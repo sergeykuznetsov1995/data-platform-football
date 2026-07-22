@@ -18,11 +18,21 @@ _whoscored_source = __file__
 if not _whoscored_source.startswith("/"):
     raise RuntimeError("WhoScored entrypoint requires an absolute source path")
 _whoscored_production = _whoscored_source.startswith("/opt/airflow/")
-_whoscored_root = "/opt/airflow" if _whoscored_production else _whoscored_source.rsplit("/scripts/", 1)[0]
+_whoscored_root = (
+    "/opt/airflow"
+    if _whoscored_production
+    else _whoscored_source.rsplit("/scripts/", 1)[0]
+)
 if _whoscored_production:
-    if getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_schema", None) != 2:
+    if (
+        getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_schema", None)
+        != 2
+    ):
         raise RuntimeError("image-baked WhoScored startup anchor is required")
-elif getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_root", None) != _whoscored_root:
+elif (
+    getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_root", None)
+    != _whoscored_root
+):
     _whoscored_anchor_path = (
         _whoscored_root + "/docker/images/airflow/whoscored_runtime_startup.py"
     )
@@ -38,8 +48,8 @@ elif getattr(_whoscored_bootstrap_sys, "_whoscored_runtime_startup_root", None) 
         compile(_whoscored_anchor_source, _whoscored_anchor_path, "exec"),
         _whoscored_anchor_globals,
     )
-_WHOSCORED_RUNTIME_CONTRACT = (
-    _whoscored_bootstrap_sys._load_whoscored_runtime_contract(_whoscored_root)
+_WHOSCORED_RUNTIME_CONTRACT = _whoscored_bootstrap_sys._load_whoscored_runtime_contract(
+    _whoscored_root
 )
 
 import argparse
@@ -85,8 +95,16 @@ from scrapers.whoscored.proxy_campaign import (
     WHOSCORED_CANARY_DISCOVERY_REQUEST_LIMIT,
     WHOSCORED_CANARY_DISCOVERY_WORK_ITEM_ID,
     WHOSCORED_CANARY_TASK_ID,
+    WHOSCORED_CHARTER_SCHEMA_VERSION,
+    WHOSCORED_DAILY_ACTIVE_SCOPE_CEILING,
+    WHOSCORED_DAILY_PLAN_SCHEMA_VERSION,
+    WHOSCORED_DAILY_PROVIDER_SAFETY_CAP_BYTES,
     WHOSCORED_INGEST_DAG_ID,
     WHOSCORED_PROXY_ALLOWED_HOSTS,
+    WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256,
+    WHOSCORED_ROLLOUT_MANIFEST_FIELDS,
+    WHOSCORED_ROLLOUT_MANIFEST_SCHEMA_VERSION,
+    WHOSCORED_ROLLOUT_WAVE_CONTRACTS,
     ProxyCampaignApproval,
     ProxyCampaignLedger,
     ProxyCampaignSignatureError,
@@ -148,13 +166,18 @@ DAILY_PROFILES_LEASE_LIMIT = 256
 DAILY_SCOPE_REQUEST_LIMIT = 64
 DAILY_SCOPE_LEASE_LIMIT = 32
 DAILY_CONCURRENCY = 4
-MAX_DAILY_ACTIVE_SCOPES = 2000
+MAX_DAILY_ACTIVE_SCOPES = WHOSCORED_DAILY_ACTIVE_SCOPE_CEILING
+# This release is admitted against the provider-side 300 MB order safety cap.
+# Raising it is a separate reviewed release, not something a rollout document
+# or environment variable may do.
+DAILY_PROVIDER_SAFETY_CAP_BYTES = WHOSCORED_DAILY_PROVIDER_SAFETY_CAP_BYTES
 # A charter must not authorise an unbounded horizon; the owner refreshes it.
 MAX_CHARTER_HORIZON = timedelta(days=62)
 PROVIDER_POLICY_SCHEMA_VERSION = 1
-CHARTER_SCHEMA_VERSION = 2
-DAILY_PLAN_SCHEMA_VERSION = 2
-ISSUANCE_LEDGER_SCHEMA_VERSION = 1
+CHARTER_SCHEMA_VERSION = WHOSCORED_CHARTER_SCHEMA_VERSION
+ROLLOUT_MANIFEST_SCHEMA_VERSION = WHOSCORED_ROLLOUT_MANIFEST_SCHEMA_VERSION
+DAILY_PLAN_SCHEMA_VERSION = WHOSCORED_DAILY_PLAN_SCHEMA_VERSION
+ISSUANCE_LEDGER_SCHEMA_VERSION = 3
 SCHEDULED_PAID_POINTER_SCHEMA_VERSION = 1
 DAILY_ISSUER_WINDOW_START = time(9, 0, tzinfo=timezone.utc)
 DAILY_ISSUER_WINDOW_END = time(9, 30, tzinfo=timezone.utc)
@@ -164,9 +187,7 @@ DEFAULT_ISSUANCE_LEDGER_PATH = (
     "/opt/airflow/logs/proxy_filter/whoscored_issuance_ledger.json"
 )
 OWNER_HMAC_SECRET_ENV = "WHOSCORED_PROXY_OWNER_HMAC_SECRET"
-ISSUANCE_LEDGER_HMAC_SECRET_ENV = (
-    "WHOSCORED_PROXY_ISSUANCE_LEDGER_HMAC_SECRET"
-)
+ISSUANCE_LEDGER_HMAC_SECRET_ENV = "WHOSCORED_PROXY_ISSUANCE_LEDGER_HMAC_SECRET"
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _TOKEN_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _PROVIDER_POLICY_UNSIGNED_FIELDS = frozenset(
@@ -196,6 +217,15 @@ _CHARTER_UNSIGNED_FIELDS = frozenset(
         "billing_month",
         "cohort_id",
         "cohort_sha256",
+        "rollout_id",
+        "wave_id",
+        "max_scopes",
+        "require_full_active",
+        "ranked_scope_ids_sha256",
+        "runtime_sha256",
+        "classifier_sha256",
+        "promotion_acceptance_sha256",
+        "promotion_terminal_receipt_sha256",
         "valid_from",
         "valid_until",
         "daily_cap_bytes",
@@ -206,15 +236,28 @@ _CHARTER_UNSIGNED_FIELDS = frozenset(
     }
 )
 _SIGNED_AUTHORITY_SUFFIX_FIELDS = frozenset({"document_sha256", "signature"})
-_COHORT_FIELDS = frozenset({"schema_version", "cohort_id", "scopes"})
+_ROLLOUT_FIELDS = WHOSCORED_ROLLOUT_MANIFEST_FIELDS
+_ROLLOUT_WAVE_CONTRACTS = WHOSCORED_ROLLOUT_WAVE_CONTRACTS
+_ROLLOUT_WAVE_PROMOTIONS = {
+    "wave-20": "wave-70",
+    "wave-70": "wave-all",
+}
 _DAILY_PLAN_FIELDS = frozenset(
     {
         "schema_version",
         "cohort_id",
         "cohort_sha256",
+        "rollout_id",
+        "wave_id",
         "max_scopes",
+        "require_full_active",
         "catalog_batch_id",
         "catalog_payload_sha256",
+        "catalog_active_scope_count",
+        "catalog_active_scopes_sha256",
+        "ranked_scope_ids_sha256",
+        "ranked_workload_sha256",
+        "ranked_scope_workloads",
         "workload_sha256",
         "scope_workloads",
         "discovery_parent_target_count",
@@ -385,11 +428,15 @@ def _read_secret(*, secret_file: str | None, secret_env: str) -> str:
     if secret_file:
         path = Path(secret_file).expanduser()
         try:
-            value = _read_bounded_file(
-                path,
-                maximum=64 * 1024,
-                require_private=True,
-            ).decode("utf-8").strip()
+            value = (
+                _read_bounded_file(
+                    path,
+                    maximum=64 * 1024,
+                    require_private=True,
+                )
+                .decode("utf-8")
+                .strip()
+            )
         except CampaignCliError:
             raise
         except OSError as exc:
@@ -497,6 +544,29 @@ def _digest(value: object, field: str) -> str:
     return value
 
 
+def _rollout_contract(
+    value: Mapping[str, object], *, label: str
+) -> tuple[str, str, int, bool]:
+    """Validate one of the three code-reviewed cumulative rollout waves."""
+
+    rollout_id = _token(value.get("rollout_id"), f"{label} rollout_id")
+    wave_id = _token(value.get("wave_id"), f"{label} wave_id")
+    max_scopes = value.get("max_scopes")
+    require_full_active = value.get("require_full_active")
+    expected = _ROLLOUT_WAVE_CONTRACTS.get(wave_id)
+    if (
+        expected is None
+        or isinstance(max_scopes, bool)
+        or not isinstance(max_scopes, int)
+        or type(require_full_active) is not bool
+        or (max_scopes, require_full_active) != expected
+    ):
+        raise CampaignCliError(
+            f"{label} must bind an exact wave-20, wave-70, or wave-all contract"
+        )
+    return rollout_id, wave_id, max_scopes, require_full_active
+
+
 def _signed_provider_policy(
     path: Path, *, owner_secret: str, now: datetime
 ) -> Mapping[str, object]:
@@ -535,7 +605,10 @@ def _signed_provider_policy(
     order = _positive_bytes(
         value.get("order_cap_bytes"), "provider policy order_cap_bytes"
     )
-    if not daily <= monthly <= order <= safety <= quota:
+    if (
+        not daily <= monthly <= order <= safety <= quota
+        or safety > DAILY_PROVIDER_SAFETY_CAP_BYTES
+    ):
         raise CampaignCliError("provider policy quota/safety caps are inconsistent")
     return value
 
@@ -569,20 +642,46 @@ def _signed_charter(
     policy_valid_until = _utc(
         str(policy.get("valid_until")), "provider policy valid_until"
     )
-    if (
-        not valid_from <= now < valid_until
-        or valid_until - now > MAX_CHARTER_HORIZON
-    ):
+    if not valid_from <= now < valid_until or valid_until - now > MAX_CHARTER_HORIZON:
         raise CampaignCliError("charter validity is outside the allowed horizon")
     if valid_from < policy_valid_from or valid_until > policy_valid_until:
-        raise CampaignCliError(
-            "charter validity is outside the provider policy window"
-        )
+        raise CampaignCliError("charter validity is outside the provider policy window")
     billing_month = str(value.get("billing_month") or "")
     if billing_month != now.strftime("%Y-%m"):
         raise CampaignCliError("charter billing_month is not current")
     _token(value.get("cohort_id"), "charter cohort_id")
     _digest(value.get("cohort_sha256"), "charter cohort_sha256")
+    _rollout_contract(value, label="charter")
+    _digest(
+        value.get("ranked_scope_ids_sha256"),
+        "charter ranked_scope_ids_sha256",
+    )
+    _digest(value.get("runtime_sha256"), "charter runtime_sha256")
+    _digest(value.get("classifier_sha256"), "charter classifier_sha256")
+    promotion_acceptance_sha256 = _digest(
+        value.get("promotion_acceptance_sha256"),
+        "charter promotion_acceptance_sha256",
+    )
+    promotion_terminal_receipt_sha256 = _digest(
+        value.get("promotion_terminal_receipt_sha256"),
+        "charter promotion_terminal_receipt_sha256",
+    )
+    if (
+        value.get("wave_id") == "wave-20"
+        and (
+            promotion_acceptance_sha256 != WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256
+            or promotion_terminal_receipt_sha256
+            != WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256
+        )
+    ) or (
+        value.get("wave_id") != "wave-20"
+        and (
+            promotion_acceptance_sha256 == WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256
+            or promotion_terminal_receipt_sha256
+            == WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256
+        )
+    ):
+        raise CampaignCliError("charter promotion proof is invalid for its wave")
     daily = _positive_bytes(value.get("daily_cap_bytes"), "charter daily_cap_bytes")
     monthly = _positive_bytes(
         value.get("monthly_cap_bytes"), "charter monthly_cap_bytes"
@@ -687,9 +786,7 @@ def _unsigned_canary(args: argparse.Namespace) -> dict[str, object]:
                 "budget_bytes": CANARY_DISCOVERY_CAP_BYTES,
                 "request_limit": discovery_requests,
                 "lease_limit": discovery_leases,
-                "allowed_path_families": list(
-                    CANARY_DISCOVERY_PATH_FAMILIES
-                ),
+                "allowed_path_families": list(CANARY_DISCOVERY_PATH_FAMILIES),
             },
             {
                 "allocation_id": CANARY_ALLOCATION_ID,
@@ -701,7 +798,7 @@ def _unsigned_canary(args: argparse.Namespace) -> dict[str, object]:
                 "request_limit": capture_requests,
                 "lease_limit": capture_leases,
                 "allowed_path_families": list(paths),
-            }
+            },
         ],
         "meter": PROXY_CAMPAIGN_METER,
         "signature_algorithm": PROXY_CAMPAIGN_SIGNATURE_ALGORITHM,
@@ -775,6 +872,14 @@ def _scope_work_item_id(scope: str) -> str:
     return "scope-" + hashlib.sha256(str(scope).encode("utf-8")).hexdigest()
 
 
+def _scope_specs_sha256(scopes: Sequence[str]) -> str:
+    """Mirror the DAG's newline-delimited active-scope identity."""
+
+    return hashlib.sha256(
+        ("\n".join(scopes) + ("\n" if scopes else "")).encode("utf-8")
+    ).hexdigest()
+
+
 def _catalog_discovery_parent_target_count(catalog: object) -> int:
     """Return a deterministic known-target baseline for incremental discovery."""
 
@@ -784,7 +889,9 @@ def _catalog_discovery_parent_target_count(catalog: object) -> int:
     competitions = rows.get("competitions", ())
     seasons = rows.get("seasons", ())
     stages = rows.get("stages", ())
-    if any(not isinstance(values, Sequence) for values in (competitions, seasons, stages)):
+    if any(
+        not isinstance(values, Sequence) for values in (competitions, seasons, stages)
+    ):
         raise CampaignCliError("parent catalog target rows are invalid")
     # Root, tournament menus, season pages, then calendar plus the two bounded
     # first/last activity probes for every known stage. Newly advertised rows
@@ -828,144 +935,468 @@ def _read_json_document(
         raise CampaignCliError(f"cannot read JSON document: {path}: {exc}") from exc
 
 
-def _read_cohort(
-    path: Path, *, require_private: bool = False
-) -> Mapping[str, object]:
+def _read_rollout(path: Path, *, require_private: bool = False) -> Mapping[str, object]:
     value = _read_json_document(path, require_private=require_private)
-    if not isinstance(value, Mapping) or frozenset(value) != _COHORT_FIELDS:
-        raise CampaignCliError("cohort manifest fields are invalid")
-    if value.get("schema_version") != 1:
-        raise CampaignCliError("unsupported cohort manifest schema")
-    _token(value.get("cohort_id"), "cohort_id")
-    scopes = value.get("scopes")
+    if not isinstance(value, Mapping) or frozenset(value) != _ROLLOUT_FIELDS:
+        raise CampaignCliError("rollout manifest fields are invalid")
+    if value.get("schema_version") != ROLLOUT_MANIFEST_SCHEMA_VERSION:
+        raise CampaignCliError("unsupported rollout manifest schema")
+    _token(value.get("cohort_id"), "rollout cohort_id")
+    _rollout_id, wave_id, _maximum, _require_full = _rollout_contract(
+        value, label="rollout"
+    )
+    _digest(value.get("runtime_sha256"), "rollout runtime_sha256")
+    _digest(value.get("classifier_sha256"), "rollout classifier_sha256")
+    promotion_acceptance_sha256 = _digest(
+        value.get("promotion_acceptance_sha256"),
+        "rollout promotion_acceptance_sha256",
+    )
+    promotion_terminal_receipt_sha256 = _digest(
+        value.get("promotion_terminal_receipt_sha256"),
+        "rollout promotion_terminal_receipt_sha256",
+    )
+    genesis_proof = WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256
     if (
-        not isinstance(scopes, list)
-        or not scopes
-        or len(scopes) > MAX_DAILY_ACTIVE_SCOPES
+        wave_id == "wave-20"
+        and (
+            promotion_acceptance_sha256 != genesis_proof
+            or promotion_terminal_receipt_sha256 != genesis_proof
+        )
+    ) or (
+        wave_id != "wave-20"
+        and (
+            promotion_acceptance_sha256 == genesis_proof
+            or promotion_terminal_receipt_sha256 == genesis_proof
+        )
+    ):
+        raise CampaignCliError("rollout promotion proof is invalid for its wave")
+    ranked_scope_ids = value.get("ranked_scope_ids")
+    if (
+        not isinstance(ranked_scope_ids, list)
+        or not ranked_scope_ids
+        or len(ranked_scope_ids) > MAX_DAILY_ACTIVE_SCOPES
         or any(
             not isinstance(item, str)
             or not item
             or item != item.strip()
             or len(item) > 512
-            for item in scopes
+            for item in ranked_scope_ids
         )
-        or len(scopes) != len(set(scopes))
+        or len(ranked_scope_ids) != len(set(ranked_scope_ids))
     ):
-        raise CampaignCliError("cohort scopes must be a bounded unique ordered list")
+        raise CampaignCliError(
+            "rollout ranked_scope_ids must be a bounded unique ordered list"
+        )
+    ranked_scope_ids_sha256 = _digest(
+        value.get("ranked_scope_ids_sha256"),
+        "rollout ranked_scope_ids_sha256",
+    )
+    if ranked_scope_ids_sha256 != _scope_specs_sha256(ranked_scope_ids):
+        raise CampaignCliError("rollout ranked scope identity is invalid")
+    basis = _normalize_daily_workloads(
+        value.get("ranking_basis_scope_workloads"),
+        label="rollout ranking basis",
+    )
+    if (
+        [str(item["scope"]) for item in basis] != ranked_scope_ids
+        or basis
+        != sorted(
+            basis,
+            key=lambda workload: (
+                -int(workload["paid_target_count"]),
+                str(workload["scope"]),
+            ),
+        )
+        or value.get("ranking_basis_workload_sha256")
+        != hashlib.sha256(canonical_json_bytes(basis)).hexdigest()
+    ):
+        raise CampaignCliError(
+            "rollout ranking basis is not the exact heavy-first scope order"
+        )
     return dict(value)
 
 
-def command_plan_daily_ingest(args: argparse.Namespace) -> None:
-    """Freeze the current catalog and exact due-workload for one cohort prefix."""
+def _promotion_acceptance_evidence(
+    *, source: Mapping[str, object], receipt_paths: object
+) -> tuple[str, str]:
+    """Validate the exact immutable receipt chain required for one promotion."""
 
-    cohort = _read_cohort(Path(args.cohort_file))
-    maximum = int(args.max_scopes)
-    if not 1 <= maximum <= MAX_DAILY_ACTIVE_SCOPES:
-        raise CampaignCliError("max_scopes is outside the release bound")
+    from dags.scripts import whoscored_rollout_acceptance as acceptance
+
+    source_wave = str(source["wave_id"])
+    try:
+        source_wave_index = acceptance.WAVE_ORDER.index(source_wave)
+    except ValueError as exc:
+        raise CampaignCliError("promotion source wave is invalid") from exc
+    if source_wave_index >= len(acceptance.WAVE_ORDER) - 1:
+        raise CampaignCliError("the terminal rollout wave cannot be promoted")
+    expected_waves = list(acceptance.WAVE_ORDER[: source_wave_index + 1])
+    expected_receipt_count = 2 * len(expected_waves)
+    if (
+        not isinstance(receipt_paths, list)
+        or len(receipt_paths) != expected_receipt_count
+        or len(set(receipt_paths)) != len(receipt_paths)
+    ):
+        raise CampaignCliError(
+            "promotion requires the exact two-receipt accepted chain per source wave"
+        )
+    records: list[tuple[str, Mapping[str, object]]] = []
+    rollout_id = str(source["rollout_id"])
+    prefix = acceptance.receipts_prefix(rollout_id)
+    for raw_path in receipt_paths:
+        path = Path(str(raw_path))
+        if (
+            path.suffix != ".json"
+            or _SHA256_RE.fullmatch(path.stem) is None
+            or path.name != f"{path.stem}.json"
+        ):
+            raise CampaignCliError(
+                "acceptance receipt filename must be its lowercase content SHA-256"
+            )
+        receipt = _read_json_document(path, require_private=True)
+        if not isinstance(receipt, Mapping):
+            raise CampaignCliError("acceptance receipt must be a JSON object")
+        records.append((f"{prefix}/{path.name}", dict(receipt)))
+    try:
+        validated = acceptance.validated_receipts(records)
+    except acceptance.WhoScoredRolloutAcceptanceError as exc:
+        raise CampaignCliError(
+            f"promotion acceptance evidence is invalid: {exc}"
+        ) from exc
+    terminal_candidates = [
+        (key, receipt)
+        for key, receipt in validated
+        if receipt["scope"]["wave_id"] == source_wave
+        and receipt["wave_accepted"] is True
+    ]
+    if not terminal_candidates:
+        raise CampaignCliError(
+            "promotion evidence must contain an accepted source-wave terminal receipt"
+        )
+    # A third and every later consecutive success is also accepted.  The exact
+    # caller-supplied chain still contains only two receipts per wave, so select
+    # the chronologically latest accepted source receipt and let the public
+    # replay helper prove that its immediate predecessor is present.
+    terminal_key, terminal_receipt = terminal_candidates[-1]
+    terminal_digest = Path(terminal_key).stem
+    terminal_scope = terminal_receipt["scope"]
+    ranked_scope_ids = list(source["ranked_scope_ids"])
+    source_cohort_sha256 = hashlib.sha256(
+        canonical_json_bytes(dict(source))
+    ).hexdigest()
+    selected_count = min(int(source["max_scopes"]), len(ranked_scope_ids))
+    if (
+        terminal_scope.get("rollout_id") != rollout_id
+        or terminal_scope.get("wave_id") != source_wave
+        or terminal_scope.get("cohort_sha256") != source_cohort_sha256
+        or terminal_scope.get("ranked_scope_ids_sha256")
+        != source["ranked_scope_ids_sha256"]
+        or terminal_scope.get("classifier_sha256") != source["classifier_sha256"]
+        or terminal_scope.get("promotion_acceptance_sha256")
+        != source["promotion_acceptance_sha256"]
+        or terminal_scope.get("promotion_terminal_receipt_sha256")
+        != source["promotion_terminal_receipt_sha256"]
+        or terminal_scope.get("catalog_active_scope_count") != len(ranked_scope_ids)
+        or terminal_scope.get("catalog_active_scopes_sha256")
+        != _scope_specs_sha256(sorted(ranked_scope_ids))
+        or terminal_scope.get("selected_scope_count") != selected_count
+        or terminal_scope.get("selected_scopes") != ranked_scope_ids[:selected_count]
+        or terminal_receipt["release"].get("code_tree_sha256")
+        != source["runtime_sha256"]
+    ):
+        raise CampaignCliError(
+            "accepted source-wave receipt differs from the frozen rollout/release"
+        )
+    try:
+        evidence = acceptance.promotion_acceptance_evidence(
+            records,
+            rollout_id=rollout_id,
+            source_wave_id=source_wave,
+            expected_terminal_receipt_sha256=terminal_digest,
+        )
+    except acceptance.WhoScoredRolloutAcceptanceError as exc:
+        raise CampaignCliError(
+            f"promotion acceptance evidence is invalid: {exc}"
+        ) from exc
+    if (
+        evidence.get("source_cohort_sha256") != source_cohort_sha256
+        or evidence.get("runtime_sha256") != source["runtime_sha256"]
+        or evidence.get("classifier_sha256") != source["classifier_sha256"]
+        or evidence.get("terminal_receipt_sha256") != terminal_digest
+        or len(evidence.get("terminal_runs", ())) != expected_receipt_count
+    ):
+        raise CampaignCliError(
+            "promotion acceptance proof differs from the frozen source rollout"
+        )
+    return str(evidence["promotion_acceptance_sha256"]), terminal_digest
+
+
+def _planned_scope_workload(
+    repository: object,
+    *,
+    scope: object,
+    runtime: object,
+) -> dict[str, object]:
+    """Freeze the exact paid target demand for one active scope."""
+
+    candidates = repository.list_match_candidates(
+        scope.competition_id,
+        scope.season_id,
+        limit=101,
+        include_exact_count=True,
+    )
+    match_count = (
+        int(candidates[0].exact_candidate_count)
+        if candidates and candidates[0].exact_candidate_count is not None
+        else len(candidates)
+    )
+    if match_count > 100:
+        raise CampaignCliError(
+            f"scope {scope.spec} match backlog exceeds daily runtime cap: "
+            f"{match_count} > 100"
+        )
+    match_ids = sorted({int(candidate.game_id) for candidate in candidates})
+    if len(match_ids) != match_count:
+        raise CampaignCliError(
+            f"scope {scope.spec} match candidate snapshot is incomplete"
+        )
+    preview_candidates = repository.list_preview_candidates(
+        scope.competition_id,
+        scope.season_id,
+        limit=257,
+    )
+    preview_count = len(preview_candidates)
+    if preview_count > 256:
+        raise CampaignCliError(
+            f"scope {scope.spec} preview workload exceeds 256 targets"
+        )
+    preview_ids = sorted(
+        {int(candidate["game_id"]) for candidate in preview_candidates}
+    )
+    if len(preview_ids) != preview_count:
+        raise CampaignCliError(
+            f"scope {scope.spec} preview candidate snapshot is not unique"
+        )
+    stage_ids = sorted(
+        {int(stage_id) for stage_id in getattr(runtime, "stage_ids", ())}
+    )
+    if not stage_ids:
+        raise CampaignCliError(f"scope {scope.spec} has no schedule stages")
+    schedule_months = _inclusive_season_month_count(runtime, scope=scope.spec)
+    # One season page plus, per stage: calendar, every bounded schedule
+    # month, 67 structured first pages and one referee page.
+    schedule_target_limit = scheduled_scope_schedule_target_limit(
+        stage_count=len(stage_ids),
+        season_month_count=schedule_months,
+    )
+    non_pagination_count = schedule_target_limit + match_count + preview_count
+    player_pagination_target_limit = scheduled_scope_player_pagination_target_limit(
+        stage_count=len(stage_ids),
+        non_pagination_target_count=non_pagination_count,
+    )
+    count = non_pagination_count + player_pagination_target_limit
+    if not 1 <= count <= WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT:
+        raise CampaignCliError(
+            "scope "
+            f"{scope.spec} paid workload exceeds the reviewed capture target "
+            f"ceiling: {count}"
+        )
+    return {
+        "scope": scope.spec,
+        "work_item_id": _scope_work_item_id(scope.spec),
+        "schedule_target_limit": schedule_target_limit,
+        "schedule_targets_sha256": scheduled_target_ids_sha256(
+            [f"season:{scope.spec}", *(f"stage:{value}" for value in stage_ids)]
+        ),
+        "player_pagination_target_limit": player_pagination_target_limit,
+        "match_target_count": match_count,
+        "match_targets_sha256": scheduled_target_ids_sha256(match_ids),
+        "preview_target_count": preview_count,
+        "preview_targets_sha256": scheduled_target_ids_sha256(preview_ids),
+        "paid_target_count": count,
+    }
+
+
+def command_create_rollout(args: argparse.Namespace) -> None:
+    """Freeze one heavy-first scope ranking from exact current paid demand."""
+
+    rollout_id = _token(args.rollout_id, "rollout_id")
+    cohort_id = _token(args.cohort_id, "cohort_id")
+    wave_id = _token(args.wave_id, "wave_id")
+    if wave_id != "wave-20":
+        raise CampaignCliError(
+            "create-rollout can only create wave-20; use promote-rollout for later waves"
+        )
+    runtime_sha256 = _digest(args.runtime_sha256, "runtime_sha256")
+    classifier_sha256 = _digest(args.classifier_sha256, "classifier_sha256")
+    wave_contract = _ROLLOUT_WAVE_CONTRACTS.get(wave_id)
+    if wave_contract is None:
+        raise CampaignCliError("wave_id is outside the reviewed rollout contract")
+    maximum, require_full_active = wave_contract
     from dags.scripts import run_whoscored_scraper as runner
 
     repository = runner._new_repository()
     generation, catalog = repository.load_catalog_generation_snapshot()
     selected = runner._select_catalog_snapshot_scopes(catalog, [], active_only=True)
     active = {scope.spec: (scope, runtime) for scope, runtime in selected}
-    workloads: list[dict[str, object]] = []
-    prefix = list(cohort["scopes"][:maximum])
-    missing = [scope_spec for scope_spec in prefix if scope_spec not in active]
-    if missing:
+    if (
+        not active
+        or len(active) != len(selected)
+        or len(active) > MAX_DAILY_ACTIVE_SCOPES
+    ):
+        raise CampaignCliError("active catalog is outside the rollout scope ceiling")
+    ranking_basis = [
+        _planned_scope_workload(repository, scope=scope, runtime=runtime)
+        for scope, runtime in (active[scope_spec] for scope_spec in sorted(active))
+    ]
+    ranking_basis.sort(
+        key=lambda workload: (
+            -int(workload["paid_target_count"]),
+            str(workload["scope"]),
+        )
+    )
+    ranked_scope_ids = [str(item["scope"]) for item in ranking_basis]
+    result = {
+        "schema_version": ROLLOUT_MANIFEST_SCHEMA_VERSION,
+        "cohort_id": cohort_id,
+        "rollout_id": rollout_id,
+        "wave_id": wave_id,
+        "max_scopes": maximum,
+        "require_full_active": require_full_active,
+        "ranked_scope_ids": ranked_scope_ids,
+        "ranked_scope_ids_sha256": _scope_specs_sha256(ranked_scope_ids),
+        "ranking_basis_workload_sha256": hashlib.sha256(
+            canonical_json_bytes(ranking_basis)
+        ).hexdigest(),
+        "ranking_basis_scope_workloads": ranking_basis,
+        "runtime_sha256": runtime_sha256,
+        "classifier_sha256": classifier_sha256,
+        "promotion_acceptance_sha256": WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256,
+        "promotion_terminal_receipt_sha256": (WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256),
+    }
+    cohort_sha256 = hashlib.sha256(canonical_json_bytes(result)).hexdigest()
+    _atomic_write_json(Path(args.output), result, replace=args.force)
+    _print_summary(
+        {
+            "status": "rollout_ranking_frozen",
+            "output": str(Path(args.output)),
+            "rollout_id": rollout_id,
+            "wave_id": wave_id,
+            "catalog_batch_id": generation["catalog_batch_id"],
+            "catalog_active_scope_count": len(ranked_scope_ids),
+            "cohort_sha256": cohort_sha256,
+            "ranked_scope_ids_sha256": result["ranked_scope_ids_sha256"],
+            "ranking_basis_workload_sha256": result["ranking_basis_workload_sha256"],
+        }
+    )
+
+
+def command_promote_rollout(args: argparse.Namespace) -> None:
+    """Derive the adjacent wave without consulting or reranking the live catalog."""
+
+    source = _read_rollout(Path(args.input), require_private=True)
+    source_wave = str(source["wave_id"])
+    target_wave = _token(args.wave_id, "wave_id")
+    expected_target = _ROLLOUT_WAVE_PROMOTIONS.get(source_wave)
+    if target_wave != expected_target:
         raise CampaignCliError(
-            f"signed cohort prefix contains inactive/missing scopes: {missing}"
+            "rollout promotion must be exactly wave-20 to wave-70 or "
+            "wave-70 to wave-all"
         )
-    for scope_spec in prefix:
+    cohort_id = _token(args.cohort_id, "cohort_id")
+    if cohort_id == source["cohort_id"]:
+        raise CampaignCliError("rollout promotion requires a new cohort_id")
+    promotion_acceptance_sha256, terminal_receipt_sha256 = (
+        _promotion_acceptance_evidence(
+            source=source,
+            receipt_paths=args.acceptance_receipt,
+        )
+    )
+    maximum, require_full_active = _ROLLOUT_WAVE_CONTRACTS[target_wave]
+    result = dict(source)
+    result.update(
+        {
+            "cohort_id": cohort_id,
+            "wave_id": target_wave,
+            "max_scopes": maximum,
+            "require_full_active": require_full_active,
+            "promotion_acceptance_sha256": promotion_acceptance_sha256,
+            "promotion_terminal_receipt_sha256": terminal_receipt_sha256,
+        }
+    )
+    # Revalidate the derived document before publication. All frozen ranking and
+    # workload-basis fields came from the already validated source unchanged.
+    if any(
+        result[field] != source[field]
+        for field in _ROLLOUT_FIELDS
+        - {
+            "cohort_id",
+            "wave_id",
+            "max_scopes",
+            "require_full_active",
+            "promotion_acceptance_sha256",
+            "promotion_terminal_receipt_sha256",
+        }
+    ):
+        raise CampaignCliError("rollout promotion changed frozen rollout identity")
+    _rollout_contract(result, label="promoted rollout")
+    cohort_sha256 = hashlib.sha256(canonical_json_bytes(result)).hexdigest()
+    _atomic_write_json(Path(args.output), result, replace=args.force)
+    _print_summary(
+        {
+            "status": "rollout_wave_promoted",
+            "output": str(Path(args.output)),
+            "rollout_id": result["rollout_id"],
+            "source_wave_id": source_wave,
+            "wave_id": target_wave,
+            "cohort_id": cohort_id,
+            "cohort_sha256": cohort_sha256,
+            "ranked_scope_ids_sha256": result["ranked_scope_ids_sha256"],
+            "promotion_acceptance_sha256": promotion_acceptance_sha256,
+            "promotion_terminal_receipt_sha256": terminal_receipt_sha256,
+        }
+    )
+
+
+def command_plan_daily_ingest(args: argparse.Namespace) -> None:
+    """Freeze the current catalog and exact heavy-first rollout wave."""
+
+    rollout = _read_rollout(Path(args.rollout_file))
+    _rollout_id, _wave_id, maximum, require_full_active = _rollout_contract(
+        rollout, label="rollout"
+    )
+    from dags.scripts import run_whoscored_scraper as runner
+
+    repository = runner._new_repository()
+    generation, catalog = repository.load_catalog_generation_snapshot()
+    selected = runner._select_catalog_snapshot_scopes(catalog, [], active_only=True)
+    active = {scope.spec: (scope, runtime) for scope, runtime in selected}
+    if not active or len(active) != len(selected):
+        raise CampaignCliError("active catalog contains no unique rollout scopes")
+    active_scopes = sorted(active)
+    ranked_scope_ids = list(rollout["ranked_scope_ids"])
+    if sorted(ranked_scope_ids) != active_scopes:
+        missing = sorted(set(active_scopes) - set(ranked_scope_ids))
+        extra = sorted(set(ranked_scope_ids) - set(active_scopes))
+        raise CampaignCliError(
+            "rollout scope universe differs from the exact active catalog: "
+            f"missing={missing}, extra={extra}"
+        )
+    ranked_workloads: list[dict[str, object]] = []
+    for scope_spec in ranked_scope_ids:
         scope, runtime = active[str(scope_spec)]
-        candidates = repository.list_match_candidates(
-            scope.competition_id,
-            scope.season_id,
-            limit=101,
-            include_exact_count=True,
+        ranked_workloads.append(
+            _planned_scope_workload(repository, scope=scope, runtime=runtime)
         )
-        match_count = (
-            int(candidates[0].exact_candidate_count)
-            if candidates and candidates[0].exact_candidate_count is not None
-            else len(candidates)
-        )
-        if match_count > 100:
-            raise CampaignCliError(
-                f"scope {scope.spec} match backlog exceeds daily runtime cap: "
-                f"{match_count} > 100"
-            )
-        match_ids = sorted({int(candidate.game_id) for candidate in candidates})
-        if len(match_ids) != match_count:
-            raise CampaignCliError(
-                f"scope {scope.spec} match candidate snapshot is incomplete"
-            )
-        preview_candidates = repository.list_preview_candidates(
-            scope.competition_id,
-            scope.season_id,
-            limit=257,
-        )
-        preview_count = len(preview_candidates)
-        if preview_count > 256:
-            raise CampaignCliError(
-                f"scope {scope.spec} preview workload exceeds 256 targets"
-            )
-        preview_ids = sorted(
-            {int(candidate["game_id"]) for candidate in preview_candidates}
-        )
-        if len(preview_ids) != preview_count:
-            raise CampaignCliError(
-                f"scope {scope.spec} preview candidate snapshot is not unique"
-            )
-        stage_ids = sorted(
-            {int(stage_id) for stage_id in getattr(runtime, "stage_ids", ())}
-        )
-        if not stage_ids:
-            raise CampaignCliError(f"scope {scope.spec} has no schedule stages")
-        schedule_months = _inclusive_season_month_count(runtime, scope=scope.spec)
-        # One season page plus, per stage: calendar, every bounded schedule
-        # month, 67 structured first pages and one referee page.
-        schedule_target_limit = scheduled_scope_schedule_target_limit(
-            stage_count=len(stage_ids),
-            season_month_count=schedule_months,
-        )
-        non_pagination_count = schedule_target_limit + match_count + preview_count
-        player_pagination_target_limit = (
-            scheduled_scope_player_pagination_target_limit(
-                stage_count=len(stage_ids),
-                non_pagination_target_count=non_pagination_count,
-            )
-        )
-        count = non_pagination_count + player_pagination_target_limit
-        if not 1 <= count <= WHOSCORED_CANARY_CAPTURE_LEASE_LIMIT:
-            raise CampaignCliError(
-                "scope "
-                f"{scope.spec} paid workload exceeds the reviewed capture target "
-                f"ceiling: {count}"
-            )
-        workloads.append(
-            {
-                "scope": scope.spec,
-                "work_item_id": _scope_work_item_id(scope.spec),
-                "schedule_target_limit": schedule_target_limit,
-                "schedule_targets_sha256": scheduled_target_ids_sha256(
-                    [f"season:{scope.spec}", *(f"stage:{value}" for value in stage_ids)]
-                ),
-                "player_pagination_target_limit": (
-                    player_pagination_target_limit
-                ),
-                "match_target_count": match_count,
-                "match_targets_sha256": scheduled_target_ids_sha256(match_ids),
-                "preview_target_count": preview_count,
-                "preview_targets_sha256": scheduled_target_ids_sha256(preview_ids),
-                "paid_target_count": count,
-            }
-        )
+    workloads = ranked_workloads[: min(maximum, len(ranked_workloads))]
+    if require_full_active and len(workloads) != len(ranked_workloads):
+        raise CampaignCliError("wave-all did not select the complete active catalog")
     from scrapers.whoscored.profile_policy import daily_profile_candidate_hard_cap
 
-    selected_values = [active[str(scope_spec)] for scope_spec in prefix]
+    selected_values = [active[str(item["scope"])] for item in workloads]
     profile_snapshot = repository.profile_candidate_snapshot(
         scopes=[
-            getattr(runtime, "scope", runtime)
-            for _scope, runtime in selected_values
+            getattr(runtime, "scope", runtime) for _scope, runtime in selected_values
         ],
         hard_cap=daily_profile_candidate_hard_cap(),
     )
@@ -978,7 +1409,10 @@ def command_plan_daily_ingest(args: argparse.Namespace) -> None:
         raise CampaignCliError(
             "exact profile workload is outside the scheduled 0..256 bound"
         )
-    cohort_sha256 = hashlib.sha256(canonical_json_bytes(cohort)).hexdigest()
+    cohort_sha256 = hashlib.sha256(canonical_json_bytes(rollout)).hexdigest()
+    ranked_workload_sha256 = hashlib.sha256(
+        canonical_json_bytes(ranked_workloads)
+    ).hexdigest()
     workload_sha256 = hashlib.sha256(canonical_json_bytes(workloads)).hexdigest()
     discovery_parent_target_count = _catalog_discovery_parent_target_count(catalog)
     discovery_target_limit = min(
@@ -987,11 +1421,19 @@ def command_plan_daily_ingest(args: argparse.Namespace) -> None:
     )
     result = {
         "schema_version": DAILY_PLAN_SCHEMA_VERSION,
-        "cohort_id": cohort["cohort_id"],
+        "cohort_id": rollout["cohort_id"],
         "cohort_sha256": cohort_sha256,
+        "rollout_id": rollout["rollout_id"],
+        "wave_id": rollout["wave_id"],
         "max_scopes": maximum,
+        "require_full_active": require_full_active,
         "catalog_batch_id": generation["catalog_batch_id"],
         "catalog_payload_sha256": generation["catalog_payload_sha256"],
+        "catalog_active_scope_count": len(active_scopes),
+        "catalog_active_scopes_sha256": _scope_specs_sha256(active_scopes),
+        "ranked_scope_ids_sha256": rollout["ranked_scope_ids_sha256"],
+        "ranked_workload_sha256": ranked_workload_sha256,
+        "ranked_scope_workloads": ranked_workloads,
         "workload_sha256": workload_sha256,
         "scope_workloads": workloads,
         "discovery_parent_target_count": discovery_parent_target_count,
@@ -1005,66 +1447,22 @@ def command_plan_daily_ingest(args: argparse.Namespace) -> None:
         {
             "status": "daily_ingest_plan_frozen",
             "output": str(Path(args.output)),
-            "cohort_id": cohort["cohort_id"],
+            "cohort_id": rollout["cohort_id"],
+            "rollout_id": rollout["rollout_id"],
+            "wave_id": rollout["wave_id"],
             "catalog_batch_id": generation["catalog_batch_id"],
+            "catalog_active_scope_count": len(active_scopes),
             "scope_count": len(workloads),
             "workload_sha256": workload_sha256,
         }
     )
 
 
-def _read_daily_plan(
-    path: Path, *, require_frozen: bool = False
-) -> Mapping[str, object]:
-    value = _read_json_document(
-        path,
-        require_private=not require_frozen,
-        require_frozen=require_frozen,
-    )
-    if not isinstance(value, Mapping) or frozenset(value) != _DAILY_PLAN_FIELDS:
-        raise CampaignCliError("daily plan fields are invalid")
-    if value.get("schema_version") != DAILY_PLAN_SCHEMA_VERSION:
-        raise CampaignCliError("unsupported daily plan schema")
-    _token(value.get("cohort_id"), "plan cohort_id")
-    _digest(value.get("cohort_sha256"), "plan cohort_sha256")
-    max_scopes = value.get("max_scopes")
-    if (
-        isinstance(max_scopes, bool)
-        or not isinstance(max_scopes, int)
-        or not 1 <= max_scopes <= MAX_DAILY_ACTIVE_SCOPES
-    ):
-        raise CampaignCliError("daily plan max_scopes is outside its bound")
-    _token(value.get("catalog_batch_id"), "plan catalog_batch_id")
-    _digest(value.get("catalog_payload_sha256"), "plan catalog_payload_sha256")
-    for field, allow_zero, maximum in (
-        ("discovery_parent_target_count", False, None),
-        ("discovery_expansion_headroom", False, None),
-        ("discovery_target_limit", False, SCHEDULED_DISCOVERY_TARGET_LIMIT_MAX),
-        ("profile_target_count", True, 256),
-    ):
-        count = value.get(field)
-        if (
-            isinstance(count, bool)
-            or not isinstance(count, int)
-            or count < (0 if allow_zero else 1)
-            or (maximum is not None and count > maximum)
-        ):
-            raise CampaignCliError(f"daily plan {field} is outside its bound")
-    if (
-        value.get("discovery_expansion_headroom")
-        != SCHEDULED_DISCOVERY_EXPANSION_HEADROOM
-        or value.get("discovery_target_limit")
-        != min(
-            SCHEDULED_DISCOVERY_TARGET_LIMIT_MAX,
-            int(value["discovery_parent_target_count"])
-            + SCHEDULED_DISCOVERY_EXPANSION_HEADROOM,
-        )
-    ):
-        raise CampaignCliError("daily plan discovery target limit is invalid")
-    _digest(value.get("profile_targets_sha256"), "plan profile_targets_sha256")
-    workloads = value.get("scope_workloads")
+def _normalize_daily_workloads(
+    workloads: object, *, label: str
+) -> list[dict[str, object]]:
     if not isinstance(workloads, list) or not workloads:
-        raise CampaignCliError("daily plan scope_workloads must be non-empty")
+        raise CampaignCliError(f"daily plan {label} must be non-empty")
     normalized: list[dict[str, object]] = []
     for item in workloads:
         if not isinstance(item, Mapping) or set(item) != {
@@ -1079,7 +1477,7 @@ def _read_daily_plan(
             "preview_targets_sha256",
             "paid_target_count",
         }:
-            raise CampaignCliError("daily plan workload fields are invalid")
+            raise CampaignCliError(f"daily plan {label} fields are invalid")
         scope = str(item.get("scope") or "")
         expected = _scope_work_item_id(scope)
         count = item.get("paid_target_count")
@@ -1107,10 +1505,9 @@ def _read_daily_plan(
             or isinstance(preview_count, bool)
             or not isinstance(preview_count, int)
             or not 0 <= preview_count <= 256
-            or count
-            != schedule_count + pagination_count + match_count + preview_count
+            or count != schedule_count + pagination_count + match_count + preview_count
         ):
-            raise CampaignCliError("daily plan workload is invalid")
+            raise CampaignCliError(f"daily plan {label} item is invalid")
         for digest_field in (
             "schedule_targets_sha256",
             "match_targets_sha256",
@@ -1120,8 +1517,95 @@ def _read_daily_plan(
         normalized.append(dict(item))
     observed_scopes = [str(item["scope"]) for item in normalized]
     if len(observed_scopes) != len(set(observed_scopes)):
-        raise CampaignCliError("daily plan workloads must be unique")
-    expected_sha = hashlib.sha256(canonical_json_bytes(normalized)).hexdigest()
+        raise CampaignCliError(f"daily plan {label} scopes must be unique")
+    return normalized
+
+
+def _read_daily_plan(
+    path: Path, *, require_frozen: bool = False
+) -> Mapping[str, object]:
+    value = _read_json_document(
+        path,
+        require_private=not require_frozen,
+        require_frozen=require_frozen,
+    )
+    if not isinstance(value, Mapping) or frozenset(value) != _DAILY_PLAN_FIELDS:
+        raise CampaignCliError("daily plan fields are invalid")
+    if value.get("schema_version") != DAILY_PLAN_SCHEMA_VERSION:
+        raise CampaignCliError("unsupported daily plan schema")
+    _token(value.get("cohort_id"), "plan cohort_id")
+    _digest(value.get("cohort_sha256"), "plan cohort_sha256")
+    _rollout_id, _wave_id, max_scopes, require_full_active = _rollout_contract(
+        value, label="daily plan"
+    )
+    _token(value.get("catalog_batch_id"), "plan catalog_batch_id")
+    _digest(value.get("catalog_payload_sha256"), "plan catalog_payload_sha256")
+    active_scopes_sha256 = _digest(
+        value.get("catalog_active_scopes_sha256"),
+        "plan catalog_active_scopes_sha256",
+    )
+    active_count = value.get("catalog_active_scope_count")
+    if (
+        isinstance(active_count, bool)
+        or not isinstance(active_count, int)
+        or not 1 <= active_count <= MAX_DAILY_ACTIVE_SCOPES
+    ):
+        raise CampaignCliError(
+            "daily plan catalog_active_scope_count is outside its bound"
+        )
+    for field, allow_zero, maximum in (
+        ("discovery_parent_target_count", False, None),
+        ("discovery_expansion_headroom", False, None),
+        ("discovery_target_limit", False, SCHEDULED_DISCOVERY_TARGET_LIMIT_MAX),
+        ("profile_target_count", True, 256),
+    ):
+        count = value.get(field)
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < (0 if allow_zero else 1)
+            or (maximum is not None and count > maximum)
+        ):
+            raise CampaignCliError(f"daily plan {field} is outside its bound")
+    if value.get(
+        "discovery_expansion_headroom"
+    ) != SCHEDULED_DISCOVERY_EXPANSION_HEADROOM or value.get(
+        "discovery_target_limit"
+    ) != min(
+        SCHEDULED_DISCOVERY_TARGET_LIMIT_MAX,
+        int(value["discovery_parent_target_count"])
+        + SCHEDULED_DISCOVERY_EXPANSION_HEADROOM,
+    ):
+        raise CampaignCliError("daily plan discovery target limit is invalid")
+    _digest(value.get("profile_targets_sha256"), "plan profile_targets_sha256")
+    ranked = _normalize_daily_workloads(
+        value.get("ranked_scope_workloads"), label="ranked_scope_workloads"
+    )
+    selected = _normalize_daily_workloads(
+        value.get("scope_workloads"), label="scope_workloads"
+    )
+    if len(ranked) != active_count:
+        raise CampaignCliError("daily plan ranked workloads are incomplete")
+    ranked_scopes = [str(workload["scope"]) for workload in ranked]
+    stable_ranked_sha256 = _digest(
+        value.get("ranked_scope_ids_sha256"),
+        "plan ranked_scope_ids_sha256",
+    )
+    if stable_ranked_sha256 != _scope_specs_sha256(ranked_scopes):
+        raise CampaignCliError("daily plan stable scope ranking is invalid")
+    if active_scopes_sha256 != _scope_specs_sha256(sorted(ranked_scopes)):
+        raise CampaignCliError("daily plan active scope digest is invalid")
+    ranked_sha = hashlib.sha256(canonical_json_bytes(ranked)).hexdigest()
+    if value.get("ranked_workload_sha256") != ranked_sha:
+        raise CampaignCliError("daily plan ranked workload digest is invalid")
+    expected_selected = ranked[: min(max_scopes, active_count)]
+    if selected != expected_selected or (
+        require_full_active and len(selected) != active_count
+    ):
+        raise CampaignCliError(
+            "daily plan selected workloads are not the exact rollout prefix"
+        )
+    expected_sha = hashlib.sha256(canonical_json_bytes(selected)).hexdigest()
     if value.get("workload_sha256") != expected_sha:
         raise CampaignCliError("daily plan workload digest is invalid")
     return dict(value)
@@ -1130,37 +1614,55 @@ def _read_daily_plan(
 def _verify_daily_plan_authority(
     *,
     plan: Mapping[str, object],
-    cohort: Mapping[str, object],
+    rollout: Mapping[str, object],
     charter: Mapping[str, object],
-    max_scopes: int,
 ) -> None:
     """Re-derive the owner-approved selection inside the offline signer."""
 
-    if not 1 <= max_scopes <= MAX_DAILY_ACTIVE_SCOPES:
-        raise CampaignCliError("max_scopes is outside the release bound")
-    cohort_sha256 = hashlib.sha256(canonical_json_bytes(dict(cohort))).hexdigest()
+    cohort_sha256 = hashlib.sha256(canonical_json_bytes(dict(rollout))).hexdigest()
+    plan_rollout_fields = (
+        "rollout_id",
+        "wave_id",
+        "max_scopes",
+        "require_full_active",
+        "ranked_scope_ids_sha256",
+    )
+    charter_rollout_fields = (
+        *plan_rollout_fields,
+        "runtime_sha256",
+        "classifier_sha256",
+        "promotion_acceptance_sha256",
+        "promotion_terminal_receipt_sha256",
+    )
     if (
-        plan.get("max_scopes") != max_scopes
-        or plan.get("cohort_id") != cohort.get("cohort_id")
+        plan.get("cohort_id") != rollout.get("cohort_id")
         or plan.get("cohort_sha256") != cohort_sha256
-        or charter.get("cohort_id") != cohort.get("cohort_id")
+        or charter.get("cohort_id") != rollout.get("cohort_id")
         or charter.get("cohort_sha256") != cohort_sha256
+        or any(plan.get(field) != rollout.get(field) for field in plan_rollout_fields)
+        or any(
+            charter.get(field) != rollout.get(field) for field in charter_rollout_fields
+        )
     ):
-        raise CampaignCliError("daily plan is outside the signed charter cohort")
-    raw_scopes = cohort.get("scopes")
+        raise CampaignCliError("daily plan is outside the signed rollout charter")
+    raw_scopes = rollout.get("ranked_scope_ids")
+    ranked = plan.get("ranked_scope_workloads")
     workloads = plan.get("scope_workloads")
-    if not isinstance(raw_scopes, list) or not isinstance(workloads, list):
-        raise CampaignCliError("daily plan cohort selection is invalid")
-    expected_scopes = [str(scope) for scope in raw_scopes[:max_scopes]]
-    observed_scopes = [
+    if not all(isinstance(value, list) for value in (raw_scopes, ranked, workloads)):
+        raise CampaignCliError("daily plan rollout selection is invalid")
+    ranked_scopes = [
         str(workload.get("scope"))
-        for workload in workloads
+        for workload in ranked
         if isinstance(workload, Mapping)
     ]
-    if observed_scopes != expected_scopes or len(observed_scopes) != len(workloads):
+    if ranked_scopes != raw_scopes or len(ranked_scopes) != len(ranked):
         raise CampaignCliError(
-            "daily plan workloads are not the exact signed cohort prefix"
+            "daily plan ranked workloads differ from the frozen rollout order"
         )
+    maximum = int(rollout["max_scopes"])
+    expected = ranked[: min(maximum, len(ranked))]
+    if workloads != expected:
+        raise CampaignCliError("daily plan workloads are not the heavy-first wave")
 
 
 def _split_scope_budgets(
@@ -1172,9 +1674,7 @@ def _split_scope_budgets(
     floors = [1_000_000 for _item in workloads]
     ceilings = [2_000_000 * demand for demand in demands]
     if scope_pool_bytes < sum(floors):
-        raise CampaignCliError(
-            "scope budget does not fit workload-aware floor bounds"
-        )
+        raise CampaignCliError("scope budget does not fit workload-aware floor bounds")
     scope_pool_bytes = min(scope_pool_bytes, sum(ceilings))
     budgets = list(floors)
     remaining = scope_pool_bytes - sum(budgets)
@@ -1332,16 +1832,26 @@ def _daily_ingest_unsigned(
             "billing_month": charter["billing_month"],
             "cohort_id": plan["cohort_id"],
             "cohort_sha256": plan["cohort_sha256"],
+            "rollout_id": plan["rollout_id"],
+            "wave_id": plan["wave_id"],
+            "max_scopes": plan["max_scopes"],
+            "require_full_active": plan["require_full_active"],
             "catalog_batch_id": plan["catalog_batch_id"],
             "catalog_payload_sha256": plan["catalog_payload_sha256"],
+            "catalog_active_scope_count": plan["catalog_active_scope_count"],
+            "catalog_active_scopes_sha256": plan["catalog_active_scopes_sha256"],
+            "ranked_scope_ids_sha256": plan["ranked_scope_ids_sha256"],
+            "ranked_workload_sha256": plan["ranked_workload_sha256"],
+            "runtime_sha256": charter["runtime_sha256"],
+            "classifier_sha256": charter["classifier_sha256"],
+            "promotion_acceptance_sha256": charter["promotion_acceptance_sha256"],
+            "promotion_terminal_receipt_sha256": charter[
+                "promotion_terminal_receipt_sha256"
+            ],
             "workload_sha256": plan["workload_sha256"],
             "scope_workloads": list(workloads),
-            "discovery_parent_target_count": plan[
-                "discovery_parent_target_count"
-            ],
-            "discovery_expansion_headroom": plan[
-                "discovery_expansion_headroom"
-            ],
+            "discovery_parent_target_count": plan["discovery_parent_target_count"],
+            "discovery_expansion_headroom": plan["discovery_expansion_headroom"],
             "discovery_target_limit": plan["discovery_target_limit"],
             "profile_target_count": plan["profile_target_count"],
             "profile_targets_sha256": plan["profile_targets_sha256"],
@@ -1356,7 +1866,9 @@ def _daily_ingest_unsigned(
     return unsigned
 
 
-def _pointer_document(*, run_id: str, approval: ProxyCampaignApproval) -> dict[str, object]:
+def _pointer_document(
+    *, run_id: str, approval: ProxyCampaignApproval
+) -> dict[str, object]:
     return {
         "schema_version": SCHEDULED_PAID_POINTER_SCHEMA_VERSION,
         "dag_id": WHOSCORED_INGEST_DAG_ID,
@@ -1376,6 +1888,84 @@ def _seal_issuance_ledger(
     return {**body, "signature": _authority_signature(body, secret)}
 
 
+def _validate_issuance_rollout_sequence(
+    values: Sequence[Mapping[str, object]],
+) -> None:
+    """Reject first-wave skips, rollback, reactivation and release drift."""
+
+    states: dict[str, Mapping[str, object]] = {}
+    wave_order = tuple(_ROLLOUT_WAVE_CONTRACTS)
+    stable_fields = (
+        "ranked_scope_ids_sha256",
+        "runtime_sha256",
+        "classifier_sha256",
+    )
+    for value in values:
+        rollout_id = str(value["rollout_id"])
+        wave_id = str(value["wave_id"])
+        wave_index = wave_order.index(wave_id)
+        proof_values = (
+            value["promotion_acceptance_sha256"],
+            value["promotion_terminal_receipt_sha256"],
+        )
+        if (
+            wave_index == 0
+            and any(
+                proof != WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256
+                for proof in proof_values
+            )
+        ) or (
+            wave_index != 0
+            and any(
+                proof == WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256
+                for proof in proof_values
+            )
+        ):
+            raise CampaignCliError(
+                "issuance rollout promotion proof is invalid for its active wave"
+            )
+        previous = states.get(rollout_id)
+        if previous is None:
+            if wave_index != 0:
+                raise CampaignCliError(
+                    "issuance rollout must begin at wave-20 before provider spend"
+                )
+        else:
+            previous_wave_index = wave_order.index(str(previous["wave_id"]))
+            if any(value[field] != previous[field] for field in stable_fields):
+                raise CampaignCliError(
+                    "existing rollout_id has frozen ranking or release-pin drift"
+                )
+            if wave_index < previous_wave_index:
+                raise CampaignCliError(
+                    "issuance rollout cannot roll back or reactivate an earlier wave"
+                )
+            if wave_index > previous_wave_index + 1:
+                raise CampaignCliError("issuance rollout cannot skip a rollout wave")
+            if wave_index == previous_wave_index and any(
+                value[field] != previous[field]
+                for field in (
+                    "cohort_sha256",
+                    "promotion_acceptance_sha256",
+                    "promotion_terminal_receipt_sha256",
+                )
+            ):
+                raise CampaignCliError(
+                    "active rollout wave cannot change cohort or acceptance proof"
+                )
+            if wave_index == previous_wave_index + 1 and any(
+                value[field] == previous[field]
+                for field in (
+                    "promotion_acceptance_sha256",
+                    "promotion_terminal_receipt_sha256",
+                )
+            ):
+                raise CampaignCliError(
+                    "adjacent rollout wave cannot reuse prior promotion evidence"
+                )
+        states[rollout_id] = value
+
+
 def _read_issuance_ledger(path: Path, *, secret: str) -> dict[str, object]:
     if not path.exists():
         return _issuance_ledger_empty()
@@ -1386,7 +1976,10 @@ def _read_issuance_ledger(path: Path, *, secret: str) -> dict[str, object]:
         "signature",
     }:
         raise CampaignCliError("issuance ledger fields are invalid")
-    body = {"schema_version": value.get("schema_version"), "entries": value.get("entries")}
+    body = {
+        "schema_version": value.get("schema_version"),
+        "entries": value.get("entries"),
+    }
     signature = value.get("signature")
     if (
         body["schema_version"] != ISSUANCE_LEDGER_SCHEMA_VERSION
@@ -1406,6 +1999,16 @@ def _read_issuance_ledger(path: Path, *, secret: str) -> dict[str, object]:
             "billing_month",
             "day",
             "charter_sha256",
+            "rollout_id",
+            "wave_id",
+            "max_scopes",
+            "require_full_active",
+            "cohort_sha256",
+            "ranked_scope_ids_sha256",
+            "runtime_sha256",
+            "classifier_sha256",
+            "promotion_acceptance_sha256",
+            "promotion_terminal_receipt_sha256",
             "total_provider_bytes",
             "approval",
             "pointer",
@@ -1417,6 +2020,23 @@ def _read_issuance_ledger(path: Path, *, secret: str) -> dict[str, object]:
         run_ids.add(run_id)
         _digest(entry.get("request_sha256"), "ledger request_sha256")
         _digest(entry.get("charter_sha256"), "ledger charter_sha256")
+        _token(entry.get("rollout_id"), "ledger rollout_id")
+        _rollout_contract(entry, label="ledger entry")
+        _digest(entry.get("cohort_sha256"), "ledger cohort_sha256")
+        _digest(
+            entry.get("ranked_scope_ids_sha256"),
+            "ledger ranked_scope_ids_sha256",
+        )
+        _digest(entry.get("runtime_sha256"), "ledger runtime_sha256")
+        _digest(entry.get("classifier_sha256"), "ledger classifier_sha256")
+        _digest(
+            entry.get("promotion_acceptance_sha256"),
+            "ledger promotion_acceptance_sha256",
+        )
+        _digest(
+            entry.get("promotion_terminal_receipt_sha256"),
+            "ledger promotion_terminal_receipt_sha256",
+        )
         _positive_bytes(
             entry.get("total_provider_bytes"), "ledger total_provider_bytes"
         )
@@ -1424,6 +2044,7 @@ def _read_issuance_ledger(path: Path, *, secret: str) -> dict[str, object]:
             entry.get("pointer"), Mapping
         ):
             raise CampaignCliError("issuance ledger artifacts are malformed")
+    _validate_issuance_rollout_sequence(entries)
     return dict(body)
 
 
@@ -1517,20 +2138,22 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
         raise CampaignCliError(
             "expires_at cannot cover the complete scheduled DagRun timeout window"
         )
-    cohort = _read_cohort(Path(args.cohort_file), require_private=True)
+    rollout = _read_rollout(Path(args.rollout_file), require_private=True)
     plan = _read_daily_plan(Path(args.plan_file), require_frozen=True)
     _verify_daily_plan_authority(
         plan=plan,
-        cohort=cohort,
+        rollout=rollout,
         charter=charter,
-        max_scopes=int(args.max_scopes),
     )
-    total_bytes = int(args.total_bytes)
-    daily_bytes = int(args.daily_bytes) if args.daily_bytes else total_bytes
-    if total_bytes <= 0 or daily_bytes <= 0 or daily_bytes > total_bytes:
+    if (
+        args.runtime_sha256 != charter["runtime_sha256"]
+        or args.classifier_sha256 != charter["classifier_sha256"]
+    ):
         raise CampaignCliError(
-            "total_bytes/daily_bytes must be positive and daily <= total"
+            "issuer release pins differ from the signed rollout charter"
         )
+    total_bytes = int(charter["daily_cap_bytes"])
+    daily_bytes = total_bytes
     discovery_reservation = min(
         DAILY_DISCOVERY_BUDGET_CEILING_BYTES,
         max(1, total_bytes // DAILY_DISCOVERY_BUDGET_DIVISOR),
@@ -1546,10 +2169,9 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
     issued_total_bytes = (
         discovery_reservation + profiles_reservation + sum(scope_reservations)
     )
-    if (
-        issued_total_bytes > int(charter["daily_cap_bytes"])
-        or min(daily_bytes, issued_total_bytes) > int(charter["daily_cap_bytes"])
-    ):
+    if issued_total_bytes > int(charter["daily_cap_bytes"]) or min(
+        daily_bytes, issued_total_bytes
+    ) > int(charter["daily_cap_bytes"]):
         raise CampaignCliError("effective budget exceeds the charter daily allowance")
     run_digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
     campaign_id = f"wsdaily-{run_digest[:32]}"
@@ -1565,8 +2187,17 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
         "provider_policy_sha256": policy["document_sha256"],
         "charter_sha256": charter["document_sha256"],
         "plan_sha256": hashlib.sha256(canonical_json_bytes(plan)).hexdigest(),
-        "runtime_sha256": args.runtime_sha256,
-        "classifier_sha256": args.classifier_sha256,
+        "rollout_id": charter["rollout_id"],
+        "wave_id": charter["wave_id"],
+        "max_scopes": charter["max_scopes"],
+        "require_full_active": charter["require_full_active"],
+        "ranked_scope_ids_sha256": charter["ranked_scope_ids_sha256"],
+        "runtime_sha256": charter["runtime_sha256"],
+        "classifier_sha256": charter["classifier_sha256"],
+        "promotion_acceptance_sha256": charter["promotion_acceptance_sha256"],
+        "promotion_terminal_receipt_sha256": charter[
+            "promotion_terminal_receipt_sha256"
+        ],
         "total_provider_bytes": total_bytes,
         "effective_total_provider_bytes": issued_total_bytes,
         "daily_provider_bytes": daily_bytes,
@@ -1578,6 +2209,22 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
     try:
         ledger = _read_issuance_ledger(ledger_path, secret=ledger_secret)
         entries = list(ledger["entries"])
+        rollout_state = {
+            field: charter[field]
+            for field in (
+                "rollout_id",
+                "wave_id",
+                "max_scopes",
+                "require_full_active",
+                "cohort_sha256",
+                "ranked_scope_ids_sha256",
+                "runtime_sha256",
+                "classifier_sha256",
+                "promotion_acceptance_sha256",
+                "promotion_terminal_receipt_sha256",
+            )
+        }
+        _validate_issuance_rollout_sequence([*entries, rollout_state])
         existing = next(
             (entry for entry in entries if entry.get("run_id") == run_id), None
         )
@@ -1649,6 +2296,20 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
                     "billing_month": month,
                     "day": day,
                     "charter_sha256": charter_sha,
+                    "rollout_id": charter["rollout_id"],
+                    "wave_id": charter["wave_id"],
+                    "max_scopes": charter["max_scopes"],
+                    "require_full_active": charter["require_full_active"],
+                    "cohort_sha256": charter["cohort_sha256"],
+                    "ranked_scope_ids_sha256": charter["ranked_scope_ids_sha256"],
+                    "runtime_sha256": charter["runtime_sha256"],
+                    "classifier_sha256": charter["classifier_sha256"],
+                    "promotion_acceptance_sha256": charter[
+                        "promotion_acceptance_sha256"
+                    ],
+                    "promotion_terminal_receipt_sha256": charter[
+                        "promotion_terminal_receipt_sha256"
+                    ],
                     "total_provider_bytes": approval.caps.total_provider_bytes,
                     "approval": signed,
                     "pointer": pointer,
@@ -1682,6 +2343,8 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
             "approval_path": str(approval_path),
             "pointer_path": str(pointer_path),
             "order_id": charter["order_id"],
+            "rollout_id": charter["rollout_id"],
+            "wave_id": charter["wave_id"],
             "active_scope_count": len(plan["scope_workloads"]),
             "total_provider_bytes": approval.caps.total_provider_bytes,
             "daily_provider_bytes": approval.caps.daily_provider_bytes,
@@ -1835,6 +2498,42 @@ def build_parser() -> argparse.ArgumentParser:
     _output_arguments(template)
     template.set_defaults(handler=command_template)
 
+    create_rollout = subparsers.add_parser(
+        "create-rollout",
+        help="freeze one exact heavy-first active-catalog ranking",
+    )
+    create_rollout.add_argument("--rollout-id", required=True)
+    create_rollout.add_argument("--cohort-id", required=True)
+    create_rollout.add_argument("--runtime-sha256", required=True)
+    create_rollout.add_argument("--classifier-sha256", required=True)
+    create_rollout.add_argument(
+        "--wave-id",
+        choices=("wave-20",),
+        required=True,
+    )
+    _output_arguments(create_rollout)
+    create_rollout.set_defaults(handler=command_create_rollout)
+
+    promote_rollout = subparsers.add_parser(
+        "promote-rollout",
+        help="derive only the adjacent wave while preserving the frozen ranking",
+    )
+    promote_rollout.add_argument("--input", required=True)
+    promote_rollout.add_argument("--cohort-id", required=True)
+    promote_rollout.add_argument(
+        "--acceptance-receipt",
+        action="append",
+        required=True,
+        help="private <content-sha256>.json receipt; repeat for the exact source chain",
+    )
+    promote_rollout.add_argument(
+        "--wave-id",
+        choices=tuple(_ROLLOUT_WAVE_CONTRACTS),
+        required=True,
+    )
+    _output_arguments(promote_rollout)
+    promote_rollout.set_defaults(handler=command_promote_rollout)
+
     sign_policy = subparsers.add_parser(
         "sign-provider-policy", help="owner-sign one provider-policy-v1 document"
     )
@@ -1844,7 +2543,7 @@ def build_parser() -> argparse.ArgumentParser:
     sign_policy.set_defaults(handler=command_sign_provider_policy)
 
     sign_charter = subparsers.add_parser(
-        "sign-charter", help="owner-sign one scheduled charter-v2 document"
+        "sign-charter", help="owner-sign one scheduled rollout charter-v4 document"
     )
     sign_charter.add_argument("--input", required=True)
     _owner_secret_arguments(sign_charter)
@@ -1853,10 +2552,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     plan_daily = subparsers.add_parser(
         "plan-daily-ingest",
-        help="freeze exact catalog/workload for an ordered paid cohort",
+        help="freeze an exact heavy-first paid rollout wave",
     )
-    plan_daily.add_argument("--cohort-file", required=True)
-    plan_daily.add_argument("--max-scopes", type=int, required=True)
+    plan_daily.add_argument("--rollout-file", required=True)
     _output_arguments(plan_daily)
     plan_daily.set_defaults(handler=command_plan_daily_ingest)
 
@@ -1866,25 +2564,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     issue_daily.add_argument("--run-id", required=True)
     issue_daily.add_argument("--plan-file", required=True)
-    issue_daily.add_argument("--cohort-file", required=True)
-    issue_daily.add_argument("--max-scopes", type=int, required=True)
+    issue_daily.add_argument("--rollout-file", required=True)
     issue_daily.add_argument("--provider-policy", required=True)
     issue_daily.add_argument("--charter", required=True)
     issue_daily.add_argument("--runtime-sha256", required=True)
     issue_daily.add_argument("--classifier-sha256", required=True)
-    issue_daily.add_argument("--total-bytes", type=int, required=True)
-    issue_daily.add_argument("--daily-bytes", type=int, default=0)
     issue_daily.add_argument("--issued-at", default="")
     issue_daily.add_argument("--expires-at", default="")
-    issue_daily.add_argument(
-        "--approval-root", default=DEFAULT_APPROVAL_ROOT
-    )
+    issue_daily.add_argument("--approval-root", default=DEFAULT_APPROVAL_ROOT)
     issue_daily.add_argument(
         "--pointer-root", default=DEFAULT_SCHEDULED_PAID_POINTER_ROOT
     )
-    issue_daily.add_argument(
-        "--issuance-ledger", default=DEFAULT_ISSUANCE_LEDGER_PATH
-    )
+    issue_daily.add_argument("--issuance-ledger", default=DEFAULT_ISSUANCE_LEDGER_PATH)
     issue_daily.add_argument("--force", action="store_true")
     _secret_arguments(issue_daily)
     _owner_secret_arguments(issue_daily)

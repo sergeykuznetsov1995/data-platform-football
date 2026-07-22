@@ -72,6 +72,52 @@ Airflow orchestration, historical replay, proxy policy, DQ and recovery.
   The all-catalog plan remains fail-closed until a sustained representative
   four-worker canary proves at least 144,000 page units/day.
 
+## Formal production GO
+
+A green build, a local receipt, a manual DagRun or even a successful running
+admission report is evidence, not the production decision. For issue 954 this
+source is in production only when all of the following are true at the same
+time:
+
+- the source-derived active senior-men catalog is on parser v8/report schema 3
+  with zero unresolved classifications and strict terminal outcomes;
+- the immutable heavy-first `wave-20` -> `wave-70` -> `wave-all` rollout has two
+  consecutive scheduler-created daily runs per wave, exact empty DagRun conf,
+  and green DQ, SLO, idempotency and paid-alert evidence;
+- final running admission replays those six exact DagRuns and their TI/XCom
+  evidence from the live Airflow metadata database while all five protected
+  services are running from the admitted release;
+- raw and ops have a fresh full-read restore drill in an off-host COMPLIANCE
+  Object-Lock store, RPO/RTO are no more than 24 hours, and the live provider
+  API proves the backup bucket's versioning, Object Lock and exact retained
+  object versions. The site attestation is bound to the raw provider evidence
+  and then owner-sealed in the GO artifact; it declares distinct production and
+  backup endpoints, buckets and failure domains, but does not independently
+  prove their physical location; and
+- operational owner `sergeykuznetsov1995` acknowledges the exact final
+  admission digest in Telegram within one hour; the operator preserves this
+  manually verified acknowledgement record and the owner seals the decision
+  between 06:00 (inclusive) and 09:00 (exclusive) UTC with
+  `scripts/whoscored_go_decision.py`.
+
+For this decision, green idempotency means that each run in the consecutive
+pair independently proves the exact expected manifest, zero duplicate and
+mismatch counters, all eleven per-scope physical/current Bronze parities, and
+both profile physical/current Bronze parities. Admission recomputes that witness
+from the live run XCom; the older warm canary is context only and is not
+idempotency authority for production GO.
+
+The canonical `production-go-sealed-v1` artifact is the only GO. The helper
+validates and signs the operator-recorded Telegram metadata; it does not query
+Telegram independently, so delivery without the owner's manually verified
+acknowledgement is not GO. The 09:00-09:30 UTC
+daily issuer window is a separate recurring spend-authority operation and is
+never part of the cutover decision. Create the historical-backfill GitHub issue
+only after the signed GO artifact exists; cite its SHA-256 and rollout identity
+in that issue. Creating the issue does not authorize paid backfill: this release
+keeps paid backfill code-disabled, and any future paid execution needs its own
+reviewed release and explicit owner-approved budget.
+
 ## Before and after
 
 | Area | Before | After |
@@ -81,7 +127,7 @@ Airflow orchestration, historical replay, proxy policy, DQ and recovery.
 | Memory and write speed | Full stage history expanded into millions of Python dictionaries and one monolithic fingerprint/write, growing past 7.6 GiB in the live canary | Stage-atomic SQLite spool, streaming fingerprints and <=20k-row Iceberg chunks; the successful EPL cold/warm/incremental canary peaked at 757.22 MiB (an interrupted World Cup traversal stayed at 0.24-0.51 GiB) |
 | Missing data | Broad parser errors could become durable `not_available` | Only a typed absence plus valid source markers can become current-version `not_available`; malformed/unsupported payloads remain retryable/failed |
 | Raw S3 write | Latest-object selection and quarantine could race; no end-to-end receipt/readback contract | Append-only versioned objects, content hash, readback-before-receipt, retry, exact invalidation and LocalExecutor snapshot locks |
-| S3 recovery | Single `weed mini` process and no verified off-host restore path | Unchanged for this rollout by owner decision; single-host loss risk is explicitly accepted and the backup DAG remains paused |
+| S3 recovery | Single `weed mini` process and no verified off-host restore path | Immutable off-host raw+ops backups with explicit RPO/RTO <=24h, full read-back and a recent empty-target restore-drill proof; Iceberg/Lakekeeper recovery remains outside this source-level objective |
 | Airflow backfill | Mutable candidate selection and no durable automatic continuation | Frozen matches/profiles, integrity-checked S3 plan/receipts, bounded dynamic mapping and deterministic continuation |
 | Backfill checkpoints | Recovery materialized the cumulative receipt history and latest-state lookup grew with generations | Checkpoint v3 keeps a compact frontier snapshot plus at most 63 bounded deltas, a <=64 KiB index, and a 12-level radix lookup; full receipts are materialized only for terminal DQ/recovery |
 | Backfill capacity | Every match was charged for a preview and the configured requests/day value could exceed neither a throttle nor a proven source ceiling | Policy v6 charges exact match plus frozen preview identities; the hard ceiling is always `source slots * 30 * 1,440` (86,400..172,800), reports observed wall-clock throughput, and stops before the next source batch on breach |
@@ -243,9 +289,9 @@ wrapper deliberately blocks every writer-start command until a one-time,
 quiesced isolation rollout replaces that container around the same external
 volume and creates the private S3 gateway plus digest-pinned HTTP proxy. This is
 not the four-plane cutover: no data migration or topology-state file is created.
-Off-host backup/WORM and the four-plane cutover remain outside the approved
-scope, so loss of this one host can still lose raw and Iceberg data;
-`dag_backup_whoscored_storage` remains paused.
+The four-plane cutover remains outside this source rollout. Raw and WhoScored
+ops data are protected by the mandatory off-host backup contract below; Iceberg
+metadata and the queryable platform still retain single-host recovery risk.
 
 If `scripts/compose.sh` reports an old `/entrypoint.sh` mini identity, obtain a
 full-platform downtime approval and run this exact one-time rollout before the
@@ -1320,19 +1366,23 @@ Docker-authorized attacker.
 
 The issuer runs outside Airflow. Its planner gets the scheduler image, data
 environment and `dp-backend`, but no signing key. Its signer gets the exact
-admitted proxy image, frozen plan, exact read-only cohort, three credentials and
-no network. The signer independently canonicalizes the cohort, re-derives its
-SHA-256 and requires the schema-v2 plan workloads to equal the ordered cohort
-prefix selected by the root wrapper's fixed `--max-scopes`; planner-declared
-selection identity is never authority. Before either container
-runs, the wrapper repeats schema-v2 running admission for all five protected
-services and checks the active signed policy against the deploy-time admission
+admitted proxy image, frozen schema-v3 daily plan, exact read-only schema-v3
+rollout manifest, its owner-signed charter-v4, three credentials and no network.
+The signer independently canonicalizes the rollout, re-derives its cohort
+SHA-256 and requires plan workloads to equal the ordered prefix selected by the
+manifest's code-owned wave contract; planner-declared selection identity is
+never authority. Before either container runs, the wrapper repeats running
+admission for all five protected services, requests live predecessor-receipt and
+metadata-DB/XCom replay with `--issuance-rollout-id` for the exact active rollout,
+and requires the
+returned release/promotion authority to equal the active rollout/charter pair.
+It also checks the active signed policy against the deploy-time admission
 receipt. Provider screenshot freshness is a deploy/new-policy gate; the daily
 timer intentionally does not require a new screenshot every 24 hours.
 
 Use the exact immutable release directory, never a `current` symlink. Keep the
 three Compose env files, both overrides, deployment attestation, rendered
-admission receipt, cohort, policy, charter and planner env root-owned mode
+admission receipt, rollout manifest, policy, charter and planner env root-owned mode
 `0600`. The planner always writes into a fresh UID-50000 subdirectory beneath
 systemd's root-only `RuntimeDirectory`; the wrapper freezes that exact plan as
 root-owned `0440`, removes the writable copy, and gives only the frozen bind to
@@ -1371,8 +1421,11 @@ This happens before writing the issuance ledger, approval or pointer.
 Install `whoscored-approval-hmac`, `whoscored-owner-hmac` and
 `whoscored-issuance-ledger-hmac` under `/etc/data-platform/credentials` as
 root-owned mode `0400`. The planner env must not contain any of those three key
-names. During 09:00–09:30 UTC, run one manual smoke and inspect the exact
-service journal. Only then enable the non-persistent 09:15 UTC timer:
+names. Production cutover and the signed GO decision happen only during
+06:00–09:00 UTC. After that distinct decision window, during 09:00–09:30 UTC,
+run one manual issuer smoke and inspect the exact service journal. This proves
+the recurring daily authority path; it cannot retroactively create GO. Only
+then enable the non-persistent 09:15 UTC timer:
 
 ```bash
 /usr/bin/systemctl start whoscored-daily-issuer.service
@@ -1408,6 +1461,8 @@ docker exec airflow-scheduler bash -euc '
     "WhoScored bounded direct-only source concurrency"
   airflow pools set "$WHOSCORED_DQ_POOL" 2 \
     "WhoScored bounded Iceberg data-quality queries"
+  airflow pools set whoscored_storage_pool 1 \
+    "WhoScored serialized backup and restore verification"
 '
 ```
 
@@ -1415,12 +1470,13 @@ Confirm `AIRFLOW__CORE__EXECUTOR=LocalExecutor`, then restart the scheduler so
 it loads the new DAG and environment. A missing pool is a deployment failure,
 not a reason to increase task-level parallelism.
 
-Keep daily ingest paused until its first manual acceptance run passes. The
-backup DAG stays paused under the accepted storage decision. Then enable only
-the daily schedule:
+Keep daily ingest paused until its first manual acceptance run passes. Keep the
+backup DAG paused until the raw+ops bootstrap backup, empty-target restore drill
+and exact evidence gate below pass. Then enable each accepted schedule:
 
 ```bash
 docker exec airflow-scheduler airflow dags unpause dag_ingest_whoscored
+docker exec airflow-scheduler airflow dags unpause dag_backup_whoscored_storage
 ```
 
 `dag_backfill_whoscored` and `dag_canary_whoscored_proxy` intentionally have no
@@ -1428,18 +1484,51 @@ schedule and remain paused manual/continuation-only DAGs. Verify all WhoScored
 pause states and the next-run timestamps in the Airflow UI or
 `airflow dags list` after the scheduler heartbeat.
 
-## Storage scope
+## Raw+ops backup and recovery contract
 
 Do not run the four-plane SeaweedFS cutover playbook during this source rollout.
-The one-time quiesced isolation rollout above is a deployment prerequisite for
-an old mini identity; after it succeeds, do not recreate the storage boundary
-during the targeted Airflow/proxy update. Verify the exact live runtime through
-the wrapper and a Trino read before and after. Backup/cutover tools remain
-code-owned disabled for a separately approved resilience project.
+The one-time quiesced isolation rollout above remains a separate deployment
+prerequisite. This section protects only the admitted source-owned prefixes:
 
-For that future project only, keep the versioned recovery command contract
-below. It is not a gate or an authorization to enable backup in this rollout.
-An operator first lists and authenticates an exact immutable inventory key:
+- `s3://${ICEBERG_WAREHOUSE}/raw/whoscored`;
+- `s3://${ICEBERG_WAREHOUSE}/ops/whoscored`.
+
+Production admission fixes both `WHOSCORED_BACKUP_RPO_HOURS` and
+`WHOSCORED_BACKUP_RTO_HOURS` at `24`. It also derives the two source URIs from
+the admitted physical `ICEBERG_WAREHOUSE` bucket; an independently supplied
+bucket or prefix fails admission. The live bucket is `football`, so production
+must render `s3://football/raw/whoscored` and
+`s3://football/ops/whoscored`.
+
+RPO is measured conservatively from each inventory's `snapshot_started_at`, not
+from marker publication. The backup DAG runs at 03:00 and 15:00 UTC, must start
+within 15 minutes and has a 10-hour DagRun deadline. Both raw and ops inventories
+must be non-empty and marker-verified. This produces a recovery-point attempt
+every 12 hours with two hours of headroom inside the 24-hour RPO. RTO means the
+complete two-prefix restore and exact-tree read-back finish within 24 hours.
+This objective does not claim recovery of Iceberg metadata, Lakekeeper, Trino
+views or a Bronze-ready platform. Those need a separate platform backup or a
+measured raw-to-Bronze rebuild objective.
+
+Provision a destination with a different S3 endpoint and bucket and with bucket
+versioning plus default **COMPLIANCE Object Lock** enabled. A configured
+`site_id`, the `object-lock` environment label, versioning by itself, or
+GOVERNANCE mode is not evidence of immutability or a physical failure domain.
+The CLI queries the provider control API and fails closed unless versioning and
+Object Lock are enabled; it also HEAD-checks the exact version and COMPLIANCE
+`retain-until` (at least 24 hours remaining) of every referenced content
+object, inventory marker and restore receipt. Independent infrastructure
+evidence is mandatory: retain the provider account/region/site contract or
+console export as a protected file and put its raw SHA-256 in the off-host site
+attestation. That field is owner-attested evidence, not a claim that the
+provider cryptographically signed it. The final GO helper reads that exact
+protected file, checks its raw SHA-256, binds the complete site attestation by
+SHA-256 and rejects identical production and backup endpoint identities,
+buckets or failure domains. Before the first
+scheduled backup, use the same admitted image and CLI to inventory, copy and
+verify both source prefixes. Keep the DAG paused during this bootstrap. Then
+list and authenticate the exact immutable inventory marker for each source;
+never select an inferred `latest` marker:
 
 ```bash
 "$RELEASE/scripts/compose.sh" --env-file "$COMPOSE_ENV_FILE" \
@@ -1448,41 +1537,218 @@ An operator first lists and authenticates an exact immutable inventory key:
     python /opt/airflow/scripts/whoscored_raw_backup.py list-inventories \
       --store-uri "$WHOSCORED_BACKUP_DESTINATION_URI" \
       --expected-source-uri "$WHOSCORED_RAW_STORE_URI" --limit 20
+    python /opt/airflow/scripts/whoscored_raw_backup.py list-inventories \
+      --store-uri "$WHOSCORED_BACKUP_DESTINATION_URI" \
+      --expected-source-uri "$WHOSCORED_OPS_STORE_URI" --limit 20
   '
 ```
 
-Restore is allowed only to an approved empty target and only from the exact
-selected key; never infer a latest marker or restore over an existing prefix:
+Restore both explicitly selected markers with the reviewed one-shot command;
+do not hand-build the evidence JSON from separate command output. Each target
+must be an approved empty S3 prefix distinct from both production prefixes,
+the off-host backup root and the other target:
 
 ```bash
-export RECOVERY_TARGET_URI=s3://approved-empty-recovery-bucket/whoscored
-export RECOVERY_EXPECTED_SOURCE_URI=s3://original-bucket/raw/whoscored
-export RECOVERY_INVENTORY_KEY=backup-inventories/EXACT_APPROVED_KEY.json
+export RAW_RECOVERY_TARGET_URI=s3://approved-empty-recovery-raw/whoscored
+export OPS_RECOVERY_TARGET_URI=s3://approved-empty-recovery-ops/whoscored
+export RAW_RECOVERY_INVENTORY_KEY=backup-inventories/EXACT_RAW_KEY.json
+export OPS_RECOVERY_INVENTORY_KEY=backup-inventories/EXACT_OPS_KEY.json
 "$RELEASE/scripts/compose.sh" --env-file "$COMPOSE_ENV_FILE" \
   --env-file "$PROXY_POOL_ENV_FILE" run --rm --no-deps \
-  --entrypoint bash -e RECOVERY_TARGET_URI -e RECOVERY_EXPECTED_SOURCE_URI \
-  -e RECOVERY_INVENTORY_KEY airflow-scheduler -euc '
-    RECOVERY_INVENTORY=/tmp/whoscored-recovery-inventory.json
-    python /opt/airflow/scripts/whoscored_raw_backup.py fetch-inventory \
-      --store-uri "$WHOSCORED_BACKUP_DESTINATION_URI" \
-      --inventory-key "$RECOVERY_INVENTORY_KEY" \
-      --expected-source-uri "$RECOVERY_EXPECTED_SOURCE_URI" \
-      --output "$RECOVERY_INVENTORY"
-    python /opt/airflow/scripts/whoscored_raw_backup.py restore \
+  --entrypoint bash \
+  -e RAW_RECOVERY_TARGET_URI -e OPS_RECOVERY_TARGET_URI \
+  -e RAW_RECOVERY_INVENTORY_KEY -e OPS_RECOVERY_INVENTORY_KEY \
+  airflow-scheduler -euc '
+    python /opt/airflow/scripts/whoscored_raw_backup.py restore-drill \
       --backup-uri "$WHOSCORED_BACKUP_DESTINATION_URI" \
-      --restore-uri "$RECOVERY_TARGET_URI" \
-      --inventory "$RECOVERY_INVENTORY" --apply --create-bucket
-    python /opt/airflow/scripts/whoscored_raw_backup.py verify-restore \
-      --store-uri "$RECOVERY_TARGET_URI" \
-      --inventory "$RECOVERY_INVENTORY"
+      --raw-source-uri "$WHOSCORED_RAW_STORE_URI" \
+      --raw-inventory-key "$RAW_RECOVERY_INVENTORY_KEY" \
+      --raw-restore-uri "$RAW_RECOVERY_TARGET_URI" \
+      --ops-source-uri "$WHOSCORED_OPS_STORE_URI" \
+      --ops-inventory-key "$OPS_RECOVERY_INVENTORY_KEY" \
+      --ops-restore-uri "$OPS_RECOVERY_TARGET_URI" \
+      --evidence-output "$WHOSCORED_BACKUP_RESTORE_DRILL_EVIDENCE_PATH" \
+      --workers "$WHOSCORED_BACKUP_WORKERS" --apply --create-buckets
   '
 ```
 
-Current rollout enforcement is the opposite: keep the deferred DAG paused.
+The command authenticates both exact inventory markers, reads every referenced
+off-host object, holds each target's restore lock while proving it is empty,
+restores and verifies every path, then takes a second full inventory. It emits
+evidence only if count, bytes and ordered object-tree SHA-256 are exact for both
+prefixes. Before atomically renewing the local mode-`0600` projection, it writes
+the schema-v2 proof under its SHA-256-derived
+`restore-drill-receipts/v2/...` key in the off-host WORM destination and reads
+it back. The DAG and production admission re-read that exact remote receipt;
+a locally authored or altered JSON file cannot satisfy the gate. Final
+production admission additionally refetches both exact inventory markers,
+reads and hashes every referenced backup object, and repeats the live provider
+versioning/Object-Lock/HEAD checks for all content objects, both markers and the
+receipt. Deleting an object after a successful drill therefore blocks GO.
+
+The DAG rejects non-canonical/unlinked/non-`0600` evidence, an absent or
+different content-addressed off-host receipt, evidence older than 24 hours, a
+drill longer than 24 hours, evidence from any parser/manifest/code
+tree other than the current canonical runtime, a stale inventory, a source URI
+mismatch, an absent or invalid completion marker, missing/corrupt objects, an
+existing restore target, partial/extraneous target tree, empty production prefix
+or omission of either raw or ops. During bootstrap, keep it paused on any
+failure. After the gate passes, enable the twice-daily serialized DAG:
 
 ```bash
-docker exec airflow-scheduler airflow dags pause dag_backup_whoscored_storage
+docker exec airflow-scheduler airflow dags unpause dag_backup_whoscored_storage
 ```
+
+Before any production GO or historical-backfill authorization, rerun
+`whoscored_production_admission.py verify-running` with
+`--rollout-id <exact-current-signed-rollout-id>` in addition to its normal
+attestation, override, environment, provider-policy, receipt and service
+arguments. The option performs no write and never resolves `latest`: it replays
+that rollout's exact content-addressed ops prefix inside the already admitted
+scheduler. Before the probe starts, admission reads only the fixed active
+root-owned pair
+`/var/lib/data-platform/whoscored-authority/rollout.json` and
+`/var/lib/data-platform/whoscored-authority/charter.json`; it validates the
+final wave-all manifest, heavy-first cohort, owner HMAC, active provider-policy
+window and every charter release/promotion binding. An archived path cannot be
+supplied on the command line. It then checks all accepted wave witnesses
+against the current Airflow DB and accepts only when the same
+parser/manifest/code tree also owns the current raw+ops restore drill. The DB
+replay requires exactly six distinct scheduled
+DagRuns (two for each cumulative wave), all still terminal `success`, in strict
+chronological order at `10:00 UTC`. The two runs within each wave must be on
+consecutive daily schedules; an operator promotion gap between waves is valid.
+Every TaskInstance-state hash, every mapped `validate_active_scope` XCom and
+the exact singleton return XComs from runtime preflight, frozen scope plan,
+catalog/profile/traffic DQ, daily SLO and paid-alert preflight must still
+reproduce the immutable receipt's normalized scope-plan and full-evidence
+digests. The final accepted run must also be the newest scheduler-created
+DagRun of any state: a newer queued/running run, failure, or success whose
+callback has not sealed its receipt fails closed. Production GO—and, after that
+GO, any separate backfill authorization—is deliberately unavailable while the
+next daily run is active. This
+same fresh replay is reused by any later backfill authorization; it does not
+make backfill part of the production activation decision. The
+probe reads each exact metadata-DB
+`DagRun.end_date`; the final
+accepted run must have completed no more than 36 hours ago (with at most five
+minutes of forward clock skew). Freshness is intentionally measured from
+completion, not `logical_date`, because Airflow's daily logical date is the
+start of the data interval and normally precedes execution by one day. The
+result's `authority_binding=current-signed-rollout` records that admission
+itself matched the receipt authority, catalog universe and runtime tree to that
+active signed pair. An older accepted rollout ID is not a GO.
+
+### Seal the owner decision
+
+Run this ceremony only in the 06:00-09:00 UTC cutover window. First write a
+fresh final admission report from the exact protected release; do not reuse the
+issuer's narrower predecessor check:
+
+```bash
+export WHOSCORED_ROLLOUT_ID=production-YYYY-MM
+export WHOSCORED_DEPLOYMENT_ADMISSION_RECEIPT="$WHOSCORED_ADMISSION_DIR/rendered-receipt.json"
+export WHOSCORED_FINAL_ADMISSION="$WHOSCORED_ADMISSION_DIR/final-running-admission.json"
+test ! -e "$WHOSCORED_FINAL_ADMISSION"
+
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_production_admission.py" verify-running \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --common-override "$WHOSCORED_COMMON_DIGEST_OVERRIDE" \
+  --gateway-override "$WHOSCORED_GATEWAY_DIGEST_OVERRIDE" \
+  --env-file "$COMPOSE_ENV_FILE" \
+  --env-file "$WHOSCORED_ENV_FILE" \
+  --env-file "$PROXY_POOL_ENV_FILE" \
+  --provider-policy "$WHOSCORED_PROVIDER_POLICY" \
+  --owner-secret-file "$WHOSCORED_OWNER_SECRET" \
+  --deployment-admission-receipt "$WHOSCORED_DEPLOYMENT_ADMISSION_RECEIPT" \
+  --rollout-id "$WHOSCORED_ROLLOUT_ID" \
+  --service airflow-scheduler \
+  --service flaresolverr \
+  --service flaresolverr_whoscored_paid \
+  --service whoscored_paid_gateway \
+  --service whoscored_proxy_filter \
+  > "$WHOSCORED_FINAL_ADMISSION"
+test "$(/usr/bin/jq -er '.status' "$WHOSCORED_FINAL_ADMISSION")" = admitted-running-v1
+export WHOSCORED_FINAL_ADMISSION_SHA256="$(/usr/bin/sha256sum "$WHOSCORED_FINAL_ADMISSION" | /usr/bin/cut -d ' ' -f 1)"
+```
+
+Keep the independent provider account/region/site contract or console export as
+a non-empty root-owned mode-`0400` or `0600` regular file in this admission
+directory (maximum 16 MiB). Create a canonical, root-owned mode-`0600`
+`off-host-site-attestation.json` with exactly these fields (replace every
+example value):
+
+```json
+{"attestation_type":"off-host-backup-site","backup_bucket":"whoscored-off-host","backup_endpoint_sha256":"<sha256-of-canonical-backup-endpoint>","backup_failure_domain":"provider-eu-central-1","operational_owner":"sergeykuznetsov1995","production_bucket":"football","production_endpoint_sha256":"<sha256-of-canonical-production-endpoint>","production_failure_domain":"production-host-berlin","provider_evidence_sha256":"<raw-sha256-of-retained-provider-evidence>","schema_version":1,"source":"whoscored","valid_from":"YYYY-MM-DDTHH:MM:SSZ","valid_until":"YYYY-MM-DDTHH:MM:SSZ"}
+```
+
+Canonical means UTF-8, keys sorted, compact separators and one trailing newline;
+`jq -cS .` produces that representation. The validity interval may be at most
+366 days. The buckets must equal the final admission, while endpoint hashes and
+failure-domain IDs must differ. The site document is a manual owner
+attestation; its referenced provider evidence is nevertheless read and
+hash-checked by the GO helper.
+
+Send `WHOSCORED_FINAL_ADMISSION_SHA256`, the rollout ID and the final wave
+receipt digest to `sergeykuznetsov1995` in Telegram. Manually verify and retain
+the conversation/export under the incident's access controls; record the
+platform's message ID and delivery time. Delivery alone is not acceptance:
+record the owner's explicit acknowledgement no more than 60 minutes later. The
+helper validates these operator-recorded fields and owner-signs them but does
+not call Telegram. Then create a canonical mode-`0600` unsigned decision with
+exactly these fields:
+
+```json
+{"acked_at":"YYYY-MM-DDTHH:MM:SSZ","acked_by":"sergeykuznetsov1995","admission_report_sha256":"<WHOSCORED_FINAL_ADMISSION_SHA256>","backup_restore_receipt_sha256":"<from-final-admission>","channel":"telegram","charter_sha256":"<from-final-admission>","decision":"GO","decision_at":"YYYY-MM-DDTHH:MM:SSZ","delivered_at":"YYYY-MM-DDTHH:MM:SSZ","final_wave_receipt_sha256":"<from-final-admission>","message_id":"<telegram-message-id>","off_host_site_attestation_sha256":"<raw-site-attestation-sha256>","operational_owner":"sergeykuznetsov1995","provider_policy_sha256":"<from-final-admission>","rollout_id":"<exact-rollout-id>","rollout_manifest_sha256":"<from-final-admission>","schema_version":1,"signature_algorithm":"hmac-sha256","source":"whoscored"}
+```
+
+The helper independently extracts and compares every authority digest, checks
+the five-service boundary, final accepted scheduled run, live WORM result,
+restore freshness, site identity, file protection, ordering and time windows,
+then creates the output once as mode `0600` and fsyncs it:
+
+```bash
+export WHOSCORED_SITE_ATTESTATION="$WHOSCORED_ADMISSION_DIR/off-host-site-attestation.json"
+export WHOSCORED_PROVIDER_SITE_EVIDENCE="$WHOSCORED_ADMISSION_DIR/provider-site-evidence"
+export WHOSCORED_UNSIGNED_GO="$WHOSCORED_ADMISSION_DIR/unsigned-go.json"
+export WHOSCORED_GO_ARTIFACT="$WHOSCORED_ADMISSION_DIR/production-go.json"
+test ! -e "$WHOSCORED_GO_ARTIFACT"
+
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_go_decision.py" \
+  --admission-report "$WHOSCORED_FINAL_ADMISSION" \
+  --decision-input "$WHOSCORED_UNSIGNED_GO" \
+  --off-host-site-attestation "$WHOSCORED_SITE_ATTESTATION" \
+  --provider-site-evidence "$WHOSCORED_PROVIDER_SITE_EVIDENCE" \
+  --owner-secret-file "$WHOSCORED_OWNER_SECRET" \
+  --output "$WHOSCORED_GO_ARTIFACT" \
+  | /usr/bin/tee "$WHOSCORED_ADMISSION_DIR/production-go-result.json"
+test "$(/usr/bin/jq -er '.status' "$WHOSCORED_ADMISSION_DIR/production-go-result.json")" = production-go-sealed-v1
+/usr/bin/sha256sum "$WHOSCORED_GO_ARTIFACT"
+```
+
+An absent artifact, a blocked helper, or an artifact from an older admission is
+NO-GO. Only after this command succeeds may the backfill planning issue be
+created; attach the raw artifact SHA-256, its internal `document_sha256`, the
+rollout ID and links to the six accepted scheduled runs. Do not attach the HMAC
+secret or provider credentials.
+
+The scheduled DAG keeps its start/SLO gate upstream of copy, but evaluates the
+restore drill on a separate terminal branch. A stale or failed RTO proof still
+makes the DagRun fail and blocks GO, while inventory/copy/read-back continues to
+refresh the raw+ops recovery point. Do not disable a healthy immutable-copy path
+only because drill evidence expired.
+
+Monitor `snapshot_started_at` inside the newest valid raw and ops inventory
+markers. An age above 24 hours, failed copy/read-back or failed restore-drill
+gate is a resilience incident: preserve all inventories/evidence and repair the
+affected path before authorizing backfill. Pause backup writes only if their
+destination identity, immutability or retention is unsafe. Rehearse the same
+two-prefix empty-target restore before production GO, at least once every 24
+hours while the production gate is active, and whenever the destination,
+credentials, retention policy, source bucket or admitted release changes.
 
 ## Canary and full backfill
 
@@ -1763,13 +2029,24 @@ not a frozen all-catalog population.
 
 Do **not** trigger the all-catalog crawl at two slots. First pass the sustained
 four-worker non-publishing capacity canary, promote the real Airflow pool to
-four, and complete one manual plus one scheduled daily run. The paid-proxy
+four, and complete one preliminary manual plus one scheduled daily run. Those
+two preliminary runs prove capacity plumbing only; they do not replace the six
+scheduler-created wave-acceptance runs in the formal GO contract. The paid-proxy
 measurement is a separate gate described in
 `docs/operations/whoscored-proxy-campaign.md`: run only its exact signed canary;
 the referenced 1 GB is the provider-order quota, while the executable
 provider-order lifetime hard cap remains exactly `300000000` decimal bytes.
-Persist the immutable p95 evidence before any separate cap review. That canary
-does not authorize the full crawl.
+Persist the immutable billed-byte p95 evidence before any separate purchase or
+cap review. Pin its measurement window/horizon, ordered receipt digests,
+provider counter, `order_id`, decimal-byte unit and p95 algorithm. The only
+forecast accepted by that later review is
+`forecast_bytes = ceil(p95_billed_bytes * 1.25)`, rounded upward to an integer
+decimal byte. A new reviewed release must keep every executable cap at or below
+that explicitly owner-signed forecast and all lower policy/charter limits.
+Neither this canary, a larger provider quota nor the current signed GO artifact
+authorizes the purchase or widening. This release intentionally has no widening
+CLI/schema; the formula is the acceptance contract that a future change must
+implement and test before its separate review and rebuild.
 
 The separately reviewed production crawl must remain `direct_only` in this
 release. If paid fallback is still required, stop: the full-crawl sentinel is
@@ -1807,9 +2084,11 @@ non-publishing live-source canary pass. Record exact test counts, discovery and
 smoke report paths and batch IDs, DQ/Trino count summary, sustained-canary
 artifact and post-run storage/proxy invariants. The repository-wide suite
 contains unrelated live/browser checks and is not a substitute for this
-deterministic source contract. Storage topology and off-host backup are
-explicitly excluded from this acceptance; the 30-day historical crawl remains
-deployment evidence and cannot be replaced by tests.
+deterministic source contract. The four-plane storage topology remains outside
+this source acceptance, but the raw+ops off-host RPO/RTO and restore-drill gate
+above are mandatory. The 30-day historical crawl is post-GO backfill completion
+evidence, not a production-activation criterion, and cannot be replaced by
+tests.
 
 ### Implementation evidence recorded 2026-07-14
 
@@ -1856,12 +2135,14 @@ deployment evidence and cannot be replaced by tests.
   attempts, transferred 47.897 MiB and used zero paid-proxy bytes. This is
   negative failure-handling evidence, not a successful canary.
 
-The parser-v8 runtime preflight, full-history production discovery and
-active-scope write-smoke/DQ are now complete. Activation still requires a green
-sustained four-worker throughput canary, promotion of the real pool to four,
-one green manual and scheduled Airflow daily DagRun, and then completion of the
-frozen all-catalog plan within its 30-day deadline. Storage migration is not
-part of this activation.
+As of the 2026-07-14 evidence below, parser-v8 runtime preflight, full-history
+production discovery and active-scope write-smoke/DQ were complete, but the
+source remained NO-GO. Activation still requires the sustained four-worker
+throughput canary, pool promotion, the current three-wave/six-scheduled-run
+acceptance, live five-service admission, off-host raw+ops recovery proof and the
+owner-sealed GO artifact defined above. Only after that GO may the separate
+frozen all-catalog backfill be planned and run against its 30-day deadline. The
+four-plane storage migration is not part of this source activation.
 
 ### Runtime activation audit recorded 2026-07-14
 

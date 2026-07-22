@@ -24,6 +24,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
@@ -65,7 +66,39 @@ SCHEDULED_SCOPE_PLAYER_ADDITIONAL_PAGES_PER_FEED = 99
 SCHEDULED_SCOPE_PLAYER_PAGINATION_TARGET_LIMIT_ENV = (
     "WHOSCORED_PLAYER_PAGINATION_TARGET_LIMIT"
 )
-WHOSCORED_CHARTER_SCHEMA_VERSION = 2
+WHOSCORED_CHARTER_SCHEMA_VERSION = 4
+WHOSCORED_ROLLOUT_MANIFEST_SCHEMA_VERSION = 3
+WHOSCORED_DAILY_PLAN_SCHEMA_VERSION = 3
+WHOSCORED_DAILY_ACTIVE_SCOPE_CEILING = 2_000
+WHOSCORED_DAILY_PROVIDER_SAFETY_CAP_BYTES = 300_000_000
+WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256 = hashlib.sha256(
+    b"whoscored-rollout-promotion-genesis-v1"
+).hexdigest()
+WHOSCORED_ROLLOUT_WAVE_CONTRACTS = MappingProxyType(
+    {
+        "wave-20": (20, False),
+        "wave-70": (70, False),
+        "wave-all": (WHOSCORED_DAILY_ACTIVE_SCOPE_CEILING, True),
+    }
+)
+WHOSCORED_ROLLOUT_MANIFEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "cohort_id",
+        "rollout_id",
+        "wave_id",
+        "max_scopes",
+        "require_full_active",
+        "ranked_scope_ids",
+        "ranked_scope_ids_sha256",
+        "ranking_basis_workload_sha256",
+        "ranking_basis_scope_workloads",
+        "runtime_sha256",
+        "classifier_sha256",
+        "promotion_acceptance_sha256",
+        "promotion_terminal_receipt_sha256",
+    }
+)
 WHOSCORED_PROVIDER_POLICY_UNSIGNED_FIELDS = frozenset(
     {
         "schema_version",
@@ -93,6 +126,15 @@ WHOSCORED_CHARTER_UNSIGNED_FIELDS = frozenset(
         "billing_month",
         "cohort_id",
         "cohort_sha256",
+        "rollout_id",
+        "wave_id",
+        "max_scopes",
+        "require_full_active",
+        "ranked_scope_ids_sha256",
+        "runtime_sha256",
+        "classifier_sha256",
+        "promotion_acceptance_sha256",
+        "promotion_terminal_receipt_sha256",
         "valid_from",
         "valid_until",
         "daily_cap_bytes",
@@ -357,8 +399,20 @@ _SCHEDULED_AUTHORITY_FIELDS = frozenset(
         "billing_month",
         "cohort_id",
         "cohort_sha256",
+        "rollout_id",
+        "wave_id",
+        "max_scopes",
+        "require_full_active",
         "catalog_batch_id",
         "catalog_payload_sha256",
+        "catalog_active_scope_count",
+        "catalog_active_scopes_sha256",
+        "ranked_scope_ids_sha256",
+        "ranked_workload_sha256",
+        "runtime_sha256",
+        "classifier_sha256",
+        "promotion_acceptance_sha256",
+        "promotion_terminal_receipt_sha256",
         "workload_sha256",
         "scope_workloads",
         "discovery_parent_target_count",
@@ -649,8 +703,7 @@ def verify_whoscored_provider_policy(
     if (
         policy.get("schema_version") != WHOSCORED_PROVIDER_POLICY_SCHEMA_VERSION
         or policy.get("source") != PROXY_CAMPAIGN_SOURCE
-        or policy.get("signature_algorithm")
-        != PROXY_CAMPAIGN_SIGNATURE_ALGORITHM
+        or policy.get("signature_algorithm") != PROXY_CAMPAIGN_SIGNATURE_ALGORITHM
     ):
         raise ProxyCampaignValidationError("provider policy identity is invalid")
     _token(policy.get("provider_id"), "provider_policy.provider_id")
@@ -669,7 +722,9 @@ def verify_whoscored_provider_policy(
         policy.get("monthly_cap_bytes"), "provider_policy.monthly_cap_bytes"
     )
     order = _integer(policy.get("order_cap_bytes"), "provider_policy.order_cap_bytes")
-    safety = _integer(policy.get("safety_cap_bytes"), "provider_policy.safety_cap_bytes")
+    safety = _integer(
+        policy.get("safety_cap_bytes"), "provider_policy.safety_cap_bytes"
+    )
     quota = _integer(
         policy.get("provider_quota_bytes"), "provider_policy.provider_quota_bytes"
     )
@@ -946,13 +1001,15 @@ class ScheduledScopeWorkload:
     @classmethod
     def from_dict(cls, value: object) -> "ScheduledScopeWorkload":
         if not isinstance(value, Mapping):
-            raise ProxyCampaignValidationError("scheduled scope workload must be an object")
+            raise ProxyCampaignValidationError(
+                "scheduled scope workload must be an object"
+            )
         _strict_fields(value, _SCOPE_WORKLOAD_FIELDS, "scheduled scope workload")
         scope = _identity(value.get("scope"), "scope_workloads[].scope")
-        expected_work_item = "scope-" + hashlib.sha256(scope.encode("utf-8")).hexdigest()
-        work_item = _token(
-            value.get("work_item_id"), "scope_workloads[].work_item_id"
+        expected_work_item = (
+            "scope-" + hashlib.sha256(scope.encode("utf-8")).hexdigest()
         )
+        work_item = _token(value.get("work_item_id"), "scope_workloads[].work_item_id")
         if work_item != expected_work_item:
             raise ProxyCampaignValidationError(
                 "scheduled scope workload work_item_id is not content-derived"
@@ -1034,7 +1091,7 @@ class ScheduledScopeWorkload:
 
 @dataclass(frozen=True)
 class ScheduledProxyAuthority:
-    """Owner-approved order/cohort envelope carried by a schema-v3 approval."""
+    """Owner-approved order/rollout envelope carried by a schema-v3 approval."""
 
     provider_policy_sha256: str
     charter_sha256: str
@@ -1043,8 +1100,20 @@ class ScheduledProxyAuthority:
     billing_month: str
     cohort_id: str
     cohort_sha256: str
+    rollout_id: str
+    wave_id: str
+    max_scopes: int
+    require_full_active: bool
     catalog_batch_id: str
     catalog_payload_sha256: str
+    catalog_active_scope_count: int
+    catalog_active_scopes_sha256: str
+    ranked_scope_ids_sha256: str
+    ranked_workload_sha256: str
+    runtime_sha256: str
+    classifier_sha256: str
+    promotion_acceptance_sha256: str
+    promotion_terminal_receipt_sha256: str
     workload_sha256: str
     scope_workloads: tuple[ScheduledScopeWorkload, ...]
     discovery_parent_target_count: int
@@ -1067,7 +1136,9 @@ class ScheduledProxyAuthority:
             raise ProxyCampaignValidationError(
                 "scheduled_authority.scope_workloads must be non-empty"
             )
-        workloads = tuple(ScheduledScopeWorkload.from_dict(item) for item in raw_workloads)
+        workloads = tuple(
+            ScheduledScopeWorkload.from_dict(item) for item in raw_workloads
+        )
         scopes = tuple(item.scope for item in workloads)
         if len(scopes) != len(set(scopes)):
             raise ProxyCampaignValidationError(
@@ -1105,6 +1176,14 @@ class ScheduledProxyAuthority:
             cohort_sha256=_digest(
                 value.get("cohort_sha256"), "scheduled_authority.cohort_sha256"
             ),
+            rollout_id=_token(
+                value.get("rollout_id"), "scheduled_authority.rollout_id"
+            ),
+            wave_id=_token(value.get("wave_id"), "scheduled_authority.wave_id"),
+            max_scopes=_integer(
+                value.get("max_scopes"), "scheduled_authority.max_scopes"
+            ),
+            require_full_active=value.get("require_full_active"),
             catalog_batch_id=_token(
                 value.get("catalog_batch_id"),
                 "scheduled_authority.catalog_batch_id",
@@ -1112,6 +1191,38 @@ class ScheduledProxyAuthority:
             catalog_payload_sha256=_digest(
                 value.get("catalog_payload_sha256"),
                 "scheduled_authority.catalog_payload_sha256",
+            ),
+            catalog_active_scope_count=_integer(
+                value.get("catalog_active_scope_count"),
+                "scheduled_authority.catalog_active_scope_count",
+            ),
+            catalog_active_scopes_sha256=_digest(
+                value.get("catalog_active_scopes_sha256"),
+                "scheduled_authority.catalog_active_scopes_sha256",
+            ),
+            ranked_scope_ids_sha256=_digest(
+                value.get("ranked_scope_ids_sha256"),
+                "scheduled_authority.ranked_scope_ids_sha256",
+            ),
+            ranked_workload_sha256=_digest(
+                value.get("ranked_workload_sha256"),
+                "scheduled_authority.ranked_workload_sha256",
+            ),
+            runtime_sha256=_digest(
+                value.get("runtime_sha256"),
+                "scheduled_authority.runtime_sha256",
+            ),
+            classifier_sha256=_digest(
+                value.get("classifier_sha256"),
+                "scheduled_authority.classifier_sha256",
+            ),
+            promotion_acceptance_sha256=_digest(
+                value.get("promotion_acceptance_sha256"),
+                "scheduled_authority.promotion_acceptance_sha256",
+            ),
+            promotion_terminal_receipt_sha256=_digest(
+                value.get("promotion_terminal_receipt_sha256"),
+                "scheduled_authority.promotion_terminal_receipt_sha256",
             ),
             workload_sha256=workload_sha256,
             scope_workloads=workloads,
@@ -1153,13 +1264,65 @@ class ScheduledProxyAuthority:
             ),
         )
         if not (
-            result.daily_cap_bytes
-            <= result.monthly_cap_bytes
-            <= result.order_cap_bytes
+            result.daily_cap_bytes <= result.monthly_cap_bytes <= result.order_cap_bytes
         ):
             raise ProxyCampaignValidationError(
                 "scheduled daily/monthly/order caps are inconsistent"
             )
+        expected_wave = WHOSCORED_ROLLOUT_WAVE_CONTRACTS.get(result.wave_id)
+        if (
+            type(result.require_full_active) is not bool
+            or expected_wave != (result.max_scopes, result.require_full_active)
+            or result.catalog_active_scope_count > WHOSCORED_DAILY_ACTIVE_SCOPE_CEILING
+            or len(result.scope_workloads)
+            != min(result.max_scopes, result.catalog_active_scope_count)
+        ):
+            raise ProxyCampaignValidationError(
+                "scheduled rollout wave authority is invalid"
+            )
+        genesis_proof = WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256
+        if (
+            result.wave_id == "wave-20"
+            and (
+                result.promotion_acceptance_sha256 != genesis_proof
+                or result.promotion_terminal_receipt_sha256 != genesis_proof
+            )
+        ) or (
+            result.wave_id != "wave-20"
+            and (
+                result.promotion_acceptance_sha256 == genesis_proof
+                or result.promotion_terminal_receipt_sha256 == genesis_proof
+            )
+        ):
+            raise ProxyCampaignValidationError(
+                "scheduled rollout promotion proof is invalid for its wave"
+            )
+        if result.require_full_active:
+            ranked_scope_ids_sha256 = hashlib.sha256(
+                (
+                    "\n".join(item.scope for item in result.scope_workloads) + "\n"
+                ).encode("utf-8")
+            ).hexdigest()
+            active_scopes_sha256 = hashlib.sha256(
+                (
+                    "\n".join(sorted(item.scope for item in result.scope_workloads))
+                    + "\n"
+                ).encode("utf-8")
+            ).hexdigest()
+            if not (
+                hmac.compare_digest(
+                    result.ranked_scope_ids_sha256, ranked_scope_ids_sha256
+                )
+                and hmac.compare_digest(
+                    result.catalog_active_scopes_sha256, active_scopes_sha256
+                )
+                and hmac.compare_digest(
+                    result.ranked_workload_sha256, result.workload_sha256
+                )
+            ):
+                raise ProxyCampaignValidationError(
+                    "wave-all ranking/catalog digests differ from selected workloads"
+                )
         if (
             result.discovery_expansion_headroom
             != SCHEDULED_DISCOVERY_EXPANSION_HEADROOM
@@ -1185,8 +1348,22 @@ class ScheduledProxyAuthority:
             "billing_month": self.billing_month,
             "cohort_id": self.cohort_id,
             "cohort_sha256": self.cohort_sha256,
+            "rollout_id": self.rollout_id,
+            "wave_id": self.wave_id,
+            "max_scopes": self.max_scopes,
+            "require_full_active": self.require_full_active,
             "catalog_batch_id": self.catalog_batch_id,
             "catalog_payload_sha256": self.catalog_payload_sha256,
+            "catalog_active_scope_count": self.catalog_active_scope_count,
+            "catalog_active_scopes_sha256": self.catalog_active_scopes_sha256,
+            "ranked_scope_ids_sha256": self.ranked_scope_ids_sha256,
+            "ranked_workload_sha256": self.ranked_workload_sha256,
+            "runtime_sha256": self.runtime_sha256,
+            "classifier_sha256": self.classifier_sha256,
+            "promotion_acceptance_sha256": self.promotion_acceptance_sha256,
+            "promotion_terminal_receipt_sha256": (
+                self.promotion_terminal_receipt_sha256
+            ),
             "workload_sha256": self.workload_sha256,
             "scope_workloads": [item.to_dict() for item in self.scope_workloads],
             "discovery_parent_target_count": self.discovery_parent_target_count,
@@ -1260,7 +1437,9 @@ class ProxyCampaignApproval:
         raw_allocations = value.get("allocations")
         if not isinstance(raw_allocations, list) or not raw_allocations:
             raise ProxyCampaignValidationError("allocations must be a non-empty array")
-        allocations = tuple(ProxyWorkAllocation.from_dict(item) for item in raw_allocations)
+        allocations = tuple(
+            ProxyWorkAllocation.from_dict(item) for item in raw_allocations
+        )
         allocation_ids = tuple(item.allocation_id for item in allocations)
         if allocation_ids != tuple(sorted(set(allocation_ids))):
             raise ProxyCampaignValidationError(
@@ -1329,6 +1508,14 @@ class ProxyCampaignApproval:
                     "scheduled campaign approval must bind daily ingest only"
                 )
             assert scheduled_authority is not None
+            if (
+                value.get("runtime_sha256") != scheduled_authority.runtime_sha256
+                or value.get("classifier_sha256")
+                != scheduled_authority.classifier_sha256
+            ):
+                raise ProxyCampaignValidationError(
+                    "scheduled approval release pins differ from rollout authority"
+                )
             if caps.total_provider_bytes > scheduled_authority.daily_cap_bytes:
                 raise ProxyCampaignValidationError(
                     "scheduled approval exceeds its signed daily cap"
@@ -1366,17 +1553,14 @@ class ProxyCampaignApproval:
                 or discovery.budget_bytes > 128 * 1024 * 1024
                 or discovery.request_limit
                 != 2 * scheduled_authority.discovery_target_limit
-                or discovery.lease_limit
-                != scheduled_authority.discovery_target_limit
+                or discovery.lease_limit != scheduled_authority.discovery_target_limit
                 or profiles.phase != "capture"
                 or profiles.workload_class != "daily_profile_refresh"
                 or profiles.work_item_id != "profiles-daily"
                 or profiles.task_id != "refresh_whoscored_profiles"
                 or profiles.budget_bytes > 256 * 1024 * 1024
-                or profiles.request_limit
-                != 2 * profile_allocation_target_count
-                or profiles.lease_limit
-                != profile_allocation_target_count
+                or profiles.request_limit != 2 * profile_allocation_target_count
+                or profiles.lease_limit != profile_allocation_target_count
             ):
                 raise ProxyCampaignValidationError(
                     "scheduled discovery/profile allocation contract is invalid"
@@ -2734,13 +2918,9 @@ class ProxyCampaignLedger:
                 }
                 if "target_manifest_sha256" in claim:
                     attempt.update(
-                        target_manifest_sha256=claim.get(
-                            "target_manifest_sha256"
-                        ),
+                        target_manifest_sha256=claim.get("target_manifest_sha256"),
                         logical_target_units=claim.get("logical_target_units"),
-                        expected_endpoint_labels=claim.get(
-                            "expected_endpoint_labels"
-                        ),
+                        expected_endpoint_labels=claim.get("expected_endpoint_labels"),
                     )
                 self._append_attempt_record(
                     body,
@@ -3463,9 +3643,7 @@ class ProxyCampaignLedger:
                 attempt.update(
                     target_manifest_sha256=active.get("target_manifest_sha256"),
                     logical_target_units=active.get("logical_target_units"),
-                    expected_endpoint_labels=active.get(
-                        "expected_endpoint_labels"
-                    ),
+                    expected_endpoint_labels=active.get("expected_endpoint_labels"),
                 )
             self._append_attempt_record(
                 body,
@@ -3825,12 +4003,8 @@ class ProxyCampaignLedger:
                 # while making every batch seal commit to its durable binding.
                 if "target_manifest_sha256" in attempt:
                     value.update(
-                        target_manifest_sha256=attempt.get(
-                            "target_manifest_sha256"
-                        ),
-                        logical_target_units=attempt.get(
-                            "logical_target_units"
-                        ),
+                        target_manifest_sha256=attempt.get("target_manifest_sha256"),
+                        logical_target_units=attempt.get("logical_target_units"),
                         expected_endpoint_labels=attempt.get(
                             "expected_endpoint_labels"
                         ),
@@ -4490,9 +4664,7 @@ def parse_proxy_campaign_approval_structure_bytes(
     """Validate one already fd-pinned approval payload without reopening a path."""
 
     if not isinstance(raw, bytes) or not 0 < len(raw) <= MAX_APPROVAL_DOCUMENT_BYTES:
-        raise ProxyCampaignValidationError(
-            "campaign approval document size is unsafe"
-        )
+        raise ProxyCampaignValidationError("campaign approval document size is unsafe")
     try:
         approval = ProxyCampaignApproval.from_dict(
             strict_json_loads(raw.decode("utf-8"))

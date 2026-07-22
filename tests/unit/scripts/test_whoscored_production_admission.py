@@ -80,14 +80,707 @@ def test_verify_running_cli_requires_split_provenance_inputs() -> None:
             "/run/credentials/owner-hmac",
             "--deployment-admission-receipt",
             "/evidence/rendered-receipt.json",
-            "--service",
-            "airflow-scheduler",
+            "--rollout-id",
+            "rollout-954",
+            *[
+                argument
+                for service in admission.PROTECTED_SERVICES
+                for argument in ("--service", service)
+            ],
         ]
     )
 
     assert args.command == "verify-running"
     assert args.common_override == Path("/evidence/common.yaml")
     assert args.gateway_override == Path("/evidence/gateway.yaml")
+    assert args.rollout_id == "rollout-954"
+
+
+def test_verify_running_rollout_modes_are_mutually_exclusive() -> None:
+    with pytest.raises(SystemExit):
+        admission._parser().parse_args(
+            [
+                "verify-running",
+                "--deployment-attestation",
+                "/evidence/deployment.json",
+                "--common-override",
+                "/evidence/common.yaml",
+                "--gateway-override",
+                "/evidence/gateway.yaml",
+                "--env-file",
+                "/evidence/production.env",
+                "--provider-policy",
+                "/authority/provider-policy.json",
+                "--owner-secret-file",
+                "/run/credentials/owner-hmac",
+                "--deployment-admission-receipt",
+                "/evidence/rendered-receipt.json",
+                "--rollout-id",
+                "rollout-954",
+                "--issuance-rollout-id",
+                "rollout-954",
+                "--service",
+                "airflow-scheduler",
+            ]
+        )
+
+
+@pytest.mark.parametrize("missing", admission.PROTECTED_SERVICES)
+def test_rollout_production_boundary_rejects_each_missing_service(
+    missing: str,
+) -> None:
+    selected = [
+        service for service in admission.PROTECTED_SERVICES if service != missing
+    ]
+
+    with pytest.raises(admission.AdmissionError, match="every protected service"):
+        admission._canonical_rollout_services(selected)
+
+
+def test_rollout_production_boundary_is_exact_unique_and_canonical() -> None:
+    assert (
+        admission._canonical_rollout_services(
+            tuple(reversed(admission.PROTECTED_SERVICES))
+        )
+        == admission.PROTECTED_SERVICES
+    )
+
+    for selected in (
+        (*admission.PROTECTED_SERVICES, "airflow-scheduler"),
+        (*admission.PROTECTED_SERVICES[:-1], "database"),
+    ):
+        with pytest.raises(admission.AdmissionError, match="every protected service"):
+            admission._canonical_rollout_services(selected)
+
+
+def _idempotency_witness(scope_count: int) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "status": "green",
+        "scope": {
+            "scope_count": scope_count,
+            "exact_manifest_pair_count": scope_count * 5,
+            "duplicate_counter_count": scope_count * 4,
+            "physical_current_pair_count": scope_count * 11,
+            "zero_mismatch_counter_count": scope_count * 6,
+            "violation_count": 0,
+            "evidence_sha256": SHA_A,
+        },
+        "profile": {
+            "exact_manifest_pair_count": 2,
+            "duplicate_counter_count": 1,
+            "physical_current_pair_count": 2,
+            "zero_mismatch_counter_count": 5,
+            "violation_count": 0,
+            "evidence_sha256": SHA_B,
+        },
+    }
+
+
+def _accepted_rollout_report() -> dict[str, Any]:
+    release = {
+        "parser_version": "whoscored-parser-v8",
+        "manifest_sha256": SHA_A,
+        "code_tree_sha256": SHA_B,
+    }
+    now = datetime.now(timezone.utc)
+    checked_at = now.replace(microsecond=0)
+    final_schedule = now.replace(hour=10, minute=0, second=0, microsecond=0)
+    if final_schedule + timedelta(hours=1) > now:
+        final_schedule -= timedelta(days=1)
+    final_logical_date = final_schedule - timedelta(days=1)
+    scope_counts = [20, 20, 70, 70, 71, 71]
+    terminal_runs = []
+    for index, scope_count in enumerate(scope_counts):
+        logical_date = final_logical_date - timedelta(days=5 - index)
+        logical_z = logical_date.isoformat().replace("+00:00", "Z")
+        terminal_runs.append(
+            {
+                "completed_at": (logical_date + timedelta(days=1, hours=1))
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "evidence_sha256": hashlib.sha256(
+                    f"run-evidence-{index}".encode()
+                ).hexdigest(),
+                "idempotency": _idempotency_witness(scope_count),
+                "logical_date": logical_z,
+                "run_id": f"scheduled__{logical_date.isoformat()}",
+                "scope_dq": {
+                    "count": scope_count,
+                    "sha256": hashlib.sha256(f"scope-dq-{index}".encode()).hexdigest(),
+                    "scopes_sha256": hashlib.sha256(
+                        f"scopes-{index}".encode()
+                    ).hexdigest(),
+                },
+                "scope_plan_sha256": hashlib.sha256(
+                    f"scope-plan-{index}".encode()
+                ).hexdigest(),
+                "task_states": {
+                    "count": scope_count + 20,
+                    "sha256": hashlib.sha256(
+                        f"task-states-{index}".encode()
+                    ).hexdigest(),
+                },
+            }
+        )
+    return {
+        "accepted_release": release,
+        "accepted_waves": ["wave-20", "wave-70", "wave-all"],
+        "authority": _accepted_rollout_authority()["authority"],
+        "authority_binding": "explicit-rollout-id",
+        "backup_recovery": {
+            "status": "passed",
+            "rpo_hours": 24,
+            "rto_hours": 24,
+            "duration_seconds": 3_600,
+            "evidence_age_seconds": 3_600,
+            "runtime_release": dict(release),
+            "off_host_receipt_key": (
+                "restore-drill-receipts/v2/20260722T100000Z-" + SHA_D + ".json"
+            ),
+            "off_host_receipt_sha256": SHA_D,
+            "live_backup": {
+                "capability": {
+                    "bucket": "off-host-backup",
+                    "checked_object_count": 74,
+                    "default_retention_days": 30,
+                    "default_retention_mode": "COMPLIANCE",
+                    "earliest_retain_until": (
+                        checked_at + timedelta(hours=25)
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "minimum_remaining_hours": 24,
+                    "object_lock_enabled": "Enabled",
+                    "status": "passed",
+                    "versioning_status": "Enabled",
+                },
+                "checked_at": checked_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "expected_retained_objects": 74,
+                "inventories": [
+                    {
+                        "checked_bytes": 7_100,
+                        "checked_content_objects": 71,
+                        "expected_content_bytes": 7_100,
+                        "expected_content_objects": 71,
+                        "inventory_key": (
+                            "backup-inventories/20260722T100000000000Z-"
+                            + "1" * 16
+                            + "-"
+                            + SHA_A
+                            + ".json"
+                        ),
+                        "inventory_sha256": SHA_A,
+                        "marker_valid": True,
+                        "object_count": 71,
+                        "objects_sha256": SHA_B,
+                        "source_uri": "s3://football/ops/whoscored",
+                        "total_bytes": 7_100,
+                    },
+                    {
+                        "checked_bytes": 7_100,
+                        "checked_content_objects": 71,
+                        "expected_content_bytes": 7_100,
+                        "expected_content_objects": 71,
+                        "inventory_key": (
+                            "backup-inventories/20260722T100000000000Z-"
+                            + "2" * 16
+                            + "-"
+                            + SHA_C
+                            + ".json"
+                        ),
+                        "inventory_sha256": SHA_C,
+                        "marker_valid": True,
+                        "object_count": 71,
+                        "objects_sha256": SHA_D,
+                        "source_uri": "s3://football/raw/whoscored",
+                        "total_bytes": 7_100,
+                    },
+                ],
+                "receipt_key": (
+                    "restore-drill-receipts/v2/20260722T100000Z-" + SHA_D + ".json"
+                ),
+                "receipt_sha256": SHA_D,
+                "status": "passed",
+            },
+            "source_uris": [
+                "s3://football/ops/whoscored",
+                "s3://football/raw/whoscored",
+            ],
+        },
+        "catalog": {
+            "active_scope_count": 71,
+            "active_scopes_sha256": SHA_C,
+        },
+        "final_wave_receipt_sha256": SHA_D,
+        "latest_scheduled_run": {
+            "completed_at": terminal_runs[-1]["completed_at"],
+            "logical_date": terminal_runs[-1]["logical_date"],
+            "run_id": terminal_runs[-1]["run_id"],
+            "state": "success",
+        },
+        "missing_waves": [],
+        "rollout_id": "rollout-954",
+        "runtime_release": dict(release),
+        "schema_version": 1,
+        "status": "accepted",
+        "terminal_runs": terminal_runs,
+    }
+
+
+def _accepted_rollout_authority() -> dict[str, Any]:
+    return {
+        "authority": {
+            "rollout_id": "rollout-954",
+            "wave_id": "wave-all",
+            "max_scopes": 2_000,
+            "require_full_active": True,
+            "cohort_sha256": SHA_D,
+            "ranked_scope_ids_sha256": SHA_A,
+            "runtime_sha256": SHA_B,
+            "classifier_sha256": SHA_C,
+            "promotion_acceptance_sha256": SHA_A,
+            "promotion_terminal_receipt_sha256": SHA_C,
+        },
+        "authority_binding": "current-signed-rollout",
+        "catalog_active_scope_count": 71,
+        "catalog_active_scopes_sha256": SHA_C,
+        "charter_sha256": SHA_A,
+        "cohort_id": "cohort-954",
+        "rollout_manifest_sha256": SHA_D,
+    }
+
+
+def _issuance_rollout_authority(wave_id: str) -> dict[str, Any]:
+    result = _accepted_rollout_authority()
+    authority = result["authority"]
+    max_scopes, require_full_active = admission._ROLLOUT_WAVE_CONTRACTS[wave_id]
+    authority["wave_id"] = wave_id
+    authority["max_scopes"] = max_scopes
+    authority["require_full_active"] = require_full_active
+    if wave_id == "wave-20":
+        authority["promotion_acceptance_sha256"] = (
+            admission._ROLLOUT_GENESIS_PROOF_SHA256
+        )
+        authority["promotion_terminal_receipt_sha256"] = (
+            admission._ROLLOUT_GENESIS_PROOF_SHA256
+        )
+    return result
+
+
+def _issuance_rollout_report(wave_id: str) -> dict[str, Any]:
+    authority = _issuance_rollout_authority(wave_id)["authority"]
+    run_count = {"wave-20": 0, "wave-70": 2, "wave-all": 4}[wave_id]
+    receipts = {
+        "wave-20": [],
+        "wave-70": [SHA_A, authority["promotion_terminal_receipt_sha256"]],
+        "wave-all": [
+            SHA_A,
+            SHA_B,
+            SHA_D,
+            authority["promotion_terminal_receipt_sha256"],
+        ],
+    }[wave_id]
+    release = {
+        "parser_version": "whoscored-parser-v8",
+        "manifest_sha256": SHA_A,
+        "code_tree_sha256": SHA_B,
+    }
+    return {
+        "promotion": {
+            "classifier_sha256": authority["classifier_sha256"],
+            "promotion_acceptance_sha256": authority["promotion_acceptance_sha256"],
+            "receipt_sha256s": receipts,
+            "release": release,
+            "runtime_sha256": authority["runtime_sha256"],
+            "schema_version": 1,
+            "source_cohort_sha256": None if wave_id == "wave-20" else SHA_D,
+            "source_wave_id": {
+                "wave-20": None,
+                "wave-70": "wave-20",
+                "wave-all": "wave-70",
+            }[wave_id],
+            "terminal_receipt_sha256": authority["promotion_terminal_receipt_sha256"],
+        },
+        "rollout_id": "rollout-954",
+        "runtime_release": release,
+        "schema_version": 1,
+        "status": "live-authority-verified",
+        "terminal_runs": _accepted_rollout_report()["terminal_runs"][:run_count],
+        "wave_id": wave_id,
+    }
+
+
+@pytest.mark.parametrize(
+    ("wave_id", "expected_runs"),
+    (("wave-20", 0), ("wave-70", 2), ("wave-all", 4)),
+)
+def test_verify_issuance_rollout_replays_exact_live_predecessor(
+    wave_id: str, expected_runs: int
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def runner(arguments: Sequence[str]) -> bytes:
+        calls.append(tuple(arguments))
+        return admission._canonical_bytes(_issuance_rollout_report(wave_id))
+
+    authority = _issuance_rollout_authority(wave_id)
+    result = admission.verify_issuance_rollout(
+        "rollout-954",
+        rollout_authority=authority,
+        scheduler_container_id="f" * 64,
+        runner=runner,
+    )
+
+    assert result == {
+        "authority": authority["authority"],
+        "authority_binding": "current-signed-rollout",
+        "charter_sha256": authority["charter_sha256"],
+        "promotion_acceptance_sha256": authority["authority"][
+            "promotion_acceptance_sha256"
+        ],
+        "promotion_terminal_receipt_sha256": authority["authority"][
+            "promotion_terminal_receipt_sha256"
+        ],
+        "rollout_id": "rollout-954",
+        "rollout_manifest_sha256": authority["rollout_manifest_sha256"],
+        "schema_version": 1,
+        "status": "live-authority-verified",
+        "wave_id": wave_id,
+    }
+    assert len(_issuance_rollout_report(wave_id)["terminal_runs"]) == expected_runs
+    command = calls[0]
+    assert command[:4] == (
+        "exec",
+        "--workdir=/opt/airflow",
+        "f" * 64,
+        "/usr/local/bin/whoscored-production-python",
+    )
+    assert "verify_daily_issuance_rollout" in command[-3]
+    assert command[-2] == "rollout-954"
+    assert json.loads(command[-1]) == {
+        **authority["authority"],
+        "catalog_active_scope_count": authority["catalog_active_scope_count"],
+        "catalog_active_scopes_sha256": authority["catalog_active_scopes_sha256"],
+    }
+    compile(command[-3], "<whoscored-rollout-issuance-probe>", "exec")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("missing-ops-terminal", "receipt chain"),
+        ("live-proof-mismatch", "current signed authority"),
+        ("terminal-mismatch", "current signed authority"),
+        ("missing-db-witness", "terminal DagRuns"),
+        ("task-state-drift", "TaskInstance-state"),
+        ("xcom-drift", "persisted-XCom"),
+        ("idempotency-drift", "idempotency witness"),
+    ),
+)
+def test_verify_issuance_rollout_rejects_fake_promotion(
+    mutation: str, message: str
+) -> None:
+    report = _issuance_rollout_report("wave-all")
+    if mutation == "missing-ops-terminal":
+        report["promotion"]["receipt_sha256s"][-1] = "e" * 64
+    elif mutation == "live-proof-mismatch":
+        report["promotion"]["promotion_acceptance_sha256"] = "e" * 64
+    elif mutation == "terminal-mismatch":
+        report["promotion"]["terminal_receipt_sha256"] = "e" * 64
+    elif mutation == "missing-db-witness":
+        report["terminal_runs"].pop()
+    elif mutation == "task-state-drift":
+        report["terminal_runs"][0]["task_states"]["count"] = 1
+    elif mutation == "idempotency-drift":
+        report["terminal_runs"][0]["idempotency"]["profile"][
+            "duplicate_counter_count"
+        ] = 2
+    else:
+        report["terminal_runs"][0]["evidence_sha256"] = "not-a-digest"
+
+    with pytest.raises(admission.AdmissionError, match=message):
+        admission.verify_issuance_rollout(
+            "rollout-954",
+            rollout_authority=_issuance_rollout_authority("wave-all"),
+            scheduler_container_id="f" * 64,
+            runner=lambda _arguments: admission._canonical_bytes(report),
+        )
+
+
+def test_verify_rollout_acceptance_uses_fixed_read_only_scheduler_probe() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def runner(arguments: Sequence[str]) -> bytes:
+        calls.append(tuple(arguments))
+        return admission._canonical_bytes(_accepted_rollout_report())
+
+    result = admission.verify_rollout_acceptance(
+        "rollout-954",
+        rollout_authority=_accepted_rollout_authority(),
+        scheduler_container_id="f" * 64,
+        runner=runner,
+    )
+
+    assert result["status"] == "accepted"
+    assert result["accepted_release"] == result["runtime_release"]
+    assert len(calls) == 1
+    command = calls[0]
+    assert command[:4] == (
+        "exec",
+        "--workdir=/opt/airflow",
+        "f" * 64,
+        "/usr/local/bin/whoscored-production-python",
+    )
+    assert command[-1] == "rollout-954"
+    assert "iter_content_addressed_json(receipts_prefix(rollout_id))" in command[-2]
+    assert "rollout_acceptance_status" in command[-2]
+    assert "validate_runtime_contract" in command[-2]
+    assert "validate_whoscored_backup_recovery_contract" in command[-2]
+    assert "terminal_task_states_evidence" in command[-2]
+    assert "mapped_scope_dq_evidence" in command[-2]
+    assert "idempotency_evidence" in command[-2]
+    assert "scope_plan_sha256" in command[-2]
+    assert "run_evidence_sha256" in command[-2]
+    assert 'DagRun.dag_id == "dag_ingest_whoscored"' in command[-2]
+    assert "TaskInstance.run_id == run_id" in command[-2]
+    assert 'XCom.task_id == "validate_active_scope"' in command[-2]
+    assert '"scope_plan": "freeze_daily_scope_plan"' in command[-2]
+    assert '"completed_at": utc_iso(dag_run.end_date)' in command[-2]
+    assert "DagRun.external_trigger.is_(False)" in command[-2]
+    assert "latest_scheduled.run_id != terminal_runs[-1]" in command[-2]
+    assert "DagRun.state.in_" not in command[-2]
+    assert "list(range(expected_count))" in command[-2]
+    assert 'iter_content_addressed_json("latest")' not in command[-2]
+    assert 'read_json("latest")' not in command[-2]
+    compile(command[-2], "<whoscored-rollout-acceptance-probe>", "exec")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("pending", "not accepted"),
+        ("release-drift", "release differs"),
+        ("recovery-release-drift", "recovery evidence"),
+        ("restore-receipt-drift", "off-host restore receipt"),
+        ("live-backup-missing", "recovery evidence"),
+        ("live-backup-governance", "Object Lock capability"),
+        ("live-backup-partial", "live backup inventory"),
+        ("live-backup-retained-count", "Object Lock capability"),
+        ("live-backup-short-retention", "retention is too short"),
+        ("live-backup-stale", "revalidation is stale"),
+        ("wrong-waves", "not accepted"),
+        ("bad-catalog", "catalog evidence"),
+        ("catalog-authority-drift", "current signed authority"),
+        ("authority-drift", "current signed authority"),
+        ("missing-terminal-run", "six verified terminal"),
+        ("scope-dq-drift", "mapped scope DQ"),
+        ("task-state-drift", "TaskInstance-state"),
+        ("persisted-xcom-drift", "persisted-XCom"),
+        ("idempotency-drift", "idempotency witness"),
+        ("non-consecutive", "consecutive within-wave pairs"),
+        ("stale-final-run", "stale or future-dated"),
+        ("newer-failed-run", "latest scheduler-created"),
+        ("newer-unreceipted-success", "latest scheduler-created"),
+        ("newer-running-run", "latest scheduler-created"),
+        ("newer-queued-run", "latest scheduler-created"),
+    ),
+)
+def test_verify_rollout_acceptance_rejects_false_go(
+    mutation: str,
+    message: str,
+) -> None:
+    report = _accepted_rollout_report()
+    if mutation == "pending":
+        report["status"] = "pending"
+    elif mutation == "release-drift":
+        report["runtime_release"]["code_tree_sha256"] = "e" * 64
+    elif mutation == "recovery-release-drift":
+        report["backup_recovery"]["runtime_release"]["code_tree_sha256"] = "e" * 64
+    elif mutation == "restore-receipt-drift":
+        report["backup_recovery"]["off_host_receipt_sha256"] = "e" * 64
+    elif mutation == "live-backup-missing":
+        report["backup_recovery"].pop("live_backup")
+    elif mutation == "live-backup-governance":
+        report["backup_recovery"]["live_backup"]["capability"][
+            "default_retention_mode"
+        ] = "GOVERNANCE"
+    elif mutation == "live-backup-partial":
+        report["backup_recovery"]["live_backup"]["inventories"][0][
+            "checked_content_objects"
+        ] -= 1
+    elif mutation == "live-backup-retained-count":
+        report["backup_recovery"]["live_backup"]["capability"][
+            "checked_object_count"
+        ] -= 1
+    elif mutation == "live-backup-short-retention":
+        checked = datetime.fromisoformat(
+            report["backup_recovery"]["live_backup"]["checked_at"].replace(
+                "Z", "+00:00"
+            )
+        )
+        report["backup_recovery"]["live_backup"]["capability"][
+            "earliest_retain_until"
+        ] = (checked + timedelta(hours=23)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    elif mutation == "live-backup-stale":
+        report["backup_recovery"]["live_backup"]["checked_at"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=6)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    elif mutation == "wrong-waves":
+        report["accepted_waves"] = ["wave-20", "wave-70"]
+    elif mutation == "bad-catalog":
+        report["catalog"]["active_scope_count"] = 0
+    elif mutation == "catalog-authority-drift":
+        report["catalog"]["active_scopes_sha256"] = SHA_B
+    elif mutation == "authority-drift":
+        report["authority"]["classifier_sha256"] = SHA_D
+    elif mutation == "missing-terminal-run":
+        report["terminal_runs"].pop()
+    elif mutation == "scope-dq-drift":
+        report["terminal_runs"][2]["scope_dq"]["count"] = 69
+    elif mutation == "task-state-drift":
+        report["terminal_runs"][0]["task_states"]["count"] = 20
+    elif mutation == "persisted-xcom-drift":
+        report["terminal_runs"][0]["evidence_sha256"] = "not-a-digest"
+    elif mutation == "idempotency-drift":
+        report["terminal_runs"][0]["idempotency"]["scope"]["violation_count"] = 1
+    elif mutation == "non-consecutive":
+        run = report["terminal_runs"][0]
+        changed = datetime.fromisoformat(
+            run["logical_date"].replace("Z", "+00:00")
+        ) - timedelta(days=1)
+        run["logical_date"] = changed.isoformat().replace("+00:00", "Z")
+        run["completed_at"] = (
+            (changed + timedelta(days=1, hours=1)).isoformat().replace("+00:00", "Z")
+        )
+        run["run_id"] = f"scheduled__{changed.isoformat()}"
+    elif mutation == "stale-final-run":
+        for run in report["terminal_runs"]:
+            logical_date = datetime.fromisoformat(
+                run["logical_date"].replace("Z", "+00:00")
+            ) - timedelta(days=3)
+            run["logical_date"] = logical_date.isoformat().replace("+00:00", "Z")
+            completed_at = datetime.fromisoformat(
+                run["completed_at"].replace("Z", "+00:00")
+            ) - timedelta(days=3)
+            run["completed_at"] = completed_at.isoformat().replace("+00:00", "Z")
+            run["run_id"] = f"scheduled__{logical_date.isoformat()}"
+        final_run = report["terminal_runs"][-1]
+        report["latest_scheduled_run"].update(
+            {
+                field: final_run[field]
+                for field in ("completed_at", "logical_date", "run_id")
+            }
+        )
+    else:
+        latest = report["latest_scheduled_run"]
+        logical_date = datetime.fromisoformat(
+            latest["logical_date"].replace("Z", "+00:00")
+        ) + timedelta(days=1)
+        latest["logical_date"] = logical_date.isoformat().replace("+00:00", "Z")
+        latest["run_id"] = f"scheduled__{logical_date.isoformat()}"
+        latest["completed_at"] = (
+            (logical_date + timedelta(days=1, hours=1))
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        if mutation == "newer-failed-run":
+            latest["state"] = "failed"
+        elif mutation == "newer-running-run":
+            latest["state"] = "running"
+        elif mutation == "newer-queued-run":
+            latest["state"] = "queued"
+
+    with pytest.raises(admission.AdmissionError, match=message):
+        admission.verify_rollout_acceptance(
+            "rollout-954",
+            rollout_authority=_accepted_rollout_authority(),
+            scheduler_container_id="f" * 64,
+            runner=lambda _arguments: admission._canonical_bytes(report),
+        )
+
+
+def test_verify_rollout_acceptance_allows_operator_gaps_between_waves() -> None:
+    report = _accepted_rollout_report()
+    for indexes, offset in (((0, 1), 4), ((2, 3), 2)):
+        for index in indexes:
+            run = report["terminal_runs"][index]
+            logical_date = datetime.fromisoformat(
+                run["logical_date"].replace("Z", "+00:00")
+            ) - timedelta(days=offset)
+            run["logical_date"] = logical_date.isoformat().replace("+00:00", "Z")
+            completed_at = datetime.fromisoformat(
+                run["completed_at"].replace("Z", "+00:00")
+            ) - timedelta(days=offset)
+            run["completed_at"] = completed_at.isoformat().replace("+00:00", "Z")
+            run["run_id"] = f"scheduled__{logical_date.isoformat()}"
+
+    result = admission.verify_rollout_acceptance(
+        "rollout-954",
+        rollout_authority=_accepted_rollout_authority(),
+        scheduler_container_id="f" * 64,
+        runner=lambda _arguments: admission._canonical_bytes(report),
+    )
+
+    assert result["terminal_runs"] == report["terminal_runs"]
+
+
+def test_verify_rollout_acceptance_freshness_uses_completion_not_logical_date():
+    report = _accepted_rollout_report()
+    for run in report["terminal_runs"]:
+        logical_date = datetime.fromisoformat(
+            run["logical_date"].replace("Z", "+00:00")
+        ) - timedelta(days=3)
+        run["logical_date"] = logical_date.isoformat().replace("+00:00", "Z")
+        run["run_id"] = f"scheduled__{logical_date.isoformat()}"
+    final_run = report["terminal_runs"][-1]
+    report["latest_scheduled_run"].update(
+        {
+            field: final_run[field]
+            for field in ("completed_at", "logical_date", "run_id")
+        }
+    )
+
+    result = admission.verify_rollout_acceptance(
+        "rollout-954",
+        rollout_authority=_accepted_rollout_authority(),
+        scheduler_container_id="f" * 64,
+        runner=lambda _arguments: admission._canonical_bytes(report),
+    )
+
+    final_logical_date = datetime.fromisoformat(
+        result["terminal_runs"][-1]["logical_date"].replace("Z", "+00:00")
+    )
+    assert datetime.now(timezone.utc) - final_logical_date > timedelta(hours=36)
+
+
+def test_verify_rollout_acceptance_rejects_invalid_explicit_identity() -> None:
+    called = False
+
+    def runner(_arguments: Sequence[str]) -> bytes:
+        nonlocal called
+        called = True
+        return b""
+
+    with pytest.raises(admission.AdmissionError, match="rollout id is invalid"):
+        admission.verify_rollout_acceptance(
+            "../../latest",
+            rollout_authority=_accepted_rollout_authority(),
+            scheduler_container_id="f" * 64,
+            runner=runner,
+        )
+
+    assert called is False
+
+    with pytest.raises(admission.AdmissionError, match="scheduler container id"):
+        admission.verify_rollout_acceptance(
+            "rollout-954",
+            rollout_authority=_accepted_rollout_authority(),
+            scheduler_container_id="airflow-scheduler",
+            runner=runner,
+        )
+
+    assert called is False
+
+
 PROXY_COMMAND = tuple(
     {
         "${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES:?set exact provider-policy daily cap in decimal bytes}": "300000000",
@@ -117,9 +810,12 @@ def _rendered_environment(service: str) -> dict[str, str]:
         environment.update(
             {
                 "FBREF_PROXY_CONTROL_TOKEN": "b" * 64,
+                "ICEBERG_WAREHOUSE": "football",
                 "TM_NATIVE_V2_ENABLED": "false",
                 "TM_STANDING_POLICY_ENABLED": "false",
                 "TM_REQUIRE_METERED_PROXY": "false",
+                "WHOSCORED_OPS_STORE_URI": "s3://football/ops/whoscored",
+                "WHOSCORED_RAW_STORE_URI": "s3://football/raw/whoscored",
             }
         )
         environment["WHOSCORED_SOURCE_POOL_SLOTS"] = "2"
@@ -214,6 +910,8 @@ def test_provider_quota_receipt_binds_fresh_protected_screenshot(
 def _provider_policy(
     tmp_path: Path, *, receipt: Path, observed: datetime
 ) -> tuple[Path, Path, dict[str, object]]:
+    from scripts import whoscored_proxy_campaign as signer
+
     owner_secret = tmp_path / "owner.key"
     owner_secret.write_text("o" * 64 + "\n", encoding="utf-8")
     owner_secret.chmod(0o600)
@@ -233,27 +931,302 @@ def _provider_policy(
         "order_cap_bytes": 300_000_000,
         "signature_algorithm": "hmac-sha256",
     }
-    digest = hashlib.sha256(admission._canonical_bytes(unsigned)).hexdigest()
-    body = {**unsigned, "document_sha256": digest}
-    value = {
-        **body,
-        "signature": hmac.new(
-            ("o" * 64).encode(),
-            admission._canonical_bytes(body),
-            hashlib.sha256,
-        ).hexdigest(),
-    }
+    value = dict(
+        signer._sign_authority_document(
+            unsigned,
+            expected_fields=signer._PROVIDER_POLICY_UNSIGNED_FIELDS,
+            secret="o" * 64,
+        )
+    )
     policy = tmp_path / "provider-policy.json"
     _canonical(policy, value)
     policy.chmod(0o600)
     return policy, owner_secret, value
 
 
+def _current_rollout_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    policy: Mapping[str, object],
+    owner_secret: Path,
+    now: datetime,
+    wave_id: str = "wave-all",
+) -> tuple[Path, Path, dict[str, object], dict[str, object]]:
+    from scripts import whoscored_proxy_campaign as signer
+
+    scopes = ["England-Premier-League-2025-2026"]
+    workload = {
+        "scope": scopes[0],
+        "work_item_id": "scope-" + hashlib.sha256(scopes[0].encode()).hexdigest(),
+        "schedule_target_limit": 2,
+        "schedule_targets_sha256": SHA_A,
+        "player_pagination_target_limit": 1,
+        "match_target_count": 1,
+        "match_targets_sha256": SHA_B,
+        "preview_target_count": 1,
+        "preview_targets_sha256": SHA_C,
+        "paid_target_count": 5,
+    }
+    rollout: dict[str, object] = {
+        "schema_version": 3,
+        "cohort_id": "cohort-954",
+        "rollout_id": "rollout-954",
+        "wave_id": wave_id,
+        "max_scopes": admission._ROLLOUT_WAVE_CONTRACTS[wave_id][0],
+        "require_full_active": admission._ROLLOUT_WAVE_CONTRACTS[wave_id][1],
+        "ranked_scope_ids": scopes,
+        "ranked_scope_ids_sha256": admission._scope_specs_sha256(scopes),
+        "ranking_basis_workload_sha256": hashlib.sha256(
+            admission._authority_canonical_bytes([workload])
+        ).hexdigest(),
+        "ranking_basis_scope_workloads": [workload],
+        "runtime_sha256": SHA_A,
+        "classifier_sha256": SHA_B,
+        "promotion_acceptance_sha256": (
+            admission._ROLLOUT_GENESIS_PROOF_SHA256 if wave_id == "wave-20" else SHA_C
+        ),
+        "promotion_terminal_receipt_sha256": (
+            admission._ROLLOUT_GENESIS_PROOF_SHA256 if wave_id == "wave-20" else SHA_D
+        ),
+    }
+    rollout_path = tmp_path / "rollout.json"
+    _canonical(rollout_path, rollout)
+    rollout_path.chmod(0o600)
+    cohort_sha256 = hashlib.sha256(
+        admission._authority_canonical_bytes(rollout)
+    ).hexdigest()
+    charter_unsigned: dict[str, object] = {
+        "schema_version": 4,
+        "source": "whoscored",
+        "provider_policy_sha256": policy["document_sha256"],
+        "order_id": policy["order_id"],
+        "billing_month": now.strftime("%Y-%m"),
+        "cohort_id": rollout["cohort_id"],
+        "cohort_sha256": cohort_sha256,
+        "rollout_id": rollout["rollout_id"],
+        "wave_id": rollout["wave_id"],
+        "max_scopes": rollout["max_scopes"],
+        "require_full_active": rollout["require_full_active"],
+        "ranked_scope_ids_sha256": rollout["ranked_scope_ids_sha256"],
+        "runtime_sha256": rollout["runtime_sha256"],
+        "classifier_sha256": rollout["classifier_sha256"],
+        "promotion_acceptance_sha256": rollout["promotion_acceptance_sha256"],
+        "promotion_terminal_receipt_sha256": rollout[
+            "promotion_terminal_receipt_sha256"
+        ],
+        "valid_from": (now - timedelta(minutes=5)).isoformat(),
+        "valid_until": (now + timedelta(hours=12)).isoformat(),
+        "daily_cap_bytes": 100_000_000,
+        "monthly_cap_bytes": 200_000_000,
+        "order_cap_bytes": 300_000_000,
+        "max_issuances": 31,
+        "signature_algorithm": "hmac-sha256",
+    }
+    secret = owner_secret.read_text(encoding="utf-8").strip()
+    charter = dict(
+        signer._sign_authority_document(
+            charter_unsigned,
+            expected_fields=signer._CHARTER_UNSIGNED_FIELDS,
+            secret=secret,
+        )
+    )
+    charter_path = tmp_path / "charter.json"
+    _canonical(charter_path, charter)
+    charter_path.chmod(0o600)
+    monkeypatch.setattr(admission, "_CURRENT_ROLLOUT_PATH", rollout_path)
+    monkeypatch.setattr(admission, "_CURRENT_CHARTER_PATH", charter_path)
+    return rollout_path, charter_path, rollout, charter
+
+
+def test_current_signed_rollout_authority_binds_fixed_final_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    receipt, _screenshot, document = _provider_quota_receipt(monkeypatch, tmp_path)
+    observed = datetime.fromisoformat(
+        str(document["observed_at"]).replace("Z", "+00:00")
+    )
+    policy_path, owner_secret, _value = _provider_policy(
+        tmp_path, receipt=receipt, observed=observed
+    )
+    policy = admission.validate_provider_policy(
+        policy_path, owner_secret_path=owner_secret
+    )
+    now = observed + timedelta(hours=1)
+    _rollout_path, _charter_path, rollout, charter = _current_rollout_files(
+        monkeypatch,
+        tmp_path,
+        policy=policy,
+        owner_secret=owner_secret,
+        now=now,
+    )
+
+    result = admission.validate_current_rollout_authority(
+        "rollout-954",
+        owner_secret_path=owner_secret,
+        provider_policy=policy,
+    )
+
+    assert result["authority_binding"] == "current-signed-rollout"
+    assert result["authority"]["runtime_sha256"] == rollout["runtime_sha256"]
+    assert result["rollout_manifest_sha256"] == charter["cohort_sha256"]
+    assert result["charter_sha256"] == charter["document_sha256"]
+
+
+@pytest.mark.parametrize("wave_id", ("wave-20", "wave-70", "wave-all"))
+def test_current_signed_issuance_authority_accepts_exact_active_wave(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, wave_id: str
+) -> None:
+    receipt, _screenshot, document = _provider_quota_receipt(monkeypatch, tmp_path)
+    observed = datetime.fromisoformat(
+        str(document["observed_at"]).replace("Z", "+00:00")
+    )
+    policy_path, owner_secret, _value = _provider_policy(
+        tmp_path, receipt=receipt, observed=observed
+    )
+    policy = admission.validate_provider_policy(
+        policy_path, owner_secret_path=owner_secret
+    )
+    _rollout_path, _charter_path, rollout, _charter = _current_rollout_files(
+        monkeypatch,
+        tmp_path,
+        policy=policy,
+        owner_secret=owner_secret,
+        now=observed + timedelta(hours=1),
+        wave_id=wave_id,
+    )
+
+    result = admission.validate_current_issuance_authority(
+        "rollout-954",
+        owner_secret_path=owner_secret,
+        provider_policy=policy,
+    )
+
+    assert result["authority"]["wave_id"] == wave_id
+    assert (
+        result["authority"]["promotion_acceptance_sha256"]
+        == rollout["promotion_acceptance_sha256"]
+    )
+
+
+def test_current_signed_issuance_authority_rejects_fake_genesis_for_promoted_wave(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    receipt, _screenshot, document = _provider_quota_receipt(monkeypatch, tmp_path)
+    observed = datetime.fromisoformat(
+        str(document["observed_at"]).replace("Z", "+00:00")
+    )
+    policy_path, owner_secret, _value = _provider_policy(
+        tmp_path, receipt=receipt, observed=observed
+    )
+    policy = admission.validate_provider_policy(
+        policy_path, owner_secret_path=owner_secret
+    )
+    rollout_path, _charter_path, rollout, _charter = _current_rollout_files(
+        monkeypatch,
+        tmp_path,
+        policy=policy,
+        owner_secret=owner_secret,
+        now=observed + timedelta(hours=1),
+        wave_id="wave-70",
+    )
+    rollout["promotion_acceptance_sha256"] = admission._ROLLOUT_GENESIS_PROOF_SHA256
+    _canonical(rollout_path, rollout)
+
+    with pytest.raises(admission.AdmissionError, match="promotion proof"):
+        admission.validate_current_issuance_authority(
+            "rollout-954",
+            owner_secret_path=owner_secret,
+            provider_policy=policy,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("old-rollout-id", "requested final"),
+        ("not-final", "requested final"),
+        ("genesis-proof", "promotion proof"),
+        ("ranking", "ranked scope identity"),
+        ("charter-signature", "digest/signature"),
+        ("charter-cohort", "active policy and rollout"),
+    ),
+)
+def test_current_signed_rollout_authority_rejects_archived_or_tampered_pair(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    receipt, _screenshot, document = _provider_quota_receipt(monkeypatch, tmp_path)
+    observed = datetime.fromisoformat(
+        str(document["observed_at"]).replace("Z", "+00:00")
+    )
+    policy_path, owner_secret, _value = _provider_policy(
+        tmp_path, receipt=receipt, observed=observed
+    )
+    policy = admission.validate_provider_policy(
+        policy_path, owner_secret_path=owner_secret
+    )
+    rollout_path, charter_path, rollout, charter = _current_rollout_files(
+        monkeypatch,
+        tmp_path,
+        policy=policy,
+        owner_secret=owner_secret,
+        now=observed + timedelta(hours=1),
+    )
+    requested = "rollout-954"
+    if mutation == "old-rollout-id":
+        requested = "archived-rollout"
+    elif mutation == "not-final":
+        rollout["wave_id"] = "wave-70"
+        rollout["max_scopes"] = 70
+        rollout["require_full_active"] = False
+        _canonical(rollout_path, rollout)
+    elif mutation == "genesis-proof":
+        rollout["promotion_acceptance_sha256"] = admission._ROLLOUT_GENESIS_PROOF_SHA256
+        _canonical(rollout_path, rollout)
+    elif mutation == "ranking":
+        rollout["ranked_scope_ids_sha256"] = SHA_D
+        _canonical(rollout_path, rollout)
+    elif mutation == "charter-signature":
+        charter["signature"] = "0" * 64
+        _canonical(charter_path, charter)
+    else:
+        charter["cohort_sha256"] = SHA_A
+        unsigned = {
+            field: charter[field] for field in admission._CHARTER_UNSIGNED_FIELDS
+        }
+        digest = hashlib.sha256(
+            admission._authority_canonical_bytes(unsigned)
+        ).hexdigest()
+        body = {**unsigned, "document_sha256": digest}
+        secret = owner_secret.read_text(encoding="utf-8").strip()
+        charter = {
+            **body,
+            "signature": hmac.new(
+                secret.encode(),
+                admission._authority_canonical_bytes(body),
+                hashlib.sha256,
+            ).hexdigest(),
+        }
+        _canonical(charter_path, charter)
+
+    with pytest.raises(admission.AdmissionError, match=message):
+        admission.validate_current_rollout_authority(
+            requested,
+            owner_secret_path=owner_secret,
+            provider_policy=policy,
+        )
+
+
 def test_provider_receipt_is_bound_to_owner_signed_policy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     receipt, _screenshot, document = _provider_quota_receipt(monkeypatch, tmp_path)
-    observed = datetime.fromisoformat(str(document["observed_at"]).replace("Z", "+00:00"))
+    observed = datetime.fromisoformat(
+        str(document["observed_at"]).replace("Z", "+00:00")
+    )
     policy, owner_secret, value = _provider_policy(
         tmp_path, receipt=receipt, observed=observed
     )
@@ -273,7 +1246,9 @@ def test_provider_policy_or_bound_receipt_tampering_fails_closed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mutation: str
 ) -> None:
     receipt, _screenshot, document = _provider_quota_receipt(monkeypatch, tmp_path)
-    observed = datetime.fromisoformat(str(document["observed_at"]).replace("Z", "+00:00"))
+    observed = datetime.fromisoformat(
+        str(document["observed_at"]).replace("Z", "+00:00")
+    )
     policy, owner_secret, value = _provider_policy(
         tmp_path, receipt=receipt, observed=observed
     )
@@ -324,7 +1299,9 @@ def test_running_admission_reuses_deploy_gate_without_receipt_freshness(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     receipt, _screenshot, document = _provider_quota_receipt(monkeypatch, tmp_path)
-    observed = datetime.fromisoformat(str(document["observed_at"]).replace("Z", "+00:00"))
+    observed = datetime.fromisoformat(
+        str(document["observed_at"]).replace("Z", "+00:00")
+    )
     policy_path, owner_secret, _policy_value = _provider_policy(
         tmp_path, receipt=receipt, observed=observed
     )
@@ -368,7 +1345,9 @@ def test_running_admission_reuses_deploy_gate_without_receipt_freshness(
     )
 
     assert projection["path"] == str(deploy_receipt)
-    assert projection["sha256"] == hashlib.sha256(deploy_receipt.read_bytes()).hexdigest()
+    assert (
+        projection["sha256"] == hashlib.sha256(deploy_receipt.read_bytes()).hexdigest()
+    )
 
 
 def _deployment(
@@ -1241,6 +2220,56 @@ def test_scheduler_admission_requires_gateway_token_and_forbids_raw_origins():
             )
 
 
+def test_scheduler_admission_derives_whoscored_stores_from_warehouse_bucket():
+    environment = _rendered_environment("airflow-scheduler")
+
+    admission._validate_rendered_environment(
+        environment,
+        service="airflow-scheduler",
+    )
+    assert environment["ICEBERG_WAREHOUSE"] == "football"
+    assert environment["WHOSCORED_RAW_STORE_URI"] == ("s3://football/raw/whoscored")
+    assert environment["WHOSCORED_OPS_STORE_URI"] == ("s3://football/ops/whoscored")
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("WHOSCORED_RAW_STORE_URI", "s3://warehouse/raw/whoscored"),
+        ("WHOSCORED_RAW_STORE_URI", "s3://football/raw/whoscored/"),
+        ("WHOSCORED_OPS_STORE_URI", "s3://warehouse/ops/whoscored"),
+        ("WHOSCORED_OPS_STORE_URI", "s3://football/raw/whoscored"),
+    ),
+)
+def test_scheduler_admission_rejects_whoscored_store_bucket_or_prefix_drift(
+    name: str,
+    value: str,
+):
+    environment = _rendered_environment("airflow-scheduler")
+    environment[name] = value
+
+    with pytest.raises(admission.AdmissionError, match="admitted ICEBERG_WAREHOUSE"):
+        admission._validate_rendered_environment(
+            environment,
+            service="airflow-scheduler",
+        )
+
+
+@pytest.mark.parametrize(
+    "bucket",
+    ("", "FOOTBALL", "s3://football", "football/raw", "127.0.0.1", "bad..bucket"),
+)
+def test_scheduler_admission_rejects_invalid_physical_warehouse_bucket(bucket: str):
+    environment = _rendered_environment("airflow-scheduler")
+    environment["ICEBERG_WAREHOUSE"] = bucket
+
+    with pytest.raises(admission.AdmissionError, match="bucket is invalid"):
+        admission._validate_rendered_environment(
+            environment,
+            service="airflow-scheduler",
+        )
+
+
 def test_scheduler_admission_rejects_static_selected_approval_path():
     environment = _rendered_environment("airflow-scheduler")
     environment["WHOSCORED_PROXY_APPROVAL_PATH"] = (
@@ -1408,9 +2437,9 @@ def test_paid_boundary_is_five_service_isolated_and_credential_bound():
     assert gateway_volumes["/opt/airflow/secure/whoscored-alert-authority"][1] is True
     filter_volume_targets = {
         target
-        for _kind, _source, target, _read_only in projections[
-            "whoscored_proxy_filter"
-        ]["volumes"]
+        for _kind, _source, target, _read_only in projections["whoscored_proxy_filter"][
+            "volumes"
+        ]
     }
     assert "/opt/airflow/configs/sofascore" not in filter_volume_targets
     services = rendered["services"]
@@ -1533,14 +2562,10 @@ def test_checked_in_compose_model_matches_admission_policy(tmp_path: Path) -> No
     common_override = tmp_path / "common-digest-only.yaml"
     gateway_override = tmp_path / "gateway-digest-only.yaml"
     common_override.write_bytes(
-        admission.compose_override_bytes(
-            BINDINGS, admission.COMMON_PROTECTED_SERVICES
-        )
+        admission.compose_override_bytes(BINDINGS, admission.COMMON_PROTECTED_SERVICES)
     )
     gateway_override.write_bytes(
-        admission.compose_override_bytes(
-            BINDINGS, admission.GATEWAY_PROTECTED_SERVICES
-        )
+        admission.compose_override_bytes(BINDINGS, admission.GATEWAY_PROTECTED_SERVICES)
     )
     environment = {
         "DOCKER_HOST": "unix:///run/docker.sock",
@@ -1703,9 +2728,7 @@ def test_split_render_rejects_legacy_single_project_controls(
             != "/opt/airflow/secure/whoscored-scheduled-pointers"
         ]
     elif mutation == "paid-profile":
-        gateway["services"]["whoscored_paid_gateway"]["profiles"] = [
-            "whoscored-paid"
-        ]
+        gateway["services"]["whoscored_paid_gateway"]["profiles"] = ["whoscored-paid"]
     elif mutation == "common-dependency":
         gateway["services"]["whoscored_proxy_filter"]["depends_on"] = {
             "airflow-log-init": {
@@ -3090,10 +4113,12 @@ def test_docker_invocation_ignores_hostile_path_and_uses_sanitized_environment(
         },
     )
     captured: dict[str, object] = {}
+    timeouts: list[object] = []
 
     def run(command: Sequence[str], **kwargs: object) -> SimpleNamespace:
         captured["command"] = tuple(command)
         captured["env"] = kwargs["env"]
+        timeouts.append(kwargs["timeout"])
         return SimpleNamespace(returncode=0, stdout=b"ok\n", stderr=b"")
 
     monkeypatch.setattr(admission.subprocess, "run", run)
@@ -3104,6 +4129,8 @@ def test_docker_invocation_ignores_hostile_path_and_uses_sanitized_environment(
         "HOME": "/nonexistent",
         "PATH": "/usr/bin:/bin",
     }
+    assert admission._run_rollout_acceptance_docker(("exec",)) == b"ok\n"
+    assert timeouts == [30, admission.ROLLOUT_ACCEPTANCE_TIMEOUT_SECONDS]
 
 
 def test_host_cli_rejects_nonisolated_or_hostile_python_import_environment(

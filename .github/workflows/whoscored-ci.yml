@@ -902,6 +902,8 @@ jobs:
             dags/scripts/whoscored_frozen_dq.py \
             dags/scripts/whoscored_identity.py \
             dags/scripts/whoscored_proxy_runtime.py \
+            dags/scripts/whoscored_production_issuance.py \
+            dags/scripts/whoscored_rollout_acceptance.py \
             dags/utils/maintenance_tasks.py \
             dags/utils/fbref_pipeline_tasks.py \
             docker/images/airflow/whoscored_capacity_worker_bootstrap.py \
@@ -935,6 +937,8 @@ jobs:
             dags/scripts/whoscored_frozen_dq.py \
             dags/scripts/whoscored_identity.py \
             dags/scripts/whoscored_proxy_runtime.py \
+            dags/scripts/whoscored_production_issuance.py \
+            dags/scripts/whoscored_rollout_acceptance.py \
             dags/utils/fbref_pipeline_tasks.py \
             docker/images/airflow/whoscored_capacity_worker_bootstrap.py \
             scripts/init_seaweedfs_bucket.py \

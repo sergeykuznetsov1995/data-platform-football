@@ -336,6 +336,170 @@ def test_daily_scope_plan_binds_exact_catalog_snapshot(monkeypatch):
 
 
 @pytest.mark.unit
+def test_paid_scope_plan_preserves_heavy_order_and_binds_full_catalog(monkeypatch):
+    mod = _load_dag_module()
+    from dags.scripts import run_whoscored_scraper as runner
+    from scrapers.whoscored.proxy_campaign import (
+        WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256,
+        ScheduledScopeWorkload,
+        canonical_json_bytes,
+    )
+
+    rows = {"competitions": [], "seasons": [], "stages": []}
+    payload_sha256 = catalog_payload_sha256(rows)
+    identity = _catalog_identity(
+        batch_id="wsc2-candidate", payload_sha256=payload_sha256
+    )
+    identity.update(
+        {
+            "parent_catalog_batch_id": "wsc2-parent",
+            "parent_catalog_payload_sha256": "d" * 64,
+            "parent_catalog_raw_provenance_sha256": "e" * 64,
+        }
+    )
+    catalog = SimpleNamespace(to_rows=lambda: rows)
+    selected = [
+        (SimpleNamespace(spec=scope), object())
+        for scope in ("C=2526", "A=2526", "B=2526")
+    ]
+    repository = SimpleNamespace(
+        load_catalog_generation_snapshot=lambda *, batch_id: (
+            (
+                {
+                    key: value
+                    for key, value in identity.items()
+                    if key != "schema_version"
+                },
+                catalog,
+            )
+            if batch_id == "wsc2-candidate"
+            else pytest.fail("wrong candidate generation")
+        )
+    )
+    monkeypatch.setattr(runner, "_new_repository", lambda: repository)
+    monkeypatch.setattr(
+        runner,
+        "_select_catalog_snapshot_scopes",
+        lambda value, requested, *, active_only: (
+            selected
+            if value is catalog and not requested and active_only
+            else pytest.fail("wrong active catalog selection")
+        ),
+    )
+    monkeypatch.setattr(
+        mod, "_validate_scheduled_scope_workloads", lambda *_args, **_kwargs: None
+    )
+
+    def workload(scope, demand):
+        return ScheduledScopeWorkload.from_dict(
+            {
+                "scope": scope,
+                "work_item_id": "scope-" + hashlib.sha256(scope.encode()).hexdigest(),
+                "schedule_target_limit": demand,
+                "schedule_targets_sha256": "1" * 64,
+                "player_pagination_target_limit": 0,
+                "match_target_count": 0,
+                "match_targets_sha256": "2" * 64,
+                "preview_target_count": 0,
+                "preview_targets_sha256": "3" * 64,
+                "paid_target_count": demand,
+            }
+        )
+
+    workloads = tuple(
+        workload(scope, demand)
+        for scope, demand in (("B=2526", 20), ("C=2526", 20), ("A=2526", 10))
+    )
+    lexical_catalog = ["A=2526", "B=2526", "C=2526"]
+    catalog_scopes_sha256 = hashlib.sha256(
+        ("\n".join(lexical_catalog) + "\n").encode()
+    ).hexdigest()
+    authority = SimpleNamespace(
+        catalog_batch_id="wsc2-parent",
+        catalog_payload_sha256="d" * 64,
+        catalog_active_scope_count=3,
+        catalog_active_scopes_sha256=catalog_scopes_sha256,
+        cohort_id="wave-all-cohort",
+        cohort_sha256="4" * 64,
+        rollout_id="production-rollout-2026-07",
+        wave_id="wave-all",
+        max_scopes=2_000,
+        require_full_active=True,
+        ranked_scope_ids_sha256=hashlib.sha256(
+            "B=2526\nC=2526\nA=2526\n".encode()
+        ).hexdigest(),
+        ranked_workload_sha256=hashlib.sha256(
+            canonical_json_bytes([item.to_dict() for item in workloads])
+        ).hexdigest(),
+        runtime_sha256="6" * 64,
+        classifier_sha256="7" * 64,
+        promotion_acceptance_sha256="8" * 64,
+        promotion_terminal_receipt_sha256="9" * 64,
+        workload_sha256=hashlib.sha256(
+            canonical_json_bytes([item.to_dict() for item in workloads])
+        ).hexdigest(),
+        scope_workloads=workloads,
+        discovery_parent_target_count=100,
+        discovery_expansion_headroom=128,
+        discovery_target_limit=228,
+        profile_target_count=0,
+        profile_targets_sha256="5" * 64,
+    )
+    monkeypatch.setattr(
+        mod,
+        "_transport_runtime",
+        lambda _context: SimpleNamespace(
+            is_paid=True,
+            approval=SimpleNamespace(scheduled_authority=authority),
+        ),
+    )
+
+    plan = mod.freeze_daily_scope_plan(
+        validated_catalog={"status": "success", "catalog_identity": identity}
+    )
+
+    assert plan["active_scopes"] == ["B=2526", "C=2526", "A=2526"]
+    assert plan["catalog_active_scope_count"] == 3
+    assert plan["catalog_active_scopes_sha256"] == catalog_scopes_sha256
+    assert plan["rollout_id"] == "production-rollout-2026-07"
+    assert plan["wave_id"] == "wave-all"
+    assert plan["max_scopes"] == 2_000
+    assert plan["require_full_active"] is True
+    assert plan["ranked_workload_sha256"] == authority.ranked_workload_sha256
+    assert plan["ranked_scope_ids_sha256"] == authority.ranked_scope_ids_sha256
+    assert plan["runtime_sha256"] == authority.runtime_sha256
+    assert (
+        plan["promotion_terminal_receipt_sha256"]
+        == authority.promotion_terminal_receipt_sha256
+    )
+    assert mod._daily_scope_plan_specs(plan) == (
+        "wsc2-candidate",
+        ["B=2526", "C=2526", "A=2526"],
+    )
+
+    tampered_ranked = {**plan, "ranked_workload_sha256": "0" * 64}
+    with pytest.raises(mod.AirflowException, match="cohort/deferred identity"):
+        mod._daily_scope_plan_specs(tampered_ranked)
+
+    tampered_catalog = {**plan, "catalog_active_scopes_sha256": "0" * 64}
+    with pytest.raises(mod.AirflowException, match="cohort/deferred identity"):
+        mod._daily_scope_plan_specs(tampered_catalog)
+
+    tampered_promotion = {
+        **plan,
+        "promotion_terminal_receipt_sha256": (WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256),
+    }
+    with pytest.raises(mod.AirflowException, match="cohort/deferred identity"):
+        mod._daily_scope_plan_specs(tampered_promotion)
+
+    authority.catalog_active_scopes_sha256 = "0" * 64
+    with pytest.raises(mod.AirflowException, match="full active catalog identity"):
+        mod.freeze_daily_scope_plan(
+            validated_catalog={"status": "success", "catalog_identity": identity}
+        )
+
+
+@pytest.mark.unit
 def test_daily_scope_plan_ignores_a_concurrently_published_newer_catalog(monkeypatch):
     mod = _load_dag_module()
     from dags.scripts import run_whoscored_scraper as runner
@@ -1041,6 +1205,9 @@ def test_daily_slo_history_includes_failed_elapsed_and_excludes_bootstrap(
         def isnot(self, _value):
             return self
 
+        def is_(self, _value):
+            return self
+
         def in_(self, _value):
             return self
 
@@ -1051,7 +1218,8 @@ def test_daily_slo_history_includes_failed_elapsed_and_excludes_bootstrap(
             return self
 
     class DagRun:
-        dag_id = run_id = state = start_date = end_date = Column()
+        dag_id = run_id = run_type = external_trigger = conf = Column()
+        state = start_date = end_date = Column()
 
     bootstrap = datetime(2026, 7, 1, 10)
     failed_start = datetime(2026, 7, 2, 10)
@@ -1078,17 +1246,32 @@ def test_daily_slo_history_includes_failed_elapsed_and_excludes_bootstrap(
         def query(self, *_args):
             self.calls += 1
             if self.calls == 1:
-                return Query([("scheduled__bootstrap",)])
+                return Query([("scheduled__bootstrap", "scheduled", False, {})])
             return Query(
                 [
                     (
+                        "scheduled__manual-spoof",
+                        "manual",
+                        True,
+                        {},
+                        "success",
+                        failed_start,
+                        failed_start + timedelta(seconds=1),
+                    ),
+                    (
                         "scheduled__failed",
+                        "scheduled",
+                        False,
+                        {},
                         "failed",
                         failed_start,
                         failed_start + timedelta(minutes=12),
                     ),
                     (
                         "scheduled__bootstrap",
+                        "scheduled",
+                        False,
+                        {},
                         "success",
                         bootstrap,
                         bootstrap + timedelta(hours=5, minutes=30),
@@ -1111,6 +1294,89 @@ def test_daily_slo_history_includes_failed_elapsed_and_excludes_bootstrap(
     monkeypatch.setitem(sys.modules, "airflow.utils.session", session_module)
 
     assert mod._scheduled_daily_durations_hours() == pytest.approx([0.2])
+
+
+@pytest.mark.unit
+def test_previous_terminal_scheduled_run_excludes_manual_prefix_spoof(monkeypatch):
+    mod = _load_dag_module()
+
+    class Column:
+        def __eq__(self, _other):
+            return self
+
+        def like(self, _value):
+            return self
+
+        def is_(self, _value):
+            return self
+
+        def in_(self, _value):
+            return self
+
+        def __lt__(self, _value):
+            return self
+
+        def desc(self):
+            return self
+
+    class DagRun:
+        dag_id = run_id = state = execution_date = Column()
+        run_type = external_trigger = conf = Column()
+
+    genuine_date = datetime(2026, 7, 21, 10, tzinfo=timezone.utc)
+
+    class Query:
+        def filter(self, *_args):
+            return self
+
+        def order_by(self, *_args):
+            return self
+
+        def all(self):
+            return [
+                (
+                    "scheduled__manual-spoof",
+                    "success",
+                    datetime(2026, 7, 22, 9, tzinfo=timezone.utc),
+                    "manual",
+                    True,
+                    {},
+                ),
+                (
+                    "scheduled__2026-07-21T10:00:00+00:00",
+                    "failed",
+                    genuine_date,
+                    "scheduled",
+                    False,
+                    {},
+                ),
+            ]
+
+    class Session:
+        def query(self, *_args):
+            return Query()
+
+    class SessionContext:
+        def __enter__(self):
+            return Session()
+
+        def __exit__(self, *_args):
+            return False
+
+    dagrun_module = types.ModuleType("airflow.models.dagrun")
+    dagrun_module.DagRun = DagRun
+    session_module = types.ModuleType("airflow.utils.session")
+    session_module.create_session = SessionContext
+    monkeypatch.setitem(sys.modules, "airflow.models.dagrun", dagrun_module)
+    monkeypatch.setitem(sys.modules, "airflow.utils.session", session_module)
+
+    assert mod._previous_terminal_scheduled_run(
+        logical_date=datetime(2026, 7, 23, 10, tzinfo=timezone.utc)
+    ) == {
+        "run_id": "scheduled__2026-07-21T10:00:00+00:00",
+        "state": "failed",
+        "logical_date": genuine_date,
+    }
 
 
 @pytest.mark.unit
@@ -3094,9 +3360,7 @@ def test_campaign_ledger_rejects_batch_bytes_outside_endpoint_boundary(monkeypat
     "tamper",
     ("from_request", "to_endpoint", "provider_bytes", "cumulative_bytes"),
 )
-def test_campaign_ledger_rejects_tampered_atomic_endpoint_switch(
-    monkeypatch, tamper
-):
+def test_campaign_ledger_rejects_tampered_atomic_endpoint_switch(monkeypatch, tamper):
     mod = _load_dag_module()
     approval, events, request_events, snapshot, dag_id, run_id = (
         _finished_batch_campaign_reconciliation_case()
@@ -3754,6 +4018,133 @@ def test_terminal_gate_rejects_false_green_after_all_done_dq():
 
 
 @pytest.mark.unit
+def test_terminal_gate_does_not_count_manual_rollout_run():
+    mod = _load_dag_module()
+    instances = [
+        SimpleNamespace(
+            task_id="validate_whoscored_catalog", map_index=-1, state="success"
+        ),
+        SimpleNamespace(task_id="final_success_gate", map_index=-1, state="running"),
+    ]
+    dag_run = SimpleNamespace(
+        run_id="manual__rollout-smoke",
+        run_type="manual",
+        external_trigger=True,
+        conf={},
+        get_task_instances=lambda: instances,
+    )
+
+    result = mod.enforce_terminal_gate(
+        scope_plan={"rollout_id": "rollout-954"},
+        dag_run=dag_run,
+        ti=SimpleNamespace(task_id="final_success_gate"),
+        run_id=dag_run.run_id,
+    )
+
+    assert result["status"] == "success"
+    assert result["rollout_acceptance"] == {
+        "status": "not_counted",
+        "reason": "requires_scheduled_empty_conf",
+    }
+
+
+@pytest.mark.unit
+def test_rollout_receipt_is_persisted_only_after_dag_success(monkeypatch):
+    mod = _load_dag_module()
+    from dags.scripts import whoscored_ops_store, whoscored_rollout_acceptance
+
+    logical_date = datetime(2026, 7, 23, 10, tzinfo=timezone.utc)
+    instances = [
+        SimpleNamespace(
+            task_id="validate_whoscored_catalog", map_index=-1, state="success"
+        ),
+        SimpleNamespace(task_id="validate_active_scope", map_index=0, state="success"),
+        SimpleNamespace(task_id="final_success_gate", map_index=-1, state="success"),
+    ]
+    dag_run = SimpleNamespace(
+        run_id=f"scheduled__{logical_date.isoformat()}",
+        run_type="scheduled",
+        external_trigger=False,
+        conf={},
+        state="success",
+        get_task_instances=lambda: instances,
+    )
+    store = object()
+    captured = {}
+    previous = {
+        "run_id": "scheduled__2026-07-22T10:00:00+00:00",
+        "state": "success",
+        "logical_date": datetime(2026, 7, 22, 10, tzinfo=timezone.utc),
+    }
+    monkeypatch.setattr(
+        whoscored_ops_store.WhoScoredOpsStore,
+        "from_env",
+        classmethod(lambda _cls, *, optional: store),
+    )
+    monkeypatch.setattr(
+        mod, "_previous_terminal_scheduled_run", lambda **_kwargs: previous
+    )
+
+    def record(**kwargs):
+        captured.update(kwargs)
+        return {"status": "accepted", "wave_id": "wave-20"}
+
+    monkeypatch.setattr(whoscored_rollout_acceptance, "record_success_receipt", record)
+    xcom = {
+        "freeze_daily_scope_plan": {
+            "rollout_id": "rollout-954",
+            "wave_id": "wave-20",
+        },
+        "validate_whoscored_runtime": {"status": "success"},
+        "validate_whoscored_catalog": {"status": "success"},
+        "validate_active_scope": [{"scope": "scope-1"}],
+        "validate_profile_refresh": {"status": "success"},
+        "report_whoscored_traffic": {"schema_version": 1},
+        "validate_whoscored_daily_slo": {"status": "success"},
+        "validate_whoscored_paid_alert_delivery": {"status": "delivered"},
+    }
+    ti = SimpleNamespace(
+        task_id="final_success_gate",
+        xcom_pull=lambda *, task_ids: xcom[task_ids],
+    )
+
+    result = mod._record_rollout_acceptance_after_dag_success(
+        {
+            "dag_run": dag_run,
+            "ti": ti,
+            "run_id": dag_run.run_id,
+            "logical_date": logical_date,
+        }
+    )
+
+    assert result["status"] == "accepted"
+    assert captured["ops_store"] is store
+    assert captured["run_id"] == dag_run.run_id
+    assert captured["logical_date"] == logical_date
+    assert captured["previous_terminal_run"] == previous
+    assert captured["scope_dq"] == [{"scope": "scope-1"}]
+    assert captured["terminal_task_states"] == [
+        {"task_id": "final_success_gate", "map_index": -1, "state": "success"},
+        {"task_id": "validate_active_scope", "map_index": 0, "state": "success"},
+        {
+            "task_id": "validate_whoscored_catalog",
+            "map_index": -1,
+            "state": "success",
+        },
+    ]
+
+
+@pytest.mark.unit
+def test_rollout_success_callback_rejects_nonterminal_dagrun():
+    mod = _load_dag_module()
+    dag_run = SimpleNamespace(state="failed")
+    ti = SimpleNamespace(xcom_pull=lambda **_kwargs: pytest.fail("must not read XCom"))
+
+    with pytest.raises(mod.AirflowException, match="terminal-success DagRun"):
+        mod._record_rollout_acceptance_after_dag_success({"dag_run": dag_run, "ti": ti})
+
+
+@pytest.mark.unit
 def test_dag_uses_workflow_commands_durable_reports_and_bounded_tasks():
     mod = _load_dag_module()
     from airflow.operators.bash import BashOperator
@@ -3761,6 +4152,10 @@ def test_dag_uses_workflow_commands_durable_reports_and_bounded_tasks():
     by_id = {task.task_id: task for task in BashOperator._instances}
     assert mod.dag._dag_kwargs["dagrun_timeout"].total_seconds() == 6 * 3600
     assert mod.dag._dag_kwargs["is_paused_upon_creation"] is True
+    assert (
+        mod.dag._dag_kwargs["on_success_callback"]
+        is mod.record_rollout_acceptance_on_success
+    )
     from airflow.operators.python import PythonOperator
 
     slo = next(
@@ -3787,6 +4182,23 @@ def test_dag_uses_workflow_commands_durable_reports_and_bounded_tasks():
         if task.task_id == "validate_whoscored_paid_alert_delivery"
     )
     assert alert_preflight._init_kwargs["retries"] == 0
+    final_gate = next(
+        task
+        for task in PythonOperator._instances
+        if task.task_id == "final_success_gate"
+    )
+    acceptance_inputs = final_gate._init_kwargs["op_kwargs"]
+    assert {
+        name: value.operator.task_id for name, value in acceptance_inputs.items()
+    } == {
+        "scope_plan": "freeze_daily_scope_plan",
+        "runtime_preflight": "validate_whoscored_runtime",
+        "catalog_dq": "validate_whoscored_catalog",
+        "profile_dq": "validate_profile_refresh",
+        "traffic_dq": "report_whoscored_traffic",
+        "daily_slo": "validate_whoscored_daily_slo",
+        "alert_preflight": "validate_whoscored_paid_alert_delivery",
+    }
     for builder_task_id in (
         "build_whoscored_discovery_command",
         "build_active_scope_commands",

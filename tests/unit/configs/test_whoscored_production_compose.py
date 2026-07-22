@@ -460,6 +460,12 @@ def test_documented_whoscored_runtime_controls_reach_airflow_tasks() -> None:
         "WHOSCORED_RAW_LOCK_TIMEOUT_SECONDS": "55",
         "WHOSCORED_RAW_SNAPSHOT_LOCK_TIMEOUT_SECONDS": "300",
         "WHOSCORED_BACKUP_WORKERS": "16",
+        "WHOSCORED_BACKUP_RPO_HOURS": "24",
+        "WHOSCORED_BACKUP_RTO_HOURS": "24",
+        "WHOSCORED_BACKUP_RESTORE_DRILL_EVIDENCE_PATH": (
+            "/opt/airflow/logs/whoscored_backup/restore-drill-evidence.json"
+        ),
+        "WHOSCORED_BACKUP_RESTORE_DRILL_MAX_AGE_HOURS": "24",
         "WHOSCORED_BACKUP_LOCAL_RETENTION_DAYS": "14",
         "WHOSCORED_STRUCTURED_REQUESTS_PER_MINUTE": "60",
         "WHOSCORED_SCOPE_WRITE_CHUNK_ROWS": "20000",
@@ -734,8 +740,26 @@ def test_example_keeps_off_host_backup_disabled_until_provisioned() -> None:
         values[key] = value
 
     assert values["WHOSCORED_BACKUP_DESTINATION_URI"] == ""
-    assert values["WHOSCORED_BACKUP_DESTINATION_SITE_ID"] == ""
     assert values["WHOSCORED_BACKUP_DESTINATION_RETENTION_MODE"] == ""
+
+
+def test_whoscored_store_prefixes_follow_the_physical_warehouse_bucket() -> None:
+    compose = _compose()
+    environment = compose["x-airflow-common"]["environment"]
+    example = {}
+    for raw_line in (ROOT / ".env.example").read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            name, value = line.split("=", 1)
+            example[name] = value
+
+    assert example["ICEBERG_WAREHOUSE"] == "football"
+    assert environment["WHOSCORED_RAW_STORE_URI"] == (
+        "s3://${ICEBERG_WAREHOUSE}/raw/whoscored"
+    )
+    assert environment["WHOSCORED_OPS_STORE_URI"] == (
+        "s3://${ICEBERG_WAREHOUSE}/ops/whoscored"
+    )
 
 
 def test_one_time_storage_isolation_covers_heavy_without_paid_profile() -> None:

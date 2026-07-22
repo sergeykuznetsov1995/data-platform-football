@@ -39,6 +39,7 @@ RUNTIME_ENTRYPOINTS = frozenset(
         "dags/dag_ingest_whoscored.py",
         "dags/scripts/run_whoscored_backfill_item.py",
         "dags/scripts/run_whoscored_scraper.py",
+        "dags/scripts/whoscored_production_issuance.py",
         "dags/scripts/whoscored_proxy_runtime.py",
         "scripts/proxy_filter/filter_proxy.py",
         "scripts/whoscored_proxy_campaign.py",
@@ -89,10 +90,11 @@ RUNTIME_STATIC_FILES = frozenset(
         "scripts/research/bench_whoscored_workflow.py",
         "scripts/research/whoscored_capacity_container_runtime.py",
         "scripts/research/whoscored_capacity_worker_exec.py",
-        # These two host-side admission sources are loaded through an exact
+        # These host-side admission/decision sources are loaded through an exact
         # fd-relative protected path, so no ordinary Python import edge can
         # make them visible to the AST fixed-point walker.
         "scripts/validate_whoscored_build_provenance.py",
+        "scripts/whoscored_go_decision.py",
         "scripts/whoscored_production_admission.py",
     }
 )
@@ -746,7 +748,7 @@ def test_checked_in_whoscored_runtime_contract_matches_release_tree():
     assert EXPECTED_RUNTIME_FILES == tuple(sorted(EXPECTED_RUNTIME_FILES))
     assert len(EXPECTED_RUNTIME_FILES) == len(set(EXPECTED_RUNTIME_FILES))
     assert tuple(contract["files"]) == EXPECTED_RUNTIME_FILES
-    assert result["file_count"] == len(EXPECTED_RUNTIME_FILES) == 88
+    assert result["file_count"] == len(EXPECTED_RUNTIME_FILES) == 91
     assert len(result["code_tree_sha256"]) == 64
     assert len(result["manifest_sha256"]) == 64
 

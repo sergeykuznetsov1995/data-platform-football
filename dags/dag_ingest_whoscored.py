@@ -396,10 +396,18 @@ def _scheduled_daily_durations_hours() -> list[float]:
 
     with create_session() as session:
         bootstrap_rows = (
-            session.query(DagRun.run_id)
+            session.query(
+                DagRun.run_id,
+                DagRun.run_type,
+                DagRun.external_trigger,
+                DagRun.conf,
+            )
             .filter(
                 DagRun.dag_id == "dag_ingest_whoscored",
                 DagRun.run_id.like("scheduled__%"),
+                DagRun.run_type == "scheduled",
+                DagRun.external_trigger.is_(False),
+                DagRun.conf == {},
                 DagRun.start_date.isnot(None),
             )
             .order_by(DagRun.start_date.asc())
@@ -410,6 +418,9 @@ def _scheduled_daily_durations_hours() -> list[float]:
         rows = (
             session.query(
                 DagRun.run_id,
+                DagRun.run_type,
+                DagRun.external_trigger,
+                DagRun.conf,
                 DagRun.state,
                 DagRun.start_date,
                 DagRun.end_date,
@@ -418,6 +429,9 @@ def _scheduled_daily_durations_hours() -> list[float]:
                 DagRun.dag_id == "dag_ingest_whoscored",
                 DagRun.state.in_(("success", "failed")),
                 DagRun.run_id.like("scheduled__%"),
+                DagRun.run_type == "scheduled",
+                DagRun.external_trigger.is_(False),
+                DagRun.conf == {},
                 DagRun.start_date.isnot(None),
                 DagRun.end_date.isnot(None),
             )
@@ -426,12 +440,75 @@ def _scheduled_daily_durations_hours() -> list[float]:
             .all()
         )
     durations: list[float] = []
-    for run_id, _state, start_date, end_date in rows:
+    from dags.scripts.whoscored_rollout_acceptance import (
+        is_countable_scheduled_run,
+    )
+
+    for run_id, run_type, external_trigger, conf, _state, start_date, end_date in rows:
+        if not is_countable_scheduled_run(
+            run_id=run_id,
+            run_type=run_type,
+            external_trigger=external_trigger,
+            conf=conf,
+        ):
+            continue
         if str(run_id) == bootstrap_run_id:
             continue
         elapsed = max(0.0, (end_date - start_date).total_seconds() / 3600)
         durations.append(elapsed)
     return durations
+
+
+def _previous_terminal_scheduled_run(
+    *, logical_date: datetime
+) -> Optional[Dict[str, Any]]:
+    """Return the immediately preceding terminal scheduler-created DagRun."""
+
+    if logical_date.tzinfo is None:
+        raise AirflowException("WhoScored rollout logical_date must be timezone-aware")
+    from airflow.models.dagrun import DagRun
+    from airflow.utils.session import create_session
+
+    with create_session() as session:
+        rows = (
+            session.query(
+                DagRun.run_id,
+                DagRun.state,
+                DagRun.execution_date,
+                DagRun.run_type,
+                DagRun.external_trigger,
+                DagRun.conf,
+            )
+            .filter(
+                DagRun.dag_id == "dag_ingest_whoscored",
+                DagRun.run_id.like("scheduled__%"),
+                DagRun.run_type == "scheduled",
+                DagRun.external_trigger.is_(False),
+                DagRun.conf == {},
+                DagRun.state.in_(("success", "failed")),
+                DagRun.execution_date < logical_date,
+            )
+            .order_by(DagRun.execution_date.desc())
+            .all()
+        )
+    from dags.scripts.whoscored_rollout_acceptance import (
+        is_countable_scheduled_run,
+    )
+
+    for run_id, state, previous_logical_date, run_type, external_trigger, conf in rows:
+        if not is_countable_scheduled_run(
+            run_id=run_id,
+            run_type=run_type,
+            external_trigger=external_trigger,
+            conf=conf,
+        ):
+            continue
+        return {
+            "run_id": str(run_id),
+            "state": str(state).lower().split(".")[-1],
+            "logical_date": previous_logical_date,
+        }
+    return None
 
 
 def validate_whoscored_daily_slo(
@@ -654,6 +731,9 @@ def freeze_daily_scope_plan(
     catalog_scopes = sorted(scope.spec for scope, _runtime in selected)
     if not catalog_scopes or len(catalog_scopes) != len(set(catalog_scopes)):
         raise AirflowException("frozen WhoScored catalog has invalid active scopes")
+    catalog_scopes_sha256 = hashlib.sha256(
+        ("\n".join(catalog_scopes) + "\n").encode("utf-8")
+    ).hexdigest()
     transport = _transport_runtime(context)
     if transport.is_paid:
         approval = transport.approval
@@ -685,6 +765,13 @@ def freeze_daily_scope_plan(
                 f"or became ineligible: {missing}; audit_sha256="
                 f"{audit['audit_sha256']}"
             )
+        if (
+            authority.catalog_active_scope_count != len(catalog_scopes)
+            or authority.catalog_active_scopes_sha256 != catalog_scopes_sha256
+        ):
+            raise AirflowException(
+                "signed full active catalog identity differs from the candidate catalog"
+            )
         selected_by_scope = {
             scope.spec: (scope, runtime) for scope, runtime in selected
         }
@@ -715,6 +802,7 @@ def freeze_daily_scope_plan(
             {
                 "schema_version": 3,
                 "catalog_active_scope_count": len(catalog_scopes),
+                "catalog_active_scopes_sha256": catalog_scopes_sha256,
                 "deferred_scopes": deferred,
                 "deferred_scope_count": len(deferred),
                 "deferred_scopes_sha256": hashlib.sha256(
@@ -722,6 +810,18 @@ def freeze_daily_scope_plan(
                 ).hexdigest(),
                 "cohort_id": authority.cohort_id,
                 "cohort_sha256": authority.cohort_sha256,
+                "rollout_id": authority.rollout_id,
+                "wave_id": authority.wave_id,
+                "max_scopes": authority.max_scopes,
+                "require_full_active": authority.require_full_active,
+                "ranked_scope_ids_sha256": authority.ranked_scope_ids_sha256,
+                "ranked_workload_sha256": authority.ranked_workload_sha256,
+                "runtime_sha256": authority.runtime_sha256,
+                "classifier_sha256": authority.classifier_sha256,
+                "promotion_acceptance_sha256": (authority.promotion_acceptance_sha256),
+                "promotion_terminal_receipt_sha256": (
+                    authority.promotion_terminal_receipt_sha256
+                ),
                 "workload_sha256": authority.workload_sha256,
                 "scope_workloads": [
                     item.to_dict() for item in authority.scope_workloads
@@ -984,11 +1084,22 @@ def _daily_scope_plan_specs(scope_plan: Mapping[str, Any]) -> tuple[str, list[st
     }
     paid_fields = {
         "catalog_active_scope_count",
+        "catalog_active_scopes_sha256",
         "deferred_scopes",
         "deferred_scope_count",
         "deferred_scopes_sha256",
         "cohort_id",
         "cohort_sha256",
+        "rollout_id",
+        "wave_id",
+        "max_scopes",
+        "require_full_active",
+        "ranked_scope_ids_sha256",
+        "ranked_workload_sha256",
+        "runtime_sha256",
+        "classifier_sha256",
+        "promotion_acceptance_sha256",
+        "promotion_terminal_receipt_sha256",
         "workload_sha256",
         "scope_workloads",
         "discovery_parent_target_count",
@@ -1024,7 +1135,7 @@ def _daily_scope_plan_specs(scope_plan: Mapping[str, Any]) -> tuple[str, list[st
         or not isinstance(scopes, list)
         or not scopes
         or any(not isinstance(value, str) or not value for value in scopes)
-        or scopes != sorted(set(scopes))
+        or len(scopes) != len(set(scopes))
         or scope_plan.get("active_scope_count") != len(scopes)
         or scope_plan.get("active_scopes_sha256")
         != hashlib.sha256(("\n".join(scopes) + "\n").encode("utf-8")).hexdigest()
@@ -1034,6 +1145,8 @@ def _daily_scope_plan_specs(scope_plan: Mapping[str, Any]) -> tuple[str, list[st
         from scrapers.whoscored.proxy_campaign import (
             SCHEDULED_DISCOVERY_EXPANSION_HEADROOM,
             SCHEDULED_DISCOVERY_TARGET_LIMIT_MAX,
+            WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256,
+            WHOSCORED_ROLLOUT_WAVE_CONTRACTS,
             ScheduledScopeWorkload,
             canonical_json_bytes,
         )
@@ -1051,6 +1164,14 @@ def _daily_scope_plan_specs(scope_plan: Mapping[str, Any]) -> tuple[str, list[st
         discovery_parent_count = scope_plan.get("discovery_parent_target_count")
         discovery_target_limit = scope_plan.get("discovery_target_limit")
         profile_target_count = scope_plan.get("profile_target_count")
+        catalog_count = scope_plan.get("catalog_active_scope_count")
+        rollout_id = str(scope_plan.get("rollout_id") or "")
+        wave_id = str(scope_plan.get("wave_id") or "")
+        max_scopes = scope_plan.get("max_scopes")
+        require_full_active = scope_plan.get("require_full_active")
+        deferred_values = deferred if isinstance(deferred, list) else []
+        full_catalog_scopes = sorted([*scopes, *deferred_values])
+        expected_wave = WHOSCORED_ROLLOUT_WAVE_CONTRACTS.get(wave_id)
         if (
             not isinstance(deferred, list)
             or any(not isinstance(value, str) or not value for value in deferred)
@@ -1059,6 +1180,11 @@ def _daily_scope_plan_specs(scope_plan: Mapping[str, Any]) -> tuple[str, list[st
             or scope_plan.get("deferred_scope_count") != len(deferred)
             or scope_plan.get("catalog_active_scope_count")
             != len(scopes) + len(deferred)
+            or full_catalog_scopes != sorted(set(full_catalog_scopes))
+            or scope_plan.get("catalog_active_scopes_sha256")
+            != hashlib.sha256(
+                ("\n".join(full_catalog_scopes) + "\n").encode("utf-8")
+            ).hexdigest()
             or scope_plan.get("deferred_scopes_sha256")
             != hashlib.sha256(
                 ("\n".join(deferred) + ("\n" if deferred else "")).encode("utf-8")
@@ -1070,6 +1196,75 @@ def _daily_scope_plan_specs(scope_plan: Mapping[str, Any]) -> tuple[str, list[st
             is None
             or re.fullmatch(r"[0-9a-f]{64}", str(scope_plan.get("cohort_sha256") or ""))
             is None
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", rollout_id) is None
+            or expected_wave is None
+            or isinstance(max_scopes, bool)
+            or not isinstance(max_scopes, int)
+            or type(require_full_active) is not bool
+            or expected_wave != (max_scopes, require_full_active)
+            or isinstance(catalog_count, bool)
+            or not isinstance(catalog_count, int)
+            or not 1 <= catalog_count <= 2_000
+            or len(scopes) != min(max_scopes, catalog_count)
+            or (require_full_active and bool(deferred))
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(scope_plan.get("ranked_scope_ids_sha256") or ""),
+            )
+            is None
+            or (
+                require_full_active
+                and scope_plan.get("ranked_scope_ids_sha256")
+                != hashlib.sha256(
+                    ("\n".join(scopes) + "\n").encode("utf-8")
+                ).hexdigest()
+            )
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(scope_plan.get("ranked_workload_sha256") or ""),
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(scope_plan.get("runtime_sha256") or "")
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}", str(scope_plan.get("classifier_sha256") or "")
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(scope_plan.get("promotion_acceptance_sha256") or ""),
+            )
+            is None
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(scope_plan.get("promotion_terminal_receipt_sha256") or ""),
+            )
+            is None
+            or (
+                wave_id == "wave-20"
+                and (
+                    scope_plan.get("promotion_acceptance_sha256")
+                    != WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256
+                    or scope_plan.get("promotion_terminal_receipt_sha256")
+                    != WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256
+                )
+            )
+            or (
+                wave_id != "wave-20"
+                and (
+                    scope_plan.get("promotion_acceptance_sha256")
+                    == WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256
+                    or scope_plan.get("promotion_terminal_receipt_sha256")
+                    == WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256
+                )
+            )
+            or (
+                require_full_active
+                and scope_plan.get("ranked_workload_sha256")
+                != scope_plan.get("workload_sha256")
+            )
             or re.fullmatch(
                 r"[0-9a-f]{64}", str(scope_plan.get("workload_sha256") or "")
             )
@@ -1146,6 +1341,7 @@ def validate_whoscored_runtime(**context: Any) -> Dict[str, Any]:
         "transport_policy": transport.policy,
         "campaign_id": transport.campaign_id or None,
         "approval_id": transport.approval_id or None,
+        "approval_sha256": transport.approval_sha256 or None,
         "runtime_contract": contract,
         "source_pool_contract": pool_contract,
     }
@@ -2101,8 +2297,7 @@ def _campaign_ledger_paid_bytes(
                         endpoint in endpoint_map
                         or (
                             not endpoint_map
-                            and endpoint
-                            != batch_binding["expected_endpoint_labels"][0]
+                            and endpoint != batch_binding["expected_endpoint_labels"][0]
                         )
                     )
                 )
@@ -5263,31 +5458,236 @@ def aggregate_traffic_reports(
     return summary
 
 
-def enforce_terminal_gate(**context: Any) -> Dict[str, Any]:
-    """Prevent ``all_done`` diagnostics from turning a failed run green."""
+def _successful_task_state_records(
+    dag_run: Any, *, exclude_task_id: Optional[str] = None
+) -> list[Dict[str, Any]]:
+    records: list[Dict[str, Any]] = []
+    failures: list[str] = []
+    for task_instance in dag_run.get_task_instances():
+        if task_instance.task_id == exclude_task_id:
+            continue
+        state = str(task_instance.state or "none").lower().split(".")[-1]
+        map_index = int(getattr(task_instance, "map_index", -1))
+        if state != "success":
+            suffix = f"[{map_index}]" if map_index >= 0 else ""
+            failures.append(f"{task_instance.task_id}{suffix}={state}")
+            continue
+        records.append(
+            {
+                "task_id": str(task_instance.task_id),
+                "map_index": map_index,
+                "state": state,
+            }
+        )
+    if failures:
+        raise AirflowException(
+            "WhoScored upstream/DQ tasks were not successful: " + ", ".join(failures)
+        )
+    return sorted(records, key=lambda item: (item["task_id"], item["map_index"]))
+
+
+def enforce_terminal_gate(
+    *,
+    scope_plan: Optional[Mapping[str, Any]] = None,
+    runtime_preflight: Optional[Mapping[str, Any]] = None,
+    catalog_dq: Optional[Mapping[str, Any]] = None,
+    profile_dq: Optional[Mapping[str, Any]] = None,
+    traffic_dq: Optional[Mapping[str, Any]] = None,
+    daily_slo: Optional[Mapping[str, Any]] = None,
+    alert_preflight: Optional[Mapping[str, Any]] = None,
+    **context: Any,
+) -> Dict[str, Any]:
+    """Prevent false green and persist countable staged-rollout evidence."""
     dag_run = context.get("dag_run")
     current_ti = context.get("ti")
     if dag_run is None:
         raise AirflowException("terminal gate requires dag_run context")
     current_task_id = getattr(current_ti, "task_id", "final_success_gate")
-    failures: list[str] = []
-    for task_instance in dag_run.get_task_instances():
-        if task_instance.task_id == current_task_id:
-            continue
-        state = str(task_instance.state or "none").lower().split(".")[-1]
-        if state != "success":
-            suffix = (
-                f"[{task_instance.map_index}]" if task_instance.map_index >= 0 else ""
-            )
-            failures.append(f"{task_instance.task_id}{suffix}={state}")
-    if failures:
-        raise AirflowException(
-            "WhoScored upstream/DQ tasks were not successful: " + ", ".join(failures)
-        )
-    return {
+    task_states = _successful_task_state_records(
+        dag_run, exclude_task_id=current_task_id
+    )
+    result: Dict[str, Any] = {
         "status": "success",
-        "checked_task_instances": len(dag_run.get_task_instances()) - 1,
+        "checked_task_instances": len(task_states),
     }
+    if not isinstance(scope_plan, Mapping) or not scope_plan.get("rollout_id"):
+        result["rollout_acceptance"] = {
+            "status": "not_counted",
+            "reason": "no_signed_rollout",
+        }
+        return result
+
+    from dags.scripts.whoscored_rollout_acceptance import (
+        is_countable_scheduled_run,
+    )
+
+    run_id = str(context.get("run_id") or getattr(dag_run, "run_id", "") or "")
+    run_type = getattr(dag_run, "run_type", None)
+    external_trigger = getattr(dag_run, "external_trigger", None)
+    conf = getattr(dag_run, "conf", None)
+    if not is_countable_scheduled_run(
+        run_id=run_id,
+        run_type=run_type,
+        external_trigger=external_trigger,
+        conf=conf,
+    ):
+        result["rollout_acceptance"] = {
+            "status": "not_counted",
+            "reason": "requires_scheduled_empty_conf",
+        }
+        return result
+    if isinstance(daily_slo, Mapping) and daily_slo.get("status") == "warming_up":
+        result["rollout_acceptance"] = {
+            "status": "not_counted",
+            "reason": "daily_slo_warming_up",
+        }
+        return result
+    required_evidence = {
+        "runtime_preflight": runtime_preflight,
+        "catalog_dq": catalog_dq,
+        "profile_dq": profile_dq,
+        "traffic_dq": traffic_dq,
+        "daily_slo": daily_slo,
+        "alert_preflight": alert_preflight,
+    }
+    missing_evidence = sorted(
+        name
+        for name, value in required_evidence.items()
+        if not isinstance(value, Mapping)
+    )
+    if missing_evidence:
+        raise AirflowException(
+            "WhoScored rollout acceptance evidence is missing: "
+            + ", ".join(missing_evidence)
+        )
+    result["rollout_acceptance"] = {
+        "status": "awaiting_dag_success_callback",
+        "rollout_id": scope_plan["rollout_id"],
+        "wave_id": scope_plan.get("wave_id"),
+    }
+    return result
+
+
+def _record_rollout_acceptance_after_dag_success(
+    context: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Seal rollout evidence only after Airflow made the DagRun terminal-green."""
+
+    dag_run = context.get("dag_run")
+    ti = context.get("ti")
+    if dag_run is None or ti is None or not callable(getattr(ti, "xcom_pull", None)):
+        raise AirflowException(
+            "WhoScored success callback requires DagRun and TaskInstance context"
+        )
+    dag_state = str(getattr(dag_run, "state", "") or "").lower().split(".")[-1]
+    if dag_state != "success":
+        raise AirflowException(
+            "WhoScored rollout receipt requires a terminal-success DagRun"
+        )
+    scope_plan = ti.xcom_pull(task_ids="freeze_daily_scope_plan")
+    if not isinstance(scope_plan, Mapping) or not scope_plan.get("rollout_id"):
+        return {"status": "not_counted", "reason": "no_signed_rollout"}
+
+    from dags.scripts.whoscored_rollout_acceptance import (
+        WhoScoredRolloutAcceptanceError,
+        is_countable_scheduled_run,
+        record_success_receipt,
+    )
+
+    run_id = str(getattr(dag_run, "run_id", "") or context.get("run_id") or "")
+    if not is_countable_scheduled_run(
+        run_id=run_id,
+        run_type=getattr(dag_run, "run_type", None),
+        external_trigger=getattr(dag_run, "external_trigger", None),
+        conf=getattr(dag_run, "conf", None),
+    ):
+        return {"status": "not_counted", "reason": "requires_scheduled_empty_conf"}
+    daily_slo = ti.xcom_pull(task_ids="validate_whoscored_daily_slo")
+    if isinstance(daily_slo, Mapping) and daily_slo.get("status") == "warming_up":
+        return {"status": "not_counted", "reason": "daily_slo_warming_up"}
+    runtime_preflight = ti.xcom_pull(task_ids="validate_whoscored_runtime")
+    catalog_dq = ti.xcom_pull(task_ids="validate_whoscored_catalog")
+    profile_dq = ti.xcom_pull(task_ids="validate_profile_refresh")
+    traffic_dq = ti.xcom_pull(task_ids="report_whoscored_traffic")
+    alert_preflight = ti.xcom_pull(task_ids="validate_whoscored_paid_alert_delivery")
+    required_evidence = {
+        "runtime_preflight": runtime_preflight,
+        "catalog_dq": catalog_dq,
+        "profile_dq": profile_dq,
+        "traffic_dq": traffic_dq,
+        "daily_slo": daily_slo,
+        "alert_preflight": alert_preflight,
+    }
+    missing_evidence = sorted(
+        name
+        for name, value in required_evidence.items()
+        if not isinstance(value, Mapping)
+    )
+    if missing_evidence:
+        raise AirflowException(
+            "WhoScored rollout success evidence is missing: "
+            + ", ".join(missing_evidence)
+        )
+    raw_scope_dq = ti.xcom_pull(task_ids="validate_active_scope")
+    if isinstance(raw_scope_dq, Mapping):
+        scope_dq = [raw_scope_dq]
+    else:
+        try:
+            scope_dq = list(raw_scope_dq)
+        except TypeError as exc:
+            raise AirflowException(
+                "WhoScored mapped scope DQ XCom is unavailable"
+            ) from exc
+    logical_date = context.get("logical_date") or getattr(
+        dag_run, "execution_date", None
+    )
+    if not isinstance(logical_date, datetime) or logical_date.tzinfo is None:
+        raise AirflowException(
+            "WhoScored rollout success callback requires logical_date"
+        )
+    terminal_task_states = _successful_task_state_records(dag_run)
+    from dags.scripts.whoscored_ops_store import WhoScoredOpsStore
+
+    ops_store = WhoScoredOpsStore.from_env(optional=False)
+    if ops_store is None:  # pragma: no cover - guarded by optional=False
+        raise AirflowException("WhoScored rollout operational store is required")
+    try:
+        return record_success_receipt(
+            ops_store=ops_store,
+            run_id=run_id,
+            logical_date=logical_date,
+            scope_plan=scope_plan,
+            runtime_preflight=runtime_preflight,
+            catalog_dq=catalog_dq,
+            scope_dq=scope_dq,
+            profile_dq=profile_dq,
+            traffic_dq=traffic_dq,
+            daily_slo=daily_slo,
+            alert_preflight=alert_preflight,
+            terminal_task_states=terminal_task_states,
+            previous_terminal_run=_previous_terminal_scheduled_run(
+                logical_date=logical_date
+            ),
+        )
+    except WhoScoredRolloutAcceptanceError as exc:
+        raise AirflowException(str(exc)) from exc
+
+
+def record_rollout_acceptance_on_success(context: Mapping[str, Any]) -> None:
+    """DAG callback wrapper that also pages if sealing acceptance fails."""
+
+    try:
+        _record_rollout_acceptance_after_dag_success(context)
+    except Exception as exc:
+        failure_callback = SCRAPER_ARGS.get("on_failure_callback")
+        if callable(failure_callback):
+            alert_context = dict(context)
+            alert_context["exception"] = exc
+            try:
+                failure_callback(alert_context)
+            except Exception:
+                pass
+        raise
 
 
 with DAG(
@@ -5303,6 +5703,7 @@ with DAG(
     # Task-level callbacks on a mapped fan-out produce one page per failed
     # map index.  A DAG-level callback reports the failed DagRun exactly once.
     on_failure_callback=SCRAPER_ARGS.get("on_failure_callback"),
+    on_success_callback=record_rollout_acceptance_on_success,
     params={
         "transport_policy": "direct_only",
         "paid_approval_id": "",
@@ -5477,6 +5878,15 @@ with DAG(
     final_gate = PythonOperator(
         task_id="final_success_gate",
         python_callable=enforce_terminal_gate,
+        op_kwargs={
+            "scope_plan": freeze_scope_plan.output,
+            "runtime_preflight": runtime_preflight.output,
+            "catalog_dq": catalog_dq.output,
+            "profile_dq": profile_dq.output,
+            "traffic_dq": traffic_dq.output,
+            "daily_slo": daily_slo.output,
+            "alert_preflight": paid_alert_preflight.output,
+        },
         trigger_rule="all_done",
         execution_timeout=timedelta(minutes=5),
     )
