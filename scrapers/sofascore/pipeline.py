@@ -20,6 +20,7 @@ from scrapers.sofascore.capture_engine import (
     SofaScoreCaptureEngine,
 )
 from scrapers.sofascore.manifest import (
+    BatchingManifestStore,
     EndpointManifest,
     JsonFileManifestStore,
     ManifestKey,
@@ -104,7 +105,14 @@ def build_capture_runtime(
     if backend == 'trino':
         from scrapers.base.trino_manager import TrinoTableManager
 
-        manifest_store: ManifestStore = TrinoManifestStore(TrinoTableManager())
+        # Batching bounds Iceberg snapshot growth to O(flushes) (#1003);
+        # SOFASCORE_MANIFEST_BATCH_SIZE=1 restores record-at-a-time commits.
+        manifest_store: ManifestStore = BatchingManifestStore(
+            TrinoManifestStore(TrinoTableManager()),
+            max_pending=max(
+                1, int(os.environ.get('SOFASCORE_MANIFEST_BATCH_SIZE', '200'))
+            ),
+        )
     elif backend == 'json':
         path = os.environ.get(
             'SOFASCORE_MANIFEST_PATH', '/tmp/sofascore-endpoint-manifest.json'

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import threading
 import uuid
@@ -18,6 +19,9 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional, Protocol
+
+
+logger = logging.getLogger(__name__)
 
 
 MANIFEST_VERSION = "sofascore-endpoint-v1"
@@ -181,6 +185,82 @@ class InMemoryManifestStore:
     def list_for_run(self, run_id: str) -> list[EndpointManifest]:
         with self._lock:
             return [r for r in self._records.values() if r.run_id == run_id]
+
+
+class BatchingManifestStore:
+    """Write-behind buffer bounding Iceberg snapshot growth (#1003).
+
+    ``TrinoManifestStore.upsert`` costs one Iceberg commit per endpoint
+    observation, so a large capture run grows the manifest table by O(rows)
+    snapshots (the 2026-07-18..21 freeze: 14 810 snapshots, commit latency
+    0.4s -> 8.5s). This wrapper coalesces pending records and flushes them
+    through the inner store's ``upsert_many`` (one MERGE, one snapshot per
+    flush), making growth O(flushes).
+
+    Semantics preserved for in-process readers: ``get`` consults the pending
+    buffer first (read-your-writes), ``list_for_run`` flushes before querying.
+    Durability trade-off: a crash loses at most ``max_pending`` unflushed
+    records. Raw payloads are persisted to the raw store *before* the manifest
+    record is written, so a resumed run re-captures only the lost endpoints;
+    committed raw blobs and Bronze rows are never lost. ``max_pending=1``
+    restores the previous record-at-a-time behaviour.
+    """
+
+    def __init__(self, inner: ManifestStore, *, max_pending: int = 200) -> None:
+        if max_pending < 1:
+            raise ValueError("max_pending must be >= 1")
+        self.inner = inner
+        self.max_pending = max_pending
+        self._pending: Dict[ManifestKey, EndpointManifest] = {}
+        self._lock = threading.RLock()
+
+    def get(self, key: ManifestKey) -> Optional[EndpointManifest]:
+        with self._lock:
+            pending = self._pending.get(key)
+        return pending if pending is not None else self.inner.get(key)
+
+    def upsert(self, record: EndpointManifest) -> None:
+        with self._lock:
+            self._pending[record.key] = record
+            if len(self._pending) >= self.max_pending:
+                self._flush_locked()
+
+    def list_for_run(self, run_id: str) -> Iterable[EndpointManifest]:
+        with self._lock:
+            self._flush_locked()
+        return self.inner.list_for_run(run_id)
+
+    def flush(self) -> None:
+        with self._lock:
+            self._flush_locked()
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    def _flush_locked(self) -> None:
+        if not self._pending:
+            return
+        records = list(self._pending.values())
+        upsert_many = getattr(self.inner, "upsert_many", None)
+        if callable(upsert_many):
+            try:
+                upsert_many(records)
+                self._pending.clear()
+                return
+            except Exception:
+                # One bulk MERGE failed as a unit. Fall back to per-record
+                # upserts so healthy records still commit; a record that fails
+                # again stays pending and the error propagates to the task.
+                logger.warning(
+                    "bulk manifest flush of %d records failed; retrying per record",
+                    len(records),
+                    exc_info=True,
+                )
+        for record in records:
+            self.inner.upsert(record)
+            del self._pending[record.key]
 
 
 class JsonFileManifestStore:
