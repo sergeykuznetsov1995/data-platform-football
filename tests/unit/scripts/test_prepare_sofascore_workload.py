@@ -18,6 +18,7 @@ from dags.scripts.prepare_sofascore_workload import (
 from scrapers.sofascore.workload_plan import (
     WorkloadBudgetPolicy,
     WorkloadClassBudget,
+    WorkloadPolicyUnavailable,
     match_workload_class,
     player_workload_class,
     production_match_shape,
@@ -36,6 +37,11 @@ EPL_SEASON_SHAPE = production_season_shape(
     team_count_band="16_20",
     max_pages_per_direction=50,
 )
+
+
+@pytest.fixture(autouse=True)
+def _pin_test_workload_policy(monkeypatch):
+    monkeypatch.setenv("SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", "b" * 64)
 
 
 def _policy(season_shape=EPL_SEASON_SHAPE, tournament="17"):
@@ -117,6 +123,88 @@ def _common_patches(plan):
             return_value=plan,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    "configured_pin",
+    [None, "", "b" * 63, "B" * 64, "g" * 64, "b" * 64 + "\n", "0" * 64],
+)
+def test_prepare_rejects_missing_noncanonical_or_zero_pin_before_loading_policy(
+    tmp_path, monkeypatch, configured_pin
+):
+    if configured_pin is None:
+        monkeypatch.delenv("SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", raising=False)
+    else:
+        monkeypatch.setenv("SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", configured_pin)
+    policy_loads = []
+
+    def load_policy(_path):
+        policy_loads.append(True)
+        raise AssertionError("policy must not be loaded without a canonical pin")
+
+    destination = tmp_path / "must-not-exist.json"
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.load_verified_workload_policy",
+            side_effect=load_policy,
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload.build_capture_runtime",
+            side_effect=AssertionError("preparation must not start"),
+        ),
+        pytest.raises(
+            WorkloadPolicyUnavailable,
+            match="64 lowercase hexadecimal|zero placeholder",
+        ),
+    ):
+        prepare_workload_plan(
+            dag_id="dag_ingest_sofascore",
+            base_run_id="scheduled-pin-rejection",
+            phase="season",
+            competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=destination,
+        )
+
+    assert policy_loads == []
+    assert not destination.exists()
+
+
+def test_prepare_rejects_verified_policy_that_does_not_match_artifact_pin(
+    tmp_path, monkeypatch
+):
+    required_artifact_id = "a" * 64
+    loaded_artifact_id = "b" * 64
+    monkeypatch.setenv(
+        "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", required_artifact_id
+    )
+    destination = tmp_path / "must-not-exist.json"
+
+    with (
+        patch(
+            "dags.scripts.prepare_sofascore_workload.load_verified_workload_policy",
+            return_value=_policy(),
+        ) as load_policy,
+        patch(
+            "dags.scripts.prepare_sofascore_workload.build_capture_runtime",
+            side_effect=AssertionError("preparation must not start"),
+        ),
+        pytest.raises(WorkloadPolicyUnavailable, match="required artifact pin")
+        as exc_info,
+    ):
+        prepare_workload_plan(
+            dag_id="dag_ingest_sofascore",
+            base_run_id="scheduled-pin-mismatch",
+            phase="season",
+            competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=destination,
+        )
+
+    load_policy.assert_called_once_with(tmp_path / "artifact.json")
+    assert required_artifact_id not in str(exc_info.value)
+    assert loaded_artifact_id not in str(exc_info.value)
+    assert not destination.exists()
 
 
 def test_observed_universe_uses_match_bronze_resolver_not_old_universe():

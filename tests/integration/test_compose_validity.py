@@ -27,6 +27,9 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_FILE = PROJECT_ROOT / "compose.yaml"
+SOFASCORE_GATEWAY_COMPOSE = (
+    PROJECT_ROOT / "deploy" / "sofascore" / "gateway.compose.yaml"
+)
 SUPERVISED_OVERLAY = PROJECT_ROOT / "compose.seaweedfs-supervised.yaml"
 SUPERSET_DIR = PROJECT_ROOT / "configs" / "superset"
 OPENMETADATA_DIR = PROJECT_ROOT / "configs" / "openmetadata"
@@ -41,6 +44,11 @@ COMPOSE_TEST_ENV = {
     "LAKEKEEPER_DB_PASSWORD": "ci-not-a-secret",
     "LAKEKEEPER_PG_ENCRYPTION_KEY": "0" * 32,
     "SEAWEEDFS_VOLUME_SIZE_LIMIT_MB": "1024",
+    # Required deployment-owned SofaScore binds.  Config rendering does not
+    # start containers; explicit dummy sources keep this test independent of a
+    # production host layout while exercising fail-closed interpolation.
+    "SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST": "/tmp/compose-test-sofascore-budget.json",
+    "SOFASCORE_GATEWAY_STATE_HOST_DIR": "/tmp/compose-test-sofascore-gateway-state",
 }
 
 
@@ -91,6 +99,42 @@ def _compose_config_json(*extra_files: Path) -> dict:
     return json.loads(proc.stdout)
 
 
+def _sofascore_gateway_config_json() -> dict:
+    """Render the separately owned SofaScore gateway compose project."""
+    if not _docker_available():
+        pytest.skip("docker CLI not available on this host")
+
+    proc = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "--project-name",
+            "sofascore-gw-config-test",
+            "--file",
+            str(SOFASCORE_GATEWAY_COMPOSE),
+            "--project-directory",
+            str(PROJECT_ROOT),
+            "--env-file",
+            str(PROJECT_ROOT / ".env.example"),
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=str(PROJECT_ROOT),
+        env=COMPOSE_TEST_ENV,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if proc.returncode != 0:
+        pytest.fail(
+            "SofaScore gateway compose config failed "
+            f"(rc={proc.returncode}):\nSTDOUT: {proc.stdout[:1000]}\n"
+            f"STDERR: {proc.stderr[:1000]}"
+        )
+    return json.loads(proc.stdout)
+
+
 @pytest.mark.integration
 class TestComposeFile:
     def test_compose_file_exists(self):
@@ -120,6 +164,67 @@ class TestComposeFile:
         assert proc.returncode == 0, (
             f"compose validation failed:\n{proc.stderr[:2000]}"
         )
+
+    def test_sofascore_gateway_renders_with_durable_exact_binds(self):
+        cfg = _sofascore_gateway_config_json()
+        service = cfg["services"]["sofascore_proxy_filter"]
+        volumes = {volume["target"]: volume for volume in service["volumes"]}
+        artifact_target = (
+            "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
+        )
+        state_target = "/opt/airflow/logs/sofascore_proxy_filter"
+
+        assert volumes[artifact_target]["source"] == (
+            COMPOSE_TEST_ENV["SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST"]
+        )
+        assert volumes[artifact_target]["read_only"] is True
+        # Compose normalizes explicit false to an empty bind-options object in
+        # some releases; the raw unit contract separately pins the source YAML.
+        assert volumes[artifact_target]["bind"].get("create_host_path", False) is False
+        assert volumes[state_target]["source"] == (
+            COMPOSE_TEST_ENV["SOFASCORE_GATEWAY_STATE_HOST_DIR"]
+        )
+        assert volumes[state_target].get("read_only", False) is False
+        assert volumes[state_target]["bind"].get("create_host_path", False) is False
+        assert "/opt/airflow/logs" not in volumes
+        assert service["healthcheck"]["test"][0:4] == [
+            "CMD",
+            "python",
+            "/opt/airflow/scripts/sofascore_runtime_preflight.py",
+            "gateway-health",
+        ]
+        assert service["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"] == (
+            "0" * 64
+        )
+
+    def test_scheduler_renders_with_exact_sofascore_artifact_bind(self):
+        cfg = _compose_config_json()
+        scheduler = cfg["services"]["airflow-scheduler"]
+        volumes = {volume["target"]: volume for volume in scheduler["volumes"]}
+        artifact_target = (
+            "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
+        )
+
+        assert volumes[artifact_target]["source"] == (
+            COMPOSE_TEST_ENV["SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST"]
+        )
+        assert volumes[artifact_target]["read_only"] is True
+        assert volumes[artifact_target]["bind"].get(
+            "create_host_path", False
+        ) is False
+        assert "/opt/airflow/configs/proxy_filter" in volumes
+        assert len(volumes) == len(scheduler["volumes"])
+        assert not any(
+            target != artifact_target and artifact_target.startswith(f"{target}/")
+            for target in volumes
+        )
+        assert scheduler["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT"] == (
+            artifact_target
+        )
+        assert scheduler["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"] == (
+            "0" * 64
+        )
+        assert scheduler["healthcheck"]["test"][0] == "CMD-SHELL"
 
     def test_required_bi_catalog_services_present(self):
         cfg = _compose_config_json()
@@ -192,7 +297,7 @@ class TestComposeFile:
             "flaresolverr_whoscored_paid",
         }.isdisjoint(services)
 
-    def test_paid_profile_contains_only_explicit_whoscored_boundary_services(self):
+    def test_retired_paid_profile_cannot_restore_external_whoscored_services(self):
         if not _docker_available():
             pytest.skip("docker CLI not available")
         proc = subprocess.run(
@@ -220,7 +325,7 @@ class TestComposeFile:
             "whoscored_proxy_filter",
             "whoscored_paid_gateway",
             "flaresolverr_whoscored_paid",
-        } <= services
+        }.isdisjoint(services)
 
     def test_superset_exposes_8088(self):
         cfg = _compose_config_json()

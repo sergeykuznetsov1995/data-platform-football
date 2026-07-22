@@ -128,6 +128,117 @@ class TestSessionMinRetention:
 
 
 @pytest.mark.unit
+class TestSofaScoreCaptureManifestMaintenance:
+    class Connection:
+        def __init__(self, *, fail_on: str | None = None):
+            self.fail_on = fail_on
+            self.executed: list[str] = []
+            self.cursors = []
+            self.closed = False
+            self.snapshot_counts = iter((9, 1))
+            self.file_stats = iter(((12, 4096), (2, 1024)))
+
+        def cursor(self):
+            connection = self
+
+            class Cursor:
+                description = []
+
+                def __init__(self):
+                    self.sql = ""
+                    self.closed = False
+
+                def execute(self, sql):
+                    self.sql = sql
+                    connection.executed.append(sql)
+                    if connection.fail_on and connection.fail_on in sql:
+                        raise RuntimeError("procedure failed")
+
+                def fetchall(self):
+                    if "$snapshots" in self.sql:
+                        return [(next(connection.snapshot_counts),)]
+                    if "$files" in self.sql:
+                        return [next(connection.file_stats)]
+                    if self.sql.startswith("SELECT count(*)"):
+                        return [(104,)]
+                    return []
+
+                def close(self):
+                    self.closed = True
+
+            cursor = Cursor()
+            self.cursors.append(cursor)
+            return cursor
+
+        def close(self):
+            self.closed = True
+
+    def test_full_optimize_then_expire_with_before_after_stats(self, monkeypatch):
+        import utils.maintenance_tasks as maintenance
+
+        conn = self.Connection()
+        monkeypatch.setattr(maintenance, "_get_trino_connection", lambda: conn)
+
+        result = maintenance.maintain_sofascore_capture_manifest()
+
+        assert result["before"] == {
+            "row_count": 104,
+            "snapshot_count": 9,
+            "live_data_file_count": 12,
+            "live_data_file_bytes": 4096,
+        }
+        assert result["after"] == {
+            "row_count": 104,
+            "snapshot_count": 1,
+            "live_data_file_count": 2,
+            "live_data_file_bytes": 1024,
+        }
+        assert conn.executed == [
+            'SELECT count(*) FROM iceberg."ops"."sofascore_capture_manifest"',
+            'SELECT count(*) FROM iceberg."ops"."sofascore_capture_manifest$snapshots"',
+            "SELECT count_if(content = 0), "
+            "coalesce(sum(IF(content = 0, file_size_in_bytes, 0)), 0) "
+            'FROM iceberg."ops"."sofascore_capture_manifest$files"',
+            'ALTER TABLE iceberg."ops"."sofascore_capture_manifest" EXECUTE optimize',
+            'ALTER TABLE iceberg."ops"."sofascore_capture_manifest" '
+            "EXECUTE expire_snapshots(retention_threshold => '7d')",
+            'SELECT count(*) FROM iceberg."ops"."sofascore_capture_manifest"',
+            'SELECT count(*) FROM iceberg."ops"."sofascore_capture_manifest$snapshots"',
+            "SELECT count_if(content = 0), "
+            "coalesce(sum(IF(content = 0, file_size_in_bytes, 0)), 0) "
+            'FROM iceberg."ops"."sofascore_capture_manifest$files"',
+        ]
+        assert all("EXECUTE remove_orphan_files" not in sql for sql in conn.executed)
+        assert conn.closed is True
+        assert all(cursor.closed for cursor in conn.cursors)
+
+    def test_procedure_error_propagates_and_connection_closes(self, monkeypatch):
+        import utils.maintenance_tasks as maintenance
+
+        conn = self.Connection(fail_on="EXECUTE optimize")
+        monkeypatch.setattr(maintenance, "_get_trino_connection", lambda: conn)
+
+        with pytest.raises(RuntimeError, match="procedure failed"):
+            maintenance.maintain_sofascore_capture_manifest()
+
+        assert conn.closed is True
+        assert all(cursor.closed for cursor in conn.cursors)
+        assert not any("expire_snapshots" in sql for sql in conn.executed)
+        assert not any("remove_orphan_files" in sql for sql in conn.executed)
+
+    def test_retention_is_validated_before_connecting(self, monkeypatch):
+        import utils.maintenance_tasks as maintenance
+
+        monkeypatch.setattr(
+            maintenance,
+            "_get_trino_connection",
+            lambda: pytest.fail("invalid retention must not connect"),
+        )
+        with pytest.raises(ValueError, match="positive Trino duration"):
+            maintenance.maintain_sofascore_capture_manifest("7d'); DROP TABLE x; --")
+
+
+@pytest.mark.unit
 class TestFrozenDQLogicalRetention:
     def test_scheduled_cleanup_is_bounded_and_closes_connection(self, monkeypatch):
         from dags.scripts import whoscored_frozen_dq

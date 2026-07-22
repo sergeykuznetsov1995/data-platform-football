@@ -3,20 +3,28 @@ name: SofaScore production CI
 on:
   pull_request:
     paths:
+      - ".env.example"
       - ".github/workflows/sofascore-*.yml"
+      - "compose.yaml"
       - "configs/sofascore/**"
       - "dags/dag_ingest_sofascore.py"
       - "dags/dag_canary_sofascore_proxy.py"
+      - "dags/dag_iceberg_maintenance.py"
       - "dags/dag_sofascore_pipeline.py"
       - "dags/dag_transform_e3.py"
       - "dags/scripts/*sofascore*"
       - "dags/sql/**/*sofascore*"
+      - "dags/utils/maintenance_tasks.py"
       - "dags/utils/sofascore_dq.py"
+      - "deploy/sofascore/**"
       - "scrapers/base/**"
       - "scrapers/sofascore/**"
       - "scripts/**/*sofascore*"
       - "scripts/proxy_filter/**"
       - "tests/fixtures/sofascore*"
+      - "tests/integration/test_compose_validity.py"
+      - "tests/unit/dags/test_dag_iceberg_maintenance.py"
+      - "tests/unit/dags/test_maintenance_tasks.py"
       - "tests/unit/**/*sofascore*"
       - "tests/unit/scripts/test_filter_proxy.py"
 
@@ -57,13 +65,18 @@ jobs:
             scrapers/sofascore \
             dags/dag_ingest_sofascore.py \
             dags/dag_canary_sofascore_proxy.py \
+            dags/dag_iceberg_maintenance.py \
             dags/dag_sofascore_pipeline.py \
             dags/scripts/run_sofascore_scraper.py \
             dags/scripts/prepare_sofascore_workload.py \
             dags/scripts/run_sofascore_discovery.py \
+            dags/utils/maintenance_tasks.py \
             dags/utils/sofascore_dq.py \
             scripts/migrate_sofascore_production.py \
             scripts/backfill_sofascore.py \
+            scripts/purge_sofascore_manifest_observations.py \
+            scripts/sofascore_capture_manifest_guard_v1.py \
+            scripts/sofascore_runtime_preflight.py \
             scripts/proxy_filter \
             scripts/research/bench_sofascore_paid_canary.py
           python -m compileall -q \
@@ -72,6 +85,12 @@ jobs:
             dags/dag_sofascore_pipeline.py \
             scripts/migrate_sofascore_production.py \
             scripts/research/bench_sofascore_paid_canary.py
+          python -m py_compile \
+            dags/dag_iceberg_maintenance.py \
+            dags/utils/maintenance_tasks.py \
+            scripts/purge_sofascore_manifest_observations.py \
+            scripts/sofascore_capture_manifest_guard_v1.py \
+            scripts/sofascore_runtime_preflight.py
 
       - name: SofaScore unit and topology tests
         env:
@@ -82,8 +101,10 @@ jobs:
             tests/unit/configs/test_sofascore_proxy_canary_cohort.py \
             tests/unit/dags/test_dag_ingest_sofascore.py \
             tests/unit/dags/test_dag_canary_sofascore_proxy.py \
+            tests/unit/dags/test_dag_iceberg_maintenance.py \
             tests/unit/dags/test_dag_sofascore_pipeline.py \
             tests/unit/dags/test_dag_transform_e3_sofascore_dq.py \
+            tests/unit/dags/test_maintenance_tasks.py \
             tests/unit/dq/test_sofascore_dq.py \
             tests/unit/scrapers/test_run_sofascore_discovery.py \
             tests/unit/scrapers/test_run_sofascore_scraper.py \
@@ -110,7 +131,11 @@ jobs:
             tests/unit/scripts/test_filter_proxy.py \
             tests/unit/scripts/test_migrate_sofascore_production.py \
             tests/unit/scripts/test_prepare_sofascore_workload.py \
+            tests/unit/scripts/test_purge_sofascore_manifest_observations.py \
             tests/unit/scripts/test_run_sofascore_workload.py \
+            tests/unit/scripts/test_sofascore_capture_manifest_guard_v1.py \
             tests/unit/scripts/test_sofascore_proxy_budget.py \
+            tests/unit/scripts/test_sofascore_runtime_preflight.py \
             tests/unit/sql/test_sofascore_league_table_silver.py \
-            tests/unit/sql/test_sofascore_post_shot_xg.py
+            tests/unit/sql/test_sofascore_post_shot_xg.py \
+            tests/integration/test_compose_validity.py

@@ -62,7 +62,12 @@ x-airflow-common: &airflow-common
     FBREF_STAGE_JANITOR_MODE: ${FBREF_STAGE_JANITOR_MODE:-apply}
     SOFASCORE_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/sofascore
     SOFASCORE_MANIFEST_BACKEND: trino
-    SOFASCORE_PROXY_BUDGET_ARTIFACT: /opt/airflow/configs/sofascore/proxy_budget_canary.json
+    # Verified deployment artifact.  This exact runtime path is backed by its
+    # own immutable host-file bind in the scheduler; it must not be hidden
+    # inside the mutable/release-scoped configs/sofascore directory mount.
+    SOFASCORE_PROXY_BUDGET_ARTIFACT: /opt/airflow/runtime/sofascore/proxy_budget_canary.json
+    # Immutable second pin used by scheduler/gateway cutover readiness.
+    SOFASCORE_PROXY_BUDGET_ARTIFACT_ID: ${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:?set the exact verified SofaScore artifact SHA-256}
     SOFASCORE_PROXY_BUDGET_LEDGER: /opt/airflow/logs/sofascore/proxy-budget-ledger.json
     SOFASCORE_WORKLOAD_PLAN_DIR: /opt/airflow/logs/sofascore/workload-plans
     # #951: прод-сбор идёт через выделенный шлюз sofascore_proxy_filter, а не
@@ -760,6 +765,10 @@ services:
       WHOSCORED_PAID_GATEWAY_TOKEN: ${WHOSCORED_PAID_GATEWAY_TOKEN:-}
       WHOSCORED_SCRAPER_PYTHON: /usr/local/bin/python
       LEGACY_SCRAPER_PYTHON: /opt/legacy-scraper-venv/bin/python
+      # Camoufox locale data is an operator-provisioned, content-pinned input.
+      # Keep it outside the image/venv trust roots and never allow the package
+      # to select or download a mutable default database.
+      FBREF_CAMOUFOX_GEOIP_DATABASE_PATH: /opt/airflow/secure/fbref-geoip/GeoLite2-City.mmdb
     # YAML merge keys replace sequences, so repeat the common mounts before
     # appending the scheduler-only, deployment-owned approval directory.
     volumes:
@@ -795,6 +804,18 @@ services:
       - type: bind
         source: ./configs/sofascore
         target: /opt/airflow/configs/sofascore
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./configs/proxy_filter
+        target: /opt/airflow/configs/proxy_filter
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST:?set the immutable verified SofaScore budget artifact host file}
+        target: /opt/airflow/runtime/sofascore/proxy_budget_canary.json
         read_only: true
         bind:
           create_host_path: false
@@ -844,6 +865,12 @@ services:
       - type: bind
         source: ${WHOSCORED_SCHEDULED_PAID_POINTER_HOST_DIR:?set an absolute protected scheduled-pointer directory}
         target: /opt/airflow/secure/whoscored-scheduled-pointers
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${FBREF_CAMOUFOX_GEOIP_DATABASE_HOST_PATH:?set the protected pinned GeoLite database}
+        target: /opt/airflow/secure/fbref-geoip/GeoLite2-City.mmdb
         read_only: true
         bind:
           create_host_path: false

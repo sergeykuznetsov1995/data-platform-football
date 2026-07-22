@@ -217,6 +217,9 @@ SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 0
 # verified SofaScore canary; there is no hand-written production allowance.
 SOFASCORE_DAGRUN_BUDGET_BYTES = 0
 SOFASCORE_BUDGET_ARTIFACT_ID = ""
+SOFASCORE_BUDGET_ARTIFACT_ID_ENV = "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"
+_LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}")
+_ZERO_SHA256 = "0" * 64
 SOFASCORE_CANARY_HARD_CAP_BYTES = 0
 SOFASCORE_CANARY_POLICY_ID = ""
 # No environment/CLI scalar can enable WhoScored.  A valid signed campaign is
@@ -850,6 +853,27 @@ TRANSFERMARKT_REQUEST_PERMITS = TransfermarktRequestPermitController()
 def _canary_policy_id(hard_cap_bytes: int) -> str:
     """Hash the explicit experimental policy without pretending it is verified."""
     return experimental_canary_policy_id(hard_cap_bytes)
+
+
+def _load_pinned_sofascore_workload_policy(artifact_path: str):
+    required_artifact_id = os.environ.get(SOFASCORE_BUDGET_ARTIFACT_ID_ENV, "")
+    if _LOWERCASE_SHA256.fullmatch(required_artifact_id) is None:
+        raise SystemExit(
+            f"{SOFASCORE_BUDGET_ARTIFACT_ID_ENV} must be exactly 64 lowercase "
+            "hexadecimal characters"
+        )
+    if required_artifact_id == _ZERO_SHA256:
+        raise SystemExit(
+            f"{SOFASCORE_BUDGET_ARTIFACT_ID_ENV} cannot use the CI/render-only "
+            "zero placeholder"
+        )
+    policy = load_verified_workload_policy(artifact_path)
+    if not hmac.compare_digest(policy.artifact_id, required_artifact_id):
+        raise SystemExit(
+            "verified SofaScore workload policy does not match the required "
+            "artifact pin"
+        )
+    return policy
 
 
 def _upstream_fingerprint(upstream: tuple[str, int, str, str]) -> str:
@@ -7136,7 +7160,9 @@ async def main() -> None:
         )
     if sofascore_artifact:
         try:
-            sofascore_policy = load_verified_workload_policy(sofascore_artifact)
+            sofascore_policy = _load_pinned_sofascore_workload_policy(
+                sofascore_artifact
+            )
         except (ProductionBudgetUnavailable, WorkloadPolicyUnavailable) as exc:
             # Other live lease consumers remain available, but SofaScore stays
             # fail-closed until a reviewed canary is checked in.

@@ -15,7 +15,8 @@
 #     up -d
 #
 # Прод-деплой: SOFASCORE_GATEWAY_IMAGE=<пинованный образ с /opt/airflow/runtime-contract>,
-# SOFASCORE_PROXY_BUDGET_ARTIFACT=<verified-артефакт на стабильном runtime-пути>.
+# SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST=<immutable verified artifact на хосте>,
+# SOFASCORE_GATEWAY_STATE_HOST_DIR=<предварительно созданный durable state-каталог>.
 # Сеть dp-backend — ВНЕШНЯЯ (создаётся основным проектом); scheduler достаёт шлюз
 # по алиасу `sofascore_proxy_filter:8899` через неё. Routing у scheduler —
 # SOFASCORE_PROXY_CONTROL_URL в общем .env (переживает пересоздания).
@@ -35,6 +36,10 @@ services:
     environment:
       PYTHONPATH: /opt/airflow
       PROXY_FILTER_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+      # Один и тот же неизменяемый container contract используют gateway и
+      # scheduler; host location задаётся отдельно bind-переменной ниже.
+      SOFASCORE_PROXY_BUDGET_ARTIFACT: /opt/airflow/runtime/sofascore/proxy_budget_canary.json
+      SOFASCORE_PROXY_BUDGET_ARTIFACT_ID: ${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:?set the exact verified SofaScore artifact SHA-256}
       # Купленный под SofaScore пул подставляется сюда; пусто => fail-closed на
       # платный путь, разрешён только --proxy-file fallback ниже.
       PROXY_POOL_JSON: ${SOFASCORE_PROXY_POOL_JSON:-}
@@ -69,7 +74,7 @@ services:
       - --max-active-leases
       - "1"
       - --sofascore-budget-artifact
-      - ${SOFASCORE_PROXY_BUDGET_ARTIFACT:-/opt/airflow/configs/sofascore/proxy_budget_canary.json}
+      - /opt/airflow/runtime/sofascore/proxy_budget_canary.json
       # 0 = боевой подписант (не эксперимент-канарейка).
       - --sofascore-canary-hard-cap-bytes
       - "0"
@@ -81,6 +86,8 @@ services:
       - /opt/airflow/logs/sofascore_proxy_filter/sofascore_allocations.json
       - --sofascore-allocation-wal
       - /opt/airflow/logs/sofascore_proxy_filter/sofascore_allocation_claims.jsonl
+      - --sofascore-parent-envelope
+      - /opt/airflow/logs/sofascore_proxy_filter/sofascore_parent_envelopes.json
     volumes:
       # Runtime-fingerprint входы: контрольная плоскость независимо
       # пересчитывает тот же digest, что и продюсер в Airflow.
@@ -91,11 +98,34 @@ services:
       - ./configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
       - ./configs/sofascore:/opt/airflow/configs/sofascore:ro
       - ./proxys.txt:/opt/airflow/proxys.txt:ro
-      - ./logs:/opt/airflow/logs
+      # Artifact and mutable accounting state are deployment-owned and live
+      # outside the release checkout.  Long bind syntax prevents Docker from
+      # silently replacing a missing source with an empty file/directory.
+      - type: bind
+        source: ${SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST:?set the immutable verified SofaScore budget artifact host file}
+        target: /opt/airflow/runtime/sofascore/proxy_budget_canary.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${SOFASCORE_GATEWAY_STATE_HOST_DIR:?set the durable SofaScore gateway state host directory}
+        target: /opt/airflow/logs/sofascore_proxy_filter
+        bind:
+          create_host_path: false
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8899/health"]
-      interval: 10s
-      timeout: 3s
+      test:
+        - CMD
+        - python
+        - /opt/airflow/scripts/sofascore_runtime_preflight.py
+        - gateway-health
+        - --artifact
+        - /opt/airflow/runtime/sofascore/proxy_budget_canary.json
+        - --state-dir
+        - /opt/airflow/logs/sofascore_proxy_filter
+        - --health-url
+        - http://localhost:8899/health
+      interval: 30s
+      timeout: 10s
       retries: 5
       start_period: 5s
     deploy:

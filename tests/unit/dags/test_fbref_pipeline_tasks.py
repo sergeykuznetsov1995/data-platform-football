@@ -3,8 +3,11 @@ from __future__ import annotations
 import dis
 import inspect
 import json
+import os
+import subprocess
 import sys
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -1688,6 +1691,9 @@ def test_dag_failure_callback_is_best_effort(monkeypatch):
 @pytest.mark.unit
 def test_live_waves_use_one_process_group_for_all_batches(monkeypatch):
     captured = {}
+    hostile_pythonpath = "/tmp/untrusted-fbref-pythonpath"
+    monkeypatch.setenv("PYTHONPATH", hostile_pythonpath)
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
 
     class Process:
         pid = 1234
@@ -1726,6 +1732,10 @@ def test_live_waves_use_one_process_group_for_all_batches(monkeypatch):
 
     assert result == {"batches": 3, "frontier_closed": True}
     assert captured["kwargs"]["start_new_session"] is True
+    child_environment = captured["kwargs"]["env"]
+    assert child_environment["PYTHONPATH"] == "/opt/airflow"
+    assert child_environment["PYTHONSAFEPATH"] == "1"
+    assert os.environ["PYTHONPATH"] == hostile_pythonpath
     command = captured["command"]
     assert command[0] == sys.executable
     assert command[1] == fbref_pipeline_tasks.LIVE_WAVES_RUNNER
@@ -1737,6 +1747,55 @@ def test_live_waves_use_one_process_group_for_all_batches(monkeypatch):
     )
     assert command[command.index("--max-batches") + 1] == "16"
     assert command[command.index("--reservation-mb") + 1] == "3"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "parent_pythonpath",
+    (None, "/tmp/untrusted-fbref-pythonpath"),
+    ids=("empty", "hostile"),
+)
+def test_live_runner_environment_fixes_pythonpath_for_safe_interpreter(
+    monkeypatch,
+    parent_pythonpath,
+):
+    repository_root = Path(fbref_pipeline_tasks.__file__).resolve().parents[2]
+    assert fbref_pipeline_tasks.LIVE_WAVES_PYTHONPATH == "/opt/airflow"
+    if parent_pythonpath is None:
+        monkeypatch.delenv("PYTHONPATH", raising=False)
+    else:
+        monkeypatch.setenv("PYTHONPATH", parent_pythonpath)
+    monkeypatch.setenv("PYTHONSAFEPATH", "1")
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "LIVE_WAVES_PYTHONPATH",
+        str(repository_root),
+    )
+
+    child_environment = fbref_pipeline_tasks._live_runner_environment()
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, pathlib, scrapers, sys; "
+                "print(json.dumps({'origin': "
+                "str(pathlib.Path(scrapers.__file__).resolve()), "
+                "'paths': sys.path}))"
+            ),
+        ],
+        env=child_environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    child = json.loads(completed.stdout)
+    assert child["paths"][0] == str(repository_root)
+    assert parent_pythonpath not in child["paths"]
+    assert child["origin"] == str(repository_root / "scrapers/__init__.py")
+    assert child_environment["PYTHONSAFEPATH"] == "1"
+    assert os.environ.get("PYTHONPATH") == parent_pythonpath
 
 
 @pytest.mark.unit

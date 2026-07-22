@@ -364,6 +364,36 @@ def test_docker_installs_last_ordered_root_owned_runtime_trust_anchor():
 
 
 @pytest.mark.unit
+def test_scheduler_payload_and_final_seal_the_application_parent():
+    dockerfile = (ROOT / "docker/images/airflow/Dockerfile").read_text(encoding="utf-8")
+    scheduler_payload = dockerfile.split(
+        "FROM airflow-base AS airflow-scheduler-payload", 1
+    )[1].split("FROM airflow-base AS airflow-whoscored-proxy-payload", 1)[0]
+    scheduler_final_marker = "FROM airflow-scheduler-payload AS airflow-scheduler\n"
+    proxy_final = dockerfile.split(
+        "FROM airflow-whoscored-proxy-payload AS airflow-whoscored-proxy", 1
+    )[1].split(scheduler_final_marker, 1)[0]
+    scheduler_final = dockerfile.split(scheduler_final_marker, 1)[1]
+
+    for stage in (scheduler_payload, scheduler_final):
+        assert stage.count("chown root:root /opt/airflow") == 1
+        assert stage.count("chmod 0755 /opt/airflow") == 1
+        assert (
+            stage.count('test "$(stat -c \'%u:%g:%a\' /opt/airflow)" = "0:0:755"') == 1
+        )
+        assert "chown -R root:root /opt/airflow" not in stage
+        assert "chmod -R 0755 /opt/airflow" not in stage
+
+    assert scheduler_payload.rindex("chown root:root /opt/airflow") > (
+        scheduler_payload.rindex("/opt/legacy-scraper-venv/bin/python -I -m pip check")
+    )
+    assert scheduler_final.rindex("chown root:root /opt/airflow") > (
+        scheduler_final.rindex("ln -s python3 /usr/local/bin/python")
+    )
+    assert "chown root:root /opt/airflow" not in proxy_final
+
+
+@pytest.mark.unit
 def test_airflow_context_mirrors_exact_flaresolverr_supply_inputs():
     airflow_context = ROOT / "docker/images/airflow"
     flaresolverr_context = ROOT / "docker/images/flaresolverr-whoscored"
