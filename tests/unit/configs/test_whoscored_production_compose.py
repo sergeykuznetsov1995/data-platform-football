@@ -920,3 +920,5 @@ def test_transfermarkt_backfill_proxy_contract_is_isolated_and_fail_closed() -> 
     assert "PROXY_FILTER_TRANSFERMARKT_PERMIT_STATE_PATH=" in example
     assert "TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON=" in example
     assert "TM_BACKFILL_PROXY_CONTROL_TOKEN=" in example
+    assert "run the updated airflow-init service successfully" in example
+    assert "scheduler-created Airflow pools" not in example
