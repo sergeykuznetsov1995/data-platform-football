@@ -100,7 +100,7 @@ PROXY_COMMAND = tuple(
     for item in admission.provenance.WHOSCORED_PROXY_COMMAND
 )
 EFFECTIVE_COMMANDS = {
-    "airflow-scheduler": ("scheduler",),
+    "airflow-scheduler": admission._EXPECTED_COMMANDS["airflow-scheduler"],
     "flaresolverr": ("/usr/local/bin/whoscored-flaresolverr-entrypoint",),
     "flaresolverr_whoscored_paid": (
         "/usr/local/bin/whoscored-flaresolverr-entrypoint",
@@ -676,7 +676,9 @@ def test_deployment_attestation_rejects_service_or_digest_drift(
 
 def _rendered(bindings: Mapping[str, str] = BINDINGS) -> dict[str, object]:
     commands = {
-        "airflow-scheduler": ["scheduler"],
+        "airflow-scheduler": list(
+            admission._EXPECTED_COMMANDS["airflow-scheduler"]
+        ),
         "flaresolverr": None,
         "flaresolverr_whoscored_paid": None,
         "whoscored_paid_gateway": list(
@@ -1395,6 +1397,16 @@ def test_scheduler_admission_preserves_metered_transfermarkt_controls():
     )
 
 
+def test_scheduler_admission_preserves_isolated_transfermarkt_backfill_controls():
+    environment = _rendered_environment("airflow-scheduler")
+    environment["TM_BACKFILL_PROXY_CONTROL_TOKEN"] = "u" * 64
+
+    admission._validate_rendered_environment(
+        environment,
+        service="airflow-scheduler",
+    )
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [
@@ -1413,6 +1425,52 @@ def test_scheduler_admission_rejects_unsafe_enabled_transfermarkt_controls(
     environment[name] = value
 
     with pytest.raises(admission.AdmissionError, match="paid controls"):
+        admission._validate_rendered_environment(
+            environment,
+            service="airflow-scheduler",
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("TM_BACKFILL_PROXY_CONTROL_URL", "http://attacker:8899"),
+        ("TM_BACKFILL_PROXY_CONTROL_TOKEN", "short"),
+    ],
+)
+def test_scheduler_admission_rejects_unsafe_transfermarkt_backfill_controls(
+    name: str,
+    value: str,
+):
+    environment = _rendered_environment("airflow-scheduler")
+    environment[name] = value
+
+    with pytest.raises(
+        admission.AdmissionError,
+        match="security environment|backfill controls",
+    ):
+        admission._validate_rendered_environment(
+            environment,
+            service="airflow-scheduler",
+        )
+
+
+@pytest.mark.parametrize(
+    "shared_name",
+    [
+        "PROXY_FILTER_CONTROL_TOKEN",
+        "SOFASCORE_PROXY_CONTROL_TOKEN",
+        "TM_PROXY_CONTROL_TOKEN",
+    ],
+)
+def test_scheduler_admission_rejects_shared_transfermarkt_backfill_token(
+    shared_name: str,
+):
+    environment = _rendered_environment("airflow-scheduler")
+    environment[shared_name] = "u" * 64
+    environment["TM_BACKFILL_PROXY_CONTROL_TOKEN"] = "u" * 64
+
+    with pytest.raises(admission.AdmissionError, match="backfill controls"):
         admission._validate_rendered_environment(
             environment,
             service="airflow-scheduler",
