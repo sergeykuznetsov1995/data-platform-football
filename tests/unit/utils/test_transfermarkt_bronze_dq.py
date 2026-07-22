@@ -122,6 +122,50 @@ def test_phantom_sql_ignores_null_scope_rows():
     assert 'b.edition_id IS NOT NULL' in sql
 
 
+def test_frozen_scope_checks_ignore_newer_daily_cycle_but_bind_exact_owner():
+    phantom = dq.build_phantom_scope_sql(
+        MEMBERSHIPS,
+        registry_snapshot_id='snapshot-s1',
+        pins={MEMBERSHIPS: 17, dq.EDITIONS_REGISTRY_TABLE: 23},
+        child_cycle_ids=('child-s1',),
+    )
+    ownership = dq.build_scope_ownership_sql(
+        MEMBERSHIPS,
+        pins={MEMBERSHIPS: 17},
+        scope_bindings=(('child-s1', 'GB1__2020', 'GB1', '2020'),),
+    )
+
+    assert "b.cycle_id IN ('child-s1')" in phantom
+    assert 'child-s2' not in phantom
+    assert "('child-s1', 'GB1__2020', 'GB1', '2020')" in ownership
+    assert 'JOIN expected e ON b.cycle_id = e.child_cycle_id' in ownership
+    assert "COALESCE(b.scope_id, '') <> e.scope_id" in ownership
+
+
+def test_scope_set_fails_when_child_cycle_rows_have_wrong_exact_scope_owner():
+    def wrong_owner(sql):
+        return 'JOIN expected e ON b.cycle_id = e.child_cycle_id' in sql
+
+    cur = StubCursor(overrides=[(wrong_owner, [(1,)])])
+    results = dq.run_bronze_dq(
+        cur,
+        registry_snapshot_id='snapshot-s1',
+        pins=_full_pins(),
+        zone='scope_set',
+        manifests=[],
+        scope_bindings=(('child-s1', 'GB1__2020', 'GB1', '2020'),),
+        legacy_allowlist=[],
+    )
+
+    ownership = [
+        item for item in results
+        if item.kind == 'bronze_scope_ownership'
+    ]
+    assert len(ownership) == len(dq.ENTITY_BRONZE_TABLES)
+    assert all(not item.passed and item.value == 1 for item in ownership)
+    assert all(item in dq.BronzeDqReport(results).errors for item in ownership)
+
+
 def test_intra_batch_duplicate_sql_appends_batch_and_snapshot_keys():
     comp_sql = dq.build_intra_batch_duplicates_sql(COMPETITIONS)
     assert 'GROUP BY competition_id, _batch_id, registry_snapshot_id' in comp_sql
@@ -158,9 +202,10 @@ def test_intra_batch_duplicate_sql_appends_batch_and_snapshot_keys():
 
 def test_intra_batch_conflicts_gate_only_on_conflicting_payload():
     mv_table = 'iceberg.bronze.transfermarkt_market_value_history'
-    split_hit = (
-        lambda sql, t=mv_table: f'FROM {t}\n' in sql and '_batch_id' in sql
-    )
+
+    def split_hit(sql, table=mv_table):
+        return f'FROM {table}\n' in sql and '_batch_id' in sql
+
     cur = StubCursor(overrides=[(split_hit, [(3, 41)])])
     results = dq.run_bronze_dq(
         cur, registry_snapshot_id='snap-1', zone='legacy', legacy_allowlist=[],
@@ -341,6 +386,8 @@ def _evidence(entity, status='ok', dedup_rows=1):
 
 def test_scope_set_presence_honors_authoritative_empty_and_not_applicable():
     manifest = SimpleNamespace(
+        child_cycle_id='child-2023',
+        scope_id='2DVB__2023',
         competition_id='2DVB',
         edition_id='2023',
         entities=(
@@ -387,6 +434,8 @@ def test_scope_set_presence_honors_authoritative_empty_and_not_applicable():
 
 def test_pinned_relation_is_required_in_scope_set_mode():
     manifest = SimpleNamespace(
+        child_cycle_id='child-2023',
+        scope_id='2DVB__2023',
         competition_id='2DVB',
         edition_id='2023',
         entities=(_evidence('squad_memberships', dedup_rows=1),),
@@ -409,7 +458,7 @@ def test_pinned_relation_is_required_in_scope_set_mode():
             manifests=[manifest],
             legacy_allowlist=[],
         )
-    with pytest.raises(ValueError, match='requires scope manifests'):
+    with pytest.raises(ValueError, match='requires exact scope bindings'):
         dq.run_bronze_dq(
             StubCursor(),
             registry_snapshot_id='snap-1',
@@ -489,6 +538,8 @@ def test_scope_columns_match_dag_map():
 
 def test_scope_set_zone_is_scope_filtered_and_skips_full_sweeps():
     manifest = SimpleNamespace(
+        child_cycle_id='child-2023',
+        scope_id='2DVB__2023',
         competition_id='2DVB',
         edition_id='2023',
         entities=(_evidence('squad_memberships', dedup_rows=1),),
@@ -557,8 +608,14 @@ def test_scope_set_zone_is_scope_filtered_and_skips_full_sweeps():
 def test_scope_set_predicates_are_chunked(monkeypatch):
     monkeypatch.setattr(dq, 'SCOPE_PREDICATE_CHUNK_SIZE', 1)
     manifests = [
-        SimpleNamespace(competition_id='2DVB', edition_id='2023', entities=()),
-        SimpleNamespace(competition_id='2DVB', edition_id='2024', entities=()),
+        SimpleNamespace(
+            child_cycle_id='child-2023', scope_id='2DVB__2023',
+            competition_id='2DVB', edition_id='2023', entities=(),
+        ),
+        SimpleNamespace(
+            child_cycle_id='child-2024', scope_id='2DVB__2024',
+            competition_id='2DVB', edition_id='2024', entities=(),
+        ),
     ]
 
     def mv_split_hit(sql):

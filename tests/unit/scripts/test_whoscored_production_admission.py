@@ -1400,6 +1400,32 @@ def test_scheduler_admission_preserves_metered_transfermarkt_controls():
     )
 
 
+def test_scheduler_admission_preserves_distinct_transfermarkt_backfill_controls():
+    environment = _rendered_environment("airflow-scheduler")
+    environment["TM_BACKFILL_PROXY_CONTROL_TOKEN"] = "b" * 64
+
+    admission._validate_rendered_environment(
+        environment,
+        service="airflow-scheduler",
+    )
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["short", "t" * 64],
+)
+def test_scheduler_admission_rejects_unsafe_transfermarkt_backfill_token(token):
+    environment = _rendered_environment("airflow-scheduler")
+    environment["TM_PROXY_CONTROL_TOKEN"] = "t" * 64
+    environment["TM_BACKFILL_PROXY_CONTROL_TOKEN"] = token
+
+    with pytest.raises(admission.AdmissionError, match="backfill controls"):
+        admission._validate_rendered_environment(
+            environment,
+            service="airflow-scheduler",
+        )
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [

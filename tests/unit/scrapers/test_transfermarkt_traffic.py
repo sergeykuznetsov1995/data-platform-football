@@ -537,7 +537,7 @@ def test_proxy_credentials_are_redacted_from_transport_error():
     assert outcome.status == FetchStatus.RETRY_EXHAUSTED
     assert 'private-user' not in outcome.error
     assert 'private-pass' not in outcome.error
-    assert '****:****@proxy.invalid:1' in outcome.error
+    assert outcome.error == 'transport:connection:RuntimeError'
     rendered_stats = str(client.get_traffic_stats())
     assert 'private-user' not in rendered_stats
     assert 'private-pass' not in rendered_stats

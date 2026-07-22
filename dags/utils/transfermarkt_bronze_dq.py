@@ -382,14 +382,23 @@ def build_phantom_scope_sql(
     *,
     registry_snapshot_id: str,
     pins: Mapping[str, Any] | None = None,
+    child_cycle_ids: Sequence[str] | None = None,
 ) -> str:
     """Scoped rows whose (competition, edition) is not in the promoted registry."""
 
     comp, ed = _entity_scope_columns(table)
+    scoped = ""
+    if child_cycle_ids is not None:
+        if not child_cycle_ids:
+            raise ValueError('child-cycle predicate requires at least one cycle')
+        scoped = "\n  AND b.cycle_id IN (" + ", ".join(
+            _sql_literal(item) for item in child_cycle_ids
+        ) + ")"
     return f"""SELECT COUNT(*)
 FROM {_pinned(table, pins)} b
 WHERE b.{comp} IS NOT NULL
   AND b.{ed} IS NOT NULL
+  {scoped}
   AND NOT EXISTS (
       SELECT 1
       FROM {_pinned(EDITIONS_REGISTRY_TABLE, pins)} r
@@ -399,10 +408,36 @@ WHERE b.{comp} IS NOT NULL
   )"""
 
 
+def build_scope_ownership_sql(
+    table: str,
+    *,
+    pins: Mapping[str, Any] | None,
+    scope_bindings: Sequence[Sequence[str]],
+) -> str:
+    """Rows owned by a child cycle must match its exact frozen scope identity."""
+
+    if not scope_bindings:
+        raise ValueError('scope ownership requires at least one binding')
+    comp, ed = _entity_scope_columns(table)
+    values = ', '.join(
+        '(' + ', '.join(_sql_literal(value) for value in binding) + ')'
+        for binding in scope_bindings
+    )
+    return f"""WITH expected (
+    child_cycle_id, scope_id, competition_id, edition_id
+) AS (VALUES {values})
+SELECT COUNT(*)
+FROM {_pinned(table, pins)} b
+JOIN expected e ON b.cycle_id = e.child_cycle_id
+WHERE COALESCE(b.scope_id, '') <> e.scope_id
+   OR COALESCE(CAST(b.{comp} AS varchar), '') <> e.competition_id
+   OR COALESCE(CAST(b.{ed} AS varchar), '') <> e.edition_id"""
+
+
 def build_registry_expected_counts_sql(registry_snapshot_id: str) -> str:
-    return f"""SELECT competition_count, edition_count
+    return f"""SELECT DISTINCT competition_count, edition_count
 FROM {REGISTRY_STATE_TABLE}
-WHERE state_key = 'canonical'
+WHERE (state_key = 'canonical' OR regexp_like(state_key, '^history:[0-9]+$'))
   AND registry_snapshot_id = {_sql_literal(registry_snapshot_id)}
   AND status = 'promoted'
   AND unknown_active_count = 0"""
@@ -833,6 +868,7 @@ def run_bronze_dq(
     pins: Mapping[str, Any] | None = None,
     zone: str = 'full',
     manifests: Sequence[Any] | None = None,
+    scope_bindings: Sequence[Sequence[str]] | None = None,
     legacy_allowlist: Iterable[Sequence[str]] = (),
 ) -> list[BronzeCheckResult]:
     """Execute the cross-table Bronze DQ suite and return every result.
@@ -847,8 +883,18 @@ def run_bronze_dq(
         raise ValueError(f'unknown Bronze DQ zone: {zone!r}')
     pins = dict(pins or {})
     if zone == 'scope_set':
-        if not manifests:
-            raise ValueError('scope_set zone requires scope manifests')
+        if not scope_bindings and manifests:
+            scope_bindings = tuple(
+                (
+                    str(item.child_cycle_id),
+                    str(item.scope_id),
+                    str(item.competition_id),
+                    str(item.edition_id),
+                )
+                for item in manifests
+            )
+        if not scope_bindings:
+            raise ValueError('scope_set zone requires exact scope bindings')
         required = (
             *NATIVE_BRONZE_SCOPE_COLUMNS,
             COMPETITIONS_REGISTRY_TABLE,
@@ -996,11 +1042,20 @@ def run_bronze_dq(
     scope_pairs: tuple[tuple[str, str], ...] | None = None
     scope_chunks: list[Sequence[tuple[str, str]]] = []
     if zone == 'scope_set':
+        normalised_bindings = tuple(sorted({
+            tuple(str(value) for value in item) for item in scope_bindings
+        }))
+        if any(len(item) != 4 or not all(item) for item in normalised_bindings):
+            raise ValueError('scope binding must be child/scope/competition/edition')
         scope_pairs = tuple(sorted({
-            (str(item.competition_id), str(item.edition_id))
-            for item in manifests
+            (item[2], item[3]) for item in normalised_bindings
         }))
         scope_chunks = list(_chunked(scope_pairs, SCOPE_PREDICATE_CHUNK_SIZE))
+        binding_chunks = list(_chunked(
+            normalised_bindings, SCOPE_PREDICATE_CHUNK_SIZE,
+        ))
+    else:
+        binding_chunks = []
 
     def entity_sqls(build_fn, table: str) -> list[str]:
         """One full-sweep query, or one query per scope-set chunk."""
@@ -1042,17 +1097,39 @@ def run_bronze_dq(
         )
 
     # -- ERROR: scoped rows must reference promoted registry editions.
-    # Deliberately global in every zone: the anti-join build side is the
-    # small registry relation, and its purpose is to catch rows OUTSIDE
-    # the requested target.
+    # A frozen backfill batch only gates its own scope set.  Daily ingest may
+    # legitimately publish a scope from a newer registry snapshot while a long
+    # campaign is still draining the old one; a global anti-join here would
+    # falsely block that campaign.
     for table in entity_tables:
         run(
             f'tm_bronze_phantom_scope[{_display(table)}]',
             'bronze_phantom_scope', 'ERROR',
-            zero_violations(build_phantom_scope_sql(
-                table, registry_snapshot_id=snapshot, pins=pins,
-            )),
+            summed_zero_violations([
+                build_phantom_scope_sql(
+                    table,
+                    registry_snapshot_id=snapshot,
+                    pins=pins,
+                    child_cycle_ids=tuple(item[0] for item in chunk),
+                )
+                for chunk in binding_chunks
+            ]) if scope_pairs is not None else zero_violations(
+                build_phantom_scope_sql(
+                    table, registry_snapshot_id=snapshot, pins=pins,
+                )
+            ),
         )
+        if scope_pairs is not None:
+            run(
+                f'tm_bronze_scope_ownership[{_display(table)}]',
+                'bronze_scope_ownership', 'ERROR',
+                summed_zero_violations([
+                    build_scope_ownership_sql(
+                        table, pins=pins, scope_bindings=chunk,
+                    )
+                    for chunk in binding_chunks
+                ]),
+            )
 
     # -- ERROR: no half-scoped rows / mislabelled NULL-scope rows --
     for table in entity_tables:

@@ -1314,8 +1314,15 @@ class TransfermarktScraper(BaseScraper):
         # authoritative health check.
         proxy_file = kwargs.pop('proxy_file', None)
         proxy = kwargs.pop('proxy', None)
+        configured_control_url = os.environ.get('TM_PROXY_CONTROL_URL')
+        if os.environ.get('TM_DAG_ID', '').strip() == 'dag_backfill_transfermarkt':
+            # Dedicated source pool/token; a missing value is fail-closed and
+            # never falls through to the production Transfermarkt quota.
+            configured_control_url = os.environ.get(
+                'TM_BACKFILL_PROXY_CONTROL_URL'
+            )
         proxy_control_url = kwargs.pop(
-            'proxy_control_url', os.environ.get('TM_PROXY_CONTROL_URL'),
+            'proxy_control_url', configured_control_url,
         )
         competition_records = kwargs.pop('competition_records', None)
         traffic_ledger = kwargs.pop('traffic_ledger', None)
@@ -1571,6 +1578,16 @@ class TransfermarktScraper(BaseScraper):
             'outcomes': self.get_fetch_outcomes(),
         }
 
+    def get_raw_capture_records(self) -> tuple[dict, ...]:
+        """Metadata for every exact response committed before parsing."""
+
+        return self._http_client.get_raw_capture_records()
+
+    def get_raw_attempt_records(self) -> tuple[dict, ...]:
+        """Immutable response/transport envelopes emitted by the HTTP client."""
+
+        return self._http_client.get_raw_attempt_records()
+
     def get_scope_capture(self) -> Optional[Dict]:
         """Return listing/squad participant evidence for the exact scope."""
 
@@ -1605,6 +1622,12 @@ class TransfermarktScraper(BaseScraper):
             error=outcome.error,
             status_code=outcome.status_code,
             attempts=outcome.attempts,
+            raw_capture_id=outcome.raw_capture_id,
+            raw_body_hash=outcome.raw_body_hash,
+            raw_uri=outcome.raw_uri,
+            raw_fetched_at=outcome.raw_fetched_at,
+            raw_attempt_envelope_id=outcome.raw_attempt_envelope_id,
+            raw_attempt_envelope_ids=outcome.raw_attempt_envelope_ids,
         )
 
     def _record_materialized_rows(
@@ -1623,6 +1646,12 @@ class TransfermarktScraper(BaseScraper):
                 error=record.error,
                 status_code=record.status_code,
                 attempts=record.attempts,
+                raw_capture_id=record.raw_capture_id,
+                raw_body_hash=record.raw_body_hash,
+                raw_uri=record.raw_uri,
+                raw_fetched_at=record.raw_fetched_at,
+                raw_attempt_envelope_id=record.raw_attempt_envelope_id,
+                raw_attempt_envelope_ids=record.raw_attempt_envelope_ids,
             )
             if record.status in (FetchStatus.OK, FetchStatus.VALID_EMPTY):
                 self._materialization_failure_streak = 0
@@ -1640,6 +1669,12 @@ class TransfermarktScraper(BaseScraper):
                 error=None,
                 status_code=record.status_code,
                 attempts=record.attempts,
+                raw_capture_id=record.raw_capture_id,
+                raw_body_hash=record.raw_body_hash,
+                raw_uri=record.raw_uri,
+                raw_fetched_at=record.raw_fetched_at,
+                raw_attempt_envelope_id=record.raw_attempt_envelope_id,
+                raw_attempt_envelope_ids=record.raw_attempt_envelope_ids,
             )
         self._materialization_failure_streak = 0
 
@@ -1670,6 +1705,12 @@ class TransfermarktScraper(BaseScraper):
                 error=error,
                 status_code=record.status_code,
                 attempts=record.attempts,
+                raw_capture_id=record.raw_capture_id,
+                raw_body_hash=record.raw_body_hash,
+                raw_uri=record.raw_uri,
+                raw_fetched_at=record.raw_fetched_at,
+                raw_attempt_envelope_id=record.raw_attempt_envelope_id,
+                raw_attempt_envelope_ids=record.raw_attempt_envelope_ids,
             )
         self._fetch_records[label][source_id] = record
         self._materialization_failure_streak += 1
@@ -1695,6 +1736,12 @@ class TransfermarktScraper(BaseScraper):
                 label=label,
                 context=context,
                 payload_hash=record.payload_hash,
+                raw_capture_id=record.raw_capture_id,
+                raw_body_hash=record.raw_body_hash,
+                raw_uri=record.raw_uri,
+                raw_fetched_at=record.raw_fetched_at,
+                raw_attempt_envelope_id=record.raw_attempt_envelope_id,
+                raw_attempt_envelope_ids=record.raw_attempt_envelope_ids,
             )
 
     @staticmethod
