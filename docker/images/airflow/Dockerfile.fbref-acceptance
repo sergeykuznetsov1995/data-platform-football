@@ -40,6 +40,10 @@ RUN test -n "${FBREF_ACCEPTANCE_GIT_SHA}" \
         /opt/airflow/runtime-contract/fbref-acceptance/source-manifest.json \
     && chmod 0444 \
         /opt/airflow/runtime-contract/fbref-acceptance/source-manifest.json \
+    && PYTHONDONTWRITEBYTECODE=1 \
+        /usr/local/bin/python -I \
+        /opt/airflow/scripts/proxy_filter/filter_proxy.py --help \
+        > /dev/null \
     && rm -f /tmp/fbref-acceptance-source.tar
 
 ENV GIT_SHA=${FBREF_ACCEPTANCE_GIT_SHA} \
