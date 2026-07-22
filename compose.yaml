@@ -179,6 +179,9 @@ x-airflow-common: &airflow-common
     # request permits can always overtake queued backfill work.
     TM_BACKFILL_PROXY_CONTROL_URL: ${TM_BACKFILL_PROXY_CONTROL_URL:-http://proxy_filter:8899}
     TM_BACKFILL_PROXY_CONTROL_TOKEN: ${TM_BACKFILL_PROXY_CONTROL_TOKEN:-}
+    # Every historical response is written before parsing so a failed scope
+    # still has durable evidence for the final backfill report.
+    TRANSFERMARKT_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/transfermarkt
     TM_REQUIRE_METERED_PROXY: ${TM_REQUIRE_METERED_PROXY:-false}
     TM_PROXY_LEASE_TTL_SECONDS: ${TM_PROXY_LEASE_TTL_SECONDS:-3600}
     FBREF_RAW_S3_ENDPOINT: seaweedfs:8333
