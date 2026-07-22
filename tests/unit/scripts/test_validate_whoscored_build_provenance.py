@@ -113,6 +113,9 @@ def test_paid_boundary_protects_five_services_with_shared_payload_mappings():
     assert provenance.PROTECTED_STAGE_RECIPE_SHA256[
         "whoscored_paid_gateway"
     ] == provenance.PROTECTED_STAGE_RECIPE_SHA256["whoscored_proxy_filter"]
+    assert provenance.PROTECTED_STAGE_RECIPE_SHA256["airflow-scheduler"] == (
+        "f784ae95f5ac83d33cd52866e81a406a23cdb65fbdad3912168cd3ed85cabe6d"
+    )
 
 
 def _git(root: Path, *arguments: str) -> str:
