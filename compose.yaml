@@ -164,9 +164,16 @@ x-airflow-common: &airflow-common
     # policies only when this is true (see dags/configs/transfermarkt/).
     TM_STANDING_POLICY_ENABLED: ${TM_STANDING_POLICY_ENABLED:-false}
     TM_PROXY_CONTROL_URL: ${TM_PROXY_CONTROL_URL:-}
-    # A dedicated source token wins. The nested fallback preserves the existing
-    # production Transfermarkt control plane during credential migration.
+    # Source credentials are deliberately distinct.  The proxy refuses an
+    # active Transfermarkt class when this equals the shared control token.
+    # Preserve the deployed daily credential fallback during the historical
+    # rollout; only the new backfill authority must be distinct.
     TM_PROXY_CONTROL_TOKEN: ${TM_PROXY_CONTROL_TOKEN:-${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}}
+    # Historical Transfermarkt traffic has a distinct credential and budget
+    # namespace.  It reaches the same local control scheduler so production
+    # request permits can always overtake queued backfill work.
+    TM_BACKFILL_PROXY_CONTROL_URL: ${TM_BACKFILL_PROXY_CONTROL_URL:-http://proxy_filter:8899}
+    TM_BACKFILL_PROXY_CONTROL_TOKEN: ${TM_BACKFILL_PROXY_CONTROL_TOKEN:-}
     TM_REQUIRE_METERED_PROXY: ${TM_REQUIRE_METERED_PROXY:-false}
     TM_PROXY_LEASE_TTL_SECONDS: ${TM_PROXY_LEASE_TTL_SECONDS:-3600}
     FBREF_RAW_S3_ENDPOINT: seaweedfs:8333
@@ -669,6 +676,11 @@ services:
         # FotMob is lightweight direct HTTP.  A separate bounded pool prevents
         # browser scrapers from serializing it while limiting source fan-out.
         airflow pools set 'fotmob_http_pool' 4 'Bounded direct FotMob HTTP work'
+        airflow pools set 'transfermarkt_proxy' 1 'Transfermarkt production and registry proxy work'
+        # Backfill has its own single-slot pool; production scheduling remains
+        # independent and receives priority in proxy request permits.
+        airflow pools set 'transfermarkt_backfill_proxy' 1 'Transfermarkt historical backfill only; bounded dedicated proxy slot'
+        airflow pools set 'transfermarkt_backfill_control' 1 'Transfermarkt historical planning and DQ only; isolated from daily ingest'
         # WhoScored daily scopes use one slot each; exclusive controller/DQ
         # tasks consume every configured slot so they cannot overlap writers.
         # `pools set` is an idempotent create/update operation on fresh and
@@ -718,7 +730,17 @@ services:
       target: airflow-scheduler
     image: data-platform-airflow-scheduler:2.11.2-whoscored
     container_name: airflow-scheduler
-    command: scheduler
+    # Reconcile the two backfill pools on every scheduler start as well as on
+    # first-time init.  `pools set` is idempotent, so an existing Airflow DB
+    # receives the rollout before any newly parsed backfill task is scheduled.
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        airflow pools set 'transfermarkt_backfill_proxy' 1 'Transfermarkt historical backfill only; bounded dedicated proxy slot'
+        airflow pools set 'transfermarkt_backfill_control' 1 'Transfermarkt historical planning and DQ only; isolated from daily ingest'
+        exec airflow scheduler
     environment:
       <<: *airflow-common-env
       # LocalExecutor runs backup/restore tasks in this process. Keep the
@@ -1532,13 +1554,16 @@ services:
       - ALL
     environment:
       PROXY_FILTER_CONTROL_TOKEN: ${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}
-      # Prefer a source credential, but keep the current production shared token
-      # usable until the ordinary proxy and scheduler rotate together.
+      # Production/backfill/shared credentials must remain pairwise distinct.
       TM_PROXY_CONTROL_TOKEN: ${TM_PROXY_CONTROL_TOKEN:-${PROXY_FILTER_CONTROL_TOKEN:-${SOFASCORE_PROXY_CONTROL_TOKEN:-}}}
+      TM_BACKFILL_PROXY_CONTROL_TOKEN: ${TM_BACKFILL_PROXY_CONTROL_TOKEN:-}
       WHOSCORED_PROXY_CAMPAIGN_LEDGER_PATH: ${WHOSCORED_PROXY_CAMPAIGN_LEDGER_PATH:-/opt/airflow/logs/proxy_filter/whoscored_campaigns.json}
       # Secret JSON is injected at runtime. The service fails closed when it is
       # blank; the legacy file is intentionally not mounted into this container.
       PROXY_POOL_JSON: ${PROXY_POOL_JSON:-}
+      # A separately purchased/provider-bounded pool.  Empty is fail-closed;
+      # backfill never falls back to PROXY_POOL_JSON.
+      TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON: ${TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON:-}
       # Production is structurally env-only. Development file fallback, when
       # needed, must use a separate explicit service definition.
       PROXY_FILTER_ALLOW_FILE_FALLBACK: "false"
@@ -1567,6 +1592,10 @@ services:
       - ${PROXY_FILTER_DAGRUN_BUDGET_BYTES:-8000000}
       - --transfermarkt-dagrun-budget-bytes
       - ${PROXY_FILTER_TRANSFERMARKT_DAGRUN_BUDGET_BYTES:-0}
+      - --transfermarkt-backfill-dagrun-budget-bytes
+      - ${PROXY_FILTER_TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES:-0}
+      - --transfermarkt-permit-state
+      - ${PROXY_FILTER_TRANSFERMARKT_PERMIT_STATE_PATH:-/opt/airflow/logs/proxy_filter/transfermarkt_request_permits.json}
       - --url-budget-bytes
       - ${PROXY_FILTER_URL_BUDGET_BYTES:-2000000}
       - --max-active-leases

@@ -176,14 +176,24 @@ DEFAULT_LEASE_TTL_SECONDS = 60
 MAX_LEASE_TTL_SECONDS = 3600
 DAILY_BUDGET_BYTES = 100 * 1024 * 1024
 DAGRUN_BUDGET_BYTES = 8_000_000
-# Transfermarkt has no signed workload plan.  Keep its paid path disabled until
-# an operator supplies both a source-scoped token and an explicit deployment cap.
+# Transfermarkt has no signed workload plan.  Keep each paid traffic class
+# disabled until an operator supplies its source-scoped token and explicit
+# deployment cap.  Historical backfill is a separate budget namespace: it has
+# its own upstream pool and DagRun ceiling and never borrows the production
+# UTC-day allowance.
 TRANSFERMARKT_DAGRUN_BUDGET_BYTES = 0
 TRANSFERMARKT_DAG_IDS = frozenset(
     {
         "dag_ingest_transfermarkt",
         "dag_discover_transfermarkt_registry",
     }
+)
+TRANSFERMARKT_BACKFILL_DAG_ID = "dag_backfill_transfermarkt"
+TRANSFERMARKT_BACKFILL_DAG_IDS = frozenset({TRANSFERMARKT_BACKFILL_DAG_ID})
+TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES = 0
+TRANSFERMARKT_REQUESTS_PER_MINUTE = 12
+TRANSFERMARKT_PERMIT_STATE_PATH = (
+    "/opt/airflow/logs/proxy_filter/transfermarkt_request_permits.json"
 )
 TRANSFERMARKT_PROXY_ALLOWED_HOSTS = frozenset(
     {"www.transfermarkt.com", "www.transfermarkt.us"}
@@ -293,6 +303,8 @@ LEASE_UPSTREAM_FAILOVER_ATTEMPTS = 2
 SOFASCORE_CANARY_EXIT_PROBE_HOST = "api.ipify.org"
 CONTROL_TOKEN = ""
 TRANSFERMARKT_CONTROL_TOKEN = ""
+TRANSFERMARKT_BACKFILL_CONTROL_TOKEN = ""
+TRANSFERMARKT_BACKFILL_PROXY_MANAGER = None
 WHOSCORED_PROXY_APPROVAL_HMAC_SECRET = ""
 WHOSCORED_PROXY_LEDGER_HMAC_SECRET = ""
 SOFASCORE_ALLOCATION_LEDGER: AllocationLedger | None = None
@@ -436,6 +448,8 @@ def _dagrun_budget_bytes(dag_id: str) -> int:
         return WHOSCORED_DAGRUN_BUDGET_BYTES
     if dag_id in TRANSFERMARKT_DAG_IDS:
         return TRANSFERMARKT_DAGRUN_BUDGET_BYTES
+    if dag_id in TRANSFERMARKT_BACKFILL_DAG_IDS:
+        return TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES
     return DAGRUN_BUDGET_BYTES
 
 
@@ -448,11 +462,389 @@ def _source_for_dag(dag_id: str) -> str:
         return "sofascore"
     if dag_id in TRANSFERMARKT_DAG_IDS:
         return "transfermarkt"
+    if dag_id in TRANSFERMARKT_BACKFILL_DAG_IDS:
+        return "transfermarkt_backfill"
     if dag_id in FBREF_DAG_IDS:
         return "fbref"
     if dag_id in WHOSCORED_PAID_DAG_IDS:
         return "whoscored"
     return ""
+
+
+def _uses_shared_daily_budget(source: str) -> bool:
+    """Return whether a traffic class belongs to the production UTC-day cap."""
+
+    return source != "transfermarkt_backfill"
+
+
+def _budget_namespace_for_source(source: str) -> str:
+    """Describe the actual hard-budget authority used by a lease source."""
+
+    return {
+        "transfermarkt": "transfermarkt_production_utc_day",
+        "transfermarkt_backfill": "transfermarkt_backfill_dagrun",
+        "sofascore": "sofascore_signed_allocation",
+        "sofascore_canary": "sofascore_canary_explicit_cap",
+        "sofascore_discovery": "sofascore_discovery_dagrun",
+        "whoscored": "whoscored_campaign_provider_order",
+        "fbref": "fbref_service_utc_day",
+    }.get(source, "shared_proxy_utc_day")
+
+
+class TransfermarktPermitError(ValueError):
+    """A request-permit operation is invalid or no longer usable."""
+
+
+class TransfermarktPermitConsumed(TransfermarktPermitError):
+    """A one-time permit was already consumed."""
+
+
+class TransfermarktPermitExpired(TransfermarktPermitError):
+    """A granted permit passed its short consume window."""
+
+
+@dataclass(frozen=True)
+class TransfermarktPermitDecision:
+    """Deterministic result returned by the source-wide request scheduler."""
+
+    permit_id: str
+    permit_token: str | None
+    traffic_class: str
+    granted: bool
+    retry_after_seconds: float
+    granted_at: float | None
+    expires_at: float | None
+
+
+@dataclass
+class _TransfermarktPermitTicket:
+    permit_id: str
+    permit_token: str = field(repr=False)
+    traffic_class: str
+    dag_id: str
+    run_id: str
+    request_id: str
+    created_at: float
+    granted_at: float | None = None
+    consumed_at: float | None = None
+
+
+class TransfermarktRequestPermitController:
+    """In-memory, no-burst 12/min scheduler with bounded production priority.
+
+    The proxy cannot inspect requests inside a CONNECT tunnel without becoming
+    a MITM.  Transfermarkt callers therefore acquire this authenticated control
+    permit immediately before each HTTP attempt.  Pending production tickets
+    are selected before fresh backfill tickets.  An aged backfill ticket gets
+    one slot before its pending TTL, preventing routine daily overlap from
+    turning into a manual platform incident while production retains at least
+    ten of every eleven continuously contended slots.
+
+    ``clock`` and ``token_factory`` are injectable and no operation sleeps,
+    which keeps ordering, persistence and one-time consumption deterministic
+    in tests.  A durable last-grant timestamp prevents a proxy restart from
+    opening an accidental burst window.  Pending tickets expire instead of
+    retaining an unbounded priority claim.
+    """
+
+    TRAFFIC_CLASSES = frozenset({"transfermarkt", "transfermarkt_backfill"})
+    MAX_TICKETS = 4096
+    PENDING_TTL_SECONDS = 90
+    BACKFILL_MAX_QUEUE_SECONDS = 55
+    GRANTED_TTL_SECONDS = 30
+    TERMINAL_TTL_SECONDS = 15 * 60
+    STATE_SCHEMA_VERSION = 1
+
+    def __init__(
+        self,
+        *,
+        requests_per_minute: int = TRANSFERMARKT_REQUESTS_PER_MINUTE,
+        clock=time.time,
+        token_factory=lambda: secrets.token_urlsafe(32),
+        state_path: str | None = None,
+    ) -> None:
+        if (
+            isinstance(requests_per_minute, bool)
+            or not isinstance(requests_per_minute, int)
+            or requests_per_minute <= 0
+        ):
+            raise ValueError("requests_per_minute must be a positive integer")
+        self.requests_per_minute = requests_per_minute
+        self.interval_seconds = 60.0 / requests_per_minute
+        self._clock = clock
+        self._token_factory = token_factory
+        self.state_path = str(state_path or "").strip()
+        self._tickets: dict[tuple[str, str, str, str], _TransfermarktPermitTicket] = {}
+        self._queues: dict[str, list[tuple[str, str, str, str]]] = {
+            "transfermarkt": [],
+            "transfermarkt_backfill": [],
+        }
+        self._last_granted_at: float | None = None
+        if self.state_path and not self._load_state():
+            # A missing checkpoint is indistinguishable from a deleted one
+            # after a crash.  Fence startup for one complete interval instead
+            # of granting immediately and potentially creating a restart
+            # burst.  This also creates the mode-0600 state on first deploy.
+            initialized_at = float(self._clock())
+            if not math.isfinite(initialized_at) or initialized_at < 0:
+                raise RuntimeError("Transfermarkt permit clock is invalid")
+            self._last_granted_at = initialized_at
+            self._persist_grant(initialized_at)
+
+    @staticmethod
+    def _validate_request_id(request_id: str) -> str:
+        value = str(request_id or "").strip()
+        if not value or len(value) > 200 or _contains_control_character(value):
+            raise ValueError("request_id must be a non-empty bounded string")
+        return value
+
+    @staticmethod
+    def _validate_run_id(run_id: str) -> str:
+        value = str(run_id or "").strip()
+        if not value or len(value) > 500 or _contains_control_character(value):
+            raise ValueError("run_id must be a non-empty bounded string")
+        return value
+
+    @staticmethod
+    def _binding_key(
+        traffic_class: str,
+        dag_id: str,
+        run_id: str,
+        request_id: str,
+    ) -> tuple[str, str, str, str]:
+        return traffic_class, dag_id, run_id, request_id
+
+    def _load_state(self) -> bool:
+        try:
+            raw = _require_private_regular_file(
+                self.state_path,
+                allow_empty=False,
+                max_bytes=4096,
+            )
+        except RuntimeError:
+            if not os.path.lexists(self.state_path):
+                return False
+            raise RuntimeError("Transfermarkt permit state is invalid") from None
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or frozenset(payload) != {
+                "schema_version",
+                "last_granted_at_epoch",
+            }:
+                raise ValueError
+            timestamp = payload["last_granted_at_epoch"]
+            if (
+                payload["schema_version"] != self.STATE_SCHEMA_VERSION
+                or isinstance(timestamp, bool)
+                or not isinstance(timestamp, (int, float))
+                or not math.isfinite(float(timestamp))
+                or float(timestamp) < 0
+            ):
+                raise ValueError
+        except (json.JSONDecodeError, TypeError, ValueError):
+            raise RuntimeError("Transfermarkt permit state is corrupt") from None
+        self._last_granted_at = float(timestamp)
+        return True
+
+    def _persist_grant(self, granted_at: float) -> None:
+        if not self.state_path:
+            return
+        payload = (
+            canonical_json_bytes(
+                {
+                    "schema_version": self.STATE_SCHEMA_VERSION,
+                    "last_granted_at_epoch": granted_at,
+                }
+            )
+            + b"\n"
+        )
+        try:
+            _atomic_private_bytes(
+                self.state_path,
+                payload,
+                replace=os.path.isfile(self.state_path),
+            )
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError("Transfermarkt permit state write failed") from exc
+
+    def _prune(self, now: float) -> None:
+        stale = [
+            key
+            for key, ticket in self._tickets.items()
+            if (
+                ticket.granted_at is None
+                and now - ticket.created_at >= self.PENDING_TTL_SECONDS
+            )
+            or (
+                ticket.granted_at is not None
+                and now - (ticket.consumed_at or ticket.granted_at)
+                >= self.TERMINAL_TTL_SECONDS
+            )
+        ]
+        for key in stale:
+            self._tickets.pop(key, None)
+
+    def _ready_at(self, now: float) -> float:
+        if self._last_granted_at is None:
+            return now
+        return self._last_granted_at + self.interval_seconds
+
+    def _grant_one(self, now: float) -> None:
+        if now < self._ready_at(now):
+            return
+        # Production overtakes fresh backfill work.  Bound starvation just
+        # below the pending-ticket TTL so a normal long daily crawl never
+        # converts traffic priority into a manual campaign block.
+        key: tuple[str, str, str, str] | None = None
+        backfill_queue = self._queues["transfermarkt_backfill"]
+        while backfill_queue and (
+            backfill_queue[0] not in self._tickets
+            or self._tickets[backfill_queue[0]].granted_at is not None
+        ):
+            backfill_queue.pop(0)
+        aged_backfill = bool(
+            backfill_queue
+            and now - self._tickets[backfill_queue[0]].created_at
+            >= self.BACKFILL_MAX_QUEUE_SECONDS
+        )
+        order = (
+            ("transfermarkt_backfill", "transfermarkt")
+            if aged_backfill
+            else ("transfermarkt", "transfermarkt_backfill")
+        )
+        for traffic_class in order:
+            queue = self._queues[traffic_class]
+            while queue and (
+                queue[0] not in self._tickets
+                or self._tickets[queue[0]].granted_at is not None
+            ):
+                queue.pop(0)
+            if queue:
+                key = queue.pop(0)
+                break
+        if key is None:
+            return
+        ticket = self._tickets[key]
+        # Durable state is the commit point.  If the write outcome is
+        # uncertain, retain the in-memory timestamp and return no permit.
+        self._last_granted_at = now
+        self._persist_grant(now)
+        ticket.granted_at = now
+
+    def request(
+        self,
+        *,
+        traffic_class: str,
+        dag_id: str,
+        run_id: str,
+        request_id: str,
+        now: float | None = None,
+    ) -> TransfermarktPermitDecision:
+        if traffic_class not in self.TRAFFIC_CLASSES:
+            raise ValueError("unsupported Transfermarkt traffic class")
+        dag_id = str(dag_id or "").strip()
+        if _source_for_dag(dag_id) != traffic_class:
+            raise ValueError("permit dag_id does not match traffic class")
+        run_id = self._validate_run_id(run_id)
+        request_id = self._validate_request_id(request_id)
+        observed_at = float(self._clock() if now is None else now)
+        if not math.isfinite(observed_at):
+            raise ValueError("permit clock must be finite")
+        self._prune(observed_at)
+        key = self._binding_key(traffic_class, dag_id, run_id, request_id)
+        ticket = self._tickets.get(key)
+        if ticket is None:
+            if len(self._tickets) >= self.MAX_TICKETS:
+                raise RuntimeError("Transfermarkt request permit queue is full")
+            permit_token = str(self._token_factory())
+            if len(permit_token) < 32 or _contains_control_character(permit_token):
+                raise RuntimeError("Transfermarkt permit token factory failed")
+            permit_id = hashlib.sha256(
+                f"tm-request-permit-v2\0{traffic_class}\0{dag_id}\0{run_id}\0"
+                f"{request_id}\0{permit_token}".encode("utf-8")
+            ).hexdigest()
+            ticket = _TransfermarktPermitTicket(
+                permit_id=permit_id,
+                permit_token=permit_token,
+                traffic_class=traffic_class,
+                dag_id=dag_id,
+                run_id=run_id,
+                request_id=request_id,
+                created_at=observed_at,
+            )
+            self._tickets[key] = ticket
+            self._queues[traffic_class].append(key)
+        elif ticket.consumed_at is not None:
+            raise TransfermarktPermitConsumed("request permit was already consumed")
+        elif (
+            ticket.granted_at is not None
+            and observed_at - ticket.granted_at >= self.GRANTED_TTL_SECONDS
+        ):
+            raise TransfermarktPermitExpired("request permit expired before consume")
+        self._grant_one(observed_at)
+        granted = ticket.granted_at is not None
+        retry_after = (
+            0.0 if granted else max(0.0, self._ready_at(observed_at) - observed_at)
+        )
+        return TransfermarktPermitDecision(
+            permit_id=ticket.permit_id,
+            permit_token=ticket.permit_token if granted else None,
+            traffic_class=ticket.traffic_class,
+            granted=granted,
+            retry_after_seconds=retry_after,
+            granted_at=ticket.granted_at,
+            expires_at=(
+                ticket.granted_at + self.GRANTED_TTL_SECONDS
+                if ticket.granted_at is not None
+                else None
+            ),
+        )
+
+    def consume(
+        self,
+        *,
+        traffic_class: str,
+        dag_id: str,
+        run_id: str,
+        request_id: str,
+        permit_id: str,
+        permit_token: str,
+        now: float | None = None,
+    ) -> float:
+        """Consume exactly one granted permit bound to one HTTP attempt."""
+
+        if traffic_class not in self.TRAFFIC_CLASSES:
+            raise TransfermarktPermitError("unsupported Transfermarkt traffic class")
+        dag_id = str(dag_id or "").strip()
+        if _source_for_dag(dag_id) != traffic_class:
+            raise TransfermarktPermitError("permit dag_id does not match traffic class")
+        run_id = self._validate_run_id(run_id)
+        request_id = self._validate_request_id(request_id)
+        observed_at = float(self._clock() if now is None else now)
+        if not math.isfinite(observed_at):
+            raise TransfermarktPermitError("permit clock must be finite")
+        self._prune(observed_at)
+        key = self._binding_key(traffic_class, dag_id, run_id, request_id)
+        ticket = self._tickets.get(key)
+        if (
+            ticket is None
+            or not permit_id
+            or not permit_token
+            or not secrets.compare_digest(ticket.permit_id, str(permit_id))
+            or not secrets.compare_digest(ticket.permit_token, str(permit_token))
+        ):
+            raise TransfermarktPermitError("request permit binding is invalid")
+        if ticket.consumed_at is not None:
+            raise TransfermarktPermitConsumed("request permit was already consumed")
+        if ticket.granted_at is None:
+            raise TransfermarktPermitError("request permit is not granted")
+        if observed_at - ticket.granted_at >= self.GRANTED_TTL_SECONDS:
+            raise TransfermarktPermitExpired("request permit expired before consume")
+        ticket.consumed_at = observed_at
+        return observed_at
+
+
+TRANSFERMARKT_REQUEST_PERMITS = TransfermarktRequestPermitController()
 
 
 def _canary_policy_id(hard_cap_bytes: int) -> str:
@@ -618,6 +1010,8 @@ class Lease:
             "entity": self.entity,
             "canonical_url": self.canonical_url,
             "source": self.source,
+            "traffic_class": self.source,
+            "budget_namespace": _budget_namespace_for_source(self.source),
             "upstream_fingerprint": _upstream_fingerprint(self.upstream),
             "dagrun_total_bytes": _run_total_bytes(self.dagrun_key),
             "dagrun_budget_bytes": _lease_dagrun_budget_bytes(self),
@@ -865,7 +1259,10 @@ def _lease_host_allowed(lease: Lease | None, host: str, port: int = 443) -> bool
         # Exact names only: neither arbitrary subdomains nor the apex can be
         # CONNECTed through the paid provider.
         return normalized in WHOSCORED_PROXY_ALLOWED_HOSTS
-    if lease is not None and lease.source == "transfermarkt":
+    if lease is not None and lease.source in {
+        "transfermarkt",
+        "transfermarkt_backfill",
+    }:
         return normalized in TRANSFERMARKT_PROXY_ALLOWED_HOSTS
     # Unknown lease sources never receive an unrestricted paid exit.  A
     # credential-less development listener is handled separately by ``handle``.
@@ -873,6 +1270,8 @@ def _lease_host_allowed(lease: Lease | None, host: str, port: int = 443) -> bool
 
 
 def _control_token_for_source(source: str) -> str:
+    if source == "transfermarkt_backfill":
+        return TRANSFERMARKT_BACKFILL_CONTROL_TOKEN
     if source == "transfermarkt":
         return TRANSFERMARKT_CONTROL_TOKEN
     return CONTROL_TOKEN
@@ -889,8 +1288,41 @@ def _any_control_token_valid(headers: dict[str, str]) -> bool:
     supplied = str(headers.get("x-proxy-control-token") or "")
     return any(
         expected and secrets.compare_digest(supplied, expected)
-        for expected in (CONTROL_TOKEN, TRANSFERMARKT_CONTROL_TOKEN)
+        for expected in (
+            CONTROL_TOKEN,
+            TRANSFERMARKT_CONTROL_TOKEN,
+            TRANSFERMARKT_BACKFILL_CONTROL_TOKEN,
+        )
     )
+
+
+def _validate_transfermarkt_control_token_separation(
+    *,
+    shared_token: str,
+    production_token: str,
+    backfill_token: str,
+    production_cap_bytes: int,
+    backfill_cap_bytes: int,
+) -> None:
+    """Keep the new backfill authority distinct without breaking daily rollout.
+
+    Production historically used the shared control credential in this stack.
+    Changing that unrelated live authority is not a prerequisite for enabling
+    the isolated historical class.  The backfill credential, however, must be
+    distinct from every active legacy/production credential.
+    """
+
+    if backfill_cap_bytes <= 0:
+        return
+    for name, token in (
+        ("shared", shared_token),
+        ("production", production_token if production_cap_bytes > 0 else ""),
+    ):
+        if token and backfill_token and secrets.compare_digest(token, backfill_token):
+            raise ValueError(
+                "backfill proxy control token must be distinct "
+                f"from {name}"
+            )
 
 
 def _json_object_without_duplicate_fields(
@@ -1739,6 +2171,8 @@ def _append_budget_event(event_type: str, lease: Lease, **values: Any) -> None:
         "entity": lease.entity,
         "canonical_url": lease.canonical_url,
         "source": lease.source,
+        "traffic_class": lease.source,
+        "budget_namespace": _budget_namespace_for_source(lease.source),
         "budget_policy_id": _lease_budget_policy_id(lease),
         "dagrun_budget_bytes": _lease_dagrun_budget_bytes(lease),
         "plan_digest": (lease.workload_plan.plan_digest if lease.workload_plan else ""),
@@ -1865,7 +2299,11 @@ def _restore_budget_ledger(path: str, *, restore_daily: bool = True) -> int:
                     _run_down_bytes[run_key] += count
                     _url_down_bytes[(run_key, canonical)] += count
                 occurred = str(event.get("occurred_at") or "")
-                if restore_daily and occurred[:10] == today:
+                if (
+                    restore_daily
+                    and occurred[:10] == today
+                    and _uses_shared_daily_budget(str(event.get("source") or ""))
+                ):
                     _daily_day = today
                     if direction == "up":
                         _daily_up_bytes += count
@@ -2478,6 +2916,14 @@ def _create_lease(
     if requested_source and requested_source != inferred_source:
         raise ValueError("paid lease source does not match dag_id")
     source = inferred_source or requested_source
+    lease_manager = mgr
+    if source == "transfermarkt_backfill":
+        if TRANSFERMARKT_BACKFILL_PROXY_MANAGER is None:
+            raise RuntimeError(
+                "Transfermarkt backfill proxy unavailable: dedicated upstream "
+                "pool is not configured"
+            )
+        lease_manager = TRANSFERMARKT_BACKFILL_PROXY_MANAGER
     if source == "whoscored" and SOURCE_MODE == "shared-no-whoscored":
         raise ProxyCampaignValidationError(
             "WhoScored leases require the dedicated provider service"
@@ -2537,7 +2983,9 @@ def _create_lease(
         )
         if whoscored_global_available <= 0:
             raise RuntimeError("WhoScored global daily/provider-order budget exhausted")
-    elif _daily_total_bytes() >= DAILY_BUDGET_BYTES:
+    elif _uses_shared_daily_budget(source) and (
+        _daily_total_bytes() >= DAILY_BUDGET_BYTES
+    ):
         raise RuntimeError("daily paid-proxy budget exhausted")
     if source == "sofascore" and SOFASCORE_DAGRUN_BUDGET_BYTES <= 0:
         raise RuntimeError(
@@ -2556,6 +3004,14 @@ def _create_lease(
             "Transfermarkt paid-proxy budget unavailable: explicit source-scoped "
             "authorization required"
         )
+    if (
+        source == "transfermarkt_backfill"
+        and TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES <= 0
+    ):
+        raise RuntimeError(
+            "Transfermarkt backfill paid-proxy budget unavailable: explicit "
+            "backfill authorization required"
+        )
     active_leases = [
         item
         for item in LEASES.values()
@@ -2566,7 +3022,17 @@ def _create_lease(
             or item.global_budget_escrow_bytes > 0
         )
     ]
-    if len(active_leases) >= MAX_ACTIVE_LEASES:
+    if source == "transfermarkt_backfill":
+        if any(item.source == "transfermarkt_backfill" for item in active_leases):
+            raise RuntimeError(
+                "Transfermarkt backfill paid-proxy concurrency limit reached"
+            )
+    elif (
+        len([item for item in active_leases if item.source != "transfermarkt_backfill"])
+        >= MAX_ACTIVE_LEASES
+    ):
+        # A backfill lease uses a different provider pool and cannot consume a
+        # production concurrency slot.
         raise RuntimeError("paid-proxy concurrency limit reached")
     if source == "sofascore" and any(
         item.source == "sofascore" for item in active_leases
@@ -2653,17 +3119,18 @@ def _create_lease(
             whoscored_global_available,
         )
     else:
-        available = min(
-            DAILY_BUDGET_BYTES - _daily_total_bytes(),
+        available_components = [
             dagrun_budget - _run_total_bytes(run_key),
             url_budget - _url_total_bytes(run_key, canonical_url),
-            (
+        ]
+        if _uses_shared_daily_budget(source):
+            available_components.append(DAILY_BUDGET_BYTES - _daily_total_bytes())
+        if parent_envelope is not None:
+            available_components.append(
                 parent_envelope.parent_cap_bytes
                 - parent_envelope.parent_spent_provider_bytes
-                if parent_envelope is not None
-                else DAILY_BUDGET_BYTES
-            ),
-        )
+            )
+        available = min(available_components)
     if available <= 0:
         raise RuntimeError("paid-proxy DagRun or URL budget exhausted")
     if workload_plan is not None and allocation is not None:
@@ -2694,7 +3161,7 @@ def _create_lease(
         lease = Lease(
             lease_id=lease_id,
             token=secrets.token_urlsafe(24),
-            upstream=_pick_upstream(mgr),
+            upstream=_pick_upstream(lease_manager),
             created_at=now,
             expires_at=effective_expires_at,
             max_bytes=min(max_bytes, available),
@@ -3003,8 +3470,10 @@ def _lease_budget_capacity(
             max(0, lease.global_budget_escrow_bytes - lease_reserved),
         )
     daily_reserved = _daily_reserved_bytes if include_reservations else 0
-    daily_remaining = max(
-        0, DAILY_BUDGET_BYTES - _daily_total_bytes() - daily_reserved
+    daily_remaining = (
+        max(0, DAILY_BUDGET_BYTES - _daily_total_bytes() - daily_reserved)
+        if _uses_shared_daily_budget(lease.source)
+        else _lease_dagrun_budget_bytes(lease)
     )
     run_key = lease.dagrun_key
     url_key = (run_key, lease.canonical_url)
@@ -3084,7 +3553,8 @@ def _reserve_lease_bytes(lease: Lease, wanted: int) -> int:
     global _daily_reserved_bytes
     count = min(max(0, wanted), _lease_remaining(lease))
     lease.reserved_bytes += count
-    _daily_reserved_bytes += count
+    if _uses_shared_daily_budget(lease.source):
+        _daily_reserved_bytes += count
     _run_reserved_bytes[lease.dagrun_key] += count
     _url_reserved_bytes[(lease.dagrun_key, lease.canonical_url)] += count
     if (
@@ -3106,7 +3576,8 @@ def _reserve_lease_bytes(lease: Lease, wanted: int) -> int:
 def _release_lease_reservation(lease: Lease, count: int) -> None:
     global _daily_reserved_bytes
     lease.reserved_bytes = max(0, lease.reserved_bytes - count)
-    _daily_reserved_bytes = max(0, _daily_reserved_bytes - count)
+    if _uses_shared_daily_budget(lease.source):
+        _daily_reserved_bytes = max(0, _daily_reserved_bytes - count)
     run_key = lease.dagrun_key
     url_key = (run_key, lease.canonical_url)
     _run_reserved_bytes[run_key] = max(0, _run_reserved_bytes[run_key] - count)
@@ -3348,18 +3819,21 @@ def _account_lease_bytes(lease: Lease, host: str, direction: str, count: int) ->
             raise RuntimeError(
                 "WhoScored provider bytes exceed global provider-order escrow"
             )
-    _refresh_daily_counter()
+    if _uses_shared_daily_budget(lease.source):
+        _refresh_daily_counter()
     host_stats = lease.hosts.setdefault(host, {"up_bytes": 0, "down_bytes": 0})
     if direction == "up":
         lease.up_bytes += count
-        _daily_up_bytes += count
+        if _uses_shared_daily_budget(lease.source):
+            _daily_up_bytes += count
         _run_up_bytes[lease.dagrun_key] += count
         _url_up_bytes[(lease.dagrun_key, lease.canonical_url)] += count
         host_stats["up_bytes"] += count
         up_bytes[host] += count
     else:
         lease.down_bytes += count
-        _daily_down_bytes += count
+        if _uses_shared_daily_budget(lease.source):
+            _daily_down_bytes += count
         _run_down_bytes[lease.dagrun_key] += count
         _url_down_bytes[(lease.dagrun_key, lease.canonical_url)] += count
         host_stats["down_bytes"] += count
@@ -3396,7 +3870,10 @@ def _account_lease_bytes(lease: Lease, host: str, direction: str, count: int) ->
     if lease.total_bytes >= lease.max_bytes or (
         lease.source != "whoscored"
         and (
-            _daily_total_bytes() >= DAILY_BUDGET_BYTES
+            (
+                _uses_shared_daily_budget(lease.source)
+                and _daily_total_bytes() >= DAILY_BUDGET_BYTES
+            )
             or _run_total_bytes(lease.dagrun_key) >= _lease_dagrun_budget_bytes(lease)
             or _url_total_bytes(lease.dagrun_key, lease.canonical_url)
             >= _lease_url_budget_bytes(lease)
@@ -4648,6 +5125,31 @@ def _service_health_report(mgr) -> dict[str, Any]:
             TRANSFERMARKT_DAGRUN_BUDGET_BYTES > 0 and bool(TRANSFERMARKT_CONTROL_TOKEN)
         ),
         "transfermarkt_dagrun_budget_bytes": TRANSFERMARKT_DAGRUN_BUDGET_BYTES,
+        "transfermarkt_backfill_paid_enabled": (
+            TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES > 0
+            and bool(TRANSFERMARKT_BACKFILL_CONTROL_TOKEN)
+            and TRANSFERMARKT_BACKFILL_PROXY_MANAGER is not None
+        ),
+        "transfermarkt_backfill_dag_ids": sorted(TRANSFERMARKT_BACKFILL_DAG_IDS),
+        "transfermarkt_backfill_dagrun_budget_bytes": (
+            TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES
+        ),
+        "transfermarkt_backfill_budget_namespace": ("transfermarkt_backfill_dagrun"),
+        "transfermarkt_backfill_uses_production_daily_budget": False,
+        "transfermarkt_requests_per_minute": TRANSFERMARKT_REQUESTS_PER_MINUTE,
+        "transfermarkt_request_permit_consume_required": True,
+        "transfermarkt_request_permit_pending_ttl_seconds": (
+            TransfermarktRequestPermitController.PENDING_TTL_SECONDS
+        ),
+        "transfermarkt_backfill_max_queue_seconds": (
+            TransfermarktRequestPermitController.BACKFILL_MAX_QUEUE_SECONDS
+        ),
+        "transfermarkt_request_permit_granted_ttl_seconds": (
+            TransfermarktRequestPermitController.GRANTED_TTL_SECONDS
+        ),
+        "transfermarkt_request_permit_state_durable": bool(
+            TRANSFERMARKT_REQUEST_PERMITS.state_path
+        ),
         "whoscored_default_paid_cap_bytes": DEFAULT_WHOSCORED_PAID_CAP_BYTES,
         "whoscored_signed_campaigns_required": True,
         "whoscored_provider_invoice_hard_cap_available": (
@@ -4680,10 +5182,144 @@ async def _handle_control(
         return True
 
     if method == "GET" and path == "/v1/auth-check":
-        if not _control_token_valid(headers):
+        # Source-specific workers must prove their own credential during
+        # fail-closed preflight; the response is read-only health metadata.
+        if not _any_control_token_valid(headers):
             await _send_json(writer, 401, {"error": "invalid control token"})
             return True
         await _send_json(writer, 200, _service_health_report(mgr))
+        return True
+
+    permit_path = "/v1/transfermarkt/request-permits"
+    consume_permit_path = permit_path + "/consume"
+    if path in {permit_path, consume_permit_path}:
+        if method != "POST":
+            await _send_json(writer, 404, {"error": "unknown control endpoint"})
+            return True
+        # Authenticate before retaining or parsing an attacker-controlled body.
+        if not _any_control_token_valid(headers):
+            await _send_json(writer, 401, {"error": "invalid control token"})
+            return True
+        if headers.get("transfer-encoding"):
+            await _send_json(writer, 400, {"error": "invalid request framing"})
+            return True
+        try:
+            raw_length = headers.get("content-length", "")
+            if (
+                not raw_length.isascii()
+                or not raw_length.isdigit()
+                or raw_length != str(int(raw_length or "0"))
+            ):
+                raise ValueError("request permit content length is invalid")
+            length = int(raw_length)
+            if not 0 < length <= MAX_CONTROL_BODY_BYTES:
+                raise ValueError("request permit body size is invalid")
+            raw = await reader.readexactly(length)
+            request = json.loads(raw)
+            expected_fields = {"dag_id", "run_id", "request_id"}
+            if path == consume_permit_path:
+                expected_fields.update({"permit_id", "permit_token"})
+            if not isinstance(request, dict) or frozenset(request) != expected_fields:
+                raise ValueError("request permit fields are invalid")
+            dag_id = str(request.get("dag_id") or "").strip()
+            run_id = str(request.get("run_id") or "").strip()
+            traffic_class = _source_for_dag(dag_id)
+            if traffic_class not in {
+                "transfermarkt",
+                "transfermarkt_backfill",
+            }:
+                raise ValueError("request permit dag_id is not allowed")
+            TransfermarktRequestPermitController._validate_run_id(run_id)
+            request_id = str(request.get("request_id") or "").strip()
+            TransfermarktRequestPermitController._validate_request_id(request_id)
+            if not _control_token_valid(headers, source=traffic_class):
+                await _send_json(writer, 401, {"error": "invalid control token"})
+                return True
+            source_ready = (
+                TRANSFERMARKT_DAGRUN_BUDGET_BYTES > 0
+                if traffic_class == "transfermarkt"
+                else (
+                    TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES > 0
+                    and TRANSFERMARKT_BACKFILL_PROXY_MANAGER is not None
+                )
+            )
+            if not source_ready:
+                raise RuntimeError(
+                    "Transfermarkt request permits are unavailable for this source"
+                )
+            if path == consume_permit_path:
+                consumed_at = TRANSFERMARKT_REQUEST_PERMITS.consume(
+                    traffic_class=traffic_class,
+                    dag_id=dag_id,
+                    run_id=run_id,
+                    request_id=request_id,
+                    permit_id=str(request.get("permit_id") or ""),
+                    permit_token=str(request.get("permit_token") or ""),
+                )
+                decision = None
+            else:
+                decision = TRANSFERMARKT_REQUEST_PERMITS.request(
+                    traffic_class=traffic_class,
+                    dag_id=dag_id,
+                    run_id=run_id,
+                    request_id=request_id,
+                )
+                consumed_at = None
+        except TransfermarktPermitError:
+            await _send_json(
+                writer,
+                409,
+                {
+                    "code": "request_permit_rejected",
+                    "error": "request permit rejected",
+                },
+            )
+            return True
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            await _send_json(writer, 400, {"error": str(exc)})
+            return True
+        except (OSError, asyncio.IncompleteReadError, RuntimeError):
+            await _send_json(
+                writer,
+                503,
+                {
+                    "code": "request_permit_unavailable",
+                    "error": "request permit unavailable",
+                },
+            )
+            return True
+        if path == consume_permit_path:
+            await _send_json(
+                writer,
+                200,
+                {
+                    "schema_version": 1,
+                    "permit_id": str(request["permit_id"]),
+                    "traffic_class": traffic_class,
+                    "consumed": True,
+                    "consumed_at_epoch": consumed_at,
+                },
+            )
+            return True
+        assert decision is not None
+        response = {
+            "schema_version": 1,
+            "permit_id": decision.permit_id,
+            "permit_token": decision.permit_token,
+            "traffic_class": decision.traffic_class,
+            "granted": decision.granted,
+            "granted_at_epoch": decision.granted_at,
+            "expires_at_epoch": decision.expires_at,
+            "retry_after_seconds": decision.retry_after_seconds,
+        }
+        if not decision.granted:
+            await _send_json(
+                writer,
+                429,
+                {"code": "request_permit_pending", **response},
+            )
+            return True
+        await _send_json(writer, 200, response)
         return True
 
     if path == "/v1/whoscored/campaign-control":
@@ -5294,13 +5930,24 @@ async def _open_lease_upstream_tunnel(
             and _attempt < LEASE_UPSTREAM_FAILOVER_ATTEMPTS
         ):
             previous = lease.upstream
+            failover_manager = mgr
+            if lease.source == "transfermarkt_backfill":
+                # The initial lease and every later repin share one isolation
+                # boundary.  A dead dedicated exit must never fall through to
+                # the production pool supplied to the shared proxy listener.
+                if TRANSFERMARKT_BACKFILL_PROXY_MANAGER is None:
+                    raise RuntimeError(
+                        "Transfermarkt backfill failover requires its "
+                        "dedicated upstream pool"
+                    )
+                failover_manager = TRANSFERMARKT_BACKFILL_PROXY_MANAGER
             # The pool draw is random: re-draw (bounded) so the replacement is
             # not the exit that just failed, unless the pool has nothing else.
-            candidate = _pick_upstream(mgr)
+            candidate = _pick_upstream(failover_manager)
             for _redraw in range(5):
                 if candidate != previous:
                     break
-                candidate = _pick_upstream(mgr)
+                candidate = _pick_upstream(failover_manager)
             lease.upstream = candidate
             lease.upstream_repins += 1
             log.warning(
@@ -5858,11 +6505,15 @@ async def main() -> None:
     global BLOCKLIST, DAILY_BUDGET_BYTES, MAX_LEASE_BYTES, LEASE_PROXY_URL
     global MAX_LEASE_TTL_SECONDS, DAGRUN_BUDGET_BYTES
     global TRANSFERMARKT_DAGRUN_BUDGET_BYTES
+    global TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES
     global SOFASCORE_DAGRUN_BUDGET_BYTES, SOFASCORE_BUDGET_ARTIFACT_ID
     global SOFASCORE_CANARY_HARD_CAP_BYTES, SOFASCORE_CANARY_POLICY_ID
     global SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES
     global URL_BUDGET_BYTES, MAX_ACTIVE_LEASES, LEDGER_PATH, CONTROL_TOKEN
     global TRANSFERMARKT_CONTROL_TOKEN
+    global TRANSFERMARKT_BACKFILL_CONTROL_TOKEN
+    global TRANSFERMARKT_BACKFILL_PROXY_MANAGER
+    global TRANSFERMARKT_PERMIT_STATE_PATH, TRANSFERMARKT_REQUEST_PERMITS
     global WHOSCORED_PROXY_APPROVAL_HMAC_SECRET
     global WHOSCORED_PROXY_LEDGER_HMAC_SECRET
     global LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS, LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS
@@ -5959,6 +6610,28 @@ async def main() -> None:
         "--transfermarkt-dagrun-budget-bytes",
         type=int,
         default=TRANSFERMARKT_DAGRUN_BUDGET_BYTES,
+    )
+    ap.add_argument(
+        "--transfermarkt-backfill-dagrun-budget-bytes",
+        type=int,
+        default=int(
+            os.environ.get(
+                "PROXY_FILTER_TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES",
+                "0",
+            )
+        ),
+        help=(
+            "separate hard cap for one dag_backfill_transfermarkt run; zero "
+            "refuses every backfill lease"
+        ),
+    )
+    ap.add_argument(
+        "--transfermarkt-permit-state",
+        default=os.environ.get(
+            "PROXY_FILTER_TRANSFERMARKT_PERMIT_STATE_PATH",
+            TRANSFERMARKT_PERMIT_STATE_PATH,
+        ),
+        help="durable last-grant timestamp for the source-wide 12/min limiter",
     )
     ap.add_argument("--url-budget-bytes", type=int, default=2_000_000)
     ap.add_argument("--max-active-leases", type=int, default=MAX_ACTIVE_LEASES)
@@ -6134,6 +6807,9 @@ async def main() -> None:
     TRANSFERMARKT_CONTROL_TOKEN = str(
         os.environ.get("TM_PROXY_CONTROL_TOKEN", "")
     ).strip()
+    TRANSFERMARKT_BACKFILL_CONTROL_TOKEN = str(
+        os.environ.get("TM_BACKFILL_PROXY_CONTROL_TOKEN", "")
+    ).strip()
     WHOSCORED_PROXY_APPROVAL_HMAC_SECRET = str(
         os.environ.get("WHOSCORED_PROXY_APPROVAL_HMAC_SECRET", "")
     ).strip()
@@ -6177,6 +6853,17 @@ async def main() -> None:
             TRANSFERMARKT_DAGRUN_BUDGET_BYTES,
         )
     )
+    transfermarkt_backfill_budget_bytes = int(
+        getattr(
+            args,
+            "transfermarkt_backfill_dagrun_budget_bytes",
+            TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES,
+        )
+    )
+    transfermarkt_permit_state_path = str(
+        getattr(args, "transfermarkt_permit_state", TRANSFERMARKT_PERMIT_STATE_PATH)
+        or ""
+    ).strip()
     url_budget_bytes = int(getattr(args, "url_budget_bytes", URL_BUDGET_BYTES))
     max_active_leases = int(getattr(args, "max_active_leases", MAX_ACTIVE_LEASES))
     lease_connect_timeout_seconds = float(
@@ -6236,6 +6923,7 @@ async def main() -> None:
         or max_lease_ttl_seconds <= 0
         or dagrun_budget_bytes <= 0
         or transfermarkt_budget_bytes < 0
+        or transfermarkt_backfill_budget_bytes < 0
         or url_budget_bytes <= 0
         or max_active_leases <= 0
         or sofascore_canary_hard_cap_bytes < 0
@@ -6252,6 +6940,38 @@ async def main() -> None:
     if TRANSFERMARKT_CONTROL_TOKEN and len(TRANSFERMARKT_CONTROL_TOKEN) < 32:
         raise SystemExit(
             "TM_PROXY_CONTROL_TOKEN must be empty or contain at least 32 characters"
+        )
+    if (
+        transfermarkt_backfill_budget_bytes > 0
+        and len(TRANSFERMARKT_BACKFILL_CONTROL_TOKEN) < 32
+    ):
+        raise SystemExit(
+            "TM_BACKFILL_PROXY_CONTROL_TOKEN must contain at least 32 characters "
+            "when Transfermarkt backfill paid proxying is enabled"
+        )
+    if (
+        TRANSFERMARKT_BACKFILL_CONTROL_TOKEN
+        and len(TRANSFERMARKT_BACKFILL_CONTROL_TOKEN) < 32
+    ):
+        raise SystemExit(
+            "TM_BACKFILL_PROXY_CONTROL_TOKEN must be empty or contain at least "
+            "32 characters"
+        )
+    try:
+        _validate_transfermarkt_control_token_separation(
+            shared_token=CONTROL_TOKEN,
+            production_token=TRANSFERMARKT_CONTROL_TOKEN,
+            backfill_token=TRANSFERMARKT_BACKFILL_CONTROL_TOKEN,
+            production_cap_bytes=transfermarkt_budget_bytes,
+            backfill_cap_bytes=transfermarkt_backfill_budget_bytes,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
+    if (
+        transfermarkt_budget_bytes > 0 or transfermarkt_backfill_budget_bytes > 0
+    ) and not transfermarkt_permit_state_path:
+        raise SystemExit(
+            "Transfermarkt paid proxying requires --transfermarkt-permit-state"
         )
     # ``inf``/``nan`` pass a bare ``<= 0`` check but would disable the dead-exit
     # bound entirely, so the timeouts require strictly finite positive values.
@@ -6282,6 +7002,22 @@ async def main() -> None:
     MAX_LEASE_TTL_SECONDS = max_lease_ttl_seconds
     DAGRUN_BUDGET_BYTES = dagrun_budget_bytes
     TRANSFERMARKT_DAGRUN_BUDGET_BYTES = transfermarkt_budget_bytes
+    TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES = transfermarkt_backfill_budget_bytes
+    TRANSFERMARKT_PERMIT_STATE_PATH = transfermarkt_permit_state_path
+    try:
+        TRANSFERMARKT_REQUEST_PERMITS = TransfermarktRequestPermitController(
+            requests_per_minute=TRANSFERMARKT_REQUESTS_PER_MINUTE,
+            state_path=(
+                TRANSFERMARKT_PERMIT_STATE_PATH
+                if (
+                    transfermarkt_budget_bytes > 0
+                    or transfermarkt_backfill_budget_bytes > 0
+                )
+                else None
+            ),
+        )
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None
     URL_BUDGET_BYTES = url_budget_bytes
     MAX_ACTIVE_LEASES = max_active_leases
     LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS = lease_connect_timeout_seconds
@@ -6456,6 +7192,42 @@ async def main() -> None:
         )
     except (OSError, ProxyPoolConfigurationError) as exc:
         raise SystemExit(f"proxy pool configuration error: {exc}") from None
+    backfill_pool_json = str(
+        os.environ.get("TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON", "")
+    ).strip()
+    TRANSFERMARKT_BACKFILL_PROXY_MANAGER = None
+    if TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES > 0 and not backfill_pool_json:
+        raise SystemExit(
+            "TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON is required when Transfermarkt "
+            "backfill paid proxying is enabled"
+        )
+    if backfill_pool_json:
+        try:
+            production_raw = str(os.environ.get(PROXY_POOL_ENV, "")).strip()
+            backfill_records = _parse_proxy_pool_json(backfill_pool_json)
+            if production_raw:
+                production_records = _parse_proxy_pool_json(production_raw)
+                production_identities = {
+                    (item["host"], item["port"], item["username"])
+                    for item in production_records
+                }
+                backfill_identities = {
+                    (item["host"], item["port"], item["username"])
+                    for item in backfill_records
+                }
+                if production_identities & backfill_identities:
+                    raise ProxyPoolConfigurationError(
+                        "Transfermarkt backfill pool overlaps the production pool"
+                    )
+            TRANSFERMARKT_BACKFILL_PROXY_MANAGER, _ = _residential_manager(
+                proxy_pool_json=backfill_pool_json,
+                proxy_file="",
+                allow_file_fallback=False,
+            )
+        except (OSError, ProxyPoolConfigurationError) as exc:
+            raise SystemExit(
+                f"Transfermarkt backfill proxy pool configuration error: {exc}"
+            ) from None
     allow_legacy_noauth = bool(getattr(args, "allow_legacy_noauth", False))
     log.info(
         "residential pool = %d proxies from %s (legacy no-auth=%s)",
@@ -6463,6 +7235,11 @@ async def main() -> None:
         pool_source,
         "enabled" if allow_legacy_noauth else "disabled",
     )
+    if TRANSFERMARKT_BACKFILL_PROXY_MANAGER is not None:
+        log.info(
+            "Transfermarkt backfill residential pool = %d proxies from dedicated env",
+            TRANSFERMARKT_BACKFILL_PROXY_MANAGER.total_count,
+        )
     listen = str(getattr(args, "listen", "0.0.0.0:8899"))
     host, port = listen.rsplit(":", 1)
 

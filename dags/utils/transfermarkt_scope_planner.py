@@ -13,7 +13,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 from scrapers.transfermarkt.registry import (
     ClassificationStatus,
@@ -36,6 +36,10 @@ CURRENT_SCOPE_INTERVAL = timedelta(days=6)
 # Half of every batch pays down career debt, half buys new coverage.  See
 # ``_quota_order``: neither obligation may starve the other.
 CAREER_DEBT_BATCH_SHARE = 0.5
+ScopeSelectionMode = Literal['all_due', 'current_only', 'historical_only']
+SCOPE_SELECTION_MODES = frozenset({
+    'all_due', 'current_only', 'historical_only',
+})
 
 REGISTRY_STATE_TABLE = 'iceberg.ops.transfermarkt_registry_state_v2'
 SCOPE_MANIFEST_TABLE = 'iceberg.ops.transfermarkt_scope_manifest_v2'
@@ -441,6 +445,28 @@ def _is_due(candidate: _Candidate, now: datetime) -> bool:
     return False
 
 
+def _assert_selection_mode(
+    candidate: _Candidate,
+    *,
+    selection_mode: ScopeSelectionMode,
+) -> None:
+    """Keep scheduled current traffic disjoint from historical campaigns."""
+
+    current = bool(candidate.edition.current)
+    if selection_mode == 'current_only' and not current:
+        raise ScopePlanningError(
+            f'{candidate.competition.competition_id}/'
+            f'{candidate.edition.edition_id}: historical scopes belong to '
+            'dag_backfill_transfermarkt'
+        )
+    if selection_mode == 'historical_only' and current:
+        raise ScopePlanningError(
+            f'{candidate.competition.competition_id}/'
+            f'{candidate.edition.edition_id}: current scopes belong to '
+            'dag_ingest_transfermarkt'
+        )
+
+
 def _select_candidates(
     params: Mapping[str, Any],
     *,
@@ -450,6 +476,7 @@ def _select_candidates(
     now: datetime,
     career_pending: Mapping[tuple[str, str], int] | None = None,
     batch_size: int = MAX_BATCH_SIZE,
+    selection_mode: ScopeSelectionMode = 'all_due',
 ) -> list[_Candidate]:
     scopes = _normalise_sequence(params.get('scopes'), name='scopes')
     leagues = _normalise_sequence(params.get('leagues'), name='leagues')
@@ -462,7 +489,7 @@ def _select_candidates(
             competition = _resolve_competition(competition_value, competitions)
             _assert_crawlable(competition)
             edition = _resolve_edition(competition, edition_value, editions)
-            selected.append(_Candidate(
+            candidate = _Candidate(
                 competition=competition,
                 edition=edition,
                 last_success_at=last_success.get(
@@ -472,7 +499,9 @@ def _select_candidates(
                     (competition.competition_id, edition.edition_id), 0
                 )),
                 explicit_order=position,
-            ))
+            )
+            _assert_selection_mode(candidate, selection_mode=selection_mode)
+            selected.append(candidate)
     elif leagues:
         for position, league in enumerate(leagues):
             competition = _resolve_competition(league, competitions)
@@ -491,7 +520,7 @@ def _select_candidates(
                         'require exactly one active current edition'
                     )
                 chosen = current[0]
-            selected.append(_Candidate(
+            candidate = _Candidate(
                 competition=competition,
                 edition=chosen,
                 last_success_at=last_success.get(
@@ -501,7 +530,9 @@ def _select_candidates(
                     (competition.competition_id, chosen.edition_id), 0
                 )),
                 explicit_order=position,
-            ))
+            )
+            _assert_selection_mode(candidate, selection_mode=selection_mode)
+            selected.append(candidate)
     else:
         if season not in (None, ''):
             raise ScopePlanningError('params.season requires leagues or scopes')
@@ -522,6 +553,10 @@ def _select_candidates(
         for key, edition in editions.items():
             competition = competitions[key[0]]
             if not competition.crawl_eligible or not edition.active:
+                continue
+            if selection_mode == 'current_only' and not edition.current:
+                continue
+            if selection_mode == 'historical_only' and edition.current:
                 continue
             candidate = _Candidate(
                 competition=competition,
@@ -701,6 +736,8 @@ def plan_transfermarkt_scopes(
     now: datetime | None = None,
     max_batch_size: int = MAX_BATCH_SIZE,
     result_root: str = RESULT_ROOT,
+    selection_mode: ScopeSelectionMode = 'all_due',
+    resume_cycle_id: str | None = None,
 ) -> ScopePlan:
     """Plan one bounded mapping batch without network, SQL, or Airflow calls.
 
@@ -710,6 +747,13 @@ def plan_transfermarkt_scopes(
     """
 
     cycle_id = _required_text('parent_cycle_id', parent_cycle_id)
+    resume_id = _required_text(
+        'resume_cycle_id', resume_cycle_id or cycle_id,
+    )
+    if selection_mode not in SCOPE_SELECTION_MODES:
+        raise ScopePlanningError(
+            f'selection_mode must be one of {sorted(SCOPE_SELECTION_MODES)}'
+        )
     if isinstance(max_batch_size, bool) or not 1 <= int(max_batch_size) <= 8:
         raise ScopePlanningError('max_batch_size must be between 1 and 8')
     batch_size = int(max_batch_size)
@@ -732,6 +776,7 @@ def plan_transfermarkt_scopes(
         career_pending=career_pending,
         now=current_time,
         batch_size=batch_size,
+        selection_mode=selection_mode,
     )
     selection_identity = [
         {
@@ -746,6 +791,7 @@ def plan_transfermarkt_scopes(
     ]
     selection_hash = _digest(selection_identity)
     parent_hash = _digest({'parent_cycle_id': cycle_id})
+    resume_hash = _digest({'resume_cycle_id': resume_id})
     ledger = ParentCycleLedger(
         parent_cycle_id=cycle_id,
         ledger_id=f'tm-ledger-{parent_hash[:24]}',
@@ -780,13 +826,14 @@ def plan_transfermarkt_scopes(
             competition.competition_id, edition.edition_id
         )
         child_hash = _digest({
-            'parent_cycle_id': cycle_id,
+            'resume_cycle_id': resume_id,
             'scope_id': scope_id,
             'registry_snapshot_id': snapshot_id,
         })
         child_cycle_id = f'tm-child-{child_hash[:24]}'
         payloads.append({
             'parent_cycle_id': cycle_id,
+            'resume_cycle_id': resume_id,
             'child_cycle_id': child_cycle_id,
             'scope_id': scope_id,
             'competition_id': competition.competition_id,
@@ -815,7 +862,7 @@ def plan_transfermarkt_scopes(
             'remaining_count': remaining_count,
             'result_paths': _result_paths(
                 root=str(root),
-                parent_hash=parent_hash,
+                parent_hash=resume_hash,
                 candidate=candidate,
                 child_cycle_id=child_cycle_id,
             ),
@@ -850,16 +897,26 @@ def build_promoted_registry_query(
 ) -> str:
     """Build, but never execute, the promoted registry read query."""
 
+    state_filter = "state_key = 'canonical'"
     snapshot_filter = ''
     if registry_snapshot_id is not None:
         snapshot = _required_text('registry_snapshot_id', registry_snapshot_id)
+        # A campaign pins the logical registry snapshot, not the mutable
+        # ``canonical`` pointer.  Promotion moves the previous canonical row to
+        # ``history:<revision>`` before advancing that pointer, so an exact
+        # pinned read must accept either representation of the same green,
+        # promoted snapshot.  Unpinned discovery still reads canonical only.
+        state_filter = (
+            "(state_key = 'canonical' OR regexp_like("
+            "state_key, '^history:[0-9]+$'))"
+        )
         snapshot_filter = (
             ' AND registry_snapshot_id = ' + _sql_literal(snapshot)
         )
     return f"""WITH promoted AS (
     SELECT registry_snapshot_id
     FROM {REGISTRY_STATE_TABLE}
-    WHERE state_key = 'canonical'
+    WHERE {state_filter}
       AND status = 'promoted'
       AND unknown_active_count = 0{snapshot_filter}
     ORDER BY revision DESC
@@ -935,10 +992,12 @@ __all__ = [
     'CURRENT_SCOPE_INTERVAL',
     'MAX_BATCH_SIZE',
     'RESULT_ROOT',
+    'SCOPE_SELECTION_MODES',
     'ParentCycleLedger',
     'RegistryScopeTarget',
     'ScopePlan',
     'ScopePlanningError',
+    'ScopeSelectionMode',
     'build_promoted_registry_query',
     'eligible_registry_scopes',
     'plan_transfermarkt_scopes',

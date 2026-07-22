@@ -328,6 +328,7 @@ def _plan_exact_scopes(**context: Any) -> list[dict[str, str]]:
         parent_cycle_id=str(context['run_id']),
         registry_rows=registry_rows,
         max_batch_size=int(params['max_batch']),
+        selection_mode='current_only',
     )
     if not plan.mapped_payloads:
         raise AirflowException('promoted registry produced no exact due scope')
@@ -1041,6 +1042,9 @@ exec python dags/scripts/run_transfermarkt_scope_cycle.py \
         retries=0,
         pool='transfermarkt_proxy',
         pool_slots=1,
+        # The proxy permit scheduler also prioritises this traffic class, but
+        # Airflow should prefer the daily writer before either task reaches it.
+        priority_weight=100,
         max_active_tis_per_dag=1,
         # Derived from the budget canon, never a literal: the task supervises
         # four entity subprocesses whose own timeouts sum to 18000 s (the

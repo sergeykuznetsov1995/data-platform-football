@@ -475,10 +475,19 @@ def test_promoted_registry_query_is_read_only_and_escapes_snapshot_literal():
     assert "registry''one" in sql
     assert "status = 'promoted'" in sql
     assert 'unknown_active_count = 0' in sql
+    assert "state_key = 'canonical' OR regexp_like" in sql
+    assert "^history:[0-9]+$" in sql
     assert 'SELECT' in sql
     assert 'INSERT ' not in sql
     assert 'UPDATE ' not in sql
     assert 'DELETE ' not in sql
+
+
+def test_latest_registry_query_still_uses_only_the_canonical_pointer():
+    sql = planner.build_promoted_registry_query()
+
+    assert "WHERE state_key = 'canonical'" in sql
+    assert "history:" not in sql
 
 
 @pytest.mark.parametrize('batch_size', [0, 9, True])
@@ -528,3 +537,101 @@ def test_a_scope_that_still_owes_careers_is_asked_for_again():
         (item['competition_id'], item['edition_id'])
         for item in owing.mapped_payloads
     ] == [('DONE', '2024')]
+
+
+class TestScopeOwnership:
+    def _registry(self):
+        competition = _competition('GB1')
+        return (
+            [competition],
+            [
+                _edition('GB1', '2025', current=True),
+                _edition('GB1', '2024', current=False),
+            ],
+        )
+
+    @pytest.mark.parametrize(
+        ('selection_mode', 'expected_edition'),
+        [
+            ('current_only', '2025'),
+            ('historical_only', '2024'),
+        ],
+    )
+    def test_default_planning_keeps_current_and_history_disjoint(
+        self, selection_mode, expected_edition,
+    ):
+        competitions, editions = self._registry()
+
+        plan = planner.plan_transfermarkt_scopes(
+            {},
+            parent_cycle_id=f'cycle-{selection_mode}',
+            competitions=competitions,
+            editions=editions,
+            now=NOW,
+            selection_mode=selection_mode,
+        )
+
+        assert [item['edition_id'] for item in plan.mapped_payloads] == [
+            expected_edition,
+        ]
+
+    @pytest.mark.parametrize(
+        ('selection_mode', 'scope', 'owner'),
+        [
+            ('current_only', 'GB1:2024', 'dag_backfill_transfermarkt'),
+            ('historical_only', 'GB1:2025', 'dag_ingest_transfermarkt'),
+        ],
+    )
+    def test_explicit_cross_owner_scope_is_rejected(
+        self, selection_mode, scope, owner,
+    ):
+        competitions, editions = self._registry()
+
+        with pytest.raises(planner.ScopePlanningError, match=owner):
+            planner.plan_transfermarkt_scopes(
+                {'scopes': [scope]},
+                parent_cycle_id=f'cycle-{selection_mode}',
+                competitions=competitions,
+                editions=editions,
+                now=NOW,
+                selection_mode=selection_mode,
+            )
+
+    def test_unknown_selection_mode_fails_closed(self):
+        competitions, editions = self._registry()
+
+        with pytest.raises(planner.ScopePlanningError, match='selection_mode'):
+            planner.plan_transfermarkt_scopes(
+                {},
+                parent_cycle_id='cycle-invalid',
+                competitions=competitions,
+                editions=editions,
+                now=NOW,
+                selection_mode='mixed',
+            )
+
+    def test_campaign_resume_identity_survives_new_airflow_batch(self):
+        competitions, editions = self._registry()
+        kwargs = {
+            'params': {'scopes': ['GB1:2024']},
+            'competitions': competitions,
+            'editions': editions,
+            'now': NOW,
+            'selection_mode': 'historical_only',
+            'resume_cycle_id': 'tm-history-campaign-1',
+        }
+
+        first = planner.plan_transfermarkt_scopes(
+            parent_cycle_id='scheduled__batch-1', **kwargs,
+        )
+        second = planner.plan_transfermarkt_scopes(
+            parent_cycle_id='scheduled__batch-2', **kwargs,
+        )
+        first_payload, = first.mapped_payloads
+        second_payload, = second.mapped_payloads
+
+        assert first_payload['resume_cycle_id'] == 'tm-history-campaign-1'
+        assert first_payload['child_cycle_id'] == second_payload['child_cycle_id']
+        assert first_payload['result_paths'] == second_payload['result_paths']
+        assert first_payload['parent_cycle_id'] != second_payload['parent_cycle_id']
+        assert first.parent_ledger.path != second.parent_ledger.path

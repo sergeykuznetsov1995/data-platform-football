@@ -112,7 +112,12 @@ def _continental_payload(tmp_path: Path) -> dict:
     return payload
 
 
-def _approved_args(tmp_path: Path, payload: dict) -> tuple[list[str], Path]:
+def _approved_args(
+    tmp_path: Path,
+    payload: dict,
+    *,
+    packet_suffix: str = '',
+) -> tuple[list[str], Path]:
     journal_path = tmp_path / 'approvals.json'
     base = [
         '--payload-json', json.dumps(payload, sort_keys=True),
@@ -142,7 +147,7 @@ def _approved_args(tmp_path: Path, payload: dict) -> tuple[list[str], Path]:
         ),
     }
     paid = ApprovalPacket(
-        packet_id='tm-paid-scope-001',
+        packet_id=f'tm-paid-scope-001{packet_suffix}',
         action='paid_proxy',
         byte_cap_bytes=cycle.HARD_BYTE_CAP,
         byte_cap_mib=Decimal('24'),
@@ -153,7 +158,7 @@ def _approved_args(tmp_path: Path, payload: dict) -> tuple[list[str], Path]:
         **values,
     )
     write = ApprovalPacket(
-        packet_id='tm-write-scope-001',
+        packet_id=f'tm-write-scope-001{packet_suffix}',
         action='production_write',
         byte_cap_bytes=0,
         byte_cap_mib=Decimal('0'),
@@ -344,6 +349,7 @@ def test_exact_cycle_runs_sequentially_without_shell_and_commits_manifest(tmp_pa
     )
     assert manifest['status'] == 'complete'
     assert manifest['dq']['silver_trigger_allowed'] is True
+    assert manifest['dq_evidence']['silver_trigger_allowed'] is True
     assert manifest['dq']['participant_contract']['endpoint_coverage'] == 1.0
     assert manifest['dq_evidence']['status'] == 'passed'
     assert manifest['dq_evidence']['registry_participant_count'] == 20
@@ -873,6 +879,114 @@ def test_standing_policy_cycle_commits_manifest_and_parent_ledger(
     assert Path(payload['parent_ledger']['path']).is_file()
     assert not (tmp_path / 'approvals.json').exists()
     assert not list(tmp_path.glob('**/journal*.json'))
+
+
+def test_backfill_policy_uses_its_own_dag_identity(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv('TM_STANDING_POLICY_ENABLED', 'true')
+    monkeypatch.setenv('TM_DAG_ID', 'dag_backfill_transfermarkt')
+    payload = _payload(tmp_path)
+    argv = _standing_args(
+        tmp_path,
+        payload,
+        dag_id='dag_backfill_transfermarkt',
+    )
+    args = _parse_args(argv)
+
+    grants = cycle._enforce_standing_policy(args)
+
+    assert grants['paid_proxy'].packet_hash == argv[
+        argv.index('--standing-policy-sha256') + 1
+    ]
+
+
+def test_campaign_checkpoint_identity_survives_parent_dagrun_change(tmp_path):
+    first_payload = _payload(tmp_path)
+    first_payload['resume_cycle_id'] = 'a' * 64
+    first_payload['capture_revision'] = 'native-v2-backfill-v1'
+    first_argv, _ = _approved_args(tmp_path, first_payload)
+    first_args = _parse_args(first_argv)
+    first_identity = cycle._scope_identity(first_args)
+
+    second_payload = json.loads(json.dumps(first_payload))
+    second_payload['parent_cycle_id'] = 'scheduled__next-batch'
+    second_payload['parent_ledger']['parent_cycle_id'] = 'scheduled__next-batch'
+    second_payload['parent_ledger']['path'] = str(tmp_path / 'next-ledger.json')
+    second_argv, _ = _approved_args(
+        tmp_path,
+        second_payload,
+        packet_suffix='-next-run',
+    )
+    second_args = _parse_args(second_argv)
+    second_identity = cycle._scope_identity(second_args)
+
+    assert first_identity.resume_cycle_id == second_identity.resume_cycle_id
+    assert first_identity.parent_cycle_id != second_identity.parent_cycle_id
+    assert cycle._checkpoint_identity(
+        first_identity,
+        first_args,
+        cycle._entity_limits(first_args),
+    ) == cycle._checkpoint_identity(
+        second_identity,
+        second_args,
+        cycle._entity_limits(second_args),
+    )
+
+
+def test_campaign_scope_manifest_cannot_authorize_silver(tmp_path):
+    payload = _payload(tmp_path)
+    payload['resume_cycle_id'] = 'a' * 64
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+
+    manifest = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess([]),
+        manifest_writer=lambda _value: None,
+        parent_ledger_writer=lambda _value: None,
+    )
+
+    assert manifest['dq']['silver_trigger_allowed'] is False
+    assert manifest['dq_evidence']['silver_trigger_allowed'] is False
+
+
+def test_failed_entity_result_preserves_raw_attempt_ids_for_finalizer(tmp_path):
+    payload = _payload(tmp_path)
+    payload['resume_cycle_id'] = 'a' * 64
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    envelope_id = 'e' * 64
+
+    def failed(command, **_kwargs):
+        result = _fake_result(tuple(command))
+        result['raw_attempts'] = [{
+            'envelope_id': envelope_id,
+            'outcome_kind': 'response',
+        }]
+        Path(command[command.index('--output') + 1]).write_text(
+            json.dumps(result), encoding='utf-8',
+        )
+        return SimpleNamespace(returncode=1, stdout='', stderr='source error')
+
+    with pytest.raises(cycle.ScopeCycleError, match='runner failed'):
+        cycle.run_scope_cycle(
+            args,
+            operation_argv=cycle.approved_operation_argv(argv),
+            subprocess_runner=failed,
+            manifest_writer=lambda _value: None,
+            parent_ledger_writer=lambda _value: None,
+        )
+
+    evidence_path = (
+        Path(payload['result_paths']['entity_staging_dir'])
+        / 'players-failed.json'
+    )
+    assert json.loads(evidence_path.read_text())['raw_attempts'][0][
+        'envelope_id'
+    ] == envelope_id
 
 
 def test_standing_policy_signs_the_manifest_it_authorized(tmp_path, monkeypatch):
@@ -1717,3 +1831,58 @@ def test_the_scope_task_timeout_covers_every_entity_timeout(tmp_path):
     # A caller may only shorten a small entity's timeout, never lengthen it.
     with pytest.raises(cycle.ScopeCycleError, match='entity timeout cannot exceed'):
         _parse_args(argv + ['--entity-timeout-seconds', '3601'])
+
+
+def test_validated_result_is_adopted_after_rename_before_checkpoint(tmp_path):
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    identity = cycle._scope_identity(args)
+    limits = cycle._entity_limits(args)
+    checkpoint_identity = cycle._checkpoint_identity(identity, args, limits)
+    parser_entity = 'players'
+    final_path = Path(identity.entity_dir) / f'{parser_entity}.json'
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    command = cycle._runner_argv(
+        identity,
+        args,
+        parser_entity,
+        str(tmp_path / 'orphaned-output.tmp'),
+        limits[parser_entity],
+        int(args.retry_limit),
+    )
+    result = _fake_result(command)
+    final_path.write_text(json.dumps(result), encoding='utf-8')
+    digest = cycle._sha256_file(final_path)
+    operation_hash = cycle.stable_hash({"operation": "same-paid-attempt"})
+    intent_path = Path(identity.entity_dir) / (
+        f'.{parser_entity}-attempt-intent.json'
+    )
+    intent_path.write_text(json.dumps({
+        'version': 1,
+        'status': 'validated',
+        'parser_entity': parser_entity,
+        'identity_hash': checkpoint_identity,
+        'operation_hash': operation_hash,
+        'result_path': str(final_path),
+        'result_sha256': digest,
+        'wall_clock_duration_ms': 17,
+        'command_sha256': cycle.stable_hash(command),
+        'attempt_id': 'attempt-one',
+    }), encoding='utf-8')
+
+    run, attempt_id, command_sha256 = cycle._adopt_uncheckpointed_run(
+        identity,
+        args,
+        parser_entity=parser_entity,
+        final_path=final_path,
+        intent_path=intent_path,
+        checkpoint_identity=checkpoint_identity,
+        operation_hash=operation_hash,
+    )
+
+    assert run.resumed is True
+    assert run.result_sha256 == digest
+    assert run.wall_clock_duration_ms == 17
+    assert attempt_id == 'attempt-one'
+    assert command_sha256 == cycle.stable_hash(command)
