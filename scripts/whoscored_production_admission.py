@@ -955,6 +955,7 @@ _SCHEDULER_ENVIRONMENT_NAMES = frozenset(
     SOFASCORE_REGISTRY_PATH SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES
     SOFASCORE_PLAYER_ROTATION_MODULUS SOFASCORE_WORKLOAD_PLAN_DIR TELEGRAM_BOT_TOKEN
     TELEGRAM_CHAT_ID TM_NATIVE_V2_ENABLED TM_STANDING_POLICY_ENABLED
+    TM_BACKFILL_PROXY_CONTROL_TOKEN TM_BACKFILL_PROXY_CONTROL_URL
     TM_PROXY_CONTROL_TOKEN TM_PROXY_CONTROL_URL TM_PROXY_LEASE_TTL_SECONDS
     TM_REQUIRE_METERED_PROXY TRINO_HOST
     TRINO_PASSWORD TRINO_PORT WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY
@@ -1055,6 +1056,7 @@ _FIXED_ENVIRONMENT = {
             "/opt/airflow/state/whoscored-proxy-filter/paid_requests.jsonl"
         ),
         "PROXY_FILTER_URL": "",
+        "TM_BACKFILL_PROXY_CONTROL_URL": "http://proxy_filter:8899",
         "WHOSCORED_BACKFILL_POOL": "whoscored_direct_pool",
         "WHOSCORED_DIRECT_POOL": "whoscored_direct_pool",
         "WHOSCORED_DQ_POOL": "whoscored_dq_pool",
@@ -1821,6 +1823,21 @@ def _validate_rendered_environment(
         ):
             raise AdmissionError(
                 "rendered Transfermarkt paid controls are not fail-closed"
+            )
+        backfill_token = environment.get(
+            "TM_BACKFILL_PROXY_CONTROL_TOKEN", ""
+        ).strip()
+        if backfill_token and (
+            len(backfill_token) < 32
+            or backfill_token
+            in {
+                environment.get("PROXY_FILTER_CONTROL_TOKEN", "").strip(),
+                environment.get("SOFASCORE_PROXY_CONTROL_TOKEN", "").strip(),
+                environment.get("TM_PROXY_CONTROL_TOKEN", "").strip(),
+            }
+        ):
+            raise AdmissionError(
+                "rendered Transfermarkt backfill controls are not fail-closed"
             )
     if service == "whoscored_proxy_filter":
         if (
