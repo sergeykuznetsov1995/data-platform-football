@@ -182,7 +182,8 @@ state (см. Next steps).
 - **C. ScraperFC.FBref cherry-pick** — botasaurus/Chromium на каждый
   fetch; GPL-3.0 лицензия блокирует прямую зависимость
   (см. [feedback_scraperfc_sofascore_blocked](../../memory/feedback_scraperfc_sofascore_blocked.md)).
-  Решение: оценить только cherry-pick парсеров в follow-up issue.
+  Решение: cherry-pick оценён в #55 → финальная секция «Track C — ScraperFC.FBref
+  parser audit (#55)» в конце дока: **оставляем своё**.
 - **D. Tuning констант** (`MAX_SLOW_PROXY_RETRIES`, `MAX_CONSECUTIVE_FAILURES`,
   `time.sleep(0.5)`) — отдельные мелкие PR'ы, follow-up
   issue. (~~CF_COOKIE_PREWARM~~ убран: инфра удалена в #581, #118 not-planned.)
@@ -327,7 +328,8 @@ JSON-парсинге. Patch необходим (закрывает изнача
 - **C. ScraperFC.FBref cherry-pick** — botasaurus/Chromium на каждый
   fetch; GPL-3.0 лицензия блокирует прямую зависимость
   (см. [feedback_scraperfc_sofascore_blocked](../../memory/feedback_scraperfc_sofascore_blocked.md)).
-  Решение: оценить только cherry-pick парсеров в follow-up issue.
+  Решение: cherry-pick оценён в #55 → финальная секция «Track C — ScraperFC.FBref
+  parser audit (#55)» в конце дока: **оставляем своё**.
 - **D. Tuning констант** (`MAX_SLOW_PROXY_RETRIES`, `MAX_CONSECUTIVE_FAILURES`,
   `time.sleep(0.5)`) — отдельные мелкие PR'ы, follow-up
   issue. (~~CF_COOKIE_PREWARM~~ убран: инфра удалена в #581, #118 not-planned.)
@@ -432,3 +434,101 @@ Raw bench: `/tmp/bench_fbref_cached_loop.json`.
 - Eventually drop `_get_or_create_loop` sync-bridge entirely и перевести
   scraper на native asyncio (нodriver был спроектирован под `uc.loop()`).
   Нынешний кэш-фикс — surgical patch, не архитектурный.
+
+---
+
+## Track C — ScraperFC.FBref parser audit + Track B/C итоговое решение (#55)
+
+> Issue: [#55](https://github.com/sergeykuznetsov1995/data-platform-football/issues/55)
+> — follow-up Tracks B+C из #45. Дата: 2026-06-16.
+> Метод: **desk-research + аудит GitHub-исходника** `oseymour/ScraperFC`
+> (`src/ScraperFC/fbref.py`, master). **Без live-бенчей**: по нашему скраперу
+> числа уже измерены (секции выше), soccerdata доказательно закрыт в #67,
+> ScraperFC ставить нельзя (GPL-3.0). Цель — закрыть acceptance #55:
+> короткий разбор по каждой опции (time/match, MB/match, success rate) +
+> решение keep / cherry-pick / migrate.
+
+### Сравнительная таблица (10 матчей APL 2025/26)
+
+| Опция | time/match | MB/match (real proxy) | success | coverage | license | maintenance |
+|---|---|---|---|---|---|---|
+| **наш FBref scraper** | **9.67 s** (#57 cached_loop) | **~2.1–2.6 MB** (21.17 / 25.51 MB на 10) | **1.0** (10/10) | все живые post-restriction таблицы | свой код | nodriver+CF+proxy, в проде стабилен |
+| soccerdata.FBref `1.9.0` | N/A — не стартует | N/A | **0** (CF-fail) | паритет | MIT | мигрировать нельзя: `BaseSeleniumReader` не проходит CF (#67) |
+| soccerdata.FBref `1.8.8` (pinned) | ≈ наш baseline (тот же UC-браузер) | ≈ | — | паритет | MIT | обёртка-абстракция, не быстрее, +слой и +наши post-process |
+| ScraperFC.FBref | N/A — не ставился | N/A | — | стат-таблицы + shots (мертвы) + officials | **GPL-3.0** | botasaurus headless Chromium на каждый fetch (`wait_time`=6s) → ≥ наша латентность, выше RAM |
+
+Числа «нашего» трассируются на `docs/research/data/bench_fbref_baseline.json`
+(31.69 s/match, 21.17 MB/10 = 2.12 MB/match, 9/10) и `bench_fbref_track_a.json`
+(33.64 s/match, 25.51 MB/10 = 2.55 MB/match, 10/10); прод-число **9.67 s/match**
+(3.5× от baseline) — секция «Bench results post-fix (#57)» выше. По альтернативам
+time/MB/success помечены **N/A**: soccerdata `1.9.0` физически не проходит CF в
+контейнере (#67), а ScraperFC не ставился (GPL-3.0) — мерить нечего, оценка
+архитектурная.
+
+### Track B — soccerdata: вердикт «не мигрируем»
+
+Полностью покрыто issue **#67** (закрыт `not-planned`, 2026-05-26) и memory
+`feedback_soccerdata_19_fbref_hold`:
+
+- `1.9.0` мигрировал FBref на `BaseSeleniumReader` → CF-bypass падает в контейнере:
+  passive UC оставляет «Just a moment…»; `uc_gui_click_captcha` требует `python3-tk`
+  (нет в образе); `host_resolver_rules=MAP` ломает DNS residential-прокси; 15s-timeout
+  не оверрайдится.
+- Держим `soccerdata==1.8.8` (`docker/images/airflow/requirements-scraping.txt:23`) —
+  это **тот же undetected-chromedriver браузерный подход**, что у нас → не быстрее,
+  плюс слой абстракции, который всё равно требует наших post-process (`fbref_match_managers`,
+  `*_extended` merge, `keeper_adv`).
+- Гипотеза #55 «может упростить maintenance» **не оправдалась**: выигрыша по
+  скорости/трафику нет, CF-совместимость хуже нашей.
+
+**→ Оставляем свой scraper. soccerdata не внедряем.**
+
+### Track C — ScraperFC.FBref parser audit
+
+Источник: `oseymour/ScraperFC`, `src/ScraperFC/fbref.py`. Лицензия репо — **GPL-3.0**
+(подтверждено `LICENSE` = GNU GPL v3, 29 June 2007). Прямая зависимость исключена:
+копилефт инфицирует наш код (та же логика, что для SofaScore #32 / Transfermarkt /
+Capology — только cherry-pick шаблонов парсинга поверх нашего HTTP-стека, без `import`,
+см. issue #32 + memory `feedback_scraperfc_sofascore_blocked`).
+
+Публичные методы класса `FBref` и наш статус покрытия:
+
+| Метод ScraperFC | Что парсит | Наш статус |
+|---|---|---|
+| `scrape_stats` / `scrape_all_stats` — **11 категорий** | standard, goalkeeping, advanced gk, shooting, **passing, pass types, gca, defensive, possession**, playing time, misc | **6 живых уже покрыты** (stats/shooting/playingtime/misc + keeper/keeper_adv); **5 жирных — мёртвый код** (FBref пуст с Apr-2026, по 22 617 пустых строк) |
+| `scrape_match` → player stats tables | per-match summary | покрыто (`read_player_match_stats('summary')`); расширенные per-match таблицы мертвы |
+| `scrape_match` → **shot data (all/home/away)** | shot-events с xG/координатами | **мёртвый код**: FBref shot-таблицы пусты, `fbref_shot_events` у нас отсутствует (xG берём из Understat/WhoScored) |
+| `scrape_match` → **officials (referee, AR, 4th, VAR)** | судейская бригада | **НЕ покрыто** — мы берём только `fbref_match_managers` (тренеры). **Единственный реальный gap** |
+| `scrape_match` → goals / teams / IDs / metadata | счёт, команды, team_id | покрыто (`read_match_events`, `read_schedule`) |
+| `scrape_league_table` | турнирная таблица | вне скоупа (выводимо из schedule/Gold) |
+| `get_valid_seasons` / `get_match_links` | сезоны / ссылки матчей | свой `read_schedule` |
+
+Наблюдения:
+
+- **Нет выигрыша по скорости/трафику.** ScraperFC = botasaurus headless Chromium на
+  каждый fetch (`wait_time` default 6s) — архитектурно ≥ наша латентность и выше RAM
+  на 11 GiB VM. Тот же браузерный путь, что у нас, но тяжелее и без нашего
+  proxy-rotation / CF-tuning.
+- **Нет выигрыша по покрытию стат-таблиц.** Их 11 категорий включают ровно те 5,
+  что FBref больше не отдаёт (`passing/pass types/gca/defensive/possession`); живые
+  6 мы уже парсим. Их продвинутые/shot-парсеры для текущего FBref — мёртвый код.
+- **Единственный неперекрытый парсер — судейская бригада (referee/AR/4th/VAR).** Это
+  metadata матч-страницы (restriction её не тронул) → данные, скорее всего, ещё
+  доступны. Но это **расширение скоупа** платформы (нужны ли судьи для аналитики?),
+  а не вопрос «keep vs migrate».
+
+### Итоговое решение (#55)
+
+**Оставляем свой FBref scraper.**
+
+- **soccerdata — не внедряем** (#67): не быстрее (тот же UC-браузер), `1.9.0` не проходит CF.
+- **ScraperFC как зависимость — исключён** (GPL-3.0). **Как cherry-pick — нет смысла**:
+  их стат/shot-парсеры мертвы post-restriction, а живые таблицы мы уже покрываем с
+  лучшей CF/proxy-интеграцией.
+- **Единственный потенциальный cherry-pick — парсер судей (referee/VAR)** — вынесен
+  как опциональный product/scope-вопрос: внедрять отдельным implementation-issue
+  только если судейские данные понадобятся для аналитики. По умолчанию — **вне скоупа**.
+
+Acceptance #55:
+- [x] Короткий разбор по каждой опции (time/match, MB/match, success rate) — таблица выше.
+- [x] Решение: **оставляем своё** (cherry-pick / migrate отклонены, с обоснованием).
