@@ -3783,10 +3783,17 @@ class FBrefPipeline:
         ):
             errors.append("byte_limit_exceeded")
         traffic = summary.get("traffic_totals") or {}
-        success_rate = traffic.get("warm_http_success_rate")
+        # The health gate is per logical fetch unit, not per HTTP request: a
+        # residential exit can eat a one-off 403 that the very same run
+        # re-fetches successfully moments later (96% of observed 403s), and
+        # per-request accounting would count that recovered page as failure —
+        # pushing the expected rate below the threshold at the provider's
+        # baseline noise. A unit only succeeds when some attempt returned
+        # 200/304, so a genuinely banned page still fails the run.
+        success_rate = traffic.get("warm_fetch_unit_success_rate")
         if success_rate is not None and float(success_rate) < 0.95:
             errors.append(
-                f"warm_http_success_rate={float(success_rate):.4f}<0.95"
+                f"warm_fetch_unit_success_rate={float(success_rate):.4f}<0.95"
             )
         if float(traffic.get("unclassified_failure_rate") or 0.0) >= 0.005:
             errors.append(

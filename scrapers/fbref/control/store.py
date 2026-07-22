@@ -4587,6 +4587,13 @@ class ControlStore:
                        ) FILTER (
                            WHERE attempt.reservation_id IS NOT NULL
                        ), 0) AS warm_http_successes,
+                       count(DISTINCT attempt.logical_refresh_id) FILTER (
+                           WHERE attempt.reservation_id IS NOT NULL
+                       ) AS warm_fetch_units,
+                       count(DISTINCT attempt.logical_refresh_id) FILTER (
+                           WHERE attempt.reservation_id IS NOT NULL
+                             AND attempt.http_status_history && ARRAY[200, 304]
+                       ) AS warm_fetch_units_succeeded,
                        count(*) FILTER (
                            WHERE attempt.reservation_id IS NOT NULL
                              AND attempt.status = 'failed'
@@ -4722,12 +4729,23 @@ class ControlStore:
             for row in _fetchall(cursor):
                 attempts = int(row["network_attempts"] or 0)
                 successes = int(row["warm_http_successes"] or 0)
+                fetch_units = int(row["warm_fetch_units"] or 0)
+                fetch_units_succeeded = int(
+                    row["warm_fetch_units_succeeded"] or 0
+                )
                 traffic_by_kind[str(row["page_kind"])] = {
                     **row,
                     "network_attempts": attempts,
                     "warm_http_successes": successes,
                     "warm_http_success_rate": (
                         None if attempts == 0 else successes / attempts
+                    ),
+                    "warm_fetch_units": fetch_units,
+                    "warm_fetch_units_succeeded": fetch_units_succeeded,
+                    "warm_fetch_unit_success_rate": (
+                        None
+                        if fetch_units == 0
+                        else fetch_units_succeeded / fetch_units
                     ),
                 }
             summary["traffic_by_page_kind"] = traffic_by_kind
@@ -4755,6 +4773,13 @@ class ControlStore:
                     int(row["duplicate_fetch_violations"] or 0)
                     for row in traffic_by_kind.values()
                 ),
+                "warm_fetch_units": sum(
+                    row["warm_fetch_units"] for row in traffic_by_kind.values()
+                ),
+                "warm_fetch_units_succeeded": sum(
+                    row["warm_fetch_units_succeeded"]
+                    for row in traffic_by_kind.values()
+                ),
             }
             total_attempts = summary["traffic_totals"]["network_attempts"]
             total_successes = summary["traffic_totals"]["warm_http_successes"]
@@ -4762,6 +4787,13 @@ class ControlStore:
                 None
                 if total_attempts == 0
                 else total_successes / total_attempts
+            )
+            total_fetch_units = summary["traffic_totals"]["warm_fetch_units"]
+            summary["traffic_totals"]["warm_fetch_unit_success_rate"] = (
+                None
+                if total_fetch_units == 0
+                else summary["traffic_totals"]["warm_fetch_units_succeeded"]
+                / total_fetch_units
             )
             summary["traffic_totals"]["unclassified_failure_rate"] = (
                 0.0
