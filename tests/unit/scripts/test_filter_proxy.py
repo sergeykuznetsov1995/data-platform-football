@@ -1122,7 +1122,7 @@ def test_cancelled_provider_head_retains_unknown_read_ahead_escrow(mod):
 
     assert lease.down_bytes == 1
     assert lease.accounting_uncertain is True
-    assert lease.reserved_bytes == 1_000
+    assert lease.reserved_bytes == 999
     state = json.loads(Path(mod.WHOSCORED_CAMPAIGN_LEDGER_PATH).read_text())
     campaign = state["campaigns"][lease.proxy_campaign_approval.campaign_id]
     active = campaign["active_claims"][lease.lease_id]
@@ -6685,7 +6685,7 @@ def test_provider_head_timeout_accounts_prefix_and_retains_unknown_escrow(
         )
 
     assert lease.down_bytes == 5
-    assert lease.reserved_bytes == 4_096
+    assert lease.reserved_bytes == 4_091
     assert lease.accounting_uncertain is True
     assert lease.usable is False
 
@@ -7576,16 +7576,24 @@ def test_uncertain_fbref_lease_settles_conservatively_and_frees_slot(mod):
     mod.MAX_ACTIVE_LEASES = 1
     mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
     lease = _make_fbref_lease(mod, mgr)
+    daily_before = mod._daily_total_bytes()
     assert mod._reserve_lease_bytes(lease, 64) == 64
-    mod._latch_lease_accounting_uncertainty(lease)
+    mod._settle_observed_lease_bytes(
+        lease,
+        reservation=64,
+        host="pool.invalid",
+        direction="down",
+        count=7,
+        force_uncertain=True,
+    )
     assert lease.accounting_uncertain is True
     assert lease.closed is True
-    assert lease.reserved_bytes == 64
+    assert lease.down_bytes == 7
+    assert lease.reserved_bytes == 57
 
-    daily_before = mod._daily_total_bytes()
     mod._reap_expired_leases()
 
-    # The unproven reservation is charged durably, never refunded.
+    # The exact prefix plus the unproven remainder are charged once each.
     assert lease.reserved_bytes == 0
     assert lease.down_bytes == 64
     assert mod._daily_total_bytes() == daily_before + 64
@@ -7594,12 +7602,13 @@ def test_uncertain_fbref_lease_settles_conservatively_and_frees_slot(mod):
         json.loads(line)
         for line in Path(mod.LEDGER_PATH).read_text().splitlines()
     ]
-    assert any(
-        event.get("event_type") == "bytes"
-        and event.get("lease_id") == lease.lease_id
-        and event.get("bytes") == 64
+    lease_byte_events = [
+        event
         for event in events
-    )
+        if event.get("event_type") == "bytes"
+        and event.get("lease_id") == lease.lease_id
+    ]
+    assert [event.get("bytes") for event in lease_byte_events] == [7, 57]
     # The single concurrency slot is free again.
     second = mod._create_lease(
         mgr,
@@ -7609,6 +7618,51 @@ def test_uncertain_fbref_lease_settles_conservatively_and_frees_slot(mod):
         require_context=True,
     )
     assert second.lease_id != lease.lease_id
+
+
+def test_uncertain_fbref_lease_never_retries_ambiguous_ledger_append(
+    mod, monkeypatch
+):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr)
+    assert mod._reserve_lease_bytes(lease, 64) == 64
+    original_append = mod._append_budget_event
+
+    def fail_append(*_args, **_kwargs):
+        raise OSError("simulated ambiguous fsync failure")
+
+    monkeypatch.setattr(mod, "_append_budget_event", fail_append)
+    with pytest.raises(RuntimeError, match="durable paid byte accounting failed"):
+        mod._settle_observed_lease_bytes(
+            lease,
+            reservation=64,
+            host="pool.invalid",
+            direction="down",
+            count=7,
+            force_uncertain=True,
+        )
+
+    assert lease.accounting_uncertain is True
+    assert lease.paid_ledger_uncertain is True
+    assert lease.down_bytes == 7
+    assert lease.reserved_bytes == 64
+
+    # Even if the filesystem starts working, the ambiguous event is never
+    # retried and the slot stays fail-closed for operator recovery.
+    monkeypatch.setattr(mod, "_append_budget_event", original_append)
+    mod._reap_expired_leases()
+    mod._reap_expired_leases()
+    assert lease.down_bytes == 7
+    assert lease.reserved_bytes == 64
+    events = [
+        json.loads(line)
+        for line in Path(mod.LEDGER_PATH).read_text().splitlines()
+    ]
+    assert not any(
+        event.get("event_type") == "bytes"
+        and event.get("lease_id") == lease.lease_id
+        for event in events
+    )
 
 
 def test_fbref_absolute_http_replaces_browser_lease_auth_with_provider_auth(

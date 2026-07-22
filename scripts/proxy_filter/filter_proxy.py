@@ -941,6 +941,10 @@ class Lease:
     close_recorded: bool = False
     budget_exceeded: bool = False
     accounting_uncertain: bool = False
+    # An append error is ambiguous: the event may have reached the filesystem
+    # before fsync failed. Never retry or release that reservation in-process,
+    # because doing so could durably charge the same provider bytes twice.
+    paid_ledger_uncertain: bool = False
     # Provider bytes are observed immediately for the in-process hard cap, but
     # WhoScored persists them in bounded aggregates on top of the already
     # durable full-lease escrow.  A failed flush is never retried because the
@@ -996,6 +1000,7 @@ class Lease:
             "expired": self.expired,
             "budget_exceeded": self.budget_exceeded,
             "accounting_uncertain": self.accounting_uncertain,
+            "paid_ledger_uncertain": self.paid_ledger_uncertain,
             "pending_provider_bytes": pending_provider_bytes,
             "durably_settled_provider_bytes": settled_provider_bytes,
             "metering_flush_failed": self.metering_flush_failed,
@@ -3753,8 +3758,11 @@ def _settle_observed_lease_bytes(
         raise
     if force_uncertain:
         # The observed prefix is exact, but cancellation/read failure can leave
-        # additional provider bytes inside transport read-ahead. Charge the
-        # prefix and retain every unconsumed escrow byte as unknown.
+        # additional provider bytes inside transport read-ahead. Convert the
+        # exact prefix from reserved allowance to durable spend, then retain
+        # only the unconsumed reservation as unknown.  Otherwise the reaper
+        # would conservatively charge the already-accounted prefix twice.
+        _release_lease_reservation(lease, min(reservation, count))
         _latch_lease_accounting_uncertainty(lease)
         return
     _release_lease_reservation(lease, reservation)
@@ -3865,6 +3873,7 @@ def _account_lease_bytes(lease: Lease, host: str, direction: str, count: int) ->
             log.exception(
                 "paid byte ledger append failed; closing lease %s", lease.lease_id
             )
+            lease.paid_ledger_uncertain = True
             lease.budget_exceeded = True
             raise RuntimeError("durable paid byte accounting failed")
     if lease.total_bytes >= lease.max_bytes or (
@@ -4773,6 +4782,7 @@ def _reap_expired_leases() -> int:
                 lease.source not in {"sofascore", "whoscored"}
                 and lease.active_tunnels == 0
                 and lease.reserved_bytes > 0
+                and not lease.paid_ledger_uncertain
             ):
                 # The retained reservation is the in-process upper bound of
                 # unproven provider spend.  Charge it durably as spent, then
@@ -4784,7 +4794,7 @@ def _reap_expired_leases() -> int:
                     _account_lease_bytes(
                         lease, "uncertain-read-ahead", "down", retained
                     )
-                except Exception:  # noqa: BLE001 - keep retained, retry next sweep
+                except Exception:  # noqa: BLE001 - retain permanently, fail closed
                     log.exception(
                         "could not durably settle retained reservation for "
                         "uncertain lease %s",
