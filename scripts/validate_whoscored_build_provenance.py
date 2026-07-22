@@ -1201,6 +1201,8 @@ def _parse_compose_services(
             index += 1
             continue
         anchor = match.group(2)
+        if anchor in anchors:
+            raise ProvenanceError(f"duplicate {description} anchor: {anchor}")
         end = index + 1
         while end < len(lines) and (
             not lines[end].strip() or lines[end].startswith(" ")
