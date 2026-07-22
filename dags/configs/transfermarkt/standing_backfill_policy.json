@@ -1,0 +1,34 @@
+{
+  "policy_version": 1,
+  "dag_id": "dag_backfill_transfermarkt",
+  "approved_by": "sergeykuznetsov1995",
+  "approved_at": "2026-07-21T00:00:00Z",
+  "expires_at": "2027-07-21T00:00:00Z",
+  "paid_proxy": {
+    "byte_cap_bytes": 25165824,
+    "request_limit": 1610,
+    "retry_limit": 800,
+    "concurrency": 1
+  },
+  "production_write": {
+    "byte_cap_bytes": 0,
+    "request_limit": 0,
+    "retry_limit": 0,
+    "concurrency": 1
+  },
+  "allowed_write_tables": [
+    "iceberg.bronze.transfermarkt_coach_profiles",
+    "iceberg.bronze.transfermarkt_coach_stints",
+    "iceberg.bronze.transfermarkt_market_value_points",
+    "iceberg.bronze.transfermarkt_player_attribute_observations",
+    "iceberg.bronze.transfermarkt_player_contract_observations",
+    "iceberg.bronze.transfermarkt_squad_memberships",
+    "iceberg.bronze.transfermarkt_transfer_events",
+    "iceberg.ops.proxy_traffic_runs",
+    "iceberg.ops.transfermarkt_fetch_state",
+    "iceberg.ops.transfermarkt_native_write_manifest_v2",
+    "iceberg.ops.transfermarkt_proxy_ledger_v2",
+    "iceberg.ops.transfermarkt_scope_manifest_v2",
+    "iceberg.ops.transfermarkt_scope_player_capture"
+  ]
+}

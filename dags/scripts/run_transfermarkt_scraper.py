@@ -37,8 +37,11 @@ from scrapers.transfermarkt.models import (
     MAX_ROSTER_WINDOW,
     PRODUCTION_ENTITY_BUDGETS,
     PROVIDER_GRANT_ENV_VAR,
+    ProxyRequiredError,
     SCOPE_HARD_PROVIDER_BYTE_CAP,
+    TrafficMeterError,
 )
+from scrapers.transfermarkt.raw_store import RawStoreError
 
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
@@ -3283,7 +3286,33 @@ def _base_result(
         'checkpoint_status': 'not_applicable',
         'bootstrap_seeded_keys': 0,
         'traffic': {'telemetry_available': False},
+        'failure_contract_version': 1,
+        'failure_stage': None,
+        'failure_kind': None,
     }
+
+
+def _mark_failure(
+    results: Dict[str, Any],
+    *,
+    stage: str,
+    kind: str,
+) -> None:
+    """Attach a small allowlisted failure taxonomy to the durable result.
+
+    Platform failures dominate a preceding source failure because a response
+    followed by a failed raw/traffic/Bronze commit is not source evidence for
+    terminalisation or unavailability.
+    """
+
+    if stage not in {'source', 'platform'}:
+        raise ValueError('failure stage must be source or platform')
+    if re.fullmatch(r'[a-z][a-z0-9_]{0,63}', kind) is None:
+        raise ValueError('failure kind is invalid')
+    if results.get('failure_stage') == 'platform' and stage != 'platform':
+        return
+    results['failure_stage'] = stage
+    results['failure_kind'] = kind
 
 
 def _run_entity(
@@ -3358,6 +3387,7 @@ def _run_entity(
     career_cache_frames = None
     state_persisted = False
     data_committed = False
+    failure_phase = 'platform'
 
     # Keep the configured path even when missing. The scraper owns the
     # fail-closed proxy policy; converting it to None here used to enable the
@@ -3516,6 +3546,7 @@ def _run_entity(
                 used_native = True
                 results['cache_only_materialization'] = True
             else:
+                failure_phase = 'source'
                 frames, authoritative_key, used_native = _read_frames(
                     scraper, spec, league, season, limit, window_offset, selected,
                     native_dual_write, coach_memberships=coach_memberships,
@@ -3582,6 +3613,7 @@ def _run_entity(
                         exit_code = 0
                         raise _EntityRunComplete(exit_code)
 
+                    failure_phase = 'platform'
                     _save_frames(
                         scraper, write_spec, frames, force_replace, results,
                     )
@@ -3643,6 +3675,7 @@ def _run_entity(
                     results['authoritative_empty'] = True
                     results['rows'] = 0
                     if not dry_run:
+                        failure_phase = 'platform'
                         deleted = _delete_valid_empty_rows(
                             scraper, write_spec, valid_empty, league, season,
                             source_key=checkpoint_spec.id_column,
@@ -3753,6 +3786,7 @@ def _run_entity(
             # Read the stored observation state BEFORE any write: a failed
             # lookup must abort the whole entity, not fall back to a fresh
             # observed_at (that is the duplication being fixed).
+            failure_phase = 'platform'
             frames = _carry_forward_observed_at(
                 scraper, write_spec, frames, results,
             )
@@ -3831,15 +3865,26 @@ def _run_entity(
             raise _EntityRunComplete(exit_code)
     except _EntityRunComplete as complete:
         exit_code = complete.exit_code
+        if exit_code != 0:
+            _mark_failure(
+                results,
+                stage='source' if failure_phase == 'source' else 'platform',
+                kind=(
+                    'source_outcome'
+                    if failure_phase == 'source' else 'platform_runtime'
+                ),
+            )
     except _EmptyRosterError as exc:
         results['fallback'] = True
         results['fallback_reason'] = 'empty_roster'
         results['errors'].append(f'{R0_2B_FALLBACK_MARKER}: {exc}')
+        _mark_failure(results, stage='platform', kind='bronze_prerequisite')
         exit_code = 2
     except ReplaceGuardError as exc:
         message = f'{REPLACE_GUARD_MARKER}: {exc}'
         logger.error(message)
         results['errors'].append(message)
+        _mark_failure(results, stage='platform', kind='dq_write_guard')
         exit_code = 3
     except Exception as exc:  # noqa: BLE001
         safe_error = _redact_sensitive(exc)
@@ -3849,6 +3894,16 @@ def _run_entity(
             exc_info=True,
         )
         results['errors'].append(safe_error)
+        if isinstance(exc, ProxyRequiredError):
+            _mark_failure(results, stage='platform', kind='proxy_control')
+        elif isinstance(exc, TrafficMeterError):
+            _mark_failure(results, stage='platform', kind='traffic_meter')
+        elif isinstance(exc, RawStoreError):
+            _mark_failure(results, stage='platform', kind='raw_store')
+        elif failure_phase == 'source':
+            _mark_failure(results, stage='source', kind='source_runtime')
+        else:
+            _mark_failure(results, stage='platform', kind='platform_runtime')
         if (
             scraper is not None and selected is not None
             and checkpoint_spec is not None
@@ -3871,6 +3926,33 @@ def _run_entity(
         _persist_response_cache(response_cache, cache_path)
         if scraper is not None:
             results['traffic'] = _normalise_traffic(scraper)
+            try:
+                # This is the durable source-attempt ledger used by the
+                # historical campaign finalizer.  It must be exported on the
+                # failure path too: an exception may happen after raw-first
+                # publication but before a FetchOutcome can be returned.
+                raw_attempt_getter = getattr(
+                    scraper,
+                    'get_raw_attempt_records',
+                    None,
+                )
+                if raw_attempt_getter is None:
+                    if os.environ.get(
+                        'TRANSFERMARKT_REQUIRE_RAW_STORE', '',
+                    ).strip().lower() in {'1', 'true', 'yes', 'on'}:
+                        raise RuntimeError('raw attempt evidence API is unavailable')
+                    results['raw_attempts'] = []
+                else:
+                    results['raw_attempts'] = list(raw_attempt_getter())
+            except Exception as exc:  # noqa: BLE001 - evidence is mandatory
+                results['errors'].append(
+                    'raw attempt evidence export failed: '
+                    f'{_redact_sensitive(exc)}'
+                )
+                _mark_failure(
+                    results, stage='platform', kind='evidence_export',
+                )
+                exit_code = 1
         traffic = results['traffic']
         results['network_fetches'] = int(traffic.get('network_fetches', 0) or 0)
         results['retries'] = int(traffic.get('retries', 0) or 0)
@@ -3919,11 +4001,17 @@ def _run_entity(
                 results['errors'].append(
                     'provider-metered traffic unavailable in production lease mode'
                 )
+                _mark_failure(
+                    results, stage='platform', kind='traffic_meter',
+                )
             if authoritative_bytes is None:
                 results['errors'].append(
                     'raw decoded_response_body_bytes telemetry unavailable and '
                     'no provider-metered replacement exists; refusing to treat '
                     'rounded MiB as paid-traffic evidence'
+                )
+                _mark_failure(
+                    results, stage='platform', kind='traffic_telemetry',
                 )
                 # Reserve the entire previously available balance.  The task
                 # is red, and even a manually launched later entity with the
@@ -3978,7 +4066,19 @@ def _run_entity(
                     results['errors'].append(
                         f'cycle traffic ledger persistence failed: {safe_error}'
                     )
+                    _mark_failure(
+                        results, stage='platform', kind='traffic_ledger',
+                    )
                     exit_code = 1
+        if exit_code != 0 and results.get('failure_stage') is None:
+            _mark_failure(
+                results,
+                stage='source' if failure_phase == 'source' else 'platform',
+                kind=(
+                    'source_outcome'
+                    if failure_phase == 'source' else 'platform_runtime'
+                ),
+            )
         _write_results(
             output_path,
             results,

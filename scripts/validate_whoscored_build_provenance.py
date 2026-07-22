@@ -196,6 +196,22 @@ PROTECTED_STAGE_RECIPE_SHA256 = {
     "whoscored_paid_gateway": "0cb2bdeed26cb9fe7cb33da3f50c1f29124ffcc07d31f9d09f69dc67f1b290b8",
     "whoscored_proxy_filter": "0cb2bdeed26cb9fe7cb33da3f50c1f29124ffcc07d31f9d09f69dc67f1b290b8",
 }
+AIRFLOW_SCHEDULER_RECONCILE_COMMAND = (
+    "bash",
+    "-c",
+    "set -euo pipefail\n"
+    "airflow pools set 'transfermarkt_backfill_proxy' 1 "
+    "'Transfermarkt historical backfill only; bounded dedicated proxy slot'\n"
+    "airflow pools set 'transfermarkt_backfill_control' 1 "
+    "'Transfermarkt historical planning and DQ only; isolated from daily ingest'\n"
+    "exec airflow scheduler\n",
+)
+AIRFLOW_SCHEDULER_COMMANDS = frozenset(
+    {
+        ("scheduler",),
+        AIRFLOW_SCHEDULER_RECONCILE_COMMAND,
+    }
+)
 WHOSCORED_PROXY_COMMAND = (
     "python",
     "/opt/airflow/scripts/proxy_filter/filter_proxy.py",
@@ -1280,7 +1296,7 @@ def _parse_compose(
             raise ProvenanceError(
                 "FlareSolverr Compose command bypasses baked preflight"
             )
-        if name == "airflow-scheduler" and command != ("scheduler",):
+        if name == "airflow-scheduler" and command not in AIRFLOW_SCHEDULER_COMMANDS:
             raise ProvenanceError(
                 "scheduler Compose command differs from production policy"
             )
@@ -1493,12 +1509,55 @@ def _service_command(block: Sequence[str]) -> tuple[str, ...] | None:
         if scalar:
             return (_clean_yaml_scalar(scalar),)
         values: list[str] = []
-        for nested in block[index + 1 :]:
+        nested_index = index + 1
+        while nested_index < len(block):
+            nested = block[nested_index]
             if nested.strip() and len(nested) - len(nested.lstrip(" ")) <= 4:
                 break
             item = re.match(r"^      -\s+(.*?)\s*$", nested)
-            if item:
-                values.append(_clean_yaml_scalar(item.group(1)))
+            if not item:
+                if nested.strip() and not nested.lstrip().startswith("#"):
+                    raise ProvenanceError(
+                        "unsupported Compose command list syntax"
+                    )
+                nested_index += 1
+                continue
+            scalar = item.group(1)
+            if scalar not in {"|", "|-", "|+"}:
+                values.append(_clean_yaml_scalar(scalar))
+                nested_index += 1
+                continue
+
+            content: list[str] = []
+            nested_index += 1
+            while nested_index < len(block):
+                content_line = block[nested_index]
+                if content_line.strip():
+                    indentation = len(content_line) - len(content_line.lstrip(" "))
+                    if indentation <= 6:
+                        break
+                    if indentation < 8:
+                        raise ProvenanceError(
+                            "Compose command literal has invalid indentation"
+                        )
+                    content.append(content_line[8:])
+                else:
+                    content.append(
+                        content_line[8:] if len(content_line) > 8 else ""
+                    )
+                nested_index += 1
+
+            if scalar in {"|", "|+"} and nested_index == len(block):
+                raise ProvenanceError(
+                    "Compose command literal has ambiguous final chomping"
+                )
+            if scalar in {"|", "|-"}:
+                while content and not content[-1]:
+                    content.pop()
+            literal = "\n".join(content)
+            if scalar in {"|", "|+"}:
+                literal += "\n"
+            values.append(literal)
         return tuple(values)
     return None
 

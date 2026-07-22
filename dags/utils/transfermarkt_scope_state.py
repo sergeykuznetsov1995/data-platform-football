@@ -280,7 +280,7 @@ class ScopeManifest:
         # the autonomous schedule replaced the one-shot approval packets, so
         # the policy is the only remaining authorization trace.  One-shot runs
         # keep their journal and simply omit the key.
-        provenance = {'standing_policy_hash'}
+        provenance = {'standing_policy_hash', 'silver_trigger_allowed'}
         optional = coverage | provenance
         if not isinstance(value, Mapping):
             raise ScopeManifestError('scope DQ evidence has an unbound field set')
@@ -299,6 +299,13 @@ class ScopeManifest:
         ):
             raise ScopeManifestError(
                 'standing policy hash is not a lowercase sha256 digest'
+            )
+        if (
+            'silver_trigger_allowed' in present
+            and not isinstance(value['silver_trigger_allowed'], bool)
+        ):
+            raise ScopeManifestError(
+                'silver_trigger_allowed must be a boolean'
             )
         if value['status'] != 'passed':
             raise ScopeManifestError('scope DQ evidence is not green')

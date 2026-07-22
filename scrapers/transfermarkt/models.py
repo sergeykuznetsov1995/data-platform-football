@@ -289,6 +289,12 @@ class FetchOutcome(Generic[T]):
     duration_seconds: float = 0.0
     cache_hit: bool = False
     payload_hash: Optional[str] = None
+    raw_capture_id: Optional[str] = None
+    raw_body_hash: Optional[str] = None
+    raw_uri: Optional[str] = None
+    raw_fetched_at: Optional[str] = None
+    raw_attempt_envelope_id: Optional[str] = None
+    raw_attempt_envelope_ids: tuple[str, ...] = ()
 
     @property
     def is_success(self) -> bool:
@@ -329,6 +335,12 @@ class FetchOutcome(Generic[T]):
             duration_seconds=self.duration_seconds,
             cache_hit=self.cache_hit,
             payload_hash=self.payload_hash,
+            raw_capture_id=self.raw_capture_id,
+            raw_body_hash=self.raw_body_hash,
+            raw_uri=self.raw_uri,
+            raw_fetched_at=self.raw_fetched_at,
+            raw_attempt_envelope_id=self.raw_attempt_envelope_id,
+            raw_attempt_envelope_ids=self.raw_attempt_envelope_ids,
         )
 
     def as_checkpoint(self) -> Dict[str, Any]:
@@ -338,7 +350,7 @@ class FetchOutcome(Generic[T]):
         if self.value is not None and payload_hash is None:
             payload_hash = stable_payload_hash(self.value)
         return {
-            "version": 2,
+            "version": 4,
             "status": self.status.value,
             "value": self.value,
             "status_code": self.status_code,
@@ -351,12 +363,21 @@ class FetchOutcome(Generic[T]):
             "provider_metered_bytes": self.provider_metered_bytes,
             "duration_seconds": self.duration_seconds,
             "payload_hash": payload_hash,
+            "raw_capture_id": self.raw_capture_id,
+            "raw_body_hash": self.raw_body_hash,
+            "raw_uri": self.raw_uri,
+            "raw_fetched_at": self.raw_fetched_at,
+            "raw_attempt_envelope_id": self.raw_attempt_envelope_id,
+            "raw_attempt_envelope_ids": list(self.raw_attempt_envelope_ids),
         }
 
     @classmethod
     def from_checkpoint(cls, value: Mapping[str, Any]) -> "FetchOutcome[Any]":
         """Restore a successful outcome and reject corrupt cached payloads."""
 
+        version = value.get("version")
+        if isinstance(version, bool) or version not in {3, 4}:
+            raise ValueError("unsupported Transfermarkt checkpoint version")
         status = FetchStatus.from_checkpoint(value.get("status"))
         if status not in (
             FetchStatus.OK,
@@ -370,12 +391,52 @@ class FetchOutcome(Generic[T]):
             actual_hash = stable_payload_hash(payload)
             if not expected_hash or actual_hash != expected_hash:
                 raise ValueError("cached Transfermarkt payload hash mismatch")
+        envelope_ids_raw = value.get("raw_attempt_envelope_ids", ())
+        if not isinstance(envelope_ids_raw, (list, tuple)):
+            raise ValueError("cached raw attempt envelope ids must be a list")
+        envelope_ids = tuple(str(item) for item in envelope_ids_raw)
+        if any(
+            len(item) != 64
+            or any(character not in "0123456789abcdef" for character in item)
+            for item in envelope_ids
+        ) or len(set(envelope_ids)) != len(envelope_ids):
+            raise ValueError("cached raw attempt envelope ids are invalid")
+        last_envelope_id = value.get("raw_attempt_envelope_id")
+        if last_envelope_id is not None:
+            last_envelope_id = str(last_envelope_id)
+            if (
+                len(last_envelope_id) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in last_envelope_id
+                )
+            ):
+                raise ValueError("cached raw attempt envelope id is invalid")
+            if envelope_ids and last_envelope_id != envelope_ids[-1]:
+                raise ValueError("cached final raw attempt envelope id drift")
+            if not envelope_ids:
+                envelope_ids = (last_envelope_id,)
+        elif envelope_ids:
+            last_envelope_id = envelope_ids[-1]
+        if version == 3 and (
+            "raw_attempt_envelope_id" in value
+            or "raw_attempt_envelope_ids" in value
+        ):
+            raise ValueError("v3 checkpoint cannot claim v4 raw attempt evidence")
+        attempts = int(value.get("attempts", 0))
+        has_raw_capture = value.get("raw_capture_id") is not None
+        if version == 4 and has_raw_capture and (
+            not envelope_ids or attempts <= 0 or len(envelope_ids) != attempts
+        ):
+            raise ValueError("v4 checkpoint raw attempt chain is incomplete")
+        if version == 4 and envelope_ids and not has_raw_capture:
+            raise ValueError("v4 attempt chain has no final raw capture")
         return cls(
             status=status,
             value=payload,
             status_code=value.get("status_code"),
             error=value.get("error"),
-            attempts=int(value.get("attempts", 0)),
+            attempts=attempts,
             label=str(value.get("label") or "endpoint"),
             context=dict(value.get("context") or {}),
             decoded_body_bytes=int(value.get("decoded_body_bytes", 0)),
@@ -390,6 +451,24 @@ class FetchOutcome(Generic[T]):
             duration_seconds=float(value.get("duration_seconds", 0.0)),
             cache_hit=True,
             payload_hash=expected_hash,
+            raw_capture_id=(
+                str(value["raw_capture_id"])
+                if value.get("raw_capture_id") is not None else None
+            ),
+            raw_body_hash=(
+                str(value["raw_body_hash"])
+                if value.get("raw_body_hash") is not None else None
+            ),
+            raw_uri=(
+                str(value["raw_uri"])
+                if value.get("raw_uri") is not None else None
+            ),
+            raw_fetched_at=(
+                str(value["raw_fetched_at"])
+                if value.get("raw_fetched_at") is not None else None
+            ),
+            raw_attempt_envelope_id=last_envelope_id,
+            raw_attempt_envelope_ids=envelope_ids,
         )
 
     def as_cache_hit(self, *, duration_seconds: float) -> "FetchOutcome[T]":
@@ -413,6 +492,12 @@ class FetchRecord:
     error: Optional[str]
     status_code: Optional[int]
     attempts: int
+    raw_capture_id: Optional[str] = None
+    raw_body_hash: Optional[str] = None
+    raw_uri: Optional[str] = None
+    raw_fetched_at: Optional[str] = None
+    raw_attempt_envelope_id: Optional[str] = None
+    raw_attempt_envelope_ids: tuple[str, ...] = ()
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -422,6 +507,12 @@ class FetchRecord:
             "error": self.error,
             "status_code": self.status_code,
             "attempts": self.attempts,
+            "raw_capture_id": self.raw_capture_id,
+            "raw_body_hash": self.raw_body_hash,
+            "raw_uri": self.raw_uri,
+            "raw_fetched_at": self.raw_fetched_at,
+            "raw_attempt_envelope_id": self.raw_attempt_envelope_id,
+            "raw_attempt_envelope_ids": list(self.raw_attempt_envelope_ids),
         }
 
 

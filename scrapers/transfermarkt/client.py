@@ -7,6 +7,7 @@ without exercising the scraper orchestration.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ import re
 import socket
 import time
 from collections import defaultdict
+from dataclasses import asdict, replace
 from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -32,6 +34,12 @@ from scrapers.transfermarkt.models import (
     TrafficBudgetExceeded,
     TrafficMeterError,
     stable_payload_hash,
+)
+from scrapers.transfermarkt.raw_store import (
+    RawAttemptEnvelopeRecord,
+    RawCaptureRecord,
+    RawResponseStore,
+    RawStoreError,
 )
 from scrapers.utils.proxy_manager import ErrorType
 
@@ -74,16 +82,34 @@ _MAX_FETCH_ATTEMPTS = 8
 # it will say so from every exit, and each try burns one.
 _MAX_BLOCKED_ATTEMPTS = 4
 
+# The proxy promotes an aged backfill ticket after 55 seconds and retains a
+# pending ticket for 90 seconds.  Keep the caller's bounded polling window
+# strictly between those limits so scheduling jitter can still observe the
+# grant without allowing an orphaned ticket to outlive the proxy queue.
+TRANSFERMARKT_REQUEST_PERMIT_MAX_WAIT_SECONDS = 65.0
+
 _URL_CREDENTIALS_RE = re.compile(
     r"(?P<scheme>(?:https?|socks[45])://)(?P<credentials>[^/@\s]+)@",
     re.IGNORECASE,
 )
+_AUTH_VALUE_RE = re.compile(
+    r"(?i)\b(proxy-authorization|authorization)\s*[:=]\s*"
+    r"(?:basic|bearer)?\s*[^\s,;]+"
+)
+_BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 
 
 def redact_sensitive(value: Any) -> str:
-    """Remove proxy credentials from third-party exception text."""
+    """Remove URL/header/bearer credentials from exception text."""
 
-    return _URL_CREDENTIALS_RE.sub(r"\g<scheme>****:****@", str(value))
+    rendered = _URL_CREDENTIALS_RE.sub(r"\g<scheme>****:****@", str(value))
+    rendered = _AUTH_VALUE_RE.sub(r"\1: [REDACTED]", rendered)
+    rendered = _BEARER_RE.sub("Bearer [REDACTED]", rendered)
+    for name in ("TM_PROXY_CONTROL_TOKEN", "TM_BACKFILL_PROXY_CONTROL_TOKEN"):
+        secret = os.environ.get(name, "")
+        if secret:
+            rendered = rendered.replace(secret, "[REDACTED]")
+    return rendered
 
 
 def _payload_hash(value: Any) -> str:
@@ -181,6 +207,8 @@ def _ledger_from_provider_grant(
 def _control_token_from_environment() -> str:
     """Return the Transfermarkt-only proxy-filter control token."""
 
+    if os.environ.get("TM_DAG_ID", "").strip() == "dag_backfill_transfermarkt":
+        return str(os.environ.get("TM_BACKFILL_PROXY_CONTROL_TOKEN", "")).strip()
     return str(os.environ.get("TM_PROXY_CONTROL_TOKEN", "")).strip()
 
 
@@ -199,6 +227,8 @@ class ProxyFilterLeaseProvider:
         control_client: Optional[Any] = None,
         control_token: Optional[str] = None,
         timeout_seconds: float = 5.0,
+        sleep_fn: Callable[[float], None] = time.sleep,
+        time_fn: Callable[[], float] = time.time,
     ) -> None:
         base = str(control_base_url).rstrip("/")
         parsed = urlsplit(base)
@@ -218,6 +248,8 @@ class ProxyFilterLeaseProvider:
         self._control_client = control_client
         self._control_token = resolved
         self.timeout_seconds = float(timeout_seconds)
+        self._sleep = sleep_fn
+        self._time = time_fn
 
     def _client(self):
         if self._control_client is None:
@@ -260,6 +292,84 @@ class ProxyFilterLeaseProvider:
                 f"(HTTP {status}): {error}"
             )
         return body
+
+    def acquire_request_permit(
+        self,
+        *,
+        metadata: Mapping[str, Any],
+        request_id: str,
+        max_wait_seconds: float = TRANSFERMARKT_REQUEST_PERMIT_MAX_WAIT_SECONDS,
+    ) -> str:
+        """Acquire and consume one source-wide permit immediately pre-I/O."""
+
+        dag_id = str(metadata.get("dag_id") or "").strip()
+        run_id = str(metadata.get("run_id") or "").strip()
+        request_key = str(request_id or "").strip()
+        if not dag_id or not run_id or not request_key:
+            raise TrafficMeterError(
+                "Transfermarkt request permit requires dag_id/run_id/request_id"
+            )
+        payload = {
+            "dag_id": dag_id,
+            "run_id": run_id,
+            "request_id": request_key,
+        }
+        started = self._time()
+        granted: Mapping[str, Any] | None = None
+        while granted is None:
+            headers = {"X-Proxy-Control-Token": self._control_token}
+            response = self._client().request(
+                "POST",
+                f"{self.control_base_url}/v1/transfermarkt/request-permits",
+                json=payload,
+                headers=headers,
+                timeout=self.timeout_seconds,
+            )
+            status = int(getattr(response, "status_code", 0) or 0)
+            try:
+                body = response.json()
+            except Exception as exc:  # noqa: BLE001 - adapter boundary
+                raise TrafficMeterError(
+                    "request permit API returned invalid JSON"
+                ) from exc
+            if not isinstance(body, Mapping):
+                raise TrafficMeterError("request permit API response is invalid")
+            if status == 200 and body.get("granted") is True:
+                granted = body
+                break
+            if status != 429 or body.get("code") != "request_permit_pending":
+                raise TrafficMeterError(
+                    f"request permit API rejected acquisition (HTTP {status})"
+                )
+            elapsed = self._time() - started
+            retry_after = max(
+                0.05,
+                min(5.0, float(body.get("retry_after_seconds", 0.05))),
+            )
+            if elapsed + retry_after > float(max_wait_seconds):
+                raise TrafficMeterError("request permit wait exceeded its bound")
+            self._sleep(retry_after)
+
+        permit_id = str(granted.get("permit_id") or "").strip()
+        permit_token = str(granted.get("permit_token") or "").strip()
+        if (
+            len(permit_id) != 64
+            or any(character not in "0123456789abcdef" for character in permit_id)
+            or len(permit_token) < 32
+        ):
+            raise TrafficMeterError("request permit grant schema mismatch")
+        consumed = self._request(
+            "POST",
+            "/v1/transfermarkt/request-permits/consume",
+            payload={
+                **payload,
+                "permit_id": permit_id,
+                "permit_token": permit_token,
+            },
+        )
+        if consumed.get("consumed") is not True or consumed.get("permit_id") != permit_id:
+            raise TrafficMeterError("request permit was not consumed")
+        return permit_id
 
     def acquire(
         self,
@@ -348,6 +458,8 @@ class TransfermarktHttpClient:
         lease_metadata: Optional[Mapping[str, Any]] = None,
         lease_ttl_seconds: int = 300,
         cache: Optional[MutableMapping[str, Mapping[str, Any]]] = None,
+        raw_store: Optional[RawResponseStore] = None,
+        require_raw_store: Optional[bool] = None,
         rate_limiter=None,
         timeout_seconds: float = 12.0,
         circuit_failures: int = 5,
@@ -382,6 +494,18 @@ class TransfermarktHttpClient:
         self._lease_ttl_seconds = max(1, int(lease_ttl_seconds))
         self._lease: Optional[ProxyLease] = None
         self._cache = cache
+        if require_raw_store is None:
+            require_raw_store = os.environ.get(
+                "TRANSFERMARKT_REQUIRE_RAW_STORE", "false"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+        if raw_store is None:
+            raw_store = RawResponseStore.from_env(optional=not require_raw_store)
+        self._raw_store = raw_store
+        self._require_raw_store = bool(require_raw_store)
+        if self._require_raw_store and self._raw_store is None:
+            raise RawStoreError("Transfermarkt raw store is required")
+        self._raw_captures: dict[str, RawCaptureRecord] = {}
+        self._raw_attempt_envelopes: dict[str, RawAttemptEnvelopeRecord] = {}
         self._rate_limiter = rate_limiter
         self.timeout_seconds = float(timeout_seconds)
         self._circuit_failures = int(circuit_failures)
@@ -503,6 +627,48 @@ class TransfermarktHttpClient:
             self._budget_exhausted = True
             self.close()
             raise
+
+    def _consume_source_request_permit(
+        self,
+        *,
+        url: str,
+        label: str,
+        context: Mapping[str, Any],
+    ) -> None:
+        if self._lease_provider is None:
+            return
+        metadata = dict(self._lease_metadata)
+        ordinal = self._capture_attempt_ordinal()
+        request_id = hashlib.sha256(
+            json.dumps(
+                {
+                    "cycle_id": context.get("cycle_id") or metadata.get("run_id"),
+                    "scope_id": context.get("scope_id")
+                    or context.get("scope")
+                    or metadata.get("scope"),
+                    "label": label,
+                    "url": url,
+                    "lease_id": (
+                        self._lease.lease_id if self._lease is not None else None
+                    ),
+                    "attempt_ordinal": ordinal,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        try:
+            self._lease_provider.acquire_request_permit(
+                metadata=metadata,
+                request_id=request_id,
+            )
+        except TrafficMeterError:
+            raise
+        except Exception as exc:  # provider adapters vary
+            raise TrafficMeterError(
+                "Transfermarkt request permit failed closed"
+            ) from exc
 
     # ------------------------------------------------------------------
     # Client/proxy lifecycle
@@ -845,6 +1011,221 @@ class TransfermarktHttpClient:
             return None
 
     @staticmethod
+    def _decode_body(body: bytes, *, as_json: bool) -> Any:
+        """Parse only bytes that have passed raw-store verification."""
+
+        if as_json:
+            return json.loads(body.decode("utf-8-sig", errors="strict"))
+        return body.decode("utf-8", errors="replace")
+
+    def _capture_attempt_ordinal(self) -> int:
+        raw_try = os.environ.get("AIRFLOW_CTX_TRY_NUMBER", "0").strip()
+        try:
+            task_try = max(0, int(raw_try))
+        except ValueError:
+            task_try = 0
+        return task_try * 1_000_000 + self._attempts + 1
+
+    def _raw_attempt_identity(
+        self,
+        *,
+        label: str,
+        context: Mapping[str, Any],
+    ) -> tuple[str, str]:
+        cycle_id = str(
+            os.environ.get("TM_CHILD_CYCLE_ID")
+            or context.get("cycle_id")
+            or self._lease_metadata.get("run_id")
+            or os.environ.get("AIRFLOW_CTX_DAG_RUN_ID")
+            or "manual"
+        )
+        scope_id = str(
+            context.get("scope_id")
+            or context.get("scope")
+            or self._lease_metadata.get("scope")
+            or "global"
+        )
+        return cycle_id, scope_id
+
+    def _commit_raw_response(
+        self,
+        *,
+        url: str,
+        body: bytes,
+        status_code: int,
+        headers: Mapping[str, Any],
+        label: str,
+        context: Mapping[str, Any],
+    ) -> tuple[
+        bytes,
+        RawCaptureRecord | None,
+        RawAttemptEnvelopeRecord | None,
+    ]:
+        """Commit capture and response envelope before parser-visible bytes."""
+
+        if self._raw_store is None:
+            if self._require_raw_store:
+                raise RawStoreError("Transfermarkt raw store is required")
+            return body, None, None
+        cycle_id, scope_id = self._raw_attempt_identity(
+            label=label, context=context,
+        )
+        try:
+            record = self._raw_store.store_attempt(
+                url=url,
+                body=body,
+                status_code=status_code,
+                headers=headers,
+                fetched_at=None,
+                cycle_id=cycle_id,
+                scope_id=scope_id,
+                endpoint=label,
+                attempt=self._capture_attempt_ordinal(),
+            )
+            verified, loaded = self._raw_store.load_capture(record.capture_id)
+            if loaded != record or verified != body:
+                raise RawStoreError(
+                    "Transfermarkt raw capture read-after-write drift"
+                )
+            envelope = self._raw_store.store_response_envelope(record)
+            verified_envelope = self._raw_store.load_attempt_envelope(
+                envelope.envelope_id
+            )
+            if verified_envelope != envelope:
+                raise RawStoreError(
+                    "Transfermarkt response envelope read-after-write drift"
+                )
+        except RawStoreError:
+            raise
+        except Exception as exc:  # object-store implementations vary
+            raise RawStoreError(
+                "Transfermarkt raw response commit failed closed"
+            ) from exc
+        self._raw_captures[record.capture_id] = record
+        self._raw_attempt_envelopes[envelope.envelope_id] = envelope
+        return verified, record, envelope
+
+    def _commit_transport_error(
+        self,
+        *,
+        url: str,
+        label: str,
+        context: Mapping[str, Any],
+        error_kind: str,
+        exception: Exception,
+    ) -> RawAttemptEnvelopeRecord | None:
+        """Persist a safe body-free envelope before any paid retry."""
+
+        if self._raw_store is None:
+            if self._require_raw_store:
+                raise RawStoreError("Transfermarkt raw store is required")
+            return None
+        cycle_id, scope_id = self._raw_attempt_identity(
+            label=label, context=context,
+        )
+        error_type = type(exception).__name__
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,127}", error_type) is None:
+            error_type = "Exception"
+        try:
+            envelope = self._raw_store.store_transport_error(
+                url=url,
+                fetched_at=None,
+                cycle_id=cycle_id,
+                scope_id=scope_id,
+                endpoint=label,
+                attempt=self._capture_attempt_ordinal(),
+                error_kind=error_kind,
+                error_type=error_type,
+            )
+            verified = self._raw_store.load_attempt_envelope(
+                envelope.envelope_id
+            )
+            if verified != envelope:
+                raise RawStoreError(
+                    "Transfermarkt transport envelope read-after-write drift"
+                )
+        except RawStoreError:
+            raise
+        except Exception as exc:  # object-store implementations vary
+            raise RawStoreError(
+                "Transfermarkt raw transport commit failed closed"
+            ) from exc
+        self._raw_attempt_envelopes[envelope.envelope_id] = envelope
+        return envelope
+
+    @staticmethod
+    def _transport_error_kind(exc: Exception) -> str:
+        rendered = f"{type(exc).__name__} {exc}".lower()
+        if "timeout" in rendered or "timed out" in rendered:
+            return "timeout"
+        if any(token in rendered for token in ("dns", "gaierror", "name resolution")):
+            return "dns"
+        if any(token in rendered for token in ("ssl", "tls", "certificate")):
+            return "tls"
+        if isinstance(exc, ProxyRequiredError):
+            return "proxy"
+        return "connection"
+
+    def _raw_lineage(
+        self,
+        record: RawCaptureRecord | None,
+        *,
+        final_envelope: RawAttemptEnvelopeRecord | None = None,
+        envelopes: tuple[RawAttemptEnvelopeRecord, ...] = (),
+    ) -> dict[str, Any]:
+        envelope_ids = tuple(item.envelope_id for item in envelopes)
+        final_envelope_id = (
+            final_envelope.envelope_id if final_envelope is not None else None
+        )
+        if record is None:
+            return {
+                "raw_capture_id": None,
+                "raw_body_hash": None,
+                "raw_uri": None,
+                "raw_fetched_at": None,
+                "raw_attempt_envelope_id": final_envelope_id,
+                "raw_attempt_envelope_ids": envelope_ids,
+            }
+        assert self._raw_store is not None
+        return {
+            "raw_capture_id": record.capture_id,
+            "raw_body_hash": record.content_hash,
+            "raw_uri": record.raw_uri,
+            "raw_fetched_at": record.fetched_at,
+            "raw_attempt_envelope_id": final_envelope_id,
+            "raw_attempt_envelope_ids": envelope_ids,
+        }
+
+    def get_raw_capture_records(self) -> tuple[dict[str, Any], ...]:
+        """Return deterministic metadata for every response seen this run."""
+
+        response_envelopes = {
+            record.capture_id: record
+            for record in self._raw_attempt_envelopes.values()
+            if record.capture_id is not None
+        }
+        return tuple(
+            {
+                **asdict(record),
+                **self._raw_lineage(
+                    record,
+                    final_envelope=response_envelopes.get(record.capture_id),
+                    envelopes=(response_envelopes[record.capture_id],)
+                    if record.capture_id in response_envelopes else (),
+                ),
+            }
+            for _, record in sorted(self._raw_captures.items())
+        )
+
+    def get_raw_attempt_records(self) -> tuple[dict[str, Any], ...]:
+        """Return verified response and transport envelopes for run evidence."""
+
+        return tuple(
+            asdict(record)
+            for _, record in sorted(self._raw_attempt_envelopes.items())
+        )
+
+    @staticmethod
     def _host(url: str) -> str:
         from urllib.parse import urlsplit
 
@@ -1015,7 +1396,12 @@ class TransfermarktHttpClient:
         self._consecutive_endpoint_failures = self._circuit_failures - 1
         return True
 
-    def _load_cached_outcome(self, cache_key: Optional[str]) -> Optional[FetchOutcome[Any]]:
+    def _load_cached_outcome(
+        self,
+        cache_key: Optional[str],
+        *,
+        as_json: bool,
+    ) -> Optional[FetchOutcome[Any]]:
         if self._cache is None or not cache_key:
             return None
         raw = self._cache.get(cache_key)
@@ -1029,7 +1415,108 @@ class TransfermarktHttpClient:
             outcome_raw = raw["outcome"]
             if not isinstance(outcome_raw, Mapping):
                 raise ValueError("cached outcome is not an object")
-            return FetchOutcome.from_checkpoint(outcome_raw)
+            checkpoint_version = int(outcome_raw.get("version", -1))
+            outcome = FetchOutcome.from_checkpoint(outcome_raw)
+            if self._require_raw_store and not outcome.raw_capture_id:
+                # Pre-raw caches are deliberately retired.  They cannot prove
+                # where their decoded value came from.
+                self._cache.pop(cache_key, None)
+                return None
+            if outcome.raw_capture_id and self._raw_store is not None:
+                try:
+                    body, record = self._raw_store.load_capture(
+                        outcome.raw_capture_id
+                    )
+                    replayed = self._decode_body(body, as_json=as_json)
+                    replay_hash = _payload_hash(replayed)
+                    if replay_hash != outcome.payload_hash:
+                        raise RawStoreError(
+                            "cached Transfermarkt value differs from raw replay"
+                        )
+                    self._raw_captures[record.capture_id] = record
+                    loaded_envelopes: list[RawAttemptEnvelopeRecord] = []
+                    for envelope_id in outcome.raw_attempt_envelope_ids:
+                        envelope = self._raw_store.load_attempt_envelope(envelope_id)
+                        self._raw_attempt_envelopes[envelope.envelope_id] = envelope
+                        loaded_envelopes.append(envelope)
+                    if not loaded_envelopes:
+                        # Read-compatible migration for successful v3
+                        # checkpoints: publish evidence from the already
+                        # verified capture, with no paid source request.
+                        if checkpoint_version != 3:
+                            raise RawStoreError(
+                                "only a v3 checkpoint may synthesize raw attempt evidence"
+                            )
+                        envelope = self._raw_store.store_response_envelope(record)
+                        envelope = self._raw_store.load_attempt_envelope(
+                            envelope.envelope_id
+                        )
+                        self._raw_attempt_envelopes[envelope.envelope_id] = envelope
+                        loaded_envelopes.append(envelope)
+                    if checkpoint_version == 4:
+                        if len(loaded_envelopes) != outcome.attempts:
+                            raise RawStoreError(
+                                "cached raw attempt count differs from checkpoint"
+                            )
+                        first = loaded_envelopes[0]
+                        previous_ordinal = -1
+                        for envelope in loaded_envelopes:
+                            if (
+                                envelope.cycle_id != first.cycle_id
+                                or envelope.scope_id != first.scope_id
+                                or envelope.endpoint != first.endpoint
+                                or envelope.url != first.url
+                                or envelope.attempt <= previous_ordinal
+                            ):
+                                raise RawStoreError(
+                                    "cached raw attempt chain identity/order drift"
+                                )
+                            previous_ordinal = envelope.attempt
+                    expected_child_cycle = os.environ.get(
+                        "TM_CHILD_CYCLE_ID", ""
+                    ).strip()
+                    if expected_child_cycle and any(
+                        envelope.cycle_id != expected_child_cycle
+                        for envelope in loaded_envelopes
+                    ):
+                        # The URL-keyed cache may outlive one daily/backfill
+                        # cycle.  Its bytes remain valid raw history, but they
+                        # are not evidence for this exact physical attempt.
+                        self._cache.pop(cache_key, None)
+                        self._raw_captures.pop(record.capture_id, None)
+                        for envelope in loaded_envelopes:
+                            self._raw_attempt_envelopes.pop(
+                                envelope.envelope_id, None
+                            )
+                        return None
+                    final_envelope = loaded_envelopes[-1]
+                    if (
+                        final_envelope.outcome_kind != "response"
+                        or final_envelope.capture_id != record.capture_id
+                    ):
+                        raise RawStoreError(
+                            "cached final attempt envelope differs from raw capture"
+                        )
+                    outcome = replace(
+                        outcome,
+                        value=replayed,
+                        **self._raw_lineage(
+                            record,
+                            final_envelope=final_envelope,
+                            envelopes=tuple(loaded_envelopes),
+                        ),
+                    )
+                except RawStoreError:
+                    raise
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise RawStoreError(
+                        "cached Transfermarkt raw capture cannot be replayed"
+                    ) from exc
+                except Exception as exc:
+                    raise RawStoreError(
+                        "cached Transfermarkt raw evidence failed closed"
+                    ) from exc
+            return outcome
         except (KeyError, TypeError, ValueError):
             # A corrupt cache is an ordinary miss; it is never returned as an
             # authoritative source result or allowed to poison a checkpoint.
@@ -1077,7 +1564,7 @@ class TransfermarktHttpClient:
 
         context = dict(context or {})
         cache_started = self._monotonic()
-        cached = self._load_cached_outcome(cache_key)
+        cached = self._load_cached_outcome(cache_key, as_json=as_json)
         if cached is not None:
             duration = self._monotonic() - cache_started
             self._record_cache_hit(label=label, duration_seconds=duration)
@@ -1104,6 +1591,9 @@ class TransfermarktHttpClient:
         last_status: Optional[int] = None
         last_error: Optional[str] = None
         terminal_status = FetchStatus.RETRY_EXHAUSTED
+        last_raw_record: RawCaptureRecord | None = None
+        last_attempt_envelope: RawAttemptEnvelopeRecord | None = None
+        attempt_envelopes: list[RawAttemptEnvelopeRecord] = []
 
         for attempt in range(1, attempts_cap + 1):
             self._check_request_budget()
@@ -1117,6 +1607,11 @@ class TransfermarktHttpClient:
                 )
                 if self._rate_limiter is not None:
                     self._rate_limiter.acquire()
+                self._consume_source_request_permit(
+                    url=url,
+                    label=label,
+                    context=context,
+                )
                 resp = client.get(
                     url,
                     timeout=self.timeout_seconds,
@@ -1129,6 +1624,57 @@ class TransfermarktHttpClient:
                 body_n = len(body)
                 decoded_for_endpoint += body_n
                 wire_n = self._content_length(resp)
+                provider_up = 0
+                provider_down = 0
+                response_headers = getattr(resp, "headers", {})
+                if not isinstance(response_headers, Mapping):
+                    response_headers = {}
+                try:
+                    body, raw_record, attempt_envelope = self._commit_raw_response(
+                        url=url,
+                        body=body,
+                        status_code=status_code,
+                        headers=response_headers,
+                        label=label,
+                        context=context,
+                    )
+                except RawStoreError:
+                    # The source answered and provider traffic was consumed;
+                    # storage failure is not a proxy failure and must not be
+                    # retried as another paid source request.
+                    try:
+                        provider_up, provider_down = self._read_lease_delta()
+                    except Exception as meter_exc:  # preserve storage failure
+                        logger.error(
+                            "could not meter raw-storage failure: %s",
+                            redact_sensitive(meter_exc),
+                        )
+                    self._record_proxy(
+                        proxy_obj=proxy_obj,
+                        success=True,
+                        error_type=None,
+                        elapsed=elapsed,
+                    )
+                    self._record_attempt(
+                        label=label,
+                        status_code=status_code,
+                        decoded_bytes=body_n,
+                        wire_bytes=wire_n,
+                        provider_up_bytes=provider_up,
+                        provider_down_bytes=provider_down,
+                        host=self._host(url),
+                        success=False,
+                        retry=attempt > 1,
+                        duration_seconds=elapsed,
+                    )
+                    raise
+                last_raw_record = raw_record
+                if attempt_envelope is not None:
+                    last_attempt_envelope = attempt_envelope
+                    attempt_envelopes.append(attempt_envelope)
+                # Raw evidence wins publication before a fallible control-plane
+                # meter read, so a received response can never disappear from
+                # the attempt ledger merely because telemetry is unavailable.
                 provider_up, provider_down = self._read_lease_delta()
                 if self._provider_metering_available:
                     wire_for_endpoint += provider_down
@@ -1137,7 +1683,7 @@ class TransfermarktHttpClient:
                 if status_code == 200:
                     if as_json:
                         try:
-                            value = resp.json()
+                            value = self._decode_body(body, as_json=True)
                         except Exception as exc:  # noqa: BLE001
                             value = None
                             body_text = body.decode("utf-8", errors="replace")
@@ -1210,6 +1756,11 @@ class TransfermarktHttpClient:
                                     ),
                                     duration_seconds=total_duration,
                                     payload_hash=_payload_hash(value),
+                                    **self._raw_lineage(
+                                        raw_record,
+                                        final_envelope=last_attempt_envelope,
+                                        envelopes=tuple(attempt_envelopes),
+                                    ),
                                 ))
                                 self._store_cached_outcome(
                                     cache_key=cache_key,
@@ -1218,10 +1769,7 @@ class TransfermarktHttpClient:
                                 )
                                 return outcome
                     else:
-                        try:
-                            value = resp.text
-                        except Exception:  # noqa: BLE001
-                            value = body.decode("utf-8", errors="replace")
+                        value = self._decode_body(body, as_json=False)
                         if self._looks_like_html_challenge(value):
                             last_error = "Cloudflare HTML challenge"
                             terminal_status = FetchStatus.BLOCKED
@@ -1273,6 +1821,11 @@ class TransfermarktHttpClient:
                                 ),
                                 duration_seconds=total_duration,
                                 payload_hash=_payload_hash(value),
+                                **self._raw_lineage(
+                                    raw_record,
+                                    final_envelope=last_attempt_envelope,
+                                    envelopes=tuple(attempt_envelopes),
+                                ),
                             ))
                             self._store_cached_outcome(
                                 cache_key=cache_key,
@@ -1384,11 +1937,24 @@ class TransfermarktHttpClient:
                         redact_sensitive(close_exc),
                     )
                 raise
+            except RawStoreError:
+                raise
             except ProxyRequiredError as exc:
+                safe_kind = self._transport_error_kind(exc)
+                transport_envelope = self._commit_transport_error(
+                    url=url,
+                    label=label,
+                    context=context,
+                    error_kind=safe_kind,
+                    exception=exc,
+                )
+                if transport_envelope is not None:
+                    last_attempt_envelope = transport_envelope
+                    attempt_envelopes.append(transport_envelope)
                 if self._attempts == endpoint_attempt_start:
                     raise
                 last_status = 0
-                last_error = redact_sensitive(exc)
+                last_error = f"transport:{safe_kind}:{type(exc).__name__}"
                 terminal_status = FetchStatus.RETRY_EXHAUSTED
                 break
             except TrafficMeterError:
@@ -1401,16 +1967,25 @@ class TransfermarktHttpClient:
                 attempt_duration_for_endpoint += elapsed
                 proxy_obj = self._proxy_obj or proxy_obj
                 last_status = 0
-                last_error = redact_sensitive(
-                    f"transport: {type(exc).__name__}: {exc}"
-                )
+                safe_kind = self._transport_error_kind(exc)
+                last_error = f"transport:{safe_kind}:{type(exc).__name__}"
                 terminal_status = FetchStatus.RETRY_EXHAUSTED
                 error_name = type(exc).__name__.lower()
                 error_type = (
                     ErrorType.TIMEOUT.value
-                    if "timeout" in error_name or "timedout" in last_error.lower()
+                    if safe_kind == "timeout" or "timeout" in error_name
                     else ErrorType.CONNECTION.value
                 )
+                transport_envelope = self._commit_transport_error(
+                    url=url,
+                    label=label,
+                    context=context,
+                    error_kind=safe_kind,
+                    exception=exc,
+                )
+                if transport_envelope is not None:
+                    last_attempt_envelope = transport_envelope
+                    attempt_envelopes.append(transport_envelope)
                 provider_up, provider_down = self._read_lease_delta()
                 if self._provider_metering_available:
                     wire_for_endpoint += provider_down
@@ -1468,4 +2043,9 @@ class TransfermarktHttpClient:
                 provider_for_endpoint if self._provider_metering_available else None
             ),
             duration_seconds=total_duration,
+            **self._raw_lineage(
+                last_raw_record,
+                final_envelope=last_attempt_envelope,
+                envelopes=tuple(attempt_envelopes),
+            ),
         ))

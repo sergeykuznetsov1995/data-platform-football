@@ -271,33 +271,35 @@ def test_whoscored_services_use_distinct_payload_and_gated_final_targets() -> No
     )
     assert shared_proxy["build"]["target"] == "airflow-base"
 
-    dockerfile = (ROOT / "docker/images/airflow/Dockerfile").read_text(
-        encoding="utf-8"
-    )
+    dockerfile = (ROOT / "docker/images/airflow/Dockerfile").read_text(encoding="utf-8")
     assert "FROM airflow-base AS airflow-scheduler-payload" in dockerfile
     assert "FROM airflow-base AS airflow-whoscored-proxy-payload" in dockerfile
-    assert (
-        "FROM airflow-scheduler-payload AS airflow-scheduler-test" in dockerfile
-    )
+    assert "FROM airflow-scheduler-payload AS airflow-scheduler-test" in dockerfile
     assert "FROM airflow-scheduler-payload AS airflow-scheduler" in dockerfile
     assert (
-        "FROM airflow-whoscored-proxy-payload AS airflow-whoscored-proxy"
-        in dockerfile
+        "FROM airflow-whoscored-proxy-payload AS airflow-whoscored-proxy" in dockerfile
     )
-    assert dockerfile.count(
-        'ENTRYPOINT ["/usr/bin/dumb-init", "--", '
-        '"/usr/local/bin/whoscored-production-entrypoint", "/entrypoint"]'
-    ) == 2
-    assert dockerfile.count("USER 50000:0") == 2
-    assert dockerfile.count(
-        "mv /usr/local/bin/python3.11 /usr/local/libexec/whoscored-python-real"
-    ) == 2
-    assert dockerfile.count(
-        "/usr/local/bin/whoscored-production-python /usr/local/bin/python3.11"
-    ) == 2
     assert (
-        "cp --dereference /opt/legacy-scraper-venv/bin/python3.11" in dockerfile
+        dockerfile.count(
+            'ENTRYPOINT ["/usr/bin/dumb-init", "--", '
+            '"/usr/local/bin/whoscored-production-entrypoint", "/entrypoint"]'
+        )
+        == 2
     )
+    assert dockerfile.count("USER 50000:0") == 2
+    assert (
+        dockerfile.count(
+            "mv /usr/local/bin/python3.11 /usr/local/libexec/whoscored-python-real"
+        )
+        == 2
+    )
+    assert (
+        dockerfile.count(
+            "/usr/local/bin/whoscored-production-python /usr/local/bin/python3.11"
+        )
+        == 2
+    )
+    assert "cp --dereference /opt/legacy-scraper-venv/bin/python3.11" in dockerfile
 
 
 def test_opt_in_overlay_defines_supervised_components() -> None:
@@ -410,9 +412,7 @@ def test_fresh_checkout_prepares_writable_logs_before_airflow_and_proxies() -> N
     assert {"CHOWN", "DAC_OVERRIDE", "FOWNER"} == set(initializer["cap_add"])
     assert "chown -R --no-dereference 50000:0 /opt/airflow/logs" in command
     assert "chmod 0770 /opt/airflow/logs" in command
-    assert (
-        "chown -R --no-dereference 50000:0 /home/airflow/soccerdata" in command
-    )
+    assert "chown -R --no-dereference 50000:0 /home/airflow/soccerdata" in command
     assert "chmod -R u+rwX,g+rwX,o-rwx /home/airflow/soccerdata" in command
     for name in ("airflow-init", "proxy_filter"):
         assert services[name]["depends_on"]["airflow-log-init"]["condition"] == (
@@ -522,7 +522,11 @@ def test_paid_approval_and_pointer_roots_are_scheduler_read_only() -> None:
     assert environment["WHOSCORED_PAID_BATCH_ENABLED"] == (
         "${WHOSCORED_PAID_BATCH_ENABLED:-0}"
     )
-    for target in ("/opt/airflow/dags", "/opt/airflow/scrapers", "/opt/airflow/scripts"):
+    for target in (
+        "/opt/airflow/dags",
+        "/opt/airflow/scrapers",
+        "/opt/airflow/scripts",
+    ):
         code_mount = _volume_for_target(scheduler, target)
         assert isinstance(code_mount, dict)
         assert code_mount["read_only"] is True
@@ -536,8 +540,7 @@ def test_paid_approval_and_pointer_roots_are_scheduler_read_only() -> None:
 
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
     assert (
-        "WHOSCORED_PROXY_APPROVAL_HOST_DIR="
-        "/root/whoscored-954-runtime/proxy-approvals"
+        "WHOSCORED_PROXY_APPROVAL_HOST_DIR=/root/whoscored-954-runtime/proxy-approvals"
     ) in example
     assert "WHOSCORED_PROXY_APPROVAL_PATH=" not in example
     assert (
@@ -564,9 +567,7 @@ def test_proxy_control_plane_is_lease_only_and_secrets_are_not_hardcoded() -> No
     assert services["proxy_filter"]["environment"]["TM_PROXY_CONTROL_TOKEN"] == (
         transfermarkt_token
     )
-    assert compose["x-airflow-common"]["environment"][
-        "TM_PROXY_CONTROL_TOKEN"
-    ] == (
+    assert compose["x-airflow-common"]["environment"]["TM_PROXY_CONTROL_TOKEN"] == (
         transfermarkt_token
     )
     assert (
@@ -643,12 +644,11 @@ def test_whoscored_paid_proxy_has_an_isolated_l7_application_boundary() -> None:
     assert gateway["environment"]["WHOSCORED_PAID_ALERT_HMAC_SECRET"] == (
         "${WHOSCORED_PAID_ALERT_HMAC_SECRET:-}"
     )
-    assert paid_browser["environment"][
-        "WHOSCORED_FLARESOLVERR_PAID_EXCLUSIVE"
-    ] == "1"
-    assert paid_browser["environment"][
-        "WHOSCORED_FLARESOLVERR_GATEWAY_SECRET"
-    ] == "${WHOSCORED_FLARESOLVERR_GATEWAY_SECRET:-}"
+    assert paid_browser["environment"]["WHOSCORED_FLARESOLVERR_PAID_EXCLUSIVE"] == "1"
+    assert (
+        paid_browser["environment"]["WHOSCORED_FLARESOLVERR_GATEWAY_SECRET"]
+        == "${WHOSCORED_FLARESOLVERR_GATEWAY_SECRET:-}"
+    )
     assert "ports" not in paid_browser
     assert "volumes" not in paid_browser
     assert paid_browser["networks"] == ["whoscored-paid-browser"]
@@ -685,8 +685,7 @@ def test_whoscored_paid_proxy_has_an_isolated_l7_application_boundary() -> None:
     ]
     command = dedicated["command"]
     assert command[command.index("--whoscored-state-marker") + 1] == (
-        "/opt/airflow/state/whoscored-proxy-filter/"
-        ".whoscored_state_initialized.json"
+        "/opt/airflow/state/whoscored-proxy-filter/.whoscored_state_initialized.json"
     )
     assert command[command.index("--daily-budget-bytes") + 1] == (
         "${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES:?set exact provider-policy daily cap in decimal bytes}"
@@ -809,12 +808,8 @@ def test_ready_promotion_uses_the_ci_pinned_buildkit_builder() -> None:
     promotion = runbook.split("#### Future ready-v1 promotion", 1)[1].split(
         "Deploy that exact reviewed promotion SHA", 1
     )[0]
-    pinned = re.search(
-        r"image=(moby/buildkit:v0\.31\.2@sha256:[0-9a-f]{64})", workflow
-    )
-    pinned_registry = re.search(
-        r"(registry:2\.8\.3@sha256:[0-9a-f]{64})", workflow
-    )
+    pinned = re.search(r"image=(moby/buildkit:v0\.31\.2@sha256:[0-9a-f]{64})", workflow)
+    pinned_registry = re.search(r"(registry:2\.8\.3@sha256:[0-9a-f]{64})", workflow)
     payload_builds = promotion.split("AIRFLOW_BASE_STAGING_TAG=", 1)[1].split(
         "AIRFLOW_BASE_ID=", 1
     )[0]
@@ -850,9 +845,9 @@ def test_ready_promotion_uses_the_ci_pinned_buildkit_builder() -> None:
         assert f'--tag "${group}_STAGING_TAG"' in payload_builds
         assert f'--tag "${group}_TAG"' not in payload_builds
     assert '"${DOCKER_CMD[@]}" image push' not in promotion
-    assert promotion.count('skopeo copy --all --preserve-digests') == 4
+    assert promotion.count("skopeo copy --all --preserve-digests") == 4
     assert promotion.index('test "$("${CLEAN_GIT[@]}" rev-parse HEAD^)"') < (
-        promotion.index('skopeo copy --all --preserve-digests')
+        promotion.index("skopeo copy --all --preserve-digests")
     )
 
 
@@ -882,3 +877,50 @@ def test_targeted_rollout_creates_and_starts_only_one_admitted_service() -> None
 
     assert '"${COMPOSE[@]}" create' not in rollout
     assert '"${COMPOSE[@]}" start' not in rollout
+
+
+def test_transfermarkt_backfill_proxy_contract_is_isolated_and_fail_closed() -> None:
+    compose = _compose()
+    proxy = compose["services"]["proxy_filter"]
+    common = compose["x-airflow-common"]["environment"]
+    init_command = compose["services"]["airflow-init"]["command"][1]
+    scheduler_command = compose["services"]["airflow-scheduler"]["command"][2]
+    command = proxy["command"]
+
+    assert common["TM_BACKFILL_PROXY_CONTROL_URL"] == (
+        "${TM_BACKFILL_PROXY_CONTROL_URL:-http://proxy_filter:8899}"
+    )
+    assert common["TM_BACKFILL_PROXY_CONTROL_TOKEN"] == (
+        "${TM_BACKFILL_PROXY_CONTROL_TOKEN:-}"
+    )
+    assert proxy["environment"]["TM_BACKFILL_PROXY_CONTROL_TOKEN"] == (
+        "${TM_BACKFILL_PROXY_CONTROL_TOKEN:-}"
+    )
+    assert proxy["environment"]["TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON"] == (
+        "${TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON:-}"
+    )
+    cap_index = command.index("--transfermarkt-backfill-dagrun-budget-bytes")
+    assert command[cap_index + 1] == (
+        "${PROXY_FILTER_TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES:-0}"
+    )
+    state_index = command.index("--transfermarkt-permit-state")
+    assert command[state_index + 1] == (
+        "${PROXY_FILTER_TRANSFERMARKT_PERMIT_STATE_PATH:-"
+        "/opt/airflow/logs/proxy_filter/transfermarkt_request_permits.json}"
+    )
+    assert init_command.count("airflow pools set 'transfermarkt_proxy' 1") == 1
+    assert init_command.count("airflow pools set 'transfermarkt_backfill_proxy' 1") == 1
+    assert init_command.count("airflow pools set 'transfermarkt_backfill_control' 1") == 1
+    assert scheduler_command.count(
+        "airflow pools set 'transfermarkt_backfill_proxy' 1"
+    ) == 1
+    assert scheduler_command.count(
+        "airflow pools set 'transfermarkt_backfill_control' 1"
+    ) == 1
+    assert scheduler_command.rstrip().endswith("exec airflow scheduler")
+
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "PROXY_FILTER_TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES=0" in example
+    assert "PROXY_FILTER_TRANSFERMARKT_PERMIT_STATE_PATH=" in example
+    assert "TRANSFERMARKT_BACKFILL_PROXY_POOL_JSON=" in example
+    assert "TM_BACKFILL_PROXY_CONTROL_TOKEN=" in example

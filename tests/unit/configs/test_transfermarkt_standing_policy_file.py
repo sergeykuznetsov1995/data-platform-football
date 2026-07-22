@@ -20,6 +20,10 @@ POLICY_PATH = (
     Path(__file__).resolve().parents[3]
     / 'dags' / 'configs' / 'transfermarkt' / 'standing_approval_policy.json'
 )
+BACKFILL_POLICY_PATH = (
+    Path(__file__).resolve().parents[3]
+    / 'dags' / 'configs' / 'transfermarkt' / 'standing_backfill_policy.json'
+)
 
 
 def test_committed_policy_parses_into_a_standing_policy():
@@ -73,3 +77,18 @@ def test_committed_policy_validity_window_is_well_formed():
 
     policy = load_standing_policy(POLICY_PATH)
     assert policy.expires_at > policy.approved_at
+
+
+def test_backfill_policy_is_native_only_and_matches_the_same_scope_caps():
+    policy = load_standing_policy(BACKFILL_POLICY_PATH)
+
+    assert policy.dag_id == 'dag_backfill_transfermarkt'
+    assert policy.paid_proxy.byte_cap_bytes == HARD_BYTE_CAP
+    assert policy.paid_proxy.request_limit == 1_610
+    assert policy.paid_proxy.retry_limit == 800
+    assert required_write_tables('native-only') <= set(
+        policy.allowed_write_tables
+    )
+    assert not (
+        required_write_tables('dual') - required_write_tables('native-only')
+    ) & set(policy.allowed_write_tables)

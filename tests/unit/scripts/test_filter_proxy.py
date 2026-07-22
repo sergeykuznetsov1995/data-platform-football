@@ -28,6 +28,9 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from scrapers.transfermarkt.client import (
+    TRANSFERMARKT_REQUEST_PERMIT_MAX_WAIT_SECONDS,
+)
 from scrapers.sofascore.workload_plan import (
     WorkloadAllocation,
     _signed_plan,
@@ -69,12 +72,8 @@ _BLOCKLIST_PATH = REPO_ROOT / "configs" / "proxy_filter" / "blocklist.txt"
 _COMPOSE_PATH = REPO_ROOT / "compose.yaml"
 # #951 (инцидент 2026-07-17): выделенный SofaScore-шлюз вынесен в СВОЙ
 # compose-проект, чтобы чужой `docker compose up` его не пересоздавал.
-_SOFASCORE_GATEWAY_COMPOSE_PATH = (
-    REPO_ROOT / "deploy/sofascore/gateway.compose.yaml"
-)
-_FBREF_ACCEPTANCE_COMPOSE_PATH = (
-    REPO_ROOT / "deploy/fbref/acceptance.compose.yaml"
-)
+_SOFASCORE_GATEWAY_COMPOSE_PATH = REPO_ROOT / "deploy/sofascore/gateway.compose.yaml"
+_FBREF_ACCEPTANCE_COMPOSE_PATH = REPO_ROOT / "deploy/fbref/acceptance.compose.yaml"
 _ENV_EXAMPLE_PATH = REPO_ROOT / ".env.example"
 _SCHEDULER_DOCKERFILE_PATH = (
     # master consolidated the scheduler runtime overlay into the single
@@ -85,9 +84,7 @@ _SCHEDULER_DOCKERFILE_PATH = (
 _ACCEPTANCE_DOCKERFILE_PATH = (
     REPO_ROOT / "docker/images/airflow/Dockerfile.fbref-acceptance"
 )
-_ACCEPTANCE_BUILD_SCRIPT_PATH = (
-    REPO_ROOT / "scripts/build_fbref_acceptance_image.sh"
-)
+_ACCEPTANCE_BUILD_SCRIPT_PATH = REPO_ROOT / "scripts/build_fbref_acceptance_image.sh"
 
 
 def _load_module():
@@ -104,6 +101,7 @@ def mod(tmp_path):
     loaded.LEDGER_PATH = str(tmp_path / "paid_requests.jsonl")
     loaded.CONTROL_TOKEN = "c" * 32
     loaded.TRANSFERMARKT_CONTROL_TOKEN = "t" * 32
+    loaded.TRANSFERMARKT_BACKFILL_CONTROL_TOKEN = "b" * 32
     loaded.WHOSCORED_PROXY_APPROVAL_HMAC_SECRET = "c" * 32
     loaded.WHOSCORED_PROXY_LEDGER_HMAC_SECRET = "c" * 32
     loaded.SOFASCORE_BUDGET_ARTIFACT_ID = "a" * 64
@@ -756,6 +754,42 @@ def test_whoscored_application_gateway_guard_is_independent_of_invoice_guard(mod
 
     assert mod.LEASES == {}
     assert mgr.calls == 0
+
+
+def test_auth_check_accepts_dedicated_transfermarkt_backfill_token(mod):
+    mod.CONTROL_TOKEN = "c" * 32
+    mod.TRANSFERMARKT_CONTROL_TOKEN = "p" * 32
+    mod.TRANSFERMARKT_BACKFILL_CONTROL_TOKEN = "b" * 32
+
+    class Reader:
+        async def readexactly(self, _length):
+            raise AssertionError("auth check must not read a request body")
+
+    class Writer:
+        def __init__(self):
+            self.payload = bytearray()
+
+        def write(self, value):
+            self.payload.extend(value)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            return None
+
+    writer = Writer()
+    handled = asyncio.run(mod._handle_control(
+        "GET",
+        "/v1/auth-check",
+        {"x-proxy-control-token": mod.TRANSFERMARKT_BACKFILL_CONTROL_TOKEN},
+        Reader(),
+        writer,
+        SimpleNamespace(total_count=1),
+    ))
+
+    assert handled is True
+    assert b"200 OK" in bytes(writer.payload).split(b"\r\n\r\n", 1)[0]
     assert not Path(mod.WHOSCORED_CAMPAIGN_LEDGER_PATH).exists()
 
 
@@ -1904,11 +1938,10 @@ def test_fbref_has_an_isolated_metered_proxy_service():
         "\n  proxy_filter:\n", 1
     )[0]
 
-    assert "PROXY_POOL_JSON: \"\"" in service
-    assert "PROXY_FILTER_ALLOW_FILE_FALLBACK: \"true\"" in service
+    assert 'PROXY_POOL_JSON: ""' in service
+    assert 'PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"' in service
     assert (
-        "${FBREF_PROXY_POOL_FILE:-./proxys.txt}:"
-        "/opt/airflow/proxys.txt:ro"
+        "${FBREF_PROXY_POOL_FILE:-./proxys.txt}:/opt/airflow/proxys.txt:ro"
     ) in service
     assert "PROXY_FILTER_CONTROL_TOKEN: ${FBREF_PROXY_CONTROL_TOKEN:-}" in service
     assert "SOFASCORE_PROXY_CONTROL_TOKEN" not in service
@@ -1932,9 +1965,7 @@ def test_fbref_control_secret_is_explicit_in_airflow_and_example_env():
 
     example = _ENV_EXAMPLE_PATH.read_text()
     assert "\nFBREF_PROXY_CONTROL_TOKEN=\n" in example
-    assert (
-        "FBREF_PROXY_POOL_FILE=/root/fbref-949-runtime/proxys.txt" in example
-    )
+    assert "FBREF_PROXY_POOL_FILE=/root/fbref-949-runtime/proxys.txt" in example
 
 
 def test_fbref_acceptance_compose_is_a_separate_project_scoped_stack():
@@ -1950,29 +1981,15 @@ def test_fbref_acceptance_compose_is_a_separate_project_scoped_stack():
     assert "container_name:" not in acceptance
     assert "ports:" not in acceptance
     assert "build:" not in acceptance
-    assert acceptance.count(
-        "image: ${FBREF_ACCEPTANCE_AIRFLOW_IMAGE:?"
-    ) == 2
-    assert acceptance.count(
-        "/opt/airflow/scripts/fbref_acceptance_entrypoint.sh"
-    ) == 2
+    assert acceptance.count("image: ${FBREF_ACCEPTANCE_AIRFLOW_IMAGE:?") == 2
+    assert acceptance.count("/opt/airflow/scripts/fbref_acceptance_entrypoint.sh") == 2
     assert acceptance.count("user: ${AIRFLOW_UID:-50000}:0") == 2
     assert "FBREF_EXPECTED_GIT_SHA: ${FBREF_ACCEPTANCE_GIT_SHA:?" in proxy
-    assert (
-        "FBREF_EXPECTED_IMAGE_DIGEST: ${FBREF_ACCEPTANCE_AIRFLOW_IMAGE:?"
-        in proxy
-    )
+    assert "FBREF_EXPECTED_IMAGE_DIGEST: ${FBREF_ACCEPTANCE_AIRFLOW_IMAGE:?" in proxy
     assert "FBREF_IMAGE_DIGEST: ${FBREF_ACCEPTANCE_AIRFLOW_IMAGE:?" in runner
-    assert (
-        "FBREF_ACCEPTANCE_OUTPUT_ROOT: /opt/airflow/logs/fbref_acceptance"
-        in runner
-    )
-    assert acceptance.count(
-        ":/opt/airflow/logs/fbref_acceptance"
-    ) == 2
-    assert (
-        "PROXY_FILTER_CONTROL_TOKEN: ${FBREF_PROXY_CONTROL_TOKEN:?" in proxy
-    )
+    assert "FBREF_ACCEPTANCE_OUTPUT_ROOT: /opt/airflow/logs/fbref_acceptance" in runner
+    assert acceptance.count(":/opt/airflow/logs/fbref_acceptance") == 2
+    assert "PROXY_FILTER_CONTROL_TOKEN: ${FBREF_PROXY_CONTROL_TOKEN:?" in proxy
     assert "SOFASCORE_PROXY_CONTROL_TOKEN" not in acceptance
     assert "${FBREF_PROXY_POOL_FILE:?" in proxy
     assert ":/run/secrets/fbref-proxys.txt:ro" in proxy
@@ -2002,25 +2019,20 @@ def test_fbref_acceptance_image_is_built_from_one_exact_git_archive():
     assert "filter_proxy.py --help" in dockerfile
     assert "org.opencontainers.image.revision" in dockerfile
     assert "COPY dags" not in dockerfile
-    assert "git -C \"$repo_root\" archive --format=tar \"$git_sha\"" in builder
+    assert 'git -C "$repo_root" archive --format=tar "$git_sha"' in builder
     assert "dags scrapers scripts configs" in builder
-    assert "${git_sha}:docker/images/airflow/Dockerfile.fbref-acceptance" in (
-        builder
-    )
+    assert "${git_sha}:docker/images/airflow/Dockerfile.fbref-acceptance" in (builder)
     assert "runtime_base_id=" in builder
     assert "local/fbref-acceptance-base:" in builder
-    assert "docker image tag \"$runtime_base_id\" \"$base_build_ref\"" in builder
-    assert "docker image rm \"$base_build_ref\"" in builder
+    assert 'docker image tag "$runtime_base_id" "$base_build_ref"' in builder
+    assert 'docker image rm "$base_build_ref"' in builder
     assert "docker image inspect" in builder
     assert "FBREF_ACCEPTANCE_AIRFLOW_IMAGE=%s" in builder
 
 
 def test_fbref_scheduler_image_requires_the_pinned_fontconfig():
     dockerfile = _SCHEDULER_DOCKERFILE_PATH.read_text()
-    assert (
-        "test -r /opt/fbref-camoufox/fontconfig/windows/fonts.conf"
-        in dockerfile
-    )
+    assert "test -r /opt/fbref-camoufox/fontconfig/windows/fonts.conf" in dockerfile
 
 
 def test_fbref_lease_is_scoped_metered_and_host_restricted(mod):
@@ -2736,6 +2748,453 @@ def test_transfermarkt_dagruns_require_an_explicit_separate_cap(mod, dag_id):
     assert mod._dagrun_budget_bytes(dag_id) == 15_728_640
     assert lease.max_bytes == 15_728_640
     assert lease.report()["dagrun_budget_bytes"] == 15_728_640
+
+
+def test_transfermarkt_backfill_is_closed_separate_source_and_budget_namespace(mod):
+    production_mgr = _FakeManager(["http://u:p@production.invalid:10000"])
+    backfill_mgr = _FakeManager(["http://u:p@backfill.invalid:10000"])
+    metadata = {
+        "dag_id": "dag_backfill_transfermarkt",
+        "run_id": "scheduled__history",
+        "task_id": "capture_scope",
+        "canonical_url": "https://www.transfermarkt.com/history",
+    }
+    mod.URL_BUDGET_BYTES = 24 * 1024 * 1024
+
+    assert mod._source_for_dag("dag_backfill_transfermarkt") == (
+        "transfermarkt_backfill"
+    )
+    assert mod._source_for_dag("dag_backfill_transfermarkt_typo") == ""
+    with pytest.raises(RuntimeError, match="dedicated upstream pool"):
+        mod._create_lease(
+            production_mgr,
+            max_bytes=1000,
+            ttl_seconds=30,
+            metadata=metadata,
+            require_context=True,
+        )
+    assert production_mgr.calls == 0
+
+    mod.TRANSFERMARKT_BACKFILL_PROXY_MANAGER = backfill_mgr
+    with pytest.raises(RuntimeError, match="backfill authorization"):
+        mod._create_lease(
+            production_mgr,
+            max_bytes=1000,
+            ttl_seconds=30,
+            metadata=metadata,
+            require_context=True,
+        )
+    mod.TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES = 10_000
+    lease = mod._create_lease(
+        production_mgr,
+        max_bytes=1000,
+        ttl_seconds=30,
+        metadata=metadata,
+        require_context=True,
+    )
+
+    assert production_mgr.calls == 0
+    assert backfill_mgr.calls == 1
+    assert lease.source == "transfermarkt_backfill"
+    assert lease.report()["traffic_class"] == "transfermarkt_backfill"
+    assert lease.report()["budget_namespace"] == ("transfermarkt_backfill_dagrun")
+
+
+def test_transfermarkt_backfill_neither_spends_day_cap_nor_blocks_production(mod):
+    production_mgr = _FakeManager(["http://u:p@production.invalid:10000"])
+    backfill_mgr = _FakeManager(["http://u:p@backfill.invalid:10000"])
+    mod.TRANSFERMARKT_BACKFILL_PROXY_MANAGER = backfill_mgr
+    mod.TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES = 10_000
+    mod.TRANSFERMARKT_DAGRUN_BUDGET_BYTES = 10_000
+    mod.URL_BUDGET_BYTES = 10_000
+    mod.MAX_ACTIVE_LEASES = 1
+    mod.DAILY_BUDGET_BYTES = 1000
+    mod._daily_day = mod._utc_day()
+    mod._daily_up_bytes = 400
+    mod._daily_down_bytes = 500
+
+    backfill = mod._create_lease(
+        production_mgr,
+        max_bytes=1000,
+        ttl_seconds=30,
+        metadata={
+            "dag_id": "dag_backfill_transfermarkt",
+            "run_id": "scheduled__history",
+            "task_id": "capture_scope",
+            "canonical_url": "https://www.transfermarkt.com/history",
+        },
+        require_context=True,
+    )
+    mod._account_lease_bytes(backfill, "www.transfermarkt.com", "down", 700)
+    assert mod._daily_total_bytes() == 900
+
+    # MAX_ACTIVE_LEASES=1 applies only to production namespaces.  An active
+    # dedicated backfill lease therefore cannot consume production's slot.
+    production = mod._create_lease(
+        production_mgr,
+        max_bytes=100,
+        ttl_seconds=30,
+        metadata={
+            "dag_id": "dag_ingest_transfermarkt",
+            "run_id": "scheduled__daily",
+            "task_id": "capture_scope",
+            "canonical_url": "https://www.transfermarkt.com/current",
+        },
+        require_context=True,
+    )
+    assert production.source == "transfermarkt"
+
+
+def test_transfermarkt_backfill_ledger_restores_run_but_not_production_day(mod):
+    production_mgr = _FakeManager(["http://u:p@production.invalid:10000"])
+    mod.TRANSFERMARKT_BACKFILL_PROXY_MANAGER = _FakeManager(
+        ["http://u:p@backfill.invalid:10000"]
+    )
+    mod.TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES = 10_000
+    mod.URL_BUDGET_BYTES = 10_000
+    lease = mod._create_lease(
+        production_mgr,
+        max_bytes=1000,
+        ttl_seconds=30,
+        metadata={
+            "dag_id": "dag_backfill_transfermarkt",
+            "run_id": "scheduled__history",
+            "task_id": "capture_scope",
+            "canonical_url": "https://www.transfermarkt.com/history",
+        },
+        require_context=True,
+    )
+    mod._account_lease_bytes(lease, "www.transfermarkt.com", "down", 700)
+    mod._run_down_bytes.clear()
+    mod._url_down_bytes.clear()
+    mod._daily_day = ""
+    mod._daily_up_bytes = mod._daily_down_bytes = 0
+
+    assert mod._restore_budget_ledger(mod.LEDGER_PATH, restore_daily=True) == 1
+    assert mod._run_total_bytes("dag_backfill_transfermarkt/scheduled__history") == 700
+    assert mod._daily_total_bytes() == 0
+
+
+def test_transfermarkt_request_permits_are_no_burst_and_production_first(mod):
+    tokens = iter(["a" * 32, "b" * 32, "c" * 32])
+    controller = mod.TransfermarktRequestPermitController(
+        requests_per_minute=12,
+        token_factory=lambda: next(tokens),
+    )
+
+    first = controller.request(
+        traffic_class="transfermarkt_backfill",
+        dag_id="dag_backfill_transfermarkt",
+        run_id="history",
+        request_id="backfill-1",
+        now=0.0,
+    )
+    waiting_backfill = controller.request(
+        traffic_class="transfermarkt_backfill",
+        dag_id="dag_backfill_transfermarkt",
+        run_id="history",
+        request_id="backfill-2",
+        now=1.0,
+    )
+    waiting_production = controller.request(
+        traffic_class="transfermarkt",
+        dag_id="dag_ingest_transfermarkt",
+        run_id="daily",
+        request_id="production-1",
+        now=2.0,
+    )
+    assert first.granted is True
+    assert waiting_backfill.granted is False
+    assert waiting_production.granted is False
+
+    # Polling the older backfill ticket at the next slot grants the queued
+    # production ticket first; backfill reserves no future slot.
+    still_waiting = controller.request(
+        traffic_class="transfermarkt_backfill",
+        dag_id="dag_backfill_transfermarkt",
+        run_id="history",
+        request_id="backfill-2",
+        now=5.0,
+    )
+    production = controller.request(
+        traffic_class="transfermarkt",
+        dag_id="dag_ingest_transfermarkt",
+        run_id="daily",
+        request_id="production-1",
+        now=5.0,
+    )
+    backfill = controller.request(
+        traffic_class="transfermarkt_backfill",
+        dag_id="dag_backfill_transfermarkt",
+        run_id="history",
+        request_id="backfill-2",
+        now=10.0,
+    )
+
+    assert still_waiting.granted is False
+    assert production.granted is True
+    assert production.granted_at == 5.0
+    assert backfill.granted is True
+    assert backfill.granted_at == 10.0
+    assert controller.interval_seconds == 5.0
+
+
+def test_transfermarkt_request_permit_is_bound_and_consumed_exactly_once(mod):
+    controller = mod.TransfermarktRequestPermitController(
+        requests_per_minute=12,
+        token_factory=lambda: "permit-secret-" + "x" * 32,
+    )
+    binding = {
+        "traffic_class": "transfermarkt_backfill",
+        "dag_id": "dag_backfill_transfermarkt",
+        "run_id": "history-run",
+        "request_id": "scope-1-attempt-1",
+    }
+    permit = controller.request(**binding, now=100.0)
+    assert permit.granted is True
+    assert permit.permit_token is not None
+
+    with pytest.raises(mod.TransfermarktPermitError, match="binding"):
+        controller.consume(
+            **{**binding, "run_id": "another-run"},
+            permit_id=permit.permit_id,
+            permit_token=permit.permit_token,
+            now=101.0,
+        )
+    with pytest.raises(mod.TransfermarktPermitError, match="binding"):
+        controller.consume(
+            **binding,
+            permit_id=permit.permit_id,
+            permit_token="wrong-" + "z" * 32,
+            now=101.0,
+        )
+
+    assert (
+        controller.consume(
+            **binding,
+            permit_id=permit.permit_id,
+            permit_token=permit.permit_token,
+            now=101.0,
+        )
+        == 101.0
+    )
+    with pytest.raises(mod.TransfermarktPermitConsumed):
+        controller.consume(
+            **binding,
+            permit_id=permit.permit_id,
+            permit_token=permit.permit_token,
+            now=102.0,
+        )
+    with pytest.raises(mod.TransfermarktPermitConsumed):
+        controller.request(**binding, now=102.0)
+
+
+def test_transfermarkt_request_permit_pending_and_granted_ttls_are_bounded(mod):
+    tokens = iter(["a" * 32, "b" * 32, "c" * 32])
+    controller = mod.TransfermarktRequestPermitController(
+        requests_per_minute=12,
+        token_factory=lambda: next(tokens),
+    )
+    controller.request(
+        traffic_class="transfermarkt",
+        dag_id="dag_ingest_transfermarkt",
+        run_id="daily",
+        request_id="production",
+        now=0.0,
+    )
+    pending = controller.request(
+        traffic_class="transfermarkt_backfill",
+        dag_id="dag_backfill_transfermarkt",
+        run_id="history",
+        request_id="pending",
+        now=1.0,
+    )
+    replacement = controller.request(
+        traffic_class="transfermarkt_backfill",
+        dag_id="dag_backfill_transfermarkt",
+        run_id="history",
+        request_id="pending",
+        now=91.0,
+    )
+    assert pending.granted is False
+    assert replacement.granted is True
+    assert replacement.permit_id != pending.permit_id
+
+    with pytest.raises(mod.TransfermarktPermitExpired):
+        controller.consume(
+            traffic_class="transfermarkt_backfill",
+            dag_id="dag_backfill_transfermarkt",
+            run_id="history",
+            request_id="pending",
+            permit_id=replacement.permit_id,
+            permit_token=replacement.permit_token,
+            now=121.0,
+        )
+
+
+@pytest.mark.parametrize("jitter_poll_at", [60.0, 66.0])
+def test_daily_priority_cannot_expire_a_waiting_backfill_permit(
+    mod,
+    jitter_poll_at,
+):
+    controller = mod.TransfermarktRequestPermitController(
+        requests_per_minute=12,
+        token_factory=lambda: "z" * 32,
+    )
+    assert (
+        controller.BACKFILL_MAX_QUEUE_SECONDS
+        < TRANSFERMARKT_REQUEST_PERMIT_MAX_WAIT_SECONDS
+        < controller.PENDING_TTL_SECONDS
+    )
+    assert controller.BACKFILL_MAX_QUEUE_SECONDS == 55
+    assert TRANSFERMARKT_REQUEST_PERMIT_MAX_WAIT_SECONDS == 65.0
+    assert controller.PENDING_TTL_SECONDS == 90
+    controller.request(
+        traffic_class="transfermarkt",
+        dag_id="dag_ingest_transfermarkt",
+        run_id="daily",
+        request_id="production-0",
+        now=0.0,
+    )
+    pending = controller.request(
+        traffic_class="transfermarkt_backfill",
+        dag_id="dag_backfill_transfermarkt",
+        run_id="history",
+        request_id="history-1",
+        now=1.0,
+    )
+    assert pending.granted is False
+
+    for timestamp in range(5, 55, 5):
+        granted = controller.request(
+            traffic_class="transfermarkt",
+            dag_id="dag_ingest_transfermarkt",
+            run_id="daily",
+            request_id=f"production-{timestamp}",
+            now=float(timestamp),
+        )
+        assert granted.granted is True
+
+    production = controller.request(
+        traffic_class="transfermarkt",
+        dag_id="dag_ingest_transfermarkt",
+        run_id="daily",
+        request_id=f"production-{jitter_poll_at:g}",
+        now=jitter_poll_at,
+    )
+    backfill = controller.request(
+        traffic_class="transfermarkt_backfill",
+        dag_id="dag_backfill_transfermarkt",
+        run_id="history",
+        request_id="history-1",
+        now=jitter_poll_at,
+    )
+    assert production.granted is False
+    assert backfill.granted is True
+
+
+def test_transfermarkt_request_limiter_restores_durable_last_grant(mod, tmp_path):
+    state = tmp_path / "transfermarkt-permits.json"
+    first = mod.TransfermarktRequestPermitController(
+        requests_per_minute=12,
+        token_factory=lambda: "a" * 32,
+        state_path=str(state),
+        clock=lambda: 95.0,
+    )
+    assert json.loads(state.read_text())["last_granted_at_epoch"] == 95.0
+    granted = first.request(
+        traffic_class="transfermarkt",
+        dag_id="dag_ingest_transfermarkt",
+        run_id="daily",
+        request_id="request-1",
+        now=100.0,
+    )
+    assert granted.granted is True
+    assert state.stat().st_mode & 0o777 == 0o600
+
+    restarted = mod.TransfermarktRequestPermitController(
+        requests_per_minute=12,
+        token_factory=lambda: "b" * 32,
+        state_path=str(state),
+    )
+    pending = restarted.request(
+        traffic_class="transfermarkt_backfill",
+        dag_id="dag_backfill_transfermarkt",
+        run_id="history",
+        request_id="request-2",
+        now=104.0,
+    )
+    resumed = restarted.request(
+        traffic_class="transfermarkt_backfill",
+        dag_id="dag_backfill_transfermarkt",
+        run_id="history",
+        request_id="request-2",
+        now=105.0,
+    )
+    assert pending.granted is False
+    assert pending.retry_after_seconds == 1.0
+    assert resumed.granted is True
+    assert json.loads(state.read_text()) == {
+        "schema_version": 1,
+        "last_granted_at_epoch": 105.0,
+    }
+
+
+def test_transfermarkt_request_limiter_rejects_corrupt_durable_state(mod, tmp_path):
+    state = tmp_path / "transfermarkt-permits.json"
+    state.write_text("{}")
+    state.chmod(0o600)
+    with pytest.raises(RuntimeError, match="corrupt"):
+        mod.TransfermarktRequestPermitController(state_path=str(state))
+
+
+def test_active_backfill_control_token_must_be_distinct_from_live_tokens(mod):
+    distinct = {
+        "shared_token": "s" * 32,
+        "production_token": "p" * 32,
+        "backfill_token": "b" * 32,
+        "production_cap_bytes": 1,
+        "backfill_cap_bytes": 1,
+    }
+    mod._validate_transfermarkt_control_token_separation(**distinct)
+
+    # Preserve the deployed production/shared credential during rollout.
+    mod._validate_transfermarkt_control_token_separation(
+        **{**distinct, "production_token": distinct["shared_token"]}
+    )
+    with pytest.raises(ValueError, match="must be distinct"):
+        mod._validate_transfermarkt_control_token_separation(
+            **{**distinct, "backfill_token": distinct["shared_token"]}
+        )
+    with pytest.raises(ValueError, match="must be distinct"):
+        mod._validate_transfermarkt_control_token_separation(
+            **{**distinct, "backfill_token": distinct["production_token"]}
+        )
+
+    # Disabled source credentials do not activate an otherwise irrelevant
+    # equality check.
+    mod._validate_transfermarkt_control_token_separation(
+        **{
+            **distinct,
+            "production_token": distinct["shared_token"],
+            "production_cap_bytes": 0,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "namespace"),
+    [
+        ("transfermarkt", "transfermarkt_production_utc_day"),
+        ("transfermarkt_backfill", "transfermarkt_backfill_dagrun"),
+        ("sofascore", "sofascore_signed_allocation"),
+        ("whoscored", "whoscored_campaign_provider_order"),
+        ("fbref", "fbref_service_utc_day"),
+        ("", "shared_proxy_utc_day"),
+    ],
+)
+def test_budget_namespace_describes_the_real_source_authority(mod, source, namespace):
+    assert mod._budget_namespace_for_source(source) == namespace
 
 
 def test_paid_lease_rejects_ttl_above_configured_hour(mod):
@@ -3800,6 +4259,159 @@ def test_common_control_token_cannot_impersonate_a_transfermarkt_dag(mod):
     assert json.loads(body)["error"] == "invalid control token"
     assert mod.LEASES == {}
     assert mgr.calls == 0
+
+
+def test_transfermarkt_backfill_request_permit_endpoint_is_source_authenticated(mod):
+    mod.TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES = 10_000
+    mod.TRANSFERMARKT_BACKFILL_PROXY_MANAGER = _FakeManager(
+        ["http://u:p@backfill.invalid:10000"]
+    )
+    mod.TRANSFERMARKT_REQUEST_PERMITS = mod.TransfermarktRequestPermitController(
+        requests_per_minute=12,
+        clock=lambda: 100.0,
+    )
+    acquire_payload = {
+        "dag_id": "dag_backfill_transfermarkt",
+        "run_id": "scheduled__history",
+        "request_id": "scope-1-attempt-1",
+    }
+
+    class Reader:
+        def __init__(self, body):
+            self.body = body
+
+        async def readexactly(self, length):
+            assert length == len(self.body)
+            return self.body
+
+    class Writer:
+        def __init__(self):
+            self.payload = bytearray()
+
+        def write(self, value):
+            self.payload.extend(value)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            return None
+
+    async def invoke(token, payload, path="/v1/transfermarkt/request-permits"):
+        request = json.dumps(payload).encode()
+        writer = Writer()
+        handled = await mod._handle_control(
+            "POST",
+            path,
+            {
+                "content-length": str(len(request)),
+                "x-proxy-control-token": token,
+            },
+            Reader(request),
+            writer,
+            object(),
+        )
+        return handled, bytes(writer.payload)
+
+    handled, rejected = asyncio.run(
+        invoke(mod.TRANSFERMARKT_CONTROL_TOKEN, acquire_payload)
+    )
+    assert handled is True
+    assert b"401 Unauthorized" in rejected
+
+    handled, accepted = asyncio.run(
+        invoke(mod.TRANSFERMARKT_BACKFILL_CONTROL_TOKEN, acquire_payload)
+    )
+    head, body = accepted.split(b"\r\n\r\n", 1)
+    assert handled is True
+    assert b"200 OK" in head
+    document = json.loads(body)
+    assert document["traffic_class"] == "transfermarkt_backfill"
+    assert document["granted"] is True
+    assert len(document["permit_id"]) == 64
+    assert len(document["permit_token"]) >= 32
+
+    consume_payload = {
+        **acquire_payload,
+        "permit_id": document["permit_id"],
+        "permit_token": document["permit_token"],
+    }
+    consume_path = "/v1/transfermarkt/request-permits/consume"
+    handled, consumed = asyncio.run(
+        invoke(
+            mod.TRANSFERMARKT_BACKFILL_CONTROL_TOKEN,
+            consume_payload,
+            consume_path,
+        )
+    )
+    assert handled is True
+    assert b"200 OK" in consumed
+    assert json.loads(consumed.split(b"\r\n\r\n", 1)[1])["consumed"] is True
+
+    _, reused = asyncio.run(
+        invoke(
+            mod.TRANSFERMARKT_BACKFILL_CONTROL_TOKEN,
+            consume_payload,
+            consume_path,
+        )
+    )
+    assert b"409 Conflict" in reused
+    assert b"request_permit_rejected" in reused
+
+    _, rebound = asyncio.run(
+        invoke(
+            mod.TRANSFERMARKT_BACKFILL_CONTROL_TOKEN,
+            {**consume_payload, "run_id": "different-run"},
+            consume_path,
+        )
+    )
+    assert b"409 Conflict" in rebound
+
+
+def test_transfermarkt_backfill_request_permit_is_fail_closed_without_pool(mod):
+    mod.TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES = 10_000
+    mod.TRANSFERMARKT_BACKFILL_PROXY_MANAGER = None
+    request = json.dumps(
+        {
+            "dag_id": "dag_backfill_transfermarkt",
+            "run_id": "scheduled__history",
+            "request_id": "scope-1-attempt-1",
+        }
+    ).encode()
+
+    class Reader:
+        async def readexactly(self, length):
+            return request
+
+    class Writer:
+        def __init__(self):
+            self.payload = bytearray()
+
+        def write(self, value):
+            self.payload.extend(value)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            return None
+
+    writer = Writer()
+    asyncio.run(
+        mod._handle_control(
+            "POST",
+            "/v1/transfermarkt/request-permits",
+            {
+                "content-length": str(len(request)),
+                "x-proxy-control-token": (mod.TRANSFERMARKT_BACKFILL_CONTROL_TOKEN),
+            },
+            Reader(),
+            writer,
+            object(),
+        )
+    )
+    assert b"503 Service Unavailable" in writer.payload
+    assert b"request_permit_unavailable" in writer.payload
 
 
 def test_fbref_auth_check_proves_meter_config_without_paid_lease(mod):
@@ -5973,6 +6585,77 @@ def test_lease_connect_failover_repins_immediate_eof_and_tunnels(mod, monkeypatc
     assert lease.active_tunnels == 0
     # M1: no failed attempt may leave its writer behind in tunnel_writers.
     assert lease.tunnel_writers == set()
+
+
+def test_transfermarkt_backfill_failover_never_draws_from_production_pool(
+    mod,
+    monkeypatch,
+):
+    production_mgr = _FakeManager([
+        "http://u:p@production.invalid:10000",
+        "http://u:p@production.invalid:10001",
+    ])
+    backfill_mgr = _FakeManager([
+        "http://u:p@backfill.invalid:20000",
+        "http://u:p@backfill.invalid:20001",
+    ])
+    mod.TRANSFERMARKT_BACKFILL_PROXY_MANAGER = backfill_mgr
+    mod.TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES = 10_000
+    mod.URL_BUDGET_BYTES = 10_000
+    lease = mod._create_lease(
+        production_mgr,
+        max_bytes=4096,
+        ttl_seconds=30,
+        metadata={
+            "dag_id": "dag_backfill_transfermarkt",
+            "run_id": "scheduled__history",
+            "task_id": "capture_scope",
+            "canonical_url": "https://www.transfermarkt.com/history",
+        },
+        require_context=True,
+    )
+    mod._begin_endpoint_request(lease, "players")
+    _shrink_failover_timeouts(mod, monkeypatch)
+
+    dead_writer = _FakeUpstreamWriter()
+    live_writer = _FakeUpstreamWriter()
+    live_head = b"HTTP/1.1 200 Connection established\r\n\r\n"
+    opens = []
+
+    async def fake_open(host, port):
+        opens.append((host, port))
+        if len(opens) == 1:
+            return _FakeUpstreamReader(b""), dead_writer
+        return _FakeUpstreamReader(live_head), live_writer
+
+    _patch_upstream_opener(mod, monkeypatch, fake_open)
+    client_writer = _ClientWriter()
+    asyncio.run(
+        asyncio.wait_for(
+            mod.handle(
+                _YieldingClientConnectReader(
+                    _connect_header_lines(
+                        lease,
+                        host="www.transfermarkt.com",
+                    )
+                ),
+                client_writer,
+                production_mgr,
+                require_lease=True,
+            ),
+            2.0,
+        )
+    )
+
+    assert b"200 Connection established" in bytes(client_writer.payload)
+    assert production_mgr.calls == 0
+    assert backfill_mgr.calls == 2
+    assert opens == [
+        ("backfill.invalid", 20000),
+        ("backfill.invalid", 20001),
+    ]
+    assert lease.upstream == ("backfill.invalid", 20001, "u", "p")
+    assert lease.upstream_repins == 1
 
 
 def test_reservation_waiter_wakes_when_peer_accounting_becomes_uncertain(mod):

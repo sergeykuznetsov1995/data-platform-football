@@ -72,6 +72,14 @@ def _canonical(path: Path, value: object) -> bytes:
     return raw
 
 
+def _scheduler_reconcile_command() -> str:
+    script = provenance.AIRFLOW_SCHEDULER_RECONCILE_COMMAND[2]
+    payload = "".join(
+        f"        {line}\n" for line in script.rstrip("\n").split("\n")
+    )
+    return "    command:\n      - bash\n      - -c\n      - |\n" + payload
+
+
 def _protected_command(service: str) -> str:
     if service == "airflow-scheduler":
         return "    command: scheduler\n"
@@ -113,6 +121,37 @@ def test_paid_boundary_protects_five_services_with_shared_payload_mappings():
     assert provenance.PROTECTED_STAGE_RECIPE_SHA256[
         "whoscored_paid_gateway"
     ] == provenance.PROTECTED_STAGE_RECIPE_SHA256["whoscored_proxy_filter"]
+
+
+def test_scheduler_literal_command_is_parsed_and_bound_exactly() -> None:
+    command = [
+        *_scheduler_reconcile_command().splitlines(),
+        "    image: example.invalid/scheduler:test",
+    ]
+
+    assert provenance._service_command(command) == (
+        provenance.AIRFLOW_SCHEDULER_RECONCILE_COMMAND
+    )
+    mutated = [
+        line.replace("exec airflow scheduler", "exec airflow webserver")
+        for line in command
+    ]
+    assert provenance._service_command(mutated) not in (
+        provenance.AIRFLOW_SCHEDULER_COMMANDS
+    )
+    with pytest.raises(
+        provenance.ProvenanceError,
+        match="unsupported Compose command list syntax",
+    ):
+        provenance._service_command([*command[:3], "      -", *command[3:]])
+    assert provenance._service_command(
+        [*command[:-1], "         ", command[-1]]
+    ) not in provenance.AIRFLOW_SCHEDULER_COMMANDS
+    with pytest.raises(
+        provenance.ProvenanceError,
+        match="ambiguous final chomping",
+    ):
+        provenance._service_command(command[:-1])
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -1584,6 +1623,31 @@ def test_protected_service_command_must_match_baked_gate_policy(
     with pytest.raises(provenance.ProvenanceError, match=message):
         provenance.discover_repository(
             root, payload_image_ids={service: f"sha256:{SHA_B}"}
+        )
+
+
+def test_scheduler_reconcile_script_body_must_match_policy(tmp_path: Path) -> None:
+    root, _, _, _ = _ready_repository(tmp_path)
+    command = _scheduler_reconcile_command().replace(
+        "exec airflow scheduler",
+        "exec airflow webserver",
+    )
+    _write(
+        root / "compose.yaml",
+        "services:\n"
+        "  airflow-scheduler:\n"
+        f"{command}"
+        "    image: example.invalid/protected@sha256:"
+        f"{SHA_A}\n",
+    )
+
+    with pytest.raises(
+        provenance.ProvenanceError,
+        match="scheduler Compose command differs from production policy",
+    ):
+        provenance.discover_repository(
+            root,
+            payload_image_ids={"airflow-scheduler": f"sha256:{SHA_B}"},
         )
 
 
