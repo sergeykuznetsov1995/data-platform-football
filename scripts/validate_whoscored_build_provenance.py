@@ -1175,6 +1175,58 @@ def _validate_compose_top_level(lines: Sequence[str], *, description: str) -> No
         raise ProvenanceError(f"{description} has no services mapping")
 
 
+def _yaml_anchor_definitions(line: str) -> list[str]:
+    """Return YAML anchor tokens outside quoted scalars and comments."""
+
+    anchors: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(line):
+        character = line[index]
+        if quote == '"':
+            if character == "\\":
+                index += 2
+                continue
+            if character == '"':
+                quote = None
+            index += 1
+            continue
+        if quote == "'":
+            if character == "'" and index + 1 < len(line) and line[index + 1] == "'":
+                index += 2
+                continue
+            if character == "'":
+                quote = None
+            index += 1
+            continue
+        if character in {'"', "'"}:
+            quote = character
+            index += 1
+            continue
+        if character == "#" and (index == 0 or line[index - 1].isspace()):
+            break
+        if character != "&" or (
+            index > 0
+            and not line[index - 1].isspace()
+            and line[index - 1] not in ":[{,-"
+        ):
+            index += 1
+            continue
+        match = re.match(r"&([A-Za-z0-9_.-]+)", line[index:])
+        if match is None:
+            index += 1
+            continue
+        end = index + len(match.group(0))
+        if end < len(line) and (
+            not line[end].isspace() and line[end] not in "#[]{} ,"
+        ):
+            index += 1
+            continue
+        anchors.append(match.group(1))
+        index = end
+    return anchors
+
+
 def _parse_compose_services(
     root: Path,
     discovery: Discovery,
@@ -1188,6 +1240,13 @@ def _parse_compose_services(
         raise ProvenanceError(f"{description} is unavailable") from exc
     discovery.material_paths.add(compose_path)
     _validate_compose_top_level(lines, description=description)
+
+    anchor_definitions: set[str] = set()
+    for line in lines:
+        for anchor in _yaml_anchor_definitions(line):
+            if anchor in anchor_definitions:
+                raise ProvenanceError(f"duplicate {description} anchor: {anchor}")
+            anchor_definitions.add(anchor)
 
     anchors: dict[str, dict[str, str | None]] = {}
     anchor_execution_overrides: set[str] = set()

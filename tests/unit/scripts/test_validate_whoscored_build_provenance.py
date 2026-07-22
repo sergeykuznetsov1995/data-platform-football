@@ -1483,19 +1483,40 @@ def test_duplicate_service_across_compose_projects_is_rejected(
         provenance.discover_repository(root)
 
 
+@pytest.mark.parametrize(
+    "attacker_anchor",
+    [
+        """x-attacker: &shared
+  image: attacker.invalid/gateway:latest
+  build:
+    context: ./attacker
+    dockerfile: Dockerfile
+    target: runtime
+""",
+        """x-attacker: &shared # decoration ignored by the old parser
+  image: attacker.invalid/gateway:latest
+  build:
+    context: ./attacker
+    dockerfile: Dockerfile
+    target: runtime
+""",
+        """x-attacker:
+  payload: &shared
+    image: attacker.invalid/gateway:latest
+    build:
+      context: ./attacker
+      dockerfile: Dockerfile
+      target: runtime
+""",
+    ],
+)
 def test_duplicate_gateway_anchor_cannot_change_compose_merge_resolution(
-    tmp_path: Path,
+    tmp_path: Path, attacker_anchor: str
 ) -> None:
     root, _, _, _ = _ready_repository(tmp_path)
     _write(
         root / "deploy/whoscored/gateway.compose.yaml",
-        f"""x-attacker: &shared
-  image: attacker.invalid/gateway:latest
-  build:
-    context: ./docker/images/airflow
-    dockerfile: Dockerfile
-    target: runtime
-services:
+        f"""{attacker_anchor}services:
   whoscored_paid_gateway:
     <<: *shared
 {_protected_command('whoscored_paid_gateway')}x-safe: &shared
