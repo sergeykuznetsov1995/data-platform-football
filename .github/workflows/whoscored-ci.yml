@@ -273,6 +273,8 @@ jobs:
           cleanup_scheduler_smoke
           trap - EXIT
           docker run --rm \
+            --network none \
+            --user 50000:0 \
             --cap-drop ALL \
             --security-opt no-new-privileges:true \
             --security-opt apparmor=docker-default \
@@ -283,9 +285,27 @@ jobs:
             -v "$PWD/scrapers:/opt/airflow/scrapers:ro" \
             -v "$PWD/scripts:/opt/airflow/scripts:ro" \
             -v "$PWD/configs:/opt/airflow/configs:ro" \
+            --tmpfs /opt/airflow/logs:rw,noexec,nosuid,nodev,size=16m,uid=50000,gid=0,mode=0770 \
             data-platform-airflow-scheduler:ci -euc '
               test "$(id -u):$(id -g)" = 50000:0
               test "$(awk '\''/^CapEff:/ {print $2}'\'' /proc/self/status)" = 0000000000000000
+              test "$(stat -c "%u:%g:%a" /opt/airflow)" = 0:0:755
+              test ! -w /opt/airflow
+              for planted_module in \
+                fbref_parent_shadow.py \
+                sitecustomize.py \
+                usercustomize.py
+              do
+                if touch "/opt/airflow/${planted_module}" 2>/dev/null; then
+                  echo "UID 50000 planted top-level module: ${planted_module}" >&2
+                  exit 1
+                fi
+                test ! -e "/opt/airflow/${planted_module}"
+              done
+              test "$(stat -c "%u:%g:%a" /opt/airflow/logs)" = 50000:0:770
+              test -w /opt/airflow/logs
+              touch /opt/airflow/logs/.scheduler-writable-submount-smoke
+              rm /opt/airflow/logs/.scheduler-writable-submount-smoke
               timeout 30 chromium \
                 --headless --no-sandbox --disable-setuid-sandbox \
                 --disable-gpu --user-data-dir=/tmp/whoscored-chromium-ci \
@@ -326,7 +346,7 @@ jobs:
               /opt/legacy-scraper-venv/bin/python -m pip check
               PYTHONWARNINGS=error /usr/local/bin/python -c "import importlib.metadata as m; import requests; assert m.version(\"chardet\") == \"5.2.0\""
               /usr/local/bin/python -c "import importlib.metadata as m; import curl_cffi,tls_client,tls_requests; assert m.version(\"tls-client-python\") == \"1.15.1\"; client=tls_requests.Client(proxy=\"http://127.0.0.1:9\"); client.close()"
-              /opt/legacy-scraper-venv/bin/python -c "import importlib.metadata as m; import camoufox,playwright,selenium,soccerdata; import scrapers.matchhistory.scraper; assert m.version(\"wrapper-tls-requests\") == \"1.2.5\""
+              /opt/legacy-scraper-venv/bin/python -c "import importlib.metadata as m; import pathlib; import camoufox,playwright,scrapers,selenium,soccerdata; import scrapers.matchhistory.scraper as matchhistory_scraper; assert pathlib.Path(scrapers.__file__).resolve() == pathlib.Path(\"/opt/airflow/scrapers/__init__.py\"); assert pathlib.Path(matchhistory_scraper.__file__).resolve() == pathlib.Path(\"/opt/airflow/scrapers/matchhistory/scraper.py\"); assert m.version(\"wrapper-tls-requests\") == \"1.2.5\""
               for runner in \
                 run_clubelo_scraper.py \
                 run_espn_scraper.py \
@@ -425,6 +445,20 @@ jobs:
           proxy="$proxy_repository@$proxy_digest"
           docker pull "$scheduler"
           docker pull "$proxy"
+          docker run --rm \
+            --network none \
+            --user 50000:0 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --security-opt apparmor=docker-default \
+            --security-opt seccomp=builtin \
+            --entrypoint bash \
+            "$scheduler" -euc '
+              test "$(stat -c "%u:%g:%a" /opt/airflow)" = 0:0:755
+              test ! -w /opt/airflow
+              ! touch /opt/airflow/final_scheduler_parent_shadow.py 2>/dev/null
+              test ! -e /opt/airflow/final_scheduler_parent_shadow.py
+            '
           {
             echo "WHOSCORED_SCHEDULER_IMAGE=$scheduler"
             echo "WHOSCORED_PROXY_IMAGE=$proxy"
@@ -502,9 +536,17 @@ jobs:
           # Materializing a venv-local executable before replacing the system
           # aliases preserves the isolated legacy dependency identity.
           docker run --rm \
+            --network none \
+            --user 50000:0 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --security-opt apparmor=docker-default \
+            --security-opt seccomp=builtin \
             --entrypoint /opt/legacy-scraper-venv/bin/python \
+            -e PYTHONPATH=/opt/airflow \
+            -v "$PWD/scrapers:/opt/airflow/scrapers:ro" \
             "$scheduler" -c \
-            "import importlib.metadata as m, urllib3; assert urllib3.__version__.startswith('1.'); assert m.version('rich') == '14.3.4'"
+            "import importlib.metadata as m, pathlib, scrapers, urllib3; import scrapers.matchhistory.scraper as matchhistory_scraper; assert pathlib.Path(scrapers.__file__).resolve() == pathlib.Path('/opt/airflow/scrapers/__init__.py'); assert pathlib.Path(matchhistory_scraper.__file__).resolve() == pathlib.Path('/opt/airflow/scrapers/matchhistory/scraper.py'); assert urllib3.__version__.startswith('1.'); assert m.version('rich') == '14.3.4'"
 
       - name: Build and smoke the immutable WhoScored FlareSolverr image
         run: |

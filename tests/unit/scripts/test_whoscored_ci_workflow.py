@@ -198,6 +198,11 @@ def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
     scheduler_smoke = text.split(
         "- name: Build and smoke the hardened scheduler test image", 1
     )[1].split("- name: Build production targets", 1)[0]
+    production_targets = text.split(
+        "- name: Build production targets and prove the declared gate state", 1
+    )[1].split(
+        "- name: Build and smoke the immutable WhoScored FlareSolverr image", 1
+    )[0]
 
     assert "--target airflow-scheduler-test" in text
     assert "docker/images/flaresolverr-whoscored/Dockerfile" in text
@@ -223,6 +228,26 @@ def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
     assert "timeout --kill-after=5s 45s docker run --rm" in scheduler_smoke
     assert "serve_logs(port=18793)" in scheduler_smoke
     assert "airflow_root_ctime" in scheduler_smoke
+    assert 'test "$(stat -c "%u:%g:%a" /opt/airflow)" = 0:0:755' in (
+        scheduler_smoke
+    )
+    assert "test ! -w /opt/airflow" in scheduler_smoke
+    assert "fbref_parent_shadow.py" in scheduler_smoke
+    assert "sitecustomize.py" in scheduler_smoke
+    assert "usercustomize.py" in scheduler_smoke
+    assert (
+        "--tmpfs /opt/airflow/logs:rw,noexec,nosuid,nodev,"
+        "size=16m,uid=50000,gid=0,mode=0770"
+    ) in scheduler_smoke
+    assert 'test "$(stat -c "%u:%g:%a" /opt/airflow/logs)" = 50000:0:770' in (
+        scheduler_smoke
+    )
+    assert "test -w /opt/airflow/logs" in scheduler_smoke
+    assert "/opt/airflow/logs/.scheduler-writable-submount-smoke" in (
+        scheduler_smoke
+    )
+    assert "/opt/airflow/scrapers/__init__.py" in scheduler_smoke
+    assert "/opt/airflow/scrapers/matchhistory/scraper.py" in scheduler_smoke
     assert "test ! -e /opt/airflow/airflow.cfg" in scheduler_smoke
     assert "test ! -e /opt/airflow/gunicorn.ctl" in scheduler_smoke
     assert "Control socket listening" in scheduler_smoke
@@ -235,6 +260,16 @@ def test_ci_uses_test_runtime_and_smokes_immutable_flaresolverr():
     assert "dict(os.environ)" not in scheduler_smoke
     assert "os='windows'" in scheduler_smoke
     assert "platform == 'Win32'" in scheduler_smoke
+    assert "final_scheduler_parent_shadow.py" in production_targets
+    assert "test ! -w /opt/airflow" in production_targets
+    assert "-e PYTHONPATH=/opt/airflow" in production_targets
+    assert '-v "$PWD/scrapers:/opt/airflow/scrapers:ro"' in production_targets
+    assert "pathlib.Path('/opt/airflow/scrapers/__init__.py')" in (
+        production_targets
+    )
+    assert "pathlib.Path('/opt/airflow/scrapers/matchhistory/scraper.py')" in (
+        production_targets
+    )
     assert "/v1/whoscored/runtime-identity" in text
     assert 'assert response["extension_sha256"] == identity["extension_sha256"]' in text
     assert "docker/setup-buildx-action@" not in text
