@@ -1702,6 +1702,119 @@ def test_service_merge_cannot_reference_a_forward_anchor(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize(
+    "service_body",
+    [
+        """    <<: *gateway
+    build:
+      context: ./docker/images/airflow
+""",
+        """    build:
+      context: ./docker/images/airflow
+    <<: *gateway
+""",
+    ],
+)
+def test_explicit_service_build_replaces_merged_anchor_build(
+    tmp_path: Path,
+    service_body: str,
+) -> None:
+    root, _, _, _ = _ready_repository(tmp_path)
+    _write(
+        root / "deploy/whoscored/gateway.compose.yaml",
+        f"""x-gateway: &gateway
+  image: ${{WHOSCORED_GATEWAY_IMAGE:-data-platform-airflow-whoscored-proxy:2.11.2-whoscored}}
+  build:
+    context: ./docker/images/airflow
+    dockerfile: Dockerfile
+    target: airflow-whoscored-proxy
+services:
+  whoscored_paid_gateway:
+{service_body}{_protected_command('whoscored_paid_gateway')}""",
+    )
+    discovery = provenance.Discovery(root=root, revision="a" * 40)
+
+    services = provenance._parse_compose_services(
+        root,
+        discovery,
+        Path("deploy/whoscored/gateway.compose.yaml"),
+    )
+
+    fields = services["whoscored_paid_gateway"]
+    assert fields["context"] == "./docker/images/airflow"
+    assert "dockerfile" not in fields
+    assert "target" not in fields
+
+
+def test_build_mapping_without_context_is_a_conflicting_root_build(
+    tmp_path: Path,
+) -> None:
+    root, _, _, _ = _ready_repository(tmp_path)
+    _write(
+        root / "compose.yaml",
+        f"""services:
+  canonical-producer:
+    image: local/whoscored:test
+    build:
+      context: ./docker/images/airflow
+      dockerfile: Dockerfile
+      target: runtime
+  conflicting-producer:
+    image: local/whoscored:test
+    build:
+      dockerfile: Attacker.Dockerfile
+      target: attacker
+  database:
+    image: postgres:16@sha256:{SHA_B}
+""",
+    )
+
+    with pytest.raises(
+        provenance.ProvenanceError,
+        match="local image tag has conflicting build producers",
+    ):
+        provenance.discover_repository(root)
+
+
+@pytest.mark.parametrize(
+    "build_input",
+    [
+        "    build:\n",
+        "    build: null\n",
+        "    build: ~\n",
+        "    build: {}\n",
+        "    build: *context\n",
+        "    build:\n      context:\n",
+        "    build:\n      context: null\n",
+        "    build:\n      context: *context\n",
+        '    build:\n      context: "./docker\\/images"\n',
+        "    build:\n      dockerfile: true\n",
+        "    build:\n      target: 123\n",
+        "    build:\n      target: -.inf\n",
+    ],
+)
+def test_noncanonical_build_identity_scalar_is_rejected(
+    tmp_path: Path,
+    build_input: str,
+) -> None:
+    root, _, _, _ = _ready_repository(tmp_path)
+    _write(
+        root / "deploy/whoscored/gateway.compose.yaml",
+        f"""services:
+  worker:
+    image: postgres:16@sha256:{SHA_A}
+{build_input}""",
+    )
+    discovery = provenance.Discovery(root=root, revision="a" * 40)
+
+    with pytest.raises(provenance.ProvenanceError, match="Compose build"):
+        provenance._parse_compose_services(
+            root,
+            discovery,
+            Path("deploy/whoscored/gateway.compose.yaml"),
+        )
+
+
+@pytest.mark.parametrize(
     "attacker_anchor",
     [
         """x-attacker: &shared

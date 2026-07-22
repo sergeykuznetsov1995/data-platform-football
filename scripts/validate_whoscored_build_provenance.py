@@ -1347,12 +1347,15 @@ def _parse_compose_services(
             raise ProvenanceError(
                 "WhoScored paid gateway Compose command differs from production policy"
             )
+        explicit_fields = _yaml_build_fields(block, 4)
+        if "build" in service_keys:
+            # YAML merge keys operate at this mapping level. An explicit
+            # service build replaces the inherited build mapping wholesale;
+            # its nested context/dockerfile/target fields are not deep-merged.
+            for key in ("context", "dockerfile", "target"):
+                fields.pop(key, None)
         fields.update(
-            {
-                key: value
-                for key, value in _yaml_build_fields(block, 4).items()
-                if value is not None
-            }
+            {key: value for key, value in explicit_fields.items() if value is not None}
         )
         services[name] = fields
         index = end
@@ -1670,6 +1673,8 @@ def _yaml_build_fields(lines: Sequence[str], base_indent: int) -> dict[str, str 
     prefix = " " * base_indent
     fields: dict[str, str | None] = {}
     in_build = False
+    build_form: str | None = None
+    build_mapping_fields = 0
     unsupported_service_fields = {"platform", "pull_policy"}
     supported_build_fields = {"context", "dockerfile", "target"}
     for line in lines:
@@ -1691,11 +1696,17 @@ def _yaml_build_fields(lines: Sequence[str], base_indent: int) -> dict[str, str 
                     fields["image"] = value
                     in_build = False
                 elif value:
+                    if _unsupported_yaml_build_scalar(value):
+                        raise ProvenanceError(
+                            "unsupported structured or null Compose build value"
+                        )
+                    build_form = "scalar"
                     if "context" in fields:
                         raise ProvenanceError("duplicate Compose build field")
                     fields["context"] = value
                     in_build = False
                 else:
+                    build_form = "mapping"
                     in_build = True
                 continue
             in_build = False
@@ -1710,8 +1721,53 @@ def _yaml_build_fields(lines: Sequence[str], base_indent: int) -> dict[str, str 
                 raise ProvenanceError(
                     f"duplicate Compose build field: {match.group(1)}"
                 )
-            fields[match.group(1)] = match.group(2)
+            value = match.group(2)
+            if _unsupported_yaml_build_scalar(value):
+                raise ProvenanceError(
+                    f"unsupported structured or null Compose build field: {match.group(1)}"
+                )
+            fields[match.group(1)] = value
+            build_mapping_fields += 1
+    if build_form == "mapping" and build_mapping_fields == 0:
+        raise ProvenanceError("Compose build mapping is empty or null")
+    if build_form == "mapping":
+        # Compose long-form build defaults context to the project directory.
+        # Canonical commands set --project-directory to the repository root.
+        fields.setdefault("context", ".")
     return fields
+
+
+def _yaml_null_scalar(value: str) -> bool:
+    return value == "" or value == "~" or value.lower() == "null"
+
+
+def _unsupported_yaml_build_scalar(value: str) -> bool:
+    if "$" in value:
+        # The caller emits the dedicated unresolved-interpolation failure.
+        return False
+    if _yaml_null_scalar(value):
+        return True
+    if re.fullmatch(r"[A-Za-z0-9_./-]+", value) is None:
+        return True
+    lowered = value.lower()
+    if lowered in {
+        "true",
+        "false",
+        "yes",
+        "no",
+        "on",
+        "off",
+        "y",
+        "n",
+    } or re.fullmatch(r"[-+]?(?:\.inf|\.nan)", lowered):
+        return True
+    if re.fullmatch(
+        r"[-+]?(?:(?:0x[0-9a-f_]+|0o[0-7_]+|0b[01_]+)|"
+        r"(?:[0-9][0-9_]*(?:\.[0-9_]*)?|\.[0-9_]+)(?:e[-+]?[0-9]+)?)",
+        lowered,
+    ):
+        return True
+    return re.fullmatch(r"[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}", value) is not None
 
 
 def _clean_yaml_scalar(value: str) -> str:
