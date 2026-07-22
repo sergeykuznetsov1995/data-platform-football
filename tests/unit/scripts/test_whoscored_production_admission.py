@@ -2212,7 +2212,21 @@ def _cutover_inventory_runner(
                 }
             },
             "State": {
-                "Running": service in {"airflow-scheduler", "flaresolverr"}
+                "Dead": False,
+                "Paused": False,
+                "Restarting": False,
+                "Running": service in {"airflow-scheduler", "flaresolverr"},
+                "OOMKilled": False,
+                "Status": (
+                    "running"
+                    if service in {"airflow-scheduler", "flaresolverr"}
+                    else "created"
+                ),
+                **(
+                    {"Health": {"Status": "healthy"}}
+                    if service in {"airflow-scheduler", "flaresolverr"}
+                    else {}
+                ),
             },
         }
         for service in present_services
@@ -2463,6 +2477,117 @@ def test_cutover_inventory_admits_only_complete_supported_modes(
         "frontend",
         "storage",
     ]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-health",
+        "health-starting",
+        "health-unhealthy",
+        "not-running-status",
+        "paused",
+        "restarting",
+        "dead",
+        "oom-killed",
+    ],
+)
+def test_cutover_inventory_rejects_unhealthy_running_baseline(
+    mutation: str,
+) -> None:
+    def mutate(
+        containers: dict[str, dict[str, Any]],
+        _networks: dict[str, dict[str, Any]],
+    ) -> None:
+        state = next(
+            container["State"]
+            for container in containers.values()
+            if container["Config"]["Labels"]["com.docker.compose.service"]
+            == "airflow-scheduler"
+        )
+        if mutation == "missing-health":
+            state.pop("Health")
+        elif mutation.startswith("health-"):
+            state["Health"]["Status"] = mutation.removeprefix("health-")
+        elif mutation == "not-running-status":
+            state["Status"] = "exited"
+        else:
+            state[
+                {
+                    "paused": "Paused",
+                    "restarting": "Restarting",
+                    "dead": "Dead",
+                    "oom-killed": "OOMKilled",
+                }[mutation]
+            ] = True
+
+    with pytest.raises(
+        admission.AdmissionError, match="not healthy and running: airflow-scheduler"
+    ):
+        admission.verify_cutover_inventory(
+            runner=_cutover_inventory_runner("full-legacy-v1", mutate),
+            input_reader=_cutover_input_reader,
+            directory_reader=_cutover_directory_reader,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("Status", "paused"),
+        ("Paused", True),
+        ("Restarting", True),
+        ("Dead", True),
+        ("OOMKilled", True),
+    ],
+)
+def test_cutover_inventory_rejects_insane_stopped_baseline(
+    field: str, value: str | bool
+) -> None:
+    def mutate(
+        containers: dict[str, dict[str, Any]],
+        _networks: dict[str, dict[str, Any]],
+    ) -> None:
+        state = next(
+            container["State"]
+            for container in containers.values()
+            if container["Config"]["Labels"]["com.docker.compose.service"]
+            == "whoscored_paid_gateway"
+        )
+        state[field] = value
+
+    with pytest.raises(
+        admission.AdmissionError,
+        match="stopped container is not sane: whoscored_paid_gateway",
+    ):
+        admission.verify_cutover_inventory(
+            runner=_cutover_inventory_runner("full-legacy-v1", mutate),
+            input_reader=_cutover_input_reader,
+            directory_reader=_cutover_directory_reader,
+        )
+
+
+def test_cutover_inventory_accepts_stopped_exited_without_health() -> None:
+    def mutate(
+        containers: dict[str, dict[str, Any]],
+        _networks: dict[str, dict[str, Any]],
+    ) -> None:
+        state = next(
+            container["State"]
+            for container in containers.values()
+            if container["Config"]["Labels"]["com.docker.compose.service"]
+            == "whoscored_paid_gateway"
+        )
+        state["Status"] = "exited"
+        assert "Health" not in state
+
+    report = admission.verify_cutover_inventory(
+        runner=_cutover_inventory_runner("full-legacy-v1", mutate),
+        input_reader=_cutover_input_reader,
+        directory_reader=_cutover_directory_reader,
+    )
+
+    assert report["status"] == "cutover-inventory-admitted-v1"
 
 
 @pytest.mark.parametrize(
@@ -2736,7 +2861,8 @@ def test_cutover_inventory_cross_checks_retained_network_endpoints(
         if mutation == "missing-running":
             networks["backend"]["Containers"].pop(scheduler_id)
         elif mutation == "stopped-listed":
-            scheduler["State"]["Running"] = False
+            scheduler["State"].update({"Running": False, "Status": "exited"})
+            scheduler["State"].pop("Health")
         else:
             networks["backend"]["Containers"]["not-an-id"] = {
                 "Name": "unrelated"
@@ -2804,9 +2930,18 @@ def _empty_quiescence_snapshot() -> dict[str, Any]:
 
 
 def test_cutover_quiescence_is_cross_source_and_ignores_only_stale_jobs() -> None:
-    assert "JOIN dag_run AS dr" in admission._CUTOVER_QUIESCENCE_SQL
+    assert "LEFT JOIN dag_run AS dr" in admission._CUTOVER_QUIESCENCE_SQL
     assert "dr.state IN ('queued', 'restarting', 'running')" in (
         admission._CUTOVER_QUIESCENCE_SQL
+    )
+    assert (
+        ") OR ti.state IN ('queued', 'restarting', 'running')"
+        in admission._CUTOVER_QUIESCENCE_SQL
+    )
+    assert (
+        "AND ti.state IN ('deferred', 'queued', 'restarting', 'running', "
+        "'scheduled', 'sensing', 'up_for_reschedule', 'up_for_retry')"
+        in admission._CUTOVER_QUIESCENCE_SQL
     )
     assert "latest_heartbeat >= transaction_timestamp() - interval '5 minutes'" in (
         admission._CUTOVER_QUIESCENCE_SQL

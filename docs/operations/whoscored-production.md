@@ -973,31 +973,62 @@ reference. Any failed rollback enters an indefinite marker-held quarantine.
 
 First snapshot every DagModel pause flag, pause exactly the previously
 unpaused DAGs, and prove that the set did not change and is now entirely
-paused. The read-only database gate joins active TaskInstances to active
-DagRuns, rejects fresh non-scheduler Airflow jobs, and also rejects every
-pending/running `fbref_control.crawl_run` and unreleased publication lock. Two
+paused. The read-only database gate joins TaskInstances to DagRuns, rejects the
+full active TaskInstance set under an active DagRun, independently rejects every
+`queued`, `restarting` or `running` TaskInstance even when its DagRun is
+terminal or absent, rejects fresh non-scheduler Airflow jobs, and also rejects
+every pending/running `fbref_control.crawl_run` and unreleased publication lock. Two
 zero snapshots at least 60 seconds apart are mandatory. Thus an active FBref,
 FotMob, Transfermarkt, SofaScore, WhoScored, or other shared-Airflow run blocks
 the cutover even when every WhoScored DAG is paused:
 
 ```bash
+wait_cutover_container_healthy() {
+  local container_id=$1
+  local service=$2
+  local project=$3
+  local attempt container_json
+  [[ "$container_id" =~ ^[0-9a-f]{64}$ ]]
+  [[ "$service" =~ ^(airflow-scheduler|flaresolverr|flaresolverr_whoscored_paid|whoscored_paid_gateway|whoscored_proxy_filter)$ ]]
+  [[ "$project" =~ ^(data-platform|whoscored-gw)$ ]]
+  for attempt in $(/usr/bin/seq 1 60); do
+    if container_json=$("${DOCKER[@]}" container inspect \
+        "$container_id" 2>/dev/null) &&
+      /usr/bin/jq -e \
+        --arg id "$container_id" --arg service "$service" --arg project "$project" '
+          type == "array" and length == 1 and .[0].Id == $id and
+          .[0].Name == ("/" + $service) and
+          .[0].Config.Labels["com.docker.compose.project"] == $project and
+          .[0].Config.Labels["com.docker.compose.service"] == $service and
+          .[0].State.Status == "running" and
+          .[0].State.Running == true and .[0].State.Paused == false and
+          .[0].State.Restarting == false and .[0].State.Dead == false and
+          .[0].State.OOMKilled == false and
+          .[0].State.Health.Status == "healthy"
+        ' <<< "$container_json" >/dev/null; then
+      return 0
+    fi
+    if (( attempt == 60 )); then
+      /usr/bin/printf 'Container did not become healthy: %s (%s)\n' \
+        "$service" "$container_id" >&2
+      return 1
+    fi
+    /usr/bin/sleep 2
+  done
+  return 1
+}
+
 restore_cutover_dag_pauses() {
   local scheduler_id=$1
   local phase=$2
   local current="$WHOSCORED_ADMISSION_DIR/dag-pauses-before-$phase.json"
   local restored="$WHOSCORED_ADMISSION_DIR/dag-pauses-restored-$phase.json"
-  local record_text record dag_id is_paused scheduler_json
+  local record_text record dag_id is_paused
   local -a records
   test ! -e "$current"
   test ! -e "$restored"
-  scheduler_json=$("${DOCKER[@]}" container inspect "$scheduler_id")
-  /usr/bin/jq -e --arg id "$scheduler_id" '
-    type == "array" and length == 1 and .[0].Id == $id and
-    .[0].Name == "/airflow-scheduler" and
-    .[0].Config.Labels["com.docker.compose.project"] == "data-platform" and
-    .[0].Config.Labels["com.docker.compose.service"] == "airflow-scheduler" and
-    .[0].State.Running == true
-  ' <<< "$scheduler_json" >/dev/null
+  wait_cutover_container_healthy \
+    "$scheduler_id" airflow-scheduler data-platform
   "${ADMISSION_PYTHON[@]}" \
     "$RELEASE/scripts/whoscored_production_admission.py" \
     snapshot-cutover-dag-pauses \
@@ -1201,14 +1232,8 @@ SCHEDULER_LABEL_IDS=$("${DOCKER[@]}" container ls --all --no-trunc \
 [[ "$SCHEDULER_NAME_IDS" =~ ^[0-9a-f]{64}$ ]]
 test "$SCHEDULER_LABEL_IDS" = "$SCHEDULER_NAME_IDS"
 LEGACY_SCHEDULER_ID=$SCHEDULER_NAME_IDS
-scheduler_json=$("${DOCKER[@]}" container inspect "$LEGACY_SCHEDULER_ID")
-/usr/bin/jq -e --arg id "$LEGACY_SCHEDULER_ID" '
-  type == "array" and length == 1 and .[0].Id == $id and
-  .[0].Name == "/airflow-scheduler" and
-  .[0].Config.Labels["com.docker.compose.project"] == "data-platform" and
-  .[0].Config.Labels["com.docker.compose.service"] == "airflow-scheduler" and
-  .[0].State.Running == true
-' <<< "$scheduler_json" >/dev/null
+wait_cutover_container_healthy \
+  "$LEGACY_SCHEDULER_ID" airflow-scheduler data-platform
 
 UNPAUSED_DAG_RECORD_TEXT=$(/usr/bin/jq -r \
   '[.dag_pause_states[] | select(.is_paused == false) | @json] | join("\n")' \
@@ -1266,6 +1291,10 @@ common FlareSolverr and paid API network only). A partial trio, extra/missing ne
 wrong Compose project or pre-existing `whoscored-gw` object fails before the
 first lifecycle command. It also binds every protected endpoint to the exact
 Docker network ID and records the retained backend, frontend and storage IDs.
+Every running legacy container must have exact `running` status, all Docker
+failure flags clear and health `healthy`; a stopped container must have
+`created` or `exited` status with `Running`, `Paused`, `Restarting`, `Dead` and
+`OOMKilled` all false. Stopped containers do not need a health result.
 It captures the old digest-qualified images,
 Compose hashes, project directory, profiles, config/env path order and
 root-protected path/stat/SHA evidence without storing environment values. The
@@ -1486,6 +1515,19 @@ rollback_split_cutover() {
     [[ "$restored_id" =~ ^[0-9a-f]{64}$ ]]
     if test "$desired_running" = true; then
       "${DOCKER[@]}" start "$restored_id"
+    fi
+  done
+
+  # Every old service that was running before cutover must return healthy on
+  # its exact recreated ID before strict inventory or any DAG pause mutation.
+  for record in "${records[@]}"; do
+    service=$(/usr/bin/jq -er '.service' <<< "$record")
+    desired_running=$(/usr/bin/jq -er '.running | tostring' <<< "$record")
+    restored_id=${restored_service_ids[$service]}
+    [[ "$restored_id" =~ ^[0-9a-f]{64}$ ]]
+    if test "$desired_running" = true; then
+      wait_cutover_container_healthy \
+        "$restored_id" "$service" data-platform
     fi
   done
 
@@ -1786,6 +1828,8 @@ test "$SCHEDULER_CONTAINER_ID" = "$SCHEDULER_CAPTURED_ID"
 test "$("${DOCKER[@]}" inspect --format '{{.Id}}' \
   "$SCHEDULER_CONTAINER_ID")" = "$SCHEDULER_CONTAINER_ID"
 "${DOCKER[@]}" start "$SCHEDULER_CONTAINER_ID"
+wait_cutover_container_healthy \
+  "$SCHEDULER_CONTAINER_ID" airflow-scheduler data-platform
 
 SEAWEED_AFTER=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
   id: .Id, command: .Config.Cmd,
@@ -1875,6 +1919,8 @@ test "$FLARESOLVERR_CONTAINER_ID" = "$FLARESOLVERR_CAPTURED_ID"
 test "$("${DOCKER[@]}" inspect --format '{{.Id}}' \
   "$FLARESOLVERR_CONTAINER_ID")" = "$FLARESOLVERR_CONTAINER_ID"
 "${DOCKER[@]}" start "$FLARESOLVERR_CONTAINER_ID"
+wait_cutover_container_healthy \
+  "$FLARESOLVERR_CONTAINER_ID" flaresolverr data-platform
 
 SEAWEED_AFTER=$(/usr/bin/docker inspect seaweedfs | /usr/bin/jq -c '.[0] | {
   id: .Id, command: .Config.Cmd,
@@ -2018,7 +2064,10 @@ provider evidence, new empty state namespace and reviewed exact-origin release
 have all passed. The gateway container was already created and admitted during
 network cutover, but remains stopped. Create, attest and start the filter and
 paid browser as separate waves, waiting for each exact container ID to become
-healthy:
+healthy. Before any DAG pause flag is restored, wait for all five exact IDs and
+run one `verify-running` admission against both protected project models and the
+deploy-time `rendered-receipt.json`; its create-once receipt is the success
+boundary. Any timeout or admission failure enters the root ERR rollback path:
 
 ```bash
 for service in whoscored_proxy_filter flaresolverr_whoscored_paid; do
@@ -2087,23 +2136,43 @@ for service in whoscored_proxy_filter flaresolverr_whoscored_paid; do
   ' "$receipt")
   test "$container_id" = "$captured_id"
   "${DOCKER[@]}" start "$container_id"
-  for attempt in $(/usr/bin/seq 1 60); do
-    test "$("${DOCKER[@]}" inspect --format '{{.State.Health.Status}}' \
-      "$container_id")" = healthy && break
-    test "$attempt" != 60
-    /usr/bin/sleep 2
-  done
+  wait_cutover_container_healthy "$container_id" "$service" whoscored-gw
 done
 
 test "$("${DOCKER[@]}" inspect --format '{{.State.Status}}' \
   "$PAID_GATEWAY_CONTAINER_ID")" = created
 "${DOCKER[@]}" start "$PAID_GATEWAY_CONTAINER_ID"
-for attempt in $(/usr/bin/seq 1 60); do
-  test "$("${DOCKER[@]}" inspect --format '{{.State.Health.Status}}' \
-    "$PAID_GATEWAY_CONTAINER_ID")" = healthy && break
-  test "$attempt" != 60
-  /usr/bin/sleep 2
-done
+wait_cutover_container_healthy \
+  "$PAID_GATEWAY_CONTAINER_ID" whoscored_paid_gateway whoscored-gw
+
+WHOSCORED_RUNNING_ADMISSION_RECEIPT="$WHOSCORED_ADMISSION_DIR/running-admission-receipt.json"
+test ! -e "$WHOSCORED_RUNNING_ADMISSION_RECEIPT"
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_production_admission.py" verify-running \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --common-override "$WHOSCORED_COMMON_DIGEST_OVERRIDE" \
+  --gateway-override "$WHOSCORED_GATEWAY_DIGEST_OVERRIDE" \
+  --env-file "$COMPOSE_ENV_FILE" \
+  --env-file "$WHOSCORED_ENV_FILE" \
+  --env-file "$PROXY_POOL_ENV_FILE" \
+  --provider-policy "$WHOSCORED_PROVIDER_POLICY" \
+  --owner-secret-file "$WHOSCORED_OWNER_SECRET" \
+  --deployment-admission-receipt \
+  "$WHOSCORED_ADMISSION_DIR/rendered-receipt.json" \
+  --service airflow-scheduler \
+  --service flaresolverr \
+  --service flaresolverr_whoscored_paid \
+  --service whoscored_paid_gateway \
+  --service whoscored_proxy_filter \
+  > "$WHOSCORED_RUNNING_ADMISSION_RECEIPT"
+/usr/bin/jq -e '
+  .schema_version == 2 and .status == "admitted-running-v1" and
+  ([.images[].service] | sort) == [
+    "airflow-scheduler", "flaresolverr", "flaresolverr_whoscored_paid",
+    "whoscored_paid_gateway", "whoscored_proxy_filter"
+  ]
+' "$WHOSCORED_RUNNING_ADMISSION_RECEIPT" >/dev/null
 restore_cutover_dag_pauses "$SCHEDULER_CONTAINER_ID" success
 cutover_finalize success
 finalize_rc=$?

@@ -1043,6 +1043,17 @@ def test_split_cutover_failure_controller_is_root_only_and_capture_complete() ->
     assert "WHOSCORED_SHARED_SCHEDULER_CUTOVER_MARKER" not in rollback
     assert ".retained_networks == .[1].retained_networks" in rollback
     assert "--post-cleanup" in rollback
+    rollback_start = rollback.index('"${DOCKER[@]}" start "$restored_id"')
+    rollback_wait = rollback.index(
+        'wait_cutover_container_healthy \\\n        "$restored_id" "$service" data-platform',
+        rollback_start,
+    )
+    rollback_inventory = rollback.index("verify-cutover-inventory", rollback_wait)
+    rollback_pause_restore = rollback.index(
+        'restore_cutover_dag_pauses "$restored_id" rollback', rollback_inventory
+    )
+    assert rollback_start < rollback_wait < rollback_inventory
+    assert rollback_inventory < rollback_pause_restore
 
     create_positions = [
         match.start()
@@ -1085,6 +1096,85 @@ def test_split_cutover_failure_controller_is_root_only_and_capture_complete() ->
         "set -Eeuo pipefail"
     )
     assert "shopt -s inherit_errexit" in success_tail
+
+
+def test_split_cutover_requires_all_five_running_admission_before_finalize() -> None:
+    runbook = (ROOT / "docs" / "operations" / "whoscored-production.md").read_text(
+        encoding="utf-8"
+    )
+    rollout = runbook.split("##### One-time split-project cutover", 1)[1].split(
+        "##### Install the bounded daily issuer", 1
+    )[0]
+    bash = "\n".join(re.findall(r"```bash\n(.*?)```", rollout, re.DOTALL))
+    commands = "\n".join(
+        line for line in bash.splitlines() if not line.lstrip().startswith("#")
+    )
+
+    wait_helper = commands.split("wait_cutover_container_healthy() {", 1)[1].split(
+        "restore_cutover_dag_pauses() {", 1
+    )[0]
+    for required in (
+        '.Id == $id',
+        '.Name == ("/" + $service)',
+        '.Config.Labels["com.docker.compose.project"] == $project',
+        '.Config.Labels["com.docker.compose.service"] == $service',
+        '.State.Status == "running"',
+        ".State.Running == true",
+        ".State.Paused == false",
+        ".State.Restarting == false",
+        ".State.Dead == false",
+        ".State.OOMKilled == false",
+        '.State.Health.Status == "healthy"',
+        "if (( attempt == 60 )); then",
+        "return 1",
+    ):
+        assert required in wait_helper
+
+    err_trap = commands.index("trap 'cutover_on_failure")
+    scheduler_wait = commands.index(
+        'wait_cutover_container_healthy \\\n  "$SCHEDULER_CONTAINER_ID" airflow-scheduler data-platform'
+    )
+    common_flaresolverr_wait = commands.index(
+        'wait_cutover_container_healthy \\\n  "$FLARESOLVERR_CONTAINER_ID" flaresolverr data-platform'
+    )
+    paid_loop = commands.index(
+        "for service in whoscored_proxy_filter flaresolverr_whoscored_paid; do"
+    )
+    paid_loop_wait = commands.index(
+        'wait_cutover_container_healthy "$container_id" "$service" whoscored-gw',
+        paid_loop,
+    )
+    gateway_wait = commands.index(
+        'wait_cutover_container_healthy \\\n  "$PAID_GATEWAY_CONTAINER_ID" whoscored_paid_gateway whoscored-gw'
+    )
+    verify_running = commands.index("verify-running", gateway_wait)
+    restore = commands.index(
+        'restore_cutover_dag_pauses "$SCHEDULER_CONTAINER_ID" success',
+        verify_running,
+    )
+    finalize = commands.index("cutover_finalize success", restore)
+
+    assert err_trap < scheduler_wait < common_flaresolverr_wait
+    assert common_flaresolverr_wait < paid_loop < paid_loop_wait < gateway_wait
+    assert gateway_wait < verify_running < restore < finalize
+
+    running_admission = commands[verify_running:restore]
+    assert 'test ! -e "$WHOSCORED_RUNNING_ADMISSION_RECEIPT"' in commands
+    assert (
+        '--deployment-admission-receipt \\\n  "$WHOSCORED_ADMISSION_DIR/rendered-receipt.json"'
+        in running_admission
+    )
+    assert running_admission.count("--service ") == 5
+    for service in (
+        "airflow-scheduler",
+        "flaresolverr",
+        "flaresolverr_whoscored_paid",
+        "whoscored_paid_gateway",
+        "whoscored_proxy_filter",
+    ):
+        assert f"--service {service}" in running_admission
+    assert '> "$WHOSCORED_RUNNING_ADMISSION_RECEIPT"' in running_admission
+    assert '.status == "admitted-running-v1"' in running_admission
 
 
 def test_gateway_header_forbids_direct_production_bootstrap() -> None:

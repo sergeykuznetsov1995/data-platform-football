@@ -279,6 +279,7 @@ _CUTOVER_ACTIVE_TASK_STATES = (
     "up_for_reschedule",
     "up_for_retry",
 )
+_CUTOVER_INDEPENDENT_TASK_STATES = ("queued", "restarting", "running")
 _CUTOVER_QUIESCENCE_SQL = f"""
 BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
 SET LOCAL statement_timeout = '30s';
@@ -296,10 +297,12 @@ SELECT jsonb_build_object(
       'state', ti.state, 'task_id', ti.task_id
     ) ORDER BY ti.dag_id, ti.run_id, ti.task_id, ti.map_index), '[]'::jsonb)
     FROM task_instance AS ti
-    JOIN dag_run AS dr
+    LEFT JOIN dag_run AS dr
       ON dr.dag_id = ti.dag_id AND dr.run_id = ti.run_id
-    WHERE dr.state IN ({', '.join(repr(state) for state in _CUTOVER_ACTIVE_DAGRUN_STATES)})
+    WHERE (
+      dr.state IN ({', '.join(repr(state) for state in _CUTOVER_ACTIVE_DAGRUN_STATES)})
       AND ti.state IN ({', '.join(repr(state) for state in _CUTOVER_ACTIVE_TASK_STATES)})
+    ) OR ti.state IN ({', '.join(repr(state) for state in _CUTOVER_INDEPENDENT_TASK_STATES)})
   ),
   'active_non_scheduler_jobs', (
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
@@ -4273,6 +4276,38 @@ def verify_rollback_bundle(
     }
 
 
+def _legacy_cutover_container_running_state(
+    state: Any, *, service: str
+) -> bool:
+    """Return the admitted legacy running flag only for a sane Docker state."""
+
+    unhealthy_flags = ("Paused", "Restarting", "Dead", "OOMKilled")
+    if (
+        not isinstance(state, dict)
+        or type(state.get("Running")) is not bool
+        or any(type(state.get(field)) is not bool for field in unhealthy_flags)
+    ):
+        raise AdmissionError(f"legacy cutover container state differs: {service}")
+    if state["Running"]:
+        health = state.get("Health")
+        if (
+            state.get("Status") != "running"
+            or any(state[field] for field in unhealthy_flags)
+            or not isinstance(health, dict)
+            or health.get("Status") != "healthy"
+        ):
+            raise AdmissionError(
+                f"legacy cutover container is not healthy and running: {service}"
+            )
+        return True
+    if (
+        state.get("Status") not in {"created", "exited"}
+        or any(state[field] for field in unhealthy_flags)
+    ):
+        raise AdmissionError(f"legacy cutover stopped container is not sane: {service}")
+    return False
+
+
 def verify_cutover_inventory(
     *,
     runner: DockerRunner = _run_docker,
@@ -4392,6 +4427,7 @@ def verify_cutover_inventory(
             if isinstance(working_directory_raw, str)
             else Path()
         )
+        running = _legacy_cutover_container_running_state(state, service=service)
         if (
             container.get("Id") != container_id
             or container.get("Name") != f"/{service}"
@@ -4400,8 +4436,6 @@ def verify_cutover_inventory(
             or labels.get("com.docker.compose.service") != service
             or labels.get("com.docker.compose.container-number") != "1"
             or labels.get("com.docker.compose.oneoff") != "False"
-            or not isinstance(state, dict)
-            or type(state.get("Running")) is not bool
             or not isinstance(attached_networks, dict)
             or not isinstance(config_hash, str)
             or _CONFIG_HASH.fullmatch(config_hash) is None
@@ -4429,7 +4463,7 @@ def verify_cutover_inventory(
             "environment_files": environment_files,
             "image": image,
             "image_id": image_id,
-            "running": state["Running"],
+            "running": running,
             "working_directory": working_directory,
         }
 
