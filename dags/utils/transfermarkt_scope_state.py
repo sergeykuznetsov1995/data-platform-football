@@ -279,7 +279,7 @@ class ScopeManifest:
         # the autonomous schedule replaced the one-shot approval packets, so
         # the policy is the only remaining authorization trace.  One-shot runs
         # keep their journal and simply omit the key.
-        provenance = {'standing_policy_hash'}
+        provenance = {'standing_policy_hash', 'silver_trigger_allowed'}
         temporal_evidence = {'scope_player_capture'}
         optional = coverage | provenance | temporal_evidence
         if not isinstance(value, Mapping):
@@ -299,6 +299,13 @@ class ScopeManifest:
         ):
             raise ScopeManifestError(
                 'standing policy hash is not a lowercase sha256 digest'
+            )
+        if (
+            'silver_trigger_allowed' in present
+            and not isinstance(value['silver_trigger_allowed'], bool)
+        ):
+            raise ScopeManifestError(
+                'silver_trigger_allowed must be a boolean'
             )
         capture_evidence = value.get('scope_player_capture')
         if self.capture_revision == 'v3' and capture_evidence is None:

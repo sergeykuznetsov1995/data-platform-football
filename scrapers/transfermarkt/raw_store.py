@@ -25,6 +25,8 @@ from pyarrow import fs
 
 
 RAW_MANIFEST_VERSION = "transfermarkt-raw-v1"
+ATTEMPT_ENVELOPE_VERSION = "transfermarkt-attempt-v1"
+MAX_ATTEMPT_ORDINAL = 1_000_000_000
 RAW_STORE_ENV = "TRANSFERMARKT_RAW_STORE_URI"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _S3_BUCKET_RE = re.compile(
@@ -57,6 +59,11 @@ _API_REGULATION_PATH_RE = re.compile(
     r"^/competition/[A-Za-z0-9_-]+/regulation$", re.ASCII
 )
 _API_CLUB_PATH_RE = re.compile(r"^/competition/[A-Za-z0-9_-]+/club$", re.ASCII)
+_ERROR_TYPE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$", re.ASCII)
+_ATTEMPT_KINDS = frozenset({"response", "transport_error"})
+_TRANSPORT_ERROR_KINDS = frozenset(
+    {"connection", "dns", "protocol", "proxy", "timeout", "tls", "transport"}
+)
 
 
 class RawStoreError(RuntimeError):
@@ -193,6 +200,20 @@ def _integer(value: object, name: str, *, minimum: int, maximum: int) -> int:
     return value
 
 
+def _error_kind(value: object) -> str:
+    candidate = _required(value, "error_kind").lower()
+    if candidate not in _TRANSPORT_ERROR_KINDS:
+        raise ValueError("error_kind is not an allowlisted transport class")
+    return candidate
+
+
+def _error_type(value: object) -> str:
+    candidate = _required(value, "error_type")
+    if _ERROR_TYPE_RE.fullmatch(candidate) is None:
+        raise ValueError("error_type must be a safe exception class name")
+    return candidate
+
+
 @dataclass(frozen=True)
 class RawCaptureRecord:
     """Durable evidence for one Transfermarkt HTTP attempt."""
@@ -216,6 +237,38 @@ class RawCaptureRecord:
     fetched_at: str
     decoded_bytes: int
     stored_bytes: int
+
+
+@dataclass(frozen=True)
+class RawAttemptEnvelopeRecord:
+    """Immutable, body-free evidence for one HTTP attempt.
+
+    A response envelope references the existing v1 capture contract.  A
+    transport-error envelope deliberately contains neither response bytes nor
+    third-party exception text: only an allowlisted failure class is durable,
+    so proxy credentials and request secrets cannot escape through an
+    exception message.
+    """
+
+    manifest_version: str
+    envelope_id: str
+    record_hash: str
+    hash_algorithm: str
+    source: str
+    outcome_kind: str
+    cycle_id: str
+    scope_id: str
+    endpoint: str
+    attempt: int
+    url: str
+    observed_at: str
+    capture_id: Optional[str]
+    capture_manifest_uri: Optional[str]
+    raw_body_hash: Optional[str]
+    status_code: Optional[int]
+    error_kind: Optional[str]
+    error_type: Optional[str]
+    envelope_uri: str
 
 
 class RawResponseStore:
@@ -471,6 +524,103 @@ class RawResponseStore:
         return f"captures/sha256/{capture_id[:2]}/{capture_id}.json"
 
     @staticmethod
+    def attempt_manifest_key(envelope_id: str) -> str:
+        if _SHA256_RE.fullmatch(str(envelope_id)) is None:
+            raise ValueError("envelope_id must be a lowercase SHA-256 digest")
+        return f"attempts/sha256/{envelope_id[:2]}/{envelope_id}.json"
+
+    @staticmethod
+    def _attempt_identity(
+        *,
+        outcome_kind: str,
+        cycle_id: str,
+        scope_id: str,
+        endpoint: str,
+        attempt: int,
+        url: str,
+        observed_at: str,
+        capture_id: Optional[str],
+        capture_manifest_uri: Optional[str],
+        raw_body_hash: Optional[str],
+        status_code: Optional[int],
+        error_kind: Optional[str],
+        error_type: Optional[str],
+    ) -> dict[str, object]:
+        kind = _required(outcome_kind, "outcome_kind").lower()
+        if kind not in _ATTEMPT_KINDS:
+            raise ValueError("outcome_kind is not supported")
+        identity: dict[str, object] = {
+            "attempt": _integer(
+                attempt, "attempt", minimum=0, maximum=MAX_ATTEMPT_ORDINAL
+            ),
+            "capture_id": capture_id,
+            "capture_manifest_uri": capture_manifest_uri,
+            "cycle_id": _required(cycle_id, "cycle_id"),
+            "endpoint": _required(endpoint, "endpoint"),
+            "error_kind": error_kind,
+            "error_type": error_type,
+            "manifest_version": ATTEMPT_ENVELOPE_VERSION,
+            "observed_at": _utc_iso(observed_at),
+            "outcome_kind": kind,
+            "raw_body_hash": raw_body_hash,
+            "scope_id": _required(scope_id, "scope_id"),
+            "source": "transfermarkt",
+            "status_code": status_code,
+            "url": _safe_url(url),
+        }
+        if kind == "response":
+            if (
+                not isinstance(capture_id, str)
+                or _SHA256_RE.fullmatch(capture_id) is None
+                or not isinstance(raw_body_hash, str)
+                or _SHA256_RE.fullmatch(raw_body_hash) is None
+                or type(capture_manifest_uri) is not str
+                or not capture_manifest_uri
+            ):
+                raise ValueError("response envelope requires capture lineage")
+            identity["status_code"] = _integer(
+                status_code, "status_code", minimum=100, maximum=599
+            )
+            if error_kind is not None or error_type is not None:
+                raise ValueError("response envelope cannot contain transport error")
+        else:
+            if any(
+                value is not None
+                for value in (
+                    capture_id,
+                    capture_manifest_uri,
+                    raw_body_hash,
+                    status_code,
+                )
+            ):
+                raise ValueError("transport envelope cannot reference response data")
+            identity["error_kind"] = _error_kind(error_kind)
+            identity["error_type"] = _error_type(error_type)
+        return identity
+
+    @classmethod
+    def allocate_attempt_envelope_id(cls, **values: object) -> str:
+        """Hash the canonical envelope body, excluding derived ID/URI fields."""
+
+        supplied = dict(values)
+        manifest_version = supplied.pop("manifest_version", ATTEMPT_ENVELOPE_VERSION)
+        source = supplied.pop("source", "transfermarkt")
+        if (
+            manifest_version != ATTEMPT_ENVELOPE_VERSION
+            or source != "transfermarkt"
+        ):
+            raise ValueError("attempt envelope contract identity mismatch")
+        identity = cls._attempt_identity(**supplied)  # type: ignore[arg-type]
+        # Storage locations are verified derived fields, not evidence identity:
+        # the same attempt keeps one ID when copied to another raw-store root.
+        canonical = dict(identity)
+        canonical.pop("capture_manifest_uri", None)
+        encoded = json.dumps(
+            canonical, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
     def allocate_capture_id(
         *,
         cycle_id: str,
@@ -486,7 +636,12 @@ class RawResponseStore:
         if _SHA256_RE.fullmatch(content_hash) is None:
             raise ValueError("content_hash must be a lowercase SHA-256 digest")
         identity = {
-            "attempt": _integer(attempt, "attempt", minimum=0, maximum=1_000_000),
+            "attempt": _integer(
+                attempt,
+                "attempt",
+                minimum=0,
+                maximum=MAX_ATTEMPT_ORDINAL,
+            ),
             "content_hash": content_hash,
             "cycle_id": _required(cycle_id, "cycle_id"),
             "endpoint": _required(endpoint, "endpoint"),
@@ -550,7 +705,12 @@ class RawResponseStore:
         safe_cycle = _required(cycle_id, "cycle_id")
         safe_scope = _required(scope_id, "scope_id")
         safe_endpoint = _required(endpoint, "endpoint")
-        ordinal = _integer(attempt, "attempt", minimum=0, maximum=1_000_000)
+        ordinal = _integer(
+            attempt,
+            "attempt",
+            minimum=0,
+            maximum=MAX_ATTEMPT_ORDINAL,
+        )
         status = _integer(
             status_code, "status_code", minimum=100, maximum=599
         )
@@ -620,6 +780,112 @@ class RawResponseStore:
                 )
             return existing
 
+    def _publish_attempt_envelope(
+        self,
+        identity: Mapping[str, object],
+    ) -> RawAttemptEnvelopeRecord:
+        envelope_id = self.allocate_attempt_envelope_id(**dict(identity))
+        manifest_key = self.attempt_manifest_key(envelope_id)
+        record = RawAttemptEnvelopeRecord(
+            manifest_version=ATTEMPT_ENVELOPE_VERSION,
+            envelope_id=envelope_id,
+            record_hash=envelope_id,
+            hash_algorithm="sha256",
+            source="transfermarkt",
+            outcome_kind=str(identity["outcome_kind"]),
+            cycle_id=str(identity["cycle_id"]),
+            scope_id=str(identity["scope_id"]),
+            endpoint=str(identity["endpoint"]),
+            attempt=int(identity["attempt"]),
+            url=str(identity["url"]),
+            observed_at=str(identity["observed_at"]),
+            capture_id=identity["capture_id"],  # type: ignore[arg-type]
+            capture_manifest_uri=identity["capture_manifest_uri"],  # type: ignore[arg-type]
+            raw_body_hash=identity["raw_body_hash"],  # type: ignore[arg-type]
+            status_code=identity["status_code"],  # type: ignore[arg-type]
+            error_kind=identity["error_kind"],  # type: ignore[arg-type]
+            error_type=identity["error_type"],  # type: ignore[arg-type]
+            envelope_uri=self._uri(manifest_key),
+        )
+        rendered = json.dumps(
+            asdict(record), ensure_ascii=False, indent=2, sort_keys=True
+        ).encode("utf-8") + b"\n"
+        with self._write_lock:
+            self._publish_immutable_bytes(
+                manifest_key,
+                rendered,
+                require_exact_bytes=True,
+            )
+            existing = self.load_attempt_envelope(envelope_id)
+            if asdict(existing) != asdict(record):
+                raise RawCaptureConflict(
+                    f"Raw attempt envelope is immutable: {envelope_id}"
+                )
+            return existing
+
+    def store_response_envelope(
+        self,
+        capture: RawCaptureRecord,
+    ) -> RawAttemptEnvelopeRecord:
+        """Publish body-free attempt evidence referencing a verified capture."""
+
+        if not isinstance(capture, RawCaptureRecord):
+            raise TypeError("capture must be a RawCaptureRecord")
+        _, committed = self.load_capture(capture.capture_id)
+        if asdict(committed) != asdict(capture):
+            raise RawCaptureConflict(
+                f"Response envelope capture drift: {capture.capture_id}"
+            )
+        identity = self._attempt_identity(
+            outcome_kind="response",
+            cycle_id=committed.cycle_id,
+            scope_id=committed.scope_id,
+            endpoint=committed.endpoint,
+            attempt=committed.attempt,
+            url=committed.url,
+            observed_at=committed.fetched_at,
+            capture_id=committed.capture_id,
+            capture_manifest_uri=self._uri(
+                self.capture_manifest_key(committed.capture_id)
+            ),
+            raw_body_hash=committed.content_hash,
+            status_code=committed.status_code,
+            error_kind=None,
+            error_type=None,
+        )
+        return self._publish_attempt_envelope(identity)
+
+    def store_transport_error(
+        self,
+        *,
+        url: str,
+        fetched_at: Optional[str],
+        cycle_id: str,
+        scope_id: str,
+        endpoint: str,
+        attempt: int,
+        error_kind: str,
+        error_type: str,
+    ) -> RawAttemptEnvelopeRecord:
+        """Publish a body-free transport failure without exception text."""
+
+        identity = self._attempt_identity(
+            outcome_kind="transport_error",
+            cycle_id=cycle_id,
+            scope_id=scope_id,
+            endpoint=endpoint,
+            attempt=attempt,
+            url=url,
+            observed_at=_utc_iso(fetched_at),
+            capture_id=None,
+            capture_manifest_uri=None,
+            raw_body_hash=None,
+            status_code=None,
+            error_kind=error_kind,
+            error_type=error_type,
+        )
+        return self._publish_attempt_envelope(identity)
+
     def load_capture(self, capture_id: str) -> tuple[bytes, RawCaptureRecord]:
         """Load and fully verify exact response bytes for offline replay."""
 
@@ -654,7 +920,10 @@ class RawResponseStore:
             if record.content_type is not None and type(record.content_type) is not str:
                 raise TypeError("manifest content_type must be a string or null")
             ordinal = _integer(
-                record.attempt, "attempt", minimum=0, maximum=1_000_000
+                record.attempt,
+                "attempt",
+                minimum=0,
+                maximum=MAX_ATTEMPT_ORDINAL,
             )
             status = _integer(
                 record.status_code,
@@ -713,6 +982,137 @@ class RawResponseStore:
             expected_stored_bytes=stored_bytes,
         )
         return body, record
+
+    def load_attempt_envelope(
+        self,
+        envelope_id: str,
+    ) -> RawAttemptEnvelopeRecord:
+        """Load and verify an envelope and its response capture, if present."""
+
+        key = self.attempt_manifest_key(envelope_id)
+        try:
+            payload = json.loads(self._read_bytes(key).decode("utf-8"))
+            if type(payload) is not dict:
+                raise TypeError("manifest must be an object")
+            record = RawAttemptEnvelopeRecord(**payload)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+            raise RawCaptureCorrupt(
+                f"Invalid raw attempt envelope: {key}"
+            ) from exc
+        try:
+            text_fields = (
+                record.manifest_version,
+                record.envelope_id,
+                record.record_hash,
+                record.hash_algorithm,
+                record.source,
+                record.outcome_kind,
+                record.cycle_id,
+                record.scope_id,
+                record.endpoint,
+                record.url,
+                record.observed_at,
+                record.envelope_uri,
+            )
+            if any(
+                type(value) is not str or not value or value != value.strip()
+                for value in text_fields
+            ):
+                raise TypeError("envelope string field has an invalid type")
+            identity = self._attempt_identity(
+                outcome_kind=record.outcome_kind,
+                cycle_id=record.cycle_id,
+                scope_id=record.scope_id,
+                endpoint=record.endpoint,
+                attempt=record.attempt,
+                url=record.url,
+                observed_at=record.observed_at,
+                capture_id=record.capture_id,
+                capture_manifest_uri=record.capture_manifest_uri,
+                raw_body_hash=record.raw_body_hash,
+                status_code=record.status_code,
+                error_kind=record.error_kind,
+                error_type=record.error_type,
+            )
+            expected_id = self.allocate_attempt_envelope_id(**identity)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RawCaptureCorrupt(
+                f"Invalid raw attempt envelope identity: {key}"
+            ) from exc
+        stored_identity = {
+            "attempt": record.attempt,
+            "capture_id": record.capture_id,
+            "capture_manifest_uri": record.capture_manifest_uri,
+            "cycle_id": record.cycle_id,
+            "endpoint": record.endpoint,
+            "error_kind": record.error_kind,
+            "error_type": record.error_type,
+            "manifest_version": record.manifest_version,
+            "observed_at": record.observed_at,
+            "outcome_kind": record.outcome_kind,
+            "raw_body_hash": record.raw_body_hash,
+            "scope_id": record.scope_id,
+            "source": record.source,
+            "status_code": record.status_code,
+            "url": record.url,
+        }
+        if (
+            record.manifest_version != ATTEMPT_ENVELOPE_VERSION
+            or record.envelope_id != envelope_id
+            or record.record_hash != envelope_id
+            or expected_id != envelope_id
+            or stored_identity != identity
+            or record.hash_algorithm != "sha256"
+            or record.source != "transfermarkt"
+            or record.envelope_uri != self._uri(key)
+        ):
+            raise RawCaptureCorrupt(f"Attempt envelope identity mismatch: {key}")
+
+        if record.outcome_kind == "response":
+            assert record.capture_id is not None
+            _, capture = self.load_capture(record.capture_id)
+            if (
+                record.capture_manifest_uri
+                != self._uri(self.capture_manifest_key(capture.capture_id))
+                or record.raw_body_hash != capture.content_hash
+                or record.status_code != capture.status_code
+                or record.cycle_id != capture.cycle_id
+                or record.scope_id != capture.scope_id
+                or record.endpoint != capture.endpoint
+                or record.attempt != capture.attempt
+                or record.url != capture.url
+                or record.observed_at != capture.fetched_at
+            ):
+                raise RawCaptureCorrupt(
+                    f"Attempt envelope capture mismatch: {key}"
+                )
+        return record
+
+    def verify_attempt_envelope(
+        self,
+        envelope_id: str,
+    ) -> RawAttemptEnvelopeRecord:
+        """Verify immutable attempt evidence and return its typed record."""
+
+        return self.load_attempt_envelope(envelope_id)
+
+    def load_attempt(self, envelope_id: str) -> RawAttemptEnvelopeRecord:
+        """Short alias for callers that already model the object as an attempt."""
+
+        return self.load_attempt_envelope(envelope_id)
+
+    def verify_attempt(self, envelope_id: str) -> RawAttemptEnvelopeRecord:
+        """Short alias for full attempt-envelope verification."""
+
+        return self.verify_attempt_envelope(envelope_id)
+
+    def replay_attempt(self, envelope_id: str) -> Optional[bytes]:
+        """Replay verified response bytes; transport failures have no body."""
+
+        record = self.load_attempt_envelope(envelope_id)
+        if record.capture_id is None:
+            return None
+        return self.load_capture(record.capture_id)[0]
 
     def replay(self, capture_id: str) -> bytes:
         """Return verified parser input without any source request."""

@@ -279,6 +279,7 @@ class TestPlanningGate:
         assert captured['params']['leagues'] == ['ENG-Premier League']
         assert captured['max_batch_size'] == 8
         assert captured['parent_cycle_id'] == 'scheduled__2026-07-13'
+        assert captured['selection_mode'] == 'current_only'
         assert len(environments) == 1
         env = environments[0]
         assert json.loads(env['TM_SCOPE_PAYLOAD_JSON'])['scope_id'] == 'GB1__2025'

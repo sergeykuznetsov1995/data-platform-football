@@ -12,6 +12,7 @@ import pytest
 from pyarrow import fs
 
 from scrapers.transfermarkt.raw_store import (
+    ATTEMPT_ENVELOPE_VERSION,
     RAW_MANIFEST_VERSION,
     RawCaptureConflict,
     RawCaptureCorrupt,
@@ -43,6 +44,21 @@ def _capture(store, body=b"<html>exact</html>\n", **overrides):
     }
     values.update(overrides)
     return store.store_attempt(**values)
+
+
+def _transport_envelope(store, **overrides):
+    values = {
+        "url": URL,
+        "fetched_at": FETCHED_AT,
+        "cycle_id": "tm-child-abc",
+        "scope_id": "GB1:2025",
+        "endpoint": "competition_page",
+        "attempt": 2,
+        "error_kind": "tls",
+        "error_type": "SSLCertVerificationError",
+    }
+    values.update(overrides)
+    return store.store_transport_error(**values)
 
 
 def _concurrent_capture_worker(uri, start, result):
@@ -80,6 +96,101 @@ def test_exact_bytes_round_trip_and_idempotent_attempt(tmp_path):
         f"{record.content_hash}.body.gz"
     )
     assert record.raw_uri.endswith(f"/{record.blob_key}")
+
+
+def test_response_attempt_envelope_references_v1_capture_and_replays(tmp_path):
+    store = _store(tmp_path)
+    body = b"<html>response-envelope</html>"
+    capture = _capture(store, body)
+    capture_manifest = store._read_bytes(
+        store.capture_manifest_key(capture.capture_id)
+    )
+
+    first = store.store_response_envelope(capture)
+    second = store.store_response_envelope(capture)
+    loaded = store.load_attempt_envelope(first.envelope_id)
+
+    assert first == second == loaded
+    assert first.manifest_version == ATTEMPT_ENVELOPE_VERSION
+    assert first.record_hash == first.envelope_id
+    assert first.outcome_kind == "response"
+    assert first.capture_id == capture.capture_id
+    assert first.raw_body_hash == capture.content_hash
+    assert first.status_code == capture.status_code
+    assert first.capture_manifest_uri.endswith(
+        store.capture_manifest_key(capture.capture_id)
+    )
+    assert store.verify_attempt_envelope(first.envelope_id) == first
+    assert store.load_attempt(first.envelope_id) == first
+    assert store.verify_attempt(first.envelope_id) == first
+    assert store.replay_attempt(first.envelope_id) == body
+    # The extension is additive: neither the v1 capture manifest nor its body
+    # key is rewritten to carry the new envelope contract.
+    assert store._read_bytes(
+        store.capture_manifest_key(capture.capture_id)
+    ) == capture_manifest
+    assert len(list((tmp_path / "raw" / "captures").rglob("*.json"))) == 1
+    assert len(list((tmp_path / "raw" / "attempts").rglob("*.json"))) == 1
+
+
+def test_attempt_id_is_independent_of_raw_store_location(tmp_path):
+    first_store = RawResponseStore.from_uri((tmp_path / "one").as_uri())
+    second_store = RawResponseStore.from_uri((tmp_path / "two").as_uri())
+
+    first = first_store.store_response_envelope(_capture(first_store))
+    second = second_store.store_response_envelope(_capture(second_store))
+
+    assert first.envelope_id == second.envelope_id
+    assert first.capture_manifest_uri != second.capture_manifest_uri
+    assert first.envelope_uri != second.envelope_uri
+
+
+def test_transport_attempt_envelope_has_no_body_or_exception_text(tmp_path):
+    store = _store(tmp_path)
+
+    record = _transport_envelope(store)
+    loaded = store.load_attempt_envelope(record.envelope_id)
+    manifest = store._read_bytes(store.attempt_manifest_key(record.envelope_id))
+
+    assert loaded == record
+    assert record.outcome_kind == "transport_error"
+    assert record.capture_id is None
+    assert record.capture_manifest_uri is None
+    assert record.raw_body_hash is None
+    assert record.status_code is None
+    assert record.error_kind == "tls"
+    assert record.error_type == "SSLCertVerificationError"
+    assert store.replay_attempt(record.envelope_id) is None
+    assert not (tmp_path / "raw" / "blobs").exists()
+    assert not (tmp_path / "raw" / "captures").exists()
+    assert b"error_message" not in manifest
+    assert b"password" not in manifest.lower()
+
+
+def test_transport_envelope_rejects_unsafe_error_metadata(tmp_path):
+    store = _store(tmp_path)
+
+    with pytest.raises(ValueError, match="safe exception class"):
+        _transport_envelope(
+            store,
+            error_type="TLS failure token=secret password=hunter2",
+        )
+    with pytest.raises(ValueError, match="allowlisted"):
+        _transport_envelope(store, error_kind="arbitrary-secret-kind")
+
+
+def test_attempt_envelope_hash_detects_tampering(tmp_path):
+    store = _store(tmp_path)
+    record = _transport_envelope(store)
+    key = store.attempt_manifest_key(record.envelope_id)
+    manifest = json.loads(store._read_bytes(key))
+    manifest["error_kind"] = "connection"
+    store._write_bytes(key, json.dumps(manifest).encode("utf-8"))
+
+    with pytest.raises(RawCaptureCorrupt, match="identity mismatch"):
+        store.load_attempt_envelope(record.envelope_id)
+    with pytest.raises(RawCaptureCorrupt, match="identity mismatch"):
+        store.replay_attempt(record.envelope_id)
 
 
 def test_gzip_bytes_are_deterministic_with_zero_mtime(tmp_path):
