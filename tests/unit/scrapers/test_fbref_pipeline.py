@@ -51,6 +51,7 @@ from scrapers.fbref.raw_store import (
 )
 from scrapers.fbref.settings import (
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
+    DEFAULT_REQUEST_RESERVATION_BYTES,
     MIN_DOMAIN_INTERVAL_SECONDS,
 )
 from scrapers.fbref.typed_bronze import TYPED_BRONZE_PARSER_VERSION
@@ -3112,6 +3113,70 @@ def test_current_publication_blocks_pending_match_backlog(tmp_path):
     with pytest.raises(
         RunValidationError, match="promotion_pending_match_count=26"
     ):
+        pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:False" not in control.events
+
+
+def test_current_publication_tolerates_pending_after_budget_requeue(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary["promotion_pending_match_count"] = 26
+    summary["target_counts"] = {"succeeded": 5, "skipped": 3}
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:True" in control.events
+
+
+def test_current_publication_tolerates_pending_when_request_budget_spent(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.run["requests_used"] = control.run["request_limit"]
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary["promotion_pending_match_count"] = 26
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:True" in control.events
+
+
+def test_current_publication_tolerates_pending_when_byte_budget_cannot_fund_a_fetch(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.run["bytes_used"] = (
+        control.run["byte_limit"] - DEFAULT_REQUEST_RESERVATION_BYTES + 1
+    )
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary["promotion_pending_match_count"] = 26
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:True" in control.events
+
+
+def test_budget_stopped_pending_run_still_fails_on_budget_overrun(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary["promotion_pending_match_count"] = 26
+    summary["target_counts"] = {"succeeded": 5, "skipped": 3}
+    summary["budget_exceeded"] = True
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(RunValidationError, match="budget_exceeded=true"):
         pipeline.validate_and_finish(str(uuid.uuid4()))
 
     assert "finish:False" not in control.events
