@@ -66,11 +66,25 @@ SCHEDULED_SCOPE_PLAYER_ADDITIONAL_PAGES_PER_FEED = 99
 SCHEDULED_SCOPE_PLAYER_PAGINATION_TARGET_LIMIT_ENV = (
     "WHOSCORED_PLAYER_PAGINATION_TARGET_LIMIT"
 )
-WHOSCORED_CHARTER_SCHEMA_VERSION = 4
-WHOSCORED_ROLLOUT_MANIFEST_SCHEMA_VERSION = 3
-WHOSCORED_DAILY_PLAN_SCHEMA_VERSION = 3
+WHOSCORED_CHARTER_SCHEMA_VERSION = 5
+WHOSCORED_ROLLOUT_MANIFEST_SCHEMA_VERSION = 4
+WHOSCORED_DAILY_PLAN_SCHEMA_VERSION = 4
 WHOSCORED_DAILY_ACTIVE_SCOPE_CEILING = 2_000
-WHOSCORED_DAILY_PROVIDER_SAFETY_CAP_BYTES = 300_000_000
+WHOSCORED_PROVIDER_ORDER_HARD_CAP_BYTES = 1_000_000_000
+WHOSCORED_PROVIDER_SAFETY_RESERVE_PERCENT = 5
+# Backwards-compatible import name used by the offline signer.  The value is a
+# code-owned upper bound only; production authority must additionally bind the
+# exact provider receipt/order and retain the reserve below.
+WHOSCORED_DAILY_PROVIDER_SAFETY_CAP_BYTES = WHOSCORED_PROVIDER_ORDER_HARD_CAP_BYTES
+WHOSCORED_ACCELERATED_BOOTSTRAP_ACCEPTANCE_MODE = "accelerated-bootstrap-v1"
+WHOSCORED_ACCELERATED_BOOTSTRAP_WAVES = (
+    "wave-20",
+    "wave-20",
+    "wave-70",
+    "wave-70",
+    "wave-all",
+    "wave-all",
+)
 WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256 = hashlib.sha256(
     b"whoscored-rollout-promotion-genesis-v1"
 ).hexdigest()
@@ -97,6 +111,10 @@ WHOSCORED_ROLLOUT_MANIFEST_FIELDS = frozenset(
         "classifier_sha256",
         "promotion_acceptance_sha256",
         "promotion_terminal_receipt_sha256",
+        "acceptance_mode",
+        "bootstrap_slots",
+        "capacity_receipt_sha256",
+        "provider_order_cap_bytes",
     }
 )
 WHOSCORED_PROVIDER_POLICY_UNSIGNED_FIELDS = frozenset(
@@ -135,6 +153,10 @@ WHOSCORED_CHARTER_UNSIGNED_FIELDS = frozenset(
         "classifier_sha256",
         "promotion_acceptance_sha256",
         "promotion_terminal_receipt_sha256",
+        "acceptance_mode",
+        "bootstrap_slots",
+        "capacity_receipt_sha256",
+        "provider_order_cap_bytes",
         "valid_from",
         "valid_until",
         "daily_cap_bytes",
@@ -424,7 +446,15 @@ _SCHEDULED_AUTHORITY_FIELDS = frozenset(
         "monthly_cap_bytes",
         "order_cap_bytes",
         "max_issuances",
+        "acceptance_mode",
+        "bootstrap_slots",
+        "capacity_receipt_sha256",
+        "provider_order_cap_bytes",
     }
+)
+_BOOTSTRAP_SLOT_FIELDS = frozenset({"run_id", "logical_date", "wave_id"})
+_BOOTSTRAP_LOGICAL_DATE_RE = re.compile(
+    r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T10:00:00Z\Z", re.ASCII
 )
 _SCOPE_WORKLOAD_FIELDS = frozenset(
     {
@@ -652,6 +682,90 @@ def _utc_timestamp(value: object, field: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
         raise ProxyCampaignValidationError(f"{field} must use UTC")
     return parsed.astimezone(timezone.utc)
+
+
+def validate_whoscored_accelerated_bootstrap_fields(
+    value: Mapping[str, object], *, label: str
+) -> tuple[Mapping[str, object], ...]:
+    """Validate the owner-frozen six-run accelerated bootstrap authority.
+
+    The textual forms are part of the signed wire contract: logical dates use
+    ``Z`` while Airflow scheduled DagRun ids use ``+00:00``.  Accepting other
+    equivalent ISO spellings would make the timetable/issuer binding
+    ambiguous and would weaken idempotent replay checks.
+    """
+
+    if value.get("acceptance_mode") != WHOSCORED_ACCELERATED_BOOTSTRAP_ACCEPTANCE_MODE:
+        raise ProxyCampaignValidationError(
+            f"{label}.acceptance_mode must be accelerated-bootstrap-v1"
+        )
+    _digest(
+        value.get("capacity_receipt_sha256"),
+        f"{label}.capacity_receipt_sha256",
+    )
+    provider_order_cap = _integer(
+        value.get("provider_order_cap_bytes"),
+        f"{label}.provider_order_cap_bytes",
+    )
+    if provider_order_cap > WHOSCORED_PROVIDER_ORDER_HARD_CAP_BYTES:
+        raise ProxyCampaignValidationError(
+            f"{label}.provider_order_cap_bytes exceeds the 1 GB hard cap"
+        )
+    raw_slots = value.get("bootstrap_slots")
+    if not isinstance(raw_slots, list) or len(raw_slots) != len(
+        WHOSCORED_ACCELERATED_BOOTSTRAP_WAVES
+    ):
+        raise ProxyCampaignValidationError(
+            f"{label}.bootstrap_slots must contain exactly six slots"
+        )
+    slots: list[Mapping[str, object]] = []
+    previous_logical: datetime | None = None
+    for index, (raw_slot, expected_wave) in enumerate(
+        zip(raw_slots, WHOSCORED_ACCELERATED_BOOTSTRAP_WAVES, strict=True)
+    ):
+        if (
+            not isinstance(raw_slot, Mapping)
+            or frozenset(raw_slot) != _BOOTSTRAP_SLOT_FIELDS
+        ):
+            raise ProxyCampaignValidationError(
+                f"{label}.bootstrap_slots[{index}] fields are invalid"
+            )
+        logical_date = raw_slot.get("logical_date")
+        run_id = raw_slot.get("run_id")
+        wave_id = raw_slot.get("wave_id")
+        if (
+            not isinstance(logical_date, str)
+            or _BOOTSTRAP_LOGICAL_DATE_RE.fullmatch(logical_date) is None
+        ):
+            raise ProxyCampaignValidationError(
+                f"{label}.bootstrap_slots[{index}].logical_date is not canonical"
+            )
+        logical = _utc_timestamp(
+            logical_date, f"{label}.bootstrap_slots[].logical_date"
+        )
+        expected_run_id = "scheduled__" + logical.isoformat()
+        if run_id != expected_run_id or wave_id != expected_wave:
+            raise ProxyCampaignValidationError(
+                f"{label}.bootstrap_slots[{index}] run/wave binding is invalid"
+            )
+        if previous_logical is not None and logical != previous_logical + timedelta(
+            days=1
+        ):
+            raise ProxyCampaignValidationError(
+                f"{label}.bootstrap_slots must be consecutive daily 10:00 UTC slots"
+            )
+        previous_logical = logical
+        slots.append(dict(raw_slot))
+    return tuple(slots)
+
+
+def whoscored_provider_spendable_cap_bytes(provider_order_cap_bytes: int) -> int:
+    """Return the receipt-bound order allowance after the mandatory reserve."""
+
+    gross = _integer(provider_order_cap_bytes, "provider_order_cap_bytes")
+    if gross > WHOSCORED_PROVIDER_ORDER_HARD_CAP_BYTES:
+        raise ProxyCampaignValidationError("provider order cap exceeds 1 GB")
+    return gross * (100 - WHOSCORED_PROVIDER_SAFETY_RESERVE_PERCENT) // 100
 
 
 def _now(value: datetime | None = None) -> datetime:
@@ -1125,6 +1239,10 @@ class ScheduledProxyAuthority:
     monthly_cap_bytes: int
     order_cap_bytes: int
     max_issuances: int
+    acceptance_mode: str
+    bootstrap_slots: tuple[Mapping[str, object], ...]
+    capacity_receipt_sha256: str
+    provider_order_cap_bytes: int
 
     @classmethod
     def from_dict(cls, value: object) -> "ScheduledProxyAuthority":
@@ -1159,6 +1277,9 @@ class ScheduledProxyAuthority:
             raise ProxyCampaignValidationError(
                 "scheduled_authority.billing_month must be YYYY-MM"
             )
+        bootstrap_slots = validate_whoscored_accelerated_bootstrap_fields(
+            value, label="scheduled_authority"
+        )
         result = cls(
             provider_policy_sha256=_digest(
                 value.get("provider_policy_sha256"),
@@ -1262,12 +1383,28 @@ class ScheduledProxyAuthority:
             max_issuances=_integer(
                 value.get("max_issuances"), "scheduled_authority.max_issuances"
             ),
+            acceptance_mode=str(value.get("acceptance_mode")),
+            bootstrap_slots=bootstrap_slots,
+            capacity_receipt_sha256=_digest(
+                value.get("capacity_receipt_sha256"),
+                "scheduled_authority.capacity_receipt_sha256",
+            ),
+            provider_order_cap_bytes=_integer(
+                value.get("provider_order_cap_bytes"),
+                "scheduled_authority.provider_order_cap_bytes",
+            ),
         )
         if not (
             result.daily_cap_bytes <= result.monthly_cap_bytes <= result.order_cap_bytes
         ):
             raise ProxyCampaignValidationError(
                 "scheduled daily/monthly/order caps are inconsistent"
+            )
+        if result.order_cap_bytes > whoscored_provider_spendable_cap_bytes(
+            result.provider_order_cap_bytes
+        ):
+            raise ProxyCampaignValidationError(
+                "scheduled order cap consumes the mandatory provider safety reserve"
             )
         expected_wave = WHOSCORED_ROLLOUT_WAVE_CONTRACTS.get(result.wave_id)
         if (
@@ -1375,6 +1512,10 @@ class ScheduledProxyAuthority:
             "monthly_cap_bytes": self.monthly_cap_bytes,
             "order_cap_bytes": self.order_cap_bytes,
             "max_issuances": self.max_issuances,
+            "acceptance_mode": self.acceptance_mode,
+            "bootstrap_slots": [dict(item) for item in self.bootstrap_slots],
+            "capacity_receipt_sha256": self.capacity_receipt_sha256,
+            "provider_order_cap_bytes": self.provider_order_cap_bytes,
         }
 
 

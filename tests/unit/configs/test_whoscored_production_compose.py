@@ -738,6 +738,12 @@ def test_whoscored_paid_proxy_has_an_isolated_l7_application_boundary() -> None:
     assert command[command.index("--daily-budget-bytes") + 1] == (
         "${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES:?set exact provider-policy daily cap in decimal bytes}"
     )
+    assert command[command.index("--whoscored-provider-order-cap-bytes") + 1] == (
+        "${WHOSCORED_PROVIDER_ORDER_CAP_BYTES:?set exact signed provider gross order cap in decimal bytes}"
+    )
+    assert dedicated["environment"]["WHOSCORED_PROVIDER_ORDER_CAP_BYTES"] == (
+        "${WHOSCORED_PROVIDER_ORDER_CAP_BYTES:?set exact signed provider gross order cap in decimal bytes}"
+    )
     assert command[command.index("--max-lease-bytes") + 1] == (
         "${WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES:-2000000}"
     )
@@ -940,7 +946,7 @@ def test_targeted_rollout_creates_and_starts_only_one_admitted_service() -> None
         create_index = rollout.index(create)
         vacancy_index = rollout.index(f"vacancy-{service}.json")
         capture_index = rollout.index("capture-created-object", create_index)
-        post_create_index = rollout.index("post-create \\\n", create_index)
+        post_create_index = rollout.index("post-create-common \\\n", create_index)
         admission_index = rollout.index(admission, post_create_index)
         receipt_index = rollout.index(receipt_id, admission_index)
         assert vacancy_index < create_index
@@ -952,6 +958,7 @@ def test_targeted_rollout_creates_and_starts_only_one_admitted_service() -> None
 
     assert '"${COMPOSE[@]}" create' not in rollout
     assert '"${COMPOSE[@]}" start' not in rollout
+    assert rollout.count('select(.status == "common-created-admitted-v1"') == 2
 
 
 def test_split_cutover_inventory_gate_precedes_exact_id_lifecycle() -> None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -21,6 +21,40 @@ def _ranked_scopes(catalog_count: int = 163) -> list[str]:
 
 def _scope_list_hash(scopes) -> str:
     return hashlib.sha256(("\n".join(scopes) + "\n").encode("utf-8")).hexdigest()
+
+
+def _bootstrap_slots():
+    waves = ("wave-20", "wave-20", "wave-70", "wave-70", "wave-all", "wave-all")
+    first = datetime(2026, 7, 16, 10, tzinfo=timezone.utc)
+    return [
+        {
+            "logical_date": (first + timedelta(days=index))
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "run_id": f"scheduled__{(first + timedelta(days=index)).isoformat()}",
+            "wave_id": wave_id,
+        }
+        for index, wave_id in enumerate(waves)
+    ]
+
+
+def _bootstrap_slo(scope_plan, runtime, slot_index):
+    slot = scope_plan["bootstrap_slots"][slot_index]
+    return {
+        "schema_version": 1,
+        "contract": "bootstrap-slo-v1",
+        "capacity_contract": "cache-capacity-v1",
+        "status": "success",
+        "acceptance_mode": "accelerated-bootstrap-v1",
+        "slot_index": slot_index,
+        "run_id": slot["run_id"],
+        "logical_date": slot["logical_date"],
+        "wave_id": slot["wave_id"],
+        "elapsed_seconds": 7_200,
+        "limit_seconds": 21_600,
+        "capacity_receipt_sha256": scope_plan["capacity_receipt_sha256"],
+        "runtime_sha256": runtime["runtime_contract"]["code_tree_sha256"],
+    }
 
 
 def _scope_plan(wave_id: str = "wave-20", *, catalog_count: int = 163):
@@ -58,6 +92,10 @@ def _scope_plan(wave_id: str = "wave-20", *, catalog_count: int = 163):
             if wave_id == "wave-20"
             else _digest(f"terminal:{wave_id}")
         ),
+        "acceptance_mode": "accelerated-bootstrap-v1",
+        "bootstrap_slots": _bootstrap_slots(),
+        "capacity_receipt_sha256": _digest("capacity-receipt"),
+        "provider_order_cap_bytes": 1_000_000_000,
     }
 
 
@@ -209,8 +247,8 @@ def _build(
     alert=None,
     scope_dq=None,
     terminal_task_states=None,
+    logical_date_override=None,
 ):
-    logical_date = datetime(2026, 7, day, 10, tzinfo=timezone.utc)
     resolved_runtime = runtime or _runtime()
     resolved_plan = dict(scope_plan or _scope_plan(wave_id))
     if scope_plan is None:
@@ -231,16 +269,52 @@ def _build(
             resolved_plan["promotion_acceptance_sha256"] = _digest(
                 f"proof:{terminal_digest}"
             )
+    wave_index = acceptance.WAVE_ORDER.index(wave_id)
+    within_wave = sum(
+        1
+        for _key, receipt in records
+        if receipt.get("scope", {}).get("wave_id") == wave_id
+    )
+    slot_index = wave_index * 2 + min(within_wave, 1)
+    slot = resolved_plan["bootstrap_slots"][slot_index]
+    logical_date = logical_date_override or datetime.fromisoformat(
+        slot["logical_date"].replace("Z", "+00:00")
+    )
+    if previous is not None:
+        legacy_previous = datetime(2026, 7, day, 10, tzinfo=timezone.utc) - timedelta(
+            days=1
+        )
+        if previous.get("logical_date") == legacy_previous:
+            matching = [
+                receipt
+                for _key, receipt in records
+                if receipt.get("run_id") == previous.get("run_id")
+            ]
+            if len(matching) == 1:
+                previous = {
+                    **previous,
+                    "logical_date": datetime.fromisoformat(
+                        matching[0]["logical_date"].replace("Z", "+00:00")
+                    ),
+                }
     selected_count = resolved_plan["active_scope_count"]
     return acceptance.build_success_receipt(
-        run_id=f"scheduled__{logical_date.isoformat()}",
+        run_id=(
+            f"scheduled__{logical_date.isoformat()}"
+            if logical_date_override is not None
+            else slot["run_id"]
+        ),
         logical_date=logical_date,
         scope_plan=resolved_plan,
         runtime_preflight=resolved_runtime,
         catalog_dq=_catalog_dq(),
         profile_dq=_profile_dq(),
         traffic_dq=_traffic_dq(),
-        daily_slo=daily_slo or {"status": "success", "p95_hours": 2.0, "samples": 20},
+        daily_slo=(
+            _bootstrap_slo(resolved_plan, resolved_runtime, slot_index)
+            if daily_slo is None
+            else daily_slo
+        ),
         alert_preflight=alert
         or {
             "status": "delivered",
@@ -327,13 +401,14 @@ def test_only_empty_scheduler_created_run_is_countable():
 @pytest.mark.unit
 def test_public_evidence_replay_matches_receipt_authority_and_green_witnesses():
     scope_plan = _scope_plan()
+    runtime = _runtime()
     kwargs = {
         "scope_plan": scope_plan,
-        "runtime_preflight": _runtime(),
+        "runtime_preflight": runtime,
         "catalog_dq": _catalog_dq(),
         "profile_dq": _profile_dq(),
         "traffic_dq": _traffic_dq(),
-        "daily_slo": {"status": "success", "p95_hours": 2.0, "samples": 20},
+        "daily_slo": _bootstrap_slo(scope_plan, runtime, 0),
         "alert_preflight": {
             "status": "delivered",
             "campaign_id": "campaign-954",
@@ -691,8 +766,12 @@ def test_complete_three_wave_chain_reports_accepted():
                 "runtime_sha256",
                 "classifier_sha256",
                 "promotion_acceptance_sha256",
-                "promotion_terminal_receipt_sha256",
-            )
+                    "promotion_terminal_receipt_sha256",
+                    "acceptance_mode",
+                    "bootstrap_slots",
+                    "capacity_receipt_sha256",
+                    "provider_order_cap_bytes",
+                )
         },
         "final_wave_receipt_sha256": _receipt_key(prior_accepted)
         .rsplit("/", 1)[-1]
@@ -758,7 +837,7 @@ def test_full_wave_rejects_any_deferred_scope():
             {"status": "warming_up"},
             None,
             None,
-            "rolling daily SLO is not green",
+            "bootstrap SLO authority is not green",
         ),
         (
             None,
@@ -859,12 +938,13 @@ def test_next_wave_cannot_predate_accepted_prior_wave():
 
     with pytest.raises(
         acceptance.WhoScoredRolloutAcceptanceError,
-        match="requires accepted wave-20",
+        match="signed bootstrap slot",
     ):
         _build(
             day=19,
             wave_id="wave-70",
             records=[_record(first), _record(accepted_20)],
+            logical_date_override=datetime(2026, 7, 15, 10, tzinfo=timezone.utc),
         )
 
 
@@ -931,19 +1011,20 @@ def test_durable_receipt_first_write_and_retry_are_identical():
             return f"s3://ops/{key}"
 
     store = Store()
-    logical_date = datetime(2026, 7, 22, 10, tzinfo=timezone.utc)
+    logical_date = datetime(2026, 7, 16, 10, tzinfo=timezone.utc)
     plan = _scope_plan("wave-20")
+    runtime = _runtime()
     kwargs = {
         "ops_store": store,
         "run_id": f"scheduled__{logical_date.isoformat()}",
         "logical_date": logical_date,
         "scope_plan": plan,
-        "runtime_preflight": _runtime(),
+        "runtime_preflight": runtime,
         "catalog_dq": _catalog_dq(),
         "scope_dq": _scope_dq(plan["active_scopes"]),
         "profile_dq": _profile_dq(),
         "traffic_dq": _traffic_dq(),
-        "daily_slo": {"status": "success", "p95_hours": 2.0, "samples": 20},
+        "daily_slo": _bootstrap_slo(plan, runtime, 0),
         "alert_preflight": {
             "status": "delivered",
             "campaign_id": "campaign-954",

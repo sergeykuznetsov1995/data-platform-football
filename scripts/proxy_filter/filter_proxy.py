@@ -129,6 +129,7 @@ from scrapers.whoscored.proxy_campaign import (  # noqa: E402 - standalone entry
     PROXY_CAMPAIGN_CONTROL_SCHEMA_VERSION,
     WHOSCORED_PAID_APPLICATION_GATEWAY_AVAILABLE,
     WHOSCORED_PROVIDER_INVOICE_HARD_CAP_AVAILABLE,
+    WHOSCORED_PROVIDER_ORDER_HARD_CAP_BYTES,
     WHOSCORED_FULL_PAID_CRAWL_AVAILABLE,
     WHOSCORED_PAID_DAG_IDS,
     WHOSCORED_PROXY_ALLOWED_HOSTS,
@@ -146,6 +147,7 @@ from scrapers.whoscored.proxy_campaign import (  # noqa: E402 - standalone entry
     canonical_json_bytes,
     daily_ingest_paid_crawl_allowed,
     strict_json_loads,
+    whoscored_provider_spendable_cap_bytes,
 )
 
 logging.basicConfig(
@@ -244,14 +246,14 @@ WHOSCORED_CAMPAIGN_LEDGER_PATH = (
 WHOSCORED_STATE_MARKER_PATH = (
     "/opt/airflow/state/whoscored-proxy-filter/.whoscored_state_initialized.json"
 )
-# Report/checkpoint payloads remain v1; the namespace marker itself is v2 and
-# binds that whole protected state tree to one exact provider order/policy.
+# Report/checkpoint payloads remain v1; the namespace marker itself is v3 and
+# binds that whole protected state tree to one exact provider order/policy/cap.
 WHOSCORED_STATE_SCHEMA_VERSION = 1
-WHOSCORED_STATE_MARKER_SCHEMA_VERSION = 2
+WHOSCORED_STATE_MARKER_SCHEMA_VERSION = 3
 WHOSCORED_PAID_LEDGER_CHAIN_SCHEMA_VERSION = 1
 # The owner-approved provider policy caps this order at exact decimal bytes.
 # Neither MiB conversion nor CLI/environment may enlarge these outer ceilings.
-WHOSCORED_PROVIDER_ORDER_SAFETY_CAP_BYTES = 300_000_000
+WHOSCORED_PROVIDER_ORDER_SAFETY_CAP_BYTES = WHOSCORED_PROVIDER_ORDER_HARD_CAP_BYTES
 WHOSCORED_MAX_LEASE_SAFETY_CAP_BYTES = 2_000_000
 MAX_LEDGER_EVENT_BYTES = 256 * 1024
 MAX_ALLOCATION_WAL_EVENT_BYTES = 4 * 1024 * 1024
@@ -320,6 +322,7 @@ WHOSCORED_PROXY_RUNTIME_SHA256 = ""
 WHOSCORED_STATE_ID = ""
 WHOSCORED_PROVIDER_ORDER_ID = ""
 WHOSCORED_PROVIDER_POLICY_SHA256 = ""
+WHOSCORED_PROVIDER_ORDER_CAP_BYTES = 0
 WHOSCORED_LEGACY_STATE_MARKER_LOADED = False
 _PAID_LEDGER_CHAIN_COUNT = 0
 _PAID_LEDGER_CHAIN_OFFSET = 0
@@ -1349,8 +1352,7 @@ def _validate_transfermarkt_control_token_separation(
     ):
         if token and backfill_token and secrets.compare_digest(token, backfill_token):
             raise ValueError(
-                "backfill proxy control token must be distinct "
-                f"from {name}"
+                f"backfill proxy control token must be distinct from {name}"
             )
 
 
@@ -1567,21 +1569,38 @@ def _daily_total_bytes() -> int:
     return _daily_up_bytes + _daily_down_bytes
 
 
-def _whoscored_provider_order_cap_bytes() -> int:
-    """Return the immutable order cap, further reduced by a lower daily cap."""
+def _whoscored_provider_order_cap_bytes(
+    approval: ProxyCampaignApproval | None = None,
+) -> int:
+    """Return the receipt-bound provider cap after the mandatory 5% reserve."""
 
-    return min(DAILY_BUDGET_BYTES, WHOSCORED_PROVIDER_ORDER_SAFETY_CAP_BYTES)
+    gross_cap = WHOSCORED_PROVIDER_ORDER_CAP_BYTES
+    authority = getattr(approval, "scheduled_authority", None)
+    if authority is not None and authority.provider_order_cap_bytes != gross_cap:
+        raise ProxyCampaignValidationError(
+            "scheduled WhoScored authority differs from provider order cap binding"
+        )
+    if (
+        isinstance(gross_cap, bool)
+        or not isinstance(gross_cap, int)
+        or not 1 <= gross_cap <= WHOSCORED_PROVIDER_ORDER_HARD_CAP_BYTES
+    ):
+        raise ProxyCampaignValidationError(
+            "WhoScored provider order cap binding is invalid"
+        )
+    return whoscored_provider_spendable_cap_bytes(gross_cap)
 
 
 def _whoscored_budget_availability(
     ledger: ProxyCampaignLedger,
+    approval: ProxyCampaignApproval | None = None,
 ) -> tuple[int, Mapping[str, int]]:
     """Conjoin signed state, global daily spend and lifetime order exposure."""
 
     accounting = ledger.provider_order_accounting()
     order_remaining = max(
         0,
-        _whoscored_provider_order_cap_bytes()
+        _whoscored_provider_order_cap_bytes(approval)
         - int(accounting["exposure_provider_bytes"]),
     )
     # The proxy WAL/report and campaign ledger are independent witnesses.  A
@@ -1603,12 +1622,13 @@ def _whoscored_budget_availability(
 
 def _assert_whoscored_provider_order_bound(
     ledger: ProxyCampaignLedger,
+    approval: ProxyCampaignApproval | None = None,
 ) -> None:
     """Re-read the durable escrow after mutation and reject any cap drift."""
 
-    _, accounting = _whoscored_budget_availability(ledger)
+    _, accounting = _whoscored_budget_availability(ledger, approval)
     if int(accounting["exposure_provider_bytes"]) > (
-        _whoscored_provider_order_cap_bytes()
+        _whoscored_provider_order_cap_bytes(approval)
     ):
         raise RuntimeError("WhoScored provider-order lifetime cap was exceeded")
     proven_today = max(
@@ -1928,19 +1948,25 @@ def _verify_signed_report(path: str) -> Mapping[str, object]:
     return body
 
 
-def _whoscored_state_binding() -> tuple[str, str]:
+def _whoscored_state_binding() -> tuple[str, str, int]:
     """Return the exact provider namespace configured by protected startup."""
 
     order_id = WHOSCORED_PROVIDER_ORDER_ID
     policy_sha256 = WHOSCORED_PROVIDER_POLICY_SHA256
+    order_cap_bytes = WHOSCORED_PROVIDER_ORDER_CAP_BYTES
     if (
         type(order_id) is not str
         or _CANONICAL_TOKEN_RE.fullmatch(order_id) is None
         or type(policy_sha256) is not str
         or _LOWER_SHA256_RE.fullmatch(policy_sha256) is None
+        or isinstance(order_cap_bytes, bool)
+        or not isinstance(order_cap_bytes, int)
+        or not 1 <= order_cap_bytes <= WHOSCORED_PROVIDER_ORDER_HARD_CAP_BYTES
+        or DAILY_BUDGET_BYTES
+        > whoscored_provider_spendable_cap_bytes(order_cap_bytes)
     ):
         raise RuntimeError("WhoScored provider state binding is invalid")
-    return order_id, policy_sha256
+    return order_id, policy_sha256, order_cap_bytes
 
 
 def _assert_whoscored_approval_state_binding(
@@ -1948,22 +1974,15 @@ def _assert_whoscored_approval_state_binding(
 ) -> None:
     """Never let scheduled-v3 authority use another order's counters."""
 
-    if WHOSCORED_LEGACY_STATE_MARKER_LOADED:
-        if approval.schema_version == SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION:
-            raise ProxyCampaignValidationError(
-                "scheduled WhoScored authority requires a provider-bound state marker"
-            )
-        return
-    order_id, policy_sha256 = _whoscored_state_binding()
+    order_id, policy_sha256, order_cap_bytes = _whoscored_state_binding()
     if approval.schema_version != SCHEDULED_PROXY_CAMPAIGN_SCHEMA_VERSION:
         return
     authority = approval.scheduled_authority
     if (
         authority is None
         or not hmac.compare_digest(authority.order_id, order_id)
-        or not hmac.compare_digest(
-            authority.provider_policy_sha256, policy_sha256
-        )
+        or not hmac.compare_digest(authority.provider_policy_sha256, policy_sha256)
+        or authority.provider_order_cap_bytes != order_cap_bytes
     ):
         raise ProxyCampaignValidationError(
             "scheduled WhoScored authority differs from provider state binding"
@@ -1972,7 +1991,7 @@ def _assert_whoscored_approval_state_binding(
 
 def _initialize_whoscored_state(out_path: str) -> None:
     global WHOSCORED_STATE_ID, WHOSCORED_LEGACY_STATE_MARKER_LOADED
-    order_id, policy_sha256 = _whoscored_state_binding()
+    order_id, policy_sha256, order_cap_bytes = _whoscored_state_binding()
     checkpoint_path = _paid_ledger_checkpoint_path()
     paths = (
         out_path,
@@ -2017,6 +2036,7 @@ def _initialize_whoscored_state(out_path: str) -> None:
         "state_id": WHOSCORED_STATE_ID,
         "order_id": order_id,
         "provider_policy_sha256": policy_sha256,
+        "provider_order_cap_bytes": order_cap_bytes,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "path_sha256": {
             "byte_report": _state_path_sha256(out_path),
@@ -2037,6 +2057,8 @@ def _load_whoscored_state_marker(
     out_path: str, *, allow_legacy_marker: bool = False
 ) -> None:
     global WHOSCORED_STATE_ID, WHOSCORED_LEGACY_STATE_MARKER_LOADED
+    if allow_legacy_marker:
+        raise RuntimeError("legacy WhoScored state markers are no longer accepted")
     raw = _require_private_regular_file(WHOSCORED_STATE_MARKER_PATH, allow_empty=False)
     try:
         value = strict_json_loads(raw)
@@ -2052,13 +2074,14 @@ def _load_whoscored_state_marker(
         "path_sha256",
         "signature",
     }
-    current_fields = common_fields | {"order_id", "provider_policy_sha256"}
-    legacy = schema_version == WHOSCORED_STATE_SCHEMA_VERSION
+    current_fields = common_fields | {
+        "order_id",
+        "provider_policy_sha256",
+        "provider_order_cap_bytes",
+    }
     if (
-        (schema_version == WHOSCORED_STATE_MARKER_SCHEMA_VERSION and frozenset(value) != current_fields)
-        or (legacy and (not allow_legacy_marker or frozenset(value) != common_fields))
-        or schema_version
-        not in {WHOSCORED_STATE_SCHEMA_VERSION, WHOSCORED_STATE_MARKER_SCHEMA_VERSION}
+        schema_version != WHOSCORED_STATE_MARKER_SCHEMA_VERSION
+        or frozenset(value) != current_fields
     ):
         raise RuntimeError("WhoScored state marker fields are invalid")
     body = {name: item for name, item in value.items() if name != "signature"}
@@ -2076,17 +2099,17 @@ def _load_whoscored_state_marker(
         or not hmac.compare_digest(str(value.get("signature")), _state_hmac(body))
     ):
         raise RuntimeError("WhoScored state marker authentication failed")
-    if not legacy:
-        order_id, policy_sha256 = _whoscored_state_binding()
-        if (
-            not hmac.compare_digest(str(body.get("order_id")), order_id)
-            or not hmac.compare_digest(
-                str(body.get("provider_policy_sha256")), policy_sha256
-            )
-        ):
-            raise RuntimeError("WhoScored state marker provider binding differs")
+    order_id, policy_sha256, order_cap_bytes = _whoscored_state_binding()
+    if (
+        not hmac.compare_digest(str(body.get("order_id")), order_id)
+        or not hmac.compare_digest(
+            str(body.get("provider_policy_sha256")), policy_sha256
+        )
+        or body.get("provider_order_cap_bytes") != order_cap_bytes
+    ):
+        raise RuntimeError("WhoScored state marker provider binding differs")
     WHOSCORED_STATE_ID = state_id
-    WHOSCORED_LEGACY_STATE_MARKER_LOADED = legacy
+    WHOSCORED_LEGACY_STATE_MARKER_LOADED = False
 
 
 def _verify_paid_ledger_chain(path: str) -> None:
@@ -2168,9 +2191,7 @@ def _verify_paid_ledger_chain(path: str) -> None:
 def _verify_whoscored_state(
     out_path: str, *, allow_legacy_marker: bool = False
 ) -> None:
-    _load_whoscored_state_marker(
-        out_path, allow_legacy_marker=allow_legacy_marker
-    )
+    _load_whoscored_state_marker(out_path, allow_legacy_marker=allow_legacy_marker)
     _verify_signed_report(out_path)
     _verify_paid_ledger_chain(LEDGER_PATH)
     _whoscored_campaign_ledger().verify_integrity()
@@ -3008,7 +3029,8 @@ def _create_lease(
             )
         proxy_campaign_ledger = _whoscored_campaign_ledger()
         whoscored_global_available, _ = _whoscored_budget_availability(
-            proxy_campaign_ledger
+            proxy_campaign_ledger,
+            proxy_campaign_approval,
         )
         if whoscored_global_available <= 0:
             raise RuntimeError("WhoScored global daily/provider-order budget exhausted")
@@ -3279,12 +3301,16 @@ def _create_lease(
                 proxy_campaign_approval,
                 proxy_campaign_claim,
                 lease.max_bytes,
-                provider_order_cap_bytes=_whoscored_provider_order_cap_bytes(),
+                provider_order_cap_bytes=_whoscored_provider_order_cap_bytes(
+                    proxy_campaign_approval
+                ),
                 global_daily_cap_bytes=DAILY_BUDGET_BYTES,
             )
             proxy_campaign_escrowed = True
             lease.global_budget_escrow_bytes = lease.max_bytes
-            _assert_whoscored_provider_order_bound(proxy_campaign_ledger)
+            _assert_whoscored_provider_order_bound(
+                proxy_campaign_ledger, proxy_campaign_approval
+            )
     except BaseException:
         if workload_plan is not None and allocation_claim is not None:
             _allocation_ledger().finish(
@@ -3468,9 +3494,7 @@ def _extend_fbref_lease(lease: Lease, new_max_bytes: int) -> dict[str, Any]:
     return _control_report(lease)
 
 
-def _lease_budget_capacity(
-    lease: Lease, *, include_reservations: bool
-) -> int:
+def _lease_budget_capacity(lease: Lease, *, include_reservations: bool) -> int:
     """Return exact spend capacity, optionally subtracting in-flight I/O.
 
     ``include_reservations=False`` is authoritative capacity after every
@@ -3509,9 +3533,7 @@ def _lease_budget_capacity(
     run_reserved = _run_reserved_bytes[run_key] if include_reservations else 0
     run_remaining = max(
         0,
-        _lease_dagrun_budget_bytes(lease)
-        - _run_total_bytes(run_key)
-        - run_reserved,
+        _lease_dagrun_budget_bytes(lease) - _run_total_bytes(run_key) - run_reserved,
     )
     url_reserved = _url_reserved_bytes[url_key] if include_reservations else 0
     url_remaining = max(
@@ -3566,10 +3588,7 @@ async def _wait_for_reservation_turnover(lease: Lease) -> None:
         # There is no await between the caller's capacity check and waiter
         # registration.  Rechecking here also protects future refactors and
         # makes close/revoke visible before this coroutine suspends.
-        if (
-            not lease.usable
-            or _lease_authoritative_remaining(lease) <= 0
-        ):
+        if not lease.usable or _lease_authoritative_remaining(lease) <= 0:
             return
         async with asyncio.timeout(_lease_operation_timeout(lease)):
             await waiter
@@ -3841,9 +3860,7 @@ def _account_lease_bytes(lease: Lease, host: str, direction: str, count: int) ->
             # owner is unattributable. Retain the full escrow and durably revoke
             # the campaign before refusing the chunk.
             _latch_lease_accounting_uncertainty(lease)
-            raise RuntimeError(
-                "WhoScored provider bytes have no active endpoint owner"
-            )
+            raise RuntimeError("WhoScored provider bytes have no active endpoint owner")
         if WHOSCORED_METER_BATCH_BYTES <= 0:
             raise RuntimeError("WhoScored metering batch must be positive")
         if count > lease.global_budget_escrow_bytes:
@@ -4233,9 +4250,7 @@ async def _pump(
                         break
                 else:
                     divisor = max(2, lease.active_provider_readers + 1)
-                    fair_window = max(
-                        1, (authoritative + divisor - 1) // divisor
-                    )
+                    fair_window = max(1, (authoritative + divisor - 1) // divisor)
                     read_size = min(read_size, fair_window)
             try:
                 metered_read = getattr(budget_guard, "read_metered", None)
@@ -4358,9 +4373,7 @@ async def _pump(
             # chunks. Only an observed provider EOF may release the lifecycle.
             _latch_lease_accounting_uncertainty(lease)
         if provider_reader_registered:
-            lease.active_provider_readers = max(
-                0, lease.active_provider_readers - 1
-            )
+            lease.active_provider_readers = max(0, lease.active_provider_readers - 1)
             _ACTIVE_PROVIDER_READERS = max(0, _ACTIVE_PROVIDER_READERS - 1)
             _notify_reservation_turnover()
         try:
@@ -4688,9 +4701,7 @@ def _begin_endpoint_request(lease: Lease, endpoint: str) -> str:
     return request_id
 
 
-def _switch_endpoint_request(
-    lease: Lease, request_id: str, endpoint: str
-) -> str:
+def _switch_endpoint_request(lease: Lease, request_id: str, endpoint: str) -> str:
     """Durably replace the browser byte owner without an event-loop gap."""
 
     endpoint = str(endpoint or "").strip()
@@ -4729,9 +4740,9 @@ def _switch_endpoint_request(
         next_endpoint=endpoint,
         lease_total_bytes=lease.total_bytes,
     )
-    lease.endpoint_request_provider_bytes.setdefault(
-        lease.current_endpoint, []
-    ).append(amount)
+    lease.endpoint_request_provider_bytes.setdefault(lease.current_endpoint, []).append(
+        amount
+    )
     lease.current_request_id = next_request_id
     lease.current_endpoint = endpoint
     lease.current_request_start_bytes = lease.total_bytes
@@ -5065,8 +5076,7 @@ async def _close_lease(
             not normalized_internal_map
             or normalized_internal_map != lease.endpoint_request_provider_bytes
             or sum(
-                sum(observations)
-                for observations in normalized_internal_map.values()
+                sum(observations) for observations in normalized_internal_map.values()
             )
             != lease.total_bytes
         ):
@@ -6104,10 +6114,7 @@ async def handle(
             lease is not None
             and (
                 lease.source == "sofascore"
-                or (
-                    lease.source == "whoscored"
-                    and SOURCE_MODE == "whoscored-only"
-                )
+                or (lease.source == "whoscored" and SOURCE_MODE == "whoscored-only")
             )
             and not lease.current_endpoint
         ):
@@ -6590,6 +6597,7 @@ async def main() -> None:
     global WHOSCORED_PROXY_RUNTIME_SHA256
     global WHOSCORED_STATE_MARKER_PATH, WHOSCORED_STATE_ID
     global WHOSCORED_PROVIDER_ORDER_ID, WHOSCORED_PROVIDER_POLICY_SHA256
+    global WHOSCORED_PROVIDER_ORDER_CAP_BYTES
     global WHOSCORED_LEGACY_STATE_MARKER_LOADED
     global _PAID_LEDGER_CHAIN_COUNT, _PAID_LEDGER_CHAIN_OFFSET
     global _PAID_LEDGER_CHAIN_TAIL
@@ -6798,11 +6806,22 @@ async def main() -> None:
         help="exact signed provider-policy digest owning the protected state",
     )
     ap.add_argument(
+        "--whoscored-provider-order-cap-bytes",
+        type=int,
+        default=(
+            int(os.environ["WHOSCORED_PROVIDER_ORDER_CAP_BYTES"])
+            if os.environ.get("WHOSCORED_PROVIDER_ORDER_CAP_BYTES")
+            else None
+        ),
+        help=(
+            "exact signed provider gross order cap; required in whoscored-only mode"
+        ),
+    )
+    ap.add_argument(
         "--allow-legacy-whoscored-state-marker-v1",
         action="store_true",
         help=(
-            "explicit manual/schema-v2 compatibility for a legacy unbound marker; "
-            "scheduled schema-v3 approvals remain forbidden"
+            "removed compatibility switch; legacy unbound markers fail closed"
         ),
     )
     ap.add_argument(
@@ -6905,6 +6924,9 @@ async def main() -> None:
     max_lease_mb = float(getattr(args, "max_lease_mb", 24.0))
     exact_daily_budget_bytes = getattr(args, "daily_budget_bytes", None)
     exact_max_lease_bytes = getattr(args, "max_lease_bytes", None)
+    provider_order_cap_bytes = getattr(
+        args, "whoscored_provider_order_cap_bytes", None
+    )
     max_lease_ttl_seconds = int(
         getattr(args, "max_lease_ttl_seconds", MAX_LEASE_TTL_SECONDS)
     )
@@ -6961,10 +6983,16 @@ async def main() -> None:
         isinstance(exact_daily_budget_bytes, bool)
         or not isinstance(exact_daily_budget_bytes, int)
         or exact_daily_budget_bytes <= 0
+        or isinstance(provider_order_cap_bytes, bool)
+        or not isinstance(provider_order_cap_bytes, int)
+        or not 1
+        <= provider_order_cap_bytes
+        <= WHOSCORED_PROVIDER_ORDER_HARD_CAP_BYTES
         or isinstance(exact_max_lease_bytes, bool)
         or not isinstance(exact_max_lease_bytes, int)
         or exact_max_lease_bytes <= 0
-        or exact_daily_budget_bytes > WHOSCORED_PROVIDER_ORDER_SAFETY_CAP_BYTES
+        or exact_daily_budget_bytes
+        > whoscored_provider_spendable_cap_bytes(provider_order_cap_bytes)
         or exact_max_lease_bytes > WHOSCORED_MAX_LEASE_SAFETY_CAP_BYTES
     ):
         raise SystemExit(
@@ -7127,6 +7155,7 @@ async def main() -> None:
     WHOSCORED_PROVIDER_POLICY_SHA256 = str(
         getattr(args, "whoscored_provider_policy_sha256", "") or ""
     ).strip()
+    WHOSCORED_PROVIDER_ORDER_CAP_BYTES = int(provider_order_cap_bytes or 0)
     WHOSCORED_STATE_ID = ""
     WHOSCORED_LEGACY_STATE_MARKER_LOADED = False
     _PAID_LEDGER_CHAIN_COUNT = 0
@@ -7187,6 +7216,8 @@ async def main() -> None:
     allow_legacy_state_marker = bool(
         getattr(args, "allow_legacy_whoscored_state_marker_v1", False)
     )
+    if allow_legacy_state_marker:
+        raise SystemExit("legacy WhoScored state markers are no longer accepted")
     if SOURCE_MODE != "whoscored-only" and initialize_state:
         raise SystemExit(
             "--initialize-whoscored-state requires --source-mode=whoscored-only"
@@ -7198,12 +7229,7 @@ async def main() -> None:
         )
     if SOURCE_MODE == "whoscored-only":
         try:
-            if initialize_state and allow_legacy_state_marker:
-                raise RuntimeError(
-                    "new WhoScored state cannot use a legacy unbound marker"
-                )
-            if not allow_legacy_state_marker:
-                _whoscored_state_binding()
+            _whoscored_state_binding()
             if initialize_state:
                 _initialize_whoscored_state(out_path)
                 log.info("initialized protected WhoScored filter state")

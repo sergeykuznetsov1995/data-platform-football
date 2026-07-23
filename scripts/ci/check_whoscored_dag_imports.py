@@ -15,8 +15,7 @@ def main() -> None:
     )
     if dag_bag.import_errors:
         details = "\n".join(
-            f"{path}: {error}"
-            for path, error in sorted(dag_bag.import_errors.items())
+            f"{path}: {error}" for path, error in sorted(dag_bag.import_errors.items())
         )
         raise SystemExit(f"real Airflow DAG import errors:\n{details}")
 

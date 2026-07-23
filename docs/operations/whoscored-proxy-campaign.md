@@ -4,8 +4,8 @@ This runbook covers the manual measurement canary only. Its legacy signed
 envelope is `1_000_000_000` decimal provider-billed bytes and it is valid only
 for `dag_canary_whoscored_proxy`; the provider order also has a 1.00 decimal-GB
 quota. Neither value is executable authority for the whole amount. This release
-enforces the stricter exact `300000000` decimal-byte lifetime ceiling across the
-initialized provider-order state and does not authorize a full paid crawl. That
+binds the initialized state to the signed provider receipt/order, caps gross
+authority at `1_000_000_000` decimal bytes, and makes only 95% spendable. That
 durable total includes spent bytes and active escrow from every approval and
 campaign, and does not reset at UTC midnight, process restart, or approval
 replacement.
@@ -30,7 +30,8 @@ nor environment variables can enable them.
 
 The ceiling is authority, not a spending target. Raw-cache hits and successful
 direct requests cost zero, and the workflow never manufactures traffic merely
-to consume the `300000000`-byte release allowance.
+to consume the receipt-bound allowance. The unspendable 5% reserve absorbs
+in-flight/provider billing drift.
 
 ## Safety properties
 
@@ -163,6 +164,13 @@ The exact persistent paths are:
 - gateway-only read-only alert authority:
   `/opt/airflow/secure/whoscored-alert-authority`.
 
+The initialization marker is authenticated schema v3 and binds the exact
+provider order ID, signed policy digest, and gross
+`WHOSCORED_PROVIDER_ORDER_CAP_BYTES`. Older marker schemas fail closed; an
+operator must preserve/quarantine their ledgers rather than delete or reset
+them. This startup gross binding also limits manual schema-v2 smoke approvals
+to the same 95% lifetime spendable order cap.
+
 The scheduler needs:
 
 - `WHOSCORED_PAID_GATEWAY_URL=http://whoscored_paid_gateway:8898` and a distinct
@@ -242,8 +250,8 @@ existing file. Review the complete unsigned JSON. In particular, prove:
 - `allowed_dag_ids` is exactly `["dag_canary_whoscored_proxy"]`;
 - total and daily budgets are exactly `1_000_000_000`; discovery is exactly
   `250_000_000` and capture is exactly `750_000_000`;
-- those legacy canary-envelope fields do not raise the release's independent
-  exact `300000000` decimal-byte provider-order lifetime cap;
+- those legacy canary-envelope fields do not raise the receipt-bound gross
+  provider order cap or consume its mandatory 5% reserve;
 - request/lease limits are code-owned and exact: discovery permits at most
   `5,000` provider dials across `2,500` URL leases, capture permits at most
   `10,000` dials across `5,000` URL leases, and the signing CLI exposes no

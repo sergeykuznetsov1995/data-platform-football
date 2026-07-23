@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -522,6 +523,17 @@ def _args(**overrides: Any) -> Namespace:
     return Namespace(**values)
 
 
+def _cache_args(**overrides: Any) -> Namespace:
+    values = {
+        "mode": bench.CACHE_CAPACITY_MODE,
+        "catalog": str(bench.DEFAULT_COMPETITIONS_PATH),
+        "flaresolverr_url": None,
+        "cache_seed_file": None,
+    }
+    values.update(overrides)
+    return _args(**values)
+
+
 def _control_pipe(payload: bytes) -> int:
     read_fd, write_fd = os.pipe()
     try:
@@ -799,6 +811,82 @@ def test_three_phase_workflow_is_json_safe_and_non_publishing():
     assert report["paid_proxy_mb"] == 0.0
     assert json.loads(json.dumps(report)) == report
     assert objects["transport"].closed is True
+
+
+def test_cache_capacity_replays_exact_seed_without_network_and_cleans_up():
+    code, report = bench.run(_cache_args())
+
+    assert code == 0
+    assert report["schema_version"] == 1
+    assert report["mode"] == "cache-capacity-v1"
+    assert report["seed_sha256"] == bench.EXPECTED_CACHE_SEED_SHA256
+    assert report["network_requests"] == 0
+    assert report["paid_proxy_bytes"] == 0
+    assert report["cleanup"] == {
+        "status": "success",
+        "temporary_workspace_removed": True,
+    }
+    phase = report["phases"][0]
+    assert phase["traffic"] == {
+        "cache_work_units_attempted": 5,
+        "successful_page_units": 5,
+        "source_request_attempts": 0,
+        "network_requests": 0,
+        "paid_proxy_bytes": 0,
+        "paid_route_requests": 0,
+    }
+    assert {result["entity"] for result in phase["results"]} == {
+        "matches",
+        "previews",
+        "profiles",
+        "multistage",
+    }
+    multistage = next(
+        result for result in phase["results"] if result["entity"] == "multistage"
+    )
+    assert multistage["metadata"]["source_stage_count"] == 2
+    assert phase["committed_rows"]["idempotent_total"] > 0
+
+
+@pytest.mark.parametrize("kind", ["missing", "tampered"])
+def test_cache_capacity_rejects_missing_or_tampered_seed_before_parse(
+    monkeypatch, tmp_path, kind
+):
+    seed_path = tmp_path / "seed.json"
+    if kind == "tampered":
+        seed_path.write_bytes(bench._EMBEDDED_CACHE_SEED_BYTES + b" ")
+    monkeypatch.setattr(
+        bench,
+        "parse_matchcentre_data",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("parsed")),
+    )
+
+    code, report = bench.run(_cache_args(cache_seed_file=seed_path))
+
+    assert code == 2
+    assert report["status"] == "configuration_error"
+    assert "seed" in report["error"]
+    assert report["network_requests"] == 0
+    assert report["phases"] == []
+
+
+def test_cache_capacity_fails_closed_and_counts_network_escape(monkeypatch):
+    def network_escape(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        return socket.create_connection(("127.0.0.1", 9), timeout=0.01)
+
+    monkeypatch.setattr(bench, "parse_matchcentre_data", network_escape)
+
+    code, report = bench.run(_cache_args())
+
+    assert code == 1
+    assert report["status"] == "failed"
+    assert report["network_requests"] == 1
+    assert "attempted network access" in report["error"]
+    assert report["cleanup"] == {
+        "status": "success",
+        "temporary_workspace_removed": True,
+    }
 
 
 def test_cli_sigterm_closes_transport_before_temporary_raw_cleanup(

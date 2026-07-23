@@ -118,6 +118,7 @@ def mod(tmp_path):
     loaded.WHOSCORED_PROXY_RUNTIME_SHA256 = "a" * 64
     loaded.WHOSCORED_PROVIDER_ORDER_ID = "proxysio-order-38950"
     loaded.WHOSCORED_PROVIDER_POLICY_SHA256 = "b" * 64
+    loaded.WHOSCORED_PROVIDER_ORDER_CAP_BYTES = 1_000_000_000
     loaded.WHOSCORED_LEGACY_STATE_MARKER_LOADED = False
     # Individual tests cover each production mode; the general accounting
     # fixture exercises both source families without a service boundary.
@@ -267,6 +268,9 @@ def _whoscored_campaign_context(
     run_id: str = "manual__campaign-one",
 ) -> dict[str, object]:
     now = datetime.now(timezone.utc)
+    utc_day_end = (now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ) - timedelta(microseconds=1)
     allocation = {
         "allocation_id": "allocation-one",
         "phase": "capture",
@@ -285,7 +289,10 @@ def _whoscored_campaign_context(
         "campaign_id": campaign_id,
         "run_id": run_id,
         "issued_at": (now - timedelta(minutes=1)).isoformat(),
-        "expires_at": (now + timedelta(hours=1)).isoformat(),
+        # Provider-byte escrow is intentionally UTC-day scoped.  Keeping the
+        # generic fixture inside the current day avoids a midnight-only flake
+        # while dedicated tests cover cross-day rejection explicitly.
+        "expires_at": min(now + timedelta(hours=1), utc_day_end).isoformat(),
         "transport_policy": "direct_then_paid",
         "runtime_sha256": "a" * 64,
         "classifier_sha256": "b" * 64,
@@ -637,14 +644,16 @@ def test_whoscored_global_cap_bounds_create_remaining_consume_and_release(mod):
 
 
 def test_whoscored_order_cap_survives_utc_reset_restart_and_new_approval(mod):
-    mod.DAILY_BUDGET_BYTES = 850
+    mod.DAILY_BUDGET_BYTES = 300_000_000
+    mod.MAX_LEASE_BYTES = 300_000_000
+    mod.WHOSCORED_PROVIDER_ORDER_CAP_BYTES = 1_000_000_000
     previous_day = datetime.now(timezone.utc).replace(
         hour=0,
         minute=0,
         second=0,
         microsecond=0,
     ) - timedelta(minutes=30)
-    first_context = _whoscored_campaign_context(mod, cap=1_000)
+    first_context = _whoscored_campaign_context(mod, cap=250_000_000)
     first_unsigned = ProxyCampaignApproval.from_dict(
         first_context["proxy_campaign_approval"]
     ).unsigned_dict()
@@ -674,13 +683,15 @@ def test_whoscored_order_cap_survives_utc_reset_restart_and_new_approval(mod):
         canonical_url="https://www.whoscored.com/Matches/1/Live",
         now=previous_day,
     )
-    ledger.reserve_provider_bytes(first_approval, claim, 800, now=previous_day)
+    ledger.reserve_provider_bytes(
+        first_approval, claim, 250_000_000, now=previous_day
+    )
     ledger.record_request(first_approval, claim, now=previous_day)
-    ledger.consume(first_approval, claim, 800, now=previous_day)
+    ledger.consume(first_approval, claim, 250_000_000, now=previous_day)
     ledger.finish(
         first_approval,
         claim,
-        provider_billed_bytes=800,
+        provider_billed_bytes=250_000_000,
         completed=False,
         now=previous_day,
     )
@@ -694,29 +705,32 @@ def test_whoscored_order_cap_survives_utc_reset_restart_and_new_approval(mod):
     mod._daily_up_bytes = mod._daily_down_bytes = mod._daily_reserved_bytes = 0
     restarted = mod._whoscored_campaign_ledger()
     before = restarted.provider_order_accounting()
-    assert before["spent_provider_bytes"] == 800
+    assert before["spent_provider_bytes"] == 250_000_000
     assert before["current_day_spent_provider_bytes"] == 0
 
     mgr = _FakeManager(["http://u:p@pool.proxys.io:10000"])
     current = mod._create_lease(
         mgr,
-        max_bytes=1_000,
+        max_bytes=300_000_000,
         ttl_seconds=30,
         metadata=_whoscored_campaign_context(
             mod,
-            cap=1_000,
+            cap=300_000_000,
             approval_id="approval-after-midnight",
             campaign_id="campaign-after-midnight",
             run_id="manual__campaign-after-midnight",
         ),
         require_context=True,
     )
-    assert current.max_bytes == 50
+    assert current.max_bytes == 300_000_000
+    assert mod._whoscored_provider_order_cap_bytes(current.proxy_campaign_approval) == (
+        950_000_000
+    )
     after = restarted.provider_order_accounting()
-    assert after["spent_provider_bytes"] == 800
-    assert after["reserved_provider_bytes"] == 50
-    assert after["exposure_provider_bytes"] == 850
-    assert after["current_day_reserved_provider_bytes"] == 50
+    assert after["spent_provider_bytes"] == 250_000_000
+    assert after["reserved_provider_bytes"] == 300_000_000
+    assert after["exposure_provider_bytes"] == 550_000_000
+    assert after["current_day_reserved_provider_bytes"] == 300_000_000
 
 
 def test_whoscored_provider_guard_rejects_before_lease_or_claim(mod):
@@ -779,14 +793,16 @@ def test_auth_check_accepts_dedicated_transfermarkt_backfill_token(mod):
             return None
 
     writer = Writer()
-    handled = asyncio.run(mod._handle_control(
-        "GET",
-        "/v1/auth-check",
-        {"x-proxy-control-token": mod.TRANSFERMARKT_BACKFILL_CONTROL_TOKEN},
-        Reader(),
-        writer,
-        SimpleNamespace(total_count=1),
-    ))
+    handled = asyncio.run(
+        mod._handle_control(
+            "GET",
+            "/v1/auth-check",
+            {"x-proxy-control-token": mod.TRANSFERMARKT_BACKFILL_CONTROL_TOKEN},
+            Reader(),
+            writer,
+            SimpleNamespace(total_count=1),
+        )
+    )
 
     assert handled is True
     assert b"200 OK" in bytes(writer.payload).split(b"\r\n\r\n", 1)[0]
@@ -1813,10 +1829,7 @@ def test_sofascore_has_a_dedicated_production_metered_proxy_service():
     assert '\n      - --max-active-leases\n      - "1"' in service
     # Ledger/WAL on the narrow persistent state root, isolated from the shared
     # gateway and from the release checkout.
-    assert (
-        "/logs/sofascore_proxy_filter/sofascore_allocation_claims.jsonl"
-        in service
-    )
+    assert "/logs/sofascore_proxy_filter/sofascore_allocation_claims.jsonl" in service
     # Isolation contract: joins the shared dp-backend network as EXTERNAL (own
     # project) and is ABSENT from the shared compose.yaml, so foreign deploys
     # can't sweep it.
@@ -1825,9 +1838,7 @@ def test_sofascore_has_a_dedicated_production_metered_proxy_service():
     assert "\n  sofascore_proxy_filter:\n" not in _COMPOSE_PATH.read_text()
     artifact_target = "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
     state_target = "/opt/airflow/logs/sofascore_proxy_filter"
-    assert model["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT"] == (
-        artifact_target
-    )
+    assert model["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT"] == (artifact_target)
     assert model["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"] == (
         "${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:?set the exact verified "
         "SofaScore artifact SHA-256}"
@@ -1837,9 +1848,7 @@ def test_sofascore_has_a_dedicated_production_metered_proxy_service():
 
     volumes = model["volumes"]
     long_volumes = {
-        volume["target"]: volume
-        for volume in volumes
-        if isinstance(volume, dict)
+        volume["target"]: volume for volume in volumes if isinstance(volume, dict)
     }
     targets = [
         volume["target"] if isinstance(volume, dict) else volume.split(":")[1]
@@ -2317,9 +2326,7 @@ def test_sofascore_policy_pin_rejection_stops_main_before_pool_or_listener(
         lambda *_args, **_kwargs: pytest.fail("listener must not start"),
     )
     monkeypatch.setenv("PROXY_FILTER_CONTROL_TOKEN", "c" * 32)
-    monkeypatch.setenv(
-        "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", required_artifact_id
-    )
+    monkeypatch.setenv("SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", required_artifact_id)
 
     with pytest.raises(SystemExit, match=expected_error) as exc_info:
         asyncio.run(mod.main())
@@ -5087,9 +5094,7 @@ def test_concurrent_provider_readers_keep_aggregate_upload_headroom(mod):
             )
             for index in range(3)
         ]
-        observed = [
-            await asyncio.wait_for(started.get(), timeout=1) for _ in range(3)
-        ]
+        observed = [await asyncio.wait_for(started.get(), timeout=1) for _ in range(3)]
         # Every provider reader may progress, but their aggregate pre-read
         # escrow leaves the exact N+1 share for an upload on this lease.
         assert lease.active_provider_readers == 3
@@ -6591,14 +6596,18 @@ def test_transfermarkt_backfill_failover_never_draws_from_production_pool(
     mod,
     monkeypatch,
 ):
-    production_mgr = _FakeManager([
-        "http://u:p@production.invalid:10000",
-        "http://u:p@production.invalid:10001",
-    ])
-    backfill_mgr = _FakeManager([
-        "http://u:p@backfill.invalid:20000",
-        "http://u:p@backfill.invalid:20001",
-    ])
+    production_mgr = _FakeManager(
+        [
+            "http://u:p@production.invalid:10000",
+            "http://u:p@production.invalid:10001",
+        ]
+    )
+    backfill_mgr = _FakeManager(
+        [
+            "http://u:p@backfill.invalid:20000",
+            "http://u:p@backfill.invalid:20001",
+        ]
+    )
     mod.TRANSFERMARKT_BACKFILL_PROXY_MANAGER = backfill_mgr
     mod.TRANSFERMARKT_BACKFILL_DAGRUN_BUDGET_BYTES = 10_000
     mod.URL_BUDGET_BYTES = 10_000
@@ -7161,9 +7170,10 @@ def test_protected_whoscored_state_initializes_once_and_survives_restart(mod, tm
     marker = json.loads(Path(mod.WHOSCORED_STATE_MARKER_PATH).read_text())
     assert marker["schema_version"] == mod.WHOSCORED_STATE_MARKER_SCHEMA_VERSION
     assert marker["order_id"] == mod.WHOSCORED_PROVIDER_ORDER_ID
+    assert marker["provider_policy_sha256"] == mod.WHOSCORED_PROVIDER_POLICY_SHA256
     assert (
-        marker["provider_policy_sha256"]
-        == mod.WHOSCORED_PROVIDER_POLICY_SHA256
+        marker["provider_order_cap_bytes"]
+        == mod.WHOSCORED_PROVIDER_ORDER_CAP_BYTES
     )
 
     mod.WHOSCORED_CAMPAIGN_LEDGER = None
@@ -7190,59 +7200,66 @@ def test_protected_whoscored_state_initializes_once_and_survives_restart(mod, tm
     (
         ("WHOSCORED_PROVIDER_ORDER_ID", "proxysio-order-another"),
         ("WHOSCORED_PROVIDER_POLICY_SHA256", "c" * 64),
+        ("WHOSCORED_PROVIDER_ORDER_CAP_BYTES", 400_000_000),
     ),
 )
 def test_protected_whoscored_state_rejects_provider_binding_mismatch(
     mod, tmp_path, field, replacement
 ):
     report = _initialize_protected_whoscored_state(mod, tmp_path)
+    protected = {
+        path: path.read_bytes()
+        for path in (
+            report,
+            Path(mod.LEDGER_PATH),
+            Path(mod.WHOSCORED_CAMPAIGN_LEDGER_PATH),
+            Path(mod._paid_ledger_checkpoint_path()),
+            Path(mod.WHOSCORED_STATE_MARKER_PATH),
+        )
+    }
     setattr(mod, field, replacement)
     mod.WHOSCORED_STATE_ID = ""
 
     with pytest.raises(RuntimeError, match="provider binding differs"):
         mod._verify_whoscored_state(str(report))
+    assert all(path.read_bytes() == raw for path, raw in protected.items())
 
 
-def test_legacy_state_marker_is_explicit_and_never_accepts_scheduled_v3(
-    mod, tmp_path
-):
+def test_old_state_marker_fails_closed_without_resetting_state(mod, tmp_path):
     report = _initialize_protected_whoscored_state(mod, tmp_path)
     marker_path = Path(mod.WHOSCORED_STATE_MARKER_PATH)
     current = json.loads(marker_path.read_text())
-    legacy_body = {
-        "schema_version": mod.WHOSCORED_STATE_SCHEMA_VERSION,
+    old_body = {
+        "schema_version": 2,
         "state_id": current["state_id"],
+        "order_id": current["order_id"],
+        "provider_policy_sha256": current["provider_policy_sha256"],
         "created_at": current["created_at"],
         "path_sha256": current["path_sha256"],
     }
-    legacy = {**legacy_body, "signature": mod._state_hmac(legacy_body)}
-    marker_path.write_bytes(mod.canonical_json_bytes(legacy) + b"\n")
+    old_marker = {**old_body, "signature": mod._state_hmac(old_body)}
+    marker_path.write_bytes(mod.canonical_json_bytes(old_marker) + b"\n")
     marker_path.chmod(0o600)
     mod.WHOSCORED_STATE_ID = ""
+    ledger_before = Path(mod.WHOSCORED_CAMPAIGN_LEDGER_PATH).read_bytes()
 
     with pytest.raises(RuntimeError, match="marker fields are invalid"):
         mod._verify_whoscored_state(str(report))
-
-    mod._verify_whoscored_state(str(report), allow_legacy_marker=True)
-    assert mod.WHOSCORED_LEGACY_STATE_MARKER_LOADED is True
-    mod._assert_whoscored_approval_state_binding(SimpleNamespace(schema_version=2))
-    with pytest.raises(
-        ProxyCampaignValidationError, match="provider-bound state marker"
-    ):
-        mod._assert_whoscored_approval_state_binding(
-            SimpleNamespace(schema_version=3)
-        )
+    with pytest.raises(RuntimeError, match="no longer accepted"):
+        mod._verify_whoscored_state(str(report), allow_legacy_marker=True)
+    assert Path(mod.WHOSCORED_CAMPAIGN_LEDGER_PATH).read_bytes() == ledger_before
 
 
 @pytest.mark.parametrize(
-    ("order_id", "policy_sha256"),
+    ("order_id", "policy_sha256", "order_cap_bytes"),
     (
-        ("proxysio-order-another", "b" * 64),
-        ("proxysio-order-38950", "c" * 64),
+        ("proxysio-order-another", "b" * 64, 1_000_000_000),
+        ("proxysio-order-38950", "c" * 64, 1_000_000_000),
+        ("proxysio-order-38950", "b" * 64, 400_000_000),
     ),
 )
 def test_scheduled_authority_must_match_current_state_binding(
-    mod, order_id, policy_sha256
+    mod, order_id, policy_sha256, order_cap_bytes
 ):
     mod._assert_whoscored_approval_state_binding(
         SimpleNamespace(
@@ -7250,6 +7267,7 @@ def test_scheduled_authority_must_match_current_state_binding(
             scheduled_authority=SimpleNamespace(
                 order_id=mod.WHOSCORED_PROVIDER_ORDER_ID,
                 provider_policy_sha256=mod.WHOSCORED_PROVIDER_POLICY_SHA256,
+                provider_order_cap_bytes=mod.WHOSCORED_PROVIDER_ORDER_CAP_BYTES,
             ),
         )
     )
@@ -7258,11 +7276,44 @@ def test_scheduled_authority_must_match_current_state_binding(
         scheduled_authority=SimpleNamespace(
             order_id=order_id,
             provider_policy_sha256=policy_sha256,
+            provider_order_cap_bytes=order_cap_bytes,
         ),
     )
 
     with pytest.raises(ProxyCampaignValidationError, match="state binding"):
         mod._assert_whoscored_approval_state_binding(approval)
+
+
+def test_whoscored_provider_cap_is_receipt_bound_with_five_percent_reserve(mod):
+    mod.DAILY_BUDGET_BYTES = 380_000_000
+    mod.MAX_LEASE_BYTES = 400_000_000
+    mod.WHOSCORED_PROVIDER_ORDER_CAP_BYTES = 400_000_000
+    manual_v2 = SimpleNamespace(schema_version=2, scheduled_authority=None)
+    scheduled_v3 = SimpleNamespace(
+        schema_version=3,
+        scheduled_authority=SimpleNamespace(provider_order_cap_bytes=400_000_000),
+    )
+    assert mod._whoscored_provider_order_cap_bytes(manual_v2) == 380_000_000
+    assert mod._whoscored_provider_order_cap_bytes(scheduled_v3) == 380_000_000
+    lease = mod._create_lease(
+        _FakeManager(["http://u:p@pool.proxys.io:10000"]),
+        max_bytes=400_000_000,
+        ttl_seconds=30,
+        metadata=_whoscored_campaign_context(mod, cap=400_000_000),
+        require_context=True,
+    )
+    assert lease.proxy_campaign_approval is not None
+    assert lease.proxy_campaign_approval.schema_version == 2
+    assert lease.max_bytes == 380_000_000
+    with pytest.raises(ProxyCampaignValidationError, match="order cap binding"):
+        mod._whoscored_provider_order_cap_bytes(
+            SimpleNamespace(
+                schema_version=3,
+                scheduled_authority=SimpleNamespace(
+                    provider_order_cap_bytes=500_000_000
+                ),
+            )
+        )
 
 
 def test_protected_whoscored_state_rejects_campaign_lock_symlink(mod, tmp_path):
@@ -7353,6 +7404,7 @@ def test_missing_protected_state_stops_before_pool_or_listener(
         whoscored_state_marker=str(tmp_path / ".initialized.json"),
         whoscored_provider_order_id="proxysio-order-38950",
         whoscored_provider_policy_sha256="b" * 64,
+        whoscored_provider_order_cap_bytes=1_000_000_000,
         daily_budget_bytes=300_000_000,
         max_lease_bytes=2_000_000,
         transfermarkt_dagrun_budget_bytes=0,
@@ -7393,20 +7445,24 @@ def test_missing_protected_state_stops_before_pool_or_listener(
 
 
 @pytest.mark.parametrize(
-    ("daily_bytes", "lease_bytes"),
+    ("daily_bytes", "gross_bytes", "lease_bytes"),
     (
-        (None, None),
-        (300_000_001, 2_000_000),
-        (300_000_000, 2_000_001),
+        (None, 1_000_000_000, None),
+        (300_000_000, None, 2_000_000),
+        (1_000_000_001, 1_000_000_000, 2_000_000),
+        (380_000_001, 400_000_000, 2_000_000),
+        (300_000_000, 1_000_000_001, 2_000_000),
+        (950_000_000, 1_000_000_000, 2_000_001),
     ),
 )
 def test_whoscored_only_requires_exact_decimal_byte_caps_before_state(
-    mod, monkeypatch, daily_bytes, lease_bytes
+    mod, monkeypatch, daily_bytes, gross_bytes, lease_bytes
 ):
     args = SimpleNamespace(
         source_mode="whoscored-only",
         allow_legacy_noauth=False,
         daily_budget_bytes=daily_bytes,
+        whoscored_provider_order_cap_bytes=gross_bytes,
         max_lease_bytes=lease_bytes,
     )
     monkeypatch.setattr(mod.argparse.ArgumentParser, "parse_args", lambda self: args)
@@ -7444,6 +7500,7 @@ def test_whoscored_only_rejects_cross_source_budget_before_state(
         source_mode="whoscored-only",
         allow_legacy_noauth=False,
         daily_budget_bytes=300_000_000,
+        whoscored_provider_order_cap_bytes=1_000_000_000,
         max_lease_bytes=2_000_000,
         transfermarkt_dagrun_budget_bytes=0,
         transfermarkt_backfill_dagrun_budget_bytes=backfill_budget,
@@ -7475,9 +7532,7 @@ def test_whoscored_only_rejects_cross_source_budget_before_state(
         asyncio.run(mod.main())
 
 
-def test_whoscored_only_rejects_legacy_noauth_before_runtime_or_state(
-    mod, monkeypatch
-):
+def test_whoscored_only_rejects_legacy_noauth_before_runtime_or_state(mod, monkeypatch):
     args = SimpleNamespace(
         source_mode="whoscored-only",
         allow_legacy_noauth=True,
@@ -7527,9 +7582,7 @@ def test_whoscored_endpoint_boundaries_are_durable_and_sum_to_close_receipt(
     report = asyncio.run(mod._close_lease(lease, completed=False))
 
     assert report["close_complete"] is True
-    assert report["endpoint_request_provider_bytes"] == {
-        "target:" + "a" * 64: [321]
-    }
+    assert report["endpoint_request_provider_bytes"] == {"target:" + "a" * 64: [321]}
     assert [event_type for event_type, _values in events] == [
         "endpoint_started",
         "bytes",
@@ -7555,9 +7608,7 @@ def test_whoscored_only_background_bytes_revoke_unowned_lease(mod):
     mod.SOURCE_MODE = "whoscored-only"
 
     with pytest.raises(RuntimeError, match="no active endpoint owner"):
-        mod._account_lease_bytes(
-            lease, "www.whoscored.com", "down", 1
-        )
+        mod._account_lease_bytes(lease, "www.whoscored.com", "down", 1)
 
     assert lease.accounting_uncertain is True
     assert lease.global_budget_escrow_bytes == 1_000
@@ -7568,9 +7619,7 @@ def test_whoscored_only_background_bytes_revoke_unowned_lease(mod):
         )
 
 
-def test_whoscored_batch_claim_binds_exact_endpoints_and_atomic_switches(
-    mod, tmp_path
-):
+def test_whoscored_batch_claim_binds_exact_endpoints_and_atomic_switches(mod, tmp_path):
     report_path = _initialize_protected_whoscored_state(mod, tmp_path)
     mod._verify_whoscored_state(str(report_path))
     mgr = _FakeManager(["http://u:p@pool.proxys.io:10000"])
@@ -7578,9 +7627,7 @@ def test_whoscored_batch_claim_binds_exact_endpoints_and_atomic_switches(
     first = "target:" + "b" * 64
     second = "target:" + "c" * 64
     labels = (bootstrap, *sorted((first, second)))
-    metadata = _whoscored_campaign_context(
-        mod, cap=1_000, requests=4, leases=2
-    )
+    metadata = _whoscored_campaign_context(mod, cap=1_000, requests=4, leases=2)
     metadata.update(
         target_manifest_sha256="d" * 64,
         logical_target_units=2,
@@ -7667,9 +7714,7 @@ def test_whoscored_batch_claim_binds_exact_endpoints_and_atomic_switches(
             "lease_total_bytes": 300,
         },
     ]
-    snapshot = mod._whoscored_campaign_ledger().snapshot(
-        lease.proxy_campaign_approval
-    )
+    snapshot = mod._whoscored_campaign_ledger().snapshot(lease.proxy_campaign_approval)
     assert snapshot["leases_used"] == 2
     attempt = snapshot["allocations"][lease.allocation_id]["attempts"][0]
     assert attempt["target_manifest_sha256"] == "d" * 64
@@ -7678,12 +7723,8 @@ def test_whoscored_batch_claim_binds_exact_endpoints_and_atomic_switches(
 
 
 def test_whoscored_batch_units_survive_restart_and_bound_retries_and_dials(mod):
-    metadata = _whoscored_campaign_context(
-        mod, cap=1_000, requests=2, leases=2
-    )
-    approval = ProxyCampaignApproval.from_dict(
-        metadata["proxy_campaign_approval"]
-    )
+    metadata = _whoscored_campaign_context(mod, cap=1_000, requests=2, leases=2)
+    approval = ProxyCampaignApproval.from_dict(metadata["proxy_campaign_approval"])
     labels = (
         "bootstrap:" + "a" * 64,
         "target:" + "b" * 64,
@@ -7738,6 +7779,7 @@ def test_whoscored_batch_units_survive_restart_and_bound_retries_and_dials(mod):
                 expected_endpoint_labels=labels,
                 now=now + timedelta(seconds=2),
             )
+
 
 # --- FBref browser-phase lease cap extension ---------------------------------
 
@@ -7795,8 +7837,7 @@ def test_uncertain_fbref_lease_settles_conservatively_and_frees_slot(mod):
     assert mod._daily_total_bytes() == daily_before + 64
     assert lease.accounting_uncertain is True  # forensic latch is permanent
     events = [
-        json.loads(line)
-        for line in Path(mod.LEDGER_PATH).read_text().splitlines()
+        json.loads(line) for line in Path(mod.LEDGER_PATH).read_text().splitlines()
     ]
     lease_byte_events = [
         event
@@ -7816,9 +7857,7 @@ def test_uncertain_fbref_lease_settles_conservatively_and_frees_slot(mod):
     assert second.lease_id != lease.lease_id
 
 
-def test_uncertain_fbref_lease_never_retries_ambiguous_ledger_append(
-    mod, monkeypatch
-):
+def test_uncertain_fbref_lease_never_retries_ambiguous_ledger_append(mod, monkeypatch):
     mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
     lease = _make_fbref_lease(mod, mgr)
     assert mod._reserve_lease_bytes(lease, 64) == 64
@@ -7851,12 +7890,10 @@ def test_uncertain_fbref_lease_never_retries_ambiguous_ledger_append(
     assert lease.down_bytes == 7
     assert lease.reserved_bytes == 64
     events = [
-        json.loads(line)
-        for line in Path(mod.LEDGER_PATH).read_text().splitlines()
+        json.loads(line) for line in Path(mod.LEDGER_PATH).read_text().splitlines()
     ]
     assert not any(
-        event.get("event_type") == "bytes"
-        and event.get("lease_id") == lease.lease_id
+        event.get("event_type") == "bytes" and event.get("lease_id") == lease.lease_id
         for event in events
     )
 

@@ -95,10 +95,13 @@ from scrapers.whoscored.proxy_campaign import (
     WHOSCORED_CANARY_DISCOVERY_REQUEST_LIMIT,
     WHOSCORED_CANARY_DISCOVERY_WORK_ITEM_ID,
     WHOSCORED_CANARY_TASK_ID,
+    WHOSCORED_ACCELERATED_BOOTSTRAP_ACCEPTANCE_MODE,
+    WHOSCORED_ACCELERATED_BOOTSTRAP_WAVES,
     WHOSCORED_CHARTER_SCHEMA_VERSION,
     WHOSCORED_DAILY_ACTIVE_SCOPE_CEILING,
     WHOSCORED_DAILY_PLAN_SCHEMA_VERSION,
     WHOSCORED_DAILY_PROVIDER_SAFETY_CAP_BYTES,
+    WHOSCORED_PROVIDER_ORDER_HARD_CAP_BYTES,
     WHOSCORED_INGEST_DAG_ID,
     WHOSCORED_PROXY_ALLOWED_HOSTS,
     WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256,
@@ -115,6 +118,8 @@ from scrapers.whoscored.proxy_campaign import (
     scheduled_scope_schedule_target_limit,
     scheduled_target_ids_sha256,
     strict_json_loads,
+    validate_whoscored_accelerated_bootstrap_fields,
+    whoscored_provider_spendable_cap_bytes,
     whoscored_canary_run_id,
 )
 
@@ -167,9 +172,9 @@ DAILY_SCOPE_REQUEST_LIMIT = 64
 DAILY_SCOPE_LEASE_LIMIT = 32
 DAILY_CONCURRENCY = 4
 MAX_DAILY_ACTIVE_SCOPES = WHOSCORED_DAILY_ACTIVE_SCOPE_CEILING
-# This release is admitted against the provider-side 300 MB order safety cap.
-# Raising it is a separate reviewed release, not something a rollout document
-# or environment variable may do.
+# Provider receipts may bind at most one decimal GB.  Every production path
+# keeps five percent unavailable for in-flight provider accounting and billing
+# drift; neither a rollout document nor an environment variable can remove it.
 DAILY_PROVIDER_SAFETY_CAP_BYTES = WHOSCORED_DAILY_PROVIDER_SAFETY_CAP_BYTES
 # A charter must not authorise an unbounded horizon; the owner refreshes it.
 MAX_CHARTER_HORIZON = timedelta(days=62)
@@ -177,7 +182,7 @@ PROVIDER_POLICY_SCHEMA_VERSION = 1
 CHARTER_SCHEMA_VERSION = WHOSCORED_CHARTER_SCHEMA_VERSION
 ROLLOUT_MANIFEST_SCHEMA_VERSION = WHOSCORED_ROLLOUT_MANIFEST_SCHEMA_VERSION
 DAILY_PLAN_SCHEMA_VERSION = WHOSCORED_DAILY_PLAN_SCHEMA_VERSION
-ISSUANCE_LEDGER_SCHEMA_VERSION = 3
+ISSUANCE_LEDGER_SCHEMA_VERSION = 4
 SCHEDULED_PAID_POINTER_SCHEMA_VERSION = 1
 DAILY_ISSUER_WINDOW_START = time(9, 0, tzinfo=timezone.utc)
 DAILY_ISSUER_WINDOW_END = time(9, 30, tzinfo=timezone.utc)
@@ -226,6 +231,10 @@ _CHARTER_UNSIGNED_FIELDS = frozenset(
         "classifier_sha256",
         "promotion_acceptance_sha256",
         "promotion_terminal_receipt_sha256",
+        "acceptance_mode",
+        "bootstrap_slots",
+        "capacity_receipt_sha256",
+        "provider_order_cap_bytes",
         "valid_from",
         "valid_until",
         "daily_cap_bytes",
@@ -265,6 +274,10 @@ _DAILY_PLAN_FIELDS = frozenset(
         "discovery_target_limit",
         "profile_target_count",
         "profile_targets_sha256",
+        "acceptance_mode",
+        "bootstrap_slots",
+        "capacity_receipt_sha256",
+        "provider_order_cap_bytes",
     }
 )
 
@@ -544,6 +557,43 @@ def _digest(value: object, field: str) -> str:
     return value
 
 
+def _bootstrap_slots_from_start(value: str) -> list[dict[str, object]]:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise CampaignCliError("bootstrap start logical date must use canonical Z")
+    start = _utc(value, "bootstrap start logical date")
+    if (
+        value != start.strftime("%Y-%m-%dT10:00:00Z")
+        or start.hour != DAILY_DAG_LOGICAL_HOUR_UTC
+        or start.minute != 0
+        or start.second != 0
+        or start.microsecond != 0
+    ):
+        raise CampaignCliError(
+            "bootstrap start logical date must be canonical daily 10:00 UTC"
+        )
+    return [
+        {
+            "run_id": "scheduled__" + logical.isoformat(),
+            "logical_date": logical.strftime("%Y-%m-%dT10:00:00Z"),
+            "wave_id": wave_id,
+        }
+        for wave_id, logical in zip(
+            WHOSCORED_ACCELERATED_BOOTSTRAP_WAVES,
+            (start + timedelta(days=index) for index in range(6)),
+            strict=True,
+        )
+    ]
+
+
+def _validate_bootstrap_authority(
+    value: Mapping[str, object], *, label: str
+) -> tuple[Mapping[str, object], ...]:
+    try:
+        return validate_whoscored_accelerated_bootstrap_fields(value, label=label)
+    except ProxyCampaignValidationError as exc:
+        raise CampaignCliError(str(exc)) from exc
+
+
 def _rollout_contract(
     value: Mapping[str, object], *, label: str
 ) -> tuple[str, str, int, bool]:
@@ -658,6 +708,7 @@ def _signed_charter(
     )
     _digest(value.get("runtime_sha256"), "charter runtime_sha256")
     _digest(value.get("classifier_sha256"), "charter classifier_sha256")
+    _validate_bootstrap_authority(value, label="charter")
     promotion_acceptance_sha256 = _digest(
         value.get("promotion_acceptance_sha256"),
         "charter promotion_acceptance_sha256",
@@ -688,11 +739,16 @@ def _signed_charter(
     )
     order = _positive_bytes(value.get("order_cap_bytes"), "charter order_cap_bytes")
     max_issuances = value.get("max_issuances")
+    spendable_order_cap = whoscored_provider_spendable_cap_bytes(
+        int(value["provider_order_cap_bytes"])
+    )
     if (
         not daily <= monthly <= order
         or daily > int(policy["daily_cap_bytes"])
         or monthly > int(policy["monthly_cap_bytes"])
         or order > int(policy["order_cap_bytes"])
+        or value.get("provider_order_cap_bytes") != policy.get("order_cap_bytes")
+        or order > spendable_order_cap
         or isinstance(max_issuances, bool)
         or not isinstance(max_issuances, int)
         or max_issuances <= 0
@@ -947,6 +1003,7 @@ def _read_rollout(path: Path, *, require_private: bool = False) -> Mapping[str, 
     )
     _digest(value.get("runtime_sha256"), "rollout runtime_sha256")
     _digest(value.get("classifier_sha256"), "rollout classifier_sha256")
+    _validate_bootstrap_authority(value, label="rollout")
     promotion_acceptance_sha256 = _digest(
         value.get("promotion_acceptance_sha256"),
         "rollout promotion_acceptance_sha256",
@@ -1229,6 +1286,23 @@ def command_create_rollout(args: argparse.Namespace) -> None:
         )
     runtime_sha256 = _digest(args.runtime_sha256, "runtime_sha256")
     classifier_sha256 = _digest(args.classifier_sha256, "classifier_sha256")
+    capacity_receipt_sha256 = _digest(
+        args.capacity_receipt_sha256, "capacity_receipt_sha256"
+    )
+    provider_order_cap_bytes = _positive_bytes(
+        args.provider_order_cap_bytes, "provider_order_cap_bytes"
+    )
+    if provider_order_cap_bytes > WHOSCORED_PROVIDER_ORDER_HARD_CAP_BYTES:
+        raise CampaignCliError("provider_order_cap_bytes exceeds the 1 GB hard cap")
+    bootstrap_slots = _bootstrap_slots_from_start(args.bootstrap_start_logical_date)
+    last_bootstrap_logical_date = _utc(
+        str(bootstrap_slots[-1]["logical_date"]),
+        "last bootstrap logical date",
+    )
+    if last_bootstrap_logical_date >= _issuance_now().astimezone(timezone.utc):
+        raise CampaignCliError(
+            "all six bootstrap logical slots must be backdated before rollout creation"
+        )
     wave_contract = _ROLLOUT_WAVE_CONTRACTS.get(wave_id)
     if wave_contract is None:
         raise CampaignCliError("wave_id is outside the reviewed rollout contract")
@@ -1273,6 +1347,10 @@ def command_create_rollout(args: argparse.Namespace) -> None:
         "classifier_sha256": classifier_sha256,
         "promotion_acceptance_sha256": WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256,
         "promotion_terminal_receipt_sha256": (WHOSCORED_ROLLOUT_GENESIS_PROOF_SHA256),
+        "acceptance_mode": WHOSCORED_ACCELERATED_BOOTSTRAP_ACCEPTANCE_MODE,
+        "bootstrap_slots": bootstrap_slots,
+        "capacity_receipt_sha256": capacity_receipt_sha256,
+        "provider_order_cap_bytes": provider_order_cap_bytes,
     }
     cohort_sha256 = hashlib.sha256(canonical_json_bytes(result)).hexdigest()
     _atomic_write_json(Path(args.output), result, replace=args.force)
@@ -1441,6 +1519,10 @@ def command_plan_daily_ingest(args: argparse.Namespace) -> None:
         "discovery_target_limit": discovery_target_limit,
         "profile_target_count": profile_target_count,
         "profile_targets_sha256": profile_targets_sha256,
+        "acceptance_mode": rollout["acceptance_mode"],
+        "bootstrap_slots": rollout["bootstrap_slots"],
+        "capacity_receipt_sha256": rollout["capacity_receipt_sha256"],
+        "provider_order_cap_bytes": rollout["provider_order_cap_bytes"],
     }
     _atomic_write_json(Path(args.output), result, replace=args.force)
     _print_summary(
@@ -1533,6 +1615,7 @@ def _read_daily_plan(
         raise CampaignCliError("daily plan fields are invalid")
     if value.get("schema_version") != DAILY_PLAN_SCHEMA_VERSION:
         raise CampaignCliError("unsupported daily plan schema")
+    _validate_bootstrap_authority(value, label="daily plan")
     _token(value.get("cohort_id"), "plan cohort_id")
     _digest(value.get("cohort_sha256"), "plan cohort_sha256")
     _rollout_id, _wave_id, max_scopes, require_full_active = _rollout_contract(
@@ -1633,6 +1716,10 @@ def _verify_daily_plan_authority(
         "classifier_sha256",
         "promotion_acceptance_sha256",
         "promotion_terminal_receipt_sha256",
+        "acceptance_mode",
+        "bootstrap_slots",
+        "capacity_receipt_sha256",
+        "provider_order_cap_bytes",
     )
     if (
         plan.get("cohort_id") != rollout.get("cohort_id")
@@ -1640,6 +1727,15 @@ def _verify_daily_plan_authority(
         or charter.get("cohort_id") != rollout.get("cohort_id")
         or charter.get("cohort_sha256") != cohort_sha256
         or any(plan.get(field) != rollout.get(field) for field in plan_rollout_fields)
+        or any(
+            plan.get(field) != rollout.get(field)
+            for field in (
+                "acceptance_mode",
+                "bootstrap_slots",
+                "capacity_receipt_sha256",
+                "provider_order_cap_bytes",
+            )
+        )
         or any(
             charter.get(field) != rollout.get(field) for field in charter_rollout_fields
         )
@@ -1859,6 +1955,10 @@ def _daily_ingest_unsigned(
             "monthly_cap_bytes": charter["monthly_cap_bytes"],
             "order_cap_bytes": charter["order_cap_bytes"],
             "max_issuances": charter["max_issuances"],
+            "acceptance_mode": charter["acceptance_mode"],
+            "bootstrap_slots": charter["bootstrap_slots"],
+            "capacity_receipt_sha256": charter["capacity_receipt_sha256"],
+            "provider_order_cap_bytes": charter["provider_order_cap_bytes"],
         },
         "meter": PROXY_CAMPAIGN_METER,
         "signature_algorithm": PROXY_CAMPAIGN_SIGNATURE_ALGORITHM,
@@ -1876,6 +1976,106 @@ def _pointer_document(
         "approval_id": approval.approval_id,
         "approval_sha256": approval.approval_sha256,
     }
+
+
+def _verify_bootstrap_rollout_charter(
+    *,
+    rollout: Mapping[str, object],
+    charter: Mapping[str, object],
+    policy: Mapping[str, object],
+) -> None:
+    cohort_sha256 = hashlib.sha256(canonical_json_bytes(dict(rollout))).hexdigest()
+    fields = (
+        "cohort_id",
+        "rollout_id",
+        "wave_id",
+        "max_scopes",
+        "require_full_active",
+        "ranked_scope_ids_sha256",
+        "runtime_sha256",
+        "classifier_sha256",
+        "promotion_acceptance_sha256",
+        "promotion_terminal_receipt_sha256",
+        "acceptance_mode",
+        "bootstrap_slots",
+        "capacity_receipt_sha256",
+        "provider_order_cap_bytes",
+    )
+    if (
+        charter.get("cohort_sha256") != cohort_sha256
+        or any(charter.get(field) != rollout.get(field) for field in fields)
+        or charter.get("provider_order_cap_bytes") != policy.get("order_cap_bytes")
+    ):
+        raise CampaignCliError(
+            "bootstrap charter differs from rollout/provider order authority"
+        )
+
+
+def _bootstrap_projection(
+    *,
+    rollout: Mapping[str, object],
+    policy: Mapping[str, object],
+    charter: Mapping[str, object],
+    secret: str,
+) -> dict[str, object]:
+    body = {
+        "schema_version": 1,
+        "acceptance_mode": charter["acceptance_mode"],
+        "bootstrap_slots": charter["bootstrap_slots"],
+        "capacity_receipt_sha256": charter["capacity_receipt_sha256"],
+        "provider_order_cap_bytes": charter["provider_order_cap_bytes"],
+        "rollout_id": charter["rollout_id"],
+        "runtime_sha256": charter["runtime_sha256"],
+        "provider_policy_sha256": policy["document_sha256"],
+    }
+    if any(
+        body[field] != rollout[field]
+        for field in (
+            "acceptance_mode",
+            "bootstrap_slots",
+            "capacity_receipt_sha256",
+            "provider_order_cap_bytes",
+            "rollout_id",
+            "runtime_sha256",
+        )
+    ):
+        raise CampaignCliError("bootstrap projection differs from rollout authority")
+    digest = hashlib.sha256(canonical_json_bytes(body)).hexdigest()
+    signed_body = {**body, "authority_sha256": digest}
+    return {**signed_body, "signature": _authority_signature(signed_body, secret)}
+
+
+def command_publish_bootstrap_authority(args: argparse.Namespace) -> None:
+    """Publish the protected timetable projection before bootstrap DagRuns exist."""
+
+    now = _issuance_now().astimezone(timezone.utc).replace(microsecond=0)
+    owner_secret = _owner_secret(args)
+    policy = _signed_provider_policy(
+        Path(args.provider_policy), owner_secret=owner_secret, now=now
+    )
+    charter = _signed_charter(
+        Path(args.charter), owner_secret=owner_secret, policy=policy, now=now
+    )
+    rollout = _read_rollout(Path(args.rollout_file), require_private=True)
+    _verify_bootstrap_rollout_charter(rollout=rollout, charter=charter, policy=policy)
+    projection = _bootstrap_projection(
+        rollout=rollout,
+        policy=policy,
+        charter=charter,
+        secret=_issuance_ledger_secret(args),
+    )
+    path = Path(args.pointer_root) / "bootstrap.json"
+    _publish_or_verify(path, projection, allow_frozen_existing=True)
+    _freeze_group_readable_artifact(path)
+    _print_summary(
+        {
+            "status": "bootstrap_authority_published",
+            "output": str(path),
+            "authority_sha256": projection["authority_sha256"],
+            "rollout_id": rollout["rollout_id"],
+            "slot_count": len(rollout["bootstrap_slots"]),
+        }
+    )
 
 
 def _issuance_ledger_empty() -> dict[str, object]:
@@ -1899,6 +2099,10 @@ def _validate_issuance_rollout_sequence(
         "ranked_scope_ids_sha256",
         "runtime_sha256",
         "classifier_sha256",
+        "acceptance_mode",
+        "bootstrap_slots",
+        "capacity_receipt_sha256",
+        "provider_order_cap_bytes",
     )
     for value in values:
         rollout_id = str(value["rollout_id"])
@@ -1999,6 +2203,12 @@ def _read_issuance_ledger(path: Path, *, secret: str) -> dict[str, object]:
             "billing_month",
             "day",
             "charter_sha256",
+            "provider_policy_sha256",
+            "receipt_sha256",
+            "provider_order_cap_bytes",
+            "safety_reserve_bytes",
+            "issuance_mode",
+            "bootstrap_slot_index",
             "rollout_id",
             "wave_id",
             "max_scopes",
@@ -2009,6 +2219,9 @@ def _read_issuance_ledger(path: Path, *, secret: str) -> dict[str, object]:
             "classifier_sha256",
             "promotion_acceptance_sha256",
             "promotion_terminal_receipt_sha256",
+            "acceptance_mode",
+            "bootstrap_slots",
+            "capacity_receipt_sha256",
             "total_provider_bytes",
             "approval",
             "pointer",
@@ -2020,6 +2233,36 @@ def _read_issuance_ledger(path: Path, *, secret: str) -> dict[str, object]:
         run_ids.add(run_id)
         _digest(entry.get("request_sha256"), "ledger request_sha256")
         _digest(entry.get("charter_sha256"), "ledger charter_sha256")
+        _digest(
+            entry.get("provider_policy_sha256"),
+            "ledger provider_policy_sha256",
+        )
+        _digest(entry.get("receipt_sha256"), "ledger receipt_sha256")
+        provider_order_cap = _positive_bytes(
+            entry.get("provider_order_cap_bytes"),
+            "ledger provider_order_cap_bytes",
+        )
+        expected_reserve = provider_order_cap - whoscored_provider_spendable_cap_bytes(
+            provider_order_cap
+        )
+        if entry.get("safety_reserve_bytes") != expected_reserve:
+            raise CampaignCliError("issuance ledger safety reserve is invalid")
+        issuance_mode = entry.get("issuance_mode")
+        slot_index = entry.get("bootstrap_slot_index")
+        if issuance_mode == "daily":
+            if slot_index is not None:
+                raise CampaignCliError(
+                    "daily ledger entry cannot bind a bootstrap slot"
+                )
+        elif issuance_mode == "accelerated-bootstrap":
+            if (
+                isinstance(slot_index, bool)
+                or not isinstance(slot_index, int)
+                or not 0 <= slot_index < 6
+            ):
+                raise CampaignCliError("bootstrap ledger slot index is invalid")
+        else:
+            raise CampaignCliError("issuance ledger mode is invalid")
         _token(entry.get("rollout_id"), "ledger rollout_id")
         _rollout_contract(entry, label="ledger entry")
         _digest(entry.get("cohort_sha256"), "ledger cohort_sha256")
@@ -2037,6 +2280,7 @@ def _read_issuance_ledger(path: Path, *, secret: str) -> dict[str, object]:
             entry.get("promotion_terminal_receipt_sha256"),
             "ledger promotion_terminal_receipt_sha256",
         )
+        _validate_bootstrap_authority(entry, label="issuance ledger entry")
         _positive_bytes(
             entry.get("total_provider_bytes"), "ledger total_provider_bytes"
         )
@@ -2044,6 +2288,27 @@ def _read_issuance_ledger(path: Path, *, secret: str) -> dict[str, object]:
             entry.get("pointer"), Mapping
         ):
             raise CampaignCliError("issuance ledger artifacts are malformed")
+    order_bindings: dict[str, tuple[object, ...]] = {}
+    for entry in entries:
+        order_id = str(entry["order_id"])
+        binding = (
+            entry["provider_policy_sha256"],
+            entry["receipt_sha256"],
+            entry["provider_order_cap_bytes"],
+            entry["safety_reserve_bytes"],
+        )
+        previous = order_bindings.setdefault(order_id, binding)
+        if previous != binding:
+            raise CampaignCliError("issuance ledger provider-order binding drifted")
+        exposure = sum(
+            int(candidate["total_provider_bytes"])
+            for candidate in entries
+            if candidate["order_id"] == order_id
+        )
+        if exposure > whoscored_provider_spendable_cap_bytes(
+            int(entry["provider_order_cap_bytes"])
+        ):
+            raise CampaignCliError("issuance ledger provider-order exposure is unsafe")
     _validate_issuance_rollout_sequence(entries)
     return dict(body)
 
@@ -2072,18 +2337,60 @@ def _issuance_lock(path: Path) -> int:
     return descriptor
 
 
-def _publish_or_verify(path: Path, value: Mapping[str, object]) -> None:
+def _publish_or_verify(
+    path: Path,
+    value: Mapping[str, object],
+    *,
+    allow_frozen_existing: bool = False,
+) -> None:
     if path.exists() or path.is_symlink():
-        if _read_json_document(path, require_private=True) != value:
+        try:
+            existing = _read_json_document(path, require_private=True)
+        except CampaignCliError:
+            if not allow_frozen_existing:
+                raise
+            existing = _read_json_document(path, require_frozen=True)
+        if existing != value:
             raise CampaignCliError(f"immutable issued artifact differs: {path}")
         return
     _atomic_write_json(path, value, replace=False)
 
 
-def command_issue_daily_ingest(args: argparse.Namespace) -> None:
+def _freeze_group_readable_artifact(path: Path) -> None:
+    """Freeze an owned pointer for a root:gid-0 scheduler read-only mount."""
+
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise CampaignCliError(f"cannot freeze issued artifact safely: {path}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) not in {0o400, 0o440, 0o600}
+        ):
+            raise CampaignCliError(f"issued artifact cannot be frozen safely: {path}")
+        os.fchmod(descriptor, 0o440)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _command_issue_scheduled_ingest(
+    args: argparse.Namespace, *, bootstrap_mode: bool
+) -> None:
     now = _issuance_now().astimezone(timezone.utc).replace(microsecond=0)
     wall_time = now.timetz()
-    if not DAILY_ISSUER_WINDOW_START <= wall_time <= DAILY_ISSUER_WINDOW_END:
+    if not bootstrap_mode and not (
+        DAILY_ISSUER_WINDOW_START <= wall_time <= DAILY_ISSUER_WINDOW_END
+    ):
         raise CampaignCliError(
             "daily issuer wall clock must be inside 09:00..09:30 UTC"
         )
@@ -2097,7 +2404,7 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
         logical_run = _utc(run_id.removeprefix("scheduled__"), "run_id")
     except CampaignCliError as exc:
         raise CampaignCliError("daily ingest run_id timestamp is invalid") from exc
-    if logical_run != _expected_daily_logical_date(now):
+    if not bootstrap_mode and logical_run != _expected_daily_logical_date(now):
         raise CampaignCliError(
             "scheduled DagRun id is not the exact daily data-interval start"
         )
@@ -2133,12 +2440,34 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
         raise CampaignCliError(
             "expires_at exceeds the provider policy or charter validity window"
         )
-    scheduled_start = logical_run + timedelta(days=1)
+    scheduled_start = issued if bootstrap_mode else logical_run + timedelta(days=1)
     if expires - scheduled_start < DAILY_INGEST_SCHEDULED_APPROVAL_HORIZON:
         raise CampaignCliError(
             "expires_at cannot cover the complete scheduled DagRun timeout window"
         )
     rollout = _read_rollout(Path(args.rollout_file), require_private=True)
+    _verify_bootstrap_rollout_charter(
+        rollout=rollout,
+        charter=charter,
+        policy=policy,
+    )
+    bootstrap_slots = _validate_bootstrap_authority(
+        charter, label="bootstrap issuance charter"
+    )
+    bootstrap_slot_index: int | None = None
+    if bootstrap_mode:
+        for index, slot in enumerate(bootstrap_slots):
+            if slot["run_id"] == run_id:
+                bootstrap_slot_index = index
+                if slot["wave_id"] != charter["wave_id"]:
+                    raise CampaignCliError(
+                        "bootstrap run_id belongs to another signed rollout wave"
+                    )
+                break
+        if bootstrap_slot_index is None:
+            raise CampaignCliError(
+                "bootstrap run_id is outside the exact owner-signed six-slot authority"
+            )
     plan = _read_daily_plan(Path(args.plan_file), require_frozen=True)
     _verify_daily_plan_authority(
         plan=plan,
@@ -2201,6 +2530,13 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
         "total_provider_bytes": total_bytes,
         "effective_total_provider_bytes": issued_total_bytes,
         "daily_provider_bytes": daily_bytes,
+        "issuance_mode": "accelerated-bootstrap" if bootstrap_mode else "daily",
+        "bootstrap_slot_index": bootstrap_slot_index,
+        "provider_order_cap_bytes": charter["provider_order_cap_bytes"],
+        "safety_reserve_bytes": int(charter["provider_order_cap_bytes"])
+        - whoscored_provider_spendable_cap_bytes(
+            int(charter["provider_order_cap_bytes"])
+        ),
     }
     request_sha256 = hashlib.sha256(canonical_json_bytes(request_body)).hexdigest()
     ledger_path = Path(args.issuance_ledger)
@@ -2209,6 +2545,19 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
     try:
         ledger = _read_issuance_ledger(ledger_path, secret=ledger_secret)
         entries = list(ledger["entries"])
+        if any(
+            entry.get("order_id") == charter["order_id"]
+            and (
+                entry.get("provider_policy_sha256") != policy["document_sha256"]
+                or entry.get("receipt_sha256") != policy["receipt_sha256"]
+                or entry.get("provider_order_cap_bytes")
+                != charter["provider_order_cap_bytes"]
+            )
+            for entry in entries
+        ):
+            raise CampaignCliError(
+                "existing issuance provider-order authority differs from receipt"
+            )
         rollout_state = {
             field: charter[field]
             for field in (
@@ -2222,6 +2571,10 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
                 "classifier_sha256",
                 "promotion_acceptance_sha256",
                 "promotion_terminal_receipt_sha256",
+                "acceptance_mode",
+                "bootstrap_slots",
+                "capacity_receipt_sha256",
+                "provider_order_cap_bytes",
             )
         }
         _validate_issuance_rollout_sequence([*entries, rollout_state])
@@ -2260,11 +2613,31 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
             charter_count = sum(
                 1 for entry in entries if entry.get("charter_sha256") == charter_sha
             )
+            if bootstrap_mode:
+                prior_bootstrap_slots = [
+                    int(entry["bootstrap_slot_index"])
+                    for entry in entries
+                    if entry.get("issuance_mode") == "accelerated-bootstrap"
+                ]
+                expected_slot_index = len(prior_bootstrap_slots)
+                if (
+                    prior_bootstrap_slots != list(range(expected_slot_index))
+                    or bootstrap_slot_index != expected_slot_index
+                ):
+                    raise CampaignCliError(
+                        "bootstrap issuance must follow the exact signed slot order"
+                    )
+            spendable_order_cap = min(
+                int(charter["order_cap_bytes"]),
+                whoscored_provider_spendable_cap_bytes(
+                    int(charter["provider_order_cap_bytes"])
+                ),
+            )
             if (
                 month != charter["billing_month"]
-                or day_total + issued_total_bytes > int(charter["daily_cap_bytes"])
+                or day_total + issued_total_bytes > int(policy["daily_cap_bytes"])
                 or month_total + issued_total_bytes > int(charter["monthly_cap_bytes"])
-                or order_total + issued_total_bytes > int(charter["order_cap_bytes"])
+                or order_total + issued_total_bytes > spendable_order_cap
                 or charter_count >= int(charter["max_issuances"])
             ):
                 raise CampaignCliError(
@@ -2296,6 +2669,17 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
                     "billing_month": month,
                     "day": day,
                     "charter_sha256": charter_sha,
+                    "provider_policy_sha256": policy["document_sha256"],
+                    "receipt_sha256": policy["receipt_sha256"],
+                    "provider_order_cap_bytes": charter["provider_order_cap_bytes"],
+                    "safety_reserve_bytes": int(charter["provider_order_cap_bytes"])
+                    - whoscored_provider_spendable_cap_bytes(
+                        int(charter["provider_order_cap_bytes"])
+                    ),
+                    "issuance_mode": (
+                        "accelerated-bootstrap" if bootstrap_mode else "daily"
+                    ),
+                    "bootstrap_slot_index": bootstrap_slot_index,
                     "rollout_id": charter["rollout_id"],
                     "wave_id": charter["wave_id"],
                     "max_scopes": charter["max_scopes"],
@@ -2310,6 +2694,9 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
                     "promotion_terminal_receipt_sha256": charter[
                         "promotion_terminal_receipt_sha256"
                     ],
+                    "acceptance_mode": charter["acceptance_mode"],
+                    "bootstrap_slots": charter["bootstrap_slots"],
+                    "capacity_receipt_sha256": charter["capacity_receipt_sha256"],
                     "total_provider_bytes": approval.caps.total_provider_bytes,
                     "approval": signed,
                     "pointer": pointer,
@@ -2332,8 +2719,12 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
     _print_summary(
         {
             "status": (
-                "daily_ingest_approval_reused"
+                "bootstrap_ingest_approval_reused"
+                if idempotent and bootstrap_mode
+                else "daily_ingest_approval_reused"
                 if idempotent
+                else "bootstrap_ingest_approval_issued"
+                if bootstrap_mode
                 else "daily_ingest_approval_issued"
             ),
             "run_id": run_id,
@@ -2351,6 +2742,14 @@ def command_issue_daily_ingest(args: argparse.Namespace) -> None:
             "expires_at": approval.expires_at,
         }
     )
+
+
+def command_issue_daily_ingest(args: argparse.Namespace) -> None:
+    _command_issue_scheduled_ingest(args, bootstrap_mode=False)
+
+
+def command_issue_bootstrap_ingest(args: argparse.Namespace) -> None:
+    _command_issue_scheduled_ingest(args, bootstrap_mode=True)
 
 
 def command_sign(args: argparse.Namespace) -> None:
@@ -2476,6 +2875,25 @@ def _output_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--force", action="store_true")
 
 
+def _scheduled_issuance_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--plan-file", required=True)
+    parser.add_argument("--rollout-file", required=True)
+    parser.add_argument("--provider-policy", required=True)
+    parser.add_argument("--charter", required=True)
+    parser.add_argument("--runtime-sha256", required=True)
+    parser.add_argument("--classifier-sha256", required=True)
+    parser.add_argument("--issued-at", default="")
+    parser.add_argument("--expires-at", default="")
+    parser.add_argument("--approval-root", default=DEFAULT_APPROVAL_ROOT)
+    parser.add_argument("--pointer-root", default=DEFAULT_SCHEDULED_PAID_POINTER_ROOT)
+    parser.add_argument("--issuance-ledger", default=DEFAULT_ISSUANCE_LEDGER_PATH)
+    parser.add_argument("--force", action="store_true")
+    _secret_arguments(parser)
+    _owner_secret_arguments(parser)
+    _issuance_ledger_secret_arguments(parser)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build, sign, inspect, verify and revoke WhoScored campaigns"
@@ -2506,6 +2924,13 @@ def build_parser() -> argparse.ArgumentParser:
     create_rollout.add_argument("--cohort-id", required=True)
     create_rollout.add_argument("--runtime-sha256", required=True)
     create_rollout.add_argument("--classifier-sha256", required=True)
+    create_rollout.add_argument("--capacity-receipt-sha256", required=True)
+    create_rollout.add_argument("--provider-order-cap-bytes", type=int, required=True)
+    create_rollout.add_argument(
+        "--bootstrap-start-logical-date",
+        required=True,
+        help="first of six consecutive logical slots, canonical YYYY-MM-DDT10:00:00Z",
+    )
     create_rollout.add_argument(
         "--wave-id",
         choices=("wave-20",),
@@ -2543,7 +2968,7 @@ def build_parser() -> argparse.ArgumentParser:
     sign_policy.set_defaults(handler=command_sign_provider_policy)
 
     sign_charter = subparsers.add_parser(
-        "sign-charter", help="owner-sign one scheduled rollout charter-v4 document"
+        "sign-charter", help="owner-sign one scheduled rollout charter-v5 document"
     )
     sign_charter.add_argument("--input", required=True)
     _owner_secret_arguments(sign_charter)
@@ -2558,29 +2983,33 @@ def build_parser() -> argparse.ArgumentParser:
     _output_arguments(plan_daily)
     plan_daily.set_defaults(handler=command_plan_daily_ingest)
 
+    publish_bootstrap = subparsers.add_parser(
+        "publish-bootstrap-authority",
+        help="publish the protected six-slot timetable authority projection",
+    )
+    publish_bootstrap.add_argument("--rollout-file", required=True)
+    publish_bootstrap.add_argument("--provider-policy", required=True)
+    publish_bootstrap.add_argument("--charter", required=True)
+    publish_bootstrap.add_argument(
+        "--pointer-root", default=DEFAULT_SCHEDULED_PAID_POINTER_ROOT
+    )
+    _owner_secret_arguments(publish_bootstrap)
+    _issuance_ledger_secret_arguments(publish_bootstrap)
+    publish_bootstrap.set_defaults(handler=command_publish_bootstrap_authority)
+
     issue_daily = subparsers.add_parser(
         "issue-daily-ingest",
         help="issue and sign one standing daily-ingest approval for a scheduled run",
     )
-    issue_daily.add_argument("--run-id", required=True)
-    issue_daily.add_argument("--plan-file", required=True)
-    issue_daily.add_argument("--rollout-file", required=True)
-    issue_daily.add_argument("--provider-policy", required=True)
-    issue_daily.add_argument("--charter", required=True)
-    issue_daily.add_argument("--runtime-sha256", required=True)
-    issue_daily.add_argument("--classifier-sha256", required=True)
-    issue_daily.add_argument("--issued-at", default="")
-    issue_daily.add_argument("--expires-at", default="")
-    issue_daily.add_argument("--approval-root", default=DEFAULT_APPROVAL_ROOT)
-    issue_daily.add_argument(
-        "--pointer-root", default=DEFAULT_SCHEDULED_PAID_POINTER_ROOT
-    )
-    issue_daily.add_argument("--issuance-ledger", default=DEFAULT_ISSUANCE_LEDGER_PATH)
-    issue_daily.add_argument("--force", action="store_true")
-    _secret_arguments(issue_daily)
-    _owner_secret_arguments(issue_daily)
-    _issuance_ledger_secret_arguments(issue_daily)
+    _scheduled_issuance_arguments(issue_daily)
     issue_daily.set_defaults(handler=command_issue_daily_ingest)
+
+    issue_bootstrap = subparsers.add_parser(
+        "issue-bootstrap-ingest",
+        help="issue one exact accelerated-bootstrap slot outside the daily window",
+    )
+    _scheduled_issuance_arguments(issue_bootstrap)
+    issue_bootstrap.set_defaults(handler=command_issue_bootstrap_ingest)
 
     sign = subparsers.add_parser("sign", help="sign one unsigned template")
     sign.add_argument("--input", required=True)

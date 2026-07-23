@@ -939,6 +939,8 @@ jobs:
             dags/dag_backfill_whoscored.py \
             dags/dag_canary_whoscored_proxy.py \
             dags/dag_backup_whoscored_storage.py \
+            dags/plugins/__init__.py \
+            dags/plugins/whoscored_bootstrap_timetable.py \
             dags/dag_ingest_matchhistory.py \
             dags/dag_iceberg_maintenance.py \
             dags/dag_iceberg_maintenance_daily.py \
@@ -946,6 +948,7 @@ jobs:
             dags/scripts/run_whoscored_scraper.py \
             dags/scripts/run_whoscored_backfill_item.py \
             dags/scripts/whoscored_ops_store.py \
+            dags/scripts/whoscored_bootstrap.py \
             dags/scripts/whoscored_frozen_dq.py \
             dags/scripts/whoscored_identity.py \
             dags/scripts/whoscored_proxy_runtime.py \
@@ -976,11 +979,14 @@ jobs:
             dags/dag_backfill_whoscored.py \
             dags/dag_canary_whoscored_proxy.py \
             dags/dag_backup_whoscored_storage.py \
+            dags/plugins/__init__.py \
+            dags/plugins/whoscored_bootstrap_timetable.py \
             dags/dag_ingest_matchhistory.py \
             dags/dag_master_pipeline.py \
             dags/scripts/run_whoscored_scraper.py \
             dags/scripts/run_whoscored_backfill_item.py \
             dags/scripts/whoscored_ops_store.py \
+            dags/scripts/whoscored_bootstrap.py \
             dags/scripts/whoscored_frozen_dq.py \
             dags/scripts/whoscored_identity.py \
             dags/scripts/whoscored_proxy_runtime.py \
@@ -1010,6 +1016,8 @@ jobs:
           bash -n scripts/seaweedfs_lifecycle_lock.sh
           bash -n scripts/seaweedfs_plane_entrypoint.sh
           bash -n scripts/research/run_fbref_canary_guarded.sh
+          bash -n scripts/whoscored_bootstrap_issuer.sh
+          bash -n scripts/whoscored_daily_issuer.sh
 
       - name: Render production compose
         if: ${{ !cancelled() }}
@@ -1149,6 +1157,23 @@ jobs:
 
       - name: Check real Airflow DAG imports
         run: |
+          pointer_parent="$(mktemp -d /tmp/whoscored-airflow-pointer.XXXXXXXX)"
+          [[ "$pointer_parent" =~ ^/tmp/whoscored-airflow-pointer\.[A-Za-z0-9]{8}$ ]]
+          pointer_root="${pointer_parent}/pointers"
+          host_python="$(command -v python)"
+          test -x "$host_python"
+          sudo chown root:root "$pointer_parent"
+          sudo chmod 0750 "$pointer_parent"
+          sudo env \
+            PYTHONPATH="${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}/dags" \
+            WHOSCORED_SCHEDULED_PAID_POINTER_ROOT="$pointer_root" \
+            "$host_python" \
+            "${GITHUB_WORKSPACE}/scripts/ci/create_whoscored_bootstrap_pointer.py"
+          test "$(sudo stat -Lc '%u:%g:%a' "$pointer_root")" = "0:0:750"
+          test "$(sudo stat -Lc '%u:%g:%a' "$pointer_root/bootstrap.json")" = "0:0:440"
+          test "$(sudo find "$pointer_root" -maxdepth 1 -type f ! -name bootstrap.json | wc -l)" = 7
+          test -z "$(sudo find "$pointer_root" -maxdepth 1 -type f ! -name bootstrap.json \
+            \( ! -uid 0 -o ! -gid 0 -o ! -perm 0640 \) -print -quit)"
           docker run --rm \
             --read-only \
             --network none \
@@ -1160,8 +1185,11 @@ jobs:
             -e AIRFLOW__CORE__LOAD_EXAMPLES=False \
             -e AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////tmp/airflow/airflow.db \
             -e AIRFLOW__CORE__DAGS_FOLDER=/workspace/dags/.whoscored-ci-staged \
+            -e AIRFLOW__CORE__PLUGINS_FOLDER=/workspace/dags/plugins \
+            -e WHOSCORED_SCHEDULED_PAID_POINTER_ROOT=/tmp/whoscored-scheduled-pointers \
             -e PYTHONPATH=/workspace:/workspace/dags \
             -v "${GITHUB_WORKSPACE}:/workspace:ro" \
+            -v "${pointer_root}:/tmp/whoscored-scheduled-pointers:ro" \
             --entrypoint /bin/bash \
             "whoscored-airflow-import:${{ matrix.airflow-version }}" \
             -euc 'mkdir -p "$HOME" "$AIRFLOW_HOME"; airflow db migrate; airflow dags list-import-errors; python /workspace/scripts/ci/check_whoscored_dag_imports.py'

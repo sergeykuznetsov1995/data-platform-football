@@ -2,10 +2,12 @@
 """Run a sustained, four-worker, non-publishing WhoScored capacity canary.
 
 Each worker repeatedly executes ``bench_whoscored_workflow.py`` in an
-independent process.  That workflow uses a temporary local raw store and an
-in-memory repository, so this supervisor cannot publish Bronze rows, manifests
-or DDL.  The production-safe defaults run four workers for six hours and fail
-closed unless all of these gates hold:
+independent process.  Production uses the exact content-addressed cache corpus,
+with worker network and paid routes forbidden.  The former direct-first path is
+retained only as an explicit diagnostic mode.  Both workflows use a temporary
+local raw store and an in-memory repository, so this supervisor cannot publish
+Bronze rows, manifests or DDL.  Production runs exactly four workers for six
+hours and fails closed unless all of these gates hold:
 
 * projected throughput is at least 144,000 source page units/day;
 * no paid route or paid byte is observed;
@@ -63,8 +65,14 @@ WORKER_EXEC_SCRIPT = (
     REPO_ROOT / "scripts" / "research" / "whoscored_capacity_worker_exec.py"
 )
 
-CANARY_VERSION = "whoscored-capacity-canary-v3"
+CANARY_VERSION = "whoscored-capacity-canary-v4"
+CAPACITY_REPORT_SCHEMA_VERSION = 1
+CACHE_CAPACITY_MODE = "cache-capacity-v1"
+DIRECT_DIAGNOSTIC_MODE = "direct-diagnostic-v1"
 EXPECTED_WORKFLOW_VERSION = "whoscored-workflow-benchmark-v2"
+EXPECTED_CACHE_SEED_SHA256 = (
+    "eb3739448a42a00f3a5812c20a0885ea691306634b2922cda1dd2d7c8490fb4a"
+)
 REQUIRED_CURL_CFFI_VERSION = "0.15.0"
 REQUIRED_FLARESOLVERR_VERSION = "3.4.6"
 REQUIRED_FLARESOLVERR_ENDPOINT = "http://127.0.0.1:8191"
@@ -114,9 +122,14 @@ REQUIRED_UNSHARE_SHA256 = (
     "51bcc77ba5db162c80028f861f0a2770d728c1de80773816d863f28d7a817adb"
 )
 WORKER_COUNT = 4
+MAX_RETAINED_ERROR_RUN_SUMMARIES = 8
+MAX_RETAINED_RUN_SUMMARIES = WORKER_COUNT * 2 + MAX_RETAINED_ERROR_RUN_SUMMARIES
 _CAPACITY_BOOTSTRAP_LIVENESS_EXIT_CODE = 70
 DEFAULT_DURATION_SECONDS = 6 * 60 * 60
 DEFAULT_SAMPLE_INTERVAL_SECONDS = 30.0
+MAX_RETAINED_SAMPLES = (
+    math.ceil(DEFAULT_DURATION_SECONDS / DEFAULT_SAMPLE_INTERVAL_SECONDS) + 4
+)
 DEFAULT_SCOPES = ("INT-World Cup=2026", "ENG-Premier League=2526")
 DEFAULT_MATCH_LIMIT = 3
 DEFAULT_PROFILE_LIMIT = 3
@@ -298,6 +311,7 @@ class WorkerCommand:
     argv: tuple[str, ...]
     browser_session_owner: Optional[str] = None
     flaresolverr_endpoint: Optional[str] = None
+    session_owner: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -324,6 +338,7 @@ class CapacityAccumulator:
     source_request_attempts: int = 0
     paid_bytes: int = 0
     paid_route_requests: int = 0
+    network_requests: int = 0
     completed_runs: int = 0
     completed_by_worker: dict[int, int] = field(
         default_factory=lambda: {worker_id: 0 for worker_id in range(WORKER_COUNT)}
@@ -331,9 +346,20 @@ class CapacityAccumulator:
     worker_seconds: float = 0.0
     deadline_truncations: int = 0
     run_summaries: list[dict[str, Any]] = field(default_factory=list)
+    run_summaries_total: int = 0
+    first_run_summary_by_worker: dict[int, dict[str, Any]] = field(
+        default_factory=dict
+    )
+    last_run_summary_by_worker: dict[int, dict[str, Any]] = field(
+        default_factory=dict
+    )
+    error_run_summaries: list[dict[str, Any]] = field(default_factory=list)
     worker_errors: list[str] = field(default_factory=list)
     safety_violations: list[str] = field(default_factory=list)
     traffic_evidence_violations: list[str] = field(default_factory=list)
+    seed_evidence_violations: list[str] = field(default_factory=list)
+    cleanup_evidence_violations: list[str] = field(default_factory=list)
+    seed_sha256: Optional[str] = None
     monitoring_errors: list[str] = field(default_factory=list)
     container_violations: list[str] = field(default_factory=list)
     samples: list[dict[str, Any]] = field(default_factory=list)
@@ -376,12 +402,12 @@ class ProductionDeployment:
     common_digest_override_path: Path
     common_digest_override_sha256: str
     common_digest_override_identity: tuple[int, ...]
-    gateway_digest_override_path: Path
-    gateway_digest_override_sha256: str
-    gateway_digest_override_identity: tuple[int, ...]
-    provider_policy_path: Path
-    owner_secret_file_path: Path
-    deployment_admission_receipt_path: Path
+    gateway_digest_override_path: Optional[Path]
+    gateway_digest_override_sha256: Optional[str]
+    gateway_digest_override_identity: Optional[tuple[int, ...]]
+    provider_policy_path: Optional[Path]
+    owner_secret_file_path: Optional[Path]
+    deployment_admission_receipt_path: Optional[Path]
     release_revision: str
     payload_revision: str
     provenance_manifest_sha256: str
@@ -391,6 +417,7 @@ class ProductionDeployment:
     protected_config_hashes: Mapping[str, str]
     running_admission: Mapping[str, Any]
     protected_inputs: tuple[ProtectedInputSnapshot, ...]
+    admission_mode: str = DIRECT_DIAGNOSTIC_MODE
 
     @property
     def flaresolverr_payload_image_id(self) -> str:
@@ -406,6 +433,8 @@ class ProductionDeployment:
 
     @property
     def gateway_compose_files(self) -> tuple[Path, ...]:
+        if self.gateway_digest_override_path is None:
+            raise RuntimeError("cache admission has no paid-gateway Compose files")
         return (
             PRODUCTION_GATEWAY_COMPOSE_FILE,
             self.gateway_digest_override_path,
@@ -413,6 +442,7 @@ class ProductionDeployment:
 
     def evidence(self) -> dict[str, Any]:
         return {
+            "admission_mode": self.admission_mode,
             "deployment_attestation_sha256": self.deployment_attestation_sha256,
             "common_digest_override_sha256": self.common_digest_override_sha256,
             "gateway_digest_override_sha256": self.gateway_digest_override_sha256,
@@ -586,6 +616,43 @@ def _json_safe_document(value: Mapping[str, Any]) -> dict[str, Any]:
     return json.loads(json.dumps(value, sort_keys=True, default=str))
 
 
+def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _attach_report_sha256(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Hash canonical report bytes excluding the self-describing digest field."""
+
+    report = _json_safe_document(value)
+    report.pop("report_sha256", None)
+    report["report_sha256"] = hashlib.sha256(
+        _canonical_json_bytes(report)
+    ).hexdigest()
+    return report
+
+
+def verify_report_sha256(value: Mapping[str, Any]) -> bool:
+    """Validate one untrusted capacity receipt's content address."""
+
+    if not isinstance(value, Mapping):
+        return False
+    claimed = value.get("report_sha256")
+    if not isinstance(claimed, str) or re.fullmatch(r"[0-9a-f]{64}", claimed) is None:
+        return False
+    document = dict(value)
+    document.pop("report_sha256", None)
+    try:
+        actual = hashlib.sha256(_canonical_json_bytes(document)).hexdigest()
+    except (TypeError, ValueError):
+        return False
+    return secrets.compare_digest(claimed, actual)
+
+
 def _absolute_evidence_path(value: Any, *, label: str) -> Path:
     if value is None:
         raise ValueError(f"{label} is required")
@@ -598,6 +665,99 @@ def _absolute_evidence_path(value: Any, *, label: str) -> Path:
     ):
         raise ValueError(f"{label} must be one canonical absolute path")
     return path
+
+
+_CACHE_ADMISSION_VALIDATION_BRIDGE = r"""
+import hashlib
+import json
+from pathlib import Path
+import runpy
+import sys
+
+admission = runpy.run_path(
+    sys.argv[1], run_name="_whoscored_cache_capacity_production_admission"
+)
+root = Path(sys.argv[2])
+deployment_attestation_path = Path(sys.argv[5])
+common_override = Path(sys.argv[6])
+env_files = tuple(Path(value) for value in sys.argv[7:])
+if len(env_files) != 3 or len(set(env_files)) != 3:
+    raise RuntimeError("cache capacity admission requires three environment files")
+admission["_assert_canonical_release"](root)
+evidence = admission["validate_bindings_with_evidence"](
+    root=root,
+    attestation_path=Path(sys.argv[3]),
+    manifest_path=Path(sys.argv[4]),
+    deployment_attestation_path=deployment_attestation_path,
+)
+common_override_raw, common_override_identity = admission["verify_override_snapshot"](
+    common_override, evidence.bindings, admission["COMMON_PROTECTED_SERVICES"]
+)
+protected_inputs = admission["_assert_protected_compose_inputs"](
+    (
+        root / "compose.yaml",
+        root / "compose.seaweedfs-supervised.yaml",
+        common_override,
+        *env_files,
+    )
+)
+projections, config_hashes, config_files, _rendered = admission[
+    "render_attested_common_project"
+](
+    evidence.bindings,
+    root=root,
+    common_override_path=common_override,
+    env_files=env_files,
+    runner=admission["_run_docker"],
+    protected_inputs={
+        path: evidence.raw for path, evidence in protected_inputs.items()
+    },
+)
+if set(protected_inputs) != set((*config_files, *env_files)):
+    raise RuntimeError("cache capacity protected Compose inputs differ")
+running_admission = admission["verify_created_containers"](
+    evidence.bindings,
+    project=admission["COMMON_PROJECT"],
+    selected_services=admission["COMMON_PROTECTED_SERVICES"],
+    projections=projections,
+    config_hashes=config_hashes,
+    config_files=config_files,
+    env_files=env_files,
+    runner=admission["_run_docker"],
+    expected_state="running",
+)
+if any(
+    record.get("image_id")
+    != evidence.validated_payload_image_ids.get(record.get("service"))
+    for record in running_admission.get("images", ())
+):
+    raise RuntimeError("cache capacity live image differs from validated payload")
+
+document = {
+    "build_attestation_identity": list(evidence.build_attestation_identity),
+    "build_attestation_sha256": hashlib.sha256(evidence.build_attestation_raw).hexdigest(),
+    "build_manifest_identity": list(evidence.build_manifest_identity),
+    "build_manifest_sha256": hashlib.sha256(evidence.build_manifest_raw).hexdigest(),
+    "deployment_attestation_identity": list(evidence.deployment_attestation_identity),
+    "deployment_attestation_sha256": hashlib.sha256(
+        evidence.deployment_attestation_raw
+    ).hexdigest(),
+    "common_digest_override_identity": list(common_override_identity),
+    "common_digest_override_sha256": hashlib.sha256(common_override_raw).hexdigest(),
+    "protected_bindings": dict(evidence.bindings),
+    "protected_config_hashes": config_hashes,
+    "protected_payload_image_ids": {
+        service: evidence.validated_payload_image_ids[service]
+        for service in evidence.bindings
+    },
+    "running_admission": running_admission,
+    "payload_revision": evidence.validated_payload_revision,
+    "provenance_manifest_sha256": evidence.validated_manifest_sha256,
+    "release_revision": evidence.validated_release_revision,
+    "source_tree_sha256": evidence.validated_source_tree_sha256,
+}
+sys.stdout.write(json.dumps(document, sort_keys=True, separators=(",", ":")))
+"""
 
 
 _ADMISSION_VALIDATION_BRIDGE = r"""
@@ -714,8 +874,255 @@ sys.stdout.write(json.dumps(document, sort_keys=True, separators=(",", ":")))
 """
 
 
+def _validate_cache_production_deployment(
+    args: argparse.Namespace,
+) -> ProductionDeployment:
+    """Admit ready common runtime without any paid-provider authority."""
+
+    deployment_attestation = _absolute_evidence_path(
+        getattr(args, "deployment_attestation", None),
+        label="deployment attestation",
+    )
+    common_digest_override = _absolute_evidence_path(
+        getattr(args, "common_digest_override", None),
+        label="common digest override",
+    )
+    input_specs = (
+        ("build-attestation", PRODUCTION_BUILD_ATTESTATION, False),
+        ("build-manifest", PRODUCTION_BUILD_MANIFEST, False),
+        ("deployment-attestation", deployment_attestation, True),
+        ("compose:compose.yaml", PRODUCTION_COMPOSE_FILES[0], False),
+        (
+            "compose:compose.seaweedfs-supervised.yaml",
+            PRODUCTION_COMPOSE_FILES[1],
+            False,
+        ),
+        ("common-digest-override", common_digest_override, True),
+        *(
+            (f"compose-env:{index}", path, True)
+            for index, path in enumerate(PRODUCTION_COMPOSE_ENV_FILES)
+        ),
+    )
+    if (
+        len({label for label, _path, _private in input_specs}) != len(input_specs)
+        or len({path for _label, path, _private in input_specs}) != len(input_specs)
+    ):
+        raise RuntimeError("cache deployment inputs are duplicated")
+    before_snapshots = tuple(
+        _protected_input_snapshot(path, label=label, private=private)
+        for label, path, private in input_specs
+    )
+    command = [
+        str(PRODUCTION_ADMISSION_PYTHON),
+        "-I",
+        "-S",
+        "-c",
+        _CACHE_ADMISSION_VALIDATION_BRIDGE,
+        str(PRODUCTION_ADMISSION_SCRIPT),
+        str(REPO_ROOT),
+        str(PRODUCTION_BUILD_ATTESTATION),
+        str(PRODUCTION_BUILD_MANIFEST),
+        str(deployment_attestation),
+        str(common_digest_override),
+        *(str(path) for path in PRODUCTION_COMPOSE_ENV_FILES),
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            env={
+                "HOME": "/nonexistent",
+                "PATH": "/usr/bin:/bin",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("cannot validate cache ready-v1 deployment") from exc
+    if result.returncode != 0:
+        detail = _safe_message(result.stderr.strip() or "validation failed")
+        raise RuntimeError(f"cache ready-v1 deployment is invalid: {detail}")
+    if len(result.stdout.encode("utf-8")) > 8192:
+        raise RuntimeError("cache deployment validation output is too large")
+    try:
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("cache deployment validation returned invalid JSON") from exc
+    expected_fields = {
+        "build_attestation_identity",
+        "build_attestation_sha256",
+        "build_manifest_identity",
+        "build_manifest_sha256",
+        "deployment_attestation_identity",
+        "deployment_attestation_sha256",
+        "common_digest_override_identity",
+        "common_digest_override_sha256",
+        "protected_bindings",
+        "protected_config_hashes",
+        "protected_payload_image_ids",
+        "running_admission",
+        "payload_revision",
+        "provenance_manifest_sha256",
+        "release_revision",
+        "source_tree_sha256",
+    }
+    if not isinstance(document, dict) or set(document) != expected_fields:
+        raise RuntimeError("cache deployment validation has an invalid shape")
+    after_snapshots = tuple(
+        _protected_input_snapshot(path, label=label, private=private)
+        for label, path, private in input_specs
+    )
+    if after_snapshots != before_snapshots:
+        raise RuntimeError("cache deployment inputs changed during validation")
+    snapshots = {snapshot.label: snapshot for snapshot in before_snapshots}
+
+    def bridge_identity(field: str) -> tuple[int, ...]:
+        value = document.get(field)
+        if (
+            type(value) is not list
+            or len(value) != len(_PROTECTED_INPUT_IDENTITY_FIELDS)
+            or any(type(item) is not int or item < 0 for item in value)
+        ):
+            raise RuntimeError("cache deployment returned an invalid input identity")
+        return tuple(value)
+
+    for label, identity_field, digest_field in (
+        ("build-attestation", "build_attestation_identity", "build_attestation_sha256"),
+        ("build-manifest", "build_manifest_identity", "build_manifest_sha256"),
+        (
+            "deployment-attestation",
+            "deployment_attestation_identity",
+            "deployment_attestation_sha256",
+        ),
+        (
+            "common-digest-override",
+            "common_digest_override_identity",
+            "common_digest_override_sha256",
+        ),
+    ):
+        if (
+            bridge_identity(identity_field) != snapshots[label].identity
+            or document.get(digest_field) != snapshots[label].sha256
+        ):
+            raise RuntimeError("cache validated bytes differ from their snapshot")
+
+    protected_bindings = document.get("protected_bindings")
+    protected_payloads = document.get("protected_payload_image_ids")
+    config_hashes = document.get("protected_config_hashes")
+    running = document.get("running_admission")
+    protected_set = set(PROTECTED_PRODUCTION_SERVICES)
+    common_set = set(ADMITTED_RUNNING_SERVICES)
+    digests = (
+        document.get("deployment_attestation_sha256"),
+        document.get("common_digest_override_sha256"),
+        document.get("provenance_manifest_sha256"),
+        document.get("source_tree_sha256"),
+    )
+    revisions = (
+        document.get("release_revision"),
+        document.get("payload_revision"),
+    )
+    if (
+        any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in digests
+        )
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{40}", value) is None
+            for value in revisions
+        )
+        or document.get("provenance_manifest_sha256")
+        != snapshots["build-manifest"].sha256
+        or not isinstance(protected_bindings, dict)
+        or set(protected_bindings) != protected_set
+        or any(
+            not isinstance(value, str) or _PINNED_IMAGE_RE.fullmatch(value) is None
+            for value in protected_bindings.values()
+        )
+        or not isinstance(protected_payloads, dict)
+        or set(protected_payloads) != protected_set
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+            for value in protected_payloads.values()
+        )
+        or not isinstance(config_hashes, dict)
+        or set(config_hashes) != common_set
+        or any(
+            not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in config_hashes.values()
+        )
+        or not isinstance(running, dict)
+        or set(running)
+        != {
+            "apparmor_profile",
+            "docker_security_options",
+            "images",
+            "networks",
+            "projects",
+            "schema_version",
+            "status",
+            "volumes",
+        }
+        or running.get("schema_version") != 1
+        or running.get("status") != "admitted-running-v1"
+        or running.get("projects")
+        != {"data-platform": list(ADMITTED_RUNNING_SERVICES)}
+    ):
+        raise RuntimeError("cache deployment validation returned invalid bindings")
+    running_images = running.get("images")
+    if not isinstance(running_images, list) or len(running_images) != len(common_set):
+        raise RuntimeError("cache running admission has an invalid image set")
+    for service, record in zip(ADMITTED_RUNNING_SERVICES, running_images):
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"container_id", "final_image", "image_id", "service"}
+            or record.get("service") != service
+            or record.get("final_image") != protected_bindings[service]
+            or not isinstance(record.get("container_id"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", record["container_id"]) is None
+            or not isinstance(record.get("image_id"), str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", record["image_id"]) is None
+            or record.get("image_id") != protected_payloads[service]
+        ):
+            raise RuntimeError("cache running admission has invalid image identity")
+    return ProductionDeployment(
+        deployment_attestation_path=deployment_attestation,
+        deployment_attestation_sha256=str(digests[0]),
+        deployment_attestation_identity=snapshots["deployment-attestation"].identity,
+        common_digest_override_path=common_digest_override,
+        common_digest_override_sha256=str(digests[1]),
+        common_digest_override_identity=snapshots["common-digest-override"].identity,
+        gateway_digest_override_path=None,
+        gateway_digest_override_sha256=None,
+        gateway_digest_override_identity=None,
+        provider_policy_path=None,
+        owner_secret_file_path=None,
+        deployment_admission_receipt_path=None,
+        release_revision=str(revisions[0]),
+        payload_revision=str(revisions[1]),
+        provenance_manifest_sha256=str(digests[2]),
+        source_tree_sha256=str(digests[3]),
+        protected_bindings=dict(protected_bindings),
+        protected_payload_image_ids=dict(protected_payloads),
+        protected_config_hashes=dict(config_hashes),
+        running_admission=_json_safe_document(running),
+        protected_inputs=before_snapshots,
+        admission_mode=CACHE_CAPACITY_MODE,
+    )
+
+
 def _validate_production_deployment(args: argparse.Namespace) -> ProductionDeployment:
     """Validate ready-v1 provenance and both exact Compose projects."""
+
+    if _capacity_mode(args) == CACHE_CAPACITY_MODE:
+        return _validate_cache_production_deployment(args)
 
     deployment_attestation = _absolute_evidence_path(
         getattr(args, "deployment_attestation", None),
@@ -1606,6 +2013,16 @@ def _state_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     return _DEFAULT_SUPERVISOR_LOCK_PATH, _DEFAULT_SESSION_OWNER_PATH
 
 
+def _state_entry_exists(path: Path) -> bool:
+    """Return whether the exact path entry exists, including a dangling link."""
+
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def _acquire_supervisor_lock(path: Path) -> int:
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
@@ -1834,6 +2251,7 @@ def _prepare_session_ownership(
         Callable[[str, Optional[str]], Sequence[str]]
     ] = None,
     finalize_worker_artifacts: Optional[Callable[[str], bool]] = None,
+    browser_network_control: bool = True,
 ) -> _SessionOwnershipLease:
     """Lock the host, clean stale ownership, then persist a new unique owner."""
 
@@ -1841,7 +2259,14 @@ def _prepare_session_ownership(
     if current_endpoint != REQUIRED_FLARESOLVERR_ENDPOINT:
         raise ValueError("FlareSolverr endpoint does not match production binding")
     worker_image_id = _validated_worker_image_id(worker_image_id)
-    lock_path, state_path = _state_paths(args)
+    lock_path, direct_state_path = _state_paths(args)
+    cache_ownership = not browser_network_control
+    state_path = direct_state_path
+    if cache_ownership:
+        # Cache workers have a distinct crash-recovery record.  Never consume
+        # or overwrite a diagnostic owner record: it may still name browser
+        # sessions which only a later explicit diagnostic cleanup may sweep.
+        state_path = state_path.with_name(f"{state_path.name}.cache")
     no_cleanup = _empty_cleanup_result(required=False, verified=True)
     try:
         lock_descriptor = _acquire_supervisor_lock(lock_path)
@@ -1871,6 +2296,24 @@ def _prepare_session_ownership(
 
     preflight = no_cleanup
     try:
+        # The shared flock prevents a supervised direct run from creating this
+        # record after the check.  Cache mode must not read, repair, or sweep a
+        # retained direct owner because only the explicit diagnostic path has
+        # browser lifecycle authority.  Even an invalid or dangling entry is a
+        # fail-closed recovery boundary.
+        if cache_ownership and _state_entry_exists(direct_state_path):
+            preflight = _empty_cleanup_result(required=True, verified=False)
+            evidence = _ownership_evidence(
+                lock_acquired=True,
+                preflight=preflight,
+                final=_empty_cleanup_result(required=False, verified=True),
+                state_file_removed=False,
+            )
+            raise _SessionOwnershipPreparationError(
+                "direct diagnostic ownership state blocks cache capacity startup",
+                evidence,
+            )
+
         if state_path.exists():
             try:
                 stale_owner, stale_endpoint, stale_worker_image_id = (
@@ -1916,7 +2359,7 @@ def _prepare_session_ownership(
                         preflight["error_sha256"] = [
                             _cleanup_error_hash("stale_workers", exc)
                         ]
-                if preflight["verified_zero"]:
+                if preflight["verified_zero"] and browser_network_control:
                     browser_cleanup = _sweep_owned_browser_sessions(
                         flaresolverr_url=stale_endpoint,
                         owner=stale_owner,
@@ -1964,20 +2407,26 @@ def _prepare_session_ownership(
         _write_owner_state(
             state_path, owner, current_endpoint, worker_image_id
         )
-        fresh_probe = _probe_fresh_session_owner(
-            flaresolverr_url=current_endpoint,
-            owner=owner,
-        )
-        preflight = _combine_cleanup_results(preflight, fresh_probe)
-        if not fresh_probe["verified_zero"]:
-            evidence = _ownership_evidence(
-                lock_acquired=True,
-                preflight=preflight,
-                final=_empty_cleanup_result(required=True, verified=False),
-                state_file_removed=False,
+        if browser_network_control:
+            fresh_probe = _probe_fresh_session_owner(
+                flaresolverr_url=current_endpoint,
+                owner=owner,
             )
-            raise _SessionOwnershipPreparationError(
-                "fresh browser-session lifecycle probe failed", evidence
+            preflight = _combine_cleanup_results(preflight, fresh_probe)
+            if not fresh_probe["verified_zero"]:
+                evidence = _ownership_evidence(
+                    lock_acquired=True,
+                    preflight=preflight,
+                    final=_empty_cleanup_result(required=True, verified=False),
+                    state_file_removed=False,
+                )
+                raise _SessionOwnershipPreparationError(
+                    "fresh browser-session lifecycle probe failed", evidence
+                )
+        else:
+            preflight = _combine_cleanup_results(
+                preflight,
+                _empty_cleanup_result(required=False, verified=True),
             )
     except _SessionOwnershipPreparationError:
         os.close(lock_descriptor)
@@ -2055,12 +2504,16 @@ def _prepare_session_ownership(
         nonlocal finalized
         if finalized is not None:
             return finalized
-        final = _sweep_owned_browser_sessions(
-            flaresolverr_url=current_endpoint,
-            owner=owner,
-            stale=False,
-            monotonic=monotonic,
-            sleep=sleep,
+        final = (
+            _sweep_owned_browser_sessions(
+                flaresolverr_url=current_endpoint,
+                owner=owner,
+                stale=False,
+                monotonic=monotonic,
+                sleep=sleep,
+            )
+            if browser_network_control
+            else _empty_cleanup_result(required=False, verified=True)
         )
         removed = False
         final["worker_artifact_cleanup_required"] = (
@@ -2232,13 +2685,18 @@ def _evidence_bool(value: Any) -> Optional[bool]:
     return value if type(value) is bool else None
 
 
-def _workflow_traffic(report: Mapping[str, Any]) -> tuple[int, int, int, int]:
-    """Return attempts, completed logical units, and paid traffic counters."""
+def _workflow_traffic(
+    report: Mapping[str, Any],
+) -> tuple[int, int, int, int, int]:
+    """Return source/network attempts, work units, and paid counters."""
 
     source_request_attempts = 0
     page_units = 0
     paid_bytes = 0
     paid_route_requests = 0
+    phase_network_requests = 0
+    mode = report.get("mode")
+    cache_mode = mode == CACHE_CAPACITY_MODE
     phases = report.get("phases")
     if not isinstance(phases, list):
         raise ValueError("workflow phases must be a list")
@@ -2252,14 +2710,21 @@ def _workflow_traffic(report: Mapping[str, Any]) -> tuple[int, int, int, int]:
             traffic.get("source_request_attempts", 0),
             field_name="source_request_attempts",
         )
+        cache_attempts = _as_child_nonnegative_int(
+            traffic.get("cache_work_units_attempted", 0),
+            field_name="cache_work_units_attempted",
+        )
         if "successful_page_units" not in traffic:
             raise ValueError("workflow omitted successful_page_units")
         completed = _as_child_nonnegative_int(
             traffic.get("successful_page_units"),
             field_name="successful_page_units",
         )
-        if completed > attempts:
-            raise ValueError("successful_page_units cannot exceed source attempts")
+        denominator = cache_attempts if cache_mode else attempts
+        if completed > denominator:
+            raise ValueError("successful_page_units cannot exceed attempted work")
+        if cache_mode and attempts != 0:
+            raise ValueError("cache workflow emitted source request attempts")
         source_request_attempts += attempts
         page_units += completed
         paid_bytes += _as_child_nonnegative_int(
@@ -2269,7 +2734,35 @@ def _workflow_traffic(report: Mapping[str, Any]) -> tuple[int, int, int, int]:
             traffic.get("paid_route_requests", 0),
             field_name="paid_route_requests",
         )
-    return source_request_attempts, page_units, paid_bytes, paid_route_requests
+        if cache_mode:
+            phase_network_requests += _as_child_nonnegative_int(
+                traffic.get("network_requests"), field_name="network_requests"
+            )
+    if cache_mode:
+        if report.get("schema_version") != CAPACITY_REPORT_SCHEMA_VERSION:
+            raise ValueError("cache workflow schema version mismatch")
+        network_requests = _as_child_nonnegative_int(
+            report.get("network_requests"), field_name="network_requests"
+        )
+        reported_paid = _as_child_nonnegative_int(
+            report.get("paid_proxy_bytes"), field_name="paid_proxy_bytes"
+        )
+        reported_paid_requests = _as_child_nonnegative_int(
+            report.get("paid_route_requests"), field_name="paid_route_requests"
+        )
+        if network_requests != phase_network_requests:
+            raise ValueError("cache workflow network counters disagree")
+        if reported_paid != paid_bytes or reported_paid_requests != paid_route_requests:
+            raise ValueError("cache workflow paid counters disagree")
+    else:
+        network_requests = source_request_attempts
+    return (
+        source_request_attempts,
+        page_units,
+        paid_bytes,
+        paid_route_requests,
+        network_requests,
+    )
 
 
 def _workflow_shape(report: Mapping[str, Any]) -> tuple[list[str], int]:
@@ -2285,17 +2778,19 @@ def _workflow_shape(report: Mapping[str, Any]) -> tuple[list[str], int]:
     if expected_feed_states != 68:
         raise ValueError("workflow did not prove the 68-feed stage contract")
     phases = report.get("phases") or []
-    cold = next(
+    cache_mode = report.get("mode") == CACHE_CAPACITY_MODE
+    expected_phase = "cache_replay" if cache_mode else "cold"
+    measured = next(
         (
             phase
             for phase in phases
-            if isinstance(phase, Mapping) and phase.get("name") == "cold"
+            if isinstance(phase, Mapping) and phase.get("name") == expected_phase
         ),
         None,
     )
-    if not isinstance(cold, Mapping):
-        raise ValueError("workflow did not emit a cold phase")
-    results = cold.get("results") or []
+    if not isinstance(measured, Mapping):
+        raise ValueError(f"workflow did not emit a {expected_phase} phase")
+    results = measured.get("results") or []
     if not isinstance(results, list):
         raise ValueError("cold phase results must be a list")
     by_entity = {
@@ -2303,15 +2798,23 @@ def _workflow_shape(report: Mapping[str, Any]) -> tuple[list[str], int]:
         for result in results
         if isinstance(result, Mapping) and result.get("entity")
     }
-    required = {"schedule", "matches", "previews", "profiles"}
+    required = (
+        {"matches", "previews", "profiles", "multistage"}
+        if cache_mode
+        else {"schedule", "matches", "previews", "profiles"}
+    )
     missing = sorted(required.difference(by_entity))
     if missing:
         raise ValueError("workflow omitted entity results: " + ", ".join(missing))
-    if not cold.get("selected_match_ids") or not cold.get("selected_profile_ids"):
+    if not cache_mode and (
+        not measured.get("selected_match_ids")
+        or not measured.get("selected_profile_ids")
+    ):
         raise ValueError("workflow did not exercise match and profile targets")
-    schedule_metadata = by_entity["schedule"].get("metadata") or {}
+    stage_entity = "multistage" if cache_mode else "schedule"
+    schedule_metadata = by_entity[stage_entity].get("metadata") or {}
     if not isinstance(schedule_metadata, Mapping):
-        raise ValueError("schedule result metadata must be an object")
+        raise ValueError("stage result metadata must be an object")
     stage_count = _as_child_nonnegative_int(
         schedule_metadata.get("source_stage_count", 0),
         field_name="source_stage_count",
@@ -2335,6 +2838,7 @@ def _summarize_outcome(outcome: WorkerOutcome) -> dict[str, Any]:
         "termination_reason": outcome.termination_reason,
         "status": "failed",
         "source_request_attempts": 0,
+        "network_requests": 0,
         "page_units": 0,
         "paid_bytes": 0,
         "paid_route_requests": 0,
@@ -2345,6 +2849,10 @@ def _summarize_outcome(outcome: WorkerOutcome) -> dict[str, Any]:
         "executes_ddl": None,
         "entities": [],
         "source_stage_count": 0,
+        "mode": None,
+        "seed_sha256": None,
+        "seed_evidence_valid": None,
+        "cleanup_evidence_valid": None,
     }
     if outcome.launch_error:
         summary["error"] = _safe_message(outcome.launch_error)
@@ -2357,8 +2865,10 @@ def _summarize_outcome(outcome: WorkerOutcome) -> dict[str, Any]:
         return summary
 
     report = outcome.report
+    mode = report.get("mode") or DIRECT_DIAGNOSTIC_MODE
     summary.update(
         {
+            "mode": mode if mode in {CACHE_CAPACITY_MODE, DIRECT_DIAGNOSTIC_MODE} else None,
             "publishes": _evidence_bool(report.get("publishes")),
             "writes_bronze": _evidence_bool(report.get("writes_bronze")),
             "executes_ddl": _evidence_bool(report.get("executes_ddl")),
@@ -2368,19 +2878,68 @@ def _summarize_outcome(outcome: WorkerOutcome) -> dict[str, Any]:
     try:
         if report.get("benchmark_version") != EXPECTED_WORKFLOW_VERSION:
             raise ValueError("workflow benchmark version mismatch")
-        attempts, page_units, paid_bytes, paid_requests = _workflow_traffic(report)
+        (
+            attempts,
+            page_units,
+            paid_bytes,
+            paid_requests,
+            network_requests,
+        ) = _workflow_traffic(report)
     except (TypeError, ValueError) as exc:
         summary["error"] = _safe_message(exc)
         return summary
     summary.update(
         {
             "source_request_attempts": attempts,
+            "network_requests": network_requests,
             "page_units": page_units,
             "paid_bytes": paid_bytes,
             "paid_route_requests": paid_requests,
             "traffic_evidence_valid": True,
         }
     )
+    if mode == CACHE_CAPACITY_MODE:
+        seed_sha256 = report.get("seed_sha256")
+        cleanup = report.get("cleanup")
+        seed_valid = (
+            isinstance(seed_sha256, str)
+            and seed_sha256 == EXPECTED_CACHE_SEED_SHA256
+        )
+        cleanup_valid = (
+            isinstance(cleanup, Mapping)
+            and cleanup.get("status") == "success"
+            and cleanup.get("temporary_workspace_removed") is True
+        )
+        summary.update(
+            {
+                "seed_sha256": (
+                    seed_sha256
+                    if isinstance(seed_sha256, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", seed_sha256)
+                    else None
+                ),
+                "seed_evidence_valid": seed_valid,
+                "cleanup_evidence_valid": cleanup_valid,
+            }
+        )
+        if not seed_valid:
+            summary["error"] = "cache workflow seed identity mismatch"
+            return summary
+        if network_requests != 0:
+            summary["error"] = "cache workflow attempted network access"
+            return summary
+        if paid_bytes != 0 or paid_requests != 0:
+            summary["error"] = "cache workflow used a paid route"
+            return summary
+        if not cleanup_valid:
+            summary["error"] = "cache workflow did not prove cleanup"
+            return summary
+    elif mode == DIRECT_DIAGNOSTIC_MODE:
+        summary["seed_evidence_valid"] = True
+        summary["cleanup_evidence_valid"] = True
+    else:
+        summary["error"] = "workflow mode mismatch"
+        return summary
     try:
         workflow_elapsed = _as_nonnegative_float(
             report.get("elapsed_seconds", 0.0), field_name="workflow elapsed_seconds"
@@ -2431,18 +2990,85 @@ def _summarize_outcome(outcome: WorkerOutcome) -> dict[str, Any]:
     return summary
 
 
-def _accept_outcome(accumulator: CapacityAccumulator, outcome: WorkerOutcome) -> None:
+def _retain_run_summary(
+    accumulator: CapacityAccumulator, summary: Mapping[str, Any]
+) -> None:
+    """Retain bounded deterministic first/last/error evidence only."""
+
+    snapshot = dict(summary)
+    worker_id = int(snapshot["worker_id"])
+    iteration = int(snapshot["iteration"])
+    accumulator.run_summaries_total += 1
+    first = accumulator.first_run_summary_by_worker.get(worker_id)
+    if first is None or iteration < int(first["iteration"]):
+        accumulator.first_run_summary_by_worker[worker_id] = snapshot
+    last = accumulator.last_run_summary_by_worker.get(worker_id)
+    if last is None or iteration > int(last["iteration"]):
+        accumulator.last_run_summary_by_worker[worker_id] = snapshot
+    if snapshot.get("status") not in {
+        "success",
+        "deadline_terminated",
+        "aborted_by_gate",
+        "aborted_by_peer_failure",
+    }:
+        errors = [*accumulator.error_run_summaries, snapshot]
+        errors.sort(key=lambda item: (int(item["iteration"]), int(item["worker_id"])))
+        accumulator.error_run_summaries = errors[
+            :MAX_RETAINED_ERROR_RUN_SUMMARIES
+        ]
+    retained: dict[tuple[int, int], dict[str, Any]] = {}
+    for item in (
+        *accumulator.first_run_summary_by_worker.values(),
+        *accumulator.last_run_summary_by_worker.values(),
+        *accumulator.error_run_summaries,
+    ):
+        retained[(int(item["iteration"]), int(item["worker_id"]))] = item
+    accumulator.run_summaries = [retained[key] for key in sorted(retained)]
+    if len(accumulator.run_summaries) > MAX_RETAINED_RUN_SUMMARIES:
+        raise RuntimeError("bounded run-summary retention invariant failed")
+
+
+def _accept_outcome(
+    accumulator: CapacityAccumulator,
+    outcome: WorkerOutcome,
+    *,
+    expected_mode: Optional[str] = None,
+) -> None:
     summary = _summarize_outcome(outcome)
-    accumulator.run_summaries.append(summary)
+    _retain_run_summary(accumulator, summary)
     accumulator.paid_bytes += int(summary["paid_bytes"])
     accumulator.paid_route_requests += int(summary["paid_route_requests"])
     accumulator.source_request_attempts += int(summary["source_request_attempts"])
+    accumulator.network_requests += int(summary["network_requests"])
 
     if summary["status"] == "deadline_terminated":
         accumulator.deadline_truncations += 1
         return
     if summary["status"] in {"aborted_by_gate", "aborted_by_peer_failure"}:
         return
+    if expected_mode is not None and summary.get("mode") != expected_mode:
+        accumulator.traffic_evidence_violations.append(
+            f"worker {outcome.worker_id} iteration {outcome.iteration} did not "
+            "prove the requested capacity mode"
+        )
+    if expected_mode == CACHE_CAPACITY_MODE:
+        if summary.get("seed_evidence_valid") is not True:
+            accumulator.seed_evidence_violations.append(
+                f"worker {outcome.worker_id} iteration {outcome.iteration} did not "
+                "prove the reviewed cache seed"
+            )
+        elif accumulator.seed_sha256 is None:
+            accumulator.seed_sha256 = str(summary["seed_sha256"])
+        elif accumulator.seed_sha256 != summary.get("seed_sha256"):
+            accumulator.seed_evidence_violations.append(
+                f"worker {outcome.worker_id} iteration {outcome.iteration} changed "
+                "cache seed identity"
+            )
+        if summary.get("cleanup_evidence_valid") is not True:
+            accumulator.cleanup_evidence_violations.append(
+                f"worker {outcome.worker_id} iteration {outcome.iteration} did not "
+                "prove cache workspace cleanup"
+            )
     if summary["traffic_evidence_valid"] is not True:
         accumulator.traffic_evidence_violations.append(
             f"worker {outcome.worker_id} iteration {outcome.iteration} did not "
@@ -3888,12 +4514,27 @@ def _admitted_running_container(
 def _containerized_worker_argv(command: WorkerCommand) -> tuple[str, ...]:
     if tuple(command.argv[:2]) != (sys.executable, str(WORKFLOW_SCRIPT)):
         raise RuntimeError("production worker bypasses the admitted workflow")
-    if (
-        command.browser_session_owner is None
-        or command.flaresolverr_endpoint != REQUIRED_FLARESOLVERR_ENDPOINT
-    ):
-        raise RuntimeError("production worker control is incomplete")
     arguments = list(command.argv[2:])
+    if arguments.count("--mode") != 1:
+        raise RuntimeError("production worker mode is invalid")
+    mode_index = arguments.index("--mode") + 1
+    if mode_index >= len(arguments):
+        raise RuntimeError("production worker mode is incomplete")
+    mode = arguments[mode_index]
+    if mode == CACHE_CAPACITY_MODE:
+        if (
+            command.browser_session_owner is not None
+            or command.flaresolverr_endpoint is not None
+        ):
+            raise RuntimeError("cache worker received network control")
+    elif mode == DIRECT_DIAGNOSTIC_MODE:
+        if (
+            command.browser_session_owner is None
+            or command.flaresolverr_endpoint != REQUIRED_FLARESOLVERR_ENDPOINT
+        ):
+            raise RuntimeError("diagnostic worker control is incomplete")
+    else:
+        raise RuntimeError("production worker mode is unsupported")
     if arguments.count("--catalog") != 1:
         raise RuntimeError("production worker catalog argument is invalid")
     catalog_index = arguments.index("--catalog") + 1
@@ -3958,7 +4599,14 @@ def _run_container_round(
         or worker_runtime.container_runtime_module is None
     ):
         raise RuntimeError("container capacity round requires admitted runtime")
-    owners = {command.browser_session_owner for command in commands}
+    # The lifecycle owner names and authenticates the disposable worker
+    # containers.  It is deliberately separate from browser control: cache
+    # workers still need an exact cleanup identity but must receive no browser
+    # session or FlareSolverr authority.
+    owners = {
+        command.session_owner or command.browser_session_owner
+        for command in commands
+    }
     if len(owners) != 1 or None in owners:
         raise RuntimeError("container capacity workers require one owner")
     owner = _validate_session_owner(str(next(iter(owners))))
@@ -4073,6 +4721,7 @@ def _run_container_round(
             argv=command.argv,
             browser_session_owner=command.browser_session_owner,
             flaresolverr_endpoint=command.flaresolverr_endpoint,
+            session_owner=command.session_owner,
         )
         active_commands[worker_id] = next_command
         worker_started_at[(worker_id, next_command.iteration)] = monotonic()
@@ -4287,6 +4936,9 @@ def _default_dependencies(
                 stale_worker_image_id=stale_image_id,
             ),
             finalize_worker_artifacts=finalize_worker_artifacts,
+            browser_network_control=(
+                _capacity_mode(args) == DIRECT_DIAGNOSTIC_MODE
+            ),
         )
 
     return CapacityDependencies(
@@ -4309,6 +4961,10 @@ def _scope_values(args: argparse.Namespace) -> tuple[str, ...]:
     raw = getattr(args, "scopes", None)
     values = raw if raw else DEFAULT_SCOPES
     return tuple(str(value).strip() for value in values)
+
+
+def _capacity_mode(args: argparse.Namespace) -> str:
+    return str(getattr(args, "mode", DIRECT_DIAGNOSTIC_MODE))
 
 
 def _container_values(args: argparse.Namespace) -> tuple[str, ...]:
@@ -5057,7 +5713,7 @@ def _runtime_identity(
         hashes[label] = hashlib.sha256(payload).hexdigest()
     deployment_evidence: Optional[dict[str, Any]] = None
     if deployment is not None:
-        expected_argument_paths = (
+        expected_argument_paths = [
             (
                 "deployment_attestation",
                 "deployment attestation",
@@ -5068,24 +5724,35 @@ def _runtime_identity(
                 "common digest override",
                 deployment.common_digest_override_path,
             ),
-            (
-                "gateway_digest_override",
-                "gateway digest override",
-                deployment.gateway_digest_override_path,
-            ),
-            ("provider_policy", "provider policy", deployment.provider_policy_path),
-            (
-                "owner_secret_file",
-                "provider-policy owner key",
-                deployment.owner_secret_file_path,
-            ),
-            (
-                "deployment_admission_receipt",
-                "deployment admission receipt",
-                deployment.deployment_admission_receipt_path,
-            ),
-        )
+        ]
+        if deployment.admission_mode == DIRECT_DIAGNOSTIC_MODE:
+            expected_argument_paths.extend(
+                (
+                    (
+                        "gateway_digest_override",
+                        "gateway digest override",
+                        deployment.gateway_digest_override_path,
+                    ),
+                    (
+                        "provider_policy",
+                        "provider policy",
+                        deployment.provider_policy_path,
+                    ),
+                    (
+                        "owner_secret_file",
+                        "provider-policy owner key",
+                        deployment.owner_secret_file_path,
+                    ),
+                    (
+                        "deployment_admission_receipt",
+                        "deployment admission receipt",
+                        deployment.deployment_admission_receipt_path,
+                    ),
+                )
+            )
         if any(
+            expected is None
+            or
             _absolute_evidence_path(
                 getattr(args, argument, None), label=label
             )
@@ -5227,8 +5894,18 @@ def _validate_args(args: argparse.Namespace) -> Optional[str]:
         return "duration, sampling interval and limits must be numeric"
     if not math.isfinite(duration) or duration <= 0:
         return "duration-seconds must be positive"
+    mode = _capacity_mode(args)
+    if mode not in {CACHE_CAPACITY_MODE, DIRECT_DIAGNOSTIC_MODE}:
+        return "capacity mode is invalid"
+    if mode == CACHE_CAPACITY_MODE and duration != DEFAULT_DURATION_SECONDS:
+        return "cache-capacity-v1 requires exactly 21600 seconds"
     if not math.isfinite(sample_interval) or not 0.1 <= sample_interval <= 300:
         return "sample-interval-seconds must be in 0.1..300"
+    if (
+        mode == CACHE_CAPACITY_MODE
+        and sample_interval != DEFAULT_SAMPLE_INTERVAL_SECONDS
+    ):
+        return "cache-capacity-v1 requires exactly 30 second sampling"
     if not 1 <= match_limit <= MAX_MATCH_LIMIT:
         return f"match-limit must be in 1..{MAX_MATCH_LIMIT}"
     if not 1 <= profile_limit <= MAX_PROFILE_LIMIT:
@@ -5256,29 +5933,34 @@ def _validate_args(args: argparse.Namespace) -> Optional[str]:
             getattr(args, "deployment_attestation", None),
             label="deployment attestation",
         )
-        evidence_paths = (
+        base_evidence_paths = (
             deployment_attestation,
             _absolute_evidence_path(
                 getattr(args, "common_digest_override", None),
                 label="common digest override",
             ),
-            _absolute_evidence_path(
-                getattr(args, "gateway_digest_override", None),
-                label="gateway digest override",
-            ),
-            _absolute_evidence_path(
-                getattr(args, "provider_policy", None),
-                label="provider policy",
-            ),
-            _absolute_evidence_path(
-                getattr(args, "owner_secret_file", None),
-                label="provider-policy owner key",
-            ),
-            _absolute_evidence_path(
-                getattr(args, "deployment_admission_receipt", None),
-                label="deployment admission receipt",
-            ),
         )
+        evidence_paths = base_evidence_paths
+        if mode == DIRECT_DIAGNOSTIC_MODE:
+            evidence_paths = (
+                *base_evidence_paths,
+                _absolute_evidence_path(
+                    getattr(args, "gateway_digest_override", None),
+                    label="gateway digest override",
+                ),
+                _absolute_evidence_path(
+                    getattr(args, "provider_policy", None),
+                    label="provider policy",
+                ),
+                _absolute_evidence_path(
+                    getattr(args, "owner_secret_file", None),
+                    label="provider-policy owner key",
+                ),
+                _absolute_evidence_path(
+                    getattr(args, "deployment_admission_receipt", None),
+                    label="deployment admission receipt",
+                ),
+            )
     except (TypeError, ValueError) as exc:
         return str(exc)
     if len(evidence_paths) != len(set(evidence_paths)):
@@ -5305,6 +5987,7 @@ def _build_commands(
     browser_session_owner: str,
 ) -> list[WorkerCommand]:
     owner = _validate_session_owner(browser_session_owner)
+    mode = _capacity_mode(args)
     scopes = _scope_values(args)
     commands: list[WorkerCommand] = []
     for worker_id in range(WORKER_COUNT):
@@ -5312,6 +5995,8 @@ def _build_commands(
         argv = (
             sys.executable,
             str(WORKFLOW_SCRIPT),
+            "--mode",
+            mode,
             "--scope",
             scope,
             "--match-limit",
@@ -5327,8 +6012,15 @@ def _build_commands(
                 iteration=iteration,
                 scope=scope,
                 argv=argv,
-                browser_session_owner=owner,
-                flaresolverr_endpoint=REQUIRED_FLARESOLVERR_ENDPOINT,
+                browser_session_owner=(
+                    None if mode == CACHE_CAPACITY_MODE else owner
+                ),
+                flaresolverr_endpoint=(
+                    None
+                    if mode == CACHE_CAPACITY_MODE
+                    else REQUIRED_FLARESOLVERR_ENDPOINT
+                ),
+                session_owner=owner,
             )
         )
     return commands
@@ -5339,6 +6031,7 @@ def _gate_documents(
     *,
     elapsed_seconds: float,
     requested_duration_seconds: float,
+    mode: str,
 ) -> list[dict[str, Any]]:
     projected = _projected_page_units_per_day(
         accumulator.page_units, elapsed_seconds
@@ -5349,7 +6042,7 @@ def _gate_documents(
     )
     duration_complete = (
         not accumulator.interrupted
-        and elapsed_seconds + 0.05 >= requested_duration_seconds
+        and elapsed_seconds >= requested_duration_seconds
     )
     return [
         {
@@ -5372,6 +6065,39 @@ def _gate_documents(
             "evidence_violations": list(
                 accumulator.traffic_evidence_violations
             ),
+        },
+        {
+            "name": "network_isolation",
+            "passed": (
+                mode != CACHE_CAPACITY_MODE
+                or (
+                    accumulator.network_requests == 0
+                    and not accumulator.traffic_evidence_violations
+                )
+            ),
+            "observed_network_requests": accumulator.network_requests,
+            "required_network_requests": 0,
+        },
+        {
+            "name": "cache_seed",
+            "passed": (
+                mode != CACHE_CAPACITY_MODE
+                or (
+                    accumulator.seed_sha256 == EXPECTED_CACHE_SEED_SHA256
+                    and not accumulator.seed_evidence_violations
+                )
+            ),
+            "observed_seed_sha256": accumulator.seed_sha256,
+            "required_seed_sha256": EXPECTED_CACHE_SEED_SHA256,
+            "violations": list(accumulator.seed_evidence_violations),
+        },
+        {
+            "name": "cache_cleanup",
+            "passed": (
+                mode != CACHE_CAPACITY_MODE
+                or not accumulator.cleanup_evidence_violations
+            ),
+            "violations": list(accumulator.cleanup_evidence_violations),
         },
         {
             "name": "memory",
@@ -5418,7 +6144,11 @@ def _gate_documents(
                 accumulator.completed_runs > 0
                 and accumulator.max_source_stage_count >= 2
             ),
-            "required_entities": ["schedule", "matches", "previews", "profiles"],
+            "required_entities": (
+                ["matches", "previews", "profiles", "multistage"]
+                if mode == CACHE_CAPACITY_MODE
+                else ["schedule", "matches", "previews", "profiles"]
+            ),
             "observed_max_source_stage_count": accumulator.max_source_stage_count,
             "minimum_source_stage_count": 2,
         },
@@ -5535,6 +6265,7 @@ def run(
 ) -> tuple[int, dict[str, Any]]:
     """Execute the canary and return a process code plus JSON-safe evidence."""
 
+    mode = _capacity_mode(args)
     validation_error = _validate_args(args)
     production_deployment: Optional[ProductionDeployment] = None
     if validation_error is None and dependencies is None:
@@ -5872,6 +6603,8 @@ def run(
                 stop_reasons.add("memory")
 
             if record_sample:
+                if len(accumulator.samples) >= MAX_RETAINED_SAMPLES:
+                    raise RuntimeError("capacity sample retention bound exceeded")
                 elapsed = max(0.0, now - started)
                 accumulator.samples.append(
                     {
@@ -5916,11 +6649,17 @@ def run(
             stop_reasons.add("monitoring_evidence")
 
     def accept_outcome(outcome: WorkerOutcome) -> None:
-        _accept_outcome(accumulator, outcome)
+        _accept_outcome(accumulator, outcome, expected_mode=mode)
         if accumulator.paid_bytes or accumulator.paid_route_requests:
             stop_reasons.add("paid_traffic")
+        if mode == CACHE_CAPACITY_MODE and accumulator.network_requests:
+            stop_reasons.add("network_isolation")
         if accumulator.traffic_evidence_violations:
             stop_reasons.add("paid_traffic")
+        if accumulator.seed_evidence_violations:
+            stop_reasons.add("cache_seed")
+        if accumulator.cleanup_evidence_violations:
+            stop_reasons.add("cache_cleanup")
         if accumulator.worker_errors:
             stop_reasons.add("worker_health")
         if accumulator.safety_violations:
@@ -6100,36 +6839,104 @@ def run(
         accumulator,
         elapsed_seconds=elapsed,
         requested_duration_seconds=duration,
+        mode=mode,
     )
     gates.append(cleanup_gate)
+    worker_runtime_cleanup_ok = (
+        worker_runtime is None or worker_runtime.runtime_cleanup_complete
+    )
+    gates.append(
+        {
+            "name": "worker_runtime_cleanup",
+            "passed": worker_runtime_cleanup_ok,
+        }
+    )
     status = "success" if all(gate["passed"] for gate in gates) else "failed"
+
+    baseline_restarts = {
+        name: int(value.get("restart_count", 0) or 0)
+        for name, value in accumulator.baseline_containers.items()
+    }
+    observed_restart_deltas: dict[str, int] = {
+        name: 0 for name in baseline_restarts
+    }
+    oom_killed = False
+    for sample in accumulator.samples:
+        for container in (
+            *(sample.get("containers") or ()),
+            *(sample.get("worker_containers") or ()),
+        ):
+            if not isinstance(container, Mapping):
+                continue
+            oom_killed = oom_killed or container.get("oom_killed") is True
+            name = str(container.get("name") or container.get("container_id") or "")
+            if name in baseline_restarts:
+                observed_restart_deltas[name] = max(
+                    observed_restart_deltas[name],
+                    max(
+                        0,
+                        int(container.get("restart_count", 0) or 0)
+                        - baseline_restarts[name],
+                    ),
+                )
+    restart_count = sum(observed_restart_deltas.values())
+    cache_cleanup_ok = not accumulator.cleanup_evidence_violations
+    cleanup_status = (
+        "success"
+        if cleanup_gate["passed"] and worker_runtime_cleanup_ok and cache_cleanup_ok
+        else "failed"
+    )
+    runtime_release_identity = {
+        "release_revision": (
+            production_deployment.release_revision
+            if production_deployment is not None
+            else accumulator.runtime_identity.get("git_revision")
+        ),
+        "manifest_sha256": accumulator.runtime_identity.get("manifest_sha256"),
+        "worker_image_id": accumulator.runtime_identity.get("worker_image_id"),
+        "git_clean": accumulator.runtime_identity.get("git_clean"),
+    }
     report: dict[str, Any] = {
         "canary_version": CANARY_VERSION,
+        "schema_version": CAPACITY_REPORT_SCHEMA_VERSION,
+        "mode": mode,
         "status": status,
         "started_at": started_wall,
         "ended_at": _utc_now(),
         "duration_seconds_requested": duration,
+        "duration_seconds_observed": round(elapsed, 3),
         "elapsed_seconds": round(elapsed, 3),
         "cleanup_elapsed_seconds": round(cleanup_elapsed, 3),
         "total_elapsed_seconds": round(total_elapsed, 3),
         "worker_count": WORKER_COUNT,
+        "workers": WORKER_COUNT,
         "scopes": list(_scope_values(args)),
         "match_limit": int(args.match_limit),
         "profile_limit": int(args.profile_limit),
         "publishes": False,
         "writes_bronze": False,
         "executes_ddl": False,
-        "raw_store_policy": "per-process temporary local storage",
+        "raw_store_policy": (
+            "exact content-addressed temporary cache"
+            if mode == CACHE_CAPACITY_MODE
+            else "per-process temporary local storage"
+        ),
         "repository_policy": "per-process in-memory repository",
         "page_unit_definition": (
-            "one unique successfully completed source target per workflow phase"
+            "five reviewed cache source objects per successful workflow run "
+            "(match, preview, profile, and two stage payloads); each object is one unit"
+            if mode == CACHE_CAPACITY_MODE
+            else "one unique successfully completed source target per workflow phase"
         ),
         "source_request_attempts": accumulator.source_request_attempts,
+        "network_requests": accumulator.network_requests,
+        "seed_sha256": accumulator.seed_sha256,
         "page_units": accumulator.page_units,
         "projected_page_units_per_day": round(
             _projected_page_units_per_day(accumulator.page_units, elapsed), 3
         ),
         "paid_bytes": accumulator.paid_bytes,
+        "paid_proxy_bytes": accumulator.paid_bytes,
         "paid_route_requests": accumulator.paid_route_requests,
         "completed_runs": accumulator.completed_runs,
         "completed_by_worker": dict(accumulator.completed_by_worker),
@@ -6143,6 +6950,16 @@ def run(
         ),
         "max_worker_container_pids": accumulator.max_worker_container_pids,
         "max_aggregate_memory_bytes": accumulator.max_aggregate_memory_bytes,
+        "peak_combined_rss_bytes": accumulator.max_aggregate_memory_bytes,
+        "restart_count": restart_count,
+        "oom_killed": oom_killed,
+        "cleanup": {
+            "status": cleanup_status,
+            "cache_workspaces_removed": cache_cleanup_ok,
+            "worker_runtime_removed": worker_runtime_cleanup_ok,
+            "browser_sessions_removed": cleanup_gate["passed"],
+        },
+        "cleanup_status": cleanup_status,
         "production_deployment": (
             production_deployment.evidence()
             if production_deployment is not None
@@ -6152,6 +6969,7 @@ def run(
             worker_runtime, accumulator.runtime_identity
         ),
         "runtime_identity": accumulator.runtime_identity,
+        "runtime_release_identity": runtime_release_identity,
         "session_cleanup": dict(cleanup_evidence),
         "baseline_containers": [
             accumulator.baseline_containers[name]
@@ -6161,15 +6979,20 @@ def run(
         "stop_reasons": sorted(stop_reasons),
         "gates": gates,
         "samples": accumulator.samples,
+        "run_summaries_total": accumulator.run_summaries_total,
+        "run_summaries_retained": len(accumulator.run_summaries),
+        "run_summaries_truncated": (
+            accumulator.run_summaries_total > len(accumulator.run_summaries)
+        ),
         "runs": accumulator.run_summaries,
     }
     # Prove that the supervisor itself emits one JSON-safe evidence document.
-    report = _json_safe_document(report)
+    report = _attach_report_sha256(report)
     return (0 if status == "success" else 1), report
 
 
 def _write_report(path: Path, report: Mapping[str, Any]) -> None:
-    payload = json.dumps(report, ensure_ascii=False, sort_keys=True) + "\n"
+    payload = _canonical_json_bytes(report).decode("utf-8") + "\n"
     descriptor, temporary_name = mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
     )
@@ -6192,6 +7015,15 @@ def _write_report(path: Path, report: Mapping[str, Any]) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mode",
+        choices=(CACHE_CAPACITY_MODE, DIRECT_DIAGNOSTIC_MODE),
+        default=CACHE_CAPACITY_MODE,
+        help=(
+            "production is cache-capacity-v1; direct-diagnostic-v1 is not "
+            "valid production capacity evidence"
+        ),
+    )
     parser.add_argument(
         "--duration-seconds",
         type=float,
@@ -6243,26 +7075,34 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gateway-digest-override",
         type=Path,
-        required=True,
-        help="root-owned gateway-project digest-only Compose file",
+        help=(
+            "root-owned gateway-project digest-only Compose file; required "
+            "only by direct-diagnostic-v1"
+        ),
     )
     parser.add_argument(
         "--provider-policy",
         type=Path,
-        required=True,
-        help="active owner-signed provider-policy-v1 admitted at deployment",
+        help=(
+            "active owner-signed provider-policy-v1; required only by "
+            "direct-diagnostic-v1"
+        ),
     )
     parser.add_argument(
         "--owner-secret-file",
         type=Path,
-        required=True,
-        help="root-owned HMAC key used only by isolated admission validation",
+        help=(
+            "root-owned provider-policy HMAC key; required only by "
+            "direct-diagnostic-v1"
+        ),
     )
     parser.add_argument(
         "--deployment-admission-receipt",
         type=Path,
-        required=True,
-        help="root-owned schema-v2 deploy-time rendered admission receipt",
+        help=(
+            "root-owned schema-v2 paid deployment receipt; required only by "
+            "direct-diagnostic-v1"
+        ),
     )
     parser.add_argument(
         "--output",
@@ -6281,8 +7121,9 @@ def main() -> int:
         except Exception as exc:
             report["status"] = "failed"
             report["output_error"] = _safe_message(exc)
+            report = _attach_report_sha256(report)
             code = 1
-    print(json.dumps(report, ensure_ascii=False, sort_keys=True, default=str))
+    print(_canonical_json_bytes(report).decode("utf-8"))
     return code
 
 

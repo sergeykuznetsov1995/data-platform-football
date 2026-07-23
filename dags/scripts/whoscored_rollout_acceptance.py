@@ -15,6 +15,14 @@ from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
+from dags.scripts.whoscored_bootstrap import (
+    ACCEPTANCE_MODE,
+    BOOTSTRAP_LIMIT_SECONDS,
+    WhoScoredBootstrapError,
+    bootstrap_slot_for_run,
+    normalize_bootstrap_authority,
+)
+
 
 ACCEPTANCE_SCHEMA_VERSION = 1
 ACCEPTANCE_PREFIX = "production/whoscored-rollout/v1"
@@ -308,6 +316,10 @@ def _scope_identity(scope_plan: Mapping[str, Any]) -> dict[str, Any]:
         raise WhoScoredRolloutAcceptanceError(
             "WhoScored rollout promotion proof differs from its wave"
         )
+    try:
+        bootstrap_authority = normalize_bootstrap_authority(scope_plan)
+    except WhoScoredBootstrapError as exc:
+        raise WhoScoredRolloutAcceptanceError(str(exc)) from exc
     return {
         "rollout_id": rollout_id,
         "wave_id": wave_id,
@@ -339,6 +351,7 @@ def _scope_identity(scope_plan: Mapping[str, Any]) -> dict[str, Any]:
         "classifier_sha256": classifier_sha256,
         "promotion_acceptance_sha256": promotion_acceptance_sha256,
         "promotion_terminal_receipt_sha256": promotion_terminal_receipt_sha256,
+        **bootstrap_authority,
     }
 
 
@@ -388,6 +401,77 @@ def _release_identity(runtime_preflight: Mapping[str, Any]) -> dict[str, str]:
             contract.get("code_tree_sha256"), label="runtime code tree"
         ),
     }
+
+
+def validated_bootstrap_slo_evidence(
+    value: Mapping[str, Any],
+    *,
+    scope: Mapping[str, Any],
+    release: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Replay one per-run <=6h SLO bound to the admitted capacity receipt."""
+
+    fields = {
+        "schema_version",
+        "contract",
+        "capacity_contract",
+        "status",
+        "acceptance_mode",
+        "slot_index",
+        "run_id",
+        "logical_date",
+        "wave_id",
+        "elapsed_seconds",
+        "limit_seconds",
+        "capacity_receipt_sha256",
+        "runtime_sha256",
+    }
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != fields
+        or value.get("schema_version") != 1
+        or value.get("contract") != "bootstrap-slo-v1"
+        or value.get("capacity_contract") != "cache-capacity-v1"
+        or value.get("status") != "success"
+        or value.get("acceptance_mode") != ACCEPTANCE_MODE
+        or value.get("limit_seconds") != BOOTSTRAP_LIMIT_SECONDS
+        or value.get("capacity_receipt_sha256")
+        != scope.get("capacity_receipt_sha256")
+        or value.get("runtime_sha256") != scope.get("runtime_sha256")
+        or value.get("runtime_sha256") != release.get("code_tree_sha256")
+    ):
+        raise WhoScoredRolloutAcceptanceError(
+            "WhoScored bootstrap SLO authority is not green"
+        )
+    elapsed_seconds = value.get("elapsed_seconds")
+    slot_index = value.get("slot_index")
+    if (
+        isinstance(elapsed_seconds, bool)
+        or not isinstance(elapsed_seconds, int)
+        or not 0 <= elapsed_seconds <= BOOTSTRAP_LIMIT_SECONDS
+        or isinstance(slot_index, bool)
+        or not isinstance(slot_index, int)
+    ):
+        raise WhoScoredRolloutAcceptanceError(
+            "WhoScored bootstrap run exceeded its six-hour SLO"
+        )
+    try:
+        slot = bootstrap_slot_for_run(
+            scope,
+            run_id=value.get("run_id"),
+            logical_date=value.get("logical_date"),
+            wave_id=scope.get("wave_id"),
+        )
+    except WhoScoredBootstrapError as exc:
+        raise WhoScoredRolloutAcceptanceError(str(exc)) from exc
+    if (
+        slot_index != slot["slot_index"]
+        or value.get("wave_id") != slot["wave_id"]
+    ):
+        raise WhoScoredRolloutAcceptanceError(
+            "WhoScored bootstrap SLO differs from its signed slot"
+        )
+    return dict(value)
 
 
 def terminal_task_states_evidence(
@@ -700,6 +784,7 @@ def _validated_idempotency_witness(
 def _validate_green_evidence(
     *,
     scope: Mapping[str, Any],
+    release: Mapping[str, Any],
     runtime_preflight: Mapping[str, Any],
     catalog_dq: Mapping[str, Any],
     profile_dq: Mapping[str, Any],
@@ -717,10 +802,7 @@ def _validate_green_evidence(
         )
     if profile_dq.get("status") != "success":
         raise WhoScoredRolloutAcceptanceError("WhoScored profile DQ is not green")
-    if daily_slo.get("status") != "success":
-        raise WhoScoredRolloutAcceptanceError(
-            "WhoScored rolling daily SLO is not green"
-        )
+    validated_bootstrap_slo_evidence(daily_slo, scope=scope, release=release)
     if (
         set(alert_preflight)
         != {
@@ -811,6 +893,10 @@ def _identity_payload(receipt: Mapping[str, Any]) -> dict[str, Any]:
         "classifier_sha256": scope["classifier_sha256"],
         "promotion_acceptance_sha256": scope["promotion_acceptance_sha256"],
         "promotion_terminal_receipt_sha256": scope["promotion_terminal_receipt_sha256"],
+        "acceptance_mode": scope["acceptance_mode"],
+        "bootstrap_slots": scope["bootstrap_slots"],
+        "capacity_receipt_sha256": scope["capacity_receipt_sha256"],
+        "provider_order_cap_bytes": scope["provider_order_cap_bytes"],
         "parser_version": release["parser_version"],
         "manifest_sha256": release["manifest_sha256"],
         "code_tree_sha256": release["code_tree_sha256"],
@@ -875,6 +961,10 @@ def _validate_receipt(key: str, value: Mapping[str, Any]) -> dict[str, Any]:
         "classifier_sha256",
         "promotion_acceptance_sha256",
         "promotion_terminal_receipt_sha256",
+        "acceptance_mode",
+        "bootstrap_slots",
+        "capacity_receipt_sha256",
+        "provider_order_cap_bytes",
     }:
         raise WhoScoredRolloutAcceptanceError(
             "invalid WhoScored rollout receipt scope schema"
@@ -964,6 +1054,20 @@ def _validate_receipt(key: str, value: Mapping[str, Any]) -> dict[str, Any]:
     if scope.get("runtime_sha256") != release.get("code_tree_sha256"):
         raise WhoScoredRolloutAcceptanceError(
             "WhoScored receipt release differs from its signed runtime pin"
+        )
+    try:
+        slot = bootstrap_slot_for_run(
+            scope,
+            run_id=receipt["run_id"],
+            logical_date=receipt["logical_date"],
+            wave_id=scope["wave_id"],
+        )
+    except WhoScoredBootstrapError as exc:
+        raise WhoScoredRolloutAcceptanceError(str(exc)) from exc
+    expected_slot_index = WAVE_ORDER.index(scope["wave_id"]) * 2
+    if slot["slot_index"] not in {expected_slot_index, expected_slot_index + 1}:
+        raise WhoScoredRolloutAcceptanceError(
+            "WhoScored receipt occupies the wrong signed wave slot"
         )
     if set(evidence) != {
         "catalog_dq_sha256",
@@ -1115,6 +1219,12 @@ def _same_rollout_basis(left: Mapping[str, Any], right: Mapping[str, Any]) -> bo
         == right_scope["ranked_scope_ids_sha256"]
         and left_scope["runtime_sha256"] == right_scope["runtime_sha256"]
         and left_scope["classifier_sha256"] == right_scope["classifier_sha256"]
+        and left_scope["acceptance_mode"] == right_scope["acceptance_mode"]
+        and left_scope["bootstrap_slots"] == right_scope["bootstrap_slots"]
+        and left_scope["capacity_receipt_sha256"]
+        == right_scope["capacity_receipt_sha256"]
+        and left_scope["provider_order_cap_bytes"]
+        == right_scope["provider_order_cap_bytes"]
     )
 
 
@@ -1390,6 +1500,7 @@ def normalized_run_evidence(
         )
     evidence = _validate_green_evidence(
         scope=scope,
+        release=release,
         runtime_preflight=runtime_preflight,
         catalog_dq=catalog_dq,
         profile_dq=profile_dq,
@@ -1466,6 +1577,20 @@ def build_success_receipt(
     scope = normalized["scope"]
     release = normalized["release"]
     evidence = normalized["evidence"]
+    try:
+        slot = bootstrap_slot_for_run(
+            scope,
+            run_id=run_id,
+            logical_date=logical_iso,
+            wave_id=scope["wave_id"],
+        )
+    except WhoScoredBootstrapError as exc:
+        raise WhoScoredRolloutAcceptanceError(str(exc)) from exc
+    expected_slot_index = WAVE_ORDER.index(scope["wave_id"]) * 2
+    if slot["slot_index"] not in {expected_slot_index, expected_slot_index + 1}:
+        raise WhoScoredRolloutAcceptanceError(
+            "WhoScored receipt occupies the wrong signed wave slot"
+        )
     records = _materialize_validated_receipts(existing_records)
     receipt: dict[str, Any] = {
         "schema_version": ACCEPTANCE_SCHEMA_VERSION,
@@ -1680,6 +1805,10 @@ def rollout_acceptance_status(
                 "classifier_sha256",
                 "promotion_acceptance_sha256",
                 "promotion_terminal_receipt_sha256",
+                "acceptance_mode",
+                "bootstrap_slots",
+                "capacity_receipt_sha256",
+                "provider_order_cap_bytes",
             )
         }
         final_wave_receipt_sha256 = _receipt_digest_from_key(final_key)

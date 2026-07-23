@@ -2637,7 +2637,10 @@ class WhoScoredTransport:
         self._paid_batch_enabled = paid_batch_enabled
         self._source_circuit_permit: Optional[CircuitPermit] = None
         self._http_session_factory = http_session_factory
-        self._direct_http = direct_http_session or self._new_http_session(None)
+        self._pool_proxy_url = self._resolve_pool_proxy_url()
+        self._direct_http = direct_http_session or self._new_http_session(
+            self._pool_proxy_url
+        )
         flaresolverr_identity = _attested_flaresolverr_identity()
         identity_kwargs = (
             {
@@ -2841,6 +2844,25 @@ class WhoScoredTransport:
             MAX_BROWSER_RETRY_BACKOFF_SECONDS,
         )
         time.sleep(delay)
+
+    def _resolve_pool_proxy_url(self) -> Optional[str]:
+        """Residential-pool egress for the direct route.
+
+        WhoScored blocks the datacentre host IP at Cloudflare while the same
+        region's residential pool passes.  When ``WHOSCORED_PROXY_FILE`` points
+        at a ``host:port:user:pass`` pool the direct curl and direct
+        FlareSolverr routes egress through one pool member chosen once per
+        process (sticky residential, matching the platform's per-task proxy
+        pattern).  Unset/empty keeps the legacy host-IP direct route.
+        """
+        path = os.environ.get("WHOSCORED_PROXY_FILE", "").strip()
+        if not path:
+            return None
+        from scrapers.utils.proxy_manager import ProxyManager
+
+        manager = ProxyManager(rotation_strategy="random")
+        manager.load_from_file_custom_format(path)
+        return manager.get_http_proxy_url()
 
     def _new_http_session(self, proxy_url: Optional[str]) -> Any:
         if self._http_session_factory is not None:
@@ -3157,7 +3179,7 @@ class WhoScoredTransport:
                     url,
                     client=self._direct_fs,
                     route=TransportRoute.DIRECT_FLARESOLVERR,
-                    proxy_url=None,
+                    proxy_url=self._pool_proxy_url,
                     bootstrap_url=browser_bootstrap_url,
                 )
                 self._validate(browser, validator)

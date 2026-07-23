@@ -46,9 +46,29 @@ ENV_FILES = (
 CONFIG_HASHES = {service: SHA_D for service in admission.PROTECTED_SERVICES}
 PROVIDER_AUTHORITY = {
     "daily_cap_bytes": 300_000_000,
+    "order_cap_bytes": 1_000_000_000,
     "order_id": "38950",
     "provider_policy_sha256": "e" * 64,
 }
+
+
+def _bootstrap_slots() -> list[dict[str, str]]:
+    now = datetime.now(timezone.utc)
+    final_schedule = now.replace(hour=10, minute=0, second=0, microsecond=0)
+    if final_schedule + timedelta(hours=1) > now:
+        final_schedule -= timedelta(days=1)
+    first = final_schedule - timedelta(days=6)
+    waves = ("wave-20", "wave-20", "wave-70", "wave-70", "wave-all", "wave-all")
+    return [
+        {
+            "logical_date": (first + timedelta(days=index))
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "run_id": f"scheduled__{(first + timedelta(days=index)).isoformat()}",
+            "wave_id": wave_id,
+        }
+        for index, wave_id in enumerate(waves)
+    ]
 
 
 def test_validator_source_owner_policy_is_strict_for_root_process(
@@ -125,6 +145,46 @@ def test_verify_running_rollout_modes_are_mutually_exclusive() -> None:
         )
 
 
+def test_common_only_cli_has_no_provider_or_gateway_authority() -> None:
+    args = admission._parser().parse_args(
+        [
+            "verify-common-rendered",
+            "--deployment-attestation",
+            "/evidence/deployment.json",
+            "--common-override",
+            "/evidence/common.yaml",
+            "--env-file",
+            "/root/data-platform-football/.env",
+            "--env-file",
+            "/root/.secrets/whoscored-runtime-v2.env",
+            "--env-file",
+            "/root/.secrets/whoscored-proxy-v2.env",
+            "--output",
+            "/evidence/common-rendered.json",
+        ]
+    )
+
+    assert args.command == "verify-common-rendered"
+    assert not hasattr(args, "gateway_override")
+    assert not hasattr(args, "provider_policy")
+    assert not hasattr(args, "provider_quota_receipt")
+
+    with pytest.raises(SystemExit):
+        admission._parser().parse_args(
+            [
+                "post-create-common",
+                "--deployment-attestation",
+                "/evidence/deployment.json",
+                "--common-override",
+                "/evidence/common.yaml",
+                "--env-file",
+                "/root/data-platform-football/.env",
+                "--service",
+                "whoscored_paid_gateway",
+            ]
+        )
+
+
 @pytest.mark.parametrize("missing", admission.PROTECTED_SERVICES)
 def test_rollout_production_boundary_rejects_each_missing_service(
     missing: str,
@@ -188,12 +248,12 @@ def _accepted_rollout_report() -> dict[str, Any]:
     final_schedule = now.replace(hour=10, minute=0, second=0, microsecond=0)
     if final_schedule + timedelta(hours=1) > now:
         final_schedule -= timedelta(days=1)
-    final_logical_date = final_schedule - timedelta(days=1)
+    slots = _bootstrap_slots()
     scope_counts = [20, 20, 70, 70, 71, 71]
     terminal_runs = []
     for index, scope_count in enumerate(scope_counts):
-        logical_date = final_logical_date - timedelta(days=5 - index)
-        logical_z = logical_date.isoformat().replace("+00:00", "Z")
+        logical_z = slots[index]["logical_date"]
+        logical_date = datetime.fromisoformat(logical_z.replace("Z", "+00:00"))
         terminal_runs.append(
             {
                 "completed_at": (logical_date + timedelta(days=1, hours=1))
@@ -203,8 +263,9 @@ def _accepted_rollout_report() -> dict[str, Any]:
                     f"run-evidence-{index}".encode()
                 ).hexdigest(),
                 "idempotency": _idempotency_witness(scope_count),
+                "duration_seconds": 7_200,
                 "logical_date": logical_z,
-                "run_id": f"scheduled__{logical_date.isoformat()}",
+                "run_id": slots[index]["run_id"],
                 "scope_dq": {
                     "count": scope_count,
                     "sha256": hashlib.sha256(f"scope-dq-{index}".encode()).hexdigest(),
@@ -339,6 +400,10 @@ def _accepted_rollout_authority() -> dict[str, Any]:
             "classifier_sha256": SHA_C,
             "promotion_acceptance_sha256": SHA_A,
             "promotion_terminal_receipt_sha256": SHA_C,
+            "acceptance_mode": "accelerated-bootstrap-v1",
+            "bootstrap_slots": _bootstrap_slots(),
+            "capacity_receipt_sha256": hashlib.sha256(b"capacity-receipt").hexdigest(),
+            "provider_order_cap_bytes": 300_000_000,
         },
         "authority_binding": "current-signed-rollout",
         "catalog_active_scope_count": 71,
@@ -384,6 +449,9 @@ def _issuance_rollout_report(wave_id: str) -> dict[str, Any]:
         "manifest_sha256": SHA_A,
         "code_tree_sha256": SHA_B,
     }
+    terminal_runs = _accepted_rollout_report()["terminal_runs"][:run_count]
+    for run in terminal_runs:
+        run.pop("duration_seconds")
     return {
         "promotion": {
             "classifier_sha256": authority["classifier_sha256"],
@@ -404,7 +472,7 @@ def _issuance_rollout_report(wave_id: str) -> dict[str, Any]:
         "runtime_release": release,
         "schema_version": 1,
         "status": "live-authority-verified",
-        "terminal_runs": _accepted_rollout_report()["terminal_runs"][:run_count],
+        "terminal_runs": terminal_runs,
         "wave_id": wave_id,
     }
 
@@ -530,28 +598,31 @@ def test_verify_rollout_acceptance_uses_fixed_read_only_scheduler_probe() -> Non
         "f" * 64,
         "/usr/local/bin/whoscored-production-python",
     )
-    assert command[-1] == "rollout-954"
-    assert "iter_content_addressed_json(receipts_prefix(rollout_id))" in command[-2]
-    assert "rollout_acceptance_status" in command[-2]
-    assert "validate_runtime_contract" in command[-2]
-    assert "validate_whoscored_backup_recovery_contract" in command[-2]
-    assert "terminal_task_states_evidence" in command[-2]
-    assert "mapped_scope_dq_evidence" in command[-2]
-    assert "idempotency_evidence" in command[-2]
-    assert "scope_plan_sha256" in command[-2]
-    assert "run_evidence_sha256" in command[-2]
-    assert 'DagRun.dag_id == "dag_ingest_whoscored"' in command[-2]
-    assert "TaskInstance.run_id == run_id" in command[-2]
-    assert 'XCom.task_id == "validate_active_scope"' in command[-2]
-    assert '"scope_plan": "freeze_daily_scope_plan"' in command[-2]
-    assert '"completed_at": utc_iso(dag_run.end_date)' in command[-2]
-    assert "DagRun.external_trigger.is_(False)" in command[-2]
-    assert "latest_scheduled.run_id != terminal_runs[-1]" in command[-2]
-    assert "DagRun.state.in_" not in command[-2]
-    assert "list(range(expected_count))" in command[-2]
-    assert 'iter_content_addressed_json("latest")' not in command[-2]
-    assert 'read_json("latest")' not in command[-2]
-    compile(command[-2], "<whoscored-rollout-acceptance-probe>", "exec")
+    assert command[-2] == "rollout-954"
+    assert json.loads(command[-1]) == _accepted_rollout_authority()["authority"]
+    probe = command[-3]
+    assert "iter_content_addressed_json(receipts_prefix(rollout_id))" in probe
+    assert "rollout_acceptance_status" in probe
+    assert "validate_runtime_contract" in probe
+    assert "validate_whoscored_backup_recovery_contract" in probe
+    assert "terminal_task_states_evidence" in probe
+    assert "mapped_scope_dq_evidence" in probe
+    assert "idempotency_evidence" in probe
+    assert "scope_plan_sha256" in probe
+    assert "run_evidence_sha256" in probe
+    assert 'DagRun.dag_id == "dag_ingest_whoscored"' in probe
+    assert "TaskInstance.run_id == run_id" in probe
+    assert 'TaskInstance.task_id != "seal_rollout_acceptance_and_pause"' in probe
+    assert 'XCom.task_id == "validate_active_scope"' in probe
+    assert '"scope_plan": "freeze_daily_scope_plan"' in probe
+    assert '"completed_at": utc_iso(dag_run.end_date)' in probe
+    assert "DagRun.external_trigger.is_(False)" in probe
+    assert "latest_scheduled.run_id != terminal_runs[-1]" in probe
+    assert "DagRun.state.in_" not in probe
+    assert "list(range(expected_count))" in probe
+    assert 'iter_content_addressed_json("latest")' not in probe
+    assert 'read_json("latest")' not in probe
+    compile(probe, "<whoscored-rollout-acceptance-probe>", "exec")
 
 
 @pytest.mark.parametrize(
@@ -576,8 +647,8 @@ def test_verify_rollout_acceptance_uses_fixed_read_only_scheduler_probe() -> Non
         ("task-state-drift", "TaskInstance-state"),
         ("persisted-xcom-drift", "persisted-XCom"),
         ("idempotency-drift", "idempotency witness"),
-        ("non-consecutive", "consecutive within-wave pairs"),
-        ("stale-final-run", "stale or future-dated"),
+        ("non-consecutive", "signed bootstrap SLO"),
+        ("stale-final-run", "signed bootstrap SLO"),
         ("newer-failed-run", "latest scheduler-created"),
         ("newer-unreceipted-success", "latest scheduler-created"),
         ("newer-running-run", "latest scheduler-created"),
@@ -698,7 +769,7 @@ def test_verify_rollout_acceptance_rejects_false_go(
         )
 
 
-def test_verify_rollout_acceptance_allows_operator_gaps_between_waves() -> None:
+def test_verify_rollout_acceptance_rejects_gaps_outside_signed_slots() -> None:
     report = _accepted_rollout_report()
     for indexes, offset in (((0, 1), 4), ((2, 3), 2)):
         for index in indexes:
@@ -713,24 +784,41 @@ def test_verify_rollout_acceptance_allows_operator_gaps_between_waves() -> None:
             run["completed_at"] = completed_at.isoformat().replace("+00:00", "Z")
             run["run_id"] = f"scheduled__{logical_date.isoformat()}"
 
-    result = admission.verify_rollout_acceptance(
-        "rollout-954",
-        rollout_authority=_accepted_rollout_authority(),
-        scheduler_container_id="f" * 64,
-        runner=lambda _arguments: admission._canonical_bytes(report),
-    )
-
-    assert result["terminal_runs"] == report["terminal_runs"]
+    with pytest.raises(admission.AdmissionError, match="signed bootstrap SLO"):
+        admission.verify_rollout_acceptance(
+            "rollout-954",
+            rollout_authority=_accepted_rollout_authority(),
+            scheduler_container_id="f" * 64,
+            runner=lambda _arguments: admission._canonical_bytes(report),
+        )
 
 
 def test_verify_rollout_acceptance_freshness_uses_completion_not_logical_date():
     report = _accepted_rollout_report()
-    for run in report["terminal_runs"]:
+    authority = _accepted_rollout_authority()
+    shifted_slots = []
+    for index, run in enumerate(report["terminal_runs"]):
         logical_date = datetime.fromisoformat(
             run["logical_date"].replace("Z", "+00:00")
         ) - timedelta(days=3)
         run["logical_date"] = logical_date.isoformat().replace("+00:00", "Z")
         run["run_id"] = f"scheduled__{logical_date.isoformat()}"
+        shifted_slots.append(
+            {
+                "logical_date": run["logical_date"],
+                "run_id": run["run_id"],
+                "wave_id": (
+                    "wave-20",
+                    "wave-20",
+                    "wave-70",
+                    "wave-70",
+                    "wave-all",
+                    "wave-all",
+                )[index],
+            }
+        )
+    authority["authority"]["bootstrap_slots"] = shifted_slots
+    report["authority"]["bootstrap_slots"] = shifted_slots
     final_run = report["terminal_runs"][-1]
     report["latest_scheduled_run"].update(
         {
@@ -741,7 +829,7 @@ def test_verify_rollout_acceptance_freshness_uses_completion_not_logical_date():
 
     result = admission.verify_rollout_acceptance(
         "rollout-954",
-        rollout_authority=_accepted_rollout_authority(),
+        rollout_authority=authority,
         scheduler_container_id="f" * 64,
         runner=lambda _arguments: admission._canonical_bytes(report),
     )
@@ -799,6 +887,7 @@ def test_cutover_inventory_cli_requires_a_new_protected_output() -> None:
 PROXY_COMMAND = tuple(
     {
         "${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES:?set exact provider-policy daily cap in decimal bytes}": "300000000",
+        "${WHOSCORED_PROVIDER_ORDER_CAP_BYTES:?set exact signed provider gross order cap in decimal bytes}": "1000000000",
         "${WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES:-2000000}": "2000000",
         "${WHOSCORED_PROXY_FILTER_MAX_LEASE_TTL_SECONDS:-3600}": "3600",
         "${WHOSCORED_PROXY_FILTER_DAGRUN_BUDGET_BYTES:-1000000000}": "1000000000",
@@ -857,6 +946,7 @@ def _rendered_environment(service: str) -> dict[str, str]:
         environment["PROXY_FILTER_CONTROL_TOKEN"] = "c" * 32
         environment["WHOSCORED_PROVIDER_ORDER_ID"] = "38950"
         environment["WHOSCORED_PROVIDER_POLICY_SHA256"] = "e" * 64
+        environment["WHOSCORED_PROVIDER_ORDER_CAP_BYTES"] = "1000000000"
         environment["WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES"] = "300000000"
         environment["WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES"] = "2000000"
         environment["WHOSCORED_PROXY_APPROVAL_HMAC_SECRET"] = "a" * 32
@@ -878,6 +968,811 @@ def _enable_metered_transfermarkt(environment: dict[str, str]) -> None:
 
 def _canonical(path: Path, value: object) -> None:
     path.write_bytes(admission._canonical_bytes(value))
+
+
+def _capacity_container_id(service: str) -> str:
+    index = admission.COMMON_PROTECTED_SERVICES.index(service) + 1
+    return f"{index:064x}"
+
+
+def _capacity_container_record(
+    service: str, *, memory_usage_bytes: int = 128
+) -> dict[str, Any]:
+    flaresolverr = service == "flaresolverr"
+    return {
+        "name": service,
+        "id": _capacity_container_id(service),
+        "image_id": PAYLOADS[service],
+        "command_contract_ok": flaresolverr,
+        "image_identity_contract_ok": flaresolverr,
+        "immutable_payload_contract_ok": flaresolverr,
+        "security_contract_ok": flaresolverr,
+        "compose_identity_ok": flaresolverr,
+        "published_endpoint_contract_ok": flaresolverr,
+        "status": "running",
+        "running": True,
+        "healthy": True,
+        "production_admission_contract_ok": True,
+        "oom_killed": False,
+        "restart_count": 0,
+        "pid": 100 + admission.COMMON_PROTECTED_SERVICES.index(service),
+        "memory_usage_bytes": memory_usage_bytes,
+        "memory_limit_bytes": 4 * 1024**3,
+        "process_count": 3,
+    }
+
+
+def _capacity_running_images() -> list[dict[str, str]]:
+    return [
+        {
+            "container_id": _capacity_container_id(service),
+            "final_image": BINDINGS[service],
+            "image_id": PAYLOADS[service],
+            "service": service,
+        }
+        for service in admission.COMMON_PROTECTED_SERVICES
+    ]
+
+
+def _capacity_common_config_hashes() -> dict[str, str]:
+    return {
+        service: CONFIG_HASHES[service]
+        for service in admission.COMMON_PROTECTED_SERVICES
+    }
+
+
+def _capacity_run(worker_id: int, iteration: int) -> dict[str, Any]:
+    return {
+        "worker_id": worker_id,
+        "iteration": iteration,
+        "scope": "test-league=2025",
+        "returncode": 0,
+        "process_elapsed_seconds": 10.0,
+        "stderr_bytes": 0,
+        "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+        "termination_reason": None,
+        "status": "success",
+        "source_request_attempts": 0,
+        "network_requests": 0,
+        "page_units": 5,
+        "paid_bytes": 0,
+        "paid_route_requests": 0,
+        "traffic_evidence_valid": True,
+        "workflow_elapsed_seconds": 9.5,
+        "publishes": False,
+        "writes_bronze": False,
+        "executes_ddl": False,
+        "entities": ["matches", "multistage", "previews", "profiles"],
+        "source_stage_count": 2,
+        "mode": admission._CAPACITY_MODE,
+        "seed_sha256": admission._CAPACITY_SEED_SHA256,
+        "seed_evidence_valid": True,
+        "cleanup_evidence_valid": True,
+    }
+
+
+def _capacity_worker_container(worker_id: int) -> dict[str, Any]:
+    return {
+        "worker_id": worker_id,
+        "iteration": 1_999,
+        "container_id": f"{worker_id + 100:064x}",
+        "status": "running",
+        "running": True,
+        "exit_code": 0,
+        "oom_killed": False,
+        "memory_usage_bytes": 64,
+        "pids_current": 1,
+    }
+
+
+def _capacity_sample(
+    elapsed_seconds: int,
+    *,
+    baseline_containers: list[dict[str, Any]],
+) -> dict[str, Any]:
+    work_elapsed = min(elapsed_seconds, 21_600)
+    completed_runs = 8_000 if work_elapsed == 21_600 else 8_000 * work_elapsed // 21_600
+    page_units = completed_runs * 5
+    worker_containers = (
+        [_capacity_worker_container(worker_id) for worker_id in range(4)]
+        if 0 < work_elapsed < 21_600
+        else []
+    )
+    worker_memory = sum(worker["memory_usage_bytes"] for worker in worker_containers)
+    worker_pids = sum(worker["pids_current"] for worker in worker_containers)
+    container_memory = (
+        sum(record["memory_usage_bytes"] for record in baseline_containers)
+        + worker_memory
+    )
+    harness_memory = 512
+    return {
+        "elapsed_seconds": elapsed_seconds,
+        "completed_runs": completed_runs,
+        "source_request_attempts": 0,
+        "page_units": page_units,
+        "projected_page_units_per_day": round(
+            page_units * 86_400 / elapsed_seconds if elapsed_seconds else 0,
+            3,
+        ),
+        "paid_bytes": 0,
+        "paid_route_requests": 0,
+        "harness_rss_bytes": harness_memory,
+        "container_memory_bytes": container_memory,
+        "worker_container_memory_bytes": worker_memory,
+        "worker_container_pids": worker_pids,
+        "aggregate_memory_bytes": harness_memory + container_memory,
+        "rss_process_count": 1,
+        "containers": [dict(record) for record in baseline_containers],
+        "worker_containers": worker_containers,
+    }
+
+
+def _capacity_compose_input_evidence() -> dict[
+    str, admission.ProtectedComposeInputEvidence
+]:
+    labels = (
+        "compose:compose.yaml",
+        "compose:compose.seaweedfs-supervised.yaml",
+        "common-digest-override",
+        "compose-env:0",
+        "compose-env:1",
+        "compose-env:2",
+    )
+    return {
+        label: admission.ProtectedComposeInputEvidence(
+            raw=f"capacity input {label}\n".encode(),
+            identity=tuple([index + 201] * 9),
+        )
+        for index, label in enumerate(labels)
+    }
+
+
+def _capacity_report() -> dict[str, Any]:
+    gates = [
+        {"name": name, "passed": True}
+        for name in sorted(admission._CAPACITY_GATE_NAMES)
+    ]
+    by_name = {gate["name"]: gate for gate in gates}
+    by_name["throughput"].update(
+        {
+            "minimum_page_units_per_day": 144_000,
+            "observed_page_units_per_day": 160_000,
+        }
+    )
+    by_name["memory"].update(
+        {
+            "maximum_aggregate_memory_bytes": 12 * 1024**3,
+            "observed_max_aggregate_memory_bytes": 1024,
+        }
+    )
+    by_name["sustained_duration"].update(
+        {"required_seconds": 21_600, "observed_seconds": 21_600}
+    )
+    by_name["network_isolation"]["observed_network_requests"] = 0
+    by_name["paid_traffic"].update(
+        {"observed_paid_bytes": 0, "observed_paid_route_requests": 0}
+    )
+    by_name["cache_seed"]["observed_seed_sha256"] = admission._CAPACITY_SEED_SHA256
+    by_name["monitoring_evidence"]["sample_count"] = 1
+    evidence = _capacity_bindings_evidence()
+    compose_input_evidence = _capacity_compose_input_evidence()
+    bound_inputs = {
+        "build-attestation": {
+            "identity": list(evidence.build_attestation_identity),
+            "sha256": hashlib.sha256(evidence.build_attestation_raw).hexdigest(),
+        },
+        "build-manifest": {
+            "identity": list(evidence.build_manifest_identity),
+            "sha256": hashlib.sha256(evidence.build_manifest_raw).hexdigest(),
+        },
+        "deployment-attestation": {
+            "identity": list(evidence.deployment_attestation_identity),
+            "sha256": hashlib.sha256(evidence.deployment_attestation_raw).hexdigest(),
+        },
+    }
+    protected_inputs = dict(bound_inputs)
+    protected_inputs.update(
+        {
+            label: {
+                "identity": list(item.identity),
+                "sha256": item.sha256,
+            }
+            for label, item in compose_input_evidence.items()
+        }
+    )
+    network_logicals = sorted(
+        {
+            logical
+            for service in admission.COMMON_PROTECTED_SERVICES
+            for logical in admission._EXPECTED_NETWORKS[service]
+        }
+    )
+    deployment = {
+        "admission_mode": "cache-capacity-v1",
+        "common_digest_override_sha256": protected_inputs["common-digest-override"][
+            "sha256"
+        ],
+        "deployment_attestation_sha256": protected_inputs["deployment-attestation"][
+            "sha256"
+        ],
+        "gateway_digest_override_sha256": None,
+        "payload_revision": "2" * 40,
+        "protected_bindings": dict(BINDINGS),
+        "protected_config_hashes": _capacity_common_config_hashes(),
+        "protected_inputs": protected_inputs,
+        "protected_payload_image_ids": dict(PAYLOADS),
+        "provenance_manifest_sha256": evidence.validated_manifest_sha256,
+        "release_revision": "1" * 40,
+        "running_admission": {
+            "apparmor_profile": "docker-default (enforce)",
+            "docker_security_options": [
+                "name=apparmor",
+                "name=cgroupns",
+                "name=seccomp,profile=builtin",
+            ],
+            "images": _capacity_running_images(),
+            "networks": [
+                {
+                    "id": f"{index + 20:064x}",
+                    "logical_name": logical,
+                    "name": admission._EXPECTED_NETWORK_DEFINITIONS[logical]["name"],
+                    "subnet": f"10.{index + 20}.0.0/24",
+                }
+                for index, logical in enumerate(network_logicals)
+            ],
+            "projects": {
+                admission.COMMON_PROJECT: list(admission.COMMON_PROTECTED_SERVICES)
+            },
+            "schema_version": 1,
+            "status": "admitted-running-v1",
+            "volumes": [
+                {
+                    "driver": "local",
+                    "mountpoint": "/var/lib/docker/volumes/soccerdata_cache/_data",
+                    "name": "soccerdata_cache",
+                }
+            ],
+        },
+        "source_tree_sha256": SHA_D,
+    }
+    contract_files, runtime_lock_sha256, runtime_tree_sha256 = (
+        admission._capacity_runtime_contract_evidence()
+    )
+    runtime_file_sha256 = admission._capacity_runtime_file_evidence()
+    assert runtime_file_sha256[admission._CAPACITY_RUNTIME_CONTRACT_RELATIVE] == (
+        runtime_lock_sha256
+    )
+    assert all(
+        runtime_file_sha256[relative] == contract_files[relative]
+        for relative in admission._CAPACITY_SEALED_RUNTIME_PATHS
+        if relative != admission._CAPACITY_RUNTIME_CONTRACT_RELATIVE
+    )
+    runtime_file_sha256.update(
+        {
+            f"external:{label}": item["sha256"]
+            for label, item in protected_inputs.items()
+        }
+    )
+    runtime_material = {
+        "file_sha256": runtime_file_sha256,
+        "python_executable": "/usr/local/bin/python",
+        "python_prefix": "/usr/local",
+        "python_version": "3.11",
+        "dependency_versions": {"curl_cffi": admission._CAPACITY_CURL_CFFI_VERSION},
+        "worker_image_id": PAYLOADS["airflow-scheduler"],
+        "production_deployment": deployment,
+    }
+    runtime_manifest_sha256 = hashlib.sha256(
+        admission._authority_canonical_bytes(runtime_material)
+    ).hexdigest()
+    runtime_release = {
+        "release_revision": "1" * 40,
+        "manifest_sha256": runtime_manifest_sha256,
+        "worker_image_id": PAYLOADS["airflow-scheduler"],
+        "git_clean": True,
+    }
+    baseline_containers = [
+        _capacity_container_record(service)
+        for service in admission.COMMON_PROTECTED_SERVICES
+    ]
+    capacity_samples = [
+        _capacity_sample(
+            elapsed_seconds,
+            baseline_containers=baseline_containers,
+        )
+        for elapsed_seconds in (*range(0, 21_601, 30), 21_601)
+    ]
+    by_name["monitoring_evidence"]["sample_count"] = len(capacity_samples)
+    report = {
+        "baseline_containers": baseline_containers,
+        "canary_version": "whoscored-capacity-canary-v4",
+        "cleanup": {
+            "status": "success",
+            "cache_workspaces_removed": True,
+            "worker_runtime_removed": True,
+            "browser_sessions_removed": True,
+        },
+        "cleanup_status": "success",
+        "cleanup_elapsed_seconds": 1,
+        "completed_by_worker": {str(index): 2_000 for index in range(4)},
+        "completed_runs": 8_000,
+        "completed_worker_seconds": 86_400,
+        "deadline_truncations": 0,
+        "duration_seconds_observed": 21_600,
+        "duration_seconds_requested": 21_600,
+        "elapsed_seconds": 21_600,
+        "ended_at": "2026-07-22T10:00:01+00:00",
+        "executes_ddl": False,
+        "gates": gates,
+        "match_limit": 10,
+        "max_aggregate_memory_bytes": 1024,
+        "max_container_memory_bytes": 512,
+        "max_harness_rss_bytes": 512,
+        "max_source_stage_count": 2,
+        "max_worker_container_memory_bytes": 256,
+        "max_worker_container_pids": 4,
+        "mode": "cache-capacity-v1",
+        "network_requests": 0,
+        "oom_killed": False,
+        "page_unit_definition": admission._CAPACITY_PAGE_UNIT_DEFINITION,
+        "page_units": 40_000,
+        "paid_bytes": 0,
+        "paid_proxy_bytes": 0,
+        "paid_route_requests": 0,
+        "peak_combined_rss_bytes": 1024,
+        "production_deployment": deployment,
+        "profile_limit": 10,
+        "projected_page_units_per_day": 160_000,
+        "publishes": False,
+        "raw_store_policy": "exact content-addressed temporary cache",
+        "repository_policy": "per-process in-memory repository",
+        "restart_count": 0,
+        "run_summaries_retained": 8,
+        "run_summaries_total": 8_000,
+        "run_summaries_truncated": True,
+        "runs": [
+            _capacity_run(worker_id, iteration)
+            for worker_id in range(4)
+            for iteration in (0, 1_999)
+        ],
+        "runtime_identity": {
+            "git_revision": runtime_release["release_revision"],
+            "git_clean": True,
+            "manifest_sha256": runtime_release["manifest_sha256"],
+            **runtime_material,
+        },
+        "runtime_release_identity": runtime_release,
+        "samples": capacity_samples,
+        "schema_version": 1,
+        "scopes": ["test-league=2025"],
+        "sealed_worker_runtime": {
+            "bundle_sha256": None,
+            "execution_mode": "exact-scheduler-image-v1",
+            "file_count": len(admission._CAPACITY_SEALED_RUNTIME_PATHS),
+            "runtime_cleanup_complete": True,
+            "runtime_tree_sha256": runtime_tree_sha256,
+            "worker_image_id": PAYLOADS["airflow-scheduler"],
+        },
+        "seed_sha256": admission._CAPACITY_SEED_SHA256,
+        "session_cleanup": {
+            "lock_acquired": True,
+            "preflight_required": False,
+            "preflight_verified_zero": True,
+            "final_verified_zero": True,
+            "state_file_removed": True,
+            "poll_attempts": 0,
+            "successful_polls": 0,
+            "final_zero_scans": 0,
+            "active_max": 0,
+            "pending_create_max": 0,
+            "pending_destroy_max": 0,
+            "failed_create_max": 0,
+            "failed_destroy_max": 0,
+            "failure_generation_changed": False,
+            "quiet_window_observed": True,
+            "error_count": 0,
+            "error_sha256": [],
+            "stale_worker_cleanup_required": False,
+            "stale_worker_cleanup_verified": True,
+            "stale_worker_containers_removed": 0,
+            "worker_artifact_cleanup_required": True,
+            "worker_artifact_cleanup_verified": True,
+        },
+        "source_request_attempts": 0,
+        "started_at": "2026-07-22T04:00:00+00:00",
+        "status": "success",
+        "stop_reasons": [],
+        "total_elapsed_seconds": 21_601,
+        "worker_count": 4,
+        "workers": 4,
+        "writes_bronze": False,
+    }
+    assert set(report) == admission._CAPACITY_REPORT_FIELDS - {"report_sha256"}
+    report["report_sha256"] = hashlib.sha256(
+        admission._authority_canonical_bytes(report)
+    ).hexdigest()
+    return report
+
+
+def _capacity_bindings_evidence() -> SimpleNamespace:
+    build_attestation_raw = b"capacity build attestation\n"
+    build_manifest_raw = b"capacity build manifest\n"
+    deployment_attestation_raw = b"capacity deployment attestation\n"
+    return SimpleNamespace(
+        bindings=BINDINGS,
+        build_attestation_raw=build_attestation_raw,
+        build_attestation_identity=tuple([101] * 9),
+        build_manifest_raw=build_manifest_raw,
+        build_manifest_identity=tuple([102] * 9),
+        deployment_attestation_raw=deployment_attestation_raw,
+        deployment_attestation_identity=tuple([103] * 9),
+        validated_release_revision="1" * 40,
+        validated_payload_revision="2" * 40,
+        validated_manifest_sha256=hashlib.sha256(build_manifest_raw).hexdigest(),
+        validated_source_tree_sha256=SHA_D,
+        validated_payload_image_ids=PAYLOADS,
+    )
+
+
+def _capacity_current_admission_evidence() -> dict[str, Any]:
+    return {
+        "compose_inputs_evidence": _capacity_compose_input_evidence(),
+        "common_config_hashes": _capacity_common_config_hashes(),
+        "running_images_evidence": _capacity_running_images(),
+    }
+
+
+def _write_capacity_receipt(path: Path, report: Mapping[str, Any]) -> None:
+    _canonical(path, report)
+    path.chmod(0o600)
+
+
+def _rehash_capacity_report(report: dict[str, Any]) -> None:
+    report.pop("report_sha256", None)
+    report["report_sha256"] = hashlib.sha256(
+        admission._authority_canonical_bytes(report)
+    ).hexdigest()
+
+
+def test_capacity_receipt_binds_internal_digest_and_current_release(
+    tmp_path: Path,
+) -> None:
+    report = _capacity_report()
+    path = tmp_path / "capacity.json"
+    _write_capacity_receipt(path, report)
+
+    result = admission.validate_capacity_receipt(
+        path,
+        capacity_receipt_sha256=report["report_sha256"],
+        bindings_evidence=_capacity_bindings_evidence(),
+        scheduler_image_id=PAYLOADS["airflow-scheduler"],
+        **_capacity_current_admission_evidence(),
+    )
+
+    assert result["status"] == "accepted-v1"
+    assert result["report_sha256"] == report["report_sha256"]
+    assert hashlib.sha256(path.read_bytes()).hexdigest() != report["report_sha256"]
+
+
+@pytest.mark.parametrize(
+    "mutation", ("non_utc", "wall_delta", "sparse_samples", "missing_work_final")
+)
+def test_capacity_receipt_rejects_fabricated_monitoring_timeline(
+    tmp_path: Path, mutation: str
+) -> None:
+    report = _capacity_report()
+    if mutation == "non_utc":
+        report["started_at"] = "2026-07-22T05:00:00+01:00"
+    elif mutation == "wall_delta":
+        report["ended_at"] = "2026-07-22T10:01:01+00:00"
+    elif mutation == "sparse_samples":
+        report["samples"] = [report["samples"][0]]
+        next(gate for gate in report["gates"] if gate["name"] == "monitoring_evidence")[
+            "sample_count"
+        ] = 1
+    else:
+        report["samples"] = [
+            sample
+            for sample in report["samples"]
+            if sample["elapsed_seconds"] != 21_600
+        ]
+        next(gate for gate in report["gates"] if gate["name"] == "monitoring_evidence")[
+            "sample_count"
+        ] = len(report["samples"])
+    _rehash_capacity_report(report)
+    path = tmp_path / f"capacity-timeline-{mutation}.json"
+    _write_capacity_receipt(path, report)
+
+    with pytest.raises(admission.AdmissionError):
+        admission.validate_capacity_receipt(
+            path,
+            capacity_receipt_sha256=report["report_sha256"],
+            bindings_evidence=_capacity_bindings_evidence(),
+            scheduler_image_id=PAYLOADS["airflow-scheduler"],
+            **_capacity_current_admission_evidence(),
+        )
+
+
+def test_capacity_receipt_rejects_running_workers_in_cleanup_final_sample(
+    tmp_path: Path,
+) -> None:
+    report = _capacity_report()
+    final = report["samples"][-1]
+    final["worker_containers"] = [
+        _capacity_worker_container(worker_id) for worker_id in range(4)
+    ]
+    worker_memory = sum(
+        worker["memory_usage_bytes"] for worker in final["worker_containers"]
+    )
+    worker_pids = sum(worker["pids_current"] for worker in final["worker_containers"])
+    final["worker_container_memory_bytes"] = worker_memory
+    final["worker_container_pids"] = worker_pids
+    final["container_memory_bytes"] += worker_memory
+    final["aggregate_memory_bytes"] += worker_memory
+    _rehash_capacity_report(report)
+    path = tmp_path / "capacity-workers-after-cleanup.json"
+    _write_capacity_receipt(path, report)
+
+    with pytest.raises(admission.AdmissionError, match="cleanup-final"):
+        admission.validate_capacity_receipt(
+            path,
+            capacity_receipt_sha256=report["report_sha256"],
+            bindings_evidence=_capacity_bindings_evidence(),
+            scheduler_image_id=PAYLOADS["airflow-scheduler"],
+            **_capacity_current_admission_evidence(),
+        )
+
+
+@pytest.mark.parametrize(
+    "label",
+    (
+        "compose:compose.yaml",
+        "compose:compose.seaweedfs-supervised.yaml",
+        "common-digest-override",
+        "compose-env:0",
+        "compose-env:1",
+        "compose-env:2",
+    ),
+)
+@pytest.mark.parametrize("mutation", ("identity", "sha256"))
+def test_capacity_receipt_binds_current_fd_pinned_compose_inputs(
+    tmp_path: Path, label: str, mutation: str
+) -> None:
+    report = _capacity_report()
+    path = tmp_path / f"capacity-compose-{mutation}-{label.replace(':', '-')}.json"
+    _write_capacity_receipt(path, report)
+    current = _capacity_current_admission_evidence()
+    compose = dict(current["compose_inputs_evidence"])
+    original = compose[label]
+    compose[label] = admission.ProtectedComposeInputEvidence(
+        raw=(original.raw if mutation == "identity" else original.raw + b"drift"),
+        identity=(
+            tuple(value + 1 for value in original.identity)
+            if mutation == "identity"
+            else original.identity
+        ),
+    )
+    current["compose_inputs_evidence"] = compose
+
+    with pytest.raises(
+        admission.AdmissionError,
+        match="current protected Compose inputs",
+    ):
+        admission.validate_capacity_receipt(
+            path,
+            capacity_receipt_sha256=report["report_sha256"],
+            bindings_evidence=_capacity_bindings_evidence(),
+            scheduler_image_id=PAYLOADS["airflow-scheduler"],
+            **current,
+        )
+
+
+@pytest.mark.parametrize("mutation", ("content", "release", "duration"))
+def test_capacity_receipt_rejects_tamper_release_or_short_run(
+    tmp_path: Path, mutation: str
+) -> None:
+    report = _capacity_report()
+    if mutation == "content":
+        report["projected_page_units_per_day"] = 159_999
+    elif mutation == "release":
+        report["runtime_release_identity"]["worker_image_id"] = f"sha256:{'e' * 64}"
+        report["runtime_identity"]["worker_image_id"] = f"sha256:{'e' * 64}"
+        report["report_sha256"] = hashlib.sha256(
+            admission._authority_canonical_bytes(
+                {key: value for key, value in report.items() if key != "report_sha256"}
+            )
+        ).hexdigest()
+    else:
+        report["duration_seconds_observed"] = 21_599
+        report["elapsed_seconds"] = 21_599
+        report["report_sha256"] = hashlib.sha256(
+            admission._authority_canonical_bytes(
+                {key: value for key, value in report.items() if key != "report_sha256"}
+            )
+        ).hexdigest()
+    path = tmp_path / f"capacity-{mutation}.json"
+    _write_capacity_receipt(path, report)
+
+    expected_digest = (
+        _capacity_report()["report_sha256"]
+        if mutation == "content"
+        else report["report_sha256"]
+    )
+    with pytest.raises(admission.AdmissionError):
+        admission.validate_capacity_receipt(
+            path,
+            capacity_receipt_sha256=expected_digest,
+            bindings_evidence=_capacity_bindings_evidence(),
+            scheduler_image_id=PAYLOADS["airflow-scheduler"],
+            **_capacity_current_admission_evidence(),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "diagnostic_admission",
+        "gateway_authority",
+        "paid_config_hash",
+        "common_config_hash",
+        "live_image",
+        "sealed_runtime",
+        "session_network",
+        "summary_bound",
+        "sample_bound",
+        "duration_fraction",
+    ),
+)
+def test_capacity_receipt_rejects_incomplete_cache_proof(
+    tmp_path: Path, mutation: str
+) -> None:
+    report = _capacity_report()
+    if mutation == "diagnostic_admission":
+        report["production_deployment"]["admission_mode"] = "direct-diagnostic-v1"
+    elif mutation == "gateway_authority":
+        report["production_deployment"]["gateway_digest_override_sha256"] = SHA_D
+    elif mutation == "paid_config_hash":
+        report["production_deployment"]["protected_config_hashes"][
+            "whoscored_paid_gateway"
+        ] = SHA_D
+    elif mutation == "common_config_hash":
+        report["production_deployment"]["protected_config_hashes"][
+            "airflow-scheduler"
+        ] = SHA_A
+    elif mutation == "live_image":
+        report["production_deployment"]["running_admission"]["images"][0][
+            "image_id"
+        ] = f"sha256:{'e' * 64}"
+    elif mutation == "sealed_runtime":
+        report["sealed_worker_runtime"]["runtime_cleanup_complete"] = False
+    elif mutation == "session_network":
+        report["session_cleanup"]["poll_attempts"] = 1
+    elif mutation == "summary_bound":
+        report["runs"] = [{} for _ in range(17)]
+        report["run_summaries_retained"] = 17
+    elif mutation == "sample_bound":
+        report["samples"] = [{} for _ in range(admission._CAPACITY_MAX_SAMPLES + 1)]
+        next(gate for gate in report["gates"] if gate["name"] == "monitoring_evidence")[
+            "sample_count"
+        ] = len(report["samples"])
+    else:
+        report["duration_seconds_observed"] = 21_599.999
+        report["elapsed_seconds"] = 21_599.999
+        next(gate for gate in report["gates"] if gate["name"] == "sustained_duration")[
+            "observed_seconds"
+        ] = 21_599.999
+    report["runtime_identity"]["production_deployment"] = report[
+        "production_deployment"
+    ]
+    unsigned = {key: value for key, value in report.items() if key != "report_sha256"}
+    report["report_sha256"] = hashlib.sha256(
+        admission._authority_canonical_bytes(unsigned)
+    ).hexdigest()
+    path = tmp_path / f"capacity-incomplete-{mutation}.json"
+    _write_capacity_receipt(path, report)
+
+    with pytest.raises(admission.AdmissionError):
+        admission.validate_capacity_receipt(
+            path,
+            capacity_receipt_sha256=report["report_sha256"],
+            bindings_evidence=_capacity_bindings_evidence(),
+            scheduler_image_id=PAYLOADS["airflow-scheduler"],
+            **_capacity_current_admission_evidence(),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "run_publishes",
+        "run_network",
+        "run_paid",
+        "sample_publishes",
+        "sample_network",
+        "sample_paid",
+        "malformed_baseline",
+        "forged_apparmor",
+        "forged_security_options",
+        "forged_network",
+        "forged_volume",
+        "string_preflight_required",
+        "string_stale_cleanup_required",
+        "forged_runtime_identity",
+        "forged_sealed_runtime",
+    ),
+)
+def test_capacity_receipt_rejects_fabricated_nested_evidence(
+    tmp_path: Path, mutation: str
+) -> None:
+    report = _capacity_report()
+    if mutation == "run_publishes":
+        report["runs"][0]["publishes"] = True
+    elif mutation == "run_network":
+        report["runs"][0]["network_requests"] = 1
+    elif mutation == "run_paid":
+        report["runs"][0]["paid_bytes"] = 1
+    elif mutation == "sample_publishes":
+        report["samples"][0]["publishes"] = True
+    elif mutation == "sample_network":
+        report["samples"][0]["network_requests"] = 1
+    elif mutation == "sample_paid":
+        report["samples"][0]["paid_bytes"] = 1
+    elif mutation == "malformed_baseline":
+        report["baseline_containers"] = "not-a-list"
+    elif mutation == "forged_apparmor":
+        report["production_deployment"]["running_admission"]["apparmor_profile"] = (
+            "unconfined"
+        )
+    elif mutation == "forged_security_options":
+        report["production_deployment"]["running_admission"][
+            "docker_security_options"
+        ] = ["name=apparmor"]
+    elif mutation == "forged_network":
+        report["production_deployment"]["running_admission"]["networks"][0][
+            "subnet"
+        ] = "8.8.8.0/24"
+    elif mutation == "forged_volume":
+        report["production_deployment"]["running_admission"]["volumes"][0]["driver"] = (
+            "nfs"
+        )
+    elif mutation == "string_preflight_required":
+        report["session_cleanup"]["preflight_required"] = "False"
+    elif mutation == "string_stale_cleanup_required":
+        report["session_cleanup"]["stale_worker_cleanup_required"] = "False"
+    elif mutation == "forged_runtime_identity":
+        runtime = report["runtime_identity"]
+        runtime["file_sha256"]["scripts/whoscored_production_admission.py"] = SHA_A
+        forged_material = {
+            field: runtime[field]
+            for field in (
+                "file_sha256",
+                "python_executable",
+                "python_prefix",
+                "python_version",
+                "dependency_versions",
+                "worker_image_id",
+                "production_deployment",
+            )
+        }
+        forged_manifest = hashlib.sha256(
+            admission._authority_canonical_bytes(forged_material)
+        ).hexdigest()
+        runtime["manifest_sha256"] = forged_manifest
+        report["runtime_release_identity"]["manifest_sha256"] = forged_manifest
+    else:
+        report["sealed_worker_runtime"]["runtime_tree_sha256"] = SHA_A
+    _rehash_capacity_report(report)
+    path = tmp_path / f"capacity-fabricated-{mutation}.json"
+    _write_capacity_receipt(path, report)
+
+    with pytest.raises(admission.AdmissionError):
+        admission.validate_capacity_receipt(
+            path,
+            capacity_receipt_sha256=report["report_sha256"],
+            bindings_evidence=_capacity_bindings_evidence(),
+            scheduler_image_id=PAYLOADS["airflow-scheduler"],
+            **_capacity_current_admission_evidence(),
+        )
 
 
 def _provider_quota_receipt(
@@ -986,7 +1881,7 @@ def _current_rollout_files(
         "paid_target_count": 5,
     }
     rollout: dict[str, object] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "cohort_id": "cohort-954",
         "rollout_id": "rollout-954",
         "wave_id": wave_id,
@@ -1006,6 +1901,10 @@ def _current_rollout_files(
         "promotion_terminal_receipt_sha256": (
             admission._ROLLOUT_GENESIS_PROOF_SHA256 if wave_id == "wave-20" else SHA_D
         ),
+        "acceptance_mode": "accelerated-bootstrap-v1",
+        "bootstrap_slots": _bootstrap_slots(),
+        "capacity_receipt_sha256": hashlib.sha256(b"capacity-receipt").hexdigest(),
+        "provider_order_cap_bytes": policy["order_cap_bytes"],
     }
     rollout_path = tmp_path / "rollout.json"
     _canonical(rollout_path, rollout)
@@ -1014,7 +1913,7 @@ def _current_rollout_files(
         admission._authority_canonical_bytes(rollout)
     ).hexdigest()
     charter_unsigned: dict[str, object] = {
-        "schema_version": 4,
+        "schema_version": 5,
         "source": "whoscored",
         "provider_policy_sha256": policy["document_sha256"],
         "order_id": policy["order_id"],
@@ -1032,11 +1931,15 @@ def _current_rollout_files(
         "promotion_terminal_receipt_sha256": rollout[
             "promotion_terminal_receipt_sha256"
         ],
+        "acceptance_mode": rollout["acceptance_mode"],
+        "bootstrap_slots": rollout["bootstrap_slots"],
+        "capacity_receipt_sha256": rollout["capacity_receipt_sha256"],
+        "provider_order_cap_bytes": rollout["provider_order_cap_bytes"],
         "valid_from": (now - timedelta(minutes=5)).isoformat(),
         "valid_until": (now + timedelta(hours=12)).isoformat(),
         "daily_cap_bytes": 100_000_000,
         "monthly_cap_bytes": 200_000_000,
-        "order_cap_bytes": 300_000_000,
+        "order_cap_bytes": 285_000_000,
         "max_issuances": 31,
         "signature_algorithm": "hmac-sha256",
     }
@@ -1671,9 +2574,7 @@ def test_deployment_attestation_rejects_service_or_digest_drift(
 
 def _rendered(bindings: Mapping[str, str] = BINDINGS) -> dict[str, object]:
     commands = {
-        "airflow-scheduler": list(
-            admission._EXPECTED_COMMANDS["airflow-scheduler"]
-        ),
+        "airflow-scheduler": list(admission._EXPECTED_COMMANDS["airflow-scheduler"]),
         "flaresolverr": None,
         "flaresolverr_whoscored_paid": None,
         "whoscored_paid_gateway": list(
@@ -1926,6 +2827,114 @@ def _use_test_geoip_identity(
     return source
 
 
+def test_common_only_rendered_projection_is_exact_and_excludes_paid_services():
+    rendered = _rendered()
+    common_networks = {
+        name
+        for service in admission.COMMON_PROTECTED_SERVICES
+        for name in admission._EXPECTED_NETWORKS[service]
+    }
+    common = {
+        "services": {
+            service: rendered["services"][service]
+            for service in admission.COMMON_PROTECTED_SERVICES
+        },
+        "networks": {name: rendered["networks"][name] for name in common_networks},
+        "volumes": rendered["volumes"],
+    }
+
+    projections = admission.verify_rendered_compose(
+        common,
+        BINDINGS,
+        selected_services=admission.COMMON_PROTECTED_SERVICES,
+    )
+
+    assert set(projections) == set(admission.COMMON_PROTECTED_SERVICES)
+    common["networks"]["attacker"] = {}
+    with pytest.raises(admission.AdmissionError, match="network definitions"):
+        admission.verify_rendered_compose(
+            common,
+            BINDINGS,
+            selected_services=admission.COMMON_PROTECTED_SERVICES,
+        )
+
+
+def test_common_project_render_accepts_external_paid_api_and_capacity_profile(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "release"
+    root.mkdir()
+    for name in ("compose.yaml", "compose.seaweedfs-supervised.yaml"):
+        (root / name).write_text("# input\n", encoding="utf-8")
+    env_file = tmp_path / "production.env"
+    env_file.write_text("# environment\n", encoding="utf-8")
+    common_override = tmp_path / "common.yaml"
+    common_override.write_bytes(
+        admission.compose_override_bytes(BINDINGS, admission.COMMON_PROTECTED_SERVICES)
+    )
+    combined = _rendered()
+    combined["services"]["airflow-scheduler"]["environment"].update(
+        {
+            "WHOSCORED_SOURCE_POOL_SLOTS": "4",
+            "WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY": "144000",
+        }
+    )
+    common_network_names = {
+        name
+        for service in admission.COMMON_PROTECTED_SERVICES
+        for name in admission._EXPECTED_NETWORKS[service]
+    }
+    rendered = {
+        "name": admission.COMMON_PROJECT,
+        "services": {
+            service: combined["services"][service]
+            for service in admission.COMMON_PROTECTED_SERVICES
+        },
+        "networks": {
+            name: (
+                admission._COMMON_EXTERNAL_NETWORKS[name]
+                if name in admission._COMMON_EXTERNAL_NETWORKS
+                else combined["networks"][name]
+            )
+            for name in common_network_names
+        },
+        "volumes": combined["volumes"],
+    }
+
+    def runner(arguments: Sequence[str]) -> bytes:
+        args = tuple(arguments)
+        if args[-3:] == ("config", "--format", "json"):
+            return json.dumps(rendered).encode()
+        if args[-3:-1] == ("config", "--hash"):
+            return f"{args[-1]} {SHA_D}\n".encode()
+        raise AssertionError(args)
+
+    projections, hashes, files, raw = admission.render_attested_common_project(
+        BINDINGS,
+        root=root,
+        common_override_path=common_override,
+        env_files=(env_file,),
+        runner=runner,
+    )
+
+    assert set(projections) == set(admission.COMMON_PROTECTED_SERVICES)
+    assert set(hashes) == set(admission.COMMON_PROTECTED_SERVICES)
+    assert files[-1] == common_override
+    assert raw == rendered
+
+    rendered["networks"]["whoscored-paid-api"] = (
+        admission._EXPECTED_NETWORK_DEFINITIONS["whoscored-paid-api"]
+    )
+    with pytest.raises(admission.AdmissionError, match="common Compose networks"):
+        admission.render_attested_common_project(
+            BINDINGS,
+            root=root,
+            common_override_path=common_override,
+            env_files=(env_file,),
+            runner=runner,
+        )
+
+
 def test_bind_source_policy_requires_preexisting_separate_protected_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2070,9 +3079,7 @@ def test_bind_source_policy_rejects_wrong_airflow_authority_identity(
         admission._validate_bind_source_policy(projections, root=root)
 
 
-@pytest.mark.parametrize(
-    "mutation", ["digest", "size", "mode", "hardlink", "symlink"]
-)
+@pytest.mark.parametrize("mutation", ["digest", "size", "mode", "hardlink", "symlink"])
 def test_bind_source_policy_rejects_unreviewed_geoip_database(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2344,9 +3351,7 @@ def test_scheduler_rejects_legacy_nested_sofascore_artifact_path() -> None:
         admission.verify_rendered_compose(rendered, BINDINGS)
 
 
-@pytest.mark.parametrize(
-    "artifact_id", ("", "not-a-digest", "A" * 64, "0" * 64)
-)
+@pytest.mark.parametrize("artifact_id", ("", "not-a-digest", "A" * 64, "0" * 64))
 def test_scheduler_rejects_invalid_expected_sofascore_artifact_id(
     artifact_id: str,
 ) -> None:
@@ -2722,6 +3727,36 @@ def test_rendered_proxy_accepts_300m_decimal_daily_safety_cap() -> None:
     assert projection["whoscored_proxy_filter"]["command"] == tuple(command)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing-environment", "environment-drift", "command-drift"),
+)
+def test_rendered_proxy_requires_exact_provider_gross_cap_binding(
+    mutation: str,
+) -> None:
+    rendered = _rendered()
+    proxy = rendered["services"]["whoscored_proxy_filter"]
+    command = proxy["command"]
+    environment = proxy["environment"]
+    if mutation == "missing-environment":
+        environment.pop("WHOSCORED_PROVIDER_ORDER_CAP_BYTES")
+    elif mutation == "environment-drift":
+        environment["WHOSCORED_PROVIDER_ORDER_CAP_BYTES"] = "400000001"
+    else:
+        environment["WHOSCORED_PROVIDER_ORDER_CAP_BYTES"] = "400000000"
+        command[command.index("--whoscored-provider-order-cap-bytes") + 1] = "400000001"
+
+    with pytest.raises(
+        admission.AdmissionError,
+        match="environment names|order cap|provider-order-cap",
+    ):
+        admission.verify_rendered_compose(
+            rendered,
+            BINDINGS,
+            provider_order_cap_bytes=400_000_000,
+        )
+
+
 @pytest.mark.parametrize("value", ["300000001", "891289600"])
 def test_rendered_proxy_rejects_daily_budget_above_policy_ceiling(value: str) -> None:
     rendered = _rendered()
@@ -2731,10 +3766,16 @@ def test_rendered_proxy_rejects_daily_budget_above_policy_ceiling(value: str) ->
     assert isinstance(proxy, dict)
     command = proxy["command"]
     assert isinstance(command, list)
+    proxy["environment"]["WHOSCORED_PROVIDER_ORDER_CAP_BYTES"] = "300000000"
+    command[command.index("--whoscored-provider-order-cap-bytes") + 1] = "300000000"
     command[command.index("--daily-budget-bytes") + 1] = value
 
     with pytest.raises(admission.AdmissionError, match="daily-budget-bytes"):
-        admission.verify_rendered_compose(rendered, BINDINGS)
+        admission.verify_rendered_compose(
+            rendered,
+            BINDINGS,
+            provider_order_cap_bytes=300_000_000,
+        )
 
 
 @pytest.mark.parametrize("value", ["1", "999999999", "1000000000"])
@@ -2794,6 +3835,7 @@ def test_checked_in_compose_model_matches_admission_policy(tmp_path: Path) -> No
         "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID": "d" * 64,
         "SOFASCORE_PROXY_CONTROL_TOKEN": "b" * 64,
         "TRINO_PUBLIC_HOST": "trino.ci.invalid",
+        "WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY": "144000",
         "WHOSCORED_PROXY_APPROVAL_HOST_DIR": (
             "/var/lib/data-platform-football/whoscored-approvals"
         ),
@@ -2809,6 +3851,7 @@ def test_checked_in_compose_model_matches_admission_policy(tmp_path: Path) -> No
         "WHOSCORED_PROXY_APPROVAL_HMAC_SECRET": "a" * 32,
         "WHOSCORED_PROXY_LEDGER_HMAC_SECRET": "l" * 32,
         "WHOSCORED_PROXY_FILTER_CONTROL_TOKEN": "c" * 32,
+        "WHOSCORED_SOURCE_POOL_SLOTS": "4",
     }
     calls: list[tuple[str, ...]] = []
 
@@ -2848,7 +3891,26 @@ def test_checked_in_compose_model_matches_admission_policy(tmp_path: Path) -> No
     assert files[admission.COMMON_PROJECT][-1] == common_override
     assert files[admission.GATEWAY_PROJECT][-1] == gateway_override
     assert set(rendered) == {admission.COMMON_PROJECT, admission.GATEWAY_PROJECT}
-    assert len(calls) == 2 + len(admission.PROTECTED_SERVICES)
+
+    common_projections, common_hashes, common_files, common_rendered = (
+        admission.render_attested_common_project(
+            BINDINGS,
+            root=root,
+            common_override_path=common_override,
+            env_files=(root / ".env.example",),
+            runner=runner,
+        )
+    )
+    assert set(common_projections) == set(admission.COMMON_PROTECTED_SERVICES)
+    assert set(common_hashes) == set(admission.COMMON_PROTECTED_SERVICES)
+    assert common_files[-1] == common_override
+    assert (
+        common_rendered["networks"]["whoscored-paid-api"]
+        == (admission._COMMON_EXTERNAL_NETWORKS["whoscored-paid-api"])
+    )
+    assert len(calls) == 3 + len(admission.PROTECTED_SERVICES) + len(
+        admission.COMMON_PROTECTED_SERVICES
+    )
 
 
 @pytest.mark.parametrize(
@@ -2860,6 +3922,7 @@ def test_checked_in_compose_model_matches_admission_policy(tmp_path: Path) -> No
         ("common-dependency", "common-project service"),
         ("provider-order", "admitted provider policy"),
         ("provider-policy", "admitted provider policy"),
+        ("provider-cap", "admitted provider policy"),
         ("provider-budget", "admitted provider policy"),
     ),
 )
@@ -2953,6 +4016,10 @@ def test_split_render_rejects_legacy_single_project_controls(
         gateway["services"]["whoscored_proxy_filter"]["environment"][
             "WHOSCORED_PROVIDER_POLICY_SHA256"
         ] = "f" * 64
+    elif mutation == "provider-cap":
+        gateway["services"]["whoscored_proxy_filter"]["environment"][
+            "WHOSCORED_PROVIDER_ORDER_CAP_BYTES"
+        ] = "999999999"
     else:
         gateway["services"]["whoscored_proxy_filter"]["environment"][
             "WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES"
@@ -3263,8 +4330,7 @@ def _cutover_inventory_runner(
     mode: str,
     mutation: Callable[[dict[str, dict[str, Any]], dict[str, dict[str, Any]]], None]
     | None = None,
-    compose_network_mutation: Callable[[dict[str, dict[str, Any]]], None]
-    | None = None,
+    compose_network_mutation: Callable[[dict[str, dict[str, Any]]], None] | None = None,
 ) -> admission.DockerRunner:
     if mode not in {"scheduler-only-v1", "full-legacy-v1"}:
         raise AssertionError(mode)
@@ -3324,7 +4390,7 @@ def _cutover_inventory_runner(
                     ),
                     "com.docker.compose.service": service,
                     "com.docker.compose.version": "2.40.3",
-                }
+                },
             },
             "Id": service_ids[service],
             "Image": PAYLOADS[service],
@@ -3336,9 +4402,9 @@ def _cutover_inventory_runner(
                             next(
                                 logical_name
                                 for logical_name in admission._LEGACY_CUTOVER_ALL_NETWORKS
-                                if admission._EXPECTED_NETWORK_DEFINITIONS[logical_name][
-                                    "name"
-                                ]
+                                if admission._EXPECTED_NETWORK_DEFINITIONS[
+                                    logical_name
+                                ]["name"]
                                 == name
                             )
                         ]
@@ -3528,9 +4594,7 @@ def _cutover_inventory_runner(
                 == next(
                     container["Image"]
                     for container in containers.values()
-                    if container["Config"]["Labels"][
-                        "com.docker.compose.service"
-                    ]
+                    if container["Config"]["Labels"]["com.docker.compose.service"]
                     == service
                 )
             )
@@ -3799,9 +4863,7 @@ def test_cutover_inventory_rejects_partial_or_ambiguous_live_state(
                 if container["Config"]["Labels"]["com.docker.compose.service"]
                 == "airflow-scheduler"
             )
-            scheduler["NetworkSettings"]["Networks"][
-                "dp-whoscored-paid-browser"
-            ] = {}
+            scheduler["NetworkSettings"]["Networks"]["dp-whoscored-paid-browser"] = {}
         else:
             container_id = "c" * 64
             containers[container_id] = {
@@ -3815,9 +4877,7 @@ def test_cutover_inventory_rejects_partial_or_ambiguous_live_state(
                 },
                 "Id": container_id,
                 "Name": "/unexpected-stopped-member",
-                "NetworkSettings": {
-                    "Networks": {"dp-whoscored-paid-api": {}}
-                },
+                "NetworkSettings": {"Networks": {"dp-whoscored-paid-api": {}}},
                 "State": {"Running": False},
             }
 
@@ -3869,9 +4929,7 @@ def test_cutover_inventory_ignores_same_service_in_isolated_project() -> None:
         }
 
     report = admission.verify_cutover_inventory(
-        runner=_cutover_inventory_runner(
-            "scheduler-only-v1", add_isolated_scheduler
-        ),
+        runner=_cutover_inventory_runner("scheduler-only-v1", add_isolated_scheduler),
         input_reader=_cutover_input_reader,
         directory_reader=_cutover_directory_reader,
     )
@@ -3958,15 +5016,11 @@ def test_cutover_inventory_rejects_mismatched_endpoint_network_id() -> None:
             if container["Config"]["Labels"]["com.docker.compose.service"]
             == "airflow-scheduler"
         )
-        scheduler["NetworkSettings"]["Networks"]["dp-backend"]["NetworkID"] = (
-            "f" * 64
-        )
+        scheduler["NetworkSettings"]["Networks"]["dp-backend"]["NetworkID"] = "f" * 64
 
     with pytest.raises(admission.AdmissionError, match="endpoint identity differs"):
         admission.verify_cutover_inventory(
-            runner=_cutover_inventory_runner(
-                "scheduler-only-v1", mismatch_endpoint
-            ),
+            runner=_cutover_inventory_runner("scheduler-only-v1", mismatch_endpoint),
             input_reader=_cutover_input_reader,
             directory_reader=_cutover_directory_reader,
         )
@@ -3999,9 +5053,7 @@ def test_cutover_inventory_cross_checks_retained_network_endpoints(
             scheduler["State"].update({"Running": False, "Status": "exited"})
             scheduler["State"].pop("Health")
         else:
-            networks["backend"]["Containers"]["not-an-id"] = {
-                "Name": "unrelated"
-            }
+            networks["backend"]["Containers"]["not-an-id"] = {"Name": "unrelated"}
 
     with pytest.raises(admission.AdmissionError, match=message):
         admission.verify_cutover_inventory(
@@ -4101,9 +5153,7 @@ def test_cutover_quiescence_is_cross_source_and_ignores_only_stale_jobs() -> Non
         }
     ]
     with pytest.raises(admission.AdmissionError, match="not quiescent"):
-        admission.verify_cutover_quiescence(
-            runner=_cutover_postgres_runner(fresh)
-        )
+        admission.verify_cutover_quiescence(runner=_cutover_postgres_runner(fresh))
 
 
 def test_cutover_quiescence_blocks_current_fbref_work() -> None:
@@ -4123,9 +5173,7 @@ def test_cutover_quiescence_blocks_current_fbref_work() -> None:
         admission.AdmissionError,
         match="active_dag_runs=1, active_fbref_crawl_runs=1",
     ):
-        admission.verify_cutover_quiescence(
-            runner=_cutover_postgres_runner(snapshot)
-        )
+        admission.verify_cutover_quiescence(runner=_cutover_postgres_runner(snapshot))
 
 
 def test_cutover_dag_pause_snapshot_preserves_every_boolean() -> None:
@@ -4159,6 +5207,7 @@ def test_create_vacancy_then_capture_binds_created_id_and_gateway_networks() -> 
             admission._CREATE_CAPTURE_GATEWAY_NETWORKS[service]
         )
     }
+
     def vacancy_runner(_arguments: Sequence[str]) -> bytes:
         return b""
 
@@ -4227,7 +5276,9 @@ def test_create_vacancy_then_capture_binds_created_id_and_gateway_networks() -> 
     ]
 
 
-def test_failed_create_capture_allows_exact_partial_networks_without_container() -> None:
+def test_failed_create_capture_allows_exact_partial_networks_without_container() -> (
+    None
+):
     service = "whoscored_paid_gateway"
     network_id = "7" * 64
     network_name = "dp-whoscored-paid-api"
@@ -4293,9 +5344,7 @@ def test_rollback_bundle_is_repeatable_and_contains_no_secret_values() -> None:
         if record["service"] == "airflow-scheduler"
     )
     assert scheduler["compose"]["profiles"] == []
-    assert scheduler["compose"]["config_files"][-1] == (
-        "/evidence/digest-only.yaml"
-    )
+    assert scheduler["compose"]["config_files"][-1] == ("/evidence/digest-only.yaml")
     flaresolverr = next(
         record
         for record in inventory["rollback"]["services"]
@@ -4327,7 +5376,9 @@ def test_cutover_inventory_rejects_rollback_network_policy_drift(
     def mutate(networks: dict[str, dict[str, Any]]) -> None:
         networks["whoscored-paid-api"][field] = value
 
-    with pytest.raises(admission.AdmissionError, match="rollback network model differs"):
+    with pytest.raises(
+        admission.AdmissionError, match="rollback network model differs"
+    ):
         admission.verify_cutover_inventory(
             runner=_cutover_inventory_runner(
                 "scheduler-only-v1",
@@ -4352,7 +5403,9 @@ def test_rollback_bundle_rejects_changed_engine29_input() -> None:
             record["sha256"] = "f" * 64
         return record
 
-    with pytest.raises(admission.AdmissionError, match="changed after cutover admission"):
+    with pytest.raises(
+        admission.AdmissionError, match="changed after cutover admission"
+    ):
         admission.verify_rollback_bundle(
             inventory,
             runner=runner,
@@ -4389,7 +5442,9 @@ def test_rollback_bundle_rejects_changed_retained_network_id() -> None:
         )
 
 
-def test_rollback_bundle_post_cleanup_accepts_exact_present_or_absent_core_ids() -> None:
+def test_rollback_bundle_post_cleanup_accepts_exact_present_or_absent_core_ids() -> (
+    None
+):
     runner = _cutover_inventory_runner("scheduler-only-v1")
     inventory = admission.verify_cutover_inventory(
         runner=runner,
@@ -4399,10 +5454,11 @@ def test_rollback_bundle_post_cleanup_accepts_exact_present_or_absent_core_ids()
 
     def post_cleanup_runner(arguments: Sequence[str]) -> bytes:
         raw = runner(arguments)
-        if (
-            list(arguments[:2]) == ["network", "inspect"]
-            and arguments[2] in {"dp-backend", "dp-frontend", "dp-storage"}
-        ):
+        if list(arguments[:2]) == ["network", "inspect"] and arguments[2] in {
+            "dp-backend",
+            "dp-frontend",
+            "dp-storage",
+        }:
             inspected = json.loads(raw)
             inspected[0]["Containers"] = {}
             return json.dumps(inspected).encode()
@@ -4425,10 +5481,11 @@ def test_rollback_bundle_post_cleanup_accepts_exact_present_or_absent_core_ids()
 
     def scheduler_removed_runner(arguments: Sequence[str]) -> bytes:
         raw = runner(arguments)
-        if (
-            list(arguments[:2]) == ["network", "inspect"]
-            and arguments[2] in {"dp-backend", "dp-frontend", "dp-storage"}
-        ):
+        if list(arguments[:2]) == ["network", "inspect"] and arguments[2] in {
+            "dp-backend",
+            "dp-frontend",
+            "dp-storage",
+        }:
             inspected = json.loads(raw)
             inspected[0]["Containers"] = {
                 container_id: endpoint
@@ -4522,9 +5579,9 @@ def test_cutover_inventory_rejects_control_characters_in_rollback_paths() -> Non
             if container["Config"]["Labels"]["com.docker.compose.service"]
             == "airflow-scheduler"
         )
-        scheduler["Config"]["Labels"][
-            "com.docker.compose.project.config_files"
-        ] += "\n/tmp/override.yaml"
+        scheduler["Config"]["Labels"]["com.docker.compose.project.config_files"] += (
+            "\n/tmp/override.yaml"
+        )
 
     with pytest.raises(admission.AdmissionError, match="config-file list is invalid"):
         admission.verify_cutover_inventory(
@@ -4556,6 +5613,78 @@ def test_post_create_verifies_container_and_digest_selected_image_identity() -> 
     assert [record["service"] for record in report["images"]] == list(
         admission.PROTECTED_SERVICES
     )
+
+
+def test_common_post_create_one_service_requires_gateway_owned_external_network() -> (
+    None
+):
+    rendered = _rendered()
+    common_network_names = {
+        name
+        for service in admission.COMMON_PROTECTED_SERVICES
+        for name in admission._EXPECTED_NETWORKS[service]
+    }
+    common = {
+        "services": {
+            service: rendered["services"][service]
+            for service in admission.COMMON_PROTECTED_SERVICES
+        },
+        "networks": {
+            name: admission._EXPECTED_NETWORK_DEFINITIONS[name]
+            for name in common_network_names
+        },
+        "volumes": rendered["volumes"],
+    }
+    projections = admission.verify_rendered_compose(
+        common,
+        BINDINGS,
+        selected_services=admission.COMMON_PROTECTED_SERVICES,
+    )
+    base_runner = _docker_runner()
+
+    def canonical_network_runner(arguments: Sequence[str]) -> bytes:
+        raw = base_runner(arguments)
+        args = tuple(arguments)
+        if args[:2] != ("network", "inspect"):
+            return raw
+        value = json.loads(raw)
+        network = value[0]
+        logical_name = network["Labels"]["com.docker.compose.network"]
+        network["Labels"]["com.docker.compose.project"] = admission._NETWORK_PROJECT[
+            logical_name
+        ]
+        return json.dumps(value).encode()
+
+    report = admission.verify_created_containers(
+        BINDINGS,
+        project=admission.COMMON_PROJECT,
+        selected_services=("airflow-scheduler",),
+        projections=projections,
+        config_hashes={
+            service: CONFIG_HASHES[service]
+            for service in admission.COMMON_PROTECTED_SERVICES
+        },
+        config_files=CONFIG_FILES,
+        env_files=ENV_FILES,
+        runner=canonical_network_runner,
+    )
+
+    assert [record["service"] for record in report["images"]] == ["airflow-scheduler"]
+
+    with pytest.raises(admission.AdmissionError, match="network identity"):
+        admission.verify_created_containers(
+            BINDINGS,
+            project=admission.COMMON_PROJECT,
+            selected_services=("airflow-scheduler",),
+            projections=projections,
+            config_hashes={
+                service: CONFIG_HASHES[service]
+                for service in admission.COMMON_PROTECTED_SERVICES
+            },
+            config_files=CONFIG_FILES,
+            env_files=ENV_FILES,
+            runner=base_runner,
+        )
 
 
 def test_engine_29_default_memory_swap_normalization_is_pinned() -> None:
