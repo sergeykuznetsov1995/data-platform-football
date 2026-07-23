@@ -945,14 +945,8 @@ class SofascoreLeaseClient:
         }
 
 
-# Conventional spelling for new callers; keep the name communicated to the
-# capture integration agent as an alias.
-SofaScoreLeaseClient = SofascoreLeaseClient
-
-
 __all__ = [
     "DiscoveryLeaseTraffic",
-    "SofaScoreLeaseClient",
     "SofascoreLeaseClient",
     "SofascoreLeaseError",
     "SofascoreLeaseProtocolError",
