@@ -54,6 +54,21 @@ def _context(run_id="scheduled__2026-07-11T10:00:00+00:00"):
     }
 
 
+def _bootstrap_slots():
+    first = datetime(2026, 7, 16, 10, tzinfo=timezone.utc)
+    waves = ("wave-20", "wave-20", "wave-70", "wave-70", "wave-all", "wave-all")
+    return [
+        {
+            "logical_date": (first + timedelta(days=index))
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "run_id": f"scheduled__{(first + timedelta(days=index)).isoformat()}",
+            "wave_id": wave_id,
+        }
+        for index, wave_id in enumerate(waves)
+    ]
+
+
 def _catalog_identity(*, batch_id="wsc2-test-generation", payload_sha256="a" * 64):
     return {
         "schema_version": 1,
@@ -336,7 +351,7 @@ def test_daily_scope_plan_binds_exact_catalog_snapshot(monkeypatch):
 
 
 @pytest.mark.unit
-def test_paid_scope_plan_preserves_heavy_order_and_binds_full_catalog(monkeypatch):
+def test_paid_scope_plan_binds_catalog_and_requires_replan_after_advance(monkeypatch):
     mod = _load_dag_module()
     from dags.scripts import run_whoscored_scraper as runner
     from scrapers.whoscored.proxy_campaign import (
@@ -435,6 +450,10 @@ def test_paid_scope_plan_preserves_heavy_order_and_binds_full_catalog(monkeypatc
         classifier_sha256="7" * 64,
         promotion_acceptance_sha256="8" * 64,
         promotion_terminal_receipt_sha256="9" * 64,
+        acceptance_mode="accelerated-bootstrap-v1",
+        bootstrap_slots=tuple(_bootstrap_slots()),
+        capacity_receipt_sha256="a" * 64,
+        provider_order_cap_bytes=300_000_000,
         workload_sha256=hashlib.sha256(
             canonical_json_bytes([item.to_dict() for item in workloads])
         ).hexdigest(),
@@ -497,6 +516,92 @@ def test_paid_scope_plan_preserves_heavy_order_and_binds_full_catalog(monkeypatc
         mod.freeze_daily_scope_plan(
             validated_catalog={"status": "success", "catalog_identity": identity}
         )
+    authority.catalog_active_scopes_sha256 = catalog_scopes_sha256
+
+    next_rows = {
+        "competitions": [{"competition_id": "catalog-advanced"}],
+        "seasons": [],
+        "stages": [],
+    }
+    next_payload_sha256 = catalog_payload_sha256(next_rows)
+    next_identity = _catalog_identity(
+        batch_id="wsc2-next-candidate",
+        payload_sha256=next_payload_sha256,
+    )
+    next_identity.update(
+        {
+            "parent_catalog_batch_id": identity["catalog_batch_id"],
+            "parent_catalog_payload_sha256": identity["catalog_payload_sha256"],
+            "parent_catalog_raw_provenance_sha256": identity[
+                "catalog_raw_provenance_sha256"
+            ],
+        }
+    )
+    next_catalog = SimpleNamespace(to_rows=lambda: next_rows)
+    next_repository = SimpleNamespace(
+        load_catalog_generation_snapshot=lambda *, batch_id: (
+            (
+                {
+                    key: value
+                    for key, value in next_identity.items()
+                    if key != "schema_version"
+                },
+                next_catalog,
+            )
+            if batch_id == "wsc2-next-candidate"
+            else pytest.fail("stale plan loaded the wrong candidate generation")
+        )
+    )
+    monkeypatch.setattr(runner, "_new_repository", lambda: next_repository)
+    monkeypatch.setattr(
+        runner,
+        "_select_catalog_snapshot_scopes",
+        lambda value, requested, *, active_only: (
+            selected
+            if value is next_catalog and not requested and active_only
+            else pytest.fail("replan used the wrong active catalog selection")
+        ),
+    )
+
+    with pytest.raises(
+        mod.AirflowException,
+        match="signed paid scope plan differs from the candidate catalog parent",
+    ):
+        mod.freeze_daily_scope_plan(
+            validated_catalog={
+                "status": "success",
+                "catalog_identity": next_identity,
+            }
+        )
+
+    replanned_authority = SimpleNamespace(**vars(authority))
+    replanned_authority.catalog_batch_id = identity["catalog_batch_id"]
+    replanned_authority.catalog_payload_sha256 = identity[
+        "catalog_payload_sha256"
+    ]
+    monkeypatch.setattr(
+        mod,
+        "_transport_runtime",
+        lambda _context: SimpleNamespace(
+            is_paid=True,
+            approval=SimpleNamespace(scheduled_authority=replanned_authority),
+        ),
+    )
+
+    replanned = mod.freeze_daily_scope_plan(
+        validated_catalog={
+            "status": "success",
+            "catalog_identity": next_identity,
+        }
+    )
+
+    assert replanned["catalog_batch_id"] == "wsc2-next-candidate"
+    assert replanned["catalog_payload_sha256"] == next_payload_sha256
+    assert replanned["parent_catalog_batch_id"] == "wsc2-candidate"
+    assert mod._daily_scope_plan_specs(replanned) == (
+        "wsc2-next-candidate",
+        ["B=2526", "C=2526", "A=2526"],
+    )
 
 
 @pytest.mark.unit
@@ -1219,10 +1324,25 @@ def test_daily_slo_history_includes_failed_elapsed_and_excludes_bootstrap(
 
     class DagRun:
         dag_id = run_id = run_type = external_trigger = conf = Column()
-        state = start_date = end_date = Column()
+        state = logical_date = execution_date = start_date = end_date = Column()
 
-    bootstrap = datetime(2026, 7, 1, 10)
-    failed_start = datetime(2026, 7, 2, 10)
+    class XCom:
+        dag_id = run_id = task_id = key = map_index = Column()
+
+        @staticmethod
+        def deserialize_value(row):
+            return row.value
+
+    bootstrap = datetime(2026, 7, 16, 10, tzinfo=timezone.utc)
+    failed_start = datetime(2026, 7, 22, 10, tzinfo=timezone.utc)
+    bootstrap_run_id = "scheduled__2026-07-16T10:00:00+00:00"
+    bootstrap_plan = {
+        "acceptance_mode": "accelerated-bootstrap-v1",
+        "bootstrap_slots": _bootstrap_slots(),
+        "capacity_receipt_sha256": "a" * 64,
+        "provider_order_cap_bytes": 300_000_000,
+        "wave_id": "wave-20",
+    }
 
     class Query:
         def __init__(self, result):
@@ -1246,37 +1366,42 @@ def test_daily_slo_history_includes_failed_elapsed_and_excludes_bootstrap(
         def query(self, *_args):
             self.calls += 1
             if self.calls == 1:
-                return Query([("scheduled__bootstrap", "scheduled", False, {})])
+                return Query(
+                    [
+                        (
+                            "scheduled__manual-spoof",
+                            "manual",
+                            True,
+                            {},
+                            "success",
+                            failed_start,
+                            failed_start,
+                            failed_start + timedelta(seconds=1),
+                        ),
+                        (
+                            "scheduled__failed",
+                            "scheduled",
+                            False,
+                            {},
+                            "failed",
+                            failed_start,
+                            failed_start,
+                            failed_start + timedelta(minutes=12),
+                        ),
+                        (
+                            bootstrap_run_id,
+                            "scheduled",
+                            False,
+                            {},
+                            "success",
+                            bootstrap,
+                            bootstrap,
+                            bootstrap + timedelta(hours=5, minutes=30),
+                        ),
+                    ]
+                )
             return Query(
-                [
-                    (
-                        "scheduled__manual-spoof",
-                        "manual",
-                        True,
-                        {},
-                        "success",
-                        failed_start,
-                        failed_start + timedelta(seconds=1),
-                    ),
-                    (
-                        "scheduled__failed",
-                        "scheduled",
-                        False,
-                        {},
-                        "failed",
-                        failed_start,
-                        failed_start + timedelta(minutes=12),
-                    ),
-                    (
-                        "scheduled__bootstrap",
-                        "scheduled",
-                        False,
-                        {},
-                        "success",
-                        bootstrap,
-                        bootstrap + timedelta(hours=5, minutes=30),
-                    ),
-                ]
+                [SimpleNamespace(run_id=bootstrap_run_id, value=bootstrap_plan)]
             )
 
     class SessionContext:
@@ -1288,9 +1413,12 @@ def test_daily_slo_history_includes_failed_elapsed_and_excludes_bootstrap(
 
     dagrun_module = types.ModuleType("airflow.models.dagrun")
     dagrun_module.DagRun = DagRun
+    xcom_module = types.ModuleType("airflow.models.xcom")
+    xcom_module.XCom = XCom
     session_module = types.ModuleType("airflow.utils.session")
     session_module.create_session = SessionContext
     monkeypatch.setitem(sys.modules, "airflow.models.dagrun", dagrun_module)
+    monkeypatch.setitem(sys.modules, "airflow.models.xcom", xcom_module)
     monkeypatch.setitem(sys.modules, "airflow.utils.session", session_module)
 
     assert mod._scheduled_daily_durations_hours() == pytest.approx([0.2])
@@ -4049,7 +4177,7 @@ def test_terminal_gate_does_not_count_manual_rollout_run():
 
 
 @pytest.mark.unit
-def test_rollout_receipt_is_persisted_only_after_dag_success(monkeypatch):
+def test_terminal_task_persists_receipt_with_control_task_excluded(monkeypatch):
     mod = _load_dag_module()
     from dags.scripts import whoscored_ops_store, whoscored_rollout_acceptance
 
@@ -4060,13 +4188,18 @@ def test_rollout_receipt_is_persisted_only_after_dag_success(monkeypatch):
         ),
         SimpleNamespace(task_id="validate_active_scope", map_index=0, state="success"),
         SimpleNamespace(task_id="final_success_gate", map_index=-1, state="success"),
+        SimpleNamespace(
+            task_id="seal_rollout_acceptance_and_pause",
+            map_index=-1,
+            state="running",
+        ),
     ]
     dag_run = SimpleNamespace(
         run_id=f"scheduled__{logical_date.isoformat()}",
         run_type="scheduled",
         external_trigger=False,
         conf={},
-        state="success",
+        state="running",
         get_task_instances=lambda: instances,
     )
     store = object()
@@ -4100,21 +4233,23 @@ def test_rollout_receipt_is_persisted_only_after_dag_success(monkeypatch):
         "validate_active_scope": [{"scope": "scope-1"}],
         "validate_profile_refresh": {"status": "success"},
         "report_whoscored_traffic": {"schema_version": 1},
-        "validate_whoscored_daily_slo": {"status": "success"},
+        "validate_whoscored_daily_slo": {
+            "contract": "bootstrap-slo-v1",
+            "status": "success",
+        },
         "validate_whoscored_paid_alert_delivery": {"status": "delivered"},
     }
     ti = SimpleNamespace(
-        task_id="final_success_gate",
+        task_id="seal_rollout_acceptance_and_pause",
         xcom_pull=lambda *, task_ids: xcom[task_ids],
     )
 
-    result = mod._record_rollout_acceptance_after_dag_success(
-        {
-            "dag_run": dag_run,
-            "ti": ti,
-            "run_id": dag_run.run_id,
-            "logical_date": logical_date,
-        }
+    result = mod._record_rollout_acceptance_at_terminal_task(
+        scope_plan=xcom["freeze_daily_scope_plan"],
+        dag_run=dag_run,
+        ti=ti,
+        run_id=dag_run.run_id,
+        logical_date=logical_date,
     )
 
     assert result["status"] == "accepted"
@@ -4135,13 +4270,17 @@ def test_rollout_receipt_is_persisted_only_after_dag_success(monkeypatch):
 
 
 @pytest.mark.unit
-def test_rollout_success_callback_rejects_nonterminal_dagrun():
+def test_rollout_terminal_seal_rejects_nonrunning_dagrun():
     mod = _load_dag_module()
     dag_run = SimpleNamespace(state="failed")
     ti = SimpleNamespace(xcom_pull=lambda **_kwargs: pytest.fail("must not read XCom"))
 
-    with pytest.raises(mod.AirflowException, match="terminal-success DagRun"):
-        mod._record_rollout_acceptance_after_dag_success({"dag_run": dag_run, "ti": ti})
+    with pytest.raises(mod.AirflowException, match="running terminal TaskInstance"):
+        mod._record_rollout_acceptance_at_terminal_task(
+            scope_plan={"rollout_id": "rollout-954"},
+            dag_run=dag_run,
+            ti=ti,
+        )
 
 
 @pytest.mark.unit
@@ -4152,10 +4291,7 @@ def test_dag_uses_workflow_commands_durable_reports_and_bounded_tasks():
     by_id = {task.task_id: task for task in BashOperator._instances}
     assert mod.dag._dag_kwargs["dagrun_timeout"].total_seconds() == 6 * 3600
     assert mod.dag._dag_kwargs["is_paused_upon_creation"] is True
-    assert (
-        mod.dag._dag_kwargs["on_success_callback"]
-        is mod.record_rollout_acceptance_on_success
-    )
+    assert "on_success_callback" not in mod.dag._dag_kwargs
     from airflow.operators.python import PythonOperator
 
     slo = next(
@@ -4199,6 +4335,23 @@ def test_dag_uses_workflow_commands_durable_reports_and_bounded_tasks():
         "daily_slo": "validate_whoscored_daily_slo",
         "alert_preflight": "validate_whoscored_paid_alert_delivery",
     }
+    terminal_seal = next(
+        task
+        for task in PythonOperator._instances
+        if task.task_id == "seal_rollout_acceptance_and_pause"
+    )
+    assert terminal_seal.python_callable is mod.seal_rollout_acceptance_and_pause
+    assert terminal_seal._init_kwargs["retries"] == 0
+    assert terminal_seal.upstream_task_ids == {"final_success_gate"}
+    assert terminal_seal.downstream_task_ids == set()
+    all_tasks = [*PythonOperator._instances, *BashOperator._instances]
+    assert {
+        task.task_id for task in all_tasks if not task.downstream_task_ids
+    } == {"seal_rollout_acceptance_and_pause"}
+    assert (
+        terminal_seal._init_kwargs["op_kwargs"]["scope_plan"].operator.task_id
+        == "freeze_daily_scope_plan"
+    )
     for builder_task_id in (
         "build_whoscored_discovery_command",
         "build_active_scope_commands",

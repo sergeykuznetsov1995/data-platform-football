@@ -11,6 +11,7 @@ from scrapers.whoscored.proxy_campaign import (
     ProxyCampaignApproval,
     ProxyCampaignLedger,
     ProxyCampaignRevoked,
+    ProxyCampaignValidationError,
 )
 from scripts import whoscored_proxy_campaign as cli
 
@@ -234,6 +235,38 @@ def test_approval_and_ledger_defaults_never_use_control_token(monkeypatch):
 
 
 @pytest.mark.unit
+def test_bootstrap_parser_rejects_conflicting_secret_sources():
+    parser = cli.build_parser()
+    required = [
+        "issue-bootstrap-ingest",
+        "--run-id",
+        "scheduled__2026-07-01T10:00:00+00:00",
+        "--plan-file",
+        "plan.json",
+        "--rollout-file",
+        "rollout.json",
+        "--provider-policy",
+        "policy.json",
+        "--charter",
+        "charter.json",
+        "--runtime-sha256",
+        "a" * 64,
+        "--classifier-sha256",
+        "b" * 64,
+    ]
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                *required,
+                "--secret-file",
+                "approval.secret",
+                "--secret-env",
+                "APPROVAL_SECRET",
+            ]
+        )
+
+
+@pytest.mark.unit
 def test_atomic_outputs_refuse_overwrite_without_force(tmp_path):
     path = tmp_path / "template.json"
     cli.main(_template_args(path))
@@ -400,8 +433,9 @@ def _rollout(
         _scope_workload_value(scope, 100 - index)
         for index, scope in enumerate(ranked_ids)
     ]
+    bootstrap_slots = cli._bootstrap_slots_from_start("2026-07-16T10:00:00Z")
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "cohort_id": "smoke-prefix",
         "rollout_id": "production-rollout-2026-07",
         "wave_id": wave_id,
@@ -425,6 +459,10 @@ def _rollout(
             if wave_id == "wave-20"
             else "e" * 64
         ),
+        "acceptance_mode": cli.WHOSCORED_ACCELERATED_BOOTSTRAP_ACCEPTANCE_MODE,
+        "bootstrap_slots": bootstrap_slots,
+        "capacity_receipt_sha256": "6" * 64,
+        "provider_order_cap_bytes": 1_000_000_000,
     }
 
 
@@ -548,7 +586,6 @@ def _promotion_receipt_files(
         for path in prior_receipt_files
     ]
     previous = None
-    day = 1
     if records:
         last_receipt = sorted(records, key=lambda item: item[1]["logical_date"])[-1][1]
         last_logical = datetime.fromisoformat(
@@ -559,7 +596,6 @@ def _promotion_receipt_files(
             "state": "success",
             "logical_date": last_logical,
         }
-        day = last_logical.day + 1
     first_wave_index = len(records) // 2
     for wave_id in acceptance.WAVE_ORDER[first_wave_index : source_index + 1]:
         maximum = acceptance.WAVE_LIMITS[wave_id]
@@ -603,11 +639,21 @@ def _promotion_receipt_files(
                 if wave_id == "wave-20"
                 else source_rollout["promotion_terminal_receipt_sha256"]
             ),
+            "acceptance_mode": source_rollout["acceptance_mode"],
+            "bootstrap_slots": source_rollout["bootstrap_slots"],
+            "capacity_receipt_sha256": source_rollout["capacity_receipt_sha256"],
+            "provider_order_cap_bytes": source_rollout["provider_order_cap_bytes"],
         }
         attempt_count = source_wave_attempts if wave_id == source_wave else 2
         for _attempt in range(attempt_count):
-            logical_date = datetime(2026, 7, day, 10, tzinfo=timezone.utc)
-            run_id = f"scheduled__{logical_date.isoformat()}"
+            slot_index = len(records)
+            if slot_index >= len(source_rollout["bootstrap_slots"]):
+                raise ValueError("test fixture exhausted exact bootstrap slots")
+            slot = source_rollout["bootstrap_slots"][slot_index]
+            logical_date = datetime.fromisoformat(
+                slot["logical_date"].replace("Z", "+00:00")
+            )
+            run_id = slot["run_id"]
             receipt = acceptance.build_success_receipt(
                 run_id=run_id,
                 logical_date=logical_date,
@@ -629,7 +675,23 @@ def _promotion_receipt_files(
                     "artifact_sha256": "c" * 64,
                     "artifact_bytes": 42,
                 },
-                daily_slo={"status": "success", "p95_hours": 2.0, "samples": 20},
+                daily_slo={
+                    "schema_version": 1,
+                    "contract": "bootstrap-slo-v1",
+                    "capacity_contract": "cache-capacity-v1",
+                    "status": "success",
+                    "acceptance_mode": source_rollout["acceptance_mode"],
+                    "slot_index": slot_index,
+                    "run_id": run_id,
+                    "logical_date": slot["logical_date"],
+                    "wave_id": slot["wave_id"],
+                    "elapsed_seconds": 7_200,
+                    "limit_seconds": acceptance.BOOTSTRAP_LIMIT_SECONDS,
+                    "capacity_receipt_sha256": source_rollout[
+                        "capacity_receipt_sha256"
+                    ],
+                    "runtime_sha256": source_rollout["runtime_sha256"],
+                },
                 alert_preflight={
                     "status": "delivered",
                     "campaign_id": "campaign-954",
@@ -666,7 +728,6 @@ def _promotion_receipt_files(
                 "state": "success",
                 "logical_date": logical_date,
             }
-            day += 1
     paths = []
     for key, receipt in records:
         path = _private_json(tmp_path / Path(key).name, receipt)
@@ -841,22 +902,17 @@ def test_rollout_promotion_preserves_frozen_ranking_across_adjacent_waves(
 
 
 @pytest.mark.unit
-def test_rollout_promotion_uses_latest_two_of_three_consecutive_successes(tmp_path):
+def test_rollout_promotion_uses_exact_two_signed_wave_slots(tmp_path):
     from types import SimpleNamespace
 
     source_path = _rollout_file(tmp_path)
     source = cli._read_rollout(source_path)
-    all_receipts = _promotion_receipt_files(
-        tmp_path,
-        source,
-        source_wave_attempts=3,
-    )
-    latest_pair = all_receipts[-2:]
-    second = json.loads(Path(latest_pair[0]).read_text())
-    third = json.loads(Path(latest_pair[1]).read_text())
+    exact_pair = _promotion_receipt_files(tmp_path, source)
+    first = json.loads(Path(exact_pair[0]).read_text())
+    second = json.loads(Path(exact_pair[1]).read_text())
+    assert first["wave_accepted"] is False
     assert second["wave_accepted"] is True
-    assert third["wave_accepted"] is True
-    assert third["previous_run_receipt_sha256"] == Path(latest_pair[0]).stem
+    assert second["previous_run_receipt_sha256"] == Path(exact_pair[0]).stem
 
     promoted_path = tmp_path / "rollout-wave-70-from-latest-pair.json"
     cli.command_promote_rollout(
@@ -864,16 +920,14 @@ def test_rollout_promotion_uses_latest_two_of_three_consecutive_successes(tmp_pa
             input=str(source_path),
             cohort_id="wave-70-latest-pair",
             wave_id="wave-70",
-            acceptance_receipt=latest_pair,
+            acceptance_receipt=exact_pair,
             output=str(promoted_path),
             force=False,
         )
     )
 
     promoted = cli._read_rollout(promoted_path)
-    assert promoted["promotion_terminal_receipt_sha256"] == Path(
-        latest_pair[1]
-    ).stem
+    assert promoted["promotion_terminal_receipt_sha256"] == Path(exact_pair[1]).stem
 
 
 @pytest.mark.unit
@@ -1056,6 +1110,9 @@ def test_rollout_creation_freezes_heavy_order_while_daily_demand_refreshes(
             wave_id="wave-20",
             runtime_sha256="a" * 64,
             classifier_sha256="b" * 64,
+            capacity_receipt_sha256="6" * 64,
+            provider_order_cap_bytes=1_000_000_000,
+            bootstrap_start_logical_date="2026-07-14T10:00:00Z",
             output=str(rollout),
             force=False,
         )
@@ -1101,6 +1158,27 @@ def test_rollout_creation_rejects_non_initial_waves(wave_id):
                 rollout_id="production-rollout-2026-07",
                 cohort_id=f"{wave_id}-cohort",
                 wave_id=wave_id,
+                output="unused.json",
+                force=False,
+            )
+        )
+
+
+@pytest.mark.unit
+def test_rollout_creation_rejects_bootstrap_slots_not_all_backdated():
+    from types import SimpleNamespace
+
+    with pytest.raises(cli.CampaignCliError, match="all six.*backdated"):
+        cli.command_create_rollout(
+            SimpleNamespace(
+                rollout_id="production-rollout-2026-07",
+                cohort_id="wave-20-cohort",
+                wave_id="wave-20",
+                runtime_sha256="a" * 64,
+                classifier_sha256="b" * 64,
+                capacity_receipt_sha256="6" * 64,
+                provider_order_cap_bytes=1_000_000_000,
+                bootstrap_start_logical_date="2999-01-01T10:00:00Z",
                 output="unused.json",
                 force=False,
             )
@@ -1172,7 +1250,7 @@ def test_daily_planner_counts_schedule_months_and_player_pagination(
 
     plan = cli._read_daily_plan(output)
     workload = plan["scope_workloads"][0]
-    assert plan["schema_version"] == 3
+    assert plan["schema_version"] == 4
     assert plan["max_scopes"] == 20
     # season page + calendar + 3 month pages + all 68 first-page feeds
     assert workload["schedule_target_limit"] == 1 + 1 + 3 + 68
@@ -1300,7 +1378,7 @@ def _plan(
     path = _private_json(
         tmp_path / "plan.json",
         {
-            "schema_version": 3,
+            "schema_version": 4,
             "cohort_id": "smoke-prefix",
             "cohort_sha256": cohort_sha,
             "rollout_id": rollout_value["rollout_id"],
@@ -1337,6 +1415,10 @@ def _plan(
             ),
             "profile_target_count": profile_target_count,
             "profile_targets_sha256": "e" * 64,
+            "acceptance_mode": rollout_value["acceptance_mode"],
+            "bootstrap_slots": rollout_value["bootstrap_slots"],
+            "capacity_receipt_sha256": rollout_value["capacity_receipt_sha256"],
+            "provider_order_cap_bytes": rollout_value["provider_order_cap_bytes"],
         },
     )
     path.chmod(0o440)
@@ -1363,10 +1445,10 @@ def _policy(
         "valid_until": (valid_until or now + timedelta(days=max(days, 1))).isoformat(),
         "receipt_sha256": "d" * 64,
         "provider_quota_bytes": 1_000_000_000,
-        "safety_cap_bytes": 300_000_000,
+        "safety_cap_bytes": 1_000_000_000,
         "daily_cap_bytes": daily_bytes,
-        "monthly_cap_bytes": 300_000_000,
-        "order_cap_bytes": 300_000_000,
+        "monthly_cap_bytes": 950_000_000,
+        "order_cap_bytes": 1_000_000_000,
         "signature_algorithm": "hmac-sha256",
     }
     signed = cli._sign_authority_document(
@@ -1394,7 +1476,7 @@ def _charter(
     rollout_value = rollout or _rollout()
     cohort_sha = _hashlib.sha256(cli.canonical_json_bytes(rollout_value)).hexdigest()
     unsigned = {
-        "schema_version": 4,
+        "schema_version": 5,
         "source": "whoscored",
         "provider_policy_sha256": policy["document_sha256"],
         "order_id": policy["order_id"],
@@ -1412,12 +1494,16 @@ def _charter(
         "promotion_terminal_receipt_sha256": rollout_value[
             "promotion_terminal_receipt_sha256"
         ],
+        "acceptance_mode": rollout_value["acceptance_mode"],
+        "bootstrap_slots": rollout_value["bootstrap_slots"],
+        "capacity_receipt_sha256": rollout_value["capacity_receipt_sha256"],
+        "provider_order_cap_bytes": rollout_value["provider_order_cap_bytes"],
         "valid_from": (valid_from or now - timedelta(minutes=5)).isoformat(),
         "valid_until": (valid_until or now + timedelta(days=days)).isoformat(),
         "daily_cap_bytes": daily_bytes,
-        "monthly_cap_bytes": 300_000_000,
-        "order_cap_bytes": 300_000_000,
-        "max_issuances": 2,
+        "monthly_cap_bytes": 950_000_000,
+        "order_cap_bytes": 950_000_000,
+        "max_issuances": 10,
         "signature_algorithm": "hmac-sha256",
     }
     signed = cli._sign_authority_document(
@@ -1484,6 +1570,16 @@ def _issue_args(tmp_path, **overrides):
     return argv
 
 
+def _bootstrap_issue_args(tmp_path, *, slot_index=0, **overrides):
+    argv = _issue_args(
+        tmp_path,
+        run_id=_rollout()["bootstrap_slots"][slot_index]["run_id"],
+        **overrides,
+    )
+    argv[0] = "issue-bootstrap-ingest"
+    return argv
+
+
 @pytest.mark.unit
 def test_issue_daily_ingest_writes_valid_approval_and_pointer(tmp_path):
     assert cli.main(_issue_args(tmp_path)) == 0
@@ -1516,6 +1612,11 @@ def test_issue_daily_ingest_writes_valid_approval_and_pointer(tmp_path):
         approval.scheduled_authority.ranked_scope_ids_sha256
         == _rollout()["ranked_scope_ids_sha256"]
     )
+
+    legacy = json.loads(approval_path.read_text())
+    del legacy["scheduled_authority"]["acceptance_mode"]
+    with pytest.raises(ProxyCampaignValidationError, match="fields are invalid"):
+        ProxyCampaignApproval.from_dict(legacy)
 
 
 @pytest.mark.unit
@@ -1592,7 +1693,7 @@ def test_issue_daily_ingest_rejects_first_spend_on_promoted_wave(tmp_path):
 
 
 @pytest.mark.unit
-def test_provider_policy_cannot_raise_code_owned_300mb_safety_cap(tmp_path):
+def test_provider_policy_cannot_raise_code_owned_one_gb_safety_cap(tmp_path):
     now = _ISSUER_NOW
     unsigned = {
         "schema_version": 1,
@@ -1603,11 +1704,11 @@ def test_provider_policy_cannot_raise_code_owned_300mb_safety_cap(tmp_path):
         "valid_from": (now - timedelta(minutes=5)).isoformat(),
         "valid_until": (now + timedelta(days=1)).isoformat(),
         "receipt_sha256": "d" * 64,
-        "provider_quota_bytes": 1_000_000_000,
-        "safety_cap_bytes": 300_000_001,
+        "provider_quota_bytes": 1_000_000_001,
+        "safety_cap_bytes": 1_000_000_001,
         "daily_cap_bytes": 300_000_000,
-        "monthly_cap_bytes": 300_000_000,
-        "order_cap_bytes": 300_000_000,
+        "monthly_cap_bytes": 950_000_000,
+        "order_cap_bytes": 1_000_000_001,
         "signature_algorithm": "hmac-sha256",
     }
     signed = cli._sign_authority_document(
@@ -1845,6 +1946,10 @@ def _ledger_rollout_state(
         "promotion_terminal_receipt_sha256": (
             genesis if wave_id == "wave-20" else terminal_token * 64
         ),
+        "acceptance_mode": cli.WHOSCORED_ACCELERATED_BOOTSTRAP_ACCEPTANCE_MODE,
+        "bootstrap_slots": cli._bootstrap_slots_from_start("2026-07-16T10:00:00Z"),
+        "capacity_receipt_sha256": "6" * 64,
+        "provider_order_cap_bytes": 1_000_000_000,
     }
 
 
@@ -1863,6 +1968,12 @@ def _write_rollout_ledger(path, states):
                 "charter_sha256": _hashlib.sha256(
                     f"charter:{index}".encode()
                 ).hexdigest(),
+                "provider_policy_sha256": "d" * 64,
+                "receipt_sha256": "e" * 64,
+                "provider_order_cap_bytes": 1_000_000_000,
+                "safety_reserve_bytes": 50_000_000,
+                "issuance_mode": "daily",
+                "bootstrap_slot_index": None,
                 **state,
                 "total_provider_bytes": 1,
                 "approval": {},
@@ -2041,3 +2152,139 @@ def test_offline_signer_preserves_exact_heavy_first_scope_priority(tmp_path):
     ]
     assert approval.scheduled_authority.rollout_id == "production-rollout-2026-07"
     assert approval.scheduled_authority.wave_id == "wave-20"
+
+
+@pytest.mark.unit
+def test_bootstrap_projection_is_content_addressed_and_idempotent(tmp_path):
+    rollout_path = _rollout_file(tmp_path)
+    policy_path = _policy(tmp_path)
+    charter_path = _charter(tmp_path, policy_path=policy_path)
+    argv = [
+        "publish-bootstrap-authority",
+        "--rollout-file",
+        str(rollout_path),
+        "--provider-policy",
+        str(policy_path),
+        "--charter",
+        str(charter_path),
+        "--pointer-root",
+        str(tmp_path / "ptr"),
+        "--owner-secret-file",
+        str(_owner_secret_file(tmp_path)),
+        "--issuance-ledger-secret-file",
+        str(_ledger_secret_file(tmp_path)),
+    ]
+    assert cli.main(argv) == 0
+    assert cli.main(argv) == 0
+    path = tmp_path / "ptr" / "bootstrap.json"
+    assert cli.main(argv) == 0
+    value = json.loads(path.read_text())
+    body = {
+        key: value[key] for key in value if key not in {"authority_sha256", "signature"}
+    }
+    assert (
+        value["authority_sha256"]
+        == _hashlib.sha256(cli.canonical_json_bytes(body)).hexdigest()
+    )
+    assert "charter_sha256" not in value
+    assert stat.S_IMODE(path.stat().st_mode) == 0o440
+
+    value["provider_order_cap_bytes"] -= 1
+    _private_json(path, value)
+    with pytest.raises(SystemExit):
+        cli.main(argv)
+
+
+@pytest.mark.unit
+def test_bootstrap_issuance_is_exact_ordered_and_idempotent(tmp_path):
+    argv = _bootstrap_issue_args(tmp_path, slot_index=0)
+    assert cli.main(argv) == 0
+    assert cli.main(argv) == 0
+    ledger = json.loads((tmp_path / "issuance.json").read_text())
+    assert len(ledger["entries"]) == 1
+    assert ledger["entries"][0]["bootstrap_slot_index"] == 0
+    assert ledger["entries"][0]["safety_reserve_bytes"] == 50_000_000
+    assert cli.main(_bootstrap_issue_args(tmp_path, slot_index=1)) == 0
+    ledger = json.loads((tmp_path / "issuance.json").read_text())
+    assert len(ledger["entries"]) == 2
+    assert {entry["day"] for entry in ledger["entries"]} == {
+        _ISSUER_NOW.date().isoformat()
+    }
+    assert (
+        sum(entry["total_provider_bytes"] for entry in ledger["entries"]) == 300_000_000
+    )
+
+    # Slot 1 is authorized by the same wave but cannot be replayed before slot 0.
+    other = tmp_path / "out-of-order"
+    other.mkdir()
+    with pytest.raises(SystemExit):
+        cli.main(_bootstrap_issue_args(other, slot_index=1))
+
+
+@pytest.mark.unit
+def test_bootstrap_issuance_aggregates_actual_day_before_artifact_publish(tmp_path):
+    policy = _policy(tmp_path, daily_bytes=300_000_000, name="bootstrap-daily")
+    charter = _charter(
+        tmp_path,
+        daily_bytes=160_000_000,
+        policy_path=policy,
+        name="bootstrap-daily",
+    )
+    overrides = {
+        "provider_policy": str(policy),
+        "charter": str(charter),
+    }
+    assert cli.main(_bootstrap_issue_args(tmp_path, slot_index=0, **overrides)) == 0
+
+    with pytest.raises(SystemExit):
+        cli.main(_bootstrap_issue_args(tmp_path, slot_index=1, **overrides))
+
+    ledger = json.loads((tmp_path / "issuance.json").read_text())
+    assert len(ledger["entries"]) == 1
+    assert ledger["entries"][0]["day"] == _ISSUER_NOW.date().isoformat()
+    second_run = _rollout()["bootstrap_slots"][1]["run_id"]
+    second_digest = _hashlib.sha256(second_run.encode()).hexdigest()
+    assert not (tmp_path / "ptr" / f"{second_digest}.json").exists()
+
+
+@pytest.mark.unit
+def test_bootstrap_issuance_serializes_concurrent_duplicate_calls(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    argv = _bootstrap_issue_args(tmp_path, slot_index=0)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: cli.main(argv), range(2)))
+    assert results == [0, 0]
+    ledger = json.loads((tmp_path / "issuance.json").read_text())
+    assert len(ledger["entries"]) == 1
+
+
+@pytest.mark.unit
+def test_bootstrap_issuance_stops_before_provider_order_overspend(tmp_path):
+    argv = _bootstrap_issue_args(tmp_path, slot_index=0)
+    policy = json.loads(Path(argv[argv.index("--provider-policy") + 1]).read_text())
+    charter = json.loads(Path(argv[argv.index("--charter") + 1]).read_text())
+    prior = _ledger_rollout_state(
+        "wave-20",
+        cohort="smoke",
+        ranked_scope_ids_sha256=_rollout()["ranked_scope_ids_sha256"],
+    )
+    ledger_path = tmp_path / "issuance.json"
+    _write_rollout_ledger(ledger_path, [prior])
+    ledger = json.loads(ledger_path.read_text())
+    entry = ledger["entries"][0]
+    entry["order_id"] = "proxysio-38950"
+    entry["provider_policy_sha256"] = policy["document_sha256"]
+    entry["receipt_sha256"] = policy["receipt_sha256"]
+    entry["cohort_sha256"] = charter["cohort_sha256"]
+    entry["total_provider_bytes"] = 900_000_000
+    body = {
+        "schema_version": cli.ISSUANCE_LEDGER_SCHEMA_VERSION,
+        "entries": ledger["entries"],
+    }
+    _private_json(ledger_path, cli._seal_issuance_ledger(body, secret="l" * 40))
+
+    with pytest.raises(SystemExit):
+        cli.main(argv)
+    assert not (tmp_path / "ptr").exists()
+    assert not (tmp_path / "appr").exists()

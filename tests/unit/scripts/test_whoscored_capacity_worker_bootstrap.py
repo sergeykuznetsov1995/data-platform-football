@@ -43,6 +43,8 @@ def _document(**overrides: Any) -> dict[str, Any]:
         "expected_curl_cffi": "0.15.0",
         "argv": [
             bootstrap.WORKFLOW_SCRIPT,
+            "--mode",
+            bootstrap.DIRECT_DIAGNOSTIC_MODE,
             "--scope",
             "INT-World Cup=2026",
             "--match-limit",
@@ -429,6 +431,68 @@ def test_workflow_gets_protected_capacity_control_pipe(monkeypatch):
     assert captured["kwargs"]["env"]["WHOSCORED_SCOPE_SPOOL_DIR"] == (
         "/run/whoscored-source"
     )
+
+
+@pytest.mark.unit
+def test_cache_workflow_gets_exact_argv_without_control_fd(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    class Workflow:
+        pass
+
+    def popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return Workflow()
+
+    monkeypatch.setattr(bootstrap.subprocess, "Popen", popen)
+    control = _control(
+        argv=[
+            bootstrap.WORKFLOW_SCRIPT,
+            "--mode",
+            bootstrap.CACHE_CAPACITY_MODE,
+            "--scope",
+            "INT-World Cup=2026",
+            "--match-limit",
+            "3",
+        ]
+    )
+
+    bootstrap._start_workflow(control)
+
+    assert captured["command"][5:] == list(control.argv)
+    assert "--capacity-control-fd" not in captured["command"]
+    assert "pass_fds" not in captured["kwargs"]
+    assert captured["kwargs"]["close_fds"] is True
+
+
+@pytest.mark.unit
+def test_baked_bootstrap_launches_real_cache_workflow_without_network_control(
+    monkeypatch,
+):
+    workflow = ROOT / "scripts/research/bench_whoscored_workflow.py"
+    catalog = ROOT / "configs/medallion/competitions.yaml"
+    monkeypatch.setattr(bootstrap, "PRODUCTION_PYTHON", sys.executable)
+    monkeypatch.setattr(bootstrap, "WORKFLOW_SCRIPT", str(workflow))
+    control = _control(
+        argv=[
+            str(workflow),
+            "--mode",
+            bootstrap.CACHE_CAPACITY_MODE,
+            "--scope",
+            "INT-World Cup=2026",
+            "--match-limit",
+            "3",
+            "--profile-limit",
+            "3",
+            "--catalog",
+            str(catalog),
+        ]
+    )
+
+    process = bootstrap._start_workflow(control)
+
+    assert process.wait(timeout=10) == 0
 
 
 @pytest.mark.unit

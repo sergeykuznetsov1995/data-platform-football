@@ -80,6 +80,10 @@ RUNTIME_STATIC_FILES = frozenset(
         "docker/images/flaresolverr-whoscored/Dockerfile",
         "docker/images/flaresolverr-whoscored/Dockerfile.dockerignore",
         "docker/images/flaresolverr-whoscored/entrypoint.sh",
+        # Airflow discovers plugins by filesystem scan rather than through an
+        # import edge reachable from a DAG entrypoint.
+        "dags/plugins/__init__.py",
+        "dags/plugins/whoscored_bootstrap_timetable.py",
         "dags/utils/maintenance_tasks.py",
         "scrapers/whoscored/runtime_contract.py",
         "scripts/flaresolverr_extended.py",
@@ -778,7 +782,7 @@ def test_checked_in_whoscored_runtime_contract_matches_release_tree():
     assert EXPECTED_RUNTIME_FILES == tuple(sorted(EXPECTED_RUNTIME_FILES))
     assert len(EXPECTED_RUNTIME_FILES) == len(set(EXPECTED_RUNTIME_FILES))
     assert tuple(contract["files"]) == EXPECTED_RUNTIME_FILES
-    assert result["file_count"] == len(EXPECTED_RUNTIME_FILES) == 91
+    assert result["file_count"] == len(EXPECTED_RUNTIME_FILES) == 94
     assert len(result["code_tree_sha256"]) == 64
     assert len(result["manifest_sha256"]) == 64
 

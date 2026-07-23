@@ -57,7 +57,7 @@ import re
 import secrets
 import shlex
 import stat
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -67,6 +67,15 @@ from airflow.exceptions import AirflowException
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
+from dags.scripts.whoscored_bootstrap import (
+    ACCEPTANCE_MODE as ACCELERATED_BOOTSTRAP_ACCEPTANCE_MODE,
+    BOOTSTRAP_LIMIT_SECONDS,
+    WhoScoredBootstrapError,
+    bootstrap_slot_for_run,
+    load_bootstrap_pointer,
+    normalize_bootstrap_authority,
+    production_schedule,
+)
 from dags.scripts.whoscored_identity import stable_safe_token
 from dags.scripts.whoscored_proxy_runtime import (
     PaidRuntime,
@@ -79,7 +88,7 @@ from dags.scripts.whoscored_proxy_runtime import (
     validate_transport_alert_delivery,
 )
 
-from utils.config import DAG_TAGS, SCHEDULES
+from utils.config import DAG_TAGS
 from utils.default_args import SCRAPER_ARGS
 
 
@@ -127,6 +136,7 @@ DIRECT_POOL = os.environ.get("WHOSCORED_DIRECT_POOL", "whoscored_direct_pool")
 DQ_POOL = os.environ.get("WHOSCORED_DQ_POOL", "whoscored_dq_pool")
 DAILY_P95_HARD_LIMIT_HOURS = 4.0
 COLD_DAGRUN_HARD_LIMIT_HOURS = 6.0
+ROLLOUT_ACCEPTANCE_SEAL_TASK_ID = "seal_rollout_acceptance_and_pause"
 
 WHOSCORED_ARGS = {
     **{
@@ -379,10 +389,10 @@ def cleanup_stale_run_directories(
 def _scheduled_daily_durations_hours() -> list[float]:
     """Read terminal scheduled durations without gate survivorship bias.
 
-    The first scheduled DagRun is the one permitted cold/full-history crawl
-    and is excluded from the normal rolling SLO. Failed later DagRuns remain
-    in the metric at their actual elapsed duration, so an SLO-gate failure is
-    represented without manufacturing a new six-hour latency observation.
+    All six signed bootstrap slots are excluded from the normal rolling p95.
+    Failed later DagRuns remain in the metric at their actual elapsed duration,
+    so an SLO-gate failure is represented without manufacturing a new latency
+    observation.
     """
     try:
         window = int(os.environ.get("WHOSCORED_DAILY_SLO_WINDOW", "30"))
@@ -392,29 +402,16 @@ def _scheduled_daily_durations_hours() -> list[float]:
         raise AirflowException("WHOSCORED_DAILY_SLO_WINDOW must be in 5..365")
 
     from airflow.models.dagrun import DagRun
+    from airflow.models.xcom import XCom
     from airflow.utils.session import create_session
 
+    logical_date_column = getattr(DagRun, "logical_date", None)
+    if logical_date_column is None:
+        logical_date_column = getattr(DagRun, "execution_date", None)
+    if logical_date_column is None:
+        raise AirflowException("Airflow DagRun has no logical-date column")
+
     with create_session() as session:
-        bootstrap_rows = (
-            session.query(
-                DagRun.run_id,
-                DagRun.run_type,
-                DagRun.external_trigger,
-                DagRun.conf,
-            )
-            .filter(
-                DagRun.dag_id == "dag_ingest_whoscored",
-                DagRun.run_id.like("scheduled__%"),
-                DagRun.run_type == "scheduled",
-                DagRun.external_trigger.is_(False),
-                DagRun.conf == {},
-                DagRun.start_date.isnot(None),
-            )
-            .order_by(DagRun.start_date.asc())
-            .limit(1)
-            .all()
-        )
-        bootstrap_run_id = str(bootstrap_rows[0][0]) if bootstrap_rows else None
         rows = (
             session.query(
                 DagRun.run_id,
@@ -422,6 +419,7 @@ def _scheduled_daily_durations_hours() -> list[float]:
                 DagRun.external_trigger,
                 DagRun.conf,
                 DagRun.state,
+                logical_date_column,
                 DagRun.start_date,
                 DagRun.end_date,
             )
@@ -439,12 +437,65 @@ def _scheduled_daily_durations_hours() -> list[float]:
             .limit(window)
             .all()
         )
+        candidate_run_ids = [str(row[0]) for row in rows]
+        scope_plan_rows = (
+            session.query(XCom)
+            .filter(
+                XCom.dag_id == "dag_ingest_whoscored",
+                XCom.run_id.in_(candidate_run_ids),
+                XCom.task_id == "freeze_daily_scope_plan",
+                XCom.key == "return_value",
+                XCom.map_index == -1,
+            )
+            .all()
+            if candidate_run_ids
+            else []
+        )
+    bootstrap_run_ids: set[str] = set()
+    for row in scope_plan_rows:
+        try:
+            value = XCom.deserialize_value(row)
+        except Exception as exc:
+            raise AirflowException(
+                "cannot deserialize WhoScored SLO scope-plan history"
+            ) from exc
+        if (
+            not isinstance(value, Mapping)
+            or value.get("acceptance_mode")
+            != ACCELERATED_BOOTSTRAP_ACCEPTANCE_MODE
+        ):
+            continue
+        try:
+            bootstrap_slot_for_run(
+                value,
+                run_id=row.run_id,
+                logical_date=next(
+                    candidate[5]
+                    for candidate in rows
+                    if str(candidate[0]) == str(row.run_id)
+                ),
+                wave_id=value.get("wave_id"),
+            )
+        except (WhoScoredBootstrapError, StopIteration) as exc:
+            raise AirflowException(
+                "invalid WhoScored bootstrap slot in SLO history"
+            ) from exc
+        bootstrap_run_ids.add(str(row.run_id))
     durations: list[float] = []
     from dags.scripts.whoscored_rollout_acceptance import (
         is_countable_scheduled_run,
     )
 
-    for run_id, run_type, external_trigger, conf, _state, start_date, end_date in rows:
+    for (
+        run_id,
+        run_type,
+        external_trigger,
+        conf,
+        _state,
+        _logical_date,
+        start_date,
+        end_date,
+    ) in rows:
         if not is_countable_scheduled_run(
             run_id=run_id,
             run_type=run_type,
@@ -452,7 +503,7 @@ def _scheduled_daily_durations_hours() -> list[float]:
             conf=conf,
         ):
             continue
-        if str(run_id) == bootstrap_run_id:
+        if str(run_id) in bootstrap_run_ids:
             continue
         elapsed = max(0.0, (end_date - start_date).total_seconds() / 3600)
         durations.append(elapsed)
@@ -514,9 +565,99 @@ def _previous_terminal_scheduled_run(
 def validate_whoscored_daily_slo(
     *,
     durations_hours: Optional[Sequence[float]] = None,
-    **_context: Any,
+    scope_plan: Optional[Mapping[str, Any]] = None,
+    runtime_preflight: Optional[Mapping[str, Any]] = None,
+    now: Optional[datetime] = None,
+    **context: Any,
 ) -> Dict[str, Any]:
-    """Gate normal rolling p95 while warming up after the first cold crawl."""
+    """Gate bootstrap per-run latency or the post-bootstrap rolling p95."""
+
+    if (
+        isinstance(scope_plan, Mapping)
+        and scope_plan.get("acceptance_mode")
+        == ACCELERATED_BOOTSTRAP_ACCEPTANCE_MODE
+    ):
+        dag_run = context.get("dag_run")
+        run_id = str(
+            context.get("run_id") or getattr(dag_run, "run_id", "") or ""
+        )
+        logical_date = context.get("logical_date") or getattr(
+            dag_run, "execution_date", None
+        )
+        try:
+            slot = bootstrap_slot_for_run(
+                scope_plan,
+                run_id=run_id,
+                logical_date=logical_date,
+                wave_id=scope_plan.get("wave_id"),
+            )
+        except WhoScoredBootstrapError as exc:
+            normalized_authority = normalize_bootstrap_authority(scope_plan)
+            last_logical = datetime.fromisoformat(
+                normalized_authority["bootstrap_slots"][-1]["logical_date"].replace(
+                    "Z", "+00:00"
+                )
+            )
+            if (
+                scope_plan.get("wave_id") == "wave-all"
+                and isinstance(logical_date, datetime)
+                and logical_date.tzinfo is not None
+                and logical_date.astimezone(timezone.utc) > last_logical
+            ):
+                # Once all finite slots are complete, this signed wave-all
+                # authority may run the ordinary daily p95 gate below.
+                slot = None
+            else:
+                raise AirflowException(str(exc)) from exc
+        if slot is not None:
+            start_date = getattr(dag_run, "start_date", None)
+            observed_at = now or datetime.now(timezone.utc)
+            contract = (
+                runtime_preflight.get("runtime_contract")
+                if isinstance(runtime_preflight, Mapping)
+                else None
+            )
+            runtime_sha256 = (
+                str(contract.get("code_tree_sha256") or "")
+                if isinstance(contract, Mapping)
+                else ""
+            )
+            if (
+                not isinstance(start_date, datetime)
+                or start_date.tzinfo is None
+                or observed_at.tzinfo is None
+                or observed_at < start_date
+                or re.fullmatch(r"[0-9a-f]{64}", runtime_sha256) is None
+                or runtime_sha256 != scope_plan.get("runtime_sha256")
+            ):
+                raise AirflowException(
+                    "invalid WhoScored bootstrap SLO runtime timing"
+                )
+            elapsed_seconds = math.ceil(
+                (observed_at - start_date).total_seconds()
+            )
+            if elapsed_seconds > BOOTSTRAP_LIMIT_SECONDS:
+                raise AirflowException(
+                    "WhoScored bootstrap run exceeded its six-hour SLO"
+                )
+            return {
+                "schema_version": 1,
+                "contract": "bootstrap-slo-v1",
+                "capacity_contract": "cache-capacity-v1",
+                "status": "success",
+                "acceptance_mode": ACCELERATED_BOOTSTRAP_ACCEPTANCE_MODE,
+                "slot_index": slot["slot_index"],
+                "run_id": slot["run_id"],
+                "logical_date": slot["logical_date"],
+                "wave_id": slot["wave_id"],
+                "elapsed_seconds": elapsed_seconds,
+                "limit_seconds": BOOTSTRAP_LIMIT_SECONDS,
+                "capacity_receipt_sha256": scope_plan[
+                    "capacity_receipt_sha256"
+                ],
+                "runtime_sha256": runtime_sha256,
+            }
+
     try:
         configured_limit = float(
             os.environ.get(
@@ -552,6 +693,7 @@ def validate_whoscored_daily_slo(
     durations = sorted(float(value) for value in raw)
     if len(durations) < minimum_samples:
         return {
+            "contract": "normal-daily-p95-v1",
             "status": "warming_up",
             "samples": len(durations),
             "minimum_samples": minimum_samples,
@@ -562,6 +704,7 @@ def validate_whoscored_daily_slo(
     rank = max(0, math.ceil(0.95 * len(durations)) - 1)
     p95_hours = durations[rank]
     summary = {
+        "contract": "normal-daily-p95-v1",
         "status": "success",
         "samples": len(durations),
         "minimum_samples": minimum_samples,
@@ -800,7 +943,7 @@ def freeze_daily_scope_plan(
         authority = transport.approval.scheduled_authority
         result.update(
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "catalog_active_scope_count": len(catalog_scopes),
                 "catalog_active_scopes_sha256": catalog_scopes_sha256,
                 "deferred_scopes": deferred,
@@ -822,6 +965,10 @@ def freeze_daily_scope_plan(
                 "promotion_terminal_receipt_sha256": (
                     authority.promotion_terminal_receipt_sha256
                 ),
+                "acceptance_mode": authority.acceptance_mode,
+                "bootstrap_slots": [dict(item) for item in authority.bootstrap_slots],
+                "capacity_receipt_sha256": authority.capacity_receipt_sha256,
+                "provider_order_cap_bytes": authority.provider_order_cap_bytes,
                 "workload_sha256": authority.workload_sha256,
                 "scope_workloads": [
                     item.to_dict() for item in authority.scope_workloads
@@ -1100,6 +1247,10 @@ def _daily_scope_plan_specs(scope_plan: Mapping[str, Any]) -> tuple[str, list[st
         "classifier_sha256",
         "promotion_acceptance_sha256",
         "promotion_terminal_receipt_sha256",
+        "acceptance_mode",
+        "bootstrap_slots",
+        "capacity_receipt_sha256",
+        "provider_order_cap_bytes",
         "workload_sha256",
         "scope_workloads",
         "discovery_parent_target_count",
@@ -1109,7 +1260,7 @@ def _daily_scope_plan_specs(scope_plan: Mapping[str, Any]) -> tuple[str, list[st
         "profile_targets_sha256",
     }
     schema_version = scope_plan.get("schema_version")
-    expected_fields = common_fields | (paid_fields if schema_version == 3 else set())
+    expected_fields = common_fields | (paid_fields if schema_version == 4 else set())
     if set(scope_plan) != expected_fields:
         raise AirflowException("invalid frozen WhoScored daily scope plan schema")
     batch_id = str(scope_plan.get("catalog_batch_id") or "")
@@ -1127,7 +1278,7 @@ def _daily_scope_plan_specs(scope_plan: Mapping[str, Any]) -> tuple[str, list[st
     )
     scopes = scope_plan.get("active_scopes")
     if (
-        schema_version not in {2, 3}
+        schema_version not in {2, 4}
         or not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", batch_id)
         or re.fullmatch(r"[0-9a-f]{64}", payload_sha256) is None
         or identity["catalog_batch_id"] != batch_id
@@ -1141,7 +1292,7 @@ def _daily_scope_plan_specs(scope_plan: Mapping[str, Any]) -> tuple[str, list[st
         != hashlib.sha256(("\n".join(scopes) + "\n").encode("utf-8")).hexdigest()
     ):
         raise AirflowException("invalid frozen WhoScored daily scope plan identity")
-    if schema_version == 3:
+    if schema_version == 4:
         from scrapers.whoscored.proxy_campaign import (
             SCHEDULED_DISCOVERY_EXPANSION_HEADROOM,
             SCHEDULED_DISCOVERY_TARGET_LIMIT_MAX,
@@ -1172,6 +1323,10 @@ def _daily_scope_plan_specs(scope_plan: Mapping[str, Any]) -> tuple[str, list[st
         deferred_values = deferred if isinstance(deferred, list) else []
         full_catalog_scopes = sorted([*scopes, *deferred_values])
         expected_wave = WHOSCORED_ROLLOUT_WAVE_CONTRACTS.get(wave_id)
+        try:
+            bootstrap_authority = normalize_bootstrap_authority(scope_plan)
+        except WhoScoredBootstrapError as exc:
+            raise AirflowException(str(exc)) from exc
         if (
             not isinstance(deferred, list)
             or any(not isinstance(value, str) or not value for value in deferred)
@@ -1269,6 +1424,8 @@ def _daily_scope_plan_specs(scope_plan: Mapping[str, Any]) -> tuple[str, list[st
                 r"[0-9a-f]{64}", str(scope_plan.get("workload_sha256") or "")
             )
             is None
+            or bootstrap_authority["acceptance_mode"]
+            != ACCELERATED_BOOTSTRAP_ACCEPTANCE_MODE
             or [item.scope for item in workloads] != scopes
             or scope_plan.get("workload_sha256")
             != hashlib.sha256(
@@ -1303,6 +1460,117 @@ def initialize_whoscored_schema() -> Dict[str, Any]:
 
     WhoScoredRepository().ensure_schema(create_views=True)
     return {"status": "success"}
+
+
+def validate_whoscored_bootstrap_authority(**context: Any) -> Dict[str, Any]:
+    """Fail before source traffic unless this run has exact signed authority."""
+
+    dag_run = context.get("dag_run")
+    run_id = str(context.get("run_id") or getattr(dag_run, "run_id", "") or "")
+    logical_date = context.get("logical_date") or getattr(
+        dag_run, "execution_date", None
+    )
+    from dags.scripts.whoscored_rollout_acceptance import (
+        is_countable_scheduled_run,
+    )
+
+    if dag_run is None or not is_countable_scheduled_run(
+        run_id=run_id,
+        run_type=getattr(dag_run, "run_type", None),
+        external_trigger=getattr(dag_run, "external_trigger", None),
+        conf=getattr(dag_run, "conf", None),
+    ):
+        return {"status": "not_required", "reason": "non_scheduled_run"}
+    if not isinstance(logical_date, datetime) or logical_date.tzinfo is None:
+        raise AirflowException(
+            "WhoScored scheduled authority barrier requires logical_date"
+        )
+
+    try:
+        bootstrap_pointer = load_bootstrap_pointer(required=False)
+    except WhoScoredBootstrapError as exc:
+        raise AirflowException(str(exc)) from exc
+    transport = _transport_runtime(context)
+    if not transport.is_paid:
+        if bootstrap_pointer is not None:
+            raise AirflowException(
+                "WhoScored accelerated bootstrap scheduled run lacks paid authority"
+            )
+        return {"status": "not_required", "reason": "direct_only_daily"}
+    approval = transport.approval
+    authority = approval.scheduled_authority if approval is not None else None
+    if authority is None:
+        raise AirflowException(
+            "WhoScored accelerated bootstrap lacks scheduled authority"
+        )
+    try:
+        normalized = normalize_bootstrap_authority(
+            {
+                "acceptance_mode": authority.acceptance_mode,
+                "bootstrap_slots": [dict(item) for item in authority.bootstrap_slots],
+                "capacity_receipt_sha256": authority.capacity_receipt_sha256,
+                "provider_order_cap_bytes": authority.provider_order_cap_bytes,
+            }
+        )
+        pointer = bootstrap_pointer or load_bootstrap_pointer(required=True)
+        assert pointer is not None
+        pointer_projection = normalize_bootstrap_authority(pointer)
+    except WhoScoredBootstrapError as exc:
+        raise AirflowException(str(exc)) from exc
+    if normalized != pointer_projection:
+        raise AirflowException(
+            "WhoScored per-run authority differs from bootstrap timetable authority"
+        )
+    for pointer_field, authority_field in (
+        ("rollout_id", "rollout_id"),
+        ("runtime_sha256", "runtime_sha256"),
+        ("provider_policy_sha256", "provider_policy_sha256"),
+    ):
+        authority_value = getattr(authority, authority_field, None)
+        if pointer.get(pointer_field) != authority_value:
+            raise AirflowException(
+                "WhoScored bootstrap pointer differs from signed scheduled authority"
+            )
+    try:
+        slot = bootstrap_slot_for_run(
+            normalized,
+            run_id=run_id,
+            logical_date=logical_date,
+            wave_id=authority.wave_id,
+        )
+    except WhoScoredBootstrapError as exc:
+        last_slot = normalized["bootstrap_slots"][-1]
+        last_logical = datetime.fromisoformat(
+            last_slot["logical_date"].replace("Z", "+00:00")
+        )
+        canonical_daily = (
+            logical_date.astimezone(timezone.utc).hour == 10
+            and logical_date.astimezone(timezone.utc).minute == 0
+            and logical_date.astimezone(timezone.utc).second == 0
+            and logical_date.astimezone(timezone.utc).microsecond == 0
+        )
+        if (
+            authority.wave_id == "wave-all"
+            and logical_date.astimezone(timezone.utc) > last_logical
+            and canonical_daily
+        ):
+            return {
+                "status": "success",
+                "mode": "normal_daily_after_bootstrap",
+                "rollout_id": authority.rollout_id,
+            }
+        raise AirflowException(str(exc)) from exc
+    return {
+        "status": "success",
+        "mode": ACCELERATED_BOOTSTRAP_ACCEPTANCE_MODE,
+        "rollout_id": authority.rollout_id,
+        "wave_id": authority.wave_id,
+        "slot_index": slot["slot_index"],
+        "run_id": slot["run_id"],
+        "logical_date": slot["logical_date"],
+        "capacity_receipt_sha256": normalized["capacity_receipt_sha256"],
+        "provider_order_cap_bytes": normalized["provider_order_cap_bytes"],
+    }
 
 
 def validate_whoscored_runtime(**context: Any) -> Dict[str, Any]:
@@ -2858,7 +3126,7 @@ def plan_daily_profile_capacity(
         or re.fullmatch(r"[0-9a-f]{64}", str(candidate_sha256 or "")) is None
     ):
         raise AirflowException("invalid exact WhoScored profile candidate snapshot")
-    if scope_plan.get("schema_version") == 3 and (
+    if scope_plan.get("schema_version") == 4 and (
         candidate_count != scope_plan.get("profile_target_count")
         or candidate_sha256 != scope_plan.get("profile_targets_sha256")
     ):
@@ -5459,12 +5727,17 @@ def aggregate_traffic_reports(
 
 
 def _successful_task_state_records(
-    dag_run: Any, *, exclude_task_id: Optional[str] = None
+    dag_run: Any,
+    *,
+    exclude_task_id: Optional[str] = None,
+    exclude_task_ids: Sequence[str] = (),
 ) -> list[Dict[str, Any]]:
     records: list[Dict[str, Any]] = []
     failures: list[str] = []
     for task_instance in dag_run.get_task_instances():
-        if task_instance.task_id == exclude_task_id:
+        if task_instance.task_id == exclude_task_id or task_instance.task_id in set(
+            exclude_task_ids
+        ):
             continue
         state = str(task_instance.state or "none").lower().split(".")[-1]
         map_index = int(getattr(task_instance, "map_index", -1))
@@ -5497,14 +5770,16 @@ def enforce_terminal_gate(
     alert_preflight: Optional[Mapping[str, Any]] = None,
     **context: Any,
 ) -> Dict[str, Any]:
-    """Prevent false green and persist countable staged-rollout evidence."""
+    """Prevent false green before the terminal receipt-sealing task."""
     dag_run = context.get("dag_run")
     current_ti = context.get("ti")
     if dag_run is None:
         raise AirflowException("terminal gate requires dag_run context")
     current_task_id = getattr(current_ti, "task_id", "final_success_gate")
     task_states = _successful_task_state_records(
-        dag_run, exclude_task_id=current_task_id
+        dag_run,
+        exclude_task_id=current_task_id,
+        exclude_task_ids=(ROLLOUT_ACCEPTANCE_SEAL_TASK_ID,),
     )
     result: Dict[str, Any] = {
         "status": "success",
@@ -5542,6 +5817,15 @@ def enforce_terminal_gate(
             "reason": "daily_slo_warming_up",
         }
         return result
+    if (
+        isinstance(daily_slo, Mapping)
+        and daily_slo.get("contract") != "bootstrap-slo-v1"
+    ):
+        result["rollout_acceptance"] = {
+            "status": "not_counted",
+            "reason": "bootstrap_slots_complete",
+        }
+        return result
     required_evidence = {
         "runtime_preflight": runtime_preflight,
         "catalog_dq": catalog_dq,
@@ -5561,30 +5845,29 @@ def enforce_terminal_gate(
             + ", ".join(missing_evidence)
         )
     result["rollout_acceptance"] = {
-        "status": "awaiting_dag_success_callback",
+        "status": "awaiting_terminal_seal",
         "rollout_id": scope_plan["rollout_id"],
         "wave_id": scope_plan.get("wave_id"),
     }
     return result
 
 
-def _record_rollout_acceptance_after_dag_success(
-    context: Mapping[str, Any],
+def _record_rollout_acceptance_at_terminal_task(
+    *, scope_plan: Mapping[str, Any], **context: Any
 ) -> Dict[str, Any]:
-    """Seal rollout evidence only after Airflow made the DagRun terminal-green."""
+    """Seal rollout evidence from the final running TaskInstance."""
 
     dag_run = context.get("dag_run")
     ti = context.get("ti")
     if dag_run is None or ti is None or not callable(getattr(ti, "xcom_pull", None)):
         raise AirflowException(
-            "WhoScored success callback requires DagRun and TaskInstance context"
+            "WhoScored terminal seal requires DagRun and TaskInstance context"
         )
     dag_state = str(getattr(dag_run, "state", "") or "").lower().split(".")[-1]
-    if dag_state != "success":
+    if dag_state != "running":
         raise AirflowException(
-            "WhoScored rollout receipt requires a terminal-success DagRun"
+            "WhoScored rollout receipt requires a running terminal TaskInstance"
         )
-    scope_plan = ti.xcom_pull(task_ids="freeze_daily_scope_plan")
     if not isinstance(scope_plan, Mapping) or not scope_plan.get("rollout_id"):
         return {"status": "not_counted", "reason": "no_signed_rollout"}
 
@@ -5605,6 +5888,11 @@ def _record_rollout_acceptance_after_dag_success(
     daily_slo = ti.xcom_pull(task_ids="validate_whoscored_daily_slo")
     if isinstance(daily_slo, Mapping) and daily_slo.get("status") == "warming_up":
         return {"status": "not_counted", "reason": "daily_slo_warming_up"}
+    if (
+        not isinstance(daily_slo, Mapping)
+        or daily_slo.get("contract") != "bootstrap-slo-v1"
+    ):
+        return {"status": "not_counted", "reason": "bootstrap_slots_complete"}
     runtime_preflight = ti.xcom_pull(task_ids="validate_whoscored_runtime")
     catalog_dq = ti.xcom_pull(task_ids="validate_whoscored_catalog")
     profile_dq = ti.xcom_pull(task_ids="validate_profile_refresh")
@@ -5643,9 +5931,12 @@ def _record_rollout_acceptance_after_dag_success(
     )
     if not isinstance(logical_date, datetime) or logical_date.tzinfo is None:
         raise AirflowException(
-            "WhoScored rollout success callback requires logical_date"
+            "WhoScored rollout terminal seal requires logical_date"
         )
-    terminal_task_states = _successful_task_state_records(dag_run)
+    terminal_task_states = _successful_task_state_records(
+        dag_run,
+        exclude_task_ids=(ROLLOUT_ACCEPTANCE_SEAL_TASK_ID,),
+    )
     from dags.scripts.whoscored_ops_store import WhoScoredOpsStore
 
     ops_store = WhoScoredOpsStore.from_env(optional=False)
@@ -5673,28 +5964,98 @@ def _record_rollout_acceptance_after_dag_success(
         raise AirflowException(str(exc)) from exc
 
 
-def record_rollout_acceptance_on_success(context: Mapping[str, Any]) -> None:
-    """DAG callback wrapper that also pages if sealing acceptance fails."""
+def _set_whoscored_dag_paused() -> None:
+    """Lock and pause the DagModel row before another slot can race ahead."""
 
+    from airflow.models.dag import DagModel
+    from airflow.utils.session import create_session
+
+    with create_session() as session:
+        row = (
+            session.query(DagModel)
+            .filter(DagModel.dag_id == "dag_ingest_whoscored")
+            .with_for_update()
+            .one_or_none()
+        )
+        if row is None:
+            raise AirflowException("WhoScored DagModel row is unavailable for pause")
+        row.is_paused = True
+        session.flush()
+
+
+def pause_after_bootstrap_slot(
+    *, scope_plan: Mapping[str, Any], **context: Any
+) -> Dict[str, Any]:
+    """Self-pause after every bootstrap slot; a root coordinator owns unpause."""
+
+    if (
+        not isinstance(scope_plan, Mapping)
+        or scope_plan.get("acceptance_mode")
+        != ACCELERATED_BOOTSTRAP_ACCEPTANCE_MODE
+    ):
+        return {"status": "not_required", "reason": "non_bootstrap_run"}
+
+    dag_run = context.get("dag_run")
+    run_id = str(context.get("run_id") or getattr(dag_run, "run_id", "") or "")
+    logical_date = context.get("logical_date") or getattr(
+        dag_run, "execution_date", None
+    )
     try:
-        _record_rollout_acceptance_after_dag_success(context)
-    except Exception as exc:
-        failure_callback = SCRAPER_ARGS.get("on_failure_callback")
-        if callable(failure_callback):
-            alert_context = dict(context)
-            alert_context["exception"] = exc
-            try:
-                failure_callback(alert_context)
-            except Exception:
-                pass
+        slot = bootstrap_slot_for_run(
+            scope_plan,
+            run_id=run_id,
+            logical_date=logical_date,
+            wave_id=scope_plan.get("wave_id"),
+        )
+    except WhoScoredBootstrapError as exc:
+        if scope_plan.get("wave_id") == "wave-all":
+            return {"status": "not_required", "reason": "normal_daily"}
+        raise AirflowException(str(exc)) from exc
+    _set_whoscored_dag_paused()
+    return {
+        "status": "paused",
+        "reason": "accepted_slot_boundary",
+        "slot_index": slot["slot_index"],
+        "wave_id": slot["wave_id"],
+    }
+
+
+def seal_rollout_acceptance_and_pause(
+    *, scope_plan: Mapping[str, Any], **context: Any
+) -> Dict[str, Any]:
+    """Persist acceptance in a real TI and pause bootstrap even on seal failure."""
+
+    acceptance: Dict[str, Any]
+    pause: Dict[str, Any]
+    acceptance_error: Optional[BaseException] = None
+    try:
+        acceptance = _record_rollout_acceptance_at_terminal_task(
+            scope_plan=scope_plan,
+            **context,
+        )
+    except BaseException as exc:
+        acceptance_error = exc
         raise
+    finally:
+        # A receipt conflict or unavailable ops store must fail this TI, but it
+        # must not leave the accelerated timetable free to consume another slot.
+        try:
+            pause = pause_after_bootstrap_slot(scope_plan=scope_plan, **context)
+        except BaseException as pause_error:
+            if acceptance_error is None:
+                raise
+            acceptance_error.add_note(
+                "WhoScored bootstrap pause also failed after receipt sealing "
+                f"({type(pause_error).__name__})"
+            )
+    return {"acceptance": acceptance, "pause": pause}
 
 
 with DAG(
     dag_id="dag_ingest_whoscored",
     default_args=WHOSCORED_ARGS,
     description="Discover and incrementally ingest all active senior-men WhoScored scopes",
-    schedule=SCHEDULES.get("dag_ingest_whoscored", "0 10 * * *"),
+    schedule=production_schedule(),
     start_date=datetime(2024, 1, 1),
     catchup=False,
     is_paused_upon_creation=True,
@@ -5703,7 +6064,6 @@ with DAG(
     # Task-level callbacks on a mapped fan-out produce one page per failed
     # map index.  A DAG-level callback reports the failed DagRun exactly once.
     on_failure_callback=SCRAPER_ARGS.get("on_failure_callback"),
-    on_success_callback=record_rollout_acceptance_on_success,
     params={
         "transport_policy": "direct_only",
         "paid_approval_id": "",
@@ -5720,6 +6080,12 @@ with DAG(
     rolling scheduled-run p95 <=4h, and a hard cold-bootstrap ceiling of 6h.
     """,
 ) as dag:
+    bootstrap_authority = PythonOperator(
+        task_id="validate_whoscored_bootstrap_authority",
+        python_callable=validate_whoscored_bootstrap_authority,
+        retries=0,
+        execution_timeout=timedelta(minutes=2),
+    )
     runtime_preflight = PythonOperator(
         task_id="validate_whoscored_runtime",
         python_callable=validate_whoscored_runtime,
@@ -5871,6 +6237,10 @@ with DAG(
     daily_slo = PythonOperator(
         task_id="validate_whoscored_daily_slo",
         python_callable=validate_whoscored_daily_slo,
+        op_kwargs={
+            "scope_plan": freeze_scope_plan.output,
+            "runtime_preflight": runtime_preflight.output,
+        },
         trigger_rule="all_done",
         pool=DQ_POOL,
         execution_timeout=timedelta(minutes=5),
@@ -5890,7 +6260,15 @@ with DAG(
         trigger_rule="all_done",
         execution_timeout=timedelta(minutes=5),
     )
+    seal_acceptance = PythonOperator(
+        task_id=ROLLOUT_ACCEPTANCE_SEAL_TASK_ID,
+        python_callable=seal_rollout_acceptance_and_pause,
+        op_kwargs={"scope_plan": freeze_scope_plan.output},
+        retries=0,
+        execution_timeout=timedelta(minutes=5),
+    )
 
+    bootstrap_authority >> runtime_preflight
     runtime_preflight >> paid_alert_preflight >> initialize_schema >> build_discovery
     build_discovery >> discover_catalog >> catalog_dq
     catalog_dq >> freeze_scope_plan
@@ -5899,6 +6277,7 @@ with DAG(
     profile_command >> profile_task >> profile_dq
     [catalog_dq, scope_dq, profile_dq, traffic_dq] >> daily_slo
     [catalog_dq, scope_dq, profile_dq, traffic_dq, daily_slo] >> final_gate
+    final_gate >> seal_acceptance
     # Traffic upload/cleanup runs only after result-consuming DQ tasks, so
     # deleting the large local JSON reports cannot race their readers.
     [catalog_dq, scope_dq, profile_dq] >> traffic_dq

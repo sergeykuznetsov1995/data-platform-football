@@ -222,6 +222,8 @@ WHOSCORED_PROXY_COMMAND = (
     "/opt/airflow/state/whoscored-proxy-filter/bytes.json",
     "--daily-budget-bytes",
     "${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES:?set exact provider-policy daily cap in decimal bytes}",
+    "--whoscored-provider-order-cap-bytes",
+    "${WHOSCORED_PROVIDER_ORDER_CAP_BYTES:?set exact signed provider gross order cap in decimal bytes}",
     "--max-lease-bytes",
     "${WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES:-2000000}",
     "--max-lease-ttl-seconds",

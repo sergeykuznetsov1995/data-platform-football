@@ -3,9 +3,10 @@
 
 This module deliberately does not know how to build an image.  The caller must
 provide the admitted scheduler image ID (``sha256:<64 lowercase hex>``) and the
-admitted FlareSolverr container ID (``64 lowercase hex``).  Workers therefore
-use the scheduler image's Python and native libraries, and share only the
-network namespace of that exact FlareSolverr container.
+admitted FlareSolverr container ID (``64 lowercase hex``).  Workers use the
+scheduler image's Python and native libraries. Direct-diagnostic workers share
+only the network namespace of that exact FlareSolverr container; cache-capacity
+workers run with Docker network mode ``none``.
 
 The scheduler image must contain the baked production gate and bootstrap named
 below. Docker starts ``dumb-init -> production-entrypoint -> isolated Python ->
@@ -80,6 +81,8 @@ READY_PAYLOAD = b"READY\n"
 RELEASE_PAYLOAD = b"G" * WORKER_COUNT
 MAX_WORKER_STDOUT_BYTES = 2 * 1024 * 1024
 MAX_WORKER_STDERR_BYTES = 512 * 1024
+CACHE_CAPACITY_MODE = "cache-capacity-v1"
+DIRECT_DIAGNOSTIC_MODE = "direct-diagnostic-v1"
 
 _IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -529,6 +532,28 @@ def _validate_worker_spec(spec: WorkerSpec) -> None:
             )
         ):
             raise ValueError("worker argv attempts to override sealed control")
+    _worker_mode(spec)
+
+
+def _worker_mode(spec: WorkerSpec) -> str:
+    arguments = spec.workload_argv[1:]
+    if arguments.count("--mode") != 1:
+        raise ValueError("worker workload mode is invalid")
+    index = arguments.index("--mode") + 1
+    if index >= len(arguments):
+        raise ValueError("worker workload mode is invalid")
+    mode = arguments[index]
+    if mode not in {CACHE_CAPACITY_MODE, DIRECT_DIAGNOSTIC_MODE}:
+        raise ValueError("worker workload mode is invalid")
+    return mode
+
+
+def _network_mode(spec: WorkerSpec, flaresolverr_container_id: str) -> str:
+    return (
+        "none"
+        if _worker_mode(spec) == CACHE_CAPACITY_MODE
+        else f"container:{flaresolverr_container_id}"
+    )
 
 
 def _container_name(owner: str, worker_index: int) -> str:
@@ -627,7 +652,7 @@ def _create_argv(
         "--security-opt",
         "seccomp=builtin",
         "--network",
-        f"container:{flaresolverr_container_id}",
+        _network_mode(spec, flaresolverr_container_id),
         "--memory",
         "2g",
         "--memory-swap",
@@ -782,7 +807,7 @@ def _validate_static_inspect(
         or set(security_list) != exact_security
     ):
         raise ContainerRuntimeError("worker capability/security options changed")
-    if host.get("NetworkMode") != f"container:{flaresolverr_container_id}":
+    if host.get("NetworkMode") != _network_mode(spec, flaresolverr_container_id):
         raise ContainerRuntimeError("worker network namespace changed")
     if host.get("Memory") != MEMORY_BYTES or host.get("MemorySwap") != MEMORY_BYTES:
         raise ContainerRuntimeError("worker memory limit changed")

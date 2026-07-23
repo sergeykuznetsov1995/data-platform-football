@@ -235,6 +235,73 @@ def _deployment_bridge_document(
     }
 
 
+def _cache_deployment_bridge_document(
+    deployment: capacity.ProductionDeployment,
+) -> dict[str, Any]:
+    build_attestation = capacity._protected_input_snapshot(
+        capacity.PRODUCTION_BUILD_ATTESTATION,
+        label="build-attestation",
+        private=False,
+    )
+    build_manifest = capacity._protected_input_snapshot(
+        capacity.PRODUCTION_BUILD_MANIFEST,
+        label="build-manifest",
+        private=False,
+    )
+    attestation = capacity._protected_input_snapshot(
+        deployment.deployment_attestation_path,
+        label="deployment-attestation",
+        private=True,
+    )
+    common_override = capacity._protected_input_snapshot(
+        deployment.common_digest_override_path,
+        label="common-digest-override",
+        private=True,
+    )
+    return {
+        "build_attestation_identity": list(build_attestation.identity),
+        "build_attestation_sha256": build_attestation.sha256,
+        "build_manifest_identity": list(build_manifest.identity),
+        "build_manifest_sha256": build_manifest.sha256,
+        "deployment_attestation_identity": list(attestation.identity),
+        "deployment_attestation_sha256": attestation.sha256,
+        "common_digest_override_identity": list(common_override.identity),
+        "common_digest_override_sha256": common_override.sha256,
+        "protected_bindings": dict(deployment.protected_bindings),
+        "protected_config_hashes": {
+            service: PROTECTED_CONFIG_HASHES[service]
+            for service in capacity.ADMITTED_RUNNING_SERVICES
+        },
+        "protected_payload_image_ids": dict(
+            deployment.protected_payload_image_ids
+        ),
+        "running_admission": {
+            "apparmor_profile": "verified-during-capacity-sampling",
+            "docker_security_options": [],
+            "images": [
+                {
+                    "container_id": RUNNING_CONTAINER_IDS[service],
+                    "final_image": PROTECTED_BINDINGS[service],
+                    "image_id": PROTECTED_PAYLOADS[service],
+                    "service": service,
+                }
+                for service in capacity.ADMITTED_RUNNING_SERVICES
+            ],
+            "networks": [],
+            "projects": {
+                "data-platform": list(capacity.ADMITTED_RUNNING_SERVICES)
+            },
+            "schema_version": 1,
+            "status": "admitted-running-v1",
+            "volumes": [],
+        },
+        "payload_revision": deployment.payload_revision,
+        "provenance_manifest_sha256": build_manifest.sha256,
+        "release_revision": deployment.release_revision,
+        "source_tree_sha256": deployment.source_tree_sha256,
+    }
+
+
 def _args(**overrides: Any) -> Namespace:
     values = {
         "duration_seconds": 900.0,
@@ -337,6 +404,60 @@ def _workflow_report(
                     "successful_page_units": page_units,
                     "paid_proxy_bytes": paid_bytes,
                     "paid_route_requests": paid_route_requests,
+                },
+            }
+        ],
+    }
+
+
+def _cache_workflow_report(
+    *,
+    page_units: int = 9_000,
+    network_requests: int = 0,
+    paid_bytes: int = 0,
+    seed_sha256: str = capacity.EXPECTED_CACHE_SEED_SHA256,
+    cleanup_status: str = "success",
+) -> dict[str, Any]:
+    return {
+        "benchmark_version": capacity.EXPECTED_WORKFLOW_VERSION,
+        "schema_version": capacity.CAPACITY_REPORT_SCHEMA_VERSION,
+        "mode": capacity.CACHE_CAPACITY_MODE,
+        "status": "success",
+        "seed_sha256": seed_sha256,
+        "network_requests": network_requests,
+        "paid_proxy_bytes": paid_bytes,
+        "paid_route_requests": 0,
+        "publishes": False,
+        "writes_bronze": False,
+        "executes_ddl": False,
+        "elapsed_seconds": 900.0,
+        "cleanup": {
+            "status": cleanup_status,
+            "temporary_workspace_removed": cleanup_status == "success",
+        },
+        "stage_statistics_contract": {"expected_feed_states_per_stage": 68},
+        "phases": [
+            {
+                "name": "cache_replay",
+                "results": [
+                    {"entity": "matches"},
+                    {"entity": "previews"},
+                    {"entity": "profiles"},
+                    {
+                        "entity": "multistage",
+                        "metadata": {
+                            "source_stage_count": 2,
+                            "source_stage_ids": [1, 2],
+                        },
+                    },
+                ],
+                "traffic": {
+                    "cache_work_units_attempted": page_units,
+                    "source_request_attempts": 0,
+                    "successful_page_units": page_units,
+                    "network_requests": 0,
+                    "paid_proxy_bytes": paid_bytes,
+                    "paid_route_requests": 0,
                 },
             }
         ],
@@ -574,6 +695,59 @@ def test_four_process_capacity_run_passes_exact_gates_without_publish_sinks():
     assert _gate(report, "runtime_identity")["passed"] is True
     assert _gate(report, "runtime_identity")["git_clean"] is True
     assert json.loads(json.dumps(report)) == report
+
+
+def test_cache_capacity_report_has_canonical_production_receipt_fields():
+    runtime = FakeCapacityRuntime(report=_cache_workflow_report())
+    args = _args(
+        mode=capacity.CACHE_CAPACITY_MODE,
+        duration_seconds=capacity.DEFAULT_DURATION_SECONDS,
+    )
+
+    code, report = capacity.run(args, dependencies=runtime.dependencies())
+
+    assert code == 0
+    assert report["schema_version"] == 1
+    assert report["mode"] == "cache-capacity-v1"
+    assert report["seed_sha256"] == capacity.EXPECTED_CACHE_SEED_SHA256
+    assert report["network_requests"] == 0
+    assert report["paid_proxy_bytes"] == 0
+    assert report["duration_seconds_requested"] == 21_600
+    assert report["duration_seconds_observed"] == 21_600
+    assert report["workers"] == 4
+    assert report["projected_page_units_per_day"] == 144_000
+    assert report["peak_combined_rss_bytes"] <= capacity.MAX_RSS_BYTES
+    assert report["restart_count"] == 0
+    assert report["oom_killed"] is False
+    assert report["cleanup"]["status"] == "success"
+    assert report["runtime_release_identity"]["release_revision"] == "a" * 40
+    assert capacity.verify_report_sha256(report) is True
+    assert _gate(report, "cache_seed")["passed"] is True
+    assert _gate(report, "network_isolation")["passed"] is True
+    assert _gate(report, "cache_cleanup")["passed"] is True
+
+
+@pytest.mark.parametrize(
+    ("overrides", "gate"),
+    [
+        ({"network_requests": 1}, "network_isolation"),
+        ({"seed_sha256": "f" * 64}, "cache_seed"),
+        ({"cleanup_status": "failed"}, "cache_cleanup"),
+    ],
+)
+def test_cache_capacity_rejects_network_seed_and_cleanup_escape(overrides, gate):
+    runtime = FakeCapacityRuntime(report=_cache_workflow_report(**overrides))
+
+    code, report = capacity.run(
+        _args(
+            mode=capacity.CACHE_CAPACITY_MODE,
+            duration_seconds=capacity.DEFAULT_DURATION_SECONDS,
+        ),
+        dependencies=runtime.dependencies(),
+    )
+
+    assert code == 1
+    assert _gate(report, gate)["passed"] is False
 
 
 def test_throughput_below_144k_fails_closed():
@@ -1486,6 +1660,71 @@ def test_production_deployment_validation_uses_exact_admission_bridge(
         "text": True,
         "timeout": 180,
     }
+
+
+def test_cache_deployment_admission_omits_all_paid_authority(
+    monkeypatch, tmp_path
+):
+    expected = _production_deployment(tmp_path)
+    environment_files = tuple(tmp_path / f"cache-env-{index}" for index in range(3))
+    for environment_file in environment_files:
+        environment_file.write_text("SAFE_TEST_VALUE=1\n")
+        environment_file.chmod(0o600)
+    monkeypatch.setattr(
+        capacity, "PRODUCTION_COMPOSE_ENV_FILES", environment_files
+    )
+    document = _cache_deployment_bridge_document(expected)
+    observed = {}
+
+    def fake_run(argv, **kwargs):
+        observed["argv"] = argv
+        observed["kwargs"] = kwargs
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(document),
+            stderr="",
+        )
+
+    monkeypatch.setattr(capacity.subprocess, "run", fake_run)
+    args = _args(
+        mode=capacity.CACHE_CAPACITY_MODE,
+        duration_seconds=capacity.DEFAULT_DURATION_SECONDS,
+        deployment_attestation=expected.deployment_attestation_path,
+        common_digest_override=expected.common_digest_override_path,
+        gateway_digest_override=None,
+        provider_policy=None,
+        owner_secret_file=None,
+        deployment_admission_receipt=None,
+    )
+
+    actual = capacity._validate_cache_production_deployment(args)
+
+    assert actual.admission_mode == capacity.CACHE_CAPACITY_MODE
+    assert actual.gateway_digest_override_path is None
+    assert actual.provider_policy_path is None
+    assert actual.owner_secret_file_path is None
+    assert actual.deployment_admission_receipt_path is None
+    assert set(actual.protected_config_hashes) == set(
+        capacity.ADMITTED_RUNNING_SERVICES
+    )
+    assert len(actual.protected_inputs) == 9
+    assert observed["argv"][5:] == [
+        str(capacity.PRODUCTION_ADMISSION_SCRIPT),
+        str(capacity.REPO_ROOT),
+        str(capacity.PRODUCTION_BUILD_ATTESTATION),
+        str(capacity.PRODUCTION_BUILD_MANIFEST),
+        str(expected.deployment_attestation_path),
+        str(expected.common_digest_override_path),
+        *(str(path) for path in environment_files),
+    ]
+    assert "render_attested_common_project" in observed["argv"][4]
+    assert "path: evidence.raw for path, evidence in protected_inputs.items()" in (
+        observed["argv"][4]
+    )
+    assert "verify_created_containers" in observed["argv"][4]
+    assert "provider_policy" not in observed["argv"][4]
+    assert "owner_secret" not in observed["argv"][4]
+    assert "deployment_admission_receipt" not in observed["argv"][4]
 
 
 @pytest.mark.parametrize(
@@ -2485,6 +2724,7 @@ def test_default_cli_is_six_hours_four_workers_and_requires_container_evidence()
     args = _parse_cli()
 
     assert args.duration_seconds == 21_600
+    assert args.mode == capacity.CACHE_CAPACITY_MODE
     assert capacity.WORKER_COUNT == 4
     assert capacity._container_values(args) == (
         "airflow-scheduler",
@@ -2509,6 +2749,72 @@ def test_default_cli_is_six_hours_four_workers_and_requires_container_evidence()
         "/evidence/rendered-receipt.json"
     )
     assert capacity._validate_args(args) is None
+
+
+def test_cache_cli_does_not_require_paid_gateway_or_provider_evidence(monkeypatch):
+    args = capacity._parser().parse_args(
+        [
+            "--deployment-attestation",
+            "/evidence/deployment-attestation.json",
+            "--common-digest-override",
+            "/evidence/common-digest-only.yaml",
+        ]
+    )
+
+    assert args.mode == capacity.CACHE_CAPACITY_MODE
+    assert args.gateway_digest_override is None
+    assert args.provider_policy is None
+    assert args.owner_secret_file is None
+    assert args.deployment_admission_receipt is None
+    assert capacity._validate_args(args) is None
+    admitted = object()
+    monkeypatch.setattr(
+        capacity,
+        "_validate_cache_production_deployment",
+        lambda candidate: admitted if candidate is args else None,
+    )
+    assert capacity._validate_production_deployment(args) is admitted
+
+
+def test_direct_diagnostic_still_requires_paid_deployment_evidence():
+    args = _args(
+        mode=capacity.DIRECT_DIAGNOSTIC_MODE,
+        gateway_digest_override=None,
+        provider_policy=None,
+        owner_secret_file=None,
+        deployment_admission_receipt=None,
+    )
+
+    assert "gateway digest override is required" in capacity._validate_args(args)
+
+
+def test_cache_capacity_rejects_shortened_production_duration():
+    assert capacity._validate_args(
+        _args(mode=capacity.CACHE_CAPACITY_MODE, duration_seconds=21_599)
+    ) == "cache-capacity-v1 requires exactly 21600 seconds"
+
+
+def test_cache_capacity_requires_bounded_production_sampling_interval():
+    assert capacity._validate_args(
+        _args(
+            mode=capacity.CACHE_CAPACITY_MODE,
+            duration_seconds=capacity.DEFAULT_DURATION_SECONDS,
+            sample_interval_seconds=0.1,
+        )
+    ) == "cache-capacity-v1 requires exactly 30 second sampling"
+
+
+def test_sustained_duration_gate_has_no_early_completion_tolerance():
+    gates = capacity._gate_documents(
+        capacity.CapacityAccumulator(),
+        elapsed_seconds=capacity.DEFAULT_DURATION_SECONDS - 0.001,
+        requested_duration_seconds=capacity.DEFAULT_DURATION_SECONDS,
+        mode=capacity.CACHE_CAPACITY_MODE,
+    )
+
+    assert next(gate for gate in gates if gate["name"] == "sustained_duration")[
+        "passed"
+    ] is False
 
 
 def test_host_cli_accepts_representative_scopes_and_all_runtime_containers():
@@ -2547,9 +2853,11 @@ def test_host_cli_accepts_representative_scopes_and_all_runtime_containers():
     ]
     assert all("--browser-session-owner" not in command.argv for command in commands)
     assert all("--flaresolverr-url" not in command.argv for command in commands)
-    assert all(command.browser_session_owner == "a" * 24 for command in commands)
+    assert all(command.browser_session_owner is None for command in commands)
+    assert all(command.flaresolverr_endpoint is None for command in commands)
+    assert all(command.session_owner == "a" * 24 for command in commands)
     assert all(
-        command.flaresolverr_endpoint == capacity.REQUIRED_FLARESOLVERR_ENDPOINT
+        command.argv[2:4] == ("--mode", capacity.CACHE_CAPACITY_MODE)
         for command in commands
     )
 
@@ -2599,16 +2907,51 @@ def test_flaresolverr_endpoint_must_be_exact_safe_loopback_origin(endpoint):
 
 def test_evidence_file_is_atomic_create_once_and_mode_0600(tmp_path):
     target = tmp_path / "capacity.json"
-    report = {"status": "success", "publishes": False}
+    report = capacity._attach_report_sha256(
+        {"status": "success", "publishes": False}
+    )
 
     capacity._write_report(target, report)
 
     assert json.loads(target.read_text()) == report
+    assert capacity.verify_report_sha256(json.loads(target.read_text())) is True
+    assert hashlib.sha256(target.read_bytes()).hexdigest() != report["report_sha256"]
+    assert target.read_bytes() == capacity._canonical_json_bytes(report) + b"\n"
     assert target.stat().st_mode & 0o777 == 0o600
     assert list(tmp_path.iterdir()) == [target]
     with pytest.raises(FileExistsError):
         capacity._write_report(target, report)
     assert list(tmp_path.iterdir()) == [target]
+
+    tampered = dict(report, status="failed")
+    assert capacity.verify_report_sha256(tampered) is False
+
+
+def test_run_summary_retention_is_bounded_at_six_hour_iteration_scale():
+    accumulator = capacity.CapacityAccumulator()
+    total = 100_000
+    for iteration in range(total // capacity.WORKER_COUNT):
+        for worker_id in range(capacity.WORKER_COUNT):
+            capacity._retain_run_summary(
+                accumulator,
+                {
+                    "worker_id": worker_id,
+                    "iteration": iteration,
+                    "status": "success",
+                },
+            )
+
+    assert accumulator.run_summaries_total == total
+    assert len(accumulator.run_summaries) == capacity.WORKER_COUNT * 2
+    assert len(accumulator.run_summaries) <= capacity.MAX_RETAINED_RUN_SUMMARIES
+    assert {
+        (summary["worker_id"], summary["iteration"])
+        for summary in accumulator.run_summaries
+    } == {
+        *((worker_id, 0) for worker_id in range(capacity.WORKER_COUNT)),
+        *((worker_id, total // capacity.WORKER_COUNT - 1) for worker_id in range(capacity.WORKER_COUNT)),
+    }
+    assert len(json.dumps(accumulator.run_summaries)) < 2_000
 
 
 def test_procfs_sampler_includes_current_process_rss():
@@ -3005,6 +3348,123 @@ def test_owner_state_is_atomic_0600_and_removed_only_after_verified_cleanup(
 
         assert evidence["final_verified_zero"] is True
         assert evidence["state_file_removed"] is True
+        assert not state_path.exists()
+    finally:
+        lease.close()
+
+
+@pytest.mark.parametrize("direct_state_kind", ["valid", "dangling-symlink"])
+def test_retained_direct_owner_state_blocks_cache_without_browser_cleanup(
+    monkeypatch, tmp_path, direct_state_kind
+):
+    state_path = tmp_path / "owner.json"
+    cache_state_path = tmp_path / "owner.json.cache"
+    monkeypatch.setattr(
+        capacity, "_DEFAULT_SUPERVISOR_LOCK_PATH", tmp_path / "capacity.lock"
+    )
+    monkeypatch.setattr(capacity, "_DEFAULT_SESSION_OWNER_PATH", state_path)
+    if direct_state_kind == "valid":
+        capacity._write_owner_state(
+            state_path,
+            "b" * 24,
+            capacity.REQUIRED_FLARESOLVERR_ENDPOINT,
+            "sha256:" + "c" * 64,
+        )
+    else:
+        state_path.symlink_to(tmp_path / "missing-owner-state")
+    monkeypatch.setattr(capacity.secrets, "token_hex", lambda size: "a" * 24)
+    monkeypatch.setattr(
+        capacity,
+        "_probe_fresh_session_owner",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("probe called")),
+    )
+    monkeypatch.setattr(
+        capacity,
+        "_sweep_owned_browser_sessions",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("sweep called")),
+    )
+    stale_cleanups: list[tuple[str, object]] = []
+    finalized: list[str] = []
+
+    with pytest.raises(
+        capacity._SessionOwnershipPreparationError,
+        match="direct diagnostic ownership state blocks cache capacity startup",
+    ) as failure:
+        capacity._prepare_session_ownership(
+            _args(mode=capacity.CACHE_CAPACITY_MODE),
+            monotonic=time.monotonic,
+            sleep=lambda seconds: None,
+            browser_network_control=False,
+            cleanup_stale_workers=lambda owner, image_id: stale_cleanups.append(
+                (owner, image_id)
+            ),
+            finalize_worker_artifacts=lambda owner: finalized.append(owner) is None,
+        )
+
+    assert failure.value.evidence["lock_acquired"] is True
+    assert failure.value.evidence["preflight_required"] is True
+    assert failure.value.evidence["preflight_verified_zero"] is False
+    assert failure.value.evidence["state_file_removed"] is False
+    assert capacity._state_entry_exists(state_path) is True
+    assert not cache_state_path.exists()
+    assert stale_cleanups == []
+    assert finalized == []
+
+
+def test_stale_cache_owner_uses_exact_worker_cleanup_without_browser_cleanup(
+    monkeypatch, tmp_path
+):
+    state_path = tmp_path / "owner.json"
+    cache_state_path = tmp_path / "owner.json.cache"
+    monkeypatch.setattr(
+        capacity, "_DEFAULT_SUPERVISOR_LOCK_PATH", tmp_path / "capacity.lock"
+    )
+    monkeypatch.setattr(capacity, "_DEFAULT_SESSION_OWNER_PATH", state_path)
+    capacity._write_owner_state(
+        cache_state_path,
+        "b" * 24,
+        capacity.REQUIRED_FLARESOLVERR_ENDPOINT,
+        "sha256:" + "c" * 64,
+    )
+    monkeypatch.setattr(capacity.secrets, "token_hex", lambda size: "a" * 24)
+    monkeypatch.setattr(
+        capacity,
+        "_probe_fresh_session_owner",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("probe called")),
+    )
+    monkeypatch.setattr(
+        capacity,
+        "_sweep_owned_browser_sessions",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("sweep called")),
+    )
+    stale_cleanups: list[tuple[str, object]] = []
+    finalized: list[str] = []
+
+    def cleanup_stale(owner, image_id):
+        stale_cleanups.append((owner, image_id))
+        return ("d" * 64,)
+
+    lease = capacity._prepare_session_ownership(
+        _args(mode=capacity.CACHE_CAPACITY_MODE),
+        monotonic=time.monotonic,
+        sleep=lambda seconds: None,
+        browser_network_control=False,
+        cleanup_stale_workers=cleanup_stale,
+        finalize_worker_artifacts=lambda owner: finalized.append(owner) is None,
+    )
+    try:
+        assert capacity._read_owner_state(cache_state_path)[0] == "a" * 24
+        assert lease.preflight["required"] is True
+        assert lease.preflight["verified_zero"] is True
+        evidence = lease.finalize()
+        assert evidence["poll_attempts"] == 0
+        assert evidence["successful_polls"] == 0
+        assert evidence["stale_worker_cleanup_required"] is True
+        assert evidence["stale_worker_containers_removed"] == 1
+        assert evidence["worker_artifact_cleanup_verified"] is True
+        assert stale_cleanups == [("b" * 24, "sha256:" + "c" * 64)]
+        assert finalized == ["a" * 24]
+        assert not cache_state_path.exists()
         assert not state_path.exists()
     finally:
         lease.close()
@@ -3732,11 +4192,17 @@ def test_container_runtime_evidence_names_the_real_execution_mode():
     }
 
 
-def test_container_round_binds_exact_images_resources_and_reports(tmp_path):
+@pytest.mark.parametrize(
+    "mode", [capacity.DIRECT_DIAGNOSTIC_MODE, capacity.CACHE_CAPACITY_MODE]
+)
+def test_container_round_binds_exact_images_resources_and_reports(tmp_path, mode):
     deployment = _production_deployment(tmp_path)
     owner = "a" * 24
     commands = capacity._build_commands(
-        _args(catalog=str(capacity.REPO_ROOT / "configs/medallion/competitions.yaml")),
+        _args(
+            mode=mode,
+            catalog=str(capacity.REPO_ROOT / "configs/medallion/competitions.yaml"),
+        ),
         2,
         browser_session_owner=owner,
     )
@@ -3833,6 +4299,7 @@ def test_container_round_binds_exact_images_resources_and_reports(tmp_path):
     assert observed["flaresolverr_container_id"] == RUNNING_CONTAINER_IDS[
         "flaresolverr"
     ]
+    assert observed["owner"] == owner
     assert [worker.workload_argv[0] for worker in observed["workers"]] == [
         capacity._CONTAINER_WORKFLOW_PATH
     ] * capacity.WORKER_COUNT
@@ -4180,7 +4647,7 @@ def test_procfs_sampler_fails_when_a_required_root_is_not_visible():
 def test_runtime_identity_covers_canary_parser_transport_and_container_helpers():
     identity = capacity._runtime_identity(_parse_cli())
 
-    assert capacity.CANARY_VERSION == "whoscored-capacity-canary-v3"
+    assert capacity.CANARY_VERSION == "whoscored-capacity-canary-v4"
     assert len(identity["git_revision"]) == 40
     assert len(identity["manifest_sha256"]) == 64
     assert identity["python_executable"] == str(Path(sys.executable).resolve())

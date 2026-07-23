@@ -163,8 +163,8 @@ ROLLOUT_ACCEPTANCE_TIMEOUT_SECONDS = 10 * 3600
 MAX_CHARTER_HORIZON = timedelta(days=62)
 _CURRENT_ROLLOUT_PATH = Path("/var/lib/data-platform/whoscored-authority/rollout.json")
 _CURRENT_CHARTER_PATH = Path("/var/lib/data-platform/whoscored-authority/charter.json")
-_ROLLOUT_MANIFEST_SCHEMA_VERSION = 3
-_CHARTER_SCHEMA_VERSION = 4
+_ROLLOUT_MANIFEST_SCHEMA_VERSION = 4
+_CHARTER_SCHEMA_VERSION = 5
 _ROLLOUT_GENESIS_PROOF_SHA256 = hashlib.sha256(
     b"whoscored-rollout-promotion-genesis-v1"
 ).hexdigest()
@@ -232,6 +232,10 @@ _ROLLOUT_MANIFEST_FIELDS = frozenset(
         "classifier_sha256",
         "promotion_acceptance_sha256",
         "promotion_terminal_receipt_sha256",
+        "acceptance_mode",
+        "bootstrap_slots",
+        "capacity_receipt_sha256",
+        "provider_order_cap_bytes",
     }
 )
 _CHARTER_UNSIGNED_FIELDS = frozenset(
@@ -252,6 +256,10 @@ _CHARTER_UNSIGNED_FIELDS = frozenset(
         "classifier_sha256",
         "promotion_acceptance_sha256",
         "promotion_terminal_receipt_sha256",
+        "acceptance_mode",
+        "bootstrap_slots",
+        "capacity_receipt_sha256",
+        "provider_order_cap_bytes",
         "valid_from",
         "valid_until",
         "daily_cap_bytes",
@@ -277,6 +285,10 @@ _ROLLOUT_ACCEPTANCE_AUTHORITY_FIELDS = frozenset(
         "classifier_sha256",
         "promotion_acceptance_sha256",
         "promotion_terminal_receipt_sha256",
+        "acceptance_mode",
+        "bootstrap_slots",
+        "capacity_receipt_sha256",
+        "provider_order_cap_bytes",
     }
 )
 _ROLLOUT_AUTHORITY_REPORT_FIELDS = frozenset(
@@ -288,6 +300,292 @@ _ROLLOUT_AUTHORITY_REPORT_FIELDS = frozenset(
         "charter_sha256",
         "cohort_id",
         "rollout_manifest_sha256",
+    }
+)
+_CAPACITY_REPORT_FIELDS = frozenset(
+    {
+        "baseline_containers",
+        "canary_version",
+        "cleanup",
+        "cleanup_status",
+        "cleanup_elapsed_seconds",
+        "completed_by_worker",
+        "completed_runs",
+        "completed_worker_seconds",
+        "deadline_truncations",
+        "duration_seconds_observed",
+        "duration_seconds_requested",
+        "elapsed_seconds",
+        "ended_at",
+        "executes_ddl",
+        "gates",
+        "match_limit",
+        "max_aggregate_memory_bytes",
+        "max_container_memory_bytes",
+        "max_harness_rss_bytes",
+        "max_source_stage_count",
+        "max_worker_container_memory_bytes",
+        "max_worker_container_pids",
+        "mode",
+        "network_requests",
+        "oom_killed",
+        "page_unit_definition",
+        "page_units",
+        "paid_bytes",
+        "paid_proxy_bytes",
+        "paid_route_requests",
+        "peak_combined_rss_bytes",
+        "production_deployment",
+        "profile_limit",
+        "projected_page_units_per_day",
+        "publishes",
+        "raw_store_policy",
+        "report_sha256",
+        "repository_policy",
+        "restart_count",
+        "runs",
+        "run_summaries_retained",
+        "run_summaries_total",
+        "run_summaries_truncated",
+        "runtime_identity",
+        "runtime_release_identity",
+        "samples",
+        "schema_version",
+        "scopes",
+        "sealed_worker_runtime",
+        "seed_sha256",
+        "session_cleanup",
+        "source_request_attempts",
+        "started_at",
+        "status",
+        "stop_reasons",
+        "total_elapsed_seconds",
+        "worker_count",
+        "workers",
+        "writes_bronze",
+    }
+)
+_CAPACITY_GATE_NAMES = frozenset(
+    {
+        "browser_session_cleanup",
+        "cache_cleanup",
+        "cache_seed",
+        "container_restart_oom",
+        "memory",
+        "monitoring_evidence",
+        "network_isolation",
+        "non_publishing",
+        "paid_traffic",
+        "representative_workload",
+        "runtime_identity",
+        "sustained_duration",
+        "throughput",
+        "worker_health",
+        "worker_runtime_cleanup",
+    }
+)
+_CAPACITY_CANARY_VERSION = "whoscored-capacity-canary-v4"
+_CAPACITY_MODE = "cache-capacity-v1"
+_CAPACITY_SEED_SHA256 = (
+    "eb3739448a42a00f3a5812c20a0885ea691306634b2922cda1dd2d7c8490fb4a"
+)
+_CAPACITY_DURATION_SECONDS = 21_600
+_CAPACITY_WORKER_COUNT = 4
+_CAPACITY_MIN_PAGE_UNITS_PER_DAY = 144_000
+_CAPACITY_MAX_COMBINED_RSS_BYTES = 12 * 1024**3
+_CAPACITY_MAX_RUN_SUMMARIES = 16
+_CAPACITY_MAX_SAMPLES = 724
+_CAPACITY_SAMPLE_INTERVAL_SECONDS = Decimal(30)
+_CAPACITY_SAMPLE_CADENCE_TOLERANCE_SECONDS = Decimal("15")
+_CAPACITY_FINAL_SAMPLE_TOLERANCE_SECONDS = Decimal("5")
+_CAPACITY_WALL_CLOCK_TOLERANCE_SECONDS = Decimal("2")
+_CAPACITY_PAGE_UNIT_DEFINITION = (
+    "five reviewed cache source objects per successful workflow run "
+    "(match, preview, profile, and two stage payloads); each object is one unit"
+)
+_CAPACITY_CURL_CFFI_VERSION = "0.15.0"
+_CAPACITY_RUN_FIELDS = frozenset(
+    {
+        "cleanup_evidence_valid",
+        "entities",
+        "executes_ddl",
+        "iteration",
+        "mode",
+        "network_requests",
+        "page_units",
+        "paid_bytes",
+        "paid_route_requests",
+        "process_elapsed_seconds",
+        "publishes",
+        "returncode",
+        "scope",
+        "seed_evidence_valid",
+        "seed_sha256",
+        "source_request_attempts",
+        "source_stage_count",
+        "status",
+        "stderr_bytes",
+        "stderr_sha256",
+        "termination_reason",
+        "traffic_evidence_valid",
+        "worker_id",
+        "workflow_elapsed_seconds",
+        "writes_bronze",
+    }
+)
+_CAPACITY_SAMPLE_FIELDS = frozenset(
+    {
+        "aggregate_memory_bytes",
+        "completed_runs",
+        "container_memory_bytes",
+        "containers",
+        "elapsed_seconds",
+        "harness_rss_bytes",
+        "page_units",
+        "paid_bytes",
+        "paid_route_requests",
+        "projected_page_units_per_day",
+        "rss_process_count",
+        "source_request_attempts",
+        "worker_container_memory_bytes",
+        "worker_container_pids",
+        "worker_containers",
+    }
+)
+_CAPACITY_CONTAINER_FIELDS = frozenset(
+    {
+        "command_contract_ok",
+        "compose_identity_ok",
+        "healthy",
+        "id",
+        "image_id",
+        "image_identity_contract_ok",
+        "immutable_payload_contract_ok",
+        "memory_limit_bytes",
+        "memory_usage_bytes",
+        "name",
+        "oom_killed",
+        "pid",
+        "process_count",
+        "production_admission_contract_ok",
+        "published_endpoint_contract_ok",
+        "restart_count",
+        "running",
+        "security_contract_ok",
+        "status",
+    }
+)
+_CAPACITY_WORKER_CONTAINER_FIELDS = frozenset(
+    {
+        "container_id",
+        "exit_code",
+        "iteration",
+        "memory_usage_bytes",
+        "oom_killed",
+        "pids_current",
+        "running",
+        "status",
+        "worker_id",
+    }
+)
+_CAPACITY_RUNTIME_IDENTITY_FIELDS = frozenset(
+    {
+        "dependency_versions",
+        "file_sha256",
+        "git_clean",
+        "git_revision",
+        "manifest_sha256",
+        "production_deployment",
+        "python_executable",
+        "python_prefix",
+        "python_version",
+        "worker_image_id",
+    }
+)
+_CAPACITY_RUNTIME_CONTRACT_RELATIVE = "scrapers/whoscored/runtime_contract.lock"
+_CAPACITY_RUNTIME_FILE_PATHS = frozenset(
+    {
+        ".dockerignore",
+        "compose.seaweedfs-supervised.yaml",
+        "compose.yaml",
+        "configs/medallion/competitions.yaml",
+        "configs/seaweedfs/S3ProxyCaddyfile",
+        "docker/images/airflow/requirements-scraping.txt",
+        "docker/images/airflow/whoscored-build-provenance-attestation.json",
+        "docker/images/airflow/whoscored-build-provenance-manifest.json",
+        "docker/images/airflow/whoscored_capacity_worker_bootstrap.py",
+        "docker/images/flaresolverr-whoscored/Dockerfile",
+        "docker/images/flaresolverr-whoscored/Dockerfile.dockerignore",
+        "docker/images/flaresolverr-whoscored/entrypoint.sh",
+        "scrapers/__init__.py",
+        "scrapers/base/__init__.py",
+        "scrapers/base/flaresolverr_client.py",
+        "scrapers/base/iceberg_writer.py",
+        "scrapers/base/sql_validator.py",
+        "scrapers/base/trino_manager.py",
+        "scrapers/utils/__init__.py",
+        "scrapers/utils/rate_limiter.py",
+        "scrapers/whoscored/__init__.py",
+        "scrapers/whoscored/catalog.py",
+        "scrapers/whoscored/detailed_feeds.py",
+        "scrapers/whoscored/domain.py",
+        "scrapers/whoscored/parsers.py",
+        "scrapers/whoscored/profile_policy.py",
+        "scrapers/whoscored/proxy_campaign.py",
+        "scrapers/whoscored/raw_store.py",
+        "scrapers/whoscored/repository.py",
+        _CAPACITY_RUNTIME_CONTRACT_RELATIVE,
+        "scrapers/whoscored/runtime_contract.py",
+        "scrapers/whoscored/runtime_limits.py",
+        "scrapers/whoscored/service.py",
+        "scrapers/whoscored/source_circuit.py",
+        "scrapers/whoscored/stage_feeds.py",
+        "scrapers/whoscored/transport.py",
+        "scripts/audit_seaweedfs_control_network.py",
+        "scripts/audit_seaweedfs_runtime_container.py",
+        "scripts/compose.sh",
+        "scripts/flaresolverr_extended.py",
+        "scripts/proxy_filter/filter_proxy.py",
+        "scripts/research/bench_whoscored_capacity.py",
+        "scripts/research/bench_whoscored_workflow.py",
+        "scripts/research/whoscored_capacity_container_runtime.py",
+        "scripts/research/whoscored_capacity_worker_exec.py",
+        "scripts/seaweedfs_legacy_entrypoint.sh",
+        "scripts/seaweedfs_lifecycle_lock.sh",
+        "scripts/validate_seaweedfs_s3_identity_config.py",
+        "scripts/validate_whoscored_build_provenance.py",
+        "scripts/whoscored_production_admission.py",
+    }
+)
+_CAPACITY_SEALED_RUNTIME_PATHS = frozenset(
+    {
+        "configs/medallion/competitions.yaml",
+        "scrapers/__init__.py",
+        "scrapers/base/__init__.py",
+        "scrapers/base/flaresolverr_client.py",
+        "scrapers/base/iceberg_writer.py",
+        "scrapers/base/sql_validator.py",
+        "scrapers/base/trino_manager.py",
+        "scrapers/utils/__init__.py",
+        "scrapers/utils/rate_limiter.py",
+        "scrapers/whoscored/__init__.py",
+        "scrapers/whoscored/catalog.py",
+        "scrapers/whoscored/detailed_feeds.py",
+        "scrapers/whoscored/domain.py",
+        "scrapers/whoscored/parsers.py",
+        "scrapers/whoscored/profile_policy.py",
+        "scrapers/whoscored/proxy_campaign.py",
+        "scrapers/whoscored/raw_store.py",
+        "scrapers/whoscored/repository.py",
+        _CAPACITY_RUNTIME_CONTRACT_RELATIVE,
+        "scrapers/whoscored/runtime_contract.py",
+        "scrapers/whoscored/runtime_limits.py",
+        "scrapers/whoscored/service.py",
+        "scrapers/whoscored/source_circuit.py",
+        "scrapers/whoscored/stage_feeds.py",
+        "scrapers/whoscored/transport.py",
+        "scripts/research/bench_whoscored_workflow.py",
+        "scripts/research/whoscored_capacity_worker_exec.py",
     }
 )
 PROTECTED_SERVICES = (
@@ -306,6 +604,11 @@ GATEWAY_PROTECTED_SERVICES = (
 )
 COMMON_PROJECT = "data-platform"
 GATEWAY_PROJECT = "whoscored-gw"
+_COMMON_ONLY_ENV_FILES = (
+    Path("/root/data-platform-football/.env"),
+    Path("/root/.secrets/whoscored-runtime-v2.env"),
+    Path("/root/.secrets/whoscored-proxy-v2.env"),
+)
 _SERVICE_PROJECT = {
     **{service: COMMON_PROJECT for service in COMMON_PROTECTED_SERVICES},
     **{service: GATEWAY_PROJECT for service in GATEWAY_PROTECTED_SERVICES},
@@ -374,7 +677,7 @@ SELECT jsonb_build_object(
       'dag_id', dag_id, 'run_id', run_id, 'state', state
     ) ORDER BY dag_id, run_id), '[]'::jsonb)
     FROM dag_run
-    WHERE state IN ({', '.join(repr(state) for state in _CUTOVER_ACTIVE_DAGRUN_STATES)})
+    WHERE state IN ({", ".join(repr(state) for state in _CUTOVER_ACTIVE_DAGRUN_STATES)})
   ),
   'active_task_instances', (
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
@@ -385,9 +688,9 @@ SELECT jsonb_build_object(
     LEFT JOIN dag_run AS dr
       ON dr.dag_id = ti.dag_id AND dr.run_id = ti.run_id
     WHERE (
-      dr.state IN ({', '.join(repr(state) for state in _CUTOVER_ACTIVE_DAGRUN_STATES)})
-      AND ti.state IN ({', '.join(repr(state) for state in _CUTOVER_ACTIVE_TASK_STATES)})
-    ) OR ti.state IN ({', '.join(repr(state) for state in _CUTOVER_INDEPENDENT_TASK_STATES)})
+      dr.state IN ({", ".join(repr(state) for state in _CUTOVER_ACTIVE_DAGRUN_STATES)})
+      AND ti.state IN ({", ".join(repr(state) for state in _CUTOVER_ACTIVE_TASK_STATES)})
+    ) OR ti.state IN ({", ".join(repr(state) for state in _CUTOVER_INDEPENDENT_TASK_STATES)})
   ),
   'active_non_scheduler_jobs', (
     SELECT COALESCE(jsonb_agg(jsonb_build_object(
@@ -1207,7 +1510,7 @@ _SCHEDULER_ENVIRONMENT_NAMES = frozenset(
     WHOSCORED_BACKUP_DESTINATION_S3_SCHEME
     WHOSCORED_BACKUP_DESTINATION_S3_SECRET_KEY
     WHOSCORED_BACKUP_DESTINATION_URI
-    WHOSCORED_BACKUP_LOCAL_RETENTION_DAYS
+    AIRFLOW__CORE__PLUGINS_FOLDER WHOSCORED_BACKUP_LOCAL_RETENTION_DAYS
     WHOSCORED_BACKUP_RESTORE_DRILL_EVIDENCE_PATH
     WHOSCORED_BACKUP_RESTORE_DRILL_MAX_AGE_HOURS
     WHOSCORED_BACKUP_RESTORE_S3_ACCESS_KEY
@@ -1274,6 +1577,7 @@ _EXPECTED_ENVIRONMENT_NAMES = {
             "PROXY_FILTER_CONTROL_TOKEN",
             "PROXY_POOL_JSON",
             "TM_PROXY_CONTROL_TOKEN",
+            "WHOSCORED_PROVIDER_ORDER_CAP_BYTES",
             "WHOSCORED_PROVIDER_ORDER_ID",
             "WHOSCORED_PROVIDER_POLICY_SHA256",
             "WHOSCORED_PROXY_APPROVAL_HMAC_SECRET",
@@ -1289,6 +1593,7 @@ _FIXED_ENVIRONMENT = {
         "AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION": "true",
         "AIRFLOW__CORE__EXECUTOR": "LocalExecutor",
         "AIRFLOW__CORE__LOAD_EXAMPLES": "false",
+        "AIRFLOW__CORE__PLUGINS_FOLDER": "/opt/airflow/dags/plugins",
         "AIRFLOW__WEBSERVER__EXPOSE_CONFIG": "false",
         "FBREF_PROXY_CONTROL_URL": "http://fbref_proxy_filter:8899",
         "FBREF_PROXY_LEASE_TTL_SECONDS": "7200",
@@ -1455,6 +1760,18 @@ class ValidatedBindingsEvidence:
     validated_manifest_sha256: str
     validated_source_tree_sha256: str
     validated_payload_image_ids: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class ProtectedComposeInputEvidence:
+    """One fd-stable, protected Compose input captured by this admission."""
+
+    raw: bytes
+    identity: tuple[int, ...]
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.raw).hexdigest()
 
 
 class _DuplicateKey(ValueError):
@@ -2067,7 +2384,11 @@ def _validate_scheduler_store_uris(environment: Mapping[str, str]) -> None:
 
 
 def _validate_rendered_environment(
-    environment: Mapping[str, str], *, service: str
+    environment: Mapping[str, str],
+    *,
+    service: str,
+    operational_cap_bytes: int = 1_000_000_000,
+    provider_order_cap_bytes: int = 1_000_000_000,
 ) -> None:
     expected_names = _EXPECTED_ENVIRONMENT_NAMES[service]
     legacy_scheduler_names = (
@@ -2165,9 +2486,19 @@ def _validate_rendered_environment(
         ):
             raise AdmissionError("rendered WhoScored provider-policy identity differs")
         _positive_capped_decimal(
+            environment.get("WHOSCORED_PROVIDER_ORDER_CAP_BYTES", ""),
+            flag="whoscored-provider-order-cap-bytes",
+            maximum=1_000_000_000,
+        )
+        if (
+            int(environment["WHOSCORED_PROVIDER_ORDER_CAP_BYTES"])
+            != provider_order_cap_bytes
+        ):
+            raise AdmissionError("rendered WhoScored provider order cap differs")
+        _positive_capped_decimal(
             environment.get("WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES", ""),
             flag="daily-budget-bytes",
-            maximum=300_000_000,
+            maximum=operational_cap_bytes,
         )
         if environment.get("WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES") != "2000000":
             raise AdmissionError("rendered max-lease-bytes differs from policy")
@@ -2370,7 +2701,11 @@ def _positive_capped_decimal(value: str, *, flag: str, maximum: int) -> None:
 
 
 def _command_projection(
-    command: tuple[str, ...] | None, *, service: str
+    command: tuple[str, ...] | None,
+    *,
+    service: str,
+    operational_cap_bytes: int = 1_000_000_000,
+    provider_order_cap_bytes: int = 1_000_000_000,
 ) -> tuple[str, ...]:
     if service in {"flaresolverr", "flaresolverr_whoscored_paid"}:
         if command is not None:
@@ -2392,27 +2727,38 @@ def _command_projection(
     variable_limits = {
         "${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES:?set exact provider-policy daily cap in decimal bytes}": (
             "--daily-budget-bytes",
-            300_000_000,
+            operational_cap_bytes,
+            None,
+        ),
+        "${WHOSCORED_PROVIDER_ORDER_CAP_BYTES:?set exact signed provider gross order cap in decimal bytes}": (
+            "--whoscored-provider-order-cap-bytes",
+            1_000_000_000,
+            provider_order_cap_bytes,
         ),
         "${WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES:-2000000}": (
             "--max-lease-bytes",
             2_000_000,
+            None,
         ),
         "${WHOSCORED_PROXY_FILTER_MAX_LEASE_TTL_SECONDS:-3600}": (
             "--max-lease-ttl-seconds",
             3_600,
+            None,
         ),
         "${WHOSCORED_PROXY_FILTER_DAGRUN_BUDGET_BYTES:-1000000000}": (
             "--dagrun-budget-bytes",
             1_000_000_000,
+            None,
         ),
         "${WHOSCORED_PROXY_FILTER_URL_BUDGET_BYTES:-2000000}": (
             "--url-budget-bytes",
             2_000_000,
+            None,
         ),
         "${WHOSCORED_PROXY_FILTER_MAX_ACTIVE_LEASES:-2}": (
             "--max-active-leases",
             2,
+            None,
         ),
     }
     for index, expected in enumerate(template):
@@ -2421,25 +2767,56 @@ def _command_projection(
             if command[index] != expected:
                 raise AdmissionError("rendered WhoScored proxy command differs")
             continue
-        flag, maximum = variable
+        flag, maximum, exact = variable
         if index == 0 or template[index - 1] != flag:
             raise AdmissionError(
                 "WhoScored proxy command template is internally invalid"
             )
         _positive_capped_decimal(command[index], flag=flag, maximum=maximum)
+        if exact is not None and int(command[index]) != exact:
+            raise AdmissionError(f"rendered {flag} differs from provider policy")
     return command
 
 
 def verify_rendered_compose(
-    rendered: Mapping[str, Any], bindings: Mapping[str, str]
+    rendered: Mapping[str, Any],
+    bindings: Mapping[str, str],
+    *,
+    provider_order_cap_bytes: int | None = None,
+    selected_services: Sequence[str] = PROTECTED_SERVICES,
 ) -> dict[str, dict[str, Any]]:
+    selected = tuple(selected_services)
+    if (
+        not selected
+        or len(selected) != len(set(selected))
+        or any(service not in _PROTECTED_SERVICE_SET for service in selected)
+    ):
+        raise AdmissionError("rendered protected service selection is invalid")
+    if provider_order_cap_bytes is None:
+        gross_cap_bytes = 1_000_000_000
+    elif (
+        isinstance(provider_order_cap_bytes, bool)
+        or not isinstance(provider_order_cap_bytes, int)
+        or not 1 <= provider_order_cap_bytes <= 1_000_000_000
+    ):
+        raise AdmissionError("provider order cap is invalid")
+    else:
+        gross_cap_bytes = provider_order_cap_bytes
+    operational_cap_bytes = gross_cap_bytes * 95 // 100
     services = rendered.get("services")
     if not isinstance(services, dict):
         raise AdmissionError("rendered Compose model has no services mapping")
+    expected_network_names = {
+        name for service in selected for name in _EXPECTED_NETWORKS[service]
+    }
     networks = rendered.get("networks")
-    if not isinstance(networks, dict) or any(
-        networks.get(name) != policy
-        for name, policy in _EXPECTED_NETWORK_DEFINITIONS.items()
+    if (
+        not isinstance(networks, dict)
+        or set(networks) != expected_network_names
+        or any(
+            networks.get(name) != _EXPECTED_NETWORK_DEFINITIONS[name]
+            for name in expected_network_names
+        )
     ):
         raise AdmissionError("rendered protected network definitions differ")
     volumes = rendered.get("volumes")
@@ -2448,7 +2825,7 @@ def verify_rendered_compose(
     }:
         raise AdmissionError("rendered protected volume definition differs")
     projections: dict[str, dict[str, Any]] = {}
-    for service in PROTECTED_SERVICES:
+    for service in selected:
         model = services.get(service)
         if not isinstance(model, dict):
             raise AdmissionError(
@@ -2514,7 +2891,12 @@ def verify_rendered_compose(
             raise AdmissionError(f"rendered environment values differ: {service}")
         if _forbidden_environment_names(environment, include_empty=True):
             raise AdmissionError(f"rendered environment has loader controls: {service}")
-        _validate_rendered_environment(environment, service=service)
+        _validate_rendered_environment(
+            environment,
+            service=service,
+            operational_cap_bytes=operational_cap_bytes,
+            provider_order_cap_bytes=gross_cap_bytes,
+        )
         if model.get("profiles") not in (None, ["whoscored-paid"]):
             raise AdmissionError(f"rendered protected profile differs: {service}")
         raw_shm_size = model.get("shm_size")
@@ -2547,7 +2929,12 @@ def verify_rendered_compose(
         command = _string_sequence(
             model.get("command"), label=f"rendered command for {service}"
         )
-        effective_command = _command_projection(command, service=service)
+        effective_command = _command_projection(
+            command,
+            service=service,
+            operational_cap_bytes=operational_cap_bytes,
+            provider_order_cap_bytes=gross_cap_bytes,
+        )
         policy = _SECURITY_POLICY[service]
         privileged = model.get("privileged")
         if privileged is not None and privileged is not False:
@@ -2619,6 +3006,8 @@ def verify_rendered_compose(
             "volumes": volumes,
             "shm_size": _EXPECTED_SHM_SIZE[service],
         }
+    if set(selected) != _PROTECTED_SERVICE_SET:
+        return projections
     scheduler_environment = projections["airflow-scheduler"]["environment"]
     gateway_environment = projections["whoscored_paid_gateway"]["environment"]
     paid_browser_environment = projections["flaresolverr_whoscored_paid"]["environment"]
@@ -2692,7 +3081,9 @@ from dags.scripts.whoscored_rollout_acceptance import (
     run_evidence_sha256,
     scope_plan_sha256,
     terminal_task_states_evidence,
+    validated_bootstrap_slo_evidence,
 )
+from dags.scripts.whoscored_bootstrap import normalize_bootstrap_authority
 from scrapers.whoscored.runtime_contract import validate_runtime_contract
 
 
@@ -2703,6 +3094,8 @@ def utc_iso(value):
 
 
 rollout_id = sys.argv[1]
+expected_authority = json.loads(sys.argv[2])
+expected_bootstrap = normalize_bootstrap_authority(expected_authority)
 runtime = validate_runtime_contract(report_schema_version=3)
 runtime_release = {
     "parser_version": runtime["parser_version"],
@@ -2730,7 +3123,13 @@ terminal_runs = acceptance.get("terminal_runs")
 if not isinstance(terminal_runs, list) or len(terminal_runs) != 6:
     raise RuntimeError("WhoScored rollout acceptance lacks six terminal DagRuns")
 run_ids = [run.get("run_id") for run in terminal_runs if isinstance(run, dict)]
-if len(run_ids) != 6 or len(run_ids) != len(set(run_ids)):
+expected_run_ids = [slot["run_id"] for slot in expected_bootstrap["bootstrap_slots"]]
+if (
+    len(run_ids) != 6
+    or len(run_ids) != len(set(run_ids))
+    or run_ids != expected_run_ids
+    or acceptance.get("authority") != expected_authority
+):
     raise RuntimeError("WhoScored rollout acceptance DagRun identities are invalid")
 verified_terminal_runs = []
 with create_session() as session:
@@ -2789,6 +3188,9 @@ with create_session() as session:
             or str(dag_run.state or "").lower().split(".")[-1] != "success"
             or utc_iso(dag_run.execution_date) != witness.get("logical_date")
             or dag_run.end_date is None
+            or dag_run.start_date is None
+            or dag_run.end_date < dag_run.start_date
+            or (dag_run.end_date - dag_run.start_date).total_seconds() > 21600
             or dag_run.end_date < dag_run.execution_date
             or not is_countable_scheduled_run(
                 run_id=dag_run.run_id,
@@ -2807,6 +3209,7 @@ with create_session() as session:
             .filter(
                 TaskInstance.dag_id == "dag_ingest_whoscored",
                 TaskInstance.run_id == run_id,
+                TaskInstance.task_id != "seal_rollout_acceptance_and_pause",
             )
             .all()
         )
@@ -2880,6 +3283,11 @@ with create_session() as session:
             name: by_task_id[task_id]
             for name, task_id in singleton_task_ids.items()
         }
+        validated_bootstrap_slo_evidence(
+            singleton_values["daily_slo"],
+            scope=singleton_values["scope_plan"],
+            release=runtime_release,
+        )
         observed_idempotency = idempotency_evidence(
             scope_dq=scope_dq_values,
             profile_dq=singleton_values["profile_dq"],
@@ -2907,6 +3315,9 @@ with create_session() as session:
         verified_terminal_runs.append(
             {
                 "completed_at": utc_iso(dag_run.end_date),
+                "duration_seconds": int(
+                    (dag_run.end_date - dag_run.start_date).total_seconds()
+                ),
                 "evidence_sha256": observed_evidence_sha256,
                 "idempotency": observed_idempotency,
                 "logical_date": witness["logical_date"],
@@ -3096,6 +3507,7 @@ def _validate_verified_rollout_runs(
     *,
     catalog_active_scope_count: int,
     expected_scope_counts: Sequence[int] | None = None,
+    expected_bootstrap_slots: Sequence[Mapping[str, Any]] | None = None,
     require_fresh_completion: bool = True,
 ) -> None:
     """Validate the compact metadata-DB witnesses returned by the fixed probe."""
@@ -3123,7 +3535,7 @@ def _validate_verified_rollout_runs(
     logical_dates: list[datetime] = []
     completed_dates: list[datetime] = []
     for position, item in enumerate(value):
-        if not isinstance(item, dict) or set(item) != {
+        expected_fields = {
             "completed_at",
             "evidence_sha256",
             "idempotency",
@@ -3132,7 +3544,10 @@ def _validate_verified_rollout_runs(
             "scope_dq",
             "scope_plan_sha256",
             "task_states",
-        }:
+        }
+        if expected_bootstrap_slots is not None:
+            expected_fields.add("duration_seconds")
+        if not isinstance(item, dict) or set(item) != expected_fields:
             raise AdmissionError(
                 "WhoScored verified terminal DagRun witness is invalid"
             )
@@ -3150,6 +3565,23 @@ def _validate_verified_rollout_runs(
             raise AdmissionError(
                 "WhoScored verified terminal DagRun identity is invalid"
             )
+        if expected_bootstrap_slots is not None:
+            if len(expected_bootstrap_slots) != len(expected_scope_counts):
+                raise AdmissionError(
+                    "WhoScored signed bootstrap slot set is incomplete"
+                )
+            expected_slot = expected_bootstrap_slots[position]
+            duration_seconds = item.get("duration_seconds")
+            if (
+                expected_slot.get("run_id") != run_id
+                or expected_slot.get("logical_date") != logical_raw
+                or isinstance(duration_seconds, bool)
+                or not isinstance(duration_seconds, int)
+                or not 0 <= duration_seconds <= 21_600
+            ):
+                raise AdmissionError(
+                    "WhoScored verified DagRun differs from signed bootstrap SLO"
+                )
         try:
             logical_date = datetime.fromisoformat(logical_raw.replace("Z", "+00:00"))
             completed_at = datetime.fromisoformat(completed_raw.replace("Z", "+00:00"))
@@ -3288,6 +3720,7 @@ def _validate_current_rollout_projection(
             or _DIGEST.fullmatch(authority[field]) is None
         ):
             raise AdmissionError("current signed rollout authority is invalid")
+    _normalized_bootstrap_authority(authority)
     for field in (
         "catalog_active_scopes_sha256",
         "charter_sha256",
@@ -3344,6 +3777,7 @@ def _validate_current_issuance_projection(
             or _DIGEST.fullmatch(authority[field]) is None
         ):
             raise AdmissionError("current signed issuance authority is invalid")
+    _normalized_bootstrap_authority(authority)
     for field in (
         "catalog_active_scopes_sha256",
         "charter_sha256",
@@ -3637,6 +4071,7 @@ def verify_rollout_acceptance(
             "-c",
             _ROLLOUT_ACCEPTANCE_PROBE,
             rollout_id,
+            _authority_canonical_bytes(rollout_authority["authority"]).decode("utf-8"),
         )
     )
     if not raw or len(raw) > 64 * 1024:
@@ -3799,6 +4234,7 @@ def verify_rollout_acceptance(
     _validate_verified_rollout_runs(
         report.get("terminal_runs"),
         catalog_active_scope_count=catalog["active_scope_count"],
+        expected_bootstrap_slots=expected_authority["bootstrap_slots"],
     )
     terminal_runs = report["terminal_runs"]
     latest_scheduled_run = report.get("latest_scheduled_run")
@@ -4144,6 +4580,139 @@ def _fixed_project_arguments(
     return tuple(arguments), config_files
 
 
+def render_attested_common_project(
+    bindings: Mapping[str, str],
+    *,
+    root: Path,
+    common_override_path: Path,
+    env_files: Sequence[Path],
+    runner: DockerRunner = _run_docker,
+    protected_inputs: Mapping[Path, bytes] | None = None,
+) -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, str],
+    tuple[Path, ...],
+    dict[str, Any],
+]:
+    """Render and fully verify only the ready common production project."""
+
+    if set(bindings) != _PROTECTED_SERVICE_SET:
+        raise AdmissionError("common render bindings omit a protected service")
+    verify_override(common_override_path, bindings, COMMON_PROTECTED_SERVICES)
+    prefix, config_files = _fixed_project_arguments(
+        root=root,
+        project=COMMON_PROJECT,
+        override_path=common_override_path,
+        env_files=env_files,
+    )
+    input_paths = (*config_files, *env_files)
+    snapshots = {
+        path: _read_regular_file(path, label="Compose admission input")
+        for path in input_paths
+    }
+    if protected_inputs is not None and (
+        set(protected_inputs) != set(snapshots)
+        or any(
+            not hmac.compare_digest(protected_inputs[path], snapshot[0])
+            for path, snapshot in snapshots.items()
+        )
+    ):
+        raise AdmissionError("protected common Compose inputs differ")
+
+    raw = runner((*prefix, "config", "--format", "json"))
+    try:
+        rendered = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+    except (_DuplicateKey, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AdmissionError("common Compose returned ambiguous JSON") from exc
+    services = rendered.get("services") if isinstance(rendered, dict) else None
+    if (
+        not isinstance(rendered, dict)
+        or rendered.get("name") != COMMON_PROJECT
+        or not isinstance(services, dict)
+        or any(service not in services for service in COMMON_PROTECTED_SERVICES)
+        or any(service in services for service in GATEWAY_PROTECTED_SERVICES)
+    ):
+        raise AdmissionError("rendered common Compose boundary differs")
+    rendered_networks = rendered.get("networks")
+    common_network_names = {
+        name
+        for service in COMMON_PROTECTED_SERVICES
+        for name in _EXPECTED_NETWORKS[service]
+    }
+    owned_common_networks = common_network_names - set(_COMMON_EXTERNAL_NETWORKS)
+    if (
+        not isinstance(rendered_networks, dict)
+        or any(
+            rendered_networks.get(name) != _EXPECTED_NETWORK_DEFINITIONS[name]
+            for name in owned_common_networks
+        )
+        or any(
+            rendered_networks.get(name) != definition
+            for name, definition in _COMMON_EXTERNAL_NETWORKS.items()
+        )
+    ):
+        raise AdmissionError("rendered common Compose networks differ")
+    protected_rendered = {
+        "services": {
+            service: services[service] for service in COMMON_PROTECTED_SERVICES
+        },
+        "networks": {
+            # The common Compose model must declare paid-api as external.  The
+            # generic protected-service verifier receives the exact owned
+            # network policy so scheduler attachment semantics are checked
+            # without pretending the common project owns that network.
+            name: _EXPECTED_NETWORK_DEFINITIONS[name]
+            for name in common_network_names
+        },
+        "volumes": rendered.get("volumes"),
+    }
+    projections = verify_rendered_compose(
+        protected_rendered,
+        bindings,
+        selected_services=COMMON_PROTECTED_SERVICES,
+    )
+    scheduler_environment = projections["airflow-scheduler"]["environment"]
+    if (
+        scheduler_environment.get("WHOSCORED_SOURCE_POOL_SLOTS") != "4"
+        or scheduler_environment.get("WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY")
+        != "144000"
+    ):
+        raise AdmissionError(
+            "common capacity profile must use four source slots and 144000 units/day"
+        )
+    config_hashes: dict[str, str] = {}
+    for service in COMMON_PROTECTED_SERVICES:
+        raw_hash = runner((*prefix, "config", "--hash", service))
+        try:
+            fields = raw_hash.decode("ascii").strip().split()
+        except UnicodeDecodeError as exc:
+            raise AdmissionError(
+                f"common Compose config hash is non-ASCII: {service}"
+            ) from exc
+        if (
+            len(fields) != 2
+            or fields[0] != service
+            or _CONFIG_HASH.fullmatch(fields[1]) is None
+        ):
+            raise AdmissionError(f"common Compose config hash is invalid: {service}")
+        config_hashes[service] = fields[1]
+    for path, (expected_raw, expected_identity) in snapshots.items():
+        actual_raw, actual_identity = _read_regular_file(
+            path, label="Compose admission input"
+        )
+        if actual_identity != expected_identity or not hmac.compare_digest(
+            actual_raw, expected_raw
+        ):
+            raise AdmissionError(f"common Compose admission input changed: {path}")
+    if protected_inputs is not None:
+        _validate_bind_source_policy(
+            projections,
+            root=root,
+            selected_services=COMMON_PROTECTED_SERVICES,
+        )
+    return projections, config_hashes, config_files, rendered
+
+
 def render_attested_projects(
     bindings: Mapping[str, str],
     *,
@@ -4254,6 +4823,7 @@ def render_attested_projects(
         for name, authority_name in (
             ("WHOSCORED_PROVIDER_ORDER_ID", "order_id"),
             ("WHOSCORED_PROVIDER_POLICY_SHA256", "provider_policy_sha256"),
+            ("WHOSCORED_PROVIDER_ORDER_CAP_BYTES", "order_cap_bytes"),
             ("WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES", "daily_cap_bytes"),
         )
     ):
@@ -4315,7 +4885,11 @@ def render_attested_projects(
         },
         "volumes": common.get("volumes"),
     }
-    projections = verify_rendered_compose(combined, bindings)
+    projections = verify_rendered_compose(
+        combined,
+        bindings,
+        provider_order_cap_bytes=provider_authority.get("order_cap_bytes"),
+    )
     if protected_inputs is not None:
         _validate_bind_source_policy(projections, root=root)
     return projections, config_hashes, config_files_by_project, rendered_projects
@@ -4593,9 +5167,7 @@ def _verify_docker_network(
             )
         endpoint_names: set[str] = set()
         for container_id, endpoint in containers.items():
-            endpoint_name = (
-                endpoint.get("Name") if isinstance(endpoint, dict) else None
-            )
+            endpoint_name = endpoint.get("Name") if isinstance(endpoint, dict) else None
             if (
                 not isinstance(container_id, str)
                 or _CONTAINER_ID.fullmatch(container_id) is None
@@ -4919,8 +5491,7 @@ def _verified_cutover_postgres(*, runner: DockerRunner) -> str:
         or state.get("Status") != "running"
         or state.get("Running") is not True
         or any(
-            state.get(field) is not False
-            for field in ("Dead", "Paused", "Restarting")
+            state.get(field) is not False for field in ("Dead", "Paused", "Restarting")
         )
         or not isinstance(health, dict)
         or health.get("Status") != "healthy"
@@ -4943,7 +5514,7 @@ def _cutover_psql_json(
             container_id,
             "/bin/sh",
             "-ceu",
-            'exec /usr/local/bin/psql -X --quiet --tuples-only --no-align '
+            "exec /usr/local/bin/psql -X --quiet --tuples-only --no-align "
             '--set=ON_ERROR_STOP=1 --username "$POSTGRES_USER" '
             '--dbname airflow --command "$1"',
             "whoscored-cutover-read-only",
@@ -5002,9 +5573,7 @@ def snapshot_cutover_dag_pauses(
     }
 
 
-def verify_cutover_quiescence(
-    *, runner: DockerRunner = _run_docker
-) -> dict[str, Any]:
+def verify_cutover_quiescence(*, runner: DockerRunner = _run_docker) -> dict[str, Any]:
     """Prove one cross-source, read-only metadata snapshot has no active work."""
 
     container_id = _verified_cutover_postgres(runner=runner)
@@ -5028,9 +5597,7 @@ def verify_cutover_quiescence(
     ):
         raise AdmissionError("cutover quiescence snapshot schema differs")
     _parse_cutover_timestamp(snapshot.get("observed_at"), label="DB observation time")
-    blockers = {
-        field: snapshot[field] for field in active_fields if snapshot[field]
-    }
+    blockers = {field: snapshot[field] for field in active_fields if snapshot[field]}
     if blockers:
         raise AdmissionError(
             "shared scheduler cutover is not quiescent: "
@@ -5343,11 +5910,7 @@ def _verify_legacy_rollback_model(
         config_files = tuple(record["config_files"])
         environment_files = tuple(record["environment_files"])
         working_directory = record["working_directory"]
-        profiles = (
-            ("whoscored-paid",)
-            if service in GATEWAY_PROTECTED_SERVICES
-            else ()
-        )
+        profiles = ("whoscored-paid",) if service in GATEWAY_PROTECTED_SERVICES else ()
         input_paths = (*config_files, *environment_files)
         before = {
             path: _validated_cutover_input_evidence(path, reader=input_reader)
@@ -5402,18 +5965,14 @@ def _verify_legacy_rollback_model(
                     f"legacy rollback network model differs: {service} {logical_name}"
                 )
         try:
-            raw_hash = runner((*prefix, "config", "--hash", service)).decode(
-                "ascii"
-            )
+            raw_hash = runner((*prefix, "config", "--hash", service)).decode("ascii")
         except UnicodeDecodeError as exc:
             raise AdmissionError(
                 f"legacy rollback Compose hash is not ASCII: {service}"
             ) from exc
         fields = raw_hash.strip().split()
         if fields != [service, record["config_hash"]]:
-            raise AdmissionError(
-                f"legacy rollback Compose hash differs: {service}"
-            )
+            raise AdmissionError(f"legacy rollback Compose hash differs: {service}")
         image = _docker_object(
             runner(("image", "inspect", str(record["image"]))),
             label=f"legacy rollback image inspect for {service}",
@@ -5566,9 +6125,7 @@ def verify_rollback_bundle(
                 raise AdmissionError("legacy rollback network inventory differs")
             network_ids.add(record["id"])
             if field == "retained_networks":
-                member_services = _LEGACY_CUTOVER_RETAINED_MEMBERS[
-                    str(logical_name)
-                ]
+                member_services = _LEGACY_CUTOVER_RETAINED_MEMBERS[str(logical_name)]
                 current_network = _verify_docker_network(
                     logical_name=str(logical_name),
                     project=COMMON_PROJECT,
@@ -5599,9 +6156,7 @@ def verify_rollback_bundle(
         inputs = record.get("inputs") if isinstance(record, dict) else None
         service = record.get("service") if isinstance(record, dict) else None
         expected_profiles = (
-            ["whoscored-paid"]
-            if service in GATEWAY_PROTECTED_SERVICES
-            else []
+            ["whoscored-paid"] if service in GATEWAY_PROTECTED_SERVICES else []
         )
         if (
             not isinstance(record, dict)
@@ -5691,9 +6246,7 @@ def verify_rollback_bundle(
     }
 
 
-def _legacy_cutover_container_running_state(
-    state: Any, *, service: str
-) -> bool:
+def _legacy_cutover_container_running_state(state: Any, *, service: str) -> bool:
     """Return the admitted legacy running flag only for a sane Docker state."""
 
     unhealthy_flags = ("Paused", "Restarting", "Dead", "OOMKilled")
@@ -5715,9 +6268,8 @@ def _legacy_cutover_container_running_state(
                 f"legacy cutover container is not healthy and running: {service}"
             )
         return True
-    if (
-        state.get("Status") not in {"created", "exited"}
-        or any(state[field] for field in unhealthy_flags)
+    if state.get("Status") not in {"created", "exited"} or any(
+        state[field] for field in unhealthy_flags
     ):
         raise AdmissionError(f"legacy cutover stopped container is not sane: {service}")
     return False
@@ -6052,10 +6604,9 @@ def verify_cutover_inventory(
     }
     for service, record in containers.items():
         for network_name, endpoint in record["attached_networks"].items():
-            if (
-                not isinstance(endpoint, dict)
-                or endpoint.get("NetworkID") != network_ids_by_name.get(network_name)
-            ):
+            if not isinstance(endpoint, dict) or endpoint.get(
+                "NetworkID"
+            ) != network_ids_by_name.get(network_name):
                 raise AdmissionError(
                     f"legacy cutover network endpoint identity differs: {service}"
                 )
@@ -6172,11 +6723,24 @@ def verify_created_containers(
         raise AdmissionError(
             "post-create services must be a non-empty unique protected subset"
         )
+    model_services = set(projections)
+    common_only_model = not split_projects and frozenset(model_services) == frozenset(
+        COMMON_PROTECTED_SERVICES
+    )
+    allowed_model_services = (
+        {frozenset(_PROTECTED_SERVICE_SET)}
+        if split_projects
+        else {
+            frozenset(_PROTECTED_SERVICE_SET),
+            frozenset(COMMON_PROTECTED_SERVICES),
+        }
+    )
     if (
-        set(projections) != _PROTECTED_SERVICE_SET
-        or set(config_hashes) != _PROTECTED_SERVICE_SET
+        model_services != set(config_hashes)
+        or frozenset(model_services) not in allowed_model_services
+        or not set(selected).issubset(model_services)
     ):
-        raise AdmissionError("post-create model does not bind all protected services")
+        raise AdmissionError("post-create model does not bind selected services")
     docker_security_options = _verify_docker_security_options(runner=runner)
     apparmor_profile = _verify_apparmor_enforcement(
         runner=runner,
@@ -6198,7 +6762,7 @@ def verify_created_containers(
                 logical_name=logical_name,
                 project=(
                     _NETWORK_PROJECT[logical_name]
-                    if split_projects
+                    if split_projects or common_only_model
                     else service_projects[selected[0]]
                 ),
                 runner=runner,
@@ -6713,16 +7277,35 @@ def _assert_canonical_release(root: Path) -> None:
         raise AdmissionError("production provenance validator changed after loading")
 
 
-def _assert_protected_compose_inputs(paths: Sequence[Path]) -> dict[Path, bytes]:
-    captured: dict[Path, bytes] = {}
+def _assert_protected_compose_inputs(
+    paths: Sequence[Path],
+) -> dict[Path, ProtectedComposeInputEvidence]:
+    captured: dict[Path, ProtectedComposeInputEvidence] = {}
     for path in paths:
         try:
-            captured[path] = provenance.read_protected_regular_file(
-                path, label="production Compose admission input"
+            raw, identity = provenance.read_protected_regular_file_snapshot(
+                path,
+                label="production Compose admission input",
             )
         except provenance.ProvenanceError as exc:
             raise AdmissionError(str(exc)) from exc
+        captured[path] = ProtectedComposeInputEvidence(raw=raw, identity=identity)
     return captured
+
+
+def _assert_compose_input_evidence_unchanged(
+    evidence: Mapping[Path, ProtectedComposeInputEvidence],
+) -> None:
+    for path, expected in evidence.items():
+        try:
+            raw, identity = provenance.read_protected_regular_file_snapshot(
+                path,
+                label="production Compose admission input",
+            )
+        except provenance.ProvenanceError as exc:
+            raise AdmissionError(str(exc)) from exc
+        if identity != expected.identity or not hmac.compare_digest(raw, expected.raw):
+            raise AdmissionError(f"protected Compose input changed: {path}")
 
 
 def _assert_protected_directory(path: Path, *, label: str) -> os.stat_result:
@@ -7117,6 +7700,23 @@ def _validate_rollout_workloads(
     return normalized
 
 
+def _normalized_bootstrap_authority(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Use the release's one shared bootstrap wire validator, loaded lazily."""
+
+    try:
+        from dags.scripts.whoscored_bootstrap import normalize_bootstrap_authority
+    except ImportError as exc:
+        raise AdmissionError(
+            "current rollout bootstrap validator is unavailable"
+        ) from exc
+    try:
+        return normalize_bootstrap_authority(value)
+    except ValueError as exc:
+        raise AdmissionError(
+            f"current rollout bootstrap authority is invalid: {exc}"
+        ) from exc
+
+
 def _verify_owner_authority_signature(
     value: Mapping[str, Any],
     *,
@@ -7226,6 +7826,13 @@ def _validate_current_active_rollout_authority(
         != hashlib.sha256(_authority_canonical_bytes(workloads)).hexdigest()
     ):
         raise AdmissionError("current rollout ranking-basis digest is invalid")
+    bootstrap_authority = _normalized_bootstrap_authority(rollout)
+    if bootstrap_authority["provider_order_cap_bytes"] != provider_policy.get(
+        "order_cap_bytes"
+    ):
+        raise AdmissionError(
+            "current rollout provider order cap differs from signed policy"
+        )
     cohort_sha256 = hashlib.sha256(_authority_canonical_bytes(rollout)).hexdigest()
 
     charter = _read_protected_authority(
@@ -7248,6 +7855,10 @@ def _validate_current_active_rollout_authority(
         "classifier_sha256",
         "promotion_acceptance_sha256",
         "promotion_terminal_receipt_sha256",
+        "acceptance_mode",
+        "bootstrap_slots",
+        "capacity_receipt_sha256",
+        "provider_order_cap_bytes",
     )
     if (
         frozenset(charter) != _CHARTER_FIELDS
@@ -7262,6 +7873,7 @@ def _validate_current_active_rollout_authority(
         or any(
             charter.get(field) != rollout.get(field) for field in rollout_charter_fields
         )
+        or _normalized_bootstrap_authority(charter) != bootstrap_authority
     ):
         raise AdmissionError(
             "current charter does not bind the active policy and rollout"
@@ -7305,6 +7917,8 @@ def _validate_current_active_rollout_authority(
         or isinstance(max_issuances, bool)
         or not isinstance(max_issuances, int)
         or max_issuances <= 0
+        or charter["order_cap_bytes"]
+        > bootstrap_authority["provider_order_cap_bytes"] * 95 // 100
     ):
         raise AdmissionError("current rollout charter caps are invalid")
     authority = {
@@ -7635,18 +8249,25 @@ def _assert_separate_mounts(paths: Mapping[str, Path], *, label: str) -> None:
 
 
 def _validate_bind_source_policy(
-    projections: Mapping[str, Mapping[str, Any]], *, root: Path
+    projections: Mapping[str, Mapping[str, Any]],
+    *,
+    root: Path,
+    selected_services: Sequence[str] = PROTECTED_SERVICES,
 ) -> None:
+    selected = tuple(selected_services)
+    if set(projections) != set(selected):
+        raise AdmissionError("rendered bind-source service set differs")
     sources: dict[tuple[str, str], Path] = {}
-    for service in PROTECTED_SERVICES:
+    for service in selected:
         for kind, raw_source, target, _read_only in projections[service]["volumes"]:
             if kind == "bind":
                 sources[(service, target)] = Path(raw_source)
     expected = {
         (service, target)
         for service, targets in _RELEASE_BIND_TARGETS.items()
+        if service in selected
         for target in targets
-    } | set(_RUNTIME_HOST_BIND_TARGETS)
+    } | {identity for identity in _RUNTIME_HOST_BIND_TARGETS if identity[0] in selected}
     pointer_identity = (
         "airflow-scheduler",
         "/opt/airflow/secure/whoscored-scheduled-pointers",
@@ -7668,6 +8289,8 @@ def _validate_bind_source_policy(
             "SofaScore budget artifact must be outside the release checkout"
         )
     for service, targets in _RELEASE_BIND_TARGETS.items():
+        if service not in selected:
+            continue
         for target, relative in targets.items():
             source = sources[(service, target)]
             expected_source = root / relative
@@ -7684,6 +8307,8 @@ def _validate_bind_source_policy(
                     source, label=f"release code file for {service} {target}"
                 )
     for identity, policy in _RUNTIME_HOST_BIND_TARGETS.items():
+        if identity[0] not in selected:
+            continue
         if identity == pointer_identity and identity not in sources:
             continue
         source = sources[identity]
@@ -7714,54 +8339,51 @@ def _validate_bind_source_policy(
             _assert_protected_regular_file(
                 source, label=f"protected input for {identity[0]} {identity[1]}"
             )
-    scheduler_filter_state = sources[
-        ("airflow-scheduler", "/opt/airflow/state/whoscored-proxy-filter")
-    ]
-    filter_state = sources[
-        ("whoscored_proxy_filter", "/opt/airflow/state/whoscored-proxy-filter")
-    ]
-    if scheduler_filter_state != filter_state:
+    scheduler_filter_identity = (
+        "airflow-scheduler",
+        "/opt/airflow/state/whoscored-proxy-filter",
+    )
+    filter_identity = (
+        "whoscored_proxy_filter",
+        "/opt/airflow/state/whoscored-proxy-filter",
+    )
+    if (
+        scheduler_filter_identity in sources
+        and filter_identity in sources
+        and sources[scheduler_filter_identity] != sources[filter_identity]
+    ):
         raise AdmissionError(
             "scheduler read-only provider evidence does not bind filter-owned state"
         )
+    protected_mount_identities = {
+        "fotmob-admission": ("airflow-scheduler", "/opt/airflow/fotmob-admission"),
+        "fbref-geoip-database": (
+            "airflow-scheduler",
+            FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH,
+        ),
+        "scheduler-logs": ("airflow-scheduler", "/opt/airflow/logs"),
+        "sofascore-budget-artifact": (
+            "airflow-scheduler",
+            "/opt/airflow/runtime/sofascore/proxy_budget_canary.json",
+        ),
+        "gateway-state": (
+            "whoscored_paid_gateway",
+            "/opt/airflow/state/whoscored-paid-gateway",
+        ),
+        "filter-state": filter_identity,
+        "scheduler-approvals": (
+            "airflow-scheduler",
+            "/opt/airflow/secure/whoscored-approvals",
+        ),
+        "gateway-alert-authority": (
+            "whoscored_paid_gateway",
+            "/opt/airflow/secure/whoscored-alert-authority",
+        ),
+    }
     protected_mounts = {
-        "fotmob-admission": sources[
-            ("airflow-scheduler", "/opt/airflow/fotmob-admission")
-        ],
-        "fbref-geoip-database": sources[
-            (
-                "airflow-scheduler",
-                FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH,
-            )
-        ],
-        "scheduler-logs": sources[("airflow-scheduler", "/opt/airflow/logs")],
-        "sofascore-budget-artifact": sources[
-            (
-                "airflow-scheduler",
-                "/opt/airflow/runtime/sofascore/proxy_budget_canary.json",
-            )
-        ],
-        "gateway-state": sources[
-            (
-                "whoscored_paid_gateway",
-                "/opt/airflow/state/whoscored-paid-gateway",
-            )
-        ],
-        "filter-state": sources[
-            (
-                "whoscored_proxy_filter",
-                "/opt/airflow/state/whoscored-proxy-filter",
-            )
-        ],
-        "scheduler-approvals": sources[
-            ("airflow-scheduler", "/opt/airflow/secure/whoscored-approvals")
-        ],
-        "gateway-alert-authority": sources[
-            (
-                "whoscored_paid_gateway",
-                "/opt/airflow/secure/whoscored-alert-authority",
-            )
-        ],
+        name: sources[identity]
+        for name, identity in protected_mount_identities.items()
+        if identity in sources
     }
     if pointer_identity in sources:
         protected_mounts["scheduler-pointers"] = sources[pointer_identity]
@@ -7783,6 +8405,1295 @@ def _read_protected_canonical_object(path: Path, *, label: str) -> dict[str, Any
     if not isinstance(value, dict) or raw != _canonical_bytes(value):
         raise AdmissionError(f"{label} is not canonical JSON")
     return value
+
+
+def _capacity_number(value: object, *, field: str) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AdmissionError(f"capacity receipt {field} is invalid")
+    number = Decimal(str(value))
+    if not number.is_finite() or number < 0:
+        raise AdmissionError(f"capacity receipt {field} is invalid")
+    return number
+
+
+def _capacity_nonnegative_int(value: object, *, field: str) -> int:
+    if type(value) is not int or value < 0:
+        raise AdmissionError(f"capacity receipt {field} is invalid")
+    return value
+
+
+def _capacity_utc_timestamp(value: object, *, field: str) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise AdmissionError(f"capacity receipt {field} is invalid")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise AdmissionError(f"capacity receipt {field} is invalid") from exc
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() != timedelta(0)
+        or parsed.isoformat() != value
+    ):
+        raise AdmissionError(f"capacity receipt {field} is not canonical UTC")
+    return parsed
+
+
+def _capacity_runtime_contract_evidence() -> tuple[dict[str, str], str, str]:
+    """Return the current lock map, lock digest and exact sealed-tree digest."""
+
+    path = _REPOSITORY_ROOT / _CAPACITY_RUNTIME_CONTRACT_RELATIVE
+    try:
+        raw = provenance.read_protected_regular_file(
+            path, label="WhoScored runtime contract"
+        )
+        document = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object)
+    except (
+        _DuplicateKey,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        provenance.ProvenanceError,
+    ) as exc:
+        raise AdmissionError("capacity runtime contract is invalid") from exc
+    if (
+        not isinstance(document, dict)
+        or set(document)
+        != {
+            "business_dataset_count",
+            "files",
+            "parser_version",
+            "report_schema_version",
+            "schema_version",
+        }
+        or document.get("schema_version") != 1
+    ):
+        raise AdmissionError("capacity runtime contract schema is invalid")
+    files = document.get("files")
+    if not isinstance(files, dict) or not files:
+        raise AdmissionError("capacity runtime contract file map is invalid")
+    normalized: dict[str, str] = {}
+    for relative, digest in files.items():
+        parts = relative.split("/") if isinstance(relative, str) else []
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or relative.startswith("/")
+            or any(part in {"", ".", ".."} for part in parts)
+            or not isinstance(digest, str)
+            or _DIGEST.fullmatch(digest) is None
+        ):
+            raise AdmissionError("capacity runtime contract file map is invalid")
+        normalized[relative] = digest
+    expected_locked_paths = _CAPACITY_SEALED_RUNTIME_PATHS - {
+        _CAPACITY_RUNTIME_CONTRACT_RELATIVE
+    }
+    if not expected_locked_paths.issubset(normalized):
+        raise AdmissionError("capacity runtime contract omits canary runtime files")
+
+    lock_sha256 = hashlib.sha256(raw).hexdigest()
+    tree_files = dict(normalized)
+    tree_files[_CAPACITY_RUNTIME_CONTRACT_RELATIVE] = lock_sha256
+    aggregate = hashlib.sha256(b"whoscored-capacity-runtime-tree-v1\0")
+    for relative, digest in sorted(tree_files.items()):
+        aggregate.update(relative.encode("utf-8"))
+        aggregate.update(b"\0")
+        aggregate.update(bytes.fromhex(digest))
+    return normalized, lock_sha256, aggregate.hexdigest()
+
+
+def _capacity_runtime_file_evidence() -> dict[str, str]:
+    """Hash the exact protected files included by the capacity identity."""
+
+    result: dict[str, str] = {}
+    for relative in sorted(_CAPACITY_RUNTIME_FILE_PATHS):
+        path = _REPOSITORY_ROOT / relative
+        try:
+            raw = provenance.read_protected_regular_file(
+                path, label=f"capacity runtime file {relative}"
+            )
+        except provenance.ProvenanceError as exc:
+            raise AdmissionError("capacity runtime file is not protected") from exc
+        result[relative] = hashlib.sha256(raw).hexdigest()
+    return result
+
+
+def _validate_capacity_container_record(
+    record: object,
+    *,
+    service: str,
+    running_images: Mapping[str, Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    expected_image = running_images.get(service)
+    flaresolverr = service == "flaresolverr"
+    if (
+        not isinstance(record, dict)
+        or set(record) != _CAPACITY_CONTAINER_FIELDS
+        or not isinstance(expected_image, Mapping)
+        or record.get("name") != service
+        or record.get("id") != expected_image.get("container_id")
+        or record.get("image_id") != expected_image.get("image_id")
+        or record.get("status") != "running"
+        or record.get("running") is not True
+        or record.get("healthy") is not True
+        or record.get("oom_killed") is not False
+        or record.get("restart_count") != 0
+        or type(record.get("restart_count")) is not int
+        or record.get("production_admission_contract_ok") is not True
+        or any(
+            record.get(field) is not flaresolverr
+            for field in (
+                "command_contract_ok",
+                "image_identity_contract_ok",
+                "immutable_payload_contract_ok",
+                "security_contract_ok",
+                "compose_identity_ok",
+                "published_endpoint_contract_ok",
+            )
+        )
+    ):
+        raise AdmissionError("capacity receipt container evidence is invalid")
+    pid = _capacity_nonnegative_int(record.get("pid"), field="container pid")
+    memory = _capacity_nonnegative_int(
+        record.get("memory_usage_bytes"), field="container memory"
+    )
+    memory_limit = _capacity_nonnegative_int(
+        record.get("memory_limit_bytes"), field="container memory limit"
+    )
+    processes = _capacity_nonnegative_int(
+        record.get("process_count"), field="container process count"
+    )
+    if pid == 0 or memory_limit == 0 or memory > memory_limit or processes == 0:
+        raise AdmissionError("capacity receipt container resources are invalid")
+    return record
+
+
+def _validate_capacity_run_summaries(
+    runs: object,
+    *,
+    scopes: frozenset[str],
+    completed_by_worker: Mapping[str, int],
+    completed_runs: int,
+    summaries_total: object,
+    summaries_retained: object,
+    summaries_truncated: object,
+    deadline_truncations: int,
+    max_source_stage_count: int,
+) -> None:
+    if (
+        not isinstance(runs, list)
+        or type(summaries_total) is not int
+        or type(summaries_retained) is not int
+        or type(summaries_truncated) is not bool
+        or summaries_total != completed_runs + deadline_truncations
+        or summaries_retained != len(runs)
+        or not 1 <= summaries_retained <= _CAPACITY_MAX_RUN_SUMMARIES
+        or summaries_truncated is not (summaries_total > summaries_retained)
+    ):
+        raise AdmissionError("capacity receipt run-summary counters are invalid")
+
+    identities: set[tuple[int, int]] = set()
+    retained_by_worker = {worker_id: 0 for worker_id in range(_CAPACITY_WORKER_COUNT)}
+    retained_deadlines = 0
+    for run in runs:
+        if not isinstance(run, dict) or set(run) != _CAPACITY_RUN_FIELDS:
+            raise AdmissionError("capacity receipt run summary is invalid")
+        worker_id = _capacity_nonnegative_int(
+            run.get("worker_id"), field="run worker_id"
+        )
+        iteration = _capacity_nonnegative_int(
+            run.get("iteration"), field="run iteration"
+        )
+        process_elapsed = _capacity_number(
+            run.get("process_elapsed_seconds"), field="run process elapsed"
+        )
+        identity = (worker_id, iteration)
+        if (
+            worker_id >= _CAPACITY_WORKER_COUNT
+            or identity in identities
+            or run.get("scope") not in scopes
+            or type(run.get("returncode")) is not int
+            or _capacity_nonnegative_int(
+                run.get("stderr_bytes"), field="run stderr bytes"
+            )
+            < 0
+            or not isinstance(run.get("stderr_sha256"), str)
+            or _DIGEST.fullmatch(run["stderr_sha256"]) is None
+        ):
+            raise AdmissionError("capacity receipt run summary is invalid")
+        identities.add(identity)
+        retained_by_worker[worker_id] += 1
+        status = run.get("status")
+        if status == "success":
+            if (
+                run.get("returncode") != 0
+                or process_elapsed <= 0
+                or run.get("termination_reason") is not None
+                or run.get("source_request_attempts") != 0
+                or type(run.get("source_request_attempts")) is not int
+                or run.get("network_requests") != 0
+                or type(run.get("network_requests")) is not int
+                or run.get("page_units") != 5
+                or type(run.get("page_units")) is not int
+                or run.get("paid_bytes") != 0
+                or type(run.get("paid_bytes")) is not int
+                or run.get("paid_route_requests") != 0
+                or type(run.get("paid_route_requests")) is not int
+                or run.get("traffic_evidence_valid") is not True
+                or _capacity_number(
+                    run.get("workflow_elapsed_seconds"),
+                    field="run workflow elapsed",
+                )
+                <= 0
+                or run.get("publishes") is not False
+                or run.get("writes_bronze") is not False
+                or run.get("executes_ddl") is not False
+                or run.get("entities")
+                != ["matches", "multistage", "previews", "profiles"]
+                or type(run.get("source_stage_count")) is not int
+                or not 2 <= run["source_stage_count"] <= max_source_stage_count
+                or run.get("mode") != _CAPACITY_MODE
+                or run.get("seed_sha256") != _CAPACITY_SEED_SHA256
+                or run.get("seed_evidence_valid") is not True
+                or run.get("cleanup_evidence_valid") is not True
+            ):
+                raise AdmissionError("capacity receipt successful run is unsafe")
+        elif status == "deadline_terminated":
+            retained_deadlines += 1
+            if (
+                run.get("termination_reason") != "deadline_terminated"
+                or any(
+                    run.get(field) != 0
+                    for field in (
+                        "source_request_attempts",
+                        "network_requests",
+                        "page_units",
+                        "paid_bytes",
+                        "paid_route_requests",
+                        "workflow_elapsed_seconds",
+                        "source_stage_count",
+                    )
+                )
+                or any(
+                    run.get(field) is not None
+                    for field in (
+                        "traffic_evidence_valid",
+                        "publishes",
+                        "writes_bronze",
+                        "executes_ddl",
+                        "mode",
+                        "seed_sha256",
+                        "seed_evidence_valid",
+                        "cleanup_evidence_valid",
+                    )
+                )
+                or run.get("entities") != []
+            ):
+                raise AdmissionError("capacity receipt deadline run is invalid")
+        else:
+            raise AdmissionError("capacity receipt retained a failed run")
+    if (
+        set(worker_id for worker_id, _iteration in identities)
+        != set(range(_CAPACITY_WORKER_COUNT))
+        or retained_deadlines != deadline_truncations
+        or any(
+            count not in {1, 2}
+            or completed_by_worker[str(worker_id)] > 1
+            and count != 2
+            for worker_id, count in retained_by_worker.items()
+        )
+    ):
+        raise AdmissionError("capacity receipt run retention is inconsistent")
+
+
+def _validate_capacity_samples(
+    samples: object,
+    *,
+    observed: Decimal,
+    total_elapsed: Decimal,
+    completed_runs: int,
+    total_page_units: int,
+    baseline: Sequence[Mapping[str, Any]],
+    running_images: Mapping[str, Mapping[str, Any]],
+    report: Mapping[str, Any],
+) -> None:
+    if not isinstance(samples, list) or not 1 <= len(samples) <= _CAPACITY_MAX_SAMPLES:
+        raise AdmissionError("capacity receipt sample retention is invalid")
+    prior_elapsed = Decimal("-1")
+    prior_completed = -1
+    sample_points: list[tuple[Decimal, int, int]] = []
+    baseline_by_service = {record["name"]: record for record in baseline}
+    maxima = {
+        "max_harness_rss_bytes": 0,
+        "max_container_memory_bytes": 0,
+        "max_worker_container_memory_bytes": 0,
+        "max_worker_container_pids": 0,
+        "max_aggregate_memory_bytes": 0,
+    }
+    for sample in samples:
+        if not isinstance(sample, dict) or set(sample) != _CAPACITY_SAMPLE_FIELDS:
+            raise AdmissionError("capacity receipt sample is invalid")
+        elapsed = _capacity_number(
+            sample.get("elapsed_seconds"), field="sample elapsed"
+        )
+        sample_completed = _capacity_nonnegative_int(
+            sample.get("completed_runs"), field="sample completed_runs"
+        )
+        page_units = _capacity_nonnegative_int(
+            sample.get("page_units"), field="sample page_units"
+        )
+        projected = _capacity_number(
+            sample.get("projected_page_units_per_day"), field="sample throughput"
+        )
+        if (
+            elapsed < prior_elapsed
+            or elapsed > total_elapsed + Decimal("0.001")
+            or sample_completed < prior_completed
+            or sample_completed > completed_runs
+            or page_units != sample_completed * 5
+            or sample.get("source_request_attempts") != 0
+            or type(sample.get("source_request_attempts")) is not int
+            or sample.get("paid_bytes") != 0
+            or type(sample.get("paid_bytes")) is not int
+            or sample.get("paid_route_requests") != 0
+            or type(sample.get("paid_route_requests")) is not int
+            or abs(
+                projected
+                - (
+                    Decimal(page_units) * Decimal(86_400) / elapsed
+                    if elapsed > 0
+                    else Decimal(0)
+                )
+            )
+            > Decimal("0.001")
+        ):
+            raise AdmissionError("capacity receipt sample accounting is invalid")
+        prior_elapsed = elapsed
+        prior_completed = sample_completed
+        sample_points.append((elapsed, sample_completed, page_units))
+
+        containers = sample.get("containers")
+        if not isinstance(containers, list) or [
+            record.get("name") if isinstance(record, dict) else None
+            for record in containers
+        ] != list(COMMON_PROTECTED_SERVICES):
+            raise AdmissionError("capacity receipt sample container set is invalid")
+        container_memory = 0
+        for service, record in zip(COMMON_PROTECTED_SERVICES, containers, strict=True):
+            admitted = _validate_capacity_container_record(
+                record, service=service, running_images=running_images
+            )
+            baseline_record = baseline_by_service[service]
+            if any(
+                admitted.get(field) != baseline_record.get(field)
+                for field in ("id", "image_id", "restart_count")
+            ):
+                raise AdmissionError("capacity receipt container identity changed")
+            container_memory += int(admitted["memory_usage_bytes"])
+
+        workers = sample.get("worker_containers")
+        if not isinstance(workers, list) or len(workers) not in {
+            0,
+            _CAPACITY_WORKER_COUNT,
+        }:
+            raise AdmissionError("capacity receipt worker sample is invalid")
+        worker_memory = 0
+        worker_pids = 0
+        worker_ids: set[int] = set()
+        for worker in workers:
+            if (
+                not isinstance(worker, dict)
+                or set(worker) != _CAPACITY_WORKER_CONTAINER_FIELDS
+            ):
+                raise AdmissionError("capacity receipt worker sample is invalid")
+            worker_id = _capacity_nonnegative_int(
+                worker.get("worker_id"), field="sample worker_id"
+            )
+            iteration = _capacity_nonnegative_int(
+                worker.get("iteration"), field="sample worker iteration"
+            )
+            del iteration
+            worker_memory += _capacity_nonnegative_int(
+                worker.get("memory_usage_bytes"), field="sample worker memory"
+            )
+            worker_pids += _capacity_nonnegative_int(
+                worker.get("pids_current"), field="sample worker pids"
+            )
+            if (
+                worker_id >= _CAPACITY_WORKER_COUNT
+                or worker_id in worker_ids
+                or not isinstance(worker.get("container_id"), str)
+                or _CONTAINER_ID.fullmatch(worker["container_id"]) is None
+                or worker.get("oom_killed") is not False
+                or type(worker.get("running")) is not bool
+                or (
+                    worker.get("running") is True
+                    and (
+                        worker.get("status") != "running"
+                        or worker.get("exit_code") != 0
+                        or type(worker.get("exit_code")) is not int
+                    )
+                )
+                or (
+                    worker.get("running") is False
+                    and (
+                        worker.get("status") != "exited"
+                        or worker.get("exit_code") != 0
+                        or type(worker.get("exit_code")) is not int
+                    )
+                )
+            ):
+                raise AdmissionError("capacity receipt worker sample is unsafe")
+            worker_ids.add(worker_id)
+        if workers and worker_ids != set(range(_CAPACITY_WORKER_COUNT)):
+            raise AdmissionError("capacity receipt worker sample is incomplete")
+
+        harness_memory = _capacity_nonnegative_int(
+            sample.get("harness_rss_bytes"), field="sample harness memory"
+        )
+        stated_worker_memory = _capacity_nonnegative_int(
+            sample.get("worker_container_memory_bytes"),
+            field="sample worker container memory",
+        )
+        stated_worker_pids = _capacity_nonnegative_int(
+            sample.get("worker_container_pids"), field="sample worker pids"
+        )
+        stated_container_memory = _capacity_nonnegative_int(
+            sample.get("container_memory_bytes"), field="sample container memory"
+        )
+        aggregate_memory = _capacity_nonnegative_int(
+            sample.get("aggregate_memory_bytes"), field="sample aggregate memory"
+        )
+        rss_process_count = _capacity_nonnegative_int(
+            sample.get("rss_process_count"), field="sample RSS process count"
+        )
+        container_memory += worker_memory
+        if (
+            stated_worker_memory != worker_memory
+            or stated_worker_pids != worker_pids
+            or stated_container_memory != container_memory
+            or aggregate_memory != harness_memory + container_memory
+            or rss_process_count == 0
+            or aggregate_memory > _CAPACITY_MAX_COMBINED_RSS_BYTES
+        ):
+            raise AdmissionError("capacity receipt sample resources are invalid")
+        maxima["max_harness_rss_bytes"] = max(
+            maxima["max_harness_rss_bytes"], harness_memory
+        )
+        maxima["max_container_memory_bytes"] = max(
+            maxima["max_container_memory_bytes"], container_memory
+        )
+        maxima["max_worker_container_memory_bytes"] = max(
+            maxima["max_worker_container_memory_bytes"], worker_memory
+        )
+        maxima["max_worker_container_pids"] = max(
+            maxima["max_worker_container_pids"], worker_pids
+        )
+        maxima["max_aggregate_memory_bytes"] = max(
+            maxima["max_aggregate_memory_bytes"], aggregate_memory
+        )
+    work_indexes = [
+        index
+        for index, (elapsed, _completed, _page_units) in enumerate(sample_points[:-1])
+        if elapsed <= observed + Decimal("0.001")
+    ]
+    if not work_indexes:
+        raise AdmissionError("capacity receipt omitted its work-final sample")
+    work_index = work_indexes[-1]
+    work_elapsed, work_completed, work_page_units = sample_points[work_index]
+    final_elapsed, final_completed, final_page_units = sample_points[-1]
+    final_sample = samples[-1]
+    assert isinstance(final_sample, dict)
+    if final_sample.get("worker_containers") != []:
+        raise AdmissionError(
+            "capacity receipt cleanup-final sample retains worker containers"
+        )
+    maximum_cadence = (
+        _CAPACITY_SAMPLE_INTERVAL_SECONDS + _CAPACITY_SAMPLE_CADENCE_TOLERANCE_SECONDS
+    )
+    if (
+        sample_points[0][0] > maximum_cadence
+        or any(
+            current[0] - previous[0] > maximum_cadence
+            for previous, current in zip(
+                sample_points[:work_index],
+                sample_points[1 : work_index + 1],
+                strict=True,
+            )
+        )
+        or abs(work_elapsed - observed) > _CAPACITY_FINAL_SAMPLE_TOLERANCE_SECONDS
+        or work_completed != completed_runs
+        or work_page_units != total_page_units
+        or abs(final_elapsed - total_elapsed) > _CAPACITY_FINAL_SAMPLE_TOLERANCE_SECONDS
+        or final_completed != completed_runs
+        or final_page_units != total_page_units
+    ):
+        raise AdmissionError("capacity receipt monitoring timeline is incomplete")
+    if any(
+        type(report.get(field)) is not int or report[field] < observed_maximum
+        for field, observed_maximum in maxima.items()
+    ):
+        raise AdmissionError("capacity receipt sample maxima are inconsistent")
+
+
+def validate_capacity_receipt(
+    path: Path,
+    *,
+    capacity_receipt_sha256: str,
+    bindings_evidence: ValidatedBindingsEvidence,
+    scheduler_image_id: str,
+    compose_inputs_evidence: Mapping[str, ProtectedComposeInputEvidence],
+    common_config_hashes: Mapping[str, str],
+    running_images_evidence: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Replay the signed six-hour capacity proof against the current release."""
+
+    value = _read_protected_canonical_object(path, label="capacity receipt")
+    if set(value) != _CAPACITY_REPORT_FIELDS:
+        raise AdmissionError("capacity receipt schema is invalid")
+    claimed = value.get("report_sha256")
+    if (
+        not isinstance(claimed, str)
+        or _DIGEST.fullmatch(claimed) is None
+        or not isinstance(capacity_receipt_sha256, str)
+        or _DIGEST.fullmatch(capacity_receipt_sha256) is None
+        or not secrets.compare_digest(claimed, capacity_receipt_sha256)
+    ):
+        raise AdmissionError("capacity receipt differs from signed rollout authority")
+    unsigned = dict(value)
+    unsigned.pop("report_sha256")
+    actual = hashlib.sha256(_authority_canonical_bytes(unsigned)).hexdigest()
+    if not secrets.compare_digest(claimed, actual):
+        raise AdmissionError("capacity receipt content address is invalid")
+
+    if (
+        value.get("canary_version") != _CAPACITY_CANARY_VERSION
+        or value.get("schema_version") != 1
+        or value.get("mode") != _CAPACITY_MODE
+        or value.get("status") != "success"
+        or value.get("seed_sha256") != _CAPACITY_SEED_SHA256
+        or value.get("worker_count") != _CAPACITY_WORKER_COUNT
+        or value.get("workers") != _CAPACITY_WORKER_COUNT
+        or value.get("publishes") is not False
+        or value.get("writes_bronze") is not False
+        or value.get("executes_ddl") is not False
+        or value.get("network_requests") != 0
+        or value.get("paid_bytes") != 0
+        or value.get("paid_proxy_bytes") != 0
+        or value.get("paid_route_requests") != 0
+        or value.get("restart_count") != 0
+        or value.get("oom_killed") is not False
+        or value.get("cleanup_status") != "success"
+        or value.get("page_unit_definition") != _CAPACITY_PAGE_UNIT_DEFINITION
+        or value.get("stop_reasons") != []
+    ):
+        raise AdmissionError("capacity receipt core contract is not green")
+    for zero_field in (
+        "network_requests",
+        "paid_bytes",
+        "paid_proxy_bytes",
+        "paid_route_requests",
+        "restart_count",
+    ):
+        if type(value[zero_field]) is not int:
+            raise AdmissionError("capacity receipt zero counters are invalid")
+
+    requested = _capacity_number(
+        value.get("duration_seconds_requested"),
+        field="duration_seconds_requested",
+    )
+    observed = _capacity_number(
+        value.get("duration_seconds_observed"),
+        field="duration_seconds_observed",
+    )
+    elapsed = _capacity_number(value.get("elapsed_seconds"), field="elapsed_seconds")
+    total_elapsed = _capacity_number(
+        value.get("total_elapsed_seconds"), field="total_elapsed_seconds"
+    )
+    if (
+        requested != _CAPACITY_DURATION_SECONDS
+        or observed < _CAPACITY_DURATION_SECONDS
+        or elapsed != observed
+        or total_elapsed < observed
+    ):
+        raise AdmissionError("capacity receipt did not sustain six hours")
+    started_at = _capacity_utc_timestamp(value.get("started_at"), field="started_at")
+    ended_at = _capacity_utc_timestamp(value.get("ended_at"), field="ended_at")
+    wall_elapsed = Decimal(str((ended_at - started_at).total_seconds()))
+    if (
+        ended_at <= started_at
+        or abs(wall_elapsed - total_elapsed) > _CAPACITY_WALL_CLOCK_TOLERANCE_SECONDS
+    ):
+        raise AdmissionError("capacity receipt wall-clock timeline is invalid")
+    throughput = _capacity_number(
+        value.get("projected_page_units_per_day"),
+        field="projected_page_units_per_day",
+    )
+    peak_rss = _capacity_number(
+        value.get("peak_combined_rss_bytes"), field="peak_combined_rss_bytes"
+    )
+    aggregate_rss = _capacity_number(
+        value.get("max_aggregate_memory_bytes"),
+        field="max_aggregate_memory_bytes",
+    )
+    if (
+        throughput < _CAPACITY_MIN_PAGE_UNITS_PER_DAY
+        or peak_rss != aggregate_rss
+        or peak_rss > _CAPACITY_MAX_COMBINED_RSS_BYTES
+    ):
+        raise AdmissionError("capacity receipt throughput or memory gate failed")
+    source_attempts = _capacity_nonnegative_int(
+        value.get("source_request_attempts"), field="source_request_attempts"
+    )
+    deadline_truncations = _capacity_nonnegative_int(
+        value.get("deadline_truncations"), field="deadline_truncations"
+    )
+    max_source_stage_count = _capacity_nonnegative_int(
+        value.get("max_source_stage_count"), field="max_source_stage_count"
+    )
+    if (
+        source_attempts != 0
+        or deadline_truncations > _CAPACITY_WORKER_COUNT
+        or max_source_stage_count < 2
+        or value.get("raw_store_policy") != "exact content-addressed temporary cache"
+        or value.get("repository_policy") != "per-process in-memory repository"
+        or type(value.get("match_limit")) is not int
+        or not 1 <= value["match_limit"] <= 10
+        or type(value.get("profile_limit")) is not int
+        or not 1 <= value["profile_limit"] <= 20
+    ):
+        raise AdmissionError("capacity receipt workload contract is invalid")
+    cleanup_elapsed = _capacity_number(
+        value.get("cleanup_elapsed_seconds"), field="cleanup_elapsed_seconds"
+    )
+    completed_worker_seconds = _capacity_number(
+        value.get("completed_worker_seconds"), field="completed_worker_seconds"
+    )
+    if (
+        abs(total_elapsed - observed - cleanup_elapsed) > Decimal("0.002")
+        or completed_worker_seconds <= 0
+    ):
+        raise AdmissionError("capacity receipt elapsed accounting is invalid")
+    for memory_field in (
+        "max_harness_rss_bytes",
+        "max_container_memory_bytes",
+        "max_worker_container_memory_bytes",
+        "max_worker_container_pids",
+        "max_aggregate_memory_bytes",
+    ):
+        _capacity_nonnegative_int(value.get(memory_field), field=memory_field)
+
+    scopes_value = value.get("scopes")
+    if (
+        not isinstance(scopes_value, list)
+        or not scopes_value
+        or len(scopes_value) != len(set(scopes_value))
+        or any(
+            not isinstance(scope, str)
+            or scope.count("=") != 1
+            or any(not part.strip() for part in scope.split("=", 1))
+            for scope in scopes_value
+        )
+    ):
+        raise AdmissionError("capacity receipt scope set is invalid")
+    scopes = frozenset(scopes_value)
+
+    completed = value.get("completed_by_worker")
+    if (
+        not isinstance(completed, dict)
+        or set(completed) != {"0", "1", "2", "3"}
+        or any(type(count) is not int or count <= 0 for count in completed.values())
+    ):
+        raise AdmissionError("capacity receipt lacks all four completed workers")
+    completed_runs_value = value.get("completed_runs")
+    page_units = value.get("page_units")
+    if (
+        type(completed_runs_value) is not int
+        or completed_runs_value != sum(completed.values())
+        or type(page_units) is not int
+        or page_units != completed_runs_value * 5
+        or abs(throughput - (Decimal(page_units) * Decimal(86_400) / observed))
+        > Decimal("0.001")
+    ):
+        raise AdmissionError("capacity receipt page-unit accounting is invalid")
+    runs = value.get("runs")
+    _validate_capacity_run_summaries(
+        runs,
+        scopes=scopes,
+        completed_by_worker=completed,
+        completed_runs=completed_runs_value,
+        summaries_total=value.get("run_summaries_total"),
+        summaries_retained=value.get("run_summaries_retained"),
+        summaries_truncated=value.get("run_summaries_truncated"),
+        deadline_truncations=deadline_truncations,
+        max_source_stage_count=max_source_stage_count,
+    )
+    samples = value.get("samples")
+    if not isinstance(samples, list) or not 1 <= len(samples) <= _CAPACITY_MAX_SAMPLES:
+        raise AdmissionError("capacity receipt sample retention is invalid")
+    cleanup = value.get("cleanup")
+    if (
+        not isinstance(cleanup, dict)
+        or set(cleanup)
+        != {
+            "status",
+            "cache_workspaces_removed",
+            "worker_runtime_removed",
+            "browser_sessions_removed",
+        }
+        or cleanup.get("status") != "success"
+        or any(
+            cleanup.get(field) is not True
+            for field in (
+                "cache_workspaces_removed",
+                "worker_runtime_removed",
+                "browser_sessions_removed",
+            )
+        )
+    ):
+        raise AdmissionError("capacity receipt cleanup proof is not green")
+    sealed_runtime = value.get("sealed_worker_runtime")
+    if (
+        not isinstance(sealed_runtime, dict)
+        or set(sealed_runtime)
+        != {
+            "bundle_sha256",
+            "execution_mode",
+            "file_count",
+            "runtime_cleanup_complete",
+            "runtime_tree_sha256",
+            "worker_image_id",
+        }
+        or sealed_runtime.get("bundle_sha256") is not None
+        or sealed_runtime.get("execution_mode") != "exact-scheduler-image-v1"
+        or type(sealed_runtime.get("file_count")) is not int
+        or sealed_runtime["file_count"] < 1
+        or sealed_runtime.get("runtime_cleanup_complete") is not True
+        or not isinstance(sealed_runtime.get("runtime_tree_sha256"), str)
+        or _DIGEST.fullmatch(sealed_runtime["runtime_tree_sha256"]) is None
+        or sealed_runtime.get("worker_image_id") != scheduler_image_id
+    ):
+        raise AdmissionError("capacity receipt sealed worker runtime is invalid")
+    session_cleanup = value.get("session_cleanup")
+    session_fields = {
+        "lock_acquired",
+        "preflight_required",
+        "preflight_verified_zero",
+        "final_verified_zero",
+        "state_file_removed",
+        "poll_attempts",
+        "successful_polls",
+        "final_zero_scans",
+        "active_max",
+        "pending_create_max",
+        "pending_destroy_max",
+        "failed_create_max",
+        "failed_destroy_max",
+        "failure_generation_changed",
+        "quiet_window_observed",
+        "error_count",
+        "error_sha256",
+        "stale_worker_cleanup_required",
+        "stale_worker_cleanup_verified",
+        "stale_worker_containers_removed",
+        "worker_artifact_cleanup_required",
+        "worker_artifact_cleanup_verified",
+    }
+    if (
+        not isinstance(session_cleanup, dict)
+        or set(session_cleanup) != session_fields
+        or any(
+            type(session_cleanup.get(field)) is not bool
+            for field in (
+                "lock_acquired",
+                "preflight_required",
+                "preflight_verified_zero",
+                "final_verified_zero",
+                "state_file_removed",
+                "failure_generation_changed",
+                "quiet_window_observed",
+                "stale_worker_cleanup_required",
+                "stale_worker_cleanup_verified",
+                "worker_artifact_cleanup_required",
+                "worker_artifact_cleanup_verified",
+            )
+        )
+        or any(
+            session_cleanup.get(field) is not True
+            for field in (
+                "lock_acquired",
+                "preflight_verified_zero",
+                "final_verified_zero",
+                "state_file_removed",
+                "quiet_window_observed",
+                "stale_worker_cleanup_verified",
+                "worker_artifact_cleanup_required",
+                "worker_artifact_cleanup_verified",
+            )
+        )
+        or session_cleanup.get("failure_generation_changed") is not False
+        or any(
+            type(session_cleanup.get(field)) is not int
+            or session_cleanup.get(field) != 0
+            for field in (
+                "poll_attempts",
+                "successful_polls",
+                "final_zero_scans",
+                "active_max",
+                "pending_create_max",
+                "pending_destroy_max",
+                "failed_create_max",
+                "failed_destroy_max",
+                "error_count",
+            )
+        )
+        or session_cleanup.get("error_sha256") != []
+        or type(session_cleanup.get("stale_worker_containers_removed")) is not int
+        or session_cleanup["stale_worker_containers_removed"] < 0
+        or session_cleanup.get("stale_worker_cleanup_required")
+        is not session_cleanup.get("preflight_required")
+        or (
+            session_cleanup.get("stale_worker_cleanup_required") is False
+            and session_cleanup.get("stale_worker_containers_removed") != 0
+        )
+    ):
+        raise AdmissionError("capacity receipt cache lifecycle cleanup is invalid")
+
+    gates = value.get("gates")
+    if not isinstance(gates, list) or len(gates) != len(_CAPACITY_GATE_NAMES):
+        raise AdmissionError("capacity receipt gate set is invalid")
+    by_name: dict[str, Mapping[str, Any]] = {}
+    for gate in gates:
+        name = gate.get("name") if isinstance(gate, Mapping) else None
+        if (
+            not isinstance(name, str)
+            or name in by_name
+            or name not in _CAPACITY_GATE_NAMES
+            or gate.get("passed") is not True
+        ):
+            raise AdmissionError("capacity receipt gate set is invalid")
+        by_name[name] = gate
+    if set(by_name) != _CAPACITY_GATE_NAMES:
+        raise AdmissionError("capacity receipt gate set is incomplete")
+    if (
+        by_name["throughput"].get("minimum_page_units_per_day")
+        != _CAPACITY_MIN_PAGE_UNITS_PER_DAY
+        or _capacity_number(
+            by_name["throughput"].get("observed_page_units_per_day"),
+            field="throughput gate",
+        )
+        != throughput
+        or by_name["memory"].get("maximum_aggregate_memory_bytes")
+        != _CAPACITY_MAX_COMBINED_RSS_BYTES
+        or _capacity_number(
+            by_name["memory"].get("observed_max_aggregate_memory_bytes"),
+            field="memory gate",
+        )
+        != peak_rss
+        or by_name["sustained_duration"].get("required_seconds")
+        != _CAPACITY_DURATION_SECONDS
+        or _capacity_number(
+            by_name["sustained_duration"].get("observed_seconds"),
+            field="sustained duration gate",
+        )
+        != observed
+        or by_name["network_isolation"].get("observed_network_requests") != 0
+        or by_name["paid_traffic"].get("observed_paid_bytes") != 0
+        or by_name["paid_traffic"].get("observed_paid_route_requests") != 0
+        or by_name["cache_seed"].get("observed_seed_sha256") != _CAPACITY_SEED_SHA256
+        or by_name["monitoring_evidence"].get("sample_count") != len(samples)
+    ):
+        raise AdmissionError("capacity receipt gate evidence is inconsistent")
+
+    release = value.get("runtime_release_identity")
+    runtime = value.get("runtime_identity")
+    deployment = value.get("production_deployment")
+    common_hashes = (
+        deployment.get("protected_config_hashes")
+        if isinstance(deployment, dict)
+        else None
+    )
+    protected_inputs = (
+        deployment.get("protected_inputs") if isinstance(deployment, dict) else None
+    )
+    running = (
+        deployment.get("running_admission") if isinstance(deployment, dict) else None
+    )
+    running_images = running.get("images") if isinstance(running, dict) else None
+    expected_input_labels = {
+        "build-attestation",
+        "build-manifest",
+        "deployment-attestation",
+        "compose:compose.yaml",
+        "compose:compose.seaweedfs-supervised.yaml",
+        "common-digest-override",
+        "compose-env:0",
+        "compose-env:1",
+        "compose-env:2",
+    }
+    expected_compose_input_labels = expected_input_labels - {
+        "build-attestation",
+        "build-manifest",
+        "deployment-attestation",
+    }
+    common_network_names = {
+        _EXPECTED_NETWORK_DEFINITIONS[name]["name"]
+        for service in COMMON_PROTECTED_SERVICES
+        for name in _EXPECTED_NETWORKS[service]
+    }
+    if (
+        not isinstance(release, dict)
+        or set(release)
+        != {"release_revision", "manifest_sha256", "worker_image_id", "git_clean"}
+        or not isinstance(runtime, dict)
+        or not isinstance(deployment, dict)
+        or set(deployment)
+        != {
+            "admission_mode",
+            "common_digest_override_sha256",
+            "deployment_attestation_sha256",
+            "gateway_digest_override_sha256",
+            "payload_revision",
+            "protected_bindings",
+            "protected_config_hashes",
+            "protected_inputs",
+            "protected_payload_image_ids",
+            "provenance_manifest_sha256",
+            "release_revision",
+            "running_admission",
+            "source_tree_sha256",
+        }
+        or deployment.get("admission_mode") != _CAPACITY_MODE
+        or deployment.get("gateway_digest_override_sha256") is not None
+        or not isinstance(deployment.get("common_digest_override_sha256"), str)
+        or _DIGEST.fullmatch(deployment["common_digest_override_sha256"]) is None
+        or not isinstance(common_hashes, dict)
+        or set(common_hashes) != set(COMMON_PROTECTED_SERVICES)
+        or any(
+            not isinstance(item, str) or _DIGEST.fullmatch(item) is None
+            for item in common_hashes.values()
+        )
+        or not isinstance(common_config_hashes, Mapping)
+        or set(common_config_hashes) != set(COMMON_PROTECTED_SERVICES)
+        or any(
+            not isinstance(item, str) or _DIGEST.fullmatch(item) is None
+            for item in common_config_hashes.values()
+        )
+        or common_hashes != dict(common_config_hashes)
+        or not isinstance(running_images_evidence, (list, tuple))
+        or any(not isinstance(item, Mapping) for item in running_images_evidence)
+        or not isinstance(protected_inputs, dict)
+        or set(protected_inputs) != expected_input_labels
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"identity", "sha256"}
+            or not isinstance(item.get("identity"), list)
+            or len(item["identity"]) != 9
+            or any(type(field) is not int or field < 0 for field in item["identity"])
+            or not isinstance(item.get("sha256"), str)
+            or _DIGEST.fullmatch(item["sha256"]) is None
+            for item in protected_inputs.values()
+        )
+        or not isinstance(compose_inputs_evidence, Mapping)
+        or set(compose_inputs_evidence) != expected_compose_input_labels
+        or any(
+            not isinstance(item, ProtectedComposeInputEvidence)
+            or not isinstance(item.raw, bytes)
+            or not item.raw
+            or len(item.identity) != 9
+            or any(type(field) is not int or field < 0 for field in item.identity)
+            for item in compose_inputs_evidence.values()
+        )
+        or not isinstance(running, dict)
+        or set(running)
+        != {
+            "apparmor_profile",
+            "docker_security_options",
+            "images",
+            "networks",
+            "projects",
+            "schema_version",
+            "status",
+            "volumes",
+        }
+        or running.get("schema_version") != 1
+        or running.get("status") != "admitted-running-v1"
+        or running.get("projects") != {COMMON_PROJECT: list(COMMON_PROTECTED_SERVICES)}
+        or not isinstance(running.get("apparmor_profile"), str)
+        or not running["apparmor_profile"]
+        or not isinstance(running.get("docker_security_options"), list)
+        or not isinstance(running_images, list)
+        or len(running_images) != len(COMMON_PROTECTED_SERVICES)
+        or any(
+            not isinstance(record, dict)
+            or set(record) != {"container_id", "final_image", "image_id", "service"}
+            or record.get("service") != service
+            or record.get("final_image") != bindings_evidence.bindings[service]
+            or record.get("image_id")
+            != bindings_evidence.validated_payload_image_ids[service]
+            or not isinstance(record.get("container_id"), str)
+            or _CONTAINER_ID.fullmatch(record["container_id"]) is None
+            for service, record in zip(
+                COMMON_PROTECTED_SERVICES, running_images, strict=True
+            )
+        )
+        or not isinstance(running.get("networks"), list)
+        or {
+            record.get("name")
+            for record in running["networks"]
+            if isinstance(record, dict)
+        }
+        != common_network_names
+        or not isinstance(running.get("volumes"), list)
+        or len(running["volumes"]) != 1
+        or not isinstance(running["volumes"][0], dict)
+        or running["volumes"][0].get("name") != "soccerdata_cache"
+        or release.get("release_revision")
+        != bindings_evidence.validated_release_revision
+        or release.get("worker_image_id") != scheduler_image_id
+        or release.get("git_clean") is not True
+        or not isinstance(release.get("manifest_sha256"), str)
+        or _DIGEST.fullmatch(release["manifest_sha256"]) is None
+        or runtime.get("git_revision") != release.get("release_revision")
+        or runtime.get("git_clean") is not True
+        or runtime.get("manifest_sha256") != release.get("manifest_sha256")
+        or runtime.get("worker_image_id") != scheduler_image_id
+        or runtime.get("production_deployment") != deployment
+        or deployment.get("release_revision")
+        != bindings_evidence.validated_release_revision
+        or deployment.get("payload_revision")
+        != bindings_evidence.validated_payload_revision
+        or deployment.get("provenance_manifest_sha256")
+        != bindings_evidence.validated_manifest_sha256
+        or deployment.get("source_tree_sha256")
+        != bindings_evidence.validated_source_tree_sha256
+        or deployment.get("protected_bindings") != dict(bindings_evidence.bindings)
+        or deployment.get("protected_payload_image_ids")
+        != dict(bindings_evidence.validated_payload_image_ids)
+        or bindings_evidence.validated_payload_image_ids.get("airflow-scheduler")
+        != scheduler_image_id
+    ):
+        raise AdmissionError("capacity receipt differs from the current release")
+
+    assert isinstance(release, dict)
+    assert isinstance(runtime, dict)
+    assert isinstance(deployment, dict)
+    assert isinstance(protected_inputs, dict)
+    assert isinstance(running, dict)
+    assert isinstance(running_images, list)
+    running_images_by_service = {
+        str(record["service"]): record
+        for record in running_images
+        if isinstance(record, dict) and isinstance(record.get("service"), str)
+    }
+    current_common_images = [
+        dict(record)
+        for record in running_images_evidence
+        if isinstance(record, Mapping)
+        and record.get("service") in COMMON_PROTECTED_SERVICES
+    ]
+    if current_common_images != running_images:
+        raise AdmissionError(
+            "capacity receipt differs from current running container evidence"
+        )
+
+    if (
+        running.get("apparmor_profile") != "docker-default (enforce)"
+        or running.get("docker_security_options")
+        != [
+            "name=apparmor",
+            "name=cgroupns",
+            "name=seccomp,profile=builtin",
+        ]
+        or running.get("volumes")
+        != [
+            {
+                "driver": "local",
+                "mountpoint": "/var/lib/docker/volumes/soccerdata_cache/_data",
+                "name": "soccerdata_cache",
+            }
+        ]
+    ):
+        raise AdmissionError("capacity receipt running security summary is invalid")
+
+    expected_network_logicals = tuple(
+        sorted(
+            {
+                logical_name
+                for service in COMMON_PROTECTED_SERVICES
+                for logical_name in _EXPECTED_NETWORKS[service]
+            }
+        )
+    )
+    networks = running.get("networks")
+    if (
+        not isinstance(networks, list)
+        or len(networks) != len(expected_network_logicals)
+        or [
+            record.get("logical_name") if isinstance(record, dict) else None
+            for record in networks
+        ]
+        != list(expected_network_logicals)
+    ):
+        raise AdmissionError("capacity receipt running network summary is invalid")
+    network_ids: set[str] = set()
+    network_subnets: set[str] = set()
+    for logical_name, record in zip(expected_network_logicals, networks, strict=True):
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"id", "logical_name", "name", "subnet"}
+            or record.get("logical_name") != logical_name
+            or record.get("name") != _EXPECTED_NETWORK_DEFINITIONS[logical_name]["name"]
+            or not isinstance(record.get("id"), str)
+            or _CONTAINER_ID.fullmatch(record["id"]) is None
+            or record["id"] in network_ids
+            or not isinstance(record.get("subnet"), str)
+            or record["subnet"] in network_subnets
+        ):
+            raise AdmissionError("capacity receipt running network summary is invalid")
+        try:
+            subnet = ipaddress.ip_network(record["subnet"], strict=True)
+        except ValueError as exc:
+            raise AdmissionError(
+                "capacity receipt running network summary is invalid"
+            ) from exc
+        if (
+            subnet.version != 4
+            or not subnet.is_private
+            or subnet.is_loopback
+            or subnet.prefixlen < 16
+        ):
+            raise AdmissionError("capacity receipt running network summary is invalid")
+        network_ids.add(record["id"])
+        network_subnets.add(record["subnet"])
+
+    build_attestation_sha256 = hashlib.sha256(
+        bindings_evidence.build_attestation_raw
+    ).hexdigest()
+    build_manifest_sha256 = hashlib.sha256(
+        bindings_evidence.build_manifest_raw
+    ).hexdigest()
+    deployment_attestation_sha256 = hashlib.sha256(
+        bindings_evidence.deployment_attestation_raw
+    ).hexdigest()
+    bound_inputs = {
+        "build-attestation": (
+            list(bindings_evidence.build_attestation_identity),
+            build_attestation_sha256,
+        ),
+        "build-manifest": (
+            list(bindings_evidence.build_manifest_identity),
+            build_manifest_sha256,
+        ),
+        "deployment-attestation": (
+            list(bindings_evidence.deployment_attestation_identity),
+            deployment_attestation_sha256,
+        ),
+    }
+    if (
+        build_manifest_sha256 != bindings_evidence.validated_manifest_sha256
+        or deployment.get("deployment_attestation_sha256")
+        != deployment_attestation_sha256
+        or deployment.get("common_digest_override_sha256")
+        != protected_inputs["common-digest-override"]["sha256"]
+        or any(
+            protected_inputs[label] != {"identity": identity, "sha256": sha256}
+            for label, (identity, sha256) in bound_inputs.items()
+        )
+    ):
+        raise AdmissionError("capacity receipt protected input binding is invalid")
+    if any(
+        protected_inputs[label]
+        != {
+            "identity": list(evidence.identity),
+            "sha256": evidence.sha256,
+        }
+        for label, evidence in compose_inputs_evidence.items()
+    ):
+        raise AdmissionError(
+            "capacity receipt differs from current protected Compose inputs"
+        )
+
+    contract_files, runtime_lock_sha256, runtime_tree_sha256 = (
+        _capacity_runtime_contract_evidence()
+    )
+    expected_runtime_file_sha256 = _capacity_runtime_file_evidence()
+    if expected_runtime_file_sha256[
+        _CAPACITY_RUNTIME_CONTRACT_RELATIVE
+    ] != runtime_lock_sha256 or any(
+        expected_runtime_file_sha256[relative] != contract_files[relative]
+        for relative in _CAPACITY_SEALED_RUNTIME_PATHS
+        if relative != _CAPACITY_RUNTIME_CONTRACT_RELATIVE
+    ):
+        raise AdmissionError("capacity receipt sealed runtime differs from its lock")
+    expected_runtime_file_sha256.update(
+        {
+            f"external:{label}": item["sha256"]
+            for label, item in protected_inputs.items()
+        }
+    )
+    identity_material = {
+        "file_sha256": expected_runtime_file_sha256,
+        "python_executable": "/usr/local/bin/python",
+        "python_prefix": "/usr/local",
+        "python_version": "3.11",
+        "dependency_versions": {"curl_cffi": _CAPACITY_CURL_CFFI_VERSION},
+        "worker_image_id": scheduler_image_id,
+        "production_deployment": deployment,
+    }
+    expected_runtime_manifest = hashlib.sha256(
+        _authority_canonical_bytes(identity_material)
+    ).hexdigest()
+    if (
+        set(runtime) != _CAPACITY_RUNTIME_IDENTITY_FIELDS
+        or runtime.get("file_sha256") != expected_runtime_file_sha256
+        or runtime.get("python_executable") != "/usr/local/bin/python"
+        or runtime.get("python_prefix") != "/usr/local"
+        or runtime.get("python_version") != "3.11"
+        or runtime.get("dependency_versions")
+        != {"curl_cffi": _CAPACITY_CURL_CFFI_VERSION}
+        or runtime.get("manifest_sha256") != expected_runtime_manifest
+        or release.get("manifest_sha256") != expected_runtime_manifest
+        or sealed_runtime.get("file_count") != len(_CAPACITY_SEALED_RUNTIME_PATHS)
+        or sealed_runtime.get("runtime_tree_sha256") != runtime_tree_sha256
+        or any(
+            expected_runtime_file_sha256.get(relative) is None
+            for relative in _CAPACITY_SEALED_RUNTIME_PATHS
+        )
+    ):
+        raise AdmissionError("capacity receipt runtime identity is not sealed")
+
+    baseline = value.get("baseline_containers")
+    if not isinstance(baseline, list) or [
+        record.get("name") if isinstance(record, dict) else None for record in baseline
+    ] != list(COMMON_PROTECTED_SERVICES):
+        raise AdmissionError("capacity receipt baseline container set is invalid")
+    for service, record in zip(COMMON_PROTECTED_SERVICES, baseline, strict=True):
+        _validate_capacity_container_record(
+            record,
+            service=service,
+            running_images=running_images_by_service,
+        )
+    _validate_capacity_samples(
+        samples,
+        observed=observed,
+        total_elapsed=total_elapsed,
+        completed_runs=completed_runs_value,
+        total_page_units=page_units,
+        baseline=baseline,
+        running_images=running_images_by_service,
+        report=value,
+    )
+
+    return {
+        "duration_seconds_observed": value["duration_seconds_observed"],
+        "mode": value["mode"],
+        "peak_combined_rss_bytes": value["peak_combined_rss_bytes"],
+        "projected_page_units_per_day": value["projected_page_units_per_day"],
+        "report_sha256": claimed,
+        "runtime_release_identity": dict(release),
+        "schema_version": value["schema_version"],
+        "status": "accepted-v1",
+        "worker_count": value["worker_count"],
+    }
 
 
 def _common_parser() -> argparse.ArgumentParser:
@@ -7821,9 +9732,7 @@ def _parser() -> argparse.ArgumentParser:
         "snapshot-cutover-dag-pauses", parents=[common]
     )
     pause_snapshot.add_argument("--output", type=Path, required=True)
-    quiescence = commands.add_parser(
-        "verify-cutover-quiescence", parents=[common]
-    )
+    quiescence = commands.add_parser("verify-cutover-quiescence", parents=[common])
     quiescence.add_argument("--output", type=Path, required=True)
     cutover = commands.add_parser("verify-cutover-inventory", parents=[common])
     cutover.add_argument("--output", type=Path, required=True)
@@ -7846,6 +9755,12 @@ def _parser() -> argparse.ArgumentParser:
     rendered.add_argument("--owner-secret-file", type=Path, required=True)
     rendered.add_argument("--provider-quota-receipt", type=Path, required=True)
     rendered.add_argument("--output", type=Path, required=True)
+    common_rendered = commands.add_parser("verify-common-rendered", parents=[common])
+    common_rendered.add_argument("--common-override", type=Path, required=True)
+    common_rendered.add_argument(
+        "--env-file", type=Path, action="append", required=True
+    )
+    common_rendered.add_argument("--output", type=Path, required=True)
     created = commands.add_parser("post-create", parents=[common])
     created.add_argument("--common-override", type=Path, required=True)
     created.add_argument("--gateway-override", type=Path, required=True)
@@ -7854,6 +9769,15 @@ def _parser() -> argparse.ArgumentParser:
     created.add_argument("--owner-secret-file", type=Path, required=True)
     created.add_argument("--provider-quota-receipt", type=Path, required=True)
     created.add_argument("--service", action="append", required=True)
+    common_created = commands.add_parser("post-create-common", parents=[common])
+    common_created.add_argument("--common-override", type=Path, required=True)
+    common_created.add_argument("--env-file", type=Path, action="append", required=True)
+    common_created.add_argument(
+        "--service",
+        action="append",
+        choices=COMMON_PROTECTED_SERVICES,
+        required=True,
+    )
     running = commands.add_parser("verify-running", parents=[common])
     running.add_argument("--common-override", type=Path, required=True)
     running.add_argument("--gateway-override", type=Path, required=True)
@@ -7861,6 +9785,14 @@ def _parser() -> argparse.ArgumentParser:
     running.add_argument("--provider-policy", type=Path, required=True)
     running.add_argument("--owner-secret-file", type=Path, required=True)
     running.add_argument("--deployment-admission-receipt", type=Path, required=True)
+    running.add_argument(
+        "--capacity-receipt",
+        type=Path,
+        help=(
+            "protected canonical six-hour cache-capacity receipt; required "
+            "for final --rollout-id GO"
+        ),
+    )
     rollout_mode = running.add_mutually_exclusive_group()
     rollout_mode.add_argument(
         "--rollout-id",
@@ -7905,6 +9837,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     manifest = _absolute(args.manifest or canonical_manifest)
     deployment = _absolute(args.deployment_attestation)
     try:
+        if (
+            args.command == "verify-running"
+            and args.capacity_receipt is not None
+            and args.rollout_id is None
+        ):
+            raise AdmissionError(
+                "--capacity-receipt is only valid with final --rollout-id"
+            )
         selected_services = (
             _canonical_rollout_services(args.service)
             if args.command == "verify-running"
@@ -7916,12 +9856,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise AdmissionError(
                 "provenance manifest and attestation must be canonical release paths"
             )
-        bindings = validate_bindings(
+        bindings_evidence = validate_bindings_with_evidence(
             root=root,
             attestation_path=attestation,
             manifest_path=manifest,
             deployment_attestation_path=deployment,
         )
+        bindings = dict(bindings_evidence.bindings)
         if args.command == "generate-override":
             common_output = _absolute(args.common_output)
             gateway_output = _absolute(args.gateway_output)
@@ -7988,9 +9929,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     else "evidence"
                 ): evidence,
                 "output": str(output),
-                "output_sha256": hashlib.sha256(
-                    _canonical_bytes(evidence)
-                ).hexdigest(),
+                "output_sha256": hashlib.sha256(_canonical_bytes(evidence)).hexdigest(),
                 "schema_version": 1,
                 "status": (
                     "cutover-inventory-recorded-v1"
@@ -7998,6 +9937,72 @@ def main(argv: Sequence[str] | None = None) -> int:
                     else f"{args.command}-recorded-v1"
                 ),
             }
+        elif args.command in {"verify-common-rendered", "post-create-common"}:
+            common_override = _absolute(args.common_override)
+            env_files = tuple(_absolute(path) for path in args.env_file)
+            if env_files != _COMMON_ONLY_ENV_FILES:
+                raise AdmissionError(
+                    "common-only admission requires the exact three production "
+                    "environment files in canonical order"
+                )
+            if args.command == "post-create-common" and len(args.service) != 1:
+                raise AdmissionError(
+                    "common post-create admission requires exactly one service"
+                )
+            protected_input_evidence = _assert_protected_compose_inputs(
+                (
+                    root / "compose.yaml",
+                    root / "compose.seaweedfs-supervised.yaml",
+                    common_override,
+                    *env_files,
+                )
+            )
+            projections, config_hashes, config_files, rendered = (
+                render_attested_common_project(
+                    bindings,
+                    root=root,
+                    common_override_path=common_override,
+                    env_files=env_files,
+                    protected_inputs={
+                        path: evidence.raw
+                        for path, evidence in protected_input_evidence.items()
+                    },
+                )
+            )
+            if args.command == "verify-common-rendered":
+                output = _absolute(args.output)
+                _assert_compose_input_evidence_unchanged(protected_input_evidence)
+                write_new_regular_file(output, _canonical_bytes(rendered))
+                report = {
+                    "config_hashes": config_hashes,
+                    "deployment_attestation": {
+                        "path": str(deployment),
+                        "sha256": hashlib.sha256(
+                            bindings_evidence.deployment_attestation_raw
+                        ).hexdigest(),
+                    },
+                    "output": str(output),
+                    "projects": {
+                        COMMON_PROJECT: list(COMMON_PROTECTED_SERVICES),
+                    },
+                    "schema_version": 1,
+                    "status": "common-rendered-admitted-v1",
+                }
+            else:
+                report = verify_created_containers(
+                    bindings,
+                    project=COMMON_PROJECT,
+                    selected_services=args.service,
+                    projections=projections,
+                    config_hashes=config_hashes,
+                    config_files=config_files,
+                    env_files=env_files,
+                )
+                _assert_compose_input_evidence_unchanged(protected_input_evidence)
+                report["admission_scope"] = "common-only-v1"
+                report["receipt_type"] = "common-post-create-v1"
+                report["schema_version"] = 2
+                report["status"] = "common-created-admitted-v1"
         else:
             provider_policy = validate_provider_policy(
                 _absolute(args.provider_policy),
@@ -8027,7 +10032,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if common_override == gateway_override:
                 raise AdmissionError("split Compose overrides must be distinct")
             env_files = tuple(_absolute(path) for path in args.env_file)
-            protected_inputs = _assert_protected_compose_inputs(
+            protected_input_evidence = _assert_protected_compose_inputs(
                 (
                     root / "compose.yaml",
                     root / "compose.seaweedfs-supervised.yaml",
@@ -8037,6 +10042,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     *env_files,
                 )
             )
+            protected_inputs = {
+                path: evidence.raw
+                for path, evidence in protected_input_evidence.items()
+            }
             projections, config_hashes, config_files, rendered = (
                 render_attested_projects(
                     bindings,
@@ -8115,6 +10124,52 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 "rollout replay lacks admitted scheduler identity"
                             )
                         if args.rollout_id is not None:
+                            if args.capacity_receipt is None:
+                                raise AdmissionError(
+                                    "final rollout GO requires --capacity-receipt"
+                                )
+                            authority_body = rollout_authority.get("authority")
+                            if not isinstance(authority_body, Mapping):
+                                raise AdmissionError(
+                                    "current rollout capacity authority is invalid"
+                                )
+                            _assert_compose_input_evidence_unchanged(
+                                protected_input_evidence
+                            )
+                            report["capacity_receipt"] = validate_capacity_receipt(
+                                _absolute(args.capacity_receipt),
+                                capacity_receipt_sha256=str(
+                                    authority_body.get("capacity_receipt_sha256")
+                                ),
+                                bindings_evidence=bindings_evidence,
+                                scheduler_image_id=str(
+                                    scheduler_records[0].get("image_id")
+                                ),
+                                compose_inputs_evidence={
+                                    "compose:compose.yaml": protected_input_evidence[
+                                        root / "compose.yaml"
+                                    ],
+                                    "compose:compose.seaweedfs-supervised.yaml": (
+                                        protected_input_evidence[
+                                            root / "compose.seaweedfs-supervised.yaml"
+                                        ]
+                                    ),
+                                    "common-digest-override": (
+                                        protected_input_evidence[common_override]
+                                    ),
+                                    **{
+                                        f"compose-env:{index}": (
+                                            protected_input_evidence[path]
+                                        )
+                                        for index, path in enumerate(env_files)
+                                    },
+                                },
+                                common_config_hashes={
+                                    service: config_hashes[service]
+                                    for service in COMMON_PROTECTED_SERVICES
+                                },
+                                running_images_evidence=tuple(report.get("images", ())),
+                            )
                             report["rollout_acceptance"] = verify_rollout_acceptance(
                                 rollout_id,
                                 rollout_authority=rollout_authority,
@@ -8123,6 +10178,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 ],
                             )
                         else:
+                            if args.capacity_receipt is not None:
+                                raise AdmissionError(
+                                    "--capacity-receipt is only valid with --rollout-id"
+                                )
                             report["issuance_rollout"] = verify_issuance_rollout(
                                 rollout_id,
                                 rollout_authority=rollout_authority,

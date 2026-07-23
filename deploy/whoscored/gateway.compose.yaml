@@ -225,6 +225,7 @@ services:
       WHOSCORED_PROXY_LEDGER_HMAC_SECRET: ${WHOSCORED_PROXY_LEDGER_HMAC_SECRET:-}
       WHOSCORED_PROVIDER_ORDER_ID: ${WHOSCORED_PROVIDER_ORDER_ID:?set exact provider order id}
       WHOSCORED_PROVIDER_POLICY_SHA256: ${WHOSCORED_PROVIDER_POLICY_SHA256:?set exact signed provider-policy sha256}
+      WHOSCORED_PROVIDER_ORDER_CAP_BYTES: ${WHOSCORED_PROVIDER_ORDER_CAP_BYTES:?set exact signed provider gross order cap in decimal bytes}
       WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES: ${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES:?set exact provider-policy daily cap in decimal bytes}
       WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES: ${WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES:-2000000}
       TM_PROXY_CONTROL_TOKEN: ""
@@ -248,6 +249,8 @@ services:
       - /opt/airflow/state/whoscored-proxy-filter/bytes.json
       - --daily-budget-bytes
       - ${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES:?set exact provider-policy daily cap in decimal bytes}
+      - --whoscored-provider-order-cap-bytes
+      - ${WHOSCORED_PROVIDER_ORDER_CAP_BYTES:?set exact signed provider gross order cap in decimal bytes}
       - --max-lease-bytes
       - ${WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES:-2000000}
       - --max-lease-ttl-seconds

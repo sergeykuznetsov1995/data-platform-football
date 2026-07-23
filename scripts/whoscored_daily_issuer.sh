@@ -13,6 +13,7 @@ readonly FLOCK=/usr/bin/flock
 readonly PLANNER_NETWORK=dp-backend
 readonly WINDOW_START=0900
 readonly WINDOW_END=0930
+readonly ISSUER_MODE="${WHOSCORED_ISSUER_MODE:-daily}"
 
 fail() {
   echo "WhoScored daily issuer blocked: $*" >&2
@@ -177,12 +178,21 @@ exec {lock_fd}>"$LOCK_PATH"
 
 readonly utc_hhmm="$($DATE -u '+%H%M')"
 [[ "$utc_hhmm" =~ ^[0-9]{4}$ ]] || fail "UTC wall clock is invalid"
-if ((10#$utc_hhmm < 10#$WINDOW_START || 10#$utc_hhmm > 10#$WINDOW_END)); then
-  fail "issuer may run only from 09:00 through 09:30 UTC"
-fi
+case "$ISSUER_MODE" in
+  daily)
+    if ((10#$utc_hhmm < 10#$WINDOW_START || 10#$utc_hhmm > 10#$WINDOW_END)); then
+      fail "issuer may run only from 09:00 through 09:30 UTC"
+    fi
+    ;;
+  bootstrap)
+    require_variable WHOSCORED_BOOTSTRAP_RUN_ID
+    ;;
+  bootstrap-publish) ;;
+  *) fail "WHOSCORED_ISSUER_MODE must be daily, bootstrap, or bootstrap-publish" ;;
+esac
 
 issuance_rollout_id="$("$JQ" -er '
-  if type == "object" and .schema_version == 3 and
+  if type == "object" and .schema_version == 4 and
     (.rollout_id | type == "string" and
       test("^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"))
   then .rollout_id
@@ -284,7 +294,11 @@ require_root_private_file "$running_admission_receipt"
       "classifier_sha256": $r.classifier_sha256,
       "promotion_acceptance_sha256": $r.promotion_acceptance_sha256,
       "promotion_terminal_receipt_sha256":
-        $r.promotion_terminal_receipt_sha256
+        $r.promotion_terminal_receipt_sha256,
+      "acceptance_mode": $r.acceptance_mode,
+      "bootstrap_slots": $r.bootstrap_slots,
+      "capacity_receipt_sha256": $r.capacity_receipt_sha256,
+      "provider_order_cap_bytes": $r.provider_order_cap_bytes
     } and
     $live.authority == {
       "rollout_id": $c.rollout_id,
@@ -297,12 +311,35 @@ require_root_private_file "$running_admission_receipt"
       "classifier_sha256": $c.classifier_sha256,
       "promotion_acceptance_sha256": $c.promotion_acceptance_sha256,
       "promotion_terminal_receipt_sha256":
-        $c.promotion_terminal_receipt_sha256
+        $c.promotion_terminal_receipt_sha256,
+      "acceptance_mode": $c.acceptance_mode,
+      "bootstrap_slots": $c.bootstrap_slots,
+      "capacity_receipt_sha256": $c.capacity_receipt_sha256,
+      "provider_order_cap_bytes": $c.provider_order_cap_bytes
     }
   ' "$running_admission_receipt" >/dev/null || fail "fresh running admission is invalid"
 
-readonly logical_date="$($DATE -u --date='yesterday 10:00:00' '+%Y-%m-%dT10:00:00+00:00')"
-readonly run_id="scheduled__${logical_date}"
+if test "$ISSUER_MODE" = daily; then
+  logical_date="$($DATE -u --date='yesterday 10:00:00' '+%Y-%m-%dT10:00:00+00:00')"
+  run_id="scheduled__${logical_date}"
+elif test "$ISSUER_MODE" = bootstrap; then
+  run_id="$WHOSCORED_BOOTSTRAP_RUN_ID"
+  logical_date="${run_id#scheduled__}"
+  test "$run_id" != "$logical_date" || fail "bootstrap run id is not scheduled"
+  "$JQ" -e --arg run_id "$run_id" '
+    . as $rollout |
+    .acceptance_mode == "accelerated-bootstrap-v1" and
+    (.bootstrap_slots | type == "array" and length == 6) and
+    ([.bootstrap_slots[] | select(.run_id == $run_id and
+      .wave_id == $rollout.wave_id)] | length == 1)
+  ' "$WHOSCORED_ROLLOUT_FILE" >/dev/null || \
+    fail "bootstrap run id/wave is outside signed rollout authority"
+else
+  logical_date="bootstrap-publish"
+  run_id="bootstrap-publish-${issuance_rollout_id}"
+fi
+readonly logical_date
+readonly run_id
 readonly run_hash="$(printf '%s' "$run_id" | "$SHA256SUM" | cut -d' ' -f1)"
 readonly planner_plan_container_path="/var/lib/whoscored/plans/${run_hash}.json"
 readonly signer_plan_container_path="/authority/daily-plan.json"
@@ -321,9 +358,15 @@ cleanup() {
     "$frozen_plan_host_path" \
     "$authority_stage/credentials/approval-hmac" \
     "$authority_stage/credentials/owner-hmac" \
-    "$authority_stage/credentials/issuance-ledger-hmac"
+    "$authority_stage/credentials/issuance-ledger-hmac" \
+    "$authority_stage/bootstrap-publisher/rollout.json" \
+    "$authority_stage/bootstrap-publisher/provider-policy.json" \
+    "$authority_stage/bootstrap-publisher/charter.json" \
+    "$authority_stage/bootstrap-publisher/owner-hmac" \
+    "$authority_stage/bootstrap-publisher/issuance-ledger-hmac"
   rmdir -- "$planner_output_dir" 2>/dev/null || true
   rmdir -- "$authority_stage/credentials" 2>/dev/null || true
+  rmdir -- "$authority_stage/bootstrap-publisher" 2>/dev/null || true
   rmdir -- "$authority_stage" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -350,7 +393,7 @@ test "$("$SHA256SUM" "$WHOSCORED_PROVIDER_POLICY_FILE" | cut -d' ' -f1)" = \
 "$JQ" -e \
   --arg runtime "$WHOSCORED_RUNTIME_SHA256" \
   --arg classifier "$WHOSCORED_CLASSIFIER_SHA256" '
-    .schema_version == 3 and
+    .schema_version == 4 and
     .runtime_sha256 == $runtime and
     .classifier_sha256 == $classifier and
     (.promotion_acceptance_sha256 | type == "string" and
@@ -365,13 +408,15 @@ test "$("$SHA256SUM" "$WHOSCORED_PROVIDER_POLICY_FILE" | cut -d' ' -f1)" = \
   --arg classifier "$WHOSCORED_CLASSIFIER_SHA256" '
     . as $charter |
     $rollout[0] as $r |
-    .schema_version == 4 and
+    .schema_version == 5 and
     .runtime_sha256 == $runtime and
     .classifier_sha256 == $classifier and
     (["cohort_id", "rollout_id", "wave_id", "max_scopes",
       "require_full_active", "ranked_scope_ids_sha256", "runtime_sha256",
       "classifier_sha256", "promotion_acceptance_sha256",
-      "promotion_terminal_receipt_sha256"] |
+      "promotion_terminal_receipt_sha256", "acceptance_mode",
+      "bootstrap_slots", "capacity_receipt_sha256",
+      "provider_order_cap_bytes"] |
       all(. as $field | $r[$field] == $charter[$field]))
   ' "$authority_stage/charter.json" >/dev/null || \
   fail "charter differs from the staged rollout/release"
@@ -431,7 +476,11 @@ readonly staged_rollout_manifest_sha256
       "classifier_sha256": $r.classifier_sha256,
       "promotion_acceptance_sha256": $r.promotion_acceptance_sha256,
       "promotion_terminal_receipt_sha256":
-        $r.promotion_terminal_receipt_sha256
+        $r.promotion_terminal_receipt_sha256,
+      "acceptance_mode": $r.acceptance_mode,
+      "bootstrap_slots": $r.bootstrap_slots,
+      "capacity_receipt_sha256": $r.capacity_receipt_sha256,
+      "provider_order_cap_bytes": $r.provider_order_cap_bytes
     } and
     $live.authority == {
       "rollout_id": $c.rollout_id,
@@ -444,7 +493,11 @@ readonly staged_rollout_manifest_sha256
       "classifier_sha256": $c.classifier_sha256,
       "promotion_acceptance_sha256": $c.promotion_acceptance_sha256,
       "promotion_terminal_receipt_sha256":
-        $c.promotion_terminal_receipt_sha256
+        $c.promotion_terminal_receipt_sha256,
+      "acceptance_mode": $c.acceptance_mode,
+      "bootstrap_slots": $c.bootstrap_slots,
+      "capacity_receipt_sha256": $c.capacity_receipt_sha256,
+      "provider_order_cap_bytes": $c.provider_order_cap_bytes
     }
   ' "$authority_stage/charter.json" >/dev/null || \
   fail "staged rollout authority differs from fresh running admission"
@@ -484,6 +537,96 @@ container_hardening=(
   --security-opt seccomp=builtin
   --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m,uid=50000,gid=0,mode=0700
 )
+publisher_hardening=(
+  --read-only
+  --user 0:0
+  --cap-drop ALL
+  --cap-add DAC_OVERRIDE
+  --security-opt no-new-privileges:true
+  --security-opt apparmor=docker-default
+  --security-opt seccomp=builtin
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=32m,uid=0,gid=0,mode=0700
+)
+
+readonly bootstrap_slots_json="$("$JQ" -c -e \
+  '.bootstrap_slots | select(type == "array" and length == 6)' \
+  "$authority_stage/rollout.json")"
+bootstrap_metadata_preflight=(
+  "${docker_clean[@]}"
+  exec
+  airflow-scheduler
+  /usr/local/bin/python
+  /opt/airflow/dags/scripts/whoscored_bootstrap.py
+  metadata-preflight
+  --bootstrap-slots-json "$bootstrap_slots_json"
+)
+case "$ISSUER_MODE" in
+  bootstrap-publish)
+    "${bootstrap_metadata_preflight[@]}" --phase publish
+    ;;
+  bootstrap)
+    test -f "$WHOSCORED_SCHEDULED_PAID_POINTER_HOST_DIR/bootstrap.json" && \
+      test ! -L "$WHOSCORED_SCHEDULED_PAID_POINTER_HOST_DIR/bootstrap.json" || \
+      fail "bootstrap timetable authority is absent or unsafe"
+    require_frozen_container_file \
+      "$WHOSCORED_SCHEDULED_PAID_POINTER_HOST_DIR/bootstrap.json"
+    "${bootstrap_metadata_preflight[@]}" --phase issue --run-id "$run_id"
+    ;;
+  daily)
+    if test -e "$WHOSCORED_SCHEDULED_PAID_POINTER_HOST_DIR/bootstrap.json" || \
+      test -L "$WHOSCORED_SCHEDULED_PAID_POINTER_HOST_DIR/bootstrap.json"; then
+      require_frozen_container_file \
+        "$WHOSCORED_SCHEDULED_PAID_POINTER_HOST_DIR/bootstrap.json"
+      "${bootstrap_metadata_preflight[@]}" --phase complete
+    fi
+    ;;
+esac
+
+if test "$ISSUER_MODE" = bootstrap-publish; then
+  readonly publisher_stage="$authority_stage/bootstrap-publisher"
+  install -d -o root -g root -m 0700 "$publisher_stage"
+  install -o root -g root -m 0400 \
+    "$WHOSCORED_ROLLOUT_FILE" "$publisher_stage/rollout.json"
+  install -o root -g root -m 0400 \
+    "$WHOSCORED_PROVIDER_POLICY_FILE" "$publisher_stage/provider-policy.json"
+  install -o root -g root -m 0400 \
+    "$WHOSCORED_CHARTER_FILE" "$publisher_stage/charter.json"
+  install -o root -g root -m 0400 \
+    "$CREDENTIALS_DIRECTORY/owner-hmac" "$publisher_stage/owner-hmac"
+  install -o root -g root -m 0400 \
+    "$CREDENTIALS_DIRECTORY/issuance-ledger-hmac" \
+    "$publisher_stage/issuance-ledger-hmac"
+  "${docker_clean[@]}" run --rm --pull never \
+    --name "whoscored-bootstrap-publisher-${run_hash:0:12}" \
+    --network none \
+    "${publisher_hardening[@]}" \
+    "${common_mounts[@]}" \
+    --mount "type=bind,src=$publisher_stage/rollout.json,dst=/authority/rollout.json,readonly" \
+    --mount "type=bind,src=$publisher_stage/provider-policy.json,dst=/authority/provider-policy.json,readonly" \
+    --mount "type=bind,src=$publisher_stage/charter.json,dst=/authority/charter.json,readonly" \
+    --mount "type=bind,src=$publisher_stage/owner-hmac,dst=/run/credentials/owner-hmac,readonly" \
+    --mount "type=bind,src=$publisher_stage/issuance-ledger-hmac,dst=/run/credentials/issuance-ledger-hmac,readonly" \
+    --mount "type=bind,src=$WHOSCORED_SCHEDULED_PAID_POINTER_HOST_DIR,dst=/authority/pointers" \
+    "$WHOSCORED_SIGNER_IMAGE" \
+    python /opt/airflow/scripts/whoscored_proxy_campaign.py \
+      publish-bootstrap-authority \
+      --rollout-file /authority/rollout.json \
+      --provider-policy /authority/provider-policy.json \
+      --charter /authority/charter.json \
+      --pointer-root /authority/pointers \
+      --owner-secret-file /run/credentials/owner-hmac \
+      --issuance-ledger-secret-file /run/credentials/issuance-ledger-hmac
+  test -f "$WHOSCORED_SCHEDULED_PAID_POINTER_HOST_DIR/bootstrap.json" || \
+    fail "signer did not publish bootstrap authority"
+  require_frozen_container_file \
+    "$WHOSCORED_SCHEDULED_PAID_POINTER_HOST_DIR/bootstrap.json"
+  echo "WhoScored bootstrap authority published"
+  exit 0
+fi
+
+issue_command=issue-daily-ingest
+test "$ISSUER_MODE" != bootstrap || issue_command=issue-bootstrap-ingest
+readonly issue_command
 
 "${docker_clean[@]}" run --rm --pull never \
   --name "whoscored-daily-planner-${run_hash:0:12}" \
@@ -509,7 +652,7 @@ rmdir -- "$planner_output_dir"
 "$JQ" -e '
   .max_scopes as $max_scopes |
   .catalog_active_scope_count as $active_count |
-  .schema_version == 3 and
+  .schema_version == 4 and
   ((.wave_id == "wave-20" and .max_scopes == 20 and
       .require_full_active == false) or
    (.wave_id == "wave-70" and .max_scopes == 70 and
@@ -541,7 +684,7 @@ rmdir -- "$planner_output_dir"
   --mount "type=bind,src=$WHOSCORED_ISSUANCE_LEDGER_HOST_DIR,dst=/authority/ledger" \
   "$WHOSCORED_SIGNER_IMAGE" \
   python /opt/airflow/scripts/whoscored_proxy_campaign.py \
-    issue-daily-ingest \
+    "$issue_command" \
     --run-id "$run_id" \
     --plan-file "$signer_plan_container_path" \
     --rollout-file /authority/rollout.json \

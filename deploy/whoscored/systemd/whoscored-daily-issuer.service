@@ -9,10 +9,15 @@ User=root
 Group=root
 UMask=0077
 EnvironmentFile=/etc/data-platform/whoscored-daily-issuer.env
+# One-shot operator request. Only the tracked bootstrap launcher may create it;
+# that launcher owns fail-closed cleanup even when a dependency prevents this
+# unit from starting. ExecStopPost is defense in depth after the unit did start.
+EnvironmentFile=-/run/whoscored-daily-issuer-control/mode.env
 LoadCredential=approval-hmac:/etc/data-platform/credentials/whoscored-approval-hmac
 LoadCredential=owner-hmac:/etc/data-platform/credentials/whoscored-owner-hmac
 LoadCredential=issuance-ledger-hmac:/etc/data-platform/credentials/whoscored-issuance-ledger-hmac
 ExecStart=/usr/local/libexec/whoscored-daily-issuer
+ExecStopPost=/usr/bin/rm -f /run/whoscored-daily-issuer-control/mode.env
 TimeoutStartSec=30min
 RuntimeDirectory=whoscored-daily-issuer
 RuntimeDirectoryMode=0700
@@ -23,7 +28,7 @@ PrivateTmp=true
 PrivateDevices=true
 PrivateNetwork=true
 ProtectSystem=strict
-ReadWritePaths=/run/whoscored-daily-issuer
+ReadWritePaths=/run/whoscored-daily-issuer -/run/whoscored-daily-issuer-control
 ProtectHome=read-only
 ProtectControlGroups=true
 ProtectKernelModules=true

@@ -22,9 +22,20 @@ BOOTSTRAP_SOURCE = (
 )
 
 
-def _workers() -> tuple[runtime.WorkerSpec, ...]:
+def _workers(
+    mode: str = runtime.DIRECT_DIAGNOSTIC_MODE,
+) -> tuple[runtime.WorkerSpec, ...]:
     return tuple(
-        runtime.WorkerSpec(index, (runtime.WORKLOAD_PATH, "--worker-id", str(index)))
+        runtime.WorkerSpec(
+            index,
+            (
+                runtime.WORKLOAD_PATH,
+                "--mode",
+                mode,
+                "--worker-id",
+                str(index),
+            ),
+        )
         for index in range(4)
     )
 
@@ -228,6 +239,7 @@ class FakeDocker:
             command=command,
             mounts=parsed_mounts,
             security_options=security_options,
+            network_mode=self._value_after(args, "--network"),
         )
         self.containers[container_id] = payload
         self.names[name] = container_id
@@ -247,6 +259,7 @@ class FakeDocker:
         command: list[str] | None = None,
         mounts: list[dict[str, object]] | None = None,
         security_options: list[str] | None = None,
+        network_mode: str = "container:" + FLARE_ID,
     ) -> dict[str, object]:
         return {
             "Id": container_id,
@@ -280,7 +293,7 @@ class FakeDocker:
                         "seccomp=builtin",
                     ]
                 ),
-                "NetworkMode": "container:" + FLARE_ID,
+                "NetworkMode": network_mode,
                 "Memory": runtime.MEMORY_BYTES,
                 "MemorySwap": runtime.MEMORY_BYTES,
                 "PidsLimit": runtime.PIDS_LIMIT,
@@ -448,8 +461,11 @@ def test_control_bytes_and_fixed_paths_match_baked_bootstrap() -> None:
         assert control.argv == spec.workload_argv
 
 
+@pytest.mark.parametrize(
+    "mode", [runtime.DIRECT_DIAGNOSTIC_MODE, runtime.CACHE_CAPACITY_MODE]
+)
 def test_success_uses_exact_hardening_and_one_atomic_release(
-    binds: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    binds: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
     fake = FakeDocker()
     runtime_root, source_circuit = binds
@@ -486,7 +502,7 @@ def test_success_uses_exact_hardening_and_one_atomic_release(
             scheduler_image_id=IMAGE_ID,
             flaresolverr_container_id=FLARE_ID,
             owner=OWNER,
-            workers=_workers(),
+            workers=_workers(mode),
             runtime_root=runtime_root,
             source_circuit_root=source_circuit,
             before_release=before_release,
@@ -545,7 +561,7 @@ def test_success_uses_exact_hardening_and_one_atomic_release(
             "schema_version": 1,
             "worker_id": spec.worker_index,
         }
-        for spec in _workers()
+        for spec in _workers(mode)
     ]
     create_calls = [call[0] for call in fake.calls if call[0][1:3] == ("container", "create")]
     assert len(create_calls) == 4
@@ -567,7 +583,14 @@ def test_success_uses_exact_hardening_and_one_atomic_release(
             IMAGE_ID,
         ):
             assert required in joined
-        assert f"container:{FLARE_ID}" in joined
+        expected_network = (
+            "none"
+            if mode == runtime.CACHE_CAPACITY_MODE
+            else f"container:{FLARE_ID}"
+        )
+        assert joined[joined.index("--network") + 1] == expected_network
+        if mode == runtime.CACHE_CAPACITY_MODE:
+            assert f"container:{FLARE_ID}" not in joined
         assert joined[joined.index("--entrypoint") + 1] == "/usr/bin/dumb-init"
         assert joined[joined.index(IMAGE_ID) + 1 :] == runtime._bootstrap_argv()
 

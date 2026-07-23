@@ -28,10 +28,14 @@ Airflow orchestration, historical replay, proxy policy, DQ and recovery.
   Execution additionally requires the admitted `ready-v1` release, a fresh
   active provider-quota receipt, exact signed authority, an active
   gateway-authenticated campaign and gateway-owned alert proof. Independently
-  of the provider quota and all signed caps, the filtering proxy enforces an
-  exact `300000000` decimal-byte lifetime hard cap for the initialized
-  provider-order state across every campaign, UTC rollover and restart. The
-  full-crawl sentinel remains false, so no paid backfill lease can be issued.
+  of the signed per-run caps, the filtering proxy binds the initialized
+  provider-order state to the fresh receipt's exact decimal-byte quota, rejects
+  any order larger than `1000000000` bytes, and keeps five percent unavailable
+  for in-flight accounting and provider-counter drift. The resulting spendable
+  lifetime cap (at most `950000000` bytes) is shared by the bounded smoke and
+  every accelerated-bootstrap run across UTC rollover and restart. The
+  full-crawl sentinel remains false, so no paid history-backfill lease can be
+  issued.
 - Raw source observations are append-only. A successful receipt is published
   only after final-object readback; quarantine invalidates the exact failed
   observation and cannot hide a concurrent healthy writer.
@@ -52,8 +56,10 @@ Airflow orchestration, historical replay, proxy policy, DQ and recovery.
   (maximum 3,000); it never publishes an inevitably partial daily repair.
 - The runtime topology is LocalExecutor. `whoscored_direct_pool` is controlled
   by `WHOSCORED_SOURCE_POOL_SLOTS`, whose runtime-enforced range is 2..4;
-  `whoscored_dq_pool` has two slots. The safe deployment default is two source
-  slots and promotion to four requires the sustained canary below.
+  `whoscored_dq_pool` has two slots. The safe effective default is a
+  two-slot `whoscored_direct_pool`; promotion of that pool to four requires the
+  sustained canary below. During the paused rollout ceremony only, the target
+  four-slot environment may be pre-staged while the database pool remains two.
 - Every structured-feed browser start is admitted by one process-global
   FlareSolverr governor. Starts from different sessions and batches are at
   least 546 ms apart; callers cannot override the interval or accumulate idle
@@ -66,11 +72,15 @@ Airflow orchestration, historical replay, proxy policy, DQ and recovery.
   Production tasks fail fast while open; only the non-publishing capacity
   harness waits. Corrupt/insecure state fails before a rate token or network
   request, while a valid raw-cache hit is always checked first.
-- The complete cold path must finish within 6 hours; normal daily rolling p95
-  must stay within 4 hours; a full-history backfill plan must finish within 30
-  days. The DAGs enforce these deadlines in addition to task-level timeouts.
-  The all-catalog plan remains fail-closed until a sustained representative
-  four-worker canary proves at least 144,000 page units/day.
+- The complete bootstrap path must finish within 6 hours and is admitted only
+  when its authority binds the exact successful 21,600-second cache-capacity
+  receipt. Each of the six accelerated runs is checked against that bootstrap
+  bound. Those samples never populate or weaken the normal daily rolling-p95
+  gate, which still requires at least 20 normal runs and must stay within 4
+  hours. A full-history backfill plan must finish within 30 days. The DAGs
+  enforce these deadlines in addition to task-level timeouts. The all-catalog
+  plan remains fail-closed until the sustained representative four-worker
+  canary proves at least 144,000 page units/day.
 
 ## Formal production GO
 
@@ -82,8 +92,11 @@ time:
 - the source-derived active senior-men catalog is on parser v8/report schema 3
   with zero unresolved classifications and strict terminal outcomes;
 - the immutable heavy-first `wave-20` -> `wave-70` -> `wave-all` rollout has two
-  consecutive scheduler-created daily runs per wave, exact empty DagRun conf,
-  and green DQ, SLO, idempotency and paid-alert evidence;
+  consecutive scheduler-created runs per wave, exact empty DagRun conf, and
+  green DQ, bootstrap-SLO, idempotency and paid-alert evidence. The six signed
+  backdated 10:00 UTC logical slots may be consumed in one controlled
+  accelerated-bootstrap window; after the sixth slot the same timetable emits
+  only the normal future daily 10:00 UTC cadence;
 - final running admission replays those six exact DagRuns and their TI/XCom
   evidence from the live Airflow metadata database while all five protected
   services are running from the admitted release;
@@ -132,7 +145,7 @@ reviewed release and explicit owner-approved budget.
 | Backfill checkpoints | Recovery materialized the cumulative receipt history and latest-state lookup grew with generations | Checkpoint v3 keeps a compact frontier snapshot plus at most 63 bounded deltas, a <=64 KiB index, and a 12-level radix lookup; full receipts are materialized only for terminal DQ/recovery |
 | Backfill capacity | Every match was charged for a preview and the configured requests/day value could exceed neither a throttle nor a proven source ceiling | Policy v6 charges exact match plus frozen preview identities; the hard ceiling is always `source slots * 30 * 1,440` (86,400..172,800), reports observed wall-clock throughput, and stops before the next source batch on breach |
 | Daily profiles | Limit estimated as roster/90, so a first run, outage or parser bump could scrape only a prefix and then fail full-coverage DQ | One exact shared candidate predicate; count/set hash pinned through planner, CLI report and DQ; complete repair or pre-source hard-cap failure |
-| Proxy use | Manual/default behavior could select the paid endpoint implicitly | Direct-only by default; scheduled daily ingest requires an exact issuer pointer and the manual measurement canary requires exact signed authority. Both remain behind the quota receipt, authenticated gateway and exact `300000000` decimal-byte provider-order lifetime cap; every paid backfill lease remains code-disabled |
+| Proxy use | Manual/default behavior could select the paid endpoint implicitly | Direct-only diagnostics remain explicit; scheduled daily ingest requires an exact issuer pointer and the bounded live smoke requires exact signed authority. Both remain behind the quota receipt, authenticated gateway and one cumulative receipt-bound order ledger: gross <=1 GB, five-percent reserve, spendable <=950 MB; every paid history-backfill lease remains code-disabled |
 | Source block handling | Independent workers could retry the same block and browser batches could start together | One fixed process-global 546 ms actual-start governor plus a persistent 15/30/60-minute shared cooldown and one half-open probe; expected origin masks and ordinary 502/timeouts never authorize paid traffic |
 | DQ | Primarily task success and partial current-run checks | Snapshot-pinned frozen scope/match/profile identities, exact stage/feed proof, owner-level parity across 25 datasets, NULL-identity duplicate sentinels, parser/availability proof, profile terminal proof and transport reconciliation (zero-paid for direct/backfill, exact authorized bytes for scheduled paid ingest); the complete historical read is 33 cardinality-invariant queries |
 | Iceberg failure handling | Metadata corruption repair could drop/recreate a table; maintenance could return green with partial failures and had no safe live-file compaction | Corruption and partial maintenance fail closed; delete-safe exact-path compaction is bounded to 64 files/512 MiB per table and 4 tables/2 GiB per task; effective retention is 30d weekly, 14d daily for WhoScored and 3d for other high-churn feeds |
@@ -260,8 +273,11 @@ ADMISSION_PYTHON=(
    `WHOSCORED_SCHEDULED_PAID_MODE=required`. A manual run pins its approval ID
    and SHA-256 in `DagRun.conf`; a scheduled run resolves the immutable
    run-ID-keyed pointer. Missing or invalid pointers fail closed. Install
-   approvals and pointers under their distinct host directories as UID `50000`,
-   mode `0600`; Compose mounts both directories read-only into
+   approvals and per-run pointers under their distinct host directories as UID
+   `50000`, mode `0600`. The one stable accelerated-bootstrap projection
+   `bootstrap.json` is the deliberate exception: the root publisher creates it
+   once as `root:root`, mode `0440`, in the same protected pointer directory.
+   Compose mounts both directories read-only into
    `airflow-scheduler` alone. Never use a mutable `current` symlink or expose
    the signing workspace to Airflow.
    The scheduler performs structural approval checks and receives no approval
@@ -916,6 +932,11 @@ and quota caps. The filter environment must match the signed order, policy
 digest and daily cap exactly. The helper publishes a new mode-0600 two-project
 rendered model only after all five protected services and that external
 evidence pass:
+
+This full render is the paid-boundary gate. If the fresh provider receipt is
+still pending, defer it and use the provider-independent
+`verify-common-rendered` procedure in the capacity section. That narrower
+receipt cannot start or authorize a paid service.
 
 ```bash
 "${ADMISSION_PYTHON[@]}" \
@@ -1850,22 +1871,19 @@ SCHEDULER_CAPTURED_ID=$(/usr/bin/jq -er \
   '.container_id | select(test("^[0-9a-f]{64}$"))' "$SCHEDULER_CAPTURE")
 
 "${ADMISSION_PYTHON[@]}" \
-  "$RELEASE/scripts/whoscored_production_admission.py" post-create \
+  "$RELEASE/scripts/whoscored_production_admission.py" post-create-common \
   --root "$RELEASE" \
   --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
   --common-override "$WHOSCORED_COMMON_DIGEST_OVERRIDE" \
-  --gateway-override "$WHOSCORED_GATEWAY_DIGEST_OVERRIDE" \
   --env-file "$COMPOSE_ENV_FILE" \
   --env-file "$WHOSCORED_ENV_FILE" \
   --env-file "$PROXY_POOL_ENV_FILE" \
-  --provider-policy "$WHOSCORED_PROVIDER_POLICY" \
-  --owner-secret-file "$WHOSCORED_OWNER_SECRET" \
-  --provider-quota-receipt "$WHOSCORED_PROVIDER_QUOTA_RECEIPT" \
   --service airflow-scheduler \
   > "$WHOSCORED_ADMISSION_DIR/post-create-scheduler-receipt.json"
 
 SCHEDULER_CONTAINER_ID=$(/usr/bin/jq -er '
-  select(.status == "admitted-v1") |
+  select(.status == "common-created-admitted-v1" and
+         .admission_scope == "common-only-v1") |
   [.images[] | select(.service == "airflow-scheduler") | .container_id] |
   select(length == 1) | .[0] |
   select(type == "string" and test("^[0-9a-f]{64}$"))
@@ -1941,22 +1959,19 @@ FLARESOLVERR_CAPTURED_ID=$(/usr/bin/jq -er \
   '.container_id | select(test("^[0-9a-f]{64}$"))' "$FLARESOLVERR_CAPTURE")
 
 "${ADMISSION_PYTHON[@]}" \
-  "$RELEASE/scripts/whoscored_production_admission.py" post-create \
+  "$RELEASE/scripts/whoscored_production_admission.py" post-create-common \
   --root "$RELEASE" \
   --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
   --common-override "$WHOSCORED_COMMON_DIGEST_OVERRIDE" \
-  --gateway-override "$WHOSCORED_GATEWAY_DIGEST_OVERRIDE" \
   --env-file "$COMPOSE_ENV_FILE" \
   --env-file "$WHOSCORED_ENV_FILE" \
   --env-file "$PROXY_POOL_ENV_FILE" \
-  --provider-policy "$WHOSCORED_PROVIDER_POLICY" \
-  --owner-secret-file "$WHOSCORED_OWNER_SECRET" \
-  --provider-quota-receipt "$WHOSCORED_PROVIDER_QUOTA_RECEIPT" \
   --service flaresolverr \
   > "$WHOSCORED_ADMISSION_DIR/post-create-flaresolverr-receipt.json"
 
 FLARESOLVERR_CONTAINER_ID=$(/usr/bin/jq -er '
-  select(.status == "admitted-v1") |
+  select(.status == "common-created-admitted-v1" and
+         .admission_scope == "common-only-v1") |
   [.images[] | select(.service == "flaresolverr") | .container_id] |
   select(length == 1) | .[0] |
   select(type == "string" and test("^[0-9a-f]{64}$"))
@@ -2001,14 +2016,23 @@ test "$(/usr/bin/id -u)" = 0
 : "${WHOSCORED_PROXY_LEDGER_HMAC_SECRET:?inject the ledger HMAC}"
 : "${WHOSCORED_PROVIDER_ORDER_ID:?set the exact admitted provider order}"
 : "${WHOSCORED_PROVIDER_POLICY_SHA256:?set the signed provider-policy digest}"
+: "${WHOSCORED_PROVIDER_ORDER_CAP_BYTES:?set the signed provider gross order cap}"
 : "${WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES:?set the exact policy daily cap}"
 : "${WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES:=2000000}"
+case "$WHOSCORED_PROVIDER_ORDER_CAP_BYTES" in
+  ''|*[!0-9]*) echo 'provider order cap is not decimal bytes' >&2; exit 2 ;;
+esac
+test "$WHOSCORED_PROVIDER_ORDER_CAP_BYTES" -ge 1
+test "$WHOSCORED_PROVIDER_ORDER_CAP_BYTES" -le 1000000000
+test "$WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES" -le \
+  "$((WHOSCORED_PROVIDER_ORDER_CAP_BYTES * 95 / 100))"
 PROXY_FILTER_CONTROL_TOKEN="$WHOSCORED_PROXY_FILTER_CONTROL_TOKEN"
 export PROXY_FILTER_CONTROL_TOKEN \
   WHOSCORED_PROXY_APPROVAL_HMAC_SECRET \
   WHOSCORED_PROXY_LEDGER_HMAC_SECRET \
   WHOSCORED_PROVIDER_ORDER_ID \
   WHOSCORED_PROVIDER_POLICY_SHA256 \
+  WHOSCORED_PROVIDER_ORDER_CAP_BYTES \
   WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES \
   WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES
 
@@ -2042,6 +2066,7 @@ esac
   --env WHOSCORED_PROXY_LEDGER_HMAC_SECRET \
   --env WHOSCORED_PROVIDER_ORDER_ID \
   --env WHOSCORED_PROVIDER_POLICY_SHA256 \
+  --env WHOSCORED_PROVIDER_ORDER_CAP_BYTES \
   --env WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES \
   --env WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES \
   --env TM_PROXY_CONTROL_TOKEN= \
@@ -2062,6 +2087,7 @@ esac
   --blocklist /opt/airflow/configs/proxy_filter/blocklist.txt \
   --out /opt/airflow/state/whoscored-proxy-filter/bytes.json \
   --daily-budget-bytes "$WHOSCORED_PROXY_FILTER_DAILY_BUDGET_BYTES" \
+  --whoscored-provider-order-cap-bytes "$WHOSCORED_PROVIDER_ORDER_CAP_BYTES" \
   --max-lease-bytes "$WHOSCORED_PROXY_FILTER_MAX_LEASE_BYTES" \
   --max-lease-ttl-seconds 3600 \
   --dagrun-budget-bytes 1000000000 \
@@ -2087,10 +2113,12 @@ done
 test ! -s "$STATE/paid_requests.jsonl"
 /usr/bin/jq -e \
   --arg order "$WHOSCORED_PROVIDER_ORDER_ID" \
-  --arg policy "$WHOSCORED_PROVIDER_POLICY_SHA256" '
-    .schema_version == 2 and
+  --arg policy "$WHOSCORED_PROVIDER_POLICY_SHA256" \
+  --argjson order_cap "$WHOSCORED_PROVIDER_ORDER_CAP_BYTES" '
+    .schema_version == 3 and
     .order_id == $order and
     .provider_policy_sha256 == $policy and
+    .provider_order_cap_bytes == $order_cap and
     (.state_id | test("^[0-9a-f]{64}$"))
   ' "$STATE/.whoscored_state_initialized.json" >/dev/null
 ```
@@ -2103,7 +2131,8 @@ pre-existing state file and the service command contains no initialization
 flag. Never add that flag to Compose, use `compose up` for initialization, or
 delete partial/authenticated files to force a rerun. Quarantine a failed state
 directory and repeat the full render/admission review with a new empty canonical
-directory. The legacy marker opt-in is forbidden in scheduled production.
+directory. Legacy marker schemas are rejected for both manual and scheduled
+approvals; never use an opt-in to reopen an unbound state namespace.
 
 The three paid-boundary services remain forbidden to start until the dedicated
 provider evidence, new empty state namespace and reviewed exact-origin release
@@ -2241,8 +2270,8 @@ Docker-authorized attacker.
 
 The issuer runs outside Airflow. Its planner gets the scheduler image, data
 environment and `dp-backend`, but no signing key. Its signer gets the exact
-admitted proxy image, frozen schema-v3 daily plan, exact read-only schema-v3
-rollout manifest, its owner-signed charter-v4, three credentials and no network.
+admitted proxy image, frozen schema-v4 daily plan, exact read-only schema-v4
+rollout manifest, its owner-signed charter-v5, three credentials and no network.
 The signer independently canonicalizes the rollout, re-derives its cohort
 SHA-256 and requires plan workloads to equal the ordered prefix selected by the
 manifest's code-owned wave contract; planner-declared selection identity is
@@ -2278,6 +2307,9 @@ This happens before writing the issuance ledger, approval or pointer.
 /usr/bin/install -o root -g root -m 0755 \
   "$RELEASE/scripts/whoscored_daily_issuer.sh" \
   /usr/local/libexec/whoscored-daily-issuer
+/usr/bin/install -o root -g root -m 0755 \
+  "$RELEASE/scripts/whoscored_bootstrap_issuer.sh" \
+  /usr/local/libexec/whoscored-bootstrap-issuer
 /usr/bin/install -o root -g root -m 0644 \
   "$RELEASE/deploy/whoscored/systemd/whoscored-daily-issuer.service" \
   "$RELEASE/deploy/whoscored/systemd/whoscored-daily-issuer.timer" \
@@ -2303,11 +2335,13 @@ the recurring daily authority path; it cannot retroactively create GO. Only
 then enable the non-persistent 09:15 UTC timer:
 
 ```bash
+/usr/bin/test ! -e /run/whoscored-daily-issuer-control/mode.env
+/usr/bin/test ! -L /run/whoscored-daily-issuer-control/mode.env
 /usr/bin/systemctl start whoscored-daily-issuer.service
 /usr/bin/systemctl --quiet is-failed whoscored-daily-issuer.service && exit 1
 /usr/bin/journalctl --unit whoscored-daily-issuer.service --since today \
   --no-pager
-/usr/bin/systemctl enable --now whoscored-daily-issuer.timer
+/usr/local/libexec/whoscored-bootstrap-issuer enable-daily
 /usr/bin/systemctl list-timers whoscored-daily-issuer.timer --no-pager
 ```
 
@@ -2315,6 +2349,64 @@ then enable the non-persistent 09:15 UTC timer:
 rejects manual or delayed starts outside 09:00–09:30 UTC, holds a host flock,
 and has a 30-minute systemd timeout. Leave the timer disabled on any admission,
 health, state-binding or signing failure.
+
+##### Execute the six-run accelerated acceptance
+
+Keep the recurring timer and the WhoScored ingest DAG paused. First complete the
+exact 21,600-second cache canary below and protect its canonical report. Create
+the initial `wave-20` rollout with that report's verified internal
+`report_sha256`, the fresh receipt's gross order cap, and six consecutive 10:00
+UTC logical dates which are already in the past. Sign the matching charter-v5,
+then publish the stable timetable projection exactly once:
+
+```bash
+/usr/local/libexec/whoscored-bootstrap-issuer publish
+test -f "$WHOSCORED_SCHEDULED_PAID_POINTER_HOST_DIR/bootstrap.json"
+test "$(stat -Lc '%u:%g:%a' \
+  "$WHOSCORED_SCHEDULED_PAID_POINTER_HOST_DIR/bootstrap.json")" = 0:0:440
+```
+
+The common services were already recreated from this exact release before the
+capacity canary. Do not restart or recreate them after the canary: the accepted
+capacity receipt binds both container IDs and would become invalid. Verify that
+the loaded DAG still uses the custom timetable, remains paused and has
+`max_active_runs=1`.
+Before each unpause, issue only the next exact slot. The wrapper is intentionally
+allowed outside the daily issuer window only in bootstrap mode:
+
+```bash
+RUN_ID='scheduled__YYYY-MM-DDT10:00:00+00:00'
+/usr/local/libexec/whoscored-bootstrap-issuer run "$RUN_ID"
+docker exec airflow-scheduler airflow dags unpause dag_ingest_whoscored
+# Wait for this exact DagRun and its create-once acceptance receipt to be green.
+# The terminal task must self-pause the DAG before the next slot is issued.
+test "$(docker exec airflow-scheduler \
+  airflow dags state dag_ingest_whoscored "$RUN_ID")" = success
+```
+
+Every accepted bootstrap run pauses the DAG inside its terminal path before
+another DagRun can race ahead. Never pre-issue slot N+1: slot N discovery
+publishes a new catalog generation, so the next plan must be frozen afterward
+against that new exact parent. Require the first run and its create-once
+acceptance receipt to be green and the DAG paused, then repeat the issue/unpause
+cycle for the second run of the same wave. Only after that second green receipt,
+promote to the adjacent wave, sign its exact charter, switch the stopped issuer
+to that manifest/charter pair, rerun issuance admission, and continue one slot
+at a time. Repeat once for `wave-all`. The immutable order is
+`wave-20, wave-20, wave-70, wave-70, wave-all, wave-all`; a manual run, skipped
+slot, changed capacity digest, or changed stable bootstrap pointer fails closed.
+
+After slot six the DAG remains paused. Run final five-service admission with
+both `--rollout-id` and `--capacity-receipt`, complete backup/restore evidence,
+and record GO only in the 06:00–09:00 UTC decision window. Then perform the
+09:00–09:30 daily issuer smoke, prove `mode.env` is absent with both `test ! -e`
+and `test ! -L`, run the locked
+`/usr/local/libexec/whoscored-bootstrap-issuer enable-daily` transition, and
+unpause the DAG. Its custom
+timetable now emits the same cron-compatible daily data interval expected by
+the issuer; it cannot replay another bootstrap slot. Detailed signer and
+promotion commands are in
+[`whoscored-proxy-daily.md`](whoscored-proxy-daily.md).
 
 ## Idempotent Airflow migration
 
@@ -2345,9 +2437,11 @@ Confirm `AIRFLOW__CORE__EXECUTOR=LocalExecutor`, then restart the scheduler so
 it loads the new DAG and environment. A missing pool is a deployment failure,
 not a reason to increase task-level parallelism.
 
-Keep daily ingest paused until its first manual acceptance run passes. Keep the
-backup DAG paused until the raw+ops bootstrap backup, empty-target restore drill
-and exact evidence gate below pass. Then enable each accepted schedule:
+Keep daily ingest paused until the cache receipt and complete six-slot
+accelerated acceptance above pass. Keep the backup DAG paused until the raw+ops
+bootstrap backup, empty-target restore drill and exact evidence gate below pass.
+Only after final GO and the first ordinary daily pointer exists, enable each
+accepted schedule:
 
 ```bash
 docker exec airflow-scheduler airflow dags unpause dag_ingest_whoscored
@@ -2407,6 +2501,7 @@ never select an inferred `latest` marker:
 
 ```bash
 "$RELEASE/scripts/compose.sh" --env-file "$COMPOSE_ENV_FILE" \
+  --env-file "$WHOSCORED_ENV_FILE" \
   --env-file "$PROXY_POOL_ENV_FILE" run --rm --no-deps \
   --entrypoint bash airflow-scheduler -euc '
     python /opt/airflow/scripts/whoscored_raw_backup.py list-inventories \
@@ -2429,6 +2524,7 @@ export OPS_RECOVERY_TARGET_URI=s3://approved-empty-recovery-ops/whoscored
 export RAW_RECOVERY_INVENTORY_KEY=backup-inventories/EXACT_RAW_KEY.json
 export OPS_RECOVERY_INVENTORY_KEY=backup-inventories/EXACT_OPS_KEY.json
 "$RELEASE/scripts/compose.sh" --env-file "$COMPOSE_ENV_FILE" \
+  --env-file "$WHOSCORED_ENV_FILE" \
   --env-file "$PROXY_POOL_ENV_FILE" run --rm --no-deps \
   --entrypoint bash \
   -e RAW_RECOVERY_TARGET_URI -e OPS_RECOVERY_TARGET_URI \
@@ -2539,6 +2635,7 @@ test ! -e "$WHOSCORED_FINAL_ADMISSION"
   --owner-secret-file "$WHOSCORED_OWNER_SECRET" \
   --deployment-admission-receipt "$WHOSCORED_DEPLOYMENT_ADMISSION_RECEIPT" \
   --rollout-id "$WHOSCORED_ROLLOUT_ID" \
+  --capacity-receipt "$CANARY_OUTPUT" \
   --service airflow-scheduler \
   --service flaresolverr \
   --service flaresolverr_whoscored_paid \
@@ -2753,38 +2850,93 @@ Any missing `discovery_mode`, non-v8 manifest, physical/current parity failure,
 paid byte, Trino restart or code-hash mismatch aborts deployment before daily
 unpause.
 
-Run the non-publishing direct-source workflow benchmark first. It uses a
-temporary raw store and a non-publishing repository. The sustained harness
-must exercise four workers for at least six hours across historical match,
-preview, profile and multi-stage work. Acceptance requires projected throughput
-of at least 144,000 page units/day, zero paid bytes, combined harness
-process-tree RSS plus monitored-container cgroup memory <=12 GiB, and no
-container restart/OOM evidence. Use the exact invocation printed by
-`--help`; keep the normal short duration only for CI and operator rehearsal.
+Run the non-publishing `cache-capacity-v1` workflow benchmark first. It replays
+one reviewed content-addressed source-shaped corpus through the production
+match, preview, profile and multi-stage parsers and an in-memory repository;
+socket/DNS access is forbidden. The production harness must exercise exactly
+four workers for exactly 21,600 seconds. Acceptance requires projected
+throughput of at least 144,000 page units/day, `network_requests=0`,
+`paid_proxy_bytes=0`, combined harness process-tree RSS plus
+monitored-container cgroup memory <=12 GiB, and no container restart/OOM
+evidence. The canonical report is content-addressed and keeps full aggregate
+counters with a bounded diagnostic sample. The former direct workflow is
+available only as explicit `direct-diagnostic-v1` evidence and cannot satisfy
+this production capacity gate.
 
-The v3 supervisor validates the exact external `ready-v1` deployment
-attestation, both protected split-project digest-only Compose overrides, the
-active owner-signed provider policy and the protected deploy-time admission
-receipt before it starts a worker. A legacy combined override is not accepted.
-It resolves the local ID behind the attested
-`repository@sha256:<64 hex>` FlareSolverr reference on every sample. The running
-container must keep that ID and the current checkout's three-file Compose
-hash/labels,
-use the image-baked root-owned launcher and extension with no bind/volume
-mounts and only the four exact reviewed tmpfs paths, keep a read-only root
-filesystem, numeric UID/GID, dropped capabilities and the exact AppArmor/seccomp
-options. Retagging the reference, using the old upstream image with an extension
-bind, shadowing the payload with tmpfs, or starting the service from another
-checkout stops the canary fail-closed.
-It renders the common-project hash through `/usr/bin/docker compose`, the base,
-supervised and exact common digest-only files in admission order, and all three
-protected environment files. The same isolated admission pass renders the
-separate gateway project from its exact Compose and digest-only files and binds
-its provider order, policy digest and decimal byte caps to the signed policy.
-The selected SeaweedFS topology state and
-`WHOSCORED_PROXY_APPROVAL_HOST_DIR` prerequisite must already pass even though
-this canary itself is direct-only. Replacement or mutation of any attestation,
-Compose or environment input stops the supervisor fail-closed.
+The v4 supervisor validates the exact external `ready-v1` deployment
+attestation and protected common-project digest-only Compose override before it
+starts a cache worker. Cache mode neither accepts nor needs paid-provider
+authority: it must remain runnable while a fresh provider receipt or gateway
+cutover is pending. `direct-diagnostic-v1` retains the full split-project,
+provider-policy, owner-key and deploy-time-admission checks. A legacy combined
+override is not accepted.
+
+Cache admission renders only the common project through
+`/usr/bin/docker compose`, using the base, supervised and exact common
+digest-only files plus the
+three fixed protected environment files. It binds the running scheduler and
+FlareSolverr container IDs, image IDs, health and Compose hashes to the admitted
+release. On every sample it resolves the local ID behind the attested
+`repository@sha256:<64 hex>` FlareSolverr reference and rechecks the hardened
+container identity. Retagging the reference, mutating any attestation, Compose
+or environment input, or starting either service from another checkout stops
+the canary fail-closed. The gateway project, provider policy and paid deployment
+receipt are deliberately outside this cache-only admission path.
+
+Because the capacity receipt binds the exact protected environment files,
+Compose hashes and running common container identities, stage the target
+configuration before starting the canary. First prove all WhoScored DAGs are
+paused. Set `WHOSCORED_SOURCE_POOL_SLOTS=4` and
+`WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY=144000` in the protected
+runtime environment. Stage the complete final off-host backup destination,
+retention, endpoint and applicable credential configuration in these same
+three canonical environment files before rendering; a fourth backup env file
+is not loaded. Editing any of the three files after the canary invalidates its
+receipt. Render/admit the common project and recreate the common Airflow
+services.
+Keep the actual Airflow `whoscored_direct_pool` at two slots throughout the
+canary. This deliberately makes every WhoScored task fail closed on a pool
+mismatch if somebody unpauses a DAG; the cache workers do not use that pool.
+Record the scheduler and FlareSolverr container IDs before the canary and do
+not recreate them afterward.
+
+The provider-independent common admission accepts exactly the canonical env
+order and enforces the rendered `4`/`144000` capacity profile. It neither reads
+a provider policy nor permits a paid service. The existing external
+`dp-whoscored-paid-api` network must retain its exact `whoscored-gw` Compose
+ownership; do not create a `data-platform` lookalike. Before either common
+container starts, publish the create-once render receipt, then use the
+vacancy/capture/create-without-start ceremony above and `post-create-common`
+for exactly one service per wave (`airflow-scheduler`, then `flaresolverr`):
+
+```bash
+test "$COMPOSE_ENV_FILE" = /root/data-platform-football/.env
+test "$WHOSCORED_ENV_FILE" = /root/.secrets/whoscored-runtime-v2.env
+test "$PROXY_POOL_ENV_FILE" = /root/.secrets/whoscored-proxy-v2.env
+WHOSCORED_COMMON_RENDERED_COMPOSE="$WHOSCORED_ADMISSION_DIR/common-rendered.json"
+test ! -e "$WHOSCORED_COMMON_RENDERED_COMPOSE"
+
+"${ADMISSION_PYTHON[@]}" \
+  "$RELEASE/scripts/whoscored_production_admission.py" \
+  verify-common-rendered \
+  --root "$RELEASE" \
+  --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
+  --common-override "$WHOSCORED_COMMON_DIGEST_OVERRIDE" \
+  --env-file "$COMPOSE_ENV_FILE" \
+  --env-file "$WHOSCORED_ENV_FILE" \
+  --env-file "$PROXY_POOL_ENV_FILE" \
+  --output "$WHOSCORED_COMMON_RENDERED_COMPOSE" \
+  > "$WHOSCORED_ADMISSION_DIR/common-rendered-receipt.json"
+test "$(/usr/bin/jq -er '.status' \
+  "$WHOSCORED_ADMISSION_DIR/common-rendered-receipt.json")" = \
+  common-rendered-admitted-v1
+```
+
+Each common post-create receipt must have
+`status=common-created-admitted-v1`, `admission_scope=common-only-v1`, and the
+single captured container ID. This scope does not authorize paid GO, DAG
+unpause, or the daily issuer timer. The cache supervisor performs a fresh
+running admission of both common services before launching any worker.
 
 Use the exact checkout whose ready revision and payloads are named by the
 deployment attestation. The evidence directory is outside the checkout and
@@ -2796,40 +2948,20 @@ cd "$RELEASE"
 test "$(pwd -P)" = "$RELEASE"
 : "${WHOSCORED_DEPLOYMENT_ATTESTATION:?set the protected ready-v1 deployment attestation}"
 : "${WHOSCORED_COMMON_DIGEST_OVERRIDE:?set the protected common-project digest-only Compose file}"
-: "${WHOSCORED_GATEWAY_DIGEST_OVERRIDE:?set the protected gateway-project digest-only Compose file}"
-: "${WHOSCORED_PROVIDER_POLICY:?set the active owner-signed provider policy}"
-: "${WHOSCORED_OWNER_SECRET:?set the root-owned provider-policy owner key}"
-: "${WHOSCORED_DEPLOYMENT_ADMISSION_RECEIPT:?set the protected deploy-time rendered admission receipt}"
 for evidence in \
   "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
-  "$WHOSCORED_COMMON_DIGEST_OVERRIDE" \
-  "$WHOSCORED_GATEWAY_DIGEST_OVERRIDE" \
-  "$WHOSCORED_PROVIDER_POLICY" \
-  "$WHOSCORED_OWNER_SECRET" \
-  "$WHOSCORED_DEPLOYMENT_ADMISSION_RECEIPT"; do
+  "$WHOSCORED_COMMON_DIGEST_OVERRIDE"; do
   test -f "$evidence"
 done
-: "${WHOSCORED_PROXY_APPROVAL_HOST_DIR:?set the protected approval directory used by the admitted Compose model}"
-test -d "$WHOSCORED_PROXY_APPROVAL_HOST_DIR"
-export WHOSCORED_PROXY_APPROVAL_HOST_DIR
 CANARY_EVIDENCE_DIR=/root/whoscored-954-runtime
 install -d -o root -g root -m 0700 "$CANARY_EVIDENCE_DIR"
 CANARY_OUTPUT="$CANARY_EVIDENCE_DIR/whoscored-capacity-$(date -u +%Y%m%dT%H%M%SZ).json"
 /root/.venvs/dpf-test/bin/python \
   scripts/research/bench_whoscored_capacity.py \
+  --mode cache-capacity-v1 \
   --duration-seconds 21600 \
-  --scope 'ENG-Premier League=2526' \
-  --scope 'INT-World Cup=2026' \
-  --match-limit 3 --profile-limit 3 \
-  --flaresolverr-url http://127.0.0.1:8191 \
   --deployment-attestation "$WHOSCORED_DEPLOYMENT_ATTESTATION" \
   --common-digest-override "$WHOSCORED_COMMON_DIGEST_OVERRIDE" \
-  --gateway-digest-override "$WHOSCORED_GATEWAY_DIGEST_OVERRIDE" \
-  --provider-policy "$WHOSCORED_PROVIDER_POLICY" \
-  --owner-secret-file "$WHOSCORED_OWNER_SECRET" \
-  --deployment-admission-receipt "$WHOSCORED_DEPLOYMENT_ADMISSION_RECEIPT" \
-  --container airflow-scheduler \
-  --container flaresolverr \
   --output "$CANARY_OUTPUT"
 ```
 
@@ -2837,11 +2969,12 @@ Run this supervisor on the host: it reads its own four child process trees from
 `/proc`, reads required-container cgroup memory through `docker stats`, and
 uses `docker inspect` for restart/recreate/OOM evidence. Scheduler and the
 WhoScored FlareSolverr are mandatory even when `--container` is omitted and
-are freshly running-admitted against the exact split deployment model and its
-deploy-time admission receipt. That option can
-only add extra monitoring-only containers (for example the shared
-`proxy_filter`) and never expands WhoScored deployment authority. The output
-path is create-once mode 0600.
+are freshly running-admitted against the exact common deployment model. That
+option can only add monitoring-only containers and never expands deployment or
+paid-provider authority. The output path is create-once mode 0600. Its signed
+`capacity_receipt_sha256` is the report's verified internal `report_sha256`:
+the SHA-256 of canonical compact sorted-key JSON with that self-digest field
+removed. It is intentionally not the raw file SHA-256.
 
 Only one capacity supervisor may run at a time. It holds a host flock and
 stores the exact owner and endpoint in a mode-0600 state file. On normal
@@ -2852,19 +2985,25 @@ stale-owner preflight cleanup. The state file may be removed only after
 verified zero; any unverified process death or lifecycle response fails closed
 and retains recovery state.
 
-The four capacity workers also share
-`$RELEASE/logs/whoscored/source-circuit-v1.json` and enable wait mode
-themselves. Do not delete or shorten this file to make a blocked canary run
-faster: a real source block must remain visible in wall-clock throughput. A
-successful half-open probe closes it automatically. An ordinary
-timeout/502/parser failure reopens the same level without escalation; another
-authoritative browser Cloudflare response advances 15 -> 30 -> 60 minutes.
+The four cache workers have no source-circuit or browser-session authority.
+Each round executes in an isolated container namespace with the admitted
+source-shaped seed supplied through sealed descriptors; any socket/DNS attempt
+is a hard failure. Cache ownership cleans only exact worker containers and host
+artifacts and performs no FlareSolverr HTTP probe or sweep. A retained direct-
+diagnostic owner-state entry, including an invalid or dangling entry, blocks
+cache startup under the shared supervisor flock. Cache mode neither reads nor
+removes that entry and performs no browser lifecycle probe; it must be resolved
+by the separate diagnostic cleanup path. A stale cache-specific owner record is
+still recovered only through exact worker-container and host-artifact cleanup.
 
-The harness must never publish production manifests. After it is green, set
-`WHOSCORED_SOURCE_POOL_SLOTS=4` and
-`WHOSCORED_BACKFILL_ASSUMED_REQUEST_UNITS_PER_DAY=144000`, recreate only the
-Airflow services, set the pool to four, and trigger one manual daily DagRun.
-Require every DQ/traffic/SLO gate to pass before unpausing the schedule.
+The harness must never publish production manifests. After it is green, change
+only the Airflow metadata pool to four slots; do not edit an admitted file or
+recreate either common container, because that invalidates the content-addressed
+capacity receipt. Recheck the recorded container IDs and the protected input
+digests, then run the ordinary runtime preflight so expected and actual pool
+sizes both equal four. Do not substitute a manual DagRun for acceptance.
+Publish the signed timetable authority and execute the exact six
+scheduler-created slots from the accelerated procedure above.
 
 ## Backfill capacity and the 30-day activation gate
 
@@ -2904,13 +3043,13 @@ not a frozen all-catalog population.
 
 Do **not** trigger the all-catalog crawl at two slots. First pass the sustained
 four-worker non-publishing capacity canary, promote the real Airflow pool to
-four, and complete one preliminary manual plus one scheduled daily run. Those
-two preliminary runs prove capacity plumbing only; they do not replace the six
-scheduler-created wave-acceptance runs in the formal GO contract. The paid-proxy
+four, and complete the six scheduler-created accelerated wave-acceptance runs
+in the formal GO contract. A manual run cannot prove or replace any slot. The paid-proxy
 measurement is a separate gate described in
 `docs/operations/whoscored-proxy-campaign.md`: run only its exact signed canary;
-the referenced 1 GB is the provider-order quota, while the executable
-provider-order lifetime hard cap remains exactly `300000000` decimal bytes.
+the referenced 1 GB is the maximum provider-order quota, while the executable
+provider-order lifetime cap is derived from that exact fresh receipt and keeps
+the mandatory five-percent reserve (`950000000` bytes at a 1 GB gross quota).
 Persist the immutable billed-byte p95 evidence before any separate purchase or
 cap review. Pin its measurement window/horizon, ordered receipt digests,
 provider counter, `order_id`, decimal-byte unit and p95 algorithm. The only
@@ -3124,8 +3263,8 @@ WhoScored DAGs stay paused, and no `all_catalog` plan may be created.
 The live storage core remains one `weed mini`, isolated behind the private S3
 gateway and HTTP proxy after the required one-time rollout. Promote concurrency
 only through the sustained canary. Do not create
-an `all_catalog` plan until the canary, pool promotion, manual daily and
-scheduled daily gates are green.
+an `all_catalog` plan until the canary, pool promotion and exact six-slot
+scheduled acceptance are green.
 
 ### Source pacing and cooldown hardening recorded 2026-07-15
 

@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Benchmark one complete WhoScored scope without publishing any data.
 
-The benchmark exercises the production parser and direct-first transport, but
-uses a temporary local raw store and an in-memory repository.  It therefore
-cannot write Bronze/Trino tables or execute DDL.  The same workflow is run as:
+The production capacity mode replays one exact, content-addressed seed through
+the production match, preview, profile and multi-stage parsers and the
+in-memory repository.  A process-wide socket guard makes any attempted network
+or paid-route escape fatal.  The direct-first three-phase workflow remains
+available only as an explicit diagnostic mode.  Neither mode can write
+Bronze/Trino tables or execute DDL.
+
+The diagnostic workflow is run as:
 
 * ``cold``: the temporary raw store is empty;
 * ``warm``: every source object must be replayed from that raw store;
@@ -48,6 +53,7 @@ from datetime import date, datetime
 from pathlib import Path
 import re
 import signal
+import socket
 import stat
 import sys
 from tempfile import TemporaryDirectory
@@ -99,7 +105,10 @@ from scrapers.whoscored.catalog import (  # noqa: E402
 from scrapers.whoscored.domain import WhoScoredScope  # noqa: E402
 from scrapers.whoscored.parsers import (  # noqa: E402
     DatasetStatus,
+    parse_matchcentre_data,
     parse_preview_bundle,
+    parse_profile_bundle,
+    parse_team_stage_statistics,
 )
 from scrapers.whoscored.raw_store import (  # noqa: E402
     RawTarget,
@@ -138,6 +147,9 @@ from scrapers.base.flaresolverr_client import MAX_XHR_BATCH_URLS  # noqa: E402
 LOG = logging.getLogger("bench_whoscored_workflow")
 MIB = 1024 * 1024
 BENCHMARK_VERSION = "whoscored-workflow-benchmark-v2"
+CACHE_CAPACITY_SCHEMA_VERSION = 1
+CACHE_CAPACITY_MODE = "cache-capacity-v1"
+DIRECT_DIAGNOSTIC_MODE = "direct-diagnostic-v1"
 DEFAULT_SCOPE = "INT-World Cup=2026"
 DEFAULT_MATCH_LIMIT = 3
 DEFAULT_PROFILE_LIMIT = 3
@@ -169,6 +181,161 @@ _FEED_STATUSES = frozenset({"available", "empty", "not_available"})
 _CAPACITY_CONTROL_SCHEMA_VERSION = 1
 _CAPACITY_CONTROL_READ_LIMIT = 512
 _CAPACITY_FLARESOLVERR_ENDPOINT = "http://127.0.0.1:8191"
+_CACHE_SEED_MAX_BYTES = 64 * 1024
+_CACHE_SOURCE_UNITS = 5
+
+
+# This deliberately small corpus is source-shaped rather than output-shaped:
+# every worker must invoke the real parsers.  Canonical JSON and the pinned
+# digest make changing even one source scalar an explicit contract update.
+_CACHE_CAPACITY_SEED: Mapping[str, Any] = {
+    "schema_version": CACHE_CAPACITY_SCHEMA_VERSION,
+    "game_id": 1903117,
+    "player_id": 11,
+    "match": {
+        "expandedMaxMinute": 94,
+        "playerIdNameDictionary": {"11": "Starter", "21": "Visitor"},
+        "events": [
+            {
+                "id": 4100001,
+                "eventId": 41,
+                "minute": 10,
+                "second": 2,
+                "expandedMinute": 10,
+                "period": {"displayName": "FirstHalf"},
+                "type": {"displayName": "Pass"},
+                "outcomeType": {"displayName": "Successful"},
+                "teamId": 26,
+                "playerId": 11,
+                "x": 25,
+                "y": 50,
+                "qualifiers": [
+                    {"type": {"value": 2, "displayName": "Cross"}}
+                ],
+            }
+        ],
+        "home": {
+            "teamId": 26,
+            "name": "Alpha FC",
+            "scores": {"fulltime": 2},
+            "stats": {"shotsTotal": 10, "possessionPct": 55.0},
+            "players": [
+                {
+                    "playerId": 11,
+                    "name": "Starter",
+                    "shirtNo": 4,
+                    "position": "DC",
+                    "isFirstEleven": True,
+                    "stats": {"ratings": {"45": 6.9, "90": 7.2}},
+                }
+            ],
+        },
+        "away": {
+            "teamId": 167,
+            "name": "Beta FC",
+            "scores": {"fulltime": 1},
+            "stats": {"shotsTotal": 8, "possessionPct": 45.0},
+            "players": [
+                {
+                    "playerId": 21,
+                    "name": "Visitor",
+                    "shirtNo": 9,
+                    "position": "FW",
+                    "isFirstEleven": True,
+                    "stats": {"ratings": {"45": 6.5, "90": 6.8}},
+                }
+            ],
+        },
+        "homeScore": 2,
+        "awayScore": 1,
+        "status": {"displayName": "FullTime"},
+    },
+    "preview_html": (
+        "<script>var predictedLineups = {home:{formation:'4-3-3',players:["
+        "{playerId:11,playerName:'Starter',position:{displayName:'DC'},"
+        "rating:7.2}]},away:{formation:'4-4-2',players:[{playerId:21,"
+        "playerName:'Visitor',position:{displayName:'FW'},rating:6.8}]}};"
+        "var matchHeaderJson = {venueName:'Seed Ground',predictedScore:'2-1'};"
+        "</script><div id='missing-players'><div><table><tbody><tr>"
+        "<td class='pn'><a href='/Players/12/Show/Reserve'>Reserve</a></td>"
+        "<td class='reason'>Injury</td><td class='confirmed'>Confirmed</td>"
+        "</tr></tbody></table></div></div>"
+    ),
+    "profile_html": (
+        "<div><span class='info-label'>Name: </span>Starter</div>"
+        "<div><span class='info-label'>Current Team: </span>"
+        "<a href='/Teams/26/Show/Alpha'>Alpha FC</a></div>"
+        "<div><span class='info-label'>Positions: </span>Defender</div>"
+        "<script>var currentParticipations = [{tournamentId:36,seasonId:10498,"
+        "stageId:23752,teamId:26,teamName:'Alpha FC',"
+        "position:{displayName:'DC'}}];</script>"
+    ),
+    "stages": [
+        {
+            "stage_id": 23752,
+            "source_season_id": 10498,
+            "payload": {
+                "teamTableStats": [
+                    {
+                        "teamId": 26,
+                        "teamName": "Alpha FC",
+                        "apps": 3,
+                        "rating": 7.2,
+                    }
+                ],
+                "paging": {
+                    "currentPage": 0,
+                    "totalPages": 0,
+                    "resultsPerPage": 0,
+                    "totalResults": 0,
+                    "firstRecordIndex": 0,
+                    "lastRecordIndex": 0,
+                },
+            },
+        },
+        {
+            "stage_id": 23753,
+            "source_season_id": 10498,
+            "payload": {
+                "teamTableStats": [
+                    {
+                        "teamId": 167,
+                        "teamName": "Beta FC",
+                        "apps": 2,
+                        "rating": 6.8,
+                    }
+                ],
+                "paging": {
+                    "currentPage": 1,
+                    "totalPages": 0,
+                    "resultsPerPage": 0,
+                    "totalResults": 0,
+                    "firstRecordIndex": 0,
+                    "lastRecordIndex": 0,
+                },
+            },
+        },
+    ],
+}
+
+
+def _canonical_seed_bytes(document: Mapping[str, Any]) -> bytes:
+    return json.dumps(
+        document,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+_EMBEDDED_CACHE_SEED_BYTES = _canonical_seed_bytes(_CACHE_CAPACITY_SEED)
+EXPECTED_CACHE_SEED_SHA256 = (
+    "eb3739448a42a00f3a5812c20a0885ea691306634b2922cda1dd2d7c8490fb4a"
+)
+if hashlib.sha256(_EMBEDDED_CACHE_SEED_BYTES).hexdigest() != (
+    EXPECTED_CACHE_SEED_SHA256
+):  # pragma: no cover - import-time source review guard
+    raise RuntimeError("embedded cache-capacity-v1 seed digest drifted")
 
 
 def _expected_stage_feed_keys(stage_ids: Iterable[int]) -> frozenset[str]:
@@ -203,6 +370,102 @@ def _expected_stage_feed_keys(stage_ids: Iterable[int]) -> frozenset[str]:
 
 class BenchmarkFailure(RuntimeError):
     """A benchmark invariant failed after setup."""
+
+
+class _NoNetworkGuard:
+    """Fail and count any Python socket/DNS escape during cache replay."""
+
+    _SOCKET_METHODS = (
+        "connect",
+        "connect_ex",
+        "send",
+        "sendall",
+        "sendto",
+        "sendmsg",
+    )
+
+    def __init__(self) -> None:
+        self.attempts = 0
+        self._saved_socket_methods: dict[str, Any] = {}
+        self._saved_module_functions: dict[str, Any] = {}
+
+    def _blocked(self, *args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        self.attempts += 1
+        raise BenchmarkFailure("cache-capacity-v1 attempted network access")
+
+    def __enter__(self) -> "_NoNetworkGuard":
+        for name in self._SOCKET_METHODS:
+            candidate = getattr(socket.socket, name, None)
+            if candidate is not None:
+                self._saved_socket_methods[name] = candidate
+                setattr(socket.socket, name, self._blocked)
+        for name in (
+            "create_connection",
+            "getaddrinfo",
+            "gethostbyaddr",
+            "gethostbyname",
+            "gethostbyname_ex",
+        ):
+            candidate = getattr(socket, name, None)
+            if candidate is not None:
+                self._saved_module_functions[name] = candidate
+                setattr(socket, name, self._blocked)
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        del exc_type, exc, tb
+        for name, candidate in self._saved_socket_methods.items():
+            setattr(socket.socket, name, candidate)
+        for name, candidate in self._saved_module_functions.items():
+            setattr(socket, name, candidate)
+        self._saved_socket_methods.clear()
+        self._saved_module_functions.clear()
+        return False
+
+
+def _load_cache_capacity_seed(path: Optional[Path]) -> dict[str, Any]:
+    """Load only the reviewed seed bytes and reject absence or substitution."""
+
+    if path is None:
+        payload = _EMBEDDED_CACHE_SEED_BYTES
+    else:
+        try:
+            metadata = path.stat()
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("cache seed is not a regular file")
+            if metadata.st_size <= 0 or metadata.st_size > _CACHE_SEED_MAX_BYTES:
+                raise ValueError("cache seed size is invalid")
+            payload = path.read_bytes()
+        except OSError as exc:
+            raise ValueError("cache seed is missing or unreadable") from exc
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != EXPECTED_CACHE_SEED_SHA256:
+        raise ValueError("cache seed digest does not match the reviewed corpus")
+    try:
+        document = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("cache seed is not canonical JSON") from exc
+    if not isinstance(document, Mapping):
+        raise ValueError("cache seed root must be an object")
+    if _canonical_seed_bytes(document) != payload:
+        raise ValueError("cache seed bytes are not canonical")
+    if set(document) != {
+        "schema_version",
+        "game_id",
+        "player_id",
+        "match",
+        "preview_html",
+        "profile_html",
+        "stages",
+    }:
+        raise ValueError("cache seed shape does not match cache-capacity-v1")
+    if document.get("schema_version") != CACHE_CAPACITY_SCHEMA_VERSION:
+        raise ValueError("cache seed schema version is invalid")
+    stages = document.get("stages")
+    if not isinstance(stages, list) or len(stages) != 2:
+        raise ValueError("cache seed must contain exactly two stages")
+    return dict(document)
 
 
 class MemoryRequestLedger:
@@ -1149,6 +1412,18 @@ def _require_phase_success(phase: Mapping[str, Any]) -> None:
 def _validate_args(args: argparse.Namespace) -> Optional[str]:
     if getattr(args, "capacity_control_fd", None) is not None:
         return "capacity control fd was not resolved"
+    mode = getattr(args, "mode", DIRECT_DIAGNOSTIC_MODE)
+    if mode not in {CACHE_CAPACITY_MODE, DIRECT_DIAGNOSTIC_MODE}:
+        return "workflow mode is invalid"
+    if mode == CACHE_CAPACITY_MODE and (
+        getattr(args, "browser_session_owner", None) is not None
+        or getattr(args, "flaresolverr_url", None) is not None
+    ):
+        return "cache-capacity-v1 forbids browser and network configuration"
+    if mode == DIRECT_DIAGNOSTIC_MODE and getattr(
+        args, "cache_seed_file", None
+    ) is not None:
+        return "cache seed is valid only in cache-capacity-v1"
     scope = str(getattr(args, "scope", ""))
     if scope.count("=") != 1 or not all(part.strip() for part in scope.split("=", 1)):
         return "scope must have the form '<competition>=<season-id>'"
@@ -1171,12 +1446,26 @@ def _apply_capacity_control(args: argparse.Namespace) -> argparse.Namespace:
     """Consume one protected inherited pipe without exposing controls in argv."""
 
     control_fd = getattr(args, "capacity_control_fd", None)
+    mode = getattr(args, "mode", DIRECT_DIAGNOSTIC_MODE)
     if control_fd is None:
+        if mode == CACHE_CAPACITY_MODE:
+            if (
+                getattr(args, "browser_session_owner", None) is not None
+                or getattr(args, "flaresolverr_url", None) is not None
+            ):
+                raise ValueError("cache capacity network configuration conflicts")
+            return args
         if getattr(args, "flaresolverr_url", None) is None:
             args.flaresolverr_url = os.environ.get(
                 "FLARESOLVERR_URL", "http://flaresolverr:8191"
             )
         return args
+    if mode == CACHE_CAPACITY_MODE:
+        try:
+            os.close(control_fd)
+        except (OSError, TypeError):
+            pass
+        raise ValueError("cache capacity does not accept browser control")
     if type(control_fd) is not int or control_fd < 3:
         raise ValueError("capacity control arguments conflict")
     if (
@@ -1232,6 +1521,352 @@ def _apply_capacity_control(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
+def _dataset_statuses(datasets: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        str(name): str(dataset.status.value)
+        for name, dataset in datasets.items()
+    }
+
+
+def _cache_capacity_phase(
+    *,
+    seed: Mapping[str, Any],
+    seed_uri: str,
+    catalog_season: CatalogSeason,
+    repository: InMemoryBenchmarkRepository,
+) -> dict[str, Any]:
+    """Parse and idempotently commit the exact representative cache corpus."""
+
+    scope = catalog_season.scope
+    game_id = int(seed["game_id"])
+    player_id = int(seed["player_id"])
+    game = "Alpha FC - Beta FC"
+    seed_sha256 = EXPECTED_CACHE_SEED_SHA256
+
+    stage_rows: list[dict[str, Any]] = []
+    stage_ids: list[int] = []
+    for raw_stage in seed["stages"]:
+        if not isinstance(raw_stage, Mapping):
+            raise BenchmarkFailure("cache seed stage is not an object")
+        stage_id = int(raw_stage["stage_id"])
+        stage_ids.append(stage_id)
+        parsed_stage = parse_team_stage_statistics(
+            raw_stage["payload"],
+            scope=scope,
+            stage_id=stage_id,
+            source_season_id=int(raw_stage["source_season_id"]),
+            source_category="summaryteam",
+            source_subcategory="all",
+        )
+        if parsed_stage.status is not DatasetStatus.AVAILABLE:
+            raise BenchmarkFailure(f"seed stage {stage_id} did not parse as available")
+        for row_index, row in enumerate(parsed_stage.rows):
+            stage_rows.append(
+                {
+                    **dict(row),
+                    "entity_key": hashlib.sha256(
+                        (
+                            f"{stage_id}\0{row_index}\0"
+                            f"{row.get('source_path')}"
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
+    if len(set(stage_ids)) != 2:
+        raise BenchmarkFailure("cache seed did not exercise two distinct stages")
+
+    schedule_rows = tuple(
+        {
+            "game_id": game_id + offset,
+            "stage_id": stage_id,
+            "status": 6,
+            "home_score": 2,
+            "away_score": 1,
+            "has_preview": offset == 0,
+            "match_is_opta": True,
+            "home_team": "Alpha FC",
+            "away_team": "Beta FC",
+            "game": game,
+            "date": f"2026-06-{11 + offset:02d}T19:00:00Z",
+        }
+        for offset, stage_id in enumerate(stage_ids)
+    )
+    feed_states = {
+        key: "not_available" for key in _expected_stage_feed_keys(stage_ids)
+    }
+    for stage_id in stage_ids:
+        available_key = f"{stage_id}:team:summaryteam:all"
+        if available_key not in feed_states:
+            raise BenchmarkFailure("stage feed contract omitted representative feed")
+        feed_states[available_key] = "available"
+    scope_commit = {
+        "league": scope.competition_id,
+        "season": scope.season_id,
+        "entity_group": CACHE_CAPACITY_MODE,
+        "datasets": {
+            "whoscored_schedule": schedule_rows,
+            "whoscored_team_stage_stats": tuple(stage_rows),
+        },
+        "distinct_keys": {
+            "whoscored_schedule": "game_id",
+            "whoscored_team_stage_stats": "entity_key",
+        },
+        "payload_sha256": seed_sha256,
+        "raw_uris": (seed_uri,),
+        "feed_states": feed_states,
+    }
+    repository.commit_scope_bundle(**scope_commit)
+
+    match = parse_matchcentre_data(
+        seed["match"], scope=scope, game_id=game_id, game=game
+    )
+    if any(
+        match.datasets[name].status is not DatasetStatus.AVAILABLE
+        for name in (
+            "matches",
+            "events",
+            "lineups",
+            "team_match_stats",
+            "player_match_stats",
+        )
+    ):
+        raise BenchmarkFailure("cache seed match coverage is incomplete")
+    match_commit = MatchCommit(
+        game_id=game_id,
+        league=scope.competition_id,
+        season=scope.season_id,
+        game=game,
+        payload_sha256=seed_sha256,
+        raw_uri=seed_uri,
+        events=match.events.rows,
+        lineups=match.lineups.rows,
+        lineups_available=True,
+        transport_mode="raw_cache",
+        proxy_mode="none",
+        direct_bytes=0,
+        paid_bytes=0,
+        parser_version=match.parser_version,
+        datasets={
+            name: dataset.rows
+            for name, dataset in match.datasets.items()
+            if name not in {"events", "lineups"}
+        },
+        dataset_statuses=_dataset_statuses(match.datasets),
+        schema_fingerprint=match.matches.rows[0]["source_schema_fingerprint"],
+        is_opta=True,
+        schedule_status=6,
+    )
+    repository.commit_matches((match_commit,))
+
+    preview = parse_preview_bundle(
+        str(seed["preview_html"]),
+        scope=scope,
+        game_id=game_id,
+        game=game,
+        home_team="Alpha FC",
+        away_team="Beta FC",
+    )
+    if any(
+        dataset.status is not DatasetStatus.AVAILABLE
+        for dataset in preview.datasets.values()
+    ):
+        raise BenchmarkFailure("cache seed preview coverage is incomplete")
+    preview_commit = PreviewCommit(
+        game_id=game_id,
+        league=scope.competition_id,
+        season=scope.season_id,
+        game=game,
+        payload_sha256=seed_sha256,
+        raw_uri=seed_uri,
+        missing_players=preview.missing_players.rows,
+        transport_mode="raw_cache",
+        proxy_mode="none",
+        direct_bytes=0,
+        paid_bytes=0,
+        parser_version=preview.parser_version,
+        datasets={
+            name: dataset.rows
+            for name, dataset in preview.datasets.items()
+            if name != "missing_players"
+        },
+        dataset_statuses=_dataset_statuses(preview.datasets),
+    )
+    repository.commit_previews((preview_commit,))
+
+    profile = parse_profile_bundle(str(seed["profile_html"]), player_id=player_id)
+    if any(
+        dataset.status is not DatasetStatus.AVAILABLE
+        for dataset in profile.datasets.values()
+    ):
+        raise BenchmarkFailure("cache seed profile coverage is incomplete")
+    profile_commit = ProfileCommit(
+        player_id=player_id,
+        profile=profile.profiles.rows[0],
+        payload_sha256=seed_sha256,
+        raw_uri=seed_uri,
+        transport_mode="raw_cache",
+        proxy_mode="none",
+        direct_bytes=0,
+        paid_bytes=0,
+        parser_version=profile.parser_version,
+        participations=profile.participations.rows,
+        participations_status=profile.participations.status.value,
+    )
+    repository.commit_profiles((profile_commit,))
+
+    # A second pass through every repository commit proves deterministic batch
+    # identity and exercises the replay/idempotency path without source I/O.
+    repository.commit_scope_bundle(**scope_commit)
+    repository.commit_matches((match_commit,))
+    repository.commit_previews((preview_commit,))
+    repository.commit_profiles((profile_commit,))
+    metrics = repository.metrics_snapshot()
+    if int(metrics.get("failure_records", 0)) != 0:
+        raise BenchmarkFailure("cache replay recorded repository failures")
+    if sum((metrics.get("idempotent_rows") or {}).values()) <= 0:
+        raise BenchmarkFailure("cache replay did not prove idempotent commits")
+
+    return {
+        "name": "cache_replay",
+        "status": "success",
+        "results": [
+            {"entity": "matches", "dataset_statuses": _dataset_statuses(match.datasets)},
+            {
+                "entity": "previews",
+                "dataset_statuses": _dataset_statuses(preview.datasets),
+            },
+            {
+                "entity": "profiles",
+                "dataset_statuses": _dataset_statuses(profile.datasets),
+            },
+            {
+                "entity": "multistage",
+                "metadata": {
+                    "source_stage_count": len(stage_ids),
+                    "source_stage_ids": sorted(stage_ids),
+                    "feed_states_per_stage": 68,
+                },
+            },
+        ],
+        "committed_rows": {
+            "accepted_total": sum((metrics.get("accepted_rows") or {}).values()),
+            "idempotent_total": sum(
+                (metrics.get("idempotent_rows") or {}).values()
+            ),
+            "logical_current_total": sum(
+                (metrics.get("logical_current_rows") or {}).values()
+            ),
+            "failure_records": int(metrics.get("failure_records", 0)),
+        },
+        "traffic": {
+            "cache_work_units_attempted": _CACHE_SOURCE_UNITS,
+            "successful_page_units": _CACHE_SOURCE_UNITS,
+            "source_request_attempts": 0,
+            "network_requests": 0,
+            "paid_proxy_bytes": 0,
+            "paid_route_requests": 0,
+        },
+    }
+
+
+def _run_cache_capacity(
+    args: argparse.Namespace,
+    *,
+    dependencies: BenchmarkFactories,
+) -> tuple[int, dict[str, Any]]:
+    started = time.monotonic()
+    cleanup: dict[str, Any] = {
+        "status": "failed",
+        "temporary_workspace_removed": False,
+    }
+    guard = _NoNetworkGuard()
+    report: dict[str, Any] = {
+        "benchmark_version": BENCHMARK_VERSION,
+        "schema_version": CACHE_CAPACITY_SCHEMA_VERSION,
+        "mode": CACHE_CAPACITY_MODE,
+        "status": "running",
+        "scope": str(args.scope),
+        "seed_sha256": EXPECTED_CACHE_SEED_SHA256,
+        "publishes": False,
+        "writes_bronze": False,
+        "executes_ddl": False,
+        "paid_route_configured": False,
+        "transport_policy": "content-addressed raw cache; network forbidden",
+        "raw_store": {
+            "kind": "content_addressed_temporary_local",
+            "retained": False,
+        },
+        "stage_statistics_contract": {
+            "expected_feed_states_per_stage": 68,
+        },
+        "phases": [],
+    }
+    workspace_path: Optional[Path] = None
+    try:
+        with guard:
+            seed_path = getattr(args, "cache_seed_file", None)
+            seed = _load_cache_capacity_seed(
+                Path(seed_path) if seed_path is not None else None
+            )
+            raw_catalog_path = str(args.catalog)
+            if _SEALED_BUNDLE_PATH:
+                if re.fullmatch(r"/proc/self/fd/[0-9]+", raw_catalog_path) is None:
+                    raise ValueError("sealed capacity catalog must be fd-backed")
+                catalog_path = Path(raw_catalog_path)
+            else:
+                catalog_path = Path(raw_catalog_path).resolve()
+            catalog = dependencies.load_catalog(catalog_path)
+            catalog_season = catalog.parse_scope_spec(str(args.scope))
+            competition = catalog.competition(catalog_season.scope.competition_id)
+            if not competition.whoscored_enabled:
+                raise ValueError(
+                    f"WhoScored is not enabled for {catalog_season.scope.spec}"
+                )
+            with TemporaryDirectory(prefix="whoscored-cache-capacity-") as raw_root:
+                workspace_path = Path(raw_root).resolve()
+                seed_object = workspace_path / f"{EXPECTED_CACHE_SEED_SHA256}.json"
+                seed_object.write_bytes(_EMBEDDED_CACHE_SEED_BYTES)
+                seed_object.chmod(0o400)
+                repository = dependencies.create_repository(catalog_season)
+                phase = _cache_capacity_phase(
+                    seed=seed,
+                    seed_uri=seed_object.as_uri(),
+                    catalog_season=catalog_season,
+                    repository=repository,
+                )
+                report["phases"].append(phase)
+        cleanup = {
+            "status": "success" if not workspace_path.exists() else "failed",
+            "temporary_workspace_removed": not workspace_path.exists(),
+        }
+        if guard.attempts:
+            raise BenchmarkFailure("cache replay observed a network attempt")
+        if cleanup["status"] != "success":
+            raise BenchmarkFailure("cache replay workspace cleanup failed")
+        report["status"] = "success"
+    except ValueError as exc:
+        report["status"] = "configuration_error"
+        report["error"] = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        report["status"] = "failed"
+        report["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if workspace_path is not None and not workspace_path.exists():
+            cleanup = {
+                "status": "success",
+                "temporary_workspace_removed": True,
+            }
+        report["cleanup"] = cleanup
+        report["network_requests"] = guard.attempts
+        report["paid_proxy_bytes"] = 0
+        report["paid_route_requests"] = 0
+        report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    code = 0 if report["status"] == "success" else (
+        2 if report["status"] == "configuration_error" else 1
+    )
+    return code, json.loads(json.dumps(report, sort_keys=True, default=str))
+
+
 def run(
     args: argparse.Namespace,
     *,
@@ -1252,6 +1887,8 @@ def run(
         }
 
     dependencies = factories or _default_factories()
+    if getattr(args, "mode", DIRECT_DIAGNOSTIC_MODE) == CACHE_CAPACITY_MODE:
+        return _run_cache_capacity(args, dependencies=dependencies)
     try:
         raw_catalog_path = str(args.catalog)
         if _SEALED_BUNDLE_PATH:
@@ -1280,6 +1917,8 @@ def run(
 
     report: dict[str, Any] = {
         "benchmark_version": BENCHMARK_VERSION,
+        "schema_version": CACHE_CAPACITY_SCHEMA_VERSION,
+        "mode": DIRECT_DIAGNOSTIC_MODE,
         "status": "running",
         "scope": catalog_season.scope.spec,
         "match_limit": int(args.match_limit),
@@ -1549,6 +2188,11 @@ def run(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mode",
+        choices=(CACHE_CAPACITY_MODE, DIRECT_DIAGNOSTIC_MODE),
+        default=DIRECT_DIAGNOSTIC_MODE,
+    )
     parser.add_argument("--scope", default=DEFAULT_SCOPE)
     parser.add_argument("--match-limit", type=int, default=DEFAULT_MATCH_LIMIT)
     parser.add_argument("--profile-limit", type=int, default=DEFAULT_PROFILE_LIMIT)
@@ -1560,6 +2204,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--flaresolverr-url",
         default=None,
+    )
+    parser.add_argument(
+        "--cache-seed-file",
+        type=Path,
+        default=None,
+        help=(
+            "optional exact cache seed override used for integrity testing; "
+            "bytes must match the reviewed embedded corpus"
+        ),
     )
     parser.add_argument(
         "--browser-session-owner",

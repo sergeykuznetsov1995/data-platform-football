@@ -50,6 +50,8 @@ MAX_ARGV_ITEMS = 64
 MAX_ARG_BYTES = 4096
 MAX_ARGV_BYTES = 32 * 1024
 CAPACITY_FLARESOLVERR_ENDPOINT = "http://127.0.0.1:8191"
+CACHE_CAPACITY_MODE = "cache-capacity-v1"
+DIRECT_DIAGNOSTIC_MODE = "direct-diagnostic-v1"
 SOURCE_CIRCUIT_ROOT = "/run/whoscored-source"
 SOURCE_CIRCUIT_PATH = f"{SOURCE_CIRCUIT_ROOT}/source-circuit-v1.json"
 
@@ -105,6 +107,7 @@ class _DuplicateKey(ValueError):
 class Control:
     worker_id: int
     owner: str
+    mode: str
     argv: tuple[str, ...]
 
 
@@ -176,7 +179,20 @@ def _parse_control(raw: bytes) -> Control:
             raise BootstrapError("capacity workflow contains a protected argument")
     if total > MAX_ARGV_BYTES:
         raise BootstrapError("capacity workflow command is too large")
-    return Control(worker_id=worker_id, owner=owner, argv=tuple(argv))
+    if argv.count("--mode") != 1:
+        raise BootstrapError("capacity workflow mode is invalid")
+    mode_index = argv.index("--mode") + 1
+    if mode_index >= len(argv) or argv[mode_index] not in {
+        CACHE_CAPACITY_MODE,
+        DIRECT_DIAGNOSTIC_MODE,
+    }:
+        raise BootstrapError("capacity workflow mode is invalid")
+    return Control(
+        worker_id=worker_id,
+        owner=owner,
+        mode=argv[mode_index],
+        argv=tuple(argv),
+    )
 
 
 def _stable_identity(before: os.stat_result, after: os.stat_result) -> bool:
@@ -487,6 +503,20 @@ def _monitor_workflow(process: subprocess.Popen[bytes], liveness_fd: int) -> int
 
 
 def _start_workflow(control: Control) -> subprocess.Popen[bytes]:
+    if control.mode == CACHE_CAPACITY_MODE:
+        try:
+            return subprocess.Popen(
+                _production_command(control.argv),
+                stdin=subprocess.DEVNULL,
+                cwd="/opt/airflow",
+                env=_child_environment(),
+                close_fds=True,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            raise BootstrapError("capacity workflow cannot start") from exc
+    if control.mode != DIRECT_DIAGNOSTIC_MODE:
+        raise BootstrapError("capacity workflow mode is invalid")
     payload = _canonical_json(
         {
             "flaresolverr_endpoint": CAPACITY_FLARESOLVERR_ENDPOINT,
