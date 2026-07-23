@@ -39,7 +39,7 @@
     "docker/images/airflow/whoscored-production-entrypoint": "53a68adb26f470ccebf8b12db9cec664032b8428d7e4d4f27fa81f10bd96f605",
     "docker/images/airflow/whoscored-production-gate": "9db75f5bb282bc8e855eac26554cd58e6d6fa8b07c94bd09af8a7203861a4e6f",
     "docker/images/airflow/whoscored-production-python": "7540a5a4e8305cf3b717d81cf5f58f201d9ba509cd95f2a3461348c9f5cd52d2",
-    "docker/images/airflow/whoscored_capacity_worker_bootstrap.py": "cd51fc83cebb7b418bea0b948da2869c1a5b4be5e03c567971e68b43095ec5c8",
+    "docker/images/airflow/whoscored_capacity_worker_bootstrap.py": "8acc095626a63c21154d232a543bdf94a4687a6a86bd6e5c82ea777ef999f9aa",
     "docker/images/airflow/whoscored_production_gate.py": "aadcc9c38a795a8e91217cd0f898b0fe0fdd584f9e353a1009e0a2f0393501c2",
     "docker/images/airflow/whoscored_runtime_pth.py": "0da3660231db3d693d0ce52d81befeaafa2c75af35cece99782b563bf9bad301",
     "docker/images/airflow/whoscored_runtime_startup.py": "06092e4ebbd27ca530b9595e952a572356aa0d3003633c977fda532c05a20f79",

@@ -349,6 +349,12 @@ def _production_command(argv: tuple[str, ...]) -> list[str]:
     return [PRODUCTION_PYTHON, "-E", "-P", "-B", "-u", *argv]
 
 
+def _workflow_directory() -> str:
+    """Return the immutable runtime root containing the baked workflow."""
+
+    return os.path.dirname(os.path.dirname(os.path.dirname(WORKFLOW_SCRIPT)))
+
+
 def _send_process_group(process: subprocess.Popen[bytes], sig: int) -> None:
     if process.poll() is not None:
         return
@@ -508,7 +514,7 @@ def _start_workflow(control: Control) -> subprocess.Popen[bytes]:
             return subprocess.Popen(
                 _production_command(control.argv),
                 stdin=subprocess.DEVNULL,
-                cwd="/opt/airflow",
+                cwd=_workflow_directory(),
                 env=_child_environment(),
                 close_fds=True,
                 start_new_session=True,
@@ -544,7 +550,7 @@ def _start_workflow(control: Control) -> subprocess.Popen[bytes]:
         return subprocess.Popen(
             _production_command(command),
             stdin=subprocess.DEVNULL,
-            cwd="/opt/airflow",
+            cwd=_workflow_directory(),
             env=_child_environment(),
             close_fds=True,
             pass_fds=(read_fd,),
