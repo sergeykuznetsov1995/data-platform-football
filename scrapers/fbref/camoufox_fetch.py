@@ -485,6 +485,7 @@ class CamoufoxFbrefTransport:
         self._byte_budget_failure: Optional[str] = None
         self._request_budget_exhausted = False
         self._redirect_blocked = False
+        self._redirect_recovery_used = False
         self._geoip_lookup_failed = False
         self._network_policy_failed = False
         self._network_policy_failure: Optional[str] = None
@@ -2169,6 +2170,29 @@ class CamoufoxFbrefTransport:
             self._pending_manual_redirect_url = None
             return
 
+    def _recover_from_inflow_redirect_block(self) -> bool:
+        """Allow one fresh, fully admitted navigation after a redirect stop.
+
+        Cloudflare's challenge completion can finish with a server-redirect
+        hop. network.http.redirection-limit=0 aborts that hop even though the
+        verify response already stored the clearance cookies, so one clean
+        re-navigation retrieves the page without skipping request admission —
+        every retried request re-enters context.route() with its request and
+        byte caps. A second redirect stop in the same fetch() call stays
+        fatal, so a genuine redirect loop cannot spin.
+        """
+        if self._redirect_recovery_used:
+            return False
+        if self._hard_network_failure_latched() or self._geoip_lookup_failed:
+            return False
+        self._redirect_recovery_used = True
+        self._redirect_blocked = False
+        self._last_solve_failure = None
+        logger.warning(
+            "Camoufox re-navigating once after an in-flow server redirect "
+            "stop (challenge-completion hop)")
+        return True
+
     # -- public fetch ----------------------------------------------------- #
     def fetch(self, url: str) -> Optional[str]:
         """Navigate to ``url``, solve Turnstile if present, return page HTML.
@@ -2181,6 +2205,7 @@ class CamoufoxFbrefTransport:
         if self._geoip_lookup_failed:
             return None
         self._redirect_blocked = False
+        self._redirect_recovery_used = False
         if (
             self._page is not None
             and self._pages_this_session >= self._max_pages_per_session
@@ -2212,6 +2237,8 @@ class CamoufoxFbrefTransport:
                     break
                 if self._redirect_blocked or error_type == "redirect_blocked":
                     self._redirect_blocked = True
+                    if self._recover_from_inflow_redirect_block():
+                        continue
                     self._last_solve_failure = "redirect_blocked"
                     break
                 if error_type in {'timeout', 'network'}:
@@ -2223,6 +2250,8 @@ class CamoufoxFbrefTransport:
             if self._hard_network_failure_latched():
                 break
             if self._redirect_blocked:
+                if self._recover_from_inflow_redirect_block():
+                    continue
                 self._last_solve_failure = "redirect_blocked"
                 break
 
@@ -2237,6 +2266,8 @@ class CamoufoxFbrefTransport:
                 logger.warning("Camoufox solve failed (attempt %d): %s",
                                attempt + 1, e)
                 if self._redirect_blocked:
+                    if self._recover_from_inflow_redirect_block():
+                        continue
                     self._last_solve_failure = "redirect_blocked"
                     break
                 if self._hard_network_failure_latched():
@@ -2247,6 +2278,8 @@ class CamoufoxFbrefTransport:
             if self._hard_network_failure_latched():
                 break
             if self._redirect_blocked:
+                if self._recover_from_inflow_redirect_block():
+                    continue
                 self._last_solve_failure = "redirect_blocked"
                 break
             if html is not None:
@@ -2261,6 +2294,8 @@ class CamoufoxFbrefTransport:
                 failure_type, url, attempt + 1,
                 self.MAX_PROXY_ROTATIONS + 1)
             if self._redirect_blocked:
+                if self._recover_from_inflow_redirect_block():
+                    continue
                 self._last_solve_failure = "redirect_blocked"
                 break
             if failure_type == 'cloudflare':

@@ -1937,7 +1937,7 @@ def test_first_request_beyond_profile_is_aborted_before_network():
     assert transport.traffic_stats()["request_budget_exhausted"] is True
 
 
-def test_blocked_native_redirect_does_not_rotate_proxy():
+def test_blocked_native_redirect_retries_once_then_fails_without_rotation():
     transport = CamoufoxFbrefTransport(geoip=False)
     transport._page = MagicMock()
     transport._page.goto.side_effect = RuntimeError("NS_ERROR_REDIRECT_LOOP")
@@ -1946,7 +1946,8 @@ def test_blocked_native_redirect_does_not_rotate_proxy():
 
     assert transport.fetch("https://fbref.com/en/") is None
 
-    transport._page.goto.assert_called_once()
+    # One admitted recovery re-navigation, then the stop stays fatal.
+    assert transport._page.goto.call_count == 2
     transport._solve_current_page.assert_not_called()
     transport._restart.assert_not_called()
     assert transport._last_solve_failure == "redirect_blocked"
@@ -1967,10 +1968,55 @@ def test_redirect_callback_with_generic_goto_error_does_not_rotate_proxy():
 
     assert transport.fetch("https://fbref.com/en/") is None
 
-    transport._page.goto.assert_called_once()
+    assert transport._page.goto.call_count == 2
     transport._solve_current_page.assert_not_called()
     transport._restart.assert_not_called()
     assert transport._last_solve_failure == "redirect_blocked"
+
+
+def test_inflow_redirect_block_during_solve_recovers_with_one_renavigation():
+    transport = CamoufoxFbrefTransport(geoip=False)
+    transport._page = MagicMock()
+    solve_calls = []
+
+    def solve():
+        solve_calls.append(True)
+        if len(solve_calls) == 1:
+            # The challenge-completion hop was aborted by
+            # network.http.redirection-limit=0 after the verify response
+            # had already stored the clearance cookies.
+            transport._redirect_blocked = True
+            return None
+        return "<html>match content</html>"
+
+    transport._solve_current_page = solve  # type: ignore[method-assign]
+    transport._restart = MagicMock()  # type: ignore[method-assign]
+
+    assert transport.fetch("https://fbref.com/en/") == "<html>match content</html>"
+
+    assert transport._page.goto.call_count == 2
+    assert len(solve_calls) == 2
+    transport._restart.assert_not_called()
+    assert transport.traffic_stats()["redirect_blocked"] is False
+
+
+def test_second_inflow_redirect_block_in_one_fetch_stays_fatal():
+    transport = CamoufoxFbrefTransport(geoip=False)
+    transport._page = MagicMock()
+
+    def solve():
+        transport._redirect_blocked = True
+        return None
+
+    transport._solve_current_page = solve  # type: ignore[method-assign]
+    transport._restart = MagicMock()  # type: ignore[method-assign]
+
+    assert transport.fetch("https://fbref.com/en/") is None
+
+    assert transport._page.goto.call_count == 2
+    transport._restart.assert_not_called()
+    assert transport._last_solve_failure == "redirect_blocked"
+    assert transport.traffic_stats()["redirect_blocked"] is True
 
 
 @pytest.mark.unit
@@ -2179,8 +2225,9 @@ def test_redirect_seen_while_solve_raises_never_rotates_proxy():
 
     assert transport.fetch("https://fbref.com/en/") is None
 
-    transport._page.goto.assert_called_once()
-    transport._solve_current_page.assert_called_once_with()
+    # One admitted recovery re-navigation, then the stop stays fatal.
+    assert transport._page.goto.call_count == 2
+    assert transport._solve_current_page.call_count == 2
     transport._restart.assert_not_called()
     assert transport._last_solve_failure == "redirect_blocked"
 
@@ -2264,7 +2311,7 @@ def test_subresource_redirect_failure_never_rotates_proxy(valid_page):
 
     assert transport.fetch("https://fbref.com/en/") is None
 
-    transport._page.goto.assert_called_once()
+    assert transport._page.goto.call_count == 2
     transport._solve_current_page.assert_not_called()
     transport._restart.assert_not_called()
     assert transport._last_solve_failure == "redirect_blocked"
