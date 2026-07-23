@@ -116,6 +116,7 @@ jobs:
             tests/unit/scrapers/test_sofascore_endpoint_manifest.py \
             tests/unit/scrapers/test_sofascore_lease_client.py \
             tests/unit/scrapers/test_sofascore_live_capture.py \
+            tests/unit/scrapers/test_sofascore_manifest_batching.py \
             tests/unit/scrapers/test_sofascore_pipeline.py \
             tests/unit/scrapers/test_sofascore_runtime_fingerprint.py \
             tests/unit/scrapers/test_sofascore_workload_plan.py \

@@ -413,10 +413,6 @@ class SofaScoreCaptureEngine:
         self.monotonic = monotonic
         self.metrics = CaptureMetrics(monotonic)
 
-    def _attempts_before(self, key: ManifestKey) -> int:
-        existing = self.manifest_store.get(key)
-        return existing.attempts if existing else 0
-
     def _record(
         self,
         spec: EndpointSpec,

@@ -525,6 +525,13 @@ def _materialize_endpoint_results(scraper, results, *, league: str, season: str)
     return frames
 
 
+def _flush_manifest_store(manifest_store) -> None:
+    """Force pending batched manifest records into durable Iceberg state."""
+    flush = getattr(manifest_store, "flush", None)
+    if callable(flush):
+        flush()
+
+
 def _run_match_capture(
     leagues: List[str],
     season: int,
@@ -1116,6 +1123,9 @@ def _run_match_capture(
 
                 finalize_materialized_results(capture_runtime, pipeline_results)
                 promote_repaired_results(capture_runtime, pipeline_results)
+                # The commit-verification below must read durable state, not
+                # the write-behind buffer.
+                _flush_manifest_store(capture_runtime.manifest_store)
                 observations = []
                 expectations = []
                 for result in pipeline_results:
@@ -1530,6 +1540,7 @@ def _run_player_capture(
                 replayed,
                 canonical_freshness_key=canonical_player_freshness,
             )
+            _flush_manifest_store(capture_runtime.manifest_store)
             results["traffic"] = _logical_capture_traffic(
                 capture_runtime.engine,
                 live_traffic,
@@ -1817,6 +1828,7 @@ def _run_season_capture_engine(
                 offline_replay=offline_replay,
             ),
         )
+        _flush_manifest_store(capture_runtime.manifest_store)
         results["pending_endpoints"] = 0
         results["endpoint_completeness"] = 1.0
         results["traffic"] = _logical_capture_traffic(
@@ -2224,55 +2236,60 @@ def main(argv=None):
         )
         return 1
 
-    if entity in {
-        ENTITY_MATCH_CAPTURE,
-        ENTITY_PLAYER_RATINGS,
-        ENTITY_SHOTMAP,
-        ENTITY_EVENT_PLAYER_STATS,
-        ENTITY_MATCH_STATS,
-    }:
-        if entity != ENTITY_MATCH_CAPTURE:
-            logger.info(
-                "Legacy entity %s is an alias of the unified match_capture engine",
-                entity,
+    try:
+        if entity in {
+            ENTITY_MATCH_CAPTURE,
+            ENTITY_PLAYER_RATINGS,
+            ENTITY_SHOTMAP,
+            ENTITY_EVENT_PLAYER_STATS,
+            ENTITY_MATCH_STATS,
+        }:
+            if entity != ENTITY_MATCH_CAPTURE:
+                logger.info(
+                    "Legacy entity %s is an alias of the unified match_capture engine",
+                    entity,
+                )
+            return _run_match_capture(
+                leagues=leagues,
+                season=args.season,
+                limit=args.limit,
+                output_path=args.output,
+                force_replace=args.force_replace,
+                capture_runtime=capture_runtime,
+                offline_replay=args.offline_replay,
+                workload_plan=workload_plan,
+                workload_allocations=workload_allocations,
             )
-        return _run_match_capture(
+
+        if entity == ENTITY_PLAYER_CAPTURE:
+            return _run_player_capture(
+                leagues=leagues,
+                season=args.season,
+                limit=args.limit,
+                output_path=args.output,
+                force_replace=args.force_replace,
+                capture_runtime=capture_runtime,
+                offline_replay=args.offline_replay,
+                workload_plan=workload_plan,
+                workload_allocations=workload_allocations,
+            )
+
+        # Default: canonical season schedule+standings flow.
+        return _run_legacy(
             leagues=leagues,
             season=args.season,
-            limit=args.limit,
             output_path=args.output,
             force_replace=args.force_replace,
+            entity=entity,
             capture_runtime=capture_runtime,
             offline_replay=args.offline_replay,
             workload_plan=workload_plan,
             workload_allocations=workload_allocations,
         )
-
-    if entity == ENTITY_PLAYER_CAPTURE:
-        return _run_player_capture(
-            leagues=leagues,
-            season=args.season,
-            limit=args.limit,
-            output_path=args.output,
-            force_replace=args.force_replace,
-            capture_runtime=capture_runtime,
-            offline_replay=args.offline_replay,
-            workload_plan=workload_plan,
-            workload_allocations=workload_allocations,
-        )
-
-    # Default: canonical season schedule+standings flow.
-    return _run_legacy(
-        leagues=leagues,
-        season=args.season,
-        output_path=args.output,
-        force_replace=args.force_replace,
-        entity=entity,
-        capture_runtime=capture_runtime,
-        offline_replay=args.offline_replay,
-        workload_plan=workload_plan,
-        workload_allocations=workload_allocations,
-    )
+    finally:
+        # Runners flush at their success boundaries; this covers every early
+        # return and error path so no buffered observation outlives the task.
+        _flush_manifest_store(capture_runtime.manifest_store)
 
 
 if __name__ == "__main__":

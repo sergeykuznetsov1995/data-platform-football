@@ -304,12 +304,6 @@ def activation_eligibility(tournament: Mapping[str, Any]) -> ActivationEligibili
     return ActivationEligibility(not reasons, tuple(dict.fromkeys(reasons)))
 
 
-def ensure_capture_allowed(tournament: Mapping[str, Any]) -> None:
-    """Raise a human-readable error unless capture is fail-closed eligible."""
-
-    activation_eligibility(tournament).require()
-
-
 def approve_tournament(
     tournament: Mapping[str, Any],
     *,
@@ -410,7 +404,6 @@ __all__ = [
     "activation_eligibility",
     "approve_tournament",
     "classify_tournament_source",
-    "ensure_capture_allowed",
     "normalize_gender",
     "pending_review",
     "reject_tournament",

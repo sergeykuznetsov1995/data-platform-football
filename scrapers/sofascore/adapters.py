@@ -215,6 +215,29 @@ class TrinoManifestStore(ManifestStore):
             merge_keys=MANIFEST_KEY_COLUMNS,
         )
 
+    def upsert_many(self, records: Sequence[EndpointManifest]) -> None:
+        """Commit many observations as ONE MERGE (one Iceberg snapshot).
+
+        Later records win on natural-key collisions — the staged MERGE
+        rejects duplicate source keys, and callers batching a run always
+        mean "latest observation".
+        """
+        deduped: dict[ManifestKey, EndpointManifest] = {}
+        for record in records:
+            deduped[record.key] = record
+        if not deduped:
+            return
+        frame = pd.DataFrame(
+            [manifest_to_row(record) for record in deduped.values()],
+            columns=MANIFEST_COLUMNS,
+        )
+        self.manager.insert_dataframe_atomic(
+            self.schema,
+            self.table,
+            frame,
+            merge_keys=MANIFEST_KEY_COLUMNS,
+        )
+
     def list_for_run(self, run_id: str) -> list[EndpointManifest]:
         run_id = str(run_id).strip()
         if not run_id:
