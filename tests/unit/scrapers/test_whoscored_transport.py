@@ -884,6 +884,57 @@ def test_curl_sessions_never_inherit_ambient_proxy_configuration(monkeypatch):
 
 
 @pytest.mark.unit
+def test_direct_route_uses_residential_pool_when_proxy_file_set(monkeypatch, tmp_path):
+    pool = tmp_path / "pool.txt"
+    pool.write_text(
+        "pool.example.io:10000:poolu:poolpw\n"
+        "pool.example.io:10001:poolu:poolpw\n"
+    )
+    monkeypatch.setenv("WHOSCORED_PROXY_FILE", str(pool))
+    monkeypatch.setenv("WHOSCORED_TRANSPORT_POLICY", "direct_only")
+
+    seen = []
+
+    def factory(proxy_url):
+        seen.append(proxy_url)
+        return FakeHTTPSession()
+
+    transport = WhoScoredTransport(
+        direct_fs_client=FakeFSClient(),
+        paid_fs_client=FakeFSClient(),
+        http_session_factory=factory,
+        context=TransportContext(transport_policy="direct_only"),
+    )
+
+    assert transport._pool_proxy_url is not None
+    assert transport._pool_proxy_url.startswith("http://poolu:poolpw@pool.example.io:")
+    # The direct curl session was built to egress through that pool member.
+    assert seen == [transport._pool_proxy_url]
+
+
+@pytest.mark.unit
+def test_direct_route_stays_host_ip_without_proxy_file(monkeypatch):
+    monkeypatch.delenv("WHOSCORED_PROXY_FILE", raising=False)
+    monkeypatch.setenv("WHOSCORED_TRANSPORT_POLICY", "direct_only")
+
+    seen = []
+
+    def factory(proxy_url):
+        seen.append(proxy_url)
+        return FakeHTTPSession()
+
+    transport = WhoScoredTransport(
+        direct_fs_client=FakeFSClient(),
+        paid_fs_client=FakeFSClient(),
+        http_session_factory=factory,
+        context=TransportContext(transport_policy="direct_only"),
+    )
+
+    assert transport._pool_proxy_url is None
+    assert seen == [None]
+
+
+@pytest.mark.unit
 def test_valid_raw_cache_skips_every_network_route():
     cache = MemoryRawCache(CachedPayload(content=OK_HTML))
     direct = FakeHTTPSession()
