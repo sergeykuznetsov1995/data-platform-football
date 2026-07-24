@@ -480,7 +480,11 @@ jobs:
           assert_success_after_gate() {
             label="$1"
             shift
-            docker run --rm -v "$sentinel:/sentinel" "$@"
+            # The ready-v1 smoke intentionally exercises the production gate and
+            # then a harmless command, but it has no Airflow metadata database.
+            # Keep the gate/entrypoint path under test while disabling the
+            # unrelated connection wait in the official Airflow entrypoint.
+            docker run --rm -e CONNECTION_CHECK_MAX_COUNT=0 -v "$sentinel:/sentinel" "$@"
             test -e "$sentinel/$label"
           }
 
