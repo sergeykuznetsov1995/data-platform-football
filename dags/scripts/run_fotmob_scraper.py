@@ -35,7 +35,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-NATIVE_MODES = ("discover", "daily", "backfill", "replay")
+# ``refresh`` is a runner-only mode: it plans and writes exactly like ``daily``
+# (current selected/latest seasons of the whole included men's catalog,
+# stalest-first) but is meant to run bounded (``--season-limit``) and rotating
+# from the continuous refresh DAG, without the pinned 21-competition daily
+# contract.  It maps onto ``RunMode.DAILY`` internally so the source planner
+# enum stays untouched; the report keeps ``mode="refresh"`` for DAG routing.
+NATIVE_MODES = ("discover", "daily", "backfill", "replay", "refresh")
 NATIVE_ENTITIES = frozenset(
     {"season", "leaderboards", "matches", "teams", "players", "transfers"}
 )
@@ -532,7 +538,9 @@ def _build_native_service(args, run_id: str):
     service = FotMobIngestService(
         transport=transport,
         repository=repository,
-        mode=RunMode(args.mode),
+        # ``refresh`` reuses DAILY service semantics (current-season focus,
+        # 1-year transfer window).  See NATIVE_MODES.
+        mode=RunMode("daily" if args.mode == "refresh" else args.mode),
         budget=budget,
         run_id=run_id,
         max_workers=args.workers,
@@ -596,6 +604,10 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         operations.append(view_operation)
         report = service.report(operations, started_at)
         payload = _native_output_payload(report)
+        # ``refresh`` runs on DAILY service semantics, so the report would echo
+        # "daily"; restore the caller's mode so the DAG routes it to the
+        # best-effort (non-daily-contract) validation path.
+        payload["mode"] = args.mode
         _deactivate_native_service(service)
         return (0 if report.ok else 1), payload
 
@@ -797,7 +809,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         if scope_validation not in operations:
             operations.append(scope_validation)
 
-    mode = RunMode(args.mode)
+    mode = RunMode("daily" if args.mode == "refresh" else args.mode)
     scope_entities = frozenset({"season", *(entities - {"transfers"})})
     scope_plan_signature = deterministic_plan_signature(
         scope_entities,
