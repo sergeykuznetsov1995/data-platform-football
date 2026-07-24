@@ -47,7 +47,7 @@ def _params(module, **overrides):
         'leagues': [],
         'season': None,
         'registry_snapshot_id': '',
-        'max_batch': 8,
+        'max_batch': 24,
         'approval_journal': module.APPROVAL_JOURNAL,
         'approval_bundles': {},
         'mv_transfers_limit': 500,
@@ -100,7 +100,7 @@ class TestDagShape:
         assert task._init_kwargs['pool'] == 'transfermarkt_proxy'
         assert task._init_kwargs['pool_slots'] == 1
         assert task._init_kwargs['max_active_tis_per_dag'] == 1
-        assert task._init_kwargs['retries'] == 0
+        assert task._init_kwargs['retries'] == 1
         assert task._init_kwargs['do_xcom_push'] is False
 
     def test_exact_wrapper_receives_both_one_shot_approvals(self, dag_module):
@@ -164,8 +164,8 @@ class TestDagShape:
         assert params['scopes'].default == []
         assert params['leagues'].default == []
         assert params['season'].default is None
-        assert params['max_batch'].default == 8
-        assert params['max_batch']._kw['maximum'] == 8
+        assert params['max_batch'].default == 24
+        assert params['max_batch']._kw['maximum'] == 24
 
     def test_bounded_operator_params_are_not_relaxable(self, dag_module):
         params = dag_module.dag._dag_kwargs['params']
@@ -177,8 +177,8 @@ class TestDagShape:
         assert dag_module.PROVIDER_SOFT_STOP_BYTES == 22 * 1024 * 1024
         assert dag_module.PARENT_BYTE_BUDGET == 336 * 1024 * 1024
         assert dag_module.PARENT_SOFT_BYTE_STOP == 320 * 1024 * 1024
-        assert dag_module.PARENT_REQUEST_LIMIT == 8 * 1610
-        assert dag_module.PARENT_RETRY_LIMIT == 8 * 800
+        assert dag_module.PARENT_REQUEST_LIMIT == 24 * 1610
+        assert dag_module.PARENT_RETRY_LIMIT == 24 * 800
         assert dag_module.PROXY_CONCURRENCY == 1
 
     def test_task_timeout_covers_every_entity_subprocess_it_supervises(
@@ -277,7 +277,7 @@ class TestPlanningGate:
 
         assert captured['params']['scopes'] == ['GB1:2025']
         assert captured['params']['leagues'] == ['ENG-Premier League']
-        assert captured['max_batch_size'] == 8
+        assert captured['max_batch_size'] == 24
         assert captured['parent_cycle_id'] == 'scheduled__2026-07-13'
         assert len(environments) == 1
         env = environments[0]
@@ -286,8 +286,8 @@ class TestPlanningGate:
         assert env['TM_PROVIDER_HARD_CAP_BYTES'] == str(24 * 1024 * 1024)
         assert env['TM_PARENT_BYTE_BUDGET'] == str(336 * 1024 * 1024)
         assert env['TM_PARENT_SOFT_BYTE_STOP'] == str(320 * 1024 * 1024)
-        assert env['TM_PARENT_REQUEST_LIMIT'] == str(8 * 1610)
-        assert env['TM_PARENT_RETRY_LIMIT'] == str(8 * 800)
+        assert env['TM_PARENT_REQUEST_LIMIT'] == str(24 * 1610)
+        assert env['TM_PARENT_RETRY_LIMIT'] == str(24 * 800)
         assert env['TM_REFRESH_MODE'] == 'current'
         assert env['TM_CHECKPOINT_TTL_DAYS'] == '35'
         assert env['TM_ENTITY_TIMEOUT_SECONDS'] == '3600'
@@ -820,6 +820,13 @@ def _write_manifest_and_ledger(module, tmp_path: Path, *, bad_digest=False):
         'retries': 0,
         'hard_provider_byte_budget': module.PARENT_BYTE_BUDGET,
         'soft_provider_byte_stop': module.PARENT_SOFT_BYTE_STOP,
+        'scopes': {
+            payload['scope_id']: {
+                'provider_metered_bytes': provider_bytes,
+                'requests': len(entities),
+                'retries': 0,
+            },
+        },
     }
     Path(payload['parent_ledger']['path']).write_text(
         json.dumps(ledger), encoding='utf-8',
@@ -1120,7 +1127,7 @@ class TestScopeSetGate:
     def test_partial_registry_coverage_still_builds_and_reports_the_slot(
         self, dag_module, tmp_path,
     ):
-        # The ~9.7k-scope target is bought eight scopes per bounded daily batch.
+        # The ~9.7k-scope target is bought in bounded daily batches.
         # Refusing to build a slot short of the complete target meant no Silver
         # or Gold for months, so partial coverage is now reported, not refused;
         # what it blocks is the reader cutover (readiness), not the build.
@@ -1209,7 +1216,7 @@ class TestScopeSetGate:
         payload, _, _ = _write_manifest_and_ledger(dag_module, tmp_path)
         ledger_path = Path(payload['parent_ledger']['path'])
         ledger = json.loads(ledger_path.read_text(encoding='utf-8'))
-        ledger['provider_metered_bytes'] = -1
+        ledger['scopes'][payload['scope_id']]['provider_metered_bytes'] = -1
         ledger_path.write_text(json.dumps(ledger), encoding='utf-8')
         with pytest.raises(Exception, match='ledger disagrees'):
             dag_module._build_scope_set(

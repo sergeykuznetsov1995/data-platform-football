@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
@@ -31,11 +32,17 @@ from utils.transfermarkt_scope_state import (
 
 
 RESULT_ROOT = '/opt/airflow/logs/transfermarkt-native-v2'
-MAX_BATCH_SIZE = 8
+MAX_BATCH_SIZE = 24
 CURRENT_SCOPE_INTERVAL = timedelta(days=6)
 # Half of every batch pays down career debt, half buys new coverage.  See
 # ``_quota_order``: neither obligation may starve the other.
 CAREER_DEBT_BATCH_SHARE = 0.5
+# ``coverage_mode`` splits the autonomous (no-selector) batch by edition
+# recency: ``current`` collects only the season the registry marks current on
+# each competition (the daily scheduled run — current season across every
+# league first), ``historical`` drains everything else (the backfill phase),
+# ``all`` keeps the original mixed behaviour.
+_COVERAGE_MODES = frozenset({'all', 'current', 'historical'})
 
 REGISTRY_STATE_TABLE = 'iceberg.ops.transfermarkt_registry_state_v2'
 SCOPE_MANIFEST_TABLE = 'iceberg.ops.transfermarkt_scope_manifest_v2'
@@ -441,6 +448,56 @@ def _is_due(candidate: _Candidate, now: datetime) -> bool:
     return False
 
 
+def _edition_recency(edition_id: str) -> tuple[int, object]:
+    """Sort key ordering editions oldest→newest.
+
+    Transfermarkt edition ids are the saison_id year ('2026' > '2025'), so a
+    numeric compare tracks recency.  Non-numeric ids sort before numeric ones
+    deterministically rather than crashing the compare.
+    """
+    text = str(edition_id)
+    if text.isdigit():
+        return (1, int(text))
+    return (0, text)
+
+
+def _recent_edition_keys(
+    editions: Mapping[tuple[str, str], EditionRecord],
+    competitions: Mapping[str, CompetitionRecord],
+    recent_seasons: int,
+) -> set[tuple[str, str]]:
+    """Keys of the current season plus the ``recent_seasons - 1`` before it.
+
+    Per eligible competition this is the edition the registry marks current
+    (26/27 today) and the immediately preceding active editions by saison_id
+    (25/26, then 24/25, …).  ``coverage_mode='current'`` keeps exactly these;
+    ``'historical'`` keeps everything older.
+    """
+    by_competition: dict[str, list[EditionRecord]] = defaultdict(list)
+    for (competition_id, _edition_id), edition in editions.items():
+        competition = competitions.get(competition_id)
+        if competition is None or not competition.crawl_eligible or not edition.active:
+            continue
+        by_competition[competition_id].append(edition)
+
+    keys: set[tuple[str, str]] = set()
+    for competition_id, comp_editions in by_competition.items():
+        current = next((e for e in comp_editions if e.current), None)
+        if current is None:
+            continue
+        keys.add((competition_id, current.edition_id))
+        current_key = _edition_recency(current.edition_id)
+        older = sorted(
+            (e for e in comp_editions
+             if _edition_recency(e.edition_id) < current_key),
+            key=lambda e: _edition_recency(e.edition_id),
+            reverse=True,
+        )
+        for edition in older[: max(0, recent_seasons - 1)]:
+            keys.add((competition_id, edition.edition_id))
+    return keys
+
+
 def _select_candidates(
     params: Mapping[str, Any],
     *,
@@ -454,6 +511,19 @@ def _select_candidates(
     scopes = _normalise_sequence(params.get('scopes'), name='scopes')
     leagues = _normalise_sequence(params.get('leagues'), name='leagues')
     season = params.get('season')
+    coverage_mode = str(params.get('coverage_mode') or 'all').strip().lower()
+    if coverage_mode not in _COVERAGE_MODES:
+        raise ScopePlanningError(
+            'coverage_mode must be one of all/current/historical, '
+            f'got {coverage_mode!r}'
+        )
+    raw_recent = params.get('recent_seasons')
+    try:
+        recent_seasons = 1 if raw_recent in (None, '') else int(raw_recent)
+    except (TypeError, ValueError):
+        raise ScopePlanningError('recent_seasons must be a positive integer')
+    if recent_seasons < 1:
+        raise ScopePlanningError('recent_seasons must be a positive integer')
     selected: list[_Candidate] = []
 
     if scopes:
@@ -519,9 +589,22 @@ def _select_candidates(
                 'active registry classifications block crawl: '
                 + ', '.join(blocked)
             )
+        # The recency window (current season + recent_seasons-1 before it) is
+        # what 'current' collects and what 'historical' drains everything below.
+        recent_keys = (
+            _recent_edition_keys(editions, competitions, recent_seasons)
+            if coverage_mode in {'current', 'historical'}
+            else set()
+        )
         for key, edition in editions.items():
             competition = competitions[key[0]]
             if not competition.crawl_eligible or not edition.active:
+                continue
+            # coverage_mode only filters the autonomous batch; explicit
+            # scopes/leagues selections above always win and ignore it.
+            if coverage_mode == 'current' and key not in recent_keys:
+                continue
+            if coverage_mode == 'historical' and key in recent_keys:
                 continue
             candidate = _Candidate(
                 competition=competition,
@@ -707,11 +790,18 @@ def plan_transfermarkt_scopes(
     Exact ``params.scopes`` take precedence over legacy ``leagues``/``season``
     defaults.  With no selector, only due scopes are returned, never-served
     scopes first and then the oldest successful current editions.
+    ``params.coverage_mode`` ('all'|'current'|'historical', default 'all')
+    further restricts that no-selector batch to the recency window or to the
+    historical backfill; ``params.recent_seasons`` (int, default 1) sets how
+    many seasons wide that window is (1 = current only, 2 = current + previous).
+    Both are ignored when scopes/leagues are given.
     """
 
     cycle_id = _required_text('parent_cycle_id', parent_cycle_id)
-    if isinstance(max_batch_size, bool) or not 1 <= int(max_batch_size) <= 8:
-        raise ScopePlanningError('max_batch_size must be between 1 and 8')
+    if isinstance(max_batch_size, bool) or not 1 <= int(max_batch_size) <= MAX_BATCH_SIZE:
+        raise ScopePlanningError(
+            f'max_batch_size must be between 1 and {MAX_BATCH_SIZE}'
+        )
     batch_size = int(max_batch_size)
     root = PurePosixPath(_required_text('result_root', result_root))
     if not root.is_absolute():

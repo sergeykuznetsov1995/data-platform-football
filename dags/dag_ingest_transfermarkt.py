@@ -656,15 +656,43 @@ def _build_scope_set(
             f"{traffic['provider_metered_bytes']}/{PARENT_BYTE_BUDGET}"
         )
     ledger = _load_json_object(next(iter(ledger_paths)), label='parent proxy ledger')
+    # The parent proxy ledger is keyed on the dagrun's run_id and accumulates
+    # every scope the child cycle committed under it.  When the scheduler
+    # re-plans mid-run (a task clear, or a crash-loop re-queue) the second plan
+    # can legitimately drop a scope that has since completed and gone not-due,
+    # yet that scope's already-committed ledger entry stays behind as an orphan
+    # and inflates the cumulative top-line.  Reconcile the traffic totals
+    # against ONLY the scopes this run actually mapped -- summed from the
+    # ledger's own per-scope evidence -- so an orphaned re-plan entry cannot red
+    # an otherwise-consistent slot.  The immutable budget constants are still
+    # asserted against the ledger itself.
+    ledger_scopes = ledger.get('scopes') or {}
+    mapped_ledger = {'provider_metered_bytes': 0, 'requests': 0, 'retries': 0}
+    for scope_payload in payloads:
+        entry = ledger_scopes.get(str(scope_payload['scope_id']))
+        if entry is None:
+            raise AirflowException(
+                f"{scope_payload['scope_id']}: mapped scope missing from parent "
+                'proxy ledger'
+            )
+        for key in mapped_ledger:
+            mapped_ledger[key] += int(entry.get(key, -1))
     required_ledger = {
         'provider_metered_bytes': traffic['provider_metered_bytes'],
         'requests': traffic['requests'],
         'retries': traffic['retries'],
+    }
+    if any(mapped_ledger[key] != value for key, value in required_ledger.items()):
+        raise AirflowException('parent proxy ledger disagrees with scope manifests')
+    ledger_constants = {
         'hard_provider_byte_budget': PARENT_BYTE_BUDGET,
         'soft_provider_byte_stop': PARENT_SOFT_BYTE_STOP,
     }
-    if any(int(ledger.get(key, -1)) != value for key, value in required_ledger.items()):
-        raise AirflowException('parent proxy ledger disagrees with scope manifests')
+    if any(
+        int(ledger.get(key, -1)) != value
+        for key, value in ledger_constants.items()
+    ):
+        raise AirflowException('parent proxy ledger budget constants drifted')
 
     current_manifests = tuple(manifests)
     targets = {
@@ -765,7 +793,7 @@ def _build_scope_set(
     complete_manifests = tuple(by_scope[key] for key in sorted(by_scope))
     # The slot is promoted with whatever it has proved so far; how much of the
     # target that is, is reported, not gated.  Demanding the whole target here
-    # was unsatisfiable by construction: at eight scopes per bounded daily batch
+    # was unsatisfiable by construction: at the bounded scopes-per-day batch
     # the 9.7k-scope target takes months, and a 7-day eviction of the evidence
     # made the collected part expire faster than the rest could be bought.
     scope_set = ScopeSetManifest.build(
@@ -923,6 +951,13 @@ with DAG(
             maximum=CURRENT_SEASON + 1,
         ),
         'registry_snapshot_id': Param(default='', type='string'),
+        'coverage_mode': Param(
+            default='current', type='string',
+            enum=['current', 'historical', 'all'],
+        ),
+        'recent_seasons': Param(
+            default=2, type='integer', minimum=1, maximum=40,
+        ),
         'max_batch': Param(
             default=MAX_SCOPE_BATCH, type='integer', minimum=1,
             maximum=MAX_SCOPE_BATCH,
@@ -1038,7 +1073,12 @@ exec python dags/scripts/run_transfermarkt_scope_cycle.py \
   --parent-request-limit "$TM_PARENT_REQUEST_LIMIT" \
   --parent-retry-limit "$TM_PARENT_RETRY_LIMIT"''',
         append_env=True,
-        retries=0,
+        # One retry softens the bigger single-run blast radius: a transient
+        # Cloudflare wave that fails a scope self-heals instead of reddening
+        # the whole batch.  The ledger is idempotent per scope_id, so a retry
+        # under the same run_id must reproduce byte-identical evidence.
+        retries=1,
+        retry_delay=timedelta(minutes=10),
         pool='transfermarkt_proxy',
         pool_slots=1,
         max_active_tis_per_dag=1,
@@ -1047,9 +1087,10 @@ exec python dags/scripts/run_transfermarkt_scope_cycle.py \
         # career entities need 5400 s each at a full 650-attempt budget), plus
         # the scope's ops MERGEs.  A shorter task timeout would SIGKILL a
         # runner mid-crawl and lose its attempt-guard write and evidence.
-        # Scopes run strictly serially (max_active_tis_per_dag=1) and runs do
-        # not overlap or backfill (max_active_runs=1, catchup=False), so a
-        # long worst-case DagRun only delays the next scheduled one.
+        # Scopes run strictly serially (max_active_tis_per_dag=1) so each
+        # scope owns the provider lease without cross-scope concurrency.
+        # Runs do not overlap or backfill (max_active_runs=1, catchup=False),
+        # so a long worst-case DagRun only delays the next scheduled one.
         execution_timeout=timedelta(seconds=SCOPE_WALL_CLOCK_TIMEOUT_SECONDS),
         do_xcom_push=False,
     ).expand(env=plan_exact_scopes_task.output)

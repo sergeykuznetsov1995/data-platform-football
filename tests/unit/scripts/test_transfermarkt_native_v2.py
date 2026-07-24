@@ -801,8 +801,8 @@ def test_scope_set_readiness_ceilings_come_from_the_daily_canon():
 
     assert control.SCOPE_SET_HARD_BYTE_CAP == 352_321_536
     assert control.SCOPE_SET_SOFT_BYTE_STOP == 335_544_320
-    assert control.SCOPE_SET_REQUEST_LIMIT == 12_880
-    assert control.SCOPE_SET_RETRY_LIMIT == 6_400
+    assert control.SCOPE_SET_REQUEST_LIMIT == 38_640
+    assert control.SCOPE_SET_RETRY_LIMIT == 19_200
 
     manifest = _scope_manifest_fixture(control)
     report, _ = _readiness(control, _ScopeEvidenceCursor(control, [manifest]))

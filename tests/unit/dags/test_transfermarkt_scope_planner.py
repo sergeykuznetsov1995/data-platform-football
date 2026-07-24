@@ -246,7 +246,7 @@ def test_unknown_active_classification_blocks_empty_and_explicit_plans():
         )
 
 
-def test_empty_params_selects_due_oldest_first_and_caps_batch_at_eight():
+def test_empty_params_selects_due_oldest_first_and_caps_batch_at_24():
     rows = []
     for index in range(10):
         competition = _competition(f'C{index:02d}')
@@ -267,9 +267,9 @@ def test_empty_params_selects_due_oldest_first_and_caps_batch_at_eight():
         now=NOW,
     )
     assert plan.total_selected_count == 10
-    assert len(plan.mapped_payloads) == 8
-    assert plan.continuation_required is True
-    assert plan.remaining_count == 2
+    assert len(plan.mapped_payloads) == 10
+    assert plan.continuation_required is False
+    assert plan.remaining_count == 0
     # Never-served identities are ordered first and deterministically.
     assert [item['competition_id'] for item in plan.mapped_payloads[:3]] == [
         'C02', 'C03', 'C04',
@@ -481,9 +481,9 @@ def test_promoted_registry_query_is_read_only_and_escapes_snapshot_literal():
     assert 'DELETE ' not in sql
 
 
-@pytest.mark.parametrize('batch_size', [0, 9, True])
+@pytest.mark.parametrize('batch_size', [0, 25, True])
 def test_batch_size_cannot_bypass_global_bound(batch_size):
-    with pytest.raises(planner.ScopePlanningError, match='between 1 and 8'):
+    with pytest.raises(planner.ScopePlanningError, match='between 1 and 24'):
         planner.plan_transfermarkt_scopes(
             {'scopes': ['GB1:2025']},
             parent_cycle_id='manual__invalid-batch',
