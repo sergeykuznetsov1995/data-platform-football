@@ -55,7 +55,7 @@ from scrapers.fotmob.source_refresh import (
 
 
 RESULT_PATH = "/tmp/fotmob_result_{{ ts_nodash }}.json"
-NATIVE_MODES = frozenset({"discover", "daily", "backfill", "replay"})
+NATIVE_MODES = frozenset({"discover", "daily", "backfill", "replay", "refresh"})
 ISSUE_930_REPLAY_ENTITIES = [
     "leaderboards",
     "matches",
