@@ -52,8 +52,10 @@ def _translate_trino_to_duckdb(sql: str) -> str:
         "(SELECT match_id FROM silver_fbref_match_enriched "
         "UNION SELECT match_id FROM silver_sofascore_shots)",
     )
-    return sql.replace("iceberg.bronze.", "bronze_").replace(
-        "iceberg.silver.", "silver_"
+    return (
+        sql.replace("iceberg.bronze.", "bronze_")
+        .replace("iceberg.silver.", "silver_")
+        .replace("iceberg.ops.", "ops_")
     )
 
 
@@ -91,7 +93,8 @@ _TABLES: Dict[str, str] = {
         away_team    VARCHAR,
         league       VARCHAR,
         season       VARCHAR,
-        _ingested_at TIMESTAMP
+        _ingested_at TIMESTAMP,
+        _batch_id    VARCHAR
     """,
     "silver_fbref_match_enriched": """
         match_id VARCHAR,
@@ -126,6 +129,15 @@ _TABLES: Dict[str, str] = {
         shot_source VARCHAR,
         league      VARCHAR,
         season      VARCHAR
+    """,
+    "ops_understat_ingest_manifest_v1": """
+        contract_version VARCHAR,
+        league           VARCHAR,
+        season           VARCHAR,
+        batch_id         VARCHAR,
+        status           VARCHAR,
+        completed_at     VARCHAR,
+        attempt_id       VARCHAR
     """,
 }
 
@@ -163,7 +175,7 @@ def _base_fixtures() -> Dict[str, List[Dict[str, Any]]]:
         "bronze_understat_schedule": [
             {"game_id": 900, "date": "2025-08-15 19:00:00", "home_team": "Liverpool",
              "away_team": "Bournemouth", "league": _LEAGUE, "season": _SEASON,
-             "_ingested_at": _ING},
+             "_ingested_at": _ING, "_batch_id": "b1"},
         ],
         "silver_fbref_match_enriched": [
             {"match_id": "m_livbou", "date": "2025-08-15", "home": "Liverpool",

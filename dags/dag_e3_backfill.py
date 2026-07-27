@@ -207,6 +207,62 @@ _BRONZE_TABLES = [
     ('iceberg.bronze.understat_shots',  'WARNING'),
     ('iceberg.bronze.espn_lineup',      'WARNING'),
 ]
+_UNDERSTAT_SHOTS_TABLE = 'iceberg.bronze.understat_shots'
+_UNDERSTAT_CONTRACT_VERSION = 'understat-bronze-v2'
+
+
+def _bronze_scope_count_sql(
+    table: str,
+    *,
+    season_sql: str,
+    league_sql: str,
+) -> str:
+    """Build a physical scope count with Understat's publication fence.
+
+    Native Understat writes seven partitions one at a time. Once a scope has a
+    manifest attempt, only a latest ``complete`` attempt's exact ``batch_id``
+    is readable; a later failed/pending attempt invalidates an older complete
+    batch. Scopes with no v2 attempt retain the legacy unbatched read path.
+    """
+
+    if table != _UNDERSTAT_SHOTS_TABLE:
+        return (
+            f"SELECT COUNT(*) FROM {table} "
+            f"WHERE season = '{season_sql}' AND league = '{league_sql}'"
+        )
+
+    return f"""
+        WITH understat_manifest_latest AS (
+            SELECT league, season, batch_id, status
+            FROM (
+                SELECT
+                    league,
+                    season,
+                    batch_id,
+                    status,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY league, season
+                        ORDER BY completed_at DESC, attempt_id DESC
+                    ) AS rn
+                FROM iceberg.ops.understat_ingest_manifest_v1
+                WHERE contract_version = '{_UNDERSTAT_CONTRACT_VERSION}'
+                  AND league = '{league_sql}'
+                  AND season = '{season_sql}'
+            )
+            WHERE rn = 1
+        )
+        SELECT COUNT(*)
+        FROM {_UNDERSTAT_SHOTS_TABLE} s
+        LEFT JOIN understat_manifest_latest m
+          ON m.league = s.league
+         AND m.season = CAST(s.season AS varchar)
+        WHERE s.season = '{season_sql}'
+          AND s.league = '{league_sql}'
+          AND (
+              m.league IS NULL
+              OR (m.status = 'complete' AND s._batch_id = m.batch_id)
+          )
+    """
 
 
 def _pre_check_bronze(**context) -> Dict[str, Any]:
@@ -214,7 +270,9 @@ def _pre_check_bronze(**context) -> Dict[str, Any]:
 
     whoscored_events_current is required (ERROR if empty); the other two are
     checked but treated as WARNING — backfill can proceed with degraded
-    coverage on understat / espn (matches production tolerance).
+    coverage on understat / espn (matches production tolerance). Understat is
+    counted through the same latest-attempt/exact-batch publication fence as
+    production consumers; only scopes with no manifest attempt use legacy rows.
 
     Logs one summary dict per table; fails the task with a single
     AirflowException if any ERROR-severity table is empty.
@@ -239,9 +297,10 @@ def _pre_check_bronze(**context) -> Dict[str, Any]:
     try:
         cur = conn.cursor()
         for table, severity in _BRONZE_TABLES:
-            sql = (
-                f"SELECT COUNT(*) FROM {table} "
-                f"WHERE season = '{season_sql}' AND league = '{league_sql}'"
+            sql = _bronze_scope_count_sql(
+                table,
+                season_sql=season_sql,
+                league_sql=league_sql,
             )
             try:
                 cur.execute(sql)

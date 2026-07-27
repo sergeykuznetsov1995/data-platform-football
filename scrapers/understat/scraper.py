@@ -1,420 +1,320 @@
-"""
-Understat Scraper
-=================
+"""Production facade for the source-native Understat ingestion."""
 
-Scraper for Understat xG data including shots, player stats,
-and team statistics.
-
-Source: https://understat.com
-"""
+from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+import os
+from pathlib import Path
+from typing import Any, List, Optional
 
 import pandas as pd
 
-from scrapers.base.base_scraper import SoccerdataScraper
+from scrapers.base.base_scraper import BaseScraper
+
+from .catalog import (
+    LEAGUE_BY_CANONICAL,
+    PRODUCTION_LEAGUES,
+    UnderstatScope,
+    source_season_id_from_slug,
+    season_slug,
+)
+from .client import UnderstatClient
+from .contracts import TABLE_CONTRACTS
+from .service import UnderstatSource
+
 
 logger = logging.getLogger(__name__)
 
 
-def _install_understat_roster_patch() -> None:
-    """Patch soccerdata 1.8.8's Understat._read_match for list-shaped rosters.
+class UnderstatScraper(BaseScraper):
+    """Native Understat scraper with legacy ``read_*`` compatibility methods.
 
-    Understat's per-match ``rosters["h"]/["a"]`` are normally a dict keyed by
-    player id, but for some matches (observed GER-Bundesliga 2024/25) the site
-    returns a *list* instead. Stock ``_read_match`` does
-    ``next(iter(rosters[side].values()))`` and downstream code iterates
-    ``rostersData.values()`` — both raise ``'list' object has no attribute
-    'values'`` and kill the whole shots / player_match_stats scrape. We
-    normalize a list roster to a dict keyed by player id so both this method and
-    its downstream consumers parse cleanly. Faithful reimplementation of the
-    v1.8.8 method with only that normalization added; applied once at import.
-    """
-    import json
-
-    try:
-        import soccerdata.understat as _us
-    except Exception:
-        # soccerdata not importable as a real package (e.g. mocked in unit
-        # tests). The patch is a runtime-only fix; skip silently.
-        return
-
-    if getattr(_us.Understat, "_dpf_roster_patch", False):
-        return
-
-    def _read_match(self, url, match_id):
-        self._ensure_cookies()
-        try:
-            api_url = _us.UNDERSTAT_URL + f"/getMatchData/{match_id}"
-            filepath = self.data_dir / f"match_{match_id}.json"
-            reader = self._request_api(api_url, filepath)
-            data = json.load(reader)
-
-            home_team_name = self._extract_team_name(data["tmpl"]["home"])
-            away_team_name = self._extract_team_name(data["tmpl"]["away"])
-            rosters = data["rosters"]
-            # Normalize list-shaped rosters to a dict keyed by player id.
-            for side in ("h", "a"):
-                if isinstance(rosters.get(side), list):
-                    rosters[side] = {
-                        str(p.get("id", i)): p
-                        for i, p in enumerate(rosters[side])
-                    }
-            # A match with an empty roster (a data-less fixture that slipped the
-            # schedule filter) has no usable team ids — skip it like a failed
-            # fetch; the callers do ``if data is None: continue``.
-            if not rosters.get("h") or not rosters.get("a"):
-                logger.warning(
-                    "Skipping match %s: empty roster (data-less fixture)",
-                    match_id,
-                )
-                return None
-            home_team_id = next(iter(rosters["h"].values()))["team_id"]
-            away_team_id = next(iter(rosters["a"].values()))["team_id"]
-
-            match_info = {
-                "h": home_team_id,
-                "a": away_team_id,
-                "team_h": home_team_name,
-                "team_a": away_team_name,
-            }
-            return {
-                "match_info": match_info,
-                "rostersData": rosters,
-                "shotsData": data["shots"],
-            }
-        except ConnectionError:
-            return None
-
-    _us.Understat._read_match = _read_match
-    _us.Understat._dpf_roster_patch = True
-
-
-_install_understat_roster_patch()
-
-
-class UnderstatScraper(SoccerdataScraper):
-    """
-    Scraper for Understat xG statistics.
-
-    Understat provides:
-    - Shot-level xG data with coordinates
-    - Player xG/xA statistics
-    - Team xG statistics
-    - Match-level xG data
-
-    Coverage: Top 5 European leagues (EPL, La Liga, Bundesliga, Serie A, Ligue 1)
-
-    Note: Understat's per-match endpoint (getMatchData) is fetched by soccerdata
-    without any inter-request delay — a full-season backfill fires ~380 requests
-    back-to-back (known limitation, lives inside the library). Steady-state runs
-    only fetch new matches thanks to the persistent page cache.
-
-    Usage:
-        scraper = UnderstatScraper(
-            leagues=['ENG-Premier League'],
-            seasons=[2023, 2024]
-        )
-        df = scraper.read_schedule()
+    Production orchestration should call :meth:`scrape_scope`, which guarantees
+    that every match payload is fetched once and parsed into both derived
+    tables. The individual readers share a scope cache and exist for ad-hoc
+    callers which used the old soccerdata-backed API.
     """
 
-    SOURCE_NAME = 'understat'
+    SOURCE_NAME = "understat"
     DEFAULT_RATE_LIMIT = 30
-
-    # Understat only covers these leagues. The site also has RUS-Premier League
-    # (RFPL), but soccerdata 1.8.8 has no league_dict entry for it — enabling
-    # it requires a custom ~/soccerdata/config/league_dict.json (lives in the
-    # soccerdata_cache volume) before adding it here.
-    SUPPORTED_LEAGUES = [
-        'ENG-Premier League',
-        'ESP-La Liga',
-        'GER-Bundesliga',
-        'ITA-Serie A',
-        'FRA-Ligue 1',
+    SUPPORTED_LEAGUES = list(PRODUCTION_LEAGUES)
+    TABLE_SPECS = [
+        (contract.reader_method, contract.table_name, contract.result_key)
+        for contract in TABLE_CONTRACTS
     ]
 
     def __init__(
         self,
         leagues: Optional[List[str]] = None,
-        seasons: Optional[List[int]] = None,
-        **kwargs
+        seasons: Optional[List[int | str]] = None,
+        *,
+        client: Optional[UnderstatClient] = None,
+        source: Optional[UnderstatSource] = None,
+        session: Any = None,
+        cache_dir: Optional[str | Path] = None,
+        requests_per_minute: Optional[int] = None,
+        client_sleep: Any = None,
+        client_monotonic: Any = None,
+        client_now: Any = None,
+        client_jitter: Any = None,
+        **kwargs: Any,
     ):
-        # Filter to only supported leagues
-        if leagues:
-            unsupported = [l for l in leagues if l not in self.SUPPORTED_LEAGUES]
-            if unsupported:
-                logger.warning(
-                    f"Dropping leagues not covered by Understat: {unsupported}"
-                )
-            leagues = [l for l in leagues if l in self.SUPPORTED_LEAGUES]
-            if not leagues:
-                raise ValueError(
-                    f"No supported Understat leagues left after filtering "
-                    f"(dropped: {unsupported}); supported: {self.SUPPORTED_LEAGUES}"
-                )
-        else:
-            leagues = list(self.SUPPORTED_LEAGUES)
-
-        super().__init__(leagues=leagues, seasons=seasons, **kwargs)
-        self._reader = None
-        # Season-rollover guard state: soccerdata caches the seasons index
-        # (getStatData -> leagues.json) FOREVER, and the cache volume persists.
-        # A frozen index hides a new season -> read_seasons() returns empty ->
-        # every read_* returns an empty frame. Refresh it once per run (23 KB).
-        self._leagues_index_refreshed = False
-        # True after read_schedule() has downloaded a fresh league JSON for this
-        # run — lets later read_* calls reuse it via force_cache instead of
-        # re-downloading (~95 KB wire per league per call).
-        self._league_json_fresh = False
-
-    def _refresh_leagues_index(self, reader) -> None:
-        """Re-download the seasons index once per run (season-rollover guard)."""
-        if not self._leagues_index_refreshed:
-            # Private soccerdata API — precedent #444; rewrites leagues.json.
-            reader._read_leagues(no_cache=True)
-            self._leagues_index_refreshed = True
-
-    def _get_reader(self):
-        """Get soccerdata Understat reader."""
-        if self._reader is None:
-            try:
-                import soccerdata as sd
-                reader = sd.Understat(
-                    leagues=self.leagues,
-                    seasons=self.seasons,
-                    **self._sd_kwargs
-                )
-                self._refresh_leagues_index(reader)
-                self._reader = reader
-            except ImportError:
-                logger.error("soccerdata library not installed")
-                raise
-        return self._reader
-
-    def read_schedule(self) -> Optional[pd.DataFrame]:
-        """
-        Read match schedule with xG data.
-
-        Returns:
-            DataFrame with schedule and xG
-        """
-        reader = self._get_reader()
-        logger.info("Fetching Understat schedule")
-
-        try:
-            df = self._execute_with_resilience(reader.read_schedule)
-            # Current-season league JSON is now fresh in the page cache —
-            # subsequent read_* calls in this run may force_cache it.
-            self._league_json_fresh = True
-
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                df = self._add_metadata(df, 'schedule')
-
-            return df
-
-        except Exception as e:
-            # Issue #466: propagate instead of returning None — a swallowed
-            # error leaves the runner's results['errors'] empty -> exit 0 ->
-            # green DAG while Bronze silently goes stale.
-            logger.error(f"Error reading schedule: {e}")
-            raise
-
-    def read_player_season_stats(self) -> Optional[pd.DataFrame]:
-        """
-        Read player season statistics.
-
-        Returns:
-            DataFrame with player xG/xA stats
-        """
-        reader = self._get_reader()
-        logger.info("Fetching Understat player season stats")
-
-        try:
-            # Reuse the league JSON downloaded by read_schedule() this run
-            # instead of re-fetching it (~95 KB wire per league).
-            df = self._execute_with_resilience(
-                reader.read_player_season_stats,
-                force_cache=self._league_json_fresh,
+        selected = list(leagues or PRODUCTION_LEAGUES)
+        unsupported = [league for league in selected if league not in LEAGUE_BY_CANONICAL]
+        if unsupported:
+            logger.warning("Dropping leagues not covered by Understat: %s", unsupported)
+            selected = [league for league in selected if league in LEAGUE_BY_CANONICAL]
+        if not selected:
+            raise ValueError(
+                "No supported Understat leagues left after filtering; "
+                f"supported: {list(PRODUCTION_LEAGUES)}"
             )
 
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                df = self._add_metadata(df, 'player_stats')
+        base_rate_limit = kwargs.pop("rate_limit", None)
+        super().__init__(
+            leagues=selected,
+            seasons=list(seasons or []),
+            rate_limit=base_rate_limit,
+            **kwargs,
+        )
+        if source is not None and client is not None:
+            raise ValueError("Pass either source or client, not both")
+        if source is None:
+            if client is None:
+                native_cache = cache_dir or os.getenv(
+                    "UNDERSTAT_CACHE_DIR",
+                    # The platform's persistent scraper-cache volume is still
+                    # mounted at ~/soccerdata; this subdirectory is owned by
+                    # the native client and imports no soccerdata runtime.
+                    str(Path.home() / "soccerdata" / "data" / "UnderstatNative"),
+                )
+                client_kwargs: dict[str, Any] = {
+                    "session": session,
+                    "cache_dir": native_cache,
+                    "requests_per_minute": (
+                        requests_per_minute or base_rate_limit or self.DEFAULT_RATE_LIMIT
+                    ),
+                }
+                optional = {
+                    "sleep": client_sleep,
+                    "monotonic": client_monotonic,
+                    "now": client_now,
+                    "jitter": client_jitter,
+                }
+                client_kwargs.update({key: value for key, value in optional.items() if value})
+                client = UnderstatClient(**client_kwargs)
+            source = UnderstatSource(client)
+        self.source = source
+        self.client = source.client
+        self._scope_cache: dict[tuple[str, str, int], dict[str, pd.DataFrame]] = {}
 
-            return df
+    def discover_scopes(self, *, force_refresh: bool = True) -> tuple[UnderstatScope, ...]:
+        return self.source.catalog.discover_scopes(force_refresh=force_refresh)
 
-        except Exception as e:
-            logger.error(f"Error reading player stats: {e}")
-            raise
+    def rolling_scopes(
+        self, *, window: int = 2, probe_next: bool = True, force_refresh: bool = True
+    ) -> tuple[UnderstatScope, ...]:
+        return self.source.catalog.rolling_scopes(
+            window=window,
+            probe_next=probe_next,
+            force_refresh=force_refresh,
+        )
 
-    def read_player_match_stats(self) -> Optional[pd.DataFrame]:
+    def scrape_scope(
+        self,
+        league: str,
+        season_slug: str,
+        source_season_id: int,
+        *,
+        mode: str = "current",
+        force_refresh: bool = False,
+    ) -> dict[str, pd.DataFrame]:
+        """Return all seven source tables without writer-owned metadata."""
+
+        return self.source.scrape_scope(
+            league,
+            season_slug,
+            source_season_id,
+            mode=mode,
+            force_refresh=force_refresh,
+        )
+
+    def save_to_iceberg(
+        self,
+        df: pd.DataFrame,
+        table_name: str,
+        partition_cols: Optional[List[str]] = None,
+        database: str = "bronze",
+        replace_partitions: Optional[List[str]] = None,
+        min_replace_ratio: Optional[float] = None,
+        replace_guard_key: Optional[str] = None,
+        natural_keys: Optional[List[str]] = None,
+        batch_id: Optional[str] = None,
+    ) -> str:
+        """Write one manifest-fenced entity without changing shared writer APIs.
+
+        The Understat runner owns one batch id for all seven tables.  Stamp the
+        writer metadata before calling the stable ``IcebergWriter`` interface
+        with ``add_metadata=False``; otherwise its per-call metadata helper
+        would generate seven unrelated batch ids.  Keeping this adaptation in
+        the source package also lets an Understat-only hot deploy coexist with
+        an attested scheduler image whose shared writer code is immutable.
         """
-        Read player match-level statistics.
 
-        Returns:
-            DataFrame with player match stats
-        """
-        reader = self._get_reader()
-        logger.info("Fetching Understat player match stats")
+        normalized_batch_id = str(batch_id or "").strip()
+        if not normalized_batch_id:
+            raise ValueError("Understat publication requires a non-empty batch_id")
+        if df.empty:
+            raise ValueError(f"Understat publication cannot write empty {table_name}")
+        if natural_keys and replace_partitions:
+            raise ValueError(
+                "natural_keys and replace_partitions are mutually exclusive"
+            )
 
-        try:
-            df = self._execute_with_resilience(reader.read_player_match_stats)
+        observed_batch_ids = set(df.get("_batch_id", pd.Series(dtype="object")).dropna())
+        if observed_batch_ids and observed_batch_ids != {normalized_batch_id}:
+            raise ValueError(
+                f"{table_name}: frame batch ids do not match {normalized_batch_id}"
+            )
 
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                df = self._add_metadata(df, 'player_match_stats')
+        partition_spec = (
+            [(column, "identity") for column in partition_cols]
+            if partition_cols
+            else None
+        )
+        delete_filter = (
+            self._build_partition_delete_filter(df, replace_partitions)
+            if replace_partitions
+            else None
+        )
+        if min_replace_ratio is not None:
+            self._enforce_replace_guard(
+                df,
+                database,
+                table_name,
+                delete_filter,
+                min_replace_ratio,
+                replace_guard_key,
+            )
 
-            return df
+        prepared = self._iceberg_writer._add_metadata_columns(
+            df,
+            self.SOURCE_NAME,
+            batch_id=normalized_batch_id,
+        )
+        table_path = self._iceberg_writer.write_dataframe(
+            df=prepared,
+            database=database,
+            table=table_name,
+            partition_spec=partition_spec,
+            add_metadata=False,
+            source=self.SOURCE_NAME,
+            delete_filter=delete_filter,
+            merge_keys=natural_keys,
+        )
+        self._stats["tables_written"].append(table_path)
+        logger.info("Saved %d rows to %s", len(df), table_path)
+        return table_path
 
-        except Exception as e:
-            logger.error(f"Error reading player match stats: {e}")
-            raise
-
-    def read_shot_events(self) -> Optional[pd.DataFrame]:
-        """
-        Read shot-level event data with xG.
-
-        Note: soccerdata has a bug with multiple leagues, so we fetch per league.
-
-        Returns:
-            DataFrame with shot events including coordinates and xG
-        """
-        import soccerdata as sd
-
-        logger.info("Fetching Understat shot events")
-
-        all_shots = []
-
-        # Fetch shots per league to avoid soccerdata bug with multiple leagues
+    def _configured_scopes(self) -> list[tuple[str, str, int]]:
+        if not self.seasons:
+            raise ValueError("At least one explicit canonical season is required")
+        result: list[tuple[str, str, int]] = []
         for league in self.leagues:
-            try:
-                logger.info(f"Fetching shots for {league}")
-                reader = sd.Understat(
-                    leagues=[league],
-                    seasons=self.seasons,
-                    **self._sd_kwargs
+            for raw in self.seasons:
+                if isinstance(raw, bool):
+                    raise ValueError("Boolean is not a valid Understat season")
+                if isinstance(raw, int):
+                    source_year = raw
+                    slug = season_slug(source_year)
+                elif isinstance(raw, str):
+                    source_year = source_season_id_from_slug(raw)
+                    slug = raw
+                else:
+                    raise ValueError(f"Unsupported season value: {raw!r}")
+                result.append((league, slug, source_year))
+        return result
+
+    def _read_table(self, table_name: str) -> Optional[pd.DataFrame]:
+        frames: list[pd.DataFrame] = []
+        for league, slug, source_year in self._configured_scopes():
+            key = (league, slug, source_year)
+            if key not in self._scope_cache:
+                self._scope_cache[key] = self.scrape_scope(
+                    league,
+                    slug,
+                    source_year,
+                    mode="current",
                 )
-                # Season-rollover guard also when this method runs standalone
-                # (no-op if _get_reader already refreshed the index this run).
-                self._refresh_leagues_index(reader)
-                df = self._execute_with_resilience(reader.read_shot_events)
-
-                if df is not None and not df.empty:
-                    df = df.reset_index()
-                    all_shots.append(df)
-
-            except Exception as e:
-                # Issue #466: a failed league must fail the run, not be
-                # silently skipped — old partitions stay intact (runner saves
-                # with replace_partitions only on success).
-                logger.error(f"Error reading shots for {league}: {e}")
-                raise
-
-        if not all_shots:
+            frame = self._scope_cache[key][table_name]
+            if not frame.empty:
+                frames.append(frame)
+        if not frames:
             return None
+        result = pd.concat(frames, ignore_index=True).convert_dtypes()
+        contract = next(item for item in TABLE_CONTRACTS if item.table_name == table_name)
+        return self._add_metadata(result, contract.result_key)
 
-        df = pd.concat(all_shots, ignore_index=True)
+    def read_schedule(
+        self, include_matches_without_data: bool = True, force_cache: bool = False
+    ) -> Optional[pd.DataFrame]:
+        frame = self._read_table("understat_schedule")
+        if frame is not None and not include_matches_without_data:
+            frame = frame[frame["has_data"].fillna(False).astype(bool)]
+        return frame
 
-        # #444: soccerdata 1.8.8 builds shot `assist_player_id` from the
-        # roster-ROW id (`player["id"]`, range 414509…793112) instead of the
-        # true player id (understat.py:580) — so the column never matches
-        # xref_player and assist resolution downstream was 100% NULL. Same family
-        # as the per-league workaround above. The assister NAME (`assist_player`)
-        # IS correct, so re-derive the id from this scrape's own shooter
-        # (player→player_id) pairs. Assisters who took no shot here stay NA — an
-        # honest NULL beats a bogus roster id (Gold fills the rest by name).
-        # Keyed per (league, season) so multi-league frames can't cross-match
-        # namesakes from another league.
-        remap_cols = {'player', 'player_id', 'assist_player', 'assist_player_id'}
-        if remap_cols.issubset(df.columns):
-            name_to_id = dict(zip(
-                zip(df['league'], df['season'], df['player']),
-                df['player_id'],
-            ))
-            assist_keys = pd.Series(
-                list(zip(df['league'], df['season'], df['assist_player'])),
-                index=df.index,
-            )
-            df['assist_player_id'] = assist_keys.map(name_to_id).astype('Int64')
+    def read_shot_events(self, match_id: Any = None) -> Optional[pd.DataFrame]:
+        return self._filter_match(self._read_table("understat_shots"), match_id)
 
-        df = self._add_metadata(df, 'shots')
-        return df
+    def read_player_season_stats(self, force_cache: bool = False) -> Optional[pd.DataFrame]:
+        return self._read_table("understat_players")
 
-    def read_team_match_stats(self) -> Optional[pd.DataFrame]:
-        """
-        Read team match-level statistics.
+    def read_team_match_stats(self, force_cache: bool = False) -> Optional[pd.DataFrame]:
+        return self._read_table("understat_team_match_stats")
 
-        Returns:
-            DataFrame with team match stats
-        """
-        reader = self._get_reader()
-        logger.info("Fetching Understat team match stats")
+    def read_player_match_stats(self, match_id: Any = None) -> Optional[pd.DataFrame]:
+        return self._filter_match(
+            self._read_table("understat_player_match_stats"), match_id
+        )
 
-        try:
-            # Reuse the league JSON downloaded by read_schedule() this run
-            # instead of re-fetching it (~95 KB wire per league).
-            df = self._execute_with_resilience(
-                reader.read_team_match_stats,
-                force_cache=self._league_json_fresh,
-            )
+    def read_player_team_season_stats(self) -> Optional[pd.DataFrame]:
+        return self._read_table("understat_player_team_season_stats")
 
-            if df is not None and not df.empty:
-                df = df.reset_index()
-                df = self._add_metadata(df, 'team_match_stats')
+    def read_team_season_breakdowns(self) -> Optional[pd.DataFrame]:
+        return self._read_table("understat_team_season_breakdowns")
 
-            return df
-
-        except Exception as e:
-            logger.error(f"Error reading team match stats: {e}")
-            raise
-
-    # (read method, bronze table, results key) — the 5-table source contract.
-    # Keep in sync with dags/scripts/run_understat_scraper.py, the Airflow
-    # orchestrator (same tables plus per-table error collection / exit codes).
-    TABLE_SPECS = [
-        ('read_schedule', 'understat_schedule', 'schedule'),
-        ('read_shot_events', 'understat_shots', 'shots'),
-        ('read_player_season_stats', 'understat_players', 'player_stats'),
-        ('read_team_match_stats', 'understat_team_match_stats',
-         'team_match_stats'),
-        ('read_player_match_stats', 'understat_player_match_stats',
-         'player_match_stats'),
-    ]
+    @staticmethod
+    def _filter_match(frame: Optional[pd.DataFrame], match_id: Any) -> Optional[pd.DataFrame]:
+        if frame is None or match_id is None:
+            return frame
+        match_ids = [match_id] if isinstance(match_id, (int, str)) else list(match_id)
+        selected = frame[frame["game_id"].isin([int(value) for value in match_ids])]
+        if selected.empty:
+            raise ValueError("No matches found with the given IDs in selected scopes")
+        return selected
 
     def scrape_all(
         self, min_replace_ratio: Optional[float] = 0.9
-    ) -> Dict[str, str]:
-        """
-        Scrape all 5 Understat bronze tables (ad-hoc/manual path).
+    ) -> dict[str, str]:
+        """Reject the legacy unfenced multi-table write path.
 
-        Previously covered only 3 of the 5 tables and saved WITHOUT the
-        replace-completeness guard — now mirrors the runner: full contract,
-        guard armed by default. Pass ``min_replace_ratio=None`` for a
-        deliberate first backfill (mirrors the runner's ``--force-replace``).
-        An empty frame raises — same fail-closed stance as the runner (an
-        empty scrape means the season is missing from the source).
-
-        Returns:
-            Dictionary mapping data type to Iceberg table path
+        Native publication requires one runner-owned batch id, a pre-write
+        manifest marker, scope DQ, and a seven-table physical fence.  Keeping
+        the abstract method fail-loud preserves the BaseScraper interface
+        without leaving an operational bypass around those guarantees.
         """
-        logger.info(
-            f"Starting Understat scrape: leagues={self.leagues}, seasons={self.seasons}"
+
+        del min_replace_ratio
+        raise RuntimeError(
+            "Understat scrape_all() is disabled: use the scope-aware "
+            "dags/scripts/run_understat_scraper.py runner"
         )
 
-        results = {}
-        for method_name, table_name, key in self.TABLE_SPECS:
-            df = getattr(self, method_name)()
-            if df is None or df.empty:
-                raise ValueError(f"{table_name}: empty scrape result (0 rows)")
-            results[key] = self.save_to_iceberg(
-                df=df,
-                table_name=table_name,
-                partition_cols=['league', 'season'],
-                replace_partitions=['league', 'season'],
-                min_replace_ratio=min_replace_ratio,
-            )
+    def close(self) -> None:
+        close = getattr(self.client.session, "close", None)
+        if callable(close):
+            close()
+        super().close()
 
-        logger.info(f"Understat scrape complete: {list(results.keys())}")
-        return results
+
+__all__ = ["UnderstatScraper"]

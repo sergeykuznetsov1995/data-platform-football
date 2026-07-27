@@ -3042,6 +3042,7 @@
         "shots": "bigint",
         "team": "varchar",
         "team_id": "bigint",
+        "team_side": "varchar",
         "xa": "double",
         "xg": "double",
         "xg_buildup": "double",

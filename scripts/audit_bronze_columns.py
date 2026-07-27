@@ -51,6 +51,25 @@ def _load_whoscored_contract():
 
 WHOSCORED_CONTRACT = _load_whoscored_contract()
 
+
+def _load_understat_contract():
+    """Load the dependency-free native seven-table registry directly."""
+
+    path = Path(__file__).resolve().parents[1] / "scrapers" / "understat" / "contracts.py"
+    module_name = "_audit_understat_contract"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load Understat table contract: {path}")
+    module = importlib.util.module_from_spec(spec)
+    # dataclasses resolves forward metadata through sys.modules while the
+    # dependency-free contract module is executing.
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+UNDERSTAT_CONTRACT = _load_understat_contract()
+
 # ---- Allowlist (verbatim from feedback_bronze_expected_null_columns.md) ----
 
 EXPECTED_NULL: dict[str, set[str]] = {
@@ -453,6 +472,15 @@ def _whoscored_expected_tables() -> dict[str, set[str]]:
     return {**business, **manifests}
 
 
+def _understat_expected_tables() -> dict[str, set[str]]:
+    """Use the parser registry as the audit source of truth."""
+
+    return {
+        contract.table_name: set(contract.required_columns) | META_COLS
+        for contract in UNDERSTAT_CONTRACT.TABLE_CONTRACTS
+    }
+
+
 if set(WHOSCORED_IDENTITY_COLUMNS) != set(WHOSCORED_CONTRACT.BUSINESS_TABLES):
     raise RuntimeError(
         "WhoScored audit identity contract does not cover all 25 datasets"
@@ -685,87 +713,9 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
         },
         # keeper_adv removed in #606 — scrape stopped, table dropped.
     },
-    "understat": {
-        # soccerdata reader output (UnderstatScraper). 5 tables, all partitioned
-        # ['league', 'season']. Minimal required set = identity keys + core metrics
-        # + META_COLS; extra live columns are NOT errors. Column names verified vs
-        # live bronze snapshot (tests/fixtures/bronze_schemas.json, 2026-06-02).
-        # NOTE: bronze.understat_players carries ×10 row dups upstream (deduped in
-        # Silver via ROW_NUMBER) — not a coverage failure (per-column non-NULL is
-        # unaffected by row dups).
-        "understat_schedule": {
-            "league",
-            "season",
-            "game",
-            "game_id",
-            "date",
-            "home_team",
-            "away_team",
-            "home_goals",
-            "away_goals",
-            "home_xg",
-            "away_xg",
-            *META_COLS,
-        },
-        "understat_shots": {
-            "league",
-            "season",
-            "game_id",
-            "shot_id",
-            "minute",
-            "player",
-            "player_id",
-            "team",
-            "team_id",
-            "xg",
-            "result",
-            *META_COLS,
-        },
-        "understat_players": {
-            "league",
-            "season",
-            "player",
-            "player_id",
-            "team",
-            "position",
-            "matches",
-            "minutes",
-            "goals",
-            "assists",
-            "shots",
-            "xg",
-            "xa",
-            *META_COLS,
-        },
-        "understat_team_match_stats": {
-            "league",
-            "season",
-            "game_id",
-            "date",
-            "home_team",
-            "away_team",
-            "home_goals",
-            "away_goals",
-            "home_xg",
-            "away_xg",
-            *META_COLS,
-        },
-        "understat_player_match_stats": {
-            "league",
-            "season",
-            "game_id",
-            "player",
-            "player_id",
-            "team",
-            "minutes",
-            "goals",
-            "assists",
-            "shots",
-            "xg",
-            "xa",
-            *META_COLS,
-        },
-    },
+    # Native client: every exact league-season attempt owns these seven
+    # normalized entities and one shared batch publication fence.
+    "understat": _understat_expected_tables(),
     "whoscored": _whoscored_expected_tables(),
     "sofascore": {
         # soccerdata Sofascore reader (schedule + league_table) + cherry-pick

@@ -180,11 +180,8 @@ def minimal_versions():
 # =============================================================================
 
 @pytest.fixture
-def understat_scraper(soccerdata_available, minimal_leagues, minimal_seasons):
-    """Understat scraper - no Tor required."""
-    if not soccerdata_available:
-        pytest.skip("soccerdata library not installed")
-
+def understat_scraper(minimal_leagues, minimal_seasons):
+    """Source-native Understat scraper — no soccerdata or Tor required."""
     from scrapers.understat import UnderstatScraper
 
     scraper = UnderstatScraper(

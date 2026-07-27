@@ -52,6 +52,7 @@ pytestmark = pytest.mark.unit
 # ---------------------------------------------------------------------------
 
 _ICEBERG_TO_LOCAL = {
+    "iceberg.ops.understat_ingest_manifest_v1": "understat_ingest_manifest_v1",
     "iceberg.bronze.understat_player_match_stats": "understat_player_match_stats",
     "iceberg.bronze.understat_shots":              "understat_shots",
     # native fotmob bronze (#930 cutover: player_season_profile, keeper_profile)
@@ -103,8 +104,9 @@ T2 = "2026-02-01 00:00:00"
 
 _UNDERSTAT_PM_COLS = {
     "game_id": "BIGINT", "player_id": "BIGINT", "player": "VARCHAR",
-    "team_id": "BIGINT", "position": "VARCHAR", "minutes": "BIGINT",
-    "goals": "BIGINT", "own_goals": "BIGINT", "shots": "BIGINT",
+    "team_id": "BIGINT", "team_side": "VARCHAR", "position": "VARCHAR",
+    "minutes": "BIGINT", "goals": "BIGINT", "own_goals": "BIGINT",
+    "shots": "BIGINT",
     "yellow_cards": "BIGINT", "red_cards": "BIGINT", "assists": "BIGINT",
     "key_passes": "BIGINT", "xg": "DOUBLE", "xa": "DOUBLE",
     "xg_chain": "DOUBLE", "xg_buildup": "DOUBLE", "league": "VARCHAR",
@@ -125,6 +127,12 @@ def duck_understat():
     con = duckdb.connect()
     con.execute(_ddl("understat_player_match_stats", _UNDERSTAT_PM_COLS))
     con.execute(_ddl("understat_shots", _UNDERSTAT_SHOTS_COLS))
+    con.execute(
+        "CREATE TABLE understat_ingest_manifest_v1 ("
+        "contract_version VARCHAR, league VARCHAR, season VARCHAR, "
+        "batch_id VARCHAR, status VARCHAR, completed_at VARCHAR, "
+        "attempt_id VARCHAR)"
+    )
     yield con
     con.close()
 
@@ -141,7 +149,8 @@ class TestUnderstatShotPenaltyDedup:
     def _seed_player_match(self, con):
         _insert(con, "understat_player_match_stats",
                 game_id=1, player_id=10, player="Test Player", team_id=99,
-                position="F", minutes=90, goals=5, own_goals=0, shots=8,
+                team_side="h", position="F", minutes=90, goals=5,
+                own_goals=0, shots=8,
                 yellow_cards=0, red_cards=0, assists=1, key_passes=2,
                 xg=3.0, xa=0.5, xg_chain=3.5, xg_buildup=1.0,
                 league="ENG-Premier League", season="2425",

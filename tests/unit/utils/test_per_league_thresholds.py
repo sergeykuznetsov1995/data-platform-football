@@ -48,11 +48,6 @@ def real_config(monkeypatch):
 _MASTER_LITERALS = {
     'whoscored_schedule': 340,
     'espn_schedule': 340,
-    'understat_schedule': 340,
-    'understat_team_match_stats': 340,
-    'understat_shots': 8000,
-    'understat_player_match_stats': 10_000,
-    'understat_players': 450,
     'sofifa_players': 450,
     'sofifa_teams': 18,
     'sofifa_team_ratings': 18,
@@ -75,7 +70,7 @@ class TestEquivalenceWithMasterConstants:
 
     def test_min_row_thresholds_fallback_values_unchanged(self):
         # The whole-table fallback dict must stay byte-compatible with master
-        # (same keys minus the 5 consumer-less legacy ones, same values) —
+        # (same live consumers, same values) —
         # it is monkeypatched by existing tests and read by validate_table
         # for every call without a league scope.
         from utils.config import MIN_ROW_THRESHOLDS
@@ -85,11 +80,6 @@ class TestEquivalenceWithMasterConstants:
             'espn_schedule': 340,
             'espn_lineup': 9000,
             'espn_matchsheet': 620,
-            'understat_schedule': 340,
-            'understat_players': 450,
-            'understat_shots': 8000,
-            'understat_team_match_stats': 340,
-            'understat_player_match_stats': 10_000,
             'sofifa_players': 450,
             'sofifa_teams': 18,
             'sofifa_team_ratings': 18,
@@ -116,8 +106,6 @@ class TestTournamentAndShrunkLeagueScaling:
         from utils.config import get_min_row_threshold
         assert get_min_row_threshold(
             'espn_schedule', 'GER-Bundesliga') == 340 * 306 // 380 == 273
-        assert get_min_row_threshold(
-            'understat_shots', 'GER-Bundesliga') == 8000 * 306 // 380 == 6442
         assert get_min_row_threshold('sofifa_teams', 'GER-Bundesliga') == 16
         # 'league' unit must NOT scale — 1 * 18 // 20 == 0 would silently
         # pass an empty sofifa_leagues partition.

@@ -1,232 +1,156 @@
-"""
-Understat Data Ingestion DAG
-============================
+"""Daily source-native Understat ingestion.
 
-Airflow DAG for scraping xG statistics from Understat.
-Uses BashOperator to run scraper in isolated subprocess,
-avoiding LocalExecutor memory issues.
+The DAG owns the single 09:00 UTC current-data schedule.  Source discovery is
+performed at task runtime and returns the rolling two-season source window
+plus the next season when Understat starts publishing it.  Each discovered
+``(league, season)`` scope is executed and validated independently; one
+subprocess can therefore never hide another league's empty or partial result.
 
-Schedules daily at 9 AM UTC.
-
-Data collected:
-- Match schedules with xG
-- Shot events with coordinates and xG
-- Player season xG/xA statistics
-- Team season xG statistics
-
-All data is written to Iceberg Bronze layer tables (via Parquet fallback).
+Historical seasons are deliberately not accepted as a UI override here.  The
+paused, self-draining ``dag_backfill_understat`` owns history and resumes from
+the durable Understat publication manifest.
 """
 
-from datetime import datetime, timedelta
-from typing import Any, Dict
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
-from airflow.models.param import Param
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 
-from utils.bronze_validation import validate_table
-from utils.config import UNDERSTAT_LEAGUES, CURRENT_SEASON, SCHEDULES, DAG_TAGS
-from utils.default_args import SCRAPER_ARGS
-
-# Issue #466: every Bronze table this DAG writes gets a fail-closed Trino
-# COUNT(*) floor (threshold key == table name in MIN_ROW_THRESHOLDS).
-UNDERSTAT_BRONZE_TABLES = [
-    'understat_schedule',
-    'understat_players',
-    'understat_shots',
-    'understat_team_match_stats',
-    'understat_player_match_stats',
-]
+from utils.config import DAG_TAGS, SCHEDULES, UNDERSTAT_LEAGUES
+from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
+from utils.understat_tasks import (
+    _close_understat_client,
+    _deduplicate_scopes,
+    _scope_value,
+    scope_environment,
+    validate_scope_result,
+)
 
 
-def validate_data(**context) -> Dict[str, Any]:
-    """
-    Validate scraped data quality.
+logger = logging.getLogger(__name__)
 
-    Returns:
-        Validation results
-    """
-    import json
-    import logging
+DAG_ID = "dag_ingest_understat"
+CURRENT_PRIORITY = 100
 
-    logger = logging.getLogger(__name__)
 
+def plan_current_scopes(**context: Any) -> list[dict[str, str]]:
+    """Discover the bounded current window and prepare mapped runner inputs."""
+
+    # Lazy import is intentional: DAG parsing must not open a source session or
+    # require the scraper-only dependency set in the scheduler process.
+    from scrapers.understat import UnderstatCatalog, UnderstatClient
+
+    client = UnderstatClient()
     try:
-        with open('/tmp/understat_result.json', 'r') as f:
-            scrape_result = json.load(f)
-    except FileNotFoundError:
-        logger.error("Results file not found - scraping may have failed")
-        raise AirflowException("Results file not found - scraping failed")
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in results: {e}")
-        raise AirflowException(f"Invalid JSON in results: {e}")
+        scopes = UnderstatCatalog(client).rolling_scopes(
+            window=2,
+            probe_next=True,
+        )
+    finally:
+        _close_understat_client(client)
+    configured = frozenset(UNDERSTAT_LEAGUES)
+    scopes = _deduplicate_scopes(
+        scope
+        for scope in scopes
+        if str(_scope_value(scope, "league")) in configured
+    )
+    if not scopes:
+        raise AirflowException("Understat current discovery returned no scopes")
 
-    validation = {
-        'status': 'success',
-        'warnings': [],
-        'summary': {
-            'schedule_rows': scrape_result.get('schedule_rows', 0),
-            'shots_rows': scrape_result.get('shots_rows', 0),
-            'player_stats_rows': scrape_result.get('player_stats_rows', 0),
-            'team_match_stats_rows': scrape_result.get('team_match_stats_rows', 0),
-            'player_match_stats_rows': scrape_result.get('player_match_stats_rows', 0),
-            'tables': scrape_result.get('tables', []),
-        }
-    }
-
-    if scrape_result.get('errors'):
-        validation['warnings'] = scrape_result['errors']
-        total_rows = sum([
-            validation['summary']['schedule_rows'],
-            validation['summary']['shots_rows'],
-            validation['summary']['player_stats_rows'],
-            validation['summary']['team_match_stats_rows'],
-            validation['summary']['player_match_stats_rows'],
-        ])
-        validation['status'] = 'partial_success' if total_rows > 0 else 'failed'
-
-    # Check minimum thresholds — per-league baselines (one EPL season: 380
-    # fixtures, ~9.8k shots, ~550 player-seasons, ~11k player-match rows)
-    # scaled by the number of leagues actually scraped this run.
-    n_leagues = len(scrape_result.get('leagues', [])) or 1
-    per_league_floors = {
-        'schedule_rows': 100,
-        'shots_rows': 500,
-        'player_stats_rows': 100,
-        'team_match_stats_rows': 100,
-        'player_match_stats_rows': 1000,
-    }
-    for key, floor in per_league_floors.items():
-        if validation['summary'][key] < floor * n_leagues:
-            validation['warnings'].append(
-                f"Low {key} ({validation['summary'][key]} < "
-                f"{floor * n_leagues} for {n_leagues} league(s)) "
-                f"- possible scraping issue"
-            )
-
-    logger.info(f"Data validation complete: {validation['status']}")
-    logger.info(f"Summary: {validation['summary']}")
-
-    if validation['warnings']:
-        logger.warning(f"Warnings: {validation['warnings']}")
-
-    if validation['status'] == 'failed':
-        raise AirflowException(f"Validation failed: {validation.get('warnings', [])}")
-
-    return validation
+    run_id = str(context.get("run_id") or "manual")
+    plan = [
+        scope_environment(
+            scope,
+            mode="current",
+            run_id=run_id,
+        )
+        for scope in scopes
+    ]
+    logger.info(
+        "Understat current plan contains %d scope(s): %s",
+        len(plan),
+        [
+            (item["UNDERSTAT_LEAGUE"], item["UNDERSTAT_SEASON_SLUG"])
+            for item in plan
+        ],
+    )
+    return plan
 
 
-# Build arguments for bash command. Scaling to more leagues = extend
-# UNDERSTAT_LEAGUES (utils/config.py). If the single task ever gets heavy or
-# needs per-league failure isolation (read_shot_events is fail-fast across the
-# whole league set), split into one task per league like dag_ingest_whoscored.
-leagues_str = ','.join(UNDERSTAT_LEAGUES)
+RUN_SCOPE_COMMAND = """
+set -euo pipefail
+cd /opt/airflow
+/opt/legacy-scraper-venv/bin/python dags/scripts/run_understat_scraper.py \\
+    --mode "${UNDERSTAT_MODE}" \\
+    --league "${UNDERSTAT_LEAGUE}" \\
+    --season-slug "${UNDERSTAT_SEASON_SLUG}" \\
+    --source-season-id "${UNDERSTAT_SOURCE_SEASON_ID}" \\
+    --source-discovered "${UNDERSTAT_SOURCE_DISCOVERED}" \\
+    --output "${UNDERSTAT_RESULT_PATH}"
+"""
 
-# DAG definition
+
 with DAG(
-    dag_id='dag_ingest_understat',
-    default_args=SCRAPER_ARGS,
-    description='Ingest xG statistics from Understat',
-    schedule=SCHEDULES.get('dag_ingest_understat', '0 9 * * *'),
-    start_date=datetime(2024, 1, 1),
+    dag_id=DAG_ID,
+    default_args=DEFAULT_ARGS,
+    description="Discover and ingest the rolling Understat current window",
+    schedule=SCHEDULES.get(DAG_ID, "0 9 * * *"),
+    start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     catchup=False,
-    tags=DAG_TAGS.get('understat', ['scraping', 'understat', 'bronze']),
     max_active_runs=1,
-    # issue #530: cap run wall-clock so a stuck/abandoned run auto-fails instead
-    # of lingering forever. Scrape execution_timeout is 2h (DEFAULT_ARGS) — 3h
-    # leaves headroom for the scrape + downstream validation tasks.
-    dagrun_timeout=timedelta(hours=3),
-    params={
-        'leagues': UNDERSTAT_LEAGUES,
-        # UI-configurable season for the 10-season backfill (#712, epic #708).
-        # Default = CURRENT_SEASON so the daily scheduled run is unchanged;
-        # override via "Trigger DAG w/ config" to ingest a past season.
-        'season': Param(
-            default=CURRENT_SEASON,
-            type='integer',
-            minimum=2000,
-            maximum=CURRENT_SEASON,
-            title='Season (start year)',
-            description=(
-                'APL season start year (2016 = 2016/17). Default = current '
-                'season for the daily run. Override here to backfill a past '
-                'season (2016…2019 closes the 10-season history). NB: '
-                'soccerdata #213 — the integer 2021 is read as slug 2021 '
-                '(=2020/21), so do NOT backfill 2021/22 via this Param (it '
-                'already exists as slug 2122).'
-            ),
-        ),
-    },
+    max_active_tasks=1,
+    dagrun_timeout=timedelta(hours=12),
+    render_template_as_native_obj=True,
+    tags=DAG_TAGS.get("understat", ["scraping", "understat", "bronze"]),
     doc_md="""
-    ## Understat Data Ingestion
+    ## Understat current ingestion
 
-    This DAG scrapes xG (expected goals) statistics from Understat.
-
-    ### Architecture
-
-    Uses BashOperator to run scraper in isolated subprocess,
-    preventing LocalExecutor fork memory issues.
-
-    ### Data Collected
-
-    - **Schedule**: Match dates, teams, scores with xG
-    - **Shots**: Individual shot events with coordinates and xG
-    - **Player Stats**: Season-level player xG/xA statistics
-    - **Team Stats**: Season-level team xG statistics
-
-    ### xG Data
-
-    Understat provides expected goals (xG) for:
-    - Individual shots based on shot location and type
-    - Aggregated player and team statistics
-
-    ### Notes
-
-    - Uses soccerdata library wrapper
-    - Written to Parquet fallback (PyIceberg disabled for stability)
+    The source catalog is discovered at runtime. One dynamically mapped task
+    ingests one exact league-season scope through the shared single-slot
+    scraper pool. The rolling two-season window automatically admits a new
+    season when Understat starts publishing it; expected pre-publication is an
+    explicit result state, never an empty successful partition.
     """,
 ) as dag:
-
-    scrape_data_task = BashOperator(
-        task_id='scrape_understat_data',
-        bash_command=f"""
-cd /opt/airflow && \\
-/opt/legacy-scraper-venv/bin/python dags/scripts/run_understat_scraper.py \\
-    --leagues "{leagues_str}" \\
-    --season {{{{ params.season }}}} \\
-    --output /tmp/understat_result.json
-""",
-        env={
-            'PYTHONPATH': '/opt/airflow:/opt/airflow/dags',
-            'PATH': '/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin',
-            'HOME': '/home/airflow',
+    plan_scopes = PythonOperator(
+        task_id="plan_current_scopes",
+        python_callable=plan_current_scopes,
+        op_kwargs={
+            "run_id": "{{ run_id }}",
         },
+        pool=INGEST_SCRAPER_POOL,
+        priority_weight=CURRENT_PRIORITY,
+        retries=1,
+        execution_timeout=timedelta(minutes=5),
+    )
+
+    run_scope = BashOperator.partial(
+        task_id="run_current_scope",
+        bash_command=RUN_SCOPE_COMMAND,
         append_env=True,
-    )
+        pool=INGEST_SCRAPER_POOL,
+        priority_weight=CURRENT_PRIORITY,
+        execution_timeout=timedelta(hours=3),
+    ).expand(env=plan_scopes.output)
 
-    validate_data_task = PythonOperator(
-        task_id='validate_data',
-        python_callable=validate_data,
+    validate_scope = PythonOperator.partial(
+        task_id="validate_current_scope",
+        python_callable=validate_scope_result,
+        retries=0,
+    ).expand(op_kwargs=plan_scopes.output)
 
-        trigger_rule='all_done',
-    )
+    plan_scopes >> run_scope >> validate_scope
 
-    # Issue #466: hard Trino COUNT(*) floors — run even if the scrape task
-    # failed (trigger_rule='all_done'), so an empty/wiped Bronze table can
-    # never pass silently. #920 Phase 2: floors are per league over the
-    # UNDERSTAT_LEAGUES scope (adding a league here requires backfilling it
-    # before the next scheduled run — the floor now fails loudly instead of
-    # the old silent whole-table gap).
-    validate_bronze_tasks = [
-        PythonOperator(
-            task_id=f'validate_{table}',
-            python_callable=validate_table,
-            op_args=[table, table, UNDERSTAT_LEAGUES],
-            trigger_rule='all_done',
-        )
-        for table in UNDERSTAT_BRONZE_TABLES
-    ]
 
-    scrape_data_task >> [validate_data_task, *validate_bronze_tasks]
+__all__ = [
+    "dag",
+    "plan_current_scopes",
+    "scope_environment",
+    "validate_scope_result",
+]

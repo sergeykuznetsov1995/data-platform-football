@@ -4,12 +4,11 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.understat_players
   description: |
-    Сезонные агрегаты игроков из Understat (soccerdata UnderstatScraper,
-    read_player_season_stats). Grain — один row на (player, team, season).
-    ВНИМАНИЕ: Bronze несёт ~×10 row-дублей upstream (особенность soccerdata) —
-    дедупликация выполняется в Silver через ROW_NUMBER; per-column non-NULL
-    дублями не затронут. Несёт xG-семейство (xG, xA, npxG, xGChain, xGBuildup).
-    Партиционирование ['league','season'].
+    Source-native сезонный league aggregate игроков Understat. Grain — один
+    row на (league, season, player_id). Для игрока с несколькими командами
+    team/team_id намеренно NULL, а исходные memberships сохранены в
+    source_team_title/source_team_ids; точные клубные splits находятся в
+    understat_player_team_season_stats. Несёт полное xG-семейство.
   tags:
     - Tier.Bronze
     - Domain.Football
@@ -19,6 +18,8 @@ columns:
     description: Лига (e.g. 'ENG-Premier League'); partition key.
   - name: season
     description: Сезон в формате Understat (e.g. '2526'); partition key.
+  - name: source_season_id
+    description: Исходный год начала сезона Understat.
   - name: player
     description: Имя игрока (PII.Low).
     tags:
@@ -29,6 +30,12 @@ columns:
     description: Название команды игрока.
   - name: team_id
     description: Understat team_id команды.
+  - name: source_team_title
+    description: Исходная строка team_title, включая несколько команд через запятую.
+  - name: source_team_ids
+    description: Understat team_id всех исходных memberships.
+  - name: is_multi_team
+    description: Игрок представлял несколько команд в этом league-season aggregate.
   - name: position
     description: Позиция игрока (e.g. F / M / D / GK / S).
   - name: matches
@@ -70,4 +77,4 @@ columns:
   - name: _ingested_at
     description: Timestamp ingest'а строки в Bronze; метаколонка.
   - name: _batch_id
-    description: Идентификатор батча ingest'а; метаколонка.
+    description: Общий publication batch для всех семи таблиц league-season scope.
