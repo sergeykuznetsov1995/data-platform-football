@@ -123,7 +123,7 @@ def test_missing_column_and_all_null_passthrough(patched_contract):
 
 
 # --- Understat contract presence guard (#277) ------------------------------
-# Regression guard: the 5 Understat bronze tables must stay in the contract so
+# Regression guard: all 7 native Understat Bronze tables must stay in the contract so
 # the --source understat audit keeps verifying full coverage.
 @pytest.mark.parametrize('table', [
     'understat_schedule',
@@ -131,9 +131,20 @@ def test_missing_column_and_all_null_passthrough(patched_contract):
     'understat_players',
     'understat_team_match_stats',
     'understat_player_match_stats',
+    'understat_player_team_season_stats',
+    'understat_team_season_breakdowns',
 ])
-def test_understat_contract_lists_all_five_tables(table):
+def test_understat_contract_lists_all_seven_tables(table):
     assert table in mod.EXPECTED_TABLES['understat']
+
+
+def test_understat_audit_contract_is_loaded_from_native_registry():
+    expected = {
+        contract.table_name: set(contract.required_columns) | mod.META_COLS
+        for contract in mod.UNDERSTAT_CONTRACT.TABLE_CONTRACTS
+    }
+
+    assert mod.EXPECTED_TABLES['understat'] == expected
 
 
 # --- WhoScored contract presence guard (#278) ------------------------------

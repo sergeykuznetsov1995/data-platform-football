@@ -113,6 +113,40 @@ WITH aliases AS (
         league
 ),
 
+understat_manifest_latest AS (
+    SELECT league, season, batch_id, status
+    FROM (
+        SELECT
+            league,
+            season,
+            batch_id,
+            status,
+            ROW_NUMBER() OVER (
+                PARTITION BY league, season
+                ORDER BY completed_at DESC, attempt_id DESC
+            ) AS rn
+        FROM iceberg.ops.understat_ingest_manifest_v1
+        WHERE contract_version = 'understat-bronze-v2'
+    )
+    WHERE rn = 1
+),
+
+understat_schedule_published AS (
+    SELECT s.*
+    FROM iceberg.bronze.understat_schedule s
+    LEFT JOIN understat_manifest_latest m
+      ON m.league = s.league
+     AND m.season = CAST(s.season AS varchar)
+    WHERE s.league IN (
+              'ENG-Premier League', 'ESP-La Liga', 'GER-Bundesliga',
+              'ITA-Serie A', 'FRA-Ligue 1'
+          )
+      AND (
+          m.league IS NULL
+          OR (m.status = 'complete' AND s._batch_id = m.batch_id)
+      )
+),
+
 league_map (competition_id, league) AS (
     -- #930 cutover: legacy bronze rows carried a `league` literal; native
     -- fotmob_matches_current carries only competition_id. The reverse map is
@@ -216,10 +250,10 @@ END AS season  -- year-start / WC direct → slug (#404 + #913)
     UNION
     -- ===== understat =====
     SELECT 'understat' AS source, home_team AS source_id, league, CAST(season AS varchar) AS season
-      FROM iceberg.bronze.understat_schedule WHERE home_team IS NOT NULL
+      FROM understat_schedule_published WHERE home_team IS NOT NULL
     UNION
     SELECT 'understat' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
-      FROM iceberg.bronze.understat_schedule WHERE away_team IS NOT NULL
+      FROM understat_schedule_published WHERE away_team IS NOT NULL
 
     UNION
     -- ===== whoscored (using schedule, not events) =====

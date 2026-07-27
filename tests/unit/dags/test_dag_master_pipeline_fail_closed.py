@@ -46,6 +46,18 @@ def test_whoscored_scheduled_failure_is_not_an_allowed_success_state():
     assert whoscored._init_kwargs["check_existence"] is True
 
 
+def test_understat_scheduled_failure_is_not_an_allowed_success_state():
+    _reload_master()
+    understat = _task("wait_for_scheduled_understat")
+
+    assert understat._init_kwargs["external_dag_id"] == "dag_ingest_understat"
+    assert understat._init_kwargs["allowed_states"] == ["success"]
+    assert understat._init_kwargs["failed_states"] == ["failed"]
+    assert understat._init_kwargs["execution_delta"].total_seconds() == 5 * 3600
+    assert understat._init_kwargs["mode"] == "reschedule"
+    assert understat._init_kwargs["check_existence"] is True
+
+
 def test_fotmob_child_failure_is_not_an_allowed_success_state():
     module = _reload_master()
     fotmob = _task("ingestion_triggers.trigger_fotmob")
@@ -118,6 +130,7 @@ def test_isolated_owner_requires_skipped_shared_trigger_and_gate_evidence():
         **{
             module.FOTMOB_OWNER_GATE_TASK_ID: "success",
             "ingestion_triggers.trigger_fotmob": "skipped",
+            "wait_for_scheduled_understat": "success",
             "wait_for_scheduled_whoscored": "success",
         }
     )
@@ -127,6 +140,7 @@ def test_isolated_owner_requires_skipped_shared_trigger_and_gate_evidence():
         fotmob_schedule_owner="isolated",
     ) == {
         "dag_ingest_fotmob": "isolated_owner",
+        "dag_ingest_understat": "success",
         "dag_ingest_whoscored": "success",
     }
 
@@ -146,6 +160,7 @@ def test_isolated_owner_rejects_overlap_or_missing_gate(
         **{
             module.FOTMOB_OWNER_GATE_TASK_ID: gate_state,
             "ingestion_triggers.trigger_fotmob": trigger_state,
+            "wait_for_scheduled_understat": "success",
             "wait_for_scheduled_whoscored": "success",
         }
     )
@@ -165,6 +180,7 @@ def test_shared_owner_rejects_skipped_fotmob_trigger():
             dag_run=_dag_run(
                 **{
                     "ingestion_triggers.trigger_fotmob": "skipped",
+                    "wait_for_scheduled_understat": "success",
                     "wait_for_scheduled_whoscored": "success",
                 }
             ),
@@ -206,11 +222,11 @@ def test_required_source_gate_waits_for_all_ingestion_and_blocks_transforms():
     expected_ingestion = {
         "ingestion_triggers.trigger_fotmob",
         "ingestion_triggers.trigger_matchhistory",
-        "ingestion_triggers.trigger_understat",
         "ingestion_triggers.trigger_espn",
         "ingestion_triggers.trigger_clubelo",
     }
     assert expected_ingestion <= gate.upstream_task_ids
+    assert "wait_for_scheduled_understat" in gate.upstream_task_ids
     assert "wait_for_scheduled_whoscored" in gate.upstream_task_ids
     assert "ingestion_triggers.trigger_whoscored" not in gate.upstream_task_ids
     assert "ingestion_triggers.trigger_fbref" not in gate.upstream_task_ids
@@ -433,6 +449,7 @@ def test_required_source_gate_rejects_every_non_success_state(state):
     run = _dag_run(
         **{
             "ingestion_triggers.trigger_fotmob": "success",
+            "wait_for_scheduled_understat": "success",
             "wait_for_scheduled_whoscored": state,
         }
     )
@@ -453,12 +470,14 @@ def test_required_source_gate_accepts_exact_current_master_success():
     run = _dag_run(
         **{
             "ingestion_triggers.trigger_fotmob": "success",
+            "wait_for_scheduled_understat": "success",
             "wait_for_scheduled_whoscored": "success",
         }
     )
 
     assert module.enforce_required_source_success(dag_run=run) == {
         "dag_ingest_fotmob": "success",
+        "dag_ingest_understat": "success",
         "dag_ingest_whoscored": "success",
     }
 
@@ -591,6 +610,7 @@ def test_terminal_check_rejects_failed_downstream_publication():
     run = _dag_run(
         **{
             "ingestion_triggers.trigger_fotmob": "success",
+            "wait_for_scheduled_understat": "success",
             "wait_for_scheduled_whoscored": "success",
             "wait_for_scheduled_fbref": "success",
             "trigger_xref_transforms": "success",

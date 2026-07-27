@@ -1,0 +1,73 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.understat_player_team_season_stats
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.understat_player_team_season_stats
+  description: |
+    Source-native клубные сезонные splits из getTeamData Understat. Grain —
+    один row на (league, season, team_id, player_id). Это authoritative
+    membership-таблица для multi-team игроков и xref_player; содержит полное
+    семейство goals/xG/xA/xGChain/xGBuildup. Партиционирование league, season.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: league_id
+    description: Внутренний идентификатор лиги Understat.
+  - name: league
+    description: Каноническая лига; partition key.
+  - name: season_id
+    description: Внутренний идентификатор сезона Understat.
+  - name: season
+    description: Канонический четырёхзначный season slug; partition key.
+  - name: source_season_id
+    description: Исходный год начала сезона Understat.
+  - name: team_id
+    description: Understat team_id; часть natural key.
+  - name: team
+    description: Название команды Understat.
+  - name: player_id
+    description: Understat player_id; часть natural key.
+  - name: player
+    description: Имя игрока.
+    tags:
+      - PII.Low
+  - name: position
+    description: Позиция игрока в исходном team-season split.
+  - name: matches
+    description: Матчи игрока за эту команду в сезоне.
+  - name: minutes
+    description: Минуты игрока за эту команду в сезоне.
+  - name: goals
+    description: Голы игрока за эту команду в сезоне.
+  - name: xg
+    description: Expected goals за team split.
+  - name: np_goals
+    description: Голы без пенальти за team split.
+  - name: np_xg
+    description: Expected goals без пенальти за team split.
+  - name: assists
+    description: Голевые передачи за team split.
+  - name: xa
+    description: Expected assists за team split.
+  - name: shots
+    description: Удары за team split.
+  - name: key_passes
+    description: Ключевые передачи за team split.
+  - name: yellow_cards
+    description: Жёлтые карточки за team split.
+  - name: red_cards
+    description: Красные карточки за team split.
+  - name: xg_chain
+    description: Суммарный xGChain за team split.
+  - name: xg_buildup
+    description: Суммарный xGBuildup за team split.
+  - name: _batch_id
+    description: Общий publication batch для всех семи таблиц league-season scope.
+  - name: _source
+    description: Источник данных understat.
+  - name: _entity_type
+    description: Тип нормализованной сущности.
+  - name: _ingested_at
+    description: UTC timestamp записи в Bronze.

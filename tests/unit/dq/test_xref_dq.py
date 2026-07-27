@@ -867,6 +867,9 @@ def test_default_player_dob_projections_use_stable_canonical_readers():
 
 def test_default_freshness_relations_exclude_frozen_fotmob_legacy():
     relations = dict(xref_dq.DEFAULT_FRESHNESS_BRONZE_TABLES)
+    assert relations['understat'] == (
+        'iceberg.bronze.understat_player_team_season_stats'
+    )
     assert relations['fotmob'] == (
         'iceberg.silver.fotmob_player_season_profile'
     )
@@ -875,6 +878,21 @@ def test_default_freshness_relations_exclude_frozen_fotmob_legacy():
         xref_dq._FRESHNESS_TS_COLUMN_BY_RELATION[relations['fotmob']]
         == '_bronze_ingested_at'
     )
+
+
+def test_understat_freshness_uses_the_same_manifest_cutover_as_resolver():
+    sql = xref_dq._freshness_source_sql(
+        'understat',
+        'iceberg.bronze.understat_player_team_season_stats',
+        '_ingested_at',
+    )
+
+    assert 'iceberg.ops.understat_ingest_manifest_v1' in sql
+    assert "contract_version = 'understat-bronze-v2'" in sql
+    assert "m.status = 'complete'" in sql
+    assert 'p._batch_id = m.batch_id' in sql
+    assert 'iceberg.bronze.understat_players' in sql
+    assert 'm.league IS NULL' in sql
 
 
 def _seed_dob_conflict_fixture(duck_conn, tm_dob: str):

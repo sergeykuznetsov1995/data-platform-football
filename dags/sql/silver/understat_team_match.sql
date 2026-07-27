@@ -29,19 +29,48 @@
 --   * Season convention: passthrough varchar slug ('2526') — matches xref_team.
 -- =============================================================================
 
-WITH bronze_dedup AS (
+WITH understat_manifest_latest AS (
+    SELECT league, season, batch_id, status
+    FROM (
+        SELECT
+            league,
+            season,
+            batch_id,
+            status,
+            ROW_NUMBER() OVER (
+                PARTITION BY league, season
+                ORDER BY completed_at DESC, attempt_id DESC
+            ) AS rn
+        FROM iceberg.ops.understat_ingest_manifest_v1
+        WHERE contract_version = 'understat-bronze-v2'
+    )
+    WHERE rn = 1
+),
+
+bronze_dedup AS (
     SELECT *
     FROM (
         SELECT
             b.*,
             ROW_NUMBER() OVER (
-                PARTITION BY game_id, league, season
-                ORDER BY _ingested_at DESC
+                PARTITION BY b.game_id, b.league, b.season
+                ORDER BY b._ingested_at DESC
             ) AS rn
         FROM iceberg.bronze.understat_team_match_stats b
-        WHERE game_id      IS NOT NULL
-          AND home_team_id IS NOT NULL
-          AND away_team_id IS NOT NULL
+        LEFT JOIN understat_manifest_latest m
+          ON m.league = b.league
+         AND m.season = CAST(b.season AS varchar)
+        WHERE b.game_id      IS NOT NULL
+          AND b.home_team_id IS NOT NULL
+          AND b.away_team_id IS NOT NULL
+          AND b.league IN (
+              'ENG-Premier League', 'ESP-La Liga', 'GER-Bundesliga',
+              'ITA-Serie A', 'FRA-Ligue 1'
+          )
+          AND (
+              m.league IS NULL
+              OR (m.status = 'complete' AND b._batch_id = m.batch_id)
+          )
     )
     WHERE rn = 1
 ),

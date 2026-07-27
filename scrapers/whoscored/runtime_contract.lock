@@ -25,7 +25,7 @@
     "dags/scripts/whoscored_rollout_acceptance.py": "73df8b5d3f904a3b9b965ced4c3d32e6fe7c14c3f067d0a9b9bb5a4564ecb895",
     "dags/utils/__init__.py": "58ffcd31e139fd39bed5ac90339ac4e3080afa404575a2126fe92010c219eb00",
     "dags/utils/alerts.py": "47968272b21abd26d3b670e661bb6fc41ee1605542583cfa9cc07cf197086bdc",
-    "dags/utils/config.py": "e7a973667c6b3d0f17575b5f6213a6b8a75c4896b16dbe3239b3ef1a427e4b16",
+    "dags/utils/config.py": "df91f3f6dcd1d9c0f849721f4e33e6df3d1240c7176d55e4361a8fc340d2bb78",
     "dags/utils/default_args.py": "a9fe403b9529e9562e58b012467bff51bfeb6ceb9388214182ddebd393e2b9c8",
     "dags/utils/maintenance_tasks.py": "170800459879f390c6ed1fb374c87a488402c295c0c3abe04725c965e04c66a6",
     "dags/utils/silver_tasks.py": "07ac23eba081b14944dd0e81090c7f832c21e6ee69b22ebb0d02fbc059af8720",

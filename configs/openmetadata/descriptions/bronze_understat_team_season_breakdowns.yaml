@@ -1,0 +1,58 @@
+# =============================================================================
+# OpenMetadata description: iceberg.bronze.understat_team_season_breakdowns
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.understat_team_season_breakdowns
+  description: |
+    Long-form source-native statistics из getTeamData Understat. Grain — один
+    row на (league, season, team_id, dimension, category). Сохраняет все
+    исходные breakdown dimensions (situation, formation, gameState, timing,
+    shotZone, attackSpeed, result) и зеркальные against metrics без потери
+    source shape. Партиционирование league, season.
+  tags:
+    - Tier.Bronze
+    - Domain.Football
+    - PII.None
+columns:
+  - name: league_id
+    description: Внутренний идентификатор лиги Understat.
+  - name: league
+    description: Каноническая лига; partition key.
+  - name: season_id
+    description: Внутренний идентификатор сезона Understat.
+  - name: season
+    description: Канонический четырёхзначный season slug; partition key.
+  - name: source_season_id
+    description: Исходный год начала сезона Understat.
+  - name: team_id
+    description: Understat team_id; часть natural key.
+  - name: team
+    description: Название команды Understat.
+  - name: dimension
+    description: Source breakdown dimension.
+  - name: category
+    description: Категория внутри dimension; часть natural key.
+  - name: source_stat
+    description: Исходный stat label Understat, если присутствует.
+  - name: minutes
+    description: Время в категории.
+  - name: shots
+    description: Удары команды в категории.
+  - name: goals
+    description: Голы команды в категории.
+  - name: xg
+    description: xG команды в категории.
+  - name: against_shots
+    description: Удары соперников в категории.
+  - name: against_goals
+    description: Голы соперников в категории.
+  - name: against_xg
+    description: xG соперников в категории.
+  - name: _batch_id
+    description: Общий publication batch для всех семи таблиц league-season scope.
+  - name: _source
+    description: Источник данных understat.
+  - name: _entity_type
+    description: Тип нормализованной сущности.
+  - name: _ingested_at
+    description: UTC timestamp записи в Bronze.

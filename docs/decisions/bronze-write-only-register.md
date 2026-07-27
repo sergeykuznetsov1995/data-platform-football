@@ -23,7 +23,7 @@ Per-table verdict vocabulary (from #476):
 
 ---
 
-## 1. Register (3 live write-only tables; audit 2026-06-15, +1 found in R5 review 2026-07-03; 4 SoFIFA via #601 + 4 FotMob via #600 + 3 Capology via #603 CONSUMED, 2026-06-17)
+## 1. Register (4 live write-only tables; native Understat contract added 2026-07-27)
 
 Cost class = cost of *stopping* the scrape. **FREE** = by-product of a request made anyway
 (removing it saves only HDFS/snapshots, not HTTP); **CHEAP** = 1 HTTP; **EXPENSIVE** =
@@ -34,6 +34,7 @@ per-item/per-season HTTP.
 | `whoscored_season_stages` | FREE (same session as `scrape_schedule`, soccerdata cache) | ⚠ `stage` all-NULL; 6 rows | (b) keep | — (§3) |
 | `clubelo_team_history` | MODERATE (per-team histories) | no `rank`/`league`; **219,861 rows** (largest unread) | **(c) stop** | [#604] |
 | `fbref_match_keeper_stats` | FREE (parsed from the same match page as `combined_match_data`, `data_readers.py:1107`) | per-match GK stats (SoTA/GA/saves/save%); 7,677 rows; found in R5 review — was never registered | **(b) future** (per-match keeper block is absent from Gold entirely) | [#870] |
+| `understat_team_season_breakdowns` | FREE (same `getTeamData` responses required by consumed `understat_player_team_season_stats`) | source-faithful long form across seven dimensions with `against_*`; seven-table scope DQ requires it | **(b) keep** (unique source data; requested production contract) | — (§3) |
 
 ### Resolved since the 2026-06-11 inventory
 
@@ -108,7 +109,7 @@ direct team payroll should supplement/replace the salary-sum wage bill is a trac
 
 ## 3. Free by-product kept without an issue
 
-One table is a **free by-product** of a request made for another, needed table, so "stop
+Two tables are **free by-products** of requests made for other, needed tables, so "stop
 scraping" would remove a parse+save but **not** the HTTP call — near-zero saving. Kept and
 documented here; no tracking issue (avoids p3 issue-spam):
 
@@ -117,6 +118,12 @@ documented here; no tracking issue (avoids p3 issue-spam):
   soccerdata reader caches the tournament page, so no extra HTTP in practice. The `stage`
   column is all-NULL for the in-scope single-stage leagues. Free; kept for the day a
   multi-stage competition enters scope.
+- **`understat_team_season_breakdowns`** — parsed from the same native
+  `getTeamData/{team}/{season}` payload that produces the consumed
+  `understat_player_team_season_stats` membership splits. It preserves every
+  current source dimension/category and is part of the seven-entity exact-scope
+  publication gate; dropping the table would save no HTTP and would discard
+  unique source data.
 
 > **Correction (2026-06-15):** `fbref_keeper_keeper_adv` was initially placed here as a "free
 > by-product of `keeper`". That was **wrong** — `KEEPER_STAT_TYPES = ['keeper','keeper_adv']`
@@ -212,6 +219,7 @@ gap tracked as followup [#738].
 
 | 2026-06-20 | §5 added — Gold→Bronze one-hop audit (#704): `fct_shot` lifted to `silver.understat_shots` (was direct `bronze.understat_shots` + `understat_players`; only the `understat_schedule` match bridge kept in Gold); `fct_event` documented as a sanctioned `team_id→name` bridge (SQL unchanged); `fct_standings` already Silver (#702); `dim_venue` (#735) + `whoscored_events` data reads in `fct_match_timeline`/`fct_team_season_stats` (#736) filed as followups. | #704 |
 | 2026-07-03 | R5 medallion-loss review: `fbref_match_keeper_stats` added — live prod producer (`data_readers.py:1107`), 0 Silver/Gold readers, was never in the register or the #476 inventory; verdict (b) future. `whoscored_player_profile` checked and NOT added: it has a live `dags/utils` reader (`xref_player_resolver.py`), which counts per §2. 2 → 3 live write-only. | `docs/research/R5_medallion_loss_review.md` |
+| 2026-07-27 | Native Understat seven-table contract added. `understat_player_team_season_stats` is consumed by `xref_player_resolver`; `understat_team_season_breakdowns` is a free parse of the same team payload and retained as unique source data + exact-scope DQ evidence. 3 → 4 live write-only. | `docs/operations/understat-production.md` |
 | 2026-06-21 | §5 followups resolved — `fct_match_timeline` (raw card/sub/goal fallback) + `fct_team_season_stats.j2` (penalty data, #161) lifted off `bronze.whoscored_events` to `silver.whoscored_events_spadl` via its audit columns (`_action_source_note` = orig WhoScored type, `qualifiers_raw` = raw JSON). Silver extended with 4 raw passthrough cols (`team_name_raw`, `related_player_id_raw`, `minute`, `second`) so the timeline keeps byte-identical classification. Only the `whoscored_schedule` bridges remain (norm). | #736 |
 
 [#476]: https://github.com/sergeykuznetsov1995/data-platform-football/issues/476

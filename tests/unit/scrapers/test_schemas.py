@@ -2,7 +2,6 @@
 Tests for schema definitions.
 """
 
-import pytest
 import pyarrow as pa
 
 
@@ -97,34 +96,6 @@ class TestFBrefSchemas:
         assert 'wins' in field_names
         assert 'losses' in field_names
         assert 'points' in field_names
-
-
-class TestUnderstatSchemas:
-    """Tests for Understat schema definitions."""
-
-    def test_shots_schema(self):
-        """Test Understat shots schema."""
-        from scrapers.schemas.understat import UNDERSTAT_SHOTS_SCHEMA
-
-        field_names = [f.name for f in UNDERSTAT_SHOTS_SCHEMA]
-
-        assert 'x' in field_names
-        assert 'y' in field_names
-        assert 'xg' in field_names
-        assert 'result' in field_names
-        assert 'situation' in field_names
-        assert 'shot_type' in field_names
-
-    def test_players_schema(self):
-        """Test Understat players schema."""
-        from scrapers.schemas.understat import UNDERSTAT_PLAYERS_SCHEMA
-
-        field_names = [f.name for f in UNDERSTAT_PLAYERS_SCHEMA]
-
-        assert 'player' in field_names
-        assert 'xg' in field_names
-        assert 'xa' in field_names
-        assert 'xg_chain' in field_names
 
 
 class TestWhoScoredSchemas:

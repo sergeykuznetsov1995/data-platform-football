@@ -4,8 +4,9 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.understat_player_match_stats
   description: |
-    Статистика игроков по матчам из Understat (soccerdata UnderstatScraper,
-    read_player_match_stats). Grain — один row на (match, player). Per-match
+    Source-native roster-статистика getMatchData Understat. Grain — один row
+    на (match, team, player); дубли roster entries детерминированно свёрнуты,
+    а исходные IDs сохранены. Per-match
     xG-семейство (xG, xA, npxG-вклад через xGChain/xGBuildup), минуты, голы,
     ассисты, удары, ключевые передачи, карточки. Партиционирование
     ['league','season'].
@@ -18,6 +19,8 @@ columns:
     description: Лига (e.g. 'ENG-Premier League'); partition key.
   - name: season
     description: Сезон в формате Understat (e.g. '2526'); partition key.
+  - name: source_season_id
+    description: Исходный год начала сезона Understat.
   - name: game_id
     description: Числовой Understat match_id.
   - name: game
@@ -32,6 +35,8 @@ columns:
     description: Название команды игрока в этом матче.
   - name: team_id
     description: Understat team_id команды.
+  - name: team_side
+    description: Сторона roster в исходном match payload (h/a).
   - name: position
     description: Позиция игрока в матче (e.g. FW / Sub / GK).
   - name: position_id
@@ -60,6 +65,14 @@ columns:
     description: Красные карточки в матче.
   - name: own_goals
     description: Автоголы в матче.
+  - name: roster_entry_id
+    description: Выбранный наиболее информативный исходный roster row id.
+  - name: roster_entry_ids
+    description: Все исходные roster row IDs, объединённые в эту player-match строку.
+  - name: roster_in
+    description: Source roster entry id входа на замену, если применимо.
+  - name: roster_out
+    description: Source roster entry id выхода на замену, если применимо.
   - name: league_id
     description: Внутренний идентификатор лиги Understat.
   - name: season_id
@@ -71,4 +84,4 @@ columns:
   - name: _ingested_at
     description: Timestamp ingest'а строки в Bronze; метаколонка.
   - name: _batch_id
-    description: Идентификатор батча ingest'а; метаколонка.
+    description: Общий publication batch для всех семи таблиц league-season scope.

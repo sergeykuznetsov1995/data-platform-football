@@ -1098,7 +1098,7 @@ def evaluate_manager_dob_collisions(
 #: native-backed Silver relation consumed by the resolver, not the stopped
 #: legacy Bronze feed. Tuple shape is kept for caller compatibility.
 DEFAULT_FRESHNESS_BRONZE_TABLES = (
-    ('understat', 'iceberg.bronze.understat_players'),
+    ('understat', 'iceberg.bronze.understat_player_team_season_stats'),
     ('fotmob', 'iceberg.silver.fotmob_player_season_profile'),
 )
 
@@ -1107,6 +1107,74 @@ DEFAULT_FRESHNESS_BRONZE_TABLES = (
 _FRESHNESS_TS_COLUMN_BY_RELATION = {
     'iceberg.silver.fotmob_player_season_profile': '_bronze_ingested_at',
 }
+
+
+def _freshness_source_sql(
+    source_label: str,
+    relation: str,
+    timestamp_column: str,
+) -> str:
+    """Render the per-season freshness query for one resolver input.
+
+    Understat needs the same publication fence as the resolver itself: native
+    player/team splits are visible only for the latest complete v2 batch, while
+    the legacy aggregate remains visible only until a scope gets its first v2
+    manifest attempt. Other sources retain the generic relation scan.
+    """
+
+    if (
+        source_label == 'understat'
+        and relation
+        == 'iceberg.bronze.understat_player_team_season_stats'
+    ):
+        return """
+            WITH understat_manifest_latest AS (
+                SELECT league, season, batch_id, status
+                FROM (
+                    SELECT
+                        league,
+                        season,
+                        batch_id,
+                        status,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY league, season
+                            ORDER BY completed_at DESC, attempt_id DESC
+                        ) AS rn
+                    FROM iceberg.ops.understat_ingest_manifest_v1
+                    WHERE contract_version = 'understat-bronze-v2'
+                )
+                WHERE rn = 1
+            ),
+            published_players AS (
+                SELECT p.season, p._ingested_at
+                FROM iceberg.bronze.understat_player_team_season_stats p
+                JOIN understat_manifest_latest m
+                  ON m.league = p.league
+                 AND m.season = CAST(p.season AS varchar)
+                 AND m.status = 'complete'
+                 AND p._batch_id = m.batch_id
+
+                UNION ALL
+
+                SELECT p.season, p._ingested_at
+                FROM iceberg.bronze.understat_players p
+                LEFT JOIN understat_manifest_latest m
+                  ON m.league = p.league
+                 AND m.season = CAST(p.season AS varchar)
+                WHERE m.league IS NULL
+            )
+            SELECT CAST(season AS varchar) AS season_str,
+                   MAX(_ingested_at) AS bronze_max
+            FROM published_players
+            GROUP BY season
+        """
+
+    return (
+        "SELECT CAST(season AS varchar) AS season_str, "
+        f"       MAX({timestamp_column}) AS bronze_max "
+        f"FROM {relation} "
+        "GROUP BY season"
+    )
 
 
 def evaluate_bronze_xref_freshness_gap(
@@ -1189,10 +1257,11 @@ def evaluate_bronze_xref_freshness_gap(
                     bronze_qualified, '_ingested_at'
                 )
                 cur.execute(
-                    "SELECT CAST(season AS varchar) AS season_str, "
-                    f"       MAX({ts_column}) AS bronze_max "
-                    f"FROM {bronze_qualified} "
-                    "GROUP BY season"
+                    _freshness_source_sql(
+                        source_label,
+                        bronze_qualified,
+                        ts_column,
+                    )
                 )
                 for season_str, bronze_max in cur.fetchall():
                     if bronze_max is None or xref_max is None:
