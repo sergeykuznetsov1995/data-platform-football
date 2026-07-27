@@ -1683,6 +1683,22 @@ class TransfermarktScraper(BaseScraper):
             if record.status in (FetchStatus.OK, FetchStatus.VALID_EMPTY):
                 self._materialization_failure_streak = 0
 
+    def _bronze_scope_has_roster(self, league: str, season_short: str) -> bool:
+        """True when Bronze already knows participants for this scope.
+
+        #1025 guard: an edition that once had a roster cannot silently become
+        authoritative-empty — that would orphan the committed rows and hide a
+        source-side regression. Unreadable/absent native tables count as "no
+        roster" so the empty-shell path stays available during rollout.
+        """
+
+        try:
+            return bool(
+                self._resolve_player_ids_from_bronze(league, season_short)
+            )
+        except Exception:  # noqa: BLE001 - rollout: native tables may be absent
+            return False
+
     def _mark_authoritative_empty(self, label: str, context: Dict) -> None:
         """Mark a schema-valid source collection that is itself empty."""
 
@@ -2189,10 +2205,12 @@ class TransfermarktScraper(BaseScraper):
             )
             if _listing_page_is_empty_shell(
                 listing_html, scope['competition_id'],
-            ):
+            ) and not self._bronze_scope_has_roster(league, season_short):
                 # #1025: the source shows this competition/edition with no
                 # participant listing at all — an authoritative empty scope,
-                # not selector drift.
+                # not selector drift. A scope that already has a Bronze
+                # roster stays on the loud schema_error path below: a
+                # populated edition cannot silently become empty.
                 self._scope_capture['listing_status'] = 'authoritative_empty'
                 self._mark_authoritative_empty(
                     'listing', {'league': league, 'season': season},
@@ -2575,6 +2593,8 @@ class TransfermarktScraper(BaseScraper):
             if not clubs:
                 if _listing_page_is_empty_shell(
                     listing_html, scope['competition_id'],
+                ) and not self._bronze_scope_has_roster(
+                    league, scope['canonical_season'],
                 ):
                     # #1025: same empty-shell competition page as in
                     # read_squad_data — an authoritative empty scope.

@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -1943,3 +1945,31 @@ def test_empty_listing_scope_completes_and_flags_follow_up_entities(tmp_path):
     assert all(
         flags[entity] == 'true' for entity in cycle.ENTITY_ORDER[1:]
     )
+
+
+def test_runner_environment_never_inherits_listing_empty_flag(tmp_path):
+    """#1025: the wrapper's own env cannot leak the flag into a scope."""
+
+    payload = _payload(tmp_path)
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    identity = cycle._scope_identity(args)
+
+    packets = {
+        action: SimpleNamespace(
+            packet_id=f'{action}-packet', packet_hash='0' * 64,
+        )
+        for action in ('paid_proxy', 'production_write')
+    }
+    with mock.patch.dict(
+        os.environ, {'TM_LISTING_AUTHORITATIVE_EMPTY': 'true'},
+    ):
+        clean = cycle._runner_environment(
+            identity, args, packets, 'players', 1,
+        )
+        flagged = cycle._runner_environment(
+            identity, args, packets, 'transfers', 1,
+            listing_authoritative_empty=True,
+        )
+    assert 'TM_LISTING_AUTHORITATIVE_EMPTY' not in clean
+    assert flagged['TM_LISTING_AUTHORITATIVE_EMPTY'] == 'true'

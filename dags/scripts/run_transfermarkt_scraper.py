@@ -636,6 +636,26 @@ def _classify_fallback(scraper) -> str:
     return f'http_{status}'
 
 
+def _hard_fetch_statuses(scraper) -> set:
+    """Terminal failure statuses observed by this run's fetch layer.
+
+    #1025: the listing-empty completion may only commit when the run saw no
+    hard failure — a transient outage must stay a loud, retryable fallback
+    instead of being recorded as authoritative emptiness.
+    """
+
+    statuses: set = set()
+    try:
+        outcomes = scraper.get_fetch_outcomes()
+        for endpoint in (outcomes or {}).values():
+            for item in (endpoint or {}).values():
+                if isinstance(item, Mapping):
+                    statuses.add(item.get('status'))
+    except Exception:  # noqa: BLE001 - treat unknown evidence as hard
+        return {'unknown'}
+    return statuses & {'schema_error', 'blocked', 'retry_exhausted'}
+
+
 def _fallback_exit_code(reason: str) -> int:
     hard = (
         reason.startswith('http_')
@@ -3424,6 +3444,12 @@ def _run_entity(
             results['provider_byte_grant'] = effective_bytes
             results['cycle_budget'] = dict(cycle_budget)
         response_cache, cache_path, cache_ttl = _load_response_cache()
+        # #1025: set by run_transfermarkt_scope_cycle for the entities that
+        # follow players once the participant listing proved authoritatively
+        # empty — there is no roster to resolve and nothing paid to fetch.
+        listing_empty_env = os.environ.get(
+            'TM_LISTING_AUTHORITATIVE_EMPTY', '',
+        ).strip().lower() == 'true'
         with TransfermarktScraper(
             leagues=[league], seasons=[season], proxy_file=proxy_file,
             retry_budget=retry_budget,
@@ -3433,13 +3459,22 @@ def _run_entity(
         ) as scraper:
             if spec.state_endpoint:
                 checkpoint_spec = spec
-                (
-                    selected, cache_hits, seeded, career_hydrate_ids, coverage,
-                ) = _select_player_ids(
-                    scraper, spec, league, season, int(limit), window_offset,
-                    refresh_mode, run_key, allow_state_writes=not dry_run,
-                    legacy_materialization_required=legacy_write_enabled,
-                )
+                if listing_empty_env:
+                    # #1025: an authoritatively empty listing has no roster;
+                    # skip resolution so _EmptyRosterError cannot fire and the
+                    # empty frames reach the listing-empty completion below.
+                    selected, cache_hits, seeded = [], 0, 0
+                    career_hydrate_ids, coverage = [], {}
+                else:
+                    (
+                        selected, cache_hits, seeded, career_hydrate_ids,
+                        coverage,
+                    ) = _select_player_ids(
+                        scraper, spec, league, season, int(limit),
+                        window_offset, refresh_mode, run_key,
+                        allow_state_writes=not dry_run,
+                        legacy_materialization_required=legacy_write_enabled,
+                    )
                 results['cache_hits'] = cache_hits
                 results['bootstrap_seeded_keys'] = seeded
                 results['roster_coverage'] = coverage
@@ -3464,6 +3499,11 @@ def _run_entity(
                     )
             elif (
                 spec.name == ENTITY_COACHES
+                # #1025: with an authoritatively empty listing there are no
+                # coach memberships to load (the loader refuses an empty club
+                # scope); the legacy path below re-verifies the empty shell
+                # against the live page instead.
+                and not listing_empty_env
                 and native_write_enabled
                 and _native_available(scraper, spec.native_reader)
             ):
@@ -3495,6 +3535,15 @@ def _run_entity(
                     scraper, coach_cached_ids,
                 )
 
+            if spec.name == ENTITY_COACHES and listing_empty_env:
+                # #1025: keep _read_frames from re-loading memberships (the
+                # loader refuses an empty club scope). An empty frame routes
+                # read_coach_data to the legacy listing path, which
+                # re-verifies the empty shell against the live page.
+                import pandas as pd
+
+                coach_memberships = pd.DataFrame()
+
             if checkpoint_spec is not None:
                 coach_cache_has_rows = bool(
                     coach_cache_frames is not None
@@ -3509,6 +3558,7 @@ def _run_entity(
                 )
                 if (
                     selected == []
+                    and not listing_empty_env
                     and not coach_cache_has_rows
                     and not career_cache_has_rows
                 ):
@@ -3745,9 +3795,10 @@ def _run_entity(
                 listing_empty = (
                     (results.get('scope_capture') or {}).get('listing_status')
                     == 'authoritative_empty'
-                    or os.environ.get(
-                        'TM_LISTING_AUTHORITATIVE_EMPTY', '',
-                    ).strip().lower() == 'true'
+                    # The env flag alone is not proof: a transient fetch
+                    # failure inside a flagged cycle must stay a loud,
+                    # retryable fallback, not become recorded emptiness.
+                    or (listing_empty_env and not _hard_fetch_statuses(scraper))
                 )
                 if listing_empty:
                     # #1025: the source renders no participant listing for

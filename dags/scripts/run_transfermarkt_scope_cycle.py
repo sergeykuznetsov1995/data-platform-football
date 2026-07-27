@@ -869,6 +869,9 @@ def _runner_environment(
         # authoritatively empty; the entities that follow in this cycle
         # must terminate as authoritative_empty instead of hard-failing.
         env['TM_LISTING_AUTHORITATIVE_EMPTY'] = 'true'
+    else:
+        # Never inherit the flag from the wrapper's own environment.
+        env.pop('TM_LISTING_AUTHORITATIVE_EMPTY', None)
     approval_context = {
         action: {
             'packet_id': packet.packet_id,

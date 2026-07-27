@@ -1922,3 +1922,38 @@ class TestEmptyShellListing:
             'ENG-Premier League:2025'
         ]
         assert record['status'] == 'valid_empty'
+
+    def test_populated_scope_cannot_become_authoritative_empty(
+        self, monkeypatch,
+    ):
+        scraper = TransfermarktScraper()
+        monkeypatch.setattr(
+            scraper, '_fetch_html',
+            lambda *args, **kwargs: self._shell('GB1'),
+        )
+        monkeypatch.setattr(
+            scraper, '_bronze_scope_has_roster',
+            lambda league, season_short: True,
+        )
+
+        bundle = scraper.read_squad_data('ENG-Premier League', 2025)
+
+        assert scraper.get_scope_capture()['listing_status'] == 'schema_error'
+        assert bundle['memberships'].empty
+
+    def test_bronze_roster_guard_defaults_open_on_lookup_failure(
+        self, monkeypatch,
+    ):
+        scraper = TransfermarktScraper()
+        monkeypatch.setattr(
+            scraper, '_resolve_player_ids_from_bronze',
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError('native tables absent'),
+            ),
+        )
+        assert scraper._bronze_scope_has_roster('ENG-Premier League', '2526') is False
+        monkeypatch.setattr(
+            scraper, '_resolve_player_ids_from_bronze',
+            lambda *args, **kwargs: ['7'],
+        )
+        assert scraper._bronze_scope_has_roster('ENG-Premier League', '2526') is True
