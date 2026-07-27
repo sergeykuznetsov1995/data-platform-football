@@ -3742,6 +3742,74 @@ def _run_entity(
                         results['dry_run'] = True
                     exit_code = 0
                     raise _EntityRunComplete(exit_code)
+                listing_empty = (
+                    (results.get('scope_capture') or {}).get('listing_status')
+                    == 'authoritative_empty'
+                    or os.environ.get(
+                        'TM_LISTING_AUTHORITATIVE_EMPTY', '',
+                    ).strip().lower() == 'true'
+                )
+                if listing_empty:
+                    # #1025: the source renders no participant listing for
+                    # this competition/edition (defunct cup / unseeded
+                    # qualifier). Commit the empty frames as the
+                    # authoritative result so the scope cycle completes
+                    # instead of replanning the scope every day. The env
+                    # flag is set by run_transfermarkt_scope_cycle for the
+                    # entities that follow players inside the same cycle.
+                    results['valid_empty'] = True
+                    results['authoritative_empty'] = True
+                    results['rows'] = 0
+                    results[spec.count_field] = 0
+                    results['outputs'] = {
+                        key: _frame_output_summary(frame)
+                        for key, frame in frames.items()
+                        if frame is not None and hasattr(frame, '__len__')
+                    }
+                    for item in results['outputs'].values():
+                        if item['rows'] == 0 and not item['applicability_status']:
+                            item['applicability_status'] = 'authoritative_empty'
+                    if dry_run:
+                        results['dry_run'] = True
+                        exit_code = 0
+                        raise _EntityRunComplete(exit_code)
+                    failure_phase = 'platform'
+                    _save_frames(
+                        scraper, write_spec, frames, force_replace, results,
+                    )
+                    data_committed = True
+                    results['native_write_complete'] = bool(
+                        used_native and native_write_enabled
+                    )
+                    if mode == 'dual' and used_native:
+                        results['batch_manifest'] = _persist_dual_write_manifest(
+                            scraper, spec, frames, results, run_key,
+                            league, season,
+                        )
+                        results['dual_write_complete'] = (
+                            results['batch_manifest'].get('status') == 'success'
+                        )
+                        if not results['dual_write_complete']:
+                            raise RuntimeError(
+                                'authoritative-empty dual-write parity failed'
+                            )
+                    elif mode == 'native-only' and used_native:
+                        results['native_write_manifest'] = (
+                            _persist_native_write_manifest(
+                                scraper, spec, frames, results, run_key,
+                                league, season, int(expected_reader_revision),
+                            )
+                        )
+                        results['native_write_manifest_complete'] = (
+                            results['native_write_manifest'].get('status')
+                            == 'success'
+                        )
+                        if not results['native_write_manifest_complete']:
+                            raise RuntimeError(
+                                'authoritative-empty native manifest failed'
+                            )
+                    exit_code = 0
+                    raise _EntityRunComplete(exit_code)
                 reason = _classify_fallback(scraper)
                 logger.error(
                     '%s: %s unavailable — reason=%s',

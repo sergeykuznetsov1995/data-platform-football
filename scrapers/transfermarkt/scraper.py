@@ -419,6 +419,33 @@ def _parse_club_listing(html: str) -> List[Dict]:
     return clubs
 
 
+def _listing_page_is_empty_shell(html: str, competition_id: str) -> bool:
+    """True when TM renders the competition page with no participant listing.
+
+    Defunct cups and not-yet-seeded qualifiers (#1025: AFC Challenge Cup
+    2014, ACL Elite/Two qualifying) serve the full site chrome — the hreflang
+    alternates still self-identify the requested competition — but the body
+    carries no tables and no club links at all. That is data truth, not
+    selector drift: a drifted layout would still expose some table or club
+    anchor for the parser to trip on, and a consent/error page would not
+    self-reference the competition path.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, 'html.parser')
+    if soup.find('table') is not None:
+        return False
+    if soup.find('a', href=_CLUB_HREF_RE) is not None:
+        return False
+    pattern = re.compile(
+        r'/(?:pokal)?wettbewerb/' + re.escape(str(competition_id)) + r'(?:/|$)'
+    )
+    return any(
+        pattern.search(str(link.get('href') or ''))
+        for link in soup.find_all('link', rel='alternate')
+    )
+
+
 # Header text (lowercased) → bio field for the detailed (`/plus/1`) squad
 # table. The column SET varies by view: TM renders `Contract` only for the
 # season IT considers current and swaps in `Current club` for past seasons
@@ -1661,7 +1688,18 @@ class TransfermarktScraper(BaseScraper):
 
         source_id = self._source_id(context)
         record = self._fetch_records.get(label, {}).get(source_id)
-        if record is not None:
+        if record is None:
+            # Mirror _mark_schema_error: create the terminal record even when
+            # the transport layer left none behind.
+            self._fetch_records[label][source_id] = FetchRecord(
+                status=FetchStatus.VALID_EMPTY,
+                row_count=0,
+                payload_hash=None,
+                error=None,
+                status_code=200,
+                attempts=0,
+            )
+        else:
             self._fetch_records[label][source_id] = FetchRecord(
                 status=FetchStatus.VALID_EMPTY,
                 row_count=0,
@@ -1787,6 +1825,17 @@ class TransfermarktScraper(BaseScraper):
                 if soup.find('h1', {'class': 'data-header__headline-wrapper'}) is None:
                     return 'missing coach profile headline'
             elif soup.find('table', {'class': 'items'}) is None:
+                if (
+                    label == 'listing'
+                    and soup.find('table') is None
+                    and soup.find('a', href=_CLUB_HREF_RE) is None
+                    and soup.find('link', rel='alternate') is not None
+                ):
+                    # Empty-shell competition page (#1025): no tables and no
+                    # club links anywhere. Accept the fetch so the caller can
+                    # decide whether it is the authoritative empty listing
+                    # for the requested competition.
+                    return None
                 return 'missing table.items'
             elif label == 'listing' and soup.find('a', href=_CLUB_HREF_RE) is None:
                 return 'listing has no club links'
@@ -2061,7 +2110,9 @@ class TransfermarktScraper(BaseScraper):
             'fetched_at': datetime.now(timezone.utc).isoformat(),
         }
 
-        def _empty_bundle() -> Dict[str, pd.DataFrame]:
+        def _empty_bundle(
+            fetch_status: Optional[str] = None,
+        ) -> Dict[str, pd.DataFrame]:
             memberships = _with_metadata(
                 [], SQUAD_MEMBERSHIP_COLUMNS,
                 entity_type='squad_memberships', batch_id=self._batch_id,
@@ -2079,15 +2130,19 @@ class TransfermarktScraper(BaseScraper):
             contracts.attrs['fetch_status'] = (
                 'not_applicable'
                 if competition.team_type.value == 'national_team'
-                else 'retry_exhausted'
+                else (fetch_status or 'retry_exhausted')
             )
+            legacy_players = materialize_legacy_players(
+                memberships, observations,
+            )
+            if fetch_status is not None:
+                for frame in (memberships, observations, legacy_players):
+                    frame.attrs['fetch_status'] = fetch_status
             return {
                 'memberships': memberships,
                 'attribute_observations': observations,
                 'contract_observations': contracts,
-                'legacy_players': materialize_legacy_players(
-                    memberships, observations,
-                ),
+                'legacy_players': legacy_players,
             }
 
         # Step 1 — exact discovered competition/edition listing → teams.
@@ -2129,10 +2184,26 @@ class TransfermarktScraper(BaseScraper):
             'listing', {'league': league, 'season': season}, len(clubs),
         )
         if not clubs:
-            self._scope_capture['listing_status'] = 'schema_error'
             self._scope_capture['fetched_at'] = (
                 datetime.now(timezone.utc).isoformat()
             )
+            if _listing_page_is_empty_shell(
+                listing_html, scope['competition_id'],
+            ):
+                # #1025: the source shows this competition/edition with no
+                # participant listing at all — an authoritative empty scope,
+                # not selector drift.
+                self._scope_capture['listing_status'] = 'authoritative_empty'
+                self._mark_authoritative_empty(
+                    'listing', {'league': league, 'season': season},
+                )
+                logger.info(
+                    "TM listing: %s/%s renders no participant listing; "
+                    "authoritative empty scope",
+                    league, season,
+                )
+                return _empty_bundle(fetch_status='authoritative_empty')
+            self._scope_capture['listing_status'] = 'schema_error'
             self._mark_schema_error(
                 'listing',
                 {'league': league, 'season': season},
@@ -2439,7 +2510,9 @@ class TransfermarktScraper(BaseScraper):
         season = scope['season_year']
         self._begin_operation_budget('coaches')
 
-        def _empty_bundle() -> Dict[str, pd.DataFrame]:
+        def _empty_bundle(
+            fetch_status: Optional[str] = None,
+        ) -> Dict[str, pd.DataFrame]:
             profiles = _with_metadata(
                 [], COACH_PROFILE_COLUMNS,
                 entity_type='coach_profiles', batch_id=self._batch_id,
@@ -2448,13 +2521,17 @@ class TransfermarktScraper(BaseScraper):
                 [], COACH_STINT_COLUMNS,
                 entity_type='coach_stints', batch_id=self._batch_id,
             )
+            legacy_coaches = materialize_legacy_coaches(
+                profiles, stints, league, season,
+                scope['season_format'],
+            )
+            if fetch_status is not None:
+                for frame in (profiles, stints, legacy_coaches):
+                    frame.attrs['fetch_status'] = fetch_status
             return {
                 'profiles': profiles,
                 'stints': stints,
-                'legacy_coaches': materialize_legacy_coaches(
-                    profiles, stints, league, season,
-                    scope['season_format'],
-                ),
+                'legacy_coaches': legacy_coaches,
             }
 
         # Step 1 — use the already-fetched squad membership dimension when
@@ -2496,6 +2573,20 @@ class TransfermarktScraper(BaseScraper):
                 'listing', {'league': league, 'season': season}, len(clubs),
             )
             if not clubs:
+                if _listing_page_is_empty_shell(
+                    listing_html, scope['competition_id'],
+                ):
+                    # #1025: same empty-shell competition page as in
+                    # read_squad_data — an authoritative empty scope.
+                    self._mark_authoritative_empty(
+                        'listing', {'league': league, 'season': season},
+                    )
+                    logger.info(
+                        "TM coaches: %s/%s renders no participant listing; "
+                        "authoritative empty scope",
+                        league, season,
+                    )
+                    return _empty_bundle(fetch_status='authoritative_empty')
                 self._mark_schema_error(
                     'listing', {'league': league, 'season': season},
                     'listing table produced zero clubs; selector/layout drift',

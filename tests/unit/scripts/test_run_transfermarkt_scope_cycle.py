@@ -1886,3 +1886,60 @@ def test_validated_result_is_adopted_after_rename_before_checkpoint(tmp_path):
     assert run.wall_clock_duration_ms == 17
     assert attempt_id == 'attempt-one'
     assert command_sha256 == cycle.stable_hash(command)
+
+
+def test_empty_listing_scope_completes_and_flags_follow_up_entities(tmp_path):
+    """#1025: an authoritative-empty listing yields a complete scope manifest."""
+
+    payload = _payload(tmp_path)
+    # The four real cases (AC14/ACCQ/ACEQ/AC2Q) carry no registry participant
+    # count; a stated count would rightly contradict the empty listing.
+    payload['edition_record']['participant_count'] = None
+    argv, _ = _approved_args(tmp_path, payload)
+    args = _parse_args(argv)
+    calls = []
+
+    def mutate(command, result):
+        result['authoritative_empty'] = True
+        result['valid_empty'] = True
+        for output_key, entity in cycle.ENTITY_OUTPUTS[result['entity']]:
+            result['outputs'][output_key] = {
+                'rows': 0,
+                'table': cycle.ENTITY_TABLES[entity],
+                'applicability_status': 'authoritative_empty',
+            }
+        for row in result['batch_manifest']['rows']:
+            row['native_rows'] = 0
+            row['native_hash'] = cycle.stable_hash([])
+        if result['entity'] == 'players':
+            result['scope_capture'].update(
+                listing_status='authoritative_empty',
+                expected_team_ids=[],
+                observed_team_ids=[],
+                endpoint_status_by_team={},
+            )
+        return result
+
+    manifest = cycle.run_scope_cycle(
+        args,
+        operation_argv=cycle.approved_operation_argv(argv),
+        subprocess_runner=_fake_subprocess(calls, mutate=mutate),
+        manifest_writer=lambda manifest: None,
+        parent_ledger_writer=lambda ledger: None,
+    )
+
+    assert manifest['status'] == 'complete'
+    contract = manifest['dq_evidence']['participant_contract']
+    assert contract['participant_count'] == 0
+    assert contract['passed'] is True
+    statuses = manifest['dq_evidence']['entity_statuses']
+    assert set(statuses.values()) == {'authoritative_empty'}
+    flags = {
+        command[command.index('--entity') + 1]:
+            options['env'].get('TM_LISTING_AUTHORITATIVE_EMPTY')
+        for command, options in calls
+    }
+    assert flags['players'] is None
+    assert all(
+        flags[entity] == 'true' for entity in cycle.ENTITY_ORDER[1:]
+    )
