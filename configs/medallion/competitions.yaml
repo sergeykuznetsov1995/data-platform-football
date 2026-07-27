@@ -90,6 +90,12 @@ competitions:
         team_count: 20
         start: "2025-08-15"
         end: "2026-05-24"
+      # 2627: типовые рамки (+1 год к 2526), уточнить по факту расписания.
+      - id: 2627
+        format: "league_round_robin"
+        team_count: 20
+        start: "2026-08-15"
+        end: "2027-05-24"
     sources:
       primary: ["fbref", "understat"]
       whoscored:
@@ -171,6 +177,12 @@ competitions:
         team_count: 20
         start: "2025-08-15"
         end: "2026-05-24"
+      # 2627: типовые рамки (+1 год к 2526), уточнить по факту расписания.
+      - id: 2627
+        format: "league_round_robin"
+        team_count: 20
+        start: "2026-08-15"
+        end: "2027-05-24"
     sources:
       primary: ["fbref", "understat"]
       whoscored:
@@ -240,6 +252,12 @@ competitions:
         team_count: 20
         start: "2025-08-23"
         end: "2026-05-24"
+      # 2627: типовые рамки (+1 год к 2526), уточнить по факту расписания.
+      - id: 2627
+        format: "league_round_robin"
+        team_count: 20
+        start: "2026-08-23"
+        end: "2027-05-24"
     sources:
       primary: ["fbref", "understat"]
       whoscored:
@@ -310,6 +328,12 @@ competitions:
         team_count: 18
         start: "2025-08-22"
         end: "2026-05-25"
+      # 2627: типовые рамки (+1 год к 2526), уточнить по факту расписания.
+      - id: 2627
+        format: "league_round_robin"
+        team_count: 18
+        start: "2026-08-22"
+        end: "2027-05-25"
     sources:
       primary: ["fbref", "understat"]
       whoscored:
@@ -381,6 +405,12 @@ competitions:
         team_count: 18
         start: "2025-08-15"
         end: "2026-05-29"
+      # 2627: типовые рамки (+1 год к 2526), уточнить по факту расписания.
+      - id: 2627
+        format: "league_round_robin"
+        team_count: 18
+        start: "2026-08-15"
+        end: "2027-05-29"
     sources:
       primary: ["fbref", "understat"]
       whoscored:
@@ -402,11 +432,65 @@ competitions:
     seasons:
       # #951 волна 1+: РПЛ собирается только SofaScore'ом; даты — календарь
       # источника (спайна fbref нет и не будет), уточняются при первом сборе.
+      # 1617-2425 (#1000): исторические сезоны для волн бэкфилла; даты
+      # типовые (июль -> май следующего года), уточняются при первом сборе.
+      - id: 1617
+        format: "league_round_robin"
+        team_count: 16
+        start: "2016-07-15"
+        end: "2017-05-30"
+      - id: 1718
+        format: "league_round_robin"
+        team_count: 16
+        start: "2017-07-15"
+        end: "2018-05-30"
+      - id: 1819
+        format: "league_round_robin"
+        team_count: 16
+        start: "2018-07-15"
+        end: "2019-05-30"
+      # 1920: covid-пауза — сезон доигран летом 2020, окно продлено до конца июля.
+      - id: 1920
+        format: "league_round_robin"
+        team_count: 16
+        start: "2019-07-15"
+        end: "2020-07-31"
+      - id: 2021
+        format: "league_round_robin"
+        team_count: 16
+        start: "2020-08-01"
+        end: "2021-05-30"
+      - id: 2122
+        format: "league_round_robin"
+        team_count: 16
+        start: "2021-07-15"
+        end: "2022-05-30"
+      - id: 2223
+        format: "league_round_robin"
+        team_count: 16
+        start: "2022-07-15"
+        end: "2023-06-03"
+      - id: 2324
+        format: "league_round_robin"
+        team_count: 16
+        start: "2023-07-15"
+        end: "2024-05-30"
+      - id: 2425
+        format: "league_round_robin"
+        team_count: 16
+        start: "2024-07-15"
+        end: "2025-05-30"
       - id: 2526
         format: "league_round_robin"
         team_count: 16
         start: "2025-07-18"
         end: "2026-05-24"
+      # 2627: старт по факту календаря РПЛ (18.07.2026), конец — типовой.
+      - id: 2627
+        format: "league_round_robin"
+        team_count: 16
+        start: "2026-07-18"
+        end: "2027-05-24"
     sources:
       primary: []
       fallback:

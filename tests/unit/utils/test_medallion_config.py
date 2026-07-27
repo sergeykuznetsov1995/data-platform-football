@@ -683,10 +683,12 @@ def test_real_config_in_scope_is_top5(real_config_dir):
 
 def test_real_config_apl_seasons_cover_ingested_history(real_config_dir):
     # #425: competitions.yaml covers the FULL ingested FBref history
-    # (1617..2526) so dim_season satisfies the dim_match season FK.
+    # (1617..2526, + 2627 pre-onboarded for the August auto-flip) so
+    # dim_season satisfies the dim_match season FK.
     seasons = real_config_dir.get_competition_seasons("ENG-Premier League")
-    assert len(seasons) == 10
+    assert len(seasons) == 11
     assert 1617 in seasons and 2425 in seasons and 2526 in seasons
+    assert 2627 in seasons
 
 
 @pytest.mark.parametrize(
