@@ -22,6 +22,7 @@ from scrapers.understat import (
 from scrapers.understat.parsers import (
     parse_match_payload,
     parse_schedule,
+    parse_team_match_stats,
     validate_league_payload,
     validate_match_payload,
     validate_team_payload,
@@ -530,6 +531,78 @@ def test_team_history_side_is_strict_and_matches_schedule_team():
     swapped["teams"]["2"]["history"][0]["h_a"] = "h"
     with pytest.raises(UnderstatSchemaDrift, match="expected 'h'.*date/team"):
         validate_league_payload(swapped)
+
+
+def test_cancelled_schedule_placeholders_do_not_define_history_sides():
+    payload = deepcopy(LEAGUE_PAYLOAD)
+    first_cancelled = deepcopy(LEAGUE_PAYLOAD["dates"][0])
+    first_cancelled.update(
+        id="101",
+        isResult=False,
+        datetime="2020-07-09 23:00:00",
+    )
+    second_cancelled = deepcopy(first_cancelled)
+    second_cancelled.update(
+        id="102",
+        h=deepcopy(first_cancelled["a"]),
+        a=deepcopy(first_cancelled["h"]),
+    )
+    payload["dates"].extend([first_cancelled, second_cancelled])
+
+    validate_league_payload(payload)
+
+
+def test_cancelled_schedule_records_remain_structurally_validated():
+    payload = deepcopy(LEAGUE_PAYLOAD)
+    payload["dates"][0]["isResult"] = False
+    del payload["dates"][0]["h"]
+
+    with pytest.raises(UnderstatSchemaDrift, match="missing required"):
+        validate_league_payload(payload)
+
+
+def test_league_validator_rejects_invalid_result_flags():
+    payload = deepcopy(LEAGUE_PAYLOAD)
+    payload["dates"][0]["isResult"] = "maybe"
+
+    with pytest.raises(UnderstatSchemaDrift, match="invalid boolean"):
+        validate_league_payload(payload)
+
+
+def test_completed_schedule_side_conflicts_still_fail_closed():
+    payload = deepcopy(LEAGUE_PAYLOAD)
+    conflicting_result = deepcopy(LEAGUE_PAYLOAD["dates"][0])
+    conflicting_result.update(
+        id="101",
+        h=deepcopy(LEAGUE_PAYLOAD["dates"][0]["a"]),
+        a=deepcopy(LEAGUE_PAYLOAD["dates"][0]["h"]),
+    )
+    payload["dates"].append(conflicting_result)
+
+    with pytest.raises(UnderstatSchemaDrift, match="conflicting side mapping"):
+        validate_league_payload(payload)
+
+
+@pytest.mark.parametrize("cancelled_id", ["100", "101"])
+def test_cancelled_fixture_cannot_shadow_played_team_history_match(cancelled_id):
+    payload = deepcopy(LEAGUE_PAYLOAD)
+    cancelled = deepcopy(LEAGUE_PAYLOAD["dates"][0])
+    cancelled.update(
+        id=cancelled_id,
+        isResult=False,
+        h=deepcopy(LEAGUE_PAYLOAD["dates"][0]["a"]),
+        a=deepcopy(LEAGUE_PAYLOAD["dates"][0]["h"]),
+    )
+    payload["dates"].append(cancelled)
+    scope = UnderstatCatalog(_CatalogClient(), today=date(2026, 7, 27)) \
+        .rolling_scopes(window=2)[0]
+
+    validate_league_payload(payload)
+    team_matches = parse_team_match_stats(payload, scope)
+
+    assert team_matches["game_id"].tolist() == [100]
+    assert team_matches["home_team_id"].tolist() == [1]
+    assert team_matches["away_team_id"].tolist() == [2]
 
 
 @pytest.mark.parametrize(
