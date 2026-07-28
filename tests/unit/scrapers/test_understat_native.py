@@ -566,11 +566,12 @@ def test_completed_schedule_side_conflicts_still_fail_closed():
         validate_league_payload(payload)
 
 
-def test_cancelled_fixture_cannot_shadow_played_team_history_match():
+@pytest.mark.parametrize("cancelled_id", ["100", "101"])
+def test_cancelled_fixture_cannot_shadow_played_team_history_match(cancelled_id):
     payload = deepcopy(LEAGUE_PAYLOAD)
     cancelled = deepcopy(LEAGUE_PAYLOAD["dates"][0])
     cancelled.update(
-        id="101",
+        id=cancelled_id,
         isResult=False,
         h=deepcopy(LEAGUE_PAYLOAD["dates"][0]["a"]),
         a=deepcopy(LEAGUE_PAYLOAD["dates"][0]["h"]),
