@@ -22,6 +22,7 @@ from scrapers.understat import (
 from scrapers.understat.parsers import (
     parse_match_payload,
     parse_schedule,
+    parse_team_match_stats,
     validate_league_payload,
     validate_match_payload,
     validate_team_payload,
@@ -563,6 +564,27 @@ def test_completed_schedule_side_conflicts_still_fail_closed():
 
     with pytest.raises(UnderstatSchemaDrift, match="conflicting side mapping"):
         validate_league_payload(payload)
+
+
+def test_cancelled_fixture_cannot_shadow_played_team_history_match():
+    payload = deepcopy(LEAGUE_PAYLOAD)
+    cancelled = deepcopy(LEAGUE_PAYLOAD["dates"][0])
+    cancelled.update(
+        id="101",
+        isResult=False,
+        h=deepcopy(LEAGUE_PAYLOAD["dates"][0]["a"]),
+        a=deepcopy(LEAGUE_PAYLOAD["dates"][0]["h"]),
+    )
+    payload["dates"].append(cancelled)
+    scope = UnderstatCatalog(_CatalogClient(), today=date(2026, 7, 27)) \
+        .rolling_scopes(window=2)[0]
+
+    validate_league_payload(payload)
+    team_matches = parse_team_match_stats(payload, scope)
+
+    assert team_matches["game_id"].tolist() == [100]
+    assert team_matches["home_team_id"].tolist() == [1]
+    assert team_matches["away_team_id"].tolist() == [2]
 
 
 @pytest.mark.parametrize(

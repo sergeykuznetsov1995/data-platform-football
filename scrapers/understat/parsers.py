@@ -672,6 +672,12 @@ def parse_team_match_stats(
             "away_team_code": _text(away.get("short_title")),
             "home_team_code": _text(home.get("short_title")),
         }
+        is_result = _boolean(
+            match.get("isResult"),
+            "getLeagueData.dates[].isResult",
+        )
+        if is_result is not True:
+            continue
         for team in (home, away):
             team_id = _integer(team.get("id"))
             if team_id is not None:
