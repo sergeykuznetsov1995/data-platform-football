@@ -85,6 +85,15 @@ class TrinoTableManager:
             self.port = port or int(os.environ.get('TRINO_PORT', 8080))
             logger.info("TRINO_PASSWORD not set, connecting via HTTP (no auth)")
         self._conn = None
+        # Metadata round-trips dominate a write-heavy run: every write asked
+        # SHOW TABLES twice, DESCRIBE once and CREATE SCHEMA once. Only facts
+        # this process cannot invalidate behind its own back are cached — a
+        # table that exists stays existing (drops/creates update the cache),
+        # a missing table is never cached, and column sets are dropped whenever
+        # this manager evolves or recreates the table.
+        self._known_schemas: set[str] = set()
+        self._known_tables: set[tuple[str, str]] = set()
+        self._column_cache: dict[tuple[str, str], Dict[str, str]] = {}
 
     # Retry settings for connection. A Trino container restart takes ~30-60s
     # (SERVER STARTED ~13s + authenticator warm-up), so the cumulative window
@@ -246,6 +255,8 @@ class TrinoTableManager:
             schema: Schema name (e.g., 'bronze', 'silver', 'gold')
         """
         qualified = validate_catalog_qualified_name(self.catalog, schema)
+        if schema in self._known_schemas:
+            return
         sql = f"CREATE SCHEMA IF NOT EXISTS {qualified}"
 
         try:
@@ -254,6 +265,7 @@ class TrinoTableManager:
         except TrinoError:
             # Schema might already exist
             logger.debug(f"Schema {schema} may already exist")
+        self._known_schemas.add(schema)
 
     def schema_exists(self, schema: str) -> bool:
         """Check if schema exists."""
@@ -275,13 +287,18 @@ class TrinoTableManager:
         """
         qualified = validate_catalog_qualified_name(self.catalog, schema)
         validate_identifier(table, "table")
+        if (schema, table) in self._known_tables:
+            return True
         sql = f"SHOW TABLES FROM {qualified} LIKE '{table}'"
 
         try:
             result = self._execute(sql, fetch=True)
-            return len(result) > 0
         except TrinoError:
             return False
+        # Absence is never cached: the very next call may be the CREATE.
+        if result:
+            self._known_tables.add((schema, table))
+        return len(result) > 0
 
     def create_external_table(
         self,
@@ -376,6 +393,8 @@ WITH (
 ){partition_clause}"""
 
         self._execute(sql)
+        self._known_tables.add((schema, table))
+        self._column_cache.pop((schema, table), None)
         logger.info(f"Created Iceberg table: {self.catalog}.{schema}.{table}")
 
     def _format_sql_value(self, val, target_type: str = '') -> str:
@@ -497,7 +516,7 @@ WITH (
         schema: str,
         table: str,
         df: pd.DataFrame,
-        batch_size: int = 1000,
+        batch_size: int = 5000,
     ) -> int:
         """
         Insert DataFrame rows into Iceberg table via VALUES clause.
@@ -510,7 +529,8 @@ WITH (
             schema: Schema name
             table: Table name
             df: Pandas DataFrame to insert
-            batch_size: Number of rows per INSERT statement (default 1000)
+            batch_size: Number of rows per INSERT statement (default 5000;
+                the SQL byte budget still splits wide rows earlier)
 
         Returns:
             Number of rows inserted
@@ -631,7 +651,7 @@ WITH (
         schema: str,
         table: str,
         df: pd.DataFrame,
-        batch_size: int = 1000,
+        batch_size: int = 5000,
         delete_filter: Optional[str] = None,
         staging_id: Optional[str] = None,
         merge_keys: Optional[Sequence[str]] = None,
@@ -829,6 +849,8 @@ WITH (
         sql = f"DROP TABLE {exists_clause}{qualified}"
 
         self._execute(sql)
+        self._known_tables.discard((schema, table))
+        self._column_cache.pop((schema, table), None)
         logger.info(f"Dropped table: {self.catalog}.{schema}.{table}")
 
     def add_column(self, schema: str, table: str, column: str, column_type: str) -> None:
@@ -844,6 +866,7 @@ WITH (
         qualified = validate_catalog_qualified_name(self.catalog, schema, table)
         sql = f'ALTER TABLE {qualified} ADD COLUMN "{column}" {column_type}'
         self._execute(sql)
+        self._column_cache.pop((schema, table), None)
         logger.info(f'Added column "{column}" {column_type} to {self.catalog}.{schema}.{table}')
 
     def get_table_columns(self, schema: str, table: str) -> Dict[str, str]:
@@ -858,6 +881,9 @@ WITH (
             Dict of column_name -> type
         """
         qualified = validate_catalog_qualified_name(self.catalog, schema, table)
+        cached = self._column_cache.get((schema, table))
+        if cached is not None:
+            return dict(cached)
         sql = f"DESCRIBE {qualified}"
         result = self._execute(sql, fetch=True)
 
@@ -868,6 +894,7 @@ WITH (
             col_type = row[1]
             columns[col_name] = col_type
 
+        self._column_cache[(schema, table)] = dict(columns)
         return columns
 
     def execute_query(self, sql: str, params: Optional[tuple] = None) -> List[Any]:

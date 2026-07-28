@@ -62,6 +62,29 @@ from .repository import (
 from .transport import FetchOutcome, FetchResult, FotMobTransport, canonicalize_target
 
 
+# A dropped catalog/query connection is not FotMob changing its payload. Both
+# used to land in the same ``except Exception`` and be committed as
+# ``schema_drift``, which poisons the canary's drift signal and stops the
+# backfill driver for an infrastructure hiccup (observed 2026-07-14: a Trino
+# restart marked a player target as drift with an empty unknown-path list).
+_INFRA_EXCEPTION_MODULES = frozenset(
+    {"trino", "requests", "urllib3", "botocore", "boto3", "http", "socket", "ssl"}
+)
+
+
+def _failure_status(exc: BaseException) -> ManifestStatus:
+    """Drift means the source changed shape; infrastructure faults retry."""
+
+    if isinstance(exc, OSError):
+        return ManifestStatus.RETRYABLE_FAILURE
+    root_module = type(exc).__module__.split(".", 1)[0]
+    if root_module in _INFRA_EXCEPTION_MODULES:
+        return ManifestStatus.RETRYABLE_FAILURE
+    if type(exc).__name__ == "TrinoError":
+        return ManifestStatus.RETRYABLE_FAILURE
+    return ManifestStatus.SCHEMA_DRIFT
+
+
 MATCH_CONTENT_SECTIONS = (
     "matchFacts",
     "stats",
@@ -273,6 +296,11 @@ class FotMobIngestService:
         self._budget_lock = threading.Lock()
         self._next_build_id: Optional[str] = None
         self.repository.ensure_schema()
+        # One query up front replaces one per target: incremental planning asks
+        # the manifest about every single target it considers.
+        preload = getattr(self.repository, "preload_manifest_index", None)
+        if preload is not None:
+            preload()
 
     def _account(self, fetch: FetchResult) -> None:
         with self._budget_lock:
@@ -597,7 +625,7 @@ class FotMobIngestService:
             self._commit_for_fetch(
                 fetch,
                 target_type="all_leagues",
-                status=ManifestStatus.SCHEMA_DRIFT,
+                status=_failure_status(exc),
                 error_code=type(exc).__name__,
                 error=str(exc),
             )
@@ -814,7 +842,7 @@ class FotMobIngestService:
             self._commit_for_fetch(
                 fetch,
                 target_type="competition_seasons",
-                status=ManifestStatus.SCHEMA_DRIFT,
+                status=_failure_status(exc),
                 competition_id=competition.competition_id,
                 error_code=type(exc).__name__,
                 error=str(exc),
@@ -1048,7 +1076,7 @@ class FotMobIngestService:
             self._commit_for_fetch(
                 fetch,
                 target_type="league_season",
-                status=ManifestStatus.SCHEMA_DRIFT,
+                status=_failure_status(exc),
                 competition_id=competition_id,
                 source_season_key=source_season_key,
                 error_code=type(exc).__name__,
@@ -1187,7 +1215,7 @@ class FotMobIngestService:
                 self._commit_for_fetch(
                     fetch,
                     target_type="leaderboard",
-                    status=ManifestStatus.SCHEMA_DRIFT,
+                    status=_failure_status(exc),
                     competition_id=bundle.scope.competition_id,
                     source_season_key=bundle.scope.source_season_key,
                     entity_id=descriptor.name,
@@ -1343,7 +1371,7 @@ class FotMobIngestService:
                 self._commit_for_fetch(
                     fetch,
                     target_type="transfers_page",
-                    status=ManifestStatus.SCHEMA_DRIFT,
+                    status=_failure_status(exc),
                     competition_id=competition_id,
                     entity_id=f"{stream_window}:{page}",
                     error_code=type(exc).__name__,
@@ -1538,7 +1566,7 @@ class FotMobIngestService:
                 self._commit_for_fetch(
                     fetch,
                     target_type="match",
-                    status=ManifestStatus.SCHEMA_DRIFT,
+                    status=_failure_status(exc),
                     competition_id=bundle.scope.competition_id,
                     source_season_key=bundle.scope.source_season_key,
                     entity_id=key,
@@ -1732,7 +1760,7 @@ class FotMobIngestService:
                 self._commit_for_fetch(
                     fetch,
                     target_type="team",
-                    status=ManifestStatus.SCHEMA_DRIFT,
+                    status=_failure_status(exc),
                     entity_id=key,
                     error_code=type(exc).__name__,
                     error=str(exc),
@@ -1963,7 +1991,7 @@ class FotMobIngestService:
                 self._commit_for_fetch(
                     fetch,
                     target_type="player",
-                    status=ManifestStatus.SCHEMA_DRIFT,
+                    status=_failure_status(exc),
                     entity_id=key,
                     error_code=type(exc).__name__,
                     error=str(exc),

@@ -1364,3 +1364,91 @@ class TestTrinoManagerRestartResilience:
             # Assert — reconnected once, statement re-ran on the new connection.
             reconnect.assert_called_once()
             ok_cursor.execute.assert_called_once_with('SELECT 1')
+
+
+class TestMetadataCaching:
+    """Every write asked SHOW TABLES twice, DESCRIBE once and CREATE SCHEMA
+    once. Those round-trips dominated a batched write run (#930), so they are
+    cached — but only facts this process itself invalidates."""
+
+    def _manager(self):
+        from scrapers.base.trino_manager import TrinoTableManager
+        TrinoTableManager._trino_unreachable = False
+        with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):
+            return TrinoTableManager()
+
+    def test_repeated_existence_and_column_lookups_hit_trino_once(self):
+        manager = self._manager()
+        calls = []
+
+        def _execute(sql, fetch=False, params=None):
+            calls.append(sql)
+            if sql.startswith("SHOW TABLES"):
+                return [("fotmob_matches",)]
+            if sql.startswith("DESCRIBE"):
+                return [("match_id", "varchar", "", "")]
+            return None
+
+        manager._execute = _execute
+
+        for _ in range(3):
+            assert manager.table_exists("bronze", "fotmob_matches") is True
+            assert manager.get_table_columns("bronze", "fotmob_matches") == {
+                "match_id": "varchar"
+            }
+            manager.create_schema("bronze")
+
+        assert sum(1 for sql in calls if sql.startswith("SHOW TABLES")) == 1
+        assert sum(1 for sql in calls if sql.startswith("DESCRIBE")) == 1
+        assert sum(1 for sql in calls if sql.startswith("CREATE SCHEMA")) == 1
+
+    def test_a_missing_table_is_never_cached_as_missing(self):
+        # The very next call is usually the CREATE; caching absence would make
+        # the writer skip the create and INSERT into a table that isn't there.
+        manager = self._manager()
+        calls = []
+
+        def _execute(sql, fetch=False, params=None):
+            calls.append(sql)
+            return []
+
+        manager._execute = _execute
+
+        assert manager.table_exists("bronze", "later") is False
+        assert manager.table_exists("bronze", "later") is False
+
+        assert sum(1 for sql in calls if sql.startswith("SHOW TABLES")) == 2
+
+    def test_dropping_a_table_forgets_it(self):
+        manager = self._manager()
+        seen = {"exists": True}
+
+        def _execute(sql, fetch=False, params=None):
+            if sql.startswith("SHOW TABLES"):
+                return [("stage",)] if seen["exists"] else []
+            return None
+
+        manager._execute = _execute
+
+        assert manager.table_exists("bronze", "stage") is True
+        manager.drop_table("bronze", "stage")
+        seen["exists"] = False
+
+        assert manager.table_exists("bronze", "stage") is False
+
+    def test_added_column_invalidates_the_cached_schema(self):
+        manager = self._manager()
+        columns = [("a", "varchar", "", "")]
+
+        def _execute(sql, fetch=False, params=None):
+            if sql.startswith("DESCRIBE"):
+                return list(columns)
+            return None
+
+        manager._execute = _execute
+
+        assert manager.get_table_columns("bronze", "t") == {"a": "varchar"}
+        columns.append(("b", "bigint", "", ""))
+        manager.add_column("bronze", "t", "b", "BIGINT")
+
+        assert manager.get_table_columns("bronze", "t") == {"a": "varchar", "b": "bigint"}
