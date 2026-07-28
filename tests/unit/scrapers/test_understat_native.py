@@ -552,6 +552,23 @@ def test_cancelled_schedule_placeholders_do_not_define_history_sides():
     validate_league_payload(payload)
 
 
+def test_cancelled_schedule_records_remain_structurally_validated():
+    payload = deepcopy(LEAGUE_PAYLOAD)
+    payload["dates"][0]["isResult"] = False
+    del payload["dates"][0]["h"]
+
+    with pytest.raises(UnderstatSchemaDrift, match="missing required"):
+        validate_league_payload(payload)
+
+
+def test_league_validator_rejects_invalid_result_flags():
+    payload = deepcopy(LEAGUE_PAYLOAD)
+    payload["dates"][0]["isResult"] = "maybe"
+
+    with pytest.raises(UnderstatSchemaDrift, match="invalid boolean"):
+        validate_league_payload(payload)
+
+
 def test_completed_schedule_side_conflicts_still_fail_closed():
     payload = deepcopy(LEAGUE_PAYLOAD)
     conflicting_result = deepcopy(LEAGUE_PAYLOAD["dates"][0])
