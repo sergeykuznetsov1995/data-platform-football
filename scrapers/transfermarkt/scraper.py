@@ -435,6 +435,22 @@ _SQUAD_HEADER_FIELDS = {
 _AGE_IN_PARENS_RE = re.compile(r'\((\d+)\)\s*$')
 
 
+def _squad_page_is_empty_roster(html: str) -> bool:
+    """True when the club page rendered but TM lists no players for the season.
+
+    Dissolved/amateur clubs (e.g. FC Lienden, saison 2011) serve a normal club
+    page — header present — with no squad table and no player links. That is
+    data truth. A page that still carries player links the parser could not
+    read stays a schema error (selector drift).
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, 'html.parser')
+    if soup.find('h1', {'class': 'data-header__headline-wrapper'}) is None:
+        return False
+    return soup.find('a', href=_PLAYER_HREF_RE) is None
+
+
 def _parse_squad_page(html: str, club_id: str) -> List[Dict]:
     """Extract per-player rows from a club's detailed (`/plus/1`) squad page.
 
@@ -1735,10 +1751,21 @@ class TransfermarktScraper(BaseScraper):
                 if soup.find('h1', {'class': 'data-header__headline-wrapper'}) is None:
                     return 'missing coach profile headline'
             elif soup.find('table', {'class': 'items'}) is None:
+                # Dissolved/amateur clubs render a normal club page with no
+                # squad table at all for old seasons (e.g. FC Lienden 2011/12)
+                # — that is data truth, not selector drift.
+                if label == 'squad' and soup.find(
+                    'h1', {'class': 'data-header__headline-wrapper'},
+                ) is not None:
+                    return None
                 return 'missing table.items'
             elif label == 'listing' and soup.find('a', href=_CLUB_HREF_RE) is None:
                 return 'listing has no club links'
             elif label == 'squad' and soup.find('a', href=_PLAYER_HREF_RE) is None:
+                if soup.find(
+                    'h1', {'class': 'data-header__headline-wrapper'},
+                ) is not None:
+                    return None
                 return 'squad has no player links'
             elif label == 'coach_history' and not _parse_coach_history(
                 html, club_id='validator',
@@ -2147,6 +2174,19 @@ class TransfermarktScraper(BaseScraper):
                 'squad', {'club_id': club['club_id']}, len(parsed_players),
             )
             if not parsed_players:
+                if _squad_page_is_empty_roster(html):
+                    # The manifest capture is a closed field set — log the
+                    # empty roster instead of annotating the capture.
+                    squad_successes += 1
+                    self._scope_capture['endpoint_status_by_team'][
+                        str(club['club_id'])
+                    ] = 'ok'
+                    logger.info(
+                        "TM squad: club %s has an empty roster for this "
+                        "season (data truth, counted as success)",
+                        club['club_id'],
+                    )
+                    continue
                 self._scope_capture['endpoint_status_by_team'][
                     str(club['club_id'])
                 ] = 'schema_error'
