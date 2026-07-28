@@ -3029,7 +3029,16 @@ def _persist_dual_write_manifest(
             native_frame = native_frame[
                 native_frame['coach_id'].astype(str).isin(legacy_ids)
             ]
-        elif native.key == 'stints' and native_frame is not None:
+        elif (
+            native.key == 'stints'
+            and native_frame is not None
+            and not native_frame.empty
+        ):
+            # A zero-row frame has nothing to slice, and ``apply(axis=1)`` on
+            # one returns an empty float64 Series that pandas then reads as a
+            # COLUMN selector — the typed empty bundle of an authoritative-empty
+            # listing (#1025) came out of the filter with no columns at all and
+            # failed the compatibility contract below.
             legacy_keys = set()
             if legacy_frame is not None and not legacy_frame.empty:
                 legacy_keys = {
