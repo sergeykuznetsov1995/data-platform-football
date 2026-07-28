@@ -246,9 +246,9 @@ def test_unknown_active_classification_blocks_empty_and_explicit_plans():
         )
 
 
-def test_empty_params_selects_due_oldest_first_and_caps_batch_at_eight():
+def test_empty_params_selects_due_oldest_first_and_caps_batch_at_the_bound():
     rows = []
-    for index in range(10):
+    for index in range(26):
         competition = _competition(f'C{index:02d}')
         edition = _edition(competition.competition_id, '2025')
         last_success = None
@@ -266,14 +266,141 @@ def test_empty_params_selects_due_oldest_first_and_caps_batch_at_eight():
         registry_rows=rows,
         now=NOW,
     )
-    assert plan.total_selected_count == 10
-    assert len(plan.mapped_payloads) == 8
+    assert plan.total_selected_count == 26
+    assert len(plan.mapped_payloads) == planner.MAX_BATCH_SIZE == 24
     assert plan.continuation_required is True
     assert plan.remaining_count == 2
     # Never-served identities are ordered first and deterministically.
     assert [item['competition_id'] for item in plan.mapped_payloads[:3]] == [
         'C02', 'C03', 'C04',
     ]
+
+
+def _current_and_history_rows(n_comps: int = 4) -> list[dict]:
+    """One current (2026) and one historical (2024) never-served edition each."""
+    rows = []
+    for index in range(n_comps):
+        competition = _competition(f'C{index:02d}')
+        rows.append(_joined_row(
+            competition, _edition(competition.competition_id, '2026', current=True),
+        ))
+        rows.append(_joined_row(
+            competition, _edition(competition.competition_id, '2024', current=False),
+        ))
+    return rows
+
+
+def test_coverage_mode_current_selects_only_the_current_season():
+    plan = planner.plan_transfermarkt_scopes(
+        {'coverage_mode': 'current'},
+        parent_cycle_id='scheduled__current',
+        registry_rows=_current_and_history_rows(4),
+        now=NOW,
+    )
+    assert plan.total_selected_count == 4
+    assert {p['edition_id'] for p in plan.mapped_payloads} == {'2026'}
+
+
+def test_coverage_mode_historical_selects_only_the_backfill_editions():
+    plan = planner.plan_transfermarkt_scopes(
+        {'coverage_mode': 'historical'},
+        parent_cycle_id='scheduled__historical',
+        registry_rows=_current_and_history_rows(4),
+        now=NOW,
+    )
+    assert plan.total_selected_count == 4
+    assert {p['edition_id'] for p in plan.mapped_payloads} == {'2024'}
+
+
+def test_coverage_mode_defaults_to_all_and_mixes_current_with_history():
+    plan = planner.plan_transfermarkt_scopes(
+        {},
+        parent_cycle_id='scheduled__all',
+        registry_rows=_current_and_history_rows(4),
+        now=NOW,
+    )
+    assert plan.total_selected_count == 8
+    assert {p['edition_id'] for p in plan.mapped_payloads} == {'2026', '2024'}
+
+
+def test_invalid_coverage_mode_fails_closed():
+    with pytest.raises(planner.ScopePlanningError, match='coverage_mode'):
+        planner.plan_transfermarkt_scopes(
+            {'coverage_mode': 'bogus'},
+            parent_cycle_id='scheduled__bad',
+            registry_rows=_current_and_history_rows(1),
+            now=NOW,
+        )
+
+
+def test_coverage_mode_is_ignored_for_explicit_scopes():
+    competition = _competition('EXP')
+    rows = [
+        _joined_row(competition, _edition('EXP', '2026', current=True)),
+        _joined_row(competition, _edition('EXP', '2024', current=False)),
+    ]
+    plan = planner.plan_transfermarkt_scopes(
+        {'coverage_mode': 'current', 'scopes': ['EXP:2024']},
+        parent_cycle_id='manual__explicit',
+        registry_rows=rows,
+        now=NOW,
+    )
+    assert [p['edition_id'] for p in plan.mapped_payloads] == ['2024']
+
+
+def _three_season_rows(n_comps: int = 3) -> list[dict]:
+    """Three active editions each: 2026 current, 2025 and 2024 historical."""
+    rows = []
+    for index in range(n_comps):
+        competition = _competition(f'C{index:02d}')
+        for edition_id, current in (('2026', True), ('2025', False), ('2024', False)):
+            rows.append(_joined_row(
+                competition,
+                _edition(competition.competition_id, edition_id, current=current),
+            ))
+    return rows
+
+
+def test_current_recent_seasons_two_adds_the_previous_season():
+    plan = planner.plan_transfermarkt_scopes(
+        {'coverage_mode': 'current', 'recent_seasons': 2},
+        parent_cycle_id='scheduled__current2',
+        registry_rows=_three_season_rows(3),
+        now=NOW,
+    )
+    assert plan.total_selected_count == 6  # 3 competitions x {2026, 2025}
+    assert {p['edition_id'] for p in plan.mapped_payloads} == {'2026', '2025'}
+
+
+def test_historical_drains_everything_below_the_recent_window():
+    plan = planner.plan_transfermarkt_scopes(
+        {'coverage_mode': 'historical', 'recent_seasons': 2},
+        parent_cycle_id='scheduled__hist2',
+        registry_rows=_three_season_rows(3),
+        now=NOW,
+    )
+    assert plan.total_selected_count == 3  # only 2024 survives per competition
+    assert {p['edition_id'] for p in plan.mapped_payloads} == {'2024'}
+
+
+def test_recent_seasons_defaults_to_current_only():
+    plan = planner.plan_transfermarkt_scopes(
+        {'coverage_mode': 'current'},
+        parent_cycle_id='scheduled__current1',
+        registry_rows=_three_season_rows(3),
+        now=NOW,
+    )
+    assert {p['edition_id'] for p in plan.mapped_payloads} == {'2026'}
+
+
+def test_invalid_recent_seasons_fails_closed():
+    with pytest.raises(planner.ScopePlanningError, match='recent_seasons'):
+        planner.plan_transfermarkt_scopes(
+            {'coverage_mode': 'current', 'recent_seasons': 0},
+            parent_cycle_id='scheduled__badn',
+            registry_rows=_three_season_rows(1),
+            now=NOW,
+        )
 
 
 def test_full_slot_target_is_registry_complete_not_limited_to_one_batch():
@@ -481,9 +608,9 @@ def test_promoted_registry_query_is_read_only_and_escapes_snapshot_literal():
     assert 'DELETE ' not in sql
 
 
-@pytest.mark.parametrize('batch_size', [0, 9, True])
+@pytest.mark.parametrize('batch_size', [0, 25, True])
 def test_batch_size_cannot_bypass_global_bound(batch_size):
-    with pytest.raises(planner.ScopePlanningError, match='between 1 and 8'):
+    with pytest.raises(planner.ScopePlanningError, match='between 1 and 24'):
         planner.plan_transfermarkt_scopes(
             {'scopes': ['GB1:2025']},
             parent_cycle_id='manual__invalid-batch',
