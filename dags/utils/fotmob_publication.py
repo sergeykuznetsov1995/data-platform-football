@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 FOTMOB_PUBLICATION_SOURCE = "fotmob"
 FOTMOB_PUBLICATION_SCHEMA = "fotmob-publication-v1"
+FOTMOB_PUBLICATION_DISABLED_SCHEMA = "fotmob-publication-disabled-v1"
 FOTMOB_RUNTIME_FINGERPRINT_ENV = "FOTMOB_DEPLOY_GIT_SHA"
 FOTMOB_PUBLICATION_LOCK_TTL_SECONDS = 14 * 24 * 60 * 60
 FOTMOB_PUBLICATION_XCOM_KEY = "fotmob_publication"
@@ -109,6 +110,15 @@ FOTMOB_DEPLOYMENT_REPORT_PATH_ENV = "FOTMOB_DEPLOYMENT_REPORT_PATH"
 FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV = "FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH"
 FOTMOB_SHARED_EVIDENCE_ROOT = "/opt/airflow/fotmob-admission"
 FOTMOB_ISOLATED_DAILY_DAG_ID = "dag_trigger_fotmob_daily"
+# Every isolated schedule owner allowed to mint a publication generation.
+# ``@continuous`` refresh/backfill DagRuns are ``scheduled`` runs too.
+FOTMOB_ISOLATED_OWNER_DAG_IDS = frozenset(
+    {
+        FOTMOB_ISOLATED_DAILY_DAG_ID,
+        "dag_refresh_fotmob",
+        "dag_backfill_fotmob",
+    }
+)
 FOTMOB_SHARED_CONSUMER_DAG_ID = "dag_sofascore_pipeline"
 FOTMOB_SHARED_MASTER_DAG_ID = "dag_master_pipeline"
 FOTMOB_PENDING_BOUNDARY_NAMES = (
@@ -824,6 +834,26 @@ def _validate_pending_consumer_runtime(
     }
 
 
+def fotmob_ceremony_configured(
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Return True when a deployment-report publication ceremony is deployed.
+
+    The deploy ceremony exports a report path into the stack environment.
+    Without one there is no deployment report to attest against and no
+    ControlStore generation lifecycle: writers then run ceremony-free behind
+    the plain ``FOTMOB_ISOLATED_STACK`` gate (WhoScored #1012 precedent).
+    Either report-path variable keeps the full fail-closed semantics for its
+    stack, so a deployed stack never silently loses the ceremony.
+    """
+
+    runtime_env = os.environ if environ is None else environ
+    return bool(
+        str(runtime_env.get(FOTMOB_DEPLOYMENT_REPORT_PATH_ENV, "")).strip()
+        or str(runtime_env.get(FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV, "")).strip()
+    )
+
+
 def attest_fotmob_isolated_runtime(
     *,
     report_path: str | os.PathLike[str] | None = None,
@@ -842,6 +872,20 @@ def attest_fotmob_isolated_runtime(
     """
 
     runtime_env = os.environ if environ is None else environ
+    if not fotmob_ceremony_configured(runtime_env):
+        # Ceremony-free contour: there is no deployment report to attest, but
+        # the stack-isolation gate stays so shared-stack tasks can never
+        # write FotMob Bronze/Silver by accident.
+        if runtime_env.get(FOTMOB_ISOLATED_STACK_ENV) != "1":
+            raise _airflow_exception(
+                "FotMob ceremony-free runtime still requires "
+                f"{FOTMOB_ISOLATED_STACK_ENV}=1"
+            )
+        logger.warning(
+            "FotMob publication ceremony is disabled: no deployment report "
+            "is configured; skipping deployment attestation"
+        )
+        return {"ceremony": "disabled"}
     configured_path = str(
         runtime_env.get(FOTMOB_DEPLOYMENT_REPORT_PATH_ENV, "")
     ).strip()
@@ -933,7 +977,10 @@ def attest_fotmob_isolated_runtime(
         dag_id = getattr(dag_run, "dag_id", None)
         run_type = getattr(dag_run, "run_type", None)
         normalized_run_type = str(getattr(run_type, "value", run_type) or "").casefold()
-        if dag_id != FOTMOB_ISOLATED_DAILY_DAG_ID or normalized_run_type != "scheduled":
+        if (
+            dag_id not in FOTMOB_ISOLATED_OWNER_DAG_IDS
+            or normalized_run_type != "scheduled"
+        ):
             raise _airflow_exception(
                 "FotMob daily producer requires an exact scheduled DagRun"
             )
@@ -1241,6 +1288,46 @@ def _control_store():
     return ControlStore.from_env()
 
 
+def _ceremony_disabled_publication(
+    owner: str, context: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Mint the deterministic ceremony-disabled stub for one owner DagRun.
+
+    The uuid5 covers dag_id, run_id and the exact data interval, so the
+    owner's templated child run ids stay unique per run and idempotent across
+    retries without any ControlStore row.  The stub schema is an explicit
+    marker: it can never satisfy the canonical binding validation, so a
+    deployed ceremony always rejects it.
+    """
+
+    start, end = _context_interval(context)
+    dag_run = context.get("dag_run")
+    dag_id = getattr(dag_run, "dag_id", None) or context.get("dag_id")
+    run_id = getattr(dag_run, "run_id", None) or context.get("run_id")
+    binding = {
+        "schema": FOTMOB_PUBLICATION_DISABLED_SCHEMA,
+        "source": FOTMOB_PUBLICATION_SOURCE,
+        "owner": str(owner or "").strip().casefold(),
+        "data_interval_start": _canonical_instant(
+            start, field="data_interval_start"
+        ),
+        "data_interval_end": _canonical_instant(end, field="data_interval_end"),
+        "runtime_fingerprint": "ceremony-disabled",
+    }
+    material = json.dumps(
+        {"dag_id": str(dag_id or ""), "run_id": str(run_id or ""), **binding},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "generation_id": str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f"fotmob-publication-disabled:{material}")
+        ),
+        "binding": binding,
+        "ceremony": "disabled",
+    }
+
+
 def initialize_fotmob_publication(
     *, publication_owner: str, **context: Any
 ) -> dict[str, Any]:
@@ -1251,6 +1338,17 @@ def initialize_fotmob_publication(
         attest_fotmob_isolated_runtime(**context)
     elif normalized_owner == "shared":
         attest_fotmob_shared_runtime(**context)
+    if not fotmob_ceremony_configured():
+        # No deployment report: there is no ControlStore lifecycle to bind a
+        # durable generation to, so hand a deterministic stub to the child.
+        publication = _ceremony_disabled_publication(normalized_owner, context)
+        task_instance = context.get("ti")
+        if task_instance is not None:
+            task_instance.xcom_push(
+                key=FOTMOB_PUBLICATION_XCOM_KEY,
+                value=publication,
+            )
+        return publication
     publication = expected_publication(publication_owner, context)
     dag_run = context.get("dag_run")
     dag_id = getattr(dag_run, "dag_id", None) or context.get("dag_id")
@@ -1316,10 +1414,14 @@ def publication_from_payload(raw: Any) -> dict[str, Any]:
     return {"generation_id": supplied_id, "binding": binding}
 
 
-def publication_from_context(context: Mapping[str, Any]) -> dict[str, Any]:
+def publication_from_context(context: Mapping[str, Any]) -> dict[str, Any] | None:
     """Read and cryptographically re-derive the parent-bound generation."""
 
     raw = _dag_run_conf(context).get(FOTMOB_PUBLICATION_CONF_KEY)
+    if not fotmob_ceremony_configured():
+        # Ceremony disabled: a missing publication or an owner stub is
+        # legitimate and carries no cryptographic authority to re-derive.
+        return dict(raw) if isinstance(raw, Mapping) else None
     if raw is None:
         raise _airflow_exception(f"DagRun conf requires {FOTMOB_PUBLICATION_CONF_KEY}")
     return publication_from_payload(raw)
@@ -1380,6 +1482,12 @@ def fotmob_publication_writer(
     """Hold the DB guard and attest before and after one Silver mutation."""
 
     publication = publication_from_context(context)
+    if not fotmob_ceremony_configured():
+        # No ControlStore generation exists without the ceremony; the attest
+        # stub still enforces the FOTMOB_ISOLATED_STACK gate for writers.
+        attest_fotmob_isolated_runtime(**dict(context))
+        yield publication if publication is not None else {"ceremony": "disabled"}
+        return
     _attest_fotmob_writer_runtime(publication, context)
     with _control_store().guard_publication_writer(
         publication["generation_id"], source=FOTMOB_PUBLICATION_SOURCE
@@ -1413,7 +1521,7 @@ def record_fotmob_silver_candidate(
 ) -> dict[str, Any]:
     """Record an immutable candidate only after every transform and both DQs."""
 
-    publication = publication_from_context(context)
+    publication = publication_from_context(context) or {}
     task_instance = context.get("ti")
     if task_instance is None:
         raise _airflow_exception("FotMob candidate task has no task instance")
@@ -1436,7 +1544,7 @@ def record_fotmob_silver_candidate(
         raise _airflow_exception("FotMob Silver quality evidence is not clean")
     evidence = {
         "schema": FOTMOB_PUBLICATION_SCHEMA,
-        "generation_id": publication["generation_id"],
+        "generation_id": publication.get("generation_id"),
         "transform_task_ids": list(expected_ids),
         "transform_results": transform_results,
         "row_count_gate": _normalize_candidate_value(dict(row_gate)),
@@ -1447,12 +1555,15 @@ def record_fotmob_silver_candidate(
     ).hexdigest()
     # ``record_publication_candidate`` locks and validates the same
     # generation row in its transaction; opening a second writer transaction
-    # here would self-deadlock on PostgreSQL's row lock.
-    _control_store().record_publication_candidate(
-        publication["generation_id"],
-        evidence,
-        source=FOTMOB_PUBLICATION_SOURCE,
-    )
+    # here would self-deadlock on PostgreSQL's row lock.  Without the
+    # ceremony there is no generation row: keep the DQ evidence gates above
+    # but skip the ControlStore write.
+    if fotmob_ceremony_configured():
+        _control_store().record_publication_candidate(
+            publication["generation_id"],
+            evidence,
+            source=FOTMOB_PUBLICATION_SOURCE,
+        )
     return evidence
 
 
@@ -1460,6 +1571,12 @@ def seal_fotmob_publication(**context: Any) -> dict[str, Any]:
     """Move ``writing`` to ``ready`` only after the Silver child succeeded."""
 
     publication = publication_from_context(context)
+    if not fotmob_ceremony_configured():
+        # No ControlStore generation to seal without the ceremony.
+        return {
+            "ceremony": "disabled",
+            "generation_id": (publication or {}).get("generation_id"),
+        }
     return _control_store().seal_publication_generation(
         publication["generation_id"],
         source=FOTMOB_PUBLICATION_SOURCE,
@@ -1489,6 +1606,25 @@ def fail_unsealed_fotmob_publication(
 ) -> dict[str, Any]:
     """Terminal producer cleanup without ever masking a failed DagRun."""
 
+    if not fotmob_ceremony_configured():
+        # No ControlStore lock exists, but a red child must still fail this
+        # terminal task so the producer DagRun never masks the failure.
+        publication = publication_from_context(context) or {}
+        states = _task_states(context)
+        success_state = states.get(success_task_id, "missing")
+        if success_state == "success":
+            return {
+                "status": "ready",
+                "ceremony": "disabled",
+                "generation_id": publication.get("generation_id"),
+            }
+        writer_states = {
+            task_id: states.get(task_id, "missing") for task_id in writer_task_ids
+        }
+        raise _airflow_exception(
+            "FotMob generation did not reach ready"
+            f" (success_task={success_state}, writers={writer_states})"
+        )
     publication = (
         publication_from_context(context)
         if publication_owner is None
