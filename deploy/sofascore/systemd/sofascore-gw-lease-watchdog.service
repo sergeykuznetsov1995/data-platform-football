@@ -1,0 +1,41 @@
+[Unit]
+Description=Free the SofaScore gateway's single lease slot when a lease latches stuck
+Documentation=https://github.com/sergeykuznetsov1995/data-platform-football/blob/master/deploy/sofascore/gateway_lease_watchdog.py
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+# Install with:
+#   install -m 0755 deploy/sofascore/gateway_lease_watchdog.py \
+#       /usr/local/libexec/sofascore-gw-lease-watchdog
+# The unit deliberately does not run the file straight out of a git checkout:
+# a mid-flight pull would swap the code of a process that restarts containers.
+ExecStart=/usr/bin/python3 /usr/local/libexec/sofascore-gw-lease-watchdog \
+    --container sofascore_gw_951 \
+    --state-dir /root/sofascore-runtime/gateway-state \
+    --expected-mount /root/dpf-release-aa2ce3ab \
+    --alert-command /root/.claude/hooks/tg-send.sh
+Restart=always
+RestartSec=30
+# It reads gateway state and shells out to docker; nothing here should ever
+# need more than that.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/run/docker.sock
+ProtectHome=read-only
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
