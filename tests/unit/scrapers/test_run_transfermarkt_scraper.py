@@ -1508,6 +1508,103 @@ class TestRunnerInternals:
         assert results['network_fetches'] == 0
         assert results['checkpoint_status'] == 'success'
 
+    def test_listing_empty_states_a_zero_roster_coverage(self, temp_output):
+        """#1025: skipping roster resolution must not skip stating coverage.
+
+        The listing-empty branch bypasses ``_select_player_ids``, which is the
+        only producer of ``roster_coverage``. Leaving the mapping empty made
+        the scope manifest carry ``{'market_value_history': {}}``, and
+        ``ScopeManifest._validate_roster_coverage`` refuses a field set that is
+        not exactly ``{roster_size, selected, pending}`` — every empty-shell
+        competition died there, one prod cycle after the last one was fixed.
+        """
+        mod = _import_runner()
+
+        class EmptyScraper:
+            _batch_id = 'empty-batch'
+            _last_endpoint_error = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read_market_value_points(self, **kwargs):
+                return pd.DataFrame(columns=[
+                    'player_id', 'mv_date', 'value_eur', '_batch_id',
+                ])
+
+            def materialize_legacy_market_value_history(
+                self, native, league, season, season_format,
+            ):
+                return native.assign(league=league, season='2526')
+
+            def get_traffic_stats(self):
+                return {
+                    'network_fetches': 0,
+                    'decoded_response_body_bytes': 0,
+                    'decoded_response_body_mb': 0.0,
+                }
+
+            def get_stats(self):
+                return {'requests': 0}
+
+        stub_pkg = MagicMock()
+        stub_pkg.TransfermarktScraper = MagicMock(return_value=EmptyScraper())
+        stub_scraper_mod = MagicMock(
+            R0_2B_FALLBACK_MARKER='TM_FALLBACK', **REAL_SEASON_HELPERS,
+        )
+
+        def committed_outputs(_scraper, spec, frames, _force, results):
+            for output in spec.outputs:
+                results['outputs'][output.key] = {
+                    'rows': 0,
+                    'table': f'iceberg.bronze.{output.table_name}',
+                    'applicability_status': 'authoritative_empty',
+                }
+
+        with (
+            patch.dict(sys.modules, {
+                'scrapers.transfermarkt': stub_pkg,
+                'scrapers.transfermarkt.scraper': stub_scraper_mod,
+                'scrapers.transfermarkt.registry': REAL_TM_REGISTRY,
+            }),
+            patch.dict(
+                os.environ, {'TM_LISTING_AUTHORITATIVE_EMPTY': 'true'},
+            ),
+            patch.object(mod, '_select_player_ids') as selection,
+            patch.object(mod, '_save_frames', side_effect=committed_outputs),
+            patch.object(mod, '_persist_dual_write_manifest', return_value={
+                'status': 'success', 'rows': [],
+            }),
+            patch.object(
+                mod, '_commit_checkpoint_or_pending', return_value='success',
+            ),
+        ):
+            mod._run_entity(
+                mod.ENTITY_SPECS['market_value_history'],
+                ['ENG-Premier League'], 2025, 100, temp_output,
+                refresh_mode='current', run_key='run-listing-empty',
+            )
+
+        # The whole point of the branch: no roster to resolve.
+        assert selection.call_count == 0
+        coverage = _load_results(temp_output)['roster_coverage']
+        assert coverage == {'roster_size': 0, 'selected': 0, 'pending': 0}
+
+        # And the shape the scope manifest actually validates against.
+        scope_state = importlib.import_module(
+            'dags.utils.transfermarkt_scope_state',
+        )
+        scope_state.ScopeManifest._validate_roster_coverage(
+            None,
+            {
+                'roster_coverage': {'market_value_history': coverage},
+                'career_fetches_pending': 0,
+            },
+        )
+
     def test_historical_selection_hydrates_only_manifest_proven_native(self):
         mod = _import_runner()
 

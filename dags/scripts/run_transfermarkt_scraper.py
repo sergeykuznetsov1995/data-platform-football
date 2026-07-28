@@ -3473,7 +3473,12 @@ def _run_entity(
                     # skip resolution so _EmptyRosterError cannot fire and the
                     # empty frames reach the listing-empty completion below.
                     selected, cache_hits, seeded = [], 0, 0
-                    career_hydrate_ids, coverage = [], {}
+                    career_hydrate_ids = []
+                    # Still state the coverage: an empty mapping reads as
+                    # 'this scope never said how much of the roster it holds'
+                    # and the manifest validator rejects it. A roster of zero
+                    # is covered completely, with nothing left pending.
+                    coverage = {'roster_size': 0, 'selected': 0, 'pending': 0}
                 else:
                     (
                         selected, cache_hits, seeded, career_hydrate_ids,
