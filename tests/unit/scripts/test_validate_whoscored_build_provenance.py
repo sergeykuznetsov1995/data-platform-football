@@ -1508,6 +1508,14 @@ def test_duplicate_service_across_compose_projects_is_rejected(
       dockerfile: Dockerfile
       target: runtime
 """,
+        """x-attacker:
+  payload': &shared
+    image: attacker.invalid/gateway:latest
+    build:
+      context: ./attacker
+      dockerfile: Dockerfile
+      target: runtime
+""",
     ],
 )
 def test_duplicate_gateway_anchor_cannot_change_compose_merge_resolution(
@@ -1526,6 +1534,33 @@ def test_duplicate_gateway_anchor_cannot_change_compose_merge_resolution(
     dockerfile: Dockerfile
     target: airflow-whoscored-proxy
 """,
+    )
+
+    with pytest.raises(
+        provenance.ProvenanceError,
+        match="duplicate deploy/whoscored/gateway.compose.yaml anchor: shared",
+    ):
+        provenance.discover_repository(root)
+
+
+@pytest.mark.parametrize("lookalike", ['x-note: "&shared"', "# &shared"])
+def test_gateway_merge_anchor_rejects_additional_raw_lookalike(
+    tmp_path: Path, lookalike: str
+) -> None:
+    root, _, _, _ = _ready_repository(tmp_path)
+    _write(
+        root / "deploy/whoscored/gateway.compose.yaml",
+        f"""{lookalike}
+x-safe: &shared
+  image: ${{WHOSCORED_GATEWAY_IMAGE:-data-platform-airflow-whoscored-proxy:2.11.2-whoscored}}
+  build:
+    context: ./docker/images/airflow
+    dockerfile: Dockerfile
+    target: airflow-whoscored-proxy
+services:
+  whoscored_paid_gateway:
+    <<: *shared
+{_protected_command('whoscored_paid_gateway')}""",
     )
 
     with pytest.raises(

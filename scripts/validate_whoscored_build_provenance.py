@@ -1175,56 +1175,16 @@ def _validate_compose_top_level(lines: Sequence[str], *, description: str) -> No
         raise ProvenanceError(f"{description} has no services mapping")
 
 
-def _yaml_anchor_definitions(line: str) -> list[str]:
-    """Return YAML anchor tokens outside quoted scalars and comments."""
+def _raw_anchor_definition_count(lines: Sequence[str], anchor: str) -> int:
+    """Count raw definitions for a service-level merge anchor.
 
-    anchors: list[str] = []
-    quote: str | None = None
-    index = 0
-    while index < len(line):
-        character = line[index]
-        if quote == '"':
-            if character == "\\":
-                index += 2
-                continue
-            if character == '"':
-                quote = None
-            index += 1
-            continue
-        if quote == "'":
-            if character == "'" and index + 1 < len(line) and line[index + 1] == "'":
-                index += 2
-                continue
-            if character == "'":
-                quote = None
-            index += 1
-            continue
-        if character in {'"', "'"}:
-            quote = character
-            index += 1
-            continue
-        if character == "#" and (index == 0 or line[index - 1].isspace()):
-            break
-        if character != "&" or (
-            index > 0
-            and not line[index - 1].isspace()
-            and line[index - 1] not in ":[{,-"
-        ):
-            index += 1
-            continue
-        match = re.match(r"&([A-Za-z0-9_.-]+)", line[index:])
-        if match is None:
-            index += 1
-            continue
-        end = index + len(match.group(0))
-        if end < len(line) and (
-            not line[end].isspace() and line[end] not in "#[]{} ,"
-        ):
-            index += 1
-            continue
-        anchors.append(match.group(1))
-        index = end
-    return anchors
+    Comments and quoted lookalikes are intentionally counted.  Requiring one
+    exact raw occurrence fails closed instead of trying to duplicate Compose's
+    YAML lexer and risking a decorated definition being missed.
+    """
+
+    pattern = re.compile(rf"&{re.escape(anchor)}(?![A-Za-z0-9_.-])")
+    return sum(len(pattern.findall(line)) for line in lines)
 
 
 def _parse_compose_services(
@@ -1240,13 +1200,6 @@ def _parse_compose_services(
         raise ProvenanceError(f"{description} is unavailable") from exc
     discovery.material_paths.add(compose_path)
     _validate_compose_top_level(lines, description=description)
-
-    anchor_definitions: set[str] = set()
-    for line in lines:
-        for anchor in _yaml_anchor_definitions(line):
-            if anchor in anchor_definitions:
-                raise ProvenanceError(f"duplicate {description} anchor: {anchor}")
-            anchor_definitions.add(anchor)
 
     anchors: dict[str, dict[str, str | None]] = {}
     anchor_execution_overrides: set[str] = set()
@@ -1325,12 +1278,17 @@ def _parse_compose_services(
                 raise ProvenanceError(f"unsupported Compose service merge: {name}")
             merged = re.match(r"^    <<:\s*\*([A-Za-z0-9_.-]+)\s*$", line)
             if merged:
-                if merged.group(1) not in anchors:
+                anchor = merged.group(1)
+                if _raw_anchor_definition_count(lines, anchor) != 1:
                     raise ProvenanceError(
-                        f"unsupported Compose service merge: {name}:{merged.group(1)}"
+                        f"duplicate {description} anchor: {anchor}"
                     )
-                merged_anchors.add(merged.group(1))
-                fields.update(anchors[merged.group(1)])
+                if anchor not in anchors:
+                    raise ProvenanceError(
+                        f"unsupported Compose service merge: {name}:{anchor}"
+                    )
+                merged_anchors.add(anchor)
+                fields.update(anchors[anchor])
         if merged_anchors & anchor_unmodelled_inputs:
             raise ProvenanceError(f"Compose service merges an unsafe anchor: {name}")
         if "extends" in service_keys:
