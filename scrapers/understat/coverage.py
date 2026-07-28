@@ -16,6 +16,10 @@ _EMPTY_MATCH_PAYLOAD = (
     "Understat getMatchData returned HTTP 200 but both shots and rosters "
     "were empty; verified 2026-07-27"
 )
+_RFPL_EMPTY_MATCH_PAYLOAD = (
+    "Understat getMatchData returned HTTP 200 but both shots and rosters "
+    "were empty; verified 2026-07-28"
+)
 
 _BY_SCOPE: Mapping[
     tuple[str, str], Mapping[str, Mapping[str, Mapping[str, str]]]
@@ -31,6 +35,24 @@ _BY_SCOPE: Mapping[
             "understat_shots": {"missing": {"27930": _EMPTY_MATCH_PAYLOAD}},
             "understat_player_match_stats": {
                 "missing": {"27930": _EMPTY_MATCH_PAYLOAD}
+            },
+        },
+        ("RUS-Premier League", "1920"): {
+            "understat_shots": {
+                "missing": {
+                    "11214": _RFPL_EMPTY_MATCH_PAYLOAD,
+                    "11222": _RFPL_EMPTY_MATCH_PAYLOAD,
+                    "11249": _RFPL_EMPTY_MATCH_PAYLOAD,
+                    "11260": _RFPL_EMPTY_MATCH_PAYLOAD,
+                }
+            },
+            "understat_player_match_stats": {
+                "missing": {
+                    "11214": _RFPL_EMPTY_MATCH_PAYLOAD,
+                    "11222": _RFPL_EMPTY_MATCH_PAYLOAD,
+                    "11249": _RFPL_EMPTY_MATCH_PAYLOAD,
+                    "11260": _RFPL_EMPTY_MATCH_PAYLOAD,
+                }
             },
         },
     }

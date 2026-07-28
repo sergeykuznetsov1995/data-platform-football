@@ -102,13 +102,16 @@ completed the scope after planning, history returns that existing attempt and
 does not append `in_progress`. The terminal watcher runs after cooldown and
 propagates mapped runner/validator failures to the DagRun status.
 
-Two match-level source exceptions were verified live on 2026-07-27. Both
-`getMatchData` calls return HTTP 200 but empty inner `shots` and `rosters`:
+Six match-level source exceptions were verified live. The FRA and GER payloads
+were verified on 2026-07-27; the four RFPL payloads were verified on
+2026-07-28. Every `getMatchData` call returns HTTP 200 but empty inner `shots`
+and `rosters`:
 
-| Scope | Match | Allowed missing entities |
-|---|---:|---|
-| FRA-Ligue 1 / 1617 | 4238 (SC Bastia–Lyon) | shots, player-match |
-| GER-Bundesliga / 2425 | 27930 (Holstein Kiel–Bochum) | shots, player-match |
+| Scope | Match IDs | Allowed missing entities | Verification date |
+|---|---|---|---|
+| FRA-Ligue 1 / 1617 | 4238 (SC Bastia–Lyon) | `understat_shots`, `understat_player_match_stats` | 2026-07-27 |
+| GER-Bundesliga / 2425 | 27930 (Holstein Kiel–Bochum) | `understat_shots`, `understat_player_match_stats` | 2026-07-27 |
+| RUS-Premier League / 1920 | 11214, 11222, 11249, 11260 | `understat_shots`, `understat_player_match_stats` | 2026-07-28 |
 
 They are exact-ID exceptions in `scrapers/understat/coverage.py`. No league- or
 season-wide percentage waiver exists; any new missing game blocks publication.
