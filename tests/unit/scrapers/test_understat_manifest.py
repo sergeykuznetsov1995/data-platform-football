@@ -403,6 +403,10 @@ def test_team_breakdowns_require_every_source_team_and_all_seven_dimensions():
 
 
 def test_reviewed_coverage_exceptions_are_exact_and_scope_specific():
+    rfpl_reason = (
+        "Understat getMatchData returned HTTP 200 but both shots and rosters "
+        "were empty; verified 2026-07-28"
+    )
     fra = coverage_exceptions_for_scope(
         ScopeKey("FRA-Ligue 1", "1617", source_season_id="2016")
     )
@@ -422,6 +426,10 @@ def test_reviewed_coverage_exceptions_are_exact_and_scope_specific():
         set(rfpl["understat_player_match_stats"]["missing"])
         == RFPL_EMPTY_MATCH_GAME_IDS
     )
+    assert set(rfpl["understat_shots"]["missing"].values()) == {rfpl_reason}
+    assert set(
+        rfpl["understat_player_match_stats"]["missing"].values()
+    ) == {rfpl_reason}
     assert coverage_exceptions_for_scope(SCOPE) == {}
 
     # The helper must not expose the reviewed module constant to mutation.
