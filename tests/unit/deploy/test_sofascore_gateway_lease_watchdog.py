@@ -281,42 +281,63 @@ def test_an_unreadable_dump_alerts():
     assert verdict.action == watchdog.ALERT
 
 
-def test_an_orphaned_durable_claim_alerts_because_a_restart_cannot_help_it():
-    allocations = {
-        "runs": {
-            "hist2024": {
-                "allocations": {
-                    "alloc-cd08d5ed": {
-                        "active_claim": {
-                            "lease_id": "lease-long-gone",
-                            "started_at": NOW - 4 * 3600.0,
-                        }
-                    }
-                }
-            }
-        }
+def _active_claim(age_seconds, **overrides):
+    """``active_claim`` exactly as the gateway persists it.
+
+    ``scrapers/sofascore/workload_plan.py:1633-1638`` writes these four keys and
+    no others: there is no lease id to match against, and ``started_at`` is an
+    ISO-8601 string rather than epoch seconds.  A fixture that invents either
+    shape passes against a watchdog that cannot read the real journal.
+    """
+
+    claim = {
+        "claim_token_hash": "c6a36352d7c44c58",
+        "attempt_id_hash": "85499ee0669aa200",
+        "start_spent_provider_bytes": 0,
+        "started_at": datetime.fromtimestamp(
+            NOW - age_seconds, tz=timezone.utc
+        ).isoformat(),
     }
+    claim.update(overrides)
+    return claim
+
+
+def _allocations(claim, allocation_id="alloc-cd08d5ed"):
+    return {
+        "runs": {"hist2024": {"allocations": {allocation_id: {"active_claim": claim}}}}
+    }
+
+
+def test_an_orphaned_durable_claim_alerts_because_a_restart_cannot_help_it():
+    allocations = _allocations(_active_claim(4 * 3600.0))
     verdict = watchdog.evaluate(_snapshot([], allocations=allocations))
     assert verdict.action == watchdog.ALERT
     assert verdict.details["orphans"][0]["allocation_id"] == "alloc-cd08d5ed"
 
 
 def test_a_young_active_claim_is_not_reported_as_orphaned():
-    allocations = {
-        "runs": {
-            "hist2024": {
-                "allocations": {
-                    "alloc-fresh": {
-                        "active_claim": {
-                            "lease_id": "lease-elsewhere",
-                            "started_at": NOW - 60.0,
-                        }
-                    }
-                }
-            }
-        }
-    }
+    # The regression: read with a plain ``float()`` the ISO stamp yields no age
+    # at all, so a claim opened a minute ago by a perfectly healthy run was
+    # paged as "outlived its lease" — on every sample, forever.
+    allocations = _allocations(_active_claim(60.0), allocation_id="alloc-fresh")
     verdict = watchdog.evaluate(_snapshot([], allocations=allocations))
+    assert verdict.action == watchdog.NONE
+
+
+def test_a_claim_whose_stamp_cannot_be_read_is_not_called_an_orphan():
+    allocations = _allocations(_active_claim(60.0, started_at="not-a-timestamp"))
+    verdict = watchdog.evaluate(_snapshot([], allocations=allocations))
+    assert verdict.action == watchdog.NONE
+
+
+def test_a_claim_naming_a_live_lease_is_skipped_whatever_its_age():
+    # Forward compatibility only: today's gateway stamps no lease id, so this
+    # branch never fires against the real journal.
+    allocations = _allocations(
+        _active_claim(4 * 3600.0, lease_id="lease-live"),
+        allocation_id="alloc-attached",
+    )
+    verdict = watchdog.evaluate(_snapshot([_lease()], allocations=allocations))
     assert verdict.action == watchdog.NONE
 
 
@@ -415,7 +436,7 @@ def test_a_boot_log_without_the_replay_line_reports_unknown():
 
 
 def test_an_unchanged_alert_is_not_repeated_every_sample():
-    # Five allocation claims have been orphaned since 2026-07-24 and will stay
+    # Four allocation claims have been orphaned since 2026-07-23 and will stay
     # orphaned until a human clears them; at one sample every five seconds that
     # is 17k notifications a day.
     throttle = watchdog.AlertThrottle()

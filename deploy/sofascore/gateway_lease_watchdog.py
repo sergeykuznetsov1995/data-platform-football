@@ -42,7 +42,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -85,8 +85,8 @@ SAMPLE_INTERVAL_SECONDS = 5.0
 MIN_RESTART_INTERVAL_SECONDS = 120.0
 MAX_RESTARTS_PER_DAY = 12
 
-# Several alert conditions are permanent until a human clears them — five
-# allocation claims have been orphaned since 2026-07-24. Repeating an unchanged
+# Several alert conditions are permanent until a human clears them — four
+# allocation claims have been orphaned since 2026-07-23. Repeating an unchanged
 # alert every sample would bury the one that is new.
 ALERT_REPEAT_SECONDS = 6 * 3600.0
 
@@ -131,6 +131,30 @@ def _as_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _as_epoch(value: Any) -> float | None:
+    """Epoch seconds from either a number or an ISO-8601 timestamp.
+
+    The two state files disagree on clock format and a single ``float()`` only
+    reads one of them: ``bytes.json`` dumps lease clocks as epoch floats, but
+    the durable allocation journal stamps ``active_claim.started_at`` with
+    ``datetime.now(timezone.utc).isoformat()`` (``scrapers/sofascore/
+    workload_plan.py:1633-1638``), which ``float()`` refuses.
+    """
+
+    number = _as_float(value)
+    if number is not None:
+        return number
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _holds_the_slot(lease: Mapping[str, Any]) -> bool:
@@ -233,19 +257,29 @@ def _orphaned_active_claims(
             claim = allocation.get("active_claim")
             if not isinstance(claim, Mapping):
                 continue
+            # The gateway persists only the token/attempt hashes and
+            # ``started_at`` into ``active_claim`` — never a lease id — so this
+            # guard is future-proofing and the age below is what actually
+            # decides. Reading the stamp with a plain ``float()`` made both
+            # skips unreachable and reported every in-flight claim of a healthy
+            # run as an orphan.
             lease_id = str(claim.get("lease_id") or "")
             if lease_id and lease_id in live:
                 continue
-            started = _as_float(claim.get("started_at"))
-            age = None if started is None else now - started
-            if age is not None and age < MAX_LEASE_TTL_SECONDS:
+            started = _as_epoch(claim.get("started_at"))
+            if started is None:
+                # An unreadable stamp is not evidence of an orphan; refuse to
+                # judge it rather than page a human on a claim we cannot age.
+                continue
+            age = now - started
+            if age < MAX_LEASE_TTL_SECONDS:
                 continue
             orphans.append(
                 {
                     "run": str(run_key),
                     "allocation_id": str(allocation_id),
                     "lease_id": lease_id,
-                    "age_seconds": None if age is None else round(age, 1),
+                    "age_seconds": round(age, 1),
                 }
             )
     return orphans
