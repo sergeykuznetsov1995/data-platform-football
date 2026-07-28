@@ -60,6 +60,11 @@ def test_production_page_chrome_paths_are_classified_not_drift():
             "content.attackingZones.expected",
             "content.heatmapUrl",
             "content.weather.condition",
+            # Appeared mid-canary on 2026-07-13 (44 matches): FotMob started
+            # shipping a video-highlights widget inside the match payload.
+            "content.highlightStories",
+            "content.highlightStories.stories[].provider",
+            "content.highlightStories.stories[].content[].restriction.blocked[]",
         ],
         "team": [
             "QAData[].question",
