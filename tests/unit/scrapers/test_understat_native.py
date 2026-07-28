@@ -532,6 +532,39 @@ def test_team_history_side_is_strict_and_matches_schedule_team():
         validate_league_payload(swapped)
 
 
+def test_cancelled_schedule_placeholders_do_not_define_history_sides():
+    payload = deepcopy(LEAGUE_PAYLOAD)
+    first_cancelled = deepcopy(LEAGUE_PAYLOAD["dates"][0])
+    first_cancelled.update(
+        id="101",
+        isResult=False,
+        datetime="2020-07-09 23:00:00",
+    )
+    second_cancelled = deepcopy(first_cancelled)
+    second_cancelled.update(
+        id="102",
+        h=deepcopy(first_cancelled["a"]),
+        a=deepcopy(first_cancelled["h"]),
+    )
+    payload["dates"].extend([first_cancelled, second_cancelled])
+
+    validate_league_payload(payload)
+
+
+def test_completed_schedule_side_conflicts_still_fail_closed():
+    payload = deepcopy(LEAGUE_PAYLOAD)
+    conflicting_result = deepcopy(LEAGUE_PAYLOAD["dates"][0])
+    conflicting_result.update(
+        id="101",
+        h=deepcopy(LEAGUE_PAYLOAD["dates"][0]["a"]),
+        a=deepcopy(LEAGUE_PAYLOAD["dates"][0]["h"]),
+    )
+    payload["dates"].append(conflicting_result)
+
+    with pytest.raises(UnderstatSchemaDrift, match="conflicting side mapping"):
+        validate_league_payload(payload)
+
+
 @pytest.mark.parametrize(
     ("field_path", "value", "message"),
     [

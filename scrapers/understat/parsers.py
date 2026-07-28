@@ -215,6 +215,12 @@ def validate_league_payload(payload: Mapping[str, Any]) -> None:
     for index, match in enumerate(dates):
         match = _require_mapping(match, f"getLeagueData.dates[{index}]")
         _validate_match_record(match, f"getLeagueData.dates[{index}]", team=False)
+        is_result = _boolean(
+            match["isResult"],
+            f"getLeagueData.dates[{index}].isResult",
+        )
+        if is_result is not True:
+            continue
         date_value = str(match["datetime"]).strip()
         for side in ("h", "a"):
             team_id = str(match[side]["id"]).strip()
