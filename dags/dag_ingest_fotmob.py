@@ -5,9 +5,12 @@ owner.  One isolated runner performs catalog discovery, exact-season planning,
 raw-first ingestion and emits an atomic, run-specific report.  Validation is
 fail-closed and Silver can only run after a complete native report.
 
-Every production run must be launched by one schedule owner with an exact
-``fotmob_publication`` binding.  An ad-hoc direct trigger has no durable writer
-lock and therefore fails before touching Bronze.
+With a deployed publication ceremony every production run must be launched by
+one schedule owner with an exact ``fotmob_publication`` binding; an ad-hoc
+direct trigger has no durable writer lock and therefore fails before touching
+Bronze.  Without a deployment report the ceremony is disabled and the fence
+degrades to the plain ``FOTMOB_ISOLATED_STACK`` gate
+(``utils.fotmob_publication.fotmob_ceremony_configured``).
 """
 
 import hashlib
@@ -63,23 +66,42 @@ ISSUE_930_REPLAY_ENTITIES = [
     "season",
     "teams",
 ]
+# The conf may legitimately lack ``fotmob_publication`` when the publication
+# ceremony is not deployed (``utils.fotmob_publication
+# .fotmob_ceremony_configured``), so the templates render empty strings
+# instead of failing.  The runner itself decides what the rendered arguments
+# mean: a full canonical set is validated cryptographically, an all-empty or
+# ceremony-disabled stub set runs without the ControlStore guard, and a
+# partial set still fails.  Keeping that decision in the runner (not in
+# Jinja) keeps it unit-testable.
+PUBLICATION_CONF_EXPR = "(dag_run.conf.get('fotmob_publication') or {})"
 PUBLICATION_GENERATION_TEMPLATE = (
-    "{{ dag_run.conf['fotmob_publication']['generation_id'] }}"
+    "{{ " + PUBLICATION_CONF_EXPR + ".get('generation_id', '') }}"
 )
 PUBLICATION_BINDING_TEMPLATE = {
-    "schema": "{{ dag_run.conf['fotmob_publication']['binding']['schema'] }}",
-    "source": "{{ dag_run.conf['fotmob_publication']['binding']['source'] }}",
-    "owner": "{{ dag_run.conf['fotmob_publication']['binding']['owner'] }}",
-    "data_interval_start": (
-        "{{ dag_run.conf['fotmob_publication']['binding']['data_interval_start'] }}"
-    ),
-    "data_interval_end": (
-        "{{ dag_run.conf['fotmob_publication']['binding']['data_interval_end'] }}"
-    ),
-    "runtime_fingerprint": (
-        "{{ dag_run.conf['fotmob_publication']['binding']['runtime_fingerprint'] }}"
-    ),
+    field: (
+        "{{ ("
+        + PUBLICATION_CONF_EXPR
+        + ".get('binding') or {}).get('"
+        + field
+        + "', '') }}"
+    )
+    for field in (
+        "schema",
+        "source",
+        "owner",
+        "data_interval_start",
+        "data_interval_end",
+        "runtime_fingerprint",
+    )
 }
+# Without a publication the Silver child still needs a unique, retry-stable
+# run id; the ingest DagRun's own run_id is exactly that.
+SILVER_TRIGGER_RUN_ID_TEMPLATE = (
+    "{{ 'fotmob_silver__' ~ ("
+    + PUBLICATION_CONF_EXPR
+    + ".get('generation_id') or run_id) }}"
+)
 
 
 def _validate_daily_selection(
@@ -830,9 +852,11 @@ with DAG(
     selected/latest seasons. ``backfill`` prioritizes required sentinels then
     active/newest and older source seasons. ``replay`` performs no network I/O.
 
-    Production runs are parent-only. The shared master or isolated daily owner
-    supplies the exact interval/release/owner publication generation; direct
-    CLI/UI triggers are intentionally rejected before the Bronze writer.
+    With a deployed publication ceremony production runs are parent-only: the
+    shared master or an isolated schedule owner supplies the exact
+    interval/release/owner publication generation and direct CLI/UI triggers
+    are rejected before the Bronze writer.  Without a deployment report the
+    ceremony is disabled and only the isolated-stack gate remains.
     """,
 ) as dag:
     publication_preflight = PythonOperator(
@@ -911,7 +935,7 @@ python dags/scripts/run_fotmob_scraper.py \\
     trigger_silver = TriggerDagRunOperator(
         task_id="trigger_silver_transform",
         trigger_dag_id="dag_transform_fotmob_silver",
-        trigger_run_id=("fotmob_silver__" + PUBLICATION_GENERATION_TEMPLATE),
+        trigger_run_id=SILVER_TRIGGER_RUN_ID_TEMPLATE,
         logical_date="{{ logical_date.isoformat() }}",
         conf={
             "fotmob_publication": {

@@ -361,7 +361,10 @@ class TestDynamicDiscoveryDag:
         assert '/usr/bin/rm -f -- "/tmp/fotmob_result_{{ ts_nodash }}.json"' in (
             task.bash_command
         )
-        generation = "{{ dag_run.conf['fotmob_publication']['generation_id'] }}"
+        generation = (
+            "{{ (dag_run.conf.get('fotmob_publication') or {})"
+            ".get('generation_id', '') }}"
+        )
         assert f'--publication-generation-id "{generation}"' in task.bash_command
         for argument in (
             "--publication-schema",

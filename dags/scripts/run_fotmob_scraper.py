@@ -72,11 +72,30 @@ PUBLICATION_BINDING_ARGUMENTS = {
 _ACTIVE_PUBLICATION_GENERATION: str | None = None
 
 
-def _publication_from_args(args) -> dict[str, Any]:
-    """Return the canonical generation identity supplied by the owner DAG."""
+def _publication_from_args(args) -> dict[str, Any] | None:
+    """Return the canonical generation identity supplied by the owner DAG.
 
-    from utils.fotmob_publication import publication_from_payload
+    ``None`` disables the publication machinery for this run: either the
+    ceremony is not deployed and no ``--publication-*`` argument was given
+    (ad-hoc run), or the owner DAG handed over an explicit ceremony-disabled
+    stub.  With a deployed ceremony the arguments stay exactly as mandatory
+    as before, and a partial set always fails.
+    """
 
+    from utils.fotmob_publication import (
+        FOTMOB_PUBLICATION_DISABLED_SCHEMA,
+        fotmob_ceremony_configured,
+        publication_from_payload,
+    )
+
+    values = [args.publication_generation_id] + [
+        getattr(args, argument) for argument in PUBLICATION_BINDING_ARGUMENTS.values()
+    ]
+    ceremony_free = not any(str(value or "").strip() for value in values) or (
+        args.publication_schema == FOTMOB_PUBLICATION_DISABLED_SCHEMA
+    )
+    if ceremony_free and not fotmob_ceremony_configured():
+        return None
     return publication_from_payload(
         {
             "generation_id": args.publication_generation_id,
@@ -553,8 +572,10 @@ def _build_native_service(args, run_id: str):
 def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, Any]]:
     """Run source-native discovery and a deterministic, budgeted work plan."""
 
-    if _ACTIVE_PUBLICATION_GENERATION != getattr(
-        args, "publication_generation_id", None
+    # An empty publication id means a ceremony-free run: no guard is active
+    # and none is required.
+    if _ACTIVE_PUBLICATION_GENERATION != (
+        getattr(args, "publication_generation_id", None) or None
     ):
         raise RuntimeError(
             "FotMob native service construction requires its exact active "
@@ -1363,7 +1384,9 @@ def _argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _validate_args(parser: argparse.ArgumentParser, args) -> dict[str, Any]:
+def _validate_args(
+    parser: argparse.ArgumentParser, args
+) -> dict[str, Any] | None:
     positive = {
         "--max-requests": args.max_requests,
         "--max-direct-mib": args.max_direct_mib,
@@ -1504,7 +1527,11 @@ def _validate_args(parser: argparse.ArgumentParser, args) -> dict[str, Any]:
         publication = _publication_from_args(args)
     except Exception as exc:
         parser.error(f"invalid FotMob publication: {exc}")
-    if args.run_id and args.run_id != publication["generation_id"]:
+    if (
+        publication is not None
+        and args.run_id
+        and args.run_id != publication["generation_id"]
+    ):
         parser.error("--run-id must exactly equal --publication-generation-id")
     return publication
 
@@ -1534,6 +1561,25 @@ def _failure_payload(args, exc: Exception) -> dict[str, Any]:
     }
 
 
+def _run_native_unfenced(args) -> tuple[int, dict[str, Any]]:
+    """Run ingestion with salvage-flush failure handling and no DB guard.
+
+    Ceremony-free runs (no publication identity) call this directly;
+    guarded runs wrap it in ``_run_native_under_fence``.
+    """
+
+    try:
+        return _run_native(args)
+    except (ValueError, RuntimeError) as exc:
+        logger.error("FotMob runner configuration/runtime failure: %s", exc)
+        _salvage_flush()
+        return 1, _failure_payload(args, exc)
+    except Exception as exc:
+        logger.exception("Unexpected FotMob runner failure")
+        _salvage_flush()
+        return 1, _failure_payload(args, exc)
+
+
 def _run_native_under_fence(
     args,
     publication: Mapping[str, Any],
@@ -1543,16 +1589,7 @@ def _run_native_under_fence(
     _attest_native_runtime(args, publication)
     with _native_writer_fence(publication):
         try:
-            try:
-                return _run_native(args)
-            except (ValueError, RuntimeError) as exc:
-                logger.error("FotMob runner configuration/runtime failure: %s", exc)
-                _salvage_flush()
-                return 1, _failure_payload(args, exc)
-            except Exception as exc:
-                logger.exception("Unexpected FotMob runner failure")
-                _salvage_flush()
-                return 1, _failure_payload(args, exc)
+            return _run_native_unfenced(args)
         finally:
             # Every normal and salvage write has finished, but the DB guard is
             # still held. Drift here turns the run red before publication can
@@ -1568,15 +1605,21 @@ def main():
     parser = _argument_parser()
     args = parser.parse_args()
     publication = _validate_args(parser, args)
-    args.publication_generation_id = publication["generation_id"]
-    args.run_id = publication["generation_id"]
+    if publication is not None:
+        args.publication_generation_id = publication["generation_id"]
+        args.run_id = publication["generation_id"]
     output = args.output or f"/tmp/fotmob_result_{_safe_run_id(args.run_id)}.json"
     try:
         signal.signal(signal.SIGTERM, _sigterm_to_exception)
     except ValueError:
         pass  # not in the main thread (unit-test harness) — keep default
     try:
-        rc, payload = _run_native_under_fence(args, publication)
+        if publication is None:
+            # Ceremony-free run: no ControlStore guard and no attestation,
+            # exactly the pre-#995 runner semantics.
+            rc, payload = _run_native_unfenced(args)
+        else:
+            rc, payload = _run_native_under_fence(args, publication)
     except Exception as exc:
         # Guard acquisition/validation failed before the service was built.
         # Do not salvage-flush here: there is no publication authority.

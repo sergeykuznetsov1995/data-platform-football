@@ -1496,3 +1496,112 @@ class TestFotmobNativeRunner:
         assert mod._ACTIVE_NATIVE_SERVICE is None
         payload = json.loads(out.read_text())
         assert any("terminated by signal" in e for e in payload["errors"])
+
+    @pytest.mark.unit
+    def test_ceremony_free_cli_accepts_absent_publication_and_rejects_partial(
+        self, monkeypatch
+    ):
+        from utils import fotmob_publication as publication
+
+        mod = self._module()
+        parser = mod._argument_parser()
+        monkeypatch.delenv(
+            publication.FOTMOB_DEPLOYMENT_REPORT_PATH_ENV, raising=False
+        )
+        monkeypatch.delenv(
+            publication.FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV, raising=False
+        )
+
+        args = parser.parse_args(["--mode", "discover"])
+        assert mod._validate_args(parser, args) is None
+        assert args.run_id == ""
+
+        with pytest.raises(SystemExit):
+            mod._validate_args(
+                parser,
+                parser.parse_args(
+                    [
+                        "--mode",
+                        "discover",
+                        "--publication-generation-id",
+                        "11111111-1111-4111-8111-111111111111",
+                    ]
+                ),
+            )
+
+    @pytest.mark.unit
+    def test_ceremony_free_cli_accepts_owner_stub_and_deployed_env_rejects_it(
+        self, monkeypatch
+    ):
+        from utils import fotmob_publication as publication
+
+        mod = self._module()
+        parser = mod._argument_parser()
+        monkeypatch.delenv(
+            publication.FOTMOB_DEPLOYMENT_REPORT_PATH_ENV, raising=False
+        )
+        monkeypatch.delenv(
+            publication.FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV, raising=False
+        )
+        stub_args = [
+            "--mode",
+            "discover",
+            "--publication-generation-id",
+            "11111111-1111-5111-8111-111111111111",
+            "--publication-schema",
+            publication.FOTMOB_PUBLICATION_DISABLED_SCHEMA,
+            "--publication-source",
+            "fotmob",
+            "--publication-owner",
+            "isolated",
+            "--publication-data-interval-start",
+            "2026-07-20T14:00:00+00:00",
+            "--publication-data-interval-end",
+            "2026-07-21T14:00:00+00:00",
+            "--publication-runtime-fingerprint",
+            "ceremony-disabled",
+        ]
+        assert mod._validate_args(parser, parser.parse_args(stub_args)) is None
+
+        monkeypatch.setenv(
+            publication.FOTMOB_DEPLOYMENT_REPORT_PATH_ENV, "/deployment-report.json"
+        )
+        with pytest.raises(SystemExit):
+            mod._validate_args(parser, parser.parse_args(stub_args))
+        with pytest.raises(SystemExit):
+            mod._validate_args(parser, parser.parse_args(["--mode", "discover"]))
+
+    @pytest.mark.unit
+    def test_ceremony_free_main_runs_without_fence_or_attestation(
+        self, monkeypatch, tmp_path
+    ):
+        from utils import fotmob_publication as publication
+
+        mod = self._module()
+        monkeypatch.delenv(
+            publication.FOTMOB_DEPLOYMENT_REPORT_PATH_ENV, raising=False
+        )
+        monkeypatch.delenv(
+            publication.FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV, raising=False
+        )
+        fence = MagicMock()
+        attest = MagicMock()
+        monkeypatch.setattr(mod, "_native_writer_fence", fence)
+        monkeypatch.setattr(mod, "_attest_native_runtime", attest)
+        monkeypatch.setattr(
+            mod,
+            "_run_native",
+            lambda _args: (0, {"status": "success", "complete": True}),
+        )
+        out = tmp_path / "report.json"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["run_fotmob_scraper.py", "--mode", "discover", "--output", str(out)],
+        )
+
+        assert mod.main() == 0
+
+        fence.assert_not_called()
+        attest.assert_not_called()
+        assert json.loads(out.read_text(encoding="utf-8"))["status"] == "success"

@@ -31,6 +31,14 @@ START = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
 END = START + timedelta(days=1)
 
 
+def _ceremony_env(monkeypatch):
+    """Pin a deployed ceremony so strict fail-closed semantics stay under test."""
+
+    monkeypatch.setenv(
+        publication.FOTMOB_DEPLOYMENT_REPORT_PATH_ENV, "/deployment-report.json"
+    )
+
+
 def _issue_930_scope_file() -> Path:
     return (
         Path(__file__).resolve().parents[3]
@@ -878,6 +886,7 @@ def test_generation_id_binds_exact_interval_runtime_and_owner(monkeypatch):
 
 
 def test_child_rejects_stale_runtime_and_wrong_generation(monkeypatch):
+    _ceremony_env(monkeypatch)
     binding = _binding()
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, OTHER_SHA)
     with pytest.raises(Exception, match="runtime fingerprint mismatch"):
@@ -891,6 +900,7 @@ def test_child_rejects_stale_runtime_and_wrong_generation(monkeypatch):
 
 
 def test_child_rejects_noncanonical_binding_even_with_matching_id(monkeypatch):
+    _ceremony_env(monkeypatch)
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     binding = _binding()
     generation_id = publication.make_generation_id(binding)
@@ -949,6 +959,7 @@ def test_master_waits_for_writing_and_claims_only_exact_ready(monkeypatch):
 
 
 def test_initializer_acquires_exact_generation_before_return(monkeypatch):
+    _ceremony_env(monkeypatch)
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     monkeypatch.setenv(publication.FOTMOB_ISOLATED_STACK_ENV, "1")
     attestation = MagicMock(return_value={"runtime_manifest_sha256": "c" * 64})
@@ -974,6 +985,7 @@ def test_initializer_acquires_exact_generation_before_return(monkeypatch):
 
 
 def test_shared_initializer_attests_admitted_runtime_before_acquire(monkeypatch):
+    _ceremony_env(monkeypatch)
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     attestation = MagicMock(return_value={"runtime_manifest_sha256": "c" * 64})
     monkeypatch.setattr(publication, "attest_fotmob_shared_runtime", attestation)
@@ -997,6 +1009,7 @@ def test_shared_initializer_attests_admitted_runtime_before_acquire(monkeypatch)
 
 
 def test_writer_preflight_holds_exact_phase_guard(monkeypatch):
+    _ceremony_env(monkeypatch)
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     monkeypatch.setenv(publication.FOTMOB_ISOLATED_STACK_ENV, "1")
     events = []
@@ -1038,6 +1051,7 @@ def test_writer_preflight_holds_exact_phase_guard(monkeypatch):
 
 
 def test_shared_writer_attests_bind_bytes_before_and_after_guarded_work(monkeypatch):
+    _ceremony_env(monkeypatch)
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     events = []
     attestation = MagicMock(
@@ -1076,6 +1090,7 @@ def test_shared_writer_attests_bind_bytes_before_and_after_guarded_work(monkeypa
 
 
 def test_writer_post_attestation_drift_fails_before_guard_release(monkeypatch):
+    _ceremony_env(monkeypatch)
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     monkeypatch.setenv(publication.FOTMOB_ISOLATED_STACK_ENV, "1")
     events = []
@@ -1116,18 +1131,21 @@ def test_writer_post_attestation_drift_fails_before_guard_release(monkeypatch):
 
 
 def test_isolated_writer_missing_role_cannot_skip_runtime_attestation(monkeypatch):
+    # Without a deployment report the ceremony is disabled, so the writer
+    # fence falls back to the plain isolation gate — which must still hold.
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     monkeypatch.delenv(publication.FOTMOB_ISOLATED_STACK_ENV, raising=False)
     store = MagicMock()
     monkeypatch.setattr(publication, "_control_store", store)
 
-    with pytest.raises(Exception, match="report path is not exactly configured"):
+    with pytest.raises(Exception, match="requires FOTMOB_ISOLATED_STACK=1"):
         publication.validate_fotmob_writer_fence(**_context())
 
     store.assert_not_called()
 
 
 def test_candidate_is_exact_digested_and_seal_renews_full_lease(monkeypatch):
+    _ceremony_env(monkeypatch)
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     record = MagicMock(return_value={"phase": "writing"})
     seal = MagicMock(return_value={"phase": "ready"})
@@ -1208,6 +1226,7 @@ def test_xref_consumer_preflight_requires_full_active_claim(monkeypatch):
 
 
 def test_raw_manual_xref_has_no_publication_authority(monkeypatch):
+    _ceremony_env(monkeypatch)
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     context = _context()
     context["dag_run"].conf = {}
@@ -1242,6 +1261,8 @@ def test_master_rejects_failed_or_already_published_generation(
 
 def test_lost_child_response_never_releases_failed_writer(monkeypatch):
     """A failed parent trigger may leave the exact Silver child still writing."""
+
+    _ceremony_env(monkeypatch)
 
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     fail = MagicMock(return_value={"phase": "failed", "released": False})
@@ -1369,3 +1390,149 @@ def test_isolated_owner_initializes_before_deterministic_exact_trigger(
     assert finalizer.upstream_task_ids == {trigger.task_id}
     assert finalizer._init_kwargs["trigger_rule"] == "all_done"
     assert module.dag._dag_kwargs["schedule"] == "0 14 * * *"
+
+
+# ---------------------------------------------------------------------------
+# Ceremony-free contour: no deployment report configured
+# ---------------------------------------------------------------------------
+
+
+def _ceremony_free_env(monkeypatch):
+    monkeypatch.delenv(publication.FOTMOB_DEPLOYMENT_REPORT_PATH_ENV, raising=False)
+    monkeypatch.delenv(
+        publication.FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV, raising=False
+    )
+    monkeypatch.setenv(publication.FOTMOB_ISOLATED_STACK_ENV, "1")
+
+
+def test_ceremony_free_attestation_keeps_only_the_isolation_gate():
+    assert publication.attest_fotmob_isolated_runtime(
+        environ={publication.FOTMOB_ISOLATED_STACK_ENV: "1"}
+    ) == {"ceremony": "disabled"}
+
+    with pytest.raises(Exception, match="requires FOTMOB_ISOLATED_STACK=1"):
+        publication.attest_fotmob_isolated_runtime(environ={})
+
+    # A configured report path keeps the full fail-closed attestation.
+    with pytest.raises(Exception, match="unavailable or invalid"):
+        publication.attest_fotmob_isolated_runtime(
+            environ={
+                publication.FOTMOB_ISOLATED_STACK_ENV: "1",
+                publication.FOTMOB_DEPLOYMENT_REPORT_PATH_ENV: "/missing.json",
+            }
+        )
+
+
+def test_ceremony_free_initializer_mints_deterministic_stub_without_store(
+    monkeypatch,
+):
+    _ceremony_free_env(monkeypatch)
+    store = MagicMock()
+    monkeypatch.setattr(publication, "_control_store", store)
+    context = _context()
+
+    result = publication.initialize_fotmob_publication(
+        publication_owner="isolated", **context
+    )
+
+    assert result["ceremony"] == "disabled"
+    assert result["binding"]["schema"] == (
+        publication.FOTMOB_PUBLICATION_DISABLED_SCHEMA
+    )
+    assert result["binding"]["owner"] == "isolated"
+    store.assert_not_called()
+    context["ti"].xcom_push.assert_called_once_with(
+        key=publication.FOTMOB_PUBLICATION_XCOM_KEY, value=result
+    )
+
+    repeat = publication.initialize_fotmob_publication(
+        publication_owner="isolated", **context
+    )
+    assert repeat["generation_id"] == result["generation_id"]
+
+    context["dag_run"].run_id = "scheduled__2026-07-21T14:00:00+00:00"
+    assert (
+        publication.initialize_fotmob_publication(
+            publication_owner="isolated", **context
+        )["generation_id"]
+        != result["generation_id"]
+    )
+
+
+def test_ceremony_free_writer_fence_passes_missing_conf_and_owner_stub(
+    monkeypatch,
+):
+    _ceremony_free_env(monkeypatch)
+    store = MagicMock()
+    monkeypatch.setattr(publication, "_control_store", store)
+    context = _context()
+    context["dag_run"].conf = {}
+
+    assert publication.validate_fotmob_writer_fence(**context) == {
+        "ceremony": "disabled"
+    }
+
+    stub = publication._ceremony_disabled_publication("isolated", context)
+    context["dag_run"].conf = {publication.FOTMOB_PUBLICATION_CONF_KEY: stub}
+    assert publication.validate_fotmob_writer_fence(**context) == stub
+    store.assert_not_called()
+
+
+def test_ceremony_free_seal_and_finalize_keep_the_child_verdict(monkeypatch):
+    _ceremony_free_env(monkeypatch)
+    store = MagicMock()
+    monkeypatch.setattr(publication, "_control_store", store)
+
+    sealed = publication.seal_fotmob_publication(**_context())
+    assert sealed["ceremony"] == "disabled"
+
+    green = _context(trigger_fotmob_refresh="success")
+    assert (
+        publication.fail_unsealed_fotmob_publication(
+            publication_owner="isolated",
+            success_task_id="trigger_fotmob_refresh",
+            writer_task_ids=["trigger_fotmob_refresh"],
+            **green,
+        )["status"]
+        == "ready"
+    )
+
+    red = _context(trigger_fotmob_refresh="failed")
+    with pytest.raises(Exception, match="did not reach ready"):
+        publication.fail_unsealed_fotmob_publication(
+            publication_owner="isolated",
+            success_task_id="trigger_fotmob_refresh",
+            writer_task_ids=["trigger_fotmob_refresh"],
+            **red,
+        )
+    store.assert_not_called()
+
+
+def test_deployed_owner_gate_admits_refresh_and_backfill_scheduled_runs(tmp_path):
+    roots, _path, _report, environment, _dag_run = _isolated_runtime_evidence(
+        tmp_path
+    )
+
+    for dag_id in sorted(publication.FOTMOB_ISOLATED_OWNER_DAG_IDS):
+        admitted = publication.attest_fotmob_isolated_runtime(
+            environ=environment,
+            hostname="1" * 12,
+            roots=roots,
+            dag_run=SimpleNamespace(dag_id=dag_id, run_type="scheduled"),
+        )
+        assert admitted["deployment_id"] == "f" * 32
+
+    with pytest.raises(Exception, match="exact scheduled DagRun"):
+        publication.attest_fotmob_isolated_runtime(
+            environ=environment,
+            hostname="1" * 12,
+            roots=roots,
+            dag_run=SimpleNamespace(dag_id="dag_refresh_fotmob", run_type="manual"),
+        )
+    with pytest.raises(Exception, match="exact scheduled DagRun"):
+        publication.attest_fotmob_isolated_runtime(
+            environ=environment,
+            hostname="1" * 12,
+            roots=roots,
+            dag_run=SimpleNamespace(dag_id="dag_ingest_fotmob", run_type="scheduled"),
+        )
