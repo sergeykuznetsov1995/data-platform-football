@@ -70,6 +70,196 @@ class TestFetchFBrefIdentityUniverse:
         ]
 
 
+class TestFetchUnderstatIdentityUniverse:
+    def test_source_unsupported_competition_is_an_empty_input(self, monkeypatch):
+        monkeypatch.setattr(
+            xpr,
+            "_execute",
+            lambda *_args, **_kwargs: pytest.fail(
+                "source-unsupported competition must not query Understat"
+            ),
+        )
+
+        assert xpr._fetch_understat_players(
+            object(), "INT-World Cup", ["2026"]
+        ) == []
+
+    def test_rejects_rfpl_outside_the_downstream_top_five(self, monkeypatch):
+        monkeypatch.setattr(
+            xpr,
+            "_execute",
+            lambda *_args, **_kwargs: pytest.fail("RFPL must not query Understat"),
+        )
+
+        with pytest.raises(xpr.ResolverError, match="top-5"):
+            xpr._fetch_understat_players(
+                object(), "RUS-Premier League", ["2526"]
+            )
+
+    def test_run_resolver_keeps_world_cup_in_the_multi_league_loop(
+        self, monkeypatch
+    ):
+        class Connection:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        connection = Connection()
+        monkeypatch.setattr(xpr, "_get_trino_connection", lambda: connection)
+        monkeypatch.setattr(xpr, "_build_nicknamer", lambda: None)
+        monkeypatch.setattr(
+            xpr,
+            "_execute",
+            lambda *_args, **_kwargs: pytest.fail(
+                "dry-run fixture must not execute SQL"
+            ),
+        )
+        for fetcher in (
+            "_fetch_fbref_players",
+            "_fetch_whoscored_players",
+            "_fetch_fotmob_players",
+            "_fetch_sofascore_players",
+            "_fetch_transfermarkt_players",
+            "_fetch_capology_players",
+            "_fetch_sofifa_players",
+            "_fetch_espn_players",
+        ):
+            monkeypatch.setattr(xpr, fetcher, lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(
+            xpr, "_fetch_dob_maps", lambda *_args, **_kwargs: {}
+        )
+
+        def resolve_all(_fb, understat, *_args, **_kwargs):
+            assert understat == []
+            return [], [], {}
+
+        monkeypatch.setattr(xpr, "_resolve_all", resolve_all)
+        monkeypatch.setattr(
+            xpr, "_dedup_canonical_per_season", lambda rows: (rows, {})
+        )
+        monkeypatch.setattr(xpr, "KNOWN_PAIRS_BY_LEAGUE", {})
+
+        summary = xpr.run_resolver(
+            league="INT-World Cup",
+            seasons=[2026],
+            drop_before_insert=False,
+            materialize_review=False,
+        )
+
+        assert summary["rows_inserted"] == 0
+        assert summary["known_pair_pass_rate"] == "skipped"
+        assert connection.closed is True
+
+    def test_native_cutover_preserves_legacy_unattempted_scopes(self, monkeypatch):
+        captured = {}
+
+        def fake_execute(conn, sql, fetch=False):
+            captured["sql"] = sql
+            return [("10", "Player", "Club", "ENG-Premier League", "2526", 90.0)]
+
+        monkeypatch.setattr(xpr, "_execute", fake_execute)
+        rows = xpr._fetch_understat_players(
+            object(), "ENG-Premier League", ["2526"]
+        )
+
+        assert "iceberg.bronze.understat_player_team_season_stats" in captured["sql"]
+        assert "iceberg.bronze.understat_players" in captured["sql"]
+        assert "iceberg.ops.understat_ingest_manifest_v1" in captured["sql"]
+        assert "contract_version = 'understat-bronze-v2'" in captured["sql"]
+        assert "ORDER BY completed_at DESC, attempt_id DESC" in captured["sql"]
+        assert "m.status = 'complete'" in captured["sql"]
+        assert "p._batch_id = m.batch_id" in captured["sql"]
+        assert "AND m.league IS NULL" in captured["sql"]
+        assert "UNION ALL" in captured["sql"]
+        assert rows[0]["raw_team_name"] == "Club"
+
+    @pytest.fixture
+    def reader_db(self, monkeypatch):
+        duckdb = pytest.importorskip("duckdb")
+        con = duckdb.connect()
+        con.execute(
+            "CREATE TABLE manifest (contract_version VARCHAR, league VARCHAR, "
+            "season VARCHAR, batch_id VARCHAR, status VARCHAR, "
+            "completed_at VARCHAR, attempt_id VARCHAR)"
+        )
+        for table in ("native_players", "legacy_players"):
+            con.execute(
+                f"CREATE TABLE {table} (player_id BIGINT, player VARCHAR, "
+                "team VARCHAR, league VARCHAR, season VARCHAR, minutes BIGINT, "
+                "_batch_id VARCHAR)"
+            )
+
+        def execute(_conn, sql, fetch=False):
+            translated = (
+                sql.replace(
+                    "iceberg.ops.understat_ingest_manifest_v1", "manifest"
+                )
+                .replace(
+                    "iceberg.bronze.understat_player_team_season_stats",
+                    "native_players",
+                )
+                .replace("iceberg.bronze.understat_players", "legacy_players")
+            )
+            return con.execute(translated).fetchall()
+
+        monkeypatch.setattr(xpr, "_execute", execute)
+        yield con
+        con.close()
+
+    def test_complete_cutover_keeps_other_legacy_history(self, reader_db):
+        reader_db.execute(
+            "INSERT INTO legacy_players VALUES "
+            "(10, 'Old Player', 'Old Club', 'ENG-Premier League', '2425', 900, 'l1'), "
+            "(11, 'Wrong Legacy', 'Legacy Club', 'ENG-Premier League', '2526', 800, 'l2')"
+        )
+        reader_db.execute(
+            "INSERT INTO native_players VALUES "
+            "(11, 'Wrong Batch', 'Wrong Club', 'ENG-Premier League', '2526', 100, 'b1'), "
+            "(11, 'Native Player', 'Native Club', 'ENG-Premier League', '2526', 700, 'b2')"
+        )
+        reader_db.execute(
+            "INSERT INTO manifest VALUES "
+            "('understat-bronze-v2', 'ENG-Premier League', '2526', 'b2', "
+            "'complete', '2026-07-27T10:00:00+00:00', 'a1')"
+        )
+
+        rows = xpr._fetch_understat_players(
+            object(), "ENG-Premier League", ["2425", "2526"]
+        )
+
+        assert {(row["season"], row["player_name"], row["raw_team_name"])
+                for row in rows} == {
+            ("2425", "Old Player", "Old Club"),
+            ("2526", "Native Player", "Native Club"),
+        }
+
+    def test_later_in_progress_attempt_hides_only_that_scope(self, reader_db):
+        reader_db.execute(
+            "INSERT INTO legacy_players VALUES "
+            "(10, 'Old Player', 'Old Club', 'ENG-Premier League', '2425', 900, 'l1')"
+        )
+        reader_db.execute(
+            "INSERT INTO native_players VALUES "
+            "(11, 'Native Player', 'Native Club', 'ENG-Premier League', '2526', 700, 'b1')"
+        )
+        reader_db.execute(
+            "INSERT INTO manifest VALUES "
+            "('understat-bronze-v2', 'ENG-Premier League', '2526', 'b1', "
+            "'complete', '2026-07-27T10:00:00+00:00', 'a1'), "
+            "('understat-bronze-v2', 'ENG-Premier League', '2526', 'b2', "
+            "'in_progress', '2026-07-27T11:00:00+00:00', 'a2')"
+        )
+
+        rows = xpr._fetch_understat_players(
+            object(), "ENG-Premier League", ["2425", "2526"]
+        )
+
+        assert [(row["season"], row["player_name"]) for row in rows] == [
+            ("2425", "Old Player")
+        ]
+
+
 # ---------------------------------------------------------------------------
 # normalize_name
 # ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@
 -- Phase B). This table therefore carries `understat_game_id` raw for Gold to
 -- bridge, NOT a resolved match_id.
 --
--- Source:
+-- Source (native seven-table Bronze contract):
 --   iceberg.bronze.understat_shots    — shot-level events with xG (primary feed)
 --   iceberg.bronze.understat_players  — name→player_id dictionary for assists
 --   iceberg.silver.xref_team          — understat team NAME → canonical id
@@ -27,13 +27,15 @@
 -- Partitioning: (league, season) — applied externally by run_silver_transform.
 --
 -- =============================================================================
--- Bronze schema (bronze.understat_shots — verified via DESCRIBE 2026-05-08)
+-- Bronze schema (bronze.understat_shots — native parser contract 2026-07-27)
 -- =============================================================================
 --   shot_id            BIGINT      -- Understat-assigned, globally unique
 --   game_id            BIGINT      -- Understat match id
 --   team_id            BIGINT      -- Understat team id (UNUSED; team via name)
 --   player_id          BIGINT      -- Understat player id
---   assist_player      VARCHAR     -- assister NAME (no per-shot numeric id, #444)
+--   assist_player_id   BIGINT      -- roster-resolved Understat player id
+--   assist_player      VARCHAR     -- raw name, retained as migration fallback
+--   last_action        VARCHAR     -- source lastAction, previously discarded
 --   minute             BIGINT
 --   location_x         DOUBLE      -- 0..1 normalized field coords
 --   location_y         DOUBLE
@@ -65,21 +67,50 @@
 --     'us_<slug>' canonicals must not leak as a resolved team_id, #506). Player
 --     xref is orphan-tolerant (xref_player emits us_* canonicals for orphans,
 --     rejection ≤6.94% per E1 — kept).
---   * assist_player has NO numeric id in bronze; resolved by NAME via the
---     understat_players dictionary, then xref_player (#444).
+--   * Native rows resolve assist_player_id from the match roster. Historical
+--     rows without it fall back to the name dictionary, then xref_player.
 -- =============================================================================
 
 WITH
 
+understat_manifest_latest AS (
+    SELECT league, season, batch_id, status
+    FROM (
+        SELECT
+            league,
+            season,
+            batch_id,
+            status,
+            ROW_NUMBER() OVER (
+                PARTITION BY league, season
+                ORDER BY completed_at DESC, attempt_id DESC
+            ) AS rn
+        FROM iceberg.ops.understat_ingest_manifest_v1
+        WHERE contract_version = 'understat-bronze-v2'
+    )
+    WHERE rn = 1
+),
+
 -- 1) Dedup bronze.understat_shots (idempotent re-scrape protection) -----------
 shots_dedup AS (
-    SELECT *,
+    SELECT s.*,
            ROW_NUMBER() OVER (
-               PARTITION BY shot_id
-               ORDER BY _ingested_at DESC
+               PARTITION BY s.shot_id
+               ORDER BY s._ingested_at DESC
            ) AS rn
-    FROM iceberg.bronze.understat_shots
-    WHERE shot_id IS NOT NULL
+    FROM iceberg.bronze.understat_shots s
+    LEFT JOIN understat_manifest_latest m
+      ON m.league = s.league
+     AND m.season = CAST(s.season AS varchar)
+    WHERE s.shot_id IS NOT NULL
+      AND s.league IN (
+          'ENG-Premier League', 'ESP-La Liga', 'GER-Bundesliga',
+          'ITA-Serie A', 'FRA-Ligue 1'
+      )
+      AND (
+          m.league IS NULL
+          OR (m.status = 'complete' AND s._batch_id = m.batch_id)
+      )
 ),
 
 -- 2) Normalize enums + cast scalars ------------------------------------------
@@ -92,7 +123,10 @@ shots_norm AS (
         s.team                         AS understat_team_source_id,
         -- xref_player.source_id for source='understat' is player_id as varchar.
         CAST(s.player_id AS varchar)   AS understat_player_source_id,
-        -- #444: resolve the assister by NAME (bronze has no per-shot assist id).
+        -- Native ingestion resolves the raw assist name against the match
+        -- roster. Keep name fallback for historical/source-anomaly rows.
+        CAST(s.assist_player_id AS varchar)
+                                        AS understat_assist_player_source_id,
         LOWER(s.assist_player)         AS assist_player_norm,
         CAST(s.minute    AS integer)   AS minute,
         s.location_x                   AS x,
@@ -133,10 +167,10 @@ shots_norm AS (
     WHERE s.rn = 1
 ),
 
--- 3) Understat name→player_id dictionary (#444) ------------------------------
---    Understat has NO per-shot numeric assist id; the assister NAME is correct,
---    so recover the player_id from bronze.understat_players (same source that
---    feeds xref_player) keyed on (LOWER(name), league, season). Deduped with
+-- 3) Understat name→player_id compatibility dictionary -----------------------
+--    Native rows carry the roster-derived numeric assist id. Historical rows
+--    may not, so recover it from bronze.understat_players keyed on
+--    (LOWER(name), league, season). Deduped with
 --    ROW_NUMBER (not GROUP BY) to keep the output shot-grain and avoid an R1
 --    ROLLUP false-positive in the charter checker. Identical names within one
 --    league-season (rare) tie-break to the most-recently-ingested row.
@@ -144,16 +178,27 @@ us_player_dim AS (
     SELECT player_norm, league, season, understat_player_id
     FROM (
         SELECT
-            LOWER(player)                AS player_norm,
-            league,
-            CAST(season AS varchar)      AS season,
-            CAST(player_id AS varchar)   AS understat_player_id,
+            LOWER(p.player)                AS player_norm,
+            p.league,
+            CAST(p.season AS varchar)      AS season,
+            CAST(p.player_id AS varchar)   AS understat_player_id,
             ROW_NUMBER() OVER (
-                PARTITION BY LOWER(player), league, CAST(season AS varchar)
-                ORDER BY _ingested_at DESC, player_id
+                PARTITION BY LOWER(p.player), p.league, CAST(p.season AS varchar)
+                ORDER BY p._ingested_at DESC, p.player_id
             )                            AS rn
-        FROM iceberg.bronze.understat_players
-        WHERE player IS NOT NULL AND player_id IS NOT NULL
+        FROM iceberg.bronze.understat_players p
+        LEFT JOIN understat_manifest_latest m
+          ON m.league = p.league
+         AND m.season = CAST(p.season AS varchar)
+        WHERE p.player IS NOT NULL AND p.player_id IS NOT NULL
+          AND p.league IN (
+              'ENG-Premier League', 'ESP-La Liga', 'GER-Bundesliga',
+              'ITA-Serie A', 'FRA-Ligue 1'
+          )
+          AND (
+              m.league IS NULL
+              OR (m.status = 'complete' AND p._batch_id = m.batch_id)
+          )
     )
     WHERE rn = 1
 )
@@ -165,7 +210,8 @@ SELECT
 
     xt.canonical_id                                AS team_id,
     xp.canonical_id                                AS player_id,
-    xa.canonical_id                                AS assist_player_id,
+    COALESCE(xa_id.canonical_id, xa_name.canonical_id)
+                                                    AS assist_player_id,
 
     sn.minute,
     sn.x,
@@ -201,14 +247,20 @@ LEFT JOIN iceberg.silver.xref_player xp
       AND xp.league    = sn.league
       AND xp.season    = sn.season
 
--- Assister: name → understat player_id (dict), then xref_player → canonical.
+-- Assister: native roster id first; name dictionary is compatibility fallback.
+LEFT JOIN iceberg.silver.xref_player xa_id
+       ON xa_id.source    = 'understat'
+      AND xa_id.source_id = sn.understat_assist_player_source_id
+      AND xa_id.league    = sn.league
+      AND xa_id.season    = sn.season
+
 LEFT JOIN us_player_dim upd
        ON upd.player_norm = sn.assist_player_norm
       AND upd.league      = sn.league
       AND upd.season      = sn.season
 
-LEFT JOIN iceberg.silver.xref_player xa
-       ON xa.source    = 'understat'
-      AND xa.source_id = upd.understat_player_id
-      AND xa.league    = sn.league
-      AND xa.season    = sn.season
+LEFT JOIN iceberg.silver.xref_player xa_name
+       ON xa_name.source    = 'understat'
+      AND xa_name.source_id = upd.understat_player_id
+      AND xa_name.league    = sn.league
+      AND xa_name.season    = sn.season

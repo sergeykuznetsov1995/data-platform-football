@@ -41,16 +41,16 @@ NON_INTERNATIONAL_LEAGUES: List[str] = [
     league for league in LEAGUES if not league.startswith('INT-')
 ]
 
-# Understat multi-league scope. Independent of the global LEAGUES for the same
-# reason as other source-owned registries (flipping LEAGUES switches every
-# source at once).
-# Extending is a deliberate step: first run per new league backfills ~380
-# match JSONs (~5 KB wire each ≈ 2 MB) + the league JSON — direct traffic, no
-# proxy; steady-state is "new matches only" (persistent soccerdata_cache).
-# Understat covers the top-5 leagues out of the box; RUS-Premier League needs a
-# custom soccerdata league_dict.json first (see UnderstatScraper.SUPPORTED_LEAGUES).
+# Source-owned production scope.  The native Understat reader keeps this
+# independent from global LEAGUES: RFPL is captured in Bronze but deliberately
+# remains outside the FBref-backed Gold spine.
 UNDERSTAT_LEAGUES: List[str] = [
     'ENG-Premier League',
+    'ESP-La Liga',
+    'GER-Bundesliga',
+    'ITA-Serie A',
+    'FRA-Ligue 1',
+    'RUS-Premier League',
 ]
 
 # MatchHistory (football-data.co.uk) multi-league scope. Independent of the
@@ -135,11 +135,6 @@ _APL_TEAMS = 20
 PER_LEAGUE_FLOOR_BASES: Dict[str, Tuple[str, int]] = {
     'whoscored_schedule': ('match', 340),      # 380 fixtures/season - 10% margin
     'espn_schedule': ('match', 340),           # 380 fixtures/season - 10% margin
-    'understat_schedule': ('match', 340),      # 380 fixtures/season - 10% margin
-    'understat_team_match_stats': ('match', 340),   # 380 team-match rows - 10%
-    'understat_shots': ('match', 8000),        # ~9.8k shots/season - 20% margin
-    'understat_player_match_stats': ('match', 10_000),  # ~11.1k rows/season - 10%
-    'understat_players': ('team', 450),        # ~547 player-season rows - 18%
     'sofifa_players': ('team', 450),           # 546 players / league edition - 18%
     'sofifa_teams': ('team', 18),              # 20 clubs / league - 10%
     'sofifa_team_ratings': ('team', 18),       # 20 clubs / league - 10%
@@ -181,7 +176,9 @@ def get_min_row_threshold(threshold_key: str, league: str) -> int:
 # Minimum row thresholds for validation (per single DagRun = 1 league x 1 season).
 # Consumed by validate_table() in dags/utils/bronze_validation.py (fail-closed
 # on a missing key, #106/#110) via the validate tasks in the whoscored / espn /
-# understat / sofifa ingest DAGs.
+# sofifa ingest DAGs. Understat has a source-native seven-table validator and
+# append-only publication manifest, so retaining its old aggregate floors here
+# would be dead configuration with a weaker and conflicting contract.
 #
 # #920 Phase 2: keys present in PER_LEAGUE_FLOOR_BASES are enforced per league
 # via get_min_row_threshold when the DAG passes its league scope; the values
@@ -202,19 +199,12 @@ MIN_ROW_THRESHOLDS: Dict[str, int] = {
     # one-scope non-empty floor and must not encode a static league list.
     'whoscored_schedule': PER_LEAGUE_FLOOR_BASES['whoscored_schedule'][1],
     'whoscored_events': 20_000_000,  # #895: top-5×10-season backfill landed (27.9M rows, append-only); wipe-floor ~72% of live
-    # ESPN / Understat / SoFIFA (issue #466): same silent-fail class as #102 —
+    # ESPN / SoFIFA (issue #466): same silent-fail class as #102 —
     # read_* swallowed errors and runners exited 0. Floors calibrated against
     # live Bronze counts on 2026-06-11.
     'espn_schedule': PER_LEAGUE_FLOOR_BASES['espn_schedule'][1],
     'espn_lineup': 9000,
     'espn_matchsheet': 620,
-    'understat_schedule': PER_LEAGUE_FLOOR_BASES['understat_schedule'][1],
-    'understat_players': PER_LEAGUE_FLOOR_BASES['understat_players'][1],
-    'understat_shots': PER_LEAGUE_FLOOR_BASES['understat_shots'][1],
-    'understat_team_match_stats':
-        PER_LEAGUE_FLOOR_BASES['understat_team_match_stats'][1],
-    'understat_player_match_stats':
-        PER_LEAGUE_FLOOR_BASES['understat_player_match_stats'][1],
     # sofifa_*: club leagues only (INT-* not covered by sofifa), scaled by the
     # club-league count so the floor does not inflate when a tournament joins
     # LEAGUES (#913).

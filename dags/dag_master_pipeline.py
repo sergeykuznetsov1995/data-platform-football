@@ -4,7 +4,8 @@ Master Pipeline DAG
 
 Airflow DAG for orchestrating all data ingestion DAGs.
 Uses TriggerDagRunOperator for trigger-owned child DAGs and fail-closed sensors
-for the independently scheduled 06:00 FBref and 10:00 WhoScored runs.
+for the independently scheduled 06:00 FBref, 09:00 Understat, and 10:00
+WhoScored runs.
 
 Schedules daily at 2 PM UTC. It owns FotMob only while the explicit
 ``fotmob_schedule_owner`` handoff control is ``shared``; the isolated scheduler
@@ -51,15 +52,19 @@ logger = logging.getLogger(__name__)
 TRIGGERED_INGESTION_DAGS = [
     'dag_ingest_fotmob',
     'dag_ingest_matchhistory',
-    'dag_ingest_understat',
     'dag_ingest_espn',
     'dag_ingest_clubelo',
 ]
 
-# FBref and WhoScored own their 06:00/10:00 schedules and request/byte budgets.
+# FBref, Understat, and WhoScored own their 06:00/09:00/10:00 schedules and
+# request/byte budgets.
 # Master only waits for those exact runs; triggering them again at 14:00 would
 # create duplicate crawls and traffic accounting generations.
-SCHEDULED_INGESTION_DAGS = ['dag_ingest_fbref', 'dag_ingest_whoscored']
+SCHEDULED_INGESTION_DAGS = [
+    'dag_ingest_fbref',
+    'dag_ingest_understat',
+    'dag_ingest_whoscored',
+]
 
 # Complete reporting scope (both master-triggered and externally scheduled).
 INGESTION_DAGS = [*TRIGGERED_INGESTION_DAGS, *SCHEDULED_INGESTION_DAGS]
@@ -70,6 +75,7 @@ INGESTION_DAGS = [*TRIGGERED_INGESTION_DAGS, *SCHEDULED_INGESTION_DAGS]
 # downstream from a failed or partial required source would mix generations.
 REQUIRED_SOURCE_TASKS = {
     'dag_ingest_fotmob': 'ingestion_triggers.trigger_fotmob',
+    'dag_ingest_understat': 'wait_for_scheduled_understat',
     'dag_ingest_whoscored': 'wait_for_scheduled_whoscored',
 }
 
@@ -327,8 +333,8 @@ def enforce_required_source_success(**context) -> Dict[str, str]:
     The check deliberately reads task instances from *this* master DagRun.
     Looking up the latest child DagRun is racy because a separately scheduled
     child run can finish while the master is still executing. Trigger-owned
-    sources and the exact-date WhoScored sensor both expose their publication
-    evidence as task-instance state in this master DagRun.
+    sources and the exact-date Understat/WhoScored sensors expose their
+    publication evidence as task-instance state in this master DagRun.
     """
     from airflow.exceptions import AirflowException
 
@@ -604,8 +610,9 @@ with DAG(
     ### Execution Order
 
     1. Other Bronze ingestion DAGs run in sequence.
-    2. Master waits for the successful scheduled **FBref 06:00** run; it does
-       not launch a second crawl or consume a second traffic budget.
+    2. Master waits for successful scheduled **FBref 06:00**, **Understat
+       09:00**, and **WhoScored 10:00** runs; it does not launch duplicate
+       source crawls or consume a second traffic budget.
     3. Master publishes xref, then E3/E4 and auxiliary Silver transforms run
        on that validated identity spine.
     4. A single final FBref Gold run consumes all successful prerequisites.
@@ -808,6 +815,23 @@ with DAG(
         check_existence=True,
     )
     wait_for_scheduled_whoscored >> required_sources_gate
+
+    # Understat is the sole owner of its 09:00 source-discovery window. The
+    # 14:00 master run waits for that exact generation instead of launching a
+    # duplicate current scrape five hours later.
+    wait_for_scheduled_understat = ExternalTaskSensor(
+        task_id='wait_for_scheduled_understat',
+        external_dag_id='dag_ingest_understat',
+        external_task_id=None,
+        allowed_states=['success'],
+        failed_states=['failed'],
+        execution_delta=timedelta(hours=5),
+        mode='reschedule',
+        poke_interval=60,
+        timeout=timedelta(hours=8).total_seconds(),
+        check_existence=True,
+    )
+    wait_for_scheduled_understat >> required_sources_gate
 
     # The isolated scheduler cannot be observed through this Airflow metadata
     # database.  Poll the shared ControlStore for the exact interval/release/

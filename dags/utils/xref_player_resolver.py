@@ -2,9 +2,9 @@
 Player identity resolver — production-quality (E1, T3)
 ======================================================
 
-Production port of the R2 spike prototype (``scripts/r2_resolver_proto.py``).
-Resolves cross-source player identities into a single ``canonical_id`` and
-materialises ``iceberg.silver.xref_player`` via Trino INSERT.
+Production player-identity resolver. Resolves cross-source identities into a
+single ``canonical_id`` and materialises ``iceberg.silver.xref_player`` via
+Trino INSERT.
 
 Pipeline
 --------
@@ -145,6 +145,29 @@ SOURCES: Tuple[str, ...] = (
     'transfermarkt', 'capology', 'sofifa', 'espn',
 )
 
+# Understat Bronze also captures RFPL for source completeness, but the
+# cross-source Silver/Gold identity spine is intentionally the European top 5.
+# Keep this boundary centralized so an ad-hoc resolver call cannot bypass the
+# SQL-level league guards and introduce RFPL orphans into xref_player.
+UNDERSTAT_DOWNSTREAM_LEAGUES = frozenset(
+    {
+        'ENG-Premier League',
+        'ESP-La Liga',
+        'GER-Bundesliga',
+        'ITA-Serie A',
+        'FRA-Ligue 1',
+    }
+)
+
+# Understat itself also exposes RFPL.  That league is intentionally captured
+# in Bronze but excluded from the shared European top-five identity spine.
+# Competitions outside this set (for example INT-World Cup) are not Understat
+# competitions at all and must contribute an empty source input rather than
+# aborting the multi-competition xref DAG.
+UNDERSTAT_SOURCE_LEAGUES = UNDERSTAT_DOWNSTREAM_LEAGUES | frozenset(
+    {"RUS-Premier League"}
+)
+
 #: Default batch size for ``INSERT INTO ... VALUES (...)``. 500 fits
 #: comfortably under Trino's default ``query.max-length`` (≈ 16 MB) for
 #: our per-row payload size (~150 bytes).
@@ -153,8 +176,7 @@ DEFAULT_CHUNK_SIZE = 500
 #: Known pairs per league that the resolver MUST resolve to a single
 #: canonical_id across the core sources. Pulled from the R2 spike — hard-coded
 #: rather than configurable so a regression in alias or threshold tuning
-#: surfaces immediately. Kept in sync with ``scripts/r2_resolver_proto.py``
-#: (KNOWN_PAIRS at the bottom). A league with NO entry here SKIPS the
+#: surfaces immediately. A league with NO entry here SKIPS the
 #: regression gate with a WARNING (multi-league prep) — add anchors when a
 #: league is onboarded, do not fail it on an empty anchor set.
 KNOWN_PAIRS_BY_LEAGUE: Dict[str, Tuple[Tuple[str, str], ...]] = {
@@ -900,11 +922,11 @@ def _execute(conn, sql: str, fetch: bool = False):
 # ---------------------------------------------------------------------------
 # Bronze readers
 # ---------------------------------------------------------------------------
-# NOTE on column names: query layout is taken verbatim from
-# scripts/r2_resolver_proto.py which was successfully run on Bronze APL
-# 2024-25 (see docs/research/R2_player_resolver.md). Bronze schemas:
+# NOTE on column names: the query layout is pinned to the production Bronze
+# schemas and its APL 2024-25 validation (see docs/research/R2_player_resolver.md):
 #   * fbref_player_stats     -> player_id, player, squad, season(int), league
-#   * understat_players      -> player_id, player, team, season(varchar), league
+#   * understat_player_team_season_stats -> player_id, player, team,
+#                                           season(varchar), league
 #   * whoscored_events_current -> player_id, player, team, season(varchar), league
 # (squad/team naming difference is REAL — FBref calls it "squad").
 # Re-discovered column names would be a regression so they are pinned here.
@@ -986,22 +1008,87 @@ def _fetch_fbref_players(
 def _fetch_understat_players(
     conn, league: str, source_seasons: List[str]
 ) -> List[Dict[str, Any]]:
-    # ``minutes`` is a season-level column on bronze.understat_players; used
+    if league not in UNDERSTAT_SOURCE_LEAGUES:
+        logger.info(
+            "Skipping Understat identity input for source-unsupported league=%r",
+            league,
+        )
+        return []
+    if league not in UNDERSTAT_DOWNSTREAM_LEAGUES:
+        raise ResolverError(
+            f"Understat downstream identity is restricted to the top-5 leagues; "
+            f"got {league!r}"
+        )
+    # The source-native team endpoint provides the correct team split for a
+    # player who changed clubs. The old league aggregate exposed a comma-joined
+    # team title and attributed the combined metrics to its first club.
+    # ``minutes`` is used
     # as the dedup tiebreaker in _dedup_canonical_per_season (issue #70) so
     # the row tied to the player's primary club wins when one canonical_id
     # maps to multiple Understat source_ids (Harrison Reed 910/6827).
+    # Publication is scope-atomic at read time. Before a scope has any native
+    # manifest attempt, retain the legacy league aggregate so deploying the
+    # parser does not erase historical identities. Once a manifest row exists,
+    # fail closed unless its latest attempt is complete; completed native scopes
+    # read only the exact seven-table batch certified by that attempt.
     sql = f"""
-        SELECT CAST(player_id AS varchar) AS pid,
-               player,
-               team,
-               league,
-               season,
-               CAST(COALESCE(MAX(minutes), 0) AS DOUBLE) AS bronze_signal
-        FROM iceberg.bronze.understat_players
-        WHERE league = '{_sql_escape(league)}'
-          AND season IN ({_seasons_in_clause(source_seasons)})
-          AND player IS NOT NULL
-        GROUP BY player_id, player, team, league, season
+        WITH understat_manifest_latest AS (
+            SELECT league, season, batch_id, status
+            FROM (
+                SELECT
+                    league,
+                    season,
+                    batch_id,
+                    status,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY league, season
+                        ORDER BY completed_at DESC, attempt_id DESC
+                    ) AS rn
+                FROM iceberg.ops.understat_ingest_manifest_v1
+                WHERE contract_version = 'understat-bronze-v2'
+            )
+            WHERE rn = 1
+        ),
+        native_players AS (
+            SELECT CAST(p.player_id AS varchar) AS pid,
+                   p.player,
+                   p.team,
+                   p.league,
+                   p.season,
+                   CAST(COALESCE(MAX(p.minutes), 0) AS DOUBLE) AS bronze_signal
+            FROM iceberg.bronze.understat_player_team_season_stats p
+            JOIN understat_manifest_latest m
+              ON m.league = p.league
+             AND m.season = CAST(p.season AS varchar)
+             AND m.status = 'complete'
+             AND p._batch_id = m.batch_id
+            WHERE p.league = '{_sql_escape(league)}'
+              AND p.season IN ({_seasons_in_clause(source_seasons)})
+              AND p.player IS NOT NULL
+            GROUP BY p.player_id, p.player, p.team, p.league, p.season
+        ),
+        legacy_players AS (
+            SELECT CAST(p.player_id AS varchar) AS pid,
+                   p.player,
+                   p.team,
+                   p.league,
+                   p.season,
+                   CAST(COALESCE(MAX(p.minutes), 0) AS DOUBLE) AS bronze_signal
+            FROM iceberg.bronze.understat_players p
+            LEFT JOIN understat_manifest_latest m
+              ON m.league = p.league
+             AND m.season = CAST(p.season AS varchar)
+            WHERE p.league = '{_sql_escape(league)}'
+              AND p.season IN ({_seasons_in_clause(source_seasons)})
+              AND p.player IS NOT NULL
+              AND m.league IS NULL
+            GROUP BY p.player_id, p.player, p.team, p.league, p.season
+        )
+        SELECT pid, player, team, league, season, bronze_signal
+        FROM native_players
+        UNION ALL
+        SELECT pid, player, team, league, season, bronze_signal
+        FROM legacy_players
     """
     rows = _execute(conn, sql, fetch=True) or []
     out: List[Dict[str, Any]] = []

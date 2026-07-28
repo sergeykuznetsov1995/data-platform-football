@@ -186,3 +186,72 @@ def test_bidirectional_parity_rejects_either_delta():
     report = dq.bidirectional_set_delta([('a',)], [('a',), ('b',)])
     assert report['passed'] is False
     assert report['right_only'] == [('b',)]
+
+
+def _empty_listing_input(**overrides):
+    statuses = {entity: 'authoritative_empty' for entity in ENTITIES}
+    values = dict(
+        expected_team_ids=(),
+        observed_team_ids=(),
+        endpoint_status_by_team={},
+        entity_statuses=statuses,
+        listing_status='authoritative_empty',
+    )
+    values.update(overrides)
+    return _input(**values)
+
+
+def test_authoritative_empty_listing_completes_with_empty_entities():
+    report = dq.validate_scope_capture(
+        _empty_listing_input(), expected_entities=ENTITIES,
+    )
+    assert report['passed'] is True
+    assert report['participant_count'] == 0
+    assert report['participant_coverage'] == 1.0
+
+
+def test_authoritative_empty_listing_rejects_participant_evidence():
+    with pytest.raises(dq.ScopeDQError, match='cannot carry participant'):
+        dq.validate_scope_capture(
+            _empty_listing_input(expected_team_ids=('1',)),
+            expected_entities=ENTITIES,
+        )
+
+
+def test_authoritative_empty_listing_rejects_ok_entities():
+    statuses = {entity: 'authoritative_empty' for entity in ENTITIES}
+    statuses['squad_memberships'] = 'ok'
+    with pytest.raises(dq.ScopeDQError, match='contradicts'):
+        dq.validate_scope_capture(
+            _empty_listing_input(entity_statuses=statuses),
+            expected_entities=ENTITIES,
+        )
+
+
+def test_authoritative_empty_listing_keeps_current_freshness_gate():
+    with pytest.raises(dq.ScopeDQError, match='stale'):
+        dq.validate_scope_capture(
+            _empty_listing_input(
+                fetched_at=datetime.now(timezone.utc) - timedelta(days=30),
+            ),
+            expected_entities=ENTITIES,
+        )
+
+
+def test_empty_listing_contract_flips_required_nonempty_entities():
+    contract = dq.entity_applicability_contract(
+        entity='squad_memberships',
+        competition_type='domestic_cup',
+        team_type='club',
+        listing_authoritative_empty=True,
+    )
+    assert contract['allowed_statuses'] == ['authoritative_empty']
+    assert contract['minimum_rows'] == 0
+    assert contract['requires_authoritative_empty_evidence'] is True
+
+    unchanged = dq.entity_applicability_contract(
+        entity='squad_memberships',
+        competition_type='domestic_cup',
+        team_type='club',
+    )
+    assert unchanged['allowed_statuses'] == ['ok']

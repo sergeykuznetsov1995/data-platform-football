@@ -4,8 +4,8 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.understat_shots
   description: |
-    Сырые удары (shot events) из Understat (soccerdata UnderstatScraper,
-    read_shot_events). Grain — один row на удар. Несёт per-shot xG, координаты
+    Source-native удары из getMatchData Understat. Grain — один row на удар.
+    Несёт per-shot xG, координаты
     на поле (нормализованные 0-1), ситуацию/часть тела и игрока-ассистента.
     Источник penalty-xG для Silver-агрегатов. Партиционирование
     ['league','season'].
@@ -18,6 +18,8 @@ columns:
     description: Лига (e.g. 'ENG-Premier League'); partition key.
   - name: season
     description: Сезон в формате Understat (e.g. '2526'); partition key.
+  - name: source_season_id
+    description: Исходный год начала сезона Understat.
   - name: game_id
     description: Числовой Understat match_id удара.
   - name: game
@@ -55,7 +57,9 @@ columns:
     tags:
       - PII.Low
   - name: assist_player_id
-    description: Understat player_id ассистента (NULL без ассиста).
+    description: Understat player_id ассистента, разрешённый через match roster (NULL без однозначного ассиста).
+  - name: last_action
+    description: Последнее действие перед ударом из source lastAction.
   - name: league_id
     description: Внутренний идентификатор лиги Understat.
   - name: season_id
@@ -67,4 +71,4 @@ columns:
   - name: _ingested_at
     description: Timestamp ingest'а строки в Bronze; метаколонка.
   - name: _batch_id
-    description: Идентификатор батча ingest'а; метаколонка.
+    description: Общий publication batch для всех семи таблиц league-season scope.

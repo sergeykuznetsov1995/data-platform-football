@@ -129,13 +129,33 @@ SOURCES = {
         WHERE status = 'STATUS_FULL_TIME'
     """,
     'understat': f"""
-        SELECT league, season,
-               {_norm('home_team')} AS home,
-               {_norm('away_team')} AS away,
-               TRY_CAST(home_goals AS integer) AS hg,
-               TRY_CAST(away_goals AS integer) AS ag
-        FROM iceberg.bronze.understat_schedule
-        WHERE is_result = true
+        WITH manifest_latest AS (
+            SELECT league, season, batch_id, status
+            FROM (
+                SELECT league, season, batch_id, status,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY league, season
+                           ORDER BY completed_at DESC, attempt_id DESC
+                       ) AS rn
+                FROM iceberg.ops.understat_ingest_manifest_v1
+                WHERE contract_version = 'understat-bronze-v2'
+            )
+            WHERE rn = 1
+        )
+        SELECT s.league, s.season,
+               {_norm('s.home_team')} AS home,
+               {_norm('s.away_team')} AS away,
+               TRY_CAST(s.home_goals AS integer) AS hg,
+               TRY_CAST(s.away_goals AS integer) AS ag
+        FROM iceberg.bronze.understat_schedule s
+        LEFT JOIN manifest_latest m
+          ON m.league = s.league
+         AND m.season = CAST(s.season AS varchar)
+        WHERE s.is_result = true
+          AND (
+              m.league IS NULL
+              OR (m.status = 'complete' AND s._batch_id = m.batch_id)
+          )
     """,
 }
 

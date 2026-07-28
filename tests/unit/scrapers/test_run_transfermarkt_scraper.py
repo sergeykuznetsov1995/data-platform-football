@@ -1273,6 +1273,45 @@ class TestRunnerInternals:
             'coach_profiles', 'coach_stints',
         }
 
+    def test_coach_manifest_accepts_authoritative_empty_typed_frames(self):
+        # #1025: an empty-shell listing hands the manifest the typed empty
+        # bundle. ``DataFrame.apply(..., axis=1)`` on a zero-row frame returns
+        # a float64 Series, which pandas reads as a (empty) COLUMN selector —
+        # the stints slice lost every column and the compatibility contract
+        # blew up before the scope could be recorded as authoritative-empty.
+        mod = _import_runner()
+        frames = {
+            'profiles': pd.DataFrame(
+                columns=_REAL_TM_SCRAPER.COACH_PROFILE_COLUMNS,
+            ),
+            'stints': pd.DataFrame(
+                columns=_REAL_TM_SCRAPER.COACH_STINT_COLUMNS,
+            ),
+            'legacy_coaches': pd.DataFrame(
+                columns=_REAL_TM_SCRAPER.LEGACY_COACH_COLUMNS,
+            ),
+        }
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        scraper = MagicMock()
+        scraper._bronze_connection.return_value = conn
+        results = {'outputs': {
+            key: {'table': f'iceberg.bronze.{key}'} for key in frames
+        }}
+
+        manifest = mod._persist_dual_write_manifest(
+            scraper, mod.ENTITY_SPECS['coaches'], frames, results, 'cycle-1',
+            'AFC-AFC Champions League', 2014,
+        )
+
+        assert manifest['status'] == 'success'
+        assert {row['entity'] for row in manifest['rows']} == {
+            'coach_profiles', 'coach_stints',
+        }
+        assert all(row['native_rows'] == 0 for row in manifest['rows'])
+
     def test_bootstrap_cache_requires_native_legacy_key_and_batch_parity(self):
         mod = _import_runner()
         cursor = MagicMock()
@@ -2915,3 +2954,36 @@ class TestObservedAtCarryForward:
             / 'transfermarkt_player_attribute_observations_v2.sql'
         ).read_text()
         assert f"PARTITION BY {', '.join(key)}" in silver
+
+
+class TestHardFetchStatuses:
+    """#1025: the listing-empty completion must not mask hard failures."""
+
+    class _Scraper:
+        def __init__(self, outcomes):
+            self._outcomes = outcomes
+
+        def get_fetch_outcomes(self):
+            return self._outcomes
+
+    def test_clean_run_has_no_hard_statuses(self):
+        mod = _import_runner()
+        scraper = self._Scraper({'listing': {'a:1': {'status': 'ok'}}})
+        assert mod._hard_fetch_statuses(scraper) == set()
+
+    def test_transient_failures_surface_as_hard(self):
+        mod = _import_runner()
+        scraper = self._Scraper({
+            'listing': {'a:1': {'status': 'valid_empty'}},
+            'coach_history': {'b:2': {'status': 'retry_exhausted'}},
+        })
+        assert mod._hard_fetch_statuses(scraper) == {'retry_exhausted'}
+
+    def test_unreadable_evidence_counts_as_hard(self):
+        mod = _import_runner()
+
+        class _Broken:
+            def get_fetch_outcomes(self):
+                raise RuntimeError('no evidence')
+
+        assert mod._hard_fetch_statuses(_Broken()) == {'unknown'}

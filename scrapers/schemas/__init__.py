@@ -12,10 +12,6 @@ from scrapers.schemas.fbref import (
     FBREF_PLAYER_MATCH_STATS_SCHEMA,
     FBREF_KEEPER_STATS_SCHEMA,
 )
-from scrapers.schemas.understat import (
-    UNDERSTAT_SHOTS_SCHEMA,
-    UNDERSTAT_PLAYERS_SCHEMA,
-)
 from scrapers.schemas.whoscored import WHOSCORED_EVENTS_SPADL_SCHEMA
 
 __all__ = [
@@ -30,9 +26,6 @@ __all__ = [
     'FBREF_PLAYER_STATS_EXTENDED_SCHEMA',
     'FBREF_PLAYER_MATCH_STATS_SCHEMA',
     'FBREF_KEEPER_STATS_SCHEMA',
-    # Understat schemas
-    'UNDERSTAT_SHOTS_SCHEMA',
-    'UNDERSTAT_PLAYERS_SCHEMA',
     # WhoScored schemas
     'WHOSCORED_EVENTS_SPADL_SCHEMA',
 ]

@@ -1,37 +1,24 @@
-"""Unit tests for ``dags/dag_ingest_understat.py`` — #712 season backfill.
+"""Production orchestration contracts for ``dag_ingest_understat``."""
 
-Airflow is not installed on the host; ``tests/unit/dags/conftest.py`` installs
-stub ``airflow`` modules (including ``airflow.models.param.Param``) into
-``sys.modules`` so the DAG module body executes and can be asserted on.
-
-These tests pin the UI-configurable season wiring added for the 10-season
-Understat backfill (issue #712, epic #708): the daily run must be unchanged
-(default = CURRENT_SEASON), and the scrape task must render
-``--season {{ params.season }}`` so a "Trigger DAG w/ config" override flows
-through to the scraper instead of a hardcoded current season.
-"""
 from __future__ import annotations
 
 import importlib
+import json
+from pathlib import Path
+from types import SimpleNamespace
 import sys
 
 import pytest
 
 
-SCRAPE_TASK_ID = 'scrape_understat_data'
-
-
 def _reload_dag_module():
-    """Force a fresh import of the Understat ingest DAG module."""
     from airflow.operators.bash import BashOperator
     from airflow.operators.python import PythonOperator
 
     BashOperator._instances.clear()
     PythonOperator._instances.clear()
-
     sys.modules.pop("dag_ingest_understat", None)
     sys.modules.pop("dags.dag_ingest_understat", None)
-
     return importlib.import_module("dag_ingest_understat")
 
 
@@ -40,101 +27,240 @@ def dag_module():
     return _reload_dag_module()
 
 
-def _bash_task(task_id):
+def _bash(task_id: str):
     from airflow.operators.bash import BashOperator
 
-    for t in BashOperator._instances:
-        if t.task_id == task_id:
-            return t
-    return None
+    return next(task for task in BashOperator._instances if task.task_id == task_id)
 
 
-class TestSeasonParam:
-    """The season must be a UI Param defaulting to CURRENT_SEASON so the
-    scheduled daily run keeps ingesting the current season unchanged."""
+def _python(task_id: str):
+    from airflow.operators.python import PythonOperator
 
-    def test_dag_module_imports(self, dag_module):
-        assert hasattr(dag_module, 'validate_data')
-
-    def test_season_param_default_is_current_season(self, dag_module):
-        from utils.config import CURRENT_SEASON
-
-        season_param = dag_module.dag._dag_kwargs['params']['season']
-        # conftest's _Param stub stores the default (real Param also exposes it).
-        assert season_param.default == CURRENT_SEASON
+    return next(task for task in PythonOperator._instances if task.task_id == task_id)
 
 
-class TestValidateData:
-    """Row floors must scale with the number of leagues the runner actually
-    scraped (results JSON ``leagues``), and the summary must read the runner's
-    real keys (``team_match_stats_rows``/``player_match_stats_rows`` — the old
-    ``team_stats_rows`` key never existed in the results file)."""
-
-    RESULTS_PATH = '/tmp/understat_result.json'
-
-    @pytest.fixture
-    def write_results(self):
-        import json
-        import os
-
-        def _write(payload):
-            with open(self.RESULTS_PATH, 'w') as f:
-                json.dump(payload, f)
-
-        yield _write
-        if os.path.exists(self.RESULTS_PATH):
-            os.unlink(self.RESULTS_PATH)
-
-    @staticmethod
-    def _payload(n_leagues=1, scale=1.0, errors=None):
-        leagues = ['ENG-Premier League', 'ESP-La Liga'][:n_leagues]
-        return {
-            'tables': ['iceberg.bronze.understat_x'],
-            'leagues': leagues,
-            'schedule_rows': int(380 * n_leagues * scale),
-            'shots_rows': int(9800 * n_leagues * scale),
-            'player_stats_rows': int(550 * n_leagues * scale),
-            'team_match_stats_rows': int(380 * n_leagues * scale),
-            'player_match_stats_rows': int(11000 * n_leagues * scale),
-            'errors': errors or [],
-        }
-
-    def test_full_two_league_run_passes_clean(self, dag_module, write_results):
-        write_results(self._payload(n_leagues=2))
-        validation = dag_module.validate_data()
-        assert validation['status'] == 'success'
-        assert validation['warnings'] == []
-        assert validation['summary']['team_match_stats_rows'] == 760
-
-    def test_floors_scale_with_league_count(self, dag_module, write_results):
-        """A row count above the single-league floor but below the two-league
-        floor must warn on a two-league run — a flat floor would wave it
-        through."""
-        payload = self._payload(n_leagues=2)
-        # floor is 1000/league: 1500 passes 1 league, fails 2 leagues (2000)
-        payload['player_match_stats_rows'] = 1500
-        write_results(payload)
-        validation = dag_module.validate_data()
-        assert any('player_match_stats_rows' in w for w in validation['warnings'])
-
-    def test_zero_rows_with_errors_fails(self, dag_module, write_results):
-        from airflow.exceptions import AirflowException
-
-        payload = self._payload(scale=0.0, errors=['understat_schedule: empty'])
-        write_results(payload)
-        with pytest.raises(AirflowException, match='Validation failed'):
-            dag_module.validate_data()
+def _scope(
+    league="ENG-Premier League",
+    season="2526",
+    source_id=2025,
+    *,
+    discovered=True,
+):
+    return SimpleNamespace(
+        league=league,
+        season=season,
+        source_season_id=source_id,
+        is_closed=True,
+        discovered=discovered,
+    )
 
 
-class TestSeasonRenderedFromParams:
-    """The scrape task must inject the season via Jinja so an overridden
-    season (backfill) reaches the scraper — not a baked-in current season."""
+def test_daily_dag_is_the_single_0900_owner(dag_module):
+    kwargs = dag_module.dag._dag_kwargs
+    assert kwargs["schedule"] == "0 9 * * *"
+    assert kwargs["max_active_runs"] == 1
+    assert kwargs["max_active_tasks"] == 1
+    assert kwargs["catchup"] is False
+    assert kwargs.get("params", {}) == {}
 
-    def test_scrape_task_renders_season_from_params(self, dag_module):
-        task = _bash_task(SCRAPE_TASK_ID)
-        assert task is not None, f"missing task {SCRAPE_TASK_ID}"
-        # f-string collapses {{{{ }}}} -> {{ }}, so the literal Jinja tag
-        # survives into the rendered bash_command.
-        assert '--season {{ params.season }}' in task.bash_command, (
-            f"{SCRAPE_TASK_ID} does not render season from params"
+
+def test_runner_is_dynamically_mapped_one_scope_per_subprocess(dag_module):
+    plan = _python("plan_current_scopes")
+    runner = _bash("run_current_scope")
+    validator = _python("validate_current_scope")
+
+    assert runner.is_mapped is True
+    assert runner._expand_kwargs["env"].operator is plan
+    assert validator.is_mapped is True
+    assert validator._expand_kwargs["op_kwargs"].operator is plan
+    assert plan._init_kwargs["pool"] == "ingest_scraper_pool"
+    assert plan._init_kwargs["priority_weight"] == dag_module.CURRENT_PRIORITY
+    assert runner._init_kwargs["pool"] == "ingest_scraper_pool"
+    assert runner._init_kwargs["priority_weight"] == dag_module.CURRENT_PRIORITY
+    assert "--mode \"${UNDERSTAT_MODE}\"" in runner.bash_command
+    assert "--league \"${UNDERSTAT_LEAGUE}\"" in runner.bash_command
+    assert "--season-slug \"${UNDERSTAT_SEASON_SLUG}\"" in runner.bash_command
+    assert "--source-season-id \"${UNDERSTAT_SOURCE_SEASON_ID}\"" in runner.bash_command
+    assert "--source-discovered \"${UNDERSTAT_SOURCE_DISCOVERED}\"" in runner.bash_command
+    assert "--output \"${UNDERSTAT_RESULT_PATH}\"" in runner.bash_command
+    assert "/tmp/understat_result.json" not in runner.bash_command
+
+
+def test_scope_environment_uses_canonical_slug_and_unique_result(dag_module):
+    first = dag_module.scope_environment(
+        _scope(), mode="current", run_id="scheduled__2026-07-27T09:00:00+00:00"
+    )
+    second = dag_module.scope_environment(
+        _scope(league="ESP-La Liga"),
+        mode="current",
+        run_id="scheduled__2026-07-27T09:00:00+00:00",
+    )
+
+    assert first["UNDERSTAT_SEASON_SLUG"] == "2526"
+    assert first["UNDERSTAT_SOURCE_SEASON_ID"] == "2025"
+    assert first["UNDERSTAT_SOURCE_DISCOVERED"] == "true"
+    assert first["UNDERSTAT_RESULT_PATH"] != second["UNDERSTAT_RESULT_PATH"]
+    assert first["UNDERSTAT_RESULT_PATH"].startswith("/tmp/understat_current_")
+    assert "UNDERSTAT_REPARSE" not in second
+    assert first["PYTHONPATH"] == "/opt/airflow:/opt/airflow/dags"
+
+
+@pytest.mark.parametrize("bad_slug", ["2025", "25", "2025/2026", "abcd"])
+def test_scope_environment_rejects_ambiguous_or_invalid_seasons(dag_module, bad_slug):
+    from airflow.exceptions import AirflowException
+
+    with pytest.raises(AirflowException, match="canonical four-digit slug"):
+        dag_module.scope_environment(
+            _scope(season=bad_slug), mode="current", run_id="manual__one"
         )
+
+
+def test_discovery_conflict_fails_closed(dag_module):
+    from airflow.exceptions import AirflowException
+
+    scopes = [_scope(source_id=2025), _scope(source_id=2026)]
+    with pytest.raises(AirflowException, match="conflicting source season ids"):
+        dag_module._deduplicate_scopes(scopes)
+
+
+def test_current_planner_uses_runtime_rolling_catalog_and_config_scope(
+    dag_module, monkeypatch
+):
+    import scrapers.understat as understat
+
+    calls = []
+
+    class Client:
+        pass
+
+    class Catalog:
+        def __init__(self, client):
+            assert isinstance(client, Client)
+
+        def rolling_scopes(self, **kwargs):
+            calls.append(kwargs)
+            return [
+                _scope(),
+                _scope(league="UNKNOWN-League"),
+            ]
+
+    monkeypatch.setattr(understat, "UnderstatClient", Client)
+    monkeypatch.setattr(understat, "UnderstatCatalog", Catalog)
+
+    plan = dag_module.plan_current_scopes(run_id="scheduled__one")
+
+    assert calls == [{"window": 2, "probe_next": True}]
+    assert len(plan) == 1
+    assert plan[0]["UNDERSTAT_LEAGUE"] == "ENG-Premier League"
+    assert "UNDERSTAT_REPARSE" not in plan[0]
+
+
+def _result(
+    path: Path,
+    *,
+    status="complete",
+    top_overrides=None,
+    attempt_overrides=None,
+):
+    from scrapers.understat.manifest import (
+        CONTRACT_VERSION,
+        UNDERSTAT_ENTITIES,
+        ScopeAttempt,
+        ScopeKey,
+    )
+
+    entity_status = status
+    row_count = 1 if status == "complete" else 0
+    attempt = ScopeAttempt(
+        scope=ScopeKey(
+            league="ENG-Premier League",
+            season="2526",
+            source_league="EPL",
+            source_season_id="2025",
+        ),
+        status=status,
+        batch_id="batch-1",
+        run_id="scheduled__one",
+        attempt_id="attempt-1",
+        mode="current",
+        parser_version="understat-native-v1",
+        contract_version=CONTRACT_VERSION,
+        entity_statuses={key: entity_status for key in UNDERSTAT_ENTITIES},
+        row_counts={key: row_count for key in UNDERSTAT_ENTITIES},
+        natural_key_counts={key: row_count for key in UNDERSTAT_ENTITIES},
+        payload_hashes={
+            key: (f"sha256:{key}" if row_count else "")
+            for key in UNDERSTAT_ENTITIES
+        },
+    ).to_dict()
+    attempt.update(attempt_overrides or {})
+    payload = {
+        "status": status,
+        "league": "ENG-Premier League",
+        "season": "2526",
+        "source_season_id": 2025,
+        "batch_id": "batch-1",
+        "entity_statuses": attempt["entity_statuses"],
+        "row_counts": attempt["row_counts"],
+        "errors": [],
+        "scope_attempt": attempt,
+        **(top_overrides or {}),
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
+def _validation_context(path: Path, *, mode="current"):
+    return {
+        "UNDERSTAT_RESULT_PATH": str(path),
+        "UNDERSTAT_MODE": mode,
+        "UNDERSTAT_LEAGUE": "ENG-Premier League",
+        "UNDERSTAT_SEASON_SLUG": "2526",
+        "UNDERSTAT_SOURCE_SEASON_ID": "2025",
+    }
+
+
+def test_exact_scope_validation_accepts_complete_publication(dag_module, tmp_path):
+    path = tmp_path / "result.json"
+    expected = _result(path)
+    assert dag_module.validate_scope_result(**_validation_context(path)) == expected
+
+
+def test_current_validation_accepts_explicit_not_published_probe(dag_module, tmp_path):
+    path = tmp_path / "result.json"
+    _result(
+        path,
+        status="not_published",
+    )
+    assert dag_module.validate_scope_result(**_validation_context(path))["status"] == (
+        "not_published"
+    )
+
+
+def test_backfill_validation_rejects_not_published_scope(dag_module, tmp_path):
+    from airflow.exceptions import AirflowException
+
+    path = tmp_path / "result.json"
+    _result(path, status="not_published")
+    with pytest.raises(AirflowException, match="terminal state"):
+        dag_module.validate_scope_result(
+            **_validation_context(path, mode="backfill")
+        )
+
+
+def test_scope_validation_rejects_stale_artifact_identity(dag_module, tmp_path):
+    from airflow.exceptions import AirflowException
+
+    path = tmp_path / "result.json"
+    _result(path, top_overrides={"league": "ESP-La Liga"})
+    with pytest.raises(AirflowException, match="scope mismatch"):
+        dag_module.validate_scope_result(**_validation_context(path))
+
+
+def test_complete_scope_requires_publication_evidence(dag_module, tmp_path):
+    from airflow.exceptions import AirflowException
+
+    path = tmp_path / "result.json"
+    _result(path, attempt_overrides={"batch_id": ""})
+    with pytest.raises(AirflowException, match="publication evidence"):
+        dag_module.validate_scope_result(**_validation_context(path))

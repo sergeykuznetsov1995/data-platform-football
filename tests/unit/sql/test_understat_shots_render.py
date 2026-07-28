@@ -9,7 +9,7 @@ The Understat shot conform + canonical resolution used to live inside
   * enum normalisation (body_part / situation / result / is_goal),
   * re-scrape dedup (latest ``_ingested_at`` per shot_id),
   * team xref (orphan-EXCLUDED) and player xref (orphan-tolerant),
-  * assist-by-NAME resolution (#444 — the assister has no per-shot numeric id),
+  * assist-by-ID resolution with a historical name fallback,
   * the mandatory (league, season) xref predicate (anti-fan-out).
 
 Strategy
@@ -47,7 +47,11 @@ def _strip_comments(sql: str) -> str:
 
 
 def _translate_trino_to_duckdb(sql: str) -> str:
-    return sql.replace("iceberg.bronze.", "bronze_").replace("iceberg.silver.", "silver_")
+    return (
+        sql.replace("iceberg.bronze.", "bronze_")
+        .replace("iceberg.silver.", "silver_")
+        .replace("iceberg.ops.", "ops_")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -72,14 +76,16 @@ _TABLES: Dict[str, str] = {
         result           VARCHAR,
         league           VARCHAR,
         season           VARCHAR,
-        _ingested_at     TIMESTAMP
+        _ingested_at     TIMESTAMP,
+        _batch_id        VARCHAR
     """,
     "bronze_understat_players": """
         player       VARCHAR,
         player_id    BIGINT,
         league       VARCHAR,
         season       VARCHAR,
-        _ingested_at TIMESTAMP
+        _ingested_at TIMESTAMP,
+        _batch_id    VARCHAR
     """,
     "silver_xref_team": """
         source       VARCHAR,
@@ -95,6 +101,15 @@ _TABLES: Dict[str, str] = {
         league       VARCHAR,
         season       VARCHAR,
         canonical_id VARCHAR
+    """,
+    "ops_understat_ingest_manifest_v1": """
+        contract_version VARCHAR,
+        league           VARCHAR,
+        season           VARCHAR,
+        batch_id         VARCHAR,
+        status           VARCHAR,
+        completed_at     VARCHAR,
+        attempt_id       VARCHAR
     """,
 }
 
@@ -134,9 +149,9 @@ def _base_fixtures() -> Dict[str, List[Dict[str, Any]]]:
         ],
         "bronze_understat_players": [
             {"player": "Mohamed Salah", "player_id": 11, "league": _LEAGUE,
-             "season": _SEASON, "_ingested_at": _ING},
+             "season": _SEASON, "_ingested_at": _ING, "_batch_id": "b1"},
             {"player": "Cody Gakpo", "player_id": 12, "league": _LEAGUE,
-             "season": _SEASON, "_ingested_at": _ING},
+             "season": _SEASON, "_ingested_at": _ING, "_batch_id": "b1"},
         ],
         "silver_xref_player": [
             {"source": "understat", "source_id": "11", "league": _LEAGUE,
@@ -155,6 +170,21 @@ def _shot(**over: Any) -> Dict[str, Any]:
         "minute": 10, "location_x": 0.9, "location_y": 0.5, "xg": 0.3,
         "body_part": "Right Foot", "situation": "Open Play", "result": "Goal",
         "league": _LEAGUE, "season": _SEASON, "_ingested_at": _ING,
+        "_batch_id": "b1",
+    }
+    row.update(over)
+    return row
+
+
+def _attempt(**over: Any) -> Dict[str, Any]:
+    row = {
+        "contract_version": "understat-bronze-v2",
+        "league": _LEAGUE,
+        "season": _SEASON,
+        "batch_id": "b1",
+        "status": "complete",
+        "completed_at": "2026-07-27T10:00:00+00:00",
+        "attempt_id": "a1",
     }
     row.update(over)
     return row
@@ -233,6 +263,53 @@ class TestDedup:
         assert rows["1"]["xg"] == pytest.approx(0.9)
 
 
+class TestPublicationFence:
+
+    def test_complete_scope_reads_only_certified_batch(self, duck_conn):
+        rows = _run(
+            duck_conn,
+            [
+                _shot(shot_id=1, _batch_id="b1"),
+                _shot(shot_id=2, _batch_id="b2"),
+            ],
+            overrides={
+                "ops_understat_ingest_manifest_v1": [
+                    _attempt(batch_id="b2")
+                ]
+            },
+        )
+
+        assert set(rows) == {"2"}
+
+    @pytest.mark.parametrize(
+        "latest_status",
+        ["in_progress", "upstream_pending", "contract_failure"],
+    )
+    def test_later_non_complete_attempt_hides_previous_complete_scope(
+        self, duck_conn, latest_status
+    ):
+        rows = _run(
+            duck_conn,
+            [
+                _shot(shot_id=1, _batch_id="b1"),
+                _shot(shot_id=2, _batch_id="b2"),
+            ],
+            overrides={
+                "ops_understat_ingest_manifest_v1": [
+                    _attempt(batch_id="b1", attempt_id="a1"),
+                    _attempt(
+                        batch_id="b2",
+                        status=latest_status,
+                        completed_at="2026-07-27T11:00:00+00:00",
+                        attempt_id="a2",
+                    ),
+                ]
+            },
+        )
+
+        assert rows == {}
+
+
 # ---------------------------------------------------------------------------
 # xref resolution
 # ---------------------------------------------------------------------------
@@ -283,11 +360,17 @@ class TestXrefResolution:
 # ---------------------------------------------------------------------------
 
 
-class TestAssistResolvesByName:
+class TestAssistResolution:
 
-    def test_assist_resolved_via_name(self, duck_conn):
+    def test_assist_resolved_via_native_id(self, duck_conn):
         rows = _run(duck_conn, [
-            _shot(shot_id="1", assist_player="Cody Gakpo", assist_player_id=500001),
+            _shot(shot_id="0", assist_player="Wrong Name", assist_player_id=12),
+        ])
+        assert rows["0"]["assist_player_id"] == "fb_gakpo"
+
+    def test_historical_assist_resolved_via_name(self, duck_conn):
+        rows = _run(duck_conn, [
+            _shot(shot_id="1", assist_player="Cody Gakpo", assist_player_id=None),
         ])
         assert rows["1"]["assist_player_id"] == "fb_gakpo"
         assert rows["1"]["player_id"] == "fb_salah"
@@ -296,13 +379,11 @@ class TestAssistResolvesByName:
         rows = _run(duck_conn, [_shot(shot_id="2", assist_player=None)])
         assert rows["2"]["assist_player_id"] is None
 
-    def test_ignores_bronze_assist_player_id(self, duck_conn):
-        """bronze.assist_player_id is never read; name resolution returns Gakpo
-        even when the bogus id points at Salah (#444)."""
+    def test_native_id_wins_over_conflicting_name(self, duck_conn):
         rows = _run(duck_conn, [
             _shot(shot_id="3", assist_player="Cody Gakpo", assist_player_id=11),
         ])
-        assert rows["3"]["assist_player_id"] == "fb_gakpo"
+        assert rows["3"]["assist_player_id"] == "fb_salah"
 
     def test_unknown_assister_name_is_null(self, duck_conn):
         rows = _run(duck_conn, [
@@ -333,8 +414,8 @@ class TestUnderstatShotsStructure:
         """Charter R3 / fan-out footgun: each xref_* join must carry (league,
         season). Assert league+season predicate per xref alias used in a join."""
         sql = _strip_comments(_read_sql()).lower()
-        # three xref aliases joined: xt (team), xp (player), xa (assist)
-        for alias in ("xt", "xp", "xa"):
+        # four xref aliases joined: team, shooter, assist-id, assist-name.
+        for alias in ("xt", "xp", "xa_id", "xa_name"):
             assert re.search(rf"{alias}\.league\s*=", sql), f"{alias} missing league predicate"
             assert re.search(rf"{alias}\.season\s*=", sql), f"{alias} missing season predicate"
 

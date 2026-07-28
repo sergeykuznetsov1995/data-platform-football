@@ -60,7 +60,25 @@
 -- (league, season) predicates — otherwise multi-season fan-out 1.5-4×.
 -- =============================================================================
 
-WITH derived AS (
+WITH understat_manifest_latest AS (
+    SELECT league, season, batch_id, status
+    FROM (
+        SELECT
+            league,
+            season,
+            batch_id,
+            status,
+            ROW_NUMBER() OVER (
+                PARTITION BY league, season
+                ORDER BY completed_at DESC, attempt_id DESC
+            ) AS rn
+        FROM iceberg.ops.understat_ingest_manifest_v1
+        WHERE contract_version = 'understat-bronze-v2'
+    )
+    WHERE rn = 1
+),
+
+derived AS (
     -- Same regex/`fut_<xxhash64>` derivation as the previous xref_match.sql
     -- and as fbref_match_enriched.sql — kept in sync so xref_match joins
     -- match_enriched 1:1 on canonical_id. Also project the canonical fields
@@ -158,6 +176,9 @@ us_resolved AS (
         xt_a.canonical_id                                              AS away_canonical_id,
         CONCAT(s.home_team, ' vs ', s.away_team)                       AS display_name
     FROM iceberg.bronze.understat_schedule s
+    LEFT JOIN understat_manifest_latest m
+      ON m.league = s.league
+     AND m.season = CAST(s.season AS varchar)
     LEFT JOIN iceberg.silver.xref_team xt_h
            ON xt_h.source    = 'understat'
           AND xt_h.source_id = s.home_team
@@ -169,6 +190,14 @@ us_resolved AS (
           AND xt_a.league    = s.league
           AND xt_a.season    = CAST(s.season AS varchar)
     WHERE s.game_id IS NOT NULL
+      AND s.league IN (
+          'ENG-Premier League', 'ESP-La Liga', 'GER-Bundesliga',
+          'ITA-Serie A', 'FRA-Ligue 1'
+      )
+      AND (
+          m.league IS NULL
+          OR (m.status = 'complete' AND s._batch_id = m.batch_id)
+      )
 ),
 
 ss_resolved AS (

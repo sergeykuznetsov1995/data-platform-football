@@ -125,6 +125,24 @@
 
 WITH
 
+understat_manifest_latest AS (
+    SELECT league, season, batch_id, status
+    FROM (
+        SELECT
+            league,
+            season,
+            batch_id,
+            status,
+            ROW_NUMBER() OVER (
+                PARTITION BY league, season
+                ORDER BY completed_at DESC, attempt_id DESC
+            ) AS rn
+        FROM iceberg.ops.understat_ingest_manifest_v1
+        WHERE contract_version = 'understat-bronze-v2'
+    )
+    WHERE rn = 1
+),
+
 -- 0) De-dup xref_team across seasons -----------------------------------------
 --    xref_team PK = (source, source_id, league, season). Joining on
 --    source+source_id alone produces N-row fan-out per season (5-10× blow-up
@@ -162,7 +180,18 @@ us_sched AS (
                 ORDER BY s._ingested_at DESC
             ) AS rn
         FROM iceberg.bronze.understat_schedule s
+        LEFT JOIN understat_manifest_latest m
+          ON m.league = s.league
+         AND m.season = CAST(s.season AS varchar)
         WHERE s.game_id IS NOT NULL
+          AND s.league IN (
+              'ENG-Premier League', 'ESP-La Liga', 'GER-Bundesliga',
+              'ITA-Serie A', 'FRA-Ligue 1'
+          )
+          AND (
+              m.league IS NULL
+              OR (m.status = 'complete' AND s._batch_id = m.batch_id)
+          )
     )
     WHERE rn = 1
 ),
