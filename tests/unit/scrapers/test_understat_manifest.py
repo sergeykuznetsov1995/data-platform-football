@@ -35,6 +35,7 @@ SCOPE = ScopeKey(
     source_season_id="2025",
 )
 BATCH = "batch-2526"
+RFPL_EMPTY_MATCH_GAME_IDS = {"11214", "11222", "11249", "11260"}
 
 
 def _value(column: str):
@@ -408,10 +409,19 @@ def test_reviewed_coverage_exceptions_are_exact_and_scope_specific():
     ger = coverage_exceptions_for_scope(
         ScopeKey("GER-Bundesliga", "2425", source_season_id="2024")
     )
+    rfpl = coverage_exceptions_for_scope(
+        ScopeKey("RUS-Premier League", "1920", source_season_id="2019")
+    )
 
     assert set(fra) == {"understat_shots", "understat_player_match_stats"}
     assert set(fra["understat_shots"]["missing"]) == {"4238"}
     assert set(ger["understat_player_match_stats"]["missing"]) == {"27930"}
+    assert set(rfpl) == {"understat_shots", "understat_player_match_stats"}
+    assert set(rfpl["understat_shots"]["missing"]) == RFPL_EMPTY_MATCH_GAME_IDS
+    assert (
+        set(rfpl["understat_player_match_stats"]["missing"])
+        == RFPL_EMPTY_MATCH_GAME_IDS
+    )
     assert coverage_exceptions_for_scope(SCOPE) == {}
 
     # The helper must not expose the reviewed module constant to mutation.
@@ -421,15 +431,30 @@ def test_reviewed_coverage_exceptions_are_exact_and_scope_specific():
     )
     assert set(fresh["understat_shots"]["missing"]) == {"4238"}
 
+    rfpl["understat_shots"]["missing"].clear()
+    fresh_rfpl = coverage_exceptions_for_scope(
+        ScopeKey("RUS-Premier League", "1920", source_season_id="2019")
+    )
+    assert (
+        set(fresh_rfpl["understat_shots"]["missing"])
+        == RFPL_EMPTY_MATCH_GAME_IDS
+    )
+
 
 @pytest.mark.parametrize(
-    ("league", "season", "game_id"),
+    ("league", "season", "game_id", "expected_game_ids"),
     [
-        ("FRA-Ligue 1", "1617", "4238"),
-        ("GER-Bundesliga", "2425", "27930"),
+        ("FRA-Ligue 1", "1617", "4238", {"4238"}),
+        ("GER-Bundesliga", "2425", "27930", {"27930"}),
+        ("RUS-Premier League", "1920", "11214", RFPL_EMPTY_MATCH_GAME_IDS),
+        ("RUS-Premier League", "1920", "11222", RFPL_EMPTY_MATCH_GAME_IDS),
+        ("RUS-Premier League", "1920", "11249", RFPL_EMPTY_MATCH_GAME_IDS),
+        ("RUS-Premier League", "1920", "11260", RFPL_EMPTY_MATCH_GAME_IDS),
     ],
 )
-def test_reviewed_empty_match_payload_exceptions_are_exact(league, season, game_id):
+def test_reviewed_empty_match_payload_exceptions_are_exact(
+    league, season, game_id, expected_game_ids
+):
     scope = ScopeKey(league, season)
     exceptions = coverage_exceptions_for_scope(scope)
 
@@ -437,10 +462,12 @@ def test_reviewed_empty_match_payload_exceptions_are_exact(league, season, game_
         "understat_shots",
         "understat_player_match_stats",
     }
-    assert set(exceptions["understat_shots"]["missing"]) == {game_id}
-    assert set(exceptions["understat_player_match_stats"]["missing"]) == {
-        game_id
-    }
+    assert game_id in expected_game_ids
+    assert set(exceptions["understat_shots"]["missing"]) == expected_game_ids
+    assert (
+        set(exceptions["understat_player_match_stats"]["missing"])
+        == expected_game_ids
+    )
     assert coverage_exceptions_for_scope(SCOPE) == {}
 
 
