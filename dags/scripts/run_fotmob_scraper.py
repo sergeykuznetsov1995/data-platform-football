@@ -1608,6 +1608,15 @@ def main():
     if publication is not None:
         args.publication_generation_id = publication["generation_id"]
         args.run_id = publication["generation_id"]
+    else:
+        # A ceremony-disabled stub still names the run — keep it as the run id
+        # so retries stay idempotent — but it is NOT a writer generation: no
+        # fence is acquired for it, so ``_run_native`` must not go looking for
+        # an active guard that by design never exists.
+        args.run_id = args.run_id or (
+            str(args.publication_generation_id or "").strip() or None
+        )
+        args.publication_generation_id = None
     output = args.output or f"/tmp/fotmob_result_{_safe_run_id(args.run_id)}.json"
     try:
         signal.signal(signal.SIGTERM, _sigterm_to_exception)
