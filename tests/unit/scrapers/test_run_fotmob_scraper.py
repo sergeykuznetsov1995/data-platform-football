@@ -1605,3 +1605,71 @@ class TestFotmobNativeRunner:
         fence.assert_not_called()
         attest.assert_not_called()
         assert json.loads(out.read_text(encoding="utf-8"))["status"] == "success"
+
+    @pytest.mark.unit
+    def test_ceremony_free_stub_never_demands_an_active_writer_guard(
+        self, monkeypatch, tmp_path
+    ):
+        """The owner stub names the run; it is not a writer generation.
+
+        The stub reaches the runner on argv, but no fence is acquired for it, so
+        ``_ACTIVE_PUBLICATION_GENERATION`` stays ``None``. Leaving the stub id on
+        ``args`` made ``_run_native`` refuse to build the service — the first
+        real daily wave after the ceremony-free rotation died on
+        "requires its exact active publication writer guard" with the whole
+        catalog untouched. The existing ceremony-free coverage stubs out
+        ``_run_native`` wholesale and cannot see that.
+        """
+        from utils import fotmob_publication as publication
+
+        mod = self._module()
+        monkeypatch.delenv(
+            publication.FOTMOB_DEPLOYMENT_REPORT_PATH_ENV, raising=False
+        )
+        monkeypatch.delenv(
+            publication.FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV, raising=False
+        )
+        stub_id = "cf43bcd4-8ee0-5069-b615-48f7b347edbc"
+        seen: dict[str, Any] = {}
+
+        def run_native(args, **_kwargs):
+            seen["publication_generation_id"] = args.publication_generation_id
+            seen["run_id"] = args.run_id
+            # The invariant `_run_native` itself enforces, verbatim.
+            assert mod._ACTIVE_PUBLICATION_GENERATION == (
+                getattr(args, "publication_generation_id", None) or None
+            )
+            return 0, {"status": "success", "complete": True}
+
+        monkeypatch.setattr(mod, "_run_native", run_native)
+        out = tmp_path / "report.json"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "run_fotmob_scraper.py",
+                "--mode",
+                "discover",
+                "--output",
+                str(out),
+                "--publication-generation-id",
+                stub_id,
+                "--publication-schema",
+                publication.FOTMOB_PUBLICATION_DISABLED_SCHEMA,
+                "--publication-source",
+                "fotmob",
+                "--publication-owner",
+                "isolated",
+                "--publication-data-interval-start",
+                "2026-07-27T14:00:00+00:00",
+                "--publication-data-interval-end",
+                "2026-07-28T14:00:00+00:00",
+                "--publication-runtime-fingerprint",
+                "ceremony-disabled",
+            ],
+        )
+
+        assert mod.main() == 0
+        assert seen["publication_generation_id"] is None
+        # The stub still gives the run a retry-stable identity.
+        assert seen["run_id"] == stub_id
