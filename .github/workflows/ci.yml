@@ -27,27 +27,34 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          # Matches the proven-green local venv (/root/.venvs/dpf-test) the
+          # pins in requirements-ci.txt were frozen from.
+          python-version: "3.12"
           cache: pip
+          cache-dependency-path: requirements-ci.txt
 
       - name: Install test runtime
         shell: bash
         run: |
-          # Airflow is deliberately absent: tests/unit/dags/conftest.py installs
-          # its operator stubs only when the real package is missing, and the DAG
-          # topology tests assert against those stubs (same contract as the local
-          # /root/.venvs/dpf-test venv and sofascore-ci.yml).
-          # The first line mirrors sofascore-ci.yml; the second adds what the
-          # FULL suite needs beyond the sofascore subset (verified by a clean
-          # replica venv: without them collection stops at 36 errors — bs4/
-          # duckdb/sqlglot — and tls_requests/psutil fail at runtime).
-          python -m pip install --disable-pip-version-check \
-            pytest pandas numpy pyarrow trino requests PyYAML jinja2 \
-            jsonschema "tls-client-python==1.15.1" python-dotenv tenacity pybreaker \
-            rapidfuzz Unidecode nicknames \
-            beautifulsoup4 lxml duckdb sqlglot psutil wrapper-tls-requests
+          # requirements-ci.txt is a pip freeze of the local proven-green test
+          # venv. Airflow is deliberately absent from it: tests/unit/dags/
+          # conftest.py installs its operator stubs only when the real package
+          # is missing, and the DAG topology tests assert against those stubs.
+          # A hand-curated short list (sofascore-ci.yml style) is NOT enough
+          # for the full suite — it left 36 collection errors and ~53 missing-
+          # module failures (bs4/duckdb/sqlglot/pyiceberg/curl_cffi/soccerdata/
+          # selenium/...), so the full frozen set is the contract.
+          python -m pip install --disable-pip-version-check -r requirements-ci.txt
 
       - name: Full unit suite
         env:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
-        run: pytest -q tests/unit
+        # The one deselect below seals the REAL interpreter's site-packages
+        # path (every component must be root-owned and non-group-writable —
+        # scripts/research/bench_whoscored_capacity.py:_trusted_worker_site_packages).
+        # That holds on the production host (/root/.venvs) and can never hold
+        # on a hosted runner (toolcache is runner-owned), so it stays a
+        # local-suite-only check.
+        run: |
+          pytest -q tests/unit \
+            --deselect tests/unit/scripts/test_bench_whoscored_capacity.py::test_worker_runtime_bundle_is_deterministic_sealed_and_checkout_free
