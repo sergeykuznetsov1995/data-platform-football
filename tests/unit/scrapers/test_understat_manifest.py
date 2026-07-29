@@ -36,6 +36,7 @@ SCOPE = ScopeKey(
 )
 BATCH = "batch-2526"
 RFPL_EMPTY_MATCH_GAME_IDS = {"11214", "11222", "11249", "11260"}
+RFPL_2021_EMPTY_MATCH_GAME_IDS = {"14229", "14235"}
 
 
 def _value(column: str):
@@ -296,6 +297,36 @@ def test_xg_and_forecast_ranges_are_fail_closed():
     }
 
 
+@pytest.mark.parametrize(
+    ("forecast", "expected_status"),
+    [
+        ((0.34, 0.26, 0.38), ManifestStatus.COMPLETE),
+        ((0.34, 0.26, 0.379), ManifestStatus.CONTRACT_FAILURE),
+        ((0.34, 0.26, 0.42), ManifestStatus.COMPLETE),
+        ((0.342, 0.561, 0.117), ManifestStatus.COMPLETE),
+        ((0.34, 0.26, 0.4201), ManifestStatus.CONTRACT_FAILURE),
+    ],
+)
+def test_complete_forecast_sum_tolerance_is_inclusive(forecast, expected_status):
+    frames = _frames()
+    columns = [
+        "forecast_home_win",
+        "forecast_draw",
+        "forecast_away_win",
+    ]
+    schedule = frames["understat_schedule"]
+    for column, value in zip(columns, forecast):
+        schedule[column] = schedule[column].astype("Float64")
+        schedule.loc[0, column] = value
+
+    report = _complete_report(frames)
+
+    assert report.status is expected_status
+    assert any(issue.code == "invalid_forecast" for issue in report.issues) is (
+        expected_status is ManifestStatus.CONTRACT_FAILURE
+    )
+
+
 def test_cross_table_missing_game_fails_unless_explicitly_allowlisted():
     frames = _two_game_frames()
     frames["understat_shots"] = frames["understat_shots"].query(
@@ -447,6 +478,108 @@ def test_reviewed_coverage_exceptions_are_exact_and_scope_specific():
         set(fresh_rfpl["understat_shots"]["missing"])
         == RFPL_EMPTY_MATCH_GAME_IDS
     )
+
+
+def test_rfpl_2021_empty_match_payload_exceptions_are_exact():
+    reason = (
+        "Understat getMatchData returned HTTP 200 but both shots and rosters "
+        "were empty; verified 2026-07-29"
+    )
+    scope = ScopeKey(
+        "RUS-Premier League",
+        "2021",
+        source_league="RFPL",
+        source_season_id="2020",
+    )
+
+    assert coverage_exceptions_for_scope(scope) == {
+        "understat_shots": {
+            "missing": {
+                game_id: reason for game_id in RFPL_2021_EMPTY_MATCH_GAME_IDS
+            }
+        },
+        "understat_player_match_stats": {
+            "missing": {
+                game_id: reason for game_id in RFPL_2021_EMPTY_MATCH_GAME_IDS
+            }
+        },
+    }
+    assert coverage_exceptions_for_scope(
+        ScopeKey("RUS-Premier League", "2122", source_season_id="2021")
+    ) == {}
+    assert coverage_exceptions_for_scope(
+        ScopeKey(
+            "RUS-Premier League",
+            "2021",
+            source_league="EPL",
+            source_season_id="2020",
+        )
+    ) == {}
+    assert coverage_exceptions_for_scope(
+        ScopeKey(
+            "RUS-Premier League",
+            "2021",
+            source_league="RFPL",
+            source_season_id="2021",
+        )
+    ) == {}
+
+
+@pytest.mark.parametrize("missing_game_id", ["14229", "14235"])
+def test_rfpl_2021_exceptions_waive_both_empty_match_entities(missing_game_id):
+    scope = ScopeKey(
+        "RUS-Premier League",
+        "2021",
+        source_league="RFPL",
+        source_season_id="2020",
+    )
+    frames = _two_game_frames()
+    for frame in frames.values():
+        frame["league_id"] = "6"
+        frame["league"] = scope.league
+        frame["season"] = scope.season
+        frame["source_season_id"] = 2020
+    for entity in (
+        "understat_schedule",
+        "understat_shots",
+        "understat_team_match_stats",
+        "understat_player_match_stats",
+    ):
+        frames[entity].loc[frames[entity]["game_id"] == 101, "game_id"] = int(
+            missing_game_id
+        )
+    for entity in ("understat_shots", "understat_player_match_stats"):
+        frames[entity] = frames[entity].query("game_id == 100").copy()
+
+    failed = validate_understat_scope(
+        frames,
+        scope=scope,
+        active=False,
+        batch_id=BATCH,
+    )
+    allowed = validate_understat_scope(
+        frames,
+        scope=scope,
+        active=False,
+        batch_id=BATCH,
+        coverage_exceptions=coverage_exceptions_for_scope(scope),
+    )
+
+    assert failed.status is ManifestStatus.CONTRACT_FAILURE
+    assert {issue.code for issue in failed.issues} >= {
+        "missing_completed_games",
+        "player_match_team_coverage_mismatch",
+        "player_match_side_team_mismatch",
+    }
+    assert allowed.status is ManifestStatus.COMPLETE
+    assert {
+        issue.entity: issue.details["game_ids"]
+        for issue in allowed.issues
+        if issue.code == "allowlisted_game_coverage"
+    } == {
+        "understat_shots": [missing_game_id],
+        "understat_player_match_stats": [missing_game_id],
+    }
 
 
 @pytest.mark.parametrize(

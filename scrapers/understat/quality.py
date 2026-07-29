@@ -531,12 +531,41 @@ def validate_understat_scope(
         )
         supplied_forecasts = forecasts.notna().sum(axis=1)
         partial_forecasts = int(supplied_forecasts.isin((1, 2)).sum())
+        forecast_sum_tolerance = 0.02
+        forecast_total_lower_bound = 1.0 - forecast_sum_tolerance
+        forecast_total_upper_bound = 1.0 + forecast_sum_tolerance
+        forecast_sums = forecasts.sum(axis=1)
+        # Three Float64 addends can accumulate one unit-scale ULP each.
+        forecast_sum_epsilon = math.ulp(1.0) * len(forecast_columns)
+        forecast_sums_below_tolerance = (
+            forecast_sums < forecast_total_lower_bound
+        ) & ~forecast_sums.map(
+            lambda total: math.isclose(
+                float(total),
+                forecast_total_lower_bound,
+                rel_tol=0.0,
+                abs_tol=forecast_sum_epsilon,
+            )
+        )
+        forecast_sums_above_tolerance = (
+            forecast_sums > forecast_total_upper_bound
+        ) & ~forecast_sums.map(
+            lambda total: math.isclose(
+                float(total),
+                forecast_total_upper_bound,
+                rel_tol=0.0,
+                abs_tol=forecast_sum_epsilon,
+            )
+        )
+        forecast_sums_outside_tolerance = (
+            forecast_sums_below_tolerance | forecast_sums_above_tolerance
+        )
         invalid_forecasts = int(
             (
                 (supplied_forecasts == 3)
                 & (
                     (~((forecasts >= 0.0) & (forecasts <= 1.0)).all(axis=1))
-                    | ((forecasts.sum(axis=1) - 1.0).abs() > 0.02)
+                    | forecast_sums_outside_tolerance
                 )
             ).sum()
         )
