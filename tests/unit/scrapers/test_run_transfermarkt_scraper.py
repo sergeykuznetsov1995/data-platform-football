@@ -36,6 +36,19 @@ import pandas as pd
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_tm_process_env():
+    # The runner mutates the live process env at call time (TM_DAG_ID /
+    # TM_RUN_ID / TM_TASK_ID / TM_SCOPE_ID via os.environ.setdefault at
+    # run_transfermarkt_scraper.py:4416) — in production that lands in a
+    # short-lived subprocess, but here it leaks into the shared pytest
+    # process and poisons the standing-policy suite in
+    # test_run_transfermarkt_scope_cycle.py (12 failures, full-suite order
+    # only). Snapshot/restore the env around every test in this file.
+    with patch.dict(os.environ):
+        yield
+
+
 REAL_TM_REGISTRY = importlib.import_module('scrapers.transfermarkt.registry')
 # The stubbed scraper module still has to date a season the way the real one
 # does — the runner and the scraper must never disagree about that again.

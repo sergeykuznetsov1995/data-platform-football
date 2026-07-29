@@ -1,0 +1,66 @@
+name: Unit suite
+
+# Repo-wide gate: the full unit suite on every PR (and on master pushes as a
+# baseline signal). Source-specific deep gates (e.g. sofascore-ci.yml) stay
+# separate — this workflow is the floor every change must clear.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-suite-${{ github.event.pull_request.number || github.ref }}
+  # PRs: newer push supersedes the running check. master: never cancel —
+  # every merge keeps its own baseline run so a red master stays bisectable.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the proven-green local venv (/root/.venvs/dpf-test) the
+          # pins in requirements-ci.txt were frozen from.
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install test runtime
+        shell: bash
+        run: |
+          # requirements-ci.txt is a pip freeze of the local proven-green test
+          # venv. Airflow is deliberately absent from it: tests/unit/dags/
+          # conftest.py installs its operator stubs only when the real package
+          # is missing, and the DAG topology tests assert against those stubs.
+          # A hand-curated short list (sofascore-ci.yml style) is NOT enough
+          # for the full suite — it left 36 collection errors and ~53 missing-
+          # module failures (bs4/duckdb/sqlglot/pyiceberg/curl_cffi/soccerdata/
+          # selenium/...), so the full frozen set is the contract.
+          python -m pip install --disable-pip-version-check -r requirements-ci.txt
+
+      - name: Full unit suite
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        # NOT SILENT: the six --ignore'd files below are the dormant WhoScored
+        # ceremony/host-seal suites (178 red on any hosted runner). They lstat
+        # the REAL host — root-owned path chains, supervisor locks, a pinned
+        # host Python — true only on the production VM, structurally never on
+        # a GitHub runner. They stay enforced by the local full suite
+        # (/root/.venvs/dpf-test) and disappear entirely when the dormant
+        # ceremony is removed (planned follow-up to #1012).
+        run: |
+          pytest -q tests/unit \
+            --ignore=tests/unit/scripts/test_bench_whoscored_capacity.py \
+            --ignore=tests/unit/scripts/test_whoscored_production_admission.py \
+            --ignore=tests/unit/scripts/test_whoscored_go_decision.py \
+            --ignore=tests/unit/scripts/test_whoscored_capacity_container_runtime.py \
+            --ignore=tests/unit/scripts/test_generate_whoscored_deployment_attestation.py \
+            --ignore=tests/unit/scripts/test_validate_whoscored_build_provenance.py
