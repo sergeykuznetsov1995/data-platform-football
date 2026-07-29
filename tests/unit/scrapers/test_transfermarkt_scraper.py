@@ -36,6 +36,7 @@ from scrapers.transfermarkt.scraper import (
     _parse_tm_money_eur,
     _parse_transfers,
     _career_collection_error,
+    _coach_history_page_is_empty,
     _season_window,
     _source_row_semantic_error,
     _stint_overlaps_season,
@@ -1275,6 +1276,92 @@ def _history_html(rows: str) -> str:
         '</table>'
         '</body></html>'
     )
+
+
+# A club with nobody on record serves its normal staff page: club headline,
+# some chrome table, no stint table and no trainer anchor anywhere (#1051,
+# live shape taken from Stade Mouscronnois / 2de Nationale FFA).
+_EMPTY_STAFF_PAGE = (
+    '<html><body>'
+    '<h1 class="data-header__headline-wrapper">Stade Mouscronnois</h1>'
+    '<table class="auflistung"><tr><td>Squad size</td><td>21</td></tr></table>'
+    '</body></html>'
+)
+
+
+class TestEmptyCoachHistoryPage:
+    def test_club_with_nobody_on_record_is_data_not_drift(self):
+        assert _coach_history_page_is_empty(_EMPTY_STAFF_PAGE) is True
+
+    def test_a_trainer_anchor_without_the_table_is_still_drift(self):
+        # A drifted layout leaves the parser something to trip on; that must
+        # keep failing loudly.
+        drifted = _EMPTY_STAFF_PAGE.replace(
+            '</body>',
+            '<a href="/some-coach/profil/trainer/42">Coach</a></body>',
+        )
+
+        assert _coach_history_page_is_empty(drifted) is False
+
+    def test_a_page_without_the_club_headline_is_still_drift(self):
+        broken = _EMPTY_STAFF_PAGE.replace(
+            '<h1 class="data-header__headline-wrapper">Stade Mouscronnois</h1>',
+            '',
+        )
+
+        assert _coach_history_page_is_empty(broken) is False
+
+    def test_fetch_validator_accepts_the_empty_staff_page(self):
+        validate = TransfermarktScraper._endpoint_validator(
+            'coach_history', as_json=False,
+        )
+
+        assert validate(_EMPTY_STAFF_PAGE) is None
+        assert validate('<html><body><p>nope</p></body></html>') == (
+            'missing table.items'
+        )
+
+    def test_empty_staff_page_counts_as_covered(self, monkeypatch):
+        # Before #1051 this club was a schema error, so one amateur side out of
+        # two dragged the scope to 1/2 and raised PartialScrapeError.
+        import scrapers.transfermarkt.scraper as tm
+
+        scraper = TransfermarktScraper()
+        memberships = pd.DataFrame([
+            {'club_id': '1', 'club_slug': 'a', 'club_name': 'A'},
+            {'club_id': '2', 'club_slug': 'b', 'club_name': 'B'},
+        ])
+        staffed = _history_html(_history_row(
+            'coach-one', '10', 'Coach One', 'Jul 1, 2025', '-',
+        ))
+        monkeypatch.setattr(tm, '_parse_coach_profile', lambda html, cid: {
+            'coach_id': cid, 'name': 'Coach Full',
+            'dob': date(1970, 1, 1), 'nationality': 'Belgium',
+        })
+        monkeypatch.setattr(
+            scraper, '_resolve_coach_bios_from_bronze',
+            MagicMock(side_effect=AssertionError('must not query Trino')),
+        )
+        monkeypatch.setattr(
+            scraper, '_fetch_html',
+            lambda url, label='html', context=None: (
+                _EMPTY_STAFF_PAGE
+                if label == 'coach_history' and '/verein/2/' in url
+                else staffed
+            ),
+        )
+
+        bundle = scraper.read_coach_data(
+            'ENG-Premier League', 2025,
+            memberships=memberships,
+            coach_profile_cache={},
+        )
+
+        # No PartialScrapeError: the empty club counts towards coverage.
+        outcomes = scraper.get_fetch_outcomes()['coach_history']
+        assert outcomes['2']['status'] == 'valid_empty'
+        # The staffed club still produced its stint; the empty one produced none.
+        assert len(bundle['stints']) == 1
 
 
 class TestParseCoachHistory:

@@ -463,6 +463,25 @@ def _listing_page_is_empty_shell(html: str, competition_id: str) -> bool:
     )
 
 
+def _coach_history_page_is_empty(html: str) -> bool:
+    """True when a club's staff page renders but nobody is on record.
+
+    Amateur and youth clubs (#1051: Stade Mouscronnois, 2de Nationale FFA)
+    serve their normal ``mitarbeiterhistorie`` page — club headline and all —
+    with no stint table and no trainer anchor anywhere.  A drifted layout
+    would still leave a trainer link for the parser to trip on, and an error
+    page would not carry the club headline.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, 'html.parser')
+    if soup.find('h1', {'class': 'data-header__headline-wrapper'}) is None:
+        return False
+    if soup.find('table', {'class': 'items'}) is not None:
+        return False
+    return soup.find('a', href=_COACH_HREF_RE) is None
+
+
 # Header text (lowercased) → bio field for the detailed (`/plus/1`) squad
 # table. The column SET varies by view: TM renders `Contract` only for the
 # season IT considers current and swaps in `Current club` for past seasons
@@ -1906,6 +1925,12 @@ class TransfermarktScraper(BaseScraper):
                     # decide whether it is the authoritative empty listing
                     # for the requested competition.
                     return None
+                if label == 'coach_history' and _coach_history_page_is_empty(
+                    html,
+                ):
+                    # A club with nobody on record (#1051) — same reasoning,
+                    # the caller decides it is authoritatively empty.
+                    return None
                 return 'missing table.items'
             elif label == 'listing' and soup.find('a', href=_CLUB_HREF_RE) is None:
                 return 'listing has no club links'
@@ -2707,6 +2732,15 @@ class TransfermarktScraper(BaseScraper):
                 'coach_history', {'club_id': club['club_id']}, len(parsed_stints),
             )
             if not parsed_stints:
+                if _coach_history_page_is_empty(html):
+                    # Nobody on record is an answer, not a failed page: count
+                    # it as covered so one amateur club cannot drag the scope
+                    # under the 90% floor (#1051).
+                    self._mark_authoritative_empty(
+                        'coach_history', {'club_id': club['club_id']},
+                    )
+                    history_successes += 1
+                    continue
                 self._mark_schema_error(
                     'coach_history', {'club_id': club['club_id']},
                     'coach-history table produced zero dated stints',
