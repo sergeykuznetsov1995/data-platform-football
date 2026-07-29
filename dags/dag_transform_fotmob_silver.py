@@ -603,8 +603,10 @@ def _validate_silver_quality_unfenced(**context) -> Dict[str, Any]:
             severity='WARNING',
         ),
         CHECK.value_range(
+            # 36, not 32: since 2024/25 the European league phase is one
+            # Swiss-model table of 36 clubs, so 31-36 are real placings.
             'silver.fotmob_team_profile', 'table_position',
-            min_val=1, max_val=30, severity='WARNING',
+            min_val=1, max_val=36, severity='WARNING',
         ),
 
         # --- team_standings (issue #600) ---
@@ -625,8 +627,10 @@ def _validate_silver_quality_unfenced(**context) -> Dict[str, Any]:
             severity='WARNING',
         ),
         CHECK.value_range(
+            # See fotmob_team_profile.table_position above — same 36-club
+            # European league phase.
             'silver.fotmob_team_standings', 'position',
-            min_val=1, max_val=30, severity='WARNING',
+            min_val=1, max_val=36, severity='WARNING',
         ),
         CHECK.value_range(
             'silver.fotmob_team_standings', 'points',
