@@ -14,7 +14,9 @@ permissions:
 
 concurrency:
   group: unit-suite-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # PRs: newer push supersedes the running check. master: never cancel —
+  # every merge keeps its own baseline run so a red master stays bisectable.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   unit:
@@ -35,10 +37,15 @@ jobs:
           # its operator stubs only when the real package is missing, and the DAG
           # topology tests assert against those stubs (same contract as the local
           # /root/.venvs/dpf-test venv and sofascore-ci.yml).
+          # The first line mirrors sofascore-ci.yml; the second adds what the
+          # FULL suite needs beyond the sofascore subset (verified by a clean
+          # replica venv: without them collection stops at 36 errors — bs4/
+          # duckdb/sqlglot — and tls_requests/psutil fail at runtime).
           python -m pip install --disable-pip-version-check \
             pytest pandas numpy pyarrow trino requests PyYAML jinja2 \
             jsonschema "tls-client-python==1.15.1" python-dotenv tenacity pybreaker \
-            rapidfuzz Unidecode nicknames
+            rapidfuzz Unidecode nicknames \
+            beautifulsoup4 lxml duckdb sqlglot psutil wrapper-tls-requests
 
       - name: Full unit suite
         env:
