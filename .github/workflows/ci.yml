@@ -1,0 +1,46 @@
+name: Unit suite
+
+# Repo-wide gate: the full unit suite on every PR (and on master pushes as a
+# baseline signal). Source-specific deep gates (e.g. sofascore-ci.yml) stay
+# separate — this workflow is the floor every change must clear.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-suite-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install test runtime
+        shell: bash
+        run: |
+          # Airflow is deliberately absent: tests/unit/dags/conftest.py installs
+          # its operator stubs only when the real package is missing, and the DAG
+          # topology tests assert against those stubs (same contract as the local
+          # /root/.venvs/dpf-test venv and sofascore-ci.yml).
+          python -m pip install --disable-pip-version-check \
+            pytest pandas numpy pyarrow trino requests PyYAML jinja2 \
+            jsonschema "tls-client-python==1.15.1" python-dotenv tenacity pybreaker \
+            rapidfuzz Unidecode nicknames
+
+      - name: Full unit suite
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: pytest -q tests/unit
