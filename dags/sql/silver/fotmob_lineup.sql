@@ -37,6 +37,13 @@
 --     slug CASE ('2526', WC '2026') — do NOT derive the slug from the key form.
 --   * dedup: *_current view is already one row per match (manifest identity
 --     entity_id = match_id) → legacy ROW_NUMBER dedup dropped.
+--   * #1040: old tournaments (AFCON 2017/18) ship a FULL lineup whose players
+--     carry NO `id` at all — only name/shirtNumber. Such a row is not a usable
+--     fact: nothing in Gold or xref can join it, and the id-less rows collapse
+--     onto each other under (match_id, player_id), breaking no_duplicates.
+--     Filter them out here, exactly as silver.whoscored_lineup does. The empty
+--     string is treated like NULL: those same records carry `optaId: ""`, so an
+--     `id: ""` variant of the same gap is one FotMob era away.
 -- =============================================================================
 
 WITH league_map(competition_id, league) AS (
@@ -128,3 +135,5 @@ SELECT
     league,
     season
 FROM exploded
+-- #1040: see the footgun above — an id-less lineup row is not a usable fact.
+WHERE NULLIF(TRIM(json_extract_scalar(player, '$.id')), '') IS NOT NULL
