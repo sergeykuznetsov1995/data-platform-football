@@ -89,6 +89,12 @@ complete attempt requires:
 - physical row counts matching the proposed manifest before `complete` is
   appended.
 
+A complete three-way forecast total is valid within the inclusive
+`1.0 +/- 0.02` interval. In particular, the source values
+`0.34 + 0.26 + 0.38 = 0.98` remain valid when nullable `Float64` subtraction
+represents the boundary infinitesimally above `0.02`; totals outside the
+inclusive interval remain contract failures.
+
 Because Iceberg replacements are table-by-table, the runner appends an
 `in_progress` marker before its first write. Consumers use the latest manifest
 attempt and exact complete `_batch_id`; a hard worker exit or newer failure
@@ -102,16 +108,18 @@ completed the scope after planning, history returns that existing attempt and
 does not append `in_progress`. The terminal watcher runs after cooldown and
 propagates mapped runner/validator failures to the DagRun status.
 
-Six match-level source exceptions were verified live. The FRA and GER payloads
-were verified on 2026-07-27; the four RFPL payloads were verified on
-2026-07-28. Every `getMatchData` call returns HTTP 200 but empty inner `shots`
-and `rosters`:
+Eight match-level source exceptions were verified live. The FRA and GER
+payloads were verified on 2026-07-27; the four RFPL 1920 payloads were verified
+on 2026-07-28; and the two RFPL 2021 payloads were verified on 2026-07-29.
+Every `getMatchData` call returns HTTP 200 but empty inner `shots` and
+`rosters`:
 
 | Scope | Match IDs | Allowed missing entities | Verification date |
 |---|---|---|---|
 | FRA-Ligue 1 / 1617 | 4238 (SC Bastia–Lyon) | `understat_shots`, `understat_player_match_stats` | 2026-07-27 |
 | GER-Bundesliga / 2425 | 27930 (Holstein Kiel–Bochum) | `understat_shots`, `understat_player_match_stats` | 2026-07-27 |
 | RUS-Premier League / 1920 | 11214, 11222, 11249, 11260 | `understat_shots`, `understat_player_match_stats` | 2026-07-28 |
+| RUS-Premier League / 2021 (RFPL source season 2020) | 14229, 14235 | `understat_shots`, `understat_player_match_stats` | 2026-07-29 |
 
 They are exact-ID exceptions in `scrapers/understat/coverage.py`. No league- or
 season-wide percentage waiver exists; any new missing game blocks publication.
