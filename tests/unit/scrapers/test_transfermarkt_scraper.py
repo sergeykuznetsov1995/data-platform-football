@@ -14,6 +14,7 @@ import pytest
 import scrapers.transfermarkt.scraper as tm_scraper
 
 from scrapers.transfermarkt import (
+    FetchStatus,
     TransfermarktScraper,
     materialize_legacy_market_value_history,
     materialize_legacy_transfers,
@@ -34,9 +35,12 @@ from scrapers.transfermarkt.scraper import (
     _parse_tm_date,
     _parse_tm_money_eur,
     _parse_transfers,
+    _career_collection_error,
     _season_window,
+    _source_row_semantic_error,
     _stint_overlaps_season,
 )
+from scrapers.transfermarkt.models import FetchRecord
 from scrapers.transfermarkt.registry import (
     SeasonFormat,
     canonical_season,
@@ -512,6 +516,98 @@ class TestParseTransfers:
 
 
 # ---------------------------------------------------------------------------
+# TM states "this move happened, the day is unknown" with a 0000-00-00
+# sentinel — routine for youth and reserve moves.  The season and both clubs
+# are still there, so the row is data and must survive with a null date.
+# ---------------------------------------------------------------------------
+
+def _unknown_date_transfer(**overrides):
+    # Shape taken verbatim from /ceapi/transferHistory/list/1440885, the
+    # payload row that aborted scope A2SW/2025 (issue #1046).
+    entry = {
+        'date': '',
+        'dateUnformatted': '0000-00-00',
+        'season': '23/24',
+        'upcoming': False,
+        'from': {
+            'clubName': 'Sport-Club Yth.',
+            'href': '/sport-club/transfers/verein/1111/saison_id/2023',
+        },
+        'to': {
+            'clubName': 'Post Wien Jgd',
+            'href': '/post-wien/transfers/verein/2222/saison_id/2023',
+        },
+        'fee': '-',
+        'marketValue': '-',
+    }
+    entry.update(overrides)
+    return entry
+
+
+class TestUnknownTransferDate:
+    def test_sentinel_date_passes_semantic_validation(self):
+        assert _source_row_semantic_error(
+            'transfer_events', _unknown_date_transfer(),
+        ) is None
+
+    def test_sentinel_row_materialises_with_a_null_date(self):
+        rows = _parse_transfers(
+            {'transfers': [_unknown_date_transfer()]}, '1440885',
+        )
+
+        assert len(rows) == 1
+        assert rows[0]['transfer_date'] is None
+        assert rows[0]['event_season'] == '2324'
+        assert rows[0]['from_club_id'] == '1111'
+        assert rows[0]['to_club_id'] == '2222'
+        assert rows[0]['is_upcoming'] is False
+
+    def test_sentinel_row_passes_collection_validation(self):
+        payload = {'transfers': [_unknown_date_transfer()]}
+
+        assert _career_collection_error(
+            'transfer_events',
+            '1440885',
+            payload['transfers'],
+            _parse_transfers(payload, '1440885'),
+        ) is None
+
+    def test_an_unreadable_date_still_fails_and_is_named(self):
+        # A genuinely new format must keep aborting the scope, and the message
+        # has to carry the value so the drift is diagnosable from the report.
+        problem = _source_row_semantic_error(
+            'transfer_events',
+            _unknown_date_transfer(dateUnformatted='2024-13-45', date=''),
+        )
+
+        assert problem is not None
+        assert '2024-13-45' in problem
+
+    def test_a_blank_date_is_still_the_source_saying_unknown(self):
+        assert _source_row_semantic_error(
+            'transfer_events',
+            _unknown_date_transfer(dateUnformatted='', date=''),
+        ) is None
+
+    def test_a_vanished_date_field_is_drift_and_still_fails(self):
+        # If TM renames the machine date field, every row loses its date. That
+        # must abort the scope, not pass as "the day is unknown" and null out
+        # the column behind a green report.
+        entry = _unknown_date_transfer()
+        del entry['dateUnformatted']
+        del entry['date']
+        entry['transferDate'] = '2024-01-15'
+
+        assert _source_row_semantic_error('transfer_events', entry) is not None
+
+    def test_a_row_without_season_or_date_still_fails(self):
+        assert _source_row_semantic_error(
+            'transfer_events',
+            _unknown_date_transfer(season=None),
+        ) == 'transfer has no valid event season/date'
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -595,6 +691,59 @@ class TestConsecutiveFailureRaise:
                 league='ENG-Premier League', season=2025,
                 player_ids=['1', '2', '3', '4'],
             )
+
+    def test_abort_message_names_the_open_parser_circuit(
+        self, scraper, monkeypatch,
+    ):
+        # With the circuit open every call is refused without a request, so a
+        # bare "50 consecutive failures" reads as a transport outage and sent
+        # two shifts after the network instead of after the parser (#1046).
+        import scrapers.transfermarkt.scraper as tm
+        monkeypatch.setattr(tm, '_MAX_CONSECUTIVE_FAILURES', 3)
+        monkeypatch.setattr(tm, '_MIN_SUCCESS_RATIO', 0)
+        monkeypatch.setattr(
+            scraper, '_fetch_json',
+            lambda url, label='json', context=None: None,
+        )
+        scraper._materialization_circuit_open = True
+        scraper._fetch_records['transfer_events']['9'] = FetchRecord(
+            status=FetchStatus.SCHEMA_ERROR,
+            row_count=0,
+            payload_hash=None,
+            error='schema: transfers[2]: unreadable date',
+            status_code=200,
+            attempts=1,
+        )
+
+        with pytest.raises(ConsecutiveFailureError) as excinfo:
+            scraper.read_transfers(
+                league='ENG-Premier League', season=2025,
+                player_ids=['1', '2', '3', '4'],
+            )
+
+        message = str(excinfo.value)
+        assert 'parser circuit is open' in message
+        assert '1 schema failure(s)' in message
+        assert 'schema: transfers[2]: unreadable date' in message
+
+    def test_abort_message_stays_bare_when_the_circuit_is_closed(
+        self, scraper, monkeypatch,
+    ):
+        import scrapers.transfermarkt.scraper as tm
+        monkeypatch.setattr(tm, '_MAX_CONSECUTIVE_FAILURES', 3)
+        monkeypatch.setattr(tm, '_MIN_SUCCESS_RATIO', 0)
+        monkeypatch.setattr(
+            scraper, '_fetch_json',
+            lambda url, label='json', context=None: None,
+        )
+
+        with pytest.raises(ConsecutiveFailureError) as excinfo:
+            scraper.read_transfers(
+                league='ENG-Premier League', season=2025,
+                player_ids=['1', '2', '3', '4'],
+            )
+
+        assert 'parser circuit' not in str(excinfo.value)
 
     def test_counter_reset_prevents_raise(self, scraper, monkeypatch):
         # 2 failures then a success, repeated — the counter never reaches

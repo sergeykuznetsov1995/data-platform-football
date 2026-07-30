@@ -324,6 +324,11 @@ _TM_DATE_FORMATS = (
     '%b %d, %Y', '%B %d, %Y', '%Y-%m-%d', '%d.%m.%Y', '%d/%m/%Y',
 )
 
+# What TM sends when it knows a transfer happened but not on which day —
+# youth and reserve moves carry it routinely.  The season is still filled in,
+# so the row is source truth with an unknown date, not an unreadable payload.
+_TM_UNKNOWN_DATE_SENTINELS = frozenset({'0000-00-00'})
+
 
 # The market-value epoch is midnight in the source's own timezone; read as UTC
 # it lands on the previous day.
@@ -358,6 +363,18 @@ def _transfer_date(entry: Dict) -> Optional[date]:
     return _parse_tm_date(
         entry.get('dateUnformatted') or entry.get('date')
     )
+
+
+def _transfer_date_is_unknown(entry: Dict) -> bool:
+    """True when the source itself says the exact transfer day is unknown."""
+
+    raw = entry.get('dateUnformatted') or entry.get('date')
+    if raw:
+        return str(raw).strip() in _TM_UNKNOWN_DATE_SENTINELS
+    # A blank value is still the source speaking. Both machine fields missing
+    # is not: a renamed date field would land here for every row and null out
+    # every date behind a green scope, so let that keep aborting.
+    return 'dateUnformatted' in entry or 'date' in entry
 
 
 def _parse_tm_date(raw) -> Optional[date]:
@@ -936,8 +953,16 @@ def _source_row_semantic_error(label: str, entry: Dict) -> Optional[str]:
         )
         if event_season is None:
             return 'transfer has no valid event season/date'
-        if transfer_date is None and not upcoming:
-            return 'non-upcoming transfer has no valid transfer date'
+        if (
+            transfer_date is None
+            and not upcoming
+            and not _transfer_date_is_unknown(entry)
+        ):
+            raw_date = entry.get('dateUnformatted') or entry.get('date')
+            return (
+                'non-upcoming transfer has an unreadable transfer date '
+                f'{str(raw_date)!r}'
+            )
 
         def _meaningful_club(side: str) -> bool:
             club = entry.get(side)
@@ -1655,6 +1680,35 @@ class TransfermarktScraper(BaseScraper):
             raw_fetched_at=outcome.raw_fetched_at,
             raw_attempt_envelope_id=outcome.raw_attempt_envelope_id,
             raw_attempt_envelope_ids=outcome.raw_attempt_envelope_ids,
+        )
+
+    def _circuit_open_detail(self, label: str) -> str:
+        """Say what a run of failures was, not just how long it ran.
+
+        Once the parser circuit opens every further call is refused without a
+        request, so a bare counter reads like a transport outage and sends
+        diagnosis after the network instead of after the parser.
+        """
+
+        if not self._materialization_circuit_open:
+            return ''
+        records = self._fetch_records.get(label, {})
+        schema_errors = [
+            record for record in records.values()
+            if record.status is FetchStatus.SCHEMA_ERROR
+        ]
+        refused = sum(
+            1 for record in records.values()
+            if record.status is FetchStatus.RETRY_EXHAUSTED
+        )
+        first_error = next(
+            (record.error for record in schema_errors if record.error),
+            'not recorded',
+        )
+        return (
+            f' — parser circuit is open: {len(schema_errors)} schema failure(s)'
+            f' opened it and {refused} later call(s) were refused without a'
+            f' request; first schema failure: {first_error}'
         )
 
     def _record_materialized_rows(
@@ -2938,6 +2992,7 @@ class TransfermarktScraper(BaseScraper):
                         f"{consecutive_failures} consecutive {label} "
                         f"failures at {idx}/{len(selected_ids)} — aborting "
                         f"to protect existing partition"
+                        + self._circuit_open_detail(label)
                     )
             else:
                 source_field = (
