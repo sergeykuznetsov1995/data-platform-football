@@ -583,6 +583,23 @@ class TestUnknownTransferDate:
         assert problem is not None
         assert '2024-13-45' in problem
 
+    def test_a_blank_date_is_still_the_source_saying_unknown(self):
+        assert _source_row_semantic_error(
+            'transfer_events',
+            _unknown_date_transfer(dateUnformatted='', date=''),
+        ) is None
+
+    def test_a_vanished_date_field_is_drift_and_still_fails(self):
+        # If TM renames the machine date field, every row loses its date. That
+        # must abort the scope, not pass as "the day is unknown" and null out
+        # the column behind a green report.
+        entry = _unknown_date_transfer()
+        del entry['dateUnformatted']
+        del entry['date']
+        entry['transferDate'] = '2024-01-15'
+
+        assert _source_row_semantic_error('transfer_events', entry) is not None
+
     def test_a_row_without_season_or_date_still_fails(self):
         assert _source_row_semantic_error(
             'transfer_events',

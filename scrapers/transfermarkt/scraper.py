@@ -369,7 +369,12 @@ def _transfer_date_is_unknown(entry: Dict) -> bool:
     """True when the source itself says the exact transfer day is unknown."""
 
     raw = entry.get('dateUnformatted') or entry.get('date')
-    return not raw or str(raw).strip() in _TM_UNKNOWN_DATE_SENTINELS
+    if raw:
+        return str(raw).strip() in _TM_UNKNOWN_DATE_SENTINELS
+    # A blank value is still the source speaking. Both machine fields missing
+    # is not: a renamed date field would land here for every row and null out
+    # every date behind a green scope, so let that keep aborting.
+    return 'dateUnformatted' in entry or 'date' in entry
 
 
 def _parse_tm_date(raw) -> Optional[date]:
