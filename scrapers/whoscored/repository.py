@@ -4688,6 +4688,9 @@ class WhoScoredRepository:
                 partition_spec=[("league", "identity"), ("season", "identity")],
                 source="whoscored",
             )
+            for row in manifest_frame:
+                identity = (row["league"], row["season"], int(row["game_id"]))
+                self._published_preview_games[identity] = True
         return tuple(commit.batch_id for commit in ordered)
 
     def _prepare_match_commit(

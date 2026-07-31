@@ -2013,6 +2013,25 @@ def test_preview_not_available_dataset_still_publishes_a_first_snapshot():
 
 
 @pytest.mark.unit
+def test_published_preview_snapshot_re_arms_the_refusal_within_one_process():
+    trino = MagicMock()
+    trino.execute_query.side_effect = [
+        [(0,)],  # no published snapshot yet
+        [],  # no successful manifest
+        [],  # no physical rows before commit
+        [],  # zero-row batch is physically complete after commit
+    ]
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+    commit = _preview_commit()
+    commit = replace(commit, dataset_statuses={"missing_players": "not_available"})
+
+    assert repository.commit_previews((commit,)) == (commit.batch_id,)
+
+    with pytest.raises(ValueError, match="not available"):
+        repository.validate_preview_commit(commit)
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("latest_state", "latest_age", "expect_heartbeat"),
     [
