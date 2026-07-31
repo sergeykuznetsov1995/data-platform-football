@@ -2622,6 +2622,10 @@ validated_complete AS (
           AND child.ancestor_cutover_sha256s =
               CONCAT(parent.ancestor_cutover_sha256s, ARRAY[parent.cutover_sha256])
     )
+), invalid_lineage_hashes AS (
+    SELECT cutover_sha256 FROM cutover_records
+    EXCEPT
+    SELECT cutover_sha256 FROM lineage_valid_cutovers
 ), conflicting_cutover_ids AS (
     SELECT cutover_id
     FROM {catalog}.{schema}.{CUTOVER_TABLE}
@@ -2643,6 +2647,8 @@ validated_complete AS (
     JOIN conflicting_cutover_predecessors fork
       ON fork.scope_id = c.scope_id
      AND fork.predecessor_cutover_sha256 IS NOT DISTINCT FROM c.predecessor_cutover_sha256
+    UNION
+    SELECT cutover_sha256 FROM invalid_lineage_hashes
 ), eligible_cutovers AS (
     SELECT c.*
     FROM lineage_valid_cutovers c

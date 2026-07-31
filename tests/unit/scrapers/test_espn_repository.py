@@ -1822,6 +1822,7 @@ def test_current_view_excludes_forks_conflicting_ids_and_all_descendants():
     assert '"ancestor_cutover_sha256_json"' in ddl
     assert '"ancestor_lineage_sha256"' in ddl
     assert "bad_cutover_hashes AS" in sql
+    assert "invalid_lineage_hashes AS" in sql
     assert "eligible_cutovers AS" in sql
     assert "ancestor_cutover_sha256s" in sql
     assert "CONTAINS(c.ancestor_cutover_sha256s, bad.cutover_sha256)" in sql
@@ -1839,6 +1840,7 @@ def test_current_view_excludes_forks_conflicting_ids_and_all_descendants():
 
     p, a, b, c, q, x1, x2, d = (digit * 64 for digit in "12345678")
     malformed_d = "9" * 64
+    propagated_e = "a" * 64
     records = (
         ("scope-1", "P", p, None, None, ()),
         ("scope-1", "P", p, None, None, ()),  # exact duplicate, not a fork
@@ -1846,10 +1848,11 @@ def test_current_view_excludes_forks_conflicting_ids_and_all_descendants():
         ("scope-1", "B", b, "P", p, (p,)),  # direct sibling fork
         ("scope-1", "C", c, "A", a, (p, a)),  # descendant of fork A
         ("scope-1", "D", malformed_d, "C", c, (c,)),  # truncated lineage
+        ("scope-1", "E", propagated_e, "D", malformed_d, (c, malformed_d)),
         ("scope-2", "Q", q, None, None, ()),
         ("scope-2", "X", x1, "Q", q, (q,)),
         ("scope-2", "X", x2, "Q", q, (q,)),  # conflicting immutable ID
-        ("scope-2", "E", d, "X", x1, (q, x1)),  # conflict descendant
+        ("scope-2", "Z", d, "X", x1, (q, x1)),  # conflict descendant
     )
     id_hashes: dict[str, set[str]] = {}
     slot_hashes: dict[tuple[str, str | None], set[str]] = {}
@@ -1878,6 +1881,20 @@ def test_current_view_excludes_forks_conflicting_ids_and_all_descendants():
         )
         == 1
     }
+    eligible_without_invalid_propagation = {
+        cutover_hash
+        for _, _, cutover_hash, _, _, ancestors in records
+        if cutover_hash in lineage_valid
+        and cutover_hash not in bad_hashes
+        and not bad_hashes.intersection(ancestors)
+    }
+    assert propagated_e in eligible_without_invalid_propagation
+    invalid_lineage_hashes = {
+        cutover_hash
+        for _, _, cutover_hash, _, _, _ in records
+        if cutover_hash not in lineage_valid
+    }
+    bad_hashes.update(invalid_lineage_hashes)
     eligible = {
         cutover_hash
         for _, _, cutover_hash, _, _, ancestors in records
@@ -1886,6 +1903,8 @@ def test_current_view_excludes_forks_conflicting_ids_and_all_descendants():
         and not bad_hashes.intersection(ancestors)
     }
     assert malformed_d not in lineage_valid
+    assert malformed_d in invalid_lineage_hashes
+    assert propagated_e not in eligible
     assert eligible == {p, q}
 
 
