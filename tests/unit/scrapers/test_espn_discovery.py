@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -23,9 +24,17 @@ from scrapers.espn.models import AgeClass, CapabilityState, Gender
 from scrapers.espn.registry import DEFAULT_REGISTRY_PATH, load_registry
 
 
-FIXTURE = Path(__file__).resolve().parents[2] / "fixtures" / "espn" / "catalog_2026-07-31.json"
+FIXTURE = (
+    Path(__file__).resolve().parents[2]
+    / "fixtures"
+    / "espn"
+    / "catalog_2026-07-31.json"
+)
 RAW_DROPDOWN_FIXTURE = (
-    Path(__file__).resolve().parents[2] / "fixtures" / "espn" / "dropdown_2026-07-31.json"
+    Path(__file__).resolve().parents[2]
+    / "fixtures"
+    / "espn"
+    / "dropdown_2026-07-31.json"
 )
 
 
@@ -52,7 +61,10 @@ def _dropdown() -> dict:
                                 "n": "FIFA World Cup",
                                 "id": "606",
                                 "lk": [
-                                    {"t": "index", "u": "https://www.espn.com/soccer/worldcup/"},
+                                    {
+                                        "t": "index",
+                                        "u": "https://www.espn.com/soccer/worldcup/",
+                                    },
                                     {
                                         "t": "schedule",
                                         "u": "https://www.espn.com/soccer/schedule/_/league/fifa.world",
@@ -179,7 +191,9 @@ def test_discovery_enriches_every_row_without_promoting_or_guessing_age() -> Non
 
 
 @pytest.mark.unit
-def test_candidate_snapshot_persists_every_row_separately_from_registry(tmp_path) -> None:
+def test_candidate_snapshot_persists_every_row_separately_from_registry(
+    tmp_path,
+) -> None:
     snapshot = discover_catalog(
         _dropdown(),
         details_by_slug={"eng.1": _detail()},
@@ -194,6 +208,19 @@ def test_candidate_snapshot_persists_every_row_separately_from_registry(tmp_path
 
 
 @pytest.mark.unit
+def test_snapshot_rejects_boolean_schema_version() -> None:
+    with pytest.raises(ValueError, match="schema_version"):
+        CatalogSnapshot.from_dict(
+            {
+                "schema_version": True,
+                "captured_at": "2026-07-31T12:00:00Z",
+                "source": "ESPN soccer dropdown",
+                "candidates": [],
+            }
+        )
+
+
+@pytest.mark.unit
 def test_saved_catalog_fixture_retains_all_220_discovery_rows() -> None:
     raw_dropdown = json.loads(RAW_DROPDOWN_FIXTURE.read_text(encoding="utf-8"))
     parsed_dropdown = parse_soccer_dropdown(raw_dropdown)
@@ -205,10 +232,69 @@ def test_saved_catalog_fixture_retains_all_220_discovery_rows() -> None:
     assert snapshot.captured_at.startswith("2026-07-31T")
     assert len(snapshot.candidates) == 220
     assert len({row.slug for row in snapshot.candidates}) == 220
-    assert [row.slug for row in snapshot.candidates] == [
-        row.slug for row in parsed_dropdown
+    assert [(row.espn_id, row.slug, row.name) for row in snapshot.candidates] == [
+        (row.espn_id, row.slug, row.name) for row in parsed_dropdown
     ]
-    assert any(row.gender is Gender.FEMALE for row in snapshot.candidates)
+    assert Counter(row.gender for row in snapshot.candidates) == {
+        Gender.MALE: 181,
+        Gender.FEMALE: 38,
+        Gender.UNKNOWN: 1,
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        {},
+        {"schedule": "proven", "lineup": "partial"},
+        {
+            "schedule": "proven",
+            "lineup": "partial",
+            "matchsheet": "absent",
+            "extra": "unknown",
+        },
+    ],
+)
+def test_snapshot_candidate_capabilities_require_exact_keys(capabilities: dict) -> None:
+    with pytest.raises(ValueError, match="exactly"):
+        CatalogCandidate.from_dict(
+            {
+                "espn_id": 700,
+                "slug": "eng.1",
+                "name": "English Premier League",
+                "group": "Europe",
+                "source_order": 0,
+                "capabilities": capabilities,
+            }
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("invalid_id", [True, 700.0, "0700", "+700", "700.0"])
+def test_native_dropdown_rejects_noncanonical_numeric_ids(invalid_id) -> None:
+    payload = {
+        "leagues": [{"id": invalid_id, "slug": "eng.1", "name": "Premier League"}]
+    }
+
+    with pytest.raises(ValueError, match="numeric id"):
+        parse_soccer_dropdown(payload)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("invalid_value", [True, 700.0, "0700", "+700", "700.0"])
+@pytest.mark.parametrize("field", ["id", "season_year"])
+def test_competition_detail_rejects_noncanonical_positive_integers(
+    field: str, invalid_value
+) -> None:
+    payload = _detail()
+    if field == "id":
+        payload["id"] = invalid_value
+    else:
+        payload["season"]["year"] = invalid_value
+
+    with pytest.raises(ValueError, match="numeric id|season.year"):
+        parse_competition_detail(payload)
 
 
 @pytest.mark.unit
@@ -224,7 +310,12 @@ def test_every_female_fixture_candidate_is_rejected_by_manual_promotion() -> Non
     for candidate in female:
         with pytest.raises(RegistryError, match="explicit MALE"):
             promote_candidate(
-                {"schema_version": 1, "registry_version": "test", "as_of": "2026-07-31", "competitions": []},
+                {
+                    "schema_version": 1,
+                    "registry_version": "test",
+                    "as_of": "2026-07-31",
+                    "competitions": [],
+                },
                 candidate,
                 age_class=AgeClass.SENIOR,
                 age_class_evidence=("manual",),
@@ -247,7 +338,11 @@ def test_catalog_diff_reports_added_removed_and_changed_fields() -> None:
             "edition_display_name": "2025-26 English Premier League",
             "start_date": "2025-06-01",
             "end_date": "2026-06-01",
-            "capabilities": {"schedule": "proven", "lineup": "partial", "matchsheet": "unknown"},
+            "capabilities": {
+                "schedule": "proven",
+                "lineup": "partial",
+                "matchsheet": "unknown",
+            },
             "gender_evidence": ["detail.gender=MALE"],
         }
     )
@@ -257,11 +352,19 @@ def test_catalog_diff_reports_added_removed_and_changed_fields() -> None:
             "slug": "eng.premier",
             "gender": "FEMALE",
             "source_season_year": 2026,
-            "capabilities": {"schedule": "proven", "lineup": "proven", "matchsheet": "partial"},
+            "capabilities": {
+                "schedule": "proven",
+                "lineup": "proven",
+                "matchsheet": "partial",
+            },
         }
     )
-    removed = CatalogCandidate.from_dict({**base.to_dict(), "espn_id": 606, "slug": "fifa.world"})
-    added = CatalogCandidate.from_dict({**base.to_dict(), "espn_id": 775, "slug": "uefa.champions"})
+    removed = CatalogCandidate.from_dict(
+        {**base.to_dict(), "espn_id": 606, "slug": "fifa.world"}
+    )
+    added = CatalogCandidate.from_dict(
+        {**base.to_dict(), "espn_id": 775, "slug": "uefa.champions"}
+    )
     previous = CatalogSnapshot("2026-07-24T00:00:00Z", (base, removed))
     current = CatalogSnapshot("2026-07-31T00:00:00Z", (changed, added))
 
@@ -291,7 +394,11 @@ def test_catalog_diff_detects_edition_window_change_without_year_change() -> Non
             "edition_display_name": "2026-27 English Premier League",
             "start_date": "2026-06-01",
             "end_date": "2027-06-01",
-            "capabilities": {"schedule": "proven", "lineup": "partial", "matchsheet": "unknown"},
+            "capabilities": {
+                "schedule": "proven",
+                "lineup": "partial",
+                "matchsheet": "unknown",
+            },
         }
     )
     after = CatalogCandidate.from_dict({**before.to_dict(), "end_date": "2027-07-01"})
@@ -322,12 +429,18 @@ def test_new_source_season_is_quarantined_until_registry_is_manually_updated() -
             "edition_display_name": "2027-28 English Premier League",
             "start_date": "2027-06-01",
             "end_date": "2028-06-01",
-            "capabilities": {"schedule": "proven", "lineup": "proven", "matchsheet": "proven"},
+            "capabilities": {
+                "schedule": "proven",
+                "lineup": "proven",
+                "matchsheet": "proven",
+            },
             "gender_evidence": ["detail.gender=MALE"],
         }
     )
 
-    quarantined = quarantine_new_editions(CatalogSnapshot("2027-07-31T00:00:00Z", (current,)), registry)
+    quarantined = quarantine_new_editions(
+        CatalogSnapshot("2027-07-31T00:00:00Z", (current,)), registry
+    )
 
     assert quarantined == {"700:2027"}
     assert registry.by_slug["eng.1"].current_edition.source_season_year == 2026

@@ -78,9 +78,15 @@ class CatalogCandidate(CanonicalModel):
 
     def __post_init__(self) -> None:
         if self.espn_id is not None and (
-            isinstance(self.espn_id, bool) or self.espn_id <= 0
+            type(self.espn_id) is not int or self.espn_id <= 0
         ):
             raise ValueError("espn_id must be a positive integer when present")
+        if type(self.source_order) is not int or self.source_order < 0:
+            raise ValueError("source_order must be a non-negative integer")
+        if self.source_season_year is not None and (
+            type(self.source_season_year) is not int or self.source_season_year < 1800
+        ):
+            raise ValueError("source_season_year must be an ESPN season year")
         if not self.slug or not self.name or not self.group:
             raise ValueError("candidate slug, name and group must not be empty")
         if not isinstance(self.gender, Gender):
@@ -93,34 +99,64 @@ class CatalogCandidate(CanonicalModel):
         if not isinstance(value, Mapping):
             raise DiscoveryError("catalog candidate must be an object")
         allowed = {
-            "espn_id", "slug", "name", "group", "source_order", "gender",
-            "age_class", "source_season_year", "edition_display_name",
-            "start_date", "end_date", "capabilities", "gender_evidence",
+            "espn_id",
+            "slug",
+            "name",
+            "group",
+            "source_order",
+            "gender",
+            "age_class",
+            "source_season_year",
+            "edition_display_name",
+            "start_date",
+            "end_date",
+            "capabilities",
+            "gender_evidence",
         }
         extras = set(value) - allowed
         if extras:
             raise DiscoveryError(f"catalog candidate has unknown keys {sorted(extras)}")
-        capabilities = value.get("capabilities") or {}
-        if not isinstance(capabilities, Mapping):
-            raise DiscoveryError("catalog candidate capabilities must be an object")
-        espn_id = value.get("espn_id")
+        if "capabilities" in value:
+            capabilities = value["capabilities"]
+            if not isinstance(capabilities, Mapping):
+                raise DiscoveryError("catalog candidate capabilities must be an object")
+            if set(capabilities) != {"schedule", "lineup", "matchsheet"}:
+                raise DiscoveryError(
+                    "catalog candidate capabilities must define exactly "
+                    "schedule, lineup and matchsheet"
+                )
+        else:
+            capabilities = {
+                "schedule": CapabilityState.UNKNOWN.value,
+                "lineup": CapabilityState.UNKNOWN.value,
+                "matchsheet": CapabilityState.UNKNOWN.value,
+            }
+        raw_espn_id = value.get("espn_id")
         source_order = value.get("source_order")
-        source_year = value.get("source_season_year")
+        raw_source_year = value.get("source_season_year")
         evidence = value.get("gender_evidence") or []
-        if espn_id is not None and (
-            isinstance(espn_id, bool) or not isinstance(espn_id, int)
-        ):
-            raise DiscoveryError("catalog candidate espn_id must be integer or null")
         if isinstance(source_order, bool) or not isinstance(source_order, int):
             raise DiscoveryError("catalog candidate source_order must be integer")
-        if source_year is not None and (
-            isinstance(source_year, bool) or not isinstance(source_year, int)
-        ):
-            raise DiscoveryError("catalog candidate source_season_year must be integer or null")
+        espn_id = (
+            _native_positive_int(raw_espn_id, "catalog candidate espn_id")
+            if raw_espn_id is not None
+            else None
+        )
+        source_year = (
+            _native_positive_int(
+                raw_source_year,
+                "catalog candidate source_season_year",
+                minimum=1800,
+            )
+            if raw_source_year is not None
+            else None
+        )
         if not isinstance(evidence, list) or not all(
             isinstance(item, str) and item.strip() for item in evidence
         ):
-            raise DiscoveryError("catalog candidate gender_evidence must be a string list")
+            raise DiscoveryError(
+                "catalog candidate gender_evidence must be a string list"
+            )
         try:
             candidate = cls(
                 espn_id=espn_id,
@@ -165,6 +201,19 @@ class CatalogSnapshot(CanonicalModel):
     schema_version: int = 1
     source: str = "ESPN soccer dropdown"
 
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise DiscoveryError("catalog snapshot schema_version must be 1")
+        _required_candidate_string(self.captured_at, "captured_at")
+        _required_candidate_string(self.source, "source")
+        if not isinstance(self.candidates, (list, tuple)) or not all(
+            isinstance(candidate, CatalogCandidate) for candidate in self.candidates
+        ):
+            raise DiscoveryError(
+                "catalog snapshot candidates must contain catalog candidates"
+            )
+        object.__setattr__(self, "candidates", tuple(self.candidates))
+
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "CatalogSnapshot":
         if not isinstance(value, Mapping):
@@ -173,13 +222,15 @@ class CatalogSnapshot(CanonicalModel):
         extras = set(value) - allowed
         if extras:
             raise DiscoveryError(f"catalog snapshot has unknown keys {sorted(extras)}")
-        if value.get("schema_version") != 1:
+        if type(value.get("schema_version")) is not int or value["schema_version"] != 1:
             raise DiscoveryError("catalog snapshot schema_version must be 1")
         rows = value.get("candidates")
         if not isinstance(rows, list):
             raise DiscoveryError("catalog snapshot candidates must be a list")
         return cls(
-            captured_at=_required_candidate_string(value.get("captured_at"), "captured_at"),
+            captured_at=_required_candidate_string(
+                value.get("captured_at"), "captured_at"
+            ),
             candidates=tuple(CatalogCandidate.from_dict(row) for row in rows),
             schema_version=1,
             source=_required_candidate_string(value.get("source"), "source"),
@@ -205,6 +256,18 @@ def _required_candidate_string(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise DiscoveryError(f"catalog candidate {field} must be a non-empty string")
     return value.strip()
+
+
+def _native_positive_int(value: Any, field: str, *, minimum: int = 1) -> int:
+    if type(value) is int:
+        parsed = value
+    elif isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value):
+        parsed = int(value)
+    else:
+        raise DiscoveryError(f"{field} must be a canonical positive integer")
+    if parsed < minimum:
+        raise DiscoveryError(f"{field} must be at least {minimum}")
+    return parsed
 
 
 def _find_league_teams(value: Any) -> Optional[Mapping[str, Any]]:
@@ -240,9 +303,7 @@ def _dropdown_mapping(payload: str | Mapping[str, Any]) -> Mapping[str, Any]:
     if position < 0:
         raise DiscoveryError("ESPN HTML contains no __espnfitt__ payload")
     try:
-        document, _ = json.JSONDecoder().raw_decode(
-            payload[position + len(marker):]
-        )
+        document, _ = json.JSONDecoder().raw_decode(payload[position + len(marker) :])
     except json.JSONDecodeError as exc:
         raise DiscoveryError("ESPN __espnfitt__ payload is not valid JSON") from exc
     result = _find_league_teams(document)
@@ -281,8 +342,12 @@ def parse_soccer_dropdown(
                 raise DiscoveryError("dropdown league must be an object")
             raw_id = row.get("id")
             try:
-                espn_id = int(raw_id) if raw_id is not None else None
-            except (TypeError, ValueError) as exc:
+                espn_id = (
+                    _native_positive_int(raw_id, "dropdown league numeric id")
+                    if raw_id is not None
+                    else None
+                )
+            except DiscoveryError as exc:
                 raise DiscoveryError("dropdown league has invalid numeric id") from exc
             slug = str(row.get("slug") or "").strip()
             name = str(row.get("name") or "").strip()
@@ -326,9 +391,13 @@ def parse_soccer_dropdown(
                 if not isinstance(row, Mapping):
                     raise DiscoveryError("dropdown competition must be an object")
                 try:
-                    espn_id = int(row["id"])
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise DiscoveryError("dropdown competition has invalid numeric id") from exc
+                    espn_id = _native_positive_int(
+                        row["id"], "dropdown competition numeric id"
+                    )
+                except (KeyError, DiscoveryError) as exc:
+                    raise DiscoveryError(
+                        "dropdown competition has invalid numeric id"
+                    ) from exc
                 name = str(row.get("n") or "").strip()
                 if not name:
                     raise DiscoveryError(f"dropdown competition {espn_id} has no name")
@@ -384,11 +453,9 @@ def parse_competition_detail(payload: Mapping[str, Any]) -> CompetitionDetail:
         espn_id = None
     else:
         try:
-            espn_id = int(raw_id)
-        except (TypeError, ValueError) as exc:
+            espn_id = _native_positive_int(raw_id, "competition detail numeric id")
+        except DiscoveryError as exc:
             raise DiscoveryError("competition detail has invalid numeric id") from exc
-        if espn_id <= 0:
-            raise DiscoveryError("competition detail has invalid numeric id")
     slug = str(payload.get("slug") or "").strip()
     name = str(payload.get("name") or payload.get("displayName") or "").strip()
     if not slug or not name:
@@ -398,7 +465,9 @@ def parse_competition_detail(payload: Mapping[str, Any]) -> CompetitionDetail:
     if evidence_value is None:
         evidence = ()
     elif isinstance(evidence_value, list):
-        evidence = tuple(str(item).strip() for item in evidence_value if str(item).strip())
+        evidence = tuple(
+            str(item).strip() for item in evidence_value if str(item).strip()
+        )
     else:
         evidence = (str(evidence_value).strip(),) if str(evidence_value).strip() else ()
     if gender is not Gender.UNKNOWN and not evidence:
@@ -408,10 +477,22 @@ def parse_competition_detail(payload: Mapping[str, Any]) -> CompetitionDetail:
     if not isinstance(season, Mapping):
         raise DiscoveryError("competition detail season must be an object")
     year_value = season.get("year")
-    source_year = int(year_value) if year_value is not None else None
-    capabilities_value = payload.get("capabilities") or {}
-    if not isinstance(capabilities_value, Mapping):
-        raise DiscoveryError("competition detail capabilities must be an object")
+    source_year = (
+        _native_positive_int(year_value, "competition detail season.year", minimum=1800)
+        if year_value is not None
+        else None
+    )
+    if "capabilities" in payload:
+        capabilities_value = payload["capabilities"]
+        if not isinstance(capabilities_value, Mapping):
+            raise DiscoveryError("competition detail capabilities must be an object")
+        if set(capabilities_value) != {"schedule", "lineup", "matchsheet"}:
+            raise DiscoveryError(
+                "competition detail capabilities must define exactly "
+                "schedule, lineup and matchsheet"
+            )
+    else:
+        capabilities_value = {}
     try:
         capabilities = EntityCapabilities(
             capabilities_value.get("schedule", CapabilityState.UNKNOWN.value),
@@ -453,8 +534,7 @@ def discover_catalog(
             candidates.append(row)
             continue
         if (
-            row.espn_id is not None
-            and detail.espn_id != row.espn_id
+            row.espn_id is not None and detail.espn_id != row.espn_id
         ) or detail.slug != row.slug:
             raise DiscoveryError(
                 f"detail identity mismatch for dropdown competition {row.espn_id}:{row.slug}"
@@ -502,10 +582,10 @@ def _representatives(
             "end_date",
             "capabilities",
         )
-        if any(getattr(previous, field) != getattr(candidate, field) for field in compared):
-            raise DiscoveryError(
-                f"conflicting duplicate discovery rows for {identity}"
-            )
+        if any(
+            getattr(previous, field) != getattr(candidate, field) for field in compared
+        ):
+            raise DiscoveryError(f"conflicting duplicate discovery rows for {identity}")
     return result
 
 
@@ -515,10 +595,18 @@ def diff_catalogs(previous: CatalogSnapshot, current: CatalogSnapshot) -> Catalo
     changes: list[DiscoveryChange] = []
     for identity in sorted(before.keys() - after.keys(), key=str):
         candidate = before[identity]
-        changes.append(DiscoveryChange(DiscoveryChangeKind.REMOVED, candidate.espn_id, candidate.slug, None))
+        changes.append(
+            DiscoveryChange(
+                DiscoveryChangeKind.REMOVED, candidate.espn_id, candidate.slug, None
+            )
+        )
     for identity in sorted(after.keys() - before.keys(), key=str):
         candidate = after[identity]
-        changes.append(DiscoveryChange(DiscoveryChangeKind.ADDED, candidate.espn_id, None, candidate.slug))
+        changes.append(
+            DiscoveryChange(
+                DiscoveryChangeKind.ADDED, candidate.espn_id, None, candidate.slug
+            )
+        )
     simple_fields = (
         (DiscoveryChangeKind.SLUG, "slug"),
         (DiscoveryChangeKind.GENDER, "gender"),
@@ -543,8 +631,7 @@ def diff_catalogs(previous: CatalogSnapshot, current: CatalogSnapshot) -> Catalo
             )
         }
         new_edition = {
-            field_name: getattr(new_candidate, field_name)
-            for field_name in old_edition
+            field_name: getattr(new_candidate, field_name) for field_name in old_edition
         }
         if old_edition != new_edition:
             changes.append(
@@ -601,7 +688,10 @@ def quarantine_new_editions(snapshot: CatalogSnapshot, registry: Any) -> set[str
         competition = by_id.get(candidate.espn_id)
         if competition is None or candidate.source_season_year is None:
             continue
-        if candidate.source_season_year != competition.current_edition.source_season_year:
+        if (
+            candidate.source_season_year
+            != competition.current_edition.source_season_year
+        ):
             quarantined.add(f"{candidate.espn_id}:{candidate.source_season_year}")
     return quarantined
 

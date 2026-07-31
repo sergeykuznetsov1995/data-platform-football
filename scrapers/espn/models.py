@@ -12,6 +12,8 @@ from datetime import date, datetime, timezone
 from enum import Enum
 import hashlib
 import json
+import re
+from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 
@@ -25,7 +27,30 @@ class Gender(str, Enum):
 class AgeClass(str, Enum):
     SENIOR = "SENIOR"
     YOUTH = "YOUTH"
+    U17 = "U17"
+    U19 = "U19"
+    U20 = "U20"
+    U21 = "U21"
+    U23 = "U23"
+    COLLEGE = "COLLEGE"
     UNKNOWN = "UNKNOWN"
+
+
+ADMITTED_AGE_CLASSES = frozenset(
+    {
+        AgeClass.SENIOR,
+        AgeClass.U17,
+        AgeClass.U19,
+        AgeClass.U20,
+        AgeClass.U21,
+        AgeClass.U23,
+        AgeClass.COLLEGE,
+    }
+)
+
+MODEL_SCHEMA_VERSION = 1
+_SIGNATURE_RE = re.compile(r"[0-9a-f]{64}")
+_SCOPE_ID_RE = re.compile(r"([1-9][0-9]*):([1-9][0-9]*)")
 
 
 class CapabilityState(str, Enum):
@@ -85,6 +110,61 @@ def _canonical_value(value: Any) -> Any:
     raise TypeError(f"unsupported canonical JSON value {type(value).__name__}")
 
 
+def _positive_int(value: Any, field_name: str, *, minimum: int = 1) -> int:
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{field_name} must be an integer of at least {minimum}")
+    return value
+
+
+def _required_string(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value
+
+
+def _string_tuple(value: Any, field_name: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise ValueError(f"{field_name} must contain non-empty strings")
+    return tuple(value)
+
+
+def _signature(value: Any, field_name: str) -> str:
+    if not isinstance(value, str) or _SIGNATURE_RE.fullmatch(value) is None:
+        raise ValueError(f"{field_name} must be a lowercase SHA-256 signature")
+    return value
+
+
+def _scope_identity(value: Any) -> tuple[int, int]:
+    if not isinstance(value, str):
+        raise ValueError("scope_id must be '<espn_id>:<source_season_year>'")
+    match = _SCOPE_ID_RE.fullmatch(value)
+    if match is None:
+        raise ValueError("scope_id must be '<espn_id>:<source_season_year>'")
+    espn_id, source_year = (int(part) for part in match.groups())
+    _positive_int(espn_id, "scope_id espn_id")
+    _positive_int(source_year, "scope_id source_season_year", minimum=1800)
+    return espn_id, source_year
+
+
+def _freeze_json(value: Any, field_name: str) -> Any:
+    """Copy JSON-like nested values into immutable containers."""
+
+    if isinstance(value, Mapping):
+        frozen: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"{field_name} keys must be strings")
+            frozen[key] = _freeze_json(item, f"{field_name}.{key}")
+        return MappingProxyType(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item, field_name) for item in value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"{field_name} must contain only JSON-compatible values")
+
+
 class CanonicalModel:
     """Mixin providing byte-stable JSON and SHA-256 signatures."""
 
@@ -130,10 +210,14 @@ class Edition(CanonicalModel):
     capabilities: EntityCapabilities
 
     def __post_init__(self) -> None:
-        if isinstance(self.source_season_year, bool) or self.source_season_year < 1800:
-            raise ValueError("source_season_year must be an ESPN season year")
-        if not self.display_name.strip():
-            raise ValueError("edition display_name must not be empty")
+        _positive_int(self.source_season_year, "source_season_year", minimum=1800)
+        _required_string(self.display_name, "edition display_name")
+        if type(self.start_date) is not date or type(self.end_date) is not date:
+            raise TypeError("edition dates must be date values")
+        if type(self.current) is not bool:
+            raise TypeError("edition current must be boolean")
+        if not isinstance(self.capabilities, EntityCapabilities):
+            raise TypeError("edition capabilities must be EntityCapabilities")
         if self.start_date > self.end_date:
             raise ValueError("edition date window starts after it ends")
 
@@ -149,10 +233,20 @@ class LegacyAliases(CanonicalModel):
     season_aliases: Mapping[int, tuple[str, ...]] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
-        if not self.league.strip():
-            raise ValueError("legacy league must not be empty")
-        if self.season_aliases is None:
-            object.__setattr__(self, "season_aliases", {})
+        _required_string(self.league, "legacy league")
+        object.__setattr__(
+            self,
+            "league_aliases",
+            _string_tuple(self.league_aliases, "legacy league_aliases"),
+        )
+        raw_aliases = self.season_aliases if self.season_aliases is not None else {}
+        if not isinstance(raw_aliases, Mapping):
+            raise TypeError("legacy season_aliases must be a mapping")
+        normalized: dict[int, tuple[str, ...]] = {}
+        for year, aliases in raw_aliases.items():
+            _positive_int(year, "legacy season_aliases year", minimum=1800)
+            normalized[year] = _string_tuple(aliases, f"legacy season_aliases[{year}]")
+        object.__setattr__(self, "season_aliases", MappingProxyType(normalized))
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,20 +263,36 @@ class Competition(CanonicalModel):
     legacy: Optional[LegacyAliases] = None
 
     def __post_init__(self) -> None:
-        if isinstance(self.espn_id, bool) or self.espn_id <= 0:
-            raise ValueError("espn_id must be a positive integer")
-        if not self.slug.strip() or not self.name.strip():
-            raise ValueError("competition slug and name must not be empty")
+        _positive_int(self.espn_id, "espn_id")
+        _required_string(self.slug, "competition slug")
+        _required_string(self.name, "competition name")
         if not isinstance(self.gender, Gender):
             object.__setattr__(self, "gender", Gender(self.gender))
         if not isinstance(self.age_class, AgeClass):
             object.__setattr__(self, "age_class", AgeClass(self.age_class))
+        if type(self.enabled) is not bool:
+            raise TypeError("competition enabled must be boolean")
+        if not isinstance(self.editions, (list, tuple)) or not all(
+            isinstance(edition, Edition) for edition in self.editions
+        ):
+            raise TypeError("competition editions must contain Edition values")
+        object.__setattr__(self, "editions", tuple(self.editions))
+        object.__setattr__(
+            self,
+            "gender_evidence",
+            _string_tuple(self.gender_evidence, "competition gender_evidence"),
+        )
+        object.__setattr__(
+            self,
+            "age_class_evidence",
+            _string_tuple(self.age_class_evidence, "competition age_class_evidence"),
+        )
+        if self.legacy is not None and not isinstance(self.legacy, LegacyAliases):
+            raise TypeError("competition legacy must be LegacyAliases or None")
 
     def scope_id(self, edition: Edition | int) -> str:
         year = (
-            edition.source_season_year
-            if isinstance(edition, Edition)
-            else int(edition)
+            edition.source_season_year if isinstance(edition, Edition) else int(edition)
         )
         return f"{self.espn_id}:{year}"
 
@@ -205,11 +315,18 @@ class ScopePlan(CanonicalModel):
     capabilities: EntityCapabilities
 
     def __post_init__(self) -> None:
+        _positive_int(self.espn_id, "espn_id")
+        _positive_int(self.source_season_year, "source_season_year", minimum=1800)
+        _required_string(self.slug, "scope slug")
         expected = f"{self.espn_id}:{self.source_season_year}"
         if self.scope_id != expected:
             raise ValueError(f"scope_id must be {expected!r}")
+        if type(self.start_date) is not date or type(self.end_date) is not date:
+            raise TypeError("scope plan dates must be date values")
         if self.start_date > self.end_date:
             raise ValueError("scope plan has an invalid date window")
+        if not isinstance(self.capabilities, EntityCapabilities):
+            raise TypeError("scope plan capabilities must be EntityCapabilities")
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +337,28 @@ class IngestPlan(CanonicalModel):
     registry_signature: str
     scopes: tuple[ScopePlan, ...]
     metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != MODEL_SCHEMA_VERSION
+        ):
+            raise ValueError(f"schema_version must be {MODEL_SCHEMA_VERSION}")
+        _required_string(self.run_id, "run_id")
+        if type(self.as_of) is not date:
+            raise TypeError("as_of must be a date")
+        _signature(self.registry_signature, "registry_signature")
+        if not isinstance(self.scopes, (list, tuple)) or not all(
+            isinstance(scope, ScopePlan) for scope in self.scopes
+        ):
+            raise TypeError("scopes must contain ScopePlan values")
+        scopes = tuple(self.scopes)
+        if len({scope.scope_id for scope in scopes}) != len(scopes):
+            raise ValueError("scopes must have unique scope_id values")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("metadata must be a mapping")
+        object.__setattr__(self, "scopes", scopes)
+        object.__setattr__(self, "metadata", _freeze_json(self.metadata, "metadata"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,8 +371,10 @@ class RequestDisposition(CanonicalModel):
     def __post_init__(self) -> None:
         if not isinstance(self.state, DispositionState):
             object.__setattr__(self, "state", DispositionState(self.state))
-        if not self.endpoint.strip() or not self.detail.strip():
-            raise ValueError("disposition endpoint and detail must not be empty")
+        _required_string(self.endpoint, "disposition endpoint")
+        _required_string(self.detail, "disposition detail")
+        if self.event_id is not None:
+            _positive_int(self.event_id, "disposition event_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,14 +390,38 @@ class ScopeManifest(CanonicalModel):
     row_counts: Mapping[str, int]
 
     def __post_init__(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != MODEL_SCHEMA_VERSION
+        ):
+            raise ValueError(f"schema_version must be {MODEL_SCHEMA_VERSION}")
+        _required_string(self.run_id, "run_id")
+        _scope_identity(self.scope_id)
+        _signature(self.registry_signature, "registry_signature")
+        _signature(self.plan_signature, "plan_signature")
         if not isinstance(self.state, ManifestState):
             object.__setattr__(self, "state", ManifestState(self.state))
         _utc_string(self.generated_at)
-        if any(value < 0 for value in self.row_counts.values()):
-            raise ValueError("manifest row counts must be non-negative")
+        if not isinstance(self.dispositions, (list, tuple)) or not all(
+            isinstance(item, RequestDisposition) for item in self.dispositions
+        ):
+            raise TypeError("dispositions must contain RequestDisposition values")
+        if not isinstance(self.row_counts, Mapping):
+            raise TypeError("manifest row_counts must be a mapping")
+        counts: dict[str, int] = {}
+        for entity, count in self.row_counts.items():
+            _required_string(entity, "manifest row_counts key")
+            if type(count) is not int:
+                raise TypeError("manifest row count must be an integer")
+            if count < 0:
+                raise ValueError("manifest row counts must be non-negative")
+            counts[entity] = count
+        object.__setattr__(self, "dispositions", tuple(self.dispositions))
+        object.__setattr__(self, "row_counts", MappingProxyType(counts))
 
 
 __all__ = [
+    "ADMITTED_AGE_CLASSES",
     "AgeClass",
     "CanonicalModel",
     "CapabilityState",
@@ -268,6 +433,7 @@ __all__ = [
     "IngestPlan",
     "LegacyAliases",
     "ManifestState",
+    "MODEL_SCHEMA_VERSION",
     "RequestDisposition",
     "ScopeManifest",
     "ScopePlan",

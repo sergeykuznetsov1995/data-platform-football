@@ -8,6 +8,7 @@ import pytest
 
 from scrapers.espn.discovery import CatalogCandidate
 from scrapers.espn.models import (
+    ADMITTED_AGE_CLASSES,
     AgeClass,
     CapabilityState,
     EntityCapabilities,
@@ -78,7 +79,10 @@ def test_seed_registry_preserves_all_nine_legacy_mappings() -> None:
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        (lambda d: d["competitions"].append(deepcopy(d["competitions"][0])), "duplicate espn_id"),
+        (
+            lambda d: d["competitions"].append(deepcopy(d["competitions"][0])),
+            "duplicate espn_id",
+        ),
         (
             lambda d: d["competitions"].append(
                 {**deepcopy(d["competitions"][0]), "espn_id": 701}
@@ -86,7 +90,10 @@ def test_seed_registry_preserves_all_nine_legacy_mappings() -> None:
             "duplicate slug",
         ),
         (lambda d: d["competitions"][0].update(gender="UNKNOWN"), "explicit MALE"),
-        (lambda d: d["competitions"][0].update(age_class="UNKNOWN"), "explicit age_class"),
+        (
+            lambda d: d["competitions"][0].update(age_class="UNKNOWN"),
+            "explicit age_class",
+        ),
         (
             lambda d: d["competitions"][0]["editions"][0]["capabilities"].update(
                 lineup="sometimes"
@@ -236,6 +243,85 @@ def test_manual_promotion_returns_new_valid_document_without_mutation() -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "age_class", sorted(ADMITTED_AGE_CLASSES, key=lambda item: item.value)
+)
+def test_manual_promotion_admits_every_explicit_age_class(age_class: AgeClass) -> None:
+    candidate = CatalogCandidate(
+        espn_id=775,
+        slug="uefa.champions",
+        name="UEFA Champions League",
+        group="Europe",
+        source_order=2,
+        gender=Gender.MALE,
+        source_season_year=2026,
+        edition_display_name="2026 UEFA Champions League",
+        start_date="2026-01-01",
+        end_date="2026-12-31",
+        capabilities=EntityCapabilities(
+            CapabilityState.PROVEN,
+            CapabilityState.PARTIAL,
+            CapabilityState.ABSENT,
+        ),
+        gender_evidence=("detail.gender=MALE",),
+    )
+
+    promoted = promote_candidate(
+        {**_document(), "competitions": []},
+        candidate,
+        age_class=age_class,
+        age_class_evidence=(f"manual: {age_class.value}",),
+        legacy_league="UEFA-Champions League",
+    )
+
+    assert validate_registry_document(promoted).by_id[775].age_class is age_class
+
+
+@pytest.mark.unit
+def test_manual_promotion_reactivates_existing_disabled_candidate() -> None:
+    document = _document()
+    row = document["competitions"][0]
+    row.update(enabled=False, gender="UNKNOWN", age_class="UNKNOWN")
+    row["gender_evidence"] = []
+    row["age_class_evidence"] = []
+    candidate = CatalogCandidate(
+        espn_id=700,
+        slug="eng.1",
+        name="English Premier League",
+        group="Europe",
+        source_order=1,
+        gender=Gender.MALE,
+        source_season_year=2026,
+        edition_display_name="2026-27 English Premier League",
+        start_date="2026-06-01",
+        end_date="2027-06-01",
+        capabilities=EntityCapabilities(
+            CapabilityState.PROVEN,
+            CapabilityState.PARTIAL,
+            CapabilityState.ABSENT,
+        ),
+        gender_evidence=("reviewed detail.gender=MALE",),
+    )
+
+    promoted = promote_candidate(
+        document,
+        candidate,
+        age_class=AgeClass.U23,
+        age_class_evidence=("manual: U23",),
+        legacy_league="ENG-Premier League",
+    )
+    competition = validate_registry_document(promoted).by_id[700]
+
+    assert document["competitions"][0]["enabled"] is False
+    assert competition.enabled is True
+    assert competition.gender is Gender.MALE
+    assert competition.age_class is AgeClass.U23
+    assert competition.gender_evidence == ("reviewed detail.gender=MALE",)
+    assert competition.age_class_evidence == ("manual: U23",)
+    assert len(competition.editions) == 1
+
+
+@pytest.mark.unit
 def test_manual_rollover_promotion_replaces_current_edition_without_mutation() -> None:
     document = _document()
     candidate = CatalogCandidate(
@@ -267,7 +353,10 @@ def test_manual_rollover_promotion_replaces_current_edition_without_mutation() -
     competition = validate_registry_document(promoted).by_id[700]
 
     assert document["competitions"][0]["editions"][0]["current"] is True
-    assert [edition.source_season_year for edition in competition.editions] == [2026, 2027]
+    assert [edition.source_season_year for edition in competition.editions] == [
+        2026,
+        2027,
+    ]
     assert competition.current_edition.source_season_year == 2027
     assert competition.legacy.season_aliases[2027] == ("2728", "2027")
 

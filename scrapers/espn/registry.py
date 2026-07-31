@@ -12,6 +12,7 @@ import yaml
 
 from .discovery import CatalogCandidate
 from .models import (
+    ADMITTED_AGE_CLASSES,
     AgeClass,
     CanonicalModel,
     CapabilityState,
@@ -34,7 +35,9 @@ class RegistryError(ValueError):
     """The source registry is missing, malformed or unsafe to activate."""
 
 
-def _reject_unknown_keys(value: Mapping[str, Any], allowed: set[str], field: str) -> None:
+def _reject_unknown_keys(
+    value: Mapping[str, Any], allowed: set[str], field: str
+) -> None:
     extras = set(value) - allowed
     if extras:
         raise RegistryError(f"{field} has unknown keys {sorted(extras)}")
@@ -80,7 +83,9 @@ def _enum(enum_type, value: Any, field: str):
     except (TypeError, ValueError) as exc:
         choices = ", ".join(item.value for item in enum_type)
         label = "capability" if enum_type is CapabilityState else field
-        raise RegistryError(f"unknown {label} {value!r}; expected one of {choices}") from exc
+        raise RegistryError(
+            f"unknown {label} {value!r}; expected one of {choices}"
+        ) from exc
 
 
 def _capabilities(value: Any, field: str) -> EntityCapabilities:
@@ -104,8 +109,12 @@ def _edition(value: Any, field: str) -> Edition:
     _reject_unknown_keys(
         value,
         {
-            "source_season_year", "display_name", "start_date", "end_date",
-            "current", "capabilities",
+            "source_season_year",
+            "display_name",
+            "start_date",
+            "end_date",
+            "current",
+            "capabilities",
         },
         field,
     )
@@ -141,9 +150,7 @@ def _legacy(value: Any, field: str) -> Optional[LegacyAliases]:
         return None
     if not isinstance(value, Mapping):
         raise RegistryError(f"{field} must be an object")
-    _reject_unknown_keys(
-        value, {"league", "league_aliases", "season_aliases"}, field
-    )
+    _reject_unknown_keys(value, {"league", "league_aliases", "season_aliases"}, field)
     league = _required_string(value.get("league"), f"{field}.league")
     league_aliases = _string_tuple(
         value.get("league_aliases", []), f"{field}.league_aliases"
@@ -172,8 +179,16 @@ def _competition(value: Any, index: int) -> Competition:
     _reject_unknown_keys(
         value,
         {
-            "espn_id", "slug", "name", "enabled", "gender", "age_class",
-            "gender_evidence", "age_class_evidence", "legacy", "editions",
+            "espn_id",
+            "slug",
+            "name",
+            "enabled",
+            "gender",
+            "age_class",
+            "gender_evidence",
+            "age_class_evidence",
+            "legacy",
+            "editions",
         },
         field,
     )
@@ -203,7 +218,7 @@ def _competition(value: Any, index: int) -> Competition:
     if enabled:
         if gender is not Gender.MALE:
             raise RegistryError(f"{field} promotion requires explicit MALE gender")
-        if age_class is AgeClass.UNKNOWN:
+        if age_class not in ADMITTED_AGE_CLASSES:
             raise RegistryError(f"{field} promotion requires explicit age_class")
         if not gender_evidence:
             raise RegistryError(f"{field} promotion requires gender evidence")
@@ -335,17 +350,21 @@ def promote_candidate(
     if candidate.espn_id is None:
         raise RegistryError("promotion requires an ESPN numeric id")
     if candidate.gender is not Gender.MALE:
-        raise RegistryError("promotion requires explicit MALE gender from detail metadata")
+        raise RegistryError(
+            "promotion requires explicit MALE gender from detail metadata"
+        )
     if not candidate.gender_evidence:
         raise RegistryError("promotion requires explicit gender evidence")
-    if age_class is AgeClass.UNKNOWN:
+    if age_class not in ADMITTED_AGE_CLASSES:
         raise RegistryError("promotion requires explicit age_class")
     if not age_class_evidence:
         raise RegistryError("promotion requires age class evidence")
     if candidate.source_season_year is None or not all(
         (candidate.edition_display_name, candidate.start_date, candidate.end_date)
     ):
-        raise RegistryError("promotion requires current edition metadata and date window")
+        raise RegistryError(
+            "promotion requires current edition metadata and date window"
+        )
     if candidate.capabilities.schedule is not CapabilityState.PROVEN:
         raise RegistryError("promotion requires proven schedule capability")
 
@@ -362,7 +381,8 @@ def promote_candidate(
         "capabilities": candidate.capabilities.to_dict(),
     }
     existing = [
-        row for row in competitions
+        row
+        for row in competitions
         if row.get("espn_id") == candidate.espn_id or row.get("slug") == candidate.slug
     ]
     if existing:
@@ -374,14 +394,36 @@ def promote_candidate(
         if row.get("name") != candidate.name:
             raise RegistryError("promotion name conflicts with existing competition")
         legacy = row.get("legacy") or {}
-        if legacy.get("league") != legacy_league:
-            raise RegistryError("promotion legacy league conflicts with existing mapping")
+        if legacy and legacy.get("league") != legacy_league:
+            raise RegistryError(
+                "promotion legacy league conflicts with existing mapping"
+            )
+        if not legacy:
+            legacy = {
+                "league": legacy_league,
+                "league_aliases": [legacy_league],
+                "season_aliases": {},
+            }
+            row["legacy"] = legacy
         editions = row.get("editions")
         if not isinstance(editions, list):
             raise RegistryError("existing competition editions must be a list")
-        for edition in editions:
-            edition["current"] = False
-        editions.append(new_edition)
+        replaced = False
+        for index, edition in enumerate(editions):
+            if edition.get("source_season_year") == candidate.source_season_year:
+                editions[index] = new_edition
+                replaced = True
+            else:
+                edition["current"] = False
+        if not replaced:
+            editions.append(new_edition)
+        row.update(
+            enabled=True,
+            gender=candidate.gender.value,
+            age_class=age_class.value,
+            gender_evidence=list(candidate.gender_evidence),
+            age_class_evidence=list(age_class_evidence),
+        )
         season_aliases = legacy.setdefault("season_aliases", {})
         season_aliases[str(candidate.source_season_year)] = _legacy_season_aliases(
             candidate
@@ -401,7 +443,9 @@ def promote_candidate(
                     "league": legacy_league,
                     "league_aliases": [legacy_league],
                     "season_aliases": {
-                        str(candidate.source_season_year): _legacy_season_aliases(candidate)
+                        str(candidate.source_season_year): _legacy_season_aliases(
+                            candidate
+                        )
                     },
                 },
                 "editions": [new_edition],
