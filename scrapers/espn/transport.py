@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import threading
 import time
 import zlib
@@ -24,6 +26,7 @@ from .raw_store import (
 )
 from .transport_contracts import (
     AmbientProxyError,
+    ByteReservation,
     BudgetExceeded,
     CanonicalTarget,
     CircuitOpen,
@@ -67,6 +70,17 @@ class _ResponseEncodingError(Exception):
     def __init__(self, direct_bytes: int, cause: Exception) -> None:
         self.direct_bytes = direct_bytes
         self.__cause__ = cause
+
+
+class _ResponseReadTimeout(Exception):
+    def __init__(self, direct_bytes: int) -> None:
+        self.direct_bytes = direct_bytes
+
+
+class _ResponseReadFailure(Exception):
+    def __init__(self, direct_bytes: int, error_type: str) -> None:
+        self.direct_bytes = direct_bytes
+        self.error_type = error_type
 
 
 class _TokenBucket:
@@ -401,8 +415,9 @@ class EspnHttpClient:
         total_direct_bytes = 0
         last_error = ""
         while attempts < self.max_attempts:
+            reservation = None
             try:
-                self.budget.admit_request()
+                reservation = self.budget.admit_request(self.response_cap_bytes)
             except BudgetExceeded as exc:
                 entry = self._entry(
                     target,
@@ -427,9 +442,39 @@ class EspnHttpClient:
                     allow_redirects=False,
                 )
                 status = int(response.status_code)
-                body, direct_bytes = self._read_response(response)
-                total_direct_bytes += direct_bytes
-                self.budget.consume_bytes(direct_bytes)
+                if status in RETRYABLE_HTTP_STATUSES or 500 <= status <= 599:
+                    body = b""
+                elif not 200 <= status <= 299:
+                    body = b""
+                else:
+                    body, direct_bytes = self._read_response(response, reservation)
+                    total_direct_bytes += direct_bytes
+            except _ResponseReadTimeout as exc:
+                total_direct_bytes += exc.direct_bytes
+                self._record_retryable_failure()
+                status = None
+                last_error = "timeout"
+                if self.circuit_is_open or attempts >= self.max_attempts:
+                    break
+                self.sleep_fn(self._retry_delay(attempts, None))
+                continue
+            except _ResponseReadFailure as exc:
+                total_direct_bytes += exc.direct_bytes
+                self._record_nonretryable_or_success()
+                entry = self._entry(
+                    target,
+                    endpoint_type,
+                    started=started,
+                    attempts=attempts,
+                    status=None,
+                    direct_bytes=total_direct_bytes,
+                    disposition="terminal_failure",
+                    error=f"non-timeout transport error: {exc.error_type}",
+                )
+                raise DirectTransportError(
+                    "Non-retryable ESPN transport error: " + exc.error_type,
+                    ledger_entry=entry,
+                ) from None
             except (requests.Timeout, Urllib3ReadTimeoutError, TimeoutError):
                 self._record_retryable_failure()
                 status = None
@@ -441,10 +486,6 @@ class EspnHttpClient:
             except _ReadLimitExceeded as exc:
                 self._record_nonretryable_or_success()
                 total_direct_bytes += exc.direct_bytes
-                try:
-                    self.budget.consume_bytes(exc.direct_bytes)
-                except BudgetExceeded:
-                    pass
                 disposition = (
                     "budget_exhausted" if exc.task_budget else "response_too_large"
                 )
@@ -463,10 +504,6 @@ class EspnHttpClient:
             except _ResponseEncodingError as exc:
                 self._record_nonretryable_or_success()
                 total_direct_bytes += exc.direct_bytes
-                try:
-                    self.budget.consume_bytes(exc.direct_bytes)
-                except BudgetExceeded:
-                    pass
                 entry = self._entry(
                     target,
                     endpoint_type,
@@ -523,7 +560,7 @@ class EspnHttpClient:
                 raise DirectTransportError(
                     "Non-retryable ESPN transport error: " + type(exc).__name__,
                     ledger_entry=entry,
-                ) from exc
+                ) from None
             except Urllib3HTTPError as exc:
                 self._record_nonretryable_or_success()
                 entry = self._entry(
@@ -539,10 +576,12 @@ class EspnHttpClient:
                 raise DirectTransportError(
                     "Non-retryable ESPN transport error: " + type(exc).__name__,
                     ledger_entry=entry,
-                ) from exc
+                ) from None
             finally:
                 if response is not None:
                     response.close()
+                if reservation is not None:
+                    reservation.release()
 
             if status in RETRYABLE_HTTP_STATUSES or 500 <= status <= 599:
                 self._record_retryable_failure()
@@ -655,32 +694,48 @@ class EspnHttpClient:
             ledger_entry=entry,
         )
 
-    def _read_response(self, response) -> tuple[bytes, int]:
+    def _read_response(
+        self, response, reservation: ByteReservation
+    ) -> tuple[bytes, int]:
         headers = response.headers or {}
-        remaining = self.budget.bytes_remaining
-        raw_limit = min(self.response_cap_bytes, remaining)
+        raw_limit = reservation.limit
         content_length = headers.get("Content-Length")
+        declared = None
         if content_length is not None:
             try:
                 declared = int(content_length)
             except (TypeError, ValueError):
-                declared = -1
-            if declared > raw_limit:
-                raise _ReadLimitExceeded(0, task_budget=remaining < declared)
+                declared = None
+            if declared is not None and declared > raw_limit:
+                raise _ReadLimitExceeded(
+                    0, task_budget=raw_limit < self.response_cap_bytes
+                )
 
         raw = response.raw
         if hasattr(raw, "decode_content"):
             raw.decode_content = False
         chunks = bytearray()
         while True:
-            chunk = raw.read(min(64 * 1024, raw_limit - len(chunks) + 1))
+            if declared is not None and len(chunks) == declared:
+                break
+            if len(chunks) >= raw_limit:
+                raise _ReadLimitExceeded(
+                    len(chunks), task_budget=raw_limit < self.response_cap_bytes
+                )
+            try:
+                chunk = raw.read(min(64 * 1024, raw_limit - len(chunks)))
+            except (requests.Timeout, Urllib3ReadTimeoutError, TimeoutError) as exc:
+                raise _ResponseReadTimeout(len(chunks)) from exc
+            except (requests.RequestException, Urllib3HTTPError, OSError) as exc:
+                raise _ResponseReadFailure(len(chunks), type(exc).__name__) from None
             if not chunk:
                 break
-            chunks.extend(chunk)
-            if len(chunks) > raw_limit:
+            if len(chunk) > raw_limit - len(chunks):
                 raise _ReadLimitExceeded(
-                    len(chunks), task_budget=remaining <= self.response_cap_bytes
+                    len(chunks), task_budget=raw_limit < self.response_cap_bytes
                 )
+            reservation.charge(len(chunk))
+            chunks.extend(chunk)
         encoded = bytes(chunks)
         encoding = str(headers.get("Content-Encoding", "")).lower().strip()
         try:
@@ -706,6 +761,8 @@ class EspnHttpClient:
         body = decoder.decompress(encoded, self.response_cap_bytes + 1)
         if len(body) > self.response_cap_bytes or decoder.unconsumed_tail:
             raise _ReadLimitExceeded(len(encoded), task_budget=False)
+        if not decoder.eof or decoder.unused_data:
+            raise zlib.error("compressed payload is truncated or has trailing data")
         body += decoder.flush(self.response_cap_bytes + 1 - len(body))
         if len(body) > self.response_cap_bytes:
             raise _ReadLimitExceeded(len(encoded), task_budget=False)
@@ -714,9 +771,11 @@ class EspnHttpClient:
     def _retry_delay(self, attempts: int, retry_after: Optional[str]) -> float:
         if retry_after is not None:
             value = str(retry_after).strip()
-            try:
-                return max(0.0, float(value))
-            except ValueError:
+            if re.fullmatch(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", value):
+                delay = float(value)
+                if math.isfinite(delay):
+                    return min(60.0, delay)
+            else:
                 try:
                     retry_at = parsedate_to_datetime(value)
                     if retry_at.tzinfo is None:
@@ -724,7 +783,9 @@ class EspnHttpClient:
                     now = self.utcnow_fn()
                     if now.tzinfo is None:
                         now = now.replace(tzinfo=timezone.utc)
-                    return max(0.0, (retry_at - now).total_seconds())
+                    delay = (retry_at - now).total_seconds()
+                    if math.isfinite(delay) and delay >= 0:
+                        return min(60.0, delay)
                 except (TypeError, ValueError, OverflowError):
                     pass
         return float(2 ** (attempts - 1))

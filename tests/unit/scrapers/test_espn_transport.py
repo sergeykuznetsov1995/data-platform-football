@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 import pytest
 import requests
+from pyarrow import fs
 
 from scrapers.espn.raw_store import EspnRawStore, RawTargetCorrupt
 from scrapers.espn.transport import (
@@ -51,6 +52,18 @@ class FakeSession:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+class PartialTimeoutRaw:
+    def __init__(self, chunk: bytes):
+        self.chunk = chunk
+        self.calls = 0
+
+    def read(self, _size):
+        self.calls += 1
+        if self.calls == 1:
+            return self.chunk
+        raise requests.Timeout("secret=must-not-leak")
 
 
 def _clear_proxy_env(monkeypatch):
@@ -345,3 +358,172 @@ def test_raw_store_requires_configuration_and_content_addresses(monkeypatch, tmp
         ]
         == first.content_hash
     )
+
+
+@pytest.mark.unit
+def test_byte_budget_reserves_before_network_and_never_overruns(monkeypatch, tmp_path):
+    exhausted, exhausted_session, _, _ = _client(
+        monkeypatch,
+        tmp_path / "empty",
+        [FakeResponse(200, b"{}")],
+        budget=TaskBudget(max_bytes=0),
+    )
+    with pytest.raises(BudgetExceeded):
+        exhausted.fetch_json("https://site.api.espn.com/catalog", "catalog")
+    assert exhausted_session.calls == []
+
+    framed, _, _, _ = _client(
+        monkeypatch,
+        tmp_path / "framed",
+        [FakeResponse(200, b"12", {"Content-Length": "2"})],
+        budget=TaskBudget(max_bytes=1),
+    )
+    with pytest.raises(BudgetExceeded):
+        framed.fetch_json("https://site.api.espn.com/catalog", "catalog")
+    assert framed.budget.bytes_used <= 1
+
+    unframed, _, _, _ = _client(
+        monkeypatch,
+        tmp_path / "unframed",
+        [FakeResponse(200, b"12")],
+        budget=TaskBudget(max_bytes=1),
+    )
+    with pytest.raises(BudgetExceeded):
+        unframed.fetch_json("https://site.api.espn.com/catalog", "catalog")
+    assert unframed.budget.bytes_used <= 1
+
+
+@pytest.mark.unit
+def test_partial_read_timeout_charges_wire_bytes_and_retries(monkeypatch, tmp_path):
+    partial = FakeResponse(200)
+    partial.raw = PartialTimeoutRaw(b"123")
+    client, session, _, _ = _client(
+        monkeypatch,
+        tmp_path,
+        [partial, FakeResponse(200, b'{"ok":true}')],
+        budget=TaskBudget(max_bytes=32),
+    )
+    result = client.fetch_json("https://site.api.espn.com/catalog", "catalog")
+    assert result.attempts == 2
+    assert result.direct_bytes == 3 + len(b'{"ok":true}')
+    assert client.budget.bytes_used == result.direct_bytes
+    assert len(session.calls) == 2
+
+
+@pytest.mark.unit
+def test_retryable_status_is_classified_before_bad_body(monkeypatch, tmp_path):
+    client, _, sleeps, store = _client(
+        monkeypatch,
+        tmp_path,
+        [
+            FakeResponse(
+                503,
+                b"not-gzip",
+                {"Content-Encoding": "gzip", "Retry-After": "4"},
+            ),
+            FakeResponse(200, b'{"ok":true}'),
+        ],
+    )
+    result = client.fetch_json("https://site.api.espn.com/catalog", "catalog")
+    assert result.attempts == 2 and sleeps == [4.0]
+    assert store.load(result.target)[0] == b'{"ok":true}'
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("retry_after", "expected"),
+    [
+        ("120", 60.0),
+        ("nan", 1.0),
+        ("inf", 1.0),
+        ("-1", 1.0),
+        ("+2", 1.0),
+        ("01", 1.0),
+        ("Thu, 31 Jul 2026 00:02:00 GMT", 60.0),
+        ("Wed, 30 Jul 2026 00:00:00 GMT", 1.0),
+    ],
+)
+def test_retry_after_is_canonical_finite_and_capped(
+    monkeypatch, tmp_path, retry_after, expected
+):
+    client, _, sleeps, _ = _client(
+        monkeypatch,
+        tmp_path,
+        [
+            FakeResponse(429, b"", {"Retry-After": retry_after}),
+            FakeResponse(200, b"{}"),
+        ],
+    )
+    client.fetch_json("https://site.api.espn.com/catalog", "catalog")
+    assert sleeps == [expected]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        gzip.compress(b"{}", mtime=0)[:-2],
+        gzip.compress(b"{}", mtime=0) + b"trailing",
+        gzip.compress(b"{}", mtime=0) + gzip.compress(b"{}", mtime=0),
+    ],
+)
+def test_gzip_requires_one_complete_member(monkeypatch, tmp_path, encoded):
+    client, _, _, store = _client(
+        monkeypatch,
+        tmp_path,
+        [FakeResponse(200, encoded, {"Content-Encoding": "gzip"})],
+        max_attempts=1,
+    )
+    target = canonicalize_target("https://site.api.espn.com/catalog")
+    with pytest.raises(DirectTransportError):
+        client.fetch_json(target.canonical_url, "catalog")
+    assert not store.has_target(target)
+
+
+@pytest.mark.unit
+def test_secrets_never_reach_alias_ledger_exception_or_repr(monkeypatch, tmp_path):
+    secret = "TOP-SECRET-123"
+    url = f"https://site.api.espn.com/catalog?apikey={secret}&event=7"
+    client, _, _, store = _client(monkeypatch, tmp_path, [FakeResponse(200, b"{}")])
+    result = client.fetch_json(url, "catalog")
+    alias = store._read_bytes(store._alias_key(result.target.url_fingerprint))
+    combined = alias + repr(result).encode() + repr(client.ledger).encode()
+    assert secret.encode() not in combined
+
+    with pytest.raises(ValueError) as exc_info:
+        canonicalize_target(f"https://user:{secret}@site.api.espn.com/catalog")
+    assert secret not in str(exc_info.value) and secret not in repr(exc_info.value)
+
+
+@pytest.mark.unit
+def test_corrupt_alias_is_cache_miss_and_nonlocal_filesystem_is_supported(
+    monkeypatch, tmp_path
+):
+    url = "https://site.api.espn.com/catalog"
+    client, session, _, store = _client(
+        monkeypatch, tmp_path, [FakeResponse(200, b'{"new":true}')]
+    )
+    target = canonicalize_target(url)
+    store.store(target, EndpointType.CATALOG, b'{"old":true}')
+    store._write_bytes(store._alias_key(target.url_fingerprint), b"not-json")
+    assert client.fetch_json(url, "catalog").json_data == {"new": True}
+    assert len(session.calls) == 1
+
+    remote = EspnRawStore(
+        fs._MockFileSystem(), "bucket/espn", uri_prefix="s3://bucket/espn"
+    )
+    record = remote.store(target, EndpointType.CATALOG, b"{}")
+    assert remote.load(target)[0] == b"{}"
+    assert record.raw_uri.startswith("s3://bucket/espn/")
+
+
+@pytest.mark.unit
+def test_off_domain_https_and_mixed_case_proxy_are_rejected(monkeypatch, tmp_path):
+    _clear_proxy_env(monkeypatch)
+    with pytest.raises(ValueError):
+        canonicalize_target("https://example.com/catalog?token=secret")
+    monkeypatch.setenv("HtTp_PrOxY", "http://proxy.invalid")
+    with pytest.raises(AmbientProxyError):
+        EspnHttpClient(
+            EspnRawStore.from_uri(tmp_path.as_uri()), session=FakeSession([])
+        )

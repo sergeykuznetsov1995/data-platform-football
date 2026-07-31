@@ -37,6 +37,7 @@ class RawTargetCorrupt(RawStoreError):
 class CanonicalTargetLike(Protocol):
     canonical_url: str
     url_fingerprint: str
+    sanitized_url: str
 
 
 def _utc_now_iso() -> str:
@@ -50,13 +51,22 @@ def _endpoint_value(endpoint: object) -> str:
     return value.strip().lower()
 
 
+def _strict_gzip_decompress(payload: bytes) -> bytes:
+    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    body = decoder.decompress(payload)
+    body += decoder.flush()
+    if not decoder.eof or decoder.unused_data or decoder.unconsumed_tail:
+        raise zlib.error("gzip payload is truncated or has trailing data")
+    return body
+
+
 @dataclass(frozen=True, slots=True)
 class RawJsonRecord:
     manifest_version: str
     source: str
     endpoint: str
     url_fingerprint: str
-    canonical_url: str
+    sanitized_url: str
     content_hash: str
     hash_algorithm: str
     blob_key: str
@@ -67,6 +77,11 @@ class RawJsonRecord:
     decoded_bytes: int
     direct_bytes: int
     stored_bytes: int
+
+    @property
+    def canonical_url(self) -> str:
+        """Compatibility alias; durable URLs are value-redacted."""
+        return self.sanitized_url
 
 
 class EspnRawStore:
@@ -228,7 +243,7 @@ class EspnRawStore:
             source="espn",
             endpoint=endpoint_value,
             url_fingerprint=fingerprint,
-            canonical_url=target.canonical_url,
+            sanitized_url=target.sanitized_url,
             content_hash=content_hash,
             hash_algorithm="sha256",
             blob_key=blob_key,
@@ -250,7 +265,7 @@ class EspnRawStore:
                     current = self._read_bytes(blob_key)
                     valid = (
                         len(current) == len(compressed)
-                        and gzip.decompress(current) == body
+                        and _strict_gzip_decompress(current) == body
                     )
                 except (RawStoreError, OSError, EOFError, gzip.BadGzipFile, zlib.error):
                     valid = False
@@ -281,10 +296,8 @@ class EspnRawStore:
             record.manifest_version != RAW_MANIFEST_VERSION
             or record.source != "espn"
             or record.url_fingerprint != fingerprint
-            or not isinstance(record.canonical_url, str)
-            or hashlib.sha256(record.canonical_url.encode("utf-8")).hexdigest()
-            != fingerprint
-            or record.canonical_url != target.canonical_url
+            or not isinstance(record.sanitized_url, str)
+            or record.sanitized_url != target.sanitized_url
             or record.hash_algorithm != "sha256"
             or record.blob_key != expected_blob
             or record.raw_uri != self._uri(expected_blob)
@@ -298,7 +311,7 @@ class EspnRawStore:
             raise RawTargetCorrupt(f"Raw ESPN alias identity mismatch: {alias_key}")
         try:
             compressed = self._read_bytes(record.blob_key)
-            body = gzip.decompress(compressed)
+            body = _strict_gzip_decompress(compressed)
         except (RawStoreError, OSError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
             with self._write_lock:
                 self._verified_blobs.discard(record.blob_key)

@@ -48,8 +48,17 @@ class EndpointType(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class CanonicalTarget:
-    canonical_url: str
+    canonical_url: str = field(repr=False)
     url_fingerprint: str
+
+    @property
+    def sanitized_url(self) -> str:
+        parsed = urlsplit(self.canonical_url)
+        keys = sorted(
+            {key for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+        )
+        query = "&".join(keys)
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
 
     @property
     def target_key(self) -> str:
@@ -167,6 +176,7 @@ class TaskBudget:
     max_bytes: int = DEFAULT_MAX_TASK_BYTES
     requests_used: int = field(default=0, init=False)
     bytes_used: int = field(default=0, init=False)
+    bytes_reserved: int = field(default=0, init=False)
     _competition_ids: set[object] = field(default_factory=set, init=False, repr=False)
     _summary_event_ids: set[object] = field(default_factory=set, init=False, repr=False)
     _lock: threading.RLock = field(
@@ -196,7 +206,7 @@ class TaskBudget:
     @property
     def bytes_remaining(self) -> int:
         with self._lock:
-            return self.max_bytes - self.bytes_used
+            return self.max_bytes - self.bytes_used - self.bytes_reserved
 
     def admit(
         self,
@@ -227,26 +237,56 @@ class TaskBudget:
             self._competition_ids = competitions
             self._summary_event_ids = events
 
-    def admit_request(self) -> None:
+    def admit_request(
+        self, response_cap_bytes: int = DEFAULT_RESPONSE_CAP_BYTES
+    ) -> "ByteReservation":
+        _nonnegative_int(response_cap_bytes, "response_cap_bytes")
         with self._lock:
             if self.requests_used >= self.max_requests:
                 raise BudgetExceeded(
                     f"ESPN request budget exhausted ({self.max_requests})"
                 )
-            if self.bytes_used >= self.max_bytes:
+            remaining = self.max_bytes - self.bytes_used - self.bytes_reserved
+            if remaining <= 0:
                 raise BudgetExceeded(f"ESPN byte budget exhausted ({self.max_bytes})")
             self.requests_used += 1
+            reserved = min(response_cap_bytes, remaining)
+            self.bytes_reserved += reserved
+            return ByteReservation(self, reserved)
 
     def consume_bytes(self, count: int) -> None:
+        """Compatibility API for non-reserved accounting; never overcommits."""
         _nonnegative_int(count, "response bytes")
         with self._lock:
-            if self.bytes_used + count > self.max_bytes:
-                self.bytes_used += count
-                raise BudgetExceeded(
-                    f"ESPN byte budget exceeded ({self.max_bytes}); "
-                    f"observed {self.bytes_used}"
-                )
+            if self.bytes_used + self.bytes_reserved + count > self.max_bytes:
+                raise BudgetExceeded(f"ESPN byte budget exceeded ({self.max_bytes})")
             self.bytes_used += count
+
+
+class ByteReservation:
+    """One response's exclusive byte allowance; unused bytes are releasable."""
+
+    def __init__(self, budget: TaskBudget, limit: int) -> None:
+        self.budget = budget
+        self.limit = limit
+        self.remaining = limit
+        self._released = False
+
+    def charge(self, count: int) -> None:
+        _nonnegative_int(count, "response bytes")
+        with self.budget._lock:
+            if self._released or count > self.remaining:
+                raise BudgetExceeded("ESPN response exceeded its reserved byte budget")
+            self.remaining -= count
+            self.budget.bytes_reserved -= count
+            self.budget.bytes_used += count
+
+    def release(self) -> None:
+        with self.budget._lock:
+            if not self._released:
+                self.budget.bytes_reserved -= self.remaining
+                self.remaining = 0
+                self._released = True
 
 
 def _iter_params(params: Optional[Params]) -> list[tuple[str, str]]:
@@ -274,8 +314,8 @@ def canonicalize_target(url: str, params: Optional[Params] = None) -> CanonicalT
     parsed = urlsplit(candidate)
     try:
         port = parsed.port
-    except ValueError as exc:
-        raise ValueError(f"Invalid ESPN HTTPS URL: {url!r}") from exc
+    except ValueError:
+        raise ValueError("Invalid ESPN HTTPS URL") from None
     if (
         parsed.scheme.lower() != "https"
         or not parsed.hostname
@@ -287,7 +327,7 @@ def canonicalize_target(url: str, params: Optional[Params] = None) -> CanonicalT
         or parsed.password is not None
         or port not in {None, 443}
     ):
-        raise ValueError(f"ESPN transport requires a direct HTTPS URL: {url!r}")
+        raise ValueError("ESPN transport requires a direct allowlisted HTTPS URL")
     query = parse_qsl(parsed.query, keep_blank_values=True)
     query.extend(_iter_params(params))
     query.sort(key=lambda pair: (pair[0], pair[1]))
@@ -308,6 +348,7 @@ def canonicalize_target(url: str, params: Optional[Params] = None) -> CanonicalT
 
 __all__ = [
     "AmbientProxyError",
+    "ByteReservation",
     "BudgetExceeded",
     "CanonicalTarget",
     "CircuitOpen",
