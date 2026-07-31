@@ -1,0 +1,73 @@
+{
+  "header": {
+    "id": "401000001",
+    "competitions": [
+      {
+        "date": "2020-09-19T18:45Z",
+        "competitors": [
+          {"homeAway": "home", "team": {"id": "10", "displayName": "Home FC"}},
+          {"homeAway": "away", "team": {"id": "20", "displayName": "Away FC"}}
+        ]
+      }
+    ]
+  },
+  "boxscore": {
+    "teams": [
+      {
+        "team": {"id": "20", "displayName": "Away FC"},
+        "statistics": [
+          {"name": "shots", "displayName": "Shots", "value": 8},
+          {"name": "possessionPct", "displayValue": "45%"}
+        ]
+      },
+      {
+        "team": {"id": "10", "displayName": "Home FC"},
+        "statistics": [
+          {"name": "shots", "displayName": "Shots", "value": 12},
+          {"name": "possessionPct", "displayValue": "55%"}
+        ]
+      }
+    ]
+  },
+  "rosters": [
+    {
+      "homeAway": "away",
+      "team": {"id": "20", "displayName": "Away FC"},
+      "roster": [
+        {
+          "starter": true,
+          "captain": true,
+          "subbedOut": true,
+          "position": {"name": "Forward"},
+          "formationPlace": "9",
+          "athlete": {"id": "201", "displayName": "Away Player", "jersey": "9"},
+          "statistics": [{"name": "goals", "value": 1}]
+        }
+      ]
+    },
+    {
+      "homeAway": "home",
+      "team": {"id": "10", "displayName": "Home FC"},
+      "roster": [
+        {
+          "starter": true,
+          "captain": false,
+          "subbedIn": false,
+          "subbedOut": false,
+          "position": {"name": "Midfielder"},
+          "formationPlace": "7",
+          "athlete": {"id": "101", "displayName": "Home Player", "jersey": "7"},
+          "statistics": [{"name": "goals", "value": 2}]
+        }
+      ]
+    }
+  ],
+  "gameInfo": {
+    "attendance": 1000,
+    "venue": {"id": "99", "fullName": "Native Ground"},
+    "officials": [
+      {"id": "77", "fullName": "Ref Example", "position": {"name": "REFEREE"}}
+    ]
+  },
+  "optionalSummaryField": {"z": 2, "a": 1}
+}
