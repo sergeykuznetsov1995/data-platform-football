@@ -334,6 +334,39 @@ class EspnRawStore:
             self._verified_blobs.add(record.blob_key)
         return body, record
 
+    def load_exact(self, raw_uri: str, content_hash: str) -> bytes:
+        """Load one immutable blob by its manifest-bound URI and SHA-256.
+
+        Target aliases are intentionally not consulted: aliases move when a
+        later source response is captured, while replay and resume must retain
+        the exact bytes named by their durable raw manifest.
+        """
+
+        digest = self._digest(content_hash, "content_hash")
+        blob_key = self._blob_key(digest)
+        expected_uri = self._uri(blob_key)
+        if raw_uri != expected_uri:
+            raise RawTargetCorrupt(
+                "Raw ESPN blob URI does not match its content SHA-256"
+            )
+        try:
+            compressed = self._read_bytes(blob_key)
+            body = _strict_gzip_decompress(compressed)
+        except (RawStoreError, OSError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
+            with self._write_lock:
+                self._verified_blobs.discard(blob_key)
+            raise RawTargetCorrupt(f"Invalid ESPN gzip blob: {blob_key}") from exc
+        actual_hash = hashlib.sha256(body).hexdigest()
+        if actual_hash != digest:
+            with self._write_lock:
+                self._verified_blobs.discard(blob_key)
+            raise RawTargetCorrupt(
+                f"Raw ESPN content mismatch: expected {digest}, got {actual_hash}"
+            )
+        with self._write_lock:
+            self._verified_blobs.add(blob_key)
+        return body
+
 
 __all__ = [
     "EspnRawStore",

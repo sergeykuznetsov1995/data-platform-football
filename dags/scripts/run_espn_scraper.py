@@ -1,203 +1,82 @@
 #!/usr/bin/env python3
-"""
-ESPN Scraper Runner Script
-==========================
+"""CLI boundary for signed ESPN Native Raw/Bronze execution."""
 
-Standalone script to run ESPN scraper.
-Called from Airflow via BashOperator to avoid memory issues with PythonOperator.
-"""
+from __future__ import annotations
 
 import argparse
+from datetime import date
 import json
 import logging
 import sys
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+from scrapers.espn.runner import (
+    ExecutionOptions,
+    RunnerConfigurationError,
+    execute,
 )
-logger = logging.getLogger(__name__)
-
-# Replace-partitions completeness guard (#513 → #583): refuse a save that would
-# shrink bronze.espn_schedule below this share of the existing (league, season)
-# partition, so a partial/failed scrape can't wipe a good partition. COUNT(*)
-# (one row per match — no replace_guard_key needed). ReplaceGuardError → exit 3;
-# bypass with --force-replace for a deliberate first backfill / known shrink.
-_MIN_REPLACE_RATIO = 0.9
-REPLACE_GUARD_MARKER = 'ESPN_REPLACE_GUARD'
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Run ESPN scraper')
-    parser.add_argument(
-        '--leagues',
-        type=str,
-        default='ENG-Premier League',
-        help='Comma-separated list of leagues'
-    )
-    parser.add_argument(
-        '--season',
-        type=int,
-        default=2024,
-        help='Season year'
-    )
-    parser.add_argument(
-        '--output',
-        type=str,
-        default='/tmp/espn_result.json',
-        help='Output file for results'
-    )
-    parser.add_argument(
-        '--force-replace',
-        action='store_true',
-        help='Bypass the completeness guard — write even if the scraped frame '
-             'shrinks the existing partition. Use for a deliberate first '
-             'backfill or a known legitimate shrink.'
-    )
-    args = parser.parse_args()
+LOGGER = logging.getLogger(__name__)
 
-    leagues = [l.strip() for l in args.leagues.split(',')]
-    # #913 Phase 1 (WC0 recon): soccerdata SeasonCode is per-league.
-    # Tournaments are single-year ('2026'), clubs are 2-year ('2627').
-    # NEVER mix them in one sd.ESPN(leagues=..., seasons=...) call — it silently
-    # forces multi-year and breaks the tournament season. We build per-league
-    # tokens and scrape each league in its own (tiny) scraper instance.
-    from utils.medallion_config import (
-        get_active_season, is_single_year_competition,
-    )
-    per_league = []
-    for lg in leagues:
-        if is_single_year_competition(lg):
-            # #920 bridge (generalized Phase 3: any single_year tournament):
-            # the DAG passes the club-formula CURRENT_SEASON (July 2026 ->
-            # 2025) — substitute the active tournament year from
-            # competitions.yaml; skip the league entirely out of window.
-            _t_season = get_active_season(lg)
-            if _t_season is None:
-                logger.warning(
-                    f"{lg}: out of its tournament window — skipping league.")
-                continue
-            if int(args.season) != int(_t_season):
-                logger.info(
-                    f"{lg}: overriding --season {args.season} -> {_t_season} "
-                    f"(active single_year season, #920 bridge).")
-            tok = str(_t_season)  # single-year
-        else:
-            tok = f"{args.season % 100:02d}{(args.season + 1) % 100:02d}"
-        per_league.append((lg, tok))
-    logger.info(
-        f"Starting ESPN scraper: leagues={leagues}, season={args.season} "
-        f"per-league tokens={[t for _,t in per_league]}"
-    )
 
-    results = {
-        'tables': [],
-        'schedule_rows': 0,
-        'lineup_rows': 0,
-        'matchsheet_rows': 0,
-        'errors': []
-    }
-
+def _iso_date(value: str) -> date:
     try:
-        from scrapers.base.base_scraper import ReplaceGuardError
-        from scrapers.espn import ESPNScraper
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected ISO date YYYY-MM-DD") from exc
 
-        # #913: one league per scraper instance → no mixed season_code ever.
-        for lg, tok in per_league:
-            with ESPNScraper(leagues=[lg], seasons=[tok]) as scraper:
-                # Scrape schedule
-                try:
-                    df = scraper.read_schedule()
-                    if df is not None and not df.empty:
-                        df = scraper._standardize_schedule(df)
-                        table_path = scraper.save_to_iceberg(
-                            df=df,
-                            table_name='espn_schedule',
-                            partition_cols=['league', 'season'],
-                            replace_partitions=['league', 'season'],
-                            min_replace_ratio=(
-                                None if args.force_replace else _MIN_REPLACE_RATIO
-                            ),
-                        )
-                        results['tables'].append(table_path)
-                        results['schedule_rows'] += len(df)
-                        logger.info(f"Saved {len(df)} schedule rows for {lg}")
-                except ReplaceGuardError as e:
-                    # Guard refused the save (partial scrape would shrink the
-                    # partition) — nothing written. Distinct exit 3 so an operator
-                    # can tell a refused guard from a hard scrape failure (#583).
-                    msg = f"{REPLACE_GUARD_MARKER}: {e}"
-                    logger.error(msg)
-                    results['errors'].append(msg)
-                    with open(args.output, 'w') as f:
-                        json.dump(results, f)
-                    return 3
-                except Exception as e:
-                    error_msg = f"Schedule scraping failed: {e}"
-                    logger.error(error_msg)
-                    results['errors'].append(error_msg)
 
-                # Scrape per-match entities (lineup, matchsheet). Far heavier than
-                # the schedule — soccerdata iterates every match endpoint. A guard
-                # refusal here is recorded as an error (exit 1), NOT exit 3: the
-                # schedule (primary freshness signal) already saved above, so we
-                # reserve exit 3 for a schedule-level refusal only.
-                #
-                # Incremental by default: skip-existing drops games already in
-                # bronze, so the frame holds only NEW games — hence the saves
-                # replace per (league, season, game), not the whole partition
-                # (a whole-partition replace would wipe the skipped games).
-                # --force-replace disables the skip for a deliberate full
-                # re-scrape; per-game replace keeps that duplicate-safe too.
-                for entity, reader_fn in (
-                    ('lineup', scraper.read_lineup),
-                    ('matchsheet', scraper.read_matchsheet),
-                ):
-                    try:
-                        df = reader_fn(skip_existing=not args.force_replace)
-                        if df is not None and not df.empty:
-                            table_path = scraper.save_to_iceberg(
-                                df=df,
-                                table_name=f'espn_{entity}',
-                                partition_cols=['league', 'season'],
-                                replace_partitions=['league', 'season', 'game'],
-                                min_replace_ratio=(
-                                    None if args.force_replace else _MIN_REPLACE_RATIO
-                                ),
-                            )
-                            results['tables'].append(table_path)
-                            results[f'{entity}_rows'] += len(df)
-                            logger.info(f"Saved {len(df)} {entity} rows for {lg}")
-                    except ReplaceGuardError as e:
-                        msg = f"{REPLACE_GUARD_MARKER} ({entity}): {e}"
-                        logger.error(msg)
-                        results['errors'].append(msg)
-                    except Exception as e:
-                        error_msg = f"{entity.capitalize()} scraping failed: {e}"
-                        logger.error(error_msg)
-                        results['errors'].append(error_msg)
-
-    except Exception as e:
-        logger.error(f"Scraper failed: {e}", exc_info=True)
-        results['errors'].append(str(e))
-        with open(args.output, 'w') as f:
-            json.dump(results, f)
-        sys.exit(1)
-
-    # Write results
-    with open(args.output, 'w') as f:
-        json.dump(results, f)
-
-    logger.info(
-        f"Scraper complete: schedule={results['schedule_rows']} "
-        f"lineup={results['lineup_rows']} matchsheet={results['matchsheet_rows']} rows"
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run one immutable ESPN Native Bronze plan selection"
     )
-    print(json.dumps(results))
-    # Issue #466: non-zero exit when any scrape step failed — otherwise the
-    # BashOperator stays green while bronze.espn_schedule silently goes stale.
-    return 1 if results.get('errors') else 0
+    parser.add_argument("mode", choices=("daily", "repair", "backfill", "replay"))
+    parser.add_argument(
+        "--scope",
+        action="append",
+        default=[],
+        help="Exact <espn_id>:<source_year> scope; repeatable (default: signed plan)",
+    )
+    parser.add_argument("--as-of", required=True, type=_iso_date)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--attempt", required=True, type=int)
+    parser.add_argument("--plan-uri", required=True)
+    parser.add_argument("--raw-manifest-uri", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--raw-store-uri", required=True)
+    parser.add_argument("--max-events", type=int, default=100)
+    return parser
 
 
-if __name__ == '__main__':
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    args = build_parser().parse_args(argv)
+    try:
+        options = ExecutionOptions(
+            mode=args.mode,
+            scopes=tuple(args.scope),
+            as_of=args.as_of,
+            run_id=args.run_id,
+            attempt=args.attempt,
+            plan_uri=args.plan_uri,
+            raw_manifest_uri=args.raw_manifest_uri,
+            output_uri=args.output,
+            raw_store_uri=args.raw_store_uri,
+            max_events=args.max_events,
+        )
+        result = execute(options)
+    except (RunnerConfigurationError, ValueError, TypeError) as exc:
+        LOGGER.error("ESPN runner rejected configuration: %s", exc)
+        return 2
+    except Exception as exc:  # repository/transport terminal failure
+        LOGGER.exception("ESPN runner failed: %s", exc)
+        return 1
+    print(json.dumps(result.payload, sort_keys=True, separators=(",", ":")))
+    return result.exit_code
+
+
+if __name__ == "__main__":
     sys.exit(main())

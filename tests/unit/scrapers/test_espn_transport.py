@@ -361,6 +361,19 @@ def test_raw_store_requires_configuration_and_content_addresses(monkeypatch, tmp
 
 
 @pytest.mark.unit
+def test_exact_blob_read_ignores_moved_alias_and_rejects_uri_hash_drift(tmp_path):
+    store = EspnRawStore.from_uri(tmp_path.as_uri())
+    target = canonicalize_target("https://site.api.espn.com/summary?event=9")
+    first = store.store(target, EndpointType.SUMMARY, b'{"version":1}')
+    store.store(target, EndpointType.SUMMARY, b'{"version":2}')
+
+    assert store.load(target)[0] == b'{"version":2}'
+    assert store.load_exact(first.raw_uri, first.content_hash) == b'{"version":1}'
+    with pytest.raises(RawTargetCorrupt, match="URI"):
+        store.load_exact(first.raw_uri, "0" * 64)
+
+
+@pytest.mark.unit
 def test_byte_budget_reserves_before_network_and_never_overruns(monkeypatch, tmp_path):
     exhausted, exhausted_session, _, _ = _client(
         monkeypatch,

@@ -1,375 +1,1414 @@
-"""
-Unit tests for ``dags/scripts/run_espn_scraper.py`` exit-code logic.
-
-Issue #466: the runner previously returned ``0`` unconditionally — a failed
-``read_schedule()`` left ``results['errors']`` populated but the BashOperator
-still saw exit 0 → green DAG while bronze.espn_schedule silently went stale.
-The fix returns ``1`` whenever ``results['errors']`` is non-empty.
-
-The runner does ``from scrapers.espn import ESPNScraper`` lazily inside
-``main()`` to avoid pulling the heavy ``scrapers/__init__.py`` into the
-parser-time import graph; we install a stub via ``patch.dict('sys.modules',
-...)`` accordingly.
-"""
+"""Network-free contracts for the plan-driven ESPN Native Bronze runner."""
 
 from __future__ import annotations
 
-import importlib
+from copy import deepcopy
+from dataclasses import replace
+from datetime import date, datetime, timedelta, timezone
+import hashlib
 import json
-import os
+from pathlib import Path
+import subprocess
 import sys
-import tempfile
-from unittest.mock import MagicMock, patch
 
-import pandas as pd
 import pytest
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def _build_scraper(*, errors: bool):
-    """Build a stub ESPNScraper context-manager.
-
-    Successful path: ``read_schedule()`` returns an EMPTY DataFrame so the
-    runner skips ``save_to_iceberg()`` but does NOT append to errors.
-    """
-    scraper = MagicMock()
-
-    if errors:
-        scraper.read_schedule.side_effect = RuntimeError("forced failure")
-    else:
-        scraper.read_schedule.return_value = pd.DataFrame()
-
-    scraper.__enter__ = MagicMock(return_value=scraper)
-    scraper.__exit__ = MagicMock(return_value=False)
-    return MagicMock(return_value=scraper)
-
-
-def _build_guard_scraper(*, guard_blocks: bool = False):
-    """Stub ESPNScraper whose ``read_schedule`` returns a non-empty frame so the
-    runner reaches ``save_to_iceberg``. With ``guard_blocks=True`` the
-    BaseScraper-level completeness guard is simulated by raising
-    ``ReplaceGuardError`` — the runner must catch it and exit 3 (#583).
-
-    Returns the scraper instance (not the class stub) so tests can inspect
-    ``save_to_iceberg.call_args``; wrap it in ``MagicMock(return_value=...)``
-    when handing it to ``_run_main``.
-    """
-    from scrapers.base.base_scraper import ReplaceGuardError
-
-    df = pd.DataFrame({
-        'league': ['ENG-Premier League'] * 10,
-        'season': [2024] * 10,
-        'match_date': ['2024-08-17'] * 10,
-    })
-    scraper = MagicMock()
-    scraper.read_schedule.return_value = df
-    # _standardize_schedule must return a real DataFrame: the success path does
-    # ``len(df)`` for schedule_rows.
-    scraper._standardize_schedule.return_value = df
-    if guard_blocks:
-        scraper.save_to_iceberg.side_effect = ReplaceGuardError(
-            'new=3 rows < 90% of existing=380 for bronze.espn_schedule '
-            '— refusing replace_partitions save (would shrink the partition)'
-        )
-    else:
-        scraper.save_to_iceberg.return_value = 'iceberg.bronze.espn_schedule'
-    scraper.__enter__ = MagicMock(return_value=scraper)
-    scraper.__exit__ = MagicMock(return_value=False)
-    return scraper
+from scrapers.espn.models import (
+    AgeClass,
+    CapabilityState,
+    Competition,
+    DispositionState,
+    Edition,
+    EntityCapabilities,
+    Gender,
+    IngestPlan,
+    RequestDisposition,
+    ScopePlan,
+)
+from scrapers.espn.parser_contracts import PARSER_VERSION
+from scrapers.espn.parsers import parse_scoreboards, parse_summary
+from scrapers.espn.raw_store import EspnRawStore
+from scrapers.espn.registry import Registry
+from scrapers.espn.repository import (
+    RawLedgerRecord,
+    ScopeGeneration,
+    ScopePublicationResult,
+    ScopePublicationState,
+    canonical_json,
+    validate_scope_generation,
+)
+from scrapers.espn.runner import (
+    ArtifactConflictError,
+    ExecutionOptions,
+    RunnerConfigurationError,
+    execute,
+    is_full_reconciliation_day,
+    scope_snapshot_bytes,
+)
+from scrapers.espn.transport_contracts import (
+    EndpointType,
+    FetchResult,
+    canonicalize_target,
+)
 
 
-def _run_main(args: list, scraper_cls) -> int:
-    """Execute ``run_espn_scraper.main()`` with stubbed scraper."""
-    stub_pkg = MagicMock()
-    stub_pkg.ESPNScraper = scraper_cls
+FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "espn"
+UTC = timezone.utc
+NOW = datetime(2026, 7, 31, 9, tzinfo=UTC)
 
-    sys.argv = ["run_espn_scraper.py"] + args
 
-    with patch.dict(
-        sys.modules,
-        {"scrapers.espn": stub_pkg},
+def _fixture(name: str) -> dict:
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def _capabilities(state: CapabilityState = CapabilityState.PROVEN):
+    return EntityCapabilities(
+        schedule=CapabilityState.PROVEN,
+        lineup=state,
+        matchsheet=state,
+    )
+
+
+def _competition(
+    espn_id: int = 730,
+    slug: str = "ita.1",
+    *,
+    source_year: int = 2020,
+    start: date = date(2020, 8, 1),
+    end: date = date(2021, 7, 31),
+    capabilities: EntityCapabilities | None = None,
+) -> tuple[Competition, Edition]:
+    edition = Edition(
+        source_season_year=source_year,
+        display_name=f"{source_year}/{str(source_year + 1)[-2:]}",
+        start_date=start,
+        end_date=end,
+        current=True,
+        capabilities=capabilities or _capabilities(),
+    )
+    competition = Competition(
+        espn_id=espn_id,
+        slug=slug,
+        name=f"League {espn_id}",
+        gender=Gender.MALE,
+        age_class=AgeClass.SENIOR,
+        enabled=True,
+        editions=(edition,),
+        gender_evidence=("fixture",),
+        age_class_evidence=("manual",),
+    )
+    return competition, edition
+
+
+def _scope(competition: Competition, edition: Edition) -> ScopePlan:
+    return ScopePlan(
+        scope_id=competition.scope_id(edition),
+        espn_id=competition.espn_id,
+        slug=competition.slug,
+        source_season_year=edition.source_season_year,
+        start_date=edition.start_date,
+        end_date=edition.end_date,
+        capabilities=edition.capabilities,
+    )
+
+
+def _scoreboard(
+    competition: Competition,
+    edition: Edition,
+    *,
+    event_ids: tuple[int, ...] = (401000001,),
+    event_date: str = "2020-09-19T18:45Z",
+    status: str = "STATUS_FULL_TIME",
+) -> bytes:
+    document = _fixture("native_scoreboard.json")
+    document["leagues"][0]["id"] = str(competition.espn_id)
+    document["leagues"][0]["slug"] = competition.slug
+    prototype = document["events"][0]
+    events = []
+    for event_id in event_ids:
+        event = deepcopy(prototype)
+        event["id"] = str(event_id)
+        event["date"] = event_date
+        event["season"]["year"] = edition.source_season_year
+        event["status"]["type"]["name"] = status
+        event["status"]["type"]["completed"] = status == "STATUS_FULL_TIME"
+        if status != "STATUS_FULL_TIME":
+            for side in event["competitions"][0]["competitors"]:
+                side.pop("score", None)
+        events.append(event)
+    document["events"] = events
+    return json.dumps(document, sort_keys=True).encode()
+
+
+def _summary(event_id: int) -> bytes:
+    document = _fixture("native_summary.json")
+    document["header"]["id"] = str(event_id)
+    return json.dumps(document, sort_keys=True).encode()
+
+
+def _empty_summary(event_id: int) -> bytes:
+    return json.dumps(
+        {
+            "header": {
+                "id": str(event_id),
+                "competitions": [
+                    {
+                        "date": "2020-09-19T18:45Z",
+                        "competitors": [
+                            {
+                                "homeAway": "home",
+                                "team": {"id": "10", "displayName": "Home FC"},
+                            },
+                            {
+                                "homeAway": "away",
+                                "team": {"id": "20", "displayName": "Away FC"},
+                            },
+                        ],
+                    }
+                ],
+            }
+        },
+        sort_keys=True,
+    ).encode()
+
+
+class FakeHttpClient:
+    def __init__(
+        self,
+        raw_store: EspnRawStore,
+        scoreboard_by_slug,
+        *,
+        fail_slug=None,
+        summary_factory=_summary,
     ):
-        sys.modules.pop("dags.scripts.run_espn_scraper", None)
-        mod = importlib.import_module("dags.scripts.run_espn_scraper")
-        importlib.reload(mod)
-        return mod.main()
+        self.raw_store = raw_store
+        self.scoreboard_by_slug = scoreboard_by_slug
+        self.fail_slug = fail_slug
+        self.summary_factory = summary_factory
+        self.calls: list[tuple[str, EndpointType, dict]] = []
 
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-class TestRunEspnExitCode:
-    """Cover the ``return 1 if results.get('errors') else 0`` branch."""
-
-    @pytest.fixture
-    def temp_output(self):
-        fd, path = tempfile.mkstemp(suffix=".json", prefix="espn_")
-        os.close(fd)
-        yield path
-        if os.path.exists(path):
-            os.unlink(path)
-
-    @pytest.mark.unit
-    def test_exit_zero_when_no_errors(self, temp_output):
-        """Empty DataFrame → nothing saved, no errors → exit 0."""
-        scraper_cls = _build_scraper(errors=False)
-
-        rc = _run_main(
-            [
-                "--leagues", "ENG-Premier League",
-                "--season", "2024",
-                "--output", temp_output,
-            ],
-            scraper_cls,
+    def fetch_json(
+        self,
+        url,
+        endpoint,
+        params=None,
+        *,
+        competition_id=None,
+        event_id=None,
+        force_refresh=False,
+    ):
+        endpoint = EndpointType.parse(endpoint)
+        params = dict(params or {})
+        self.calls.append((url, endpoint, params))
+        slug = url.split("/soccer/", 1)[1].split("/", 1)[0]
+        if slug == self.fail_slug:
+            raise RuntimeError("injected transport failure")
+        body = (
+            self.scoreboard_by_slug[slug]
+            if endpoint is EndpointType.SCOREBOARD
+            else self.summary_factory(int(event_id))
+        )
+        target = canonicalize_target(url, params)
+        record = self.raw_store.store(
+            target,
+            endpoint,
+            body,
+            fetched_at="2026-07-31T08:00:00+00:00",
+            direct_bytes=len(body),
+        )
+        return FetchResult(
+            target=target,
+            endpoint=endpoint,
+            json_data=json.loads(body),
+            body=body,
+            attempts=1,
+            status=200,
+            cache_hit=False,
+            direct_bytes=len(body),
+            proxy_bytes=0,
+            raw_uri=record.raw_uri,
+            content_hash=record.content_hash,
+            fetched_at=record.fetched_at,
         )
 
-        assert rc == 0
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert payload["errors"] == []
 
-    @pytest.mark.unit
-    def test_exit_one_when_errors(self, temp_output):
-        """read_schedule raises → error recorded → exit MUST be 1.
+class FakeRepository:
+    def __init__(self, *, fail_scope: str | None = None):
+        self.fail_scope = fail_scope
+        self.generations: list[ScopeGeneration] = []
 
-        Direct regression on issue #466: previously the runner returned 0
-        unconditionally.
-        """
-        scraper_cls = _build_scraper(errors=True)
-
-        rc = _run_main(
-            [
-                "--leagues", "ENG-Premier League",
-                "--season", "2024",
-                "--output", temp_output,
-            ],
-            scraper_cls,
+    def publish_scope(self, generation: ScopeGeneration):
+        report = validate_scope_generation(generation)
+        assert report.passed, report.failures
+        if generation.plan.scope_id == self.fail_scope:
+            raise RuntimeError("injected publication failure")
+        self.generations.append(generation)
+        return ScopePublicationResult(
+            scope_id=generation.plan.scope_id,
+            generation_id=generation.generation_id,
+            state=ScopePublicationState.PUBLISHED,
+            manifest_sha256=generation.manifest_sha256,
         )
 
-        assert rc == 1, (
-            "Expected exit 1 when results.errors is populated — "
-            "green-DAG-on-total-failure regression (#466)."
+
+def _write(path: Path, payload: bytes | str) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload.encode() if isinstance(payload, str) else payload)
+    return path.as_uri()
+
+
+def _registry(tmp_path: Path, competitions: tuple[Competition, ...]) -> tuple[str, str]:
+    registry = Registry(
+        schema_version=1,
+        registry_version="fixture-v1",
+        as_of=date(2026, 7, 31),
+        competitions=competitions,
+    )
+    uri = _write(tmp_path / "registry.json", registry.canonical_json())
+    return uri, registry.signature()
+
+
+def _prior_generation(
+    competition: Competition,
+    edition: Edition,
+    *,
+    event_ids: tuple[int, ...] = (401000001,),
+) -> ScopeGeneration:
+    scope = _scope(competition, edition)
+    schedule = parse_scoreboards(
+        _scoreboard(competition, edition, event_ids=event_ids),
+        competition=competition,
+        edition=edition,
+        query_start=edition.start_date,
+        query_end=edition.end_date,
+    )
+    summaries = [
+        parse_summary(
+            _summary(event.event_id),
+            competition=competition,
+            edition=edition,
+            event=event,
         )
-
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert len(payload["errors"]) == 1
-        assert "Schedule" in payload["errors"][0]
-
-
-class TestEspnReplaceGuard:
-    """#583: completeness-guard wiring in the ESPN runner.
-
-    The guard arithmetic lives in ``BaseScraper.save_to_iceberg`` (covered by
-    ``test_base_scraper.py``); here we cover the runner's *handling* — arm the
-    guard on the normal path, map ``ReplaceGuardError`` to exit 3, and let
-    ``--force-replace`` disarm it.
-    """
-
-    @pytest.fixture
-    def temp_output(self):
-        fd, path = tempfile.mkstemp(suffix=".json", prefix="espn_")
-        os.close(fd)
-        yield path
-        if os.path.exists(path):
-            os.unlink(path)
-
-    @pytest.mark.unit
-    def test_guard_refusal_exits_3(self, temp_output):
-        """save_to_iceberg raises ReplaceGuardError → exit 3 + ESPN_REPLACE_GUARD
-        marker (distinct from the exit-1 hard-failure path)."""
-        scraper = _build_guard_scraper(guard_blocks=True)
-
-        rc = _run_main(
-            ["--leagues", "ENG-Premier League", "--season", "2024",
-             "--output", temp_output],
-            MagicMock(return_value=scraper),
+        for event in schedule
+    ]
+    scoreboard_hash = hashlib.sha256(b"prior-scoreboard").hexdigest()
+    ledger = [
+        RawLedgerRecord(
+            request_id="scoreboard:prior",
+            endpoint="scoreboard",
+            event_id=None,
+            disposition=DispositionState.CAPTURED,
+            raw_uri="s3://raw/prior-scoreboard.json.gz",
+            raw_sha256=scoreboard_hash,
+            fetched_at=NOW - timedelta(days=1),
+            direct_bytes=100,
+            proxy_bytes=0,
+            event_ids=tuple(event.event_id for event in schedule),
         )
-
-        assert rc == 3
-        scraper.save_to_iceberg.assert_called_once()
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert any("ESPN_REPLACE_GUARD" in e for e in payload["errors"])
-
-    @pytest.mark.unit
-    def test_normal_path_arms_guard_exits_0(self, temp_output):
-        """Non-force run passes min_replace_ratio=0.9 (raw COUNT(*), no key)."""
-        scraper = _build_guard_scraper()
-
-        rc = _run_main(
-            ["--leagues", "ENG-Premier League", "--season", "2024",
-             "--output", temp_output],
-            MagicMock(return_value=scraper),
+    ]
+    dispositions = []
+    for event, summary in zip(schedule, summaries):
+        ledger.append(
+            RawLedgerRecord(
+                request_id=f"summary:{event.event_id}",
+                endpoint="summary",
+                event_id=event.event_id,
+                disposition=DispositionState.CAPTURED,
+                raw_uri=f"s3://raw/prior-summary-{event.event_id}.json.gz",
+                raw_sha256=hashlib.sha256(str(event.event_id).encode()).hexdigest(),
+                fetched_at=NOW - timedelta(days=1),
+                direct_bytes=200,
+                proxy_bytes=0,
+            )
         )
+        for entity, state in (
+            ("lineup", summary.lineup_state),
+            ("matchsheet", summary.matchsheet_state),
+        ):
+            dispositions.append(
+                RequestDisposition(
+                    endpoint=entity,
+                    state=DispositionState(state.value),
+                    detail="prior complete",
+                    event_id=event.event_id,
+                )
+            )
+    return ScopeGeneration(
+        plan=scope,
+        run_id="prior-run",
+        generation_id="prior-generation",
+        registry_snapshot_uri="s3://registry/prior.json",
+        registry_signature="a" * 64,
+        plan_signature="b" * 64,
+        parser_version=PARSER_VERSION,
+        runtime_version="espn-native-runtime-v2",
+        ingested_at=NOW - timedelta(days=1),
+        batch_id="prior-batch",
+        schedule=schedule,
+        lineup=tuple(row for summary in summaries for row in summary.lineup),
+        matchsheet=tuple(row for summary in summaries for row in summary.matchsheet),
+        planned_request_ids=tuple(item.request_id for item in ledger),
+        raw_ledger=tuple(ledger),
+        dispositions=tuple(dispositions),
+    )
 
-        assert rc == 0
-        kwargs = scraper.save_to_iceberg.call_args.kwargs
-        assert kwargs["min_replace_ratio"] == 0.9
-        assert kwargs["replace_partitions"] == ["league", "season"]
-        # schedules store one row per match → raw COUNT(*), no replace_guard_key
-        assert "replace_guard_key" not in kwargs
 
-    @pytest.mark.unit
-    def test_force_replace_disarms_guard(self, temp_output):
-        """--force-replace must pass min_replace_ratio=None to the save."""
-        scraper = _build_guard_scraper()
+def _plan(
+    tmp_path: Path,
+    mode: str,
+    competitions: tuple[tuple[Competition, Edition], ...],
+    *,
+    attempt: int = 1,
+    run_id: str = "run-1",
+    as_of: date = date(2020, 9, 20),
+    initial_capture: bool = True,
+    priors: dict[str, ScopeGeneration] | None = None,
+    active: dict[str, bool] | None = None,
+    known_nonterminal_events: dict[str, list[dict]] | None = None,
+    replay_source: dict | None = None,
+    max_events: int = 100,
+) -> tuple[ExecutionOptions, IngestPlan]:
+    registry_uri, registry_signature = _registry(
+        tmp_path, tuple(item[0] for item in competitions)
+    )
+    raw_manifest = tmp_path / "runs" / run_id / f"attempt-{attempt}" / "raw.json"
+    output = tmp_path / "runs" / run_id / f"attempt-{attempt}" / "result.json"
+    bindings = {}
+    priors = priors or {}
+    active = active or {}
+    known_nonterminal_events = known_nonterminal_events or {}
+    for competition, edition in competitions:
+        scope = _scope(competition, edition)
+        prior = priors.get(scope.scope_id)
+        prior_binding = None
+        if prior is not None:
+            prior_path = tmp_path / "prior" / f"{scope.scope_id}.json"
+            prior_bytes = scope_snapshot_bytes(prior)
+            prior_uri = _write(prior_path, prior_bytes)
+            prior_binding = {
+                "uri": prior_uri,
+                "artifact_sha256": hashlib.sha256(prior_bytes).hexdigest(),
+                "scope_id": scope.scope_id,
+                "generation_id": prior.generation_id,
+                "generation_signature": prior.generation_signature,
+                "manifest_sha256": prior.manifest_sha256,
+            }
+        bindings[scope.scope_id] = {
+            "active": active.get(scope.scope_id, True),
+            "initial_capture": initial_capture,
+            "generation_id": f"generation-{scope.scope_id.replace(':', '-')}",
+            "batch_id": f"batch-{scope.scope_id.replace(':', '-')}",
+            "ingested_at": NOW.isoformat().replace("+00:00", "Z"),
+            "generation_snapshot_uri": (
+                tmp_path
+                / "runs"
+                / run_id
+                / f"attempt-{attempt}"
+                / f"scope-{scope.scope_id}.json"
+            ).as_uri(),
+            "known_nonterminal_events": known_nonterminal_events.get(
+                scope.scope_id, []
+            ),
+            "prior": prior_binding,
+        }
+    metadata = {
+        "runtime": {
+            "mode": mode,
+            "attempt": attempt,
+            "registry_snapshot_uri": registry_uri,
+            "raw_manifest_uri": raw_manifest.as_uri(),
+            "output_uri": output.as_uri(),
+            "raw_store_uri": (tmp_path / "raw-store").as_uri(),
+            "max_events": max_events,
+            "scope_bindings": bindings,
+            "replay_source": replay_source,
+        }
+    }
+    plan = IngestPlan(
+        schema_version=1,
+        run_id=run_id,
+        as_of=as_of,
+        registry_signature=registry_signature,
+        scopes=tuple(_scope(*item) for item in competitions),
+        metadata=metadata,
+    )
+    envelope = {
+        "kind": "espn-ingest-plan-v1",
+        "plan": plan.to_dict(),
+        "signature": plan.signature(),
+    }
+    plan_uri = _write(
+        tmp_path / "plans" / f"{run_id}.json",
+        json.dumps(envelope, sort_keys=True, separators=(",", ":")),
+    )
+    options = ExecutionOptions(
+        mode=mode,
+        scopes=tuple(scope.scope_id for scope in plan.scopes),
+        as_of=as_of,
+        run_id=run_id,
+        attempt=attempt,
+        plan_uri=plan_uri,
+        raw_manifest_uri=raw_manifest.as_uri(),
+        output_uri=output.as_uri(),
+        raw_store_uri=(tmp_path / "raw-store").as_uri(),
+        max_events=max_events,
+    )
+    return options, plan
 
-        rc = _run_main(
-            ["--leagues", "ENG-Premier League", "--season", "2024",
-             "--force-replace", "--output", temp_output],
-            MagicMock(return_value=scraper),
-        )
 
-        assert rc == 0
-        kwargs = scraper.save_to_iceberg.call_args.kwargs
-        assert kwargs["min_replace_ratio"] is None
+def _rewrite_signed_plan(options, plan: IngestPlan, mutate):
+    document = plan.to_dict()
+    mutate(document)
+    rebuilt = IngestPlan(
+        schema_version=document["schema_version"],
+        run_id=document["run_id"],
+        as_of=date.fromisoformat(document["as_of"]),
+        registry_signature=document["registry_signature"],
+        scopes=plan.scopes,
+        metadata=document["metadata"],
+    )
+    envelope = {
+        "kind": "espn-ingest-plan-v1",
+        "plan": rebuilt.to_dict(),
+        "signature": rebuilt.signature(),
+    }
+    Path(options.plan_uri.removeprefix("file://")).write_text(
+        json.dumps(envelope, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return rebuilt
 
 
-# ---------------------------------------------------------------------------
-# #713: the runner now writes all three ESPN bronze tables (schedule + lineup +
-# matchsheet) in one run — one DAG = one source. Cover the lineup/matchsheet
-# wiring (the column coercion itself lives in ESPNScraper.read_lineup /
-# read_matchsheet, exercised by test_espn_scraper.py).
-# ---------------------------------------------------------------------------
-def _build_full_scraper(*, lineup_raises: bool = False):
-    """Stub ESPNScraper returning non-empty frames for all three reads."""
-    sched = pd.DataFrame({
-        'league': ['ENG-Premier League'] * 10,
-        'season': [2024] * 10,
-        'match_date': ['2024-08-17'] * 10,
-    })
-    lineup = pd.DataFrame({'league': ['ENG-Premier League'] * 22, 'season': [2024] * 22})
-    matchsheet = pd.DataFrame({'league': ['ENG-Premier League'] * 2, 'season': [2024] * 2})
+def _reseal_raw_manifest(path: Path, mutate) -> None:
+    manifest = json.loads(path.read_text())
+    mutate(manifest)
+    base = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    manifest["manifest_sha256"] = hashlib.sha256(
+        (canonical_json(base) + "\n").encode()
+    ).hexdigest()
+    path.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
 
-    scraper = MagicMock()
-    scraper.read_schedule.return_value = sched
-    scraper._standardize_schedule.return_value = sched
-    if lineup_raises:
-        scraper.read_lineup.side_effect = RuntimeError("lineup boom")
+
+def _bind_replay_to_capture(options, plan, capture_options):
+    def mutate(document):
+        runtime = document["metadata"]["runtime"]
+        runtime["raw_manifest_uri"] = capture_options.raw_manifest_uri
+        runtime["raw_store_uri"] = capture_options.raw_store_uri
+
+    rebuilt = _rewrite_signed_plan(options, plan, mutate)
+    return (
+        replace(
+            options,
+            raw_manifest_uri=capture_options.raw_manifest_uri,
+            raw_store_uri=capture_options.raw_store_uri,
+        ),
+        rebuilt,
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["daily", "repair", "backfill", "replay"])
+def test_cli_exposes_only_native_modes_and_rejects_legacy_flags(mode, tmp_path):
+    from dags.scripts.run_espn_scraper import build_parser
+
+    parser = build_parser()
+    argv = [
+        mode,
+        "--scope",
+        "730:2020",
+        "--as-of",
+        "2020-09-20",
+        "--run-id",
+        "run-1",
+        "--attempt",
+        "1",
+        "--plan-uri",
+        (tmp_path / "plan.json").as_uri(),
+        "--raw-manifest-uri",
+        (tmp_path / "raw.json").as_uri(),
+        "--output",
+        (tmp_path / "result.json").as_uri(),
+        "--raw-store-uri",
+        (tmp_path / "raw").as_uri(),
+        "--max-events",
+        "50",
+    ]
+    args = parser.parse_args(argv)
+    assert args.mode == mode
+    assert args.scope == ["730:2020"]
+    for legacy in ("--leagues", "--season", "--force-replace"):
+        with pytest.raises(SystemExit):
+            parser.parse_args([*argv, legacy, "legacy"])
+
+
+@pytest.mark.unit
+def test_runner_rejects_run_attempt_scope_and_registry_drift_before_io(tmp_path):
+    competition, edition = _competition()
+    options, _ = _plan(tmp_path, "daily", ((competition, edition),))
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store, {competition.slug: _scoreboard(competition, edition)}
+    )
+    repository = FakeRepository()
+
+    for drifted in (
+        replace(options, run_id="wrong-run"),
+        replace(options, attempt=2),
+        replace(options, scopes=("999:2020",)),
+        replace(options, mode="repair"),
+    ):
+        with pytest.raises(RunnerConfigurationError):
+            execute(
+                drifted, repository=repository, raw_store=raw_store, http_client=client
+            )
+    assert client.calls == []
+    assert repository.generations == []
+
+    registry_path = (
+        Path(options.plan_uri.removeprefix("file://")).parents[1] / "registry.json"
+    )
+    registry_path.write_text('{"forged":true}', encoding="utf-8")
+    with pytest.raises(RunnerConfigurationError, match="registry"):
+        execute(options, repository=repository, raw_store=raw_store, http_client=client)
+    assert client.calls == []
+
+
+@pytest.mark.unit
+def test_initial_capture_fetches_full_calendar_and_one_summary_for_both_entities(
+    tmp_path,
+):
+    competition, edition = _competition()
+    options, _ = _plan(tmp_path, "daily", ((competition, edition),))
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store, {competition.slug: _scoreboard(competition, edition)}
+    )
+    repository = FakeRepository()
+
+    result = execute(
+        options,
+        repository=repository,
+        raw_store=raw_store,
+        http_client=client,
+    )
+
+    assert result.exit_code == 0
+    generation = repository.generations[0]
+    assert generation.schedule and generation.lineup and generation.matchsheet
+    summary_calls = [call for call in client.calls if call[1] is EndpointType.SUMMARY]
+    assert len(summary_calls) == 1
+    scoreboard_call = next(
+        call for call in client.calls if call[1] is EndpointType.SCOREBOARD
+    )
+    assert scoreboard_call[2]["dates"] == "20200801-20210731"
+    assert Path(options.output_uri.removeprefix("file://")).is_file()
+    assert not list(tmp_path.rglob("*.tmp-*"))
+
+
+@pytest.mark.unit
+def test_daily_window_known_nonterminal_and_sha256_full_shard_are_deterministic(
+    tmp_path,
+):
+    competition, edition = _competition()
+    prior = _prior_generation(competition, edition)
+    scope_id = competition.scope_id(edition)
+    known = {scope_id: [{"event_id": 999, "event_date": "2020-11-01"}]}
+    options, _ = _plan(
+        tmp_path,
+        "daily",
+        ((competition, edition),),
+        initial_capture=False,
+        priors={scope_id: prior},
+        known_nonterminal_events=known,
+    )
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store,
+        {
+            competition.slug: _scoreboard(
+                competition,
+                edition,
+                event_ids=(),
+                status="STATUS_SCHEDULED",
+            )
+        },
+    )
+    repository = FakeRepository()
+    result = execute(
+        options, repository=repository, raw_store=raw_store, http_client=client
+    )
+    assert result.exit_code == 1
+    assert "known non-terminal" in result.payload["scopes"][0]["error"]
+    assert repository.generations == []
+    date_queries = {
+        call[2]["dates"] for call in client.calls if call[1] is EndpointType.SCOREBOARD
+    }
+    if is_full_reconciliation_day(scope_id, options.as_of):
+        assert date_queries == {"20200801-20210731"}
     else:
-        scraper.read_lineup.return_value = lineup
-    scraper.read_matchsheet.return_value = matchsheet
-    # Echo the table name back so tests can read call ordering off the result.
-    scraper.save_to_iceberg.side_effect = lambda **kw: f"iceberg.bronze.{kw['table_name']}"
-    scraper.__enter__ = MagicMock(return_value=scraper)
-    scraper.__exit__ = MagicMock(return_value=False)
-    return scraper
+        assert date_queries == {"20200917-20201004", "20201101"}
+
+    days = [options.as_of + timedelta(days=offset) for offset in range(7)]
+    assert sum(is_full_reconciliation_day(scope_id, day) for day in days) == 1
+    assert is_full_reconciliation_day(scope_id, days[0]) == (
+        int(hashlib.sha256(scope_id.encode()).hexdigest(), 16) % 7
+        == days[0].toordinal() % 7
+    )
 
 
-class TestEspnAllTables:
-    """#713: one DAG run writes schedule + lineup + matchsheet."""
+@pytest.mark.unit
+def test_daily_full_generation_preserves_out_of_window_rows_and_prior_raw_bindings(
+    tmp_path,
+):
+    competition, edition = _competition()
+    prior = _prior_generation(competition, edition, event_ids=(401000001, 401000002))
+    outside_id = 401000002
+    outside_kickoff = datetime(2020, 12, 19, 18, 45, tzinfo=UTC)
+    prior = ScopeGeneration(
+        **{
+            **prior.constructor_values(),
+            "schedule": tuple(
+                replace(
+                    row,
+                    kickoff=outside_kickoff,
+                    date=outside_kickoff,
+                    match_date=outside_kickoff,
+                )
+                if row.event_id == outside_id
+                else row
+                for row in prior.schedule
+            ),
+        }
+    )
+    outside_schedule = next(row for row in prior.schedule if row.event_id == outside_id)
+    outside_lineup = tuple(row for row in prior.lineup if row.event_id == outside_id)
+    outside_matchsheet = tuple(
+        row for row in prior.matchsheet if row.event_id == outside_id
+    )
+    scope_id = competition.scope_id(edition)
+    # Pick a non-reconciliation day so this specifically exercises the daily merge.
+    as_of = date(2020, 9, 20)
+    while is_full_reconciliation_day(scope_id, as_of):
+        as_of += timedelta(days=1)
+    options, _ = _plan(
+        tmp_path,
+        "daily",
+        ((competition, edition),),
+        as_of=as_of,
+        initial_capture=False,
+        priors={scope_id: prior},
+    )
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store,
+        {competition.slug: _scoreboard(competition, edition, event_ids=(401000001,))},
+    )
+    repository = FakeRepository()
 
-    @pytest.fixture
-    def temp_output(self):
-        fd, path = tempfile.mkstemp(suffix=".json", prefix="espn_")
-        os.close(fd)
-        yield path
-        if os.path.exists(path):
-            os.unlink(path)
+    result = execute(
+        options, repository=repository, raw_store=raw_store, http_client=client
+    )
 
-    @pytest.mark.unit
-    def test_all_three_tables_saved(self, temp_output):
-        """All three reads return data → three saves, exit 0, per-table counts."""
-        scraper = _build_full_scraper()
+    assert result.exit_code == 0
+    generation = repository.generations[0]
+    assert outside_schedule in generation.schedule
+    assert set(outside_lineup).issubset(generation.lineup)
+    assert set(outside_matchsheet).issubset(generation.matchsheet)
+    outside_scoreboard_bindings = [
+        item
+        for item in generation.raw_ledger
+        if item.endpoint == "scoreboard" and outside_id in item.event_ids
+    ]
+    assert len(outside_scoreboard_bindings) == 1
+    assert outside_scoreboard_bindings[0].request_id == "scoreboard:prior"
 
-        rc = _run_main(
-            ["--leagues", "ENG-Premier League", "--season", "2024",
-             "--output", temp_output],
-            MagicMock(return_value=scraper),
+
+@pytest.mark.unit
+def test_overlapping_scoreboards_bind_every_event_to_exactly_one_raw_record(tmp_path):
+    competition, edition = _competition()
+    prior = _prior_generation(competition, edition)
+    scope_id = competition.scope_id(edition)
+    as_of = date(2020, 9, 20)
+    while is_full_reconciliation_day(scope_id, as_of):
+        as_of += timedelta(days=1)
+    options, _ = _plan(
+        tmp_path,
+        "daily",
+        ((competition, edition),),
+        as_of=as_of,
+        initial_capture=False,
+        priors={scope_id: prior},
+        known_nonterminal_events={
+            scope_id: [{"event_id": 401000001, "event_date": "2020-09-19"}]
+        },
+    )
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store,
+        {competition.slug: _scoreboard(competition, edition)},
+    )
+    repository = FakeRepository()
+
+    execute(options, repository=repository, raw_store=raw_store, http_client=client)
+
+    generation = repository.generations[0]
+    bindings = [
+        record
+        for record in generation.raw_ledger
+        if record.endpoint == "scoreboard" and 401000001 in record.event_ids
+    ]
+    assert len(bindings) == 1
+    assert validate_scope_generation(generation).passed
+
+
+@pytest.mark.unit
+def test_101_final_events_checkpoint_as_50_50_1_and_resume_without_refetch(tmp_path):
+    competition, edition = _competition(
+        capabilities=_capabilities(CapabilityState.PARTIAL)
+    )
+    event_ids = tuple(range(401100001, 401100102))
+    options, _ = _plan(tmp_path, "backfill", ((competition, edition),))
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    body = _scoreboard(competition, edition, event_ids=event_ids)
+    first_client = FakeHttpClient(
+        raw_store, {competition.slug: body}, summary_factory=_empty_summary
+    )
+    first_repo = FakeRepository()
+
+    first = execute(
+        options,
+        repository=first_repo,
+        raw_store=raw_store,
+        http_client=first_client,
+    )
+    assert first.exit_code != 0
+    assert first_repo.generations == []
+    assert sum(call[1] is EndpointType.SUMMARY for call in first_client.calls) == 100
+
+    second_client = FakeHttpClient(
+        raw_store, {competition.slug: body}, summary_factory=_empty_summary
+    )
+    second_repo = FakeRepository()
+    second = execute(
+        options,
+        repository=second_repo,
+        raw_store=raw_store,
+        http_client=second_client,
+    )
+    assert second.exit_code == 0
+    assert sum(call[1] is EndpointType.SUMMARY for call in second_client.calls) == 1
+    assert not any(call[1] is EndpointType.SCOREBOARD for call in second_client.calls)
+    raw_manifest = json.loads(
+        Path(options.raw_manifest_uri.removeprefix("file://")).read_text()
+    )
+    summary_sizes = [
+        len(checkpoint["requests"])
+        for checkpoint in raw_manifest["checkpoints"]
+        if checkpoint["endpoint"] == "summary"
+    ]
+    assert summary_sizes == [50, 50, 1]
+
+
+@pytest.mark.unit
+def test_replay_uses_bound_exact_blobs_after_alias_moves_and_never_http(tmp_path):
+    competition, edition = _competition()
+    capture_options, capture_plan = _plan(
+        tmp_path / "capture", "backfill", ((competition, edition),)
+    )
+    raw_store = EspnRawStore.from_uri(capture_options.raw_store_uri)
+    capture_client = FakeHttpClient(
+        raw_store, {competition.slug: _scoreboard(competition, edition)}
+    )
+    assert (
+        execute(
+            capture_options,
+            repository=FakeRepository(),
+            raw_store=raw_store,
+            http_client=capture_client,
+        ).exit_code
+        == 0
+    )
+    manifest_path = Path(capture_options.raw_manifest_uri.removeprefix("file://"))
+    manifest_bytes = manifest_path.read_bytes()
+    replay_source = {
+        "mode": "backfill",
+        "run_id": capture_options.run_id,
+        "attempt": capture_options.attempt,
+        "plan_signature": capture_plan.signature(),
+        "raw_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+    }
+    replay_options, _ = _plan(
+        tmp_path / "replay",
+        "replay",
+        ((competition, edition),),
+        run_id="replay-run",
+        replay_source=replay_source,
+    )
+    replay_options = replace(
+        replay_options,
+        raw_manifest_uri=capture_options.raw_manifest_uri,
+        raw_store_uri=capture_options.raw_store_uri,
+    )
+    # Rewrite the replay plan so its signed URI matches the exact source manifest.
+    envelope_path = Path(replay_options.plan_uri.removeprefix("file://"))
+    envelope = json.loads(envelope_path.read_text())
+    envelope["plan"]["metadata"]["runtime"]["raw_manifest_uri"] = (
+        capture_options.raw_manifest_uri
+    )
+    envelope["plan"]["metadata"]["runtime"]["raw_store_uri"] = (
+        capture_options.raw_store_uri
+    )
+    unsigned = envelope["plan"]
+    # Rebuild through the public model to obtain its canonical signature.
+    replay_plan = IngestPlan(
+        schema_version=unsigned["schema_version"],
+        run_id=unsigned["run_id"],
+        as_of=date.fromisoformat(unsigned["as_of"]),
+        registry_signature=unsigned["registry_signature"],
+        scopes=tuple(_scope(competition, edition) for _ in unsigned["scopes"]),
+        metadata=unsigned["metadata"],
+    )
+    envelope["signature"] = replay_plan.signature()
+    envelope_path.write_text(
+        json.dumps(envelope, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    # Point mutable target aliases at bad JSON. Exact blob replay must ignore them.
+    for target_file in (
+        Path(capture_options.raw_store_uri.removeprefix("file://")) / "targets"
+    ).rglob("*.json"):
+        target_file.write_text('{"forged":true}', encoding="utf-8")
+
+    replay_repo = FakeRepository()
+    result = execute(replay_options, repository=replay_repo, raw_store=raw_store)
+    assert result.exit_code == 0
+    assert replay_repo.generations[0].schedule[0].event_id == 401000001
+
+
+@pytest.mark.unit
+def test_clean_noop_requires_bound_prior_complete_identity(tmp_path, monkeypatch):
+    competition, edition = _competition()
+    scope_id = competition.scope_id(edition)
+    without_prior, _ = _plan(
+        tmp_path / "bad",
+        "daily",
+        ((competition, edition),),
+        initial_capture=False,
+        active={scope_id: False},
+    )
+    raw_store = EspnRawStore.from_uri(without_prior.raw_store_uri)
+    with pytest.raises(RunnerConfigurationError, match="prior COMPLETE"):
+        execute(without_prior, repository=FakeRepository(), raw_store=raw_store)
+
+    prior = _prior_generation(competition, edition)
+    options, _ = _plan(
+        tmp_path / "good",
+        "daily",
+        ((competition, edition),),
+        initial_capture=False,
+        priors={scope_id: prior},
+        active={scope_id: False},
+    )
+    import scrapers.espn.runner as runner_module
+
+    class ForbiddenDependency:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("clean no-op touched network/repository dependency")
+
+        @classmethod
+        def from_uri(cls, *args, **kwargs):
+            raise AssertionError("clean no-op opened raw store")
+
+    monkeypatch.setattr(runner_module, "EspnRawStore", ForbiddenDependency)
+    monkeypatch.setattr(runner_module, "EspnBronzeRepository", ForbiddenDependency)
+    result = execute(options)
+    assert result.exit_code == 0
+    assert result.payload["state"] == "noop"
+
+
+@pytest.mark.unit
+def test_empty_initial_scope_fails_but_good_scope_publishes_independently(tmp_path):
+    first, first_edition = _competition(730, "ita.1")
+    second, second_edition = _competition(731, "eng.1")
+    options, _ = _plan(
+        tmp_path,
+        "repair",
+        ((first, first_edition), (second, second_edition)),
+    )
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store,
+        {
+            first.slug: _scoreboard(
+                first,
+                first_edition,
+                event_ids=(401000001,),
+                status="STATUS_SCHEDULED",
+            ),
+            second.slug: _scoreboard(second, second_edition, event_ids=()),
+        },
+    )
+    repository = FakeRepository()
+
+    result = execute(
+        options, repository=repository, raw_store=raw_store, http_client=client
+    )
+
+    assert result.exit_code != 0
+    assert [item.plan.scope_id for item in repository.generations] == [
+        first.scope_id(first_edition)
+    ]
+    states = {item["scope_id"]: item["state"] for item in result.payload["scopes"]}
+    assert states[first.scope_id(first_edition)] == "complete"
+    assert states[second.scope_id(second_edition)] == "incomplete"
+
+
+@pytest.mark.unit
+def test_retry_generation_identity_is_byte_stable_and_repository_idempotent(tmp_path):
+    competition, edition = _competition()
+    options, _ = _plan(tmp_path, "backfill", ((competition, edition),))
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store, {competition.slug: _scoreboard(competition, edition)}
+    )
+    first_repo = FakeRepository()
+    assert (
+        execute(
+            options, repository=first_repo, raw_store=raw_store, http_client=client
+        ).exit_code
+        == 0
+    )
+    first = first_repo.generations[0]
+
+    class IdempotentRepository(FakeRepository):
+        def publish_scope(self, generation):
+            assert generation.generation_signature == first.generation_signature
+            assert generation.manifest_sha256 == first.manifest_sha256
+            return ScopePublicationResult(
+                scope_id=generation.plan.scope_id,
+                generation_id=generation.generation_id,
+                state=ScopePublicationState.IDEMPOTENT,
+                manifest_sha256=generation.manifest_sha256,
+            )
+
+    retry_client = FakeHttpClient(raw_store, {competition.slug: b"forbidden"})
+    retry = execute(
+        options,
+        repository=IdempotentRepository(),
+        raw_store=raw_store,
+        http_client=retry_client,
+    )
+    assert retry.exit_code == 0
+    assert retry_client.calls == []
+
+
+@pytest.mark.unit
+def test_signed_plan_tamper_unknown_metadata_and_resume_identity_fail_before_io(
+    tmp_path,
+):
+    competition, edition = _competition()
+    options, plan = _plan(tmp_path, "backfill", ((competition, edition),))
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store, {competition.slug: _scoreboard(competition, edition)}
+    )
+    repository = FakeRepository()
+    plan_path = Path(options.plan_uri.removeprefix("file://"))
+    original = plan_path.read_text()
+    tampered = json.loads(original)
+    tampered["plan"]["run_id"] = "forged"
+    plan_path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(RunnerConfigurationError, match="signature"):
+        execute(options, repository=repository, raw_store=raw_store, http_client=client)
+    assert client.calls == [] and repository.generations == []
+
+    plan_path.write_text(original, encoding="utf-8")
+    _rewrite_signed_plan(
+        options,
+        plan,
+        lambda document: document["metadata"]["runtime"].__setitem__(
+            "unknown", "forbidden"
+        ),
+    )
+    with pytest.raises(RunnerConfigurationError, match="unknown"):
+        execute(options, repository=repository, raw_store=raw_store, http_client=client)
+    assert client.calls == []
+
+    plan_path.write_text(original, encoding="utf-8")
+    assert (
+        execute(
+            options, repository=repository, raw_store=raw_store, http_client=client
+        ).exit_code
+        == 0
+    )
+    raw_path = Path(options.raw_manifest_uri.removeprefix("file://"))
+    _reseal_raw_manifest(raw_path, lambda manifest: manifest.__setitem__("attempt", 2))
+    with pytest.raises(RunnerConfigurationError, match="resume raw manifest identity"):
+        execute(
+            options,
+            repository=FakeRepository(),
+            raw_store=raw_store,
+            http_client=client,
         )
 
-        assert rc == 0
-        saved = [c.kwargs["table_name"] for c in scraper.save_to_iceberg.call_args_list]
-        assert saved == ["espn_schedule", "espn_lineup", "espn_matchsheet"]
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert payload["lineup_rows"] == 22
-        assert payload["matchsheet_rows"] == 2
-        assert payload["errors"] == []
 
-    @pytest.mark.unit
-    def test_lineup_error_recorded_but_others_saved(self, temp_output):
-        """A lineup failure is recorded (exit 1) but does NOT abort the run:
-        schedule already saved and matchsheet is still attempted. Exit 3 stays
-        reserved for a schedule-level guard refusal only."""
-        scraper = _build_full_scraper(lineup_raises=True)
+@pytest.mark.unit
+@pytest.mark.parametrize("drift", ["hash", "generation"])
+def test_prior_snapshot_hash_and_generation_drift_are_rejected(tmp_path, drift):
+    competition, edition = _competition()
+    prior = _prior_generation(competition, edition)
+    scope_id = competition.scope_id(edition)
+    options, plan = _plan(
+        tmp_path,
+        "daily",
+        ((competition, edition),),
+        initial_capture=False,
+        priors={scope_id: prior},
+    )
+    prior_path = tmp_path / "prior" / f"{scope_id}.json"
+    if drift == "hash":
+        prior_path.write_bytes(prior_path.read_bytes() + b" ")
+    else:
+        envelope = json.loads(prior_path.read_text())
+        envelope["generation_id"] = "forged-generation"
+        rewritten = (canonical_json(envelope) + "\n").encode()
+        prior_path.write_bytes(rewritten)
 
-        rc = _run_main(
-            ["--leagues", "ENG-Premier League", "--season", "2024",
-             "--output", temp_output],
-            MagicMock(return_value=scraper),
+        def update_binding(document):
+            binding = document["metadata"]["runtime"]["scope_bindings"][scope_id]
+            binding["prior"]["artifact_sha256"] = hashlib.sha256(rewritten).hexdigest()
+
+        _rewrite_signed_plan(options, plan, update_binding)
+    with pytest.raises(RunnerConfigurationError, match="prior .*drift"):
+        execute(
+            options,
+            repository=FakeRepository(),
+            raw_store=EspnRawStore.from_uri(options.raw_store_uri),
         )
 
-        assert rc == 1
-        saved = [c.kwargs["table_name"] for c in scraper.save_to_iceberg.call_args_list]
-        assert "espn_schedule" in saved
-        assert "espn_matchsheet" in saved
-        assert "espn_lineup" not in saved
-        with open(temp_output) as f:
-            payload = json.load(f)
-        assert any("Lineup scraping failed" in e for e in payload["errors"])
 
-    @pytest.mark.unit
-    def test_per_match_saves_use_per_game_replace(self, temp_output):
-        """Incremental runs scrape only NEW games, so lineup/matchsheet saves
-        must delete+insert per (league, season, game) — a whole-partition
-        replace would wipe the already-ingested games the scrape skipped."""
-        scraper = _build_full_scraper()
+@pytest.mark.unit
+def test_final_proven_summary_schema_failure_is_incomplete_while_good_scope_publishes(
+    tmp_path,
+):
+    first, first_edition = _competition(730, "ita.1")
+    second, second_edition = _competition(731, "eng.1")
+    options, _ = _plan(
+        tmp_path,
+        "repair",
+        ((first, first_edition), (second, second_edition)),
+    )
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
 
-        rc = _run_main(
-            ["--leagues", "ENG-Premier League", "--season", "2024",
-             "--output", temp_output],
-            MagicMock(return_value=scraper),
+    def summaries(event_id: int) -> bytes:
+        return _summary(event_id) if event_id == 401000001 else b"{}"
+
+    client = FakeHttpClient(
+        raw_store,
+        {
+            first.slug: _scoreboard(first, first_edition, event_ids=(401000001,)),
+            second.slug: _scoreboard(second, second_edition, event_ids=(401000002,)),
+        },
+        summary_factory=summaries,
+    )
+    repository = FakeRepository()
+    result = execute(
+        options, repository=repository, raw_store=raw_store, http_client=client
+    )
+    assert result.exit_code == 1
+    assert [item.plan.scope_id for item in repository.generations] == [
+        first.scope_id(first_edition)
+    ]
+    by_scope = {item["scope_id"]: item for item in result.payload["scopes"]}
+    assert by_scope[second.scope_id(second_edition)]["state"] == "incomplete"
+
+
+@pytest.mark.unit
+def test_successful_partial_absent_sections_publish_explicit_valid_empty(tmp_path):
+    capabilities = EntityCapabilities(
+        schedule=CapabilityState.PROVEN,
+        lineup=CapabilityState.PARTIAL,
+        matchsheet=CapabilityState.ABSENT,
+    )
+    competition, edition = _competition(capabilities=capabilities)
+    options, _ = _plan(tmp_path, "backfill", ((competition, edition),))
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store,
+        {competition.slug: _scoreboard(competition, edition)},
+        summary_factory=_empty_summary,
+    )
+    repository = FakeRepository()
+    result = execute(
+        options, repository=repository, raw_store=raw_store, http_client=client
+    )
+    assert result.exit_code == 0
+    generation = repository.generations[0]
+    assert generation.lineup == generation.matchsheet == ()
+    assert {(item.endpoint, item.state) for item in generation.dispositions} == {
+        ("lineup", DispositionState.VALID_EMPTY),
+        ("matchsheet", DispositionState.VALID_EMPTY),
+    }
+
+
+@pytest.mark.unit
+def test_each_summary_payload_is_parsed_exactly_once(tmp_path, monkeypatch):
+    import scrapers.espn.runner as runner_module
+
+    competition, edition = _competition()
+    options, _ = _plan(tmp_path, "backfill", ((competition, edition),))
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store, {competition.slug: _scoreboard(competition, edition)}
+    )
+    calls = []
+    original = runner_module.parse_summary
+
+    def counted(*args, **kwargs):
+        calls.append(kwargs["event"].event_id)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "parse_summary", counted)
+    assert (
+        execute(
+            options,
+            repository=FakeRepository(),
+            raw_store=raw_store,
+            http_client=client,
+        ).exit_code
+        == 0
+    )
+    assert calls == [401000001]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["repair", "backfill"])
+def test_repair_and_backfill_always_read_full_edition_for_noninitial_scope(
+    tmp_path, mode
+):
+    competition, edition = _competition()
+    prior = _prior_generation(competition, edition)
+    scope_id = competition.scope_id(edition)
+    options, _ = _plan(
+        tmp_path,
+        mode,
+        ((competition, edition),),
+        initial_capture=False,
+        priors={scope_id: prior},
+    )
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store,
+        {
+            competition.slug: _scoreboard(
+                competition, edition, status="STATUS_SCHEDULED"
+            )
+        },
+    )
+    assert (
+        execute(
+            options,
+            repository=FakeRepository(),
+            raw_store=raw_store,
+            http_client=client,
+        ).exit_code
+        == 0
+    )
+    scoreboard = next(
+        call for call in client.calls if call[1] is EndpointType.SCOREBOARD
+    )
+    assert scoreboard[2]["dates"] == "20200801-20210731"
+
+
+@pytest.mark.unit
+def test_budget_duplicate_scope_and_signed_budget_drift_are_strict(tmp_path):
+    competition, edition = _competition()
+    options, _ = _plan(tmp_path, "backfill", ((competition, edition),))
+    with pytest.raises(ValueError, match="max_events"):
+        replace(options, max_events=101)
+    with pytest.raises(ValueError, match="duplicate"):
+        replace(options, scopes=("730:2020", "730:2020"))
+    drifted = replace(options, max_events=50)
+    with pytest.raises(RunnerConfigurationError, match="max_events"):
+        execute(
+            drifted,
+            repository=FakeRepository(),
+            raw_store=EspnRawStore.from_uri(options.raw_store_uri),
         )
 
-        assert rc == 0
-        by_table = {c.kwargs["table_name"]: c.kwargs
-                    for c in scraper.save_to_iceberg.call_args_list}
-        for table in ("espn_lineup", "espn_matchsheet"):
-            assert by_table[table]["replace_partitions"] == \
-                ["league", "season", "game"]
-        # schedule keeps whole-partition replace (always scraped in full)
-        assert by_table["espn_schedule"]["replace_partitions"] == \
-            ["league", "season"]
 
-    @pytest.mark.unit
-    def test_skip_existing_wired_to_force_replace(self, temp_output):
-        """Default run: read_lineup/read_matchsheet get skip_existing=True
-        (steady-state = new matches only). --force-replace flips it to False
-        for a deliberate full re-scrape."""
-        scraper = _build_full_scraper()
-        _run_main(
-            ["--leagues", "ENG-Premier League", "--season", "2024",
-             "--output", temp_output],
-            MagicMock(return_value=scraper),
+@pytest.mark.unit
+def test_artifact_uri_collisions_fail_preflight_before_publication(tmp_path):
+    competition, edition = _competition()
+    options, plan = _plan(tmp_path, "backfill", ((competition, edition),))
+
+    def collide(document):
+        runtime = document["metadata"]["runtime"]
+        runtime["output_uri"] = runtime["raw_manifest_uri"]
+
+    _rewrite_signed_plan(options, plan, collide)
+    options = replace(options, output_uri=options.raw_manifest_uri)
+    repository = FakeRepository()
+    with pytest.raises(RunnerConfigurationError, match="artifact URI collision"):
+        execute(options, repository=repository)
+    assert repository.generations == []
+
+
+@pytest.mark.unit
+def test_final_to_postponed_refresh_removes_stale_prior_summary_entities(tmp_path):
+    competition, edition = _competition()
+    prior = _prior_generation(competition, edition)
+    scope_id = competition.scope_id(edition)
+    as_of = date(2020, 9, 20)
+    while is_full_reconciliation_day(scope_id, as_of):
+        as_of += timedelta(days=1)
+    options, _ = _plan(
+        tmp_path,
+        "daily",
+        ((competition, edition),),
+        as_of=as_of,
+        initial_capture=False,
+        priors={scope_id: prior},
+    )
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store,
+        {
+            competition.slug: _scoreboard(
+                competition, edition, status="STATUS_POSTPONED"
+            )
+        },
+    )
+    repository = FakeRepository()
+    assert (
+        execute(
+            options, repository=repository, raw_store=raw_store, http_client=client
+        ).exit_code
+        == 0
+    )
+    generation = repository.generations[0]
+    assert generation.lineup == generation.matchsheet == generation.dispositions == ()
+    assert all(item.endpoint != "summary" for item in generation.raw_ledger)
+
+
+@pytest.mark.unit
+def test_existing_snapshot_and_terminal_result_conflicts_fail_same_identity(tmp_path):
+    competition, edition = _competition()
+    options, _ = _plan(tmp_path, "backfill", ((competition, edition),))
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store, {competition.slug: _scoreboard(competition, edition)}
+    )
+    repository = FakeRepository()
+    assert (
+        execute(
+            options, repository=repository, raw_store=raw_store, http_client=client
+        ).exit_code
+        == 0
+    )
+    snapshot_path = tmp_path / "runs" / "run-1" / "attempt-1" / "scope-730:2020.json"
+    snapshot_bytes = snapshot_path.read_bytes()
+    snapshot_path.write_text('{"forged":true}', encoding="utf-8")
+    with pytest.raises(ArtifactConflictError, match="immutable artifact conflict"):
+        execute(
+            options,
+            repository=FakeRepository(),
+            raw_store=raw_store,
+            http_client=FakeHttpClient(raw_store, {competition.slug: b"forbidden"}),
         )
-        assert scraper.read_lineup.call_args.kwargs["skip_existing"] is True
-        assert scraper.read_matchsheet.call_args.kwargs["skip_existing"] is True
 
-        scraper = _build_full_scraper()
-        _run_main(
-            ["--leagues", "ENG-Premier League", "--season", "2024",
-             "--force-replace", "--output", temp_output],
-            MagicMock(return_value=scraper),
-        )
-        assert scraper.read_lineup.call_args.kwargs["skip_existing"] is False
-        assert scraper.read_matchsheet.call_args.kwargs["skip_existing"] is False
-
-    @pytest.mark.unit
-    def test_season_int_converted_to_unambiguous_slug(self, temp_output):
-        """#713: --season 2021 must reach soccerdata as slug '2122' (2021/22).
-        Passing int 2021 directly is read as 2020/21 (20,21 look like a season
-        code), silently scraping the wrong season."""
-        scraper = _build_guard_scraper()
-        cls = MagicMock(return_value=scraper)
-
-        _run_main(
-            ["--leagues", "ENG-Premier League", "--season", "2021",
-             "--output", temp_output],
-            cls,
+    snapshot_path.write_bytes(snapshot_bytes)
+    output_path = Path(options.output_uri.removeprefix("file://"))
+    output_path.write_text('{"state":"complete"}', encoding="utf-8")
+    with pytest.raises(ArtifactConflictError, match="terminal run result conflict"):
+        execute(
+            options,
+            repository=FakeRepository(),
+            raw_store=raw_store,
+            http_client=FakeHttpClient(raw_store, {competition.slug: b"forbidden"}),
         )
 
-        assert cls.call_args.kwargs["seasons"] == ["2122"]
+
+@pytest.mark.unit
+def test_replay_manifest_hash_run_and_attempt_are_exactly_bound(tmp_path):
+    competition, edition = _competition()
+    capture_options, capture_plan = _plan(
+        tmp_path / "capture", "backfill", ((competition, edition),)
+    )
+    raw_store = EspnRawStore.from_uri(capture_options.raw_store_uri)
+    assert (
+        execute(
+            capture_options,
+            repository=FakeRepository(),
+            raw_store=raw_store,
+            http_client=FakeHttpClient(
+                raw_store, {competition.slug: _scoreboard(competition, edition)}
+            ),
+        ).exit_code
+        == 0
+    )
+    raw_path = Path(capture_options.raw_manifest_uri.removeprefix("file://"))
+    original = raw_path.read_bytes()
+    replay_source = {
+        "mode": "backfill",
+        "run_id": capture_options.run_id,
+        "attempt": capture_options.attempt,
+        "plan_signature": capture_plan.signature(),
+        "raw_manifest_sha256": hashlib.sha256(original).hexdigest(),
+    }
+    replay_options, replay_plan = _plan(
+        tmp_path / "replay",
+        "replay",
+        ((competition, edition),),
+        run_id="replay-run",
+        replay_source=replay_source,
+    )
+    replay_options, replay_plan = _bind_replay_to_capture(
+        replay_options, replay_plan, capture_options
+    )
+
+    raw_path.write_bytes(original + b" ")
+    with pytest.raises(RunnerConfigurationError, match="hash mismatch"):
+        execute(replay_options, repository=FakeRepository(), raw_store=raw_store)
+
+    raw_path.write_bytes(original)
+    _reseal_raw_manifest(
+        raw_path,
+        lambda manifest: (
+            manifest.__setitem__("run_id", "wrong-run"),
+            manifest.__setitem__("attempt", 2),
+        ),
+    )
+    drifted_bytes = raw_path.read_bytes()
+
+    def bind_new_hash(document):
+        source = document["metadata"]["runtime"]["replay_source"]
+        source["raw_manifest_sha256"] = hashlib.sha256(drifted_bytes).hexdigest()
+
+    _rewrite_signed_plan(replay_options, replay_plan, bind_new_hash)
+    with pytest.raises(RunnerConfigurationError, match="identity mismatch"):
+        execute(replay_options, repository=FakeRepository(), raw_store=raw_store)
+
+
+@pytest.mark.unit
+def test_native_import_path_never_imports_legacy_scraper_or_soccerdata():
+    code = """
+import builtins
+real_import = builtins.__import__
+def guarded(name, *args, **kwargs):
+    if name == 'scrapers.espn.scraper' or name.startswith('soccerdata'):
+        raise AssertionError(name)
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = guarded
+import scrapers.espn.runner
+import dags.scripts.run_espn_scraper
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[3],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
