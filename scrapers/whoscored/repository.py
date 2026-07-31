@@ -1539,7 +1539,9 @@ class WhoScoredRepository:
             self.writer._trino_manager = trino
         self.catalog = catalog
         self.schema = schema
-        self._published_preview_games: dict[tuple[str, str, int], bool] = {}
+        self._published_preview_datasets_cache: dict[
+            tuple[str, str, int], frozenset[str]
+        ] = {}
 
     @property
     def _manifest(self) -> str:
@@ -4337,31 +4339,47 @@ class WhoScoredRepository:
         )
         return outcome_batch_id
 
-    def _preview_snapshot_published(self, commit: PreviewCommit) -> bool:
-        """Answer whether this game already carries a published preview snapshot.
+    def _published_preview_datasets(self, commit: PreviewCommit) -> frozenset[str]:
+        """Name the datasets this game already publishes with real rows.
 
-        A dataset the source never renders for a game must not block its first
-        snapshot: with nothing published there is nothing to hide.  Once a
-        snapshot exists the zero-row publication really would supersede it, so
-        the refusal stands.
+        Only those can be hidden by a zero-row snapshot.  A dataset the source
+        never renders for the game has nothing to hide — neither on its first
+        snapshot nor on a replay of the very same page, which is what a resumed
+        backfill chunk does.
         """
 
         identity = (commit.league, commit.season, int(commit.game_id))
-        cached = self._published_preview_games.get(identity)
+        cached = self._published_preview_datasets_cache.get(identity)
         if cached is None:
-            if not self.trino.table_exists(self.schema, PREVIEW_MANIFEST_TABLE):
-                cached = False
-            else:
+            cached = frozenset()
+            if self.trino.table_exists(self.schema, PREVIEW_MANIFEST_TABLE):
                 rows = self.trino.execute_query(
-                    f"SELECT COUNT(*) FROM {self._preview_manifest} "
+                    "SELECT dataset_statuses_json, entity_counts_json, "
+                    f"missing_players_count FROM {self._preview_manifest} "
                     f"WHERE league = {_sql_string(commit.league)} "
                     f"AND season = {_sql_string(commit.season)} "
                     f"AND game_id = {int(commit.game_id)} "
-                    "AND state = 'success'"
+                    "AND state = 'success' ORDER BY completed_at DESC LIMIT 1"
                 )
-                cached = bool(rows) and int(rows[0][0]) > 0
-            self._published_preview_games[identity] = cached
+                if rows:
+                    cached = self._preview_datasets_with_rows(rows[0])
+            self._published_preview_datasets_cache[identity] = cached
         return cached
+
+    @staticmethod
+    def _preview_datasets_with_rows(row: Sequence[Any]) -> frozenset[str]:
+        statuses = json.loads(str(row[0])) if row[0] else {}
+        if statuses:
+            return frozenset(
+                str(name)
+                for name, status in statuses.items()
+                if str(status) == "available"
+            )
+        # Snapshots published before dataset statuses existed only carry counts.
+        counts = json.loads(str(row[1])) if row[1] else {}
+        if not counts and row[2] is not None:
+            counts = {"missing_players": int(row[2])}
+        return frozenset(str(name) for name, count in counts.items() if int(count) > 0)
 
     def _prepare_preview_commit(
         self, commit: PreviewCommit
@@ -4421,7 +4439,9 @@ class WhoScoredRepository:
                 raise ValueError(
                     f"preview {commit.game_id}/{name} has invalid status {status!r}"
                 )
-            if status == "not_available" and self._preview_snapshot_published(commit):
+            if status == "not_available" and name in self._published_preview_datasets(
+                commit
+            ):
                 raise ValueError(
                     f"preview {commit.game_id}/{name} is not available; refusing "
                     "to hide the previously published snapshot"
@@ -4690,7 +4710,15 @@ class WhoScoredRepository:
             )
             for row in manifest_frame:
                 identity = (row["league"], row["season"], int(row["game_id"]))
-                self._published_preview_games[identity] = True
+                self._published_preview_datasets_cache[identity] = (
+                    self._preview_datasets_with_rows(
+                        (
+                            row["dataset_statuses_json"],
+                            row["entity_counts_json"],
+                            row["missing_players_count"],
+                        )
+                    )
+                )
         return tuple(commit.batch_id for commit in ordered)
 
     def _prepare_match_commit(

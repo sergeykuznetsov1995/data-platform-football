@@ -1971,7 +1971,9 @@ def test_preview_partial_orphan_fails_closed():
 def test_preview_not_available_dataset_cannot_hide_previous_snapshot():
     trino = MagicMock()
     trino.table_exists.return_value = True
-    trino.execute_query.return_value = [(1,)]
+    trino.execute_query.return_value = [
+        (json.dumps({"preview_lineups": "available"}), None, 0)
+    ]
     repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
     commit = _preview_commit(
         datasets={"preview_lineups": ()},
@@ -1992,7 +1994,7 @@ def test_preview_not_available_dataset_cannot_hide_previous_snapshot():
 def test_preview_not_available_dataset_still_publishes_a_first_snapshot():
     trino = MagicMock()
     trino.table_exists.return_value = True
-    trino.execute_query.return_value = [(0,)]
+    trino.execute_query.return_value = []
     repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
     commit = _preview_commit(
         datasets={"preview_lineups": ()},
@@ -2013,22 +2015,53 @@ def test_preview_not_available_dataset_still_publishes_a_first_snapshot():
 
 
 @pytest.mark.unit
-def test_published_preview_snapshot_re_arms_the_refusal_within_one_process():
+def test_replaying_a_never_rendered_preview_dataset_stays_publishable():
+    # A resumed backfill chunk republishes the very same page.  The previous
+    # snapshot itself carries not_available for that dataset, so nothing can be
+    # hidden and the replay must not fail closed.
     trino = MagicMock()
-    trino.execute_query.side_effect = [
-        [(0,)],  # no published snapshot yet
-        [],  # no successful manifest
-        [],  # no physical rows before commit
-        [],  # zero-row batch is physically complete after commit
+    trino.table_exists.return_value = True
+    trino.execute_query.return_value = [
+        (
+            json.dumps(
+                {"missing_players": "not_available", "preview_lineups": "available"}
+            ),
+            None,
+            0,
+        )
     ]
     repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
-    commit = _preview_commit()
-    commit = replace(commit, dataset_statuses={"missing_players": "not_available"})
+    commit = _preview_commit(datasets={"preview_lineups": ()})
+    commit = replace(
+        commit,
+        dataset_statuses={
+            "missing_players": "not_available",
+            "preview_lineups": "empty",
+        },
+    )
+
+    repository.validate_preview_commit(commit)
+
+
+@pytest.mark.unit
+def test_publishing_rows_re_arms_the_refusal_within_one_process():
+    trino = MagicMock()
+    trino.execute_query.side_effect = [
+        [],  # no successful manifest for this batch
+        [],  # no physical rows before commit
+        [(_preview_commit(rows=({"team": "Home", "player_id": 10},)).batch_id, 1)],
+    ]
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+    commit = _preview_commit(rows=({"team": "Home", "player_id": 10},))
 
     assert repository.commit_previews((commit,)) == (commit.batch_id,)
 
+    # The freshly published snapshot does carry rows, so a later zero-row
+    # commit for the same game would hide it — the refusal must be back on.
+    hollow = replace(commit, dataset_statuses={"missing_players": "not_available"})
+    hollow = replace(hollow, missing_players=())
     with pytest.raises(ValueError, match="not available"):
-        repository.validate_preview_commit(commit)
+        repository.validate_preview_commit(hollow)
 
 
 @pytest.mark.unit
