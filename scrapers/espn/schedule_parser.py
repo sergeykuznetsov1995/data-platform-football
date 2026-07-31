@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
+from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
 from .models import Competition, Edition
@@ -37,32 +38,34 @@ _PLAYED = _Status(True, True, False)
 _NONPLAYED = _Status(True, False, True)
 
 # Explicit and deliberately versioned. New upstream values require review.
-STATUS_MAP: Mapping[str, _Status] = {
-    "STATUS_SCHEDULED": _OPEN,
-    "STATUS_PRE_GAME": _OPEN,
-    "STATUS_IN_PROGRESS": _OPEN,
-    "STATUS_FIRST_HALF": _OPEN,
-    "STATUS_HALFTIME": _OPEN,
-    "STATUS_SECOND_HALF": _OPEN,
-    "STATUS_END_PERIOD": _OPEN,
-    "STATUS_OVERTIME": _OPEN,
-    "STATUS_SHOOTOUT": _OPEN,
-    "STATUS_DELAYED": _OPEN,
-    "STATUS_RAIN_DELAY": _OPEN,
-    "STATUS_FULL_TIME": _PLAYED,
-    "STATUS_FINAL": _PLAYED,
-    "STATUS_FINAL_AET": _PLAYED,
-    "STATUS_FINAL_PEN": _PLAYED,
-    "STATUS_END_OF_REGULATION": _PLAYED,
-    "STATUS_END_OF_EXTRA_TIME": _PLAYED,
-    "STATUS_POSTPONED": _NONPLAYED,
-    "STATUS_CANCELED": _NONPLAYED,
-    "STATUS_CANCELLED": _NONPLAYED,
-    "STATUS_ABANDONED": _NONPLAYED,
-    "STATUS_SUSPENDED": _NONPLAYED,
-    "STATUS_FORFEIT": _NONPLAYED,
-    "STATUS_WALKOVER": _NONPLAYED,
-}
+STATUS_MAP: Mapping[str, _Status] = MappingProxyType(
+    {
+        "STATUS_SCHEDULED": _OPEN,
+        "STATUS_PRE_GAME": _OPEN,
+        "STATUS_IN_PROGRESS": _OPEN,
+        "STATUS_FIRST_HALF": _OPEN,
+        "STATUS_HALFTIME": _OPEN,
+        "STATUS_SECOND_HALF": _OPEN,
+        "STATUS_END_PERIOD": _OPEN,
+        "STATUS_OVERTIME": _OPEN,
+        "STATUS_SHOOTOUT": _OPEN,
+        "STATUS_DELAYED": _OPEN,
+        "STATUS_RAIN_DELAY": _OPEN,
+        "STATUS_FULL_TIME": _PLAYED,
+        "STATUS_FINAL": _PLAYED,
+        "STATUS_FINAL_AET": _PLAYED,
+        "STATUS_FINAL_PEN": _PLAYED,
+        "STATUS_END_OF_REGULATION": _PLAYED,
+        "STATUS_END_OF_EXTRA_TIME": _PLAYED,
+        "STATUS_POSTPONED": _OPEN,
+        "STATUS_CANCELED": _NONPLAYED,
+        "STATUS_CANCELLED": _NONPLAYED,
+        "STATUS_ABANDONED": _NONPLAYED,
+        "STATUS_SUSPENDED": _OPEN,
+        "STATUS_FORFEIT": _NONPLAYED,
+        "STATUS_WALKOVER": _NONPLAYED,
+    }
+)
 
 
 def _validate_scope(competition: Competition, edition: Edition) -> None:
@@ -79,6 +82,32 @@ def _legacy(competition: Competition, edition: Edition) -> tuple[str, str]:
     return competition.legacy.league, aliases[0] if aliases else str(
         edition.source_season_year
     )
+
+
+def _scoreboard_league(
+    payload: Mapping[str, Any], competition: Competition
+) -> Mapping[str, Any]:
+    leagues = required_list(payload.get("leagues"), "scoreboard.leagues")
+    matching: list[Mapping[str, Any]] = []
+    for index, value in enumerate(leagues):
+        league = required_mapping(value, f"scoreboard.leagues[{index}]")
+        league_id = native_id(league.get("id"), f"scoreboard.leagues[{index}].id")
+        if league_id != competition.espn_id:
+            continue
+        if "slug" in league and league["slug"] is not None:
+            slug = required_string(league["slug"], f"scoreboard.leagues[{index}].slug")
+            if slug != competition.slug:
+                raise EspnParseError(
+                    f"scoreboard promoted league slug {slug!r} does not match "
+                    f"registry slug {competition.slug!r}"
+                )
+        matching.append(league)
+    if len(matching) != 1:
+        raise EspnParseError(
+            "scoreboard must contain exactly one promoted league matching "
+            f"competition {competition.espn_id}:{competition.slug}"
+        )
+    return matching[0]
 
 
 def _calendar_ranges(item: Any, field: str) -> list[tuple[date, date]]:
@@ -104,18 +133,8 @@ def parse_scoreboard_calendar(
 ) -> tuple[date, ...]:
     _validate_scope(competition, edition)
     payload = decode_object(raw, "scoreboard")
-    leagues = required_list(payload.get("leagues"), "scoreboard.leagues")
-    matching: list[Mapping[str, Any]] = []
-    for index, value in enumerate(leagues):
-        league = required_mapping(value, f"scoreboard.leagues[{index}]")
-        if (
-            native_id(league.get("id"), f"scoreboard.leagues[{index}].id")
-            == competition.espn_id
-        ):
-            matching.append(league)
-    if len(matching) != 1:
-        raise EspnParseError("scoreboard must contain exactly one promoted league")
-    calendar = required_list(matching[0].get("calendar"), "scoreboard league calendar")
+    league = _scoreboard_league(payload, competition)
+    calendar = required_list(league.get("calendar"), "scoreboard league calendar")
     days: set[date] = set()
     for index, item in enumerate(calendar):
         for start, end in _calendar_ranges(item, f"scoreboard calendar[{index}]"):
@@ -146,6 +165,7 @@ def _event_row(
     edition: Edition,
     query_start: date,
     query_end: date,
+    source_extra: Mapping[str, Any],
 ) -> ScheduleRow | None:
     event = required_mapping(event_raw, "scoreboard event")
     event_id = native_id(event.get("id"), "scoreboard event.id")
@@ -263,6 +283,15 @@ def _event_row(
             }
     if side_extras:
         extras["sides"] = side_extras
+    if "venue" in event_competition and event_competition["venue"] is not None:
+        raw_venue = required_mapping(
+            event_competition["venue"], f"event[{event_id}].competition.venue"
+        )
+        venue_extra = unknown_fields(raw_venue, ("id", "fullName"))
+        if venue_extra:
+            extras["venue"] = venue_extra
+    if source_extra:
+        extras["source"] = dict(source_extra)
     return ScheduleRow(
         scope_id=competition.scope_id(edition),
         competition_id=competition.espn_id,
@@ -284,7 +313,8 @@ def _event_row(
         away_score=away[2],
         venue_id=venue_id,
         venue=venue_name,
-        attendance=attendance,
+        attendance=str(attendance) if attendance is not None else None,
+        attendance_value=attendance,
         league=league,
         season=legacy_season,
         game=game,
@@ -292,8 +322,8 @@ def _event_row(
         league_id=competition.slug,
         date=kickoff,
         match_date=kickoff,
-        home_goals=home[2],
-        away_goals=away[2],
+        home_goals=str(home[2]) if home[2] is not None else None,
+        away_goals=str(away[2]) if away[2] is not None else None,
         parser_version=PARSER_VERSION,
         extra_json=canonical_json(extras),
     )
@@ -318,6 +348,14 @@ def parse_scoreboards(
     by_event: dict[int, ScheduleRow] = {}
     for payload_index, raw in enumerate(payloads):
         document = decode_object(raw, f"scoreboard[{payload_index}]")
+        league = _scoreboard_league(document, competition)
+        source_extra: dict[str, Any] = {}
+        root_extra = unknown_fields(document, ("events", "leagues"))
+        league_extra = unknown_fields(league, ("id", "slug", "calendar"))
+        if root_extra:
+            source_extra["scoreboard"] = root_extra
+        if league_extra:
+            source_extra["league"] = league_extra
         events = required_list(
             document.get("events"), f"scoreboard[{payload_index}].events"
         )
@@ -328,6 +366,7 @@ def parse_scoreboards(
                 edition=edition,
                 query_start=query_start,
                 query_end=query_end,
+                source_extra=source_extra,
             )
             if row is None:
                 continue

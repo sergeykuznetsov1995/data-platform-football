@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import re
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from .models import CapabilityState, Competition, Edition
@@ -22,11 +24,75 @@ from .parser_common import (
 )
 from .parser_contracts import (
     EntityParseState,
+    LINEUP_STAT_MAP_VERSION,
     LineupRow,
+    MATCHSHEET_STAT_MAP_VERSION,
     MatchsheetRow,
     PARSER_VERSION,
     ScheduleRow,
     SummaryParseResult,
+)
+
+
+LINEUP_STAT_NAME_MAP: Mapping[str, str] = MappingProxyType(
+    {
+        "appearances": "appearances",
+        "foulsCommitted": "fouls_committed",
+        "foulsSuffered": "fouls_suffered",
+        "goalAssists": "goal_assists",
+        "goalsConceded": "goals_conceded",
+        "offsides": "offsides",
+        "ownGoals": "own_goals",
+        "redCards": "red_cards",
+        "saves": "saves",
+        "shotsFaced": "shots_faced",
+        "shotsOnTarget": "shots_on_target",
+        "subIns": "sub_ins",
+        "totalGoals": "total_goals",
+        "totalShots": "total_shots",
+        "yellowCards": "yellow_cards",
+    }
+)
+
+MATCHSHEET_STAT_NAME_MAP: Mapping[str, str] = MappingProxyType(
+    {
+        "accurateCrosses": "accurate_crosses",
+        "accurateLongBalls": "accurate_long_balls",
+        "accuratePasses": "accurate_passes",
+        "blockedShots": "blocked_shots",
+        "crossPct": "cross_pct",
+        "effectiveClearance": "effective_clearance",
+        "effectiveTackles": "effective_tackles",
+        "foulsCommitted": "fouls_committed",
+        "fouls": "fouls_committed",
+        "goalAssists": "goal_assists",
+        "goalDifference": "goal_difference",
+        "goalsConceded": "goals_conceded",
+        "interceptions": "interceptions",
+        "longballPct": "longball_pct",
+        "offsides": "offsides",
+        "passPct": "pass_pct",
+        "penaltyKickGoals": "penalty_kick_goals",
+        "penaltyKickShots": "penalty_kick_shots",
+        "possessionPct": "possession_pct",
+        "possession": "possession_pct",
+        "redCards": "red_cards",
+        "saves": "saves",
+        "shotPct": "shot_pct",
+        "shotsOnTarget": "shots_on_target",
+        "tacklePct": "tackle_pct",
+        "totalClearance": "total_clearance",
+        "totalCrosses": "total_crosses",
+        "totalGoals": "total_goals",
+        "totalLongBalls": "total_long_balls",
+        "totalPasses": "total_passes",
+        "shots": "total_shots",
+        "totalShots": "total_shots",
+        "totalTackles": "total_tackles",
+        "wonCorners": "won_corners",
+        "cornerKicks": "won_corners",
+        "yellowCards": "yellow_cards",
+    }
 )
 
 
@@ -166,7 +232,7 @@ def _legacy_substitutions(
     starter: bool | None,
     subbed_in: bool | None,
     subbed_out: bool | None,
-) -> tuple[str | int | None, str | int | None]:
+) -> tuple[str | None, str | None]:
     events: list[Mapping[str, Any]] = []
     for key in ("subbedIn", "subbedOut"):
         value = player.get(key)
@@ -184,16 +250,16 @@ def _legacy_substitutions(
         if (minute := _substitution_minute(event, f"{field}.substitution[{index}]"))
         is not None
     ]
-    sub_in: str | int | None
+    sub_in: str | None
     if starter is True:
         sub_in = "start"
     elif subbed_in is True:
-        sub_in = minutes[0] if minutes else None
+        sub_in = str(minutes[0]) if minutes else None
     else:
         sub_in = None
     if subbed_out is True:
         minute_index = 1 if subbed_in is True and len(minutes) > 1 else 0
-        sub_out = minutes[minute_index] if minutes else None
+        sub_out = str(minutes[minute_index]) if minutes else None
     elif (starter is True or subbed_in is True) and subbed_out is False:
         sub_out = "end"
     else:
@@ -203,12 +269,22 @@ def _legacy_substitutions(
 
 def _parse_game_info(
     payload: Mapping[str, Any], event: ScheduleRow
-) -> tuple[int | None, str | None, int | None, int | None, str | None, dict[str, Any]]:
+) -> tuple[
+    int | None,
+    str | None,
+    int | None,
+    str | None,
+    int | None,
+    str | None,
+    dict[str, Any],
+]:
     if "gameInfo" not in payload or payload["gameInfo"] is None:
-        return None, None, None, None, None, {}
+        return None, None, None, None, None, None, {}
     info = required_mapping(payload["gameInfo"], "summary.gameInfo")
     venue_id: int | None = None
     venue_name: str | None = None
+    capacity: str | None = None
+    venue_extra: dict[str, Any] = {}
     if "venue" in info and info["venue"] is not None:
         venue = required_mapping(info["venue"], "summary.gameInfo.venue")
         if "id" in venue and venue["id"] is not None:
@@ -216,6 +292,11 @@ def _parse_game_info(
         venue_name = optional_string(
             venue.get("fullName"), "summary.gameInfo.venue.fullName"
         )
+        capacity_value = optional_nonnegative_int(
+            venue.get("capacity"), "summary.gameInfo.venue.capacity"
+        )
+        capacity = str(capacity_value) if capacity_value is not None else None
+        venue_extra = unknown_fields(venue, ("id", "fullName"))
         if (
             event.venue_id is not None
             and venue_id is not None
@@ -227,6 +308,7 @@ def _parse_game_info(
     )
     referee_id: int | None = None
     referee_name: str | None = None
+    official_extras: list[dict[str, Any]] = []
     if "officials" in info:
         officials = required_list(info["officials"], "summary.gameInfo.officials")
         referees: list[Mapping[str, Any]] = []
@@ -244,6 +326,17 @@ def _parse_game_info(
                 "MATCH REFEREE",
             }:
                 referees.append(official)
+            official_extra = unknown_fields(official, ("id", "fullName", "position"))
+            position_extra = unknown_fields(position, ("name", "displayName"))
+            if official_extra or position_extra:
+                official_extras.append(
+                    {
+                        **official_extra,
+                        **({"position": position_extra} if position_extra else {}),
+                    }
+                )
+            else:
+                official_extras.append({})
         if len(referees) > 1:
             raise EspnParseError("Summary contains multiple primary referees")
         if referees:
@@ -253,14 +346,43 @@ def _parse_game_info(
             referee_name = required_string(
                 referee.get("fullName"), "summary referee.fullName"
             )
+    extra = unknown_fields(info, ("venue", "attendance", "officials"))
+    if venue_extra:
+        extra["venue"] = venue_extra
+    if any(official_extras):
+        extra["officials"] = official_extras
     return (
         venue_id,
         venue_name,
         attendance,
+        capacity,
         referee_id,
         referee_name,
-        unknown_fields(info, ("venue", "attendance", "officials")),
+        extra,
     )
+
+
+def _lineup_stat_values(statistics: Any, field: str) -> dict[str, float]:
+    if isinstance(statistics, Mapping):
+        return {}
+    rows = required_list(statistics, field)
+    values: dict[str, float] = {}
+    for index, raw_stat in enumerate(rows):
+        stat = required_mapping(raw_stat, f"{field}[{index}]")
+        name = required_string(stat.get("name"), f"{field}[{index}].name")
+        target = LINEUP_STAT_NAME_MAP.get(name)
+        if target is None:
+            continue
+        value = stat.get("value")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise EspnParseError(f"{field}[{index}].value must be numeric")
+        normalized = float(value)
+        if not math.isfinite(normalized):
+            raise EspnParseError(f"{field}[{index}].value must be finite")
+        if target in values:
+            raise EspnParseError(f"{field} maps duplicate statistic {target!r}")
+        values[target] = normalized
+    return values
 
 
 def _lineup(
@@ -363,6 +485,7 @@ def _lineup(
                 statistics = player.get("stats", player.get("statistics", []))
             if not isinstance(statistics, (list, Mapping)):
                 raise EspnParseError(f"{field}.statistics must be an array or object")
+            legacy_stats = _lineup_stat_values(statistics, f"{field}.statistics")
             substitution_fields = {
                 key: value
                 for key, value in player.items()
@@ -417,8 +540,24 @@ def _lineup(
                 subbed_out=subbed_out,
                 sub_in=sub_in,
                 sub_out=sub_out,
+                appearances=legacy_stats.get("appearances"),
+                fouls_committed=legacy_stats.get("fouls_committed"),
+                fouls_suffered=legacy_stats.get("fouls_suffered"),
+                goal_assists=legacy_stats.get("goal_assists"),
+                goals_conceded=legacy_stats.get("goals_conceded"),
+                offsides=legacy_stats.get("offsides"),
+                own_goals=legacy_stats.get("own_goals"),
+                red_cards=legacy_stats.get("red_cards"),
+                saves=legacy_stats.get("saves"),
+                shots_faced=legacy_stats.get("shots_faced"),
+                shots_on_target=legacy_stats.get("shots_on_target"),
+                sub_ins=legacy_stats.get("sub_ins"),
+                total_goals=legacy_stats.get("total_goals"),
+                total_shots=legacy_stats.get("total_shots"),
+                yellow_cards=legacy_stats.get("yellow_cards"),
                 substitutions_json=canonical_json(substitution_fields),
                 statistics_json=canonical_json(statistics),
+                stat_map_version=LINEUP_STAT_MAP_VERSION,
                 league=event.league,
                 season=event.season,
                 game=event.game,
@@ -429,18 +568,53 @@ def _lineup(
             team_rows.append(row)
         per_team_rows[team_id] = team_rows
 
-    # Apply XI cardinality only when the response actually supplies a conventional
-    # full roster with explicit starter flags for both sides.
-    conventional = all(
-        len(team_rows) >= 11 and all(row.starter is not None for row in team_rows)
+    explicit_starter_semantics = any(
+        row.starter is not None
         for team_rows in per_team_rows.values()
+        for row in team_rows
     )
-    if conventional:
-        for team_id, team_rows in per_team_rows.items():
-            if sum(row.starter is True for row in team_rows) != 11:
-                raise EspnParseError(
-                    f"conventional lineup team {team_id} must have 11 starters"
+    if explicit_starter_semantics:
+        if any(
+            row.starter is None
+            for team_rows in per_team_rows.values()
+            for row in team_rows
+        ):
+            raise EspnParseError(
+                "explicit starter semantics require a starter flag for every athlete"
+            )
+        starter_counts = {
+            team_id: sum(row.starter is True for row in team_rows)
+            for team_id, team_rows in per_team_rows.items()
+        }
+        counts = tuple(starter_counts.values())
+        conventional_xi = all(count == 11 for count in counts)
+        small_sided_size: int | None = None
+        if "format" in payload:
+            match_format = required_mapping(payload["format"], "summary.format")
+            configured_size = match_format.get("startersPerTeam")
+            if configured_size is None and "regulation" in match_format:
+                regulation = required_mapping(
+                    match_format["regulation"], "summary.format.regulation"
                 )
+                configured_size = regulation.get("startersPerTeam")
+            if configured_size is not None:
+                if type(configured_size) is not int or not 1 <= configured_size <= 7:
+                    raise EspnParseError(
+                        "summary.format.startersPerTeam must be an integer from 1 to 7"
+                    )
+                small_sided_size = configured_size
+        # Non-XI tolerance requires explicit source format evidence. Counts 8-10
+        # are always treated as truncated conventional XIs.
+        balanced_small_sided = (
+            small_sided_size is not None
+            and len(set(counts)) == 1
+            and counts[0] == small_sided_size
+        )
+        if not conventional_xi and not balanced_small_sided:
+            raise EspnParseError(
+                "explicit conventional lineup must contain 11 starters per team; "
+                f"got {starter_counts}"
+            )
     return (
         tuple(
             sorted(
@@ -452,14 +626,39 @@ def _lineup(
     )
 
 
-def _stat_values(statistics: list[Any], field: str) -> dict[str, Any]:
-    values: dict[str, Any] = {}
+_NUMERIC_DISPLAY_RE = re.compile(r"[+-]?\d+(?:\.\d+)?%?")
+
+
+def _stat_scalar(stat: Mapping[str, Any], field: str) -> str:
+    value = stat.get("value")
+    if value is None:
+        value = stat.get("displayValue")
+    if isinstance(value, bool) or isinstance(value, (list, Mapping)) or value is None:
+        raise EspnParseError(f"{field}.value must be a supported scalar value")
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise EspnParseError(f"{field}.value must be finite")
+        return str(value)
+    if isinstance(value, str):
+        display = value.strip()
+        if not display or _NUMERIC_DISPLAY_RE.fullmatch(display) is None:
+            raise EspnParseError(f"{field}.value must be a numeric display scalar")
+        return display
+    raise EspnParseError(f"{field}.value must be a supported scalar value")
+
+
+def _stat_values(statistics: list[Any], field: str) -> dict[str, str]:
+    values: dict[str, str] = {}
     for index, raw_stat in enumerate(statistics):
         stat = required_mapping(raw_stat, f"{field}[{index}]")
         name = required_string(stat.get("name"), f"{field}[{index}].name")
-        if name in values:
-            raise EspnParseError(f"{field} contains duplicate statistic {name!r}")
-        values[name] = stat.get("value", stat.get("displayValue"))
+        target = MATCHSHEET_STAT_NAME_MAP.get(name)
+        scalar = _stat_scalar(stat, f"{field}[{index}]")
+        if target is None:
+            continue
+        if target in values:
+            raise EspnParseError(f"{field} maps duplicate statistic {target!r}")
+        values[target] = scalar
     return values
 
 
@@ -471,7 +670,13 @@ def _matchsheet(
     event: ScheduleRow,
     by_team: Mapping[int, tuple[str, str]],
     game_info: tuple[
-        int | None, str | None, int | None, int | None, str | None, dict[str, Any]
+        int | None,
+        str | None,
+        int | None,
+        str | None,
+        int | None,
+        str | None,
+        dict[str, Any],
     ],
 ) -> tuple[tuple[MatchsheetRow, ...], EntityParseState]:
     capability = edition.capabilities.matchsheet
@@ -494,7 +699,23 @@ def _matchsheet(
     if set(blocks) != set(by_team):
         raise EspnParseError("Summary matchsheet must contain both event teams")
 
-    venue_id, venue_name, attendance, referee_id, referee_name, _ = game_info
+    venue_id, venue_name, attendance, capacity, referee_id, referee_name, _ = game_info
+    roster_by_team: dict[int, str] = {}
+    if "rosters" in payload:
+        rosters = required_list(payload["rosters"], "summary.rosters")
+        for index, raw_roster in enumerate(rosters):
+            roster_team_id, _, _, roster_block = _team_block(
+                raw_roster, f"summary.rosters[{index}]", by_team
+            )
+            if roster_team_id in roster_by_team:
+                raise EspnParseError("Summary rosters contain a duplicate team ID")
+            if "roster" in roster_block:
+                roster_by_team[roster_team_id] = canonical_json(
+                    required_list(
+                        roster_block["roster"],
+                        f"summary.rosters[{index}].roster",
+                    )
+                )
     score_by_team = {
         event.home_team_id: event.home_score,
         event.away_team_id: event.away_score,
@@ -510,7 +731,7 @@ def _matchsheet(
             statistics, f"summary.boxscore.teams[{team_id}].statistics"
         )
         if not set(values).intersection(
-            {"shots", "totalShots", "shotsOnTarget", "possessionPct", "possession"}
+            {"total_shots", "shots_on_target", "possession_pct"}
         ):
             raise EspnParseError(
                 "Summary matchsheet team must contain a recognized core statistic"
@@ -529,16 +750,43 @@ def _matchsheet(
                 home_away=side,
                 is_home=side == "home",
                 score=score_by_team[team_id],
-                total_shots=values.get("shots", values.get("totalShots")),
-                shots_on_target=values.get("shotsOnTarget"),
-                possession_pct=values.get("possessionPct", values.get("possession")),
-                fouls_committed=values.get("foulsCommitted", values.get("fouls")),
-                yellow_cards=values.get("yellowCards"),
-                red_cards=values.get("redCards"),
+                accurate_crosses=values.get("accurate_crosses"),
+                accurate_long_balls=values.get("accurate_long_balls"),
+                accurate_passes=values.get("accurate_passes"),
+                blocked_shots=values.get("blocked_shots"),
+                capacity=capacity,
+                cross_pct=values.get("cross_pct"),
+                effective_clearance=values.get("effective_clearance"),
+                effective_tackles=values.get("effective_tackles"),
+                fouls_committed=values.get("fouls_committed"),
+                goal_assists=values.get("goal_assists"),
+                goal_difference=values.get("goal_difference"),
+                goals_conceded=values.get("goals_conceded"),
+                interceptions=values.get("interceptions"),
+                longball_pct=values.get("longball_pct"),
                 offsides=values.get("offsides"),
-                corner_kicks=values.get("wonCorners", values.get("cornerKicks")),
+                pass_pct=values.get("pass_pct"),
+                penalty_kick_goals=values.get("penalty_kick_goals"),
+                penalty_kick_shots=values.get("penalty_kick_shots"),
+                possession_pct=values.get("possession_pct"),
+                red_cards=values.get("red_cards"),
+                roster=roster_by_team.get(team_id),
                 saves=values.get("saves"),
+                shot_pct=values.get("shot_pct"),
+                shots_on_target=values.get("shots_on_target"),
+                tackle_pct=values.get("tackle_pct"),
+                total_clearance=values.get("total_clearance"),
+                total_crosses=values.get("total_crosses"),
+                total_goals=values.get("total_goals"),
+                total_long_balls=values.get("total_long_balls"),
+                total_passes=values.get("total_passes"),
+                total_shots=values.get("total_shots"),
+                total_tackles=values.get("total_tackles"),
+                won_corners=values.get("won_corners"),
+                yellow_cards=values.get("yellow_cards"),
+                corner_kicks=values.get("won_corners"),
                 statistics_json=canonical_json(statistics),
+                stat_map_version=MATCHSHEET_STAT_MAP_VERSION,
                 venue_id=venue_id,
                 venue=venue_name,
                 attendance=attendance,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import fields
 from datetime import date, timezone
 import json
 from pathlib import Path
@@ -116,6 +117,17 @@ def test_catalog_facade_accepts_raw_bytes_only_and_retains_native_identity() -> 
 
 
 @pytest.mark.unit
+def test_dropdown_raw_bytes_facade_accepts_the_html_contract_from_discovery() -> None:
+    html = b"""<html><script>window['__espnfitt__']={"navigation":{"leagueTeams":{"groups":[{"name":"Europe","columns":[{"teams":[{"n":"Serie A","id":"730","lk":[{"u":"/soccer/league/_/name/ita.1"}]}]}]}]}}};</script></html>"""
+
+    rows = parse_soccer_dropdown_bytes(html)
+
+    assert [(row.espn_id, row.slug, row.name) for row in rows] == [
+        (730, "ita.1", "Serie A")
+    ]
+
+
+@pytest.mark.unit
 def test_schedule_normalizes_native_ids_status_scores_and_legacy_fields() -> None:
     _, _, rows = _schedule()
 
@@ -127,7 +139,13 @@ def test_schedule_normalizes_native_ids_status_scores_and_legacy_fields() -> Non
     assert row.kickoff.tzinfo is timezone.utc
     assert row.status == "STATUS_FULL_TIME"
     assert row.terminal and row.played_final and not row.terminal_nonplayed
-    assert (row.venue_id, row.venue, row.attendance) == (99, "Native Ground", 1000)
+    assert (row.venue_id, row.venue, row.attendance_value) == (
+        99,
+        "Native Ground",
+        1000,
+    )
+    assert row.attendance == "1000"
+    assert (row.home_goals, row.away_goals) == ("2", "1")
     assert (row.league, row.season, row.game_id) == (
         "LEG-Test",
         "2020",
@@ -145,7 +163,8 @@ def test_schedule_normalizes_native_ids_status_scores_and_legacy_fields() -> Non
         ("STATUS_SCHEDULED", False, False, False),
         ("STATUS_IN_PROGRESS", False, False, False),
         ("STATUS_FULL_TIME", True, True, False),
-        ("STATUS_POSTPONED", True, False, True),
+        ("STATUS_POSTPONED", False, False, False),
+        ("STATUS_SUSPENDED", False, False, False),
         ("STATUS_CANCELED", True, False, True),
     ],
 )
@@ -170,6 +189,26 @@ def test_versioned_status_map_separates_final_from_terminal_nonplayed(
 
 
 @pytest.mark.unit
+def test_postponed_native_event_can_transition_to_rescheduled_final() -> None:
+    postponed = _load("native_scoreboard.json")
+    postponed_event = postponed["events"][0]
+    postponed_event["status"]["type"]["name"] = "STATUS_POSTPONED"
+    for side in postponed_event["competitions"][0]["competitors"]:
+        side.pop("score")
+    _, _, postponed_rows = _schedule(postponed)
+
+    final = _load("native_scoreboard.json")
+    final["events"][0]["date"] = "2020-10-19T18:45Z"
+    _, _, final_rows = _schedule(final)
+
+    assert postponed_rows[0].event_id == final_rows[0].event_id
+    assert not postponed_rows[0].terminal
+    assert not postponed_rows[0].terminal_nonplayed
+    assert final_rows[0].terminal
+    assert final_rows[0].played_final
+
+
+@pytest.mark.unit
 def test_unknown_status_and_required_schema_drift_fail_closed() -> None:
     payload = _load("native_scoreboard.json")
     payload["events"][0]["status"]["type"]["name"] = "STATUS_NEW_FROM_UPSTREAM"
@@ -189,6 +228,36 @@ def test_unknown_status_and_required_schema_drift_fail_closed() -> None:
             query_start=date(2020, 8, 1),
             query_end=date(2021, 7, 31),
         )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("leagues", "message"),
+    [
+        (None, "scoreboard.leagues"),
+        ("drift", "scoreboard.leagues"),
+        ([{"id": "740", "slug": "esp.1"}], "promoted league"),
+        (
+            [
+                {"id": "730", "slug": "ita.1"},
+                {"id": "730", "slug": "ita.1"},
+            ],
+            "exactly one promoted league",
+        ),
+        ([{"id": "730", "slug": "wrong.slug"}], "slug"),
+    ],
+)
+def test_every_scoreboard_document_is_bound_to_one_promoted_root_league(
+    leagues: object, message: str
+) -> None:
+    payload = _load("native_scoreboard.json")
+    if leagues is None:
+        payload.pop("leagues")
+    else:
+        payload["leagues"] = leagues
+
+    with pytest.raises(EspnParseError, match=message):
+        _schedule(payload)
 
 
 @pytest.mark.unit
@@ -339,8 +408,8 @@ def test_summary_is_parsed_once_and_joins_reordered_sections_by_native_team_id()
     assert result.lineup[0].is_home
     assert result.lineup[0].position == "Midfielder"
     assert result.lineup[0].formation_place == "7"
-    assert result.lineup[0].sub_in == "start"
-    assert result.lineup[0].sub_out == "end"
+    assert result.lineup[0].sub_in is None
+    assert result.lineup[0].sub_out is None
     assert result.lineup[0].statistics_json.startswith("[")
     assert result.matchsheet[0].venue_id == 99
     assert result.matchsheet[0].is_home
@@ -367,6 +436,45 @@ def test_summary_missing_optionals_still_normalizes_rows() -> None:
     assert all(
         row.venue_id is None and row.referee_id is None for row in result.matchsheet
     )
+
+
+@pytest.mark.unit
+def test_consumed_nested_optionals_are_retained_in_canonical_extra_json() -> None:
+    scoreboard = _load("native_scoreboard.json")
+    scoreboard["events"][0]["competitions"][0]["venue"].update(
+        {"capacity": 42000, "address": {"city": "Rome", "country": "IT"}}
+    )
+    scoreboard["events"][0]["competitions"][0]["competitors"][0]["team"]["color"] = (
+        "112233"
+    )
+    competition, edition, schedule = _schedule(scoreboard)
+    schedule_extra = json.loads(schedule[0].extra_json)
+
+    summary = _load("native_summary.json")
+    summary["gameInfo"]["venue"].update(
+        {"capacity": 42000, "address": {"country": "IT", "city": "Rome"}}
+    )
+    summary["gameInfo"]["officials"][0].update(
+        {"order": 1, "position": {"name": "REFEREE", "rank": 3}}
+    )
+    result = parse_summary(
+        _raw(summary), competition=competition, edition=edition, event=schedule[0]
+    )
+    summary_extra = json.loads(result.extra_json)
+
+    assert schedule_extra["venue"] == {
+        "address": {"city": "Rome", "country": "IT"},
+        "capacity": 42000,
+    }
+    assert schedule_extra["sides"]["home"]["team"]["color"] == "112233"
+    assert schedule_extra["source"]["league"]["sourceOptional"] == {"a": 1, "z": 2}
+    assert summary_extra["gameInfo"]["venue"] == {
+        "address": {"city": "Rome", "country": "IT"},
+        "capacity": 42000,
+    }
+    assert summary_extra["gameInfo"]["officials"][0]["order"] == 1
+    assert summary_extra["gameInfo"]["officials"][0]["position"] == {"rank": 3}
+    assert '"address":{"city":"Rome","country":"IT"}' in result.extra_json
 
 
 @pytest.mark.unit
@@ -449,6 +557,7 @@ def test_conventional_xi_requires_22_unique_starters() -> None:
         roster["roster"] = []
         for offset in range(1, 12):
             player = deepcopy(seed)
+            player["starter"] = True
             player["athlete"]["id"] = str(base_id + offset)
             player["athlete"]["displayName"] = f"Player {base_id + offset}"
             roster["roster"].append(player)
@@ -463,3 +572,183 @@ def test_conventional_xi_requires_22_unique_starters() -> None:
         parse_summary(
             _raw(payload), competition=competition, edition=edition, event=schedule[0]
         )
+
+    asymmetric = _load("native_summary.json")
+    for roster in asymmetric["rosters"]:
+        seed = roster["roster"][0]
+        base_id = 100 if roster["homeAway"] == "home" else 200
+        roster["roster"] = []
+        count = 11 if roster["homeAway"] == "home" else 10
+        for offset in range(1, count + 1):
+            player = deepcopy(seed)
+            player["starter"] = True
+            player["athlete"]["id"] = str(base_id + offset)
+            roster["roster"].append(player)
+    with pytest.raises(EspnParseError, match="starter|conventional"):
+        parse_summary(
+            _raw(asymmetric),
+            competition=competition,
+            edition=edition,
+            event=schedule[0],
+        )
+
+
+@pytest.mark.unit
+def test_balanced_small_sided_explicit_lineup_is_genuinely_non_conventional() -> None:
+    competition, edition, schedule = _schedule()
+    payload = _load("native_summary.json")
+    payload["format"] = {"startersPerTeam": 5}
+    for roster in payload["rosters"]:
+        seed = roster["roster"][0]
+        base_id = 100 if roster["homeAway"] == "home" else 200
+        roster["roster"] = []
+        for offset in range(1, 6):
+            player = deepcopy(seed)
+            player["starter"] = True
+            player["athlete"]["id"] = str(base_id + offset)
+            roster["roster"].append(player)
+
+    result = parse_summary(
+        _raw(payload), competition=competition, edition=edition, event=schedule[0]
+    )
+
+    assert sum(row.starter is True for row in result.lineup) == 10
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad_value", [None, True, [12], {"value": 12}, "twelve"])
+def test_matchsheet_rejects_malformed_stat_values(bad_value: object) -> None:
+    competition, edition, schedule = _schedule()
+    payload = _load("native_summary.json")
+    payload["boxscore"]["teams"][0]["statistics"][0]["value"] = bad_value
+
+    with pytest.raises(EspnParseError, match="statistic.*value|scalar"):
+        parse_summary(
+            _raw(payload), competition=competition, edition=edition, event=schedule[0]
+        )
+
+
+@pytest.mark.unit
+def test_matchsheet_uses_numeric_display_value_when_value_is_null() -> None:
+    competition, edition, schedule = _schedule()
+    payload = _load("native_summary.json")
+    for team in payload["boxscore"]["teams"]:
+        team["statistics"] = [{"name": "shots", "value": None, "displayValue": "12"}]
+
+    result = parse_summary(
+        _raw(payload), competition=competition, edition=edition, event=schedule[0]
+    )
+
+    assert [row.total_shots for row in result.matchsheet] == ["12", "12"]
+
+
+@pytest.mark.unit
+def test_parser_rows_explicitly_cover_every_existing_legacy_bronze_column() -> None:
+    schema = json.loads(
+        (
+            Path(__file__).resolve().parents[2] / "fixtures" / "bronze_schemas.json"
+        ).read_text()
+    )["tables"]
+    metadata = {"_batch_id", "_entity_type", "_ingested_at", "_source"}
+    from scrapers.espn.parser_contracts import LineupRow, MatchsheetRow, ScheduleRow
+
+    actual = {
+        "bronze.espn_schedule": {field.name for field in fields(ScheduleRow)},
+        "bronze.espn_lineup": {field.name for field in fields(LineupRow)},
+        "bronze.espn_matchsheet": {field.name for field in fields(MatchsheetRow)},
+    }
+    for table, row_fields in actual.items():
+        expected = set(schema[table]["columns"]) - metadata
+        assert expected <= row_fields, (
+            f"{table} missing {sorted(expected - row_fields)}"
+        )
+
+
+@pytest.mark.unit
+def test_versioned_stat_name_maps_populate_full_legacy_surfaces() -> None:
+    from scrapers.espn.parser_contracts import (
+        LINEUP_STAT_MAP_VERSION,
+        MATCHSHEET_STAT_MAP_VERSION,
+    )
+
+    competition, edition, schedule = _schedule()
+    payload = _load("native_summary.json")
+    lineup_names = {
+        "appearances": "appearances",
+        "foulsCommitted": "fouls_committed",
+        "foulsSuffered": "fouls_suffered",
+        "goalAssists": "goal_assists",
+        "goalsConceded": "goals_conceded",
+        "offsides": "offsides",
+        "ownGoals": "own_goals",
+        "redCards": "red_cards",
+        "saves": "saves",
+        "shotsFaced": "shots_faced",
+        "shotsOnTarget": "shots_on_target",
+        "subIns": "sub_ins",
+        "totalGoals": "total_goals",
+        "totalShots": "total_shots",
+        "yellowCards": "yellow_cards",
+    }
+    matchsheet_names = {
+        "accurateCrosses": "accurate_crosses",
+        "accurateLongBalls": "accurate_long_balls",
+        "accuratePasses": "accurate_passes",
+        "blockedShots": "blocked_shots",
+        "crossPct": "cross_pct",
+        "effectiveClearance": "effective_clearance",
+        "effectiveTackles": "effective_tackles",
+        "foulsCommitted": "fouls_committed",
+        "goalAssists": "goal_assists",
+        "goalDifference": "goal_difference",
+        "goalsConceded": "goals_conceded",
+        "interceptions": "interceptions",
+        "longballPct": "longball_pct",
+        "offsides": "offsides",
+        "passPct": "pass_pct",
+        "penaltyKickGoals": "penalty_kick_goals",
+        "penaltyKickShots": "penalty_kick_shots",
+        "possessionPct": "possession_pct",
+        "redCards": "red_cards",
+        "saves": "saves",
+        "shotPct": "shot_pct",
+        "shotsOnTarget": "shots_on_target",
+        "tacklePct": "tackle_pct",
+        "totalClearance": "total_clearance",
+        "totalCrosses": "total_crosses",
+        "totalGoals": "total_goals",
+        "totalLongBalls": "total_long_balls",
+        "totalPasses": "total_passes",
+        "totalShots": "total_shots",
+        "totalTackles": "total_tackles",
+        "wonCorners": "won_corners",
+        "yellowCards": "yellow_cards",
+    }
+    for roster in payload["rosters"]:
+        roster["roster"][0]["stats"] = [
+            {"name": name, "value": index + 0.5}
+            for index, name in enumerate(lineup_names)
+        ]
+        roster["roster"][0].pop("statistics", None)
+    for team in payload["boxscore"]["teams"]:
+        team["statistics"] = [
+            {"name": name, "value": index + 1}
+            for index, name in enumerate(matchsheet_names)
+        ]
+
+    result = parse_summary(
+        _raw(payload), competition=competition, edition=edition, event=schedule[0]
+    )
+
+    lineup = result.lineup[0]
+    matchsheet = result.matchsheet[0]
+    assert LINEUP_STAT_MAP_VERSION == "espn-lineup-stat-map-v1"
+    assert MATCHSHEET_STAT_MAP_VERSION == "espn-matchsheet-stat-map-v1"
+    assert all(
+        isinstance(getattr(lineup, target), float) for target in lineup_names.values()
+    )
+    assert all(
+        isinstance(getattr(matchsheet, target), str)
+        for target in matchsheet_names.values()
+    )
+    assert matchsheet.won_corners == "31"

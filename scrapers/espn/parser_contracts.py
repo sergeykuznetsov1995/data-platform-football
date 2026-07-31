@@ -5,11 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Any
 
-
-PARSER_VERSION = "espn-native-parser-v1"
-STATUS_MAP_VERSION = "espn-status-v1"
+PARSER_VERSION = "espn-native-parser-v2"
+STATUS_MAP_VERSION = "espn-status-v2"
+LINEUP_STAT_MAP_VERSION = "espn-lineup-stat-map-v1"
+MATCHSHEET_STAT_MAP_VERSION = "espn-matchsheet-stat-map-v1"
 
 
 class EntityParseState(str, Enum):
@@ -39,7 +39,8 @@ class ScheduleRow:
     away_score: int | None
     venue_id: int | None
     venue: str | None
-    attendance: int | None
+    attendance: str | None
+    attendance_value: int | None
     league: str
     season: str
     game: str
@@ -47,8 +48,8 @@ class ScheduleRow:
     league_id: str
     date: datetime
     match_date: datetime
-    home_goals: int | None
-    away_goals: int | None
+    home_goals: str | None
+    away_goals: str | None
     parser_version: str
     extra_json: str
 
@@ -72,10 +73,26 @@ class LineupRow:
     captain: bool | None
     subbed_in: bool | None
     subbed_out: bool | None
-    sub_in: str | int | None
-    sub_out: str | int | None
+    sub_in: str | None
+    sub_out: str | None
+    appearances: float | None
+    fouls_committed: float | None
+    fouls_suffered: float | None
+    goal_assists: float | None
+    goals_conceded: float | None
+    offsides: float | None
+    own_goals: float | None
+    red_cards: float | None
+    saves: float | None
+    shots_faced: float | None
+    shots_on_target: float | None
+    sub_ins: float | None
+    total_goals: float | None
+    total_shots: float | None
+    yellow_cards: float | None
     substitutions_json: str
     statistics_json: str
+    stat_map_version: str
     league: str
     season: str
     game: str
@@ -94,16 +111,43 @@ class MatchsheetRow:
     home_away: str
     is_home: bool
     score: int | None
-    total_shots: Any
-    shots_on_target: Any
-    possession_pct: Any
-    fouls_committed: Any
-    yellow_cards: Any
-    red_cards: Any
-    offsides: Any
-    corner_kicks: Any
-    saves: Any
+    accurate_crosses: str | None
+    accurate_long_balls: str | None
+    accurate_passes: str | None
+    blocked_shots: str | None
+    capacity: str | None
+    cross_pct: str | None
+    effective_clearance: str | None
+    effective_tackles: str | None
+    fouls_committed: str | None
+    goal_assists: str | None
+    goal_difference: str | None
+    goals_conceded: str | None
+    interceptions: str | None
+    longball_pct: str | None
+    offsides: str | None
+    pass_pct: str | None
+    penalty_kick_goals: str | None
+    penalty_kick_shots: str | None
+    possession_pct: str | None
+    red_cards: str | None
+    roster: str | None
+    saves: str | None
+    shot_pct: str | None
+    shots_on_target: str | None
+    tackle_pct: str | None
+    total_clearance: str | None
+    total_crosses: str | None
+    total_goals: str | None
+    total_long_balls: str | None
+    total_passes: str | None
+    total_shots: str | None
+    total_tackles: str | None
+    won_corners: str | None
+    yellow_cards: str | None
+    corner_kicks: str | None
     statistics_json: str
+    stat_map_version: str
     venue_id: int | None
     venue: str | None
     attendance: int | None
