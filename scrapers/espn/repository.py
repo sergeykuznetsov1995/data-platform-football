@@ -45,6 +45,15 @@ _CUTOVER_ANCESTRY_COLUMNS = (
     ("ancestor_cutover_sha256_json", "varchar"),
     ("ancestor_lineage_sha256", "varchar"),
 )
+_CUTOVER_GRAPH_COLUMNS = (
+    "cutover_id",
+    "scope_id",
+    "cutover_sha256",
+    "predecessor_cutover_id",
+    "predecessor_cutover_sha256",
+    "ancestor_cutover_sha256_json",
+    "ancestor_lineage_sha256",
+)
 ENTITY_TABLES = MappingProxyType(
     {
         "schedule": "espn_schedule_generation_v2",
@@ -222,17 +231,185 @@ def _stored_cutover_ancestry(
         raise PublicationError("stored cutover ancestry JSON is invalid") from exc
     if not isinstance(decoded, list):
         raise PublicationError("stored cutover ancestry must be a JSON array")
-    ancestors = tuple(
-        _sha256(value, "stored ancestor cutover SHA-256") for value in decoded
-    )
+    try:
+        ancestors = tuple(
+            _sha256(value, "stored ancestor cutover SHA-256") for value in decoded
+        )
+    except ValueError as exc:
+        raise PublicationError(
+            "stored cutover ancestry contains an invalid SHA-256"
+        ) from exc
     if len(set(ancestors)) != len(ancestors):
         raise PublicationError("stored cutover ancestry contains a cycle")
     if canonical_json(ancestors) != raw_json:
         raise PublicationError("stored cutover ancestry is not canonical")
-    lineage_sha256 = _sha256(raw_lineage_sha256, "stored ancestor lineage SHA-256")
+    try:
+        lineage_sha256 = _sha256(raw_lineage_sha256, "stored ancestor lineage SHA-256")
+    except ValueError as exc:
+        raise PublicationError("stored cutover ancestry hash is invalid") from exc
     if lineage_sha256 != canonical_sha256(ancestors):
         raise PublicationError("stored cutover ancestry hash does not match")
     return ancestors
+
+
+@dataclass(frozen=True, slots=True)
+class _StoredCutoverGraphNode:
+    cutover_id: str
+    scope_id: str
+    cutover_sha256: str
+    predecessor_cutover_id: str | None
+    predecessor_cutover_sha256: str | None
+    ancestor_cutover_sha256s: tuple[str, ...]
+
+
+def _stored_cutover_graph_node(raw: object) -> _StoredCutoverGraphNode:
+    if isinstance(raw, Mapping):
+        values = tuple(raw.get(column) for column in _CUTOVER_GRAPH_COLUMNS)
+    elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        values = tuple(raw)
+    else:
+        raise PublicationError(
+            "cutover ancestry migration graph row must be a mapping or sequence"
+        )
+    if len(values) != len(_CUTOVER_GRAPH_COLUMNS):
+        raise PublicationError(
+            "cutover ancestry migration graph row has an unexpected column count"
+        )
+    (
+        raw_cutover_id,
+        raw_scope_id,
+        raw_cutover_sha256,
+        raw_predecessor_id,
+        raw_predecessor_sha256,
+        raw_ancestry_json,
+        raw_lineage_sha256,
+    ) = values
+    try:
+        cutover_id = _required_string(raw_cutover_id, "stored cutover_id")
+        cutover_sha256 = _sha256(raw_cutover_sha256, "stored cutover_sha256")
+    except ValueError as exc:
+        raise PublicationError(
+            "cutover ancestry migration graph identity is malformed"
+        ) from exc
+    if type(raw_scope_id) is not str or _SCOPE_RE.fullmatch(raw_scope_id) is None:
+        raise PublicationError(
+            f"cutover ancestry migration graph scope is invalid for {cutover_id!r}"
+        )
+    predecessor_values = (raw_predecessor_id, raw_predecessor_sha256)
+    if any(value is not None for value in predecessor_values) and not all(
+        value is not None for value in predecessor_values
+    ):
+        raise PublicationError(
+            f"cutover ancestry migration predecessor pair is incomplete for {cutover_id!r}"
+        )
+    predecessor_id: str | None = None
+    predecessor_sha256: str | None = None
+    if raw_predecessor_id is not None:
+        try:
+            predecessor_id = _required_string(
+                raw_predecessor_id, "stored predecessor_cutover_id"
+            )
+            predecessor_sha256 = _sha256(
+                raw_predecessor_sha256, "stored predecessor_cutover_sha256"
+            )
+        except ValueError as exc:
+            raise PublicationError(
+                f"cutover ancestry migration predecessor is malformed for {cutover_id!r}"
+            ) from exc
+    try:
+        ancestors = _stored_cutover_ancestry(raw_ancestry_json, raw_lineage_sha256)
+    except PublicationError as exc:
+        raise PublicationError(
+            f"cutover ancestry migration validation failed for {cutover_id!r}: {exc}"
+        ) from exc
+    if predecessor_sha256 is None:
+        if ancestors:
+            raise PublicationError(
+                f"cutover ancestry migration root {cutover_id!r} must have empty ancestry"
+            )
+    elif not ancestors or ancestors[-1] != predecessor_sha256:
+        raise PublicationError(
+            f"cutover ancestry migration child {cutover_id!r} must end with its predecessor hash"
+        )
+    return _StoredCutoverGraphNode(
+        cutover_id=cutover_id,
+        scope_id=raw_scope_id,
+        cutover_sha256=cutover_sha256,
+        predecessor_cutover_id=predecessor_id,
+        predecessor_cutover_sha256=predecessor_sha256,
+        ancestor_cutover_sha256s=ancestors,
+    )
+
+
+def _validate_stored_cutover_graph(rows: Sequence[object]) -> None:
+    """Validate the complete logical control graph before replacing views.
+
+    The startup query projects only graph fields and applies DISTINCT, so this
+    uses linear memory in logical cutovers rather than physical retry rows.
+    """
+
+    nodes = {_stored_cutover_graph_node(raw) for raw in rows}
+    by_id: dict[str, _StoredCutoverGraphNode] = {}
+    by_hash: dict[str, _StoredCutoverGraphNode] = {}
+    by_identity: dict[tuple[str, str, str], _StoredCutoverGraphNode] = {}
+    global_identities: set[tuple[str, str]] = set()
+    for node in nodes:
+        previous_id = by_id.setdefault(node.cutover_id, node)
+        if previous_id != node:
+            raise PublicationError(
+                f"cutover ancestry migration found conflicting cutover_id {node.cutover_id!r}"
+            )
+        previous_hash = by_hash.setdefault(node.cutover_sha256, node)
+        if previous_hash != node:
+            raise PublicationError(
+                "cutover ancestry migration found one hash bound to conflicting nodes"
+            )
+        by_identity[(node.scope_id, node.cutover_id, node.cutover_sha256)] = node
+        global_identities.add((node.cutover_id, node.cutover_sha256))
+
+    children: dict[_StoredCutoverGraphNode, set[_StoredCutoverGraphNode]] = {}
+    roots: set[_StoredCutoverGraphNode] = set()
+    for node in nodes:
+        if node.predecessor_cutover_id is None:
+            roots.add(node)
+            continue
+        identity = (
+            node.scope_id,
+            node.predecessor_cutover_id,
+            node.predecessor_cutover_sha256,
+        )
+        predecessor = by_identity.get(identity)
+        if predecessor is None:
+            same_global_identity = (
+                node.predecessor_cutover_id,
+                node.predecessor_cutover_sha256,
+            ) in global_identities
+            kind = "cross-scope" if same_global_identity else "missing or ambiguous"
+            raise PublicationError(
+                f"cutover ancestry migration has {kind} predecessor for {node.cutover_id!r}"
+            )
+        expected_ancestry = (
+            *predecessor.ancestor_cutover_sha256s,
+            predecessor.cutover_sha256,
+        )
+        if node.ancestor_cutover_sha256s != expected_ancestry:
+            raise PublicationError(
+                f"cutover ancestry migration child {node.cutover_id!r} does not extend its predecessor"
+            )
+        children.setdefault(predecessor, set()).add(node)
+
+    reachable = set(roots)
+    pending = list(roots)
+    while pending:
+        predecessor = pending.pop()
+        for child in children.get(predecessor, set()):
+            if child not in reachable:
+                reachable.add(child)
+                pending.append(child)
+    if reachable != nodes:
+        raise PublicationError(
+            "cutover ancestry migration graph contains a cyclic or unreachable node"
+        )
 
 
 def _freeze_json(value: Any, field_name: str) -> Any:
@@ -1411,7 +1588,9 @@ class EspnBronzeRepository:
     distributed caller must still hold the source/scope lease while appending
     catalog snapshots or cutovers: Iceberg append has no uniqueness primitive.
     Cutover predecessor hashes make a raced fork durable and current views
-    suppress it instead of choosing a branch.
+    suppress it instead of choosing a branch. Direct writes to the cutover
+    table are outside the supported contract: every transition must use
+    :meth:`append_cutover` under that lease.
     """
 
     manifest_columns = MANIFEST_COLUMNS
@@ -1467,16 +1646,13 @@ class EspnBronzeRepository:
                 f"ALTER TABLE {qualified_cutover} ADD COLUMN IF NOT EXISTS "
                 f'"{column}" {column_type}'
             )
-        legacy_cutovers = self._execute(
-            f'SELECT "cutover_id" /* cutover_ancestry_rollout_gate */ '
-            f"FROM {qualified_cutover} "
-            'WHERE "ancestor_cutover_sha256_json" IS NULL '
-            'OR "ancestor_lineage_sha256" IS NULL LIMIT 1'
+        graph_projection = ", ".join(f'"{column}"' for column in _CUTOVER_GRAPH_COLUMNS)
+        stored_cutover_graph = self._execute(
+            f"SELECT DISTINCT {graph_projection} "
+            "/* cutover_ancestry_rollout_gate */ "
+            f"FROM {qualified_cutover}"
         )
-        if legacy_cutovers:
-            raise PublicationError(
-                "cutover ancestry migration is required before creating current views"
-            )
+        _validate_stored_cutover_graph(stored_cutover_graph)
         for entity in _ENTITIES:
             self._execute(
                 render_current_view_sql(
@@ -2400,8 +2576,12 @@ validated_complete AS (
         FROM {catalog}.{schema}.{CUTOVER_TABLE} c
     ) parsed
     WHERE parsed.ancestor_cutover_sha256s IS NOT NULL
+      AND json_format(CAST(parsed.ancestor_cutover_sha256s AS JSON))
+          = parsed.ancestor_cutover_sha256_json
       AND lower(to_hex(sha256(to_utf8(parsed.ancestor_cutover_sha256_json))))
           = parsed.ancestor_lineage_sha256
+      AND regexp_like(parsed.cutover_sha256, '^[0-9a-f]{{64}}$')
+      AND regexp_like(parsed.ancestor_lineage_sha256, '^[0-9a-f]{{64}}$')
       AND all_match(
           parsed.ancestor_cutover_sha256s,
           ancestor -> regexp_like(ancestor, '^[0-9a-f]{{64}}$')
@@ -2417,11 +2597,31 @@ validated_complete AS (
           OR (
               parsed.predecessor_cutover_id IS NOT NULL
               AND parsed.predecessor_cutover_sha256 IS NOT NULL
+              AND regexp_like(
+                  parsed.predecessor_cutover_sha256,
+                  '^[0-9a-f]{{64}}$'
+              )
               AND cardinality(parsed.ancestor_cutover_sha256s) > 0
               AND element_at(parsed.ancestor_cutover_sha256s, -1)
                   = parsed.predecessor_cutover_sha256
           )
       )
+), lineage_valid_cutovers AS (
+    SELECT child.*
+    FROM cutover_records child
+    WHERE (
+        child.predecessor_cutover_id IS NULL
+        AND child.predecessor_cutover_sha256 IS NULL
+        AND cardinality(child.ancestor_cutover_sha256s) = 0
+    ) OR EXISTS (
+        SELECT 1
+        FROM cutover_records parent
+        WHERE parent.scope_id = child.scope_id
+          AND parent.cutover_id = child.predecessor_cutover_id
+          AND parent.cutover_sha256 = child.predecessor_cutover_sha256
+          AND child.ancestor_cutover_sha256s =
+              CONCAT(parent.ancestor_cutover_sha256s, ARRAY[parent.cutover_sha256])
+    )
 ), conflicting_cutover_ids AS (
     SELECT cutover_id
     FROM {catalog}.{schema}.{CUTOVER_TABLE}
@@ -2445,7 +2645,7 @@ validated_complete AS (
      AND fork.predecessor_cutover_sha256 IS NOT DISTINCT FROM c.predecessor_cutover_sha256
 ), eligible_cutovers AS (
     SELECT c.*
-    FROM cutover_records c
+    FROM lineage_valid_cutovers c
     WHERE NOT EXISTS (
         SELECT 1
         FROM bad_cutover_hashes bad

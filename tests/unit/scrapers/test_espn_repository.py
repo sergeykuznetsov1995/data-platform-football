@@ -301,6 +301,33 @@ class RepositoryStateQuery(FakeQuery):
         return super().execute_query(sql, params=params)
 
 
+CUTOVER_GRAPH_COLUMNS = (
+    "cutover_id",
+    "scope_id",
+    "cutover_sha256",
+    "predecessor_cutover_id",
+    "predecessor_cutover_sha256",
+    "ancestor_cutover_sha256_json",
+    "ancestor_lineage_sha256",
+)
+
+
+class CutoverGraphQuery(FakeQuery):
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = list(rows)
+
+    def execute_query(self, sql, params=None):
+        if "cutover_ancestry_rollout_gate" in sql:
+            self.calls.append((sql, params))
+            if 'WHERE "ancestor_cutover_sha256_json" IS NULL' in sql:
+                return [row for row in self.rows if row[5] is None or row[6] is None][
+                    :1
+                ]
+            return list(self.rows)
+        return super().execute_query(sql, params=params)
+
+
 @pytest.mark.unit
 def test_ddl_and_views_have_append_only_contract_and_full_join_identity():
     ddl = render_repository_ddl()
@@ -1404,6 +1431,251 @@ def _native_cutover(generation: ScopeGeneration, **changes):
     return repository_module.ScopeCutover(**values)
 
 
+def _rollback_cutover(parent, *, cutover_id="rollback-graph-a"):
+    return repository_module.ScopeCutover(
+        **{
+            **parent.constructor_values(),
+            "cutover_id": cutover_id,
+            "active_source": "legacy",
+            "previous_source": "native",
+            "predecessor_cutover_id": parent.cutover_id,
+            "predecessor_cutover_sha256": parent.cutover_sha256,
+            "effective_at": datetime(2026, 7, 31, 11, tzinfo=UTC),
+            "native_generation_id": None,
+            "native_generation_signature": None,
+            "native_manifest_sha256": None,
+            "rollback_run_id": f"{cutover_id}-run",
+            "rollback_reason": "graph validation",
+            "ancestor_cutover_sha256s": (
+                *parent.ancestor_cutover_sha256s,
+                parent.cutover_sha256,
+            ),
+        }
+    )
+
+
+def _cutover_graph_chain(generation):
+    parent = _native_cutover(generation)
+    branch = _rollback_cutover(parent)
+    child = _native_cutover(
+        generation,
+        cutover_id="native-graph-c",
+        predecessor_cutover_id=branch.cutover_id,
+        predecessor_cutover_sha256=branch.cutover_sha256,
+        effective_at=datetime(2026, 7, 31, 12, tzinfo=UTC),
+        ancestor_cutover_sha256s=(
+            parent.cutover_sha256,
+            branch.cutover_sha256,
+        ),
+    )
+    return parent, branch, child
+
+
+def _cutover_graph_row(cutover, **changes):
+    row = cutover.to_row()
+    row.update(changes)
+    return tuple(row[column] for column in CUTOVER_GRAPH_COLUMNS)
+
+
+def _assert_cutover_graph_rejected_before_views(rows, match):
+    query = CutoverGraphQuery(rows)
+    repository = EspnBronzeRepository(writer=FakeWriter(), query=query)
+
+    with pytest.raises(PublicationError, match=match):
+        repository.ensure_objects()
+    assert not any(sql.startswith("CREATE OR REPLACE VIEW") for sql, _ in query.calls)
+
+
+@pytest.mark.unit
+def test_ensure_objects_accepts_complete_cutover_graph_and_exact_duplicates():
+    parent, branch, child = _cutover_graph_chain(_generation())
+    sibling = _rollback_cutover(parent, cutover_id="rollback-graph-b")
+    branch_row = _cutover_graph_row(branch)
+    query = CutoverGraphQuery(
+        (
+            _cutover_graph_row(parent),
+            branch_row,
+            branch_row,
+            _cutover_graph_row(sibling),
+            _cutover_graph_row(child),
+        )
+    )
+    repository = EspnBronzeRepository(writer=FakeWriter(), query=query)
+
+    repository.ensure_objects()
+
+    assert sum(
+        sql.startswith("CREATE OR REPLACE VIEW") for sql, _ in query.calls
+    ) == len(ENTITY_TABLES)
+
+
+@pytest.mark.unit
+def test_ensure_objects_rejects_truncated_cutover_ancestry_before_views():
+    parent, branch, child = _cutover_graph_chain(_generation())
+    truncated = (branch.cutover_sha256,)
+    _assert_cutover_graph_rejected_before_views(
+        (
+            _cutover_graph_row(parent),
+            _cutover_graph_row(branch),
+            _cutover_graph_row(
+                child,
+                ancestor_cutover_sha256_json=canonical_json(truncated),
+                ancestor_lineage_sha256=repository_module.canonical_sha256(truncated),
+            ),
+        ),
+        "extend",
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "malformation",
+    (
+        "invalid_json",
+        "noncanonical_json",
+        "uppercase_sha",
+        "uppercase_cutover_sha",
+        "duplicate_ancestor",
+        "incomplete_predecessor",
+    ),
+)
+def test_ensure_objects_rejects_nonnull_malformed_cutover_ancestry_before_views(
+    malformation,
+):
+    parent, branch, _ = _cutover_graph_chain(_generation())
+    changes = {}
+    if malformation == "invalid_json":
+        changes["ancestor_cutover_sha256_json"] = "[not-json]"
+    elif malformation == "noncanonical_json":
+        changes["ancestor_cutover_sha256_json"] = f'[ "{parent.cutover_sha256}" ]'
+    elif malformation == "uppercase_sha":
+        ancestors = (parent.cutover_sha256.upper(),)
+        changes.update(
+            ancestor_cutover_sha256_json=canonical_json(ancestors),
+            ancestor_lineage_sha256=repository_module.canonical_sha256(ancestors),
+        )
+    elif malformation == "uppercase_cutover_sha":
+        changes["cutover_sha256"] = branch.cutover_sha256.upper()
+    elif malformation == "duplicate_ancestor":
+        ancestors = (parent.cutover_sha256, parent.cutover_sha256)
+        changes.update(
+            ancestor_cutover_sha256_json=canonical_json(ancestors),
+            ancestor_lineage_sha256=repository_module.canonical_sha256(ancestors),
+        )
+    else:
+        changes["predecessor_cutover_id"] = None
+    _assert_cutover_graph_rejected_before_views(
+        (_cutover_graph_row(parent), _cutover_graph_row(branch, **changes)),
+        "ancestry migration",
+    )
+
+
+@pytest.mark.unit
+def test_ensure_objects_rejects_cutover_ancestry_hash_mismatch_before_views():
+    parent, branch, _ = _cutover_graph_chain(_generation())
+    _assert_cutover_graph_rejected_before_views(
+        (
+            _cutover_graph_row(parent),
+            _cutover_graph_row(branch, ancestor_lineage_sha256="0" * 64),
+        ),
+        "hash",
+    )
+
+
+@pytest.mark.unit
+def test_ensure_objects_rejects_missing_and_cross_scope_cutover_predecessors():
+    parent, branch, child = _cutover_graph_chain(_generation())
+    _assert_cutover_graph_rejected_before_views(
+        (_cutover_graph_row(parent), _cutover_graph_row(child)),
+        "predecessor",
+    )
+    _assert_cutover_graph_rejected_before_views(
+        (
+            _cutover_graph_row(parent),
+            _cutover_graph_row(branch, scope_id="740:2020"),
+        ),
+        "scope",
+    )
+
+
+@pytest.mark.unit
+def test_ensure_objects_rejects_conflicting_and_cyclic_cutover_nodes():
+    parent, branch, _ = _cutover_graph_chain(_generation())
+    conflicting_hash = "e" * 64
+    _assert_cutover_graph_rejected_before_views(
+        (
+            _cutover_graph_row(parent),
+            _cutover_graph_row(branch),
+            _cutover_graph_row(branch, cutover_sha256=conflicting_hash),
+        ),
+        "conflicting",
+    )
+    ambiguous_ancestors = ("d" * 64, parent.cutover_sha256)
+    _assert_cutover_graph_rejected_before_views(
+        (
+            _cutover_graph_row(parent),
+            _cutover_graph_row(branch),
+            _cutover_graph_row(
+                branch,
+                ancestor_cutover_sha256_json=canonical_json(ambiguous_ancestors),
+                ancestor_lineage_sha256=repository_module.canonical_sha256(
+                    ambiguous_ancestors
+                ),
+            ),
+        ),
+        "conflicting",
+    )
+    _assert_cutover_graph_rejected_before_views(
+        (
+            _cutover_graph_row(parent),
+            _cutover_graph_row(branch),
+            _cutover_graph_row(branch, cutover_id="hash-alias"),
+        ),
+        "hash bound to conflicting",
+    )
+
+    cyclic_hash = "9" * 64
+    cyclic = (
+        "cyclic-cutover",
+        parent.scope_id,
+        cyclic_hash,
+        "cyclic-cutover",
+        cyclic_hash,
+        canonical_json((cyclic_hash,)),
+        repository_module.canonical_sha256((cyclic_hash,)),
+    )
+    _assert_cutover_graph_rejected_before_views((cyclic,), "extend|cyclic")
+
+
+@pytest.mark.unit
+def test_ensure_objects_rejects_invalid_stored_root_and_child_shapes():
+    parent, branch, _ = _cutover_graph_chain(_generation())
+    root_ancestors = ("f" * 64,)
+    _assert_cutover_graph_rejected_before_views(
+        (
+            _cutover_graph_row(
+                parent,
+                ancestor_cutover_sha256_json=canonical_json(root_ancestors),
+                ancestor_lineage_sha256=repository_module.canonical_sha256(
+                    root_ancestors
+                ),
+            ),
+        ),
+        "root",
+    )
+    _assert_cutover_graph_rejected_before_views(
+        (
+            _cutover_graph_row(parent),
+            _cutover_graph_row(
+                branch,
+                ancestor_cutover_sha256_json=canonical_json(()),
+                ancestor_lineage_sha256=repository_module.canonical_sha256(()),
+            ),
+        ),
+        "child",
+    )
+
+
 @pytest.mark.unit
 def test_cutover_contract_persists_canonical_immutable_ancestor_lineage():
     generation = _generation()
@@ -1553,37 +1825,67 @@ def test_current_view_excludes_forks_conflicting_ids_and_all_descendants():
     assert "eligible_cutovers AS" in sql
     assert "ancestor_cutover_sha256s" in sql
     assert "CONTAINS(c.ancestor_cutover_sha256s, bad.cutover_sha256)" in sql
+    assert "lineage_valid_cutovers AS" in sql
+    assert "FROM lineage_valid_cutovers c" in sql
     assert "FROM eligible_cutovers c" in sql
+    assert "parent.scope_id = child.scope_id" in sql
+    assert "parent.cutover_id = child.predecessor_cutover_id" in sql
+    assert "parent.cutover_sha256 = child.predecessor_cutover_sha256" in sql
+    assert (
+        "CONCAT(parent.ancestor_cutover_sha256s, ARRAY[parent.cutover_sha256])" in sql
+    )
+    assert "json_format(CAST(parsed.ancestor_cutover_sha256s AS JSON))" in sql
     assert "cardinality(array_distinct(parsed.ancestor_cutover_sha256s))" in sql
 
     p, a, b, c, q, x1, x2, d = (digit * 64 for digit in "12345678")
+    malformed_d = "9" * 64
     records = (
-        ("scope-1", "P", p, None, ()),
-        ("scope-1", "P", p, None, ()),  # exact duplicate, not a fork
-        ("scope-1", "A", a, p, (p,)),
-        ("scope-1", "B", b, p, (p,)),  # direct sibling fork
-        ("scope-1", "C", c, a, (p, a)),  # descendant of fork A
-        ("scope-2", "Q", q, None, ()),
-        ("scope-2", "X", x1, q, (q,)),
-        ("scope-2", "X", x2, q, (q,)),  # conflicting immutable ID
-        ("scope-2", "D", d, x1, (q, x1)),  # conflicting-ID descendant
+        ("scope-1", "P", p, None, None, ()),
+        ("scope-1", "P", p, None, None, ()),  # exact duplicate, not a fork
+        ("scope-1", "A", a, "P", p, (p,)),
+        ("scope-1", "B", b, "P", p, (p,)),  # direct sibling fork
+        ("scope-1", "C", c, "A", a, (p, a)),  # descendant of fork A
+        ("scope-1", "D", malformed_d, "C", c, (c,)),  # truncated lineage
+        ("scope-2", "Q", q, None, None, ()),
+        ("scope-2", "X", x1, "Q", q, (q,)),
+        ("scope-2", "X", x2, "Q", q, (q,)),  # conflicting immutable ID
+        ("scope-2", "E", d, "X", x1, (q, x1)),  # conflict descendant
     )
     id_hashes: dict[str, set[str]] = {}
     slot_hashes: dict[tuple[str, str | None], set[str]] = {}
-    for scope_id, cutover_id, cutover_hash, predecessor, _ in records:
+    for scope_id, cutover_id, cutover_hash, _, predecessor, _ in records:
         id_hashes.setdefault(cutover_id, set()).add(cutover_hash)
         slot_hashes.setdefault((scope_id, predecessor), set()).add(cutover_hash)
     bad_hashes = {
         cutover_hash
-        for scope_id, cutover_id, cutover_hash, predecessor, _ in records
+        for scope_id, cutover_id, cutover_hash, _, predecessor, _ in records
         if len(id_hashes[cutover_id]) > 1
         or len(slot_hashes[(scope_id, predecessor)]) > 1
     }
+    lineage_valid = {
+        cutover_hash
+        for scope_id, _, cutover_hash, predecessor_id, predecessor_hash, ancestors in records
+        if (predecessor_id is None and predecessor_hash is None and not ancestors)
+        or len(
+            {
+                parent
+                for parent in records
+                if parent[0] == scope_id
+                and parent[1] == predecessor_id
+                and parent[2] == predecessor_hash
+                and ancestors == (*parent[5], parent[2])
+            }
+        )
+        == 1
+    }
     eligible = {
         cutover_hash
-        for _, _, cutover_hash, _, ancestors in records
-        if cutover_hash not in bad_hashes and not bad_hashes.intersection(ancestors)
+        for _, _, cutover_hash, _, _, ancestors in records
+        if cutover_hash in lineage_valid
+        and cutover_hash not in bad_hashes
+        and not bad_hashes.intersection(ancestors)
     }
+    assert malformed_d not in lineage_valid
     assert eligible == {p, q}
 
 
