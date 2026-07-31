@@ -222,17 +222,15 @@ def test_required_source_gate_waits_for_all_ingestion_and_blocks_transforms():
     expected_ingestion = {
         "ingestion_triggers.trigger_fotmob",
         "ingestion_triggers.trigger_matchhistory",
-        "ingestion_triggers.trigger_espn",
         "ingestion_triggers.trigger_clubelo",
     }
     assert expected_ingestion <= gate.upstream_task_ids
+    assert "ingestion_triggers.trigger_espn" not in gate.upstream_task_ids
     assert "wait_for_scheduled_understat" in gate.upstream_task_ids
     assert "wait_for_scheduled_whoscored" in gate.upstream_task_ids
     assert "ingestion_triggers.trigger_whoscored" not in gate.upstream_task_ids
     assert "ingestion_triggers.trigger_fbref" not in gate.upstream_task_ids
-    assert (
-        "ingestion_triggers.trigger_sofascore" not in gate.upstream_task_ids
-    )
+    assert "ingestion_triggers.trigger_sofascore" not in gate.upstream_task_ids
     assert gate._init_kwargs["trigger_rule"] == "all_done"
     assert fbref_sensor.upstream_task_ids == set()
     assert gate.task_id in fotmob_sensor.upstream_task_ids
@@ -243,11 +241,87 @@ def test_required_source_gate_waits_for_all_ingestion_and_blocks_transforms():
     assert scope.task_id in xref.upstream_task_ids
     assert xref.task_id in e3.upstream_task_ids
     assert fbref_sensor._init_kwargs["external_dag_id"] == "dag_ingest_fbref"
-    assert fbref_sensor._init_kwargs["execution_delta"].total_seconds() == (
-        8 * 60 * 60
-    )
+    assert fbref_sensor._init_kwargs["execution_delta"].total_seconds() == (8 * 60 * 60)
     assert fbref_sensor._init_kwargs["timeout"] == 12 * 60 * 60
     assert e3._init_kwargs["trigger_rule"] == "all_success"
+
+
+def test_optional_espn_branch_joins_terminal_report_not_required_gate():
+    _reload_master()
+    espn = _task("ingestion_triggers.trigger_espn")
+    gate = _task("validate_required_sources")
+    check = _task("check_pipeline_success")
+
+    assert espn.task_id not in gate.upstream_task_ids
+    assert espn.task_id in check.upstream_task_ids
+    assert check.task_id in espn.downstream_task_ids
+    assert check._init_kwargs["trigger_rule"] == "all_done"
+
+
+def test_terminal_report_uses_exact_current_master_espn_child(
+    monkeypatch,
+):
+    module = _reload_master()
+    import airflow.models
+
+    expected_child_run_id = (
+        "espn_daily__dag_master_pipeline__scheduled__2026-07-31T14:00:00+00:00"
+    )
+    calls = []
+
+    class FakeDagRun:
+        @staticmethod
+        def find(*, dag_id, run_id=None):
+            calls.append({"dag_id": dag_id, "run_id": run_id})
+            if dag_id == "dag_ingest_espn" and run_id == expected_child_run_id:
+                return [
+                    SimpleNamespace(
+                        dag_id=dag_id,
+                        run_id=run_id,
+                        state="failed",
+                        logical_date=datetime(2026, 7, 31, 14, tzinfo=timezone.utc),
+                    )
+                ]
+            # An old green ESPN run must never hide the exact failed child.
+            return [
+                SimpleNamespace(
+                    dag_id=dag_id,
+                    run_id="old-success",
+                    state="success",
+                    logical_date=datetime(2026, 7, 30, 14, tzinfo=timezone.utc),
+                )
+            ]
+
+    monkeypatch.setattr(airflow.models, "DagRun", FakeDagRun, raising=False)
+
+    current_master = SimpleNamespace(
+        dag_id="dag_master_pipeline",
+        run_id="scheduled__2026-07-31T14:00:00+00:00",
+        get_task_instances=lambda: [
+            SimpleNamespace(task_id=task_id, state="success")
+            for task_id in {
+                "ingestion_triggers.trigger_fotmob",
+                "wait_for_scheduled_understat",
+                "wait_for_scheduled_whoscored",
+                "wait_for_fotmob_publication",
+                "wait_for_scheduled_fbref",
+                "trigger_xref_transforms",
+                "trigger_e3_transforms",
+                "trigger_fbref_gold",
+            }
+        ],
+    )
+
+    result = module.check_pipeline_success(dag_run=current_master)
+
+    assert {
+        "dag_id": "dag_ingest_espn",
+        "run_id": expected_child_run_id,
+    } in calls
+    assert result["dag_run_ids"]["dag_ingest_espn"] == expected_child_run_id
+    assert result["dag_statuses"]["dag_ingest_espn"] == "failed"
+    assert result["status"] == "partial_success"
+    assert result["degraded_dags"] == ["dag_ingest_espn"]
 
 
 def test_master_pins_every_fotmob_child_to_exact_claimed_generation():
@@ -259,13 +333,9 @@ def test_master_pins_every_fotmob_child_to_exact_claimed_generation():
     gold = _task("trigger_fbref_gold")
     release = _task("release_fbref_publication_lock")
 
-    expected_template = (
-        "{{ ti.xcom_pull(task_ids='resolve_fbref_publication_scope') }}"
-    )
+    expected_template = "{{ ti.xcom_pull(task_ids='resolve_fbref_publication_scope') }}"
     assert scope._init_kwargs["retries"] == 0
-    assert xref._init_kwargs["conf"]["fbref_control_run_id"] == (
-        expected_template
-    )
+    assert xref._init_kwargs["conf"]["fbref_control_run_id"] == (expected_template)
     for child in (xref, e3, e4, gold):
         conf = child._init_kwargs["conf"]
         assert conf["publication_owner"] == "dag_master_pipeline"
@@ -287,13 +357,10 @@ def test_master_pins_every_fotmob_child_to_exact_claimed_generation():
             for value in fotmob_conf["binding"].values()
         )
         assert "fotmob_generation_id" not in conf
-    assert gold._init_kwargs["conf"]["fbref_control_run_id"] == (
-        expected_template
-    )
+    assert gold._init_kwargs["conf"]["fbref_control_run_id"] == (expected_template)
     assert module.MASTER_ARGS["retries"] == 0
     assert module.MASTER_DAGRUN_TIMEOUT_HOURS == (
-        module.MASTER_CRITICAL_PATH_HOURS
-        + module.MASTER_TIMEOUT_SLACK_HOURS
+        module.MASTER_CRITICAL_PATH_HOURS + module.MASTER_TIMEOUT_SLACK_HOURS
     )
     assert module.dag._dag_kwargs["dagrun_timeout"].total_seconds() == (
         module.MASTER_DAGRUN_TIMEOUT_HOURS * 60 * 60
@@ -302,11 +369,15 @@ def test_master_pins_every_fotmob_child_to_exact_claimed_generation():
         module.MASTER_FOTMOB_TRIGGER_TIMEOUT_HOURS
         + (len(module.TRIGGERED_INGESTION_DAGS) - 1) * 12
     )
-    assert module.MASTER_DAGRUN_TIMEOUT_HOURS - (
-        module.MASTER_SOURCE_CHAIN_HOURS
-        + module.MASTER_PUBLICATION_CHAIN_HOURS
-        + module.MASTER_CONTROL_TASK_HOURS
-    ) == module.MASTER_TIMEOUT_SLACK_HOURS
+    assert (
+        module.MASTER_DAGRUN_TIMEOUT_HOURS
+        - (
+            module.MASTER_SOURCE_CHAIN_HOURS
+            + module.MASTER_PUBLICATION_CHAIN_HOURS
+            + module.MASTER_CONTROL_TASK_HOURS
+        )
+        == module.MASTER_TIMEOUT_SLACK_HOURS
+    )
     assert release._init_kwargs["trigger_rule"] == "all_done"
     assert {
         "wait_for_scheduled_fbref",
@@ -322,12 +393,14 @@ def test_master_resolves_exact_successful_scheduled_fbref_control_run(
 
     expected_id = "11111111-1111-4111-8111-111111111111"
     store = SimpleNamespace(
-        get_run=lambda run_id: {
-            "run_type": "current",
-            "status": "succeeded",
-        }
-        if run_id == expected_id
-        else None,
+        get_run=lambda run_id: (
+            {
+                "run_type": "current",
+                "status": "succeeded",
+            }
+            if run_id == expected_id
+            else None
+        ),
         get_publication_lock=lambda source: {
             "owner_run_id": expected_id,
             "active": True,
@@ -335,6 +408,7 @@ def test_master_resolves_exact_successful_scheduled_fbref_control_run(
         renew_publication_lock=MagicMock(),
     )
     monkeypatch.setattr(control.ControlStore, "from_env", lambda: store)
+
     def make_id(airflow_run_id, dag_id):
         assert airflow_run_id == "scheduled__2026-07-14T06:00:00+00:00"
         assert dag_id == "dag_ingest_fbref"
@@ -342,9 +416,12 @@ def test_master_resolves_exact_successful_scheduled_fbref_control_run(
 
     monkeypatch.setattr(control, "make_control_run_id", make_id)
 
-    assert module.resolve_scheduled_fbref_control_run(
-        logical_date=datetime(2026, 7, 14, 14, tzinfo=timezone.utc)
-    ) == expected_id
+    assert (
+        module.resolve_scheduled_fbref_control_run(
+            logical_date=datetime(2026, 7, 14, 14, tzinfo=timezone.utc)
+        )
+        == expected_id
+    )
     store.renew_publication_lock.assert_called_once_with(
         expected_id,
         source="fbref",
@@ -368,24 +445,16 @@ def test_master_releases_only_after_scheduled_source_sensor_succeeded(
 
     release = MagicMock(return_value={"released": True})
     monkeypatch.setattr(control, "make_control_run_id", make_id)
-    monkeypatch.setattr(
-        fbref_pipeline_tasks, "release_fbref_publication_lock", release
-    )
+    monkeypatch.setattr(fbref_pipeline_tasks, "release_fbref_publication_lock", release)
     dag_run = SimpleNamespace(
         logical_date=datetime(2026, 7, 14, 14, tzinfo=timezone.utc),
         get_task_instances=lambda: [
-            SimpleNamespace(
-                task_id="wait_for_scheduled_fbref", state="success"
-            ),
-            SimpleNamespace(
-                task_id="generate_pipeline_report", state="success"
-            ),
+            SimpleNamespace(task_id="wait_for_scheduled_fbref", state="success"),
+            SimpleNamespace(task_id="generate_pipeline_report", state="success"),
         ],
     )
 
-    result = module.release_scheduled_fbref_publication_lock(
-        dag_run=dag_run
-    )
+    result = module.release_scheduled_fbref_publication_lock(dag_run=dag_run)
     assert result == {"released": True}
     release.assert_called_once_with(control_run_id=expected_id)
 
@@ -403,9 +472,7 @@ def test_master_cleanup_releases_unstarted_path_but_preserves_failed_verdict(
         control, "make_control_run_id", lambda *_args, **_kwargs: expected_id
     )
     release = MagicMock(return_value={"released": True})
-    monkeypatch.setattr(
-        fbref_pipeline_tasks, "release_fbref_publication_lock", release
-    )
+    monkeypatch.setattr(fbref_pipeline_tasks, "release_fbref_publication_lock", release)
     publication_ids = {
         "trigger_xref_transforms",
         "trigger_e3_transforms",
@@ -416,9 +483,7 @@ def test_master_cleanup_releases_unstarted_path_but_preserves_failed_verdict(
         "trigger_fbref_gold",
     }
     instances = [
-        SimpleNamespace(
-            task_id="wait_for_scheduled_fbref", state="success"
-        ),
+        SimpleNamespace(task_id="wait_for_scheduled_fbref", state="success"),
         SimpleNamespace(task_id="generate_pipeline_report", state="skipped"),
         *[
             SimpleNamespace(task_id=task_id, state="upstream_failed")

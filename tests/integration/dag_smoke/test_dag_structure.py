@@ -19,9 +19,12 @@ class TestDagStructure:
                 dag = dag_bag.dags[dag_id]
                 task_ids = [task.task_id for task in dag.tasks]
 
-                validate_tasks = [t for t in dag.tasks if t.task_id.startswith('validate')]
-                assert validate_tasks, \
+                validate_tasks = [
+                    t for t in dag.tasks if t.task_id.startswith("validate")
+                ]
+                assert validate_tasks, (
                     f"DAG '{dag_id}' has no validate* task. Tasks: {task_ids}"
+                )
 
     def test_validate_tasks_follow_declared_failure_policy(
         self, dag_bag, ingestion_dag_ids
@@ -29,24 +32,27 @@ class TestDagStructure:
         """
         Legacy ingestion observers use ``all_done`` to report partial output.
 
-        The durable FBref producer is deliberately fail-closed: its validation
-        is also the only parent of Silver, so running it after a red fetch or
-        persistence task could promote partial data.
+        Durable FBref and ESPN producers are deliberately fail-closed. Their
+        validation tasks must not run after a red prerequisite and accidentally
+        make partial data look healthy.
         """
         for dag_id in ingestion_dag_ids:
             if dag_id in dag_bag.dags:
                 dag = dag_bag.dags[dag_id]
 
-                validate_tasks = [t for t in dag.tasks if t.task_id.startswith('validate')]
+                validate_tasks = [
+                    t for t in dag.tasks if t.task_id.startswith("validate")
+                ]
                 for validate_task in validate_tasks:
                     expected = (
-                        'all_success'
-                        if dag_id == 'dag_ingest_fbref'
-                        else 'all_done'
+                        "all_success"
+                        if dag_id in {"dag_ingest_fbref", "dag_ingest_espn"}
+                        else "all_done"
                     )
-                    assert validate_task.trigger_rule == expected, \
-                        f"DAG '{dag_id}' {validate_task.task_id} has trigger_rule=" \
+                    assert validate_task.trigger_rule == expected, (
+                        f"DAG '{dag_id}' {validate_task.task_id} has trigger_rule="
                         f"'{validate_task.trigger_rule}', should be '{expected}'"
+                    )
 
     def test_dags_have_at_least_two_tasks(self, dag_bag, expected_dag_ids):
         """Test that all DAGs have at least 2 tasks."""
@@ -55,8 +61,9 @@ class TestDagStructure:
                 dag = dag_bag.dags[dag_id]
                 task_count = len(dag.tasks)
 
-                assert task_count >= 2, \
+                assert task_count >= 2, (
                     f"DAG '{dag_id}' has only {task_count} tasks, should have at least 2"
+                )
 
     def test_no_orphan_tasks(self, dag_bag, expected_dag_ids):
         """Test that all tasks have at least one dependency (no orphans)."""
@@ -84,8 +91,9 @@ class TestDagStructure:
                 for task in dag.tasks:
                     # Check if retries is set (either on task or inherited from DAG)
                     retries = task.retries
-                    assert retries is not None and retries >= 0, \
+                    assert retries is not None and retries >= 0, (
                         f"DAG '{dag_id}' task '{task.task_id}' has no retries configured"
+                    )
 
     def test_execution_timeout_set(self, dag_bag, ingestion_dag_ids):
         """Test that tasks have execution_timeout configured."""
@@ -116,7 +124,7 @@ class TestScheduleConfiguration:
                 schedule = str(dag.schedule_interval)
 
                 # Skip weekly DAGs from this check
-                if '* * 0' in schedule or '* * 7' in schedule:
+                if "* * 0" in schedule or "* * 7" in schedule:
                     continue
 
                 if schedule in schedules:
@@ -166,7 +174,7 @@ class TestMasterPipeline:
 
     def test_master_has_trigger_operators(self, dag_bag):
         """Test that master pipeline has TriggerDagRunOperator tasks."""
-        dag_id = 'dag_master_pipeline'
+        dag_id = "dag_master_pipeline"
 
         if dag_id not in dag_bag.dags:
             pytest.skip(f"DAG '{dag_id}' not found")
@@ -175,53 +183,53 @@ class TestMasterPipeline:
 
         # Check for trigger tasks (should have multiple)
         trigger_tasks = [
-            task for task in dag.tasks
-            if 'trigger' in task.task_id.lower()
+            task for task in dag.tasks if "trigger" in task.task_id.lower()
         ]
 
-        assert len(trigger_tasks) >= 6, \
+        assert len(trigger_tasks) >= 6, (
             f"Master pipeline should have multiple trigger tasks, found: {len(trigger_tasks)}"
+        )
 
     def test_master_pipeline_triggers_fbref_gold(self, dag_bag):
         """Master pipeline must trigger the FBref Gold DAG (issue #39)."""
-        dag_id = 'dag_master_pipeline'
+        dag_id = "dag_master_pipeline"
 
         if dag_id not in dag_bag.dags:
             pytest.skip(f"DAG '{dag_id}' not found")
 
         dag = dag_bag.dags[dag_id]
-        assert 'trigger_fbref_gold' in {t.task_id for t in dag.tasks}
+        assert "trigger_fbref_gold" in {t.task_id for t in dag.tasks}
 
-        trigger = dag.get_task('trigger_fbref_gold')
-        assert getattr(trigger, 'trigger_dag_id', None) == 'dag_transform_fbref_gold'
+        trigger = dag.get_task("trigger_fbref_gold")
+        assert getattr(trigger, "trigger_dag_id", None) == "dag_transform_fbref_gold"
 
     def test_fbref_gold_runs_after_silver_and_before_check(self, dag_bag):
         """`trigger_fbref_gold` must run after TM/Cap/SoFIFA Silver and feed
         into the pipeline success check (issue #39)."""
-        dag_id = 'dag_master_pipeline'
+        dag_id = "dag_master_pipeline"
 
         if dag_id not in dag_bag.dags:
             pytest.skip(f"DAG '{dag_id}' not found")
 
         dag = dag_bag.dags[dag_id]
-        task = dag.get_task('trigger_fbref_gold')
+        task = dag.get_task("trigger_fbref_gold")
 
         upstream_ids = {t.task_id for t in task.upstream_list}
         assert {
-            'trigger_silver_transfermarkt',
-            'trigger_silver_capology',
-            'trigger_silver_sofifa',
+            "trigger_silver_transfermarkt",
+            "trigger_silver_capology",
+            "trigger_silver_sofifa",
         } <= upstream_ids, (
             "trigger_fbref_gold must run after the TM/Capology/SoFIFA Silver "
             f"block (fct_team_season_stats finance inputs), got: {upstream_ids}"
         )
 
         downstream_ids = {t.task_id for t in task.downstream_list}
-        assert 'check_pipeline_success' in downstream_ids
+        assert "check_pipeline_success" in downstream_ids
 
     def test_master_has_check_and_report_tasks(self, dag_bag):
         """Test that master pipeline has check and report tasks."""
-        dag_id = 'dag_master_pipeline'
+        dag_id = "dag_master_pipeline"
 
         if dag_id not in dag_bag.dags:
             pytest.skip(f"DAG '{dag_id}' not found")
@@ -229,14 +237,16 @@ class TestMasterPipeline:
         dag = dag_bag.dags[dag_id]
         task_ids = [task.task_id for task in dag.tasks]
 
-        assert 'check_pipeline_success' in task_ids, \
+        assert "check_pipeline_success" in task_ids, (
             "Master pipeline missing 'check_pipeline_success' task"
-        assert 'generate_pipeline_report' in task_ids, \
+        )
+        assert "generate_pipeline_report" in task_ids, (
             "Master pipeline missing 'generate_pipeline_report' task"
+        )
 
     def test_master_runs_after_all_ingestion(self, dag_bag, ingestion_dag_ids):
         """Test that master pipeline runs after all ingestion DAGs."""
-        master_dag = dag_bag.dags.get('dag_master_pipeline')
+        master_dag = dag_bag.dags.get("dag_master_pipeline")
 
         if not master_dag:
             pytest.skip("Master pipeline not found")
@@ -244,13 +254,14 @@ class TestMasterPipeline:
         master_schedule = master_dag.schedule_interval
 
         # Master should run at 14:00 or later
-        if isinstance(master_schedule, str) and ' ' in master_schedule:
+        if isinstance(master_schedule, str) and " " in master_schedule:
             parts = master_schedule.split()
             if len(parts) >= 2:
                 try:
                     master_hour = int(parts[1])
-                    assert master_hour >= 14, \
-                        f"Master pipeline runs at {master_hour}:00, " \
+                    assert master_hour >= 14, (
+                        f"Master pipeline runs at {master_hour}:00, "
                         "should be at 14:00 or later"
+                    )
                 except ValueError:
                     pass

@@ -37,6 +37,7 @@ from scrapers.espn.repository import (
     row_fingerprint,
     validate_scope_generation,
 )
+from scrapers.espn.operations import LeaseLost
 from scrapers.espn.schedule_parser import parse_scoreboards
 from scrapers.espn.summary_parser import parse_summary
 
@@ -226,7 +227,8 @@ class PhysicalQuery(FakeQuery):
             sql.lstrip().startswith("SELECT")
             and "FROM iceberg.bronze.espn_ingest_manifest_v2" in sql
         ):
-            return []
+            row = self.manifests.get((params[0], params[1]))
+            return [row] if row else []
         if 'SELECT DISTINCT "generation_signature", "_row_sha256"' in sql:
             relation_tables = {
                 **ENTITY_TABLES,
@@ -825,11 +827,36 @@ def test_manifest_is_last_and_partial_commit_is_not_published():
 
 
 @pytest.mark.unit
+def test_reclaimed_lease_is_rechecked_before_complete_manifest():
+    """A writer fenced after physical rows must never expose COMPLETE."""
+
+    writer = FakeWriter()
+    repository = EspnBronzeRepository(
+        writer=writer,
+        query=FakeQuery(),
+        verify_physical=False,
+        ensure_objects_on_write=False,
+    )
+
+    def publication_fence():
+        written = {table for table, _ in writer.calls}
+        if repository_module.LEDGER_TABLE in written:
+            raise LeaseLost("lease reclaimed")
+
+    with pytest.raises(LeaseLost, match="reclaimed"):
+        repository.publish_scope(_generation(), publication_fence=publication_fence)
+
+    assert repository_module.LEDGER_TABLE in {table for table, _ in writer.calls}
+    assert MANIFEST_TABLE not in {table for table, _ in writer.calls}
+
+
+@pytest.mark.unit
 def test_success_writes_all_entities_then_manifest_and_replay_is_idempotent():
     writer = FakeWriter()
     query = FakeQuery()
     repository = EspnBronzeRepository(writer=writer, query=query, verify_physical=False)
     generation = _generation()
+    assert repository.exact_complete_exists(generation) is False
     result = repository.publish_scope(generation)
     assert result.state is ScopePublicationState.PUBLISHED
     assert [table for table, _ in writer.calls] == [
@@ -841,10 +868,45 @@ def test_success_writes_all_entities_then_manifest_and_replay_is_idempotent():
     query.manifests[(generation.plan.scope_id, generation.generation_id)] = tuple(
         manifest_row[column] for column in repository.manifest_columns
     )
+    assert repository.exact_complete_exists(generation) is True
     before = len(writer.calls)
     replay = repository.publish_scope(generation)
     assert replay.state is ScopePublicationState.IDEMPOTENT
     assert len(writer.calls) == before
+
+
+@pytest.mark.unit
+def test_published_dq_verifies_exact_manifest_and_rows_without_an_append():
+    generation = _generation()
+    report = validate_scope_generation(generation)
+    query = PhysicalQuery(generation)
+    manifest = generation.manifest_row(report)
+    query.manifests[(generation.plan.scope_id, generation.generation_id)] = tuple(
+        manifest[column] for column in EspnBronzeRepository.manifest_columns
+    )
+    writer = FakeWriter()
+    repository = EspnBronzeRepository(writer=writer, query=query)
+
+    observed = repository.verify_published_scope(generation)
+
+    assert observed == report
+    assert writer.calls == []
+
+
+@pytest.mark.unit
+def test_published_dq_rejects_noncomplete_exact_generation_manifest():
+    generation = _generation()
+    report = validate_scope_generation(generation)
+    manifest = generation.manifest_row(report)
+    query = PhysicalQuery(generation)
+    query.manifests[(generation.plan.scope_id, generation.generation_id)] = tuple(
+        "incomplete" if column == "status" else manifest[column]
+        for column in EspnBronzeRepository.manifest_columns
+    )
+    repository = EspnBronzeRepository(writer=FakeWriter(), query=query)
+
+    with pytest.raises(ManifestConflictError, match="status"):
+        repository.verify_published_scope(generation)
 
 
 @pytest.mark.unit

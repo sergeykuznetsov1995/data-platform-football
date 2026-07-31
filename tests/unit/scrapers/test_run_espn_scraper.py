@@ -45,6 +45,7 @@ from scrapers.espn.runner import (
     execute,
     is_full_reconciliation_day,
     scope_snapshot_bytes,
+    stage,
 )
 from scrapers.espn.transport_contracts import (
     EndpointType,
@@ -616,6 +617,32 @@ def test_initial_capture_fetches_full_calendar_and_one_summary_for_both_entities
     assert scoreboard_call[2]["dates"] == "20200801-20210731"
     assert Path(options.output_uri.removeprefix("file://")).is_file()
     assert not list(tmp_path.rglob("*.tmp-*"))
+
+
+@pytest.mark.unit
+def test_offline_stage_uses_complete_exact_raw_without_http_or_publication(tmp_path):
+    competition, edition = _competition()
+    options, _ = _plan(tmp_path, "daily", ((competition, edition),))
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store, {competition.slug: _scoreboard(competition, edition)}
+    )
+    captured_repository = FakeRepository()
+    execute(
+        options,
+        repository=captured_repository,
+        raw_store=raw_store,
+        http_client=client,
+    )
+    captured_calls = tuple(client.calls)
+
+    result = stage(options, raw_store=raw_store)
+
+    assert result.exit_code == 0
+    assert result.payload["state"] == "staged"
+    assert tuple(result.generations) == (competition.scope_id(edition),)
+    assert result.generations[competition.scope_id(edition)].schedule
+    assert tuple(client.calls) == captured_calls
 
 
 @pytest.mark.unit

@@ -50,42 +50,51 @@ logger = logging.getLogger(__name__)
 # (#951, master paused); re-adding it here without pausing that DAG would
 # double the ingest run and the xref/e3/e4 publication triggers.
 TRIGGERED_INGESTION_DAGS = [
-    'dag_ingest_fotmob',
-    'dag_ingest_matchhistory',
-    'dag_ingest_espn',
-    'dag_ingest_clubelo',
+    "dag_ingest_fotmob",
+    "dag_ingest_matchhistory",
+    "dag_ingest_clubelo",
 ]
+
+# ESPN is trigger-owned by this daily master, but its failure is deliberately
+# isolated from unrelated xref/E3/Gold publication. Its own DAG remains red
+# through the terminal propagator and health artifacts.
+ESPN_DAG_ID = "dag_ingest_espn"
+ESPN_CHILD_RUN_ID_PREFIX = "espn_daily"
+ESPN_CHILD_RUN_ID_TEMPLATE = "espn_daily__{{ dag.dag_id }}__{{ run_id }}"
+OPTIONAL_TRIGGERED_INGESTION_DAGS = [ESPN_DAG_ID]
 
 # FBref, Understat, and WhoScored own their 06:00/09:00/10:00 schedules and
 # request/byte budgets.
 # Master only waits for those exact runs; triggering them again at 14:00 would
 # create duplicate crawls and traffic accounting generations.
 SCHEDULED_INGESTION_DAGS = [
-    'dag_ingest_fbref',
-    'dag_ingest_understat',
-    'dag_ingest_whoscored',
+    "dag_ingest_fbref",
+    "dag_ingest_understat",
+    "dag_ingest_whoscored",
 ]
 
 # Complete reporting scope (both master-triggered and externally scheduled).
-INGESTION_DAGS = [*TRIGGERED_INGESTION_DAGS, *SCHEDULED_INGESTION_DAGS]
+INGESTION_DAGS = [
+    *TRIGGERED_INGESTION_DAGS,
+    *OPTIONAL_TRIGGERED_INGESTION_DAGS,
+    *SCHEDULED_INGESTION_DAGS,
+]
 
 # A failed optional source may still be reported as degraded without blocking
 # the historical master pipeline. WhoScored feeds xref/E3 event facts, while
 # FotMob publishes a strict source-native completeness manifest. Publishing
 # downstream from a failed or partial required source would mix generations.
 REQUIRED_SOURCE_TASKS = {
-    'dag_ingest_fotmob': 'ingestion_triggers.trigger_fotmob',
-    'dag_ingest_understat': 'wait_for_scheduled_understat',
-    'dag_ingest_whoscored': 'wait_for_scheduled_whoscored',
+    "dag_ingest_fotmob": "ingestion_triggers.trigger_fotmob",
+    "dag_ingest_understat": "wait_for_scheduled_understat",
+    "dag_ingest_whoscored": "wait_for_scheduled_whoscored",
 }
 
-FOTMOB_SCHEDULE_OWNER_VARIABLE = 'fotmob_schedule_owner'
-FOTMOB_SCHEDULE_OWNER_ENV = 'FOTMOB_SCHEDULE_OWNER'
-FOTMOB_SCHEDULE_OWNERS = frozenset({'shared', 'isolated'})
-FOTMOB_OWNER_GATE_TASK_ID = (
-    'ingestion_triggers.fotmob_shared_schedule_owner'
-)
-FOTMOB_OWNER_XCOM_KEY = 'fotmob_schedule_owner'
+FOTMOB_SCHEDULE_OWNER_VARIABLE = "fotmob_schedule_owner"
+FOTMOB_SCHEDULE_OWNER_ENV = "FOTMOB_SCHEDULE_OWNER"
+FOTMOB_SCHEDULE_OWNERS = frozenset({"shared", "isolated"})
+FOTMOB_OWNER_GATE_TASK_ID = "ingestion_triggers.fotmob_shared_schedule_owner"
+FOTMOB_OWNER_XCOM_KEY = "fotmob_schedule_owner"
 
 # Publication evidence whose failure must make the current master DagRun fail.
 # The scheduled FBref chain (Bronze -> FBref Silver, sensed fail-closed) and the
@@ -94,26 +103,26 @@ FOTMOB_OWNER_XCOM_KEY = 'fotmob_schedule_owner'
 # as a successful trigger would publish a mixed generation and let the
 # terminal report turn green despite failed DQ.
 REQUIRED_PUBLICATION_TASKS = {
-    'fotmob_publication': 'wait_for_fotmob_publication',
-    'dag_ingest_fbref': 'wait_for_scheduled_fbref',
-    'dag_transform_xref': 'trigger_xref_transforms',
-    'dag_transform_e3': 'trigger_e3_transforms',
-    'dag_transform_fbref_gold': 'trigger_fbref_gold',
+    "fotmob_publication": "wait_for_fotmob_publication",
+    "dag_ingest_fbref": "wait_for_scheduled_fbref",
+    "dag_transform_xref": "trigger_xref_transforms",
+    "dag_transform_e3": "trigger_e3_transforms",
+    "dag_transform_fbref_gold": "trigger_fbref_gold",
 }
 
 # Extended default args for master pipeline
 MASTER_ARGS = {
     **DEFAULT_ARGS,
-    'execution_timeout': timedelta(hours=12),  # Long timeout for full pipeline
+    "execution_timeout": timedelta(hours=12),  # Long timeout for full pipeline
     # Retrying a blocking child trigger can reset or duplicate publication.
     # One bounded attempt keeps the critical path and side effects explicit.
-    'retries': 0,
+    "retries": 0,
 }
 
 MASTER_FOTMOB_TRIGGER_TIMEOUT_HOURS = 14
-MASTER_SOURCE_CHAIN_HOURS = MASTER_FOTMOB_TRIGGER_TIMEOUT_HOURS + (
-    len(TRIGGERED_INGESTION_DAGS) - 1
-) * 12
+MASTER_SOURCE_CHAIN_HOURS = (
+    MASTER_FOTMOB_TRIGGER_TIMEOUT_HOURS + (len(TRIGGERED_INGESTION_DAGS) - 1) * 12
+)
 MASTER_FOTMOB_SENSOR_TIMEOUT_HOURS = 16
 MASTER_PUBLICATION_CHAIN_HOURS = (
     MASTER_FOTMOB_SENSOR_TIMEOUT_HOURS + 5 + 12 + 12 + 12 + 12
@@ -125,9 +134,7 @@ MASTER_CRITICAL_PATH_HOURS = (
     + MASTER_PUBLICATION_CHAIN_HOURS
     + MASTER_CONTROL_TASK_HOURS
 )
-MASTER_DAGRUN_TIMEOUT_HOURS = (
-    MASTER_CRITICAL_PATH_HOURS + MASTER_TIMEOUT_SLACK_HOURS
-)
+MASTER_DAGRUN_TIMEOUT_HOURS = MASTER_CRITICAL_PATH_HOURS + MASTER_TIMEOUT_SLACK_HOURS
 
 
 def resolve_fotmob_schedule_owner(value: Any = None) -> str:
@@ -142,16 +149,16 @@ def resolve_fotmob_schedule_owner(value: Any = None) -> str:
     from airflow.models import Variable
 
     if value is None:
-        fallback = os.environ.get(FOTMOB_SCHEDULE_OWNER_ENV, 'shared')
+        fallback = os.environ.get(FOTMOB_SCHEDULE_OWNER_ENV, "shared")
         value = Variable.get(
             FOTMOB_SCHEDULE_OWNER_VARIABLE,
             default_var=fallback,
         )
-    owner = str(value or '').strip().casefold()
+    owner = str(value or "").strip().casefold()
     if owner not in FOTMOB_SCHEDULE_OWNERS:
         raise AirflowException(
-            'Invalid FotMob schedule owner '
-            f'{value!r}; expected one of {sorted(FOTMOB_SCHEDULE_OWNERS)!r}'
+            "Invalid FotMob schedule owner "
+            f"{value!r}; expected one of {sorted(FOTMOB_SCHEDULE_OWNERS)!r}"
         )
     return owner
 
@@ -160,20 +167,20 @@ def allow_shared_fotmob_schedule(**context) -> bool:
     """Allow the master trigger only while the shared stack owns FotMob."""
 
     owner = resolve_fotmob_schedule_owner()
-    task_instance = context.get('ti')
+    task_instance = context.get("ti")
     if task_instance is not None:
         task_instance.xcom_push(key=FOTMOB_OWNER_XCOM_KEY, value=owner)
-    logger.info('FotMob 14:00 UTC schedule owner: %s', owner)
-    return owner == 'shared'
+    logger.info("FotMob 14:00 UTC schedule owner: %s", owner)
+    return owner == "shared"
 
 
 def _fotmob_owner_for_run(context: Dict[str, Any]) -> str:
     """Use the owner captured by this DagRun, not a value changed mid-run."""
 
-    explicit = context.get('fotmob_schedule_owner')
+    explicit = context.get("fotmob_schedule_owner")
     if explicit is not None:
         return resolve_fotmob_schedule_owner(explicit)
-    task_instance = context.get('ti')
+    task_instance = context.get("ti")
     if task_instance is not None:
         captured = task_instance.xcom_pull(
             task_ids=FOTMOB_OWNER_GATE_TASK_ID,
@@ -198,8 +205,8 @@ def finalize_exact_fotmob_publication(**context) -> dict:
 
     return finalize_fotmob_publication_consumer(
         publication_owner=_fotmob_owner_for_run(context),
-        report_task_id='generate_pipeline_report',
-        sensor_task_id='wait_for_fotmob_publication',
+        report_task_id="generate_pipeline_report",
+        sensor_task_id="wait_for_fotmob_publication",
         **context,
     )
 
@@ -210,35 +217,35 @@ def resolve_scheduled_fbref_control_run(**context) -> str:
     from airflow.exceptions import AirflowException
     from scrapers.fbref.control import ControlStore, make_control_run_id
 
-    logical_date = context.get('logical_date')
+    logical_date = context.get("logical_date")
     if logical_date is None:
-        dag_run = context.get('dag_run')
-        logical_date = getattr(dag_run, 'logical_date', None)
+        dag_run = context.get("dag_run")
+        logical_date = getattr(dag_run, "logical_date", None)
     if logical_date is None:
-        raise AirflowException('master run has no logical_date')
+        raise AirflowException("master run has no logical_date")
     source_logical_date = logical_date - timedelta(hours=8)
     source_airflow_run_id = f"scheduled__{source_logical_date.isoformat()}"
     control_run_id = make_control_run_id(
-        source_airflow_run_id, dag_id='dag_ingest_fbref'
+        source_airflow_run_id, dag_id="dag_ingest_fbref"
     )
     control = ControlStore.from_env()
     source_run = control.get_run(control_run_id)
     if source_run is None:
         raise AirflowException(
-            f'FBref control run not found for {source_airflow_run_id}'
+            f"FBref control run not found for {source_airflow_run_id}"
         )
-    if str(source_run.get('run_type') or '').casefold() != 'current':
-        raise AirflowException('scheduled FBref control run is not current')
-    if str(source_run.get('status') or '').casefold() != 'succeeded':
-        raise AirflowException('scheduled FBref control run is not succeeded')
-    publication_lock = control.get_publication_lock(source='fbref')
+    if str(source_run.get("run_type") or "").casefold() != "current":
+        raise AirflowException("scheduled FBref control run is not current")
+    if str(source_run.get("status") or "").casefold() != "succeeded":
+        raise AirflowException("scheduled FBref control run is not succeeded")
+    publication_lock = control.get_publication_lock(source="fbref")
     if (
         publication_lock is None
-        or not bool(publication_lock.get('active'))
-        or str(publication_lock.get('owner_run_id')) != str(control_run_id)
+        or not bool(publication_lock.get("active"))
+        or str(publication_lock.get("owner_run_id")) != str(control_run_id)
     ):
         raise AirflowException(
-            'scheduled FBref publication generation is not exclusively locked'
+            "scheduled FBref publication generation is not exclusively locked"
         )
     from utils.fbref_pipeline_tasks import (
         FBREF_PUBLICATION_LOCK_TTL_SECONDS,
@@ -246,7 +253,7 @@ def resolve_scheduled_fbref_control_run(**context) -> str:
 
     control.renew_publication_lock(
         control_run_id,
-        source='fbref',
+        source="fbref",
         ttl_seconds=FBREF_PUBLICATION_LOCK_TTL_SECONDS,
     )
     return str(control_run_id)
@@ -258,71 +265,65 @@ def release_scheduled_fbref_publication_lock(**context) -> dict:
     from scrapers.fbref.control import make_control_run_id
     from utils.fbref_pipeline_tasks import release_fbref_publication_lock
 
-    dag_run = context.get('dag_run')
-    instances = (
-        dag_run.get_task_instances() if dag_run is not None else []
-    )
+    dag_run = context.get("dag_run")
+    instances = dag_run.get_task_instances() if dag_run is not None else []
     states = {
-        str(getattr(instance, 'task_id', '')): str(
-            getattr(instance, 'state', '') or ''
+        str(getattr(instance, "task_id", "")): str(
+            getattr(instance, "state", "") or ""
         ).casefold()
         for instance in instances
     }
-    sensor_state = states.get('wait_for_scheduled_fbref', 'missing')
-    report_state = states.get('generate_pipeline_report', 'missing')
-    if sensor_state != 'success' or report_state != 'success':
+    sensor_state = states.get("wait_for_scheduled_fbref", "missing")
+    report_state = states.get("generate_pipeline_report", "missing")
+    if sensor_state != "success" or report_state != "success":
         from airflow.exceptions import AirflowException
 
         publication_task_ids = {
-            'trigger_xref_transforms',
-            'trigger_e3_transforms',
-            'trigger_e4_transforms',
-            'trigger_silver_transfermarkt',
-            'trigger_silver_capology',
-            'trigger_silver_sofifa',
-            'trigger_fbref_gold',
+            "trigger_xref_transforms",
+            "trigger_e3_transforms",
+            "trigger_e4_transforms",
+            "trigger_silver_transfermarkt",
+            "trigger_silver_capology",
+            "trigger_silver_sofifa",
+            "trigger_fbref_gold",
         }
         publication_states = {
-            task_id: states.get(task_id, 'missing')
-            for task_id in publication_task_ids
+            task_id: states.get(task_id, "missing") for task_id in publication_task_ids
         }
-        safely_terminal = (
-            sensor_state == 'success'
-            and set(publication_states.values())
-            <= {'success', 'skipped', 'upstream_failed'}
-        )
+        safely_terminal = sensor_state == "success" and set(
+            publication_states.values()
+        ) <= {"success", "skipped", "upstream_failed"}
         if safely_terminal:
-            logical_date = context.get('logical_date')
+            logical_date = context.get("logical_date")
             if logical_date is None and dag_run is not None:
-                logical_date = getattr(dag_run, 'logical_date', None)
+                logical_date = getattr(dag_run, "logical_date", None)
             if logical_date is None:
-                raise ValueError('master cleanup has no logical_date')
+                raise ValueError("master cleanup has no logical_date")
             source_logical_date = logical_date - timedelta(hours=8)
-            source_airflow_run_id = (
-                f"scheduled__{source_logical_date.isoformat()}"
-            )
+            source_airflow_run_id = f"scheduled__{source_logical_date.isoformat()}"
             control_run_id = make_control_run_id(
-                source_airflow_run_id, dag_id='dag_ingest_fbref'
+                source_airflow_run_id, dag_id="dag_ingest_fbref"
             )
-            release_fbref_publication_lock(
-                control_run_id=control_run_id
-            )
+            release_fbref_publication_lock(control_run_id=control_run_id)
         raise AirflowException(
-            'FBref master publication did not succeed; '
-            + ('lock released after terminal tasks' if safely_terminal else
-               'lock retained because child state is ambiguous')
-            + f' (sensor={sensor_state}, report={report_state}, '
-            f'publication={publication_states})'
+            "FBref master publication did not succeed; "
+            + (
+                "lock released after terminal tasks"
+                if safely_terminal
+                else "lock retained because child state is ambiguous"
+            )
+            + f" (sensor={sensor_state}, report={report_state}, "
+            f"publication={publication_states})"
         )
-    logical_date = context.get('logical_date')
+    logical_date = context.get("logical_date")
     if logical_date is None and dag_run is not None:
-        logical_date = getattr(dag_run, 'logical_date', None)
+        logical_date = getattr(dag_run, "logical_date", None)
     if logical_date is None:
-        raise ValueError('master cleanup has no logical_date')
+        raise ValueError("master cleanup has no logical_date")
     source_logical_date = logical_date - timedelta(hours=8)
     source_airflow_run_id = f"scheduled__{source_logical_date.isoformat()}"
     control_run_id = make_control_run_id(
-        source_airflow_run_id, dag_id='dag_ingest_fbref'
+        source_airflow_run_id, dag_id="dag_ingest_fbref"
     )
     return release_fbref_publication_lock(control_run_id=control_run_id)
 
@@ -338,50 +339,44 @@ def enforce_required_source_success(**context) -> Dict[str, str]:
     """
     from airflow.exceptions import AirflowException
 
-    dag_run = context.get('dag_run')
+    dag_run = context.get("dag_run")
     if dag_run is None:
-        raise AirflowException('required-source gate has no current DagRun')
+        raise AirflowException("required-source gate has no current DagRun")
 
     task_states = {}
     for task_instance in dag_run.get_task_instances():
-        state = getattr(task_instance.state, 'value', task_instance.state)
-        task_states[task_instance.task_id] = (
-            str(state or 'none').lower().split('.')[-1]
-        )
+        state = getattr(task_instance.state, "value", task_instance.state)
+        task_states[task_instance.task_id] = str(state or "none").lower().split(".")[-1]
 
     required_states = {
-        dag_id: task_states.get(task_id, 'missing')
+        dag_id: task_states.get(task_id, "missing")
         for dag_id, task_id in REQUIRED_SOURCE_TASKS.items()
     }
     fotmob_owner = _fotmob_owner_for_run(context)
-    expected_fotmob_state = 'success' if fotmob_owner == 'shared' else 'skipped'
+    expected_fotmob_state = "success" if fotmob_owner == "shared" else "skipped"
     invalid = {
         dag_id: state
         for dag_id, state in required_states.items()
         if state
-        != (
-            expected_fotmob_state
-            if dag_id == 'dag_ingest_fotmob'
-            else 'success'
-        )
+        != (expected_fotmob_state if dag_id == "dag_ingest_fotmob" else "success")
     }
-    if fotmob_owner == 'isolated':
-        owner_gate_state = task_states.get(FOTMOB_OWNER_GATE_TASK_ID, 'missing')
-        if owner_gate_state != 'success':
-            invalid['fotmob_schedule_owner_gate'] = owner_gate_state
+    if fotmob_owner == "isolated":
+        owner_gate_state = task_states.get(FOTMOB_OWNER_GATE_TASK_ID, "missing")
+        if owner_gate_state != "success":
+            invalid["fotmob_schedule_owner_gate"] = owner_gate_state
     if invalid:
-        details = ', '.join(
-            f'{dag_id}={state}' for dag_id, state in sorted(invalid.items())
+        details = ", ".join(
+            f"{dag_id}={state}" for dag_id, state in sorted(invalid.items())
         )
         raise AirflowException(
-            'Required ingestion source did not publish a complete successful '
-            f'run; downstream transforms are blocked: {details}'
+            "Required ingestion source did not publish a complete successful "
+            f"run; downstream transforms are blocked: {details}"
         )
-    if fotmob_owner == 'isolated':
+    if fotmob_owner == "isolated":
         # A skipped trigger is successful evidence only together with the
         # captured isolated-owner decision above. Never report it as a source
         # generation produced by this master DagRun.
-        required_states['dag_ingest_fotmob'] = 'isolated_owner'
+        required_states["dag_ingest_fotmob"] = "isolated_owner"
     return required_states
 
 
@@ -389,33 +384,29 @@ def enforce_required_publication_success(**context) -> Dict[str, str]:
     """Fail unless the current master's required transform triggers succeeded."""
     from airflow.exceptions import AirflowException
 
-    dag_run = context.get('dag_run')
+    dag_run = context.get("dag_run")
     if dag_run is None:
-        raise AirflowException('required-publication gate has no current DagRun')
+        raise AirflowException("required-publication gate has no current DagRun")
 
     task_states = {}
     for task_instance in dag_run.get_task_instances():
-        state = getattr(task_instance.state, 'value', task_instance.state)
-        task_states[task_instance.task_id] = (
-            str(state or 'none').lower().split('.')[-1]
-        )
+        state = getattr(task_instance.state, "value", task_instance.state)
+        task_states[task_instance.task_id] = str(state or "none").lower().split(".")[-1]
 
     required_states = {
-        dag_id: task_states.get(task_id, 'missing')
+        dag_id: task_states.get(task_id, "missing")
         for dag_id, task_id in REQUIRED_PUBLICATION_TASKS.items()
     }
     invalid = {
-        dag_id: state
-        for dag_id, state in required_states.items()
-        if state != 'success'
+        dag_id: state for dag_id, state in required_states.items() if state != "success"
     }
     if invalid:
-        details = ', '.join(
-            f'{dag_id}={state}' for dag_id, state in sorted(invalid.items())
+        details = ", ".join(
+            f"{dag_id}={state}" for dag_id, state in sorted(invalid.items())
         )
         raise AirflowException(
-            'Required publication transform did not complete successfully; '
-            f'the master cannot report a published generation: {details}'
+            "Required publication transform did not complete successfully; "
+            f"the master cannot report a published generation: {details}"
         )
     return required_states
 
@@ -436,49 +427,111 @@ def check_pipeline_success(**context) -> Dict[str, Any]:
     required_publication_states = enforce_required_publication_success(**context)
 
     from airflow.models import DagRun
-    from airflow.utils.state import State
 
     logger = logging.getLogger(__name__)
 
     results = {
-        'status': 'success',
-        'required_source_states': required_source_states,
-        'required_publication_states': required_publication_states,
-        'dag_statuses': {},
-        'failed_dags': [],
-        'successful_dags': [],
+        "status": "success",
+        "required_source_states": required_source_states,
+        "required_publication_states": required_publication_states,
+        "dag_statuses": {},
+        "dag_run_ids": {},
+        "failed_dags": [],
+        "degraded_dags": [],
+        "successful_dags": [],
     }
+
+    master_run = context.get("dag_run")
+    master_dag_id = str(getattr(master_run, "dag_id", "") or "")
+    master_run_id = str(getattr(master_run, "run_id", "") or "")
+    if not master_dag_id or not master_run_id:
+        from airflow.exceptions import AirflowException
+
+        raise AirflowException(
+            "pipeline report cannot bind the exact ESPN child without the "
+            "current master dag_id and run_id"
+        )
+    espn_child_run_id = f"{ESPN_CHILD_RUN_ID_PREFIX}__{master_dag_id}__{master_run_id}"
 
     for dag_id in INGESTION_DAGS:
         try:
-            # Get the most recent run for this DAG
-            dag_runs = DagRun.find(dag_id=dag_id)
-            if dag_runs:
-                latest_run = max(dag_runs, key=lambda x: x.logical_date or x.start_date)
-                state = latest_run.state
-
-                results['dag_statuses'][dag_id] = state
-
-                if state == State.SUCCESS:
-                    results['successful_dags'].append(dag_id)
-                elif state == State.FAILED:
-                    results['failed_dags'].append(dag_id)
+            if dag_id == ESPN_DAG_ID:
+                # The optional child is trigger-owned by this master. Looking
+                # up "latest" could let an old green run hide today's red
+                # child, so the deterministic run identity is mandatory.
+                dag_runs = DagRun.find(
+                    dag_id=dag_id,
+                    run_id=espn_child_run_id,
+                )
+                dag_runs = [
+                    run
+                    for run in dag_runs
+                    if getattr(run, "run_id", None) == espn_child_run_id
+                ]
+                results["dag_run_ids"][dag_id] = espn_child_run_id
             else:
-                results['dag_statuses'][dag_id] = 'not_found'
+                # Legacy sources do not yet expose a deterministic child-run
+                # contract to this report.
+                dag_runs = DagRun.find(dag_id=dag_id)
+
+            if dag_runs:
+                if dag_id == ESPN_DAG_ID and len(dag_runs) != 1:
+                    state = "identity_error"
+                else:
+                    selected_run = (
+                        dag_runs[0]
+                        if dag_id == ESPN_DAG_ID
+                        else max(
+                            dag_runs,
+                            key=lambda run: run.logical_date or run.start_date,
+                        )
+                    )
+                    raw_state = selected_run.state
+                    state = (
+                        str(getattr(raw_state, "value", raw_state) or "none")
+                        .lower()
+                        .split(".")[-1]
+                    )
+                    results["dag_run_ids"][dag_id] = getattr(
+                        selected_run,
+                        "run_id",
+                        None,
+                    )
+
+                results["dag_statuses"][dag_id] = state
+
+                if state == "success":
+                    results["successful_dags"].append(dag_id)
+                elif state == "failed" or dag_id == ESPN_DAG_ID:
+                    results["failed_dags"].append(dag_id)
+                    if dag_id == ESPN_DAG_ID:
+                        results["degraded_dags"].append(dag_id)
+            else:
+                results["dag_statuses"][dag_id] = "not_found"
                 logger.warning(f"No runs found for {dag_id}")
+                if dag_id == ESPN_DAG_ID:
+                    results["failed_dags"].append(dag_id)
+                    results["degraded_dags"].append(dag_id)
 
         except Exception as e:
             logger.error(f"Error checking status for {dag_id}: {e}")
-            results['dag_statuses'][dag_id] = 'error'
+            results["dag_statuses"][dag_id] = "error"
+            if dag_id == ESPN_DAG_ID:
+                results["failed_dags"].append(dag_id)
+                results["degraded_dags"].append(dag_id)
 
     # Determine overall status
-    if results['failed_dags']:
-        results['status'] = 'partial_success' if results['successful_dags'] else 'failed'
+    if results["degraded_dags"]:
+        results["status"] = "partial_success"
+    elif results["failed_dags"]:
+        results["status"] = (
+            "partial_success" if results["successful_dags"] else "failed"
+        )
 
     logger.info(f"Pipeline check complete: {results['status']}")
     logger.info(f"Successful: {len(results['successful_dags'])}/{len(INGESTION_DAGS)}")
 
-    if results['failed_dags']:
+    if results["failed_dags"]:
         logger.warning(f"Failed DAGs: {results['failed_dags']}")
 
     return results
@@ -493,17 +546,19 @@ def _transfermarkt_gold_gate(**context) -> Dict[str, Any]:
     try:
         state = tm_v2.read_reader_state(cur, allow_missing=True)
         result = state.to_dict()
-        if state.active_version != 'v2':
-            result['status'] = 'legacy_soft_gate'
+        if state.active_version != "v2":
+            result["status"] = "legacy_soft_gate"
             return result
-        if not all((
-            state.approved_cycle_id,
-            state.approved_scope_set_id,
-            state.approved_model_revision is not None,
-            state.active_slot,
-        )):
+        if not all(
+            (
+                state.approved_cycle_id,
+                state.approved_scope_set_id,
+                state.approved_model_revision is not None,
+                state.active_slot,
+            )
+        ):
             raise AirflowException(
-                'active TM v2 reader has incomplete scope-set evidence'
+                "active TM v2 reader has incomplete scope-set evidence"
             )
         marker = tm_v2.readiness(
             cur,
@@ -516,29 +571,29 @@ def _transfermarkt_gold_gate(**context) -> Dict[str, Any]:
             require_current_snapshots=False,
         )
         if (
-            marker.get('scope_set_id') != state.approved_scope_set_id
-            or marker.get('candidate_slot') != state.active_slot
-            or int(marker.get('expected_state_revision', -1))
+            marker.get("scope_set_id") != state.approved_scope_set_id
+            or marker.get("candidate_slot") != state.active_slot
+            or int(marker.get("expected_state_revision", -1))
             != int(state.approved_model_revision)
-            or not marker.get('ready')
+            or not marker.get("ready")
         ):
             raise AirflowException(
-                'active TM v2 scope-set readiness does not match the approved '
-                f'cycle/slot/revision: {marker}'
+                "active TM v2 scope-set readiness does not match the approved "
+                f"cycle/slot/revision: {marker}"
             )
         views = tm_v2.verify_reader_views(
             cur,
-            expected_version='v2',
+            expected_version="v2",
             expected_revision=state.revision,
             expected_slot=state.active_slot,
             allow_static_slot=state.cleanup_completed_at is not None,
         )
-        if not views['passed']:
+        if not views["passed"]:
             raise AirflowException(
-                f'active TM v2 canonical reader verification failed: {views}'
+                f"active TM v2 canonical reader verification failed: {views}"
             )
         result.update(
-            status='v2_scope_set_and_views_ready',
+            status="v2_scope_set_and_views_ready",
             readiness=marker,
             reader_views=views,
         )
@@ -560,16 +615,22 @@ def generate_pipeline_report(**context) -> Dict[str, Any]:
 
     logger = logging.getLogger(__name__)
 
-    ti = context['ti']
-    check_result = ti.xcom_pull(task_ids='check_pipeline_success')
+    ti = context["ti"]
+    check_result = ti.xcom_pull(task_ids="check_pipeline_success")
 
     report = {
-        'timestamp': dt.utcnow().isoformat(),
-        'pipeline_status': check_result.get('status', 'unknown') if check_result else 'unknown',
-        'total_dags': len(INGESTION_DAGS),
-        'successful_dags': len(check_result.get('successful_dags', [])) if check_result else 0,
-        'failed_dags': len(check_result.get('failed_dags', [])) if check_result else 0,
-        'dag_details': check_result.get('dag_statuses', {}) if check_result else {},
+        "timestamp": dt.utcnow().isoformat(),
+        "pipeline_status": check_result.get("status", "unknown")
+        if check_result
+        else "unknown",
+        "total_dags": len(INGESTION_DAGS),
+        "successful_dags": len(check_result.get("successful_dags", []))
+        if check_result
+        else 0,
+        "failed_dags": len(check_result.get("failed_dags", [])) if check_result else 0,
+        "degraded_dags": check_result.get("degraded_dags", []) if check_result else [],
+        "dag_details": check_result.get("dag_statuses", {}) if check_result else {},
+        "dag_run_ids": check_result.get("dag_run_ids", {}) if check_result else {},
     }
 
     # Log report
@@ -581,7 +642,7 @@ def generate_pipeline_report(**context) -> Dict[str, Any]:
     logger.info(f"Successful: {report['successful_dags']}/{report['total_dags']}")
     logger.info("-" * 60)
 
-    for dag_id, status in report['dag_details'].items():
+    for dag_id, status in report["dag_details"].items():
         logger.info(f"  {dag_id}: {status}")
 
     logger.info("=" * 60)
@@ -591,13 +652,13 @@ def generate_pipeline_report(**context) -> Dict[str, Any]:
 
 # DAG definition
 with DAG(
-    dag_id='dag_master_pipeline',
+    dag_id="dag_master_pipeline",
     default_args=MASTER_ARGS,
-    description='Master pipeline orchestrating all data ingestion DAGs',
-    schedule=SCHEDULES.get('dag_master_pipeline', '0 14 * * *'),
+    description="Master pipeline orchestrating all data ingestion DAGs",
+    schedule=SCHEDULES.get("dag_master_pipeline", "0 14 * * *"),
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    tags=DAG_TAGS.get('master', ['orchestration', 'master', 'pipeline']),
+    tags=DAG_TAGS.get("master", ["orchestration", "master", "pipeline"]),
     max_active_runs=1,
     # Computed from seven sequential 12h source triggers, then the bounded
     # sensor/xref/E3/E4/aux/Gold path, control tasks, and 12h scheduler slack.
@@ -692,15 +753,14 @@ with DAG(
       materialises their Silver tables daily (idempotent CTAS, no re-scrape)
     """,
 ) as dag:
-
     # Create trigger tasks for each ingestion DAG
     trigger_tasks = []
 
-    with TaskGroup(group_id='ingestion_triggers') as triggers_group:
+    with TaskGroup(group_id="ingestion_triggers") as triggers_group:
         prev_task = None
 
         fotmob_owner_gate = ShortCircuitOperator(
-            task_id='fotmob_shared_schedule_owner',
+            task_id="fotmob_shared_schedule_owner",
             python_callable=allow_shared_fotmob_schedule,
             # Skip only the direct FotMob trigger. The next sequential source
             # has trigger_rule=all_done and must still be allowed to run.
@@ -709,9 +769,9 @@ with DAG(
         )
 
         initialize_fotmob_publication_task = PythonOperator(
-            task_id='initialize_fotmob_publication',
+            task_id="initialize_fotmob_publication",
             python_callable=initialize_fotmob_publication,
-            op_kwargs={'publication_owner': 'shared'},
+            op_kwargs={"publication_owner": "shared"},
             retries=0,
         )
 
@@ -722,55 +782,53 @@ with DAG(
         fotmob_binding_template = {
             field: (
                 "{{ ti.xcom_pull(task_ids='ingestion_triggers."
-                "initialize_fotmob_publication')['binding']['"
-                + field
-                + "'] }}"
+                "initialize_fotmob_publication')['binding']['" + field + "'] }}"
             )
             for field in (
-                'schema',
-                'source',
-                'owner',
-                'data_interval_start',
-                'data_interval_end',
-                'runtime_fingerprint',
+                "schema",
+                "source",
+                "owner",
+                "data_interval_start",
+                "data_interval_end",
+                "runtime_fingerprint",
             )
         }
 
         for dag_id in TRIGGERED_INGESTION_DAGS:
             required_source = dag_id in REQUIRED_SOURCE_TASKS
             trigger_kwargs = {
-                'reset_dag_run': True,
-                'execution_date': '{{ ds }}',
-                'conf': {},
+                "reset_dag_run": True,
+                "execution_date": "{{ ds }}",
+                "conf": {},
             }
-            if dag_id == 'dag_ingest_fotmob':
+            if dag_id == "dag_ingest_fotmob":
                 trigger_kwargs = {
-                    'trigger_run_id': (
-                        'fotmob_ingest__' + fotmob_generation_template
-                    ),
-                    'logical_date': '{{ logical_date.isoformat() }}',
-                    'reset_dag_run': False,
-                    'execution_timeout': timedelta(
+                    "trigger_run_id": ("fotmob_ingest__" + fotmob_generation_template),
+                    "logical_date": "{{ logical_date.isoformat() }}",
+                    "reset_dag_run": False,
+                    "execution_timeout": timedelta(
                         hours=MASTER_FOTMOB_TRIGGER_TIMEOUT_HOURS
                     ),
-                    'conf': {
+                    "conf": {
                         **fotmob_daily_trigger_conf(),
-                        'fotmob_publication': {
-                            'generation_id': fotmob_generation_template,
-                            'binding': fotmob_binding_template,
+                        "fotmob_publication": {
+                            "generation_id": fotmob_generation_template,
+                            "binding": fotmob_binding_template,
                         },
                     },
                 }
             trigger_task = TriggerDagRunOperator(
-                task_id=f'trigger_{dag_id.replace("dag_ingest_", "")}',
+                task_id=f"trigger_{dag_id.replace('dag_ingest_', '')}",
                 trigger_dag_id=dag_id,
                 wait_for_completion=True,
                 poke_interval=60,  # Check every minute
-                allowed_states=(['success'] if required_source else ['success', 'failed']),
-                failed_states=(['failed'] if required_source else []),
+                allowed_states=(
+                    ["success"] if required_source else ["success", "failed"]
+                ),
+                failed_states=(["failed"] if required_source else []),
                 # Keep independent later sources running after a required
                 # source failure. The explicit gate below blocks transforms.
-                trigger_rule=('all_done' if prev_task else 'all_success'),
+                trigger_rule=("all_done" if prev_task else "all_success"),
                 # master_data_interval_end went to dag_sofascore_pipeline
                 # together with the sofascore trigger (#951).
                 **trigger_kwargs,
@@ -778,7 +836,7 @@ with DAG(
 
             if prev_task:
                 prev_task >> trigger_task
-            elif dag_id == 'dag_ingest_fotmob':
+            elif dag_id == "dag_ingest_fotmob":
                 (
                     fotmob_owner_gate
                     >> initialize_fotmob_publication_task
@@ -788,11 +846,39 @@ with DAG(
             prev_task = trigger_task
             trigger_tasks.append(trigger_task)
 
+        # Independent optional branch: exact parent/run binding prevents a
+        # direct trigger from impersonating this schedule owner. It is not an
+        # upstream of the required-source gate.
+        trigger_espn = TriggerDagRunOperator(
+            task_id="trigger_espn",
+            trigger_dag_id="dag_ingest_espn",
+            trigger_run_id=ESPN_CHILD_RUN_ID_TEMPLATE,
+            logical_date="{{ logical_date.isoformat() }}",
+            conf={
+                "espn_parent": {
+                    "schema": "espn-master-parent-v1",
+                    "parent_dag_id": "dag_master_pipeline",
+                    "parent_run_id": "{{ run_id }}",
+                    "logical_date": "{{ logical_date.isoformat() }}",
+                    "data_interval_start": "{{ data_interval_start.isoformat() }}",
+                    "data_interval_end": "{{ data_interval_end.isoformat() }}",
+                    "child_run_id": ESPN_CHILD_RUN_ID_TEMPLATE,
+                }
+            },
+            wait_for_completion=True,
+            poke_interval=60,
+            allowed_states=["success", "failed"],
+            failed_states=[],
+            reset_dag_run=False,
+            execution_timeout=timedelta(hours=12),
+            retries=0,
+        )
+
     required_sources_gate = PythonOperator(
-        task_id='validate_required_sources',
+        task_id="validate_required_sources",
         python_callable=enforce_required_source_success,
         # It must execute (and raise) when a required trigger failed.
-        trigger_rule='all_done',
+        trigger_rule="all_done",
         execution_timeout=timedelta(minutes=5),
         retries=0,
     )
@@ -803,13 +889,13 @@ with DAG(
     # missing or failed source generation. ``reschedule`` releases the worker
     # slot while the source is still running.
     wait_for_scheduled_whoscored = ExternalTaskSensor(
-        task_id='wait_for_scheduled_whoscored',
-        external_dag_id='dag_ingest_whoscored',
+        task_id="wait_for_scheduled_whoscored",
+        external_dag_id="dag_ingest_whoscored",
         external_task_id=None,
-        allowed_states=['success'],
-        failed_states=['failed'],
+        allowed_states=["success"],
+        failed_states=["failed"],
         execution_delta=timedelta(hours=4),
-        mode='reschedule',
+        mode="reschedule",
         poke_interval=60,
         timeout=timedelta(hours=8).total_seconds(),
         check_existence=True,
@@ -820,13 +906,13 @@ with DAG(
     # 14:00 master run waits for that exact generation instead of launching a
     # duplicate current scrape five hours later.
     wait_for_scheduled_understat = ExternalTaskSensor(
-        task_id='wait_for_scheduled_understat',
-        external_dag_id='dag_ingest_understat',
+        task_id="wait_for_scheduled_understat",
+        external_dag_id="dag_ingest_understat",
         external_task_id=None,
-        allowed_states=['success'],
-        failed_states=['failed'],
+        allowed_states=["success"],
+        failed_states=["failed"],
         execution_delta=timedelta(hours=5),
-        mode='reschedule',
+        mode="reschedule",
         poke_interval=60,
         timeout=timedelta(hours=8).total_seconds(),
         check_existence=True,
@@ -837,9 +923,9 @@ with DAG(
     # database.  Poll the shared ControlStore for the exact interval/release/
     # owner generation and atomically claim it before any xref/Gold consumer.
     wait_for_fotmob_publication = PythonSensor(
-        task_id='wait_for_fotmob_publication',
+        task_id="wait_for_fotmob_publication",
         python_callable=wait_for_exact_fotmob_publication,
-        mode='reschedule',
+        mode="reschedule",
         poke_interval=60,
         timeout=timedelta(hours=MASTER_FOTMOB_SENSOR_TIMEOUT_HOURS).total_seconds(),
         execution_timeout=timedelta(minutes=5),
@@ -855,20 +941,20 @@ with DAG(
     # at the master's 14:00 start; two additional hours cover scheduler slack.
     # Cross-source xref is launched below and cannot affect source verdict.
     wait_for_scheduled_fbref = ExternalTaskSensor(
-        task_id='wait_for_scheduled_fbref',
-        external_dag_id='dag_ingest_fbref',
+        task_id="wait_for_scheduled_fbref",
+        external_dag_id="dag_ingest_fbref",
         external_task_id=None,
-        allowed_states=['success'],
-        failed_states=['failed'],
+        allowed_states=["success"],
+        failed_states=["failed"],
         execution_delta=timedelta(hours=8),
-        mode='reschedule',
+        mode="reschedule",
         poke_interval=60,
         timeout=timedelta(hours=12).total_seconds(),
         check_existence=True,
     )
 
     resolve_fbref_publication_scope = PythonOperator(
-        task_id='resolve_fbref_publication_scope',
+        task_id="resolve_fbref_publication_scope",
         python_callable=resolve_scheduled_fbref_control_run,
         retries=0,
         execution_timeout=timedelta(minutes=5),
@@ -878,28 +964,27 @@ with DAG(
     # E1 identity publication: separate from the FBref source verdict
     # =========================================================================
     trigger_xref_transforms = TriggerDagRunOperator(
-        task_id='trigger_xref_transforms',
-        trigger_dag_id='dag_transform_xref',
-        trigger_run_id='master_xref__{{ dag.dag_id }}__{{ run_id }}',
-        logical_date='{{ ti.start_date }}',
+        task_id="trigger_xref_transforms",
+        trigger_dag_id="dag_transform_xref",
+        trigger_run_id="master_xref__{{ dag.dag_id }}__{{ run_id }}",
+        logical_date="{{ ti.start_date }}",
         conf={
-            **fotmob_consumer_trigger_conf('dag_master_pipeline'),
-            'fbref_source_dag_id': 'dag_ingest_fbref',
-            'fbref_control_run_id': (
-                "{{ ti.xcom_pull(task_ids="
-                "'resolve_fbref_publication_scope') }}"
+            **fotmob_consumer_trigger_conf("dag_master_pipeline"),
+            "fbref_source_dag_id": "dag_ingest_fbref",
+            "fbref_control_run_id": (
+                "{{ ti.xcom_pull(task_ids='resolve_fbref_publication_scope') }}"
             ),
         },
         wait_for_completion=True,
         poke_interval=30,
-        allowed_states=['success'],
-        failed_states=['failed'],
+        allowed_states=["success"],
+        failed_states=["failed"],
         reset_dag_run=False,
         # Child has a 4h DagRun timeout; leave one hour for scheduler handoff
         # and terminal-state propagation before this parent task expires.
         execution_timeout=timedelta(hours=5),
         retries=0,
-        trigger_rule='all_success',
+        trigger_rule="all_success",
     )
 
     # =========================================================================
@@ -913,16 +998,16 @@ with DAG(
     # The E3 DAG itself runs sequentially (`max_active_tasks=1`) for OOM
     # safety. Its validation is a hard prerequisite for final Gold.
     trigger_e3_transforms = TriggerDagRunOperator(
-        task_id='trigger_e3_transforms',
-        trigger_dag_id='dag_transform_e3',
+        task_id="trigger_e3_transforms",
+        trigger_dag_id="dag_transform_e3",
         wait_for_completion=True,
         poke_interval=30,
-        allowed_states=['success'],
-        failed_states=['failed'],
+        allowed_states=["success"],
+        failed_states=["failed"],
         reset_dag_run=True,
-        execution_date='{{ ds }}',
-        conf=fotmob_consumer_trigger_conf('dag_master_pipeline'),
-        trigger_rule='all_success',
+        execution_date="{{ ds }}",
+        conf=fotmob_consumer_trigger_conf("dag_master_pipeline"),
+        trigger_rule="all_success",
     )
 
     # =========================================================================
@@ -935,16 +1020,16 @@ with DAG(
     # The E4 DAG itself runs sequentially (`max_active_tasks=1`) for OOM
     # safety. Its validation is a hard prerequisite for final Gold.
     trigger_e4_transforms = TriggerDagRunOperator(
-        task_id='trigger_e4_transforms',
-        trigger_dag_id='dag_transform_e4',
+        task_id="trigger_e4_transforms",
+        trigger_dag_id="dag_transform_e4",
         wait_for_completion=True,
         poke_interval=30,
-        allowed_states=['success'],
-        failed_states=['failed'],
+        allowed_states=["success"],
+        failed_states=["failed"],
         reset_dag_run=True,
-        execution_date='{{ ds }}',
-        conf=fotmob_consumer_trigger_conf('dag_master_pipeline'),
-        trigger_rule='all_success',
+        execution_date="{{ ds }}",
+        conf=fotmob_consumer_trigger_conf("dag_master_pipeline"),
+        trigger_rule="all_success",
     )
 
     # =========================================================================
@@ -956,21 +1041,21 @@ with DAG(
     # failure blocks downstream Gold because the canonical readers would
     # otherwise be unsafe.
     trigger_silver_transfermarkt = PythonOperator(
-        task_id='trigger_silver_transfermarkt',
+        task_id="trigger_silver_transfermarkt",
         python_callable=_transfermarkt_gold_gate,
-        trigger_rule='all_success',
+        trigger_rule="all_success",
     )
 
     trigger_silver_capology = TriggerDagRunOperator(
-        task_id='trigger_silver_capology',
-        trigger_dag_id='dag_transform_capology_silver',
+        task_id="trigger_silver_capology",
+        trigger_dag_id="dag_transform_capology_silver",
         wait_for_completion=True,
         poke_interval=30,
-        allowed_states=['success'],
-        failed_states=['failed'],
+        allowed_states=["success"],
+        failed_states=["failed"],
         reset_dag_run=True,
-        execution_date='{{ ds }}',
-        trigger_rule='all_success',
+        execution_date="{{ ds }}",
+        trigger_rule="all_success",
     )
 
     # SoFIFA Silver (issue #42) — same dependency profile as TM/Capology:
@@ -979,15 +1064,15 @@ with DAG(
     # Bronze ingest is weekly (Sunday); CTAS is idempotent so daily re-
     # materialisation keeps canonical_id coverage aligned.
     trigger_silver_sofifa = TriggerDagRunOperator(
-        task_id='trigger_silver_sofifa',
-        trigger_dag_id='dag_transform_sofifa_silver',
+        task_id="trigger_silver_sofifa",
+        trigger_dag_id="dag_transform_sofifa_silver",
         wait_for_completion=True,
         poke_interval=30,
-        allowed_states=['success'],
-        failed_states=['failed'],
+        allowed_states=["success"],
+        failed_states=["failed"],
         reset_dag_run=True,
-        execution_date='{{ ds }}',
-        trigger_rule='all_success',
+        execution_date="{{ ds }}",
+        trigger_rule="all_success",
     )
 
     # =========================================================================
@@ -1005,67 +1090,70 @@ with DAG(
     # The Gold DAG itself runs sequentially (max_active_tasks=1) for OOM safety.
     # Child failure propagates so reporting cannot turn a failed promotion green.
     trigger_fbref_gold = TriggerDagRunOperator(
-        task_id='trigger_fbref_gold',
-        trigger_dag_id='dag_transform_fbref_gold',
+        task_id="trigger_fbref_gold",
+        trigger_dag_id="dag_transform_fbref_gold",
         wait_for_completion=True,
         poke_interval=30,
-        allowed_states=['success'],
-        failed_states=['failed'],
+        allowed_states=["success"],
+        failed_states=["failed"],
         reset_dag_run=True,
-        execution_date='{{ ds }}',
+        execution_date="{{ ds }}",
         conf={
-            **fotmob_consumer_trigger_conf('dag_master_pipeline'),
-            'fbref_control_run_id': (
-                "{{ ti.xcom_pull(task_ids="
-                "'resolve_fbref_publication_scope') }}"
+            **fotmob_consumer_trigger_conf("dag_master_pipeline"),
+            "fbref_control_run_id": (
+                "{{ ti.xcom_pull(task_ids='resolve_fbref_publication_scope') }}"
             ),
         },
         execution_timeout=timedelta(hours=12),
         retries=0,
-        trigger_rule='all_success',
+        trigger_rule="all_success",
     )
 
     # Check overall pipeline success
     check_success_task = PythonOperator(
-        task_id='check_pipeline_success',
+        task_id="check_pipeline_success",
         python_callable=check_pipeline_success,
-
-        trigger_rule='all_done',
+        trigger_rule="all_done",
         execution_timeout=timedelta(minutes=5),
         retries=0,
     )
 
     # Generate summary report
     generate_report_task = PythonOperator(
-        task_id='generate_pipeline_report',
+        task_id="generate_pipeline_report",
         python_callable=generate_pipeline_report,
         execution_timeout=timedelta(minutes=5),
         retries=0,
     )
 
     release_fbref_publication = PythonOperator(
-        task_id='release_fbref_publication_lock',
+        task_id="release_fbref_publication_lock",
         python_callable=release_scheduled_fbref_publication_lock,
-        trigger_rule='all_done',
+        trigger_rule="all_done",
         execution_timeout=timedelta(minutes=5),
         retries=0,
     )
 
     finalize_fotmob_publication_task = PythonOperator(
-        task_id='finalize_fotmob_publication',
+        task_id="finalize_fotmob_publication",
         python_callable=finalize_exact_fotmob_publication,
-        trigger_rule='all_done',
+        trigger_rule="all_done",
         execution_timeout=timedelta(minutes=5),
         retries=0,
     )
 
     # Dependencies
     # Source/Silver and cross-source publication have independent verdicts.
-    [wait_for_fotmob_publication, wait_for_scheduled_fbref] \
-        >> resolve_fbref_publication_scope
-    (resolve_fbref_publication_scope
-     >> trigger_xref_transforms >> trigger_e3_transforms
-     >> trigger_e4_transforms)
+    [
+        wait_for_fotmob_publication,
+        wait_for_scheduled_fbref,
+    ] >> resolve_fbref_publication_scope
+    (
+        resolve_fbref_publication_scope
+        >> trigger_xref_transforms
+        >> trigger_e3_transforms
+        >> trigger_e4_transforms
+    )
     trigger_e4_transforms >> [
         trigger_silver_transfermarkt,
         trigger_silver_capology,
@@ -1077,7 +1165,9 @@ with DAG(
         trigger_silver_sofifa,
     ] >> trigger_fbref_gold
     trigger_fbref_gold >> check_success_task >> generate_report_task
-    [wait_for_scheduled_fbref, generate_report_task] \
-        >> release_fbref_publication
-    [wait_for_fotmob_publication, generate_report_task] \
-        >> finalize_fotmob_publication_task
+    trigger_espn >> check_success_task
+    [wait_for_scheduled_fbref, generate_report_task] >> release_fbref_publication
+    [
+        wait_for_fotmob_publication,
+        generate_report_task,
+    ] >> finalize_fotmob_publication_task

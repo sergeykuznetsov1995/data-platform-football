@@ -138,6 +138,7 @@ class EspnHttpClient:
         sleep_fn: Callable[[float], None] = time.sleep,
         monotonic_fn: Callable[[], float] = time.monotonic,
         utcnow_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        request_permit: Optional[Callable[[], None]] = None,
         environ: Optional[Mapping[str, str]] = None,
     ) -> None:
         environment = os.environ if environ is None else environ
@@ -211,6 +212,9 @@ class EspnHttpClient:
         self.sleep_fn = sleep_fn
         self.monotonic_fn = monotonic_fn
         self.utcnow_fn = utcnow_fn
+        if request_permit is not None and not callable(request_permit):
+            raise TypeError("request_permit must be callable or None")
+        self.request_permit = request_permit
         self._rate_limiter = _TokenBucket(
             self.rate_per_minute,
             self.burst,
@@ -431,10 +435,12 @@ class EspnHttpClient:
                 )
                 exc.ledger_entry = entry
                 raise
-            self._rate_limiter.acquire()
-            attempts += 1
             response = None
             try:
+                self._rate_limiter.acquire()
+                if self.request_permit is not None:
+                    self.request_permit()
+                attempts += 1
                 response = self.session.get(
                     target.canonical_url,
                     timeout=(self.connect_timeout, self.read_timeout),

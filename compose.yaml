@@ -201,6 +201,17 @@ x-airflow-common: &airflow-common
     FOTMOB_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/fotmob
     FOTMOB_RAW_S3_ENDPOINT: seaweedfs:8333
     FOTMOB_RAW_S3_SCHEME: http
+    # ESPN Native v2 is direct-only and shares PostgreSQL for its fenced
+    # scope leases, exact run evidence and global 30 rpm request gate.
+    ESPN_REGISTRY_PATH: /opt/airflow/configs/espn/registry.yaml
+    ESPN_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/espn
+    ESPN_ARTIFACT_ROOT_URI: s3://${ICEBERG_WAREHOUSE}/artifacts/espn
+    ESPN_CONTROL_DATABASE_URL: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}
+    ESPN_RAW_S3_ENDPOINT: seaweedfs:8333
+    ESPN_RAW_S3_SCHEME: http
+    ESPN_ARTIFACT_S3_ENDPOINT: seaweedfs:8333
+    ESPN_ARTIFACT_S3_SCHEME: http
+    ESPN_DISCOVERY_CATALOG_URL: ${ESPN_DISCOVERY_CATALOG_URL:-https://site.api.espn.com/apis/site/v2/sports/soccer/leagues}
     # Development-only legacy FlareSolverr proxy URL. Production keeps this
     # blank: port 8899 requires a lease unless --allow-legacy-noauth is added.
     PROXY_FILTER_URL: ${PROXY_FILTER_URL:-}
@@ -218,6 +229,7 @@ x-airflow-common: &airflow-common
     # FotMob Silver/xref SQL. Keep the shared scheduler on the same reviewed
     # bytes as the isolated cutover stack.
     - ./configs/fotmob:/opt/airflow/configs/fotmob:ro
+    - ./configs/espn:/opt/airflow/configs/espn:ro
     # #920 Phase 3: versioned soccerdata league_dict fragment (ESPN/WhoScored
     # tournament ids). Read by scrapers/base/soccerdata_config.py, which
     # merges it into ~/soccerdata/config/league_dict.json inside the
@@ -690,6 +702,7 @@ services:
         # FotMob is lightweight direct HTTP.  A separate bounded pool prevents
         # browser scrapers from serializing it while limiting source fan-out.
         airflow pools set 'fotmob_http_pool' 4 'Bounded direct FotMob HTTP work'
+        airflow pools set 'espn_http_pool' 1 'ESPN direct-only mapped HTTP waves; global rate gate is PostgreSQL-backed'
         airflow pools set 'transfermarkt_proxy' 1 'Transfermarkt production and registry proxy work'
         # Backfill has its own single-slot pool; production scheduling remains
         # independent and receives priority in proxy request permits.
@@ -794,6 +807,12 @@ services:
       - type: bind
         source: ./configs/fotmob
         target: /opt/airflow/configs/fotmob
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./configs/espn
+        target: /opt/airflow/configs/espn
         read_only: true
         bind:
           create_host_path: false

@@ -161,6 +161,28 @@ def test_replay_has_zero_network_calls_and_corrupt_cache_refetches(
 
 
 @pytest.mark.unit
+def test_force_refresh_daily_get_ignores_existing_mutable_target_alias(
+    monkeypatch, tmp_path
+):
+    url = "https://site.api.espn.com/apis/site/v2/sports/soccer/summary?event=9"
+    client, session, _, store = _client(
+        monkeypatch, tmp_path, [FakeResponse(200, b'{"fresh":true}')]
+    )
+    store.store(canonicalize_target(url), EndpointType.SUMMARY, b'{"stale":true}')
+
+    fetched = client.fetch_json(
+        url,
+        EndpointType.SUMMARY,
+        event_id=9,
+        force_refresh=True,
+    )
+
+    assert fetched.json_data == {"fresh": True}
+    assert fetched.cache_hit is False
+    assert len(session.calls) == 1
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("status", [408, 425, 429, 500, 503])
 def test_retryable_statuses_honor_retry_after(monkeypatch, tmp_path, status):
     client, session, sleeps, _ = _client(
@@ -237,6 +259,26 @@ def test_rate_limit_is_thirty_per_minute_with_burst_four(monkeypatch, tmp_path):
 
     assert len(session.calls) == 5
     assert sleeps == [2.0]
+
+
+@pytest.mark.unit
+def test_each_real_attempt_uses_shared_durable_request_permit(monkeypatch, tmp_path):
+    permits = []
+    client, session, _, _ = _client(
+        monkeypatch,
+        tmp_path,
+        [FakeResponse(503), FakeResponse(200, b"{}")],
+        request_permit=lambda: permits.append("permit"),
+    )
+
+    client.fetch_json(
+        "https://site.api.espn.com/apis/site/v2/sports/soccer/leagues",
+        "catalog",
+        force_refresh=True,
+    )
+
+    assert permits == ["permit", "permit"]
+    assert len(session.calls) == 2
 
 
 @pytest.mark.unit

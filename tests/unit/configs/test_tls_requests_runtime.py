@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("tls_requests", reason="native TLS runtime is tested in the scheduler image smoke")
+pytest.importorskip(
+    "tls_requests", reason="native TLS runtime is tested in the scheduler image smoke"
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -42,10 +44,13 @@ def test_tls_wrapper_and_native_library_are_pinned_in_the_image():
     ]
     assert len(wrapper_locks) == 1
     assert "--hash=sha256:" in wrapper_locks[0]
-    assert ci_requirements.splitlines().count(
-        "wrapper-tls-requests==1.2.5 "
-        "--hash=sha256:36f297aff6102fe85bf803c67917c87664ddf1aace056032ab1455aed88fdc44"
-    ) == 1
+    assert (
+        ci_requirements.splitlines().count(
+            "wrapper-tls-requests==1.2.5 "
+            "--hash=sha256:36f297aff6102fe85bf803c67917c87664ddf1aace056032ab1455aed88fdc44"
+        )
+        == 1
+    )
     chardet_locks = [
         line
         for line in core_requirements.splitlines()
@@ -126,13 +131,17 @@ def test_legacy_browser_jobs_use_only_the_isolated_runner():
     commands = {
         "dags/dag_ingest_sofifa.py": "run_sofifa_scraper.py",
         "dags/dag_ingest_understat.py": "run_understat_scraper.py",
-        "dags/dag_ingest_espn.py": "run_espn_scraper.py",
         "dags/dag_ingest_clubelo.py": "run_clubelo_scraper.py",
         "dags/dag_ingest_sofascore.py": "run_sofascore_scraper.py",
     }
     for relative, runner in commands.items():
         source = (REPO_ROOT / relative).read_text(encoding="utf-8")
         assert f"/opt/legacy-scraper-venv/bin/python dags/scripts/{runner}" in source
+
+    espn_source = (REPO_ROOT / "dags/dag_ingest_espn.py").read_text(encoding="utf-8")
+    assert "build_espn_ingest_dag" in espn_source
+    assert "/opt/legacy-scraper-venv" not in espn_source
+    assert "run_espn_scraper.py" not in espn_source
 
 
 @pytest.mark.unit
@@ -170,18 +179,18 @@ def test_browser_assets_are_checksum_pinned_and_source_isolated():
     sofascore_block = dockerfile.split(
         "camoufox/releases/download/v135.0.1-beta.24/", 1
     )[1].split("camoufox/releases/download/v152.0.4-beta.26/", 1)[0]
-    fbref_block = dockerfile.split(
-        "camoufox/releases/download/v152.0.4-beta.26/", 1
-    )[1].split(
+    fbref_block = dockerfile.split("camoufox/releases/download/v152.0.4-beta.26/", 1)[
+        1
+    ].split(
         "RUN --network=none install -d -o root -g root -m 0755 /opt/tls-client",
         1,
     )[0]
 
-    assert f"camoufox-{sofascore_version}-{sofascore_release}-lin.x86_64.zip" in sofascore_block
     assert (
-        f'echo "{sofascore_sha256}  /tmp/sofascore-camoufox.zip"'
+        f"camoufox-{sofascore_version}-{sofascore_release}-lin.x86_64.zip"
         in sofascore_block
     )
+    assert f'echo "{sofascore_sha256}  /tmp/sofascore-camoufox.zip"' in sofascore_block
     assert 'stat -c %s /tmp/sofascore-camoufox.zip)" -eq 712711368' in sofascore_block
     assert (
         "-e /tmp/sofascore-camoufox.zip \\\n      /home/airflow/.cache/camoufox"
@@ -224,7 +233,9 @@ def test_browser_assets_are_checksum_pinned_and_source_isolated():
         "browser.new_page().evaluate('[navigator.userAgent, navigator.platform]')"
         in scheduler_smoke
     )
-    assert "'FONTCONFIG_PATH': '/opt/fbref-camoufox/fontconfig/windows'" in scheduler_smoke
+    assert (
+        "'FONTCONFIG_PATH': '/opt/fbref-camoufox/fontconfig/windows'" in scheduler_smoke
+    )
     assert "'XDG_CACHE_HOME': cache" in scheduler_smoke
     assert "'HOME': home.name" in scheduler_smoke
     assert "os='windows'" in scheduler_smoke

@@ -30,27 +30,27 @@ def get_current_season() -> int:
 # After successful test runs, gradually add more leagues back:
 # 'ESP-La Liga', 'GER-Bundesliga', 'ITA-Serie A', 'FRA-Ligue 1'
 LEAGUES: List[str] = [
-    'ENG-Premier League',
-    'INT-World Cup',  # #913 Phase 1 (single-year WC). Targeting 5 sources: fbref, fotmob, sofascore, espn, whoscored. Club-only sources (sofifa etc) protected in thresholds.
+    "ENG-Premier League",
+    "INT-World Cup",  # #913 Phase 1 (single-year WC). Targeting 5 sources: fbref, fotmob, sofascore, espn, whoscored. Club-only sources (sofifa etc) protected in thresholds.
 ]
 
 # Club-only slice of LEAGUES — the scope for sources that do not cover
 # international tournaments (sofifa). #920 Phase 2: also the league set the
 # sofifa validate tasks check per-league floors against.
 NON_INTERNATIONAL_LEAGUES: List[str] = [
-    league for league in LEAGUES if not league.startswith('INT-')
+    league for league in LEAGUES if not league.startswith("INT-")
 ]
 
 # Source-owned production scope.  The native Understat reader keeps this
 # independent from global LEAGUES: RFPL is captured in Bronze but deliberately
 # remains outside the FBref-backed Gold spine.
 UNDERSTAT_LEAGUES: List[str] = [
-    'ENG-Premier League',
-    'ESP-La Liga',
-    'GER-Bundesliga',
-    'ITA-Serie A',
-    'FRA-Ligue 1',
-    'RUS-Premier League',
+    "ENG-Premier League",
+    "ESP-La Liga",
+    "GER-Bundesliga",
+    "ITA-Serie A",
+    "FRA-Ligue 1",
+    "RUS-Premier League",
 ]
 
 # MatchHistory (football-data.co.uk) multi-league scope. Independent of the
@@ -61,57 +61,59 @@ UNDERSTAT_LEAGUES: List[str] = [
 # season for these leagues = manual DAG trigger with the season param.
 # Scraper supports 18 league codes (MatchHistoryScraper.LEAGUE_CODES).
 MATCHHISTORY_LEAGUES: List[str] = [
-    'ENG-Premier League',
-    'ESP-La Liga',
-    'GER-Bundesliga',
-    'ITA-Serie A',
-    'FRA-Ligue 1',
+    "ENG-Premier League",
+    "ESP-La Liga",
+    "GER-Bundesliga",
+    "ITA-Serie A",
+    "FRA-Ligue 1",
 ]
 
 # Current season (dynamically calculated)
 CURRENT_SEASON: int = get_current_season()
 
 # Last 5 seasons as 4-digit CSV ("2122,2223,2324,2425,2526") — WhoScored multi-season ingest.
-SEASONS_STR: str = ','.join(
+SEASONS_STR: str = ",".join(
     f"{(CURRENT_SEASON - off) % 100:02d}{(CURRENT_SEASON - off + 1) % 100:02d}"
     for off in range(4, -1, -1)
 )
 
 # SoFIFA versions (FIFA game versions)
 # Valid values: "latest", "all", or list of version IDs from URL (e.g., 230034)
-SOFIFA_VERSIONS: str = 'latest'
+SOFIFA_VERSIONS: str = "latest"
 
 # Lightweight, direct-only FotMob requests must not occupy the serialized
 # browser scraper pool. The pool is bootstrapped by the Airflow deployment.
-FOTMOB_HTTP_POOL: str = 'fotmob_http_pool'
+FOTMOB_HTTP_POOL: str = "fotmob_http_pool"
 
 # DAG schedule configuration (cron format, UTC)
 SCHEDULES: Dict[str, Optional[str]] = {
-    'dag_ingest_fbref': '0 6 * * *',         # 6:00 UTC daily
+    "dag_ingest_fbref": "0 6 * * *",  # 6:00 UTC daily
     # One schedule owner: the master pipeline triggers FotMob daily.  Keeping
     # a second source cron doubled the same direct-HTTP work.
-    'dag_ingest_fotmob': None,
-    'dag_ingest_matchhistory': '0 8 * * *',  # 8:00 UTC daily
-    'dag_ingest_understat': '0 9 * * *',     # 9:00 UTC daily
-    'dag_ingest_whoscored': '0 10 * * *',    # 10:00 UTC daily
+    "dag_ingest_fotmob": None,
+    "dag_ingest_matchhistory": "0 8 * * *",  # 8:00 UTC daily
+    "dag_ingest_understat": "0 9 * * *",  # 9:00 UTC daily
+    "dag_ingest_whoscored": "0 10 * * *",  # 10:00 UTC daily
     # Two attempts plus the DAG's ten-hour deadline keep the latest completed
     # raw+ops recovery point inside the fixed 24-hour production RPO.
-    'dag_backup_whoscored_storage': '0 3,15 * * *',
+    "dag_backup_whoscored_storage": "0 3,15 * * *",
     # Daily ingestion (including the Saturday player branch) is orchestrated by
     # dag_sofascore_pipeline (#951; the paused master no longer triggers this
     # source). A second source cron duplicated billable proxy traffic.
-    'dag_ingest_sofascore': None,
+    "dag_ingest_sofascore": None,
     # Master's own 14:00 slot: resolve_scheduled_fbref_control_run subtracts
     # 8h from logical_date to pin the 06:00 FBref generation for xref.
-    'dag_sofascore_pipeline': '0 14 * * *',
-    'dag_ingest_espn': '0 12 * * *',         # 12:00 UTC daily
-    'dag_ingest_clubelo': '0 13 * * *',      # 13:00 UTC daily
-    'dag_ingest_sofifa': '0 6 * * 0',        # 6:00 UTC Sunday (weekly)
-    'dag_ingest_transfermarkt': '0 4 * * *', # 4:00 UTC daily (parent cycle)
-    'dag_ingest_capology': '0 5 * * 1',      # 5:00 UTC Monday (weekly)
-    'dag_master_pipeline': '0 14 * * *',     # 14:00 UTC daily
-    'dag_transform_fbref_silver': None,     # Trigger only (after ingestion)
-    'dag_transform_fotmob_silver': None,    # Trigger only (after ingestion)
+    "dag_sofascore_pipeline": "0 14 * * *",
+    # One schedule owner: the master starts the fail-closed native ESPN child
+    # with an exact parent/child run identity. A child cron would duplicate it.
+    "dag_ingest_espn": None,
+    "dag_ingest_clubelo": "0 13 * * *",  # 13:00 UTC daily
+    "dag_ingest_sofifa": "0 6 * * 0",  # 6:00 UTC Sunday (weekly)
+    "dag_ingest_transfermarkt": "0 4 * * *",  # 4:00 UTC daily (parent cycle)
+    "dag_ingest_capology": "0 5 * * 1",  # 5:00 UTC Monday (weekly)
+    "dag_master_pipeline": "0 14 * * *",  # 14:00 UTC daily
+    "dag_transform_fbref_silver": None,  # Trigger only (after ingestion)
+    "dag_transform_fotmob_silver": None,  # Trigger only (after ingestion)
 }
 
 # --- Per-competition bronze floors (#920 Phase 2) ---------------------------
@@ -133,12 +135,12 @@ _APL_TEAMS = 20
 #                  count, which tracks team_count);
 #       'league' — constant per league (e.g. 1 lookup row).
 PER_LEAGUE_FLOOR_BASES: Dict[str, Tuple[str, int]] = {
-    'whoscored_schedule': ('match', 340),      # 380 fixtures/season - 10% margin
-    'espn_schedule': ('match', 340),           # 380 fixtures/season - 10% margin
-    'sofifa_players': ('team', 450),           # 546 players / league edition - 18%
-    'sofifa_teams': ('team', 18),              # 20 clubs / league - 10%
-    'sofifa_team_ratings': ('team', 18),       # 20 clubs / league - 10%
-    'sofifa_leagues': ('league', 1),           # 1 lookup row per league
+    "whoscored_schedule": ("match", 340),  # 380 fixtures/season - 10% margin
+    "espn_schedule": ("match", 340),  # 380 fixtures/season - 10% margin
+    "sofifa_players": ("team", 450),  # 546 players / league edition - 18%
+    "sofifa_teams": ("team", 18),  # 20 clubs / league - 10%
+    "sofifa_team_ratings": ("team", 18),  # 20 clubs / league - 10%
+    "sofifa_leagues": ("league", 1),  # 1 lookup row per league
 }
 
 
@@ -149,16 +151,17 @@ def scale_floor_for_league(unit: str, base: int, league: str) -> int:
     club league reduces to ``base`` EXACTLY — the #920 Phase 2 equivalence
     contract with the pre-per-league constants.
     """
-    if unit == 'league':
+    if unit == "league":
         return base
     # Lazy import: utils.config is imported by every DAG and by host tests
     # without MEDALLION_CONFIG_DIR — competitions.yaml must only be read when
     # a floor is actually evaluated (same pattern as the runner bridge).
     from utils.medallion_config import get_competition_floor_basis
+
     matches, teams = get_competition_floor_basis(league)
-    if unit == 'match':
+    if unit == "match":
         return base * matches // _APL_MATCHES
-    if unit == 'team':
+    if unit == "team":
         return base * teams // _APL_TEAMS
     raise ValueError(f"unknown floor unit {unit!r}")
 
@@ -197,42 +200,44 @@ MIN_ROW_THRESHOLDS: Dict[str, int] = {
     # scrape (root cause of #102). The source DAG now validates every dynamic
     # catalog scope independently; this old whole-table guard is only a
     # one-scope non-empty floor and must not encode a static league list.
-    'whoscored_schedule': PER_LEAGUE_FLOOR_BASES['whoscored_schedule'][1],
-    'whoscored_events': 20_000_000,  # #895: top-5×10-season backfill landed (27.9M rows, append-only); wipe-floor ~72% of live
+    "whoscored_schedule": PER_LEAGUE_FLOOR_BASES["whoscored_schedule"][1],
+    "whoscored_events": 20_000_000,  # #895: top-5×10-season backfill landed (27.9M rows, append-only); wipe-floor ~72% of live
     # ESPN / SoFIFA (issue #466): same silent-fail class as #102 —
     # read_* swallowed errors and runners exited 0. Floors calibrated against
     # live Bronze counts on 2026-06-11.
-    'espn_schedule': PER_LEAGUE_FLOOR_BASES['espn_schedule'][1],
-    'espn_lineup': 9000,
-    'espn_matchsheet': 620,
+    "espn_schedule": PER_LEAGUE_FLOOR_BASES["espn_schedule"][1],
+    "espn_lineup": 9000,
+    "espn_matchsheet": 620,
     # sofifa_*: club leagues only (INT-* not covered by sofifa), scaled by the
     # club-league count so the floor does not inflate when a tournament joins
     # LEAGUES (#913).
-    'sofifa_players':
-        PER_LEAGUE_FLOOR_BASES['sofifa_players'][1] * len(NON_INTERNATIONAL_LEAGUES),
-    'sofifa_teams':
-        PER_LEAGUE_FLOOR_BASES['sofifa_teams'][1] * len(NON_INTERNATIONAL_LEAGUES),
-    'sofifa_team_ratings':
-        PER_LEAGUE_FLOOR_BASES['sofifa_team_ratings'][1] * len(NON_INTERNATIONAL_LEAGUES),
-    'sofifa_versions': 15,                 # ~20 editions (FIFA 07→FC 26) on post-EA-FC homepage (#654/#670); +1/yr
-    'sofifa_leagues': len(NON_INTERNATIONAL_LEAGUES),   # 1 lookup row per league
-    'sofifa_player_ratings':
-        450 * len(NON_INTERNATIONAL_LEAGUES),  # 546 per-player pages / league edition - 18%; no league column in bronze
+    "sofifa_players": PER_LEAGUE_FLOOR_BASES["sofifa_players"][1]
+    * len(NON_INTERNATIONAL_LEAGUES),
+    "sofifa_teams": PER_LEAGUE_FLOOR_BASES["sofifa_teams"][1]
+    * len(NON_INTERNATIONAL_LEAGUES),
+    "sofifa_team_ratings": PER_LEAGUE_FLOOR_BASES["sofifa_team_ratings"][1]
+    * len(NON_INTERNATIONAL_LEAGUES),
+    "sofifa_versions": 15,  # ~20 editions (FIFA 07→FC 26) on post-EA-FC homepage (#654/#670); +1/yr
+    "sofifa_leagues": len(NON_INTERNATIONAL_LEAGUES),  # 1 lookup row per league
+    "sofifa_player_ratings": 450
+    * len(
+        NON_INTERNATIONAL_LEAGUES
+    ),  # 546 per-player pages / league edition - 18%; no league column in bronze
 }
 
 # Tags for DAG organization
 DAG_TAGS: Dict[str, List[str]] = {
-    'fbref': ['scraping', 'fbref', 'bronze', 'football', 'selenium'],
-    'fotmob': ['scraping', 'fotmob', 'bronze', 'football', 'http'],
-    'matchhistory': ['scraping', 'matchhistory', 'bronze', 'football', 'odds'],
-    'understat': ['scraping', 'understat', 'bronze', 'football', 'xg'],
-    'whoscored': ['scraping', 'whoscored', 'bronze', 'football', 'selenium', 'spadl'],
-    'sofascore': ['scraping', 'sofascore', 'bronze', 'football'],
-    'espn': ['scraping', 'espn', 'bronze', 'football'],
-    'clubelo': ['scraping', 'clubelo', 'bronze', 'football', 'elo'],
-    'sofifa': ['scraping', 'sofifa', 'bronze', 'football', 'fifa'],
-    'transfermarkt': ['scraping', 'transfermarkt', 'bronze', 'football'],
-    'capology': ['scraping', 'capology', 'bronze', 'football', 'salaries'],
-    'master': ['orchestration', 'master', 'pipeline'],
-    'silver_fbref': ['transform', 'fbref', 'silver', 'football', 'trino'],
+    "fbref": ["scraping", "fbref", "bronze", "football", "selenium"],
+    "fotmob": ["scraping", "fotmob", "bronze", "football", "http"],
+    "matchhistory": ["scraping", "matchhistory", "bronze", "football", "odds"],
+    "understat": ["scraping", "understat", "bronze", "football", "xg"],
+    "whoscored": ["scraping", "whoscored", "bronze", "football", "selenium", "spadl"],
+    "sofascore": ["scraping", "sofascore", "bronze", "football"],
+    "espn": ["scraping", "espn", "bronze", "football"],
+    "clubelo": ["scraping", "clubelo", "bronze", "football", "elo"],
+    "sofifa": ["scraping", "sofifa", "bronze", "football", "fifa"],
+    "transfermarkt": ["scraping", "transfermarkt", "bronze", "football"],
+    "capology": ["scraping", "capology", "bronze", "football", "salaries"],
+    "master": ["orchestration", "master", "pipeline"],
+    "silver_fbref": ["transform", "fbref", "silver", "football", "trino"],
 }

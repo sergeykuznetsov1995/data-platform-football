@@ -22,7 +22,7 @@ import json
 import math
 import re
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping, Optional, Protocol, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Sequence
 
 import pandas as pd
 
@@ -1791,7 +1791,28 @@ class EspnBronzeRepository:
                 f"physical row/hash parity failed: expected={expected!r}, observed={observed!r}"
             )
 
-    def publish_scope(self, generation: ScopeGeneration) -> ScopePublicationResult:
+    def publish_scope(
+        self,
+        generation: ScopeGeneration,
+        *,
+        publication_fence: Callable[[], None] | None = None,
+    ) -> ScopePublicationResult:
+        """Publish one generation, rechecking an optional distributed fence.
+
+        The fence is invoked immediately before every append, especially the
+        COMPLETE manifest.  Production orchestration supplies a callback
+        backed by the scope lease epoch; ordinary callers retain the Task 4
+        behavior when no callback is supplied.
+        """
+
+        if publication_fence is not None and not callable(publication_fence):
+            raise TypeError("publication_fence must be callable or None")
+
+        def assert_fence() -> None:
+            if publication_fence is not None:
+                publication_fence()
+
+        assert_fence()
         report = validate_scope_generation(generation)
         if not report.passed:
             raise PublicationError("; ".join(report.failures))
@@ -1828,6 +1849,7 @@ class EspnBronzeRepository:
                     rows = [
                         row for row in rows if row["_row_sha256"] not in existing_hashes
                     ]
+                assert_fence()
                 self._write(table, rows)
             ledger_rows = _ledger_physical_rows(generation)
             if self.verify_physical:
@@ -1843,15 +1865,26 @@ class EspnBronzeRepository:
                     for row in ledger_rows
                     if row["_row_sha256"] not in existing_hashes
                 ]
+            assert_fence()
             self._write(LEDGER_TABLE, ledger_rows)
             if self.verify_physical:
                 self._verify_physical(generation, report)
-            self._write(MANIFEST_TABLE, [manifest])
         except ManifestConflictError:
             raise
         except Exception as exc:
             raise PublicationError(
                 f"scope {generation.plan.scope_id} generation publication failed: {exc}"
+            ) from exc
+        # Keep the lease error outside the generic publication wrapper so the
+        # orchestrator can classify a reclaimed owner as a hard alert.  The
+        # manifest is the visibility boundary: without it physical rows remain
+        # harmless and the previous COMPLETE generation stays current.
+        assert_fence()
+        try:
+            self._write(MANIFEST_TABLE, [manifest])
+        except Exception as exc:
+            raise PublicationError(
+                f"scope {generation.plan.scope_id} manifest publication failed: {exc}"
             ) from exc
         return ScopePublicationResult(
             scope_id=generation.plan.scope_id,
@@ -1859,6 +1892,57 @@ class EspnBronzeRepository:
             state=ScopePublicationState.PUBLISHED,
             manifest_sha256=manifest["manifest_sha256"],
         )
+
+    def verify_published_scope(self, generation: ScopeGeneration) -> ScopeQualityReport:
+        """Run exact current-generation DQ without invoking any append path."""
+
+        report = validate_scope_generation(generation)
+        if not report.passed:
+            raise PublicationError("; ".join(report.failures))
+        expected = generation.manifest_row(report)
+        stored = self._existing_manifest(
+            generation.plan.scope_id, generation.generation_id
+        )
+        if stored is None:
+            raise PublicationError("exact COMPLETE scope manifest is missing")
+        identity_fields = (
+            "manifest_version",
+            "scope_id",
+            "generation_id",
+            "generation_signature",
+            "run_id",
+            "registry_snapshot_uri",
+            "registry_signature",
+            "plan_signature",
+            "parser_version",
+            "runtime_version",
+            "_batch_id",
+            "status",
+            "manifest_sha256",
+        )
+        mismatched = [
+            field
+            for field in identity_fields
+            if stored.get(field) != expected.get(field)
+        ]
+        if mismatched:
+            raise ManifestConflictError(
+                "published manifest identity mismatch: " + ", ".join(mismatched)
+            )
+        if self.verify_physical:
+            self._verify_physical(generation, report)
+        return report
+
+    def exact_complete_exists(self, generation: ScopeGeneration) -> bool:
+        """Return whether this exact, physically valid COMPLETE already exists."""
+
+        existing = self._existing_manifest(
+            generation.plan.scope_id, generation.generation_id
+        )
+        if existing is None:
+            return False
+        self.verify_published_scope(generation)
+        return True
 
     def publish_many(
         self, generations: Iterable[ScopeGeneration]

@@ -155,6 +155,15 @@ class ExecutionResult:
 
 
 @dataclass(frozen=True, slots=True)
+class StagingResult:
+    """Offline parser output before the manifest-gated repository boundary."""
+
+    exit_code: int
+    payload: Mapping[str, Any]
+    generations: Mapping[str, ScopeGeneration]
+
+
+@dataclass(frozen=True, slots=True)
 class KnownNonterminalEvent:
     event_id: int
     event_date: date
@@ -774,6 +783,62 @@ def scope_snapshot_bytes(generation: ScopeGeneration) -> bytes:
         "generation": json.loads(canonical_json(generation)),
     }
     return _canonical_bytes(payload)
+
+
+def load_scope_snapshot(
+    uri: str,
+    *,
+    artifact_sha256: str,
+    expected_scope_id: str | None = None,
+) -> ScopeGeneration:
+    """Load one exact staged/prior generation snapshot for DQ/publication."""
+
+    expected_hash = _sha256(artifact_sha256, "snapshot artifact_sha256")
+    payload = _read_artifact(uri)
+    if hashlib.sha256(payload).hexdigest() != expected_hash:
+        raise RunnerConfigurationError("scope snapshot artifact hash mismatch")
+    try:
+        document = _mapping(json.loads(payload.decode("utf-8")), "scope snapshot")
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RunnerConfigurationError("scope snapshot is not valid JSON") from exc
+    _exact_keys(
+        document,
+        {
+            "kind",
+            "status",
+            "scope_id",
+            "generation_id",
+            "generation_signature",
+            "manifest_sha256",
+            "generation",
+        },
+        "scope snapshot",
+    )
+    if document["kind"] != SCOPE_SNAPSHOT_KIND or document["status"] != "complete":
+        raise RunnerConfigurationError("scope snapshot is not COMPLETE")
+    generation = _scope_generation(document["generation"])
+    if expected_scope_id is not None and generation.plan.scope_id != expected_scope_id:
+        raise RunnerConfigurationError("scope snapshot scope identity mismatch")
+    expected = (
+        generation.plan.scope_id,
+        generation.generation_id,
+        generation.generation_signature,
+        generation.manifest_sha256,
+    )
+    actual = (
+        document["scope_id"],
+        document["generation_id"],
+        document["generation_signature"],
+        document["manifest_sha256"],
+    )
+    if actual != expected:
+        raise RunnerConfigurationError("scope snapshot generation identity mismatch")
+    report = validate_scope_generation(generation)
+    if not report.passed:
+        raise RunnerConfigurationError(
+            "scope snapshot DQ failed: " + "; ".join(report.failures)
+        )
+    return generation
 
 
 def _schedule_row(value: Any, field_name: str) -> ScheduleRow:
@@ -1618,8 +1683,10 @@ def _execute_scope(
     raw_manifest: dict[str, Any],
     raw_store: EspnRawStore,
     http_client: Any | None,
-    repository: RepositoryProtocol,
+    repository: RepositoryProtocol | None,
     budget_state: _BudgetState,
+    publish: bool = True,
+    staged_generations: dict[str, ScopeGeneration] | None = None,
 ) -> dict[str, Any]:
     if not binding.active:
         if prior is None:
@@ -1888,6 +1955,25 @@ def _execute_scope(
     snapshot = scope_snapshot_bytes(generation)
     _assert_immutable_target(binding.generation_snapshot_uri, snapshot)
     _write_artifact(binding.generation_snapshot_uri, snapshot, immutable=True)
+    if staged_generations is not None:
+        staged_generations[scope.scope_id] = generation
+    if not publish:
+        return {
+            "scope_id": scope.scope_id,
+            "state": "staged",
+            "generation_id": generation.generation_id,
+            "generation_signature": generation.generation_signature,
+            "manifest_sha256": generation.manifest_sha256,
+            "generation_snapshot_uri": binding.generation_snapshot_uri,
+            "generation_snapshot_sha256": hashlib.sha256(snapshot).hexdigest(),
+            "row_counts": {
+                "schedule": len(generation.schedule),
+                "lineup": len(generation.lineup),
+                "matchsheet": len(generation.matchsheet),
+            },
+        }
+    if repository is None:
+        raise AssertionError("publication requires a repository")
     publication = repository.publish_scope(generation)
     if publication.state not in {
         ScopePublicationState.PUBLISHED,
@@ -1922,6 +2008,122 @@ def _default_http_client(raw_store: EspnRawStore, selected_count: int, max_event
         max_bytes=DEFAULT_MAX_TASK_BYTES,
     )
     return EspnHttpClient(raw_store, budget=budget)
+
+
+def stage(
+    options: ExecutionOptions,
+    *,
+    raw_store: EspnRawStore | None = None,
+) -> StagingResult:
+    """Build validated generation snapshots from exact Raw with zero HTTP.
+
+    This is the Task 6 phase seam.  It deliberately has no HTTP-client or
+    repository argument: missing Raw evidence makes the scope incomplete, and
+    publication can happen only after a separate staging-DQ task.
+    """
+
+    if not isinstance(options, ExecutionOptions):
+        raise TypeError("options must be ExecutionOptions")
+    loaded = _load_signed_plan(options.plan_uri)
+    selected = _validate_options(options, loaded)
+    _preflight_artifact_uris(options, loaded, selected)
+    registry = _load_registry(
+        loaded.registry_snapshot_uri, loaded.plan.registry_signature
+    )
+    registry_scopes = {
+        scope.scope_id: _registry_scope(registry, scope) for scope in selected
+    }
+    priors: dict[str, ScopeGeneration | None] = {}
+    for scope in selected:
+        prior_binding = loaded.bindings[scope.scope_id].prior
+        priors[scope.scope_id] = (
+            _load_prior(prior_binding, scope) if prior_binding is not None else None
+        )
+    raw_manifest, existed = _load_raw_manifest(loaded, selected)
+    if not existed:
+        return StagingResult(
+            exit_code=1,
+            payload={
+                "kind": "espn-native-staging-result-v1",
+                "schema_version": 1,
+                "run_id": loaded.plan.run_id,
+                "attempt": loaded.attempt,
+                "plan_signature": loaded.signature,
+                "state": "incomplete",
+                "scopes": [
+                    {
+                        "scope_id": scope.scope_id,
+                        "state": "incomplete",
+                        "error": "exact raw manifest is missing",
+                    }
+                    for scope in selected
+                ],
+            },
+            generations={},
+        )
+    active = [scope for scope in selected if loaded.bindings[scope.scope_id].active]
+    if active and raw_store is None:
+        raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    budget_state = _BudgetState(options.max_events)
+    generations: dict[str, ScopeGeneration] = {}
+    scope_results: list[dict[str, Any]] = []
+    for scope in selected:
+        competition, edition = registry_scopes[scope.scope_id]
+        try:
+            result = _execute_scope(
+                loaded=loaded,
+                scope=scope,
+                competition=competition,
+                edition=edition,
+                binding=loaded.bindings[scope.scope_id],
+                prior=priors[scope.scope_id],
+                raw_manifest=raw_manifest,
+                raw_store=raw_store,
+                http_client=None,
+                repository=None,
+                budget_state=budget_state,
+                publish=False,
+                staged_generations=generations,
+            )
+        except RunnerConfigurationError:
+            raise
+        except Exception as exc:
+            result = {
+                "scope_id": scope.scope_id,
+                "state": "incomplete",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        scope_results.append(result)
+    incomplete = any(item["state"] == "incomplete" for item in scope_results)
+    staged = any(item["state"] == "staged" for item in scope_results)
+    state = "incomplete" if incomplete else ("staged" if staged else "noop")
+    payload_base = {
+        "kind": "espn-native-staging-result-v1",
+        "schema_version": 1,
+        "run_id": loaded.plan.run_id,
+        "attempt": loaded.attempt,
+        "mode": loaded.mode,
+        "as_of": loaded.plan.as_of.isoformat(),
+        "plan_signature": loaded.signature,
+        "registry_signature": loaded.plan.registry_signature,
+        "raw_manifest_uri": loaded.raw_manifest_uri,
+        "raw_manifest_sha256": hashlib.sha256(
+            _canonical_bytes(raw_manifest)
+        ).hexdigest(),
+        "state": state,
+        "scopes": scope_results,
+    }
+    payload = {
+        **payload_base,
+        "staging_result_sha256": hashlib.sha256(
+            _canonical_bytes(payload_base)
+        ).hexdigest(),
+    }
+    return StagingResult(
+        exit_code=1 if incomplete else 0,
+        payload=payload,
+        generations=generations,
+    )
 
 
 def execute(
@@ -2051,7 +2253,10 @@ __all__ = [
     "RunnerConfigurationError",
     "RunnerError",
     "ScopeIncompleteError",
+    "StagingResult",
     "execute",
     "is_full_reconciliation_day",
+    "load_scope_snapshot",
     "scope_snapshot_bytes",
+    "stage",
 ]
