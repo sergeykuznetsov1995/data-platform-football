@@ -40,6 +40,7 @@ MANIFEST_VERSION = "espn-ingest-manifest-v2"
 CATALOG_TABLE = "espn_catalog_snapshot_v2"
 MANIFEST_TABLE = "espn_ingest_manifest_v2"
 CUTOVER_TABLE = "espn_scope_cutover_v2"
+LEDGER_TABLE = "espn_request_ledger_generation_v2"
 ENTITY_TABLES = MappingProxyType(
     {
         "schedule": "espn_schedule_generation_v2",
@@ -59,6 +60,7 @@ _ENTITIES = tuple(ENTITY_TABLES)
 PROVENANCE_COLUMNS = (
     "scope_id",
     "generation_id",
+    "generation_signature",
     "run_id",
     "registry_snapshot_uri",
     "registry_signature",
@@ -73,6 +75,16 @@ PROVENANCE_COLUMNS = (
     "_source",
     "_entity_type",
     "_row_sha256",
+)
+
+TABLE_PARTITIONS = MappingProxyType(
+    {
+        **{table: ("scope_id",) for table in ENTITY_TABLES.values()},
+        LEDGER_TABLE: ("scope_id",),
+        MANIFEST_TABLE: ("scope_id",),
+        CUTOVER_TABLE: ("scope_id",),
+        CATALOG_TABLE: ("snapshot_id",),
+    }
 )
 
 
@@ -97,7 +109,7 @@ def _identifier(value: object, field_name: str) -> str:
 
 
 def _required_string(value: object, field_name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
+    if type(value) is not str or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
     return value
 
@@ -128,6 +140,33 @@ def _aware_utc(value: object, field_name: str) -> datetime:
     ):
         raise ValueError(f"{field_name} must be a timezone-aware datetime")
     return value.astimezone(timezone.utc)
+
+
+def _stored_utc(value: object, field_name: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise ValueError(f"{field_name} must be a datetime")
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _text(value: object, field_name: str, *, optional: bool = False) -> None:
+    if value is None and optional:
+        return
+    if type(value) is not str or not value.strip():
+        kind = "non-empty string or null" if optional else "non-empty string"
+        raise TypeError(f"{field_name} must be a {kind}")
+
+
+def _canonical_json_text(value: object, field_name: str) -> None:
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be canonical JSON text")
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{field_name} must be valid JSON") from exc
+    if canonical_json(decoded) != value:
+        raise ValueError(f"{field_name} must use canonical JSON encoding")
 
 
 def _json_value(value: Any) -> Any:
@@ -166,6 +205,23 @@ def canonical_json(value: Any) -> str:
 
 def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _freeze_json(value: Any, field_name: str) -> Any:
+    if isinstance(value, Mapping):
+        frozen: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"{field_name} keys must be strings")
+            frozen[key] = _freeze_json(item, f"{field_name}.{key}")
+        return MappingProxyType(frozen)
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_json(item, field_name) for item in value)
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"{field_name} must contain finite JSON numbers")
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"{field_name} must contain JSON-compatible values")
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +278,43 @@ class RawLedgerRecord:
 
     def constructor_values(self) -> dict[str, Any]:
         return {field.name: getattr(self, field.name) for field in fields(self)}
+
+    @classmethod
+    def from_physical_row(cls, row: Mapping[str, Any]) -> "RawLedgerRecord":
+        if not isinstance(row, Mapping):
+            raise TypeError("physical ledger row must be a mapping")
+        raw_event_ids = row.get("event_ids_json")
+        if not isinstance(raw_event_ids, str):
+            raise ValueError("physical ledger event_ids_json must be canonical JSON")
+        try:
+            event_ids = json.loads(raw_event_ids)
+        except json.JSONDecodeError as exc:
+            raise ValueError("physical ledger event_ids_json is invalid") from exc
+        if canonical_json(event_ids) != raw_event_ids:
+            raise ValueError("physical ledger event_ids_json must be canonical JSON")
+        raw_disposition = row.get("disposition")
+        try:
+            disposition = DispositionState(raw_disposition)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("physical ledger disposition is invalid") from exc
+        raw_fetched_at = row.get("fetched_at")
+        fetched_at = (
+            None
+            if raw_fetched_at is None
+            else _stored_utc(raw_fetched_at, "physical ledger fetched_at")
+        )
+        return cls(
+            request_id=row.get("request_id"),
+            endpoint=row.get("endpoint"),
+            event_id=row.get("event_id"),
+            disposition=disposition,
+            raw_uri=row.get("raw_uri"),
+            raw_sha256=row.get("raw_sha256"),
+            fetched_at=fetched_at,
+            direct_bytes=row.get("direct_bytes"),
+            proxy_bytes=row.get("proxy_bytes"),
+            event_ids=tuple(event_ids),
+        )
 
 
 _ROW_TYPES = {
@@ -304,6 +397,30 @@ class ScopeGeneration:
         return {field.name: getattr(self, field.name) for field in fields(self)}
 
     @property
+    def generation_signature(self) -> str:
+        return canonical_sha256(
+            {
+                "repository_version": REPOSITORY_VERSION,
+                "plan": self.plan,
+                "run_id": self.run_id,
+                "generation_id": self.generation_id,
+                "registry_snapshot_uri": self.registry_snapshot_uri,
+                "registry_signature": self.registry_signature,
+                "plan_signature": self.plan_signature,
+                "parser_version": self.parser_version,
+                "runtime_version": self.runtime_version,
+                "ingested_at": self.ingested_at,
+                "batch_id": self.batch_id,
+                "schedule": self.schedule,
+                "lineup": self.lineup,
+                "matchsheet": self.matchsheet,
+                "planned_request_ids": self.planned_request_ids,
+                "raw_ledger": self.raw_ledger,
+                "dispositions": self.dispositions,
+            }
+        )
+
+    @property
     def manifest_sha256(self) -> str:
         return self.manifest_row()["manifest_sha256"]
 
@@ -319,6 +436,7 @@ class ScopeGeneration:
             "source_season_year": self.plan.source_season_year,
             "run_id": self.run_id,
             "generation_id": self.generation_id,
+            "generation_signature": self.generation_signature,
             "_batch_id": self.batch_id,
             "registry_snapshot_uri": self.registry_snapshot_uri,
             "registry_signature": self.registry_signature,
@@ -328,6 +446,14 @@ class ScopeGeneration:
             "status": "complete",
             "row_counts_json": canonical_json(dict(report.row_counts)),
             "row_hashes_json": canonical_json(dict(report.row_hashes)),
+            "ledger_count": report.ledger_count,
+            "ledger_hash": report.ledger_hash,
+            "planned_request_ids_json": canonical_json(
+                sorted(self.planned_request_ids)
+            ),
+            "planned_request_ids_sha256": canonical_sha256(
+                sorted(self.planned_request_ids)
+            ),
             "raw_ledger_sha256": canonical_sha256(self.raw_ledger),
             "dispositions_json": canonical_json(self.dispositions),
             "quality_json": canonical_json(
@@ -344,6 +470,32 @@ def _validate_row_native_types(entity: str, row: Any) -> None:
     if getattr(row, "scope_id") != f"{row.competition_id}:{row.source_season_year}":
         raise ValueError(f"{entity}.scope_id conflicts with native identity")
     if entity == "schedule":
+        for field_name in (
+            "scope_id",
+            "competition_slug",
+            "status",
+            "status_map_version",
+            "home_team",
+            "away_team",
+            "league",
+            "season",
+            "game",
+            "league_id",
+            "parser_version",
+        ):
+            _text(getattr(row, field_name), f"schedule.{field_name}")
+        for field_name in (
+            "venue",
+            "attendance",
+            "home_goals",
+            "away_goals",
+        ):
+            _text(
+                getattr(row, field_name),
+                f"schedule.{field_name}",
+                optional=True,
+            )
+        _canonical_json_text(row.extra_json, "schedule.extra_json")
         for field_name in ("home_team_id", "away_team_id", "game_id"):
             _positive_native_id(getattr(row, field_name), f"schedule.{field_name}")
         for field_name in ("venue_id",):
@@ -368,8 +520,42 @@ def _validate_row_native_types(entity: str, row: Any) -> None:
         _positive_native_id(row.team_id, f"{entity}.team_id")
         if type(row.is_home) is not bool:
             raise TypeError(f"{entity}.is_home must be boolean")
+        for field_name in (
+            "scope_id",
+            "team",
+            "home_away",
+            "league",
+            "season",
+            "game",
+            "parser_version",
+        ):
+            _text(getattr(row, field_name), f"{entity}.{field_name}")
+        if row.home_away not in {"home", "away"}:
+            raise ValueError(f"{entity}.home_away must be home or away")
+        if row.is_home != (row.home_away == "home"):
+            raise ValueError(f"{entity}.home_away conflicts with is_home")
         if entity == "lineup":
             _positive_native_id(row.athlete_id, "lineup.athlete_id")
+            _text(row.player, "lineup.player")
+            _text(row.stat_map_version, "lineup.stat_map_version")
+            for field_name in (
+                "jersey",
+                "position",
+                "formation_place",
+                "sub_in",
+                "sub_out",
+            ):
+                _text(
+                    getattr(row, field_name),
+                    f"lineup.{field_name}",
+                    optional=True,
+                )
+            for field_name in (
+                "substitutions_json",
+                "statistics_json",
+                "extra_json",
+            ):
+                _canonical_json_text(getattr(row, field_name), f"lineup.{field_name}")
             for field_name in ("starter", "captain", "subbed_in", "subbed_out"):
                 value = getattr(row, field_name)
                 if value is not None and type(value) is not bool:
@@ -393,14 +579,61 @@ def _validate_row_native_types(entity: str, row: Any) -> None:
             ):
                 value = getattr(row, field_name)
                 if value is not None and (
-                    isinstance(value, bool)
-                    or not isinstance(value, (int, float))
-                    or not math.isfinite(value)
+                    type(value) is not float or not math.isfinite(value)
                 ):
                     raise TypeError(
                         f"lineup.{field_name} must be finite numeric or null"
                     )
         if entity == "matchsheet":
+            _text(row.stat_map_version, "matchsheet.stat_map_version")
+            for field_name in (
+                "accurate_crosses",
+                "accurate_long_balls",
+                "accurate_passes",
+                "blocked_shots",
+                "capacity",
+                "cross_pct",
+                "effective_clearance",
+                "effective_tackles",
+                "fouls_committed",
+                "goal_assists",
+                "goal_difference",
+                "goals_conceded",
+                "interceptions",
+                "longball_pct",
+                "offsides",
+                "pass_pct",
+                "penalty_kick_goals",
+                "penalty_kick_shots",
+                "possession_pct",
+                "red_cards",
+                "roster",
+                "saves",
+                "shot_pct",
+                "shots_on_target",
+                "tackle_pct",
+                "total_clearance",
+                "total_crosses",
+                "total_goals",
+                "total_long_balls",
+                "total_passes",
+                "total_shots",
+                "total_tackles",
+                "won_corners",
+                "yellow_cards",
+                "corner_kicks",
+                "venue",
+                "referee",
+            ):
+                _text(
+                    getattr(row, field_name),
+                    f"matchsheet.{field_name}",
+                    optional=True,
+                )
+            for field_name in ("statistics_json", "extra_json"):
+                _canonical_json_text(
+                    getattr(row, field_name), f"matchsheet.{field_name}"
+                )
             for field_name in ("venue_id", "referee_id"):
                 value = getattr(row, field_name)
                 if value is not None:
@@ -418,6 +651,8 @@ class ScopeQualityReport:
     failures: tuple[str, ...]
     row_counts: Mapping[str, int]
     row_hashes: Mapping[str, str]
+    ledger_count: int
+    ledger_hash: str
 
     def __post_init__(self) -> None:
         if _SCOPE_RE.fullmatch(self.scope_id) is None:
@@ -427,6 +662,8 @@ class ScopeQualityReport:
         object.__setattr__(self, "failures", tuple(self.failures))
         object.__setattr__(self, "row_counts", MappingProxyType(dict(self.row_counts)))
         object.__setattr__(self, "row_hashes", MappingProxyType(dict(self.row_hashes)))
+        _nonnegative_int(self.ledger_count, "ledger_count")
+        _sha256(self.ledger_hash, "ledger_hash")
 
 
 def _raw_binding(
@@ -466,6 +703,7 @@ def row_fingerprint(generation: ScopeGeneration, entity: str, row: Any) -> str:
             "row": row,
             "scope_id": generation.plan.scope_id,
             "generation_id": generation.generation_id,
+            "generation_signature": generation.generation_signature,
             "run_id": generation.run_id,
             "registry_snapshot_uri": generation.registry_snapshot_uri,
             "registry_signature": generation.registry_signature,
@@ -479,6 +717,34 @@ def row_fingerprint(generation: ScopeGeneration, entity: str, row: Any) -> str:
             "batch_id": generation.batch_id,
         }
     )
+
+
+def ledger_row_fingerprint(generation: ScopeGeneration, record: RawLedgerRecord) -> str:
+    if not isinstance(record, RawLedgerRecord):
+        raise TypeError("record must be RawLedgerRecord")
+    return canonical_sha256(
+        {
+            "record": record,
+            "scope_id": generation.plan.scope_id,
+            "generation_id": generation.generation_id,
+            "generation_signature": generation.generation_signature,
+            "run_id": generation.run_id,
+            "registry_snapshot_uri": generation.registry_snapshot_uri,
+            "registry_signature": generation.registry_signature,
+            "plan_signature": generation.plan_signature,
+            "parser_version": generation.parser_version,
+            "runtime_version": generation.runtime_version,
+            "ingested_at": generation.ingested_at,
+            "batch_id": generation.batch_id,
+        }
+    )
+
+
+def _ledger_dataset_hash(generation: ScopeGeneration) -> str:
+    hashes = sorted(
+        ledger_row_fingerprint(generation, record) for record in generation.raw_ledger
+    )
+    return hashlib.sha256("".join(hashes).encode("ascii")).hexdigest()
 
 
 def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport:
@@ -496,6 +762,11 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
         failures.append("planned/raw ledger parity: duplicate request identity")
     if set(planned) != set(observed):
         failures.append("planned/raw ledger parity: request sets differ")
+    if any(
+        item.disposition is not DispositionState.CAPTURED
+        for item in generation.raw_ledger
+    ):
+        failures.append("planned raw request is not captured")
     if any(item.proxy_bytes != 0 for item in generation.raw_ledger):
         failures.append("proxy bytes must be exactly zero")
 
@@ -517,6 +788,8 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
             <= scope.end_date
         ):
             failures.append("edition window excludes schedule event")
+        if row.date != row.kickoff or row.match_date != row.kickoff:
+            failures.append("schedule legacy timestamps must equal native kickoff")
         if row.event_id in schedule_by_event:
             failures.append("schedule event uniqueness violated")
         schedule_by_event[row.event_id] = row
@@ -524,8 +797,29 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
             failures.append("schedule event must have two distinct sides")
         if row.played_final and (row.home_score is None or row.away_score is None):
             failures.append("played-final schedule event requires both scores")
+        if (
+            row.played_final
+            and row.terminal_nonplayed
+            or row.terminal != (row.played_final or row.terminal_nonplayed)
+            or row.summary_required != row.played_final
+        ):
+            failures.append("schedule status flag invariant violated")
+        if row.terminal_nonplayed and (
+            row.home_score is not None or row.away_score is not None
+        ):
+            failures.append("terminal nonplayed event must not carry scores")
     if not generation.schedule:
         failures.append("schedule is required and must not be empty")
+    scoreboard_event_ids = [
+        event_id
+        for item in generation.raw_ledger
+        if item.endpoint == "scoreboard"
+        for event_id in item.event_ids
+    ]
+    if set(scoreboard_event_ids) != set(schedule_by_event) or len(
+        scoreboard_event_ids
+    ) != len(set(scoreboard_event_ids)):
+        failures.append("scoreboard event binding parity differs from schedule")
     for event_id in schedule_by_event:
         raw_bindings = [
             item
@@ -595,25 +889,29 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
         matchsheet_keys.add(key)
         matchsheet_by_event.setdefault(row.event_id, set()).add(row.team_id)
 
+    for entity, grouped in (
+        ("lineup", lineup_by_event),
+        ("matchsheet", matchsheet_by_event),
+    ):
+        for event_id, sides in grouped.items():
+            event = schedule_by_event.get(event_id)
+            if event is None:
+                continue
+            if sides != {event.home_team_id, event.away_team_id}:
+                failures.append(f"{entity} two-side completeness failed for {event_id}")
+
     disposition_index: dict[tuple[str, int], RequestDisposition] = {}
     for item in generation.dispositions:
         if item.endpoint not in {"lineup", "matchsheet"} or item.event_id is None:
-            failures.append("played-final disposition has invalid entity or event")
+            failures.append("entity disposition has invalid endpoint or event")
             continue
         if item.event_id not in schedule_by_event:
-            failures.append("played-final disposition references an unknown event")
+            failures.append("entity disposition references an unknown event")
         key = (item.endpoint, item.event_id)
         if key in disposition_index:
-            failures.append("played-final disposition is duplicated")
+            failures.append("entity disposition is duplicated")
         disposition_index[key] = item
 
-    successful_summary = {
-        item.event_id
-        for item in generation.raw_ledger
-        if item.endpoint == "summary"
-        and item.disposition is DispositionState.CAPTURED
-        and item.event_id is not None
-    }
     captured_summary_counts: dict[int, int] = {}
     for item in generation.raw_ledger:
         if item.endpoint == "summary" and item.disposition is DispositionState.CAPTURED:
@@ -630,64 +928,60 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
                 )
     if any(count != 1 for count in captured_summary_counts.values()):
         failures.append("Summary raw binding must be exact per event")
+    for event_id in captured_summary_counts:
+        for entity in ("lineup", "matchsheet"):
+            if (entity, event_id) not in disposition_index:
+                failures.append(
+                    f"captured Summary disposition missing for {entity}/{event_id}"
+                )
 
     for (entity, event_id), disposition in disposition_index.items():
-        if disposition.state is not DispositionState.CAPTURED:
-            continue
         event = schedule_by_event.get(event_id)
         if event is None:
             continue
-        expected_sides = {event.home_team_id, event.away_team_id}
         sides = (
             lineup_by_event.get(event_id, set())
             if entity == "lineup"
             else matchsheet_by_event.get(event_id, set())
         )
-        if sides != expected_sides:
-            label = (
-                "matchsheet two-side completeness"
-                if entity == "matchsheet"
-                else "lineup two-side completeness"
-            )
-            failures.append(f"{label} failed for {event_id}")
+        capability = getattr(scope.capabilities, entity)
+        summary_count = captured_summary_counts.get(event_id, 0)
+        if disposition.state is DispositionState.CAPTURED:
+            if summary_count != 1:
+                failures.append(
+                    f"captured {entity} requires exact raw Summary for {event_id}"
+                )
+            if sides != {event.home_team_id, event.away_team_id}:
+                failures.append(f"{entity} two-side completeness failed for {event_id}")
+        elif disposition.state is DispositionState.VALID_EMPTY:
+            if capability not in {CapabilityState.PARTIAL, CapabilityState.ABSENT}:
+                failures.append(f"valid_empty is forbidden for proven {entity}")
+            if summary_count != 1:
+                failures.append(
+                    f"valid_empty requires successful raw Summary for {entity}/{event_id}"
+                )
+            if sides:
+                failures.append(f"valid_empty {entity} contains physical rows")
+        else:
+            failures.append(f"entity disposition unresolved for {entity}/{event_id}")
+
+    for entity, grouped in (
+        ("lineup", lineup_by_event),
+        ("matchsheet", matchsheet_by_event),
+    ):
+        for event_id in grouped:
+            if (entity, event_id) not in disposition_index:
+                failures.append(
+                    f"emitted {entity} rows lack disposition for {event_id}"
+                )
+
     for event_id, event in schedule_by_event.items():
         if not event.played_final:
             continue
-        expected_sides = {event.home_team_id, event.away_team_id}
-        for entity, capability, sides in (
-            ("lineup", scope.capabilities.lineup, lineup_by_event.get(event_id, set())),
-            (
-                "matchsheet",
-                scope.capabilities.matchsheet,
-                matchsheet_by_event.get(event_id, set()),
-            ),
-        ):
-            disposition = disposition_index.get((entity, event_id))
-            if disposition is None:
+        for entity in ("lineup", "matchsheet"):
+            if (entity, event_id) not in disposition_index:
                 failures.append(
                     f"played-final disposition missing for {entity}/{event_id}"
-                )
-                continue
-            if disposition.state is DispositionState.CAPTURED:
-                if sides != expected_sides:
-                    label = (
-                        "matchsheet two-side completeness"
-                        if entity == "matchsheet"
-                        else "lineup two-side completeness"
-                    )
-                    failures.append(f"{label} failed for {event_id}")
-            elif disposition.state is DispositionState.VALID_EMPTY:
-                if capability not in {CapabilityState.PARTIAL, CapabilityState.ABSENT}:
-                    failures.append(f"valid_empty is forbidden for proven {entity}")
-                if event_id not in successful_summary:
-                    failures.append(
-                        f"valid_empty requires successful raw Summary for {entity}/{event_id}"
-                    )
-                if sides:
-                    failures.append(f"valid_empty {entity} contains physical rows")
-            else:
-                failures.append(
-                    f"played-final disposition unresolved for {entity}/{event_id}"
                 )
 
     row_hashes: dict[str, str] = {}
@@ -708,6 +1002,8 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
         failures=tuple(dict.fromkeys(failures)),
         row_counts=row_counts,
         row_hashes=row_hashes,
+        ledger_count=len(generation.raw_ledger),
+        ledger_hash=_ledger_dataset_hash(generation),
     )
 
 
@@ -724,6 +1020,220 @@ class ScopePublicationResult:
 class BatchPublicationResult:
     results: tuple[ScopePublicationResult, ...]
     passed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogSnapshot:
+    snapshot_id: str
+    registry_signature: str
+    captured_at: datetime
+    run_id: str
+    raw_uri: str
+    raw_sha256: str
+    parser_version: str
+    runtime_version: str
+    ingested_at: datetime
+    batch_id: str
+    competitions: tuple[Mapping[str, Any], ...]
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "snapshot_id",
+            "run_id",
+            "raw_uri",
+            "parser_version",
+            "runtime_version",
+            "batch_id",
+        ):
+            _required_string(getattr(self, field_name), field_name)
+        _sha256(self.registry_signature, "registry_signature")
+        _sha256(self.raw_sha256, "raw_sha256")
+        _aware_utc(self.captured_at, "captured_at")
+        _aware_utc(self.ingested_at, "ingested_at")
+        if not isinstance(self.competitions, (tuple, list)):
+            raise TypeError("catalog competitions must be a sequence")
+        normalized: list[tuple[int, Mapping[str, Any]]] = []
+        seen_ids: set[int] = set()
+        seen_slugs: set[str] = set()
+        for raw in self.competitions:
+            if not isinstance(raw, Mapping):
+                raise TypeError("catalog competition must be a mapping")
+            espn_id = _positive_native_id(raw.get("espn_id"), "catalog espn_id")
+            slug = _required_string(raw.get("slug"), "catalog slug")
+            if espn_id in seen_ids or slug in seen_slugs:
+                raise ValueError("catalog snapshot has duplicate ID or slug")
+            seen_ids.add(espn_id)
+            seen_slugs.add(slug)
+            frozen = _freeze_json(dict(raw), "catalog competition")
+            normalized.append((espn_id, frozen))
+        if not normalized:
+            raise ValueError("catalog snapshot must contain competitions")
+        object.__setattr__(
+            self,
+            "competitions",
+            tuple(value for _, value in sorted(normalized, key=lambda item: item[0])),
+        )
+
+    @property
+    def content_sha256(self) -> str:
+        return canonical_sha256(self.competitions)
+
+    @property
+    def snapshot_signature(self) -> str:
+        return canonical_sha256(
+            {
+                "snapshot_id": self.snapshot_id,
+                "registry_signature": self.registry_signature,
+                "captured_at": self.captured_at,
+                "run_id": self.run_id,
+                "raw_uri": self.raw_uri,
+                "raw_sha256": self.raw_sha256,
+                "parser_version": self.parser_version,
+                "runtime_version": self.runtime_version,
+                "ingested_at": self.ingested_at,
+                "batch_id": self.batch_id,
+                "content_sha256": self.content_sha256,
+            }
+        )
+
+    @property
+    def rows(self) -> tuple[dict[str, Any], ...]:
+        output: list[dict[str, Any]] = []
+        for raw in self.competitions:
+            payload = canonical_json(raw)
+            output.append(
+                {
+                    "snapshot_id": self.snapshot_id,
+                    "snapshot_signature": self.snapshot_signature,
+                    "snapshot_content_sha256": self.content_sha256,
+                    "registry_signature": self.registry_signature,
+                    "competition_id": raw["espn_id"],
+                    "competition_slug": raw["slug"],
+                    "record_json": payload,
+                    "record_sha256": hashlib.sha256(
+                        payload.encode("utf-8")
+                    ).hexdigest(),
+                    "captured_at": self.captured_at,
+                    "run_id": self.run_id,
+                    "raw_uri": self.raw_uri,
+                    "raw_sha256": self.raw_sha256,
+                    "parser_version": self.parser_version,
+                    "runtime_version": self.runtime_version,
+                    "_source_fetched_at": self.captured_at,
+                    "_ingested_at": self.ingested_at,
+                    "_batch_id": self.batch_id,
+                    "_source": "espn",
+                    "_entity_type": "catalog",
+                }
+            )
+        return tuple(output)
+
+
+@dataclass(frozen=True, slots=True)
+class ScopeCutover:
+    """One source transition with an immutable activation-readiness proof.
+
+    The bound native generation proves that native data was complete when the
+    source was activated; it is not a version pin.  Once native is active, the
+    current views keep selecting the latest validated generation for the scope.
+    """
+
+    cutover_id: str
+    scope_id: str
+    active_source: str
+    previous_source: str
+    predecessor_cutover_id: str | None
+    predecessor_cutover_sha256: str | None
+    legacy_league: str
+    legacy_season: str
+    registry_signature: str
+    effective_at: datetime
+    native_generation_id: str | None
+    native_generation_signature: str | None
+    native_manifest_sha256: str | None
+    rollback_run_id: str | None
+    rollback_reason: str | None
+    metadata: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        for field_name in ("cutover_id", "legacy_league", "legacy_season"):
+            _required_string(getattr(self, field_name), field_name)
+        if (
+            not isinstance(self.scope_id, str)
+            or _SCOPE_RE.fullmatch(self.scope_id) is None
+        ):
+            raise ValueError("cutover scope_id is invalid")
+        if self.active_source not in {
+            "native",
+            "legacy",
+        } or self.previous_source not in {
+            "native",
+            "legacy",
+        }:
+            raise ValueError("cutover sources must be native or legacy")
+        if self.active_source == self.previous_source:
+            raise ValueError("cutover must change active source")
+        predecessor_values = (
+            self.predecessor_cutover_id,
+            self.predecessor_cutover_sha256,
+        )
+        if any(value is not None for value in predecessor_values) and not all(
+            value is not None for value in predecessor_values
+        ):
+            raise ValueError(
+                "cutover predecessor ID and hash must be supplied together"
+            )
+        if self.predecessor_cutover_id is not None:
+            _required_string(self.predecessor_cutover_id, "predecessor_cutover_id")
+            _sha256(
+                self.predecessor_cutover_sha256,
+                "predecessor_cutover_sha256",
+            )
+        _sha256(self.registry_signature, "registry_signature")
+        _aware_utc(self.effective_at, "effective_at")
+        native_values = (
+            self.native_generation_id,
+            self.native_generation_signature,
+            self.native_manifest_sha256,
+        )
+        if self.active_source == "native":
+            if self.previous_source != "legacy" or not all(native_values):
+                raise ValueError(
+                    "native cutover requires legacy transition and complete manifest binding"
+                )
+            _required_string(self.native_generation_id, "native_generation_id")
+            _sha256(self.native_generation_signature, "native_generation_signature")
+            _sha256(self.native_manifest_sha256, "native_manifest_sha256")
+            if self.rollback_run_id is not None or self.rollback_reason is not None:
+                raise ValueError("native cutover must not claim rollback audit fields")
+        else:
+            if self.previous_source != "native" or any(native_values):
+                raise ValueError(
+                    "legacy rollback must transition from native without native binding"
+                )
+            _required_string(self.rollback_run_id, "rollback_run_id")
+            _required_string(self.rollback_reason, "rollback_reason")
+        if not isinstance(self.metadata, Mapping) or not self.metadata:
+            raise ValueError("cutover metadata must be a non-empty mapping")
+        object.__setattr__(self, "metadata", _freeze_json(self.metadata, "metadata"))
+
+    def constructor_values(self) -> dict[str, Any]:
+        return {field.name: getattr(self, field.name) for field in fields(self)}
+
+    @property
+    def cutover_sha256(self) -> str:
+        return canonical_sha256(self.constructor_values())
+
+    def to_row(self) -> dict[str, Any]:
+        return {
+            **{
+                field.name: getattr(self, field.name)
+                for field in fields(self)
+                if field.name != "metadata"
+            },
+            "metadata_json": canonical_json(self.metadata),
+            "cutover_sha256": self.cutover_sha256,
+        }
 
 
 class WriterProtocol(Protocol):
@@ -756,6 +1266,7 @@ def _physical_rows(generation: ScopeGeneration, entity: str) -> list[dict[str, A
             {
                 "scope_id": generation.plan.scope_id,
                 "generation_id": generation.generation_id,
+                "generation_signature": generation.generation_signature,
                 "run_id": generation.run_id,
                 "registry_snapshot_uri": generation.registry_snapshot_uri,
                 "registry_signature": generation.registry_signature,
@@ -776,6 +1287,43 @@ def _physical_rows(generation: ScopeGeneration, entity: str) -> list[dict[str, A
     return output
 
 
+def _ledger_physical_rows(generation: ScopeGeneration) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for record in generation.raw_ledger:
+        output.append(
+            {
+                "scope_id": generation.plan.scope_id,
+                "competition_id": generation.plan.espn_id,
+                "source_season_year": generation.plan.source_season_year,
+                "generation_id": generation.generation_id,
+                "generation_signature": generation.generation_signature,
+                "run_id": generation.run_id,
+                "_batch_id": generation.batch_id,
+                "registry_snapshot_uri": generation.registry_snapshot_uri,
+                "registry_signature": generation.registry_signature,
+                "plan_signature": generation.plan_signature,
+                "parser_version": generation.parser_version,
+                "runtime_version": generation.runtime_version,
+                "request_id": record.request_id,
+                "planned": record.request_id in generation.planned_request_ids,
+                "endpoint": record.endpoint,
+                "event_id": record.event_id,
+                "event_ids_json": canonical_json(record.event_ids),
+                "disposition": record.disposition.value,
+                "raw_uri": record.raw_uri,
+                "raw_sha256": record.raw_sha256,
+                "fetched_at": record.fetched_at,
+                "direct_bytes": record.direct_bytes,
+                "proxy_bytes": record.proxy_bytes,
+                "_ingested_at": generation.ingested_at,
+                "_source": "espn",
+                "_entity_type": "request_ledger",
+                "_row_sha256": ledger_row_fingerprint(generation, record),
+            }
+        )
+    return output
+
+
 MANIFEST_COLUMNS = (
     "manifest_version",
     "repository_version",
@@ -784,6 +1332,7 @@ MANIFEST_COLUMNS = (
     "source_season_year",
     "run_id",
     "generation_id",
+    "generation_signature",
     "_batch_id",
     "registry_snapshot_uri",
     "registry_signature",
@@ -793,6 +1342,10 @@ MANIFEST_COLUMNS = (
     "status",
     "row_counts_json",
     "row_hashes_json",
+    "ledger_count",
+    "ledger_hash",
+    "planned_request_ids_json",
+    "planned_request_ids_sha256",
     "raw_ledger_sha256",
     "dispositions_json",
     "quality_json",
@@ -802,7 +1355,14 @@ MANIFEST_COLUMNS = (
 
 
 class EspnBronzeRepository:
-    """Production adapter over the platform IcebergWriter and Trino manager."""
+    """Production adapter over the platform IcebergWriter and Trino manager.
+
+    Publication is append-only and detects immutable-identity conflicts.  A
+    distributed caller must still hold the source/scope lease while appending
+    catalog snapshots or cutovers: Iceberg append has no uniqueness primitive.
+    Cutover predecessor hashes make a raced fork durable and current views
+    suppress it instead of choosing a branch.
+    """
 
     manifest_columns = MANIFEST_COLUMNS
 
@@ -814,6 +1374,7 @@ class EspnBronzeRepository:
         catalog: str = "iceberg",
         schema: str = "bronze",
         verify_physical: bool = True,
+        ensure_objects_on_write: bool = True,
     ) -> None:
         self.catalog = _identifier(catalog, "catalog")
         self.schema = _identifier(schema, "schema")
@@ -830,7 +1391,11 @@ class EspnBronzeRepository:
         self.query = query
         if type(verify_physical) is not bool:
             raise TypeError("verify_physical must be boolean")
+        if type(ensure_objects_on_write) is not bool:
+            raise TypeError("ensure_objects_on_write must be boolean")
         self.verify_physical = verify_physical
+        self.ensure_objects_on_write = ensure_objects_on_write
+        self._objects_ensured = False
 
     def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> Sequence[Any]:
         execute = getattr(self.query, "execute_query", None)
@@ -839,6 +1404,8 @@ class EspnBronzeRepository:
         return execute(sql, params=params) or []
 
     def ensure_objects(self) -> None:
+        if self._objects_ensured:
+            return
         self._execute(f"CREATE SCHEMA IF NOT EXISTS {self.catalog}.{self.schema}")
         for sql in render_repository_ddl(
             catalog=self.catalog, schema=self.schema
@@ -850,6 +1417,7 @@ class EspnBronzeRepository:
                     entity, catalog=self.catalog, schema=self.schema
                 )
             )
+        self._objects_ensured = True
 
     def _existing_manifest(
         self, scope_id: str, generation_id: str
@@ -883,13 +1451,18 @@ class EspnBronzeRepository:
         return normalized[0]
 
     def _write(self, table: str, rows: Sequence[Mapping[str, Any]]) -> str:
+        if table not in TABLE_PARTITIONS:
+            raise ValueError(f"unsupported ESPN repository table {table!r}")
         if not rows:
             return f"{self.catalog}.{self.schema}.{table}"
+        frame = pd.DataFrame(list(rows))
+        if table == LEDGER_TABLE and "event_id" in frame:
+            frame["event_id"] = frame["event_id"].astype("Int64")
         return self.writer.write_dataframe(
-            pd.DataFrame(list(rows)),
+            frame,
             database=self.schema,
             table=table,
-            partition_spec=[("scope_id", "identity")],
+            partition_spec=[(column, "identity") for column in TABLE_PARTITIONS[table]],
             mode="append",
             add_metadata=False,
             source="espn",
@@ -898,24 +1471,29 @@ class EspnBronzeRepository:
     def _physical_row_hashes(
         self, generation: ScopeGeneration, entity: str
     ) -> frozenset[str]:
-        table = ENTITY_TABLES[entity]
+        table = LEDGER_TABLE if entity == "ledger" else ENTITY_TABLES[entity]
         rows = self._execute(
-            f'SELECT DISTINCT "_row_sha256" '
+            f'SELECT DISTINCT "generation_signature", "_row_sha256" '
             f"FROM {self.catalog}.{self.schema}.{table} "
-            'WHERE "scope_id" = ? AND "generation_id" = ? AND "run_id" = ? '
-            'AND "_batch_id" = ? AND "registry_signature" = ? AND "plan_signature" = ?',
+            'WHERE "scope_id" = ? AND "generation_id" = ?',
             (
                 generation.plan.scope_id,
                 generation.generation_id,
-                generation.run_id,
-                generation.batch_id,
-                generation.registry_signature,
-                generation.plan_signature,
             ),
         )
         hashes: set[str] = set()
         for raw in rows:
-            value = raw.get("_row_sha256") if isinstance(raw, Mapping) else raw[0]
+            if isinstance(raw, Mapping):
+                signature = raw.get("generation_signature")
+                value = raw.get("_row_sha256")
+            else:
+                if len(raw) != 2:
+                    raise PublicationError("physical fingerprint row is malformed")
+                signature, value = raw
+            if signature != generation.generation_signature:
+                raise ManifestConflictError(
+                    f"{entity} generation identity has conflicting content signature"
+                )
             hashes.add(_sha256(value, "stored _row_sha256"))
         return frozenset(hashes)
 
@@ -924,20 +1502,22 @@ class EspnBronzeRepository:
     ) -> None:
         selects: list[str] = []
         params: list[Any] = []
-        for entity, table in ENTITY_TABLES.items():
+        for entity, table in (*ENTITY_TABLES.items(), ("ledger", LEDGER_TABLE)):
             selects.append(
                 f"SELECT '{entity}' AS entity, COUNT(DISTINCT \"_row_sha256\") AS row_count, "
                 "COALESCE(lower(to_hex(sha256(to_utf8(array_join(array_sort(array_distinct(array_agg(\"_row_sha256\"))), ''))))), "
                 "lower(to_hex(sha256(to_utf8(''))))) AS row_hash "
                 f"FROM {self.catalog}.{self.schema}.{table} "
                 'WHERE "scope_id" = ? AND "generation_id" = ? AND "run_id" = ? '
-                'AND "_batch_id" = ? AND "registry_signature" = ? AND "plan_signature" = ?'
+                'AND "generation_signature" = ? AND "_batch_id" = ? '
+                'AND "registry_signature" = ? AND "plan_signature" = ?'
             )
             params.extend(
                 (
                     generation.plan.scope_id,
                     generation.generation_id,
                     generation.run_id,
+                    generation.generation_signature,
                     generation.batch_id,
                     generation.registry_signature,
                     generation.plan_signature,
@@ -963,6 +1543,7 @@ class EspnBronzeRepository:
             entity: (report.row_counts[entity], report.row_hashes[entity])
             for entity in _ENTITIES
         }
+        expected["ledger"] = (report.ledger_count, report.ledger_hash)
         if observed != expected:
             raise PublicationError(
                 f"physical row/hash parity failed: expected={expected!r}, observed={observed!r}"
@@ -972,6 +1553,8 @@ class EspnBronzeRepository:
         report = validate_scope_generation(generation)
         if not report.passed:
             raise PublicationError("; ".join(report.failures))
+        if self.ensure_objects_on_write:
+            self.ensure_objects()
         manifest = generation.manifest_row(report)
         existing = self._existing_manifest(
             generation.plan.scope_id, generation.generation_id
@@ -1004,6 +1587,21 @@ class EspnBronzeRepository:
                         row for row in rows if row["_row_sha256"] not in existing_hashes
                     ]
                 self._write(table, rows)
+            ledger_rows = _ledger_physical_rows(generation)
+            if self.verify_physical:
+                existing_hashes = self._physical_row_hashes(generation, "ledger")
+                expected_hashes = frozenset(row["_row_sha256"] for row in ledger_rows)
+                unexpected = existing_hashes - expected_hashes
+                if unexpected:
+                    raise ManifestConflictError(
+                        "ledger generation contains conflicting physical rows"
+                    )
+                ledger_rows = [
+                    row
+                    for row in ledger_rows
+                    if row["_row_sha256"] not in existing_hashes
+                ]
+            self._write(LEDGER_TABLE, ledger_rows)
             if self.verify_physical:
                 self._verify_physical(generation, report)
             self._write(MANIFEST_TABLE, [manifest])
@@ -1053,33 +1651,168 @@ class EspnBronzeRepository:
             ),
         )
 
-    def append_catalog_snapshot(self, rows: Sequence[Mapping[str, Any]]) -> str:
-        return self._write(CATALOG_TABLE, rows)
-
-    def append_cutover(self, row: Mapping[str, Any]) -> str:
-        required = {
-            "cutover_id",
-            "scope_id",
-            "active_source",
-            "previous_source",
-            "legacy_league",
-            "legacy_season",
-            "registry_signature",
-            "effective_at",
-            "rollback_run_id",
-            "rollback_reason",
+    def append_catalog_snapshot(self, snapshot: CatalogSnapshot) -> str:
+        if not isinstance(snapshot, CatalogSnapshot):
+            raise TypeError("snapshot must be CatalogSnapshot")
+        if self.ensure_objects_on_write:
+            self.ensure_objects()
+        stored = self._execute(
+            f'SELECT "competition_id", "record_sha256", "snapshot_signature" '
+            f"FROM {self.catalog}.{self.schema}.{CATALOG_TABLE} "
+            'WHERE "snapshot_id" = ?',
+            (snapshot.snapshot_id,),
+        )
+        existing: dict[int, str] = {}
+        signatures: set[str] = set()
+        for raw in stored:
+            if isinstance(raw, Mapping):
+                competition_id = raw.get("competition_id")
+                record_hash = raw.get("record_sha256")
+                signature = raw.get("snapshot_signature")
+            else:
+                if len(raw) != 3:
+                    raise PublicationError("catalog snapshot row is malformed")
+                competition_id, record_hash, signature = raw
+            competition_id = _positive_native_id(
+                competition_id, "stored catalog competition_id"
+            )
+            record_hash = _sha256(record_hash, "stored catalog record_sha256")
+            signatures.add(_sha256(signature, "stored snapshot_signature"))
+            if competition_id in existing and existing[competition_id] != record_hash:
+                raise ManifestConflictError(
+                    "catalog snapshot contains conflicting competition rows"
+                )
+            existing[competition_id] = record_hash
+        if signatures and signatures != {snapshot.snapshot_signature}:
+            raise ManifestConflictError(
+                "same catalog snapshot_id has conflicting content"
+            )
+        expected = {
+            int(row["competition_id"]): str(row["record_sha256"])
+            for row in snapshot.rows
         }
-        if set(row) != required:
-            raise ValueError(f"cutover row fields must be exactly {sorted(required)}")
-        if row["active_source"] not in {"native", "legacy"} or row[
-            "previous_source"
-        ] not in {"native", "legacy"}:
-            raise ValueError("cutover sources must be native or legacy")
-        if row["active_source"] == row["previous_source"]:
-            raise ValueError("cutover must change active source")
-        _sha256(row["registry_signature"], "registry_signature")
-        _aware_utc(row["effective_at"], "effective_at")
-        return self._write(CUTOVER_TABLE, [dict(row)])
+        if any(expected.get(key) != value for key, value in existing.items()):
+            raise ManifestConflictError("catalog snapshot physical rows conflict")
+        missing = [
+            row for row in snapshot.rows if int(row["competition_id"]) not in existing
+        ]
+        return self._write(CATALOG_TABLE, missing)
+
+    def append_cutover(self, cutover: ScopeCutover) -> str:
+        if not isinstance(cutover, ScopeCutover):
+            raise TypeError("cutover must be ScopeCutover")
+        if self.ensure_objects_on_write:
+            self.ensure_objects()
+        existing_rows = self._execute(
+            f'SELECT "cutover_sha256" FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE} '
+            'WHERE "cutover_id" = ?',
+            (cutover.cutover_id,),
+        )
+        existing_hashes = {
+            _sha256(
+                raw.get("cutover_sha256") if isinstance(raw, Mapping) else raw[0],
+                "stored cutover_sha256",
+            )
+            for raw in existing_rows
+        }
+        slot_rows = self._execute(
+            f'SELECT "cutover_id", "cutover_sha256" '
+            f"FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE} "
+            'WHERE "scope_id" = ? '
+            'AND "predecessor_cutover_sha256" IS NOT DISTINCT FROM ?',
+            (cutover.scope_id, cutover.predecessor_cutover_sha256),
+        )
+        slot_identities: set[tuple[str, str]] = set()
+        for raw in slot_rows:
+            if isinstance(raw, Mapping):
+                cutover_id = raw.get("cutover_id")
+                cutover_hash = raw.get("cutover_sha256")
+            else:
+                if len(raw) != 2:
+                    raise PublicationError("cutover predecessor slot row is malformed")
+                cutover_id, cutover_hash = raw
+            slot_identities.add(
+                (
+                    _required_string(cutover_id, "stored cutover_id"),
+                    _sha256(cutover_hash, "stored cutover_sha256"),
+                )
+            )
+        if existing_hashes:
+            if existing_hashes == {cutover.cutover_sha256} and slot_identities == {
+                (cutover.cutover_id, cutover.cutover_sha256)
+            }:
+                return f"{self.catalog}.{self.schema}.{CUTOVER_TABLE}"
+            raise ManifestConflictError("same cutover_id has conflicting content")
+        if slot_identities:
+            raise ManifestConflictError(
+                "cutover predecessor already has a different successor"
+            )
+
+        latest_rows = self._execute(
+            f'SELECT "cutover_id", "cutover_sha256", "active_source", "effective_at" '
+            f"FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE} "
+            'WHERE "scope_id" = ? '
+            'ORDER BY "effective_at" DESC, "cutover_id" DESC, "cutover_sha256" DESC '
+            "LIMIT 1",
+            (cutover.scope_id,),
+        )
+        if latest_rows:
+            raw = latest_rows[0]
+            if isinstance(raw, Mapping):
+                latest_id = raw.get("cutover_id")
+                latest_hash = raw.get("cutover_sha256")
+                active_source = raw.get("active_source")
+                effective_at = raw.get("effective_at")
+            else:
+                if len(raw) != 4:
+                    raise PublicationError("latest cutover row is malformed")
+                latest_id, latest_hash, active_source, effective_at = raw
+            latest_identity = (
+                _required_string(latest_id, "stored latest cutover_id"),
+                _sha256(latest_hash, "stored latest cutover_sha256"),
+            )
+            if latest_identity != (
+                cutover.predecessor_cutover_id,
+                cutover.predecessor_cutover_sha256,
+            ):
+                raise ManifestConflictError(
+                    "cutover predecessor does not match latest scope transition"
+                )
+            if active_source != cutover.previous_source:
+                raise ManifestConflictError(
+                    "cutover previous_source does not match latest active source"
+                )
+            if cutover.effective_at <= _stored_utc(
+                effective_at, "stored cutover effective_at"
+            ):
+                raise ManifestConflictError(
+                    "cutover effective_at must advance the scope transition chain"
+                )
+        elif (
+            cutover.previous_source != "legacy"
+            or cutover.predecessor_cutover_id is not None
+            or cutover.predecessor_cutover_sha256 is not None
+        ):
+            raise ManifestConflictError(
+                "first scope transition must start from legacy without predecessor"
+            )
+
+        if cutover.active_source == "native":
+            manifest = self._existing_manifest(
+                cutover.scope_id, str(cutover.native_generation_id)
+            )
+            if (
+                manifest is None
+                or manifest.get("status") != "complete"
+                or manifest.get("generation_signature")
+                != cutover.native_generation_signature
+                or manifest.get("manifest_sha256") != cutover.native_manifest_sha256
+                or manifest.get("registry_signature") != cutover.registry_signature
+            ):
+                raise PublicationError(
+                    "native cutover is not bound to a matching COMPLETE manifest"
+                )
+        return self._write(CUTOVER_TABLE, [cutover.to_row()])
 
 
 def build_catalog_snapshot(
@@ -1095,53 +1828,20 @@ def build_catalog_snapshot(
     ingested_at: datetime,
     batch_id: str,
     competitions: Iterable[Mapping[str, Any]],
-) -> tuple[dict[str, Any], ...]:
-    _required_string(snapshot_id, "snapshot_id")
-    _sha256(registry_signature, "registry_signature")
-    _aware_utc(captured_at, "captured_at")
-    for field_name, value in (
-        ("run_id", run_id),
-        ("raw_uri", raw_uri),
-        ("parser_version", parser_version),
-        ("runtime_version", runtime_version),
-        ("batch_id", batch_id),
-    ):
-        _required_string(value, field_name)
-    _sha256(raw_sha256, "raw_sha256")
-    _aware_utc(ingested_at, "ingested_at")
-    output: list[dict[str, Any]] = []
-    seen: set[int] = set()
-    for raw in competitions:
-        if not isinstance(raw, Mapping):
-            raise TypeError("catalog competitions must be mappings")
-        espn_id = _positive_native_id(raw.get("espn_id"), "catalog espn_id")
-        if espn_id in seen:
-            raise ValueError("catalog snapshot has duplicate ESPN competition ID")
-        seen.add(espn_id)
-        slug = _required_string(raw.get("slug"), "catalog slug")
-        payload = canonical_json(dict(raw))
-        output.append(
-            {
-                "snapshot_id": snapshot_id,
-                "registry_signature": registry_signature,
-                "competition_id": espn_id,
-                "competition_slug": slug,
-                "record_json": payload,
-                "record_sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
-                "captured_at": captured_at,
-                "run_id": run_id,
-                "raw_uri": raw_uri,
-                "raw_sha256": raw_sha256,
-                "parser_version": parser_version,
-                "runtime_version": runtime_version,
-                "_source_fetched_at": captured_at,
-                "_ingested_at": ingested_at,
-                "_batch_id": batch_id,
-                "_source": "espn",
-                "_entity_type": "catalog",
-            }
-        )
-    return tuple(sorted(output, key=lambda row: row["competition_id"]))
+) -> CatalogSnapshot:
+    return CatalogSnapshot(
+        snapshot_id=snapshot_id,
+        registry_signature=registry_signature,
+        captured_at=captured_at,
+        run_id=run_id,
+        raw_uri=raw_uri,
+        raw_sha256=raw_sha256,
+        parser_version=parser_version,
+        runtime_version=runtime_version,
+        ingested_at=ingested_at,
+        batch_id=batch_id,
+        competitions=tuple(competitions),
+    )
 
 
 _TRINO_TYPES = {
@@ -1243,10 +1943,45 @@ def render_repository_ddl(
         statements[table] = _table_ddl(
             f"{catalog}.{schema}.{table}", columns, "scope_id"
         )
+    statements[LEDGER_TABLE] = _table_ddl(
+        f"{catalog}.{schema}.{LEDGER_TABLE}",
+        (
+            ("scope_id", "varchar"),
+            ("competition_id", "bigint"),
+            ("source_season_year", "bigint"),
+            ("generation_id", "varchar"),
+            ("generation_signature", "varchar"),
+            ("run_id", "varchar"),
+            ("_batch_id", "varchar"),
+            ("registry_snapshot_uri", "varchar"),
+            ("registry_signature", "varchar"),
+            ("plan_signature", "varchar"),
+            ("parser_version", "varchar"),
+            ("runtime_version", "varchar"),
+            ("request_id", "varchar"),
+            ("planned", "boolean"),
+            ("endpoint", "varchar"),
+            ("event_id", "bigint"),
+            ("event_ids_json", "varchar"),
+            ("disposition", "varchar"),
+            ("raw_uri", "varchar"),
+            ("raw_sha256", "varchar"),
+            ("fetched_at", "timestamp(6)"),
+            ("direct_bytes", "bigint"),
+            ("proxy_bytes", "bigint"),
+            ("_ingested_at", "timestamp(6)"),
+            ("_source", "varchar"),
+            ("_entity_type", "varchar"),
+            ("_row_sha256", "varchar"),
+        ),
+        "scope_id",
+    )
     statements[CATALOG_TABLE] = _table_ddl(
         f"{catalog}.{schema}.{CATALOG_TABLE}",
         (
             ("snapshot_id", "varchar"),
+            ("snapshot_signature", "varchar"),
+            ("snapshot_content_sha256", "varchar"),
             ("registry_signature", "varchar"),
             ("competition_id", "bigint"),
             ("competition_slug", "varchar"),
@@ -1269,6 +2004,7 @@ def render_repository_ddl(
     manifest_types = {
         "competition_id": "bigint",
         "source_season_year": "bigint",
+        "ledger_count": "bigint",
         "completed_at": "timestamp(6)",
     }
     statements[MANIFEST_TABLE] = _table_ddl(
@@ -1286,12 +2022,19 @@ def render_repository_ddl(
             ("scope_id", "varchar"),
             ("active_source", "varchar"),
             ("previous_source", "varchar"),
+            ("predecessor_cutover_id", "varchar"),
+            ("predecessor_cutover_sha256", "varchar"),
             ("legacy_league", "varchar"),
             ("legacy_season", "varchar"),
             ("registry_signature", "varchar"),
             ("effective_at", "timestamp(6)"),
+            ("native_generation_id", "varchar"),
+            ("native_generation_signature", "varchar"),
+            ("native_manifest_sha256", "varchar"),
             ("rollback_run_id", "varchar"),
             ("rollback_reason", "varchar"),
+            ("metadata_json", "varchar"),
+            ("cutover_sha256", "varchar"),
         ),
         "scope_id",
     )
@@ -1416,7 +2159,6 @@ def render_current_view_sql(
         raise ValueError(f"unknown ESPN entity {entity!r}")
     catalog = _identifier(catalog, "catalog")
     schema = _identifier(schema, "schema")
-    table = ENTITY_TABLES[entity]
     view = CURRENT_VIEWS[entity]
     columns = tuple(dict.fromkeys((*_row_columns(entity), *PROVENANCE_COLUMNS)))
     native_projection = ",\n        ".join(f'g."{column}"' for column in columns)
@@ -1431,6 +2173,7 @@ def render_current_view_sql(
         "competition_id",
         "source_season_year",
         "generation_id",
+        "generation_signature",
         "run_id",
         "_batch_id",
         "registry_snapshot_uri",
@@ -1439,83 +2182,147 @@ def render_current_view_sql(
         "parser_version",
         "runtime_version",
     )
+    # The signature is an isolation boundary.  Rows left by an incomplete
+    # concurrent attempt with the same generation_id but another signature do
+    # not contaminate (or hide) the manifest-bound generation.
     join = "\n   AND ".join(f'g."{key}" = m."{key}"' for key in join_keys)
     identity_projection = ", ".join(f'"{key}"' for key in join_keys)
-    fence_join = "\n   AND ".join(f'f."{key}" = m."{key}"' for key in join_keys)
+    empty_hash = "lower(to_hex(sha256(to_utf8(''))))"
+
+    relation_tables = {**ENTITY_TABLES, "ledger": LEDGER_TABLE}
+    fence_parts: list[str] = []
+    for relation, relation_table in relation_tables.items():
+        fence_parts.append(
+            f"""ranked_{relation}_rows AS (
+    SELECT r.*,
+           ROW_NUMBER() OVER (
+               PARTITION BY {identity_projection}, "_row_sha256"
+               ORDER BY "_ingested_at" DESC, "_row_sha256" DESC
+           ) AS physical_rn
+    FROM {catalog}.{schema}.{relation_table} r
+), {relation}_rows AS (
+    SELECT * FROM ranked_{relation}_rows WHERE physical_rn = 1
+), {relation}_fence AS (
+    SELECT {identity_projection},
+           COUNT(*) AS row_count,
+           lower(to_hex(sha256(to_utf8(array_join(array_sort(array_agg("_row_sha256")), ''))))) AS row_hash
+    FROM {relation}_rows
+    GROUP BY {identity_projection}
+)"""
+        )
+    fence_sql = ",\n".join(fence_parts)
+
+    def fence_join(relation: str) -> str:
+        return "\n   AND ".join(
+            f'{relation}_fence."{key}" = m."{key}"' for key in join_keys
+        )
+
+    entity_validation = []
+    for relation in _ENTITIES:
+        entity_validation.extend(
+            (
+                f"COALESCE({relation}_fence.row_count, 0) = "
+                f"TRY_CAST(TRY(json_extract_scalar(m.row_counts_json, '$.{relation}')) AS bigint)",
+                f"COALESCE({relation}_fence.row_hash, {empty_hash}) = "
+                f"TRY(json_extract_scalar(m.row_hashes_json, '$.{relation}'))",
+            )
+        )
+    entity_validation.extend(
+        (
+            "COALESCE(ledger_fence.row_count, 0) = m.ledger_count",
+            f"COALESCE(ledger_fence.row_hash, {empty_hash}) = m.ledger_hash",
+        )
+    )
+    validation_where = "\n      AND ".join(entity_validation)
+    fence_joins = "\n".join(
+        f"LEFT JOIN {relation}_fence\n      ON {fence_join(relation)}"
+        for relation in relation_tables
+    )
     return f"""CREATE OR REPLACE VIEW {catalog}.{schema}.{view} AS
-WITH ranked_manifests AS (
+WITH complete_manifest_candidates AS (
+    SELECT *
+    FROM {catalog}.{schema}.{MANIFEST_TABLE}
+    WHERE status = 'complete'
+), conflicting_complete_identities AS (
+    SELECT scope_id, generation_id
+    FROM complete_manifest_candidates
+    GROUP BY scope_id, generation_id
+    HAVING COUNT(DISTINCT manifest_sha256) > 1
+        OR COUNT(DISTINCT generation_signature) > 1
+), {fence_sql},
+validated_complete AS (
+    SELECT m.*
+    FROM complete_manifest_candidates m
+    LEFT JOIN conflicting_complete_identities conflict
+      ON conflict.scope_id = m.scope_id
+     AND conflict.generation_id = m.generation_id
+    {fence_joins}
+    WHERE conflict.scope_id IS NULL
+      AND {validation_where}
+), ranked_manifests AS (
     SELECT m.*,
            ROW_NUMBER() OVER (
                PARTITION BY scope_id
                ORDER BY completed_at DESC, generation_id DESC, manifest_sha256 DESC
            ) AS rn
-    FROM {catalog}.{schema}.{MANIFEST_TABLE} m
-    WHERE status = 'complete'
-), latest_complete AS (
+    FROM validated_complete m
+), latest_validated AS (
     SELECT * FROM ranked_manifests WHERE rn = 1
-), ranked_generation_rows AS (
-    SELECT g.*,
-           ROW_NUMBER() OVER (
-               PARTITION BY {identity_projection}, "_row_sha256"
-               ORDER BY "_ingested_at" DESC, "_row_sha256" DESC
-           ) AS physical_rn
-    FROM {catalog}.{schema}.{table} g
-), generation_rows AS (
-    SELECT * FROM ranked_generation_rows WHERE physical_rn = 1
-), physical_fence AS (
-    SELECT {identity_projection},
-           COUNT(*) AS row_count,
-           lower(to_hex(sha256(to_utf8(array_join(array_sort(array_agg("_row_sha256")), ''))))) AS row_hash
-    FROM generation_rows
-    GROUP BY {identity_projection}
-), validated_manifests AS (
-    SELECT m.*
-    FROM latest_complete m
-    JOIN physical_fence f
-      ON {fence_join}
-     AND f.row_count = CAST(json_extract_scalar(m.row_counts_json, '$.{entity}') AS bigint)
-     AND f.row_hash = json_extract_scalar(m.row_hashes_json, '$.{entity}')
+), conflicting_cutover_ids AS (
+    SELECT cutover_id
+    FROM {catalog}.{schema}.{CUTOVER_TABLE}
+    GROUP BY cutover_id
+    HAVING COUNT(DISTINCT cutover_sha256) > 1
+), conflicting_cutover_predecessors AS (
+    SELECT scope_id, predecessor_cutover_sha256
+    FROM {catalog}.{schema}.{CUTOVER_TABLE}
+    GROUP BY scope_id, predecessor_cutover_sha256
+    HAVING COUNT(DISTINCT cutover_sha256) > 1
 ), ranked_cutovers AS (
     SELECT c.*,
            ROW_NUMBER() OVER (
                PARTITION BY scope_id
-               ORDER BY effective_at DESC, cutover_id DESC
+               ORDER BY effective_at DESC, cutover_id DESC, cutover_sha256 DESC
            ) AS rn
     FROM {catalog}.{schema}.{CUTOVER_TABLE} c
+    LEFT JOIN conflicting_cutover_ids conflict
+      ON conflict.cutover_id = c.cutover_id
+    LEFT JOIN conflicting_cutover_predecessors fork
+      ON fork.scope_id = c.scope_id
+     AND fork.predecessor_cutover_sha256 IS NOT DISTINCT FROM c.predecessor_cutover_sha256
+    WHERE conflict.cutover_id IS NULL
+      AND fork.scope_id IS NULL
 ), latest_cutover AS (
     SELECT * FROM ranked_cutovers WHERE rn = 1
-), native_scopes AS (
-    SELECT * FROM latest_cutover WHERE active_source = 'native'
-), legacy_scopes AS (
-    SELECT * FROM latest_cutover WHERE active_source = 'legacy'
+), native_ready AS (
+    SELECT c.*
+    FROM latest_cutover c
+    WHERE c.active_source = 'native'
+      AND EXISTS (
+          SELECT 1
+          FROM validated_complete ready_manifest
+          WHERE ready_manifest.scope_id = c.scope_id
+            AND ready_manifest.generation_id = c.native_generation_id
+            AND ready_manifest.generation_signature = c.native_generation_signature
+            AND ready_manifest.manifest_sha256 = c.native_manifest_sha256
+            AND ready_manifest.registry_signature = c.registry_signature
+      )
 ), native_rows AS (
     SELECT
         {native_projection}
-    FROM generation_rows g
-    JOIN validated_manifests m
+    FROM {entity}_rows g
+    JOIN latest_validated m
       ON {join}
-    JOIN native_scopes c ON c.scope_id = m.scope_id
+    JOIN native_ready c ON c.scope_id = m.scope_id
 ), legacy_rows AS (
     SELECT
         {legacy_projection}
     FROM {catalog}.{schema}.espn_{entity} l
     WHERE NOT EXISTS (
-        SELECT 1 FROM native_scopes c
+        SELECT 1 FROM native_ready c
         WHERE c.legacy_league = l.league
           AND c.legacy_season = CAST(l.season AS varchar)
     )
-      AND (
-        NOT EXISTS (
-            SELECT 1 FROM latest_cutover c
-            WHERE c.legacy_league = l.league
-              AND c.legacy_season = CAST(l.season AS varchar)
-        )
-        OR EXISTS (
-            SELECT 1 FROM legacy_scopes c
-            WHERE c.legacy_league = l.league
-              AND c.legacy_season = CAST(l.season AS varchar)
-        )
-      )
 )
 SELECT * FROM native_rows
 UNION ALL
@@ -1525,10 +2332,12 @@ SELECT * FROM legacy_rows"""
 __all__ = [
     "BatchPublicationResult",
     "CATALOG_TABLE",
+    "CatalogSnapshot",
     "CURRENT_VIEWS",
     "CUTOVER_TABLE",
     "ENTITY_TABLES",
     "EspnBronzeRepository",
+    "LEDGER_TABLE",
     "MANIFEST_TABLE",
     "ManifestConflictError",
     "PROVENANCE_COLUMNS",
@@ -1536,12 +2345,15 @@ __all__ = [
     "RawLedgerRecord",
     "REPOSITORY_VERSION",
     "ScopeGeneration",
+    "ScopeCutover",
     "ScopePublicationResult",
     "ScopePublicationState",
     "ScopeQualityReport",
+    "TABLE_PARTITIONS",
     "build_catalog_snapshot",
     "canonical_json",
     "canonical_sha256",
+    "ledger_row_fingerprint",
     "render_current_view_sql",
     "render_repository_ddl",
     "row_fingerprint",

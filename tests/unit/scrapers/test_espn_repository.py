@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+import scrapers.espn.repository as repository_module
 from scrapers.espn.models import (
     CapabilityState,
     DispositionState,
@@ -30,6 +31,7 @@ from scrapers.espn.repository import (
     ScopeGeneration,
     ScopePublicationState,
     build_catalog_snapshot,
+    canonical_json,
     render_current_view_sql,
     render_repository_ddl,
     row_fingerprint,
@@ -173,9 +175,11 @@ class FakeWriter:
     def __init__(self, fail_table: str | None = None):
         self.fail_table = fail_table
         self.calls: list[tuple[str, pd.DataFrame]] = []
+        self.options: list[dict] = []
 
     def write_dataframe(self, df, *, database, table, **kwargs):
         self.calls.append((table, df.copy()))
+        self.options.append({"database": database, **kwargs})
         if table == self.fail_table:
             raise RuntimeError("injected write failure")
         return f"iceberg.{database}.{table}"
@@ -189,7 +193,10 @@ class FakeQuery:
 
     def execute_query(self, sql, params=None):
         self.calls.append((sql, params))
-        if "FROM iceberg.bronze.espn_ingest_manifest_v2" in sql:
+        if (
+            sql.lstrip().startswith("SELECT")
+            and "FROM iceberg.bronze.espn_ingest_manifest_v2" in sql
+        ):
             row = self.manifests.get((params[0], params[1]))
             return [row] if row else []
         if " AS entity" in sql and "UNION ALL" in sql:
@@ -201,22 +208,44 @@ class FakeQuery:
 
 
 class PhysicalQuery(FakeQuery):
-    def __init__(self, generation: ScopeGeneration, existing=None):
+    def __init__(
+        self,
+        generation: ScopeGeneration,
+        existing=None,
+        existing_signatures=None,
+    ):
         super().__init__()
+        self.generation = generation
         self.report = validate_scope_generation(generation)
         self.existing = existing or {}
+        self.existing_signatures = existing_signatures or {}
 
     def execute_query(self, sql, params=None):
         self.calls.append((sql, params))
-        if "FROM iceberg.bronze.espn_ingest_manifest_v2" in sql:
+        if (
+            sql.lstrip().startswith("SELECT")
+            and "FROM iceberg.bronze.espn_ingest_manifest_v2" in sql
+        ):
             return []
-        if 'SELECT DISTINCT "_row_sha256"' in sql:
+        if 'SELECT DISTINCT "generation_signature", "_row_sha256"' in sql:
+            relation_tables = {
+                **ENTITY_TABLES,
+                "ledger": repository_module.LEDGER_TABLE,
+            }
             entity = next(
-                entity for entity, table in ENTITY_TABLES.items() if table in sql
+                entity for entity, table in relation_tables.items() if table in sql
             )
-            return [(value,) for value in self.existing.get(entity, ())]
-        if " AS entity" in sql and "UNION ALL" in sql:
             return [
+                (
+                    self.existing_signatures.get(
+                        entity, self.generation.generation_signature
+                    ),
+                    value,
+                )
+                for value in self.existing.get(entity, ())
+            ]
+        if " AS entity" in sql and "UNION ALL" in sql:
+            entities = [
                 (
                     entity,
                     self.report.row_counts[entity],
@@ -224,7 +253,46 @@ class PhysicalQuery(FakeQuery):
                 )
                 for entity in ENTITY_TABLES
             ]
+            return [
+                *entities,
+                ("ledger", self.report.ledger_count, self.report.ledger_hash),
+            ]
         return []
+
+
+class RepositoryStateQuery(FakeQuery):
+    def __init__(self):
+        super().__init__()
+        self.catalog_rows: list[tuple[int, str, str]] = []
+        self.cutover_hashes: dict[str, list[str]] = {}
+        self.cutover_slots: dict[tuple[str, str | None], list[tuple[str, str]]] = {}
+        self.latest_cutovers: dict[str, tuple[str, str, str, datetime]] = {}
+
+    def execute_query(self, sql, params=None):
+        if f"FROM iceberg.bronze.{CATALOG_TABLE}" in sql:
+            self.calls.append((sql, params))
+            return list(self.catalog_rows)
+        if (
+            f"FROM iceberg.bronze.{CUTOVER_TABLE}" in sql
+            and 'WHERE "cutover_id" = ?' in sql
+        ):
+            self.calls.append((sql, params))
+            return [(value,) for value in self.cutover_hashes.get(str(params[0]), [])]
+        if (
+            f"FROM iceberg.bronze.{CUTOVER_TABLE}" in sql
+            and 'WHERE "scope_id" = ?' in sql
+            and '"predecessor_cutover_sha256" IS NOT DISTINCT FROM ?' in sql
+        ):
+            self.calls.append((sql, params))
+            return list(self.cutover_slots.get((str(params[0]), params[1]), []))
+        if (
+            f"FROM iceberg.bronze.{CUTOVER_TABLE}" in sql
+            and 'WHERE "scope_id" = ?' in sql
+        ):
+            self.calls.append((sql, params))
+            latest = self.latest_cutovers.get(str(params[0]))
+            return [latest] if latest else []
+        return super().execute_query(sql, params=params)
 
 
 @pytest.mark.unit
@@ -246,6 +314,7 @@ def test_ddl_and_views_have_append_only_contract_and_full_join_identity():
             "competition_id",
             "source_season_year",
             "generation_id",
+            "generation_signature",
             "run_id",
             "_batch_id",
             "registry_snapshot_uri",
@@ -257,9 +326,9 @@ def test_ddl_and_views_have_append_only_contract_and_full_join_identity():
             assert f'g."{key}" = m."{key}"' in sql
         assert "espn_scope_cutover_v2" in sql
         assert "active_source = 'native'" in sql
-        assert "active_source = 'legacy'" in sql
         assert "NOT EXISTS" in sql
-        assert "physical_fence" in sql
+        assert "validated_complete" in sql
+        assert "native_ready" in sql
         assert f"'$.{entity}'" in sql
 
 
@@ -381,6 +450,8 @@ def test_terminal_nonplayed_does_not_require_summary_entities():
             "schedule": (schedule,),
             "lineup": (),
             "matchsheet": (),
+            "planned_request_ids": (generation.planned_request_ids[0],),
+            "raw_ledger": (generation.raw_ledger[0],),
             "dispositions": (),
         }
     )
@@ -453,7 +524,7 @@ def test_schedule_requires_exact_row_to_scoreboard_raw_binding():
     )
     report = validate_scope_generation(candidate)
     assert not report.passed
-    assert "schedule raw binding must be exact" in report.failures[0]
+    assert "schedule raw binding must be exact" in " ".join(report.failures)
 
 
 @pytest.mark.unit
@@ -540,6 +611,7 @@ def test_partial_generation_retry_appends_only_missing_hashes_then_manifest():
     assert [table for table, _ in writer.calls] == [
         ENTITY_TABLES["lineup"],
         ENTITY_TABLES["matchsheet"],
+        repository_module.LEDGER_TABLE,
         MANIFEST_TABLE,
     ]
     assert len(writer.calls[0][1]) == len(generation.lineup) - 1
@@ -579,6 +651,41 @@ def test_partial_retry_with_changed_raw_provenance_fails_as_conflict():
 
 
 @pytest.mark.unit
+def test_abandoned_generation_with_different_signature_blocks_identity_reuse():
+    original = _generation()
+    changed_raw = RawLedgerRecord(
+        **{
+            **original.raw_ledger[-1].constructor_values(),
+            "raw_uri": "s3://raw/summary/concurrent.json.gz",
+            "raw_sha256": "c" * 64,
+        }
+    )
+    changed = ScopeGeneration(
+        **{
+            **original.constructor_values(),
+            "raw_ledger": (*original.raw_ledger[:-1], changed_raw),
+        }
+    )
+    existing = {
+        "schedule": {row_fingerprint(original, "schedule", original.schedule[0])}
+    }
+    query = PhysicalQuery(
+        changed,
+        existing=existing,
+        existing_signatures={"schedule": original.generation_signature},
+    )
+    writer = FakeWriter()
+    repository = EspnBronzeRepository(
+        writer=writer,
+        query=query,
+        ensure_objects_on_write=False,
+    )
+    with pytest.raises(ManifestConflictError, match="content signature"):
+        repository.publish_scope(changed)
+    assert not writer.calls
+
+
+@pytest.mark.unit
 def test_manifest_is_last_and_partial_commit_is_not_published():
     writer = FakeWriter(fail_table=ENTITY_TABLES["matchsheet"])
     repository = EspnBronzeRepository(
@@ -604,6 +711,7 @@ def test_success_writes_all_entities_then_manifest_and_replay_is_idempotent():
     assert result.state is ScopePublicationState.PUBLISHED
     assert [table for table, _ in writer.calls] == [
         *ENTITY_TABLES.values(),
+        repository_module.LEDGER_TABLE,
         MANIFEST_TABLE,
     ]
     manifest_row = writer.calls[-1][1].iloc[0].to_dict()
@@ -685,7 +793,7 @@ def test_two_scope_batch_publishes_good_scope_and_returns_failed_verdict():
 @pytest.mark.unit
 def test_catalog_snapshot_and_cutover_preserve_rollback_metadata():
     captured_at = datetime(2026, 7, 31, 7, tzinfo=UTC)
-    rows = build_catalog_snapshot(
+    snapshot = build_catalog_snapshot(
         snapshot_id="registry-20260731",
         registry_signature=SIG_A,
         captured_at=captured_at,
@@ -698,8 +806,8 @@ def test_catalog_snapshot_and_cutover_preserve_rollback_metadata():
         batch_id="catalog-batch-1",
         competitions=({"espn_id": 700, "slug": "eng.1"},),
     )
-    assert rows[0]["registry_signature"] == SIG_A
-    assert rows[0]["raw_sha256"] == SIG_B
+    assert snapshot.rows[0]["registry_signature"] == SIG_A
+    assert snapshot.rows[0]["raw_sha256"] == SIG_B
     cutover = render_repository_ddl()[CUTOVER_TABLE]
     for column in (
         "active_source",
@@ -710,3 +818,612 @@ def test_catalog_snapshot_and_cutover_preserve_rollback_metadata():
         "legacy_season",
     ):
         assert f'"{column}"' in cutover
+
+
+# Fix-round regressions: these describe the scope-level commit boundary, not
+# implementation details of the in-memory fakes above.
+
+
+@pytest.mark.unit
+def test_current_view_validates_all_four_relations_before_ranking_and_falls_back():
+    sql = render_current_view_sql("schedule")
+    assert repository_module.LEDGER_TABLE in sql
+    assert "generation_signature" in sql
+    assert "conflicting_complete_identities" in sql
+    assert "validated_complete" in sql
+    assert sql.index("validated_complete") < sql.index("ranked_manifests")
+    assert "LEFT JOIN schedule_fence" in sql
+    assert "LEFT JOIN lineup_fence" in sql
+    assert "LEFT JOIN matchsheet_fence" in sql
+    assert "LEFT JOIN ledger_fence" in sql
+    assert sql.count("COALESCE(") >= 8
+    assert "native_ready" in sql
+    assert "JOIN latest_validated" in sql
+    assert "FROM validated_complete ready_manifest" in sql
+    assert "AND EXISTS (" in sql
+    assert "TRY_CAST(TRY(json_extract_scalar" in sql
+    assert "TRY(json_extract_scalar(m.row_hashes_json" in sql
+    # The cutover generation is activation evidence, not a version pin.
+    native_rows = sql[sql.index("native_rows AS") : sql.index("legacy_rows AS")]
+    assert "JOIN latest_validated m" in native_rows
+    assert "JOIN native_ready c ON c.scope_id = m.scope_id" in native_rows
+    assert "c.native_generation_id" not in native_rows
+
+
+@pytest.mark.unit
+def test_current_view_conflict_and_zero_count_contract_is_manifest_led():
+    sql = render_current_view_sql("lineup")
+    assert "COUNT(DISTINCT manifest_sha256)" in sql
+    assert "HAVING COUNT(DISTINCT" in sql
+    assert "sha256(to_utf8(''))" in sql
+    assert "COALESCE(lineup_fence.row_count, 0)" in sql
+    assert "COALESCE(lineup_fence.row_hash" in sql
+    # A cutover row alone cannot suppress the legacy fallback.
+    legacy_block = sql[sql.index("legacy_rows AS") :]
+    assert "native_ready" in legacy_block
+    assert "native_scopes" not in legacy_block
+
+
+@pytest.mark.unit
+def test_current_view_signature_isolates_unmanifested_concurrent_attempts():
+    sql = render_current_view_sql("matchsheet")
+    for relation in (*ENTITY_TABLES, "ledger"):
+        assert (
+            f'{relation}_fence."generation_signature" = m."generation_signature"'
+        ) in sql
+    assert "physical_generation_signatures" not in sql
+
+
+@pytest.mark.unit
+def test_generation_signature_changes_with_raw_or_runtime_and_is_in_every_row():
+    generation = _generation()
+    changed_raw = RawLedgerRecord(
+        **{
+            **generation.raw_ledger[-1].constructor_values(),
+            "raw_uri": "s3://raw/summary/changed-v2.json.gz",
+            "raw_sha256": "c" * 64,
+        }
+    )
+    changed = ScopeGeneration(
+        **{
+            **generation.constructor_values(),
+            "raw_ledger": (*generation.raw_ledger[:-1], changed_raw),
+        }
+    )
+    assert generation.generation_signature != changed.generation_signature
+    assert (
+        generation.manifest_row()["generation_signature"]
+        == generation.generation_signature
+    )
+    ddl = render_repository_ddl()
+    for table in (
+        *ENTITY_TABLES.values(),
+        repository_module.LEDGER_TABLE,
+        MANIFEST_TABLE,
+    ):
+        assert '"generation_signature"' in ddl[table]
+
+
+@pytest.mark.unit
+def test_dq_rejects_noncaptured_planned_raw_and_scoreboard_binding_drift():
+    generation = _generation()
+    failed = RawLedgerRecord(
+        **{
+            **generation.raw_ledger[-1].constructor_values(),
+            "disposition": DispositionState.FAILED,
+            "raw_uri": None,
+            "raw_sha256": None,
+            "fetched_at": None,
+        }
+    )
+    failed_generation = ScopeGeneration(
+        **{
+            **generation.constructor_values(),
+            "raw_ledger": (*generation.raw_ledger[:-1], failed),
+        }
+    )
+    assert "planned raw request is not captured" in " ".join(
+        validate_scope_generation(failed_generation).failures
+    )
+
+    contaminated = RawLedgerRecord(
+        **{
+            **generation.raw_ledger[0].constructor_values(),
+            "event_ids": (*generation.raw_ledger[0].event_ids, 999999999),
+        }
+    )
+    contaminated_generation = ScopeGeneration(
+        **{
+            **generation.constructor_values(),
+            "raw_ledger": (contaminated, *generation.raw_ledger[1:]),
+        }
+    )
+    assert "scoreboard event binding parity" in " ".join(
+        validate_scope_generation(contaminated_generation).failures
+    )
+
+
+@pytest.mark.unit
+def test_dq_validates_every_disposition_and_every_emitted_group():
+    generation = _generation()
+    nonfinal = ScheduleRow(
+        **{
+            **asdict(generation.schedule[0]),
+            "terminal": False,
+            "played_final": False,
+            "summary_required": False,
+            "home_score": None,
+            "away_score": None,
+            "home_goals": None,
+            "away_goals": None,
+        }
+    )
+    invalid_empty = ScopeGeneration(
+        **{
+            **generation.constructor_values(),
+            "schedule": (nonfinal,),
+            "lineup": (),
+            "matchsheet": (),
+            "dispositions": (
+                RequestDisposition(
+                    endpoint="lineup",
+                    state=DispositionState.VALID_EMPTY,
+                    detail="not allowed for proven",
+                    event_id=nonfinal.event_id,
+                ),
+            ),
+        }
+    )
+    report = validate_scope_generation(invalid_empty)
+    assert not report.passed
+    assert "valid_empty is forbidden for proven lineup" in report.failures
+
+    one_side = ScopeGeneration(
+        **{
+            **generation.constructor_values(),
+            "schedule": (nonfinal,),
+            "lineup": (generation.lineup[0],),
+            "matchsheet": (),
+            "dispositions": (
+                RequestDisposition(
+                    endpoint="lineup",
+                    state=DispositionState.CAPTURED,
+                    detail="one side only",
+                    event_id=nonfinal.event_id,
+                ),
+            ),
+        }
+    )
+    assert "lineup two-side completeness" in " ".join(
+        validate_scope_generation(one_side).failures
+    )
+
+
+@pytest.mark.unit
+def test_schedule_flag_invariants_fail_closed():
+    generation = _generation()
+    impossible = ScheduleRow(
+        **{
+            **asdict(generation.schedule[0]),
+            "terminal": False,
+            "played_final": True,
+            "terminal_nonplayed": True,
+            "summary_required": False,
+        }
+    )
+    report = validate_scope_generation(
+        ScopeGeneration(
+            **{**generation.constructor_values(), "schedule": (impossible,)}
+        )
+    )
+    assert "schedule status flag invariant" in " ".join(report.failures)
+
+
+@pytest.mark.unit
+def test_durable_ledger_is_written_verified_and_reconstructable_before_manifest():
+    generation = _generation()
+    writer = FakeWriter()
+    repository = EspnBronzeRepository(
+        writer=writer,
+        query=PhysicalQuery(generation),
+        verify_physical=True,
+        ensure_objects_on_write=False,
+    )
+    repository.publish_scope(generation)
+    tables = [table for table, _ in writer.calls]
+    assert tables == [
+        *ENTITY_TABLES.values(),
+        repository_module.LEDGER_TABLE,
+        MANIFEST_TABLE,
+    ]
+    ledger_frame = writer.calls[-2][1]
+    rebuilt = tuple(
+        RawLedgerRecord.from_physical_row(row)
+        for row in ledger_frame.to_dict(orient="records")
+    )
+    assert rebuilt == generation.raw_ledger
+    manifest = writer.calls[-1][1].iloc[0]
+    assert manifest["ledger_count"] == len(generation.raw_ledger)
+    assert len(manifest["ledger_hash"]) == 64
+    assert len(manifest["planned_request_ids_sha256"]) == 64
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        ("schedule", "home_score", True),
+        ("schedule", "venue", 123),
+        ("lineup", "home_away", "HOME"),
+        ("lineup", "jersey", 9),
+        ("lineup", "statistics_json", '{"z":1, "a":2}'),
+        ("matchsheet", "attendance", True),
+        ("matchsheet", "referee", 123),
+        ("matchsheet", "extra_json", "not-json"),
+    ],
+)
+def test_exact_row_type_matrix_rejects_coercions(mutation):
+    generation = _generation()
+    entity, field_name, value = mutation
+    row_type = type(getattr(generation, entity)[0])
+    bad_row = row_type(**{**asdict(getattr(generation, entity)[0]), field_name: value})
+    with pytest.raises((TypeError, ValueError)):
+        ScopeGeneration(**{**generation.constructor_values(), entity: (bad_row,)})
+
+
+@pytest.mark.unit
+def test_exact_row_type_matrix_rejects_string_backed_enum():
+    generation = _generation()
+    bad = ScheduleRow(
+        **{
+            **asdict(generation.schedule[0]),
+            "status": DispositionState.CAPTURED,
+        }
+    )
+    with pytest.raises(TypeError, match="schedule.status"):
+        ScopeGeneration(**{**generation.constructor_values(), "schedule": (bad,)})
+
+
+@pytest.mark.unit
+def test_dq_requires_legacy_timestamp_and_captured_summary_dispositions():
+    generation = _generation()
+    drifted = ScheduleRow(
+        **{
+            **asdict(generation.schedule[0]),
+            "date": datetime(2035, 1, 1, tzinfo=UTC),
+            "match_date": datetime(2036, 1, 1, tzinfo=UTC),
+        }
+    )
+    drifted_report = validate_scope_generation(
+        ScopeGeneration(**{**generation.constructor_values(), "schedule": (drifted,)})
+    )
+    assert "schedule legacy timestamps" in " ".join(drifted_report.failures)
+
+    nonfinal = ScheduleRow(
+        **{
+            **asdict(generation.schedule[0]),
+            "terminal": False,
+            "played_final": False,
+            "summary_required": False,
+            "home_score": None,
+            "away_score": None,
+            "home_goals": None,
+            "away_goals": None,
+        }
+    )
+    missing_dispositions = ScopeGeneration(
+        **{
+            **generation.constructor_values(),
+            "schedule": (nonfinal,),
+            "lineup": (),
+            "matchsheet": (),
+            "dispositions": (),
+        }
+    )
+    assert "captured Summary disposition missing" in " ".join(
+        validate_scope_generation(missing_dispositions).failures
+    )
+
+
+@pytest.mark.unit
+def test_raw_ledger_reconstruction_normalizes_naive_trino_timestamp_to_utc():
+    record = _generation().raw_ledger[-1]
+    physical = {
+        **record.constructor_values(),
+        "disposition": record.disposition.value,
+        "event_ids_json": canonical_json(record.event_ids),
+        "fetched_at": record.fetched_at.replace(tzinfo=None),
+    }
+    rebuilt = RawLedgerRecord.from_physical_row(physical)
+    assert rebuilt == record
+    assert rebuilt.fetched_at.tzinfo is UTC
+
+
+@pytest.mark.unit
+def test_table_partition_map_matches_real_writer_contract():
+    assert repository_module.TABLE_PARTITIONS == {
+        **{table: ("scope_id",) for table in ENTITY_TABLES.values()},
+        repository_module.LEDGER_TABLE: ("scope_id",),
+        MANIFEST_TABLE: ("scope_id",),
+        CUTOVER_TABLE: ("scope_id",),
+        CATALOG_TABLE: ("snapshot_id",),
+    }
+    writer = FakeWriter()
+    repository = EspnBronzeRepository(
+        writer=writer, query=FakeQuery(), ensure_objects_on_write=False
+    )
+    snapshot = build_catalog_snapshot(
+        snapshot_id="registry-20260731-v2",
+        registry_signature=SIG_A,
+        captured_at=datetime(2026, 7, 31, 7, tzinfo=UTC),
+        run_id="discovery-2",
+        raw_uri="s3://raw/catalog/v2.json.gz",
+        raw_sha256=SIG_B,
+        parser_version="espn-native-parser-v2",
+        runtime_version="espn-native-runtime-v2",
+        ingested_at=datetime(2026, 7, 31, 8, tzinfo=UTC),
+        batch_id="catalog-batch-2",
+        competitions=({"espn_id": 700, "slug": "eng.1"},),
+    )
+    assert isinstance(snapshot, repository_module.CatalogSnapshot)
+    repository.append_catalog_snapshot(snapshot)
+    assert writer.calls[0][0] == CATALOG_TABLE
+    assert writer.options[0]["partition_spec"] == [("snapshot_id", "identity")]
+
+
+@pytest.mark.unit
+def test_catalog_snapshot_retry_is_idempotent_and_conflicts_fail_closed():
+    captured_at = datetime(2026, 7, 31, 7, tzinfo=UTC)
+    snapshot = build_catalog_snapshot(
+        snapshot_id="registry-cas-1",
+        registry_signature=SIG_A,
+        captured_at=captured_at,
+        run_id="discovery-cas-1",
+        raw_uri="s3://raw/catalog/cas-1.json.gz",
+        raw_sha256=SIG_B,
+        parser_version="espn-native-parser-v2",
+        runtime_version="espn-native-runtime-v2",
+        ingested_at=captured_at,
+        batch_id="catalog-cas-1",
+        competitions=(
+            {"espn_id": 700, "slug": "eng.1"},
+            {"espn_id": 730, "slug": "ita.1"},
+        ),
+    )
+    writer = FakeWriter()
+    query = RepositoryStateQuery()
+    repository = EspnBronzeRepository(
+        writer=writer,
+        query=query,
+        ensure_objects_on_write=False,
+    )
+
+    repository.append_catalog_snapshot(snapshot)
+    assert len(writer.calls) == 1
+    query.catalog_rows = [
+        (
+            int(row["competition_id"]),
+            str(row["record_sha256"]),
+            snapshot.snapshot_signature,
+        )
+        for row in snapshot.rows
+    ]
+    repository.append_catalog_snapshot(snapshot)
+    assert len(writer.calls) == 1
+
+    conflict = build_catalog_snapshot(
+        snapshot_id=snapshot.snapshot_id,
+        registry_signature=SIG_A,
+        captured_at=captured_at,
+        run_id="discovery-cas-1",
+        raw_uri="s3://raw/catalog/cas-1.json.gz",
+        raw_sha256=SIG_B,
+        parser_version="espn-native-parser-v2",
+        runtime_version="espn-native-runtime-v2",
+        ingested_at=captured_at,
+        batch_id="catalog-cas-1",
+        competitions=(
+            {"espn_id": 700, "slug": "eng.1"},
+            {"espn_id": 730, "slug": "ita.changed"},
+        ),
+    )
+    with pytest.raises(ManifestConflictError, match="snapshot_id"):
+        repository.append_catalog_snapshot(conflict)
+    assert len(writer.calls) == 1
+
+
+def _native_cutover(generation: ScopeGeneration, **changes):
+    manifest = generation.manifest_row()
+    values = {
+        "cutover_id": "cutover-cas-1",
+        "scope_id": generation.plan.scope_id,
+        "active_source": "native",
+        "previous_source": "legacy",
+        "predecessor_cutover_id": None,
+        "predecessor_cutover_sha256": None,
+        "legacy_league": "ITA-Serie A",
+        "legacy_season": "2021",
+        "registry_signature": generation.registry_signature,
+        "effective_at": datetime(2026, 7, 31, 10, tzinfo=UTC),
+        "native_generation_id": generation.generation_id,
+        "native_generation_signature": generation.generation_signature,
+        "native_manifest_sha256": manifest["manifest_sha256"],
+        "rollback_run_id": None,
+        "rollback_reason": None,
+        "metadata": {"approved_by": "test"},
+    }
+    values.update(changes)
+    return repository_module.ScopeCutover(**values)
+
+
+@pytest.mark.unit
+def test_cutover_repository_enforces_readiness_idempotency_and_conflict_cas():
+    generation = _generation()
+    cutover = _native_cutover(generation)
+    writer = FakeWriter()
+    query = RepositoryStateQuery()
+    repository = EspnBronzeRepository(
+        writer=writer,
+        query=query,
+        verify_physical=False,
+        ensure_objects_on_write=False,
+    )
+
+    with pytest.raises(PublicationError, match="COMPLETE manifest"):
+        repository.append_cutover(cutover)
+    assert not writer.calls
+
+    manifest = generation.manifest_row()
+    query.manifests[(generation.plan.scope_id, generation.generation_id)] = tuple(
+        manifest[column] for column in repository.manifest_columns
+    )
+    repository.append_cutover(cutover)
+    assert [table for table, _ in writer.calls] == [CUTOVER_TABLE]
+    assert writer.options[-1]["partition_spec"] == [("scope_id", "identity")]
+
+    query.cutover_hashes[cutover.cutover_id] = [cutover.cutover_sha256]
+    query.cutover_slots[(cutover.scope_id, None)] = [
+        (cutover.cutover_id, cutover.cutover_sha256)
+    ]
+    repository.append_cutover(cutover)
+    assert len(writer.calls) == 1
+
+    conflicting_retry = _native_cutover(
+        generation,
+        metadata={"approved_by": "different-operator"},
+    )
+    with pytest.raises(ManifestConflictError, match="cutover_id"):
+        repository.append_cutover(conflicting_retry)
+    assert len(writer.calls) == 1
+
+
+@pytest.mark.unit
+def test_cutover_repository_enforces_transition_chain_and_timestamp():
+    generation = _generation()
+    native = _native_cutover(generation)
+    query = RepositoryStateQuery()
+    query.manifests[(generation.plan.scope_id, generation.generation_id)] = tuple(
+        generation.manifest_row()[column]
+        for column in EspnBronzeRepository.manifest_columns
+    )
+    query.latest_cutovers[generation.plan.scope_id] = (
+        native.cutover_id,
+        native.cutover_sha256,
+        "native",
+        native.effective_at,
+    )
+    writer = FakeWriter()
+    repository = EspnBronzeRepository(
+        writer=writer,
+        query=query,
+        ensure_objects_on_write=False,
+    )
+    rollback = repository_module.ScopeCutover(
+        cutover_id="rollback-cas-1",
+        scope_id=generation.plan.scope_id,
+        active_source="legacy",
+        previous_source="native",
+        predecessor_cutover_id=native.cutover_id,
+        predecessor_cutover_sha256=native.cutover_sha256,
+        legacy_league=native.legacy_league,
+        legacy_season=native.legacy_season,
+        registry_signature=native.registry_signature,
+        effective_at=datetime(2026, 7, 31, 11, tzinfo=UTC),
+        native_generation_id=None,
+        native_generation_signature=None,
+        native_manifest_sha256=None,
+        rollback_run_id="rollback-run-cas-1",
+        rollback_reason="operator rollback",
+        metadata={"approved_by": "test"},
+    )
+    repository.append_cutover(rollback)
+    assert writer.calls[-1][1].iloc[0]["cutover_sha256"] == rollback.cutover_sha256
+
+    stale = repository_module.ScopeCutover(
+        **{
+            **rollback.constructor_values(),
+            "cutover_id": "rollback-cas-stale",
+            "effective_at": native.effective_at,
+        }
+    )
+    with pytest.raises(ManifestConflictError, match="effective_at"):
+        repository.append_cutover(stale)
+
+    query.latest_cutovers[generation.plan.scope_id] = (
+        rollback.cutover_id,
+        rollback.cutover_sha256,
+        "legacy",
+        rollback.effective_at,
+    )
+    with pytest.raises(ManifestConflictError, match="previous_source"):
+        repository.append_cutover(
+            repository_module.ScopeCutover(
+                **{
+                    **rollback.constructor_values(),
+                    "cutover_id": "rollback-cas-invalid-chain",
+                    "predecessor_cutover_id": rollback.cutover_id,
+                    "predecessor_cutover_sha256": rollback.cutover_sha256,
+                    "effective_at": datetime(2026, 7, 31, 12, tzinfo=UTC),
+                }
+            )
+        )
+
+    query.cutover_slots[(generation.plan.scope_id, native.cutover_sha256)] = [
+        (rollback.cutover_id, rollback.cutover_sha256)
+    ]
+    with pytest.raises(ManifestConflictError, match="different successor"):
+        repository.append_cutover(
+            repository_module.ScopeCutover(
+                **{
+                    **rollback.constructor_values(),
+                    "cutover_id": "rollback-cas-fork",
+                    "effective_at": datetime(2026, 7, 31, 13, tzinfo=UTC),
+                }
+            )
+        )
+
+
+@pytest.mark.unit
+def test_cutover_contract_cas_readiness_and_deterministic_rollback():
+    cutover_type = repository_module.ScopeCutover
+    native = cutover_type(
+        cutover_id="cutover-1",
+        scope_id="730:2020",
+        active_source="native",
+        previous_source="legacy",
+        predecessor_cutover_id=None,
+        predecessor_cutover_sha256=None,
+        legacy_league="ITA-Serie A",
+        legacy_season="2021",
+        registry_signature=SIG_A,
+        effective_at=datetime(2026, 7, 31, 10, tzinfo=UTC),
+        native_generation_id="generation-1",
+        native_generation_signature="c" * 64,
+        native_manifest_sha256="d" * 64,
+        rollback_run_id=None,
+        rollback_reason=None,
+        metadata={"approved_by": "test"},
+    )
+    assert len(native.cutover_sha256) == 64
+    with pytest.raises(ValueError):
+        cutover_type(**{**native.constructor_values(), "previous_source": "native"})
+    rollback = cutover_type(
+        **{
+            **native.constructor_values(),
+            "cutover_id": "rollback-1",
+            "active_source": "legacy",
+            "previous_source": "native",
+            "predecessor_cutover_id": native.cutover_id,
+            "predecessor_cutover_sha256": native.cutover_sha256,
+            "effective_at": datetime(2026, 7, 31, 11, tzinfo=UTC),
+            "native_generation_id": None,
+            "native_generation_signature": None,
+            "native_manifest_sha256": None,
+            "rollback_run_id": "rollback-run-1",
+            "rollback_reason": "operator rollback",
+        }
+    )
+    assert rollback.cutover_sha256 != native.cutover_sha256
+    sql = render_current_view_sql("schedule")
+    assert "effective_at DESC, cutover_id DESC, cutover_sha256 DESC" in sql
+    assert "conflicting_cutover_predecessors" in sql
