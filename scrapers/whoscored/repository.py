@@ -1539,6 +1539,7 @@ class WhoScoredRepository:
             self.writer._trino_manager = trino
         self.catalog = catalog
         self.schema = schema
+        self._published_preview_games: dict[tuple[str, str, int], bool] = {}
 
     @property
     def _manifest(self) -> str:
@@ -4336,6 +4337,32 @@ class WhoScoredRepository:
         )
         return outcome_batch_id
 
+    def _preview_snapshot_published(self, commit: PreviewCommit) -> bool:
+        """Answer whether this game already carries a published preview snapshot.
+
+        A dataset the source never renders for a game must not block its first
+        snapshot: with nothing published there is nothing to hide.  Once a
+        snapshot exists the zero-row publication really would supersede it, so
+        the refusal stands.
+        """
+
+        identity = (commit.league, commit.season, int(commit.game_id))
+        cached = self._published_preview_games.get(identity)
+        if cached is None:
+            if not self.trino.table_exists(self.schema, PREVIEW_MANIFEST_TABLE):
+                cached = False
+            else:
+                rows = self.trino.execute_query(
+                    f"SELECT COUNT(*) FROM {self._preview_manifest} "
+                    f"WHERE league = {_sql_string(commit.league)} "
+                    f"AND season = {_sql_string(commit.season)} "
+                    f"AND game_id = {int(commit.game_id)} "
+                    "AND state = 'success'"
+                )
+                cached = bool(rows) and int(rows[0][0]) > 0
+            self._published_preview_games[identity] = cached
+        return cached
+
     def _prepare_preview_commit(
         self, commit: PreviewCommit
     ) -> tuple[dict[str, Sequence[Mapping[str, Any]]], dict[str, int], str]:
@@ -4394,7 +4421,7 @@ class WhoScoredRepository:
                 raise ValueError(
                     f"preview {commit.game_id}/{name} has invalid status {status!r}"
                 )
-            if status == "not_available":
+            if status == "not_available" and self._preview_snapshot_published(commit):
                 raise ValueError(
                     f"preview {commit.game_id}/{name} is not available; refusing "
                     "to hide the previously published snapshot"
@@ -4403,9 +4430,9 @@ class WhoScoredRepository:
                 raise ValueError(
                     f"preview {commit.game_id}/{name} is available but has no rows"
                 )
-            if status == "empty" and rows:
+            if status in {"empty", "not_available"} and rows:
                 raise ValueError(
-                    f"preview {commit.game_id}/{name} is empty but has rows"
+                    f"preview {commit.game_id}/{name} is {status} but has rows"
                 )
         counts = {name: len(rows) for name, rows in datasets.items()}
         schema_fingerprint = (
@@ -4661,6 +4688,9 @@ class WhoScoredRepository:
                 partition_spec=[("league", "identity"), ("season", "identity")],
                 source="whoscored",
             )
+            for row in manifest_frame:
+                identity = (row["league"], row["season"], int(row["game_id"]))
+                self._published_preview_games[identity] = True
         return tuple(commit.batch_id for commit in ordered)
 
     def _prepare_match_commit(

@@ -1969,7 +1969,10 @@ def test_preview_partial_orphan_fails_closed():
 
 @pytest.mark.unit
 def test_preview_not_available_dataset_cannot_hide_previous_snapshot():
-    repository = WhoScoredRepository(writer=MagicMock(), trino=MagicMock())
+    trino = MagicMock()
+    trino.table_exists.return_value = True
+    trino.execute_query.return_value = [(1,)]
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
     commit = _preview_commit(
         datasets={"preview_lineups": ()},
     )
@@ -1980,6 +1983,49 @@ def test_preview_not_available_dataset_cannot_hide_previous_snapshot():
             "preview_lineups": "not_available",
         },
     )
+
+    with pytest.raises(ValueError, match="not available"):
+        repository.validate_preview_commit(commit)
+
+
+@pytest.mark.unit
+def test_preview_not_available_dataset_still_publishes_a_first_snapshot():
+    trino = MagicMock()
+    trino.table_exists.return_value = True
+    trino.execute_query.return_value = [(0,)]
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+    commit = _preview_commit(
+        datasets={"preview_lineups": ()},
+    )
+    commit = replace(
+        commit,
+        dataset_statuses={
+            "missing_players": "not_available",
+            "preview_lineups": "empty",
+        },
+    )
+
+    repository.validate_preview_commit(commit)
+
+    datasets, counts, _ = repository._prepare_preview_commit(commit)
+    assert counts == {"missing_players": 0, "preview_lineups": 0}
+    assert not datasets["missing_players"]
+
+
+@pytest.mark.unit
+def test_published_preview_snapshot_re_arms_the_refusal_within_one_process():
+    trino = MagicMock()
+    trino.execute_query.side_effect = [
+        [(0,)],  # no published snapshot yet
+        [],  # no successful manifest
+        [],  # no physical rows before commit
+        [],  # zero-row batch is physically complete after commit
+    ]
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+    commit = _preview_commit()
+    commit = replace(commit, dataset_statuses={"missing_players": "not_available"})
+
+    assert repository.commit_previews((commit,)) == (commit.batch_id,)
 
     with pytest.raises(ValueError, match="not available"):
         repository.validate_preview_commit(commit)
