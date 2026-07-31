@@ -236,13 +236,28 @@ def test_unknown_status_and_required_schema_drift_fail_closed() -> None:
     [
         (None, "scoreboard.leagues"),
         ("drift", "scoreboard.leagues"),
+        ([], "exactly one root league"),
         ([{"id": "740", "slug": "esp.1"}], "promoted league"),
         (
             [
                 {"id": "730", "slug": "ita.1"},
                 {"id": "730", "slug": "ita.1"},
             ],
-            "exactly one promoted league",
+            "exactly one root league",
+        ),
+        (
+            [
+                {"id": "730", "slug": "ita.1"},
+                {"id": "740", "slug": "esp.1"},
+            ],
+            "exactly one root league",
+        ),
+        (
+            [
+                {"id": "740", "slug": "esp.1"},
+                {"id": "730", "slug": "ita.1"},
+            ],
+            "exactly one root league",
         ),
         ([{"id": "730", "slug": "wrong.slug"}], "slug"),
     ],
@@ -478,6 +493,55 @@ def test_consumed_nested_optionals_are_retained_in_canonical_extra_json() -> Non
 
 
 @pytest.mark.unit
+def test_summary_official_position_is_optional_and_unclassified_rows_are_retained() -> (
+    None
+):
+    competition, edition, schedule = _schedule()
+    payload = _load("native_summary.json")
+    payload["gameInfo"]["officials"] = [
+        {
+            "id": "88",
+            "fullName": "Fourth Official",
+            "displayName": "Fourth Official",
+            "order": 4,
+        },
+        {
+            "id": "89",
+            "fullName": "Video Official",
+            "position": {"name": "VIDEO_ASSISTANT", "rank": 2},
+            "providerExtra": {"code": "VAR"},
+        },
+        {
+            "id": "90",
+            "fullName": "Reserve Official",
+            "position": None,
+        },
+    ]
+
+    result = parse_summary(
+        _raw(payload), competition=competition, edition=edition, event=schedule[0]
+    )
+
+    assert all(
+        row.referee_id is None and row.referee is None for row in result.matchsheet
+    )
+    officials = json.loads(result.extra_json)["gameInfo"]["officials"]
+    assert officials == payload["gameInfo"]["officials"]
+
+
+@pytest.mark.unit
+def test_summary_official_position_rejects_non_object_when_non_null() -> None:
+    competition, edition, schedule = _schedule()
+    payload = _load("native_summary.json")
+    payload["gameInfo"]["officials"][0]["position"] = "REFEREE"
+
+    with pytest.raises(EspnParseError, match=r"officials\[0\].position"):
+        parse_summary(
+            _raw(payload), competition=competition, edition=edition, event=schedule[0]
+        )
+
+
+@pytest.mark.unit
 def test_malformed_athlete_and_one_sided_sections_fail_not_valid_empty() -> None:
     competition, edition, schedule = _schedule()
     malformed = _load("native_summary.json")
@@ -640,6 +704,66 @@ def test_matchsheet_uses_numeric_display_value_when_value_is_null() -> None:
     )
 
     assert [row.total_shots for row in result.matchsheet] == ["12", "12"]
+
+
+@pytest.mark.unit
+def test_unknown_structured_matchsheet_stats_remain_canonical_without_failing() -> None:
+    competition, edition, schedule = _schedule()
+    payload = _load("native_summary.json")
+    for team in payload["boxscore"]["teams"]:
+        team["statistics"].append(
+            {
+                "name": "newProviderShape",
+                "value": {"segments": [1, 2], "label": "experimental"},
+            }
+        )
+
+    result = parse_summary(
+        _raw(payload), competition=competition, edition=edition, event=schedule[0]
+    )
+
+    assert all(row.total_shots is not None for row in result.matchsheet)
+    assert all("newProviderShape" in row.statistics_json for row in result.matchsheet)
+
+
+@pytest.mark.unit
+def test_dual_lineup_stat_sources_and_mapping_shapes_populate_legacy_fields() -> None:
+    competition, edition, schedule = _schedule()
+    payload = _load("native_summary.json")
+    for roster in payload["rosters"]:
+        player = roster["roster"][0]
+        player["stats"] = [{"name": "totalShots", "value": 4}]
+        player["statistics"] = {
+            "appearances": {"displayValue": "3"},
+            "foulsCommitted": {"value": 2},
+            "goalAssists": 1,
+        }
+
+    result = parse_summary(
+        _raw(payload), competition=competition, edition=edition, event=schedule[0]
+    )
+
+    assert all(row.total_shots == 4.0 for row in result.lineup)
+    assert all(row.appearances == 3.0 for row in result.lineup)
+    assert all(row.fouls_committed == 2.0 for row in result.lineup)
+    assert all(row.goal_assists == 1.0 for row in result.lineup)
+    assert all('"statistics"' in row.statistics_json for row in result.lineup)
+    assert all('"stats"' in row.statistics_json for row in result.lineup)
+
+
+@pytest.mark.unit
+def test_conflicting_dual_lineup_stat_sources_fail_closed() -> None:
+    competition, edition, schedule = _schedule()
+    payload = _load("native_summary.json")
+    for roster in payload["rosters"]:
+        player = roster["roster"][0]
+        player["stats"] = [{"name": "totalShots", "value": 4}]
+        player["statistics"] = {"totalShots": 5}
+
+    with pytest.raises(EspnParseError, match="conflicting.*total_shots"):
+        parse_summary(
+            _raw(payload), competition=competition, edition=edition, event=schedule[0]
+        )
 
 
 @pytest.mark.unit

@@ -316,16 +316,27 @@ def _parse_game_info(
             official = required_mapping(
                 raw_official, f"summary.gameInfo.officials[{index}]"
             )
+            raw_position = official.get("position")
+            if raw_position is None:
+                # ESPN commonly emits fourth/reserve officials without a role.
+                # With no explicit classification, preserve the full source row.
+                official_extras.append(dict(official))
+                continue
             position = required_mapping(
-                official.get("position"),
-                f"summary.gameInfo.officials[{index}].position",
+                raw_position, f"summary.gameInfo.officials[{index}].position"
             )
             label = position.get("name", position.get("displayName"))
-            if isinstance(label, str) and label.strip().upper() in {
+            primary = isinstance(label, str) and label.strip().upper() in {
                 "REFEREE",
                 "MATCH REFEREE",
-            }:
+            }
+            if primary:
                 referees.append(official)
+            else:
+                # An explicit but unrecognized role cannot safely populate the
+                # primary referee fields. Preserve the complete official row.
+                official_extras.append(dict(official))
+                continue
             official_extra = unknown_fields(official, ("id", "fullName", "position"))
             position_extra = unknown_fields(position, ("name", "displayName"))
             if official_extra or position_extra:
@@ -362,26 +373,65 @@ def _parse_game_info(
     )
 
 
-def _lineup_stat_values(statistics: Any, field: str) -> dict[str, float]:
+def _lineup_stat_entries(statistics: Any, field: str) -> list[tuple[str, Any, str]]:
+    entries: list[tuple[str, Any, str]] = []
     if isinstance(statistics, Mapping):
-        return {}
+        for raw_name in sorted(statistics, key=str):
+            name = required_string(raw_name, f"{field} statistic name")
+            raw_value = statistics[raw_name]
+            item_field = f"{field}.{name}"
+            if isinstance(raw_value, Mapping):
+                mapped_name = raw_value.get("name", name)
+                name = required_string(mapped_name, f"{item_field}.name")
+                if "value" in raw_value:
+                    raw_value = raw_value["value"]
+                elif "displayValue" in raw_value:
+                    raw_value = raw_value["displayValue"]
+                else:
+                    raw_value = None
+            entries.append((name, raw_value, item_field))
+        return entries
     rows = required_list(statistics, field)
-    values: dict[str, float] = {}
     for index, raw_stat in enumerate(rows):
         stat = required_mapping(raw_stat, f"{field}[{index}]")
         name = required_string(stat.get("name"), f"{field}[{index}].name")
-        target = LINEUP_STAT_NAME_MAP.get(name)
-        if target is None:
-            continue
         value = stat.get("value")
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise EspnParseError(f"{field}[{index}].value must be numeric")
-        normalized = float(value)
-        if not math.isfinite(normalized):
-            raise EspnParseError(f"{field}[{index}].value must be finite")
-        if target in values:
-            raise EspnParseError(f"{field} maps duplicate statistic {target!r}")
-        values[target] = normalized
+        if value is None:
+            value = stat.get("displayValue")
+        entries.append((name, value, f"{field}[{index}]"))
+    return entries
+
+
+def _lineup_stat_values(sources: list[tuple[str, Any]], field: str) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for source_name, statistics in sources:
+        for name, value, item_field in _lineup_stat_entries(
+            statistics, f"{field}.{source_name}"
+        ):
+            target = LINEUP_STAT_NAME_MAP.get(name)
+            if target is None:
+                continue
+            if isinstance(value, bool):
+                raise EspnParseError(f"{item_field}.value must be numeric")
+            if isinstance(value, (int, float)):
+                normalized = float(value)
+            elif (
+                isinstance(value, str)
+                and _NUMERIC_DISPLAY_RE.fullmatch(value.strip()) is not None
+                and not value.strip().endswith("%")
+            ):
+                normalized = float(value.strip())
+            else:
+                raise EspnParseError(f"{item_field}.value must be numeric")
+            if not math.isfinite(normalized):
+                raise EspnParseError(f"{item_field}.value must be finite")
+            existing = values.get(target)
+            if existing is not None and existing != normalized:
+                raise EspnParseError(
+                    f"{field} has conflicting mapped statistic {target!r}: "
+                    f"{existing} versus {normalized}"
+                )
+            values[target] = normalized
     return values
 
 
@@ -476,16 +526,21 @@ def _lineup(
                 formation_place = optional_string(
                     raw_formation_place, f"{field}.formationPlace"
                 )
-            if "stats" in player and "statistics" in player:
+            stat_sources = [
+                (name, player[name])
+                for name in ("stats", "statistics")
+                if name in player
+            ]
+            if len(stat_sources) == 2:
                 statistics = {
                     "statistics": player["statistics"],
                     "stats": player["stats"],
                 }
+            elif stat_sources:
+                statistics = stat_sources[0][1]
             else:
-                statistics = player.get("stats", player.get("statistics", []))
-            if not isinstance(statistics, (list, Mapping)):
-                raise EspnParseError(f"{field}.statistics must be an array or object")
-            legacy_stats = _lineup_stat_values(statistics, f"{field}.statistics")
+                statistics = []
+            legacy_stats = _lineup_stat_values(stat_sources, f"{field}.statistics")
             substitution_fields = {
                 key: value
                 for key, value in player.items()
@@ -653,9 +708,9 @@ def _stat_values(statistics: list[Any], field: str) -> dict[str, str]:
         stat = required_mapping(raw_stat, f"{field}[{index}]")
         name = required_string(stat.get("name"), f"{field}[{index}].name")
         target = MATCHSHEET_STAT_NAME_MAP.get(name)
-        scalar = _stat_scalar(stat, f"{field}[{index}]")
         if target is None:
             continue
+        scalar = _stat_scalar(stat, f"{field}[{index}]")
         if target in values:
             raise EspnParseError(f"{field} maps duplicate statistic {target!r}")
         values[target] = scalar

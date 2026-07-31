@@ -88,26 +88,26 @@ def _scoreboard_league(
     payload: Mapping[str, Any], competition: Competition
 ) -> Mapping[str, Any]:
     leagues = required_list(payload.get("leagues"), "scoreboard.leagues")
-    matching: list[Mapping[str, Any]] = []
-    for index, value in enumerate(leagues):
-        league = required_mapping(value, f"scoreboard.leagues[{index}]")
-        league_id = native_id(league.get("id"), f"scoreboard.leagues[{index}].id")
-        if league_id != competition.espn_id:
-            continue
-        if "slug" in league and league["slug"] is not None:
-            slug = required_string(league["slug"], f"scoreboard.leagues[{index}].slug")
-            if slug != competition.slug:
-                raise EspnParseError(
-                    f"scoreboard promoted league slug {slug!r} does not match "
-                    f"registry slug {competition.slug!r}"
-                )
-        matching.append(league)
-    if len(matching) != 1:
+    if len(leagues) != 1:
         raise EspnParseError(
-            "scoreboard must contain exactly one promoted league matching "
-            f"competition {competition.espn_id}:{competition.slug}"
+            "scoreboard must contain exactly one root league because events "
+            "have no per-league binding"
         )
-    return matching[0]
+    league = required_mapping(leagues[0], "scoreboard.leagues[0]")
+    league_id = native_id(league.get("id"), "scoreboard.leagues[0].id")
+    if league_id != competition.espn_id:
+        raise EspnParseError(
+            "scoreboard promoted league does not match competition "
+            f"{competition.espn_id}:{competition.slug}"
+        )
+    if "slug" in league and league["slug"] is not None:
+        slug = required_string(league["slug"], "scoreboard.leagues[0].slug")
+        if slug != competition.slug:
+            raise EspnParseError(
+                f"scoreboard promoted league slug {slug!r} does not match "
+                f"registry slug {competition.slug!r}"
+            )
+    return league
 
 
 def _calendar_ranges(item: Any, field: str) -> list[tuple[date, date]]:
