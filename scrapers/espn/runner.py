@@ -202,6 +202,7 @@ class LoadedPlan:
     max_events: int
     mode: str
     attempt: int
+    selected_scopes: tuple[str, ...]
     bindings: Mapping[str, ScopeBinding]
     replay_source: ReplaySource | None
 
@@ -488,6 +489,27 @@ def _replay_source(value: Any) -> ReplaySource | None:
     )
 
 
+def _signed_scope_selection(value: Any, scope_ids: set[str]) -> tuple[str, ...]:
+    field_name = "plan.metadata.runtime.selected_scopes"
+    if not isinstance(value, (list, tuple)) or not all(
+        type(scope_id) is str and scope_id for scope_id in value
+    ):
+        raise RunnerConfigurationError(f"{field_name} must be a sequence of scope IDs")
+    selected = tuple(value)
+    if not selected:
+        raise RunnerConfigurationError(f"{field_name} must not be empty")
+    if len(selected) != len(set(selected)):
+        raise RunnerConfigurationError(f"{field_name} must contain unique scope IDs")
+    if selected != tuple(sorted(selected)):
+        raise RunnerConfigurationError(f"{field_name} must be sorted")
+    unknown = sorted(set(selected) - scope_ids)
+    if unknown:
+        raise RunnerConfigurationError(
+            f"{field_name} contains scopes outside the signed plan: {unknown}"
+        )
+    return selected
+
+
 def _load_signed_plan(uri: str) -> LoadedPlan:
     try:
         envelope = json.loads(_read_artifact(uri).decode("utf-8"))
@@ -514,6 +536,7 @@ def _load_signed_plan(uri: str) -> LoadedPlan:
             "output_uri",
             "raw_store_uri",
             "max_events",
+            "selected_scopes",
             "scope_bindings",
             "replay_source",
         },
@@ -526,6 +549,7 @@ def _load_signed_plan(uri: str) -> LoadedPlan:
         runtime["scope_bindings"], "plan.metadata.runtime.scope_bindings"
     )
     scope_ids = {scope.scope_id for scope in plan.scopes}
+    selected_scopes = _signed_scope_selection(runtime["selected_scopes"], scope_ids)
     if set(raw_bindings) != scope_ids:
         raise RunnerConfigurationError(
             "plan scope bindings must exactly match signed plan scopes"
@@ -555,6 +579,7 @@ def _load_signed_plan(uri: str) -> LoadedPlan:
         max_events=_max_events(runtime["max_events"], "runtime.max_events"),
         mode=mode,
         attempt=_positive_int(runtime["attempt"], "runtime.attempt"),
+        selected_scopes=selected_scopes,
         bindings=bindings,
         replay_source=replay,
     )
@@ -993,12 +1018,9 @@ def _validate_options(
             "CLI identity mismatches signed plan: " + ", ".join(mismatches)
         )
     by_scope = {scope.scope_id: scope for scope in plan.scopes}
-    selected_ids = tuple(sorted(options.scopes or tuple(by_scope)))
-    missing = [scope_id for scope_id in selected_ids if scope_id not in by_scope]
-    if missing:
-        raise RunnerConfigurationError(
-            f"requested scopes are not in signed plan: {sorted(missing)}"
-        )
+    selected_ids = loaded.selected_scopes
+    if options.scopes and tuple(sorted(options.scopes)) != selected_ids:
+        raise RunnerConfigurationError("CLI scopes do not match signed scope selection")
     if len(selected_ids) > DEFAULT_MAX_COMPETITIONS:
         raise RunnerConfigurationError(
             f"selected scopes exceed task limit {DEFAULT_MAX_COMPETITIONS}"
@@ -1195,10 +1217,15 @@ def _validate_raw_manifest(manifest: Any) -> dict[str, Any]:
     base = {key: value for key, value in raw.items() if key != "manifest_sha256"}
     if hashlib.sha256(_canonical_bytes(base)).hexdigest() != expected_hash:
         raise RunnerConfigurationError("raw manifest self-signature mismatch")
-    if not isinstance(raw["selected_scopes"], list) or len(
-        set(raw["selected_scopes"])
-    ) != len(raw["selected_scopes"]):
+    selected_scopes = raw["selected_scopes"]
+    if not isinstance(selected_scopes, list) or not all(
+        type(scope_id) is str and scope_id for scope_id in selected_scopes
+    ):
         raise RunnerConfigurationError("raw manifest selected scopes are invalid")
+    if len(set(selected_scopes)) != len(selected_scopes):
+        raise RunnerConfigurationError("raw manifest selected scopes are not unique")
+    if selected_scopes != sorted(selected_scopes):
+        raise RunnerConfigurationError("raw manifest selected scopes are not sorted")
     checkpoints = raw["checkpoints"]
     if not isinstance(checkpoints, list):
         raise RunnerConfigurationError("raw manifest checkpoints must be a list")
@@ -1254,7 +1281,11 @@ def _load_raw_manifest(
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RunnerConfigurationError("raw manifest is not valid JSON") from exc
     expected_scopes = sorted(scope.scope_id for scope in selected)
-    if manifest["selected_scopes"] != expected_scopes:
+    manifest_scopes = manifest["selected_scopes"]
+    if loaded.mode == "replay":
+        if not set(expected_scopes).issubset(manifest_scopes):
+            raise RunnerConfigurationError("raw manifest scope selection mismatch")
+    elif manifest_scopes != expected_scopes:
         raise RunnerConfigurationError("raw manifest scope selection mismatch")
     if manifest["as_of"] != loaded.plan.as_of.isoformat():
         raise RunnerConfigurationError("raw manifest as_of mismatch")
@@ -1856,6 +1887,7 @@ def _execute_scope(
         raise ScopeIncompleteError("; ".join(report.failures))
     snapshot = scope_snapshot_bytes(generation)
     _assert_immutable_target(binding.generation_snapshot_uri, snapshot)
+    _write_artifact(binding.generation_snapshot_uri, snapshot, immutable=True)
     publication = repository.publish_scope(generation)
     if publication.state not in {
         ScopePublicationState.PUBLISHED,
@@ -1866,7 +1898,6 @@ def _execute_scope(
         )
     if publication.manifest_sha256 != generation.manifest_sha256:
         raise ScopeIncompleteError("repository manifest identity mismatch")
-    _write_artifact(binding.generation_snapshot_uri, snapshot, immutable=True)
     return {
         "scope_id": scope.scope_id,
         "state": "complete",
@@ -1950,6 +1981,12 @@ def execute(
                 repository=repository,
                 budget_state=budget_state,
             )
+        except ArtifactConflictError as exc:
+            result = {
+                "scope_id": scope.scope_id,
+                "state": "incomplete",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
         except RunnerConfigurationError:
             raise
         except Exception as exc:

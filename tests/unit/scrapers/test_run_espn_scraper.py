@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -367,6 +368,7 @@ def _plan(
     known_nonterminal_events: dict[str, list[dict]] | None = None,
     replay_source: dict | None = None,
     max_events: int = 100,
+    selected_scopes: tuple[str, ...] | None = None,
 ) -> tuple[ExecutionOptions, IngestPlan]:
     registry_uri, registry_signature = _registry(
         tmp_path, tuple(item[0] for item in competitions)
@@ -420,6 +422,9 @@ def _plan(
             "output_uri": output.as_uri(),
             "raw_store_uri": (tmp_path / "raw-store").as_uri(),
             "max_events": max_events,
+            "selected_scopes": list(
+                selected_scopes if selected_scopes is not None else sorted(bindings)
+            ),
             "scope_bindings": bindings,
             "replay_source": replay_source,
         }
@@ -443,7 +448,11 @@ def _plan(
     )
     options = ExecutionOptions(
         mode=mode,
-        scopes=tuple(scope.scope_id for scope in plan.scopes),
+        scopes=(
+            selected_scopes
+            if selected_scopes is not None
+            else tuple(scope.scope_id for scope in plan.scopes)
+        ),
         as_of=as_of,
         run_id=run_id,
         attempt=attempt,
@@ -536,6 +545,10 @@ def test_cli_exposes_only_native_modes_and_rejects_legacy_flags(mode, tmp_path):
     args = parser.parse_args(argv)
     assert args.mode == mode
     assert args.scope == ["730:2020"]
+    assert os.access(
+        Path(__file__).resolve().parents[3] / "dags/scripts/run_espn_scraper.py",
+        os.X_OK,
+    )
     for legacy in ("--leagues", "--season", "--force-replace"):
         with pytest.raises(SystemExit):
             parser.parse_args([*argv, legacy, "legacy"])
@@ -1256,6 +1269,135 @@ def test_artifact_uri_collisions_fail_preflight_before_publication(tmp_path):
 
 
 @pytest.mark.unit
+def test_signed_scope_selection_rejects_cli_subset_and_permuted_plan(tmp_path):
+    first, first_edition = _competition(730, "ita.1")
+    second, second_edition = _competition(731, "eng.1")
+    competitions = ((first, first_edition), (second, second_edition))
+    options, _ = _plan(tmp_path / "subset", "repair", competitions)
+    with pytest.raises(RunnerConfigurationError, match="signed scope selection"):
+        execute(
+            replace(options, scopes=(first.scope_id(first_edition),)),
+            repository=FakeRepository(),
+        )
+
+    reversed_ids = (
+        second.scope_id(second_edition),
+        first.scope_id(first_edition),
+    )
+    permuted, _ = _plan(
+        tmp_path / "permuted",
+        "repair",
+        competitions,
+        selected_scopes=reversed_ids,
+    )
+    with pytest.raises(RunnerConfigurationError, match="sorted"):
+        execute(permuted, repository=FakeRepository())
+
+
+@pytest.mark.unit
+def test_signed_scope_selection_must_be_nonempty(tmp_path):
+    competition, edition = _competition()
+    options, _ = _plan(
+        tmp_path,
+        "repair",
+        ((competition, edition),),
+        selected_scopes=(),
+    )
+
+    with pytest.raises(RunnerConfigurationError, match="must not be empty"):
+        execute(options, repository=FakeRepository())
+
+
+@pytest.mark.unit
+def test_cli_omitted_uses_signed_selection_and_distinct_batch_plans_are_usable(
+    tmp_path,
+):
+    first, first_edition = _competition(730, "ita.1")
+    second, second_edition = _competition(731, "eng.1")
+    competitions = ((first, first_edition), (second, second_edition))
+    scoreboard = {
+        first.slug: _scoreboard(first, first_edition, status="STATUS_SCHEDULED"),
+        second.slug: _scoreboard(second, second_edition, status="STATUS_SCHEDULED"),
+    }
+    published = []
+    for label, selected in (
+        ("a", first.scope_id(first_edition)),
+        ("b", second.scope_id(second_edition)),
+    ):
+        options, _ = _plan(
+            tmp_path / label,
+            "repair",
+            competitions,
+            run_id=f"run-{label}",
+            selected_scopes=(selected,),
+        )
+        if label == "a":
+            options = replace(options, scopes=())
+        raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+        repository = FakeRepository()
+        result = execute(
+            options,
+            repository=repository,
+            raw_store=raw_store,
+            http_client=FakeHttpClient(raw_store, scoreboard),
+        )
+        assert result.exit_code == 0
+        published.extend(item.plan.scope_id for item in repository.generations)
+    assert published == [first.scope_id(first_edition), second.scope_id(second_edition)]
+
+
+@pytest.mark.unit
+def test_replay_selected_scope_accepts_verified_source_manifest_superset(tmp_path):
+    first, first_edition = _competition(730, "ita.1")
+    second, second_edition = _competition(731, "eng.1")
+    competitions = ((first, first_edition), (second, second_edition))
+    capture_options, capture_plan = _plan(
+        tmp_path / "capture", "repair", competitions, run_id="capture-run"
+    )
+    raw_store = EspnRawStore.from_uri(capture_options.raw_store_uri)
+    source_payloads = {
+        first.slug: _scoreboard(first, first_edition, status="STATUS_SCHEDULED"),
+        second.slug: _scoreboard(second, second_edition, status="STATUS_SCHEDULED"),
+    }
+    assert (
+        execute(
+            capture_options,
+            repository=FakeRepository(),
+            raw_store=raw_store,
+            http_client=FakeHttpClient(raw_store, source_payloads),
+        ).exit_code
+        == 0
+    )
+    raw_bytes = Path(
+        capture_options.raw_manifest_uri.removeprefix("file://")
+    ).read_bytes()
+    replay_source = {
+        "mode": "repair",
+        "run_id": capture_options.run_id,
+        "attempt": capture_options.attempt,
+        "plan_signature": capture_plan.signature(),
+        "raw_manifest_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+    }
+    replay_options, replay_plan = _plan(
+        tmp_path / "replay",
+        "replay",
+        competitions,
+        run_id="replay-run",
+        replay_source=replay_source,
+        selected_scopes=(first.scope_id(first_edition),),
+    )
+    replay_options, _ = _bind_replay_to_capture(
+        replay_options, replay_plan, capture_options
+    )
+    repository = FakeRepository()
+    result = execute(replay_options, repository=repository, raw_store=raw_store)
+    assert result.exit_code == 0
+    assert [item.plan.scope_id for item in repository.generations] == [
+        first.scope_id(first_edition)
+    ]
+
+
+@pytest.mark.unit
 def test_final_to_postponed_refresh_removes_stale_prior_summary_entities(tmp_path):
     competition, edition = _competition()
     prior = _prior_generation(competition, edition)
@@ -1293,7 +1435,98 @@ def test_final_to_postponed_refresh_removes_stale_prior_summary_entities(tmp_pat
 
 
 @pytest.mark.unit
-def test_existing_snapshot_and_terminal_result_conflicts_fail_same_identity(tmp_path):
+def test_snapshot_conflict_is_scope_incomplete_and_other_scope_still_publishes(
+    tmp_path,
+):
+    first, first_edition = _competition(730, "ita.1")
+    second, second_edition = _competition(731, "eng.1")
+    options, _ = _plan(
+        tmp_path,
+        "repair",
+        ((first, first_edition), (second, second_edition)),
+    )
+    conflicting = tmp_path / "runs" / "run-1" / "attempt-1" / "scope-730:2020.json"
+    conflicting.parent.mkdir(parents=True, exist_ok=True)
+    conflicting.write_text('{"forged":true}', encoding="utf-8")
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    repository = FakeRepository()
+    result = execute(
+        options,
+        repository=repository,
+        raw_store=raw_store,
+        http_client=FakeHttpClient(
+            raw_store,
+            {
+                first.slug: _scoreboard(
+                    first, first_edition, status="STATUS_SCHEDULED"
+                ),
+                second.slug: _scoreboard(
+                    second, second_edition, status="STATUS_SCHEDULED"
+                ),
+            },
+        ),
+    )
+    assert result.exit_code == 1
+    assert [item.plan.scope_id for item in repository.generations] == [
+        second.scope_id(second_edition)
+    ]
+    assert [item["state"] for item in result.payload["scopes"]] == [
+        "incomplete",
+        "complete",
+    ]
+    assert Path(options.output_uri.removeprefix("file://")).is_file()
+
+
+@pytest.mark.unit
+def test_snapshot_io_failure_happens_before_publish_and_retry_is_safe(
+    tmp_path, monkeypatch
+):
+    import scrapers.espn.runner as runner_module
+
+    competition, edition = _competition()
+    options, _ = _plan(tmp_path, "backfill", ((competition, edition),))
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    snapshot_uri = (
+        tmp_path / "runs" / "run-1" / "attempt-1" / "scope-730:2020.json"
+    ).as_uri()
+    real_write = runner_module._write_artifact
+    failed = False
+
+    def fail_snapshot_once(uri, payload, *, immutable):
+        nonlocal failed
+        if uri == snapshot_uri and not failed:
+            failed = True
+            raise OSError("injected durable snapshot failure")
+        return real_write(uri, payload, immutable=immutable)
+
+    monkeypatch.setattr(runner_module, "_write_artifact", fail_snapshot_once)
+    first_repository = FakeRepository()
+    first = execute(
+        options,
+        repository=first_repository,
+        raw_store=raw_store,
+        http_client=FakeHttpClient(
+            raw_store, {competition.slug: _scoreboard(competition, edition)}
+        ),
+    )
+    assert first.exit_code == 1
+    assert first_repository.generations == []
+
+    retry_client = FakeHttpClient(raw_store, {competition.slug: b"forbidden"})
+    retry_repository = FakeRepository()
+    retry = execute(
+        options,
+        repository=retry_repository,
+        raw_store=raw_store,
+        http_client=retry_client,
+    )
+    assert retry.exit_code == 0
+    assert len(retry_repository.generations) == 1
+    assert retry_client.calls == []
+
+
+@pytest.mark.unit
+def test_terminal_result_conflict_fails_same_identity(tmp_path):
     competition, edition = _competition()
     options, _ = _plan(tmp_path, "backfill", ((competition, edition),))
     raw_store = EspnRawStore.from_uri(options.raw_store_uri)
@@ -1307,18 +1540,6 @@ def test_existing_snapshot_and_terminal_result_conflicts_fail_same_identity(tmp_
         ).exit_code
         == 0
     )
-    snapshot_path = tmp_path / "runs" / "run-1" / "attempt-1" / "scope-730:2020.json"
-    snapshot_bytes = snapshot_path.read_bytes()
-    snapshot_path.write_text('{"forged":true}', encoding="utf-8")
-    with pytest.raises(ArtifactConflictError, match="immutable artifact conflict"):
-        execute(
-            options,
-            repository=FakeRepository(),
-            raw_store=raw_store,
-            http_client=FakeHttpClient(raw_store, {competition.slug: b"forbidden"}),
-        )
-
-    snapshot_path.write_bytes(snapshot_bytes)
     output_path = Path(options.output_uri.removeprefix("file://"))
     output_path.write_text('{"state":"complete"}', encoding="utf-8")
     with pytest.raises(ArtifactConflictError, match="terminal run result conflict"):
