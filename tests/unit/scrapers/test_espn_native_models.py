@@ -320,3 +320,25 @@ def test_native_contracts_reject_invalid_identity_and_integrity_values(
 ) -> None:
     with pytest.raises((TypeError, ValueError), match=message):
         factory()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "source_season_year",
+    [True, 2026.0, "2026", "+2026", "2026.0", "02026"],
+)
+def test_competition_scope_id_rejects_noncanonical_year_values(
+    source_season_year,
+) -> None:
+    competition = Competition(
+        espn_id=700,
+        slug="eng.1",
+        name="English Premier League",
+        gender=Gender.MALE,
+        age_class=AgeClass.SENIOR,
+        enabled=True,
+        editions=(_edition(),),
+    )
+
+    with pytest.raises(ValueError, match="source_season_year"):
+        competition.scope_id(source_season_year)

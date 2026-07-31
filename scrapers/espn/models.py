@@ -291,9 +291,9 @@ class Competition(CanonicalModel):
             raise TypeError("competition legacy must be LegacyAliases or None")
 
     def scope_id(self, edition: Edition | int) -> str:
-        year = (
-            edition.source_season_year if isinstance(edition, Edition) else int(edition)
-        )
+        _positive_int(self.espn_id, "espn_id")
+        year = edition.source_season_year if isinstance(edition, Edition) else edition
+        _positive_int(year, "source_season_year", minimum=1800)
         return f"{self.espn_id}:{year}"
 
     @property

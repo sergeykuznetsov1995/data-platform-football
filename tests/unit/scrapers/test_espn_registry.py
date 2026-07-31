@@ -368,3 +368,15 @@ def test_registry_rejects_unknown_keys() -> None:
 
     with pytest.raises(RegistryError, match="unknown keys"):
         validate_registry_document(document)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("schema_version", [True, False, 1.0, "1"])
+def test_registry_schema_version_requires_exact_supported_integer(
+    schema_version,
+) -> None:
+    document = _document()
+    document["schema_version"] = schema_version
+
+    with pytest.raises(RegistryError, match="schema_version"):
+        validate_registry_document(document)

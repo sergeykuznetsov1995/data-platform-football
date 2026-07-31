@@ -283,7 +283,11 @@ def validate_registry_document(document: Mapping[str, Any]) -> Registry:
         "registry",
     )
     schema_version = document.get("schema_version")
-    if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+    if (
+        type(schema_version) is not int
+        or schema_version <= 0
+        or schema_version not in SUPPORTED_SCHEMA_VERSIONS
+    ):
         raise RegistryError(
             f"schema_version must be one of {sorted(SUPPORTED_SCHEMA_VERSIONS)}"
         )
