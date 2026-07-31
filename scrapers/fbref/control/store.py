@@ -4124,6 +4124,47 @@ class ControlStore:
         """Compatibility alias for full frontier scope reconciliation."""
         return self.reconcile_frontier_scope(source=source)
 
+    def quarantine_contract_rejected_target(
+        self,
+        target_id: object,
+        *,
+        content_hash: object,
+        reason: object,
+    ) -> bool:
+        """Retire one target whose own published shape the parser cannot use.
+
+        Fenced to the exact bytes that were rejected: a fetch that landed newer
+        content while the verdict was being formed must not be retired on a
+        stale reading.  Callers treat ``False`` as "not retired" and fail their
+        wave, so a lost race is reported rather than silently swallowed.
+
+        Deliberately a different ``last_error_class`` than the scope quarantine:
+        scope reconciliation reopens only its own verdict, so a page the parser
+        has proven unusable is not resurrected by the next registry sweep.
+        Reopening this verdict is an out-of-band decision, by design -- the
+        source shape has to change first.
+        """
+
+        target = _text(target_id, "target_id")
+        digest = _text(content_hash, "content_hash")
+        detail = _text(reason, "reason")[:1000]
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                UPDATE fbref_control.page_frontier
+                SET state = 'quarantined', next_fetch_at = NULL,
+                    retry_after = NULL,
+                    last_error_class = 'ParseContractQuarantined',
+                    last_error_message = %s,
+                    updated_at = clock_timestamp()
+                WHERE target_id = %s
+                  AND last_content_hash = %s
+                  AND state NOT IN ('leased', 'dead')
+                """,
+                (detail, target, digest),
+            )
+            return bool(cursor.rowcount)
+
     def list_acceptance_candidates(
         self,
         *,
@@ -5902,6 +5943,11 @@ class ControlStore:
                 WHERE attempt.status = 'succeeded'
                   AND attempt.raw_manifest_key IS NOT NULL
                   AND attempt.content_hash IS NOT NULL
+                  -- Raw behind a retired target is out of scope by the same
+                  -- decision that retired it, exactly as in the recovery
+                  -- cohort.  Without this the run would clear recovery and
+                  -- then fail its own unprocessed-raw gate on the same bytes.
+                  AND frontier.state <> 'quarantined'
                   AND (
                     (
                       %s::text IS NULL
@@ -6619,6 +6665,11 @@ class ControlStore:
         a successful immutable raw commit remains recoverable when a later task
         made its parent run fail or get cancelled.  Oldest raw is drained first
         so repeated bounded calls cannot starve earlier observations.
+
+        Quarantined targets are excluded: their raw is out of scope by the same
+        decision that retired them, and without this a page the parser has
+        already proven unusable would be re-selected by every later run.
+        Reopening a target requeues it and makes its raw eligible again.
         """
         parser = _text(parser_version, "parser_version")
         typed_parser = _text(typed_parser_version, "typed_parser_version")
@@ -6652,6 +6703,7 @@ class ControlStore:
                 JOIN fbref_control.page_frontier AS frontier
                   ON frontier.target_id = attempt.target_id
                 WHERE frontier.source = %s
+                  AND frontier.state <> 'quarantined'
                   AND attempt.status = 'succeeded'
                   AND attempt.raw_manifest_key IS NOT NULL
                   AND attempt.content_hash IS NOT NULL

@@ -48,6 +48,7 @@ from scrapers.fbref.discovery import (
     parse_competition_index_html,
     parse_schedule_html,
     parse_season_html,
+    season_page_is_complete_without_schedule,
     sentinel_coverage,
 )
 from scrapers.fbref.fetcher import (
@@ -112,6 +113,10 @@ SENTINEL_COMPETITIONS = (
 # fence and renew all outstanding sequential leases before every target.
 FETCH_LEASE_SECONDS = 60 * 60
 PROCESSING_LEASE_SECONDS = 60 * 60
+# Above this count, and only when retirements also dominate their wave, a
+# source contract rejection stops looking like a few unusable archived pages
+# and starts looking like FBref having changed its markup.
+MAX_ROUTINE_CONTRACT_QUARANTINES = 5
 REPLAY_SOURCE_REQUEST_LIMIT = 200
 REPLAY_SOURCE_BYTE_LIMIT = 100 * MIB
 ACCEPTANCE_REQUEST_LIMIT = 100
@@ -152,6 +157,24 @@ class RunValidationError(PipelineError):
 
 class TypedPromotionDeferred(PipelineError):
     """An active target refresh prevents an atomic typed promotion."""
+
+
+class SourceContractRejected(ParseWaveError):
+    """One page's own published shape can never satisfy its parser contract.
+
+    A ``ParseWaveError`` subclass so every caller outside the parse wave keeps
+    failing closed.  Inside the wave it is the one failure isolated to its own
+    target: retrying the same immutable bytes cannot change the verdict, so the
+    target is retired instead of stalling every other page behind it.
+    """
+
+    def __init__(
+        self, message: str, *, target_id: str, content_hash: str, reason: str
+    ) -> None:
+        super().__init__(message)
+        self.target_id = target_id
+        self.content_hash = content_hash
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -402,6 +425,7 @@ class WaveResult:
     requeued_at_budget: int = 0
     requeued_dead_clearance: int = 0
     requeued_session_exhaustion: int = 0
+    contract_quarantined: int = 0
     failures: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -1193,6 +1217,16 @@ def page_target_from_link(link: DiscoveredPageLink) -> PageTarget:
         ),
         canonical_url=link.canonical_url,
         source_ids=source_ids,
+    )
+
+
+def _is_mass_contract_rejection(result: "WaveResult") -> bool:
+    """Tell a few unusable archived pages from the source changing shape."""
+
+    retired = result.contract_quarantined
+    return (
+        retired > MAX_ROUTINE_CONTRACT_QUARANTINES
+        and retired * 2 > result.cohort_size
     )
 
 
@@ -3392,10 +3426,35 @@ class FBrefPipeline:
         if record.page_kind != "season":
             return
         parsed = parse_season_html(html, self._season_ref(record))
-        if parsed.has_errors:
-            raise ParseWaveError(
-                f"Season source contract failed for {record.target_id}"
+        if not parsed.has_errors:
+            return
+        reason = ",".join(
+            sorted(
+                {
+                    str(dataset.reason or dataset.error_type or "unknown")
+                    for dataset in parsed.datasets.values()
+                    if dataset.status.value == "error"
+                }
             )
+        )
+        # Only a shape the source itself proves finished may retire its target.
+        # Every other contract failure -- a table-free shell that cannot prove
+        # its identity, a link the parser could not canonicalize -- stays a loud
+        # wave failure, because a retry of fresher bytes can still succeed.
+        if reason == "schedule_link_missing" and (
+            season_page_is_complete_without_schedule(
+                html, competition_id=str(record.source_ids["competition_id"])
+            )
+        ):
+            raise SourceContractRejected(
+                f"Season source contract failed for {record.target_id}",
+                target_id=record.target_id,
+                content_hash=record.content_hash,
+                reason=reason,
+            )
+        raise ParseWaveError(
+            f"Season source contract failed for {record.target_id}"
+        )
 
     def parse_wave(
         self,
@@ -3620,11 +3679,49 @@ class FBrefPipeline:
                             f"{item['target_id']}:observation_fence:"
                             f"{type(fence_exc).__name__}:{fence_exc}"
                         )
+                if isinstance(exc, SourceContractRejected):
+                    # The verdict is a property of these immutable bytes, so
+                    # the target is retired here rather than left to block the
+                    # recovery cohort of every later run.  Quarantining runs
+                    # after the content guard released its frontier row lock.
+                    retired = False
+                    try:
+                        retired = self.control.quarantine_contract_rejected_target(
+                            exc.target_id,
+                            content_hash=exc.content_hash,
+                            reason=exc.reason,
+                        )
+                    except Exception as quarantine_exc:
+                        result.failures.append(
+                            f"{item['target_id']}:contract_quarantine:"
+                            f"{type(quarantine_exc).__name__}:{quarantine_exc}"
+                        )
+                    if retired:
+                        logger.warning(
+                            "Quarantined %s after source contract rejection: %s",
+                            exc.target_id,
+                            exc.reason,
+                        )
+                        result.contract_quarantined += 1
+                        continue
+                    # A target raced into a lease or was already retired stays
+                    # a wave failure: reporting progress that did not shrink
+                    # the cohort would spin the recovery drain forever.
                 result.failures.append(
                     f"{item['target_id']}:{type(exc).__name__}:{exc}"
                 )
         if result.failures:
             raise ParseWaveError("; ".join(result.failures))
+        if _is_mass_contract_rejection(result):
+            # Retiring a handful of archived editions is routine.  Retiring the
+            # bulk of a live cohort is not a property of those pages -- it is
+            # the source's markup having moved under the parser -- and silently
+            # shrinking the crawl scope is the one outcome worse than stopping.
+            raise ParseWaveError(
+                "Mass source contract rejection: "
+                f"{result.contract_quarantined} of {result.cohort_size} "
+                "targets retired in one wave"
+            )
         return result
 
     def recover_unprocessed_wave(

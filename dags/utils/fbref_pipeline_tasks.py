@@ -1592,6 +1592,9 @@ def run_recovery_wave(
         if cohort_size == 0:
             break
         parsed = int(result.get("parsed") or 0)
+        # Retiring a target the parser can never accept shrinks the cohort for
+        # good, so it is progress even though nothing was parsed.
+        retired = int(result.get("contract_quarantined") or 0)
         aggregate["batches"] = int(aggregate["batches"]) + 1
         for key, value in result.items():
             if key == "failures":
@@ -1601,7 +1604,7 @@ def run_recovery_wave(
                 aggregate[key] = bool(aggregate.get(key, False)) or value
             elif isinstance(value, int):
                 aggregate[key] = int(aggregate.get(key, 0)) + value
-        if parsed == 0:
+        if parsed == 0 and retired == 0:
             raise RuntimeError(
                 "FBref raw recovery made no progress with "
                 f"{cohort_size} observation(s) still selected"
