@@ -266,9 +266,15 @@ class RepositoryStateQuery(FakeQuery):
         self.catalog_rows: list[tuple[int, str, str]] = []
         self.cutover_hashes: dict[str, list[str]] = {}
         self.cutover_slots: dict[tuple[str, str | None], list[tuple[str, str]]] = {}
-        self.latest_cutovers: dict[str, tuple[str, str, str, datetime]] = {}
+        self.latest_cutovers: dict[str, tuple[str, str, str, datetime, str, str]] = {}
+        self.unresolved_cutover_forks: set[str] = set()
 
     def execute_query(self, sql, params=None):
+        if "unresolved_cutover_forks" in sql:
+            self.calls.append((sql, params))
+            return (
+                [("f" * 64,)] if str(params[0]) in self.unresolved_cutover_forks else []
+            )
         if f"FROM iceberg.bronze.{CATALOG_TABLE}" in sql:
             self.calls.append((sql, params))
             return list(self.catalog_rows)
@@ -330,6 +336,51 @@ def test_ddl_and_views_have_append_only_contract_and_full_join_identity():
         assert "validated_complete" in sql
         assert "native_ready" in sql
         assert f"'$.{entity}'" in sql
+
+
+@pytest.mark.unit
+def test_ensure_objects_evolves_cutover_ancestry_before_creating_views():
+    query = FakeQuery()
+    repository = EspnBronzeRepository(writer=FakeWriter(), query=query)
+
+    repository.ensure_objects()
+
+    statements = [sql for sql, _ in query.calls]
+    alterations = [
+        index
+        for index, sql in enumerate(statements)
+        if f"ALTER TABLE iceberg.bronze.{CUTOVER_TABLE}" in sql
+    ]
+    gate = next(
+        index
+        for index, sql in enumerate(statements)
+        if "cutover_ancestry_rollout_gate" in sql
+    )
+    first_view = next(
+        index
+        for index, sql in enumerate(statements)
+        if sql.startswith("CREATE OR REPLACE VIEW")
+    )
+    assert len(alterations) == 2
+    assert max(alterations) < gate < first_view
+    assert all("ADD COLUMN IF NOT EXISTS" in statements[index] for index in alterations)
+
+
+@pytest.mark.unit
+def test_ensure_objects_blocks_legacy_cutovers_until_ancestry_is_migrated():
+    class LegacyCutoverQuery(FakeQuery):
+        def execute_query(self, sql, params=None):
+            if "cutover_ancestry_rollout_gate" in sql:
+                self.calls.append((sql, params))
+                return [("legacy-cutover",)]
+            return super().execute_query(sql, params=params)
+
+    query = LegacyCutoverQuery()
+    repository = EspnBronzeRepository(writer=FakeWriter(), query=query)
+
+    with pytest.raises(PublicationError, match="ancestry migration"):
+        repository.ensure_objects()
+    assert not any(sql.startswith("CREATE OR REPLACE VIEW") for sql, _ in query.calls)
 
 
 @pytest.mark.unit
@@ -442,6 +493,51 @@ def test_terminal_nonplayed_does_not_require_summary_entities():
             "summary_required": False,
             "home_score": None,
             "away_score": None,
+        }
+    )
+    candidate = ScopeGeneration(
+        **{
+            **generation.constructor_values(),
+            "schedule": (schedule,),
+            "lineup": (),
+            "matchsheet": (),
+            "planned_request_ids": (generation.planned_request_ids[0],),
+            "raw_ledger": (generation.raw_ledger[0],),
+            "dispositions": (),
+        }
+    )
+    assert validate_scope_generation(candidate).passed
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("status", "home_score", "away_score"),
+    [
+        ("STATUS_FORFEIT", 3, 0),
+        ("STATUS_FORFEIT", None, None),
+        ("STATUS_WALKOVER", 3, 0),
+        ("STATUS_WALKOVER", None, None),
+        ("STATUS_CANCELED", None, None),
+        ("STATUS_ABANDONED", 1, 0),
+        ("STATUS_ABANDONED", 1, None),
+    ],
+)
+def test_terminal_nonplayed_preserves_source_administrative_or_partial_scores(
+    status, home_score, away_score
+):
+    generation = _generation()
+    schedule = ScheduleRow(
+        **{
+            **asdict(generation.schedule[0]),
+            "status": status,
+            "terminal": True,
+            "played_final": False,
+            "terminal_nonplayed": True,
+            "summary_required": False,
+            "home_score": home_score,
+            "away_score": away_score,
+            "home_goals": None if home_score is None else str(home_score),
+            "away_goals": None if away_score is None else str(away_score),
         }
     )
     candidate = ScopeGeneration(
@@ -875,6 +971,58 @@ def test_current_view_signature_isolates_unmanifested_concurrent_attempts():
 
 
 @pytest.mark.unit
+def test_current_view_bounds_every_physical_fence_to_complete_candidates():
+    sql = render_current_view_sql("schedule")
+    assert "candidate_generation_identities AS" in sql
+    assert "SELECT DISTINCT" in sql[sql.index("candidate_generation_identities AS") :]
+    for relation in (*ENTITY_TABLES, "ledger"):
+        block = sql[
+            sql.index(f"ranked_{relation}_rows AS") : sql.index(
+                f"), {relation}_rows AS"
+            )
+        ]
+        assert "JOIN candidate_generation_identities candidate" in block
+        for key in (
+            "scope_id",
+            "competition_id",
+            "source_season_year",
+            "generation_id",
+            "generation_signature",
+            "run_id",
+            "_batch_id",
+            "registry_snapshot_uri",
+            "registry_signature",
+            "plan_signature",
+            "parser_version",
+            "runtime_version",
+        ):
+            assert f'r."{key}" = candidate."{key}"' in block
+
+    candidate = (
+        "730:2020",
+        730,
+        2020,
+        "generation-ready",
+        "a" * 64,
+        "run-ready",
+        "batch-ready",
+        "s3://raw/catalog/registry.json.gz",
+        "b" * 64,
+        "c" * 64,
+        "parser-v2",
+        "runtime-v2",
+    )
+    orphan = (*candidate[:-1], "runtime-unmanifested")
+    candidates = {candidate}
+    physical = {
+        (*candidate, "ready-row"),
+        (*orphan, "orphan-row"),
+    }
+    bounded = {row for row in physical if row[:-1] in candidates}
+    assert bounded == {(*candidate, "ready-row")}
+
+
+@pytest.mark.unit
 def test_generation_signature_changes_with_raw_or_runtime_and_is_in_every_row():
     generation = _generation()
     changed_raw = RawLedgerRecord(
@@ -1257,6 +1405,189 @@ def _native_cutover(generation: ScopeGeneration, **changes):
 
 
 @pytest.mark.unit
+def test_cutover_contract_persists_canonical_immutable_ancestor_lineage():
+    generation = _generation()
+    parent = _native_cutover(generation)
+    child = repository_module.ScopeCutover(
+        cutover_id="rollback-lineage-1",
+        scope_id=generation.plan.scope_id,
+        active_source="legacy",
+        previous_source="native",
+        predecessor_cutover_id=parent.cutover_id,
+        predecessor_cutover_sha256=parent.cutover_sha256,
+        legacy_league=parent.legacy_league,
+        legacy_season=parent.legacy_season,
+        registry_signature=parent.registry_signature,
+        effective_at=datetime(2026, 7, 31, 11, tzinfo=UTC),
+        native_generation_id=None,
+        native_generation_signature=None,
+        native_manifest_sha256=None,
+        rollback_run_id="rollback-lineage-run-1",
+        rollback_reason="lineage test",
+        metadata={"approved_by": "test"},
+        ancestor_cutover_sha256s=(parent.cutover_sha256,),
+    )
+    row = child.to_row()
+    assert row["ancestor_cutover_sha256_json"] == canonical_json(
+        (parent.cutover_sha256,)
+    )
+    assert len(row["ancestor_lineage_sha256"]) == 64
+    with pytest.raises(ValueError, match="ancestry"):
+        repository_module.ScopeCutover(
+            **{
+                **child.constructor_values(),
+                "ancestor_cutover_sha256s": (),
+            }
+        )
+
+
+@pytest.mark.unit
+def test_cutover_repository_rejects_descendant_while_scope_fork_is_unresolved():
+    generation = _generation()
+    parent = _native_cutover(generation)
+    branch = repository_module.ScopeCutover(
+        cutover_id="rollback-branch-a",
+        scope_id=generation.plan.scope_id,
+        active_source="legacy",
+        previous_source="native",
+        predecessor_cutover_id=parent.cutover_id,
+        predecessor_cutover_sha256=parent.cutover_sha256,
+        legacy_league=parent.legacy_league,
+        legacy_season=parent.legacy_season,
+        registry_signature=parent.registry_signature,
+        effective_at=datetime(2026, 7, 31, 11, tzinfo=UTC),
+        native_generation_id=None,
+        native_generation_signature=None,
+        native_manifest_sha256=None,
+        rollback_run_id="rollback-branch-a-run",
+        rollback_reason="branch A",
+        metadata={"approved_by": "test"},
+        ancestor_cutover_sha256s=(parent.cutover_sha256,),
+    )
+    descendant = _native_cutover(
+        generation,
+        cutover_id="native-descendant-c",
+        predecessor_cutover_id=branch.cutover_id,
+        predecessor_cutover_sha256=branch.cutover_sha256,
+        effective_at=datetime(2026, 7, 31, 12, tzinfo=UTC),
+        ancestor_cutover_sha256s=(
+            parent.cutover_sha256,
+            branch.cutover_sha256,
+        ),
+    )
+    query = RepositoryStateQuery()
+    query.unresolved_cutover_forks.add(generation.plan.scope_id)
+    query.latest_cutovers[generation.plan.scope_id] = (
+        branch.cutover_id,
+        branch.cutover_sha256,
+        "legacy",
+        branch.effective_at,
+        canonical_json(branch.ancestor_cutover_sha256s),
+        branch.ancestor_lineage_sha256,
+    )
+    manifest = generation.manifest_row()
+    query.manifests[(generation.plan.scope_id, generation.generation_id)] = tuple(
+        manifest[column] for column in EspnBronzeRepository.manifest_columns
+    )
+    writer = FakeWriter()
+    repository = EspnBronzeRepository(
+        writer=writer,
+        query=query,
+        ensure_objects_on_write=False,
+    )
+    with pytest.raises(ManifestConflictError, match="unresolved cutover fork"):
+        repository.append_cutover(descendant)
+    assert not writer.calls
+
+
+@pytest.mark.unit
+def test_cutover_repository_exact_retry_remains_noop_after_scope_fork():
+    generation = _generation()
+    cutover = _native_cutover(generation)
+    query = RepositoryStateQuery()
+    query.cutover_hashes[cutover.cutover_id] = [cutover.cutover_sha256]
+    query.unresolved_cutover_forks.add(generation.plan.scope_id)
+    writer = FakeWriter()
+    repository = EspnBronzeRepository(
+        writer=writer,
+        query=query,
+        ensure_objects_on_write=False,
+    )
+
+    assert repository.append_cutover(cutover) == f"iceberg.bronze.{CUTOVER_TABLE}"
+    assert not writer.calls
+    assert not any("unresolved_cutover_forks" in sql for sql, _ in query.calls)
+
+
+@pytest.mark.unit
+def test_cutover_repository_fork_probe_detects_global_conflicting_ids():
+    generation = _generation()
+    cutover = _native_cutover(generation)
+    query = RepositoryStateQuery()
+    # Models the same cutover_id having another hash in another scope.
+    query.unresolved_cutover_forks.add(generation.plan.scope_id)
+    repository = EspnBronzeRepository(
+        writer=FakeWriter(),
+        query=query,
+        ensure_objects_on_write=False,
+    )
+    with pytest.raises(ManifestConflictError, match="unresolved cutover fork"):
+        repository.append_cutover(cutover)
+    probe_sql = next(sql for sql, _ in query.calls if "unresolved_cutover_forks" in sql)
+    conflicting_ids = probe_sql[
+        probe_sql.index("conflicting_ids AS") : probe_sql.index(
+            "), conflicting_predecessors AS"
+        )
+    ]
+    assert f"FROM iceberg.bronze.{CUTOVER_TABLE}" in conflicting_ids
+    assert "FROM scope_cutovers" not in conflicting_ids
+
+
+@pytest.mark.unit
+def test_current_view_excludes_forks_conflicting_ids_and_all_descendants():
+    sql = render_current_view_sql("lineup")
+    ddl = render_repository_ddl()[CUTOVER_TABLE]
+    assert '"ancestor_cutover_sha256_json"' in ddl
+    assert '"ancestor_lineage_sha256"' in ddl
+    assert "bad_cutover_hashes AS" in sql
+    assert "eligible_cutovers AS" in sql
+    assert "ancestor_cutover_sha256s" in sql
+    assert "CONTAINS(c.ancestor_cutover_sha256s, bad.cutover_sha256)" in sql
+    assert "FROM eligible_cutovers c" in sql
+    assert "cardinality(array_distinct(parsed.ancestor_cutover_sha256s))" in sql
+
+    p, a, b, c, q, x1, x2, d = (digit * 64 for digit in "12345678")
+    records = (
+        ("scope-1", "P", p, None, ()),
+        ("scope-1", "P", p, None, ()),  # exact duplicate, not a fork
+        ("scope-1", "A", a, p, (p,)),
+        ("scope-1", "B", b, p, (p,)),  # direct sibling fork
+        ("scope-1", "C", c, a, (p, a)),  # descendant of fork A
+        ("scope-2", "Q", q, None, ()),
+        ("scope-2", "X", x1, q, (q,)),
+        ("scope-2", "X", x2, q, (q,)),  # conflicting immutable ID
+        ("scope-2", "D", d, x1, (q, x1)),  # conflicting-ID descendant
+    )
+    id_hashes: dict[str, set[str]] = {}
+    slot_hashes: dict[tuple[str, str | None], set[str]] = {}
+    for scope_id, cutover_id, cutover_hash, predecessor, _ in records:
+        id_hashes.setdefault(cutover_id, set()).add(cutover_hash)
+        slot_hashes.setdefault((scope_id, predecessor), set()).add(cutover_hash)
+    bad_hashes = {
+        cutover_hash
+        for scope_id, cutover_id, cutover_hash, predecessor, _ in records
+        if len(id_hashes[cutover_id]) > 1
+        or len(slot_hashes[(scope_id, predecessor)]) > 1
+    }
+    eligible = {
+        cutover_hash
+        for _, _, cutover_hash, _, ancestors in records
+        if cutover_hash not in bad_hashes and not bad_hashes.intersection(ancestors)
+    }
+    assert eligible == {p, q}
+
+
+@pytest.mark.unit
 def test_cutover_repository_enforces_readiness_idempotency_and_conflict_cas():
     generation = _generation()
     cutover = _native_cutover(generation)
@@ -1311,6 +1642,8 @@ def test_cutover_repository_enforces_transition_chain_and_timestamp():
         native.cutover_sha256,
         "native",
         native.effective_at,
+        canonical_json(native.ancestor_cutover_sha256s),
+        native.ancestor_lineage_sha256,
     )
     writer = FakeWriter()
     repository = EspnBronzeRepository(
@@ -1335,6 +1668,7 @@ def test_cutover_repository_enforces_transition_chain_and_timestamp():
         rollback_run_id="rollback-run-cas-1",
         rollback_reason="operator rollback",
         metadata={"approved_by": "test"},
+        ancestor_cutover_sha256s=(native.cutover_sha256,),
     )
     repository.append_cutover(rollback)
     assert writer.calls[-1][1].iloc[0]["cutover_sha256"] == rollback.cutover_sha256
@@ -1354,6 +1688,8 @@ def test_cutover_repository_enforces_transition_chain_and_timestamp():
         rollback.cutover_sha256,
         "legacy",
         rollback.effective_at,
+        canonical_json(rollback.ancestor_cutover_sha256s),
+        rollback.ancestor_lineage_sha256,
     )
     with pytest.raises(ManifestConflictError, match="previous_source"):
         repository.append_cutover(
@@ -1363,6 +1699,10 @@ def test_cutover_repository_enforces_transition_chain_and_timestamp():
                     "cutover_id": "rollback-cas-invalid-chain",
                     "predecessor_cutover_id": rollback.cutover_id,
                     "predecessor_cutover_sha256": rollback.cutover_sha256,
+                    "ancestor_cutover_sha256s": (
+                        native.cutover_sha256,
+                        rollback.cutover_sha256,
+                    ),
                     "effective_at": datetime(2026, 7, 31, 12, tzinfo=UTC),
                 }
             )
@@ -1421,6 +1761,7 @@ def test_cutover_contract_cas_readiness_and_deterministic_rollback():
             "native_manifest_sha256": None,
             "rollback_run_id": "rollback-run-1",
             "rollback_reason": "operator rollback",
+            "ancestor_cutover_sha256s": (native.cutover_sha256,),
         }
     )
     assert rollback.cutover_sha256 != native.cutover_sha256

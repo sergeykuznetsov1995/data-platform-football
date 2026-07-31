@@ -41,6 +41,10 @@ CATALOG_TABLE = "espn_catalog_snapshot_v2"
 MANIFEST_TABLE = "espn_ingest_manifest_v2"
 CUTOVER_TABLE = "espn_scope_cutover_v2"
 LEDGER_TABLE = "espn_request_ledger_generation_v2"
+_CUTOVER_ANCESTRY_COLUMNS = (
+    ("ancestor_cutover_sha256_json", "varchar"),
+    ("ancestor_lineage_sha256", "varchar"),
+)
 ENTITY_TABLES = MappingProxyType(
     {
         "schedule": "espn_schedule_generation_v2",
@@ -205,6 +209,30 @@ def canonical_json(value: Any) -> str:
 
 def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _stored_cutover_ancestry(
+    raw_json: object, raw_lineage_sha256: object
+) -> tuple[str, ...]:
+    if type(raw_json) is not str:
+        raise PublicationError("stored cutover ancestry must be canonical JSON")
+    try:
+        decoded = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise PublicationError("stored cutover ancestry JSON is invalid") from exc
+    if not isinstance(decoded, list):
+        raise PublicationError("stored cutover ancestry must be a JSON array")
+    ancestors = tuple(
+        _sha256(value, "stored ancestor cutover SHA-256") for value in decoded
+    )
+    if len(set(ancestors)) != len(ancestors):
+        raise PublicationError("stored cutover ancestry contains a cycle")
+    if canonical_json(ancestors) != raw_json:
+        raise PublicationError("stored cutover ancestry is not canonical")
+    lineage_sha256 = _sha256(raw_lineage_sha256, "stored ancestor lineage SHA-256")
+    if lineage_sha256 != canonical_sha256(ancestors):
+        raise PublicationError("stored cutover ancestry hash does not match")
+    return ancestors
 
 
 def _freeze_json(value: Any, field_name: str) -> Any:
@@ -797,6 +825,9 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
             failures.append("schedule event must have two distinct sides")
         if row.played_final and (row.home_score is None or row.away_score is None):
             failures.append("played-final schedule event requires both scores")
+        # Task 3's versioned parser owns status validation and intentionally
+        # preserves optional source scores for terminal non-played outcomes.
+        # Do not reinterpret forfeit, walkover, cancelled, or abandoned scores.
         if (
             row.played_final
             and row.terminal_nonplayed
@@ -804,10 +835,6 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
             or row.summary_required != row.played_final
         ):
             failures.append("schedule status flag invariant violated")
-        if row.terminal_nonplayed and (
-            row.home_score is not None or row.away_score is not None
-        ):
-            failures.append("terminal nonplayed event must not carry scores")
     if not generation.schedule:
         failures.append("schedule is required and must not be empty")
     scoreboard_event_ids = [
@@ -1154,6 +1181,7 @@ class ScopeCutover:
     rollback_run_id: str | None
     rollback_reason: str | None
     metadata: Mapping[str, Any]
+    ancestor_cutover_sha256s: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in ("cutover_id", "legacy_league", "legacy_season"):
@@ -1189,6 +1217,20 @@ class ScopeCutover:
                 self.predecessor_cutover_sha256,
                 "predecessor_cutover_sha256",
             )
+        if not isinstance(self.ancestor_cutover_sha256s, (tuple, list)):
+            raise TypeError("cutover ancestry must be a sequence")
+        ancestors = tuple(
+            _sha256(value, "ancestor cutover SHA-256")
+            for value in self.ancestor_cutover_sha256s
+        )
+        if len(set(ancestors)) != len(ancestors):
+            raise ValueError("cutover ancestry must not contain a cycle")
+        if self.predecessor_cutover_sha256 is None:
+            if ancestors:
+                raise ValueError("root cutover ancestry must be empty")
+        elif not ancestors or ancestors[-1] != self.predecessor_cutover_sha256:
+            raise ValueError("cutover ancestry must end with the predecessor hash")
+        object.__setattr__(self, "ancestor_cutover_sha256s", ancestors)
         _sha256(self.registry_signature, "registry_signature")
         _aware_utc(self.effective_at, "effective_at")
         native_values = (
@@ -1224,14 +1266,22 @@ class ScopeCutover:
     def cutover_sha256(self) -> str:
         return canonical_sha256(self.constructor_values())
 
+    @property
+    def ancestor_lineage_sha256(self) -> str:
+        return canonical_sha256(self.ancestor_cutover_sha256s)
+
     def to_row(self) -> dict[str, Any]:
         return {
             **{
                 field.name: getattr(self, field.name)
                 for field in fields(self)
-                if field.name != "metadata"
+                if field.name not in {"metadata", "ancestor_cutover_sha256s"}
             },
             "metadata_json": canonical_json(self.metadata),
+            "ancestor_cutover_sha256_json": canonical_json(
+                self.ancestor_cutover_sha256s
+            ),
+            "ancestor_lineage_sha256": self.ancestor_lineage_sha256,
             "cutover_sha256": self.cutover_sha256,
         }
 
@@ -1411,6 +1461,22 @@ class EspnBronzeRepository:
             catalog=self.catalog, schema=self.schema
         ).values():
             self._execute(sql)
+        qualified_cutover = f"{self.catalog}.{self.schema}.{CUTOVER_TABLE}"
+        for column, column_type in _CUTOVER_ANCESTRY_COLUMNS:
+            self._execute(
+                f"ALTER TABLE {qualified_cutover} ADD COLUMN IF NOT EXISTS "
+                f'"{column}" {column_type}'
+            )
+        legacy_cutovers = self._execute(
+            f'SELECT "cutover_id" /* cutover_ancestry_rollout_gate */ '
+            f"FROM {qualified_cutover} "
+            'WHERE "ancestor_cutover_sha256_json" IS NULL '
+            'OR "ancestor_lineage_sha256" IS NULL LIMIT 1'
+        )
+        if legacy_cutovers:
+            raise PublicationError(
+                "cutover ancestry migration is required before creating current views"
+            )
         for entity in _ENTITIES:
             self._execute(
                 render_current_view_sql(
@@ -1715,6 +1781,42 @@ class EspnBronzeRepository:
             )
             for raw in existing_rows
         }
+        if existing_hashes:
+            if existing_hashes == {cutover.cutover_sha256}:
+                return f"{self.catalog}.{self.schema}.{CUTOVER_TABLE}"
+            raise ManifestConflictError("same cutover_id has conflicting content")
+        unresolved_forks = self._execute(
+            f"""WITH scope_cutovers AS (
+    SELECT *
+    FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE}
+    WHERE "scope_id" = ?
+), conflicting_ids AS (
+    SELECT "cutover_id"
+    FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE}
+    GROUP BY "cutover_id"
+    HAVING COUNT(DISTINCT "cutover_sha256") > 1
+), conflicting_predecessors AS (
+    SELECT "predecessor_cutover_sha256"
+    FROM scope_cutovers
+    GROUP BY "predecessor_cutover_sha256"
+    HAVING COUNT(DISTINCT "cutover_sha256") > 1
+), unresolved_cutover_forks AS (
+    SELECT c."cutover_sha256"
+    FROM scope_cutovers c
+    JOIN conflicting_ids conflict ON conflict."cutover_id" = c."cutover_id"
+    UNION
+    SELECT c."cutover_sha256"
+    FROM scope_cutovers c
+    JOIN conflicting_predecessors fork
+      ON fork."predecessor_cutover_sha256" IS NOT DISTINCT FROM c."predecessor_cutover_sha256"
+)
+SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
+            (cutover.scope_id,),
+        )
+        if unresolved_forks:
+            raise ManifestConflictError(
+                "scope has an unresolved cutover fork; serialize repair under lease"
+            )
         slot_rows = self._execute(
             f'SELECT "cutover_id", "cutover_sha256" '
             f"FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE} "
@@ -1737,19 +1839,14 @@ class EspnBronzeRepository:
                     _sha256(cutover_hash, "stored cutover_sha256"),
                 )
             )
-        if existing_hashes:
-            if existing_hashes == {cutover.cutover_sha256} and slot_identities == {
-                (cutover.cutover_id, cutover.cutover_sha256)
-            }:
-                return f"{self.catalog}.{self.schema}.{CUTOVER_TABLE}"
-            raise ManifestConflictError("same cutover_id has conflicting content")
         if slot_identities:
             raise ManifestConflictError(
                 "cutover predecessor already has a different successor"
             )
 
         latest_rows = self._execute(
-            f'SELECT "cutover_id", "cutover_sha256", "active_source", "effective_at" '
+            f'SELECT "cutover_id", "cutover_sha256", "active_source", "effective_at", '
+            '"ancestor_cutover_sha256_json", "ancestor_lineage_sha256" '
             f"FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE} "
             'WHERE "scope_id" = ? '
             'ORDER BY "effective_at" DESC, "cutover_id" DESC, "cutover_sha256" DESC '
@@ -1763,10 +1860,19 @@ class EspnBronzeRepository:
                 latest_hash = raw.get("cutover_sha256")
                 active_source = raw.get("active_source")
                 effective_at = raw.get("effective_at")
+                raw_ancestry = raw.get("ancestor_cutover_sha256_json")
+                raw_lineage_hash = raw.get("ancestor_lineage_sha256")
             else:
-                if len(raw) != 4:
+                if len(raw) != 6:
                     raise PublicationError("latest cutover row is malformed")
-                latest_id, latest_hash, active_source, effective_at = raw
+                (
+                    latest_id,
+                    latest_hash,
+                    active_source,
+                    effective_at,
+                    raw_ancestry,
+                    raw_lineage_hash,
+                ) = raw
             latest_identity = (
                 _required_string(latest_id, "stored latest cutover_id"),
                 _sha256(latest_hash, "stored latest cutover_sha256"),
@@ -1777,6 +1883,12 @@ class EspnBronzeRepository:
             ):
                 raise ManifestConflictError(
                     "cutover predecessor does not match latest scope transition"
+                )
+            latest_ancestry = _stored_cutover_ancestry(raw_ancestry, raw_lineage_hash)
+            expected_ancestry = (*latest_ancestry, latest_identity[1])
+            if cutover.ancestor_cutover_sha256s != expected_ancestry:
+                raise ManifestConflictError(
+                    "cutover ancestry does not extend the latest scope transition"
                 )
             if active_source != cutover.previous_source:
                 raise ManifestConflictError(
@@ -1792,6 +1904,7 @@ class EspnBronzeRepository:
             cutover.previous_source != "legacy"
             or cutover.predecessor_cutover_id is not None
             or cutover.predecessor_cutover_sha256 is not None
+            or cutover.ancestor_cutover_sha256s
         ):
             raise ManifestConflictError(
                 "first scope transition must start from legacy without predecessor"
@@ -2034,6 +2147,7 @@ def render_repository_ddl(
             ("rollback_run_id", "varchar"),
             ("rollback_reason", "varchar"),
             ("metadata_json", "varchar"),
+            *_CUTOVER_ANCESTRY_COLUMNS,
             ("cutover_sha256", "varchar"),
         ),
         "scope_id",
@@ -2187,6 +2301,10 @@ def render_current_view_sql(
     # not contaminate (or hide) the manifest-bound generation.
     join = "\n   AND ".join(f'g."{key}" = m."{key}"' for key in join_keys)
     identity_projection = ", ".join(f'"{key}"' for key in join_keys)
+    ranked_identity_projection = ", ".join(f'r."{key}"' for key in join_keys)
+    candidate_join = "\n       AND ".join(
+        f'r."{key}" = candidate."{key}"' for key in join_keys
+    )
     empty_hash = "lower(to_hex(sha256(to_utf8(''))))"
 
     relation_tables = {**ENTITY_TABLES, "ledger": LEDGER_TABLE}
@@ -2196,10 +2314,12 @@ def render_current_view_sql(
             f"""ranked_{relation}_rows AS (
     SELECT r.*,
            ROW_NUMBER() OVER (
-               PARTITION BY {identity_projection}, "_row_sha256"
-               ORDER BY "_ingested_at" DESC, "_row_sha256" DESC
+               PARTITION BY {ranked_identity_projection}, r."_row_sha256"
+               ORDER BY r."_ingested_at" DESC, r."_row_sha256" DESC
            ) AS physical_rn
     FROM {catalog}.{schema}.{relation_table} r
+    JOIN candidate_generation_identities candidate
+      ON {candidate_join}
 ), {relation}_rows AS (
     SELECT * FROM ranked_{relation}_rows WHERE physical_rn = 1
 ), {relation}_fence AS (
@@ -2243,6 +2363,9 @@ WITH complete_manifest_candidates AS (
     SELECT *
     FROM {catalog}.{schema}.{MANIFEST_TABLE}
     WHERE status = 'complete'
+), candidate_generation_identities AS (
+    SELECT DISTINCT {identity_projection}
+    FROM complete_manifest_candidates
 ), conflicting_complete_identities AS (
     SELECT scope_id, generation_id
     FROM complete_manifest_candidates
@@ -2268,6 +2391,37 @@ validated_complete AS (
     FROM validated_complete m
 ), latest_validated AS (
     SELECT * FROM ranked_manifests WHERE rn = 1
+), cutover_records AS (
+    SELECT parsed.*
+    FROM (
+        SELECT c.*,
+               TRY(CAST(json_parse(c.ancestor_cutover_sha256_json) AS array(varchar)))
+                   AS ancestor_cutover_sha256s
+        FROM {catalog}.{schema}.{CUTOVER_TABLE} c
+    ) parsed
+    WHERE parsed.ancestor_cutover_sha256s IS NOT NULL
+      AND lower(to_hex(sha256(to_utf8(parsed.ancestor_cutover_sha256_json))))
+          = parsed.ancestor_lineage_sha256
+      AND all_match(
+          parsed.ancestor_cutover_sha256s,
+          ancestor -> regexp_like(ancestor, '^[0-9a-f]{{64}}$')
+      )
+      AND cardinality(array_distinct(parsed.ancestor_cutover_sha256s))
+          = cardinality(parsed.ancestor_cutover_sha256s)
+      AND (
+          (
+              parsed.predecessor_cutover_id IS NULL
+              AND parsed.predecessor_cutover_sha256 IS NULL
+              AND cardinality(parsed.ancestor_cutover_sha256s) = 0
+          )
+          OR (
+              parsed.predecessor_cutover_id IS NOT NULL
+              AND parsed.predecessor_cutover_sha256 IS NOT NULL
+              AND cardinality(parsed.ancestor_cutover_sha256s) > 0
+              AND element_at(parsed.ancestor_cutover_sha256s, -1)
+                  = parsed.predecessor_cutover_sha256
+          )
+      )
 ), conflicting_cutover_ids AS (
     SELECT cutover_id
     FROM {catalog}.{schema}.{CUTOVER_TABLE}
@@ -2278,20 +2432,33 @@ validated_complete AS (
     FROM {catalog}.{schema}.{CUTOVER_TABLE}
     GROUP BY scope_id, predecessor_cutover_sha256
     HAVING COUNT(DISTINCT cutover_sha256) > 1
+), bad_cutover_hashes AS (
+    SELECT DISTINCT c.cutover_sha256
+    FROM {catalog}.{schema}.{CUTOVER_TABLE} c
+    JOIN conflicting_cutover_ids conflict
+      ON conflict.cutover_id = c.cutover_id
+    UNION
+    SELECT DISTINCT c.cutover_sha256
+    FROM {catalog}.{schema}.{CUTOVER_TABLE} c
+    JOIN conflicting_cutover_predecessors fork
+      ON fork.scope_id = c.scope_id
+     AND fork.predecessor_cutover_sha256 IS NOT DISTINCT FROM c.predecessor_cutover_sha256
+), eligible_cutovers AS (
+    SELECT c.*
+    FROM cutover_records c
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM bad_cutover_hashes bad
+        WHERE bad.cutover_sha256 = c.cutover_sha256
+           OR CONTAINS(c.ancestor_cutover_sha256s, bad.cutover_sha256)
+    )
 ), ranked_cutovers AS (
     SELECT c.*,
            ROW_NUMBER() OVER (
                PARTITION BY scope_id
                ORDER BY effective_at DESC, cutover_id DESC, cutover_sha256 DESC
            ) AS rn
-    FROM {catalog}.{schema}.{CUTOVER_TABLE} c
-    LEFT JOIN conflicting_cutover_ids conflict
-      ON conflict.cutover_id = c.cutover_id
-    LEFT JOIN conflicting_cutover_predecessors fork
-      ON fork.scope_id = c.scope_id
-     AND fork.predecessor_cutover_sha256 IS NOT DISTINCT FROM c.predecessor_cutover_sha256
-    WHERE conflict.cutover_id IS NULL
-      AND fork.scope_id IS NULL
+    FROM eligible_cutovers c
 ), latest_cutover AS (
     SELECT * FROM ranked_cutovers WHERE rn = 1
 ), native_ready AS (
