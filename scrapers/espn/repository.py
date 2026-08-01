@@ -1996,6 +1996,8 @@ class EspnBronzeRepository:
     def exact_complete_exists(self, generation: ScopeGeneration) -> bool:
         """Return whether this exact, physically valid COMPLETE already exists."""
 
+        if self.ensure_objects_on_write:
+            self.ensure_objects()
         existing = self._existing_manifest(
             generation.plan.scope_id, generation.generation_id
         )

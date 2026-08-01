@@ -851,6 +851,102 @@ def test_reclaimed_lease_is_rechecked_before_complete_manifest():
 
 
 @pytest.mark.unit
+def test_exact_complete_exists_bootstraps_first_write_catalog_once_before_query():
+    class FirstWriteQuery(FakeQuery):
+        def __init__(self):
+            super().__init__()
+            self.manifest_table_exists = False
+
+        def execute_query(self, sql, params=None):
+            if sql.startswith(
+                f"CREATE TABLE IF NOT EXISTS iceberg.bronze.{MANIFEST_TABLE}"
+            ):
+                self.manifest_table_exists = True
+            if (
+                sql.lstrip().startswith("SELECT")
+                and f"FROM iceberg.bronze.{MANIFEST_TABLE}" in sql
+                and not self.manifest_table_exists
+            ):
+                raise RuntimeError("TABLE_NOT_FOUND: manifest")
+            return super().execute_query(sql, params=params)
+
+    query = FirstWriteQuery()
+    repository = EspnBronzeRepository(writer=FakeWriter(), query=query)
+    generation = _generation()
+
+    assert repository.exact_complete_exists(generation) is False
+    assert repository.exact_complete_exists(generation) is False
+
+    statements = [sql for sql, _ in query.calls]
+    schema = [
+        index
+        for index, sql in enumerate(statements)
+        if sql == "CREATE SCHEMA IF NOT EXISTS iceberg.bronze"
+    ]
+    tables = [
+        index
+        for index, sql in enumerate(statements)
+        if sql.startswith("CREATE TABLE IF NOT EXISTS")
+    ]
+    gate = [
+        index
+        for index, sql in enumerate(statements)
+        if "cutover_ancestry_rollout_gate" in sql
+    ]
+    views = [
+        index
+        for index, sql in enumerate(statements)
+        if sql.startswith("CREATE OR REPLACE VIEW")
+    ]
+    manifest_queries = [
+        index
+        for index, sql in enumerate(statements)
+        if sql.lstrip().startswith("SELECT")
+        and f"FROM iceberg.bronze.{MANIFEST_TABLE}" in sql
+    ]
+    assert len(schema) == 1
+    assert len(tables) == len(render_repository_ddl())
+    assert len(gate) == 1
+    assert len(views) == len(ENTITY_TABLES)
+    assert len(manifest_queries) == 2
+    assert schema[0] < min(tables) <= max(tables) < gate[0]
+    assert gate[0] < min(views) <= max(views) < manifest_queries[0]
+
+
+@pytest.mark.unit
+def test_exact_complete_exists_skips_bootstrap_when_disabled():
+    query = FakeQuery()
+    repository = EspnBronzeRepository(
+        writer=FakeWriter(),
+        query=query,
+        ensure_objects_on_write=False,
+    )
+
+    assert repository.exact_complete_exists(_generation()) is False
+
+    assert len(query.calls) == 1
+    assert query.calls[0][0].lstrip().startswith("SELECT")
+    assert f"FROM iceberg.bronze.{MANIFEST_TABLE}" in query.calls[0][0]
+
+
+@pytest.mark.unit
+def test_exact_complete_exists_does_not_reinterpret_manifest_query_errors():
+    class FailingQuery(FakeQuery):
+        def execute_query(self, sql, params=None):
+            if (
+                sql.lstrip().startswith("SELECT")
+                and f"FROM iceberg.bronze.{MANIFEST_TABLE}" in sql
+            ):
+                raise RuntimeError("Trino permission denied")
+            return super().execute_query(sql, params=params)
+
+    repository = EspnBronzeRepository(writer=FakeWriter(), query=FailingQuery())
+
+    with pytest.raises(RuntimeError, match="Trino permission denied"):
+        repository.exact_complete_exists(_generation())
+
+
+@pytest.mark.unit
 def test_success_writes_all_entities_then_manifest_and_replay_is_idempotent():
     writer = FakeWriter()
     query = FakeQuery()
