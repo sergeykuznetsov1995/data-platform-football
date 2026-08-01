@@ -1,4 +1,4 @@
-"""Trigger-only daily ESPN Native Bronze v2 DAG."""
+"""airflow DAG: trigger-only daily ESPN Native Bronze v2 ingestion."""
 
 from utils.espn_dag_factory import build_espn_ingest_dag
 

@@ -1,4 +1,4 @@
-"""Manual ESPN repair DAG with explicit promoted scopes."""
+"""airflow DAG: manual ESPN repair with explicit promoted scopes."""
 
 from utils.espn_dag_factory import build_espn_ingest_dag
 

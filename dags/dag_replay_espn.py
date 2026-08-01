@@ -1,4 +1,4 @@
-"""Manual zero-network ESPN replay from exact Raw manifests."""
+"""airflow DAG: manual zero-network ESPN replay from exact Raw manifests."""
 
 from utils.espn_dag_factory import build_espn_ingest_dag
 

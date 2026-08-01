@@ -23,6 +23,7 @@ from scrapers.espn.operations import (
     PostgresEspnControlStore,
     RunManifestEvidence,
     MAX_SCOPE_SUMMARY_EVENTS,
+    SUMMARY_BATCH_SIZE,
     ScopeHead,
     ScopeLease,
     evaluate_alerts,
@@ -64,6 +65,18 @@ DISCOVERY_REQUESTS_PER_COMPETITION = 3
 MAX_DISCOVERY_DETAIL_REQUESTS = (
     MAX_DISCOVERY_COMPETITIONS * DISCOVERY_REQUESTS_PER_COMPETITION
 )
+# Airflow 2.11's production ``core.max_map_length`` default is 1024.
+MAX_AIRFLOW_DYNAMIC_MAP_ITEMS = 1024
+MAX_MAPPING_DESCRIPTOR_URI_BYTES = 4096
+MAX_INGEST_SCOPE_MAP_ITEMS = MAX_DISCOVERY_COMPETITIONS
+MAX_SUMMARY_BATCH_MAP_ITEMS = min(
+    MAX_AIRFLOW_DYNAMIC_MAP_ITEMS,
+    MAX_INGEST_SCOPE_MAP_ITEMS
+    * ((MAX_SCOPE_SUMMARY_EVENTS + SUMMARY_BATCH_SIZE - 1) // SUMMARY_BATCH_SIZE),
+)
+MAX_DISCOVERY_DETAIL_BATCH_MAP_ITEMS = (
+    MAX_DISCOVERY_COMPETITIONS + DISCOVERY_DETAIL_BATCH_SIZE - 1
+) // DISCOVERY_DETAIL_BATCH_SIZE
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 _MANUAL_MODES = frozenset({"repair", "backfill", "replay"})
 _PRODUCER_SUCCESS = frozenset({"success"})
@@ -93,6 +106,62 @@ def _sha(value: object, field: str) -> str:
     if _SHA_RE.fullmatch(result) is None:
         raise OperationsError(f"{field} must be a lowercase SHA-256")
     return result
+
+
+def select_mapping_descriptors(
+    *,
+    source: object,
+    source_key: str,
+    descriptor_key: str,
+    max_items: int,
+) -> list[dict[str, dict[str, str]]]:
+    """Return one bounded map list through Airflow's ``return_value`` XCom."""
+
+    source_field = _required(source_key, "mapping selector source_key")
+    descriptor_field = _required(descriptor_key, "mapping selector descriptor_key")
+    if (
+        isinstance(max_items, bool)
+        or not isinstance(max_items, int)
+        or not 1 <= max_items <= MAX_SUMMARY_BATCH_MAP_ITEMS
+    ):
+        raise OperationsError("mapping selector max_items is outside its static bound")
+    if not isinstance(source, dict):
+        raise OperationsError("mapping selector source must be an object")
+    if source_field not in source:
+        raise OperationsError(f"mapping selector source lacks {source_field!r}")
+    rows = source[source_field]
+    if not isinstance(rows, list):
+        raise OperationsError(f"mapping selector {source_field!r} must be a list")
+    if len(rows) > max_items:
+        raise OperationsError(
+            f"mapping selector static bound exceeded: {len(rows)} > {max_items}"
+        )
+    selected: list[dict[str, dict[str, str]]] = []
+    identities: set[tuple[str, str]] = set()
+    for index, row in enumerate(rows):
+        item_field = f"mapping selector {source_field}[{index}]"
+        if not isinstance(row, dict) or set(row) != {descriptor_field}:
+            raise OperationsError(
+                f"{item_field} must contain only {descriptor_field!r}"
+            )
+        descriptor = row[descriptor_field]
+        if not isinstance(descriptor, dict) or set(descriptor) != {
+            "uri",
+            "sha256",
+        }:
+            raise OperationsError(f"{item_field}.{descriptor_field} is not a URI/SHA")
+        uri = _required(descriptor["uri"], f"{item_field}.{descriptor_field}.uri")
+        if len(uri.encode("utf-8")) > MAX_MAPPING_DESCRIPTOR_URI_BYTES:
+            raise OperationsError(
+                f"{item_field}.{descriptor_field}.uri exceeds its static bound"
+            )
+        digest = _sha(descriptor["sha256"], f"{item_field}.{descriptor_field}.sha256")
+        identity = (uri, digest)
+        if identity in identities:
+            raise OperationsError(f"{item_field} duplicates a URI/SHA descriptor")
+        identities.add(identity)
+        selected.append({descriptor_field: {"uri": uri, "sha256": digest}})
+    return selected
 
 
 def _artifact_root() -> str:

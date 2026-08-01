@@ -88,14 +88,17 @@ def test_daily_has_one_master_owner_and_real_two_wave_chain():
     expected_chain = (
         ("validate_registry_and_admission", "acquire_scope_leases"),
         ("acquire_scope_leases", "build_signed_scope_plans"),
-        ("build_signed_scope_plans", "fetch_scoreboard_batches"),
+        ("build_signed_scope_plans", "select_network_scope_bindings"),
+        ("select_network_scope_bindings", "fetch_scoreboard_batches"),
         ("fetch_scoreboard_batches", "plan_summary_batches"),
-        ("plan_summary_batches", "fetch_summary_batches"),
+        ("plan_summary_batches", "select_summary_batches"),
+        ("select_summary_batches", "fetch_summary_batches"),
         ("reduce_raw_manifests", "offline_parse"),
         ("offline_parse", "staging_dq"),
         ("staging_dq", "publish_scopes"),
         ("publish_scopes", "persist_run_manifests"),
-        ("persist_run_manifests", "published_dq"),
+        ("persist_run_manifests", "select_publications"),
+        ("select_publications", "published_dq"),
         ("published_dq", "terminal_verdict"),
         ("terminal_verdict", "record_health_metrics"),
         ("terminal_verdict", "release_scope_leases"),
@@ -142,14 +145,17 @@ def test_terminal_health_release_and_propagator_cannot_mask_failure():
         "validate_registry_and_admission",
         "acquire_scope_leases",
         "build_signed_scope_plans",
+        "select_network_scope_bindings",
         "fetch_scoreboard_batches",
         "plan_summary_batches",
+        "select_summary_batches",
         "fetch_summary_batches",
         "reduce_raw_manifests",
         "offline_parse",
         "staging_dq",
         "publish_scopes",
         "persist_run_manifests",
+        "select_publications",
         "published_dq",
     }
     assert set(tasks["terminal_verdict"]._init_kwargs["op_kwargs"]) == {
@@ -207,6 +213,10 @@ def test_weekly_discovery_never_promotes_and_monitor_is_network_free():
         discovery_tasks["plan_discovery_detail_batches"]._init_kwargs.get("pool")
         is None
     )
+    assert (
+        discovery_tasks["select_discovery_detail_batches"]._init_kwargs.get("pool")
+        is None
+    )
     assert discovery_tasks["fetch_discovery_detail_batches"].is_mapped is True
     assert discovery_tasks["fetch_discovery_detail_batches"]._init_kwargs["pool"] == (
         "espn_http_pool"
@@ -214,6 +224,10 @@ def test_weekly_discovery_never_promotes_and_monitor_is_network_free():
     assert (
         discovery_tasks["fetch_discovery_detail_batches"]._init_kwargs["pool_slots"]
         == 1
+    )
+    assert (
+        "select_discovery_detail_batches"
+        in discovery_tasks["fetch_discovery_detail_batches"].upstream_task_ids
     )
     assert (
         "fetch_discovery_detail_batches"
@@ -225,6 +239,173 @@ def test_weekly_discovery_never_promotes_and_monitor_is_network_free():
     assert monitor.dag.schedule == "0 */6 * * *"
     assert all(task._init_kwargs.get("pool") is None for task in monitor_tasks.values())
     assert "check_36h_freshness_and_alerts" in monitor_tasks
+
+
+def test_every_mapped_input_is_a_selector_or_producer_return_value():
+    _reload("dag_ingest_espn")
+    tasks = _tasks()
+
+    expected_producers = {
+        "fetch_scoreboard_batches": "select_network_scope_bindings",
+        "fetch_summary_batches": "select_summary_batches",
+        "offline_parse": "reduce_raw_manifests",
+        "staging_dq": "offline_parse",
+        "publish_scopes": "staging_dq",
+        "published_dq": "select_publications",
+    }
+    for task_id, producer_id in expected_producers.items():
+        mapped = tasks[task_id]._expand_kwargs["op_kwargs"]
+        assert mapped.operator.task_id == producer_id
+        assert mapped.key is None
+
+    _reload("dag_discover_espn_registry")
+    discovery_tasks = _tasks()
+    mapped = discovery_tasks["fetch_discovery_detail_batches"]._expand_kwargs[
+        "op_kwargs"
+    ]
+    assert mapped.operator.task_id == "select_discovery_detail_batches"
+    assert mapped.key is None
+
+
+def test_selectors_read_whole_return_values_and_are_not_multiple_outputs():
+    from dags.utils import espn_native_tasks
+
+    _reload("dag_ingest_espn")
+    tasks = _tasks()
+    expected = {
+        "select_network_scope_bindings": (
+            "build_signed_scope_plans",
+            "network_scope_binding_refs",
+            "scope_binding_ref",
+            espn_native_tasks.MAX_INGEST_SCOPE_MAP_ITEMS,
+        ),
+        "select_summary_batches": (
+            "plan_summary_batches",
+            "summary_batch_refs",
+            "summary_batch_ref",
+            espn_native_tasks.MAX_SUMMARY_BATCH_MAP_ITEMS,
+        ),
+        "select_publications": (
+            "persist_run_manifests",
+            "publication_refs",
+            "publication_ref",
+            espn_native_tasks.MAX_INGEST_SCOPE_MAP_ITEMS,
+        ),
+    }
+    for task_id, contract in expected.items():
+        selector = tasks[task_id]
+        source = selector._init_kwargs["op_kwargs"]["source"]
+        actual = (
+            source.operator.task_id,
+            selector._init_kwargs["op_kwargs"]["source_key"],
+            selector._init_kwargs["op_kwargs"]["descriptor_key"],
+            selector._init_kwargs["op_kwargs"]["max_items"],
+        )
+        assert actual == contract
+        assert source.key is None
+        assert selector._init_kwargs.get("multiple_outputs") is not True
+
+    _reload("dag_replay_espn")
+    replay_tasks = _tasks()
+    producers = set(
+        replay_tasks["terminal_verdict"]._init_kwargs["op_kwargs"]["producer_task_ids"]
+    )
+    assert "select_publications" in producers
+    assert "select_network_scope_bindings" not in producers
+    assert "select_summary_batches" not in producers
+
+
+def test_mapping_selector_accepts_only_bounded_uri_sha_descriptors():
+    from dags.utils import espn_native_tasks
+
+    row = {
+        "scope_binding_ref": {
+            "uri": "s3://artifacts/scope-binding.json",
+            "sha256": "a" * 64,
+        }
+    }
+    source = {"network_scope_binding_refs": [row]}
+
+    assert espn_native_tasks.select_mapping_descriptors(
+        source=source,
+        source_key="network_scope_binding_refs",
+        descriptor_key="scope_binding_ref",
+        max_items=1,
+    ) == [row]
+    assert (
+        espn_native_tasks.select_mapping_descriptors(
+            source={"network_scope_binding_refs": []},
+            source_key="network_scope_binding_refs",
+            descriptor_key="scope_binding_ref",
+            max_items=1,
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        [],
+        {},
+        {"rows": ()},
+        {"rows": [None]},
+        {"rows": [{}]},
+        {"rows": [{"ref": {"uri": "s3://a", "sha256": "a" * 64}, "x": 1}]},
+        {"rows": [{"ref": {"uri": "", "sha256": "a" * 64}}]},
+        {
+            "rows": [
+                {
+                    "ref": {
+                        "uri": "s3://" + "a" * 4096,
+                        "sha256": "a" * 64,
+                    }
+                }
+            ]
+        },
+        {"rows": [{"ref": {"uri": "s3://a", "sha256": "A" * 64}}]},
+        {"rows": [{"ref": {"uri": "s3://a", "sha256": "a" * 64, "x": 1}}]},
+    ],
+)
+def test_mapping_selector_rejects_missing_or_wrong_shape(source):
+    from dags.utils import espn_native_tasks
+
+    with pytest.raises(espn_native_tasks.OperationsError):
+        espn_native_tasks.select_mapping_descriptors(
+            source=source,
+            source_key="rows",
+            descriptor_key="ref",
+            max_items=2,
+        )
+
+
+def test_mapping_selector_rejects_unbounded_payload():
+    from dags.utils import espn_native_tasks
+
+    row = {"ref": {"uri": "s3://a", "sha256": "a" * 64}}
+    with pytest.raises(espn_native_tasks.OperationsError, match="bound"):
+        espn_native_tasks.select_mapping_descriptors(
+            source={"rows": [row, row]},
+            source_key="rows",
+            descriptor_key="ref",
+            max_items=1,
+        )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="static bound"):
+        espn_native_tasks.select_mapping_descriptors(
+            source={"rows": []},
+            source_key="rows",
+            descriptor_key="ref",
+            max_items=espn_native_tasks.MAX_SUMMARY_BATCH_MAP_ITEMS + 1,
+        )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="duplicates"):
+        espn_native_tasks.select_mapping_descriptors(
+            source={"rows": [row, row]},
+            source_key="rows",
+            descriptor_key="ref",
+            max_items=2,
+        )
 
 
 def test_production_compose_provisions_exactly_one_espn_http_slot():

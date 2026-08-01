@@ -23,8 +23,10 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
         ]
         + (
             [
+                "select_network_scope_bindings",
                 "fetch_scoreboard_batches",
                 "plan_summary_batches",
+                "select_summary_batches",
                 "fetch_summary_batches",
                 "reduce_raw_manifests",
             ]
@@ -36,6 +38,7 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
             "staging_dq",
             "publish_scopes",
             "persist_run_manifests",
+            "select_publications",
             "published_dq",
         ]
     )
@@ -77,6 +80,17 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
         admission >> leasing >> planning
 
         if network:
+            network_selector = PythonOperator(
+                task_id="select_network_scope_bindings",
+                python_callable=tasks.select_mapping_descriptors,
+                op_kwargs={
+                    "source": planning.output,
+                    "source_key": "network_scope_binding_refs",
+                    "descriptor_key": "scope_binding_ref",
+                    "max_items": tasks.MAX_INGEST_SCOPE_MAP_ITEMS,
+                },
+                retries=0,
+            )
             scoreboard = PythonOperator.partial(
                 task_id="fetch_scoreboard_batches",
                 python_callable=tasks.fetch_scoreboard_batch,
@@ -84,7 +98,7 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
                 pool_slots=1,
                 retries=1,
                 retry_delay=timedelta(minutes=1),
-            ).expand(op_kwargs=planning.output["network_scope_binding_refs"])
+            ).expand(op_kwargs=network_selector.output)
             summary_plan = PythonOperator(
                 task_id="plan_summary_batches",
                 python_callable=tasks.plan_summary_batch_wave,
@@ -96,6 +110,17 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
                 trigger_rule="none_failed",
                 retries=0,
             )
+            summary_selector = PythonOperator(
+                task_id="select_summary_batches",
+                python_callable=tasks.select_mapping_descriptors,
+                op_kwargs={
+                    "source": summary_plan.output,
+                    "source_key": "summary_batch_refs",
+                    "descriptor_key": "summary_batch_ref",
+                    "max_items": tasks.MAX_SUMMARY_BATCH_MAP_ITEMS,
+                },
+                retries=0,
+            )
             summary_fetch = PythonOperator.partial(
                 task_id="fetch_summary_batches",
                 python_callable=tasks.fetch_summary_batch,
@@ -103,7 +128,7 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
                 pool_slots=1,
                 retries=1,
                 retry_delay=timedelta(minutes=1),
-            ).expand(op_kwargs=summary_plan.output["summary_batch_refs"])
+            ).expand(op_kwargs=summary_selector.output)
             raw_source = PythonOperator(
                 task_id="reduce_raw_manifests",
                 python_callable=tasks.reduce_raw_manifest_wave,
@@ -114,7 +139,15 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
                 trigger_rule="none_failed",
                 retries=0,
             )
-            planning >> scoreboard >> summary_plan >> summary_fetch >> raw_source
+            (
+                planning
+                >> network_selector
+                >> scoreboard
+                >> summary_plan
+                >> summary_selector
+                >> summary_fetch
+                >> raw_source
+            )
         else:
             raw_source = PythonOperator(
                 task_id="bind_replay_raw_manifests",
@@ -149,12 +182,31 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
             multiple_outputs=True,
             retries=0,
         )
+        publication_selector = PythonOperator(
+            task_id="select_publications",
+            python_callable=tasks.select_mapping_descriptors,
+            op_kwargs={
+                "source": persist.output,
+                "source_key": "publication_refs",
+                "descriptor_key": "publication_ref",
+                "max_items": tasks.MAX_INGEST_SCOPE_MAP_ITEMS,
+            },
+            retries=0,
+        )
         published_dq = PythonOperator.partial(
             task_id="published_dq",
             python_callable=tasks.published_dq_scope,
             retries=0,
-        ).expand(op_kwargs=persist.output["publication_refs"])
-        raw_source >> offline >> staging_dq >> publish >> persist >> published_dq
+        ).expand(op_kwargs=publication_selector.output)
+        (
+            raw_source
+            >> offline
+            >> staging_dq
+            >> publish
+            >> persist
+            >> publication_selector
+            >> published_dq
+        )
 
         verdict = PythonOperator(
             task_id="terminal_verdict",
