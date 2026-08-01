@@ -84,6 +84,7 @@ def test_daily_has_one_master_owner_and_real_two_wave_chain():
         "persist_run_manifests",
     ):
         assert tasks[task_id]._init_kwargs["multiple_outputs"] is True
+    assert tasks["persist_run_manifests"]._init_kwargs["trigger_rule"] == "none_failed"
 
     expected_chain = (
         ("validate_registry_and_admission", "acquire_scope_leases"),
@@ -233,6 +234,10 @@ def test_weekly_discovery_never_promotes_and_monitor_is_network_free():
         "fetch_discovery_detail_batches"
         in discovery_tasks["write_reviewable_diff"].upstream_task_ids
     )
+    assert (
+        discovery_tasks["write_reviewable_diff"]._init_kwargs["trigger_rule"]
+        == "none_failed"
+    )
 
     monitor = _reload("dag_monitor_espn")
     monitor_tasks = _tasks()
@@ -315,6 +320,16 @@ def test_selectors_read_whole_return_values_and_are_not_multiple_outputs():
     assert "select_summary_batches" not in producers
 
 
+def test_summary_planner_receives_the_exact_plan_index_guard():
+    _reload("dag_ingest_espn")
+    tasks = _tasks()
+
+    planner_kwargs = tasks["plan_summary_batches"]._init_kwargs["op_kwargs"]
+    plan_index_ref = planner_kwargs["plan_index_ref"]
+    assert plan_index_ref.operator.task_id == "build_signed_scope_plans"
+    assert plan_index_ref.key == "plan_index_ref"
+
+
 def test_mapping_selector_accepts_only_bounded_uri_sha_descriptors():
     from dags.utils import espn_native_tasks
 
@@ -341,6 +356,292 @@ def test_mapping_selector_accepts_only_bounded_uri_sha_descriptors():
         )
         == []
     )
+
+
+def test_summary_reducer_accepts_airflow_none_only_for_signed_zero_map(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    summary_index_ref = {"uri": "file:///summary-index.json", "sha256": "a" * 64}
+    summary_index = {
+        "kind": "espn-summary-wave-index-v1",
+        "schema_version": 1,
+        "expected_map_count": 0,
+        "expected_scoreboard_map_count": 0,
+        "scopes": [
+            {
+                "scope_id": "700:2024",
+                "scope_binding_ref": {
+                    "uri": "file:///scope-binding.json",
+                    "sha256": "b" * 64,
+                },
+                "scoreboard_phase_ref": None,
+                "summary_batch_refs": [],
+                "budget_exhausted": False,
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_ref",
+        lambda ref, *, kind=None: (
+            summary_index
+            if ref == summary_index_ref and kind == "espn-summary-wave-index-v1"
+            else pytest.fail(f"unexpected artifact read: {ref!r}, {kind!r}")
+        ),
+    )
+    binding_ref = summary_index["scopes"][0]["scope_binding_ref"]
+    loaded = SimpleNamespace(
+        bindings={"700:2024": SimpleNamespace(active=False, prior=object())}
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_heartbeat_scope_binding", lambda _ref: None
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_binding",
+        lambda ref: (
+            (
+                None,
+                {
+                    "scope_root": "file:///run/scopes/700-2024",
+                    "raw_manifest_uri": "file:///raw-manifest.json",
+                },
+                loaded,
+                SimpleNamespace(scope_id="700:2024"),
+                None,
+            )
+            if ref == binding_ref
+            else pytest.fail(f"unexpected binding: {ref!r}")
+        ),
+    )
+    monkeypatch.setattr(espn_native_tasks.runner, "_manifest_base", lambda *_: {})
+    monkeypatch.setattr(espn_native_tasks.runner, "_seal_manifest", lambda value: value)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda uri, _payload, **_kwargs: {"uri": uri, "sha256": "c" * 64},
+    )
+
+    reduced = espn_native_tasks.reduce_raw_manifest_wave(
+        summary_index_ref=summary_index_ref,
+        summary_phase_refs=None,
+    )
+    assert len(reduced) == 1
+    assert set(reduced[0]) == {"raw_phase_ref"}
+
+
+@pytest.mark.parametrize(
+    ("expected_map_count", "mapped_output"),
+    [
+        (1, None),
+        (1, []),
+        (0, [{"summary_phase_ref": {"uri": "file:///extra", "sha256": "b" * 64}}]),
+        (1, [None]),
+        (False, None),
+        (-1, None),
+    ],
+)
+def test_summary_reducer_rejects_missing_extra_or_malformed_mapped_output(
+    monkeypatch, expected_map_count, mapped_output
+):
+    from dags.utils import espn_native_tasks
+
+    summary_index_ref = {"uri": "file:///summary-index.json", "sha256": "a" * 64}
+    summary_index = {
+        "kind": "espn-summary-wave-index-v1",
+        "schema_version": 1,
+        "expected_map_count": expected_map_count,
+        "expected_scoreboard_map_count": 0,
+        "scopes": [
+            {
+                "scope_id": "700:2026",
+                "summary_batch_refs": (
+                    [{"uri": "file:///batch", "sha256": "c" * 64}]
+                    if type(expected_map_count) is int and expected_map_count == 1
+                    else []
+                ),
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_ref",
+        lambda ref, *, kind=None: (
+            summary_index
+            if ref == summary_index_ref and kind == "espn-summary-wave-index-v1"
+            else pytest.fail(f"unexpected artifact read: {ref!r}, {kind!r}")
+        ),
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="Summary"):
+        espn_native_tasks.reduce_raw_manifest_wave(
+            summary_index_ref=summary_index_ref,
+            summary_phase_refs=mapped_output,
+        )
+
+
+def test_summary_planner_accepts_airflow_none_for_signed_zero_scoreboard_map(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+
+    scope_id = "700:2024"
+    plan_index_ref = {"uri": "file:///plan-index.json", "sha256": "a" * 64}
+    scope_binding_ref = {"uri": "file:///scope-binding.json", "sha256": "b" * 64}
+    plan_index = {
+        "kind": "espn-plan-index-v1",
+        "schema_version": 1,
+        "scope_ids": [scope_id],
+        "network_scope_ids": [],
+        "expected_scoreboard_map_count": 0,
+    }
+    descriptor = {"scope_root": "file:///run/scopes/700-2024"}
+    loaded = SimpleNamespace(
+        bindings={scope_id: SimpleNamespace(active=False, prior=object())}
+    )
+    scope = SimpleNamespace(scope_id=scope_id)
+    written = {}
+
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_ref",
+        lambda ref, *, kind=None: (
+            plan_index
+            if ref == plan_index_ref and kind == "espn-plan-index-v1"
+            else pytest.fail(f"unexpected artifact read: {ref!r}, {kind!r}")
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_heartbeat_scope_binding", lambda _ref: None
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_binding",
+        lambda ref: (
+            (
+                None,
+                descriptor,
+                loaded,
+                scope,
+                None,
+            )
+            if ref == scope_binding_ref
+            else pytest.fail(f"unexpected binding: {ref!r}")
+        ),
+    )
+
+    def capture_write(uri, payload, **_kwargs):
+        written[uri] = payload
+        return {"uri": uri, "sha256": "c" * 64}
+
+    monkeypatch.setattr(espn_native_tasks, "_write_payload", capture_write)
+
+    result = espn_native_tasks.plan_summary_batch_wave(
+        plan_index_ref=plan_index_ref,
+        scoreboard_phase_refs=None,
+        scope_binding_refs=[{"scope_binding_ref": scope_binding_ref}],
+    )
+
+    assert result["summary_batch_refs"] == []
+    index = next(iter(written.values()))
+    assert index["expected_scoreboard_map_count"] == 0
+    assert index["expected_map_count"] == 0
+
+
+def test_summary_planner_rejects_airflow_none_when_scoreboard_map_was_expected(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+
+    plan_index_ref = {"uri": "file:///plan-index.json", "sha256": "a" * 64}
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_ref",
+        lambda ref, *, kind=None: (
+            {
+                "kind": "espn-plan-index-v1",
+                "schema_version": 1,
+                "scope_ids": ["700:2026"],
+                "network_scope_ids": ["700:2026"],
+                "expected_scoreboard_map_count": 1,
+            }
+            if ref == plan_index_ref and kind == "espn-plan-index-v1"
+            else pytest.fail(f"unexpected artifact read: {ref!r}, {kind!r}")
+        ),
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="scoreboard phase"):
+        espn_native_tasks.plan_summary_batch_wave(
+            plan_index_ref=plan_index_ref,
+            scoreboard_phase_refs=None,
+            scope_binding_refs=[],
+        )
+
+
+def test_publication_reducer_runs_after_zero_map_and_rejects_none(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    plan_index_ref = {"uri": "file:///plan-index.json", "sha256": "a" * 64}
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_ref",
+        lambda ref, *, kind=None: (
+            {
+                "kind": "espn-plan-index-v1",
+                "scope_ids": ["700:2026"],
+            }
+            if ref == plan_index_ref and kind == "espn-plan-index-v1"
+            else pytest.fail(f"unexpected artifact read: {ref!r}, {kind!r}")
+        ),
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="publication"):
+        espn_native_tasks.persist_run_manifests(
+            plan_index_ref=plan_index_ref,
+            publication_refs=None,
+        )
+
+
+def test_discovery_reducer_runs_after_zero_map_and_rejects_none(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    index_ref = {"uri": "file:///discovery-index.json", "sha256": "a" * 64}
+    batch_ref = {"uri": "file:///batch.json", "sha256": "b" * 64}
+    detail_index = {
+        "kind": "espn-discovery-detail-index-v1",
+        "competition_count": 1,
+        "competition_cap": espn_native_tasks.MAX_DISCOVERY_COMPETITIONS,
+        "detail_request_cap": espn_native_tasks.MAX_DISCOVERY_DETAIL_REQUESTS,
+        "batch_ids": ["batch-1"],
+        "batch_refs": [batch_ref],
+    }
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_run_identity",
+        lambda _context: (
+            "dag_discover_espn_registry",
+            "manual__zero-map",
+            datetime(2026, 8, 1, tzinfo=timezone.utc),
+        ),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "file:///tmp")
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_ref",
+        lambda ref, *, kind=None: (
+            detail_index
+            if ref == index_ref and kind == "espn-discovery-detail-index-v1"
+            else pytest.fail(f"unexpected artifact read: {ref!r}, {kind!r}")
+        ),
+    )
+
+    with pytest.raises(
+        espn_native_tasks.OperationsError, match="discovery detail phase"
+    ):
+        espn_native_tasks.write_reviewable_discovery_diff(
+            discovery_detail_index_ref=index_ref,
+            discovery_detail_phase_refs=None,
+        )
 
 
 @pytest.mark.parametrize(

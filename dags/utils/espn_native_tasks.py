@@ -7,6 +7,7 @@ shared source rate gate, current heads and exact current-run evidence.
 
 from __future__ import annotations
 
+from collections.abc import Sequence as SequenceCollection
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
@@ -162,6 +163,35 @@ def select_mapping_descriptors(
         identities.add(identity)
         selected.append({descriptor_field: {"uri": uri, "sha256": digest}})
     return selected
+
+
+def _exact_mapped_results(
+    values: object,
+    *,
+    expected_count: object,
+    label: str,
+) -> list[Mapping[str, Any]]:
+    """Normalize Airflow's zero-map ``None`` behind an exact durable count."""
+
+    if type(expected_count) is not int or expected_count < 0:
+        raise OperationsError(f"{label} expected map count is invalid")
+    if values is None:
+        if expected_count == 0:
+            return []
+        raise OperationsError(f"{label} mapped output is missing")
+    if isinstance(values, (str, bytes, bytearray, Mapping)) or not isinstance(
+        values, SequenceCollection
+    ):
+        raise OperationsError(f"{label} mapped output must be a sequence")
+    rows = list(values)
+    if len(rows) != expected_count:
+        raise OperationsError(
+            f"{label} mapped output count differs from signed plan: "
+            f"{len(rows)} != {expected_count}"
+        )
+    if any(not isinstance(row, Mapping) for row in rows):
+        raise OperationsError(f"{label} mapped output row must be an object")
+    return rows
 
 
 def _artifact_root() -> str:
@@ -1441,16 +1471,46 @@ def _registry_scope(loaded, scope):
 
 def plan_summary_batch_wave(
     *,
-    scoreboard_phase_refs: Sequence[Mapping[str, Any]],
+    plan_index_ref: Mapping[str, str],
+    scoreboard_phase_refs: Sequence[Mapping[str, Any]] | None,
     scope_binding_refs: Sequence[Mapping[str, Any]],
     **_context,
 ) -> dict[str, Any]:
     """Offline enumerate wave-two IDs and persist each <=50 descriptor."""
 
+    plan_index = _read_ref(plan_index_ref, kind="espn-plan-index-v1")
+    indexed_scope_ids = plan_index.get("scope_ids")
+    network_scope_ids = plan_index.get("network_scope_ids")
+    expected_scoreboard_count = plan_index.get("expected_scoreboard_map_count")
+    if (
+        not isinstance(indexed_scope_ids, list)
+        or not indexed_scope_ids
+        or not all(
+            isinstance(scope_id, str) and scope_id for scope_id in indexed_scope_ids
+        )
+        or len(indexed_scope_ids) != len(set(indexed_scope_ids))
+        or not isinstance(network_scope_ids, list)
+        or not all(
+            isinstance(scope_id, str) and scope_id for scope_id in network_scope_ids
+        )
+        or len(network_scope_ids) != len(set(network_scope_ids))
+        or not set(network_scope_ids).issubset(indexed_scope_ids)
+        or type(expected_scoreboard_count) is not int
+        or expected_scoreboard_count != len(network_scope_ids)
+        or expected_scoreboard_count > MAX_INGEST_SCOPE_MAP_ITEMS
+    ):
+        raise OperationsError("signed plan index scoreboard map contract is invalid")
+    scoreboard_phase_refs = _exact_mapped_results(
+        scoreboard_phase_refs,
+        expected_count=expected_scoreboard_count,
+        label="scoreboard phase",
+    )
     batch_refs = []
     scope_indexes = []
     phases_by_scope = {}
     for wrapped in scoreboard_phase_refs:
+        if set(wrapped) != {"scoreboard_phase_ref"}:
+            raise OperationsError("scoreboard phase wrapper mismatch")
         phase_ref = wrapped["scoreboard_phase_ref"]
         phase = _read_ref(phase_ref, kind="espn-scoreboard-phase-result-v1")
         _, _, _, phase_scope, _ = _binding(phase["scope_binding_ref"])
@@ -1577,6 +1637,8 @@ def plan_summary_batch_wave(
         )
     if phases_by_scope:
         raise OperationsError("unplanned extra scoreboard phase scope")
+    if seen_scopes != set(indexed_scope_ids):
+        raise OperationsError("summary scope bindings differ from signed plan index")
     if len(roots) != 1:
         raise OperationsError("summary scope bindings must share one run root")
     index_payload = {
@@ -1665,14 +1727,47 @@ def fetch_summary_batch(
 def reduce_raw_manifest_wave(
     *,
     summary_index_ref: Mapping[str, str],
-    summary_phase_refs: Sequence[Mapping[str, Any]],
+    summary_phase_refs: Sequence[Mapping[str, Any]] | None,
     **_context,
 ) -> list[dict[str, Any]]:
     """Deterministically reduce exact signed batch set; no shared mutable map."""
 
     index = _read_ref(summary_index_ref, kind="espn-summary-wave-index-v1")
+    scope_indexes = index.get("scopes")
+    expected_map_count = index.get("expected_map_count")
+    if not isinstance(scope_indexes, list) or not scope_indexes:
+        raise OperationsError("Summary wave index scopes are invalid")
+    indexed_scope_ids = []
+    indexed_summary_count = 0
+    for scope_index in scope_indexes:
+        if not isinstance(scope_index, Mapping):
+            raise OperationsError("Summary wave index scope must be an object")
+        scope_id = scope_index.get("scope_id")
+        summary_batch_refs = scope_index.get("summary_batch_refs")
+        if (
+            not isinstance(scope_id, str)
+            or not scope_id
+            or not isinstance(summary_batch_refs, list)
+        ):
+            raise OperationsError("Summary wave index scope contract is invalid")
+        indexed_scope_ids.append(scope_id)
+        indexed_summary_count += len(summary_batch_refs)
+    if (
+        len(indexed_scope_ids) != len(set(indexed_scope_ids))
+        or type(expected_map_count) is not int
+        or expected_map_count != indexed_summary_count
+        or expected_map_count > MAX_SUMMARY_BATCH_MAP_ITEMS
+    ):
+        raise OperationsError("Summary wave index map contract is invalid")
+    summary_phase_refs = _exact_mapped_results(
+        summary_phase_refs,
+        expected_count=expected_map_count,
+        label="Summary phase",
+    )
     summary_phases = {}
     for wrapped in summary_phase_refs:
+        if set(wrapped) != {"summary_phase_ref"}:
+            raise OperationsError("Summary phase wrapper mismatch")
         phase_ref = wrapped["summary_phase_ref"]
         phase = _read_ref(phase_ref, kind="espn-summary-phase-result-v1")
         key = phase["expected_batch"]["batch_id"]
@@ -1681,7 +1776,7 @@ def reduce_raw_manifest_wave(
         summary_phases[key] = (phase_ref, phase)
     outputs = []
     consumed: set[str] = set()
-    for scope_index in index["scopes"]:
+    for scope_index in scope_indexes:
         if scope_index["budget_exhausted"]:
             raise OperationsError(
                 f"scope {scope_index['scope_id']} exhausted 100% Summary budget"
@@ -2428,12 +2523,25 @@ def _evidence_dict(item: RunManifestEvidence) -> dict[str, Any]:
 def persist_run_manifests(
     *,
     plan_index_ref: Mapping[str, str],
-    publication_refs: Sequence[Mapping[str, Any]],
+    publication_refs: Sequence[Mapping[str, Any]] | None,
     **_context,
 ) -> dict[str, Any]:
     """Seal exact current-run durable evidence; never consult a latest pointer."""
 
     index = _read_ref(plan_index_ref, kind="espn-plan-index-v1")
+    scope_ids = index.get("scope_ids")
+    if (
+        not isinstance(scope_ids, list)
+        or not scope_ids
+        or not all(isinstance(scope_id, str) and scope_id for scope_id in scope_ids)
+        or len(scope_ids) != len(set(scope_ids))
+    ):
+        raise OperationsError("plan index scope set is invalid")
+    publication_refs = _exact_mapped_results(
+        publication_refs,
+        expected_count=len(scope_ids),
+        label="publication",
+    )
     indexed_plans = {}
     for descriptor_ref in index["scope_plan_refs"]:
         descriptor = _read_ref(descriptor_ref, kind="espn-scope-plan-descriptor-v1")
@@ -4376,7 +4484,7 @@ def _publish_latest_discovery_state(
 def write_reviewable_discovery_diff(
     *,
     discovery_detail_index_ref: Mapping[str, str],
-    discovery_detail_phase_refs: Sequence[Mapping[str, Any]],
+    discovery_detail_phase_refs: Sequence[Mapping[str, Any]] | None,
     **context,
 ) -> dict[str, str]:
     """Persist candidate/diff artifacts; this function has no promotion path."""
@@ -4395,9 +4503,17 @@ def write_reviewable_discovery_diff(
         discovery_detail_index_ref,
         label="discovery detail index reference",
     )
-    canonical_phase_refs = _discovery_phase_input_refs(discovery_detail_phase_refs)
     existing_review = _optional_payload(review_uri, kind="espn-discovery-review-v1")
     if existing_review is not None:
+        committed_phase_refs = existing_review.get("discovery_detail_phase_refs")
+        if not isinstance(committed_phase_refs, list) or not committed_phase_refs:
+            raise OperationsError("existing discovery review phase set is invalid")
+        discovery_detail_phase_refs = _exact_mapped_results(
+            discovery_detail_phase_refs,
+            expected_count=len(committed_phase_refs),
+            label="discovery detail phase",
+        )
+        canonical_phase_refs = _discovery_phase_input_refs(discovery_detail_phase_refs)
         review = _validate_discovery_review_checkpoint(
             existing_review,
             discovery_detail_index_ref=canonical_index_ref,
@@ -4419,13 +4535,33 @@ def write_reviewable_discovery_diff(
 
     detail_index = _read_ref(canonical_index_ref, kind="espn-discovery-detail-index-v1")
     competition_count = detail_index.get("competition_count")
+    batch_ids = detail_index.get("batch_ids")
+    batch_refs = detail_index.get("batch_refs")
+    expected_batch_count = (
+        (competition_count + DISCOVERY_DETAIL_BATCH_SIZE - 1)
+        // DISCOVERY_DETAIL_BATCH_SIZE
+        if type(competition_count) is int and competition_count > 0
+        else 0
+    )
     if (
         detail_index.get("competition_cap") != MAX_DISCOVERY_COMPETITIONS
         or detail_index.get("detail_request_cap") != MAX_DISCOVERY_DETAIL_REQUESTS
         or type(competition_count) is not int
-        or not 0 <= competition_count <= MAX_DISCOVERY_COMPETITIONS
+        or not 1 <= competition_count <= MAX_DISCOVERY_COMPETITIONS
+        or not isinstance(batch_ids, list)
+        or not isinstance(batch_refs, list)
+        or not all(isinstance(batch_id, str) and batch_id for batch_id in batch_ids)
+        or len(batch_ids) != expected_batch_count
+        or len(batch_refs) != expected_batch_count
+        or len(batch_ids) != len(set(batch_ids))
     ):
         raise OperationsError("discovery detail index violates the static request cap")
+    discovery_detail_phase_refs = _exact_mapped_results(
+        discovery_detail_phase_refs,
+        expected_count=expected_batch_count,
+        label="discovery detail phase",
+    )
+    canonical_phase_refs = _discovery_phase_input_refs(discovery_detail_phase_refs)
     raw = _read_ref(detail_index["discovery_raw_ref"], kind="espn-discovery-raw-v1")
     body = EspnRawStore.from_uri(_raw_store_uri()).load_exact(
         raw["raw_uri"], raw["raw_sha256"]

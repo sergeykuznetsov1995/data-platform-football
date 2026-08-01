@@ -66,6 +66,7 @@ with DAG(
             ],
             "discovery_detail_phase_refs": detail_fetch.output,
         },
+        trigger_rule="none_failed",
         retries=0,
     )
     fetch >> detail_plan >> detail_selector >> detail_fetch >> review

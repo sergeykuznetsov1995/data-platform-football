@@ -103,6 +103,7 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
                 task_id="plan_summary_batches",
                 python_callable=tasks.plan_summary_batch_wave,
                 op_kwargs={
+                    "plan_index_ref": planning.output["plan_index_ref"],
                     "scoreboard_phase_refs": scoreboard.output,
                     "scope_binding_refs": planning.output["scope_binding_refs"],
                 },
@@ -180,6 +181,7 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
                 "publication_refs": publish.output,
             },
             multiple_outputs=True,
+            trigger_rule="none_failed",
             retries=0,
         )
         publication_selector = PythonOperator(
