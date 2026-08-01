@@ -54,8 +54,12 @@ jobs:
           # its operator stubs only when the real package is missing, and the DAG
           # topology tests assert against those stubs. Installing Airflow here
           # would silently disable them.
+          # ruff is pinned: it gates the merge, and an unpinned linter turns
+          # every upstream release into an unreviewed change to that gate.
+          # 0.16.0 widened the default rule set and made this job fail on
+          # untouched master (565 findings here, 844 in fbref-ci).
           python -m pip install --disable-pip-version-check \
-            pytest ruff pandas numpy pyarrow trino requests PyYAML jinja2 \
+            pytest "ruff==0.15.20" pandas numpy pyarrow trino requests PyYAML jinja2 \
             jsonschema "tls-client-python==1.15.1" python-dotenv tenacity pybreaker \
             rapidfuzz Unidecode nicknames
 
