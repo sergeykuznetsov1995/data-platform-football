@@ -9,6 +9,7 @@ import pytest
 
 from dags.scripts.run_whoscored_backfill_item import (
     _filtered_candidates,
+    _frozen_profile_ids,
     _parser,
     _schedule_request_accounting,
     _source_request_attempts,
@@ -60,6 +61,40 @@ def test_explicit_game_ids_must_freeze_exactly_or_fail():
             {"selector": {"game_ids": [1, 2]}},
             scope,
         )
+
+
+class _RosterRepository:
+    def __init__(self, player_ids):
+        self.player_ids = player_ids
+
+    def list_roster_player_ids(self, *, scopes):
+        assert len(scopes) == 1
+        return list(self.player_ids)
+
+
+def _roster_service(player_ids):
+    return SimpleNamespace(
+        repository=_RosterRepository(player_ids),
+        scope=SimpleNamespace(spec="FRA-Ligue 1=2526"),
+    )
+
+
+@pytest.mark.unit
+def test_roster_freeze_drops_placeholder_ids_instead_of_failing_the_scope():
+    frozen = _frozen_profile_ids(_roster_service([0, 11, 7, 7]))
+
+    assert frozen == [7, 11]
+
+
+@pytest.mark.unit
+def test_roster_freeze_still_fails_when_nothing_but_placeholders_remains():
+    with pytest.raises(RuntimeError, match="only placeholder player_ids"):
+        _frozen_profile_ids(_roster_service([0, -3]))
+
+
+@pytest.mark.unit
+def test_roster_freeze_keeps_an_empty_roster_empty():
+    assert _frozen_profile_ids(_roster_service([])) == []
 
 
 @pytest.mark.unit

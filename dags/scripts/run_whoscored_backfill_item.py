@@ -214,10 +214,31 @@ def _filtered_candidates(
 
 
 def _frozen_profile_ids(service: Any) -> list[int]:
+    """Freeze the scope roster, dropping the source's placeholder ids.
+
+    WhoScored publishes an occasional roster row whose player_id is a
+    non-positive placeholder for a player it never identified.  Rejecting the
+    whole roster over it deadlocked the campaign: the work item reported
+    ``retryable: false`` while its queue entry stayed open, so the driver
+    replayed the same chunk forever (#1078 -- the same class as #1065, where a
+    source variation was read as corruption).  Non-positive ids are refused by
+    the profile receipt contract anyway, so dropping them here is what keeps
+    the frozen set publishable.  A roster that holds nothing else is still a
+    hard failure.
+    """
+
     player_ids = service.repository.list_roster_player_ids(scopes=[service.scope])
-    frozen = sorted({int(value) for value in player_ids})
-    if any(value <= 0 for value in frozen):
-        raise WhoScoredOpsStoreError("roster contains invalid profile player_ids")
+    seen = sorted({int(value) for value in player_ids})
+    frozen = [value for value in seen if value > 0]
+    placeholders = len(seen) - len(frozen)
+    if placeholders:
+        runner.logger.warning(
+            "WhoScored roster %s: dropped %d placeholder profile player_id(s)",
+            service.scope.spec,
+            placeholders,
+        )
+    if seen and not frozen:
+        raise WhoScoredOpsStoreError("roster contains only placeholder player_ids")
     return frozen
 
 
