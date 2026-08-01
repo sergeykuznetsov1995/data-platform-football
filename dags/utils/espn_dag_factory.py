@@ -84,12 +84,16 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
                 pool_slots=1,
                 retries=1,
                 retry_delay=timedelta(minutes=1),
-            ).expand(op_kwargs=planning.output["scope_binding_refs"])
+            ).expand(op_kwargs=planning.output["network_scope_binding_refs"])
             summary_plan = PythonOperator(
                 task_id="plan_summary_batches",
                 python_callable=tasks.plan_summary_batch_wave,
-                op_kwargs={"scoreboard_phase_refs": scoreboard.output},
+                op_kwargs={
+                    "scoreboard_phase_refs": scoreboard.output,
+                    "scope_binding_refs": planning.output["scope_binding_refs"],
+                },
                 multiple_outputs=True,
+                trigger_rule="none_failed",
                 retries=0,
             )
             summary_fetch = PythonOperator.partial(
@@ -171,7 +175,9 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
         release = PythonOperator(
             task_id="release_scope_leases",
             python_callable=tasks.release_scope_leases,
-            op_kwargs={},
+            op_kwargs={
+                "lease_acquisition_ref": leasing.output["lease_acquisition_ref"]
+            },
             trigger_rule="all_done",
             retries=0,
         )

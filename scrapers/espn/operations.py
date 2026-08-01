@@ -8,7 +8,7 @@ the in-memory reference implementation.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -26,6 +26,8 @@ from typing import (
     Protocol,
     Sequence,
 )
+
+from .selection import current_manifest_order_key
 
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -730,6 +732,7 @@ class ScopeHead:
     plan_signature: str
     run_id: str
     published_at: datetime
+    completed_at: datetime | None = None
 
     def __post_init__(self) -> None:
         _required(self.dag_id, "dag_id")
@@ -745,6 +748,8 @@ class ScopeHead:
         ):
             _signature(getattr(self, field), field)
         _utc(self.published_at, "published_at")
+        if self.completed_at is not None:
+            _utc(self.completed_at, "completed_at")
 
 
 @dataclass(frozen=True, slots=True)
@@ -780,7 +785,7 @@ class PublicationFence:
     def __init__(
         self,
         assert_fn: Callable[[], None],
-        record_fn: Callable[[ScopeHead | None, RunManifestEvidence], None],
+        record_fn: Callable[[ScopeHead | None, RunManifestEvidence], ScopeHead | None],
         clock_fn: Callable[[], datetime],
     ) -> None:
         self._assert_fn = assert_fn
@@ -802,7 +807,9 @@ class PublicationFence:
         self._last_asserted_at = _utc(self._clock_fn(), "publication clock")
         return self._last_asserted_at
 
-    def record_published(self, head: ScopeHead, evidence: RunManifestEvidence) -> None:
+    def record_published(
+        self, head: ScopeHead, evidence: RunManifestEvidence
+    ) -> ScopeHead:
         self()
         if head.scope_id != evidence.scope_id:
             raise ValueError("head/evidence scope mismatch")
@@ -814,7 +821,10 @@ class PublicationFence:
             raise ValueError("head/evidence plan mismatch")
         if head.registry_signature != evidence.registry_signature:
             raise ValueError("head/evidence registry mismatch")
-        self._record_fn(head, evidence)
+        selected = self._record_fn(head, evidence)
+        if selected is None:
+            raise OperationsError("published head selection returned no head")
+        return selected
 
     def record_evidence(self, evidence: RunManifestEvidence) -> None:
         """Record an exact no-op run without moving the current scope head."""
@@ -829,6 +839,16 @@ class ScopeLeaseStore(Protocol):
     def acquire_many(
         self,
         scope_ids: Iterable[str],
+        *,
+        owner_id: str,
+        plan_signature: str,
+        now: datetime,
+        ttl: timedelta,
+    ) -> tuple[ScopeLease, ...]: ...
+
+    def reclaim_owner_many(
+        self,
+        expected_leases: Iterable[ScopeLease],
         *,
         owner_id: str,
         plan_signature: str,
@@ -851,6 +871,15 @@ class ScopeLeaseStore(Protocol):
     def read_scope_heads_owned(
         self, leases: Iterable[ScopeLease], *, now: datetime
     ) -> dict[str, ScopeHead]: ...
+
+    def hydrate_head_completed_at(
+        self,
+        lease: ScopeLease,
+        expected: ScopeHead,
+        *,
+        completed_at: datetime,
+        now: datetime,
+    ) -> ScopeHead: ...
 
     def renew(
         self, lease: ScopeLease, *, now: datetime, ttl: timedelta
@@ -1001,6 +1030,42 @@ class MemoryScopeLeaseStore:
                 if lease.scope_id in self._heads
             }
 
+    def hydrate_head_completed_at(
+        self,
+        lease: ScopeLease,
+        expected: ScopeHead,
+        *,
+        completed_at: datetime,
+        now: datetime,
+    ) -> ScopeHead:
+        """Backfill logical time only from an exact immutable snapshot."""
+
+        checked_at = _utc(now, "now")
+        logical_time = _utc(completed_at, "completed_at")
+        with self._lock:
+            current_lease = self._rows.get(lease.scope_id)
+            current_head = self._heads.get(lease.scope_id)
+            if (
+                not self._same_identity(current_lease, lease)
+                or current_lease.expires_at <= checked_at
+            ):
+                raise LeaseLost(
+                    f"ESPN scope lease lost for {lease.scope_id} epoch {lease.epoch}"
+                )
+            if current_head != expected:
+                raise OperationsError(
+                    "scope head changed during logical-time hydration"
+                )
+            if current_head.completed_at is not None:
+                if current_head.completed_at != logical_time:
+                    raise OperationsError(
+                        "scope head logical time conflicts with snapshot"
+                    )
+                return current_head
+            hydrated = replace(current_head, completed_at=logical_time)
+            self._heads[lease.scope_id] = hydrated
+            return hydrated
+
     def read_run_evidence(
         self, *, dag_id: str, run_id: str, attempt: int
     ) -> tuple[RunManifestEvidence, ...]:
@@ -1105,6 +1170,65 @@ class MemoryScopeLeaseStore:
                     f"ESPN scope lease lost for {lease.scope_id} epoch {lease.epoch}"
                 )
 
+    def reclaim_owner_many(
+        self,
+        expected_leases: Iterable[ScopeLease],
+        *,
+        owner_id: str,
+        plan_signature: str,
+        now: datetime,
+        ttl: timedelta,
+    ) -> tuple[ScopeLease, ...]:
+        """Fence every worker of one partial retry bundle with fresh epochs."""
+
+        candidates = tuple(expected_leases)
+        if any(not isinstance(item, ScopeLease) for item in candidates):
+            raise TypeError("expected leases must be ScopeLease values")
+        expected = tuple(sorted(candidates, key=lambda item: item.scope_id))
+        ordered = tuple(item.scope_id for item in expected)
+        if not ordered or len(ordered) != len(set(ordered)):
+            raise ValueError("scope lease batch must be non-empty and unique")
+        owner = _required(owner_id, "owner_id")
+        if any(item.owner_id != owner for item in expected):
+            raise LeaseConflict("expected retry bundle owner differs")
+        signature = _signature(plan_signature, "plan_signature")
+        acquired_at = _utc(now, "now")
+        lifetime = _ttl(ttl)
+        if not any(item.expires_at <= acquired_at for item in expected):
+            raise LeaseConflict("ESPN retry bundle has no expired lease")
+        with self._lock:
+            current = {scope_id: self._rows.get(scope_id) for scope_id in ordered}
+            expected_by_scope = {item.scope_id: item for item in expected}
+            if any(
+                not self._same_identity(current[scope_id], expected_by_scope[scope_id])
+                for scope_id in ordered
+            ):
+                raise LeaseLost("ESPN retry bundle identity changed before reclaim")
+            if not any(lease.expires_at <= acquired_at for lease in current.values()):
+                raise LeaseConflict("ESPN retry bundle is live after locked recheck")
+            result = []
+            for scope_id in ordered:
+                previous = current[scope_id]
+                epoch = max(self._epochs.get(scope_id, 0), previous.epoch) + 1
+                replacement = ScopeLease(
+                    scope_id=scope_id,
+                    owner_id=owner,
+                    plan_signature=signature,
+                    epoch=epoch,
+                    token_sha256=_lease_token(
+                        scope_id=scope_id,
+                        owner_id=owner,
+                        plan_signature=signature,
+                        epoch=epoch,
+                    ),
+                    acquired_at=acquired_at,
+                    expires_at=acquired_at + lifetime,
+                )
+                self._rows[scope_id] = replacement
+                self._epochs[scope_id] = epoch
+                result.append(replacement)
+            return tuple(result)
+
     @staticmethod
     def _same_identity(current: ScopeLease | None, expected: ScopeLease) -> bool:
         return current is not None and (
@@ -1186,7 +1310,9 @@ class MemoryScopeLeaseStore:
                         f"epoch {lease.epoch}"
                     )
 
-            def record(head: ScopeHead | None, evidence: RunManifestEvidence) -> None:
+            def record(
+                head: ScopeHead | None, evidence: RunManifestEvidence
+            ) -> ScopeHead | None:
                 if evidence.scope_id != lease.scope_id:
                     raise LeaseLost("publication evidence scope is not leased")
                 if head is not None:
@@ -1199,11 +1325,10 @@ class MemoryScopeLeaseStore:
                             raise OperationsError(
                                 "scope head generation identity conflict"
                             )
-                        if (
-                            not same_generation
-                            and head.published_at < existing_head.published_at
-                        ):
-                            raise OperationsError("scope head cannot move backwards")
+                        if existing_head.completed_at is None:
+                            raise OperationsError(
+                                "scope head logical order is not hydrated"
+                            )
                 key = (
                     evidence.dag_id,
                     evidence.run_id,
@@ -1213,9 +1338,16 @@ class MemoryScopeLeaseStore:
                 stored = self._run_evidence.get(key)
                 if stored is not None and stored != evidence:
                     raise OperationsError("run manifest evidence conflict")
-                if head is not None:
+                selected = existing_head if head is not None else None
+                if head is not None and (
+                    existing_head is None
+                    or current_manifest_order_key(head)
+                    > current_manifest_order_key(existing_head)
+                ):
                     self._heads[head.scope_id] = head
+                    selected = head
                 self._run_evidence[key] = evidence
+                return selected
 
             yield PublicationFence(assert_locked, record, lambda: checked_at)
 
@@ -1296,7 +1428,8 @@ class PostgresEspnControlStore:
     registry_signature char(64) NOT NULL,
     plan_signature char(64) NOT NULL,
     run_id text NOT NULL,
-    published_at timestamptz NOT NULL
+    published_at timestamptz NOT NULL,
+    completed_at timestamptz
 )"""
                     )
                     cursor.execute(
@@ -1321,6 +1454,10 @@ class PostgresEspnControlStore:
                     cursor.execute(
                         f"ALTER TABLE {self.HEAD_TABLE} "
                         "ADD COLUMN IF NOT EXISTS dag_id text"
+                    )
+                    cursor.execute(
+                        f"ALTER TABLE {self.HEAD_TABLE} "
+                        "ADD COLUMN IF NOT EXISTS completed_at timestamptz"
                     )
                     cursor.execute(
                         f"UPDATE {self.HEAD_TABLE} SET dag_id = "
@@ -1395,13 +1532,74 @@ $espn_migration$"""
                     cursor.execute(
                         f"SELECT dag_id, scope_id, generation_id, generation_signature, "
                         f"manifest_sha256, snapshot_uri, snapshot_sha256, "
-                        f"registry_signature, plan_signature, run_id, published_at "
+                        f"registry_signature, plan_signature, run_id, published_at, "
+                        f"completed_at "
                         f"FROM {self.HEAD_TABLE} WHERE scope_id = ANY(%s) "
                         "ORDER BY scope_id FOR UPDATE",
                         ([lease.scope_id for lease in ordered],),
                     )
                     heads = tuple(self._head_from_row(row) for row in cursor.fetchall())
                     return {head.scope_id: head for head in heads}
+        finally:
+            connection.close()
+
+    def hydrate_head_completed_at(
+        self,
+        lease: ScopeLease,
+        expected: ScopeHead,
+        *,
+        completed_at: datetime,
+        now: datetime,
+    ) -> ScopeHead:
+        """Hydrate a legacy nullable head from its exact signed snapshot only."""
+
+        _utc(now, "now")
+        logical_time = _utc(completed_at, "completed_at")
+        connection = self._connect()
+        try:
+            with connection:
+                with connection.cursor() as cursor:
+                    self._advisory_lock(cursor, lease.scope_id)
+                    database_now = self._db_now(cursor)
+                    current_lease = self._select_lease(
+                        cursor, lease.scope_id, for_update=True
+                    )
+                    if (
+                        not self._same_lease(current_lease, lease)
+                        or current_lease.expires_at <= database_now
+                    ):
+                        raise LeaseLost(
+                            f"ESPN scope lease lost for {lease.scope_id} "
+                            f"epoch {lease.epoch}"
+                        )
+                    cursor.execute(
+                        f"SELECT dag_id, scope_id, generation_id, "
+                        f"generation_signature, manifest_sha256, snapshot_uri, "
+                        f"snapshot_sha256, registry_signature, plan_signature, "
+                        f"run_id, published_at, completed_at FROM {self.HEAD_TABLE} "
+                        "WHERE scope_id = %s FOR UPDATE",
+                        (lease.scope_id,),
+                    )
+                    row = cursor.fetchone()
+                    current = None if row is None else self._head_from_row(row)
+                    if current != expected:
+                        raise OperationsError(
+                            "scope head changed during logical-time hydration"
+                        )
+                    if current.completed_at is not None:
+                        if current.completed_at != logical_time:
+                            raise OperationsError(
+                                "scope head logical time conflicts with snapshot"
+                            )
+                        return current
+                    cursor.execute(
+                        f"UPDATE {self.HEAD_TABLE} SET completed_at = %s "
+                        "WHERE scope_id = %s AND completed_at IS NULL",
+                        (logical_time, lease.scope_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise OperationsError("scope head logical-time hydration raced")
+                    return replace(current, completed_at=logical_time)
         finally:
             connection.close()
 
@@ -1460,7 +1658,7 @@ $espn_migration$"""
 
     @staticmethod
     def _head_from_row(row: Sequence[Any]) -> ScopeHead:
-        if len(row) != 11:
+        if len(row) not in {11, 12}:
             raise OperationsError("stored ESPN scope head row is malformed")
         return ScopeHead(
             dag_id=row[0],
@@ -1474,6 +1672,7 @@ $espn_migration$"""
             plan_signature=row[8],
             run_id=row[9],
             published_at=row[10],
+            completed_at=None if len(row) == 11 else row[11],
         )
 
     @staticmethod
@@ -1504,7 +1703,8 @@ $espn_migration$"""
                     cursor.execute(
                         f"SELECT dag_id, scope_id, generation_id, generation_signature, "
                         f"manifest_sha256, snapshot_uri, snapshot_sha256, "
-                        f"registry_signature, plan_signature, run_id, published_at "
+                        f"registry_signature, plan_signature, run_id, published_at, "
+                        f"completed_at "
                         f"FROM {self.HEAD_TABLE} WHERE scope_id = ANY(%s)",
                         (list(scopes),),
                     )
@@ -1731,6 +1931,102 @@ expires_at = EXCLUDED.expires_at""",
         finally:
             connection.close()
 
+    def reclaim_owner_many(
+        self,
+        expected_leases: Iterable[ScopeLease],
+        *,
+        owner_id: str,
+        plan_signature: str,
+        now: datetime,
+        ttl: timedelta,
+    ) -> tuple[ScopeLease, ...]:
+        """Atomically re-epoch a partial same-owner retry bundle."""
+
+        _utc(now, "now")
+        candidates = tuple(expected_leases)
+        if any(not isinstance(item, ScopeLease) for item in candidates):
+            raise TypeError("expected leases must be ScopeLease values")
+        expected = tuple(sorted(candidates, key=lambda item: item.scope_id))
+        ordered = tuple(item.scope_id for item in expected)
+        if not ordered or len(ordered) != len(set(ordered)):
+            raise ValueError("scope lease batch must be non-empty and unique")
+        owner = _required(owner_id, "owner_id")
+        if any(item.owner_id != owner for item in expected):
+            raise LeaseConflict("expected retry bundle owner differs")
+        signature = _signature(plan_signature, "plan_signature")
+        lifetime = _ttl(ttl)
+        connection = self._connect()
+        try:
+            with connection:
+                with connection.cursor() as cursor:
+                    for scope_id in ordered:
+                        self._advisory_lock(cursor, scope_id)
+                    database_now = self._db_now(cursor)
+                    if not any(item.expires_at <= database_now for item in expected):
+                        raise LeaseConflict("ESPN retry bundle has no expired lease")
+                    current = {
+                        scope_id: self._select_lease(cursor, scope_id, for_update=True)
+                        for scope_id in ordered
+                    }
+                    expected_by_scope = {item.scope_id: item for item in expected}
+                    if any(
+                        not self._same_lease(
+                            current[scope_id], expected_by_scope[scope_id]
+                        )
+                        for scope_id in ordered
+                    ):
+                        raise LeaseLost(
+                            "ESPN retry bundle identity changed before reclaim"
+                        )
+                    if not any(
+                        lease.expires_at <= database_now for lease in current.values()
+                    ):
+                        raise LeaseConflict(
+                            "ESPN retry bundle is live after locked recheck"
+                        )
+                    result = []
+                    for scope_id in ordered:
+                        previous = current[scope_id]
+                        epoch = previous.epoch + 1
+                        replacement = ScopeLease(
+                            scope_id=scope_id,
+                            owner_id=owner,
+                            plan_signature=signature,
+                            epoch=epoch,
+                            token_sha256=_lease_token(
+                                scope_id=scope_id,
+                                owner_id=owner,
+                                plan_signature=signature,
+                                epoch=epoch,
+                            ),
+                            acquired_at=database_now,
+                            expires_at=database_now + lifetime,
+                        )
+                        cursor.execute(
+                            f"UPDATE {self.LEASE_TABLE} SET "
+                            "plan_signature = %s, epoch = %s, token_sha256 = %s, "
+                            "acquired_at = %s, expires_at = %s "
+                            "WHERE scope_id = %s AND owner_id = %s AND epoch = %s "
+                            "AND token_sha256 = %s",
+                            (
+                                replacement.plan_signature,
+                                replacement.epoch,
+                                replacement.token_sha256,
+                                replacement.acquired_at,
+                                replacement.expires_at,
+                                scope_id,
+                                owner,
+                                previous.epoch,
+                                previous.token_sha256,
+                            ),
+                        )
+                        if cursor.rowcount != 1:
+                            raise LeaseLost(f"ESPN retry reclaim lost scope {scope_id}")
+                        result.append(replacement)
+                    return tuple(result)
+        finally:
+            connection.close()
+
     @staticmethod
     def _same_lease(current: ScopeLease | None, expected: ScopeLease) -> bool:
         return current is not None and (
@@ -1880,7 +2176,8 @@ expires_at = EXCLUDED.expires_at""",
 
                     def record(
                         head: ScopeHead | None, evidence: RunManifestEvidence
-                    ) -> None:
+                    ) -> ScopeHead | None:
+                        current_head = None
                         if evidence.scope_id != lease.scope_id:
                             raise LeaseLost("publication evidence scope is not leased")
                         if head is not None:
@@ -1889,7 +2186,7 @@ expires_at = EXCLUDED.expires_at""",
                                 f"generation_signature, manifest_sha256, "
                                 f"snapshot_uri, snapshot_sha256, "
                                 f"registry_signature, plan_signature, run_id, "
-                                f"published_at FROM {self.HEAD_TABLE} "
+                                f"published_at, completed_at FROM {self.HEAD_TABLE} "
                                 "WHERE scope_id = %s FOR UPDATE",
                                 (head.scope_id,),
                             )
@@ -1905,12 +2202,9 @@ expires_at = EXCLUDED.expires_at""",
                                     raise OperationsError(
                                         "scope head generation identity conflict"
                                     )
-                                if (
-                                    not same_generation
-                                    and head.published_at < current_head.published_at
-                                ):
+                                if current_head.completed_at is None:
                                     raise OperationsError(
-                                        "scope head cannot move backwards"
+                                        "scope head logical order is not hydrated"
                                     )
                         cursor.execute(
                             f"""INSERT INTO {self.RUN_TABLE}
@@ -1950,13 +2244,18 @@ ON CONFLICT (dag_id, run_id, attempt, scope_id) DO NOTHING""",
                             or self._evidence_from_row(evidence_row) != evidence
                         ):
                             raise OperationsError("run manifest evidence conflict")
-                        if head is not None:
+                        selected_head = current_head
+                        if head is not None and (
+                            current_head is None
+                            or current_manifest_order_key(head)
+                            > current_manifest_order_key(current_head)
+                        ):
                             cursor.execute(
                                 f"""INSERT INTO {self.HEAD_TABLE}
 (dag_id, scope_id, generation_id, generation_signature, manifest_sha256,
  snapshot_uri, snapshot_sha256, registry_signature, plan_signature,
- run_id, published_at)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+ run_id, published_at, completed_at)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (scope_id) DO UPDATE SET
 dag_id = EXCLUDED.dag_id,
 generation_id = EXCLUDED.generation_id,
@@ -1967,7 +2266,8 @@ snapshot_sha256 = EXCLUDED.snapshot_sha256,
 registry_signature = EXCLUDED.registry_signature,
 plan_signature = EXCLUDED.plan_signature,
 run_id = EXCLUDED.run_id,
-published_at = EXCLUDED.published_at""",
+published_at = EXCLUDED.published_at,
+completed_at = EXCLUDED.completed_at""",
                                 (
                                     head.dag_id,
                                     head.scope_id,
@@ -1980,8 +2280,11 @@ published_at = EXCLUDED.published_at""",
                                     head.plan_signature,
                                     head.run_id,
                                     head.published_at,
+                                    head.completed_at,
                                 ),
                             )
+                            selected_head = head
+                        return selected_head
 
                     assert_locked()
                     yield PublicationFence(

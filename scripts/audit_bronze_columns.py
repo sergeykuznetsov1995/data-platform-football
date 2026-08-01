@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import re
 import sys
 from collections import defaultdict
@@ -73,7 +74,9 @@ ESPN_CONTRACT = _load_espn_contract()
 def _load_understat_contract():
     """Load the dependency-free native seven-table registry directly."""
 
-    path = Path(__file__).resolve().parents[1] / "scrapers" / "understat" / "contracts.py"
+    path = (
+        Path(__file__).resolve().parents[1] / "scrapers" / "understat" / "contracts.py"
+    )
     module_name = "_audit_understat_contract"
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
@@ -512,8 +515,7 @@ if set(WHOSCORED_IDENTITY_COLUMNS) != set(WHOSCORED_CONTRACT.BUSINESS_TABLES):
 # #274 seeds espn only; other sources filled in #276-#286.
 EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
     "espn": {
-        table: set(columns)
-        for table, columns in ESPN_CONTRACT.REQUIRED_COLUMNS.items()
+        table: set(columns) for table, columns in ESPN_CONTRACT.REQUIRED_COLUMNS.items()
     },
     "fbref": {
         # Minimal required set per table — identity keys + a few core metrics
@@ -1655,9 +1657,7 @@ def diff_contract(
                 expected_absent.append((table, "present but empty — expected"))
                 continue
             if table in capability_empty_ok:
-                expected_empty.append(
-                    (table, "present but empty — capability-gated")
-                )
+                expected_empty.append((table, "present but empty — capability-gated"))
             else:
                 missing_tables.append((table, "present but empty (0 rows)"))
                 continue
@@ -1914,7 +1914,7 @@ def render_source_report(
 # ---- Main ----
 
 
-def main():
+def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument(
         "--output", default=f"/tmp/bronze_column_audit_{datetime.utcnow():%Y-%m-%d}.md"
@@ -1925,7 +1925,7 @@ def main():
         help="slug (espn, fbref, ...) — scan only {source}_* tables and "
         "diff against the parser contract (EXPECTED_TABLES)",
     )
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     source: Optional[str] = None
     if args.source:
@@ -1966,13 +1966,37 @@ def main():
             )
 
     output = Path(args.output)
+    contract_failures = 0
     if source:
         diff = diff_contract(cur, source, set(all_tables), per_table)
         render_source_report(source, diff, per_table, output)
+        contract_failures = sum(
+            len(diff[key])
+            for key in ("missing_tables", "missing_columns", "all_null_columns")
+        )
     else:
         render_report(per_table, output)
+    audit_failures = sum(
+        finding.get("sev") in {"ERROR", "WARN"}
+        for _, findings in per_table.values()
+        for finding in findings
+    )
+    status = 1 if contract_failures or audit_failures else 0
+    print(
+        json.dumps(
+            {
+                "status": "failed" if status else "clean",
+                "contract_findings": contract_failures,
+                "audit_findings": audit_failures,
+                "report": str(output),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
     print(f"\nReport written to: {output}", file=sys.stderr)
+    return status
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

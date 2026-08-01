@@ -33,6 +33,10 @@ from .models import (
     ScopePlan,
 )
 from .parser_contracts import LineupRow, MatchsheetRow, ScheduleRow
+from .selection import (
+    CURRENT_MANIFEST_ORDER_FIELDS,
+    select_current_manifest,
+)
 
 
 REPOSITORY_VERSION = "espn-bronze-repository-v2"
@@ -1935,6 +1939,60 @@ class EspnBronzeRepository:
             self._verify_physical(generation, report)
         return report
 
+    def verify_current_scope_selection(
+        self, generation: ScopeGeneration
+    ) -> dict[str, int]:
+        """Prove the real cutover-gated current views select this generation."""
+
+        report = self.verify_published_scope(generation)
+        observed_counts: dict[str, int] = {}
+        expected_identity = (
+            generation.generation_id,
+            generation.generation_signature,
+            generation.run_id,
+            generation.registry_signature,
+            generation.plan_signature,
+        )
+        for entity, view in CURRENT_VIEWS.items():
+            rows = self._execute(
+                'SELECT "generation_id", "generation_signature", "run_id", '
+                '"registry_signature", "plan_signature", COUNT(*) AS row_count '
+                f"FROM {self.catalog}.{self.schema}.{view} "
+                'WHERE "scope_id" = ? GROUP BY 1, 2, 3, 4, 5',
+                (generation.plan.scope_id,),
+            )
+            identities = []
+            for raw in rows:
+                if isinstance(raw, Mapping):
+                    identity = tuple(
+                        raw.get(field)
+                        for field in (
+                            "generation_id",
+                            "generation_signature",
+                            "run_id",
+                            "registry_signature",
+                            "plan_signature",
+                        )
+                    )
+                    count = int(raw.get("row_count") or 0)
+                else:
+                    if len(raw) != 6:
+                        raise PublicationError("current view identity row is malformed")
+                    identity, count = tuple(raw[:5]), int(raw[5])
+                identities.append((identity, count))
+            expected_count = report.row_counts[entity]
+            if expected_count == 0:
+                if identities:
+                    raise PublicationError(
+                        f"{entity} current view contains unexpected scope rows"
+                    )
+            elif identities != [(expected_identity, expected_count)]:
+                raise PublicationError(
+                    f"{entity} current view selection differs from control head"
+                )
+            observed_counts[entity] = expected_count
+        return observed_counts
+
     def exact_complete_exists(self, generation: ScopeGeneration) -> bool:
         """Return whether this exact, physically valid COMPLETE already exists."""
 
@@ -2668,7 +2726,7 @@ validated_complete AS (
     SELECT m.*,
            ROW_NUMBER() OVER (
                PARTITION BY scope_id
-               ORDER BY completed_at DESC, generation_id DESC, manifest_sha256 DESC
+               ORDER BY {", ".join(f"{field} DESC" for field in CURRENT_MANIFEST_ORDER_FIELDS)}
            ) AS rn
     FROM validated_complete m
 ), latest_validated AS (
@@ -2814,6 +2872,7 @@ __all__ = [
     "CATALOG_TABLE",
     "CatalogSnapshot",
     "CURRENT_VIEWS",
+    "CURRENT_MANIFEST_ORDER_FIELDS",
     "CUTOVER_TABLE",
     "ENTITY_TABLES",
     "EspnBronzeRepository",
@@ -2837,5 +2896,6 @@ __all__ = [
     "render_current_view_sql",
     "render_repository_ddl",
     "row_fingerprint",
+    "select_current_manifest",
     "validate_scope_generation",
 ]

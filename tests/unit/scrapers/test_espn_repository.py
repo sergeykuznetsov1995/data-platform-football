@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
 
@@ -1033,6 +1033,38 @@ def test_current_view_validates_all_four_relations_before_ranking_and_falls_back
     assert "JOIN latest_validated m" in native_rows
     assert "JOIN native_ready c ON c.scope_id = m.scope_id" in native_rows
     assert "c.native_generation_id" not in native_rows
+
+
+def test_current_view_and_control_head_share_one_canonical_total_order():
+    completed = datetime(2026, 8, 1, tzinfo=UTC)
+    rows = [
+        {
+            "completed_at": completed,
+            "generation_id": "generation-a",
+            "manifest_sha256": "f" * 64,
+        },
+        {
+            "completed_at": completed,
+            "generation_id": "generation-b",
+            "manifest_sha256": "0" * 64,
+        },
+        {
+            "completed_at": completed - timedelta(days=1),
+            "generation_id": "generation-z",
+            "manifest_sha256": "f" * 64,
+        },
+    ]
+
+    selected = repository_module.select_current_manifest(rows)
+    sql = render_current_view_sql("schedule")
+
+    assert selected == rows[1]
+    assert "ORDER BY completed_at DESC, generation_id DESC, manifest_sha256 DESC" in sql
+    assert repository_module.CURRENT_MANIFEST_ORDER_FIELDS == (
+        "completed_at",
+        "generation_id",
+        "manifest_sha256",
+    )
 
 
 @pytest.mark.unit

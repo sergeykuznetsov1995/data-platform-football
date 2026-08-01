@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import importlib
 from contextlib import nullcontext
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -154,7 +155,9 @@ def test_terminal_health_release_and_propagator_cannot_mask_failure():
     assert set(tasks["terminal_verdict"]._init_kwargs["op_kwargs"]) == {
         "producer_task_ids"
     }
-    assert tasks["release_scope_leases"]._init_kwargs["op_kwargs"] == {}
+    assert set(tasks["release_scope_leases"]._init_kwargs["op_kwargs"]) == {
+        "lease_acquisition_ref"
+    }
 
 
 @pytest.mark.parametrize(
@@ -200,6 +203,22 @@ def test_weekly_discovery_never_promotes_and_monitor_is_network_free():
     )
     assert "promote" not in " ".join(discovery_tasks).casefold()
     assert "write_reviewable_diff" in discovery_tasks
+    assert (
+        discovery_tasks["plan_discovery_detail_batches"]._init_kwargs.get("pool")
+        is None
+    )
+    assert discovery_tasks["fetch_discovery_detail_batches"].is_mapped is True
+    assert discovery_tasks["fetch_discovery_detail_batches"]._init_kwargs["pool"] == (
+        "espn_http_pool"
+    )
+    assert (
+        discovery_tasks["fetch_discovery_detail_batches"]._init_kwargs["pool_slots"]
+        == 1
+    )
+    assert (
+        "fetch_discovery_detail_batches"
+        in discovery_tasks["write_reviewable_diff"].upstream_task_ids
+    )
 
     monitor = _reload("dag_monitor_espn")
     monitor_tasks = _tasks()
@@ -295,31 +314,42 @@ def test_discovery_rollover_is_detected_from_frozen_detail_without_network():
     from dags.utils import espn_native_tasks
     from scrapers.espn.discovery import quarantine_new_editions
 
+    metadata = json.loads(
+        (ROOT / "tests/fixtures/espn/native_competition_detail.json").read_text()
+    )
+    metadata["id"] = "700"
+    metadata["slug"] = "eng.1"
+    metadata["name"] = "English Premier League"
+    metadata["season"] = {
+        "year": 2027,
+        "displayName": "2027-28 English Premier League",
+        "startDate": "2027-07-01T00:00:00Z",
+        "endDate": "2028-06-30T23:59:59Z",
+    }
+    scoreboard = json.loads(
+        (ROOT / "tests/fixtures/espn/native_scoreboard.json").read_text()
+    )
+    scoreboard["leagues"][0].update({"id": "700", "slug": "eng.1"})
+    detail = espn_native_tasks._competition_detail_document(
+        metadata,
+        scoreboard,
+        json.loads((ROOT / "tests/fixtures/espn/native_summary.json").read_text()),
+        espn_id=700,
+        slug="eng.1",
+        name="English Premier League",
+    )
     snapshot = espn_native_tasks._discovery_snapshot(
         {
-            "sports": [
-                {
-                    "leagues": [
-                        {
-                            "id": "700",
-                            "slug": "eng.1",
-                            "name": "English Premier League",
-                            "gender": "MALE",
-                            "season": {
-                                "year": 2027,
-                                "displayName": "2027-28 English Premier League",
-                                "startDate": "2027-07-01T00:00:00Z",
-                                "endDate": "2028-06-30T23:59:59Z",
-                            },
-                            "capabilities": {
-                                "schedule": "proven",
-                                "lineup": "proven",
-                                "matchsheet": "proven",
-                            },
-                        }
-                    ]
-                }
-            ]
+            "dropdown": {
+                "leagues": [
+                    {
+                        "id": "700",
+                        "slug": "eng.1",
+                        "name": "English Premier League",
+                    }
+                ]
+            },
+            "details_by_slug": {"eng.1": detail},
         },
         captured_at="2027-07-01T00:00:00+00:00",
     )
@@ -332,6 +362,1152 @@ def test_discovery_rollover_is_detected_from_frozen_detail_without_network():
     )
 
     assert quarantine_new_editions(snapshot, registry) == {"700:2027"}
+
+
+def test_nested_discovery_plans_220_unique_details_as_eleven_bounded_batches(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+
+    flattened = json.loads(
+        (ROOT / "tests/fixtures/espn/dropdown_2026-07-31.json").read_text()
+    )
+    dropdown = {"sports": [{"name": "soccer", "leagues": flattened["leagues"]}]}
+    raw = {
+        "kind": "espn-discovery-raw-v1",
+        "schema_version": 1,
+        "captured_at": "2026-08-01T00:00:00+00:00",
+        "raw_uri": "s3://raw/dropdown.json",
+        "raw_sha256": "a" * 64,
+        "direct_bytes": 1,
+        "proxy_bytes": 0,
+    }
+    payloads = []
+
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: raw)
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        lambda _uri: SimpleNamespace(
+            load_exact=lambda *_args: json.dumps(dropdown).encode()
+        ),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(espn_native_tasks, "_optional_payload", lambda *_a, **_k: None)
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_run_identity",
+        lambda _context: (
+            "dag_discover_espn_registry",
+            "run-1",
+            datetime(2026, 8, 1, tzinfo=timezone.utc),
+        ),
+    )
+
+    def write(uri, payload, **_kwargs):
+        payloads.append(payload)
+        return {"uri": uri, "sha256": hashlib.sha256(uri.encode()).hexdigest()}
+
+    monkeypatch.setattr(espn_native_tasks, "_write_payload", write)
+
+    result = espn_native_tasks.plan_discovery_detail_batches(
+        discovery_raw_ref={"uri": "raw", "sha256": "b" * 64}
+    )
+    batches = [
+        payload
+        for payload in payloads
+        if payload.get("kind") == "espn-discovery-detail-batch-v1"
+    ]
+
+    assert len(result["discovery_detail_batch_refs"]) == 11
+    assert [len(batch["competitions"]) for batch in batches] == [20] * 11
+    assert (
+        len(
+            {
+                (item["espn_id"], item["slug"])
+                for batch in batches
+                for item in batch["competitions"]
+            }
+        )
+        == 220
+    )
+
+
+def test_discovery_rejects_catalog_above_static_run_request_cap(monkeypatch):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn import discovery
+
+    raw = {
+        "kind": "espn-discovery-raw-v1",
+        "raw_uri": "s3://raw/dropdown.json",
+        "raw_sha256": "a" * 64,
+    }
+    candidates = tuple(
+        SimpleNamespace(espn_id=index, slug=f"league.{index}", name=f"League {index}")
+        for index in range(1, espn_native_tasks.MAX_DISCOVERY_COMPETITIONS + 2)
+    )
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: raw)
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        lambda _uri: SimpleNamespace(load_exact=lambda *_args: b"{}"),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(discovery, "parse_soccer_dropdown", lambda _payload: candidates)
+    monkeypatch.setattr(
+        espn_native_tasks, "_normalize_discovery_dropdown", lambda _payload: {}
+    )
+
+    with pytest.raises(
+        espn_native_tasks.OperationsError, match="competition cap exceeded"
+    ):
+        espn_native_tasks.plan_discovery_detail_batches(
+            discovery_raw_ref={"uri": "raw", "sha256": "b" * 64}
+        )
+
+
+def test_discovery_rejects_empty_catalog_before_dynamic_mapping(monkeypatch):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn import discovery
+
+    raw = {
+        "kind": "espn-discovery-raw-v1",
+        "raw_uri": "s3://raw/dropdown.json",
+        "raw_sha256": "a" * 64,
+    }
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: raw)
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        lambda _uri: SimpleNamespace(load_exact=lambda *_args: b"{}"),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(discovery, "parse_soccer_dropdown", lambda _payload: ())
+    monkeypatch.setattr(
+        espn_native_tasks, "_normalize_discovery_dropdown", lambda _payload: {}
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="no competitions"):
+        espn_native_tasks.plan_discovery_detail_batches(
+            discovery_raw_ref={"uri": "raw", "sha256": "b" * 64}
+        )
+
+
+def test_discovery_detail_fetch_saves_three_exact_evidence_documents(monkeypatch):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.transport_contracts import EndpointType
+
+    batch_ref = {"uri": "s3://artifacts/batch.json", "sha256": "a" * 64}
+    batch = {
+        "kind": "espn-discovery-detail-batch-v1",
+        "batch_id": "batch-1",
+        "competitions": [{"espn_id": 730, "slug": "ita.1", "name": "Italian Serie A"}],
+    }
+    scoreboard = json.loads(
+        (ROOT / "tests/fixtures/espn/native_scoreboard.json").read_text()
+    )
+    calls = []
+    client_bounds = []
+
+    class Client:
+        def fetch_json(
+            self,
+            url,
+            endpoint,
+            params=None,
+            *,
+            competition_id=None,
+            event_id=None,
+            force_refresh=False,
+        ):
+            calls.append(
+                (url, endpoint, params, competition_id, event_id, force_refresh)
+            )
+            documents = {
+                EndpointType.CATALOG: {"id": "730", "slug": "ita.1"},
+                EndpointType.SCOREBOARD: scoreboard,
+                EndpointType.SUMMARY: {"header": {"id": "401000001"}},
+            }
+            index = len(calls)
+            return SimpleNamespace(
+                json_data=documents[endpoint],
+                raw_uri=f"s3://raw/{index}.json",
+                content_hash=str(index) * 64,
+                direct_bytes=index,
+                proxy_bytes=0,
+            )
+
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: batch)
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        lambda _uri: SimpleNamespace(),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(
+        espn_native_tasks, "_optional_payload", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_http_client",
+        lambda _store, **bounds: client_bounds.append(bounds) or Client(),
+    )
+    written = []
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda uri, payload, **_kwargs: (
+            written.append(payload) or {"uri": uri, "sha256": "f" * 64}
+        ),
+    )
+
+    espn_native_tasks.fetch_discovery_detail_batch(discovery_detail_batch_ref=batch_ref)
+
+    detail = next(
+        payload["details"][0]
+        for payload in written
+        if payload.get("kind") == "espn-discovery-detail-phase-v1"
+    )
+    assert [call[1] for call in calls] == [
+        EndpointType.CATALOG,
+        EndpointType.SCOREBOARD,
+        EndpointType.SUMMARY,
+    ]
+    assert calls[2][4] == "401000001"
+    assert client_bounds == [
+        {"max_summary_events": 1, "max_competitions": 1, "max_requests": 12}
+    ]
+    assert detail["request_count"] == 3
+    assert detail["direct_bytes"] == 6
+    assert detail["summary_event_id"] == "401000001"
+
+
+def test_discovery_catalog_retry_reuses_committed_raw_checkpoint(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    captured_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    existing = {
+        "kind": "espn-discovery-raw-v1",
+        "schema_version": 1,
+        "captured_at": captured_at.isoformat(),
+        "raw_uri": "s3://raw/catalog.json",
+        "raw_sha256": "a" * 64,
+        "direct_bytes": 123,
+        "proxy_bytes": 0,
+    }
+    loaded = []
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_run_identity",
+        lambda _context: ("dag_discover_espn_registry", "run-1", captured_at),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        lambda _uri: SimpleNamespace(
+            load_exact=lambda uri, digest: loaded.append((uri, digest)) or b"old"
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_optional_payload", lambda *_args, **_kwargs: existing
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_ref_for_uri",
+        lambda uri: {"uri": uri, "sha256": "b" * 64},
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_http_client",
+        lambda *_args, **_kwargs: pytest.fail("retry must not observe the network"),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: pytest.fail("retry must not touch the control store")),
+    )
+
+    result = espn_native_tasks.fetch_discovery_catalog()
+
+    assert loaded == [(existing["raw_uri"], existing["raw_sha256"])]
+    assert result["discovery_raw_ref"]["uri"].endswith("/discovery-raw.json")
+
+
+def test_discovery_detail_retry_reuses_committed_phase_without_network(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    batch_ref = {"uri": "s3://artifacts/batch.json", "sha256": "a" * 64}
+    competition = {"espn_id": 730, "slug": "ita.1", "name": "Italian Serie A"}
+    batch = {
+        "kind": "espn-discovery-detail-batch-v1",
+        "batch_id": "batch-1",
+        "competitions": [competition],
+    }
+    detail = {
+        **competition,
+        "metadata_raw_uri": "s3://raw/metadata.json",
+        "metadata_raw_sha256": "b" * 64,
+        "scoreboard_raw_uri": "s3://raw/scoreboard.json",
+        "scoreboard_raw_sha256": "c" * 64,
+        "summary_raw_uri": None,
+        "summary_raw_sha256": None,
+        "summary_event_id": None,
+        "request_count": 2,
+        "direct_bytes": 20,
+        "proxy_bytes": 0,
+    }
+    phase = {
+        "kind": "espn-discovery-detail-phase-v1",
+        "schema_version": 1,
+        "batch_id": "batch-1",
+        "discovery_detail_batch_ref": batch_ref,
+        "details": [detail],
+    }
+    loaded = []
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_args, **_kwargs: batch)
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        lambda _uri: SimpleNamespace(
+            load_exact=lambda uri, digest: loaded.append((uri, digest)) or b"old"
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_optional_payload", lambda *_args, **_kwargs: phase
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_ref_for_uri",
+        lambda uri: {"uri": uri, "sha256": "d" * 64},
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_http_client",
+        lambda *_args, **_kwargs: pytest.fail("retry must not observe the network"),
+    )
+
+    result = espn_native_tasks.fetch_discovery_detail_batch(
+        discovery_detail_batch_ref=batch_ref
+    )
+
+    assert loaded == [
+        (detail["metadata_raw_uri"], detail["metadata_raw_sha256"]),
+        (detail["scoreboard_raw_uri"], detail["scoreboard_raw_sha256"]),
+    ]
+    assert result["discovery_detail_phase_ref"]["uri"].endswith(".phase.json")
+
+
+def test_discovery_detail_retry_reuses_partial_item_and_fetches_only_remainder(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.transport_contracts import EndpointType
+
+    batch_ref = {"uri": "s3://artifacts/batch.json", "sha256": "a" * 64}
+    old_competition = {
+        "espn_id": 730,
+        "slug": "ita.1",
+        "name": "Italian Serie A",
+    }
+    remaining_competition = {
+        "espn_id": 731,
+        "slug": "fra.1",
+        "name": "French Ligue 1",
+    }
+    batch = {
+        "kind": "espn-discovery-detail-batch-v1",
+        "batch_id": "batch-1",
+        "competitions": [old_competition, remaining_competition],
+    }
+    old_detail = {
+        **old_competition,
+        "metadata_raw_uri": "s3://raw/old-metadata.json",
+        "metadata_raw_sha256": "b" * 64,
+        "scoreboard_raw_uri": "s3://raw/old-scoreboard.json",
+        "scoreboard_raw_sha256": "c" * 64,
+        "summary_raw_uri": None,
+        "summary_raw_sha256": None,
+        "summary_event_id": None,
+        "request_count": 2,
+        "direct_bytes": 20,
+        "proxy_bytes": 0,
+    }
+    old_item_key = hashlib.sha256(
+        espn_native_tasks._canonical_bytes(
+            {
+                "kind": "espn-discovery-detail-item-id-v1",
+                "batch_id": batch["batch_id"],
+                "identity": old_competition,
+            }
+        )
+    ).hexdigest()
+    old_item_uri = batch_ref["uri"] + f".item-{old_item_key}.json"
+    old_checkpoint = {
+        "kind": "espn-discovery-detail-item-v1",
+        "schema_version": 1,
+        "batch_id": batch["batch_id"],
+        "discovery_detail_batch_ref": batch_ref,
+        "detail": old_detail,
+    }
+    scoreboard = json.loads(
+        (ROOT / "tests/fixtures/espn/native_scoreboard.json").read_text()
+    )
+    scoreboard["leagues"][0].update({"id": "731", "slug": "fra.1"})
+    calls = []
+
+    class Client:
+        def fetch_json(
+            self,
+            url,
+            endpoint,
+            params=None,
+            *,
+            competition_id=None,
+            event_id=None,
+            force_refresh=False,
+        ):
+            calls.append((endpoint, competition_id, event_id))
+            documents = {
+                EndpointType.CATALOG: {"id": "731", "slug": "fra.1"},
+                EndpointType.SCOREBOARD: scoreboard,
+                EndpointType.SUMMARY: {"header": {"id": "401000001"}},
+            }
+            index = len(calls)
+            return SimpleNamespace(
+                json_data=documents[endpoint],
+                raw_uri=f"s3://raw/new-{index}.json",
+                content_hash=str(index) * 64,
+                direct_bytes=index,
+                proxy_bytes=0,
+            )
+
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_args, **_kwargs: batch)
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        lambda _uri: SimpleNamespace(load_exact=lambda *_args: b"old"),
+    )
+
+    def optional(uri, **_kwargs):
+        if uri.endswith(".phase.json"):
+            return None
+        return old_checkpoint if uri == old_item_uri else None
+
+    monkeypatch.setattr(espn_native_tasks, "_optional_payload", optional)
+    monkeypatch.setattr(
+        espn_native_tasks, "_http_client", lambda *_args, **_kwargs: Client()
+    )
+    written = []
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda uri, payload, **_kwargs: (
+            written.append((uri, payload))
+            or {"uri": uri, "sha256": hashlib.sha256(uri.encode()).hexdigest()}
+        ),
+    )
+
+    espn_native_tasks.fetch_discovery_detail_batch(discovery_detail_batch_ref=batch_ref)
+
+    assert [call[0] for call in calls] == [
+        EndpointType.CATALOG,
+        EndpointType.SCOREBOARD,
+        EndpointType.SUMMARY,
+    ]
+    assert {call[1] for call in calls} == {731}
+    assert all(uri != old_item_uri for uri, _payload in written)
+    phase = next(
+        payload
+        for _uri, payload in written
+        if payload.get("kind") == "espn-discovery-detail-phase-v1"
+    )
+    assert [item["espn_id"] for item in phase["details"]] == [730, 731]
+
+
+@pytest.mark.parametrize("foreign_first", [True, False])
+def test_discovery_rejects_mixed_scoreboard_league_ownership(foreign_first):
+    from dags.utils import espn_native_tasks
+
+    metadata = json.loads(
+        (ROOT / "tests/fixtures/espn/native_competition_detail.json").read_text()
+    )
+    scoreboard = json.loads(
+        (ROOT / "tests/fixtures/espn/native_scoreboard.json").read_text()
+    )
+    summary = json.loads((ROOT / "tests/fixtures/espn/native_summary.json").read_text())
+    foreign_league = {"id": "999", "slug": "foreign.1"}
+    foreign_event = {
+        "id": "499999999",
+        "season": {"year": 2020},
+        "competitions": [
+            {
+                "competitors": [
+                    {"team": {"id": "91"}},
+                    {"team": {"id": "92"}},
+                ]
+            }
+        ],
+    }
+    if foreign_first:
+        scoreboard["leagues"].insert(0, foreign_league)
+        scoreboard["events"].insert(0, foreign_event)
+    else:
+        scoreboard["leagues"].append(foreign_league)
+        scoreboard["events"].append(foreign_event)
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="own exactly"):
+        espn_native_tasks._competition_detail_document(
+            metadata,
+            scoreboard,
+            summary,
+            espn_id=730,
+            slug="ita.1",
+            name="Italian Serie A",
+        )
+
+
+def test_discovery_null_dropdown_id_binds_core_and_scoreboard_identity():
+    from dags.utils import espn_native_tasks
+
+    metadata = json.loads(
+        (ROOT / "tests/fixtures/espn/native_competition_detail.json").read_text()
+    )
+    scoreboard = json.loads(
+        (ROOT / "tests/fixtures/espn/native_scoreboard.json").read_text()
+    )
+    summary = json.loads((ROOT / "tests/fixtures/espn/native_summary.json").read_text())
+    resolved = espn_native_tasks._competition_detail_document(
+        metadata,
+        scoreboard,
+        summary,
+        espn_id=None,
+        slug="ita.1",
+        name="Italian Serie A",
+    )
+    assert resolved["id"] == 730
+
+    scoreboard["leagues"][0]["id"] = "999"
+    with pytest.raises(espn_native_tasks.OperationsError, match="own exactly"):
+        espn_native_tasks._competition_detail_document(
+            metadata,
+            scoreboard,
+            summary,
+            espn_id=None,
+            slug="ita.1",
+            name="Italian Serie A",
+        )
+
+
+def test_shipped_null_id_discovery_row_remains_unpromotable_with_slug_evidence():
+    from dags.utils import espn_native_tasks
+
+    dropdown = json.loads(
+        (ROOT / "tests/fixtures/espn/dropdown_2026-07-31.json").read_text()
+    )
+    row = next(item for item in dropdown["leagues"] if item["slug"] == "fifa.wwcq.ply")
+    assert row["id"] is None
+    metadata = json.loads(
+        (ROOT / "tests/fixtures/espn/native_competition_detail.json").read_text()
+    )
+    metadata.update({"id": None, "slug": row["slug"], "name": row["name"]})
+    scoreboard = json.loads(
+        (ROOT / "tests/fixtures/espn/native_scoreboard.json").read_text()
+    )
+    scoreboard["leagues"][0].update({"id": None, "slug": row["slug"]})
+    detail = espn_native_tasks._competition_detail_document(
+        metadata,
+        scoreboard,
+        json.loads((ROOT / "tests/fixtures/espn/native_summary.json").read_text()),
+        espn_id=None,
+        slug=row["slug"],
+        name=row["name"],
+    )
+    snapshot = espn_native_tasks._discovery_snapshot(
+        {
+            "dropdown": {"leagues": [row]},
+            "details_by_slug": {row["slug"]: detail},
+        },
+        captured_at=dropdown["captured_at"],
+    )
+
+    assert snapshot.candidates[0].espn_id is None
+    assert snapshot.candidates[0].slug == "fifa.wwcq.ply"
+    assert snapshot.candidates[0].capabilities.lineup.value == "unknown"
+
+
+@pytest.mark.parametrize(
+    "malformed_case",
+    [
+        "empty_athlete",
+        "wrong_roster_side",
+        "invalid_captain",
+        "empty_statistic",
+        "unnamed_statistic",
+    ],
+)
+def test_discovery_sample_requires_parser_equivalent_capability_rows(malformed_case):
+    from dags.utils import espn_native_tasks
+
+    metadata = json.loads(
+        (ROOT / "tests/fixtures/espn/native_competition_detail.json").read_text()
+    )
+    scoreboard = json.loads(
+        (ROOT / "tests/fixtures/espn/native_scoreboard.json").read_text()
+    )
+    summary = json.loads((ROOT / "tests/fixtures/espn/native_summary.json").read_text())
+    if malformed_case == "empty_athlete":
+        summary["rosters"][0]["roster"] = [{}]
+    elif malformed_case == "wrong_roster_side":
+        summary["rosters"][0]["homeAway"] = "home"
+    elif malformed_case == "invalid_captain":
+        summary["rosters"][0]["roster"][0]["captain"] = "yes"
+    elif malformed_case == "empty_statistic":
+        summary["boxscore"]["teams"][0]["statistics"] = [{}]
+    else:
+        summary["boxscore"]["teams"][0]["statistics"].insert(0, {})
+
+    detail = espn_native_tasks._competition_detail_document(
+        metadata,
+        scoreboard,
+        summary,
+        espn_id=730,
+        slug="ita.1",
+        name="Italian Serie A",
+    )
+
+    assert detail["capabilities"] == {
+        "schedule": "proven",
+        "lineup": "unknown",
+        "matchsheet": "unknown",
+    }
+
+
+def test_saved_detail_evidence_reaches_reviewable_discovery_diff(monkeypatch):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.registry import validate_registry_document
+
+    dropdown_ref = {"uri": "raw-ref", "sha256": "a" * 64}
+    index_ref = {"uri": "index-ref", "sha256": "b" * 64}
+    batch_ref = {"uri": "batch-ref", "sha256": "c" * 64}
+    phase_ref = {"uri": "phase-ref", "sha256": "d" * 64}
+    raw = {
+        "kind": "espn-discovery-raw-v1",
+        "captured_at": "2026-08-01T00:00:00+00:00",
+        "raw_uri": "s3://raw/dropdown.json",
+        "raw_sha256": "e" * 64,
+        "proxy_bytes": 0,
+    }
+    competition = {"espn_id": 730, "slug": "ita.1", "name": "Italian Serie A"}
+    batch = {
+        "kind": "espn-discovery-detail-batch-v1",
+        "batch_id": "batch-1",
+        "discovery_raw_ref": dropdown_ref,
+        "competitions": [competition],
+    }
+    index = {
+        "kind": "espn-discovery-detail-index-v1",
+        "discovery_raw_ref": dropdown_ref,
+        "captured_at": raw["captured_at"],
+        "batch_ids": ["batch-1"],
+        "batch_refs": [batch_ref],
+        "competition_count": 1,
+        "competition_cap": espn_native_tasks.MAX_DISCOVERY_COMPETITIONS,
+        "detail_request_cap": espn_native_tasks.MAX_DISCOVERY_DETAIL_REQUESTS,
+    }
+    phase = {
+        "kind": "espn-discovery-detail-phase-v1",
+        "batch_id": "batch-1",
+        "discovery_detail_batch_ref": batch_ref,
+        "details": [
+            {
+                **competition,
+                "metadata_raw_uri": "s3://raw/ita-metadata.json",
+                "metadata_raw_sha256": "f" * 64,
+                "scoreboard_raw_uri": "s3://raw/ita-scoreboard.json",
+                "scoreboard_raw_sha256": "1" * 64,
+                "summary_raw_uri": "s3://raw/ita-summary.json",
+                "summary_raw_sha256": "2" * 64,
+                "summary_event_id": "401000001",
+                "request_count": 3,
+                "direct_bytes": 3,
+                "proxy_bytes": 0,
+            }
+        ],
+    }
+    payload_by_uri = {
+        dropdown_ref["uri"]: raw,
+        index_ref["uri"]: index,
+        batch_ref["uri"]: batch,
+        phase_ref["uri"]: phase,
+    }
+    dropdown = {
+        "sports": [
+            {
+                "leagues": [
+                    {"id": "730", "slug": "ita.1", "displayName": "Italian Serie A"}
+                ]
+            }
+        ]
+    }
+    saved = {
+        "s3://raw/ita-metadata.json": (
+            ROOT / "tests/fixtures/espn/native_competition_detail.json"
+        ).read_bytes(),
+        "s3://raw/ita-scoreboard.json": (
+            ROOT / "tests/fixtures/espn/native_scoreboard.json"
+        ).read_bytes(),
+        "s3://raw/ita-summary.json": (
+            ROOT / "tests/fixtures/espn/native_summary.json"
+        ).read_bytes(),
+    }
+    written = []
+    alert_snapshots = []
+    registry = validate_registry_document(
+        {
+            "schema_version": 1,
+            "registry_version": "fixture-2020",
+            "as_of": "2020-08-01",
+            "competitions": [
+                {
+                    "espn_id": 730,
+                    "slug": "ita.1",
+                    "name": "Italian Serie A",
+                    "enabled": True,
+                    "gender": "MALE",
+                    "age_class": "SENIOR",
+                    "gender_evidence": ["fixture core detail"],
+                    "age_class_evidence": ["fixture operator review"],
+                    "legacy": None,
+                    "editions": [
+                        {
+                            "source_season_year": 2020,
+                            "display_name": "2020-21 Italian Serie A",
+                            "start_date": "2020-08-01",
+                            "end_date": "2021-07-31",
+                            "current": True,
+                            "capabilities": {
+                                "schedule": "proven",
+                                "lineup": "partial",
+                                "matchsheet": "partial",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_ref",
+        lambda ref, **_kwargs: payload_by_uri[ref["uri"]],
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        lambda _uri: SimpleNamespace(
+            load_exact=lambda uri, _sha: (
+                json.dumps(dropdown).encode() if uri == raw["raw_uri"] else saved[uri]
+            )
+        ),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(espn_native_tasks, "_optional_payload", lambda *_a, **_k: None)
+    monkeypatch.setattr(espn_native_tasks, "load_registry", lambda _path: registry)
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(
+            lambda _cls: SimpleNamespace(
+                current_time=lambda: datetime(2026, 8, 1, tzinfo=timezone.utc)
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "evaluate_alerts",
+        lambda snapshot, **_kwargs: alert_snapshots.append(snapshot) or (),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_run_identity",
+        lambda _context: (
+            "dag_discover_espn_registry",
+            "run-1",
+            datetime(2026, 8, 1, tzinfo=timezone.utc),
+        ),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_attempt", lambda _context: 1)
+    monkeypatch.delenv("ESPN_DISCOVERY_PREVIOUS_URI", raising=False)
+
+    def write(uri, payload, **_kwargs):
+        written.append(payload)
+        return {"uri": uri, "sha256": hashlib.sha256(uri.encode()).hexdigest()}
+
+    monkeypatch.setattr(espn_native_tasks, "_write_payload", write)
+
+    result = espn_native_tasks.write_reviewable_discovery_diff(
+        discovery_detail_index_ref=index_ref,
+        discovery_detail_phase_refs=[{"discovery_detail_phase_ref": phase_ref}],
+        params={"attempt": 1},
+    )
+
+    candidate = next(
+        payload for payload in written if payload.get("source") is not None
+    )["candidates"][0]
+    review = next(
+        payload
+        for payload in written
+        if payload.get("kind") == "espn-discovery-review-v1"
+    )
+    assert candidate["name"] == "Italian Serie A"
+    assert candidate["gender"] == "MALE"
+    assert candidate["gender_evidence"] == ["core-detail.gender=MALE"]
+    assert candidate["source_season_year"] == 2020
+    assert candidate["edition_display_name"] == "2020-21 Italian Serie A"
+    assert candidate["start_date"] == "2020-08-01"
+    assert candidate["end_date"] == "2021-07-31"
+    assert candidate["capabilities"] == {
+        "schedule": "proven",
+        "lineup": "partial",
+        "matchsheet": "partial",
+    }
+    assert alert_snapshots[0]["direct_requests"] == 4
+    assert alert_snapshots[0]["request_budget"] == (
+        1 + espn_native_tasks.MAX_DISCOVERY_DETAIL_REQUESTS
+    )
+    assert review["promotion_performed"] is False
+    assert result["discovery_review_ref"]["uri"].endswith("reviewable-diff.json")
+
+
+def test_discovery_review_retry_replays_checkpoint_without_recomputation(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    index_ref = {"uri": "s3://artifacts/index.json", "sha256": "a" * 64}
+    phase_ref = {"uri": "s3://artifacts/phase.json", "sha256": "b" * 64}
+    candidate_ref = {"uri": "s3://artifacts/candidate.json", "sha256": "c" * 64}
+    candidate = {
+        "captured_at": "2026-08-01T00:00:00+00:00",
+        "candidates": [{"espn_id": 730, "slug": "ita.1"}],
+        "source": "committed retry fixture",
+    }
+    candidate_identity = hashlib.sha256(
+        espn_native_tasks._canonical_bytes(candidate["candidates"])
+    ).hexdigest()
+    review = {
+        "kind": "espn-discovery-review-v1",
+        "schema_version": 2,
+        "discovery_detail_index_ref": index_ref,
+        "discovery_detail_phase_refs": [phase_ref],
+        "candidate_ref": candidate_ref,
+        "candidate_identity": candidate_identity,
+        "registry_signature": "d" * 64,
+        "quarantined_scopes": [],
+        "changes": [],
+        "change_count": 0,
+        "unresolved_discovery_diffs": False,
+        "alerts": [],
+        "promotion_performed": False,
+        "observed_at": "2026-08-01T00:00:00+00:00",
+    }
+    review_ref = {"uri": "s3://artifacts/reviewable-diff.json", "sha256": "e" * 64}
+    writes = []
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_run_identity",
+        lambda _context: (
+            "dag_discover_espn_registry",
+            "run-1",
+            datetime(2026, 8, 1, tzinfo=timezone.utc),
+        ),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_optional_payload",
+        lambda uri, **_kwargs: review if uri.endswith("reviewable-diff.json") else None,
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_ref",
+        lambda ref, **_kwargs: (
+            candidate
+            if ref == candidate_ref
+            else pytest.fail("retry must not reread discovery inputs")
+        ),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_ref_for_uri", lambda _uri: review_ref)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda uri, payload, **kwargs: (
+            writes.append((uri, payload, kwargs)) or {"uri": uri, "sha256": "f" * 64}
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(
+            lambda _cls: pytest.fail("retry must not read a new database clock")
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "load_registry",
+        lambda _path: pytest.fail("retry must not recompute mutable registry state"),
+    )
+
+    result = espn_native_tasks.write_reviewable_discovery_diff(
+        discovery_detail_index_ref=index_ref,
+        discovery_detail_phase_refs=[{"discovery_detail_phase_ref": phase_ref}],
+    )
+
+    assert result == {"discovery_review_ref": review_ref}
+    assert len(writes) == 1
+    latest_uri, latest_state, kwargs = writes[0]
+    assert latest_uri.endswith("/discovery/latest-state.json")
+    assert latest_state["candidate_identity"] == candidate_identity
+    assert latest_state["review_ref"] == review_ref
+    assert kwargs == {"immutable": False}
+
+
+def test_shipped_finished_current_scopes_plan_safely_for_every_daily_shard(
+    monkeypatch,
+):
+    """Euro/Copa must be signed no-ops on non-reconciliation weekdays."""
+
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.registry import DEFAULT_REGISTRY_PATH, load_registry
+
+    registry = load_registry(DEFAULT_REGISTRY_PATH)
+    finished = [registry.by_id[781], registry.by_id[780]]
+    head = SimpleNamespace(
+        snapshot_uri="s3://artifacts/prior.json",
+        snapshot_sha256="a" * 64,
+        scope_id=None,
+        generation_id="prior-generation",
+        generation_signature="b" * 64,
+        manifest_sha256="c" * 64,
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "load_scope_snapshot",
+        lambda *_args, expected_scope_id, **_kwargs: SimpleNamespace(
+            plan=espn_native_tasks._scope_plan(registry, expected_scope_id),
+            schedule=(),
+        ),
+    )
+
+    for competition in finished:
+        scope = espn_native_tasks._scope_plan(
+            registry, competition.scope_id(competition.current_edition)
+        )
+        observed_activity = []
+        for offset in range(7):
+            as_of = date(2026, 8, 1) + timedelta(days=offset)
+            current_head = SimpleNamespace(
+                **{**head.__dict__, "scope_id": scope.scope_id}
+            )
+            binding = espn_native_tasks._scope_binding(
+                head=current_head,
+                scope=scope,
+                run_id=f"daily-{as_of}",
+                attempt=1,
+                mode="daily",
+                root="s3://artifacts/run",
+                ingested_at=datetime.combine(
+                    as_of, datetime.min.time(), tzinfo=timezone.utc
+                ),
+                as_of=as_of,
+            )
+            typed = espn_native_tasks.runner._scope_binding(binding, scope.scope_id)
+            requests = espn_native_tasks.runner._scoreboard_requests(
+                scope, typed, as_of=as_of, mode="daily"
+            )
+            assert binding["active"] is bool(requests)
+            if not requests:
+                assert binding["prior"] is not None
+            observed_activity.append(binding["active"])
+        assert any(observed_activity)
+        assert not all(observed_activity)
+
+
+def test_expired_same_owner_acquisition_reclaims_instead_of_failing(monkeypatch):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.operations import LeaseLost, MemoryScopeLeaseStore
+
+    now = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+    expired = MemoryScopeLeaseStore().acquire_many(
+        ("700:2026",),
+        owner_id="dag_ingest_espn/run-1/1",
+        plan_signature="a" * 64,
+        now=now - timedelta(hours=10),
+        ttl=timedelta(hours=1),
+    )[0]
+    replacement = replace(
+        expired,
+        epoch=expired.epoch + 1,
+        token_sha256="b" * 64,
+        acquired_at=now,
+        expires_at=now + timedelta(hours=9),
+    )
+    calls = []
+
+    class Store:
+        def migrate(self):
+            pass
+
+        def read_owner_leases(self, _owner):
+            return (expired,)
+
+        def assert_owned(self, _lease, **_kwargs):
+            raise LeaseLost("expired")
+
+        def reclaim_owner_many(self, *_args, **_kwargs):
+            calls.append(_kwargs)
+            return (replacement,)
+
+    admission = {
+        "kind": "espn-airflow-admission-v1",
+        "dag_id": "dag_ingest_espn",
+        "run_id": "run-1",
+        "attempt": 1,
+        "scope_ids": ["700:2026"],
+        "artifact_root": "s3://artifacts/run",
+        "logical_date": now.isoformat(),
+    }
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: admission)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_run_identity",
+        lambda _context: ("dag_ingest_espn", "run-1", now),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: Store()),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda uri, _payload, **_kwargs: {"uri": uri, "sha256": "d" * 64},
+    )
+
+    result = espn_native_tasks.acquire_scope_leases(
+        admission_ref={"uri": "admission", "sha256": "a" * 64}
+    )
+
+    assert result["lease_acquisition_ref"]["uri"].endswith("lease-acquisition.json")
+    assert len(calls) == 1
+    assert calls[0]["ttl"] >= timedelta(hours=8)
+
+
+def test_bound_lease_heartbeat_renews_at_long_running_boundary(monkeypatch):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.operations import MemoryScopeLeaseStore
+
+    now = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+    lease = MemoryScopeLeaseStore().acquire_many(
+        ("700:2026",),
+        owner_id="dag/run/1",
+        plan_signature="a" * 64,
+        now=now,
+        ttl=timedelta(hours=1),
+    )[0]
+    renewed = replace(lease, expires_at=now + timedelta(hours=9))
+    calls = []
+
+    class Store:
+        def renew(self, current, **kwargs):
+            calls.append((current, kwargs))
+            return renewed
+
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_binding",
+        lambda _ref: ({}, {}, SimpleNamespace(), SimpleNamespace(), lease),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: Store()),
+    )
+
+    assert (
+        espn_native_tasks._heartbeat_scope_binding({"uri": "x", "sha256": "e" * 64})
+        == renewed
+    )
+    assert calls[0][0] == lease
+    assert calls[0][1]["ttl"] >= timedelta(hours=8)
+
+
+def test_stale_cleanup_cannot_release_same_owner_reclaimed_epoch(monkeypatch):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.operations import MemoryScopeLeaseStore
+
+    store = MemoryScopeLeaseStore()
+    acquired_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    owner = "dag_ingest_espn/run-1/1"
+    old = store.acquire_many(
+        ("700:2026",),
+        owner_id=owner,
+        plan_signature="a" * 64,
+        now=acquired_at,
+        ttl=timedelta(hours=1),
+    )[0]
+    replacement = store.acquire_many(
+        ("700:2026",),
+        owner_id=owner,
+        plan_signature="a" * 64,
+        now=acquired_at + timedelta(hours=2),
+        ttl=timedelta(hours=9),
+    )[0]
+    acquisition = {
+        "kind": "espn-lease-acquisition-v2",
+        "schema_version": 2,
+        "owner_id": owner,
+        "scope_ids": ["700:2026"],
+        "leases": [espn_native_tasks._lease_to_dict(old)],
+    }
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_ref",
+        lambda *_args, **_kwargs: acquisition,
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: store),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_run_identity",
+        lambda _context: (
+            "dag_ingest_espn",
+            "run-1",
+            acquired_at + timedelta(hours=2),
+        ),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_attempt", lambda _context: 1)
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda uri, _payload, **_kwargs: {"uri": uri, "sha256": "b" * 64},
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="cleanup failures"):
+        espn_native_tasks.release_scope_leases(
+            lease_acquisition_ref={"uri": "acquisition", "sha256": "c" * 64}
+        )
+
+    assert store.current("700:2026") == replacement
 
 
 def test_operational_metrics_read_exact_raw_and_summary_budget(monkeypatch):
@@ -517,6 +1693,9 @@ def test_summary_mapped_retry_resumes_only_missing_exact_request(monkeypatch):
         lambda _ref: ({}, descriptor, loaded, scope, object()),
     )
     monkeypatch.setattr(
+        espn_native_tasks, "_heartbeat_scope_binding", lambda _ref: object()
+    )
+    monkeypatch.setattr(
         espn_native_tasks.EspnRawStore, "from_uri", lambda _uri: object()
     )
     monkeypatch.setattr(
@@ -623,6 +1802,9 @@ def test_scoreboard_mapped_retry_resumes_only_missing_exact_request(monkeypatch)
         lambda _ref: ({}, descriptor, loaded, scope, object()),
     )
     monkeypatch.setattr(
+        espn_native_tasks, "_heartbeat_scope_binding", lambda _ref: object()
+    )
+    monkeypatch.setattr(
         espn_native_tasks.runner,
         "_scoreboard_requests",
         lambda *_args, **_kwargs: requests,
@@ -717,12 +1899,13 @@ def test_publish_scope_recovers_crash_after_complete_from_durable_intent(
     monkeypatch,
 ):
     from dags.utils import espn_native_tasks
-    from scrapers.espn.operations import PublicationFence
+    from scrapers.espn.operations import PublicationFence, ScopeHead
     from scrapers.espn.repository import ScopePublicationState
 
     artifacts = {}
     crash_evidence_once = True
     prepared_at = datetime(2026, 7, 31, 12, tzinfo=timezone.utc)
+    logical_completed_at = prepared_at - timedelta(days=1)
     clock_values = iter(prepared_at.replace(second=second) for second in range(8))
     scope = SimpleNamespace(scope_id="700:2026")
     loaded = SimpleNamespace(
@@ -735,6 +1918,20 @@ def test_publish_scope_recovers_crash_after_complete_from_durable_intent(
         generation_id="generation-current",
         generation_signature="c" * 64,
         manifest_sha256="d" * 64,
+        run_id="run-current",
+        registry_signature="b" * 64,
+        plan_signature="a" * 64,
+        ingested_at=logical_completed_at,
+    )
+    old_generation = SimpleNamespace(
+        plan=scope,
+        generation_id="generation-old",
+        generation_signature="8" * 64,
+        manifest_sha256="9" * 64,
+        run_id="run-old",
+        registry_signature="7" * 64,
+        plan_signature="6" * 64,
+        ingested_at=logical_completed_at - timedelta(days=1),
     )
     lease = SimpleNamespace(epoch=7)
     descriptor = {
@@ -753,6 +1950,21 @@ def test_publish_scope_recovers_crash_after_complete_from_durable_intent(
         "proxy_bytes": 0,
     }
     recorded = []
+    order = []
+    legacy_head = ScopeHead(
+        dag_id=descriptor["dag_id"],
+        scope_id=scope.scope_id,
+        generation_id=old_generation.generation_id,
+        generation_signature=old_generation.generation_signature,
+        manifest_sha256=old_generation.manifest_sha256,
+        snapshot_uri="s3://artifacts/scope/generation-old.json",
+        snapshot_sha256="5" * 64,
+        registry_signature=old_generation.registry_signature,
+        plan_signature=old_generation.plan_signature,
+        run_id=old_generation.run_id,
+        published_at=prepared_at - timedelta(days=1),
+        completed_at=None,
+    )
 
     def write_artifact(uri, body, **_kwargs):
         nonlocal crash_evidence_once
@@ -764,32 +1976,59 @@ def test_publish_scope_recovers_crash_after_complete_from_durable_intent(
             raise AssertionError(f"immutable conflict at {uri}")
 
     class Store:
+        def __init__(self):
+            self.head = legacy_head
+
         def renew(self, current, **_kwargs):
             return current
 
         def read_scope_heads_owned(self, _leases, **_kwargs):
-            return {}
+            return {scope.scope_id: self.head}
+
+        def hydrate_head_completed_at(
+            self, _lease, expected, *, completed_at, **_kwargs
+        ):
+            assert expected == self.head
+            self.head = replace(expected, completed_at=completed_at)
+            return self.head
 
         def publication_guard(self, _lease, **_kwargs):
+            def record(head, evidence):
+                recorded.append((head, evidence))
+                if head is not None:
+                    self.head = head
+                return self.head
+
             fence = PublicationFence(
                 lambda: None,
-                lambda head, evidence: recorded.append((head, evidence)),
+                record,
                 lambda: next(clock_values),
             )
             return nullcontext(fence)
 
+    store = Store()
+    bronze_current = {"generation": old_generation}
     publication_states = iter(
         (ScopePublicationState.PUBLISHED, ScopePublicationState.IDEMPOTENT)
     )
 
     class Repository:
-        def exact_complete_exists(self, _generation):
-            return False
+        def verify_current_scope_selection(self, current_generation):
+            order.append(f"verify-{current_generation.generation_id}")
+            if current_generation is not bronze_current["generation"]:
+                raise RuntimeError("generation is not current")
+            return {}
+
+        def exact_complete_exists(self, current_generation):
+            return current_generation is bronze_current["generation"]
 
         def publish_scope(self, current_generation, *, publication_fence):
+            order.append("publish")
             publication_fence()
+            state = next(publication_states)
+            bronze_current["generation"] = current_generation
             return SimpleNamespace(
-                state=next(publication_states),
+                state=state,
                 manifest_sha256=current_generation.manifest_sha256,
             )
 
@@ -802,7 +2041,9 @@ def test_publish_scope_recovers_crash_after_complete_from_durable_intent(
     monkeypatch.setattr(
         espn_native_tasks.runner,
         "load_scope_snapshot",
-        lambda *_args, **_kwargs: generation,
+        lambda uri, **_kwargs: (
+            old_generation if uri == legacy_head.snapshot_uri else generation
+        ),
     )
     monkeypatch.setattr(
         espn_native_tasks, "_assert_generation_binding", lambda **_: None
@@ -818,7 +2059,7 @@ def test_publish_scope_recovers_crash_after_complete_from_durable_intent(
     monkeypatch.setattr(
         espn_native_tasks.PostgresEspnControlStore,
         "from_env",
-        classmethod(lambda _cls: Store()),
+        classmethod(lambda _cls: store),
     )
     monkeypatch.setattr(espn_native_tasks, "EspnBronzeRepository", Repository)
     monkeypatch.setattr(
@@ -843,8 +2084,502 @@ def test_publish_scope_recovers_crash_after_complete_from_durable_intent(
 
     assert result["publication_ref"]["uri"].endswith("publication-result.json")
     assert recorded[0][0].published_at == prepared_at
+    assert recorded[0][0].completed_at == logical_completed_at
+    assert recorded[0][0].completed_at != recorded[0][0].published_at
     assert recorded[0][1].recorded_at == prepared_at
     assert any(uri.endswith("publication-intent.json") for uri in artifacts)
+    assert store.head.generation_id == generation.generation_id
+    assert order == [
+        "verify-generation-current",
+        "verify-generation-old",
+        "publish",
+        "verify-generation-current",
+        "verify-generation-current",
+        "publish",
+    ]
+
+
+def test_publish_scope_reconciles_legacy_old_head_to_existing_current_complete(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.operations import PublicationFence, ScopeHead
+    from scrapers.espn.repository import ScopePublicationState
+
+    artifacts = {}
+    publication_time = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+    old_completed_at = publication_time - timedelta(days=2)
+    new_completed_at = publication_time - timedelta(days=1)
+    scope = SimpleNamespace(scope_id="700:2026")
+    loaded = SimpleNamespace(
+        plan=SimpleNamespace(run_id="run-new", registry_signature="b" * 64),
+        attempt=1,
+        signature="a" * 64,
+    )
+    old_generation = SimpleNamespace(
+        plan=scope,
+        generation_id="generation-old",
+        generation_signature="c" * 64,
+        manifest_sha256="d" * 64,
+        run_id="run-old",
+        registry_signature="b" * 64,
+        plan_signature="9" * 64,
+        ingested_at=old_completed_at,
+    )
+    generation = SimpleNamespace(
+        plan=scope,
+        generation_id="generation-new",
+        generation_signature="e" * 64,
+        manifest_sha256="f" * 64,
+        run_id="run-new",
+        registry_signature="b" * 64,
+        plan_signature="a" * 64,
+        ingested_at=new_completed_at,
+    )
+    snapshot_ref = {
+        "uri": "s3://artifacts/scope/generation-new.json",
+        "sha256": "1" * 64,
+    }
+    old_head = ScopeHead(
+        dag_id="dag_ingest_espn",
+        scope_id=scope.scope_id,
+        generation_id=old_generation.generation_id,
+        generation_signature=old_generation.generation_signature,
+        manifest_sha256=old_generation.manifest_sha256,
+        snapshot_uri="s3://artifacts/scope/generation-old.json",
+        snapshot_sha256="2" * 64,
+        registry_signature=old_generation.registry_signature,
+        plan_signature=old_generation.plan_signature,
+        run_id=old_generation.run_id,
+        published_at=publication_time - timedelta(days=1, hours=12),
+        completed_at=None,
+    )
+    lease = SimpleNamespace(epoch=4)
+    dq = {
+        "scope_binding_ref": {"uri": "binding", "sha256": "3" * 64},
+        "snapshot_ref": snapshot_ref,
+        "state": "complete",
+        "quality": {"passed": True},
+        "direct_requests": 3,
+        "proxy_bytes": 0,
+    }
+    descriptor = {
+        "dag_id": "dag_ingest_espn",
+        "scope_root": "s3://artifacts/scope",
+    }
+    intent_prepared_at = publication_time - timedelta(hours=6)
+    intent_identity = espn_native_tasks._publication_intent_identity(
+        dag_id=descriptor["dag_id"],
+        loaded=loaded,
+        scope=scope,
+        generation=generation,
+        snapshot_ref=snapshot_ref,
+    )
+    artifacts["s3://artifacts/scope/publication-intent.json"] = (
+        espn_native_tasks._canonical_bytes(
+            {
+                "kind": "espn-publication-intent-v1",
+                "schema_version": 1,
+                **intent_identity,
+                "prepared_at": intent_prepared_at.isoformat(),
+            }
+        )
+    )
+    verify_order = []
+    publish_calls = []
+
+    class Store:
+        def __init__(self):
+            self.head = old_head
+            self.hydrated = False
+
+        def renew(self, current, **_kwargs):
+            return current
+
+        def read_scope_heads_owned(self, _leases, **_kwargs):
+            return {scope.scope_id: self.head}
+
+        def hydrate_head_completed_at(
+            self, _lease, expected, *, completed_at, **_kwargs
+        ):
+            assert expected == self.head
+            assert completed_at == old_completed_at
+            self.hydrated = True
+            self.head = replace(expected, completed_at=completed_at)
+            return self.head
+
+        def publication_guard(self, _lease, **_kwargs):
+            def record(head, _evidence):
+                assert self.hydrated is True
+                self.head = head
+                return head
+
+            return nullcontext(
+                PublicationFence(lambda: None, record, lambda: publication_time)
+            )
+
+    store = Store()
+
+    class Repository:
+        def verify_current_scope_selection(self, current_generation):
+            verify_order.append(current_generation.generation_id)
+            if current_generation is old_generation:
+                raise RuntimeError("old generation is no longer current")
+            assert current_generation is generation
+            return {"schedule": 1}
+
+        def exact_complete_exists(self, current_generation):
+            assert (
+                current_generation is generation or current_generation is old_generation
+            )
+            return True
+
+        def publish_scope(self, current_generation, *, publication_fence):
+            assert current_generation is generation
+            publish_calls.append(current_generation.generation_id)
+            publication_fence()
+            return SimpleNamespace(
+                state=ScopePublicationState.IDEMPOTENT,
+                manifest_sha256=current_generation.manifest_sha256,
+            )
+
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: dq)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_binding",
+        lambda _ref: ({}, descriptor, loaded, scope, lease),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "load_scope_snapshot",
+        lambda uri, **_kwargs: (
+            old_generation if uri == old_head.snapshot_uri else generation
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_assert_generation_binding", lambda **_kwargs: None
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "validate_scope_generation",
+        lambda _generation: SimpleNamespace(passed=True),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_quality_payload", lambda _quality: {"passed": True}
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: store),
+    )
+    monkeypatch.setattr(espn_native_tasks, "EspnBronzeRepository", Repository)
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "_read_artifact",
+        lambda uri: (
+            artifacts[uri]
+            if uri in artifacts
+            else (_ for _ in ()).throw(FileNotFoundError(uri))
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "_write_artifact",
+        lambda uri, body, **_kwargs: artifacts.setdefault(uri, body),
+    )
+
+    espn_native_tasks.publish_scope(staging_dq_ref={"uri": "dq", "sha256": "4" * 64})
+
+    intent = json.loads(
+        next(
+            body
+            for uri, body in artifacts.items()
+            if uri.endswith("publication-intent.json")
+        )
+    )
+    assert intent["schema_version"] == 1
+    assert set(intent) == {
+        "kind",
+        "schema_version",
+        *intent_identity,
+        "prepared_at",
+    }
+    assert store.head.generation_id == generation.generation_id
+    assert store.head.completed_at == new_completed_at
+    assert store.head.published_at == intent_prepared_at
+    assert publish_calls == [generation.generation_id]
+    assert verify_order == [
+        generation.generation_id,
+        old_generation.generation_id,
+        generation.generation_id,
+    ]
+
+
+def test_resumed_noop_hydrates_legacy_head_before_recording_evidence(monkeypatch):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.operations import PublicationFence, ScopeHead
+
+    completed_at = datetime(2026, 7, 31, 12, tzinfo=timezone.utc)
+    scope = SimpleNamespace(scope_id="700:2026")
+    loaded = SimpleNamespace(
+        plan=SimpleNamespace(run_id="run-noop", registry_signature="b" * 64),
+        attempt=1,
+        signature="a" * 64,
+    )
+    generation = SimpleNamespace(
+        plan=scope,
+        generation_id="generation-prior",
+        generation_signature="c" * 64,
+        manifest_sha256="d" * 64,
+        run_id="prior-run",
+        registry_signature="b" * 64,
+        plan_signature="a" * 64,
+        ingested_at=completed_at,
+    )
+    snapshot_ref = {"uri": "s3://scope/generation.json", "sha256": "f" * 64}
+    head = ScopeHead(
+        dag_id="dag_ingest_espn",
+        scope_id=scope.scope_id,
+        generation_id=generation.generation_id,
+        generation_signature=generation.generation_signature,
+        manifest_sha256=generation.manifest_sha256,
+        snapshot_uri=snapshot_ref["uri"],
+        snapshot_sha256=snapshot_ref["sha256"],
+        registry_signature=generation.registry_signature,
+        plan_signature=generation.plan_signature,
+        run_id=generation.run_id,
+        published_at=completed_at,
+        completed_at=None,
+    )
+    lease = SimpleNamespace(epoch=4)
+    payloads = []
+    order = []
+
+    class Store:
+        def renew(self, current, **_kwargs):
+            return current
+
+        def read_scope_heads_owned(self, _leases, **_kwargs):
+            return {scope.scope_id: head}
+
+        def hydrate_head_completed_at(
+            self, _lease, expected, *, completed_at, **_kwargs
+        ):
+            order.append("hydrate")
+            return replace(expected, completed_at=completed_at)
+
+        def publication_guard(self, _lease, **_kwargs):
+            return nullcontext(
+                PublicationFence(
+                    lambda: None,
+                    lambda published_head, _evidence: (
+                        order.append("record") or published_head
+                    ),
+                    lambda: completed_at,
+                )
+            )
+
+    class Repository:
+        def exact_complete_exists(self, current_generation):
+            assert current_generation is generation
+            return True
+
+        def verify_current_scope_selection(self, current_generation):
+            order.append("verify-current")
+            assert current_generation is generation
+            return {}
+
+        def publish_scope(self, *_args, **_kwargs):
+            raise AssertionError("no-op must not append a COMPLETE manifest")
+
+    dq = {
+        "kind": "espn-staging-dq-result-v1",
+        "scope_binding_ref": {"uri": "binding", "sha256": "e" * 64},
+        "snapshot_ref": snapshot_ref,
+        "state": "noop",
+        "quality": {"passed": True},
+        "direct_requests": 0,
+        "proxy_bytes": 0,
+    }
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: dq)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_binding",
+        lambda _ref: (
+            {},
+            {"dag_id": "dag_ingest_espn", "scope_root": "s3://scope"},
+            loaded,
+            scope,
+            lease,
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "load_scope_snapshot",
+        lambda *_args, **_kwargs: generation,
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "_read_artifact",
+        lambda uri: (_ for _ in ()).throw(FileNotFoundError(uri)),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_assert_generation_binding", lambda **_kwargs: None
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "validate_scope_generation",
+        lambda _generation: SimpleNamespace(passed=True),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_quality_payload", lambda _quality: {"passed": True}
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: Store()),
+    )
+    monkeypatch.setattr(espn_native_tasks, "EspnBronzeRepository", Repository)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda uri, payload, **_kwargs: (
+            payloads.append(payload) or {"uri": uri, "sha256": "0" * 64}
+        ),
+    )
+
+    espn_native_tasks.publish_scope(staging_dq_ref={"uri": "dq", "sha256": "1" * 64})
+
+    publication = next(
+        payload
+        for payload in payloads
+        if payload.get("kind") == "espn-publication-result-v1"
+    )
+    assert publication["selected_head"]["completed_at"] == completed_at.isoformat()
+    assert order[:3] == ["verify-current", "hydrate", "record"]
+
+
+def test_legacy_head_divergence_fails_before_hydration(monkeypatch):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.operations import ScopeHead
+
+    logical = datetime(2026, 7, 31, 12, tzinfo=timezone.utc)
+    head = ScopeHead(
+        dag_id="dag_ingest_espn",
+        scope_id="700:2026",
+        generation_id="delayed-older",
+        generation_signature="a" * 64,
+        manifest_sha256="b" * 64,
+        snapshot_uri="s3://scope/older.json",
+        snapshot_sha256="c" * 64,
+        registry_signature="d" * 64,
+        plan_signature="e" * 64,
+        run_id="older-run",
+        published_at=logical + timedelta(days=1),
+        completed_at=None,
+    )
+    generation = SimpleNamespace(
+        plan=SimpleNamespace(scope_id=head.scope_id),
+        generation_id=head.generation_id,
+        generation_signature=head.generation_signature,
+        manifest_sha256=head.manifest_sha256,
+        run_id=head.run_id,
+        registry_signature=head.registry_signature,
+        plan_signature=head.plan_signature,
+        ingested_at=logical,
+    )
+    candidate = SimpleNamespace(
+        plan=SimpleNamespace(scope_id=head.scope_id),
+        generation_id="unrelated-candidate",
+        generation_signature="f" * 64,
+        manifest_sha256="1" * 64,
+        run_id="unrelated-run",
+        registry_signature="2" * 64,
+        plan_signature="3" * 64,
+        ingested_at=logical + timedelta(hours=1),
+    )
+    hydrated = []
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "load_scope_snapshot",
+        lambda *_args, **_kwargs: generation,
+    )
+    repository = SimpleNamespace(
+        verify_current_scope_selection=lambda _generation: (_ for _ in ()).throw(
+            RuntimeError("newer Bronze generation is current")
+        )
+    )
+    store = SimpleNamespace(
+        hydrate_head_completed_at=lambda *_args, **_kwargs: hydrated.append(True)
+    )
+
+    with pytest.raises(
+        espn_native_tasks.OperationsError, match="repair the control head"
+    ):
+        espn_native_tasks._prepare_scope_head_for_publication(
+            store=store,
+            lease=SimpleNamespace(),
+            head=head,
+            repository=repository,
+            state="complete",
+            dag_id="dag_ingest_espn",
+            generation=candidate,
+            snapshot_ref={"uri": "candidate", "sha256": "4" * 64},
+        )
+
+    assert hydrated == []
+
+
+def test_reclaimed_retry_accepts_exact_immutable_evidence_from_prior_epoch():
+    from dags.utils import espn_native_tasks
+
+    recorded_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    loaded = SimpleNamespace(
+        plan=SimpleNamespace(run_id="run-1", registry_signature="b" * 64),
+        attempt=1,
+        signature="a" * 64,
+    )
+    scope = SimpleNamespace(scope_id="700:2026")
+    generation = SimpleNamespace(
+        generation_id="generation-1",
+        generation_signature="c" * 64,
+        manifest_sha256="d" * 64,
+    )
+    payload = espn_native_tasks._evidence_payload(
+        dag_id="dag_ingest_espn",
+        loaded=loaded,
+        scope=scope,
+        state="complete",
+        generation=generation,
+        lease=SimpleNamespace(epoch=7),
+        recorded_at=recorded_at,
+        publication_intent_ref={"uri": "intent", "sha256": "e" * 64},
+    )
+
+    espn_native_tasks._validate_evidence_payload(
+        payload,
+        dag_id="dag_ingest_espn",
+        loaded=loaded,
+        scope=scope,
+        state="complete",
+        generation=generation,
+        lease=SimpleNamespace(epoch=8),
+        recorded_at=recorded_at,
+        publication_intent_ref={"uri": "intent", "sha256": "e" * 64},
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="not recoverable"):
+        espn_native_tasks._validate_evidence_payload(
+            payload,
+            dag_id="dag_ingest_espn",
+            loaded=loaded,
+            scope=scope,
+            state="complete",
+            generation=generation,
+            lease=SimpleNamespace(epoch=6),
+            recorded_at=recorded_at,
+            publication_intent_ref={"uri": "intent", "sha256": "e" * 64},
+        )
 
 
 def test_publication_intent_cannot_be_created_after_exact_complete(monkeypatch):

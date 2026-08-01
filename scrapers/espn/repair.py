@@ -417,7 +417,8 @@ VALUES
 {expected}
 ), schedule AS (
 SELECT league, CAST(season AS varchar) AS season, game, TRY_CAST(game_id AS bigint) AS game_id,
-       CAST(match_date AS date) AS match_date, status, home_goals, away_goals
+       CAST(match_date AS date) AS match_date, status, home_team, away_team,
+       home_goals, away_goals
 FROM {catalog}.{schema}.espn_schedule FOR VERSION AS OF {snapshots["espn_schedule"]}
 ), lineup AS (
 SELECT league, CAST(season AS varchar) AS season, game, team, player
@@ -457,8 +458,12 @@ FROM expected e LEFT JOIN matchsheet m
   ON m.league = e.legacy_league AND m.season = e.legacy_season
 GROUP BY e.scope_id
 ), lineup_games AS (
-SELECT league, season, game FROM lineup
-WHERE game IS NOT NULL GROUP BY league, season, game
+SELECT l.league, l.season, l.game,
+       COUNT(DISTINCT l.team) AS team_count,
+       COUNT(DISTINCT IF(l.team IN (s.home_team, s.away_team), l.team, NULL)) AS required_team_count
+FROM lineup l JOIN schedule s
+  ON s.league = l.league AND s.season = l.season AND s.game = l.game
+WHERE l.game IS NOT NULL GROUP BY l.league, l.season, l.game
 ), matchsheet_games AS (
 SELECT league, season, game, COUNT(DISTINCT team) AS team_count,
        COUNT(DISTINCT is_home) AS side_count
@@ -466,7 +471,8 @@ FROM matchsheet WHERE game IS NOT NULL GROUP BY league, season, game
 ), coverage AS (
 SELECT e.scope_id,
        COUNT_IF({final} AND (COALESCE(m.team_count, 0) != 2 OR COALESCE(m.side_count, 0) != 2)) AS matchsheet_two_side_failures,
-       COUNT_IF({final} AND l.game IS NOT NULL AND m.team_count = 2 AND m.side_count = 2) AS summary_covered_events
+       COUNT_IF({final} AND l.team_count = 2 AND l.required_team_count = 2
+         AND m.team_count = 2 AND m.side_count = 2) AS summary_covered_events
 FROM expected e LEFT JOIN schedule s
   ON s.league = e.legacy_league AND s.season = e.legacy_season
 LEFT JOIN lineup_games l ON l.league = s.league AND l.season = s.season AND l.game = s.game

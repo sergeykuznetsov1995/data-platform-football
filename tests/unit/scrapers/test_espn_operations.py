@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,8 @@ from scrapers.espn.operations import (
     PostgresEspnControlStore,
     PublicationFence,
     RunManifestEvidence,
+    ScopeHead,
+    ScopeLease,
     evaluate_alerts,
     plan_summary_batches,
     producer_state_failures,
@@ -471,6 +474,365 @@ def test_publication_fence_refreshes_clock_after_complete_boundary():
     fence()
 
     assert fence.publication_time() == after
+
+
+def _scope_head(
+    *,
+    generation_id: str,
+    completed_at: datetime,
+    published_at: datetime,
+    dag_id: str = "dag_ingest_espn",
+    run_id: str = "run-current",
+    manifest_sha256: str = "c" * 64,
+) -> ScopeHead:
+    return ScopeHead(
+        dag_id=dag_id,
+        scope_id="700:2026",
+        generation_id=generation_id,
+        generation_signature="b" * 64,
+        manifest_sha256=manifest_sha256,
+        snapshot_uri=f"s3://artifacts/{generation_id}.json",
+        snapshot_sha256="d" * 64,
+        registry_signature="e" * 64,
+        plan_signature="f" * 64,
+        run_id=run_id,
+        published_at=published_at,
+        completed_at=completed_at,
+    )
+
+
+def test_partial_same_owner_retry_reclaims_whole_bundle_with_new_epochs():
+    store = MemoryScopeLeaseStore()
+    started = datetime(2026, 8, 1, tzinfo=UTC)
+    original = store.acquire_many(
+        ("700:2026", "701:2026"),
+        owner_id="dag/run/1",
+        plan_signature="a" * 64,
+        now=started,
+        ttl=timedelta(hours=1),
+    )
+    bound = store.bind_plans(
+        original,
+        {"700:2026": "b" * 64, "701:2026": "c" * 64},
+        now=started,
+    )
+    store.renew(
+        bound[0],
+        now=started + timedelta(minutes=30),
+        ttl=timedelta(hours=3),
+    )
+
+    reclaimed = store.reclaim_owner_many(
+        bound,
+        owner_id="dag/run/1",
+        plan_signature="a" * 64,
+        now=started + timedelta(hours=2),
+        ttl=timedelta(hours=9),
+    )
+
+    assert [item.epoch for item in reclaimed] == [2, 2]
+    assert all(item.plan_signature == "a" * 64 for item in reclaimed)
+    assert {item.token_sha256 for item in reclaimed}.isdisjoint(
+        {item.token_sha256 for item in bound}
+    )
+    with pytest.raises(LeaseLost):
+        store.release(bound[0], now=started + timedelta(hours=2))
+
+
+def test_stale_same_owner_retry_cannot_reclaim_a_newer_live_epoch():
+    store = MemoryScopeLeaseStore()
+    started = datetime(2026, 8, 1, tzinfo=UTC)
+    stale = store.acquire_many(
+        ("700:2026",),
+        owner_id="dag/run/1",
+        plan_signature="a" * 64,
+        now=started,
+        ttl=timedelta(hours=1),
+    )
+    current = store.reclaim_owner_many(
+        stale,
+        owner_id="dag/run/1",
+        plan_signature="a" * 64,
+        now=started + timedelta(hours=2),
+        ttl=timedelta(hours=9),
+    )
+
+    with pytest.raises(LeaseLost, match="identity changed before reclaim"):
+        store.reclaim_owner_many(
+            stale,
+            owner_id="dag/run/1",
+            plan_signature="a" * 64,
+            now=started + timedelta(hours=3),
+            ttl=timedelta(hours=9),
+        )
+
+    assert store.current("700:2026") == current[0]
+
+
+def test_reclaim_rechecks_expiration_after_same_epoch_heartbeat():
+    store = MemoryScopeLeaseStore()
+    started = datetime(2026, 8, 1, tzinfo=UTC)
+    stale = store.acquire_many(
+        ("700:2026",),
+        owner_id="dag/run/1",
+        plan_signature="a" * 64,
+        now=started,
+        ttl=timedelta(hours=1),
+    )
+    renewed = store.renew(
+        stale[0],
+        now=started + timedelta(minutes=30),
+        ttl=timedelta(hours=3),
+    )
+
+    with pytest.raises(LeaseConflict, match="live after locked recheck"):
+        store.reclaim_owner_many(
+            stale,
+            owner_id="dag/run/1",
+            plan_signature="a" * 64,
+            now=started + timedelta(hours=2),
+            ttl=timedelta(hours=9),
+        )
+
+    assert store.current("700:2026") == renewed
+
+
+def _record_head(
+    store: MemoryScopeLeaseStore,
+    head: ScopeHead,
+    *,
+    owner: str,
+    attempt: int,
+) -> None:
+    lease = store.acquire_many(
+        (head.scope_id,),
+        owner_id=owner,
+        plan_signature=head.plan_signature,
+        now=head.published_at - timedelta(seconds=1),
+        ttl=timedelta(hours=1),
+    )[0]
+    evidence = RunManifestEvidence(
+        dag_id=head.dag_id,
+        run_id=head.run_id,
+        attempt=attempt,
+        scope_id=head.scope_id,
+        plan_signature=head.plan_signature,
+        registry_signature=head.registry_signature,
+        state="complete",
+        evidence_uri=f"s3://evidence/{head.run_id}-{attempt}.json",
+        evidence_sha256=("a" if attempt == 1 else "9") * 64,
+        recorded_at=head.published_at,
+    )
+    with store.publication_guard(lease, now=head.published_at) as fence:
+        fence.record_published(head, evidence)
+    store.release(lease, now=head.published_at)
+
+
+def test_scope_head_uses_manifest_total_order_not_wall_clock_publication_order():
+    store = MemoryScopeLeaseStore()
+    logical_new = datetime(2026, 8, 2, tzinfo=UTC)
+    logical_old = datetime(2026, 8, 1, tzinfo=UTC)
+    first = _scope_head(
+        generation_id="generation-new",
+        completed_at=logical_new,
+        published_at=datetime(2026, 8, 2, 1, tzinfo=UTC),
+        run_id="daily-new",
+    )
+    delayed = _scope_head(
+        generation_id="generation-old",
+        completed_at=logical_old,
+        published_at=datetime(2026, 8, 2, 2, tzinfo=UTC),
+        run_id="daily-delayed",
+        manifest_sha256="8" * 64,
+    )
+
+    _record_head(store, first, owner="daily/new/1", attempt=1)
+    _record_head(store, delayed, owner="daily/delayed/1", attempt=1)
+
+    assert store.read_scope_heads(("700:2026",))["700:2026"] == first
+    assert (
+        store.read_run_evidence(
+            dag_id="dag_ingest_espn", run_id="daily-delayed", attempt=1
+        )[0].scope_id
+        == "700:2026"
+    )
+
+
+def test_scope_head_equal_timestamp_retries_and_manual_runs_are_totally_ordered():
+    store = MemoryScopeLeaseStore()
+    logical = datetime(2026, 8, 2, tzinfo=UTC)
+    lower = _scope_head(
+        generation_id="generation-a",
+        completed_at=logical,
+        published_at=datetime(2026, 8, 2, 1, tzinfo=UTC),
+        run_id="daily-a",
+    )
+    higher = _scope_head(
+        generation_id="generation-b",
+        completed_at=logical,
+        published_at=datetime(2026, 8, 2, 2, tzinfo=UTC),
+        dag_id="dag_repair_espn",
+        run_id="manual-b",
+        manifest_sha256="8" * 64,
+    )
+
+    _record_head(store, lower, owner="daily/a/1", attempt=1)
+    _record_head(store, lower, owner="daily/a/2", attempt=2)
+    _record_head(store, higher, owner="repair/b/1", attempt=1)
+
+    assert store.read_scope_heads(("700:2026",))["700:2026"] == higher
+
+
+def test_postgres_publication_transaction_retains_canonical_equal_time_head():
+    logical = datetime(2026, 8, 2, tzinfo=UTC)
+    higher = _scope_head(
+        generation_id="generation-b",
+        completed_at=logical,
+        published_at=logical + timedelta(hours=1),
+        dag_id="dag_repair_espn",
+        run_id="manual-b",
+        manifest_sha256="8" * 64,
+    )
+    lower = _scope_head(
+        generation_id="generation-a",
+        completed_at=logical,
+        published_at=logical + timedelta(hours=2),
+        run_id="retry-a",
+    )
+    lease = ScopeLease(
+        scope_id=lower.scope_id,
+        owner_id="dag_ingest_espn/retry-a/2",
+        plan_signature=lower.plan_signature,
+        epoch=2,
+        token_sha256="7" * 64,
+        acquired_at=logical,
+        expires_at=logical + timedelta(hours=9),
+    )
+    evidence = RunManifestEvidence(
+        dag_id=lower.dag_id,
+        run_id=lower.run_id,
+        attempt=2,
+        scope_id=lower.scope_id,
+        plan_signature=lower.plan_signature,
+        registry_signature=lower.registry_signature,
+        state="complete",
+        evidence_uri="s3://evidence/retry-a.json",
+        evidence_sha256="6" * 64,
+        recorded_at=lower.published_at,
+    )
+    state = SimpleNamespace(
+        lease=lease,
+        head=higher,
+        evidence_row=None,
+    )
+
+    class Cursor:
+        rowcount = 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=None):
+            normalized = " ".join(sql.split())
+            self.result = None
+            if normalized == "SELECT clock_timestamp()":
+                self.result = (logical + timedelta(minutes=1),)
+            elif f"FROM {PostgresEspnControlStore.LEASE_TABLE}" in normalized:
+                self.result = (
+                    state.lease.scope_id,
+                    state.lease.owner_id,
+                    state.lease.plan_signature,
+                    state.lease.epoch,
+                    state.lease.token_sha256,
+                    state.lease.acquired_at,
+                    state.lease.expires_at,
+                )
+            elif f"FROM {PostgresEspnControlStore.HEAD_TABLE}" in normalized:
+                self.result = (
+                    state.head.dag_id,
+                    state.head.scope_id,
+                    state.head.generation_id,
+                    state.head.generation_signature,
+                    state.head.manifest_sha256,
+                    state.head.snapshot_uri,
+                    state.head.snapshot_sha256,
+                    state.head.registry_signature,
+                    state.head.plan_signature,
+                    state.head.run_id,
+                    state.head.published_at,
+                    state.head.completed_at,
+                )
+            elif normalized.startswith(
+                f"INSERT INTO {PostgresEspnControlStore.RUN_TABLE}"
+            ):
+                state.evidence_row = params
+            elif f"FROM {PostgresEspnControlStore.RUN_TABLE}" in normalized:
+                self.result = state.evidence_row
+            elif normalized.startswith(
+                f"INSERT INTO {PostgresEspnControlStore.HEAD_TABLE}"
+            ):
+                raise AssertionError("lower equal-time head must not replace control")
+
+        def fetchone(self):
+            return self.result
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+        def close(self):
+            pass
+
+    store = PostgresEspnControlStore(lambda: Connection())
+    with store.publication_guard(lease, now=logical) as fence:
+        selected = fence.record_published(lower, evidence)
+
+    assert selected == higher
+    assert state.head == higher
+    assert state.evidence_row is not None
+
+
+def test_postgres_migration_never_guesses_legacy_logical_order_from_wall_clock():
+    executed = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=None):
+            executed.append((sql, params))
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+        def close(self):
+            pass
+
+    PostgresEspnControlStore(lambda: Connection()).migrate()
+    sql = "\n".join(statement for statement, _ in executed)
+
+    assert "ADD COLUMN IF NOT EXISTS completed_at timestamptz" in sql
+    assert "SET completed_at = published_at" not in sql
+    assert "ALTER COLUMN completed_at SET NOT NULL" not in sql
 
 
 def test_two_wave_summary_batches_are_deterministic_bounded_descriptors():

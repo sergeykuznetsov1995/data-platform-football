@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 
+import duckdb
 import pytest
 
 from scrapers.espn.repair import (
@@ -248,6 +249,105 @@ def test_snapshot_sql_is_read_only_and_time_travels_all_three_tables():
     )[0]
     assert "concat(m.game, chr(31), m.team)" in matchsheet_key_sql
     assert "m.is_home IS NULL" not in matchsheet_key_sql
+
+
+def test_summary_coverage_requires_lineups_from_both_final_match_teams():
+    sql = render_top5_audit_sql(
+        {
+            "espn_schedule": 101,
+            "espn_lineup": 102,
+            "espn_matchsheet": 103,
+        }
+    )
+    lineup_games = sql.split("), lineup_games AS (", 1)[1].split(
+        "), matchsheet_games AS (", 1
+    )[0]
+    coverage = sql.split("), coverage AS (", 1)[1].split(")\nSELECT", 1)[0]
+
+    assert "COUNT(DISTINCT l.team) AS team_count" in lineup_games
+    assert (
+        "COUNT(DISTINCT IF(l.team IN (s.home_team, s.away_team), l.team, NULL)) "
+        "AS required_team_count" in lineup_games
+    )
+    assert "l.team_count = 2" in coverage
+    assert "l.required_team_count = 2" in coverage
+    assert "l.game IS NOT NULL" not in coverage
+
+
+def test_summary_coverage_sql_executes_with_exact_final_teams():
+    scope = expected_top5_scopes()[0]
+    connection = duckdb.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE espn_schedule (league VARCHAR, season VARCHAR, game VARCHAR, "
+        "game_id VARCHAR, match_date DATE, status VARCHAR, home_team VARCHAR, "
+        "away_team VARCHAR, home_goals INTEGER, away_goals INTEGER)"
+    )
+    connection.execute(
+        "CREATE TABLE espn_lineup (league VARCHAR, season VARCHAR, game VARCHAR, "
+        "team VARCHAR, player VARCHAR)"
+    )
+    connection.execute(
+        "CREATE TABLE espn_matchsheet (league VARCHAR, season VARCHAR, game VARCHAR, "
+        "team VARCHAR, is_home BOOLEAN)"
+    )
+    games = ("wrong-teams", "one-team", "correct-teams")
+    connection.executemany(
+        "INSERT INTO espn_schedule VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                scope.legacy_league,
+                scope.legacy_season,
+                game,
+                str(index),
+                scope.start_date,
+                "STATUS_FULL_TIME",
+                "Home",
+                "Away",
+                1,
+                0,
+            )
+            for index, game in enumerate(games, start=1)
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO espn_lineup VALUES (?, ?, ?, ?, ?)",
+        [
+            (scope.legacy_league, scope.legacy_season, "wrong-teams", team, player)
+            for team, player in (("Other A", "p1"), ("Other B", "p2"))
+        ]
+        + [(scope.legacy_league, scope.legacy_season, "one-team", "Home", "p3")]
+        + [
+            (scope.legacy_league, scope.legacy_season, "correct-teams", team, player)
+            for team, player in (("Home", "p4"), ("Away", "p5"))
+        ],
+    )
+    connection.executemany(
+        "INSERT INTO espn_matchsheet VALUES (?, ?, ?, ?, ?)",
+        [
+            (scope.legacy_league, scope.legacy_season, game, team, is_home)
+            for game in games
+            for team, is_home in (("Home", True), ("Away", False))
+        ],
+    )
+    sql = render_top5_audit_sql(
+        {"espn_schedule": 101, "espn_lineup": 102, "espn_matchsheet": 103}
+    )
+    executable = (
+        sql.replace(
+            "iceberg.bronze.espn_schedule FOR VERSION AS OF 101", "espn_schedule"
+        )
+        .replace("iceberg.bronze.espn_lineup FOR VERSION AS OF 102", "espn_lineup")
+        .replace(
+            "iceberg.bronze.espn_matchsheet FOR VERSION AS OF 103", "espn_matchsheet"
+        )
+    )
+
+    rows = connection.execute(executable).fetchall()
+    observed = next(item for item in rows if item[0] == scope.scope_id)
+
+    assert observed[16] == 3  # final_events
+    assert observed[18] == 3  # summary_required_events
+    assert observed[19] == 1  # summary_covered_events
 
 
 def test_validator_rejects_operator_rows_without_snapshot_provenance():

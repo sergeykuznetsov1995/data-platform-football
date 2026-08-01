@@ -1,0 +1,13 @@
+{
+  "id": "730",
+  "slug": "ita.1",
+  "name": "Italian Serie A",
+  "displayName": "Italian Serie A",
+  "gender": "MALE",
+  "season": {
+    "year": 2020,
+    "displayName": "2020-21 Italian Serie A",
+    "startDate": "2020-08-01T00:00:00Z",
+    "endDate": "2021-07-31T23:59:59Z"
+  }
+}

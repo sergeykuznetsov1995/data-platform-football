@@ -8,6 +8,8 @@ from airflow.operators.python import PythonOperator
 from utils.espn_native_tasks import (
     HTTP_POOL,
     fetch_discovery_catalog,
+    fetch_discovery_detail_batch,
+    plan_discovery_detail_batches,
     write_reviewable_discovery_diff,
 )
 
@@ -28,10 +30,29 @@ with DAG(
         retries=1,
         multiple_outputs=True,
     )
+    detail_plan = PythonOperator(
+        task_id="plan_discovery_detail_batches",
+        python_callable=plan_discovery_detail_batches,
+        op_kwargs={"discovery_raw_ref": fetch.output["discovery_raw_ref"]},
+        retries=0,
+        multiple_outputs=True,
+    )
+    detail_fetch = PythonOperator.partial(
+        task_id="fetch_discovery_detail_batches",
+        python_callable=fetch_discovery_detail_batch,
+        pool=HTTP_POOL,
+        pool_slots=1,
+        retries=1,
+    ).expand(op_kwargs=detail_plan.output["discovery_detail_batch_refs"])
     review = PythonOperator(
         task_id="write_reviewable_diff",
         python_callable=write_reviewable_discovery_diff,
-        op_kwargs={"discovery_raw_ref": fetch.output["discovery_raw_ref"]},
+        op_kwargs={
+            "discovery_detail_index_ref": detail_plan.output[
+                "discovery_detail_index_ref"
+            ],
+            "discovery_detail_phase_refs": detail_fetch.output,
+        },
         retries=0,
     )
-    fetch >> review
+    fetch >> detail_plan >> detail_fetch >> review
