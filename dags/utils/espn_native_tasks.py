@@ -2819,6 +2819,7 @@ def release_scope_leases(
     dag_id, run_id, _ = _run_identity(context)
     owner_id = f"{dag_id}/{run_id}/{_attempt(context)}"
     leases = store.read_owner_leases(owner_id)
+    acquisition = None
     if lease_acquisition_ref is not None:
         acquisition = _read_ref(lease_acquisition_ref, kind="espn-lease-acquisition-v1")
         if acquisition["owner_id"] != owner_id or {
@@ -2834,9 +2835,26 @@ def release_scope_leases(
             failures.append(f"{lease.scope_id}: {type(exc).__name__}: {exc}")
             continue
         released.append(lease.scope_id)
+    scope_ids = sorted(
+        acquisition["scope_ids"]
+        if acquisition is not None
+        else {lease.scope_id for lease in leases}
+    )
+    result = {
+        "kind": "espn-lease-release-result-v1",
+        "schema_version": 1,
+        "dag_id": dag_id,
+        "run_id": run_id,
+        "attempt": _attempt(context),
+        "scope_ids": scope_ids,
+        "released": sorted(released),
+        "failures": sorted(failures),
+    }
+    root = _join_uri(_artifact_root(), "runs", _run_key(dag_id, run_id))
+    release_ref = _write_payload(_join_uri(root, "lease-release.json"), result)
     if failures:
         raise OperationsError("lease cleanup failures: " + "; ".join(failures))
-    return {"released": sorted(released)}
+    return {"released": sorted(released), "release_ref": release_ref}
 
 
 def propagate_terminal_failure(
@@ -2844,8 +2862,8 @@ def propagate_terminal_failure(
     verdict_ref: Mapping[str, str] | None = None,
     cleanup_task_ids: Sequence[str] = (),
     **context,
-) -> None:
-    """Final task restores failed DAG state after health and cleanup finish."""
+) -> dict[str, str]:
+    """Restore failure or seal the only post-health/post-cleanup success receipt."""
 
     verdict_ref = verdict_ref or _current_verdict_ref(context)
     verdict = _read_ref(verdict_ref, kind="espn-terminal-verdict-v1")
@@ -2863,6 +2881,73 @@ def propagate_terminal_failure(
         from airflow.exceptions import AirflowException
 
         raise AirflowException("ESPN cleanup/health failed: " + "; ".join(failures))
+
+    dag_id, run_id, _ = _run_identity(context)
+    attempt = _attempt(context)
+    root = _join_uri(_artifact_root(), "runs", _run_key(dag_id, run_id))
+    admission_ref = _ref_for_uri(_join_uri(root, "admission.json"))
+    admission = _read_ref(admission_ref, kind="espn-airflow-admission-v1")
+    plan_index_ref = _ref_for_uri(_join_uri(root, "plan-index.json"))
+    index = _read_ref(plan_index_ref, kind="espn-plan-index-v1")
+    durable_ref = _ref_for_uri(_join_uri(root, "durable-run-manifest.json"))
+    durable = _read_ref(durable_ref, kind="espn-durable-run-manifest-v1")
+    health_ref = _ref_for_uri(_join_uri(root, "health.json"))
+    health = _read_ref(health_ref, kind="espn-health-result-v1")
+    release_ref = _ref_for_uri(_join_uri(root, "lease-release.json"))
+    release = _read_ref(release_ref, kind="espn-lease-release-result-v1")
+    identity = (dag_id, run_id, attempt)
+    if (
+        (verdict["dag_id"], verdict["run_id"], verdict["attempt"]),
+        (admission["dag_id"], admission["run_id"], admission["attempt"]),
+        (index["dag_id"], index["run_id"], index["attempt"]),
+        (durable["dag_id"], durable["run_id"], durable["attempt"]),
+        (release["dag_id"], release["run_id"], release["attempt"]),
+    ) != (identity, identity, identity, identity, identity):
+        raise OperationsError("success receipt inputs have different run identities")
+    if (
+        (health["run_id"], health["attempt"]) != (run_id, attempt)
+        or health["status"] != "complete"
+        or health["verdict_ref"] != verdict_ref
+        or health["alerts"]
+        or release["failures"]
+        or sorted(release["released"]) != sorted(index["scope_ids"])
+    ):
+        raise OperationsError("success receipt inputs are not fully green")
+    dq_refs = []
+    for descriptor_ref in index["scope_plan_refs"]:
+        descriptor = _read_ref(descriptor_ref, kind="espn-scope-plan-descriptor-v1")
+        dq_refs.append(
+            {
+                "scope_id": descriptor["scope_id"],
+                "published_dq_ref": _ref_for_uri(
+                    _join_uri(descriptor["scope_root"], "published-dq.json")
+                ),
+            }
+        )
+    receipt = {
+        "kind": "espn-run-success-receipt-v1",
+        "schema_version": 1,
+        "dag_id": dag_id,
+        "run_id": run_id,
+        "attempt": attempt,
+        "mode": admission["mode"],
+        "as_of": admission["as_of"],
+        "logical_date": admission["logical_date"],
+        "parent": admission["parent"],
+        "scope_ids": index["scope_ids"],
+        "registry_ref": admission["registry_ref"],
+        "registry_signature": index["registry_signature"],
+        "admission_ref": admission_ref,
+        "plan_index_ref": plan_index_ref,
+        "durable_manifest_ref": durable_ref,
+        "published_dq_refs": sorted(dq_refs, key=lambda item: item["scope_id"]),
+        "verdict_ref": verdict_ref,
+        "health_ref": health_ref,
+        "lease_release_ref": release_ref,
+    }
+    receipt["receipt_sha256"] = hashlib.sha256(_canonical_bytes(receipt)).hexdigest()
+    success_ref = _write_payload(_join_uri(root, "run-success.json"), receipt)
+    return {"success_receipt_ref": success_ref}
 
 
 def fetch_discovery_catalog(**context) -> dict[str, str]:

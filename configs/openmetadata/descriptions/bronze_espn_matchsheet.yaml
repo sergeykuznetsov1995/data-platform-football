@@ -4,11 +4,10 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.espn_matchsheet
   description: |
-    Сырой протокол матча и командная статистика из ESPN (soccerdata
-    ESPN.read_matchsheet; backfill scripts/backfill_espn_e3_5.py, #298).
-    Grain — один row на (game, team). Несёт стадион/посещаемость и ~30
-    командных метрик строками. Кормит Gold dim_venue (написания стадионов).
-    Партиционирование ['league','season']. Backfill-only, не в daily dag_ingest_espn.
+    Retained legacy ESPN matchsheet, frozen as rollback evidence and fallback
+    for scopes not yet promoted to Native Bronze v2. The native production
+    writer never changes or drops this object; consumers should use
+    bronze.espn_matchsheet_current during the one-scope-at-a-time cutover.
   tags:
     - Tier.Bronze
     - Domain.Football
@@ -29,7 +28,7 @@ columns:
   - name: attendance
     description: Посещаемость матча (bigint).
   - name: capacity
-    description: Вместимость стадиона; 100% NULL (current soccerdata не эмитит — по allowlist).
+    description: Вместимость стадиона; исторически 100% NULL и разрешена явным allowlist.
   - name: roster
     description: Состав команды (список игроков) строкой.
     tags:

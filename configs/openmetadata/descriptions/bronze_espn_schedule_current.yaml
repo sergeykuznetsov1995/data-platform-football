@@ -1,0 +1,16 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.espn_schedule_current
+  description: |
+    Canonical ESPN schedule serving view. A scope uses Native rows only when
+    physical hashes match its COMPLETE manifest and the latest valid cutover is
+    native; otherwise retained legacy rows remain visible with native IDs null.
+  tags: [Tier.Bronze, Domain.Football, PII.None]
+columns:
+  - name: scope_id
+    description: Native scope ID; null on retained legacy fallback rows.
+  - name: competition_id
+    description: Native ESPN competition ID; null on legacy fallback rows.
+  - name: event_id
+    description: Native ESPN event ID; null on legacy fallback rows.
+  - name: generation_id
+    description: COMPLETE native generation; null on legacy fallback rows.

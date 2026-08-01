@@ -170,25 +170,37 @@ def test_whoscored_contract_requires_logical_commit_column_for_every_dataset():
         assert mod.META_COLS <= contract[table]
 
 
-# --- ESPN contract presence guard (#279, #298) ------------------------------
-# Regression guard: the 3 ESPN bronze tables must stay in the contract so the
-# --source espn audit keeps verifying full coverage. espn_standings is NOT in
-# the contract — soccerdata's ESPN reader has no read_standings, so the table
-# never materialises (would be a permanent false-positive); the dead scrape
-# path was removed in #354. espn_matchsheet was legacy/ad-hoc but its write-path
-# is now in the daily DAG runner (ESPNScraper.read_matchsheet, soccerdata
-# read_matchsheet — #298/#713; one DAG writes all three ESPN tables).
-@pytest.mark.parametrize('table', [
-    'espn_schedule',
-    'espn_lineup',
-    'espn_matchsheet',
-])
-def test_espn_contract_lists_all_tables(table):
-    assert table in mod.EXPECTED_TABLES['espn']
+# --- ESPN native-v2 contract guard -------------------------------------------
+def test_espn_contract_is_loaded_from_dependency_free_v2_inventory():
+    assert mod.EXPECTED_TABLES['espn'] == {
+        table: set(columns)
+        for table, columns in mod.ESPN_CONTRACT.REQUIRED_COLUMNS.items()
+    }
+
+
+def test_espn_contract_lists_legacy_native_current_and_control_objects():
+    assert set(mod.EXPECTED_TABLES['espn']) == (
+        set(mod.ESPN_CONTRACT.LEGACY_TABLES)
+        | set(mod.ESPN_CONTRACT.GENERATION_TABLES)
+        | set(mod.ESPN_CONTRACT.CURRENT_VIEWS)
+        | set(mod.ESPN_CONTRACT.CONTROL_TABLES)
+    )
 
 
 def test_espn_standings_excluded_from_contract():
     assert 'espn_standings' not in mod.EXPECTED_TABLES['espn']
+
+
+def test_capability_gated_empty_espn_entity_is_structurally_audited(monkeypatch):
+    table = 'espn_lineup_generation_v2'
+    required = mod.EXPECTED_TABLES['espn'][table]
+    cursor = _FakeCursor({table: [(column, 'varchar') for column in required]})
+
+    diff = mod.diff_contract(cursor, 'espn', {table}, {table: (0, [])})
+
+    assert (table, 'present but empty — capability-gated') in diff['expected_empty']
+    assert all(item[0] != table for item in diff['missing_tables'])
+    assert all(item[0] != table for item in diff['missing_columns'])
 
 
 # --- SofaScore contract presence guard (#280) ------------------------------

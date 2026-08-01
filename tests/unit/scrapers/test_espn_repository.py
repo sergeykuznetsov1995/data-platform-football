@@ -1383,6 +1383,7 @@ def test_table_partition_map_matches_real_writer_contract():
         repository_module.LEDGER_TABLE: ("scope_id",),
         MANIFEST_TABLE: ("scope_id",),
         CUTOVER_TABLE: ("scope_id",),
+        repository_module.BASELINE_TABLE: ("scope_id",),
         CATALOG_TABLE: ("snapshot_id",),
     }
     writer = FakeWriter()

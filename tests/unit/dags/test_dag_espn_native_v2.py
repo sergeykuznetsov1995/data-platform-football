@@ -1100,3 +1100,104 @@ def test_terminal_rejects_stale_or_prior_plan_artifact(
             plan_index_ref={"uri": "index", "sha256": "b" * 64},
             **context,
         )
+
+
+def test_final_leaf_seals_success_only_after_health_and_release(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    verdict_ref = {"uri": "verdict", "sha256": "1" * 64}
+    descriptor_ref = {"uri": "descriptor", "sha256": "2" * 64}
+    payloads = {
+        "verdict": {
+            "dag_id": "dag_ingest_espn",
+            "run_id": "child-run",
+            "attempt": 1,
+            "status": "complete",
+            "failures": [],
+        },
+        "admission.json": {
+            "dag_id": "dag_ingest_espn",
+            "run_id": "child-run",
+            "attempt": 1,
+            "mode": "daily",
+            "as_of": "2026-07-31",
+            "logical_date": "2026-07-31T00:00:00+00:00",
+            "parent": {"schema": "espn-master-parent-v1"},
+            "registry_ref": {"uri": "registry", "sha256": "3" * 64},
+        },
+        "plan-index.json": {
+            "dag_id": "dag_ingest_espn",
+            "run_id": "child-run",
+            "attempt": 1,
+            "mode": "daily",
+            "scope_ids": ["700:2026"],
+            "registry_signature": "4" * 64,
+            "scope_plan_refs": [descriptor_ref],
+        },
+        "durable-run-manifest.json": {
+            "dag_id": "dag_ingest_espn",
+            "run_id": "child-run",
+            "attempt": 1,
+        },
+        "health.json": {
+            "run_id": "child-run",
+            "attempt": 1,
+            "status": "complete",
+            "verdict_ref": verdict_ref,
+            "alerts": [],
+        },
+        "lease-release.json": {
+            "dag_id": "dag_ingest_espn",
+            "run_id": "child-run",
+            "attempt": 1,
+            "released": ["700:2026"],
+            "failures": [],
+        },
+        "descriptor": {
+            "scope_id": "700:2026",
+            "scope_root": "s3://artifacts/run/scopes/700-2026",
+        },
+    }
+
+    def ref_for_uri(uri):
+        return {"uri": uri, "sha256": hashlib.sha256(uri.encode()).hexdigest()}
+
+    def read_ref(ref, **_kwargs):
+        return payloads[ref["uri"].rsplit("/", 1)[-1]]
+
+    written = {}
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(espn_native_tasks, "_ref_for_uri", ref_for_uri)
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", read_ref)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda uri, payload, **_kwargs: (
+            written.update(uri=uri, payload=payload) or ref_for_uri(uri)
+        ),
+    )
+    task_instances = (
+        SimpleNamespace(task_id="record_health_metrics", state="success"),
+        SimpleNamespace(task_id="release_scope_leases", state="success"),
+    )
+    context = {
+        "dag": SimpleNamespace(dag_id="dag_ingest_espn"),
+        "dag_run": SimpleNamespace(get_task_instances=lambda: task_instances),
+        "run_id": "child-run",
+        "logical_date": datetime(2026, 7, 31, tzinfo=timezone.utc),
+        "params": {"attempt": 1},
+    }
+
+    result = espn_native_tasks.propagate_terminal_failure(
+        verdict_ref=verdict_ref,
+        cleanup_task_ids=("record_health_metrics", "release_scope_leases"),
+        **context,
+    )
+
+    assert result["success_receipt_ref"]["uri"].endswith("/run-success.json")
+    assert written["payload"]["kind"] == "espn-run-success-receipt-v1"
+    assert written["payload"]["health_ref"]["uri"].endswith("/health.json")
+    assert written["payload"]["lease_release_ref"]["uri"].endswith(
+        "/lease-release.json"
+    )
+    assert len(written["payload"]["receipt_sha256"]) == 64

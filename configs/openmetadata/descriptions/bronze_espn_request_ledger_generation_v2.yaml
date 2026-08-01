@@ -1,0 +1,20 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.espn_request_ledger_generation_v2
+  description: |
+    Append-only request ledger for each ESPN Native generation. It binds every
+    planned scoreboard/Summary request to exact Raw URI/hash, disposition,
+    direct bytes and zero proxy bytes; manifest DQ requires exact parity.
+  tags: [Tier.Bronze, Domain.Football, PII.None]
+columns:
+  - name: scope_id
+    description: Native competition/edition scope.
+  - name: request_id
+    description: Deterministic request identity.
+  - name: endpoint
+    description: Scoreboard or Summary endpoint type.
+  - name: raw_uri
+    description: Immutable content-addressed Raw URI.
+  - name: raw_sha256
+    description: Raw response SHA-256.
+  - name: proxy_bytes
+    description: Must be zero for the direct-only ESPN transport.

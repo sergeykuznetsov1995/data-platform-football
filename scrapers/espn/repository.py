@@ -41,6 +41,7 @@ CATALOG_TABLE = "espn_catalog_snapshot_v2"
 MANIFEST_TABLE = "espn_ingest_manifest_v2"
 CUTOVER_TABLE = "espn_scope_cutover_v2"
 LEDGER_TABLE = "espn_request_ledger_generation_v2"
+BASELINE_TABLE = "espn_legacy_baseline_v2"
 _CUTOVER_ANCESTRY_COLUMNS = (
     ("ancestor_cutover_sha256_json", "varchar"),
     ("ancestor_lineage_sha256", "varchar"),
@@ -96,6 +97,7 @@ TABLE_PARTITIONS = MappingProxyType(
         LEDGER_TABLE: ("scope_id",),
         MANIFEST_TABLE: ("scope_id",),
         CUTOVER_TABLE: ("scope_id",),
+        BASELINE_TABLE: ("scope_id",),
         CATALOG_TABLE: ("snapshot_id",),
     }
 )
@@ -2412,6 +2414,26 @@ def render_repository_ddl(
         ),
         "scope_id",
     )
+    statements[BASELINE_TABLE] = _table_ddl(
+        f"{catalog}.{schema}.{BASELINE_TABLE}",
+        (
+            ("baseline_version", "varchar"),
+            ("scope_id", "varchar"),
+            ("legacy_league", "varchar"),
+            ("legacy_season", "varchar"),
+            ("captured_at", "timestamp(6)"),
+            ("entity_metrics_json", "varchar"),
+            ("legacy_snapshot_ids_json", "varchar"),
+            ("registry_signature", "varchar"),
+            ("durable_manifest_uri", "varchar"),
+            ("durable_manifest_sha256", "varchar"),
+            ("replay_raw_manifest_uri", "varchar"),
+            ("replay_raw_manifest_sha256", "varchar"),
+            ("trust_label", "varchar"),
+            ("baseline_sha256", "varchar"),
+        ),
+        "scope_id",
+    )
     return MappingProxyType(statements)
 
 
@@ -2787,6 +2809,7 @@ SELECT * FROM legacy_rows"""
 
 
 __all__ = [
+    "BASELINE_TABLE",
     "BatchPublicationResult",
     "CATALOG_TABLE",
     "CatalogSnapshot",

@@ -1,0 +1,20 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.espn_scope_cutover_v2
+  description: |
+    An append-only per-scope native/legacy cutover chain with predecessor CAS and
+    ancestry hashes. Promotion binds an exact COMPLETE native manifest;
+    rollback appends a legacy successor and never deletes either data path.
+  tags: [Tier.Bronze, Domain.Football, PII.None]
+columns:
+  - name: cutover_id
+    description: Deterministic immutable transition ID.
+  - name: scope_id
+    description: Scope changed by this transition.
+  - name: active_source
+    description: Source selected after this transition, native or legacy.
+  - name: predecessor_cutover_sha256
+    description: CAS hash of the previous transition.
+  - name: native_manifest_sha256
+    description: COMPLETE manifest bound by native promotion.
+  - name: cutover_sha256
+    description: Immutable transition fingerprint.

@@ -1,0 +1,29 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.espn_lineup_generation_v2
+  description: |
+    Append-only ESPN Native Bronze v2 lineup generations, one native athlete
+    per event and team. A proven capability requires complete data; partial or
+    absent capabilities may produce valid_empty only after a successful Raw
+    response, never after transport or schema failure.
+  tags: [Tier.Bronze, Domain.Football, PII.Low]
+columns:
+  - name: scope_id
+    description: Stable ESPN competition/edition scope.
+  - name: competition_id
+    description: Authoritative numeric ESPN competition ID.
+  - name: event_id
+    description: Authoritative numeric ESPN event ID.
+  - name: team_id
+    description: Authoritative numeric ESPN team ID.
+  - name: athlete_id
+    description: Authoritative numeric ESPN athlete ID.
+  - name: generation_id
+    description: Immutable physical generation identity.
+  - name: registry_signature
+    description: Exact promoted-registry SHA-256.
+  - name: plan_signature
+    description: Exact signed-plan SHA-256.
+  - name: raw_uri
+    description: Immutable content-addressed Summary Raw URI.
+  - name: raw_sha256
+    description: SHA-256 of the exact Summary Raw payload.

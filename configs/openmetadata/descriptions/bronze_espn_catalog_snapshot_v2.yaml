@@ -1,0 +1,20 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.espn_catalog_snapshot_v2
+  description: |
+    Append-only ESPN discovery catalog snapshots. They preserve all observed
+    candidates and evidence but never promote a competition or edition; manual
+    registry review remains the only promotion boundary.
+  tags: [Tier.Bronze, Domain.Football, PII.None]
+columns:
+  - name: snapshot_id
+    description: Immutable discovery snapshot identity.
+  - name: competition_id
+    description: Observed numeric ESPN competition ID.
+  - name: competition_slug
+    description: Observed ESPN competition slug.
+  - name: registry_signature
+    description: Registry signature used for comparison, not auto-promotion.
+  - name: raw_uri
+    description: Immutable source catalog Raw URI.
+  - name: raw_sha256
+    description: Source catalog Raw SHA-256.

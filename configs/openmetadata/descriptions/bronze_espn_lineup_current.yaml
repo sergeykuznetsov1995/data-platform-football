@@ -1,0 +1,17 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.espn_lineup_current
+  description: |
+    Canonical ESPN lineup serving view. COMPLETE manifest and native cutover
+    gates select Native rows; retained legacy remains fallback with native IDs
+    null. For proven capability missing data is failure; partial or absent can
+    be valid_empty only with successful Raw evidence.
+  tags: [Tier.Bronze, Domain.Football, PII.Low]
+columns:
+  - name: scope_id
+    description: Native scope ID; null on retained legacy fallback rows.
+  - name: event_id
+    description: Native ESPN event ID; null on legacy fallback rows.
+  - name: team_id
+    description: Native ESPN team ID; null on legacy fallback rows.
+  - name: athlete_id
+    description: Native ESPN athlete ID; null on legacy fallback rows.

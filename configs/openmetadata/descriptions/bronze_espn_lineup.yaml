@@ -4,10 +4,10 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.espn_lineup
   description: |
-    Сырые составы и индивидуальная статистика игроков за матч из ESPN
-    (soccerdata ESPN.read_lineup; backfill scripts/backfill_espn_e3_5.py).
-    Grain — один row на (game, team, player). Кормит Silver espn_lineup →
-    Gold fct_event / fct_shot / fct_lineup. Партиционирование ['league','season'].
+    Retained legacy ESPN lineup, frozen as rollback evidence and fallback for
+    scopes not yet promoted to Native Bronze v2. The native production writer
+    never changes or drops this object; consumers should use
+    bronze.espn_lineup_current during the one-scope-at-a-time cutover.
   tags:
     - Tier.Bronze
     - Domain.Football

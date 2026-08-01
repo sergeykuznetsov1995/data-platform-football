@@ -1,0 +1,28 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.espn_schedule_generation_v2
+  description: |
+    Append-only ESPN Native Bronze v2 schedule generations. Grain is one native
+    event per scope and generation; rows become visible only through an exact
+    COMPLETE manifest and an approved scope cutover.
+  tags: [Tier.Bronze, Domain.Football, PII.None]
+columns:
+  - name: scope_id
+    description: Stable ESPN scope key `<competition_id>:<source_season_year>`.
+  - name: competition_id
+    description: Authoritative numeric ESPN competition ID.
+  - name: event_id
+    description: Authoritative numeric ESPN event ID.
+  - name: home_team_id
+    description: Authoritative numeric ESPN home-team ID.
+  - name: away_team_id
+    description: Authoritative numeric ESPN away-team ID.
+  - name: generation_id
+    description: Immutable physical generation identity.
+  - name: registry_signature
+    description: SHA-256 of the exact promoted registry snapshot.
+  - name: plan_signature
+    description: SHA-256 of the exact signed ingest plan.
+  - name: raw_uri
+    description: Immutable content-addressed Raw payload URI.
+  - name: raw_sha256
+    description: SHA-256 of the exact Raw payload.

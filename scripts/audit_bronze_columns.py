@@ -52,6 +52,24 @@ def _load_whoscored_contract():
 WHOSCORED_CONTRACT = _load_whoscored_contract()
 
 
+def _load_espn_contract():
+    """Load the dependency-free retained/native/current ESPN inventory."""
+
+    path = Path(__file__).with_name("espn_v2_object_contract.py")
+    spec = importlib.util.spec_from_file_location(
+        "_audit_espn_v2_object_contract",
+        path,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load ESPN object contract: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+ESPN_CONTRACT = _load_espn_contract()
+
+
 def _load_understat_contract():
     """Load the dependency-free native seven-table registry directly."""
 
@@ -494,55 +512,8 @@ if set(WHOSCORED_IDENTITY_COLUMNS) != set(WHOSCORED_CONTRACT.BUSINESS_TABLES):
 # #274 seeds espn only; other sources filled in #276-#286.
 EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
     "espn": {
-        # Reliably-produced set (verified vs live bronze 2026-06-03). The
-        # _standardize_schedule renames (home_score->home_goals, venue, attendance)
-        # are conditional on raw soccerdata columns that ESPN never supplies, so
-        # those targets never materialise — contract lists what actually lands.
-        "espn_schedule": {
-            "league",
-            "season",
-            "game",
-            "match_date",
-            "home_team",
-            "away_team",
-            "game_id",
-            "league_id",
-            *META_COLS,
-        },
-        # Producer: ESPNScraper.read_lineup (dags/scripts/run_espn_scraper.py
-        # lineup branch). Extra stat columns also land, but only these are
-        # required.
-        "espn_lineup": {
-            "league",
-            "season",
-            "game",
-            "team",
-            "player",
-            "position",
-            "formation_place",
-            "sub_in",
-            "sub_out",
-            *META_COLS,
-        },
-        # Producer: ESPNScraper.read_matchsheet (run_espn_scraper.py matchsheet
-        # branch; soccerdata read_matchsheet — #298). One row per (game, team) with
-        # venue + ~35 team stat columns; only identity + venue are required
-        # (extra stat columns are NOT errors; `capacity` is 100%-NULL and lives
-        # in EXPECTED_NULL, so it is not listed here).
-        "espn_matchsheet": {
-            "league",
-            "season",
-            "game",
-            "team",
-            "is_home",
-            "venue",
-            "attendance",
-            *META_COLS,
-        },
-        # NOTE: espn_standings is NOT in the contract — soccerdata's ESPN reader
-        # has no read_standings, so the table is never materialised. The dead
-        # scrape path was removed in #354. Listing it here would be a permanent
-        # false-positive.
+        table: set(columns)
+        for table, columns in ESPN_CONTRACT.REQUIRED_COLUMNS.items()
     },
     "fbref": {
         # Minimal required set per table — identity keys + a few core metrics
@@ -1413,6 +1384,10 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
     },
 }
 
+CAPABILITY_EMPTY_ALLOWED: dict[str, set[str]] = {
+    "espn": set(ESPN_CONTRACT.CAPABILITY_GATED_TABLES),
+}
+
 # Tables a source's contract names but that are intentionally NOT materialised
 # (upstream restriction). Absent / empty == PASS, surfaced as "expected absent (OK)"
 # instead of a missing-table failure.
@@ -1652,8 +1627,10 @@ def diff_contract(
     """
     contract = EXPECTED_TABLES.get(source, {})
     absent_ok = EXPECTED_ABSENT.get(source, set())
+    capability_empty_ok = CAPABILITY_EMPTY_ALLOWED.get(source, set())
     missing_tables: list[tuple[str, str]] = []
     expected_absent: list[tuple[str, str]] = []
+    expected_empty: list[tuple[str, str]] = []
     missing_columns: list[tuple[str, str]] = []
     all_null_columns: list[tuple[str, str, str]] = []
 
@@ -1676,9 +1653,14 @@ def diff_contract(
         if total == 0:
             if in_absent_ok:
                 expected_absent.append((table, "present but empty — expected"))
+                continue
+            if table in capability_empty_ok:
+                expected_empty.append(
+                    (table, "present but empty — capability-gated")
+                )
             else:
                 missing_tables.append((table, "present but empty (0 rows)"))
-            continue
+                continue
         live_cols = {c.lower() for c, _ in describe(cur, table)}
         for col in sorted(expected_cols):
             if col.lower() not in live_cols:
@@ -1694,6 +1676,7 @@ def diff_contract(
     return {
         "missing_tables": missing_tables,
         "expected_absent": expected_absent,
+        "expected_empty": expected_empty,
         "missing_columns": missing_columns,
         "all_null_columns": all_null_columns,
     }
@@ -1817,6 +1800,7 @@ def render_source_report(
     """Per-source contract report: missing tables / columns / all-NULL columns."""
     missing_tables = diff["missing_tables"]
     expected_absent = diff.get("expected_absent", [])
+    expected_empty = diff.get("expected_empty", [])
     missing_columns = diff["missing_columns"]
     all_null_columns = diff["all_null_columns"]
     contract = EXPECTED_TABLES.get(source, {})
@@ -1835,6 +1819,7 @@ def render_source_report(
         f"- Contract tables: **{len(contract)}**",
         f"- Missing tables: **{len(missing_tables)}**",
         f"- Expected absent (OK): **{len(expected_absent)}**",
+        f"- Capability-gated empty (OK): **{len(expected_empty)}**",
         f"- Missing columns: **{len(missing_columns)}**",
         f"- All-NULL columns: **{len(all_null_columns)}**",
         "",
@@ -1866,6 +1851,19 @@ def render_source_report(
         lines.append("| Table | Reason |")
         lines.append("|---|---|")
         for table, reason in expected_absent:
+            lines.append(f"| `{table}` | {reason} |")
+    else:
+        lines.append("(none)")
+    lines.append("")
+
+    # 1c. Entity availability is decided by the signed edition capability and
+    # exact manifest DQ, not by a global non-empty table heuristic.
+    lines.append("## Capability-gated empty (OK)")
+    lines.append("")
+    if expected_empty:
+        lines.append("| Table | Reason |")
+        lines.append("|---|---|")
+        for table, reason in expected_empty:
             lines.append(f"| `{table}` | {reason} |")
     else:
         lines.append("(none)")
