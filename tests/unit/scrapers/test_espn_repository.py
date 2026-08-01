@@ -312,6 +312,11 @@ CUTOVER_GRAPH_COLUMNS = (
     "ancestor_cutover_sha256_json",
     "ancestor_lineage_sha256",
 )
+CUTOVER_ROUTE_COLUMNS = (
+    *CUTOVER_GRAPH_COLUMNS,
+    "active_source",
+    "effective_at",
+)
 
 
 class CutoverGraphQuery(FakeQuery):
@@ -1666,6 +1671,118 @@ def _cutover_graph_row(cutover, **changes):
     row = cutover.to_row()
     row.update(changes)
     return tuple(row[column] for column in CUTOVER_GRAPH_COLUMNS)
+
+
+def _cutover_route_row(cutover, **changes):
+    row = cutover.to_row()
+    row.update(changes)
+    return tuple(row[column] for column in CUTOVER_ROUTE_COLUMNS)
+
+
+class CurrentRouteQuery(FakeQuery):
+    def __init__(self, routes=(), *, unresolved_fork=False, visible=None):
+        super().__init__()
+        self.routes = list(routes)
+        self.unresolved_fork = unresolved_fork
+        self.visible = dict(visible or {})
+
+    def execute_query(self, sql, params=None):
+        self.calls.append((sql, params))
+        if "unresolved_cutover_forks" in sql:
+            return [("f" * 64,)] if self.unresolved_fork else []
+        if (
+            f"FROM iceberg.bronze.{CUTOVER_TABLE}" in sql
+            and "SELECT DISTINCT" in sql
+            and '"active_source"' in sql
+        ):
+            return list(self.routes)
+        if 'SELECT COUNT(*) AS "row_count"' in sql:
+            entity = next(
+                name
+                for name, view in repository_module.CURRENT_VIEWS.items()
+                if view in sql
+            )
+            return [(self.visible.get(entity, 0),)]
+        return []
+
+
+@pytest.mark.unit
+def test_current_scope_route_tracks_unpromoted_native_and_legacy_rollback():
+    generation = _generation()
+    native = _native_cutover(generation)
+    rollback = _rollback_cutover(native)
+
+    assert (
+        EspnBronzeRepository(
+            writer=FakeWriter(), query=CurrentRouteQuery()
+        ).current_scope_route(generation.plan.scope_id)
+        is None
+    )
+    assert (
+        EspnBronzeRepository(
+            writer=FakeWriter(),
+            query=CurrentRouteQuery((_cutover_route_row(native),)),
+        ).current_scope_route(generation.plan.scope_id)
+        == "native"
+    )
+    assert (
+        EspnBronzeRepository(
+            writer=FakeWriter(),
+            query=CurrentRouteQuery(
+                (_cutover_route_row(native), _cutover_route_row(rollback))
+            ),
+        ).current_scope_route(generation.plan.scope_id)
+        == "legacy"
+    )
+    assert (
+        EspnBronzeRepository(
+            writer=FakeWriter(),
+            query=CurrentRouteQuery(
+                (
+                    _cutover_route_row(native),
+                    _cutover_route_row(rollback, effective_at=native.effective_at),
+                )
+            ),
+        ).current_scope_route(generation.plan.scope_id)
+        == "legacy"
+    )
+
+
+@pytest.mark.unit
+def test_current_scope_route_rejects_malformed_graph_and_unresolved_fork():
+    generation = _generation()
+    native = _native_cutover(generation)
+    malformed = _cutover_route_row(native, ancestor_lineage_sha256="0" * 64)
+    with pytest.raises(PublicationError, match="ancestry hash"):
+        EspnBronzeRepository(
+            writer=FakeWriter(), query=CurrentRouteQuery((malformed,))
+        ).current_scope_route(generation.plan.scope_id)
+
+    with pytest.raises(ManifestConflictError, match="unresolved cutover fork"):
+        EspnBronzeRepository(
+            writer=FakeWriter(),
+            query=CurrentRouteQuery(
+                (_cutover_route_row(native),), unresolved_fork=True
+            ),
+        ).current_scope_route(generation.plan.scope_id)
+
+
+@pytest.mark.unit
+def test_current_scope_absence_is_exact_and_rejects_native_visibility():
+    scope_id = _generation().plan.scope_id
+    repository = EspnBronzeRepository(writer=FakeWriter(), query=CurrentRouteQuery())
+    assert repository.verify_current_scope_absence(scope_id) == {
+        "schedule": 0,
+        "lineup": 0,
+        "matchsheet": 0,
+    }
+
+    visible = EspnBronzeRepository(
+        writer=FakeWriter(),
+        query=CurrentRouteQuery(visible={"schedule": 1}),
+    )
+    with pytest.raises(PublicationError, match="exposes native rows"):
+        visible.verify_current_scope_absence(scope_id)
 
 
 def _assert_cutover_graph_rejected_before_views(rows, match):

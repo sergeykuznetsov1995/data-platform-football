@@ -59,6 +59,11 @@ _CUTOVER_GRAPH_COLUMNS = (
     "ancestor_cutover_sha256_json",
     "ancestor_lineage_sha256",
 )
+_CUTOVER_ROUTE_COLUMNS = (
+    *_CUTOVER_GRAPH_COLUMNS,
+    "active_source",
+    "effective_at",
+)
 ENTITY_TABLES = MappingProxyType(
     {
         "schedule": "espn_schedule_generation_v2",
@@ -1797,6 +1802,37 @@ class EspnBronzeRepository:
                 f"physical row/hash parity failed: expected={expected!r}, observed={observed!r}"
             )
 
+    def _scope_has_unresolved_cutover_fork(self, scope_id: str) -> bool:
+        rows = self._execute(
+            f"""WITH scope_cutovers AS (
+    SELECT *
+    FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE}
+    WHERE "scope_id" = ?
+), conflicting_ids AS (
+    SELECT "cutover_id"
+    FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE}
+    GROUP BY "cutover_id"
+    HAVING COUNT(DISTINCT "cutover_sha256") > 1
+), conflicting_predecessors AS (
+    SELECT "predecessor_cutover_sha256"
+    FROM scope_cutovers
+    GROUP BY "predecessor_cutover_sha256"
+    HAVING COUNT(DISTINCT "cutover_sha256") > 1
+), unresolved_cutover_forks AS (
+    SELECT c."cutover_sha256"
+    FROM scope_cutovers c
+    JOIN conflicting_ids conflict ON conflict."cutover_id" = c."cutover_id"
+    UNION
+    SELECT c."cutover_sha256"
+    FROM scope_cutovers c
+    JOIN conflicting_predecessors fork
+      ON fork."predecessor_cutover_sha256" IS NOT DISTINCT FROM c."predecessor_cutover_sha256"
+)
+SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
+            (scope_id,),
+        )
+        return bool(rows)
+
     def publish_scope(
         self,
         generation: ScopeGeneration,
@@ -1993,6 +2029,106 @@ class EspnBronzeRepository:
             observed_counts[entity] = expected_count
         return observed_counts
 
+    def current_scope_route(self, scope_id: str) -> str | None:
+        """Return the validated current-view route without mutating cutover state."""
+
+        if type(scope_id) is not str or _SCOPE_RE.fullmatch(scope_id) is None:
+            raise ValueError("scope_id is invalid")
+        projection = ", ".join(f'"{column}"' for column in _CUTOVER_ROUTE_COLUMNS)
+        stored_routes = self._execute(
+            f"SELECT DISTINCT {projection} "
+            f"FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE}"
+        )
+        normalized: list[tuple[Any, ...]] = []
+        for raw in stored_routes:
+            if isinstance(raw, Mapping):
+                values = tuple(raw.get(column) for column in _CUTOVER_ROUTE_COLUMNS)
+            elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+                values = tuple(raw)
+            else:
+                raise PublicationError("stored cutover route row is malformed")
+            if len(values) != len(_CUTOVER_ROUTE_COLUMNS):
+                raise PublicationError(
+                    "stored cutover route row has an unexpected column count"
+                )
+            normalized.append(values)
+        _validate_stored_cutover_graph(
+            tuple(values[: len(_CUTOVER_GRAPH_COLUMNS)] for values in normalized)
+        )
+        if self._scope_has_unresolved_cutover_fork(scope_id):
+            raise ManifestConflictError(
+                "scope has an unresolved cutover fork; current route is ambiguous"
+            )
+        routes: dict[tuple[str, str], tuple[str, datetime]] = {}
+        for values in normalized:
+            if values[1] != scope_id:
+                continue
+            cutover_id = _required_string(values[0], "stored cutover_id")
+            cutover_hash = _sha256(values[2], "stored cutover_sha256")
+            active_source = values[-2]
+            if active_source not in {"native", "legacy"}:
+                raise PublicationError("stored cutover active_source is invalid")
+            effective_at = _stored_utc(values[-1], "stored cutover effective_at")
+            identity = (cutover_id, cutover_hash)
+            route = (active_source, effective_at)
+            previous = routes.setdefault(identity, route)
+            if previous != route:
+                raise ManifestConflictError(
+                    "stored cutover identity has conflicting route fields"
+                )
+        if not routes:
+            return None
+        return max(
+            (
+                (effective_at, cutover_id, cutover_hash, active_source)
+                for (cutover_id, cutover_hash), (
+                    active_source,
+                    effective_at,
+                ) in routes.items()
+            ),
+        )[-1]
+
+    def verify_current_scope_absence(self, scope_id: str) -> dict[str, int]:
+        """Prove cutover-gated views expose no native rows for one scope."""
+
+        if type(scope_id) is not str or _SCOPE_RE.fullmatch(scope_id) is None:
+            raise ValueError("scope_id is invalid")
+        observed: dict[str, int] = {}
+        for entity, view in CURRENT_VIEWS.items():
+            rows = self._execute(
+                f'SELECT COUNT(*) AS "row_count" '
+                f"FROM {self.catalog}.{self.schema}.{view} "
+                'WHERE "scope_id" = ?',
+                (scope_id,),
+            )
+            if len(rows) != 1:
+                raise PublicationError(
+                    f"{entity} current view absence query is malformed"
+                )
+            raw = rows[0]
+            if isinstance(raw, Mapping):
+                count = raw.get("row_count")
+            elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+                if len(raw) != 1:
+                    raise PublicationError(
+                        f"{entity} current view absence row is malformed"
+                    )
+                count = raw[0]
+            else:
+                raise PublicationError(
+                    f"{entity} current view absence row is malformed"
+                )
+            if type(count) is not int or count < 0:
+                raise PublicationError(
+                    f"{entity} current view absence count is malformed"
+                )
+            if count:
+                raise PublicationError(
+                    f"{entity} current view exposes native rows while route is legacy"
+                )
+            observed[entity] = count
+        return observed
+
     def exact_complete_exists(self, generation: ScopeGeneration) -> bool:
         """Return whether this exact, physically valid COMPLETE already exists."""
 
@@ -2107,35 +2243,7 @@ class EspnBronzeRepository:
             if existing_hashes == {cutover.cutover_sha256}:
                 return f"{self.catalog}.{self.schema}.{CUTOVER_TABLE}"
             raise ManifestConflictError("same cutover_id has conflicting content")
-        unresolved_forks = self._execute(
-            f"""WITH scope_cutovers AS (
-    SELECT *
-    FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE}
-    WHERE "scope_id" = ?
-), conflicting_ids AS (
-    SELECT "cutover_id"
-    FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE}
-    GROUP BY "cutover_id"
-    HAVING COUNT(DISTINCT "cutover_sha256") > 1
-), conflicting_predecessors AS (
-    SELECT "predecessor_cutover_sha256"
-    FROM scope_cutovers
-    GROUP BY "predecessor_cutover_sha256"
-    HAVING COUNT(DISTINCT "cutover_sha256") > 1
-), unresolved_cutover_forks AS (
-    SELECT c."cutover_sha256"
-    FROM scope_cutovers c
-    JOIN conflicting_ids conflict ON conflict."cutover_id" = c."cutover_id"
-    UNION
-    SELECT c."cutover_sha256"
-    FROM scope_cutovers c
-    JOIN conflicting_predecessors fork
-      ON fork."predecessor_cutover_sha256" IS NOT DISTINCT FROM c."predecessor_cutover_sha256"
-)
-SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
-            (cutover.scope_id,),
-        )
-        if unresolved_forks:
+        if self._scope_has_unresolved_cutover_fork(cutover.scope_id):
             raise ManifestConflictError(
                 "scope has an unresolved cutover fork; serialize repair under lease"
             )

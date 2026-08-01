@@ -3047,6 +3047,216 @@ def test_resumed_noop_hydrates_legacy_head_before_recording_evidence(monkeypatch
     assert order[:3] == ["verify-current", "hydrate", "record"]
 
 
+@pytest.mark.parametrize(
+    ("current_route", "current_mismatch"),
+    ((None, False), ("legacy", False), ("native", False), ("native", True)),
+)
+def test_published_dq_verifies_current_views_for_the_active_route(
+    monkeypatch, current_route, current_mismatch
+):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.operations import ScopeHead
+
+    completed_at = datetime(2026, 8, 1, 20, tzinfo=timezone.utc)
+    scope = SimpleNamespace(scope_id="700:2026")
+    loaded = SimpleNamespace(
+        plan=SimpleNamespace(run_id="canary-run", registry_signature="a" * 64),
+        attempt=1,
+        signature="b" * 64,
+    )
+    generation = SimpleNamespace(
+        plan=scope,
+        generation_id="generation-complete",
+        generation_signature="c" * 64,
+        manifest_sha256="d" * 64,
+        run_id=loaded.plan.run_id,
+        registry_signature=loaded.plan.registry_signature,
+        plan_signature=loaded.signature,
+        ingested_at=completed_at,
+    )
+    snapshot_ref = {
+        "uri": "s3://artifacts/scope/generation.json",
+        "sha256": "e" * 64,
+    }
+    head = ScopeHead(
+        dag_id="dag_repair_espn",
+        scope_id=scope.scope_id,
+        generation_id=generation.generation_id,
+        generation_signature=generation.generation_signature,
+        manifest_sha256=generation.manifest_sha256,
+        snapshot_uri=snapshot_ref["uri"],
+        snapshot_sha256=snapshot_ref["sha256"],
+        registry_signature=generation.registry_signature,
+        plan_signature=generation.plan_signature,
+        run_id=generation.run_id,
+        published_at=completed_at + timedelta(minutes=1),
+        completed_at=completed_at,
+    )
+    publication_ref = {
+        "uri": "s3://artifacts/scope/publication-result.json",
+        "sha256": "f" * 64,
+    }
+    evidence_ref = {
+        "uri": "s3://artifacts/scope/run-evidence.json",
+        "sha256": "1" * 64,
+    }
+    publication = {
+        "kind": "espn-publication-result-v1",
+        "scope_binding_ref": {"uri": "binding", "sha256": "2" * 64},
+        "snapshot_ref": snapshot_ref,
+        "publication_intent_ref": {"uri": "intent", "sha256": "3" * 64},
+        "evidence_ref": evidence_ref,
+        "state": "complete",
+        "selected_head": espn_native_tasks._head_to_dict(head),
+    }
+    evidence = {"recorded_at": completed_at.isoformat()}
+    descriptor = {
+        "dag_id": head.dag_id,
+        "scope_root": "s3://artifacts/scope",
+    }
+    lease = SimpleNamespace(epoch=7)
+    repository_calls = []
+    validation_calls = []
+    writes = []
+
+    class Store:
+        def read_scope_heads(self, scope_ids):
+            assert scope_ids == (scope.scope_id,)
+            return {scope.scope_id: head}
+
+    class Repository:
+        def verify_published_scope(self, current_generation):
+            assert current_generation is generation
+            repository_calls.append("verify-published")
+            return SimpleNamespace(passed=True, failures=())
+
+        def current_scope_route(self, current_scope_id):
+            assert current_scope_id == scope.scope_id
+            repository_calls.append("current-route")
+            return current_route
+
+        def verify_current_scope_selection(self, current_generation):
+            assert current_generation is generation
+            repository_calls.append("verify-current")
+            if current_mismatch:
+                raise RuntimeError("native current selection differs")
+            if current_route != "native":
+                raise AssertionError("an unpromoted generation is not current")
+            return {"schedule": 380, "lineup": 0, "matchsheet": 0}
+
+        def verify_current_scope_absence(self, current_scope_id):
+            assert current_scope_id == scope.scope_id
+            repository_calls.append("verify-absence")
+            return {"schedule": 0, "lineup": 0, "matchsheet": 0}
+
+    def read_ref(ref, *, kind=None):
+        if ref == publication_ref:
+            assert kind == "espn-publication-result-v1"
+            return publication
+        if ref == evidence_ref:
+            assert kind == "espn-run-manifest-evidence-v1"
+            return evidence
+        raise AssertionError(f"unexpected artifact read: {ref!r}")
+
+    def load_scope_snapshot(uri, *, artifact_sha256, expected_scope_id):
+        assert (uri, artifact_sha256, expected_scope_id) == (
+            snapshot_ref["uri"],
+            snapshot_ref["sha256"],
+            scope.scope_id,
+        )
+        return generation
+
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", read_ref)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_binding",
+        lambda _ref: ({}, descriptor, loaded, scope, lease),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner, "load_scope_snapshot", load_scope_snapshot
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_validate_publication_intent_for_result",
+        lambda *args, **kwargs: validation_calls.append(("intent", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_assert_generation_binding",
+        lambda **kwargs: validation_calls.append(("binding", kwargs)),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_validate_evidence_payload",
+        lambda *args, **kwargs: validation_calls.append(("evidence", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: Store()),
+    )
+    monkeypatch.setattr(espn_native_tasks, "EspnBronzeRepository", Repository)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_quality_payload",
+        lambda report: {"passed": report.passed, "schedule_rows": 380},
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda uri, payload: (
+            writes.append((uri, payload)) or {"uri": uri, "sha256": "4" * 64}
+        ),
+    )
+
+    if current_mismatch:
+        with pytest.raises(RuntimeError, match="native current selection differs"):
+            espn_native_tasks.published_dq_scope(publication_ref=publication_ref)
+        assert repository_calls == [
+            "verify-published",
+            "verify-published",
+            "current-route",
+            "verify-current",
+        ]
+        assert [call[0] for call in validation_calls] == ["intent", "binding"]
+        assert writes == []
+        return
+
+    result = espn_native_tasks.published_dq_scope(publication_ref=publication_ref)
+
+    assert result["published_dq_ref"]["uri"].endswith("/published-dq.json")
+    current_check = "verify-current" if current_route == "native" else "verify-absence"
+    assert repository_calls == [
+        "verify-published",
+        "verify-published",
+        "current-route",
+        current_check,
+    ]
+    assert [call[0] for call in validation_calls] == [
+        "intent",
+        "binding",
+        "evidence",
+    ]
+    assert writes == [
+        (
+            "s3://artifacts/scope/published-dq.json",
+            {
+                "kind": "espn-published-dq-result-v1",
+                "schema_version": 1,
+                "dag_id": head.dag_id,
+                "scope_id": scope.scope_id,
+                "run_id": loaded.plan.run_id,
+                "attempt": loaded.attempt,
+                "plan_signature": loaded.signature,
+                "registry_signature": loaded.plan.registry_signature,
+                "publication_ref": publication_ref,
+                "current_selection": espn_native_tasks._head_to_dict(head),
+                "quality": {"passed": True, "schedule_rows": 380},
+            },
+        )
+    ]
+
+
 def test_legacy_head_divergence_fails_before_hydration(monkeypatch):
     from dags.utils import espn_native_tasks
     from scrapers.espn.operations import ScopeHead

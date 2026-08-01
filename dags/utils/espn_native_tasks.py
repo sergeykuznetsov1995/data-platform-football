@@ -2800,7 +2800,11 @@ def published_dq_scope(
     else:
         raise OperationsError("publication state is invalid")
     report = repository.verify_published_scope(selected_generation)
-    repository.verify_current_scope_selection(selected_generation)
+    current_route = repository.current_scope_route(scope.scope_id)
+    if current_route == "native":
+        repository.verify_current_scope_selection(selected_generation)
+    else:
+        repository.verify_current_scope_absence(scope.scope_id)
     if not report.passed:
         raise OperationsError("published DQ failed: " + "; ".join(report.failures))
     evidence = _read_ref(
