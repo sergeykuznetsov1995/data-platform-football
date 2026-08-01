@@ -217,18 +217,31 @@ def _seed_full_event_referee(
     )
 
 
+def _stamp_user_counts(event: dict, *, home: int, away: int, tournament: int) -> None:
+    """Attach the popularity counters SofaScore stamps on every live event."""
+
+    event["homeTeam"]["userCount"] = home
+    event["awayTeam"]["userCount"] = away
+    event.setdefault("tournament", {}).setdefault("uniqueTournament", {})[
+        "userCount"
+    ] = tournament
+
+
 def _seed_complete_partition_roots(
     store: RawPayloadStore,
     *,
+    schedule_last_payload=None,
     schedule_next_payload=None,
 ) -> None:
     evidence = _payload(PLAYER_EVIDENCE_CASES)
+    if schedule_last_payload is None:
+        schedule_last_payload = _payload(FIXTURE_PATHS["schedule_last"])
     if schedule_next_payload is None:
         schedule_next_payload = _payload(FIXTURE_PATHS["schedule_next"])
     roots = [
         (
             build_schedule_page_spec(direction="last", page=0, **_common()),
-            _payload(FIXTURE_PATHS["schedule_last"]),
+            schedule_last_payload,
         ),
         (
             build_schedule_page_spec(direction="next", page=0, **_common()),
@@ -1643,21 +1656,35 @@ def test_partition_materializer_rejects_duplicate_schedule_natural_key(tmp_path)
         )
 
 
-def _replayed_partition_with_cross_page_repeat(tmp_path, *, mutate=False):
+def _replayed_partition_with_cross_page_repeat(
+    tmp_path,
+    *,
+    mutate=False,
+    user_count_tick=False,
+):
     """Partition whose live-feed pages repeat event 14000001 on BOTH pages.
 
     A live paginated feed (e.g. the World Cup knockout stage) can shift a
     settled match between page windows, so the same event legally appears on
     two different pages with an identical payload (#951). ``mutate`` makes the
     repeat's payload disagree — a data conflict that must stay a hard error.
+    ``user_count_tick`` moves only the popularity counters between the two
+    fetches, which is what the source really does (#1071).
     """
     raw_store = _raw_store(tmp_path)
     manifest = InMemoryManifestStore()
     event = _schedule_event(14000001)
     if mutate:
         event["startTimestamp"] = int(event.get("startTimestamp") or 0) + 3600
+    schedule_last_payload = None
+    if user_count_tick:
+        schedule_last_payload = _payload(FIXTURE_PATHS["schedule_last"])
+        for seeded in schedule_last_payload["events"]:
+            _stamp_user_counts(seeded, home=59171, away=8138, tournament=32989)
+        _stamp_user_counts(event, home=59115, away=8142, tournament=32953)
     _seed_complete_partition_roots(
         raw_store,
+        schedule_last_payload=schedule_last_payload,
         schedule_next_payload={"events": [event], "hasNextPage": False},
     )
     plan = plan_season_partition(raw_store, manifest, **_common())
@@ -1702,6 +1729,35 @@ def test_partition_materializer_collapses_cross_page_schedule_repeat(tmp_path):
 
 
 @pytest.mark.unit
+def test_partition_materializer_collapses_cross_page_repeat_with_ticking_user_counts(
+    tmp_path,
+):
+    """#1071: the source's follower counters move between two page fetches of
+    one run. That is not a data conflict — the match itself is identical — and
+    it must not drop the whole season."""
+    plan, results = _replayed_partition_with_cross_page_repeat(
+        tmp_path,
+        user_count_tick=True,
+    )
+    materialization = materialize_season_partition(
+        plan,
+        results,
+        canonical_league="ENG-Premier League",
+        canonical_season="2025/26",
+    )
+    repeats = [
+        row
+        for row in materialization.schedule_rows
+        if str(row["game_id"]) == "14000001"
+    ]
+    assert len(repeats) == 1
+    # The first-seen page wins, counters included.
+    assert repeats[0]["source_page_direction"] == "last"
+    assert repeats[0]["home_team_user_count"] == 59171
+    assert repeats[0]["tournament_unique_tournament_user_count"] == 32989
+
+
+@pytest.mark.unit
 def test_partition_materializer_rejects_cross_page_payload_conflict(tmp_path):
     """A cross-page repeat whose match payload disagrees is a data conflict,
     not pagination noise — it must remain a hard error."""
@@ -1716,6 +1772,28 @@ def test_partition_materializer_rejects_cross_page_payload_conflict(tmp_path):
             canonical_league="ENG-Premier League",
             canonical_season="2025/26",
         )
+
+
+@pytest.mark.unit
+def test_partition_materializer_conflict_names_the_disagreeing_columns(tmp_path):
+    """A conflict must say WHICH columns disagree: without that the next
+    occurrence costs a raw-store forensic dig before anyone can tell a
+    live-feed race from a parser defect (#1071)."""
+    plan, results = _replayed_partition_with_cross_page_repeat(
+        tmp_path,
+        mutate=True,
+    )
+    with pytest.raises(SeasonMaterializationError) as excinfo:
+        materialize_season_partition(
+            plan,
+            results,
+            canonical_league="ENG-Premier League",
+            canonical_season="2025/26",
+        )
+    message = str(excinfo.value)
+    assert "conflicting columns" in message
+    assert "start_timestamp" in message
+    assert "user_count" not in message
 
 
 @pytest.mark.unit

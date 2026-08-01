@@ -1008,6 +1008,22 @@ _SCHEDULE_LINEAGE_COLUMNS = frozenset({
 })
 
 
+def _is_volatile_schedule_column(column: str) -> bool:
+    """Popularity counters that tick between two page fetches of one run.
+
+    SofaScore stamps every event with how many users follow the tournament and
+    each team (``tournament_unique_tournament_user_count``,
+    ``home_team_user_count``, ``away_team_user_count``). Those numbers move
+    every few seconds, so the same match repeated across two pages disagrees on
+    them while the match itself is byte-identical — and the cross-page dedup
+    below then reported a false conflict that dropped the whole season (#1071).
+    They are followers of the entity, not facts about the match; the stored row
+    keeps whichever value the first page carried.
+    """
+
+    return column.endswith("_user_count")
+
+
 def _row_with_partition_and_lineage(
     source: Mapping[str, object],
     *,
@@ -1254,11 +1270,17 @@ def materialize_season_partition(
     # Cup during its knockout stage) can return the SAME match on two DIFFERENT
     # pages when a sibling match settles between page fetches and shifts the
     # window. Those rows carry identical match payload and differ only in the
-    # per-page raw-lineage columns, so collapse them. A duplicate that repeats
-    # within one page (same raw_blob_key) is a parser defect, and a duplicate
-    # whose match payload disagrees is a data conflict — both stay hard errors.
+    # per-page raw-lineage columns and the live popularity counters, so collapse
+    # them. A duplicate that repeats within one page (same raw_blob_key) is a
+    # parser defect, and a duplicate whose match payload disagrees is a data
+    # conflict — both stay hard errors.
     def _schedule_payload(row: Mapping[str, object]) -> dict:
-        return {k: v for k, v in row.items() if k not in _SCHEDULE_LINEAGE_COLUMNS}
+        return {
+            k: v
+            for k, v in row.items()
+            if k not in _SCHEDULE_LINEAGE_COLUMNS
+            and not _is_volatile_schedule_column(k)
+        }
 
     deduped_schedule: dict[tuple[str, str, str], dict] = {}
     for row in schedule_rows:
@@ -1268,11 +1290,27 @@ def materialize_season_partition(
         key = (league, season, str(event_id))
         existing = deduped_schedule.get(key)
         if existing is not None:
-            same_payload = _schedule_payload(existing) == _schedule_payload(row)
+            previous = _schedule_payload(existing)
+            current = _schedule_payload(row)
             cross_page = existing.get("raw_blob_key") != row.get("raw_blob_key")
-            if same_payload and cross_page:
+            if previous == current and cross_page:
                 continue
-            raise SeasonMaterializationError(f"duplicate schedule natural key: {key}")
+            # Name the disagreeing columns: without them a conflict costs a
+            # raw-store forensic dig before anyone can tell a live-feed race
+            # from a parser defect.
+            conflicts = sorted(
+                k
+                for k in set(previous) | set(current)
+                if previous.get(k) != current.get(k)
+            )
+            detail = (
+                f"conflicting columns: {conflicts}"
+                if conflicts
+                else "repeated within one page"
+            )
+            raise SeasonMaterializationError(
+                f"duplicate schedule natural key: {key} ({detail})"
+            )
         deduped_schedule[key] = row
     schedule_rows = list(deduped_schedule.values())
 
