@@ -52,8 +52,12 @@ jobs:
           cache: pip
       - name: Install import-light runtime
         run: |
+          # ruff is pinned: it gates the merge, and an unpinned linter turns
+          # every upstream release into an unreviewed change to that gate.
+          # 0.16.0 widened the default rule set and made this job fail on
+          # untouched master (844 findings here, 565 in sofascore-ci).
           python -m pip install --disable-pip-version-check \
-            pytest ruff pandas numpy pyarrow boto3==1.42.61 trino requests beautifulsoup4 lxml \
+            pytest "ruff==0.15.20" pandas numpy pyarrow boto3==1.42.61 trino requests beautifulsoup4 lxml \
             psycopg2-binary python-dotenv tenacity pybreaker rapidfuzz \
             Unidecode nicknames PyYAML jsonschema psutil
       - name: Static checks
