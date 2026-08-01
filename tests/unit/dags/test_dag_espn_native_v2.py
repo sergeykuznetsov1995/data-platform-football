@@ -34,36 +34,52 @@ def _tasks():
 
 
 def _daily_parent_context():
-    logical_date = datetime(2026, 7, 31, 12, tzinfo=timezone.utc)
-    run_id = "scheduled__2026-07-31T12:00:00+00:00"
-    child_run_id = f"espn_daily__dag_master_pipeline__{run_id}"
+    logical_date = datetime(2026, 7, 31, 14, tzinfo=timezone.utc)
+    run_id = "scheduled__2026-07-31T14:00:00+00:00"
+    child_run_id = f"espn_daily__dag_trigger_espn_daily__{run_id}"
     parent = {
-        "schema": "espn-master-parent-v1",
-        "parent_dag_id": "dag_master_pipeline",
+        "schema": "espn-daily-parent-v2",
+        "owner_profile": "espn-isolated-v1",
+        "parent_dag_id": "dag_trigger_espn_daily",
+        "parent_task_id": "trigger_espn_ingest",
         "parent_run_id": run_id,
+        "parent_run_type": "scheduled",
         "logical_date": logical_date.isoformat(),
         "data_interval_start": logical_date.isoformat(),
-        "data_interval_end": logical_date.replace(hour=13).isoformat(),
+        "data_interval_end": (logical_date + timedelta(days=1)).isoformat(),
+        "child_dag_id": "dag_ingest_espn",
         "child_run_id": child_run_id,
     }
-    trigger = SimpleNamespace(state="running", run_id=run_id)
-    master = SimpleNamespace(
-        dag_id="dag_master_pipeline",
+    trigger = SimpleNamespace(
+        dag_id="dag_trigger_espn_daily",
+        task_id="trigger_espn_ingest",
+        state="running",
         run_id=run_id,
+    )
+    owner = SimpleNamespace(
+        dag_id="dag_trigger_espn_daily",
+        run_id=run_id,
+        run_type="scheduled",
+        state="running",
         logical_date=logical_date,
         data_interval_start=logical_date,
-        data_interval_end=logical_date.replace(hour=13),
+        data_interval_end=logical_date + timedelta(days=1),
         get_task_instance=lambda **_kwargs: trigger,
     )
     context = {
-        "dag_run": SimpleNamespace(conf={"espn_parent": parent}),
+        "dag": SimpleNamespace(dag_id="dag_ingest_espn"),
+        "dag_run": SimpleNamespace(
+            dag_id="dag_ingest_espn",
+            run_id=child_run_id,
+            conf={"espn_parent": parent},
+        ),
         "logical_date": logical_date,
         "run_id": child_run_id,
     }
-    return context, master
+    return context, owner
 
 
-def test_daily_has_one_master_owner_and_real_two_wave_chain():
+def test_daily_has_one_isolated_owner_and_real_two_wave_chain():
     module = _reload("dag_ingest_espn")
     tasks = _tasks()
 
@@ -725,7 +741,7 @@ def test_production_compose_provisions_exactly_one_espn_http_slot():
     assert "create_host_path: false" in espn_mount
 
 
-def test_master_triggers_espn_as_exact_optional_independent_branch():
+def test_shared_master_envelope_is_legacy_and_cannot_satisfy_daily_v2_admission():
     _reload("dag_master_pipeline")
     tasks = _tasks()
     trigger = tasks["ingestion_triggers.trigger_espn"]
@@ -750,45 +766,135 @@ def test_master_triggers_espn_as_exact_optional_independent_branch():
     }
 
 
-def test_daily_admission_binds_real_exact_master_run(monkeypatch):
+def test_daily_admission_binds_real_exact_isolated_owner_run(monkeypatch):
     from dags.utils import espn_native_tasks
 
-    context, master = _daily_parent_context()
-    monkeypatch.setattr(espn_native_tasks, "_exact_parent_run", lambda _run_id: master)
+    context, owner = _daily_parent_context()
+    monkeypatch.setattr(espn_native_tasks, "_exact_parent_run", lambda *_args: owner)
 
     parent = espn_native_tasks._daily_parent(context)
 
-    assert parent["parent_run_id"] == master.run_id
+    assert parent["parent_run_id"] == owner.run_id
+    assert parent["owner_profile"] == "espn-isolated-v1"
 
 
 def test_daily_admission_rejects_forged_child_or_stale_interval(monkeypatch):
     from dags.utils import espn_native_tasks
 
-    context, master = _daily_parent_context()
-    monkeypatch.setattr(espn_native_tasks, "_exact_parent_run", lambda _run_id: master)
+    context, owner = _daily_parent_context()
+    monkeypatch.setattr(espn_native_tasks, "_exact_parent_run", lambda *_args: owner)
     context["dag_run"].conf["espn_parent"]["child_run_id"] = "forged"
     with pytest.raises(espn_native_tasks.OperationsError, match="deterministic child"):
         espn_native_tasks._daily_parent(context)
 
-    context, master = _daily_parent_context()
-    monkeypatch.setattr(espn_native_tasks, "_exact_parent_run", lambda _run_id: master)
+    context, owner = _daily_parent_context()
+    monkeypatch.setattr(espn_native_tasks, "_exact_parent_run", lambda *_args: owner)
     context["dag_run"].conf["espn_parent"]["data_interval_end"] = (
-        context["logical_date"].replace(hour=14).isoformat()
-    )
+        context["logical_date"] + timedelta(hours=23)
+    ).isoformat()
     with pytest.raises(espn_native_tasks.OperationsError, match="data_interval_end"):
         espn_native_tasks._daily_parent(context)
 
 
-def test_daily_admission_rejects_inactive_master_trigger(monkeypatch):
+def test_daily_admission_rejects_inactive_owner_trigger(monkeypatch):
     from dags.utils import espn_native_tasks
 
-    context, master = _daily_parent_context()
-    master.get_task_instance = lambda **_kwargs: SimpleNamespace(
-        state="failed", run_id=master.run_id
+    context, owner = _daily_parent_context()
+    owner.get_task_instance = lambda **_kwargs: SimpleNamespace(
+        dag_id="dag_trigger_espn_daily",
+        task_id="trigger_espn_ingest",
+        state="failed",
+        run_id=owner.run_id,
     )
-    monkeypatch.setattr(espn_native_tasks, "_exact_parent_run", lambda _run_id: master)
+    monkeypatch.setattr(espn_native_tasks, "_exact_parent_run", lambda *_args: owner)
 
     with pytest.raises(espn_native_tasks.OperationsError, match="not active"):
+        espn_native_tasks._daily_parent(context)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("owner_profile", "unknown-v9", "profile"),
+        ("schema", "espn-master-parent-v1", "schema"),
+        ("parent_dag_id", "dag_master_pipeline", "DAG"),
+        ("parent_task_id", "ingestion_triggers.trigger_espn", "task"),
+        ("parent_run_type", "manual", "run type"),
+        ("child_dag_id", "dag_repair_espn", "child DAG"),
+    ],
+)
+def test_daily_admission_rejects_unknown_profile_and_identity_drift(
+    monkeypatch, field, value, message
+):
+    from dags.utils import espn_native_tasks
+
+    context, owner = _daily_parent_context()
+    context["dag_run"].conf["espn_parent"][field] = value
+    monkeypatch.setattr(espn_native_tasks, "_exact_parent_run", lambda *_args: owner)
+
+    with pytest.raises(espn_native_tasks.OperationsError, match=message):
+        espn_native_tasks._daily_parent(context)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("run_type", "manual", "scheduled"),
+        ("run_id", "scheduled__forged", "run ID"),
+        ("dag_id", "dag_master_pipeline", "DAG"),
+    ],
+)
+def test_daily_admission_rejects_metadata_owner_drift(
+    monkeypatch, field, value, message
+):
+    from dags.utils import espn_native_tasks
+
+    context, owner = _daily_parent_context()
+    setattr(owner, field, value)
+    monkeypatch.setattr(espn_native_tasks, "_exact_parent_run", lambda *_args: owner)
+
+    with pytest.raises(espn_native_tasks.OperationsError, match=message):
+        espn_native_tasks._daily_parent(context)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("dag_id", "dag_master_pipeline"),
+        ("task_id", "ingestion_triggers.trigger_espn"),
+        ("run_id", "scheduled__forged"),
+    ],
+)
+def test_daily_admission_rejects_metadata_trigger_identity_drift(
+    monkeypatch, field, value
+):
+    from dags.utils import espn_native_tasks
+
+    context, owner = _daily_parent_context()
+    trigger = owner.get_task_instance()
+    setattr(trigger, field, value)
+    owner.get_task_instance = lambda **_kwargs: trigger
+    monkeypatch.setattr(espn_native_tasks, "_exact_parent_run", lambda *_args: owner)
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="task identity"):
+        espn_native_tasks._daily_parent(context)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("dag_id", "dag_repair_espn"),
+        ("run_id", "manual__forged"),
+    ],
+)
+def test_daily_admission_rejects_child_dagrun_identity_drift(monkeypatch, field, value):
+    from dags.utils import espn_native_tasks
+
+    context, owner = _daily_parent_context()
+    setattr(context["dag_run"], field, value)
+    monkeypatch.setattr(espn_native_tasks, "_exact_parent_run", lambda *_args: owner)
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="child DagRun"):
         espn_native_tasks._daily_parent(context)
 
 

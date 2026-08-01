@@ -94,8 +94,8 @@ def _evidence(tmp_path: Path) -> tuple[Path, list[dict]]:
     green_runs = []
     for attempt in range(1, 4):
         as_of = f"2026-07-{28 + attempt:02d}"
-        parent_run_id = f"scheduled__{as_of}T00:00:00+00:00"
-        run_id = f"espn_daily__dag_master_pipeline__{parent_run_id}"
+        parent_run_id = f"scheduled__{as_of}T14:00:00+00:00"
+        run_id = f"espn_daily__dag_trigger_espn_daily__{parent_run_id}"
         plan_signature = str(attempt) * 64
         generation_signature = chr(97 + attempt) * 64
         generation_manifest_sha256 = ("def0"[attempt]) * 64
@@ -250,17 +250,21 @@ def _evidence(tmp_path: Path) -> tuple[Path, list[dict]]:
                 "failures": [],
             },
         )
-        logical_date = f"{as_of}T00:00:00+00:00"
+        logical_date = f"{as_of}T14:00:00+00:00"
         interval_end = (
             datetime.fromisoformat(logical_date) + timedelta(days=1)
         ).isoformat()
         parent = {
-            "schema": "espn-master-parent-v1",
-            "parent_dag_id": "dag_master_pipeline",
+            "schema": "espn-daily-parent-v2",
+            "owner_profile": "espn-isolated-v1",
+            "parent_dag_id": "dag_trigger_espn_daily",
+            "parent_task_id": "trigger_espn_ingest",
             "parent_run_id": parent_run_id,
+            "parent_run_type": "scheduled",
             "logical_date": logical_date,
             "data_interval_start": logical_date,
             "data_interval_end": interval_end,
+            "child_dag_id": "dag_ingest_espn",
             "child_run_id": run_id,
         }
         receipt = {
@@ -326,6 +330,38 @@ def _evidence(tmp_path: Path) -> tuple[Path, list[dict]]:
     evidence_path = tmp_path / "promotion-evidence.json"
     evidence_path.write_text(json.dumps(document), encoding="utf-8")
     return evidence_path, green_runs
+
+
+def _rewrite_success_parent(
+    evidence_path: Path,
+    green_runs: list[dict],
+    *,
+    index: int,
+    parent: dict,
+) -> None:
+    document = json.loads(evidence_path.read_text())
+    success_path = Path(
+        green_runs[index]["success_receipt_ref"]["uri"].removeprefix("file://")
+    )
+    success = json.loads(success_path.read_text())
+    success["parent"] = parent
+    success.pop("receipt_sha256")
+    success["receipt_sha256"] = hashlib.sha256(
+        (
+            json.dumps(
+                success,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode()
+    ).hexdigest()
+    success_ref = _write_json(
+        success_path.with_name(f"run-success-rewritten-{index}.json"), success
+    )
+    document["green_runs"][index]["success_receipt_ref"] = success_ref
+    evidence_path.write_text(json.dumps(document), encoding="utf-8")
 
 
 class FakeBackend:
@@ -626,6 +662,63 @@ def test_cutover_time_must_follow_all_three_green_runs(tmp_path):
     evidence_path.write_text(json.dumps(document), encoding="utf-8")
 
     with pytest.raises(MigrationError, match="after the third green run"):
+        load_promotion_evidence(evidence_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("owner_profile", "unknown-v9", "profile"),
+        ("schema", "espn-master-parent-v1", "identity"),
+        ("parent_dag_id", "dag_master_pipeline", "identity"),
+        ("parent_task_id", "ingestion_triggers.trigger_espn", "identity"),
+        ("parent_run_type", "manual", "identity"),
+        ("child_dag_id", "dag_repair_espn", "identity"),
+    ],
+)
+def test_promotion_rejects_nonisolated_parent_v2_evidence(
+    tmp_path, field, value, message
+):
+    evidence_path, green = _evidence(tmp_path)
+    success_path = Path(green[0]["success_receipt_ref"]["uri"].removeprefix("file://"))
+    parent = json.loads(success_path.read_text())["parent"]
+    parent[field] = value
+    _rewrite_success_parent(evidence_path, green, index=0, parent=parent)
+
+    with pytest.raises(MigrationError, match=message):
+        load_promotion_evidence(evidence_path)
+
+
+def test_promotion_rejects_old_master_v1_envelope(tmp_path):
+    evidence_path, green = _evidence(tmp_path)
+    success_path = Path(green[0]["success_receipt_ref"]["uri"].removeprefix("file://"))
+    receipt = json.loads(success_path.read_text())
+    v2 = receipt["parent"]
+    old_parent = {
+        "schema": "espn-master-parent-v1",
+        "parent_dag_id": "dag_master_pipeline",
+        "parent_run_id": v2["parent_run_id"],
+        "logical_date": v2["logical_date"],
+        "data_interval_start": v2["data_interval_start"],
+        "data_interval_end": v2["data_interval_end"],
+        "child_run_id": v2["child_run_id"],
+    }
+    _rewrite_success_parent(evidence_path, green, index=0, parent=old_parent)
+
+    with pytest.raises(MigrationError, match="parent schema"):
+        load_promotion_evidence(evidence_path)
+
+
+def test_promotion_requires_exact_adjacent_daily_owner_intervals(tmp_path):
+    evidence_path, green = _evidence(tmp_path)
+    success_path = Path(green[1]["success_receipt_ref"]["uri"].removeprefix("file://"))
+    parent = json.loads(success_path.read_text())["parent"]
+    parent["data_interval_start"] = (
+        datetime.fromisoformat(parent["data_interval_start"]) + timedelta(minutes=1)
+    ).isoformat()
+    _rewrite_success_parent(evidence_path, green, index=1, parent=parent)
+
+    with pytest.raises(MigrationError, match="daily interval"):
         load_promotion_evidence(evidence_path)
 
 

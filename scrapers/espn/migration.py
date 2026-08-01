@@ -21,6 +21,14 @@ from urllib.parse import unquote, urlparse
 
 import yaml
 
+from .daily_owner import (
+    DAILY_PARENT_FIELDS,
+    SCHEDULED_RUN_TYPE,
+    DailyOwnerError,
+    daily_child_run_id,
+    resolve_daily_owner_profile,
+    standard_scheduled_run_id,
+)
 from .operations import PostgresEspnControlStore
 from .repository import (
     BASELINE_TABLE,
@@ -588,39 +596,52 @@ def _load_green_run(
         success.get("registry_ref"), field=f"{field}.success.registry_ref"
     )
     parent = success.get("parent")
-    parent_keys = {
-        "schema",
-        "parent_dag_id",
-        "parent_run_id",
-        "logical_date",
-        "data_interval_start",
-        "data_interval_end",
-        "child_run_id",
-    }
-    if not isinstance(parent, Mapping) or set(parent) != parent_keys:
+    if not isinstance(parent, Mapping) or set(parent) != DAILY_PARENT_FIELDS:
         raise MigrationError(f"{field} success receipt parent schema mismatch")
+    try:
+        profile = resolve_daily_owner_profile(parent.get("owner_profile"))
+    except DailyOwnerError as exc:
+        raise MigrationError(f"{field} daily owner profile is unknown") from exc
     parent_run_id = _required(parent.get("parent_run_id"), f"{field}.parent_run_id")
-    expected_child = f"espn_daily__dag_master_pipeline__{parent_run_id}"
+    expected_child = daily_child_run_id(parent_run_id)
     if (
         parent.get("schema"),
         parent.get("parent_dag_id"),
+        parent.get("parent_task_id"),
+        parent.get("parent_run_type"),
+        parent.get("child_dag_id"),
         parent.get("child_run_id"),
         run_id,
     ) != (
-        "espn-master-parent-v1",
-        "dag_master_pipeline",
+        profile.envelope_schema,
+        profile.parent_dag_id,
+        profile.trigger_task_id,
+        SCHEDULED_RUN_TYPE,
+        profile.child_dag_id,
         expected_child,
         expected_child,
     ):
         raise MigrationError(f"{field} daily owner identity mismatch")
     logical_date = _utc(success.get("logical_date"), f"{field}.logical_date")
+    parent_logical_date = _utc(
+        parent.get("logical_date"), f"{field}.parent_logical_date"
+    )
     interval_start = _utc(
         parent.get("data_interval_start"), f"{field}.data_interval_start"
     )
     interval_end = _utc(parent.get("data_interval_end"), f"{field}.data_interval_end")
     if (
-        parent.get("logical_date") != logical_date.isoformat()
-        or interval_start >= interval_end
+        parent_logical_date != logical_date
+        or interval_start != logical_date
+        or interval_end - interval_start != timedelta(days=1)
+        or (
+            interval_start.hour,
+            interval_start.minute,
+            interval_start.second,
+            interval_start.microsecond,
+        )
+        != (14, 0, 0, 0)
+        or parent_run_id != standard_scheduled_run_id(logical_date)
     ):
         raise MigrationError(f"{field} daily interval identity mismatch")
     matching_dq = (
@@ -804,7 +825,7 @@ def load_promotion_evidence(
         or right.logical_date.date() != left.logical_date.date() + timedelta(days=1)
         for left, right in zip(runs, runs[1:])
     ):
-        raise MigrationError("green runs must have adjacent master data intervals")
+        raise MigrationError("green runs must have adjacent daily-owner data intervals")
     if (
         any(
             item.run_registry_snapshot_ref.sha256 != registry_ref.sha256

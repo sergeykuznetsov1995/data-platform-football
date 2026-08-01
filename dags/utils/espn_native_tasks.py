@@ -17,6 +17,16 @@ import re
 from typing import Any, Callable, Mapping, Sequence
 
 from scrapers.espn.models import IngestPlan, ScopePlan
+from scrapers.espn.daily_owner import (
+    ACTIVE_TRIGGER_STATES,
+    DAILY_PARENT_FIELDS,
+    ESPN_ISOLATED_V1,
+    SCHEDULED_RUN_TYPE,
+    DailyOwnerError,
+    daily_child_run_id,
+    resolve_daily_owner_profile,
+    standard_scheduled_run_id,
+)
 from scrapers.espn.operations import (
     LeaseConflict,
     LeaseLost,
@@ -323,82 +333,119 @@ def _iso_utc(value: object, field: str) -> str:
     return value.astimezone(UTC).isoformat()
 
 
-def _exact_parent_run(parent_run_id: str):
-    """Load exactly one master DagRun from Airflow metadata."""
+def _exact_parent_run(profile: object, parent_run_id: str):
+    """Load exactly one frozen-profile DagRun from Airflow metadata."""
 
     from airflow.models import DagRun
 
     matches = DagRun.find(
-        dag_id="dag_master_pipeline",
+        dag_id=getattr(profile, "parent_dag_id", None),
         run_id=_required(parent_run_id, "parent_run_id"),
     )
     if len(matches) != 1:
-        raise OperationsError("daily ESPN exact master parent was not found")
+        raise OperationsError("daily ESPN exact isolated parent was not found")
     return matches[0]
 
 
 def _daily_parent(context: Mapping[str, Any]) -> dict[str, str]:
     dag_run = context.get("dag_run")
+    context_run_id = context.get("run_id")
+    if (
+        getattr(dag_run, "dag_id", None) != ESPN_ISOLATED_V1.child_dag_id
+        or getattr(dag_run, "run_id", None) != context_run_id
+    ):
+        raise OperationsError("daily ESPN child DagRun identity mismatch")
     conf = getattr(dag_run, "conf", None) or {}
     parent = conf.get("espn_parent")
-    expected_keys = {
-        "schema",
-        "parent_dag_id",
-        "parent_run_id",
-        "logical_date",
-        "data_interval_start",
-        "data_interval_end",
-        "child_run_id",
-    }
-    if not isinstance(parent, Mapping) or set(parent) != expected_keys:
-        raise OperationsError("daily ESPN admission requires exact master parent")
-    if parent["schema"] != "espn-master-parent-v1":
+    if not isinstance(parent, Mapping) or set(parent) != DAILY_PARENT_FIELDS:
+        raise OperationsError("daily ESPN admission requires exact isolated parent")
+    try:
+        profile = resolve_daily_owner_profile(parent.get("owner_profile"))
+    except DailyOwnerError as exc:
+        raise OperationsError(f"daily ESPN owner profile rejected: {exc}") from exc
+    if parent["schema"] != profile.envelope_schema:
         raise OperationsError("daily ESPN parent schema mismatch")
-    if parent["parent_dag_id"] != "dag_master_pipeline":
+    if parent["parent_dag_id"] != profile.parent_dag_id:
         raise OperationsError("daily ESPN parent DAG mismatch")
+    if parent["parent_task_id"] != profile.trigger_task_id:
+        raise OperationsError("daily ESPN parent task mismatch")
+    if parent["parent_run_type"] != SCHEDULED_RUN_TYPE:
+        raise OperationsError("daily ESPN parent run type mismatch")
+    if parent["child_dag_id"] != profile.child_dag_id:
+        raise OperationsError("daily ESPN child DAG mismatch")
+    child_dag = context.get("dag")
+    if getattr(child_dag, "dag_id", None) != profile.child_dag_id:
+        raise OperationsError("daily ESPN runtime child DAG mismatch")
     parent_run_id = _required(parent["parent_run_id"], "parent_run_id")
-    expected_child_run_id = f"espn_daily__dag_master_pipeline__{parent_run_id}"
+    expected_child_run_id = daily_child_run_id(parent_run_id)
     if parent["child_run_id"] != expected_child_run_id:
         raise OperationsError("daily ESPN deterministic child identity mismatch")
-    if parent["child_run_id"] != context.get("run_id"):
+    if parent["child_run_id"] != context_run_id:
         raise OperationsError("daily ESPN child run identity mismatch")
     if parent["logical_date"] != _logical_date(context).isoformat():
         raise OperationsError("daily ESPN logical-date binding mismatch")
-    master_run = _exact_parent_run(parent_run_id)
-    if getattr(master_run, "dag_id", None) != parent["parent_dag_id"]:
+    parent_run = _exact_parent_run(profile, parent_run_id)
+    if getattr(parent_run, "dag_id", None) != profile.parent_dag_id:
         raise OperationsError("daily ESPN metadata parent DAG mismatch")
-    if getattr(master_run, "run_id", None) != parent_run_id:
-        raise OperationsError("daily ESPN metadata parent run mismatch")
+    if getattr(parent_run, "run_id", None) != parent_run_id:
+        raise OperationsError("daily ESPN metadata parent run ID mismatch")
+    metadata_run_type = getattr(
+        getattr(parent_run, "run_type", None),
+        "value",
+        getattr(parent_run, "run_type", None),
+    )
+    if str(metadata_run_type or "").lower().split(".")[-1] != SCHEDULED_RUN_TYPE:
+        raise OperationsError("daily ESPN metadata parent is not scheduled")
+    parent_state = getattr(
+        getattr(parent_run, "state", None),
+        "value",
+        getattr(parent_run, "state", None),
+    )
+    if str(parent_state or "").lower().split(".")[-1] != "running":
+        raise OperationsError("daily ESPN metadata parent run is not active")
     exact_dates = {
         "logical_date": _iso_utc(
-            getattr(master_run, "logical_date", None), "parent logical_date"
+            getattr(parent_run, "logical_date", None), "parent logical_date"
         ),
         "data_interval_start": _iso_utc(
-            getattr(master_run, "data_interval_start", None),
+            getattr(parent_run, "data_interval_start", None),
             "parent data_interval_start",
         ),
         "data_interval_end": _iso_utc(
-            getattr(master_run, "data_interval_end", None),
+            getattr(parent_run, "data_interval_end", None),
             "parent data_interval_end",
         ),
     }
     for field, actual in exact_dates.items():
         if parent[field] != actual:
             raise OperationsError(f"daily ESPN parent {field} binding mismatch")
-    trigger_instance = master_run.get_task_instance(
-        task_id="ingestion_triggers.trigger_espn"
-    )
+    metadata_logical = datetime.fromisoformat(exact_dates["logical_date"])
+    metadata_start = datetime.fromisoformat(exact_dates["data_interval_start"])
+    metadata_end = datetime.fromisoformat(exact_dates["data_interval_end"])
+    if (
+        parent_run_id != standard_scheduled_run_id(metadata_logical)
+        or metadata_logical != metadata_start
+        or metadata_end - metadata_start != timedelta(days=1)
+        or (
+            metadata_start.hour,
+            metadata_start.minute,
+            metadata_start.second,
+            metadata_start.microsecond,
+        )
+        != (14, 0, 0, 0)
+    ):
+        raise OperationsError("daily ESPN metadata parent run ID/interval mismatch")
+    trigger_instance = parent_run.get_task_instance(task_id=profile.trigger_task_id)
+    if (
+        getattr(trigger_instance, "dag_id", None) != profile.parent_dag_id
+        or getattr(trigger_instance, "task_id", None) != profile.trigger_task_id
+        or getattr(trigger_instance, "run_id", None) != parent_run_id
+    ):
+        raise OperationsError("daily ESPN parent trigger task identity mismatch")
     trigger_state = getattr(trigger_instance, "state", None)
     trigger_state = getattr(trigger_state, "value", trigger_state)
-    if str(trigger_state or "").lower() not in {
-        "running",
-        "deferred",
-        "up_for_reschedule",
-        "success",
-    }:
-        raise OperationsError("daily ESPN master trigger task is not active")
-    if getattr(trigger_instance, "run_id", parent_run_id) != parent_run_id:
-        raise OperationsError("daily ESPN master trigger task run mismatch")
+    if str(trigger_state or "").lower().split(".")[-1] not in ACTIVE_TRIGGER_STATES:
+        raise OperationsError("daily ESPN owner trigger task is not active")
     return {key: str(parent[key]) for key in sorted(parent)}
 
 
@@ -412,7 +459,7 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
     if mode != "daily":
         dag_run = context.get("dag_run")
         if (getattr(dag_run, "conf", None) or {}).get("espn_parent") is not None:
-            raise OperationsError("manual ESPN mode forbids master daily parent")
+            raise OperationsError("manual ESPN mode forbids isolated daily parent")
     registry_path = Path(
         os.environ.get(REGISTRY_ENV, "/opt/airflow/configs/espn/registry.yaml")
     )

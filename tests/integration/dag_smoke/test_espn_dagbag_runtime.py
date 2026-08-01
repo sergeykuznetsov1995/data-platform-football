@@ -16,13 +16,26 @@ ESPN_DAG_FILES = (
     "dag_replay_espn.py",
     "dag_discover_espn_registry.py",
     "dag_monitor_espn.py",
+    "dag_trigger_espn_daily.py",
 )
 ESPN_DAG_IDS = {path.removesuffix(".py") for path in ESPN_DAG_FILES}
+MASTER_DAG_FILE = "dag_master_pipeline.py"
+
+
+def _copy_isolated_projection(dag_folder: Path) -> None:
+    """Project reviewed ESPN DAGs while proving the shared master is ignored."""
+
+    for filename in (*ESPN_DAG_FILES, MASTER_DAG_FILE):
+        shutil.copy2(ROOT / "dags" / filename, dag_folder / filename)
+    shutil.copy2(
+        ROOT / "configs" / "espn" / "isolated.airflowignore",
+        dag_folder / ".airflowignore",
+    )
 
 
 @pytest.mark.integration
 def test_real_airflow_safe_mode_loads_every_espn_dag_with_return_value_maps(
-    tmp_path,
+    tmp_path, monkeypatch
 ):
     try:
         import airflow
@@ -37,8 +50,10 @@ def test_real_airflow_safe_mode_loads_every_espn_dag_with_return_value_maps(
 
     dag_folder = tmp_path / "espn-dags"
     dag_folder.mkdir()
-    for filename in ESPN_DAG_FILES:
-        shutil.copy2(ROOT / "dags" / filename, dag_folder / filename)
+    _copy_isolated_projection(dag_folder)
+    assert (dag_folder / MASTER_DAG_FILE).is_file()
+
+    monkeypatch.setenv("ESPN_ISOLATED_STACK", "1")
 
     bag = DagBag(
         dag_folder=str(dag_folder),
@@ -48,6 +63,8 @@ def test_real_airflow_safe_mode_loads_every_espn_dag_with_return_value_maps(
 
     assert bag.import_errors == {}
     assert set(bag.dags) == ESPN_DAG_IDS
+    assert len(bag.dags) == 7
+    assert "dag_master_pipeline" not in bag.dags
     mapped_count = 0
     for dag in bag.dags.values():
         for task in dag.tasks:
@@ -60,3 +77,26 @@ def test_real_airflow_safe_mode_loads_every_espn_dag_with_return_value_maps(
                 assert references
                 assert {key for _operator, key in references} == {XCOM_RETURN_KEY}
     assert mapped_count == 23
+
+
+@pytest.mark.integration
+def test_real_airflow_projection_omits_owner_without_exact_role(tmp_path, monkeypatch):
+    try:
+        import airflow
+        from airflow.models import DagBag
+    except ImportError:
+        pytest.skip("real Airflow is not installed in the host unit environment")
+    if not isinstance(getattr(airflow, "__version__", None), str):
+        pytest.skip("unit-test Airflow stubs cannot parse mapped DAGs")
+
+    dag_folder = tmp_path / "espn-dags"
+    dag_folder.mkdir()
+    _copy_isolated_projection(dag_folder)
+    assert (dag_folder / MASTER_DAG_FILE).is_file()
+    monkeypatch.delenv("ESPN_ISOLATED_STACK", raising=False)
+
+    bag = DagBag(dag_folder=str(dag_folder), include_examples=False, safe_mode=True)
+
+    assert bag.import_errors == {}
+    assert set(bag.dags) == ESPN_DAG_IDS - {"dag_trigger_espn_daily"}
+    assert "dag_master_pipeline" not in bag.dags

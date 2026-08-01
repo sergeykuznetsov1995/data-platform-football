@@ -20,6 +20,7 @@ FORBIDDEN_MODULE = "soccerdata"
 FORBIDDEN_MODULES = ("soccerdata", "scrapers.espn.scraper")
 FORBIDDEN_FACADE = "scrapers.espn.ESPNScraper"
 RUNTIME_MODULES = (
+    "scrapers.espn.daily_owner",
     "scrapers.espn.registry",
     "scrapers.espn.discovery",
     "scrapers.espn.raw_store",
@@ -38,6 +39,7 @@ RUNTIME_MODULES = (
     "dag_replay_espn",
     "dag_monitor_espn",
     "dag_discover_espn_registry",
+    "dag_trigger_espn_daily",
     "dags.scripts.run_espn_scraper",
     "migrate_espn_native_v2",
     "audit_espn_repair",
@@ -288,6 +290,7 @@ def _install_airflow_probe_stubs() -> dict[str, object] | None:
     params = types.ModuleType("airflow.models.param")
     operators = types.ModuleType("airflow.operators")
     python = types.ModuleType("airflow.operators.python")
+    trigger_dagrun = types.ModuleType("airflow.operators.trigger_dagrun")
 
     class _XCom:
         def __init__(self, operator, key=None):
@@ -341,10 +344,12 @@ def _install_airflow_probe_stubs() -> dict[str, object] | None:
     models.DAG = _DAG
     params.Param = _Param
     python.PythonOperator = _Operator
+    trigger_dagrun.TriggerDagRunOperator = _Operator
     airflow.models = models
     airflow.operators = operators
     models.param = params
     operators.python = python
+    operators.trigger_dagrun = trigger_dagrun
     sys.modules.update(
         {
             "airflow": airflow,
@@ -352,6 +357,7 @@ def _install_airflow_probe_stubs() -> dict[str, object] | None:
             "airflow.models.param": params,
             "airflow.operators": operators,
             "airflow.operators.python": python,
+            "airflow.operators.trigger_dagrun": trigger_dagrun,
         }
     )
     return saved

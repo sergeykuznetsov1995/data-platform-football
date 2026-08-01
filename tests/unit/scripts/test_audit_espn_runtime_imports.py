@@ -18,6 +18,8 @@ def test_production_surface_includes_native_runtime_but_not_retained_legacy():
     assert "dags/utils/espn_native_tasks.py" in paths
     assert "dags/scripts/run_espn_scraper.py" in paths
     assert "dags/dag_discover_espn_registry.py" in paths
+    assert "dags/dag_trigger_espn_daily.py" in paths
+    assert "scrapers/espn/daily_owner.py" in paths
     assert "scrapers/espn/scraper.py" not in paths
     assert "scrapers/espn/__init__.py" not in paths
 
@@ -124,4 +126,7 @@ def test_actual_static_and_runtime_gate_is_machine_readable_and_green():
     assert report["status"] == "pass"
     assert report["static_findings"] == []
     assert all(item["status"] == "imported" for item in report["runtime_probe"])
+    imported = {item["module"] for item in report["runtime_probe"]}
+    assert "scrapers.espn.daily_owner" in imported
+    assert "dag_trigger_espn_daily" in imported
     assert len(report["result_sha256"]) == 64
