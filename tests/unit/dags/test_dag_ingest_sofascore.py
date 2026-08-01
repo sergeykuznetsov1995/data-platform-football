@@ -62,8 +62,15 @@ def _bash_task(task_id):
 def _patch_active_catalog(monkeypatch, competition_ids, source_seasons=None):
     """Replace the read-only registry consumer for one DAG import."""
     from scrapers.sofascore.catalog import SofaScoreCatalog
+    from utils.config import CURRENT_SEASON
 
     configured = source_seasons or {}
+    # The DAG demands the season it is scheduled for, and that rolls over every
+    # 1 August (utils.config.get_current_season). A literal here silently rots
+    # into "scheduled season is missing from the SofaScore registry" on that
+    # date — derive it exactly the way dag_ingest_sofascore does. Tests that
+    # need a *stale* season still pass one explicitly via source_seasons.
+    club_season = f"{CURRENT_SEASON % 100:02d}{(CURRENT_SEASON + 1) % 100:02d}"
 
     class _Catalog:
         @staticmethod
@@ -72,7 +79,7 @@ def _patch_active_catalog(monkeypatch, competition_ids, source_seasons=None):
 
         @staticmethod
         def competition(competition_id):
-            default = "2026" if competition_id.startswith("INT-") else "2526"
+            default = "2026" if competition_id.startswith("INT-") else club_season
             seasons = configured.get(competition_id, (default,))
             return SimpleNamespace(
                 seasons=tuple(
