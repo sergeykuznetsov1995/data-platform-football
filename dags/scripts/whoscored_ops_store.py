@@ -50,6 +50,12 @@ MATCH_REQUEST_UNITS_PER_GAME = 1
 PREVIEW_REQUEST_UNITS_PER_GAME = 1
 PROFILE_REQUESTS_PER_PLAYER = 1
 ROSTER_REQUEST_UNITS = 0
+# Provenance fields that describe when a plan was frozen rather than what it
+# covers.  They must stay out of the plan identity so a resumed run reuses the
+# stored plan (and its receipts) instead of minting a new one.
+PLAN_IDENTITY_EXCLUDED_PROVENANCE = frozenset(
+    {"backfill_started_at", "backfill_deadline_at"}
+)
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]{1,120}$")
 _T = TypeVar("_T")
 
@@ -474,6 +480,24 @@ class WhoScoredBackfillState:
         return result
 
     @staticmethod
+    def _identity_provenance(
+        provenance: Optional[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Drop the wall-clock fields so a resumed plan keeps its identity.
+
+        ``backfill_started_at`` and its derived deadline describe *when* a plan
+        was first frozen, not *what* it covers.  Hashing them made every run
+        mint a fresh plan id, which orphaned the receipts of the previous run
+        and restarted the queue from the first chunk forever.
+        """
+
+        return {
+            key: value
+            for key, value in dict(provenance or {}).items()
+            if key not in PLAN_IDENTITY_EXCLUDED_PROVENANCE
+        }
+
+    @staticmethod
     def plan_id(
         selector: Mapping[str, Any],
         scopes: Iterable[str],
@@ -485,7 +509,7 @@ class WhoScoredBackfillState:
         frozen = {
             "selector": dict(selector),
             "scopes": normalized_scopes,
-            "provenance": dict(provenance or {}),
+            "provenance": WhoScoredBackfillState._identity_provenance(provenance),
             "policy": dict(policy or _policy_identity()),
             "schedule_stage_ids": WhoScoredBackfillState._normalise_schedule_stage_ids(
                 normalized_scopes,

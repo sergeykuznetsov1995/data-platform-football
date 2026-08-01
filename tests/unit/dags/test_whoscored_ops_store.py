@@ -121,6 +121,42 @@ def test_plan_identity_binds_catalog_generation_and_candidate_policy(
 
 
 @pytest.mark.unit
+def test_plan_identity_ignores_when_the_backfill_was_started(monkeypatch, tmp_path):
+    # A resumed run freezes the same work at a later wall-clock time.  Hashing
+    # that timestamp minted a new plan per run, orphaning every receipt and
+    # restarting the queue from the first chunk forever.
+    state = _state(monkeypatch, tmp_path)
+    common = {
+        "queue_id": "q",
+        "selector": {"scopes": ["WS-1=2026"]},
+        "scopes": ["WS-1=2026"],
+        "schedule_stage_ids": {"WS-1=2026": [1]},
+    }
+    first = state.create_plan(
+        provenance={
+            "catalog_batch_id": "wsc2-one",
+            "backfill_started_at": "2026-07-31T18:13:48+00:00",
+            "backfill_deadline_at": "2026-08-30T18:13:48+00:00",
+        },
+        **common,
+    )
+    resumed = state.create_plan(
+        provenance={
+            "catalog_batch_id": "wsc2-one",
+            "backfill_started_at": "2026-07-31T20:51:04+00:00",
+            "backfill_deadline_at": "2026-08-30T20:51:04+00:00",
+        },
+        **common,
+    )
+
+    assert resumed["plan_id"] == first["plan_id"]
+    # The stored plan wins, so the deadline still counts from the first freeze.
+    assert resumed["provenance"]["backfill_started_at"] == (
+        "2026-07-31T18:13:48+00:00"
+    )
+
+
+@pytest.mark.unit
 def test_catalog_backfill_plan_rejects_missing_frozen_stage_identities(
     monkeypatch, tmp_path
 ):
