@@ -2128,6 +2128,255 @@ def test_discovery_detail_fetch_saves_three_exact_evidence_documents(monkeypatch
     assert detail["summary_event_id"] == "401000001"
 
 
+def test_discovery_detail_fetch_records_missing_summary_404(monkeypatch):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.transport_contracts import EndpointType, HttpStatusError
+
+    batch_ref = {"uri": "s3://artifacts/batch.json", "sha256": "a" * 64}
+    batch = {
+        "kind": "espn-discovery-detail-batch-v1",
+        "batch_id": "batch-1",
+        "competitions": [
+            {"espn_id": 730, "slug": "fifa.wwcq.ply", "name": "WWCQ Playoff"}
+        ],
+    }
+    scoreboard = json.loads(
+        (ROOT / "tests/fixtures/espn/native_scoreboard.json").read_text()
+    )
+    scoreboard["leagues"][0].update({"id": "730", "slug": "fifa.wwcq.ply"})
+    calls = []
+
+    class Client:
+        def fetch_json(
+            self,
+            url,
+            endpoint,
+            params=None,
+            *,
+            competition_id=None,
+            event_id=None,
+            force_refresh=False,
+        ):
+            calls.append(endpoint)
+            if endpoint is EndpointType.SUMMARY:
+                raise HttpStatusError(
+                    404,
+                    "missing optional Summary",
+                    ledger_entry=SimpleNamespace(direct_bytes=7, proxy_bytes=5),
+                )
+            document = (
+                {"id": "730", "slug": "fifa.wwcq.ply"}
+                if endpoint is EndpointType.CATALOG
+                else scoreboard
+            )
+            index = len(calls)
+            return SimpleNamespace(
+                json_data=document,
+                raw_uri=f"s3://raw/{index}.json",
+                content_hash=str(index) * 64,
+                direct_bytes=index,
+                proxy_bytes=index,
+            )
+
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: batch)
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        lambda _uri: SimpleNamespace(),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(
+        espn_native_tasks, "_optional_payload", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_http_client", lambda *_args, **_kwargs: Client()
+    )
+    written = []
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda uri, payload, **_kwargs: (
+            written.append(payload) or {"uri": uri, "sha256": "f" * 64}
+        ),
+    )
+
+    espn_native_tasks.fetch_discovery_detail_batch(discovery_detail_batch_ref=batch_ref)
+
+    detail = next(
+        payload["details"][0]
+        for payload in written
+        if payload.get("kind") == "espn-discovery-detail-phase-v1"
+    )
+    assert calls == [
+        EndpointType.CATALOG,
+        EndpointType.SCOREBOARD,
+        EndpointType.SUMMARY,
+    ]
+    assert detail == {
+        "espn_id": 730,
+        "slug": "fifa.wwcq.ply",
+        "name": "WWCQ Playoff",
+        "metadata_raw_uri": "s3://raw/1.json",
+        "metadata_raw_sha256": "1" * 64,
+        "scoreboard_raw_uri": "s3://raw/2.json",
+        "scoreboard_raw_sha256": "2" * 64,
+        "summary_raw_uri": None,
+        "summary_raw_sha256": None,
+        "summary_event_id": "401000001",
+        "request_count": 3,
+        "direct_bytes": 10,
+        "proxy_bytes": 8,
+    }
+
+
+@pytest.mark.parametrize(
+    ("failed_endpoint", "status"),
+    [
+        ("catalog", 404),
+        ("scoreboard", 404),
+        ("summary", 500),
+    ],
+)
+def test_discovery_detail_fetch_keeps_nonoptional_http_errors_fatal(
+    monkeypatch, failed_endpoint, status
+):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.transport_contracts import EndpointType, HttpStatusError
+
+    batch_ref = {"uri": "s3://artifacts/batch.json", "sha256": "a" * 64}
+    batch = {
+        "kind": "espn-discovery-detail-batch-v1",
+        "batch_id": "batch-1",
+        "competitions": [{"espn_id": 730, "slug": "ita.1", "name": "Serie A"}],
+    }
+    scoreboard = json.loads(
+        (ROOT / "tests/fixtures/espn/native_scoreboard.json").read_text()
+    )
+
+    class Client:
+        def fetch_json(self, _url, endpoint, *_args, **_kwargs):
+            if endpoint.value == failed_endpoint:
+                raise HttpStatusError(status, f"HTTP {status}")
+            document = {
+                EndpointType.CATALOG: {"id": "730", "slug": "ita.1"},
+                EndpointType.SCOREBOARD: scoreboard,
+                EndpointType.SUMMARY: {"header": {"id": "401000001"}},
+            }[endpoint]
+            return SimpleNamespace(
+                json_data=document,
+                raw_uri=f"s3://raw/{endpoint.value}.json",
+                content_hash="b" * 64,
+                direct_bytes=1,
+                proxy_bytes=0,
+            )
+
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: batch)
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        lambda _uri: SimpleNamespace(),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(
+        espn_native_tasks, "_optional_payload", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_http_client", lambda *_args, **_kwargs: Client()
+    )
+
+    with pytest.raises(HttpStatusError) as exc_info:
+        espn_native_tasks.fetch_discovery_detail_batch(
+            discovery_detail_batch_ref=batch_ref
+        )
+
+    assert exc_info.value.status == status
+
+
+def test_discovery_detail_checkpoint_accepts_attempted_missing_summary():
+    from dags.utils import espn_native_tasks
+
+    competition = {
+        "espn_id": 730,
+        "slug": "fifa.wwcq.ply",
+        "name": "WWCQ Playoff",
+    }
+    detail = {
+        **competition,
+        "metadata_raw_uri": "s3://raw/metadata.json",
+        "metadata_raw_sha256": "a" * 64,
+        "scoreboard_raw_uri": "s3://raw/scoreboard.json",
+        "scoreboard_raw_sha256": "b" * 64,
+        "summary_raw_uri": None,
+        "summary_raw_sha256": None,
+        "summary_event_id": "401000001",
+        "request_count": 3,
+        "direct_bytes": 12,
+        "proxy_bytes": 0,
+    }
+    loaded = []
+
+    result = espn_native_tasks._validate_discovery_detail_record(
+        detail,
+        expected=competition,
+        raw_store=SimpleNamespace(
+            load_exact=lambda uri, digest: loaded.append((uri, digest)) or b"{}"
+        ),
+    )
+
+    assert result is detail
+    assert loaded == [
+        (detail["metadata_raw_uri"], detail["metadata_raw_sha256"]),
+        (detail["scoreboard_raw_uri"], detail["scoreboard_raw_sha256"]),
+    ]
+
+
+@pytest.mark.parametrize(
+    (
+        "summary_raw_uri",
+        "summary_raw_sha256",
+        "summary_event_id",
+        "request_count",
+    ),
+    [
+        (None, None, None, 3),
+        (None, None, "401000001", 2),
+        ("s3://raw/summary.json", "c" * 64, None, 3),
+        (None, "c" * 64, "401000001", 3),
+        (None, None, 401000001, 3),
+        ("s3://raw/summary.json", "c" * 64, "401000001", 2),
+    ],
+)
+def test_discovery_detail_checkpoint_rejects_other_summary_states(
+    summary_raw_uri,
+    summary_raw_sha256,
+    summary_event_id,
+    request_count,
+):
+    from dags.utils import espn_native_tasks
+
+    competition = {"espn_id": 730, "slug": "ita.1", "name": "Serie A"}
+    detail = {
+        **competition,
+        "metadata_raw_uri": "s3://raw/metadata.json",
+        "metadata_raw_sha256": "a" * 64,
+        "scoreboard_raw_uri": "s3://raw/scoreboard.json",
+        "scoreboard_raw_sha256": "b" * 64,
+        "summary_raw_uri": summary_raw_uri,
+        "summary_raw_sha256": summary_raw_sha256,
+        "summary_event_id": summary_event_id,
+        "request_count": request_count,
+        "direct_bytes": 12,
+        "proxy_bytes": 0,
+    }
+
+    with pytest.raises(espn_native_tasks.OperationsError):
+        espn_native_tasks._validate_discovery_detail_record(
+            detail,
+            expected=competition,
+            raw_store=SimpleNamespace(load_exact=lambda *_args: b"{}"),
+        )
+
+
 def test_discovery_catalog_retry_reuses_committed_raw_checkpoint(monkeypatch):
     from dags.utils import espn_native_tasks
 
@@ -2532,7 +2781,10 @@ def test_discovery_sample_requires_parser_equivalent_capability_rows(malformed_c
     }
 
 
-def test_saved_detail_evidence_reaches_male_registry_artifact(monkeypatch):
+@pytest.mark.parametrize("summary_missing", [False, True], ids=["saved", "404"])
+def test_saved_detail_evidence_reaches_male_registry_artifact(
+    monkeypatch, summary_missing
+):
     from dags.utils import espn_native_tasks
     from scrapers.espn.registry import validate_registry_document
 
@@ -2575,8 +2827,10 @@ def test_saved_detail_evidence_reaches_male_registry_artifact(monkeypatch):
                 "metadata_raw_sha256": "f" * 64,
                 "scoreboard_raw_uri": "s3://raw/ita-scoreboard.json",
                 "scoreboard_raw_sha256": "1" * 64,
-                "summary_raw_uri": "s3://raw/ita-summary.json",
-                "summary_raw_sha256": "2" * 64,
+                "summary_raw_uri": (
+                    None if summary_missing else "s3://raw/ita-summary.json"
+                ),
+                "summary_raw_sha256": None if summary_missing else "2" * 64,
                 "summary_event_id": "401000001",
                 "request_count": 3,
                 "direct_bytes": 3,
@@ -2606,10 +2860,11 @@ def test_saved_detail_evidence_reaches_male_registry_artifact(monkeypatch):
         "s3://raw/ita-scoreboard.json": (
             ROOT / "tests/fixtures/espn/native_scoreboard.json"
         ).read_bytes(),
-        "s3://raw/ita-summary.json": (
-            ROOT / "tests/fixtures/espn/native_summary.json"
-        ).read_bytes(),
     }
+    if not summary_missing:
+        saved["s3://raw/ita-summary.json"] = (
+            ROOT / "tests/fixtures/espn/native_summary.json"
+        ).read_bytes()
     written = []
     writes = []
     alert_snapshots = []
@@ -2720,11 +2975,19 @@ def test_saved_detail_evidence_reaches_male_registry_artifact(monkeypatch):
     assert candidate["edition_display_name"] == "2020-21 Italian Serie A"
     assert candidate["start_date"] == "2020-08-01"
     assert candidate["end_date"] == "2021-07-31"
-    assert candidate["capabilities"] == {
-        "schedule": "proven",
-        "lineup": "partial",
-        "matchsheet": "partial",
-    }
+    assert candidate["capabilities"] == (
+        {
+            "schedule": "proven",
+            "lineup": "unknown",
+            "matchsheet": "unknown",
+        }
+        if summary_missing
+        else {
+            "schedule": "proven",
+            "lineup": "partial",
+            "matchsheet": "partial",
+        }
+    )
     assert alert_snapshots[0]["direct_requests"] == 4
     assert alert_snapshots[0]["request_budget"] == (
         1 + espn_native_tasks.MAX_DISCOVERY_DETAIL_REQUESTS

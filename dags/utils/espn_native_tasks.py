@@ -66,6 +66,7 @@ from scrapers.espn.transport_contracts import (
     DEFAULT_MAX_REQUESTS,
     DEFAULT_MAX_TASK_BYTES,
     EndpointType,
+    HttpStatusError,
     TaskBudget,
 )
 
@@ -4240,20 +4241,15 @@ def _validate_discovery_detail_record(
     summary_uri = detail["summary_raw_uri"]
     summary_sha256 = detail["summary_raw_sha256"]
     summary_event_id = detail["summary_event_id"]
-    if summary_uri is None:
-        if summary_sha256 is not None or summary_event_id is not None:
-            raise OperationsError("discovery Summary checkpoint is incomplete")
-    else:
+    expected_requests = _discovery_detail_request_count(
+        summary_uri=summary_uri,
+        summary_sha256=summary_sha256,
+        summary_event_id=summary_event_id,
+    )
+    if summary_uri is not None:
         uri = _required(summary_uri, "discovery Summary raw uri")
         digest = _sha(summary_sha256, "discovery Summary raw sha256")
-        if (
-            not isinstance(summary_event_id, str)
-            or not summary_event_id.isdecimal()
-            or summary_event_id.startswith("0")
-        ):
-            raise OperationsError("discovery Summary checkpoint event id is invalid")
         raw_store.load_exact(uri, digest)
-    expected_requests = 2 + int(summary_uri is not None)
     if detail["request_count"] != expected_requests:
         raise OperationsError("discovery detail checkpoint request count mismatch")
     for field in ("direct_bytes", "proxy_bytes"):
@@ -4262,6 +4258,26 @@ def _validate_discovery_detail_record(
                 f"discovery detail checkpoint {field} must be non-negative"
             )
     return detail
+
+
+def _discovery_detail_request_count(
+    *, summary_uri: object, summary_sha256: object, summary_event_id: object
+) -> int:
+    """Validate the three backward-compatible Summary evidence states."""
+
+    if (summary_uri is None) != (summary_sha256 is None):
+        raise OperationsError("discovery Summary checkpoint is incomplete")
+    if summary_event_id is None:
+        if summary_uri is not None:
+            raise OperationsError("discovery Summary checkpoint is incomplete")
+        return 2
+    if (
+        not isinstance(summary_event_id, str)
+        or not summary_event_id.isdecimal()
+        or summary_event_id.startswith("0")
+    ):
+        raise OperationsError("discovery Summary checkpoint event id is invalid")
+    return 3
 
 
 def _validate_discovery_detail_phase(
@@ -4418,18 +4434,34 @@ def fetch_discovery_detail_batch(
             slug=item["slug"],
         )
         summary = None
+        missing_summary_request = None
         if event_id is not None:
-            summary = client.fetch_json(
-                summary_template.format(
-                    slug=item["slug"], espn_id=item["espn_id"], event_id=event_id
-                ),
-                EndpointType.SUMMARY,
-                {"event": event_id},
-                competition_id=identity,
-                event_id=event_id,
-                force_refresh=True,
-            )
-        fetched_items = (metadata, scoreboard) + (() if summary is None else (summary,))
+            try:
+                summary = client.fetch_json(
+                    summary_template.format(
+                        slug=item["slug"],
+                        espn_id=item["espn_id"],
+                        event_id=event_id,
+                    ),
+                    EndpointType.SUMMARY,
+                    {"event": event_id},
+                    competition_id=identity,
+                    event_id=event_id,
+                    force_refresh=True,
+                )
+            except HttpStatusError as exc:
+                if exc.status != 404:
+                    raise
+                if exc.ledger_entry is None:
+                    raise OperationsError(
+                        "missing discovery Summary 404 request ledger"
+                    ) from exc
+                missing_summary_request = exc.ledger_entry
+        fetched_items = (metadata, scoreboard) + (
+            (summary,)
+            if summary is not None
+            else (() if missing_summary_request is None else (missing_summary_request,))
+        )
         detail = {
             **item,
             "metadata_raw_uri": metadata.raw_uri,
@@ -5385,11 +5417,11 @@ def publish_discovered_male_registry(
             summary_uri = item.get("summary_raw_uri")
             summary_sha256 = item.get("summary_raw_sha256")
             summary_event_id = item.get("summary_event_id")
-            if (summary_uri is None) != (summary_sha256 is None) or (
-                summary_uri is None and summary_event_id is not None
-            ):
-                raise OperationsError("discovery Summary evidence is incomplete")
-            expected_request_count = 2 + int(summary_uri is not None)
+            expected_request_count = _discovery_detail_request_count(
+                summary_uri=summary_uri,
+                summary_sha256=summary_sha256,
+                summary_event_id=summary_event_id,
+            )
             if item.get("request_count") != expected_request_count:
                 raise OperationsError("discovery detail request accounting mismatch")
             detail_request_count += expected_request_count
