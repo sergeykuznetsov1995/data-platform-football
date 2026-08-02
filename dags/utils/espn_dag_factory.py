@@ -22,7 +22,7 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
         start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
         catchup=False,
         max_active_runs=1,
-        dagrun_timeout=timedelta(hours=8),
+        dagrun_timeout=timedelta(hours=11),
         tags=["espn", "native", "bronze"],
         params={
             "scopes": Param(default=[], type="array"),

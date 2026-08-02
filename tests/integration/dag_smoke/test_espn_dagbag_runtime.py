@@ -71,6 +71,7 @@ def test_real_airflow_safe_mode_loads_every_espn_dag_with_return_value_maps(
         "dag_backfill_espn",
         "dag_replay_espn",
     ):
+        assert bag.dags[dag_id].dagrun_timeout.total_seconds() == 11 * 60 * 60
         verdict = bag.dags[dag_id].get_task("terminal_verdict")
         assert verdict.upstream_task_ids == set(verdict.op_kwargs["producer_task_ids"])
     mapped_count = 0

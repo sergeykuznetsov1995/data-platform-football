@@ -17,7 +17,7 @@ import re
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
-from scrapers.espn.models import IngestPlan, ScopePlan
+from scrapers.espn.models import Gender, IngestPlan, ScopePlan
 from scrapers.espn.daily_owner import (
     ACTIVE_TRIGGER_STATES,
     DAILY_PARENT_FIELDS,
@@ -75,7 +75,10 @@ HTTP_POOL = "espn_http_pool"
 REGISTRY_ENV = "ESPN_REGISTRY_PATH"
 ARTIFACT_ROOT_ENV = "ESPN_ARTIFACT_ROOT_URI"
 RAW_STORE_ENV = "ESPN_RAW_STORE_URI"
-LEASE_TTL = timedelta(hours=9)
+LEASE_TTL = timedelta(hours=12)
+DAILY_BOOTSTRAP_SCOPE_LIMIT = 10
+DISCOVERY_MAX_AGE = timedelta(days=8)
+DISCOVERY_FUTURE_TOLERANCE = timedelta(minutes=5)
 DISCOVERY_DETAIL_BATCH_SIZE = 20
 DISCOVERY_SELECTION_POLICY = "explicit-core-gender-MALE-v1"
 MAX_DISCOVERY_COMPETITIONS = 300
@@ -328,6 +331,8 @@ def _selected_scopes(registry: Registry, mode: str, params: Mapping[str, Any]):
         requested = tuple(sorted(str(item) for item in requested))
         if len(requested) != len(set(requested)):
             raise OperationsError("duplicate ESPN scope selector")
+        if len(requested) > MAX_INGEST_SCOPE_MAP_ITEMS:
+            raise OperationsError("ESPN scope selector exceeds its static bound")
         admitted = all_promoted if mode in _MANUAL_MODES else current
         unknown = sorted(set(requested) - set(admitted))
         if unknown:
@@ -336,6 +341,56 @@ def _selected_scopes(registry: Registry, mode: str, params: Mapping[str, Any]):
     if mode in _MANUAL_MODES:
         raise OperationsError(f"manual ESPN {mode} requires explicit scopes")
     return current
+
+
+def _bounded_daily_scopes(
+    registry: Registry, heads: Mapping[str, ScopeHead]
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Select every established scope plus the first missing onboarding cohort."""
+
+    target = tuple(
+        sorted(
+            competition.scope_id(competition.current_edition)
+            for competition in registry.promoted
+        )
+    )
+    if len(target) > MAX_INGEST_SCOPE_MAP_ITEMS:
+        raise OperationsError("daily ESPN target exceeds its static map bound")
+    established = tuple(scope for scope in target if scope in heads)
+    missing = tuple(scope for scope in target if scope not in heads)
+    bootstrap = missing[:DAILY_BOOTSTRAP_SCOPE_LIMIT]
+    return target, tuple(sorted((*established, *bootstrap))), bootstrap
+
+
+def _load_discovered_registry(
+    *, now: datetime
+) -> tuple[Registry, dict[str, Any]]:
+    """Pin and validate the exact fresh all-male discovery projection."""
+
+    if not isinstance(now, datetime) or now.tzinfo is None:
+        raise OperationsError("discovery freshness clock must be timezone-aware")
+    database_now = now.astimezone(UTC)
+    latest_uri = _join_uri(_artifact_root(), "discovery", "latest-state.json")
+    try:
+        state_ref = _ref_for_uri(latest_uri)
+        state = _read_ref(state_ref, kind="espn-discovery-state-v2")
+        _candidate, registry, _review = _load_discovery_state_v2(state)
+    except OperationsError:
+        raise
+    except (FileNotFoundError, OSError, KeyError, TypeError, ValueError) as exc:
+        raise OperationsError("discovered registry checkpoint is invalid") from exc
+    observed_at = _discovery_observed_at(
+        state["observed_at"], label="discovery state observed_at"
+    )
+    if database_now - observed_at > DISCOVERY_MAX_AGE:
+        raise OperationsError("discovery state is older than eight days")
+    if observed_at - database_now > DISCOVERY_FUTURE_TOLERANCE:
+        raise OperationsError("discovery state is more than five minutes in the future")
+    if any(competition.gender is not Gender.MALE for competition in registry.promoted):
+        raise OperationsError("discovery registry contains an enabled non-MALE row")
+    if len(registry.promoted) != state["male_scope_count"]:
+        raise OperationsError("discovery state male registry count mismatch")
+    return registry, {**state, "discovery_state_ref": state_ref}
 
 
 def _iso_utc(value: object, field: str) -> str:
@@ -471,23 +526,29 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
         dag_run = context.get("dag_run")
         if (getattr(dag_run, "conf", None) or {}).get("espn_parent") is not None:
             raise OperationsError("manual ESPN mode forbids isolated daily parent")
-    registry_path = Path(
-        os.environ.get(REGISTRY_ENV, "/opt/airflow/configs/espn/registry.yaml")
+    store = PostgresEspnControlStore.from_env()
+    store.migrate()
+    registry, discovery = _load_discovered_registry(now=store.current_time())
+    target_scopes = tuple(
+        sorted(
+            competition.scope_id(competition.current_edition)
+            for competition in registry.promoted
+        )
     )
-    registry = load_registry(registry_path)
-    scopes = _selected_scopes(registry, mode, context.get("params") or {})
+    bootstrap_scopes: tuple[str, ...] = ()
+    if mode == "daily":
+        heads = store.read_scope_heads(target_scopes)
+        target_scopes, scopes, bootstrap_scopes = _bounded_daily_scopes(
+            registry, heads
+        )
+    else:
+        scopes = _selected_scopes(registry, mode, context.get("params") or {})
     if not scopes:
         raise OperationsError("ESPN registry has no admitted scopes")
     root = _join_uri(_artifact_root(), "runs", _run_key(dag_id, run_id))
-    registry_uri = _join_uri(root, "registry.json")
-    registry_ref = _write_payload(
-        registry_uri,
-        json.loads(registry.canonical_json()),
-        immutable=True,
-    )
     payload = {
-        "kind": "espn-airflow-admission-v1",
-        "schema_version": 1,
+        "kind": "espn-airflow-admission-v2",
+        "schema_version": 2,
         "dag_id": dag_id,
         "run_id": run_id,
         "attempt": _attempt(context),
@@ -495,9 +556,15 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
         "as_of": logical_date.date().isoformat(),
         "logical_date": logical_date.isoformat(),
         "parent": parent,
-        "registry_ref": registry_ref,
+        "registry_ref": discovery["male_registry_ref"],
         "registry_signature": registry.signature(),
+        "target_scope_ids": list(target_scopes),
         "scope_ids": list(scopes),
+        "bootstrap_scope_ids": list(bootstrap_scopes),
+        "discovery_state_ref": discovery["discovery_state_ref"],
+        "candidate_ref": discovery["candidate_ref"],
+        "selection_policy": discovery["selection_policy"],
+        "male_scope_count": discovery["male_scope_count"],
         "artifact_root": root,
         "raw_store_uri": _raw_store_uri(),
         "replay_sources": (
@@ -506,7 +573,9 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
             else {}
         ),
     }
-    return _write_payload(_join_uri(root, "admission.json"), payload)
+    return _write_payload(
+        _join_uri(root, "admission.json"), payload, immutable=True
+    )
 
 
 def _load_registry_ref(admission: Mapping[str, Any]) -> Registry:
@@ -688,7 +757,7 @@ def acquire_scope_leases(
 ) -> dict[str, Any]:
     """Atomically own the admitted scope bundle before reading any head."""
 
-    admission = _read_ref(admission_ref, kind="espn-airflow-admission-v1")
+    admission = _read_ref(admission_ref, kind="espn-airflow-admission-v2")
     dag_id, run_id, _ = _run_identity(context)
     if run_id != admission["run_id"]:
         raise OperationsError("lease owner run differs from admission")
@@ -771,7 +840,7 @@ def build_signed_scope_plans(
     }:
         raise OperationsError("lease acquisition artifact kind is invalid")
     admission = _read_ref(
-        acquisition["admission_ref"], kind="espn-airflow-admission-v1"
+        acquisition["admission_ref"], kind="espn-airflow-admission-v2"
     )
     registry = _load_registry_ref(admission)
     store = PostgresEspnControlStore.from_env()
@@ -3360,7 +3429,7 @@ def record_health_metrics(
                 _run_key(dag_id, run_id),
                 "admission.json",
             ),
-            kind="espn-airflow-admission-v1",
+            kind="espn-airflow-admission-v2",
         )
         index = (
             None
@@ -3622,7 +3691,7 @@ def propagate_terminal_failure(
     attempt = _attempt(context)
     root = _join_uri(_artifact_root(), "runs", _run_key(dag_id, run_id))
     admission_ref = _ref_for_uri(_join_uri(root, "admission.json"))
-    admission = _read_ref(admission_ref, kind="espn-airflow-admission-v1")
+    admission = _read_ref(admission_ref, kind="espn-airflow-admission-v2")
     plan_index_ref = _ref_for_uri(_join_uri(root, "plan-index.json"))
     index = _read_ref(plan_index_ref, kind="espn-plan-index-v1")
     durable_ref = _ref_for_uri(_join_uri(root, "durable-run-manifest.json"))

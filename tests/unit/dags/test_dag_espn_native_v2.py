@@ -79,6 +79,65 @@ def _daily_parent_context():
     return context, owner
 
 
+def _generated_registry(count: int):
+    from scrapers.espn.models import (
+        AgeClass,
+        CapabilityState,
+        Competition,
+        Edition,
+        EntityCapabilities,
+        Gender,
+    )
+    from scrapers.espn.registry import Registry
+
+    capabilities = EntityCapabilities(
+        schedule=CapabilityState.PROVEN,
+        lineup=CapabilityState.PARTIAL,
+        matchsheet=CapabilityState.PARTIAL,
+    )
+    competitions = tuple(
+        Competition(
+            espn_id=10_000 + index,
+            slug=f"male-{index:03d}",
+            name=f"Male Competition {index:03d}",
+            gender=Gender.MALE,
+            age_class=AgeClass.UNKNOWN,
+            enabled=True,
+            editions=(
+                Edition(
+                    source_season_year=2026,
+                    display_name=f"2026 Male Competition {index:03d}",
+                    start_date=date(2026, 1, 1),
+                    end_date=date(2026, 12, 31),
+                    current=True,
+                    capabilities=capabilities,
+                ),
+            ),
+            gender_evidence=("core-detail.gender=MALE",),
+        )
+        for index in range(count)
+    )
+    return Registry(
+        schema_version=1,
+        registry_version=f"generated-{count}",
+        as_of=date(2026, 8, 2),
+        competitions=competitions,
+    )
+
+
+def _scope_ids(registry):
+    return tuple(
+        sorted(
+            competition.scope_id(competition.current_edition)
+            for competition in registry.promoted
+        )
+    )
+
+
+def _head(scope_id: str):
+    return SimpleNamespace(scope_id=scope_id)
+
+
 def test_daily_has_one_isolated_owner_and_real_two_wave_chain():
     module = _reload("dag_ingest_espn")
     tasks = _tasks()
@@ -141,6 +200,24 @@ def test_only_network_waves_use_one_slot_http_pool():
     }
     for task_id in pooled:
         assert tasks[task_id]._init_kwargs["pool_slots"] == 1
+
+
+def test_ingest_timeout_lease_and_mapping_bounds_cover_bounded_onboarding():
+    from dags.utils import espn_native_tasks
+
+    module = _reload("dag_ingest_espn")
+    tasks = _tasks()
+
+    assert module.dag._dag_kwargs["dagrun_timeout"] == timedelta(hours=11)
+    assert espn_native_tasks.LEASE_TTL == timedelta(hours=12)
+    assert espn_native_tasks.MAX_INGEST_SCOPE_MAP_ITEMS == 300
+    assert espn_native_tasks.MAX_SUMMARY_BATCH_MAP_ITEMS == 1024
+    assert tasks["select_network_scope_bindings"]._init_kwargs["op_kwargs"][
+        "max_items"
+    ] == 300
+    assert tasks["select_summary_batches"]._init_kwargs["op_kwargs"][
+        "max_items"
+    ] == 1024
 
 
 def test_terminal_health_release_and_propagator_cannot_mask_failure():
@@ -927,6 +1004,283 @@ def test_daily_admission_binds_real_exact_isolated_owner_run(monkeypatch):
 
     assert parent["parent_run_id"] == owner.run_id
     assert parent["owner_profile"] == "espn-isolated-v1"
+
+
+def test_daily_admission_pins_exact_all_male_registry_and_first_bootstrap_cohort():
+    from dags.utils.espn_native_tasks import _bounded_daily_scopes
+
+    registry = _generated_registry(181)
+    heads = {scope: _head(scope) for scope in _scope_ids(registry)[:9]}
+
+    target, selected, bootstrap = _bounded_daily_scopes(registry, heads)
+
+    assert len(target) == 181
+    assert len(selected) == 19
+    assert bootstrap == target[9:19]
+    assert set(selected) == set(target[:19])
+
+
+def test_daily_bootstrap_never_skips_the_first_failed_scope():
+    from dags.utils.espn_native_tasks import _bounded_daily_scopes
+
+    registry = _generated_registry(181)
+
+    target, selected, bootstrap = _bounded_daily_scopes(registry, {})
+
+    assert selected == bootstrap == target[:10]
+
+
+def test_daily_admission_v2_persists_exact_discovery_and_coverage(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    now = datetime(2026, 8, 2, 12, tzinfo=timezone.utc)
+    registry = _generated_registry(181)
+    target = _scope_ids(registry)
+    state_ref = {
+        "uri": "s3://artifacts/discovery/latest-state.json",
+        "sha256": "a" * 64,
+    }
+    registry_ref = {
+        "uri": "s3://artifacts/discovery/run/male-registry.json",
+        "sha256": "b" * 64,
+    }
+    candidate_ref = {
+        "uri": "s3://artifacts/discovery/run/candidate.json",
+        "sha256": "c" * 64,
+    }
+    discovery = {
+        "discovery_state_ref": state_ref,
+        "male_registry_ref": registry_ref,
+        "candidate_ref": candidate_ref,
+        "selection_policy": "explicit-core-gender-MALE-v1",
+        "male_scope_count": 181,
+    }
+    writes = []
+
+    class Store:
+        def migrate(self):
+            pass
+
+        def current_time(self):
+            return now
+
+        def read_scope_heads(self, scope_ids):
+            assert tuple(scope_ids) == target
+            return {scope: _head(scope) for scope in target[:9]}
+
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: Store()),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_discovered_registry",
+        lambda *, now: (registry, discovery),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_run_identity",
+        lambda _context: ("dag_ingest_espn", "run-1", now),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_daily_parent", lambda _context: {"schema": "owner"}
+    )
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda uri, payload, **kwargs: (
+            writes.append((uri, payload, kwargs))
+            or {"uri": uri, "sha256": "d" * 64}
+        ),
+    )
+
+    espn_native_tasks.validate_registry_and_admission(mode="daily", params={})
+
+    assert len(writes) == 1
+    admission_uri, admission, kwargs = writes[0]
+    assert admission_uri.endswith("/admission.json")
+    assert kwargs == {"immutable": True}
+    assert admission["kind"] == "espn-airflow-admission-v2"
+    assert admission["schema_version"] == 2
+    assert admission["registry_ref"] == registry_ref
+    assert admission["registry_signature"] == registry.signature()
+    assert admission["discovery_state_ref"] == state_ref
+    assert admission["candidate_ref"] == candidate_ref
+    assert admission["selection_policy"] == "explicit-core-gender-MALE-v1"
+    assert admission["male_scope_count"] == 181
+    assert admission["target_scope_ids"] == list(target)
+    assert admission["scope_ids"] == list(target[:19])
+    assert admission["bootstrap_scope_ids"] == list(target[9:19])
+
+
+def test_manual_admission_keeps_explicit_generated_scope_without_reading_heads(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+
+    now = datetime(2026, 8, 2, 12, tzinfo=timezone.utc)
+    registry = _generated_registry(20)
+    target = _scope_ids(registry)
+    discovery = {
+        "discovery_state_ref": {"uri": "state", "sha256": "a" * 64},
+        "male_registry_ref": {"uri": "registry", "sha256": "b" * 64},
+        "candidate_ref": {"uri": "candidate", "sha256": "c" * 64},
+        "selection_policy": "explicit-core-gender-MALE-v1",
+        "male_scope_count": 20,
+    }
+    writes = []
+
+    class Store:
+        def migrate(self):
+            pass
+
+        def current_time(self):
+            return now
+
+        def read_scope_heads(self, _scope_ids):
+            pytest.fail("manual admission must not read current heads")
+
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: Store()),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_discovered_registry",
+        lambda *, now: (registry, discovery),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_run_identity",
+        lambda _context: ("dag_repair_espn", "run-1", now),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda uri, payload, **_kwargs: (
+            writes.append((uri, payload)) or {"uri": uri, "sha256": "d" * 64}
+        ),
+    )
+    context = {
+        "params": {"scopes": [target[7]]},
+        "dag_run": SimpleNamespace(conf={}),
+    }
+
+    espn_native_tasks.validate_registry_and_admission(mode="repair", **context)
+
+    admission = writes[0][1]
+    assert admission["target_scope_ids"] == list(target)
+    assert admission["scope_ids"] == [target[7]]
+    assert admission["bootstrap_scope_ids"] == []
+
+    context["params"] = {"scopes": ["999999:2026"]}
+    with pytest.raises(espn_native_tasks.OperationsError, match="unpromoted"):
+        espn_native_tasks.validate_registry_and_admission(mode="repair", **context)
+
+
+def test_discovery_registry_rejects_future_state_and_enabled_non_male(monkeypatch):
+    from dags.utils import espn_native_tasks
+    from dataclasses import replace
+    from scrapers.espn.models import Gender
+
+    now = datetime(2026, 8, 2, 12, tzinfo=timezone.utc)
+    state_ref = {
+        "uri": "s3://artifacts/discovery/latest-state.json",
+        "sha256": "a" * 64,
+    }
+    registry = _generated_registry(1)
+    state = {
+        "kind": "espn-discovery-state-v2",
+        "observed_at": (now + timedelta(minutes=5, seconds=1)).isoformat(),
+        "male_scope_count": 1,
+    }
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(espn_native_tasks, "_ref_for_uri", lambda _uri: state_ref)
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: state)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_discovery_state_v2",
+        lambda _state: ({}, registry, {}),
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="future"):
+        espn_native_tasks._load_discovered_registry(now=now)
+
+    state["observed_at"] = now.isoformat()
+    female = replace(registry.competitions[0], gender=Gender.FEMALE)
+    non_male_registry = replace(registry, competitions=(female,))
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_discovery_state_v2",
+        lambda _state: ({}, non_male_registry, {}),
+    )
+    with pytest.raises(espn_native_tasks.OperationsError, match="non-MALE"):
+        espn_native_tasks._load_discovered_registry(now=now)
+
+
+@pytest.mark.parametrize("fault", ["missing", "stale", "hash", "count"])
+def test_discovery_registry_fault_fails_before_leases(monkeypatch, fault):
+    from dags.utils import espn_native_tasks
+
+    now = datetime(2026, 8, 2, 12, tzinfo=timezone.utc)
+    state_ref = {
+        "uri": "s3://artifacts/discovery/latest-state.json",
+        "sha256": "a" * 64,
+    }
+    state = {
+        "kind": "espn-discovery-state-v2",
+        "observed_at": (
+            now - timedelta(days=8, seconds=1)
+            if fault == "stale"
+            else now
+        ).isoformat(),
+    }
+    registry = _generated_registry(1)
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+
+    if fault == "missing":
+        monkeypatch.setattr(
+            espn_native_tasks,
+            "_ref_for_uri",
+            lambda _uri: (_ for _ in ()).throw(
+                FileNotFoundError("missing discovery state")
+            ),
+        )
+    else:
+        monkeypatch.setattr(espn_native_tasks, "_ref_for_uri", lambda _uri: state_ref)
+        monkeypatch.setattr(
+            espn_native_tasks,
+            "_read_ref",
+            lambda *_args, **_kwargs: (
+                (_ for _ in ()).throw(
+                    espn_native_tasks.OperationsError("artifact reference hash mismatch")
+                )
+                if fault == "hash"
+                else state
+            ),
+        )
+        monkeypatch.setattr(
+            espn_native_tasks,
+            "_load_discovery_state_v2",
+            lambda _state: (
+                (_ for _ in ()).throw(
+                    espn_native_tasks.OperationsError(
+                        "discovery state male registry count mismatch"
+                    )
+                )
+                if fault == "count"
+                else ({}, registry, {})
+            ),
+        )
+
+    with pytest.raises(espn_native_tasks.OperationsError):
+        espn_native_tasks._load_discovered_registry(now=now)
 
 
 def test_daily_admission_rejects_forged_child_or_stale_interval(monkeypatch):
@@ -2496,7 +2850,7 @@ def test_expired_same_owner_acquisition_reclaims_instead_of_failing(monkeypatch)
             return (replacement,)
 
     admission = {
-        "kind": "espn-airflow-admission-v1",
+        "kind": "espn-airflow-admission-v2",
         "dag_id": "dag_ingest_espn",
         "run_id": "run-1",
         "attempt": 1,
