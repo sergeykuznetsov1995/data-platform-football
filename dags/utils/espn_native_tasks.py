@@ -596,7 +596,9 @@ def _exact_parent_run(profile: object, parent_run_id: str):
     return matches[0]
 
 
-def _daily_parent(context: Mapping[str, Any]) -> dict[str, str]:
+def _daily_parent_envelope(context: Mapping[str, Any]) -> dict[str, str]:
+    """Bind only the child runtime/conf envelope without metadata DB reads."""
+
     dag_run = context.get("dag_run")
     context_run_id = context.get("run_id")
     if (
@@ -608,6 +610,12 @@ def _daily_parent(context: Mapping[str, Any]) -> dict[str, str]:
     parent = conf.get("espn_parent")
     if not isinstance(parent, Mapping) or set(parent) != DAILY_PARENT_FIELDS:
         raise OperationsError("daily ESPN admission requires exact isolated parent")
+    return {key: str(parent[key]) for key in sorted(parent)}
+
+
+def _daily_parent(context: Mapping[str, Any]) -> dict[str, str]:
+    parent = _daily_parent_envelope(context)
+    context_run_id = context.get("run_id")
     try:
         profile = resolve_daily_owner_profile(parent.get("owner_profile"))
     except DailyOwnerError as exc:
@@ -704,7 +712,7 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
     if mode not in {"daily", *_MANUAL_MODES}:
         raise OperationsError("unsupported ESPN orchestration mode")
     dag_id, run_id, logical_date = _run_identity(context)
-    parent = _daily_parent(context) if mode == "daily" else None
+    retry_parent = _daily_parent_envelope(context) if mode == "daily" else None
     if mode != "daily":
         dag_run = context.get("dag_run")
         if (getattr(dag_run, "conf", None) or {}).get("espn_parent") is not None:
@@ -717,11 +725,12 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
         dag_id=dag_id,
         run_id=run_id,
         logical_date=logical_date,
-        parent=parent,
+        parent=retry_parent,
         context=context,
     )
     if existing_ref is not None:
         return existing_ref
+    parent = _daily_parent(context) if mode == "daily" else None
     store = PostgresEspnControlStore.from_env()
     store.migrate()
     registry, discovery = _load_discovered_registry(now=store.current_time())

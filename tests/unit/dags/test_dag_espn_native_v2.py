@@ -1086,6 +1086,11 @@ def test_daily_admission_v2_persists_exact_discovery_and_coverage(monkeypatch):
     monkeypatch.setattr(
         espn_native_tasks, "_daily_parent", lambda _context: {"schema": "owner"}
     )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_daily_parent_envelope",
+        lambda _context: {"schema": "owner"},
+    )
     monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
     monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
     monkeypatch.setattr(
@@ -1271,6 +1276,74 @@ def test_admission_retry_replays_exact_v2_before_mutable_reads(monkeypatch):
             params={"attempt": 1, "scopes": ["10000:2026"]},
             dag_run=SimpleNamespace(conf={}),
         )
+
+
+@pytest.mark.parametrize("schema_version", [1, 2])
+def test_daily_admission_retry_replays_without_parent_metadata_or_mutable_db(
+    monkeypatch, schema_version
+):
+    from dags.utils import espn_native_tasks
+
+    context, _owner = _daily_parent_context()
+    registry = _generated_registry(1)
+    scope_id = _scope_ids(registry)[0]
+    root = "s3://artifacts/runs/frozen"
+    admission_ref = {"uri": f"{root}/admission.json", "sha256": "a" * 64}
+    admission = {
+        "kind": f"espn-airflow-admission-v{schema_version}",
+        "schema_version": schema_version,
+        "dag_id": "dag_ingest_espn",
+        "run_id": context["run_id"],
+        "attempt": 1,
+        "mode": "daily",
+        "as_of": context["logical_date"].date().isoformat(),
+        "logical_date": context["logical_date"].isoformat(),
+        "parent": context["dag_run"].conf["espn_parent"],
+        "registry_ref": {"uri": "registry", "sha256": "b" * 64},
+        "registry_signature": registry.signature(),
+        "scope_ids": [scope_id],
+        "artifact_root": root,
+        "raw_store_uri": "s3://raw",
+        "replay_sources": {},
+    }
+    if schema_version == 2:
+        admission.update(
+            target_scope_ids=[scope_id],
+            bootstrap_scope_ids=[scope_id],
+            discovery_state_ref={"uri": "state", "sha256": "c" * 64},
+            candidate_ref={"uri": "candidate", "sha256": "d" * 64},
+            selection_policy="explicit-core-gender-MALE-v1",
+            male_scope_count=1,
+        )
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(espn_native_tasks, "_run_key", lambda *_args: "frozen")
+    monkeypatch.setattr(espn_native_tasks, "_ref_for_uri", lambda _uri: admission_ref)
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: admission)
+    monkeypatch.setattr(espn_native_tasks, "_load_registry_ref", lambda _a: registry)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_exact_parent_run",
+        lambda *_args: pytest.fail("retry must not read mutable parent metadata"),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: pytest.fail("retry must not read control store")),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_discovered_registry",
+        lambda **_kwargs: pytest.fail("retry must not read mutable discovery"),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_raw_store_uri",
+        lambda: pytest.fail("retry must preserve sealed raw store"),
+    )
+
+    assert espn_native_tasks.validate_registry_and_admission(
+        mode="daily", **context
+    ) == admission_ref
 
 
 @pytest.mark.parametrize(
