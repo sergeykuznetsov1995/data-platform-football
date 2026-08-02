@@ -132,6 +132,7 @@ services:
     command:
       - -euc
       - |
+        python /opt/airflow/scripts/verify_espn_database_topology.py
         airflow db migrate
         airflow pools set espn_http_pool 1 'ESPN direct-only HTTP work'
         for dag_id in \

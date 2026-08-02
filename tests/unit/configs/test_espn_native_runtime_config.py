@@ -308,7 +308,14 @@ def test_rendered_isolated_espn_compose_proves_role_projection_and_freeze() -> N
         assert volumes["/opt/espn-source/dags"]["read_only"] is True
 
     init_command = services["airflow-init"]["command"][-1]
+    topology_preflight = (
+        "python /opt/airflow/scripts/verify_espn_database_topology.py"
+    )
+    assert topology_preflight in init_command
     assert "airflow db migrate" in init_command
+    assert init_command.index(topology_preflight) < init_command.index(
+        "airflow db migrate"
+    )
     assert "airflow pools set espn_http_pool 1" in init_command
     for dag_id in (
         "dag_ingest_espn",

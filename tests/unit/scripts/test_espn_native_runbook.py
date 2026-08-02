@@ -79,6 +79,8 @@ def test_runbook_contracts_automatic_all_male_rollout_and_reversal():
         "airflow jobs check",
         "bag.import_errors == {}",
         "set(bag.dags) == expected_dag_ids",
+        "scripts/verify_espn_database_topology.py",
+        "connected server/database identity",
         'state["candidate_ref"]',
         'state["male_registry_ref"]',
         '"MALE": 181, "FEMALE": 38, "UNKNOWN": 1',

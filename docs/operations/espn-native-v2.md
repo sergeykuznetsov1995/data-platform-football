@@ -82,7 +82,11 @@ Protected env file обязан задать dedicated metadata
 только к dedicated `airflow-metadb`. Отдельный
 `ESPN_CONTROL_DATABASE_URL` обязан указывать на shared ESPN control
 DB для lease/rate/publication fences; metadata и control DSN не могут
-быть одинаковыми.
+быть одинаковыми. Перед любой migration/startup `airflow-init`
+запускает `scripts/verify_espn_database_topology.py`: preflight
+реально открывает оба DSN и доказывает разный connected server/database identity
+по `server address + port + current_database()`. Два разных hostname,
+которые ведут в одну БД, fail-closed останавливают init.
 
 До первого шага сохранить cross-stack evidence, что shared
 `dag_master_pipeline` остаётся paused и не имеет active run. Если shared
