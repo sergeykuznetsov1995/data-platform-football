@@ -962,8 +962,9 @@ def _run_match_core(
                        -- Opta id; a repeat of that triple is one record stored
                        -- twice, which is the defect worth failing on.
                        COUNT(*) OVER (PARTITION BY e.league,e.season,e.game_id,
-                           e.team_id,e.team_event_id,
-                           e.opta_event_id) team_duplicate_count
+                           e.team_id,e.team_event_id,COALESCE(
+                               e.opta_event_id,e.source_event_id
+                           )) team_duplicate_count
                 FROM iceberg.bronze.whoscored_events_current e
                 JOIN success_match m ON m.league=e.league AND m.season=e.season
                  AND CAST(m.game_id AS BIGINT)=CAST(e.game_id AS BIGINT)

@@ -1064,10 +1064,10 @@ def parse_events(
         # repeat discarded the whole match and deadlocked the backfill (#1080).
         #
         # The record is the counter *plus* the Opta ``id``.  A repeat of that
-        # triple is one source record delivered twice, which stays fatal; it is
-        # also the only case where the surrogate below would have to fall back
-        # to a positional salt, so refusing it keeps every minted id derived
-        # from stable inputs.
+        # triple is one source record delivered twice, which stays fatal -- and
+        # it is the only reachable way for two records to ask the surrogate
+        # above for the same token, so refusing it keeps minted ids a function
+        # of the record rather than of its position in the feed.
         record_key = (opta_event_id, team_id, team_event_id)
         if record_key in seen_records:
             raise WhoScoredParseError(

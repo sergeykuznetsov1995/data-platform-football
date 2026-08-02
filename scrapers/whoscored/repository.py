@@ -4751,7 +4751,19 @@ class WhoScoredRepository:
             raise ValueError(f"game {commit.game_id} has invalid team_event_id")
         # The team-local counter is not an identity on its own -- the source
         # reuses it for distinct actions (#1080).  A source record is the
-        # counter plus the Opta id.
+        # counter plus the Opta id, so the Opta id is load-bearing here and gets
+        # the same null/range check as the two columns above: were it ever to
+        # arrive missing, this key would silently collapse back to the pair and
+        # bring the deadlock back under a new message.
+        opta_event_ids = [row.get("opta_event_id") for row in commit.events]
+        if any(
+            value is None
+            or isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in opta_event_ids
+        ):
+            raise ValueError(f"game {commit.game_id} has invalid opta_event_id")
         record_keys = [
             (row.get("opta_event_id"), row.get("team_id"), row.get("team_event_id"))
             for row in commit.events
