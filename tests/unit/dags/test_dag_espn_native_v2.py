@@ -2099,6 +2099,99 @@ def test_discovery_review_retry_replays_checkpoint_without_recomputation(monkeyp
     assert kwargs == {"immutable": False}
 
 
+def test_discovery_monitor_reads_v1_state_during_v2_transition(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    state = {
+        "kind": "espn-discovery-state-v1",
+        "review_ref": {"uri": "s3://artifacts/review-v1.json", "sha256": "a" * 64},
+    }
+    review = {
+        "kind": "espn-discovery-review-v1",
+        "quarantined_scopes": ["700:2027"],
+        "unresolved_discovery_diffs": True,
+    }
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_optional_payload",
+        lambda _uri, *, kind=None: (
+            state if kind is None else pytest.fail("transition read must accept v1")
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_ref",
+        lambda ref, *, kind=None: (
+            review
+            if ref == state["review_ref"] and kind == "espn-discovery-review-v1"
+            else pytest.fail("unexpected transition artifact read")
+        ),
+    )
+
+    assert espn_native_tasks._latest_discovery_flags("700:2026") == (True, True)
+
+
+def test_discovery_state_v2_rejects_mixed_review_projection(monkeypatch):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn import discovery
+
+    candidate_ref = {"uri": "s3://artifacts/candidate.json", "sha256": "a" * 64}
+    registry_ref = {"uri": "s3://artifacts/male-registry.json", "sha256": "b" * 64}
+    review_ref = {"uri": "s3://artifacts/review.json", "sha256": "c" * 64}
+    candidate_signature = "d" * 64
+    registry_signature = "e" * 64
+    state = {
+        "kind": "espn-discovery-state-v2",
+        "schema_version": 2,
+        "candidate_ref": candidate_ref,
+        "candidate_signature": candidate_signature,
+        "review_ref": review_ref,
+        "male_registry_ref": registry_ref,
+        "male_registry_signature": registry_signature,
+        "male_scope_count": 1,
+        "selection_policy": "explicit-core-gender-MALE-v1",
+        "observed_at": "2026-08-02T00:00:00+00:00",
+    }
+    review = {
+        "kind": "espn-discovery-review-v2",
+        "schema_version": 2,
+        "discovery_detail_index_ref": {"uri": "index", "sha256": "1" * 64},
+        "discovery_detail_phase_refs": [{"uri": "phase", "sha256": "2" * 64}],
+        "candidate_ref": candidate_ref,
+        "candidate_signature": "f" * 64,
+        "male_registry_ref": registry_ref,
+        "male_registry_signature": registry_signature,
+        "male_scope_count": 1,
+        "selection_policy": "explicit-core-gender-MALE-v1",
+        "quarantined_scopes": [],
+        "changes": [],
+        "change_count": 0,
+        "unresolved_discovery_diffs": False,
+        "alerts": [],
+        "promotion_performed": False,
+        "observed_at": state["observed_at"],
+    }
+    monkeypatch.setattr(
+        discovery.CatalogSnapshot,
+        "from_dict",
+        classmethod(lambda _cls, _value: SimpleNamespace(signature=lambda: candidate_signature)),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "validate_registry_document",
+        lambda _value: SimpleNamespace(signature=lambda: registry_signature, promoted=(1,)),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_ref",
+        lambda ref, **_kwargs: review if ref == review_ref else {},
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="projection"):
+        espn_native_tasks._load_discovery_state_v2(state)
+
+
 def test_shipped_finished_current_scopes_plan_safely_for_every_daily_shard(
     monkeypatch,
 ):

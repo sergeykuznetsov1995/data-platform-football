@@ -3217,14 +3217,21 @@ def _optional_payload(uri: str, *, kind: str | None = None):
 def _latest_discovery_flags(scope_id: str) -> tuple[bool, bool]:
     state = _optional_payload(
         _join_uri(_artifact_root(), "discovery", "latest-state.json"),
-        kind="espn-discovery-state-v2",
     )
     if state is None:
         return False, False
-    review = _read_ref(state["review_ref"], kind="espn-discovery-review-v2")
-    if state.get("male_registry_ref") != review.get("male_registry_ref"):
-        raise OperationsError("discovery state registry reference mismatch")
-    return False, bool(review["unresolved_discovery_diffs"])
+    if state.get("kind") == "espn-discovery-state-v1":
+        review = _read_ref(state["review_ref"], kind="espn-discovery-review-v1")
+        competition_id = scope_id.split(":", 1)[0]
+        rollover = any(
+            str(item).split(":", 1)[0] == competition_id
+            for item in review["quarantined_scopes"]
+        )
+        return rollover, bool(review["unresolved_discovery_diffs"])
+    if state.get("kind") == "espn-discovery-state-v2":
+        _, _, review = _load_discovery_state_v2(state)
+        return False, bool(review["unresolved_discovery_diffs"])
+    raise OperationsError("existing discovery state schema is unsupported")
 
 
 def _head_identity_sha256(head: ScopeHead) -> str:
@@ -4523,7 +4530,7 @@ def _discovery_observed_at(value: object, *, label: str) -> datetime:
 
 def _load_discovery_state_v2(
     state: object,
-) -> tuple[Mapping[str, Any], Registry]:
+) -> tuple[Mapping[str, Any], Registry, Mapping[str, Any]]:
     required_keys = {
         "kind",
         "schema_version",
@@ -4549,7 +4556,7 @@ def _load_discovery_state_v2(
     candidate_ref = _discovery_artifact_ref(
         state["candidate_ref"], label="discovery state candidate reference"
     )
-    _discovery_artifact_ref(
+    review_ref = _discovery_artifact_ref(
         state["review_ref"], label="discovery state review reference"
     )
     male_registry_ref = _discovery_artifact_ref(
@@ -4564,6 +4571,30 @@ def _load_discovery_state_v2(
     )
     _discovery_observed_at(state["observed_at"], label="discovery state observed_at")
 
+    review = _read_ref(review_ref, kind="espn-discovery-review-v2")
+    projection_fields = {
+        "candidate_ref",
+        "candidate_signature",
+        "male_registry_ref",
+        "male_registry_signature",
+        "male_scope_count",
+        "selection_policy",
+        "observed_at",
+    }
+    if any(state[field] != review.get(field) for field in projection_fields):
+        raise OperationsError("discovery state/review projection mismatch")
+    review_index_ref = review.get("discovery_detail_index_ref")
+    review_phase_refs = review.get("discovery_detail_phase_refs")
+    if not isinstance(review_index_ref, Mapping) or not isinstance(
+        review_phase_refs, list
+    ):
+        raise OperationsError("discovery state review input references are invalid")
+    _validate_discovery_review_checkpoint(
+        review,
+        discovery_detail_index_ref=review_index_ref,
+        discovery_detail_phase_refs=review_phase_refs,
+    )
+
     from scrapers.espn.discovery import CatalogSnapshot
 
     candidate = _read_ref(candidate_ref)
@@ -4574,7 +4605,7 @@ def _load_discovery_state_v2(
         raise OperationsError("discovery state male registry signature mismatch")
     if len(male_registry.promoted) != state["male_scope_count"]:
         raise OperationsError("discovery state male registry count mismatch")
-    return candidate, male_registry
+    return candidate, male_registry, review
 
 
 def _validate_discovery_review_checkpoint(
@@ -4889,7 +4920,7 @@ def publish_discovered_male_registry(
     if previous_state is not None and previous_state.get("kind") == (
         "espn-discovery-state-v2"
     ):
-        previous_candidate, previous_registry = _load_discovery_state_v2(
+        previous_candidate, previous_registry, _ = _load_discovery_state_v2(
             previous_state
         )
     if previous_uri:
