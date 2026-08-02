@@ -1236,6 +1236,11 @@ def test_admission_retry_replays_exact_v2_before_mutable_reads(monkeypatch):
     monkeypatch.setattr(espn_native_tasks, "_ref_for_uri", lambda _uri: admission_ref)
     monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: admission)
     monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_registry_ref",
+        lambda _admission: _generated_registry(1),
+    )
+    monkeypatch.setattr(
         espn_native_tasks.PostgresEspnControlStore,
         "from_env",
         classmethod(lambda _cls: pytest.fail("retry must not read database state")),
@@ -1259,6 +1264,14 @@ def test_admission_retry_replays_exact_v2_before_mutable_reads(monkeypatch):
 
     assert result == admission_ref
 
+    admission.pop("candidate_ref")
+    with pytest.raises(espn_native_tasks.OperationsError, match="fields"):
+        espn_native_tasks.validate_registry_and_admission(
+            mode="repair",
+            params={"attempt": 1, "scopes": ["10000:2026"]},
+            dag_run=SimpleNamespace(conf={}),
+        )
+
 
 @pytest.mark.parametrize(
     ("kind", "schema_version"),
@@ -1269,7 +1282,32 @@ def test_admission_consumers_accept_inflight_v1_and_current_v2(
 ):
     from dags.utils import espn_native_tasks
 
-    admission = {"kind": kind, "schema_version": schema_version}
+    admission = {
+        "kind": kind,
+        "schema_version": schema_version,
+        "dag_id": "dag_ingest_espn",
+        "run_id": "run-1",
+        "attempt": 1,
+        "mode": "daily",
+        "as_of": "2026-08-02",
+        "logical_date": "2026-08-02T12:00:00+00:00",
+        "parent": None,
+        "registry_ref": {"uri": "registry", "sha256": "b" * 64},
+        "registry_signature": "c" * 64,
+        "scope_ids": ["10000:2026"],
+        "artifact_root": "s3://artifacts/run",
+        "raw_store_uri": "s3://raw",
+        "replay_sources": {},
+    }
+    if schema_version == 2:
+        admission.update(
+            target_scope_ids=["10000:2026"],
+            bootstrap_scope_ids=["10000:2026"],
+            discovery_state_ref={"uri": "state", "sha256": "d" * 64},
+            candidate_ref={"uri": "candidate", "sha256": "e" * 64},
+            selection_policy="explicit-core-gender-MALE-v1",
+            male_scope_count=1,
+        )
     monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: admission)
 
     assert espn_native_tasks._read_admission_ref(
@@ -2945,14 +2983,21 @@ def test_expired_same_owner_acquisition_reclaims_instead_of_failing(monkeypatch)
             return (replacement,)
 
     admission = {
-        "kind": "espn-airflow-admission-v2",
-        "schema_version": 2,
+        "kind": "espn-airflow-admission-v1",
+        "schema_version": 1,
         "dag_id": "dag_ingest_espn",
         "run_id": "run-1",
         "attempt": 1,
+        "mode": "daily",
+        "as_of": now.date().isoformat(),
+        "parent": None,
+        "registry_ref": {"uri": "registry", "sha256": "e" * 64},
+        "registry_signature": "f" * 64,
         "scope_ids": ["700:2026"],
         "artifact_root": "s3://artifacts/run",
         "logical_date": now.isoformat(),
+        "raw_store_uri": "s3://raw",
+        "replay_sources": {},
     }
     monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: admission)
     monkeypatch.setattr(
@@ -4651,6 +4696,11 @@ def test_final_leaf_seals_success_only_after_health_and_release(monkeypatch):
             "logical_date": "2026-07-31T00:00:00+00:00",
             "parent": {"schema": "espn-master-parent-v1"},
             "registry_ref": {"uri": "registry", "sha256": "3" * 64},
+            "registry_signature": "4" * 64,
+            "scope_ids": ["700:2026"],
+            "artifact_root": "s3://artifacts/run",
+            "raw_store_uri": "s3://raw",
+            "replay_sources": {},
         },
         "plan-index.json": {
             "dag_id": "dag_ingest_espn",

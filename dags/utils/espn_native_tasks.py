@@ -410,6 +410,95 @@ def _admission_payload(value: object) -> Mapping[str, Any]:
     kind = value.get("kind")
     if kind not in expected or expected[kind] != value.get("schema_version"):
         raise OperationsError("admission artifact schema is unsupported")
+    common = {
+        "kind",
+        "schema_version",
+        "dag_id",
+        "run_id",
+        "attempt",
+        "mode",
+        "as_of",
+        "logical_date",
+        "parent",
+        "registry_ref",
+        "registry_signature",
+        "scope_ids",
+        "artifact_root",
+        "raw_store_uri",
+        "replay_sources",
+    }
+    v2 = {
+        "target_scope_ids",
+        "bootstrap_scope_ids",
+        "discovery_state_ref",
+        "candidate_ref",
+        "selection_policy",
+        "male_scope_count",
+    }
+    if set(value) != common | (v2 if expected[kind] == 2 else set()):
+        raise OperationsError("admission artifact fields mismatch its schema")
+    for field in ("dag_id", "run_id", "artifact_root", "raw_store_uri"):
+        _required(value[field], f"admission {field}")
+    if type(value["attempt"]) is not int or value["attempt"] < 1:
+        raise OperationsError("admission attempt must be positive")
+    if value["mode"] not in {"daily", *_MANUAL_MODES}:
+        raise OperationsError("admission mode is unsupported")
+    try:
+        date.fromisoformat(_required(value["as_of"], "admission as_of"))
+        logical_date = datetime.fromisoformat(
+            _required(value["logical_date"], "admission logical_date")
+        )
+    except ValueError as exc:
+        raise OperationsError("admission dates are invalid") from exc
+    if logical_date.tzinfo is None:
+        raise OperationsError("admission logical_date must be timezone-aware")
+    if value["parent"] is not None and not isinstance(value["parent"], Mapping):
+        raise OperationsError("admission parent must be an object or null")
+    _discovery_artifact_ref(value["registry_ref"], label="admission registry reference")
+    _sha(value["registry_signature"], "admission registry signature")
+    if not isinstance(value["replay_sources"], Mapping):
+        raise OperationsError("admission replay_sources must be an object")
+
+    def scopes(field: str, *, allow_empty: bool) -> tuple[str, ...]:
+        raw = value[field]
+        if not isinstance(raw, list) or not all(
+            isinstance(item, str) and item for item in raw
+        ):
+            raise OperationsError(f"admission {field} must be a string list")
+        result = tuple(raw)
+        if (not allow_empty and not result) or tuple(sorted(set(result))) != result:
+            raise OperationsError(f"admission {field} must be sorted and unique")
+        if len(result) > MAX_INGEST_SCOPE_MAP_ITEMS:
+            raise OperationsError(f"admission {field} exceeds its static bound")
+        return result
+
+    selected = scopes("scope_ids", allow_empty=False)
+    if expected[kind] == 2:
+        target = scopes("target_scope_ids", allow_empty=False)
+        bootstrap = scopes("bootstrap_scope_ids", allow_empty=True)
+        _discovery_artifact_ref(
+            value["discovery_state_ref"], label="admission discovery state reference"
+        )
+        _discovery_artifact_ref(
+            value["candidate_ref"], label="admission candidate reference"
+        )
+        if value["selection_policy"] != DISCOVERY_SELECTION_POLICY:
+            raise OperationsError("admission selection policy mismatch")
+        if (
+            type(value["male_scope_count"]) is not int
+            or value["male_scope_count"] != len(target)
+        ):
+            raise OperationsError("admission male scope count mismatch")
+        if (
+            len(bootstrap) > DAILY_BOOTSTRAP_SCOPE_LIMIT
+            or not set(bootstrap).issubset(selected)
+            or not set(bootstrap).issubset(target)
+        ):
+            raise OperationsError("admission bootstrap coverage is invalid")
+        if value["mode"] == "daily" and not set(selected).issubset(target):
+            raise OperationsError("daily admission selects a non-target scope")
+        if value["mode"] in _MANUAL_MODES and bootstrap:
+            raise OperationsError("manual admission cannot contain bootstrap scopes")
     return value
 
 
@@ -434,6 +523,26 @@ def _replay_existing_admission(
     except FileNotFoundError:
         return None
     admission = _read_admission_ref(admission_ref)
+    if admission["kind"] == "espn-airflow-admission-v2":
+        registry = _load_registry_ref(admission)
+        target = tuple(
+            sorted(
+                competition.scope_id(competition.current_edition)
+                for competition in registry.promoted
+            )
+        )
+        admitted = {
+            competition.scope_id(edition)
+            for competition in registry.promoted
+            for edition in competition.editions
+        }
+        if (
+            any(item.gender is not Gender.MALE for item in registry.promoted)
+            or len(registry.promoted) != admission["male_scope_count"]
+            or target != tuple(admission["target_scope_ids"])
+            or not set(admission["scope_ids"]).issubset(admitted)
+        ):
+            raise OperationsError("sealed admission registry coverage mismatch")
     params = context.get("params") or {}
     attempt = _attempt(context)
     expected_identity = (
