@@ -92,6 +92,12 @@ def _dead_or_zombie(pid: int) -> bool:
         state = open(f"/proc/{pid}/stat", encoding="utf-8").read().split()[2]
     except FileNotFoundError:
         return True
+    except ProcessLookupError:
+        # The pid directory outlived the process it describes: /proc answers
+        # ESRCH rather than ENOENT for the window between exit and teardown.
+        # That is the condition this helper is asked about, so it must report
+        # it instead of tearing the test down on its own success.
+        return True
     return state == "Z"
 
 
