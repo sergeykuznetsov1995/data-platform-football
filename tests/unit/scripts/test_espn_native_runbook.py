@@ -40,6 +40,7 @@ def test_runbook_contracts_automatic_all_male_rollout_and_reversal():
     automatic_rollout = text.split("## Automatic all-male rollout", 1)[1].split(
         "## Canary и три зелёных запуска", 1
     )[0]
+    rollout_steps = automatic_rollout.split("### Rollback expanded registry", 1)[0]
 
     for required in (
         "explicit-core-gender-MALE-v1",
@@ -57,6 +58,11 @@ def test_runbook_contracts_automatic_all_male_rollout_and_reversal():
         "dag_backfill_espn",
         "explicit <=10 cohort",
         "airflow dags pause dag_discover_espn_registry",
+        "airflow dags unpause dag_discover_espn_registry",
+        "airflow dags unpause dag_backfill_espn",
+        "airflow dags pause dag_backfill_espn",
+        "airflow dags unpause dag_ingest_espn",
+        "airflow dags unpause dag_monitor_espn",
         'state["candidate_ref"]',
         'state["male_registry_ref"]',
         '"MALE": 181, "FEMALE": 38, "UNKNOWN": 1',
@@ -66,3 +72,29 @@ def test_runbook_contracts_automatic_all_male_rollout_and_reversal():
 
     assert "airflow dags trigger dag_trigger_espn_daily" not in automatic_rollout
     assert "WHERE dag_id" not in automatic_rollout
+
+    ordered_markers = (
+        "airflow dags pause dag_trigger_espn_daily",
+        "airflow dags pause dag_discover_espn_registry",
+        "Deploy reviewed release",
+        "airflow dags unpause dag_discover_espn_registry",
+        "airflow dags trigger dag_discover_espn_registry",
+        "airflow dags pause dag_discover_espn_registry",
+        "ESPN_DISCOVERY_STATE_REF_URI",
+        "Запускать bounded bootstrap",
+        "airflow dags unpause dag_backfill_espn",
+        "airflow dags trigger dag_backfill_espn",
+        "Выполнить exact coverage reconciliation",
+        "запустить один manual all-scope canary",
+        "airflow dags pause dag_backfill_espn",
+        "airflow dags unpause dag_ingest_espn",
+        "airflow dags unpause dag_monitor_espn",
+        "airflow dags unpause dag_discover_espn_registry",
+        "airflow dags unpause dag_trigger_espn_daily",
+        "три новых scheduled green",
+    )
+    cursor = 0
+    for marker in ordered_markers:
+        position = rollout_steps.find(marker, cursor)
+        assert position >= 0, marker
+        cursor = position + len(marker)

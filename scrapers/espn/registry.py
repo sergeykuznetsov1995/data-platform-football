@@ -411,20 +411,27 @@ def _discovered_competition(
     discovered_edition = _discovered_edition(candidate)
     if prior is not None:
         legacy = manual.legacy if manual is not None else None
-        if prior.current_edition.source_season_year == candidate.source_season_year:
-            editions = prior.editions
-        else:
-            editions = tuple(
-                Edition(
-                    source_season_year=edition.source_season_year,
-                    display_name=edition.display_name,
-                    start_date=edition.start_date,
-                    end_date=edition.end_date,
-                    current=False,
-                    capabilities=edition.capabilities,
-                )
-                for edition in prior.editions
-            ) + (discovered_edition,)
+        retained_year = any(
+            edition.source_season_year == candidate.source_season_year
+            for edition in prior.editions
+        )
+        editions = tuple(
+            Edition(
+                source_season_year=edition.source_season_year,
+                display_name=edition.display_name,
+                start_date=edition.start_date,
+                end_date=edition.end_date,
+                current=(
+                    edition.source_season_year == candidate.source_season_year
+                    if retained_year
+                    else False
+                ),
+                capabilities=edition.capabilities,
+            )
+            for edition in prior.editions
+        )
+        if not retained_year:
+            editions += (discovered_edition,)
         return Competition(
             espn_id=candidate.espn_id,
             slug=candidate.slug,

@@ -83,6 +83,10 @@ DISCOVERY_MAX_AGE = timedelta(days=8)
 DISCOVERY_FUTURE_TOLERANCE = timedelta(minutes=5)
 DISCOVERY_DETAIL_BATCH_SIZE = 20
 DISCOVERY_SELECTION_POLICY = "explicit-core-gender-MALE-v1"
+DISCOVERY_CATALOG_URL = (
+    "https://sports.core.api.espn.com/v2/sports/soccer/leagues"
+    "?limit=500&lang=en&region=us"
+)
 MAX_DISCOVERY_COMPETITIONS = 300
 DISCOVERY_REQUESTS_PER_COMPETITION = 3
 MAX_DISCOVERY_DETAIL_REQUESTS = (
@@ -4012,8 +4016,12 @@ def fetch_discovery_catalog(**context) -> dict[str, str]:
         return {"discovery_raw_ref": _ref_for_uri(artifact_uri)}
     url = os.environ.get(
         "ESPN_DISCOVERY_CATALOG_URL",
-        "https://sports.core.api.espn.com/v2/sports/soccer/leagues?limit=500&lang=en&region=us",
+        DISCOVERY_CATALOG_URL,
     )
+    if url != DISCOVERY_CATALOG_URL:
+        raise OperationsError(
+            "ESPN discovery catalog URL must be the authoritative Core catalog"
+        )
     PostgresEspnControlStore.from_env().migrate()
     fetched = _http_client(raw_store, max_summary_events=1).fetch_json(
         url,
@@ -4032,8 +4040,10 @@ def fetch_discovery_catalog(**context) -> dict[str, str]:
     return {"discovery_raw_ref": _write_payload(artifact_uri, payload)}
 
 
-def _normalize_discovery_dropdown(document: object) -> Mapping[str, Any]:
-    """Expose one supported dropdown shape to both planning and review."""
+def _normalize_discovery_dropdown(
+    document: object, *, allow_normalized: bool = False
+) -> Mapping[str, Any]:
+    """Normalize the authoritative Core shape, or an explicit internal bundle."""
 
     if not isinstance(document, Mapping):
         raise OperationsError("discovery catalog must be an object")
@@ -4094,52 +4104,47 @@ def _normalize_discovery_dropdown(document: object) -> Mapping[str, Any]:
             slugs.add(slug)
             leagues.append({"id": None, "slug": slug, "name": slug})
         return {"leagues": leagues}
+    if allow_normalized and set(document) == {"leagues"} and isinstance(
+        document.get("leagues"), list
+    ):
+        return document
+    raise OperationsError(
+        "discovery production policy requires an authoritative Core catalog"
+    )
 
-    def find(value: object):
-        if isinstance(value, Mapping):
-            for key in ("leagues", "groups"):
-                if isinstance(value.get(key), list):
-                    return key, value[key]
-            if isinstance(value.get("leagueTeams"), Mapping):
-                return "leagueTeams", value["leagueTeams"]
-            for child in value.values():
-                found = find(child)
-                if found is not None:
-                    return found
-        elif isinstance(value, list):
-            for child in value:
-                found = find(child)
-                if found is not None:
-                    return found
-        return None
 
-    found = find(document)
-    if found is None:
-        raise OperationsError("discovery catalog contains no supported dropdown")
-    key, rows = found
-    if key == "leagueTeams":
-        return rows
-    if key == "groups":
-        return {"groups": rows}
-    return {
-        "leagues": [
-            {
-                **dict(row),
-                "name": row.get("name") or row.get("displayName"),
-            }
-            if isinstance(row, Mapping)
-            else row
-            for row in rows
-        ]
-    }
+def _normalized_discovery_competitions(
+    document: object,
+) -> tuple[tuple[int | None, str, str], ...]:
+    """Return the exact unique identities represented by one Core catalog."""
+
+    from scrapers.espn.discovery import parse_soccer_dropdown
+
+    dropdown = _normalize_discovery_dropdown(document)
+    competitions = tuple(
+        (candidate.espn_id, candidate.slug, candidate.name)
+        for candidate in parse_soccer_dropdown(dropdown)
+    )
+    if not competitions:
+        raise OperationsError("discovery catalog contains no competitions")
+    slugs = tuple(identity[1] for identity in competitions)
+    if (
+        len(competitions) != len(set(competitions))
+        or len(slugs) != len(set(slugs))
+    ):
+        raise OperationsError("discovery Core catalog identities must be unique")
+    if len(competitions) > MAX_DISCOVERY_COMPETITIONS:
+        raise OperationsError(
+            "discovery competition cap exceeded: "
+            f"{len(competitions)} > {MAX_DISCOVERY_COMPETITIONS}"
+        )
+    return competitions
 
 
 def plan_discovery_detail_batches(
     *, discovery_raw_ref: Mapping[str, str], **context
 ) -> dict[str, Any]:
     """Offline-plan deterministic unique competition detail batches of at most 20."""
-
-    from scrapers.espn.discovery import parse_soccer_dropdown
 
     raw = _read_ref(discovery_raw_ref, kind="espn-discovery-raw-v1")
     body = EspnRawStore.from_uri(_raw_store_uri()).load_exact(
@@ -4149,30 +4154,7 @@ def plan_discovery_detail_batches(
         dropdown = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise OperationsError("discovery catalog is not valid JSON") from exc
-    dropdown = _normalize_discovery_dropdown(dropdown)
-    unique = {}
-    slugs = {}
-    for candidate in parse_soccer_dropdown(dropdown):
-        identity = (candidate.espn_id, candidate.slug, candidate.name)
-        key = (
-            ("id", candidate.espn_id)
-            if candidate.espn_id is not None
-            else ("slug", candidate.slug)
-        )
-        if key in unique and unique[key] != identity:
-            raise OperationsError("discovery dropdown has conflicting identities")
-        if candidate.slug in slugs and slugs[candidate.slug] != identity:
-            raise OperationsError("discovery dropdown has conflicting slugs")
-        unique.setdefault(key, identity)
-        slugs.setdefault(candidate.slug, identity)
-    competitions = list(unique.values())
-    if not competitions:
-        raise OperationsError("discovery catalog contains no competitions")
-    if len(competitions) > MAX_DISCOVERY_COMPETITIONS:
-        raise OperationsError(
-            "discovery competition cap exceeded: "
-            f"{len(competitions)} > {MAX_DISCOVERY_COMPETITIONS}"
-        )
+    competitions = _normalized_discovery_competitions(dropdown)
     dag_id, run_id, _ = _run_identity(context)
     root = _join_uri(_artifact_root(), "discovery", _run_key(dag_id, run_id))
     batch_refs = []
@@ -4717,7 +4699,9 @@ def _discovery_snapshot(document: Mapping[str, Any], *, captured_at: str):
             candidates=parsed.candidates,
             source=parsed.source,
         )
-    dropdown = _normalize_discovery_dropdown(document.get("dropdown", document))
+    dropdown = _normalize_discovery_dropdown(
+        document.get("dropdown", document), allow_normalized=True
+    )
     explicit_details = document.get("details_by_slug", {})
     if not isinstance(explicit_details, Mapping):
         raise OperationsError("discovery details_by_slug must be an object")
@@ -5003,8 +4987,9 @@ def _validate_discovery_reducer_checkpoint(
     candidate_uri: str,
     male_registry_uri: str,
     review_uri: str,
+    discovery_state_uri: str,
 ) -> dict[str, Any]:
-    required_keys = {
+    v1_keys = {
         "kind",
         "schema_version",
         "discovery_detail_index_ref",
@@ -5020,11 +5005,18 @@ def _validate_discovery_reducer_checkpoint(
         "review_ref",
         "observed_at",
     }
+    v2_keys = v1_keys | {"discovery_state_payload", "discovery_state_ref"}
+    if not isinstance(checkpoint, dict):
+        raise OperationsError("discovery reducer checkpoint mismatch")
+    version = (checkpoint.get("kind"), checkpoint.get("schema_version"))
+    if version == ("espn-discovery-reducer-checkpoint-v1", 1):
+        required_keys = v1_keys
+    elif version == ("espn-discovery-reducer-checkpoint-v2", 2):
+        required_keys = v2_keys
+    else:
+        raise OperationsError("discovery reducer checkpoint mismatch")
     if (
-        not isinstance(checkpoint, dict)
-        or set(checkpoint) != required_keys
-        or checkpoint.get("kind") != "espn-discovery-reducer-checkpoint-v1"
-        or checkpoint.get("schema_version") != 1
+        set(checkpoint) != required_keys
         or checkpoint.get("discovery_detail_index_ref")
         != discovery_detail_index_ref
         or checkpoint.get("discovery_detail_phase_refs")
@@ -5071,7 +5063,32 @@ def _validate_discovery_reducer_checkpoint(
         or checkpoint["observed_at"] != review["observed_at"]
     ):
         raise OperationsError("discovery reducer checkpoint review binding mismatch")
-    return checkpoint
+    expected_state = _discovery_review_state(review, review_ref=review_ref)
+    normalized = dict(checkpoint)
+    if version == ("espn-discovery-reducer-checkpoint-v2", 2):
+        state_ref = _discovery_artifact_ref(
+            checkpoint["discovery_state_ref"],
+            label="sealed discovery state reference",
+        )
+        if (
+            not isinstance(checkpoint.get("discovery_state_payload"), Mapping)
+            or checkpoint["discovery_state_payload"] != expected_state
+            or state_ref["uri"] != discovery_state_uri
+            or _payload_ref(discovery_state_uri, checkpoint["discovery_state_payload"])
+            != state_ref
+        ):
+            raise OperationsError(
+                "discovery reducer checkpoint state binding mismatch"
+            )
+    else:
+        # A pre-v2 reducer checkpoint sealed the complete review projection.
+        # Derive the state deterministically so interrupted rollout runs remain
+        # replayable while every new checkpoint seals the state explicitly.
+        normalized["discovery_state_payload"] = expected_state
+        normalized["discovery_state_ref"] = _payload_ref(
+            discovery_state_uri, expected_state
+        )
+    return normalized
 
 
 def _replay_discovery_reducer_checkpoint(
@@ -5082,6 +5099,7 @@ def _replay_discovery_reducer_checkpoint(
     candidate_uri: str,
     male_registry_uri: str,
     review_uri: str,
+    discovery_state_uri: str,
     latest_state_uri: str,
 ) -> dict[str, Any]:
     sealed = _validate_discovery_reducer_checkpoint(
@@ -5091,31 +5109,46 @@ def _replay_discovery_reducer_checkpoint(
         candidate_uri=candidate_uri,
         male_registry_uri=male_registry_uri,
         review_uri=review_uri,
+        discovery_state_uri=discovery_state_uri,
     )
     candidate_ref = _write_payload(candidate_uri, sealed["candidate_payload"])
     male_registry_ref = _write_payload(
         male_registry_uri, sealed["male_registry_payload"]
     )
     review_ref = _write_payload(review_uri, sealed["review_payload"])
+    discovery_state_ref = _write_payload(
+        discovery_state_uri, sealed["discovery_state_payload"]
+    )
     if (
         candidate_ref != sealed["candidate_ref"]
         or male_registry_ref != sealed["male_registry_ref"]
         or review_ref != sealed["review_ref"]
+        or discovery_state_ref != sealed["discovery_state_ref"]
     ):
         raise OperationsError("discovery reducer replay reference mismatch")
     _publish_latest_discovery_state(
         latest_state_uri,
-        _discovery_review_state(sealed["review_payload"], review_ref=review_ref),
+        sealed["discovery_state_payload"],
+        state_ref=discovery_state_ref,
     )
     return {
+        "discovery_state_ref": discovery_state_ref,
         "discovery_review_ref": review_ref,
         "male_registry_ref": male_registry_ref,
     }
 
 
 def _publish_latest_discovery_state(
-    latest_state_uri: str, state: Mapping[str, Any]
+    latest_state_uri: str,
+    state: Mapping[str, Any],
+    *,
+    state_ref: Mapping[str, str],
 ) -> None:
+    sealed_ref = _discovery_artifact_ref(
+        state_ref, label="immutable discovery state reference"
+    )
+    if sealed_ref["sha256"] != hashlib.sha256(_canonical_bytes(state)).hexdigest():
+        raise OperationsError("immutable discovery state payload hash mismatch")
     incoming_time = _discovery_observed_at(
         state.get("observed_at"), label="discovery state observed_at"
     )
@@ -5158,15 +5191,14 @@ def publish_discovered_male_registry(
     candidate_uri = _join_uri(root, "candidate.json")
     male_registry_uri = _join_uri(root, "male-registry.json")
     review_uri = _join_uri(root, "reviewable-diff.json")
+    discovery_state_uri = _join_uri(root, "discovery-state.json")
     checkpoint_uri = _join_uri(root, "reducer-checkpoint.json")
     latest_state_uri = _join_uri(_artifact_root(), "discovery", "latest-state.json")
     canonical_index_ref = _discovery_artifact_ref(
         discovery_detail_index_ref,
         label="discovery detail index reference",
     )
-    existing_checkpoint = _optional_payload(
-        checkpoint_uri, kind="espn-discovery-reducer-checkpoint-v1"
-    )
+    existing_checkpoint = _optional_payload(checkpoint_uri)
     if existing_checkpoint is not None:
         committed_phase_refs = existing_checkpoint.get(
             "discovery_detail_phase_refs"
@@ -5188,6 +5220,7 @@ def publish_discovered_male_registry(
             candidate_uri=candidate_uri,
             male_registry_uri=male_registry_uri,
             review_uri=review_uri,
+            discovery_state_uri=discovery_state_uri,
             latest_state_uri=latest_state_uri,
         )
     existing_review = _optional_payload(review_uri)
@@ -5207,11 +5240,15 @@ def publish_discovered_male_registry(
             discovery_detail_phase_refs=canonical_phase_refs,
         )
         review_ref = _ref_for_uri(review_uri)
+        state = _discovery_review_state(review, review_ref=review_ref)
+        discovery_state_ref = _write_payload(discovery_state_uri, state)
         _publish_latest_discovery_state(
             latest_state_uri,
-            _discovery_review_state(review, review_ref=review_ref),
+            state,
+            state_ref=discovery_state_ref,
         )
         return {
+            "discovery_state_ref": discovery_state_ref,
             "discovery_review_ref": review_ref,
             "male_registry_ref": review["male_registry_ref"],
         }
@@ -5253,6 +5290,59 @@ def publish_discovered_male_registry(
         dropdown = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise OperationsError("discovery catalog is not valid JSON") from exc
+    catalog_competitions = _normalized_discovery_competitions(dropdown)
+    indexed_batches = {}
+    indexed_competitions = []
+    for batch_ref in detail_index["batch_refs"]:
+        batch = _read_ref(batch_ref, kind="espn-discovery-detail-batch-v1")
+        batch_id = batch.get("batch_id")
+        batch_competitions = batch.get("competitions")
+        if not isinstance(batch_id, str) or not batch_id:
+            raise OperationsError("discovery detail batch identity is invalid")
+        if batch_id in indexed_batches:
+            raise OperationsError("discovery detail index duplicates a batch")
+        if batch.get("discovery_raw_ref") != detail_index["discovery_raw_ref"]:
+            raise OperationsError("discovery detail batch raw identity mismatch")
+        if (
+            not isinstance(batch_competitions, list)
+            or not 1 <= len(batch_competitions) <= DISCOVERY_DETAIL_BATCH_SIZE
+        ):
+            raise OperationsError("discovery detail batch coverage is invalid")
+        for item in batch_competitions:
+            if (
+                not isinstance(item, Mapping)
+                or set(item) != {"espn_id", "slug", "name"}
+                or (
+                    item["espn_id"] is not None
+                    and (
+                        type(item["espn_id"]) is not int or item["espn_id"] <= 0
+                    )
+                )
+                or not isinstance(item["slug"], str)
+                or not item["slug"]
+                or not isinstance(item["name"], str)
+                or not item["name"]
+            ):
+                raise OperationsError("discovery detail batch identity is invalid")
+            indexed_competitions.append(
+                (item["espn_id"], item["slug"], item["name"])
+            )
+        indexed_batches[batch_id] = (batch_ref, batch)
+    if set(indexed_batches) != set(detail_index["batch_ids"]):
+        raise OperationsError("discovery detail index batch references are incomplete")
+    catalog_slugs = {identity[1] for identity in catalog_competitions}
+    indexed_slugs = {identity[1] for identity in indexed_competitions}
+    if (
+        detail_index["competition_count"] != len(catalog_competitions)
+        or len(indexed_competitions) != len(catalog_competitions)
+        or len(indexed_competitions) != len(set(indexed_competitions))
+        or set(indexed_competitions) != set(catalog_competitions)
+        or indexed_slugs != catalog_slugs
+        or len(indexed_slugs) != len(indexed_competitions)
+    ):
+        raise OperationsError(
+            "discovery raw catalog coverage differs from signed detail index"
+        )
     phases = {}
     for phase_ref in canonical_phase_refs:
         phase = _read_ref(
@@ -5264,16 +5354,6 @@ def publish_discovered_male_registry(
         phases[phase["batch_id"]] = phase
     if set(phases) != set(detail_index["batch_ids"]):
         raise OperationsError("discovery detail phase set differs from signed index")
-    indexed_batches = {}
-    for batch_ref in detail_index["batch_refs"]:
-        batch = _read_ref(batch_ref, kind="espn-discovery-detail-batch-v1")
-        if batch["batch_id"] in indexed_batches:
-            raise OperationsError("discovery detail index duplicates a batch")
-        if batch["discovery_raw_ref"] != detail_index["discovery_raw_ref"]:
-            raise OperationsError("discovery detail batch raw identity mismatch")
-        indexed_batches[batch["batch_id"]] = (batch_ref, batch)
-    if set(indexed_batches) != set(detail_index["batch_ids"]):
-        raise OperationsError("discovery detail index batch references are incomplete")
     details_by_slug = {}
     seen_ids = set()
     detail_request_count = 0
@@ -5300,6 +5380,8 @@ def publish_discovered_male_registry(
             if identity in seen_ids:
                 raise OperationsError("discovery detail identity was fetched twice")
             seen_ids.add(identity)
+            if item["slug"] in details_by_slug:
+                raise OperationsError("discovery detail slug was fetched twice")
             summary_uri = item.get("summary_raw_uri")
             summary_sha256 = item.get("summary_raw_sha256")
             summary_event_id = item.get("summary_event_id")
@@ -5361,7 +5443,10 @@ def publish_discovered_male_registry(
                 slug=item["slug"],
                 name=item["name"],
             )
-    if len(seen_ids) != detail_index["competition_count"]:
+    if (
+        len(seen_ids) != len(catalog_competitions)
+        or len(details_by_slug) != len(catalog_competitions)
+    ):
         raise OperationsError("discovery detail competition count mismatch")
     if detail_request_count > detail_index["detail_request_cap"]:
         raise OperationsError("discovery detail request cap exceeded")
@@ -5462,9 +5547,11 @@ def publish_discovered_male_registry(
         "observed_at": observed_at.isoformat(),
     }
     review_ref = _payload_ref(review_uri, review)
+    discovery_state = _discovery_review_state(review, review_ref=review_ref)
+    discovery_state_ref = _payload_ref(discovery_state_uri, discovery_state)
     checkpoint = {
-        "kind": "espn-discovery-reducer-checkpoint-v1",
-        "schema_version": 1,
+        "kind": "espn-discovery-reducer-checkpoint-v2",
+        "schema_version": 2,
         "discovery_detail_index_ref": canonical_index_ref,
         "discovery_detail_phase_refs": canonical_phase_refs,
         "candidate_payload": candidate_payload,
@@ -5476,6 +5563,8 @@ def publish_discovered_male_registry(
         "male_scope_count": male_scope_count,
         "review_payload": review,
         "review_ref": review_ref,
+        "discovery_state_payload": discovery_state,
+        "discovery_state_ref": discovery_state_ref,
         "observed_at": observed_at.isoformat(),
     }
     _write_payload(checkpoint_uri, checkpoint)
@@ -5486,6 +5575,7 @@ def publish_discovered_male_registry(
         candidate_uri=candidate_uri,
         male_registry_uri=male_registry_uri,
         review_uri=review_uri,
+        discovery_state_uri=discovery_state_uri,
         latest_state_uri=latest_state_uri,
     )
 

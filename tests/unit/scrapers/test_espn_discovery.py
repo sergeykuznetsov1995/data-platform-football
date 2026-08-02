@@ -162,6 +162,13 @@ def test_detail_metadata_is_only_source_of_gender_edition_and_capabilities() -> 
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("gender", ["M", "MEN", "male", "MALE ", "UNDECLARED"])
+def test_core_detail_rejects_non_literal_gender_tokens(gender: str) -> None:
+    with pytest.raises(ValueError, match="unknown competition detail gender"):
+        parse_competition_detail(_detail(gender=gender))
+
+
+@pytest.mark.unit
 def test_detail_without_numeric_id_remains_an_unpromotable_candidate() -> None:
     payload = _detail(gender="FEMALE")
     payload.pop("id")

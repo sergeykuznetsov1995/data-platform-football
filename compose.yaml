@@ -211,7 +211,12 @@ x-airflow-common: &airflow-common
     ESPN_RAW_S3_SCHEME: http
     ESPN_ARTIFACT_S3_ENDPOINT: seaweedfs:8333
     ESPN_ARTIFACT_S3_SCHEME: http
-    ESPN_DISCOVERY_CATALOG_URL: ${ESPN_DISCOVERY_CATALOG_URL:-https://site.api.espn.com/apis/site/v2/sports/soccer/leagues}
+    ESPN_DISCOVERY_CATALOG_URL: ${ESPN_DISCOVERY_CATALOG_URL:-https://sports.core.api.espn.com/v2/sports/soccer/leagues?limit=500&lang=en&region=us}
+    # Optional rollout freeze. Null Compose values inherit a host value when
+    # configured and omit the key entirely when absent; blank strings are not
+    # valid because the runtime requires either both exact values or neither.
+    ESPN_DISCOVERY_STATE_REF_URI:
+    ESPN_DISCOVERY_STATE_REF_SHA256:
     # Development-only legacy FlareSolverr proxy URL. Production keeps this
     # blank: port 8899 requires a lease unless --allow-legacy-noauth is added.
     PROXY_FILTER_URL: ${PROXY_FILTER_URL:-}

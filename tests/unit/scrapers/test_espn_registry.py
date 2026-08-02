@@ -271,6 +271,47 @@ def test_generated_registry_rollover_preserves_prior_editions() -> None:
 
 
 @pytest.mark.unit
+def test_generated_registry_reactivates_retained_historical_edition() -> None:
+    document = _document()
+    historical = deepcopy(document["competitions"][0]["editions"][0])
+    historical.update(
+        source_season_year=2025,
+        display_name="retained 2025 contract",
+        start_date="2025-06-01",
+        end_date="2026-05-31",
+        current=False,
+    )
+    document["competitions"][0]["editions"].insert(0, historical)
+    prior = validate_registry_document(document)
+    candidate = replace(
+        _male_candidate(),
+        espn_id=700,
+        slug="eng.1",
+        name="English Premier League",
+        source_season_year=2025,
+        edition_display_name="stale ESPN 2025 label",
+        start_date="2025-01-01",
+        end_date="2025-12-31",
+    )
+
+    generated = build_discovered_male_registry(
+        CatalogSnapshot("2026-08-02T00:00:00+00:00", (candidate,)),
+        legacy_registry=prior,
+        previous_registry=prior,
+    )
+
+    competition = generated.by_id[700]
+    assert [edition.source_season_year for edition in competition.editions] == [
+        2025,
+        2026,
+    ]
+    assert [edition.current for edition in competition.editions] == [True, False]
+    assert competition.current_edition.display_name == "retained 2025 contract"
+    assert competition.current_edition.start_date.isoformat() == "2025-06-01"
+    assert competition.current_edition.end_date.isoformat() == "2026-05-31"
+
+
+@pytest.mark.unit
 def test_seed_registry_preserves_all_nine_legacy_mappings() -> None:
     registry = load_registry(DEFAULT_REGISTRY_PATH)
 

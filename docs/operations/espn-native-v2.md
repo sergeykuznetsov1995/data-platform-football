@@ -16,7 +16,7 @@ cutover для одного scope.
 ## Discovery и явное promotion registry
 
 1. Запустить `dag_discover_espn_registry` и дождаться зелёных
-   `fetch_discovery_catalog` и `write_reviewable_diff`.
+   `fetch_discovery_catalog` и `publish_discovered_male_registry`.
 2. Скачать immutable discovery snapshot и review diff. Сверить ESPN ID, slug,
    мужской пол, age class, edition, даты и три capability. Discovery никогда
    сам не меняет registry.
@@ -39,11 +39,16 @@ cutover для одного scope.
 record останавливает rollout.
 
 Сохранять нужно immutable `male_registry_ref` (`uri` и SHA-256), candidate,
-review и discovery-state ref из успешного weekly run. `latest-state.json`
+review и `discovery_state_ref`, который возвращает успешный
+`publish_discovered_male_registry`. Его URI имеет run-scoped вид
+`<ESPN_ARTIFACT_ROOT_URI>/discovery/<run-key>/discovery-state.json`.
+`latest-state.json`
 является лишь mutable discovery pointer: `latest-state.json никогда не является
 registry запуска`. Он может помочь найти state, но admission, bootstrap,
 canary и rollback используют frozen immutable discovery-state ref, который
-сам связывает `male_registry_ref`.
+сам связывает `male_registry_ref`. Reducer сначала публикует immutable state,
+а затем копирует в alias те же canonical bytes; более новый weekly run меняет
+только alias и не делает старый run-scoped ref нечитаемым.
 
 Выполнять шаги строго в этом порядке.
 
@@ -54,24 +59,38 @@ canary и rollback используют frozen immutable discovery-state ref, к
    airflow dags pause dag_discover_espn_registry
    ```
 
-2. Deploy reviewed release и запустить weekly discovery:
+2. Deploy reviewed release. Ручной run поставленного на паузу DAG
+   остаётся `queued`, поэтому для одного exact weekly discovery run
+   временно снять паузу и задать явный run ID:
 
    ```bash
-   airflow dags trigger dag_discover_espn_registry
+   export DISCOVERY_RUN_ID='all-male-rollout-<UTC-timestamp>'
+   airflow dags unpause dag_discover_espn_registry
+   airflow dags trigger dag_discover_espn_registry --run-id "$DISCOVERY_RUN_ID"
    ```
 
-   Дождаться `publish_discovered_male_registry`, сохранить immutable state/ref,
+   Дождаться terminal success именно `$DISCOVERY_RUN_ID` и его
+   `publish_discovered_male_registry`, затем сразу вернуть discovery
+   на паузу до финальной активации:
+
+   ```bash
+   airflow dags pause dag_discover_espn_registry
+   ```
+
+   Сохранить возвращённый
+   immutable `discovery_state_ref`,
    SHA-256, registry signature и count. Подтвердить baseline `181/38/1`, exact
    Core coverage и zero duplicate IDs/slugs. Сохранить immutable state ref и
    `male_registry_ref` из этого run; state ref — frozen input, связывающий
-   exact generated registry. Настроить оба значения во **всех** Airflow
-   компонентах (scheduler, workers и запланированных task containers), затем
-   recreate/restart их до bootstrap; неполная пара запрещена:
+   exact generated registry. Настроить оба значения в shared Compose
+   environment для `airflow-init`, `airflow-scheduler` и `airflow-webserver`;
+   LocalExecutor task subprocesses наследуют их от scheduler. Затем
+   recreate/restart этих Airflow services до bootstrap; неполная пара запрещена:
 
    ```bash
-   export ESPN_DISCOVERY_STATE_REF_URI='s3://.../immutable-discovery-state.json'
+   export ESPN_DISCOVERY_STATE_REF_URI='s3://.../discovery/<run-key>/discovery-state.json'
    export ESPN_DISCOVERY_STATE_REF_SHA256='...lowercase-64-hex...'
-   # inject both variables into every Airflow component and recreate it
+   # compose.yaml omits both keys when unset and propagates both exact values here
    ```
 
    С включённой парой admission читает только этот exact state ref и никогда
@@ -81,7 +100,15 @@ canary и rollback используют frozen immutable discovery-state ref, к
    rollout или rollback.
 
 3. Запускать bounded bootstrap через `dag_backfill_espn`, не через daily
-   owner. После каждой exact coverage reconciliation вычислить deterministic
+   owner. Перед первым cohort снять паузу только с manual
+   `dag_backfill_espn`; его `schedule=None`, и он остаётся unpaused только
+   до завершения all-scope canary:
+
+   ```bash
+   airflow dags unpause dag_backfill_espn
+   ```
+
+   После каждой exact coverage reconciliation вычислить deterministic
    `sorted(target - COMPLETE)` и передать только первые 10 отсутствующих scope
    как явный `scopes` (explicit <=10 cohort); это ten-scope bootstrap rule, а
    не разрешение расширить map/lease limit. Дождаться terminal success и
@@ -185,12 +212,20 @@ canary и rollback используют frozen immutable discovery-state ref, к
    saved state ref/`male_registry_ref`; zero-row scope считается успешным лишь
    с exact signed manifest/checkpoint evidence, а не из-за отсутствия mapped
    output. Summary reuse также требует exact signed prior evidence. Затем
-   подтвердить zero active leases и zero alerts. Только после этого снять
-   паузу с owner и discovery:
+   подтвердить zero active leases и zero alerts. Только после этого
+   вернуть manual backfill на паузу, оставить repair/replay на паузе,
+   снять паузу с child ingest и monitoring, затем с discovery и лишь
+   после них — с daily owner. Этот порядок обязателен после
+   init/recreate, когда все ESPN DAG-и могли быть поставлены на паузу:
 
    ```bash
-   airflow dags unpause dag_trigger_espn_daily
+   airflow dags pause dag_backfill_espn
+   airflow dags pause dag_repair_espn
+   airflow dags pause dag_replay_espn
+   airflow dags unpause dag_ingest_espn
+   airflow dags unpause dag_monitor_espn
    airflow dags unpause dag_discover_espn_registry
+   airflow dags unpause dag_trigger_espn_daily
    ```
 
    Из-за нового registry signature обязательны три новых scheduled green

@@ -429,6 +429,27 @@ def test_core_catalog_rejects_partial_or_malformed_coverage(catalog):
         espn_native_tasks._normalize_discovery_dropdown(catalog)
 
 
+def test_discovery_policy_rejects_legacy_site_catalog_shape():
+    from dags.utils import espn_native_tasks
+
+    site_catalog = {
+        "sports": [
+            {
+                "leagues": [
+                    {
+                        "id": "730",
+                        "slug": "ita.1",
+                        "displayName": "Italian Serie A",
+                    }
+                ]
+            }
+        ]
+    }
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="Core catalog"):
+        espn_native_tasks._normalize_discovery_dropdown(site_catalog)
+
+
 def test_core_catalog_default_fetches_complete_single_page(monkeypatch):
     from dags.utils import espn_native_tasks
     from scrapers.espn.transport_contracts import EndpointType
@@ -489,6 +510,47 @@ def test_core_catalog_default_fetches_complete_single_page(monkeypatch):
             {"force_refresh": True},
         )
     ]
+
+
+def test_discovery_catalog_rejects_non_core_runtime_override(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    monkeypatch.setenv(
+        "ESPN_DISCOVERY_CATALOG_URL",
+        "https://site.api.espn.com/apis/site/v2/sports/soccer/all",
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_run_identity",
+        lambda _context: (
+            "dag_discover_espn_registry",
+            "run-1",
+            datetime(2026, 8, 2, tzinfo=timezone.utc),
+        ),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(espn_native_tasks, "_optional_payload", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        lambda _uri: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: pytest.fail("invalid URL must fail before DB access")),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_http_client",
+        lambda *_a, **_k: pytest.fail("invalid URL must fail before network access"),
+    )
+
+    with pytest.raises(
+        espn_native_tasks.OperationsError, match="authoritative Core catalog"
+    ):
+        espn_native_tasks.fetch_discovery_catalog()
 
 
 def test_every_mapped_input_is_a_selector_or_producer_return_value():
@@ -1475,6 +1537,8 @@ def test_discovery_registry_freeze_requires_complete_ref_pair(
 ):
     from dags.utils import espn_native_tasks
 
+    monkeypatch.delenv(espn_native_tasks.DISCOVERY_STATE_REF_URI_ENV, raising=False)
+    monkeypatch.delenv(espn_native_tasks.DISCOVERY_STATE_REF_SHA256_ENV, raising=False)
     monkeypatch.setenv(name, value)
 
     with pytest.raises(espn_native_tasks.OperationsError, match="configured together"):
@@ -1841,7 +1905,19 @@ def test_nested_discovery_plans_220_unique_details_as_eleven_bounded_batches(
     flattened = json.loads(
         (ROOT / "tests/fixtures/espn/dropdown_2026-07-31.json").read_text()
     )
-    dropdown = {"sports": [{"name": "soccer", "leagues": flattened["leagues"]}]}
+    dropdown = {
+        "count": len(flattened["leagues"]),
+        "pageCount": 1,
+        "items": [
+            {
+                "$ref": (
+                    "https://sports.core.api.espn.com/v2/sports/soccer/leagues/"
+                    f"{row['slug']}"
+                )
+            }
+            for row in flattened["leagues"]
+        ],
+    }
     raw = {
         "kind": "espn-discovery-raw-v1",
         "schema_version": 1,
@@ -2471,7 +2547,7 @@ def test_saved_detail_evidence_reaches_male_registry_artifact(monkeypatch):
         "raw_sha256": "e" * 64,
         "proxy_bytes": 0,
     }
-    competition = {"espn_id": 730, "slug": "ita.1", "name": "Italian Serie A"}
+    competition = {"espn_id": None, "slug": "ita.1", "name": "ita.1"}
     batch = {
         "kind": "espn-discovery-detail-batch-v1",
         "batch_id": "batch-1",
@@ -2515,13 +2591,13 @@ def test_saved_detail_evidence_reaches_male_registry_artifact(monkeypatch):
         phase_ref["uri"]: phase,
     }
     dropdown = {
-        "sports": [
+        "count": 1,
+        "pageCount": 1,
+        "items": [
             {
-                "leagues": [
-                    {"id": "730", "slug": "ita.1", "displayName": "Italian Serie A"}
-                ]
+                "$ref": "https://sports.core.api.espn.com/v2/sports/soccer/leagues/ita.1?lang=en&region=us"
             }
-        ]
+        ],
     }
     saved = {
         "s3://raw/ita-metadata.json": (
@@ -2535,6 +2611,7 @@ def test_saved_detail_evidence_reaches_male_registry_artifact(monkeypatch):
         ).read_bytes(),
     }
     written = []
+    writes = []
     alert_snapshots = []
     registry = validate_registry_document(
         {
@@ -2615,8 +2692,9 @@ def test_saved_detail_evidence_reaches_male_registry_artifact(monkeypatch):
     monkeypatch.setattr(espn_native_tasks, "_attempt", lambda _context: 1)
     monkeypatch.delenv("ESPN_DISCOVERY_PREVIOUS_URI", raising=False)
 
-    def write(uri, payload, **_kwargs):
+    def write(uri, payload, **kwargs):
         written.append(payload)
+        writes.append((uri, payload, kwargs))
         return espn_native_tasks._payload_ref(uri, payload)
 
     monkeypatch.setattr(espn_native_tasks, "_write_payload", write)
@@ -2668,6 +2746,128 @@ def test_saved_detail_evidence_reaches_male_registry_artifact(monkeypatch):
     assert review["quarantined_scopes"] == []
     assert review["promotion_performed"] is False
     assert result["discovery_review_ref"]["uri"].endswith("reviewable-diff.json")
+    assert result["discovery_state_ref"]["uri"].endswith("/discovery-state.json")
+    checkpoint = next(
+        payload
+        for payload in written
+        if payload.get("kind") == "espn-discovery-reducer-checkpoint-v2"
+    )
+    state_uri, state_payload, state_kwargs = next(
+        write for write in writes if write[0].endswith("/discovery-state.json")
+    )
+    latest_uri, latest_payload, latest_kwargs = next(
+        write for write in writes if write[0].endswith("/discovery/latest-state.json")
+    )
+    assert checkpoint["discovery_state_payload"] == state_payload
+    assert checkpoint["discovery_state_ref"] == result["discovery_state_ref"]
+    assert state_payload["kind"] == "espn-discovery-state-v2"
+    assert state_payload == latest_payload
+    assert result["discovery_state_ref"]["sha256"] == hashlib.sha256(
+        espn_native_tasks._canonical_bytes(latest_payload)
+    ).hexdigest()
+    assert state_uri != latest_uri
+    assert state_kwargs == {}
+    assert latest_kwargs == {"immutable": False}
+
+
+def test_discovery_reducer_rejects_partial_index_before_phase_reduction(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    raw_ref = {"uri": "s3://artifacts/raw-ref.json", "sha256": "a" * 64}
+    index_ref = {"uri": "s3://artifacts/index-ref.json", "sha256": "b" * 64}
+    batch_ref = {"uri": "s3://artifacts/batch-ref.json", "sha256": "c" * 64}
+    phase_ref = {"uri": "s3://artifacts/phase-ref.json", "sha256": "d" * 64}
+    competition = {"espn_id": None, "slug": "eng.1", "name": "eng.1"}
+    raw = {
+        "kind": "espn-discovery-raw-v1",
+        "captured_at": "2026-08-01T00:00:00+00:00",
+        "raw_uri": "s3://raw/core-catalog.json",
+        "raw_sha256": "e" * 64,
+        "proxy_bytes": 0,
+    }
+    index = {
+        "kind": "espn-discovery-detail-index-v1",
+        "discovery_raw_ref": raw_ref,
+        "captured_at": raw["captured_at"],
+        "batch_ids": ["batch-1"],
+        "batch_refs": [batch_ref],
+        "competition_count": 1,
+        "competition_cap": espn_native_tasks.MAX_DISCOVERY_COMPETITIONS,
+        "detail_request_cap": espn_native_tasks.MAX_DISCOVERY_DETAIL_REQUESTS,
+    }
+    batch = {
+        "kind": "espn-discovery-detail-batch-v1",
+        "batch_id": "batch-1",
+        "discovery_raw_ref": raw_ref,
+        "competitions": [competition],
+    }
+    phase = {
+        "kind": "espn-discovery-detail-phase-v1",
+        "batch_id": "batch-1",
+        "discovery_detail_batch_ref": batch_ref,
+        "details": [{**competition}],
+    }
+    payloads = {
+        raw_ref["uri"]: raw,
+        index_ref["uri"]: index,
+        batch_ref["uri"]: batch,
+        phase_ref["uri"]: phase,
+    }
+    core_catalog = {
+        "count": 2,
+        "pageCount": 1,
+        "items": [
+            {
+                "$ref": "https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1"
+            },
+            {
+                "$ref": "https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions"
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_run_identity",
+        lambda _context: (
+            "dag_discover_espn_registry",
+            "run-partial-index",
+            datetime(2026, 8, 1, tzinfo=timezone.utc),
+        ),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(espn_native_tasks, "_optional_payload", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_ref",
+        lambda ref, **_kwargs: payloads[ref["uri"]],
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        lambda _uri: SimpleNamespace(
+            load_exact=lambda uri, _sha: (
+                json.dumps(core_catalog).encode()
+                if uri == raw["raw_uri"]
+                else pytest.fail("partial index must fail before detail evidence reads")
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda *_a, **_k: pytest.fail(
+            "partial index must fail before publishing reducer artifacts"
+        ),
+    )
+
+    with pytest.raises(
+        espn_native_tasks.OperationsError, match="raw catalog coverage"
+    ):
+        espn_native_tasks.publish_discovered_male_registry(
+            discovery_detail_index_ref=index_ref,
+            discovery_detail_phase_refs=[{"discovery_detail_phase_ref": phase_ref}],
+        )
 
 
 def test_discovery_review_retry_replays_checkpoint_without_recomputation(monkeypatch):
@@ -2794,7 +2994,8 @@ def test_discovery_review_retry_replays_checkpoint_without_recomputation(monkeyp
         espn_native_tasks,
         "_write_payload",
         lambda uri, payload, **kwargs: (
-            writes.append((uri, payload, kwargs)) or {"uri": uri, "sha256": "f" * 64}
+            writes.append((uri, payload, kwargs))
+            or espn_native_tasks._payload_ref(uri, payload)
         ),
     )
     monkeypatch.setattr(
@@ -2815,17 +3016,20 @@ def test_discovery_review_retry_replays_checkpoint_without_recomputation(monkeyp
         discovery_detail_phase_refs=[{"discovery_detail_phase_ref": phase_ref}],
     )
 
-    assert result == {
-        "discovery_review_ref": review_ref,
-        "male_registry_ref": male_registry_ref,
-    }
-    assert len(writes) == 1
-    latest_uri, latest_state, kwargs = writes[0]
+    assert result["discovery_review_ref"] == review_ref
+    assert result["male_registry_ref"] == male_registry_ref
+    assert result["discovery_state_ref"]["uri"].endswith("/discovery-state.json")
+    assert len(writes) == 2
+    state_uri, immutable_state, state_kwargs = writes[0]
+    latest_uri, latest_state, kwargs = writes[1]
+    assert state_uri.endswith("/discovery-state.json")
     assert latest_uri.endswith("/discovery/latest-state.json")
+    assert immutable_state == latest_state
     assert latest_state["candidate_signature"] == candidate_signature
     assert latest_state["male_registry_ref"] == male_registry_ref
     assert latest_state["male_registry_signature"] == male_registry_signature
     assert latest_state["review_ref"] == review_ref
+    assert state_kwargs == {}
     assert kwargs == {"immutable": False}
 
 
@@ -2840,6 +3044,7 @@ def test_discovery_partial_publication_replays_sealed_reducer_checkpoint(monkeyp
     candidate_uri = f"{root}/candidate.json"
     registry_uri = f"{root}/male-registry.json"
     review_uri = f"{root}/reviewable-diff.json"
+    state_uri = f"{root}/discovery-state.json"
     checkpoint_uri = f"{root}/reducer-checkpoint.json"
     candidate = {
         "schema_version": 1,
@@ -2932,6 +3137,8 @@ def test_discovery_partial_publication_replays_sealed_reducer_checkpoint(monkeyp
         "observed_at": "2026-08-01T00:00:00+00:00",
     }
     review_ref = ref(review_uri, review)
+    state = espn_native_tasks._discovery_review_state(review, review_ref=review_ref)
+    state_ref = ref(state_uri, state)
     checkpoint = {
         "kind": "espn-discovery-reducer-checkpoint-v1",
         "schema_version": 1,
@@ -2948,6 +3155,28 @@ def test_discovery_partial_publication_replays_sealed_reducer_checkpoint(monkeyp
         "review_ref": review_ref,
         "observed_at": review["observed_at"],
     }
+    sealed_v2 = {
+        **checkpoint,
+        "kind": "espn-discovery-reducer-checkpoint-v2",
+        "schema_version": 2,
+        "discovery_state_payload": state,
+        "discovery_state_ref": state_ref,
+    }
+    tampered_v2 = json.loads(json.dumps(sealed_v2))
+    tampered_v2["discovery_state_payload"]["male_scope_count"] = 2
+    with pytest.raises(
+        espn_native_tasks.OperationsError, match="state binding mismatch"
+    ):
+        espn_native_tasks._validate_discovery_reducer_checkpoint(
+            tampered_v2,
+            discovery_detail_index_ref=index_ref,
+            discovery_detail_phase_refs=[phase_ref],
+            candidate_uri=candidate_uri,
+            male_registry_uri=registry_uri,
+            review_uri=review_uri,
+            discovery_state_uri=state_uri,
+        )
+
     published = {checkpoint_uri: checkpoint}
     writes = []
     fail_review = [True]
@@ -3011,6 +3240,7 @@ def test_discovery_partial_publication_replays_sealed_reducer_checkpoint(monkeyp
             candidate_uri=candidate_uri,
             male_registry_uri=registry_uri,
             review_uri=review_uri,
+            discovery_state_uri=state_uri,
             latest_state_uri="s3://artifacts/discovery/latest-state.json",
         )
     assert published[candidate_uri] == candidate
@@ -3025,6 +3255,7 @@ def test_discovery_partial_publication_replays_sealed_reducer_checkpoint(monkeyp
     )
 
     assert result == {
+        "discovery_state_ref": state_ref,
         "discovery_review_ref": review_ref,
         "male_registry_ref": registry_ref,
     }
@@ -3032,8 +3263,121 @@ def test_discovery_partial_publication_replays_sealed_reducer_checkpoint(monkeyp
         candidate_uri,
         registry_uri,
         review_uri,
+        state_uri,
         "s3://artifacts/discovery/latest-state.json",
     ]
+    assert writes[-2][1] == state
+    assert writes[-1][1] == state
+    assert writes[-2][2] == {}
+    assert writes[-1][2] == {"immutable": False}
+
+
+def test_older_immutable_discovery_state_loads_after_latest_alias_advances(
+    monkeypatch, tmp_path
+):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.discovery import CatalogCandidate, CatalogSnapshot
+    from scrapers.espn.models import AgeClass, CapabilityState, EntityCapabilities, Gender
+
+    artifact_root = tmp_path.as_uri()
+    registry = _generated_registry(1)
+    competition = registry.promoted[0]
+    edition = competition.current_edition
+    candidate = CatalogSnapshot(
+        "2026-08-01T00:00:00+00:00",
+        (
+            CatalogCandidate(
+                espn_id=competition.espn_id,
+                slug=competition.slug,
+                name=competition.name,
+                group="ESPN soccer dropdown",
+                source_order=0,
+                gender=Gender.MALE,
+                age_class=AgeClass.UNKNOWN,
+                source_season_year=edition.source_season_year,
+                edition_display_name=edition.display_name,
+                start_date=edition.start_date.isoformat(),
+                end_date=edition.end_date.isoformat(),
+                capabilities=EntityCapabilities(
+                    CapabilityState.UNKNOWN,
+                    CapabilityState.UNKNOWN,
+                    CapabilityState.UNKNOWN,
+                ),
+                gender_evidence=("core-detail.gender=MALE",),
+            ),
+        ),
+    )
+
+    def publish(run_name: str, observed_at: str):
+        run_root = espn_native_tasks._join_uri(
+            artifact_root, "discovery", run_name
+        )
+        candidate_payload = json.loads(candidate.canonical_json())
+        registry_payload = json.loads(registry.canonical_json())
+        candidate_ref = espn_native_tasks._write_payload(
+            espn_native_tasks._join_uri(run_root, "candidate.json"), candidate_payload
+        )
+        registry_ref = espn_native_tasks._write_payload(
+            espn_native_tasks._join_uri(run_root, "male-registry.json"),
+            registry_payload,
+        )
+        review = {
+            "kind": "espn-discovery-review-v2",
+            "schema_version": 2,
+            "discovery_detail_index_ref": {"uri": "index", "sha256": "1" * 64},
+            "discovery_detail_phase_refs": [{"uri": "phase", "sha256": "2" * 64}],
+            "candidate_ref": candidate_ref,
+            "candidate_signature": candidate.signature(),
+            "male_registry_ref": registry_ref,
+            "male_registry_signature": registry.signature(),
+            "male_scope_count": 1,
+            "selection_policy": espn_native_tasks.DISCOVERY_SELECTION_POLICY,
+            "quarantined_scopes": [],
+            "changes": [],
+            "change_count": 0,
+            "unresolved_discovery_diffs": False,
+            "alerts": [],
+            "promotion_performed": False,
+            "observed_at": observed_at,
+        }
+        review_ref = espn_native_tasks._write_payload(
+            espn_native_tasks._join_uri(run_root, "reviewable-diff.json"), review
+        )
+        state = espn_native_tasks._discovery_review_state(
+            review, review_ref=review_ref
+        )
+        state_ref = espn_native_tasks._write_payload(
+            espn_native_tasks._join_uri(run_root, "discovery-state.json"), state
+        )
+        espn_native_tasks._publish_latest_discovery_state(
+            espn_native_tasks._join_uri(artifact_root, "discovery", "latest-state.json"),
+            state,
+            state_ref=state_ref,
+        )
+        return state_ref, state
+
+    first_ref, first_state = publish("run-a", "2026-08-01T00:00:00+00:00")
+    second_ref, second_state = publish("run-b", "2026-08-08T00:00:00+00:00")
+    assert first_ref != second_ref
+    monkeypatch.setenv(
+        espn_native_tasks.DISCOVERY_STATE_REF_URI_ENV, first_ref["uri"]
+    )
+    monkeypatch.setenv(
+        espn_native_tasks.DISCOVERY_STATE_REF_SHA256_ENV, first_ref["sha256"]
+    )
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: artifact_root)
+
+    loaded_registry, discovery = espn_native_tasks._load_discovered_registry(
+        now=datetime(2026, 8, 20, tzinfo=timezone.utc)
+    )
+
+    latest_ref = espn_native_tasks._ref_for_uri(
+        espn_native_tasks._join_uri(artifact_root, "discovery", "latest-state.json")
+    )
+    assert espn_native_tasks._read_ref(first_ref) == first_state
+    assert espn_native_tasks._read_ref(latest_ref) == second_state
+    assert discovery["discovery_state_ref"] == first_ref
+    assert loaded_registry.signature() == registry.signature()
 
 
 def test_discovery_monitor_reads_v1_state_during_v2_transition(monkeypatch):

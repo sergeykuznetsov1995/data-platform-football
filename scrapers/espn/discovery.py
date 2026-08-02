@@ -434,11 +434,10 @@ def _date_part(value: Any, field: str) -> Optional[str]:
 def _parse_gender(value: Any) -> Gender:
     if value is None:
         return Gender.UNKNOWN
-    token = str(value).strip().upper()
-    aliases = {"MEN": "MALE", "M": "MALE", "WOMEN": "FEMALE", "F": "FEMALE"}
-    token = aliases.get(token, token)
+    if not isinstance(value, str):
+        raise DiscoveryError(f"unknown competition detail gender {value!r}")
     try:
-        return Gender(token)
+        return Gender(value)
     except ValueError as exc:
         raise DiscoveryError(f"unknown competition detail gender {value!r}") from exc
 
