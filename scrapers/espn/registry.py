@@ -359,6 +359,21 @@ def _validate_explicit_male_candidate(candidate: CatalogCandidate) -> None:
         _iso_date(candidate.end_date, "end_date")
         if candidate.start_date > candidate.end_date:
             raise ValueError("date window is invalid")
+        if not isinstance(candidate.capabilities, EntityCapabilities):
+            raise ValueError("capabilities are invalid")
+        if candidate.capabilities.schedule not in {
+            CapabilityState.PROVEN,
+            CapabilityState.UNKNOWN,
+        }:
+            raise ValueError("schedule capability is unsafe")
+        for entity in ("lineup", "matchsheet"):
+            if getattr(candidate.capabilities, entity) not in {
+                CapabilityState.PROVEN,
+                CapabilityState.PARTIAL,
+                CapabilityState.ABSENT,
+                CapabilityState.UNKNOWN,
+            }:
+                raise ValueError(f"{entity} capability is unsafe")
     except (RegistryError, TypeError, ValueError) as exc:
         raise RegistryError("explicit MALE candidate has incomplete identity") from exc
 
@@ -395,7 +410,7 @@ def _discovered_competition(
     manual = _matching_competition(legacy_registry, candidate)
     discovered_edition = _discovered_edition(candidate)
     if prior is not None:
-        legacy = prior.legacy or (manual.legacy if manual is not None else None)
+        legacy = manual.legacy if manual is not None else None
         if prior.current_edition.source_season_year == candidate.source_season_year:
             editions = prior.editions
         else:

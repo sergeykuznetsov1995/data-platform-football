@@ -129,6 +129,30 @@ def test_generated_registry_preserves_only_known_legacy_aliases() -> None:
 
 
 @pytest.mark.unit
+def test_generated_registry_removes_non_configured_prior_legacy_alias() -> None:
+    previous_document = _document()
+    previous_document["competitions"][0].update(
+        espn_id=775,
+        slug="uefa.champions",
+        name="UEFA Champions League",
+        legacy={
+            "league": "NON-CONFIGURED",
+            "league_aliases": ["NON-CONFIGURED"],
+            "season_aliases": {"2026": ["2026"]},
+        },
+    )
+    previous = validate_registry_document(previous_document)
+
+    generated = build_discovered_male_registry(
+        CatalogSnapshot("2026-08-02T00:00:00+00:00", (_male_candidate(),)),
+        legacy_registry=load_registry(DEFAULT_REGISTRY_PATH),
+        previous_registry=previous,
+    )
+
+    assert generated.by_id[775].legacy is None
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -141,6 +165,47 @@ def test_generated_registry_preserves_only_known_legacy_aliases() -> None:
 )
 def test_explicit_male_with_incomplete_identity_fails_closed(field, value) -> None:
     candidate = replace(_male_candidate(), **{field: value})
+
+    with pytest.raises(RegistryError, match="explicit MALE candidate"):
+        build_discovered_male_registry(
+            CatalogSnapshot("2026-08-02T00:00:00+00:00", (candidate,)),
+            legacy_registry=load_registry(DEFAULT_REGISTRY_PATH),
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        EntityCapabilities(
+            CapabilityState.PARTIAL,
+            CapabilityState.UNKNOWN,
+            CapabilityState.UNKNOWN,
+        ),
+        EntityCapabilities(
+            CapabilityState.ABSENT,
+            CapabilityState.UNKNOWN,
+            CapabilityState.UNKNOWN,
+        ),
+        EntityCapabilities(
+            CapabilityState.QUARANTINED,
+            CapabilityState.UNKNOWN,
+            CapabilityState.UNKNOWN,
+        ),
+        EntityCapabilities(
+            CapabilityState.UNKNOWN,
+            CapabilityState.QUARANTINED,
+            CapabilityState.UNKNOWN,
+        ),
+        EntityCapabilities(
+            CapabilityState.UNKNOWN,
+            CapabilityState.UNKNOWN,
+            CapabilityState.QUARANTINED,
+        ),
+    ],
+)
+def test_generated_registry_rejects_unsafe_candidate_capabilities(capabilities) -> None:
+    candidate = replace(_male_candidate(), capabilities=capabilities)
 
     with pytest.raises(RegistryError, match="explicit MALE candidate"):
         build_discovered_male_registry(
