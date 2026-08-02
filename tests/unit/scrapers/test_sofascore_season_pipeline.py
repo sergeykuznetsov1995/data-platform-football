@@ -669,6 +669,101 @@ def test_planner_expands_squads_and_referees_from_stored_evidence(tmp_path):
 
 
 @pytest.mark.unit
+def test_wrong_entity_in_stored_payload_does_not_abort_the_season_plan(tmp_path):
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="last", page=0, **_common()),
+        _schedule_payload([14000001], has_next=False),
+    )
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="next", page=0, **_common()),
+        _schedule_payload([], has_next=False),
+    )
+    _seed_json(
+        raw_store,
+        build_participants_spec(**_common()),
+        {"teams": [{"id": 44, "name": "Liverpool"}, {"id": 42, "name": "Arsenal"}]},
+    )
+    _seed_full_event_referee(
+        raw_store,
+        event_id=14000001,
+        referee_id=900,
+        freshness_key="event-final-v2",
+    )
+    referee_spec = build_referee_profile_spec(referee_id=900, **_common())
+    # SofaScore answered 200 for referee 900 with referee 901's profile (#1081).
+    _seed_json(raw_store, referee_spec, {"referee": {"id": 901, "name": "Other"}})
+
+    plan = plan_season_partition(
+        raw_store,
+        manifest,
+        event_freshness_key="event-final-v2",
+        **_common(),
+    )
+
+    assert referee_spec.key in plan.pending_keys
+    assert referee_spec.key in plan.missing_raw_keys
+    # The rest of the season still planned: one bad target is not a dead plan.
+    assert plan.team_ids == ("42", "44")
+    assert plan.referee_ids == ("900",)
+
+
+@pytest.mark.unit
+def test_success_manifest_over_a_wrong_entity_payload_stays_fatal(tmp_path):
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="last", page=0, **_common()),
+        _schedule_payload([14000001], has_next=False),
+    )
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="next", page=0, **_common()),
+        _schedule_payload([], has_next=False),
+    )
+    _seed_json(
+        raw_store,
+        build_participants_spec(**_common()),
+        {"teams": [{"id": 44, "name": "Liverpool"}, {"id": 42, "name": "Arsenal"}]},
+    )
+    _seed_full_event_referee(
+        raw_store,
+        event_id=14000001,
+        referee_id=900,
+        freshness_key="event-final-v2",
+    )
+    referee_spec = build_referee_profile_spec(referee_id=900, **_common())
+    _seed_json(raw_store, referee_spec, {"referee": {"id": 901, "name": "Other"}})
+    _, raw = raw_store.load_bytes(referee_spec.raw_target)
+    manifest.upsert(
+        EndpointManifest(
+            key=referee_spec.key,
+            status=ManifestStatus.SUCCESS,
+            run_id="referee-wrong-entity",
+            task_id="season",
+            attempts=1,
+            row_count=1,
+            http_status=200,
+            raw_content_hash=raw.content_hash,
+            raw_blob_key=raw.blob_key,
+            request_url=referee_spec.url,
+        )
+    )
+
+    with pytest.raises(SeasonPlanningError, match="no usable JSON"):
+        plan_season_partition(
+            raw_store,
+            manifest,
+            event_freshness_key="event-final-v2",
+            **_common(),
+        )
+
+
+@pytest.mark.unit
 def test_empty_participants_cannot_prove_player_universe(tmp_path):
     raw_store = _raw_store(tmp_path)
     manifest = InMemoryManifestStore()

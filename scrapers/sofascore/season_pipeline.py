@@ -615,7 +615,20 @@ def _load_stored_payload(
             f"stored schema validation failed for {spec.key.stable_id()}: {exc}"
         ) from exc
     if valid is False:
-        raise SeasonPlanningError(f"stored schema rejected for {spec.key.stable_id()}")
+        # The source can answer 200 with a well-formed payload describing a
+        # different entity than the one requested: referee 786094 came back as
+        # referee 774129 (#1081).  Refusing the payload is right -- publishing it
+        # would file one referee's record under another's -- but refusing it
+        # *here* aborted planning for the whole season, and with it the daily run
+        # and the history runner, over one target out of hundreds.
+        #
+        # Report it as "no usable payload" instead.  The caller already knows
+        # that shape: the key lands in `pending`/`missing_raw` and is captured
+        # again, while the capture engine keeps recording the non-terminal
+        # `schema_error` that describes it.  A manifest that claims success over
+        # an unusable payload remains a hard error, in
+        # `_assert_terminal_raw_consistency`.
+        return _StoredPayload(None, raw)
     return _StoredPayload(payload, raw)
 
 
