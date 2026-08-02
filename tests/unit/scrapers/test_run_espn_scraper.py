@@ -1476,6 +1476,70 @@ def test_artifact_uri_collisions_fail_preflight_before_publication(tmp_path):
 
 
 @pytest.mark.unit
+def test_s3_artifact_resolver_reuses_one_filesystem_per_process(monkeypatch):
+    import scrapers.espn.runner as runner_module
+
+    created = []
+
+    def fake_s3_filesystem(**kwargs):
+        filesystem = object()
+        created.append((filesystem, kwargs))
+        return filesystem
+
+    monkeypatch.setenv("S3_ACCESS_KEY", "access")
+    monkeypatch.setenv("S3_SECRET_KEY", "secret")
+    monkeypatch.setenv("ESPN_ARTIFACT_S3_ENDPOINT", "seaweedfs:8333")
+    monkeypatch.setenv("ESPN_ARTIFACT_S3_SCHEME", "http")
+    monkeypatch.setenv("ESPN_ARTIFACT_S3_REGION", "us-east-1")
+    monkeypatch.setattr(runner_module.os, "getpid", lambda: 101)
+    monkeypatch.setattr(runner_module.fs, "S3FileSystem", fake_s3_filesystem)
+    runner_module._s3_filesystem.cache_clear()
+    try:
+        first, first_path = runner_module._resolve_uri("s3://football/a.json")
+        second, second_path = runner_module._resolve_uri("s3://football/b.json")
+    finally:
+        runner_module._s3_filesystem.cache_clear()
+
+    assert first is second
+    assert (first_path, second_path) == ("football/a.json", "football/b.json")
+    assert len(created) == 1
+    assert created[0][1] == {
+        "access_key": "access",
+        "secret_key": "secret",
+        "endpoint_override": "seaweedfs:8333",
+        "scheme": "http",
+        "region": "us-east-1",
+        "background_writes": False,
+    }
+
+
+@pytest.mark.unit
+def test_s3_artifact_resolver_does_not_reuse_across_processes(monkeypatch):
+    import scrapers.espn.runner as runner_module
+
+    created = []
+    pid = [101]
+
+    def fake_s3_filesystem(**_kwargs):
+        filesystem = object()
+        created.append(filesystem)
+        return filesystem
+
+    monkeypatch.setattr(runner_module.os, "getpid", lambda: pid[0])
+    monkeypatch.setattr(runner_module.fs, "S3FileSystem", fake_s3_filesystem)
+    runner_module._s3_filesystem.cache_clear()
+    try:
+        first, _ = runner_module._resolve_uri("s3://football/a.json")
+        pid[0] = 202
+        second, _ = runner_module._resolve_uri("s3://football/a.json")
+    finally:
+        runner_module._s3_filesystem.cache_clear()
+
+    assert first is not second
+    assert created == [first, second]
+
+
+@pytest.mark.unit
 def test_signed_scope_selection_rejects_cli_subset_and_permuted_plan(tmp_path):
     first, first_edition = _competition(730, "ita.1")
     second, second_edition = _competition(731, "eng.1")

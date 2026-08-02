@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -595,28 +596,51 @@ def _load_signed_plan(uri: str) -> LoadedPlan:
     )
 
 
+@lru_cache(maxsize=16)
+def _s3_filesystem(
+    process_id: int,
+    access_key: str | None,
+    secret_key: str | None,
+    endpoint_override: str,
+    scheme: str,
+    region: str,
+) -> fs.S3FileSystem:
+    """Reuse Arrow's expensive S3 client only inside one exact process."""
+
+    if process_id <= 0:
+        raise RunnerConfigurationError("artifact S3 process identity is invalid")
+    return fs.S3FileSystem(
+        access_key=access_key,
+        secret_key=secret_key,
+        endpoint_override=endpoint_override,
+        scheme=scheme,
+        region=region,
+        background_writes=False,
+    )
+
+
 def _resolve_uri(uri: str) -> tuple[fs.FileSystem, str]:
     candidate = _required_string(uri, "artifact URI")
     parsed = urlparse(candidate)
     if parsed.scheme == "s3":
         if not parsed.netloc:
             raise RunnerConfigurationError("S3 artifact URI must contain a bucket")
-        filesystem = fs.S3FileSystem(
-            access_key=os.environ.get("S3_ACCESS_KEY"),
-            secret_key=os.environ.get("S3_SECRET_KEY"),
-            endpoint_override=os.environ.get(
+        filesystem = _s3_filesystem(
+            os.getpid(),
+            os.environ.get("S3_ACCESS_KEY"),
+            os.environ.get("S3_SECRET_KEY"),
+            os.environ.get(
                 "ESPN_ARTIFACT_S3_ENDPOINT",
                 os.environ.get("ESPN_RAW_S3_ENDPOINT", "seaweedfs:8333"),
             ),
-            scheme=os.environ.get(
+            os.environ.get(
                 "ESPN_ARTIFACT_S3_SCHEME",
                 os.environ.get("ESPN_RAW_S3_SCHEME", "http"),
             ),
-            region=os.environ.get(
+            os.environ.get(
                 "ESPN_ARTIFACT_S3_REGION",
                 os.environ.get("ESPN_RAW_S3_REGION", "us-east-1"),
             ),
-            background_writes=False,
         )
         return filesystem, f"{parsed.netloc}/{parsed.path.lstrip('/')}"
     try:
