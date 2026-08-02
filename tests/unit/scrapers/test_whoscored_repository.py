@@ -155,7 +155,14 @@ def _commit(*, lineups=(), lineups_available=False) -> MatchCommit:
         game="Home-Away",
         payload_sha256="a" * 64,
         raw_uri="s3://raw/match.json.gz",
-        events=({"source_event_id": 10, "team_event_id": 1, "team_id": 1},),
+        events=(
+            {
+                "source_event_id": 10,
+                "opta_event_id": 10,
+                "team_event_id": 1,
+                "team_id": 1,
+            },
+        ),
         lineups=lineups,
         lineups_available=lineups_available,
         transport_mode="direct_http",
@@ -967,6 +974,48 @@ def test_commit_matches_rejects_lineup_availability_contradictions_before_io():
 
 
 @pytest.mark.unit
+def test_commit_matches_identifies_a_record_by_counter_and_opta_id():
+    trino = MagicMock()
+    writer = MagicMock()
+    repository = WhoScoredRepository(writer=writer, trino=trino)
+    base = {"team_event_id": 1, "team_id": 1}
+
+    # The source reuses its team-local counter for distinct actions (#1080), so
+    # the pair alone must not be refused.
+    repository._prepare_match_commit(
+        replace(
+            _commit(),
+            events=(
+                {**base, "source_event_id": 10, "opta_event_id": 10},
+                {**base, "source_event_id": 11, "opta_event_id": 11},
+            ),
+        )
+    )
+
+    with pytest.raises(ValueError, match="duplicate source event records"):
+        repository._prepare_match_commit(
+            replace(
+                _commit(),
+                events=(
+                    {**base, "source_event_id": 10, "opta_event_id": 10},
+                    {**base, "source_event_id": 11, "opta_event_id": 10},
+                ),
+            )
+        )
+
+    # The Opta id carries that identity, so it may not go missing unnoticed.
+    with pytest.raises(ValueError, match="invalid opta_event_id"):
+        repository._prepare_match_commit(
+            replace(
+                _commit(),
+                events=({**base, "source_event_id": 10},),
+            )
+        )
+
+    writer.write_dataframe.assert_not_called()
+
+
+@pytest.mark.unit
 def test_match_batch_v3_identity_is_bound_to_league_and_season():
     first = _commit()
     other_league = replace(first, league="OTHER")
@@ -1136,6 +1185,7 @@ def test_final_opta_match_rejects_a_valid_but_truncated_event_prefix():
     events = tuple(
         {
             "source_event_id": index + 1,
+            "opta_event_id": index + 1,
             "team_event_id": index + 1,
             "team_id": 1,
             "expanded_minute": index,
@@ -1164,6 +1214,7 @@ def test_final_opta_match_cannot_replace_a_larger_published_event_stream(
     events = tuple(
         {
             "source_event_id": index + 1,
+            "opta_event_id": index + 1,
             "team_event_id": index + 1,
             "team_id": 1,
             "expanded_minute": min(index, 95),
@@ -1226,6 +1277,7 @@ def test_final_opta_guard_accepts_a_source_declared_shortened_match():
     events = tuple(
         {
             "source_event_id": index + 1,
+            "opta_event_id": index + 1,
             "team_event_id": index + 1,
             "team_id": 1,
             "expanded_minute": min(index, 59),
