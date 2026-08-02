@@ -172,6 +172,23 @@ def _generation(**changes) -> ScopeGeneration:
     return ScopeGeneration(**values)
 
 
+def _track_generation_signature_reads(monkeypatch) -> list[ScopeGeneration]:
+    original_getter = ScopeGeneration.generation_signature.fget
+    assert original_getter is not None
+    calls: list[ScopeGeneration] = []
+
+    def counted_signature(candidate):
+        calls.append(candidate)
+        return original_getter(candidate)
+
+    monkeypatch.setattr(
+        ScopeGeneration,
+        "generation_signature",
+        property(counted_signature),
+    )
+    return calls
+
+
 class FakeWriter:
     def __init__(self, fail_table: str | None = None):
         self.fail_table = fail_table
@@ -457,6 +474,94 @@ def test_exact_scope_dq_accepts_parsed_fixture_and_binds_hashes():
     assert report.row_counts == {"schedule": 1, "lineup": 2, "matchsheet": 2}
     assert set(report.row_hashes) == set(ENTITY_TABLES)
     assert all(len(value) == 64 for value in report.row_hashes.values())
+
+
+@pytest.mark.unit
+def test_scope_dq_computes_generation_signature_once(monkeypatch):
+    generation = _generation()
+    calls = _track_generation_signature_reads(monkeypatch)
+
+    report = validate_scope_generation(generation)
+
+    assert report.passed
+    assert calls == [generation]
+
+
+@pytest.mark.unit
+def test_physical_rows_reuse_signature_and_preserve_public_hashes(monkeypatch):
+    generation = _generation()
+    expected_signature = generation.generation_signature
+    expected_hashes = [
+        row_fingerprint(generation, "lineup", row) for row in generation.lineup
+    ]
+    calls = _track_generation_signature_reads(monkeypatch)
+
+    rows = repository_module._physical_rows(generation, "lineup")
+
+    assert [row["generation_signature"] for row in rows] == [expected_signature] * len(
+        rows
+    )
+    assert [row["_row_sha256"] for row in rows] == expected_hashes
+    assert calls == [generation]
+
+
+@pytest.mark.unit
+def test_ledger_physical_rows_reuse_signature_and_preserve_public_hashes(monkeypatch):
+    generation = _generation()
+    expected_signature = generation.generation_signature
+    expected_hashes = [
+        repository_module.ledger_row_fingerprint(generation, record)
+        for record in generation.raw_ledger
+    ]
+    calls = _track_generation_signature_reads(monkeypatch)
+
+    rows = repository_module._ledger_physical_rows(generation)
+
+    assert [row["generation_signature"] for row in rows] == [expected_signature] * len(
+        rows
+    )
+    assert [row["_row_sha256"] for row in rows] == expected_hashes
+    assert calls == [generation]
+
+
+@pytest.mark.unit
+def test_physical_hash_lookup_reads_generation_signature_once(monkeypatch):
+    generation = _generation()
+    expected_signature = generation.generation_signature
+    expected_hashes = frozenset({"c" * 64, "d" * 64})
+
+    class StoredHashesQuery(FakeQuery):
+        def execute_query(self, sql, params=None):
+            self.calls.append((sql, params))
+            return [(expected_signature, value) for value in expected_hashes]
+
+    repository = EspnBronzeRepository(
+        writer=FakeWriter(),
+        query=StoredHashesQuery(),
+        ensure_objects_on_write=False,
+    )
+    calls = _track_generation_signature_reads(monkeypatch)
+
+    assert repository._physical_row_hashes(generation, "schedule") == expected_hashes
+    assert calls == [generation]
+
+
+@pytest.mark.unit
+def test_physical_verification_reads_generation_signature_once(monkeypatch):
+    generation = _generation()
+    expected_signature = generation.generation_signature
+    query = PhysicalQuery(generation)
+    repository = EspnBronzeRepository(
+        writer=FakeWriter(),
+        query=query,
+        ensure_objects_on_write=False,
+    )
+    calls = _track_generation_signature_reads(monkeypatch)
+
+    repository._verify_physical(generation, query.report)
+
+    assert calls == [generation]
+    assert query.calls[-1][1][3::7] == (expected_signature,) * 4
 
 
 @pytest.mark.unit

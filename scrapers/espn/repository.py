@@ -908,9 +908,13 @@ def _raw_binding(
     return matches[0]
 
 
-def row_fingerprint(generation: ScopeGeneration, entity: str, row: Any) -> str:
-    """Hash the complete immutable physical-row identity, including raw origin."""
-
+def _row_fingerprint(
+    generation: ScopeGeneration,
+    entity: str,
+    row: Any,
+    *,
+    generation_signature: str,
+) -> str:
     if entity not in _ROW_TYPES or not isinstance(row, _ROW_TYPES[entity]):
         raise TypeError("row does not match the requested ESPN entity")
     raw = _raw_binding(generation, entity, row.event_id)
@@ -919,7 +923,7 @@ def row_fingerprint(generation: ScopeGeneration, entity: str, row: Any) -> str:
             "row": row,
             "scope_id": generation.plan.scope_id,
             "generation_id": generation.generation_id,
-            "generation_signature": generation.generation_signature,
+            "generation_signature": generation_signature,
             "run_id": generation.run_id,
             "registry_snapshot_uri": generation.registry_snapshot_uri,
             "registry_signature": generation.registry_signature,
@@ -935,7 +939,23 @@ def row_fingerprint(generation: ScopeGeneration, entity: str, row: Any) -> str:
     )
 
 
-def ledger_row_fingerprint(generation: ScopeGeneration, record: RawLedgerRecord) -> str:
+def row_fingerprint(generation: ScopeGeneration, entity: str, row: Any) -> str:
+    """Hash the complete immutable physical-row identity, including raw origin."""
+
+    return _row_fingerprint(
+        generation,
+        entity,
+        row,
+        generation_signature=generation.generation_signature,
+    )
+
+
+def _ledger_row_fingerprint(
+    generation: ScopeGeneration,
+    record: RawLedgerRecord,
+    *,
+    generation_signature: str,
+) -> str:
     if not isinstance(record, RawLedgerRecord):
         raise TypeError("record must be RawLedgerRecord")
     return canonical_sha256(
@@ -943,7 +963,7 @@ def ledger_row_fingerprint(generation: ScopeGeneration, record: RawLedgerRecord)
             "record": record,
             "scope_id": generation.plan.scope_id,
             "generation_id": generation.generation_id,
-            "generation_signature": generation.generation_signature,
+            "generation_signature": generation_signature,
             "run_id": generation.run_id,
             "registry_snapshot_uri": generation.registry_snapshot_uri,
             "registry_signature": generation.registry_signature,
@@ -956,9 +976,24 @@ def ledger_row_fingerprint(generation: ScopeGeneration, record: RawLedgerRecord)
     )
 
 
-def _ledger_dataset_hash(generation: ScopeGeneration) -> str:
+def ledger_row_fingerprint(generation: ScopeGeneration, record: RawLedgerRecord) -> str:
+    return _ledger_row_fingerprint(
+        generation,
+        record,
+        generation_signature=generation.generation_signature,
+    )
+
+
+def _ledger_dataset_hash(
+    generation: ScopeGeneration, *, generation_signature: str
+) -> str:
     hashes = sorted(
-        ledger_row_fingerprint(generation, record) for record in generation.raw_ledger
+        _ledger_row_fingerprint(
+            generation,
+            record,
+            generation_signature=generation_signature,
+        )
+        for record in generation.raw_ledger
     )
     return hashlib.sha256("".join(hashes).encode("ascii")).hexdigest()
 
@@ -1199,12 +1234,20 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
                     f"played-final disposition missing for {entity}/{event_id}"
                 )
 
+    generation_signature = generation.generation_signature
     row_hashes: dict[str, str] = {}
     for entity in _ENTITIES:
         hashes: list[str] = []
         for row in getattr(generation, entity):
             try:
-                hashes.append(row_fingerprint(generation, entity, row))
+                hashes.append(
+                    _row_fingerprint(
+                        generation,
+                        entity,
+                        row,
+                        generation_signature=generation_signature,
+                    )
+                )
             except PublicationError as exc:
                 failures.append(str(exc))
         row_hashes[entity] = hashlib.sha256(
@@ -1218,7 +1261,10 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
         row_counts=row_counts,
         row_hashes=row_hashes,
         ledger_count=len(generation.raw_ledger),
-        ledger_hash=_ledger_dataset_hash(generation),
+        ledger_hash=_ledger_dataset_hash(
+            generation,
+            generation_signature=generation_signature,
+        ),
     )
 
 
@@ -1495,16 +1541,22 @@ class QueryProtocol(Protocol):
 
 
 def _physical_rows(generation: ScopeGeneration, entity: str) -> list[dict[str, Any]]:
+    generation_signature = generation.generation_signature
     output: list[dict[str, Any]] = []
     for typed_row in getattr(generation, entity):
         row = asdict(typed_row)
         raw = _raw_binding(generation, entity, typed_row.event_id)
-        row_hash = row_fingerprint(generation, entity, typed_row)
+        row_hash = _row_fingerprint(
+            generation,
+            entity,
+            typed_row,
+            generation_signature=generation_signature,
+        )
         row.update(
             {
                 "scope_id": generation.plan.scope_id,
                 "generation_id": generation.generation_id,
-                "generation_signature": generation.generation_signature,
+                "generation_signature": generation_signature,
                 "run_id": generation.run_id,
                 "registry_snapshot_uri": generation.registry_snapshot_uri,
                 "registry_signature": generation.registry_signature,
@@ -1526,6 +1578,7 @@ def _physical_rows(generation: ScopeGeneration, entity: str) -> list[dict[str, A
 
 
 def _ledger_physical_rows(generation: ScopeGeneration) -> list[dict[str, Any]]:
+    generation_signature = generation.generation_signature
     output: list[dict[str, Any]] = []
     for record in generation.raw_ledger:
         output.append(
@@ -1534,7 +1587,7 @@ def _ledger_physical_rows(generation: ScopeGeneration) -> list[dict[str, Any]]:
                 "competition_id": generation.plan.espn_id,
                 "source_season_year": generation.plan.source_season_year,
                 "generation_id": generation.generation_id,
-                "generation_signature": generation.generation_signature,
+                "generation_signature": generation_signature,
                 "run_id": generation.run_id,
                 "_batch_id": generation.batch_id,
                 "registry_snapshot_uri": generation.registry_snapshot_uri,
@@ -1556,7 +1609,11 @@ def _ledger_physical_rows(generation: ScopeGeneration) -> list[dict[str, Any]]:
                 "_ingested_at": generation.ingested_at,
                 "_source": "espn",
                 "_entity_type": "request_ledger",
-                "_row_sha256": ledger_row_fingerprint(generation, record),
+                "_row_sha256": _ledger_row_fingerprint(
+                    generation,
+                    record,
+                    generation_signature=generation_signature,
+                ),
             }
         )
     return output
@@ -1724,6 +1781,7 @@ class EspnBronzeRepository:
     def _physical_row_hashes(
         self, generation: ScopeGeneration, entity: str
     ) -> frozenset[str]:
+        generation_signature = generation.generation_signature
         table = LEDGER_TABLE if entity == "ledger" else ENTITY_TABLES[entity]
         rows = self._execute(
             f'SELECT DISTINCT "generation_signature", "_row_sha256" '
@@ -1743,7 +1801,7 @@ class EspnBronzeRepository:
                 if len(raw) != 2:
                     raise PublicationError("physical fingerprint row is malformed")
                 signature, value = raw
-            if signature != generation.generation_signature:
+            if signature != generation_signature:
                 raise ManifestConflictError(
                     f"{entity} generation identity has conflicting content signature"
                 )
@@ -1753,6 +1811,7 @@ class EspnBronzeRepository:
     def _verify_physical(
         self, generation: ScopeGeneration, report: ScopeQualityReport
     ) -> None:
+        generation_signature = generation.generation_signature
         selects: list[str] = []
         params: list[Any] = []
         for entity, table in (*ENTITY_TABLES.items(), ("ledger", LEDGER_TABLE)):
@@ -1770,7 +1829,7 @@ class EspnBronzeRepository:
                     generation.plan.scope_id,
                     generation.generation_id,
                     generation.run_id,
-                    generation.generation_signature,
+                    generation_signature,
                     generation.batch_id,
                     generation.registry_signature,
                     generation.plan_signature,
