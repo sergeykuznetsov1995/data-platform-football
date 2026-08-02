@@ -24,7 +24,194 @@ cutover для одного scope.
    к точному candidate и `configs/espn/registry.yaml`. Сохранить evidence для
    gender/age class, затем проверить `validate_registry_document` и SHA-256.
 4. Capability `absent` означает, что соответствующая native сущность может
-   быть пустой; `unknown` не даёт права на автоматическое включение.
+   быть пустой. `CapabilityState.UNKNOWN` допускается для явно MALE кандидата,
+   но не доказывает отсутствие сущности; `Gender.UNKNOWN` не даёт права на
+   автоматическое включение.
+
+## Automatic all-male rollout
+
+Эта процедура управляет automatic all-male registry, а не ручным списком
+соревнований. Политика selection должна быть ровно
+`explicit-core-gender-MALE-v1`. Датированный rollout baseline:
+`2026-08-02: 181 MALE / 38 FEMALE / 1 UNKNOWN`. FEMALE и UNKNOWN —
+исключения; в generated registry допускаются только явно подтверждённые MALE
+записи. Любой другой count, duplicate ID/slug или malformed explicit-MALE
+record останавливает rollout.
+
+Сохранять нужно immutable `male_registry_ref` (`uri` и SHA-256), candidate,
+review и discovery-state ref из успешного weekly run. `latest-state.json`
+является лишь mutable discovery pointer: `latest-state.json никогда не является
+registry запуска`. Он может помочь найти state, но admission, bootstrap,
+canary и rollback используют frozen immutable discovery-state ref, который
+сам связывает `male_registry_ref`.
+
+Выполнять шаги строго в этом порядке.
+
+1. Поставить на паузу daily owner и discovery; не запускать daily owner вручную:
+
+   ```bash
+   airflow dags pause dag_trigger_espn_daily
+   airflow dags pause dag_discover_espn_registry
+   ```
+
+2. Deploy reviewed release и запустить weekly discovery:
+
+   ```bash
+   airflow dags trigger dag_discover_espn_registry
+   ```
+
+   Дождаться `publish_discovered_male_registry`, сохранить immutable state/ref,
+   SHA-256, registry signature и count. Подтвердить baseline `181/38/1`, exact
+   Core coverage и zero duplicate IDs/slugs. Сохранить immutable state ref и
+   `male_registry_ref` из этого run; state ref — frozen input, связывающий
+   exact generated registry. Настроить оба значения во **всех** Airflow
+   компонентах (scheduler, workers и запланированных task containers), затем
+   recreate/restart их до bootstrap; неполная пара запрещена:
+
+   ```bash
+   export ESPN_DISCOVERY_STATE_REF_URI='s3://.../immutable-discovery-state.json'
+   export ESPN_DISCOVERY_STATE_REF_SHA256='...lowercase-64-hex...'
+   # inject both variables into every Airflow component and recreate it
+   ```
+
+   С включённой парой admission читает только этот exact state ref и никогда
+   не fallback-ит к mutable pointer. Не менять пару до окончания rollout или
+   rollback.
+
+3. Запускать bounded bootstrap через `dag_backfill_espn`, не через daily
+   owner. После каждой exact coverage reconciliation вычислить deterministic
+   `sorted(target - COMPLETE)` и передать только первые 10 отсутствующих scope
+   как явный `scopes` (explicit <=10 cohort); это ten-scope bootstrap rule, а
+   не разрешение расширить map/lease limit. Дождаться terminal success и
+   release leases перед следующим cohort.
+
+   ```bash
+   COHORT_CONF='{"scopes":["<first-missing-scope>","..."]}'
+   airflow dags trigger dag_backfill_espn --conf "$COHORT_CONF"
+   ```
+
+   Не продолжать, если admission не закрепил state ref, связанный
+   `male_registry_ref` и registry signature, либо если любой selected scope
+   не опубликовал exact COMPLETE head.
+
+4. Выполнить exact coverage reconciliation. В environment с теми же
+   `ESPN_ARTIFACT_ROOT_URI`, control-DB и credentials положить сохранённые
+   immutable URI/SHA в переменные и выполнить команду ниже. Она доказывает
+   `discovered MALE target == generated registry target == union of COMPLETE
+   heads` и явно требует zero duplicates.
+
+   ```bash
+   python - <<'PY'
+   from collections import Counter
+   import json
+   import os
+   from dags.utils.espn_native_tasks import _read_ref, _verified_complete_head
+   from scrapers.espn.discovery import CatalogSnapshot
+   from scrapers.espn.operations import PostgresEspnControlStore
+   from scrapers.espn.registry import Gender, validate_registry_document
+
+   state_ref = {
+       "uri": os.environ["ESPN_DISCOVERY_STATE_REF_URI"],
+       "sha256": os.environ["ESPN_DISCOVERY_STATE_REF_SHA256"],
+   }
+   state = _read_ref(state_ref, kind="espn-discovery-state-v2")
+   candidate_ref = state["candidate_ref"]
+   registry_ref = state["male_registry_ref"]
+   candidate = CatalogSnapshot.from_dict(_read_ref(candidate_ref))
+   registry = validate_registry_document(_read_ref(registry_ref))
+   candidate_ids = [item.espn_id for item in candidate.candidates]
+   candidate_slugs = [item.slug for item in candidate.candidates]
+   assert len(candidate_ids) == len(set(candidate_ids)), "duplicate candidate IDs"
+   assert len(candidate_slugs) == len(set(candidate_slugs)), "duplicate candidate slugs"
+   gender_counts = Counter(item.gender.value for item in candidate.candidates)
+   assert gender_counts == {"MALE": 181, "FEMALE": 38, "UNKNOWN": 1}, gender_counts
+   discovered_male_scope_ids = {
+       f"{item.espn_id}:{item.source_season_year}"
+       for item in candidate.candidates
+       if item.gender is Gender.MALE
+   }
+   generated_scope_ids = {
+       competition.scope_id(competition.current_edition)
+       for competition in registry.promoted
+   }
+   assert len(discovered_male_scope_ids) == len(generated_scope_ids), "count drift"
+   assert len(registry.by_id) == len(registry.competitions), "duplicate IDs"
+   assert len(registry.by_slug) == len(registry.competitions), "duplicate slugs"
+   store = PostgresEspnControlStore.from_env()
+   with store._connect() as connection:
+       with connection.cursor() as cursor:
+           cursor.execute(
+               f"SELECT scope_id FROM {store.HEAD_TABLE} "
+               "WHERE registry_signature = %s",
+               (registry.signature(),),
+           )
+           head_scope_ids = {row[0] for row in cursor.fetchall()}
+   complete_scope_ids = {
+       scope_id
+       for scope_id, head in store.read_scope_heads(head_scope_ids).items()
+       if _verified_complete_head(head)[1] == "complete"
+   }
+   assert discovered_male_scope_ids == generated_scope_ids, {
+       "discovered_minus_generated": sorted(
+           discovered_male_scope_ids - generated_scope_ids
+       ),
+       "generated_minus_discovered": sorted(
+           generated_scope_ids - discovered_male_scope_ids
+       ),
+   }
+   missing = sorted(generated_scope_ids - complete_scope_ids)
+   extra = sorted(complete_scope_ids - generated_scope_ids)
+   assert not extra, {"complete_minus_generated": extra}
+   print(
+       "exact coverage reconciliation: "
+       f"{len(missing)} missing, 0 extra, 0 duplicate IDs/slugs"
+   )
+   print(json.dumps({"scopes": missing[:10]}))
+   PY
+   ```
+
+   В handoff/evidence записать результат как
+   `target_scope_ids - COMPLETE scope_head_v2 = empty`; не подменять exact set
+   одним count. Пока разность не пуста, взять последнюю JSON-строку как
+   `COHORT_CONF`, запустить ровно этот `dag_backfill_espn` cohort и повторить
+   reconciliation. Если любой head не проходит physical COMPLETE verification,
+   сначала выполнить repair/backfill его exact scope; простое наличие строки
+   `scope_head_v2` не является COMPLETE evidence.
+
+5. После пустой разности запустить один manual all-scope canary через
+   `dag_backfill_espn`, передав в `scopes` exact frozen target array из
+   saved state ref/`male_registry_ref`; zero-row scope считается успешным лишь
+   с exact signed manifest/checkpoint evidence, а не из-за отсутствия mapped
+   output. Summary reuse также требует exact signed prior evidence. Затем
+   подтвердить zero active leases и zero alerts. Только после этого снять
+   паузу с owner и discovery:
+
+   ```bash
+   airflow dags unpause dag_trigger_espn_daily
+   airflow dags unpause dag_discover_espn_registry
+   ```
+
+   Из-за нового registry signature обязательны три новых scheduled green
+   parent/child runs. Manual bootstrap/canary не засчитываются в эти три.
+
+### Rollback expanded registry
+
+При regression или hard alert немедленно поставить owner на паузу. Сохранить
+immutable raw/generation/reconciliation evidence; ничего из него не удалять.
+Затем восстановить last reviewed release и **freeze the last good immutable
+discovery-state ref, binding the last good `male_registry_ref`** в rollback
+record/admission evidence. Установить сохранённые
+`ESPN_DISCOVERY_STATE_REF_URI` и `ESPN_DISCOVERY_STATE_REF_SHA256` во всех
+Airflow компонентах и recreate их. Не выбирать текущий `latest-state.json` и
+не генерировать новый registry во время rollback: last good frozen state ref
+и его `male_registry_ref` остаются неизменяемым target до отдельного reviewed
+rollout.
+
+```bash
+airflow dags pause dag_trigger_espn_daily
+airflow dags pause dag_discover_espn_registry
+# deploy last reviewed release; retain immutable raw and generation artifacts
+```
 
 ## Canary и три зелёных запуска
 

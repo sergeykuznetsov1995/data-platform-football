@@ -75,6 +75,8 @@ HTTP_POOL = "espn_http_pool"
 REGISTRY_ENV = "ESPN_REGISTRY_PATH"
 ARTIFACT_ROOT_ENV = "ESPN_ARTIFACT_ROOT_URI"
 RAW_STORE_ENV = "ESPN_RAW_STORE_URI"
+DISCOVERY_STATE_REF_URI_ENV = "ESPN_DISCOVERY_STATE_REF_URI"
+DISCOVERY_STATE_REF_SHA256_ENV = "ESPN_DISCOVERY_STATE_REF_SHA256"
 LEASE_TTL = timedelta(hours=12)
 DAILY_BOOTSTRAP_SCOPE_LIMIT = 10
 DISCOVERY_MAX_AGE = timedelta(days=8)
@@ -362,6 +364,24 @@ def _bounded_daily_scopes(
     return target, tuple(sorted((*established, *bootstrap))), bootstrap
 
 
+def _frozen_discovery_state_ref() -> dict[str, str] | None:
+    """Return the optional release-pinned discovery state, fail-closed."""
+
+    uri = os.environ.get(DISCOVERY_STATE_REF_URI_ENV)
+    sha256 = os.environ.get(DISCOVERY_STATE_REF_SHA256_ENV)
+    if (uri is None) != (sha256 is None):
+        raise OperationsError(
+            f"{DISCOVERY_STATE_REF_URI_ENV} and "
+            f"{DISCOVERY_STATE_REF_SHA256_ENV} must be configured together"
+        )
+    if uri is None:
+        return None
+    return {
+        "uri": _required(uri, DISCOVERY_STATE_REF_URI_ENV),
+        "sha256": _sha(sha256, DISCOVERY_STATE_REF_SHA256_ENV),
+    }
+
+
 def _load_discovered_registry(
     *, now: datetime
 ) -> tuple[Registry, dict[str, Any]]:
@@ -370,9 +390,13 @@ def _load_discovered_registry(
     if not isinstance(now, datetime) or now.tzinfo is None:
         raise OperationsError("discovery freshness clock must be timezone-aware")
     database_now = now.astimezone(UTC)
-    latest_uri = _join_uri(_artifact_root(), "discovery", "latest-state.json")
     try:
-        state_ref = _ref_for_uri(latest_uri)
+        state_ref = _frozen_discovery_state_ref()
+        if state_ref is None:
+            latest_uri = _join_uri(
+                _artifact_root(), "discovery", "latest-state.json"
+            )
+            state_ref = _ref_for_uri(latest_uri)
         state = _read_ref(state_ref, kind="espn-discovery-state-v2")
         _candidate, registry, _review = _load_discovery_state_v2(state)
     except OperationsError:

@@ -1463,6 +1463,90 @@ def test_discovery_registry_rejects_future_state_and_enabled_non_male(monkeypatc
         espn_native_tasks._load_discovered_registry(now=now)
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("ESPN_DISCOVERY_STATE_REF_URI", "s3://artifacts/discovery/frozen.json"),
+        ("ESPN_DISCOVERY_STATE_REF_SHA256", "a" * 64),
+    ],
+)
+def test_discovery_registry_freeze_requires_complete_ref_pair(
+    monkeypatch, name, value
+):
+    from dags.utils import espn_native_tasks
+
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="configured together"):
+        espn_native_tasks._load_discovered_registry(
+            now=datetime(2026, 8, 2, 12, tzinfo=timezone.utc)
+        )
+
+
+def test_discovery_registry_freeze_uses_exact_ref_and_ignores_latest(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    now = datetime(2026, 8, 2, 12, tzinfo=timezone.utc)
+    frozen_ref = {
+        "uri": "s3://artifacts/discovery/frozen-state.json",
+        "sha256": "a" * 64,
+    }
+    state = {
+        "kind": "espn-discovery-state-v2",
+        "observed_at": now.isoformat(),
+        "male_scope_count": 1,
+    }
+    registry = _generated_registry(1)
+    monkeypatch.setenv(espn_native_tasks.DISCOVERY_STATE_REF_URI_ENV, frozen_ref["uri"])
+    monkeypatch.setenv(
+        espn_native_tasks.DISCOVERY_STATE_REF_SHA256_ENV, frozen_ref["sha256"]
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_ref_for_uri",
+        lambda _uri: pytest.fail("frozen override must not resolve latest-state"),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_ref",
+        lambda ref, **_kwargs: (
+            state
+            if ref == frozen_ref
+            else pytest.fail("frozen override read a different discovery state")
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_discovery_state_v2",
+        lambda _state: ({}, registry, {}),
+    )
+
+    loaded, discovery = espn_native_tasks._load_discovered_registry(now=now)
+
+    assert loaded == registry
+    assert discovery["discovery_state_ref"] == frozen_ref
+
+
+def test_discovery_registry_freeze_rejects_bad_state_hash(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    monkeypatch.setenv(
+        espn_native_tasks.DISCOVERY_STATE_REF_URI_ENV,
+        "s3://artifacts/discovery/frozen-state.json",
+    )
+    monkeypatch.setenv(espn_native_tasks.DISCOVERY_STATE_REF_SHA256_ENV, "A" * 64)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_ref_for_uri",
+        lambda _uri: pytest.fail("invalid frozen SHA must fail before latest-state"),
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="lowercase SHA-256"):
+        espn_native_tasks._load_discovered_registry(
+            now=datetime(2026, 8, 2, 12, tzinfo=timezone.utc)
+        )
+
+
 @pytest.mark.parametrize("fault", ["missing", "stale", "hash", "count"])
 def test_discovery_registry_fault_fails_before_leases(monkeypatch, fault):
     from dags.utils import espn_native_tasks
