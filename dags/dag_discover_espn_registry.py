@@ -1,4 +1,4 @@
-"""Weekly observational ESPN registry discovery; never auto-promotes."""
+"""Weekly ESPN Core discovery and generated all-male registry publication."""
 
 from datetime import datetime, timezone
 
@@ -11,8 +11,8 @@ from utils.espn_native_tasks import (
     fetch_discovery_detail_batch,
     MAX_DISCOVERY_DETAIL_BATCH_MAP_ITEMS,
     plan_discovery_detail_batches,
+    publish_discovered_male_registry,
     select_mapping_descriptors,
-    write_reviewable_discovery_diff,
 )
 
 
@@ -58,8 +58,8 @@ with DAG(
         retries=1,
     ).expand(op_kwargs=detail_selector.output)
     review = PythonOperator(
-        task_id="write_reviewable_diff",
-        python_callable=write_reviewable_discovery_diff,
+        task_id="publish_discovered_male_registry",
+        python_callable=publish_discovered_male_registry,
         op_kwargs={
             "discovery_detail_index_ref": detail_plan.output[
                 "discovery_detail_index_ref"

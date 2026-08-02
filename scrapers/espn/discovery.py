@@ -543,7 +543,7 @@ def discover_catalog(
             CatalogCandidate(
                 espn_id=detail.espn_id,
                 slug=row.slug,
-                name=row.name,
+                name=detail.name,
                 group=row.group,
                 source_order=row.source_order,
                 gender=detail.gender,

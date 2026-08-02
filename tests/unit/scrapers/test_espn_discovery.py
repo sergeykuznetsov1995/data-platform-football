@@ -191,6 +191,17 @@ def test_discovery_enriches_every_row_without_promoting_or_guessing_age() -> Non
 
 
 @pytest.mark.unit
+def test_detail_name_replaces_core_ref_placeholder() -> None:
+    snapshot = discover_catalog(
+        {"leagues": [{"id": None, "slug": "eng.1", "name": "eng.1"}]},
+        details_by_slug={"eng.1": _detail()},
+        captured_at="2026-08-02T00:00:00+00:00",
+    )
+
+    assert snapshot.candidates[0].name == "English Premier League"
+
+
+@pytest.mark.unit
 def test_candidate_snapshot_persists_every_row_separately_from_registry(
     tmp_path,
 ) -> None:

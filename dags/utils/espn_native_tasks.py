@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 from typing import Any, Callable, Mapping, Sequence
+from urllib.parse import urlsplit
 
 from scrapers.espn.models import IngestPlan, ScopePlan
 from scrapers.espn.daily_owner import (
@@ -46,7 +47,12 @@ from scrapers.espn.operations import (
     validate_raw_checkpoint,
 )
 from scrapers.espn.raw_store import EspnRawStore
-from scrapers.espn.registry import Registry, load_registry
+from scrapers.espn.registry import (
+    Registry,
+    build_discovered_male_registry,
+    load_registry,
+    validate_registry_document,
+)
 from scrapers.espn.repository import (
     EspnBronzeRepository,
     ScopePublicationState,
@@ -71,6 +77,7 @@ ARTIFACT_ROOT_ENV = "ESPN_ARTIFACT_ROOT_URI"
 RAW_STORE_ENV = "ESPN_RAW_STORE_URI"
 LEASE_TTL = timedelta(hours=9)
 DISCOVERY_DETAIL_BATCH_SIZE = 20
+DISCOVERY_SELECTION_POLICY = "explicit-core-gender-MALE-v1"
 MAX_DISCOVERY_COMPETITIONS = 300
 DISCOVERY_REQUESTS_PER_COMPETITION = 3
 MAX_DISCOVERY_DETAIL_REQUESTS = (
@@ -3210,17 +3217,14 @@ def _optional_payload(uri: str, *, kind: str | None = None):
 def _latest_discovery_flags(scope_id: str) -> tuple[bool, bool]:
     state = _optional_payload(
         _join_uri(_artifact_root(), "discovery", "latest-state.json"),
-        kind="espn-discovery-state-v1",
+        kind="espn-discovery-state-v2",
     )
     if state is None:
         return False, False
-    review = _read_ref(state["review_ref"], kind="espn-discovery-review-v1")
-    competition_id = scope_id.split(":", 1)[0]
-    rollover = any(
-        str(item).split(":", 1)[0] == competition_id
-        for item in review["quarantined_scopes"]
-    )
-    return rollover, bool(review["unresolved_discovery_diffs"])
+    review = _read_ref(state["review_ref"], kind="espn-discovery-review-v2")
+    if state.get("male_registry_ref") != review.get("male_registry_ref"):
+        raise OperationsError("discovery state registry reference mismatch")
+    return False, bool(review["unresolved_discovery_diffs"])
 
 
 def _head_identity_sha256(head: ScopeHead) -> str:
@@ -3699,7 +3703,7 @@ def fetch_discovery_catalog(**context) -> dict[str, str]:
         return {"discovery_raw_ref": _ref_for_uri(artifact_uri)}
     url = os.environ.get(
         "ESPN_DISCOVERY_CATALOG_URL",
-        "https://site.api.espn.com/apis/site/v2/sports/soccer/leagues",
+        "https://sports.core.api.espn.com/v2/sports/soccer/leagues?limit=500&lang=en&region=us",
     )
     PostgresEspnControlStore.from_env().migrate()
     fetched = _http_client(raw_store, max_summary_events=1).fetch_json(
@@ -3724,6 +3728,63 @@ def _normalize_discovery_dropdown(document: object) -> Mapping[str, Any]:
 
     if not isinstance(document, Mapping):
         raise OperationsError("discovery catalog must be an object")
+    core_keys = {"count", "pageCount", "items"}
+    if core_keys.intersection(document):
+        count = document.get("count")
+        page_count = document.get("pageCount")
+        items = document.get("items")
+        if (
+            type(count) is not int
+            or not isinstance(items, list)
+            or count != len(items)
+            or count < 1
+            or type(page_count) is not int
+            or page_count != 1
+        ):
+            raise OperationsError(
+                "discovery Core catalog must provide one complete page"
+            )
+        leagues = []
+        references = set()
+        slugs = set()
+        for item in items:
+            if not isinstance(item, Mapping) or set(item) != {"$ref"}:
+                raise OperationsError("discovery Core catalog item must be a $ref")
+            reference = item["$ref"]
+            if not isinstance(reference, str) or reference in references:
+                raise OperationsError(
+                    "discovery Core catalog references must be unique URLs"
+                )
+            try:
+                parsed = urlsplit(reference)
+                port = parsed.port
+            except ValueError as exc:
+                raise OperationsError(
+                    "discovery Core catalog reference is malformed"
+                ) from exc
+            if (
+                parsed.scheme not in {"http", "https"}
+                or parsed.hostname != "sports.core.api.espn.com"
+                or parsed.username is not None
+                or parsed.password is not None
+                or port is not None
+                or parsed.fragment
+            ):
+                raise OperationsError("discovery Core catalog reference is not ESPN")
+            match = re.fullmatch(
+                r"/v2/sports/soccer/leagues/([A-Za-z0-9._-]+)", parsed.path
+            )
+            if match is None:
+                raise OperationsError(
+                    "discovery Core catalog reference has no exact league slug"
+                )
+            slug = match.group(1)
+            if slug in slugs:
+                raise OperationsError("discovery Core catalog has duplicate slugs")
+            references.add(reference)
+            slugs.add(slug)
+            leagues.append({"id": None, "slug": slug, "name": slug})
+        return {"leagues": leagues}
 
     def find(value: object):
         if isinstance(value, Mapping):
@@ -4293,7 +4354,10 @@ def _competition_detail_document(
     )
     detail = dict(metadata_document)
     detail["slug"] = slug
-    detail["name"] = _required(name, "discovery competition name")
+    authoritative_name = _required(
+        metadata_document.get("name") or metadata_document.get("displayName"),
+        "discovery metadata name",
+    )
     if resolved_espn_id is not None:
         detail["id"] = resolved_espn_id
     season = detail.get("season") or {}
@@ -4325,7 +4389,7 @@ def _competition_detail_document(
         summary_document=summary_document,
         resolved_espn_id=resolved_espn_id,
         slug=slug,
-        name=name,
+        name=authoritative_name,
         season=normalized_season,
         scoreboard_event_id=scoreboard_event_id,
     )
@@ -4434,14 +4498,15 @@ def _discovery_review_state(
     review: Mapping[str, Any], *, review_ref: Mapping[str, str]
 ) -> dict[str, Any]:
     return {
-        "kind": "espn-discovery-state-v1",
-        "schema_version": 1,
+        "kind": "espn-discovery-state-v2",
+        "schema_version": 2,
         "candidate_ref": review["candidate_ref"],
+        "candidate_signature": review["candidate_signature"],
         "review_ref": dict(review_ref),
-        "candidate_identity": review["candidate_identity"],
-        "registry_signature": review["registry_signature"],
-        "quarantined_scopes": review["quarantined_scopes"],
-        "unresolved_discovery_diffs": review["unresolved_discovery_diffs"],
+        "male_registry_ref": review["male_registry_ref"],
+        "male_registry_signature": review["male_registry_signature"],
+        "male_scope_count": review["male_scope_count"],
+        "selection_policy": review["selection_policy"],
         "observed_at": review["observed_at"],
     }
 
@@ -4456,6 +4521,62 @@ def _discovery_observed_at(value: object, *, label: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def _load_discovery_state_v2(
+    state: object,
+) -> tuple[Mapping[str, Any], Registry]:
+    required_keys = {
+        "kind",
+        "schema_version",
+        "candidate_ref",
+        "candidate_signature",
+        "review_ref",
+        "male_registry_ref",
+        "male_registry_signature",
+        "male_scope_count",
+        "selection_policy",
+        "observed_at",
+    }
+    if (
+        not isinstance(state, Mapping)
+        or set(state) != required_keys
+        or state.get("kind") != "espn-discovery-state-v2"
+        or state.get("schema_version") != 2
+        or state.get("selection_policy") != DISCOVERY_SELECTION_POLICY
+        or type(state.get("male_scope_count")) is not int
+        or state["male_scope_count"] < 1
+    ):
+        raise OperationsError("discovery state v2 checkpoint mismatch")
+    candidate_ref = _discovery_artifact_ref(
+        state["candidate_ref"], label="discovery state candidate reference"
+    )
+    _discovery_artifact_ref(
+        state["review_ref"], label="discovery state review reference"
+    )
+    male_registry_ref = _discovery_artifact_ref(
+        state["male_registry_ref"], label="discovery state male registry reference"
+    )
+    candidate_signature = _sha(
+        state["candidate_signature"], "discovery state candidate signature"
+    )
+    male_registry_signature = _sha(
+        state["male_registry_signature"],
+        "discovery state male registry signature",
+    )
+    _discovery_observed_at(state["observed_at"], label="discovery state observed_at")
+
+    from scrapers.espn.discovery import CatalogSnapshot
+
+    candidate = _read_ref(candidate_ref)
+    if CatalogSnapshot.from_dict(candidate).signature() != candidate_signature:
+        raise OperationsError("discovery state candidate signature mismatch")
+    male_registry = validate_registry_document(_read_ref(male_registry_ref))
+    if male_registry.signature() != male_registry_signature:
+        raise OperationsError("discovery state male registry signature mismatch")
+    if len(male_registry.promoted) != state["male_scope_count"]:
+        raise OperationsError("discovery state male registry count mismatch")
+    return candidate, male_registry
+
+
 def _validate_discovery_review_checkpoint(
     review: object,
     *,
@@ -4468,8 +4589,11 @@ def _validate_discovery_review_checkpoint(
         "discovery_detail_index_ref",
         "discovery_detail_phase_refs",
         "candidate_ref",
-        "candidate_identity",
-        "registry_signature",
+        "candidate_signature",
+        "male_registry_ref",
+        "male_registry_signature",
+        "male_scope_count",
+        "selection_policy",
         "quarantined_scopes",
         "changes",
         "change_count",
@@ -4481,14 +4605,17 @@ def _validate_discovery_review_checkpoint(
     if (
         not isinstance(review, dict)
         or set(review) != required_keys
-        or review.get("kind") != "espn-discovery-review-v1"
+        or review.get("kind") != "espn-discovery-review-v2"
         or review.get("schema_version") != 2
         or review.get("discovery_detail_index_ref") != discovery_detail_index_ref
         or review.get("discovery_detail_phase_refs")
         != list(discovery_detail_phase_refs)
         or review.get("promotion_performed") is not False
-        or type(review.get("unresolved_discovery_diffs")) is not bool
-        or not isinstance(review.get("quarantined_scopes"), list)
+        or review.get("unresolved_discovery_diffs") is not False
+        or review.get("quarantined_scopes") != []
+        or review.get("selection_policy") != DISCOVERY_SELECTION_POLICY
+        or type(review.get("male_scope_count")) is not int
+        or review["male_scope_count"] < 1
         or not isinstance(review.get("changes"), list)
         or type(review.get("change_count")) is not int
         or review["change_count"] != len(review["changes"])
@@ -4502,10 +4629,19 @@ def _validate_discovery_review_checkpoint(
     candidates = candidate.get("candidates")
     if not isinstance(candidates, list):
         raise OperationsError("existing discovery candidate checkpoint mismatch")
-    candidate_identity = hashlib.sha256(_canonical_bytes(candidates)).hexdigest()
-    if review.get("candidate_identity") != candidate_identity:
-        raise OperationsError("existing discovery candidate identity mismatch")
-    _sha(review.get("registry_signature"), "discovery registry signature")
+    from scrapers.espn.discovery import CatalogSnapshot
+
+    candidate_signature = CatalogSnapshot.from_dict(candidate).signature()
+    if review.get("candidate_signature") != candidate_signature:
+        raise OperationsError("existing discovery candidate signature mismatch")
+    male_registry_ref = _discovery_artifact_ref(
+        review["male_registry_ref"], label="discovered male registry reference"
+    )
+    male_registry = validate_registry_document(_read_ref(male_registry_ref))
+    if review.get("male_registry_signature") != male_registry.signature():
+        raise OperationsError("existing discovered male registry signature mismatch")
+    if review["male_scope_count"] != len(male_registry.promoted):
+        raise OperationsError("existing discovered male registry scope count mismatch")
     _discovery_observed_at(review.get("observed_at"), label="discovery observed_at")
     return review
 
@@ -4516,8 +4652,13 @@ def _publish_latest_discovery_state(
     incoming_time = _discovery_observed_at(
         state.get("observed_at"), label="discovery state observed_at"
     )
-    existing = _optional_payload(latest_state_uri, kind="espn-discovery-state-v1")
+    existing = _optional_payload(latest_state_uri)
     if existing is not None:
+        if existing.get("kind") not in {
+            "espn-discovery-state-v1",
+            "espn-discovery-state-v2",
+        }:
+            raise OperationsError("existing discovery state schema is unsupported")
         existing_time = _discovery_observed_at(
             existing.get("observed_at"), label="existing discovery state observed_at"
         )
@@ -4532,18 +4673,17 @@ def _publish_latest_discovery_state(
     _write_payload(latest_state_uri, state, immutable=False)
 
 
-def write_reviewable_discovery_diff(
+def publish_discovered_male_registry(
     *,
     discovery_detail_index_ref: Mapping[str, str],
     discovery_detail_phase_refs: Sequence[Mapping[str, Any]] | None,
     **context,
 ) -> dict[str, str]:
-    """Persist candidate/diff artifacts; this function has no promotion path."""
+    """Persist the exact candidate, generated MALE registry and review pointer."""
 
     from scrapers.espn.discovery import (
         CatalogSnapshot,
         diff_catalogs,
-        quarantine_new_editions,
     )
 
     dag_id, run_id, _ = _run_identity(context)
@@ -4554,7 +4694,7 @@ def write_reviewable_discovery_diff(
         discovery_detail_index_ref,
         label="discovery detail index reference",
     )
-    existing_review = _optional_payload(review_uri, kind="espn-discovery-review-v1")
+    existing_review = _optional_payload(review_uri)
     if existing_review is not None:
         committed_phase_refs = existing_review.get("discovery_detail_phase_refs")
         if not isinstance(committed_phase_refs, list) or not committed_phase_refs:
@@ -4575,14 +4715,10 @@ def write_reviewable_discovery_diff(
             latest_state_uri,
             _discovery_review_state(review, review_ref=review_ref),
         )
-        if review["quarantined_scopes"]:
-            from airflow.exceptions import AirflowException
-
-            raise AirflowException(
-                "ESPN discovery quarantined unpromoted current seasons: "
-                + ", ".join(review["quarantined_scopes"])
-            )
-        return {"discovery_review_ref": review_ref}
+        return {
+            "discovery_review_ref": review_ref,
+            "male_registry_ref": review["male_registry_ref"],
+        }
 
     detail_index = _read_ref(canonical_index_ref, kind="espn-discovery-detail-index-v1")
     competition_count = detail_index.get("competition_count")
@@ -4737,45 +4873,57 @@ def write_reviewable_discovery_diff(
         {"dropdown": dropdown, "details_by_slug": details_by_slug},
         captured_at=raw["captured_at"],
     )
-    previous_state = _optional_payload(latest_state_uri, kind="espn-discovery-state-v1")
+    previous_state = _optional_payload(latest_state_uri)
+    if previous_state is not None and previous_state.get("kind") not in {
+        "espn-discovery-state-v1",
+        "espn-discovery-state-v2",
+    }:
+        raise OperationsError("existing discovery state schema is unsupported")
     previous_uri = os.environ.get("ESPN_DISCOVERY_PREVIOUS_URI")
     registry_path = Path(
         os.environ.get(REGISTRY_ENV, "/opt/airflow/configs/espn/registry.yaml")
     )
-    registry = load_registry(registry_path)
+    legacy_registry = load_registry(registry_path)
+    previous_registry = None
+    previous_candidate = None
+    if previous_state is not None and previous_state.get("kind") == (
+        "espn-discovery-state-v2"
+    ):
+        previous_candidate, previous_registry = _load_discovery_state_v2(
+            previous_state
+        )
     if previous_uri:
         previous_document = json.loads(
             runner._read_artifact(previous_uri).decode("utf-8")
         )
         previous = CatalogSnapshot.from_dict(previous_document)
+    elif previous_candidate is not None:
+        previous = CatalogSnapshot.from_dict(previous_candidate)
     elif previous_state is not None:
         previous = CatalogSnapshot.from_dict(_read_ref(previous_state["candidate_ref"]))
     else:
-        previous = _promoted_registry_baseline(current, registry)
+        previous = _promoted_registry_baseline(current, legacy_registry)
     diff = diff_catalogs(previous, current)
     candidate_ref = _write_payload(
         _join_uri(root, "candidate.json"), json.loads(current.canonical_json())
     )
-    candidate_identity = hashlib.sha256(
-        _canonical_bytes([item.to_dict() for item in current.candidates])
-    ).hexdigest()
-    quarantined = sorted(quarantine_new_editions(current, registry))
-    unresolved = bool(diff.changes)
-    if (
-        previous_state is not None
-        and previous_state["candidate_identity"] == candidate_identity
-        and previous_state["registry_signature"] == registry.signature()
-    ):
-        unresolved = bool(previous_state["unresolved_discovery_diffs"])
-    observed_at = PostgresEspnControlStore.from_env().current_time()
-    alert_scopes = (
-        quarantined
-        or [
-            competition.scope_id(competition.current_edition)
-            for competition in registry.competitions
-            if competition.enabled
-        ][:1]
+    candidate_signature = current.signature()
+    male_registry = build_discovered_male_registry(
+        current,
+        legacy_registry=legacy_registry,
+        previous_registry=previous_registry,
     )
+    male_registry_ref = _write_payload(
+        _join_uri(root, "male-registry.json"),
+        json.loads(male_registry.canonical_json()),
+    )
+    male_registry_signature = male_registry.signature()
+    male_scope_count = len(male_registry.promoted)
+    observed_at = PostgresEspnControlStore.from_env().current_time()
+    alert_scopes = [
+        competition.scope_id(competition.current_edition)
+        for competition in male_registry.promoted[:1]
+    ]
     alerts = []
     for alert_scope in alert_scopes:
         alerts.extend(
@@ -4788,31 +4936,34 @@ def write_reviewable_discovery_diff(
                     "subject_dag_id": None,
                     "subject_run_id": None,
                     "identity_kind": "discovery-candidate",
-                    "identity_sha256": candidate_identity,
+                    "identity_sha256": candidate_signature,
                     "state": "complete",
                     "last_complete_at": observed_at,
                     "direct_requests": 1 + detail_request_count,
                     "request_budget": 1 + MAX_DISCOVERY_DETAIL_REQUESTS,
                     "proxy_bytes": raw["proxy_bytes"] + detail_proxy_bytes,
                     "lease_conflict": False,
-                    "unpromoted_current_season": alert_scope in quarantined,
-                    "unresolved_discovery_diffs": unresolved,
+                    "unpromoted_current_season": False,
+                    "unresolved_discovery_diffs": False,
                 },
                 observed_at=observed_at,
             )
         )
     review = {
-        "kind": "espn-discovery-review-v1",
+        "kind": "espn-discovery-review-v2",
         "schema_version": 2,
         "discovery_detail_index_ref": canonical_index_ref,
         "discovery_detail_phase_refs": canonical_phase_refs,
         "candidate_ref": candidate_ref,
-        "candidate_identity": candidate_identity,
-        "registry_signature": registry.signature(),
-        "quarantined_scopes": quarantined,
+        "candidate_signature": candidate_signature,
+        "male_registry_ref": male_registry_ref,
+        "male_registry_signature": male_registry_signature,
+        "male_scope_count": male_scope_count,
+        "selection_policy": DISCOVERY_SELECTION_POLICY,
+        "quarantined_scopes": [],
         "changes": [json.loads(item.canonical_json()) for item in diff.changes],
         "change_count": len(diff.changes),
-        "unresolved_discovery_diffs": unresolved,
+        "unresolved_discovery_diffs": False,
         "alerts": alerts,
         "promotion_performed": False,
         "observed_at": observed_at.isoformat(),
@@ -4822,14 +4973,14 @@ def write_reviewable_discovery_diff(
         latest_state_uri,
         _discovery_review_state(review, review_ref=review_ref),
     )
-    if quarantined:
-        from airflow.exceptions import AirflowException
+    return {
+        "discovery_review_ref": review_ref,
+        "male_registry_ref": male_registry_ref,
+    }
 
-        raise AirflowException(
-            "ESPN discovery quarantined unpromoted current seasons: "
-            + ", ".join(quarantined)
-        )
-    return {"discovery_review_ref": review_ref}
+
+# Release compatibility for callers importing the old observational reducer name.
+write_reviewable_discovery_diff = publish_discovered_male_registry
 
 
 def check_36h_freshness_and_alerts(**context) -> dict[str, str]:

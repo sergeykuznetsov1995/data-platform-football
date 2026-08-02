@@ -221,7 +221,7 @@ def test_replay_dag_has_no_network_operator_at_all():
     )
 
 
-def test_weekly_discovery_never_promotes_and_monitor_is_network_free():
+def test_weekly_discovery_publishes_generated_registry_and_monitor_is_network_free():
     discovery = _reload("dag_discover_espn_registry")
     discovery_tasks = _tasks()
     assert discovery.dag.schedule == "0 7 * * 1"
@@ -232,8 +232,7 @@ def test_weekly_discovery_never_promotes_and_monitor_is_network_free():
         discovery_tasks["fetch_discovery_catalog"]._init_kwargs["multiple_outputs"]
         is True
     )
-    assert "promote" not in " ".join(discovery_tasks).casefold()
-    assert "write_reviewable_diff" in discovery_tasks
+    assert "publish_discovered_male_registry" in discovery_tasks
     assert (
         discovery_tasks["plan_discovery_detail_batches"]._init_kwargs.get("pool")
         is None
@@ -256,10 +255,12 @@ def test_weekly_discovery_never_promotes_and_monitor_is_network_free():
     )
     assert (
         "fetch_discovery_detail_batches"
-        in discovery_tasks["write_reviewable_diff"].upstream_task_ids
+        in discovery_tasks["publish_discovered_male_registry"].upstream_task_ids
     )
     assert (
-        discovery_tasks["write_reviewable_diff"]._init_kwargs["trigger_rule"]
+        discovery_tasks["publish_discovered_male_registry"]._init_kwargs[
+            "trigger_rule"
+        ]
         == "none_failed"
     )
 
@@ -268,6 +269,148 @@ def test_weekly_discovery_never_promotes_and_monitor_is_network_free():
     assert monitor.dag.schedule == "0 */6 * * *"
     assert all(task._init_kwargs.get("pool") is None for task in monitor_tasks.values())
     assert "check_36h_freshness_and_alerts" in monitor_tasks
+
+
+def test_core_catalog_refs_normalize_to_all_slugs():
+    from dags.utils.espn_native_tasks import _normalize_discovery_dropdown
+
+    catalog = {
+        "count": 2,
+        "pageCount": 1,
+        "items": [
+            {
+                "$ref": "http://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1?lang=en"
+            },
+            {
+                "$ref": "http://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions?lang=en"
+            },
+        ],
+    }
+
+    normalized = _normalize_discovery_dropdown(catalog)
+
+    assert [row["slug"] for row in normalized["leagues"]] == [
+        "eng.1",
+        "uefa.champions",
+    ]
+
+
+@pytest.mark.parametrize(
+    "catalog",
+    [
+        {
+            "count": 2,
+            "pageCount": 1,
+            "items": [
+                {
+                    "$ref": "https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1"
+                }
+            ],
+        },
+        {
+            "count": 1,
+            "pageCount": 2,
+            "items": [
+                {
+                    "$ref": "https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1"
+                }
+            ],
+        },
+        {
+            "count": 1,
+            "pageCount": 1,
+            "items": [{"$ref": "https://example.com/v2/sports/soccer/leagues/eng.1"}],
+        },
+        {
+            "count": 1,
+            "pageCount": 1,
+            "items": [
+                {
+                    "$ref": "https://sports.core.api.espn.com:bad/v2/sports/soccer/leagues/eng.1"
+                }
+            ],
+        },
+        {
+            "count": 1,
+            "pageCount": 1,
+            "items": [
+                {
+                    "$ref": "https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1"
+                },
+                {
+                    "$ref": "https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1?lang=en"
+                },
+            ],
+        },
+    ],
+)
+def test_core_catalog_rejects_partial_or_malformed_coverage(catalog):
+    from dags.utils import espn_native_tasks
+
+    with pytest.raises(espn_native_tasks.OperationsError):
+        espn_native_tasks._normalize_discovery_dropdown(catalog)
+
+
+def test_core_catalog_default_fetches_complete_single_page(monkeypatch):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.transport_contracts import EndpointType
+
+    calls = []
+    monkeypatch.delenv("ESPN_DISCOVERY_CATALOG_URL", raising=False)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_run_identity",
+        lambda _context: (
+            "dag_discover_espn_registry",
+            "run-1",
+            datetime(2026, 8, 2, tzinfo=timezone.utc),
+        ),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(espn_native_tasks, "_optional_payload", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        lambda _uri: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: SimpleNamespace(migrate=lambda: None)),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_http_client",
+        lambda *_a, **_k: SimpleNamespace(
+            fetch_json=lambda *args, **kwargs: (
+                calls.append((args, kwargs))
+                or SimpleNamespace(
+                    raw_uri="s3://raw/catalog.json",
+                    content_hash="a" * 64,
+                    direct_bytes=1,
+                    proxy_bytes=0,
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda uri, _payload: {"uri": uri, "sha256": "b" * 64},
+    )
+
+    espn_native_tasks.fetch_discovery_catalog()
+
+    assert calls == [
+        (
+            (
+                "https://sports.core.api.espn.com/v2/sports/soccer/leagues?limit=500&lang=en&region=us",
+                EndpointType.CATALOG,
+            ),
+            {"force_refresh": True},
+        )
+    ]
 
 
 def test_every_mapped_input_is_a_selector_or_producer_return_value():
@@ -1583,7 +1726,7 @@ def test_discovery_sample_requires_parser_equivalent_capability_rows(malformed_c
     }
 
 
-def test_saved_detail_evidence_reaches_reviewable_discovery_diff(monkeypatch):
+def test_saved_detail_evidence_reaches_male_registry_artifact(monkeypatch):
     from dags.utils import espn_native_tasks
     from scrapers.espn.registry import validate_registry_document
 
@@ -1748,7 +1891,7 @@ def test_saved_detail_evidence_reaches_reviewable_discovery_diff(monkeypatch):
 
     monkeypatch.setattr(espn_native_tasks, "_write_payload", write)
 
-    result = espn_native_tasks.write_reviewable_discovery_diff(
+    result = espn_native_tasks.publish_discovered_male_registry(
         discovery_detail_index_ref=index_ref,
         discovery_detail_phase_refs=[{"discovery_detail_phase_ref": phase_ref}],
         params={"attempt": 1},
@@ -1760,7 +1903,7 @@ def test_saved_detail_evidence_reaches_reviewable_discovery_diff(monkeypatch):
     review = next(
         payload
         for payload in written
-        if payload.get("kind") == "espn-discovery-review-v1"
+        if payload.get("kind") == "espn-discovery-review-v2"
     )
     assert candidate["name"] == "Italian Serie A"
     assert candidate["gender"] == "MALE"
@@ -1778,32 +1921,108 @@ def test_saved_detail_evidence_reaches_reviewable_discovery_diff(monkeypatch):
     assert alert_snapshots[0]["request_budget"] == (
         1 + espn_native_tasks.MAX_DISCOVERY_DETAIL_REQUESTS
     )
+    male_registry = next(
+        payload
+        for payload in written
+        if payload.get("registry_version", "").startswith("discovery-male-")
+    )
+    male_registry_ref = review["male_registry_ref"]
+    assert [row["espn_id"] for row in male_registry["competitions"]] == [730]
+    assert review["selection_policy"] == "explicit-core-gender-MALE-v1"
+    assert review["male_scope_count"] == 1
+    assert review["male_registry_signature"] == validate_registry_document(
+        male_registry
+    ).signature()
+    assert male_registry_ref["uri"].endswith("/male-registry.json")
+    assert review["unresolved_discovery_diffs"] is False
+    assert review["quarantined_scopes"] == []
     assert review["promotion_performed"] is False
     assert result["discovery_review_ref"]["uri"].endswith("reviewable-diff.json")
 
 
 def test_discovery_review_retry_replays_checkpoint_without_recomputation(monkeypatch):
     from dags.utils import espn_native_tasks
+    from scrapers.espn.discovery import CatalogSnapshot
+    from scrapers.espn.registry import validate_registry_document
 
     index_ref = {"uri": "s3://artifacts/index.json", "sha256": "a" * 64}
     phase_ref = {"uri": "s3://artifacts/phase.json", "sha256": "b" * 64}
     candidate_ref = {"uri": "s3://artifacts/candidate.json", "sha256": "c" * 64}
     candidate = {
+        "schema_version": 1,
         "captured_at": "2026-08-01T00:00:00+00:00",
-        "candidates": [{"espn_id": 730, "slug": "ita.1"}],
+        "candidates": [
+            {
+                "espn_id": 730,
+                "slug": "ita.1",
+                "name": "Italian Serie A",
+                "group": "ESPN soccer dropdown",
+                "source_order": 0,
+                "gender": "MALE",
+                "age_class": "UNKNOWN",
+                "source_season_year": 2020,
+                "edition_display_name": "2020-21 Italian Serie A",
+                "start_date": "2020-08-01",
+                "end_date": "2021-07-31",
+                "capabilities": {
+                    "schedule": "proven",
+                    "lineup": "partial",
+                    "matchsheet": "partial",
+                },
+                "gender_evidence": ["core-detail.gender=MALE"],
+            }
+        ],
         "source": "committed retry fixture",
     }
-    candidate_identity = hashlib.sha256(
-        espn_native_tasks._canonical_bytes(candidate["candidates"])
-    ).hexdigest()
+    candidate_signature = CatalogSnapshot.from_dict(candidate).signature()
+    male_registry_ref = {
+        "uri": "s3://artifacts/male-registry.json",
+        "sha256": "d" * 64,
+    }
+    male_registry = {
+        "schema_version": 1,
+        "registry_version": "discovery-male-retry",
+        "as_of": "2026-08-01",
+        "competitions": [
+            {
+                "espn_id": 730,
+                "slug": "ita.1",
+                "name": "Italian Serie A",
+                "enabled": True,
+                "gender": "MALE",
+                "age_class": "UNKNOWN",
+                "gender_evidence": ["core-detail.gender=MALE"],
+                "age_class_evidence": [],
+                "legacy": None,
+                "editions": [
+                    {
+                        "source_season_year": 2020,
+                        "display_name": "2020-21 Italian Serie A",
+                        "start_date": "2020-08-01",
+                        "end_date": "2021-07-31",
+                        "current": True,
+                        "capabilities": {
+                            "schedule": "proven",
+                            "lineup": "partial",
+                            "matchsheet": "partial",
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    male_registry_signature = validate_registry_document(male_registry).signature()
     review = {
-        "kind": "espn-discovery-review-v1",
+        "kind": "espn-discovery-review-v2",
         "schema_version": 2,
         "discovery_detail_index_ref": index_ref,
         "discovery_detail_phase_refs": [phase_ref],
         "candidate_ref": candidate_ref,
-        "candidate_identity": candidate_identity,
-        "registry_signature": "d" * 64,
+        "candidate_signature": candidate_signature,
+        "male_registry_ref": male_registry_ref,
+        "male_registry_signature": male_registry_signature,
+        "male_scope_count": 1,
+        "selection_policy": "explicit-core-gender-MALE-v1",
         "quarantined_scopes": [],
         "changes": [],
         "change_count": 0,
@@ -1835,6 +2054,8 @@ def test_discovery_review_retry_replays_checkpoint_without_recomputation(monkeyp
         lambda ref, **_kwargs: (
             candidate
             if ref == candidate_ref
+            else male_registry
+            if ref == male_registry_ref
             else pytest.fail("retry must not reread discovery inputs")
         ),
     )
@@ -1864,11 +2085,16 @@ def test_discovery_review_retry_replays_checkpoint_without_recomputation(monkeyp
         discovery_detail_phase_refs=[{"discovery_detail_phase_ref": phase_ref}],
     )
 
-    assert result == {"discovery_review_ref": review_ref}
+    assert result == {
+        "discovery_review_ref": review_ref,
+        "male_registry_ref": male_registry_ref,
+    }
     assert len(writes) == 1
     latest_uri, latest_state, kwargs = writes[0]
     assert latest_uri.endswith("/discovery/latest-state.json")
-    assert latest_state["candidate_identity"] == candidate_identity
+    assert latest_state["candidate_signature"] == candidate_signature
+    assert latest_state["male_registry_ref"] == male_registry_ref
+    assert latest_state["male_registry_signature"] == male_registry_signature
     assert latest_state["review_ref"] == review_ref
     assert kwargs == {"immutable": False}
 
