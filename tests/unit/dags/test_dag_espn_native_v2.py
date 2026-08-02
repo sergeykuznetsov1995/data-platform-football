@@ -1090,6 +1090,11 @@ def test_daily_admission_v2_persists_exact_discovery_and_coverage(monkeypatch):
     monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
     monkeypatch.setattr(
         espn_native_tasks,
+        "_ref_for_uri",
+        lambda _uri: (_ for _ in ()).throw(FileNotFoundError()),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
         "_write_payload",
         lambda uri, payload, **kwargs: (
             writes.append((uri, payload, kwargs))
@@ -1162,6 +1167,11 @@ def test_manual_admission_keeps_explicit_generated_scope_without_reading_heads(
     monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
     monkeypatch.setattr(
         espn_native_tasks,
+        "_ref_for_uri",
+        lambda _uri: (_ for _ in ()).throw(FileNotFoundError()),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
         "_write_payload",
         lambda uri, payload, **_kwargs: (
             writes.append((uri, payload)) or {"uri": uri, "sha256": "d" * 64}
@@ -1182,6 +1192,89 @@ def test_manual_admission_keeps_explicit_generated_scope_without_reading_heads(
     context["params"] = {"scopes": ["999999:2026"]}
     with pytest.raises(espn_native_tasks.OperationsError, match="unpromoted"):
         espn_native_tasks.validate_registry_and_admission(mode="repair", **context)
+
+
+def test_admission_retry_replays_exact_v2_before_mutable_reads(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    logical_date = datetime(2026, 8, 2, 12, tzinfo=timezone.utc)
+    admission_ref = {
+        "uri": "s3://artifacts/runs/frozen/admission.json",
+        "sha256": "a" * 64,
+    }
+    admission = {
+        "kind": "espn-airflow-admission-v2",
+        "schema_version": 2,
+        "dag_id": "dag_repair_espn",
+        "run_id": "run-1",
+        "attempt": 1,
+        "mode": "repair",
+        "as_of": "2026-08-02",
+        "logical_date": logical_date.isoformat(),
+        "parent": None,
+        "registry_ref": {"uri": "registry", "sha256": "b" * 64},
+        "registry_signature": "c" * 64,
+        "target_scope_ids": ["10000:2026"],
+        "scope_ids": ["10000:2026"],
+        "bootstrap_scope_ids": [],
+        "discovery_state_ref": {"uri": "state", "sha256": "d" * 64},
+        "candidate_ref": {"uri": "candidate", "sha256": "e" * 64},
+        "selection_policy": "explicit-core-gender-MALE-v1",
+        "male_scope_count": 1,
+        "artifact_root": "s3://artifacts/runs/frozen",
+        "raw_store_uri": "s3://raw",
+        "replay_sources": {},
+    }
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_run_identity",
+        lambda _context: ("dag_repair_espn", "run-1", logical_date),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_attempt", lambda _context: 1)
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(espn_native_tasks, "_run_key", lambda *_args: "frozen")
+    monkeypatch.setattr(espn_native_tasks, "_ref_for_uri", lambda _uri: admission_ref)
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: admission)
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: pytest.fail("retry must not read database state")),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_discovered_registry",
+        lambda **_kwargs: pytest.fail("retry must not read mutable discovery"),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_raw_store_uri",
+        lambda: pytest.fail("retry must preserve its sealed raw store"),
+    )
+
+    result = espn_native_tasks.validate_registry_and_admission(
+        mode="repair",
+        params={"attempt": 1, "scopes": ["10000:2026"]},
+        dag_run=SimpleNamespace(conf={}),
+    )
+
+    assert result == admission_ref
+
+
+@pytest.mark.parametrize(
+    ("kind", "schema_version"),
+    [("espn-airflow-admission-v1", 1), ("espn-airflow-admission-v2", 2)],
+)
+def test_admission_consumers_accept_inflight_v1_and_current_v2(
+    monkeypatch, kind, schema_version
+):
+    from dags.utils import espn_native_tasks
+
+    admission = {"kind": kind, "schema_version": schema_version}
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: admission)
+
+    assert espn_native_tasks._read_admission_ref(
+        {"uri": "admission", "sha256": "a" * 64}
+    ) == admission
 
 
 def test_discovery_registry_rejects_future_state_and_enabled_non_male(monkeypatch):
@@ -1259,7 +1352,9 @@ def test_discovery_registry_fault_fails_before_leases(monkeypatch, fault):
             "_read_ref",
             lambda *_args, **_kwargs: (
                 (_ for _ in ()).throw(
-                    espn_native_tasks.OperationsError("artifact reference hash mismatch")
+                    espn_native_tasks.runner.RunnerConfigurationError(
+                        "artifact pointer content hash mismatch"
+                    )
                 )
                 if fault == "hash"
                 else state
@@ -2851,6 +2946,7 @@ def test_expired_same_owner_acquisition_reclaims_instead_of_failing(monkeypatch)
 
     admission = {
         "kind": "espn-airflow-admission-v2",
+        "schema_version": 2,
         "dag_id": "dag_ingest_espn",
         "run_id": "run-1",
         "attempt": 1,
@@ -4545,6 +4641,8 @@ def test_final_leaf_seals_success_only_after_health_and_release(monkeypatch):
             "failures": [],
         },
         "admission.json": {
+            "kind": "espn-airflow-admission-v1",
+            "schema_version": 1,
             "dag_id": "dag_ingest_espn",
             "run_id": "child-run",
             "attempt": 1,

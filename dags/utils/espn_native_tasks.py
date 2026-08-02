@@ -377,7 +377,14 @@ def _load_discovered_registry(
         _candidate, registry, _review = _load_discovery_state_v2(state)
     except OperationsError:
         raise
-    except (FileNotFoundError, OSError, KeyError, TypeError, ValueError) as exc:
+    except (
+        FileNotFoundError,
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+        runner.RunnerError,
+    ) as exc:
         raise OperationsError("discovered registry checkpoint is invalid") from exc
     observed_at = _discovery_observed_at(
         state["observed_at"], label="discovery state observed_at"
@@ -391,6 +398,73 @@ def _load_discovered_registry(
     if len(registry.promoted) != state["male_scope_count"]:
         raise OperationsError("discovery state male registry count mismatch")
     return registry, {**state, "discovery_state_ref": state_ref}
+
+
+def _admission_payload(value: object) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise OperationsError("admission artifact must be an object")
+    expected = {
+        "espn-airflow-admission-v1": 1,
+        "espn-airflow-admission-v2": 2,
+    }
+    kind = value.get("kind")
+    if kind not in expected or expected[kind] != value.get("schema_version"):
+        raise OperationsError("admission artifact schema is unsupported")
+    return value
+
+
+def _read_admission_ref(ref: Mapping[str, str]) -> Mapping[str, Any]:
+    """Read current v2 and in-flight v1 admissions through one version gate."""
+
+    return _admission_payload(_read_ref(ref))
+
+
+def _replay_existing_admission(
+    *,
+    admission_uri: str,
+    mode: str,
+    dag_id: str,
+    run_id: str,
+    logical_date: datetime,
+    parent: Mapping[str, str] | None,
+    context: Mapping[str, Any],
+) -> dict[str, str] | None:
+    try:
+        admission_ref = _ref_for_uri(admission_uri)
+    except FileNotFoundError:
+        return None
+    admission = _read_admission_ref(admission_ref)
+    params = context.get("params") or {}
+    attempt = _attempt(context)
+    expected_identity = (
+        dag_id,
+        run_id,
+        attempt,
+        mode,
+        logical_date.date().isoformat(),
+        logical_date.isoformat(),
+        parent,
+        admission_uri.rsplit("/", 1)[0],
+    )
+    actual_identity = (
+        admission.get("dag_id"),
+        admission.get("run_id"),
+        admission.get("attempt"),
+        admission.get("mode"),
+        admission.get("as_of"),
+        admission.get("logical_date"),
+        admission.get("parent"),
+        admission.get("artifact_root"),
+    )
+    if actual_identity != expected_identity:
+        raise OperationsError("existing admission identity differs from retry")
+    requested = tuple(sorted(str(item) for item in (params.get("scopes") or ())))
+    if mode in _MANUAL_MODES and tuple(admission.get("scope_ids") or ()) != requested:
+        raise OperationsError("existing admission scopes differ from retry")
+    replay_sources = params.get("replay_sources", {}) if mode == "replay" else {}
+    if admission.get("replay_sources") != replay_sources:
+        raise OperationsError("existing admission replay sources differ from retry")
+    return dict(admission_ref)
 
 
 def _iso_utc(value: object, field: str) -> str:
@@ -526,6 +600,19 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
         dag_run = context.get("dag_run")
         if (getattr(dag_run, "conf", None) or {}).get("espn_parent") is not None:
             raise OperationsError("manual ESPN mode forbids isolated daily parent")
+    root = _join_uri(_artifact_root(), "runs", _run_key(dag_id, run_id))
+    admission_uri = _join_uri(root, "admission.json")
+    existing_ref = _replay_existing_admission(
+        admission_uri=admission_uri,
+        mode=mode,
+        dag_id=dag_id,
+        run_id=run_id,
+        logical_date=logical_date,
+        parent=parent,
+        context=context,
+    )
+    if existing_ref is not None:
+        return existing_ref
     store = PostgresEspnControlStore.from_env()
     store.migrate()
     registry, discovery = _load_discovered_registry(now=store.current_time())
@@ -545,7 +632,6 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
         scopes = _selected_scopes(registry, mode, context.get("params") or {})
     if not scopes:
         raise OperationsError("ESPN registry has no admitted scopes")
-    root = _join_uri(_artifact_root(), "runs", _run_key(dag_id, run_id))
     payload = {
         "kind": "espn-airflow-admission-v2",
         "schema_version": 2,
@@ -573,9 +659,7 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
             else {}
         ),
     }
-    return _write_payload(
-        _join_uri(root, "admission.json"), payload, immutable=True
-    )
+    return _write_payload(admission_uri, payload, immutable=True)
 
 
 def _load_registry_ref(admission: Mapping[str, Any]) -> Registry:
@@ -757,7 +841,7 @@ def acquire_scope_leases(
 ) -> dict[str, Any]:
     """Atomically own the admitted scope bundle before reading any head."""
 
-    admission = _read_ref(admission_ref, kind="espn-airflow-admission-v2")
+    admission = _read_admission_ref(admission_ref)
     dag_id, run_id, _ = _run_identity(context)
     if run_id != admission["run_id"]:
         raise OperationsError("lease owner run differs from admission")
@@ -839,9 +923,7 @@ def build_signed_scope_plans(
         "espn-lease-acquisition-v2",
     }:
         raise OperationsError("lease acquisition artifact kind is invalid")
-    admission = _read_ref(
-        acquisition["admission_ref"], kind="espn-airflow-admission-v2"
-    )
+    admission = _read_admission_ref(acquisition["admission_ref"])
     registry = _load_registry_ref(admission)
     store = PostgresEspnControlStore.from_env()
     expected_owner = (
@@ -3429,8 +3511,9 @@ def record_health_metrics(
                 _run_key(dag_id, run_id),
                 "admission.json",
             ),
-            kind="espn-airflow-admission-v2",
         )
+        if admission is not None:
+            admission = _admission_payload(admission)
         index = (
             None
             if admission is None
@@ -3691,7 +3774,7 @@ def propagate_terminal_failure(
     attempt = _attempt(context)
     root = _join_uri(_artifact_root(), "runs", _run_key(dag_id, run_id))
     admission_ref = _ref_for_uri(_join_uri(root, "admission.json"))
-    admission = _read_ref(admission_ref, kind="espn-airflow-admission-v2")
+    admission = _read_admission_ref(admission_ref)
     plan_index_ref = _ref_for_uri(_join_uri(root, "plan-index.json"))
     index = _read_ref(plan_index_ref, kind="espn-plan-index-v1")
     durable_ref = _ref_for_uri(_join_uri(root, "durable-run-manifest.json"))
