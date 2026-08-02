@@ -646,7 +646,7 @@ def reduce_raw_checkpoints(
         if descriptor_identity != actual:
             raise OperationsError("raw batch descriptor identity mismatch")
         actual_requests = sorted(request["request_id"] for request in item["requests"])
-        if actual_requests != descriptor["request_ids"]:
+        if actual_requests != sorted(descriptor["request_ids"]):
             raise OperationsError("raw checkpoint request set mismatch")
         actual_events = sorted(
             request["event_id"]

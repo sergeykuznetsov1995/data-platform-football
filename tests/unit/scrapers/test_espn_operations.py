@@ -963,6 +963,48 @@ def test_raw_checkpoint_reducer_is_deterministic_and_rejects_stale_identity():
         )
 
 
+def test_raw_checkpoint_reducer_accepts_mixed_width_summary_event_ids():
+    event_ids = (762134, 401861299)
+    descriptor = seal_raw_batch_descriptor(
+        endpoint="summary",
+        run_id="run-mixed-width",
+        attempt=1,
+        scope_id="700:2026",
+        plan_signature="a" * 64,
+        batch_id="summary-mixed-width",
+        request_ids=tuple(f"summary:{event_id}" for event_id in event_ids),
+        event_ids=event_ids,
+    )
+    checkpoint = seal_raw_checkpoint(
+        endpoint="summary",
+        run_id="run-mixed-width",
+        attempt=1,
+        scope_id="700:2026",
+        plan_signature="a" * 64,
+        batch_id="summary-mixed-width",
+        requests=tuple(
+            _raw_request(
+                f"summary:{event_id}", "summary", event_id=event_id
+            )
+            for event_id in event_ids
+        ),
+    )
+
+    manifest = reduce_raw_checkpoints(
+        run_id="run-mixed-width",
+        attempt=1,
+        mode="backfill",
+        as_of="2026-08-02",
+        registry_signature="d" * 64,
+        plan_signature="a" * 64,
+        selected_scopes=("700:2026",),
+        expected_batches=(descriptor,),
+        checkpoints=(checkpoint,),
+    )
+
+    assert manifest["checkpoints"][0]["requests"] == checkpoint["requests"]
+
+
 def test_shared_request_permit_survives_task_client_recreation():
     gate = MemoryRequestPermitStore(requests_per_minute=30)
     now = datetime(2026, 7, 31, 12, tzinfo=UTC)

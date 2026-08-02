@@ -1649,7 +1649,7 @@ def _resume_checkpoint(uri: str, expected: Mapping[str, Any]) -> dict[str, str] 
         expected["scope_id"],
         expected["plan_signature"],
         expected["batch_id"],
-        expected["request_ids"],
+        sorted(expected["request_ids"]),
     )
     if identity != expected_identity:
         raise OperationsError("existing raw checkpoint identity mismatch")
@@ -1730,7 +1730,9 @@ def _seal_completed_batch(
     expected: Mapping[str, Any],
     requests: Sequence[Mapping[str, Any]],
 ) -> dict[str, str]:
-    if sorted(item["request_id"] for item in requests) != expected["request_ids"]:
+    if sorted(item["request_id"] for item in requests) != sorted(
+        expected["request_ids"]
+    ):
         raise OperationsError("raw request checkpoints do not match signed batch")
     checkpoint = seal_raw_checkpoint(
         endpoint=expected["endpoint"],
@@ -1762,7 +1764,9 @@ def fetch_scoreboard_batch(
         mode=runner._effective_mode(loaded),
     )
     expected = descriptor["expected_scoreboard_batch"]
-    if sorted(item.request_id for item in requests) != expected["request_ids"]:
+    if sorted(item.request_id for item in requests) != sorted(
+        expected["request_ids"]
+    ):
         raise OperationsError("scoreboard request plan drift")
     checkpoint_ref = _resume_checkpoint(
         descriptor["scoreboard_checkpoint_uri"], expected

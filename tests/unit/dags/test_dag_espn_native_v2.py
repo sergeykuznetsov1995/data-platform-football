@@ -4099,12 +4099,13 @@ def _artifact_ref(artifacts, uri, payload):
     return {"uri": uri, "sha256": hashlib.sha256(body).hexdigest()}
 
 
-def test_summary_mapped_retry_resumes_only_missing_exact_request(monkeypatch):
+def test_summary_mapped_retry_resumes_mixed_width_exact_requests(monkeypatch):
     from dags.utils import espn_native_tasks
 
     artifacts = {}
+    event_ids = (762134, 762135, 401861299)
     expected = espn_native_tasks.make_summary_batches(
-        (101, 102, 103),
+        event_ids,
         run_id="run-current",
         attempt=2,
         scope_id="700:2026",
@@ -4135,7 +4136,7 @@ def test_summary_mapped_retry_resumes_only_missing_exact_request(monkeypatch):
             nonlocal failed
             event_id = params["event"]
             calls.append((event_id, kwargs["force_refresh"]))
-            if event_id == 103 and not failed:
+            if event_id == 401861299 and not failed:
                 failed = True
                 raise RuntimeError("late request failed")
             return SimpleNamespace(event_id=event_id)
@@ -4193,9 +4194,16 @@ def test_summary_mapped_retry_resumes_only_missing_exact_request(monkeypatch):
     assert len([uri for uri in artifacts if "-requests/" in uri]) == 2
 
     result = espn_native_tasks.fetch_summary_batch(summary_batch_ref=batch_ref)
+    resumed = espn_native_tasks.fetch_summary_batch(summary_batch_ref=batch_ref)
 
-    assert calls == [(101, True), (102, True), (103, True), (103, True)]
+    assert calls == [
+        (762134, True),
+        (762135, True),
+        (401861299, True),
+        (401861299, True),
+    ]
     assert result["summary_phase_ref"]["uri"].endswith(".phase.json")
+    assert resumed == result
 
 
 def test_scoreboard_mapped_retry_resumes_only_missing_exact_request(monkeypatch):
