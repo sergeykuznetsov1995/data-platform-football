@@ -1016,7 +1016,7 @@ def parse_events(
     occupied_source_ids = set(raw_source_ids)
     rows: list[dict[str, Any]] = []
     seen_source_ids: set[int] = set()
-    seen_team_event_ids: set[tuple[Optional[int], int]] = set()
+    seen_records: set[tuple[int, Optional[int], int]] = set()
     identity = _identity_fields(scope, _required_int(game_id, "game_id"), game)
     for index, event in enumerate(raw_events):
         if not isinstance(event, Mapping):
@@ -1057,13 +1057,23 @@ def parse_events(
                 f"Duplicate technical event id {source_event_id} in game {game_id}"
             )
         seen_source_ids.add(source_event_id)
-        team_event_key = (team_id, team_event_id)
-        if team_event_key in seen_team_event_ids:
+        # ``(teamId, eventId)`` alone is not an identity: it is a per-team
+        # counter that the feed reuses for genuinely distinct actions.  Game
+        # 1901279 files a Save by one player and a BallRecovery by another under
+        # ``(75, 838)`` -- each with its own Opta ``id`` -- and rejecting the
+        # repeat discarded the whole match and deadlocked the backfill (#1080).
+        #
+        # The record is the counter *plus* the Opta ``id``.  A repeat of that
+        # triple is one source record delivered twice, which stays fatal; it is
+        # also the only case where the surrogate below would have to fall back
+        # to a positional salt, so refusing it keeps every minted id derived
+        # from stable inputs.
+        record_key = (opta_event_id, team_id, team_event_id)
+        if record_key in seen_records:
             raise WhoScoredParseError(
-                "Duplicate team-local event identity "
-                f"{team_event_key!r} in game {game_id}"
+                f"Duplicate source event record {record_key!r} in game {game_id}"
             )
-        seen_team_event_ids.add(team_event_key)
+        seen_records.add(record_key)
         player_id = _optional_int(event.get("playerId"), f"events[{index}].playerId")
         qualifiers = event.get("qualifiers")
         if qualifiers is None:
