@@ -46,6 +46,7 @@ from scrapers.espn.runner import (
     is_full_reconciliation_day,
     scope_snapshot_bytes,
     stage,
+    summary_refresh_event_ids,
 )
 from scrapers.espn.transport_contracts import (
     EndpointType,
@@ -355,6 +356,42 @@ def _prior_generation(
     )
 
 
+@pytest.mark.unit
+def test_unchanged_final_event_reuses_prior_summary():
+    competition, edition = _competition()
+    prior = _prior_generation(competition, edition)
+
+    assert summary_refresh_event_ids(prior.schedule, prior) == ()
+
+
+@pytest.mark.unit
+def test_changed_or_new_final_event_refreshes_summary():
+    competition, edition = _competition()
+    prior = _prior_generation(competition, edition)
+    event = prior.schedule[0]
+    changed = replace(event, home_score=9)
+    missing_summary = ScopeGeneration(
+        **{
+            **prior.constructor_values(),
+            "planned_request_ids": (prior.raw_ledger[0].request_id,),
+            "raw_ledger": (prior.raw_ledger[0],),
+        }
+    )
+    missing_disposition = ScopeGeneration(
+        **{
+            **prior.constructor_values(),
+            "dispositions": tuple(
+                item for item in prior.dispositions if item.endpoint != "lineup"
+            ),
+        }
+    )
+
+    assert summary_refresh_event_ids((changed,), prior) == (changed.event_id,)
+    assert summary_refresh_event_ids((event,), None) == (event.event_id,)
+    assert summary_refresh_event_ids((event,), missing_summary) == (event.event_id,)
+    assert summary_refresh_event_ids((event,), missing_disposition) == (event.event_id,)
+
+
 def _plan(
     tmp_path: Path,
     mode: str,
@@ -622,6 +659,37 @@ def test_initial_capture_fetches_full_calendar_and_one_summary_for_both_entities
 
 
 @pytest.mark.unit
+def test_initial_identity_valid_empty_scoreboard_publishes_complete_generation(
+    tmp_path,
+):
+    competition, edition = _competition()
+    options, _ = _plan(tmp_path, "daily", ((competition, edition),))
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store,
+        {competition.slug: _scoreboard(competition, edition, event_ids=())},
+    )
+    repository = FakeRepository()
+
+    result = execute(
+        options,
+        repository=repository,
+        raw_store=raw_store,
+        http_client=client,
+    )
+
+    assert result.exit_code == 0
+    generation = repository.generations[0]
+    assert generation.schedule == ()
+    assert generation.lineup == generation.matchsheet == generation.dispositions == ()
+    assert len(generation.raw_ledger) == 1
+    assert generation.raw_ledger[0].endpoint == "scoreboard"
+    assert generation.raw_ledger[0].event_ids == ()
+    assert validate_scope_generation(generation).passed
+    assert all(call[1] is not EndpointType.SUMMARY for call in client.calls)
+
+
+@pytest.mark.unit
 def test_initial_capture_splits_calendar_longer_than_supported_scoreboard_window():
     from scrapers.espn import runner
 
@@ -736,6 +804,45 @@ def test_daily_window_known_nonterminal_and_sha256_full_shard_are_deterministic(
         int(hashlib.sha256(scope_id.encode()).hexdigest(), 16) % 7
         == days[0].toordinal() % 7
     )
+
+
+@pytest.mark.unit
+def test_unchanged_final_event_reuses_prior_summary_during_execution(tmp_path):
+    competition, edition = _competition()
+    prior = _prior_generation(competition, edition)
+    scope_id = competition.scope_id(edition)
+    as_of = date(2020, 9, 20)
+    while is_full_reconciliation_day(scope_id, as_of):
+        as_of += timedelta(days=1)
+    options, _ = _plan(
+        tmp_path,
+        "daily",
+        ((competition, edition),),
+        as_of=as_of,
+        initial_capture=False,
+        priors={scope_id: prior},
+    )
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store,
+        {competition.slug: _scoreboard(competition, edition)},
+    )
+    repository = FakeRepository()
+
+    result = execute(
+        options, repository=repository, raw_store=raw_store, http_client=client
+    )
+
+    assert result.exit_code == 0
+    generation = repository.generations[0]
+    assert all(call[1] is not EndpointType.SUMMARY for call in client.calls)
+    assert generation.lineup == prior.lineup
+    assert generation.matchsheet == prior.matchsheet
+    assert generation.dispositions == prior.dispositions
+    assert tuple(
+        item for item in generation.raw_ledger if item.endpoint == "summary"
+    ) == tuple(item for item in prior.raw_ledger if item.endpoint == "summary")
+    assert validate_scope_generation(generation).passed
 
 
 @pytest.mark.unit
@@ -1010,7 +1117,7 @@ def test_clean_noop_requires_bound_prior_complete_identity(tmp_path, monkeypatch
 
 
 @pytest.mark.unit
-def test_empty_initial_scope_fails_but_good_scope_publishes_independently(tmp_path):
+def test_empty_initial_scope_and_good_scope_publish_independently(tmp_path):
     first, first_edition = _competition(730, "ita.1")
     second, second_edition = _competition(731, "eng.1")
     options, _ = _plan(
@@ -1037,13 +1144,14 @@ def test_empty_initial_scope_fails_but_good_scope_publishes_independently(tmp_pa
         options, repository=repository, raw_store=raw_store, http_client=client
     )
 
-    assert result.exit_code != 0
+    assert result.exit_code == 0
     assert [item.plan.scope_id for item in repository.generations] == [
-        first.scope_id(first_edition)
+        first.scope_id(first_edition),
+        second.scope_id(second_edition),
     ]
     states = {item["scope_id"]: item["state"] for item in result.payload["scopes"]}
     assert states[first.scope_id(first_edition)] == "complete"
-    assert states[second.scope_id(second_edition)] == "incomplete"
+    assert states[second.scope_id(second_edition)] == "complete"
 
 
 @pytest.mark.unit

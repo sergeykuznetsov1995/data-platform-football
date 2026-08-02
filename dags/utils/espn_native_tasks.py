@@ -1916,9 +1916,12 @@ def plan_summary_batch_wave(
             raise OperationsError(
                 f"known non-terminal events absent from scoreboard: {missing_known}"
             )
-        event_ids = tuple(
-            sorted(row.event_id for row in fetched.values() if row.summary_required)
+        prior = (
+            runner._load_prior(typed_binding.prior, scope)
+            if typed_binding.prior is not None
+            else None
         )
+        event_ids = runner.summary_refresh_event_ids(fetched.values(), prior)
         planned = make_summary_batches(
             event_ids,
             run_id=loaded.plan.run_id,

@@ -15,7 +15,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Iterable, Mapping, Protocol, Sequence
 from urllib.parse import urlparse
 import uuid
 
@@ -1525,6 +1525,53 @@ def _summary_request_id(event_id: int) -> str:
     return f"summary:{event_id}"
 
 
+def summary_refresh_event_ids(
+    events: Iterable[ScheduleRow], prior: ScopeGeneration | None
+) -> tuple[int, ...]:
+    """Return played finals whose exact terminal Summary evidence is not reusable."""
+
+    prior_schedule = (
+        {row.event_id: row for row in prior.schedule} if prior is not None else {}
+    )
+    prior_summary_states: dict[int, list[DispositionState]] = {}
+    prior_dispositions: dict[tuple[str, int], list[DispositionState]] = {}
+    if prior is not None:
+        for record in prior.raw_ledger:
+            if record.endpoint == "summary" and record.event_id is not None:
+                prior_summary_states.setdefault(record.event_id, []).append(
+                    record.disposition
+                )
+        for disposition in prior.dispositions:
+            if (
+                disposition.endpoint in {"lineup", "matchsheet"}
+                and disposition.event_id is not None
+            ):
+                prior_dispositions.setdefault(
+                    (disposition.endpoint, disposition.event_id), []
+                ).append(disposition.state)
+
+    terminal = {DispositionState.CAPTURED, DispositionState.VALID_EMPTY}
+    refresh: set[int] = set()
+    for event in events:
+        if not event.played_final:
+            continue
+        event_id = event.event_id
+        prior_event = prior_schedule.get(event_id)
+        dispositions_are_terminal = all(
+            len(states := prior_dispositions.get((entity, event_id), [])) == 1
+            and states[0] in terminal
+            for entity in ("lineup", "matchsheet")
+        )
+        if (
+            prior_event is None
+            or prior_event != event
+            or prior_summary_states.get(event_id) != [DispositionState.CAPTURED]
+            or not dispositions_are_terminal
+        ):
+            refresh.add(event_id)
+    return tuple(sorted(refresh))
+
+
 def _summary_capture(
     event: ScheduleRow,
     *,
@@ -1792,11 +1839,8 @@ def _execute_scope(
             f"known non-terminal events absent from scoreboard: {missing_known}"
         )
     full = _full_strategy(scope, binding, mode, loaded.plan.as_of)
-    if not fetched_by_event:
-        if full or prior is None:
-            raise ScopeIncompleteError(
-                "active full/initial schedule is unexplained empty"
-            )
+    if not fetched_by_event and not full:
+        assert prior is not None
         return {
             "scope_id": scope.scope_id,
             "state": "noop",
@@ -1819,9 +1863,16 @@ def _execute_scope(
         sorted(schedule_by_event.values(), key=lambda row: (row.kickoff, row.event_id))
     )
 
+    refresh_event_ids = set(
+        summary_refresh_event_ids(fetched_by_event.values(), prior)
+    )
     eligible = tuple(
         sorted(
-            (row for row in fetched_by_event.values() if row.summary_required),
+            (
+                row
+                for row in fetched_by_event.values()
+                if row.event_id in refresh_event_ids
+            ),
             key=lambda row: row.event_id,
         )
     )
@@ -1868,20 +1919,26 @@ def _execute_scope(
     prior_lineup = prior.lineup if prior is not None else ()
     prior_matchsheet = prior.matchsheet if prior is not None else ()
     prior_dispositions = prior.dispositions if prior is not None else ()
+    retained_summary_event_ids = {
+        event_id
+        for event_id, event in schedule_by_event.items()
+        if event_id not in refresh_event_ids
+        and (event_id not in fetched_event_ids or event.played_final)
+    }
     lineup = [
         row
         for row in prior_lineup
-        if row.event_id in schedule_by_event and row.event_id not in fetched_event_ids
+        if row.event_id in retained_summary_event_ids
     ]
     matchsheet = [
         row
         for row in prior_matchsheet
-        if row.event_id in schedule_by_event and row.event_id not in fetched_event_ids
+        if row.event_id in retained_summary_event_ids
     ]
     dispositions = [
         item
         for item in prior_dispositions
-        if item.event_id in schedule_by_event and item.event_id not in fetched_event_ids
+        if item.event_id in retained_summary_event_ids
     ]
     summary_ledger: list[RawLedgerRecord] = []
     if prior is not None:
@@ -1889,8 +1946,7 @@ def _execute_scope(
             item
             for item in prior.raw_ledger
             if item.endpoint == "summary"
-            and item.event_id in schedule_by_event
-            and item.event_id not in fetched_event_ids
+            and item.event_id in retained_summary_event_ids
         )
     for event in eligible:
         record = raw_index[_summary_request_id(event.event_id)]

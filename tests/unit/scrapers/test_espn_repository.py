@@ -477,6 +477,71 @@ def test_exact_scope_dq_accepts_parsed_fixture_and_binds_hashes():
 
 
 @pytest.mark.unit
+def test_valid_empty_scoreboard_requires_complete_exact_raw_evidence():
+    generation = _generation()
+    scoreboard = RawLedgerRecord(
+        **{**generation.raw_ledger[0].constructor_values(), "event_ids": ()}
+    )
+    valid_empty = ScopeGeneration(
+        **{
+            **generation.constructor_values(),
+            "schedule": (),
+            "lineup": (),
+            "matchsheet": (),
+            "planned_request_ids": (scoreboard.request_id,),
+            "raw_ledger": (scoreboard,),
+            "dispositions": (),
+        }
+    )
+
+    assert validate_scope_generation(valid_empty).passed
+
+    without_scoreboard = ScopeGeneration(
+        **{
+            **valid_empty.constructor_values(),
+            "planned_request_ids": (),
+            "raw_ledger": (),
+        }
+    )
+    report = validate_scope_generation(without_scoreboard)
+    assert not report.passed
+    assert "successful scoreboard raw evidence" in " ".join(report.failures)
+
+
+@pytest.mark.unit
+def test_valid_empty_scoreboard_rejects_summary_or_disposition_rows():
+    generation = _generation()
+    scoreboard = RawLedgerRecord(
+        **{**generation.raw_ledger[0].constructor_values(), "event_ids": ()}
+    )
+    summary = generation.raw_ledger[1]
+    disposition = generation.dispositions[0]
+
+    with_summary = ScopeGeneration(
+        **{
+            **generation.constructor_values(),
+            "schedule": (),
+            "lineup": (),
+            "matchsheet": (),
+            "planned_request_ids": (scoreboard.request_id, summary.request_id),
+            "raw_ledger": (scoreboard, summary),
+            "dispositions": (),
+        }
+    )
+    with_disposition = ScopeGeneration(
+        **{
+            **with_summary.constructor_values(),
+            "planned_request_ids": (scoreboard.request_id,),
+            "raw_ledger": (scoreboard,),
+            "dispositions": (disposition,),
+        }
+    )
+
+    assert not validate_scope_generation(with_summary).passed
+    assert not validate_scope_generation(with_disposition).passed
+
+
+@pytest.mark.unit
 def test_scope_dq_computes_generation_signature_once(monkeypatch):
     generation = _generation()
     calls = _track_generation_signature_reads(monkeypatch)

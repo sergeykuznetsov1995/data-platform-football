@@ -1058,12 +1058,39 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
             or row.summary_required != row.played_final
         ):
             failures.append("schedule status flag invariant violated")
+    scoreboard_records = tuple(
+        item for item in generation.raw_ledger if item.endpoint == "scoreboard"
+    )
     if not generation.schedule:
-        failures.append("schedule is required and must not be empty")
+        ledger_complete = (
+            len(set(planned)) == len(planned)
+            and len(set(observed)) == len(observed)
+            and set(planned) == set(observed)
+            and all(
+                item.disposition is DispositionState.CAPTURED
+                for item in generation.raw_ledger
+            )
+        )
+        empty_schedule_has_exact_evidence = (
+            bool(scoreboard_records)
+            and all(
+                item.disposition is DispositionState.CAPTURED and not item.event_ids
+                for item in scoreboard_records
+            )
+            and ledger_complete
+            and not any(
+                item.endpoint == "summary" for item in generation.raw_ledger
+            )
+            and not generation.dispositions
+        )
+        if not empty_schedule_has_exact_evidence:
+            failures.append(
+                "empty schedule requires complete successful scoreboard raw evidence "
+                "and no Summary/disposition rows"
+            )
     scoreboard_event_ids = [
         event_id
-        for item in generation.raw_ledger
-        if item.endpoint == "scoreboard"
+        for item in scoreboard_records
         for event_id in item.event_ids
     ]
     if set(scoreboard_event_ids) != set(schedule_by_event) or len(

@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
+from math import ceil
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -1028,6 +1029,40 @@ def test_daily_bootstrap_never_skips_the_first_failed_scope():
     target, selected, bootstrap = _bounded_daily_scopes(registry, {})
 
     assert selected == bootstrap == target[:10]
+
+
+def test_exact_181_scope_fixture_bounds_reconciliation_summary_map():
+    from scrapers.espn.discovery import CatalogSnapshot
+    from scrapers.espn.registry import (
+        DEFAULT_REGISTRY_PATH,
+        build_discovered_male_registry,
+        load_registry,
+    )
+    from scrapers.espn.runner import is_full_reconciliation_day
+
+    snapshot = CatalogSnapshot.from_dict(
+        json.loads(
+            (ROOT / "tests/fixtures/espn/catalog_2026-07-31.json").read_text()
+        )
+    )
+    registry = build_discovered_male_registry(
+        snapshot,
+        legacy_registry=load_registry(DEFAULT_REGISTRY_PATH),
+    )
+    scope_ids = _scope_ids(registry)
+    days = tuple(date(2026, 7, 31) + timedelta(days=offset) for offset in range(7))
+    reconciliation_groups = {
+        day: tuple(
+            scope_id
+            for scope_id in scope_ids
+            if is_full_reconciliation_day(scope_id, day)
+        )
+        for day in days
+    }
+
+    assert len(scope_ids) == sum(map(len, reconciliation_groups.values())) == 181
+    assert max(map(len, reconciliation_groups.values())) == 35
+    assert 35 * ceil(1000 / 50) + 10 * ceil(1000 / 50) == 900 < 1024
 
 
 def test_daily_admission_v2_persists_exact_discovery_and_coverage(monkeypatch):
