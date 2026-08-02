@@ -192,6 +192,7 @@ def _seed_full_event_referee(
     event_id: int,
     referee_id: int,
     freshness_key: str = FRESHNESS,
+    referee_slug: str | None = None,
 ) -> None:
     target = PayloadTarget(
         source_tournament_id=str(TOURNAMENT_ID),
@@ -201,11 +202,14 @@ def _seed_full_event_referee(
         endpoint="event",
         freshness_key=freshness_key,
     )
+    referee: dict = {"id": referee_id, "name": f"Referee {referee_id}"}
+    if referee_slug is not None:
+        referee["slug"] = referee_slug
     payload = {
         "event": {
             "id": event_id,
             "season": {"id": SEASON_ID},
-            "referee": {"id": referee_id, "name": f"Referee {referee_id}"},
+            "referee": referee,
         }
     }
     store.store_bytes(
@@ -666,6 +670,94 @@ def test_planner_expands_squads_and_referees_from_stored_evidence(tmp_path):
         for spec in plan.specs
         if spec.key.endpoint == "referee_profile"
     ] == ["900"]
+
+
+@pytest.mark.unit
+def test_referee_profile_accepts_the_sources_own_canonicalised_id():
+    # ``/referee/786094`` answers 200 with the merged profile 774129, carrying
+    # the slug the source itself embeds as 786094 in its event pages (#1081).
+    canonicalised = {"referee": {"id": 774129, "slug": "benoit-millot"}}
+    with_evidence = build_referee_profile_spec(
+        referee_id=786094,
+        expected_slugs=("benoit-millot",),
+        **_common(),
+    )
+    without_evidence = build_referee_profile_spec(referee_id=786094, **_common())
+
+    assert with_evidence.schema_validator(canonicalised) is True
+    # No slug evidence leaves the strict id check as the only guard there is.
+    assert without_evidence.schema_validator(canonicalised) is False
+    # The alias never becomes the target: we still asked 786094 and file it there.
+    assert with_evidence.key.target_id == "786094"
+    assert with_evidence.url.endswith("/referee/786094")
+
+
+@pytest.mark.unit
+def test_referee_profile_still_rejects_another_referees_page():
+    spec = build_referee_profile_spec(
+        referee_id=786094,
+        expected_slugs=("benoit-millot",),
+        **_common(),
+    )
+
+    # A proxy handing us somebody else's page carries somebody else's slug.
+    assert (
+        spec.schema_validator({"referee": {"id": 52599, "slug": "clement-turpin"}})
+        is False
+    )
+    # A foreign id with no slug at all proves nothing and stays rejected.
+    assert spec.schema_validator({"referee": {"id": 774129}}) is False
+    assert spec.schema_validator({"referee": {"id": 786094}}) is True
+    assert spec.schema_validator({"referee": None}) is True
+    assert spec.schema_validator({"other": 1}) is False
+
+
+@pytest.mark.unit
+def test_stored_canonicalised_referee_profile_does_not_abort_planning(tmp_path):
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="last", page=0, **_common()),
+        _schedule_payload([14000001], has_next=False),
+    )
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="next", page=0, **_common()),
+        _schedule_payload([], has_next=False),
+    )
+    _seed_full_event_referee(
+        raw_store,
+        event_id=14000001,
+        referee_id=786094,
+        freshness_key="event-final-v2",
+        referee_slug="benoit-millot",
+    )
+    _seed_json(
+        raw_store,
+        build_referee_profile_spec(referee_id=786094, **_common()),
+        {"referee": {"id": 774129, "slug": "benoit-millot", "name": "Benoît Millot"}},
+    )
+
+    # Before #1081 this raised SeasonPlanningError and took the whole DAG down.
+    plan = plan_season_partition(
+        raw_store,
+        manifest,
+        event_freshness_key="event-final-v2",
+        **_common(),
+    )
+
+    spec = next(
+        item for item in plan.specs if item.key.endpoint == "referee_profile"
+    )
+    assert plan.referee_ids == ("786094",)
+    assert spec.key.target_id == "786094"
+    assert spec.schema_validator(
+        {"referee": {"id": 774129, "slug": "benoit-millot"}}
+    ) is True
+    # The stored payload now reads as usable evidence, so it replays instead of
+    # asking the paid pool for a page the source will canonicalise again.
+    assert spec.key not in plan.missing_raw_keys
 
 
 @pytest.mark.unit

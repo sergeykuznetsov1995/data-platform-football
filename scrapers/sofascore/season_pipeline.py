@@ -504,14 +504,36 @@ def build_squad_spec(
     )
 
 
-def _referee_schema(referee_id: str):
+def _referee_slug(referee: Mapping) -> Optional[str]:
+    slug = referee.get("slug")
+    if isinstance(slug, str) and slug.strip():
+        return slug.strip()
+    return None
+
+
+def _referee_schema(referee_id: str, expected_slugs: frozenset[str]):
     def validate(payload: object) -> bool:
         if not isinstance(payload, Mapping) or "referee" not in payload:
             return False
         referee = payload.get("referee")
-        return referee is None or (
-            isinstance(referee, Mapping) and str(referee.get("id")) == referee_id
-        )
+        if referee is None:
+            return True
+        if not isinstance(referee, Mapping):
+            return False
+        if str(referee.get("id")) == referee_id:
+            return True
+        # The source canonicalises merged duplicate profiles: ``/referee/786094``
+        # answers 200 with profile 774129 -- the same Benoît Millot the source
+        # itself still embeds as 786094 in its own event pages, now carrying the
+        # merged career totals (#1081).  The id we asked for is therefore not the
+        # identity of the answer; the profile the source associates with that id
+        # is.  The source publishes that association as the slug, so accepting a
+        # canonicalised id costs nothing of the guard this check exists for: a
+        # proxy handing us some other referee's page still carries another slug
+        # and is still rejected.  Without slug evidence the strict id check is
+        # all we have and it stands unchanged.
+        slug = _referee_slug(referee)
+        return slug is not None and slug in expected_slugs
 
     return validate
 
@@ -523,6 +545,7 @@ def build_referee_profile_spec(
     referee_id: str | int,
     freshness_key: str,
     paid_proxy: bool = True,
+    expected_slugs: Sequence[str] = (),
 ) -> EndpointSpec:
     tournament, season = _source_ids(source_tournament_id, source_season_id)
     referee = _positive_id(referee_id, "referee_id")
@@ -537,7 +560,7 @@ def build_referee_profile_spec(
             freshness_key=str(freshness_key),
         ),
         url=f"{BASE_URL}{path}",
-        schema_validator=_referee_schema(referee),
+        schema_validator=_referee_schema(referee, frozenset(expected_slugs)),
         empty_predicate=lambda payload: payload["referee"] is None,
         parsers={},
         paid_proxy=paid_proxy,
@@ -666,7 +689,7 @@ def _event_referee_from_stored_page(
     source_season_id: str,
     event_id: str,
     freshness_key: str,
-) -> Optional[str]:
+) -> Optional[tuple[str, Optional[str]]]:
     target = PayloadTarget(
         source_tournament_id=source_tournament_id,
         source_season_id=source_season_id,
@@ -707,7 +730,7 @@ def _event_referee_from_stored_page(
             f"stored full event {event_id} has invalid referee evidence"
         )
     try:
-        return _positive_id(referee["id"], "referee_id")
+        return _positive_id(referee["id"], "referee_id"), _referee_slug(referee)
     except ValueError as exc:
         raise SeasonPlanningError(
             f"stored full event {event_id} has invalid referee evidence"
@@ -757,6 +780,9 @@ def plan_season_partition(
     scheduled_team_ids: set[str] = set()
     placeholder_team_ids: set[str] = set()
     embedded_referee_ids: set[str] = set()
+    # Slugs the source itself publishes for a referee id, used to recognise its
+    # own canonicalised profile without weakening the cross-talk guard (#1081).
+    referee_slugs: dict[str, set[str]] = {}
     player_universe_evidence_gaps: list[str] = []
 
     def append_key_once(keys: list[ManifestKey], key: ManifestKey) -> None:
@@ -859,13 +885,19 @@ def plan_season_partition(
                             f"schedule event {event_id} has invalid referee evidence"
                         )
                     try:
-                        embedded_referee_ids.add(
-                            _positive_id(referee["id"], "referee_id")
+                        embedded_referee_id = _positive_id(
+                            referee["id"], "referee_id"
                         )
                     except ValueError as exc:
                         raise SeasonPlanningError(
                             f"schedule event {event_id} has invalid referee evidence"
                         ) from exc
+                    embedded_referee_ids.add(embedded_referee_id)
+                    embedded_slug = _referee_slug(referee)
+                    if embedded_slug is not None:
+                        referee_slugs.setdefault(embedded_referee_id, set()).add(
+                            embedded_slug
+                        )
             if payload.get("hasNextPage") is not True:
                 break
             if page + 1 >= max_pages:
@@ -948,17 +980,24 @@ def plan_season_partition(
 
     referee_ids = set(embedded_referee_ids)
     for event_id in event_ids:
-        referee_id = _event_referee_from_stored_page(
+        evidence = _event_referee_from_stored_page(
             raw_store,
             source_tournament_id=tournament,
             source_season_id=season,
             event_id=event_id,
             freshness_key=event_freshness,
         )
-        if referee_id is not None:
+        if evidence is not None:
+            referee_id, referee_slug = evidence
             referee_ids.add(referee_id)
+            if referee_slug is not None:
+                referee_slugs.setdefault(referee_id, set()).add(referee_slug)
     for referee_id in sorted(referee_ids, key=int):
-        spec = build_referee_profile_spec(referee_id=referee_id, **common)
+        spec = build_referee_profile_spec(
+            referee_id=referee_id,
+            expected_slugs=sorted(referee_slugs.get(referee_id, ())),
+            **common,
+        )
         specs.append(spec)
         inspect(spec)
 
