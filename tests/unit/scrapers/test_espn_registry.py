@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
+import json
+from pathlib import Path
 
 import pytest
 
-from scrapers.espn.discovery import CatalogCandidate
+from scrapers.espn.discovery import CatalogCandidate, CatalogSnapshot
 from scrapers.espn.models import (
     ADMITTED_AGE_CLASSES,
     AgeClass,
@@ -17,9 +20,18 @@ from scrapers.espn.models import (
 from scrapers.espn.registry import (
     DEFAULT_REGISTRY_PATH,
     RegistryError,
+    build_discovered_male_registry,
     load_registry,
     promote_candidate,
     validate_registry_document,
+)
+
+
+FIXTURE = (
+    Path(__file__).resolve().parents[2]
+    / "fixtures"
+    / "espn"
+    / "catalog_2026-07-31.json"
 )
 
 
@@ -62,6 +74,137 @@ def _document() -> dict:
     }
 
 
+def _male_candidate() -> CatalogCandidate:
+    return CatalogCandidate(
+        espn_id=775,
+        slug="uefa.champions",
+        name="UEFA Champions League",
+        group="Europe",
+        source_order=2,
+        gender=Gender.MALE,
+        source_season_year=2026,
+        edition_display_name="2026-27 UEFA Champions League",
+        start_date="2026-07-01",
+        end_date="2027-06-30",
+        capabilities=EntityCapabilities(
+            CapabilityState.UNKNOWN,
+            CapabilityState.UNKNOWN,
+            CapabilityState.UNKNOWN,
+        ),
+        gender_evidence=("detail.gender=MALE",),
+    )
+
+
+@pytest.mark.unit
+def test_generated_registry_contains_every_and_only_explicit_male_fixture() -> None:
+    snapshot = CatalogSnapshot.from_dict(json.loads(FIXTURE.read_text()))
+    generated = build_discovered_male_registry(
+        snapshot,
+        legacy_registry=load_registry(DEFAULT_REGISTRY_PATH),
+    )
+    expected = {
+        (row.espn_id, row.slug, row.source_season_year)
+        for row in snapshot.candidates
+        if row.gender is Gender.MALE
+    }
+
+    assert len(expected) == 181
+    assert {
+        (row.espn_id, row.slug, row.current_edition.source_season_year)
+        for row in generated.promoted
+    } == expected
+    assert all(row.gender is Gender.MALE for row in generated.promoted)
+
+
+@pytest.mark.unit
+def test_generated_registry_preserves_only_known_legacy_aliases() -> None:
+    generated = build_discovered_male_registry(
+        CatalogSnapshot.from_dict(json.loads(FIXTURE.read_text())),
+        legacy_registry=load_registry(DEFAULT_REGISTRY_PATH),
+    )
+
+    assert sum(row.legacy is not None for row in generated.promoted) == 9
+    assert generated.by_id[700].legacy.league == "ENG-Premier League"
+    assert generated.by_id[775].legacy is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("espn_id", None),
+        ("gender_evidence", ()),
+        ("source_season_year", None),
+        ("start_date", None),
+        ("end_date", None),
+    ],
+)
+def test_explicit_male_with_incomplete_identity_fails_closed(field, value) -> None:
+    candidate = replace(_male_candidate(), **{field: value})
+
+    with pytest.raises(RegistryError, match="explicit MALE candidate"):
+        build_discovered_male_registry(
+            CatalogSnapshot("2026-08-02T00:00:00+00:00", (candidate,)),
+            legacy_registry=load_registry(DEFAULT_REGISTRY_PATH),
+        )
+
+
+@pytest.mark.unit
+def test_generated_registry_retains_same_year_prior_contract() -> None:
+    prior = validate_registry_document(_document())
+    candidate = replace(
+        _male_candidate(),
+        espn_id=700,
+        slug="eng.1",
+        name="English Premier League",
+        source_season_year=2026,
+        edition_display_name="changed ESPN display name",
+        start_date="2026-01-01",
+        end_date="2026-12-31",
+    )
+
+    generated = build_discovered_male_registry(
+        CatalogSnapshot("2026-08-02T00:00:00+00:00", (candidate,)),
+        legacy_registry=prior,
+        previous_registry=prior,
+    )
+
+    competition = generated.by_id[700]
+    assert competition.age_class is AgeClass.SENIOR
+    assert competition.legacy == prior.by_id[700].legacy
+    assert competition.current_edition == prior.by_id[700].current_edition
+
+
+@pytest.mark.unit
+def test_generated_registry_rollover_preserves_prior_editions() -> None:
+    prior = validate_registry_document(_document())
+    candidate = replace(
+        _male_candidate(),
+        espn_id=700,
+        slug="eng.1",
+        name="English Premier League",
+        source_season_year=2027,
+        edition_display_name="2027-28 English Premier League",
+        start_date="2027-06-01",
+        end_date="2028-06-01",
+    )
+
+    generated = build_discovered_male_registry(
+        CatalogSnapshot("2026-08-02T00:00:00+00:00", (candidate,)),
+        legacy_registry=prior,
+        previous_registry=prior,
+    )
+
+    competition = generated.by_id[700]
+    assert [edition.source_season_year for edition in competition.editions] == [
+        2026,
+        2027,
+    ]
+    assert [edition.current for edition in competition.editions] == [False, True]
+    assert competition.age_class is AgeClass.SENIOR
+    assert competition.legacy == prior.by_id[700].legacy
+
+
 @pytest.mark.unit
 def test_seed_registry_preserves_all_nine_legacy_mappings() -> None:
     registry = load_registry(DEFAULT_REGISTRY_PATH)
@@ -91,10 +234,6 @@ def test_seed_registry_preserves_all_nine_legacy_mappings() -> None:
         ),
         (lambda d: d["competitions"][0].update(gender="UNKNOWN"), "explicit MALE"),
         (
-            lambda d: d["competitions"][0].update(age_class="UNKNOWN"),
-            "explicit age_class",
-        ),
-        (
             lambda d: d["competitions"][0]["editions"][0]["capabilities"].update(
                 lineup="sometimes"
             ),
@@ -122,33 +261,9 @@ def test_seed_registry_preserves_all_nine_legacy_mappings() -> None:
         ),
         (
             lambda d: d["competitions"][0]["editions"][0]["capabilities"].update(
-                lineup="unknown"
-            ),
-            "lineup capability must be explicit",
-        ),
-        (
-            lambda d: d["competitions"][0]["editions"][0]["capabilities"].update(
                 matchsheet="quarantined"
             ),
             "matchsheet capability must be explicit",
-        ),
-        (
-            lambda d: d["competitions"][0]["editions"].append(
-                {
-                    **deepcopy(d["competitions"][0]["editions"][0]),
-                    "source_season_year": 2025,
-                    "display_name": "2025-26 English Premier League",
-                    "start_date": "2025-06-01",
-                    "end_date": "2026-06-01",
-                    "current": False,
-                    "capabilities": {
-                        "schedule": "unknown",
-                        "lineup": "unknown",
-                        "matchsheet": "unknown",
-                    },
-                }
-            ),
-            "schedule capability must be proven",
         ),
     ],
 )
@@ -158,6 +273,22 @@ def test_registry_rejects_unsafe_enabled_entries(mutation, message: str) -> None
 
     with pytest.raises(RegistryError, match=message):
         validate_registry_document(document)
+
+
+@pytest.mark.unit
+def test_registry_allows_enabled_explicit_male_with_honest_unknowns() -> None:
+    document = _document()
+    row = document["competitions"][0]
+    row.update(age_class="UNKNOWN", age_class_evidence=[])
+    row["editions"][0]["capabilities"] = {
+        "schedule": "unknown",
+        "lineup": "unknown",
+        "matchsheet": "unknown",
+    }
+
+    registry = validate_registry_document(document)
+
+    assert registry.promoted[0].age_class is AgeClass.UNKNOWN
 
 
 @pytest.mark.unit

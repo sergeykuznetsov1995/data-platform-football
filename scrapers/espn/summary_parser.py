@@ -99,7 +99,11 @@ MATCHSHEET_STAT_NAME_MAP: Mapping[str, str] = MappingProxyType(
 def _valid_empty_or_fail(capability: CapabilityState, entity: str) -> EntityParseState:
     if capability is CapabilityState.PROVEN:
         raise EspnParseError(f"proven {entity} section is absent or empty")
-    if capability not in {CapabilityState.PARTIAL, CapabilityState.ABSENT}:
+    if capability not in {
+        CapabilityState.PARTIAL,
+        CapabilityState.ABSENT,
+        CapabilityState.UNKNOWN,
+    }:
         raise EspnParseError(f"{entity} capability does not permit valid_empty")
     return EntityParseState.VALID_EMPTY
 

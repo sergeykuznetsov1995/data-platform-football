@@ -1658,6 +1658,7 @@ def _disposition(
     if disposition_state is DispositionState.VALID_EMPTY and capability not in {
         CapabilityState.PARTIAL,
         CapabilityState.ABSENT,
+        CapabilityState.UNKNOWN,
     }:
         raise ScopeIncompleteError(
             f"final event {event_id} has unresolved proven {entity}"

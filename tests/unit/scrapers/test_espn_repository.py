@@ -746,6 +746,43 @@ def test_valid_empty_requires_capability_and_successful_raw():
 
 
 @pytest.mark.unit
+def test_valid_empty_allows_unknown_capability() -> None:
+    generation = _generation()
+    unknown = ScopePlan(
+        **{
+            **generation.plan.to_dict(),
+            "start_date": generation.plan.start_date,
+            "end_date": generation.plan.end_date,
+            "capabilities": EntityCapabilities(
+                schedule=CapabilityState.UNKNOWN,
+                lineup=CapabilityState.UNKNOWN,
+                matchsheet=CapabilityState.UNKNOWN,
+            ),
+        }
+    )
+    dispositions = tuple(
+        RequestDisposition(
+            endpoint=entity,
+            state=DispositionState.VALID_EMPTY,
+            detail="section absent in successful Summary",
+            event_id=generation.schedule[0].event_id,
+        )
+        for entity in ("lineup", "matchsheet")
+    )
+    candidate = ScopeGeneration(
+        **{
+            **generation.constructor_values(),
+            "plan": unknown,
+            "lineup": (),
+            "matchsheet": (),
+            "dispositions": dispositions,
+        }
+    )
+
+    assert validate_scope_generation(candidate).passed
+
+
+@pytest.mark.unit
 def test_schedule_requires_exact_row_to_scoreboard_raw_binding():
     generation = _generation()
     unbound = RawLedgerRecord(

@@ -1235,6 +1235,36 @@ def test_successful_partial_absent_sections_publish_explicit_valid_empty(tmp_pat
 
 
 @pytest.mark.unit
+def test_successful_unknown_sections_publish_explicit_valid_empty(tmp_path):
+    capabilities = EntityCapabilities(
+        schedule=CapabilityState.UNKNOWN,
+        lineup=CapabilityState.UNKNOWN,
+        matchsheet=CapabilityState.UNKNOWN,
+    )
+    competition, edition = _competition(capabilities=capabilities)
+    options, _ = _plan(tmp_path, "backfill", ((competition, edition),))
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store,
+        {competition.slug: _scoreboard(competition, edition)},
+        summary_factory=_empty_summary,
+    )
+    repository = FakeRepository()
+
+    result = execute(
+        options, repository=repository, raw_store=raw_store, http_client=client
+    )
+
+    assert result.exit_code == 0
+    assert {
+        (item.endpoint, item.state) for item in repository.generations[0].dispositions
+    } == {
+        ("lineup", DispositionState.VALID_EMPTY),
+        ("matchsheet", DispositionState.VALID_EMPTY),
+    }
+
+
+@pytest.mark.unit
 def test_each_summary_payload_is_parsed_exactly_once(tmp_path, monkeypatch):
     import scrapers.espn.runner as runner_module
 

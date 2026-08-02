@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
 import yaml
 
-from .discovery import CatalogCandidate
+from .discovery import CatalogCandidate, CatalogSnapshot
 from .models import (
     ADMITTED_AGE_CLASSES,
     AgeClass,
@@ -218,16 +218,20 @@ def _competition(value: Any, index: int) -> Competition:
     if enabled:
         if gender is not Gender.MALE:
             raise RegistryError(f"{field} promotion requires explicit MALE gender")
-        if age_class not in ADMITTED_AGE_CLASSES:
-            raise RegistryError(f"{field} promotion requires explicit age_class")
         if not gender_evidence:
             raise RegistryError(f"{field} promotion requires gender evidence")
-        if not age_evidence:
+        if age_class is not AgeClass.UNKNOWN and age_class not in ADMITTED_AGE_CLASSES:
+            raise RegistryError(f"{field} promotion requires explicit age_class")
+        if age_class is not AgeClass.UNKNOWN and not age_evidence:
             raise RegistryError(f"{field} promotion requires age class evidence")
         for edition in editions:
-            if edition.capabilities.schedule is not CapabilityState.PROVEN:
+            if edition.capabilities.schedule not in {
+                CapabilityState.PROVEN,
+                CapabilityState.UNKNOWN,
+            }:
                 raise RegistryError(
-                    f"{field} schedule capability must be proven for every edition"
+                    f"{field} schedule capability must be proven or unknown "
+                    "for every edition"
                 )
             for entity in ("lineup", "matchsheet"):
                 state = getattr(edition.capabilities, entity)
@@ -235,10 +239,11 @@ def _competition(value: Any, index: int) -> Competition:
                     CapabilityState.PROVEN,
                     CapabilityState.PARTIAL,
                     CapabilityState.ABSENT,
+                    CapabilityState.UNKNOWN,
                 }:
                     raise RegistryError(
                         f"{field} {entity} capability must be explicit "
-                        "(proven, partial or absent)"
+                        "(proven, partial, absent or unknown)"
                     )
     return Competition(
         espn_id=_positive_int(value.get("espn_id"), f"{field}.espn_id"),
@@ -326,6 +331,148 @@ def load_registry(path: str | Path = DEFAULT_REGISTRY_PATH) -> Registry:
     except (OSError, yaml.YAMLError) as exc:
         raise RegistryError(f"cannot read registry {source}: {exc}") from exc
     return validate_registry_document(document)
+
+
+def _captured_date(captured_at: str) -> date:
+    if not isinstance(captured_at, str):
+        raise RegistryError("discovery captured_at must be an ISO-8601 timestamp")
+    try:
+        return datetime.fromisoformat(captured_at.replace("Z", "+00:00")).date()
+    except ValueError as exc:
+        raise RegistryError(
+            "discovery captured_at must be an ISO-8601 timestamp"
+        ) from exc
+
+
+def _validate_explicit_male_candidate(candidate: CatalogCandidate) -> None:
+    try:
+        if candidate.gender is not Gender.MALE:
+            raise ValueError("gender is not MALE")
+        _positive_int(candidate.espn_id, "espn_id")
+        _required_string(candidate.slug, "slug")
+        _required_string(candidate.name, "name")
+        if not candidate.gender_evidence:
+            raise ValueError("gender evidence is missing")
+        _positive_int(candidate.source_season_year, "source_season_year")
+        _required_string(candidate.edition_display_name, "edition_display_name")
+        _iso_date(candidate.start_date, "start_date")
+        _iso_date(candidate.end_date, "end_date")
+        if candidate.start_date > candidate.end_date:
+            raise ValueError("date window is invalid")
+    except (RegistryError, TypeError, ValueError) as exc:
+        raise RegistryError("explicit MALE candidate has incomplete identity") from exc
+
+
+def _matching_competition(
+    registry: Registry, candidate: CatalogCandidate
+) -> Competition | None:
+    by_id = registry.by_id.get(candidate.espn_id)
+    by_slug = registry.by_slug.get(candidate.slug)
+    if by_id is None and by_slug is None:
+        return None
+    if by_id is None or by_slug is None or by_id is not by_slug:
+        raise RegistryError("explicit MALE candidate identity conflicts with registry")
+    return by_id
+
+
+def _discovered_edition(candidate: CatalogCandidate) -> Edition:
+    return Edition(
+        source_season_year=candidate.source_season_year,
+        display_name=candidate.edition_display_name,
+        start_date=_iso_date(candidate.start_date, "start_date"),
+        end_date=_iso_date(candidate.end_date, "end_date"),
+        current=True,
+        capabilities=candidate.capabilities,
+    )
+
+
+def _discovered_competition(
+    candidate: CatalogCandidate,
+    overlay: Registry,
+    legacy_registry: Registry,
+) -> Competition:
+    prior = _matching_competition(overlay, candidate)
+    manual = _matching_competition(legacy_registry, candidate)
+    discovered_edition = _discovered_edition(candidate)
+    if prior is not None:
+        legacy = prior.legacy or (manual.legacy if manual is not None else None)
+        if prior.current_edition.source_season_year == candidate.source_season_year:
+            editions = prior.editions
+        else:
+            editions = tuple(
+                Edition(
+                    source_season_year=edition.source_season_year,
+                    display_name=edition.display_name,
+                    start_date=edition.start_date,
+                    end_date=edition.end_date,
+                    current=False,
+                    capabilities=edition.capabilities,
+                )
+                for edition in prior.editions
+            ) + (discovered_edition,)
+        return Competition(
+            espn_id=candidate.espn_id,
+            slug=candidate.slug,
+            name=candidate.name,
+            gender=Gender.MALE,
+            age_class=prior.age_class,
+            enabled=True,
+            editions=editions,
+            gender_evidence=candidate.gender_evidence,
+            age_class_evidence=prior.age_class_evidence,
+            legacy=legacy,
+        )
+    return Competition(
+        espn_id=candidate.espn_id,
+        slug=candidate.slug,
+        name=candidate.name,
+        gender=Gender.MALE,
+        age_class=AgeClass.UNKNOWN,
+        enabled=True,
+        editions=(discovered_edition,),
+        gender_evidence=candidate.gender_evidence,
+        age_class_evidence=(),
+        legacy=manual.legacy if manual is not None else None,
+    )
+
+
+def build_discovered_male_registry(
+    snapshot: CatalogSnapshot,
+    *,
+    legacy_registry: Registry,
+    previous_registry: Registry | None = None,
+) -> Registry:
+    """Build a deterministic enabled registry from explicit ESPN male evidence."""
+
+    if not isinstance(snapshot, CatalogSnapshot):
+        raise TypeError("snapshot must be a CatalogSnapshot")
+    if not isinstance(legacy_registry, Registry):
+        raise TypeError("legacy_registry must be a Registry")
+    if previous_registry is not None and not isinstance(previous_registry, Registry):
+        raise TypeError("previous_registry must be a Registry or None")
+    overlay = previous_registry or legacy_registry
+    rows: list[Competition] = []
+    seen_ids: set[int] = set()
+    seen_slugs: set[str] = set()
+    for candidate in snapshot.candidates:
+        if candidate.gender is not Gender.MALE:
+            continue
+        _validate_explicit_male_candidate(candidate)
+        if candidate.espn_id in seen_ids or candidate.slug in seen_slugs:
+            raise RegistryError("explicit MALE candidate identity is duplicated")
+        seen_ids.add(candidate.espn_id)
+        seen_slugs.add(candidate.slug)
+        rows.append(_discovered_competition(candidate, overlay, legacy_registry))
+    if not rows:
+        raise RegistryError("discovery contains no explicit MALE competitions")
+    if len(rows) > 300:
+        raise RegistryError("explicit MALE competition cap exceeded")
+    return Registry(
+        schema_version=SCHEMA_VERSION,
+        registry_version=f"discovery-male-{snapshot.signature()[:16]}",
+        as_of=_captured_date(snapshot.captured_at),
+        competitions=tuple(sorted(rows, key=lambda row: (row.espn_id, row.slug))),
+    )
 
 
 def _legacy_season_aliases(candidate: CatalogCandidate) -> list[str]:
@@ -465,6 +612,7 @@ __all__ = [
     "RegistryError",
     "SCHEMA_VERSION",
     "SUPPORTED_SCHEMA_VERSIONS",
+    "build_discovered_male_registry",
     "load_registry",
     "promote_candidate",
     "validate_registry_document",

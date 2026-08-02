@@ -1204,7 +1204,11 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
             if sides != {event.home_team_id, event.away_team_id}:
                 failures.append(f"{entity} two-side completeness failed for {event_id}")
         elif disposition.state is DispositionState.VALID_EMPTY:
-            if capability not in {CapabilityState.PARTIAL, CapabilityState.ABSENT}:
+            if capability not in {
+                CapabilityState.PARTIAL,
+                CapabilityState.ABSENT,
+                CapabilityState.UNKNOWN,
+            }:
                 failures.append(f"valid_empty is forbidden for proven {entity}")
             if summary_count != 1:
                 failures.append(

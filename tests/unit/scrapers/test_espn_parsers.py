@@ -612,6 +612,43 @@ def test_structurally_valid_prematch_stub_is_valid_empty_only_when_permitted() -
 
 
 @pytest.mark.unit
+def test_structurally_valid_prematch_stub_allows_unknown_capabilities() -> None:
+    competition, edition = _scope(
+        lineup=CapabilityState.UNKNOWN, matchsheet=CapabilityState.UNKNOWN
+    )
+    _, _, schedule = _schedule(
+        lineup=CapabilityState.UNKNOWN, matchsheet=CapabilityState.UNKNOWN
+    )
+    stub = {
+        "header": {
+            "id": str(schedule[0].event_id),
+            "competitions": [
+                {
+                    "date": schedule[0].kickoff.isoformat(),
+                    "competitors": [
+                        {
+                            "homeAway": "home",
+                            "team": {"id": "10", "displayName": "Home FC"},
+                        },
+                        {
+                            "homeAway": "away",
+                            "team": {"id": "20", "displayName": "Away FC"},
+                        },
+                    ],
+                }
+            ],
+        }
+    }
+
+    result = parse_summary(
+        _raw(stub), competition=competition, edition=edition, event=schedule[0]
+    )
+
+    assert result.lineup_state is EntityParseState.VALID_EMPTY
+    assert result.matchsheet_state is EntityParseState.VALID_EMPTY
+
+
+@pytest.mark.unit
 def test_conventional_xi_requires_22_unique_starters() -> None:
     competition, edition, schedule = _schedule()
     payload = _load("native_summary.json")
