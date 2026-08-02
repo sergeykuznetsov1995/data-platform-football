@@ -238,6 +238,10 @@ def _write_payload(uri: str, payload: Mapping[str, Any], *, immutable: bool = Tr
     return {"uri": uri, "sha256": hashlib.sha256(body).hexdigest()}
 
 
+def _payload_ref(uri: str, payload: Mapping[str, Any]) -> dict[str, str]:
+    return {"uri": uri, "sha256": hashlib.sha256(_canonical_bytes(payload)).hexdigest()}
+
+
 def _read_ref(ref: object, *, kind: str | None = None) -> dict[str, Any]:
     if not isinstance(ref, Mapping) or set(ref) != {"uri", "sha256"}:
         raise OperationsError("artifact reference must contain only uri and sha256")
@@ -4613,6 +4617,8 @@ def _validate_discovery_review_checkpoint(
     *,
     discovery_detail_index_ref: Mapping[str, str],
     discovery_detail_phase_refs: Sequence[Mapping[str, str]],
+    candidate_payload: Mapping[str, Any] | None = None,
+    male_registry_payload: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     required_keys = {
         "kind",
@@ -4656,7 +4662,13 @@ def _validate_discovery_review_checkpoint(
     candidate_ref = _discovery_artifact_ref(
         review["candidate_ref"], label="discovery candidate reference"
     )
-    candidate = _read_ref(candidate_ref)
+    candidate = (
+        _read_ref(candidate_ref) if candidate_payload is None else candidate_payload
+    )
+    if candidate_payload is not None and _payload_ref(
+        candidate_ref["uri"], candidate
+    ) != candidate_ref:
+        raise OperationsError("sealed discovery candidate reference mismatch")
     candidates = candidate.get("candidates")
     if not isinstance(candidates, list):
         raise OperationsError("existing discovery candidate checkpoint mismatch")
@@ -4668,13 +4680,139 @@ def _validate_discovery_review_checkpoint(
     male_registry_ref = _discovery_artifact_ref(
         review["male_registry_ref"], label="discovered male registry reference"
     )
-    male_registry = validate_registry_document(_read_ref(male_registry_ref))
+    male_registry = validate_registry_document(
+        _read_ref(male_registry_ref)
+        if male_registry_payload is None
+        else male_registry_payload
+    )
+    if male_registry_payload is not None and _payload_ref(
+        male_registry_ref["uri"], male_registry_payload
+    ) != male_registry_ref:
+        raise OperationsError("sealed discovered male registry reference mismatch")
     if review.get("male_registry_signature") != male_registry.signature():
         raise OperationsError("existing discovered male registry signature mismatch")
     if review["male_scope_count"] != len(male_registry.promoted):
         raise OperationsError("existing discovered male registry scope count mismatch")
     _discovery_observed_at(review.get("observed_at"), label="discovery observed_at")
     return review
+
+
+def _validate_discovery_reducer_checkpoint(
+    checkpoint: object,
+    *,
+    discovery_detail_index_ref: Mapping[str, str],
+    discovery_detail_phase_refs: Sequence[Mapping[str, str]],
+    candidate_uri: str,
+    male_registry_uri: str,
+    review_uri: str,
+) -> dict[str, Any]:
+    required_keys = {
+        "kind",
+        "schema_version",
+        "discovery_detail_index_ref",
+        "discovery_detail_phase_refs",
+        "candidate_payload",
+        "candidate_ref",
+        "candidate_signature",
+        "male_registry_payload",
+        "male_registry_ref",
+        "male_registry_signature",
+        "male_scope_count",
+        "review_payload",
+        "review_ref",
+        "observed_at",
+    }
+    if (
+        not isinstance(checkpoint, dict)
+        or set(checkpoint) != required_keys
+        or checkpoint.get("kind") != "espn-discovery-reducer-checkpoint-v1"
+        or checkpoint.get("schema_version") != 1
+        or checkpoint.get("discovery_detail_index_ref")
+        != discovery_detail_index_ref
+        or checkpoint.get("discovery_detail_phase_refs")
+        != list(discovery_detail_phase_refs)
+        or not isinstance(checkpoint.get("candidate_payload"), Mapping)
+        or not isinstance(checkpoint.get("male_registry_payload"), Mapping)
+        or not isinstance(checkpoint.get("review_payload"), Mapping)
+    ):
+        raise OperationsError("discovery reducer checkpoint mismatch")
+    candidate_ref = _discovery_artifact_ref(
+        checkpoint["candidate_ref"], label="sealed candidate reference"
+    )
+    male_registry_ref = _discovery_artifact_ref(
+        checkpoint["male_registry_ref"], label="sealed male registry reference"
+    )
+    review_ref = _discovery_artifact_ref(
+        checkpoint["review_ref"], label="sealed review reference"
+    )
+    if (
+        candidate_ref["uri"] != candidate_uri
+        or male_registry_ref["uri"] != male_registry_uri
+        or review_ref["uri"] != review_uri
+        or _payload_ref(candidate_uri, checkpoint["candidate_payload"])
+        != candidate_ref
+        or _payload_ref(male_registry_uri, checkpoint["male_registry_payload"])
+        != male_registry_ref
+        or _payload_ref(review_uri, checkpoint["review_payload"]) != review_ref
+    ):
+        raise OperationsError("discovery reducer checkpoint artifact binding mismatch")
+    review = _validate_discovery_review_checkpoint(
+        checkpoint["review_payload"],
+        discovery_detail_index_ref=discovery_detail_index_ref,
+        discovery_detail_phase_refs=discovery_detail_phase_refs,
+        candidate_payload=checkpoint["candidate_payload"],
+        male_registry_payload=checkpoint["male_registry_payload"],
+    )
+    if (
+        checkpoint["candidate_ref"] != review["candidate_ref"]
+        or checkpoint["candidate_signature"] != review["candidate_signature"]
+        or checkpoint["male_registry_ref"] != review["male_registry_ref"]
+        or checkpoint["male_registry_signature"]
+        != review["male_registry_signature"]
+        or checkpoint["male_scope_count"] != review["male_scope_count"]
+        or checkpoint["observed_at"] != review["observed_at"]
+    ):
+        raise OperationsError("discovery reducer checkpoint review binding mismatch")
+    return checkpoint
+
+
+def _replay_discovery_reducer_checkpoint(
+    checkpoint: object,
+    *,
+    discovery_detail_index_ref: Mapping[str, str],
+    discovery_detail_phase_refs: Sequence[Mapping[str, str]],
+    candidate_uri: str,
+    male_registry_uri: str,
+    review_uri: str,
+    latest_state_uri: str,
+) -> dict[str, Any]:
+    sealed = _validate_discovery_reducer_checkpoint(
+        checkpoint,
+        discovery_detail_index_ref=discovery_detail_index_ref,
+        discovery_detail_phase_refs=discovery_detail_phase_refs,
+        candidate_uri=candidate_uri,
+        male_registry_uri=male_registry_uri,
+        review_uri=review_uri,
+    )
+    candidate_ref = _write_payload(candidate_uri, sealed["candidate_payload"])
+    male_registry_ref = _write_payload(
+        male_registry_uri, sealed["male_registry_payload"]
+    )
+    review_ref = _write_payload(review_uri, sealed["review_payload"])
+    if (
+        candidate_ref != sealed["candidate_ref"]
+        or male_registry_ref != sealed["male_registry_ref"]
+        or review_ref != sealed["review_ref"]
+    ):
+        raise OperationsError("discovery reducer replay reference mismatch")
+    _publish_latest_discovery_state(
+        latest_state_uri,
+        _discovery_review_state(sealed["review_payload"], review_ref=review_ref),
+    )
+    return {
+        "discovery_review_ref": review_ref,
+        "male_registry_ref": male_registry_ref,
+    }
 
 
 def _publish_latest_discovery_state(
@@ -4719,12 +4857,41 @@ def publish_discovered_male_registry(
 
     dag_id, run_id, _ = _run_identity(context)
     root = _join_uri(_artifact_root(), "discovery", _run_key(dag_id, run_id))
+    candidate_uri = _join_uri(root, "candidate.json")
+    male_registry_uri = _join_uri(root, "male-registry.json")
     review_uri = _join_uri(root, "reviewable-diff.json")
+    checkpoint_uri = _join_uri(root, "reducer-checkpoint.json")
     latest_state_uri = _join_uri(_artifact_root(), "discovery", "latest-state.json")
     canonical_index_ref = _discovery_artifact_ref(
         discovery_detail_index_ref,
         label="discovery detail index reference",
     )
+    existing_checkpoint = _optional_payload(
+        checkpoint_uri, kind="espn-discovery-reducer-checkpoint-v1"
+    )
+    if existing_checkpoint is not None:
+        committed_phase_refs = existing_checkpoint.get(
+            "discovery_detail_phase_refs"
+        )
+        if not isinstance(committed_phase_refs, list) or not committed_phase_refs:
+            raise OperationsError("existing discovery reducer phase set is invalid")
+        discovery_detail_phase_refs = _exact_mapped_results(
+            discovery_detail_phase_refs,
+            expected_count=len(committed_phase_refs),
+            label="discovery detail phase",
+        )
+        canonical_phase_refs = _discovery_phase_input_refs(
+            discovery_detail_phase_refs
+        )
+        return _replay_discovery_reducer_checkpoint(
+            existing_checkpoint,
+            discovery_detail_index_ref=canonical_index_ref,
+            discovery_detail_phase_refs=canonical_phase_refs,
+            candidate_uri=candidate_uri,
+            male_registry_uri=male_registry_uri,
+            review_uri=review_uri,
+            latest_state_uri=latest_state_uri,
+        )
     existing_review = _optional_payload(review_uri)
     if existing_review is not None:
         committed_phase_refs = existing_review.get("discovery_detail_phase_refs")
@@ -4935,19 +5102,16 @@ def publish_discovered_male_registry(
     else:
         previous = _promoted_registry_baseline(current, legacy_registry)
     diff = diff_catalogs(previous, current)
-    candidate_ref = _write_payload(
-        _join_uri(root, "candidate.json"), json.loads(current.canonical_json())
-    )
+    candidate_payload = json.loads(current.canonical_json())
+    candidate_ref = _payload_ref(candidate_uri, candidate_payload)
     candidate_signature = current.signature()
     male_registry = build_discovered_male_registry(
         current,
         legacy_registry=legacy_registry,
         previous_registry=previous_registry,
     )
-    male_registry_ref = _write_payload(
-        _join_uri(root, "male-registry.json"),
-        json.loads(male_registry.canonical_json()),
-    )
+    male_registry_payload = json.loads(male_registry.canonical_json())
+    male_registry_ref = _payload_ref(male_registry_uri, male_registry_payload)
     male_registry_signature = male_registry.signature()
     male_scope_count = len(male_registry.promoted)
     observed_at = PostgresEspnControlStore.from_env().current_time()
@@ -4999,15 +5163,33 @@ def publish_discovered_male_registry(
         "promotion_performed": False,
         "observed_at": observed_at.isoformat(),
     }
-    review_ref = _write_payload(review_uri, review)
-    _publish_latest_discovery_state(
-        latest_state_uri,
-        _discovery_review_state(review, review_ref=review_ref),
-    )
-    return {
-        "discovery_review_ref": review_ref,
+    review_ref = _payload_ref(review_uri, review)
+    checkpoint = {
+        "kind": "espn-discovery-reducer-checkpoint-v1",
+        "schema_version": 1,
+        "discovery_detail_index_ref": canonical_index_ref,
+        "discovery_detail_phase_refs": canonical_phase_refs,
+        "candidate_payload": candidate_payload,
+        "candidate_ref": candidate_ref,
+        "candidate_signature": candidate_signature,
+        "male_registry_payload": male_registry_payload,
         "male_registry_ref": male_registry_ref,
+        "male_registry_signature": male_registry_signature,
+        "male_scope_count": male_scope_count,
+        "review_payload": review,
+        "review_ref": review_ref,
+        "observed_at": observed_at.isoformat(),
     }
+    _write_payload(checkpoint_uri, checkpoint)
+    return _replay_discovery_reducer_checkpoint(
+        checkpoint,
+        discovery_detail_index_ref=canonical_index_ref,
+        discovery_detail_phase_refs=canonical_phase_refs,
+        candidate_uri=candidate_uri,
+        male_registry_uri=male_registry_uri,
+        review_uri=review_uri,
+        latest_state_uri=latest_state_uri,
+    )
 
 
 # Release compatibility for callers importing the old observational reducer name.
