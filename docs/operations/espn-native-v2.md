@@ -75,8 +75,10 @@ canary и rollback используют frozen immutable discovery-state ref, к
    ```
 
    С включённой парой admission читает только этот exact state ref и никогда
-   не fallback-ит к mutable pointer. Не менять пару до окончания rollout или
-   rollback.
+   не fallback-ит к mutable pointer. Frozen ref не имеет 8-дневного срока и
+   остаётся valid, пока обе переменные атомарно не удалены или не заменены
+   новой полной парой; неполная замена fail-closed. Не менять пару до окончания
+   rollout или rollback.
 
 3. Запускать bounded bootstrap через `dag_backfill_espn`, не через daily
    owner. После каждой exact coverage reconciliation вычислить deterministic

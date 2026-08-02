@@ -60,6 +60,7 @@ def test_runbook_contracts_automatic_all_male_rollout_and_reversal():
         'state["candidate_ref"]',
         'state["male_registry_ref"]',
         '"MALE": 181, "FEMALE": 38, "UNKNOWN": 1',
+        "пока обе переменные атомарно не удалены или не заменены",
     ):
         assert required in text
 

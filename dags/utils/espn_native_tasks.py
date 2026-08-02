@@ -391,7 +391,8 @@ def _load_discovered_registry(
         raise OperationsError("discovery freshness clock must be timezone-aware")
     database_now = now.astimezone(UTC)
     try:
-        state_ref = _frozen_discovery_state_ref()
+        frozen_state_ref = _frozen_discovery_state_ref()
+        state_ref = frozen_state_ref
         if state_ref is None:
             latest_uri = _join_uri(
                 _artifact_root(), "discovery", "latest-state.json"
@@ -413,7 +414,7 @@ def _load_discovered_registry(
     observed_at = _discovery_observed_at(
         state["observed_at"], label="discovery state observed_at"
     )
-    if database_now - observed_at > DISCOVERY_MAX_AGE:
+    if frozen_state_ref is None and database_now - observed_at > DISCOVERY_MAX_AGE:
         raise OperationsError("discovery state is older than eight days")
     if observed_at - database_now > DISCOVERY_FUTURE_TOLERANCE:
         raise OperationsError("discovery state is more than five minutes in the future")

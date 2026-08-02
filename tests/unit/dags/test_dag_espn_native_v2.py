@@ -1547,6 +1547,57 @@ def test_discovery_registry_freeze_rejects_bad_state_hash(monkeypatch):
         )
 
 
+def test_discovery_registry_freeze_allows_stale_state_but_latest_rejects_it(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+
+    now = datetime(2026, 8, 20, 12, tzinfo=timezone.utc)
+    frozen_ref = {
+        "uri": "s3://artifacts/discovery/frozen-state.json",
+        "sha256": "a" * 64,
+    }
+    stale_state = {
+        "kind": "espn-discovery-state-v2",
+        "observed_at": (now - timedelta(days=8, seconds=1)).isoformat(),
+        "male_scope_count": 1,
+    }
+    registry = _generated_registry(1)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_discovery_state_v2",
+        lambda _state: ({}, registry, {}),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_ref",
+        lambda ref, **_kwargs: (
+            stale_state
+            if ref == frozen_ref
+            else pytest.fail("unexpected discovery-state reference")
+        ),
+    )
+    monkeypatch.setenv(espn_native_tasks.DISCOVERY_STATE_REF_URI_ENV, frozen_ref["uri"])
+    monkeypatch.setenv(
+        espn_native_tasks.DISCOVERY_STATE_REF_SHA256_ENV, frozen_ref["sha256"]
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_ref_for_uri",
+        lambda _uri: pytest.fail("frozen state must not resolve latest-state"),
+    )
+
+    assert espn_native_tasks._load_discovered_registry(now=now)[0] == registry
+
+    monkeypatch.delenv(espn_native_tasks.DISCOVERY_STATE_REF_URI_ENV)
+    monkeypatch.delenv(espn_native_tasks.DISCOVERY_STATE_REF_SHA256_ENV)
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(espn_native_tasks, "_ref_for_uri", lambda _uri: frozen_ref)
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="older than eight"):
+        espn_native_tasks._load_discovered_registry(now=now)
+
+
 @pytest.mark.parametrize("fault", ["missing", "stale", "hash", "count"])
 def test_discovery_registry_fault_fails_before_leases(monkeypatch, fault):
     from dags.utils import espn_native_tasks
