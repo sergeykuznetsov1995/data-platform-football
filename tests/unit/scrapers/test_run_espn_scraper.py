@@ -611,12 +611,54 @@ def test_initial_capture_fetches_full_calendar_and_one_summary_for_both_entities
     assert generation.schedule and generation.lineup and generation.matchsheet
     summary_calls = [call for call in client.calls if call[1] is EndpointType.SUMMARY]
     assert len(summary_calls) == 1
-    scoreboard_call = next(
+    scoreboard_calls = [
         call for call in client.calls if call[1] is EndpointType.SCOREBOARD
-    )
+    ]
+    assert len(scoreboard_calls) == 1
+    scoreboard_call = scoreboard_calls[0]
     assert scoreboard_call[2]["dates"] == "20200801-20210731"
     assert Path(options.output_uri.removeprefix("file://")).is_file()
     assert not list(tmp_path.rglob("*.tmp-*"))
+
+
+@pytest.mark.unit
+def test_initial_capture_splits_calendar_longer_than_supported_scoreboard_window():
+    from scrapers.espn import runner
+
+    competition, edition = _competition(
+        espn_id=3908,
+        slug="caf.nations",
+        source_year=2025,
+        start=date(2025, 12, 21),
+        end=date(2026, 12, 31),
+    )
+    scope = _scope(competition, edition)
+    binding = runner.ScopeBinding(
+        active=True,
+        initial_capture=True,
+        generation_id="generation-3908-2025",
+        batch_id="batch-3908-2025",
+        ingested_at=NOW,
+        generation_snapshot_uri="s3://artifacts/generation.json",
+        known_nonterminal_events=(),
+        prior=None,
+    )
+
+    requests = runner._scoreboard_requests(
+        scope,
+        binding,
+        as_of=date(2026, 7, 31),
+        mode="daily",
+    )
+
+    assert [(request.query_start, request.query_end) for request in requests] == [
+        (date(2025, 12, 21), date(2026, 12, 20)),
+        (date(2026, 12, 21), date(2026, 12, 31)),
+    ]
+    assert [request.params["dates"] for request in requests] == [
+        "20251221-20261220",
+        "20261221-20261231",
+    ]
 
 
 @pytest.mark.unit

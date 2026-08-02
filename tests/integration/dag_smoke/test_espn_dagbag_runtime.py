@@ -65,6 +65,14 @@ def test_real_airflow_safe_mode_loads_every_espn_dag_with_return_value_maps(
     assert set(bag.dags) == ESPN_DAG_IDS
     assert len(bag.dags) == 7
     assert "dag_master_pipeline" not in bag.dags
+    for dag_id in (
+        "dag_ingest_espn",
+        "dag_repair_espn",
+        "dag_backfill_espn",
+        "dag_replay_espn",
+    ):
+        verdict = bag.dags[dag_id].get_task("terminal_verdict")
+        assert verdict.upstream_task_ids == set(verdict.op_kwargs["producer_task_ids"])
     mapped_count = 0
     for dag in bag.dags.values():
         for task in dag.tasks:

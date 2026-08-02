@@ -70,6 +70,7 @@ SCOPE_SNAPSHOT_KIND = "espn-scope-generation-snapshot-v1"
 ARTIFACT_POINTER_KIND = "espn-artifact-pointer-v1"
 SUMMARY_CHECKPOINT_SIZE = 50
 SCOREBOARD_LIMIT = 1000
+SCOREBOARD_MAX_RANGE_DAYS = 365
 SCOREBOARD_URL = (
     "https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard"
 )
@@ -1169,9 +1170,20 @@ def _scoreboard_requests(
                 )
             if not any(start <= event.event_date <= end for start, end in ranges):
                 ranges.add((event.event_date, event.event_date))
+    bounded_ranges = []
+    for start, end in sorted(ranges):
+        cursor = start
+        while cursor <= end:
+            chunk_end = min(
+                end,
+                cursor + timedelta(days=SCOREBOARD_MAX_RANGE_DAYS - 1),
+            )
+            bounded_ranges.append((cursor, chunk_end))
+            cursor = chunk_end + timedelta(days=1)
+
     requests: list[ScoreboardRequest] = []
     url = SCOREBOARD_URL.format(slug=scope.slug)
-    for start, end in sorted(ranges):
+    for start, end in bounded_ranges:
         dates = start.strftime("%Y%m%d")
         if start != end:
             dates += "-" + end.strftime("%Y%m%d")

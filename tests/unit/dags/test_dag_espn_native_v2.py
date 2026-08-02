@@ -156,9 +156,10 @@ def test_terminal_health_release_and_propagator_cannot_mask_failure():
     assert tasks["propagate_terminal_failure"]._init_kwargs["op_kwargs"][
         "cleanup_task_ids"
     ] == ["record_health_metrics", "release_scope_leases"]
-    assert set(
+    producer_task_ids = set(
         tasks["terminal_verdict"]._init_kwargs["op_kwargs"]["producer_task_ids"]
-    ) == {
+    )
+    assert producer_task_ids == {
         "validate_registry_and_admission",
         "acquire_scope_leases",
         "build_signed_scope_plans",
@@ -175,6 +176,7 @@ def test_terminal_health_release_and_propagator_cannot_mask_failure():
         "select_publications",
         "published_dq",
     }
+    assert tasks["terminal_verdict"].upstream_task_ids == producer_task_ids
     assert set(tasks["terminal_verdict"]._init_kwargs["op_kwargs"]) == {
         "producer_task_ids"
     }
@@ -199,6 +201,9 @@ def test_manual_network_modes_reuse_same_contract_without_schedule(module_name, 
     assert tasks["fetch_scoreboard_batches"]._init_kwargs["pool"] == "espn_http_pool"
     assert tasks["fetch_summary_batches"]._init_kwargs["pool"] == "espn_http_pool"
     assert "publish_scopes" in tasks
+    assert tasks["terminal_verdict"].upstream_task_ids == set(
+        tasks["terminal_verdict"]._init_kwargs["op_kwargs"]["producer_task_ids"]
+    )
 
 
 def test_replay_dag_has_no_network_operator_at_all():
@@ -211,6 +216,9 @@ def test_replay_dag_has_no_network_operator_at_all():
     assert "fetch_summary_batches" not in tasks
     assert "bind_replay_raw_manifests" in tasks
     assert all(task._init_kwargs.get("pool") is None for task in tasks.values())
+    assert tasks["terminal_verdict"].upstream_task_ids == set(
+        tasks["terminal_verdict"]._init_kwargs["op_kwargs"]["producer_task_ids"]
+    )
 
 
 def test_weekly_discovery_never_promotes_and_monitor_is_network_free():
@@ -2325,7 +2333,9 @@ def test_scoreboard_mapped_retry_resumes_only_missing_exact_request(monkeypatch)
     artifacts = {}
     requests = [
         SimpleNamespace(
-            request_id=f"scoreboard:{day}",
+            # Logical date order intentionally differs from the canonical
+            # descriptor order used for set identity.
+            request_id=f"scoreboard:{3 - day}",
             url="https://example.test/scoreboard",
             params={"day": day},
             query_start=f"2026-07-0{day}",
@@ -2434,6 +2444,12 @@ def test_scoreboard_mapped_retry_resumes_only_missing_exact_request(monkeypatch)
     espn_native_tasks.fetch_scoreboard_batch(scope_binding_ref=binding_ref)
 
     assert calls == [(1, True), (2, True), (2, True)]
+
+    requests[1].request_id = "scoreboard:unexpected"
+    with pytest.raises(
+        espn_native_tasks.OperationsError, match="scoreboard request plan drift"
+    ):
+        espn_native_tasks.fetch_scoreboard_batch(scope_binding_ref=binding_ref)
 
 
 def test_complete_head_requires_exact_snapshot_and_physical_complete(monkeypatch):

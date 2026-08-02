@@ -1452,7 +1452,7 @@ def fetch_scoreboard_batch(
         mode=runner._effective_mode(loaded),
     )
     expected = descriptor["expected_scoreboard_batch"]
-    if [item.request_id for item in requests] != expected["request_ids"]:
+    if sorted(item.request_id for item in requests) != expected["request_ids"]:
         raise OperationsError("scoreboard request plan drift")
     checkpoint_ref = _resume_checkpoint(
         descriptor["scoreboard_checkpoint_uri"], expected

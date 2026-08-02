@@ -15,33 +15,6 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
     if mode not in {"daily", "repair", "backfill", "replay"}:
         raise ValueError("unsupported ESPN DAG mode")
     network = mode != "replay"
-    producer_task_ids = (
-        [
-            "validate_registry_and_admission",
-            "acquire_scope_leases",
-            "build_signed_scope_plans",
-        ]
-        + (
-            [
-                "select_network_scope_bindings",
-                "fetch_scoreboard_batches",
-                "plan_summary_batches",
-                "select_summary_batches",
-                "fetch_summary_batches",
-                "reduce_raw_manifests",
-            ]
-            if network
-            else ["bind_replay_raw_manifests"]
-        )
-        + [
-            "offline_parse",
-            "staging_dq",
-            "publish_scopes",
-            "persist_run_manifests",
-            "select_publications",
-            "published_dq",
-        ]
-    )
     with DAG(
         dag_id=dag_id,
         description=f"ESPN Native Bronze v2 {mode} ingestion",
@@ -149,6 +122,14 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
                 >> summary_fetch
                 >> raw_source
             )
+            capture_tasks = [
+                network_selector,
+                scoreboard,
+                summary_plan,
+                summary_selector,
+                summary_fetch,
+                raw_source,
+            ]
         else:
             raw_source = PythonOperator(
                 task_id="bind_replay_raw_manifests",
@@ -157,6 +138,7 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
                 retries=0,
             )
             planning >> raw_source
+            capture_tasks = [raw_source]
 
         offline = PythonOperator.partial(
             task_id="offline_parse",
@@ -210,6 +192,20 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
             >> published_dq
         )
 
+        producer_tasks = [
+            admission,
+            leasing,
+            planning,
+            *capture_tasks,
+            offline,
+            staging_dq,
+            publish,
+            persist,
+            publication_selector,
+            published_dq,
+        ]
+        producer_task_ids = tuple(task.task_id for task in producer_tasks)
+
         verdict = PythonOperator(
             task_id="terminal_verdict",
             python_callable=tasks.terminal_verdict,
@@ -247,7 +243,8 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
             trigger_rule="all_done",
             retries=0,
         )
-        published_dq >> verdict
+        for producer_task in producer_tasks:
+            producer_task >> verdict
         verdict >> health
         verdict >> release
         [health, release] >> propagate
