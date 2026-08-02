@@ -52,21 +52,103 @@ canary и rollback используют frozen immutable discovery-state ref, к
 
 Выполнять шаги строго в этом порядке.
 
-1. Поставить на паузу daily owner и discovery; не запускать daily owner вручную:
+Этот rollout выполняется только в отдельном ESPN Airflow stack из
+versioned `deploy/espn/airflow.compose.yaml`, а не в shared `compose.yaml`.
+Compose жёстко задаёт `ESPN_ISOLATED_STACK=1`; fresh DagBag projection
+содержит ровно семь ESPN root DAG-ов и не содержит
+`dag_master_pipeline`. Создать новый, не переиспользуемый projection
+из exact immutable release и задать compose wrapper:
+
+```bash
+export ESPN_RELEASE_ROOT='/absolute/immutable/espn-release-<git-sha>'
+export ESPN_DAGBAG_ROOT='/absolute/new/espn-dagbag-<git-sha>'
+export ESPN_ENV_FILE='/protected/path/espn.env'
+python scripts/build_espn_dagbag_projection.py \
+  --release-root "$ESPN_RELEASE_ROOT" \
+  --output "$ESPN_DAGBAG_ROOT"
+espn_compose() {
+  docker compose --env-file "$ESPN_ENV_FILE" --project-name espn-airflow \
+    -f deploy/espn/airflow.compose.yaml "$@"
+}
+espn_airflow() {
+  espn_compose exec -T airflow-scheduler airflow "$@"
+}
+espn_compose config --quiet
+```
+
+Protected env file обязан задать dedicated metadata
+`ESPN_AIRFLOW_DATABASE_URL` с URL-encoded password и отдельный raw
+`ESPN_AIRFLOW_DB_PASSWORD` для Postgres container. Оба относятся
+только к dedicated `airflow-metadb`. Отдельный
+`ESPN_CONTROL_DATABASE_URL` обязан указывать на shared ESPN control
+DB для lease/rate/publication fences; metadata и control DSN не могут
+быть одинаковыми.
+
+До первого шага сохранить cross-stack evidence, что shared
+`dag_master_pipeline` остаётся paused и не имеет active run. Если shared
+master должен быть scheduled, этот rollout заблокирован до
+отдельного reviewed release, удаляющего его ESPN trigger. Не допускать
+два daily owner в разных metadata DB.
+
+1. Если isolated project уже работает, до deploy поставить на
+   паузу daily owner и discovery; не запускать daily owner вручную.
+   Если это первый deploy и scheduler ещё не существует, команды
+   `exec` не выполнять: `DAGS_ARE_PAUSED_AT_CREATION=true` и init
+   поставят все семь DAG-ов на паузу, а шаг 2 повторит
+   явные pause после health/topology checks:
 
    ```bash
-   airflow dags pause dag_trigger_espn_daily
-   airflow dags pause dag_discover_espn_registry
+   espn_airflow dags pause dag_trigger_espn_daily
+   espn_airflow dags pause dag_discover_espn_registry
    ```
 
-2. Deploy reviewed release. Ручной run поставленного на паузу DAG
+2. Deploy reviewed release через isolated Compose и принудительно
+   пересоздать Airflow services. Обычный restart не меняет
+   environment и запрещён. До discovery доказать exact isolated role
+   в фактическом scheduler container и проверить, что `airflow dags list`
+   содержит ровно семь reviewed ESPN DAG-ов, включая owner, и не
+   содержит `dag_master_pipeline`:
+
+   ```bash
+   espn_compose --profile ui up -d --wait --wait-timeout 180 --force-recreate \
+     airflow-init airflow-scheduler airflow-webserver
+   espn_compose exec -T airflow-scheduler airflow jobs check \
+     --job-type SchedulerJob
+   test "$(espn_compose exec -T airflow-scheduler \
+     printenv ESPN_ISOLATED_STACK)" = '1'
+   espn_compose exec -T airflow-scheduler python - <<'PY'
+   from airflow.models import DagBag
+
+   expected_dag_ids = {
+       "dag_ingest_espn",
+       "dag_repair_espn",
+       "dag_backfill_espn",
+       "dag_replay_espn",
+       "dag_discover_espn_registry",
+       "dag_monitor_espn",
+       "dag_trigger_espn_daily",
+   }
+   bag = DagBag(
+       dag_folder="/opt/airflow/dags",
+       include_examples=False,
+       safe_mode=True,
+   )
+   assert bag.import_errors == {}, bag.import_errors
+   assert set(bag.dags) == expected_dag_ids, sorted(bag.dags)
+   assert "dag_master_pipeline" not in bag.dags
+   PY
+   espn_airflow dags pause dag_trigger_espn_daily
+   espn_airflow dags pause dag_discover_espn_registry
+   ```
+
+   Ручной run поставленного на паузу DAG
    остаётся `queued`, поэтому для одного exact weekly discovery run
    временно снять паузу и задать явный run ID:
 
    ```bash
    export DISCOVERY_RUN_ID='all-male-rollout-<UTC-timestamp>'
-   airflow dags unpause dag_discover_espn_registry
-   airflow dags trigger dag_discover_espn_registry --run-id "$DISCOVERY_RUN_ID"
+   espn_airflow dags unpause dag_discover_espn_registry
+   espn_airflow dags trigger dag_discover_espn_registry --run-id "$DISCOVERY_RUN_ID"
    ```
 
    Дождаться terminal success именно `$DISCOVERY_RUN_ID` и его
@@ -74,7 +156,7 @@ canary и rollback используют frozen immutable discovery-state ref, к
    на паузу до финальной активации:
 
    ```bash
-   airflow dags pause dag_discover_espn_registry
+   espn_airflow dags pause dag_discover_espn_registry
    ```
 
    Сохранить возвращённый
@@ -82,15 +164,26 @@ canary и rollback используют frozen immutable discovery-state ref, к
    SHA-256, registry signature и count. Подтвердить baseline `181/38/1`, exact
    Core coverage и zero duplicate IDs/slugs. Сохранить immutable state ref и
    `male_registry_ref` из этого run; state ref — frozen input, связывающий
-   exact generated registry. Настроить оба значения в shared Compose
-   environment для `airflow-init`, `airflow-scheduler` и `airflow-webserver`;
-   LocalExecutor task subprocesses наследуют их от scheduler. Затем
-   recreate/restart этих Airflow services до bootstrap; неполная пара запрещена:
+   exact generated registry. Настроить оба значения в environment
+   isolated Compose для `airflow-init`, `airflow-scheduler` и
+   `airflow-webserver`; LocalExecutor task subprocesses наследуют их от
+   scheduler. Неполная пара запрещена. После export обязательно
+   выполнить force-recreate, затем до bootstrap сравнить оба
+   фактических container values с exact saved values:
 
    ```bash
    export ESPN_DISCOVERY_STATE_REF_URI='s3://.../discovery/<run-key>/discovery-state.json'
    export ESPN_DISCOVERY_STATE_REF_SHA256='...lowercase-64-hex...'
-   # compose.yaml omits both keys when unset and propagates both exact values here
+   espn_compose --profile ui up -d --wait --wait-timeout 180 --force-recreate \
+     airflow-init airflow-scheduler airflow-webserver
+   espn_compose exec -T airflow-scheduler airflow jobs check \
+     --job-type SchedulerJob
+   test "$(espn_compose exec -T airflow-scheduler \
+     printenv ESPN_DISCOVERY_STATE_REF_URI)" = "$ESPN_DISCOVERY_STATE_REF_URI"
+   test "$(espn_compose exec -T airflow-scheduler \
+     printenv ESPN_DISCOVERY_STATE_REF_SHA256)" = "$ESPN_DISCOVERY_STATE_REF_SHA256"
+   test "$(espn_compose exec -T airflow-scheduler \
+     printenv ESPN_ISOLATED_STACK)" = '1'
    ```
 
    С включённой парой admission читает только этот exact state ref и никогда
@@ -105,7 +198,7 @@ canary и rollback используют frozen immutable discovery-state ref, к
    до завершения all-scope canary:
 
    ```bash
-   airflow dags unpause dag_backfill_espn
+   espn_airflow dags unpause dag_backfill_espn
    ```
 
    После каждой exact coverage reconciliation вычислить deterministic
@@ -116,7 +209,7 @@ canary и rollback используют frozen immutable discovery-state ref, к
 
    ```bash
    COHORT_CONF='{"scopes":["<first-missing-scope>","..."]}'
-   airflow dags trigger dag_backfill_espn --conf "$COHORT_CONF"
+   espn_airflow dags trigger dag_backfill_espn --conf "$COHORT_CONF"
    ```
 
    Не продолжать, если admission не закрепил state ref, связанный
@@ -219,13 +312,13 @@ canary и rollback используют frozen immutable discovery-state ref, к
    init/recreate, когда все ESPN DAG-и могли быть поставлены на паузу:
 
    ```bash
-   airflow dags pause dag_backfill_espn
-   airflow dags pause dag_repair_espn
-   airflow dags pause dag_replay_espn
-   airflow dags unpause dag_ingest_espn
-   airflow dags unpause dag_monitor_espn
-   airflow dags unpause dag_discover_espn_registry
-   airflow dags unpause dag_trigger_espn_daily
+   espn_airflow dags pause dag_backfill_espn
+   espn_airflow dags pause dag_repair_espn
+   espn_airflow dags pause dag_replay_espn
+   espn_airflow dags unpause dag_ingest_espn
+   espn_airflow dags unpause dag_monitor_espn
+   espn_airflow dags unpause dag_discover_espn_registry
+   espn_airflow dags unpause dag_trigger_espn_daily
    ```
 
    Из-за нового registry signature обязательны три новых scheduled green
@@ -239,14 +332,16 @@ immutable raw/generation/reconciliation evidence; ничего из него н�
 discovery-state ref, binding the last good `male_registry_ref`** в rollback
 record/admission evidence. Установить сохранённые
 `ESPN_DISCOVERY_STATE_REF_URI` и `ESPN_DISCOVERY_STATE_REF_SHA256` во всех
-Airflow компонентах и recreate их. Не выбирать текущий `latest-state.json` и
+Airflow компонентах и повторить exact `espn_compose ... up -d
+--force-recreate` и container `printenv` проверки из rollout. Не выбирать
+текущий `latest-state.json` и
 не генерировать новый registry во время rollback: last good frozen state ref
 и его `male_registry_ref` остаются неизменяемым target до отдельного reviewed
 rollout.
 
 ```bash
-airflow dags pause dag_trigger_espn_daily
-airflow dags pause dag_discover_espn_registry
+espn_airflow dags pause dag_trigger_espn_daily
+espn_airflow dags pause dag_discover_espn_registry
 # deploy last reviewed release; retain immutable raw and generation artifacts
 ```
 

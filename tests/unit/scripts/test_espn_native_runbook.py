@@ -63,6 +63,22 @@ def test_runbook_contracts_automatic_all_male_rollout_and_reversal():
         "airflow dags pause dag_backfill_espn",
         "airflow dags unpause dag_ingest_espn",
         "airflow dags unpause dag_monitor_espn",
+        "deploy/espn/airflow.compose.yaml",
+        "scripts/build_espn_dagbag_projection.py",
+        "ESPN_ISOLATED_STACK=1",
+        "dag_master_pipeline",
+        "--force-recreate",
+        "exec -T airflow-scheduler",
+        "printenv ESPN_DISCOVERY_STATE_REF_URI",
+        "printenv ESPN_DISCOVERY_STATE_REF_SHA256",
+        "ESPN_AIRFLOW_DATABASE_URL",
+        "ESPN_CONTROL_DATABASE_URL",
+        "первый deploy",
+        "DAGS_ARE_PAUSED_AT_CREATION=true",
+        "--wait-timeout",
+        "airflow jobs check",
+        "bag.import_errors == {}",
+        "set(bag.dags) == expected_dag_ids",
         'state["candidate_ref"]',
         'state["male_registry_ref"]',
         '"MALE": 181, "FEMALE": 38, "UNKNOWN": 1',
@@ -71,6 +87,7 @@ def test_runbook_contracts_automatic_all_male_rollout_and_reversal():
         assert required in text
 
     assert "airflow dags trigger dag_trigger_espn_daily" not in automatic_rollout
+    assert "docker compose restart" not in automatic_rollout
     assert "WHERE dag_id" not in automatic_rollout
 
     ordered_markers = (
@@ -81,6 +98,9 @@ def test_runbook_contracts_automatic_all_male_rollout_and_reversal():
         "airflow dags trigger dag_discover_espn_registry",
         "airflow dags pause dag_discover_espn_registry",
         "ESPN_DISCOVERY_STATE_REF_URI",
+        "--force-recreate",
+        "printenv ESPN_DISCOVERY_STATE_REF_URI",
+        "printenv ESPN_DISCOVERY_STATE_REF_SHA256",
         "Запускать bounded bootstrap",
         "airflow dags unpause dag_backfill_espn",
         "airflow dags trigger dag_backfill_espn",
