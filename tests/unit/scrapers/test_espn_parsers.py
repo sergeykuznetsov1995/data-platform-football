@@ -1089,7 +1089,58 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
             762013,
             ((1936, 11), (7388, 11)),
         ),
+        "1105bf97b43fe4a3733e41e8f0ad303f82a9746d5ac7ad536c4f98399b6b6ec4": (
+            "3903:2026",
+            401843855,
+            ((2, 11), (7845, 11)),
+        ),
+        "64345c28d330aadb8a8ac6a483b931563f35bfb25749c085e299f8e064cc3d82": (
+            "3904:2026",
+            401844958,
+            ((2635, 11), (14074, 8)),
+        ),
+        "4e1cb30f5e297aa0d409790db4e14d553bcfefc25a10f5a897019a2454a0b0c2": (
+            "3904:2026",
+            401844963,
+            ((10052, 9), (10105, 9)),
+        ),
+        "9d8e0a3cb88a5e5a06aac1cfc8a3ea7f1b37fdd81e64243f599133d340189dd7": (
+            "3911:2012",
+            340346,
+            ((2650, 17), (9632, 16)),
+        ),
+        "39b01ed6ba1b65b835bf0a8237aaed33fafaf704e5fa1c3b40c0f6426674b864": (
+            "3911:2012",
+            340348,
+            ((2873, 17), (9632, 13)),
+        ),
+        "7e4203120f22150fe68dcee99f47dcf75d632b216e0b3ba27ac808d1ea1050fb": (
+            "3911:2012",
+            340350,
+            ((2874, 11), (2875, 12)),
+        ),
+        "916d34e732a06275cc6e5f5b3acd06d75625eddaa85318b0a7dd0ca2f1aed851": (
+            "3911:2012",
+            340351,
+            ((2888, 11), (11790, 16)),
+        ),
+        "6208068f6165e7f090ecd6a25f732af081bc3c5c25e849bf984f4ae9e9f8a6bc": (
+            "3911:2012",
+            340352,
+            ((2874, 15), (11790, 15)),
+        ),
+        "960c13658d2be1a4c8fd9f82cf07d5c9f6db7f50bf8ab2a3de3dd7fe86adb436": (
+            "3911:2012",
+            340357,
+            ((2875, 12), (2888, 11)),
+        ),
     }
+    assert summary_parser_module._REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES == (
+        frozenset({"3904:2026"})
+    )
+    assert summary_parser_module._REVIEWED_DUPLICATE_LINEUP_SCOPES == frozenset(
+        {"3911:2012"}
+    )
     assert dict(summary_parser_module._REVIEWED_ONE_SIDED_LINEUPS) == {
         "54c233a36e49dee961703a659ef03de013d445659614f3e3450bad0e63ad9ced": (
             "19834:2026",
@@ -1112,6 +1163,203 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
         summary_parser_module._REVIEWED_ONE_SIDED_LINEUPS["0" * 64] = (  # type: ignore[index]
             "19834:2026",
             401897918,
+        )
+
+
+@pytest.mark.unit
+def test_reviewed_scope_discards_only_partial_conventional_lineups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    competition, edition, schedule = _schedule(lineup=CapabilityState.UNKNOWN)
+    payload = _load("native_summary.json")
+    for roster in payload["rosters"]:
+        seed = roster["roster"][0]
+        base_id = 100 if roster["homeAway"] == "home" else 200
+        starter_count = 11 if roster["homeAway"] == "home" else 6
+        roster["roster"] = []
+        for offset in range(1, 21):
+            player = deepcopy(seed)
+            player["starter"] = offset <= starter_count
+            player["subbedIn"] = False
+            player["subbedOut"] = False
+            player["athlete"]["id"] = str(base_id + offset)
+            player["athlete"]["displayName"] = f"Player {base_id + offset}"
+            roster["roster"].append(player)
+
+    raw = _raw(payload)
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(raw, competition=competition, edition=edition, event=schedule[0])
+
+    monkeypatch.setattr(
+        summary_parser_module,
+        "_REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES",
+        frozenset({schedule[0].scope_id}),
+    )
+    result = parse_summary(
+        raw, competition=competition, edition=edition, event=schedule[0]
+    )
+    assert result.lineup == ()
+    assert result.lineup_state is EntityParseState.VALID_EMPTY
+    assert result.matchsheet_state is EntityParseState.CAPTURED
+
+    contradictory = deepcopy(payload)
+    contradictory["rosters"][0]["roster"][0]["subbedIn"] = True
+    with pytest.raises(EspnParseError, match="contradictory"):
+        parse_summary(
+            _raw(contradictory),
+            competition=competition,
+            edition=edition,
+            event=schedule[0],
+        )
+
+    complete = deepcopy(payload)
+    away = next(
+        roster for roster in complete["rosters"] if roster["homeAway"] == "away"
+    )
+    for player in away["roster"][:11]:
+        player["starter"] = True
+    for player in away["roster"][11:]:
+        player["starter"] = False
+    captured = parse_summary(
+        _raw(complete),
+        competition=competition,
+        edition=edition,
+        event=schedule[0],
+    )
+    assert captured.lineup_state is EntityParseState.CAPTURED
+    assert len(captured.lineup) == 40
+
+    balanced_small_sided = deepcopy(payload)
+    balanced_small_sided["format"] = {"startersPerTeam": 5}
+    for roster in balanced_small_sided["rosters"]:
+        for index, player in enumerate(roster["roster"]):
+            player["starter"] = index < 5
+    small_sided_result = parse_summary(
+        _raw(balanced_small_sided),
+        competition=competition,
+        edition=edition,
+        event=schedule[0],
+    )
+    assert small_sided_result.lineup_state is EntityParseState.CAPTURED
+
+    unbalanced_small_sided = deepcopy(balanced_small_sided)
+    unbalanced_small_sided["rosters"][0]["roster"][4]["starter"] = False
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            _raw(unbalanced_small_sided),
+            competition=competition,
+            edition=edition,
+            event=schedule[0],
+        )
+
+    proven_competition, proven_edition, proven_schedule = _schedule()
+    monkeypatch.setattr(
+        summary_parser_module,
+        "_REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES",
+        frozenset({proven_schedule[0].scope_id}),
+    )
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            raw,
+            competition=proven_competition,
+            edition=proven_edition,
+            event=proven_schedule[0],
+        )
+
+
+@pytest.mark.unit
+def test_reviewed_scope_discards_duplicate_lineup_after_full_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    competition, edition, schedule = _schedule(lineup=CapabilityState.UNKNOWN)
+    payload = _load("native_summary.json")
+    duplicate = deepcopy(payload["rosters"][0]["roster"][0])
+    duplicate["captain"] = not duplicate["captain"]
+    payload["rosters"][0]["roster"].append(duplicate)
+    raw = _raw(payload)
+
+    with pytest.raises(EspnParseError, match="duplicate event/team/athlete"):
+        parse_summary(raw, competition=competition, edition=edition, event=schedule[0])
+
+    monkeypatch.setattr(
+        summary_parser_module,
+        "_REVIEWED_DUPLICATE_LINEUP_SCOPES",
+        frozenset({schedule[0].scope_id}),
+    )
+    result = parse_summary(
+        raw, competition=competition, edition=edition, event=schedule[0]
+    )
+    assert result.lineup == ()
+    assert result.lineup_state is EntityParseState.VALID_EMPTY
+    assert result.matchsheet_state is EntityParseState.CAPTURED
+
+    contradictory = deepcopy(payload)
+    for roster in contradictory["rosters"]:
+        for player in roster["roster"]:
+            player["starter"] = True
+            player["subbedIn"] = False
+            player["subbedOut"] = False
+    contradictory["rosters"][0]["roster"][0]["subbedIn"] = True
+    with pytest.raises(EspnParseError, match="contradictory"):
+        parse_summary(
+            _raw(contradictory),
+            competition=competition,
+            edition=edition,
+            event=schedule[0],
+        )
+
+    malformed = deepcopy(payload)
+    malformed["rosters"][1]["roster"][0]["athlete"].pop("id")
+    with pytest.raises(EspnParseError, match="athlete.id"):
+        parse_summary(
+            _raw(malformed),
+            competition=competition,
+            edition=edition,
+            event=schedule[0],
+        )
+
+    mixed_starter_semantics = deepcopy(payload)
+    mixed_starter_semantics["rosters"][0]["roster"][0]["starter"] = True
+    with pytest.raises(EspnParseError, match="starter flag for every athlete"):
+        parse_summary(
+            _raw(mixed_starter_semantics),
+            competition=competition,
+            edition=edition,
+            event=schedule[0],
+        )
+
+    invalid_small_sided_format = deepcopy(payload)
+    invalid_small_sided_format["format"] = {"startersPerTeam": 8}
+    with pytest.raises(EspnParseError, match="integer from 1 to 7"):
+        parse_summary(
+            _raw(invalid_small_sided_format),
+            competition=competition,
+            edition=edition,
+            event=schedule[0],
+        )
+
+    unique = deepcopy(payload)
+    unique["rosters"][0]["roster"].pop()
+    captured = parse_summary(
+        _raw(unique),
+        competition=competition,
+        edition=edition,
+        event=schedule[0],
+    )
+    assert captured.lineup_state is EntityParseState.CAPTURED
+
+    proven_competition, proven_edition, proven_schedule = _schedule()
+    monkeypatch.setattr(
+        summary_parser_module,
+        "_REVIEWED_DUPLICATE_LINEUP_SCOPES",
+        frozenset({proven_schedule[0].scope_id}),
+    )
+    with pytest.raises(EspnParseError, match="duplicate event/team/athlete"):
+        parse_summary(
+            raw,
+            competition=proven_competition,
+            edition=proven_edition,
+            event=proven_schedule[0],
         )
 
 

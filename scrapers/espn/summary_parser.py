@@ -160,8 +160,66 @@ _REVIEWED_CONTRADICTORY_LINEUPS: Mapping[
             762013,
             ((1936, 11), (7388, 11)),
         ),
+        "1105bf97b43fe4a3733e41e8f0ad303f82a9746d5ac7ad536c4f98399b6b6ec4": (
+            "3903:2026",
+            401843855,
+            ((2, 11), (7845, 11)),
+        ),
+        "64345c28d330aadb8a8ac6a483b931563f35bfb25749c085e299f8e064cc3d82": (
+            "3904:2026",
+            401844958,
+            ((2635, 11), (14074, 8)),
+        ),
+        "4e1cb30f5e297aa0d409790db4e14d553bcfefc25a10f5a897019a2454a0b0c2": (
+            "3904:2026",
+            401844963,
+            ((10052, 9), (10105, 9)),
+        ),
+        "9d8e0a3cb88a5e5a06aac1cfc8a3ea7f1b37fdd81e64243f599133d340189dd7": (
+            "3911:2012",
+            340346,
+            ((2650, 17), (9632, 16)),
+        ),
+        "39b01ed6ba1b65b835bf0a8237aaed33fafaf704e5fa1c3b40c0f6426674b864": (
+            "3911:2012",
+            340348,
+            ((2873, 17), (9632, 13)),
+        ),
+        "7e4203120f22150fe68dcee99f47dcf75d632b216e0b3ba27ac808d1ea1050fb": (
+            "3911:2012",
+            340350,
+            ((2874, 11), (2875, 12)),
+        ),
+        "916d34e732a06275cc6e5f5b3acd06d75625eddaa85318b0a7dd0ca2f1aed851": (
+            "3911:2012",
+            340351,
+            ((2888, 11), (11790, 16)),
+        ),
+        "6208068f6165e7f090ecd6a25f732af081bc3c5c25e849bf984f4ae9e9f8a6bc": (
+            "3911:2012",
+            340352,
+            ((2874, 15), (11790, 15)),
+        ),
+        "960c13658d2be1a4c8fd9f82cf07d5c9f6db7f50bf8ab2a3de3dd7fe86adb436": (
+            "3911:2012",
+            340357,
+            ((2875, 12), (2888, 11)),
+        ),
     }
 )
+
+# Argentina's 2026 third tier exposes no complete XI in its 17 non-empty
+# roster responses: every one is a structurally valid but partial participant
+# snapshot.  Keep a future valid XI, but discard only non-conventional roster
+# shapes for this exact scope when the registry does not promise lineups.
+_REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES: frozenset[str] = frozenset(
+    {"3904:2026"}
+)
+
+# Six 2012 CONCACAF U23 responses concatenate two roster snapshots and repeat
+# athletes with conflicting starter/bench flags.  Never choose or merge a
+# duplicate row; discard the affected lineup after validating every row.
+_REVIEWED_DUPLICATE_LINEUP_SCOPES: frozenset[str] = frozenset({"3911:2012"})
 
 # One Club Friendly Summary contains a one-player roster for only one side.
 # Bind the waiver to the complete canonical lineup source and event identity.
@@ -306,6 +364,25 @@ def _substitution_minute(value: Any, field: str) -> int | None:
     display = required_string(clock.get("displayValue"), f"{field}.clock.displayValue")
     parts = re.findall(r"\d{1,3}", display)
     return sum(int(part) for part in parts) if parts else None
+
+
+def _small_sided_size(payload: Mapping[str, Any]) -> int | None:
+    if "format" not in payload:
+        return None
+    match_format = required_mapping(payload["format"], "summary.format")
+    configured_size = match_format.get("startersPerTeam")
+    if configured_size is None and "regulation" in match_format:
+        regulation = required_mapping(
+            match_format["regulation"], "summary.format.regulation"
+        )
+        configured_size = regulation.get("startersPerTeam")
+    if configured_size is None:
+        return None
+    if type(configured_size) is not int or not 1 <= configured_size <= 7:
+        raise EspnParseError(
+            "summary.format.startersPerTeam must be an integer from 1 to 7"
+        )
+    return configured_size
 
 
 def _legacy_substitutions(
@@ -582,6 +659,7 @@ def _lineup(
     per_team_rows: dict[int, list[LineupRow]] = {}
     contradictory_substitution_semantics = False
     seen: set[tuple[int, int, int]] = set()
+    duplicate_athlete_rows = False
     for team_id, (side, team_name, block) in blocks.items():
         roster = required_list(
             block.get("roster"), f"summary.rosters[{team_id}].roster"
@@ -599,10 +677,16 @@ def _lineup(
             )
             key = (event.event_id, team_id, athlete_id)
             if key in seen:
-                raise EspnParseError(
-                    "Summary lineup has duplicate event/team/athlete row"
-                )
-            seen.add(key)
+                if (
+                    capability is CapabilityState.PROVEN
+                    or event.scope_id not in _REVIEWED_DUPLICATE_LINEUP_SCOPES
+                ):
+                    raise EspnParseError(
+                        "Summary lineup has duplicate event/team/athlete row"
+                    )
+                duplicate_athlete_rows = True
+            else:
+                seen.add(key)
             jersey_raw = athlete.get("jersey")
             if jersey_raw is None:
                 jersey = None
@@ -766,21 +850,7 @@ def _lineup(
         }
         counts = tuple(starter_counts.values())
         conventional_xi = all(count == 11 for count in counts)
-        small_sided_size: int | None = None
-        if "format" in payload:
-            match_format = required_mapping(payload["format"], "summary.format")
-            configured_size = match_format.get("startersPerTeam")
-            if configured_size is None and "regulation" in match_format:
-                regulation = required_mapping(
-                    match_format["regulation"], "summary.format.regulation"
-                )
-                configured_size = regulation.get("startersPerTeam")
-            if configured_size is not None:
-                if type(configured_size) is not int or not 1 <= configured_size <= 7:
-                    raise EspnParseError(
-                        "summary.format.startersPerTeam must be an integer from 1 to 7"
-                    )
-                small_sided_size = configured_size
+        small_sided_size = _small_sided_size(payload)
         # Non-XI capture requires explicit source format evidence.
         balanced_small_sided = (
             small_sided_size is not None
@@ -801,6 +871,23 @@ def _lineup(
             raise EspnParseError(
                 "Summary lineup has contradictory starter/substitution semantics"
             )
+    elif duplicate_athlete_rows:
+        # A duplicate in the reviewed historical scope is a known semantic
+        # conflict, not permission to hide new collection/schema drift.
+        _small_sided_size(payload)
+
+    if duplicate_athlete_rows:
+        return (), _valid_empty_or_fail(capability, "lineup")
+
+    if explicit_starter_semantics:
+        if (
+            not conventional_xi
+            and not balanced_small_sided
+            and small_sided_size is None
+            and capability is not CapabilityState.PROVEN
+            and event.scope_id in _REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES
+        ):
+            return (), _valid_empty_or_fail(capability, "lineup")
         if not conventional_xi and not balanced_small_sided:
             # Some ESPN competitions expose a sparse event-participant list in
             # ``rosters`` (for example, only the scorer) while still attaching
