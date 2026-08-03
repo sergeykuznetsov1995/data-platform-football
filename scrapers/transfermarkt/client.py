@@ -88,6 +88,10 @@ _MAX_BLOCKED_ATTEMPTS = 4
 # grant without allowing an orphaned ticket to outlive the proxy queue.
 TRANSFERMARKT_REQUEST_PERMIT_MAX_WAIT_SECONDS = 65.0
 
+
+class TransportStatusError(ConnectionError):
+    """A pseudo-response carried no real HTTP status (tls-client quirk)."""
+
 _URL_CREDENTIALS_RE = re.compile(
     r"(?P<scheme>(?:https?|socks[45])://)(?P<credentials>[^/@\s]+)@",
     re.IGNORECASE,
@@ -1620,6 +1624,17 @@ class TransfermarktHttpClient:
                 attempt_duration_for_endpoint += elapsed
                 status_code = int(getattr(resp, "status_code", 0) or 0)
                 last_status = status_code
+                if not 100 <= status_code <= 599:
+                    # tls-client reports some transport-level failures as a
+                    # pseudo-response with status 0 instead of raising.  The
+                    # raw store only accepts real HTTP statuses (100..599), so
+                    # committing such a response fails the whole cycle closed
+                    # (#1092).  Route it through the transport-error path,
+                    # which retries on a fresh exit like any other
+                    # connection failure.
+                    raise TransportStatusError(
+                        f"transport failure: pseudo HTTP status {status_code}"
+                    )
                 body = self._response_bytes(resp)
                 body_n = len(body)
                 decoded_for_endpoint += body_n
