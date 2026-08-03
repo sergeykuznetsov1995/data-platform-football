@@ -5,11 +5,13 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import fields
 from datetime import date, timezone
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
+from scrapers.espn import summary_parser as summary_parser_module
 from scrapers.espn.models import (
     AgeClass,
     CapabilityState,
@@ -649,6 +651,88 @@ def test_structurally_valid_prematch_stub_allows_unknown_capabilities() -> None:
 
 
 @pytest.mark.unit
+def test_matchsheet_without_team_statistics_is_valid_empty_only_when_permitted() -> (
+    None
+):
+    competition, edition, schedule = _schedule(matchsheet=CapabilityState.UNKNOWN)
+    payload = _load("native_summary.json")
+    for team in payload["boxscore"]["teams"]:
+        team.pop("statistics")
+
+    result = parse_summary(
+        _raw(payload), competition=competition, edition=edition, event=schedule[0]
+    )
+
+    assert result.lineup_state is EntityParseState.CAPTURED
+    assert result.matchsheet == ()
+    assert result.matchsheet_state is EntityParseState.VALID_EMPTY
+
+    proven_competition, proven_edition, proven_schedule = _schedule()
+    with pytest.raises(EspnParseError, match="proven matchsheet"):
+        parse_summary(
+            _raw(payload),
+            competition=proven_competition,
+            edition=proven_edition,
+            event=proven_schedule[0],
+        )
+
+
+@pytest.mark.unit
+def test_matchsheet_rejects_one_sided_missing_team_statistics() -> None:
+    competition, edition, schedule = _schedule(matchsheet=CapabilityState.UNKNOWN)
+    payload = _load("native_summary.json")
+    payload["boxscore"]["teams"][0].pop("statistics")
+
+    with pytest.raises(EspnParseError, match="both or neither"):
+        parse_summary(
+            _raw(payload),
+            competition=competition,
+            edition=edition,
+            event=schedule[0],
+        )
+
+
+@pytest.mark.unit
+def test_lineup_without_team_rosters_is_valid_empty_only_when_permitted() -> None:
+    competition, edition, schedule = _schedule(lineup=CapabilityState.PARTIAL)
+    payload = _load("native_summary.json")
+    for team in payload["rosters"]:
+        team.pop("roster")
+
+    result = parse_summary(
+        _raw(payload), competition=competition, edition=edition, event=schedule[0]
+    )
+
+    assert result.lineup == ()
+    assert result.lineup_state is EntityParseState.VALID_EMPTY
+    assert result.matchsheet_state is EntityParseState.CAPTURED
+
+    proven_competition, proven_edition, proven_schedule = _schedule()
+    with pytest.raises(EspnParseError, match="proven lineup"):
+        parse_summary(
+            _raw(payload),
+            competition=proven_competition,
+            edition=proven_edition,
+            event=proven_schedule[0],
+        )
+
+
+@pytest.mark.unit
+def test_lineup_rejects_one_sided_missing_team_roster() -> None:
+    competition, edition, schedule = _schedule(lineup=CapabilityState.PARTIAL)
+    payload = _load("native_summary.json")
+    payload["rosters"][0].pop("roster")
+
+    with pytest.raises(EspnParseError, match="both or neither"):
+        parse_summary(
+            _raw(payload),
+            competition=competition,
+            edition=edition,
+            event=schedule[0],
+        )
+
+
+@pytest.mark.unit
 def test_conventional_xi_requires_22_unique_starters() -> None:
     competition, edition, schedule = _schedule()
     payload = _load("native_summary.json")
@@ -691,6 +775,110 @@ def test_conventional_xi_requires_22_unique_starters() -> None:
             competition=competition,
             edition=edition,
             event=schedule[0],
+        )
+
+
+@pytest.mark.unit
+def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
+    assert dict(summary_parser_module._REVIEWED_TRUNCATED_LINEUPS) == {
+        "c52e475f0cea8f775a9c3b47200c3a6a6ed1978a8e0e8ef961c320c20ad12230": (
+            "18481:2025",
+            761072,
+            ((347, 11), (3802, 10)),
+        )
+    }
+    with pytest.raises(TypeError):
+        summary_parser_module._REVIEWED_TRUNCATED_LINEUPS["0" * 64] = (  # type: ignore[index]
+            "18481:2025",
+            761072,
+            ((347, 11), (3802, 10)),
+        )
+
+
+@pytest.mark.unit
+def test_only_reviewed_truncated_conventional_lineup_degrades_to_valid_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    competition, edition, schedule = _schedule(lineup=CapabilityState.UNKNOWN)
+    payload = _load("native_summary.json")
+    for roster in payload["rosters"]:
+        seed = roster["roster"][0]
+        base_id = 100 if roster["homeAway"] == "home" else 200
+        count = 11 if roster["homeAway"] == "home" else 10
+        roster["roster"] = []
+        for offset in range(1, count + 1):
+            player = deepcopy(seed)
+            player["starter"] = True
+            player["athlete"]["id"] = str(base_id + offset)
+            player["athlete"]["displayName"] = f"Player {base_id + offset}"
+            roster["roster"].append(player)
+
+    raw = _raw(payload)
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            raw, competition=competition, edition=edition, event=schedule[0]
+        )
+
+    identity = (
+        schedule[0].scope_id,
+        schedule[0].event_id,
+        ((10, 11), (20, 10)),
+    )
+    monkeypatch.setattr(
+        summary_parser_module,
+        "_REVIEWED_TRUNCATED_LINEUPS",
+        {hashlib.sha256(raw).hexdigest(): identity},
+    )
+    result = parse_summary(
+        raw, competition=competition, edition=edition, event=schedule[0]
+    )
+
+    assert result.lineup == ()
+    assert result.lineup_state is EntityParseState.VALID_EMPTY
+    assert result.matchsheet_state is EntityParseState.CAPTURED
+
+    # The same parsed values with different raw bytes must not match.
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            raw + b"\n",
+            competition=competition,
+            edition=edition,
+            event=schedule[0],
+        )
+
+    # The same raw hash must still match scope, event and exact team counts.
+    wrong_identities = (
+        ("other:2025", schedule[0].event_id, ((10, 11), (20, 10))),
+        (schedule[0].scope_id, schedule[0].event_id + 1, ((10, 11), (20, 10))),
+        (schedule[0].scope_id, schedule[0].event_id, ((10, 11), (20, 9))),
+    )
+    for wrong_identity in wrong_identities:
+        monkeypatch.setattr(
+            summary_parser_module,
+            "_REVIEWED_TRUNCATED_LINEUPS",
+            {hashlib.sha256(raw).hexdigest(): wrong_identity},
+        )
+        with pytest.raises(EspnParseError, match="11 starters"):
+            parse_summary(
+                raw,
+                competition=competition,
+                edition=edition,
+                event=schedule[0],
+            )
+
+    # Even the exact reviewed identity remains forbidden for PROVEN capability.
+    monkeypatch.setattr(
+        summary_parser_module,
+        "_REVIEWED_TRUNCATED_LINEUPS",
+        {hashlib.sha256(raw).hexdigest(): identity},
+    )
+    proven_competition, proven_edition, proven_schedule = _schedule()
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            raw,
+            competition=proven_competition,
+            edition=proven_edition,
+            event=proven_schedule[0],
         )
 
 

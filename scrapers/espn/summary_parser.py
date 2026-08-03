@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 from types import MappingProxyType
@@ -92,6 +93,22 @@ MATCHSHEET_STAT_NAME_MAP: Mapping[str, str] = MappingProxyType(
         "wonCorners": "won_corners",
         "cornerKicks": "won_corners",
         "yellowCards": "yellow_cards",
+    }
+)
+
+# ESPN omitted Kai Jennings from AFC Wimbledon's otherwise explicit XI for
+# event 761072. Independent match reports list him as the eleventh starter, so
+# this exact immutable Summary is known to be truncated. Discard its lineup;
+# never synthesize the missing player or relax cardinality for other payloads.
+_REVIEWED_TRUNCATED_LINEUPS: Mapping[
+    str, tuple[str, int, tuple[tuple[int, int], ...]]
+] = MappingProxyType(
+    {
+        "c52e475f0cea8f775a9c3b47200c3a6a6ed1978a8e0e8ef961c320c20ad12230": (
+            "18481:2025",
+            761072,
+            ((347, 11), (3802, 10)),
+        )
     }
 )
 
@@ -442,6 +459,7 @@ def _lineup_stat_values(sources: list[tuple[str, Any]], field: str) -> dict[str,
 def _lineup(
     payload: Mapping[str, Any],
     *,
+    raw_sha256: str,
     competition: Competition,
     edition: Edition,
     event: ScheduleRow,
@@ -463,6 +481,13 @@ def _lineup(
         blocks[team_id] = (side, team_name, block)
     if set(blocks) != set(by_team):
         raise EspnParseError("Summary lineup must contain both event teams")
+    roster_presence = ["roster" in block for _, _, block in blocks.values()]
+    if not any(roster_presence):
+        return (), _valid_empty_or_fail(capability, "lineup")
+    if not all(roster_presence):
+        raise EspnParseError(
+            "Summary lineup rosters must exist for both or neither team"
+        )
 
     rows: list[LineupRow] = []
     per_team_rows: dict[int, list[LineupRow]] = {}
@@ -662,14 +687,24 @@ def _lineup(
                         "summary.format.startersPerTeam must be an integer from 1 to 7"
                     )
                 small_sided_size = configured_size
-        # Non-XI tolerance requires explicit source format evidence. Counts 8-10
-        # are always treated as truncated conventional XIs.
+        # Non-XI capture requires explicit source format evidence.
         balanced_small_sided = (
             small_sided_size is not None
             and len(set(counts)) == 1
             and counts[0] == small_sided_size
         )
         if not conventional_xi and not balanced_small_sided:
+            reviewed_identity = _REVIEWED_TRUNCATED_LINEUPS.get(raw_sha256)
+            observed_identity = (
+                event.scope_id,
+                event.event_id,
+                tuple(sorted(starter_counts.items())),
+            )
+            if (
+                capability is not CapabilityState.PROVEN
+                and reviewed_identity == observed_identity
+            ):
+                return (), _valid_empty_or_fail(capability, "lineup")
             raise EspnParseError(
                 "explicit conventional lineup must contain 11 starters per team; "
                 f"got {starter_counts}"
@@ -757,6 +792,13 @@ def _matchsheet(
         blocks[team_id] = (side, team_name, block)
     if set(blocks) != set(by_team):
         raise EspnParseError("Summary matchsheet must contain both event teams")
+    statistics_presence = ["statistics" in block for _, _, block in blocks.values()]
+    if not any(statistics_presence):
+        return (), _valid_empty_or_fail(capability, "matchsheet")
+    if not all(statistics_presence):
+        raise EspnParseError(
+            "Summary matchsheet statistics must exist for both or neither team"
+        )
 
     venue_id, venue_name, attendance, capacity, referee_id, referee_name, _ = game_info
     roster_by_team: dict[int, str] = {}
@@ -878,6 +920,7 @@ def parse_summary(
     game_info = _parse_game_info(payload, event)
     lineup, lineup_state = _lineup(
         payload,
+        raw_sha256=hashlib.sha256(raw).hexdigest(),
         competition=competition,
         edition=edition,
         event=event,
