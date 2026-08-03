@@ -1107,6 +1107,26 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
             401879623,
             ((7259, 11), (131835, 6)),
         ),
+        "7db63748d32060a7de06ec08c7ba8f7cf00bb2e41f7803b5696ed8ef4904e0a6": (
+            "3929:2026",
+            401898685,
+            ((7243, 4), (7245, 11)),
+        ),
+        "f02ab1944137c5e8218238dd271ea404bb698f3f3fd80bc020c08b91e5e77b60": (
+            "3945:2026",
+            401842743,
+            ((2720, 11), (20856, 10)),
+        ),
+        "79983143b5562e8aa233fdc1caa0b977f88857f35bac3b9d50e1d6bb0ce39a6d": (
+            "3945:2026",
+            401842746,
+            ((20856, 10), (22163, 11)),
+        ),
+        "8caabc860d5894856e51b2e4a22d49455d083fe65f3eb06dc36d97e6532ec928": (
+            "3945:2026",
+            401842760,
+            ((2495, 11), (20856, 10)),
+        ),
     }
     assert dict(summary_parser_module._REVIEWED_CONTRADICTORY_LINEUPS) == {
         "287b2052375fe3ef2fc4fc24f8c69f0be23d20adac832d86a098fc194275985f": (
@@ -1203,6 +1223,16 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
             "3922:2026",
             401874104,
             ((657, 10), (1038, 11)),
+        ),
+        "9836f00b83e2ce9a2c28090537dd686ead41118f4ab8a95295ba2db726c6ab18": (
+            "3934:2026",
+            762422,
+            ((5584, 11), (21313, 11)),
+        ),
+        "a78cf5d47e0096a10e96ef19465feb3c854b895e2c8150d8c256ecf986296a98": (
+            "3940:2026",
+            401878593,
+            ((259, 11), (422, 11)),
         ),
     }
     assert summary_parser_module._REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES == (
