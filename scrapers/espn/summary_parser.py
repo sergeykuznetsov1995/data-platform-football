@@ -109,6 +109,62 @@ _REVIEWED_TRUNCATED_LINEUPS: Mapping[
             "18481:2025",
             761072,
             ((347, 11), (3802, 10)),
+        ),
+        "0d8f88f7e3486d1b40328e62f67c7484fe31373894c59a38490711b32f4960ef": (
+            "19834:2026",
+            401872737,
+            ((124, 11), (3384, 10)),
+        ),
+    }
+)
+
+# ESPN published internally contradictory starter/substitution flags for these
+# exact lineups. Preserve no player rows rather than guess which source flag is
+# correct.
+_REVIEWED_CONTRADICTORY_LINEUPS: Mapping[
+    str, tuple[str, int, tuple[tuple[int, int], ...]]
+] = MappingProxyType(
+    {
+        "287b2052375fe3ef2fc4fc24f8c69f0be23d20adac832d86a098fc194275985f": (
+            "19778:2025",
+            734179,
+            ((2664, 11), (2728, 11)),
+        ),
+        "dc4b54fc66f6d2ce7b7004c8fcb6411e59ca9470ae6386be6c745a4dc933788c": (
+            "19778:2025",
+            734184,
+            ((214, 11), (2641, 11)),
+        ),
+        "e3a51e4590879e092163e1fad6a377467b4f7cc361fd56d3c91fac4e7965c2f9": (
+            "19831:2020",
+            565756,
+            ((2829, 11), (18210, 12)),
+        ),
+        "6083361093816508832ea3be234c8cf475e4a5725d9d47871e7ca262c2594345": (
+            "19831:2020",
+            599000,
+            ((2875, 11), (2888, 11)),
+        ),
+        "d42c97067cc2ac708e6e0085dd5735b7ef8c899a06d0658ffd7b2061cb412274": (
+            "19834:2026",
+            401867393,
+            ((367, 11), (22344, 11)),
+        ),
+        "3698912fea6e1545167896f6aa1571491f7e6210c5f2f1e2ec0f895384236b30": (
+            "19915:2026",
+            401841831,
+            ((20684, 11), (22525, 11)),
+        ),
+    }
+)
+
+# One Club Friendly Summary contains a one-player roster for only one side.
+# Bind the waiver to the complete canonical lineup source and event identity.
+_REVIEWED_ONE_SIDED_LINEUPS: Mapping[str, tuple[str, int]] = MappingProxyType(
+    {
+        "54c233a36e49dee961703a659ef03de013d445659614f3e3450bad0e63ad9ced": (
+            "19834:2026",
+            401897918,
         )
     }
 )
@@ -299,9 +355,10 @@ def _parse_game_info(
     int | None,
     str | None,
     dict[str, Any],
+    tuple[dict[str, Any], ...],
 ]:
     if "gameInfo" not in payload or payload["gameInfo"] is None:
-        return None, None, None, None, None, None, {}
+        return None, None, None, None, None, None, {}, ()
     info = required_mapping(payload["gameInfo"], "summary.gameInfo")
     venue_id: int | None = None
     venue_name: str | None = None
@@ -330,10 +387,11 @@ def _parse_game_info(
     )
     referee_id: int | None = None
     referee_name: str | None = None
+    ambiguous_officials: tuple[dict[str, Any], ...] = ()
     official_extras: list[dict[str, Any]] = []
     if "officials" in info:
         officials = required_list(info["officials"], "summary.gameInfo.officials")
-        referees: list[Mapping[str, Any]] = []
+        referees: list[tuple[int, Mapping[str, Any]]] = []
         for index, raw_official in enumerate(officials):
             official = required_mapping(
                 raw_official, f"summary.gameInfo.officials[{index}]"
@@ -353,7 +411,7 @@ def _parse_game_info(
                 "MATCH REFEREE",
             }
             if primary:
-                referees.append(official)
+                referees.append((index, official))
             else:
                 # An explicit but unrecognized role cannot safely populate the
                 # primary referee fields. Preserve the complete official row.
@@ -371,9 +429,25 @@ def _parse_game_info(
             else:
                 official_extras.append({})
         if len(referees) > 1:
-            raise EspnParseError("Summary contains multiple primary referees")
-        if referees:
-            referee = referees[0]
+            # A scalar referee column cannot represent multiple equally typed
+            # source rows. Validate and preserve all officials without guessing.
+            for index, referee in referees:
+                if "id" in referee and referee["id"] is not None:
+                    native_id(
+                        referee["id"],
+                        f"summary.gameInfo.officials[{index}].id",
+                    )
+                required_string(
+                    referee.get("fullName"),
+                    f"summary.gameInfo.officials[{index}].fullName",
+                )
+            official_extras = [
+                dict(required_mapping(row, f"summary.gameInfo.officials[{index}]"))
+                for index, row in enumerate(officials)
+            ]
+            ambiguous_officials = tuple(official_extras)
+        elif referees:
+            _, referee = referees[0]
             if "id" in referee and referee["id"] is not None:
                 referee_id = native_id(referee["id"], "summary referee.id")
             referee_name = required_string(
@@ -392,6 +466,7 @@ def _parse_game_info(
         referee_id,
         referee_name,
         extra,
+        ambiguous_officials,
     )
 
 
@@ -491,12 +566,16 @@ def _lineup(
     if not any(roster_presence):
         return (), _valid_empty_or_fail(capability, "lineup")
     if not all(roster_presence):
+        reviewed_identity = _REVIEWED_ONE_SIDED_LINEUPS.get(lineup_source_sha256)
+        if reviewed_identity == (event.scope_id, event.event_id):
+            return (), _valid_empty_or_fail(capability, "lineup")
         raise EspnParseError(
             "Summary lineup rosters must exist for both or neither team"
         )
 
     rows: list[LineupRow] = []
     per_team_rows: dict[int, list[LineupRow]] = {}
+    contradictory_substitution_semantics = False
     seen: set[tuple[int, int, int]] = set()
     for team_id, (side, team_name, block) in blocks.items():
         roster = required_list(
@@ -532,6 +611,10 @@ def _lineup(
             subbed_out = _substitution_flag(
                 player.get("subbedOut"), f"{field}.subbedOut"
             )
+            if (starter is True and subbed_in is True) or (
+                starter is False and subbed_out is True and subbed_in is not True
+            ):
+                contradictory_substitution_semantics = True
             sub_in, sub_out = _legacy_substitutions(
                 player,
                 field=field,
@@ -699,15 +782,22 @@ def _lineup(
             and len(set(counts)) == 1
             and counts[0] == small_sided_size
         )
-        if not conventional_xi and not balanced_small_sided:
-            reviewed_identity = _REVIEWED_TRUNCATED_LINEUPS.get(
+        observed_identity = (
+            event.scope_id,
+            event.event_id,
+            tuple(sorted(starter_counts.items())),
+        )
+        if contradictory_substitution_semantics:
+            reviewed_identity = _REVIEWED_CONTRADICTORY_LINEUPS.get(
                 lineup_source_sha256
             )
-            observed_identity = (
-                event.scope_id,
-                event.event_id,
-                tuple(sorted(starter_counts.items())),
+            if reviewed_identity == observed_identity:
+                return (), _valid_empty_or_fail(capability, "lineup")
+            raise EspnParseError(
+                "Summary lineup has contradictory starter/substitution semantics"
             )
+        if not conventional_xi and not balanced_small_sided:
+            reviewed_identity = _REVIEWED_TRUNCATED_LINEUPS.get(lineup_source_sha256)
             if (
                 capability is not CapabilityState.PROVEN
                 and reviewed_identity == observed_identity
@@ -779,6 +869,7 @@ def _matchsheet(
         int | None,
         str | None,
         dict[str, Any],
+        tuple[dict[str, Any], ...],
     ],
 ) -> tuple[tuple[MatchsheetRow, ...], EntityParseState]:
     capability = edition.capabilities.matchsheet
@@ -807,8 +898,33 @@ def _matchsheet(
         raise EspnParseError(
             "Summary matchsheet statistics must exist for both or neither team"
         )
+    statistics_by_team = {
+        team_id: required_list(
+            block.get("statistics"),
+            f"summary.boxscore.teams[{team_id}].statistics",
+        )
+        for team_id, (_, _, block) in blocks.items()
+    }
+    empty_statistics = {
+        team_id for team_id, statistics in statistics_by_team.items() if not statistics
+    }
+    if len(empty_statistics) == len(statistics_by_team):
+        return (), _valid_empty_or_fail(capability, "matchsheet")
+    if empty_statistics:
+        raise EspnParseError(
+            "Summary matchsheet statistics must be empty for both or neither team"
+        )
 
-    venue_id, venue_name, attendance, capacity, referee_id, referee_name, _ = game_info
+    (
+        venue_id,
+        venue_name,
+        attendance,
+        capacity,
+        referee_id,
+        referee_name,
+        _,
+        ambiguous_officials,
+    ) = game_info
     roster_by_team: dict[int, str] = {}
     if "rosters" in payload:
         rosters = required_list(payload["rosters"], "summary.rosters")
@@ -831,11 +947,7 @@ def _matchsheet(
     }
     rows: list[MatchsheetRow] = []
     for team_id, (side, team_name, block) in blocks.items():
-        statistics = required_list(
-            block.get("statistics"), f"summary.boxscore.teams[{team_id}].statistics"
-        )
-        if not statistics:
-            raise EspnParseError("Summary matchsheet team must contain core statistics")
+        statistics = statistics_by_team[team_id]
         values = _stat_values(
             statistics, f"summary.boxscore.teams[{team_id}].statistics"
         )
@@ -848,6 +960,12 @@ def _matchsheet(
         extra = unknown_fields(
             block, ("team", "homeAway", "statistics", "displayOrder")
         )
+        if ambiguous_officials:
+            if "summaryGameInfo" in extra:
+                raise EspnParseError(
+                    "Summary matchsheet extra field collides with preserved gameInfo"
+                )
+            extra["summaryGameInfo"] = {"officials": ambiguous_officials}
         rows.append(
             MatchsheetRow(
                 scope_id=event.scope_id,
@@ -977,8 +1095,8 @@ def parse_summary(
                 }
         if roster_extras:
             extras["rosters"] = roster_extras
-    if game_info[-1]:
-        extras["gameInfo"] = game_info[-1]
+    if game_info[-2]:
+        extras["gameInfo"] = game_info[-2]
     return SummaryParseResult(
         event_id=event.event_id,
         lineup=lineup,
