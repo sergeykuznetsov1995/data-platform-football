@@ -98,13 +98,14 @@ MATCHSHEET_STAT_NAME_MAP: Mapping[str, str] = MappingProxyType(
 
 # ESPN omitted Kai Jennings from AFC Wimbledon's otherwise explicit XI for
 # event 761072. Independent match reports list him as the eleventh starter, so
-# this exact immutable Summary is known to be truncated. Discard its lineup;
-# never synthesize the missing player or relax cardinality for other payloads.
+# this exact canonical lineup source (rosters plus format) is known to be
+# truncated. Discard its lineup; never synthesize the missing player or relax
+# cardinality elsewhere.
 _REVIEWED_TRUNCATED_LINEUPS: Mapping[
     str, tuple[str, int, tuple[tuple[int, int], ...]]
 ] = MappingProxyType(
     {
-        "c52e475f0cea8f775a9c3b47200c3a6a6ed1978a8e0e8ef961c320c20ad12230": (
+        "41c1ce43ba84ebb976040b5fb748f7a54c01d1d47ae5eff36193d74d9f289aad": (
             "18481:2025",
             761072,
             ((347, 11), (3802, 10)),
@@ -459,7 +460,6 @@ def _lineup_stat_values(sources: list[tuple[str, Any]], field: str) -> dict[str,
 def _lineup(
     payload: Mapping[str, Any],
     *,
-    raw_sha256: str,
     competition: Competition,
     edition: Edition,
     event: ScheduleRow,
@@ -471,6 +471,12 @@ def _lineup(
     rosters = required_list(payload["rosters"], "summary.rosters")
     if not rosters:
         return (), _valid_empty_or_fail(capability, "lineup")
+    lineup_source: dict[str, Any] = {"rosters": rosters}
+    if "format" in payload:
+        lineup_source["format"] = payload["format"]
+    lineup_source_sha256 = hashlib.sha256(
+        canonical_json(lineup_source).encode("utf-8")
+    ).hexdigest()
     blocks: dict[int, tuple[str, str, Mapping[str, Any]]] = {}
     for index, raw_roster in enumerate(rosters):
         team_id, side, team_name, block = _team_block(
@@ -694,7 +700,9 @@ def _lineup(
             and counts[0] == small_sided_size
         )
         if not conventional_xi and not balanced_small_sided:
-            reviewed_identity = _REVIEWED_TRUNCATED_LINEUPS.get(raw_sha256)
+            reviewed_identity = _REVIEWED_TRUNCATED_LINEUPS.get(
+                lineup_source_sha256
+            )
             observed_identity = (
                 event.scope_id,
                 event.event_id,
@@ -920,7 +928,6 @@ def parse_summary(
     game_info = _parse_game_info(payload, event)
     lineup, lineup_state = _lineup(
         payload,
-        raw_sha256=hashlib.sha256(raw).hexdigest(),
         competition=competition,
         edition=edition,
         event=event,

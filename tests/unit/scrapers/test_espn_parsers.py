@@ -781,7 +781,7 @@ def test_conventional_xi_requires_22_unique_starters() -> None:
 @pytest.mark.unit
 def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
     assert dict(summary_parser_module._REVIEWED_TRUNCATED_LINEUPS) == {
-        "c52e475f0cea8f775a9c3b47200c3a6a6ed1978a8e0e8ef961c320c20ad12230": (
+        "41c1ce43ba84ebb976040b5fb748f7a54c01d1d47ae5eff36193d74d9f289aad": (
             "18481:2025",
             761072,
             ((347, 11), (3802, 10)),
@@ -824,10 +824,22 @@ def test_only_reviewed_truncated_conventional_lineup_degrades_to_valid_empty(
         schedule[0].event_id,
         ((10, 11), (20, 10)),
     )
+    lineup_source = {"rosters": payload["rosters"]}
+    if "format" in payload:
+        lineup_source["format"] = payload["format"]
+    lineup_source_sha256 = hashlib.sha256(
+        json.dumps(
+            lineup_source,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
     monkeypatch.setattr(
         summary_parser_module,
         "_REVIEWED_TRUNCATED_LINEUPS",
-        {hashlib.sha256(raw).hexdigest(): identity},
+        {lineup_source_sha256: identity},
     )
     result = parse_summary(
         raw, competition=competition, edition=edition, event=schedule[0]
@@ -837,16 +849,38 @@ def test_only_reviewed_truncated_conventional_lineup_degrades_to_valid_empty(
     assert result.lineup_state is EntityParseState.VALID_EMPTY
     assert result.matchsheet_state is EntityParseState.CAPTURED
 
-    # The same parsed values with different raw bytes must not match.
+    # Unrelated response-byte drift must not change an identical roster section.
+    drifted = parse_summary(
+        raw + b"\n",
+        competition=competition,
+        edition=edition,
+        event=schedule[0],
+    )
+    assert drifted.lineup_state is EntityParseState.VALID_EMPTY
+
+    # A roster-section change with the same starter counts must not match.
+    changed_roster = deepcopy(payload)
+    changed_roster["rosters"][1]["roster"][0]["athlete"]["displayName"] = "Changed"
     with pytest.raises(EspnParseError, match="11 starters"):
         parse_summary(
-            raw + b"\n",
+            _raw(changed_roster),
             competition=competition,
             edition=edition,
             event=schedule[0],
         )
 
-    # The same raw hash must still match scope, event and exact team counts.
+    # A lineup-relevant format change with identical rosters must not match.
+    changed_format = deepcopy(payload)
+    changed_format["format"] = {"startersPerTeam": 5}
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            _raw(changed_format),
+            competition=competition,
+            edition=edition,
+            event=schedule[0],
+        )
+
+    # The same roster hash must still match scope, event and exact team counts.
     wrong_identities = (
         ("other:2025", schedule[0].event_id, ((10, 11), (20, 10))),
         (schedule[0].scope_id, schedule[0].event_id + 1, ((10, 11), (20, 10))),
@@ -856,7 +890,7 @@ def test_only_reviewed_truncated_conventional_lineup_degrades_to_valid_empty(
         monkeypatch.setattr(
             summary_parser_module,
             "_REVIEWED_TRUNCATED_LINEUPS",
-            {hashlib.sha256(raw).hexdigest(): wrong_identity},
+            {lineup_source_sha256: wrong_identity},
         )
         with pytest.raises(EspnParseError, match="11 starters"):
             parse_summary(
@@ -870,7 +904,7 @@ def test_only_reviewed_truncated_conventional_lineup_degrades_to_valid_empty(
     monkeypatch.setattr(
         summary_parser_module,
         "_REVIEWED_TRUNCATED_LINEUPS",
-        {hashlib.sha256(raw).hexdigest(): identity},
+        {lineup_source_sha256: identity},
     )
     proven_competition, proven_edition, proven_schedule = _schedule()
     with pytest.raises(EspnParseError, match="11 starters"):
