@@ -106,3 +106,97 @@ def test_backfill_has_finalize_and_cooldown(backfill):
     _python("finalize_chunk")
     cooldown = _python("wait_before_next_continuous_run")
     assert cooldown._init_kwargs["mode"] == "reschedule"
+
+
+# ------------------------ error budget (#1053) ----------------------------
+
+def _budget_context(tmp_path, report):
+    import json
+
+    path = tmp_path / "result.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    return {"templates_dict": {"result_path": str(path)}}
+
+
+def _scopes(total, failed_names=()):
+    scopes = [
+        {"scope": name, "status": "failed"} for name in failed_names
+    ]
+    scopes += [
+        {"scope": f"OK-{i}", "status": "success"}
+        for i in range(total - len(scopes))
+    ]
+    return scopes
+
+
+def test_ingest_daily_tolerates_runner_rc_when_report_exists(ingest):
+    # Красный rc раннера при живом отчёте — норма (#1053): судит бюджет.
+    cmd = _bash("ingest_daily")._init_kwargs["bash_command"]
+    assert "|| [ -s" in cmd
+
+
+def test_freshness_is_not_the_sole_leaf(ingest):
+    # #1053: единственный all_done-лист красил ран зелёным при упавшем сборе.
+    # Теперь гейт качества — самостоятельный лист, а freshness висит на
+    # ingest_daily параллельной веткой.
+    validate = _python("validate_data")
+    freshness = _python("validate_bronze_freshness")
+    assert freshness._init_kwargs["trigger_rule"] == "all_done"
+    assert validate.downstream_task_ids == set()
+    assert freshness.downstream_task_ids == set()
+    assert freshness.upstream_task_ids == {"ingest_daily"}
+    assert validate.upstream_task_ids == {"ingest_daily"}
+
+
+def test_validate_data_passes_within_error_budget(ingest, tmp_path):
+    report = {
+        "schema_version": 3,
+        "status": "failed",
+        "rows": 2_956_592,
+        "scopes": _scopes(141, ["RUS-Premier League=2526", "TUR-Super Lig=2526"]),
+        "errors": ["scope x: ProxyError"],
+    }
+    ingest.validate_data(**_budget_context(tmp_path, report))
+
+
+def test_validate_data_fails_on_protected_scope(ingest, tmp_path):
+    from airflow.exceptions import AirflowException
+
+    report = {
+        "schema_version": 3,
+        "status": "failed",
+        "rows": 1_000,
+        "scopes": _scopes(141, ["ENG-Premier League=2526"]),
+        "errors": [],
+    }
+    with pytest.raises(AirflowException, match="protected"):
+        ingest.validate_data(**_budget_context(tmp_path, report))
+
+
+def test_validate_data_fails_beyond_share_budget(ingest, tmp_path):
+    from airflow.exceptions import AirflowException
+
+    failed = [f"X-{i}=2526" for i in range(10)]
+    report = {
+        "schema_version": 3,
+        "status": "failed",
+        "rows": 1_000,
+        "scopes": _scopes(100, failed),
+        "errors": [],
+    }
+    with pytest.raises(AirflowException, match="budget"):
+        ingest.validate_data(**_budget_context(tmp_path, report))
+
+
+def test_validate_data_fails_on_zero_rows(ingest, tmp_path):
+    from airflow.exceptions import AirflowException
+
+    report = {
+        "schema_version": 3,
+        "status": "failed",
+        "rows": 0,
+        "scopes": _scopes(141, ["X-1=2526"]),
+        "errors": [],
+    }
+    with pytest.raises(AirflowException, match="zero rows"):
+        ingest.validate_data(**_budget_context(tmp_path, report))

@@ -71,28 +71,79 @@ def _load_report(path: str) -> dict[str, Any]:
     return report
 
 
+# Error budget (#1053): every daily run carries a handful of source-side scope
+# failures (observed steady state: ~4 of 141), so "any failure = red" would be
+# permanently red — as useless as the permanently green all_done leaf it
+# replaces. Red is reserved for signals someone must act on: a protected
+# top-league scope failing, the failed share exceeding the budget, or a run
+# that wrote nothing at all. Everything within budget passes loudly, with the
+# counters in the log.
+WHOSCORED_DAILY_MAX_FAILED_SCOPE_SHARE = 0.05
+WHOSCORED_PROTECTED_SCOPE_PREFIXES = (
+    "ENG-Premier League",
+    "ESP-La Liga",
+    "GER-Bundesliga",
+    "ITA-Serie A",
+    "FRA-Ligue 1",
+)
+
+
 def validate_data(**context: Any) -> None:
-    """Fail closed unless the runner reported a fully successful ingest."""
+    """Error-budget gate over the runner report (#1053)."""
     result_path = context["templates_dict"]["result_path"]
     report = _load_report(result_path)
     status = report.get("status")
     scopes = report.get("scopes") or []
+    rows = int(report.get("rows") or 0)
     failed = [
-        scope.get("scope")
+        str(scope.get("scope") or "")
         for scope in scopes
         if scope.get("status") not in {"success", "pending"}
     ]
+    protected_failed = [
+        scope
+        for scope in failed
+        if scope.startswith(WHOSCORED_PROTECTED_SCOPE_PREFIXES)
+    ]
     logger.info(
-        "WhoScored daily: status=%s scopes=%d rows=%s failed=%s",
+        "WhoScored daily: status=%s scopes=%d rows=%s failed=%d (%s) protected_failed=%s",
         status,
         len(scopes),
-        report.get("rows"),
-        failed,
+        rows,
+        len(failed),
+        ", ".join(failed) or "-",
+        protected_failed or "-",
     )
-    if status != "success":
+    if not scopes:
+        if status == "success":
+            return
         raise AirflowException(
-            f"WhoScored daily ingest status={status!r}; "
-            f"errors={report.get('errors')}; failed_scopes={failed}"
+            f"WhoScored daily ingest planned no scopes and status={status!r}; "
+            f"errors={report.get('errors')}"
+        )
+    if protected_failed:
+        raise AirflowException(
+            f"WhoScored daily ingest failed protected scope(s): {protected_failed}"
+        )
+    share = len(failed) / len(scopes)
+    if share > WHOSCORED_DAILY_MAX_FAILED_SCOPE_SHARE:
+        raise AirflowException(
+            f"WhoScored daily ingest failed {len(failed)}/{len(scopes)} scopes "
+            f"({share:.1%} > budget {WHOSCORED_DAILY_MAX_FAILED_SCOPE_SHARE:.0%}); "
+            f"errors={report.get('errors')}"
+        )
+    if rows <= 0:
+        raise AirflowException(
+            "WhoScored daily ingest wrote zero rows across "
+            f"{len(scopes)} scope(s) — collection did not happen"
+        )
+    if failed:
+        logger.warning(
+            "WhoScored daily ingest is within the error budget: "
+            "%d/%d failed scope(s), %d rows written",
+            len(failed),
+            len(scopes),
+            rows,
         )
 
 
@@ -141,12 +192,17 @@ with DAG(
 
     ingest_daily = BashOperator(
         task_id="ingest_daily",
+        # The runner exits non-zero whenever ANY scope failed, which is the
+        # steady state (#1053). A written report means the run completed and
+        # the error-budget gate downstream is the judge; the task itself only
+        # fails when the runner died without a report.
         bash_command=(
             "cd /opt/airflow && rm -f {result} && "
             "python {runner} daily "
             "--skip-profiles "
             "--transport-policy direct_only "
-            "--output {result}"
+            "--output {result} "
+            "|| [ -s {result} ]"
         ).format(runner=RUNNER, result=RESULT_PATH),
         env=_TASK_ENV,
         append_env=True,
@@ -164,4 +220,8 @@ with DAG(
         trigger_rule="all_done",
     )
 
-    discover_catalog >> ingest_daily >> validate >> bronze_freshness
+    # bronze_freshness stays useful on a red run (all_done), but it must not
+    # be the sole leaf that colours the run green while validate_data is
+    # upstream_failed (#1053) — the gate is a leaf of its own now.
+    discover_catalog >> ingest_daily >> validate
+    ingest_daily >> bronze_freshness
