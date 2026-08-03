@@ -1291,7 +1291,14 @@ def _lease_host_allowed(lease: Lease | None, host: str, port: int = 443) -> bool
             "sofascore",
             "sofascore_canary",
         }
-    if lease is not None and lease.source in ("sofascore", "sofascore_canary"):
+    if lease is not None and lease.source in (
+        "sofascore",
+        "sofascore_canary",
+        # Registry discovery is a metered JSON scan of the same catalog hosts;
+        # without this entry every discovery lease dies with 403 before the
+        # residential dial (#1093).
+        "sofascore_discovery",
+    ):
         return (
             normalized == "sofascore.com"
             or normalized.endswith(".sofascore.com")

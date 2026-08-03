@@ -234,6 +234,20 @@ def test_unknown_paid_lease_source_has_no_host_scope(mod):
     )
 
 
+@pytest.mark.parametrize(
+    "host",
+    ["sofascore.com", "api.sofascore.com", "www.sofascore.com"],
+)
+def test_sofascore_discovery_lease_reaches_the_catalog_hosts(mod, host):
+    """#1093: metered registry discovery scans the same catalog hosts as
+    production sofascore leases; the source must not fall into the unknown
+    default that refuses every dial with 403."""
+    lease = SimpleNamespace(source="sofascore_discovery")
+    assert mod._lease_host_allowed(lease, host, 443)
+    assert not mod._lease_host_allowed(lease, host, 80)
+    assert not mod._lease_host_allowed(lease, "evil.example", 443)
+
+
 def test_all_whoscored_paid_dags_are_recognized_but_default_to_zero(mod):
     for dag_id in (
         "dag_ingest_whoscored",
