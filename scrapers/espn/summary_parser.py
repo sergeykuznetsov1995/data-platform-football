@@ -314,6 +314,61 @@ _REVIEWED_TRUNCATED_LINEUPS: Mapping[
             401874090,
             ((4817, 10), (5501, 11)),
         ),
+        "ada9a6ab03d317a5367b71f56ecf73e72ab4b732251aa9541d875d69d1e6d688": (
+            "750:2026",
+            401859282,
+            ((3384, 10), (7112, 11)),
+        ),
+        "7c7e868a01ef3a4ac078751aa3b4021462a54a5faf530e63e2bb3788c41e64ab": (
+            "750:2026",
+            401859292,
+            ((3384, 10), (7476, 11)),
+        ),
+        "76524e8804ef2730c5ee4db878cc0b38fec1c0cb9170d103e42b66b4eec88a13": (
+            "750:2026",
+            401859295,
+            ((3384, 10), (7116, 11)),
+        ),
+        "ac022e4da079afc7b3f2c240f9560dd45f8fb38f513022399a9ca559e89251c0": (
+            "750:2026",
+            401859322,
+            ((3384, 10), (3393, 11)),
+        ),
+        "67e7ca8453744a470fbad76de3b025fbf57a4252e779380abdb086d8647a4719": (
+            "750:2026",
+            401859339,
+            ((3384, 10), (7116, 11)),
+        ),
+        "7552ae5531ed4da4ac3d95bd0702c98fb4166f85da0ad5e85a8d41bb292279c3": (
+            "750:2026",
+            401859347,
+            ((3384, 10), (22167, 11)),
+        ),
+        "3f993e1d6259613cd3b0195c2b9341e2b28e9ebe0da9dabcecf98ebad1f35910": (
+            "750:2026",
+            401859367,
+            ((3384, 10), (7476, 11)),
+        ),
+        "d583d18bfe9f4aa323941c73632973a5e90d918a15d4146bfbe079dcaab9ac93": (
+            "750:2026",
+            401859392,
+            ((3384, 10), (3385, 11)),
+        ),
+        "0b5a89362ccb342baeeb963d59b81494d695b24dc2ec84d66ab8f6e096a1e97d": (
+            "750:2026",
+            401859403,
+            ((3384, 10), (7115, 11)),
+        ),
+        "fef7edf4a722fdf39b4a99a0492c81a70528225cfd74393c5fd6d46db3c60fe9": (
+            "750:2026",
+            401859429,
+            ((3384, 10), (131701, 11)),
+        ),
+        "200dcbfdbeff2c7f7e083b49d7cdf1092f227a60b3188451863f67ff890537fe": (
+            "750:2026",
+            401859435,
+            ((3384, 10), (7111, 11)),
+        ),
     }
 )
 
@@ -464,6 +519,26 @@ _REVIEWED_CONTRADICTORY_LINEUPS: Mapping[
             401874024,
             ((5492, 11), (9902, 11)),
         ),
+        "7a7f0b292c9717f61d50648ea673f233429a264da431072c174dc46f5cc0d66c": (
+            "750:2026",
+            401859369,
+            ((3384, 11), (7112, 11)),
+        ),
+        "e31a9ecaf4eb74108214c6542b9930098289cc6dc1586af049ba27e803bd4d74": (
+            "750:2026",
+            401859388,
+            ((3384, 11), (3393, 11)),
+        ),
+        "87e341d8042b27960717ea36a2cc225fdd587b0920298db3203190e5ae794574": (
+            "750:2026",
+            401859419,
+            ((3384, 11), (131701, 11)),
+        ),
+        "b30f7d451580df80a7701b9a76e6e2c98ca7909a3ac049ec2340b42bbbd418ce": (
+            "750:2026",
+            401859420,
+            ((3384, 11), (7111, 11)),
+        ),
     }
 )
 
@@ -485,9 +560,7 @@ _REVIEWED_MALFORMED_LINEUPS: Mapping[
 # roster responses: every one is a structurally valid but partial participant
 # snapshot.  Keep a future valid XI, but discard only non-conventional roster
 # shapes for this exact scope when the registry does not promise lineups.
-_REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES: frozenset[str] = frozenset(
-    {"3904:2026"}
-)
+_REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES: frozenset[str] = frozenset({"3904:2026"})
 
 # Six 2012 CONCACAF U23 responses concatenate two roster snapshots and repeat
 # athletes with conflicting starter/bench flags.  Never choose or merge a

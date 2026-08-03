@@ -8,6 +8,7 @@ from datetime import date, timezone
 import hashlib
 import json
 from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -33,6 +34,87 @@ from scrapers.espn.parsers import (
 
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "espn"
+
+_COHORT_015_TRUNCATED_LINEUPS = {
+    "ada9a6ab03d317a5367b71f56ecf73e72ab4b732251aa9541d875d69d1e6d688": (
+        "750:2026",
+        401859282,
+        ((3384, 10), (7112, 11)),
+    ),
+    "7c7e868a01ef3a4ac078751aa3b4021462a54a5faf530e63e2bb3788c41e64ab": (
+        "750:2026",
+        401859292,
+        ((3384, 10), (7476, 11)),
+    ),
+    "76524e8804ef2730c5ee4db878cc0b38fec1c0cb9170d103e42b66b4eec88a13": (
+        "750:2026",
+        401859295,
+        ((3384, 10), (7116, 11)),
+    ),
+    "ac022e4da079afc7b3f2c240f9560dd45f8fb38f513022399a9ca559e89251c0": (
+        "750:2026",
+        401859322,
+        ((3384, 10), (3393, 11)),
+    ),
+    "67e7ca8453744a470fbad76de3b025fbf57a4252e779380abdb086d8647a4719": (
+        "750:2026",
+        401859339,
+        ((3384, 10), (7116, 11)),
+    ),
+    "7552ae5531ed4da4ac3d95bd0702c98fb4166f85da0ad5e85a8d41bb292279c3": (
+        "750:2026",
+        401859347,
+        ((3384, 10), (22167, 11)),
+    ),
+    "3f993e1d6259613cd3b0195c2b9341e2b28e9ebe0da9dabcecf98ebad1f35910": (
+        "750:2026",
+        401859367,
+        ((3384, 10), (7476, 11)),
+    ),
+    "d583d18bfe9f4aa323941c73632973a5e90d918a15d4146bfbe079dcaab9ac93": (
+        "750:2026",
+        401859392,
+        ((3384, 10), (3385, 11)),
+    ),
+    "0b5a89362ccb342baeeb963d59b81494d695b24dc2ec84d66ab8f6e096a1e97d": (
+        "750:2026",
+        401859403,
+        ((3384, 10), (7115, 11)),
+    ),
+    "fef7edf4a722fdf39b4a99a0492c81a70528225cfd74393c5fd6d46db3c60fe9": (
+        "750:2026",
+        401859429,
+        ((3384, 10), (131701, 11)),
+    ),
+    "200dcbfdbeff2c7f7e083b49d7cdf1092f227a60b3188451863f67ff890537fe": (
+        "750:2026",
+        401859435,
+        ((3384, 10), (7111, 11)),
+    ),
+}
+
+_COHORT_015_CONTRADICTORY_LINEUPS = {
+    "7a7f0b292c9717f61d50648ea673f233429a264da431072c174dc46f5cc0d66c": (
+        "750:2026",
+        401859369,
+        ((3384, 11), (7112, 11)),
+    ),
+    "e31a9ecaf4eb74108214c6542b9930098289cc6dc1586af049ba27e803bd4d74": (
+        "750:2026",
+        401859388,
+        ((3384, 11), (3393, 11)),
+    ),
+    "87e341d8042b27960717ea36a2cc225fdd587b0920298db3203190e5ae794574": (
+        "750:2026",
+        401859419,
+        ((3384, 11), (131701, 11)),
+    ),
+    "b30f7d451580df80a7701b9a76e6e2c98ca7909a3ac049ec2340b42bbbd418ce": (
+        "750:2026",
+        401859420,
+        ((3384, 11), (7111, 11)),
+    ),
+}
 
 
 def _load(name: str) -> dict:
@@ -86,6 +168,74 @@ def _schedule(payload: dict | None = None, **scope_kwargs):
         query_end=edition.end_date,
     )
     return competition, edition, rows
+
+
+def _cohort_015_summary_case(
+    identity: tuple[str, int, tuple[tuple[int, int], ...]],
+    *,
+    contradictory: bool,
+    lineup: CapabilityState,
+):
+    _, event_id, team_counts = identity
+    home_team_id = team_counts[0][0]
+    away_team_id = team_counts[1][0]
+    team_ids = {"home": home_team_id, "away": away_team_id}
+
+    scoreboard = _load("native_scoreboard.json")
+    scoreboard["leagues"][0].update(
+        {"id": "750", "slug": "test.750", "calendar": ["2026-03-01T12:00Z"]}
+    )
+    raw_event = scoreboard["events"][0]
+    raw_event.update({"id": str(event_id), "date": "2026-03-01T18:45Z"})
+    raw_event["season"]["year"] = 2026
+    for competitor in raw_event["competitions"][0]["competitors"]:
+        side = competitor["homeAway"]
+        competitor["team"]["id"] = str(team_ids[side])
+        competitor["team"]["displayName"] = f"{side.title()} {team_ids[side]}"
+
+    competition, edition, schedule = _schedule(
+        scoreboard,
+        espn_id=750,
+        slug="test.750",
+        year=2026,
+        start=date(2026, 1, 1),
+        end=date(2026, 12, 31),
+        lineup=lineup,
+    )
+
+    payload = _load("native_summary.json")
+    payload["header"]["id"] = str(event_id)
+    payload["header"]["competitions"][0]["date"] = "2026-03-01T18:45Z"
+    for competitor in payload["header"]["competitions"][0]["competitors"]:
+        side = competitor["homeAway"]
+        competitor["team"]["id"] = str(team_ids[side])
+        competitor["team"]["displayName"] = f"{side.title()} {team_ids[side]}"
+    for block in payload["boxscore"]["teams"]:
+        side = "away" if block["team"]["id"] == "20" else "home"
+        block["team"]["id"] = str(team_ids[side])
+        block["team"]["displayName"] = f"{side.title()} {team_ids[side]}"
+
+    counts_by_team = dict(team_counts)
+    for block in payload["rosters"]:
+        side = block["homeAway"]
+        team_id = team_ids[side]
+        starter_count = counts_by_team[team_id]
+        seed = block["roster"][0]
+        block["team"]["id"] = str(team_id)
+        block["team"]["displayName"] = f"{side.title()} {team_id}"
+        block["roster"] = []
+        for offset in range(13):
+            player = deepcopy(seed)
+            player["starter"] = offset < starter_count
+            player["captain"] = offset == 0
+            player["subbedIn"] = False
+            player["subbedOut"] = False
+            player["athlete"]["id"] = str(team_id * 100 + offset)
+            player["athlete"]["displayName"] = f"Player {team_id}-{offset}"
+            block["roster"].append(player)
+    if contradictory:
+        payload["rosters"][0]["roster"][0]["subbedIn"] = True
+    return competition, edition, schedule[0], payload
 
 
 @pytest.mark.unit
@@ -1252,6 +1402,7 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
             401874090,
             ((4817, 10), (5501, 11)),
         ),
+        **_COHORT_015_TRUNCATED_LINEUPS,
     }
     assert dict(summary_parser_module._REVIEWED_CONTRADICTORY_LINEUPS) == {
         "287b2052375fe3ef2fc4fc24f8c69f0be23d20adac832d86a098fc194275985f": (
@@ -1394,6 +1545,7 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
             401874024,
             ((5492, 11), (9902, 11)),
         ),
+        **_COHORT_015_CONTRADICTORY_LINEUPS,
     }
     assert dict(summary_parser_module._REVIEWED_MALFORMED_LINEUPS) == {
         "64f1f810c6a8ccfacb66cafd55c96988fdcef75ca40cf90e987a8171fa290d29": (
@@ -1436,6 +1588,111 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
         summary_parser_module._REVIEWED_ONE_SIDED_LINEUPS["0" * 64] = (  # type: ignore[index]
             "19834:2026",
             401897918,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("policy_name", "lineup_sha256", "identity"),
+    [
+        *(
+            ("truncated", lineup_sha256, identity)
+            for lineup_sha256, identity in _COHORT_015_TRUNCATED_LINEUPS.items()
+        ),
+        *(
+            ("contradictory", lineup_sha256, identity)
+            for lineup_sha256, identity in _COHORT_015_CONTRADICTORY_LINEUPS.items()
+        ),
+    ],
+)
+def test_cohort_015_lineup_exceptions_are_exact_and_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    policy_name: str,
+    lineup_sha256: str,
+    identity: tuple[str, int, tuple[tuple[int, int], ...]],
+) -> None:
+    policy_attr = (
+        "_REVIEWED_TRUNCATED_LINEUPS"
+        if policy_name == "truncated"
+        else "_REVIEWED_CONTRADICTORY_LINEUPS"
+    )
+    policy = getattr(summary_parser_module, policy_attr)
+    assert isinstance(policy, MappingProxyType)
+    assert policy[lineup_sha256] == identity
+
+    competition, edition, event, payload = _cohort_015_summary_case(
+        identity,
+        contradictory=policy_name == "contradictory",
+        lineup=CapabilityState.UNKNOWN,
+    )
+
+    def use_digest(digest: str) -> None:
+        monkeypatch.setattr(
+            summary_parser_module,
+            "hashlib",
+            SimpleNamespace(
+                sha256=lambda _raw: SimpleNamespace(hexdigest=lambda: digest)
+            ),
+        )
+
+    use_digest(lineup_sha256)
+    result = parse_summary(
+        _raw(payload), competition=competition, edition=edition, event=event
+    )
+    assert result.lineup == ()
+    assert result.lineup_state is EntityParseState.VALID_EMPTY
+    assert result.matchsheet
+    assert result.matchsheet_state is EntityParseState.CAPTURED
+
+    failure = "11 starters" if policy_name == "truncated" else "contradictory"
+    mutated_sha256 = ("0" if lineup_sha256[0] != "0" else "1") + lineup_sha256[1:]
+    use_digest(mutated_sha256)
+    with pytest.raises(EspnParseError, match=failure):
+        parse_summary(
+            _raw(payload), competition=competition, edition=edition, event=event
+        )
+
+    use_digest(lineup_sha256)
+    scope_id, event_id, starter_counts = identity
+    first_team_id, first_count = starter_counts[0]
+    mutated_identities = (
+        ("751:2026", event_id, starter_counts),
+        (scope_id, event_id + 1, starter_counts),
+        (
+            scope_id,
+            event_id,
+            ((first_team_id, first_count + 1), *starter_counts[1:]),
+        ),
+    )
+    for mutated_identity in mutated_identities:
+        monkeypatch.setattr(
+            summary_parser_module,
+            policy_attr,
+            MappingProxyType({lineup_sha256: mutated_identity}),
+        )
+        with pytest.raises(EspnParseError, match=failure):
+            parse_summary(
+                _raw(payload), competition=competition, edition=edition, event=event
+            )
+
+    monkeypatch.setattr(
+        summary_parser_module,
+        policy_attr,
+        MappingProxyType({lineup_sha256: identity}),
+    )
+    proven_competition, proven_edition, proven_event, proven_payload = (
+        _cohort_015_summary_case(
+            identity,
+            contradictory=policy_name == "contradictory",
+            lineup=CapabilityState.PROVEN,
+        )
+    )
+    with pytest.raises(EspnParseError):
+        parse_summary(
+            _raw(proven_payload),
+            competition=proven_competition,
+            edition=proven_edition,
+            event=proven_event,
         )
 
 
@@ -1995,9 +2252,9 @@ def test_balanced_small_sided_explicit_lineup_is_genuinely_non_conventional() ->
         lineup=CapabilityState.UNKNOWN
     )
     unbalanced = deepcopy(payload)
-    next(
-        roster for roster in unbalanced["rosters"] if roster["homeAway"] == "home"
-    )["roster"].pop()
+    next(roster for roster in unbalanced["rosters"] if roster["homeAway"] == "home")[
+        "roster"
+    ].pop()
     with pytest.raises(EspnParseError, match="11 starters"):
         parse_summary(
             _raw(unbalanced),
