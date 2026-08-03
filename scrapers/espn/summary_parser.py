@@ -96,11 +96,10 @@ MATCHSHEET_STAT_NAME_MAP: Mapping[str, str] = MappingProxyType(
     }
 )
 
-# ESPN omitted Kai Jennings from AFC Wimbledon's otherwise explicit XI for
-# event 761072. Independent match reports list him as the eleventh starter, so
-# this exact canonical lineup source (rosters plus format) is known to be
-# truncated. Discard its lineup; never synthesize the missing player or relax
-# cardinality elsewhere.
+# ESPN occasionally publishes an otherwise conventional roster with an exact
+# reviewed starter-cardinality defect.  Bind every exception to the canonical
+# lineup source (rosters plus format), scope, event and team counts.  Discard
+# its lineup; never synthesize a player or relax cardinality elsewhere.
 _REVIEWED_TRUNCATED_LINEUPS: Mapping[
     str, tuple[str, int, tuple[tuple[int, int], ...]]
 ] = MappingProxyType(
@@ -114,6 +113,61 @@ _REVIEWED_TRUNCATED_LINEUPS: Mapping[
             "19834:2026",
             401872737,
             ((124, 11), (3384, 10)),
+        ),
+        "7e5ceeae758c411a2be8e7693ba728d9ad6ff9f8b92fe5506ef3f71247887f3d": (
+            "3922:2026",
+            401856621,
+            ((580, 11), (11678, 12)),
+        ),
+        "d97c47b2e2e437033280a2182cad85c540e3cd622c2db9c1e2d68ffaac750378": (
+            "3922:2026",
+            401863500,
+            ((449, 11), (624, 12)),
+        ),
+        "58d2a9f9d41a3edd58af0795f389b6e718b5abc44e12654d7f8ba2bf45521726": (
+            "3922:2026",
+            401864003,
+            ((205, 12), (2659, 11)),
+        ),
+        "7ea0b551a150097dcd84d46a14b1e6bcfed57115931ef0982f721b119361b613": (
+            "3922:2026",
+            401867105,
+            ((4214, 10), (4277, 11)),
+        ),
+        "252ff0807fb86e598fce6433aab55898d8d535161047eb38b3769035982862af": (
+            "3922:2026",
+            401871169,
+            ((479, 12), (2850, 11)),
+        ),
+        "7b15e1d008506a2e495627b7d1da7347bff968a8ca70afefd053c3efb7c0681c": (
+            "3922:2026",
+            401874051,
+            ((4214, 10), (4385, 12)),
+        ),
+        "190cfb44654474b30825a9b001f59917e9c20fc10812481aaf117629943c79d4": (
+            "3928:2026",
+            401879512,
+            ((7251, 8), (7257, 11)),
+        ),
+        "31e4165e594c8166526c254535ccdc529c41911437ba7ea93aa225b1d1d94f90": (
+            "3928:2026",
+            401879513,
+            ((7254, 10), (7870, 9)),
+        ),
+        "b9e6120e51f6562faf02edcd10d6d0e02dc77574841128b95fa951276cbe2970": (
+            "3928:2026",
+            401879514,
+            ((17516, 9), (131213, 9)),
+        ),
+        "9af01563ee246de907407877a8048b47f25209eabbc1e34b06713d64306f7a89": (
+            "3928:2026",
+            401879517,
+            ((7252, 10), (7253, 11)),
+        ),
+        "3adb6bbe510e7a520a5deb6d8d99d540f27e343b8177f0f4eab4cedbbb06d061": (
+            "3928:2026",
+            401879623,
+            ((7259, 11), (131835, 6)),
         ),
     }
 )
@@ -204,6 +258,21 @@ _REVIEWED_CONTRADICTORY_LINEUPS: Mapping[
             "3911:2012",
             340357,
             ((2875, 12), (2888, 11)),
+        ),
+        "7141b48dd8adb4790be50a7fa8d7c4c6b4f2e5d6374de2b45efea7d000b881f1": (
+            "3922:2026",
+            401867936,
+            ((657, 8), (4214, 14)),
+        ),
+        "17d0e8226c3d20f947bfbe5d0b2578730a7f069a34cce259711300df0902c6a5": (
+            "3922:2026",
+            401872547,
+            ((469, 11), (7368, 11)),
+        ),
+        "b2febcd86b77adeb0227ce853ee7ae0cbb5dcd4d8b249b70625253f84d784304": (
+            "3922:2026",
+            401874104,
+            ((657, 10), (1038, 11)),
         ),
     }
 )
