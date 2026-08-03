@@ -3538,9 +3538,8 @@ def test_ttl_with_active_provider_state_revokes_and_never_releases_claim(
     assert first.allocation_finished is False
     assert first.accounting_uncertain is True
 
-    # A later in-process drain cannot prove that provider read-ahead contained
-    # no unmetered bytes. The durable claim therefore remains unavailable for
-    # retry instead of minting fresh allowance after the uncertainty latch.
+    # Inside the reclaim grace the drained latch still refuses retries: the
+    # client's own close path gets the first shot at a clean finish.
     first.active_tunnels = 0
     first.reserved_bytes = 0
     with pytest.raises(RuntimeError, match="active attempt"):
@@ -3552,6 +3551,24 @@ def test_ttl_with_active_provider_state_revokes_and_never_releases_claim(
             require_context=True,
         )
     assert first.allocation_finished is False
+
+    # #1060: past the grace the reaper performs the restart-equivalent
+    # recovery — the durable claim finishes with its eagerly charged bytes
+    # (completed=False, no new allowance minted), the slot frees, and the
+    # retry claims the allocation's remainder. The latch itself is permanent.
+    clock[0] = 3_031.0 + mod.LATCHED_SLOT_RECLAIM_GRACE_SECONDS + 1
+    retry = mod._create_lease(
+        mgr,
+        max_bytes=1000,
+        ttl_seconds=30,
+        metadata={**context, "attempt_id": "retry-after-grace"},
+        require_context=True,
+    )
+    assert first.allocation_finished is True
+    assert first.accounting_uncertain is True
+    assert retry.lease_id != first.lease_id
+    wal = mod._read_allocation_wal()
+    assert wal[first.lease_id]["finished"] is True
 
 
 def test_restart_recovers_endpoint_provenance_without_minting_bytes(mod):

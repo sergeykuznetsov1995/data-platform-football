@@ -229,6 +229,11 @@ SOFASCORE_CANARY_POLICY_ID = ""
 WHOSCORED_DAGRUN_BUDGET_BYTES = DEFAULT_WHOSCORED_PAID_CAP_BYTES
 URL_BUDGET_BYTES = 2_000_000
 MAX_ACTIVE_LEASES = 4
+# How long a latched (accounting-uncertain) SofaScore lease keeps its
+# concurrency slot before the reaper performs the restart-equivalent claim
+# finish (#1060). Mirrors the external watchdog's LATCH_GRACE_SECONDS so an
+# in-flight client close gets its normal path first.
+LATCHED_SLOT_RECLAIM_GRACE_SECONDS = 30
 LEASE_PROXY_URL = "http://proxy_filter:8900"
 LEDGER_PATH = "/opt/airflow/logs/proxy_filter/paid_requests.jsonl"
 SOFASCORE_ALLOCATION_LEDGER_PATH = (
@@ -950,6 +955,11 @@ class Lease:
     expected_endpoint_labels: tuple[str, ...] = ()
     proxy_exit_hash: str | None = None
     allocation_finished: bool = False
+    # Wall-clock moment the accounting-uncertainty latch engaged (0 = never).
+    # The reaper waits LATCHED_SLOT_RECLAIM_GRACE_SECONDS from here before the
+    # restart-equivalent claim finish, so a client-side close still in flight
+    # gets its normal path first (#1060).
+    latched_at: float = 0.0
     up_bytes: int = 0
     down_bytes: int = 0
     reserved_bytes: int = 0
@@ -3746,6 +3756,7 @@ def _latch_lease_accounting_uncertainty(lease: Lease) -> None:
                 lease.lease_id,
             )
     lease.accounting_uncertain = True
+    lease.latched_at = _wall_time()
     lease.closed = True
     lease.budget_exceeded = True
     _notify_reservation_turnover()
@@ -4843,6 +4854,62 @@ def _reap_expired_leases() -> int:
                         lease.lease_id,
                         retained,
                     )
+            if (
+                lease.source == "sofascore"
+                and lease.active_tunnels == 0
+                and not lease.allocation_finished
+                and lease.workload_plan is not None
+                and lease.allocation_claim is not None
+                and _wall_time() - lease.latched_at
+                >= LATCHED_SLOT_RECLAIM_GRACE_SECONDS
+            ):
+                # #1060: a client that dies mid-response latches the lease and,
+                # with max_active_leases=1, starves every retry with 429 until
+                # a container restart replays the allocation WAL. Perform the
+                # byte-identical recovery in-process: finish the durable claim
+                # with the eagerly charged endpoint map (completed=False, no
+                # new allowance minted, unproven read-ahead stays uncharged —
+                # exactly what the restart path does), then release only the
+                # concurrency facets. The uncertainty latch itself remains
+                # permanent forensic state.
+                try:
+                    if lease.current_request_id:
+                        _finish_endpoint_request(lease, lease.current_request_id)
+                    _allocation_ledger().finish(
+                        lease.workload_plan,
+                        lease.allocation_claim,
+                        lease_id=lease.lease_id,
+                        endpoint_request_provider_bytes=(
+                            lease.endpoint_request_provider_bytes
+                        ),
+                        completed=False,
+                        meter=WORKLOAD_METER,
+                        proxy_exit_hash=lease.proxy_exit_hash,
+                    )
+                except Exception:  # noqa: BLE001 - retain latched, fail closed
+                    log.exception(
+                        "could not finish durable claim for latched sofascore "
+                        "lease %s; slot stays held",
+                        lease.lease_id,
+                    )
+                else:
+                    _append_allocation_wal(
+                        "allocation_finished",
+                        lease.lease_id,
+                        completed=False,
+                        reaped_after_latch=True,
+                    )
+                    lease.allocation_finished = True
+                    if lease.reserved_bytes > 0:
+                        _release_lease_reservation(lease, lease.reserved_bytes)
+                    lease.provider_reserved_bytes = 0
+                    log.warning(
+                        "latched sofascore lease %s: durable claim finished "
+                        "with its eagerly charged bytes (restart-equivalent "
+                        "recovery); concurrency slot released",
+                        lease.lease_id,
+                    )
+                    reaped += 1
             continue
         if not lease.expired:
             continue
