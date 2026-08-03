@@ -5634,11 +5634,20 @@ def check_36h_freshness_and_alerts(**context) -> dict[str, str]:
     store = PostgresEspnControlStore.from_env()
     store.migrate()
     now = store.current_time()
+    frozen_state_ref = _frozen_discovery_state_ref()
+    if frozen_state_ref is None:
+        raise OperationsError(
+            "ESPN monitor requires a frozen discovery state reference"
+        )
     registry, discovery = _load_discovered_registry(now=now)
     discovery_state_ref = _discovery_artifact_ref(
         discovery.get("discovery_state_ref"),
         label="monitor discovery state reference",
     )
+    if discovery_state_ref != frozen_state_ref:
+        raise OperationsError(
+            "monitor discovery state reference differs from configured frozen target"
+        )
     male_registry_ref = _discovery_artifact_ref(
         discovery.get("male_registry_ref"),
         label="monitor male registry reference",

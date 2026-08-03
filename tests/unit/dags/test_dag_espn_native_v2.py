@@ -5536,6 +5536,14 @@ def test_monitor_checks_exact_frozen_181_scope_registry_and_binds_identity(
         ),
     )
     monkeypatch.setenv(espn_native_tasks.ARTIFACT_ROOT_ENV, "s3://artifacts")
+    monkeypatch.setenv(
+        espn_native_tasks.DISCOVERY_STATE_REF_URI_ENV,
+        discovery_state_ref["uri"],
+    )
+    monkeypatch.setenv(
+        espn_native_tasks.DISCOVERY_STATE_REF_SHA256_ENV,
+        discovery_state_ref["sha256"],
+    )
     context = {
         "dag": SimpleNamespace(dag_id="dag_monitor_espn"),
         "run_id": "monitor-run",
@@ -5636,6 +5644,14 @@ def test_monitor_rejects_tampered_frozen_registry_projection(
         "_load_discovered_registry",
         lambda *, now: (registry, discovery),
     )
+    monkeypatch.setenv(
+        espn_native_tasks.DISCOVERY_STATE_REF_URI_ENV,
+        "s3://artifacts/discovery/frozen-state.json",
+    )
+    monkeypatch.setenv(
+        espn_native_tasks.DISCOVERY_STATE_REF_SHA256_ENV,
+        "a" * 64,
+    )
 
     with pytest.raises(espn_native_tasks.OperationsError, match=message):
         espn_native_tasks.check_36h_freshness_and_alerts(
@@ -5710,6 +5726,11 @@ def test_monitor_rejects_complete_head_from_another_registry(monkeypatch):
         lambda uri, payload, **_kwargs: {"uri": uri, "sha256": "e" * 64},
     )
     monkeypatch.setenv(espn_native_tasks.ARTIFACT_ROOT_ENV, "s3://artifacts")
+    monkeypatch.setenv(espn_native_tasks.DISCOVERY_STATE_REF_URI_ENV, "state")
+    monkeypatch.setenv(
+        espn_native_tasks.DISCOVERY_STATE_REF_SHA256_ENV,
+        "a" * 64,
+    )
 
     espn_native_tasks.check_36h_freshness_and_alerts(
         dag=SimpleNamespace(dag_id="dag_monitor_espn"),
@@ -5768,6 +5789,52 @@ def test_monitor_rejects_partial_frozen_discovery_ref_without_static_fallback(
         )
 
 
+def test_monitor_rejects_missing_frozen_discovery_ref_without_latest_fallback(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+
+    database_now = datetime(2026, 7, 31, 13, tzinfo=timezone.utc)
+
+    class Store:
+        def migrate(self):
+            pass
+
+        def current_time(self):
+            return database_now
+
+    monkeypatch.delenv(espn_native_tasks.DISCOVERY_STATE_REF_URI_ENV, raising=False)
+    monkeypatch.delenv(espn_native_tasks.DISCOVERY_STATE_REF_SHA256_ENV, raising=False)
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: Store()),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_discovered_registry",
+        lambda *, now: pytest.fail(
+            "monitor without frozen refs must not read mutable latest-state"
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "load_registry",
+        lambda _path: pytest.fail("monitor must not fall back to static registry"),
+    )
+
+    with pytest.raises(
+        espn_native_tasks.OperationsError,
+        match="requires a frozen discovery state reference",
+    ):
+        espn_native_tasks.check_36h_freshness_and_alerts(
+            dag=SimpleNamespace(dag_id="dag_monitor_espn"),
+            run_id="monitor-run",
+            logical_date=database_now,
+            params={"attempt": 1},
+        )
+
+
 def test_monitor_uses_database_clock_and_distinguishes_missing_subject(monkeypatch):
     from dags.utils import espn_native_tasks
 
@@ -5818,6 +5885,11 @@ def test_monitor_uses_database_clock_and_distinguishes_missing_subject(monkeypat
         lambda uri, payload, **_kwargs: {"uri": uri, "sha256": "f" * 64},
     )
     monkeypatch.setenv(espn_native_tasks.ARTIFACT_ROOT_ENV, "s3://artifacts")
+    monkeypatch.setenv(espn_native_tasks.DISCOVERY_STATE_REF_URI_ENV, "state")
+    monkeypatch.setenv(
+        espn_native_tasks.DISCOVERY_STATE_REF_SHA256_ENV,
+        "b" * 64,
+    )
     context = {
         "dag": SimpleNamespace(dag_id="dag_monitor_espn"),
         "run_id": "monitor-run",
