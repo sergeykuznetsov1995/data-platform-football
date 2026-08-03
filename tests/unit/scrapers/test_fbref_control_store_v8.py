@@ -1274,3 +1274,65 @@ def test_session_failure_retries_same_run_and_logical_refresh_immediately():
     assert "frontier.state IN ('queued', 'retry')" in claim_source
     assert "WHERE logical_refresh_id = %s" in claim_source
     assert factory.connections[0].committed is True
+
+
+def test_contract_quarantine_is_a_distinct_verdict_from_the_scope_sweep():
+    captured = {}
+
+    def handler(sql, params):
+        captured["sql"] = sql
+        captured["params"] = params
+        return [], 1
+
+    store, factory = make_store(handler)
+    applied = store.quarantine_contract_rejected_target(
+        "fbref:season:76:2017",
+        content_hash="c" * 64,
+        reason="schedule_link_missing",
+    )
+
+    assert applied is True
+    sql = captured["sql"]
+    assert "SET state = 'quarantined'" in sql
+    assert "next_fetch_at = NULL" in sql
+    # A scope sweep reopens only its own verdict, so a parser verdict must not
+    # borrow its error class or the next sweep would resurrect the target.
+    assert "last_error_class = 'ParseContractQuarantined'" in sql
+    assert "ScopeQuarantined" not in sql
+    assert "state NOT IN ('leased', 'dead')" in sql
+    # Fenced to the rejected bytes: a newer fetch must not be retired on a
+    # verdict formed against content it already replaced.
+    assert "last_content_hash = %s" in sql
+    assert captured["params"] == (
+        "schedule_link_missing",
+        "fbref:season:76:2017",
+        "c" * 64,
+    )
+    assert "DELETE" not in sql
+    assert factory.connections[0].committed is True
+
+
+def test_contract_quarantine_reports_when_the_target_was_not_retired():
+    store, _ = make_store(lambda sql, params: ([], 0))
+
+    assert (
+        store.quarantine_contract_rejected_target(
+            "fbref:season:76:2017",
+            content_hash="c" * 64,
+            reason="schedule_link_missing",
+        )
+        is False
+    )
+
+
+def test_retired_targets_leave_both_the_cohort_and_the_unprocessed_raw_gate():
+    cohort = inspect.getsource(ControlStore.list_unprocessed_fetches)
+    summary = inspect.getsource(ControlStore.get_run_summary)
+
+    # Raw behind a retired target is out of scope by the same decision that
+    # retired it.  Both readers must agree: clearing recovery while the run
+    # summary still counts the same bytes only moves the failure downstream.
+    assert "frontier.state <> 'quarantined'" in cohort
+    assert "attempt.status = 'succeeded'" in cohort
+    assert "frontier.state <> 'quarantined'" in summary
+    assert "global_sla_overdue_count" in summary

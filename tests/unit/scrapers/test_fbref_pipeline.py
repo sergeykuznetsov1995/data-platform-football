@@ -498,7 +498,28 @@ class FakeControl:
                 **item,
             }
             for item in rows
+            if self.frontier.get(
+                str(item["target_id"]), {}
+            ).get("state") != "quarantined"
         ]
+
+    def quarantine_contract_rejected_target(
+        self, target_id, *, content_hash, reason
+    ):
+        row = self.frontier.get(str(target_id))
+        if row is None or row.get("state") in {"leased", "dead"}:
+            return False
+        if str(row.get("last_content_hash") or "") != str(content_hash):
+            return False
+        row.update(
+            state="quarantined",
+            next_fetch_at=None,
+            retry_after=None,
+            last_error_class="ParseContractQuarantined",
+            last_error_message=str(reason),
+        )
+        self.events.append(f"contract_quarantine:{target_id}")
+        return True
 
     def claim_observation_processing(self, **kwargs):
         key = (
@@ -2441,6 +2462,277 @@ def test_zero_table_source_shell_fails_before_typed_promotion(tmp_path):
 
     assert generic_writer.pages[0][0].tables == ()
     assert typed_writer.calls == []
+    # A shell that cannot prove its own identity may be a challenge page or a
+    # truncated capture: fresher bytes can still parse, so it must never be
+    # retired on this evidence.
+    assert control.frontier[record.target_id]["state"] == "fetched"
+
+
+def _schedule_less_season_wave(tmp_path):
+    """Cohort of the production shape plus a healthy season page.
+
+    A dead league's archived edition (NASL 2017) publishes squad tables but no
+    Scores & Fixtures link at all, which no retry can change.
+    """
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    for competition_id, name in (("76", "NASL"), ("122", "UEFA Super Cup")):
+        control.registry[competition_id] = {
+            "competition_id": competition_id,
+            "canonical_url": (
+                f"https://fbref.com/en/comps/{competition_id}/history/x"
+            ),
+            "name": name,
+            "gender": "male",
+            "classification": "cup:club",
+            "metadata": {},
+        }
+    rejected = page_target_from_link(DiscoveredPageLink(
+        page_kind="season",
+        canonical_url="https://fbref.com/en/comps/76/2017/2017-NASL-Stats",
+        source_ids={"competition_id": "76", "season_id": "2017"},
+    ))
+    healthy = page_target_from_link(DiscoveredPageLink(
+        page_kind="season",
+        canonical_url=(
+            "https://fbref.com/en/comps/122/2013-2014/"
+            "2013-UEFA-Super-Cup-Stats"
+        ),
+        source_ids={"competition_id": "122", "season_id": "2013-2014"},
+    ))
+    pages = [
+        (rejected, """
+        <div id="content"><h1>2017 NASL Stats</h1>
+          <a href="/en/comps/76/history/NASL-Seasons">Seasons</a>
+          <table id="stats_squads_standard_for">
+            <thead><tr><th data-stat="team">Squad</th></tr></thead>
+            <tbody><tr><td data-stat="team">New York Cosmos</td></tr></tbody>
+          </table>
+        </div>
+        """),
+        (healthy, """
+        <div id="content"><h1>2013 UEFA Super Cup Stats</h1>
+          <a href="/en/comps/122/history/UEFA-Super-Cup-Seasons">Seasons</a>
+        </div>
+        """),
+    ]
+    records = {}
+    for target, html in pages:
+        refresh, record = _commit_for_parse(raw, target, html)
+        records[target.target_id] = record
+        control.frontier[record.target_id] = {
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "source_ids": dict(record.source_ids),
+            "state": "fetched",
+            "last_content_hash": record.content_hash,
+        }
+        control.fetches.append({
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "logical_refresh_id": refresh,
+        })
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=ContractWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+    return control, pipeline, rejected.target_id, healthy.target_id
+
+
+def test_schedule_less_season_page_is_retired_without_failing_its_cohort(
+    tmp_path,
+):
+    control, pipeline, rejected_id, healthy_id = _schedule_less_season_wave(
+        tmp_path
+    )
+
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season"],
+        settings=_settings("current"),
+    )
+
+    assert result.failures == []
+    assert result.contract_quarantined == 1
+    # The healthy sibling in the same cohort is not held hostage.
+    assert result.parsed == 1
+    assert control.frontier[healthy_id]["state"] == "fetched"
+    rejected = control.frontier[rejected_id]
+    assert rejected["state"] == "quarantined"
+    assert rejected["last_error_class"] == "ParseContractQuarantined"
+    assert rejected["last_error_message"] == "schedule_link_missing"
+    assert rejected["next_fetch_at"] is None
+
+
+def test_contract_quarantine_drops_the_target_from_the_recovery_cohort(
+    tmp_path,
+):
+    control, pipeline, rejected_id, _ = _schedule_less_season_wave(tmp_path)
+
+    first = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season"],
+        settings=_settings("current"),
+    )
+    second = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season"],
+        settings=_settings("current"),
+    )
+
+    assert first.cohort_size == 2
+    # Without the retirement the same raw is re-selected by every later run,
+    # which is what blocked the daily DAG behind three archived seasons.
+    assert second.cohort_size == 0
+    assert control.frontier[rejected_id]["state"] == "quarantined"
+
+
+def test_unretired_contract_rejection_still_fails_the_wave(tmp_path):
+    control, pipeline, rejected_id, _ = _schedule_less_season_wave(tmp_path)
+    # A target that raced into a lease cannot be retired, and claiming progress
+    # that did not shrink the cohort would spin the recovery drain forever.
+    control.quarantine_contract_rejected_target = (
+        lambda target_id, *, reason: False
+    )
+
+    with pytest.raises(ParseWaveError, match="Season source contract failed"):
+        pipeline.recover_unprocessed_wave(
+            str(uuid.uuid4()),
+            page_kinds=["season"],
+            settings=_settings("current"),
+        )
+
+    assert control.frontier[rejected_id]["state"] == "fetched"
+
+
+def test_schedule_less_page_without_source_identity_is_never_retired(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="season",
+        canonical_url="https://fbref.com/en/comps/76/2017/2017-NASL-Stats",
+        source_ids={"competition_id": "76", "season_id": "2017"},
+    ))
+    # Tables but no competition-history backlink: a truncated or challenged
+    # capture looks exactly like this, and fresher bytes can still parse.
+    html = """
+    <div id="content"><h1>2017 NASL Stats</h1>
+      <table id="stats_squads_standard_for">
+        <thead><tr><th data-stat="team">Squad</th></tr></thead>
+        <tbody><tr><td data-stat="team">New York Cosmos</td></tr></tbody>
+      </table>
+    </div>
+    """
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    }]
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=ContractWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+
+    with pytest.raises(ParseWaveError, match="Season source contract failed"):
+        pipeline.recover_unprocessed_wave(
+            str(uuid.uuid4()),
+            page_kinds=["season"],
+            settings=_settings("current"),
+        )
+
+    assert control.frontier[record.target_id]["state"] == "fetched"
+
+
+def test_superseded_raw_of_a_rejecting_page_is_skipped_not_retired(tmp_path):
+    control, pipeline, rejected_id, _ = _schedule_less_season_wave(tmp_path)
+    # A newer fetch already replaced these bytes.  The content guard classifies
+    # the observation as stale before the contract is ever consulted, so the
+    # verdict is never formed against superseded evidence.
+    control.frontier[rejected_id]["last_content_hash"] = "a" * 64
+
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season"],
+        settings=_settings("current"),
+    )
+
+    assert result.failures == []
+    assert result.contract_quarantined == 0
+    assert result.stale_typed_observations_skipped == 1
+    assert control.frontier[rejected_id]["state"] == "fetched"
+
+
+def test_mass_contract_rejection_fails_the_wave_instead_of_shrinking_scope():
+    from scrapers.fbref.pipeline import _is_mass_contract_rejection
+
+    # A few unusable archived editions: routine, the wave carries on.
+    assert not _is_mass_contract_rejection(
+        WaveResult(cohort_size=25, contract_quarantined=3)
+    )
+    # Retirements dominate a live cohort: the source moved, not the pages.
+    assert _is_mass_contract_rejection(
+        WaveResult(cohort_size=25, contract_quarantined=25)
+    )
+    # Dominant but still small stays routine, so a short backlog can drain.
+    assert not _is_mass_contract_rejection(
+        WaveResult(cohort_size=5, contract_quarantined=5)
+    )
+    # Many retirements that do not dominate stay routine too.
+    assert not _is_mass_contract_rejection(
+        WaveResult(cohort_size=25, contract_quarantined=10)
+    )
+
+
+def test_wave_result_publishes_the_counter_the_recovery_drain_reads(tmp_path):
+    # The drain reads this key off as_dict(); the DAG-side test mocks the dict,
+    # so bind the name here.
+    assert "contract_quarantined" in WaveResult().as_dict()
+
+
+def test_non_contract_parse_failure_still_fails_the_whole_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="season",
+        canonical_url="https://fbref.com/en/comps/76/2017/2017-NASL-Stats",
+        source_ids={"competition_id": "76", "season_id": "2017"},
+    ))
+    refresh, record = _commit_for_parse(raw, target, "<html></html>")
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "target_id": "fbref:season:76:9999",
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    }]
+    pipeline = FBrefPipeline(control, raw, generic_writer=ContractWriter())
+
+    with pytest.raises(ParseWaveError, match="target mismatch"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["season"],
+            settings=_settings("current"),
+        )
+
+    assert control.frontier[record.target_id]["state"] == "fetched"
 
 
 def test_duplicate_display_label_selects_one_canonical_current_edition(
