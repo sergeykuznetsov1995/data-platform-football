@@ -216,6 +216,13 @@ class FakeQuery:
             and "FROM iceberg.bronze.espn_ingest_manifest_v2" in sql
         ):
             row = self.manifests.get((params[0], params[1]))
+            if (
+                row is not None
+                and "\"status\" = 'complete'" in sql
+                and row[EspnBronzeRepository.manifest_columns.index("status")]
+                != "complete"
+            ):
+                return []
             return [row] if row else []
         if " AS entity" in sql and "UNION ALL" in sql:
             return [
@@ -245,6 +252,13 @@ class PhysicalQuery(FakeQuery):
             and "FROM iceberg.bronze.espn_ingest_manifest_v2" in sql
         ):
             row = self.manifests.get((params[0], params[1]))
+            if (
+                row is not None
+                and "\"status\" = 'complete'" in sql
+                and row[EspnBronzeRepository.manifest_columns.index("status")]
+                != "complete"
+            ):
+                return []
             return [row] if row else []
         if 'SELECT DISTINCT "generation_signature", "_row_sha256"' in sql:
             relation_tables = {
@@ -335,6 +349,13 @@ CUTOVER_GRAPH_COLUMNS = (
 CUTOVER_ROUTE_COLUMNS = (
     *CUTOVER_GRAPH_COLUMNS,
     "active_source",
+    "previous_source",
+    "legacy_league",
+    "legacy_season",
+    "registry_signature",
+    "native_generation_id",
+    "native_generation_signature",
+    "native_manifest_sha256",
     "effective_at",
 )
 
@@ -1216,7 +1237,7 @@ def test_published_dq_rejects_noncomplete_exact_generation_manifest():
     )
     repository = EspnBronzeRepository(writer=FakeWriter(), query=query)
 
-    with pytest.raises(ManifestConflictError, match="status"):
+    with pytest.raises(PublicationError, match="missing"):
         repository.verify_published_scope(generation)
 
 
@@ -1891,9 +1912,32 @@ def _cutover_route_row(cutover, **changes):
 
 
 class CurrentRouteQuery(FakeQuery):
-    def __init__(self, routes=(), *, unresolved_fork=False, visible=None):
+    def __init__(
+        self,
+        routes=(),
+        *,
+        generation=None,
+        generations=(),
+        physical_valid=True,
+        conflicting_generation_signature=False,
+        unresolved_fork=False,
+        visible=None,
+    ):
         super().__init__()
         self.routes = list(routes)
+        self.physical_valid = physical_valid
+        self.conflicting_generation_signature = conflicting_generation_signature
+        candidates = tuple(generations)
+        if generation is not None:
+            candidates = (generation, *candidates)
+        self.generations = {
+            candidate.generation_id: candidate for candidate in candidates
+        }
+        for candidate in candidates:
+            manifest = candidate.manifest_row()
+            self.manifests[(candidate.plan.scope_id, candidate.generation_id)] = tuple(
+                manifest[column] for column in EspnBronzeRepository.manifest_columns
+            )
         self.unresolved_fork = unresolved_fork
         self.visible = dict(visible or {})
 
@@ -1914,6 +1958,34 @@ class CurrentRouteQuery(FakeQuery):
                 if view in sql
             )
             return [(self.visible.get(entity, 0),)]
+        if " AS entity" in sql and "UNION ALL" in sql and self.generations:
+            generation_id = (
+                params[3] if "stored_manifest_physical" in sql else params[1]
+            )
+            report = validate_scope_generation(self.generations[generation_id])
+            rows = [
+                (entity, report.row_counts[entity], report.row_hashes[entity])
+                for entity in ENTITY_TABLES
+            ]
+            rows.append(("ledger", report.ledger_count, report.ledger_hash))
+            if not self.physical_valid:
+                entity, count, digest = rows[0]
+                rows[0] = (entity, count + 1, digest)
+            return rows
+        if (
+            sql.lstrip().startswith("SELECT")
+            and f"FROM iceberg.bronze.{MANIFEST_TABLE}" in sql
+        ):
+            row = self.manifests.get((params[0], params[1]))
+            if row is None:
+                return []
+            if not self.conflicting_generation_signature:
+                return [row]
+            conflict = list(row)
+            conflict[
+                EspnBronzeRepository.manifest_columns.index("generation_signature")
+            ] = "f" * 64
+            return [row, tuple(conflict)]
         return []
 
 
@@ -1932,7 +2004,9 @@ def test_current_scope_route_tracks_unpromoted_native_and_legacy_rollback():
     assert (
         EspnBronzeRepository(
             writer=FakeWriter(),
-            query=CurrentRouteQuery((_cutover_route_row(native),)),
+            query=CurrentRouteQuery(
+                (_cutover_route_row(native),), generation=generation
+            ),
         ).current_scope_route(generation.plan.scope_id)
         == "native"
     )
@@ -1979,6 +2053,103 @@ def test_current_scope_route_rejects_malformed_graph_and_unresolved_fork():
 
 
 @pytest.mark.unit
+def test_current_scope_route_rejects_invalid_or_unproved_native_eligibility():
+    generation = _generation()
+    native = _native_cutover(generation)
+
+    with pytest.raises(PublicationError, match="matching COMPLETE manifest"):
+        EspnBronzeRepository(
+            writer=FakeWriter(),
+            query=CurrentRouteQuery((_cutover_route_row(native),)),
+        ).current_scope_route(generation.plan.scope_id)
+
+    mismatched = _cutover_route_row(native, native_manifest_sha256="f" * 64)
+    with pytest.raises(PublicationError, match="matching COMPLETE manifest"):
+        EspnBronzeRepository(
+            writer=FakeWriter(),
+            query=CurrentRouteQuery((mismatched,), generation=generation),
+        ).current_scope_route(generation.plan.scope_id)
+
+    malformed_fallback = _cutover_route_row(native, legacy_season=None)
+    with pytest.raises(PublicationError, match="both present or both null"):
+        EspnBronzeRepository(
+            writer=FakeWriter(),
+            query=CurrentRouteQuery((malformed_fallback,), generation=generation),
+        ).current_scope_route(generation.plan.scope_id)
+
+    with pytest.raises(
+        PublicationError, match="stored manifest physical row/hash parity failed"
+    ):
+        EspnBronzeRepository(
+            writer=FakeWriter(),
+            query=CurrentRouteQuery(
+                (_cutover_route_row(native),),
+                generation=generation,
+                physical_valid=False,
+            ),
+        ).current_scope_route(generation.plan.scope_id)
+
+    with pytest.raises(ManifestConflictError, match="conflicting manifests"):
+        EspnBronzeRepository(
+            writer=FakeWriter(),
+            query=CurrentRouteQuery(
+                (_cutover_route_row(native),),
+                generation=generation,
+                conflicting_generation_signature=True,
+            ),
+        ).current_scope_route(generation.plan.scope_id)
+
+
+@pytest.mark.unit
+def test_current_scope_route_activation_generation_does_not_pin_current_serving():
+    activation = _generation()
+    current = _generation(
+        generation_id="generation-2",
+        run_id="run-2",
+        batch_id="batch-2",
+        ingested_at=activation.ingested_at + timedelta(days=1),
+    )
+    native = _native_cutover(activation)
+    repository = EspnBronzeRepository(
+        writer=FakeWriter(),
+        query=CurrentRouteQuery(
+            (_cutover_route_row(native),),
+            generations=(activation, current),
+        ),
+    )
+
+    assert repository.current_scope_route(activation.plan.scope_id) == "native"
+    assert repository.verify_published_scope(current).passed
+    activation_physical_sql, activation_params = next(
+        (sql, params)
+        for sql, params in repository.query.calls
+        if "stored_manifest_physical" in sql
+    )
+    physical_identity_columns = (
+        "scope_id",
+        "competition_id",
+        "source_season_year",
+        "generation_id",
+        "generation_signature",
+        "run_id",
+        "_batch_id",
+        "registry_snapshot_uri",
+        "registry_signature",
+        "plan_signature",
+        "parser_version",
+        "runtime_version",
+    )
+    assert all(
+        activation_physical_sql.count(f'"{column}" = ?') == 4
+        for column in physical_identity_columns
+    )
+    assert {
+        activation_params[index + 3]
+        for index in range(0, len(activation_params), len(physical_identity_columns))
+    } == {activation.generation_id}
+
+
+@pytest.mark.unit
 def test_current_scope_absence_is_exact_and_rejects_native_visibility():
     scope_id = _generation().plan.scope_id
     repository = EspnBronzeRepository(writer=FakeWriter(), query=CurrentRouteQuery())
@@ -1992,7 +2163,10 @@ def test_current_scope_absence_is_exact_and_rejects_native_visibility():
         writer=FakeWriter(),
         query=CurrentRouteQuery(visible={"schedule": 1}),
     )
-    with pytest.raises(PublicationError, match="exposes native rows"):
+    with pytest.raises(
+        PublicationError,
+        match="exposes native rows while route uses fallback",
+    ):
         visible.verify_current_scope_absence(scope_id)
 
 

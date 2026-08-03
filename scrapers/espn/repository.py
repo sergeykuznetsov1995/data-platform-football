@@ -62,7 +62,28 @@ _CUTOVER_GRAPH_COLUMNS = (
 _CUTOVER_ROUTE_COLUMNS = (
     *_CUTOVER_GRAPH_COLUMNS,
     "active_source",
+    "previous_source",
+    "legacy_league",
+    "legacy_season",
+    "registry_signature",
+    "native_generation_id",
+    "native_generation_signature",
+    "native_manifest_sha256",
     "effective_at",
+)
+_PHYSICAL_IDENTITY_COLUMNS = (
+    "scope_id",
+    "competition_id",
+    "source_season_year",
+    "generation_id",
+    "generation_signature",
+    "run_id",
+    "_batch_id",
+    "registry_snapshot_uri",
+    "registry_signature",
+    "plan_signature",
+    "parser_version",
+    "runtime_version",
 )
 ENTITY_TABLES = MappingProxyType(
     {
@@ -1785,6 +1806,7 @@ class EspnBronzeRepository:
         rows = self._execute(
             f"SELECT {columns} FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE} "
             'WHERE "scope_id" = ? AND "generation_id" = ? '
+            "AND \"status\" = 'complete' "
             'ORDER BY "completed_at" DESC, "manifest_sha256" DESC',
             (scope_id, generation_id),
         )
@@ -1802,7 +1824,13 @@ class EspnBronzeRepository:
                         "stored manifest has an unexpected column count"
                     )
                 normalized.append(dict(zip(MANIFEST_COLUMNS, raw)))
-        fingerprints = {str(row["manifest_sha256"]) for row in normalized}
+        fingerprints = {
+            (
+                str(row["manifest_sha256"]),
+                str(row["generation_signature"]),
+            )
+            for row in normalized
+        }
         if len(fingerprints) != 1:
             raise ManifestConflictError(
                 "conflicting manifests share one generation identity"
@@ -1909,6 +1937,125 @@ class EspnBronzeRepository:
         if observed != expected:
             raise PublicationError(
                 f"physical row/hash parity failed: expected={expected!r}, observed={observed!r}"
+            )
+
+    def _verify_stored_manifest_physical(self, manifest: Mapping[str, Any]) -> None:
+        """Prove a stored COMPLETE manifest passes the current-view fence."""
+
+        try:
+            scope_id = _required_string(manifest.get("scope_id"), "stored scope_id")
+            if _SCOPE_RE.fullmatch(scope_id) is None:
+                raise ValueError("stored scope_id is invalid")
+            competition_id = _positive_native_id(
+                manifest.get("competition_id"), "stored competition_id"
+            )
+            source_season_year = _positive_native_id(
+                manifest.get("source_season_year"), "stored source_season_year"
+            )
+            if scope_id != f"{competition_id}:{source_season_year}":
+                raise ValueError("stored manifest scope identity is inconsistent")
+            identity = {
+                "scope_id": scope_id,
+                "competition_id": competition_id,
+                "source_season_year": source_season_year,
+                "generation_id": _required_string(
+                    manifest.get("generation_id"), "stored generation_id"
+                ),
+                "generation_signature": _sha256(
+                    manifest.get("generation_signature"),
+                    "stored generation_signature",
+                ),
+                "run_id": _required_string(manifest.get("run_id"), "stored run_id"),
+                "_batch_id": _required_string(
+                    manifest.get("_batch_id"), "stored _batch_id"
+                ),
+                "registry_snapshot_uri": _required_string(
+                    manifest.get("registry_snapshot_uri"),
+                    "stored registry_snapshot_uri",
+                ),
+                "registry_signature": _sha256(
+                    manifest.get("registry_signature"),
+                    "stored registry_signature",
+                ),
+                "plan_signature": _sha256(
+                    manifest.get("plan_signature"), "stored plan_signature"
+                ),
+                "parser_version": _required_string(
+                    manifest.get("parser_version"), "stored parser_version"
+                ),
+                "runtime_version": _required_string(
+                    manifest.get("runtime_version"), "stored runtime_version"
+                ),
+            }
+            if manifest.get("status") != "complete":
+                raise ValueError("stored manifest status is not complete")
+
+            raw_counts = manifest.get("row_counts_json")
+            raw_hashes = manifest.get("row_hashes_json")
+            if type(raw_counts) is not str or type(raw_hashes) is not str:
+                raise ValueError("stored manifest row metrics are not JSON strings")
+            counts = json.loads(raw_counts)
+            hashes = json.loads(raw_hashes)
+            if type(counts) is not dict or set(counts) != set(_ENTITIES):
+                raise ValueError("stored manifest row counts have invalid entities")
+            if type(hashes) is not dict or set(hashes) != set(_ENTITIES):
+                raise ValueError("stored manifest row hashes have invalid entities")
+            expected = {
+                entity: (
+                    _nonnegative_int(counts[entity], f"stored {entity} row count"),
+                    _sha256(hashes[entity], f"stored {entity} row hash"),
+                )
+                for entity in _ENTITIES
+            }
+            expected["ledger"] = (
+                _nonnegative_int(manifest.get("ledger_count"), "stored ledger_count"),
+                _sha256(manifest.get("ledger_hash"), "stored ledger_hash"),
+            )
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise PublicationError(
+                f"stored COMPLETE manifest is malformed: {exc}"
+            ) from exc
+
+        selects: list[str] = []
+        params: list[Any] = []
+        for entity, table in (*ENTITY_TABLES.items(), ("ledger", LEDGER_TABLE)):
+            predicates = " AND ".join(
+                f'"{column}" = ?' for column in _PHYSICAL_IDENTITY_COLUMNS
+            )
+            selects.append(
+                f"SELECT '{entity}' AS entity, COUNT(DISTINCT \"_row_sha256\") AS row_count, "
+                "COALESCE(lower(to_hex(sha256(to_utf8(array_join(array_sort(array_distinct(array_agg(\"_row_sha256\"))), ''))))), "
+                "lower(to_hex(sha256(to_utf8(''))))) AS row_hash "
+                f"FROM {self.catalog}.{self.schema}.{table} "
+                f"WHERE {predicates} /* stored_manifest_physical */"
+            )
+            params.extend(identity[column] for column in _PHYSICAL_IDENTITY_COLUMNS)
+        rows = self._execute(" UNION ALL ".join(selects), tuple(params))
+        observed: dict[str, tuple[int, str]] = {}
+        for raw in rows:
+            if isinstance(raw, Mapping):
+                entity = str(raw.get("entity"))
+                count = int(raw.get("row_count") or 0)
+                row_hash = str(raw.get("row_hash") or "")
+            elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+                if len(raw) != 3:
+                    raise PublicationError(
+                        "stored manifest physical parity row is malformed"
+                    )
+                entity, count, row_hash = str(raw[0]), int(raw[1]), str(raw[2] or "")
+            else:
+                raise PublicationError(
+                    "stored manifest physical parity row is malformed"
+                )
+            if entity in observed:
+                raise PublicationError(
+                    "stored manifest physical parity duplicated an entity"
+                )
+            observed[entity] = (count, row_hash)
+        if observed != expected:
+            raise PublicationError(
+                "stored manifest physical row/hash parity failed: "
+                f"expected={expected!r}, observed={observed!r}"
             )
 
     def _scope_has_unresolved_cutover_fork(self, scope_id: str) -> bool:
@@ -2139,7 +2286,13 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
         return observed_counts
 
     def current_scope_route(self, scope_id: str) -> str | None:
-        """Return the validated current-view route without mutating cutover state."""
+        """Return the route only after proving its current-view eligibility.
+
+        A native route is not useful evidence by itself: its fallback tuple and
+        activation-bound COMPLETE generation must also pass the same physical
+        fence as the view.  That activation proof is deliberately not a serving
+        pin; current rows may advance to a newer validated generation.
+        """
 
         if type(scope_id) is not str or _SCOPE_RE.fullmatch(scope_id) is None:
             raise ValueError("scope_id is invalid")
@@ -2168,18 +2321,81 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
             raise ManifestConflictError(
                 "scope has an unresolved cutover fork; current route is ambiguous"
             )
-        routes: dict[tuple[str, str], tuple[str, datetime]] = {}
+        routes: dict[tuple[str, str], tuple[Any, ...]] = {}
         for values in normalized:
-            if values[1] != scope_id:
-                continue
             cutover_id = _required_string(values[0], "stored cutover_id")
             cutover_hash = _sha256(values[2], "stored cutover_sha256")
-            active_source = values[-2]
+            active_source = values[7]
             if active_source not in {"native", "legacy", "absent"}:
                 raise PublicationError("stored cutover active_source is invalid")
-            effective_at = _stored_utc(values[-1], "stored cutover effective_at")
+            previous_source = values[8]
+            aliases = (values[9], values[10])
+            if (aliases[0] is None) != (aliases[1] is None):
+                raise PublicationError(
+                    "stored cutover legacy aliases must be both present or both null"
+                )
+            has_legacy_fallback = aliases[0] is not None
+            if has_legacy_fallback:
+                legacy_league = _required_string(
+                    aliases[0], "stored cutover legacy_league"
+                )
+                legacy_season = _required_string(
+                    aliases[1], "stored cutover legacy_season"
+                )
+            else:
+                legacy_league = legacy_season = None
+            registry_signature = _sha256(
+                values[11], "stored cutover registry_signature"
+            )
+            native_values = values[12:15]
+            if active_source == "native":
+                if previous_source not in {"legacy", "absent"}:
+                    raise PublicationError(
+                        "stored native cutover previous_source is invalid"
+                    )
+                if (previous_source == "legacy") != has_legacy_fallback:
+                    raise PublicationError(
+                        "stored native cutover fallback source and aliases disagree"
+                    )
+                native_generation_id = _required_string(
+                    native_values[0], "stored cutover native_generation_id"
+                )
+                native_generation_signature = _sha256(
+                    native_values[1],
+                    "stored cutover native_generation_signature",
+                )
+                native_manifest_sha256 = _sha256(
+                    native_values[2], "stored cutover native_manifest_sha256"
+                )
+            else:
+                if previous_source != "native" or any(
+                    value is not None for value in native_values
+                ):
+                    raise PublicationError(
+                        "stored rollback must transition from native without native binding"
+                    )
+                if (active_source == "legacy") != has_legacy_fallback:
+                    raise PublicationError(
+                        "stored rollback source and legacy aliases disagree"
+                    )
+                native_generation_id = None
+                native_generation_signature = None
+                native_manifest_sha256 = None
+            effective_at = _stored_utc(values[15], "stored cutover effective_at")
+            if values[1] != scope_id:
+                continue
             identity = (cutover_id, cutover_hash)
-            route = (active_source, effective_at)
+            route = (
+                active_source,
+                previous_source,
+                legacy_league,
+                legacy_season,
+                registry_signature,
+                native_generation_id,
+                native_generation_signature,
+                native_manifest_sha256,
+                effective_at,
+            )
             previous = routes.setdefault(identity, route)
             if previous != route:
                 raise ManifestConflictError(
@@ -2187,15 +2403,25 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
                 )
         if not routes:
             return None
-        return max(
-            (
-                (effective_at, cutover_id, cutover_hash, active_source)
-                for (cutover_id, cutover_hash), (
-                    active_source,
-                    effective_at,
-                ) in routes.items()
-            ),
-        )[-1]
+        (cutover_id, cutover_hash), selected = max(
+            routes.items(),
+            key=lambda item: (item[1][-1], item[0][0], item[0][1]),
+        )
+        active_source = selected[0]
+        if active_source == "native":
+            manifest = self._existing_manifest(scope_id, selected[5])
+            if (
+                manifest is None
+                or manifest.get("status") != "complete"
+                or manifest.get("registry_signature") != selected[4]
+                or manifest.get("generation_signature") != selected[6]
+                or manifest.get("manifest_sha256") != selected[7]
+            ):
+                raise PublicationError(
+                    "current native route is not bound to a matching COMPLETE manifest"
+                )
+            self._verify_stored_manifest_physical(manifest)
+        return active_source
 
     def verify_current_scope_absence(self, scope_id: str) -> dict[str, int]:
         """Prove cutover-gated views expose no native rows for one scope."""
@@ -2233,7 +2459,7 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
                 )
             if count:
                 raise PublicationError(
-                    f"{entity} current view exposes native rows while route is legacy"
+                    f"{entity} current view exposes native rows while route uses fallback"
                 )
             observed[entity] = count
         return observed
@@ -2853,20 +3079,7 @@ def render_current_view_sql(
         else f'CAST(NULL AS {_column_type(entity, column)}) AS "{column}"'
         for column in columns
     )
-    join_keys = (
-        "scope_id",
-        "competition_id",
-        "source_season_year",
-        "generation_id",
-        "generation_signature",
-        "run_id",
-        "_batch_id",
-        "registry_snapshot_uri",
-        "registry_signature",
-        "plan_signature",
-        "parser_version",
-        "runtime_version",
-    )
+    join_keys = _PHYSICAL_IDENTITY_COLUMNS
     # The signature is an isolation boundary.  Rows left by an incomplete
     # concurrent attempt with the same generation_id but another signature do
     # not contaminate (or hide) the manifest-bound generation.
