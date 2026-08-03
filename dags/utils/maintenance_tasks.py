@@ -957,41 +957,23 @@ class _CompactionProbeResult:
     skipped_delete_partitions: int
 
 
-def _compaction_candidates(
+def _is_missing_partition_column_error(exc: BaseException) -> bool:
+    """True for Trino COLUMN_NOT_FOUND on the ``partition`` metadata column."""
+
+    text = str(exc)
+    return "COLUMN_NOT_FOUND" in text and "'partition'" in text
+
+
+def _run_compaction_probe_query(
     conn,
     *,
-    schema: str,
-    table: str,
-    max_input_bytes: int,
-) -> _CompactionProbeResult:
-    """Return a bounded exact-path set from one small-file partition.
-
-    The exact ``count_if`` predicate avoids permanently skipping partitions
-    that contain both large and small files. The lowest lexical small-file
-    path is a deterministic progress cursor: after those exact paths are
-    rewritten, the next partition/path set advances without mutable state.
-
-    Any partition containing a live position/equality delete file is excluded.
-    Otherwise OPTIMIZE could read bytes that are absent from the data-file-only
-    budget, and exact-path subset rewrites can leave active delete files behind.
-    The skipped partition count is returned for operational visibility rather
-    than silently undercounting that workload. Only one clean partition and a
-    256-path window reach the bounded ranking CTE. Both the 64-file and byte
-    limits are enforced in SQL and revalidated in Python before a path can
-    reach ``OPTIMIZE``.
-    """
-
-    if type(max_input_bytes) is not int or max_input_bytes <= 0:
-        raise ValueError("max_input_bytes must be a positive integer")
-    budget = min(max_input_bytes, COMPACTION_MAX_INPUT_BYTES_PER_TABLE)
-    if budget <= 0:
-        return _CompactionProbeResult((), 0)
-    schema_sql = _quote_identifier(schema)
-    files_sql = _quote_identifier(f"{table}$files")
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            f"""
+    schema_sql: str,
+    files_sql: str,
+    budget: int,
+    partitioned: bool = True,
+) -> list:
+    if partitioned:
+        inventory_sql = f"""
             WITH partition_inventory AS (
                 SELECT
                     partition,
@@ -1031,7 +1013,43 @@ def _compaction_candidates(
                   AND f.file_size_in_bytes < {COMPACTION_SMALL_FILE_MAX_BYTES}
                 ORDER BY f.file_path
                 LIMIT {COMPACTION_DISCOVERY_MAX_FILES}
+            ),"""
+    else:
+        # Unpartitioned table: ``$files`` has no ``partition`` column, the
+        # whole table is the single candidate under identical predicates.
+        inventory_sql = f"""
+            WITH partition_inventory AS (
+                SELECT
+                    count_if(
+                        content = 0
+                        AND file_size_in_bytes > 0
+                        AND file_size_in_bytes < {COMPACTION_SMALL_FILE_MAX_BYTES}
+                    ) AS small_data_files_count,
+                    count_if(content IS DISTINCT FROM 0) AS delete_files_count
+                FROM iceberg.{schema_sql}.{files_sql}
             ),
+            candidate_partition AS (
+                SELECT 1 AS whole_table
+                FROM partition_inventory
+                WHERE small_data_files_count >= 2
+                  AND delete_files_count = 0
+                LIMIT 1
+            ),
+            candidate_files AS (
+                SELECT f.file_path, f.file_size_in_bytes
+                FROM iceberg.{schema_sql}.{files_sql} f
+                CROSS JOIN candidate_partition
+                WHERE f.content = 0
+                  AND f.file_size_in_bytes > 0
+                  AND f.file_size_in_bytes < {COMPACTION_SMALL_FILE_MAX_BYTES}
+                ORDER BY f.file_path
+                LIMIT {COMPACTION_DISCOVERY_MAX_FILES}
+            ),"""
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            inventory_sql
+            + f"""
             bounded_files AS (
                 SELECT
                     file_path,
@@ -1067,9 +1085,63 @@ def _compaction_candidates(
             ORDER BY file_path NULLS LAST
             """
         )
-        rows = cur.fetchall()
+        return cur.fetchall()
     finally:
         cur.close()
+
+
+def _compaction_candidates(
+    conn,
+    *,
+    schema: str,
+    table: str,
+    max_input_bytes: int,
+) -> _CompactionProbeResult:
+    """Return a bounded exact-path set from one small-file partition.
+
+    The exact ``count_if`` predicate avoids permanently skipping partitions
+    that contain both large and small files. The lowest lexical small-file
+    path is a deterministic progress cursor: after those exact paths are
+    rewritten, the next partition/path set advances without mutable state.
+
+    Any partition containing a live position/equality delete file is excluded.
+    Otherwise OPTIMIZE could read bytes that are absent from the data-file-only
+    budget, and exact-path subset rewrites can leave active delete files behind.
+    The skipped partition count is returned for operational visibility rather
+    than silently undercounting that workload. Only one clean partition and a
+    256-path window reach the bounded ranking CTE. Both the 64-file and byte
+    limits are enforced in SQL and revalidated in Python before a path can
+    reach ``OPTIMIZE``.
+    """
+
+    if type(max_input_bytes) is not int or max_input_bytes <= 0:
+        raise ValueError("max_input_bytes must be a positive integer")
+    budget = min(max_input_bytes, COMPACTION_MAX_INPUT_BYTES_PER_TABLE)
+    if budget <= 0:
+        return _CompactionProbeResult((), 0)
+    schema_sql = _quote_identifier(schema)
+    files_sql = _quote_identifier(f"{table}$files")
+    try:
+        rows = _run_compaction_probe_query(
+            conn,
+            schema_sql=schema_sql,
+            files_sql=files_sql,
+            budget=budget,
+        )
+    except Exception as exc:
+        if not _is_missing_partition_column_error(exc):
+            raise
+        # #1054: an unpartitioned Iceberg table exposes no ``partition``
+        # column in ``$files``, so the partition-ranked probe fails with
+        # COLUMN_NOT_FOUND. The whole table is then the single candidate:
+        # same bounded predicates and delete-file contract, no grouping.
+        rows = _run_compaction_probe_query(
+            conn,
+            schema_sql=schema_sql,
+            files_sql=files_sql,
+            budget=budget,
+            partitioned=False,
+        )
 
     selected: list[tuple[str, int]] = []
     selected_paths: set[str] = set()
