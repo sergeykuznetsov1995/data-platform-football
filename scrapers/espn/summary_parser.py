@@ -249,6 +249,71 @@ _REVIEWED_TRUNCATED_LINEUPS: Mapping[
             401860171,
             ((9970, 11), (17313, 12)),
         ),
+        "7dc19bdd9487d3bd6a4e56a6687e19c10b6cadbf1813d671701b4cfb0b218a65": (
+            "630:2026",
+            401841140,
+            ((2029, 12), (9318, 12)),
+        ),
+        "983e7c6532af8166ec008db0e853db21ae9cfb5ed5604a2fa7b43bf23e939ae6": (
+            "650:2026",
+            401873658,
+            ((4815, 11), (5264, 12)),
+        ),
+        "20ef46b014790d969a6b3caef0fd234d29cf1f1b58f2b5a6ad530a9064cc5b7b": (
+            "680:2026",
+            401872687,
+            ((4817, 10), (8416, 11)),
+        ),
+        "e0e5bdfc51870d5cbdda46009c8e6a97d97c8d9d84e458034ebaac79b612ca72": (
+            "680:2026",
+            401872695,
+            ((19002, 11), (21403, 9)),
+        ),
+        "27f41710a5c316d9a2634c7e8c4107d8c60bd51c472a2abf1c9f614613eff60a": (
+            "680:2026",
+            401872700,
+            ((2684, 11), (10000, 10)),
+        ),
+        "242a83340f67d07615de53ba2ca49e3bc244b7616717a957a0b48d3260e4efb7": (
+            "680:2026",
+            401872701,
+            ((4817, 10), (6866, 8)),
+        ),
+        "97a872c662c32dd87b6c1a22feadf4462d65f63d4068010ea5e7b2996b9cd7e6": (
+            "680:2026",
+            401872711,
+            ((2684, 11), (4817, 10)),
+        ),
+        "acab9a5675a4069d23ed8a5c04d92ffb9791a397dffed0e19518333464f7bc1b": (
+            "680:2026",
+            401872712,
+            ((1007, 11), (9902, 10)),
+        ),
+        "da02d5120d8a355451e2ea02965d7054664380c8a571458ddac6446cf1adfbf2": (
+            "680:2026",
+            401872714,
+            ((10000, 10), (21403, 9)),
+        ),
+        "0c519a3186b8e6bfa2358eda1ea9b5da6265574c5620c383908bff7bda1a7f25": (
+            "680:2026",
+            401872717,
+            ((5501, 10), (6866, 9)),
+        ),
+        "0b93d915afdc9a5c38c57ccf68484e611c4e34a247895dcb19ee43ba67272e75": (
+            "680:2026",
+            401872721,
+            ((8416, 11), (21403, 9)),
+        ),
+        "519887a8d42dd79e2101dde738af591e48ff012ac6917feab347a6a0809750d6": (
+            "680:2026",
+            401872726,
+            ((4817, 10), (19002, 11)),
+        ),
+        "3c6790f8c3a2a3c5c2a8124f44ac1f2576d5df3d535ae0ce212bf8ea588bcfc4": (
+            "680:2026",
+            401874090,
+            ((4817, 10), (5501, 11)),
+        ),
     }
 )
 
@@ -384,6 +449,35 @@ _REVIEWED_CONTRADICTORY_LINEUPS: Mapping[
             401869747,
             ((6946, 11), (9780, 11)),
         ),
+        "14fa3e7b4173ac6d9c09313e1b6f2fd02b09d080fef176e88960a708f1dc5999": (
+            "640:2026",
+            401850512,
+            ((4138, 11), (8110, 11)),
+        ),
+        "c70bad3b868c1e161ca8bf8edc44bdf30d4d0dcf813f9fbc4eef61fdea8365f0": (
+            "660:2026",
+            401859568,
+            ((2686, 11), (10307, 11)),
+        ),
+        "a3bb00aa009db5f818da69ac4c39688b5879f16dda8c1609381da69e37be5158": (
+            "680:2026",
+            401874024,
+            ((5492, 11), (9902, 11)),
+        ),
+    }
+)
+
+# ESPN published empty substitution clocks for this exact roster. Discard its
+# lineup before clock validation rather than infer a substitution minute.
+_REVIEWED_MALFORMED_LINEUPS: Mapping[
+    str, tuple[str, int, tuple[tuple[int, int], ...]]
+] = MappingProxyType(
+    {
+        "64f1f810c6a8ccfacb66cafd55c96988fdcef75ca40cf90e987a8171fa290d29": (
+            "680:2026",
+            401872713,
+            ((9999, 11), (131688, 9)),
+        )
     }
 )
 
@@ -833,6 +927,35 @@ def _lineup(
         raise EspnParseError(
             "Summary lineup rosters must exist for both or neither team"
         )
+
+    reviewed_identity = _REVIEWED_MALFORMED_LINEUPS.get(lineup_source_sha256)
+    if reviewed_identity is not None:
+        starter_counts = tuple(
+            sorted(
+                (
+                    team_id,
+                    sum(
+                        optional_bool(
+                            required_mapping(
+                                raw_player,
+                                f"summary.rosters[{team_id}].roster[{index}]",
+                            ).get("starter"),
+                            f"summary.rosters[{team_id}].roster[{index}].starter",
+                        )
+                        is True
+                        for index, raw_player in enumerate(
+                            required_list(
+                                block.get("roster"),
+                                f"summary.rosters[{team_id}].roster",
+                            )
+                        )
+                    ),
+                )
+                for team_id, (_, _, block) in blocks.items()
+            )
+        )
+        if reviewed_identity == (event.scope_id, event.event_id, starter_counts):
+            return (), _valid_empty_or_fail(capability, "lineup")
 
     rows: list[LineupRow] = []
     per_team_rows: dict[int, list[LineupRow]] = {}
