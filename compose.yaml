@@ -345,6 +345,13 @@ services:
       - -allowDeleteBucketNotEmpty=false
       - -concurrentFileUploadLimit=16
       - -concurrentUploadLimitMB=512
+    # The Go runtime must know about the cgroup ceiling: without GOMEMLIMIT
+    # the GC let anon-RSS reach the 1G limit and cgroup-OOM killed the gateway
+    # roughly daily (2026-07-28..31, RestartCount=11), tearing Iceberg
+    # operations mid-flight. 2GiB leaves the collector a whole GiB of slack
+    # under the raised 3G ceiling before the kernel gets involved.
+    environment:
+      GOMEMLIMIT: 2GiB
     volumes:
       - ${SEAWEEDFS_S3_CONFIG_FILE:-./configs/seaweedfs/s3.config.json}:/etc/seaweedfs/s3.config.json:ro
       - ./scripts/seaweedfs_legacy_entrypoint.sh:/usr/local/bin/seaweedfs-legacy-entrypoint:ro
@@ -369,7 +376,10 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          # 1G sat at the observed working set and cgroup-OOM killed the only
+          # Iceberg S3 path daily; 3G matches the live `docker update` applied
+          # 2026-07-31 so a compose recreate cannot silently shrink it back.
+          memory: 3G
         reservations:
           memory: 128M
 
