@@ -248,7 +248,9 @@ def test_fixture_endpoint_specs_validate_and_parse_every_branch(endpoint, datase
     )
     assert spec.schema_validator(payload) is True
     assert spec.empty_predicate(payload) is False
-    assert spec.not_supported_http_statuses == ()
+    # final-спек: 404 завершённого матча терминален (#1039); до финала — ()
+    assert spec.not_supported_http_statuses == (404,)
+    assert _spec(endpoint, freshness_key="day-2026-07-01").not_supported_http_statuses == ()
     assert set(spec.parsers) == datasets
     parsed = {name: parser(payload) for name, parser in spec.parsers.items()}
     assert all(isinstance(rows, list) and rows for rows in parsed.values())
@@ -435,8 +437,21 @@ def test_player_specs_fail_closed_on_wrong_identity_and_schema_drift():
 @pytest.mark.parametrize(
     ("spec", "expected_status", "resume_expected"),
     [
-        (_spec("event"), ManifestStatus.RETRYABLE_FAILURE, True),
-        (_spec("lineups"), ManifestStatus.RETRYABLE_FAILURE, True),
+        # До финального свистка 404 = «ещё не опубликовано» — ретраится.
+        (
+            _spec("event", freshness_key="day-2026-07-01"),
+            ManifestStatus.RETRYABLE_FAILURE,
+            True,
+        ),
+        (
+            _spec("lineups", freshness_key="day-2026-07-01"),
+            ManifestStatus.RETRYABLE_FAILURE,
+            True,
+        ),
+        # Для завершённого матча (final) 404 — источник никогда не публиковал
+        # этот эндпоинт (#1039): терминальный NOT_SUPPORTED, resume скипает.
+        (_spec("event"), ManifestStatus.NOT_SUPPORTED, False),
+        (_spec("lineups"), ManifestStatus.NOT_SUPPORTED, False),
         (_player_spec("player_profile"), ManifestStatus.RETRYABLE_FAILURE, True),
         (
             _player_spec("player_season_statistics"),

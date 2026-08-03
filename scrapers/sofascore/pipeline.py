@@ -405,9 +405,15 @@ def build_event_spec(
         parsers=_parsers(endpoint, target),
         paid_proxy=paid_proxy,
         # Every event endpoint in the coverage contract is required for a
-        # scheduled event. A 404 is therefore a retryable failure, never a
-        # terminal "unsupported" cache entry that endpoint resume would skip.
-        not_supported_http_statuses=(),
+        # scheduled event, so before the final whistle a 404 means "not
+        # published yet, retry later" and stays retryable. For a FINISHED
+        # match (freshness_key == 'final') the same 404 is the source stating
+        # it never published this endpoint and never will (#1039: historical
+        # seasons carry permanent lineups holes) — a terminal NOT_SUPPORTED
+        # that endpoint resume skips instead of retrying forever.
+        not_supported_http_statuses=(
+            (404,) if str(freshness_key) == 'final' else ()
+        ),
     )
 
 
