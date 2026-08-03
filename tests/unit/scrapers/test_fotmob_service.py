@@ -1063,7 +1063,7 @@ def test_generic_transport_absence_cannot_publish_entity_tombstone():
     assert repository.commits[-1].status == ManifestStatus.TERMINAL_FAILURE
 
 
-def test_historical_advertised_team_absence_resolves_without_tombstone():
+def test_advertised_team_absence_resolves_without_tombstone():
     bundle = parse_season_bundle(
         _league_payload(selected="2010/2011"),
         ScopeRef(47, "2010/2011"),
@@ -1098,7 +1098,7 @@ def test_historical_advertised_team_absence_resolves_without_tombstone():
     absences = [
         commit
         for commit in repository.commits
-        if commit.error_code == "source_historical_team_unavailable"
+        if commit.error_code == "source_team_unavailable"
     ]
     assert len(absences) == 2
     assert all(commit.status == ManifestStatus.EXCLUDED for commit in absences)
@@ -1477,3 +1477,125 @@ def test_infrastructure_faults_are_retryable_not_schema_drift():
     drift = [KeyError("matchFacts"), ValueError("unexpected shape"), TypeError("int")]
     for exc in drift:
         assert _failure_status(exc) == ManifestStatus.SCHEMA_DRIFT, exc
+
+
+def _null_body_fetch(endpoint, params):
+    target = canonicalize_target(endpoint, params)
+    return FetchResult(
+        outcome=FetchOutcome.NOT_AVAILABLE,
+        target_key=target.target_key,
+        url=target.canonical_url,
+        http_status=304,
+        json_data=None,
+        body=b"null",
+        attempts=1,
+        retries=0,
+        cache_hit=True,
+        stale=False,
+        terminal=True,
+        etag='"etag"',
+        last_modified=None,
+        raw_uri=None,
+        content_hash=None,
+        fetched_at=None,
+        encoded_bytes=4,
+        decoded_bytes=4,
+        direct_bytes=0,
+        proxy_bytes=0,
+    )
+
+
+def test_dead_catalog_entry_resolves_as_intentional_absence():
+    # #1070: allLeagues advertises the id, /leagues answers a null body. That
+    # is a fact about the source catalog, not a collection failure.
+    from scrapers.fotmob.catalog import classify_competition
+    from scrapers.fotmob.domain import CompetitionRef, ScopeDecision
+
+    classification = classify_competition(CompetitionRef(285, "Landesliga"))
+    assert classification.decision == ScopeDecision.INCLUDED
+    service, _, repository = _service({})
+
+    outcome = service.discover_competition(
+        classification,
+        prefetched=_null_body_fetch("leagues", {"id": 285}),
+    )
+
+    assert outcome.operation.ok
+    assert outcome.operation.not_available == 1
+    assert outcome.operation.metadata["intentional_not_available"] == 1
+    commit = repository.commits[-1]
+    assert commit.status == ManifestStatus.EXCLUDED
+    assert commit.error_code == "source_dead_catalog_entry"
+
+
+def test_transfer_stream_tolerates_source_hits_self_disagreement():
+    # #1074: every page fetched, stream ran dry, unique events short of the
+    # source's own ``hits`` by <= 2 — complete, deficit recorded as metadata.
+    page1 = canonicalize_target(
+        "transfers", {"leagueIds": "47", "page": 1}
+    ).canonical_url
+    page2 = canonicalize_target(
+        "transfers", {"leagueIds": "47", "page": 2}
+    ).canonical_url
+    first = {
+        "hits": 3,
+        "page": 1,
+        "transfers": [
+            {
+                "playerId": 1,
+                "name": "One",
+                "transferDate": "2026-07-01",
+                "fromClubId": 10,
+                "toClubId": 20,
+                "feeText": "€1m",
+            },
+            {
+                "playerId": 2,
+                "name": "Two",
+                "transferDate": "2026-07-02",
+                "fromClubId": 30,
+                "toClubId": 40,
+                "feeText": "Free",
+            },
+        ],
+    }
+    second = {"hits": 3, "page": 2, "transfers": []}
+    service, _, _ = _service({page1: first, page2: second})
+
+    result = service.sync_transfers(47)
+
+    assert result.ok
+    assert result.counts["events"] == 2
+    assert result.metadata["source_hits_deficit"] == 1
+    assert "next_missing_page" not in result.metadata
+
+
+def test_transfer_stream_deficit_beyond_tolerance_stays_incomplete():
+    page1 = canonicalize_target(
+        "transfers", {"leagueIds": "47", "page": 1}
+    ).canonical_url
+    page2 = canonicalize_target(
+        "transfers", {"leagueIds": "47", "page": 2}
+    ).canonical_url
+    first = {
+        "hits": 9,
+        "page": 1,
+        "transfers": [
+            {
+                "playerId": 1,
+                "name": "One",
+                "transferDate": "2026-07-01",
+                "fromClubId": 10,
+                "toClubId": 20,
+                "feeText": "€1m",
+            }
+        ],
+    }
+    second = {"hits": 9, "page": 2, "transfers": []}
+    service, _, _ = _service({page1: first, page2: second})
+
+    result = service.sync_transfers(47)
+
+    assert not result.ok
+    assert any("transfer pagination incomplete" in item for item in result.errors)
+    assert "source_hits_deficit" not in result.metadata
