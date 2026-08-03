@@ -944,6 +944,102 @@ def test_conventional_xi_requires_22_unique_starters() -> None:
 
 
 @pytest.mark.unit
+def test_sparse_explicit_participant_roster_discards_the_whole_lineup() -> None:
+    competition, edition, schedule = _schedule(lineup=CapabilityState.UNKNOWN)
+    payload = _load("native_summary.json")
+    for roster in payload["rosters"]:
+        seed = roster["roster"][0]
+        is_home = roster["homeAway"] == "home"
+        base_id = 100 if is_home else 200
+        row_count = 1 if is_home else 20
+        starter_count = 1 if is_home else 11
+        roster["roster"] = []
+        for offset in range(1, row_count + 1):
+            player = deepcopy(seed)
+            player["starter"] = offset <= starter_count
+            player["subbedIn"] = False
+            player["subbedOut"] = False
+            player["athlete"]["id"] = str(base_id + offset)
+            player["athlete"]["displayName"] = f"Player {base_id + offset}"
+            roster["roster"].append(player)
+
+    result = parse_summary(
+        _raw(payload), competition=competition, edition=edition, event=schedule[0]
+    )
+
+    assert result.lineup == ()
+    assert result.lineup_state is EntityParseState.VALID_EMPTY
+    assert result.matchsheet_state is EntityParseState.CAPTURED
+
+    seven_player_boundary = deepcopy(payload)
+    sparse_roster = next(
+        roster
+        for roster in seven_player_boundary["rosters"]
+        if roster["homeAway"] == "home"
+    )
+    seed = sparse_roster["roster"][0]
+    for offset in range(2, 8):
+        player = deepcopy(seed)
+        player["athlete"]["id"] = str(100 + offset)
+        player["athlete"]["displayName"] = f"Player {100 + offset}"
+        sparse_roster["roster"].append(player)
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            _raw(seven_player_boundary),
+            competition=competition,
+            edition=edition,
+            event=schedule[0],
+        )
+
+    malformed = deepcopy(payload)
+    malformed["rosters"][1]["roster"][0]["athlete"].pop("id")
+    with pytest.raises(EspnParseError, match="athlete.id"):
+        parse_summary(
+            _raw(malformed),
+            competition=competition,
+            edition=edition,
+            event=schedule[0],
+        )
+
+    proven_competition, proven_edition, proven_schedule = _schedule()
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            _raw(payload),
+            competition=proven_competition,
+            edition=proven_edition,
+            event=proven_schedule[0],
+        )
+
+
+@pytest.mark.unit
+def test_complete_rosters_with_bad_starter_counts_still_fail() -> None:
+    competition, edition, schedule = _schedule(lineup=CapabilityState.UNKNOWN)
+    payload = _load("native_summary.json")
+    for roster in payload["rosters"]:
+        seed = roster["roster"][0]
+        is_home = roster["homeAway"] == "home"
+        base_id = 100 if is_home else 200
+        starter_count = 11 if is_home else 10
+        roster["roster"] = []
+        for offset in range(1, 21):
+            player = deepcopy(seed)
+            player["starter"] = offset <= starter_count
+            player["subbedIn"] = False
+            player["subbedOut"] = False
+            player["athlete"]["id"] = str(base_id + offset)
+            player["athlete"]["displayName"] = f"Player {base_id + offset}"
+            roster["roster"].append(player)
+
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            _raw(payload),
+            competition=competition,
+            edition=edition,
+            event=schedule[0],
+        )
+
+
+@pytest.mark.unit
 def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
     assert dict(summary_parser_module._REVIEWED_TRUNCATED_LINEUPS) == {
         "41c1ce43ba84ebb976040b5fb748f7a54c01d1d47ae5eff36193d74d9f289aad": (
@@ -1023,11 +1119,13 @@ def test_only_reviewed_truncated_conventional_lineup_degrades_to_valid_empty(
     for roster in payload["rosters"]:
         seed = roster["roster"][0]
         base_id = 100 if roster["homeAway"] == "home" else 200
-        count = 11 if roster["homeAway"] == "home" else 10
+        starter_count = 11 if roster["homeAway"] == "home" else 10
         roster["roster"] = []
-        for offset in range(1, count + 1):
+        for offset in range(1, 21):
             player = deepcopy(seed)
-            player["starter"] = True
+            player["starter"] = offset <= starter_count
+            player["subbedIn"] = False
+            player["subbedOut"] = False
             player["athlete"]["id"] = str(base_id + offset)
             player["athlete"]["displayName"] = f"Player {base_id + offset}"
             roster["roster"].append(player)
@@ -1269,6 +1367,21 @@ def test_balanced_small_sided_explicit_lineup_is_genuinely_non_conventional() ->
     )
 
     assert sum(row.starter is True for row in result.lineup) == 10
+
+    unknown_competition, unknown_edition, unknown_schedule = _schedule(
+        lineup=CapabilityState.UNKNOWN
+    )
+    unbalanced = deepcopy(payload)
+    next(
+        roster for roster in unbalanced["rosters"] if roster["homeAway"] == "home"
+    )["roster"].pop()
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            _raw(unbalanced),
+            competition=unknown_competition,
+            edition=unknown_edition,
+            event=unknown_schedule[0],
+        )
 
 
 @pytest.mark.unit

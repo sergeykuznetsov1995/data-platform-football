@@ -797,6 +797,23 @@ def _lineup(
                 "Summary lineup has contradictory starter/substitution semantics"
             )
         if not conventional_xi and not balanced_small_sided:
+            # Some ESPN competitions expose a sparse event-participant list in
+            # ``rosters`` (for example, only the scorer) while still attaching
+            # explicit starter flags.  Fewer than seven athlete rows cannot
+            # field a conventional team.  Never publish those partial player
+            # rows, but let a non-PROVEN capability preserve the event's
+            # schedule and matchsheet.  Complete rosters with bad starter
+            # semantics remain a hard error below, and explicit balanced
+            # small-sided formats were accepted above.
+            incomplete_conventional_roster = any(
+                len(team_rows) < 7 for team_rows in per_team_rows.values()
+            )
+            if (
+                incomplete_conventional_roster
+                and small_sided_size is None
+                and capability is not CapabilityState.PROVEN
+            ):
+                return (), _valid_empty_or_fail(capability, "lineup")
             reviewed_identity = _REVIEWED_TRUNCATED_LINEUPS.get(lineup_source_sha256)
             if (
                 capability is not CapabilityState.PROVEN
