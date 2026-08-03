@@ -438,21 +438,6 @@ def _replay_missing_raw_evidence(
     }
 
 
-def _scope_is_historical(source_season_key: str, *, reference_year: int) -> bool:
-    """Identify a source season that ended before the run's UTC year.
-
-    FotMob can keep an old season selected for a discontinued competition, so
-    ``is_latest`` alone is not proof that its globally addressed teams still
-    exist. Unknown season formats stay fail-closed.
-    """
-
-    years = [
-        int(value)
-        for value in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", str(source_season_key))
-    ]
-    return bool(years) and max(years) < int(reference_year)
-
-
 def _identity_hash(values: Iterable[Any]) -> str:
     material = "\0".join(sorted(str(value) for value in values)).encode("utf-8")
     return hashlib.sha256(material).hexdigest()

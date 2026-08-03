@@ -142,16 +142,6 @@ class TestFotmobNativeRunner:
             mod._parse_scopes(["47="])
 
     @pytest.mark.unit
-    def test_historical_scope_detection_handles_old_selected_competitions(self):
-        mod = self._module()
-
-        assert mod._scope_is_historical("2025", reference_year=2026)
-        assert mod._scope_is_historical("2024/2025", reference_year=2026)
-        assert not mod._scope_is_historical("2025/2026", reference_year=2026)
-        assert not mod._scope_is_historical("2026/2027", reference_year=2026)
-        assert not mod._scope_is_historical("current", reference_year=2026)
-
-    @pytest.mark.unit
     def test_max_buffered_rows_defaults_high_and_rejects_non_positive(self):
         # The repository's 20k default flushed every ~4 matches once
         # field-inventory rows piled up, defeating --commit-batch-size (#930).
