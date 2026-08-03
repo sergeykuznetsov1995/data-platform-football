@@ -255,7 +255,8 @@ def test_season_phase_signs_only_the_bounded_season_allocation(tmp_path, monkeyp
     assert signed.allocations[0].workload_class == season_workload_class(
         EPL_SEASON_SHAPE
     )
-    assert signed.run_cap_bytes == 300
+    # Замер 300 + структурный headroom 15% (#1044).
+    assert signed.run_cap_bytes == 345
     assert dict(signed.freshness_keys) == {
         "season": "day-fixed",
         "match": "final",

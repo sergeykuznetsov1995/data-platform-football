@@ -63,7 +63,7 @@
     "scrapers/fotmob/constants.py": "3a3e6bc7619fa229c6cc232e268fcec2bdc3a92e93537d27e5ffa7c858d53575",
     "scrapers/sofascore/__init__.py": "2d1df1ef6078d9c956efcc26e92ee161222087de0ef8b8c21380487ae4e4cecd",
     "scrapers/sofascore/runtime_fingerprint.py": "0665600a2bdef91b97a57fa6aa08106b70778431d98080d1dd9f49c6da30ef27",
-    "scrapers/sofascore/workload_plan.py": "a5fbb2bf9d3b94969fcc9567bcb0df1f66fb42ef1dea8b1f1a838f13e347e929",
+    "scrapers/sofascore/workload_plan.py": "7d89ee68c2a1d601d5753e690c24d13ceac712ebc889016b9e83a952393dc06f",
     "scrapers/utils/__init__.py": "f9d38300deedaa60abb7ee03b0a517c00c03f4cd12112db47c942c09300f02c1",
     "scrapers/utils/proxy_manager.py": "3ee21c9045090046bd2f9509a038fbc2bc815e3cd1b67006841404bdd57b564b",
     "scrapers/utils/rate_limiter.py": "3183e193a694fea4374cf36d1c0e506e7ef00c31b6bf3b912c6ecd732f172677",
