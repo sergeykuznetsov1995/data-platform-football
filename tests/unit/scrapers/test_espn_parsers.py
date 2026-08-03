@@ -1309,6 +1309,11 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
             401860167,
             ((6154, 11), (6270, 11)),
         ),
+        "3f566c1f950c9f416f812dda5ec6c09d125dfd915bc13f744ad0acea4897f3b0": (
+            "5698:2026",
+            401869747,
+            ((6946, 11), (9780, 11)),
+        ),
     }
     assert summary_parser_module._REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES == (
         frozenset({"3904:2026"})
