@@ -1084,6 +1084,11 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
             401841831,
             ((20684, 11), (22525, 11)),
         ),
+        "b1b068b7e2c931527efaf57dd574f953483544cc4046b87aa23099d1937cc535": (
+            "2272:2026",
+            762013,
+            ((1936, 11), (7388, 11)),
+        ),
     }
     assert dict(summary_parser_module._REVIEWED_ONE_SIDED_LINEUPS) == {
         "54c233a36e49dee961703a659ef03de013d445659614f3e3450bad0e63ad9ced": (
