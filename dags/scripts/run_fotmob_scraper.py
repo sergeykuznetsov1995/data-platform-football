@@ -953,17 +953,14 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 team_operation, player_ids = service.sync_team_snapshots(
                     bundle,
                     limit=min(per_run_limit, capacity),
-                    # A team advertised only by a historical season can have
-                    # a deliberately removed global endpoint. Resolve that
-                    # absence without tombstoning a last-good global snapshot;
-                    # current or unparseable latest seasons remain fail-closed.
-                    allow_advertised_absence=(
-                        not item.is_latest
-                        or _scope_is_historical(
-                            item.source_season_key,
-                            reference_year=started_at.year,
-                        )
-                    ),
+                    # An advertised team without a global /teams payload is a
+                    # fact about the source in ANY season: besides removed
+                    # deep-history clubs, current small-cup entrants and
+                    # bracket placeholders (e.g. team id -1) never get a page
+                    # (#1070: 96 proven null-body teams in latest seasons).
+                    # The absence path commits EXCLUDED without tombstoning a
+                    # last-good snapshot, so latest seasons are safe too.
+                    allow_advertised_absence=True,
                 )
                 operations.append(team_operation)
                 scope_operations.append(team_operation)
@@ -1191,10 +1188,13 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             operations.append(transfer_operation)
             expected_hits = transfer_operation.metadata.get("source_hits")
             observed_events = int(transfer_operation.counts.get("events") or 0)
+            tolerated_deficit = int(
+                transfer_operation.metadata.get("source_hits_deficit") or 0
+            )
             complete_stream = (
                 transfer_operation.ok
                 and expected_hits is not None
-                and observed_events >= int(expected_hits)
+                and observed_events + tolerated_deficit >= int(expected_hits)
             )
             if complete_stream:
                 completion = OperationResult(
@@ -1214,6 +1214,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                                 "window": transfer_window,
                                 "source_hits": int(expected_hits),
                                 "observed_events": observed_events,
+                                "source_hits_deficit": tolerated_deficit,
                             },
                             counts={"events": observed_events},
                         )
