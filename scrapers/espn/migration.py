@@ -2,8 +2,8 @@
 
 The default path only renders a machine-readable plan.  Applying a promotion
 requires one exact scope, three immutable green-run bundles, a matching
-physical COMPLETE manifest, a captured legacy baseline, and the durable scope
-lease held through the append-only cutover record.
+physical COMPLETE manifest, an immutable legacy-or-absence fallback baseline,
+and the durable scope lease held through the append-only cutover record.
 """
 
 from __future__ import annotations
@@ -42,14 +42,18 @@ from .repository import (
     render_repository_ddl,
 )
 from . import runner
-from .registry import RegistryError, validate_registry_document
+from .registry import Registry, RegistryError, validate_registry_document
 
 
 UTC = timezone.utc
-MIGRATION_VERSION = "espn-native-bronze-v2-migration-v1"
+LEGACY_MIGRATION_VERSION = "espn-native-bronze-v2-migration-v1"
+MIGRATION_VERSION = "espn-native-bronze-v2-migration-v2"
 BASELINE_VERSION = "espn-legacy-baseline-v1"
-PROMOTION_EVIDENCE_VERSION = "espn-v2-promotion-evidence-v2"
-ROLLBACK_PLAN_VERSION = "espn-v2-rollback-plan-v1"
+ABSENCE_BASELINE_VERSION = "espn-absence-baseline-v1"
+LEGACY_PROMOTION_EVIDENCE_VERSION = "espn-v2-promotion-evidence-v2"
+PROMOTION_EVIDENCE_VERSION = "espn-v2-promotion-evidence-v3"
+LEGACY_ROLLBACK_PLAN_VERSION = "espn-v2-rollback-plan-v1"
+ROLLBACK_PLAN_VERSION = "espn-v2-rollback-plan-v2"
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
 _SCOPE_RE = re.compile(r"([1-9][0-9]*):([1-9][0-9]*)")
 _BASELINE_COLUMNS = (
@@ -170,6 +174,61 @@ class ArtifactRef:
 
 
 @dataclass(frozen=True, slots=True)
+class FallbackDescriptor:
+    """The honest route to restore when native data is deactivated."""
+
+    kind: str
+    league: str | None = None
+    season: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind == "legacy":
+            _required(self.league, "fallback.league")
+            _required(self.season, "fallback.season")
+        elif self.kind == "absent":
+            if self.league is not None or self.season is not None:
+                raise MigrationError("absent fallback must not contain legacy aliases")
+        else:
+            raise MigrationError("fallback.kind must be legacy or absent")
+
+    @classmethod
+    def from_mapping(
+        cls, value: object, *, field: str = "fallback"
+    ) -> "FallbackDescriptor":
+        if not isinstance(value, Mapping):
+            raise MigrationError(f"{field} must be an object")
+        kind = value.get("kind")
+        expected = {"kind", "league", "season"} if kind == "legacy" else {"kind"}
+        if set(value) != expected:
+            raise MigrationError(f"{field} schema mismatch")
+        try:
+            return cls(
+                kind=_required(kind, f"{field}.kind"),
+                league=(
+                    _required(value.get("league"), f"{field}.league")
+                    if kind == "legacy"
+                    else None
+                ),
+                season=(
+                    _required(value.get("season"), f"{field}.season")
+                    if kind == "legacy"
+                    else None
+                ),
+            )
+        except MigrationError as exc:
+            raise MigrationError(f"{field} is invalid: {exc}") from exc
+
+    def to_dict(self) -> dict[str, str]:
+        if self.kind == "absent":
+            return {"kind": "absent"}
+        return {
+            "kind": "legacy",
+            "league": str(self.league),
+            "season": str(self.season),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class GreenRunEvidence:
     dag_id: str
     run_id: str
@@ -231,16 +290,56 @@ class GreenRunEvidence:
 
 @dataclass(frozen=True, slots=True)
 class PromotionEvidence:
+    evidence_version: str
     scope_id: str
     espn_id: int
     source_season_year: int
-    legacy_league: str
-    legacy_season: str
+    fallback: FallbackDescriptor
     trust_label: str
     cutover_id: str
     effective_at: datetime
     registry_snapshot_ref: ArtifactRef
     green_runs: tuple[GreenRunEvidence, ...]
+
+    @property
+    def legacy_league(self) -> str | None:
+        return self.fallback.league
+
+    @property
+    def legacy_season(self) -> str | None:
+        return self.fallback.season
+
+
+def registry_fallback_descriptors(
+    registry: Registry,
+) -> dict[str, FallbackDescriptor]:
+    """Derive one deterministic fallback for every enabled current scope."""
+
+    if not isinstance(registry, Registry):
+        raise TypeError("registry must be Registry")
+    output: dict[str, FallbackDescriptor] = {}
+    for competition in registry.promoted:
+        edition = competition.current_edition
+        scope_id = competition.scope_id(edition)
+        if competition.legacy is None:
+            fallback = FallbackDescriptor(kind="absent")
+        else:
+            seasons = competition.legacy.season_aliases.get(
+                edition.source_season_year, ()
+            )
+            if not seasons:
+                raise MigrationError(
+                    f"registry legacy fallback has no reviewed season for {scope_id}"
+                )
+            fallback = FallbackDescriptor(
+                kind="legacy",
+                league=competition.legacy.league,
+                season=seasons[0],
+            )
+        if scope_id in output:
+            raise MigrationError(f"registry fallback scope is duplicated: {scope_id}")
+        output[scope_id] = fallback
+    return dict(sorted(output.items()))
 
 
 ArtifactReader = Callable[[str], bytes]
@@ -753,25 +852,33 @@ def load_promotion_evidence(
         document = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise MigrationError(f"cannot read promotion evidence: {exc}") from exc
-    expected = {
+    common = {
         "schema_version",
         "scope_id",
-        "legacy_league",
-        "legacy_season",
         "trust_label",
         "cutover_id",
         "effective_at",
         "registry_snapshot_ref",
         "green_runs",
     }
-    if not isinstance(document, Mapping) or set(document) != expected:
+    if not isinstance(document, Mapping):
         raise MigrationError("promotion evidence schema mismatch")
-    if document["schema_version"] != PROMOTION_EVIDENCE_VERSION:
+    evidence_version = document.get("schema_version")
+    expected = (
+        common | {"legacy_league", "legacy_season"}
+        if evidence_version == LEGACY_PROMOTION_EVIDENCE_VERSION
+        else common | {"fallback"}
+        if evidence_version == PROMOTION_EVIDENCE_VERSION
+        else set()
+    )
+    if not expected:
         raise MigrationError("unsupported promotion evidence schema")
+    if set(document) != expected:
+        raise MigrationError("promotion evidence schema mismatch")
     scope_id, espn_id, source_year = _scope(document["scope_id"])
     trust = _required(document["trust_label"], "trust_label")
-    if source_year < 2016 or trust == "legacy_untrusted":
-        raise MigrationError("legacy_untrusted pre-2016 data cannot be promoted")
+    if trust == "legacy_untrusted":
+        raise MigrationError("legacy_untrusted data cannot be promoted")
     if trust != "trusted":
         raise MigrationError("promotion evidence trust_label must be trusted")
     cutover_id = _required(document["cutover_id"], "cutover_id")
@@ -862,25 +969,37 @@ def load_promotion_evidence(
     )
     if competition is None or not competition.enabled or edition is None:
         raise MigrationError("registry does not promote the exact ESPN edition")
+    fallback = (
+        FallbackDescriptor(
+            kind="legacy",
+            league=_required(document["legacy_league"], "legacy_league"),
+            season=_required(document["legacy_season"], "legacy_season"),
+        )
+        if evidence_version == LEGACY_PROMOTION_EVIDENCE_VERSION
+        else FallbackDescriptor.from_mapping(document["fallback"])
+    )
     legacy = competition.legacy
-    legacy_league = _required(document["legacy_league"], "legacy_league")
-    legacy_season = _required(document["legacy_season"], "legacy_season")
-    if (
-        legacy is None
-        or legacy_league
-        not in {
-            legacy.league,
-            *legacy.league_aliases,
-        }
-        or legacy_season not in legacy.season_aliases.get(source_year, ())
-    ):
-        raise MigrationError("legacy league/season aliases do not match the registry")
+    if fallback.kind == "legacy":
+        if (
+            legacy is None
+            or fallback.league
+            not in {
+                legacy.league,
+                *legacy.league_aliases,
+            }
+            or fallback.season not in legacy.season_aliases.get(source_year, ())
+        ):
+            raise MigrationError("fallback legacy aliases do not match the registry")
+        if source_year < 2016:
+            raise MigrationError("legacy_untrusted pre-2016 data cannot be promoted")
+    elif legacy is not None:
+        raise MigrationError("fallback kind does not match the registry legacy route")
     return PromotionEvidence(
+        evidence_version=str(evidence_version),
         scope_id=scope_id,
         espn_id=espn_id,
         source_season_year=source_year,
-        legacy_league=legacy_league,
-        legacy_season=legacy_season,
+        fallback=fallback,
         trust_label=trust,
         cutover_id=cutover_id,
         effective_at=effective_at,
@@ -965,17 +1084,15 @@ def build_promotion_plan(
         "mutates": False,
         "scope_id": evidence.scope_id,
         "registry_snapshot_ref": evidence.registry_snapshot_ref.to_dict(),
-        "legacy_scope": {
-            "league": evidence.legacy_league,
-            "season": evidence.legacy_season,
-            "trust_label": evidence.trust_label,
-        },
+        "fallback": evidence.fallback.to_dict(),
+        "trust_label": evidence.trust_label,
         "green_runs": [item.to_dict() for item in evidence.green_runs],
         "candidate": _candidate(evidence.green_runs[-1]),
         "statements": list(migration_statements(catalog=catalog, schema=schema)),
         "baseline": {
             "table": f"{catalog}.{schema}.{BASELINE_TABLE}",
             "status": "planned",
+            "kind": evidence.fallback.kind,
             "entities": ["schedule", "lineup", "matchsheet"],
             "captures_snapshot_ids": True,
         },
@@ -991,6 +1108,8 @@ class MigrationBackend(Protocol):
     def legacy_baseline(
         self, league: str, season: str
     ) -> tuple[Mapping[str, Mapping[str, Any]], Mapping[str, int]]: ...
+
+    def absence_baseline(self) -> Mapping[str, int]: ...
 
     def verify_candidate(
         self, candidate: GreenRunEvidence, registry_snapshot_ref: ArtifactRef
@@ -1051,38 +1170,41 @@ def _baseline_row(
     captured_at: datetime,
 ) -> dict[str, Any]:
     expected_entities = {"schedule", "lineup", "matchsheet"}
-    if set(metrics) != expected_entities:
-        raise MigrationError("legacy baseline metrics entity set mismatch")
     normalized_metrics: dict[str, dict[str, Any]] = {}
-    for entity in sorted(expected_entities):
-        value = metrics[entity]
-        if not isinstance(value, Mapping) or set(value) < {
-            "row_count",
-            "distinct_key_count",
-            "max_ingested_at",
-        }:
-            raise MigrationError(f"legacy {entity} baseline metrics are incomplete")
-        row_count = value["row_count"]
-        key_count = value["distinct_key_count"]
-        if type(row_count) is not int or row_count < 0:
-            raise MigrationError(f"legacy {entity} row_count is invalid")
-        if type(key_count) is not int or not 0 <= key_count <= row_count:
-            raise MigrationError(f"legacy {entity} distinct key count is invalid")
-        normalized_metrics[entity] = {
-            key: value[key]
-            for key in sorted(value)
-            if key
-            in {
+    if evidence.fallback.kind == "legacy":
+        if set(metrics) != expected_entities:
+            raise MigrationError("legacy baseline metrics entity set mismatch")
+        for entity in sorted(expected_entities):
+            value = metrics[entity]
+            if not isinstance(value, Mapping) or set(value) < {
                 "row_count",
                 "distinct_key_count",
-                "null_key_count",
-                "min_match_date",
-                "max_match_date",
                 "max_ingested_at",
+            }:
+                raise MigrationError(f"legacy {entity} baseline metrics are incomplete")
+            row_count = value["row_count"]
+            key_count = value["distinct_key_count"]
+            if type(row_count) is not int or row_count < 0:
+                raise MigrationError(f"legacy {entity} row_count is invalid")
+            if type(key_count) is not int or not 0 <= key_count <= row_count:
+                raise MigrationError(f"legacy {entity} distinct key count is invalid")
+            normalized_metrics[entity] = {
+                key: value[key]
+                for key in sorted(value)
+                if key
+                in {
+                    "row_count",
+                    "distinct_key_count",
+                    "null_key_count",
+                    "min_match_date",
+                    "max_match_date",
+                    "max_ingested_at",
+                }
             }
-        }
-    if normalized_metrics["schedule"]["row_count"] == 0:
-        raise MigrationError("legacy schedule baseline is empty")
+        if normalized_metrics["schedule"]["row_count"] == 0:
+            raise MigrationError("legacy schedule baseline is empty")
+    elif metrics:
+        raise MigrationError("absence baseline must not contain legacy metrics")
     if set(snapshot_ids) != {
         "espn_schedule",
         "espn_lineup",
@@ -1091,7 +1213,11 @@ def _baseline_row(
         raise MigrationError("legacy Iceberg snapshot ID set is incomplete")
     candidate = evidence.green_runs[-1]
     base = {
-        "baseline_version": BASELINE_VERSION,
+        "baseline_version": (
+            BASELINE_VERSION
+            if evidence.fallback.kind == "legacy"
+            else ABSENCE_BASELINE_VERSION
+        ),
         "scope_id": evidence.scope_id,
         "legacy_league": evidence.legacy_league,
         "legacy_season": evidence.legacy_season,
@@ -1112,7 +1238,11 @@ def _validate_existing_baseline(
     row: Mapping[str, Any], evidence: PromotionEvidence
 ) -> dict[str, Any]:
     expected = (
-        BASELINE_VERSION,
+        (
+            BASELINE_VERSION
+            if evidence.fallback.kind == "legacy"
+            else ABSENCE_BASELINE_VERSION
+        ),
         evidence.scope_id,
         evidence.legacy_league,
         evidence.legacy_season,
@@ -1130,8 +1260,25 @@ def _validate_existing_baseline(
     )
     if actual != expected:
         raise MigrationError(
-            "existing legacy baseline conflicts with promotion evidence"
+            "existing fallback baseline conflicts with promotion evidence"
         )
+    try:
+        metrics = json.loads(row.get("entity_metrics_json"))
+        snapshot_ids = json.loads(row.get("legacy_snapshot_ids_json"))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise MigrationError("existing fallback baseline payload is invalid") from exc
+    if canonical_json(metrics) != row.get("entity_metrics_json"):
+        raise MigrationError("existing fallback baseline metrics are not canonical")
+    if canonical_json(snapshot_ids) != row.get("legacy_snapshot_ids_json"):
+        raise MigrationError("existing fallback baseline snapshots are not canonical")
+    if evidence.fallback.kind == "absent" and metrics != {}:
+        raise MigrationError("existing absence baseline contains legacy metrics")
+    if set(snapshot_ids) != {
+        "espn_schedule",
+        "espn_lineup",
+        "espn_matchsheet",
+    } or any(type(value) is not int or value <= 0 for value in snapshot_ids.values()):
+        raise MigrationError("existing fallback baseline snapshot set is invalid")
     _sha(row.get("registry_signature"), "baseline.registry_signature")
     _immutable_uri(row.get("durable_manifest_uri"), "baseline.durable_manifest_uri")
     _sha(row.get("durable_manifest_sha256"), "baseline.durable_manifest_sha256")
@@ -1163,8 +1310,10 @@ def _native_cutover(
         predecessor_id = predecessor_sha = None
         ancestors: tuple[str, ...] = ()
     else:
-        if predecessor.active_source != "legacy":
-            raise MigrationError("native re-promotion requires a legacy rollback head")
+        if predecessor.active_source != evidence.fallback.kind:
+            raise MigrationError(
+                "native re-promotion requires the matching fallback rollback head"
+            )
         expected_id = f"{root_id}-repromote-{predecessor.cutover_sha256[:16]}"
         predecessor_id = predecessor.cutover_id
         predecessor_sha = predecessor.cutover_sha256
@@ -1182,7 +1331,7 @@ def _native_cutover(
         cutover_id=evidence.cutover_id,
         scope_id=evidence.scope_id,
         active_source="native",
-        previous_source="legacy",
+        previous_source=evidence.fallback.kind,
         predecessor_cutover_id=predecessor_id,
         predecessor_cutover_sha256=predecessor_sha,
         legacy_league=evidence.legacy_league,
@@ -1196,6 +1345,7 @@ def _native_cutover(
         rollback_reason=None,
         metadata={
             "migration_version": MIGRATION_VERSION,
+            "fallback": evidence.fallback.to_dict(),
             "baseline_sha256": baseline["baseline_sha256"],
             "durable_manifest_ref": candidate.durable_manifest_ref.to_dict(),
             "run_evidence_ref": candidate.run_evidence_ref.to_dict(),
@@ -1221,11 +1371,8 @@ def _promotion_result(
         "mutates": True,
         "scope_id": evidence.scope_id,
         "registry_snapshot_ref": evidence.registry_snapshot_ref.to_dict(),
-        "legacy_scope": {
-            "league": evidence.legacy_league,
-            "season": evidence.legacy_season,
-            "trust_label": evidence.trust_label,
-        },
+        "fallback": evidence.fallback.to_dict(),
+        "trust_label": evidence.trust_label,
         "green_runs": [item.to_dict() for item in evidence.green_runs],
         "candidate": _candidate(evidence.green_runs[-1]),
         "baseline": _jsonable(baseline),
@@ -1251,6 +1398,15 @@ def _is_exact_committed_promotion(
         else f"{root_id}-repromote-{cutover.predecessor_cutover_sha256[:16]}"
     )
     metadata = dict(cutover.metadata)
+    fallback_metadata_matches = metadata.get("fallback") == evidence.fallback.to_dict()
+    if (
+        not fallback_metadata_matches
+        and evidence.evidence_version == LEGACY_PROMOTION_EVIDENCE_VERSION
+        and evidence.fallback.kind == "legacy"
+        and metadata.get("fallback") is None
+        and metadata.get("migration_version") == LEGACY_MIGRATION_VERSION
+    ):
+        fallback_metadata_matches = True
     return (
         (
             cutover.cutover_id,
@@ -1276,7 +1432,7 @@ def _is_exact_committed_promotion(
             expected_id,
             evidence.scope_id,
             "native",
-            "legacy",
+            evidence.fallback.kind,
             evidence.legacy_league,
             evidence.legacy_season,
             candidate.registry_signature,
@@ -1293,6 +1449,7 @@ def _is_exact_committed_promotion(
             candidate.success_receipt_ref.to_dict(),
         )
         and evidence.cutover_id == expected_id
+        and fallback_metadata_matches
         and canonical_json(metadata.get("three_green_runs"))
         == canonical_json([item.to_dict() for item in evidence.green_runs])
     )
@@ -1342,7 +1499,11 @@ def apply_promotion(
                 backend.append_cutover(cutover)
             else:
                 predecessor = latest
-                if predecessor is not None and predecessor.active_source != "legacy":
+                if predecessor is not None and (
+                    predecessor.active_source != evidence.fallback.kind
+                    or predecessor.legacy_league != evidence.fallback.league
+                    or predecessor.legacy_season != evidence.fallback.season
+                ):
                     raise MigrationError("scope cutover head is invalid for promotion")
 
                 manifest = backend.complete_manifest(
@@ -1359,9 +1520,14 @@ def apply_promotion(
                     )
                 backend.verify_candidate(candidate, evidence.registry_snapshot_ref)
                 if baseline is None:
-                    metrics, snapshot_ids = backend.legacy_baseline(
-                        evidence.legacy_league, evidence.legacy_season
-                    )
+                    if evidence.fallback.kind == "legacy":
+                        metrics, snapshot_ids = backend.legacy_baseline(
+                            str(evidence.legacy_league),
+                            str(evidence.legacy_season),
+                        )
+                    else:
+                        metrics = {}
+                        snapshot_ids = backend.absence_baseline()
                     baseline = _baseline_row(
                         evidence,
                         metrics=metrics,
@@ -1384,7 +1550,8 @@ def build_rollback_plan(
 ) -> dict[str, Any]:
     if (
         not isinstance(promotion_report, Mapping)
-        or promotion_report.get("schema_version") != MIGRATION_VERSION
+        or promotion_report.get("schema_version")
+        not in {MIGRATION_VERSION, LEGACY_MIGRATION_VERSION}
         or promotion_report.get("status") != "promoted"
     ):
         raise MigrationError("rollback requires a successful promotion report")
@@ -1396,12 +1563,22 @@ def build_rollback_plan(
     scope_id, _, _ = _scope(promotion_report.get("scope_id"))
     cutover = promotion_report.get("cutover")
     candidate = promotion_report.get("candidate")
-    legacy = promotion_report.get("legacy_scope")
     baseline = promotion_report.get("baseline")
-    if not all(
-        isinstance(value, Mapping) for value in (cutover, candidate, legacy, baseline)
-    ):
+    if not all(isinstance(value, Mapping) for value in (cutover, candidate, baseline)):
         raise MigrationError("promotion report rollback binding is incomplete")
+    if promotion_report.get("schema_version") == MIGRATION_VERSION:
+        fallback = FallbackDescriptor.from_mapping(promotion_report.get("fallback"))
+    else:
+        legacy = promotion_report.get("legacy_scope")
+        if not isinstance(legacy, Mapping):
+            raise MigrationError(
+                "legacy promotion report rollback binding is incomplete"
+            )
+        fallback = FallbackDescriptor(
+            kind="legacy",
+            league=_required(legacy.get("league"), "legacy_scope.league"),
+            season=_required(legacy.get("season"), "legacy_scope.season"),
+        )
     predecessor_id = _required(cutover.get("cutover_id"), "cutover.cutover_id")
     predecessor_sha = _sha(cutover.get("cutover_sha256"), "cutover.cutover_sha256")
     try:
@@ -1427,6 +1604,33 @@ def build_rollback_plan(
         cutover.get("effective_at"), "cutover.effective_at"
     ) + timedelta(microseconds=1)
     rollback_id = predecessor_id + "-rollback"
+    baseline_sha256 = _sha(baseline.get("baseline_sha256"), "baseline.baseline_sha256")
+    if (
+        cutover.get("active_source") != "native"
+        or cutover.get("previous_source") != fallback.kind
+        or cutover.get("legacy_league") != fallback.league
+        or cutover.get("legacy_season") != fallback.season
+        or cutover.get("native_generation_id") != candidate.get("generation_id")
+        or cutover.get("native_generation_signature")
+        != candidate.get("generation_signature")
+        or cutover.get("native_manifest_sha256") != candidate.get("manifest_sha256")
+    ):
+        raise MigrationError("promotion report fallback/candidate binding is invalid")
+    try:
+        metadata = json.loads(_required(cutover.get("metadata_json"), "metadata_json"))
+    except json.JSONDecodeError as exc:
+        raise MigrationError("promotion cutover metadata is invalid") from exc
+    legacy_metadata_compatibility = (
+        fallback.kind == "legacy"
+        and metadata.get("migration_version") == LEGACY_MIGRATION_VERSION
+        and metadata.get("fallback") is None
+    )
+    if metadata.get("baseline_sha256") != baseline_sha256 or (
+        promotion_report.get("schema_version") == MIGRATION_VERSION
+        and metadata.get("fallback") != fallback.to_dict()
+        and not legacy_metadata_compatibility
+    ):
+        raise MigrationError("promotion report baseline/fallback binding is invalid")
     result = {
         "schema_version": ROLLBACK_PLAN_VERSION,
         "mode": "dry_run",
@@ -1438,8 +1642,7 @@ def build_rollback_plan(
         "predecessor_cutover_id": predecessor_id,
         "predecessor_cutover_sha256": predecessor_sha,
         "ancestor_cutover_sha256s": [*predecessor_ancestors, predecessor_sha],
-        "legacy_league": _required(legacy.get("league"), "legacy_scope.league"),
-        "legacy_season": _required(legacy.get("season"), "legacy_scope.season"),
+        "fallback": fallback.to_dict(),
         "registry_signature": _sha(
             candidate.get("registry_signature"), "candidate.registry_signature"
         ),
@@ -1448,17 +1651,15 @@ def build_rollback_plan(
         ),
         "rollback_run_id": "rollback/" + rollback_id,
         "reason": _required(reason, "rollback reason"),
-        "baseline_sha256": _sha(
-            baseline.get("baseline_sha256"), "baseline.baseline_sha256"
-        ),
+        "baseline_sha256": baseline_sha256,
         "output_path": str(Path(output_path).resolve()),
     }
     result["plan_sha256"] = canonical_sha256(result)
     return result
 
 
-def _validate_rollback_plan(plan: Mapping[str, Any]) -> None:
-    expected = {
+def _validate_rollback_plan(plan: Mapping[str, Any]) -> FallbackDescriptor:
+    common = {
         "schema_version",
         "mode",
         "status",
@@ -1469,8 +1670,6 @@ def _validate_rollback_plan(plan: Mapping[str, Any]) -> None:
         "predecessor_cutover_id",
         "predecessor_cutover_sha256",
         "ancestor_cutover_sha256s",
-        "legacy_league",
-        "legacy_season",
         "registry_signature",
         "plan_signature",
         "rollback_run_id",
@@ -1479,11 +1678,57 @@ def _validate_rollback_plan(plan: Mapping[str, Any]) -> None:
         "output_path",
         "plan_sha256",
     }
-    if set(plan) != expected or plan.get("schema_version") != ROLLBACK_PLAN_VERSION:
+    version = plan.get("schema_version")
+    expected = (
+        common | {"fallback"}
+        if version == ROLLBACK_PLAN_VERSION
+        else common | {"legacy_league", "legacy_season"}
+        if version == LEGACY_ROLLBACK_PLAN_VERSION
+        else set()
+    )
+    if not expected or set(plan) != expected:
         raise MigrationError("rollback plan schema mismatch")
     base = {key: value for key, value in plan.items() if key != "plan_sha256"}
     if canonical_sha256(base) != plan.get("plan_sha256"):
         raise MigrationError("rollback plan SHA-256 mismatch")
+    if (
+        plan.get("mode") != "dry_run"
+        or plan.get("status") != "planned"
+        or plan.get("mutates") is not False
+    ):
+        raise MigrationError("rollback plan state is invalid")
+    _scope(plan.get("scope_id"))
+    _required(plan.get("cutover_id"), "cutover_id")
+    _utc(plan.get("effective_at"), "effective_at")
+    _required(plan.get("predecessor_cutover_id"), "predecessor_cutover_id")
+    predecessor_sha = _sha(
+        plan.get("predecessor_cutover_sha256"), "predecessor_cutover_sha256"
+    )
+    ancestors = plan.get("ancestor_cutover_sha256s")
+    if (
+        not isinstance(ancestors, list)
+        or not ancestors
+        or ancestors[-1] != predecessor_sha
+        or any(
+            not isinstance(item, str) or _SHA_RE.fullmatch(item) is None
+            for item in ancestors
+        )
+        or len(set(ancestors)) != len(ancestors)
+    ):
+        raise MigrationError("rollback ancestry is invalid")
+    _sha(plan.get("registry_signature"), "registry_signature")
+    _sha(plan.get("plan_signature"), "plan_signature")
+    _required(plan.get("rollback_run_id"), "rollback_run_id")
+    _required(plan.get("reason"), "reason")
+    _sha(plan.get("baseline_sha256"), "baseline_sha256")
+    _required(plan.get("output_path"), "output_path")
+    if version == ROLLBACK_PLAN_VERSION:
+        return FallbackDescriptor.from_mapping(plan.get("fallback"))
+    return FallbackDescriptor(
+        kind="legacy",
+        league=_required(plan.get("legacy_league"), "legacy_league"),
+        season=_required(plan.get("legacy_season"), "legacy_season"),
+    )
 
 
 def apply_rollback(
@@ -1493,7 +1738,7 @@ def apply_rollback(
     lease_store: LeaseStore,
     now: datetime,
 ) -> dict[str, Any]:
-    _validate_rollback_plan(plan)
+    fallback = _validate_rollback_plan(plan)
     if not isinstance(now, datetime) or now.tzinfo is None:
         raise TypeError("now must be timezone-aware")
     observed_at = now.astimezone(UTC)
@@ -1511,12 +1756,12 @@ def apply_rollback(
             rollback = ScopeCutover(
                 cutover_id=plan["cutover_id"],
                 scope_id=plan["scope_id"],
-                active_source="legacy",
+                active_source=fallback.kind,
                 previous_source="native",
                 predecessor_cutover_id=plan["predecessor_cutover_id"],
                 predecessor_cutover_sha256=plan["predecessor_cutover_sha256"],
-                legacy_league=plan["legacy_league"],
-                legacy_season=plan["legacy_season"],
+                legacy_league=fallback.league,
+                legacy_season=fallback.season,
                 registry_signature=plan["registry_signature"],
                 effective_at=_utc(plan["effective_at"], "effective_at"),
                 native_generation_id=None,
@@ -1525,7 +1770,16 @@ def apply_rollback(
                 rollback_run_id=plan["rollback_run_id"],
                 rollback_reason=plan["reason"],
                 metadata={
-                    "migration_version": MIGRATION_VERSION,
+                    "migration_version": (
+                        LEGACY_MIGRATION_VERSION
+                        if plan["schema_version"] == LEGACY_ROLLBACK_PLAN_VERSION
+                        else MIGRATION_VERSION
+                    ),
+                    **(
+                        {}
+                        if plan["schema_version"] == LEGACY_ROLLBACK_PLAN_VERSION
+                        else {"fallback": fallback.to_dict()}
+                    ),
                     "baseline_sha256": plan["baseline_sha256"],
                     "rollback_plan_sha256": plan["plan_sha256"],
                 },
@@ -1549,6 +1803,23 @@ def apply_rollback(
             ):
                 raise MigrationError("rollback predecessor is stale")
             else:
+                latest_metadata = dict(latest.metadata)
+                if (
+                    latest.previous_source,
+                    latest.legacy_league,
+                    latest.legacy_season,
+                    latest.registry_signature,
+                    latest_metadata.get("baseline_sha256"),
+                ) != (
+                    fallback.kind,
+                    fallback.league,
+                    fallback.season,
+                    plan["registry_signature"],
+                    plan["baseline_sha256"],
+                ):
+                    raise MigrationError(
+                        "rollback fallback does not match the native predecessor"
+                    )
                 backend.append_cutover(rollback)
     finally:
         lease_store.release(lease, now=observed_at)
@@ -1581,12 +1852,9 @@ class RepositoryMigrationBackend:
     def ensure_objects(self) -> None:
         self.repository.ensure_objects()
 
-    def legacy_baseline(
-        self, league: str, season: str
-    ) -> tuple[Mapping[str, Mapping[str, Any]], Mapping[str, int]]:
-        output = {}
-        snapshot_ids = {}
-        for entity, key_sql in self._LEGACY_KEYS.items():
+    def absence_baseline(self) -> Mapping[str, int]:
+        snapshot_ids: dict[str, int] = {}
+        for entity in self._LEGACY_KEYS:
             table = f"espn_{entity}"
             ref_rows = self.repository._execute(
                 f'SELECT snapshot_id FROM {self.repository.catalog}.{self.repository.schema}."{table}$refs" '
@@ -1603,6 +1871,16 @@ class RepositoryMigrationBackend:
             if type(snapshot_id) is not int or snapshot_id <= 0:
                 raise MigrationError(f"legacy {table} main snapshot is invalid")
             snapshot_ids[table] = snapshot_id
+        return snapshot_ids
+
+    def legacy_baseline(
+        self, league: str, season: str
+    ) -> tuple[Mapping[str, Mapping[str, Any]], Mapping[str, int]]:
+        output = {}
+        snapshot_ids = dict(self.absence_baseline())
+        for entity, key_sql in self._LEGACY_KEYS.items():
+            table = f"espn_{entity}"
+            snapshot_id = snapshot_ids[table]
             rows = self.repository._execute(
                 f"""SELECT COUNT(*) AS row_count,
 COUNT(DISTINCT {key_sql}) AS distinct_key_count,
@@ -1839,12 +2117,18 @@ class ProductionLeaseStore:
 
 
 __all__ = [
+    "ABSENCE_BASELINE_VERSION",
     "BASELINE_TABLE",
     "BASELINE_VERSION",
+    "FallbackDescriptor",
+    "LEGACY_MIGRATION_VERSION",
+    "LEGACY_PROMOTION_EVIDENCE_VERSION",
+    "LEGACY_ROLLBACK_PLAN_VERSION",
     "MIGRATION_VERSION",
     "MigrationError",
     "ProductionLeaseStore",
     "PromotionEvidence",
+    "PROMOTION_EVIDENCE_VERSION",
     "RepositoryMigrationBackend",
     "apply_promotion",
     "apply_rollback",
@@ -1852,4 +2136,5 @@ __all__ = [
     "build_rollback_plan",
     "load_promotion_evidence",
     "migration_statements",
+    "registry_fallback_descriptors",
 ]

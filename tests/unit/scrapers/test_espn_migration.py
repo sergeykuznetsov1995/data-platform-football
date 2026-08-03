@@ -11,7 +11,13 @@ from pathlib import Path
 import pytest
 
 from scrapers.espn.migration import (
+    ABSENCE_BASELINE_VERSION,
     BASELINE_TABLE,
+    LEGACY_MIGRATION_VERSION,
+    LEGACY_PROMOTION_EVIDENCE_VERSION,
+    LEGACY_ROLLBACK_PLAN_VERSION,
+    PROMOTION_EVIDENCE_VERSION,
+    FallbackDescriptor,
     MigrationError,
     RepositoryMigrationBackend,
     apply_promotion,
@@ -20,9 +26,15 @@ from scrapers.espn.migration import (
     build_rollback_plan,
     load_promotion_evidence,
     migration_statements,
+    registry_fallback_descriptors,
 )
 from scrapers.espn.repository import MANIFEST_TABLE, canonical_sha256
-from scrapers.espn.registry import load_registry
+from scrapers.espn.discovery import CatalogSnapshot
+from scrapers.espn.registry import (
+    build_discovered_male_registry,
+    load_registry,
+    validate_registry_document,
+)
 from scripts.migrate_espn_native_v2 import main
 
 
@@ -85,8 +97,15 @@ def _raw_manifest(
     return {**base, "manifest_sha256": hashlib.sha256(body).hexdigest()}
 
 
-def _evidence(tmp_path: Path) -> tuple[Path, list[dict]]:
-    registry = load_registry()
+def _evidence(
+    tmp_path: Path, *, fallback_kind: str = "legacy", evidence_v3: bool = False
+) -> tuple[Path, list[dict]]:
+    registry_document = json.loads(load_registry().canonical_json())
+    if fallback_kind == "absent":
+        next(
+            item for item in registry_document["competitions"] if item["espn_id"] == 700
+        )["legacy"] = None
+    registry = validate_registry_document(registry_document)
     registry_ref = _write_json(
         tmp_path / "registry.json", json.loads(registry.canonical_json())
     )
@@ -317,16 +336,35 @@ def _evidence(tmp_path: Path) -> tuple[Path, list[dict]]:
             }
         )
     document = {
-        "schema_version": "espn-v2-promotion-evidence-v2",
+        "schema_version": (
+            PROMOTION_EVIDENCE_VERSION
+            if evidence_v3 or fallback_kind == "absent"
+            else LEGACY_PROMOTION_EVIDENCE_VERSION
+        ),
         "scope_id": "700:2026",
-        "legacy_league": "ENG-Premier League",
-        "legacy_season": "2627",
         "trust_label": "trusted",
         "cutover_id": "espn-native-700-2026",
         "effective_at": "2026-08-01T09:00:00+00:00",
         "registry_snapshot_ref": registry_ref,
         "green_runs": green_runs,
     }
+    if document["schema_version"] == LEGACY_PROMOTION_EVIDENCE_VERSION:
+        document.update(
+            {
+                "legacy_league": "ENG-Premier League",
+                "legacy_season": "2627",
+            }
+        )
+    else:
+        document["fallback"] = (
+            {"kind": "absent"}
+            if fallback_kind == "absent"
+            else {
+                "kind": "legacy",
+                "league": "ENG-Premier League",
+                "season": "2627",
+            }
+        )
     evidence_path = tmp_path / "promotion-evidence.json"
     evidence_path.write_text(json.dumps(document), encoding="utf-8")
     return evidence_path, green_runs
@@ -398,6 +436,14 @@ class FakeBackend:
             "espn_matchsheet": 103,
         }
         return metrics, snapshots
+
+    def absence_baseline(self):
+        self.actions.append("capture_absence_baseline")
+        return {
+            "espn_schedule": 101,
+            "espn_lineup": 102,
+            "espn_matchsheet": 103,
+        }
 
     def verify_candidate(self, candidate, registry_snapshot_ref):
         self.actions.append("verify_physical_candidate")
@@ -828,6 +874,43 @@ def test_repository_adapter_accepts_positional_trino_rows_and_normalizes_time():
     assert cutover.effective_at == NOW
 
 
+def test_repository_adapter_accepts_nullable_native_only_fallback_aliases():
+    cutover_values = (
+        "espn-native-700-2026",
+        "700:2026",
+        "native",
+        "absent",
+        None,
+        None,
+        None,
+        None,
+        "a" * 64,
+        NOW.replace(tzinfo=None),
+        "generation-3",
+        "e" * 64,
+        "f" * 64,
+        None,
+        None,
+        '{"fallback":{"kind":"absent"},"migration_version":"test"}',
+        "[]",
+    )
+
+    class Repository:
+        catalog = "iceberg"
+        schema = "bronze"
+
+        def _execute(self, sql, params=()):
+            assert params == ("700:2026",)
+            return [cutover_values]
+
+    cutover = RepositoryMigrationBackend(Repository()).latest_cutover("700:2026")
+
+    assert cutover.active_source == "native"
+    assert cutover.previous_source == "absent"
+    assert cutover.legacy_league is None
+    assert cutover.legacy_season is None
+
+
 def test_post_cutover_retry_recovers_even_if_ingestion_head_advanced(tmp_path):
     evidence_path, _ = _evidence(tmp_path)
     evidence = load_promotion_evidence(evidence_path)
@@ -948,6 +1031,32 @@ def test_legacy_baseline_uses_main_refs_and_exact_time_travel_snapshots():
     assert "MAX(SNAPSHOT_ID)" not in rendered
 
 
+def test_absence_baseline_captures_only_exact_main_snapshot_ids():
+    statements = []
+    snapshot_by_table = {
+        "espn_schedule": 201,
+        "espn_lineup": 202,
+        "espn_matchsheet": 203,
+    }
+
+    class Repository:
+        catalog = "iceberg"
+        schema = "bronze"
+
+        def _execute(self, sql, params=()):
+            statements.append((sql, params))
+            assert "$refs" in sql
+            assert params == ()
+            table = next(name for name in snapshot_by_table if name in sql)
+            return [(snapshot_by_table[table],)]
+
+    snapshots = RepositoryMigrationBackend(Repository()).absence_baseline()
+
+    assert snapshots == snapshot_by_table
+    assert len(statements) == 3
+    assert all("name = 'main' AND type = 'BRANCH'" in sql for sql, _ in statements)
+
+
 def test_rollback_repair_and_repromotion_extend_append_only_ancestry(tmp_path):
     first_path, _ = _evidence(tmp_path / "first")
     first_evidence = load_promotion_evidence(first_path)
@@ -985,3 +1094,290 @@ def test_rollback_repair_and_repromotion_extend_append_only_ancestry(tmp_path):
     assert json.loads(repromotion["cutover"]["ancestor_cutover_sha256_json"])[-1] == (
         rollback.cutover_sha256
     )
+
+
+def test_frozen_181_registry_has_exact_honest_fallback_descriptors():
+    fixture = (
+        Path(__file__).resolve().parents[2] / "fixtures/espn/catalog_2026-07-31.json"
+    )
+    snapshot = CatalogSnapshot.from_dict(
+        json.loads(fixture.read_text(encoding="utf-8"))
+    )
+    registry = build_discovered_male_registry(
+        snapshot,
+        legacy_registry=load_registry(),
+    )
+
+    fallbacks = registry_fallback_descriptors(registry)
+
+    assert tuple(fallbacks) == tuple(sorted(fallbacks))
+    assert len(fallbacks) == 181
+    assert sum(item.kind == "legacy" for item in fallbacks.values()) == 9
+    assert sum(item.kind == "absent" for item in fallbacks.values()) == 172
+    for scope_id, fallback in fallbacks.items():
+        competition = registry.by_id[int(scope_id.split(":", 1)[0])]
+        if competition.legacy is None:
+            assert fallback == FallbackDescriptor(kind="absent")
+        else:
+            assert fallback.kind == "legacy"
+            assert fallback.league == competition.legacy.league
+            assert (
+                fallback.season
+                in competition.legacy.season_aliases[int(scope_id.split(":", 1)[1])]
+            )
+
+
+@pytest.mark.parametrize(
+    "fallback",
+    [
+        {"kind": "absent", "league": "must-not-be-here"},
+        {"kind": "legacy", "league": "ENG-Premier League"},
+        {"kind": "unknown"},
+    ],
+)
+def test_v3_promotion_evidence_rejects_malformed_fallback_descriptor(
+    tmp_path, fallback
+):
+    evidence_path, _ = _evidence(tmp_path, evidence_v3=True)
+    document = json.loads(evidence_path.read_text())
+    document["fallback"] = fallback
+    evidence_path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(MigrationError, match="fallback"):
+        load_promotion_evidence(evidence_path)
+
+
+def test_promotion_fallback_must_match_registry_route_kind(tmp_path):
+    legacy_path, _ = _evidence(tmp_path / "legacy", evidence_v3=True)
+    legacy_document = json.loads(legacy_path.read_text())
+    legacy_document["fallback"] = {"kind": "absent"}
+    legacy_path.write_text(json.dumps(legacy_document), encoding="utf-8")
+    with pytest.raises(MigrationError, match="fallback.*registry"):
+        load_promotion_evidence(legacy_path)
+
+    absent_path, _ = _evidence(tmp_path / "absent", fallback_kind="absent")
+    absent_document = json.loads(absent_path.read_text())
+    absent_document["fallback"] = {
+        "kind": "legacy",
+        "league": "ENG-Premier League",
+        "season": "2627",
+    }
+    absent_path.write_text(json.dumps(absent_document), encoding="utf-8")
+    with pytest.raises(MigrationError, match="fallback.*registry"):
+        load_promotion_evidence(absent_path)
+
+
+def test_native_only_promotion_is_idempotent_and_rolls_back_to_absent(tmp_path):
+    evidence_path, _ = _evidence(tmp_path, fallback_kind="absent")
+    evidence = load_promotion_evidence(evidence_path)
+    backend = FakeBackend(evidence.green_runs[-1])
+
+    first = apply_promotion(
+        evidence, backend=backend, lease_store=FakeLeaseStore(), now=NOW
+    )
+    second = apply_promotion(
+        evidence, backend=backend, lease_store=FakeLeaseStore(), now=NOW
+    )
+
+    assert first["cutover"]["cutover_sha256"] == second["cutover"]["cutover_sha256"]
+    assert first["fallback"] == {"kind": "absent"}
+    assert "capture_baseline" not in backend.actions
+    assert backend.actions.count("capture_absence_baseline") == 1
+    baseline = backend.baselines["700:2026"]
+    assert baseline["baseline_version"] == ABSENCE_BASELINE_VERSION
+    assert baseline["legacy_league"] is None
+    assert baseline["legacy_season"] is None
+    assert json.loads(baseline["entity_metrics_json"]) == {}
+    assert backend.latest.active_source == "native"
+    assert backend.latest.previous_source == "absent"
+    assert backend.latest.legacy_league is None
+    assert backend.latest.legacy_season is None
+
+    rollback_plan = build_rollback_plan(
+        first,
+        reason="native-only canary regression",
+        output_path=tmp_path / "rollback.json",
+    )
+    assert rollback_plan["fallback"] == {"kind": "absent"}
+    result = apply_rollback(
+        rollback_plan,
+        backend=backend,
+        lease_store=FakeLeaseStore(),
+        now=NOW,
+    )
+    retry = apply_rollback(
+        rollback_plan,
+        backend=backend,
+        lease_store=FakeLeaseStore(),
+        now=NOW,
+    )
+
+    assert result["status"] == retry["status"] == "rolled_back"
+    assert result["cutover"]["cutover_sha256"] == retry["cutover"]["cutover_sha256"]
+    assert len(backend.cutovers) == 2
+    assert backend.latest.active_source == "absent"
+    assert backend.latest.previous_source == "native"
+    assert backend.latest.legacy_league is None
+    assert backend.latest.legacy_season is None
+
+
+def test_v2_legacy_evidence_keeps_strict_legacy_baseline_and_rollback(tmp_path):
+    evidence_path, _ = _evidence(tmp_path)
+    evidence = load_promotion_evidence(evidence_path)
+    backend = FakeBackend(evidence.green_runs[-1])
+
+    promotion = apply_promotion(
+        evidence, backend=backend, lease_store=FakeLeaseStore(), now=NOW
+    )
+    rollback_plan = build_rollback_plan(
+        promotion,
+        reason="legacy canary regression",
+        output_path=tmp_path / "rollback.json",
+    )
+    apply_rollback(
+        rollback_plan,
+        backend=backend,
+        lease_store=FakeLeaseStore(),
+        now=NOW,
+    )
+
+    assert evidence.fallback == FallbackDescriptor(
+        kind="legacy", league="ENG-Premier League", season="2627"
+    )
+    assert "capture_baseline" in backend.actions
+    assert promotion["fallback"] == {
+        "kind": "legacy",
+        "league": "ENG-Premier League",
+        "season": "2627",
+    }
+    assert backend.latest.active_source == "legacy"
+    assert backend.latest.legacy_league == "ENG-Premier League"
+    assert backend.latest.legacy_season == "2627"
+
+
+def test_v2_legacy_retry_recognizes_exact_v1_committed_cutover(tmp_path):
+    evidence_path, _ = _evidence(tmp_path)
+    evidence = load_promotion_evidence(evidence_path)
+    backend = FakeBackend(evidence.green_runs[-1])
+    apply_promotion(evidence, backend=backend, lease_store=FakeLeaseStore(), now=NOW)
+    current = backend.latest
+    legacy_metadata = dict(current.metadata)
+    legacy_metadata.pop("fallback")
+    legacy_metadata["migration_version"] = LEGACY_MIGRATION_VERSION
+    legacy_cutover = type(current)(
+        **{
+            **current.constructor_values(),
+            "metadata": legacy_metadata,
+        }
+    )
+    backend.latest = legacy_cutover
+    backend.cutovers = {legacy_cutover.cutover_id: legacy_cutover}
+
+    recovered = apply_promotion(
+        evidence, backend=backend, lease_store=FakeLeaseStore(), now=NOW
+    )
+    rollback = build_rollback_plan(
+        recovered,
+        reason="v1 compatibility",
+        output_path=tmp_path / "rollback.json",
+    )
+
+    assert recovered["cutover"]["cutover_sha256"] == legacy_cutover.cutover_sha256
+    assert rollback["fallback"] == {
+        "kind": "legacy",
+        "league": "ENG-Premier League",
+        "season": "2627",
+    }
+
+
+def test_v3_legacy_evidence_is_readable_with_exact_reviewed_aliases(tmp_path):
+    evidence_path, _ = _evidence(tmp_path, evidence_v3=True)
+
+    evidence = load_promotion_evidence(evidence_path)
+
+    assert evidence.evidence_version == PROMOTION_EVIDENCE_VERSION
+    assert evidence.fallback == FallbackDescriptor(
+        kind="legacy", league="ENG-Premier League", season="2627"
+    )
+
+
+def test_rehashed_nonempty_absence_baseline_is_rejected_on_retry(tmp_path):
+    evidence_path, _ = _evidence(tmp_path, fallback_kind="absent")
+    evidence = load_promotion_evidence(evidence_path)
+    backend = FakeBackend(evidence.green_runs[-1])
+    apply_promotion(evidence, backend=backend, lease_store=FakeLeaseStore(), now=NOW)
+    baseline = backend.baselines[evidence.scope_id]
+    baseline["entity_metrics_json"] = '{"schedule":{"row_count":1}}'
+    baseline["baseline_sha256"] = canonical_sha256(
+        {key: value for key, value in baseline.items() if key != "baseline_sha256"}
+    )
+
+    with pytest.raises(MigrationError, match="absence baseline"):
+        apply_promotion(
+            evidence,
+            backend=backend,
+            lease_store=FakeLeaseStore(),
+            now=NOW,
+        )
+
+
+def test_rollback_rejects_rehashed_fallback_that_differs_from_native_parent(tmp_path):
+    evidence_path, _ = _evidence(tmp_path)
+    evidence = load_promotion_evidence(evidence_path)
+    backend = FakeBackend(evidence.green_runs[-1])
+    promotion = apply_promotion(
+        evidence, backend=backend, lease_store=FakeLeaseStore(), now=NOW
+    )
+    plan = build_rollback_plan(
+        promotion,
+        reason="tamper test",
+        output_path=tmp_path / "rollback.json",
+    )
+    plan["fallback"] = {"kind": "absent"}
+    plan["plan_sha256"] = canonical_sha256(
+        {key: value for key, value in plan.items() if key != "plan_sha256"}
+    )
+
+    with pytest.raises(MigrationError, match="fallback.*native predecessor"):
+        apply_rollback(
+            plan,
+            backend=backend,
+            lease_store=FakeLeaseStore(),
+            now=NOW,
+        )
+
+    assert backend.latest.active_source == "native"
+    assert len(backend.cutovers) == 1
+
+
+def test_legacy_v1_rollback_plan_remains_readable_and_strict(tmp_path):
+    evidence_path, _ = _evidence(tmp_path)
+    evidence = load_promotion_evidence(evidence_path)
+    backend = FakeBackend(evidence.green_runs[-1])
+    promotion = apply_promotion(
+        evidence, backend=backend, lease_store=FakeLeaseStore(), now=NOW
+    )
+    plan = build_rollback_plan(
+        promotion,
+        reason="legacy plan compatibility",
+        output_path=tmp_path / "rollback.json",
+    )
+    plan["schema_version"] = LEGACY_ROLLBACK_PLAN_VERSION
+    plan.pop("fallback")
+    plan["legacy_league"] = "ENG-Premier League"
+    plan["legacy_season"] = "2627"
+    plan["plan_sha256"] = canonical_sha256(
+        {key: value for key, value in plan.items() if key != "plan_sha256"}
+    )
+
+    result = apply_rollback(
+        plan,
+        backend=backend,
+        lease_store=FakeLeaseStore(),
+        now=NOW,
+    )
+
+    assert result["status"] == "rolled_back"
+    assert backend.latest.active_source == "legacy"
+    assert backend.latest.legacy_league == "ENG-Premier League"
+    assert backend.latest.legacy_season == "2627"

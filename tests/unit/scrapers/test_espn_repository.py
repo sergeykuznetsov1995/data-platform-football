@@ -285,7 +285,10 @@ class RepositoryStateQuery(FakeQuery):
         self.catalog_rows: list[tuple[int, str, str]] = []
         self.cutover_hashes: dict[str, list[str]] = {}
         self.cutover_slots: dict[tuple[str, str | None], list[tuple[str, str]]] = {}
-        self.latest_cutovers: dict[str, tuple[str, str, str, datetime, str, str]] = {}
+        self.latest_cutovers: dict[
+            str,
+            tuple[str, str, str, datetime, str, str, str | None, str | None],
+        ] = {}
         self.unresolved_cutover_forks: set[str] = set()
 
     def execute_query(self, sql, params=None):
@@ -2272,6 +2275,8 @@ def test_cutover_repository_rejects_descendant_while_scope_fork_is_unresolved():
         branch.effective_at,
         canonical_json(branch.ancestor_cutover_sha256s),
         branch.ancestor_lineage_sha256,
+        branch.legacy_league,
+        branch.legacy_season,
     )
     manifest = generation.manifest_row()
     query.manifests[(generation.plan.scope_id, generation.generation_id)] = tuple(
@@ -2481,6 +2486,8 @@ def test_cutover_repository_enforces_transition_chain_and_timestamp():
         native.effective_at,
         canonical_json(native.ancestor_cutover_sha256s),
         native.ancestor_lineage_sha256,
+        native.legacy_league,
+        native.legacy_season,
     )
     writer = FakeWriter()
     repository = EspnBronzeRepository(
@@ -2527,6 +2534,8 @@ def test_cutover_repository_enforces_transition_chain_and_timestamp():
         rollback.effective_at,
         canonical_json(rollback.ancestor_cutover_sha256s),
         rollback.ancestor_lineage_sha256,
+        rollback.legacy_league,
+        rollback.legacy_season,
     )
     with pytest.raises(ManifestConflictError, match="previous_source"):
         repository.append_cutover(
@@ -2605,3 +2614,194 @@ def test_cutover_contract_cas_readiness_and_deterministic_rollback():
     sql = render_current_view_sql("schedule")
     assert "effective_at DESC, cutover_id DESC, cutover_sha256 DESC" in sql
     assert "conflicting_cutover_predecessors" in sql
+
+
+@pytest.mark.unit
+def test_native_only_cutover_contract_has_absent_root_and_absent_rollback():
+    generation = _generation()
+    native = _native_cutover(
+        generation,
+        previous_source="absent",
+        legacy_league=None,
+        legacy_season=None,
+    )
+    rollback = repository_module.ScopeCutover(
+        **{
+            **native.constructor_values(),
+            "cutover_id": "rollback-native-only-1",
+            "active_source": "absent",
+            "previous_source": "native",
+            "predecessor_cutover_id": native.cutover_id,
+            "predecessor_cutover_sha256": native.cutover_sha256,
+            "effective_at": native.effective_at + timedelta(seconds=1),
+            "native_generation_id": None,
+            "native_generation_signature": None,
+            "native_manifest_sha256": None,
+            "rollback_run_id": "rollback/native-only-1",
+            "rollback_reason": "native-only regression",
+            "ancestor_cutover_sha256s": (native.cutover_sha256,),
+        }
+    )
+
+    assert native.active_source == "native"
+    assert native.previous_source == "absent"
+    assert native.legacy_league is native.legacy_season is None
+    assert rollback.active_source == "absent"
+    assert rollback.previous_source == "native"
+    assert rollback.legacy_league is rollback.legacy_season is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"previous_source": "absent"},
+        {"legacy_league": None, "legacy_season": None},
+        {"legacy_league": None},
+    ],
+)
+def test_native_cutover_rejects_mixed_fallback_identity(changes):
+    with pytest.raises(ValueError, match="fallback|legacy"):
+        _native_cutover(_generation(), **changes)
+
+
+@pytest.mark.unit
+def test_native_only_repository_keeps_complete_cas_idempotency_and_fork_guards():
+    generation = _generation()
+    native = _native_cutover(
+        generation,
+        previous_source="absent",
+        legacy_league=None,
+        legacy_season=None,
+    )
+    manifest = generation.manifest_row()
+    query = RepositoryStateQuery()
+    query.manifests[(generation.plan.scope_id, generation.generation_id)] = tuple(
+        manifest[column] for column in EspnBronzeRepository.manifest_columns
+    )
+    writer = FakeWriter()
+    repository = EspnBronzeRepository(
+        writer=writer,
+        query=query,
+        ensure_objects_on_write=False,
+    )
+
+    repository.append_cutover(native)
+    assert len(writer.calls) == 1
+    query.cutover_hashes[native.cutover_id] = [native.cutover_sha256]
+    repository.append_cutover(native)
+    assert len(writer.calls) == 1
+
+    query.cutover_hashes.clear()
+    query.latest_cutovers[generation.plan.scope_id] = (
+        native.cutover_id,
+        native.cutover_sha256,
+        "native",
+        native.effective_at,
+        canonical_json(native.ancestor_cutover_sha256s),
+        native.ancestor_lineage_sha256,
+        native.legacy_league,
+        native.legacy_season,
+    )
+    wrong_fallback = repository_module.ScopeCutover(
+        **{
+            **native.constructor_values(),
+            "cutover_id": "rollback-native-only-wrong-fallback",
+            "active_source": "legacy",
+            "previous_source": "native",
+            "predecessor_cutover_id": native.cutover_id,
+            "predecessor_cutover_sha256": native.cutover_sha256,
+            "legacy_league": "ITA-Serie A",
+            "legacy_season": "2021",
+            "effective_at": native.effective_at + timedelta(microseconds=1),
+            "native_generation_id": None,
+            "native_generation_signature": None,
+            "native_manifest_sha256": None,
+            "rollback_run_id": "rollback/native-only-wrong-fallback",
+            "rollback_reason": "must fail",
+            "ancestor_cutover_sha256s": (native.cutover_sha256,),
+        }
+    )
+    with pytest.raises(ManifestConflictError, match="fallback aliases"):
+        repository.append_cutover(wrong_fallback)
+    assert len(writer.calls) == 1
+
+    rollback = repository_module.ScopeCutover(
+        **{
+            **native.constructor_values(),
+            "cutover_id": "rollback-native-only-cas",
+            "active_source": "absent",
+            "previous_source": "native",
+            "predecessor_cutover_id": native.cutover_id,
+            "predecessor_cutover_sha256": native.cutover_sha256,
+            "effective_at": native.effective_at + timedelta(seconds=1),
+            "native_generation_id": None,
+            "native_generation_signature": None,
+            "native_manifest_sha256": None,
+            "rollback_run_id": "rollback/native-only-cas",
+            "rollback_reason": "native-only regression",
+            "ancestor_cutover_sha256s": (native.cutover_sha256,),
+        }
+    )
+    repository.append_cutover(rollback)
+    assert len(writer.calls) == 2
+
+    query.cutover_slots[(generation.plan.scope_id, native.cutover_sha256)] = [
+        (rollback.cutover_id, rollback.cutover_sha256)
+    ]
+    fork = repository_module.ScopeCutover(
+        **{
+            **rollback.constructor_values(),
+            "cutover_id": "rollback-native-only-fork",
+            "effective_at": rollback.effective_at + timedelta(seconds=1),
+        }
+    )
+    with pytest.raises(ManifestConflictError, match="different successor"):
+        repository.append_cutover(fork)
+
+
+@pytest.mark.unit
+def test_native_only_route_is_absent_and_never_suppresses_legacy_rows():
+    generation = _generation()
+    native = _native_cutover(
+        generation,
+        previous_source="absent",
+        legacy_league=None,
+        legacy_season=None,
+    )
+    rollback = repository_module.ScopeCutover(
+        **{
+            **native.constructor_values(),
+            "cutover_id": "rollback-native-only-view",
+            "active_source": "absent",
+            "previous_source": "native",
+            "predecessor_cutover_id": native.cutover_id,
+            "predecessor_cutover_sha256": native.cutover_sha256,
+            "effective_at": native.effective_at + timedelta(seconds=1),
+            "native_generation_id": None,
+            "native_generation_signature": None,
+            "native_manifest_sha256": None,
+            "rollback_run_id": "rollback/native-only-view",
+            "rollback_reason": "native-only regression",
+            "ancestor_cutover_sha256s": (native.cutover_sha256,),
+        }
+    )
+    route = EspnBronzeRepository(
+        writer=FakeWriter(),
+        query=CurrentRouteQuery(
+            (_cutover_route_row(native), _cutover_route_row(rollback))
+        ),
+    ).current_scope_route(generation.plan.scope_id)
+    sql = render_current_view_sql("matchsheet")
+    legacy_block = sql[sql.index("legacy_rows AS") :]
+
+    assert route == "absent"
+    assert "c.legacy_league IS NOT NULL" in legacy_block
+    assert "c.legacy_season IS NOT NULL" in legacy_block
+    assert "c.legacy_league = l.league" in legacy_block
+    assert "c.legacy_season = CAST(l.season AS varchar)" in legacy_block
+    native_ready = sql[sql.index("native_ready AS") : sql.index("native_rows AS")]
+    assert "c.previous_source = 'legacy'" in native_ready
+    assert "c.previous_source = 'absent'" in native_ready
+    assert "c.legacy_league IS NULL" in native_ready
+    assert "c.legacy_season IS NULL" in native_ready

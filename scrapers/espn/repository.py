@@ -1078,9 +1078,7 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
                 for item in scoreboard_records
             )
             and ledger_complete
-            and not any(
-                item.endpoint == "summary" for item in generation.raw_ledger
-            )
+            and not any(item.endpoint == "summary" for item in generation.raw_ledger)
             and not generation.dispositions
         )
         if not empty_schedule_has_exact_evidence:
@@ -1089,9 +1087,7 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
                 "and no Summary/disposition rows"
             )
     scoreboard_event_ids = [
-        event_id
-        for item in scoreboard_records
-        for event_id in item.event_ids
+        event_id for item in scoreboard_records for event_id in item.event_ids
     ]
     if set(scoreboard_event_ids) != set(schedule_by_event) or len(
         scoreboard_event_ids
@@ -1436,8 +1432,8 @@ class ScopeCutover:
     previous_source: str
     predecessor_cutover_id: str | None
     predecessor_cutover_sha256: str | None
-    legacy_league: str
-    legacy_season: str
+    legacy_league: str | None
+    legacy_season: str | None
     registry_signature: str
     effective_at: datetime
     native_generation_id: str | None
@@ -1449,7 +1445,7 @@ class ScopeCutover:
     ancestor_cutover_sha256s: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        for field_name in ("cutover_id", "legacy_league", "legacy_season"):
+        for field_name in ("cutover_id",):
             _required_string(getattr(self, field_name), field_name)
         if (
             not isinstance(self.scope_id, str)
@@ -1459,11 +1455,13 @@ class ScopeCutover:
         if self.active_source not in {
             "native",
             "legacy",
+            "absent",
         } or self.previous_source not in {
             "native",
             "legacy",
+            "absent",
         }:
-            raise ValueError("cutover sources must be native or legacy")
+            raise ValueError("cutover sources must be native, legacy or absent")
         if self.active_source == self.previous_source:
             raise ValueError("cutover must change active source")
         predecessor_values = (
@@ -1496,6 +1494,17 @@ class ScopeCutover:
         elif not ancestors or ancestors[-1] != self.predecessor_cutover_sha256:
             raise ValueError("cutover ancestry must end with the predecessor hash")
         object.__setattr__(self, "ancestor_cutover_sha256s", ancestors)
+        aliases = (self.legacy_league, self.legacy_season)
+        if any(value is None for value in aliases) and not all(
+            value is None for value in aliases
+        ):
+            raise ValueError(
+                "legacy fallback aliases must be both present or both null"
+            )
+        has_legacy_fallback = all(value is not None for value in aliases)
+        if has_legacy_fallback:
+            _required_string(self.legacy_league, "legacy_league")
+            _required_string(self.legacy_season, "legacy_season")
         _sha256(self.registry_signature, "registry_signature")
         _aware_utc(self.effective_at, "effective_at")
         native_values = (
@@ -1504,9 +1513,15 @@ class ScopeCutover:
             self.native_manifest_sha256,
         )
         if self.active_source == "native":
-            if self.previous_source != "legacy" or not all(native_values):
+            if self.previous_source not in {"legacy", "absent"} or not all(
+                native_values
+            ):
                 raise ValueError(
-                    "native cutover requires legacy transition and complete manifest binding"
+                    "native cutover requires a fallback transition and complete manifest binding"
+                )
+            if (self.previous_source == "legacy") != has_legacy_fallback:
+                raise ValueError(
+                    "native cutover fallback source and legacy aliases disagree"
                 )
             _required_string(self.native_generation_id, "native_generation_id")
             _sha256(self.native_generation_signature, "native_generation_signature")
@@ -1516,8 +1531,10 @@ class ScopeCutover:
         else:
             if self.previous_source != "native" or any(native_values):
                 raise ValueError(
-                    "legacy rollback must transition from native without native binding"
+                    "rollback must transition from native without native binding"
                 )
+            if (self.active_source == "legacy") != has_legacy_fallback:
+                raise ValueError("rollback source and legacy fallback aliases disagree")
             _required_string(self.rollback_run_id, "rollback_run_id")
             _required_string(self.rollback_reason, "rollback_reason")
         if not isinstance(self.metadata, Mapping) or not self.metadata:
@@ -2158,7 +2175,7 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
             cutover_id = _required_string(values[0], "stored cutover_id")
             cutover_hash = _sha256(values[2], "stored cutover_sha256")
             active_source = values[-2]
-            if active_source not in {"native", "legacy"}:
+            if active_source not in {"native", "legacy", "absent"}:
                 raise PublicationError("stored cutover active_source is invalid")
             effective_at = _stored_utc(values[-1], "stored cutover effective_at")
             identity = (cutover_id, cutover_hash)
@@ -2368,7 +2385,8 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
 
         latest_rows = self._execute(
             f'SELECT "cutover_id", "cutover_sha256", "active_source", "effective_at", '
-            '"ancestor_cutover_sha256_json", "ancestor_lineage_sha256" '
+            '"ancestor_cutover_sha256_json", "ancestor_lineage_sha256", '
+            '"legacy_league", "legacy_season" '
             f"FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE} "
             'WHERE "scope_id" = ? '
             'ORDER BY "effective_at" DESC, "cutover_id" DESC, "cutover_sha256" DESC '
@@ -2384,8 +2402,10 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
                 effective_at = raw.get("effective_at")
                 raw_ancestry = raw.get("ancestor_cutover_sha256_json")
                 raw_lineage_hash = raw.get("ancestor_lineage_sha256")
+                latest_legacy_league = raw.get("legacy_league")
+                latest_legacy_season = raw.get("legacy_season")
             else:
-                if len(raw) != 6:
+                if len(raw) != 8:
                     raise PublicationError("latest cutover row is malformed")
                 (
                     latest_id,
@@ -2394,6 +2414,8 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
                     effective_at,
                     raw_ancestry,
                     raw_lineage_hash,
+                    latest_legacy_league,
+                    latest_legacy_season,
                 ) = raw
             latest_identity = (
                 _required_string(latest_id, "stored latest cutover_id"),
@@ -2416,6 +2438,13 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
                 raise ManifestConflictError(
                     "cutover previous_source does not match latest active source"
                 )
+            if (latest_legacy_league, latest_legacy_season) != (
+                cutover.legacy_league,
+                cutover.legacy_season,
+            ):
+                raise ManifestConflictError(
+                    "cutover fallback aliases do not match latest scope transition"
+                )
             if cutover.effective_at <= _stored_utc(
                 effective_at, "stored cutover effective_at"
             ):
@@ -2423,13 +2452,13 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
                     "cutover effective_at must advance the scope transition chain"
                 )
         elif (
-            cutover.previous_source != "legacy"
+            cutover.previous_source not in {"legacy", "absent"}
             or cutover.predecessor_cutover_id is not None
             or cutover.predecessor_cutover_sha256 is not None
             or cutover.ancestor_cutover_sha256s
         ):
             raise ManifestConflictError(
-                "first scope transition must start from legacy without predecessor"
+                "first scope transition must start from a fallback without predecessor"
             )
 
         if cutover.active_source == "native":
@@ -3037,6 +3066,18 @@ validated_complete AS (
     SELECT c.*
     FROM latest_cutover c
     WHERE c.active_source = 'native'
+      AND (
+          (
+              c.previous_source = 'legacy'
+              AND c.legacy_league IS NOT NULL
+              AND c.legacy_season IS NOT NULL
+          )
+          OR (
+              c.previous_source = 'absent'
+              AND c.legacy_league IS NULL
+              AND c.legacy_season IS NULL
+          )
+      )
       AND EXISTS (
           SELECT 1
           FROM validated_complete ready_manifest
@@ -3059,7 +3100,9 @@ validated_complete AS (
     FROM {catalog}.{schema}.espn_{entity} l
     WHERE NOT EXISTS (
         SELECT 1 FROM native_ready c
-        WHERE c.legacy_league = l.league
+        WHERE c.legacy_league IS NOT NULL
+          AND c.legacy_season IS NOT NULL
+          AND c.legacy_league = l.league
           AND c.legacy_season = CAST(l.season AS varchar)
     )
 )
