@@ -1127,6 +1127,16 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
             401842760,
             ((2495, 11), (20856, 10)),
         ),
+        "1d8990bebaf63d86307699c83412076f22531f3494a93059bed59a6464c9dd3f": (
+            "3951:2025",
+            761019,
+            ((89, 11), (131470, 10)),
+        ),
+        "3eba44177eb9c59701a441c9a6b573c321d317b19ac624915f75b59ccc70506a": (
+            "3951:2025",
+            759767,
+            ((21290, 11), (131470, 10)),
+        ),
     }
     assert dict(summary_parser_module._REVIEWED_CONTRADICTORY_LINEUPS) == {
         "287b2052375fe3ef2fc4fc24f8c69f0be23d20adac832d86a098fc194275985f": (
@@ -1233,6 +1243,11 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
             "3940:2026",
             401878593,
             ((259, 11), (422, 11)),
+        ),
+        "97c143f9860485451ade9617e618739e7b284f07abe9f5f2e17fd3a7158b1e0e": (
+            "3957:2025",
+            759190,
+            ((3735, 11), (8493, 11)),
         ),
     }
     assert summary_parser_module._REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES == (
