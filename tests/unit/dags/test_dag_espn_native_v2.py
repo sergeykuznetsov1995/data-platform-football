@@ -5457,6 +5457,317 @@ def test_publication_intent_reference_is_revalidated_downstream(monkeypatch):
         )
 
 
+def test_monitor_checks_exact_frozen_181_scope_registry_and_binds_identity(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+
+    logical = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    database_now = datetime(2026, 7, 31, 13, tzinfo=timezone.utc)
+    registry = _generated_registry(181)
+    scope_ids = _scope_ids(registry)
+    registry_signature = registry.signature()
+    discovery_state_ref = {
+        "uri": "s3://artifacts/discovery/frozen-state.json",
+        "sha256": "a" * 64,
+    }
+    male_registry_ref = {
+        "uri": "s3://artifacts/discovery/frozen-male-registry.json",
+        "sha256": "b" * 64,
+    }
+    discovery = {
+        "discovery_state_ref": discovery_state_ref,
+        "male_registry_ref": male_registry_ref,
+        "male_registry_signature": registry_signature,
+        "selection_policy": espn_native_tasks.DISCOVERY_SELECTION_POLICY,
+        "male_scope_count": 181,
+    }
+    observed = []
+    writes = []
+
+    class Store:
+        def migrate(self):
+            pass
+
+        def read_scope_heads(self, requested_scope_ids):
+            assert tuple(requested_scope_ids) == scope_ids
+            return {}
+
+        def current_time(self):
+            return database_now
+
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: Store()),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_discovered_registry",
+        lambda *, now: (
+            (registry, discovery)
+            if now == database_now
+            else pytest.fail("monitor did not use the database clock")
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "load_registry",
+        lambda _path: pytest.fail("monitor must not load the static registry"),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_latest_discovery_flags",
+        lambda _scope: pytest.fail(
+            "frozen monitor must not mix in mutable latest discovery state"
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "evaluate_alerts",
+        lambda snapshot, *, observed_at: observed.append((snapshot, observed_at)) or (),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda uri, payload, **_kwargs: (
+            writes.append((uri, payload))
+            or {"uri": uri, "sha256": "f" * 64}
+        ),
+    )
+    monkeypatch.setenv(espn_native_tasks.ARTIFACT_ROOT_ENV, "s3://artifacts")
+    context = {
+        "dag": SimpleNamespace(dag_id="dag_monitor_espn"),
+        "run_id": "monitor-run",
+        "logical_date": logical,
+        "params": {"attempt": 1},
+    }
+
+    espn_native_tasks.check_36h_freshness_and_alerts(**context)
+
+    assert len(observed) == 181
+    assert [item[0]["scope_id"] for item in observed] == list(scope_ids)
+    assert all(item[1] == database_now for item in observed)
+    assert observed[0][0]["identity_sha256"] == espn_native_tasks._subject_identity(
+        dag_id="dag_monitor_espn",
+        run_id="monitor-run",
+        scope_id=scope_ids[0],
+        registry_signature=registry_signature,
+    )
+    _, payload = writes[0]
+    assert payload == {
+        "kind": "espn-monitor-result-v2",
+        "schema_version": 2,
+        "dag_id": "dag_monitor_espn",
+        "run_id": "monitor-run",
+        "observed_at": database_now.isoformat(),
+        "discovery_state_ref": discovery_state_ref,
+        "male_registry_ref": male_registry_ref,
+        "registry_signature": registry_signature,
+        "selection_policy": espn_native_tasks.DISCOVERY_SELECTION_POLICY,
+        "male_scope_count": 181,
+        "scope_ids": list(scope_ids),
+        "alerts": [],
+    }
+
+
+@pytest.mark.parametrize(
+    ("fault", "message"),
+    [
+        ("registry_signature", "registry signature"),
+        ("scope_count", "scope count"),
+        ("selection_policy", "selection policy"),
+        ("male_registry_ref", "male registry reference"),
+        ("discovery_state_ref", "discovery state reference"),
+    ],
+)
+def test_monitor_rejects_tampered_frozen_registry_projection(
+    monkeypatch, fault, message
+):
+    from dags.utils import espn_native_tasks
+
+    database_now = datetime(2026, 7, 31, 13, tzinfo=timezone.utc)
+    registry = _generated_registry(181)
+    discovery = {
+        "discovery_state_ref": {
+            "uri": "s3://artifacts/discovery/frozen-state.json",
+            "sha256": "a" * 64,
+        },
+        "male_registry_ref": {
+            "uri": "s3://artifacts/discovery/frozen-male-registry.json",
+            "sha256": "b" * 64,
+        },
+        "male_registry_signature": registry.signature(),
+        "selection_policy": espn_native_tasks.DISCOVERY_SELECTION_POLICY,
+        "male_scope_count": 181,
+    }
+    if fault == "registry_signature":
+        discovery["male_registry_signature"] = "c" * 64
+    elif fault == "scope_count":
+        discovery["male_scope_count"] = 180
+    elif fault == "selection_policy":
+        discovery["selection_policy"] = "not-the-frozen-policy"
+    elif fault == "male_registry_ref":
+        discovery["male_registry_ref"] = {
+            "uri": "s3://artifacts/discovery/tampered.json"
+        }
+    else:
+        discovery["discovery_state_ref"] = {
+            "sha256": "a" * 64,
+        }
+
+    class Store:
+        def migrate(self):
+            pass
+
+        def current_time(self):
+            return database_now
+
+        def read_scope_heads(self, _scope_ids):
+            pytest.fail("tampered frozen registry must fail before reading heads")
+
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: Store()),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_discovered_registry",
+        lambda *, now: (registry, discovery),
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match=message):
+        espn_native_tasks.check_36h_freshness_and_alerts(
+            dag=SimpleNamespace(dag_id="dag_monitor_espn"),
+            run_id="monitor-run",
+            logical_date=database_now,
+            params={"attempt": 1},
+        )
+
+
+def test_monitor_rejects_complete_head_from_another_registry(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    database_now = datetime(2026, 7, 31, 13, tzinfo=timezone.utc)
+    registry = _generated_registry(1)
+    scope_id = _scope_ids(registry)[0]
+    discovery = {
+        "discovery_state_ref": {"uri": "state", "sha256": "a" * 64},
+        "male_registry_ref": {"uri": "registry", "sha256": "b" * 64},
+        "male_registry_signature": registry.signature(),
+        "selection_policy": espn_native_tasks.DISCOVERY_SELECTION_POLICY,
+        "male_scope_count": 1,
+    }
+    raw_head = SimpleNamespace(
+        scope_id=scope_id,
+        dag_id="dag_ingest_espn",
+        run_id="old-registry-run",
+        registry_signature="c" * 64,
+        published_at=database_now,
+    )
+    observed = []
+
+    class Store:
+        def migrate(self):
+            pass
+
+        def current_time(self):
+            return database_now
+
+        def read_scope_heads(self, _scope_ids):
+            return {scope_id: raw_head}
+
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: Store()),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_discovered_registry",
+        lambda *, now: (registry, discovery),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_verified_complete_head",
+        lambda _head: (raw_head, "complete"),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_head_identity_sha256", lambda _head: "d" * 64
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_latest_discovery_flags", lambda _scope: (False, False)
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "evaluate_alerts",
+        lambda snapshot, *, observed_at: observed.append(snapshot) or (),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda uri, payload, **_kwargs: {"uri": uri, "sha256": "e" * 64},
+    )
+    monkeypatch.setenv(espn_native_tasks.ARTIFACT_ROOT_ENV, "s3://artifacts")
+
+    espn_native_tasks.check_36h_freshness_and_alerts(
+        dag=SimpleNamespace(dag_id="dag_monitor_espn"),
+        run_id="monitor-run",
+        logical_date=database_now,
+        params={"attempt": 1},
+    )
+
+    assert observed[0]["state"] == "incomplete"
+    assert observed[0]["last_complete_at"] is None
+    assert observed[0]["identity_kind"] == "scope-head"
+    assert observed[0]["identity_sha256"] == "d" * 64
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("ESPN_DISCOVERY_STATE_REF_URI", "s3://artifacts/discovery/frozen.json"),
+        ("ESPN_DISCOVERY_STATE_REF_SHA256", "a" * 64),
+    ],
+)
+def test_monitor_rejects_partial_frozen_discovery_ref_without_static_fallback(
+    monkeypatch, name, value
+):
+    from dags.utils import espn_native_tasks
+
+    database_now = datetime(2026, 7, 31, 13, tzinfo=timezone.utc)
+
+    class Store:
+        def migrate(self):
+            pass
+
+        def current_time(self):
+            return database_now
+
+    monkeypatch.delenv(espn_native_tasks.DISCOVERY_STATE_REF_URI_ENV, raising=False)
+    monkeypatch.delenv(espn_native_tasks.DISCOVERY_STATE_REF_SHA256_ENV, raising=False)
+    monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: Store()),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "load_registry",
+        lambda _path: pytest.fail("partial frozen ref must not fall back to static"),
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="configured together"):
+        espn_native_tasks.check_36h_freshness_and_alerts(
+            dag=SimpleNamespace(dag_id="dag_monitor_espn"),
+            run_id="monitor-run",
+            logical_date=database_now,
+            params={"attempt": 1},
+        )
+
+
 def test_monitor_uses_database_clock_and_distinguishes_missing_subject(monkeypatch):
     from dags.utils import espn_native_tasks
 
@@ -5474,10 +5785,19 @@ def test_monitor_uses_database_clock_and_distinguishes_missing_subject(monkeypat
         def current_time(self):
             return database_now
 
-    registry = SimpleNamespace(signature=lambda: "a" * 64)
-    monkeypatch.setattr(espn_native_tasks, "load_registry", lambda _path: registry)
+    registry = _generated_registry(1)
+    registry_signature = registry.signature()
+    discovery = {
+        "discovery_state_ref": {"uri": "state", "sha256": "b" * 64},
+        "male_registry_ref": {"uri": "registry", "sha256": "c" * 64},
+        "male_registry_signature": registry_signature,
+        "selection_policy": espn_native_tasks.DISCOVERY_SELECTION_POLICY,
+        "male_scope_count": 1,
+    }
     monkeypatch.setattr(
-        espn_native_tasks, "_selected_scopes", lambda *_args: ("700:2026",)
+        espn_native_tasks,
+        "_load_discovered_registry",
+        lambda *, now: (registry, discovery),
     )
     monkeypatch.setattr(
         espn_native_tasks.PostgresEspnControlStore,
@@ -5513,6 +5833,12 @@ def test_monitor_uses_database_clock_and_distinguishes_missing_subject(monkeypat
     assert snapshot["subject_dag_id"] is None
     assert snapshot["subject_run_id"] is None
     assert snapshot["identity_kind"] == "monitor-subject"
+    assert snapshot["identity_sha256"] == espn_native_tasks._subject_identity(
+        dag_id="dag_monitor_espn",
+        run_id="monitor-run",
+        scope_id=_scope_ids(registry)[0],
+        registry_signature=registry_signature,
+    )
 
 
 def test_first_discovery_bootstraps_source_only_catalog_without_empty_diff():

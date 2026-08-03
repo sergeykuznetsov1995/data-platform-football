@@ -5631,20 +5631,63 @@ write_reviewable_discovery_diff = publish_discovered_male_registry
 def check_36h_freshness_and_alerts(**context) -> dict[str, str]:
     """Network-free six-hour monitor over durable COMPLETE scope heads."""
 
-    registry = load_registry(
-        Path(os.environ.get(REGISTRY_ENV, "/opt/airflow/configs/espn/registry.yaml"))
-    )
-    scope_ids = _selected_scopes(registry, "daily", {})
     store = PostgresEspnControlStore.from_env()
     store.migrate()
-    heads = store.read_scope_heads(scope_ids)
-    dag_id, run_id, _ = _run_identity(context)
     now = store.current_time()
+    registry, discovery = _load_discovered_registry(now=now)
+    discovery_state_ref = _discovery_artifact_ref(
+        discovery.get("discovery_state_ref"),
+        label="monitor discovery state reference",
+    )
+    male_registry_ref = _discovery_artifact_ref(
+        discovery.get("male_registry_ref"),
+        label="monitor male registry reference",
+    )
+    registry_signature = _sha(
+        registry.signature(), "monitor registry signature"
+    )
+    discovered_registry_signature = _sha(
+        discovery.get("male_registry_signature"),
+        "monitor discovered registry signature",
+    )
+    if discovered_registry_signature != registry_signature:
+        raise OperationsError(
+            "monitor registry signature differs from frozen discovery state"
+        )
+    if discovery.get("selection_policy") != DISCOVERY_SELECTION_POLICY:
+        raise OperationsError("monitor selection policy differs from frozen target")
+    scope_ids = tuple(
+        sorted(
+            competition.scope_id(competition.current_edition)
+            for competition in registry.promoted
+        )
+    )
+    if not scope_ids or tuple(sorted(set(scope_ids))) != scope_ids:
+        raise OperationsError("monitor frozen target scope set is invalid")
+    male_scope_count = discovery.get("male_scope_count")
+    if type(male_scope_count) is not int or male_scope_count != len(scope_ids):
+        raise OperationsError("monitor scope count differs from frozen target")
+    heads = store.read_scope_heads(scope_ids)
+    unexpected_heads = sorted(set(heads) - set(scope_ids))
+    if unexpected_heads:
+        raise OperationsError(
+            f"monitor scope heads contain non-target scopes: {unexpected_heads}"
+        )
+    dag_id, run_id, _ = _run_identity(context)
     alerts = []
+    # The exact v2 discovery checkpoint is admitted only after its review has
+    # no quarantined scopes or unresolved diffs.  Do not mix mutable
+    # ``latest-state.json`` flags into this frozen monitor run.
+    rollover, unresolved = False, False
     for scope_id in scope_ids:
         raw_head = heads.get(scope_id)
-        head, state = _verified_complete_head(raw_head)
-        rollover, unresolved = _latest_discovery_flags(scope_id)
+        if (
+            raw_head is not None
+            and raw_head.registry_signature != registry_signature
+        ):
+            head, state = None, "incomplete"
+        else:
+            head, state = _verified_complete_head(raw_head)
         if raw_head is None:
             alert_identity = {
                 "identity_kind": "monitor-subject",
@@ -5652,7 +5695,7 @@ def check_36h_freshness_and_alerts(**context) -> dict[str, str]:
                     dag_id=dag_id,
                     run_id=run_id,
                     scope_id=scope_id,
-                    registry_signature=registry.signature(),
+                    registry_signature=registry_signature,
                 ),
             }
         else:
@@ -5683,10 +5726,16 @@ def check_36h_freshness_and_alerts(**context) -> dict[str, str]:
             )
         )
     payload = {
-        "kind": "espn-monitor-result-v1",
-        "schema_version": 1,
+        "kind": "espn-monitor-result-v2",
+        "schema_version": 2,
+        "dag_id": dag_id,
         "run_id": run_id,
         "observed_at": now.isoformat(),
+        "discovery_state_ref": discovery_state_ref,
+        "male_registry_ref": male_registry_ref,
+        "registry_signature": registry_signature,
+        "selection_policy": DISCOVERY_SELECTION_POLICY,
+        "male_scope_count": male_scope_count,
         "scope_ids": list(scope_ids),
         "alerts": alerts,
     }
