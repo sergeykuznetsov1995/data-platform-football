@@ -150,9 +150,19 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
             python_callable=tasks.staging_dq_scope,
             retries=0,
         ).expand(op_kwargs=offline.output)
+        repository_ready = PythonOperator(
+            task_id="ensure_repository_objects",
+            python_callable=tasks.ensure_repository_objects,
+            pool=tasks.REPOSITORY_POOL,
+            pool_slots=tasks.REPOSITORY_POOL_SLOTS,
+            trigger_rule="none_failed",
+            retries=0,
+        )
         publish = PythonOperator.partial(
             task_id="publish_scopes",
             python_callable=tasks.publish_scope,
+            pool=tasks.REPOSITORY_POOL,
+            pool_slots=1,
             retries=0,
         ).expand(op_kwargs=staging_dq.output)
         persist = PythonOperator(
@@ -186,6 +196,7 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
             raw_source
             >> offline
             >> staging_dq
+            >> repository_ready
             >> publish
             >> persist
             >> publication_selector
@@ -199,6 +210,7 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
             *capture_tasks,
             offline,
             staging_dq,
+            repository_ready,
             publish,
             persist,
             publication_selector,

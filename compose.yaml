@@ -708,6 +708,7 @@ services:
         # browser scrapers from serializing it while limiting source fan-out.
         airflow pools set 'fotmob_http_pool' 4 'Bounded direct FotMob HTTP work'
         airflow pools set 'espn_http_pool' 1 'ESPN direct-only mapped HTTP waves; global rate gate is PostgreSQL-backed'
+        airflow pools set 'espn_repository_pool' 16 'ESPN repository DDL/write coordination'
         airflow pools set 'transfermarkt_proxy' 1 'Transfermarkt production and registry proxy work'
         # Backfill has its own single-slot pool; production scheduling remains
         # independent and receives priority in proxy request permits.

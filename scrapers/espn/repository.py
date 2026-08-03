@@ -1562,6 +1562,7 @@ class WriterProtocol(Protocol):
         mode: str = "append",
         add_metadata: bool = True,
         source: Optional[str] = None,
+        allow_target_ddl: bool = True,
     ) -> str: ...
 
 
@@ -1807,6 +1808,7 @@ class EspnBronzeRepository:
             mode="append",
             add_metadata=False,
             source="espn",
+            allow_target_ddl=self.ensure_objects_on_write,
         )
 
     def _physical_row_hashes(

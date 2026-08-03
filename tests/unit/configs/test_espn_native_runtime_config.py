@@ -294,29 +294,27 @@ def test_rendered_isolated_espn_compose_proves_role_projection_and_freeze() -> N
         assert environment["ESPN_CONTROL_DATABASE_URL"] == (
             "postgresql://espn-control.example.test/espn"
         )
-        assert environment["AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"] != environment[
-            "ESPN_CONTROL_DATABASE_URL"
-        ]
+        assert (
+            environment["AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"]
+            != environment["ESPN_CONTROL_DATABASE_URL"]
+        )
         assert set(service["networks"]) == {"backend", "default", "storage"}
         volumes = {volume["target"]: volume for volume in service["volumes"]}
         assert volumes["/opt/airflow/dags"]["type"] == "bind"
         assert volumes["/opt/airflow/dags"]["source"] == "/tmp/espn-dagbag"
         assert volumes["/opt/airflow/dags"]["read_only"] is True
-        assert volumes["/opt/espn-source/dags"]["source"] == (
-            "/tmp/espn-release/dags"
-        )
+        assert volumes["/opt/espn-source/dags"]["source"] == ("/tmp/espn-release/dags")
         assert volumes["/opt/espn-source/dags"]["read_only"] is True
 
     init_command = services["airflow-init"]["command"][-1]
-    topology_preflight = (
-        "python /opt/airflow/scripts/verify_espn_database_topology.py"
-    )
+    topology_preflight = "python /opt/airflow/scripts/verify_espn_database_topology.py"
     assert topology_preflight in init_command
     assert "airflow db migrate" in init_command
     assert init_command.index(topology_preflight) < init_command.index(
         "airflow db migrate"
     )
     assert "airflow pools set espn_http_pool 1" in init_command
+    assert "airflow pools set espn_repository_pool 16" in init_command
     for dag_id in (
         "dag_ingest_espn",
         "dag_repair_espn",

@@ -150,6 +150,7 @@ def test_daily_has_one_isolated_owner_and_real_two_wave_chain():
     assert tasks["fetch_summary_batches"].is_mapped is True
     assert tasks["offline_parse"].is_mapped is True
     assert tasks["staging_dq"].is_mapped is True
+    assert tasks["ensure_repository_objects"].is_mapped is False
     assert tasks["publish_scopes"].is_mapped is True
     assert tasks["published_dq"].is_mapped is True
     assert tasks["reduce_raw_manifests"]._init_kwargs["trigger_rule"] == "none_failed"
@@ -172,7 +173,8 @@ def test_daily_has_one_isolated_owner_and_real_two_wave_chain():
         ("select_summary_batches", "fetch_summary_batches"),
         ("reduce_raw_manifests", "offline_parse"),
         ("offline_parse", "staging_dq"),
-        ("staging_dq", "publish_scopes"),
+        ("staging_dq", "ensure_repository_objects"),
+        ("ensure_repository_objects", "publish_scopes"),
         ("publish_scopes", "persist_run_manifests"),
         ("persist_run_manifests", "select_publications"),
         ("select_publications", "published_dq"),
@@ -186,7 +188,7 @@ def test_daily_has_one_isolated_owner_and_real_two_wave_chain():
         assert upstream in tasks[downstream].upstream_task_ids
 
 
-def test_only_network_waves_use_one_slot_http_pool():
+def test_network_and_repository_work_use_bounded_dedicated_pools():
     _reload("dag_ingest_espn")
     tasks = _tasks()
     pooled = {
@@ -198,9 +200,13 @@ def test_only_network_waves_use_one_slot_http_pool():
     assert pooled == {
         "fetch_scoreboard_batches": "espn_http_pool",
         "fetch_summary_batches": "espn_http_pool",
+        "ensure_repository_objects": "espn_repository_pool",
+        "publish_scopes": "espn_repository_pool",
     }
-    for task_id in pooled:
+    for task_id in ("fetch_scoreboard_batches", "fetch_summary_batches"):
         assert tasks[task_id]._init_kwargs["pool_slots"] == 1
+    assert tasks["ensure_repository_objects"]._init_kwargs["pool_slots"] == 16
+    assert tasks["publish_scopes"]._init_kwargs["pool_slots"] == 1
 
 
 def test_ingest_timeout_lease_and_mapping_bounds_cover_bounded_onboarding():
@@ -213,12 +219,13 @@ def test_ingest_timeout_lease_and_mapping_bounds_cover_bounded_onboarding():
     assert espn_native_tasks.LEASE_TTL == timedelta(hours=12)
     assert espn_native_tasks.MAX_INGEST_SCOPE_MAP_ITEMS == 300
     assert espn_native_tasks.MAX_SUMMARY_BATCH_MAP_ITEMS == 1024
-    assert tasks["select_network_scope_bindings"]._init_kwargs["op_kwargs"][
-        "max_items"
-    ] == 300
-    assert tasks["select_summary_batches"]._init_kwargs["op_kwargs"][
-        "max_items"
-    ] == 1024
+    assert (
+        tasks["select_network_scope_bindings"]._init_kwargs["op_kwargs"]["max_items"]
+        == 300
+    )
+    assert (
+        tasks["select_summary_batches"]._init_kwargs["op_kwargs"]["max_items"] == 1024
+    )
 
 
 def test_terminal_health_release_and_propagator_cannot_mask_failure():
@@ -249,6 +256,7 @@ def test_terminal_health_release_and_propagator_cannot_mask_failure():
         "reduce_raw_manifests",
         "offline_parse",
         "staging_dq",
+        "ensure_repository_objects",
         "publish_scopes",
         "persist_run_manifests",
         "select_publications",
@@ -278,6 +286,10 @@ def test_manual_network_modes_reuse_same_contract_without_schedule(module_name, 
     assert module.DAG_MODE == mode
     assert tasks["fetch_scoreboard_batches"]._init_kwargs["pool"] == "espn_http_pool"
     assert tasks["fetch_summary_batches"]._init_kwargs["pool"] == "espn_http_pool"
+    assert tasks["ensure_repository_objects"]._init_kwargs["pool"] == (
+        "espn_repository_pool"
+    )
+    assert tasks["publish_scopes"]._init_kwargs["pool"] == "espn_repository_pool"
     assert "publish_scopes" in tasks
     assert tasks["terminal_verdict"].upstream_task_ids == set(
         tasks["terminal_verdict"]._init_kwargs["op_kwargs"]["producer_task_ids"]
@@ -293,7 +305,14 @@ def test_replay_dag_has_no_network_operator_at_all():
     assert "fetch_scoreboard_batches" not in tasks
     assert "fetch_summary_batches" not in tasks
     assert "bind_replay_raw_manifests" in tasks
-    assert all(task._init_kwargs.get("pool") is None for task in tasks.values())
+    assert {
+        task_id: task._init_kwargs.get("pool")
+        for task_id, task in tasks.items()
+        if task._init_kwargs.get("pool") is not None
+    } == {
+        "ensure_repository_objects": "espn_repository_pool",
+        "publish_scopes": "espn_repository_pool",
+    }
     assert tasks["terminal_verdict"].upstream_task_ids == set(
         tasks["terminal_verdict"]._init_kwargs["op_kwargs"]["producer_task_ids"]
     )
@@ -336,9 +355,7 @@ def test_weekly_discovery_publishes_generated_registry_and_monitor_is_network_fr
         in discovery_tasks["publish_discovered_male_registry"].upstream_task_ids
     )
     assert (
-        discovery_tasks["publish_discovered_male_registry"]._init_kwargs[
-            "trigger_rule"
-        ]
+        discovery_tasks["publish_discovered_male_registry"]._init_kwargs["trigger_rule"]
         == "none_failed"
     )
 
@@ -1016,6 +1033,75 @@ def test_mapping_selector_rejects_unbounded_payload():
         )
 
 
+def test_repository_preflight_runs_ddl_once_and_publish_factory_disables_it(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+
+    instances = []
+
+    class Repository:
+        def __init__(self, *, ensure_objects_on_write=True):
+            self.ensure_objects_on_write = ensure_objects_on_write
+            self.ensure_calls = 0
+            instances.append(self)
+
+        def ensure_objects(self):
+            self.ensure_calls += 1
+
+    monkeypatch.setattr(espn_native_tasks, "EspnBronzeRepository", Repository)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_repository_pool_slots",
+        lambda: espn_native_tasks.REPOSITORY_POOL_SLOTS,
+    )
+
+    assert espn_native_tasks.ensure_repository_objects() == {"state": "ready"}
+    publication_repository = espn_native_tasks._publication_repository()
+
+    assert len(instances) == 2
+    assert instances[0].ensure_objects_on_write is True
+    assert instances[0].ensure_calls == 1
+    assert publication_repository.ensure_objects_on_write is False
+    assert publication_repository.ensure_calls == 0
+
+    monkeypatch.setattr(espn_native_tasks, "_repository_pool_slots", lambda: 15)
+    with pytest.raises(espn_native_tasks.OperationsError, match="exactly 16"):
+        espn_native_tasks.ensure_repository_objects()
+
+
+@pytest.mark.parametrize(
+    ("pool", "expected_error"),
+    (
+        (None, "missing or malformed"),
+        (SimpleNamespace(slots="16"), "missing or malformed"),
+        (SimpleNamespace(slots=16), None),
+    ),
+)
+def test_repository_pool_lookup_uses_exact_airflow_pool(
+    monkeypatch, pool, expected_error
+):
+    from dags.utils import espn_native_tasks
+
+    class Pool:
+        @staticmethod
+        def get_pool(pool_name):
+            assert pool_name == espn_native_tasks.REPOSITORY_POOL
+            return pool
+
+    monkeypatch.setitem(
+        sys.modules,
+        "airflow.models.pool",
+        SimpleNamespace(Pool=Pool),
+    )
+
+    if expected_error is not None:
+        with pytest.raises(espn_native_tasks.OperationsError, match=expected_error):
+            espn_native_tasks._repository_pool_slots()
+        return
+    assert espn_native_tasks._repository_pool_slots() == 16
+
+
 def test_production_compose_provisions_exactly_one_espn_http_slot():
     compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
     command = compose.split("airflow-init:", 1)[1].split("airflow-scheduler:", 1)[0]
@@ -1024,6 +1110,7 @@ def test_production_compose_provisions_exactly_one_espn_http_slot():
     )[0]
 
     assert command.count("airflow pools set 'espn_http_pool' 1") == 1
+    assert command.count("airflow pools set 'espn_repository_pool' 16") == 1
     assert scheduler.count("target: /opt/airflow/configs/espn") == 1
     espn_mount = scheduler.split("source: ./configs/espn", 1)[1].split(
         "- type: bind", 1
@@ -1103,9 +1190,7 @@ def test_exact_181_scope_fixture_bounds_reconciliation_summary_map():
     from scrapers.espn.runner import is_full_reconciliation_day
 
     snapshot = CatalogSnapshot.from_dict(
-        json.loads(
-            (ROOT / "tests/fixtures/espn/catalog_2026-07-31.json").read_text()
-        )
+        json.loads((ROOT / "tests/fixtures/espn/catalog_2026-07-31.json").read_text())
     )
     registry = build_discovered_male_registry(
         snapshot,
@@ -1199,8 +1284,7 @@ def test_daily_admission_v2_persists_exact_discovery_and_coverage(monkeypatch):
         espn_native_tasks,
         "_write_payload",
         lambda uri, payload, **kwargs: (
-            writes.append((uri, payload, kwargs))
-            or {"uri": uri, "sha256": "d" * 64}
+            writes.append((uri, payload, kwargs)) or {"uri": uri, "sha256": "d" * 64}
         ),
     )
 
@@ -1438,9 +1522,10 @@ def test_daily_admission_retry_replays_without_parent_metadata_or_mutable_db(
         lambda: pytest.fail("retry must preserve sealed raw store"),
     )
 
-    assert espn_native_tasks.validate_registry_and_admission(
-        mode="daily", **context
-    ) == admission_ref
+    assert (
+        espn_native_tasks.validate_registry_and_admission(mode="daily", **context)
+        == admission_ref
+    )
 
 
 @pytest.mark.parametrize(
@@ -1480,9 +1565,10 @@ def test_admission_consumers_accept_inflight_v1_and_current_v2(
         )
     monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: admission)
 
-    assert espn_native_tasks._read_admission_ref(
-        {"uri": "admission", "sha256": "a" * 64}
-    ) == admission
+    assert (
+        espn_native_tasks._read_admission_ref({"uri": "admission", "sha256": "a" * 64})
+        == admission
+    )
 
 
 def test_discovery_registry_rejects_future_state_and_enabled_non_male(monkeypatch):
@@ -1532,9 +1618,7 @@ def test_discovery_registry_rejects_future_state_and_enabled_non_male(monkeypatc
         ("ESPN_DISCOVERY_STATE_REF_SHA256", "a" * 64),
     ],
 )
-def test_discovery_registry_freeze_requires_complete_ref_pair(
-    monkeypatch, name, value
-):
+def test_discovery_registry_freeze_requires_complete_ref_pair(monkeypatch, name, value):
     from dags.utils import espn_native_tasks
 
     monkeypatch.delenv(espn_native_tasks.DISCOVERY_STATE_REF_URI_ENV, raising=False)
@@ -1674,9 +1758,7 @@ def test_discovery_registry_fault_fails_before_leases(monkeypatch, fault):
     state = {
         "kind": "espn-discovery-state-v2",
         "observed_at": (
-            now - timedelta(days=8, seconds=1)
-            if fault == "stale"
-            else now
+            now - timedelta(days=8, seconds=1) if fault == "stale" else now
         ).isoformat(),
     }
     registry = _generated_registry(1)
@@ -3001,9 +3083,10 @@ def test_saved_detail_evidence_reaches_male_registry_artifact(
     assert [row["espn_id"] for row in male_registry["competitions"]] == [730]
     assert review["selection_policy"] == "explicit-core-gender-MALE-v1"
     assert review["male_scope_count"] == 1
-    assert review["male_registry_signature"] == validate_registry_document(
-        male_registry
-    ).signature()
+    assert (
+        review["male_registry_signature"]
+        == validate_registry_document(male_registry).signature()
+    )
     assert male_registry_ref["uri"].endswith("/male-registry.json")
     assert review["unresolved_discovery_diffs"] is False
     assert review["quarantined_scopes"] == []
@@ -3025,9 +3108,12 @@ def test_saved_detail_evidence_reaches_male_registry_artifact(
     assert checkpoint["discovery_state_ref"] == result["discovery_state_ref"]
     assert state_payload["kind"] == "espn-discovery-state-v2"
     assert state_payload == latest_payload
-    assert result["discovery_state_ref"]["sha256"] == hashlib.sha256(
-        espn_native_tasks._canonical_bytes(latest_payload)
-    ).hexdigest()
+    assert (
+        result["discovery_state_ref"]["sha256"]
+        == hashlib.sha256(
+            espn_native_tasks._canonical_bytes(latest_payload)
+        ).hexdigest()
+    )
     assert state_uri != latest_uri
     assert state_kwargs == {}
     assert latest_kwargs == {"immutable": False}
@@ -3080,9 +3166,7 @@ def test_discovery_reducer_rejects_partial_index_before_phase_reduction(monkeypa
         "count": 2,
         "pageCount": 1,
         "items": [
-            {
-                "$ref": "https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1"
-            },
+            {"$ref": "https://sports.core.api.espn.com/v2/sports/soccer/leagues/eng.1"},
             {
                 "$ref": "https://sports.core.api.espn.com/v2/sports/soccer/leagues/uefa.champions"
             },
@@ -3124,9 +3208,7 @@ def test_discovery_reducer_rejects_partial_index_before_phase_reduction(monkeypa
         ),
     )
 
-    with pytest.raises(
-        espn_native_tasks.OperationsError, match="raw catalog coverage"
-    ):
+    with pytest.raises(espn_native_tasks.OperationsError, match="raw catalog coverage"):
         espn_native_tasks.publish_discovered_male_registry(
             discovery_detail_index_ref=index_ref,
             discovery_detail_phase_refs=[{"discovery_detail_phase_ref": phase_ref}],
@@ -3540,7 +3622,12 @@ def test_older_immutable_discovery_state_loads_after_latest_alias_advances(
 ):
     from dags.utils import espn_native_tasks
     from scrapers.espn.discovery import CatalogCandidate, CatalogSnapshot
-    from scrapers.espn.models import AgeClass, CapabilityState, EntityCapabilities, Gender
+    from scrapers.espn.models import (
+        AgeClass,
+        CapabilityState,
+        EntityCapabilities,
+        Gender,
+    )
 
     artifact_root = tmp_path.as_uri()
     registry = _generated_registry(1)
@@ -3572,9 +3659,7 @@ def test_older_immutable_discovery_state_loads_after_latest_alias_advances(
     )
 
     def publish(run_name: str, observed_at: str):
-        run_root = espn_native_tasks._join_uri(
-            artifact_root, "discovery", run_name
-        )
+        run_root = espn_native_tasks._join_uri(artifact_root, "discovery", run_name)
         candidate_payload = json.loads(candidate.canonical_json())
         registry_payload = json.loads(registry.canonical_json())
         candidate_ref = espn_native_tasks._write_payload(
@@ -3606,14 +3691,14 @@ def test_older_immutable_discovery_state_loads_after_latest_alias_advances(
         review_ref = espn_native_tasks._write_payload(
             espn_native_tasks._join_uri(run_root, "reviewable-diff.json"), review
         )
-        state = espn_native_tasks._discovery_review_state(
-            review, review_ref=review_ref
-        )
+        state = espn_native_tasks._discovery_review_state(review, review_ref=review_ref)
         state_ref = espn_native_tasks._write_payload(
             espn_native_tasks._join_uri(run_root, "discovery-state.json"), state
         )
         espn_native_tasks._publish_latest_discovery_state(
-            espn_native_tasks._join_uri(artifact_root, "discovery", "latest-state.json"),
+            espn_native_tasks._join_uri(
+                artifact_root, "discovery", "latest-state.json"
+            ),
             state,
             state_ref=state_ref,
         )
@@ -3622,9 +3707,7 @@ def test_older_immutable_discovery_state_loads_after_latest_alias_advances(
     first_ref, first_state = publish("run-a", "2026-08-01T00:00:00+00:00")
     second_ref, second_state = publish("run-b", "2026-08-08T00:00:00+00:00")
     assert first_ref != second_ref
-    monkeypatch.setenv(
-        espn_native_tasks.DISCOVERY_STATE_REF_URI_ENV, first_ref["uri"]
-    )
+    monkeypatch.setenv(espn_native_tasks.DISCOVERY_STATE_REF_URI_ENV, first_ref["uri"])
     monkeypatch.setenv(
         espn_native_tasks.DISCOVERY_STATE_REF_SHA256_ENV, first_ref["sha256"]
     )
@@ -3719,12 +3802,16 @@ def test_discovery_state_v2_rejects_mixed_review_projection(monkeypatch):
     monkeypatch.setattr(
         discovery.CatalogSnapshot,
         "from_dict",
-        classmethod(lambda _cls, _value: SimpleNamespace(signature=lambda: candidate_signature)),
+        classmethod(
+            lambda _cls, _value: SimpleNamespace(signature=lambda: candidate_signature)
+        ),
     )
     monkeypatch.setattr(
         espn_native_tasks,
         "validate_registry_document",
-        lambda _value: SimpleNamespace(signature=lambda: registry_signature, promoted=(1,)),
+        lambda _value: SimpleNamespace(
+            signature=lambda: registry_signature, promoted=(1,)
+        ),
     )
     monkeypatch.setattr(
         espn_native_tasks,
@@ -4544,7 +4631,7 @@ def test_publish_scope_recovers_crash_after_complete_from_durable_intent(
         "from_env",
         classmethod(lambda _cls: store),
     )
-    monkeypatch.setattr(espn_native_tasks, "EspnBronzeRepository", Repository)
+    monkeypatch.setattr(espn_native_tasks, "_publication_repository", Repository)
     monkeypatch.setattr(
         espn_native_tasks.runner,
         "_read_artifact",
@@ -4755,7 +4842,7 @@ def test_publish_scope_reconciles_legacy_old_head_to_existing_current_complete(
         "from_env",
         classmethod(lambda _cls: store),
     )
-    monkeypatch.setattr(espn_native_tasks, "EspnBronzeRepository", Repository)
+    monkeypatch.setattr(espn_native_tasks, "_publication_repository", Repository)
     monkeypatch.setattr(
         espn_native_tasks.runner,
         "_read_artifact",
@@ -4922,7 +5009,7 @@ def test_resumed_noop_hydrates_legacy_head_before_recording_evidence(monkeypatch
         "from_env",
         classmethod(lambda _cls: Store()),
     )
-    monkeypatch.setattr(espn_native_tasks, "EspnBronzeRepository", Repository)
+    monkeypatch.setattr(espn_native_tasks, "_publication_repository", Repository)
     monkeypatch.setattr(
         espn_native_tasks,
         "_write_payload",

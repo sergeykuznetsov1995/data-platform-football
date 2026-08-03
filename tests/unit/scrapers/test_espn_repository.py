@@ -1747,6 +1747,7 @@ def test_table_partition_map_matches_real_writer_contract():
     repository.append_catalog_snapshot(snapshot)
     assert writer.calls[0][0] == CATALOG_TABLE
     assert writer.options[0]["partition_spec"] == [("snapshot_id", "identity")]
+    assert writer.options[0]["allow_target_ddl"] is False
 
 
 @pytest.mark.unit

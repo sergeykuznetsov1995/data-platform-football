@@ -330,6 +330,77 @@ class TestIcebergWriterWriteToIceberg:
             mock_trino.create_iceberg_table.assert_not_called()
             mock_trino.insert_dataframe_atomic.assert_called_once()
 
+    def test_write_to_iceberg_without_target_ddl_requires_existing_table(self):
+        from scrapers.base.iceberg_writer import IcebergWriter
+
+        writer = IcebergWriter()
+        mock_trino = MagicMock()
+        mock_trino.table_exists.return_value = False
+        mock_trino.arrow_schema_to_trino.return_value = {"col1": "BIGINT"}
+        writer._trino_manager = mock_trino
+
+        with pytest.raises(RuntimeError, match="not pre-provisioned"):
+            writer._write_to_iceberg(
+                pd.DataFrame({"col1": [1]}),
+                "bronze",
+                "test_table",
+                None,
+                allow_target_ddl=False,
+            )
+
+        mock_trino.create_iceberg_table.assert_not_called()
+        mock_trino.insert_dataframe_atomic.assert_not_called()
+
+    def test_write_to_iceberg_without_target_ddl_rejects_schema_drift(self):
+        from scrapers.base.iceberg_writer import IcebergWriter
+
+        writer = IcebergWriter()
+        mock_trino = MagicMock()
+        mock_trino.table_exists.return_value = True
+        mock_trino.get_table_columns.return_value = ["col1"]
+        mock_trino.arrow_schema_to_trino.return_value = {
+            "col1": "BIGINT",
+            "new_col": "VARCHAR",
+        }
+        writer._trino_manager = mock_trino
+
+        with pytest.raises(RuntimeError, match="missing columns: new_col"):
+            writer._write_to_iceberg(
+                pd.DataFrame({"col1": [1], "new_col": ["x"]}),
+                "bronze",
+                "test_table",
+                None,
+                allow_target_ddl=False,
+            )
+
+        mock_trino.create_iceberg_table.assert_not_called()
+        mock_trino.add_column.assert_not_called()
+        mock_trino.insert_dataframe_atomic.assert_not_called()
+
+    def test_write_to_iceberg_without_target_ddl_only_appends(self):
+        from scrapers.base.iceberg_writer import IcebergWriter
+
+        writer = IcebergWriter()
+        mock_trino = MagicMock()
+        mock_trino.table_exists.return_value = True
+        mock_trino.get_table_columns.return_value = ["col1"]
+        mock_trino.arrow_schema_to_trino.return_value = {"col1": "BIGINT"}
+        mock_trino.insert_dataframe_atomic.return_value = 1
+        writer._trino_manager = mock_trino
+
+        result = writer._write_to_iceberg(
+            pd.DataFrame({"col1": [1]}),
+            "bronze",
+            "test_table",
+            None,
+            allow_target_ddl=False,
+        )
+
+        assert result == "iceberg.bronze.test_table"
+        mock_trino.create_iceberg_table.assert_not_called()
+        mock_trino.add_column.assert_not_called()
+        mock_trino.insert_dataframe_atomic.assert_called_once()
+
     def test_write_to_iceberg_bulk_arrow_bypasses_values_inserts(self):
         """Large append-only frames use one Parquet/Iceberg commit."""
         with patch.dict('sys.modules', {'trino': MagicMock(), 'trino.dbapi': MagicMock()}):

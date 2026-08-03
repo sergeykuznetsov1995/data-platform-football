@@ -265,6 +265,7 @@ class IcebergWriter:
         delete_filter: Optional[str] = None,
         merge_keys: Optional[Sequence[str]] = None,
         bulk_arrow: bool = False,
+        allow_target_ddl: bool = True,
     ) -> str:
         """
         Write DataFrame to Iceberg table via Trino INSERT.
@@ -282,6 +283,9 @@ class IcebergWriter:
                 Use for partition-replace semantics, e.g.
                 ``"league='ENG-Premier League' AND season=2025"``.
             merge_keys: Optional natural key for an incremental Iceberg MERGE.
+            allow_target_ddl: Whether this call may create or evolve the target
+                table. Disable after an exclusive schema preflight when mapped
+                writers must not mutate shared target objects.
 
         Returns:
             Full table identifier (e.g., 'iceberg.bronze.fbref_schedule')
@@ -311,6 +315,7 @@ class IcebergWriter:
                 delete_filter=delete_filter,
                 merge_keys=merge_keys,
                 bulk_arrow=bulk_arrow,
+                allow_target_ddl=allow_target_ddl,
             )
         except Exception as e:
             logger.error(f"Error writing to {database}.{table}: {e}")
@@ -326,6 +331,7 @@ class IcebergWriter:
         delete_filter: Optional[str] = None,
         merge_keys: Optional[Sequence[str]] = None,
         bulk_arrow: bool = False,
+        allow_target_ddl: bool = True,
     ) -> str:
         """
         Write DataFrame directly to Iceberg via Trino INSERT.
@@ -349,6 +355,8 @@ class IcebergWriter:
 
         if mode not in {"append", "overwrite"}:
             raise ValueError("mode must be 'append' or 'overwrite'")
+        if type(allow_target_ddl) is not bool:
+            raise TypeError("allow_target_ddl must be boolean")
         if mode == "overwrite":
             if delete_filter or merge_keys:
                 raise ValueError(
@@ -371,8 +379,14 @@ class IcebergWriter:
         columns = trino.arrow_schema_to_trino(arrow_table.schema)
         partition_cols = [col for col, _ in partition_spec] if partition_spec else None
 
-        # Create table if not exists
-        if not trino.table_exists(database, table):
+        # Shared target DDL may be disabled after an exclusive schema preflight.
+        # Atomic inserts can still use their uniquely named staging tables.
+        target_exists = trino.table_exists(database, table)
+        if not target_exists and not allow_target_ddl:
+            raise RuntimeError(
+                f"target DDL is disabled and {full_table} is not pre-provisioned"
+            )
+        if not target_exists:
             trino.create_iceberg_table(
                 schema=database,
                 table=table,
@@ -381,8 +395,8 @@ class IcebergWriter:
             )
             logger.info(f"Created Iceberg table: {full_table}")
 
-        # Schema evolution — add missing columns to existing table
-        if trino.table_exists(database, table):
+        # Schema evolution — add missing columns to existing table.
+        if allow_target_ddl and trino.table_exists(database, table):
             try:
                 self._evolve_schema(trino, database, table, arrow_table.schema)
             except TrinoError as e:
@@ -396,6 +410,21 @@ class IcebergWriter:
                     )
                 else:
                     raise
+        elif not allow_target_ddl:
+            existing_columns = {
+                column.lower() for column in trino.get_table_columns(database, table)
+            }
+            incoming_columns = trino.arrow_schema_to_trino(arrow_table.schema)
+            missing_columns = sorted(
+                column
+                for column in incoming_columns
+                if column.lower() not in existing_columns
+            )
+            if missing_columns:
+                raise RuntimeError(
+                    f"target DDL is disabled and {full_table} is missing columns: "
+                    + ", ".join(missing_columns)
+                )
 
         # Insert data — atomic stage+merge so the target gets ONE snapshot
         # regardless of how many byte-budget VALUES batches the rows need (#269).

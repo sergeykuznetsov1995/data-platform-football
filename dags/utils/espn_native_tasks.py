@@ -73,6 +73,8 @@ from scrapers.espn.transport_contracts import (
 
 UTC = timezone.utc
 HTTP_POOL = "espn_http_pool"
+REPOSITORY_POOL = "espn_repository_pool"
+REPOSITORY_POOL_SLOTS = 16
 REGISTRY_ENV = "ESPN_REGISTRY_PATH"
 ARTIFACT_ROOT_ENV = "ESPN_ARTIFACT_ROOT_URI"
 RAW_STORE_ENV = "ESPN_RAW_STORE_URI"
@@ -387,9 +389,7 @@ def _frozen_discovery_state_ref() -> dict[str, str] | None:
     }
 
 
-def _load_discovered_registry(
-    *, now: datetime
-) -> tuple[Registry, dict[str, Any]]:
+def _load_discovered_registry(*, now: datetime) -> tuple[Registry, dict[str, Any]]:
     """Pin and validate the exact fresh all-male discovery projection."""
 
     if not isinstance(now, datetime) or now.tzinfo is None:
@@ -399,9 +399,7 @@ def _load_discovered_registry(
         frozen_state_ref = _frozen_discovery_state_ref()
         state_ref = frozen_state_ref
         if state_ref is None:
-            latest_uri = _join_uri(
-                _artifact_root(), "discovery", "latest-state.json"
-            )
+            latest_uri = _join_uri(_artifact_root(), "discovery", "latest-state.json")
             state_ref = _ref_for_uri(latest_uri)
         state = _read_ref(state_ref, kind="espn-discovery-state-v2")
         _candidate, registry, _review = _load_discovery_state_v2(state)
@@ -514,10 +512,9 @@ def _admission_payload(value: object) -> Mapping[str, Any]:
         )
         if value["selection_policy"] != DISCOVERY_SELECTION_POLICY:
             raise OperationsError("admission selection policy mismatch")
-        if (
-            type(value["male_scope_count"]) is not int
-            or value["male_scope_count"] != len(target)
-        ):
+        if type(value["male_scope_count"]) is not int or value[
+            "male_scope_count"
+        ] != len(target):
             raise OperationsError("admission male scope count mismatch")
         if (
             len(bootstrap) > DAILY_BOOTSTRAP_SCOPE_LIMIT
@@ -773,9 +770,7 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
     bootstrap_scopes: tuple[str, ...] = ()
     if mode == "daily":
         heads = store.read_scope_heads(target_scopes)
-        target_scopes, scopes, bootstrap_scopes = _bounded_daily_scopes(
-            registry, heads
-        )
+        target_scopes, scopes, bootstrap_scopes = _bounded_daily_scopes(registry, heads)
     else:
         scopes = _selected_scopes(registry, mode, context.get("params") or {})
     if not scopes:
@@ -1764,9 +1759,7 @@ def fetch_scoreboard_batch(
         mode=runner._effective_mode(loaded),
     )
     expected = descriptor["expected_scoreboard_batch"]
-    if sorted(item.request_id for item in requests) != sorted(
-        expected["request_ids"]
-    ):
+    if sorted(item.request_id for item in requests) != sorted(expected["request_ids"]):
         raise OperationsError("scoreboard request plan drift")
     checkpoint_ref = _resume_checkpoint(
         descriptor["scoreboard_checkpoint_uri"], expected
@@ -2692,6 +2685,33 @@ def _load_existing_publication_evidence(
     )
 
 
+def _repository_pool_slots() -> int:
+    from airflow.models.pool import Pool
+
+    pool = Pool.get_pool(REPOSITORY_POOL)
+    if pool is None or type(pool.slots) is not int:
+        raise OperationsError("ESPN repository pool is missing or malformed")
+    return pool.slots
+
+
+def ensure_repository_objects(**_context) -> dict[str, str]:
+    """Create/evolve shared ESPN objects once before parallel publication."""
+
+    if _repository_pool_slots() != REPOSITORY_POOL_SLOTS:
+        raise OperationsError(
+            f"ESPN repository pool must have exactly {REPOSITORY_POOL_SLOTS} slots"
+        )
+    repository = EspnBronzeRepository()
+    repository.ensure_objects()
+    return {"state": "ready"}
+
+
+def _publication_repository() -> EspnBronzeRepository:
+    """Return a writer that trusts the exclusive upstream DDL preflight."""
+
+    return EspnBronzeRepository(ensure_objects_on_write=False)
+
+
 def publish_scope(*, staging_dq_ref: Mapping[str, str], **_context) -> dict[str, str]:
     """Publish under a row-lock fence held through the COMPLETE manifest."""
 
@@ -2716,7 +2736,7 @@ def publish_scope(*, staging_dq_ref: Mapping[str, str], **_context) -> dict[str,
     existing_head = store.read_scope_heads_owned((renewed,), now=datetime.now(UTC)).get(
         scope.scope_id
     )
-    repository = EspnBronzeRepository()
+    repository = _publication_repository()
     existing_head, allow_current_reconciliation = _prepare_scope_head_for_publication(
         store=store,
         lease=renewed,
@@ -4109,8 +4129,10 @@ def _normalize_discovery_dropdown(
             slugs.add(slug)
             leagues.append({"id": None, "slug": slug, "name": slug})
         return {"leagues": leagues}
-    if allow_normalized and set(document) == {"leagues"} and isinstance(
-        document.get("leagues"), list
+    if (
+        allow_normalized
+        and set(document) == {"leagues"}
+        and isinstance(document.get("leagues"), list)
     ):
         return document
     raise OperationsError(
@@ -4133,10 +4155,7 @@ def _normalized_discovery_competitions(
     if not competitions:
         raise OperationsError("discovery catalog contains no competitions")
     slugs = tuple(identity[1] for identity in competitions)
-    if (
-        len(competitions) != len(set(competitions))
-        or len(slugs) != len(set(slugs))
-    ):
+    if len(competitions) != len(set(competitions)) or len(slugs) != len(set(slugs)):
         raise OperationsError("discovery Core catalog identities must be unique")
     if len(competitions) > MAX_DISCOVERY_COMPETITIONS:
         raise OperationsError(
@@ -4983,9 +5002,10 @@ def _validate_discovery_review_checkpoint(
     candidate = (
         _read_ref(candidate_ref) if candidate_payload is None else candidate_payload
     )
-    if candidate_payload is not None and _payload_ref(
-        candidate_ref["uri"], candidate
-    ) != candidate_ref:
+    if (
+        candidate_payload is not None
+        and _payload_ref(candidate_ref["uri"], candidate) != candidate_ref
+    ):
         raise OperationsError("sealed discovery candidate reference mismatch")
     candidates = candidate.get("candidates")
     if not isinstance(candidates, list):
@@ -5003,9 +5023,11 @@ def _validate_discovery_review_checkpoint(
         if male_registry_payload is None
         else male_registry_payload
     )
-    if male_registry_payload is not None and _payload_ref(
-        male_registry_ref["uri"], male_registry_payload
-    ) != male_registry_ref:
+    if (
+        male_registry_payload is not None
+        and _payload_ref(male_registry_ref["uri"], male_registry_payload)
+        != male_registry_ref
+    ):
         raise OperationsError("sealed discovered male registry reference mismatch")
     if review.get("male_registry_signature") != male_registry.signature():
         raise OperationsError("existing discovered male registry signature mismatch")
@@ -5053,8 +5075,7 @@ def _validate_discovery_reducer_checkpoint(
         raise OperationsError("discovery reducer checkpoint mismatch")
     if (
         set(checkpoint) != required_keys
-        or checkpoint.get("discovery_detail_index_ref")
-        != discovery_detail_index_ref
+        or checkpoint.get("discovery_detail_index_ref") != discovery_detail_index_ref
         or checkpoint.get("discovery_detail_phase_refs")
         != list(discovery_detail_phase_refs)
         or not isinstance(checkpoint.get("candidate_payload"), Mapping)
@@ -5075,8 +5096,7 @@ def _validate_discovery_reducer_checkpoint(
         candidate_ref["uri"] != candidate_uri
         or male_registry_ref["uri"] != male_registry_uri
         or review_ref["uri"] != review_uri
-        or _payload_ref(candidate_uri, checkpoint["candidate_payload"])
-        != candidate_ref
+        or _payload_ref(candidate_uri, checkpoint["candidate_payload"]) != candidate_ref
         or _payload_ref(male_registry_uri, checkpoint["male_registry_payload"])
         != male_registry_ref
         or _payload_ref(review_uri, checkpoint["review_payload"]) != review_ref
@@ -5093,8 +5113,7 @@ def _validate_discovery_reducer_checkpoint(
         checkpoint["candidate_ref"] != review["candidate_ref"]
         or checkpoint["candidate_signature"] != review["candidate_signature"]
         or checkpoint["male_registry_ref"] != review["male_registry_ref"]
-        or checkpoint["male_registry_signature"]
-        != review["male_registry_signature"]
+        or checkpoint["male_registry_signature"] != review["male_registry_signature"]
         or checkpoint["male_scope_count"] != review["male_scope_count"]
         or checkpoint["observed_at"] != review["observed_at"]
     ):
@@ -5113,9 +5132,7 @@ def _validate_discovery_reducer_checkpoint(
             or _payload_ref(discovery_state_uri, checkpoint["discovery_state_payload"])
             != state_ref
         ):
-            raise OperationsError(
-                "discovery reducer checkpoint state binding mismatch"
-            )
+            raise OperationsError("discovery reducer checkpoint state binding mismatch")
     else:
         # A pre-v2 reducer checkpoint sealed the complete review projection.
         # Derive the state deterministically so interrupted rollout runs remain
@@ -5236,9 +5253,7 @@ def publish_discovered_male_registry(
     )
     existing_checkpoint = _optional_payload(checkpoint_uri)
     if existing_checkpoint is not None:
-        committed_phase_refs = existing_checkpoint.get(
-            "discovery_detail_phase_refs"
-        )
+        committed_phase_refs = existing_checkpoint.get("discovery_detail_phase_refs")
         if not isinstance(committed_phase_refs, list) or not committed_phase_refs:
             raise OperationsError("existing discovery reducer phase set is invalid")
         discovery_detail_phase_refs = _exact_mapped_results(
@@ -5246,9 +5261,7 @@ def publish_discovered_male_registry(
             expected_count=len(committed_phase_refs),
             label="discovery detail phase",
         )
-        canonical_phase_refs = _discovery_phase_input_refs(
-            discovery_detail_phase_refs
-        )
+        canonical_phase_refs = _discovery_phase_input_refs(discovery_detail_phase_refs)
         return _replay_discovery_reducer_checkpoint(
             existing_checkpoint,
             discovery_detail_index_ref=canonical_index_ref,
@@ -5350,9 +5363,7 @@ def publish_discovered_male_registry(
                 or set(item) != {"espn_id", "slug", "name"}
                 or (
                     item["espn_id"] is not None
-                    and (
-                        type(item["espn_id"]) is not int or item["espn_id"] <= 0
-                    )
+                    and (type(item["espn_id"]) is not int or item["espn_id"] <= 0)
                 )
                 or not isinstance(item["slug"], str)
                 or not item["slug"]
@@ -5360,9 +5371,7 @@ def publish_discovered_male_registry(
                 or not item["name"]
             ):
                 raise OperationsError("discovery detail batch identity is invalid")
-            indexed_competitions.append(
-                (item["espn_id"], item["slug"], item["name"])
-            )
+            indexed_competitions.append((item["espn_id"], item["slug"], item["name"]))
         indexed_batches[batch_id] = (batch_ref, batch)
     if set(indexed_batches) != set(detail_index["batch_ids"]):
         raise OperationsError("discovery detail index batch references are incomplete")
@@ -5479,9 +5488,8 @@ def publish_discovered_male_registry(
                 slug=item["slug"],
                 name=item["name"],
             )
-    if (
-        len(seen_ids) != len(catalog_competitions)
-        or len(details_by_slug) != len(catalog_competitions)
+    if len(seen_ids) != len(catalog_competitions) or len(details_by_slug) != len(
+        catalog_competitions
     ):
         raise OperationsError("discovery detail competition count mismatch")
     if detail_request_count > detail_index["detail_request_cap"]:
