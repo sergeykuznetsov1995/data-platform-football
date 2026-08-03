@@ -467,6 +467,28 @@ class WorkloadClassBudget:
     measured_tournament_ids: tuple[str, ...]
 
 
+# ``hard_task_bytes`` is the exact maximum of the canary's cold samples and the
+# artifact guard keeps it that way — the evidence must stay honest. But an
+# enforcement cap sitting AT the observed maximum has zero headroom: season
+# classes drift a few percent between samples, and a historical season pulls a
+# fuller schedule than the measured current one, so the first slightly heavier
+# page exhausts the allocation mid-attempt and surfaces as a bogus
+# "residential exit unreachable" (#1044). The cap therefore carries a
+# structural headroom above the evidence. This is NOT the forbidden artifact
+# ``budget_multiplier``: that guard rejects caller/artifact-supplied values;
+# this is a fixed code constant applied uniformly at plan build.
+ALLOCATION_BUDGET_HEADROOM_PERCENT = 15
+
+
+def allocation_budget_bytes(hard_task_bytes: int) -> int:
+    """Enforcement cap for one allocation: measured evidence plus headroom."""
+
+    measured = int(hard_task_bytes)
+    if measured <= 0:
+        raise WorkloadPlanError("hard_task_bytes must be positive")
+    return (measured * (100 + ALLOCATION_BUDGET_HEADROOM_PERCENT) + 99) // 100
+
+
 @dataclass(frozen=True)
 class WorkloadBudgetPolicy:
     artifact_id: str
@@ -1249,7 +1271,7 @@ def build_signed_allocation_plan(
             "class": workload_class,
             "batch_index": request.batch_index,
             "units": list(units),
-            "budget": measured.hard_task_bytes,
+            "budget": allocation_budget_bytes(measured.hard_task_bytes),
         }
         allocations.append(
             WorkloadAllocation(
@@ -1260,7 +1282,7 @@ def build_signed_allocation_plan(
                 workload_class=workload_class,
                 batch_index=request.batch_index,
                 units=units,
-                budget_bytes=measured.hard_task_bytes,
+                budget_bytes=allocation_budget_bytes(measured.hard_task_bytes),
             )
         )
     return _signed_plan(
@@ -1335,7 +1357,7 @@ def build_signed_dagrun_plan(
                 workload_class,
                 batch_index,
                 units,
-                measured.hard_task_bytes,
+                allocation_budget_bytes(measured.hard_task_bytes),
             )
         )
     for batch_index, units in enumerate(
@@ -1358,7 +1380,7 @@ def build_signed_dagrun_plan(
                 workload_class,
                 batch_index,
                 units,
-                measured.hard_task_bytes,
+                allocation_budget_bytes(measured.hard_task_bytes),
             )
         )
 
@@ -1385,7 +1407,7 @@ def build_signed_dagrun_plan(
                 workload.workload_class,
                 season_index,
                 (workload.unit,),
-                measured.hard_task_bytes,
+                allocation_budget_bytes(measured.hard_task_bytes),
             )
         )
         season_index += 1

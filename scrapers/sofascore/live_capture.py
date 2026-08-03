@@ -35,6 +35,12 @@ from scrapers.sofascore.workload_plan import SignedDagRunPlan, WorkloadAllocatio
 
 _ALLOWED_SOURCE_HOSTS = frozenset({"api.sofascore.com", "www.sofascore.com"})
 
+# Smallest lease worth entering a paid capture with: a single warmed HTTPS
+# fetch costs at least a few KiB of provider traffic (TLS + headers + body),
+# so a lease clamped below this can only die mid-request (#1044: attempts
+# were granted 29-byte leases from an exhausted allocation's remainder).
+_VIABLE_LEASE_FLOOR_BYTES = 4096
+
 
 def _zero_traffic() -> dict[str, Any]:
     return {
@@ -339,6 +345,23 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             if int(self._last_stats.total_bytes) != 0:
                 raise BudgetAccountingError(
                     "new SofaScore lease already has provider traffic"
+                )
+            # The gateway clamps the lease to the allocation's REMAINDER, so a
+            # near-exhausted allocation yields a technically valid lease of a
+            # few bytes. The first paid fetch then dies mid-CONNECT and
+            # surfaces as "residential exit unreachable (InvalidProxy)" —
+            # the misdiagnosis that hid #1044 for two shifts. This transport
+            # only exists to perform paid fetches, so a lease below the
+            # smallest viable fetch is budget exhaustion; name it as such.
+            granted = int(getattr(self._lease, "max_bytes", 0) or 0)
+            requested = int(self.hard_run_bytes)
+            if granted < min(requested, _VIABLE_LEASE_FLOOR_BYTES):
+                raise ProxyBudgetExceeded(
+                    "SofaScore allocation budget is exhausted: gateway "
+                    f"clamped the lease to {granted} of the requested "
+                    f"{requested} bytes — below the smallest viable paid "
+                    "fetch. Prior attempts consumed the allocation (#1044); "
+                    "this is not a residential exit failure."
                 )
         except BaseException:
             if self._lease is not None:

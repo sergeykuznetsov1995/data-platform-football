@@ -38,7 +38,14 @@ from scrapers.sofascore.pipeline import (
     replay_event_specs,
     replay_player_specs,
 )
+from scrapers.sofascore.live_capture import _AllocationBudgetView
 from scrapers.sofascore.raw_store import RawPayloadStore
+from scrapers.sofascore.workload_plan import (
+    WorkloadAllocation,
+    _signed_plan,
+    allocation_budget_bytes,
+)
+from scripts.proxy_filter.budget import BudgetPolicy
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[2] / "fixtures"
@@ -179,11 +186,23 @@ def test_runtime_reads_verified_budget_configuration_without_blocking_replay(
     assert "explicit workload_class" in runtime.budget_error
 
 
+def _class_policy(hard_task_bytes=456_951):
+    return BudgetPolicy(
+        artifact_id="c" * 64,
+        hard_run_bytes=hard_task_bytes,
+        endpoint_reservation_bytes={"event": hard_task_bytes},
+        sample_count=20,
+        distinct_proxy_exits=20,
+        workload_class="match_batch_25",
+        parent_artifact_id="a" * 64,
+    )
+
+
 def test_runtime_wires_a_reviewed_policy_and_shared_ledger(
     tmp_path,
     monkeypatch,
 ):
-    policy = object()
+    policy = _class_policy()
     ledger = object()
     monkeypatch.setenv("SOFASCORE_PROXY_BUDGET_ARTIFACT", "/canary.json")
     monkeypatch.setenv(
@@ -198,7 +217,9 @@ def test_runtime_wires_a_reviewed_policy_and_shared_ledger(
             "scrapers.sofascore.pipeline.load_verified_policy",
             return_value=policy,
         ) as load_policy,
-        patch("scrapers.sofascore.pipeline.SharedBudgetLedger", return_value=ledger),
+        patch(
+            "scrapers.sofascore.pipeline.SharedBudgetLedger", return_value=ledger
+        ) as ledger_class,
     ):
         runtime = build_capture_runtime(
             run_id="paid-run",
@@ -213,6 +234,68 @@ def test_runtime_wires_a_reviewed_policy_and_shared_ledger(
     load_policy.assert_called_once_with(
         "/canary.json", workload_class="match_batch_25"
     )
+    # Локальные enforcement-капы несут тот же headroom, что и подписанная
+    # аллокация (#1044); улики артефакта при этом не мутируются.
+    wired = ledger_class.call_args.args[1]
+    assert wired.hard_run_bytes == allocation_budget_bytes(456_951)
+    assert wired.endpoint_reservation_bytes == {
+        "event": allocation_budget_bytes(456_951)
+    }
+    assert policy.hard_run_bytes == 456_951
+
+
+def test_local_ledger_cap_equals_the_signed_allocation_budget(
+    tmp_path,
+    monkeypatch,
+):
+    # #1044: план и локальный леджер должны сойтись байт в байт. Если headroom
+    # применён только к плану, _AllocationBudgetView роняет КАЖДЫЙ платный
+    # захват как "local budget policy differs from signed allocation
+    # provenance", а без него локальный кап срезает headroom обратно.
+    policy = _class_policy()
+    monkeypatch.setenv("SOFASCORE_PROXY_BUDGET_ARTIFACT", "/canary.json")
+    monkeypatch.setenv(
+        "SOFASCORE_PROXY_BUDGET_LEDGER", str(tmp_path / "budget.json")
+    )
+    monkeypatch.setenv(
+        "SOFASCORE_MANIFEST_PATH", str(tmp_path / "manifest.json")
+    )
+
+    with patch(
+        "scrapers.sofascore.pipeline.load_verified_policy", return_value=policy
+    ):
+        runtime = build_capture_runtime(
+            run_id="paid-run",
+            task_id="match-capture",
+            raw_store_uri=f"file://{tmp_path / 'raw'}",
+            manifest_backend="json",
+            workload_class="match_batch_25",
+        )
+
+    allocation = WorkloadAllocation(
+        allocation_id="alloc-" + "1" * 32,
+        task_id="match-capture",
+        scope="match",
+        workload_class="match_batch_25",
+        batch_index=0,
+        units=("1",),
+        budget_bytes=allocation_budget_bytes(policy.hard_run_bytes),
+    )
+    plan = _signed_plan(
+        artifact_id=policy.parent_artifact_id,
+        dag_id="dag_ingest_sofascore",
+        run_id="paid-run",
+        player_universe_ids=(),
+        allocations=(allocation,),
+        control_token=b"x" * 32,
+    )
+
+    view = _AllocationBudgetView(
+        runtime.engine.budget, plan=plan, allocation=allocation
+    )
+
+    assert view.policy.hard_run_bytes == allocation.budget_bytes
+    assert runtime.engine.budget.policy.hard_run_bytes == allocation.budget_bytes
 
 
 class MetadataScraper:
@@ -248,7 +331,9 @@ def test_fixture_endpoint_specs_validate_and_parse_every_branch(endpoint, datase
     )
     assert spec.schema_validator(payload) is True
     assert spec.empty_predicate(payload) is False
-    assert spec.not_supported_http_statuses == ()
+    # final-спек: 404 завершённого матча терминален (#1039); до финала — ()
+    assert spec.not_supported_http_statuses == (404,)
+    assert _spec(endpoint, freshness_key="day-2026-07-01").not_supported_http_statuses == ()
     assert set(spec.parsers) == datasets
     parsed = {name: parser(payload) for name, parser in spec.parsers.items()}
     assert all(isinstance(rows, list) and rows for rows in parsed.values())
@@ -435,8 +520,21 @@ def test_player_specs_fail_closed_on_wrong_identity_and_schema_drift():
 @pytest.mark.parametrize(
     ("spec", "expected_status", "resume_expected"),
     [
-        (_spec("event"), ManifestStatus.RETRYABLE_FAILURE, True),
-        (_spec("lineups"), ManifestStatus.RETRYABLE_FAILURE, True),
+        # До финального свистка 404 = «ещё не опубликовано» — ретраится.
+        (
+            _spec("event", freshness_key="day-2026-07-01"),
+            ManifestStatus.RETRYABLE_FAILURE,
+            True,
+        ),
+        (
+            _spec("lineups", freshness_key="day-2026-07-01"),
+            ManifestStatus.RETRYABLE_FAILURE,
+            True,
+        ),
+        # Для завершённого матча (final) 404 — источник никогда не публиковал
+        # этот эндпоинт (#1039): терминальный NOT_SUPPORTED, resume скипает.
+        (_spec("event"), ManifestStatus.NOT_SUPPORTED, False),
+        (_spec("lineups"), ManifestStatus.NOT_SUPPORTED, False),
         (_player_spec("player_profile"), ManifestStatus.RETRYABLE_FAILURE, True),
         (
             _player_spec("player_season_statistics"),
