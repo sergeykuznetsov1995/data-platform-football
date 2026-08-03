@@ -1255,3 +1255,54 @@ def test_a_page_paid_for_by_one_cycle_is_not_paid_for_again():
     stats = second.get_traffic_stats()
     assert stats["cache_hits"] == 1
     assert stats["provider_metered_bytes"] == 0
+
+
+@pytest.mark.unit
+def test_pseudo_status_zero_retries_on_a_fresh_exit_instead_of_failing_closed():
+    """#1092: tls-client may surface a transport failure as a pseudo-response
+    with status 0.  That response must never reach the raw store (it only
+    accepts real HTTP statuses and would fail the whole cycle closed) — the
+    attempt retries on a fresh exit like any other connection failure."""
+    provider = _FakeLeaseProvider([])
+    factory = _TlsFactory([
+        _Response(b"", status=0),
+        _Response(b"recovered"),
+    ])
+    client = TransfermarktHttpClient(
+        lease_provider=provider,
+        traffic_ledger=SharedTrafficLedger(),
+        lease_metadata=_metadata(),
+        client_factory=factory,
+        sleep_fn=lambda _s: None,
+    )
+
+    outcome = client.fetch(
+        "https://www.transfermarkt.us/a", as_json=False, label="squads",
+    )
+
+    assert outcome.status is FetchStatus.OK
+    stats = client.get_traffic_stats()
+    assert stats["failed_attempts"] == 1
+    assert stats["successful_attempts"] == 1
+    assert stats["status_counts"] == {"0": 1, "200": 1}
+
+
+@pytest.mark.unit
+def test_pseudo_status_zero_exhausts_retries_without_a_raw_store_error():
+    provider = _FakeLeaseProvider([])
+    factory = _TlsFactory([_Response(b"", status=0)] * 8)
+    client = TransfermarktHttpClient(
+        lease_provider=provider,
+        traffic_ledger=SharedTrafficLedger(),
+        lease_metadata=_metadata(),
+        client_factory=factory,
+        sleep_fn=lambda _s: None,
+    )
+
+    outcome = client.fetch(
+        "https://www.transfermarkt.us/a", as_json=False, label="squads",
+    )
+
+    assert outcome.status is FetchStatus.RETRY_EXHAUSTED
+    assert outcome.status_code == 0
+    assert "transport" in (outcome.error or "")
