@@ -351,8 +351,13 @@ class ScopeManifest:
             raise ScopeManifestError('scope capture team type is unsupported')
         if capture['gender'] != 'men' or capture['age_category'] != 'senior':
             raise ScopeManifestError('scope capture is not senior men')
-        if capture['listing_status'] != 'ok':
+        listing_status = str(capture['listing_status'])
+        if listing_status not in {'ok', 'authoritative_empty'}:
             raise ScopeManifestError('scope participant listing is not authoritative')
+        # #1025: authoritative_empty = source renders the competition page
+        # with no participant listing at all; the scope completes with zero
+        # participants and every entity authoritative_empty.
+        listing_empty = listing_status == 'authoritative_empty'
         for field in ('listing_source_url', 'listing_source_body_hash'):
             if not isinstance(capture[field], str) or not capture[field].strip():
                 raise ScopeManifestError(f'scope capture {field} is empty')
@@ -369,7 +374,9 @@ class ScopeManifest:
             if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
                 raise ScopeManifestError(f'scope capture {field} must be an array')
             result = tuple(str(item).strip() for item in raw)
-            if not result or any(not item for item in result):
+            if any(not item for item in result) or (
+                not result and not listing_empty
+            ):
                 raise ScopeManifestError(f'scope capture {field} is empty')
             if len(set(result)) != len(result):
                 raise ScopeManifestError(f'scope capture {field} has duplicates')
@@ -384,6 +391,12 @@ class ScopeManifest:
             str(team).strip(): str(status).strip()
             for team, status in endpoints.items()
         }
+        if listing_empty and (
+            expected_teams or observed_teams or endpoint_statuses
+        ):
+            raise ScopeManifestError(
+                'authoritative-empty listing cannot carry participants'
+            )
         if (
             any(not team or not status for team, status in endpoint_statuses.items())
             or set(endpoint_statuses) != set(expected_teams)
@@ -394,7 +407,10 @@ class ScopeManifest:
         }
         if set(observed_teams) != successful_teams:
             raise ScopeManifestError('observed participants differ from successful endpoints')
-        coverage = len(set(observed_teams) & set(expected_teams)) / len(expected_teams)
+        coverage = (
+            len(set(observed_teams) & set(expected_teams)) / len(expected_teams)
+            if expected_teams else 1.0
+        )
         strict = competition_type in strict_types
         if strict and set(observed_teams) != set(expected_teams):
             raise ScopeManifestError('strict participant contract is incomplete')
@@ -418,6 +434,7 @@ class ScopeManifest:
             entities=expected_entities,
             competition_type=competition_type,
             team_type=team_type,
+            listing_authoritative_empty=listing_empty,
         )
         contracts = value['entity_contracts']
         if not isinstance(contracts, Mapping) or dict(contracts) != expected_contracts:

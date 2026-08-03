@@ -63,6 +63,7 @@ def contract_applicability(
 
 def entity_applicability_contract(
     *, entity: str, competition_type: str, team_type: str,
+    listing_authoritative_empty: bool = False,
 ) -> dict[str, Any]:
     """Return the exact per-competition terminal-state contract for an entity."""
 
@@ -81,6 +82,18 @@ def entity_applicability_contract(
             'allowed_statuses': ['not_applicable'],
             'minimum_rows': 0,
             'requires_authoritative_empty_evidence': False,
+        }
+    if listing_authoritative_empty:
+        # #1025: the source renders no participant listing for this scope at
+        # all, so zero rows is the only truthful terminal state — an 'ok'
+        # entity would contradict the empty participant manifest.
+        return {
+            'competition_type': competition_type,
+            'team_type': team_type,
+            'applicability': 'applicable',
+            'allowed_statuses': ['authoritative_empty'],
+            'minimum_rows': 0,
+            'requires_authoritative_empty_evidence': True,
         }
     if entity in REQUIRED_NONEMPTY_ENTITIES:
         return {
@@ -103,12 +116,14 @@ def entity_applicability_contract(
 
 def entity_applicability_contracts(
     *, entities: Iterable[str], competition_type: str, team_type: str,
+    listing_authoritative_empty: bool = False,
 ) -> dict[str, dict[str, Any]]:
     return {
         entity: entity_applicability_contract(
             entity=entity,
             competition_type=competition_type,
             team_type=team_type,
+            listing_authoritative_empty=listing_authoritative_empty,
         )
         for entity in sorted(set(entities))
     }
@@ -127,6 +142,60 @@ def validate_scope_capture(
         )
     if value.team_type not in {'club', 'national_team'}:
         raise ScopeDQError(f'unsupported team type {value.team_type!r}')
+    if value.listing_status == 'authoritative_empty':
+        # #1025: the competition page rendered with no participant listing at
+        # all (defunct cup / unseeded qualifier). Zero participants is the
+        # authoritative result; no participant evidence may sneak in beside
+        # it, and every applicable entity must be authoritative_empty.
+        if (
+            value.expected_team_ids
+            or value.observed_team_ids
+            or value.endpoint_status_by_team
+        ):
+            raise ScopeDQError(
+                'authoritative-empty listing cannot carry participant evidence'
+            )
+        required_entities = set(expected_entities)
+        if set(value.entity_statuses) != required_entities:
+            raise ScopeDQError(
+                'entity manifest mismatch: '
+                f'expected={sorted(required_entities)} '
+                f'got={sorted(value.entity_statuses)}'
+            )
+        empty_contracts = entity_applicability_contracts(
+            entities=required_entities,
+            competition_type=value.competition_type,
+            team_type=value.team_type,
+            listing_authoritative_empty=True,
+        )
+        for entity, contract in empty_contracts.items():
+            status = value.entity_statuses[entity]
+            if status == 'ok' or status not in contract['allowed_statuses']:
+                raise ScopeDQError(
+                    f'{entity}: status {status!r} contradicts the '
+                    'authoritative-empty participant listing'
+                )
+        now = value.now or datetime.now(timezone.utc)
+        fetched = value.fetched_at
+        if fetched.tzinfo is None:
+            fetched = fetched.replace(tzinfo=timezone.utc)
+        if value.current and now - fetched > max_current_age:
+            raise ScopeDQError('current scope is stale')
+        empty_strict = value.competition_type in STRICT_TYPES
+        return {
+            'passed': True,
+            'competition_type': value.competition_type,
+            'strict': empty_strict,
+            'participant_count': 0,
+            'observed_participant_count': 0,
+            'participant_coverage': 1.0,
+            'endpoint_coverage': 1.0,
+            'minimum_participant_coverage': (
+                1.0 if empty_strict
+                else DOMESTIC_LEAGUE_MIN_PARTICIPANT_COVERAGE
+            ),
+            'fresh': True,
+        }
     if value.listing_status != 'ok':
         raise ScopeDQError(
             f'participant listing is not authoritative: {value.listing_status!r}'

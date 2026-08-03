@@ -633,6 +633,26 @@ def _classify_fallback(scraper) -> str:
     return f'http_{status}'
 
 
+def _hard_fetch_statuses(scraper) -> set:
+    """Terminal failure statuses observed by this run's fetch layer.
+
+    #1025: the listing-empty completion may only commit when the run saw no
+    hard failure — a transient outage must stay a loud, retryable fallback
+    instead of being recorded as authoritative emptiness.
+    """
+
+    statuses: set = set()
+    try:
+        outcomes = scraper.get_fetch_outcomes()
+        for endpoint in (outcomes or {}).values():
+            for item in (endpoint or {}).values():
+                if isinstance(item, Mapping):
+                    statuses.add(item.get('status'))
+    except Exception:  # noqa: BLE001 - treat unknown evidence as hard
+        return {'unknown'}
+    return statuses & {'schema_error', 'blocked', 'retry_exhausted'}
+
+
 def _fallback_exit_code(reason: str) -> int:
     hard = (
         reason.startswith('http_')
@@ -3006,7 +3026,16 @@ def _persist_dual_write_manifest(
             native_frame = native_frame[
                 native_frame['coach_id'].astype(str).isin(legacy_ids)
             ]
-        elif native.key == 'stints' and native_frame is not None:
+        elif (
+            native.key == 'stints'
+            and native_frame is not None
+            and not native_frame.empty
+        ):
+            # A zero-row frame has nothing to slice, and ``apply(axis=1)`` on
+            # one returns an empty float64 Series that pandas then reads as a
+            # COLUMN selector — the typed empty bundle of an authoritative-empty
+            # listing (#1025) came out of the filter with no columns at all and
+            # failed the compatibility contract below.
             legacy_keys = set()
             if legacy_frame is not None and not legacy_frame.empty:
                 legacy_keys = {
@@ -3394,6 +3423,12 @@ def _run_entity(
             results['provider_byte_grant'] = effective_bytes
             results['cycle_budget'] = dict(cycle_budget)
         response_cache, cache_path, cache_ttl = _load_response_cache()
+        # #1025: set by run_transfermarkt_scope_cycle for the entities that
+        # follow players once the participant listing proved authoritatively
+        # empty — there is no roster to resolve and nothing paid to fetch.
+        listing_empty_env = os.environ.get(
+            'TM_LISTING_AUTHORITATIVE_EMPTY', '',
+        ).strip().lower() == 'true'
         with TransfermarktScraper(
             leagues=[league], seasons=[season], proxy_file=proxy_file,
             retry_budget=retry_budget,
@@ -3403,13 +3438,27 @@ def _run_entity(
         ) as scraper:
             if spec.state_endpoint:
                 checkpoint_spec = spec
-                (
-                    selected, cache_hits, seeded, career_hydrate_ids, coverage,
-                ) = _select_player_ids(
-                    scraper, spec, league, season, int(limit), window_offset,
-                    refresh_mode, run_key, allow_state_writes=not dry_run,
-                    legacy_materialization_required=legacy_write_enabled,
-                )
+                if listing_empty_env:
+                    # #1025: an authoritatively empty listing has no roster;
+                    # skip resolution so _EmptyRosterError cannot fire and the
+                    # empty frames reach the listing-empty completion below.
+                    selected, cache_hits, seeded = [], 0, 0
+                    career_hydrate_ids = []
+                    # Still state the coverage: an empty mapping reads as
+                    # 'this scope never said how much of the roster it holds'
+                    # and the manifest validator rejects it. A roster of zero
+                    # is covered completely, with nothing left pending.
+                    coverage = {'roster_size': 0, 'selected': 0, 'pending': 0}
+                else:
+                    (
+                        selected, cache_hits, seeded, career_hydrate_ids,
+                        coverage,
+                    ) = _select_player_ids(
+                        scraper, spec, league, season, int(limit),
+                        window_offset, refresh_mode, run_key,
+                        allow_state_writes=not dry_run,
+                        legacy_materialization_required=legacy_write_enabled,
+                    )
                 results['cache_hits'] = cache_hits
                 results['bootstrap_seeded_keys'] = seeded
                 results['roster_coverage'] = coverage
@@ -3434,6 +3483,11 @@ def _run_entity(
                     )
             elif (
                 spec.name == ENTITY_COACHES
+                # #1025: with an authoritatively empty listing there are no
+                # coach memberships to load (the loader refuses an empty club
+                # scope); the legacy path below re-verifies the empty shell
+                # against the live page instead.
+                and not listing_empty_env
                 and native_write_enabled
                 and _native_available(scraper, spec.native_reader)
             ):
@@ -3465,6 +3519,15 @@ def _run_entity(
                     scraper, coach_cached_ids,
                 )
 
+            if spec.name == ENTITY_COACHES and listing_empty_env:
+                # #1025: keep _read_frames from re-loading memberships (the
+                # loader refuses an empty club scope). An empty frame routes
+                # read_coach_data to the legacy listing path, which
+                # re-verifies the empty shell against the live page.
+                import pandas as pd
+
+                coach_memberships = pd.DataFrame()
+
             if checkpoint_spec is not None:
                 coach_cache_has_rows = bool(
                     coach_cache_frames is not None
@@ -3479,6 +3542,7 @@ def _run_entity(
                 )
                 if (
                     selected == []
+                    and not listing_empty_env
                     and not coach_cache_has_rows
                     and not career_cache_has_rows
                 ):
@@ -3707,6 +3771,75 @@ def _run_entity(
                             )
                     else:
                         results['dry_run'] = True
+                    exit_code = 0
+                    raise _EntityRunComplete(exit_code)
+                listing_empty = (
+                    (results.get('scope_capture') or {}).get('listing_status')
+                    == 'authoritative_empty'
+                    # The env flag alone is not proof: a transient fetch
+                    # failure inside a flagged cycle must stay a loud,
+                    # retryable fallback, not become recorded emptiness.
+                    or (listing_empty_env and not _hard_fetch_statuses(scraper))
+                )
+                if listing_empty:
+                    # #1025: the source renders no participant listing for
+                    # this competition/edition (defunct cup / unseeded
+                    # qualifier). Commit the empty frames as the
+                    # authoritative result so the scope cycle completes
+                    # instead of replanning the scope every day. The env
+                    # flag is set by run_transfermarkt_scope_cycle for the
+                    # entities that follow players inside the same cycle.
+                    results['valid_empty'] = True
+                    results['authoritative_empty'] = True
+                    results['rows'] = 0
+                    results[spec.count_field] = 0
+                    results['outputs'] = {
+                        key: _frame_output_summary(frame)
+                        for key, frame in frames.items()
+                        if frame is not None and hasattr(frame, '__len__')
+                    }
+                    for item in results['outputs'].values():
+                        if item['rows'] == 0 and not item['applicability_status']:
+                            item['applicability_status'] = 'authoritative_empty'
+                    if dry_run:
+                        results['dry_run'] = True
+                        exit_code = 0
+                        raise _EntityRunComplete(exit_code)
+                    failure_phase = 'platform'
+                    _save_frames(
+                        scraper, write_spec, frames, force_replace, results,
+                    )
+                    data_committed = True
+                    results['native_write_complete'] = bool(
+                        used_native and native_write_enabled
+                    )
+                    if mode == 'dual' and used_native:
+                        results['batch_manifest'] = _persist_dual_write_manifest(
+                            scraper, spec, frames, results, run_key,
+                            league, season,
+                        )
+                        results['dual_write_complete'] = (
+                            results['batch_manifest'].get('status') == 'success'
+                        )
+                        if not results['dual_write_complete']:
+                            raise RuntimeError(
+                                'authoritative-empty dual-write parity failed'
+                            )
+                    elif mode == 'native-only' and used_native:
+                        results['native_write_manifest'] = (
+                            _persist_native_write_manifest(
+                                scraper, spec, frames, results, run_key,
+                                league, season, int(expected_reader_revision),
+                            )
+                        )
+                        results['native_write_manifest_complete'] = (
+                            results['native_write_manifest'].get('status')
+                            == 'success'
+                        )
+                        if not results['native_write_manifest_complete']:
+                            raise RuntimeError(
+                                'authoritative-empty native manifest failed'
+                            )
                     exit_code = 0
                     raise _EntityRunComplete(exit_code)
                 reason = _classify_fallback(scraper)

@@ -124,8 +124,16 @@ full-budget scope finishes in ~2 h 52 m; this 5 h 15 m ceiling only has to be
 worst-case compatible.
 """
 
-MAX_SCOPE_BATCH = 8
-"""Most scope cycles one parent (daily) cycle may map."""
+MAX_SCOPE_BATCH = 24
+"""Most scope cycles one parent (daily) cycle may map.
+
+Raised from 8 for the current-first sprint: with the schedule locked at one
+cycle/day, throughput is batch x 1 run, so the batch carries the day's work.
+Sized to fit the 336 MiB parent cap (the 320 MiB soft-stop halts the run
+gracefully first) and run 3-wide (max_active_tis_per_dag=3) so a full batch
+finishes inside the day.  Going past the parent cap needs the proxy-filter's
+per-DagRun budget raised in the deployment .env too.
+"""
 
 PARENT_REQUEST_LIMIT = MAX_SCOPE_BATCH * SCOPE_REQUEST_LIMIT
 """Parent-cycle attempt ceiling, derived — never hand-edited."""

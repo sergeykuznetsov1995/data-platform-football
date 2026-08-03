@@ -5,10 +5,13 @@ live path is exercised by ``scripts/research/bench_transfermarkt_fetch.py``.
 """
 
 from datetime import date
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
+
+import scrapers.transfermarkt.scraper as tm_scraper
 
 from scrapers.transfermarkt import (
     TransfermarktScraper,
@@ -677,6 +680,53 @@ class TestPartialScrapeRatio:
         )
         df = scraper.read_players(league='ENG-Premier League', season=2025)
         assert df['player_id'].nunique() == 9
+
+    _EMPTY_ROSTER_HTML = (
+        '<html><h1 class="data-header__headline-wrapper">FC Lienden</h1>'
+        '<div>No data available</div></html>'
+    )
+
+    def test_empty_roster_clubs_count_as_success(self, scraper, monkeypatch):
+        # Dissolved amateur clubs (FC Lienden 2011/12): a valid club page with
+        # no squad table is data truth, not a failed fetch — 2 of 10 empty
+        # must not trip the 0.9 ratio (#936 daily-red on TM-511).
+        import scrapers.transfermarkt.scraper as tm
+        self._patch_players_pipeline(
+            monkeypatch, scraper,
+            [self._EMPTY_ROSTER_HTML] * 2 + ['<html/>'] * 8,
+        )
+        monkeypatch.setattr(
+            tm, '_parse_squad_page',
+            lambda html, club_id: []
+            if html == self._EMPTY_ROSTER_HTML
+            else [{'player_id': f'p{club_id}',
+                   'player_slug': f'player-{club_id}',
+                   'name': f'P{club_id}', 'club_id': club_id,
+                   'market_value_eur': None}],
+        )
+        df = scraper.read_players(league='ENG-Premier League', season=2025)
+        assert df['player_id'].nunique() == 8
+        capture = scraper.get_scope_capture() or {}
+        # the closed manifest field set must stay intact; empty clubs are 'ok'
+        assert 'empty_squad_club_ids' not in capture
+        statuses = capture.get('endpoint_status_by_team') or {}
+        assert statuses.get('0') == 'ok' and statuses.get('1') == 'ok'
+        # the fetch validator must accept the same page instead of burning
+        # six attempts on 'missing table.items'
+        validator = scraper._endpoint_validator('squad', False)
+        assert validator(self._EMPTY_ROSTER_HTML) is None
+
+    def test_empty_roster_detector_requires_club_header(self):
+        from scrapers.transfermarkt.scraper import _squad_page_is_empty_roster
+
+        assert _squad_page_is_empty_roster(self._EMPTY_ROSTER_HTML)
+        # a page that still carries player links stays a schema error
+        assert not _squad_page_is_empty_roster(
+            '<html><h1 class="data-header__headline-wrapper">X</h1>'
+            '<a href="/a/profil/spieler/1">A</a></html>'
+        )
+        # an interstitial/error page without the club header is not "empty"
+        assert not _squad_page_is_empty_roster('<html>blocked</html>')
 
     def test_read_mv_history_raises_on_low_success_ratio(
         self, scraper, monkeypatch,
@@ -1815,3 +1865,142 @@ class TestWithMetadataDatetimeUnit:
         )
 
         assert str(frame['_ingested_at'].dtype) == 'datetime64[ns]'
+
+
+class TestEmptyShellListing:
+    """#1025: competition pages that render no participant listing at all."""
+
+    FIXTURES = (
+        Path(__file__).parents[2] / 'fixtures' / 'transfermarkt' / 'listing'
+    )
+
+    @staticmethod
+    def _shell(competition_id: str = 'GB1') -> str:
+        return (
+            '<html><head>'
+            f'<link hreflang="de" rel="alternate" '
+            f'href="https://www.transfermarkt.de/x/startseite/'
+            f'pokalwettbewerb/{competition_id}/saison_id/2014/plus/" />'
+            '</head><body><div id="main">chrome only</div></body></html>'
+        )
+
+    def test_real_afc_cup_fixture_is_empty_shell(self):
+        html = (
+            self.FIXTURES / 'ac14_afc_challenge_cup_2014_plus_saison.html'
+        ).read_text(encoding='utf-8')
+        assert tm_scraper._listing_page_is_empty_shell(html, 'AC14') is True
+        # The same shell is NOT authoritative for another competition.
+        assert tm_scraper._listing_page_is_empty_shell(html, 'GB1') is False
+
+    def test_pages_with_tables_or_club_links_are_not_empty_shell(self):
+        with_table = (
+            '<html><head><link rel="alternate" href="/x/startseite/'
+            'wettbewerb/GB1/" /></head>'
+            '<body><table class="auflistung"><tr><td>x</td></tr></table>'
+            '</body></html>'
+        )
+        assert tm_scraper._listing_page_is_empty_shell(with_table, 'GB1') is False
+        with_club_link = self._shell('GB1').replace(
+            '<div id="main">chrome only</div>',
+            '<a href="/fc/startseite/verein/11">FC</a>',
+        )
+        assert (
+            tm_scraper._listing_page_is_empty_shell(with_club_link, 'GB1')
+            is False
+        )
+        no_alternates = '<html><body><div id="main">bare</div></body></html>'
+        assert (
+            tm_scraper._listing_page_is_empty_shell(no_alternates, 'GB1')
+            is False
+        )
+
+    def test_validator_passes_empty_shell_but_keeps_drift_error(self):
+        validator = TransfermarktScraper._endpoint_validator('listing', False)
+        assert validator(self._shell()) is None
+        assert validator('<html/>') == 'missing table.items'
+        with_stray_table = (
+            '<html><head><link rel="alternate" href="/x" /></head>'
+            '<body><table class="other"></table></body></html>'
+        )
+        assert validator(with_stray_table) == 'missing table.items'
+
+    def test_empty_shell_listing_is_authoritative_empty(self, monkeypatch):
+        scraper = TransfermarktScraper()
+        monkeypatch.setattr(
+            scraper, '_fetch_html',
+            lambda *args, **kwargs: self._shell('GB1'),
+        )
+
+        bundle = scraper.read_squad_data('ENG-Premier League', 2025)
+
+        capture = scraper.get_scope_capture()
+        assert capture['listing_status'] == 'authoritative_empty'
+        assert capture['expected_team_ids'] == []
+        assert capture['endpoint_status_by_team'] == {}
+        assert capture['listing_source_body_hash'] is not None
+        record = scraper.get_fetch_outcomes()['listing'][
+            'ENG-Premier League:2025'
+        ]
+        assert record['status'] == 'valid_empty'
+        assert bundle['memberships'].empty
+        assert (
+            bundle['memberships'].attrs['fetch_status']
+            == 'authoritative_empty'
+        )
+        assert (
+            bundle['contract_observations'].attrs['fetch_status']
+            == 'authoritative_empty'
+        )
+
+    def test_coach_listing_empty_shell_is_authoritative_empty(
+        self, monkeypatch,
+    ):
+        scraper = TransfermarktScraper()
+        monkeypatch.setattr(
+            scraper, '_fetch_html',
+            lambda *args, **kwargs: self._shell('GB1'),
+        )
+
+        bundle = scraper.read_coach_data('ENG-Premier League', 2025)
+
+        assert bundle['profiles'].empty
+        assert bundle['profiles'].attrs['fetch_status'] == 'authoritative_empty'
+        record = scraper.get_fetch_outcomes()['listing'][
+            'ENG-Premier League:2025'
+        ]
+        assert record['status'] == 'valid_empty'
+
+    def test_populated_scope_cannot_become_authoritative_empty(
+        self, monkeypatch,
+    ):
+        scraper = TransfermarktScraper()
+        monkeypatch.setattr(
+            scraper, '_fetch_html',
+            lambda *args, **kwargs: self._shell('GB1'),
+        )
+        monkeypatch.setattr(
+            scraper, '_bronze_scope_has_roster',
+            lambda league, season_short: True,
+        )
+
+        bundle = scraper.read_squad_data('ENG-Premier League', 2025)
+
+        assert scraper.get_scope_capture()['listing_status'] == 'schema_error'
+        assert bundle['memberships'].empty
+
+    def test_bronze_roster_guard_defaults_open_on_lookup_failure(
+        self, monkeypatch,
+    ):
+        scraper = TransfermarktScraper()
+        monkeypatch.setattr(
+            scraper, '_resolve_player_ids_from_bronze',
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError('native tables absent'),
+            ),
+        )
+        assert scraper._bronze_scope_has_roster('ENG-Premier League', '2526') is False
+        monkeypatch.setattr(
+            scraper, '_resolve_player_ids_from_bronze',
+            lambda *args, **kwargs: ['7'],
+        )
+        assert scraper._bronze_scope_has_roster('ENG-Premier League', '2526') is True

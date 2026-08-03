@@ -847,8 +847,17 @@ def _runner_environment(
     packets: Mapping[str, Any],
     parser_entity: str,
     retry_budget: int,
+    listing_authoritative_empty: bool = False,
 ) -> Mapping[str, str]:
     env = dict(os.environ)
+    if listing_authoritative_empty:
+        # #1025: the players entity proved the participant listing is
+        # authoritatively empty; the entities that follow in this cycle
+        # must terminate as authoritative_empty instead of hard-failing.
+        env['TM_LISTING_AUTHORITATIVE_EMPTY'] = 'true'
+    else:
+        # Never inherit the flag from the wrapper's own environment.
+        env.pop('TM_LISTING_AUTHORITATIVE_EMPTY', None)
     approval_context = {
         action: {
             'packet_id': packet.packet_id,
@@ -1247,6 +1256,9 @@ def _build_scope_manifest(
         entities=entity_statuses,
         competition_type=str(identity.competition_record['competition_type']),
         team_type=str(identity.competition_record['team_type']),
+        listing_authoritative_empty=(
+            scope_capture.get('listing_status') == 'authoritative_empty'
+        ),
     )
     authoritative_empty_evidence: dict[str, dict[str, str]] = {}
     for run in runs:
@@ -2176,6 +2188,15 @@ def run_scope_cycle(
                 command,
                 env=_runner_environment(
                     identity, args, packets, parser_entity, child_retry_budget,
+                    listing_authoritative_empty=any(
+                        run.parser_entity == 'players'
+                        and isinstance(
+                            run.result.get('scope_capture'), Mapping,
+                        )
+                        and run.result['scope_capture'].get('listing_status')
+                        == 'authoritative_empty'
+                        for run in runs
+                    ),
                 ),
                 shell=False,
                 check=False,
