@@ -7,11 +7,14 @@ before forwarding it to or from the provider.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlsplit
+
+logger = logging.getLogger(__name__)
 
 
 METER_ID = "proxy_filter_provider_path_v2"
@@ -404,6 +407,23 @@ class FBrefProxyLeaseClient:
             )
             stats = self._stats_from_mapping(lease, body, expected=expected)
             if status != 409 and stats.close_complete:
+                return stats
+            close_error = str(body.get("close_error") or "")
+            if status == 409 and close_error.startswith(
+                "provider byte accounting is uncertain"
+            ):
+                # One mid-response abort latches the lease uncertain forever:
+                # the filter retains the unproven byte tail as durable escrow
+                # and by design never reports close_complete for that lease.
+                # Its counters are the final client-visible ledger, so waiting
+                # out the deadline would fail the whole run without protecting
+                # any budget (#1099, mirrors #1096 for Transfermarkt).
+                logger.warning(
+                    "FBref lease %s closed with uncertain provider "
+                    "accounting; filter retains the unproven tail as durable "
+                    "escrow",
+                    lease.lease_id,
+                )
                 return stats
             if self._monotonic() >= deadline:
                 raise FBrefProxyLeaseError(

@@ -355,3 +355,67 @@ def replace_context(**values):
     result = dict(CONTEXT)
     result.update(values)
     return result
+
+
+def test_close_accepts_the_permanent_uncertainty_latch():
+    # One mid-response abort latches accounting_uncertain forever; the filter
+    # retains the unproven tail as durable escrow and by design never reports
+    # close_complete for that lease. Its 409 counters are the final
+    # client-visible ledger (#1099, mirrors #1096 for Transfermarkt).
+    latched = _stats_body(
+        up_bytes=50,
+        down_bytes=75,
+        total_bytes=125,
+        closed=True,
+        close_complete=False,
+        close_error=(
+            "provider byte accounting is uncertain; durable escrow retained"
+        ),
+    )
+    session = _Session(
+        [
+            _Response(201, _lease_body()),
+            _Response(409, latched),
+        ]
+    )
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+        sleep=lambda _seconds: None,
+        monotonic=lambda: 0.0,
+    )
+    lease = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+
+    stats = client.close(lease, expected=CONTEXT)
+
+    assert stats.close_complete is False
+    assert stats.total_bytes == 125
+    assert [call[0] for call in session.calls] == ["POST", "DELETE"]
+
+
+def test_close_still_times_out_on_pending_without_the_latch():
+    pending = _stats_body(
+        active_tunnels=1,
+        closed=True,
+        close_complete=False,
+    )
+    session = _Session(
+        [
+            _Response(201, _lease_body()),
+            _Response(409, dict(pending)),
+            _Response(409, dict(pending)),
+        ]
+    )
+    ticks = iter((0.0, 0.0, 1000.0))
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+        sleep=lambda _seconds: None,
+        monotonic=lambda: next(ticks),
+    )
+    lease = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+
+    with pytest.raises(FBrefProxyLeaseError, match="did not return final"):
+        client.close(lease, expected=CONTEXT)
