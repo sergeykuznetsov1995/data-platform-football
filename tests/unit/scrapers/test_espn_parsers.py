@@ -93,6 +93,19 @@ _COHORT_015_TRUNCATED_LINEUPS = {
     ),
 }
 
+_COHORT_016_TRUNCATED_LINEUPS = {
+    "fe48a61e4e03c52c8a31ead6de1c6ff5e644acd2e732a4d57066254f84ec768b": (
+        "787:2023",
+        684600,
+        ((207, 10), (210, 11)),
+    ),
+    "3b49a2c949523ade122a7017815bda0d5a0b9bc2901e77014e8f523f5127eeeb": (
+        "789:2023",
+        684561,
+        ((6722, 10), (6770, 11)),
+    ),
+}
+
 _COHORT_015_CONTRADICTORY_LINEUPS = {
     "7a7f0b292c9717f61d50648ea673f233429a264da431072c174dc46f5cc0d66c": (
         "750:2026",
@@ -170,24 +183,32 @@ def _schedule(payload: dict | None = None, **scope_kwargs):
     return competition, edition, rows
 
 
-def _cohort_015_summary_case(
+def _reviewed_lineup_summary_case(
     identity: tuple[str, int, tuple[tuple[int, int], ...]],
     *,
     contradictory: bool,
     lineup: CapabilityState,
 ):
-    _, event_id, team_counts = identity
+    scope_id, event_id, team_counts = identity
+    espn_id_text, year_text = scope_id.split(":", 1)
+    espn_id = int(espn_id_text)
+    year = int(year_text)
+    event_date = f"{year}-03-01T18:45Z"
     home_team_id = team_counts[0][0]
     away_team_id = team_counts[1][0]
     team_ids = {"home": home_team_id, "away": away_team_id}
 
     scoreboard = _load("native_scoreboard.json")
     scoreboard["leagues"][0].update(
-        {"id": "750", "slug": "test.750", "calendar": ["2026-03-01T12:00Z"]}
+        {
+            "id": espn_id_text,
+            "slug": f"test.{espn_id}",
+            "calendar": [f"{year}-03-01T12:00Z"],
+        }
     )
     raw_event = scoreboard["events"][0]
-    raw_event.update({"id": str(event_id), "date": "2026-03-01T18:45Z"})
-    raw_event["season"]["year"] = 2026
+    raw_event.update({"id": str(event_id), "date": event_date})
+    raw_event["season"]["year"] = year
     for competitor in raw_event["competitions"][0]["competitors"]:
         side = competitor["homeAway"]
         competitor["team"]["id"] = str(team_ids[side])
@@ -195,17 +216,17 @@ def _cohort_015_summary_case(
 
     competition, edition, schedule = _schedule(
         scoreboard,
-        espn_id=750,
-        slug="test.750",
-        year=2026,
-        start=date(2026, 1, 1),
-        end=date(2026, 12, 31),
+        espn_id=espn_id,
+        slug=f"test.{espn_id}",
+        year=year,
+        start=date(year, 1, 1),
+        end=date(year, 12, 31),
         lineup=lineup,
     )
 
     payload = _load("native_summary.json")
     payload["header"]["id"] = str(event_id)
-    payload["header"]["competitions"][0]["date"] = "2026-03-01T18:45Z"
+    payload["header"]["competitions"][0]["date"] = event_date
     for competitor in payload["header"]["competitions"][0]["competitors"]:
         side = competitor["homeAway"]
         competitor["team"]["id"] = str(team_ids[side])
@@ -1403,6 +1424,7 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
             ((4817, 10), (5501, 11)),
         ),
         **_COHORT_015_TRUNCATED_LINEUPS,
+        **_COHORT_016_TRUNCATED_LINEUPS,
     }
     assert dict(summary_parser_module._REVIEWED_CONTRADICTORY_LINEUPS) == {
         "287b2052375fe3ef2fc4fc24f8c69f0be23d20adac832d86a098fc194275985f": (
@@ -1597,7 +1619,9 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
     [
         *(
             ("truncated", lineup_sha256, identity)
-            for lineup_sha256, identity in _COHORT_015_TRUNCATED_LINEUPS.items()
+            for lineup_sha256, identity in (
+                _COHORT_015_TRUNCATED_LINEUPS | _COHORT_016_TRUNCATED_LINEUPS
+            ).items()
         ),
         *(
             ("contradictory", lineup_sha256, identity)
@@ -1605,7 +1629,7 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
         ),
     ],
 )
-def test_cohort_015_lineup_exceptions_are_exact_and_fail_closed(
+def test_reviewed_lineup_exceptions_are_exact_and_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
     policy_name: str,
     lineup_sha256: str,
@@ -1620,7 +1644,7 @@ def test_cohort_015_lineup_exceptions_are_exact_and_fail_closed(
     assert isinstance(policy, MappingProxyType)
     assert policy[lineup_sha256] == identity
 
-    competition, edition, event, payload = _cohort_015_summary_case(
+    competition, edition, event, payload = _reviewed_lineup_summary_case(
         identity,
         contradictory=policy_name == "contradictory",
         lineup=CapabilityState.UNKNOWN,
@@ -1681,7 +1705,7 @@ def test_cohort_015_lineup_exceptions_are_exact_and_fail_closed(
         MappingProxyType({lineup_sha256: identity}),
     )
     proven_competition, proven_edition, proven_event, proven_payload = (
-        _cohort_015_summary_case(
+        _reviewed_lineup_summary_case(
             identity,
             contradictory=policy_name == "contradictory",
             lineup=CapabilityState.PROVEN,
