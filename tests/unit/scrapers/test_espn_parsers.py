@@ -137,6 +137,14 @@ _COHORT_015_CONTRADICTORY_LINEUPS = {
     ),
 }
 
+_COHORT_018_CONTRADICTORY_LINEUPS = {
+    "99a75b2d24ac58f772113600e39ffcb078788e7549ad11d25282d5c6b33d5cf8": (
+        "8313:2026",
+        401871509,
+        ((2919, 11), (5481, 11)),
+    ),
+}
+
 
 def _load(name: str) -> dict:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
@@ -1577,6 +1585,7 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
             ((5492, 11), (9902, 11)),
         ),
         **_COHORT_015_CONTRADICTORY_LINEUPS,
+        **_COHORT_018_CONTRADICTORY_LINEUPS,
     }
     assert dict(summary_parser_module._REVIEWED_MALFORMED_LINEUPS) == {
         "64f1f810c6a8ccfacb66cafd55c96988fdcef75ca40cf90e987a8171fa290d29": (
@@ -1586,7 +1595,7 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
         )
     }
     assert summary_parser_module._REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES == (
-        frozenset({"3904:2026"})
+        frozenset({"3904:2026", "8313:2026"})
     )
     assert summary_parser_module._REVIEWED_DUPLICATE_LINEUP_SCOPES == frozenset(
         {"3911:2012"}
@@ -1636,7 +1645,9 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
         ),
         *(
             ("contradictory", lineup_sha256, identity)
-            for lineup_sha256, identity in _COHORT_015_CONTRADICTORY_LINEUPS.items()
+            for lineup_sha256, identity in (
+                _COHORT_015_CONTRADICTORY_LINEUPS | _COHORT_018_CONTRADICTORY_LINEUPS
+            ).items()
         ),
     ],
 )
@@ -1680,6 +1691,39 @@ def test_reviewed_lineup_exceptions_are_exact_and_fail_closed(
     assert result.matchsheet_state is EntityParseState.CAPTURED
 
     failure = "11 starters" if policy_name == "truncated" else "contradictory"
+    lineup_source = {"rosters": payload["rosters"]}
+    if "format" in payload:
+        lineup_source["format"] = payload["format"]
+    reviewed_source_bytes = json.dumps(
+        lineup_source,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    monkeypatch.setattr(
+        summary_parser_module,
+        "hashlib",
+        SimpleNamespace(
+            sha256=lambda raw: (
+                SimpleNamespace(hexdigest=lambda: lineup_sha256)
+                if raw == reviewed_source_bytes
+                else hashlib.sha256(raw)
+            )
+        ),
+    )
+    changed_payload = deepcopy(payload)
+    changed_payload["rosters"][0]["roster"][0]["athlete"]["displayName"] = (
+        "Changed Player"
+    )
+    with pytest.raises(EspnParseError, match=failure):
+        parse_summary(
+            _raw(changed_payload),
+            competition=competition,
+            edition=edition,
+            event=event,
+        )
+
     mutated_sha256 = ("0" if lineup_sha256[0] != "0" else "1") + lineup_sha256[1:]
     use_digest(mutated_sha256)
     with pytest.raises(EspnParseError, match=failure):
@@ -1834,6 +1878,104 @@ def test_reviewed_scope_discards_only_partial_conventional_lineups(
             competition=proven_competition,
             edition=proven_edition,
             event=proven_schedule[0],
+        )
+
+
+@pytest.mark.unit
+def test_copa_colombia_scope_discards_only_partial_conventional_lineups() -> None:
+    partial_identity = (
+        "8313:2026",
+        401871509,
+        ((2919, 11), (5481, 6)),
+    )
+    competition, edition, event, payload = _reviewed_lineup_summary_case(
+        partial_identity,
+        contradictory=False,
+        lineup=CapabilityState.UNKNOWN,
+    )
+
+    result = parse_summary(
+        _raw(payload), competition=competition, edition=edition, event=event
+    )
+    assert result.lineup == ()
+    assert result.lineup_state is EntityParseState.VALID_EMPTY
+    assert result.matchsheet
+    assert result.matchsheet_state is EntityParseState.CAPTURED
+
+    complete_identity = (
+        partial_identity[0],
+        partial_identity[1],
+        ((2919, 11), (5481, 11)),
+    )
+    complete_competition, complete_edition, complete_event, complete_payload = (
+        _reviewed_lineup_summary_case(
+            complete_identity,
+            contradictory=False,
+            lineup=CapabilityState.UNKNOWN,
+        )
+    )
+    captured = parse_summary(
+        _raw(complete_payload),
+        competition=complete_competition,
+        edition=complete_edition,
+        event=complete_event,
+    )
+    assert captured.lineup_state is EntityParseState.CAPTURED
+    assert len(captured.lineup) == 26
+
+    contradictory = deepcopy(payload)
+    contradictory["rosters"][0]["roster"][0]["subbedIn"] = True
+    with pytest.raises(EspnParseError, match="contradictory"):
+        parse_summary(
+            _raw(contradictory),
+            competition=competition,
+            edition=edition,
+            event=event,
+        )
+
+    malformed = deepcopy(payload)
+    malformed["rosters"][1]["roster"][0]["athlete"].pop("id")
+    with pytest.raises(EspnParseError, match="athlete.id"):
+        parse_summary(
+            _raw(malformed),
+            competition=competition,
+            edition=edition,
+            event=event,
+        )
+
+    proven_competition, proven_edition, proven_event, proven_payload = (
+        _reviewed_lineup_summary_case(
+            partial_identity,
+            contradictory=False,
+            lineup=CapabilityState.PROVEN,
+        )
+    )
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            _raw(proven_payload),
+            competition=proven_competition,
+            edition=proven_edition,
+            event=proven_event,
+        )
+
+    unrelated_identity = (
+        "8312:2026",
+        partial_identity[1],
+        partial_identity[2],
+    )
+    unrelated_competition, unrelated_edition, unrelated_event, unrelated_payload = (
+        _reviewed_lineup_summary_case(
+            unrelated_identity,
+            contradictory=False,
+            lineup=CapabilityState.UNKNOWN,
+        )
+    )
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            _raw(unrelated_payload),
+            competition=unrelated_competition,
+            edition=unrelated_edition,
+            event=unrelated_event,
         )
 
 

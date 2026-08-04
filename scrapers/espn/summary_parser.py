@@ -554,6 +554,11 @@ _REVIEWED_CONTRADICTORY_LINEUPS: Mapping[
             401859420,
             ((3384, 11), (7111, 11)),
         ),
+        "99a75b2d24ac58f772113600e39ffcb078788e7549ad11d25282d5c6b33d5cf8": (
+            "8313:2026",
+            401871509,
+            ((2919, 11), (5481, 11)),
+        ),
     }
 )
 
@@ -571,11 +576,14 @@ _REVIEWED_MALFORMED_LINEUPS: Mapping[
     }
 )
 
-# Argentina's 2026 third tier exposes no complete XI in its 17 non-empty
-# roster responses: every one is a structurally valid but partial participant
-# snapshot.  Keep a future valid XI, but discard only non-conventional roster
-# shapes for this exact scope when the registry does not promise lineups.
-_REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES: frozenset[str] = frozenset({"3904:2026"})
+# Argentina's 2026 third tier exposes no complete XI in its 17 non-empty roster
+# responses.  Copa Colombia 2026 has 10 non-XI partial conventional roster
+# responses across 54 reviewed Summaries.  Keep a future valid XI, but discard
+# only non-conventional roster shapes for these exact scopes when the registry
+# does not promise lineups.
+_REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES: frozenset[str] = frozenset(
+    {"3904:2026", "8313:2026"}
+)
 
 # Six 2012 CONCACAF U23 responses concatenate two roster snapshots and repeat
 # athletes with conflicting starter/bench flags.  Never choose or merge a
