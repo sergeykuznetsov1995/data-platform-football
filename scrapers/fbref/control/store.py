@@ -868,21 +868,112 @@ class ControlStore:
                 )
         return normalized_run_id
 
-    def start_run(self, run_id: object) -> None:
+    def start_run(
+        self, run_id: object, *, reopen_targets: bool = True
+    ) -> None:
         normalized = _uuid(run_id, "run_id")
         with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT status, run_type, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                FOR UPDATE
+                """,
+                (normalized,),
+            )
+            row = _fetchone(cursor)
+            if row is None:
+                raise StateConflict(f"Run {normalized} cannot be started")
+            status = str(row["status"] or "")
+            if status in {"pending", "running"}:
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.crawl_run
+                    SET status = 'running',
+                        started_at = COALESCE(started_at, clock_timestamp()),
+                        updated_at = clock_timestamp()
+                    WHERE run_id = %s AND status IN ('pending', 'running')
+                    """,
+                    (normalized,),
+                )
+                if cursor.rowcount != 1:
+                    raise StateConflict(f"Run {normalized} cannot be started")
+                return
+            metadata = _json_mapping(row["metadata"], "crawl run metadata")
+            if (
+                status != "failed"
+                or str(row["run_type"] or "") == "publication"
+                or "raw_fetch_attempt_snapshot" in metadata
+            ):
+                raise StateConflict(f"Run {normalized} cannot be started")
+            # A rerun after ``airflow tasks clear`` hits the same
+            # deterministic run_id that abort_run left 'failed' (#1102).
+            # Reanimation flips only status/finished_at: the monotonic ledger
+            # columns (requests_used/bytes_used/budget_exceeded) and metadata
+            # carry the previous attempts' spend that the retry subprocess
+            # subtracts from its budget (#1107).  'succeeded' stays terminal,
+            # publication generations keep their own terminal 'failed', and a
+            # sealed run must not re-open — its raw-audit snapshot is
+            # create-once and fresh fetches would break the seal.
             cursor.execute(
                 """
                 UPDATE fbref_control.crawl_run
                 SET status = 'running',
                     started_at = COALESCE(started_at, clock_timestamp()),
+                    finished_at = NULL,
                     updated_at = clock_timestamp()
-                WHERE run_id = %s AND status IN ('pending', 'running')
+                WHERE run_id = %s AND status = 'failed'
                 """,
                 (normalized,),
             )
             if cursor.rowcount != 1:
                 raise StateConflict(f"Run {normalized} cannot be started")
+            if not reopen_targets:
+                return
+            # Give the reanimated run its interrupted work back.  The abort
+            # marked open targets 'failed' (and a budget stop marked handed-
+            # back ones 'skipped') while returning the pages themselves to the
+            # frontier.  Only pages that are claimable RIGHT NOW come back as
+            # 'retry': the page must be due (no future backoff — a backed-off
+            # page would re-wedge the wave gate as unfinished-but-unclaimable)
+            # and must not be open in any other live run (the cohort admission
+            # guard below is mirrored so one page is never open in two runs).
+            # Dead-lettered pages ('dead') and pages other runs already
+            # handled stay behind — the wave/validation gates exclude them
+            # instead of deadlocking on them.
+            cursor.execute(
+                """
+                UPDATE fbref_control.run_target AS target
+                SET status = 'retry', updated_at = clock_timestamp()
+                FROM fbref_control.page_frontier AS frontier
+                WHERE target.run_id = %s
+                  AND target.status IN ('failed', 'skipped')
+                  AND frontier.target_id = target.target_id
+                  AND frontier.state IN ('queued', 'retry')
+                  AND (
+                    frontier.retry_after IS NULL
+                    OR frontier.retry_after <= clock_timestamp()
+                  )
+                  AND (
+                    frontier.next_fetch_at IS NULL
+                    OR frontier.next_fetch_at <= clock_timestamp()
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM fbref_control.run_target AS outstanding
+                      JOIN fbref_control.crawl_run AS outstanding_run
+                        ON outstanding_run.run_id = outstanding.run_id
+                      WHERE outstanding.target_id = target.target_id
+                        AND outstanding.run_id <> target.run_id
+                        AND outstanding.status IN (
+                            'pending', 'leased', 'retry'
+                        )
+                        AND outstanding_run.status IN ('pending', 'running')
+                  )
+                """,
+                (normalized,),
+            )
 
     @staticmethod
     def _publication_generation_result(
@@ -5458,6 +5549,17 @@ class ControlStore:
                 "response_too_large",
                 "invalid_encoding",
                 "invalid_content_type",
+                # Abort bookkeeping stamps in-flight attempts with the classes
+                # below (#1102).  They are deliberate run-lifecycle evidence,
+                # not unclassified surprises — without them here a resumed run
+                # was branded red by the accounting of its own abort (one
+                # stamped attempt over a 200-request profile is exactly the
+                # 0.005 gate threshold).
+                "AirflowDagFailure",
+                "RunAborted",
+                "LiveWavesSubprocessTimeout",
+                "LiveWavesSubprocessFailure",
+                "LiveWavesResultMissing",
             ]
             cursor.execute(
                 """
@@ -5508,7 +5610,14 @@ class ControlStore:
                                        attempt.logical_refresh_id
                                    AND prior.attempt_number <
                                        attempt.attempt_number
-                                   AND prior.status IN ('failed', 'expired')
+                                   -- 'cancelled' priors are consciously
+                                   -- returned-unfetched claims (budget stop
+                                   -- / UnfetchedRequeue); a reanimated run
+                                   -- re-claiming them (#1102) is not a
+                                   -- duplicate paid fetch.
+                                   AND prior.status IN (
+                                       'failed', 'expired', 'cancelled'
+                                   )
                                    AND prior.error_class IS NOT NULL
                              )
                        )

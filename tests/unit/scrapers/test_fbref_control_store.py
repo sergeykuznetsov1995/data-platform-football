@@ -1737,6 +1737,157 @@ def test_bind_reservation_uses_terminal_lock_order():
     ]
 
 
+def test_start_run_reanimates_a_failed_crawl_run_without_touching_the_ledger():
+    # A rerun after ``airflow tasks clear`` hits the same deterministic
+    # run_id that abort_run left 'failed' (#1102). The reanimation may only
+    # flip status/finished_at and return claimable aborted targets to
+    # 'retry': the monotonic ledger carries the previous attempts' spend
+    # that the retry subprocess subtracts (#1107).
+    run_id = str(uuid.uuid4())
+    captured = {}
+
+    def handler(sql, params):
+        if sql.startswith("SELECT status, run_type, metadata"):
+            return [
+                {"status": "failed", "run_type": "current", "metadata": {}}
+            ], 1
+        if "UPDATE fbref_control.crawl_run" in sql:
+            captured["crawl_sql"] = sql
+            captured["crawl_params"] = params
+            return [], 1
+        if "UPDATE fbref_control.run_target" in sql:
+            captured["target_sql"] = sql
+            captured["target_params"] = params
+            return [], 3
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+
+    store.start_run(run_id)
+
+    set_clause, where_clause = captured["crawl_sql"].split(" WHERE ", 1)
+    assert "finished_at = NULL" in set_clause
+    assert "status = 'failed'" in where_clause
+    for ledger_column in (
+        "requests_used",
+        "bytes_used",
+        "requests_reserved",
+        "bytes_reserved",
+        "budget_exceeded",
+        "metadata",
+    ):
+        assert ledger_column not in set_clause
+    assert captured["crawl_params"] == (run_id,)
+    target_sql = captured["target_sql"]
+    assert "SET status = 'retry'" in target_sql
+    assert "target.status IN ('failed', 'skipped')" in target_sql
+    assert "frontier.state IN ('queued', 'retry')" in target_sql
+    # A backed-off page would come back as unfinished-but-unclaimable and
+    # re-wedge the wave gate; a page open in another live run must never be
+    # opened twice (mirror of the cohort admission guard).
+    assert "frontier.retry_after IS NULL" in target_sql
+    assert "frontier.next_fetch_at IS NULL" in target_sql
+    assert "NOT EXISTS" in target_sql
+    assert "outstanding.status IN ( 'pending', 'leased', 'retry' )" in target_sql
+    assert "outstanding_run.status IN ('pending', 'running')" in target_sql
+    assert "outstanding.run_id <> target.run_id" in target_sql
+    assert captured["target_params"] == (run_id,)
+
+
+def test_start_run_without_reopen_targets_only_flips_the_run_row():
+    # The validate path finishes the run immediately after reanimation, so
+    # it must not reopen targets into a run that becomes succeeded at once.
+    run_id = str(uuid.uuid4())
+
+    def handler(sql, _params):
+        if sql.startswith("SELECT status, run_type, metadata"):
+            return [
+                {"status": "failed", "run_type": "current", "metadata": {}}
+            ], 1
+        if "UPDATE fbref_control.crawl_run" in sql:
+            return [], 1
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+
+    store.start_run(run_id, reopen_targets=False)
+
+
+def test_run_summary_does_not_brand_a_reclaimed_cancelled_prior_a_duplicate():
+    # A reanimated run re-claims its former 'skipped' targets whose only
+    # prior attempts are 'cancelled' (UnfetchedRequeue).  The duplicate
+    # fetch counter must accept such priors as justification (#1102), or
+    # every resume goes permanently red AFTER spending budget on refetch.
+    sql_source = inspect.getsource(ControlStore.get_run_summary)
+    assert "'failed', 'expired', 'cancelled'" in sql_source
+
+
+def test_start_run_pending_path_neither_resets_finished_at_nor_targets():
+    run_id = str(uuid.uuid4())
+    captured = {}
+
+    def handler(sql, params):
+        if sql.startswith("SELECT status, run_type, metadata"):
+            return [
+                {"status": "pending", "run_type": "current", "metadata": {}}
+            ], 1
+        if "UPDATE fbref_control.crawl_run" in sql:
+            captured["crawl_sql"] = sql
+            return [], 1
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+
+    store.start_run(run_id)
+
+    set_clause = captured["crawl_sql"].split(" WHERE ", 1)[0]
+    assert "finished_at" not in set_clause
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        None,
+        {"status": "succeeded", "run_type": "current", "metadata": {}},
+        {"status": "failed", "run_type": "publication", "metadata": {}},
+        {
+            "status": "failed",
+            "run_type": "current",
+            "metadata": {"raw_fetch_attempt_snapshot": {"attempts": []}},
+        },
+    ],
+)
+def test_start_run_still_refuses_a_terminal_run(row):
+    # 'succeeded', terminal publication generations, sealed runs (their
+    # raw-audit snapshot is create-once) and unknown run ids all stay
+    # StateConflict — reanimation is only for aborted crawl runs.
+    run_id = str(uuid.uuid4())
+
+    def handler(sql, _params):
+        if sql.startswith("SELECT status, run_type, metadata"):
+            return ([row] if row is not None else []), (
+                1 if row is not None else 0
+            )
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+
+    with pytest.raises(StateConflict, match="cannot be started"):
+        store.start_run(run_id)
+
+
 def test_abort_run_never_downgrades_a_succeeded_run():
     run_id = str(uuid.uuid4())
     executions = []

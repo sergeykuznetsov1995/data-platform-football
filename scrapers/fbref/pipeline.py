@@ -1925,11 +1925,28 @@ class FBrefPipeline:
             # stopped at its budget. Counting it as unfinished made the wave
             # after the budget stop raise instead of no-opping, so a run that
             # spent its budget still went red.
+            # 'failed' is unreachable for this run: reanimation (#1102) has
+            # already returned every claimable aborted target to 'retry', so
+            # what remains 'failed' has no living frontier page behind it —
+            # typically a permanent dead-letter that NO run will ever refetch.
+            # Counting it as unfinished deadlocked every resumed run; instead
+            # the loss is logged loudly below and run quality stays with the
+            # traffic gates in validate_and_finish.
             unfinished = sum(
                 int(count)
                 for status, count in target_counts.items()
-                if status not in {"succeeded", "skipped"}
+                if status not in {"succeeded", "skipped", "failed"}
             )
+            terminally_failed = int(target_counts.get("failed") or 0)
+            if terminally_failed:
+                logger.warning(
+                    "Run %s ends its waves with %d terminally failed "
+                    "target(s); this run will not refetch them — each page "
+                    "is either dead-lettered, backed off, or already handled "
+                    "by another run (frontier state is authoritative)",
+                    run_id,
+                    terminally_failed,
+                )
             if unfinished:
                 raise FetchWaveError(
                     f"Run has {unfinished} unfinished target(s) that are not claimable"
@@ -2563,6 +2580,14 @@ class FBrefPipeline:
         normalized_batches = int(max_batches)
         if not 1 <= normalized_batches <= 16:
             raise ValueError("max_batches must be between 1 and 16")
+
+        run = self.control.get_run(run_id)
+        if run is not None and str(run.get("status") or "") == "failed":
+            # ``airflow tasks clear -t run_live_waves`` re-runs only this
+            # task, never initialize_run, so the #1102 reanimation must live
+            # on the path every resume actually takes.  start_run itself
+            # refuses terminal runs (succeeded/publication/sealed).
+            self.control.start_run(run_id)
 
         aggregate = LiveRunResult()
         live_session = _LiveFetchSession()
@@ -3776,11 +3801,26 @@ class FBrefPipeline:
         # 'skipped' is a target the run deliberately did not fetch — it stopped
         # at its budget and handed the target back to the queue. That is the
         # designed steady state of a budgeted crawler, not an incomplete run.
+        # 'failed' mirrors the wave gate (#1102): reanimation already returned
+        # every claimable aborted target to 'retry', so a remaining 'failed'
+        # has no living page behind it and this run cannot act on it any more.
+        # It is not "incomplete" here either — the loss is logged loudly and a
+        # genuinely unhealthy run is still rejected by the traffic gates below.
         incomplete = {
             status: count
             for status, count in target_counts.items()
-            if status not in {"succeeded", "skipped"} and int(count) > 0
+            if status not in {"succeeded", "skipped", "failed"}
+            and int(count) > 0
         }
+        if int(target_counts.get("failed") or 0) > 0:
+            logger.warning(
+                "Run %s finishes with %d terminally failed target(s); this "
+                "run will not refetch them — each page is either "
+                "dead-lettered, backed off, or already handled by another "
+                "run (frontier state is authoritative)",
+                run_id,
+                int(target_counts.get("failed") or 0),
+            )
         dataset_counts = summary.get("dataset_validation_counts") or {}
         dataset_failures = sum(
             int(count)
@@ -4040,6 +4080,16 @@ class FBrefPipeline:
                 ),
                 replay=True,
             )
+        run_row = self.control.get_run(run_id)
+        if run_row is not None and str(run_row.get("status") or "") == "failed":
+            # A lone ``clear`` of the validate task never re-runs the waves,
+            # so the reanimation (#1102) must also live here: the gates above
+            # have just passed, and finishing a 'failed' run raises
+            # StateConflict otherwise.  start_run keeps refusing terminal
+            # runs (succeeded/publication/sealed).  No targets are reopened —
+            # the run is finishing right now, and reopened 'retry' rows would
+            # linger in a succeeded run forever.
+            self.control.start_run(run_id, reopen_targets=False)
         self.control.finish_run(run_id, succeeded=True)
         return summary
 
