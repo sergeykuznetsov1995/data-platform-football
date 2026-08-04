@@ -58,13 +58,21 @@ def test_shipped_registry_preserves_current_activation_and_legacy_views():
     # (16). Keep it an exact tuple -- it is the guard that no league reaches
     # production capture without an operator having gone through review+enable.
     assert catalog.enabled_competition_ids() == (
+        "BEL-Pro League",
         "ENG-Premier League",
         "ESP-La Liga",
         "FRA-Ligue 1",
+        "FRA-Ligue 2",
+        "GER-2. Bundesliga",
         "GER-Bundesliga",
         "INT-World Cup",
         "ITA-Serie A",
+        "ITA-Serie B",
+        "NED-Eredivisie",
+        "POL-Ekstraklasa",
+        "POR-Liga Portugal",
         "RUS-Premier League",
+        "TUR-Süper Lig",
     )
     assert catalog.tournament_map()["ENG-Premier League"] == 17
     assert catalog.slug_map()["INT-World Cup"] == (

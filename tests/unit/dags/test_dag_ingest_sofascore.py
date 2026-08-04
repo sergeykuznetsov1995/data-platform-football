@@ -734,10 +734,17 @@ class TestPlayerRotationGate:
             assert gate._init_kwargs["ignore_downstream_trigger_rules"] is False
 
     def test_todays_two_league_scope_keeps_its_weekly_cadence(
-        self, dag_module, rotation_env
+        self, dag_module, monkeypatch, rotation_env
     ):
         # Regression: below the threshold the rotation is a no-op — EPL and the
-        # World Cup still run on every Saturday.
+        # World Cup still run on every Saturday. The shipped scope crossed the
+        # threshold in wave 2 (#1090), so the narrow bootstrap pair is
+        # simulated explicitly, mirroring ``_wide_scope``.
+        monkeypatch.setattr(
+            dag_module, "SOFASCORE_LEAGUES", ["ENG-Premier League", "INT-World Cup"]
+        )
+        monkeypatch.setattr(dag_module, "CLUB_LEAGUES", ["ENG-Premier League"])
+        monkeypatch.setattr(dag_module, "TOURNAMENT_LEAGUES", ["INT-World Cup"])
         for week in range(4):
             boundary = datetime(2026, 1, 10 + 7 * week)
             due = dag_module._due_player_leagues(
@@ -950,16 +957,32 @@ class TestRegistryActivation:
             "FRA-Ligue 1",  # 34
             "GER-Bundesliga",  # 35
             "RUS-Premier League",  # 203 (#951+, решение владельца 2026-07-16)
+            "BEL-Pro League",  # 38 (#1090 волна 2, решение владельца 2026-08-04)
+            "FRA-Ligue 2",  # 182 (#1090 волна 2)
+            "GER-2. Bundesliga",  # 44 (#1090 волна 2)
+            "ITA-Serie B",  # 53 (#1090 волна 2)
+            "NED-Eredivisie",  # 37 (#1090 волна 2)
+            "POL-Ekstraklasa",  # 202 (#1090 волна 2)
+            "POR-Liga Portugal",  # 238 (#1090 волна 2)
+            "TUR-Süper Lig",  # 52 (#1090 волна 2)
         }
         # EPL stays the primary club (legacy task ids / result paths); the rest
         # follow the registry's canonical-id sort order.
         assert dag_module.CLUB_LEAGUES == [
             "ENG-Premier League",
+            "BEL-Pro League",
             "ESP-La Liga",
             "FRA-Ligue 1",
+            "FRA-Ligue 2",
+            "GER-2. Bundesliga",
             "GER-Bundesliga",
             "ITA-Serie A",
+            "ITA-Serie B",
+            "NED-Eredivisie",
+            "POL-Ekstraklasa",
+            "POR-Liga Portugal",
             "RUS-Premier League",
+            "TUR-Süper Lig",
         ]
         assert dag_module.TOURNAMENT_LEAGUES == ["INT-World Cup"]
 
