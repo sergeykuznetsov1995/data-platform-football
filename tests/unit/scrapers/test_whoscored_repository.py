@@ -1832,6 +1832,26 @@ def test_backfill_freeze_includes_every_completed_match_regardless_manifest():
 
 
 @pytest.mark.unit
+def test_probe_verdicts_come_from_the_latest_ingest_view_only():
+    trino = MagicMock()
+    trino.execute_query.return_value = [(2, "not_available"), (1, "success")]
+    repository = WhoScoredRepository(writer=MagicMock(), trino=trino)
+
+    states = repository.list_match_ingest_states(
+        "WS-252-26", "2526", match_ids=[2, 1, 2]
+    )
+
+    assert states == {1: "success", 2: "not_available"}
+    sql = trino.execute_query.call_args.args[0]
+    assert "whoscored_match_ingest_latest" in sql
+    assert "league = 'WS-252-26'" in sql
+    assert "season = '2526'" in sql
+    assert "game_id IN (1,2)" in sql
+    assert repository.list_match_ingest_states("WS-252-26", "2526", match_ids=[]) == {}
+    assert trino.execute_query.call_count == 1
+
+
+@pytest.mark.unit
 def test_backfill_profile_freeze_ignores_mutable_manifest_state():
     trino = MagicMock()
     trino.execute_query.return_value = [(7,), (11,)]

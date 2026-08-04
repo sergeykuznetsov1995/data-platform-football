@@ -13,6 +13,7 @@ from dags.scripts.whoscored_ops_store import (
     CHECKPOINT_DELTAS_PER_SNAPSHOT,
     LEGACY_BACKFILL_CHECKPOINT_VERSION,
     MATCH_CHUNK_SIZE,
+    PROBE_SAMPLE_SIZE,
     PROFILE_CHUNK_SIZE,
     schedule_request_units,
     WhoScoredBackfillState,
@@ -37,6 +38,7 @@ def _schedule_outcome(
     *,
     candidate_game_ids,
     preview_game_ids,
+    non_opta_game_ids=(),
     source_stage_ids=None,
     source_request_attempts=0,
 ):
@@ -46,6 +48,7 @@ def _schedule_outcome(
     estimated = int(work["estimated_request_units"])
     return {
         "candidate_game_ids": list(candidate_game_ids),
+        "non_opta_game_ids": list(non_opta_game_ids),
         "preview_game_ids": list(preview_game_ids),
         "source_stage_ids": observed_stage_ids,
         "source_request_attempts": source_request_attempts,
@@ -105,14 +108,15 @@ def test_plan_identity_binds_catalog_generation_and_candidate_policy(
 
     assert first["plan_id"] != second["plan_id"]
     assert first["policy"]["match_candidate_policy"] == (
-        "all_completed_schedule_matches"
+        "all_completed_schedule_matches+non_opta_probe_v1"
     )
+    assert first["policy"]["probe_sample_size"] == 2
     assert first["policy"]["availability_version"]
     assert first["policy"]["schedule_capacity_policy"] == (
         "pinned-catalog-stage-count-v1"
     )
     assert first["policy"]["schedule_request_units_per_stage"] == 70
-    assert first["policy"]["policy_version"] == 6
+    assert first["policy"]["policy_version"] == 7
     assert first["policy"]["match_capacity_policy"] == (
         "exact-match-plus-preview-cardinality-v1"
     )
@@ -260,6 +264,307 @@ def test_match_capacity_uses_exact_match_and_preview_cardinality(
     assert match["game_ids"] == [1, 2, 3, 4]
     assert match["preview_game_ids"] == [2, 4]
     assert state.request_units(match) == 6
+
+
+def _probe_plan_with_schedule_receipt(
+    state,
+    *,
+    queue_id,
+    selector=None,
+    candidate_game_ids,
+    non_opta_game_ids,
+):
+    plan = state.create_plan(
+        queue_id=queue_id,
+        selector=dict(selector or {}),
+        scopes=["WS-252-26=2526"],
+        schedule_stage_ids={"WS-252-26=2526": [1]},
+    )
+    schedule = state.pending_work(queue_id, plan["plan_id"])[0]
+    state.append_receipt(
+        queue_id=queue_id,
+        plan_id=plan["plan_id"],
+        work_item=schedule,
+        outcome=_schedule_outcome(
+            schedule,
+            candidate_game_ids=candidate_game_ids,
+            preview_game_ids=candidate_game_ids,
+            non_opta_game_ids=non_opta_game_ids,
+        ),
+    )
+    return plan
+
+
+@pytest.mark.unit
+def test_all_non_opta_scope_probes_before_match_chunks_and_defers_on_stubs(
+    monkeypatch, tmp_path
+):
+    state = _state(monkeypatch, tmp_path)
+    candidates = list(range(1, 53))
+    plan = _probe_plan_with_schedule_receipt(
+        state,
+        queue_id="probe-q",
+        candidate_game_ids=candidates,
+        non_opta_game_ids=candidates,
+    )
+    plan_id = plan["plan_id"]
+
+    pending = state.pending_work("probe-q", plan_id)
+    assert [item["kind"] for item in pending] == ["probe"]
+    probe = pending[0]
+    # Evenly spread picks: the first and the last frozen candidate, never a
+    # prefix of the earliest (stub-heavy) rounds.
+    assert probe["game_ids"] == [1, 52]
+    assert PROBE_SAMPLE_SIZE == 2
+    assert probe["candidate_game_ids"] == candidates
+    # A resumed plan re-derives the byte-identical probe item.
+    assert state.pending_work("probe-q", plan_id) == [probe]
+
+    outcome = {
+        "game_ids": [1, 52],
+        "not_available_game_ids": [1, 52],
+        "known_data_game_ids": [],
+        "deferred_game_ids": list(range(2, 52)),
+    }
+    assert set(outcome["game_ids"]) | set(outcome["deferred_game_ids"]) == set(
+        candidates
+    )
+    state.append_receipt(
+        queue_id="probe-q",
+        plan_id=plan_id,
+        work_item=probe,
+        outcome=outcome,
+    )
+
+    chunks = state.pending_work("probe-q", plan_id)
+    assert [item["kind"] for item in chunks] == ["matches"]
+    assert chunks[0]["game_ids"] == [1, 52]
+    assert chunks[0]["preview_game_ids"] == [1, 52]
+    state.append_receipt(
+        queue_id="probe-q",
+        plan_id=plan_id,
+        work_item=chunks[0],
+        outcome={"game_ids": [1, 52]},
+    )
+
+    roster = state.pending_work("probe-q", plan_id)
+    assert [item["kind"] for item in roster] == ["roster"]
+    state.append_receipt(
+        queue_id="probe-q",
+        plan_id=plan_id,
+        work_item=roster[0],
+        outcome={"profile_player_ids": []},
+    )
+    progress = state.progress("probe-q", plan_id)
+    assert progress["status"] == "complete"
+    assert progress["completed_probes"] == 1
+    assert progress["completed_match_chunks"] == 1
+
+
+@pytest.mark.unit
+def test_probe_verdicts_that_refute_the_flag_chunk_every_candidate(
+    monkeypatch, tmp_path
+):
+    state = _state(monkeypatch, tmp_path)
+    candidates = list(range(1, 53))
+    plan = _probe_plan_with_schedule_receipt(
+        state,
+        queue_id="probe-lied",
+        candidate_game_ids=candidates,
+        non_opta_game_ids=candidates,
+    )
+    probe = state.pending_work("probe-lied", plan["plan_id"])[0]
+    state.append_receipt(
+        queue_id="probe-lied",
+        plan_id=plan["plan_id"],
+        work_item=probe,
+        outcome={
+            "game_ids": [1, 52],
+            "not_available_game_ids": [1],
+            "known_data_game_ids": [],
+            "deferred_game_ids": [],
+        },
+    )
+
+    chunks = state.pending_work("probe-lied", plan["plan_id"])
+    assert [len(item["game_ids"]) for item in chunks] == [25, 25, 2]
+    assert sorted(
+        game_id for item in chunks for game_id in item["game_ids"]
+    ) == candidates
+
+
+@pytest.mark.unit
+def test_manifest_evidence_behind_other_candidates_vetoes_the_deferral(
+    monkeypatch, tmp_path
+):
+    # Both probes hit stubs, but the manifest already proves data behind
+    # other candidates (e.g. a prior campaign): the flag lies for this scope,
+    # so every candidate must be chunked and nothing may be deferred.
+    state = _state(monkeypatch, tmp_path)
+    candidates = list(range(1, 53))
+    plan = _probe_plan_with_schedule_receipt(
+        state,
+        queue_id="probe-evidence",
+        candidate_game_ids=candidates,
+        non_opta_game_ids=candidates,
+    )
+    probe = state.pending_work("probe-evidence", plan["plan_id"])[0]
+    state.append_receipt(
+        queue_id="probe-evidence",
+        plan_id=plan["plan_id"],
+        work_item=probe,
+        outcome={
+            "game_ids": [1, 52],
+            "not_available_game_ids": [1, 52],
+            "known_data_game_ids": [10, 30],
+            "deferred_game_ids": [],
+        },
+    )
+
+    chunks = state.pending_work("probe-evidence", plan["plan_id"])
+    assert [len(item["game_ids"]) for item in chunks] == [25, 25, 2]
+    assert sorted(
+        game_id for item in chunks for game_id in item["game_ids"]
+    ) == candidates
+
+
+@pytest.mark.unit
+def test_probe_picks_are_evenly_spread_over_the_frozen_candidates():
+    probe = WhoScoredBackfillState._probe_work("WS-1=2026", list(range(1, 94)))
+    assert probe["game_ids"] == [1, 93]
+    assert WhoScoredBackfillState._probe_work("WS-1=2026", [7])["game_ids"] == [7]
+    assert WhoScoredBackfillState._probe_work("WS-1=2026", [7, 9])["game_ids"] == [
+        7,
+        9,
+    ]
+
+
+@pytest.mark.unit
+def test_probe_stage_requires_all_non_opta_and_no_explicit_game_ids(
+    monkeypatch, tmp_path
+):
+    state = _state(monkeypatch, tmp_path)
+    partially = _probe_plan_with_schedule_receipt(
+        state,
+        queue_id="mixed-flags",
+        candidate_game_ids=[1, 2, 3],
+        non_opta_game_ids=[2, 3],
+    )
+    assert [
+        item["kind"] for item in state.pending_work("mixed-flags", partially["plan_id"])
+    ] == ["matches"]
+
+    explicit = _probe_plan_with_schedule_receipt(
+        state,
+        queue_id="explicit-ids",
+        selector={"game_ids": [1, 2, 3]},
+        candidate_game_ids=[1, 2, 3],
+        non_opta_game_ids=[1, 2, 3],
+    )
+    assert [
+        item["kind"] for item in state.pending_work("explicit-ids", explicit["plan_id"])
+    ] == ["matches"]
+
+
+@pytest.mark.unit
+def test_probe_receipt_that_would_lose_candidates_is_rejected(monkeypatch, tmp_path):
+    state = _state(monkeypatch, tmp_path)
+    plan = _probe_plan_with_schedule_receipt(
+        state,
+        queue_id="probe-guard",
+        candidate_game_ids=[1, 2, 3, 4, 5],
+        non_opta_game_ids=[1, 2, 3, 4, 5],
+    )
+    probe = state.pending_work("probe-guard", plan["plan_id"])[0]
+    assert probe["game_ids"] == [1, 5]
+
+    with pytest.raises(RuntimeError, match="preserve every frozen candidate"):
+        state.append_receipt(
+            queue_id="probe-guard",
+            plan_id=plan["plan_id"],
+            work_item=probe,
+            outcome={
+                "game_ids": [1, 5],
+                "not_available_game_ids": [1, 5],
+                "known_data_game_ids": [],
+                "deferred_game_ids": [2, 3],
+            },
+        )
+    with pytest.raises(RuntimeError, match="preserve every frozen candidate"):
+        state.append_receipt(
+            queue_id="probe-guard",
+            plan_id=plan["plan_id"],
+            work_item=probe,
+            outcome={
+                "game_ids": [1, 5],
+                "not_available_game_ids": [5],
+                "known_data_game_ids": [],
+                "deferred_game_ids": [2, 3, 4],
+            },
+        )
+    # Manifest evidence of data behind another candidate forbids deferral too.
+    with pytest.raises(RuntimeError, match="preserve every frozen candidate"):
+        state.append_receipt(
+            queue_id="probe-guard",
+            plan_id=plan["plan_id"],
+            work_item=probe,
+            outcome={
+                "game_ids": [1, 5],
+                "not_available_game_ids": [1, 5],
+                "known_data_game_ids": [3],
+                "deferred_game_ids": [2, 3, 4],
+            },
+        )
+
+
+@pytest.mark.unit
+def test_probe_receipts_survive_compact_checkpoint_continuation(
+    monkeypatch, tmp_path
+):
+    state = _state(monkeypatch, tmp_path)
+    candidates = list(range(1, 30))
+    plan = _probe_plan_with_schedule_receipt(
+        state,
+        queue_id="probe-frontier",
+        candidate_game_ids=candidates,
+        non_opta_game_ids=candidates,
+    )
+    plan_id = plan["plan_id"]
+    probe_batch = state.create_batch(
+        "probe-frontier", plan_id, batch_id="scheduled__probe"
+    )
+    assert [item["kind"] for item in probe_batch["work_items"]] == ["probe"]
+    probe = probe_batch["work_items"][0]
+    state.append_receipt(
+        queue_id="probe-frontier",
+        plan_id=plan_id,
+        work_item=probe,
+        outcome={
+            "game_ids": [1, 29],
+            "not_available_game_ids": [1, 29],
+            "known_data_game_ids": [],
+            "deferred_game_ids": list(range(2, 29)),
+        },
+    )
+    progress = state.advance_batch(
+        "probe-frontier", plan_id, batch_id="scheduled__probe"
+    )
+    assert progress["completed_probes"] == 1
+
+    # The continuation path derives the deferral branch from the compact
+    # frontier alone; a full receipt rebuild here would hide a dropped
+    # probe receipt until terminal DQ.
+    monkeypatch.setattr(
+        state,
+        "receipts",
+        lambda *_args, **_kwargs: pytest.fail("unexpected full receipt rebuild"),
+    )
+    match_batch = state.create_batch(
+        "probe-frontier", plan_id, batch_id="scheduled__matches"
+    )
+    assert [(item["kind"], item["game_ids"]) for item in match_batch["work_items"]] == [
+        ("matches", [1, 29])
+    ]
 
 
 @pytest.mark.unit
