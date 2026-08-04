@@ -106,6 +106,14 @@ _COHORT_016_TRUNCATED_LINEUPS = {
     ),
 }
 
+_COHORT_017_TRUNCATED_LINEUPS = {
+    "663b694e2e27825b469bfaa53a112bac1d4bd1f0faf80bd32d710d1085da6b77": (
+        "790:2023",
+        687138,
+        ((5775, 11), (8600, 10)),
+    ),
+}
+
 _COHORT_015_CONTRADICTORY_LINEUPS = {
     "7a7f0b292c9717f61d50648ea673f233429a264da431072c174dc46f5cc0d66c": (
         "750:2026",
@@ -1425,6 +1433,7 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
         ),
         **_COHORT_015_TRUNCATED_LINEUPS,
         **_COHORT_016_TRUNCATED_LINEUPS,
+        **_COHORT_017_TRUNCATED_LINEUPS,
     }
     assert dict(summary_parser_module._REVIEWED_CONTRADICTORY_LINEUPS) == {
         "287b2052375fe3ef2fc4fc24f8c69f0be23d20adac832d86a098fc194275985f": (
@@ -1620,7 +1629,9 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
         *(
             ("truncated", lineup_sha256, identity)
             for lineup_sha256, identity in (
-                _COHORT_015_TRUNCATED_LINEUPS | _COHORT_016_TRUNCATED_LINEUPS
+                _COHORT_015_TRUNCATED_LINEUPS
+                | _COHORT_016_TRUNCATED_LINEUPS
+                | _COHORT_017_TRUNCATED_LINEUPS
             ).items()
         ),
         *(
@@ -1682,6 +1693,11 @@ def test_reviewed_lineup_exceptions_are_exact_and_fail_closed(
     mutated_identities = (
         ("751:2026", event_id, starter_counts),
         (scope_id, event_id + 1, starter_counts),
+        (
+            scope_id,
+            event_id,
+            ((first_team_id + 1, first_count), *starter_counts[1:]),
+        ),
         (
             scope_id,
             event_id,
