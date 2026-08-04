@@ -817,9 +817,13 @@ class FBrefFetcher:
         try:
             self._extend_provider_lease_for_http()
         except Exception as exc:
+            # fetch_attempt.error_message only ever stores str(FetchError), so
+            # the chained cause text must be inlined here or it is lost (#1107).
+            cause_text = str(exc)[:300]
             raise FetchError(
                 "FBref browser/HTTP provider phase boundary failed: "
-                f"{type(exc).__name__}",
+                f"{type(exc).__name__}"
+                + (f": {cause_text}" if cause_text else ""),
                 error_class="hard_transport_policy",
                 browser_document_bytes=breakdown[0],
                 browser_asset_bytes=breakdown[1],

@@ -231,12 +231,20 @@ def _run(args: argparse.Namespace) -> int:
         "scope": args.worker_id,
         "canonical_url": "https://fbref.com/en/",
     }
+    # The proxy filter meters the byte budget per dagrun, shared across every
+    # task attempt (#1107).  A retry subprocess therefore must not re-request
+    # the full CLI cap: subtract what earlier attempts already spent or still
+    # hold reserved, exactly as the filter's own run_remaining does.
+    dagrun_bytes_spent = int(run.get("bytes_used") or 0) + int(
+        run.get("bytes_reserved") or 0
+    )
+    provider_byte_budget = max(0, settings.byte_limit - dagrun_bytes_spent)
     pipeline.fetcher_factory = (
         lambda _proxy_file, max_browser_requests, max_browser_bytes: FBrefFetcher(
             max_browser_requests=max_browser_requests,
             max_browser_bytes=max_browser_bytes,
             provider_context=provider_context,
-            provider_max_bytes=settings.byte_limit,
+            provider_max_bytes=provider_byte_budget,
             proxy_control_url=proxy_control_url,
         )
     )
