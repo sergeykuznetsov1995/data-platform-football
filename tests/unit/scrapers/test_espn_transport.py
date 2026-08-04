@@ -83,6 +83,7 @@ def _client(monkeypatch, tmp_path, responses, **kwargs):
     store = EspnRawStore.from_uri(tmp_path.as_uri())
     session = FakeSession(responses)
     sleeps = []
+    kwargs.setdefault("allow_site_origin_failover", True)
     client = EspnHttpClient(
         store,
         session=session,
@@ -582,3 +583,382 @@ def test_off_domain_https_and_mixed_case_proxy_are_rejected(monkeypatch, tmp_pat
         EspnHttpClient(
             EspnRawStore.from_uri(tmp_path.as_uri()), session=FakeSession([])
         )
+
+
+@pytest.mark.unit
+def test_exact_primary_403_fails_over_once_to_official_site_mirror(
+    monkeypatch, tmp_path
+):
+    url = (
+        "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard"
+        "?dates=20260801&limit=1000"
+    )
+    body = b'{"events":[{"id":"1"}]}'
+    permits = []
+    client, session, sleeps, store = _client(
+        monkeypatch,
+        tmp_path,
+        [FakeResponse(403, b"blocked"), FakeResponse(200, body)],
+        request_permit=lambda: permits.append("permit"),
+        burst=1,
+    )
+
+    result = client.fetch_json(
+        url,
+        EndpointType.SCOREBOARD,
+        competition_id=700,
+        force_refresh=True,
+    )
+
+    assert result.target.canonical_url == canonicalize_target(url).canonical_url
+    assert result.target.url_fingerprint == canonicalize_target(url).url_fingerprint
+    assert result.transport_origin == "https://site.web.api.espn.com"
+    assert result.attempts == 2
+    assert result.direct_bytes == len(body)
+    assert client.budget.requests_used == 2
+    assert client.budget.bytes_used == len(body)
+    assert permits == ["permit", "permit"]
+    assert sleeps == [2.0]
+    assert [call[0] for call in session.calls] == [
+        canonicalize_target(url).canonical_url,
+        canonicalize_target(url).canonical_url.replace(
+            "https://site.api.espn.com", "https://site.web.api.espn.com", 1
+        ),
+    ]
+    assert all(call[1]["allow_redirects"] is False for call in session.calls)
+    stored_body, record = store.load(result.target)
+    alias = json.loads(
+        store._read_bytes(store._alias_key(result.target.url_fingerprint))
+    )
+    assert stored_body == body
+    assert record.transport_origin == "https://site.web.api.espn.com"
+    assert record.manifest_version == "espn-raw-v2"
+    assert alias["transport_origin"] == "https://site.web.api.espn.com"
+    assert client.ledger[-1].transport_origin == "https://site.web.api.espn.com"
+
+
+@pytest.mark.unit
+def test_site_mirror_failure_is_terminal_and_never_fails_over_twice(
+    monkeypatch, tmp_path
+):
+    url = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
+    client, session, _, _ = _client(
+        monkeypatch,
+        tmp_path,
+        [FakeResponse(403), FakeResponse(403), FakeResponse(200, b"{}")],
+    )
+
+    with pytest.raises(HttpStatusError) as exc_info:
+        client.fetch_json(
+            url,
+            EndpointType.SUMMARY,
+            {"event": 9},
+            competition_id=700,
+            event_id=9,
+            force_refresh=True,
+        )
+
+    assert exc_info.value.status == 403
+    assert exc_info.value.ledger_entry.attempts == 2
+    assert (
+        exc_info.value.ledger_entry.transport_origin == "https://site.web.api.espn.com"
+    )
+    assert len(session.calls) == 2
+
+
+@pytest.mark.unit
+def test_site_mirror_retryable_failure_is_not_requested_twice(monkeypatch, tmp_path):
+    url = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
+    client, session, sleeps, _ = _client(
+        monkeypatch,
+        tmp_path,
+        [FakeResponse(403), FakeResponse(503), FakeResponse(200, b"{}")],
+    )
+
+    with pytest.raises(RetryExhausted) as exc_info:
+        client.fetch_json(
+            url,
+            EndpointType.SUMMARY,
+            {"event": 9},
+            event_id=9,
+            force_refresh=True,
+        )
+
+    assert exc_info.value.ledger_entry.attempts == 2
+    assert (
+        exc_info.value.ledger_entry.transport_origin == "https://site.web.api.espn.com"
+    )
+    assert len(session.calls) == 2
+    assert sleeps == []
+
+
+@pytest.mark.unit
+def test_site_mirror_is_not_used_for_other_hosts_statuses_endpoints_or_paths(
+    monkeypatch, tmp_path
+):
+    cases = (
+        (
+            "other-host",
+            "https://sports.core.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard",
+            EndpointType.SCOREBOARD,
+            403,
+            {"competition_id": 700},
+        ),
+        (
+            "other-status",
+            "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard",
+            EndpointType.SCOREBOARD,
+            401,
+            {"competition_id": 700},
+        ),
+        (
+            "catalog-endpoint",
+            "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard",
+            EndpointType.CATALOG,
+            403,
+            {},
+        ),
+        (
+            "catalog-path",
+            "https://site.api.espn.com/apis/site/v2/sports/soccer/leagues",
+            EndpointType.CATALOG,
+            403,
+            {},
+        ),
+        (
+            "other-path",
+            "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/standings",
+            EndpointType.SCOREBOARD,
+            403,
+            {"competition_id": 700},
+        ),
+        (
+            "endpoint-path-mismatch",
+            "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard",
+            EndpointType.SUMMARY,
+            403,
+            {"competition_id": 700, "event_id": 9},
+        ),
+        (
+            "unexpected-query",
+            "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary?event=9&token=secret",
+            EndpointType.SUMMARY,
+            403,
+            {"event_id": 9},
+        ),
+        (
+            "event-identity-mismatch",
+            "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary?event=10",
+            EndpointType.SUMMARY,
+            403,
+            {"event_id": 9},
+        ),
+    )
+
+    for name, url, endpoint, status, identity in cases:
+        client, session, _, _ = _client(
+            monkeypatch,
+            tmp_path / name,
+            [FakeResponse(status), FakeResponse(200, b"{}")],
+        )
+        with pytest.raises(HttpStatusError) as exc_info:
+            client.fetch_json(url, endpoint, force_refresh=True, **identity)
+        assert exc_info.value.status == status
+        assert len(session.calls) == 1
+        if name == "unexpected-query":
+            combined = f"{exc_info.value!s}{exc_info.value!r}{client.ledger!r}"
+            assert "secret" not in combined
+
+
+@pytest.mark.unit
+def test_site_mirror_is_internal_only_and_failover_requires_explicit_policy(
+    monkeypatch, tmp_path
+):
+    direct, direct_session, _, _ = _client(
+        monkeypatch,
+        tmp_path / "direct-mirror",
+        [FakeResponse(200, b"{}")],
+    )
+    with pytest.raises(ValueError, match="mirror"):
+        direct.fetch_json(
+            "https://site.web.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary",
+            EndpointType.SUMMARY,
+            {"event": 9},
+            event_id=9,
+        )
+    assert direct_session.calls == []
+
+    disabled, disabled_session, _, _ = _client(
+        monkeypatch,
+        tmp_path / "disabled",
+        [FakeResponse(403), FakeResponse(200, b"{}")],
+        allow_site_origin_failover=False,
+    )
+    with pytest.raises(HttpStatusError) as exc_info:
+        disabled.fetch_json(
+            "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary",
+            EndpointType.SUMMARY,
+            {"event": 9},
+            event_id=9,
+            force_refresh=True,
+        )
+    assert exc_info.value.status == 403
+    assert len(disabled_session.calls) == 1
+
+
+@pytest.mark.unit
+def test_failover_obeys_request_and_attempt_budgets(monkeypatch, tmp_path):
+    url = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
+    permits = []
+    budgeted, budgeted_session, _, _ = _client(
+        monkeypatch,
+        tmp_path / "request-budget",
+        [FakeResponse(403), FakeResponse(200, b"{}")],
+        budget=TaskBudget(max_requests=1),
+        request_permit=lambda: permits.append("permit"),
+    )
+    with pytest.raises(BudgetExceeded):
+        budgeted.fetch_json(
+            url,
+            EndpointType.SUMMARY,
+            {"event": 9},
+            event_id=9,
+            force_refresh=True,
+        )
+    assert budgeted.budget.requests_used == 1
+    assert len(budgeted_session.calls) == 1
+    assert permits == ["permit"]
+
+    bounded, bounded_session, _, _ = _client(
+        monkeypatch,
+        tmp_path / "attempt-budget",
+        [FakeResponse(403), FakeResponse(200, b"{}")],
+        max_attempts=1,
+    )
+    with pytest.raises(HttpStatusError) as exc_info:
+        bounded.fetch_json(
+            url,
+            EndpointType.SUMMARY,
+            {"event": 9},
+            event_id=9,
+            force_refresh=True,
+        )
+    assert exc_info.value.status == 403
+    assert len(bounded_session.calls) == 1
+
+    capped, capped_session, _, _ = _client(
+        monkeypatch,
+        tmp_path / "byte-budget",
+        [FakeResponse(403), FakeResponse(200, b"12")],
+        response_cap_bytes=1,
+    )
+    with pytest.raises(ResponseTooLarge):
+        capped.fetch_json(
+            url,
+            EndpointType.SUMMARY,
+            {"event": 9},
+            event_id=9,
+            force_refresh=True,
+        )
+    assert len(capped_session.calls) == 2
+    assert capped.budget.bytes_used <= 1
+
+
+@pytest.mark.unit
+def test_legacy_raw_alias_cache_hit_stays_network_free_and_origin_is_additive(
+    monkeypatch, tmp_path
+):
+    url = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
+    target = canonicalize_target(url, {"event": 9})
+    client, session, _, store = _client(
+        monkeypatch,
+        tmp_path,
+        [FakeResponse(403), FakeResponse(200, b'{"new":true}')],
+    )
+    record = store.store(target, EndpointType.SUMMARY, b'{"old":true}')
+    alias_key = store._alias_key(target.url_fingerprint)
+    legacy_alias = json.loads(store._read_bytes(alias_key))
+    assert "transport_origin" not in legacy_alias
+
+    result = client.fetch_json(
+        url,
+        EndpointType.SUMMARY,
+        {"event": 9},
+        event_id=9,
+    )
+
+    assert result.json_data == {"old": True}
+    assert result.cache_hit and result.attempts == 0
+    assert result.transport_origin == "https://site.api.espn.com"
+    assert client.ledger[-1].transport_origin == "https://site.api.espn.com"
+    assert store.load(target)[1].content_hash == record.content_hash
+    assert session.calls == []
+
+
+@pytest.mark.unit
+def test_transport_origin_is_validated_serialized_and_secret_free(tmp_path):
+    store = EspnRawStore.from_uri(tmp_path.as_uri())
+    target = canonicalize_target(
+        "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary",
+        {"event": 9},
+    )
+    record = store.store(
+        target,
+        EndpointType.SUMMARY,
+        b"{}",
+        transport_origin="https://site.web.api.espn.com",
+    )
+    alias = json.loads(store._read_bytes(store._alias_key(target.url_fingerprint)))
+    assert record.transport_origin == "https://site.web.api.espn.com"
+    assert alias["transport_origin"] == "https://site.web.api.espn.com"
+    assert store.load(target)[1].transport_origin == record.transport_origin
+
+    secret = "ORIGIN-SECRET-123"
+    invalid = (
+        "https://example.com",
+        "http://site.web.api.espn.com",
+        "https://site.web.api.espn.com/path",
+        f"https://user:{secret}@site.web.api.espn.com",
+    )
+    for origin in invalid:
+        with pytest.raises(ValueError) as exc_info:
+            store.store(
+                target,
+                EndpointType.SUMMARY,
+                b"{}",
+                transport_origin=origin,
+            )
+        assert secret not in str(exc_info.value)
+        assert secret not in repr(exc_info.value)
+
+
+@pytest.mark.unit
+def test_raw_alias_versions_reject_mixed_provenance_schema(tmp_path):
+    store = EspnRawStore.from_uri(tmp_path.as_uri())
+    target = canonicalize_target(
+        "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary",
+        {"event": 9},
+    )
+    legacy = store.store(target, EndpointType.SUMMARY, b"{}")
+    alias_key = store._alias_key(target.url_fingerprint)
+    legacy_payload = json.loads(store._read_bytes(alias_key))
+    assert legacy.manifest_version == "espn-raw-v1"
+    assert "transport_origin" not in legacy_payload
+
+    legacy_payload["transport_origin"] = "https://site.api.espn.com"
+    store._write_bytes(alias_key, (json.dumps(legacy_payload) + "\n").encode())
+    with pytest.raises(RawTargetCorrupt, match="identity"):
+        store.load(target)
+
+    current = store.store(
+        target,
+        EndpointType.SUMMARY,
+        b"{}",
+        transport_origin="https://site.api.espn.com",
+    )
+    current_payload = json.loads(store._read_bytes(alias_key))
+    assert current.manifest_version == "espn-raw-v2"
+    current_payload.pop("transport_origin")
+    store._write_bytes(alias_key, (json.dumps(current_payload) + "\n").encode())
+    with pytest.raises(RawTargetCorrupt, match="identity"):
+        store.load(target)

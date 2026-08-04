@@ -58,15 +58,19 @@ from .transport_contracts import (
     DEFAULT_MAX_SUMMARY_EVENTS,
     DEFAULT_MAX_TASK_BYTES,
     EndpointType,
+    ESPN_SITE_API_CAPTURE_ORIGINS,
+    ESPN_SITE_API_PRIMARY_ORIGIN,
     FetchResult,
     TaskBudget,
     canonicalize_target,
+    normalize_transport_origin,
 )
 
 
 RUNTIME_VERSION = "espn-native-runtime-v2"
 PLAN_KIND = "espn-ingest-plan-v1"
-RAW_MANIFEST_KIND = "espn-raw-run-manifest-v1"
+LEGACY_RAW_MANIFEST_KIND = "espn-raw-run-manifest-v1"
+RAW_MANIFEST_KIND = "espn-raw-run-manifest-v2"
 SCOPE_SNAPSHOT_KIND = "espn-scope-generation-snapshot-v1"
 ARTIFACT_POINTER_KIND = "espn-artifact-pointer-v1"
 SUMMARY_CHECKPOINT_SIZE = 50
@@ -1229,7 +1233,7 @@ def _scoreboard_requests(
 def _manifest_base(loaded: LoadedPlan, selected: Sequence[ScopePlan]) -> dict[str, Any]:
     return {
         "kind": RAW_MANIFEST_KIND,
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": loaded.plan.run_id,
         "attempt": loaded.attempt,
         "mode": loaded.mode,
@@ -1249,9 +1253,11 @@ def _seal_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _validate_raw_request(value: Any, field_name: str) -> dict[str, Any]:
+def _validate_raw_request(
+    value: Any, field_name: str, *, schema_version: int
+) -> dict[str, Any]:
     raw = dict(_mapping(value, field_name))
-    expected = {
+    required = {
         "request_id",
         "scope_id",
         "endpoint",
@@ -1266,7 +1272,15 @@ def _validate_raw_request(value: Any, field_name: str) -> dict[str, Any]:
         "query_start",
         "query_end",
     }
-    _exact_keys(raw, expected, field_name)
+    expected = required if schema_version == 1 else {*required, "transport_origin"}
+    if (
+        type(schema_version) is not int
+        or schema_version not in {1, 2}
+        or set(raw) != expected
+    ):
+        raise RunnerConfigurationError(
+            f"{field_name} fields mismatch for raw manifest v{schema_version}"
+        )
     _required_string(raw["request_id"], f"{field_name}.request_id")
     _required_string(raw["scope_id"], f"{field_name}.scope_id")
     if raw["endpoint"] not in {"scoreboard", "summary"}:
@@ -1286,6 +1300,18 @@ def _validate_raw_request(value: Any, field_name: str) -> dict[str, Any]:
             raise RunnerConfigurationError(f"{field_name}.{name} is invalid")
     if raw["proxy_bytes"] != 0:
         raise RunnerConfigurationError("ESPN raw manifest contains proxy traffic")
+    if schema_version == 2:
+        try:
+            origin = normalize_transport_origin(raw["transport_origin"])
+        except ValueError as exc:
+            raise RunnerConfigurationError(
+                f"{field_name}.transport_origin is invalid"
+            ) from exc
+        if (
+            origin != raw["transport_origin"]
+            or origin not in ESPN_SITE_API_CAPTURE_ORIGINS
+        ):
+            raise RunnerConfigurationError(f"{field_name}.transport_origin is invalid")
     if raw["endpoint"] == "scoreboard":
         start = _parse_date(raw["query_start"], f"{field_name}.query_start")
         end = _parse_date(raw["query_end"], f"{field_name}.query_end")
@@ -1312,7 +1338,13 @@ def _validate_raw_manifest(manifest: Any) -> dict[str, Any]:
         "manifest_sha256",
     }
     _exact_keys(raw, expected, "raw manifest")
-    if raw["kind"] != RAW_MANIFEST_KIND or raw["schema_version"] != 1:
+    if type(raw["schema_version"]) is not int or (
+        raw["kind"],
+        raw["schema_version"],
+    ) not in {
+        (LEGACY_RAW_MANIFEST_KIND, 1),
+        (RAW_MANIFEST_KIND, 2),
+    }:
         raise RunnerConfigurationError("unsupported raw manifest")
     expected_hash = _sha256(raw["manifest_sha256"], "raw manifest.manifest_sha256")
     base = {key: value for key, value in raw.items() if key != "manifest_sha256"}
@@ -1351,7 +1383,9 @@ def _validate_raw_manifest(manifest: Any) -> dict[str, Any]:
             raise RunnerConfigurationError("Summary checkpoint exceeds 50 events")
         for request_index, request in enumerate(requests):
             validated = _validate_raw_request(
-                request, f"{field_name}.requests[{request_index}]"
+                request,
+                f"{field_name}.requests[{request_index}]",
+                schema_version=raw["schema_version"],
             )
             if validated["endpoint"] != endpoint:
                 raise RunnerConfigurationError("raw checkpoint endpoint drift")
@@ -1444,6 +1478,12 @@ def _append_checkpoint(
 ) -> None:
     if not requests:
         return
+    if manifest["schema_version"] == 1:
+        for checkpoint in manifest["checkpoints"]:
+            for request in checkpoint["requests"]:
+                request["transport_origin"] = ESPN_SITE_API_PRIMARY_ORIGIN
+        manifest["kind"] = RAW_MANIFEST_KIND
+        manifest["schema_version"] = 2
     if endpoint == "summary" and len(requests) > SUMMARY_CHECKPOINT_SIZE:
         raise AssertionError("Summary checkpoint exceeds hard limit")
     checkpoints = manifest["checkpoints"]
@@ -1476,6 +1516,16 @@ def _raw_request_from_fetch(
 ) -> dict[str, Any]:
     if result.proxy_bytes != 0 or not 200 <= result.status <= 299:
         raise ScopeIncompleteError("ESPN capture did not produce direct successful raw")
+    try:
+        transport_origin = normalize_transport_origin(result.transport_origin)
+    except ValueError as exc:
+        raise ScopeIncompleteError(
+            "ESPN capture did not provide a valid transport origin"
+        ) from exc
+    if transport_origin not in ESPN_SITE_API_CAPTURE_ORIGINS:
+        raise ScopeIncompleteError(
+            "ESPN capture did not use an allowlisted site API origin"
+        )
     return {
         "request_id": request_id,
         "scope_id": scope_id,
@@ -1488,6 +1538,7 @@ def _raw_request_from_fetch(
         "http_status": result.status,
         "direct_bytes": result.direct_bytes,
         "proxy_bytes": result.proxy_bytes,
+        "transport_origin": transport_origin,
         "query_start": query_start.isoformat() if query_start else None,
         "query_end": query_end.isoformat() if query_end else None,
     }
@@ -1887,9 +1938,7 @@ def _execute_scope(
         sorted(schedule_by_event.values(), key=lambda row: (row.kickoff, row.event_id))
     )
 
-    refresh_event_ids = set(
-        summary_refresh_event_ids(fetched_by_event.values(), prior)
-    )
+    refresh_event_ids = set(summary_refresh_event_ids(fetched_by_event.values(), prior))
     eligible = tuple(
         sorted(
             (
@@ -1949,15 +1998,9 @@ def _execute_scope(
         if event_id not in refresh_event_ids
         and (event_id not in fetched_event_ids or event.played_final)
     }
-    lineup = [
-        row
-        for row in prior_lineup
-        if row.event_id in retained_summary_event_ids
-    ]
+    lineup = [row for row in prior_lineup if row.event_id in retained_summary_event_ids]
     matchsheet = [
-        row
-        for row in prior_matchsheet
-        if row.event_id in retained_summary_event_ids
+        row for row in prior_matchsheet if row.event_id in retained_summary_event_ids
     ]
     dispositions = [
         item
@@ -2100,7 +2143,11 @@ def _default_http_client(raw_store: EspnRawStore, selected_count: int, max_event
         max_requests=DEFAULT_MAX_REQUESTS,
         max_bytes=DEFAULT_MAX_TASK_BYTES,
     )
-    return EspnHttpClient(raw_store, budget=budget)
+    return EspnHttpClient(
+        raw_store,
+        budget=budget,
+        allow_site_origin_failover=True,
+    )
 
 
 def stage(

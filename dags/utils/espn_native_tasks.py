@@ -1602,6 +1602,7 @@ def _http_client(
     max_summary_events: int,
     max_competitions: int = 1,
     max_requests: int = DEFAULT_MAX_REQUESTS,
+    allow_site_origin_failover: bool = False,
 ) -> EspnHttpClient:
     control = PostgresEspnControlStore.from_env()
     budget = TaskBudget(
@@ -1614,6 +1615,7 @@ def _http_client(
         raw_store,
         budget=budget,
         request_permit=control.acquire_request_permit,
+        allow_site_origin_failover=allow_site_origin_failover,
     )
 
 
@@ -1751,7 +1753,11 @@ def fetch_scoreboard_batch(
     if loaded.mode == "replay":
         raise OperationsError("replay must not instantiate a network operator")
     raw_store = EspnRawStore.from_uri(descriptor["raw_store_uri"])
-    client = _http_client(raw_store, max_summary_events=1)
+    client = _http_client(
+        raw_store,
+        max_summary_events=1,
+        allow_site_origin_failover=True,
+    )
     requests = runner._scoreboard_requests(
         scope,
         loaded.bindings[scope.scope_id],
@@ -2024,7 +2030,9 @@ def fetch_summary_batch(
         raise OperationsError("Summary network batch exceeds 50 events")
     raw_store = EspnRawStore.from_uri(descriptor["raw_store_uri"])
     client = _http_client(
-        raw_store, max_summary_events=max(1, len(expected["event_ids"]))
+        raw_store,
+        max_summary_events=max(1, len(expected["event_ids"])),
+        allow_site_origin_failover=True,
     )
     checkpoint_ref = _resume_checkpoint(batch["checkpoint_uri"], expected)
     if checkpoint_ref is None:
@@ -2259,7 +2267,7 @@ def offline_parse_scope(
     _heartbeat_scope_binding(raw_phase["scope_binding_ref"])
     _, descriptor, loaded, scope, _ = _binding(raw_phase["scope_binding_ref"])
     raw_ref = raw_phase["raw_manifest_ref"]
-    raw_payload = _read_ref(raw_ref, kind=runner.RAW_MANIFEST_KIND)
+    raw_payload = runner._validate_raw_manifest(_read_ref(raw_ref))
     if raw_ref["uri"] != descriptor["raw_manifest_uri"]:
         raise OperationsError("offline parse raw URI differs from signed plan")
     if raw_payload["selected_scopes"] != [scope.scope_id]:
@@ -2359,7 +2367,7 @@ def staging_dq_scope(*, offline_ref: Mapping[str, str], **_context) -> dict[str,
     state = scope_result[0]["state"]
     snapshot_ref = None
     quality = None
-    raw_manifest = _read_ref(phase["raw_manifest_ref"], kind=runner.RAW_MANIFEST_KIND)
+    raw_manifest = runner._validate_raw_manifest(_read_ref(phase["raw_manifest_ref"]))
     current_requests = [
         request
         for checkpoint in raw_manifest["checkpoints"]
@@ -5652,9 +5660,7 @@ def check_36h_freshness_and_alerts(**context) -> dict[str, str]:
         discovery.get("male_registry_ref"),
         label="monitor male registry reference",
     )
-    registry_signature = _sha(
-        registry.signature(), "monitor registry signature"
-    )
+    registry_signature = _sha(registry.signature(), "monitor registry signature")
     discovered_registry_signature = _sha(
         discovery.get("male_registry_signature"),
         "monitor discovered registry signature",
@@ -5690,10 +5696,7 @@ def check_36h_freshness_and_alerts(**context) -> dict[str, str]:
     rollover, unresolved = False, False
     for scope_id in scope_ids:
         raw_head = heads.get(scope_id)
-        if (
-            raw_head is not None
-            and raw_head.registry_signature != registry_signature
-        ):
+        if raw_head is not None and raw_head.registry_signature != registry_signature:
             head, state = None, "incomplete"
         else:
             head, state = _verified_complete_head(raw_head)

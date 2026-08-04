@@ -318,6 +318,158 @@ def test_replay_dag_has_no_network_operator_at_all():
     )
 
 
+def test_replay_offline_tasks_accept_exact_legacy_v1_raw_manifest(
+    tmp_path, monkeypatch
+):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn import runner
+
+    scope_id = "700:2026"
+    request = {
+        "request_id": "scoreboard:legacy",
+        "scope_id": scope_id,
+        "endpoint": "scoreboard",
+        "event_id": None,
+        "url_fingerprint": "a" * 64,
+        "raw_uri": "file:///raw/blobs/legacy.json.gz",
+        "raw_sha256": "b" * 64,
+        "fetched_at": "2026-08-04T12:00:00+00:00",
+        "http_status": 200,
+        "direct_bytes": 2,
+        "proxy_bytes": 0,
+        "query_start": "2026-08-04",
+        "query_end": "2026-08-04",
+    }
+    manifest_base = {
+        "kind": runner.LEGACY_RAW_MANIFEST_KIND,
+        "schema_version": 1,
+        "run_id": "capture-run",
+        "attempt": 1,
+        "mode": "backfill",
+        "as_of": "2026-08-04",
+        "registry_signature": "c" * 64,
+        "plan_signature": "d" * 64,
+        "selected_scopes": [scope_id],
+        "checkpoints": [
+            {
+                "checkpoint_id": 1,
+                "scope_id": scope_id,
+                "endpoint": "scoreboard",
+                "requests": [request],
+            }
+        ],
+    }
+    manifest = runner._seal_manifest(manifest_base)
+    manifest_path = tmp_path / "legacy-raw-manifest.json"
+    manifest_bytes = espn_native_tasks._canonical_bytes(manifest)
+    manifest_path.write_bytes(manifest_bytes)
+    manifest_ref = {
+        "uri": manifest_path.as_uri(),
+        "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+    }
+    binding_ref = {"uri": "file:///binding.json", "sha256": "e" * 64}
+    raw_phase = {
+        "kind": "espn-raw-reduction-result-v1",
+        "schema_version": 1,
+        "scope_binding_ref": binding_ref,
+        "raw_manifest_ref": manifest_ref,
+    }
+    raw_phase_path = tmp_path / "raw-phase.json"
+    raw_phase_bytes = espn_native_tasks._canonical_bytes(raw_phase)
+    raw_phase_path.write_bytes(raw_phase_bytes)
+    raw_phase_ref = {
+        "uri": raw_phase_path.as_uri(),
+        "sha256": hashlib.sha256(raw_phase_bytes).hexdigest(),
+    }
+    scope_root = (tmp_path / "scope").as_uri()
+    descriptor = {
+        "scope_root": scope_root,
+        "raw_manifest_uri": manifest_ref["uri"],
+        "raw_store_uri": (tmp_path / "raw-store").as_uri(),
+        "plan_ref": {"uri": (tmp_path / "plan.json").as_uri()},
+    }
+    plan = SimpleNamespace(
+        run_id="replay-run",
+        as_of=date(2026, 8, 4),
+        registry_signature="c" * 64,
+    )
+    loaded = SimpleNamespace(
+        mode="replay",
+        plan=plan,
+        attempt=1,
+        output_uri=(tmp_path / "output").as_uri(),
+        max_events=100,
+        signature="f" * 64,
+    )
+    scope = SimpleNamespace(scope_id=scope_id)
+    monkeypatch.setattr(espn_native_tasks, "_heartbeat_scope_binding", lambda *_: None)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_binding",
+        lambda _ref: (None, descriptor, loaded, scope, None),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_http_client",
+        lambda: pytest.fail("replay offline tasks must not create an HTTP client"),
+    )
+    staged_payload = {
+        "state": "complete",
+        "run_id": plan.run_id,
+        "plan_signature": loaded.signature,
+        "registry_signature": plan.registry_signature,
+        "scopes": [
+            {
+                "scope_id": scope_id,
+                "state": "staged",
+                "generation_snapshot_uri": "file:///snapshot.json",
+                "generation_snapshot_sha256": "1" * 64,
+            }
+        ],
+    }
+    stage_calls = []
+
+    def fake_stage(options, *, raw_store):
+        stage_calls.append((options, raw_store))
+        return SimpleNamespace(exit_code=0, payload=staged_payload)
+
+    monkeypatch.setattr(espn_native_tasks.runner, "stage", fake_stage)
+    offline = espn_native_tasks.offline_parse_scope(raw_phase_ref=raw_phase_ref)
+
+    generation = object()
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "load_scope_snapshot",
+        lambda *_a, **_k: generation,
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_assert_generation_binding", lambda **_: None
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "validate_scope_generation",
+        lambda _generation: SimpleNamespace(
+            scope_id=scope_id,
+            passed=True,
+            failures=(),
+            row_counts={"schedule": 1},
+            row_hashes={"schedule": "2" * 64},
+            ledger_count=1,
+            ledger_hash="3" * 64,
+        ),
+    )
+    dq = espn_native_tasks.staging_dq_scope(offline_ref=offline["offline_ref"])
+
+    dq_payload = espn_native_tasks._read_ref(
+        dq["staging_dq_ref"], kind="espn-staging-dq-result-v1"
+    )
+    assert len(stage_calls) == 1
+    assert stage_calls[0][0].mode == "replay"
+    assert dq_payload["direct_requests"] == 1
+    assert dq_payload["proxy_bytes"] == 0
+    assert manifest_path.read_bytes() == manifest_bytes
+
+
 def test_weekly_discovery_publishes_generated_registry_and_monitor_is_network_free():
     discovery = _reload("dag_discover_espn_registry")
     discovery_tasks = _tasks()
@@ -5531,8 +5683,7 @@ def test_monitor_checks_exact_frozen_181_scope_registry_and_binds_identity(
         espn_native_tasks,
         "_write_payload",
         lambda uri, payload, **_kwargs: (
-            writes.append((uri, payload))
-            or {"uri": uri, "sha256": "f" * 64}
+            writes.append((uri, payload)) or {"uri": uri, "sha256": "f" * 64}
         ),
     )
     monkeypatch.setenv(espn_native_tasks.ARTIFACT_ROOT_ENV, "s3://artifacts")

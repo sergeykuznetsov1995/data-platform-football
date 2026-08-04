@@ -28,6 +28,11 @@ from typing import (
 )
 
 from .selection import current_manifest_order_key
+from .transport_contracts import (
+    ESPN_SITE_API_CAPTURE_ORIGINS,
+    ESPN_SITE_API_PRIMARY_ORIGIN,
+    normalize_transport_origin,
+)
 
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -437,29 +442,34 @@ def plan_summary_batches(
     }
 
 
-def _validate_raw_request(value: object) -> dict[str, Any]:
+def _validate_raw_request(value: object, *, schema_version: int) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise OperationsError("raw request must be a mapping")
     request = dict(value)
-    _exact_keys(
-        request,
-        {
-            "request_id",
-            "scope_id",
-            "endpoint",
-            "event_id",
-            "url_fingerprint",
-            "raw_uri",
-            "raw_sha256",
-            "fetched_at",
-            "http_status",
-            "direct_bytes",
-            "proxy_bytes",
-            "query_start",
-            "query_end",
-        },
-        "raw request",
-    )
+    required = {
+        "request_id",
+        "scope_id",
+        "endpoint",
+        "event_id",
+        "url_fingerprint",
+        "raw_uri",
+        "raw_sha256",
+        "fetched_at",
+        "http_status",
+        "direct_bytes",
+        "proxy_bytes",
+        "query_start",
+        "query_end",
+    }
+    expected = required if schema_version == 1 else {*required, "transport_origin"}
+    if (
+        type(schema_version) is not int
+        or schema_version not in {1, 2}
+        or set(request) != expected
+    ):
+        raise OperationsError(
+            f"raw request fields mismatch for checkpoint v{schema_version}"
+        )
     _required(request["request_id"], "request_id")
     _scope_id(request["scope_id"])
     if request["endpoint"] not in {"scoreboard", "summary"}:
@@ -490,6 +500,16 @@ def _validate_raw_request(value: object) -> dict[str, Any]:
             raise OperationsError(f"raw request {field} is invalid")
     if request["proxy_bytes"] != 0:
         raise OperationsError("ESPN raw request contains proxy traffic")
+    if schema_version == 2:
+        try:
+            origin = normalize_transport_origin(request["transport_origin"])
+        except ValueError as exc:
+            raise OperationsError("raw request transport_origin is invalid") from exc
+        if (
+            origin != request["transport_origin"]
+            or origin not in ESPN_SITE_API_CAPTURE_ORIGINS
+        ):
+            raise OperationsError("raw request transport_origin is invalid")
     return request
 
 
@@ -507,9 +527,27 @@ def seal_raw_checkpoint(
 
     if endpoint not in {"scoreboard", "summary"}:
         raise ValueError("endpoint must be scoreboard or summary")
-    normalized = tuple(_validate_raw_request(item) for item in requests)
-    if not normalized:
+    if not requests:
         raise ValueError("raw checkpoint requests must be non-empty")
+    versions = {
+        2 if isinstance(item, Mapping) and "transport_origin" in item else 1
+        for item in requests
+    }
+    schema_version = max(versions)
+    normalized_inputs = tuple(
+        (
+            dict(item)
+            if schema_version == 1 or "transport_origin" in item
+            else {**item, "transport_origin": ESPN_SITE_API_PRIMARY_ORIGIN}
+        )
+        if isinstance(item, Mapping)
+        else item
+        for item in requests
+    )
+    normalized = tuple(
+        _validate_raw_request(item, schema_version=schema_version)
+        for item in normalized_inputs
+    )
     if endpoint == "summary" and len(normalized) > SUMMARY_BATCH_SIZE:
         raise ValueError("Summary checkpoint cannot exceed 50 requests")
     if any(item["endpoint"] != endpoint for item in normalized):
@@ -521,8 +559,8 @@ def seal_raw_checkpoint(
     if len(request_ids) != len(set(request_ids)):
         raise OperationsError("checkpoint request IDs must be unique")
     base = {
-        "kind": "espn-raw-batch-checkpoint-v1",
-        "schema_version": 1,
+        "kind": f"espn-raw-batch-checkpoint-v{schema_version}",
+        "schema_version": schema_version,
         "endpoint": endpoint,
         "run_id": _required(run_id, "run_id"),
         "attempt": _positive_int(attempt, "attempt"),
@@ -558,6 +596,10 @@ def _validated_checkpoint(value: object) -> dict[str, Any]:
         "raw checkpoint",
     )
     expected_hash = _signature(checkpoint["checkpoint_sha256"], "checkpoint_sha256")
+    if type(checkpoint["schema_version"]) is not int or checkpoint[
+        "schema_version"
+    ] not in {1, 2}:
+        raise OperationsError("raw checkpoint schema version is unsupported")
     base = {key: item for key, item in checkpoint.items() if key != "checkpoint_sha256"}
     if hashlib.sha256(_canonical_bytes(base)).hexdigest() != expected_hash:
         raise OperationsError("raw checkpoint signature mismatch")
@@ -670,17 +712,28 @@ def reduce_raw_checkpoints(
         if seen_requests & request_ids:
             raise OperationsError("duplicate raw request across checkpoints")
         seen_requests.update(request_ids)
+        normalized_requests = [
+            (
+                dict(request)
+                if item["schema_version"] == 2
+                else {
+                    **request,
+                    "transport_origin": ESPN_SITE_API_PRIMARY_ORIGIN,
+                }
+            )
+            for request in item["requests"]
+        ]
         manifest_checkpoints.append(
             {
                 "checkpoint_id": index,
                 "scope_id": item["scope_id"],
                 "endpoint": item["endpoint"],
-                "requests": item["requests"],
+                "requests": normalized_requests,
             }
         )
     base = {
-        "kind": "espn-raw-run-manifest-v1",
-        "schema_version": 1,
+        "kind": "espn-raw-run-manifest-v2",
+        "schema_version": 2,
         "run_id": run,
         "attempt": attempt_value,
         "mode": mode,

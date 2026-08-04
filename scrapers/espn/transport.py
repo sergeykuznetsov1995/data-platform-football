@@ -12,6 +12,7 @@ import zlib
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Callable, Mapping, Optional
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import requests
 from urllib3.exceptions import HTTPError as Urllib3HTTPError
@@ -42,6 +43,8 @@ from .transport_contracts import (
     DEFAULT_RESPONSE_CAP_BYTES,
     DirectTransportError,
     EndpointType,
+    ESPN_SITE_API_FAILOVER_ORIGIN,
+    ESPN_SITE_API_PRIMARY_ORIGIN,
     EspnTransportError,
     FetchResult,
     HttpStatusError,
@@ -53,11 +56,69 @@ from .transport_contracts import (
     TaskBudget,
     _nonnegative_int,
     canonicalize_target,
+    normalize_transport_origin,
 )
 
 
 RETRYABLE_HTTP_STATUSES = frozenset({408, 425, 429})
 PROXY_VARIABLES = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"})
+_SITE_DATA_PATH = re.compile(
+    r"\A/apis/site/v2/sports/soccer/[A-Za-z0-9][A-Za-z0-9._-]*/"
+    r"(?P<endpoint>scoreboard|summary)\Z"
+)
+
+
+def _transport_origin(url: str) -> str:
+    parsed = urlsplit(url)
+    return normalize_transport_origin(
+        urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+    )
+
+
+def _official_site_failover_url(
+    target: CanonicalTarget,
+    endpoint: EndpointType,
+    *,
+    enabled: bool,
+    event_id: object = None,
+) -> Optional[str]:
+    """Map only an exact blocked data route to ESPN's official site mirror."""
+
+    parsed = urlsplit(target.canonical_url)
+    if (
+        not enabled
+        or _transport_origin(target.canonical_url) != ESPN_SITE_API_PRIMARY_ORIGIN
+    ):
+        return None
+    match = _SITE_DATA_PATH.fullmatch(parsed.path)
+    if match is None or match.group("endpoint") != endpoint.value:
+        return None
+    if endpoint not in {EndpointType.SCOREBOARD, EndpointType.SUMMARY}:
+        return None
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    if len(query) != len({key for key, _ in query}):
+        return None
+    params = dict(query)
+    if endpoint is EndpointType.SCOREBOARD:
+        if set(params) not in ({"limit"}, {"dates", "limit"}):
+            return None
+        if not re.fullmatch(r"[1-9][0-9]{0,3}", params["limit"]):
+            return None
+        if int(params["limit"]) > 1000:
+            return None
+        if "dates" in params and not re.fullmatch(
+            r"[0-9]{8}(?:-[0-9]{8})?", params["dates"]
+        ):
+            return None
+    else:
+        if set(params) != {"event"} or not re.fullmatch(
+            r"[1-9][0-9]*", params["event"]
+        ):
+            return None
+        if event_id is None or str(event_id) != params["event"]:
+            return None
+    mirror = urlsplit(ESPN_SITE_API_FAILOVER_ORIGIN)
+    return urlunsplit((parsed.scheme, mirror.netloc, parsed.path, parsed.query, ""))
 
 
 class _ReadLimitExceeded(Exception):
@@ -139,6 +200,7 @@ class EspnHttpClient:
         monotonic_fn: Callable[[], float] = time.monotonic,
         utcnow_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         request_permit: Optional[Callable[[], None]] = None,
+        allow_site_origin_failover: bool = False,
         environ: Optional[Mapping[str, str]] = None,
     ) -> None:
         environment = os.environ if environ is None else environ
@@ -215,6 +277,9 @@ class EspnHttpClient:
         if request_permit is not None and not callable(request_permit):
             raise TypeError("request_permit must be callable or None")
         self.request_permit = request_permit
+        if type(allow_site_origin_failover) is not bool:
+            raise TypeError("allow_site_origin_failover must be a boolean")
+        self.allow_site_origin_failover = allow_site_origin_failover
         self._rate_limiter = _TokenBucket(
             self.rate_per_minute,
             self.burst,
@@ -264,6 +329,7 @@ class EspnHttpClient:
         disposition: str,
         record: Optional[RawJsonRecord] = None,
         error: Optional[str] = None,
+        transport_origin: Optional[str] = None,
     ) -> RequestLedgerEntry:
         return self._append_ledger(
             RequestLedgerEntry(
@@ -278,6 +344,7 @@ class EspnHttpClient:
                 content_hash=record.content_hash if record else None,
                 disposition=disposition,
                 error=error,
+                transport_origin=transport_origin,
             )
         )
 
@@ -291,6 +358,12 @@ class EspnHttpClient:
         started: float,
         disposition: str = "cache_hit",
     ) -> FetchResult:
+        # v1 aliases predate failover, so their logical HTTPS origin is also
+        # their actual transport origin. Keep the alias bytes untouched while
+        # allowing a new v2 checkpoint to reuse that audited legacy capture.
+        transport_origin = record.transport_origin or _transport_origin(
+            target.canonical_url
+        )
         try:
             data = json.loads(body)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -304,6 +377,7 @@ class EspnHttpClient:
                 disposition="corrupt_cache",
                 record=record,
                 error="cached raw body is not valid JSON",
+                transport_origin=transport_origin,
             )
             raise InvalidJsonError(
                 "Cached ESPN raw body is not valid JSON", ledger_entry=entry
@@ -317,6 +391,7 @@ class EspnHttpClient:
             direct_bytes=0,
             disposition=disposition,
             record=record,
+            transport_origin=transport_origin,
         )
         return FetchResult(
             target=target,
@@ -331,6 +406,7 @@ class EspnHttpClient:
             raw_uri=record.raw_uri,
             content_hash=record.content_hash,
             fetched_at=record.fetched_at,
+            transport_origin=transport_origin,
         )
 
     def replay_json(
@@ -344,6 +420,8 @@ class EspnHttpClient:
     ) -> FetchResult:
         started = self.monotonic_fn()
         target = canonicalize_target(url, params)
+        if _transport_origin(target.canonical_url) == ESPN_SITE_API_FAILOVER_ORIGIN:
+            raise ValueError("ESPN site mirror is reserved for bounded failover")
         endpoint_type = EndpointType.parse(endpoint)
         self.budget.admit(
             endpoint_type, competition_id=competition_id, event_id=event_id
@@ -367,6 +445,8 @@ class EspnHttpClient:
     ) -> FetchResult:
         started = self.monotonic_fn()
         target = canonicalize_target(url, params)
+        if _transport_origin(target.canonical_url) == ESPN_SITE_API_FAILOVER_ORIGIN:
+            raise ValueError("ESPN site mirror is reserved for bounded failover")
         endpoint_type = EndpointType.parse(endpoint)
         try:
             self.budget.admit(
@@ -418,6 +498,15 @@ class EspnHttpClient:
         status: Optional[int] = None
         total_direct_bytes = 0
         last_error = ""
+        request_url = target.canonical_url
+        failover_url = _official_site_failover_url(
+            target,
+            endpoint_type,
+            enabled=self.allow_site_origin_failover,
+            event_id=event_id,
+        )
+        failover_used = False
+        last_transport_origin: Optional[str] = None
         while attempts < self.max_attempts:
             reservation = None
             try:
@@ -432,6 +521,7 @@ class EspnHttpClient:
                     direct_bytes=total_direct_bytes,
                     disposition="budget_exhausted",
                     error=str(exc),
+                    transport_origin=last_transport_origin,
                 )
                 exc.ledger_entry = entry
                 raise
@@ -441,8 +531,9 @@ class EspnHttpClient:
                 if self.request_permit is not None:
                     self.request_permit()
                 attempts += 1
+                last_transport_origin = _transport_origin(request_url)
                 response = self.session.get(
-                    target.canonical_url,
+                    request_url,
                     timeout=(self.connect_timeout, self.read_timeout),
                     stream=True,
                     allow_redirects=False,
@@ -460,7 +551,14 @@ class EspnHttpClient:
                 self._record_retryable_failure()
                 status = None
                 last_error = "timeout"
-                if self.circuit_is_open or attempts >= self.max_attempts:
+                if (
+                    (
+                        failover_used
+                        and last_transport_origin == ESPN_SITE_API_FAILOVER_ORIGIN
+                    )
+                    or self.circuit_is_open
+                    or attempts >= self.max_attempts
+                ):
                     break
                 self.sleep_fn(self._retry_delay(attempts, None))
                 continue
@@ -476,6 +574,7 @@ class EspnHttpClient:
                     direct_bytes=total_direct_bytes,
                     disposition="terminal_failure",
                     error=f"non-timeout transport error: {exc.error_type}",
+                    transport_origin=last_transport_origin,
                 )
                 raise DirectTransportError(
                     "Non-retryable ESPN transport error: " + exc.error_type,
@@ -485,7 +584,14 @@ class EspnHttpClient:
                 self._record_retryable_failure()
                 status = None
                 last_error = "timeout"
-                if self.circuit_is_open or attempts >= self.max_attempts:
+                if (
+                    (
+                        failover_used
+                        and last_transport_origin == ESPN_SITE_API_FAILOVER_ORIGIN
+                    )
+                    or self.circuit_is_open
+                    or attempts >= self.max_attempts
+                ):
                     break
                 self.sleep_fn(self._retry_delay(attempts, None))
                 continue
@@ -504,6 +610,7 @@ class EspnHttpClient:
                     direct_bytes=total_direct_bytes,
                     disposition=disposition,
                     error=disposition,
+                    transport_origin=last_transport_origin,
                 )
                 error_type = BudgetExceeded if exc.task_budget else ResponseTooLarge
                 raise error_type(disposition, ledger_entry=entry) from exc
@@ -519,6 +626,7 @@ class EspnHttpClient:
                     direct_bytes=total_direct_bytes,
                     disposition="terminal_failure",
                     error="invalid response encoding",
+                    transport_origin=last_transport_origin,
                 )
                 raise DirectTransportError(
                     "Invalid ESPN response encoding", ledger_entry=entry
@@ -533,6 +641,7 @@ class EspnHttpClient:
                     direct_bytes=total_direct_bytes,
                     disposition="budget_exhausted",
                     error=str(exc),
+                    transport_origin=last_transport_origin,
                 )
                 exc.ledger_entry = entry
                 raise
@@ -547,6 +656,7 @@ class EspnHttpClient:
                     direct_bytes=total_direct_bytes,
                     disposition="terminal_failure",
                     error=f"invalid response encoding: {type(exc).__name__}",
+                    transport_origin=last_transport_origin,
                 )
                 raise DirectTransportError(
                     "Invalid ESPN response encoding", ledger_entry=entry
@@ -562,6 +672,7 @@ class EspnHttpClient:
                     direct_bytes=total_direct_bytes,
                     disposition="terminal_failure",
                     error=f"non-timeout transport error: {type(exc).__name__}",
+                    transport_origin=last_transport_origin,
                 )
                 raise DirectTransportError(
                     "Non-retryable ESPN transport error: " + type(exc).__name__,
@@ -578,6 +689,7 @@ class EspnHttpClient:
                     direct_bytes=total_direct_bytes,
                     disposition="terminal_failure",
                     error=f"non-timeout transport error: {type(exc).__name__}",
+                    transport_origin=last_transport_origin,
                 )
                 raise DirectTransportError(
                     "Non-retryable ESPN transport error: " + type(exc).__name__,
@@ -589,10 +701,28 @@ class EspnHttpClient:
                 if reservation is not None:
                     reservation.release()
 
+            if (
+                status == 403
+                and failover_url is not None
+                and not failover_used
+                and attempts < self.max_attempts
+            ):
+                self._record_nonretryable_or_success()
+                request_url = failover_url
+                failover_used = True
+                continue
+
             if status in RETRYABLE_HTTP_STATUSES or 500 <= status <= 599:
                 self._record_retryable_failure()
                 last_error = f"retryable HTTP {status}"
-                if self.circuit_is_open or attempts >= self.max_attempts:
+                if (
+                    (
+                        failover_used
+                        and last_transport_origin == ESPN_SITE_API_FAILOVER_ORIGIN
+                    )
+                    or self.circuit_is_open
+                    or attempts >= self.max_attempts
+                ):
                     break
                 self.sleep_fn(
                     self._retry_delay(attempts, response.headers.get("Retry-After"))
@@ -610,6 +740,7 @@ class EspnHttpClient:
                     direct_bytes=total_direct_bytes,
                     disposition="terminal_http_failure",
                     error=f"non-retryable HTTP {status}",
+                    transport_origin=last_transport_origin,
                 )
                 raise HttpStatusError(
                     status,
@@ -627,6 +758,7 @@ class EspnHttpClient:
                     fetched_at=fetched_at,
                     http_status=status,
                     direct_bytes=total_direct_bytes,
+                    transport_origin=last_transport_origin,
                 )
             except (RawStoreError, OSError) as exc:
                 entry = self._entry(
@@ -638,6 +770,7 @@ class EspnHttpClient:
                     direct_bytes=total_direct_bytes,
                     disposition="raw_store_failure",
                     error=f"raw store failure: {type(exc).__name__}",
+                    transport_origin=last_transport_origin,
                 )
                 raise DirectTransportError(
                     "ESPN raw response could not be committed", ledger_entry=entry
@@ -656,6 +789,7 @@ class EspnHttpClient:
                     disposition="invalid_json",
                     record=record,
                     error="response is not valid JSON",
+                    transport_origin=last_transport_origin,
                 )
                 raise InvalidJsonError(
                     "ESPN response is not valid JSON", ledger_entry=entry
@@ -669,6 +803,7 @@ class EspnHttpClient:
                 direct_bytes=total_direct_bytes,
                 disposition="success",
                 record=record,
+                transport_origin=last_transport_origin,
             )
             return FetchResult(
                 target=target,
@@ -683,6 +818,7 @@ class EspnHttpClient:
                 raw_uri=record.raw_uri,
                 content_hash=record.content_hash,
                 fetched_at=record.fetched_at,
+                transport_origin=record.transport_origin,
             )
 
         entry = self._entry(
@@ -694,6 +830,7 @@ class EspnHttpClient:
             direct_bytes=total_direct_bytes,
             disposition="retry_exhausted",
             error=last_error,
+            transport_origin=last_transport_origin,
         )
         raise RetryExhausted(
             f"ESPN retryable request failed after {attempts} attempts: {last_error}",

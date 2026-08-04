@@ -20,9 +20,40 @@ DEFAULT_MAX_COMPETITIONS = 20
 DEFAULT_MAX_SUMMARY_EVENTS = 100
 DEFAULT_MAX_REQUESTS = 600
 DEFAULT_MAX_TASK_BYTES = 64 * 1024 * 1024
+ESPN_SITE_API_PRIMARY_ORIGIN = "https://site.api.espn.com"
+ESPN_SITE_API_FAILOVER_ORIGIN = "https://site.web.api.espn.com"
+ESPN_SITE_API_CAPTURE_ORIGINS = frozenset(
+    {ESPN_SITE_API_PRIMARY_ORIGIN, ESPN_SITE_API_FAILOVER_ORIGIN}
+)
 
 ParamValue = Union[str, int, float, bool, None, Sequence[object]]
 Params = Union[Mapping[str, ParamValue], Sequence[tuple[str, ParamValue]]]
+
+
+def normalize_transport_origin(value: object) -> str:
+    """Return a value-redacted canonical ESPN HTTPS origin."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("transport_origin must be an ESPN HTTPS origin")
+    parsed = urlsplit(value.strip())
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ValueError("transport_origin must be an ESPN HTTPS origin") from None
+    hostname = (parsed.hostname or "").lower()
+    if (
+        parsed.scheme.lower() != "https"
+        or not hostname
+        or not (hostname == "espn.com" or hostname.endswith(".espn.com"))
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("transport_origin must be an ESPN HTTPS origin")
+    return f"https://{hostname}"
 
 
 class EndpointType(str, Enum):
@@ -78,6 +109,15 @@ class RequestLedgerEntry:
     content_hash: Optional[str]
     disposition: str
     error: Optional[str] = None
+    transport_origin: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.transport_origin is not None:
+            object.__setattr__(
+                self,
+                "transport_origin",
+                normalize_transport_origin(self.transport_origin),
+            )
 
     @property
     def terminal_disposition(self) -> str:
@@ -102,6 +142,15 @@ class FetchResult:
     raw_uri: str
     content_hash: str
     fetched_at: str
+    transport_origin: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.transport_origin is not None:
+            object.__setattr__(
+                self,
+                "transport_origin",
+                normalize_transport_origin(self.transport_origin),
+            )
 
     @property
     def data(self) -> Any:
@@ -364,6 +413,9 @@ __all__ = [
     "DEFAULT_RESPONSE_CAP_BYTES",
     "DirectTransportError",
     "EndpointType",
+    "ESPN_SITE_API_CAPTURE_ORIGINS",
+    "ESPN_SITE_API_FAILOVER_ORIGIN",
+    "ESPN_SITE_API_PRIMARY_ORIGIN",
     "EspnTransportError",
     "FetchResult",
     "HttpStatusError",
@@ -375,4 +427,5 @@ __all__ = [
     "TaskBudget",
     "_nonnegative_int",
     "canonicalize_target",
+    "normalize_transport_origin",
 ]

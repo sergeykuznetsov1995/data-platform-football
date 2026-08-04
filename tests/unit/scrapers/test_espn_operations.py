@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 import threading
 from types import SimpleNamespace
 
@@ -25,14 +27,17 @@ from scrapers.espn.operations import (
     reduce_raw_checkpoints,
     seal_raw_batch_descriptor,
     seal_raw_checkpoint,
+    validate_raw_checkpoint,
 )
 
 
 UTC = timezone.utc
 
 
-def _raw_request(request_id: str, endpoint: str, *, event_id=None):
-    return {
+def _raw_request(
+    request_id: str, endpoint: str, *, event_id=None, transport_origin=None
+):
+    request = {
         "request_id": request_id,
         "scope_id": "700:2026",
         "endpoint": endpoint,
@@ -47,6 +52,9 @@ def _raw_request(request_id: str, endpoint: str, *, event_id=None):
         "query_start": "2026-07-01" if endpoint == "scoreboard" else None,
         "query_end": "2027-06-30" if endpoint == "scoreboard" else None,
     }
+    if transport_origin is not None:
+        request["transport_origin"] = transport_origin
+    return request
 
 
 def test_scope_leases_are_atomic_sorted_and_retry_idempotent():
@@ -926,7 +934,7 @@ def test_raw_checkpoint_reducer_is_deterministic_and_rejects_stale_identity():
     second = reduce_raw_checkpoints(**kwargs)
 
     assert first == second
-    assert first["kind"] == "espn-raw-run-manifest-v1"
+    assert first["kind"] == "espn-raw-run-manifest-v2"
     assert [item["endpoint"] for item in first["checkpoints"]] == [
         "scoreboard",
         "summary",
@@ -983,9 +991,7 @@ def test_raw_checkpoint_reducer_accepts_mixed_width_summary_event_ids():
         plan_signature="a" * 64,
         batch_id="summary-mixed-width",
         requests=tuple(
-            _raw_request(
-                f"summary:{event_id}", "summary", event_id=event_id
-            )
+            _raw_request(f"summary:{event_id}", "summary", event_id=event_id)
             for event_id in event_ids
         ),
     )
@@ -1002,7 +1008,209 @@ def test_raw_checkpoint_reducer_accepts_mixed_width_summary_event_ids():
         checkpoints=(checkpoint,),
     )
 
-    assert manifest["checkpoints"][0]["requests"] == checkpoint["requests"]
+    assert manifest["checkpoints"][0]["requests"] == [
+        {**request, "transport_origin": "https://site.api.espn.com"}
+        for request in checkpoint["requests"]
+    ]
+
+
+def test_raw_checkpoint_preserves_and_validates_transport_origin_provenance():
+    request = _raw_request(
+        "summary:101",
+        "summary",
+        event_id=101,
+        transport_origin="https://site.web.api.espn.com",
+    )
+    checkpoint = seal_raw_checkpoint(
+        endpoint="summary",
+        run_id="run-origin",
+        attempt=1,
+        scope_id="700:2026",
+        plan_signature="a" * 64,
+        batch_id="summary-origin",
+        requests=(request,),
+    )
+
+    assert (
+        checkpoint["requests"][0]["transport_origin"] == "https://site.web.api.espn.com"
+    )
+    assert checkpoint["schema_version"] == 2
+    assert checkpoint["kind"] == "espn-raw-batch-checkpoint-v2"
+
+    request["transport_origin"] = "https://example.com"
+    with pytest.raises(OperationsError, match="transport_origin"):
+        seal_raw_checkpoint(
+            endpoint="summary",
+            run_id="run-origin",
+            attempt=1,
+            scope_id="700:2026",
+            plan_signature="a" * 64,
+            batch_id="summary-origin",
+            requests=(request,),
+        )
+
+
+def test_raw_checkpoint_rejects_boolean_schema_version():
+    checkpoint = seal_raw_checkpoint(
+        endpoint="scoreboard",
+        run_id="run-schema",
+        attempt=1,
+        scope_id="700:2026",
+        plan_signature="a" * 64,
+        batch_id="scoreboard-schema",
+        requests=(_raw_request("scoreboard:one", "scoreboard"),),
+    )
+    checkpoint["schema_version"] = True
+    base = {
+        key: value for key, value in checkpoint.items() if key != "checkpoint_sha256"
+    }
+    checkpoint["checkpoint_sha256"] = hashlib.sha256(
+        json.dumps(
+            base,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
+
+    with pytest.raises(OperationsError, match="schema version is unsupported"):
+        validate_raw_checkpoint(checkpoint)
+
+
+def test_legacy_raw_checkpoint_is_upgraded_to_v2_manifest_with_primary_origin():
+    request = _raw_request("scoreboard:one", "scoreboard")
+    checkpoint = seal_raw_checkpoint(
+        endpoint="scoreboard",
+        run_id="run-legacy-origin",
+        attempt=1,
+        scope_id="700:2026",
+        plan_signature="a" * 64,
+        batch_id="scoreboard-legacy-origin",
+        requests=(request,),
+    )
+    assert checkpoint["schema_version"] == 1
+    assert checkpoint["kind"] == "espn-raw-batch-checkpoint-v1"
+    descriptor = seal_raw_batch_descriptor(
+        endpoint="scoreboard",
+        run_id="run-legacy-origin",
+        attempt=1,
+        scope_id="700:2026",
+        plan_signature="a" * 64,
+        batch_id="scoreboard-legacy-origin",
+        request_ids=("scoreboard:one",),
+        event_ids=(),
+    )
+
+    manifest = reduce_raw_checkpoints(
+        run_id="run-legacy-origin",
+        attempt=1,
+        mode="backfill",
+        as_of="2026-08-04",
+        registry_signature="d" * 64,
+        plan_signature="a" * 64,
+        selected_scopes=("700:2026",),
+        expected_batches=(descriptor,),
+        checkpoints=(checkpoint,),
+    )
+
+    assert manifest["schema_version"] == 2
+    assert (
+        manifest["checkpoints"][0]["requests"][0]["transport_origin"]
+        == "https://site.api.espn.com"
+    )
+
+
+def test_partial_v1_resume_and_new_mirror_checkpoint_reduce_to_one_v2_manifest():
+    scoreboard = seal_raw_checkpoint(
+        endpoint="scoreboard",
+        run_id="run-mixed-origin",
+        attempt=1,
+        scope_id="700:2026",
+        plan_signature="a" * 64,
+        batch_id="scoreboard-mixed-origin",
+        requests=(_raw_request("scoreboard:one", "scoreboard"),),
+    )
+    summary = seal_raw_checkpoint(
+        endpoint="summary",
+        run_id="run-mixed-origin",
+        attempt=1,
+        scope_id="700:2026",
+        plan_signature="a" * 64,
+        batch_id="summary-mixed-origin",
+        requests=(
+            _raw_request(
+                "summary:101",
+                "summary",
+                event_id=101,
+                transport_origin="https://site.web.api.espn.com",
+            ),
+        ),
+    )
+    descriptors = tuple(
+        seal_raw_batch_descriptor(
+            endpoint=endpoint,
+            run_id="run-mixed-origin",
+            attempt=1,
+            scope_id="700:2026",
+            plan_signature="a" * 64,
+            batch_id=batch_id,
+            request_ids=(request_id,),
+            event_ids=event_ids,
+        )
+        for endpoint, batch_id, request_id, event_ids in (
+            ("scoreboard", "scoreboard-mixed-origin", "scoreboard:one", ()),
+            ("summary", "summary-mixed-origin", "summary:101", (101,)),
+        )
+    )
+
+    manifest = reduce_raw_checkpoints(
+        run_id="run-mixed-origin",
+        attempt=1,
+        mode="backfill",
+        as_of="2026-08-04",
+        registry_signature="d" * 64,
+        plan_signature="a" * 64,
+        selected_scopes=("700:2026",),
+        expected_batches=descriptors,
+        checkpoints=(scoreboard, summary),
+    )
+
+    requests = [
+        request
+        for checkpoint in manifest["checkpoints"]
+        for request in checkpoint["requests"]
+    ]
+    assert manifest["schema_version"] == 2
+    assert [request["transport_origin"] for request in requests] == [
+        "https://site.api.espn.com",
+        "https://site.web.api.espn.com",
+    ]
+
+
+def test_partial_v1_request_resume_and_new_mirror_request_seal_as_v2_batch():
+    checkpoint = seal_raw_checkpoint(
+        endpoint="summary",
+        run_id="run-partial-batch-origin",
+        attempt=1,
+        scope_id="700:2026",
+        plan_signature="a" * 64,
+        batch_id="summary-partial-batch-origin",
+        requests=(
+            _raw_request("summary:101", "summary", event_id=101),
+            _raw_request(
+                "summary:102",
+                "summary",
+                event_id=102,
+                transport_origin="https://site.web.api.espn.com",
+            ),
+        ),
+    )
+
+    assert checkpoint["schema_version"] == 2
+    assert [item["transport_origin"] for item in checkpoint["requests"]] == [
+        "https://site.api.espn.com",
+        "https://site.web.api.espn.com",
+    ]
 
 
 def test_shared_request_permit_survives_task_client_recreation():

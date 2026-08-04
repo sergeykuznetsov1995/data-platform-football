@@ -183,11 +183,13 @@ class FakeHttpClient:
         *,
         fail_slug=None,
         summary_factory=_summary,
+        transport_origin="https://site.api.espn.com",
     ):
         self.raw_store = raw_store
         self.scoreboard_by_slug = scoreboard_by_slug
         self.fail_slug = fail_slug
         self.summary_factory = summary_factory
+        self.transport_origin = transport_origin
         self.calls: list[tuple[str, EndpointType, dict]] = []
 
     def fetch_json(
@@ -218,6 +220,7 @@ class FakeHttpClient:
             body,
             fetched_at="2026-07-31T08:00:00+00:00",
             direct_bytes=len(body),
+            transport_origin=self.transport_origin,
         )
         return FetchResult(
             target=target,
@@ -232,6 +235,7 @@ class FakeHttpClient:
             raw_uri=record.raw_uri,
             content_hash=record.content_hash,
             fetched_at=record.fetched_at,
+            transport_origin=record.transport_origin,
         )
 
 
@@ -1076,6 +1080,116 @@ def test_replay_uses_bound_exact_blobs_after_alias_moves_and_never_http(tmp_path
 
 
 @pytest.mark.unit
+def test_legacy_v1_raw_manifest_replays_exact_blobs_without_http(tmp_path):
+    competition, edition = _competition()
+    capture_options, capture_plan = _plan(
+        tmp_path / "capture", "backfill", ((competition, edition),)
+    )
+    raw_store = EspnRawStore.from_uri(capture_options.raw_store_uri)
+    assert (
+        execute(
+            capture_options,
+            repository=FakeRepository(),
+            raw_store=raw_store,
+            http_client=FakeHttpClient(
+                raw_store, {competition.slug: _scoreboard(competition, edition)}
+            ),
+        ).exit_code
+        == 0
+    )
+    raw_path = Path(capture_options.raw_manifest_uri.removeprefix("file://"))
+
+    def downgrade_to_v1(manifest):
+        manifest["kind"] = "espn-raw-run-manifest-v1"
+        manifest["schema_version"] = 1
+        for checkpoint in manifest["checkpoints"]:
+            for request in checkpoint["requests"]:
+                request.pop("transport_origin")
+
+    _reseal_raw_manifest(raw_path, downgrade_to_v1)
+    legacy_bytes = raw_path.read_bytes()
+    replay_source = {
+        "mode": "backfill",
+        "run_id": capture_options.run_id,
+        "attempt": capture_options.attempt,
+        "plan_signature": capture_plan.signature(),
+        "raw_manifest_sha256": hashlib.sha256(legacy_bytes).hexdigest(),
+    }
+    replay_options, replay_plan = _plan(
+        tmp_path / "replay",
+        "replay",
+        ((competition, edition),),
+        run_id="legacy-replay-run",
+        replay_source=replay_source,
+    )
+    replay_options, _ = _bind_replay_to_capture(
+        replay_options, replay_plan, capture_options
+    )
+
+    repository = FakeRepository()
+    result = execute(replay_options, repository=repository, raw_store=raw_store)
+
+    assert result.exit_code == 0
+    assert repository.generations[0].schedule[0].event_id == 401000001
+    assert raw_path.read_bytes() == legacy_bytes
+
+
+@pytest.mark.unit
+def test_v2_mirror_origin_manifest_replays_unchanged_without_http(tmp_path):
+    competition, edition = _competition()
+    capture_options, capture_plan = _plan(
+        tmp_path / "capture", "backfill", ((competition, edition),)
+    )
+    raw_store = EspnRawStore.from_uri(capture_options.raw_store_uri)
+    assert (
+        execute(
+            capture_options,
+            repository=FakeRepository(),
+            raw_store=raw_store,
+            http_client=FakeHttpClient(
+                raw_store,
+                {competition.slug: _scoreboard(competition, edition)},
+                transport_origin="https://site.web.api.espn.com",
+            ),
+        ).exit_code
+        == 0
+    )
+    raw_path = Path(capture_options.raw_manifest_uri.removeprefix("file://"))
+    manifest = json.loads(raw_path.read_text())
+    manifest_bytes = raw_path.read_bytes()
+    assert manifest["schema_version"] == 2
+    assert {
+        request["transport_origin"]
+        for checkpoint in manifest["checkpoints"]
+        for request in checkpoint["requests"]
+    } == {"https://site.web.api.espn.com"}
+    replay_source = {
+        "mode": "backfill",
+        "run_id": capture_options.run_id,
+        "attempt": capture_options.attempt,
+        "plan_signature": capture_plan.signature(),
+        "raw_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+    }
+    replay_options, replay_plan = _plan(
+        tmp_path / "replay",
+        "replay",
+        ((competition, edition),),
+        run_id="mirror-replay-run",
+        replay_source=replay_source,
+    )
+    replay_options, _ = _bind_replay_to_capture(
+        replay_options, replay_plan, capture_options
+    )
+
+    repository = FakeRepository()
+    result = execute(replay_options, repository=repository, raw_store=raw_store)
+
+    assert result.exit_code == 0
+    assert repository.generations[0].schedule[0].event_id == 401000001
+    assert raw_path.read_bytes() == manifest_bytes
+
+
+@pytest.mark.unit
 def test_clean_noop_requires_bound_prior_complete_identity(tmp_path, monkeypatch):
     competition, edition = _competition()
     scope_id = competition.scope_id(edition)
@@ -1904,3 +2018,77 @@ import dags.scripts.run_espn_scraper
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.unit
+def test_raw_manifest_request_origin_is_additive_validated_and_serialized(tmp_path):
+    from scrapers.espn import runner
+
+    target = canonicalize_target(
+        "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary",
+        {"event": 9},
+    )
+    result = FetchResult(
+        target=target,
+        endpoint=EndpointType.SUMMARY,
+        json_data={},
+        body=b"{}",
+        attempts=2,
+        status=200,
+        cache_hit=False,
+        direct_bytes=2,
+        proxy_bytes=0,
+        raw_uri="s3://raw/blobs/sha256/aa/" + "a" * 64 + ".json.gz",
+        content_hash="a" * 64,
+        fetched_at="2026-08-04T12:00:00+00:00",
+        transport_origin="https://site.web.api.espn.com",
+    )
+    request = runner._raw_request_from_fetch(
+        request_id="summary:9",
+        scope_id="700:2026",
+        endpoint="summary",
+        event_id=9,
+        result=result,
+        query_start=None,
+        query_end=None,
+    )
+
+    assert runner._validate_raw_request(request, "request", schema_version=2) == request
+    assert request["transport_origin"] == "https://site.web.api.espn.com"
+
+    legacy = dict(request)
+    legacy.pop("transport_origin")
+    assert "transport_origin" not in runner._validate_raw_request(
+        legacy, "legacy", schema_version=1
+    )
+    with pytest.raises(RunnerConfigurationError, match="fields mismatch"):
+        runner._validate_raw_request(legacy, "current", schema_version=2)
+    with pytest.raises(RunnerConfigurationError, match="fields mismatch"):
+        runner._validate_raw_request(request, "legacy", schema_version=1)
+
+    request["transport_origin"] = "https://example.com"
+    with pytest.raises(RunnerConfigurationError, match="transport_origin"):
+        runner._validate_raw_request(request, "request", schema_version=2)
+
+
+@pytest.mark.unit
+def test_raw_manifest_rejects_boolean_schema_version():
+    from scrapers.espn import runner
+
+    manifest = runner._seal_manifest(
+        {
+            "kind": runner.LEGACY_RAW_MANIFEST_KIND,
+            "schema_version": True,
+            "run_id": "run-1",
+            "attempt": 1,
+            "mode": "backfill",
+            "as_of": "2026-08-04",
+            "registry_signature": "a" * 64,
+            "plan_signature": "b" * 64,
+            "selected_scopes": ["700:2026"],
+            "checkpoints": [],
+        }
+    )
+
+    with pytest.raises(RunnerConfigurationError, match="unsupported raw manifest"):
+        runner._validate_raw_manifest(manifest)

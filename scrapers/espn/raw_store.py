@@ -17,8 +17,11 @@ from urllib.parse import urlparse
 
 from pyarrow import fs
 
+from .transport_contracts import normalize_transport_origin
 
-RAW_MANIFEST_VERSION = "espn-raw-v1"
+
+LEGACY_RAW_MANIFEST_VERSION = "espn-raw-v1"
+RAW_MANIFEST_VERSION = "espn-raw-v2"
 RAW_STORE_ENV = "ESPN_RAW_STORE_URI"
 
 
@@ -77,6 +80,7 @@ class RawJsonRecord:
     decoded_bytes: int
     direct_bytes: int
     stored_bytes: int
+    transport_origin: Optional[str] = None
 
     @property
     def canonical_url(self) -> str:
@@ -218,6 +222,7 @@ class EspnRawStore:
         fetched_at: Optional[str] = None,
         http_status: int = 200,
         direct_bytes: Optional[int] = None,
+        transport_origin: Optional[str] = None,
     ) -> RawJsonRecord:
         """Persist body first, then atomically publish its replay alias."""
         if not isinstance(body, bytes):
@@ -234,12 +239,21 @@ class EspnRawStore:
         wire_bytes = len(body) if direct_bytes is None else direct_bytes
         if type(wire_bytes) is not int or wire_bytes < 0:
             raise ValueError("direct_bytes must be non-negative")
+        normalized_origin = (
+            None
+            if transport_origin is None
+            else normalize_transport_origin(transport_origin)
+        )
 
         content_hash = hashlib.sha256(body).hexdigest()
         blob_key = self._blob_key(content_hash)
         compressed = gzip.compress(body, compresslevel=6, mtime=0)
         record = RawJsonRecord(
-            manifest_version=RAW_MANIFEST_VERSION,
+            manifest_version=(
+                RAW_MANIFEST_VERSION
+                if normalized_origin is not None
+                else LEGACY_RAW_MANIFEST_VERSION
+            ),
             source="espn",
             endpoint=endpoint_value,
             url_fingerprint=fingerprint,
@@ -254,9 +268,13 @@ class EspnRawStore:
             decoded_bytes=len(body),
             direct_bytes=wire_bytes,
             stored_bytes=len(compressed),
+            transport_origin=normalized_origin,
         )
+        alias_payload = asdict(record)
+        if normalized_origin is None:
+            alias_payload.pop("transport_origin")
         alias = (
-            json.dumps(asdict(record), sort_keys=True, separators=(",", ":")) + "\n"
+            json.dumps(alias_payload, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode("utf-8")
 
         with self._write_lock:
@@ -292,8 +310,27 @@ class EspnRawStore:
             expected_blob = self._blob_key(record.content_hash)
         except (TypeError, ValueError) as exc:
             raise RawTargetCorrupt(f"Invalid raw ESPN alias hash: {alias_key}") from exc
+        try:
+            normalized_origin = (
+                None
+                if record.transport_origin is None
+                else normalize_transport_origin(record.transport_origin)
+            )
+        except ValueError as exc:
+            raise RawTargetCorrupt(
+                f"Invalid raw ESPN transport origin: {alias_key}"
+            ) from exc
+        provenance_schema_valid = (
+            record.manifest_version == LEGACY_RAW_MANIFEST_VERSION
+            and "transport_origin" not in payload
+            and record.transport_origin is None
+        ) or (
+            record.manifest_version == RAW_MANIFEST_VERSION
+            and "transport_origin" in payload
+            and normalized_origin is not None
+        )
         if (
-            record.manifest_version != RAW_MANIFEST_VERSION
+            not provenance_schema_valid
             or record.source != "espn"
             or record.url_fingerprint != fingerprint
             or not isinstance(record.sanitized_url, str)
@@ -302,6 +339,7 @@ class EspnRawStore:
             or record.blob_key != expected_blob
             or record.raw_uri != self._uri(expected_blob)
             or record.compression != "gzip"
+            or normalized_origin != record.transport_origin
             or type(record.http_status) is not int
             or type(record.decoded_bytes) is not int
             or type(record.direct_bytes) is not int
@@ -370,6 +408,7 @@ class EspnRawStore:
 
 __all__ = [
     "EspnRawStore",
+    "LEGACY_RAW_MANIFEST_VERSION",
     "RAW_MANIFEST_VERSION",
     "RAW_STORE_ENV",
     "RawJsonRecord",
