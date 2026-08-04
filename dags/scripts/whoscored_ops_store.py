@@ -27,8 +27,8 @@ from scrapers.whoscored.runtime_contract import require_production_runtime_class
 
 OPS_SCHEMA_VERSION = 1
 BACKFILL_PLAN_VERSION = 5
-BACKFILL_RECEIPT_VERSION = 5
-BACKFILL_POLICY_VERSION = 6
+BACKFILL_RECEIPT_VERSION = 6
+BACKFILL_POLICY_VERSION = 7
 LEGACY_BACKFILL_CHECKPOINT_VERSION = 2
 BACKFILL_CHECKPOINT_VERSION = 3
 BACKFILL_CHECKPOINT_DATA_VERSION = 1
@@ -43,6 +43,10 @@ CHECKPOINT_MAX_GENERATION = (10**CHECKPOINT_GENERATION_DIGITS) - 1
 BACKFILL_BATCH_VERSION = 2
 DEFAULT_WORK_LIMIT = 100
 MATCH_CHUNK_SIZE = 25
+# A scope whose frozen schedule flags every candidate as non-Opta fetches this
+# many real probe matches first; the manifest verdicts of those probes decide
+# whether the remaining candidates are chunked or deferred.
+PROBE_SAMPLE_SIZE = 2
 PROFILE_CHUNK_SIZE = 200
 SCHEDULE_REQUEST_UNITS_PER_STAGE = 70
 SCHEDULE_MINIMUM_STAGE_COUNT = 1
@@ -120,7 +124,10 @@ def _policy_identity() -> dict[str, Any]:
 
     return {
         "policy_version": BACKFILL_POLICY_VERSION,
-        "match_candidate_policy": "all_completed_schedule_matches",
+        "match_candidate_policy": (
+            "all_completed_schedule_matches+non_opta_probe_v1"
+        ),
+        "probe_sample_size": PROBE_SAMPLE_SIZE,
         "profile_candidate_policy": "all_post_match_frozen_roster_players",
         "parser_version": PARSER_VERSION,
         "availability_version": MATCH_AVAILABILITY_VERSION,
@@ -706,6 +713,7 @@ class WhoScoredBackfillState:
         if kind == "schedule":
             if set(outcome) != {
                 "candidate_game_ids",
+                "non_opta_game_ids",
                 "preview_game_ids",
                 "source_stage_ids",
                 "source_request_attempts",
@@ -716,6 +724,13 @@ class WhoScoredBackfillState:
             candidate_ids = cls._int_ids(
                 outcome["candidate_game_ids"], field="candidate_game_ids"
             )
+            non_opta_ids = cls._int_ids(
+                outcome["non_opta_game_ids"], field="non_opta_game_ids"
+            )
+            if not set(non_opta_ids) <= set(candidate_ids):
+                raise WhoScoredOpsStoreError(
+                    "non_opta_game_ids must be completed candidate_game_ids"
+                )
             preview_ids = cls._int_ids(
                 outcome["preview_game_ids"], field="preview_game_ids"
             )
@@ -745,6 +760,53 @@ class WhoScoredBackfillState:
             ):
                 raise WhoScoredOpsStoreError(
                     "schedule receipt request-unit accounting is invalid"
+                )
+        elif kind == "probe":
+            if set(outcome) != {
+                "game_ids",
+                "not_available_game_ids",
+                "known_data_game_ids",
+                "deferred_game_ids",
+            }:
+                raise WhoScoredOpsStoreError("invalid probe receipt outcome schema")
+            game_ids = cls._int_ids(
+                outcome["game_ids"],
+                field="game_ids",
+                maximum=PROBE_SAMPLE_SIZE,
+            )
+            if game_ids != work_item["game_ids"]:
+                raise WhoScoredOpsStoreError("probe receipt outcome identity mismatch")
+            not_available_ids = cls._int_ids(
+                outcome["not_available_game_ids"], field="not_available_game_ids"
+            )
+            if not set(not_available_ids) <= set(game_ids):
+                raise WhoScoredOpsStoreError(
+                    "not_available_game_ids must be probed game_ids"
+                )
+            known_data_ids = cls._int_ids(
+                outcome["known_data_game_ids"], field="known_data_game_ids"
+            )
+            if not set(known_data_ids) <= (
+                set(work_item["candidate_game_ids"]) - set(game_ids)
+            ):
+                raise WhoScoredOpsStoreError(
+                    "known_data_game_ids must be non-probed candidates"
+                )
+            deferred_ids = cls._int_ids(
+                outcome["deferred_game_ids"], field="deferred_game_ids"
+            )
+            # Deferral must never lose a candidate: only a scope where every
+            # probe verdict is not_available AND no other candidate already
+            # carries manifest evidence of data defers exactly candidates
+            # minus probes; any other combination defers nothing at all.
+            expected_deferred = (
+                sorted(set(work_item["candidate_game_ids"]) - set(game_ids))
+                if not_available_ids == game_ids and not known_data_ids
+                else []
+            )
+            if deferred_ids != expected_deferred:
+                raise WhoScoredOpsStoreError(
+                    "probe receipt deferral must preserve every frozen candidate"
                 )
         elif kind == "roster":
             if set(outcome) != {"profile_player_ids"}:
@@ -1060,6 +1122,8 @@ class WhoScoredBackfillState:
             return expected
         if kind == "roster":
             return ROSTER_REQUEST_UNITS
+        if kind == "probe":
+            return len(item.get("game_ids", [])) * MATCH_REQUEST_UNITS_PER_GAME
         if kind == "matches":
             game_ids = item.get("game_ids", [])
             preview_game_ids = item.get("preview_game_ids", [])
@@ -1070,6 +1134,65 @@ class WhoScoredBackfillState:
         if kind == "profiles":
             return len(item.get("player_ids", [])) * PROFILE_REQUESTS_PER_PLAYER
         raise WhoScoredOpsStoreError(f"unknown work item kind: {kind!r}")
+
+    @staticmethod
+    def _probe_game_ids(candidate_game_ids: list[int]) -> list[int]:
+        """Pick evenly spread probes over the sorted freeze (first and last
+        for two).  A first-N prefix would systematically sample the earliest
+        cup rounds — exactly where stubs concentrate — and could defer a
+        scope whose later rounds carry real data.
+        """
+
+        count = min(PROBE_SAMPLE_SIZE, len(candidate_game_ids))
+        if count <= 1:
+            return list(candidate_game_ids[:count])
+        last_index = len(candidate_game_ids) - 1
+        indexes = sorted(
+            {(step * last_index) // (count - 1) for step in range(count)}
+        )
+        return [candidate_game_ids[index] for index in indexes]
+
+    @staticmethod
+    def _probe_work(scope: str, candidate_game_ids: list[int]) -> dict[str, Any]:
+        game_ids = WhoScoredBackfillState._probe_game_ids(candidate_game_ids)
+        encoded = (
+            ",".join(str(item) for item in game_ids)
+            + "|"
+            + ",".join(str(item) for item in candidate_game_ids)
+        )
+        digest = hashlib.sha256(encoded.encode("ascii")).hexdigest()[:12]
+        return {
+            "work_id": f"probe-{_scope_digest(scope)}-{digest}",
+            "kind": "probe",
+            "scope": scope,
+            "game_ids": game_ids,
+            "candidate_game_ids": list(candidate_game_ids),
+        }
+
+    @classmethod
+    def _probe_work_from_schedule(
+        cls,
+        plan: Mapping[str, Any],
+        scope: str,
+        schedule_outcome: Mapping[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        """Derive the probe stage for an all-non-Opta frozen scope, or None.
+
+        ``match_is_opta`` is metadata, not an availability gate (the schedule
+        flag lies in both directions), so no candidate is ever filtered on it.
+        The probe fetches real matches and only their source-owned manifest
+        verdicts decide the deferral.  Explicit game_id selectors demanded the
+        exact frozen set, so they never probe.
+        """
+
+        if plan.get("selector", {}).get("game_ids"):
+            return None
+        candidate_game_ids = list(schedule_outcome["candidate_game_ids"])
+        if not candidate_game_ids:
+            return None
+        if schedule_outcome["non_opta_game_ids"] != candidate_game_ids:
+            return None
+        return cls._probe_work(scope, candidate_game_ids)
 
     @staticmethod
     def _match_work(
@@ -1127,6 +1250,19 @@ class WhoScoredBackfillState:
             expected = WhoScoredBackfillState._schedule_work(plan, scope)
         elif kind == "roster":
             expected = WhoScoredBackfillState._roster_work(scope)
+        elif kind == "probe":
+            candidate_game_ids = item.get("candidate_game_ids")
+            if (
+                not isinstance(candidate_game_ids, list)
+                or not candidate_game_ids
+                or any(
+                    type(value) is not int or value <= 0
+                    for value in candidate_game_ids
+                )
+                or candidate_game_ids != sorted(set(candidate_game_ids))
+            ):
+                raise WhoScoredOpsStoreError("invalid probe work item")
+            expected = WhoScoredBackfillState._probe_work(scope, candidate_game_ids)
         elif kind == "matches":
             game_ids = item.get("game_ids")
             preview_game_ids = item.get("preview_game_ids")
@@ -1178,22 +1314,24 @@ class WhoScoredBackfillState:
                 f"work item identity mismatch: {item.get('work_id')!r}"
             )
 
-    def _pending_work_from_completion(
+    def _campaign_source_work(
         self,
         plan: Mapping[str, Any],
-        completed: set[str],
         earliest: Mapping[str, Mapping[str, Any]],
-        *,
-        limit: int,
-    ) -> list[dict[str, Any]]:
-        schedules = [self._schedule_work(plan, scope) for scope in plan["scopes"]]
-        pending_schedules = [
-            item for item in schedules if item["work_id"] not in completed
-        ]
-        result = pending_schedules[:limit]
-        if len(result) >= limit:
-            return result
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        """Derive probe and match work deterministically from frozen receipts.
 
+        The branch is a pure function of receipt contents so every plan resume
+        re-derives byte-identical work items: an all-non-Opta scope probes
+        first, and its match chunks stay undecidable until the probe receipt
+        freezes the source-owned verdicts.  The receipt's deferred_game_ids is
+        the single source of truth: non-empty (all probes not_available and no
+        manifest evidence of data behind any other candidate) shrinks the
+        chunked set to the probes themselves; empty chunks every candidate.
+        """
+
+        schedules = [self._schedule_work(plan, scope) for scope in plan["scopes"]]
+        probe_work: list[dict[str, Any]] = []
         match_work: list[dict[str, Any]] = []
         for schedule in schedules:
             receipt = earliest.get(schedule["work_id"])
@@ -1201,6 +1339,18 @@ class WhoScoredBackfillState:
                 continue
             game_ids = receipt["outcome"]["candidate_game_ids"]
             preview_ids = set(receipt["outcome"]["preview_game_ids"])
+            probe = self._probe_work_from_schedule(
+                plan,
+                str(schedule["scope"]),
+                receipt["outcome"],
+            )
+            if probe is not None:
+                probe_work.append(probe)
+                probe_receipt = earliest.get(probe["work_id"])
+                if probe_receipt is None:
+                    continue
+                if probe_receipt["outcome"]["deferred_game_ids"]:
+                    game_ids = probe["game_ids"]
             chunks = [
                 game_ids[index : index + MATCH_CHUNK_SIZE]
                 for index in range(0, len(game_ids), MATCH_CHUNK_SIZE)
@@ -1214,6 +1364,33 @@ class WhoScoredBackfillState:
                 )
                 for ordinal, chunk in enumerate(chunks)
             )
+        return schedules, probe_work, match_work
+
+    def _pending_work_from_completion(
+        self,
+        plan: Mapping[str, Any],
+        completed: set[str],
+        earliest: Mapping[str, Mapping[str, Any]],
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        schedules, probe_work, match_work = self._campaign_source_work(
+            plan, earliest
+        )
+        pending_schedules = [
+            item for item in schedules if item["work_id"] not in completed
+        ]
+        result = pending_schedules[:limit]
+        if len(result) >= limit:
+            return result
+
+        pending_probes = [
+            item for item in probe_work if item["work_id"] not in completed
+        ]
+        result.extend(pending_probes[: limit - len(result)])
+        if len(result) >= limit:
+            return result
+
         pending_matches = [
             item for item in match_work if item["work_id"] not in completed
         ]
@@ -1226,6 +1403,8 @@ class WhoScoredBackfillState:
         # lineups, substitutions, or preview injury data, so the pre-match
         # roster is not a complete profile population.
         if any(schedule["work_id"] not in completed for schedule in schedules):
+            return result
+        if any(item["work_id"] not in completed for item in probe_work):
             return result
         if any(item["work_id"] not in completed for item in match_work):
             return result
@@ -1290,6 +1469,7 @@ class WhoScoredBackfillState:
             str(value["work_id"]): value
             for value in (
                 *frontier["schedule_receipts"],
+                *frontier["probe_receipts"],
                 *frontier["roster_receipts"],
             )
         }
@@ -1344,32 +1524,15 @@ class WhoScoredBackfillState:
         plan_id = str(plan["plan_id"])
         completed = {str(item["work_id"]) for item in receipts}
         schedule_receipts = [item for item in receipts if item["kind"] == "schedule"]
+        probe_receipts = [item for item in receipts if item["kind"] == "probe"]
         match_receipts = [item for item in receipts if item["kind"] == "matches"]
         profile_receipts = [item for item in receipts if item["kind"] == "profiles"]
         roster_receipts = [item for item in receipts if item["kind"] == "roster"]
         earliest = {str(item["work_id"]): item for item in receipts}
-        schedule_work = [
-            self._schedule_work(plan, scope) for scope in plan["scopes"]
-        ]
+        schedule_work, expected_probe_work, expected_match_work = (
+            self._campaign_source_work(plan, earliest)
+        )
         freeze_complete = all(item["work_id"] in completed for item in schedule_work)
-        expected_match_work: list[dict[str, Any]] = []
-        for schedule in schedule_work:
-            receipt = earliest.get(schedule["work_id"])
-            if receipt is None:
-                continue
-            game_ids = receipt["outcome"]["candidate_game_ids"]
-            preview_ids = set(receipt["outcome"]["preview_game_ids"])
-            expected_match_work.extend(
-                self._match_work(
-                    schedule["scope"],
-                    game_ids[index : index + MATCH_CHUNK_SIZE],
-                    sorted(
-                        preview_ids & set(game_ids[index : index + MATCH_CHUNK_SIZE])
-                    ),
-                    index // MATCH_CHUNK_SIZE,
-                )
-                for index in range(0, len(game_ids), MATCH_CHUNK_SIZE)
-            )
         expected_profile_work: list[dict[str, Any]] = []
         expected_roster_work = (
             [self._roster_work(scope) for scope in plan["scopes"]]
@@ -1402,6 +1565,7 @@ class WhoScoredBackfillState:
             item["work_id"]
             for item in (
                 *schedule_work,
+                *expected_probe_work,
                 *expected_match_work,
                 *expected_roster_work,
                 *expected_profile_work,
@@ -1412,6 +1576,7 @@ class WhoScoredBackfillState:
             str(item["work_id"]): item
             for item in (
                 *schedule_work,
+                *expected_probe_work,
                 *expected_match_work,
                 *expected_roster_work,
                 *expected_profile_work,
@@ -1470,6 +1635,9 @@ class WhoScoredBackfillState:
             "completed_schedules": len(
                 {str(item["scope"]) for item in schedule_receipts}
             ),
+            "completed_probes": len(
+                {str(item["work_id"]) for item in probe_receipts}
+            ),
             "completed_match_chunks": len(
                 {str(item["work_id"]) for item in match_receipts}
             ),
@@ -1525,33 +1693,16 @@ class WhoScoredBackfillState:
         completed = set(frontier["completed_work_ids"])
         by_kind = frontier["completed_by_kind"]
         schedule_receipts = frontier["schedule_receipts"]
+        probe_receipts = frontier["probe_receipts"]
         roster_receipts = frontier["roster_receipts"]
         earliest = {
             str(value["work_id"]): value
-            for value in (*schedule_receipts, *roster_receipts)
+            for value in (*schedule_receipts, *probe_receipts, *roster_receipts)
         }
-        schedule_work = [
-            self._schedule_work(plan, scope) for scope in plan["scopes"]
-        ]
+        schedule_work, expected_probe_work, expected_match_work = (
+            self._campaign_source_work(plan, earliest)
+        )
         freeze_complete = all(item["work_id"] in completed for item in schedule_work)
-        expected_match_work: list[dict[str, Any]] = []
-        for schedule in schedule_work:
-            receipt = earliest.get(schedule["work_id"])
-            if receipt is None:
-                continue
-            game_ids = receipt["outcome"]["candidate_game_ids"]
-            preview_ids = set(receipt["outcome"]["preview_game_ids"])
-            expected_match_work.extend(
-                self._match_work(
-                    schedule["scope"],
-                    game_ids[index : index + MATCH_CHUNK_SIZE],
-                    sorted(
-                        preview_ids & set(game_ids[index : index + MATCH_CHUNK_SIZE])
-                    ),
-                    index // MATCH_CHUNK_SIZE,
-                )
-                for index in range(0, len(game_ids), MATCH_CHUNK_SIZE)
-            )
         expected_roster_work = (
             [self._roster_work(scope) for scope in plan["scopes"]]
             if freeze_complete
@@ -1584,6 +1735,7 @@ class WhoScoredBackfillState:
             str(item["work_id"]): item
             for item in (
                 *schedule_work,
+                *expected_probe_work,
                 *expected_match_work,
                 *expected_roster_work,
                 *expected_profile_work,
@@ -1631,6 +1783,7 @@ class WhoScoredBackfillState:
             "status": status,
             "scopes": schedule_count,
             "completed_schedules": int(by_kind["schedule"]),
+            "completed_probes": int(by_kind["probe"]),
             "completed_match_chunks": int(by_kind["matches"]),
             "completed_roster_freezes": int(by_kind["roster"]),
             "completed_profile_chunks": int(by_kind["profiles"]),
@@ -1712,11 +1865,13 @@ class WhoScoredBackfillState:
             "completed_work_ids": [],
             "completed_by_kind": {
                 "schedule": 0,
+                "probe": 0,
                 "matches": 0,
                 "roster": 0,
                 "profiles": 0,
             },
             "schedule_receipts": [],
+            "probe_receipts": [],
             "roster_receipts": [],
             "completed_profile_players": 0,
             "estimated_completed_request_units": 0,
@@ -1765,16 +1920,18 @@ class WhoScoredBackfillState:
         completed = frontier.get("completed_work_ids")
         by_kind = frontier.get("completed_by_kind")
         schedule_values = frontier.get("schedule_receipts")
+        probe_values = frontier.get("probe_receipts")
         roster_values = frontier.get("roster_receipts")
         if (
             not isinstance(completed, list)
             or any(not isinstance(value, str) for value in completed)
             or completed != sorted(set(completed))
             or not isinstance(by_kind, dict)
-            or set(by_kind) != {"schedule", "matches", "roster", "profiles"}
+            or set(by_kind) != {"schedule", "probe", "matches", "roster", "profiles"}
             or any(type(value) is not int or value < 0 for value in by_kind.values())
             or sum(by_kind.values()) != len(completed)
             or not isinstance(schedule_values, list)
+            or not isinstance(probe_values, list)
             or not isinstance(roster_values, list)
         ):
             raise WhoScoredOpsStoreError("invalid compact frontier identity")
@@ -1784,11 +1941,19 @@ class WhoScoredBackfillState:
             self._validate_frontier_receipt(value, plan=plan, kind="schedule")
             for value in schedule_values
         ]
+        probes = [
+            self._validate_frontier_receipt(value, plan=plan, kind="probe")
+            for value in probe_values
+        ]
         rosters = [
             self._validate_frontier_receipt(value, plan=plan, kind="roster")
             for value in roster_values
         ]
-        for name, values in (("schedule", schedules), ("roster", rosters)):
+        for name, values in (
+            ("schedule", schedules),
+            ("probe", probes),
+            ("roster", rosters),
+        ):
             ids = [str(value["work_id"]) for value in values]
             scopes = [str(value["scope"]) for value in values]
             if (
@@ -1824,6 +1989,7 @@ class WhoScoredBackfillState:
             "completed_work_ids": list(completed),
             "completed_by_kind": {name: int(by_kind[name]) for name in sorted(by_kind)},
             "schedule_receipts": schedules,
+            "probe_receipts": probes,
             "roster_receipts": rosters,
             "completed_profile_players": int(
                 frontier["completed_profile_players"]
@@ -1867,6 +2033,9 @@ class WhoScoredBackfillState:
         schedules = {
             str(value["work_id"]): value for value in selected["schedule_receipts"]
         }
+        probes = {
+            str(value["work_id"]): value for value in selected["probe_receipts"]
+        }
         rosters = {
             str(value["work_id"]): value for value in selected["roster_receipts"]
         }
@@ -1892,6 +2061,8 @@ class WhoScoredBackfillState:
                     len(receipt["outcome"]["source_stage_ids"])
                     != len(receipt["work_item"]["catalog_stage_ids"])
                 )
+            elif kind == "probe":
+                probes[work_id] = self._compact_frontier_receipt(receipt)
             elif kind == "roster":
                 rosters[work_id] = self._compact_frontier_receipt(receipt)
             elif kind == "profiles":
@@ -1904,6 +2075,9 @@ class WhoScoredBackfillState:
             "completed_by_kind": by_kind,
             "schedule_receipts": sorted(
                 schedules.values(), key=lambda value: str(value["work_id"])
+            ),
+            "probe_receipts": sorted(
+                probes.values(), key=lambda value: str(value["work_id"])
             ),
             "roster_receipts": sorted(
                 rosters.values(), key=lambda value: str(value["work_id"])

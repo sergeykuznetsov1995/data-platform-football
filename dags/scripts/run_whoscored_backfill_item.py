@@ -148,12 +148,16 @@ def _airflow_identity() -> dict[str, Any]:
     }
 
 
-def _operation_args(*, game_ids: Optional[list[int]] = None) -> SimpleNamespace:
+def _operation_args(
+    *,
+    game_ids: Optional[list[int]] = None,
+    historical_replay: bool = True,
+) -> SimpleNamespace:
     return SimpleNamespace(
         command="backfill",
         _match_ids=game_ids,
         _force_replay=True,
-        _historical_replay=True,
+        _historical_replay=historical_replay,
         max_matches=None,
         profiles_limit=200,
     )
@@ -176,7 +180,14 @@ def _filtered_candidates(
     service: Any,
     plan: Mapping[str, Any],
     scope: runner.RunnerScope,
-) -> list[int]:
+) -> tuple[list[int], list[int]]:
+    """Freeze the candidate set together with its schedule non-Opta flags.
+
+    The flag is metadata, not an availability gate, so it never filters a
+    candidate here; it only lets the plan decide whether the scope earns a
+    probe stage before its match chunks.
+    """
+
     selector = plan.get("selector", {})
     requested_ids = selector.get("game_ids") or None
     candidates = service.repository.list_completed_match_candidates(
@@ -187,6 +198,7 @@ def _filtered_candidates(
     date_from = selector.get("date_from")
     date_to = selector.get("date_to")
     result: list[int] = []
+    non_opta: list[int] = []
     for candidate in candidates:
         if candidate.kickoff is None and (date_from or date_to):
             continue
@@ -198,7 +210,10 @@ def _filtered_candidates(
         if date_to and kickoff_date and kickoff_date > str(date_to):
             continue
         result.append(int(candidate.game_id))
+        if not candidate.match_is_opta:
+            non_opta.append(int(candidate.game_id))
     frozen = sorted(set(result))
+    frozen_non_opta = sorted(set(non_opta))
     if requested_ids is not None:
         requested = sorted({int(value) for value in requested_ids})
         missing = sorted(set(requested) - set(frozen))
@@ -210,7 +225,67 @@ def _filtered_candidates(
             raise WhoScoredOpsStoreError(
                 f"explicit game_ids did not freeze exactly in {scope.spec}"
             )
-    return frozen
+    return frozen, frozen_non_opta
+
+
+def _probe_outcome(
+    service: Any,
+    scope: runner.RunnerScope,
+    item: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Freeze the source-owned probe verdicts into the receipt outcome.
+
+    The immutable plan must branch identically on every resume, so the
+    manifest verdicts are read once, right after the probe fetch, and live in
+    the content-addressed receipt instead of a mutable re-read.  The read
+    covers the whole frozen candidate set: earlier campaigns or replays may
+    already have proven real data behind non-probe candidates (committed
+    success), and that evidence vetoes the deferral without a single extra
+    fetch.  Deferred ids are only recorded here; no synthetic manifest
+    verdict is ever written for them.
+    """
+
+    game_ids = [int(value) for value in item["game_ids"]]
+    candidate_game_ids = [int(value) for value in item["candidate_game_ids"]]
+    states = service.repository.list_match_ingest_states(
+        scope.competition_id,
+        scope.season_id,
+        match_ids=candidate_game_ids,
+    )
+    missing = sorted(set(game_ids) - set(states))
+    if missing:
+        raise WhoScoredOpsStoreError(
+            f"probe game_ids have no ingest manifest verdict: {missing}"
+        )
+    not_available = sorted(
+        game_id
+        for game_id in game_ids
+        if str(states[game_id]) == "not_available"
+    )
+    # Only a committed success proves the source served real match data.
+    # parse_failed does not: the classifier writes it for any CONTENT
+    # failure without the two-marker not-available proof, including shell
+    # pages carrying no data at all (#1101 family) — and a genuinely
+    # malformed match is not being collected today either way, so deferring
+    # it loses nothing while the probes' bounded cache TTL keeps a path to
+    # reconsider.  retryable/terminal or a missing row prove nothing.
+    known_data = sorted(
+        game_id
+        for game_id in candidate_game_ids
+        if game_id not in set(game_ids)
+        and str(states.get(game_id, "")) == "success"
+    )
+    deferred = (
+        sorted(set(candidate_game_ids) - set(game_ids))
+        if not_available == game_ids and not known_data
+        else []
+    )
+    return {
+        "game_ids": game_ids,
+        "not_available_game_ids": not_available,
+        "known_data_game_ids": known_data,
+        "deferred_game_ids": deferred,
+    }
 
 
 def _frozen_profile_ids(service: Any) -> list[int]:
@@ -389,17 +464,41 @@ def _run_work_item(
                         report, record, scope, "schedule", result
                     )
                     if not record["errors"]:
-                        candidate_game_ids = _filtered_candidates(
+                        candidate_game_ids, non_opta_game_ids = _filtered_candidates(
                             service,
                             plan,
                             scope,
                         )
                         outcome["candidate_game_ids"] = candidate_game_ids
+                        outcome["non_opta_game_ids"] = non_opta_game_ids
                         outcome["preview_game_ids"] = _frozen_preview_ids(
                             service,
                             scope,
                             candidate_game_ids,
                         )
+                elif item["kind"] == "probe":
+                    # Probe matches travel the exact sync_matches path, so
+                    # their manifest verdicts carry the same raw-proof
+                    # guarantees as any other frozen match chunk.  Unlike the
+                    # chunks, a probe must notice a source that published
+                    # data later: historical_replay=False refreshes its raw
+                    # evidence after MATCH_REFRESH_DAYS instead of reparsing
+                    # a cached stub forever.
+                    args = _operation_args(
+                        game_ids=list(item["game_ids"]),
+                        historical_replay=False,
+                    )
+                    result = runner._invoke(service, "matches", args)
+                    runner._merge_result(report, result, scope_record=record)
+                    runner._record_result_state(
+                        report, record, scope, "probe", result
+                    )
+                    if int(getattr(result, "attempted", -1)) != len(item["game_ids"]):
+                        raise WhoScoredOpsStoreError(
+                            "frozen probe work did not attempt every game_id"
+                        )
+                    if not record["errors"]:
+                        outcome.update(_probe_outcome(service, scope, item))
                 elif item["kind"] == "matches":
                     args = _operation_args(game_ids=list(item["game_ids"]))
                     result = runner._invoke(service, "matches", args)
