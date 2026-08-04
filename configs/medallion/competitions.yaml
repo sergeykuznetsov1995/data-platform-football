@@ -502,12 +502,185 @@ competitions:
     name: "Dutch Eredivisie"
     country: "Netherlands"
     tier: 1
-    seasons: []
+    seasons:
+      # #1090 волна 2: даты типовые (август -> май), уточняются при первом сборе.
+      - id: 2526
+        format: "league_round_robin"
+        team_count: 18
+        start: "2025-08-08"
+        end: "2026-05-17"
+      - id: 2627
+        format: "league_round_robin"
+        team_count: 18
+        start: "2026-08-07"
+        end: "2027-05-23"
     sources:
       primary: []
-      fallback: []
+      fallback:
+        - "sofascore"
     in_scope: false
-    notes: "stub for E8b (Top-5 sister league — Understat covers it)"
+    notes: "#1090 волна 2: onboarded for SofaScore Bronze capture (была stub E8b — Understat покрывает Top-5 sister); not in Gold spine"
+
+  - id: "POR-Liga Portugal"
+    name: "Liga Portugal Betclic"
+    country: "Portugal"
+    tier: 1
+    seasons:
+      # #1090 волна 2: даты типовые (август -> май), уточняются при первом сборе.
+      - id: 2526
+        format: "league_round_robin"
+        team_count: 18
+        start: "2025-08-08"
+        end: "2026-05-17"
+      - id: 2627
+        format: "league_round_robin"
+        team_count: 18
+        start: "2026-08-07"
+        end: "2027-05-23"
+    sources:
+      primary: []
+      fallback:
+        - "sofascore"
+    in_scope: false
+    notes: "#1090 волна 2: onboarded for SofaScore Bronze capture; not in Gold spine"
+
+  - id: "TUR-Süper Lig"
+    name: "Turkish Süper Lig"
+    country: "Turkey"
+    tier: 1
+    seasons:
+      # #1090 волна 2: даты типовые (август -> май/июнь), уточняются при первом сборе.
+      - id: 2526
+        format: "league_round_robin"
+        team_count: 18
+        start: "2025-08-08"
+        end: "2026-05-31"
+      - id: 2627
+        format: "league_round_robin"
+        team_count: 18
+        start: "2026-08-07"
+        end: "2027-05-30"
+    sources:
+      primary: []
+      fallback:
+        - "sofascore"
+    in_scope: false
+    notes: "#1090 волна 2: onboarded for SofaScore Bronze capture; not in Gold spine"
+
+  - id: "BEL-Pro League"
+    name: "Belgian Pro League"
+    country: "Belgium"
+    tier: 1
+    seasons:
+      # #1090 волна 2: даты типовые (июль -> май, включая плей-офф), уточняются при первом сборе.
+      - id: 2526
+        format: "league_round_robin"
+        team_count: 16
+        start: "2025-07-25"
+        end: "2026-05-31"
+      - id: 2627
+        format: "league_round_robin"
+        team_count: 16
+        start: "2026-07-24"
+        end: "2027-05-30"
+    sources:
+      primary: []
+      fallback:
+        - "sofascore"
+    in_scope: false
+    notes: "#1090 волна 2: onboarded for SofaScore Bronze capture; not in Gold spine"
+
+  - id: "GER-2. Bundesliga"
+    name: "German 2. Bundesliga"
+    country: "Germany"
+    tier: 2
+    seasons:
+      # #1090 волна 2: даты типовые (август -> май), уточняются при первом сборе.
+      - id: 2526
+        format: "league_round_robin"
+        team_count: 18
+        start: "2025-08-01"
+        end: "2026-05-17"
+      - id: 2627
+        format: "league_round_robin"
+        team_count: 18
+        start: "2026-07-31"
+        end: "2027-05-23"
+    sources:
+      primary: []
+      fallback:
+        - "sofascore"
+    in_scope: false
+    notes: "#1090 волна 2: onboarded for SofaScore Bronze capture; not in Gold spine"
+
+  - id: "ITA-Serie B"
+    name: "Italian Serie B"
+    country: "Italy"
+    tier: 2
+    seasons:
+      # #1090 волна 2: даты типовые (август -> май/июнь с плей-офф), уточняются при первом сборе.
+      - id: 2526
+        format: "league_round_robin"
+        team_count: 20
+        start: "2025-08-22"
+        end: "2026-06-10"
+      - id: 2627
+        format: "league_round_robin"
+        team_count: 20
+        start: "2026-08-21"
+        end: "2027-06-10"
+    sources:
+      primary: []
+      fallback:
+        - "sofascore"
+    in_scope: false
+    notes: "#1090 волна 2: onboarded for SofaScore Bronze capture; not in Gold spine"
+
+  - id: "FRA-Ligue 2"
+    name: "French Ligue 2"
+    country: "France"
+    tier: 2
+    seasons:
+      # #1090 волна 2: даты типовые (август -> май), уточняются при первом сборе.
+      - id: 2526
+        format: "league_round_robin"
+        team_count: 18
+        start: "2025-08-08"
+        end: "2026-05-16"
+      - id: 2627
+        format: "league_round_robin"
+        team_count: 18
+        start: "2026-08-07"
+        end: "2027-05-22"
+    sources:
+      primary: []
+      fallback:
+        - "sofascore"
+    in_scope: false
+    notes: "#1090 волна 2: onboarded for SofaScore Bronze capture; not in Gold spine"
+
+  - id: "POL-Ekstraklasa"
+    name: "Polish Ekstraklasa"
+    country: "Poland"
+    tier: 1
+    seasons:
+      # #1090 волна 2: даты типовые (июль -> май), уточняются при первом сборе.
+      - id: 2526
+        format: "league_round_robin"
+        team_count: 18
+        start: "2025-07-18"
+        end: "2026-05-24"
+      - id: 2627
+        format: "league_round_robin"
+        team_count: 18
+        start: "2026-07-17"
+        end: "2027-05-23"
+    sources:
+      primary: []
+      fallback:
+        - "sofascore"
+    in_scope: false
+    notes: "#1090 волна 2: onboarded for SofaScore Bronze capture; not in Gold spine"
 
   - id: "UEFA-Europa League"
     name: "UEFA Europa League"
