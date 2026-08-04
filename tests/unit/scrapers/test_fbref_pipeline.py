@@ -3203,6 +3203,101 @@ def test_validation_fails_closed_on_partial_target_state(tmp_path):
     assert "finish:False" not in control.events
 
 
+def test_validation_treats_failed_targets_as_returned_to_queue(tmp_path):
+    """Mirror of the wave gate for #1102: a terminally failed target is the
+    frontier's problem now, not this run's — validation must not brand the
+    resumed run incomplete over it. Traffic gates still police run quality."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    base_summary = control.get_run_summary(str(uuid.uuid4()))
+    control.get_run_summary = lambda _, **__: {
+        **base_summary,
+        "target_counts": {"succeeded": 1, "failed": 1},
+        "traffic_totals": {"warm_http_success_rate": 1.0},
+    }
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:True" in control.events
+
+
+def test_lone_validate_clear_reanimates_before_finishing_green(tmp_path):
+    """Clearing only the validate task never re-runs the waves; when the
+    gates pass on a 'failed' run, validation itself must reanimate before
+    finish_run, or the resume dies on StateConflict (#1102)."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.run["status"] = "failed"
+    captured = {}
+
+    def start_run(run_id, **kwargs):
+        control.events.append("start_run")
+        captured.update(kwargs)
+        control.run["status"] = "running"
+
+    control.start_run = start_run
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "start_run" in control.events
+    assert "finish:True" in control.events
+    # The run is finishing right now — reopened 'retry' targets would linger
+    # in a succeeded run forever.
+    assert captured == {"reopen_targets": False}
+
+
+def test_run_live_waves_reanimates_a_failed_run_before_the_first_wave(
+    tmp_path,
+):
+    """``airflow tasks clear -t run_live_waves`` re-runs only this task,
+    never initialize_run, so the waves themselves must reanimate the aborted
+    control run (#1102)."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.run["status"] = "failed"
+
+    def start_run(run_id):
+        control.events.append("start_run")
+        control.run["status"] = "running"
+
+    control.start_run = start_run
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    pipeline.fetch_wave = lambda *a, **k: WaveResult()
+    pipeline.parse_wave = lambda *a, **k: WaveResult()
+
+    pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="resume-live",
+        page_kinds=["competition_index"],
+        settings=_settings(),
+    )
+
+    assert "start_run" in control.events
+
+
+def test_run_live_waves_does_not_touch_a_healthy_run(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.run["status"] = "running"
+
+    def start_run(run_id):
+        raise AssertionError("healthy runs must not be restarted mid-flight")
+
+    control.start_run = start_run
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    pipeline.fetch_wave = lambda *a, **k: WaveResult()
+    pipeline.parse_wave = lambda *a, **k: WaveResult()
+
+    pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="resume-live",
+        page_kinds=["competition_index"],
+        settings=_settings(),
+    )
+
+
 def test_validation_accepts_complete_eligible_sentinel_coverage(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
@@ -5440,6 +5535,71 @@ def test_a_wave_after_the_budget_stop_no_ops_instead_of_raising(tmp_path):
 
     assert result.claimed == 0
     assert result.failures == []
+
+
+def test_a_resumed_run_with_terminally_failed_targets_no_ops_instead_of_deadlocking(
+    tmp_path,
+):
+    """A 'failed' target is terminal for its run: it is not claimable and can
+    never re-enter this run's cohort, while the page itself is already back in
+    the frontier for later runs. Counting it as unfinished deadlocked every
+    resumed run on the same FetchWaveError forever (#1102)."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.claim_targets = lambda *args, **kwargs: []
+    control.create_due_run_cohort = lambda *args, **kwargs: []
+    control.get_run_summary = lambda *args, **kwargs: {
+        "target_counts": {"succeeded": 29, "skipped": 20, "failed": 1},
+    }
+
+    def forbidden(*_):
+        raise AssertionError("no fetcher for an empty wave")
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=forbidden,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="worker-1",
+        page_kinds=["competition"],
+        settings=_settings(),
+    )
+
+    assert result.claimed == 0
+    assert result.failures == []
+
+
+def test_a_wave_with_claimable_backlog_still_raises_the_unfinished_gate(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.claim_targets = lambda *args, **kwargs: []
+    control.create_due_run_cohort = lambda *args, **kwargs: []
+    control.get_run_summary = lambda *args, **kwargs: {
+        "target_counts": {"succeeded": 1, "pending": 2, "leased": 1},
+    }
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError, match="3 unfinished"):
+        pipeline.fetch_wave(
+            str(uuid.UUID(int=1)),
+            worker_id="worker-1",
+            page_kinds=["competition"],
+            settings=_settings(),
+        )
 
 
 def test_the_bootstrap_allowance_follows_the_run_budget_everywhere():
