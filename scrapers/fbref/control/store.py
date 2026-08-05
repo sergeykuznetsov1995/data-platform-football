@@ -3493,6 +3493,7 @@ class ControlStore:
                     %s, %s, %s, %s, %s, %s, %s, %s::jsonb
                 )
                 ON CONFLICT (source, competition_id, alias) DO UPDATE SET
+                    season_id = EXCLUDED.season_id,
                     alias_kind = EXCLUDED.alias_kind,
                     last_snapshot_id = COALESCE(
                         EXCLUDED.last_snapshot_id,
@@ -3500,7 +3501,16 @@ class ControlStore:
                     ),
                     metadata = EXCLUDED.metadata,
                     last_seen_at = clock_timestamp()
+                -- A display label is a shop window, not an identity: FBref
+                -- reuses one label across editions, so a season rollover
+                -- legitimately hands it to the incoming season.  Rebinding a
+                -- label is therefore allowed -- refusing it would abort the
+                -- parse of the whole competition.  Every other kind stays
+                -- fail-closed: a 'source' token is the season's own id, and
+                -- letting a label steal it would silently re-scope the targets
+                -- of the season that owns it.
                 WHERE fbref_control.season_alias.season_id = EXCLUDED.season_id
+                   OR fbref_control.season_alias.alias_kind = 'label'
                 RETURNING season_id
                 """,
                 (

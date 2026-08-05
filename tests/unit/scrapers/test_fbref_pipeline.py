@@ -631,7 +631,13 @@ class FakeControl:
     def upsert_season_alias(self, alias, *, snapshot_id=None):
         key = (alias.source, alias.competition_id, alias.alias)
         previous = self.season_aliases.get(key)
-        if previous is not None and previous[0].season_id != alias.season_id:
+        # A display label follows its season rollover; only an identity token
+        # refuses to be remapped.  Mirrors ControlStore.upsert_season_alias.
+        if (
+            previous is not None
+            and previous[0].season_id != alias.season_id
+            and previous[0].alias_kind != "label"
+        ):
             raise StateConflict(
                 f"Season alias {alias.competition_id}/{alias.alias} "
                 "is already mapped to a different season"

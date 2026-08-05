@@ -17,6 +17,7 @@ from scrapers.fbref.control import (
     CompetitionRegistryEntry,
     ControlStore,
     FrontierTarget,
+    SeasonAlias,
     SeasonRegistryEntry,
     StateConflict,
 )
@@ -550,3 +551,112 @@ def test_a_cross_competition_handover_fails_loudly(
             [_season("2025-2026", shared, current=True)],
             T0 + timedelta(days=1),
         )
+
+
+def _aliases(uri: str) -> dict[str, dict]:
+    return {
+        str(row["alias"]): row
+        for row in _query(
+            uri,
+            """
+            SELECT alias, season_id, alias_kind
+            FROM fbref_control.season_alias
+            WHERE source = 'fbref' AND competition_id = %s
+            """,
+            (COMPETITION,),
+        )
+    }
+
+
+def test_a_display_label_follows_the_rollover_to_the_new_edition(
+    isolated_postgres_uri,  # noqa: F811
+):
+    """FBref reuses one label across editions, so rebinding must succeed."""
+    pytest.importorskip("psycopg2")
+    store = ControlStore(isolated_postgres_uri)
+    _seed_competition(store, T0)
+    first = store.create_registry_snapshot(fetched_at=T0, successful=True)
+    store.reconcile_seasons(
+        first,
+        COMPETITION,
+        [_season("2025-2026", BARE_URL, current=True)],
+    )
+    store.upsert_season_alias(
+        SeasonAlias(
+            competition_id=COMPETITION,
+            alias="2026",
+            season_id="2025-2026",
+            alias_kind="label",
+        ),
+        snapshot_id=first,
+    )
+
+    # The rollover drops the outgoing season from the history table, so the
+    # pipeline guard cannot see the label is already taken.
+    second = store.create_registry_snapshot(
+        fetched_at=T0 + timedelta(days=1),
+        successful=True,
+    )
+    store.reconcile_seasons(
+        second,
+        COMPETITION,
+        [
+            _season("2026-2027", BARE_URL, current=True),
+            _season("2025-2026", DATED_2025),
+        ],
+    )
+    store.upsert_season_alias(
+        SeasonAlias(
+            competition_id=COMPETITION,
+            alias="2026",
+            season_id="2026-2027",
+            alias_kind="label",
+        ),
+        snapshot_id=second,
+    )
+
+    aliases = _aliases(isolated_postgres_uri)
+    assert aliases["2026"]["season_id"] == "2026-2027"
+    assert aliases["2026"]["alias_kind"] == "label"
+
+
+def test_a_source_token_is_never_stolen_by_a_label(
+    isolated_postgres_uri,  # noqa: F811
+):
+    """A source token is the season's own id: rebinding it would re-scope it."""
+    pytest.importorskip("psycopg2")
+    store = ControlStore(isolated_postgres_uri)
+    _seed_competition(store, T0)
+    snapshot = store.create_registry_snapshot(fetched_at=T0, successful=True)
+    store.reconcile_seasons(
+        snapshot,
+        COMPETITION,
+        [
+            _season("2026-2027", BARE_URL, current=True),
+            _season("2025-2026", DATED_2025),
+        ],
+    )
+    store.upsert_season_alias(
+        SeasonAlias(
+            competition_id=COMPETITION,
+            alias="2025-2026",
+            season_id="2025-2026",
+            alias_kind="source",
+        ),
+        snapshot_id=snapshot,
+    )
+
+    with pytest.raises(StateConflict):
+        store.upsert_season_alias(
+            SeasonAlias(
+                competition_id=COMPETITION,
+                alias="2025-2026",
+                season_id="2026-2027",
+                alias_kind="label",
+            ),
+            snapshot_id=snapshot,
+        )
+
+    aliases = _aliases(isolated_postgres_uri)
+    assert aliases["2025-2026"]["season_id"] == "2025-2026"
+    assert aliases["2025-2026"]["alias_kind"] == "source"
