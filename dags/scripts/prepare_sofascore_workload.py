@@ -499,7 +499,13 @@ def prepare_workload_plan(
         registered = set(squad_player_ids(runtime.raw_store, season_plan))
         observed = _observed_player_ids(item.league, canonical)
         universe = tuple(sorted(registered | observed, key=int))
-        if not universe:
+        if not universe and matches:
+            # Finished matches but nobody to capture means the evidence was
+            # lost, and planning past that would hide it. With no finished
+            # match either, the league is simply waiting for its first
+            # matchday (#1109): plan the partition empty and let the runner's
+            # schedule probe decide, the same way the capture phase does. It
+            # still fails closed there when the season is actually running.
             raise RuntimeError(
                 f"{item.league} player universe is empty after squads and matches"
             )

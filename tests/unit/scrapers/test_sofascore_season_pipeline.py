@@ -1633,6 +1633,128 @@ def test_runner_live_player_reports_committed_not_deferred_completeness(
     assert payload["traffic"]["endpoint_completeness"] == 1.0
 
 
+def _signed_plan_without_players():
+    """The signature a league gets while it waits for its first matchday."""
+    return SimpleNamespace(
+        player_universe_ids=(),
+        freshness_key=lambda scope: {
+            "season": FRESHNESS,
+            "match": "final",
+            "player": "fixture-week",
+        }[scope],
+    )
+
+
+def _schedule_probe(count, stale=0):
+    """Fake Trino for the schedule probe: ``stale`` overdue rows of ``count``."""
+
+    def connect():
+        cursor = MagicMock()
+        cursor.fetchone.return_value = (count, stale)
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        return connection
+
+    return connect
+
+
+def _player_capture_with_an_empty_signature(tmp_path, monkeypatch, probe, output_name):
+    from dags.scripts import run_sofascore_scraper as runner
+
+    engine = SimpleNamespace(
+        run_id="scheduled-1::players",
+        metrics=SimpleNamespace(snapshot=lambda: {"paid_proxy_bytes": 0}),
+    )
+    runtime = SimpleNamespace(
+        engine=engine,
+        raw_store=MagicMock(),
+        manifest_store=MagicMock(),
+    )
+    scraper = MagicMock()
+    scraper.__enter__.return_value = scraper
+    scraper.__exit__.return_value = False
+    scraper._resolve_player_ids_from_bronze.return_value = []
+    output = tmp_path / output_name
+    monkeypatch.setattr(
+        runner,
+        "_source_context",
+        lambda *args: (TOURNAMENT_ID, SEASON_ID),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_tournament_canonical_url",
+        lambda *args: "https://www.sofascore.com/tournament/premier-league/17",
+    )
+    monkeypatch.setattr(runner, "_trino_connect", probe)
+
+    with (
+        patch(
+            "scrapers.sofascore.season_pipeline.plan_season_partition",
+            return_value=SimpleNamespace(complete=True),
+        ),
+        patch(
+            "scrapers.sofascore.season_pipeline.squad_player_ids",
+            return_value=(),
+        ),
+        patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper),
+    ):
+        rc = runner._run_player_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=_signed_plan_without_players(),
+            workload_allocations=(),
+            offline_replay=False,
+        )
+
+    return rc, json.loads(output.read_text(encoding="utf-8")), scraper
+
+
+@pytest.mark.unit
+def test_empty_signature_for_an_unstarted_season_captures_nothing_quietly(
+    tmp_path,
+    monkeypatch,
+):
+    """#1109 has to survive the signed plan, which is all production ever uses.
+
+    The planner signs a waiting league with an empty universe on purpose, so
+    an empty signature must reach the schedule probe instead of being read as
+    a broken one.
+    """
+    rc, payload, scraper = _player_capture_with_an_empty_signature(
+        tmp_path,
+        monkeypatch,
+        probe=_schedule_probe(380),
+        output_name="player-signed-unstarted.json",
+    )
+
+    assert rc == 0
+    assert payload["errors"] == []
+    assert payload["fallback_reason"] == "season_has_no_finished_matches"
+    assert payload["traffic"]["request_count"] == 0
+    scraper.save_to_iceberg.assert_not_called()
+
+
+@pytest.mark.unit
+def test_empty_signature_in_a_running_season_still_fails_closed(
+    tmp_path,
+    monkeypatch,
+):
+    """Nobody to capture while matches are overdue means evidence was lost."""
+    rc, payload, scraper = _player_capture_with_an_empty_signature(
+        tmp_path,
+        monkeypatch,
+        probe=_schedule_probe(380, stale=12),
+        output_name="player-signed-running.json",
+    )
+
+    assert rc == 1
+    assert any("player universe is empty" in error for error in payload["errors"])
+    scraper.save_to_iceberg.assert_not_called()
+
+
 @pytest.mark.unit
 def test_runner_refuses_new_local_player_outside_signed_post_match_plan(
     tmp_path,

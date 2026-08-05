@@ -1394,6 +1394,46 @@ class TestValidatePlayerData:
         assert out["status"] == "success"  # low rows are WARN-only, not failed
         assert any("Low player_profile" in w for w in out["warnings"])
 
+    def test_unstarted_season_is_not_judged_on_coverage(
+        self,
+        dag_module,
+        monkeypatch,
+        tmp_path,
+    ):
+        """#1109: a league with no squad yet published never ran a capture.
+
+        Reading its empty universe as 0% coverage reddens the run for the
+        whole rollover, which is exactly what the quiet zero exists to stop.
+        """
+        quiet_zero = {
+            "rows": 0,
+            "profile_players": 0,
+            "fallback": False,
+            "errors": [],
+            "fallback_reason": "season_has_no_finished_matches",
+        }
+        monkeypatch.setattr(
+            dag_module,
+            "_load_result",
+            lambda path, logger: (
+                {
+                    "rows": 500,
+                    "profile_players": 500,
+                    "players_total": 500,
+                    "fallback": False,
+                    "tables": ["t"],
+                    "errors": [],
+                }
+                if path == dag_module.PLAYER_CAPTURE_RESULT_PATH
+                else quiet_zero
+            ),
+        )
+
+        out = dag_module.validate_player_data()
+
+        assert out["status"] == "success"
+        assert not any("below 95%" in warning for warning in out["warnings"])
+
     def test_fallback_with_some_rows_hard_fails(
         self,
         dag_module,
