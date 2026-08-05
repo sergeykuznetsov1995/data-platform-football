@@ -16,7 +16,9 @@ from scrapers.espn.migration import (
     PROMOTION_EVIDENCE_VERSION,
     V4_PROMOTION_EVIDENCE_VERSION,
     apply_promotion,
+    build_rollback_plan,
     load_promotion_evidence,
+    RepositoryMigrationBackend,
 )
 from scrapers.espn.models import DispositionState, IngestPlan, ScopePlan
 from scrapers.espn.parser_contracts import PARSER_VERSION
@@ -125,6 +127,7 @@ def _signed_plan(
     attempt: int,
     as_of: date,
     prior: dict[str, str],
+    ingested_at: datetime | None = None,
 ) -> tuple[dict[str, str], str]:
     binding = {
         "active": False,
@@ -132,9 +135,9 @@ def _signed_plan(
         "scoreboard_max_range_days": runner.SCOREBOARD_MAX_RANGE_DAYS,
         "generation_id": f"qualification-generation-{attempt}",
         "batch_id": hashlib.sha256(f"batch-{attempt}".encode()).hexdigest(),
-        "ingested_at": datetime.combine(as_of, datetime.min.time(), tzinfo=UTC)
-        .isoformat()
-        .replace("+00:00", "Z"),
+        "ingested_at": (
+            ingested_at or datetime.combine(as_of, datetime.min.time(), tzinfo=UTC)
+        ).isoformat(),
         "generation_snapshot_uri": (root / "generation.json").as_uri(),
         "known_nonterminal_events": [],
         "prior": prior,
@@ -189,7 +192,12 @@ def _raw_manifest(
     return {**base, "manifest_sha256": hashlib.sha256(body).hexdigest()}
 
 
-def _v4_evidence(tmp_path: Path, states: tuple[str, str, str]) -> Path:
+def _v4_evidence(
+    tmp_path: Path,
+    states: tuple[str, str, str],
+    *,
+    complete_ingested_at: dict[int, datetime] | None = None,
+) -> Path:
     registry = _frozen_registry()
     assert len(registry.promoted) == 181
     registry_ref = _write(
@@ -241,6 +249,10 @@ def _v4_evidence(tmp_path: Path, states: tuple[str, str, str]) -> Path:
         parent_run_id = f"scheduled__{logical_date.isoformat()}"
         run_id = f"espn_daily__dag_trigger_espn_daily__{parent_run_id}"
         root = tmp_path / f"run-{index}"
+        current_ingested_at = (complete_ingested_at or {}).get(
+            index,
+            datetime.combine(as_of, datetime.min.time(), tzinfo=UTC),
+        )
         plan_ref, plan_signature = _signed_plan(
             root,
             scope=scope,
@@ -250,6 +262,7 @@ def _v4_evidence(tmp_path: Path, states: tuple[str, str, str]) -> Path:
             attempt=index,
             as_of=as_of,
             prior=prior,
+            ingested_at=current_ingested_at,
         )
         if state == "complete":
             physical = replace(
@@ -257,7 +270,7 @@ def _v4_evidence(tmp_path: Path, states: tuple[str, str, str]) -> Path:
                 run_id=run_id,
                 generation_id=f"qualification-generation-{index}",
                 plan_signature=plan_signature,
-                ingested_at=datetime.combine(as_of, datetime.min.time(), tzinfo=UTC),
+                ingested_at=current_ingested_at,
                 batch_id=hashlib.sha256(f"batch-{index}".encode()).hexdigest(),
             )
             snapshot_path = root / "generation.json"
@@ -410,30 +423,48 @@ def _v4_evidence(tmp_path: Path, states: tuple[str, str, str]) -> Path:
             {
                 "kind": "espn-scope-qualification-attestation-v1",
                 "schema_version": 1,
-                "dag_id": "dag_ingest_espn",
-                "run_id": run_id,
-                "attempt": index,
-                "scope_id": scope.scope_id,
-                "state": state,
-                "registry_signature": registry_signature,
-                "plan_signature": plan_signature,
-                "lease_epoch": lease_epoch,
-                "recorded_at": evidence_payload["recorded_at"],
+                "qualification": {
+                    "dag_id": "dag_ingest_espn",
+                    "run_id": run_id,
+                    "attempt": index,
+                    "scope_id": scope.scope_id,
+                    "state": state,
+                    "registry_signature": registry_signature,
+                    "plan_signature": plan_signature,
+                    "recorded_at": evidence_payload["recorded_at"],
+                    "lease": {
+                        "scope_id": scope.scope_id,
+                        "owner_id": f"dag_ingest_espn/{run_id}/{index}",
+                        "plan_signature": plan_signature,
+                        "binding_epoch": lease_epoch,
+                        "evidence_epoch": lease_epoch,
+                        "token_sha256": str(index) * 64,
+                        "acquired_at": (
+                            logical_date - timedelta(minutes=5)
+                        ).isoformat(),
+                        "expires_at": (logical_date + timedelta(hours=1)).isoformat(),
+                    },
+                },
                 "scope_binding_ref": binding_ref,
                 "run_evidence_ref": evidence_ref,
                 "publication_ref": publication_ref,
                 "published_dq_ref": dq_ref,
-                "snapshot_ref": snapshot_ref,
                 "selected_head": selected_head,
                 "physical_generation": {
+                    "dag_id": selected_head["dag_id"],
                     "run_id": physical.run_id,
-                    "plan_signature": physical.plan_signature,
+                    "scope_id": scope.scope_id,
                     "generation_id": physical.generation_id,
                     "generation_signature": physical.generation_signature,
                     "manifest_sha256": physical.manifest_sha256,
+                    "snapshot_ref": snapshot_ref,
+                    "registry_snapshot_ref": registry_ref,
                     "registry_signature": physical.registry_signature,
+                    "plan_signature": physical.plan_signature,
                     "parser_version": physical.parser_version,
                     "runtime_version": physical.runtime_version,
+                    "published_at": selected_head["published_at"],
+                    "completed_at": selected_head["completed_at"],
                 },
             },
         )
@@ -609,6 +640,25 @@ def test_v4_noop_sequences_qualify_against_one_physical_complete(tmp_path, state
     )
 
 
+def test_v4_mixed_complete_head_is_canonically_non_regressing(tmp_path):
+    evidence = load_promotion_evidence(
+        _v4_evidence(tmp_path, ("noop", "complete", "noop"))
+    )
+
+    assert [run.state for run in evidence.green_runs] == ["noop", "complete", "noop"]
+
+
+def test_v4_mixed_older_complete_head_is_rejected(tmp_path):
+    path = _v4_evidence(
+        tmp_path,
+        ("noop", "complete", "noop"),
+        complete_ingested_at={2: datetime(2026, 7, 26, 8, tzinfo=UTC)},
+    )
+
+    with pytest.raises(MigrationError, match="regressed"):
+        load_promotion_evidence(path)
+
+
 def test_same_noop_chain_is_rejected_under_v3(tmp_path):
     path = _v4_evidence(tmp_path, ("noop", "noop", "noop"))
     document = json.loads(path.read_text())
@@ -624,12 +674,12 @@ def test_same_noop_chain_is_rejected_under_v3(tmp_path):
 @pytest.mark.parametrize(
     ("path", "value"),
     [
-        (("run_id",), "tampered-run"),
-        (("attempt",), 99),
-        (("scope_id",), "740:2026"),
-        (("registry_signature",), "1" * 64),
-        (("plan_signature",), "2" * 64),
-        (("state",), "failed"),
+        (("qualification", "run_id"), "tampered-run"),
+        (("qualification", "attempt"), 99),
+        (("qualification", "scope_id"), "740:2026"),
+        (("qualification", "registry_signature"), "1" * 64),
+        (("qualification", "plan_signature"), "2" * 64),
+        (("qualification", "state"), "failed"),
         (("selected_head", "manifest_sha256"), "3" * 64),
         (("physical_generation", "run_id"), "tampered-physical-run"),
         (("physical_generation", "plan_signature"), "4" * 64),
@@ -657,35 +707,64 @@ def test_v4_attestation_tampering_is_rejected(tmp_path, path, value):
 
 
 @pytest.mark.parametrize(
-    ("artifact_key", "path", "value"),
+    ("artifact_kind", "path", "value"),
     [
-        ("scope_binding_ref", ("kind",), "tampered-binding"),
-        ("published_dq_ref", ("current_selection", "run_id"), "tampered-head"),
-        ("published_dq_ref", ("quality", "passed"), False),
-        ("snapshot_ref", ("runtime_version",), "espn-native-runtime-v2"),
+        ("binding", ("kind",), "tampered-binding"),
+        ("dq", ("current_selection", "run_id"), "tampered-head"),
+        ("dq", ("quality", "passed"), False),
+        ("snapshot", ("runtime_version",), "espn-native-runtime-v2"),
     ],
 )
-def test_v4_rejects_tampered_linked_artifact(tmp_path, artifact_key, path, value):
+def test_v4_rejects_rehashed_semantic_tamper(tmp_path, artifact_kind, path, value):
     evidence_path = _v4_evidence(tmp_path, ("noop", "noop", "noop"))
     document = json.loads(evidence_path.read_text())
+    green = document["green_runs"][0]
     attestation_ref = document["green_runs"][0]["qualification_attestation_ref"]
     attestation = json.loads(
         Path(attestation_ref["uri"].removeprefix("file://")).read_text()
     )
-    ref = attestation[artifact_key]
+    ref = (
+        attestation["scope_binding_ref"]
+        if artifact_kind == "binding"
+        else attestation["published_dq_ref"]
+        if artifact_kind == "dq"
+        else attestation["physical_generation"]["snapshot_ref"]
+    )
     artifact = Path(ref["uri"].removeprefix("file://"))
     payload = json.loads(artifact.read_text())
     target = payload
     for key in path[:-1]:
         target = target[key]
     target[path[-1]] = value
-    artifact.write_text(json.dumps(payload), encoding="utf-8")
+    rewritten_ref = _write(artifact.with_name(f"rehashed-{artifact.name}"), payload)
+    if artifact_kind == "binding":
+        attestation["scope_binding_ref"] = rewritten_ref
+    elif artifact_kind == "snapshot":
+        attestation["physical_generation"]["snapshot_ref"] = rewritten_ref
+    else:
+        attestation["published_dq_ref"] = rewritten_ref
+        green["published_dq_ref"] = rewritten_ref
+        success_ref = green["success_receipt_ref"]
+        success_path = Path(success_ref["uri"].removeprefix("file://"))
+        success = json.loads(success_path.read_text())
+        success.pop("receipt_sha256")
+        success["published_dq_refs"][0]["published_dq_ref"] = rewritten_ref
+        green["success_receipt_ref"] = _write(
+            success_path.with_name("rehashed-success.json"), _receipt(success)
+        )
+    green["qualification_attestation_ref"] = _write(
+        Path(attestation_ref["uri"].removeprefix("file://")).with_name(
+            "rehashed-attestation.json"
+        ),
+        attestation,
+    )
+    evidence_path.write_text(json.dumps(document), encoding="utf-8")
 
     with pytest.raises(MigrationError):
         load_promotion_evidence(evidence_path)
 
 
-def test_v4_rejects_tampered_complete_publication_intent(tmp_path):
+def test_v4_rejects_rehashed_evidence_publication_intent_divergence(tmp_path):
     evidence_path = _v4_evidence(tmp_path, ("complete", "noop", "noop"))
     document = json.loads(evidence_path.read_text())
     attestation_ref = document["green_runs"][0]["qualification_attestation_ref"]
@@ -698,19 +777,84 @@ def test_v4_rejects_tampered_complete_publication_intent(tmp_path):
     )
     intent_ref = publication["publication_intent_ref"]
     intent_path = Path(intent_ref["uri"].removeprefix("file://"))
-    intent = json.loads(intent_path.read_text())
-    intent["plan_signature"] = "0" * 64
-    intent_path.write_text(json.dumps(intent), encoding="utf-8")
+    alternate_intent_ref = _write(
+        intent_path.with_name("alternate-publication-intent.json"),
+        json.loads(intent_path.read_text()),
+    )
+    green = document["green_runs"][0]
+    evidence_ref = attestation["run_evidence_ref"]
+    evidence_artifact = Path(evidence_ref["uri"].removeprefix("file://"))
+    evidence_payload = json.loads(evidence_artifact.read_text())
+    evidence_payload["publication_intent_ref"] = alternate_intent_ref
+    new_evidence_ref = _write(
+        evidence_artifact.with_name("rehashed-run-evidence.json"), evidence_payload
+    )
+
+    publication["evidence_ref"] = new_evidence_ref
+    publication_path = Path(publication_ref["uri"].removeprefix("file://"))
+    new_publication_ref = _write(
+        publication_path.with_name("rehashed-publication.json"), publication
+    )
+    dq_ref = attestation["published_dq_ref"]
+    dq_path = Path(dq_ref["uri"].removeprefix("file://"))
+    dq = json.loads(dq_path.read_text())
+    dq["publication_ref"] = new_publication_ref
+    new_dq_ref = _write(dq_path.with_name("rehashed-published-dq.json"), dq)
+
+    durable_ref = green["durable_manifest_ref"]
+    durable_path = Path(durable_ref["uri"].removeprefix("file://"))
+    durable = json.loads(durable_path.read_text())
+    durable["evidence"][0]["evidence_uri"] = new_evidence_ref["uri"]
+    durable["evidence"][0]["evidence_sha256"] = new_evidence_ref["sha256"]
+    durable["publication_refs"][0]["publication_ref"] = new_publication_ref
+    new_durable_ref = _write(durable_path.with_name("rehashed-durable.json"), durable)
+
+    attestation["run_evidence_ref"] = new_evidence_ref
+    attestation["publication_ref"] = new_publication_ref
+    attestation["published_dq_ref"] = new_dq_ref
+    new_attestation_ref = _write(
+        Path(attestation_ref["uri"].removeprefix("file://")).with_name(
+            "rehashed-intent-attestation.json"
+        ),
+        attestation,
+    )
+    success_ref = green["success_receipt_ref"]
+    success_path = Path(success_ref["uri"].removeprefix("file://"))
+    success = json.loads(success_path.read_text())
+    success.pop("receipt_sha256")
+    success["durable_manifest_ref"] = new_durable_ref
+    success["published_dq_refs"][0]["published_dq_ref"] = new_dq_ref
+    green.update(
+        {
+            "durable_manifest_ref": new_durable_ref,
+            "published_dq_ref": new_dq_ref,
+            "qualification_attestation_ref": new_attestation_ref,
+            "success_receipt_ref": _write(
+                success_path.with_name("rehashed-intent-success.json"),
+                _receipt(success),
+            ),
+        }
+    )
+    evidence_path.write_text(json.dumps(document), encoding="utf-8")
 
     with pytest.raises(MigrationError):
         load_promotion_evidence(evidence_path)
 
 
 class _V4ApplyBackend:
-    def __init__(self, candidate, *, stale_latest: bool = False):
+    def __init__(
+        self,
+        candidate,
+        *,
+        stale_latest: bool = False,
+        race_after_baseline: bool = False,
+    ):
         self.candidate = candidate
         self.stale_latest = stale_latest
+        self.race_after_baseline = race_after_baseline
         self.actions: list[str] = []
+        self.baseline_row = None
+        self.cutover = None
 
     def ensure_objects(self):
         self.actions.append("ensure_objects")
@@ -720,8 +864,8 @@ class _V4ApplyBackend:
         return (
             {
                 entity: {
-                    "row_count": 0,
-                    "distinct_key_count": 0,
+                    "row_count": 1 if entity == "schedule" else 0,
+                    "distinct_key_count": 1 if entity == "schedule" else 0,
                     "max_ingested_at": None,
                 }
                 for entity in ("schedule", "lineup", "matchsheet")
@@ -734,6 +878,9 @@ class _V4ApplyBackend:
         )
 
     def verify_candidate(self, candidate, registry_snapshot_ref):
+        self.actions.append("verify_candidate")
+
+    def verify_physical_generation(self, physical, registry_snapshot_ref):
         self.actions.append("verify_candidate")
 
     def _manifest(self):
@@ -769,16 +916,20 @@ class _V4ApplyBackend:
         return manifest
 
     def baseline(self, scope_id):
-        return None
+        return self.baseline_row
 
     def append_baseline(self, row):
         self.actions.append("append_baseline")
+        self.baseline_row = dict(row)
+        if self.race_after_baseline:
+            self.stale_latest = True
 
     def latest_cutover(self, scope_id):
-        return None
+        return self.cutover
 
     def append_cutover(self, cutover):
         self.actions.append("append_cutover")
+        self.cutover = cutover
 
 
 class _V4LeaseStore:
@@ -821,3 +972,110 @@ def test_v4_apply_rejects_control_or_manifest_race_before_append(tmp_path, race)
 
     assert "append_baseline" not in backend.actions
     assert "append_cutover" not in backend.actions
+
+
+def test_v4_successful_apply_builds_existing_v2_rollback_shape(tmp_path):
+    evidence = load_promotion_evidence(_v4_evidence(tmp_path, ("noop", "noop", "noop")))
+    candidate = evidence.green_runs[-1]
+    backend = _V4ApplyBackend(candidate)
+
+    report = apply_promotion(
+        evidence,
+        backend=backend,
+        lease_store=_V4LeaseStore(dict(candidate.selected_head)),
+        now=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    rollback = build_rollback_plan(
+        report,
+        reason="verified emergency rollback",
+        output_path=tmp_path / "rollback.json",
+    )
+
+    assert rollback["schema_version"] == "espn-v2-rollback-plan-v2"
+    assert rollback["registry_signature"] == candidate.registry_signature
+    assert rollback["plan_signature"] == candidate.physical_generation.plan_signature
+    assert backend.actions.index("verify_candidate") < backend.actions.index(
+        "append_baseline"
+    )
+    assert backend.actions.index("verify_candidate") < backend.actions.index(
+        "append_cutover"
+    )
+
+
+def test_v4_apply_rereads_frozen_registry_under_lease_before_write(tmp_path):
+    evidence = load_promotion_evidence(_v4_evidence(tmp_path, ("noop", "noop", "noop")))
+    candidate = evidence.green_runs[-1]
+    registry_path = Path(evidence.registry_snapshot_ref.uri.removeprefix("file://"))
+    registry_path.write_text("{}", encoding="utf-8")
+    backend = _V4ApplyBackend(candidate)
+
+    with pytest.raises(MigrationError, match="registry"):
+        apply_promotion(
+            evidence,
+            backend=backend,
+            lease_store=_V4LeaseStore(dict(candidate.selected_head)),
+            now=datetime(2026, 8, 2, tzinfo=UTC),
+        )
+
+    assert "append_baseline" not in backend.actions
+    assert "append_cutover" not in backend.actions
+
+
+def test_v4_second_guard_rejects_race_after_baseline_before_cutover(tmp_path):
+    evidence = load_promotion_evidence(_v4_evidence(tmp_path, ("noop", "noop", "noop")))
+    candidate = evidence.green_runs[-1]
+    backend = _V4ApplyBackend(candidate, race_after_baseline=True)
+
+    with pytest.raises(MigrationError, match="newer COMPLETE"):
+        apply_promotion(
+            evidence,
+            backend=backend,
+            lease_store=_V4LeaseStore(dict(candidate.selected_head)),
+            now=datetime(2026, 8, 2, tzinfo=UTC),
+        )
+
+    assert "append_baseline" in backend.actions
+    assert "append_cutover" not in backend.actions
+
+
+def test_v4_idempotent_apply_reverifies_before_append(tmp_path):
+    evidence = load_promotion_evidence(_v4_evidence(tmp_path, ("noop", "noop", "noop")))
+    candidate = evidence.green_runs[-1]
+    backend = _V4ApplyBackend(candidate)
+    lease_store = _V4LeaseStore(dict(candidate.selected_head))
+    apply_promotion(
+        evidence,
+        backend=backend,
+        lease_store=lease_store,
+        now=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    backend.actions.clear()
+
+    apply_promotion(
+        evidence,
+        backend=backend,
+        lease_store=lease_store,
+        now=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+
+    assert backend.actions.index("verify_candidate") < backend.actions.index(
+        "append_cutover"
+    )
+
+
+def test_repository_v4_verifier_loads_snapshot_and_runs_physical_dq(tmp_path):
+    evidence = load_promotion_evidence(_v4_evidence(tmp_path, ("noop", "noop", "noop")))
+    physical = evidence.green_runs[-1].physical_generation
+    calls = []
+
+    class Repository:
+        def verify_published_scope(self, generation):
+            calls.append(generation)
+            return type("Report", (), {"passed": True, "failures": ()})()
+
+    RepositoryMigrationBackend(Repository()).verify_physical_generation(
+        physical, evidence.registry_snapshot_ref
+    )
+
+    assert calls[0].run_id == physical.run_id
+    assert calls[0].plan_signature == physical.plan_signature

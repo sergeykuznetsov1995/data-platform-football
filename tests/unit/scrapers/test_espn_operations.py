@@ -422,6 +422,107 @@ def test_latest_run_evidence_is_read_only_and_ordered_by_recorded_at():
     assert store.read_scope_heads(("700:2026",)) == {}
 
 
+def test_latest_run_evidence_rejects_equal_maximum_as_ambiguous():
+    store = MemoryScopeLeaseStore()
+    recorded_at = datetime(2026, 7, 31, 14, tzinfo=UTC)
+    for index in (1, 2):
+        lease = store.acquire_many(
+            ("700:2026",),
+            owner_id=f"dag_ingest_espn/tied-{index}/1",
+            plan_signature=str(index) * 64,
+            now=recorded_at - timedelta(minutes=1),
+            ttl=timedelta(hours=1),
+        )[0]
+        evidence = RunManifestEvidence(
+            dag_id="dag_ingest_espn",
+            run_id=f"tied-{index}",
+            attempt=1,
+            scope_id="700:2026",
+            plan_signature=str(index) * 64,
+            registry_signature="b" * 64,
+            state="noop",
+            evidence_uri=f"s3://evidence/tied-{index}.json",
+            evidence_sha256=str(index + 2) * 64,
+            recorded_at=recorded_at,
+        )
+        with store.publication_guard(lease, now=recorded_at) as fence:
+            fence.record_evidence(evidence)
+        store.release(lease, now=recorded_at)
+
+    with pytest.raises(OperationsError, match="ambiguous latest run evidence"):
+        store.read_latest_run_evidence_by_scope(("700:2026",), dag_id="dag_ingest_espn")
+
+
+@pytest.mark.parametrize("scope_ids", [("701:2026", "700:2026"), ("700:2026",) * 2])
+@pytest.mark.parametrize("store_kind", ["memory", "postgres"])
+def test_latest_run_evidence_requires_sorted_unique_scope_input(scope_ids, store_kind):
+    store = (
+        MemoryScopeLeaseStore()
+        if store_kind == "memory"
+        else PostgresEspnControlStore(
+            lambda: (_ for _ in ()).throw(AssertionError("must reject before connect"))
+        )
+    )
+
+    with pytest.raises(ValueError, match="sorted and unique"):
+        store.read_latest_run_evidence_by_scope(scope_ids, dag_id="dag_ingest_espn")
+
+
+def test_postgres_latest_evidence_uses_dense_rank_and_rejects_tie():
+    executed = []
+    recorded_at = datetime(2026, 7, 31, 14, tzinfo=UTC)
+    rows = [
+        (
+            "dag_ingest_espn",
+            f"tied-{index}",
+            1,
+            "700:2026",
+            str(index) * 64,
+            "b" * 64,
+            "noop",
+            f"s3://evidence/tied-{index}.json",
+            str(index + 2) * 64,
+            recorded_at,
+        )
+        for index in (1, 2)
+    ]
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=None):
+            executed.append((sql, params))
+
+        def fetchall(self):
+            return rows
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+        def close(self):
+            pass
+
+    with pytest.raises(OperationsError, match="ambiguous latest run evidence"):
+        PostgresEspnControlStore(
+            lambda: Connection()
+        ).read_latest_run_evidence_by_scope(("700:2026",), dag_id="dag_ingest_espn")
+
+    sql, params = executed[-1]
+    assert "DENSE_RANK() OVER" in sql
+    assert params == ("dag_ingest_espn", ["700:2026"])
+
+
 def test_postgres_evidence_read_binds_exact_dag_run_and_attempt():
     executed = []
 

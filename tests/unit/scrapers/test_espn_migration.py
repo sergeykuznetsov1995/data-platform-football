@@ -17,7 +17,9 @@ from scrapers.espn.migration import (
     LEGACY_PROMOTION_EVIDENCE_VERSION,
     LEGACY_ROLLBACK_PLAN_VERSION,
     PROMOTION_EVIDENCE_VERSION,
+    ArtifactRef,
     FallbackDescriptor,
+    GreenRunEvidence,
     MigrationError,
     RepositoryMigrationBackend,
     apply_promotion,
@@ -28,7 +30,7 @@ from scrapers.espn.migration import (
     migration_statements,
     registry_fallback_descriptors,
 )
-from scrapers.espn.repository import MANIFEST_TABLE, canonical_sha256
+from scrapers.espn.repository import MANIFEST_TABLE, canonical_json, canonical_sha256
 from scrapers.espn.discovery import CatalogSnapshot
 from scrapers.espn.registry import (
     build_discovered_male_registry,
@@ -548,6 +550,88 @@ def test_migration_statements_never_mutate_legacy_objects():
     assert "ALTER TABLE ICEBERG.BRONZE.ESPN_SCHEDULE " not in rendered
     assert "ALTER TABLE ICEBERG.BRONZE.ESPN_LINEUP " not in rendered
     assert "ALTER TABLE ICEBERG.BRONZE.ESPN_MATCHSHEET " not in rendered
+
+
+def test_legacy_v2_v3_green_run_serializer_keeps_reviewed_bytes_and_hash():
+    def ref(name: str, digit: str) -> ArtifactRef:
+        return ArtifactRef(
+            uri=f"file:///golden/{name}.json",
+            sha256=digit * 64,
+        )
+
+    run = GreenRunEvidence(
+        dag_id="dag_ingest_espn",
+        run_id="espn_daily__golden",
+        attempt=3,
+        scope_id="700:2026",
+        registry_signature="a" * 64,
+        plan_signature="b" * 64,
+        generation_id="generation-golden",
+        generation_signature="c" * 64,
+        manifest_sha256="d" * 64,
+        as_of=datetime(2026, 7, 31, tzinfo=UTC).date(),
+        logical_date=datetime(2026, 7, 31, 14, tzinfo=UTC),
+        data_interval_start=datetime(2026, 7, 31, 14, tzinfo=UTC),
+        data_interval_end=datetime(2026, 8, 1, 14, tzinfo=UTC),
+        parent_run_id="scheduled__2026-07-31T14:00:00+00:00",
+        recorded_at=datetime(2026, 8, 1, 15, 16, 17, tzinfo=UTC),
+        durable_manifest_ref=ref("durable", "0"),
+        run_evidence_ref=ref("run-evidence", "1"),
+        raw_manifest_ref=ref("raw", "2"),
+        publication_ref=ref("publication", "3"),
+        generation_snapshot_ref=ref("generation", "4"),
+        published_dq_ref=ref("published-dq", "5"),
+        terminal_verdict_ref=ref("terminal-verdict", "6"),
+        health_ref=ref("health", "7"),
+        lease_release_ref=ref("lease-release", "8"),
+        success_receipt_ref=ref("success-receipt", "9"),
+        run_registry_snapshot_ref=ref("registry", "a"),
+    )
+
+    # Frozen from c6927c8 in a detached worktree. Do not regenerate this golden
+    # from the current serializer: v2/v3 evidence hashes are a public contract.
+    expected_bytes = (
+        b'{"as_of":"2026-07-31","attempt":3,"dag_id":"dag_ingest_espn",'
+        b'"data_interval_end":"2026-08-01T14:00:00+00:00",'
+        b'"data_interval_start":"2026-07-31T14:00:00+00:00",'
+        b'"durable_manifest_ref":{"sha256":"00000000000000000000000000000000'
+        b'00000000000000000000000000000000","uri":"file:///golden/durable.json"},'
+        b'"generation_id":"generation-golden","generation_signature":"cccccccc'
+        b'cccccccccccccccccccccccccccccccccccccccccccccccccccccccc",'
+        b'"generation_snapshot_ref":{"sha256":"44444444444444444444444444444444'
+        b'44444444444444444444444444444444","uri":"file:///golden/generation.json"},'
+        b'"health_ref":{"sha256":"7777777777777777777777777777777777777777'
+        b'777777777777777777777777","uri":"file:///golden/health.json"},'
+        b'"lease_release_ref":{"sha256":"88888888888888888888888888888888'
+        b'88888888888888888888888888888888","uri":"file:///golden/lease-release.json"},'
+        b'"logical_date":"2026-07-31T14:00:00+00:00","manifest_sha256":"dddddddd'
+        b'dddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
+        b'"parent_run_id":"scheduled__2026-07-31T14:00:00+00:00",'
+        b'"plan_signature":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+        b'bbbbbbbb","publication_ref":{"sha256":"33333333333333333333333333333333'
+        b'33333333333333333333333333333333","uri":"file:///golden/publication.json"},'
+        b'"published_dq_ref":{"sha256":"55555555555555555555555555555555'
+        b'55555555555555555555555555555555","uri":"file:///golden/published-dq.json"},'
+        b'"raw_manifest_ref":{"sha256":"22222222222222222222222222222222'
+        b'22222222222222222222222222222222","uri":"file:///golden/raw.json"},'
+        b'"recorded_at":"2026-08-01T15:16:17+00:00","registry_signature":"aaaaaaaa'
+        b'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+        b'"run_evidence_ref":{"sha256":"11111111111111111111111111111111'
+        b'11111111111111111111111111111111","uri":"file:///golden/run-evidence.json"},'
+        b'"run_id":"espn_daily__golden","run_registry_snapshot_ref":{"sha256":'
+        b'"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+        b'"uri":"file:///golden/registry.json"},"scope_id":"700:2026",'
+        b'"success_receipt_ref":{"sha256":"99999999999999999999999999999999'
+        b'99999999999999999999999999999999","uri":"file:///golden/success-receipt.json"},'
+        b'"terminal_verdict_ref":{"sha256":"66666666666666666666666666666666'
+        b'66666666666666666666666666666666","uri":"file:///golden/terminal-verdict.json"}}'
+    )
+    expected_sha256 = "f32d9c8f2a8103857dee9a39b8abb8cb479fd73aae739e235e48c638b96738c4"
+
+    payload = run.to_dict()
+    assert canonical_json(payload).encode("utf-8") == expected_bytes
+    assert hashlib.sha256(expected_bytes).hexdigest() == expected_sha256
+    assert canonical_sha256(payload) == expected_sha256
 
 
 def test_cli_defaults_to_dry_run_and_does_not_construct_live_adapters(tmp_path):

@@ -326,7 +326,9 @@ master должен быть scheduled, этот rollout заблокирова�
    ```
 
    Из-за нового registry signature обязательны три новых scheduled green
-   parent/child runs. Manual bootstrap/canary не засчитываются в эти три.
+   parent/child runs. Для v4 день считается зелёным при точной квалификации
+   каждого scope в состоянии `complete` **или** `noop`; manual bootstrap/canary
+   не засчитываются в эти три.
 
 ### Rollback expanded registry
 
@@ -359,13 +361,39 @@ offline parse, DQ, COMPLETE manifest, publication evidence и health artifact
 только после зелёного published DQ, пустого списка alerts и успешного release
 lease. Одного durable manifest недостаточно — он создаётся раньше этих проверок.
 
-Перед cutover нужны **три последовательных зелёных** запуска
-`dag_ingest_espn` для того же scope и registry signature. В promotion evidence
-положить exact registry snapshot URI/SHA, а для каждого запуска — durable/raw,
-published-DQ, terminal-verdict, health, lease-release и final success receipt
-URI/SHA. Три master data interval должны соприкасаться без пропуска; третья
-COMPLETE generation становится кандидатом. Ошибка, warning, stale manifest,
-пропущенный день или другой registry signature обнуляют серию.
+Production qualification использует `espn-v2-promotion-evidence-v4` и
+`espn-native-runtime-v3`. Для каждого scheduled scope состояние должно быть
+одинаковым в durable summary, неизменённом `espn-run-manifest-evidence-v1` и
+publication: только `complete` или `noop`. `complete` публикует новую физическую
+COMPLETE generation. `noop` заново проверяет уже выбранную COMPLETE generation,
+но не двигает `ScopeHead.published_at` и не притворяется новой generation.
+
+После published DQ рядом с immutable `run-evidence.json` должен лежать
+канонический sibling `qualification-attestation.json` вида
+`espn-scope-qualification-attestation-v1`. Сборщик для каждого scope обязан
+получить exact URI/SHA этого sibling только заменой конечного имени
+`run-evidence.json`, проверить его и положить ссылку в
+`qualification_attestation_ref`; `latest` и поиск по префиксу запрещены.
+Attestation связывает текущую квалификацию с выбранной физической generation,
+её registry/parser/runtime, signed plan, lease, publication и DQ.
+
+Все v1 receipts остаются byte-for-byte прежними. В частности,
+`espn-run-success-receipt-v1` не получает поле attestation: receipt доказывает
+успешный финал запуска, а canonical sibling отдельно доказывает связь scope с
+физическими данными. Старые promotion evidence v2/v3 остаются complete-only.
+
+Перед cutover нужны **три последовательных зелёных** scheduled qualification
+запуска `dag_ingest_espn` для того же scope и registry signature. В v4
+разрешены последовательности из `complete|noop`, например
+`complete, noop, noop` или `noop, noop, noop`, если каждый `noop` полностью
+перепроверил exact current COMPLETE head. В promotion evidence положить exact
+registry snapshot URI/SHA, а для каждого запуска — durable/raw, published-DQ,
+qualification-attestation, terminal-verdict, health, lease-release и final
+success receipt URI/SHA. Три master data interval должны соприкасаться без
+пропуска. Кандидатом становится физическая COMPLETE generation, выбранная
+третьей квалификацией; сам `noop` новой generation не создаёт. Ошибка, warning,
+stale manifest, неподходящий parser/runtime, пропущенный день или другой
+registry signature обнуляют серию.
 
 Сначала выполнить план — команда по умолчанию dry-run и не открывает БД:
 

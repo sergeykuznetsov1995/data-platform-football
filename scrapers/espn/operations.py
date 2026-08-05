@@ -1155,7 +1155,9 @@ class MemoryScopeLeaseStore:
     def read_latest_run_evidence_by_scope(
         self, scope_ids: Iterable[str], *, dag_id: str
     ) -> dict[str, RunManifestEvidence]:
-        scopes = tuple(sorted({_scope_id(item) for item in scope_ids}))
+        scopes = tuple(_scope_id(item) for item in scope_ids)
+        if scopes != tuple(sorted(set(scopes))):
+            raise ValueError("latest evidence scope set must be sorted and unique")
         dag = _required(dag_id, "dag_id")
         with self._lock:
             candidates: dict[str, list[RunManifestEvidence]] = {}
@@ -1916,7 +1918,9 @@ $espn_migration$"""
     def read_latest_run_evidence_by_scope(
         self, scope_ids: Iterable[str], *, dag_id: str
     ) -> dict[str, RunManifestEvidence]:
-        scopes = tuple(sorted({_scope_id(item) for item in scope_ids}))
+        scopes = tuple(_scope_id(item) for item in scope_ids)
+        if scopes != tuple(sorted(set(scopes))):
+            raise ValueError("latest evidence scope set must be sorted and unique")
         dag = _required(dag_id, "dag_id")
         if not scopes:
             return {}
