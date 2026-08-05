@@ -2648,6 +2648,12 @@ def _validate_publication_intent_for_result(
     )
 
 
+def _qualification_state(value: object) -> str:
+    if type(value) is not str or value not in {"complete", "noop"}:
+        raise OperationsError("publication result state is invalid")
+    return value
+
+
 def _load_existing_publication_evidence(
     *,
     uri: str,
@@ -2965,8 +2971,7 @@ def persist_run_manifests(
             index["registry_signature"],
         ):
             raise OperationsError("publication plan differs from plan index")
-        if publication["state"] not in {"complete", "noop"}:
-            raise OperationsError("publication result state is invalid")
+        _qualification_state(publication["state"])
         generation = runner.load_scope_snapshot(
             publication["snapshot_ref"]["uri"],
             artifact_sha256=publication["snapshot_ref"]["sha256"],
@@ -3183,7 +3188,43 @@ def published_dq_scope(
     result_ref = _write_payload(
         _join_uri(descriptor["scope_root"], "published-dq.json"), result
     )
-    return {"published_dq_ref": result_ref}
+    attestation = {
+        "kind": "espn-scope-qualification-attestation-v1",
+        "schema_version": 1,
+        "dag_id": descriptor["dag_id"],
+        "run_id": loaded.plan.run_id,
+        "attempt": loaded.attempt,
+        "scope_id": scope.scope_id,
+        "state": publication["state"],
+        "registry_signature": loaded.plan.registry_signature,
+        "plan_signature": loaded.signature,
+        "lease_epoch": evidence["lease_epoch"],
+        "recorded_at": evidence["recorded_at"],
+        "scope_binding_ref": publication["scope_binding_ref"],
+        "run_evidence_ref": publication["evidence_ref"],
+        "publication_ref": publication_ref,
+        "published_dq_ref": result_ref,
+        "snapshot_ref": publication["snapshot_ref"],
+        "selected_head": selected_head,
+        "physical_generation": {
+            "run_id": selected_generation.run_id,
+            "plan_signature": selected_generation.plan_signature,
+            "generation_id": selected_generation.generation_id,
+            "generation_signature": selected_generation.generation_signature,
+            "manifest_sha256": selected_generation.manifest_sha256,
+            "registry_signature": selected_generation.registry_signature,
+            "parser_version": selected_generation.parser_version,
+            "runtime_version": selected_generation.runtime_version,
+        },
+    }
+    attestation_ref = _write_payload(
+        _join_uri(descriptor["scope_root"], "qualification-attestation.json"),
+        attestation,
+    )
+    return {
+        "published_dq_ref": result_ref,
+        "qualification_attestation_ref": attestation_ref,
+    }
 
 
 def _observed_task_states(context: Mapping[str, Any], task_ids: Sequence[str]):
@@ -3390,13 +3431,13 @@ def terminal_verdict(
             if scope.scope_id in publications_by_scope:
                 raise OperationsError("durable manifest duplicates a publication")
             if (
-                publication["state"] in {"complete", "noop"},
+                _qualification_state(publication["state"]),
                 loaded_plan.plan.run_id,
                 loaded_plan.attempt,
                 loaded_plan.signature,
                 loaded_plan.plan.registry_signature,
             ) != (
-                True,
+                publication["state"],
                 run_id,
                 attempt,
                 plan_identities.get(scope.scope_id),
@@ -3594,7 +3635,9 @@ def _head_identity_sha256(head: ScopeHead) -> str:
     ).hexdigest()
 
 
-def _verified_complete_head(head: ScopeHead | None) -> tuple[ScopeHead | None, str]:
+def _verified_complete_head(
+    head: ScopeHead | None, *, expected_registry_signature: str | None = None
+) -> tuple[ScopeHead | None, str]:
     """Accept freshness only after exact snapshot, COMPLETE and physical parity."""
 
     if head is None:
@@ -3625,12 +3668,274 @@ def _verified_complete_head(head: ScopeHead | None) -> tuple[ScopeHead | None, s
         )
         if identity != expected:
             raise OperationsError("scope head snapshot identity mismatch")
+        if expected_registry_signature is not None and (
+            head.registry_signature != expected_registry_signature
+            or generation.registry_signature != expected_registry_signature
+            or generation.parser_version != runner.PARSER_VERSION
+            or generation.runtime_version != runner.RUNTIME_VERSION
+        ):
+            raise OperationsError("scope head runtime policy mismatch")
         report = EspnBronzeRepository().verify_published_scope(generation)
         if not report.passed:
             raise OperationsError("scope head COMPLETE physical parity failed")
     except Exception:
         return None, "incomplete"
     return head, "complete"
+
+
+def _qualified_freshness_at(
+    head: ScopeHead | None,
+    evidence: RunManifestEvidence | None,
+    *,
+    expected_registry_signature: str,
+    observed_at: datetime,
+) -> tuple[ScopeHead | None, str, datetime | None]:
+    """Derive freshness without mutating the physical COMPLETE control head."""
+
+    verified, state = _verified_complete_head(head)
+    if verified is None:
+        return None, state, None
+    fallback = verified.published_at
+    if evidence is None:
+        return verified, state, fallback
+    try:
+        if (
+            evidence.scope_id,
+            evidence.registry_signature,
+            evidence.state,
+        ) != (verified.scope_id, expected_registry_signature, "noop"):
+            raise OperationsError("freshness evidence identity mismatch")
+        if not (
+            verified.published_at <= evidence.recorded_at <= observed_at.astimezone(UTC)
+        ):
+            raise OperationsError("freshness evidence timestamp is not current")
+        evidence_ref = {
+            "uri": evidence.evidence_uri,
+            "sha256": evidence.evidence_sha256,
+        }
+        evidence_payload = _read_ref(evidence_ref, kind="espn-run-manifest-evidence-v1")
+        if (
+            evidence_payload.get("dag_id"),
+            evidence_payload.get("run_id"),
+            evidence_payload.get("attempt"),
+            evidence_payload.get("scope_id"),
+            evidence_payload.get("plan_signature"),
+            evidence_payload.get("registry_signature"),
+            evidence_payload.get("state"),
+            evidence_payload.get("recorded_at"),
+        ) != (
+            evidence.dag_id,
+            evidence.run_id,
+            evidence.attempt,
+            evidence.scope_id,
+            evidence.plan_signature,
+            evidence.registry_signature,
+            evidence.state,
+            evidence.recorded_at.isoformat(),
+        ):
+            raise OperationsError(
+                "freshness evidence artifact differs from durable row"
+            )
+        parsed_evidence_uri = urlsplit(evidence.evidence_uri)
+        if (
+            parsed_evidence_uri.query
+            or parsed_evidence_uri.fragment
+            or parsed_evidence_uri.path.rsplit("/", 1)[-1] != "run-evidence.json"
+        ):
+            raise OperationsError("freshness evidence URI is not canonical")
+        root = evidence.evidence_uri.rsplit("/", 1)[0]
+        attestation = _read_ref(
+            _ref_for_uri(_join_uri(root, "qualification-attestation.json")),
+            kind="espn-scope-qualification-attestation-v1",
+        )
+        publication_ref = attestation.get("publication_ref")
+        published_dq_ref = attestation.get("published_dq_ref")
+        publication = _read_ref(publication_ref, kind="espn-publication-result-v1")
+        published_dq = _read_ref(published_dq_ref, kind="espn-published-dq-result-v1")
+        selected_head = _head_to_dict(verified)
+        physical = attestation.get("physical_generation")
+        if (
+            not isinstance(physical, Mapping)
+            or set(physical)
+            != {
+                "run_id",
+                "plan_signature",
+                "generation_id",
+                "generation_signature",
+                "manifest_sha256",
+                "registry_signature",
+                "parser_version",
+                "runtime_version",
+            }
+            or set(attestation)
+            != {
+                "kind",
+                "schema_version",
+                "dag_id",
+                "run_id",
+                "attempt",
+                "scope_id",
+                "state",
+                "registry_signature",
+                "plan_signature",
+                "lease_epoch",
+                "recorded_at",
+                "scope_binding_ref",
+                "run_evidence_ref",
+                "publication_ref",
+                "published_dq_ref",
+                "snapshot_ref",
+                "selected_head",
+                "physical_generation",
+            }
+        ):
+            raise OperationsError("freshness physical identity is missing")
+        _, descriptor, loaded, scope, lease = _binding(attestation["scope_binding_ref"])
+        evidence_epoch = evidence_payload.get("lease_epoch")
+        if (
+            descriptor.get("dag_id"),
+            loaded.plan.run_id,
+            loaded.attempt,
+            scope.scope_id,
+            loaded.plan.registry_signature,
+            loaded.signature,
+            lease.scope_id,
+            lease.owner_id,
+            lease.plan_signature,
+            type(evidence_epoch) is int and 1 <= evidence_epoch <= lease.epoch,
+        ) != (
+            evidence.dag_id,
+            evidence.run_id,
+            evidence.attempt,
+            evidence.scope_id,
+            evidence.registry_signature,
+            evidence.plan_signature,
+            evidence.scope_id,
+            f"{evidence.dag_id}/{evidence.run_id}/{evidence.attempt}",
+            evidence.plan_signature,
+            True,
+        ):
+            raise OperationsError("freshness signed binding identity mismatch")
+        if (
+            attestation.get("dag_id"),
+            attestation.get("run_id"),
+            attestation.get("attempt"),
+            attestation.get("scope_id"),
+            attestation.get("state"),
+            attestation.get("registry_signature"),
+            attestation.get("plan_signature"),
+            attestation.get("lease_epoch"),
+            attestation.get("recorded_at"),
+            attestation.get("run_evidence_ref"),
+            attestation.get("scope_binding_ref"),
+            attestation.get("snapshot_ref"),
+            attestation.get("selected_head"),
+            publication.get("evidence_ref"),
+            publication.get("scope_binding_ref"),
+            publication.get("state"),
+            publication.get("snapshot_ref"),
+            publication.get("selected_head"),
+            published_dq.get("publication_ref"),
+            published_dq.get("dag_id"),
+            published_dq.get("run_id"),
+            published_dq.get("attempt"),
+            published_dq.get("scope_id"),
+            published_dq.get("plan_signature"),
+            published_dq.get("registry_signature"),
+            published_dq.get("current_selection"),
+            published_dq.get("quality", {}).get("passed"),
+            published_dq.get("quality", {}).get("failures"),
+        ) != (
+            evidence.dag_id,
+            evidence.run_id,
+            evidence.attempt,
+            evidence.scope_id,
+            evidence.state,
+            evidence.registry_signature,
+            evidence.plan_signature,
+            evidence_epoch,
+            evidence.recorded_at.isoformat(),
+            evidence_ref,
+            attestation.get("scope_binding_ref"),
+            {"uri": verified.snapshot_uri, "sha256": verified.snapshot_sha256},
+            selected_head,
+            evidence_ref,
+            attestation.get("scope_binding_ref"),
+            evidence.state,
+            {"uri": verified.snapshot_uri, "sha256": verified.snapshot_sha256},
+            selected_head,
+            publication_ref,
+            evidence.dag_id,
+            evidence.run_id,
+            evidence.attempt,
+            evidence.scope_id,
+            evidence.plan_signature,
+            evidence.registry_signature,
+            selected_head,
+            True,
+            [],
+        ):
+            raise OperationsError("freshness qualification chain mismatch")
+        if (
+            evidence.state == "noop"
+            and publication.get("publication_intent_ref") is not None
+        ):
+            raise OperationsError("freshness no-op contains publication intent")
+        prior = loaded.bindings[evidence.scope_id].prior
+        if prior is None or (
+            prior.uri,
+            prior.artifact_sha256,
+            prior.scope_id,
+            prior.generation_id,
+            prior.generation_signature,
+            prior.manifest_sha256,
+        ) != (
+            verified.snapshot_uri,
+            verified.snapshot_sha256,
+            verified.scope_id,
+            verified.generation_id,
+            verified.generation_signature,
+            verified.manifest_sha256,
+        ):
+            raise OperationsError("freshness signed prior differs from physical head")
+        generation = runner.load_scope_snapshot(
+            verified.snapshot_uri,
+            artifact_sha256=verified.snapshot_sha256,
+            expected_scope_id=verified.scope_id,
+        )
+        if generation.plan != scope:
+            raise OperationsError(
+                "freshness physical scope plan differs from signed plan"
+            )
+        if (
+            evidence_payload.get("generation_id"),
+            evidence_payload.get("generation_signature"),
+            evidence_payload.get("manifest_sha256"),
+            physical.get("run_id"),
+            physical.get("plan_signature"),
+            physical.get("generation_id"),
+            physical.get("generation_signature"),
+            physical.get("manifest_sha256"),
+            physical.get("registry_signature"),
+            physical.get("parser_version"),
+            physical.get("runtime_version"),
+        ) != (
+            verified.generation_id,
+            verified.generation_signature,
+            verified.manifest_sha256,
+            generation.run_id,
+            generation.plan_signature,
+            generation.generation_id,
+            generation.generation_signature,
+            generation.manifest_sha256,
+            generation.registry_signature,
+            runner.PARSER_VERSION,
+            runner.RUNTIME_VERSION,
+        ):
+            raise OperationsError("freshness physical generation mismatch")
+    except Exception:
+        return verified, state, fallback
+    return verified, state, evidence.recorded_at
 
 
 def _subject_identity(
@@ -3721,6 +4026,19 @@ def record_health_metrics(
         store = PostgresEspnControlStore.from_env()
         store.migrate()
         heads = store.read_scope_heads(index["scope_ids"])
+        read_current_evidence = getattr(store, "read_run_evidence", None)
+        current_evidence = (
+            {
+                item.scope_id: item
+                for item in read_current_evidence(
+                    dag_id=verdict["dag_id"],
+                    run_id=verdict["run_id"],
+                    attempt=verdict["attempt"],
+                )
+            }
+            if callable(read_current_evidence)
+            else {}
+        )
         now = store.current_time()
         conflict = _optional_payload(
             _join_uri(
@@ -3733,7 +4051,12 @@ def record_health_metrics(
         )
         for scope_id in index["scope_ids"]:
             raw_head = heads.get(scope_id)
-            head, head_state = _verified_complete_head(raw_head)
+            head, head_state, freshness_at = _qualified_freshness_at(
+                raw_head,
+                current_evidence.get(scope_id),
+                expected_registry_signature=index["registry_signature"],
+                observed_at=now,
+            )
             metric = verdict.get("scope_metrics", {}).get(scope_id, {})
             rollover, unresolved = _latest_discovery_flags(scope_id)
             state = (
@@ -3773,9 +4096,7 @@ def record_health_metrics(
                         "attempt": verdict["attempt"],
                         "scope_id": scope_id,
                         "state": state,
-                        "last_complete_at": (
-                            head.published_at if head is not None else None
-                        ),
+                        "last_complete_at": freshness_at,
                         "direct_requests": metric.get("budget_used", 0),
                         "request_budget": metric.get(
                             "budget_limit", MAX_SCOPE_SUMMARY_EVENTS
@@ -5684,6 +6005,12 @@ def check_36h_freshness_and_alerts(**context) -> dict[str, str]:
     if type(male_scope_count) is not int or male_scope_count != len(scope_ids):
         raise OperationsError("monitor scope count differs from frozen target")
     heads = store.read_scope_heads(scope_ids)
+    read_latest_evidence = getattr(store, "read_latest_run_evidence_by_scope", None)
+    latest_evidence = (
+        read_latest_evidence(scope_ids, dag_id="dag_ingest_espn")
+        if callable(read_latest_evidence)
+        else {}
+    )
     unexpected_heads = sorted(set(heads) - set(scope_ids))
     if unexpected_heads:
         raise OperationsError(
@@ -5697,10 +6024,12 @@ def check_36h_freshness_and_alerts(**context) -> dict[str, str]:
     rollover, unresolved = False, False
     for scope_id in scope_ids:
         raw_head = heads.get(scope_id)
-        if raw_head is not None and raw_head.registry_signature != registry_signature:
-            head, state = None, "incomplete"
-        else:
-            head, state = _verified_complete_head(raw_head)
+        head, state, freshness_at = _qualified_freshness_at(
+            raw_head,
+            latest_evidence.get(scope_id),
+            expected_registry_signature=registry_signature,
+            observed_at=now,
+        )
         if raw_head is None:
             alert_identity = {
                 "identity_kind": "monitor-subject",
@@ -5727,7 +6056,7 @@ def check_36h_freshness_and_alerts(**context) -> dict[str, str]:
                     "subject_run_id": raw_head.run_id if raw_head else None,
                     **alert_identity,
                     "state": state,
-                    "last_complete_at": head.published_at if head else None,
+                    "last_complete_at": freshness_at,
                     "direct_requests": 0,
                     "request_budget": DEFAULT_MAX_REQUESTS,
                     "proxy_bytes": 0,

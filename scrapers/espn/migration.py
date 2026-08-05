@@ -52,6 +52,8 @@ BASELINE_VERSION = "espn-legacy-baseline-v1"
 ABSENCE_BASELINE_VERSION = "espn-absence-baseline-v1"
 LEGACY_PROMOTION_EVIDENCE_VERSION = "espn-v2-promotion-evidence-v2"
 PROMOTION_EVIDENCE_VERSION = "espn-v2-promotion-evidence-v3"
+V4_PROMOTION_EVIDENCE_VERSION = "espn-v2-promotion-evidence-v4"
+V4_MIGRATION_VERSION = "espn-native-bronze-v2-migration-v3"
 LEGACY_ROLLBACK_PLAN_VERSION = "espn-v2-rollback-plan-v1"
 ROLLBACK_PLAN_VERSION = "espn-v2-rollback-plan-v2"
 _SHA_RE = re.compile(r"[0-9a-f]{64}")
@@ -79,6 +81,20 @@ _MANIFEST_IDENTITY_COLUMNS = (
     "generation_signature",
     "manifest_sha256",
     "registry_signature",
+)
+_V4_MANIFEST_IDENTITY_COLUMNS = (
+    "status",
+    "scope_id",
+    "run_id",
+    "generation_id",
+    "generation_signature",
+    "manifest_sha256",
+    "registry_snapshot_uri",
+    "registry_signature",
+    "plan_signature",
+    "parser_version",
+    "runtime_version",
+    "completed_at",
 )
 
 
@@ -258,6 +274,8 @@ class GreenRunEvidence:
     run_registry_snapshot_ref: ArtifactRef
 
     def to_dict(self) -> dict[str, Any]:
+        """Frozen v2/v3 serialization used by existing hashes and retries."""
+
         return {
             "dag_id": self.dag_id,
             "run_id": self.run_id,
@@ -289,6 +307,162 @@ class GreenRunEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class QualificationIdentityV1:
+    dag_id: str
+    run_id: str
+    attempt: int
+    scope_id: str
+    state: str
+    registry_signature: str
+    plan_signature: str
+    recorded_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalGenerationIdentityV1:
+    dag_id: str
+    run_id: str
+    scope_id: str
+    generation_id: str
+    generation_signature: str
+    manifest_sha256: str
+    snapshot_ref: ArtifactRef
+    registry_snapshot_ref: ArtifactRef
+    registry_signature: str
+    plan_signature: str
+    parser_version: str
+    runtime_version: str
+    published_at: datetime
+    completed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class GreenRunEvidenceV4:
+    qualification: QualificationIdentityV1
+    physical_generation: PhysicalGenerationIdentityV1
+    as_of: date
+    logical_date: datetime
+    data_interval_start: datetime
+    data_interval_end: datetime
+    parent_run_id: str
+    durable_manifest_ref: ArtifactRef
+    run_evidence_ref: ArtifactRef
+    raw_manifest_ref: ArtifactRef
+    publication_ref: ArtifactRef
+    published_dq_ref: ArtifactRef
+    qualification_attestation_ref: ArtifactRef
+    terminal_verdict_ref: ArtifactRef
+    health_ref: ArtifactRef
+    lease_release_ref: ArtifactRef
+    success_receipt_ref: ArtifactRef
+    run_registry_snapshot_ref: ArtifactRef
+    selected_head: Mapping[str, Any]
+
+    @property
+    def dag_id(self) -> str:
+        return self.qualification.dag_id
+
+    @property
+    def run_id(self) -> str:
+        return self.qualification.run_id
+
+    @property
+    def attempt(self) -> int:
+        return self.qualification.attempt
+
+    @property
+    def scope_id(self) -> str:
+        return self.qualification.scope_id
+
+    @property
+    def state(self) -> str:
+        return self.qualification.state
+
+    @property
+    def registry_signature(self) -> str:
+        return self.qualification.registry_signature
+
+    @property
+    def plan_signature(self) -> str:
+        return self.qualification.plan_signature
+
+    @property
+    def recorded_at(self) -> datetime:
+        return self.qualification.recorded_at
+
+    @property
+    def generation_id(self) -> str:
+        return self.physical_generation.generation_id
+
+    @property
+    def generation_signature(self) -> str:
+        return self.physical_generation.generation_signature
+
+    @property
+    def manifest_sha256(self) -> str:
+        return self.physical_generation.manifest_sha256
+
+    @property
+    def generation_snapshot_ref(self) -> ArtifactRef:
+        return self.physical_generation.snapshot_ref
+
+    @property
+    def physical_run_id(self) -> str:
+        return self.physical_generation.run_id
+
+    @property
+    def physical_runtime_version(self) -> str:
+        return self.physical_generation.runtime_version
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "qualification": {
+                "dag_id": self.dag_id,
+                "run_id": self.run_id,
+                "attempt": self.attempt,
+                "scope_id": self.scope_id,
+                "state": self.state,
+                "registry_signature": self.registry_signature,
+                "plan_signature": self.plan_signature,
+                "recorded_at": self.recorded_at.isoformat(),
+            },
+            "physical_generation": {
+                "dag_id": self.physical_generation.dag_id,
+                "run_id": self.physical_generation.run_id,
+                "scope_id": self.physical_generation.scope_id,
+                "generation_id": self.generation_id,
+                "generation_signature": self.generation_signature,
+                "manifest_sha256": self.manifest_sha256,
+                "snapshot_ref": self.generation_snapshot_ref.to_dict(),
+                "registry_snapshot_ref": self.physical_generation.registry_snapshot_ref.to_dict(),
+                "registry_signature": self.physical_generation.registry_signature,
+                "plan_signature": self.physical_generation.plan_signature,
+                "parser_version": self.physical_generation.parser_version,
+                "runtime_version": self.physical_generation.runtime_version,
+                "published_at": self.physical_generation.published_at.isoformat(),
+                "completed_at": self.physical_generation.completed_at.isoformat(),
+            },
+            "as_of": self.as_of.isoformat(),
+            "logical_date": self.logical_date.isoformat(),
+            "data_interval_start": self.data_interval_start.isoformat(),
+            "data_interval_end": self.data_interval_end.isoformat(),
+            "parent_run_id": self.parent_run_id,
+            "durable_manifest_ref": self.durable_manifest_ref.to_dict(),
+            "run_evidence_ref": self.run_evidence_ref.to_dict(),
+            "raw_manifest_ref": self.raw_manifest_ref.to_dict(),
+            "publication_ref": self.publication_ref.to_dict(),
+            "published_dq_ref": self.published_dq_ref.to_dict(),
+            "qualification_attestation_ref": self.qualification_attestation_ref.to_dict(),
+            "terminal_verdict_ref": self.terminal_verdict_ref.to_dict(),
+            "health_ref": self.health_ref.to_dict(),
+            "lease_release_ref": self.lease_release_ref.to_dict(),
+            "success_receipt_ref": self.success_receipt_ref.to_dict(),
+            "run_registry_snapshot_ref": self.run_registry_snapshot_ref.to_dict(),
+            "selected_head": dict(self.selected_head),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class PromotionEvidence:
     evidence_version: str
     scope_id: str
@@ -299,7 +473,7 @@ class PromotionEvidence:
     cutover_id: str
     effective_at: datetime
     registry_snapshot_ref: ArtifactRef
-    green_runs: tuple[GreenRunEvidence, ...]
+    green_runs: tuple[GreenRunEvidence | GreenRunEvidenceV4, ...]
 
     @property
     def legacy_league(self) -> str | None:
@@ -388,13 +562,16 @@ def _read_bytes_ref(ref: ArtifactRef, *, reader: ArtifactReader, field: str) -> 
     return body
 
 
-def _load_green_run(
+def _load_green_run_common(
     raw: object,
     *,
     scope_id: str,
     reader: ArtifactReader,
     field: str,
+    expected_state: str = "complete",
 ) -> GreenRunEvidence:
+    if expected_state not in {"complete", "noop"}:
+        raise MigrationError(f"{field} state is invalid")
     if not isinstance(raw, Mapping) or set(raw) != {
         "durable_manifest_ref",
         "raw_manifest_ref",
@@ -460,7 +637,7 @@ def _load_green_run(
         summary.get("attempt"),
         summary.get("registry_signature"),
         summary.get("state"),
-    ) != (dag_id, run_id, attempt, registry_signature, "complete"):
+    ) != (dag_id, run_id, attempt, registry_signature, expected_state):
         raise MigrationError(f"{field} durable scope evidence identity mismatch")
     plan_signature = _sha(summary.get("plan_signature"), f"{field}.plan_signature")
     evidence_ref = ArtifactRef(
@@ -486,7 +663,7 @@ def _load_green_run(
         run_id,
         attempt,
         scope_id,
-        "complete",
+        expected_state,
         plan_signature,
         registry_signature,
     ):
@@ -524,8 +701,8 @@ def _load_green_run(
             f"{field} must bind one exact durable publication to scope evidence"
         )
     publication_ref, publication = publications[0]
-    if publication.get("state") != "complete":
-        raise MigrationError(f"{field} promotion run must publish a new generation")
+    if publication.get("state") != expected_state:
+        raise MigrationError(f"{field} publication state differs from run evidence")
     if (
         type(publication.get("proxy_bytes")) is not int
         or publication["proxy_bytes"] != 0
@@ -842,6 +1019,585 @@ def _load_green_run(
     )
 
 
+def _load_green_run(
+    raw: object,
+    *,
+    scope_id: str,
+    reader: ArtifactReader,
+    field: str,
+) -> GreenRunEvidence:
+    """Frozen complete-only v2/v3 promotion loader."""
+
+    return _load_green_run_common(
+        raw,
+        scope_id=scope_id,
+        reader=reader,
+        field=field,
+        expected_state="complete",
+    )
+
+
+_SELECTED_HEAD_FIELDS = {
+    "dag_id",
+    "scope_id",
+    "generation_id",
+    "generation_signature",
+    "manifest_sha256",
+    "snapshot_uri",
+    "snapshot_sha256",
+    "registry_signature",
+    "plan_signature",
+    "run_id",
+    "published_at",
+    "completed_at",
+}
+_PHYSICAL_FIELDS = {
+    "run_id",
+    "plan_signature",
+    "generation_id",
+    "generation_signature",
+    "manifest_sha256",
+    "registry_signature",
+    "parser_version",
+    "runtime_version",
+}
+_ATTESTATION_FIELDS = {
+    "kind",
+    "schema_version",
+    "dag_id",
+    "run_id",
+    "attempt",
+    "scope_id",
+    "state",
+    "registry_signature",
+    "plan_signature",
+    "lease_epoch",
+    "recorded_at",
+    "scope_binding_ref",
+    "run_evidence_ref",
+    "publication_ref",
+    "published_dq_ref",
+    "snapshot_ref",
+    "selected_head",
+    "physical_generation",
+}
+
+
+def _load_v4_binding(
+    ref: ArtifactRef,
+    *,
+    reader: ArtifactReader,
+    field: str,
+    expected: Mapping[str, Any],
+):
+    binding = _read_ref(ref, reader=reader, field=f"{field}.scope_binding_ref")
+    if set(binding) != {"kind", "schema_version", "scope_plan_ref", "lease"} or (
+        binding.get("kind"),
+        binding.get("schema_version"),
+    ) != ("espn-scope-lease-binding-v1", 1):
+        raise MigrationError(f"{field} scope binding schema mismatch")
+    descriptor_ref = ArtifactRef.from_mapping(
+        binding.get("scope_plan_ref"), field=f"{field}.scope_plan_ref"
+    )
+    descriptor = _read_ref(
+        descriptor_ref, reader=reader, field=f"{field}.scope_plan_ref"
+    )
+    descriptor_fields = {
+        "kind",
+        "schema_version",
+        "dag_id",
+        "run_id",
+        "attempt",
+        "mode",
+        "scope_id",
+        "plan_ref",
+        "plan_signature",
+        "raw_manifest_uri",
+        "raw_store_uri",
+        "generation_snapshot_uri",
+        "expected_scoreboard_batch",
+        "scoreboard_checkpoint_uri",
+        "scope_root",
+    }
+    if set(descriptor) != descriptor_fields or (
+        descriptor.get("kind"),
+        descriptor.get("schema_version"),
+        descriptor.get("dag_id"),
+        descriptor.get("run_id"),
+        descriptor.get("attempt"),
+        descriptor.get("mode"),
+        descriptor.get("scope_id"),
+        descriptor.get("plan_signature"),
+    ) != (
+        "espn-scope-plan-descriptor-v1",
+        1,
+        expected["dag_id"],
+        expected["run_id"],
+        expected["attempt"],
+        "daily",
+        expected["scope_id"],
+        expected["plan_signature"],
+    ):
+        raise MigrationError(f"{field} scope descriptor identity mismatch")
+    plan_ref = ArtifactRef.from_mapping(
+        descriptor.get("plan_ref"), field=f"{field}.plan_ref"
+    )
+    envelope = _read_ref(plan_ref, reader=reader, field=f"{field}.plan_ref")
+    if (
+        set(envelope) != {"kind", "plan", "signature"}
+        or envelope.get("kind") != runner.PLAN_KIND
+    ):
+        raise MigrationError(f"{field} signed plan schema mismatch")
+    try:
+        plan = runner._ingest_plan(envelope.get("plan"))
+    except Exception as exc:
+        raise MigrationError(f"{field} signed plan is invalid: {exc}") from exc
+    if envelope.get(
+        "signature"
+    ) != plan.signature() or plan.signature() != expected.get("plan_signature"):
+        raise MigrationError(f"{field} signed plan signature mismatch")
+    if (
+        plan.run_id,
+        plan.registry_signature,
+        plan.as_of.isoformat(),
+        len(plan.scopes),
+        plan.scopes[0].scope_id if plan.scopes else None,
+    ) != (
+        expected["run_id"],
+        expected["registry_signature"],
+        expected["as_of"],
+        1,
+        expected["scope_id"],
+    ):
+        raise MigrationError(f"{field} signed plan identity mismatch")
+    if not isinstance(plan.metadata, Mapping) or set(plan.metadata) != {"runtime"}:
+        raise MigrationError(f"{field} signed plan metadata schema mismatch")
+    runtime = plan.metadata.get("runtime")
+    runtime_fields = {
+        "mode",
+        "attempt",
+        "registry_snapshot_uri",
+        "raw_manifest_uri",
+        "output_uri",
+        "raw_store_uri",
+        "max_events",
+        "selected_scopes",
+        "scope_bindings",
+        "replay_source",
+    }
+    if not isinstance(runtime, Mapping) or set(runtime) != runtime_fields:
+        raise MigrationError(f"{field} signed plan runtime schema mismatch")
+    raw_bindings = runtime.get("scope_bindings")
+    if not isinstance(raw_bindings, Mapping) or set(raw_bindings) != {
+        expected["scope_id"]
+    }:
+        raise MigrationError(f"{field} signed scope binding set mismatch")
+    raw_binding = (
+        raw_bindings.get(expected["scope_id"])
+        if isinstance(raw_bindings, Mapping)
+        else None
+    )
+    try:
+        typed_binding = runner._scope_binding(raw_binding, expected["scope_id"])
+    except Exception as exc:
+        raise MigrationError(f"{field} signed scope binding is invalid: {exc}") from exc
+    if (
+        runtime.get("mode"),
+        runtime.get("attempt"),
+        runtime.get("registry_snapshot_uri"),
+        runtime.get("raw_manifest_uri"),
+        runtime.get("raw_store_uri"),
+        runtime.get("output_uri"),
+        runtime.get("max_events"),
+        tuple(runtime.get("selected_scopes", ())),
+        runtime.get("replay_source"),
+        typed_binding.generation_snapshot_uri,
+    ) != (
+        "daily",
+        expected["attempt"],
+        expected["registry_snapshot_uri"],
+        descriptor.get("raw_manifest_uri"),
+        descriptor.get("raw_store_uri"),
+        f"{str(descriptor.get('scope_root')).rstrip('/')}/runner-result.json",
+        100,
+        (expected["scope_id"],),
+        None,
+        descriptor.get("generation_snapshot_uri"),
+    ):
+        raise MigrationError(f"{field} signed plan runtime identity mismatch")
+    lease = binding.get("lease")
+    lease_epoch = lease.get("epoch") if isinstance(lease, Mapping) else None
+    if (
+        not isinstance(lease, Mapping)
+        or set(lease)
+        != {
+            "scope_id",
+            "owner_id",
+            "plan_signature",
+            "epoch",
+            "token_sha256",
+            "acquired_at",
+            "expires_at",
+        }
+        or (
+            lease.get("scope_id"),
+            lease.get("owner_id"),
+            lease.get("plan_signature"),
+        )
+        != (
+            expected["scope_id"],
+            f"{expected['dag_id']}/{expected['run_id']}/{expected['attempt']}",
+            expected["plan_signature"],
+        )
+        or type(lease_epoch) is not int
+        or not 1 <= expected["lease_epoch"] <= lease_epoch
+    ):
+        raise MigrationError(f"{field} lease owner identity mismatch")
+    _sha(lease.get("token_sha256"), f"{field}.lease.token_sha256")
+    _utc(lease.get("acquired_at"), f"{field}.lease.acquired_at")
+    _utc(lease.get("expires_at"), f"{field}.lease.expires_at")
+    return plan.scopes[0], typed_binding
+
+
+def _load_green_run_v4(
+    raw: object,
+    *,
+    scope_id: str,
+    registry_ref: ArtifactRef,
+    reader: ArtifactReader,
+    field: str,
+) -> GreenRunEvidence:
+    legacy_fields = {
+        "durable_manifest_ref",
+        "raw_manifest_ref",
+        "published_dq_ref",
+        "terminal_verdict_ref",
+        "health_ref",
+        "lease_release_ref",
+        "success_receipt_ref",
+    }
+    if not isinstance(raw, Mapping) or set(raw) != legacy_fields | {
+        "qualification_attestation_ref"
+    }:
+        raise MigrationError(f"{field} schema mismatch")
+    attestation_ref = ArtifactRef.from_mapping(
+        raw["qualification_attestation_ref"],
+        field=f"{field}.qualification_attestation_ref",
+    )
+    attestation = _read_ref(
+        attestation_ref,
+        reader=reader,
+        field=f"{field}.qualification_attestation_ref",
+    )
+    if set(attestation) != _ATTESTATION_FIELDS or (
+        attestation.get("kind"),
+        attestation.get("schema_version"),
+    ) != ("espn-scope-qualification-attestation-v1", 1):
+        raise MigrationError(f"{field} qualification attestation schema mismatch")
+    state = attestation.get("state")
+    if state not in {"complete", "noop"}:
+        raise MigrationError(f"{field} qualification state is invalid")
+    base = _load_green_run_common(
+        {key: raw[key] for key in legacy_fields},
+        scope_id=scope_id,
+        reader=reader,
+        field=field,
+        expected_state=state,
+    )
+    publication = _read_ref(
+        base.publication_ref, reader=reader, field=f"{field}.publication_ref"
+    )
+    published_dq = _read_ref(
+        base.published_dq_ref, reader=reader, field=f"{field}.published_dq_ref"
+    )
+    evidence_payload = _read_ref(
+        base.run_evidence_ref, reader=reader, field=f"{field}.run_evidence_ref"
+    )
+    scope_binding_ref = ArtifactRef.from_mapping(
+        attestation.get("scope_binding_ref"), field=f"{field}.scope_binding_ref"
+    )
+    snapshot_ref = ArtifactRef.from_mapping(
+        attestation.get("snapshot_ref"), field=f"{field}.snapshot_ref"
+    )
+    selected_head = attestation.get("selected_head")
+    physical = attestation.get("physical_generation")
+    if (
+        not isinstance(selected_head, Mapping)
+        or set(selected_head) != _SELECTED_HEAD_FIELDS
+    ):
+        raise MigrationError(f"{field} selected head schema mismatch")
+    if not isinstance(physical, Mapping) or set(physical) != _PHYSICAL_FIELDS:
+        raise MigrationError(f"{field} physical generation schema mismatch")
+    lease_epoch = _positive_int(attestation.get("lease_epoch"), f"{field}.lease_epoch")
+    expected_attestation = (
+        attestation.get("dag_id"),
+        attestation.get("run_id"),
+        attestation.get("attempt"),
+        attestation.get("scope_id"),
+        attestation.get("registry_signature"),
+        attestation.get("plan_signature"),
+        attestation.get("recorded_at"),
+        attestation.get("run_evidence_ref"),
+        attestation.get("publication_ref"),
+        attestation.get("published_dq_ref"),
+        publication.get("scope_binding_ref"),
+        publication.get("snapshot_ref"),
+        publication.get("selected_head"),
+        published_dq.get("current_selection"),
+        evidence_payload.get("lease_epoch"),
+    )
+    required_attestation = (
+        base.dag_id,
+        base.run_id,
+        base.attempt,
+        base.scope_id,
+        base.registry_signature,
+        base.plan_signature,
+        base.recorded_at.isoformat(),
+        base.run_evidence_ref.to_dict(),
+        base.publication_ref.to_dict(),
+        base.published_dq_ref.to_dict(),
+        scope_binding_ref.to_dict(),
+        snapshot_ref.to_dict(),
+        dict(selected_head),
+        dict(selected_head),
+        lease_epoch,
+    )
+    if expected_attestation != required_attestation:
+        raise MigrationError(f"{field} qualification attestation identity mismatch")
+    if state == "noop" and publication.get("publication_intent_ref") is not None:
+        raise MigrationError(f"{field} no-op publication must not have an intent")
+    if state == "complete":
+        intent_ref = ArtifactRef.from_mapping(
+            publication.get("publication_intent_ref"),
+            field=f"{field}.publication_intent_ref",
+        )
+        intent = _read_ref(
+            intent_ref, reader=reader, field=f"{field}.publication_intent_ref"
+        )
+        intent_fields = {
+            "kind",
+            "schema_version",
+            "dag_id",
+            "run_id",
+            "attempt",
+            "scope_id",
+            "plan_signature",
+            "registry_signature",
+            "generation_id",
+            "generation_signature",
+            "manifest_sha256",
+            "snapshot_ref",
+            "prepared_at",
+        }
+        if set(intent) != intent_fields or (
+            intent.get("kind"),
+            intent.get("schema_version"),
+            intent.get("dag_id"),
+            intent.get("run_id"),
+            intent.get("attempt"),
+            intent.get("scope_id"),
+            intent.get("plan_signature"),
+            intent.get("registry_signature"),
+            intent.get("generation_id"),
+            intent.get("generation_signature"),
+            intent.get("manifest_sha256"),
+            intent.get("snapshot_ref"),
+        ) != (
+            "espn-publication-intent-v1",
+            1,
+            base.dag_id,
+            base.run_id,
+            base.attempt,
+            base.scope_id,
+            base.plan_signature,
+            base.registry_signature,
+            base.generation_id,
+            base.generation_signature,
+            base.manifest_sha256,
+            snapshot_ref.to_dict(),
+        ):
+            raise MigrationError(f"{field} complete publication intent mismatch")
+        _utc(intent.get("prepared_at"), f"{field}.publication_intent.prepared_at")
+    scope, signed_binding = _load_v4_binding(
+        scope_binding_ref,
+        reader=reader,
+        field=field,
+        expected={
+            "dag_id": base.dag_id,
+            "run_id": base.run_id,
+            "attempt": base.attempt,
+            "scope_id": base.scope_id,
+            "registry_signature": base.registry_signature,
+            "plan_signature": base.plan_signature,
+            "registry_snapshot_uri": registry_ref.uri,
+            "lease_epoch": lease_epoch,
+            "as_of": base.as_of.isoformat(),
+        },
+    )
+    try:
+        generation = runner.load_scope_snapshot(
+            snapshot_ref.uri,
+            artifact_sha256=snapshot_ref.sha256,
+            expected_scope_id=scope_id,
+        )
+    except Exception as exc:
+        raise MigrationError(f"{field} physical snapshot is invalid: {exc}") from exc
+    if generation.plan != scope:
+        raise MigrationError(f"{field} physical scope plan differs from current plan")
+    physical_identity = (
+        generation.run_id,
+        generation.plan_signature,
+        generation.generation_id,
+        generation.generation_signature,
+        generation.manifest_sha256,
+        generation.registry_signature,
+        generation.parser_version,
+        generation.runtime_version,
+    )
+    required_physical = (
+        physical.get("run_id"),
+        physical.get("plan_signature"),
+        physical.get("generation_id"),
+        physical.get("generation_signature"),
+        physical.get("manifest_sha256"),
+        physical.get("registry_signature"),
+        physical.get("parser_version"),
+        physical.get("runtime_version"),
+    )
+    if physical_identity != required_physical:
+        raise MigrationError(f"{field} physical generation identity mismatch")
+    if (
+        base.generation_id,
+        base.generation_signature,
+        base.manifest_sha256,
+    ) != (
+        generation.generation_id,
+        generation.generation_signature,
+        generation.manifest_sha256,
+    ):
+        raise MigrationError(f"{field} run evidence differs from physical generation")
+    head_identity = (
+        selected_head.get("dag_id"),
+        selected_head.get("scope_id"),
+        selected_head.get("generation_id"),
+        selected_head.get("generation_signature"),
+        selected_head.get("manifest_sha256"),
+        selected_head.get("snapshot_uri"),
+        selected_head.get("snapshot_sha256"),
+        selected_head.get("registry_signature"),
+        selected_head.get("plan_signature"),
+        selected_head.get("run_id"),
+        selected_head.get("completed_at"),
+    )
+    if head_identity != (
+        _required(selected_head.get("dag_id"), f"{field}.selected_head.dag_id"),
+        scope_id,
+        generation.generation_id,
+        generation.generation_signature,
+        generation.manifest_sha256,
+        snapshot_ref.uri,
+        snapshot_ref.sha256,
+        generation.registry_signature,
+        generation.plan_signature,
+        generation.run_id,
+        generation.ingested_at.isoformat(),
+    ):
+        raise MigrationError(f"{field} selected head differs from physical generation")
+    _utc(selected_head.get("published_at"), f"{field}.selected_head.published_at")
+    if (
+        generation.registry_snapshot_uri != registry_ref.uri
+        or generation.registry_signature != base.registry_signature
+        or generation.parser_version != runner.PARSER_VERSION
+        or generation.runtime_version != runner.RUNTIME_VERSION
+    ):
+        raise MigrationError(f"{field} physical generation policy mismatch")
+    prior = signed_binding.prior
+    if state == "noop":
+        if prior is None or (
+            prior.uri,
+            prior.artifact_sha256,
+            prior.scope_id,
+            prior.generation_id,
+            prior.generation_signature,
+            prior.manifest_sha256,
+        ) != (
+            snapshot_ref.uri,
+            snapshot_ref.sha256,
+            scope_id,
+            generation.generation_id,
+            generation.generation_signature,
+            generation.manifest_sha256,
+        ):
+            raise MigrationError(f"{field} signed no-op prior identity mismatch")
+    elif (
+        generation.run_id,
+        generation.plan_signature,
+        generation.generation_id,
+        generation.batch_id,
+        generation.ingested_at,
+        snapshot_ref.uri,
+    ) != (
+        base.run_id,
+        base.plan_signature,
+        signed_binding.generation_id,
+        signed_binding.batch_id,
+        signed_binding.ingested_at,
+        signed_binding.generation_snapshot_uri,
+    ):
+        raise MigrationError(f"{field} complete physical/current identity mismatch")
+    return GreenRunEvidenceV4(
+        qualification=QualificationIdentityV1(
+            dag_id=base.dag_id,
+            run_id=base.run_id,
+            attempt=base.attempt,
+            scope_id=base.scope_id,
+            state=state,
+            registry_signature=base.registry_signature,
+            plan_signature=base.plan_signature,
+            recorded_at=base.recorded_at,
+        ),
+        physical_generation=PhysicalGenerationIdentityV1(
+            dag_id=_required(
+                selected_head.get("dag_id"), f"{field}.selected_head.dag_id"
+            ),
+            run_id=generation.run_id,
+            scope_id=base.scope_id,
+            generation_id=generation.generation_id,
+            generation_signature=generation.generation_signature,
+            manifest_sha256=generation.manifest_sha256,
+            snapshot_ref=snapshot_ref,
+            registry_snapshot_ref=registry_ref,
+            registry_signature=generation.registry_signature,
+            plan_signature=generation.plan_signature,
+            parser_version=generation.parser_version,
+            runtime_version=generation.runtime_version,
+            published_at=_utc(
+                selected_head.get("published_at"),
+                f"{field}.selected_head.published_at",
+            ),
+            completed_at=generation.ingested_at,
+        ),
+        as_of=base.as_of,
+        logical_date=base.logical_date,
+        data_interval_start=base.data_interval_start,
+        data_interval_end=base.data_interval_end,
+        parent_run_id=base.parent_run_id,
+        durable_manifest_ref=base.durable_manifest_ref,
+        run_evidence_ref=base.run_evidence_ref,
+        raw_manifest_ref=base.raw_manifest_ref,
+        publication_ref=base.publication_ref,
+        published_dq_ref=base.published_dq_ref,
+        qualification_attestation_ref=attestation_ref,
+        terminal_verdict_ref=base.terminal_verdict_ref,
+        health_ref=base.health_ref,
+        lease_release_ref=base.lease_release_ref,
+        success_receipt_ref=base.success_receipt_ref,
+        run_registry_snapshot_ref=base.run_registry_snapshot_ref,
+        selected_head=dict(selected_head),
+    )
+
+
 def load_promotion_evidence(
     path: str | Path,
     *,
@@ -868,7 +1624,8 @@ def load_promotion_evidence(
         common | {"legacy_league", "legacy_season"}
         if evidence_version == LEGACY_PROMOTION_EVIDENCE_VERSION
         else common | {"fallback"}
-        if evidence_version == PROMOTION_EVIDENCE_VERSION
+        if evidence_version
+        in {PROMOTION_EVIDENCE_VERSION, V4_PROMOTION_EVIDENCE_VERSION}
         else set()
     )
     if not expected:
@@ -900,11 +1657,21 @@ def load_promotion_evidence(
         document["registry_snapshot_ref"], field="registry_snapshot_ref"
     )
     runs = tuple(
-        _load_green_run(
-            raw,
-            scope_id=scope_id,
-            reader=reader,
-            field=f"green_runs[{index}]",
+        (
+            _load_green_run_v4(
+                raw,
+                scope_id=scope_id,
+                registry_ref=registry_ref,
+                reader=reader,
+                field=f"green_runs[{index}]",
+            )
+            if evidence_version == V4_PROMOTION_EVIDENCE_VERSION
+            else _load_green_run(
+                raw,
+                scope_id=scope_id,
+                reader=reader,
+                field=f"green_runs[{index}]",
+            )
         )
         for index, raw in enumerate(raw_runs)
     )
@@ -933,6 +1700,20 @@ def load_promotion_evidence(
         for left, right in zip(runs, runs[1:])
     ):
         raise MigrationError("green runs must have adjacent daily-owner data intervals")
+    if evidence_version == V4_PROMOTION_EVIDENCE_VERSION:
+        v4_runs = tuple(item for item in runs if isinstance(item, GreenRunEvidenceV4))
+        if len(v4_runs) != 3:
+            raise MigrationError("v4 promotion contains a legacy green run")
+        if (
+            all(item.state == "noop" for item in v4_runs)
+            and len({canonical_json(item.selected_head) for item in v4_runs}) != 1
+        ):
+            raise MigrationError("three v4 no-ops must bind one physical head")
+        if any(
+            right.state == "noop" and right.selected_head != left.selected_head
+            for left, right in zip(v4_runs, v4_runs[1:])
+        ):
+            raise MigrationError("v4 no-op differs from preceding physical head")
     if (
         any(
             item.run_registry_snapshot_ref.sha256 != registry_ref.sha256
@@ -941,6 +1722,10 @@ def load_promotion_evidence(
         or runs[-1].run_registry_snapshot_ref != registry_ref
     ):
         raise MigrationError("green runs do not use one exact registry content")
+    if evidence_version == V4_PROMOTION_EVIDENCE_VERSION and any(
+        item.run_registry_snapshot_ref != registry_ref for item in runs
+    ):
+        raise MigrationError("v4 green runs do not use the exact frozen registry")
 
     try:
         registry_document = yaml.safe_load(
@@ -954,6 +1739,12 @@ def load_promotion_evidence(
     registry_signature = runs[0].registry_signature
     if registry.signature() != registry_signature:
         raise MigrationError("registry snapshot signature differs from green runs")
+    if evidence_version == V4_PROMOTION_EVIDENCE_VERSION:
+        frozen_scopes = tuple(
+            sorted(item.scope_id(item.current_edition) for item in registry.promoted)
+        )
+        if len(frozen_scopes) != 181 or len(set(frozen_scopes)) != 181:
+            raise MigrationError("v4 promotion requires the frozen 181-scope registry")
     competition = registry.by_id.get(espn_id)
     edition = (
         next(
@@ -1031,8 +1822,28 @@ def migration_statements(
     return tuple(statements)
 
 
-def _candidate(run: GreenRunEvidence) -> dict[str, Any]:
+def _is_v4(evidence: PromotionEvidence) -> bool:
+    return evidence.evidence_version == V4_PROMOTION_EVIDENCE_VERSION
+
+
+def _migration_version(evidence: PromotionEvidence) -> str:
+    return V4_MIGRATION_VERSION if _is_v4(evidence) else MIGRATION_VERSION
+
+
+def _run_dict(
+    evidence: PromotionEvidence, run: GreenRunEvidence | GreenRunEvidenceV4
+) -> dict[str, Any]:
+    if _is_v4(evidence):
+        if not isinstance(run, GreenRunEvidenceV4):
+            raise MigrationError("v4 promotion contains legacy green-run evidence")
+        return run.to_dict()
+    if not isinstance(run, GreenRunEvidence):
+        raise MigrationError("legacy promotion contains v4 green-run evidence")
     return run.to_dict()
+
+
+def _candidate(evidence: PromotionEvidence) -> dict[str, Any]:
+    return _run_dict(evidence, evidence.green_runs[-1])
 
 
 def _rollback_instructions(
@@ -1078,7 +1889,7 @@ def build_promotion_plan(
         raise TypeError("evidence must be PromotionEvidence")
     output = Path(output_path)
     result = {
-        "schema_version": MIGRATION_VERSION,
+        "schema_version": _migration_version(evidence),
         "mode": "dry_run",
         "status": "planned",
         "mutates": False,
@@ -1086,8 +1897,8 @@ def build_promotion_plan(
         "registry_snapshot_ref": evidence.registry_snapshot_ref.to_dict(),
         "fallback": evidence.fallback.to_dict(),
         "trust_label": evidence.trust_label,
-        "green_runs": [item.to_dict() for item in evidence.green_runs],
-        "candidate": _candidate(evidence.green_runs[-1]),
+        "green_runs": [_run_dict(evidence, item) for item in evidence.green_runs],
+        "candidate": _candidate(evidence),
         "statements": list(migration_statements(catalog=catalog, schema=schema)),
         "baseline": {
             "table": f"{catalog}.{schema}.{BASELINE_TABLE}",
@@ -1112,7 +1923,9 @@ class MigrationBackend(Protocol):
     def absence_baseline(self) -> Mapping[str, int]: ...
 
     def verify_candidate(
-        self, candidate: GreenRunEvidence, registry_snapshot_ref: ArtifactRef
+        self,
+        candidate: GreenRunEvidence | GreenRunEvidenceV4,
+        registry_snapshot_ref: ArtifactRef,
     ) -> None: ...
 
     def complete_manifest(
@@ -1120,6 +1933,10 @@ class MigrationBackend(Protocol):
     ) -> Mapping[str, Any] | None: ...
 
     def latest_complete_manifest(self, scope_id: str) -> Mapping[str, Any] | None: ...
+
+    def latest_complete_manifest_v4(
+        self, scope_id: str
+    ) -> Mapping[str, Any] | None: ...
 
     def baseline(self, scope_id: str) -> Mapping[str, Any] | None: ...
 
@@ -1141,11 +1958,14 @@ class LeaseStore(Protocol):
 
     def release(self, lease: object, *, now: datetime) -> None: ...
 
+    def current_scope_head(self, scope_id: str) -> object | None: ...
+
 
 def _manifest_matches(
-    manifest: Mapping[str, Any] | None, run: GreenRunEvidence
+    manifest: Mapping[str, Any] | None,
+    run: GreenRunEvidence | GreenRunEvidenceV4,
 ) -> bool:
-    return manifest is not None and (
+    legacy_match = manifest is not None and (
         manifest.get("status"),
         manifest.get("scope_id"),
         manifest.get("generation_id"),
@@ -1160,6 +1980,72 @@ def _manifest_matches(
         run.manifest_sha256,
         run.registry_signature,
     )
+    if not legacy_match or not isinstance(run, GreenRunEvidenceV4):
+        return legacy_match
+    return (
+        manifest.get("run_id"),
+        manifest.get("registry_snapshot_uri"),
+        manifest.get("plan_signature"),
+        manifest.get("parser_version"),
+        manifest.get("runtime_version"),
+        _jsonable(manifest.get("completed_at")),
+    ) == (
+        run.physical_generation.run_id,
+        run.physical_generation.registry_snapshot_ref.uri,
+        run.physical_generation.plan_signature,
+        run.physical_generation.parser_version,
+        run.physical_generation.runtime_version,
+        run.physical_generation.completed_at.isoformat(),
+    )
+
+
+def _control_head_dict(head: object | None) -> dict[str, Any] | None:
+    if head is None:
+        return None
+    if isinstance(head, Mapping):
+        return dict(head)
+    try:
+        completed_at = getattr(head, "completed_at")
+        published_at = getattr(head, "published_at")
+        return {
+            "dag_id": getattr(head, "dag_id"),
+            "scope_id": getattr(head, "scope_id"),
+            "generation_id": getattr(head, "generation_id"),
+            "generation_signature": getattr(head, "generation_signature"),
+            "manifest_sha256": getattr(head, "manifest_sha256"),
+            "snapshot_uri": getattr(head, "snapshot_uri"),
+            "snapshot_sha256": getattr(head, "snapshot_sha256"),
+            "registry_signature": getattr(head, "registry_signature"),
+            "plan_signature": getattr(head, "plan_signature"),
+            "run_id": getattr(head, "run_id"),
+            "published_at": published_at.isoformat(),
+            "completed_at": completed_at.isoformat(),
+        }
+    except (AttributeError, TypeError) as exc:
+        raise MigrationError("current control head is malformed") from exc
+
+
+def _reverify_v4_candidate(
+    evidence: PromotionEvidence,
+    *,
+    backend: MigrationBackend,
+    lease_store: LeaseStore,
+) -> None:
+    if not _is_v4(evidence):
+        return
+    candidate = evidence.green_runs[-1]
+    current_head = _control_head_dict(lease_store.current_scope_head(evidence.scope_id))
+    if current_head != candidate.selected_head:
+        raise MigrationError("current control head changed before promotion mutation")
+    manifest = backend.complete_manifest(evidence.scope_id, candidate.generation_id)
+    if not _manifest_matches(manifest, candidate):
+        raise MigrationError(
+            "physical COMPLETE manifest changed before promotion mutation"
+        )
+    latest = backend.latest_complete_manifest_v4(evidence.scope_id)
+    if not _manifest_matches(latest, candidate):
+        raise MigrationError("newer COMPLETE manifest exists before promotion mutation")
+    backend.verify_candidate(candidate, evidence.registry_snapshot_ref)
 
 
 def _baseline_row(
@@ -1344,7 +2230,7 @@ def _native_cutover(
         rollback_run_id=None,
         rollback_reason=None,
         metadata={
-            "migration_version": MIGRATION_VERSION,
+            "migration_version": _migration_version(evidence),
             "fallback": evidence.fallback.to_dict(),
             "baseline_sha256": baseline["baseline_sha256"],
             "durable_manifest_ref": candidate.durable_manifest_ref.to_dict(),
@@ -1353,7 +2239,9 @@ def _native_cutover(
             "registry_snapshot_ref": evidence.registry_snapshot_ref.to_dict(),
             "generation_snapshot_ref": candidate.generation_snapshot_ref.to_dict(),
             "success_receipt_ref": candidate.success_receipt_ref.to_dict(),
-            "three_green_runs": [item.to_dict() for item in evidence.green_runs],
+            "three_green_runs": [
+                _run_dict(evidence, item) for item in evidence.green_runs
+            ],
         },
         ancestor_cutover_sha256s=ancestors,
     )
@@ -1365,7 +2253,7 @@ def _promotion_result(
     cutover: ScopeCutover,
 ) -> dict[str, Any]:
     result = {
-        "schema_version": MIGRATION_VERSION,
+        "schema_version": _migration_version(evidence),
         "mode": "apply",
         "status": "promoted",
         "mutates": True,
@@ -1373,8 +2261,8 @@ def _promotion_result(
         "registry_snapshot_ref": evidence.registry_snapshot_ref.to_dict(),
         "fallback": evidence.fallback.to_dict(),
         "trust_label": evidence.trust_label,
-        "green_runs": [item.to_dict() for item in evidence.green_runs],
-        "candidate": _candidate(evidence.green_runs[-1]),
+        "green_runs": [_run_dict(evidence, item) for item in evidence.green_runs],
+        "candidate": _candidate(evidence),
         "baseline": _jsonable(baseline),
         "cutover": {
             **cutover.to_row(),
@@ -1451,7 +2339,7 @@ def _is_exact_committed_promotion(
         and evidence.cutover_id == expected_id
         and fallback_metadata_matches
         and canonical_json(metadata.get("three_green_runs"))
-        == canonical_json([item.to_dict() for item in evidence.green_runs])
+        == canonical_json([_run_dict(evidence, item) for item in evidence.green_runs])
     )
 
 
@@ -1496,6 +2384,9 @@ def apply_promotion(
                         "scope already has a different native cutover head"
                     )
                 cutover = latest
+                _reverify_v4_candidate(
+                    evidence, backend=backend, lease_store=lease_store
+                )
                 backend.append_cutover(cutover)
             else:
                 predecessor = latest
@@ -1513,7 +2404,11 @@ def apply_promotion(
                     raise MigrationError(
                         "candidate is not bound to the exact physical COMPLETE manifest"
                     )
-                latest_manifest = backend.latest_complete_manifest(evidence.scope_id)
+                latest_manifest = (
+                    backend.latest_complete_manifest_v4(evidence.scope_id)
+                    if _is_v4(evidence)
+                    else backend.latest_complete_manifest(evidence.scope_id)
+                )
                 if not _manifest_matches(latest_manifest, candidate):
                     raise MigrationError(
                         "candidate is no longer the latest COMPLETE manifest under lease"
@@ -1534,8 +2429,14 @@ def apply_promotion(
                         snapshot_ids=snapshot_ids,
                         captured_at=observed_at,
                     )
+                    _reverify_v4_candidate(
+                        evidence, backend=backend, lease_store=lease_store
+                    )
                     backend.append_baseline(baseline)
                 cutover = _native_cutover(evidence, baseline, predecessor)
+                _reverify_v4_candidate(
+                    evidence, backend=backend, lease_store=lease_store
+                )
                 backend.append_cutover(cutover)
     finally:
         lease_store.release(lease, now=observed_at)
@@ -1551,7 +2452,7 @@ def build_rollback_plan(
     if (
         not isinstance(promotion_report, Mapping)
         or promotion_report.get("schema_version")
-        not in {MIGRATION_VERSION, LEGACY_MIGRATION_VERSION}
+        not in {V4_MIGRATION_VERSION, MIGRATION_VERSION, LEGACY_MIGRATION_VERSION}
         or promotion_report.get("status") != "promoted"
     ):
         raise MigrationError("rollback requires a successful promotion report")
@@ -1566,7 +2467,10 @@ def build_rollback_plan(
     baseline = promotion_report.get("baseline")
     if not all(isinstance(value, Mapping) for value in (cutover, candidate, baseline)):
         raise MigrationError("promotion report rollback binding is incomplete")
-    if promotion_report.get("schema_version") == MIGRATION_VERSION:
+    if promotion_report.get("schema_version") in {
+        V4_MIGRATION_VERSION,
+        MIGRATION_VERSION,
+    }:
         fallback = FallbackDescriptor.from_mapping(promotion_report.get("fallback"))
     else:
         legacy = promotion_report.get("legacy_scope")
@@ -1626,7 +2530,8 @@ def build_rollback_plan(
         and metadata.get("fallback") is None
     )
     if metadata.get("baseline_sha256") != baseline_sha256 or (
-        promotion_report.get("schema_version") == MIGRATION_VERSION
+        promotion_report.get("schema_version")
+        in {V4_MIGRATION_VERSION, MIGRATION_VERSION}
         and metadata.get("fallback") != fallback.to_dict()
         and not legacy_metadata_compatibility
     ):
@@ -1937,7 +2842,9 @@ WHERE league = ? AND CAST(season AS varchar) = ?""",
         return output, snapshot_ids
 
     def verify_candidate(
-        self, candidate: GreenRunEvidence, registry_snapshot_ref: ArtifactRef
+        self,
+        candidate: GreenRunEvidence | GreenRunEvidenceV4,
+        registry_snapshot_ref: ArtifactRef,
     ) -> None:
         try:
             generation = runner.load_scope_snapshot(
@@ -1949,6 +2856,16 @@ WHERE league = ? AND CAST(season AS varchar) = ?""",
             raise MigrationError(
                 f"cannot load candidate generation snapshot: {exc}"
             ) from exc
+        physical_run_id = (
+            candidate.physical_generation.run_id
+            if isinstance(candidate, GreenRunEvidenceV4)
+            else candidate.run_id
+        )
+        physical_plan_signature = (
+            candidate.physical_generation.plan_signature
+            if isinstance(candidate, GreenRunEvidenceV4)
+            else candidate.plan_signature
+        )
         if (
             generation.run_id,
             generation.generation_id,
@@ -1958,15 +2875,28 @@ WHERE league = ? AND CAST(season AS varchar) = ?""",
             generation.registry_signature,
             generation.plan_signature,
         ) != (
-            candidate.run_id,
+            physical_run_id,
             candidate.generation_id,
             candidate.generation_signature,
             candidate.manifest_sha256,
             registry_snapshot_ref.uri,
             candidate.registry_signature,
-            candidate.plan_signature,
+            physical_plan_signature,
         ):
             raise MigrationError("candidate generation snapshot identity mismatch")
+        if isinstance(candidate, GreenRunEvidenceV4) and (
+            generation.parser_version,
+            generation.runtime_version,
+        ) != (
+            candidate.physical_generation.parser_version,
+            candidate.physical_generation.runtime_version,
+        ):
+            raise MigrationError("candidate physical parser/runtime identity mismatch")
+        if isinstance(candidate, GreenRunEvidenceV4) and (
+            generation.parser_version != runner.PARSER_VERSION
+            or generation.runtime_version != runner.RUNTIME_VERSION
+        ):
+            raise MigrationError("candidate physical runtime policy mismatch")
         try:
             report = self.repository.verify_published_scope(generation)
         except Exception as exc:
@@ -2003,6 +2933,27 @@ WHERE league = ? AND CAST(season AS varchar) = ?""",
         if len(values) != len(_MANIFEST_IDENTITY_COLUMNS):
             raise MigrationError("latest COMPLETE manifest row is malformed")
         return dict(zip(_MANIFEST_IDENTITY_COLUMNS, values))
+
+    def latest_complete_manifest_v4(self, scope_id: str) -> Mapping[str, Any] | None:
+        rows = self.repository._execute(
+            "SELECT "
+            + ", ".join(f'"{name}"' for name in _V4_MANIFEST_IDENTITY_COLUMNS)
+            + f" FROM {self.repository.catalog}.{self.repository.schema}.{MANIFEST_TABLE} "
+            + 'WHERE "scope_id" = ? AND "status" = \'complete\' '
+            + 'ORDER BY "completed_at" DESC, "generation_id" DESC, "manifest_sha256" DESC LIMIT 1',
+            (scope_id,),
+        )
+        if not rows:
+            return None
+        raw = rows[0]
+        values = (
+            tuple(raw.get(name) for name in _V4_MANIFEST_IDENTITY_COLUMNS)
+            if isinstance(raw, Mapping)
+            else tuple(raw)
+        )
+        if len(values) != len(_V4_MANIFEST_IDENTITY_COLUMNS):
+            raise MigrationError("latest v4 COMPLETE manifest row is malformed")
+        return dict(zip(_V4_MANIFEST_IDENTITY_COLUMNS, values))
 
     def baseline(self, scope_id: str) -> Mapping[str, Any] | None:
         rows = self.repository._execute(
@@ -2115,6 +3066,9 @@ class ProductionLeaseStore:
     def release(self, lease: object, *, now: datetime) -> None:
         self.store.release(lease, now=self.store.current_time())
 
+    def current_scope_head(self, scope_id: str) -> object | None:
+        return self.store.read_scope_heads((scope_id,)).get(scope_id)
+
 
 __all__ = [
     "ABSENCE_BASELINE_VERSION",
@@ -2129,6 +3083,8 @@ __all__ = [
     "ProductionLeaseStore",
     "PromotionEvidence",
     "PROMOTION_EVIDENCE_VERSION",
+    "V4_MIGRATION_VERSION",
+    "V4_PROMOTION_EVIDENCE_VERSION",
     "RepositoryMigrationBackend",
     "apply_promotion",
     "apply_rollback",

@@ -387,6 +387,41 @@ def test_run_evidence_identity_includes_dag_id_for_colliding_run_ids():
     assert [item.dag_id for item in repair] == ["dag_repair_espn"]
 
 
+def test_latest_run_evidence_is_read_only_and_ordered_by_recorded_at():
+    store = MemoryScopeLeaseStore()
+    now = datetime(2026, 7, 31, 12, tzinfo=UTC)
+    for index in (1, 2):
+        lease = store.acquire_many(
+            ("700:2026",),
+            owner_id=f"dag_ingest_espn/run-{index}/{index}",
+            plan_signature=str(index) * 64,
+            now=now + timedelta(hours=index),
+            ttl=timedelta(hours=1),
+        )[0]
+        evidence = RunManifestEvidence(
+            dag_id="dag_ingest_espn",
+            run_id=f"run-{index}",
+            attempt=index,
+            scope_id="700:2026",
+            plan_signature=str(index) * 64,
+            registry_signature="b" * 64,
+            state="noop",
+            evidence_uri=f"s3://evidence/run-{index}.json",
+            evidence_sha256=str(index + 2) * 64,
+            recorded_at=now + timedelta(hours=index),
+        )
+        with store.publication_guard(lease, now=evidence.recorded_at) as fence:
+            fence.record_evidence(evidence)
+        store.release(lease, now=evidence.recorded_at)
+
+    latest = store.read_latest_run_evidence_by_scope(
+        ("700:2026",), dag_id="dag_ingest_espn"
+    )
+
+    assert latest["700:2026"].run_id == "run-2"
+    assert store.read_scope_heads(("700:2026",)) == {}
+
+
 def test_postgres_evidence_read_binds_exact_dag_run_and_attempt():
     executed = []
 

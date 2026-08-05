@@ -5559,6 +5559,8 @@ def test_published_dq_verifies_current_views_for_the_active_route(
         run_id=loaded.plan.run_id,
         registry_signature=loaded.plan.registry_signature,
         plan_signature=loaded.signature,
+        parser_version="espn-native-parser-v2",
+        runtime_version="espn-native-runtime-v3",
         ingested_at=completed_at,
     )
     snapshot_ref = {
@@ -5596,7 +5598,7 @@ def test_published_dq_verifies_current_views_for_the_active_route(
         "state": "complete",
         "selected_head": espn_native_tasks._head_to_dict(head),
     }
-    evidence = {"recorded_at": completed_at.isoformat()}
+    evidence = {"recorded_at": completed_at.isoformat(), "lease_epoch": 7}
     descriptor = {
         "dag_id": head.dag_id,
         "scope_root": "s3://artifacts/scope",
@@ -5724,24 +5726,30 @@ def test_published_dq_verifies_current_views_for_the_active_route(
         "binding",
         "evidence",
     ]
-    assert writes == [
-        (
-            "s3://artifacts/scope/published-dq.json",
-            {
-                "kind": "espn-published-dq-result-v1",
-                "schema_version": 1,
-                "dag_id": head.dag_id,
-                "scope_id": scope.scope_id,
-                "run_id": loaded.plan.run_id,
-                "attempt": loaded.attempt,
-                "plan_signature": loaded.signature,
-                "registry_signature": loaded.plan.registry_signature,
-                "publication_ref": publication_ref,
-                "current_selection": espn_native_tasks._head_to_dict(head),
-                "quality": {"passed": True, "schedule_rows": 380},
-            },
-        )
-    ]
+    assert writes[0] == (
+        "s3://artifacts/scope/published-dq.json",
+        {
+            "kind": "espn-published-dq-result-v1",
+            "schema_version": 1,
+            "dag_id": head.dag_id,
+            "scope_id": scope.scope_id,
+            "run_id": loaded.plan.run_id,
+            "attempt": loaded.attempt,
+            "plan_signature": loaded.signature,
+            "registry_signature": loaded.plan.registry_signature,
+            "publication_ref": publication_ref,
+            "current_selection": espn_native_tasks._head_to_dict(head),
+            "quality": {"passed": True, "schedule_rows": 380},
+        },
+    )
+    assert writes[1][0] == "s3://artifacts/scope/qualification-attestation.json"
+    assert writes[1][1]["physical_generation"]["runtime_version"] == (
+        "espn-native-runtime-v3"
+    )
+    assert result["qualification_attestation_ref"] == {
+        "uri": "s3://artifacts/scope/qualification-attestation.json",
+        "sha256": "4" * 64,
+    }
 
 
 def test_legacy_head_divergence_fails_before_hydration(monkeypatch):
@@ -6166,7 +6174,7 @@ def test_monitor_rejects_tampered_frozen_registry_projection(
         )
 
 
-def test_monitor_rejects_complete_head_from_another_registry(monkeypatch):
+def test_monitor_retains_physical_head_freshness_from_another_registry(monkeypatch):
     from dags.utils import espn_native_tasks
 
     database_now = datetime(2026, 7, 31, 13, tzinfo=timezone.utc)
@@ -6243,8 +6251,8 @@ def test_monitor_rejects_complete_head_from_another_registry(monkeypatch):
         params={"attempt": 1},
     )
 
-    assert observed[0]["state"] == "incomplete"
-    assert observed[0]["last_complete_at"] is None
+    assert observed[0]["state"] == "complete"
+    assert observed[0]["last_complete_at"] == database_now
     assert observed[0]["identity_kind"] == "scope-head"
     assert observed[0]["identity_sha256"] == "d" * 64
 
@@ -6625,3 +6633,241 @@ def test_final_leaf_seals_success_only_after_health_and_release(monkeypatch):
         "/lease-release.json"
     )
     assert len(written["payload"]["receipt_sha256"]) == 64
+
+
+def test_exact_v4_noop_attestation_refreshes_without_moving_old_head(monkeypatch):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.operations import RunManifestEvidence, ScopeHead
+    from scrapers.espn import runner
+
+    old = datetime(2026, 7, 29, 9, tzinfo=timezone.utc)
+    fresh = datetime(2026, 8, 1, 14, 30, tzinfo=timezone.utc)
+    head = ScopeHead(
+        dag_id="dag_ingest_espn",
+        scope_id="700:2026",
+        generation_id="physical-generation",
+        generation_signature="a" * 64,
+        manifest_sha256="b" * 64,
+        snapshot_uri="s3://artifacts/physical/generation.json",
+        snapshot_sha256="c" * 64,
+        registry_signature="d" * 64,
+        plan_signature="e" * 64,
+        run_id="physical-run",
+        published_at=old,
+        completed_at=old - timedelta(minutes=1),
+    )
+    evidence = RunManifestEvidence(
+        dag_id="dag_ingest_espn",
+        run_id="qualification-run",
+        attempt=3,
+        scope_id=head.scope_id,
+        plan_signature="f" * 64,
+        registry_signature=head.registry_signature,
+        state="noop",
+        evidence_uri="s3://artifacts/qualification/run-evidence.json",
+        evidence_sha256="1" * 64,
+        recorded_at=fresh,
+    )
+    selected = espn_native_tasks._head_to_dict(head)
+    evidence_ref = {"uri": evidence.evidence_uri, "sha256": evidence.evidence_sha256}
+    publication_ref = {
+        "uri": "s3://artifacts/qualification/publication.json",
+        "sha256": "2" * 64,
+    }
+    dq_ref = {
+        "uri": "s3://artifacts/qualification/published-dq.json",
+        "sha256": "3" * 64,
+    }
+    snapshot_ref = {"uri": head.snapshot_uri, "sha256": head.snapshot_sha256}
+    evidence_payload = {
+        "dag_id": evidence.dag_id,
+        "run_id": evidence.run_id,
+        "attempt": evidence.attempt,
+        "scope_id": evidence.scope_id,
+        "plan_signature": evidence.plan_signature,
+        "registry_signature": evidence.registry_signature,
+        "state": evidence.state,
+        "recorded_at": evidence.recorded_at.isoformat(),
+        "lease_epoch": 3,
+        "generation_id": head.generation_id,
+        "generation_signature": head.generation_signature,
+        "manifest_sha256": head.manifest_sha256,
+    }
+    physical = {
+        "run_id": head.run_id,
+        "plan_signature": head.plan_signature,
+        "generation_id": head.generation_id,
+        "generation_signature": head.generation_signature,
+        "manifest_sha256": head.manifest_sha256,
+        "registry_signature": head.registry_signature,
+        "parser_version": runner.PARSER_VERSION,
+        "runtime_version": runner.RUNTIME_VERSION,
+    }
+    attestation = {
+        "kind": "espn-scope-qualification-attestation-v1",
+        "schema_version": 1,
+        "dag_id": evidence.dag_id,
+        "run_id": evidence.run_id,
+        "attempt": evidence.attempt,
+        "scope_id": evidence.scope_id,
+        "state": evidence.state,
+        "registry_signature": evidence.registry_signature,
+        "plan_signature": evidence.plan_signature,
+        "lease_epoch": 3,
+        "recorded_at": evidence.recorded_at.isoformat(),
+        "run_evidence_ref": evidence_ref,
+        "scope_binding_ref": {
+            "uri": "s3://artifacts/qualification/binding.json",
+            "sha256": "4" * 64,
+        },
+        "publication_ref": publication_ref,
+        "published_dq_ref": dq_ref,
+        "snapshot_ref": snapshot_ref,
+        "selected_head": selected,
+        "physical_generation": physical,
+    }
+    publication = {
+        "evidence_ref": evidence_ref,
+        "state": "noop",
+        "snapshot_ref": snapshot_ref,
+        "selected_head": selected,
+        "publication_intent_ref": None,
+        "scope_binding_ref": attestation["scope_binding_ref"],
+    }
+    dq = {
+        "publication_ref": publication_ref,
+        "dag_id": evidence.dag_id,
+        "run_id": evidence.run_id,
+        "attempt": evidence.attempt,
+        "scope_id": evidence.scope_id,
+        "plan_signature": evidence.plan_signature,
+        "registry_signature": evidence.registry_signature,
+        "current_selection": selected,
+        "quality": {"passed": True, "failures": []},
+    }
+
+    def read_ref(_ref, *, kind=None):
+        return {
+            "espn-run-manifest-evidence-v1": evidence_payload,
+            "espn-scope-qualification-attestation-v1": attestation,
+            "espn-publication-result-v1": publication,
+            "espn-published-dq-result-v1": dq,
+        }[kind]
+
+    generation = SimpleNamespace(
+        plan=SimpleNamespace(scope_id=head.scope_id),
+        run_id=head.run_id,
+        plan_signature=head.plan_signature,
+        generation_id=head.generation_id,
+        generation_signature=head.generation_signature,
+        manifest_sha256=head.manifest_sha256,
+        registry_signature=head.registry_signature,
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_verified_complete_head",
+        lambda *_args, **_kwargs: (head, "complete"),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", read_ref)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_binding",
+        lambda _ref: (
+            {},
+            {"dag_id": evidence.dag_id},
+            SimpleNamespace(
+                plan=SimpleNamespace(
+                    run_id=evidence.run_id,
+                    registry_signature=evidence.registry_signature,
+                ),
+                attempt=evidence.attempt,
+                signature=evidence.plan_signature,
+                bindings={
+                    evidence.scope_id: SimpleNamespace(
+                        prior=SimpleNamespace(
+                            uri=head.snapshot_uri,
+                            artifact_sha256=head.snapshot_sha256,
+                            scope_id=head.scope_id,
+                            generation_id=head.generation_id,
+                            generation_signature=head.generation_signature,
+                            manifest_sha256=head.manifest_sha256,
+                        )
+                    )
+                },
+            ),
+            generation.plan,
+            SimpleNamespace(
+                scope_id=evidence.scope_id,
+                owner_id=f"{evidence.dag_id}/{evidence.run_id}/{evidence.attempt}",
+                plan_signature=evidence.plan_signature,
+                epoch=3,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_ref_for_uri",
+        lambda uri: {"uri": uri, "sha256": "9" * 64},
+    )
+    monkeypatch.setattr(
+        runner, "load_scope_snapshot", lambda *_args, **_kwargs: generation
+    )
+
+    verified, state, freshness_at = espn_native_tasks._qualified_freshness_at(
+        head,
+        evidence,
+        expected_registry_signature=head.registry_signature,
+        observed_at=fresh + timedelta(minutes=1),
+    )
+
+    assert (verified, state, freshness_at) == (head, "complete", fresh)
+    assert head.published_at == old
+
+    physical["runtime_version"] = "espn-native-runtime-v2"
+    assert (
+        espn_native_tasks._qualified_freshness_at(
+            head,
+            evidence,
+            expected_registry_signature=head.registry_signature,
+            observed_at=fresh + timedelta(minutes=1),
+        )[2]
+        == old
+    )
+
+    physical["runtime_version"] = runner.RUNTIME_VERSION
+    stale_evidence = replace(evidence, recorded_at=old - timedelta(minutes=1))
+    assert (
+        espn_native_tasks._qualified_freshness_at(
+            head,
+            stale_evidence,
+            expected_registry_signature=head.registry_signature,
+            observed_at=fresh + timedelta(minutes=1),
+        )[2]
+        == old
+    )
+    mismatched_evidence = replace(evidence, registry_signature="0" * 64)
+    assert (
+        espn_native_tasks._qualified_freshness_at(
+            head,
+            mismatched_evidence,
+            expected_registry_signature=head.registry_signature,
+            observed_at=fresh + timedelta(minutes=1),
+        )[2]
+        == old
+    )
+
+
+@pytest.mark.parametrize("state", ["complete", "noop"])
+def test_qualification_state_accepts_only_terminal_success_states(state):
+    from dags.utils import espn_native_tasks
+
+    assert espn_native_tasks._qualification_state(state) == state
+
+
+@pytest.mark.parametrize("state", ["staged", "failed", "skipped", None, True])
+def test_qualification_state_rejects_every_other_value(state):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.operations import OperationsError
+
+    with pytest.raises(OperationsError, match="publication result state is invalid"):
+        espn_native_tasks._qualification_state(state)

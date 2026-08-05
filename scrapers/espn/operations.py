@@ -889,6 +889,14 @@ class PublicationFence:
 
 
 class ScopeLeaseStore(Protocol):
+    def read_run_evidence(
+        self, *, dag_id: str, run_id: str, attempt: int
+    ) -> tuple[RunManifestEvidence, ...]: ...
+
+    def read_latest_run_evidence_by_scope(
+        self, scope_ids: Iterable[str], *, dag_id: str
+    ) -> dict[str, RunManifestEvidence]: ...
+
     def acquire_many(
         self,
         scope_ids: Iterable[str],
@@ -1143,6 +1151,28 @@ class MemoryScopeLeaseStore:
                     key=lambda item: item.scope_id,
                 )
             )
+
+    def read_latest_run_evidence_by_scope(
+        self, scope_ids: Iterable[str], *, dag_id: str
+    ) -> dict[str, RunManifestEvidence]:
+        scopes = tuple(sorted({_scope_id(item) for item in scope_ids}))
+        dag = _required(dag_id, "dag_id")
+        with self._lock:
+            candidates: dict[str, list[RunManifestEvidence]] = {}
+            for evidence in self._run_evidence.values():
+                if evidence.scope_id not in scopes or evidence.dag_id != dag:
+                    continue
+                candidates.setdefault(evidence.scope_id, []).append(evidence)
+            latest = {}
+            for scope_id, rows in candidates.items():
+                latest_at = max(item.recorded_at for item in rows)
+                matches = [item for item in rows if item.recorded_at == latest_at]
+                if len(matches) != 1:
+                    raise OperationsError(
+                        f"ambiguous latest run evidence for {scope_id}"
+                    )
+                latest[scope_id] = matches[0]
+            return dict(sorted(latest.items()))
 
     def acquire_many(
         self,
@@ -1880,6 +1910,42 @@ $espn_migration$"""
                     return tuple(
                         self._evidence_from_row(row) for row in cursor.fetchall()
                     )
+        finally:
+            connection.close()
+
+    def read_latest_run_evidence_by_scope(
+        self, scope_ids: Iterable[str], *, dag_id: str
+    ) -> dict[str, RunManifestEvidence]:
+        scopes = tuple(sorted({_scope_id(item) for item in scope_ids}))
+        dag = _required(dag_id, "dag_id")
+        if not scopes:
+            return {}
+        connection = self._connect()
+        try:
+            with connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT dag_id, run_id, attempt, scope_id, plan_signature, "
+                        "registry_signature, state, evidence_uri, evidence_sha256, "
+                        "recorded_at FROM (SELECT dag_id, run_id, attempt, scope_id, "
+                        "plan_signature, registry_signature, state, evidence_uri, "
+                        "evidence_sha256, recorded_at, DENSE_RANK() OVER "
+                        "(PARTITION BY scope_id ORDER BY recorded_at DESC) AS freshness_rank "
+                        f"FROM {self.RUN_TABLE} WHERE dag_id = %s AND scope_id = ANY(%s)"
+                        ") ranked WHERE freshness_rank = 1 ORDER BY scope_id",
+                        (dag, list(scopes)),
+                    )
+                    rows = tuple(
+                        self._evidence_from_row(row) for row in cursor.fetchall()
+                    )
+                    output = {}
+                    for item in rows:
+                        if item.scope_id in output:
+                            raise OperationsError(
+                                f"ambiguous latest run evidence for {item.scope_id}"
+                            )
+                        output[item.scope_id] = item
+                    return output
         finally:
             connection.close()
 

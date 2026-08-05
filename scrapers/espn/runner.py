@@ -69,7 +69,7 @@ from .transport_contracts import (
 )
 
 
-RUNTIME_VERSION = "espn-native-runtime-v2"
+RUNTIME_VERSION = "espn-native-runtime-v3"
 PLAN_KIND = "espn-ingest-plan-v1"
 LEGACY_RAW_MANIFEST_KIND = "espn-raw-run-manifest-v1"
 RAW_MANIFEST_KIND = "espn-raw-run-manifest-v2"
