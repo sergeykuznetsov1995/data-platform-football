@@ -962,6 +962,285 @@ def test_match_runner_long_manifest_noop_is_exact_zero_before_browser(
     }
 
 
+def _scheduled_events_probe(count, stale=0, seen=None):
+    """Fake Trino: ``count`` scheduled rows, ``stale`` of them overdue."""
+
+    def connect():
+        cursor = MagicMock()
+
+        def execute(sql, params=None):
+            if seen is not None:
+                seen.append((sql, params))
+
+        cursor.execute.side_effect = execute
+        cursor.fetchone.return_value = (count, stale)
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        return connection
+
+    return connect
+
+
+def test_unstarted_season_captures_nothing_without_reddening_the_run(
+    tmp_path,
+    monkeypatch,
+):
+    """A league waiting for its first matchday is the calendar, not a failure."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    monkeypatch.setattr(
+        runner,
+        "_resolve_match_ids_from_bronze",
+        lambda *args, **kwargs: [],
+    )
+    # The schedule IS there -- every match of it is still upcoming.
+    monkeypatch.setattr(runner, "_trino_connect", _scheduled_events_probe(18))
+    runtime, transport = _runtime(tmp_path, sink=SuccessSink())
+    output = tmp_path / "match-unstarted.json"
+    browser = MagicMock(side_effect=AssertionError("unstarted season opened a scraper"))
+
+    with patch("scrapers.sofascore.SofaScoreScraper", browser):
+        rc = runner._run_match_capture(
+            leagues=["ESP-La Liga"],
+            season=2026,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=False,
+        )
+
+    assert rc == 0
+    assert transport.calls == 0
+    browser.assert_not_called()
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["errors"] == []
+    assert result["rows"] == 0
+    assert result["matches_total"] == 0
+    assert result["fallback_reason"] == "season_has_no_finished_matches"
+    assert result["traffic"]["request_count"] == 0
+    # The DQ barrier exempts this reason instead of reading a completeness
+    # stamp the capture engine never earned (dag_ingest_sofascore).
+    assert result["fallback"] is False
+    assert "endpoint_completeness" not in result
+
+
+def _empty_universe_scraper():
+    scraper = _runner_player_scraper()
+    scraper._resolve_player_ids_from_bronze.return_value = []
+    return scraper
+
+
+def test_unstarted_season_leaves_the_player_phase_quiet(tmp_path, monkeypatch):
+    """#1109: no squad published yet is the calendar, like the capture phase."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    _patch_complete_season_player_universe(monkeypatch)
+    monkeypatch.setattr(runner, "_source_context", lambda *args: (17, 76986))
+    monkeypatch.setattr(runner, "_trino_connect", _scheduled_events_probe(380))
+    runtime, transport = _runtime(tmp_path)
+    scraper = _empty_universe_scraper()
+    output = tmp_path / "player-unstarted.json"
+
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
+        rc = runner._run_player_capture(
+            leagues=["ENG-Premier League"],
+            season=2026,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=False,
+        )
+
+    assert rc == 0
+    assert transport.calls == 0
+    scraper.save_to_iceberg.assert_not_called()
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["errors"] == []
+    assert result["fallback_reason"] == "season_has_no_finished_matches"
+
+
+def test_empty_player_universe_in_a_running_season_still_fails(
+    tmp_path, monkeypatch
+):
+    """Nothing to do mid-season means evidence was lost, not published late."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    _patch_complete_season_player_universe(monkeypatch)
+    monkeypatch.setattr(runner, "_source_context", lambda *args: (17, 76986))
+    # 12 kickoffs are long past yet still claim to be upcoming.
+    monkeypatch.setattr(
+        runner, "_trino_connect", _scheduled_events_probe(380, stale=12)
+    )
+    runtime, transport = _runtime(tmp_path)
+    scraper = _empty_universe_scraper()
+    output = tmp_path / "player-running.json"
+
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
+        rc = runner._run_player_capture(
+            leagues=["ENG-Premier League"],
+            season=2026,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=False,
+        )
+
+    assert rc == 1
+    assert transport.calls == 0
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert any("player universe is empty" in error for error in result["errors"])
+
+
+def test_stale_schedule_is_not_mistaken_for_an_unstarted_season(
+    tmp_path,
+    monkeypatch,
+):
+    """Kickoffs long past that still claim 'upcoming' mean the data is wrong."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    monkeypatch.setattr(
+        runner,
+        "_resolve_match_ids_from_bronze",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        runner, "_trino_connect", _scheduled_events_probe(380, stale=12)
+    )
+    runtime, transport = _runtime(tmp_path, sink=SuccessSink())
+    output = tmp_path / "match-stale.json"
+    browser = MagicMock(side_effect=AssertionError("stale schedule opened a scraper"))
+
+    with patch("scrapers.sofascore.SofaScoreScraper", browser):
+        rc = runner._run_match_capture(
+            leagues=["ESP-La Liga"],
+            season=2026,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=False,
+        )
+
+    assert rc == 1
+    browser.assert_not_called()
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert any("no finished event ids" in error for error in result["errors"])
+
+
+def test_schedule_probe_asks_for_the_whole_partition_not_finished_rows(
+    tmp_path,
+    monkeypatch,
+):
+    """The probe must not inherit the finished-only filter it exists to bypass."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    seen = []
+    monkeypatch.setattr(
+        runner,
+        "_resolve_match_ids_from_bronze",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        runner, "_trino_connect", _scheduled_events_probe(306, seen=seen)
+    )
+    runtime, _ = _runtime(tmp_path, sink=SuccessSink())
+
+    with patch("scrapers.sofascore.SofaScoreScraper", MagicMock()):
+        runner._run_match_capture(
+            leagues=["ESP-La Liga"],
+            season=2026,
+            limit=None,
+            output_path=str(tmp_path / "match-sql.json"),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=False,
+        )
+
+    assert seen, "probe never queried Trino"
+    sql, params = seen[0]
+    assert "iceberg.bronze.sofascore_schedule" in sql
+    assert "status_type = 'finished'" not in sql
+    assert "count_if" in sql
+    assert params == ("ESP-La Liga", "2627")
+
+
+def test_unanswerable_schedule_probe_refuses_like_before(
+    tmp_path,
+    monkeypatch,
+):
+    """A storage hiccup must never be read as an unstarted season."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    monkeypatch.setattr(
+        runner,
+        "_resolve_match_ids_from_bronze",
+        lambda *args, **kwargs: [],
+    )
+
+    def exploding_connect():
+        raise RuntimeError("trino unreachable")
+
+    monkeypatch.setattr(runner, "_trino_connect", exploding_connect)
+    runtime, transport = _runtime(tmp_path, sink=SuccessSink())
+    output = tmp_path / "match-probe-down.json"
+    browser = MagicMock(side_effect=AssertionError("probe failure opened a scraper"))
+
+    with patch("scrapers.sofascore.SofaScoreScraper", browser):
+        rc = runner._run_match_capture(
+            leagues=["ESP-La Liga"],
+            season=2026,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=False,
+        )
+
+    assert rc == 1
+    assert transport.calls == 0
+    browser.assert_not_called()
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert any("no finished event ids" in error for error in result["errors"])
+
+
+def test_missing_schedule_still_refuses_standalone_rediscovery(
+    tmp_path,
+    monkeypatch,
+):
+    """No schedule at all is the case the raw-manifest guard exists for."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    monkeypatch.setattr(
+        runner,
+        "_resolve_match_ids_from_bronze",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(runner, "_trino_connect", _scheduled_events_probe(0))
+    runtime, transport = _runtime(tmp_path, sink=SuccessSink())
+    output = tmp_path / "match-noschedule.json"
+    browser = MagicMock(side_effect=AssertionError("missing schedule opened a scraper"))
+
+    with patch("scrapers.sofascore.SofaScoreScraper", browser):
+        rc = runner._run_match_capture(
+            leagues=["ESP-La Liga"],
+            season=2026,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=False,
+        )
+
+    assert rc == 1
+    assert transport.calls == 0
+    browser.assert_not_called()
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert any("no finished event ids" in error for error in result["errors"])
+
+
 def test_compatibility_status_failure_keeps_long_manifest_replayable_without_network(
     tmp_path,
     monkeypatch,
