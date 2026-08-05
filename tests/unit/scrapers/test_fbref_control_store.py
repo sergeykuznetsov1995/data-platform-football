@@ -1261,6 +1261,49 @@ def test_observation_claim_is_keyed_by_refresh_not_repeated_content_hash():
     assert state["row"]["status"] == "succeeded"
 
 
+def test_session_transport_failures_are_classified_not_unclassified():
+    """#1122: re-solving on a fresh proxy is designed behaviour, so the run must
+    not be branded red for the very failure the wave already resolved."""
+    run_id = str(uuid.uuid4())
+    captured = []
+
+    def handler(sql, params):
+        if "SELECT * FROM fbref_control.crawl_run" in sql:
+            return [{"run_id": run_id, "run_type": "current"}], 1
+        if "AS missing" in sql:
+            return [{"count": 0}], 1
+        if params:
+            captured.append(params)
+        return [], 0
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+    store.get_run_summary(
+        run_id,
+        parser_version="page-current",
+        typed_parser_version="typed-current",
+        stateful_parser_version="discovery-current",
+    )
+
+    classified = [
+        value
+        for params in captured
+        for value in params
+        if isinstance(value, list) and "http_exception" in value
+    ]
+    assert classified, "run summary never passed its classified-error list"
+    for error_class in (
+        "warm_session_connection",
+        "warm_session_timeout",
+        "warm_session_rate_limit",
+        "warm_session_forbidden",
+        "warm_session_cloudflare",
+    ):
+        assert error_class in classified[0]
+
+
 def test_versioned_run_summary_uses_current_observation_and_parser_fences():
     executions = []
     run_id = str(uuid.uuid4())
