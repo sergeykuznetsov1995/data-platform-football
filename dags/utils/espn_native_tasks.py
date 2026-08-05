@@ -1544,11 +1544,96 @@ def _prepare_scope_head_for_publication(
     return hydrated, candidate_is_current
 
 
+_SCOPE_LEASE_BINDING_FIELDS = {
+    "kind",
+    "schema_version",
+    "scope_plan_ref",
+    "lease",
+}
+_SCOPE_LEASE_FIELDS = {
+    "scope_id",
+    "owner_id",
+    "plan_signature",
+    "epoch",
+    "token_sha256",
+    "acquired_at",
+    "expires_at",
+}
+_SCOPE_PLAN_DESCRIPTOR_FIELDS = {
+    "kind",
+    "schema_version",
+    "dag_id",
+    "run_id",
+    "attempt",
+    "mode",
+    "scope_id",
+    "plan_ref",
+    "plan_signature",
+    "raw_manifest_uri",
+    "raw_store_uri",
+    "generation_snapshot_uri",
+    "expected_scoreboard_batch",
+    "scoreboard_checkpoint_uri",
+    "scope_root",
+}
+
+
 def _binding(ref: Mapping[str, str]):
     binding = _read_ref(ref, kind="espn-scope-lease-binding-v1")
+    raw_lease = binding.get("lease")
+    if (
+        set(binding) != _SCOPE_LEASE_BINDING_FIELDS
+        or type(binding.get("schema_version")) is not int
+        or binding.get("schema_version") != 1
+        or not isinstance(raw_lease, Mapping)
+        or set(raw_lease) != _SCOPE_LEASE_FIELDS
+    ):
+        raise OperationsError("scope lease binding schema mismatch")
+    try:
+        lease = _lease_from_dict(raw_lease)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise OperationsError("scope lease binding lease is invalid") from exc
+    canonical_lease = {
+        **_lease_to_dict(lease),
+        "acquired_at": lease.acquired_at.astimezone(UTC).isoformat(),
+        "expires_at": lease.expires_at.astimezone(UTC).isoformat(),
+    }
+    if canonical_lease != dict(raw_lease):
+        raise OperationsError("scope lease binding lease is not canonical")
     descriptor = _read_ref(
         binding["scope_plan_ref"], kind="espn-scope-plan-descriptor-v1"
     )
+    if (
+        set(descriptor) != _SCOPE_PLAN_DESCRIPTOR_FIELDS
+        or type(descriptor.get("schema_version")) is not int
+        or descriptor.get("schema_version") != 1
+        or type(descriptor.get("attempt")) is not int
+        or descriptor.get("attempt", 0) <= 0
+    ):
+        raise OperationsError("scope plan descriptor schema mismatch")
+    for field in (
+        "dag_id",
+        "run_id",
+        "mode",
+        "scope_id",
+        "plan_signature",
+        "raw_manifest_uri",
+        "raw_store_uri",
+        "generation_snapshot_uri",
+        "scope_root",
+    ):
+        _required(descriptor[field], f"scope descriptor {field}")
+    scoreboard_batch = descriptor["expected_scoreboard_batch"]
+    scoreboard_checkpoint_uri = descriptor["scoreboard_checkpoint_uri"]
+    if (scoreboard_batch is None) != (scoreboard_checkpoint_uri is None) or (
+        scoreboard_batch is not None
+        and (
+            not isinstance(scoreboard_batch, Mapping)
+            or not isinstance(scoreboard_checkpoint_uri, str)
+            or not scoreboard_checkpoint_uri
+        )
+    ):
+        raise OperationsError("scope descriptor scoreboard contract is invalid")
     plan_envelope = _read_ref(descriptor["plan_ref"], kind=runner.PLAN_KIND)
     loaded = runner._load_signed_plan(descriptor["plan_ref"]["uri"])
     if (
@@ -1579,7 +1664,6 @@ def _binding(ref: Mapping[str, str]):
         descriptor["generation_snapshot_uri"],
     ):
         raise OperationsError("scope descriptor identity mismatch")
-    lease = _lease_from_dict(binding["lease"])
     if lease.scope_id != scope.scope_id:
         raise OperationsError("lease/scope identity mismatch")
     if lease.plan_signature != loaded.signature:

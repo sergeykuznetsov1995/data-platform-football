@@ -1956,6 +1956,27 @@ def _is_v4(evidence: PromotionEvidence) -> bool:
     return evidence.evidence_version == V4_PROMOTION_EVIDENCE_VERSION
 
 
+def _validate_promotion_evidence_runtime_shape(
+    evidence: PromotionEvidence,
+) -> bool:
+    """Make serialized version and in-memory guard routing one invariant."""
+
+    v4 = _is_v4(evidence)
+    if v4:
+        if (
+            type(evidence) is not PromotionEvidenceV4
+            or len(evidence.green_runs) != 3
+            or any(type(run) is not GreenRunEvidenceV4 for run in evidence.green_runs)
+        ):
+            raise MigrationError("v4 promotion runtime shape is invalid")
+        return True
+    if isinstance(evidence, PromotionEvidenceV4) or any(
+        type(run) is not GreenRunEvidence for run in evidence.green_runs
+    ):
+        raise MigrationError("legacy promotion runtime shape is invalid")
+    return False
+
+
 def _migration_version(evidence: PromotionEvidence) -> str:
     return V4_MIGRATION_VERSION if _is_v4(evidence) else MIGRATION_VERSION
 
@@ -2017,6 +2038,7 @@ def build_promotion_plan(
 ) -> dict[str, Any]:
     if not isinstance(evidence, PromotionEvidence):
         raise TypeError("evidence must be PromotionEvidence")
+    _validate_promotion_evidence_runtime_shape(evidence)
     output = Path(output_path)
     result = {
         "schema_version": _migration_version(evidence),
@@ -2535,6 +2557,7 @@ def apply_promotion(
 ) -> dict[str, Any]:
     if not isinstance(evidence, PromotionEvidence):
         raise TypeError("evidence must be PromotionEvidence")
+    v4 = _validate_promotion_evidence_runtime_shape(evidence)
     if not isinstance(now, datetime) or now.tzinfo is None:
         raise TypeError("now must be timezone-aware")
     observed_at = now.astimezone(UTC)
@@ -2567,9 +2590,7 @@ def apply_promotion(
                         "scope already has a different native cutover head"
                     )
                 cutover = latest
-                if isinstance(evidence, PromotionEvidenceV4) and isinstance(
-                    candidate, GreenRunEvidenceV4
-                ):
+                if v4:
                     _assert_physical_181(
                         evidence,
                         candidate,
@@ -2595,14 +2616,14 @@ def apply_promotion(
                     )
                 latest_manifest = (
                     backend.latest_complete_manifest_v4(evidence.scope_id)
-                    if _is_v4(evidence)
+                    if v4
                     else backend.latest_complete_manifest(evidence.scope_id)
                 )
                 if not _manifest_matches(latest_manifest, candidate):
                     raise MigrationError(
                         "candidate is no longer the latest COMPLETE manifest under lease"
                     )
-                if isinstance(candidate, GreenRunEvidenceV4):
+                if v4:
                     backend.verify_physical_generation(
                         candidate.physical_generation,
                         evidence.registry_snapshot_ref,
@@ -2624,9 +2645,7 @@ def apply_promotion(
                         snapshot_ids=snapshot_ids,
                         captured_at=observed_at,
                     )
-                    if isinstance(evidence, PromotionEvidenceV4) and isinstance(
-                        candidate, GreenRunEvidenceV4
-                    ):
+                    if v4:
                         _assert_physical_181(
                             evidence,
                             candidate,
@@ -2635,9 +2654,7 @@ def apply_promotion(
                         )
                     backend.append_baseline(baseline)
                 cutover = _native_cutover(evidence, baseline, predecessor)
-                if isinstance(evidence, PromotionEvidenceV4) and isinstance(
-                    candidate, GreenRunEvidenceV4
-                ):
+                if v4:
                     _assert_physical_181(
                         evidence,
                         candidate,

@@ -12,10 +12,13 @@ import pytest
 from scrapers.espn import runner
 from scrapers.espn.discovery import CatalogSnapshot
 from scrapers.espn.migration import (
+    ArtifactRef,
     MigrationError,
     PROMOTION_EVIDENCE_VERSION,
+    PromotionEvidence,
     V4_PROMOTION_EVIDENCE_VERSION,
     apply_promotion,
+    build_promotion_plan,
     build_rollback_plan,
     load_promotion_evidence,
     RepositoryMigrationBackend,
@@ -848,13 +851,20 @@ class _V4ApplyBackend:
         *,
         stale_latest: bool = False,
         race_after_baseline: bool = False,
+        stale_exact_after_preflight: bool = False,
     ):
         self.candidate = candidate
         self.stale_latest = stale_latest
         self.race_after_baseline = race_after_baseline
+        self.stale_exact_after_preflight = stale_exact_after_preflight
+        self.exact_reads = 0
         self.actions: list[str] = []
         self.baseline_row = None
         self.cutover = None
+        self.guard_active = lambda: True
+
+    def _assert_guard_active(self):
+        assert self.guard_active()
 
     def ensure_objects(self):
         self.actions.append("ensure_objects")
@@ -878,10 +888,11 @@ class _V4ApplyBackend:
         )
 
     def verify_candidate(self, candidate, registry_snapshot_ref):
-        self.actions.append("verify_candidate")
+        self.actions.append("verify_legacy_candidate")
 
     def verify_physical_generation(self, physical, registry_snapshot_ref):
-        self.actions.append("verify_candidate")
+        self._assert_guard_active()
+        self.actions.append("verify_physical_generation")
 
     def _manifest(self):
         physical = self.candidate.physical_generation
@@ -901,14 +912,20 @@ class _V4ApplyBackend:
         }
 
     def complete_manifest(self, scope_id, generation_id):
+        self._assert_guard_active()
         self.actions.append("complete_manifest")
-        return self._manifest()
+        self.exact_reads += 1
+        manifest = self._manifest()
+        if self.stale_exact_after_preflight and self.exact_reads > 1:
+            manifest["manifest_sha256"] = "0" * 64
+        return manifest
 
     def latest_complete_manifest(self, scope_id):
         self.actions.append("latest_complete_manifest")
         return self._manifest()
 
     def latest_complete_manifest_v4(self, scope_id):
+        self._assert_guard_active()
         self.actions.append("latest_complete_manifest_v4")
         manifest = self._manifest()
         if self.stale_latest:
@@ -919,6 +936,7 @@ class _V4ApplyBackend:
         return self.baseline_row
 
     def append_baseline(self, row):
+        self._assert_guard_active()
         self.actions.append("append_baseline")
         self.baseline_row = dict(row)
         if self.race_after_baseline:
@@ -928,13 +946,16 @@ class _V4ApplyBackend:
         return self.cutover
 
     def append_cutover(self, cutover):
+        self._assert_guard_active()
         self.actions.append("append_cutover")
         self.cutover = cutover
 
 
 class _V4LeaseStore:
-    def __init__(self, head):
+    def __init__(self, head, actions=None):
         self.head = head
+        self.actions = actions
+        self.guard_active = False
 
     def migrate(self):
         pass
@@ -944,13 +965,98 @@ class _V4LeaseStore:
 
     @contextmanager
     def guard(self, lease, *, now):
-        yield
+        assert not self.guard_active
+        self.guard_active = True
+        try:
+            yield
+        finally:
+            self.guard_active = False
 
     def release(self, lease, *, now):
         pass
 
     def current_scope_head(self, scope_id):
+        assert self.guard_active
+        if self.actions is not None:
+            self.actions.append("current_scope_head")
         return self.head
+
+
+_MUTATION_ADJACENT_GUARD_SUFFIX = [
+    "registry_snapshot_reread",
+    "current_scope_head",
+    "complete_manifest",
+    "latest_complete_manifest_v4",
+    "verify_physical_generation",
+]
+
+
+def _track_registry_guard_reads(monkeypatch, actions, lease_store):
+    from scrapers.espn import migration
+
+    reader = migration._default_artifact_reader
+
+    def tracked(uri):
+        assert lease_store.guard_active
+        actions.append("registry_snapshot_reread")
+        return reader(uri)
+
+    monkeypatch.setattr(migration, "_default_artifact_reader", tracked)
+
+
+def _assert_guard_immediately_precedes(actions, append_action):
+    append_indexes = [
+        index for index, action in enumerate(actions) if action == append_action
+    ]
+    assert append_indexes
+    for index in append_indexes:
+        assert actions[index - 5 : index] == _MUTATION_ADJACENT_GUARD_SUFFIX
+
+
+def test_programmatic_base_v4_cannot_skip_physical_guards(tmp_path):
+    loaded = load_promotion_evidence(_v4_evidence(tmp_path, ("noop", "noop", "noop")))
+    evidence = PromotionEvidence(
+        evidence_version=V4_PROMOTION_EVIDENCE_VERSION,
+        scope_id=loaded.scope_id,
+        espn_id=loaded.espn_id,
+        source_season_year=loaded.source_season_year,
+        fallback=loaded.fallback,
+        trust_label=loaded.trust_label,
+        cutover_id=loaded.cutover_id,
+        effective_at=loaded.effective_at,
+        registry_snapshot_ref=loaded.registry_snapshot_ref,
+        green_runs=loaded.green_runs,
+    )
+    candidate = evidence.green_runs[-1]
+    backend = _V4ApplyBackend(candidate)
+
+    with pytest.raises(MigrationError, match="v4 promotion runtime shape"):
+        build_promotion_plan(evidence, output_path=tmp_path / "plan.json")
+    with pytest.raises(MigrationError, match="v4 promotion runtime shape"):
+        apply_promotion(
+            evidence,
+            backend=backend,
+            lease_store=_V4LeaseStore(dict(candidate.selected_head)),
+            now=datetime(2026, 8, 2, tzinfo=UTC),
+        )
+
+    assert backend.actions == []
+
+
+def test_programmatic_non_v4_forbids_v4_runtime_objects(tmp_path):
+    evidence = load_promotion_evidence(_v4_evidence(tmp_path, ("noop", "noop", "noop")))
+    disguised = replace(evidence, evidence_version=PROMOTION_EVIDENCE_VERSION)
+
+    with pytest.raises(MigrationError, match="legacy promotion runtime shape"):
+        build_promotion_plan(disguised, output_path=tmp_path / "plan.json")
+
+
+def test_programmatic_v4_requires_exactly_three_runs(tmp_path):
+    evidence = load_promotion_evidence(_v4_evidence(tmp_path, ("noop", "noop", "noop")))
+    incomplete = replace(evidence, green_runs=evidence.green_runs[:2])
+
+    with pytest.raises(MigrationError, match="v4 promotion runtime shape"):
+        build_promotion_plan(incomplete, output_path=tmp_path / "plan.json")
 
 
 @pytest.mark.parametrize("race", ["head", "latest"])
@@ -974,15 +1080,18 @@ def test_v4_apply_rejects_control_or_manifest_race_before_append(tmp_path, race)
     assert "append_cutover" not in backend.actions
 
 
-def test_v4_successful_apply_builds_existing_v2_rollback_shape(tmp_path):
+def test_v4_successful_apply_builds_existing_v2_rollback_shape(tmp_path, monkeypatch):
     evidence = load_promotion_evidence(_v4_evidence(tmp_path, ("noop", "noop", "noop")))
     candidate = evidence.green_runs[-1]
     backend = _V4ApplyBackend(candidate)
+    lease_store = _V4LeaseStore(dict(candidate.selected_head), backend.actions)
+    backend.guard_active = lambda: lease_store.guard_active
+    _track_registry_guard_reads(monkeypatch, backend.actions, lease_store)
 
     report = apply_promotion(
         evidence,
         backend=backend,
-        lease_store=_V4LeaseStore(dict(candidate.selected_head)),
+        lease_store=lease_store,
         now=datetime(2026, 8, 2, tzinfo=UTC),
     )
     rollback = build_rollback_plan(
@@ -994,22 +1103,43 @@ def test_v4_successful_apply_builds_existing_v2_rollback_shape(tmp_path):
     assert rollback["schema_version"] == "espn-v2-rollback-plan-v2"
     assert rollback["registry_signature"] == candidate.registry_signature
     assert rollback["plan_signature"] == candidate.physical_generation.plan_signature
-    assert backend.actions.index("verify_candidate") < backend.actions.index(
-        "append_baseline"
-    )
-    assert backend.actions.index("verify_candidate") < backend.actions.index(
-        "append_cutover"
-    )
+    _assert_guard_immediately_precedes(backend.actions, "append_baseline")
+    _assert_guard_immediately_precedes(backend.actions, "append_cutover")
 
 
-def test_v4_apply_rereads_frozen_registry_under_lease_before_write(tmp_path):
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("cardinality", "frozen 181-scope registry"),
+        ("membership", "frozen registry identity changed"),
+    ],
+)
+def test_v4_apply_rejects_rehashed_semantic_registry_mutation_under_lease(
+    tmp_path, mutation, message
+):
     evidence = load_promotion_evidence(_v4_evidence(tmp_path, ("noop", "noop", "noop")))
     candidate = evidence.green_runs[-1]
     registry_path = Path(evidence.registry_snapshot_ref.uri.removeprefix("file://"))
-    registry_path.write_text("{}", encoding="utf-8")
+    registry_document = json.loads(registry_path.read_text(encoding="utf-8"))
+    changed = next(
+        item for item in registry_document["competitions"] if item["espn_id"] != 700
+    )
+    if mutation == "cardinality":
+        changed["enabled"] = False
+    else:
+        changed["espn_id"] = 999_999_999
+    changed_ref = _write(registry_path, registry_document)
+    assert changed_ref["sha256"] != evidence.registry_snapshot_ref.sha256
+    evidence = replace(
+        evidence,
+        registry_snapshot_ref=ArtifactRef.from_mapping(
+            changed_ref, field="changed_registry_ref"
+        ),
+    )
+    assert evidence.registry_snapshot_ref.sha256 == changed_ref["sha256"]
     backend = _V4ApplyBackend(candidate)
 
-    with pytest.raises(MigrationError, match="registry"):
+    with pytest.raises(MigrationError, match=message):
         apply_promotion(
             evidence,
             backend=backend,
@@ -1038,11 +1168,33 @@ def test_v4_second_guard_rejects_race_after_baseline_before_cutover(tmp_path):
     assert "append_cutover" not in backend.actions
 
 
-def test_v4_idempotent_apply_reverifies_before_append(tmp_path):
+def test_v4_guard_rejects_exact_manifest_mutation_after_preflight(tmp_path):
+    evidence = load_promotion_evidence(_v4_evidence(tmp_path, ("noop", "noop", "noop")))
+    candidate = evidence.green_runs[-1]
+    backend = _V4ApplyBackend(candidate, stale_exact_after_preflight=True)
+
+    with pytest.raises(
+        MigrationError, match="physical COMPLETE manifest changed before"
+    ):
+        apply_promotion(
+            evidence,
+            backend=backend,
+            lease_store=_V4LeaseStore(dict(candidate.selected_head)),
+            now=datetime(2026, 8, 2, tzinfo=UTC),
+        )
+
+    assert backend.exact_reads == 2
+    assert "append_baseline" not in backend.actions
+    assert "append_cutover" not in backend.actions
+
+
+def test_v4_idempotent_apply_reverifies_before_append(tmp_path, monkeypatch):
     evidence = load_promotion_evidence(_v4_evidence(tmp_path, ("noop", "noop", "noop")))
     candidate = evidence.green_runs[-1]
     backend = _V4ApplyBackend(candidate)
-    lease_store = _V4LeaseStore(dict(candidate.selected_head))
+    lease_store = _V4LeaseStore(dict(candidate.selected_head), backend.actions)
+    backend.guard_active = lambda: lease_store.guard_active
+    _track_registry_guard_reads(monkeypatch, backend.actions, lease_store)
     apply_promotion(
         evidence,
         backend=backend,
@@ -1058,9 +1210,32 @@ def test_v4_idempotent_apply_reverifies_before_append(tmp_path):
         now=datetime(2026, 8, 2, tzinfo=UTC),
     )
 
-    assert backend.actions.index("verify_candidate") < backend.actions.index(
-        "append_cutover"
+    _assert_guard_immediately_precedes(backend.actions, "append_cutover")
+
+
+def test_v4_idempotent_apply_rejects_stale_latest_before_append(tmp_path):
+    evidence = load_promotion_evidence(_v4_evidence(tmp_path, ("noop", "noop", "noop")))
+    candidate = evidence.green_runs[-1]
+    backend = _V4ApplyBackend(candidate)
+    lease_store = _V4LeaseStore(dict(candidate.selected_head))
+    apply_promotion(
+        evidence,
+        backend=backend,
+        lease_store=lease_store,
+        now=datetime(2026, 8, 2, tzinfo=UTC),
     )
+    backend.actions.clear()
+    backend.stale_latest = True
+
+    with pytest.raises(MigrationError, match="newer COMPLETE manifest"):
+        apply_promotion(
+            evidence,
+            backend=backend,
+            lease_store=lease_store,
+            now=datetime(2026, 8, 2, tzinfo=UTC),
+        )
+
+    assert "append_cutover" not in backend.actions
 
 
 def test_repository_v4_verifier_loads_snapshot_and_runs_physical_dq(tmp_path):

@@ -5822,6 +5822,11 @@ def _run_published_dq_through_terminal(monkeypatch, *, state, mutation=None):
         attempt=1,
         signature="b" * 64,
         registry_snapshot_uri=registry_uri,
+        selected_scopes=(scope.scope_id,),
+        mode="daily",
+        replay_source=None,
+        raw_manifest_uri="s3://artifacts/raw-manifest.json",
+        raw_store_uri="s3://raw",
         bindings={},
     )
     generation = SimpleNamespace(
@@ -5835,7 +5840,7 @@ def _run_published_dq_through_terminal(monkeypatch, *, state, mutation=None):
         parser_version=espn_native_tasks.runner.PARSER_VERSION,
         runtime_version=espn_native_tasks.runner.RUNTIME_VERSION,
         registry_snapshot_uri=registry_uri,
-        ingested_at=recorded_at,
+        ingested_at=recorded_at - timedelta(minutes=2),
     )
     snapshot_ref = {
         "uri": "s3://artifacts/scope/generation.json",
@@ -5852,10 +5857,11 @@ def _run_published_dq_through_terminal(monkeypatch, *, state, mutation=None):
         registry_signature=generation.registry_signature,
         plan_signature=generation.plan_signature,
         run_id=generation.run_id,
-        published_at=recorded_at + timedelta(minutes=1),
-        completed_at=recorded_at,
+        published_at=recorded_at - timedelta(minutes=1),
+        completed_at=generation.ingested_at,
     )
     loaded.bindings[scope.scope_id] = SimpleNamespace(
+        generation_snapshot_uri=snapshot_ref["uri"],
         prior=SimpleNamespace(
             uri=head.snapshot_uri,
             artifact_sha256=head.snapshot_sha256,
@@ -5863,7 +5869,7 @@ def _run_published_dq_through_terminal(monkeypatch, *, state, mutation=None):
             generation_id=head.generation_id,
             generation_signature=head.generation_signature,
             manifest_sha256=head.manifest_sha256,
-        )
+        ),
     )
     lease = SimpleNamespace(
         scope_id=scope.scope_id,
@@ -5875,17 +5881,43 @@ def _run_published_dq_through_terminal(monkeypatch, *, state, mutation=None):
         expires_at=recorded_at + timedelta(hours=1),
     )
     scope_root = "s3://artifacts/scope"
-    binding_ref = _artifact_ref(artifacts, f"{scope_root}/binding.json", {})
+    plan_ref = _artifact_ref(
+        artifacts,
+        f"{scope_root}/plan.json",
+        {
+            "kind": espn_native_tasks.runner.PLAN_KIND,
+            "plan": {},
+            "signature": loaded.signature,
+        },
+    )
     descriptor = {
         "kind": "espn-scope-plan-descriptor-v1",
+        "schema_version": 1,
         "dag_id": "dag_ingest_espn",
+        "run_id": loaded.plan.run_id,
+        "attempt": loaded.attempt,
+        "mode": loaded.mode,
         "scope_id": scope.scope_id,
         "scope_root": scope_root,
         "plan_signature": loaded.signature,
-        "plan_ref": {"uri": "s3://artifacts/signed-plan.json", "sha256": "8" * 64},
+        "plan_ref": plan_ref,
+        "raw_manifest_uri": loaded.raw_manifest_uri,
+        "raw_store_uri": loaded.raw_store_uri,
+        "generation_snapshot_uri": snapshot_ref["uri"],
+        "expected_scoreboard_batch": None,
+        "scoreboard_checkpoint_uri": None,
     }
     descriptor_ref = _artifact_ref(
         artifacts, "s3://artifacts/descriptor.json", descriptor
+    )
+    binding_payload = {
+        "kind": "espn-scope-lease-binding-v1",
+        "schema_version": 1,
+        "scope_plan_ref": descriptor_ref,
+        "lease": espn_native_tasks._lease_to_dict(lease),
+    }
+    binding_ref = _artifact_ref(
+        artifacts, f"{scope_root}/binding.json", binding_payload
     )
     evidence_payload = {
         "kind": "espn-run-manifest-evidence-v1",
@@ -5976,11 +6008,6 @@ def _run_published_dq_through_terminal(monkeypatch, *, state, mutation=None):
         espn_native_tasks.runner, "_load_signed_plan", lambda _uri: loaded
     )
     monkeypatch.setattr(
-        espn_native_tasks,
-        "_binding",
-        lambda _ref: ({}, descriptor, loaded, scope, lease),
-    )
-    monkeypatch.setattr(
         espn_native_tasks.PostgresEspnControlStore,
         "from_env",
         classmethod(lambda _cls: Store()),
@@ -6021,6 +6048,62 @@ def _run_published_dq_through_terminal(monkeypatch, *, state, mutation=None):
                 "sha256": "9" * 64,
             }
         artifacts[attestation_uri] = espn_native_tasks._canonical_bytes(attestation)
+    elif mutation in {
+        "binding-extra",
+        "binding-version",
+        "binding-type",
+        "lease-extra",
+        "lease-type",
+        "descriptor-extra",
+        "descriptor-version",
+        "descriptor-type",
+    }:
+        if mutation.startswith("descriptor-"):
+            if mutation == "descriptor-extra":
+                descriptor["unexpected"] = True
+            elif mutation == "descriptor-version":
+                descriptor["schema_version"] = 2
+            else:
+                descriptor["attempt"] = True
+            descriptor_ref = _artifact_ref(artifacts, descriptor_ref["uri"], descriptor)
+            binding_payload["scope_plan_ref"] = descriptor_ref
+        elif mutation == "binding-extra":
+            binding_payload["unexpected"] = True
+        elif mutation == "binding-version":
+            binding_payload["schema_version"] = 2
+        elif mutation == "binding-type":
+            binding_payload["schema_version"] = True
+        elif mutation == "lease-extra":
+            binding_payload["lease"]["unexpected"] = True
+        else:
+            binding_payload["lease"]["epoch"] = True
+        binding_ref = _artifact_ref(artifacts, binding_ref["uri"], binding_payload)
+        publication["scope_binding_ref"] = binding_ref
+        publication_ref = _artifact_ref(artifacts, publication_ref["uri"], publication)
+        dq_uri = producer_result["published_dq_ref"]["uri"]
+        dq = json.loads(artifacts[dq_uri])
+        dq["publication_ref"] = publication_ref
+        published_dq_ref = _artifact_ref(artifacts, dq_uri, dq)
+        attestation = json.loads(artifacts[attestation_uri])
+        attestation["scope_binding_ref"] = binding_ref
+        attestation["publication_ref"] = publication_ref
+        attestation["published_dq_ref"] = published_dq_ref
+        _artifact_ref(artifacts, attestation_uri, attestation)
+
+        verified, freshness_state, freshness_at = (
+            espn_native_tasks._qualified_freshness_at(
+                head,
+                evidence_row,
+                expected_registry_ref=espn_native_tasks._ref_for_uri(registry_uri),
+                expected_registry_signature=head.registry_signature,
+                observed_at=recorded_at + timedelta(minutes=1),
+            )
+        )
+        assert (verified, freshness_state, freshness_at) == (
+            head,
+            "complete",
+            head.published_at,
+        )
 
     durable = {
         "kind": "espn-durable-run-manifest-v1",
@@ -6082,6 +6165,26 @@ def test_published_dq_attestation_is_consumed_by_terminal(monkeypatch, state):
 
 @pytest.mark.parametrize("mutation", ["missing", "extra", "substituted"])
 def test_terminal_fails_closed_on_invalid_canonical_attestation(monkeypatch, mutation):
+    with pytest.raises(Exception, match="ESPN terminal verdict failed"):
+        _run_published_dq_through_terminal(monkeypatch, state="noop", mutation=mutation)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "binding-extra",
+        "binding-version",
+        "binding-type",
+        "lease-extra",
+        "lease-type",
+        "descriptor-extra",
+        "descriptor-version",
+        "descriptor-type",
+    ],
+)
+def test_freshness_and_terminal_reject_rehashed_binding_schema_extra(
+    monkeypatch, mutation
+):
     with pytest.raises(Exception, match="ESPN terminal verdict failed"):
         _run_published_dq_through_terminal(monkeypatch, state="noop", mutation=mutation)
 
