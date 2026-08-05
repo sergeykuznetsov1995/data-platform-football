@@ -329,6 +329,55 @@ def test_warm_transport_error_has_structured_session_classification():
     assert caught.value.http_requests == 1
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Real libcurl prose seen in production; none of it contains a
+        # substring the text classifier looks for.
+        "Failed to perform, curl: (7) Could not connect to proxy",
+        "Proxy CONNECT aborted",
+        "Failed to perform, curl: (56) Recv failure",
+    ],
+)
+def test_dead_proxy_is_a_session_failure_not_a_target_verdict(message):
+    """#1122: the transport never reached the source, so the page was not judged."""
+    exceptions = pytest.importorskip("curl_cffi.requests.exceptions")
+    fetcher = _fetcher(_response())
+    fetcher._http_session.get.side_effect = exceptions.ProxyError(message)
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch("https://fbref.com/en/comps", page_kind="competition_index")
+
+    assert caught.value.error_class == "warm_session_connection"
+
+
+def test_transport_timeout_is_typed_even_when_the_prose_is_silent():
+    exceptions = pytest.importorskip("curl_cffi.requests.exceptions")
+    fetcher = _fetcher(_response())
+    fetcher._http_session.get.side_effect = exceptions.Timeout(
+        "Failed to perform, curl: (28)"
+    )
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch("https://fbref.com/en/comps", page_kind="competition_index")
+
+    assert caught.value.error_class == "warm_session_timeout"
+
+
+def test_a_source_verdict_outranks_the_exception_type():
+    """A proxy error carrying 403 stays forbidden: the source did answer."""
+    exceptions = pytest.importorskip("curl_cffi.requests.exceptions")
+    fetcher = _fetcher(_response())
+    error = exceptions.ProxyError("Could not connect to proxy")
+    error.response = SimpleNamespace(status_code=403)
+    fetcher._http_session.get.side_effect = error
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch("https://fbref.com/en/comps", page_kind="competition_index")
+
+    assert caught.value.error_class == "warm_session_forbidden"
+
+
 def test_unknown_warm_error_remains_target_scoped_http_exception():
     fetcher = _fetcher(_response())
     fetcher._http_session.get.side_effect = RuntimeError("decoder exploded")

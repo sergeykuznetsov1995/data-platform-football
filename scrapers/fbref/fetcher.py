@@ -55,6 +55,27 @@ try:  # pragma: no cover - curl_cffi is installed in the production image
 except ImportError:  # pragma: no cover - exercised by the import-light suite
     _CURL_WRITEFUNC_ERROR = 0xFFFFFFFF
 
+# A dead proxy raises a transport exception whose libcurl prose ("Could not
+# connect to proxy", "Recv failure") matches none of the substrings the text
+# classifier looks for, so the sessionwide failure used to be filed as an
+# unclassified per-target one and failed the whole wave (#1122). The exception
+# TYPE says what the text does not. Same guarded-import pattern as above so the
+# import-light suite keeps working without the optional transport.
+try:  # pragma: no cover - curl_cffi is installed in the production image
+    from curl_cffi.requests import exceptions as _curl_exceptions
+
+    _TRANSPORT_TIMEOUT_ERRORS: tuple[type[BaseException], ...] = (
+        _curl_exceptions.Timeout,
+    )
+    _TRANSPORT_CONNECTION_ERRORS: tuple[type[BaseException], ...] = (
+        _curl_exceptions.ProxyError,
+        _curl_exceptions.ConnectionError,
+        _curl_exceptions.DNSError,
+    )
+except (ImportError, AttributeError):  # pragma: no cover - import-light suite
+    _TRANSPORT_TIMEOUT_ERRORS = ()
+    _TRANSPORT_CONNECTION_ERRORS = ()
+
 
 class _CumulativeBodyBuffer:
     """Bound response bodies across every HTTP attempt for one logical fetch."""
@@ -923,6 +944,16 @@ class FBrefFetcher:
             429: "rate_limit",
         }
         error_type = status_types.get(partial_status)
+        if error_type is None:
+            # Order matters: a source that answered keeps its verdict, then the
+            # exception type, and only then the prose. Typing the transport
+            # exceptions is what stops a dead proxy from being filed as an
+            # unclassified target failure (#1122) -- the text classifier misses
+            # them because libcurl says "connect", not "connection".
+            if isinstance(exc, _TRANSPORT_TIMEOUT_ERRORS):
+                error_type = "timeout"
+            elif isinstance(exc, _TRANSPORT_CONNECTION_ERRORS):
+                error_type = "connection"
         if error_type is None:
             error_type = classify_error(str(exc))
         if error_type in {
