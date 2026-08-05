@@ -188,6 +188,50 @@ class TestBronzeFreshnessGate:
         assert result["status"] == "success"
         assert any(entry.endswith(":noop") for entry in result["checked"])
 
+    def test_manifest_dq_accepts_a_season_that_has_not_started(
+        self, dag_module, monkeypatch
+    ):
+        """#1109: nothing played yet means the capture engine never ran, so it
+        cannot stamp completeness. Without this exemption every league waiting
+        for its first matchday keeps the whole daily run red."""
+
+        def load(path, logger):
+            if "match_capture" in path:
+                return {
+                    "matches_total": 0,
+                    "matches_skipped_existing": 0,
+                    "rows": 0,
+                    "errors": [],
+                    "fallback": False,
+                    "fallback_reason": "season_has_no_finished_matches",
+                }
+            return {"endpoint_completeness": 1.0, "errors": []}
+
+        monkeypatch.setattr(dag_module, "_load_result", load)
+        result = dag_module.run_sofascore_dq()
+        assert result["status"] == "success"
+        assert any(entry.endswith(":unstarted") for entry in result["checked"])
+
+    def test_manifest_dq_rejects_an_empty_capture_without_that_reason(
+        self, dag_module, monkeypatch
+    ):
+        """A capture that wrote nothing for any other reason still fails."""
+
+        def load(path, logger):
+            if "match_capture" in path:
+                return {
+                    "matches_total": 0,
+                    "matches_skipped_existing": 0,
+                    "rows": 0,
+                    "errors": [],
+                    "fallback": False,
+                }
+            return {"endpoint_completeness": 1.0, "errors": []}
+
+        monkeypatch.setattr(dag_module, "_load_result", load)
+        with pytest.raises(Exception, match="canonical endpoint completeness failed"):
+            dag_module.run_sofascore_dq()
+
     def test_manifest_dq_rejects_partial_skip_without_completeness(
         self, dag_module, monkeypatch
     ):

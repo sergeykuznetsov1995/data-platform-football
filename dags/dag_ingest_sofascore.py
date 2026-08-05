@@ -348,6 +348,23 @@ def _competition_floors(league: str) -> Dict[str, int]:
     }
 
 
+def _season_not_started(capture_result: Dict[str, Any]) -> bool:
+    """#1109: the runner proved the season has a schedule but nothing played.
+
+    Distinct from ``_capture_noop``: there, matches were resolved and all were
+    already terminal in bronze; here the source has not played a single match
+    yet, so no match was ever resolved.
+    """
+    return bool(
+        capture_result
+        and not capture_result.get("fallback")
+        and not (capture_result.get("errors") or [])
+        and capture_result.get("fallback_reason")
+        == "season_has_no_finished_matches"
+        and not capture_result.get("matches_total", 0)
+    )
+
+
 def _capture_noop(capture_result: Dict[str, Any]) -> bool:
     """#842 incremental match_capture: True when the run resolved matches but
     skipped them ALL (already in bronze) with no fallback/errors — a clean
@@ -712,6 +729,14 @@ def run_sofascore_dq(**context) -> Dict[str, Any]:
                     raise AirflowException(
                         f"{league} {phase} cannot be skipped in production"
                     )
+                continue
+            if phase == "match" and _season_not_started(result):
+                # #1109: the season has a schedule but nothing played yet, so
+                # the capture engine never ran and cannot stamp completeness —
+                # the same reason the incremental no-op below is exempt. Claiming
+                # completeness in the result file instead would assert a manifest
+                # check that never happened.
+                checked.append(f"{league}:{phase}:unstarted")
                 continue
             if phase == "match" and _capture_noop(result):
                 # #842/#951: a clean incremental no-op (every resolved match is
