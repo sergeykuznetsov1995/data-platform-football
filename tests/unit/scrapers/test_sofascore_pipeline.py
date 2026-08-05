@@ -962,6 +962,53 @@ def test_match_runner_long_manifest_noop_is_exact_zero_before_browser(
     }
 
 
+_SCHEDULE_SCHEMA = {
+    "iceberg": {
+        "bronze": {
+            "sofascore_schedule": {
+                "start_timestamp": "double",
+                "status_type": "varchar",
+                "league": "varchar",
+                "season": "varchar",
+            }
+        }
+    }
+}
+
+
+def _mixed_time_comparisons(sql):
+    """Comparisons that put a number on one side and a timestamp on the other.
+
+    Trino rejects those outright, so a probe carrying one can never answer.
+    """
+    import sqlglot
+    from sqlglot import exp
+    from sqlglot.optimizer.annotate_types import annotate_types
+    from sqlglot.optimizer.qualify import qualify
+
+    typed = annotate_types(
+        qualify(
+            sqlglot.parse_one(sql.replace("?", "''"), dialect="trino"),
+            schema=_SCHEDULE_SCHEMA,
+            dialect="trino",
+            validate_qualify_columns=False,
+        ),
+        schema=_SCHEDULE_SCHEMA,
+        dialect="trino",
+    )
+    mixed = []
+    for node in typed.find_all(exp.LT, exp.GT, exp.LTE, exp.GTE):
+        left, right = node.left.type, node.right.type
+        if not left or not right:
+            continue
+        sides = {left.this, right.this}
+        if sides & set(exp.DataType.NUMERIC_TYPES) and sides & set(
+            exp.DataType.TEMPORAL_TYPES
+        ):
+            mixed.append(node.sql(dialect="trino"))
+    return mixed
+
+
 def _scheduled_events_probe(count, stale=0, seen=None):
     """Fake Trino: ``count`` scheduled rows, ``stale`` of them overdue."""
 
@@ -1165,6 +1212,15 @@ def test_schedule_probe_asks_for_the_whole_partition_not_finished_rows(
     assert "status_type = 'finished'" not in sql
     assert "count_if" in sql
     assert params == ("ESP-La Liga", "2627")
+    # ``start_timestamp`` is epoch seconds in a ``double`` column: comparing it
+    # to ``current_timestamp`` raw is not a slow query but a rejected one, and
+    # the answer comes back disguised as "the probe could not answer". Assert
+    # the resolved types rather than the spelling -- swapping the operands
+    # keeps every substring intact and still dies on Trino.
+    assert not _mixed_time_comparisons(sql), (
+        "epoch-double is compared to a timestamp: "
+        f"{_mixed_time_comparisons(sql)}"
+    )
 
 
 def test_unanswerable_schedule_probe_refuses_like_before(

@@ -1101,6 +1101,11 @@ def validate_player_data(**context) -> Dict[str, Any]:
             )
         if extra.get("skipped"):
             continue
+        if _season_not_started(extra):
+            # #1109: no squad published because nothing has been played yet.
+            # There is no coverage to judge -- the phase never ran, exactly as
+            # the capture barrier already accepts for the match phase.
+            continue
         if extra.get("fallback") or extra.get("errors"):
             raise AirflowException(
                 f"{league}: player capture returned fallback/errors"

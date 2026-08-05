@@ -237,7 +237,17 @@ def _schedule_is_pending(league: str, season: str) -> bool:
         cur = conn.cursor()
         cur.execute(
             "SELECT count(*), "
-            "count_if(start_timestamp < current_timestamp - interval '6' hour "
+            # bronze stores the kickoff as epoch seconds in a ``double``, the
+            # way the source ships it, so the comparison has to convert before
+            # it compares -- Trino rejects ``double < timestamp`` outright and
+            # the raised error would be swallowed into "refusing as before",
+            # putting every unstarted league back where #1109 found it.
+            # A missing kickoff counts as overdue for the same reason the whole
+            # probe exists: only evidence may buy a quiet zero, and a NULL is
+            # the absence of it (comparisons against NULL would abstain).
+            "count_if((start_timestamp IS NULL "
+            "          OR from_unixtime(start_timestamp) "
+            "             < current_timestamp - interval '6' hour) "
             "         AND coalesce(status_type, 'unknown') "
             "             NOT IN ('finished', 'postponed', 'canceled')) "
             "FROM iceberg.bronze.sofascore_schedule "
@@ -1411,10 +1421,12 @@ def _run_player_capture(
                     ),
                     key=int,
                 )
-                if not planned_universe:
-                    raise RuntimeError(
-                        "signed player universe is empty for this partition"
-                    )
+                # An empty signature is not automatically a broken one: a
+                # league still waiting for its first matchday is planned empty
+                # on purpose (prepare_sofascore_workload). Falling through
+                # leaves the decision to the schedule probe below, and the
+                # unplanned-local check right after still refuses the case
+                # that matters -- a plan that dropped players we can see.
                 missing_local = set(planned_universe) - set(full_player_ids)
                 if missing_local:
                     raise RuntimeError(
