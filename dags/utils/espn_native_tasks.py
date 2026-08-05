@@ -856,6 +856,7 @@ def _scope_binding(
     binding = {
         "active": True,
         "initial_capture": head is None,
+        "scoreboard_max_range_days": runner.SCOREBOARD_MAX_RANGE_DAYS,
         "generation_id": identity,
         "batch_id": hashlib.sha256(f"espn-batch-v1\x00{identity}".encode()).hexdigest(),
         "ingested_at": ingested_at.isoformat().replace("+00:00", "Z"),
@@ -951,6 +952,7 @@ def _replay_scope_binding(
     return {
         "active": source_binding.active,
         "initial_capture": source_binding.initial_capture,
+        "scoreboard_max_range_days": source_binding.scoreboard_max_range_days,
         "generation_id": identity,
         "batch_id": hashlib.sha256(f"espn-batch-v1\x00{identity}".encode()).hexdigest(),
         "ingested_at": ingested_at.isoformat().replace("+00:00", "Z"),
@@ -1928,12 +1930,11 @@ def plan_summary_batch_wave(
             if request is None:
                 raise OperationsError("scoreboard checkpoint has unplanned request")
             body = raw_store.load_exact(record["raw_uri"], record["raw_sha256"])
-            rows = runner.parse_scoreboards(
+            rows = runner._parse_scoreboard_response(
                 body,
+                request=request,
                 competition=competition,
                 edition=edition,
-                query_start=request.query_start,
-                query_end=request.query_end,
             )
             for row in rows:
                 existing = fetched.get(row.event_id)

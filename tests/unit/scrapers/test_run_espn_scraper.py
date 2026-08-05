@@ -208,11 +208,11 @@ class FakeHttpClient:
         slug = url.split("/soccer/", 1)[1].split("/", 1)[0]
         if slug == self.fail_slug:
             raise RuntimeError("injected transport failure")
-        body = (
-            self.scoreboard_by_slug[slug]
-            if endpoint is EndpointType.SCOREBOARD
-            else self.summary_factory(int(event_id))
-        )
+        if endpoint is EndpointType.SCOREBOARD:
+            scoreboard = self.scoreboard_by_slug[slug]
+            body = scoreboard(params) if callable(scoreboard) else scoreboard
+        else:
+            body = self.summary_factory(int(event_id))
         target = canonicalize_target(url, params)
         record = self.raw_store.store(
             target,
@@ -411,6 +411,7 @@ def _plan(
     replay_source: dict | None = None,
     max_events: int = 100,
     selected_scopes: tuple[str, ...] | None = None,
+    scoreboard_max_range_days: int | None = None,
 ) -> tuple[ExecutionOptions, IngestPlan]:
     registry_uri, registry_signature = _registry(
         tmp_path, tuple(item[0] for item in competitions)
@@ -437,7 +438,7 @@ def _plan(
                 "generation_signature": prior.generation_signature,
                 "manifest_sha256": prior.manifest_sha256,
             }
-        bindings[scope.scope_id] = {
+        binding = {
             "active": active.get(scope.scope_id, True),
             "initial_capture": initial_capture,
             "generation_id": f"generation-{scope.scope_id.replace(':', '-')}",
@@ -455,6 +456,9 @@ def _plan(
             ),
             "prior": prior_binding,
         }
+        if scoreboard_max_range_days is not None:
+            binding["scoreboard_max_range_days"] = scoreboard_max_range_days
+        bindings[scope.scope_id] = binding
     metadata = {
         "runtime": {
             "mode": mode,
@@ -714,6 +718,7 @@ def test_initial_capture_splits_calendar_longer_than_supported_scoreboard_window
         generation_snapshot_uri="s3://artifacts/generation.json",
         known_nonterminal_events=(),
         prior=None,
+        scoreboard_max_range_days=31,
     )
 
     requests = runner._scoreboard_requests(
@@ -723,14 +728,523 @@ def test_initial_capture_splits_calendar_longer_than_supported_scoreboard_window
         mode="daily",
     )
 
-    assert [(request.query_start, request.query_end) for request in requests] == [
-        (date(2025, 12, 21), date(2026, 12, 20)),
-        (date(2026, 12, 21), date(2026, 12, 31)),
+    windows = [(request.query_start, request.query_end) for request in requests]
+    assert windows[0][0] == scope.start_date
+    assert windows[-1][1] == scope.end_date
+    assert all((end - start).days + 1 <= 31 for start, end in windows)
+    assert all(
+        following_start == previous_end + timedelta(days=1)
+        for (_, previous_end), (following_start, _) in zip(windows, windows[1:])
+    )
+    assert (
+        sum((end - start).days + 1 for start, end in windows)
+        == (scope.end_date - scope.start_date).days + 1
+    )
+    assert all(request.params["limit"] == 1000 for request in requests)
+
+
+@pytest.mark.unit
+def test_full_edition_over_1000_events_keeps_events_evicted_from_one_large_page(
+    tmp_path,
+):
+    competition, edition = _competition(
+        espn_id=5487,
+        slug="usa.ncaa.m.1",
+        source_year=2026,
+        start=date(2026, 1, 1),
+        end=date(2026, 4, 30),
+    )
+    event_ids = tuple(range(401_000_001, 401_001_201))
+    page_specs = {
+        "20260101-20260131": (event_ids[0:300], "2026-01-15T12:00Z"),
+        "20260201-20260303": (event_ids[300:600], "2026-02-15T12:00Z"),
+        "20260304-20260403": (event_ids[600:900], "2026-03-15T12:00Z"),
+        "20260404-20260430": (event_ids[900:1200], "2026-04-15T12:00Z"),
+    }
+
+    def scoreboard(params):
+        dates = params["dates"]
+        if dates in page_specs:
+            page_ids, event_date = page_specs[dates]
+        else:
+            # Model the upstream limit on the former whole-edition request:
+            # the first 200 events are displaced by the later 1000.
+            assert dates == "20260101-20260430"
+            page_ids, event_date = event_ids[-1000:], "2026-03-15T12:00Z"
+        return _scoreboard(
+            competition,
+            edition,
+            event_ids=tuple(page_ids),
+            event_date=event_date,
+            status="STATUS_SCHEDULED",
+        )
+
+    options, _ = _plan(
+        tmp_path,
+        "backfill",
+        ((competition, edition),),
+        as_of=date(2026, 4, 30),
+        scoreboard_max_range_days=31,
+    )
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(raw_store, {competition.slug: scoreboard})
+    repository = FakeRepository()
+
+    result = execute(
+        options,
+        repository=repository,
+        raw_store=raw_store,
+        http_client=client,
+    )
+
+    assert result.exit_code == 0
+    assert {row.event_id for row in repository.generations[0].schedule} == set(
+        event_ids
+    )
+    assert event_ids[0] in {row.event_id for row in repository.generations[0].schedule}
+    scoreboard_calls = [
+        call for call in client.calls if call[1] is EndpointType.SCOREBOARD
     ]
-    assert [request.params["dates"] for request in requests] == [
-        "20251221-20261220",
-        "20261221-20261231",
-    ]
+    assert [call[2]["dates"] for call in scoreboard_calls] == list(page_specs)
+    assert all(call[2]["limit"] == 1000 for call in scoreboard_calls)
+    assert all(call[1] is not EndpointType.SUMMARY for call in client.calls)
+
+
+@pytest.mark.unit
+def test_31_day_request_budget_allows_one_48_page_scope(tmp_path):
+    competition, edition = _competition(
+        espn_id=5487,
+        slug="concacaf.u23",
+        source_year=2012,
+        start=date(2012, 1, 1),
+        end=date(2016, 1, 1),
+    )
+    options, _ = _plan(
+        tmp_path,
+        "backfill",
+        ((competition, edition),),
+        as_of=date(2016, 1, 1),
+        scoreboard_max_range_days=31,
+    )
+
+    class RejectingHttpClient:
+        def __init__(self):
+            self.calls = 0
+
+        def fetch_json(self, *_args, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("bounded request reached HTTP")
+
+    client = RejectingHttpClient()
+    result = execute(options, repository=FakeRepository(), http_client=client)
+
+    assert result.exit_code == 1
+    assert client.calls == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("page_count", "maximum_attempts", "rejected"),
+    [(50, 600, False), (51, 604, True)],
+)
+def test_request_budget_allows_exact_600_and_rejects_604(
+    tmp_path,
+    page_count,
+    maximum_attempts,
+    rejected,
+):
+    start = date(2012, 1, 1)
+    competition, edition = _competition(
+        espn_id=5487,
+        slug="request.boundary",
+        source_year=2012,
+        start=start,
+        end=start + timedelta(days=page_count * 31 - 1),
+    )
+    options, _ = _plan(
+        tmp_path,
+        "backfill",
+        ((competition, edition),),
+        as_of=edition.end_date,
+        scoreboard_max_range_days=31,
+    )
+
+    class RejectingHttpClient:
+        def __init__(self):
+            self.calls = 0
+
+        def fetch_json(self, *_args, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("budget boundary reached HTTP")
+
+    client = RejectingHttpClient()
+    repository = FakeRepository()
+    if rejected:
+        with pytest.raises(RunnerConfigurationError, match="request budget"):
+            execute(options, repository=repository, http_client=client)
+        assert client.calls == 0
+    else:
+        result = execute(options, repository=repository, http_client=client)
+        assert result.exit_code == 1
+        assert client.calls == 1
+
+    assert (page_count + options.max_events) * 4 == maximum_attempts
+    assert repository.generations == []
+
+
+@pytest.mark.unit
+def test_31_day_request_budget_rejects_multi_scope_overflow_before_side_effects(
+    tmp_path,
+):
+    competitions = tuple(
+        _competition(
+            espn_id=5_487 + index,
+            slug=f"concacaf.u23.{index}",
+            source_year=2012,
+            start=date(2012, 1, 1),
+            end=date(2016, 1, 1),
+        )
+        for index in range(2)
+    )
+    options, _ = _plan(
+        tmp_path,
+        "backfill",
+        competitions,
+        as_of=date(2016, 1, 1),
+        scoreboard_max_range_days=31,
+    )
+
+    class UnexpectedHttpClient:
+        def __init__(self):
+            self.calls = 0
+
+        def fetch_json(self, *_args, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("overflow reached HTTP")
+
+    client = UnexpectedHttpClient()
+    repository = FakeRepository()
+
+    with pytest.raises(RunnerConfigurationError, match="request budget"):
+        execute(options, repository=repository, http_client=client)
+
+    assert client.calls == 0
+    assert repository.generations == []
+    assert not Path(options.raw_manifest_uri.removeprefix("file://")).exists()
+    assert not Path(options.output_uri.removeprefix("file://")).exists()
+    assert not Path(options.raw_store_uri.removeprefix("file://")).exists()
+
+
+@pytest.mark.unit
+def test_request_budget_resume_uses_valid_persisted_scoreboard_manifest(tmp_path):
+    from scrapers.espn import runner
+    from scrapers.espn.transport_contracts import (
+        DEFAULT_MAX_ATTEMPTS,
+        DEFAULT_MAX_REQUESTS,
+    )
+
+    start = date(2012, 1, 1)
+    competition, edition = _competition(
+        espn_id=5487,
+        slug="request.resume",
+        source_year=2012,
+        start=start,
+        end=start + timedelta(days=51 * 31 - 1),
+    )
+    options, _ = _plan(
+        tmp_path,
+        "backfill",
+        ((competition, edition),),
+        as_of=edition.end_date,
+        scoreboard_max_range_days=31,
+    )
+    loaded = runner._load_signed_plan(options.plan_uri)
+    selected = runner._validate_options(options, loaded)
+    requests = runner._scoreboard_requests(
+        selected[0],
+        loaded.bindings[selected[0].scope_id],
+        as_of=loaded.plan.as_of,
+        mode=loaded.mode,
+    )
+    assert len(requests) == 51
+    assert (
+        len(requests) - 1 + options.max_events
+    ) * DEFAULT_MAX_ATTEMPTS == DEFAULT_MAX_REQUESTS
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    empty_scoreboard = _scoreboard(competition, edition, event_ids=())
+    seed_client = FakeHttpClient(raw_store, {competition.slug: empty_scoreboard})
+    first_request = requests[0]
+    fetched = seed_client.fetch_json(
+        first_request.url,
+        EndpointType.SCOREBOARD,
+        first_request.params,
+        competition_id=competition.espn_id,
+        force_refresh=True,
+    )
+    record = runner._raw_request_from_fetch(
+        request_id=first_request.request_id,
+        scope_id=selected[0].scope_id,
+        endpoint="scoreboard",
+        event_id=None,
+        result=fetched,
+        query_start=first_request.query_start,
+        query_end=first_request.query_end,
+    )
+    manifest = runner._manifest_base(loaded, selected)
+    runner._append_checkpoint(
+        manifest,
+        scope_id=selected[0].scope_id,
+        endpoint="scoreboard",
+        requests=[record],
+    )
+    runner._persist_raw_manifest(options.raw_manifest_uri, manifest)
+    manifest_bytes = Path(options.raw_manifest_uri.removeprefix("file://")).read_bytes()
+
+    class RejectingHttpClient:
+        def __init__(self):
+            self.calls = 0
+
+        def fetch_json(self, *_args, **_kwargs):
+            self.calls += 1
+            raise RuntimeError("resumed request reached HTTP")
+
+    client = RejectingHttpClient()
+    repository = FakeRepository()
+    result = execute(
+        options,
+        repository=repository,
+        raw_store=raw_store,
+        http_client=client,
+    )
+
+    assert result.exit_code == 1
+    assert client.calls == 1
+    assert repository.generations == []
+    assert (
+        Path(options.raw_manifest_uri.removeprefix("file://")).read_bytes()
+        == manifest_bytes
+    )
+
+
+@pytest.mark.unit
+def test_exact_scoreboard_limit_fails_before_summary_or_publication(tmp_path):
+    competition, edition = _competition(
+        espn_id=5487,
+        slug="usa.ncaa.m.1",
+        source_year=2026,
+        start=date(2026, 1, 1),
+        end=date(2026, 1, 31),
+    )
+    options, _ = _plan(
+        tmp_path,
+        "backfill",
+        ((competition, edition),),
+        as_of=date(2026, 1, 31),
+        scoreboard_max_range_days=31,
+    )
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store,
+        {
+            competition.slug: _scoreboard(
+                competition,
+                edition,
+                event_ids=tuple(range(401_000_001, 401_001_001)),
+                event_date="2026-01-15T12:00Z",
+                status="STATUS_SCHEDULED",
+            )
+        },
+    )
+    repository = FakeRepository()
+
+    result = execute(
+        options,
+        repository=repository,
+        raw_store=raw_store,
+        http_client=client,
+    )
+
+    assert result.exit_code == 1
+    assert "saturated" in result.payload["scopes"][0]["error"]
+    assert repository.generations == []
+    assert all(call[1] is not EndpointType.SUMMARY for call in client.calls)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("saturated_event_count", [1000, 1001])
+def test_runwide_scoreboard_barrier_blocks_valid_first_scope_before_summary(
+    tmp_path,
+    saturated_event_count,
+):
+    first_competition, first_edition = _competition(
+        espn_id=100,
+        slug="first.valid",
+        source_year=2026,
+        start=date(2026, 1, 1),
+        end=date(2026, 1, 31),
+    )
+    second_competition, second_edition = _competition(
+        espn_id=200,
+        slug="second.saturated",
+        source_year=2026,
+        start=date(2026, 1, 1),
+        end=date(2026, 1, 31),
+    )
+    options, _ = _plan(
+        tmp_path,
+        "backfill",
+        (
+            (first_competition, first_edition),
+            (second_competition, second_edition),
+        ),
+        as_of=date(2026, 1, 31),
+    )
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store,
+        {
+            first_competition.slug: _scoreboard(
+                first_competition,
+                first_edition,
+                event_ids=(401_000_001,),
+                event_date="2026-01-15T12:00Z",
+            ),
+            second_competition.slug: _scoreboard(
+                second_competition,
+                second_edition,
+                event_ids=tuple(
+                    range(402_000_001, 402_000_001 + saturated_event_count)
+                ),
+                event_date="2026-01-15T12:00Z",
+                status="STATUS_SCHEDULED",
+            ),
+        },
+    )
+    repository = FakeRepository()
+
+    result = execute(
+        options,
+        repository=repository,
+        raw_store=raw_store,
+        http_client=client,
+    )
+
+    assert result.exit_code == 1
+    assert sum(call[1] is EndpointType.SCOREBOARD for call in client.calls) == 2
+    assert all(call[1] is not EndpointType.SUMMARY for call in client.calls)
+    assert repository.generations == []
+    assert "saturated" in result.payload["scopes"][1]["error"]
+
+
+@pytest.mark.unit
+def test_legacy_365_saturated_raw_fails_during_zero_http_replay(tmp_path):
+    competition, edition = _competition(
+        espn_id=5487,
+        slug="usa.ncaa.m.1",
+        source_year=2026,
+        start=date(2026, 1, 1),
+        end=date(2026, 1, 31),
+    )
+    capture_options, capture_plan = _plan(
+        tmp_path / "capture",
+        "backfill",
+        ((competition, edition),),
+        as_of=date(2026, 1, 31),
+    )
+    raw_store = EspnRawStore.from_uri(capture_options.raw_store_uri)
+    capture_client = FakeHttpClient(
+        raw_store,
+        {
+            competition.slug: _scoreboard(
+                competition,
+                edition,
+                event_ids=tuple(range(401_000_001, 401_001_001)),
+                event_date="2026-01-15T12:00Z",
+                status="STATUS_SCHEDULED",
+            )
+        },
+    )
+
+    capture = execute(
+        capture_options,
+        repository=FakeRepository(),
+        raw_store=raw_store,
+        http_client=capture_client,
+    )
+
+    assert capture.exit_code == 1
+    assert "saturated" in capture.payload["scopes"][0]["error"]
+    assert sum(call[1] is EndpointType.SCOREBOARD for call in capture_client.calls) == 1
+    manifest_bytes = Path(
+        capture_options.raw_manifest_uri.removeprefix("file://")
+    ).read_bytes()
+    replay_source = {
+        "mode": "backfill",
+        "run_id": capture_options.run_id,
+        "attempt": capture_options.attempt,
+        "plan_signature": capture_plan.signature(),
+        "raw_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+    }
+    replay_options, replay_plan = _plan(
+        tmp_path / "replay",
+        "replay",
+        ((competition, edition),),
+        as_of=date(2026, 1, 31),
+        run_id="legacy-saturated-replay",
+        replay_source=replay_source,
+    )
+    replay_options, _ = _bind_replay_to_capture(
+        replay_options, replay_plan, capture_options
+    )
+    repository = FakeRepository()
+
+    replay = execute(replay_options, repository=repository, raw_store=raw_store)
+
+    assert replay.exit_code == 1
+    assert "saturated" in replay.payload["scopes"][0]["error"]
+    assert repository.generations == []
+    assert (
+        Path(capture_options.raw_manifest_uri.removeprefix("file://")).read_bytes()
+        == manifest_bytes
+    )
+
+
+@pytest.mark.unit
+def test_legacy_binding_without_range_keeps_365_day_request_identity(tmp_path):
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    options, _ = _plan(tmp_path, "backfill", ((competition, edition),))
+    loaded = runner._load_signed_plan(options.plan_uri)
+    binding = loaded.bindings[competition.scope_id(edition)]
+
+    assert binding.scoreboard_max_range_days == 365
+    requests = runner._scoreboard_requests(
+        loaded.plan.scopes[0],
+        binding,
+        as_of=loaded.plan.as_of,
+        mode=loaded.mode,
+    )
+    assert [request.params["dates"] for request in requests] == ["20200801-20210731"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", [True, 0, 30, 32, 364, 366])
+def test_signed_scoreboard_range_accepts_only_new_31_or_legacy_365(tmp_path, value):
+    competition, edition = _competition()
+    options, _ = _plan(
+        tmp_path,
+        "backfill",
+        ((competition, edition),),
+        scoreboard_max_range_days=value,
+    )
+
+    with pytest.raises(RunnerConfigurationError, match="scoreboard_max_range_days"):
+        execute(
+            options,
+            repository=FakeRepository(),
+            raw_store=EspnRawStore.from_uri(options.raw_store_uri),
+        )
 
 
 @pytest.mark.unit
@@ -1003,23 +1517,39 @@ def test_101_final_events_checkpoint_as_50_50_1_and_resume_without_refetch(tmp_p
 
 
 @pytest.mark.unit
-def test_replay_uses_bound_exact_blobs_after_alias_moves_and_never_http(tmp_path):
+@pytest.mark.parametrize(
+    ("scoreboard_max_range_days", "expected_scoreboard_requests"),
+    [(None, 1), (31, 12)],
+)
+def test_replay_uses_bound_exact_blobs_after_alias_moves_and_never_http(
+    tmp_path,
+    scoreboard_max_range_days,
+    expected_scoreboard_requests,
+):
     competition, edition = _competition()
     capture_options, capture_plan = _plan(
-        tmp_path / "capture", "backfill", ((competition, edition),)
+        tmp_path / "capture",
+        "backfill",
+        ((competition, edition),),
+        scoreboard_max_range_days=scoreboard_max_range_days,
     )
     raw_store = EspnRawStore.from_uri(capture_options.raw_store_uri)
     capture_client = FakeHttpClient(
         raw_store, {competition.slug: _scoreboard(competition, edition)}
     )
+    capture_repo = FakeRepository()
     assert (
         execute(
             capture_options,
-            repository=FakeRepository(),
+            repository=capture_repo,
             raw_store=raw_store,
             http_client=capture_client,
         ).exit_code
         == 0
+    )
+    assert (
+        sum(call[1] is EndpointType.SCOREBOARD for call in capture_client.calls)
+        == expected_scoreboard_requests
     )
     manifest_path = Path(capture_options.raw_manifest_uri.removeprefix("file://"))
     manifest_bytes = manifest_path.read_bytes()
@@ -1036,6 +1566,7 @@ def test_replay_uses_bound_exact_blobs_after_alias_moves_and_never_http(tmp_path
         ((competition, edition),),
         run_id="replay-run",
         replay_source=replay_source,
+        scoreboard_max_range_days=scoreboard_max_range_days,
     )
     replay_options = replace(
         replay_options,
@@ -1077,6 +1608,17 @@ def test_replay_uses_bound_exact_blobs_after_alias_moves_and_never_http(tmp_path
     result = execute(replay_options, repository=replay_repo, raw_store=raw_store)
     assert result.exit_code == 0
     assert replay_repo.generations[0].schedule[0].event_id == 401000001
+
+    def raw_identity(generation):
+        return tuple(
+            (item.request_id, item.raw_uri, item.raw_sha256)
+            for item in generation.raw_ledger
+        )
+
+    assert raw_identity(replay_repo.generations[0]) == raw_identity(
+        capture_repo.generations[0]
+    )
+    assert manifest_path.read_bytes() == manifest_bytes
 
 
 @pytest.mark.unit

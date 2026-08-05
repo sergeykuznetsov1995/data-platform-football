@@ -40,6 +40,7 @@ from .parser_contracts import (
     PARSER_VERSION,
     ScheduleRow,
 )
+from .parser_common import decode_object, required_list
 from .parsers import parse_scoreboards, parse_summary
 from .raw_store import EspnRawStore
 from .registry import Registry, RegistryError, validate_registry_document
@@ -53,6 +54,7 @@ from .repository import (
 )
 from .transport import EspnHttpClient
 from .transport_contracts import (
+    DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MAX_COMPETITIONS,
     DEFAULT_MAX_REQUESTS,
     DEFAULT_MAX_SUMMARY_EVENTS,
@@ -75,7 +77,11 @@ SCOPE_SNAPSHOT_KIND = "espn-scope-generation-snapshot-v1"
 ARTIFACT_POINTER_KIND = "espn-artifact-pointer-v1"
 SUMMARY_CHECKPOINT_SIZE = 50
 SCOREBOARD_LIMIT = 1000
-SCOREBOARD_MAX_RANGE_DAYS = 365
+SCOREBOARD_MAX_RANGE_DAYS = 31
+LEGACY_SCOREBOARD_MAX_RANGE_DAYS = 365
+SCOREBOARD_RANGE_DAYS = frozenset(
+    {SCOREBOARD_MAX_RANGE_DAYS, LEGACY_SCOREBOARD_MAX_RANGE_DAYS}
+)
 SCOREBOARD_URL = (
     "https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard"
 )
@@ -195,6 +201,7 @@ class ScopeBinding:
     generation_snapshot_uri: str
     known_nonterminal_events: tuple[KnownNonterminalEvent, ...]
     prior: PriorBinding | None
+    scoreboard_max_range_days: int = SCOREBOARD_MAX_RANGE_DAYS
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,20 +422,38 @@ def _prior_binding(value: Any, field_name: str) -> PriorBinding | None:
 def _scope_binding(value: Any, scope_id: str) -> ScopeBinding:
     field_name = f"plan.metadata.runtime.scope_bindings[{scope_id!r}]"
     raw = _mapping(value, field_name)
-    _exact_keys(
-        raw,
-        {
-            "active",
-            "initial_capture",
-            "generation_id",
-            "batch_id",
-            "ingested_at",
-            "generation_snapshot_uri",
-            "known_nonterminal_events",
-            "prior",
-        },
-        field_name,
-    )
+    legacy_keys = {
+        "active",
+        "initial_capture",
+        "generation_id",
+        "batch_id",
+        "ingested_at",
+        "generation_snapshot_uri",
+        "known_nonterminal_events",
+        "prior",
+    }
+    range_key = "scoreboard_max_range_days"
+    current_keys = legacy_keys | {range_key}
+    actual_keys = set(raw)
+    if actual_keys == legacy_keys:
+        scoreboard_max_range_days = LEGACY_SCOREBOARD_MAX_RANGE_DAYS
+    elif actual_keys == current_keys:
+        scoreboard_max_range_days = raw[range_key]
+        if (
+            type(scoreboard_max_range_days) is not int
+            or scoreboard_max_range_days not in SCOREBOARD_RANGE_DAYS
+        ):
+            raise RunnerConfigurationError(
+                f"{field_name}.{range_key} must be exactly one of "
+                f"{sorted(SCOREBOARD_RANGE_DAYS)}"
+            )
+    else:
+        _exact_keys(
+            raw,
+            current_keys if range_key in raw else legacy_keys,
+            field_name,
+        )
+        raise AssertionError("unreachable scope binding key validation")
     for boolean in ("active", "initial_capture"):
         if type(raw[boolean]) is not bool:
             raise RunnerConfigurationError(f"{field_name}.{boolean} must be boolean")
@@ -478,6 +503,7 @@ def _scope_binding(value: Any, scope_id: str) -> ScopeBinding:
             sorted(known, key=lambda item: (item.event_date, item.event_id))
         ),
         prior=prior,
+        scoreboard_max_range_days=scoreboard_max_range_days,
     )
 
 
@@ -1204,7 +1230,7 @@ def _scoreboard_requests(
         while cursor <= end:
             chunk_end = min(
                 end,
-                cursor + timedelta(days=SCOREBOARD_MAX_RANGE_DAYS - 1),
+                cursor + timedelta(days=binding.scoreboard_max_range_days - 1),
             )
             bounded_ranges.append((cursor, chunk_end))
             cursor = chunk_end + timedelta(days=1)
@@ -1228,6 +1254,70 @@ def _scoreboard_requests(
             )
         )
     return tuple(requests)
+
+
+def _parse_scoreboard_response(
+    body: bytes,
+    *,
+    request: ScoreboardRequest,
+    competition: Competition,
+    edition: Edition,
+) -> tuple[ScheduleRow, ...]:
+    """Parse one exact raw page only after proving it was not limit-saturated."""
+
+    requested_limit = request.params.get("limit")
+    if type(requested_limit) is not int or requested_limit <= 0:
+        raise RunnerConfigurationError(
+            f"scoreboard request {request.request_id} has an invalid requested limit"
+        )
+    document = decode_object(body, "scoreboard raw response")
+    events = required_list(document.get("events"), "scoreboard raw response.events")
+    if len(events) >= requested_limit:
+        raise ScopeIncompleteError(
+            "scoreboard response saturated requested limit: "
+            f"scope={request.scope_id}, dates={request.params.get('dates')}, "
+            f"events={len(events)}, limit={requested_limit}"
+        )
+    return parse_scoreboards(
+        body,
+        competition=competition,
+        edition=edition,
+        query_start=request.query_start,
+        query_end=request.query_end,
+    )
+
+
+def _preflight_request_budget(
+    options: ExecutionOptions,
+    loaded: LoadedPlan,
+    selected: Sequence[ScopePlan],
+    raw_manifest: Mapping[str, Any],
+) -> None:
+    """Reject a run that cannot fit its remaining work in one transport budget."""
+
+    captured_request_ids = set(_raw_index(raw_manifest))
+    mode = _effective_mode(loaded)
+    missing_scoreboards = sum(
+        request.request_id not in captured_request_ids
+        for scope in selected
+        if loaded.bindings[scope.scope_id].active
+        for request in _scoreboard_requests(
+            scope,
+            loaded.bindings[scope.scope_id],
+            as_of=loaded.plan.as_of,
+            mode=mode,
+        )
+    )
+    logical_requests = missing_scoreboards + options.max_events
+    maximum_attempts = logical_requests * DEFAULT_MAX_ATTEMPTS
+    if maximum_attempts > DEFAULT_MAX_REQUESTS:
+        raise RunnerConfigurationError(
+            "planned request budget exceeds transport limit: "
+            f"missing_scoreboards={missing_scoreboards}, "
+            f"max_summary_events={options.max_events}, "
+            f"maximum_attempts={maximum_attempts}, "
+            f"max_requests={DEFAULT_MAX_REQUESTS}"
+        )
 
 
 def _manifest_base(loaded: LoadedPlan, selected: Sequence[ScopePlan]) -> dict[str, Any]:
@@ -1807,7 +1897,29 @@ class _BudgetState:
         return self.max_events - self.captured_events
 
 
-def _execute_scope(
+@dataclass(frozen=True, slots=True)
+class _PreparedScoreboard:
+    fetched_by_event: Mapping[int, ScheduleRow]
+    winner: Mapping[int, str]
+    records: tuple[Mapping[str, Any], ...]
+    noop_result: Mapping[str, Any] | None = None
+
+
+def _noop_scope_result(scope: ScopePlan, prior: ScopeGeneration) -> dict[str, Any]:
+    return {
+        "scope_id": scope.scope_id,
+        "state": "noop",
+        "generation_id": prior.generation_id,
+        "manifest_sha256": prior.manifest_sha256,
+        "row_counts": {
+            "schedule": len(prior.schedule),
+            "lineup": len(prior.lineup),
+            "matchsheet": len(prior.matchsheet),
+        },
+    }
+
+
+def _prepare_scope_scoreboard(
     *,
     loaded: LoadedPlan,
     scope: ScopePlan,
@@ -1816,46 +1928,24 @@ def _execute_scope(
     binding: ScopeBinding,
     prior: ScopeGeneration | None,
     raw_manifest: dict[str, Any],
-    raw_store: EspnRawStore,
+    raw_store: EspnRawStore | None,
     http_client: Any | None,
-    repository: RepositoryProtocol | None,
-    budget_state: _BudgetState,
-    publish: bool = True,
-    staged_generations: dict[str, ScopeGeneration] | None = None,
-) -> dict[str, Any]:
+) -> _PreparedScoreboard:
     if not binding.active:
         if prior is None:
             raise RunnerConfigurationError(
                 f"scope {scope.scope_id} no-op requires prior COMPLETE identity"
             )
-        return {
-            "scope_id": scope.scope_id,
-            "state": "noop",
-            "generation_id": prior.generation_id,
-            "manifest_sha256": prior.manifest_sha256,
-            "row_counts": {
-                "schedule": len(prior.schedule),
-                "lineup": len(prior.lineup),
-                "matchsheet": len(prior.matchsheet),
-            },
-        }
+        return _PreparedScoreboard({}, {}, (), _noop_scope_result(scope, prior))
 
     mode = _effective_mode(loaded)
     requests = _scoreboard_requests(scope, binding, as_of=loaded.plan.as_of, mode=mode)
     if not requests:
         if prior is None:
             raise ScopeIncompleteError("active scope has no calendar query or prior")
-        return {
-            "scope_id": scope.scope_id,
-            "state": "noop",
-            "generation_id": prior.generation_id,
-            "manifest_sha256": prior.manifest_sha256,
-            "row_counts": {
-                "schedule": len(prior.schedule),
-                "lineup": len(prior.lineup),
-                "matchsheet": len(prior.matchsheet),
-            },
-        }
+        return _PreparedScoreboard({}, {}, (), _noop_scope_result(scope, prior))
+    if raw_store is None:
+        raise AssertionError("active scoreboard preparation requires a raw store")
     replay = loaded.mode == "replay"
     raw_index = _raw_index(raw_manifest)
     scoreboard_payloads: list[tuple[ScoreboardRequest, bytes, Mapping[str, Any]]] = []
@@ -1888,12 +1978,11 @@ def _execute_scope(
     winner: dict[int, str] = {}
     scoreboard_records: list[Mapping[str, Any]] = []
     for request, body, record in scoreboard_payloads:
-        rows = parse_scoreboards(
+        rows = _parse_scoreboard_response(
             body,
+            request=request,
             competition=competition,
             edition=edition,
-            query_start=request.query_start,
-            query_end=request.query_end,
         )
         for row in rows:
             existing = fetched_by_event.get(row.event_id)
@@ -1916,17 +2005,43 @@ def _execute_scope(
     full = _full_strategy(scope, binding, mode, loaded.plan.as_of)
     if not fetched_by_event and not full:
         assert prior is not None
-        return {
-            "scope_id": scope.scope_id,
-            "state": "noop",
-            "generation_id": prior.generation_id,
-            "manifest_sha256": prior.manifest_sha256,
-            "row_counts": {
-                "schedule": len(prior.schedule),
-                "lineup": len(prior.lineup),
-                "matchsheet": len(prior.matchsheet),
-            },
-        }
+        return _PreparedScoreboard({}, {}, (), _noop_scope_result(scope, prior))
+    return _PreparedScoreboard(
+        fetched_by_event=dict(fetched_by_event),
+        winner=dict(winner),
+        records=tuple(scoreboard_records),
+    )
+
+
+def _process_prepared_scope(
+    *,
+    loaded: LoadedPlan,
+    scope: ScopePlan,
+    competition: Competition,
+    edition: Edition,
+    binding: ScopeBinding,
+    prior: ScopeGeneration | None,
+    prepared: _PreparedScoreboard,
+    raw_manifest: dict[str, Any],
+    raw_store: EspnRawStore | None,
+    http_client: Any | None,
+    repository: RepositoryProtocol | None,
+    budget_state: _BudgetState,
+    publish: bool = True,
+    staged_generations: dict[str, ScopeGeneration] | None = None,
+) -> dict[str, Any]:
+    if prepared.noop_result is not None:
+        return dict(prepared.noop_result)
+    if raw_store is None:
+        raise AssertionError("active scope processing requires a raw store")
+
+    fetched_by_event = prepared.fetched_by_event
+    winner = prepared.winner
+    scoreboard_records = prepared.records
+    mode = _effective_mode(loaded)
+    replay = loaded.mode == "replay"
+    raw_index = _raw_index(raw_manifest)
+    full = _full_strategy(scope, binding, mode, loaded.plan.as_of)
     if full:
         schedule_by_event = dict(fetched_by_event)
     else:
@@ -2136,6 +2251,78 @@ def _execute_scope(
     }
 
 
+def _prepare_run_scoreboards(
+    *,
+    loaded: LoadedPlan,
+    selected: Sequence[ScopePlan],
+    registry_scopes: Mapping[str, tuple[Competition, Edition]],
+    priors: Mapping[str, ScopeGeneration | None],
+    raw_manifest: dict[str, Any],
+    raw_store: EspnRawStore | None,
+    http_client: Any | None,
+) -> tuple[
+    dict[str, _PreparedScoreboard],
+    dict[str, dict[str, Any]],
+]:
+    """Prepare every scoreboard before any scope may process Summary data."""
+
+    prepared: dict[str, _PreparedScoreboard] = {}
+    failures: dict[str, dict[str, Any]] = {}
+    for scope in selected:
+        competition, edition = registry_scopes[scope.scope_id]
+        try:
+            prepared[scope.scope_id] = _prepare_scope_scoreboard(
+                loaded=loaded,
+                scope=scope,
+                competition=competition,
+                edition=edition,
+                binding=loaded.bindings[scope.scope_id],
+                prior=priors[scope.scope_id],
+                raw_manifest=raw_manifest,
+                raw_store=raw_store,
+                http_client=http_client,
+            )
+        except RunnerConfigurationError:
+            raise
+        except Exception as exc:
+            failures[scope.scope_id] = {
+                "scope_id": scope.scope_id,
+                "state": "incomplete",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+    return prepared, failures
+
+
+def _scoreboard_barrier_results(
+    selected: Sequence[ScopePlan],
+    prepared: Mapping[str, _PreparedScoreboard],
+    failures: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Describe a failed run-wide phase without processing any Summary data."""
+
+    results: list[dict[str, Any]] = []
+    for scope in selected:
+        failure = failures.get(scope.scope_id)
+        if failure is not None:
+            results.append(dict(failure))
+            continue
+        preparation = prepared[scope.scope_id]
+        if preparation.noop_result is not None:
+            results.append(dict(preparation.noop_result))
+            continue
+        results.append(
+            {
+                "scope_id": scope.scope_id,
+                "state": "incomplete",
+                "error": (
+                    "ScopeIncompleteError: run-wide scoreboard validation failed "
+                    "before Summary/publication"
+                ),
+            }
+        )
+    return results
+
+
 def _default_http_client(raw_store: EspnRawStore, selected_count: int, max_events: int):
     budget = TaskBudget(
         max_competitions=min(selected_count, DEFAULT_MAX_COMPETITIONS),
@@ -2204,36 +2391,51 @@ def stage(
     active = [scope for scope in selected if loaded.bindings[scope.scope_id].active]
     if active and raw_store is None:
         raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    prepared, scoreboard_failures = _prepare_run_scoreboards(
+        loaded=loaded,
+        selected=selected,
+        registry_scopes=registry_scopes,
+        priors=priors,
+        raw_manifest=raw_manifest,
+        raw_store=raw_store,
+        http_client=None,
+    )
     budget_state = _BudgetState(options.max_events)
     generations: dict[str, ScopeGeneration] = {}
-    scope_results: list[dict[str, Any]] = []
-    for scope in selected:
-        competition, edition = registry_scopes[scope.scope_id]
-        try:
-            result = _execute_scope(
-                loaded=loaded,
-                scope=scope,
-                competition=competition,
-                edition=edition,
-                binding=loaded.bindings[scope.scope_id],
-                prior=priors[scope.scope_id],
-                raw_manifest=raw_manifest,
-                raw_store=raw_store,
-                http_client=None,
-                repository=None,
-                budget_state=budget_state,
-                publish=False,
-                staged_generations=generations,
-            )
-        except RunnerConfigurationError:
-            raise
-        except Exception as exc:
-            result = {
-                "scope_id": scope.scope_id,
-                "state": "incomplete",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        scope_results.append(result)
+    if scoreboard_failures:
+        scope_results = _scoreboard_barrier_results(
+            selected, prepared, scoreboard_failures
+        )
+    else:
+        scope_results = []
+        for scope in selected:
+            competition, edition = registry_scopes[scope.scope_id]
+            try:
+                result = _process_prepared_scope(
+                    loaded=loaded,
+                    scope=scope,
+                    competition=competition,
+                    edition=edition,
+                    binding=loaded.bindings[scope.scope_id],
+                    prior=priors[scope.scope_id],
+                    prepared=prepared[scope.scope_id],
+                    raw_manifest=raw_manifest,
+                    raw_store=raw_store,
+                    http_client=None,
+                    repository=None,
+                    budget_state=budget_state,
+                    publish=False,
+                    staged_generations=generations,
+                )
+            except RunnerConfigurationError:
+                raise
+            except Exception as exc:
+                result = {
+                    "scope_id": scope.scope_id,
+                    "state": "incomplete",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            scope_results.append(result)
     incomplete = any(item["state"] == "incomplete" for item in scope_results)
     staged = any(item["state"] == "staged" for item in scope_results)
     state = "incomplete" if incomplete else ("staged" if staged else "noop")
@@ -2293,9 +2495,10 @@ def execute(
             _load_prior(prior_binding, scope) if prior_binding is not None else None
         )
     raw_manifest, existed = _load_raw_manifest(loaded, selected)
+    active = [scope for scope in selected if loaded.bindings[scope.scope_id].active]
+    _preflight_request_budget(options, loaded, selected, raw_manifest)
     if loaded.mode != "replay" and not existed:
         _persist_raw_manifest(loaded.raw_manifest_uri, raw_manifest)
-    active = [scope for scope in selected if loaded.bindings[scope.scope_id].active]
     if loaded.mode == "replay" and http_client is not None:
         raise RunnerConfigurationError("replay forbids an HTTP client")
     if active and raw_store is None:
@@ -2303,41 +2506,56 @@ def execute(
     if loaded.mode != "replay" and active and http_client is None:
         assert raw_store is not None
         http_client = _default_http_client(raw_store, len(selected), options.max_events)
-    if active and repository is None:
-        repository = EspnBronzeRepository()
+    prepared, scoreboard_failures = _prepare_run_scoreboards(
+        loaded=loaded,
+        selected=selected,
+        registry_scopes=registry_scopes,
+        priors=priors,
+        raw_manifest=raw_manifest,
+        raw_store=raw_store,
+        http_client=http_client,
+    )
     budget_state = _BudgetState(options.max_events)
-    scope_results: list[dict[str, Any]] = []
-    for scope in selected:
-        competition, edition = registry_scopes[scope.scope_id]
-        try:
-            result = _execute_scope(
-                loaded=loaded,
-                scope=scope,
-                competition=competition,
-                edition=edition,
-                binding=loaded.bindings[scope.scope_id],
-                prior=priors[scope.scope_id],
-                raw_manifest=raw_manifest,
-                raw_store=raw_store,
-                http_client=http_client,
-                repository=repository,
-                budget_state=budget_state,
-            )
-        except ArtifactConflictError as exc:
-            result = {
-                "scope_id": scope.scope_id,
-                "state": "incomplete",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        except RunnerConfigurationError:
-            raise
-        except Exception as exc:
-            result = {
-                "scope_id": scope.scope_id,
-                "state": "incomplete",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        scope_results.append(result)
+    if scoreboard_failures:
+        scope_results = _scoreboard_barrier_results(
+            selected, prepared, scoreboard_failures
+        )
+    else:
+        if active and repository is None:
+            repository = EspnBronzeRepository()
+        scope_results = []
+        for scope in selected:
+            competition, edition = registry_scopes[scope.scope_id]
+            try:
+                result = _process_prepared_scope(
+                    loaded=loaded,
+                    scope=scope,
+                    competition=competition,
+                    edition=edition,
+                    binding=loaded.bindings[scope.scope_id],
+                    prior=priors[scope.scope_id],
+                    prepared=prepared[scope.scope_id],
+                    raw_manifest=raw_manifest,
+                    raw_store=raw_store,
+                    http_client=http_client,
+                    repository=repository,
+                    budget_state=budget_state,
+                )
+            except ArtifactConflictError as exc:
+                result = {
+                    "scope_id": scope.scope_id,
+                    "state": "incomplete",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            except RunnerConfigurationError:
+                raise
+            except Exception as exc:
+                result = {
+                    "scope_id": scope.scope_id,
+                    "state": "incomplete",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            scope_results.append(result)
     incomplete = any(item["state"] == "incomplete" for item in scope_results)
     complete = any(item["state"] == "complete" for item in scope_results)
     state = "incomplete" if incomplete else ("complete" if complete else "noop")

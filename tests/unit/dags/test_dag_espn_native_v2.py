@@ -1054,6 +1054,308 @@ def test_summary_planner_rejects_airflow_none_when_scoreboard_map_was_expected(
         )
 
 
+def test_native_summary_planner_rejects_exactly_saturated_scoreboard_page(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+
+    scope_id = "5487:2026"
+    plan_index_ref = {"uri": "file:///plan-index.json", "sha256": "a" * 64}
+    binding_ref = {"uri": "file:///binding.json", "sha256": "b" * 64}
+    phase_ref = {"uri": "file:///scoreboard-phase.json", "sha256": "c" * 64}
+    checkpoint_ref = {"uri": "file:///scoreboard.json", "sha256": "d" * 64}
+    request = SimpleNamespace(
+        scope_id=scope_id,
+        request_id="scoreboard:page",
+        params={"dates": "20260101-20260131", "limit": 1000},
+        query_start=date(2026, 1, 1),
+        query_end=date(2026, 1, 31),
+    )
+    loaded = SimpleNamespace(
+        plan=SimpleNamespace(run_id="canary", as_of=date(2026, 1, 31)),
+        attempt=1,
+        signature="e" * 64,
+        mode="backfill",
+        bindings={
+            scope_id: SimpleNamespace(
+                active=True,
+                prior=None,
+                known_nonterminal_events=(),
+            )
+        },
+    )
+    scope = SimpleNamespace(scope_id=scope_id)
+    descriptor = {
+        "scope_root": "file:///run/scopes/5487-2026",
+        "raw_store_uri": "file:///raw",
+    }
+    plan_index = {
+        "kind": "espn-plan-index-v1",
+        "schema_version": 1,
+        "scope_ids": [scope_id],
+        "network_scope_ids": [scope_id],
+        "expected_scoreboard_map_count": 1,
+    }
+    phase = {
+        "kind": "espn-scoreboard-phase-result-v1",
+        "scope_binding_ref": binding_ref,
+        "checkpoint_ref": checkpoint_ref,
+    }
+    checkpoint = {
+        "requests": [
+            {
+                "request_id": request.request_id,
+                "raw_uri": "file:///raw/page.json.gz",
+                "raw_sha256": "f" * 64,
+            }
+        ]
+    }
+    saturated = json.dumps({"events": [{} for _ in range(1000)]}).encode()
+
+    def read_ref(ref, *, kind=None):
+        if ref == plan_index_ref and kind == "espn-plan-index-v1":
+            return plan_index
+        if ref == phase_ref and kind == "espn-scoreboard-phase-result-v1":
+            return phase
+        if ref == checkpoint_ref and kind is None:
+            return checkpoint
+        pytest.fail(f"unexpected artifact read: {ref!r}, {kind!r}")
+
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", read_ref)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_binding",
+        lambda ref: (
+            ({}, descriptor, loaded, scope, object())
+            if ref == binding_ref
+            else pytest.fail(f"unexpected binding: {ref!r}")
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_heartbeat_scope_binding", lambda _ref: None
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "_scoreboard_requests",
+        lambda *_args, **_kwargs: (request,),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner, "_effective_mode", lambda _loaded: "backfill"
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_registry_scope", lambda *_args: (object(), object())
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        lambda _uri: SimpleNamespace(load_exact=lambda *_args: saturated),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda *_args, **_kwargs: pytest.fail("saturated raw reached summary planning"),
+    )
+
+    with pytest.raises(
+        espn_native_tasks.runner.ScopeIncompleteError, match="saturated"
+    ):
+        espn_native_tasks.plan_summary_batch_wave(
+            plan_index_ref=plan_index_ref,
+            scoreboard_phase_refs=[{"scoreboard_phase_ref": phase_ref}],
+            scope_binding_refs=[{"scope_binding_ref": binding_ref}],
+        )
+
+
+def test_native_summary_planner_keeps_missing_known_event_guard(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    scope_id = "5487:2026"
+    plan_index_ref = {"uri": "file:///plan-index.json", "sha256": "a" * 64}
+    binding_ref = {"uri": "file:///binding.json", "sha256": "b" * 64}
+    phase_ref = {"uri": "file:///scoreboard-phase.json", "sha256": "c" * 64}
+    checkpoint_ref = {"uri": "file:///scoreboard.json", "sha256": "d" * 64}
+    request = SimpleNamespace(
+        scope_id=scope_id,
+        request_id="scoreboard:page",
+        params={"dates": "20260101-20260131", "limit": 1000},
+        query_start=date(2026, 1, 1),
+        query_end=date(2026, 1, 31),
+    )
+    loaded = SimpleNamespace(
+        plan=SimpleNamespace(run_id="canary", as_of=date(2026, 1, 31)),
+        attempt=1,
+        signature="e" * 64,
+        mode="backfill",
+        bindings={
+            scope_id: SimpleNamespace(
+                active=True,
+                prior=None,
+                known_nonterminal_events=(SimpleNamespace(event_id=401_901_061),),
+            )
+        },
+    )
+    scope = SimpleNamespace(scope_id=scope_id)
+    descriptor = {
+        "scope_root": "file:///run/scopes/5487-2026",
+        "raw_store_uri": "file:///raw",
+    }
+    plan_index = {
+        "kind": "espn-plan-index-v1",
+        "schema_version": 1,
+        "scope_ids": [scope_id],
+        "network_scope_ids": [scope_id],
+        "expected_scoreboard_map_count": 1,
+    }
+    phase = {
+        "kind": "espn-scoreboard-phase-result-v1",
+        "scope_binding_ref": binding_ref,
+        "checkpoint_ref": checkpoint_ref,
+    }
+    checkpoint = {
+        "requests": [
+            {
+                "request_id": request.request_id,
+                "raw_uri": "file:///raw/page.json.gz",
+                "raw_sha256": "f" * 64,
+            }
+        ]
+    }
+
+    def read_ref(ref, *, kind=None):
+        if ref == plan_index_ref and kind == "espn-plan-index-v1":
+            return plan_index
+        if ref == phase_ref and kind == "espn-scoreboard-phase-result-v1":
+            return phase
+        if ref == checkpoint_ref and kind is None:
+            return checkpoint
+        pytest.fail(f"unexpected artifact read: {ref!r}, {kind!r}")
+
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", read_ref)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_binding",
+        lambda ref: (
+            ({}, descriptor, loaded, scope, object())
+            if ref == binding_ref
+            else pytest.fail(f"unexpected binding: {ref!r}")
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_heartbeat_scope_binding", lambda _ref: None
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "_scoreboard_requests",
+        lambda *_args, **_kwargs: (request,),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner, "_effective_mode", lambda _loaded: "backfill"
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_registry_scope", lambda *_args: (object(), object())
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        lambda _uri: SimpleNamespace(load_exact=lambda *_args: b"{}"),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "_parse_scoreboard_response",
+        lambda *_args, **_kwargs: (),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda *_args, **_kwargs: pytest.fail("missing known reached batch planning"),
+    )
+
+    with pytest.raises(
+        espn_native_tasks.OperationsError,
+        match=r"known non-terminal events absent.*401901061",
+    ):
+        espn_native_tasks.plan_summary_batch_wave(
+            plan_index_ref=plan_index_ref,
+            scoreboard_phase_refs=[{"scoreboard_phase_ref": phase_ref}],
+            scope_binding_refs=[{"scope_binding_ref": binding_ref}],
+        )
+
+
+def test_native_network_binding_signs_31_day_scoreboard_pages():
+    from dags.utils import espn_native_tasks
+
+    registry = _generated_registry(1)
+    competition = registry.promoted[0]
+    scope = espn_native_tasks._scope_plan(
+        registry, competition.scope_id(competition.current_edition)
+    )
+
+    binding = espn_native_tasks._scope_binding(
+        head=None,
+        scope=scope,
+        run_id="backfill-run",
+        attempt=1,
+        mode="backfill",
+        root="s3://artifacts/run",
+        ingested_at=datetime(2026, 8, 2, tzinfo=timezone.utc),
+        as_of=date(2026, 8, 2),
+    )
+
+    assert binding["scoreboard_max_range_days"] == 31
+    typed = espn_native_tasks.runner._scope_binding(binding, scope.scope_id)
+    requests = espn_native_tasks.runner._scoreboard_requests(
+        scope, typed, as_of=date(2026, 8, 2), mode="backfill"
+    )
+    assert all((item.query_end - item.query_start).days + 1 <= 31 for item in requests)
+
+
+@pytest.mark.parametrize(
+    ("source_range", "expected_range"),
+    [(None, 365), (31, 31)],
+)
+def test_native_replay_copies_signed_scoreboard_range_identity(
+    source_range,
+    expected_range,
+):
+    from dags.utils import espn_native_tasks
+
+    scope_id = "700:2024"
+    source_document = {
+        "active": True,
+        "initial_capture": True,
+        "generation_id": "source-generation",
+        "batch_id": "source-batch",
+        "ingested_at": "2026-08-01T00:00:00Z",
+        "generation_snapshot_uri": "s3://artifacts/source.json",
+        "known_nonterminal_events": [],
+        "prior": None,
+    }
+    if source_range is not None:
+        source_document["scoreboard_max_range_days"] = source_range
+    source_binding = espn_native_tasks.runner._scope_binding(
+        source_document,
+        scope_id,
+    )
+
+    replay = espn_native_tasks._replay_scope_binding(
+        source_binding=source_binding,
+        scope=SimpleNamespace(scope_id=scope_id),
+        run_id="replay-run",
+        attempt=1,
+        root="s3://artifacts/replay",
+        ingested_at=datetime(2026, 8, 2, tzinfo=timezone.utc),
+    )
+
+    assert source_binding.scoreboard_max_range_days == expected_range
+    assert replay["scoreboard_max_range_days"] == expected_range
+    assert (
+        espn_native_tasks.runner._scope_binding(
+            replay, scope_id
+        ).scoreboard_max_range_days
+        == expected_range
+    )
+
+
 def test_publication_reducer_runs_after_zero_map_and_rejects_none(monkeypatch):
     from dags.utils import espn_native_tasks
 
@@ -1362,6 +1664,57 @@ def test_exact_181_scope_fixture_bounds_reconciliation_summary_map():
     assert len(scope_ids) == sum(map(len, reconciliation_groups.values())) == 181
     assert max(map(len, reconciliation_groups.values())) == 35
     assert 35 * ceil(1000 / 50) + 10 * ceil(1000 / 50) == 900 < 1024
+
+
+def test_live_and_frozen_catalogs_fit_31_day_pages_inside_transport_budget():
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.discovery import CatalogSnapshot
+    from scrapers.espn.registry import (
+        DEFAULT_REGISTRY_PATH,
+        build_discovered_male_registry,
+        load_registry,
+    )
+    from scrapers.espn.runner import ScopeBinding
+    from scrapers.espn.transport_contracts import (
+        DEFAULT_MAX_ATTEMPTS,
+        DEFAULT_MAX_REQUESTS,
+    )
+
+    live = load_registry(DEFAULT_REGISTRY_PATH)
+    snapshot = CatalogSnapshot.from_dict(
+        json.loads((ROOT / "tests/fixtures/espn/catalog_2026-07-31.json").read_text())
+    )
+    frozen = build_discovered_male_registry(snapshot, legacy_registry=live)
+    binding = ScopeBinding(
+        active=True,
+        initial_capture=True,
+        generation_id="catalog-budget",
+        batch_id="catalog-budget",
+        ingested_at=datetime(2026, 7, 31, tzinfo=timezone.utc),
+        generation_snapshot_uri="file:///catalog-budget.json",
+        known_nonterminal_events=(),
+        prior=None,
+        scoreboard_max_range_days=31,
+    )
+    page_counts = []
+    for registry in (live, frozen):
+        for scope_id in _scope_ids(registry):
+            scope = espn_native_tasks._scope_plan(registry, scope_id)
+            requests = espn_native_tasks.runner._scoreboard_requests(
+                scope,
+                binding,
+                as_of=date(2026, 7, 31),
+                mode="backfill",
+            )
+            assert all(
+                (request.query_end - request.query_start).days + 1 <= 31
+                for request in requests
+            )
+            page_counts.append(len(requests))
+
+    max_pages = max(page_counts)
+    assert max_pages == 48
+    assert max_pages * DEFAULT_MAX_ATTEMPTS < DEFAULT_MAX_REQUESTS
 
 
 def test_daily_admission_v2_persists_exact_discovery_and_coverage(monkeypatch):
