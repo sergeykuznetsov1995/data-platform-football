@@ -5658,6 +5658,16 @@ class ControlStore:
                 "response_too_large",
                 "invalid_encoding",
                 "invalid_content_type",
+                # A clearance/transport failure names the session, not a
+                # surprise: the wave resolves it by re-solving on a fresh proxy
+                # and re-claiming the same lease, and the attempt is kept as
+                # traffic evidence. Counting it unclassified made the run red
+                # for handling a dead proxy exactly as designed (#1122).
+                "warm_session_cloudflare",
+                "warm_session_connection",
+                "warm_session_forbidden",
+                "warm_session_rate_limit",
+                "warm_session_timeout",
                 # Abort bookkeeping stamps in-flight attempts with the classes
                 # below (#1102).  They are deliberate run-lifecycle evidence,
                 # not unclassified surprises — without them here a resumed run

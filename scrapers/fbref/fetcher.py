@@ -61,20 +61,38 @@ except ImportError:  # pragma: no cover - exercised by the import-light suite
 # unclassified per-target one and failed the whole wave (#1122). The exception
 # TYPE says what the text does not. Same guarded-import pattern as above so the
 # import-light suite keeps working without the optional transport.
-try:  # pragma: no cover - curl_cffi is installed in the production image
-    from curl_cffi.requests import exceptions as _curl_exceptions
+def _transport_error_types(*names: str) -> tuple[type[BaseException], ...]:
+    """Collect the transport exception types this curl_cffi actually ships.
 
-    _TRANSPORT_TIMEOUT_ERRORS: tuple[type[BaseException], ...] = (
-        _curl_exceptions.Timeout,
+    Resolved name by name: a renamed or dropped class costs its own coverage,
+    never the whole tuple, so an upgrade cannot silently restore #1122.
+    """
+    try:  # pragma: no cover - curl_cffi is installed in the production image
+        from curl_cffi.requests import exceptions as curl_exceptions
+    except ImportError:  # pragma: no cover - exercised by import-light suite
+        return ()
+    found = tuple(
+        resolved
+        for resolved in (getattr(curl_exceptions, name, None) for name in names)
+        if isinstance(resolved, type) and issubclass(resolved, BaseException)
     )
-    _TRANSPORT_CONNECTION_ERRORS: tuple[type[BaseException], ...] = (
-        _curl_exceptions.ProxyError,
-        _curl_exceptions.ConnectionError,
-        _curl_exceptions.DNSError,
-    )
-except (ImportError, AttributeError):  # pragma: no cover - import-light suite
-    _TRANSPORT_TIMEOUT_ERRORS = ()
-    _TRANSPORT_CONNECTION_ERRORS = ()
+    missing = [name for name in names if not hasattr(curl_exceptions, name)]
+    if missing:  # pragma: no cover - only on a transport upgrade
+        logging.getLogger(__name__).warning(
+            "curl_cffi no longer exposes %s; transport failures using it fall "
+            "back to text classification",
+            ", ".join(missing),
+        )
+    return found
+
+
+# ProxyError and friends are what a dead proxy raises. Their subclasses come
+# along by isinstance: SSLError and DNSError extend ConnectionError,
+# ConnectTimeout and ReadTimeout extend Timeout.
+_TRANSPORT_TIMEOUT_ERRORS = _transport_error_types("Timeout")
+_TRANSPORT_CONNECTION_ERRORS = _transport_error_types(
+    "ProxyError", "ConnectionError"
+)
 
 
 class _CumulativeBodyBuffer:
@@ -945,17 +963,19 @@ class FBrefFetcher:
         }
         error_type = status_types.get(partial_status)
         if error_type is None:
-            # Order matters: a source that answered keeps its verdict, then the
-            # exception type, and only then the prose. Typing the transport
-            # exceptions is what stops a dead proxy from being filed as an
-            # unclassified target failure (#1122) -- the text classifier misses
-            # them because libcurl says "connect", not "connection".
+            error_type = classify_error(str(exc))
+        if error_type == "unknown":
+            # The prose stays the primary signal: a proxy that reports "HTTP
+            # code 429 after CONNECT" carries no response object, so its only
+            # evidence of rate limiting is that sentence. The exception type is
+            # the fallback for the prose libcurl writes when a proxy is simply
+            # dead -- "Could not connect to proxy", which matches none of the
+            # classifier's substrings and used to be filed as an unclassified
+            # per-target failure that killed the whole wave (#1122).
             if isinstance(exc, _TRANSPORT_TIMEOUT_ERRORS):
                 error_type = "timeout"
             elif isinstance(exc, _TRANSPORT_CONNECTION_ERRORS):
                 error_type = "connection"
-        if error_type is None:
-            error_type = classify_error(str(exc))
         if error_type in {
             "cloudflare",
             "connection",

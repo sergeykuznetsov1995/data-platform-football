@@ -378,6 +378,40 @@ def test_a_source_verdict_outranks_the_exception_type():
     assert caught.value.error_class == "warm_session_forbidden"
 
 
+def test_proxy_prose_about_rate_limiting_outranks_the_exception_type():
+    """A proxy that reports 429 after CONNECT has no response object: the
+    sentence is its only evidence, so the text must stay the primary signal."""
+    exceptions = pytest.importorskip("curl_cffi.requests.exceptions")
+    fetcher = _fetcher(_response())
+    fetcher._http_session.get.side_effect = exceptions.ProxyError(
+        "Received HTTP code 429 from proxy after CONNECT"
+    )
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch("https://fbref.com/en/comps", page_kind="competition_index")
+
+    assert caught.value.error_class == "warm_session_rate_limit"
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["SSLError", "DNSError", "ConnectTimeout", "ReadTimeout"],
+)
+def test_transport_subclasses_are_session_failures_too(name):
+    """Subclasses ride along by isinstance — pin that radius explicitly."""
+    exceptions = pytest.importorskip("curl_cffi.requests.exceptions")
+    error_type = getattr(exceptions, name, None)
+    if error_type is None:
+        pytest.skip(f"curl_cffi does not expose {name}")
+    fetcher = _fetcher(_response())
+    fetcher._http_session.get.side_effect = error_type("opaque libcurl prose")
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch("https://fbref.com/en/comps", page_kind="competition_index")
+
+    assert caught.value.error_class.startswith("warm_session_")
+
+
 def test_unknown_warm_error_remains_target_scoped_http_exception():
     fetcher = _fetcher(_response())
     fetcher._http_session.get.side_effect = RuntimeError("decoder exploded")
