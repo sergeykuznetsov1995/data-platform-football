@@ -6189,6 +6189,93 @@ def test_freshness_and_terminal_reject_rehashed_binding_schema_extra(
         _run_published_dq_through_terminal(monkeypatch, state="noop", mutation=mutation)
 
 
+def test_non_utc_scope_lease_serializes_and_binds_canonically(monkeypatch):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.operations import ScopeLease
+
+    scope_id = "700:2026"
+    plan_signature = "a" * 64
+    offset = timezone(timedelta(hours=2))
+    lease = ScopeLease(
+        scope_id=scope_id,
+        owner_id="dag_ingest_espn/run/1",
+        plan_signature=plan_signature,
+        epoch=3,
+        token_sha256="b" * 64,
+        acquired_at=datetime(2026, 8, 2, 12, tzinfo=offset),
+        expires_at=datetime(2026, 8, 2, 13, tzinfo=offset),
+    )
+    serialized = espn_native_tasks._lease_to_dict(lease)
+    round_tripped = espn_native_tasks._lease_from_dict(serialized)
+    plan_ref = {"uri": "s3://artifacts/plan.json", "sha256": "c" * 64}
+    descriptor_ref = {
+        "uri": "s3://artifacts/descriptor.json",
+        "sha256": "d" * 64,
+    }
+    descriptor = {
+        "kind": "espn-scope-plan-descriptor-v1",
+        "schema_version": 1,
+        "dag_id": "dag_ingest_espn",
+        "run_id": "run",
+        "attempt": 1,
+        "mode": "daily",
+        "scope_id": scope_id,
+        "plan_ref": plan_ref,
+        "plan_signature": plan_signature,
+        "raw_manifest_uri": "s3://artifacts/raw.json",
+        "raw_store_uri": "s3://raw",
+        "generation_snapshot_uri": "s3://artifacts/generation.json",
+        "expected_scoreboard_batch": None,
+        "scoreboard_checkpoint_uri": None,
+        "scope_root": "s3://artifacts/scope",
+    }
+    binding = {
+        "kind": "espn-scope-lease-binding-v1",
+        "schema_version": 1,
+        "scope_plan_ref": descriptor_ref,
+        "lease": serialized,
+    }
+    binding_ref = {"uri": "s3://artifacts/binding.json", "sha256": "e" * 64}
+    scope = SimpleNamespace(scope_id=scope_id)
+    loaded = SimpleNamespace(
+        signature=plan_signature,
+        selected_scopes=(scope_id,),
+        attempt=1,
+        mode="daily",
+        raw_manifest_uri=descriptor["raw_manifest_uri"],
+        raw_store_uri=descriptor["raw_store_uri"],
+        bindings={
+            scope_id: SimpleNamespace(
+                generation_snapshot_uri=descriptor["generation_snapshot_uri"]
+            )
+        },
+        plan=SimpleNamespace(scopes=(scope,), run_id=descriptor["run_id"]),
+    )
+
+    def read_ref(_ref, *, kind=None):
+        return {
+            "espn-scope-lease-binding-v1": binding,
+            "espn-scope-plan-descriptor-v1": descriptor,
+            espn_native_tasks.runner.PLAN_KIND: {
+                "kind": espn_native_tasks.runner.PLAN_KIND,
+                "plan": {},
+                "signature": plan_signature,
+            },
+        }[kind]
+
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", read_ref)
+    monkeypatch.setattr(
+        espn_native_tasks.runner, "_load_signed_plan", lambda _uri: loaded
+    )
+
+    *_, bound_lease = espn_native_tasks._binding(binding_ref)
+
+    assert serialized["acquired_at"] == "2026-08-02T10:00:00+00:00"
+    assert serialized["expires_at"] == "2026-08-02T11:00:00+00:00"
+    assert espn_native_tasks._lease_to_dict(round_tripped) == serialized
+    assert bound_lease == round_tripped
+
+
 def test_legacy_head_divergence_fails_before_hydration(monkeypatch):
     from dags.utils import espn_native_tasks
     from scrapers.espn.operations import ScopeHead

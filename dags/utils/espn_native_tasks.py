@@ -1327,8 +1327,8 @@ def _lease_to_dict(lease: ScopeLease) -> dict[str, Any]:
         "plan_signature": lease.plan_signature,
         "epoch": lease.epoch,
         "token_sha256": lease.token_sha256,
-        "acquired_at": lease.acquired_at.isoformat(),
-        "expires_at": lease.expires_at.isoformat(),
+        "acquired_at": lease.acquired_at.astimezone(UTC).isoformat(),
+        "expires_at": lease.expires_at.astimezone(UTC).isoformat(),
     }
 
 

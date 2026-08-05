@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -632,6 +632,44 @@ def test_legacy_v2_v3_green_run_serializer_keeps_reviewed_bytes_and_hash():
     assert canonical_json(payload).encode("utf-8") == expected_bytes
     assert hashlib.sha256(expected_bytes).hexdigest() == expected_sha256
     assert canonical_sha256(payload) == expected_sha256
+
+
+@pytest.mark.parametrize("evidence_v3", [False, True], ids=["v2", "v3"])
+def test_programmatic_legacy_green_run_subclass_keeps_non_v4_routing(
+    tmp_path, evidence_v3
+):
+    class CompatibleGreenRunEvidence(GreenRunEvidence):
+        pass
+
+    evidence_path, _ = _evidence(tmp_path, evidence_v3=evidence_v3)
+    loaded = load_promotion_evidence(evidence_path)
+    green_runs = tuple(
+        CompatibleGreenRunEvidence(
+            **{
+                field.name: getattr(run, field.name)
+                for field in fields(GreenRunEvidence)
+            }
+        )
+        for run in loaded.green_runs
+    )
+    evidence = replace(loaded, green_runs=green_runs)
+
+    plan = build_promotion_plan(
+        evidence,
+        output_path=tmp_path / "promotion-result.json",
+    )
+    backend = FakeBackend(green_runs[-1])
+    result = apply_promotion(
+        evidence,
+        backend=backend,
+        lease_store=FakeLeaseStore(),
+        now=NOW,
+    )
+
+    assert plan["green_runs"] == [run.to_dict() for run in green_runs]
+    assert result["status"] == "promoted"
+    assert "verify_latest_manifest" in backend.actions
+    assert "verify_physical_candidate" in backend.actions
 
 
 def test_cli_defaults_to_dry_run_and_does_not_construct_live_adapters(tmp_path):

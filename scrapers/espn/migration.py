@@ -1971,7 +1971,7 @@ def _validate_promotion_evidence_runtime_shape(
             raise MigrationError("v4 promotion runtime shape is invalid")
         return True
     if isinstance(evidence, PromotionEvidenceV4) or any(
-        type(run) is not GreenRunEvidence for run in evidence.green_runs
+        not isinstance(run, GreenRunEvidence) for run in evidence.green_runs
     ):
         raise MigrationError("legacy promotion runtime shape is invalid")
     return False

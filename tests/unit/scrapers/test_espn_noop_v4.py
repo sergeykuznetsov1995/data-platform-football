@@ -1046,9 +1046,22 @@ def test_programmatic_base_v4_cannot_skip_physical_guards(tmp_path):
 def test_programmatic_non_v4_forbids_v4_runtime_objects(tmp_path):
     evidence = load_promotion_evidence(_v4_evidence(tmp_path, ("noop", "noop", "noop")))
     disguised = replace(evidence, evidence_version=PROMOTION_EVIDENCE_VERSION)
+    base_with_v4_runs = PromotionEvidence(
+        evidence_version=PROMOTION_EVIDENCE_VERSION,
+        scope_id=evidence.scope_id,
+        espn_id=evidence.espn_id,
+        source_season_year=evidence.source_season_year,
+        fallback=evidence.fallback,
+        trust_label=evidence.trust_label,
+        cutover_id=evidence.cutover_id,
+        effective_at=evidence.effective_at,
+        registry_snapshot_ref=evidence.registry_snapshot_ref,
+        green_runs=evidence.green_runs,
+    )
 
-    with pytest.raises(MigrationError, match="legacy promotion runtime shape"):
-        build_promotion_plan(disguised, output_path=tmp_path / "plan.json")
+    for invalid in (disguised, base_with_v4_runs):
+        with pytest.raises(MigrationError, match="legacy promotion runtime shape"):
+            build_promotion_plan(invalid, output_path=tmp_path / "plan.json")
 
 
 def test_programmatic_v4_requires_exactly_three_runs(tmp_path):
