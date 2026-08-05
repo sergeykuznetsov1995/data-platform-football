@@ -1107,6 +1107,91 @@ def test_advertised_team_absence_resolves_without_tombstone():
     assert repository.latest_entity_success("team", "1")["status"] == "success"
 
 
+def _stub_team_fetch(team_id, payload):
+    target = canonicalize_target("teams", {"id": str(team_id)})
+    body = json.dumps(payload).encode()
+    return FetchResult(
+        outcome=FetchOutcome.SUCCESS,
+        target_key=target.target_key,
+        url=target.canonical_url,
+        http_status=200,
+        json_data=payload,
+        body=body,
+        attempts=1,
+        retries=0,
+        cache_hit=False,
+        stale=False,
+        terminal=False,
+        etag=None,
+        last_modified=None,
+        raw_uri=None,
+        content_hash=None,
+        fetched_at=None,
+        encoded_bytes=len(body),
+        decoded_bytes=len(body),
+        direct_bytes=len(body),
+        proxy_bytes=0,
+    )
+
+
+def test_not_found_stub_for_an_advertised_team_is_an_absence_not_drift():
+    # An unfilled future bracket advertises team_id 0; /teams answers 200 with
+    # a routing stub for it, which used to raise CatalogShapeError every run.
+    bundle = parse_season_bundle(
+        _league_payload(selected="2010/2011"),
+        ScopeRef(47, "2010/2011"),
+    )
+    service, _, repository = _service({}, mode=RunMode.BACKFILL)
+    service._fetch_many = lambda requests: {
+        key: _stub_team_fetch(key, {"action": {"notFound": {"statusCode": 404}}})
+        for key, _, _ in requests
+    }
+
+    result, player_ids = service.sync_team_snapshots(
+        bundle,
+        allow_advertised_absence=True,
+    )
+
+    assert result.ok
+    assert not result.errors
+    assert result.not_available == 2
+    assert result.metadata["intentional_not_available"] == 2
+    assert player_ids == set()
+    absences = [
+        commit
+        for commit in repository.commits
+        if commit.error_code == "source_team_unavailable"
+    ]
+    assert len(absences) == 2
+    assert all(commit.status == ManifestStatus.EXCLUDED for commit in absences)
+
+
+def test_a_team_payload_carrying_the_stub_key_still_fails_closed():
+    # Only the bare stub counts as an absence: a payload that also carries team
+    # JSON is a real shape change and must stay a hard failure.
+    bundle = parse_season_bundle(
+        _league_payload(selected="2010/2011"),
+        ScopeRef(47, "2010/2011"),
+    )
+    service, _, _ = _service({}, mode=RunMode.BACKFILL)
+    service._fetch_many = lambda requests: {
+        key: _stub_team_fetch(
+            key,
+            {"action": {"notFound": {}}, "details": {"id": int(key)}},
+        )
+        for key, _, _ in requests
+    }
+
+    result, _ = service.sync_team_snapshots(
+        bundle,
+        allow_advertised_absence=True,
+    )
+
+    assert result.not_available == 0
+    assert result.errors
+    assert not result.ok
+
+
 def test_record_failure_leaves_retryable_failure_open_and_not_intentional():
     result = OperationResult("team_snapshots")
     FotMobIngestService._record_failure(

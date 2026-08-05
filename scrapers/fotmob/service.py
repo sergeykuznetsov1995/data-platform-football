@@ -210,6 +210,21 @@ def _is_source_missing_player(data: Any) -> bool:
     )
 
 
+def _is_not_found_stub(data: Any) -> bool:
+    """FotMob answers HTTP 200 with a bare routing stub for a team it has no
+    page for — an unfilled future bracket advertises ``team_id`` 0 and gets one
+    every run. Fail closed: only the stub on its own counts, so a payload that
+    carries a team alongside it keeps falling through to schema drift."""
+
+    action = data.get("action") if isinstance(data, Mapping) else None
+    return (
+        isinstance(data, Mapping)
+        and set(data) == {"action"}
+        and isinstance(action, Mapping)
+        and "notFound" in action
+    )
+
+
 def _fetch_manifest_status(fetch: FetchResult) -> ManifestStatus:
     if fetch.outcome in {FetchOutcome.SUCCESS, FetchOutcome.STALE_REPLAY}:
         return ManifestStatus.SUCCESS
@@ -2007,8 +2022,19 @@ class FotMobIngestService:
                 result.errors.append(f"team {key}: {outcome}")
                 continue
             fetch = outcome
-            if not fetch.ok:
-                if (
+            # A team the source has no page for is not always a transport
+            # absence: /teams answers 200 with a not-found stub for it, and an
+            # unfilled future bracket advertises team_id 0 that way every run
+            # (#1112).  The stub carries no team, so it is the same absence the
+            # branch below resolves -- classifying it here keeps CatalogShapeError
+            # strict for JSON shapes that really do carry a team.
+            stub_absence = (
+                allow_advertised_absence
+                and fetch.ok
+                and _is_not_found_stub(fetch.data)
+            )
+            if not fetch.ok or stub_absence:
+                if stub_absence or (
                     allow_advertised_absence
                     and fetch.outcome == FetchOutcome.NOT_AVAILABLE
                 ):
