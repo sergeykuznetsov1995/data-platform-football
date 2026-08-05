@@ -1336,3 +1336,186 @@ def test_retired_targets_leave_both_the_cohort_and_the_unprocessed_raw_gate():
     assert "attempt.status = 'succeeded'" in cohort
     assert "frontier.state <> 'quarantined'" in summary
     assert "global_sla_overdue_count" in summary
+
+
+def _rollover_handler(installed, *, released=True):
+    def handler(sql, params):
+        if "FROM fbref_control.page_frontier" in sql and "FOR UPDATE" in sql:
+            target_id, canonical_url = params
+            rows = [
+                dict(row)
+                for row in installed
+                if row["target_id"] == target_id
+                or row["canonical_url"] == canonical_url
+            ]
+            return rows, len(rows)
+        if "UPDATE fbref_control.page_frontier AS outgoing" in sql:
+            return [], 1 if released else 0
+        if "INSERT INTO fbref_control.page_frontier" in sql:
+            return [], 1
+        raise AssertionError(sql)
+
+    return handler
+
+
+def _outgoing_season_row(**overrides):
+    row = {
+        "target_id": "fbref:season:12:2025-2026",
+        "source": "fbref",
+        "page_kind": "season",
+        "canonical_url": "https://fbref.com/en/comps/12/La-Liga-Stats",
+        "source_ids": {"competition_id": "12", "season_id": "2025-2026"},
+        "state": "fetched",
+    }
+    row.update(overrides)
+    return row
+
+
+def _incoming_season_target():
+    return FrontierTarget(
+        target_id="fbref:season:12:2026-2027",
+        page_kind="season",
+        canonical_url="https://fbref.com/en/comps/12/La-Liga-Stats",
+        source_ids={"competition_id": "12", "season_id": "2026-2027"},
+        refresh_policy="daily",
+    )
+
+
+def _releases(factory):
+    return [
+        (sql, params)
+        for sql, params in factory.connections[0].fake_cursor.executions
+        if sql.startswith("UPDATE fbref_control.page_frontier AS outgoing")
+    ]
+
+
+def test_rollover_moves_the_outgoing_edition_onto_its_registry_url():
+    store, factory = make_store(_rollover_handler([_outgoing_season_row()]))
+
+    store.upsert_frontier_target(_incoming_season_target())
+
+    releases = _releases(factory)
+    assert len(releases) == 1
+    sql, params = releases[0]
+    # The registry is the only authority for the URL an outgoing season moved
+    # to: never a sentinel, never a derived URL, and never a state change that
+    # would drop a live target out of its run cohort.
+    assert "SET canonical_url = season.canonical_url" in sql
+    assert "state" not in sql.split(" FROM ")[0]
+    assert "NOT EXISTS" in sql
+    # Never copy a registry row that is itself parked or unpublished, and never
+    # carry the validators of the URL the target is leaving.
+    assert "strpos(season.canonical_url, '#superseded:') = 0" in sql
+    assert "season.present AND season.lifecycle_state = 'present'" in sql
+    assert "last_etag = NULL" in sql
+    # last_content_hash fences the observation already in flight for this
+    # target, so the move must not clear it.
+    assert "last_content_hash" not in sql
+    assert params == (
+        "fbref:season:12:2025-2026",
+        "https://fbref.com/en/comps/12/La-Liga-Stats",
+    )
+
+
+def test_rollover_release_never_touches_a_leased_holder():
+    store, factory = make_store(
+        _rollover_handler([_outgoing_season_row(state="leased")])
+    )
+
+    with pytest.raises(StateConflict, match="Canonical URL already belongs"):
+        store.upsert_frontier_target(_incoming_season_target())
+    assert _releases(factory) == []
+
+
+def test_rollover_release_is_limited_to_season_targets():
+    store, factory = make_store(
+        _rollover_handler([_outgoing_season_row(page_kind="season_stats")])
+    )
+
+    with pytest.raises(StateConflict, match="Canonical URL already belongs"):
+        store.upsert_frontier_target(_incoming_season_target())
+    assert _releases(factory) == []
+
+
+def test_a_stale_edition_cannot_take_a_url_the_registry_still_assigns():
+    store, factory = make_store(
+        _rollover_handler([_outgoing_season_row()], released=False)
+    )
+
+    # The registry pins the URL to its current holder, so nothing is released
+    # and admission fails closed exactly as it did before the rollover fix.
+    with pytest.raises(StateConflict, match="Canonical URL already belongs"):
+        store.upsert_frontier_target(_incoming_season_target())
+    assert len(_releases(factory)) == 1
+
+
+def test_season_reconcile_releases_claimed_urls_before_it_upserts_them():
+    fetched_at = datetime(2026, 8, 5, 6, 0, tzinfo=timezone.utc)
+    snapshot = str(uuid.uuid4())
+
+    def handler(sql, params):
+        if "FROM fbref_control.registry_snapshot" in sql:
+            return [{
+                "snapshot_id": snapshot,
+                "source": "fbref",
+                "successful": True,
+                "fetched_at": fetched_at,
+            }], 1
+        if "FROM fbref_control.competition_registry" in sql:
+            return [{
+                "crawl_state": "active",
+                "lifecycle_state": "present",
+                "present": True,
+            }], 1
+        if "max(last_seen_at)" in sql:
+            return [{"latest": None}], 1
+        return [], 0
+
+    store, factory = make_store(handler)
+    store.reconcile_seasons(
+        snapshot,
+        "12",
+        [
+            SeasonRegistryEntry(
+                competition_id="12",
+                season_id="2026-2027",
+                canonical_url="https://fbref.com/en/comps/12/La-Liga-Stats",
+                is_current=True,
+            ),
+            SeasonRegistryEntry(
+                competition_id="12",
+                season_id="2025-2026",
+                canonical_url=(
+                    "https://fbref.com/en/comps/12/2025-2026/"
+                    "2025-2026-La-Liga-Stats"
+                ),
+            ),
+        ],
+    )
+
+    statements = [
+        sql for sql, _ in factory.connections[0].fake_cursor.executions
+    ]
+    release = next(
+        index
+        for index, sql in enumerate(statements)
+        if sql.startswith("UPDATE fbref_control.season_registry AS season")
+        and "'#superseded:'" in sql
+    )
+    first_upsert = next(
+        index
+        for index, sql in enumerate(statements)
+        if sql.startswith("INSERT INTO fbref_control.season_registry")
+    )
+    # UNIQUE (source, canonical_url) is not an upsert arbiter: the handover has
+    # to be released before the first row claims a URL someone else still owns.
+    assert release < first_upsert
+    sql, params = factory.connections[0].fake_cursor.executions[release]
+    # The sentinel carries the parked row's own season id, so repeated
+    # handovers of one URL can never collide on the constraint they release.
+    assert (
+        "'#superseded:' || season.competition_id || ':' || season.season_id"
+        in sql
+    )
+    assert params[0] == ["2026-2027", "2025-2026"]
+    assert params[2:] == ("fbref", "12")
