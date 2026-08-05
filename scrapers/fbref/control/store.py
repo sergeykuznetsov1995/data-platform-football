@@ -3310,6 +3310,44 @@ class ControlStore:
                     """,
                     (source, competition, incoming_current),
                 )
+            if seasons:
+                # A season rollover hands one URL to another edition: FBref
+                # publishes the running season on the bare competition URL and
+                # moves the outgoing season onto its dated URL.  UNIQUE
+                # (source, canonical_url) is not an upsert arbiter here, so
+                # release every incoming URL still held by a different season
+                # of this competition before the loop below claims it.  The
+                # release deliberately stops at the competition even though the
+                # constraint is global: only the sweep below can retire a parked
+                # row, it is scoped to this competition too, and a parked URL is
+                # not inert -- canonicalisation drops the fragment, so a row
+                # left published on a sentinel would be seeded straight back
+                # onto the live URL.  A cross-competition handover therefore
+                # still fails loudly instead of corrupting another registry.  The
+                # outgoing season is normally republished in the same snapshot
+                # with its dated URL; anything left on the sentinel is swept to
+                # not-present below and is therefore never seeded again.  The
+                # sentinel carries the parked season's own id, so it stays
+                # unique no matter how often one URL changes hands: two seasons
+                # of one competition can never share a base URL to begin with.
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.season_registry AS season
+                    SET canonical_url = season.canonical_url || '#superseded:'
+                        || season.competition_id || ':' || season.season_id
+                    FROM unnest(%s::text[], %s::text[])
+                        AS incoming(season_id, canonical_url)
+                    WHERE season.source = %s AND season.competition_id = %s
+                      AND season.canonical_url = incoming.canonical_url
+                      AND season.season_id <> incoming.season_id
+                    """,
+                    (
+                        [entry.season_id for entry in seasons],
+                        [entry.canonical_url for entry in seasons],
+                        source,
+                        competition,
+                    ),
+                )
             for entry in seasons:
                 seen_ids.append(entry.season_id)
                 current_count += int(entry.is_current)
@@ -3629,6 +3667,11 @@ class ControlStore:
                   AND NOT season.is_current
                   AND season.metadata ->> 'direct_match_only'
                       IS DISTINCT FROM 'true'
+                  -- A season whose URL was handed to another edition is parked
+                  -- on a sentinel.  Never mint a target from one: canonical
+                  -- URLs drop the fragment, so the cohort would fetch the live
+                  -- page of whichever edition owns it now.
+                  AND strpos(season.canonical_url, '#superseded:') = 0
                   AND competition.gender = 'male'
                   AND competition.crawl_state = 'active'
                   AND competition.lifecycle_state IN (
@@ -3657,6 +3700,58 @@ class ControlStore:
                 (_text(source, "source"), normalized_limit),
             )
             return _fetchall(cursor)
+
+    @staticmethod
+    def _release_rolled_over_season_url(
+        cursor: Any,
+        row: Mapping[str, Any],
+        canonical_url: str,
+    ) -> bool:
+        """Move an outgoing season target onto the URL the registry gives it.
+
+        A season rollover republishes the bare competition URL under the new
+        edition, so the outgoing season no longer owns it.  ``reconcile_seasons``
+        runs before discovery seeds the frontier, so the registry already holds
+        the dated URL that outgoing season moved to: install exactly that, never
+        a derived or sentinel URL.  Anything else -- a stale claim on a URL the
+        registry still assigns to its current holder, a leased identity, a
+        registry row that is itself parked or no longer published, or a
+        destination another target already owns -- releases nothing and leaves
+        the caller to fail closed.  The move points the target at a different
+        resource, so the conditional-request validators of the URL it is leaving
+        must go with it: a stale ``If-None-Match`` would answer 304 for a page
+        that was never fetched.  ``last_content_hash`` deliberately stays: it
+        fences the observation already in flight for this target.
+        """
+        if str(row["state"]) == "leased" or row["page_kind"] != "season":
+            return False
+        cursor.execute(
+            """
+            UPDATE fbref_control.page_frontier AS outgoing
+            SET canonical_url = season.canonical_url,
+                last_etag = NULL,
+                last_modified = NULL,
+                updated_at = clock_timestamp()
+            FROM fbref_control.season_registry AS season
+            WHERE outgoing.target_id = %s
+              AND season.source = outgoing.source
+              AND season.competition_id =
+                  outgoing.source_ids ->> 'competition_id'
+              AND season.season_id = outgoing.source_ids ->> 'season_id'
+              AND season.present AND season.lifecycle_state = 'present'
+              AND season.metadata ->> 'direct_match_only'
+                  IS DISTINCT FROM 'true'
+              AND strpos(season.canonical_url, '#superseded:') = 0
+              AND season.canonical_url <> outgoing.canonical_url
+              AND season.canonical_url <> %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM fbref_control.page_frontier AS holder
+                  WHERE holder.canonical_url = season.canonical_url
+              )
+            """,
+            (row["target_id"], canonical_url),
+        )
+        return cursor.rowcount == 1
 
     def upsert_frontier_target(
         self,
@@ -3703,6 +3798,10 @@ class ControlStore:
                             """,
                             (target_id, row["target_id"]),
                         )
+                        continue
+                    if self._release_rolled_over_season_url(
+                        cursor, row, canonical_url
+                    ):
                         continue
                     raise StateConflict(
                         f"Canonical URL already belongs to {row['target_id']}"
