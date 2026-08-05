@@ -638,7 +638,7 @@ def test_exact_primary_403_fails_over_once_to_official_site_mirror(
 
 
 @pytest.mark.unit
-def test_site_mirror_failure_is_terminal_and_never_fails_over_twice(
+def test_site_mirror_nonretryable_failure_is_terminal_without_origin_cycle(
     monkeypatch, tmp_path
 ):
     url = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
@@ -667,12 +667,62 @@ def test_site_mirror_failure_is_terminal_and_never_fails_over_twice(
 
 
 @pytest.mark.unit
-def test_site_mirror_retryable_failure_is_not_requested_twice(monkeypatch, tmp_path):
+def test_site_mirror_retryable_scoreboard_failure_retries_same_mirror(
+    monkeypatch, tmp_path
+):
+    url = (
+        "https://site.api.espn.com/apis/site/v2/sports/soccer/uefa.euro_u21/scoreboard"
+    )
+    params = {"dates": "20250201-20250303", "limit": 1000}
+    permits = []
+    client, session, sleeps, _ = _client(
+        monkeypatch,
+        tmp_path,
+        [
+            FakeResponse(403),
+            FakeResponse(502),
+            FakeResponse(200, b'{"events":[]}'),
+        ],
+        request_permit=lambda: permits.append("permit"),
+    )
+
+    result = client.fetch_json(
+        url,
+        EndpointType.SCOREBOARD,
+        params,
+        competition_id=5693,
+        force_refresh=True,
+    )
+
+    target = canonicalize_target(url, params)
+    mirror_url = target.canonical_url.replace(
+        "https://site.api.espn.com", "https://site.web.api.espn.com", 1
+    )
+    assert result.attempts == 3
+    assert result.target.url_fingerprint == target.url_fingerprint
+    assert result.transport_origin == "https://site.web.api.espn.com"
+    assert [call[0] for call in session.calls] == [
+        target.canonical_url,
+        mirror_url,
+        mirror_url,
+    ]
+    assert client.budget.requests_used == 3
+    assert permits == ["permit", "permit", "permit"]
+    assert sleeps == [2.0]
+
+
+@pytest.mark.unit
+def test_site_mirror_retryable_failure_stays_bounded(monkeypatch, tmp_path):
     url = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
     client, session, sleeps, _ = _client(
         monkeypatch,
         tmp_path,
-        [FakeResponse(403), FakeResponse(503), FakeResponse(200, b"{}")],
+        [
+            FakeResponse(403),
+            FakeResponse(502),
+            FakeResponse(503),
+            FakeResponse(503),
+        ],
     )
 
     with pytest.raises(RetryExhausted) as exc_info:
@@ -684,12 +734,119 @@ def test_site_mirror_retryable_failure_is_not_requested_twice(monkeypatch, tmp_p
             force_refresh=True,
         )
 
-    assert exc_info.value.ledger_entry.attempts == 2
+    mirror_url = canonicalize_target(url, {"event": 9}).canonical_url.replace(
+        "https://site.api.espn.com", "https://site.web.api.espn.com", 1
+    )
+    assert exc_info.value.ledger_entry.attempts == 4
     assert (
         exc_info.value.ledger_entry.transport_origin == "https://site.web.api.espn.com"
     )
-    assert len(session.calls) == 2
-    assert sleeps == []
+    assert [call[0] for call in session.calls] == [
+        canonicalize_target(url, {"event": 9}).canonical_url,
+        mirror_url,
+        mirror_url,
+        mirror_url,
+    ]
+    assert sleeps == [2.0, 4.0]
+
+
+@pytest.mark.unit
+def test_site_mirror_retries_remain_circuit_and_rate_bounded(monkeypatch, tmp_path):
+    url = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
+    client, session, sleeps, _ = _client(
+        monkeypatch,
+        tmp_path,
+        [
+            FakeResponse(403),
+            FakeResponse(502),
+            FakeResponse(503),
+            FakeResponse(200, b"{}"),
+        ],
+        burst=1,
+        circuit_failure_threshold=2,
+    )
+
+    with pytest.raises(RetryExhausted) as exc_info:
+        client.fetch_json(
+            url,
+            EndpointType.SUMMARY,
+            {"event": 9},
+            event_id=9,
+            force_refresh=True,
+        )
+
+    mirror_url = canonicalize_target(url, {"event": 9}).canonical_url.replace(
+        "https://site.api.espn.com", "https://site.web.api.espn.com", 1
+    )
+    assert exc_info.value.ledger_entry.attempts == 3
+    assert client.circuit_is_open
+    assert [call[0] for call in session.calls] == [
+        canonicalize_target(url, {"event": 9}).canonical_url,
+        mirror_url,
+        mirror_url,
+    ]
+    assert sleeps == [2.0, 2.0, 2.0]
+
+
+@pytest.mark.unit
+def test_site_mirror_timeout_retries_same_mirror(monkeypatch, tmp_path):
+    url = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
+    client, session, sleeps, _ = _client(
+        monkeypatch,
+        tmp_path,
+        [FakeResponse(403), requests.Timeout("late"), FakeResponse(200, b"{}")],
+    )
+
+    result = client.fetch_json(
+        url,
+        EndpointType.SUMMARY,
+        {"event": 9},
+        event_id=9,
+        force_refresh=True,
+    )
+
+    mirror_url = canonicalize_target(url, {"event": 9}).canonical_url.replace(
+        "https://site.api.espn.com", "https://site.web.api.espn.com", 1
+    )
+    assert result.attempts == 3
+    assert [call[0] for call in session.calls] == [
+        canonicalize_target(url, {"event": 9}).canonical_url,
+        mirror_url,
+        mirror_url,
+    ]
+    assert sleeps == [2.0]
+
+
+@pytest.mark.unit
+def test_site_mirror_partial_read_timeout_retries_same_mirror(monkeypatch, tmp_path):
+    url = "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/summary"
+    partial = FakeResponse(200)
+    partial.raw = PartialTimeoutRaw(b"{")
+    client, session, sleeps, _ = _client(
+        monkeypatch,
+        tmp_path,
+        [FakeResponse(403), partial, FakeResponse(200, b"{}")],
+    )
+
+    result = client.fetch_json(
+        url,
+        EndpointType.SUMMARY,
+        {"event": 9},
+        event_id=9,
+        force_refresh=True,
+    )
+
+    mirror_url = canonicalize_target(url, {"event": 9}).canonical_url.replace(
+        "https://site.api.espn.com", "https://site.web.api.espn.com", 1
+    )
+    assert result.attempts == 3
+    assert result.direct_bytes == 3
+    assert [call[0] for call in session.calls] == [
+        canonicalize_target(url, {"event": 9}).canonical_url,
+        mirror_url,
+        mirror_url,
+    ]
+    assert sleeps == [2.0]
 
 
 @pytest.mark.unit
@@ -828,6 +985,24 @@ def test_failover_obeys_request_and_attempt_budgets(monkeypatch, tmp_path):
     assert budgeted.budget.requests_used == 1
     assert len(budgeted_session.calls) == 1
     assert permits == ["permit"]
+
+    retry_budgeted, retry_budgeted_session, _, _ = _client(
+        monkeypatch,
+        tmp_path / "mirror-retry-budget",
+        [FakeResponse(403), FakeResponse(502), FakeResponse(200, b"{}")],
+        budget=TaskBudget(max_requests=2),
+    )
+    with pytest.raises(BudgetExceeded) as retry_budget_error:
+        retry_budgeted.fetch_json(
+            url,
+            EndpointType.SUMMARY,
+            {"event": 9},
+            event_id=9,
+            force_refresh=True,
+        )
+    assert retry_budget_error.value.ledger_entry.attempts == 2
+    assert retry_budgeted.budget.requests_used == 2
+    assert len(retry_budgeted_session.calls) == 2
 
     bounded, bounded_session, _, _ = _client(
         monkeypatch,

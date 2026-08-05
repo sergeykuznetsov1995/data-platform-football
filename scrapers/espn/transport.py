@@ -551,14 +551,7 @@ class EspnHttpClient:
                 self._record_retryable_failure()
                 status = None
                 last_error = "timeout"
-                if (
-                    (
-                        failover_used
-                        and last_transport_origin == ESPN_SITE_API_FAILOVER_ORIGIN
-                    )
-                    or self.circuit_is_open
-                    or attempts >= self.max_attempts
-                ):
+                if self.circuit_is_open or attempts >= self.max_attempts:
                     break
                 self.sleep_fn(self._retry_delay(attempts, None))
                 continue
@@ -584,14 +577,7 @@ class EspnHttpClient:
                 self._record_retryable_failure()
                 status = None
                 last_error = "timeout"
-                if (
-                    (
-                        failover_used
-                        and last_transport_origin == ESPN_SITE_API_FAILOVER_ORIGIN
-                    )
-                    or self.circuit_is_open
-                    or attempts >= self.max_attempts
-                ):
+                if self.circuit_is_open or attempts >= self.max_attempts:
                     break
                 self.sleep_fn(self._retry_delay(attempts, None))
                 continue
@@ -715,14 +701,7 @@ class EspnHttpClient:
             if status in RETRYABLE_HTTP_STATUSES or 500 <= status <= 599:
                 self._record_retryable_failure()
                 last_error = f"retryable HTTP {status}"
-                if (
-                    (
-                        failover_used
-                        and last_transport_origin == ESPN_SITE_API_FAILOVER_ORIGIN
-                    )
-                    or self.circuit_is_open
-                    or attempts >= self.max_attempts
-                ):
+                if self.circuit_is_open or attempts >= self.max_attempts:
                     break
                 self.sleep_fn(
                     self._retry_delay(attempts, response.headers.get("Retry-After"))
