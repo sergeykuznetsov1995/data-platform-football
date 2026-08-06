@@ -707,7 +707,7 @@ class TestFotmobNativeRunner:
         repository.ensure_current_views.assert_called_once_with()
 
     @pytest.mark.unit
-    def test_backfill_skips_only_scope_completed_by_current_publication_run(self):
+    def test_backfill_skips_scope_completed_by_any_earlier_run(self):
         from scrapers.fotmob.transport import canonicalize_target
         from tests.unit.scrapers.test_fotmob_service import (
             _league_payload,
@@ -731,14 +731,14 @@ class TestFotmobNativeRunner:
 
         assert rc == 0
         assert report["status"] == "success"
+        # No run_id: the drain must resume where the previous DagRun stopped.
         repository.completed_scope_keys.assert_called_once_with(
             report["selection"]["scope_plan_signature"],
-            run_id=service.run_id,
         )
         assert not any("season=2025%2F2026" in url for url, _ in transport.calls)
 
     @pytest.mark.unit
-    def test_new_backfill_generation_reprocesses_prior_generation_completion(self):
+    def test_new_backfill_generation_resumes_after_prior_generation(self):
         from scrapers.fotmob.planner import (
             RunMode,
             deterministic_plan_signature,
@@ -797,12 +797,15 @@ class TestFotmobNativeRunner:
 
         rc, report = _run_native_admitted(mod, args, service=service)
 
+        # The publication generation_id is a fresh uuid on every DagRun, so
+        # scoping the resume set to it made the @continuous drain replan the
+        # same first chunk forever. A scope committed by an earlier generation
+        # is done: this run plans nothing and spends no season request.
         assert rc == 0, report["errors"]
-        assert report["selection"]["completed_scopes"] == ["47=2025/2026"]
-        assert repository.completed_scope_keys(signature, run_id=service.run_id) == {
-            (47, "2025/2026")
-        }
-        assert any("leagues?id=47" in url for url, _ in transport.calls)
+        assert report["selection"]["planned_scopes"] == []
+        assert report["selection"]["completed_scopes"] == []
+        assert repository.completed_scope_keys(signature) == {(47, "2025/2026")}
+        assert not any("season=2025%2F2026" in url for url, _ in transport.calls)
 
     @pytest.mark.unit
     def test_transfer_competition_limit_applies_after_completion_filter(self):
@@ -852,12 +855,8 @@ class TestFotmobNativeRunner:
                 "transfers", {"leagueIds": "48", "page": 1}
             ).canonical_url
         ]
-        assert repository.completed_scope_keys.call_args.kwargs == {
-            "run_id": service.run_id
-        }
-        assert repository.completed_competition_ids.call_args.kwargs == {
-            "run_id": service.run_id
-        }
+        assert repository.completed_scope_keys.call_args.kwargs == {}
+        assert repository.completed_competition_ids.call_args.kwargs == {}
 
     @pytest.mark.unit
     def test_players_receive_deduplicated_ids_from_team_snapshots(self):
@@ -1324,6 +1323,65 @@ class TestFotmobNativeRunner:
         assert rc == 1
         assert report["status"] == "incomplete"
         assert any("not advertised" in error for error in report["errors"])
+
+    @pytest.mark.unit
+    def test_partially_unadvertised_scopes_are_skipped_not_failed(self):
+        # A backfill chunk mixes seasons FotMob advertises with a pair it never
+        # ran (competition 42 has no 2026/2027). The absent pair must not paint
+        # the whole chunk red — exactly what killed the drain run on 03.08,
+        # where five of six scopes had been collected.
+        import copy
+
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            _league_payload,
+            _service,
+        )
+
+        mod = self._module()
+        other = copy.deepcopy(_league_payload())
+        other["details"]["id"] = 42
+        other["details"]["name"] = "Competition 42"
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [
+                    {
+                        "leagues": [
+                            {"id": 47, "name": "Premier League"},
+                            {"id": 42, "name": "Competition 42"},
+                        ]
+                    }
+                ]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target("leagues", {"id": 42}).canonical_url: other,
+        }
+        service, _, _ = _service(responses)
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "backfill",
+                "--scope",
+                "47=2025/2026,42=2026/2027",
+                "--entities",
+                "season",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0, report["errors"]
+        assert report["status"] == "success"
+        assert report["errors"] == []
+        assert report["selection"]["completed_scopes"] == ["47=2025/2026"]
+        validation = next(
+            item
+            for item in report["operations"]
+            if item["entity"] == "scope_validation"
+        )
+        assert validation["status"] == "success"
+        assert validation["skipped"] == 1
+        assert validation["metadata"]["unadvertised_scopes"] == ["42=2026/2027"]
 
     @pytest.mark.unit
     def test_every_exit_path_flushes_buffered_commits(self):
