@@ -808,10 +808,21 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     discovered_identities = {season.identity for season in seasons}
     missing_scopes = sorted(set(explicit_scopes) - discovered_identities)
     if missing_scopes:
-        scope_validation.errors.append(
-            "requested exact scopes were not advertised by FotMob: "
-            + ",".join(f"{comp}={season}" for comp, season in missing_scopes)
-        )
+        # FotMob simply does not advertise every requested ID=season pair (a
+        # competition that did not run that season). That is a property of the
+        # source, not a run failure: turning it into an error made a whole
+        # backfill chunk red even when every other requested scope was
+        # collected. Unadvertised pairs are therefore reported as skipped, and
+        # only a request where NOTHING asked for exists stays an error.
+        scope_validation.skipped += len(missing_scopes)
+        scope_validation.metadata["unadvertised_scopes"] = [
+            f"{comp}={season}" for comp, season in missing_scopes
+        ]
+        if not (set(explicit_scopes) & discovered_identities):
+            scope_validation.errors.append(
+                "requested exact scopes were not advertised by FotMob: "
+                + ",".join(f"{comp}={season}" for comp, season in missing_scopes)
+            )
         if scope_validation not in operations:
             operations.append(scope_validation)
 
@@ -828,9 +839,13 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     )
     previously_complete: set[tuple[int, str]] = set()
     if mode == RunMode.BACKFILL:
+        # No run_id filter on purpose: service.run_id is the publication
+        # generation_id, unique per DagRun, so scoping the resume set to it made
+        # every @continuous drain iteration replan the very first chunk forever.
+        # The drain resumes across DagRuns on plan_signature + parser_version;
+        # a parser bump still reprocesses everything.
         previously_complete = service.repository.completed_scope_keys(
             scope_plan_signature,
-            run_id=service.run_id,
         )
     elif mode == RunMode.REPLAY:
         for season in seasons:
@@ -1117,7 +1132,6 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         if mode == RunMode.BACKFILL:
             completed_transfer_ids = service.repository.completed_competition_ids(
                 transfer_signature,
-                run_id=service.run_id,
             )
         elif mode == RunMode.DAILY:
             transfer_completion_times = service.repository.competition_completion_times(
