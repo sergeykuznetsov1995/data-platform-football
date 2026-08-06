@@ -39,7 +39,8 @@
 --     станет больше, включая старые окна; season-атрибуция по transfer_date
 --     раскладывает их по своим партициям.
 --   * transfer_date в bronze — строка; TRY_CAST(SUBSTR(...,1,10) AS DATE) робастно
---     к 'YYYY-MM-DD' и к полному ISO-таймстемпу. Dedup идёт по СЫРОЙ строке.
+--     к 'YYYY-MM-DD' и к полному ISO-таймстемпу. Dedup идёт по РАСПАРСЕННОЙ дате
+--     (= PK Silver): сырая строка пропускала дубли с таймстемпами одного дня.
 --   * fee_value (double, NULL для free/нераскрытых) → fee_eur (BIGINT евро).
 --   * market_value в native — source-native число → CAST AS varchar (контракт
 --     Silver «сырой varchar, парсинг в Gold» сохраняется).
@@ -132,7 +133,11 @@ bronze_dedup AS (
         SELECT
             s.*,
             ROW_NUMBER() OVER (
-                PARTITION BY player_id, from_club_id, to_club_id, transfer_date, league, season_year
+                -- 2026-08-04: дедуп по РАСПАРСЕННОЙ дате, не по сырой строке —
+                -- источник может отдать один переход дважды с таймстемпами в
+                -- минутах друг от друга (NED-Eredivisie, player 874482), обе
+                -- строки выживали и ломали no_duplicates по DATE-грейну.
+                PARTITION BY player_id, from_club_id, to_club_id, transfer_date_parsed, league, season_year
                 ORDER BY src_priority DESC, _observed_at DESC, _target_batch_id DESC
             ) AS rn
         FROM seasoned s
