@@ -31,6 +31,7 @@ from scrapers.fbref.pipeline import (
     RunValidationError,
     SENTINEL_COMPETITIONS,
     WaveResult,
+    affordable_clearance_reservation,
     backfill_season_cohort_capacity,
     frontier_target,
     live_wave_target_capacity,
@@ -5396,6 +5397,196 @@ def test_dead_clearance_at_budget_boundary_stops_cleanly(
         for lease, _ in control.failed
     )
     assert control.events.count(f"requeue:{untouched.target_id}") == 1
+
+
+def test_a_late_re_solve_reserves_the_rotations_it_can_still_afford():
+    """A daily run reserves four proxy rotations for a clearance, but a solve
+    measures ~19 requests. Demanding all four before a mid-run re-solve ended
+    every run with ~40 % of its request budget unspent (#1129)."""
+
+    daily = PipelineSettings(
+        run_type="current",
+        request_limit=200,
+        byte_limit=100 * 1024 * 1024,
+        shard_size=25,
+    )
+    assert daily.bootstrap_request_reservation == 80
+
+    plenty = 90 * 1024 * 1024
+    assert affordable_clearance_reservation(
+        daily, request_remaining=200, byte_remaining=plenty
+    ) == (80, 16 * 1024 * 1024)
+    # 78 left: the old guard needed 82 and stopped the run right here.
+    assert affordable_clearance_reservation(
+        daily, request_remaining=78, byte_remaining=plenty
+    ) == (60, 12 * 1024 * 1024)
+    assert affordable_clearance_reservation(
+        daily, request_remaining=25, byte_remaining=plenty
+    ) == (20, 4 * 1024 * 1024)
+    # One solve plus one target is the floor; below it the ceiling is real.
+    assert (
+        affordable_clearance_reservation(
+            daily, request_remaining=21, byte_remaining=plenty
+        )
+        is None
+    )
+    # Bytes bind the same way.
+    assert affordable_clearance_reservation(
+        daily, request_remaining=200, byte_remaining=8 * 1024 * 1024
+    ) == (20, 4 * 1024 * 1024)
+    assert (
+        affordable_clearance_reservation(
+            daily, request_remaining=200, byte_remaining=6 * 1024 * 1024
+        )
+        is None
+    )
+
+    # A run that only ever reserved one solve keeps its old boundary exactly.
+    small = PipelineSettings(
+        run_type="current",
+        request_limit=120,
+        byte_limit=100 * 1024 * 1024,
+        shard_size=4,
+    )
+    assert small.bootstrap_request_reservation == 20
+    assert affordable_clearance_reservation(
+        small, request_remaining=22, byte_remaining=plenty
+    ) == (20, 4 * 1024 * 1024)
+    assert (
+        affordable_clearance_reservation(
+            small, request_remaining=21, byte_remaining=plenty
+        )
+        is None
+    )
+
+
+def test_a_warm_session_failure_late_in_a_run_re_solves_on_a_smaller_budget(
+    tmp_path,
+):
+    """The run had 78 requests left and a dead warm session. It could pay for
+    three rotations, but the guard asked for four and handed the rest of the
+    shard back — 2-10 times a day, on the drain runner too (#1129)."""
+
+    raw = _raw_store(tmp_path)
+    control = BudgetAwareFakeControl(raw)
+    control.run.update(
+        request_limit=200,
+        requests_used=40,
+        byte_limit=100 * 1024 * 1024,
+    )
+    run_id = str(uuid.UUID(int=1))
+
+    def make_lease(attempt, target, refresh, epoch):
+        return TargetLease(
+            attempt_id=str(uuid.UUID(int=attempt)),
+            run_id=run_id,
+            target_id=target,
+            logical_refresh_id=str(uuid.UUID(int=refresh)),
+            canonical_url="https://fbref.com/en/comps/",
+            page_kind="competition_index",
+            source_ids={"competition_index": "all"},
+            claim_token=str(uuid.UUID(int=attempt + 100)),
+            lease_epoch=epoch,
+            attempt_number=epoch,
+            leased_by="worker-1",
+            lease_expires_at=NOW + timedelta(minutes=10),
+        )
+
+    warm_up = make_lease(191, "fbref:competition_index:all", 191, 1)
+    rejected = make_lease(192, "fbref:competition_index:all", 192, 1)
+    retry = make_lease(193, rejected.target_id, 192, 2)
+    claims = iter(([warm_up, rejected], [retry]))
+    control.claim_targets = lambda *args, **kwargs: next(claims)
+
+    class LateFailureFetcher:
+        """The clearance spends its whole allowance, then the session dies."""
+
+        def __init__(self, events):
+            self.events = events
+            self.calls = 0
+
+        def __enter__(self):
+            self.events.append("fetcher_enter")
+            return self
+
+        def __exit__(self, *args):
+            self.events.append("fetcher_exit")
+
+        def ensure_clearance(self):
+            self.events.append("browser")
+            return True
+
+        def fetch(self, url, **kwargs):
+            self.calls += 1
+            self.events.append("http")
+            if self.calls == 2:
+                raise FetchError(
+                    "FBref warm session lost its connection",
+                    error_class="warm_session_connection",
+                    http_status=None,
+                    wire_bytes=200,
+                    browser_requests=0,
+                    target_requests=1,
+                    http_requests=1,
+                    http_status_history=(),
+                    latency_ms=100,
+                )
+            body = b"<html>ok</html>"
+            http_requests = 78 if self.calls == 1 else 1
+            return FetchResponse(
+                url=url,
+                status_code=200,
+                body=body,
+                headers={"etag": '"v1"'},
+                latency_ms=10,
+                http_wire_bytes=len(body) + 120,
+                decoded_html_bytes=len(body),
+                http_requests=http_requests,
+                http_status_history=(200,) * http_requests,
+                browser_document_bytes=500,
+                browser_asset_bytes=100,
+                browser_requests=1,
+                browser_bootstrap_attempts=1,
+            )
+
+    allowances = []
+
+    def factory(proxy_file, max_browser_requests, max_browser_bytes):
+        allowances.append((max_browser_requests, max_browser_bytes))
+        return LateFailureFetcher(control.events)
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=factory,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="worker-1",
+        page_kinds=["competition_index"],
+        settings=PipelineSettings(
+            run_type="current",
+            request_limit=200,
+            byte_limit=100 * 1024 * 1024,
+            shard_size=4,
+            domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+        ),
+    )
+
+    # The wave finished its shard instead of returning it at a false ceiling.
+    assert result.budget_exhausted is False
+    assert result.requeued_at_budget == 0
+    assert result.requeued_dead_clearance == 1
+    assert result.failures == []
+    # First solve got the full reservation, the re-solve got what still fit,
+    # and the transport was rebuilt so it cannot outspend the smaller booking.
+    assert allowances == [(80, 16 * 1024 * 1024), (60, 12 * 1024 * 1024)]
+    assert control.reservations[-1][1]["requests"] == 62
+    assert control.run["requests_used"] <= 200
 
 
 def test_a_run_that_hits_its_budget_requeues_its_targets_and_ends_clean(tmp_path):
