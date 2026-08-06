@@ -7,6 +7,7 @@ import os
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit
 
 import pytest
@@ -116,6 +117,7 @@ def test_current_matches_are_admitted_before_older_enrichment_backlog():
         f"fbref:test:match:{position}:{suffix}" for position in range(4)
     ]
     season_target = f"fbref:test:season:{suffix}"
+    fresh_schedule_target = f"fbref:test:fresh-schedule:{suffix}"
     stats_target = f"fbref:test:season-stats:{suffix}"
     player_target = f"fbref:test:player:{suffix}"
     historical_target = f"fbref:test:historical-match:{suffix}"
@@ -242,6 +244,16 @@ def test_current_matches_are_admitted_before_older_enrichment_backlog():
                 "1940-01-01T00:00:00Z",
             )
             insert_target(
+                fresh_schedule_target,
+                "schedule",
+                {
+                    "competition_id": male_competition,
+                    "season_id": season_id,
+                },
+                current_policy,
+                datetime.now(timezone.utc).isoformat(),
+            )
+            insert_target(
                 stats_target,
                 "season_stats",
                 {
@@ -298,9 +310,13 @@ def test_current_matches_are_admitted_before_older_enrichment_backlog():
             refresh_policies=current_policies,
             limit=5,
         )
+        # The season page is overdue by far more than its freshness SLA, so it
+        # preempts the match drain it feeds; the schedule page that is merely
+        # due stays behind those matches.
         assert [item.target_id for item in first] == [
             index_target,
-            *match_targets,
+            season_target,
+            *match_targets[:3],
         ]
         assert [item.ordinal for item in first] == list(range(5))
 
@@ -319,14 +335,21 @@ def test_current_matches_are_admitted_before_older_enrichment_backlog():
             refresh_policies=current_policies,
             limit=1,
         )
-        assert [item.target_id for item in second] == [season_target]
-        assert [item.target_id for item in third] == [stats_target]
-        assert [item.target_id for item in fourth] == [player_target]
+        fifth = store.create_due_run_cohort(
+            run_id,
+            refresh_policies=current_policies,
+            limit=1,
+        )
+        assert [item.target_id for item in second] == [match_targets[3]]
+        assert [item.target_id for item in third] == [fresh_schedule_target]
+        assert [item.target_id for item in fourth] == [stats_target]
+        assert [item.target_id for item in fifth] == [player_target]
         selected = {
             *(item.target_id for item in first),
             second[0].target_id,
             third[0].target_id,
             fourth[0].target_id,
+            fifth[0].target_id,
         }
         assert historical_target not in selected
         assert not any("female-match" in item for item in selected)

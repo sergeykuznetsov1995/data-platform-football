@@ -5136,6 +5136,9 @@ class ControlStore:
         # Admission tiers keep the publication spine ahead of an arbitrarily
         # old enrichment backlog.  In particular, a newly discovered current
         # match must not need a previous fetch before it becomes critical.
+        # The escape hatch above the match drain is deliberate: a spine page
+        # that is overdue by more than a whole freshness SLA has stopped
+        # discovering the very matches the drain feeds on, so it preempts it.
         cohort = []
         with self._transaction() as cursor:
             cursor.execute(
@@ -5150,7 +5153,10 @@ class ControlStore:
                 raise StateConflict(f"Run {run} cannot accept a due cohort")
             cursor.execute(
                 _FRONTIER_SCOPE_CTE
-                + """
+                + f"""
+                , sla(page_kind, sla_seconds) AS (
+                    VALUES {_PAGE_KIND_SLA_VALUES}
+                )
                 , eligible AS MATERIALIZED (
                   SELECT frontier.target_id, frontier.page_kind,
                          frontier.last_fetched_at, frontier.created_at,
@@ -5164,21 +5170,33 @@ class ControlStore:
                          CASE
                            WHEN frontier.page_kind = 'competition_index'
                              THEN 0
+                           WHEN frontier.page_kind = ANY(%s::text[])
+                            AND frontier.refresh_policy <> 'historical_once'
+                            AND COALESCE(
+                                  frontier.retry_after,
+                                  frontier.next_fetch_at,
+                                  frontier.last_fetched_at,
+                                  frontier.created_at
+                                ) < clock_timestamp()
+                                    - (sla.sla_seconds * interval '1 second')
+                             THEN 1
                            WHEN frontier.page_kind = 'match'
                             AND frontier.refresh_policy <> 'historical_once'
                             AND COALESCE(scope.has_current_season, false)
-                             THEN 1
-                           WHEN frontier.page_kind = ANY(%s::text[])
-                            AND frontier.refresh_policy <> 'historical_once'
                              THEN 2
                            WHEN frontier.page_kind = ANY(%s::text[])
                             AND frontier.refresh_policy <> 'historical_once'
                              THEN 3
-                           ELSE 4
+                           WHEN frontier.page_kind = ANY(%s::text[])
+                            AND frontier.refresh_policy <> 'historical_once'
+                             THEN 4
+                           ELSE 5
                          END AS admission_tier
                   FROM fbref_control.page_frontier AS frontier
                   LEFT JOIN scope_rollup AS scope
                     ON scope.target_id = frontier.target_id
+                  LEFT JOIN sla
+                    ON sla.page_kind = frontier.page_kind
                   WHERE (
                         frontier.state IN ('queued', 'retry')
                         OR (
@@ -5241,6 +5259,7 @@ class ControlStore:
                 FOR UPDATE OF frontier SKIP LOCKED
                 """,
                 (
+                    list(DISCOVERY_SPINE_PAGE_KINDS),
                     list(DISCOVERY_SPINE_PAGE_KINDS),
                     list(OTHER_PUBLICATION_CRITICAL_PAGE_KINDS),
                     kinds,
