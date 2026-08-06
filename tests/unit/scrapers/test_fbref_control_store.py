@@ -758,9 +758,10 @@ def test_due_cohort_uses_explicit_publication_admission_tiers():
     ]
     assert "frontier.page_kind = 'competition_index' THEN 0" in sql
     assert "frontier.page_kind = 'match'" in sql
-    assert "COALESCE(scope.has_current_season, false) THEN 1" in sql
+    assert "COALESCE(scope.has_current_season, false) THEN 2" in sql
     assert "frontier.refresh_policy <> 'historical_once'" in sql
-    assert selected["params"][:2] == (
+    assert selected["params"][:3] == (
+        list(DISCOVERY_SPINE_PAGE_KINDS),
         list(DISCOVERY_SPINE_PAGE_KINDS),
         list(OTHER_PUBLICATION_CRITICAL_PAGE_KINDS),
     )
@@ -771,6 +772,46 @@ def test_due_cohort_uses_explicit_publication_admission_tiers():
     assert "scope.has_current_season" in sql
     assert "NOT (frontier.source_ids ? 'competition_id')" not in sql
     assert "FOR UPDATE OF frontier SKIP LOCKED" in sql
+
+
+def test_due_cohort_promotes_spine_starved_past_its_freshness_sla():
+    selected = {}
+
+    def handler(sql, params):
+        if "SELECT status FROM fbref_control.crawl_run" in sql:
+            return [{"status": "running"}], 1
+        if "SELECT frontier.target_id" in sql:
+            selected["sql"] = sql
+            return [], 0
+        if "SELECT COALESCE(max(ordinal)" in sql:
+            return [{"next_ordinal": 0}], 1
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+
+    assert store.create_due_run_cohort(str(uuid.uuid4()), limit=5) == []
+    sql = selected["sql"]
+    case = sql[sql.index("CASE") : sql.index("END AS admission_tier")]
+    # A spine page overdue by more than a whole freshness SLA outranks the
+    # match drain, otherwise a permanent match backlog starves discovery.
+    assert case.index("sla.sla_seconds") < case.index(
+        "frontier.page_kind = 'match'"
+    )
+    assert (
+        "frontier.page_kind = ANY(%s::text[]) "
+        "AND frontier.refresh_policy <> 'historical_once' "
+        "AND COALESCE( frontier.retry_after, frontier.next_fetch_at, "
+        "frontier.last_fetched_at, frontier.created_at ) "
+        "< clock_timestamp() - (sla.sla_seconds * interval '1 second') THEN 1"
+    ) in case
+    # The escape reuses the publication freshness SLA, not a private constant.
+    assert "sla(page_kind, sla_seconds) AS ( VALUES" in sql
+    assert "('schedule', 86400)" in sql
+    # Page kinds without an SLA row must keep their eligibility.
+    assert "LEFT JOIN sla ON sla.page_kind = frontier.page_kind" in sql
 
 
 def test_due_cohort_rechecks_cross_run_membership_after_frontier_lock():
