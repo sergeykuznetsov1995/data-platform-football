@@ -73,6 +73,8 @@ from scrapers.fbref.raw_store import (
     season_page_target,
 )
 from scrapers.fbref.settings import (
+    DEFAULT_BROWSER_BYTE_LIMIT_BYTES,
+    DEFAULT_BROWSER_REQUESTS_PER_SOLVE,
     DEFAULT_BYTE_LIMIT,
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
     DEFAULT_REQUEST_LIMIT,
@@ -397,6 +399,44 @@ def live_wave_target_capacity(
     return min(settings.shard_size, request_capacity)
 
 
+def affordable_clearance_reservation(
+    settings: PipelineSettings,
+    *,
+    request_remaining: int,
+    byte_remaining: int,
+) -> Optional[tuple[int, int]]:
+    """Return the largest clearance reservation the rest of a run can fund.
+
+    The full bootstrap reservation buys every proxy rotation the transport is
+    allowed to try — four solves for a 200-request daily run.  Demanding all
+    four before a mid-run re-solve is what left ~40 % of the request budget
+    unspent: a warm-session failure at request 120 of 200 could not book
+    80 + 2, so the wave handed its remaining targets back even though a solve
+    measures ~19 requests.  Offer the retry the largest whole number of
+    rotations that still fits alongside one target; the browser is then capped
+    at exactly what was reserved, so a shrunken allowance still cannot
+    overspend the run.  ``None`` means not even a single solve fits, which is
+    the same clean budget boundary as before.
+    """
+
+    full_requests = int(settings.bootstrap_request_reservation)
+    full_bytes = int(settings.bootstrap_byte_reservation)
+    rotations = max(1, full_requests // DEFAULT_BROWSER_REQUESTS_PER_SOLVE)
+    for count in range(rotations, 0, -1):
+        requests = min(
+            full_requests, count * DEFAULT_BROWSER_REQUESTS_PER_SOLVE
+        )
+        bytes_ = min(full_bytes, count * DEFAULT_BROWSER_BYTE_LIMIT_BYTES)
+        fits = (
+            request_remaining - requests
+            >= settings.target_request_reservation
+            and byte_remaining - bytes_ >= settings.request_reservation_bytes
+        )
+        if fits:
+            return requests, bytes_
+    return None
+
+
 @dataclass(frozen=True)
 class _FrontierSeedCandidate:
     link: DiscoveredPageLink
@@ -455,6 +495,20 @@ class _LiveFetchSession:
     session_id: Optional[str] = None
     consecutive_clearance_refreshes: int = 0
     needs_clearance: bool = True
+    # What the next solve may spend, once the run's remaining budget can no
+    # longer fund the full reservation.  ``None`` means the settings default.
+    clearance_requests: Optional[int] = None
+    clearance_bytes: Optional[int] = None
+
+    def clearance_reservation(self, settings) -> tuple[int, int]:
+        return (
+            settings.bootstrap_request_reservation
+            if self.clearance_requests is None
+            else self.clearance_requests,
+            settings.bootstrap_byte_reservation
+            if self.clearance_bytes is None
+            else self.clearance_bytes,
+        )
 
     def close(self, control, *, status: str) -> None:
         try:
@@ -2028,13 +2082,17 @@ class FBrefPipeline:
                             result.recovered_from_raw += 1
                             continue
 
+                    (
+                        clearance_requests,
+                        clearance_bytes,
+                    ) = live_session.clearance_reservation(settings)
                     reserved_requests = settings.target_request_reservation + (
-                        settings.bootstrap_request_reservation
+                        clearance_requests
                         if live_session.needs_clearance
                         else 0
                     )
                     reserved_bytes = settings.request_reservation_bytes + (
-                        settings.bootstrap_byte_reservation
+                        clearance_bytes
                         if live_session.needs_clearance
                         else 0
                     )
@@ -2072,8 +2130,8 @@ class FBrefPipeline:
                                 live_session.stack.enter_context(
                                     self.fetcher_factory(
                                         settings.proxy_file,
-                                        settings.bootstrap_request_reservation,
-                                        settings.bootstrap_byte_reservation,
+                                        clearance_requests,
+                                        clearance_bytes,
                                     )
                                 )
                             )
@@ -2343,12 +2401,12 @@ class FBrefPipeline:
                                 run_after_failure.get("bytes_reserved") or 0
                             ),
                         )
-                        retry_fits_budget = wave_target_capacity(
+                        retry_reservation = affordable_clearance_reservation(
                             settings,
                             request_remaining=request_remaining,
                             byte_remaining=byte_remaining,
-                            bootstrap_required=True,
-                        ) > 0
+                        )
+                        retry_fits_budget = retry_reservation is not None
                         if retry_fits_budget:
                             self.control.retry_session_fetch(
                                 lease,
@@ -2391,6 +2449,20 @@ class FBrefPipeline:
                                 1 + returned,
                             )
                             break
+                        (
+                            allowed_requests,
+                            allowed_bytes,
+                        ) = retry_reservation
+                        (
+                            previous_requests,
+                            previous_bytes,
+                        ) = live_session.clearance_reservation(settings)
+                        clearance_downgraded = (
+                            allowed_requests < previous_requests
+                            or allowed_bytes < previous_bytes
+                        )
+                        live_session.clearance_requests = allowed_requests
+                        live_session.clearance_bytes = allowed_bytes
                         logger.warning(
                             "FBref clearance failed (%s, HTTP %s) — "
                             "%s stays in this run and the session is being "
@@ -2402,6 +2474,17 @@ class FBrefPipeline:
                             live_session.consecutive_clearance_refreshes,
                             MAX_CONSECUTIVE_CLEARANCE_REFRESHES,
                         )
+                        if clearance_downgraded:
+                            logger.warning(
+                                "FBref re-solve reserves %d request(s) and "
+                                "%d byte(s) instead of %d/%d — the rest of "
+                                "the run can no longer fund every proxy "
+                                "rotation",
+                                allowed_requests,
+                                allowed_bytes,
+                                previous_requests,
+                                previous_bytes,
+                            )
                         if (
                             live_session.consecutive_clearance_refreshes
                             > MAX_CONSECUTIVE_CLEARANCE_REFRESHES
@@ -2423,9 +2506,12 @@ class FBrefPipeline:
                             "reset_clearance",
                             None,
                         )
-                        if callable(reset):
+                        if callable(reset) and not clearance_downgraded:
                             reset()
                         else:
+                            # A transport built for the old allowance would
+                            # still spend it. Rebuild it against the smaller
+                            # reservation the run just booked.
                             live_session.stack.close()
                             live_session.stack = ExitStack()
                             live_session.fetcher = None
