@@ -56,7 +56,7 @@
     "scrapers/fbref/control/__init__.py": "6294141868355f808cb375d33769cddae6de5ac81e8745fda02fbda44938c341",
     "scrapers/fbref/control/migrations.py": "42ad79c2566a13fd7306c63acba90ce1d5ac4033b5750c01fc29644d2c0baa6f",
     "scrapers/fbref/control/models.py": "a1d7784e67ac11f49beab8c49a27a334c07599741f10a75f4ae33129dd6c7fc3",
-    "scrapers/fbref/control/store.py": "1f0031c4cb39879a1d584954fde132f9f60f7f38e3eb6bc5935bb0c3655aa575",
+    "scrapers/fbref/control/store.py": "854ea9aa9014e053d3d5a6b6d9b43e05755e6c00a2b61c40d2d5f4f0b9b8a7b5",
     "scrapers/fbref/policy.py": "f28b736ddb4a18ffa7f14de9f3c65cf45a8fb7ced5e9bd4519bc728b2cea5cdf",
     "scrapers/fbref/settings.py": "fad2f1ca0eb9ea993d5d394ba3de1d0801f850d45b0e19edd9cebef5cfec5026",
     "scrapers/fotmob/__init__.py": "3f2163fabd0097d2162a0e7daf14851ce66c3acbc7e9ffc53aeaba4681dbc990",
