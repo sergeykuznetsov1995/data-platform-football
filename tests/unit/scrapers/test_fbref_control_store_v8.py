@@ -16,6 +16,7 @@ from scrapers.fbref.control import (
     make_frontier_provenance_id,
 )
 from scrapers.fbref.control.migrations import MIGRATIONS
+from scrapers.fbref.policy import CLAIMABLE_REFRESH_POLICIES
 
 
 class FakeCursor:
@@ -1113,6 +1114,94 @@ def test_run_summary_splits_current_historical_and_crawlable_scope_metrics():
     assert "state = 'fetched'" in freshness_sql
     assert "state IN ('queued', 'retry', 'leased')" in freshness_sql
     assert "COALESCE( last_fetched_at, created_at )" in freshness_sql
+
+
+def test_freshness_denominator_drops_rows_no_wave_can_ever_claim():
+    # #1130: fbref:schedule:851:2025-2026 went 'dead' on response_too_large and
+    # a stray target carried a refresh_policy no run lists.  Neither can be
+    # fetched again by anyone, so counting them as stale wedged publication on
+    # work nobody can do.  They leave the denominator — and stay countable.
+    run_id = str(uuid.uuid4())
+    executions = []
+
+    def handler(sql, params):
+        executions.append((sql, params))
+        if "SELECT * FROM fbref_control.crawl_run" in sql:
+            return [{"run_id": run_id, "run_type": "current"}], 1
+        if "FROM evaluated_scope" in sql:
+            return [
+                {
+                    "page_kind": "schedule",
+                    "sla_seconds": 86_400,
+                    "total_targets": 41,
+                    "fresh_targets": 41,
+                    "stale_targets": 0,
+                    "never_fetched_targets": 0,
+                    "unclaimable_state_targets": 1,
+                    "unclaimable_policy_targets": 0,
+                    "oldest_last_fetched_at": None,
+                },
+                {
+                    "page_kind": "player",
+                    "sla_seconds": 2_592_000,
+                    "total_targets": 7,
+                    "fresh_targets": 7,
+                    "stale_targets": 0,
+                    "never_fetched_targets": 0,
+                    "unclaimable_state_targets": 0,
+                    "unclaimable_policy_targets": 1,
+                    "oldest_last_fetched_at": None,
+                },
+            ], 2
+        return [], 0
+
+    store, _ = make_store(handler)
+    summary = store.get_run_summary(run_id)
+
+    assert summary["current_scope_freshness"] == {
+        "total_targets": 48,
+        "fresh_targets": 48,
+        "stale_targets": 0,
+        "never_fetched_targets": 0,
+        "unclaimable_state_targets": 1,
+        "unclaimable_policy_targets": 1,
+        "all_within_sla": True,
+    }
+    assert summary["freshness_by_page_kind"]["schedule"][
+        "unclaimable_state_targets"
+    ] == 1
+    # 'player' is not publication-critical, so its unclaimable row must not
+    # leak into the publication aggregate.
+    publication = summary["publication_scope_freshness"]
+    assert publication["unclaimable_state_targets"] == 1
+    assert publication["unclaimable_policy_targets"] == 0
+
+    freshness_sql = next(
+        sql for sql, _ in executions if "FROM evaluated_scope" in sql
+    )
+    assert (
+        "CASE WHEN state IN ( 'skipped', 'quarantined', 'dead' ) "
+        "THEN 'unclaimable_state'" in freshness_sql
+    )
+    policy_clause = freshness_sql.split(
+        "WHEN refresh_policy NOT IN (", 1
+    )[1].split(") THEN 'unclaimable_policy'", 1)[0]
+    for policy in CLAIMABLE_REFRESH_POLICIES:
+        assert f"'{policy}'" in policy_clause
+    # The refresh policy of the stray test artefact is claimable by nobody.
+    assert "'current_daily'" not in freshness_sql
+    # Every numerator and denominator is gated on claimability.
+    for aggregate in (
+        "WHERE unclaimable_reason IS NULL ) AS total_targets",
+        "WHERE unclaimable_reason IS NULL AND last_fetched_at IS NULL )"
+        " AS never_fetched_targets",
+        "WHERE unclaimable_reason IS NULL AND NOT within_sla )"
+        " AS stale_targets",
+        "WHERE unclaimable_reason IS NULL AND within_sla ) AS fresh_targets",
+        "min(last_fetched_at) FILTER ( WHERE unclaimable_reason IS NULL )"
+        " AS oldest_last_fetched_at",
+    ):
+        assert aggregate in freshness_sql
 
 
 def test_run_summary_separates_concurrent_raw_from_run_owned_raw():

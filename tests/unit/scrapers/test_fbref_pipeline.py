@@ -1189,6 +1189,24 @@ def test_current_and_historical_squad_urls_are_distinct_targets():
     }
 
 
+def test_every_minted_refresh_policy_stays_claimable_for_the_freshness_gate():
+    # The freshness gate (#1130) drops targets whose refresh_policy is outside
+    # CLAIMABLE_REFRESH_POLICIES, because no wave lists them.  A new policy
+    # minted here without that set knowing about it would silently vanish from
+    # the denominator instead of being measured.
+    from scrapers.fbref.control.store import _PAGE_KIND_SLA_SECONDS
+    from scrapers.fbref.pipeline import _frontier_policy
+    from scrapers.fbref.policy import CLAIMABLE_REFRESH_POLICIES
+
+    for page_kind in (*_PAGE_KIND_SLA_SECONDS, "unregistered_page_kind"):
+        for historical in (False, True):
+            policy, _ = _frontier_policy(page_kind, historical=historical)
+            assert policy in CLAIMABLE_REFRESH_POLICIES
+
+    # Completion promotes a current match onto its own one-shot policy.
+    assert "current_completed_once" in CLAIMABLE_REFRESH_POLICIES
+
+
 def test_current_and_backfill_share_player_without_policy_downgrade():
     player = PageTarget(
         source="fbref",

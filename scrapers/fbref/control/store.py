@@ -35,6 +35,7 @@ from scrapers.fbref.control.models import (
     ThrottleSlot,
 )
 from scrapers.fbref.policy import (
+    CLAIMABLE_REFRESH_POLICIES,
     DISCOVERY_SPINE_PAGE_KINDS,
     OTHER_PUBLICATION_CRITICAL_PAGE_KINDS,
     PUBLICATION_FRESHNESS_PAGE_KINDS,
@@ -99,6 +100,9 @@ _PAGE_KIND_SLA_SECONDS = {
 _PAGE_KIND_SLA_VALUES = ", ".join(
     f"('{page_kind}', {seconds})"
     for page_kind, seconds in sorted(_PAGE_KIND_SLA_SECONDS.items())
+)
+_CLAIMABLE_REFRESH_POLICY_VALUES = ", ".join(
+    f"'{policy}'" for policy in sorted(CLAIMABLE_REFRESH_POLICIES)
 )
 _PENDING_MATCH_SAMPLE_LIMIT = 10
 _MAX_FRONTIER_DISCOVERY_TARGETS = 1000
@@ -6038,6 +6042,20 @@ class ControlStore:
                       )
                 ), evaluated_scope AS (
                     SELECT current_scope.*,
+                           -- A row no wave can ever claim carries no freshness
+                           -- verdict, only a loss report (#1130).  Retired
+                           -- states and refresh policies no run lists leave
+                           -- the denominator and are counted apart, so the
+                           -- loss stays visible instead of wedging
+                           -- publication on work nobody can do.
+                           CASE
+                             WHEN state IN (
+                               'skipped', 'quarantined', 'dead'
+                             ) THEN 'unclaimable_state'
+                             WHEN refresh_policy NOT IN (
+                               {_CLAIMABLE_REFRESH_POLICY_VALUES}
+                             ) THEN 'unclaimable_policy'
+                           END AS unclaimable_reason,
                            CASE
                              WHEN page_kind = 'match'
                               AND refresh_policy = 'current_completed_once'
@@ -6068,15 +6086,29 @@ class ControlStore:
                     FROM current_scope
                 )
                 SELECT page_kind, max(sla_seconds) AS sla_seconds,
-                       count(*) AS total_targets,
                        count(*) FILTER (
-                           WHERE last_fetched_at IS NULL
+                           WHERE unclaimable_reason IS NULL
+                       ) AS total_targets,
+                       count(*) FILTER (
+                           WHERE unclaimable_reason IS NULL
+                             AND last_fetched_at IS NULL
                        ) AS never_fetched_targets,
-                       count(*) FILTER (WHERE NOT within_sla)
-                           AS stale_targets,
-                       count(*) FILTER (WHERE within_sla)
-                           AS fresh_targets,
-                       min(last_fetched_at) AS oldest_last_fetched_at
+                       count(*) FILTER (
+                           WHERE unclaimable_reason IS NULL
+                             AND NOT within_sla
+                       ) AS stale_targets,
+                       count(*) FILTER (
+                           WHERE unclaimable_reason IS NULL AND within_sla
+                       ) AS fresh_targets,
+                       count(*) FILTER (
+                           WHERE unclaimable_reason = 'unclaimable_state'
+                       ) AS unclaimable_state_targets,
+                       count(*) FILTER (
+                           WHERE unclaimable_reason = 'unclaimable_policy'
+                       ) AS unclaimable_policy_targets,
+                       min(last_fetched_at) FILTER (
+                           WHERE unclaimable_reason IS NULL
+                       ) AS oldest_last_fetched_at
                 FROM evaluated_scope
                 GROUP BY page_kind
                 ORDER BY page_kind
@@ -6090,6 +6122,12 @@ class ControlStore:
                     "stale_targets": int(row["stale_targets"] or 0),
                     "never_fetched_targets": int(
                         row["never_fetched_targets"] or 0
+                    ),
+                    "unclaimable_state_targets": int(
+                        row.get("unclaimable_state_targets") or 0
+                    ),
+                    "unclaimable_policy_targets": int(
+                        row.get("unclaimable_policy_targets") or 0
                     ),
                     "oldest_last_fetched_at": row.get(
                         "oldest_last_fetched_at"
@@ -6115,6 +6153,14 @@ class ControlStore:
                     row["never_fetched_targets"]
                     for row in freshness_by_kind.values()
                 ),
+                "unclaimable_state_targets": sum(
+                    row["unclaimable_state_targets"]
+                    for row in freshness_by_kind.values()
+                ),
+                "unclaimable_policy_targets": sum(
+                    row["unclaimable_policy_targets"]
+                    for row in freshness_by_kind.values()
+                ),
             }
             freshness_totals["all_within_sla"] = (
                 freshness_totals["stale_targets"] == 0
@@ -6137,6 +6183,14 @@ class ControlStore:
                 ),
                 "never_fetched_targets": sum(
                     row["never_fetched_targets"] for row in publication_rows
+                ),
+                "unclaimable_state_targets": sum(
+                    row["unclaimable_state_targets"]
+                    for row in publication_rows
+                ),
+                "unclaimable_policy_targets": sum(
+                    row["unclaimable_policy_targets"]
+                    for row in publication_rows
                 ),
             }
             publication_freshness["all_within_sla"] = (

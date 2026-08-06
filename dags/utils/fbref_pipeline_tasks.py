@@ -884,6 +884,31 @@ def validate_fbref_current_scope_freshness(
                 "never_fetched_targets": never,
             }
 
+    # The control plane keeps rows no wave can ever claim out of the
+    # denominator (dead-lettered/retired pages, a refresh policy no run lists),
+    # so one permanently unreachable page cannot wedge publication forever.
+    # This gate therefore stays green on them — the count below is the only
+    # thing between us and a silent hole, so it is reported and logged for
+    # every page kind, publication-critical or not (#1130).
+    unclaimable_by_kind = {}
+    if isinstance(by_kind, Mapping):
+        for raw_kind, raw_metrics in by_kind.items():
+            if not isinstance(raw_metrics, Mapping):
+                continue
+            excluded = {
+                reason: _non_negative_metric(
+                    raw_metrics, f"unclaimable_{reason}_targets"
+                )
+                for reason in ("state", "policy")
+            }
+            if any(excluded.values()):
+                unclaimable_by_kind[str(raw_kind)] = excluded
+    if unclaimable_by_kind:
+        logger.warning(
+            "FBref freshness gate excluded unclaimable targets: %s",
+            json.dumps(unclaimable_by_kind, sort_keys=True),
+        )
+
     normalized_aggregate = {}
     if isinstance(aggregate, Mapping):
         total = _non_negative_metric(aggregate, "total_targets")
@@ -903,6 +928,12 @@ def validate_fbref_current_scope_freshness(
             "stale_targets": stale,
             "never_fetched_targets": never,
             "all_within_sla": within_sla,
+            "unclaimable_state_targets": _non_negative_metric(
+                aggregate, "unclaimable_state_targets"
+            ),
+            "unclaimable_policy_targets": _non_negative_metric(
+                aggregate, "unclaimable_policy_targets"
+            ),
         }
 
     if violations:
@@ -920,6 +951,7 @@ def validate_fbref_current_scope_freshness(
         "run_type": normalized_run_type,
         "publication_scope_freshness": normalized_aggregate,
         "freshness_by_page_kind": normalized_kinds,
+        "unclaimable_targets": unclaimable_by_kind,
     }
 
 

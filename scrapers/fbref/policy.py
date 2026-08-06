@@ -34,6 +34,23 @@ OTHER_PUBLICATION_CRITICAL_PAGE_KINDS = (
     "standings",
 )
 
+# Every refresh policy a fetch wave can actually ask for: ``_frontier_policy``
+# (scrapers/fbref/pipeline.py) mints exactly these, and a completed current
+# match is promoted to ``current_completed_once``.  A frontier row carrying any
+# other policy is unreachable for every run — no wave lists it, so it can never
+# be refreshed.  The freshness gate must not count such a row as stale (#1130):
+# it would wedge publication on work nobody can do.
+CLAIMABLE_REFRESH_POLICIES = frozenset(
+    (
+        "six_hourly",
+        "daily",
+        "weekly",
+        "monthly",
+        "historical_once",
+        "current_completed_once",
+    )
+)
+
 # Parser/document version stamps, centralized in this import-light module so the
 # control plane (control/store.py) can read them without pulling the heavy parser
 # stack (pandas/pyarrow/bs4 via page_document/typed_bronze/discovery) into its

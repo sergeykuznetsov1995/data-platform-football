@@ -3,6 +3,7 @@ from __future__ import annotations
 import dis
 import inspect
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -1472,6 +1473,117 @@ def test_current_scope_freshness_allows_new_final_match_inside_24h_sla(
     assert result["freshness_by_page_kind"]["match"][
         "never_fetched_targets"
     ] == 1
+
+
+@pytest.mark.unit
+def test_dead_page_leaves_the_denominator_but_stays_in_the_report(
+    monkeypatch, caplog
+):
+    # #1130: fbref:schedule:851:2025-2026 is 'dead' (response_too_large) and no
+    # run can claim it again — the gate must not stay red forever on work
+    # nobody can do.  It must not hide the loss either.
+    summary = _freshness_summary()
+    summary["freshness_by_page_kind"]["schedule"][
+        "unclaimable_state_targets"
+    ] = 1
+    summary["current_scope_freshness"]["unclaimable_state_targets"] = 1
+    control = MagicMock()
+    control.get_run_summary.return_value = summary
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+            airflow_run_id="scheduled__2026-08-06T06:00:00+00:00",
+            dag_id="dag_ingest_fbref",
+            run_type="current",
+        )
+
+    assert result["status"] == "passed"
+    assert result["freshness_by_page_kind"]["schedule"]["stale_targets"] == 0
+    assert result["unclaimable_targets"] == {
+        "schedule": {"state": 1, "policy": 0}
+    }
+    assert result["publication_scope_freshness"][
+        "unclaimable_state_targets"
+    ] == 1
+    assert "excluded unclaimable targets" in caplog.text
+    assert '"state": 1' in caplog.text
+
+
+@pytest.mark.unit
+def test_unclaimable_refresh_policy_is_reported_instead_of_counted_stale(
+    monkeypatch, caplog
+):
+    # A frontier row whose refresh_policy no wave lists (a stray artefact in
+    # the control DB) is unreachable for every run, including outside the
+    # publication-critical page kinds — report it, do not fail on it.
+    summary = _freshness_summary()
+    summary["freshness_by_page_kind"]["match"][
+        "unclaimable_policy_targets"
+    ] = 1
+    summary["freshness_by_page_kind"]["player"] = {
+        "sla_seconds": (
+            fbref_pipeline_tasks.FBREF_PLAYER_MATCHLOG_FRESHNESS_HOURS
+            * 60
+            * 60
+        ),
+        "total_targets": 0,
+        "fresh_targets": 0,
+        "stale_targets": 0,
+        "never_fetched_targets": 0,
+        "unclaimable_state_targets": 0,
+        "unclaimable_policy_targets": 2,
+    }
+    summary["current_scope_freshness"]["unclaimable_policy_targets"] = 3
+    control = MagicMock()
+    control.get_run_summary.return_value = summary
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+            airflow_run_id="scheduled__2026-08-06T06:00:00+00:00",
+            dag_id="dag_ingest_fbref",
+            run_type="current",
+        )
+
+    assert result["status"] == "passed"
+    assert result["freshness_by_page_kind"]["match"]["stale_targets"] == 0
+    assert result["unclaimable_targets"] == {
+        "match": {"state": 0, "policy": 1},
+        "player": {"state": 0, "policy": 2},
+    }
+    assert result["publication_scope_freshness"][
+        "unclaimable_policy_targets"
+    ] == 3
+    assert "excluded unclaimable targets" in caplog.text
+
+
+@pytest.mark.unit
+def test_freshness_report_stays_empty_without_unclaimable_evidence(
+    monkeypatch,
+):
+    # Rolling upgrade: a summary written before #1130 carries no unclaimable
+    # counters, and the gate must neither invent nor demand them.
+    control = MagicMock()
+    control.get_run_summary.return_value = _freshness_summary()
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    result = fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+        airflow_run_id="scheduled__2026-08-06T06:00:00+00:00",
+        dag_id="dag_ingest_fbref",
+        run_type="current",
+    )
+
+    assert result["unclaimable_targets"] == {}
+    assert result["publication_scope_freshness"][
+        "unclaimable_state_targets"
+    ] == 0
 
 
 @pytest.mark.unit
