@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import pytest
 
+from utils.fotmob_publication import FOTMOB_DAILY_COMPETITION_IDS
+
 from scrapers.fotmob.catalog import (
     CatalogConflictError,
+    DEFAULT_SCOPE_OVERRIDES,
     SelectedSeasonMismatch,
     classify_competition,
     competition_from_league_payload,
@@ -79,6 +82,125 @@ def test_male_senior_scope_classifier_is_auditable(competition, expected, rule):
     result = classify_competition(competition)
     assert result.decision is expected
     assert result.policy_rule == rule
+
+
+@pytest.mark.parametrize(
+    ("competition", "rule"),
+    [
+        # Диакритика снимается перед матчингом (NFKD).
+        (CompetitionRef(7001, "Coupe de France Féminine"), "exclude_female"),
+        (CompetitionRef(7002, "Première Ligue Féminine"), "exclude_female"),
+        # Романские формы: португальская, итальянская, мексиканская.
+        (CompetitionRef(7003, "Nacional Feminino"), "exclude_female"),
+        (CompetitionRef(7004, "Serie A Femminile"), "exclude_female"),
+        (CompetitionRef(7005, "Liga MX Femenil"), "exclude_female"),
+        # "Womens" без апострофа ломал \b после women.
+        (CompetitionRef(7006, "Womens Asian Cup"), "exclude_female"),
+        # Скандинавские и нидерландская формы.
+        (CompetitionRef(7007, "1. Division Kvinner"), "exclude_female"),
+        (CompetitionRef(7008, "Kvindeliga"), "exclude_female"),
+        (CompetitionRef(7009, "Eredivisie Vrouwen"), "exclude_female"),
+        # Суффикс (W) — маркер, который использует сам источник.
+        (CompetitionRef(7010, "Damallsvenskan (W)"), "exclude_female"),
+        (CompetitionRef(7011, "World Cup Qualification (W) UEFA"), "exclude_female"),
+        # Португальская молодёжная лига U23.
+        (CompetitionRef(7012, "Liga Revelação"), "exclude_youth"),
+    ],
+)
+def test_scope_classifier_catches_localised_women_and_youth_names(competition, rule):
+    assert classify_competition(competition).policy_rule == rule
+
+
+@pytest.mark.parametrize(
+    "competition",
+    [
+        # Вторые дивизионы: токены ii/b — ловушка для широких шаблонов.
+        CompetitionRef(9117, "NB II", country_name="Hungary"),
+        CompetitionRef(9113, "Liga II", country_name="Romania"),
+        CompetitionRef(264, "First Division B", country_name="Belgium"),
+        CompetitionRef(146, "2. Bundesliga", country_name="Germany"),
+        CompetitionRef(8968, "Primera Federación", country_name="Spain"),
+        # "Sudamericana" содержит "damer", "Eliteserien" содержит "elite".
+        CompetitionRef(299, "Copa Sudamericana", country_name="International"),
+        CompetitionRef(59, "Eliteserien", country_name="Norway"),
+        CompetitionRef(47, "Premier League", country_name="England"),
+    ],
+)
+def test_scope_classifier_keeps_mens_competitions_that_look_suspicious(competition):
+    result = classify_competition(competition)
+    assert result.decision is ScopeDecision.INCLUDED, result.reason
+
+
+def test_national_team_friendlies_are_in_scope_but_club_and_charity_are_not():
+    """Решение владельца 07.08.2026: товарищеские сборных собираем, остальные — нет."""
+
+    friendlies = CompetitionRef(114, "Friendlies", country_name="International")
+    assert classify_competition(friendlies).decision is ScopeDecision.INCLUDED
+    assert classify_competition(friendlies).policy_rule == "include_national_team_friendlies"
+
+    for competition_id, name in (
+        (489, "Club Friendlies"),
+        (10312, "Sidemen Charity Match"),
+        (10656, "Beta Squad vs Amp Charity"),
+    ):
+        competition = CompetitionRef(competition_id, name, country_name="International")
+        assert classify_competition(competition).policy_rule == "exclude_friendly"
+
+    # Женские и молодёжные товарищеские остаются за бортом по своим правилам.
+    assert classify_competition(
+        CompetitionRef(293, "Women's Friendlies", country_name="International")
+    ).policy_rule == "exclude_female"
+    assert classify_competition(
+        CompetitionRef(344, "Friendlies U-21", country_name="International")
+    ).policy_rule == "exclude_youth"
+
+
+def test_scope_overrides_decide_by_id_not_by_name():
+    """Пары турниров, различающиеся ТОЛЬКО id — имя и страна совпадают побайтово."""
+
+    female_cup = CompetitionRef(11029, "Super Cup", country_name="Netherlands")
+    male_cup = CompetitionRef(237, "Super Cup", country_name="Netherlands")
+    assert classify_competition(female_cup).decision is ScopeDecision.EXCLUDED
+    assert classify_competition(male_cup).decision is ScopeDecision.INCLUDED
+
+
+def test_scope_overrides_are_unique_and_reviewable():
+    ids = [item.competition_id for item in DEFAULT_SCOPE_OVERRIDES]
+    assert len(ids) == len(set(ids)), "дубли id в DEFAULT_SCOPE_OVERRIDES"
+    assert all(item.name.strip() and item.country.strip() for item in DEFAULT_SCOPE_OVERRIDES)
+
+
+def test_women_pinned_into_the_sealed_daily_cohort_stay_documented():
+    """Растяжка на отложенный долг #1139: 10557/10558 — женские, но опечатаны в когорте.
+
+    Источник отдаёт по ним ``details.gender=female``. Исключить их нельзя, не пересчитав
+    оба SHA когорты #930 в четырёх местах, иначе падает ``validate_data``. Если кто-то
+    добавит их в overrides без ротации печати — сначала упадёт этот тест и объяснит,
+    что нужно сделать, а не соседний фенс с непонятной ошибкой.
+    """
+
+    override_ids = {item.competition_id for item in DEFAULT_SCOPE_OVERRIDES}
+    for competition_id in (10557, 10558):
+        assert competition_id in FOTMOB_DAILY_COMPETITION_IDS
+        assert competition_id not in override_ids, (
+            f"турнир {competition_id} женский, но вшит в опечатанную дневную когорту #930: "
+            "его исключение требует пересчёта FOTMOB_DAILY_SCOPE_SHA256 и "
+            "FOTMOB_DAILY_COMPETITION_IDS_SHA256 в dags/utils/fotmob_publication.py, "
+            "deploy/fotmob/deploy.py, scripts/fotmob_runtime.py, scripts/fotmob_acceptance.py "
+            "и docs/operations/fotmob-production.md"
+        )
+
+
+def test_daily_cohort_stays_inside_the_included_scope():
+    """Фенс: исключение турнира из когорты роняет validate_data и дневную волну."""
+
+    for competition_id in FOTMOB_DAILY_COMPETITION_IDS:
+        competition = CompetitionRef(competition_id, f"cohort-{competition_id}")
+        result = classify_competition(competition)
+        assert result.decision is ScopeDecision.INCLUDED, (
+            f"турнир {competition_id} из дневной когорты больше не included "
+            f"({result.policy_rule}) — нужна согласованная ротация когорты"
+        )
 
 
 def test_scope_classifier_hook_can_override_ambiguous_source_metadata():

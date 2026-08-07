@@ -61,6 +61,14 @@ FOTMOB_PUBLICATION_BINDING_FIELDS = (
 # accidental ~493-competition crawl from entering the 14:00 publication slot.
 FOTMOB_DAILY_CONTRACT_SCHEMA = "fotmob-daily-v1"
 FOTMOB_DAILY_SCOPE_FILE = "/opt/airflow/configs/fotmob/issue-930-scopes.txt"
+# ⚠️ #1139: 10557 и 10558 — ЖЕНСКИЕ турниры (источник в карточке лиги называет их
+# «UEFA Women's Nations League A/B Qualification» и отдаёт ``details.gender=female``;
+# каталог ``allLeagues`` срезает «Women's», из-за чего их приняли за мужские двойники
+# 10717/10718, лежащие в когорте рядом). Их вывод из сбора требует пересчёта обоих
+# SHA здесь и в трёх независимых копиях пина — ``deploy/fotmob/deploy.py``,
+# ``scripts/fotmob_runtime.py``, ``scripts/fotmob_acceptance.py`` — плюс
+# ``docs/operations/fotmob-production.md``. Вскрытие печати #930 вынесено отдельно;
+# до него эти два турнира остаются в дневной волне (26 матчей).
 FOTMOB_DAILY_SCOPE_SHA256 = (
     "f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58"
 )

@@ -7,7 +7,9 @@ storage; this layer turns the returned JSON into auditable source identities.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import re
+import unicodedata
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple
 
 from .domain import (
@@ -52,14 +54,29 @@ class CatalogDiscovery:
 ClassifierHook = Callable[[CompetitionRef], Optional[ScopeClassification]]
 
 
+# Названия матчатся после снятия диакритики (``_fold``), поэтому шаблоны — ASCII.
+#
+# ⚠️ Эти регулярки — СТРАХОВКА, а не основной механизм. Замер #1139 (06.08.2026,
+# реплей raw store по 491 турниру): из 41 женского турнира каталога текущая версия
+# ловила 2, доработанная ловит 19, а поле источника ``details.gender`` — все 41.
+# У 22 турниров (Liga F, NWSL, WSL, Toppserien, WE League, A-Liga, SWPL 1,
+# Copa de la Reina…) в названии нет гендерного маркера ни в каком виде, и никакой
+# текстовый шаблон их не отличит. Их решает ``DEFAULT_SCOPE_OVERRIDES``.
+#
+# ⚠️ НЕ расширять широкими токенами без границ слова: ``damer`` внутри слова ловит
+# ``Copa Sudamericana`` (144 матча), ``elite`` ловит ``Eliteserien`` (высший дивизион
+# Норвегии), ``ii``/``b`` ловят вторые дивизионы (``NB II``, ``Liga II``,
+# ``First Division B``). Исключённый турнир перестаёт фетчиться, но его строки в
+# ``*_current`` не обнуляются, а замерзают — ошибка не оставляет улик.
 _FEMALE_RE = re.compile(
-    r"(?:\bwomen(?:'s)?\b|\bwoman\b|\bfemale\b|\bfeminine\b|\bfemenin[oa]\b|"
-    r"\bfrauen\b|\bdamer\b|\bdonne\b|\bladies\b)",
+    r"(?:\bwomen'?s?\b|\bwoman\b|\bfemale\b|\bfeminin\w*\b|\bfemenin\w*\b|\bfemenil\b|"
+    r"\bfemmin\w*\b|\bfrauen\b|\bdamer\b|\bdonne\b|\bladies\b|\bkvinn\w*\b|\bkvinde\w*\b|"
+    r"\bvrouwen\b|\(w\)(?:\s|$))",
     re.IGNORECASE,
 )
 _YOUTH_RE = re.compile(
     r"(?:\bu\s*-?\s*(?:17|18|19|20|21|22|23)\b|\bunder\s*-?\s*(?:17|18|19|20|21|22|23)\b|"
-    r"\byouth\b|\bacademy\b|\bjunior(?:s)?\b|\bjuvenil\b|\bprimavera\b)",
+    r"\byouth\b|\bacademy\b|\bjunior(?:s)?\b|\bjuvenil\b|\bprimavera\b|\brevelacao\b)",
     re.IGNORECASE,
 )
 _RESERVE_RE = re.compile(
@@ -71,6 +88,13 @@ _FRIENDLY_RE = re.compile(
     r"(?:\bfriendly|friendlies\b|\bcharity\b|\bexhibition\b|\btestimonial\b)",
     re.IGNORECASE,
 )
+
+
+def _fold(text: str) -> str:
+    """Drop diacritics so ``Féminine`` and ``Revelação`` match the ASCII patterns."""
+
+    normalised = unicodedata.normalize("NFKD", text)
+    return "".join(char for char in normalised if not unicodedata.combining(char))
 
 
 def _nonempty(value: Any) -> Optional[str]:
@@ -268,10 +292,128 @@ def discover_competitions(
     return CatalogDiscovery(tuple(competitions), tuple(conflicts), tuple(issues))
 
 
+@dataclass(frozen=True, slots=True)
+class ScopeOverride:
+    """A reviewed per-id scope decision that outranks the name heuristics.
+
+    Keyed by the immutable FotMob id, never by name: ``allLeagues`` serves three
+    pairs of competitions whose name and country are byte-identical while the
+    source itself reports different genders (237/11029 ``Super Cup`` [NED],
+    10717/10557 and 10718/10558 ``UEFA Nations League A/B Qualification``).
+    """
+
+    competition_id: int
+    decision: ScopeDecision
+    name: str
+    country: str
+    reason: str = "women/female competition (source details.gender)"
+    policy_rule: str = "exclude_female_source_gender"
+
+    def __post_init__(self) -> None:
+        if isinstance(self.competition_id, bool) or int(self.competition_id) <= 0:
+            raise CatalogShapeError("scope override id must be a positive integer")
+        if not str(self.name).strip():
+            raise CatalogShapeError(
+                f"scope override {self.competition_id} has no name for review"
+            )
+
+
+# Источник истины — поле ``details.gender`` из карточки лиги ``/leagues``.
+# Каталог ``allLeagues`` его НЕ отдаёт (32 наблюдённых json-пути, пола среди них нет),
+# поэтому решение по каталогу принимается по названию и течёт.
+#
+# Список снят 06.08.2026 реплеем raw store по 491 турниру, у которых карточка уже
+# скачана: 450 ``male``, 41 ``female``, пустых нет. Все 41 были ``included``.
+# Разбор: /root/E1139-E0-REPORT-2026-08-06.md, issue #1139.
+#
+# Пересматривать вместе с реестром: новый женский турнир попадёт сюда только после
+# первой карточки, до этого его держит ``_FEMALE_RE`` (ловит примерно половину).
+DEFAULT_SCOPE_OVERRIDES: Tuple[ScopeOverride, ...] = (
+    ScopeOverride(256, ScopeDecision.EXCLUDED, "A-Liga", "Denmark"),
+    ScopeOverride(331, ScopeDecision.EXCLUDED, "Toppserien", "Norway"),
+    ScopeOverride(332, ScopeDecision.EXCLUDED, "1. Division Kvinner", "Norway"),
+    ScopeOverride(333, ScopeDecision.EXCLUDED, "Norgesmesterskapet Kvinner", "Norway"),
+    ScopeOverride(9089, ScopeDecision.EXCLUDED, "Damallsvenskan (W)", "Sweden"),
+    ScopeOverride(9134, ScopeDecision.EXCLUDED, "NWSL", "United States"),
+    ScopeOverride(9227, ScopeDecision.EXCLUDED, "WSL", "England"),
+    ScopeOverride(9294, ScopeDecision.EXCLUDED, "WSL 2", "England"),
+    ScopeOverride(9382, ScopeDecision.EXCLUDED, "Toppserien Qualification (W)", "Norway"),
+    ScopeOverride(9500, ScopeDecision.EXCLUDED, "WE League", "Japan"),
+    ScopeOverride(9677, ScopeDecision.EXCLUDED, "Première Ligue Féminine", "France"),
+    ScopeOverride(9906, ScopeDecision.EXCLUDED, "Liga MX Femenil", "Mexico"),
+    ScopeOverride(9907, ScopeDecision.EXCLUDED, "Liga F", "Spain"),
+    ScopeOverride(9921, ScopeDecision.EXCLUDED, "SheBelieves Cup (W)", "International"),
+    ScopeOverride(10167, ScopeDecision.EXCLUDED, "NWSL Challenge Cup", "United States"),
+    ScopeOverride(10178, ScopeDecision.EXCLUDED, "Serie A Femminile", "Italy"),
+    ScopeOverride(10269, ScopeDecision.EXCLUDED, "Womens Asian Cup", "International"),
+    ScopeOverride(10289, ScopeDecision.EXCLUDED, "Eredivisie Vrouwen", "Netherlands"),
+    ScopeOverride(10308, ScopeDecision.EXCLUDED, "Eliteettan (W)", "Sweden"),
+    ScopeOverride(10316, ScopeDecision.EXCLUDED, "Damallsvenskan Qualification (W)", "Sweden"),
+    ScopeOverride(10357, ScopeDecision.EXCLUDED, "World Cup Qualification (W) UEFA", "International"),
+    ScopeOverride(
+        10359,
+        ScopeDecision.EXCLUDED,
+        "World Cup Qualification (W) Inter-Confederation",
+        "International",
+    ),
+    ScopeOverride(10434, ScopeDecision.EXCLUDED, "Serie A Femminile Qualification", "Italy"),
+    ScopeOverride(10449, ScopeDecision.EXCLUDED, "Nacional Feminino", "Portugal"),
+    ScopeOverride(
+        10498,
+        ScopeDecision.EXCLUDED,
+        "Summer Olympics Qualification CONCACAF (W)",
+        "International",
+    ),
+    # ⚠️ 10557 и 10558 ЗДЕСЬ СОЗНАТЕЛЬНО ОТСУТСТВУЮТ, хотя источник говорит female.
+    # Карточка называет их "UEFA Women's Nations League A/B Qualification", каталог
+    # срезает "Women's", и их приняли за мужские двойники 10717/10718. Оба вшиты в
+    # опечатанную SHA-256 дневную когорту #930 (dags/utils/fotmob_publication.py),
+    # причём пин продублирован в трёх независимых копиях. Их исключение уронит
+    # validate_data и остановит дневную волну, поэтому вскрытие печати вынесено в
+    # отдельную работу. Цена отсрочки — 26 матчей. См. #1139.
+    ScopeOverride(10649, ScopeDecision.EXCLUDED, "NWSL x Liga MX", "International"),
+    ScopeOverride(10651, ScopeDecision.EXCLUDED, "Copa de la Reina", "Spain"),
+    ScopeOverride(10657, ScopeDecision.EXCLUDED, "Nacional Feminino Qualification", "Portugal"),
+    ScopeOverride(10714, ScopeDecision.EXCLUDED, "1. divisjon kvinner kvalifisering", "Norway"),
+    ScopeOverride(10791, ScopeDecision.EXCLUDED, "SWPL 1", "Scotland"),
+    ScopeOverride(10872, ScopeDecision.EXCLUDED, "Northern Super League", "Canada"),
+    ScopeOverride(11013, ScopeDecision.EXCLUDED, "CONCACAF W Champions Cup", "International"),
+    ScopeOverride(11015, ScopeDecision.EXCLUDED, "Supercoppa Italiana", "Italy"),
+    ScopeOverride(11019, ScopeDecision.EXCLUDED, "SWPL Cup", "Scotland"),
+    ScopeOverride(11020, ScopeDecision.EXCLUDED, "SWF Scottish Cup", "Scotland"),
+    ScopeOverride(11028, ScopeDecision.EXCLUDED, "Coupe de France Féminine", "France"),
+    # 11029 — женский Super Cup; мужской с тем же именем и страной — 237.
+    ScopeOverride(11029, ScopeDecision.EXCLUDED, "Super Cup", "Netherlands"),
+    ScopeOverride(11315, ScopeDecision.EXCLUDED, "Concacaf W Qualifiers", "International"),
+    ScopeOverride(11839, ScopeDecision.EXCLUDED, "WSL Promotion/Relegation", "England"),
+    # Решение владельца от 07.08.2026: товарищеские матчи ВЗРОСЛЫХ МУЖСКИХ СБОРНЫХ
+    # берём в сбор. Правило exclude_friendly для них перестаёт действовать, но
+    # продолжает резать остальные три: 489 Club Friendlies (клубные, не сборные),
+    # 10312 Sidemen Charity Match и 10656 Beta Squad vs Amp Charity (шоу-матчи).
+    # 293 Women's Friendlies и 344 Friendlies U-21 режутся своими правилами.
+    ScopeOverride(
+        114,
+        ScopeDecision.INCLUDED,
+        "Friendlies",
+        "International",
+        reason="senior national-team friendlies are in scope by owner decision",
+        policy_rule="include_national_team_friendlies",
+    ),
+)
+
+
+@lru_cache(maxsize=4)
+def _override_index(
+    overrides: Tuple[ScopeOverride, ...]
+) -> Mapping[int, ScopeOverride]:
+    return {item.competition_id: item for item in overrides}
+
+
 def classify_competition(
     competition: CompetitionRef,
     *,
     hooks: Sequence[ClassifierHook] = (),
+    overrides: Sequence[ScopeOverride] = DEFAULT_SCOPE_OVERRIDES,
 ) -> ScopeClassification:
     """Apply the adult-men official-competition policy with override hooks."""
 
@@ -282,14 +424,22 @@ def classify_competition(
                 raise ValueError("classifier hook returned a decision for another competition")
             return decision
 
-    text = " ".join(
-        part
-        for part in (
-            competition.name,
-            competition.competition_type,
-            competition.age_group,
+    override = _override_index(tuple(overrides)).get(competition.competition_id)
+    if override is not None:
+        return ScopeClassification(
+            competition, override.decision, override.reason, override.policy_rule
         )
-        if part
+
+    text = _fold(
+        " ".join(
+            part
+            for part in (
+                competition.name,
+                competition.competition_type,
+                competition.age_group,
+            )
+            if part
+        )
     )
     gender = (competition.gender or "").strip().lower()
     if gender in {"female", "women", "woman", "f"} or _FEMALE_RE.search(text):
@@ -469,6 +619,8 @@ __all__ = [
     "CatalogDiscovery",
     "CatalogShapeError",
     "ClassifierHook",
+    "DEFAULT_SCOPE_OVERRIDES",
+    "ScopeOverride",
     "SelectedSeasonMismatch",
     "classify_competition",
     "competition_from_league_payload",
