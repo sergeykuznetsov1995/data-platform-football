@@ -330,7 +330,7 @@ class BoundaryCheckedTriggerDagRunOperator(TriggerDagRunOperator):
 
 
 def finalize_or_skip_rejected_launch(**context: Any) -> dict[str, Any]:
-    """Do not finalize or advance a safely rejected, never-started child."""
+    """Preserve the terminal verdict of a safely rejected child launch."""
 
     ti = context.get("ti")
     rejected = (
@@ -339,7 +339,12 @@ def finalize_or_skip_rejected_launch(**context: Any) -> dict[str, Any]:
         else None
     )
     if isinstance(rejected, Mapping) and rejected.get("state_advanced") is False:
-        raise AirflowSkipException("FotMob child launch was safely rejected")
+        verdict = rejected.get("verdict")
+        if verdict == "skipped":
+            raise AirflowSkipException("FotMob child launch was safely rejected")
+        if verdict == "failed":
+            raise AirflowException("FotMob child launch failed before child trigger")
+        raise AirflowException("FotMob rejected launch verdict is invalid")
     return fail_unsealed_fotmob_publication(
         publication_owner="isolated",
         success_task_id=TRIGGER_TASK_ID,

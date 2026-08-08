@@ -414,8 +414,13 @@ def test_pretrigger_exception_releases_generation_and_preserves_red_verdict(
         "state_advanced": False,
         "verdict": "failed",
     }
-    with pytest.raises(module.AirflowSkipException, match="safely rejected"):
+    with pytest.raises(
+        module.AirflowException, match="failed before child trigger"
+    ):
         module.finalize_or_skip_rejected_launch(ti=ti)
+    advance = _task("advance_fotmob_scheduler_state")
+    assert advance.upstream_task_ids == {"finalize_fotmob_publication"}
+    assert advance._init_kwargs.get("trigger_rule", "all_success") == "all_success"
 
 
 def test_pretrigger_final_check_orders_active_query_then_clock_then_trigger(
