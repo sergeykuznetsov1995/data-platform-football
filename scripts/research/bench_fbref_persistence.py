@@ -213,6 +213,12 @@ def _load_replay_items(html_dir: Path) -> tuple[_ReplayItem, ...]:
     return tuple(items)
 
 
+def _mean_iteration_seconds(*, elapsed_seconds: float, iterations: int) -> float:
+    """Convert a multi-iteration wall clock into one comparable replay time."""
+
+    return elapsed_seconds / iterations
+
+
 def _run_sequential(
     manager: CountingTrinoTableManager,
     *,
@@ -241,7 +247,10 @@ def _run_sequential(
                 run_id=run_id,
                 target_identity=f"benchmark:match:{item.match_id}",
             )
-    return time.perf_counter() - started
+    return _mean_iteration_seconds(
+        elapsed_seconds=time.perf_counter() - started,
+        iterations=iterations,
+    )
 
 
 def _batch_api_available() -> bool:
@@ -303,7 +312,10 @@ def _run_batch(
             )
         generic_writer.persist_pages(generic_items)
         typed_writer.persist_matches(typed_items)
-    return time.perf_counter() - started
+    return _mean_iteration_seconds(
+        elapsed_seconds=time.perf_counter() - started,
+        iterations=iterations,
+    )
 
 
 def _normalized_value(value: Any) -> Any:

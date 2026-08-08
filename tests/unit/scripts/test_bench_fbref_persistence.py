@@ -2,7 +2,10 @@
 
 import pytest
 
-from scripts.research.bench_fbref_persistence import evaluate_gate
+from scripts.research.bench_fbref_persistence import (
+    _mean_iteration_seconds,
+    evaluate_gate,
+)
 
 
 @pytest.mark.unit
@@ -31,3 +34,10 @@ def test_gate_requires_zero_network_and_four_x_speedup():
     )
     assert report.seconds_per_match == pytest.approx(8.0)
     assert report.passed is True
+
+
+@pytest.mark.unit
+def test_iteration_timings_are_meaned_before_gate_evaluation():
+    assert _mean_iteration_seconds(elapsed_seconds=30.0, iterations=3) == (
+        pytest.approx(10.0)
+    )
