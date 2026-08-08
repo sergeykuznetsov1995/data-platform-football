@@ -170,3 +170,42 @@ def test_extractor_skips_window_function_aliases():
         "Window-function alias 'rn' must not be attributed to bronze"
     )
     assert "game_id" in refs["understat_player_match_stats"]
+
+
+@pytest.mark.unit
+def test_extractor_skips_unnest_value_and_ordinality_aliases_through_cte():
+    """UNNEST aliases are derived values, not Bronze schedule columns.
+
+    Trino's AST stores the value alias in ``Unnest.alias.columns`` and the
+    WITH ORDINALITY alias separately in ``Unnest.offset``.  Both must survive
+    CTE passthrough without being attributed to the Bronze source.
+    """
+    sql = """
+    WITH bronze_src_schedule AS (
+        SELECT * FROM iceberg.bronze.espn_schedule_generation_v2
+    ),
+    schedule_dedup AS (
+        SELECT *
+        FROM (
+            SELECT b.*, ROW_NUMBER() OVER (
+                PARTITION BY event_id ORDER BY _ingested_at DESC
+            ) AS rn
+            FROM bronze_src_schedule b
+        )
+        WHERE rn = 1
+    ),
+    event_details AS (
+        SELECT s.*, detail, seq
+        FROM schedule_dedup s
+        CROSS JOIN UNNEST(
+            CAST(json_extract(s.extra_json, '$.competition.details') AS array<json>)
+        ) WITH ORDINALITY AS u(detail, seq)
+    )
+    SELECT events.event_id, events.seq, events.detail FROM event_details events
+    """
+    refs = collect_bronze_refs(sql)
+
+    schedule_refs = refs["espn_schedule_generation_v2"]
+    assert {"event_id", "extra_json"} <= schedule_refs
+    assert "detail" not in schedule_refs
+    assert "seq" not in schedule_refs

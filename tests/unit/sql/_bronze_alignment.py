@@ -157,6 +157,10 @@ def collect_bronze_refs(sql: str) -> Dict[str, Set[str]]:
                 actual_aliases.add(alias_node.name)
             for col in getattr(alias_node, "columns", []):
                 unnest_introduced.add(col.name)
+            offset = unnest.args.get("offset")
+            offset_name = getattr(offset, "name", None)
+            if offset_name:
+                unnest_introduced.add(offset_name)
 
         scope_aliases: Dict[str, Tuple[str, Set[str]]] = {}
         for alias in actual_aliases:
