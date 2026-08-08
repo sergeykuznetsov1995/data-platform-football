@@ -34,6 +34,9 @@ def test_gate_deduplicates_schedule_match_keys_and_emits_competition_plus_total(
     assert "schedule_rank = 1" in sql
     assert "grouping sets" in sql
     assert "total" in sql
+    assert "current_run_matches" in sql
+    assert "iceberg.bronze.fbref_page_manifest" in sql
+    assert "manifest.run_id = cast(:control_run_id as varchar)" in sql
 
 
 @pytest.mark.unit
@@ -52,6 +55,7 @@ def test_gate_requires_all_eight_dataset_decisions_and_direct_or_empty_proof():
 
     assert all(f"('{dataset}'" in sql for dataset in datasets)
     assert "availability_decisions = 8" in sql
+    assert "current_run_match_rows = 1" in sql
     assert "availability = 'available'" in sql
     assert "typed_rows > 0" in sql
     assert re.search(
@@ -66,6 +70,7 @@ def test_gate_requires_all_eight_dataset_decisions_and_direct_or_empty_proof():
     assert "nullif(trim(availability.reason), '') is not null" in sql
     assert all(f"fbref_{dataset}" in sql for dataset in datasets)
     assert "manifest.parser_version = observation.typed_parser_version" in sql
+    assert "_batch_id = cast(:control_run_id as varchar)" in sql
 
 
 @pytest.mark.unit

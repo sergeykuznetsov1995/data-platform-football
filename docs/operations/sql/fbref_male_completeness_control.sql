@@ -265,6 +265,25 @@ WITH required_seasons(source_season_id) AS (
     FROM schedule_ranked
     WHERE schedule_rank = 1
       AND nullif(trim(score), '') IS NOT NULL
+), current_run_matches AS (
+    SELECT regexp_extract(
+               manifest.target_id, '^fbref:match:([^:]+)$', 1
+           ) AS match_id,
+           count(*) AS current_run_match_rows,
+           count_if(
+               manifest.parse_status <> 'succeeded'
+               OR manifest.persist_status <> 'succeeded'
+               OR manifest.validation_status <> 'succeeded'
+           ) AS invalid_current_run_match_rows
+    FROM iceberg.bronze.fbref_page_manifest AS manifest
+    WHERE manifest.run_id = CAST(:control_run_id AS varchar)
+      AND manifest.page_kind = 'match'
+      AND regexp_extract(
+              manifest.target_id, '^fbref:match:([^:]+)$', 1
+          ) IS NOT NULL
+    GROUP BY regexp_extract(
+                 manifest.target_id, '^fbref:match:([^:]+)$', 1
+             )
 ), availability_ranked AS (
     SELECT match_id, dataset, availability, reason, _ingested_at,
            row_number() OVER (
@@ -273,37 +292,58 @@ WITH required_seasons(source_season_id) AS (
            ) AS availability_rank
     FROM iceberg.bronze.fbref_dataset_availability
     WHERE dataset IN (SELECT dataset FROM match_datasets)
+      AND _batch_id = CAST(:control_run_id AS varchar)
 ), availability AS (
     SELECT match_id, dataset, availability, reason
     FROM availability_ranked
     WHERE availability_rank = 1
 ), typed_rows AS (
     SELECT match_id, 'shot_events' AS dataset, count(*) AS typed_rows
-      FROM iceberg.bronze.fbref_shot_events GROUP BY match_id
+      FROM iceberg.bronze.fbref_shot_events
+     WHERE _batch_id = CAST(:control_run_id AS varchar)
+     GROUP BY match_id
     UNION ALL
     SELECT match_id, 'match_events', count(*)
-      FROM iceberg.bronze.fbref_match_events GROUP BY match_id
+      FROM iceberg.bronze.fbref_match_events
+     WHERE _batch_id = CAST(:control_run_id AS varchar)
+     GROUP BY match_id
     UNION ALL
     SELECT match_id, 'lineups', count(*)
-      FROM iceberg.bronze.fbref_lineups GROUP BY match_id
+      FROM iceberg.bronze.fbref_lineups
+     WHERE _batch_id = CAST(:control_run_id AS varchar)
+     GROUP BY match_id
     UNION ALL
     SELECT match_id, 'match_team_stats', count(*)
-      FROM iceberg.bronze.fbref_match_team_stats GROUP BY match_id
+      FROM iceberg.bronze.fbref_match_team_stats
+     WHERE _batch_id = CAST(:control_run_id AS varchar)
+     GROUP BY match_id
     UNION ALL
     SELECT match_id, 'match_managers', count(*)
-      FROM iceberg.bronze.fbref_match_managers GROUP BY match_id
+      FROM iceberg.bronze.fbref_match_managers
+     WHERE _batch_id = CAST(:control_run_id AS varchar)
+     GROUP BY match_id
     UNION ALL
     SELECT match_id, 'match_officials', count(*)
-      FROM iceberg.bronze.fbref_match_officials GROUP BY match_id
+      FROM iceberg.bronze.fbref_match_officials
+     WHERE _batch_id = CAST(:control_run_id AS varchar)
+     GROUP BY match_id
     UNION ALL
     SELECT match_id, 'match_keeper_stats', count(*)
-      FROM iceberg.bronze.fbref_match_keeper_stats GROUP BY match_id
+      FROM iceberg.bronze.fbref_match_keeper_stats
+     WHERE _batch_id = CAST(:control_run_id AS varchar)
+     GROUP BY match_id
     UNION ALL
     SELECT match_id, 'match_player_stats', count(*)
-      FROM iceberg.bronze.fbref_match_player_stats GROUP BY match_id
+      FROM iceberg.bronze.fbref_match_player_stats
+     WHERE _batch_id = CAST(:control_run_id AS varchar)
+     GROUP BY match_id
 ), match_proof AS (
     SELECT played.source_competition_id, played.source_season_id,
            played.match_id,
+           max(coalesce(current.current_run_match_rows, 0))
+               AS current_run_match_rows,
+           max(coalesce(current.invalid_current_run_match_rows, 1))
+               AS invalid_current_run_match_rows,
            count_if(availability.dataset IS NOT NULL)
                AS availability_decisions,
            count_if(
@@ -336,6 +376,8 @@ WITH required_seasons(source_season_id) AS (
            ) AS explicitly_empty_datasets
     FROM played
     CROSS JOIN match_datasets AS required
+    LEFT JOIN current_run_matches AS current
+      ON current.match_id = played.match_id
     LEFT JOIN availability
       ON availability.match_id = played.match_id
      AND availability.dataset = required.dataset
@@ -351,11 +393,15 @@ WITH required_seasons(source_season_id) AS (
            count(DISTINCT published.source_season_id) AS published_scope_rows,
            count(DISTINCT played.match_id) AS played_matches,
            count(DISTINCT proof.match_id) FILTER (
-               WHERE proof.availability_decisions = 8
+               WHERE proof.current_run_match_rows = 1
+                 AND proof.invalid_current_run_match_rows = 0
+                 AND proof.availability_decisions = 8
                  AND proof.invalid_dataset_decisions = 0
            ) AS fully_proved_matches,
            count(DISTINCT proof.match_id) FILTER (
-               WHERE proof.availability_decisions <> 8
+               WHERE proof.current_run_match_rows <> 1
+                  OR proof.invalid_current_run_match_rows <> 0
+                  OR proof.availability_decisions <> 8
                   OR proof.invalid_dataset_decisions <> 0
            ) AS unproved_matches,
            (

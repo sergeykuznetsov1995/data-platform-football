@@ -11,6 +11,7 @@ from scripts.research.bench_fbref_persistence import (
     AcceptanceBaseline,
     BenchmarkConfig,
     ControlRunEvidence,
+    PipelineRunMetrics,
     PersistenceRun,
     StatementCounts,
     TableDigest,
@@ -22,6 +23,7 @@ from scripts.research.bench_fbref_persistence import (
     _sentinel_digests,
     _mean_iteration_seconds,
     _table_digests,
+    _validate_trino_match_cohort,
     evaluate_gate,
     evaluate_existing_pipeline_acceptance,
     run_benchmark,
@@ -385,28 +387,44 @@ def test_benchmark_restores_trino_logger_when_persistence_fails(
 class _DifferentialManager:
     catalog = "iceberg"
 
-    def __init__(self, *, nonzero_query=None):
+    def __init__(self, *, nonzero_query=None, trino_match_ids=("m1",)):
         self.queries = []
         self.nonzero_query = nonzero_query
+        self.trino_match_ids = tuple(trino_match_ids)
 
     def table_exists(self, _schema, _table):
         return True
 
-    def get_table_columns(self, _schema, _table):
+    def get_table_columns(self, _schema, table):
+        if table in BENCHMARK_TABLES[:3]:
+            return {
+                "target_id": "VARCHAR",
+                "run_id": "VARCHAR",
+                "persisted_at": "TIMESTAMP(6)",
+            }
         return {
-            "target_id": "VARCHAR",
             "match_id": "VARCHAR",
             "_batch_id": "VARCHAR",
             "_ingested_at": "TIMESTAMP(6)",
-            "persisted_at": "TIMESTAMP(6)",
         }
 
     def _execute(self, sql, fetch=False, params=None):
         self.queries.append((sql, params))
         if '$snapshots"' in sql:
             return [(101,)]
+        if "AS acceptance_match_id" in sql:
+            return [(match_id,) for match_id in self.trino_match_ids]
         if "WHERE target_id = ?" in sql or "WHERE match_id = ?" in sql:
             return [("sentinel", "batch")]
+        if sql.startswith("SELECT ") and "SELECT count(*)" not in sql:
+            table = next(table for table in BENCHMARK_TABLES if table in sql)
+            run_id = "run-one" if ".sequential." in sql else "run-two"
+            identity = (
+                "fbref:match:m1"
+                if table in BENCHMARK_TABLES[:3]
+                else "m1"
+            )
+            return [(identity, run_id)]
         value = 1 if self.nonzero_query and self.nonzero_query in sql else 0
         return [(value,)]
 
@@ -422,11 +440,77 @@ def test_all_12_tables_use_dynamic_columns_and_bidirectional_except_all():
     queries = [sql for sql, _params in manager.queries]
     assert len(queries) == 24
     assert all("EXCEPT ALL" in sql for sql in queries)
-    assert all('"match_id"' in sql and '"_batch_id"' in sql for sql in queries)
+    assert all(
+        ('"target_id"' in sql and '"run_id"' in sql)
+        or ('"match_id"' in sql and '"_batch_id"' in sql)
+        for sql in queries
+    )
     assert all('"_ingested_at"' not in sql for sql in queries)
     assert all('"persisted_at"' not in sql for sql in queries)
     assert all(diff.sequential_minus_batch == 0 for diff in diffs.values())
     assert all(diff.batch_minus_sequential == 0 for diff in diffs.values())
+
+
+@pytest.mark.unit
+def test_distinct_control_run_ids_are_verified_then_canonicalized_in_diffs():
+    manager = _DifferentialManager()
+
+    diffs = _bidirectional_table_diffs(
+        manager,
+        "sequential",
+        "batch",
+        sequential_run_id="run-one",
+        batch_run_id="run-two",
+        sentinel_match_id="outside-match",
+    )
+
+    assert set(diffs) == set(BENCHMARK_TABLES)
+    lineage_queries = [
+        (sql, params)
+        for sql, params in manager.queries
+        if "IS DISTINCT FROM ?" in sql and "EXCEPT ALL" not in sql
+    ]
+    diff_queries = [
+        (sql, params)
+        for sql, params in manager.queries
+        if "EXCEPT ALL" in sql
+    ]
+    assert len(lineage_queries) == 24
+    assert len(diff_queries) == 24
+    assert all("CASE WHEN" in sql for sql, _params in diff_queries)
+    assert all("__fbref_acceptance_run__" in sql for sql, _params in diff_queries)
+    assert any("run-one" in params for _sql, params in diff_queries)
+    assert any("run-two" in params for _sql, params in diff_queries)
+
+
+@pytest.mark.unit
+def test_unexpected_cohort_lineage_fails_closed_before_comparison():
+    manager = _DifferentialManager(nonzero_query="IS DISTINCT FROM")
+
+    with pytest.raises(ValueError, match="unexpected run lineage"):
+        _bidirectional_table_diffs(
+            manager,
+            "sequential",
+            "batch",
+            sequential_run_id="run-one",
+            batch_run_id="run-two",
+            sentinel_match_id="outside-match",
+        )
+
+
+@pytest.mark.unit
+def test_trino_page_manifest_must_equal_the_direct_control_match_cohort():
+    evidence = _control_run_evidence(_DirectControl(), "run-one")
+    manager = _DifferentialManager(trino_match_ids=())
+
+    with pytest.raises(ValueError, match="Trino match cohort"):
+        _validate_trino_match_cohort(
+            manager,
+            schema="sequential",
+            expected_run_id="run-one",
+            sentinel_match_id="outside-match",
+            control_evidence=evidence,
+        )
 
 
 @pytest.mark.unit
@@ -494,8 +578,22 @@ class _DirectControl:
             "bytes_used": 0,
             "metadata": {
                 "bronze_acceptance_replay": {
+                    "schema_version": "fbref-bronze-acceptance-replay-v1",
                     "status": "passed",
                     "processing_control_run_id": run_id,
+                    "strict_gates": {
+                        "source_acceptance_status": "passed",
+                        "network_attempts": 0,
+                        "requests_used": 0,
+                        "bytes_used": 0,
+                        "request_limit": 0,
+                        "byte_limit": 0,
+                        "replay_candidates_remaining": 0,
+                        "raw_audit_status": "passed",
+                        "raw_zero_delta_required": True,
+                        "raw_audited_attempt_count": 1,
+                        "raw_audit_artifact_sha256": "a" * 64,
+                    },
                 }
             },
         }
@@ -561,9 +659,40 @@ def test_control_evidence_reads_run_summary_and_rows_directly():
     assert evidence.valid is True
     assert evidence.logical_refreshes == 1
     assert evidence.dataset_manifests == 8
+    assert evidence.match_targets == 1
+    assert evidence.match_keys_sha256
     assert evidence.observation_sha256
     assert evidence.manifest_sha256
     assert evidence.latest_state_sha256
+
+
+@pytest.mark.unit
+def test_control_evidence_rejects_an_unversioned_strict_marker():
+    class Unversioned(_DirectControl):
+        def get_run(self, run_id):
+            run = super().get_run(run_id)
+            del run["metadata"]["bronze_acceptance_replay"]["schema_version"]
+            return run
+
+    evidence = _control_run_evidence(Unversioned(), "run-one")
+
+    assert evidence.valid is False
+    assert "strict_acceptance_missing" in evidence.failures
+
+
+@pytest.mark.unit
+def test_control_evidence_rejects_an_incomplete_strict_gate():
+    class Incomplete(_DirectControl):
+        def get_run(self, run_id):
+            run = super().get_run(run_id)
+            strict = run["metadata"]["bronze_acceptance_replay"]
+            del strict["strict_gates"]["network_attempts"]
+            return run
+
+    evidence = _control_run_evidence(Incomplete(), "run-one")
+
+    assert evidence.valid is False
+    assert "strict_acceptance_gates_invalid" in evidence.failures
 
 
 @pytest.mark.unit
@@ -630,6 +759,47 @@ def test_postgres_control_evidence_uses_actual_replay_processing_rows():
 
 
 @pytest.mark.unit
+def _run_metrics(
+    *,
+    control_run_id,
+    schema,
+    mode,
+    seconds,
+    evidence,
+    statement_counts,
+):
+    return PipelineRunMetrics(
+        control_run_id=control_run_id,
+        schema=schema,
+        mode=mode,
+        elapsed_seconds=seconds,
+        match_count=evidence.match_targets,
+        match_keys_sha256=evidence.match_keys_sha256,
+        statement_counts=statement_counts,
+    )
+
+
+@pytest.mark.unit
+def test_pipeline_metrics_reject_zero_statement_or_unbound_artifacts():
+    with pytest.raises(ValueError, match="statement counts"):
+        PipelineRunMetrics.from_mapping(
+            {
+                "schema_version": "fbref-pipeline-run-metrics-v1",
+                "control_run_id": "run-one",
+                "schema": "sequential",
+                "mode": "sequential",
+                "elapsed_seconds": 80.0,
+                "match_count": 1,
+                "match_keys_sha256": "a" * 64,
+                "statement_counts": {
+                    "execute": 0,
+                    "execute_committing": 0,
+                },
+            }
+        )
+
+
+@pytest.mark.unit
 def test_real_pipeline_evidence_mode_is_read_only_and_has_one_strict_verdict():
     manager = _DifferentialManager()
     control = _DirectControl()
@@ -648,6 +818,8 @@ def test_real_pipeline_evidence_mode_is_read_only_and_has_one_strict_verdict():
         sentinels=baseline_sentinels,
     )
     manager.queries.clear()
+    sequential_evidence = _control_run_evidence(_DirectControl(), "run-one")
+    batch_evidence = _control_run_evidence(_DirectControl(), "run-two")
 
     report = evaluate_existing_pipeline_acceptance(
         manager=manager,
@@ -656,11 +828,22 @@ def test_real_pipeline_evidence_mode_is_read_only_and_has_one_strict_verdict():
         batch_schema="batch",
         sequential_control_run_id="run-one",
         batch_control_run_id="run-two",
-        sequential_seconds=80.0,
-        batch_seconds=16.0,
-        matches=2,
-        sequential_statement_counts=StatementCounts(120, 24),
-        batch_statement_counts=StatementCounts(20, 4),
+        sequential_metrics=_run_metrics(
+            control_run_id="run-one",
+            schema="sequential",
+            mode="sequential",
+            seconds=80.0,
+            evidence=sequential_evidence,
+            statement_counts=StatementCounts(120, 24),
+        ),
+        batch_metrics=_run_metrics(
+            control_run_id="run-two",
+            schema="batch",
+            mode="batch",
+            seconds=16.0,
+            evidence=batch_evidence,
+            statement_counts=StatementCounts(20, 4),
+        ),
         sequential_baseline=sequential_baseline,
         batch_baseline=batch_baseline,
         sentinel_match_id=sentinel,
@@ -668,6 +851,7 @@ def test_real_pipeline_evidence_mode_is_read_only_and_has_one_strict_verdict():
     rendered = report.to_dict()
 
     assert rendered["passed"] is True
+    assert rendered["matches"] == 1
     assert len(rendered["table_diffs"]) == 12
     assert rendered["sentinels_preserved"] is True
     assert rendered["control_equivalent"] is True
@@ -687,6 +871,62 @@ def test_real_pipeline_evidence_mode_is_read_only_and_has_one_strict_verdict():
         )
         for sql, _params in manager.queries
     )
+
+
+@pytest.mark.unit
+def test_real_pipeline_rejects_metrics_for_a_different_match_cohort():
+    manager = _DifferentialManager()
+    control = _DirectControl()
+    sentinel = "outside-match"
+    sentinels = _sentinel_digests(manager, "sequential", sentinel)
+    sequential_evidence = _control_run_evidence(_DirectControl(), "run-one")
+    batch_evidence = _control_run_evidence(_DirectControl(), "run-two")
+    sequential_metrics = _run_metrics(
+        control_run_id="run-one",
+        schema="sequential",
+        mode="sequential",
+        seconds=80.0,
+        evidence=sequential_evidence,
+        statement_counts=StatementCounts(120, 24),
+    )
+    sequential_metrics = PipelineRunMetrics(
+        **{
+            **sequential_metrics.to_dict(),
+            "match_count": 2,
+        }
+    )
+
+    with pytest.raises(ValueError, match="match cohort"):
+        evaluate_existing_pipeline_acceptance(
+            manager=manager,
+            control=control,
+            sequential_schema="sequential",
+            batch_schema="batch",
+            sequential_control_run_id="run-one",
+            batch_control_run_id="run-two",
+            sequential_metrics=sequential_metrics,
+            batch_metrics=_run_metrics(
+                control_run_id="run-two",
+                schema="batch",
+                mode="batch",
+                seconds=16.0,
+                evidence=batch_evidence,
+                statement_counts=StatementCounts(20, 4),
+            ),
+            sequential_baseline=AcceptanceBaseline(
+                schema="sequential",
+                sentinel_match_id=sentinel,
+                snapshots={table: 100 for table in BENCHMARK_TABLES},
+                sentinels=sentinels,
+            ),
+            batch_baseline=AcceptanceBaseline(
+                schema="batch",
+                sentinel_match_id=sentinel,
+                snapshots={table: 100 for table in BENCHMARK_TABLES},
+                sentinels=sentinels,
+            ),
+            sentinel_match_id=sentinel,
+        )
 
 
 @pytest.mark.unit

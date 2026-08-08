@@ -200,6 +200,11 @@ def test_rollout_runbook_has_staged_go_and_rollback_contract():
     assert "fbref_batch_persist=1" in lowered
     assert "except all" in lowered
     assert "12" in text and "sentinel" in lowered and "snapshot" in lowered
+    assert "--sequential-metrics" in lowered
+    assert "--batch-metrics" in lowered
+    assert "--sequential-seconds" not in lowered
+    assert "match-key sha-256" in lowered
+    assert "current-run page manifest" in lowered
     assert "4×" in text and "20 seconds" in lowered
     assert "1,500" in text
     assert "100 requests / 50 mib" in lowered

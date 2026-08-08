@@ -64,6 +64,11 @@ Never point this stage at a fetch DAG or the proxy filter.
 4. Restore the identical control/raw baseline, then run it in the second
    schema with `FBREF_BATCH_PERSIST=1`. Keep the same frozen cohort and parser
    versions. Both replays must show zero proxy requests and zero proxy bytes.
+   The replay launcher must write a protected metrics artifact for each run;
+   hand-entered times, match counts, or statement counts are not accepted.
+   Each artifact uses schema version `fbref-pipeline-run-metrics-v1` and binds
+   its mode, Trino schema, control run ID, elapsed seconds, positive statement
+   counts, match count, and match-key SHA-256 to that exact replay.
 5. Run the strict persistence evidence tool with both control run IDs. It must
    use dynamic installed columns, excluding only `_ingested_at` and
    `persisted_at`, and execute `EXCEPT ALL` in both directions for every one of
@@ -76,9 +81,15 @@ Never point this stage at a fetch DAG or the proxy filter.
      --batch-control-run-id BATCH_RUN_ID --sentinel-match-id OUTSIDE_MATCH \
      --sequential-baseline SEQUENTIAL_BASELINE_JSON \
      --batch-baseline BATCH_BASELINE_JSON \
-     --sequential-seconds SEQUENTIAL_SECONDS --batch-seconds BATCH_SECONDS \
-     --matches MATCH_COUNT --output STRICT_EVIDENCE_JSON
+     --sequential-metrics SEQUENTIAL_METRICS_JSON \
+     --batch-metrics BATCH_METRICS_JSON --output STRICT_EVIDENCE_JSON
    ```
+
+The evidence tool rejects a metrics file if its control run ID, mode, schema,
+match count, or match-key digest differs from direct PostgreSQL evidence. It
+also verifies that every non-sentinel Trino row carries that replay's own
+`run_id`/`_batch_id`; only then does it map the two distinct IDs to one
+comparison token. The lineage columns remain in the comparison.
 
 The saved JSON must contain both elapsed times, Trino statement counts,
 Iceberg snapshot before/after evidence, unchanged sentinel digests, direct
@@ -95,7 +106,8 @@ engines. Every active/present male competition is crossed with source seasons
 `2025-2026` and `2026-2027`; there is no hand-written competition count.
 
 Every row, including `TOTAL`, must be `PASS`. This proves deduplicated schedule
-keys, all eight dataset decisions per played match, physical rows for
+keys, a successful current-run page manifest for every played match, all eight
+current-run dataset decisions per played match, current-run physical rows for
 `available`, a nonblank reason plus zero rows for explicit empty results, and
 direct durable/dead control evidence. Save both result sets with the replay
 JSON.

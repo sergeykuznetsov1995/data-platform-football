@@ -12,6 +12,7 @@ import gzip
 import hashlib
 import json
 import logging
+import math
 import sys
 import time
 from contextlib import contextmanager
@@ -54,12 +55,24 @@ BENCHMARK_TABLES = (
     *MATCH_DATASET_TABLES.values(),
     MATCH_AVAILABILITY_TABLE,
 )
+GENERIC_BENCHMARK_TABLES = frozenset(
+    {TABLE_CELLS_TABLE, TABLE_INVENTORY_TABLE, PAGE_MANIFEST_TABLE}
+)
+ACCEPTANCE_RUN_TOKEN = "__fbref_acceptance_run__"
 OFFLINE_CONTEXT = TypedSourceContext(
     source_competition_id="9",
     source_season_id="2025-2026",
     competition_name="Premier League",
     season_label="2025-2026",
 )
+
+
+def _is_sha256(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 @dataclass(frozen=True)
@@ -93,6 +106,91 @@ class StatementCounts:
 
 
 @dataclass(frozen=True)
+class PipelineRunMetrics:
+    """Run-bound timing and Trino statement evidence from the replay runner."""
+
+    control_run_id: str
+    schema: str
+    mode: str
+    elapsed_seconds: float
+    match_count: int
+    match_keys_sha256: str
+    statement_counts: StatementCounts
+    schema_version: str = "fbref-pipeline-run-metrics-v1"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "PipelineRunMetrics":
+        required_fields = {
+            "schema_version",
+            "control_run_id",
+            "schema",
+            "mode",
+            "elapsed_seconds",
+            "match_count",
+            "match_keys_sha256",
+            "statement_counts",
+        }
+        if set(value) != required_fields:
+            raise ValueError("pipeline metrics fields are invalid")
+        if value.get("schema_version") != "fbref-pipeline-run-metrics-v1":
+            raise ValueError("pipeline metrics schema version is invalid")
+        control_run_id = value.get("control_run_id")
+        schema = value.get("schema")
+        mode = value.get("mode")
+        elapsed_seconds = value.get("elapsed_seconds")
+        match_count = value.get("match_count")
+        match_keys_sha256 = value.get("match_keys_sha256")
+        counts = value.get("statement_counts")
+        if not isinstance(control_run_id, str) or not control_run_id.strip():
+            raise ValueError("pipeline metrics control run ID is invalid")
+        if not isinstance(schema, str) or not schema.strip():
+            raise ValueError("pipeline metrics schema is invalid")
+        if mode not in {"sequential", "batch"}:
+            raise ValueError("pipeline metrics mode is invalid")
+        if (
+            isinstance(elapsed_seconds, bool)
+            or not isinstance(elapsed_seconds, (int, float))
+            or not math.isfinite(float(elapsed_seconds))
+            or float(elapsed_seconds) <= 0
+        ):
+            raise ValueError("pipeline metrics elapsed seconds are invalid")
+        if (
+            isinstance(match_count, bool)
+            or not isinstance(match_count, int)
+            or match_count < 1
+        ):
+            raise ValueError("pipeline metrics match count is invalid")
+        if not _is_sha256(match_keys_sha256):
+            raise ValueError("pipeline metrics match digest is invalid")
+        if not isinstance(counts, Mapping):
+            raise ValueError("pipeline metrics statement counts are invalid")
+        if set(counts) != {"execute", "execute_committing"}:
+            raise ValueError("pipeline metrics statement counts are invalid")
+        execute = counts.get("execute")
+        committing = counts.get("execute_committing")
+        if any(
+            isinstance(item, bool) or not isinstance(item, int) or item < 0
+            for item in (execute, committing)
+        ) or int(execute) + int(committing) <= 0:
+            raise ValueError("pipeline metrics statement counts are invalid")
+        return cls(
+            control_run_id=control_run_id,
+            schema=schema,
+            mode=mode,
+            elapsed_seconds=float(elapsed_seconds),
+            match_count=match_count,
+            match_keys_sha256=match_keys_sha256,
+            statement_counts=StatementCounts(
+                execute=execute,
+                execute_committing=committing,
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class TableDigest:
     present: bool
     rows: int | None
@@ -120,6 +218,8 @@ class ControlRunEvidence:
     proxy_bytes: int
     logical_refreshes: int
     dataset_manifests: int
+    match_targets: int
+    match_keys_sha256: str
     observation_sha256: str
     manifest_sha256: str
     latest_state_sha256: str
@@ -157,22 +257,44 @@ class AcceptanceBaseline:
         for table, item in sentinels.items():
             if not isinstance(item, Mapping):
                 raise ValueError("acceptance sentinel evidence is invalid")
+            present = item.get("present")
+            rows = item.get("rows")
+            sha256 = item.get("sha256")
+            if not isinstance(present, bool):
+                raise ValueError("acceptance sentinel presence is invalid")
+            if rows is not None and (
+                isinstance(rows, bool) or not isinstance(rows, int) or rows < 0
+            ):
+                raise ValueError("acceptance sentinel row count is invalid")
+            if sha256 is not None and (
+                not isinstance(sha256, str)
+                or len(sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in sha256
+                )
+            ):
+                raise ValueError("acceptance sentinel digest is invalid")
+            if present and (rows is None or sha256 is None):
+                raise ValueError("acceptance sentinel evidence is incomplete")
             parsed_sentinels[str(table)] = TableDigest(
-                present=bool(item.get("present")),
-                rows=(None if item.get("rows") is None else int(item["rows"])),
-                sha256=(
-                    None
-                    if item.get("sha256") is None
-                    else str(item["sha256"])
-                ),
+                present=present,
+                rows=rows,
+                sha256=sha256,
             )
+        parsed_snapshots = {}
+        for table, snapshot_id in snapshots.items():
+            if snapshot_id is not None and (
+                isinstance(snapshot_id, bool)
+                or not isinstance(snapshot_id, int)
+                or snapshot_id < 0
+            ):
+                raise ValueError("acceptance snapshot ID is invalid")
+            parsed_snapshots[str(table)] = snapshot_id
         return cls(
             schema=str(value.get("schema") or ""),
             sentinel_match_id=str(value.get("sentinel_match_id") or ""),
-            snapshots={
-                str(table): None if item is None else int(item)
-                for table, item in snapshots.items()
-            },
+            snapshots=parsed_snapshots,
             sentinels=parsed_sentinels,
         )
 
@@ -443,7 +565,12 @@ def _normalized_value(value: Any) -> Any:
 
 
 def _normalized_rows(
-    columns: Iterable[str], rows: Iterable[Sequence[Any]]
+    columns: Iterable[str],
+    rows: Iterable[Sequence[Any]],
+    *,
+    table: str | None = None,
+    expected_run_id: str | None = None,
+    sentinel_match_id: str | None = None,
 ) -> list[str]:
     kept_columns = [
         column
@@ -456,6 +583,18 @@ def _normalized_rows(
             column: _normalized_value(value)
             for column, value in zip(kept_columns, row)
         }
+        if expected_run_id is not None:
+            if table is None or sentinel_match_id is None:
+                raise ValueError("run-normalized digest requires a sentinel")
+            names = {name.casefold(): name for name in record}
+            sentinel_column = names[_sentinel_column(table)]
+            lineage_column = names[_lineage_column(table)]
+            if (
+                record[sentinel_column]
+                != _sentinel_value(table, sentinel_match_id)
+                and record[lineage_column] == expected_run_id
+            ):
+                record[lineage_column] = ACCEPTANCE_RUN_TOKEN
         normalized.append(
             json.dumps(
                 record,
@@ -469,8 +608,14 @@ def _normalized_rows(
 
 
 def _table_digests(
-    manager: CountingTrinoTableManager, schema: str
+    manager: CountingTrinoTableManager,
+    schema: str,
+    *,
+    expected_run_id: str | None = None,
+    sentinel_match_id: str | None = None,
 ) -> dict[str, TableDigest]:
+    if (expected_run_id is None) != (sentinel_match_id is None):
+        raise ValueError("run-normalized digest arguments are incomplete")
     digests: dict[str, TableDigest] = {}
     for table in BENCHMARK_TABLES:
         if not manager.table_exists(schema, table):
@@ -493,7 +638,13 @@ def _table_digests(
         rows = manager._execute(
             f"SELECT {selected} FROM {qualified}", fetch=True
         )
-        normalized = _normalized_rows(kept_columns, rows or ())
+        normalized = _normalized_rows(
+            kept_columns,
+            rows or (),
+            table=table,
+            expected_run_id=expected_run_id,
+            sentinel_match_id=sentinel_match_id,
+        )
         payload = "\n".join(normalized).encode("utf-8")
         digests[table] = TableDigest(
             present=True,
@@ -535,6 +686,135 @@ def _comparison_columns(
     return columns
 
 
+def _lineage_column(table: str) -> str:
+    return "run_id" if table in GENERIC_BENCHMARK_TABLES else "_batch_id"
+
+
+def _comparison_projection(
+    columns: Sequence[str],
+    *,
+    table: str,
+    expected_run_id: str | None,
+    sentinel_match_id: str | None,
+) -> tuple[str, tuple[Any, ...]]:
+    if expected_run_id is None:
+        if sentinel_match_id is not None:
+            raise ValueError("run-aware comparison arguments are incomplete")
+        return ", ".join(f'"{column}"' for column in columns), ()
+    if not expected_run_id or sentinel_match_id is None:
+        raise ValueError("run-aware comparison arguments are incomplete")
+    names = {column.casefold(): column for column in columns}
+    lineage_name = names.get(_lineage_column(table))
+    sentinel_name = names.get(_sentinel_column(table))
+    if lineage_name is None or sentinel_name is None:
+        raise ValueError(f"benchmark table {table!r} has no lineage columns")
+    selected = []
+    params: list[Any] = []
+    for column in columns:
+        if column == lineage_name:
+            selected.append(
+                "CASE WHEN "
+                f'"{sentinel_name}" IS DISTINCT FROM ? '
+                f'AND "{lineage_name}" = ? '
+                f"THEN '{ACCEPTANCE_RUN_TOKEN}' "
+                f'ELSE "{lineage_name}" END AS "{lineage_name}"'
+            )
+            params.extend(
+                (_sentinel_value(table, sentinel_match_id), expected_run_id)
+            )
+        else:
+            selected.append(f'"{column}"')
+    return ", ".join(selected), tuple(params)
+
+
+def _validate_run_lineage(
+    manager: CountingTrinoTableManager,
+    *,
+    schema: str,
+    expected_run_id: str,
+    sentinel_match_id: str,
+) -> None:
+    """Reject every non-sentinel row not owned by the expected replay."""
+
+    if not expected_run_id or not sentinel_match_id:
+        raise ValueError("expected run lineage and sentinel must be nonblank")
+    for table in BENCHMARK_TABLES:
+        if not manager.table_exists(schema, table):
+            raise ValueError(f"missing required benchmark table {table!r}")
+        columns = manager.get_table_columns(schema, table)
+        names = {name.casefold(): name for name in columns}
+        lineage_name = names.get(_lineage_column(table))
+        sentinel_name = names.get(_sentinel_column(table))
+        if lineage_name is None or sentinel_name is None:
+            raise ValueError(f"benchmark table {table!r} has no lineage columns")
+        qualified = validate_catalog_qualified_name(
+            manager.catalog, schema, table
+        )
+        rows = manager._execute(
+            f"SELECT count(*) FROM {qualified} "
+            f'WHERE "{sentinel_name}" IS DISTINCT FROM ? '
+            f'AND "{lineage_name}" IS DISTINCT FROM ?',
+            fetch=True,
+            params=(
+                _sentinel_value(table, sentinel_match_id),
+                expected_run_id,
+            ),
+        )
+        unexpected = _single_count(
+            rows, label=f"unexpected lineage {schema}.{table}"
+        )
+        if unexpected:
+            raise ValueError(
+                "unexpected run lineage in benchmark table "
+                f"{schema}.{table}: {unexpected} rows"
+            )
+
+
+def _validate_trino_match_cohort(
+    manager: CountingTrinoTableManager,
+    *,
+    schema: str,
+    expected_run_id: str,
+    sentinel_match_id: str,
+    control_evidence: ControlRunEvidence,
+) -> None:
+    """Bind the physical page-manifest match set to direct control evidence."""
+
+    qualified = validate_catalog_qualified_name(
+        manager.catalog, schema, PAGE_MANIFEST_TABLE
+    )
+    rows = manager._execute(
+        "SELECT regexp_extract(\"target_id\", '^fbref:match:(.+)$', 1) "
+        f"AS acceptance_match_id FROM {qualified} "
+        'WHERE "target_id" IS DISTINCT FROM ? '
+        'AND "run_id" = ? '
+        "AND regexp_like(\"target_id\", '^fbref:match:.+$') "
+        "ORDER BY acceptance_match_id",
+        fetch=True,
+        params=(
+            _sentinel_value(PAGE_MANIFEST_TABLE, sentinel_match_id),
+            expected_run_id,
+        ),
+    )
+    match_keys = []
+    for row in rows or ():
+        if not isinstance(row, Sequence) or len(row) != 1:
+            raise RuntimeError("Unexpected Trino match-cohort result")
+        match_id = str(row[0] or "")
+        if not match_id:
+            raise ValueError("Trino match cohort contains an invalid key")
+        match_keys.append(match_id)
+    if (
+        len(match_keys) != control_evidence.match_targets
+        or len(set(match_keys)) != len(match_keys)
+        or _stable_sha256(sorted(match_keys))
+        != control_evidence.match_keys_sha256
+    ):
+        raise ValueError(
+            f"Trino match cohort for {schema!r} differs from direct control"
+        )
+
+
 def _except_all_count(
     manager: CountingTrinoTableManager,
     *,
@@ -542,6 +822,9 @@ def _except_all_count(
     right_schema: str,
     table: str,
     columns: Sequence[str],
+    left_run_id: str | None = None,
+    right_run_id: str | None = None,
+    sentinel_match_id: str | None = None,
 ) -> int:
     left = validate_catalog_qualified_name(
         manager.catalog, left_schema, table
@@ -549,15 +832,30 @@ def _except_all_count(
     right = validate_catalog_qualified_name(
         manager.catalog, right_schema, table
     )
-    selected = ", ".join(f'"{column}"' for column in columns)
-    rows = manager._execute(
-        "SELECT count(*) FROM ("
-        f"SELECT {selected} FROM {left} "
-        "EXCEPT ALL "
-        f"SELECT {selected} FROM {right}"
-        ") AS directional_diff",
-        fetch=True,
+    left_selected, left_params = _comparison_projection(
+        columns,
+        table=table,
+        expected_run_id=left_run_id,
+        sentinel_match_id=sentinel_match_id,
     )
+    right_selected, right_params = _comparison_projection(
+        columns,
+        table=table,
+        expected_run_id=right_run_id,
+        sentinel_match_id=sentinel_match_id,
+    )
+    sql = (
+        "SELECT count(*) FROM ("
+        f"SELECT {left_selected} FROM {left} "
+        "EXCEPT ALL "
+        f"SELECT {right_selected} FROM {right}"
+        ") AS directional_diff"
+    )
+    params = left_params + right_params
+    if params:
+        rows = manager._execute(sql, fetch=True, params=params)
+    else:
+        rows = manager._execute(sql, fetch=True)
     return _single_count(rows, label=f"{left_schema}-{right_schema} {table}")
 
 
@@ -565,9 +863,33 @@ def _bidirectional_table_diffs(
     manager: CountingTrinoTableManager,
     sequential_schema: str,
     batch_schema: str,
+    *,
+    sequential_run_id: str | None = None,
+    batch_run_id: str | None = None,
+    sentinel_match_id: str | None = None,
 ) -> dict[str, TableDiff]:
     """Compare every physical match table with EXCEPT ALL in both directions."""
 
+    supplied = (
+        sequential_run_id is not None,
+        batch_run_id is not None,
+        sentinel_match_id is not None,
+    )
+    if any(supplied) and not all(supplied):
+        raise ValueError("run-aware comparison arguments are incomplete")
+    if all(supplied):
+        _validate_run_lineage(
+            manager,
+            schema=sequential_schema,
+            expected_run_id=str(sequential_run_id),
+            sentinel_match_id=str(sentinel_match_id),
+        )
+        _validate_run_lineage(
+            manager,
+            schema=batch_schema,
+            expected_run_id=str(batch_run_id),
+            sentinel_match_id=str(sentinel_match_id),
+        )
     diffs = {}
     for table in BENCHMARK_TABLES:
         if not manager.table_exists(
@@ -584,6 +906,9 @@ def _bidirectional_table_diffs(
                 right_schema=batch_schema,
                 table=table,
                 columns=columns,
+                left_run_id=sequential_run_id,
+                right_run_id=batch_run_id,
+                sentinel_match_id=sentinel_match_id,
             ),
             batch_minus_sequential=_except_all_count(
                 manager,
@@ -591,6 +916,9 @@ def _bidirectional_table_diffs(
                 right_schema=sequential_schema,
                 table=table,
                 columns=columns,
+                left_run_id=batch_run_id,
+                right_run_id=sequential_run_id,
+                sentinel_match_id=sentinel_match_id,
             ),
         )
     return diffs
@@ -862,34 +1190,77 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
     metadata = metadata if isinstance(metadata, Mapping) else {}
     strict = metadata.get("bronze_acceptance_replay")
     strict = strict if isinstance(strict, Mapping) else {}
+    strict_gates = strict.get("strict_gates")
+    strict_gates = strict_gates if isinstance(strict_gates, Mapping) else {}
     if str(run.get("status") or "").casefold() != "succeeded":
         failures.append("run_not_succeeded")
     if str(run.get("run_type") or "").casefold() != "replay":
         failures.append("run_not_replay")
-    for metric in (
+    run_zero_metrics = (
         "request_limit",
         "byte_limit",
         "requests_used",
         "bytes_used",
-    ):
-        if int(run.get(metric) or 0) != 0:
+    )
+    for metric in run_zero_metrics:
+        if (
+            metric not in run
+            or type(run.get(metric)) is not int
+            or run.get(metric) != 0
+        ):
             failures.append(f"{metric}_not_zero")
     if (
-        str(strict.get("status") or "").casefold() != "passed"
+        strict.get("schema_version")
+        != "fbref-bronze-acceptance-replay-v1"
+        or str(strict.get("status") or "").casefold() != "passed"
         or str(strict.get("processing_control_run_id") or "") != str(run_id)
+        or not isinstance(strict.get("strict_gates"), Mapping)
     ):
         failures.append("strict_acceptance_missing")
-    for metric in (
+    strict_zero_metrics = (
+        "network_attempts",
+        "requests_used",
+        "bytes_used",
+        "request_limit",
+        "byte_limit",
+        "replay_candidates_remaining",
+    )
+    if (
+        str(strict_gates.get("source_acceptance_status") or "").casefold()
+        != "passed"
+        or str(strict_gates.get("raw_audit_status") or "").casefold()
+        != "passed"
+        or strict_gates.get("raw_zero_delta_required") is not True
+        or any(
+            metric not in strict_gates
+            or type(strict_gates.get(metric)) is not int
+            or strict_gates.get(metric) != 0
+            for metric in strict_zero_metrics
+        )
+        or type(strict_gates.get("raw_audited_attempt_count")) is not int
+        or int(strict_gates.get("raw_audited_attempt_count") or 0) <= 0
+        or not _is_sha256(strict_gates.get("raw_audit_artifact_sha256"))
+    ):
+        failures.append("strict_acceptance_gates_invalid")
+    summary_zero_metrics = (
         "requests_reserved",
         "bytes_reserved",
         "unprocessed_raw_count",
-    ):
-        if int(summary.get(metric) or 0) != 0:
+    )
+    for metric in summary_zero_metrics:
+        if (
+            metric not in summary
+            or type(summary.get(metric)) is not int
+            or summary.get(metric) != 0
+        ):
             failures.append(f"{metric}_not_zero")
     traffic = summary.get("traffic_totals")
-    if not isinstance(traffic, Mapping) or int(
-        traffic.get("network_attempts") or 0
-    ) != 0:
+    if (
+        not isinstance(traffic, Mapping)
+        or "network_attempts" not in traffic
+        or type(traffic.get("network_attempts")) is not int
+        or traffic.get("network_attempts") != 0
+    ):
         failures.append("network_attempts_not_zero")
 
     targets = evidence.get("targets")
@@ -899,18 +1270,50 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
     if not isinstance(datasets, Sequence) or isinstance(datasets, (str, bytes)):
         raise ValueError("direct dataset evidence is missing")
     refresh_ids = [str(item.get("logical_refresh_id") or "") for item in targets]
+    match_keys = []
+    for item in targets:
+        if str(item.get("page_kind") or "").casefold() != "match":
+            continue
+        target_id = str(item.get("target_id") or "")
+        target_match_id = (
+            target_id.removeprefix("fbref:match:")
+            if target_id.startswith("fbref:match:")
+            else ""
+        )
+        source_ids = item.get("source_ids")
+        source_match_id = (
+            str(source_ids.get("match_id") or "")
+            if isinstance(source_ids, Mapping)
+            else ""
+        )
+        if not target_match_id or (
+            source_match_id and source_match_id != target_match_id
+        ):
+            failures.append("match_target_key_invalid")
+            continue
+        match_keys.append(target_match_id)
     if not targets:
         failures.append("target_evidence_empty")
     if any(not refresh_id for refresh_id in refresh_ids):
         failures.append("logical_refresh_id_missing")
     if len(set(refresh_ids)) != len(refresh_ids):
         failures.append("logical_refresh_id_duplicate")
+    if not match_keys:
+        failures.append("match_target_evidence_empty")
+    if len(set(match_keys)) != len(match_keys):
+        failures.append("match_target_key_duplicate")
     if not datasets:
         failures.append("dataset_evidence_empty")
+    target_ids = {str(item.get("target_id") or "") for item in targets}
+    manifest_target_ids = {
+        str(item.get("target_id") or "") for item in datasets
+    }
+    if target_ids - manifest_target_ids:
+        failures.append("target_dataset_manifest_missing")
     required_match_datasets = {
         f"typed:{dataset}" for dataset in MATCH_DATASET_TABLES
     }
-    match_targets = {
+    match_target_ids = {
         str(item.get("target_id") or "")
         for item in targets
         if str(item.get("page_kind") or "").casefold() == "match"
@@ -921,13 +1324,13 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
             for item in datasets
             if str(item.get("target_id") or "") == target_id
         }
-        for target_id in match_targets
+        for target_id in match_target_ids
     }
     if any(
         not required_match_datasets.issubset(
             datasets_by_target.get(target_id, set())
         )
-        for target_id in match_targets
+        for target_id in match_target_ids
     ):
         failures.append("match_dataset_manifest_set_incomplete")
     for item in targets:
@@ -937,6 +1340,12 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
             break
     for item in targets:
         observation_status = item.get("observation_status")
+        if (
+            evidence_source == "direct_processing_rows"
+            and observation_status is None
+        ):
+            failures.append("observation_missing")
+            break
         if observation_status is not None and (
             str(observation_status).casefold() != "succeeded"
             or str(item.get("generic_status") or "").casefold()
@@ -1043,6 +1452,8 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
         proxy_bytes=int(run.get("bytes_used") or 0),
         logical_refreshes=len(refresh_ids),
         dataset_manifests=len(datasets),
+        match_targets=len(match_keys),
+        match_keys_sha256=_stable_sha256(sorted(match_keys)),
         observation_sha256=_stable_sha256(observations),
         manifest_sha256=_stable_sha256(manifests),
         latest_state_sha256=_stable_sha256(latest_state),
@@ -1262,6 +1673,8 @@ def _control_evidence_equivalent(
         and batch.valid
         and sequential.logical_refreshes == batch.logical_refreshes
         and sequential.dataset_manifests == batch.dataset_manifests
+        and sequential.match_targets == batch.match_targets
+        and sequential.match_keys_sha256 == batch.match_keys_sha256
         and sequential.observation_sha256 == batch.observation_sha256
         and sequential.manifest_sha256 == batch.manifest_sha256
         and sequential.latest_state_sha256 == batch.latest_state_sha256
@@ -1319,6 +1732,29 @@ def _validate_acceptance_baseline(
         raise ValueError("acceptance baseline sentinels are incomplete")
 
 
+def _validated_pipeline_metrics(
+    metrics: PipelineRunMetrics,
+    *,
+    expected_control_run_id: str,
+    expected_schema: str,
+    expected_mode: str,
+    control_evidence: ControlRunEvidence,
+) -> PipelineRunMetrics:
+    parsed = PipelineRunMetrics.from_mapping(metrics.to_dict())
+    if parsed.control_run_id != expected_control_run_id:
+        raise ValueError("pipeline metrics control run ID does not match")
+    if parsed.schema.casefold() != expected_schema.casefold():
+        raise ValueError("pipeline metrics schema does not match")
+    if parsed.mode != expected_mode:
+        raise ValueError("pipeline metrics mode does not match")
+    if (
+        parsed.match_count != control_evidence.match_targets
+        or parsed.match_keys_sha256 != control_evidence.match_keys_sha256
+    ):
+        raise ValueError("pipeline metrics match cohort does not match control")
+    return parsed
+
+
 def evaluate_existing_pipeline_acceptance(
     *,
     manager: CountingTrinoTableManager,
@@ -1327,11 +1763,8 @@ def evaluate_existing_pipeline_acceptance(
     batch_schema: str,
     sequential_control_run_id: str,
     batch_control_run_id: str,
-    sequential_seconds: float,
-    batch_seconds: float,
-    matches: int,
-    sequential_statement_counts: StatementCounts,
-    batch_statement_counts: StatementCounts,
+    sequential_metrics: PipelineRunMetrics,
+    batch_metrics: PipelineRunMetrics,
     sequential_baseline: AcceptanceBaseline,
     batch_baseline: AcceptanceBaseline,
     sentinel_match_id: str,
@@ -1340,14 +1773,12 @@ def evaluate_existing_pipeline_acceptance(
 ) -> BenchmarkReport:
     """Verify two already-completed real pipeline replays without writes."""
 
-    if matches < 1:
-        raise ValueError("matches must be at least 1")
-    if sequential_seconds <= 0 or batch_seconds <= 0:
-        raise ValueError("pipeline elapsed seconds must be positive")
     if sequential_schema.casefold() == batch_schema.casefold():
         raise ValueError(
             "sequential and batch schemas must be case-insensitively distinct"
         )
+    if sequential_control_run_id == batch_control_run_id:
+        raise ValueError("sequential and batch control run IDs must be distinct")
     _validate_acceptance_baseline(
         sequential_baseline,
         schema=sequential_schema,
@@ -1359,6 +1790,53 @@ def evaluate_existing_pipeline_acceptance(
         sentinel_match_id=sentinel_match_id,
     )
 
+    control_sequential = _control_run_evidence(
+        control, sequential_control_run_id
+    )
+    control_batch = _control_run_evidence(control, batch_control_run_id)
+    sequential_metrics = _validated_pipeline_metrics(
+        sequential_metrics,
+        expected_control_run_id=sequential_control_run_id,
+        expected_schema=sequential_schema,
+        expected_mode="sequential",
+        control_evidence=control_sequential,
+    )
+    batch_metrics = _validated_pipeline_metrics(
+        batch_metrics,
+        expected_control_run_id=batch_control_run_id,
+        expected_schema=batch_schema,
+        expected_mode="batch",
+        control_evidence=control_batch,
+    )
+    if (
+        control_sequential.match_targets != control_batch.match_targets
+        or control_sequential.match_keys_sha256
+        != control_batch.match_keys_sha256
+    ):
+        raise ValueError("sequential and batch control match cohorts differ")
+    matches = control_sequential.match_targets
+    _validate_trino_match_cohort(
+        manager,
+        schema=sequential_schema,
+        expected_run_id=sequential_control_run_id,
+        sentinel_match_id=sentinel_match_id,
+        control_evidence=control_sequential,
+    )
+    _validate_trino_match_cohort(
+        manager,
+        schema=batch_schema,
+        expected_run_id=batch_control_run_id,
+        sentinel_match_id=sentinel_match_id,
+        control_evidence=control_batch,
+    )
+    table_diffs = _bidirectional_table_diffs(
+        manager,
+        sequential_schema,
+        batch_schema,
+        sequential_run_id=sequential_control_run_id,
+        batch_run_id=batch_control_run_id,
+        sentinel_match_id=sentinel_match_id,
+    )
     sequential_after = _snapshot_ids(manager, sequential_schema)
     batch_after = _snapshot_ids(manager, batch_schema)
     sequential_sentinel_after = _sentinel_digests(
@@ -1368,9 +1846,14 @@ def evaluate_existing_pipeline_acceptance(
         manager, batch_schema, sentinel_match_id
     )
     sequential = PersistenceRun(
-        seconds=float(sequential_seconds),
-        statement_counts=sequential_statement_counts,
-        table_digests=_table_digests(manager, sequential_schema),
+        seconds=sequential_metrics.elapsed_seconds,
+        statement_counts=sequential_metrics.statement_counts,
+        table_digests=_table_digests(
+            manager,
+            sequential_schema,
+            expected_run_id=sequential_control_run_id,
+            sentinel_match_id=sentinel_match_id,
+        ),
         snapshots_before=dict(sequential_baseline.snapshots),
         snapshots_after=sequential_after,
         snapshot_deltas=_snapshot_deltas(
@@ -1380,9 +1863,14 @@ def evaluate_existing_pipeline_acceptance(
         sentinel_after=sequential_sentinel_after,
     )
     batch = PersistenceRun(
-        seconds=float(batch_seconds),
-        statement_counts=batch_statement_counts,
-        table_digests=_table_digests(manager, batch_schema),
+        seconds=batch_metrics.elapsed_seconds,
+        statement_counts=batch_metrics.statement_counts,
+        table_digests=_table_digests(
+            manager,
+            batch_schema,
+            expected_run_id=batch_control_run_id,
+            sentinel_match_id=sentinel_match_id,
+        ),
         snapshots_before=dict(batch_baseline.snapshots),
         snapshots_after=batch_after,
         snapshot_deltas=_snapshot_deltas(
@@ -1390,9 +1878,6 @@ def evaluate_existing_pipeline_acceptance(
         ),
         sentinel_before=dict(batch_baseline.sentinels),
         sentinel_after=batch_sentinel_after,
-    )
-    table_diffs = _bidirectional_table_diffs(
-        manager, sequential_schema, batch_schema
     )
     exact_tables = all(
         diff.sequential_minus_batch == 0
@@ -1402,10 +1887,6 @@ def evaluate_existing_pipeline_acceptance(
     equivalent = exact_tables and _digests_equivalent(
         sequential.table_digests, batch.table_digests
     )
-    control_sequential = _control_run_evidence(
-        control, sequential_control_run_id
-    )
-    control_batch = _control_run_evidence(control, batch_control_run_id)
     control_equivalent = _control_evidence_equivalent(
         control_sequential, control_batch
     )
@@ -1620,13 +2101,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sentinel-match-id")
     parser.add_argument("--sequential-baseline", type=Path)
     parser.add_argument("--batch-baseline", type=Path)
-    parser.add_argument("--sequential-seconds", type=float)
-    parser.add_argument("--batch-seconds", type=float)
-    parser.add_argument("--matches", type=int)
-    parser.add_argument("--sequential-execute-statements", type=int, default=0)
-    parser.add_argument("--sequential-committing-statements", type=int, default=0)
-    parser.add_argument("--batch-execute-statements", type=int, default=0)
-    parser.add_argument("--batch-committing-statements", type=int, default=0)
+    parser.add_argument("--sequential-metrics", type=Path)
+    parser.add_argument("--batch-metrics", type=Path)
     return parser.parse_args(argv)
 
 
@@ -1640,6 +2116,18 @@ def _read_baseline(path: Path) -> AcceptanceBaseline:
     if not isinstance(payload, Mapping):
         raise ValueError("acceptance baseline is invalid")
     return AcceptanceBaseline.from_mapping(payload)
+
+
+def _read_pipeline_metrics(path: Path) -> PipelineRunMetrics:
+    try:
+        if path.stat().st_size > 1024 * 1024:
+            raise ValueError("pipeline metrics artifact is too large")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError("pipeline metrics artifact is unreadable") from None
+    if not isinstance(payload, Mapping):
+        raise ValueError("pipeline metrics artifact is invalid")
+    return PipelineRunMetrics.from_mapping(payload)
 
 
 def _require_args(args: argparse.Namespace, *names: str) -> None:
@@ -1684,9 +2172,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "sentinel_match_id",
                 "sequential_baseline",
                 "batch_baseline",
-                "sequential_seconds",
-                "batch_seconds",
-                "matches",
+                "sequential_metrics",
+                "batch_metrics",
             )
             from scrapers.fbref.control import ControlStore
 
@@ -1702,16 +2189,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                             args.sequential_control_run_id
                         ),
                         batch_control_run_id=args.batch_control_run_id,
-                        sequential_seconds=args.sequential_seconds,
-                        batch_seconds=args.batch_seconds,
-                        matches=args.matches,
-                        sequential_statement_counts=StatementCounts(
-                            args.sequential_execute_statements,
-                            args.sequential_committing_statements,
+                        sequential_metrics=_read_pipeline_metrics(
+                            args.sequential_metrics
                         ),
-                        batch_statement_counts=StatementCounts(
-                            args.batch_execute_statements,
-                            args.batch_committing_statements,
+                        batch_metrics=_read_pipeline_metrics(
+                            args.batch_metrics
                         ),
                         sequential_baseline=_read_baseline(
                             args.sequential_baseline
