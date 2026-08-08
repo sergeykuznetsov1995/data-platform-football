@@ -559,9 +559,7 @@ def _validate_issue930_kept_paused_writer(
             raise _airflow_exception("FotMob kept-paused ingest run identity differs")
         raw_scopes = identity.get("scopes")
         raw_scope_items = (
-            []
-            if raw_scopes == ""
-            else raw_scopes.split(",")
+            raw_scopes.split(",")
             if isinstance(raw_scopes, str)
             else list(raw_scopes or ())
         )
@@ -569,7 +567,8 @@ def _validate_issue930_kept_paused_writer(
             scope_items = list(validate_scope_tokens(raw_scope_items))
         except ValueError:
             scope_items = []
-        if tuple(raw_scope_items) != tuple(scope_items):
+        scope_evidence_valid = tuple(raw_scope_items) == tuple(scope_items)
+        if not scope_evidence_valid:
             scope_items = []
         scope_bytes = ("\n".join(scope_items) + "\n").encode("utf-8")
         raw_entities = identity.get("entities")
@@ -617,6 +616,7 @@ def _validate_issue930_kept_paused_writer(
                 )
             if (
                 mode != "backfill"
+                or not scope_evidence_valid
                 or scope_items
                 or entities != {"players"}
                 or any(
@@ -643,7 +643,8 @@ def _validate_issue930_kept_paused_writer(
                     "FotMob kept-paused source-refresh contract differs"
                 )
         elif (
-            len(scope_items) != FOTMOB_DAILY_SCOPE_COUNT
+            not scope_evidence_valid
+            or len(scope_items) != FOTMOB_DAILY_SCOPE_COUNT
             or len(set(scope_items)) != FOTMOB_DAILY_SCOPE_COUNT
             or hashlib.sha256(scope_bytes).hexdigest() != FOTMOB_DAILY_SCOPE_SHA256
             or entities != FOTMOB_ISSUE930_WRITER_ENTITIES

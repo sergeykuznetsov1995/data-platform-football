@@ -773,6 +773,16 @@ def test_kept_paused_attestation_binds_exact_source_refresh_profile(tmp_path):
                 writer_identity={**identity, field: value},
             )
 
+    with pytest.raises(Exception, match="source-refresh contract differs"):
+        publication.attest_fotmob_isolated_runtime(
+            environ=environment,
+            hostname="1" * 12,
+            roots=roots,
+            require_scheduled_owner=False,
+            allow_kept_paused_writer=True,
+            writer_identity={**identity, "scopes": ""},
+        )
+
 
 def test_kept_paused_validator_accepts_spaced_exact_source_season(monkeypatch):
     scope = "230=2025 Apertura"
