@@ -62,8 +62,7 @@ _FEMALE_RE = re.compile(
     re.IGNORECASE,
 )
 _YOUTH_RE = re.compile(
-    r"(?:\bu\s*-?\s*(?:[1-9]|1\d|2[0-3])\b|"
-    r"\bunder\s*-?\s*(?:[1-9]|1\d|2[0-3])\b|"
+    r"(?:\bu\s*-?\s*\d+\b|\bunder\s*-?\s*\d+\b|"
     r"\byouth\b|\bacademy\b|\bjunior(?:s)?\b|\bjuvenil\b|\bprimavera\b)",
     re.IGNORECASE,
 )

@@ -148,6 +148,8 @@ def test_structural_female_field_beats_an_identical_male_facing_name():
     ("name", "rule"),
     [
         ("UEFA U16 Championship", "exclude_youth"),
+        ("International U24 Tournament", "exclude_youth"),
+        ("Under 25 Championship", "exclude_youth"),
         ("UEFA Ｕ－21 Championship", "exclude_youth"),
         ("UEFA U‑21 Championship", "exclude_youth"),
         ("National Development Cup", "exclude_reserve"),
