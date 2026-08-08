@@ -61,4 +61,8 @@ columns:
     description: Source season year как varchar; partition key из schedule.
   - name: _silver_created_at
     description: Технический timestamp CTAS-раннера при материализации Silver.
-relationships: []
+relationships:
+  - from: event_id
+    to: trino_iceberg.iceberg.silver.espn_match.event_id
+    type: FOREIGN_KEY
+    description: N:1 — дочерняя запись относится к одному матчу ESPN.

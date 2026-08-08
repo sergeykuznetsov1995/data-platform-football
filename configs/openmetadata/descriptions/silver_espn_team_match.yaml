@@ -8,8 +8,10 @@ table:
     сыгранных матчей. Последняя generation-v2 schedule и matchsheet выбирается
     по _ingested_at до JSON expansion. Matchsheet является авторитетной
     wide-веткой; scoreboard statistics из schedule используются целиком только
-    когда matchsheet для события отсутствует. Ноль — измеренное значение, а не
-    пропуск; percentages Bronze не переносятся и пересчитываются из счётчиков.
+    когда matchsheet для события отсутствует. ESPN zero может быть измеренным
+    значением или означать metric not tracked в зависимости от соревнования;
+    Silver сохраняет raw zero, а не угадывает NULL. Percentages Bronze не
+    переносятся и пересчитываются из счётчиков.
     goals_against предпочитает score противоположной matchsheet-строки.
     _bronze_ingested_at — lineage, league/season — partition keys.
   tags:
@@ -57,4 +59,8 @@ columns:
     description: Source season year как varchar; partition key из schedule.
   - name: _silver_created_at
     description: Технический timestamp CTAS-раннера при материализации Silver.
-relationships: []
+relationships:
+  - from: event_id
+    to: trino_iceberg.iceberg.silver.espn_match.event_id
+    type: FOREIGN_KEY
+    description: N:1 — дочерняя запись относится к одному матчу ESPN.

@@ -48,7 +48,7 @@ columns:
   - name: is_own_goal
     description: TRUE для автогола.
   - name: is_penalty
-    description: TRUE для игрового пенальти.
+    description: Raw penaltyKick flag; он включает shootout rows, поэтому для игрового пенальти потребители комбинируют его с is_shootout.
   - name: is_yellow_card
     description: TRUE для жёлтой карточки.
   - name: is_red_card
@@ -61,4 +61,8 @@ columns:
     description: Source season year как varchar; partition key.
   - name: _silver_created_at
     description: Технический timestamp CTAS-раннера при материализации Silver.
-relationships: []
+relationships:
+  - from: event_id
+    to: trino_iceberg.iceberg.silver.espn_match.event_id
+    type: FOREIGN_KEY
+    description: N:1 — дочерняя запись относится к одному матчу ESPN.

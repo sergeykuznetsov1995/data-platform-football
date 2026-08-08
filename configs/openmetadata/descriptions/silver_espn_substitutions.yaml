@@ -6,10 +6,11 @@ table:
   description: |
     Входящие замены ESPN: одна строка на (event_id, team_id, player_in_id).
     Источник — bronze.espn_lineup_generation_v2, дедуплицированный по полному
-    player-match ключу и последнему _ingested_at перед фильтром subbed_in=true;
-    schedule добавляет played status и partition keys. Таблица сознательно
-    строится от вошедшего игрока: несбалансированные строки «ушёл без входящего»
-    сюда не попадают. Номера и игрок на выход из JSON имеют источник рядом с
+    player-match ключу и последнему _ingested_at перед фильтром subbed_in=true.
+    JOIN к schedule фильтрует played_final: несыгранные матчи исключаются;
+    schedule также даёт partition keys. Таблица сознательно строится от
+    вошедшего игрока: несбалансированные строки «ушёл без входящего» сюда не
+    попадают. Номера и игрок на выход из JSON имеют источник рядом с
     subbedInFor, а не внутри athlete. _bronze_ingested_at — lineage.
   tags:
     - Tier.Silver
@@ -48,4 +49,8 @@ columns:
     description: Source season year как varchar; partition key из schedule.
   - name: _silver_created_at
     description: Технический timestamp CTAS-раннера при материализации Silver.
-relationships: []
+relationships:
+  - from: event_id
+    to: trino_iceberg.iceberg.silver.espn_match.event_id
+    type: FOREIGN_KEY
+    description: N:1 — дочерняя запись относится к одному матчу ESPN.

@@ -46,6 +46,11 @@ columns:
     description: Сырой ESPN ID победителя, включая разрешение серии пенальти.
   - name: stage
     description: Нормализованная стадия только для разрешённых season_slug; иначе NULL.
+  - name: season_slug_platform
+    description: |
+      Платформенный сезон, отличный от partition `season`: displayName формата
+      YYYY-YY или YYYY-YYYY преобразуется в YYZZ; отдельное edition YYYY
+      сохраняется как YYYY; при отсутствии обоих используется source_season_year.
   - name: group_name
     description: Группа, извлечённая из хвоста alt_game_note; NULL если не применимо.
   - name: attendance
