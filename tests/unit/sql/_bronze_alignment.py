@@ -157,8 +157,6 @@ def collect_bronze_refs(sql: str) -> Dict[str, Set[str]]:
             alias_node = unnest.args.get("alias")
             if alias_node is None:
                 continue
-            if alias_node.name:
-                actual_aliases.add(alias_node.name)
             for col in getattr(alias_node, "columns", []):
                 unnest_introduced.add(col.name)
             offset = unnest.args.get("offset")

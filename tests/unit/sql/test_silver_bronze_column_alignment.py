@@ -188,6 +188,24 @@ def test_extractor_retains_qualified_bronze_column_matching_ordinality_alias():
 
 
 @pytest.mark.unit
+def test_extractor_retains_unqualified_bronze_columns_beside_unnest():
+    """A local UDTF must not turn one Bronze source into a multi-source scope."""
+    sql = """
+    SELECT event_id, detail, seq
+    FROM iceberg.bronze.espn_schedule_generation_v2 b
+    CROSS JOIN UNNEST(
+        CAST(json_extract(b.extra_json, '$.competition.details') AS array<json>)
+    ) WITH ORDINALITY AS u(detail, seq)
+    """
+    refs = collect_bronze_refs(sql)
+
+    schedule_refs = refs["espn_schedule_generation_v2"]
+    assert {"event_id", "extra_json"} <= schedule_refs
+    assert "detail" not in schedule_refs
+    assert "seq" not in schedule_refs
+
+
+@pytest.mark.unit
 def test_extractor_skips_unnest_value_and_ordinality_aliases_through_cte():
     """UNNEST aliases are derived values, not Bronze schedule columns.
 
