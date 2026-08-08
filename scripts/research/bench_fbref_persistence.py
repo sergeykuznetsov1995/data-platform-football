@@ -434,24 +434,87 @@ def _validate_schema_isolation(config: BenchmarkConfig) -> None:
         )
 
 
+def _normalized_column_signature(
+    columns: Mapping[str, str],
+) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        sorted(
+            (
+                str(name).casefold(),
+                " ".join(str(column_type).casefold().split()),
+            )
+            for name, column_type in columns.items()
+        )
+    )
+
+
+def _table_has_rows(
+    manager: CountingTrinoTableManager, schema: str, table: str
+) -> bool:
+    qualified = validate_catalog_qualified_name(manager.catalog, schema, table)
+    rows = manager._execute(f"SELECT 1 FROM {qualified} LIMIT 1", fetch=True)
+    return bool(rows)
+
+
+def _close_preflight_manager(manager: CountingTrinoTableManager) -> None:
+    connection = getattr(manager, "_conn", None)
+    if connection is None:
+        return
+    try:
+        connection.close()
+    except Exception:  # pragma: no cover - diagnostic cleanup only
+        pass
+    finally:
+        manager._conn = None
+
+
 def _preflight_schemas(config: BenchmarkConfig) -> None:
-    """Reject replay schemas containing any table the benchmark may touch."""
+    """Require fully provisioned, empty schemas before replay writes begin."""
 
     manager = CountingTrinoTableManager()
-    schemas = (config.sequential_schema,)
-    if config.batch_schema is not None:
-        schemas += (config.batch_schema,)
-    for schema in schemas:
-        present = [
-            table
-            for table in BENCHMARK_TABLES
-            if manager.table_exists(schema, table)
-        ]
-        if present:
-            raise ValueError(
-                f"benchmark schema {schema!r} must be empty; found "
-                + ", ".join(present)
-            )
+    try:
+        schemas = (config.sequential_schema,)
+        if config.batch_schema is not None:
+            schemas += (config.batch_schema,)
+        signatures: dict[str, dict[str, tuple[tuple[str, str], ...]]] = {}
+        for schema in schemas:
+            missing = [
+                table
+                for table in BENCHMARK_TABLES
+                if not manager.table_exists(schema, table)
+            ]
+            if missing:
+                raise ValueError(
+                    f"benchmark schema {schema!r} is missing required benchmark "
+                    "tables: "
+                    + ", ".join(missing)
+                )
+            table_signatures = {}
+            for table in BENCHMARK_TABLES:
+                if _table_has_rows(manager, schema, table):
+                    raise ValueError(
+                        f"benchmark schema {schema!r} table {table!r} must "
+                        "contain zero rows"
+                    )
+                table_signatures[table] = _normalized_column_signature(
+                    manager.get_table_columns(schema, table)
+                )
+            signatures[schema] = table_signatures
+
+        if config.batch_schema is None:
+            return
+        for table in BENCHMARK_TABLES:
+            if (
+                signatures[config.sequential_schema][table]
+                != signatures[config.batch_schema][table]
+            ):
+                raise ValueError(
+                    "column/type signature mismatch for benchmark table "
+                    f"{table!r} between {config.sequential_schema!r} and "
+                    f"{config.batch_schema!r}"
+                )
+    finally:
+        _close_preflight_manager(manager)
 
 
 def _run_persistence(

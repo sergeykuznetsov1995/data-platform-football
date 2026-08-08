@@ -122,67 +122,176 @@ def test_case_insensitive_duplicate_schemas_fail_before_benchmark_run(
     assert called == []
 
 
-@pytest.mark.unit
-def test_dirty_sequential_schema_fails_before_loading_or_timing(
-    monkeypatch, tmp_path
-):
-    class Manager:
-        catalog = "iceberg"
+class _ProvisionedManager:
+    catalog = "iceberg"
 
-        def table_exists(self, schema, table):
-            return table == BENCHMARK_TABLES[0]
+    def __init__(self, *, missing=(), rows=None, signatures=None):
+        self.missing = set(missing)
+        self.rows = dict(rows or {})
+        self.signatures = dict(signatures or {})
 
+    def table_exists(self, schema, table):
+        return (schema, table) not in self.missing
+
+    def get_table_columns(self, schema, table):
+        return self.signatures.get((schema, table), {"identity": "VARCHAR"})
+
+    def _execute(self, sql, fetch=False):
+        table = next(table for table in BENCHMARK_TABLES if table in sql)
+        schema = next(
+            schema for schema in ("sequential", "batch") if f".{schema}." in sql
+        )
+        return [(1,)] if self.rows.get((schema, table), 0) else []
+
+
+def _reject_before_replay(monkeypatch):
     called = []
-    monkeypatch.setattr(benchmark, "CountingTrinoTableManager", Manager)
     monkeypatch.setattr(
         benchmark, "_load_replay_items", lambda _path: called.append("load")
     )
     monkeypatch.setattr(
         benchmark, "_run_persistence", lambda **_kwargs: called.append("run")
     )
+    return called
 
-    with pytest.raises(ValueError, match="must be empty"):
+
+@pytest.mark.unit
+def test_partial_provisioning_fails_before_loading_or_timing(
+    monkeypatch, tmp_path
+):
+    manager = _ProvisionedManager(
+        missing={("sequential", BENCHMARK_TABLES[0])}
+    )
+    monkeypatch.setattr(benchmark, "CountingTrinoTableManager", lambda: manager)
+    called = _reject_before_replay(monkeypatch)
+
+    with pytest.raises(ValueError, match="missing required benchmark tables"):
         run_benchmark(
-            BenchmarkConfig(
-                html_dir=tmp_path,
-                sequential_schema="replay",
-                batch_schema=None,
-            )
+            BenchmarkConfig(tmp_path, "sequential", batch_schema=None)
         )
 
     assert called == []
 
 
 @pytest.mark.unit
-def test_dirty_batch_schema_fails_before_loading_or_timing(
+def test_row_containing_schema_fails_before_loading_or_timing(
     monkeypatch, tmp_path
 ):
-    class Manager:
-        catalog = "iceberg"
+    manager = _ProvisionedManager(
+        rows={("sequential", BENCHMARK_TABLES[0]): 1}
+    )
+    monkeypatch.setattr(benchmark, "CountingTrinoTableManager", lambda: manager)
+    called = _reject_before_replay(monkeypatch)
 
-        def table_exists(self, schema, table):
-            return schema == "batch" and table == BENCHMARK_TABLES[0]
+    with pytest.raises(ValueError, match="must contain zero rows"):
+        run_benchmark(
+            BenchmarkConfig(tmp_path, "sequential", batch_schema=None)
+        )
 
-    called = []
-    monkeypatch.setattr(benchmark, "CountingTrinoTableManager", Manager)
+    assert called == []
+
+
+@pytest.mark.unit
+def test_candidate_signature_mismatch_fails_before_loading_or_timing(
+    monkeypatch, tmp_path
+):
+    manager = _ProvisionedManager(
+        signatures={("batch", BENCHMARK_TABLES[0]): {"identity": "BIGINT"}}
+    )
+    monkeypatch.setattr(benchmark, "CountingTrinoTableManager", lambda: manager)
+    monkeypatch.setattr(benchmark, "_batch_api_available", lambda: True)
+    called = _reject_before_replay(monkeypatch)
+
+    with pytest.raises(ValueError, match="column/type signature mismatch"):
+        run_benchmark(BenchmarkConfig(tmp_path, "sequential", "batch"))
+
+    assert called == []
+
+
+@pytest.mark.unit
+def test_fully_provisioned_empty_pair_proceeds_and_can_turn_green(
+    monkeypatch, tmp_path
+):
+    manager = _ProvisionedManager()
+    monkeypatch.setattr(benchmark, "CountingTrinoTableManager", lambda: manager)
     monkeypatch.setattr(benchmark, "_batch_api_available", lambda: True)
     monkeypatch.setattr(
-        benchmark, "_load_replay_items", lambda _path: called.append("load")
+        benchmark, "_load_replay_items", lambda _path: (object(), object())
+    )
+    runs = iter(
+        (
+            PersistenceRun(
+                seconds=80.0,
+                statement_counts=StatementCounts(
+                    execute=0, execute_committing=0
+                ),
+                table_digests={
+                    table: TableDigest(present=True, rows=0, sha256="digest")
+                    for table in BENCHMARK_TABLES
+                },
+            ),
+            PersistenceRun(
+                seconds=16.0,
+                statement_counts=StatementCounts(
+                    execute=0, execute_committing=0
+                ),
+                table_digests={
+                    table: TableDigest(present=True, rows=0, sha256="digest")
+                    for table in BENCHMARK_TABLES
+                },
+            ),
+        )
     )
     monkeypatch.setattr(
-        benchmark, "_run_persistence", lambda **_kwargs: called.append("run")
+        benchmark, "_run_persistence", lambda **_kwargs: next(runs)
     )
 
-    with pytest.raises(ValueError, match="batch.*must be empty"):
-        run_benchmark(
-            BenchmarkConfig(
-                html_dir=tmp_path,
-                sequential_schema="sequential",
-                batch_schema="batch",
-            )
-        )
+    report = run_benchmark(BenchmarkConfig(tmp_path, "sequential", "batch"))
 
-    assert called == []
+    assert report.equivalent is True
+    assert report.gate is not None
+    assert report.gate.passed is True
+
+
+@pytest.mark.unit
+def test_fully_provisioned_empty_sequential_schema_proceeds(
+    monkeypatch, tmp_path
+):
+    manager = _ProvisionedManager()
+    monkeypatch.setattr(benchmark, "CountingTrinoTableManager", lambda: manager)
+    monkeypatch.setattr(benchmark, "_load_replay_items", lambda _path: (object(),))
+    monkeypatch.setattr(
+        benchmark, "_run_persistence", lambda **_kwargs: _empty_persistence_run()
+    )
+
+    report = run_benchmark(
+        BenchmarkConfig(tmp_path, "sequential", batch_schema=None)
+    )
+
+    assert report.batch is None
+
+
+@pytest.mark.unit
+def test_preflight_closes_its_manager_connection(monkeypatch, tmp_path):
+    class Connection:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    manager = _ProvisionedManager()
+    connection = Connection()
+    manager._conn = connection
+    monkeypatch.setattr(benchmark, "CountingTrinoTableManager", lambda: manager)
+    monkeypatch.setattr(benchmark, "_load_replay_items", lambda _path: (object(),))
+    monkeypatch.setattr(
+        benchmark, "_run_persistence", lambda **_kwargs: _empty_persistence_run()
+    )
+
+    run_benchmark(BenchmarkConfig(tmp_path, "sequential", batch_schema=None))
+
+    assert connection.closed is True
+    assert manager._conn is None
 
 
 def _empty_persistence_run() -> PersistenceRun:
@@ -210,7 +319,12 @@ def test_benchmark_suppresses_trino_sql_logs_and_restores_logger(
         logger.info("Replaced rows matching 'secret-normal'")
         return _empty_persistence_run()
 
-    monkeypatch.setattr(benchmark, "_preflight_schemas", lambda _config: None)
+    def preflight_with_sql_logs(_config):
+        logger.debug("Executing SQL: SELECT 'secret-preflight'")
+
+    monkeypatch.setattr(
+        benchmark, "_preflight_schemas", preflight_with_sql_logs
+    )
     monkeypatch.setattr(benchmark, "_load_replay_items", lambda _path: (object(),))
     monkeypatch.setattr(benchmark, "_run_persistence", emit_sql_logs)
 
@@ -220,6 +334,7 @@ def test_benchmark_suppresses_trino_sql_logs_and_restores_logger(
 
     assert report.batch is None
     assert "secret-normal" not in caplog.text
+    assert "secret-preflight" not in caplog.text
     assert logger.disabled is original_disabled
     logger.info("trino logging restored")
     assert "trino logging restored" in caplog.text
