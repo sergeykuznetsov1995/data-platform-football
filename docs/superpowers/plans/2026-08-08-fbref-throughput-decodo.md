@@ -610,61 +610,374 @@ git commit -m "perf(fbref): replace tariff caps with safety circuit"
 ### Task 6: Reuse the metered Decodo HTTP session across pages
 
 **Files:**
+- Modify: `scrapers/fbref/settings.py`
 - Modify: `scrapers/fbref/proxy_lease.py`
 - Modify: `scrapers/fbref/fetcher.py`
 - Modify: `scrapers/fbref/pipeline.py`
+- Modify: `scrapers/fbref/control/__init__.py`
+- Modify: `scrapers/fbref/control/migrations.py`
 - Modify: `scrapers/fbref/control/store.py`
+- Modify: `dags/utils/fbref_pipeline_tasks.py`
+- Modify: `dags/scripts/run_fbref_live_waves.py`
 - Modify: `scripts/proxy_filter/filter_proxy.py`
 - Modify: `compose.yaml`
+- Modify: `.env.example`
+- Modify: `tests/unit/dags/test_fbref_pipeline_tasks.py`
+- Modify: `tests/unit/dags/test_run_fbref_live_waves_runner.py`
+- Modify: `tests/unit/scrapers/test_fbref_control_store.py`
 - Modify: `tests/unit/scrapers/test_fbref_proxy_lease.py`
 - Modify: `tests/unit/scrapers/test_fbref_metered_fetcher.py`
 - Modify: `tests/unit/scrapers/test_fbref_pipeline.py`
 - Modify: `tests/unit/scrapers/test_fbref_control_store_v8.py`
 - Modify: `tests/unit/scripts/test_filter_proxy.py`
+- Modify: `tests/integration/test_compose_validity.py`
+- Create: `tests/integration/scrapers/test_fbref_persistent_metering.py`
 
 **Interfaces:**
-- Consumes: the existing serial `curl_cffi.Session`, authoritative proxy-filter counters, and Task 5's safety circuit.
-- Produces: optional persistent HTTP/TLS reuse, exact per-page plus final-tail accounting, and unchanged raw/data/retry semantics.
+- Consumes: the existing serial `curl_cffi.Session`, immutable raw-v2 records,
+  Task 5's one-lease Decodo circuit, and the existing run-first budget lock
+  order.
+- Produces: `FBrefProxyLeaseClient.wait_idle(...)`,
+  `FBrefProxyLeaseClient.close_strict(...)`,
+  `FBrefFetcher.begin_metered_session(...)`,
+  `FBrefFetcher.finalize_metered_session()`,
+  `ControlStore.reserve_clearance_session_tail(...)`,
+  `ControlStore.settle_clearance_session_page(...)`,
+  `ControlStore.settle_clearance_session_tail(...)`, and
+  `ControlStore.assert_persistent_metering_reconciled(...)`.
+- Preserves: default-off per-page close/drain, 6.1-second serial source
+  spacing, conditional headers, raw-before-control-success, zero-network raw
+  recovery, one paid lease, response limits, and every Task 3 batch invariant.
 
-- [ ] **Step 1: Add failing persistent-session tests**
+- [ ] **Step 1: Pin a strict default-off run profile**
 
-Behind `FBREF_PERSISTENT_HTTP_SESSION=0` by default, two successful pages must use one curl session and one pinned proxy lease, must not close after page one, and must close exactly once at final session shutdown. A 403/429, dead clearance, transport failure, meter ambiguity, or explicit rollover still closes and rotates. Conditional headers, decoded/raw bytes, content hashes, and the raw-before-settlement order must remain unchanged.
+Add a strict `0`/`1` parser for `FBREF_PERSISTENT_HTTP_SESSION`, default `0`,
+and expose it in Compose and `.env.example` as `0`. Store the resolved boolean
+in immutable crawl-run metadata at initialization. The child runner compares
+the environment with that stored value before pipeline/fetcher construction;
+an old run with no marker is accepted only when the feature is off. Replay
+always stays off. This prevents one DagRun from mixing the old and new byte
+ledgers after a task retry or deployment change.
 
-- [ ] **Step 2: Add failing exact-accounting tests**
+Add RED tests proving that feature-off calls the existing
+`_finish_metered_fetch()` per page and creates no tail/page-accounting rows,
+while a stored/environment mismatch fails before a fetcher or lease request.
+Account for one additional tail byte reservation in live capacity only when
+the feature is on; requests remain zero and feature-off capacity is unchanged.
 
-Add non-secret proxy-filter stats for `active_provider_readers`, `provider_reserved_bytes`, and `pending_client_hellos`. Add a proxy-lease `wait_idle()` checkpoint and require two identical authoritative samples. With zero tunnels every reservation must be zero. With one expected tunnel, exactly one provider reader may exist, `reserved_bytes == provider_reserved_bytes`, and there must be no pending client hello. Any other reservation cannot be proven idle and fails closed. Prove:
+- [ ] **Step 2: Prove a real idle boundary inside one open tunnel**
+
+Expose these non-secret per-lease fields in every stats/close report and parse
+them as non-negative integers in `FBrefLeaseStats`:
 
 ```text
-sum(page provider deltas) + final connection tail == authoritative close total
+active_provider_readers
+provider_reserved_bytes
+pending_client_hellos
+staged_client_bytes
 ```
 
-The control-plane run byte total and clearance-session metric must equal the same value exactly. Counter regression, timeout, unexpected tunnels, unknown final tail, or insufficient tail reservation fails closed and opens no new paid lease.
+Instrument the client-to-provider pump so `staged_client_bytes` is increased
+immediately after a local read and decreased only after the complete staged
+prefix is durably metered or moved into the permanent uncertainty latch. This
+closes the gap where request bytes are waiting for allowance but neither
+`reserved_bytes` nor `provider_reserved_bytes` can see them.
 
-- [ ] **Step 3: Implement persistent metered checkpoints**
+Add `wait_idle(lease, *, expected, expected_tunnels=1)`. It returns only after
+two consecutive, identical authoritative samples satisfy one of these exact
+states:
 
-Replace success-path per-page close/drain with the new serial idle checkpoint. Keep the current close/drain behavior for all rotation/error paths. Do not create parallel requests: one session remains strictly serial and the source interval still gates every target.
+```text
+expected_tunnels == 0:
+  active_tunnels == active_provider_readers == reserved_bytes == 0
+  provider_reserved_bytes == pending_client_hellos == staged_client_bytes == 0
 
-- [ ] **Step 4: Settle final connection overhead idempotently**
+expected_tunnels == 1:
+  active_tunnels == active_provider_readers == 1
+  reserved_bytes == provider_reserved_bytes
+  pending_client_hellos == staged_client_bytes == 0
+```
 
-Create a run-scoped, zero-request session-tail reservation keyed deterministically from the non-secret clearance `session_id` before opening the persistent connection; reserve the existing conservative per-target byte amount. Add one atomic `settle_clearance_session_tail()` control API which locks run, reservation, and clearance session in that order, proves `page provider sum + tail == authoritative close total`, settles the reservation, sets the session total absolutely, and stores idempotency evidence. Identical repeats are no-ops; a different repeat conflicts. On `_LiveFetchSession.close()`, close curl and the provider lease, settle the exact tail, then close the control clearance session. An orphan tail blocks a new paid lease and is conservatively charged by run abort. Never attribute tail bytes to an arbitrary page or leave them uncounted.
+The complete counter tuple, including `up_bytes`, `down_bytes`, and lifecycle
+flags, must be identical across the two samples. Counter movement restarts the
+two-sample proof. Counter regression, a second tunnel/reader, a staged client
+chunk, an unrelated reservation, timeout, or an uncertainty/budget latch
+raises `FBrefProxyLeaseError` and does not authorize page settlement.
 
-- [ ] **Step 5: Preserve zero-network recovery**
+- [ ] **Step 3: Add a strict final provider close**
 
-Any failure after immutable raw commit retries parsing/persistence only from raw. A healthy target never rotates merely to obtain a new IP. A rollover may happen only on a raw boundary and must settle the old session completely before opening the next lease. Fix the adjacent response-obtained/raw-store-failure path to settle authoritative `provider_billed_bytes` and session metrics rather than only local wire bytes.
+Keep the existing `close()` compatibility behavior for the default-off path.
+Add `close_strict(lease, *, expected)` for persistent mode. It accepts only a
+2xx control reply with `closed == close_complete == True` and all tunnel,
+reader, reservation, hello, and staged-client fields equal to zero. A 409
+uncertainty response, timeout, incomplete close, changing provenance, or a
+non-zero lifecycle field is terminal and never returns a usable byte total.
 
-- [ ] **Step 6: Run focused tests**
+Use strict close for every provider lease in one persistent clearance,
+including leases rejected during browser bootstrap. No browser retry, reset,
+or new Decodo lease may start while the previous strict close is unresolved.
 
-Run: `/root/.venvs/dpf-test/bin/pytest tests/unit/scrapers/test_fbref_proxy_lease.py tests/unit/scrapers/test_fbref_metered_fetcher.py tests/unit/scrapers/test_fbref_pipeline.py tests/unit/scrapers/test_fbref_control_store_v8.py tests/unit/scripts/test_filter_proxy.py -q`
+- [ ] **Step 4: Add dedicated, migration-backed accounting evidence**
 
-Expected: PASS, including the pre-existing hard-transport-policy and raw-first ordering tests.
+Add migration `persistent_http_metering` with two typed tables:
 
-- [ ] **Step 7: Commit persistent-session support**
+```text
+fbref_control.clearance_session_page_accounting
+  reservation_id PK/FK budget_reservation
+  session_id FK clearance_session
+  run_id FK crawl_run
+  attempt_id UNIQUE/FK fetch_attempt
+  requests_used
+  browser_bootstrap_attempts, browser_bootstrap_requests
+  browser_document_bytes, browser_asset_bytes, browser_unobserved_bytes
+  http_requests, http_wire_bytes, decoded_html_bytes, compressed_raw_bytes
+  provider_billed_bytes NOT NULL
+  evidence_sha256 NOT NULL
+
+fbref_control.clearance_session_tail_reservation
+  session_id PK/FK clearance_session
+  run_id FK crawl_run
+  reservation_id UNIQUE/FK budget_reservation
+  baseline_provider_bytes NOT NULL
+  bytes_reserved NOT NULL
+  status IN ('reserved', 'settled', 'aborted')
+  page_provider_bytes, authoritative_provider_bytes, tail_provider_bytes
+  settlement_sha256, settled_at
+```
+
+All byte/request columns are non-negative. A settled row requires every final
+counter and digest; a reserved/aborted row cannot pretend to have exact close
+evidence. Export a deterministic
+`make_clearance_tail_reservation_id(session_id)` UUID5 helper.
+
+`reserve_clearance_session_tail(run_id, session_id, bytes_reserved,
+baseline_provider_bytes)` creates a zero-request generic budget reservation
+whose logical identity is the clearance session, then binds it to the typed
+tail row. It is called after the control clearance session and fetcher are
+created but before `ensure_clearance()` can open a browser/provider socket.
+Use the existing conservative per-target byte reservation. An identical retry
+is a no-op; different evidence conflicts. Any other `reserved` tail for the
+run is an orphan and blocks all new paid traffic until abort settles it
+conservatively.
+
+- [ ] **Step 5: Make page settlement atomic and retry-idempotent**
+
+Add this single feature-on control path:
+
+```python
+settle_clearance_session_page(
+    session_id,
+    reservation_id,
+    *,
+    attempt_id,
+    requests_used,
+    provider_billed_bytes,
+    browser_bootstrap_attempts,
+    browser_bootstrap_requests,
+    browser_document_bytes,
+    browser_asset_bytes,
+    browser_unobserved_bytes,
+    http_requests,
+    http_wire_bytes,
+    decoded_html_bytes,
+    compressed_raw_bytes,
+) -> dict
+```
+
+In one transaction it locks `crawl_run -> budget_reservation ->
+clearance_session -> tail row`, validates an active same-run session, inserts
+immutable page evidence, settles the target reservation, updates run counters,
+and increments non-provider clearance metrics exactly once. It leaves
+`clearance_session.provider_billed_bytes` NULL until final close. An identical
+repeat returns the installed row without incrementing anything; any changed
+field raises `StateConflict`. The feature-off path keeps the current
+`settle_budget()` plus `record_session_metrics()` behavior.
+
+For the response-obtained/raw-store-failure path, settle the page with
+`response.provider_billed_bytes`, never the local wire/browser approximation,
+and install the same session evidence before failing the fetch attempt. A paid
+persistent response without an authoritative provider value is a run-level
+hard transport failure.
+
+- [ ] **Step 6: Meter from the session baseline, including bootstrap rotations**
+
+Add an idempotent fetcher lifecycle:
+
+```python
+begin_metered_session(session_id: str) -> int
+finalize_metered_session() -> PersistentMeteredSessionReceipt
+```
+
+`begin_metered_session()` captures the current cumulative provider total as
+the session baseline before any browser request and initializes the page
+settlement cursor to that baseline. `_provider_total_bytes` remains cumulative
+across every bootstrap lease/exit. Therefore the first emitted page delta is
+`checkpoint_total - baseline` and includes all browser bootstrap bytes and all
+strictly closed failed bootstrap leases; later pages use the prior idle
+checkpoint. This fixes the current bootstrap undercount and preserves exact
+multi-lease aggregation.
+
+With the feature on, a successful page uses `wait_idle(...,
+expected_tunnels=1)` instead of closing curl. Two pages reuse one curl session,
+one CONNECT/TLS tunnel, and one pinned Decodo lease. Requests remain strictly
+serial and each physical target still obtains its durable 6.1-second domain
+slot. Conditional headers, response bodies, content hashes, decoded/raw byte
+evidence, retries, and raw-before-control-settlement ordering stay unchanged.
+
+A 403/429, rejected/dead clearance, transport failure, meter ambiguity, or
+explicit rollover closes curl and the current provider lease strictly. A
+healthy target never rotates merely to obtain another exit.
+
+- [ ] **Step 7: Finalize tail bytes exactly once**
+
+`PersistentMeteredSessionReceipt` contains only non-secret evidence:
+
+```text
+session_id, meter, baseline_provider_bytes,
+page_provider_bytes, authoritative_provider_bytes, tail_provider_bytes
+```
+
+Finalization closes curl first, strict-closes the final provider lease, folds
+that final counter into the cumulative aggregate, and proves:
+
+```text
+authoritative_provider_bytes
+  == page_provider_bytes + tail_provider_bytes
+  == cumulative_provider_total - baseline_provider_bytes
+```
+
+The receipt is cached, so repeated finalizer calls return byte-identical
+evidence and never close or count twice. A different session identity or a
+negative/regressing total conflicts.
+
+`settle_clearance_session_tail(session_id, receipt)` discovers the typed tail,
+then in one transaction locks `crawl_run -> budget_reservation ->
+clearance_session -> tail row -> page evidence`. It recomputes the durable page
+sum instead of trusting the caller, verifies the baseline and all receipt
+equalities, settles the zero-request reservation with the exact tail, updates
+the run, sets `clearance_session.provider_billed_bytes` to the authoritative
+session total absolutely, and stores a canonical settlement digest. An
+identical repeat is a no-op; different evidence or a page-sum mismatch rolls
+back and raises `StateConflict`.
+
+If the exact tail is larger than its reservation, still charge the exact
+amount atomically, latch `crawl_run.budget_exceeded`, and return a terminal
+result so orchestration fails loudly. Never roll back a known provider byte
+total merely because it crossed the safety circuit.
+
+- [ ] **Step 8: Make the pipeline finalizer an explicit state machine**
+
+Give `_LiveFetchSession` explicit `active -> provider_finalized ->
+tail_settled -> control_closed` states and cached receipt/settlement evidence.
+Every normal return, exception, cancellation, and session rollover calls the
+same idempotent `finalize()` method in this order:
+
+```text
+1. finalize fetcher (curl close, strict provider close)
+2. settle the exact session tail
+3. close the control clearance session
+4. release/reset the fetcher only after steps 1-3 succeed
+```
+
+Do not let `ExitStack.close()` silently close the provider before its receipt
+is consumed. Preserve the original work exception, but promote any finalizer
+failure to `hard_transport_policy` evidence and leave the session/tail handle
+available for an in-process retry. No new clearance, browser, or paid lease may
+start until the old session reaches `control_closed`.
+
+On a clearance rejection, settle its target page/failure evidence first,
+finalize the old session completely, and only then call `reset_clearance()` or
+construct the next fetcher. Rollover is permitted only between target/raw
+boundaries. Immutable raw recovery still performs zero network and never
+creates a session or tail reservation.
+
+Update `abort_run()` under the same global order: run, frontier rows, all budget
+reservations, clearance sessions, typed tail/page rows. It charges every
+orphan target and tail reservation conservatively, marks the tail `aborted`,
+and closes the session failed; it never invents exact provider evidence. This
+is the only recovery when a process dies after provider close but before its
+receipt is durably installed.
+
+- [ ] **Step 9: Reconcile every successful rollover and the whole run**
+
+Add `assert_persistent_metering_reconciled(run_id)` and call it after the final
+session closes, before a persistent live run can validate or publish. It
+requires:
+
+```text
+no reserved tail and no active clearance session
+each terminal exact session: page sum + tail == session provider total
+sum(exact session provider totals) == crawl_run.bytes_used
+sum(page requests_used) == crawl_run.requests_used
+every persistent target reservation has exactly one page-accounting row
+```
+
+Run equality is mandatory across multiple clearance rollovers and batches.
+Aborted/uncertain sessions make the run ineligible rather than being presented
+as exact. This gate also rejects a run that mixed feature profiles.
+
+- [ ] **Step 10: Cover success, failure, and crash boundaries**
+
+Add RED-then-GREEN tests for all of the following:
+
+- default off retains per-page curl close/drain and makes no new control calls;
+- two successful pages share one curl/tunnel/lease and close exactly once;
+- first-page bytes include bootstrap and several failed bootstrap leases;
+- later deltas and final tail reconcile to the strict-close aggregate;
+- staged client data, moving counters, unexpected readers/tunnels,
+  uncertainty, and strict-close 409 all fail closed;
+- 403, 429, dead clearance, transport failure, and explicit rollover finalize
+  old evidence before any new lease;
+- raw-store failure uses authoritative provider bytes and records metrics once;
+- repeated page/tail/finalizer calls are no-ops, changed evidence conflicts;
+- tail over-reservation is charged exactly and fails the safety circuit;
+- two sessions/rollovers equal the run counters; an orphan blocks the next
+  lease and abort charges it conservatively;
+- transaction/failpoint crashes after tail reserve, raw commit, page
+  settlement, strict provider close, tail settlement, control-session close,
+  and during rollover never undercount, double count, lose raw, or open a
+  second paid lease;
+- a disposable PostgreSQL test executes migration constraints, idempotent
+  repeats, rollback at every database mutation, and concurrent lock ordering.
+
+The PostgreSQL integration test uses the repository's supported explicit test
+DSN and skips when it is absent; collection itself must always pass.
+
+- [ ] **Step 11: Run focused verification**
+
+Run:
 
 ```bash
-git add scrapers/fbref/proxy_lease.py scrapers/fbref/fetcher.py \
-  scrapers/fbref/pipeline.py scrapers/fbref/control/store.py \
-  scripts/proxy_filter/filter_proxy.py compose.yaml tests/unit/scrapers \
-  tests/unit/scripts/test_filter_proxy.py
+/root/.venvs/dpf-test/bin/pytest \
+  tests/unit/dags/test_fbref_pipeline_tasks.py \
+  tests/unit/dags/test_run_fbref_live_waves_runner.py \
+  tests/unit/scrapers/test_fbref_control_store.py \
+  tests/unit/scrapers/test_fbref_control_store_v8.py \
+  tests/unit/scrapers/test_fbref_proxy_lease.py \
+  tests/unit/scrapers/test_fbref_metered_fetcher.py \
+  tests/unit/scrapers/test_fbref_pipeline.py \
+  tests/unit/scripts/test_filter_proxy.py \
+  tests/integration/test_compose_validity.py \
+  tests/integration/scrapers/test_fbref_persistent_metering.py -q
+```
+
+Expected: PASS, including pre-existing hard-transport-policy, raw-first,
+per-page feature-off, safety-circuit, and recovery tests. The live PostgreSQL
+case may skip only for a missing explicit test DSN.
+
+- [ ] **Step 12: Commit persistent-session support**
+
+```bash
+git add scrapers/fbref/settings.py scrapers/fbref/proxy_lease.py \
+  scrapers/fbref/fetcher.py scrapers/fbref/pipeline.py \
+  scrapers/fbref/control dags/utils/fbref_pipeline_tasks.py \
+  dags/scripts/run_fbref_live_waves.py \
+  scripts/proxy_filter/filter_proxy.py compose.yaml .env.example \
+  tests/unit/dags/test_fbref_pipeline_tasks.py \
+  tests/unit/dags/test_run_fbref_live_waves_runner.py \
+  tests/unit/scrapers tests/unit/scripts/test_filter_proxy.py \
+  tests/integration/test_compose_validity.py \
+  tests/integration/scrapers/test_fbref_persistent_metering.py
 git commit -m "perf(fbref): reuse metered proxy sessions across pages"
 ```
 
