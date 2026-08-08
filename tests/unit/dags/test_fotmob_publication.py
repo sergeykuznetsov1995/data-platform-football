@@ -1301,6 +1301,80 @@ def test_candidate_is_exact_digested_and_seal_renews_full_lease(monkeypatch):
     assert seal.call_args.kwargs["ttl_seconds"] == 14 * 24 * 60 * 60
 
 
+def test_bronze_only_candidate_is_deterministic_from_validated_evidence(monkeypatch):
+    _ceremony_env(monkeypatch)
+    monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
+    record = MagicMock(return_value={"phase": "writing"})
+    monkeypatch.setattr(
+        publication,
+        "_control_store",
+        lambda: SimpleNamespace(record_publication_candidate=record),
+    )
+    validation = {
+        "status": "success",
+        "run_id": "bronze-no-op",
+        "mode": "refresh",
+        "rows": {},
+        "tables": ["iceberg.bronze.fotmob_competition_profiles"],
+        "bronze_inputs_changed": [
+            "iceberg.bronze.fotmob_competition_profiles"
+        ],
+        "selection": {"scope_plan_signature": "fmplan1-" + "a" * 64},
+        "transport": {"attempts": 1, "direct_bytes": 1, "proxy_bytes": 0},
+        "budget": {"requests": 1, "max_requests": 10_000},
+    }
+    context = _context()
+    context["ti"].xcom_pull.return_value = validation
+    silver_inputs = ["iceberg.bronze.fotmob_matches"]
+
+    first = publication.record_fotmob_bronze_only_candidate(
+        validation_task_id="validate_data",
+        silver_input_tables=silver_inputs,
+        **context,
+    )
+    second = publication.record_fotmob_bronze_only_candidate(
+        validation_task_id="validate_data",
+        silver_input_tables=silver_inputs,
+        **context,
+    )
+
+    assert first == second
+    assert first["candidate_kind"] == "bronze_only"
+    assert first["validated_bronze"] == validation
+    assert len(first["digest"]) == 64
+    assert [call.args[1] for call in record.call_args_list] == [first, first]
+    assert all(call.kwargs["source"] == "fotmob" for call in record.call_args_list)
+
+
+def test_bronze_candidate_defers_to_silver_without_record_conflict(monkeypatch):
+    _ceremony_env(monkeypatch)
+    monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
+    record = MagicMock()
+    monkeypatch.setattr(
+        publication,
+        "_control_store",
+        lambda: SimpleNamespace(record_publication_candidate=record),
+    )
+    context = _context()
+    context["ti"].xcom_pull.return_value = {
+        "status": "success",
+        "bronze_inputs_changed": ["iceberg.bronze.fotmob_player_snapshots"],
+    }
+
+    result = publication.record_fotmob_bronze_only_candidate(
+        validation_task_id="validate_data",
+        silver_input_tables=["iceberg.bronze.fotmob_player_snapshots"],
+        **context,
+    )
+
+    assert result == {
+        "status": "silver_required",
+        "recorded": False,
+        "bronze_inputs_changed": ["iceberg.bronze.fotmob_player_snapshots"],
+    }
+    record.assert_not_called()
+
+
 def test_xref_consumer_preflight_requires_full_active_claim(monkeypatch):
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     context = _context()

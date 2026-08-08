@@ -1063,8 +1063,21 @@ class TestSilverDependency:
         assert silver_triggers == [mod.trigger_silver]
         assert mod.transform_gate._init_kwargs["ignore_downstream_trigger_rules"] is False
         assert mod.transform_gate._init_kwargs.get("op_kwargs", {}) == {}
+        bronze_candidate = next(
+            task
+            for task in PythonOperator._instances
+            if task.task_id == "record_bronze_only_publication_candidate"
+        )
+        assert bronze_candidate.python_callable is (
+            mod.record_fotmob_bronze_only_candidate
+        )
+        assert bronze_candidate.upstream_task_ids == {"validate_data"}
+        assert bronze_candidate._init_kwargs["op_kwargs"] == {
+            "validation_task_id": "validate_data",
+            "silver_input_tables": sorted(mod.FOTMOB_SILVER_BRONZE_INPUTS),
+        }
         assert mod.seal_publication.upstream_task_ids == {
-            "validate_data",
+            "record_bronze_only_publication_candidate",
             "trigger_silver_transform",
         }
         assert mod.seal_publication._init_kwargs["trigger_rule"] == (

@@ -119,11 +119,23 @@ def _store_state(state: FotMobSchedulerState) -> None:
     Variable.set(SCHEDULER_STATE_VARIABLE, state.to_dict(), serialize_json=True)
 
 
-def _ingest_child_running() -> bool:
+def _ingest_child_active() -> bool:
     # Lazy import keeps host DAG unit tests independent of a full Airflow DB.
     from airflow.models import DagRun
 
+    if DagRun.find(dag_id=INGEST_DAG_ID, state="queued"):
+        return True
     return bool(DagRun.find(dag_id=INGEST_DAG_ID, state="running"))
+
+
+def _context_utc_now(context: Mapping[str, Any]) -> datetime:
+    """Read the real clock at the call site, with deterministic test hooks."""
+
+    clock = context.get("utcnow")
+    if callable(clock):
+        return _utc_now(clock())
+    supplied_now = context.get("now_utc")
+    return _utc_now(supplied_now if isinstance(supplied_now, datetime) else None)
 
 
 def _attest_owner_runtime(**context: Any) -> dict[str, Any]:
@@ -173,13 +185,12 @@ def _attest_owner_runtime(**context: Any) -> dict[str, Any]:
 def select_fotmob_lane(**context: Any) -> dict[str, Any] | bool:
     """Short-circuit an idle tick, otherwise publish one immutable decision."""
 
-    supplied_now = context.get("now_utc")
-    now = _utc_now(supplied_now if isinstance(supplied_now, datetime) else None)
+    now = _context_utc_now(context)
     state = _load_state()
     child_running = bool(
         context.get("child_running")
         if "child_running" in context
-        else _ingest_child_running()
+        else _ingest_child_active()
     )
     decision = choose_lane(now, state, child_running)
     if decision.lane is None:
@@ -215,15 +226,7 @@ def _launch_still_admitted(context: Mapping[str, Any]) -> bool:
     if current != selected_state:
         raise AirflowException("FotMob scheduler state changed before launch")
 
-    supplied_now = context.get("now_utc")
-    now = _utc_now(supplied_now if isinstance(supplied_now, datetime) else None)
-    child_running = bool(
-        context.get("child_running")
-        if "child_running" in context
-        else _ingest_child_running()
-    )
-    if choose_lane(now, current, child_running).lane is not selected_lane:
-        return False
+    deadline = None
     if selected_lane is not FotMobLane.DAILY:
         conf = raw.get("conf")
         if not isinstance(conf, Mapping):
@@ -235,8 +238,21 @@ def _launch_still_admitted(context: Mapping[str, Any]) -> bool:
             raise AirflowException("FotMob background deadline is invalid") from exc
         if deadline.tzinfo is None or deadline.utcoffset() is None:
             raise AirflowException("FotMob background deadline is invalid")
-        if now >= deadline.astimezone(UTC):
-            return False
+        deadline = deadline.astimezone(UTC)
+
+    child_active = bool(
+        context.get("child_running")
+        if "child_running" in context
+        else _ingest_child_active()
+    )
+    # This is deliberately the last potentially changing observation.  State
+    # and DagRun queries above may be slow; after this clock read only pure
+    # comparisons remain before TriggerDagRunOperator performs its insert.
+    now = _context_utc_now(context)
+    if choose_lane(now, current, child_active).lane is not selected_lane:
+        return False
+    if deadline is not None and now >= deadline:
+        return False
     return True
 
 
@@ -279,19 +295,34 @@ def _release_unstarted_publication(context: Mapping[str, Any]) -> dict[str, Any]
 class BoundaryCheckedTriggerDagRunOperator(TriggerDagRunOperator):
     """Guarantee a fresh boundary check at the child-trigger operation."""
 
+    @staticmethod
+    def _release_and_mark_rejected(
+        context: Mapping[str, Any], *, verdict: str
+    ) -> None:
+        released = _release_unstarted_publication(context)
+        if fotmob_ceremony_configured() and released.get("released") is not True:
+            raise AirflowException(
+                "FotMob unstarted publication generation was not released"
+            )
+        ti = context.get("ti")
+        if ti is not None:
+            ti.xcom_push(
+                key=LAUNCH_REJECTED_XCOM_KEY,
+                value={
+                    "safe_release": True,
+                    "state_advanced": False,
+                    "verdict": verdict,
+                },
+            )
+
     def execute(self, context: Mapping[str, Any]):
-        if not _launch_still_admitted(context):
-            released = _release_unstarted_publication(context)
-            if fotmob_ceremony_configured() and released.get("released") is not True:
-                raise AirflowException(
-                    "FotMob unstarted publication generation was not released"
-                )
-            ti = context.get("ti")
-            if ti is not None:
-                ti.xcom_push(
-                    key=LAUNCH_REJECTED_XCOM_KEY,
-                    value={"safe_release": True, "state_advanced": False},
-                )
+        try:
+            admitted = _launch_still_admitted(context)
+        except Exception:
+            self._release_and_mark_rejected(context, verdict="failed")
+            raise
+        if not admitted:
+            self._release_and_mark_rejected(context, verdict="skipped")
             raise AirflowSkipException(
                 "FotMob launch window closed before child trigger"
             )

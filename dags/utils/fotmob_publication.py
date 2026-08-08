@@ -1594,6 +1594,79 @@ def record_fotmob_silver_candidate(
     return evidence
 
 
+def record_fotmob_bronze_only_candidate(
+    *,
+    validation_task_id: str,
+    silver_input_tables: Sequence[str],
+    **context: Any,
+) -> dict[str, Any]:
+    """Record the validated Bronze candidate when no Silver input changed."""
+
+    publication = publication_from_context(context) or {}
+    task_instance = context.get("ti")
+    if task_instance is None:
+        raise _airflow_exception("FotMob Bronze candidate task has no task instance")
+    normalized_task_id = str(validation_task_id or "").strip()
+    if not normalized_task_id:
+        raise _airflow_exception("FotMob Bronze validation task id is invalid")
+    validation = task_instance.xcom_pull(task_ids=normalized_task_id)
+    if not isinstance(validation, Mapping) or validation.get("status") not in {
+        "success",
+        "partial_success",
+    }:
+        raise _airflow_exception("FotMob validated Bronze evidence is not successful")
+
+    changed = validation.get("bronze_inputs_changed")
+    if not isinstance(changed, list) or any(
+        not isinstance(table, str) or not table.strip() for table in changed
+    ):
+        raise _airflow_exception("FotMob changed Bronze input evidence is invalid")
+    normalized_changed = sorted({table.strip().casefold() for table in changed})
+    if isinstance(silver_input_tables, (str, bytes)) or not isinstance(
+        silver_input_tables, Sequence
+    ):
+        raise _airflow_exception("FotMob Silver input table set is invalid")
+    if any(
+        not isinstance(table, str) or not table.strip()
+        for table in silver_input_tables
+    ):
+        raise _airflow_exception("FotMob Silver input table set is invalid")
+    normalized_silver_inputs = sorted(
+        {table.strip().casefold() for table in silver_input_tables}
+    )
+    if not normalized_silver_inputs:
+        raise _airflow_exception("FotMob Silver input table set is invalid")
+    if set(normalized_changed).intersection(normalized_silver_inputs):
+        return {
+            "status": "silver_required",
+            "recorded": False,
+            "bronze_inputs_changed": normalized_changed,
+        }
+
+    validated_bronze = dict(validation)
+    validated_bronze["bronze_inputs_changed"] = normalized_changed
+    validated_bronze = json.loads(
+        json.dumps(validated_bronze, sort_keys=True, separators=(",", ":"))
+    )
+    evidence = {
+        "schema": FOTMOB_PUBLICATION_SCHEMA,
+        "generation_id": publication.get("generation_id"),
+        "candidate_kind": "bronze_only",
+        "validation_task_id": normalized_task_id,
+        "validated_bronze": _normalize_candidate_value(validated_bronze),
+    }
+    evidence["digest"] = hashlib.sha256(
+        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if fotmob_ceremony_configured():
+        _control_store().record_publication_candidate(
+            publication["generation_id"],
+            evidence,
+            source=FOTMOB_PUBLICATION_SOURCE,
+        )
+    return evidence
+
+
 def seal_fotmob_publication(**context: Any) -> dict[str, Any]:
     """Move ``writing`` to ``ready`` only after the Silver child succeeded."""
 

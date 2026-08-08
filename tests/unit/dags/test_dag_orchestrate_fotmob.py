@@ -143,6 +143,36 @@ def test_first_run_state_default_is_canonical_json(monkeypatch):
     assert module._load_state() == module.FotMobSchedulerState.initial()
 
 
+@pytest.mark.parametrize(
+    ("queued", "running", "expected"),
+    [
+        ([SimpleNamespace(state="queued")], [], True),
+        ([], [SimpleNamespace(state="running")], True),
+        ([], [], False),
+    ],
+)
+def test_ingest_child_activity_queries_queued_and_running_dagruns(
+    monkeypatch, queued, running, expected
+):
+    import airflow.models
+
+    module = _reload_owner(monkeypatch, isolated=False)
+    calls = []
+
+    class _DagRun:
+        @classmethod
+        def find(cls, **kwargs):
+            calls.append(kwargs)
+            return {"queued": queued, "running": running}[kwargs["state"]]
+
+    monkeypatch.setattr(airflow.models, "DagRun", _DagRun, raising=False)
+
+    assert module._ingest_child_active() is expected
+    assert calls[0] == {"dag_id": module.INGEST_DAG_ID, "state": "queued"}
+    if not queued:
+        assert calls[1] == {"dag_id": module.INGEST_DAG_ID, "state": "running"}
+
+
 def test_successful_child_advances_durable_lane_once_across_task_retry(monkeypatch):
     module = _reload_owner(monkeypatch, isolated=False)
     state = module.FotMobSchedulerState.initial()
@@ -279,6 +309,7 @@ def test_pretrigger_cutoff_safely_releases_without_child_or_state_advance(
     assert ti.values[(module.TRIGGER_TASK_ID, module.LAUNCH_REJECTED_XCOM_KEY)] == {
         "safe_release": True,
         "state_advanced": False,
+        "verdict": "skipped",
     }
     monkeypatch.setattr(
         module,
@@ -322,6 +353,176 @@ def test_pretrigger_boundary_allows_background_before_cutoff(monkeypatch):
 
     assert module.trigger_ingest.execute(context) == "triggered"
     assert child_triggers == [context]
+
+
+def test_pretrigger_exception_releases_generation_and_preserves_red_verdict(
+    monkeypatch,
+):
+    from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+
+    module = _reload_owner(monkeypatch, isolated=True)
+
+    class _TI:
+        def __init__(self):
+            self.values = {}
+
+        def xcom_pull(self, *, task_ids, key=None):
+            if task_ids == module.INITIALIZER_TASK_ID:
+                return {"generation_id": "generation-one"}
+            return self.values.get((task_ids, key))
+
+        def xcom_push(self, *, key, value):
+            self.values[(module.TRIGGER_TASK_ID, key)] = value
+
+    ti = _TI()
+    releases = []
+    child_triggers = []
+    monkeypatch.setattr(
+        module,
+        "_launch_still_admitted",
+        lambda context: (_ for _ in ()).throw(
+            module.AirflowException("scheduler state read failed")
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "_release_unstarted_publication",
+        lambda context: releases.append(context) or {"released": True},
+    )
+    monkeypatch.setattr(module, "fotmob_ceremony_configured", lambda *args: True)
+    monkeypatch.setattr(
+        TriggerDagRunOperator,
+        "execute",
+        lambda self, context: child_triggers.append(context),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module.Variable,
+        "set",
+        lambda *args, **kwargs: pytest.fail("scheduler state must not advance"),
+        raising=False,
+    )
+    context = {"ti": ti}
+
+    with pytest.raises(module.AirflowException, match="state read failed"):
+        module.trigger_ingest.execute(context)
+
+    assert releases == [context]
+    assert child_triggers == []
+    assert ti.values[(module.TRIGGER_TASK_ID, module.LAUNCH_REJECTED_XCOM_KEY)] == {
+        "safe_release": True,
+        "state_advanced": False,
+        "verdict": "failed",
+    }
+    with pytest.raises(module.AirflowSkipException, match="safely rejected"):
+        module.finalize_or_skip_rejected_launch(ti=ti)
+
+
+def test_pretrigger_final_check_orders_active_query_then_clock_then_trigger(
+    monkeypatch,
+):
+    from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+
+    module = _reload_owner(monkeypatch, isolated=True)
+    state = module.FotMobSchedulerState.initial()
+    selected_at = datetime(2026, 8, 8, 13, 29, tzinfo=timezone.utc)
+    decision = {
+        "lane": "refresh",
+        "state": state.to_dict(),
+        "conf": module.build_child_conf(module.FotMobLane.REFRESH, selected_at),
+    }
+    ti = SimpleNamespace(xcom_pull=lambda **kwargs: decision)
+    events = []
+    monkeypatch.setattr(module, "_load_state", lambda: state)
+    monkeypatch.setattr(
+        module,
+        "_ingest_child_active",
+        lambda: events.append("active_child_query") or False,
+    )
+    monkeypatch.setattr(
+        TriggerDagRunOperator,
+        "execute",
+        lambda self, context: events.append("trigger_child") or "triggered",
+        raising=False,
+    )
+    context = {
+        "ti": ti,
+        "utcnow": lambda: events.append("actual_clock")
+        or datetime(2026, 8, 8, 13, 29, 59, tzinfo=timezone.utc),
+    }
+
+    assert module.trigger_ingest.execute(context) == "triggered"
+    assert events == ["active_child_query", "actual_clock", "trigger_child"]
+
+
+def test_queued_child_appearing_between_init_and_trigger_is_rejected(monkeypatch):
+    from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+
+    module = _reload_owner(monkeypatch, isolated=True)
+    state = module.FotMobSchedulerState.initial()
+    selected_at = datetime(2026, 8, 8, 13, 29, tzinfo=timezone.utc)
+    decision = {
+        "lane": "refresh",
+        "state": state.to_dict(),
+        "conf": module.build_child_conf(module.FotMobLane.REFRESH, selected_at),
+    }
+
+    class _TI:
+        def __init__(self):
+            self.values = {}
+
+        def xcom_pull(self, *, task_ids, key=None):
+            if task_ids == module.DECISION_TASK_ID:
+                return decision
+            if task_ids == module.INITIALIZER_TASK_ID:
+                return {"generation_id": "generation-one"}
+            return self.values.get((task_ids, key))
+
+        def xcom_push(self, *, key, value):
+            self.values[(module.TRIGGER_TASK_ID, key)] = value
+
+    ti = _TI()
+    active = iter([False, True])
+    clock = iter(
+        [
+            datetime(2026, 8, 8, 13, 29, tzinfo=timezone.utc),
+            datetime(2026, 8, 8, 13, 29, 30, tzinfo=timezone.utc),
+        ]
+    )
+    initialized = []
+    released = []
+    child_triggers = []
+    monkeypatch.setattr(module, "_load_state", lambda: state)
+    monkeypatch.setattr(module, "_ingest_child_active", lambda: next(active))
+    monkeypatch.setattr(
+        module,
+        "initialize_fotmob_publication",
+        lambda **context: initialized.append(context)
+        or {"generation_id": "generation-one"},
+    )
+    monkeypatch.setattr(
+        module,
+        "_release_unstarted_publication",
+        lambda context: released.append(context) or {"released": True},
+    )
+    monkeypatch.setattr(module, "fotmob_ceremony_configured", lambda *args: True)
+    monkeypatch.setattr(
+        TriggerDagRunOperator,
+        "execute",
+        lambda self, context: child_triggers.append(context),
+        raising=False,
+    )
+    context = {"ti": ti, "utcnow": lambda: next(clock)}
+
+    assert module.initialize_admitted_publication(**context)["generation_id"] == (
+        "generation-one"
+    )
+    with pytest.raises(module.AirflowSkipException):
+        module.trigger_ingest.execute(context)
+
+    assert len(initialized) == 1
+    assert released == [context]
+    assert child_triggers == []
 
 
 def test_unstarted_publication_release_is_explicitly_safe(monkeypatch):

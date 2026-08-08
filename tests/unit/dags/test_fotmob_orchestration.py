@@ -41,7 +41,8 @@ def _state(
         (_at(13, 59), None),
         (_at(14, 0), FotMobLane.DAILY),
         (_at(14, 59), FotMobLane.DAILY),
-        (_at(15, 0), FotMobLane.REFRESH),
+        (_at(15, 0), None),
+        (_at(23, 59), None),
     ],
 )
 def test_lane_windows(now, expected):
@@ -116,6 +117,7 @@ def test_child_conf_uses_dynamic_contract_and_exact_caps(
         assert conf["deadline"] == "2026-08-08T13:45:00+00:00"
 
 
-def test_afternoon_background_uses_next_days_cooperative_deadline():
-    conf = build_child_conf(FotMobLane.REFRESH, _at(15, 1))
-    assert conf["deadline"] == "2026-08-09T13:45:00+00:00"
+@pytest.mark.parametrize("now", [_at(13, 30), _at(15, 1), _at(23, 59)])
+def test_background_conf_fails_closed_after_daily_cutoff(now):
+    with pytest.raises(ValueError, match="13:30 UTC cutoff"):
+        build_child_conf(FotMobLane.REFRESH, now)

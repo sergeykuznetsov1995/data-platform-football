@@ -42,6 +42,7 @@ from utils.fotmob_publication import (
     FOTMOB_DAILY_SCOPE_FILE,
     FOTMOB_DAILY_SCOPE_SHA256,
     fail_unsealed_fotmob_publication,
+    record_fotmob_bronze_only_candidate,
     seal_fotmob_publication,
     validate_fotmob_writer_fence,
 )
@@ -1023,6 +1024,16 @@ python dags/scripts/run_fotmob_scraper.py \\
         ignore_downstream_trigger_rules=False,
     )
 
+    record_bronze_only_candidate = PythonOperator(
+        task_id="record_bronze_only_publication_candidate",
+        python_callable=record_fotmob_bronze_only_candidate,
+        op_kwargs={
+            "validation_task_id": "validate_data",
+            "silver_input_tables": sorted(FOTMOB_SILVER_BRONZE_INPUTS),
+        },
+        retries=0,
+    )
+
     trigger_silver = TriggerDagRunOperator(
         task_id="trigger_silver_transform",
         trigger_dag_id="dag_transform_fotmob_silver",
@@ -1064,7 +1075,10 @@ python dags/scripts/run_fotmob_scraper.py \\
         retries=0,
     )
 
-    publication_preflight >> scrape_data_task >> validate_data_task >> transform_gate
+    publication_preflight >> scrape_data_task >> validate_data_task
+    validate_data_task >> record_bronze_only_candidate
+    validate_data_task >> transform_gate
     transform_gate >> trigger_silver
-    [validate_data_task, trigger_silver] >> seal_publication >> finalize_publication
+    [record_bronze_only_candidate, trigger_silver] >> seal_publication
+    seal_publication >> finalize_publication
     scrape_data_task >> replay_missing_inputs_proof >> finalize_publication

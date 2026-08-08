@@ -8,7 +8,7 @@ that keeps the daily reservation and fair background alternation testable.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timezone
 from enum import Enum
 from typing import Any, Mapping
 
@@ -135,6 +135,8 @@ def choose_lane(
         if state.daily_date == now.date():
             return LaneDecision(None, "daily_already_completed")
         return LaneDecision(FotMobLane.DAILY, "daily_window")
+    if wall_time >= DAILY_WINDOW_END:
+        return LaneDecision(None, "background_window_closed")
     return LaneDecision(state.next_background_lane, "background_fair_turn")
 
 
@@ -173,10 +175,7 @@ _LANE_CAPS = {
 
 
 def _background_deadline(now: datetime) -> datetime:
-    target = datetime.combine(now.date(), BACKGROUND_DEADLINE, tzinfo=UTC)
-    if target <= now:
-        target += timedelta(days=1)
-    return target
+    return datetime.combine(now.date(), BACKGROUND_DEADLINE, tzinfo=UTC)
 
 
 def build_child_conf(lane: FotMobLane, now_utc: datetime) -> dict[str, Any]:
@@ -184,6 +183,13 @@ def build_child_conf(lane: FotMobLane, now_utc: datetime) -> dict[str, Any]:
 
     normalized_lane = FotMobLane(lane)
     now = _as_utc(now_utc)
+    if (
+        normalized_lane in BACKGROUND_LANES
+        and now.time().replace(tzinfo=None) >= BACKGROUND_HOLD_START
+    ):
+        raise ValueError(
+            "FotMob background child cannot start at or after the 13:30 UTC cutoff"
+        )
     max_requests, max_direct_mib, rpm = _LANE_CAPS[normalized_lane]
     deadline = (
         ""
