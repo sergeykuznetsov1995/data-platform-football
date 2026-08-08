@@ -223,12 +223,27 @@ def _validate_release_identity(
 
 
 def _validated_canary_claim(
-    ref: object,
+    value: object,
     *,
     release: Mapping[str, Any],
     target_scope_ids: Sequence[str],
+    dag_id: str,
+    run_id: str,
+    admission_identity: str,
 ) -> dict[str, Any]:
-    claim = _read_ref(ref, kind="espn-canary-claim-evidence-v1")
+    if not isinstance(value, Mapping) or set(value) != {
+        "claim_ref",
+        "consumption_ref",
+        "admission_identity",
+    }:
+        raise OperationsError("canary claim binding schema mismatch")
+    bound_identity = _sha(
+        value["admission_identity"], "canary admission identity"
+    )
+    if bound_identity != admission_identity:
+        raise OperationsError("canary claim admission identity drift")
+    claim_ref = value["claim_ref"]
+    claim = _read_ref(claim_ref, kind="espn-canary-claim-evidence-v1")
     if set(claim) != {
         "kind",
         "schema_version",
@@ -266,13 +281,34 @@ def _validated_canary_claim(
     current_ledger = _read_ref(claim["ledger_ref"])
     if current_ledger != claim["ledger"]:
         raise OperationsError("canary claim ledger changed after claim")
+    try:
+        from scripts.espn_canary_campaign import validate_campaign_consumption
+
+        validate_campaign_consumption(
+            claim_ref=claim_ref,
+            consumption_ref=value["consumption_ref"],
+            dag_id=dag_id,
+            run_id=run_id,
+            admission_identity=admission_identity,
+        )
+    except CampaignError as exc:
+        raise OperationsError(f"canary claim consumption is invalid: {exc}") from exc
     return {
-        "claim_ref": dict(ref),
+        "claim_ref": dict(claim_ref),
+        "consumption_ref": dict(value["consumption_ref"]),
+        "admission_identity": bound_identity,
         "campaign_id": campaign.campaign_id,
         "attempt_id": attempt.attempt_id,
         "ordinal": attempt.ordinal,
         "ledger_ref": dict(claim["ledger_ref"]),
     }
+
+
+def _canary_admission_identity(
+    admission: Mapping[str, Any], claim_ref: Mapping[str, str]
+) -> str:
+    identity_payload = {**dict(admission), "canary_claim": dict(claim_ref)}
+    return hashlib.sha256(_canonical_bytes(identity_payload)).hexdigest()
 
 
 def select_mapping_descriptors(
@@ -730,10 +766,20 @@ def _admission_payload(value: object) -> Mapping[str, Any]:
                     "181-scope backfill must equal the exact frozen canary target"
                 )
             if exact_canary:
+                if not isinstance(value["canary_claim"], Mapping):
+                    raise OperationsError(
+                        "exact all-181 canary requires a bound single-use claim"
+                    )
+                admission_identity = _canary_admission_identity(
+                    value, value["canary_claim"].get("claim_ref", {})
+                )
                 _validated_canary_claim(
                     value["canary_claim"],
                     release=release,
                     target_scope_ids=target,
+                    dag_id=value["dag_id"],
+                    run_id=value["run_id"],
+                    admission_identity=admission_identity,
                 )
             elif value["canary_claim"] is not None:
                 raise OperationsError("non-canary admission forbids a campaign claim")
@@ -741,9 +787,15 @@ def _admission_payload(value: object) -> Mapping[str, Any]:
 
 
 def _read_admission_ref(ref: Mapping[str, str]) -> Mapping[str, Any]:
-    """Read current v2 and in-flight v1 admissions through one version gate."""
+    """Read only admissions signed by the current release-aware runtime."""
 
-    return _admission_payload(_read_ref(ref))
+    admission = _admission_payload(_read_ref(ref))
+    if admission["kind"] != "espn-airflow-admission-v3":
+        raise OperationsError(
+            "current runtime rejects pre-v3 admission; exact historical replay "
+            "requires pinned e12b85a"
+        )
+    return admission
 
 
 def _replay_existing_admission(
@@ -761,10 +813,7 @@ def _replay_existing_admission(
     except FileNotFoundError:
         return None
     admission = _read_admission_ref(admission_ref)
-    if admission["kind"] in {
-        "espn-airflow-admission-v2",
-        "espn-airflow-admission-v3",
-    }:
+    if admission["kind"] == "espn-airflow-admission-v3":
         registry = _load_registry_ref(admission)
         target = tuple(
             sorted(
@@ -974,13 +1023,6 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
         if mode != "daily":
             return existing_ref
         admission = _read_admission_ref(existing_ref)
-        if admission["kind"] not in {
-            "espn-airflow-admission-v2",
-            "espn-airflow-admission-v3",
-        }:
-            raise OperationsError(
-                "daily admission retry requires current v2 admission schema"
-            )
         registry = _load_registry_ref(admission)
         store = PostgresEspnControlStore.from_env()
         store.migrate()
@@ -997,9 +1039,14 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
             )
         return existing_ref
     parent = _daily_parent(context) if mode == "daily" else None
-    store = PostgresEspnControlStore.from_env()
-    store.migrate()
-    registry, discovery = _load_discovered_registry(now=store.current_time())
+    requested = tuple((context.get("params") or {}).get("scopes") or ())
+    prospective_canary = mode == "backfill" and len(requested) == 181
+    store = None
+    if not prospective_canary:
+        store = PostgresEspnControlStore.from_env()
+        store.migrate()
+    discovery_now = datetime.now(UTC) if store is None else store.current_time()
+    registry, discovery = _load_discovered_registry(now=discovery_now)
     target_scopes = tuple(
         sorted(
             competition.scope_id(competition.current_edition)
@@ -1008,6 +1055,7 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
     )
     bootstrap_scopes: tuple[str, ...] = ()
     if mode == "daily":
+        assert store is not None
         target_scopes, scopes, bootstrap_scopes = _validated_daily_heads(
             store, registry
         )
@@ -1038,11 +1086,6 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
     if exact_canary:
         if canary_claim_ref is None:
             raise OperationsError("exact all-181 canary requires immutable claim evidence")
-        _validated_canary_claim(
-            canary_claim_ref,
-            release=release,
-            target_scope_ids=target_scopes,
-        )
     elif canary_claim_ref is not None:
         raise OperationsError("non-canary admission forbids a campaign claim")
     payload = {
@@ -1074,6 +1117,29 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
             else {}
         ),
     }
+    if exact_canary:
+        assert canary_claim_ref is not None
+        admission_identity = _canary_admission_identity(payload, canary_claim_ref)
+        try:
+            from scripts.espn_canary_campaign import consume_campaign_claim
+
+            consumption_ref = consume_campaign_claim(
+                claim_ref=canary_claim_ref,
+                dag_id=dag_id,
+                run_id=run_id,
+                admission_identity=admission_identity,
+            )
+        except CampaignError as exc:
+            raise OperationsError(f"canary claim consumption failed: {exc}") from exc
+        payload["canary_claim"] = {
+            "claim_ref": canary_claim_ref,
+            "consumption_ref": consumption_ref,
+            "admission_identity": admission_identity,
+        }
+    _admission_payload(payload)
+    if store is None:
+        store = PostgresEspnControlStore.from_env()
+        store.migrate()
     return _write_payload(admission_uri, payload, immutable=True)
 
 
@@ -2036,6 +2102,12 @@ def _binding(ref: Mapping[str, str]):
                 loaded_claim,
                 release=release,
                 target_scope_ids=target_scope_ids,
+                dag_id=descriptor["dag_id"],
+                run_id=loaded.plan.run_id,
+                admission_identity=_sha(
+                    loaded_claim.get("admission_identity"),
+                    "signed plan canary admission identity",
+                ),
             )
     if (
         loaded.signature,
@@ -3262,6 +3334,12 @@ def _canary_campaign_identity(
         claim_ref,
         release=release,
         target_scope_ids=target_scope_ids,
+        dag_id=index["dag_id"],
+        run_id=index["run_id"],
+        admission_identity=_sha(
+            claim_ref.get("admission_identity"),
+            "plan index canary admission identity",
+        ),
     )
 
 

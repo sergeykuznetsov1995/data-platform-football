@@ -378,11 +378,19 @@ master должен быть scheduled, этот rollout заблокирова�
    точную пару как `ESPN_CANARY_CLAIM_URI` и `ESPN_CANARY_CLAIM_SHA256` до
    admission. Admission strict-read проверяет bytes/SHA, canonical
    `CampaignLedger`, latest active attempt, exact frozen scope array/target SHA
-   и текущий ledger SHA, затем включает claim ref в signed admission и каждый
-   signed plan. Неполная пара, чужой claim или изменившийся ledger блокируют run
-   до lease/fetch/write. После terminal receipt `finish_campaign_attempt`
-   публикует отдельный content-addressed immutable `finish_ref`; claim и finish
-   evidence никогда не перезаписывают друг друга.
+   и текущий ledger SHA. До первого control-store access admission атомарно
+   создаёт immutable single-use consumption marker, связанный с exact
+   `(dag_id, run_id, canonical admission identity)`, и включает claim,
+   consumption ref и admission identity в signed admission и каждый signed
+   plan. Retry того же exact run идемпотентен; concurrent или последовательный
+   другой run с тем же claim всегда блокируется до lease/fetch/write. После
+   terminal receipt `finish_campaign_attempt` публикует отдельный immutable
+   deterministic `finish_ref`; он монотонно отзывает claim, поэтому даже
+   восстановление старых active ledger bytes не возвращает authorization.
+   Claim, consumption и finish evidence никогда не перезаписывают друг друга.
+   Текущий runtime исполняет только `espn-airflow-admission-v3`; authentic v1/v2
+   можно разобрать для аудита, но их execution/retry требует pinned `e12b85a` и
+   fail-closed отклоняется до registry/control/network/publication.
 
    ```bash
    espn_airflow dags pause dag_backfill_espn

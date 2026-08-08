@@ -1529,11 +1529,16 @@ def test_exact_all_scope_backfill_binds_consumed_campaign_ordinal(
     monkeypatch, tmp_path
 ):
     from dags.utils import espn_native_tasks
-    from scripts.espn_canary_campaign import claim_campaign_attempt
+    from scripts.espn_canary_campaign import (
+        claim_campaign_attempt,
+        consume_campaign_claim,
+    )
 
     monkeypatch.setenv(espn_native_tasks.RELEASE_COMMIT_ENV, "a" * 40)
     monkeypatch.setenv(espn_native_tasks.RELEASE_TREE_SHA256_ENV, "b" * 64)
     index = {
+        "dag_id": "dag_backfill_espn",
+        "run_id": "manual__canary",
         "mode": "backfill",
         "registry_signature": "c" * 64,
         "scope_ids": sorted(f"{item}:2026" for item in range(1, 182)),
@@ -1547,7 +1552,19 @@ def test_exact_all_scope_backfill_binds_consumed_campaign_ordinal(
         target_scope_ids=release["target_scope_ids"],
         now=datetime(2026, 8, 8, tzinfo=timezone.utc),
     )
-    index["canary_claim"] = claimed["claim_ref"]
+    admission_identity = "d" * 64
+    consumption_ref = consume_campaign_claim(
+        claim_ref=claimed["claim_ref"],
+        dag_id=index["dag_id"],
+        run_id=index["run_id"],
+        admission_identity=admission_identity,
+        now=datetime(2026, 8, 8, tzinfo=timezone.utc),
+    )
+    index["canary_claim"] = {
+        "claim_ref": claimed["claim_ref"],
+        "consumption_ref": consumption_ref,
+        "admission_identity": admission_identity,
+    }
 
     result = espn_native_tasks._canary_campaign_identity(index, release)
 
@@ -2199,7 +2216,7 @@ def test_manual_admission_keeps_explicit_generated_scope_without_reading_heads(
         espn_native_tasks.validate_registry_and_admission(mode="repair", **context)
 
 
-def test_admission_retry_replays_exact_v2_before_mutable_reads(monkeypatch):
+def test_current_runtime_rejects_authentic_v2_before_mutable_reads(monkeypatch):
     from dags.utils import espn_native_tasks
 
     logical_date = datetime(2026, 8, 2, 12, tzinfo=timezone.utc)
@@ -2243,7 +2260,7 @@ def test_admission_retry_replays_exact_v2_before_mutable_reads(monkeypatch):
     monkeypatch.setattr(
         espn_native_tasks,
         "_load_registry_ref",
-        lambda _admission: _generated_registry(1),
+        lambda _admission: pytest.fail("v2 must fail before registry access"),
     )
     monkeypatch.setattr(
         espn_native_tasks.PostgresEspnControlStore,
@@ -2261,16 +2278,16 @@ def test_admission_retry_replays_exact_v2_before_mutable_reads(monkeypatch):
         lambda: pytest.fail("retry must preserve its sealed raw store"),
     )
 
-    result = espn_native_tasks.validate_registry_and_admission(
-        mode="repair",
-        params={"attempt": 1, "scopes": ["10000:2026"]},
-        dag_run=SimpleNamespace(conf={}),
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda *_args, **_kwargs: pytest.fail("v2 must fail before publication"),
     )
 
-    assert result == admission_ref
-
-    admission.pop("candidate_ref")
-    with pytest.raises(espn_native_tasks.OperationsError, match="fields"):
+    with pytest.raises(
+        espn_native_tasks.OperationsError,
+        match="pinned e12b85a",
+    ):
         espn_native_tasks.validate_registry_and_admission(
             mode="repair",
             params={"attempt": 1, "scopes": ["10000:2026"]},
@@ -2278,8 +2295,78 @@ def test_admission_retry_replays_exact_v2_before_mutable_reads(monkeypatch):
         )
 
 
+def test_exact_181_v2_backfill_cannot_resume_before_control_or_publication(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+
+    logical_date = datetime(2026, 8, 2, 12, tzinfo=timezone.utc)
+    scopes = sorted(f"{index}:2026" for index in range(1, 182))
+    admission = {
+        "kind": "espn-airflow-admission-v2",
+        "schema_version": 2,
+        "dag_id": "dag_backfill_espn",
+        "run_id": "manual__legacy-canary",
+        "attempt": 1,
+        "mode": "backfill",
+        "as_of": logical_date.date().isoformat(),
+        "logical_date": logical_date.isoformat(),
+        "parent": None,
+        "registry_ref": {"uri": "registry", "sha256": "a" * 64},
+        "registry_signature": "b" * 64,
+        "target_scope_ids": scopes,
+        "scope_ids": scopes,
+        "bootstrap_scope_ids": [],
+        "discovery_state_ref": {"uri": "state", "sha256": "c" * 64},
+        "candidate_ref": {"uri": "candidate", "sha256": "d" * 64},
+        "selection_policy": "explicit-core-gender-MALE-v1",
+        "male_scope_count": 181,
+        "artifact_root": "s3://artifacts/runs/legacy",
+        "raw_store_uri": "s3://raw",
+        "replay_sources": {},
+    }
+    admission_ref = {
+        "uri": f"{admission['artifact_root']}/admission.json",
+        "sha256": "e" * 64,
+    }
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_run_identity",
+        lambda _context: (admission["dag_id"], admission["run_id"], logical_date),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(espn_native_tasks, "_run_key", lambda *_args: "legacy")
+    monkeypatch.setattr(espn_native_tasks, "_ref_for_uri", lambda _uri: admission_ref)
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_args, **_kwargs: admission)
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: pytest.fail("v2 must fail before control store")),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_registry_ref",
+        lambda _admission: pytest.fail("v2 must fail before registry access"),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda *_args, **_kwargs: pytest.fail("v2 must fail before publication"),
+    )
+
+    with pytest.raises(
+        espn_native_tasks.OperationsError,
+        match="pinned e12b85a",
+    ):
+        espn_native_tasks.validate_registry_and_admission(
+            mode="backfill",
+            params={"attempt": 1, "scopes": scopes},
+            dag_run=SimpleNamespace(conf={}),
+        )
+
+
 @pytest.mark.parametrize("schema_version", [1, 2])
-def test_daily_admission_retry_revalidates_heads_without_parent_metadata(
+def test_daily_pre_v3_admission_retry_fails_before_parent_or_control_metadata(
     monkeypatch, schema_version
 ):
     from dags.utils import espn_native_tasks
@@ -2343,7 +2430,7 @@ def test_daily_admission_retry_revalidates_heads_without_parent_metadata(
     monkeypatch.setattr(
         espn_native_tasks.PostgresEspnControlStore,
         "from_env",
-        classmethod(lambda _cls: Store()),
+        classmethod(lambda _cls: pytest.fail("pre-v3 must fail before control store")),
     )
     monkeypatch.setattr(
         espn_native_tasks,
@@ -2364,14 +2451,8 @@ def test_daily_admission_retry_revalidates_heads_without_parent_metadata(
         ),
     )
 
-    if schema_version == 1:
-        with pytest.raises(espn_native_tasks.OperationsError, match="current v2"):
-            espn_native_tasks.validate_registry_and_admission(mode="daily", **context)
-    else:
-        assert (
-            espn_native_tasks.validate_registry_and_admission(mode="daily", **context)
-            == admission_ref
-        )
+    with pytest.raises(espn_native_tasks.OperationsError, match="pinned e12b85a"):
+        espn_native_tasks.validate_registry_and_admission(mode="daily", **context)
 
 
 def test_missing_release_identity_fails_before_control_store(monkeypatch):
@@ -2420,6 +2501,7 @@ def test_canary_claim_strict_read_rejects_mutated_ledger(tmp_path):
     from dags.utils import espn_native_tasks
     from scripts.espn_canary_campaign import (
         claim_campaign_attempt,
+        consume_campaign_claim,
         finish_campaign_attempt,
     )
 
@@ -2439,8 +2521,26 @@ def test_canary_claim_strict_read_rejects_mutated_ledger(tmp_path):
         "runtime_version": "espn-native-runtime-v4",
     }
 
+    admission_identity = "f" * 64
+    consumption_ref = consume_campaign_claim(
+        claim_ref=claimed["claim_ref"],
+        dag_id="dag_backfill_espn",
+        run_id="manual__canary",
+        admission_identity=admission_identity,
+        now=datetime(2026, 8, 8, tzinfo=timezone.utc),
+    )
+    binding = {
+        "claim_ref": claimed["claim_ref"],
+        "consumption_ref": consumption_ref,
+        "admission_identity": admission_identity,
+    }
     validated = espn_native_tasks._validated_canary_claim(
-        claimed["claim_ref"], release=release, target_scope_ids=scopes
+        binding,
+        release=release,
+        target_scope_ids=scopes,
+        dag_id="dag_backfill_espn",
+        run_id="manual__canary",
+        admission_identity=admission_identity,
     )
     assert validated["attempt_id"].endswith("ordinal001")
 
@@ -2453,8 +2553,112 @@ def test_canary_claim_strict_read_rejects_mutated_ledger(tmp_path):
     )
     with pytest.raises(Exception, match="hash|changed"):
         espn_native_tasks._validated_canary_claim(
-            claimed["claim_ref"], release=release, target_scope_ids=scopes
+            binding,
+            release=release,
+            target_scope_ids=scopes,
+            dag_id="dag_backfill_espn",
+            run_id="manual__canary",
+            admission_identity=admission_identity,
         )
+
+
+def test_exact_v3_canary_admission_consumes_claim_before_control_and_is_idempotent(
+    monkeypatch, tmp_path
+):
+    from dags.utils import espn_native_tasks
+    from scripts.espn_canary_campaign import claim_campaign_attempt
+
+    logical_date = datetime(2026, 8, 8, 12, tzinfo=timezone.utc)
+    registry = _generated_registry(181)
+    scopes = _scope_ids(registry)
+    discovery = {
+        "discovery_state_ref": {"uri": "file:///state.json", "sha256": "d" * 64},
+        "male_registry_ref": {"uri": "file:///registry.json", "sha256": "e" * 64},
+        "candidate_ref": {"uri": "file:///candidate.json", "sha256": "f" * 64},
+        "selection_policy": "explicit-core-gender-MALE-v1",
+        "male_scope_count": 181,
+    }
+    ledger_path = tmp_path / "campaigns.json"
+    claimed = claim_campaign_attempt(
+        ledger_path=ledger_path,
+        release_commit="a" * 40,
+        release_tree_sha256="b" * 64,
+        registry_signature=registry.signature(),
+        target_scope_ids=scopes,
+        now=logical_date,
+    )
+    monkeypatch.setenv(
+        espn_native_tasks.CANARY_CLAIM_URI_ENV, claimed["claim_ref"]["uri"]
+    )
+    monkeypatch.setenv(
+        espn_native_tasks.CANARY_CLAIM_SHA256_ENV,
+        claimed["claim_ref"]["sha256"],
+    )
+    artifact_root = (tmp_path / "artifacts").resolve().as_uri()
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: artifact_root)
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_discovered_registry",
+        lambda *, now: (registry, discovery),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_load_registry_ref", lambda _a: registry)
+    control_entries = []
+
+    class Store:
+        def migrate(self):
+            control_entries.append("migrate")
+
+    def store_factory(_cls):
+        markers = list(
+            ledger_path.with_name(ledger_path.name + ".evidence").glob(
+                "espn-canary-claim-consumption-v1-*.json"
+            )
+        )
+        assert len(markers) == 1, "claim must be consumed before control access"
+        return Store()
+
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(store_factory),
+    )
+    context = {
+        "dag": SimpleNamespace(dag_id="dag_backfill_espn"),
+        "dag_run": SimpleNamespace(conf={}),
+        "run_id": "manual__canary",
+        "logical_date": logical_date,
+        "params": {"attempt": 1, "scopes": list(scopes)},
+    }
+
+    admission_ref = espn_native_tasks.validate_registry_and_admission(
+        mode="backfill", **context
+    )
+    admission = espn_native_tasks._read_admission_ref(admission_ref)
+    binding = admission["canary_claim"]
+    assert binding["claim_ref"] == claimed["claim_ref"]
+    assert binding["admission_identity"] == espn_native_tasks._canary_admission_identity(
+        admission, claimed["claim_ref"]
+    )
+    assert control_entries == ["migrate"]
+    tampered = json.loads(json.dumps(admission))
+    tampered["raw_store_uri"] = "s3://raw/drifted"
+    with pytest.raises(
+        espn_native_tasks.OperationsError,
+        match="admission identity drift",
+    ):
+        espn_native_tasks._admission_payload(tampered)
+
+    assert (
+        espn_native_tasks.validate_registry_and_admission(mode="backfill", **context)
+        == admission_ref
+    )
+    other_context = {**context, "run_id": "manual__other-canary"}
+    with pytest.raises(espn_native_tasks.OperationsError, match="already consumed"):
+        espn_native_tasks.validate_registry_and_admission(
+            mode="backfill", **other_context
+        )
+    assert control_entries == ["migrate"]
 
 
 def test_pending_empty_control_evidence_is_strictly_loaded_for_next_plan(
@@ -2546,7 +2750,7 @@ def test_pending_empty_control_evidence_is_strictly_loaded_for_next_plan(
     ) == observation
 
 
-def test_daily_v2_admission_retry_revalidates_all_current_runtime_heads(
+def test_daily_v2_admission_retry_rejects_before_runtime_head_reads(
     monkeypatch,
 ):
     from dags.utils import espn_native_tasks
@@ -2602,7 +2806,7 @@ def test_daily_v2_admission_retry_revalidates_all_current_runtime_heads(
     monkeypatch.setattr(
         espn_native_tasks.PostgresEspnControlStore,
         "from_env",
-        classmethod(lambda _cls: Store()),
+        classmethod(lambda _cls: pytest.fail("v2 must fail before control store")),
     )
     monkeypatch.setattr(
         espn_native_tasks.runner,
@@ -2621,7 +2825,7 @@ def test_daily_v2_admission_retry_revalidates_all_current_runtime_heads(
         ),
     )
 
-    with pytest.raises(espn_native_tasks.OperationsError, match="181/181"):
+    with pytest.raises(espn_native_tasks.OperationsError, match="pinned e12b85a"):
         espn_native_tasks.validate_registry_and_admission(mode="daily", **context)
 
 
@@ -2629,7 +2833,7 @@ def test_daily_v2_admission_retry_revalidates_all_current_runtime_heads(
     ("kind", "schema_version"),
     [("espn-airflow-admission-v1", 1), ("espn-airflow-admission-v2", 2)],
 )
-def test_admission_consumers_accept_inflight_v1_and_current_v2(
+def test_pre_v3_admissions_remain_parseable_but_are_not_executable(
     monkeypatch, kind, schema_version
 ):
     from dags.utils import espn_native_tasks
@@ -2662,10 +2866,11 @@ def test_admission_consumers_accept_inflight_v1_and_current_v2(
         )
     monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: admission)
 
-    assert (
-        espn_native_tasks._read_admission_ref({"uri": "admission", "sha256": "a" * 64})
-        == admission
-    )
+    assert espn_native_tasks._admission_payload(admission) == admission
+    with pytest.raises(espn_native_tasks.OperationsError, match="pinned e12b85a"):
+        espn_native_tasks._read_admission_ref(
+            {"uri": "admission", "sha256": "a" * 64}
+        )
 
 
 def test_discovery_registry_rejects_future_state_and_enabled_non_male(monkeypatch):
@@ -5019,8 +5224,8 @@ def test_expired_same_owner_acquisition_reclaims_instead_of_failing(monkeypatch)
             return (replacement,)
 
     admission = {
-        "kind": "espn-airflow-admission-v1",
-        "schema_version": 1,
+        "kind": "espn-airflow-admission-v3",
+        "schema_version": 3,
         "dag_id": "dag_ingest_espn",
         "run_id": "run-1",
         "attempt": 1,
@@ -5029,7 +5234,18 @@ def test_expired_same_owner_acquisition_reclaims_instead_of_failing(monkeypatch)
         "parent": None,
         "registry_ref": {"uri": "registry", "sha256": "e" * 64},
         "registry_signature": "f" * 64,
+        "target_scope_ids": ["700:2026"],
         "scope_ids": ["700:2026"],
+        "bootstrap_scope_ids": [],
+        "discovery_state_ref": {"uri": "state", "sha256": "b" * 64},
+        "candidate_ref": {"uri": "candidate", "sha256": "c" * 64},
+        "selection_policy": "explicit-core-gender-MALE-v1",
+        "male_scope_count": 1,
+        "release": espn_native_tasks._release_identity(
+            registry_signature="f" * 64,
+            target_scope_ids=("700:2026",),
+        ),
+        "canary_claim": None,
         "artifact_root": "s3://artifacts/run",
         "logical_date": now.isoformat(),
         "raw_store_uri": "s3://raw",
@@ -7678,9 +7894,9 @@ def test_final_leaf_seals_success_only_after_health_and_release(monkeypatch):
             "status": "complete",
             "failures": [],
         },
-        "admission.json": {
-            "kind": "espn-airflow-admission-v1",
-            "schema_version": 1,
+            "admission.json": {
+                "kind": "espn-airflow-admission-v3",
+                "schema_version": 3,
             "dag_id": "dag_ingest_espn",
             "run_id": "child-run",
             "attempt": 1,
@@ -7689,8 +7905,19 @@ def test_final_leaf_seals_success_only_after_health_and_release(monkeypatch):
             "logical_date": "2026-07-31T00:00:00+00:00",
             "parent": {"schema": "espn-master-parent-v1"},
             "registry_ref": {"uri": "registry", "sha256": "3" * 64},
-            "registry_signature": "4" * 64,
-            "scope_ids": ["700:2026"],
+                "registry_signature": "4" * 64,
+                "target_scope_ids": ["700:2026"],
+                "scope_ids": ["700:2026"],
+                "bootstrap_scope_ids": [],
+                "discovery_state_ref": {"uri": "state", "sha256": "5" * 64},
+                "candidate_ref": {"uri": "candidate", "sha256": "6" * 64},
+                "selection_policy": "explicit-core-gender-MALE-v1",
+                "male_scope_count": 1,
+                "release": espn_native_tasks._release_identity(
+                    registry_signature="4" * 64,
+                    target_scope_ids=("700:2026",),
+                ),
+                "canary_claim": None,
             "artifact_root": "s3://artifacts/run",
             "raw_store_uri": "s3://raw",
             "replay_sources": {},

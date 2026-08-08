@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
+import threading
 
 import pytest
 
+import scripts.espn_canary_campaign as campaign_operator
 from scripts.espn_canary_campaign import (
     claim_campaign_attempt,
     finish_campaign_attempt,
@@ -97,3 +100,121 @@ def test_claim_and_finish_evidence_are_content_addressed_and_immutable(tmp_path)
     assert finished["finish_ref"]["uri"] != claim_ref["uri"]
     finish_path = Path(finished["finish_ref"]["uri"].removeprefix("file://"))
     assert hashlib.sha256(finish_path.read_bytes()).hexdigest() == finished["finish_ref"]["sha256"]
+
+
+@pytest.mark.unit
+def test_claim_consumption_is_single_use_and_same_run_retry_is_idempotent(tmp_path):
+    claimed = _claim(tmp_path / "campaigns.json")
+    binding = {
+        "claim_ref": claimed["claim_ref"],
+        "dag_id": "dag_backfill_espn",
+        "run_id": "manual__canary-a",
+        "admission_identity": "d" * 64,
+        "now": NOW,
+    }
+
+    first = campaign_operator.consume_campaign_claim(**binding)
+    retry = campaign_operator.consume_campaign_claim(**binding)
+
+    assert retry == first
+    with pytest.raises(CampaignError, match="already consumed"):
+        campaign_operator.consume_campaign_claim(
+            **{**binding, "run_id": "manual__canary-b"}
+        )
+    campaign_operator.validate_campaign_consumption(
+        claim_ref=claimed["claim_ref"],
+        consumption_ref=first,
+        dag_id=binding["dag_id"],
+        run_id=binding["run_id"],
+        admission_identity=binding["admission_identity"],
+    )
+
+
+@pytest.mark.unit
+def test_concurrent_claim_reuse_allows_exactly_one_run(tmp_path):
+    claimed = _claim(tmp_path / "campaigns.json")
+    barrier = threading.Barrier(2)
+
+    def consume(run_id):
+        barrier.wait()
+        try:
+            return campaign_operator.consume_campaign_claim(
+                claim_ref=claimed["claim_ref"],
+                dag_id="dag_backfill_espn",
+                run_id=run_id,
+                admission_identity=hashlib.sha256(run_id.encode()).hexdigest(),
+                now=NOW,
+            )
+        except CampaignError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(consume, ("manual__a", "manual__b")))
+
+    assert sum(isinstance(item, dict) for item in results) == 1
+    errors = [item for item in results if isinstance(item, CampaignError)]
+    assert len(errors) == 1
+    assert "already consumed" in str(errors[0])
+
+
+@pytest.mark.unit
+def test_finished_claim_stays_revoked_after_active_ledger_restore(tmp_path):
+    ledger_path = tmp_path / "campaigns.json"
+    claimed = _claim(ledger_path)
+    active_ledger = ledger_path.read_bytes()
+    consumption_ref = campaign_operator.consume_campaign_claim(
+        claim_ref=claimed["claim_ref"],
+        dag_id="dag_backfill_espn",
+        run_id="manual__canary",
+        admission_identity="d" * 64,
+        now=NOW,
+    )
+    finish_campaign_attempt(
+        ledger_path=ledger_path,
+        attempt_id=claimed["attempt"]["attempt_id"],
+        terminal_ref={"uri": "s3://evidence/failure.json", "sha256": "e" * 64},
+        successful=False,
+        now=NOW,
+    )
+    ledger_path.write_bytes(active_ledger)
+
+    with pytest.raises(CampaignError, match="finished|revoked"):
+        campaign_operator.validate_campaign_consumption(
+            claim_ref=claimed["claim_ref"],
+            consumption_ref=consumption_ref,
+            dag_id="dag_backfill_espn",
+            run_id="manual__canary",
+            admission_identity="d" * 64,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("dag_id", "dag_ingest_espn"),
+        ("run_id", "manual__other"),
+        ("admission_identity", "f" * 64),
+    ],
+)
+def test_consumption_validation_requires_exact_admission_binding(
+    tmp_path, field, value
+):
+    claimed = _claim(tmp_path / "campaigns.json")
+    binding = {
+        "dag_id": "dag_backfill_espn",
+        "run_id": "manual__canary",
+        "admission_identity": "d" * 64,
+    }
+    consumption_ref = campaign_operator.consume_campaign_claim(
+        claim_ref=claimed["claim_ref"],
+        now=NOW,
+        **binding,
+    )
+
+    with pytest.raises(CampaignError, match="binding"):
+        campaign_operator.validate_campaign_consumption(
+            claim_ref=claimed["claim_ref"],
+            consumption_ref=consumption_ref,
+            **{**binding, field: value},
+        )
