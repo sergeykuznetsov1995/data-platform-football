@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import json
 import uuid
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -37,6 +39,7 @@ from scrapers.fbref.pipeline import (
     live_wave_target_capacity,
     page_target_from_link,
     wave_target_capacity,
+    _bounded_int,
     _session_failure,
 )
 from scrapers.fbref.discovery import (
@@ -164,10 +167,27 @@ def _complete_sentinel_coverage():
 class FakeWriter:
     def __init__(self):
         self.pages = []
+        self.batch_sizes = []
+        self.batch_error = None
 
     def persist_page(self, page, **kwargs):
         self.pages.append((page, kwargs))
         return {"cells": 0, "tables": len(page.tables), "manifest": 1}
+
+    def persist_pages(self, items):
+        materialized = tuple(items)
+        self.batch_sizes.append(len(materialized))
+        if self.batch_error is not None:
+            raise self.batch_error
+        return [
+            self.persist_page(
+                item.page,
+                canonical_url=item.canonical_url,
+                run_id=item.run_id,
+                staging_identity=item.staging_identity,
+            )
+            for item in materialized
+        ]
 
 
 class ContractWriter(FakeWriter):
@@ -184,6 +204,8 @@ class FakeTypedWriter:
         self.fail = fail
         self.calls = []
         self.events = events
+        self.batch_sizes = []
+        self.batch_error = None
 
     def persist_schedule(self, parsed, **kwargs):
         self.calls.append(("schedule", parsed, kwargs))
@@ -203,11 +225,32 @@ class FakeTypedWriter:
 
     def persist_match(self, parsed, **kwargs):
         self.calls.append(("match", parsed, kwargs))
+        if self.events is not None:
+            self.events.append(f"typed_write:match:{kwargs['match_id']}")
         return {
             name: dataset.row_count
             for name, dataset in parsed.datasets.items()
             if dataset.status.value == "available"
         }
+
+    def persist_matches(self, items):
+        materialized = tuple(items)
+        self.batch_sizes.append(len(materialized))
+        if self.batch_error is not None:
+            raise self.batch_error
+        counts = [
+            self.persist_match(
+                item.parsed,
+                match_id=item.match_id,
+                context=item.context,
+                run_id=item.run_id,
+                target_identity=item.target_identity,
+            )
+            for item in materialized
+        ]
+        if self.events is not None:
+            self.events.append("typed_batch:availability")
+        return counts
 
 
 class FakeTypedAdapter:
@@ -237,6 +280,7 @@ class FakeControl:
         self.session_metrics = []
         self.heartbeats = []
         self.claim_calls = []
+        self.observation_claim_calls = []
         self.eligible_competition_calls = 0
         self.run = {
             "run_type": "current",
@@ -523,6 +567,7 @@ class FakeControl:
         return True
 
     def claim_observation_processing(self, **kwargs):
+        self.observation_claim_calls.append(dict(kwargs))
         key = (
             str(kwargs["logical_refresh_id"]),
             str(kwargs["parser_version"]),
@@ -570,6 +615,7 @@ class FakeControl:
             lease.stateful_parser_version,
         )
         self.observations[key].update(status="failed", **kwargs)
+        self.events.append(f"observation_fail:{lease.target_id}")
 
     def list_backfill_seasons(self, *, limit):
         rows = []
@@ -601,6 +647,7 @@ class FakeControl:
 
     def record_dataset_manifest(self, **kwargs):
         self.manifests.append(kwargs)
+        self.events.append(f"manifest:{kwargs['target_id']}:{kwargs['dataset']}")
 
     def create_registry_snapshot(self, **kwargs):
         self.events.append("snapshot")
@@ -927,6 +974,638 @@ def _commit_for_parse(store, target, html):
         http_status=200,
     )
     return refresh, record
+
+
+MATCH_FIXTURE = (
+    Path(__file__).parents[2]
+    / "fixtures"
+    / "fbref"
+    / "matches"
+    / "0701e218.html.gz"
+)
+
+
+def _pipeline_with_saved_matches(tmp_path, match_ids=("0701e218", "a071faa8")):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry["9"] = {
+        "competition_id": "9",
+        "canonical_url": "https://fbref.com/en/comps/9/history/x",
+        "name": "Premier League",
+        "gender": "male",
+        "classification": "league:club",
+        "metadata": {},
+    }
+    html = gzip.decompress(MATCH_FIXTURE.read_bytes()).decode("utf-8")
+    records = []
+    for position, match_id in enumerate(match_ids):
+        target_id = f"fbref:match:{match_id}:{position}"
+        target = PageTarget(
+            source="fbref",
+            page_kind="match",
+            target_id=target_id,
+            canonical_url=(
+                f"https://fbref.com/en/matches/{match_id}/x-{position}"
+            ),
+            source_ids={
+                "competition_id": "9",
+                "season_id": "2025-2026",
+                "match_id": match_id,
+            },
+        )
+        refresh, record = _commit_for_parse(raw, target, html)
+        records.append(record)
+        control.frontier[target.target_id] = {
+            "target_id": target.target_id,
+            "page_kind": "match",
+            "state": "fetched",
+            "last_content_hash": record.content_hash,
+            "last_logical_refresh_id": refresh,
+        }
+        control.fetches.append({
+            "target_id": target.target_id,
+            "page_kind": "match",
+            "logical_refresh_id": refresh,
+            "content_hash": record.content_hash,
+        })
+    generic = FakeWriter()
+    typed = FakeTypedWriter(events=control.events)
+
+    def forbidden_transport(*_args):
+        raise AssertionError("parse batching must not construct a transport")
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=generic,
+        typed_adapter=FakeTypedAdapter(typed),
+        fetcher_factory=forbidden_transport,
+    )
+    pipeline.batch_persist_enabled = True
+    return pipeline, control, records, generic, typed
+
+
+def test_batch_persist_configuration_is_bounded_and_default_off(monkeypatch):
+    pipeline = FBrefPipeline(
+        FakeControl(), object(), generic_writer=FakeWriter()
+    )
+    assert pipeline.batch_persist_enabled is False
+    assert pipeline.batch_persist_matches == 8
+    assert pipeline.batch_persist_max_cells == 150000
+    monkeypatch.delenv("FBREF_BATCH_PERSIST_MATCHES", raising=False)
+    assert _bounded_int(
+        "FBREF_BATCH_PERSIST_MATCHES", default=8, lower=2, upper=25
+    ) == 8
+    monkeypatch.setenv("FBREF_BATCH_PERSIST_MATCHES", "2")
+    assert _bounded_int(
+        "FBREF_BATCH_PERSIST_MATCHES", default=8, lower=2, upper=25
+    ) == 2
+    monkeypatch.setenv("FBREF_BATCH_PERSIST_MATCHES", "26")
+    with pytest.raises(ValueError, match="between 2 and 25"):
+        _bounded_int(
+            "FBREF_BATCH_PERSIST_MATCHES", default=8, lower=2, upper=25
+        )
+
+
+def test_match_parse_wave_batches_writers_and_completes_each_lease(tmp_path):
+    pipeline, control, records, generic, typed = (
+        _pipeline_with_saved_matches(tmp_path)
+    )
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["match"],
+        settings=_settings(),
+    )
+
+    assert generic.batch_sizes == [2]
+    assert typed.batch_sizes == [2]
+    assert result.claimed == result.parsed == result.typed_promoted == 2
+    assert all(row["status"] == "succeeded" for row in control.observations.values())
+    for record in records:
+        availability = control.events.index("typed_batch:availability")
+        typed_complete = control.events.index(
+            f"manifest:{record.target_id}:typed:__complete__"
+        )
+        page_complete = control.events.index(
+            f"manifest:{record.target_id}:__page__"
+        )
+        observation_complete = control.events.index(
+            f"observation_complete:{record.target_id}"
+        )
+        assert availability < typed_complete < page_complete < observation_complete
+
+
+@pytest.mark.parametrize("writer_name", ["generic", "typed"])
+def test_match_batch_failure_reuses_claims_and_raw_without_network(
+    tmp_path, writer_name
+):
+    pipeline, control, _records, generic, typed = (
+        _pipeline_with_saved_matches(tmp_path)
+    )
+    writer = generic if writer_name == "generic" else typed
+    writer.batch_error = RuntimeError("commit reset")
+    load_calls = 0
+    original_load = pipeline.raw_store.load_fetch_html
+
+    def counted_load(logical_refresh_id):
+        nonlocal load_calls
+        load_calls += 1
+        return original_load(logical_refresh_id)
+
+    pipeline.raw_store.load_fetch_html = counted_load
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+
+    assert result.claimed == result.parsed == 2
+    assert load_calls == 2
+    assert len(control.observation_claim_calls) == 2
+    assert len(control.observations) == 2
+    assert all(row["status"] == "succeeded" for row in control.observations.values())
+    if writer_name == "generic":
+        assert len(generic.pages) == 2
+    else:
+        assert len(generic.pages) == 2
+        assert [call[0] for call in typed.calls] == ["match", "match"]
+        guards = [
+            event for event in control.events
+            if event.startswith("content_guard:")
+        ]
+        assert len(guards) == 2
+        for call in typed.calls:
+            target_identity = call[2]["target_identity"]
+            record = next(
+                record for record in _records
+                if record.logical_refresh_id == target_identity
+            )
+            write = control.events.index(
+                f"typed_write:match:{call[2]['match_id']}"
+            )
+            guard_exit = control.events.index(
+                f"content_guard_exit:{record.target_id}"
+            )
+            assert write < guard_exit
+
+
+def test_duplicate_match_identity_uses_claimed_sequential_fallback(tmp_path):
+    pipeline, control, records, generic, typed = _pipeline_with_saved_matches(
+        tmp_path
+    )
+    original_load = pipeline.raw_store.load_fetch_html
+
+    def duplicate_match_id(logical_refresh_id):
+        html, record = original_load(logical_refresh_id)
+        if record.logical_refresh_id == records[1].logical_refresh_id:
+            record = replace(
+                record,
+                source_ids={**record.source_ids, "match_id": "0701e218"},
+            )
+        return html, record
+
+    pipeline.raw_store.load_fetch_html = duplicate_match_id
+    # The fake control can represent duplicate source rows even though the raw
+    # store target is the same. Each observation remains independently leased.
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+
+    assert result.claimed == result.parsed == 2
+    assert generic.batch_sizes == []
+    assert typed.batch_sizes == []
+    assert len(generic.pages) == len(typed.calls) == 2
+    assert all(row["status"] == "succeeded" for row in control.observations.values())
+
+
+def test_duplicate_target_identity_uses_claimed_sequential_fallback(tmp_path):
+    pipeline, control, records, generic, typed = _pipeline_with_saved_matches(
+        tmp_path
+    )
+    original_load = pipeline.raw_store.load_fetch_html
+    duplicate_target = records[0].target_id
+    control.fetches[1]["target_id"] = duplicate_target
+
+    def load_with_duplicate_target(logical_refresh_id):
+        html, record = original_load(logical_refresh_id)
+        if record.logical_refresh_id == records[1].logical_refresh_id:
+            record = replace(record, target_id=duplicate_target)
+        return html, record
+
+    pipeline.raw_store.load_fetch_html = load_with_duplicate_target
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+
+    assert result.claimed == result.parsed == 2
+    assert generic.batch_sizes == typed.batch_sizes == []
+    assert len(generic.pages) == 2
+    assert len(control.observation_claim_calls) == 2
+
+
+def test_match_batch_size_and_cell_limits_are_inclusive(tmp_path):
+    pipeline, _control, _records, generic, typed = (
+        _pipeline_with_saved_matches(tmp_path)
+    )
+    pipeline.batch_persist_matches = 2
+    pipeline.batch_persist_max_cells = 1000
+    pipeline._match_item_cells = lambda _item: 500
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+
+    assert result.parsed == 2
+    assert generic.batch_sizes == typed.batch_sizes == [2]
+
+    overflow, _control, _records, generic, typed = _pipeline_with_saved_matches(
+        tmp_path / "overflow"
+    )
+    overflow.batch_persist_max_cells = 1000
+    overflow._match_item_cells = lambda _item: 600
+    result = overflow.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+    assert result.parsed == 2
+    assert generic.batch_sizes == typed.batch_sizes == [1, 1]
+
+
+def test_match_batches_flush_around_non_match_items(tmp_path):
+    pipeline, control, records, generic, typed = _pipeline_with_saved_matches(
+        tmp_path
+    )
+    player = PageTarget(
+        source="fbref",
+        page_kind="player",
+        target_id="fbref:player:1234abcd",
+        canonical_url="https://fbref.com/en/players/1234abcd/x",
+        source_ids={"player_id": "1234abcd"},
+    )
+    refresh, player_record = _commit_for_parse(
+        pipeline.raw_store,
+        player,
+        "<html><head><link rel='canonical' "
+        "href='https://fbref.com/en/players/1234abcd/x'>"
+        "<meta property='og:type' content='Athlete'></head>"
+        "<body><div id='meta'><h1>X</h1></div></body></html>",
+    )
+    control.frontier[player.target_id] = {
+        "state": "fetched",
+        "last_content_hash": player_record.content_hash,
+        "last_logical_refresh_id": refresh,
+    }
+    player_fetch = {
+        "target_id": player.target_id,
+        "page_kind": "player",
+        "logical_refresh_id": refresh,
+        "content_hash": player_record.content_hash,
+    }
+    control.fetches = [control.fetches[0], player_fetch, control.fetches[1]]
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["match", "player"],
+        settings=_settings(),
+    )
+
+    assert result.parsed == 3
+    assert generic.batch_sizes == typed.batch_sizes == [1, 1]
+    assert [page.target_id for page, _ in generic.pages] == [
+        records[0].target_id,
+        player.target_id,
+        records[1].target_id,
+    ]
+
+
+def test_batch_guards_enter_sorted_and_exit_reverse_sorted(tmp_path):
+    pipeline, control, _records, _generic, _typed = (
+        _pipeline_with_saved_matches(tmp_path)
+    )
+    control.fetches.reverse()
+
+    pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+
+    entries = [
+        event.removeprefix("content_guard:")
+        for event in control.events
+        if event.startswith("content_guard:")
+    ]
+    exits = [
+        event.removeprefix("content_guard_exit:")
+        for event in control.events
+        if event.startswith("content_guard_exit:")
+    ]
+    assert entries == sorted(entries)
+    assert exits == list(reversed(entries))
+
+
+def test_batch_latest_same_hash_new_refresh_is_stale_at_final_lock(tmp_path):
+    pipeline, control, records, generic, typed = _pipeline_with_saved_matches(
+        tmp_path
+    )
+    original_batch = generic.persist_pages
+
+    def race_after_preparation(items):
+        result = original_batch(items)
+        first = records[0]
+        # A -> B -> A: same final content hash, different observation identity.
+        control.frontier[first.target_id].update(
+            last_content_hash="b" * 64,
+            last_logical_refresh_id=str(uuid.uuid4()),
+        )
+        control.frontier[first.target_id]["last_content_hash"] = (
+            first.content_hash
+        )
+        return result
+
+    generic.persist_pages = race_after_preparation
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+
+    assert result.parsed == 2
+    assert result.typed_promoted == 1
+    assert result.stale_typed_observations_skipped == 1
+    assert typed.batch_sizes == [1]
+    stale = next(
+        item for item in control.manifests
+        if item["target_id"] == records[0].target_id
+        and item["dataset"] == "typed:__stale_observation__"
+    )
+    assert stale["persistence_status"] == "skipped"
+    assert not any(
+        item["target_id"] == records[0].target_id
+        and item["dataset"] == "typed:__complete__"
+        for item in control.manifests
+    )
+
+
+def test_batch_none_verdict_fails_lease_after_unlock_without_markers(tmp_path):
+    pipeline, control, records, _generic, typed = _pipeline_with_saved_matches(
+        tmp_path
+    )
+    deferred = records[0]
+    control.frontier[deferred.target_id]["state"] = "leased"
+
+    with pytest.raises(ParseWaveError, match="TypedPromotionDeferred"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+        )
+
+    deferred_manifests = [
+        item for item in control.manifests
+        if item["target_id"] == deferred.target_id
+    ]
+    assert not any(
+        item["dataset"] in {
+            "typed:__stale_observation__",
+            "typed:__complete__",
+            "__page__",
+        }
+        for item in deferred_manifests
+    )
+    key = next(
+        key for key, row in control.observations.items()
+        if row["target_id"] == deferred.target_id
+    )
+    assert control.observations[key]["status"] == "failed"
+    assert typed.batch_sizes == [1]
+    fail = control.events.index(f"observation_fail:{deferred.target_id}")
+    exits = [
+        index for index, event in enumerate(control.events)
+        if event.startswith("content_guard_exit:")
+    ]
+    assert max(exits) < fail
+
+
+def test_batch_limit_flushes_at_max_items_and_oversized_singleton_falls_back(
+    tmp_path,
+):
+    pipeline, _control, _records, generic, typed = _pipeline_with_saved_matches(
+        tmp_path,
+        match_ids=("0701e218", "a071faa8", "643d26fd"),
+    )
+    pipeline.batch_persist_matches = 2
+    pipeline._match_item_cells = lambda _item: 500
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+
+    assert result.parsed == 3
+    assert generic.batch_sizes == typed.batch_sizes == [2, 1]
+
+    singleton, _control, _records, generic, typed = (
+        _pipeline_with_saved_matches(
+            tmp_path / "singleton", match_ids=("0701e218",)
+        )
+    )
+    singleton.batch_persist_max_cells = 1000
+    singleton._match_item_cells = lambda _item: 1001
+    result = singleton.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+    assert result.parsed == 1
+    assert generic.batch_sizes == typed.batch_sizes == []
+    assert len(generic.pages) == len(typed.calls) == 1
+
+
+def test_match_page_parser_error_keeps_legacy_sequential_error_evidence(
+    tmp_path,
+):
+    pipeline, control, records, _generic, typed = _pipeline_with_saved_matches(
+        tmp_path, match_ids=("0701e218",)
+    )
+    pipeline.generic_writer = ContractWriter()
+    original_parse = pipeline._parse_generic
+
+    def page_with_error(html, record):
+        return replace(
+            original_parse(html, record), errors=("forced_parser_error",)
+        )
+
+    pipeline._parse_generic = page_with_error
+
+    with pytest.raises(ParseWaveError, match="generic contract failed"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+        )
+
+    page_evidence = [
+        item for item in control.manifests
+        if item["target_id"] == records[0].target_id
+        and item["dataset"] == "__page__"
+    ]
+    assert len(page_evidence) == 1
+    assert page_evidence[0]["parse_status"] == "failed"
+    assert page_evidence[0]["persistence_status"] == "failed"
+    assert typed.calls == []
+    assert next(iter(control.observations.values()))["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "fault_dataset",
+    ["typed:match_events", "typed:__complete__", "__page__"],
+)
+def test_batch_per_item_manifest_fault_never_completes_early_and_continues(
+    tmp_path, fault_dataset
+):
+    pipeline, control, records, _generic, _typed = (
+        _pipeline_with_saved_matches(tmp_path)
+    )
+    first = records[0]
+    original_record = control.record_dataset_manifest
+    injected = False
+
+    def fail_one_manifest(**kwargs):
+        nonlocal injected
+        if (
+            not injected
+            and kwargs["target_id"] == first.target_id
+            and kwargs["dataset"] == fault_dataset
+        ):
+            injected = True
+            raise RuntimeError(f"fault after {fault_dataset}")
+        return original_record(**kwargs)
+
+    control.record_dataset_manifest = fail_one_manifest
+
+    with pytest.raises(ParseWaveError, match="fault after"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+        )
+
+    first_key = next(
+        key for key, row in control.observations.items()
+        if row["target_id"] == first.target_id
+    )
+    second_key = next(
+        key for key, row in control.observations.items()
+        if row["target_id"] == records[1].target_id
+    )
+    assert control.observations[first_key]["status"] == "failed"
+    assert control.observations[second_key]["status"] == "succeeded"
+    first_datasets = [
+        item["dataset"] for item in control.manifests
+        if item["target_id"] == first.target_id
+    ]
+    if fault_dataset != "__page__":
+        assert "__page__" in first_datasets
+        assert next(
+            item for item in control.manifests
+            if item["target_id"] == first.target_id
+            and item["dataset"] == "__page__"
+        )["validation_status"] == "failed"
+    assert f"observation_complete:{first.target_id}" not in control.events
+    failure = control.events.index(f"observation_fail:{first.target_id}")
+    guard_exits = [
+        index for index, event in enumerate(control.events)
+        if event.startswith("content_guard_exit:")
+    ]
+    assert max(guard_exits) < failure
+
+
+def test_batch_observation_completion_fault_fails_only_that_lease(tmp_path):
+    pipeline, control, records, _generic, _typed = (
+        _pipeline_with_saved_matches(tmp_path)
+    )
+    first = records[0]
+    original_complete = control.complete_observation_processing
+
+    def fail_before_complete(lease, **kwargs):
+        if lease.target_id == first.target_id:
+            raise RuntimeError("observation commit fault")
+        return original_complete(lease, **kwargs)
+
+    control.complete_observation_processing = fail_before_complete
+
+    with pytest.raises(ParseWaveError, match="observation commit fault"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+        )
+
+    statuses = {
+        row["target_id"]: row["status"] for row in control.observations.values()
+    }
+    assert statuses[first.target_id] == "failed"
+    assert statuses[records[1].target_id] == "succeeded"
+    assert not any(row["status"] == "processing" for row in control.observations.values())
+    failure = control.events.index(f"observation_fail:{first.target_id}")
+    assert max(
+        index for index, event in enumerate(control.events)
+        if event.startswith("content_guard_exit:")
+    ) < failure
+
+
+def test_generic_batch_misaligned_counts_use_idempotent_sequential_repair(
+    tmp_path,
+):
+    pipeline, control, _records, generic, typed = (
+        _pipeline_with_saved_matches(tmp_path)
+    )
+    original_batch = generic.persist_pages
+
+    def misaligned(items):
+        counts = original_batch(items)
+        return counts[:-1]
+
+    generic.persist_pages = misaligned
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+
+    assert result.parsed == 2
+    assert len(control.observation_claim_calls) == 2
+    # First batch writes plus one idempotent singleton repair per item.
+    assert len(generic.pages) == 4
+    assert typed.batch_sizes == []
+    assert [call[0] for call in typed.calls] == ["match", "match"]
+
+
+def test_second_batch_guard_enter_fault_closes_first_then_fails_all_leases(
+    tmp_path,
+):
+    pipeline, control, records, _generic, typed = (
+        _pipeline_with_saved_matches(tmp_path)
+    )
+    ordered = sorted(record.target_id for record in records)
+
+    @contextmanager
+    def guard_with_second_enter_fault(
+        target_id, content_hash, logical_refresh_id
+    ):
+        del content_hash, logical_refresh_id
+        control.events.append(f"content_guard:{target_id}")
+        if target_id == ordered[1]:
+            raise RuntimeError("second guard enter fault")
+        try:
+            yield True
+        finally:
+            control.events.append(f"content_guard_exit:{target_id}")
+
+    control.guard_latest_content = guard_with_second_enter_fault
+
+    with pytest.raises(ParseWaveError, match="second guard enter fault"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+        )
+
+    first_exit = control.events.index(f"content_guard_exit:{ordered[0]}")
+    failures = [
+        control.events.index(f"observation_fail:{target_id}")
+        for target_id in ordered
+    ]
+    assert all(first_exit < failure for failure in failures)
+    assert typed.calls == []
+    assert typed.batch_sizes == []
+    assert {
+        row["status"] for row in control.observations.values()
+    } == {"failed"}
 
 
 def test_completed_manifest_conflict_does_not_mask_processing_failure(

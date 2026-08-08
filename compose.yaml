@@ -781,6 +781,10 @@ services:
       # Keep it outside the image/venv trust roots and never allow the package
       # to select or download a mutable default database.
       FBREF_CAMOUFOX_GEOIP_DATABASE_PATH: /opt/airflow/secure/fbref-geoip/GeoLite2-City.mmdb
+      # Default-off until saved-raw differential and recovery gates pass.
+      FBREF_BATCH_PERSIST: ${FBREF_BATCH_PERSIST:-0}
+      FBREF_BATCH_PERSIST_MATCHES: ${FBREF_BATCH_PERSIST_MATCHES:-8}
+      FBREF_BATCH_PERSIST_MAX_CELLS: ${FBREF_BATCH_PERSIST_MAX_CELLS:-150000}
     # YAML merge keys replace sequences, so repeat the common mounts before
     # appending the scheduler-only, deployment-owned approval directory.
     volumes:
@@ -935,6 +939,9 @@ services:
     environment:
       <<: *airflow-common-env
       AIRFLOW__WEBSERVER__WORKERS: "2"
+      FBREF_BATCH_PERSIST: ${FBREF_BATCH_PERSIST:-0}
+      FBREF_BATCH_PERSIST_MATCHES: ${FBREF_BATCH_PERSIST_MATCHES:-8}
+      FBREF_BATCH_PERSIST_MAX_CELLS: ${FBREF_BATCH_PERSIST_MAX_CELLS:-150000}
       # SSO через Keycloak (webserver_config.py); false = обычная форма логина
       AIRFLOW_OAUTH_ENABLED: ${AIRFLOW_OAUTH_ENABLED:-false}
       AIRFLOW_OIDC_CLIENT_SECRET: ${AIRFLOW_OIDC_CLIENT_SECRET:-}

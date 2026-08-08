@@ -11,14 +11,18 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
-from contextlib import ExitStack
-from dataclasses import asdict, dataclass, field
+from contextlib import ExitStack, contextmanager
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
-from scrapers.fbref.bronze import FBrefGenericBronzeWriter
+from scrapers.fbref.bronze import (
+    FBrefGenericBronzeWriter,
+    GenericPagePersistItem,
+)
 from scrapers.fbref.control import (
     BudgetExceeded,
     CompetitionRegistryEntry,
@@ -31,7 +35,7 @@ from scrapers.fbref.control import (
     make_control_run_id,
     make_logical_refresh_id,
 )
-from scrapers.fbref.control.models import CohortTarget
+from scrapers.fbref.control.models import CohortTarget, ObservationLease
 from scrapers.fbref.discovery import (
     DISCOVERY_PARSER_VERSION,
     CalendarType,
@@ -60,6 +64,7 @@ from scrapers.fbref.fetcher import (
 from scrapers.fbref.page_document import (
     PAGE_DOCUMENT_VERSION,
     Availability,
+    PageDocument,
     parse_page_document,
 )
 from scrapers.fbref.raw_store import (
@@ -91,6 +96,7 @@ from scrapers.fbref.typed_bronze import (
     TYPED_BRONZE_PARSER_VERSION,
     FBrefTypedBronzeAdapter,
     FBrefTypedBronzeWriter,
+    TypedMatchPersistItem,
     TypedBronzeError,
     TypedSourceContext,
     parse_match_html as parse_typed_match_html,
@@ -98,6 +104,7 @@ from scrapers.fbref.typed_bronze import (
     parse_season_stats_html as parse_typed_season_stats_html,
     typed_result_requires_persistence,
 )
+from scrapers.fbref.match_parser import MatchParseResult
 
 
 SENTINEL_COMPETITIONS = (
@@ -139,6 +146,51 @@ CLEARANCE_REJECTED_STATUSES = frozenset({401, 403, 429})
 MAX_CONSECUTIVE_CLEARANCE_REFRESHES = 2
 
 logger = logging.getLogger(__name__)
+
+
+def _bounded_int(
+    name: str, *, default: int, lower: int, upper: int
+) -> int:
+    """Read an integer environment setting and reject unsafe bounds."""
+
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if not lower <= value <= upper:
+        raise ValueError(f"{name} must be between {lower} and {upper}")
+    return value
+
+
+FBREF_BATCH_PERSIST = os.environ.get("FBREF_BATCH_PERSIST", "0") == "1"
+FBREF_BATCH_PERSIST_MATCHES = _bounded_int(
+    "FBREF_BATCH_PERSIST_MATCHES", default=8, lower=2, upper=25
+)
+FBREF_BATCH_PERSIST_MAX_CELLS = _bounded_int(
+    "FBREF_BATCH_PERSIST_MAX_CELLS",
+    default=150000,
+    lower=1000,
+    upper=500000,
+)
+
+
+@contextmanager
+def _captured_exit_stack(errors: list[Exception]):
+    """Close every acquired context and defer lock errors to lease fencing."""
+
+    stack = ExitStack()
+    try:
+        yield stack
+    except Exception as exc:
+        errors.append(exc)
+    finally:
+        try:
+            stack.close()
+        except Exception as exc:
+            errors.append(exc)
 
 
 class PipelineError(RuntimeError):
@@ -470,6 +522,48 @@ class WaveResult:
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class _ProcessedObservation:
+    """Per-lease outcome which can be aggregated without stopping a cohort."""
+
+    parsed: int = 0
+    typed_promoted: int = 0
+    stale_typed_observations_skipped: int = 0
+    seeded: int = 0
+    skipped_ineligible: int = 0
+    contract_quarantined: int = 0
+    failures: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _ClaimedMatchObservation:
+    run_id: str
+    html: str
+    record: RawFetchRecord
+    observation_lease: ObservationLease
+    page: PageDocument
+    typed_match: MatchParseResult
+    typed_context: TypedSourceContext
+    match_id: str
+    stateful_run_id: str
+    stateful_run_type: str
+
+    def sequential_args(self, *, generic_persisted: bool = False) -> dict:
+        return {
+            "run_id": self.run_id,
+            "html": self.html,
+            "record": self.record,
+            "observation_lease": self.observation_lease,
+            "page": self.page,
+            "typed_match": self.typed_match,
+            "typed_context": self.typed_context,
+            "match_id": self.match_id,
+            "generic_persisted": generic_persisted,
+            "stateful_run_id": self.stateful_run_id,
+            "stateful_run_type": self.stateful_run_type,
+        }
 
 
 @dataclass
@@ -1427,6 +1521,11 @@ class FBrefPipeline:
         )
         self.sleep = sleep
         self.clock = clock
+        # Instance fields make the default-off rollout and bounded cohort
+        # policy directly inspectable and overridable in deterministic tests.
+        self.batch_persist_enabled = FBREF_BATCH_PERSIST
+        self.batch_persist_matches = FBREF_BATCH_PERSIST_MATCHES
+        self.batch_persist_max_cells = FBREF_BATCH_PERSIST_MAX_CELLS
 
     @classmethod
     def from_env(cls) -> "FBrefPipeline":
@@ -3206,6 +3305,14 @@ class FBrefPipeline:
         html: str,
         record: RawFetchRecord,
     ):
+        page = self._parse_generic(html, record)
+        self._persist_generic_page(
+            run_id, page, record, record_failure=True
+        )
+        return page
+
+    @staticmethod
+    def _parse_generic(html: str, record: RawFetchRecord) -> PageDocument:
         page = parse_page_document(
             html,
             target_id=record.target_id,
@@ -3213,6 +3320,25 @@ class FBrefPipeline:
             source_ids=record.source_ids,
             content_hash=record.content_hash,
         )
+        if (
+            page.target_id != record.target_id
+            or page.page_kind != record.page_kind
+            or page.content_hash != record.content_hash
+            or page.parser_version != PAGE_DOCUMENT_VERSION
+        ):
+            raise ParseWaveError(
+                f"Generic parser identity mismatch for {record.target_id}"
+            )
+        return page
+
+    def _persist_generic_page(
+        self,
+        run_id: str,
+        page: PageDocument,
+        record: RawFetchRecord,
+        *,
+        record_failure: bool,
+    ) -> None:
         try:
             self.generic_writer.persist_page(
                 page,
@@ -3221,30 +3347,29 @@ class FBrefPipeline:
                 staging_identity=record.logical_refresh_id,
             )
         except Exception as exc:
-            try:
-                self.control.record_dataset_manifest(
-                    target_id=record.target_id,
-                    content_hash=record.content_hash,
-                    parser_version=PAGE_DOCUMENT_VERSION,
-                    dataset="__page__",
-                    availability=Availability.ERROR.value,
-                    parse_status=("failed" if page.errors else "succeeded"),
-                    persistence_status="failed",
-                    validation_status="failed",
-                    row_count=0,
-                    error_class=type(exc).__name__,
-                    error_message=str(exc),
-                )
-            except StateConflict:
-                # These exact bytes already have a completed manifest from an
-                # earlier parse by this exact parser; that evidence stands.
-                # Recording a failure over it must never replace the error that
-                # actually broke this parse — the diagnosis is what we need.
-                logger.warning(
-                    "Failure manifest for %s not recorded: the generic "
-                    "manifest is already completed", record.target_id,
-                )
+            if record_failure:
+                try:
+                    self._record_page_completion(
+                        record,
+                        page,
+                        succeeded=False,
+                        error=exc,
+                        parse_succeeded=not page.errors,
+                    )
+                except StateConflict:
+                    # These exact bytes already have a completed manifest from
+                    # an earlier retry; immutable completion evidence stands.
+                    logger.warning(
+                        "Failure manifest for %s not recorded: the generic "
+                        "manifest is already completed",
+                        record.target_id,
+                    )
             raise
+        self._record_generic_table_results(record, page)
+
+    def _record_generic_table_results(
+        self, record: RawFetchRecord, page: PageDocument
+    ) -> None:
         for table in page.tables:
             self.control.record_dataset_manifest(
                 target_id=record.target_id,
@@ -3258,7 +3383,6 @@ class FBrefPipeline:
                 row_count=table.row_count,
                 error_message=table.reason,
             )
-        return page
 
     def _typed_context(
         self, record: RawFetchRecord
@@ -3276,6 +3400,55 @@ class FBrefPipeline:
             ),
             season_label=str(season_id),
         )
+
+    def _parse_typed_match(
+        self, html: str, record: RawFetchRecord
+    ) -> tuple[MatchParseResult, str, TypedSourceContext]:
+        context = self._typed_context(record)
+        if context is None:
+            raise TypedBronzeError(
+                "Typed page requires source competition_id and season_id"
+            )
+        match_id = str(record.source_ids.get("match_id") or "").strip()
+        if not match_id:
+            raise TypedBronzeError("Match target has no source match_id")
+        parsed = parse_typed_match_html(
+            html,
+            match_id=match_id,
+            context=context,
+            require_player_contract=False,
+        )
+        if not isinstance(parsed, MatchParseResult):
+            raise TypedBronzeError("Typed match parser returned invalid result")
+        return parsed, match_id, context
+
+    def _persist_preparsed_typed_match(
+        self,
+        run_id: str,
+        record: RawFetchRecord,
+        parsed: MatchParseResult,
+        *,
+        match_id: str,
+        context: TypedSourceContext,
+    ) -> None:
+        counts: Optional[Mapping[str, int]] = None
+        try:
+            if parsed.has_errors:
+                raise TypedBronzeError("Typed match parser failed")
+            counts = self.typed_adapter.writer.persist_match(
+                parsed,
+                match_id=match_id,
+                context=context,
+                run_id=run_id,
+                target_identity=record.logical_refresh_id,
+            )
+        except Exception:
+            self._record_typed_results(
+                record, parsed.datasets, persisted=None
+            )
+            raise
+        self._record_typed_results(record, parsed.datasets, persisted=counts)
+        self._record_typed_completion(record)
 
     def _record_typed_results(
         self,
@@ -3477,6 +3650,7 @@ class FBrefPipeline:
         *,
         succeeded: bool,
         error: Optional[Exception] = None,
+        parse_succeeded: bool = False,
     ) -> None:
         self.control.record_dataset_manifest(
             target_id=record.target_id,
@@ -3490,7 +3664,9 @@ class FBrefPipeline:
                 if page is not None and page.tables
                 else Availability.EMPTY.value
             ),
-            parse_status="succeeded" if succeeded else "failed",
+            parse_status=(
+                "succeeded" if succeeded or parse_succeeded else "failed"
+            ),
             persistence_status="succeeded" if succeeded else "failed",
             validation_status="succeeded" if succeeded else "failed",
             row_count=(
@@ -3566,6 +3742,573 @@ class FBrefPipeline:
         raise ParseWaveError(
             f"Season source contract failed for {record.target_id}"
         )
+
+    def _failed_claimed_observation(
+        self,
+        *,
+        record: RawFetchRecord,
+        page: Optional[PageDocument],
+        observation_lease: ObservationLease,
+        exc: Exception,
+        parse_succeeded: bool = False,
+        typed_promoted: int = 0,
+        stale_typed_observations_skipped: int = 0,
+    ) -> _ProcessedObservation:
+        failures: list[str] = []
+        if not isinstance(exc, TypedPromotionDeferred):
+            try:
+                self._record_page_completion(
+                    record,
+                    page,
+                    succeeded=False,
+                    error=exc,
+                    parse_succeeded=parse_succeeded,
+                )
+            except StateConflict:
+                logger.warning(
+                    "Failure completion marker for %s already exists",
+                    record.target_id,
+                )
+            except Exception as manifest_exc:
+                failures.append(
+                    f"{record.target_id}:manifest:"
+                    f"{type(manifest_exc).__name__}:{manifest_exc}"
+                )
+        try:
+            self.control.fail_observation_processing(
+                observation_lease,
+                error_class=type(exc).__name__,
+                error_message=str(exc),
+            )
+        except Exception as fence_exc:
+            failures.append(
+                f"{record.target_id}:observation_fence:"
+                f"{type(fence_exc).__name__}:{fence_exc}"
+            )
+        if isinstance(exc, SourceContractRejected):
+            retired = False
+            try:
+                retired = self.control.quarantine_contract_rejected_target(
+                    exc.target_id,
+                    content_hash=exc.content_hash,
+                    reason=exc.reason,
+                )
+            except Exception as quarantine_exc:
+                failures.append(
+                    f"{record.target_id}:contract_quarantine:"
+                    f"{type(quarantine_exc).__name__}:{quarantine_exc}"
+                )
+            if retired:
+                logger.warning(
+                    "Quarantined %s after source contract rejection: %s",
+                    exc.target_id,
+                    exc.reason,
+                )
+                return _ProcessedObservation(
+                    typed_promoted=typed_promoted,
+                    stale_typed_observations_skipped=(
+                        stale_typed_observations_skipped
+                    ),
+                    contract_quarantined=1,
+                    failures=tuple(failures),
+                )
+        failures.append(f"{record.target_id}:{type(exc).__name__}:{exc}")
+        return _ProcessedObservation(
+            typed_promoted=typed_promoted,
+            stale_typed_observations_skipped=(
+                stale_typed_observations_skipped
+            ),
+            failures=tuple(failures),
+        )
+
+    def _finish_claimed_observation(
+        self,
+        *,
+        run_id: str,
+        html: str,
+        record: RawFetchRecord,
+        observation_lease: ObservationLease,
+        page: PageDocument,
+        typed_match: Optional[MatchParseResult],
+        typed_context: Optional[TypedSourceContext],
+        match_id: Optional[str],
+        is_latest: Optional[bool],
+        stateful_run_id: str,
+        stateful_run_type: str,
+        typed_batch_counts: Optional[Mapping[str, int]] = None,
+        progress: Optional[dict[str, int]] = None,
+    ) -> _ProcessedObservation:
+        """Finish one supplied lease under an already-held frontier verdict."""
+
+        typed_page = record.page_kind in {
+            "schedule",
+            "season",
+            "season_stats",
+            "match",
+        }
+        if is_latest is None:
+            raise TypedPromotionDeferred(
+                f"Stateful promotion deferred for active target {record.target_id}"
+            )
+        if is_latest:
+            self._validate_pre_promotion_contract(html, record)
+            typed_promoted = 0
+            if typed_page:
+                if record.page_kind == "match" and typed_match is not None:
+                    if typed_context is None or not match_id:
+                        raise TypedBronzeError(
+                            "Prepared match is missing typed identity"
+                        )
+                    if typed_batch_counts is None:
+                        self._persist_preparsed_typed_match(
+                            run_id,
+                            record,
+                            typed_match,
+                            match_id=match_id,
+                            context=typed_context,
+                        )
+                    else:
+                        self._record_typed_results(
+                            record,
+                            typed_match.datasets,
+                            persisted=typed_batch_counts,
+                        )
+                        self._record_typed_completion(record)
+                else:
+                    if self._typed_context(record) is None:
+                        raise TypedBronzeError(
+                            "Typed page requires source competition_id and "
+                            "season_id"
+                        )
+                    self._persist_typed(run_id, html, record)
+                typed_promoted = 1
+                if progress is not None:
+                    progress["typed_promoted"] = 1
+                typed_status = "succeeded"
+            else:
+                typed_status = "skipped"
+            seeded, skipped = self._apply_stateful_effects(
+                stateful_run_id,
+                html,
+                record,
+                run_type=stateful_run_type,
+                historical=stateful_run_type == "backfill",
+            )
+            stateful_status = "succeeded"
+            stale = 0
+        else:
+            seeded, skipped = 0, 0
+            typed_promoted = 0
+            stale = int(typed_page)
+            stateful_status = "skipped"
+            typed_status = "skipped"
+            if typed_page:
+                self._record_stale_typed_observation(record)
+                if progress is not None:
+                    progress["stale_typed_observations_skipped"] = 1
+        self._record_page_completion(record, page, succeeded=True)
+        self.control.complete_observation_processing(
+            observation_lease,
+            typed_status=typed_status,
+            stateful_status=stateful_status,
+        )
+        return _ProcessedObservation(
+            parsed=1,
+            typed_promoted=typed_promoted,
+            stale_typed_observations_skipped=stale,
+            seeded=seeded,
+            skipped_ineligible=skipped,
+        )
+
+    def _process_claimed_observation(
+        self,
+        *,
+        run_id: str,
+        html: str,
+        record: RawFetchRecord,
+        observation_lease: ObservationLease,
+        page: Optional[PageDocument],
+        typed_match: Optional[MatchParseResult],
+        stateful_run_id: str,
+        stateful_run_type: str,
+        typed_context: Optional[TypedSourceContext] = None,
+        match_id: Optional[str] = None,
+        generic_persisted: bool = False,
+    ) -> _ProcessedObservation:
+        """Persist and finish an already-claimed observation without I/O."""
+
+        prepared_page = page
+        try:
+            if prepared_page is None:
+                prepared_page = self._parse_generic(html, record)
+        except Exception as exc:
+            return self._failed_claimed_observation(
+                record=record,
+                page=prepared_page,
+                observation_lease=observation_lease,
+                exc=exc,
+            )
+        try:
+            if not generic_persisted:
+                self._persist_generic_page(
+                    run_id,
+                    prepared_page,
+                    record,
+                    record_failure=False,
+                )
+        except Exception as exc:
+            return self._failed_claimed_observation(
+                record=record,
+                page=prepared_page,
+                observation_lease=observation_lease,
+                exc=exc,
+                parse_succeeded=not prepared_page.errors,
+            )
+        try:
+            progress: dict[str, int] = {}
+            with self.control.guard_latest_content(
+                record.target_id,
+                record.content_hash,
+                record.logical_refresh_id,
+            ) as is_latest:
+                return self._finish_claimed_observation(
+                    run_id=run_id,
+                    html=html,
+                    record=record,
+                    observation_lease=observation_lease,
+                    page=prepared_page,
+                    typed_match=typed_match,
+                    typed_context=typed_context,
+                    match_id=match_id,
+                    is_latest=is_latest,
+                    stateful_run_id=stateful_run_id,
+                    stateful_run_type=stateful_run_type,
+                    progress=progress,
+                )
+        except Exception as exc:
+            return self._failed_claimed_observation(
+                record=record,
+                page=prepared_page,
+                observation_lease=observation_lease,
+                exc=exc,
+                typed_promoted=progress.get("typed_promoted", 0),
+                stale_typed_observations_skipped=progress.get(
+                    "stale_typed_observations_skipped", 0
+                ),
+            )
+
+    @staticmethod
+    def _batch_has_duplicate_identity(
+        items: Sequence[_ClaimedMatchObservation],
+    ) -> bool:
+        target_ids = [item.record.target_id for item in items]
+        match_ids = [item.match_id for item in items]
+        return len(target_ids) != len(set(target_ids)) or len(match_ids) != len(
+            set(match_ids)
+        )
+
+    @staticmethod
+    def _match_item_cells(item: _ClaimedMatchObservation) -> int:
+        # Bound both lossless generic cells and materialized typed dataframe
+        # cells. The latter is conservative but prevents a small HTML table
+        # inventory from hiding a very wide typed cohort.
+        return len(item.page.cell_records()) + sum(
+            int(dataset.frame.size)
+            for dataset in item.typed_match.datasets.values()
+            if dataset.frame is not None
+        )
+
+    def _match_batch_cells(
+        self, items: Sequence[_ClaimedMatchObservation]
+    ) -> int:
+        return sum(self._match_item_cells(item) for item in items)
+
+    def _process_claimed_match_batch(
+        self, items: Sequence[_ClaimedMatchObservation]
+    ) -> list[_ProcessedObservation]:
+        materialized = tuple(items)
+        if not materialized:
+            return []
+        if self._batch_has_duplicate_identity(materialized):
+            return [
+                self._process_claimed_observation(**item.sequential_args())
+                for item in materialized
+            ]
+        outcomes: list[_ProcessedObservation] = []
+        cohort: list[_ClaimedMatchObservation] = []
+        cohort_cells = 0
+
+        def flush_cohort() -> None:
+            nonlocal cohort, cohort_cells
+            if cohort:
+                outcomes.extend(self._persist_and_finish_match_batch(cohort))
+                cohort = []
+                cohort_cells = 0
+
+        for item in materialized:
+            item_cells = self._match_item_cells(item)
+            if item.page.errors or item.typed_match.has_errors:
+                flush_cohort()
+                outcomes.append(
+                    self._process_claimed_observation(
+                        **item.sequential_args()
+                    )
+                )
+                continue
+            if item_cells > self.batch_persist_max_cells:
+                flush_cohort()
+                outcomes.append(
+                    self._process_claimed_observation(
+                        **item.sequential_args()
+                    )
+                )
+                continue
+            if cohort and (
+                len(cohort) == self.batch_persist_matches
+                or cohort_cells + item_cells
+                > self.batch_persist_max_cells
+            ):
+                flush_cohort()
+            cohort.append(item)
+            cohort_cells += item_cells
+        flush_cohort()
+        return outcomes
+
+    def _persist_and_finish_match_batch(
+        self, items: Sequence[_ClaimedMatchObservation]
+    ) -> list[_ProcessedObservation]:
+        try:
+            generic_counts = self.generic_writer.persist_pages(
+                [
+                    GenericPagePersistItem(
+                        page=item.page,
+                        canonical_url=item.record.canonical_url,
+                        run_id=item.run_id,
+                        staging_identity=item.record.logical_refresh_id,
+                    )
+                    for item in items
+                ]
+            )
+            if len(generic_counts) != len(items):
+                raise ParseWaveError(
+                    "Generic batch returned misaligned item counts"
+                )
+        except Exception:
+            # The generic writer may have committed a prefix. Re-run each
+            # parsed page idempotently, using the same lease and immutable raw.
+            return [
+                self._process_claimed_observation(**item.sequential_args())
+                for item in items
+            ]
+
+        outcomes: dict[str, _ProcessedObservation] = {}
+        active_items = []
+        for item in items:
+            try:
+                self._record_generic_table_results(item.record, item.page)
+            except Exception as exc:
+                outcomes[item.record.logical_refresh_id] = (
+                    self._failed_claimed_observation(
+                        record=item.record,
+                        page=item.page,
+                        observation_lease=item.observation_lease,
+                        exc=exc,
+                    )
+                )
+            else:
+                active_items.append(item)
+        finish_failures: list[
+            tuple[_ClaimedMatchObservation, Exception, dict[str, int]]
+        ] = []
+        lock_errors: list[Exception] = []
+        with _captured_exit_stack(lock_errors) as stack:
+            verdicts = {
+                target_id: stack.enter_context(
+                    self.control.guard_latest_content(
+                        item.record.target_id,
+                        item.record.content_hash,
+                        item.record.logical_refresh_id,
+                    )
+                )
+                for target_id, item in sorted(
+                    (
+                        (item.record.target_id, item)
+                        for item in active_items
+                    ),
+                    key=lambda pair: pair[0],
+                )
+            }
+            eligible = [
+                item
+                for item in active_items
+                if verdicts[item.record.target_id] is True
+            ]
+            counts_by_refresh: dict[str, Mapping[str, int]] = {}
+            batch_error: Optional[Exception] = None
+            if eligible:
+                try:
+                    batch_counts = self.typed_adapter.writer.persist_matches(
+                        [
+                            TypedMatchPersistItem(
+                                parsed=item.typed_match,
+                                match_id=item.match_id,
+                                context=item.typed_context,
+                                run_id=item.run_id,
+                                target_identity=(
+                                    item.record.logical_refresh_id
+                                ),
+                            )
+                            for item in eligible
+                        ]
+                    )
+                    if len(batch_counts) != len(eligible):
+                        raise TypedBronzeError(
+                            "Typed batch returned misaligned item counts"
+                        )
+                    counts_by_refresh = {
+                        item.record.logical_refresh_id: count
+                        for item, count in zip(eligible, batch_counts)
+                    }
+                except Exception as exc:
+                    batch_error = exc
+
+            for item in active_items:
+                verdict = verdicts[item.record.target_id]
+                if verdict is None:
+                    finish_failures.append((
+                        item,
+                        TypedPromotionDeferred(
+                            "Stateful promotion deferred for active target "
+                            f"{item.record.target_id}"
+                        ),
+                        {},
+                    ))
+                    continue
+                try:
+                    # A typed batch error is repaired under the same captured
+                    # verdict and locks. Re-entering the guard would deadlock;
+                    # releasing first would let a newer raw commit race the
+                    # repair of partially replaced old typed tables.
+                    typed_counts = (
+                        None
+                        if batch_error is not None
+                        else counts_by_refresh.get(
+                            item.record.logical_refresh_id
+                        )
+                    )
+                    progress: dict[str, int] = {}
+                    outcomes[item.record.logical_refresh_id] = (
+                        self._finish_claimed_observation(
+                            run_id=item.run_id,
+                            html=item.html,
+                            record=item.record,
+                            observation_lease=item.observation_lease,
+                            page=item.page,
+                            typed_match=item.typed_match,
+                            typed_context=item.typed_context,
+                            match_id=item.match_id,
+                            is_latest=verdict,
+                            stateful_run_id=item.stateful_run_id,
+                            stateful_run_type=item.stateful_run_type,
+                            typed_batch_counts=typed_counts,
+                            progress=progress,
+                        )
+                    )
+                except Exception as exc:
+                    finish_failures.append((item, exc, progress))
+
+        if lock_errors:
+            scheduled = {
+                item.record.logical_refresh_id
+                for item, _exc, _progress in finish_failures
+            }
+            unfinished = [
+                item
+                for item in active_items
+                if item.record.logical_refresh_id not in outcomes
+                and item.record.logical_refresh_id not in scheduled
+            ]
+            for item in unfinished:
+                finish_failures.append((item, lock_errors[0], {}))
+            if not unfinished and outcomes:
+                # An exit failure after durable completion cannot safely turn
+                # a succeeded lease back into failed. Keep its state, but make
+                # the wave report the frontier-fence failure loudly.
+                first_key = next(iter(outcomes))
+                first = outcomes[first_key]
+                lock_error = lock_errors[0]
+                outcomes[first_key] = replace(
+                    first,
+                    failures=first.failures
+                    + (
+                        f"{items[0].record.target_id}:content_guard:"
+                        f"{type(lock_error).__name__}:{lock_error}",
+                    ),
+                )
+
+        # Failure fencing uses its own control transaction, so it must happen
+        # only after every frontier lock is gone. This includes ordinary
+        # per-item failures as well as deferred latest verdicts.
+        for item, exc, progress in finish_failures:
+            outcomes[item.record.logical_refresh_id] = (
+                self._failed_claimed_observation(
+                    record=item.record,
+                    page=item.page,
+                    observation_lease=item.observation_lease,
+                    exc=exc,
+                    typed_promoted=progress.get("typed_promoted", 0),
+                    stale_typed_observations_skipped=progress.get(
+                        "stale_typed_observations_skipped", 0
+                    ),
+                )
+            )
+        return [outcomes[item.record.logical_refresh_id] for item in items]
+
+    def _load_and_claim_observation(
+        self, item: Mapping[str, object]
+    ) -> Optional[tuple[str, RawFetchRecord, ObservationLease]]:
+        logical_refresh_id = str(item["logical_refresh_id"])
+        html, record = self.raw_store.load_fetch_html(logical_refresh_id)
+        if record.logical_refresh_id != logical_refresh_id:
+            raise ParseWaveError(
+                f"Raw/control refresh mismatch for {logical_refresh_id}"
+            )
+        if record.target_id != str(item["target_id"]):
+            raise ParseWaveError(
+                f"Raw/control target mismatch for {logical_refresh_id}"
+            )
+        if item.get("content_hash") and record.content_hash != str(
+            item["content_hash"]
+        ):
+            raise ParseWaveError(
+                f"Raw/control content mismatch for {logical_refresh_id}"
+            )
+        lease = self.control.claim_observation_processing(
+            logical_refresh_id=logical_refresh_id,
+            target_id=record.target_id,
+            content_hash=record.content_hash,
+            parser_version=PAGE_DOCUMENT_VERSION,
+            typed_parser_version=TYPED_BRONZE_PARSER_VERSION,
+            stateful_parser_version=DISCOVERY_PARSER_VERSION,
+            lease_seconds=PROCESSING_LEASE_SECONDS,
+        )
+        if lease is None:
+            return None
+        return html, record, lease
+
+    @staticmethod
+    def _merge_processed_result(
+        result: WaveResult, outcome: _ProcessedObservation
+    ) -> None:
+        result.parsed += outcome.parsed
+        result.typed_promoted += outcome.typed_promoted
+        result.stale_typed_observations_skipped += (
+            outcome.stale_typed_observations_skipped
+        )
+        result.seeded += outcome.seeded
+        result.skipped_ineligible += outcome.skipped_ineligible
+        result.contract_quarantined += outcome.contract_quarantined
+        result.failures.extend(outcome.failures)
 
     def parse_wave(
         self,
@@ -3649,7 +4392,8 @@ class FBrefPipeline:
                 limit=settings.shard_size,
             )
         result.cohort_size = len(fetches)
-        for item in fetches:
+
+        def stateful_identity(item):
             item_stateful_run_id = stateful_run_id
             item_stateful_run_type = stateful_run_type
             if _recover_cross_run:
@@ -3661,166 +4405,102 @@ class FBrefPipeline:
                     ).get("run_type")
                     or "current"
                 )
-            historical = item_stateful_run_type == "backfill"
-            logical_refresh_id = str(item["logical_refresh_id"])
-            record = None
-            page = None
-            observation_lease = None
+            return item_stateful_run_id, item_stateful_run_type
+
+        def process_sequential_item(item):
             try:
-                html, record = self.raw_store.load_fetch_html(
-                    logical_refresh_id
-                )
-                if record.logical_refresh_id != logical_refresh_id:
-                    raise ParseWaveError(
-                        f"Raw/control refresh mismatch for {logical_refresh_id}"
-                    )
-                if record.target_id != str(item["target_id"]):
-                    raise ParseWaveError(
-                        f"Raw/control target mismatch for {logical_refresh_id}"
-                    )
-                if item.get("content_hash") and record.content_hash != str(
-                    item["content_hash"]
-                ):
-                    raise ParseWaveError(
-                        f"Raw/control content mismatch for {logical_refresh_id}"
-                    )
-                observation_lease = self.control.claim_observation_processing(
-                    logical_refresh_id=logical_refresh_id,
-                    target_id=record.target_id,
-                    content_hash=record.content_hash,
-                    parser_version=PAGE_DOCUMENT_VERSION,
-                    typed_parser_version=TYPED_BRONZE_PARSER_VERSION,
-                    stateful_parser_version=DISCOVERY_PARSER_VERSION,
-                    lease_seconds=PROCESSING_LEASE_SECONDS,
-                )
-                if observation_lease is None:
-                    continue
-                result.claimed += 1
-                page = self._persist_generic(run_id, html, record)
-                typed_page = record.page_kind in {
-                    "schedule",
-                    "season",
-                    "season_stats",
-                    "match",
-                }
-                # One frontier lock linearizes typed output, stateful parser
-                # effects, and completion against the next fetch.  Replay is
-                # offline but intentionally rebuilds state from latest raw
-                # when its discovery parser version changes.
-                with self.control.guard_latest_content(
-                    record.target_id,
-                    record.content_hash,
-                    record.logical_refresh_id,
-                ) as is_latest:
-                    if is_latest is None:
-                        raise TypedPromotionDeferred(
-                            "Stateful promotion deferred for active target "
-                            f"{record.target_id}"
-                        )
-                    if is_latest:
-                        self._validate_pre_promotion_contract(html, record)
-                        if typed_page:
-                            if self._typed_context(record) is None:
-                                raise TypedBronzeError(
-                                    "Typed page requires source "
-                                    "competition_id and season_id"
-                                )
-                            self._persist_typed(run_id, html, record)
-                            result.typed_promoted += 1
-                            typed_status = "succeeded"
-                        else:
-                            typed_status = "skipped"
-                        seeded, skipped = self._apply_stateful_effects(
-                            item_stateful_run_id,
-                            html,
-                            record,
-                            run_type=item_stateful_run_type,
-                            historical=historical,
-                        )
-                        stateful_status = "succeeded"
-                    else:
-                        seeded, skipped = 0, 0
-                        stateful_status = "skipped"
-                        typed_status = "skipped"
-                        if typed_page:
-                            self._record_stale_typed_observation(record)
-                            result.stale_typed_observations_skipped += 1
-                    self._record_page_completion(
-                        record, page, succeeded=True
-                    )
-                    self.control.complete_observation_processing(
-                        observation_lease,
-                        typed_status=typed_status,
-                        stateful_status=stateful_status,
-                    )
-                result.seeded += seeded
-                result.skipped_ineligible += skipped
-                result.parsed += 1
+                claimed = self._load_and_claim_observation(item)
             except Exception as exc:
-                if record is not None and not isinstance(
-                    exc, TypedPromotionDeferred
-                ):
-                    try:
-                        self._record_page_completion(
-                            record, page, succeeded=False, error=exc
-                        )
-                    except StateConflict:
-                        # A prior retry may already have committed immutable
-                        # completion evidence for these exact bytes/parser.
-                        # Preserve it and, critically, do not mask the error
-                        # that caused this processing attempt to fail.
-                        logger.warning(
-                            "Failure completion marker for %s already exists",
-                            record.target_id,
-                        )
-                    except Exception as manifest_exc:
-                        result.failures.append(
-                            f"{item['target_id']}:manifest:"
-                            f"{type(manifest_exc).__name__}:{manifest_exc}"
-                        )
-                if observation_lease is not None:
-                    try:
-                        self.control.fail_observation_processing(
-                            observation_lease,
-                            error_class=type(exc).__name__,
-                            error_message=str(exc),
-                        )
-                    except Exception as fence_exc:
-                        result.failures.append(
-                            f"{item['target_id']}:observation_fence:"
-                            f"{type(fence_exc).__name__}:{fence_exc}"
-                        )
-                if isinstance(exc, SourceContractRejected):
-                    # The verdict is a property of these immutable bytes, so
-                    # the target is retired here rather than left to block the
-                    # recovery cohort of every later run.  Quarantining runs
-                    # after the content guard released its frontier row lock.
-                    retired = False
-                    try:
-                        retired = self.control.quarantine_contract_rejected_target(
-                            exc.target_id,
-                            content_hash=exc.content_hash,
-                            reason=exc.reason,
-                        )
-                    except Exception as quarantine_exc:
-                        result.failures.append(
-                            f"{item['target_id']}:contract_quarantine:"
-                            f"{type(quarantine_exc).__name__}:{quarantine_exc}"
-                        )
-                    if retired:
-                        logger.warning(
-                            "Quarantined %s after source contract rejection: %s",
-                            exc.target_id,
-                            exc.reason,
-                        )
-                        result.contract_quarantined += 1
-                        continue
-                    # A target raced into a lease or was already retired stays
-                    # a wave failure: reporting progress that did not shrink
-                    # the cohort would spin the recovery drain forever.
                 result.failures.append(
                     f"{item['target_id']}:{type(exc).__name__}:{exc}"
                 )
+                return
+            if claimed is None:
+                return
+            result.claimed += 1
+            html, record, observation_lease = claimed
+            item_run_id, item_run_type = stateful_identity(item)
+            outcome = self._process_claimed_observation(
+                run_id=run_id,
+                html=html,
+                record=record,
+                observation_lease=observation_lease,
+                page=None,
+                typed_match=None,
+                stateful_run_id=item_run_id,
+                stateful_run_type=item_run_type,
+            )
+            self._merge_processed_result(result, outcome)
+
+        def flush_match_items(buffer):
+            prepared: list[_ClaimedMatchObservation] = []
+            for item in buffer:
+                try:
+                    claimed = self._load_and_claim_observation(item)
+                except Exception as exc:
+                    result.failures.append(
+                        f"{item['target_id']}:{type(exc).__name__}:{exc}"
+                    )
+                    continue
+                if claimed is None:
+                    continue
+                result.claimed += 1
+                html, record, observation_lease = claimed
+                item_run_id, item_run_type = stateful_identity(item)
+                page: Optional[PageDocument] = None
+                try:
+                    page = self._parse_generic(html, record)
+                    typed_match, match_id, typed_context = (
+                        self._parse_typed_match(html, record)
+                    )
+                except Exception:
+                    # Preparation validation failed. Preserve the legacy
+                    # sequential evidence path using this same lease/raw.
+                    outcome = self._process_claimed_observation(
+                        run_id=run_id,
+                        html=html,
+                        record=record,
+                        observation_lease=observation_lease,
+                        page=page,
+                        typed_match=None,
+                        stateful_run_id=item_run_id,
+                        stateful_run_type=item_run_type,
+                    )
+                    self._merge_processed_result(result, outcome)
+                    continue
+                prepared.append(_ClaimedMatchObservation(
+                    run_id=run_id,
+                    html=html,
+                    record=record,
+                    observation_lease=observation_lease,
+                    page=page,
+                    typed_match=typed_match,
+                    typed_context=typed_context,
+                    match_id=match_id,
+                    stateful_run_id=item_run_id,
+                    stateful_run_type=item_run_type,
+                ))
+            for outcome in self._process_claimed_match_batch(prepared):
+                self._merge_processed_result(result, outcome)
+
+        if not self.batch_persist_enabled:
+            for item in fetches:
+                process_sequential_item(item)
+        else:
+            match_buffer = []
+            for item in fetches:
+                if str(item.get("page_kind") or "") == "match":
+                    match_buffer.append(item)
+                    if len(match_buffer) == self.batch_persist_matches:
+                        flush_match_items(match_buffer)
+                        match_buffer = []
+                    continue
+                if match_buffer:
+                    flush_match_items(match_buffer)
+                    match_buffer = []
+                process_sequential_item(item)
+            if match_buffer:
+                flush_match_items(match_buffer)
         if result.failures:
             raise ParseWaveError("; ".join(result.failures))
         if _is_mass_contract_rejection(result):
