@@ -1,3 +1,4 @@
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -12,10 +13,16 @@ from scrapers.fotmob.repository import (
     FotMobRepository,
     ManifestStatus,
     MemoryFotMobRepository,
+    TABLE_PARTITIONS,
     TableRows,
     TargetCommit,
     deterministic_target_batch_id,
     normalize_rows,
+)
+from scrapers.fotmob.domain import (
+    CompetitionScopeEvidence,
+    ProbeStatus,
+    ScopeDecision,
 )
 
 
@@ -80,6 +87,47 @@ class CatalogSnapshotWriter(RecordingWriter):
         return self.trino
 
 
+class ScopeEvidenceTrino:
+    def __init__(self):
+        self.sql = []
+
+    def table_exists(self, schema, table):
+        return table == "fotmob_competition_scope_observations"
+
+    def execute_query(self, sql):
+        self.sql.append(sql)
+        return [
+            (
+                "47",
+                "Premier League",
+                "Premier League",
+                "male",
+                "adult",
+                "league",
+                "success",
+                "included",
+                "structurally confirmed adult men's competition",
+                "include_structural_male_adult",
+                "fotmob-men-v1",
+                "b" * 64,
+                "c" * 64,
+                "d" * 64,
+                0,
+                None,
+                datetime(2026, 8, 8, 10),
+            )
+        ]
+
+
+class ScopeEvidenceWriter(RecordingWriter):
+    def __init__(self):
+        super().__init__()
+        self.trino = ScopeEvidenceTrino()
+
+    def _get_trino_manager(self):
+        return self.trino
+
+
 def _commit(**overrides):
     values = {
         "run_id": "run-1",
@@ -121,6 +169,113 @@ def test_native_parser_contract_is_v2_and_playoff_key_uses_match_ids():
         "source_season_key",
         "entity_id",
     )
+
+
+def _scope_evidence(
+    competition_id=47,
+    *,
+    observed_at=datetime(2026, 8, 8, 10),
+    decision=ScopeDecision.INCLUDED,
+):
+    return CompetitionScopeEvidence(
+        competition_id=competition_id,
+        catalog_name="Premier League",
+        profile_name="Premier League",
+        source_gender="male",
+        source_age_group="adult",
+        source_type="league",
+        probe_status=ProbeStatus.SUCCESS,
+        decision=decision,
+        reason="structurally confirmed adult men's competition",
+        policy_rule="include_structural_male_adult",
+        classifier_version="fotmob-men-v1",
+        profile_target_key="b" * 64,
+        profile_content_hash="c" * 64,
+        catalog_fingerprint="d" * 64,
+        authoritative_miss_count=0,
+        next_probe_at=None,
+        observed_at=observed_at,
+    )
+
+
+def test_scope_observation_table_and_current_view_are_profile_manifest_gated():
+    assert TABLE_PARTITIONS["fotmob_competition_scope_observations"] == (
+        "competition_id",
+    )
+
+
+def test_repository_creates_stable_scope_evidence_schema_before_first_probe():
+    writer = ViewWriter()
+
+    FotMobRepository(writer=writer).ensure_schema()
+
+    assert len(writer.trino.sql) == 2
+    evidence_sql = " ".join(writer.trino.sql[1].split())
+    assert "fotmob_competition_scope_observations" in evidence_sql
+    assert "authoritative_miss_count INTEGER" in evidence_sql
+    assert "partitioning = ARRAY['competition_id']" in evidence_sql
+    assert CURRENT_VIEW_SPECS["fotmob_competition_scope_observations"] == (
+        "competition_profile",
+        ("competition_id",),
+    )
+
+
+def test_memory_latest_scope_evidence_ignores_uncommitted_rows_and_selects_latest():
+    repository = MemoryFotMobRepository()
+    older = _scope_evidence(observed_at=datetime(2026, 8, 7, 10))
+    newer = _scope_evidence(
+        observed_at=datetime(2026, 8, 8, 10),
+        decision=ScopeDecision.EXCLUDED,
+    )
+    for run_id, evidence in (("old", older), ("new", newer)):
+        commit = _commit(
+            run_id=run_id,
+            target_type="competition_profile",
+            target_key=evidence.profile_target_key,
+            competition_id=str(evidence.competition_id),
+            content_hash=evidence.profile_content_hash,
+            observation_id=run_id,
+        )
+        repository.commit(
+            commit,
+            [
+                TableRows(
+                    "fotmob_competition_scope_observations",
+                    [{**asdict(evidence), "discovery_run_id": run_id}],
+                    "competition_scope_observations",
+                )
+            ],
+        )
+    repository.tables["fotmob_competition_scope_observations"].append(
+        {
+            **asdict(
+                _scope_evidence(
+                    observed_at=datetime(2026, 8, 9, 10),
+                    decision=ScopeDecision.REVIEW_REQUIRED,
+                )
+            ),
+            "discovery_run_id": "crashed",
+            "_target_batch_id": "never-committed",
+        }
+    )
+
+    latest = repository.latest_scope_evidence([47, 999])
+
+    assert latest == {47: newer}
+
+
+def test_iceberg_latest_scope_evidence_joins_only_committed_profile_manifests():
+    writer = ScopeEvidenceWriter()
+    repository = FotMobRepository(writer=writer)
+
+    latest = repository.latest_scope_evidence([47, 999])
+
+    assert latest[47] == _scope_evidence()
+    sql = " ".join(writer.trino.sql[0].split())
+    assert "target_type = 'competition_profile'" in sql
+    assert "status IN ('success', 'not_modified')" in sql
+    assert "m.batch_id = e._target_batch_id" in sql
+    assert "PARTITION BY e.competition_id" in sql
 
 
 def test_repository_writes_physical_rows_before_success_manifest():

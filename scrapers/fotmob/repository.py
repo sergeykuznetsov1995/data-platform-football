@@ -27,6 +27,11 @@ from typing import Any, Iterable, Mapping, Optional, Protocol, Sequence
 import pandas as pd
 
 from scrapers.base.iceberg_writer import IcebergWriter
+from scrapers.fotmob.domain import (
+    CompetitionScopeEvidence,
+    ProbeStatus,
+    ScopeDecision,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -37,6 +42,27 @@ PARSER_VERSION = "fotmob-native-v2"
 # successful v2 replacement or an explicit v2 tombstone exists.
 LEGACY_PARSER_VERSION = "fotmob-native-v1"
 MANIFEST_TABLE = "fotmob_ingest_manifest"
+SCOPE_OBSERVATIONS_TABLE = "fotmob_competition_scope_observations"
+
+_SCOPE_EVIDENCE_FIELDS = (
+    "competition_id",
+    "catalog_name",
+    "profile_name",
+    "source_gender",
+    "source_age_group",
+    "source_type",
+    "probe_status",
+    "decision",
+    "reason",
+    "policy_rule",
+    "classifier_version",
+    "profile_target_key",
+    "profile_content_hash",
+    "catalog_fingerprint",
+    "authoritative_miss_count",
+    "next_probe_at",
+    "observed_at",
+)
 
 
 class ManifestStatus(str, Enum):
@@ -81,6 +107,68 @@ def utc_now() -> datetime:
     """Return a timezone-naive UTC timestamp accepted by Trino/Iceberg."""
 
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _evidence_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _scope_evidence_from_row(
+    row: Mapping[str, Any],
+) -> CompetitionScopeEvidence:
+    def enum_value(value: Any) -> str:
+        return str(value.value if isinstance(value, Enum) else value)
+
+    observed_at = _evidence_datetime(row.get("observed_at"))
+    if observed_at is None:
+        raise ValueError("scope evidence observed_at is required")
+    return CompetitionScopeEvidence(
+        competition_id=int(row["competition_id"]),
+        catalog_name=str(row.get("catalog_name") or ""),
+        profile_name=(
+            str(row["profile_name"]) if row.get("profile_name") is not None else None
+        ),
+        source_gender=(
+            str(row["source_gender"])
+            if row.get("source_gender") is not None
+            else None
+        ),
+        source_age_group=(
+            str(row["source_age_group"])
+            if row.get("source_age_group") is not None
+            else None
+        ),
+        source_type=(
+            str(row["source_type"]) if row.get("source_type") is not None else None
+        ),
+        probe_status=ProbeStatus(enum_value(row["probe_status"])),
+        decision=ScopeDecision(enum_value(row["decision"])),
+        reason=str(row.get("reason") or ""),
+        policy_rule=str(row.get("policy_rule") or ""),
+        classifier_version=str(row.get("classifier_version") or ""),
+        profile_target_key=(
+            str(row["profile_target_key"])
+            if row.get("profile_target_key") is not None
+            else None
+        ),
+        profile_content_hash=(
+            str(row["profile_content_hash"])
+            if row.get("profile_content_hash") is not None
+            else None
+        ),
+        catalog_fingerprint=str(row.get("catalog_fingerprint") or ""),
+        authoritative_miss_count=int(row.get("authoritative_miss_count") or 0),
+        next_probe_at=_evidence_datetime(row.get("next_probe_at")),
+        observed_at=observed_at,
+    )
 
 
 def _json_default(value: Any) -> Any:
@@ -359,6 +447,7 @@ class TargetCommit:
 # source_season_key is VARCHAR and is never derived from a year integer.
 TABLE_PARTITIONS: dict[str, tuple[str, ...]] = {
     "fotmob_competitions": ("discovery_date",),
+    SCOPE_OBSERVATIONS_TABLE: ("competition_id",),
     "fotmob_competition_seasons": ("competition_id",),
     "fotmob_competition_season_history": ("competition_id",),
     "fotmob_season_stages": ("competition_id", "source_season_key"),
@@ -380,6 +469,7 @@ TABLE_PARTITIONS: dict[str, tuple[str, ...]] = {
 
 CURRENT_VIEW_SPECS: dict[str, tuple[str, tuple[str, ...]]] = {
     "fotmob_competitions": ("all_leagues", ("competition_id",)),
+    SCOPE_OBSERVATIONS_TABLE: ("competition_profile", ("competition_id",)),
     "fotmob_competition_seasons": (
         "competition_seasons",
         ("competition_id", "source_season_key"),
@@ -1369,11 +1459,12 @@ class FotMobRepository:
         return paths[-1] if paths else ""
 
     def ensure_schema(self) -> None:
-        """Create the stable manifest and current logical views.
+        """Create stable manifest/evidence tables used before entity fan-out.
 
         Entity tables are created by their first typed dataframe because some
-        FotMob capabilities are competition-specific.  The manifest schema is
-        fixed so even a completely unavailable run remains observable.
+        FotMob capabilities are competition-specific.  Manifest and scope
+        evidence schemas are fixed so an unavailable first profile cannot
+        create an unusable all-NULL inferred table.
         """
 
         manager_getter = getattr(self.writer, "_get_trino_manager", None)
@@ -1420,6 +1511,38 @@ class FotMobRepository:
                 _entity_type VARCHAR,
                 _ingested_at TIMESTAMP(6)
             ) WITH (partitioning = ARRAY['target_type'])
+            """
+        )
+        trino._execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.catalog}.{self.schema}.{SCOPE_OBSERVATIONS_TABLE} (
+                competition_id VARCHAR,
+                catalog_name VARCHAR,
+                profile_name VARCHAR,
+                source_gender VARCHAR,
+                source_age_group VARCHAR,
+                source_type VARCHAR,
+                probe_status VARCHAR,
+                decision VARCHAR,
+                reason VARCHAR,
+                policy_rule VARCHAR,
+                classifier_version VARCHAR,
+                profile_target_key VARCHAR,
+                profile_content_hash VARCHAR,
+                catalog_fingerprint VARCHAR,
+                authoritative_miss_count INTEGER,
+                next_probe_at TIMESTAMP(6),
+                observed_at TIMESTAMP(6),
+                discovery_run_id VARCHAR,
+                _target_batch_id VARCHAR,
+                _payload_sha256 VARCHAR,
+                _parser_version VARCHAR,
+                _raw_uri VARCHAR,
+                _observed_at TIMESTAMP(6),
+                _source VARCHAR,
+                _entity_type VARCHAR,
+                _ingested_at TIMESTAMP(6)
+            ) WITH (partitioning = ARRAY['competition_id'])
             """
         )
 
@@ -1546,6 +1669,63 @@ class FotMobRepository:
             )
             created.append(f"{self.catalog}.{self.schema}.{view}")
         return created
+
+    def latest_scope_evidence(
+        self, competition_ids: Iterable[int]
+    ) -> dict[int, CompetitionScopeEvidence]:
+        """Return newest manifest-committed profile evidence for each id."""
+
+        wanted = sorted({int(value) for value in competition_ids})
+        if not wanted:
+            return {}
+        manager_getter = getattr(self.writer, "_get_trino_manager", None)
+        if manager_getter is None:
+            return {}
+        trino = manager_getter()
+        if not trino.table_exists(self.schema, SCOPE_OBSERVATIONS_TABLE):
+            return {}
+        safe_version = PARSER_VERSION.replace("'", "''")
+        id_values = ", ".join(f"'{value}'" for value in wanted)
+        selected = ", ".join(f'e."{field}"' for field in _SCOPE_EVIDENCE_FIELDS)
+        rows = trino.execute_query(
+            f"""
+            WITH committed AS (
+                SELECT DISTINCT batch_id
+                FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+                WHERE target_type = 'competition_profile'
+                  AND parser_version = '{safe_version}'
+                  AND status IN ('success', 'not_modified')
+            ), ranked AS (
+                SELECT {selected},
+                       ROW_NUMBER() OVER (
+                           PARTITION BY e.competition_id
+                           ORDER BY e.observed_at DESC,
+                                    e._ingested_at DESC,
+                                    e._target_batch_id DESC
+                       ) AS evidence_rn
+                FROM {self.catalog}.{self.schema}.{SCOPE_OBSERVATIONS_TABLE} e
+                INNER JOIN committed m
+                    ON m.batch_id = e._target_batch_id
+                WHERE CAST(e.competition_id AS VARCHAR) IN ({id_values})
+            )
+            SELECT {', '.join(f'"{field}"' for field in _SCOPE_EVIDENCE_FIELDS)}
+            FROM ranked
+            WHERE evidence_rn = 1
+            """
+        )
+        output: dict[int, CompetitionScopeEvidence] = {}
+        for raw in rows:
+            if isinstance(raw, Mapping):
+                row = {str(key).lower(): value for key, value in raw.items()}
+            else:
+                row = dict(zip(_SCOPE_EVIDENCE_FIELDS, raw))
+            try:
+                evidence = _scope_evidence_from_row(row)
+            except (KeyError, TypeError, ValueError):
+                logger.warning("ignoring malformed FotMob scope evidence row")
+                continue
+            output[evidence.competition_id] = evidence
+        return output
 
     def latest_success(
         self, target_key: str, *, run_id: Optional[str] = None
@@ -2036,6 +2216,39 @@ class MemoryFotMobRepository:
 
     def ensure_current_views(self) -> list[str]:
         return []
+
+    def latest_scope_evidence(
+        self, competition_ids: Iterable[int]
+    ) -> dict[int, CompetitionScopeEvidence]:
+        wanted = {int(value) for value in competition_ids}
+        if not wanted:
+            return {}
+        committed_batches = {
+            commit.batch_id
+            for commit in self.commits
+            if commit.target_type == "competition_profile"
+            and commit.parser_version == PARSER_VERSION
+            and commit.status.value in SUCCESS_STATES
+        }
+        selected: dict[int, tuple[tuple[datetime, str, str], CompetitionScopeEvidence]] = {}
+        for row in self.tables.get(SCOPE_OBSERVATIONS_TABLE, []):
+            if row.get("_target_batch_id") not in committed_batches:
+                continue
+            try:
+                evidence = _scope_evidence_from_row(row)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if evidence.competition_id not in wanted:
+                continue
+            rank = (
+                evidence.observed_at,
+                str(row.get("_ingested_at") or ""),
+                str(row.get("_target_batch_id") or ""),
+            )
+            current = selected.get(evidence.competition_id)
+            if current is None or rank >= current[0]:
+                selected[evidence.competition_id] = (rank, evidence)
+        return {competition_id: value[1] for competition_id, value in selected.items()}
 
     def flush(self) -> list[str]:
         return []

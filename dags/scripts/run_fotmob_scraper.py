@@ -802,7 +802,17 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         discovery_plan.metadata["budget_deferred_competition_ids"] = [
             item.competition.competition_id for item in budget_deferred
         ]
-    for discovered in service.discover_competitions(candidates):
+    candidate_profile_payloads = {
+        item.competition.competition_id: catalog.profile_payloads[
+            item.competition.competition_id
+        ]
+        for item in candidates
+        if item.competition.competition_id in catalog.profile_payloads
+    }
+    for discovered in service.discover_competitions(
+        candidates,
+        profile_payloads=candidate_profile_payloads,
+    ):
         operations.append(discovered.operation)
         seasons.extend(discovered.seasons)
         if discovered.selected_bundle is not None and discovered.fetch is not None:

@@ -9,6 +9,7 @@ from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -154,6 +155,11 @@ class TestFotmobNativeRunner:
     @pytest.mark.unit
     def test_runner_and_daily_evidence_share_ordered_deduplicated_scopes(self):
         mod = self._module()
+        # This focused scraper suite does not collect tests/unit/dags, whose
+        # conftest normally installs the host-side Airflow API stubs.
+        from tests.unit.dags.conftest import _install_airflow_stubs
+
+        _install_airflow_stubs()
         daily = importlib.import_module("dag_ingest_fotmob")
         expected_pairs = ((230, "2025 Apertura"), (47, "2024/2025"))
         expected_tokens = ("230=2025 Apertura", "47=2024/2025")
@@ -836,7 +842,11 @@ class TestFotmobNativeRunner:
     @pytest.mark.unit
     def test_transfer_competition_limit_applies_after_completion_filter(self):
         from scrapers.fotmob.transport import canonicalize_target
-        from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
+        from tests.unit.scrapers.test_fotmob_service import (
+            _competition_payload,
+            _league_payload,
+            _service,
+        )
 
         mod = self._module()
         responses = {
@@ -851,6 +861,9 @@ class TestFotmobNativeRunner:
                 ]
             },
             canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target("leagues", {"id": 48}).canonical_url: (
+                _competition_payload(48, "Competition 48")
+            ),
             canonicalize_target(
                 "transfers", {"leagueIds": "48", "page": 1}
             ).canonical_url: {"hits": 0, "page": 1, "transfers": []},
@@ -1208,7 +1221,7 @@ class TestFotmobNativeRunner:
         )
         discovered_ids = []
 
-        def discover_competitions(candidates):
+        def discover_competitions(candidates, **_kwargs):
             discovered_ids.extend(
                 item.competition.competition_id for item in candidates
             )
@@ -1440,7 +1453,7 @@ class TestFotmobNativeRunner:
         rc, report = _run_native_admitted(mod, args, service=service)
 
         assert rc == 0
-        repository.flush.assert_called_once_with()
+        assert repository.flush.call_count == 2
 
     @pytest.mark.unit
     def test_failed_flush_turns_the_run_red_instead_of_losing_targets(self):
