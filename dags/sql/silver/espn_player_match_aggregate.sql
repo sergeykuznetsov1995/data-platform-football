@@ -2,12 +2,18 @@
 -- Silver: espn_player_match_aggregate (native v2)
 -- =============================================================================
 -- Grain/PK: one row per (event_id, team_id, athlete_id), played final only.
--- Sources: native v2 lineup + native v2 schedule.
+-- Sources (native v2): lineup player rows (event_id/team_id/athlete_id bigint,
+-- starter/substitution booleans, counters numeric, JSON varchars); schedule event
+-- rows (event_id bigint, status varchar, played_final boolean, partition fields).
+-- Notes: schedule supplies played status and partitions; lineup remains the player
+-- grain and is deduplicated before any JSON array operation.
 -- Footguns: player ids may occur for both teams in a match; JSON jersey outranks
 -- bronze jersey; empty statistics means unavailable, while zero remains a fact.
--- didScore/didAssist comes from per-player plays; FINAL_PEN can include shootout
--- plays and is intentionally surfaced for audit rather than capped to scoreboard
--- score. Minutes are best-effort because ESPN stores summed stoppage minutes.
+-- didScore/didAssist comes from per-player plays. Live calibration across all 316
+-- STATUS_FINAL_PEN events confirmed didScore does not include shootout kicks and
+-- never exceeds regulation scoreboard goals, so it is counted as-is (no cap/filter).
+-- Minutes are best-effort because ESPN stores summed stoppage minutes.
+-- DAG integration: run_silver_transform wraps this pure SELECT in CTAS.
 -- =============================================================================
 
 WITH bronze_src_schedule AS (

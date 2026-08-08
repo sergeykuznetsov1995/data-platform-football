@@ -4,7 +4,11 @@
 -- Grain/PK: one row per ESPN event_id. Native v2 schedule is append-only and is
 -- deduplicated before any JSON parsing; matchsheet is joined only through the
 -- per-event referee aggregate, so it cannot fan out a match.
--- Sources: native v2 schedule and native v2 matchsheet.
+-- Sources (native v2): schedule event rows (event_id bigint, status varchar,
+-- played_final boolean, score integers, extra_json varchar); matchsheet team rows
+-- (event_id/team_id bigint, referee varchar, extra_json varchar).
+-- Notes: schedule supplies the match grain and all partition keys; matchsheet is
+-- reduced to one referee value per event before the join.
 -- Footguns: non-played ESPN fixtures carry literal 0:0; attendance=0 means
 -- unknown; shootout score is separate from regulation score; season_slug is
 -- sometimes a cup stage. season_slug_platform parses displayName, not dates.
@@ -102,11 +106,11 @@ match_modeled AS (
             THEN season_slug
         END AS stage,
         CASE
-            WHEN regexp_extract(source_season_display_name, '(\\d{4})\\s*[-/]\\s*(\\d{2}|\\d{4})', 1) <> ''
-            THEN substr(regexp_extract(source_season_display_name, '(\\d{4})\\s*[-/]\\s*(\\d{2}|\\d{4})', 1), 3, 2)
-                 || right(regexp_extract(source_season_display_name, '(\\d{4})\\s*[-/]\\s*(\\d{2}|\\d{4})', 2), 2)
-            WHEN regexp_extract(source_season_display_name, '(\\d{4})', 1) <> ''
-            THEN regexp_extract(source_season_display_name, '(\\d{4})', 1)
+            WHEN regexp_extract(source_season_display_name, '(\d{4})\s*[-/]\s*(\d{2}|\d{4})', 1) <> ''
+            THEN substr(regexp_extract(source_season_display_name, '(\d{4})\s*[-/]\s*(\d{2}|\d{4})', 1), 3, 2)
+                 || right(regexp_extract(source_season_display_name, '(\d{4})\s*[-/]\s*(\d{2}|\d{4})', 2), 2)
+            WHEN regexp_extract(source_season_display_name, '(\d{4})', 1) <> ''
+            THEN regexp_extract(source_season_display_name, '(\d{4})', 1)
             ELSE CAST(source_season_year AS varchar)
         END AS season_slug_platform
     FROM schedule_parsed p
@@ -138,7 +142,7 @@ SELECT
     season_slug,
     season_type,
     stage,
-    regexp_extract(alt_game_note, '(Group\\s+[A-Z0-9]+)\\s*$', 1) AS group_name,
+    regexp_extract(alt_game_note, '(Group\s+[A-Z0-9]+)\s*$', 1) AS group_name,
     alt_game_note,
     leg,
     home_aggregate_score,

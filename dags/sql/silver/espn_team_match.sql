@@ -2,13 +2,19 @@
 -- Silver: espn_team_match (native v2)
 -- =============================================================================
 -- Grain/PK: one row per (event_id, team_id), played final matches only.
--- Sources: native v2 schedule + native v2 matchsheet.
+-- Sources (native v2): schedule event rows (event_id/team ids bigint, score
+-- integers, played_final boolean, extra_json varchar); matchsheet team rows
+-- (event_id/team_id bigint, score integer, measured stat varchars).
+-- Notes: matchsheet is authoritative for both sides' score when available; the
+-- schedule score is a per-side fallback. Scoreboard JSON is used only for events
+-- with no matchsheet at all.
 -- Matchsheet wins wholesale per event; scoreboard statistics are a fallback only.
 -- Footguns: ESPN 0 is a genuine measured value, not missing data; arg.2 carries
 -- cards only; per-league stat availability differs. Bronze percentage fields are
 -- coarse fragments and are intentionally recalculated from counters. Dead Bronze
 -- fields (capacity, total_goals, goal_assists, goals_conceded, referee_id and the
 -- duplicate corner_kicks) are deliberately not projected.
+-- DAG integration: run_silver_transform wraps this pure SELECT in CTAS.
 -- =============================================================================
 
 WITH bronze_src_schedule AS (
@@ -41,7 +47,10 @@ matchsheet_rows AS (
         CASE WHEN m.team_id = s.home_team_id THEN s.away_team_id ELSE s.home_team_id END AS opponent_team_id,
         m.team_id = s.home_team_id AS is_home,
         COALESCE(m.score, CASE WHEN m.team_id = s.home_team_id THEN s.home_score ELSE s.away_score END) AS goals_for,
-        CASE WHEN m.team_id = s.home_team_id THEN s.away_score ELSE s.home_score END AS goals_against,
+        COALESCE(
+            opponent.score,
+            CASE WHEN m.team_id = s.home_team_id THEN s.away_score ELSE s.home_score END
+        ) AS goals_against,
         TRY_CAST(m.possession_pct AS double) AS possession_pct,
         TRY_CAST(m.total_shots AS integer) AS total_shots,
         TRY_CAST(m.shots_on_target AS integer) AS shots_on_target,
@@ -71,6 +80,12 @@ matchsheet_rows AS (
         s.source_season_year
     FROM matchsheet_dedup m
     JOIN schedule_dedup s ON s.event_id = m.event_id
+    LEFT JOIN matchsheet_dedup opponent
+      ON opponent.event_id = m.event_id
+     AND opponent.team_id = CASE
+         WHEN m.team_id = s.home_team_id THEN s.away_team_id
+         ELSE s.home_team_id
+     END
     WHERE s.played_final
 ),
 scoreboard_home_flat AS (

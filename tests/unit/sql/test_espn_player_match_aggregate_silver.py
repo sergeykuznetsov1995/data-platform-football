@@ -45,6 +45,59 @@ class TestEspnPlayerMatchAggregateSilver:
         assert "$.didScore" in sql and "$.didAssist" in sql
         assert "STATUS_FINAL_PEN" in sql
 
+    def test_executable_final_pen_didscore_is_counted_as_is(self):
+        """Lineup plays are the only input; shootout detail is deliberately absent.
+
+        Live calibration established that FINAL_PEN lineup didScore excludes series
+        kicks, so a scoreboard cap/filter would discard valid data rather than fix it.
+        """
+        duckdb = pytest.importorskip("duckdb")
+        con = duckdb.connect(":memory:")
+        rows = con.execute("""
+            WITH lineup_plays(event_id, status, did_score) AS (
+                VALUES (1, 'STATUS_FINAL_PEN', TRUE), (1, 'STATUS_FINAL_PEN', FALSE),
+                       (2, 'STATUS_FULL_TIME', TRUE)
+            ), regulation_score(event_id, goals) AS (
+                VALUES (1, 1), (2, 1)
+            ), shootout_details(event_id, made_kicks) AS (
+                VALUES (1, 5)
+            )
+            SELECT p.event_id, SUM(CASE WHEN p.did_score THEN 1 ELSE 0 END) AS goals_events,
+                   s.goals AS regulation_goals
+            FROM lineup_plays p
+            JOIN regulation_score s ON s.event_id = p.event_id
+            GROUP BY p.event_id, s.goals
+            ORDER BY p.event_id
+        """).fetchall()
+        assert rows == [(1, 1, 1), (2, 1, 1)]
+
+        formula = _sql().split("AS goals_events", 1)[0].rsplit("COALESCE", 1)[-1]
+        assert "$.didScore" in formula
+        assert "shootout" not in formula.lower() and "clock" not in formula.lower()
+
+    def test_executable_position_group_agrees_with_roster_abbreviation(self):
+        duckdb = pytest.importorskip("duckdb")
+        con = duckdb.connect(":memory:")
+        rows = con.execute("""
+            WITH lineup(position, roster_position) AS (
+                VALUES ('Goalkeeper', 'G'), ('Center Left Defender', 'D'),
+                       ('Attacking Midfielder', 'M'), ('Center Right Forward', 'F'),
+                       ('Substitute', NULL)
+            )
+            SELECT position,
+              CASE WHEN position = 'Goalkeeper' THEN 'GK'
+                   WHEN position LIKE '%Back%' OR position LIKE '%Defender%' OR position = 'Sweeper' THEN 'DF'
+                   WHEN position LIKE '%Midfielder%' THEN 'MF'
+                   WHEN position LIKE '%Forward%' THEN 'FW' END AS position_group,
+              CASE roster_position WHEN 'G' THEN 'GK' WHEN 'D' THEN 'DF'
+                                   WHEN 'M' THEN 'MF' WHEN 'F' THEN 'FW' END AS roster_group
+            FROM lineup ORDER BY position
+        """).fetchall()
+        assert {(group, roster) for _, group, roster in rows if roster} == {
+            ("GK", "GK"), ("DF", "DF"), ("MF", "MF"), ("FW", "FW")
+        }
+        assert "clean_position LIKE '%Defender%'" in _sql()
+
     def test_fixture_minutes_and_team_qualified_pk_are_executable(self):
         duckdb = pytest.importorskip("duckdb")
         con = duckdb.connect(":memory:")

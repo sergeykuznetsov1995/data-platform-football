@@ -45,6 +45,46 @@ class TestEspnMatchSilver:
         assert "$.source.league.season.displayName" in sql
         assert "source_season_year" in sql
 
+    def test_executable_latest_snapshot_season_slug_and_group_parsing(self):
+        """DuckDB fixture exercises the same scalar expressions as the Trino SQL.
+
+        JSON extraction/array casts are Trino-specific, but dedup and the scalar
+        regexp expressions below are executable in DuckDB.
+        """
+        duckdb = pytest.importorskip("duckdb")
+        con = duckdb.connect(":memory:")
+        rows = con.execute(r"""
+            WITH schedule(event_id, ingested_at, display_name, alt_game_note, source_year) AS (
+                VALUES
+                  (1, TIMESTAMP '2026-08-01 00:00:00', 'Premier League 2025-26', 'WCQ - AFC, Group A', 2025),
+                  (1, TIMESTAMP '2026-08-02 00:00:00', 'Premier League 2026-27', 'WCQ - AFC, Group B', 2026),
+                  (2, TIMESTAMP '2026-08-02 00:00:00', 'FIFA Club World Cup 2026', 'Cup, Final', 2026),
+                  (3, TIMESTAMP '2026-08-02 00:00:00', 'Unknown', 'League', 2031)
+            ), dedup AS (
+                SELECT *, row_number() OVER (PARTITION BY event_id ORDER BY ingested_at DESC) AS rn
+                FROM schedule
+            )
+            SELECT event_id,
+              CASE
+                WHEN regexp_extract(display_name, '(\d{4})\s*[-/]\s*(\d{2}|\d{4})', 1) <> ''
+                  THEN substr(regexp_extract(display_name, '(\d{4})\s*[-/]\s*(\d{2}|\d{4})', 1), 3, 2)
+                       || right(regexp_extract(display_name, '(\d{4})\s*[-/]\s*(\d{2}|\d{4})', 2), 2)
+                WHEN regexp_extract(display_name, '(\d{4})', 1) <> ''
+                  THEN regexp_extract(display_name, '(\d{4})', 1)
+                ELSE CAST(source_year AS varchar)
+              END AS season_slug_platform,
+              regexp_extract(alt_game_note, '(Group\s+[A-Z0-9]+)\s*$', 1) AS group_name
+            FROM dedup WHERE rn = 1 ORDER BY event_id
+        """).fetchall()
+        assert rows == [(1, "2627", "Group B"), (2, "2026", ""), (3, "2031", "")]
+
+        # Tie the executable fixture to the production expression and prevent
+        # the double-backslash Trino literal regression.
+        sql = _sql()
+        assert r"(\d{4})\s*[-/]\s*(\d{2}|\d{4})" in sql
+        assert r"(Group\s+[A-Z0-9]+)\s*$" in sql
+        assert r"\\d" not in sql and r"\\s" not in sql
+
     def test_referee_is_aggregated_before_schedule_join_and_partition_keys_trail(self):
         sql = _sql()
         assert "referee_by_event" in sql
@@ -52,3 +92,14 @@ class TestEspnMatchSilver:
         final = sql.rsplit("SELECT", 1)[-1]
         assert re.search(r"competition_slug\s+AS\s+league", final, re.I)
         assert re.search(r"CAST\s*\(\s*source_season_year\s+AS\s+varchar\s*\)\s+AS\s+season", final, re.I)
+
+    def test_all_native_v2_transforms_have_required_header_sections(self):
+        for name in (
+            "espn_match.sql",
+            "espn_team_match.sql",
+            "espn_player_match_aggregate.sql",
+        ):
+            sql = (ROOT / "dags" / "sql" / "silver" / name).read_text(encoding="utf-8")
+            assert "-- Sources (native v2):" in sql
+            assert "-- Notes:" in sql
+            assert "-- DAG integration:" in sql

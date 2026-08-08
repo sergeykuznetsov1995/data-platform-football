@@ -45,8 +45,50 @@ class TestEspnTeamMatchSilver:
             assert pct in sql
         assert re.search(r"ROUND\s*\(\s*100\.0\s*\*\s*accurate_passes\s*/\s*NULLIF\s*\(\s*total_passes\s*,\s*0\s*\)", sql, re.I)
 
-    def test_fixture_math_for_scoreboard_fallback_is_executable(self):
+    def test_executable_matchsheet_first_scores_and_scoreboard_fallback(self):
+        """Exercise the score pairing independently of Trino JSON UNNEST."""
         duckdb = pytest.importorskip("duckdb")
         con = duckdb.connect(":memory:")
-        row = con.execute("SELECT ROUND(100.0 * 45 / NULLIF(50, 0), 2), 100.0 * 0 / NULLIF(0, 0)").fetchone()
-        assert row == (90.0, None)
+        rows = con.execute("""
+            WITH schedule(event_id, ingested_at, home_id, away_id, home_score, away_score) AS (
+                VALUES
+                  (1, TIMESTAMP '2026-08-01 00:00:00', 10, 20, 2, 1),
+                  (1, TIMESTAMP '2026-08-02 00:00:00', 10, 20, 2, 1),
+                  (2, TIMESTAMP '2026-08-02 00:00:00', 30, 40, 5, 6)
+            ), schedule_dedup AS (
+                SELECT *, row_number() OVER (PARTITION BY event_id ORDER BY ingested_at DESC) AS rn FROM schedule
+            ), matchsheet(event_id, team_id, score, ingested_at) AS (
+                VALUES
+                  (1, 10, 99, TIMESTAMP '2026-08-01 00:00:00'),
+                  (1, 10, 3, TIMESTAMP '2026-08-02 00:00:00'),
+                  (1, 20, 98, TIMESTAMP '2026-08-01 00:00:00'),
+                  (1, 20, 4, TIMESTAMP '2026-08-02 00:00:00')
+            ), matchsheet_dedup AS (
+                SELECT *, row_number() OVER (PARTITION BY event_id, team_id ORDER BY ingested_at DESC) AS rn FROM matchsheet
+            ), matchsheet_rows AS (
+                SELECT m.event_id, m.team_id,
+                  COALESCE(m.score, CASE WHEN m.team_id = s.home_id THEN s.home_score ELSE s.away_score END) AS goals_for,
+                  COALESCE(opponent.score, CASE WHEN m.team_id = s.home_id THEN s.away_score ELSE s.home_score END) AS goals_against
+                FROM matchsheet_dedup m
+                JOIN schedule_dedup s ON s.event_id = m.event_id AND s.rn = 1
+                LEFT JOIN matchsheet_dedup opponent
+                  ON opponent.event_id = m.event_id
+                 AND opponent.team_id = CASE WHEN m.team_id = s.home_id THEN s.away_id ELSE s.home_id END
+                 AND opponent.rn = 1
+                WHERE m.rn = 1
+            ), scoreboard_rows AS (
+                SELECT event_id, home_id AS team_id, home_score AS goals_for, away_score AS goals_against
+                FROM schedule_dedup WHERE rn = 1 AND event_id = 2
+                UNION ALL
+                SELECT event_id, away_id, away_score, home_score
+                FROM schedule_dedup WHERE rn = 1 AND event_id = 2
+            )
+            SELECT * FROM matchsheet_rows
+            UNION ALL SELECT * FROM scoreboard_rows
+            ORDER BY event_id, team_id
+        """).fetchall()
+        assert rows == [(1, 10, 3, 4), (1, 20, 4, 3), (2, 30, 5, 6), (2, 40, 6, 5)]
+
+        sql = _sql()
+        assert "LEFT JOIN matchsheet_dedup opponent" in sql
+        assert re.search(r"COALESCE\s*\(\s*opponent\.score", sql, re.I)
