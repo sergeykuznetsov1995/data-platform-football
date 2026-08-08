@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+import unicodedata
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple
 
 from .domain import (
@@ -52,24 +53,39 @@ class CatalogDiscovery:
 ClassifierHook = Callable[[CompetitionRef], Optional[ScopeClassification]]
 
 
+CLASSIFIER_VERSION = "fotmob-men-v1"
+
+
 _FEMALE_RE = re.compile(
     r"(?:\bwomen(?:'s)?\b|\bwoman\b|\bfemale\b|\bfeminine\b|\bfemenin[oa]\b|"
     r"\bfrauen\b|\bdamer\b|\bdonne\b|\bladies\b)",
     re.IGNORECASE,
 )
 _YOUTH_RE = re.compile(
-    r"(?:\bu\s*-?\s*(?:17|18|19|20|21|22|23)\b|\bunder\s*-?\s*(?:17|18|19|20|21|22|23)\b|"
+    r"(?:\bu\s*-?\s*(?:[1-9]|1\d|2[0-3])\b|"
+    r"\bunder\s*-?\s*(?:[1-9]|1\d|2[0-3])\b|"
     r"\byouth\b|\bacademy\b|\bjunior(?:s)?\b|\bjuvenil\b|\bprimavera\b)",
     re.IGNORECASE,
 )
 _RESERVE_RE = re.compile(
-    r"(?:\breserve(?:s)?\b|\bdevelopment league\b|\bsecond teams?\b|\bii teams?\b|"
+    r"(?:\breserve(?:s)?\b|\bdevelopment\b|\bsecond teams?\b|\bii teams?\b|"
     r"\bpremier league 2(?:\s+div(?:ision)?\s+\d+)?\b)",
     re.IGNORECASE,
 )
 _FRIENDLY_RE = re.compile(
-    r"(?:\bfriendly|friendlies\b|\bcharity\b|\bexhibition\b|\btestimonial\b)",
+    r"(?:\bfriendly\b|\bfriendlies\b)",
     re.IGNORECASE,
+)
+_SHOW_RE = re.compile(
+    r"(?:\bcharity\b|\btestimonial\b|\bexhibition\b|\bshows?\b|\blegends?\b)",
+    re.IGNORECASE,
+)
+
+_MALE_GENDERS = frozenset({"male", "men", "man", "m"})
+_FEMALE_GENDERS = frozenset({"female", "women", "woman", "f"})
+_ADULT_AGE_GROUPS = frozenset({"adult", "adults", "senior", "seniors", "male", "men"})
+_KNOWN_COMPETITION_TYPES = frozenset(
+    {"competition", "cup", "friendly", "friendlies", "league", "tournament"}
 )
 
 
@@ -87,6 +103,40 @@ def _integer_id(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _classifier_text(value: Any) -> str:
+    """Normalize source labels before applying conservative text signals."""
+
+    normalized = unicodedata.normalize("NFKD", str(value or "")).casefold()
+    return "".join(
+        "-" if unicodedata.category(character) == "Pd" else character
+        for character in normalized
+        if not unicodedata.combining(character)
+    ).strip()
+
+
+def _structural_conflict_fields(
+    catalog_ref: CompetitionRef, profile_ref: CompetitionRef
+) -> tuple[str, ...]:
+    def canonical(field: str, value: Any) -> str:
+        normalized = _classifier_text(value)
+        if field == "gender":
+            if normalized in _MALE_GENDERS:
+                return "male"
+            if normalized in _FEMALE_GENDERS:
+                return "female"
+        if field == "age_group" and normalized in _ADULT_AGE_GROUPS:
+            return "adult"
+        return normalized
+
+    conflicts: list[str] = []
+    for field in ("gender", "competition_type", "age_group"):
+        catalog_value = canonical(field, getattr(catalog_ref, field))
+        profile_value = canonical(field, getattr(profile_ref, field))
+        if catalog_value and profile_value and catalog_value != profile_value:
+            conflicts.append(field)
+    return tuple(conflicts)
 
 
 def _source_key(value: Any, *, field: str) -> str:
@@ -269,67 +319,107 @@ def discover_competitions(
 
 
 def classify_competition(
-    competition: CompetitionRef,
+    catalog_ref: CompetitionRef,
+    profile_ref: Optional[CompetitionRef] = None,
     *,
     hooks: Sequence[ClassifierHook] = (),
 ) -> ScopeClassification:
-    """Apply the adult-men official-competition policy with override hooks."""
+    """Classify a catalog entry from its identity-matching source profile.
+
+    ``allLeagues`` is discovery evidence only.  It cannot authorize fan-out;
+    inclusion requires a successful ``/leagues`` profile whose numeric source
+    identity matches the catalog entry.
+    """
+
+    if profile_ref is None:
+        return ScopeClassification(
+            catalog_ref,
+            ScopeDecision.PENDING_PROBE,
+            "an identity-matching /leagues profile is required",
+            "probe_required",
+        )
+    if profile_ref.competition_id != catalog_ref.competition_id:
+        raise ValueError("profile returned metadata for another competition")
 
     for hook in hooks:
-        decision = hook(competition)
+        decision = hook(profile_ref)
         if decision is not None:
-            if decision.competition.competition_id != competition.competition_id:
+            if decision.competition.competition_id != catalog_ref.competition_id:
                 raise ValueError("classifier hook returned a decision for another competition")
             return decision
 
-    text = " ".join(
+    conflict_fields = _structural_conflict_fields(catalog_ref, profile_ref)
+    if conflict_fields:
+        return ScopeClassification(
+            profile_ref,
+            ScopeDecision.REVIEW_REQUIRED,
+            "conflicting catalog/profile metadata: " + ",".join(conflict_fields),
+            "review_structural_conflict",
+        )
+
+    text = _classifier_text(" ".join(
         part
         for part in (
-            competition.name,
-            competition.competition_type,
-            competition.age_group,
+            catalog_ref.name,
+            profile_ref.name,
+            profile_ref.competition_type,
+            profile_ref.age_group,
         )
         if part
-    )
-    gender = (competition.gender or "").strip().lower()
-    if gender in {"female", "women", "woman", "f"} or _FEMALE_RE.search(text):
+    ))
+    gender = _classifier_text(profile_ref.gender)
+    if gender in _FEMALE_GENDERS or _FEMALE_RE.search(text):
         return ScopeClassification(
-            competition, ScopeDecision.EXCLUDED, "women/female competition", "exclude_female"
+            profile_ref, ScopeDecision.EXCLUDED, "women/female competition", "exclude_female"
         )
     if _YOUTH_RE.search(text):
         return ScopeClassification(
-            competition, ScopeDecision.EXCLUDED, "youth competition", "exclude_youth"
+            profile_ref, ScopeDecision.EXCLUDED, "youth competition", "exclude_youth"
         )
     if _RESERVE_RE.search(text):
         return ScopeClassification(
-            competition, ScopeDecision.EXCLUDED, "reserve/development competition", "exclude_reserve"
+            profile_ref, ScopeDecision.EXCLUDED, "reserve/development competition", "exclude_reserve"
         )
-    if _FRIENDLY_RE.search(text):
+    if _SHOW_RE.search(text):
         return ScopeClassification(
-            competition, ScopeDecision.EXCLUDED, "friendly/charity/exhibition", "exclude_friendly"
+            profile_ref,
+            ScopeDecision.EXCLUDED,
+            "charity/testimonial/exhibition/show competition",
+            "exclude_show",
         )
-    if gender and gender not in {"male", "men", "m"}:
+    if gender not in _MALE_GENDERS:
         return ScopeClassification(
-            competition,
+            profile_ref,
             ScopeDecision.REVIEW_REQUIRED,
-            f"unrecognized explicit gender {competition.gender!r}",
+            f"missing or unrecognized profile gender {profile_ref.gender!r}",
             "review_unknown_gender",
         )
-    age_group = (competition.age_group or "").strip().lower()
-    if age_group and age_group not in {
-        "adult", "adults", "senior", "seniors", "male", "men"
-    }:
+    age_group = _classifier_text(profile_ref.age_group)
+    if age_group and age_group not in _ADULT_AGE_GROUPS:
         return ScopeClassification(
-            competition,
+            profile_ref,
             ScopeDecision.REVIEW_REQUIRED,
-            f"unrecognized explicit age group {competition.age_group!r}",
+            f"unrecognized explicit age group {profile_ref.age_group!r}",
             "review_unknown_age_group",
         )
+    competition_type = _classifier_text(profile_ref.competition_type)
+    if competition_type not in _KNOWN_COMPETITION_TYPES:
+        return ScopeClassification(
+            profile_ref,
+            ScopeDecision.REVIEW_REQUIRED,
+            f"missing or unrecognized profile type {profile_ref.competition_type!r}",
+            "review_unknown_type",
+        )
+    friendly = bool(_FRIENDLY_RE.search(text))
     return ScopeClassification(
-        competition,
+        profile_ref,
         ScopeDecision.INCLUDED,
-        "no women/youth/reserve/friendly exclusion signal",
-        "include_male_senior_default",
+        (
+            "structurally confirmed adult men's friendly"
+            if friendly
+            else "structurally confirmed adult men's competition"
+        ),
+        "include_structural_male_adult",
     )
 
 
@@ -349,6 +439,7 @@ def competition_from_league_payload(payload: Mapping[str, Any]) -> CompetitionRe
         country_code=_nonempty(details.get("country", details.get("countryCode"))),
         gender=_nonempty(details.get("gender")),
         competition_type=_nonempty(details.get("type")),
+        age_group=_nonempty(details.get("ageGroup", details.get("age_group"))),
         page_url=_nonempty(details.get("pageUrl")),
         source_slug=_nonempty(details.get("seopath")),
         source_paths=("$.details",),
@@ -464,6 +555,7 @@ def parse_seasons(
 
 
 __all__ = [
+    "CLASSIFIER_VERSION",
     "CatalogConflict",
     "CatalogConflictError",
     "CatalogDiscovery",
