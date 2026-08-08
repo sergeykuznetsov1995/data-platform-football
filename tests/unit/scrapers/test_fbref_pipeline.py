@@ -1585,6 +1585,9 @@ def test_second_batch_guard_enter_fault_closes_first_then_fails_all_leases(
             raise RuntimeError("second guard enter fault")
         try:
             yield True
+        except RuntimeError:
+            control.events.append(f"content_guard_rollback:{target_id}")
+            raise
         finally:
             control.events.append(f"content_guard_exit:{target_id}")
 
@@ -1596,10 +1599,14 @@ def test_second_batch_guard_enter_fault_closes_first_then_fails_all_leases(
         )
 
     first_exit = control.events.index(f"content_guard_exit:{ordered[0]}")
+    rollback = control.events.index(
+        f"content_guard_rollback:{ordered[0]}"
+    )
     failures = [
         control.events.index(f"observation_fail:{target_id}")
         for target_id in ordered
     ]
+    assert rollback < first_exit
     assert all(first_exit < failure for failure in failures)
     assert typed.calls == []
     assert typed.batch_sizes == []

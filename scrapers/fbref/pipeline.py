@@ -179,18 +179,16 @@ FBREF_BATCH_PERSIST_MAX_CELLS = _bounded_int(
 
 @contextmanager
 def _captured_exit_stack(errors: list[Exception]):
-    """Close every acquired context and defer lock errors to lease fencing."""
+    """Unwind with the real exception, then defer it to lease fencing."""
 
-    stack = ExitStack()
     try:
-        yield stack
+        # The exception must cross ExitStack.__exit__ before it is captured so
+        # database guard contexts see the real exc_info and roll back rather
+        # than treating a failed second lock entry as a successful body.
+        with ExitStack() as stack:
+            yield stack
     except Exception as exc:
         errors.append(exc)
-    finally:
-        try:
-            stack.close()
-        except Exception as exc:
-            errors.append(exc)
 
 
 class PipelineError(RuntimeError):
