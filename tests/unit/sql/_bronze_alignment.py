@@ -142,14 +142,18 @@ def collect_bronze_refs(sql: str) -> Dict[str, Set[str]]:
         # Only consider sources EXPLICITLY referenced in this scope's FROM/JOIN;
         # ignore CTE visibility (sqlglot lists every visible CTE in scope.sources).
         actual_aliases: Set[str] = set()
-        # Columns introduced by UNNEST(...) AS t(v) — exclude them from bronze
-        # attribution (they originate from JSON arrays, not the bronze table).
+        # Columns introduced by local UNNEST(...) AS t(v) — exclude them from
+        # unqualified Bronze attribution (they originate from JSON arrays, not
+        # the Bronze table). Keep these local to the current scope: recursive
+        # ``find_all`` would mix in nested CTE UDTFs and hide real columns.
         unnest_introduced: Set[str] = set()
         for t in scope.tables:
             actual_aliases.add(t.alias_or_name)
         for d in scope.derived_tables:
             actual_aliases.add(d.alias if d.alias else "")
-        for unnest in scope.expression.find_all(exp.Unnest):
+        for unnest in scope.udtfs:
+            if not isinstance(unnest, exp.Unnest):
+                continue
             alias_node = unnest.args.get("alias")
             if alias_node is None:
                 continue
@@ -182,7 +186,15 @@ def collect_bronze_refs(sql: str) -> Dict[str, Set[str]]:
                         inner_introduced | _select_introduced_aliases(source.expression),
                     )
 
-        scope_meta[id(scope)] = scope_aliases
+        # A single-Bronze passthrough CTE can expose its local UNNEST value and
+        # ordinality aliases to an outer scope. Propagate them as introduced
+        # columns, but do not add them to ``scope_aliases`` used below: a
+        # qualified ``bronze_alias.seq`` remains a real Bronze reference even
+        # when a local WITH ORDINALITY alias is also named ``seq``.
+        scope_meta[id(scope)] = {
+            alias: (bronze_table, introduced | unnest_introduced)
+            for alias, (bronze_table, introduced) in scope_aliases.items()
+        }
 
         bronze_in_scope = {a: v for a, v in scope_aliases.items() if v[0] is not None}
         non_bronze_count = len(actual_aliases) - len(bronze_in_scope)
@@ -191,7 +203,7 @@ def collect_bronze_refs(sql: str) -> Dict[str, Set[str]]:
             ctab = col.table
             if ctab and ctab in bronze_in_scope:
                 bt, intro = bronze_in_scope[ctab]
-                if col.name not in intro and col.name not in unnest_introduced:
+                if col.name not in intro:
                     refs.setdefault(bt, set()).add(col.name)
             elif not ctab and len(bronze_in_scope) == 1 and non_bronze_count == 0:
                 bt, intro = next(iter(bronze_in_scope.values()))

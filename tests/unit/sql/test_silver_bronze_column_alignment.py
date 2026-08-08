@@ -173,6 +173,21 @@ def test_extractor_skips_window_function_aliases():
 
 
 @pytest.mark.unit
+def test_extractor_retains_qualified_bronze_column_matching_ordinality_alias():
+    """A UDTF alias must not hide a same-named qualified Bronze column."""
+    sql = """
+    SELECT b.seq, b.event_id, detail, seq
+    FROM iceberg.bronze.espn_schedule_generation_v2 b
+    CROSS JOIN UNNEST(
+        CAST(json_extract(b.extra_json, '$.competition.details') AS array<json>)
+    ) WITH ORDINALITY AS u(detail, seq)
+    """
+    refs = collect_bronze_refs(sql)
+
+    assert {"seq", "event_id", "extra_json"} <= refs["espn_schedule_generation_v2"]
+
+
+@pytest.mark.unit
 def test_extractor_skips_unnest_value_and_ordinality_aliases_through_cte():
     """UNNEST aliases are derived values, not Bronze schedule columns.
 
