@@ -1120,7 +1120,8 @@ class PersistentFakeFetcher:
         self.events.append("browser")
         return True
 
-    def persistent_session_rollover_due(self):
+    def persistent_session_rollover_due(self, *, within_seconds=0):
+        assert within_seconds >= 0
         return False
 
     def fetch(self, url, **_kwargs):
@@ -3439,6 +3440,75 @@ def test_fetch_wave_recovers_committed_raw_without_constructing_transport(tmp_pa
     assert control.completed[0][1]["recovered_from_attempt_id"] == str(
         uuid.UUID(int=99)
     )
+
+
+def test_persistent_rollover_precedes_raw_recovery_early_exit(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = PersistentFakeControl(raw)
+    target = competition_index_target()
+    raw.commit_fetch(
+        target,
+        b"<html>committed</html>",
+        logical_refresh_id=str(uuid.UUID(int=2)),
+        attempt_id=str(uuid.UUID(int=99)),
+        http_status=200,
+    )
+
+    class DueFetcher:
+        persistent_http_session = True
+
+        def persistent_session_rollover_due(self, *, within_seconds=0):
+            control.events.append(("rollover_check", within_seconds))
+            return True
+
+        def finalize_metered_session(self):
+            control.events.append("provider_finalize")
+            return PersistentMeteredSessionReceipt(
+                session_id="session-existing",
+                meter="proxy_filter_provider_path_v2",
+                baseline_provider_bytes=0,
+                page_provider_bytes=0,
+                authoritative_provider_bytes=0,
+                tail_provider_bytes=0,
+            )
+
+        def reset_clearance(self):
+            control.events.append("rollover_reset")
+
+    live = _LiveFetchSession(
+        fetcher=DueFetcher(),
+        session_id="session-existing",
+        needs_clearance=False,
+        persistent_enabled=True,
+        state="active",
+        tail_reserved=True,
+    )
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: (_ for _ in ()).throw(
+            AssertionError("raw recovery must not build a transport")
+        ),
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="worker-1",
+        page_kinds=["competition_index"],
+        settings=_persistent_settings(),
+        _live_session=live,
+    )
+
+    assert result.recovered_from_raw == 1
+    assert control.events.index("provider_finalize") < control.events.index(
+        "complete"
+    )
+    assert control.events.index("session_close") < control.events.index(
+        "complete"
+    )
+    assert "rollover_reset" in control.events
 
 
 def test_sequential_wave_renews_current_and_waiting_leases(tmp_path):
@@ -7167,6 +7237,67 @@ def test_live_runner_reuses_one_fetch_session_and_parses_after_each_raw_batch(
     assert result.parse.parsed == 1
 
 
+def test_live_runner_closes_near_deadline_session_before_offline_parse(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = PersistentFakeControl(raw)
+    control.run["bytes_used"] = 120
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    class NearDeadlineFetcher:
+        persistent_http_session = True
+
+        def persistent_session_rollover_due(self, *, within_seconds=0):
+            control.events.append(("deadline_probe", within_seconds))
+            return within_seconds >= 600
+
+        def finalize_metered_session(self):
+            control.events.append("provider_finalize")
+            return PersistentMeteredSessionReceipt(
+                session_id="session-near-deadline",
+                meter="proxy_filter_provider_path_v2",
+                baseline_provider_bytes=0,
+                page_provider_bytes=120,
+                authoritative_provider_bytes=130,
+                tail_provider_bytes=10,
+            )
+
+        def reset_clearance(self):
+            control.events.append("rollover_reset")
+
+    def fake_fetch(*_args, _live_session, **_kwargs):
+        _live_session.fetcher = NearDeadlineFetcher()
+        _live_session.session_id = "session-near-deadline"
+        _live_session.needs_clearance = False
+        _live_session.state = "active"
+        _live_session.tail_reserved = True
+        return WaveResult(claimed=1, fetched=1, budget_exhausted=True)
+
+    def fake_parse(*_args, **_kwargs):
+        control.events.append("offline_parse")
+        return WaveResult(cohort_size=1, parsed=1)
+
+    pipeline.fetch_wave = fake_fetch
+    pipeline.parse_wave = fake_parse
+
+    pipeline.run_live_waves(
+        str(uuid.UUID(int=1)),
+        worker_id="current-live",
+        page_kinds=["competition_index"],
+        settings=_persistent_settings(),
+        max_batches=1,
+    )
+
+    assert ("deadline_probe", 600) in control.events
+    assert control.events.index("provider_finalize") < control.events.index(
+        "offline_parse"
+    )
+    assert control.events.index("session_close") < control.events.index(
+        "offline_parse"
+    )
+
+
 @pytest.mark.parametrize("invalid", [False, True, 0, 81, 1.5, "1.5"])
 def test_live_runner_accepts_only_strict_one_to_eighty_batches(
     tmp_path, invalid
@@ -7425,7 +7556,8 @@ def test_1501_pages_roll_over_into_multiple_exact_persistent_sessions():
             events.append(("begin", session_id))
             return self.baseline
 
-        def persistent_session_rollover_due(self):
+        def persistent_session_rollover_due(self, *, within_seconds=0):
+            assert within_seconds >= 0
             return self.now >= self.deadline
 
         def record_page(self):

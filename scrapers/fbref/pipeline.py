@@ -145,6 +145,11 @@ CLEARANCE_REJECTED_STATUSES = frozenset({401, 403, 429})
 # expiry is independent transport churn, not evidence that the source rejects
 # every fresh clearance.
 MAX_CONSECUTIVE_CLEARANCE_REFRESHES = 2
+# One production parse batch may consume the accepted 20 seconds per match for
+# all 25 targets (500s). Add 100s for scheduler/strict-close variance, and
+# finalize before entering that offline gap whenever the 115-minute local
+# session deadline is this close.
+PERSISTENT_PARSE_GUARD_SECONDS = 10 * 60
 
 logger = logging.getLogger(__name__)
 
@@ -705,7 +710,9 @@ class _LiveFetchSession:
         self.tail_reserved = True
         self.state = "active"
 
-    def rollover_if_due(self, control) -> bool:
+    def rollover_if_due(
+        self, control, *, within_seconds: float = 0.0
+    ) -> bool:
         """Finalize one exact session before its paid lease can expire."""
 
         if (
@@ -722,7 +729,7 @@ class _LiveFetchSession:
             raise PipelineError(
                 "FBref persistent fetcher must expose rollover deadline"
             )
-        if not bool(due()):
+        if not bool(due(within_seconds=within_seconds)):
             return False
 
         # This ordering is the paid-traffic fence: strict provider close,
@@ -2523,6 +2530,11 @@ class FBrefPipeline:
                 record = None
                 budget_settled = False
                 try:
+                    if live_session.rollover_if_due(self.control):
+                        logger.info(
+                            "FBref persistent session reached its safe local "
+                            "lifetime; exact tail settled before rollover"
+                        )
                     # Exact logical-refresh crash recovery is always safe.
                     # Historical targets are immutable by contract, so they
                     # may additionally adopt the latest verified raw-v2 (or
@@ -2548,12 +2560,6 @@ class FBrefPipeline:
                             )
                             result.recovered_from_raw += 1
                             continue
-
-                    if live_session.rollover_if_due(self.control):
-                        logger.info(
-                            "FBref persistent session reached its safe local "
-                            "lifetime; exact tail settled before rollover"
-                        )
 
                     (
                         clearance_requests,
@@ -3239,6 +3245,10 @@ class FBrefPipeline:
                     page_kinds=page_kinds,
                     settings=settings,
                     _live_session=live_session,
+                )
+                live_session.rollover_if_due(
+                    self.control,
+                    within_seconds=PERSISTENT_PARSE_GUARD_SECONDS,
                 )
                 parsed = self.parse_wave(
                     run_id,

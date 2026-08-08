@@ -808,9 +808,16 @@ class FBrefFetcher:
         self._persistent_session_deadline = started_at + safe_age
         return baseline
 
-    def persistent_session_rollover_due(self) -> bool:
+    def persistent_session_rollover_due(
+        self, *, within_seconds: float = 0.0
+    ) -> bool:
         """Return true before the current provider/sticky lifetime expires."""
 
+        if isinstance(within_seconds, bool):
+            raise ValueError("within_seconds must be a non-negative number")
+        guard = float(within_seconds)
+        if not math.isfinite(guard) or guard < 0:
+            raise ValueError("within_seconds must be a non-negative number")
         if (
             self._persistent_session_id is None
             or self._persistent_receipt is not None
@@ -826,7 +833,7 @@ class FBrefFetcher:
             raise FBrefProxyLeaseError(
                 "FBref persistent monotonic clock is invalid"
             )
-        return now >= deadline
+        return now + guard >= deadline
 
     def _persistent_page_checkpoint(self, *, close_tunnel: bool) -> int:
         if (

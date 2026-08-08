@@ -770,10 +770,13 @@ def test_persistent_session_rolls_before_the_provider_lease_deadline():
     )
 
     fetcher.begin_metered_session("session-deadline")
-    now[0] += PERSISTENT_SESSION_MAX_AGE_SECONDS - 0.001
+    now[0] += PERSISTENT_SESSION_MAX_AGE_SECONDS - 500
     assert fetcher.persistent_session_rollover_due() is False
+    assert fetcher.persistent_session_rollover_due(
+        within_seconds=600
+    ) is True
 
-    now[0] += 0.001
+    now[0] += 500
     assert fetcher.persistent_session_rollover_due() is True
     assert PERSISTENT_SESSION_MAX_AGE_SECONDS == 115 * 60
     assert PERSISTENT_SESSION_MAX_AGE_SECONDS < 7200
