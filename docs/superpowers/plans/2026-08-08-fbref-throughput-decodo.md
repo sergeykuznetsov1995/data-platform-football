@@ -422,6 +422,8 @@ git commit -m "perf(fbref): persist match waves in safe batches"
 - Modify: `dags/utils/fbref_pipeline_tasks.py`
 - Modify: `dags/utils/fbref_current_dag_factory.py`
 - Modify: `dags/dag_backfill_fbref.py`
+- Modify: `dags/dag_accept_fbref_bronze.py`
+- Modify: `dags/scripts/run_fbref_live_waves.py`
 - Modify: `scrapers/fbref/pipeline.py`
 - Modify: `scrapers/fbref/control/store.py`
 - Modify: `compose.yaml`
@@ -429,26 +431,28 @@ git commit -m "perf(fbref): persist match waves in safe batches"
 - Modify: `tests/unit/dags/test_dag_bootstrap_fbref.py`
 - Modify: `tests/unit/dags/test_dag_ingest_fbref.py`
 - Modify: `tests/unit/dags/test_dag_backfill_fbref.py`
+- Modify: `tests/unit/dags/test_dag_accept_fbref_bronze.py`
+- Modify: `tests/unit/dags/test_run_fbref_live_waves.py`
 - Modify: `tests/unit/scrapers/test_fbref_pipeline.py`
 - Modify: `tests/unit/scrapers/test_fbref_control_store_v8.py`
 
 **Interfaces:**
 - Consumes: durable progress/completion semantics from Tasks 2–3.
-- Produces: a dedicated one-slot FBref Airflow pool, aligned internal/Airflow timeouts, honest run success classification, and a proven superseded-only recovery skip.
+- Produces: a dedicated one-slot FBref Airflow pool, a six-hour child limit with an outer cleanup margin, capacity for 2,000 targets per run, honest run success classification, and a proven superseded-only recovery skip.
 
 - [ ] **Step 1: Add failing timeout/pool tests**
 
 ```python
-def test_bootstrap_has_aligned_eight_hour_dag_and_six_hour_live_task_limits():
+def test_bootstrap_has_eight_hour_dag_and_live_cleanup_margin():
     dag = load_bootstrap_dag()
     live = dag.get_task("run_live_waves")
     assert dag.dagrun_timeout == timedelta(hours=8)
-    assert live.execution_timeout == timedelta(hours=6)
+    assert live.execution_timeout == timedelta(hours=6, minutes=5)
     assert live.pool == "fbref_scraper_pool"
-    assert live.op_kwargs["max_batches"] == 20
+    assert live.op_kwargs["max_batches"] == 80
 ```
 
-Assert the same pool and six-hour task limit in current/backfill DAGs, the internal subprocess wall clock is six hours, and runtime validation accepts exactly 1–20 batches.
+Assert the same pool and outer task limit in current/backfill DAGs, move the paid live-acceptance task to the dedicated pool too, keep the internal subprocess wall clock at six hours, and make every wrapper/CLI/pipeline boundary accept exactly 1–80 batches. At shard size 25 this permits 2,000 targets in one run, enough headroom for the 1,500-match/day production gate once Task 5 removes the obsolete tariff profile.
 
 - [ ] **Step 2: Add failing honest-success tests**
 
@@ -485,7 +489,7 @@ Cover unresolved failure, newer success with a different parser-version triple, 
 
 - [ ] **Step 4: Run focused tests and confirm failures**
 
-Run: `/root/.venvs/dpf-test/bin/pytest tests/unit/dags/test_fbref_pipeline_tasks.py tests/unit/dags/test_dag_bootstrap_fbref.py tests/unit/dags/test_dag_ingest_fbref.py tests/unit/dags/test_dag_backfill_fbref.py tests/unit/scrapers/test_fbref_pipeline.py tests/unit/scrapers/test_fbref_control_store_v8.py -q`
+Run: `/root/.venvs/dpf-test/bin/pytest tests/unit/dags/test_fbref_pipeline_tasks.py tests/unit/dags/test_dag_bootstrap_fbref.py tests/unit/dags/test_dag_ingest_fbref.py tests/unit/dags/test_dag_backfill_fbref.py tests/unit/dags/test_dag_accept_fbref_bronze.py tests/unit/dags/test_run_fbref_live_waves.py tests/unit/scrapers/test_fbref_pipeline.py tests/unit/scrapers/test_fbref_control_store_v8.py -q`
 
 Expected: FAIL on current pool/timeouts, success thresholds, and poison-row selection.
 
@@ -493,11 +497,11 @@ Expected: FAIL on current pool/timeouts, success thresholds, and poison-row sele
 
 ```python
 FBREF_LIVE_WAVE_WALL_CLOCK_TIMEOUT_SECONDS = 6 * 60 * 60
-FBREF_MAX_LIVE_BATCHES = 20
+FBREF_MAX_LIVE_BATCHES = 80
 FBREF_SCRAPER_POOL = "fbref_scraper_pool"
 ```
 
-Set bootstrap `dagrun_timeout=8h`, live task `execution_timeout=6h`, and the internal subprocess timeout to six hours. Use `fbref_scraper_pool` for FBref live tasks only, keep its size one, and add idempotent pool creation to `airflow-init`. Do not increase the shared `ingest_scraper_pool`.
+Set bootstrap `dagrun_timeout=8h`, live task `execution_timeout=6h05m`, and the internal subprocess timeout to six hours so SIGTERM/process-group cleanup has an outer margin. Use `fbref_scraper_pool` for FBref live tasks only, including live acceptance, keep its size one, and add idempotent pool creation to `airflow-init`. Do not increase the shared `ingest_scraper_pool`.
 
 - [ ] **Step 6: Make success state-based rather than colour-based**
 
@@ -509,7 +513,7 @@ Modify `list_unprocessed_fetches` and its count companion with the same `NOT EXI
 
 - [ ] **Step 8: Run focused tests**
 
-Run: `/root/.venvs/dpf-test/bin/pytest tests/unit/dags/test_fbref_pipeline_tasks.py tests/unit/dags/test_dag_bootstrap_fbref.py tests/unit/dags/test_dag_ingest_fbref.py tests/unit/dags/test_dag_backfill_fbref.py tests/unit/scrapers/test_fbref_pipeline.py tests/unit/scrapers/test_fbref_control_store_v8.py -q`
+Run: `/root/.venvs/dpf-test/bin/pytest tests/unit/dags/test_fbref_pipeline_tasks.py tests/unit/dags/test_dag_bootstrap_fbref.py tests/unit/dags/test_dag_ingest_fbref.py tests/unit/dags/test_dag_backfill_fbref.py tests/unit/dags/test_dag_accept_fbref_bronze.py tests/unit/dags/test_run_fbref_live_waves.py tests/unit/scrapers/test_fbref_pipeline.py tests/unit/scrapers/test_fbref_control_store_v8.py -q`
 
 Expected: PASS.
 
@@ -517,7 +521,8 @@ Expected: PASS.
 
 ```bash
 git add dags/utils/fbref_pipeline_tasks.py dags/utils/fbref_current_dag_factory.py \
-  dags/dag_backfill_fbref.py scrapers/fbref/pipeline.py \
+  dags/dag_backfill_fbref.py dags/dag_accept_fbref_bronze.py \
+  dags/scripts/run_fbref_live_waves.py scrapers/fbref/pipeline.py \
   scrapers/fbref/control/store.py compose.yaml tests/unit/dags \
   tests/unit/scrapers/test_fbref_pipeline.py \
   tests/unit/scrapers/test_fbref_control_store_v8.py
@@ -526,7 +531,134 @@ git commit -m "fix(fbref): remove false stalls from productive runs"
 
 ---
 
-### Task 5: Decodo-efficient rollout evidence and completeness gate
+### Task 5: Remove tariff caps and make Decodo session rotation deterministic
+
+**Files:**
+- Modify: `scrapers/fbref/settings.py`
+- Modify: `scrapers/fbref/readiness.py`
+- Modify: `dags/utils/fbref_pipeline_tasks.py`
+- Modify: `dags/utils/fbref_current_dag_factory.py`
+- Modify: `dags/dag_backfill_fbref.py`
+- Modify: `dags/scripts/run_fbref_live_waves.py`
+- Modify: `scripts/proxy_filter/filter_proxy.py`
+- Modify: `compose.yaml`
+- Modify: `tests/unit/dags/test_fbref_pipeline_tasks.py`
+- Modify: `tests/unit/dags/test_dag_ingest_fbref.py`
+- Modify: `tests/unit/dags/test_dag_backfill_fbref.py`
+- Modify: `tests/unit/scrapers/test_fbref_readiness.py`
+- Modify: `tests/unit/scripts/test_filter_proxy.py`
+- Modify: `tests/integration/test_compose_validity.py`
+
+**Interfaces:**
+- Consumes: Task 4's 2,000-target run capacity and the existing lease/budget accounting.
+- Produces: no tariff-sized production stop, a high explicit runaway circuit breaker, and deterministic no-immediate-repeat Decodo session selection after transport failure.
+
+- [ ] **Step 1: Add failing capacity and breaker tests**
+
+Assert that production uses `4096` requests and `2048 MiB` only as an emergency circuit breaker, while the non-publishing canary remains exactly `100/50`. Keep the stored `request_limit`/`byte_limit` fields for schema compatibility, but remove wording and validation that treats the production values as an acceptable tariff budget. Prove that `80 * 25 == 2000` targets fit below the request breaker and that validation still rejects values above the configured safety circuit.
+
+- [ ] **Step 2: Add failing Decodo rotation tests**
+
+For the dedicated FBref proxy-filter service, prove that a failed lease cannot immediately select the same normalized proxy/session identity when another healthy identity exists. Selection must be deterministic and bounded, must never repin an active lease, and must not change the random-selection contract for other proxy-filter consumers. Tests and errors may contain only a redacted identity hash, never username, password, full proxy URL, or exit IP.
+
+- [ ] **Step 3: Replace business profiles with safety controls**
+
+```python
+FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT = 4096
+FBREF_PRODUCTION_SAFETY_BYTE_LIMIT_MIB = 2048
+FBREF_CANARY_REQUEST_LIMIT = 100
+FBREF_CANARY_BYTE_LIMIT_MIB = 50
+```
+
+The production constants are circuit breakers, not success gates. A run that reaches either breaker fails loudly as a runaway/incomplete run; ordinary acceptance compares bytes per durable match without an absolute-MB pass threshold. Keep max response size, one active lease, 6.1-second interval, raw-first commit, and all reservation settlement checks. Readiness verifies that the filter is configured for at least the safety circuit, not that a provider tariff balance is available.
+
+- [ ] **Step 4: Align proxy-filter safety configuration**
+
+Expose one secret-free `FBREF_PROXY_SAFETY_CIRCUIT_MIB` Compose setting, default `2048`, and use it for the dedicated FBref daily/run/URL filter ceilings. Do not increase limits for other scrapers. Keep `--max-active-leases 1`. Production credentials remain only in the deployment-owned `0640` proxy file mounted into the proxy filter; Airflow workers continue to see only the local filter endpoint.
+
+- [ ] **Step 5: Implement no-immediate-repeat session rotation**
+
+Track a bounded FBref-only cursor/last failed normalized session identity in the filter's lease allocator. On a new lease after failure, exclude the prior identity when another candidate exists; exhaustively fail if no candidate is healthy. Do not silently switch upstream inside an active lease. A one-entry pool may reuse its sole identity only after the normal cooldown/health policy permits it.
+
+- [ ] **Step 6: Run focused tests**
+
+Run: `/root/.venvs/dpf-test/bin/pytest tests/unit/dags/test_fbref_pipeline_tasks.py tests/unit/dags/test_dag_ingest_fbref.py tests/unit/dags/test_dag_backfill_fbref.py tests/unit/scrapers/test_fbref_readiness.py tests/unit/scripts/test_filter_proxy.py tests/integration/test_compose_validity.py -q`
+
+Expected: PASS with no credential-bearing output.
+
+- [ ] **Step 7: Commit capacity and rotation changes**
+
+```bash
+git add scrapers/fbref/settings.py scrapers/fbref/readiness.py \
+  dags/utils/fbref_pipeline_tasks.py dags/utils/fbref_current_dag_factory.py \
+  dags/dag_backfill_fbref.py dags/scripts/run_fbref_live_waves.py \
+  scripts/proxy_filter/filter_proxy.py compose.yaml tests
+git commit -m "perf(fbref): replace tariff caps with safety circuit"
+```
+
+---
+
+### Task 6: Reuse the metered Decodo HTTP session across pages
+
+**Files:**
+- Modify: `scrapers/fbref/proxy_lease.py`
+- Modify: `scrapers/fbref/fetcher.py`
+- Modify: `scrapers/fbref/pipeline.py`
+- Modify: `scrapers/fbref/control/store.py`
+- Modify: `compose.yaml`
+- Modify: `tests/unit/scrapers/test_fbref_proxy_lease.py`
+- Modify: `tests/unit/scrapers/test_fbref_metered_fetcher.py`
+- Modify: `tests/unit/scrapers/test_fbref_pipeline.py`
+- Modify: `tests/unit/scrapers/test_fbref_control_store_v8.py`
+
+**Interfaces:**
+- Consumes: the existing serial `curl_cffi.Session`, authoritative proxy-filter counters, and Task 5's safety circuit.
+- Produces: optional persistent HTTP/TLS reuse, exact per-page plus final-tail accounting, and unchanged raw/data/retry semantics.
+
+- [ ] **Step 1: Add failing persistent-session tests**
+
+Behind `FBREF_PERSISTENT_HTTP_SESSION=0` by default, two successful pages must use one curl session and one pinned proxy lease, must not close after page one, and must close exactly once at final session shutdown. A 403/429, dead clearance, transport failure, meter ambiguity, or explicit rollover still closes and rotates. Conditional headers, decoded/raw bytes, content hashes, and the raw-before-settlement order must remain unchanged.
+
+- [ ] **Step 2: Add failing exact-accounting tests**
+
+Add a proxy-lease `wait_idle()` checkpoint which requires page reservations to drain while allowing the one expected persistent tunnel. Require two stable authoritative samples before settlement. Prove:
+
+```text
+sum(page provider deltas) + final connection tail == authoritative close total
+```
+
+The control-plane run byte total and clearance-session metric must equal the same value exactly. Counter regression, timeout, unexpected tunnels, unknown final tail, or insufficient tail reservation fails closed and opens no new paid lease.
+
+- [ ] **Step 3: Implement persistent metered checkpoints**
+
+Replace success-path per-page close/drain with the new serial idle checkpoint. Keep the current close/drain behavior for all rotation/error paths. Do not create parallel requests: one session remains strictly serial and the source interval still gates every target.
+
+- [ ] **Step 4: Settle final connection overhead idempotently**
+
+Create a run-scoped, zero-request session-tail reservation keyed by a non-secret session identity before opening the persistent connection. On `_LiveFetchSession.close()`, finalize the fetcher's provider accounting before closing the clearance session, settle the exact final delta once, and record it in both run and session metrics. Repeated close/finalize calls must be no-ops. Never attribute tail bytes to an arbitrary page or leave them uncounted.
+
+- [ ] **Step 5: Preserve zero-network recovery**
+
+Any failure after immutable raw commit retries parsing/persistence only from raw. A healthy target never rotates merely to obtain a new IP. A rollover may happen only on a raw boundary and must settle the old session completely before opening the next lease.
+
+- [ ] **Step 6: Run focused tests**
+
+Run: `/root/.venvs/dpf-test/bin/pytest tests/unit/scrapers/test_fbref_proxy_lease.py tests/unit/scrapers/test_fbref_metered_fetcher.py tests/unit/scrapers/test_fbref_pipeline.py tests/unit/scrapers/test_fbref_control_store_v8.py -q`
+
+Expected: PASS, including the pre-existing hard-transport-policy and raw-first ordering tests.
+
+- [ ] **Step 7: Commit persistent-session support**
+
+```bash
+git add scrapers/fbref/proxy_lease.py scrapers/fbref/fetcher.py \
+  scrapers/fbref/pipeline.py scrapers/fbref/control/store.py compose.yaml \
+  tests/unit/scrapers
+git commit -m "perf(fbref): reuse metered proxy sessions across pages"
+```
+
+---
+
+### Task 7: Decodo-efficient rollout evidence and completeness gate
 
 **Files:**
 - Create: `scripts/research/bench_fbref_decodo_session.py`
@@ -537,7 +669,7 @@ git commit -m "fix(fbref): remove false stalls from productive runs"
 - Modify: `tests/unit/scripts/test_bench_fbref_persistence.py`
 
 **Interfaces:**
-- Consumes: Tasks 1–4 and Decodo credentials supplied only through the runtime proxy file.
+- Consumes: Tasks 1–6 and Decodo credentials supplied only through the runtime proxy file.
 - Produces: a no-secret sticky-session canary, canonical completeness SQL, bidirectional 12-table replay comparison, and an explicit staged rollout/rollback runbook.
 
 - [ ] **Step 1: Add failing session-canary tests**
