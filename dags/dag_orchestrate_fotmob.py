@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from airflow import DAG
-from airflow.exceptions import AirflowException
+from airflow.exceptions import AirflowException, AirflowSkipException
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator, ShortCircuitOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
@@ -23,6 +23,7 @@ from utils.fotmob_orchestration import (
 )
 from utils.fotmob_publication import (
     FOTMOB_DEPLOYMENT_REPORT_PATH_ENV,
+    FOTMOB_PUBLICATION_SOURCE,
     attest_fotmob_isolated_runtime,
     fail_unsealed_fotmob_publication,
     fotmob_ceremony_configured,
@@ -41,6 +42,7 @@ AUTOMATIC_ADMITTED_DAGS = frozenset(
 DECISION_TASK_ID = "choose_fotmob_lane"
 INITIALIZER_TASK_ID = "initialize_fotmob_publication"
 TRIGGER_TASK_ID = "trigger_fotmob_ingest"
+LAUNCH_REJECTED_XCOM_KEY = "fotmob_launch_rejected"
 
 GENERATION_TEMPLATE = (
     "{{ ti.xcom_pull(task_ids='initialize_fotmob_publication')"
@@ -192,9 +194,9 @@ def select_fotmob_lane(**context: Any) -> dict[str, Any] | bool:
     }
 
 
-def initialize_admitted_publication(**context: Any) -> dict[str, Any] | bool:
-    """Recheck the launch boundary before creating a publication generation."""
-
+def _selected_launch(
+    context: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], FotMobSchedulerState, FotMobLane]:
     ti = context.get("ti")
     raw = ti.xcom_pull(task_ids=DECISION_TASK_ID) if ti is not None else None
     if not isinstance(raw, Mapping):
@@ -204,6 +206,11 @@ def initialize_admitted_publication(**context: Any) -> dict[str, Any] | bool:
         selected_lane = FotMobLane(str(raw["lane"]))
     except (KeyError, TypeError, ValueError) as exc:
         raise AirflowException("FotMob scheduler decision XCom is invalid") from exc
+    return raw, selected_state, selected_lane
+
+
+def _launch_still_admitted(context: Mapping[str, Any]) -> bool:
+    raw, selected_state, selected_lane = _selected_launch(context)
     current = _load_state()
     if current != selected_state:
         raise AirflowException("FotMob scheduler state changed before launch")
@@ -218,7 +225,10 @@ def initialize_admitted_publication(**context: Any) -> dict[str, Any] | bool:
     if choose_lane(now, current, child_running).lane is not selected_lane:
         return False
     if selected_lane is not FotMobLane.DAILY:
-        raw_deadline = (raw.get("conf") or {}).get("deadline")
+        conf = raw.get("conf")
+        if not isinstance(conf, Mapping):
+            raise AirflowException("FotMob background launch conf is invalid")
+        raw_deadline = conf.get("deadline")
         try:
             deadline = datetime.fromisoformat(str(raw_deadline))
         except (TypeError, ValueError) as exc:
@@ -227,10 +237,82 @@ def initialize_admitted_publication(**context: Any) -> dict[str, Any] | bool:
             raise AirflowException("FotMob background deadline is invalid")
         if now >= deadline.astimezone(UTC):
             return False
+    return True
 
+
+def initialize_admitted_publication(**context: Any) -> dict[str, Any] | bool:
+    """Recheck the launch boundary before creating a publication generation."""
+
+    if not _launch_still_admitted(context):
+        return False
     return initialize_fotmob_publication(
         publication_owner="isolated",
         require_scheduled_owner=False,
+        **context,
+    )
+
+
+def _release_unstarted_publication(context: Mapping[str, Any]) -> dict[str, Any]:
+    """Fail and safely unlock a generation before any child was triggered."""
+
+    ti = context.get("ti")
+    publication = (
+        ti.xcom_pull(task_ids=INITIALIZER_TASK_ID) if ti is not None else None
+    )
+    if not isinstance(publication, Mapping) or not publication.get("generation_id"):
+        raise AirflowException("FotMob initialized publication XCom is missing")
+    if not fotmob_ceremony_configured():
+        return {
+            "status": "released",
+            "ceremony": "disabled",
+            "generation_id": publication["generation_id"],
+        }
+    from scrapers.fbref.control import ControlStore
+
+    return ControlStore.from_env().fail_publication_generation(
+        publication["generation_id"],
+        safe_to_release=True,
+        source=FOTMOB_PUBLICATION_SOURCE,
+    )
+
+
+class BoundaryCheckedTriggerDagRunOperator(TriggerDagRunOperator):
+    """Guarantee a fresh boundary check at the child-trigger operation."""
+
+    def execute(self, context: Mapping[str, Any]):
+        if not _launch_still_admitted(context):
+            released = _release_unstarted_publication(context)
+            if fotmob_ceremony_configured() and released.get("released") is not True:
+                raise AirflowException(
+                    "FotMob unstarted publication generation was not released"
+                )
+            ti = context.get("ti")
+            if ti is not None:
+                ti.xcom_push(
+                    key=LAUNCH_REJECTED_XCOM_KEY,
+                    value={"safe_release": True, "state_advanced": False},
+                )
+            raise AirflowSkipException(
+                "FotMob launch window closed before child trigger"
+            )
+        return super().execute(context)
+
+
+def finalize_or_skip_rejected_launch(**context: Any) -> dict[str, Any]:
+    """Do not finalize or advance a safely rejected, never-started child."""
+
+    ti = context.get("ti")
+    rejected = (
+        ti.xcom_pull(task_ids=TRIGGER_TASK_ID, key=LAUNCH_REJECTED_XCOM_KEY)
+        if ti is not None
+        else None
+    )
+    if isinstance(rejected, Mapping) and rejected.get("state_advanced") is False:
+        raise AirflowSkipException("FotMob child launch was safely rejected")
+    return fail_unsealed_fotmob_publication(
+        publication_owner="isolated",
+        success_task_id=TRIGGER_TASK_ID,
+        writer_task_ids=[TRIGGER_TASK_ID],
         **context,
     )
 
@@ -323,7 +405,7 @@ if os.environ.get(ISOLATED_STACK_ENV) == "1":
             retries=0,
         )
 
-        trigger_ingest = TriggerDagRunOperator(
+        trigger_ingest = BoundaryCheckedTriggerDagRunOperator(
             task_id=TRIGGER_TASK_ID,
             trigger_dag_id=INGEST_DAG_ID,
             trigger_run_id="fotmob_orchestrated__" + GENERATION_TEMPLATE,
@@ -346,12 +428,7 @@ if os.environ.get(ISOLATED_STACK_ENV) == "1":
 
         finalize_publication = PythonOperator(
             task_id="finalize_fotmob_publication",
-            python_callable=fail_unsealed_fotmob_publication,
-            op_kwargs={
-                "publication_owner": "isolated",
-                "success_task_id": TRIGGER_TASK_ID,
-                "writer_task_ids": [TRIGGER_TASK_ID],
-            },
+            python_callable=finalize_or_skip_rejected_launch,
             trigger_rule="all_done",
             retries=0,
         )
