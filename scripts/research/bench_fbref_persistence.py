@@ -11,13 +11,15 @@ import argparse
 import gzip
 import hashlib
 import json
+import logging
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -85,8 +87,9 @@ class StatementCounts:
 
 @dataclass(frozen=True)
 class TableDigest:
-    rows: int
-    sha256: str
+    present: bool
+    rows: int | None
+    sha256: str | None
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,19 @@ class BenchmarkReport:
 
 class BatchPersistenceUnavailableError(RuntimeError):
     """Raised until the Task 2 writer batch APIs are available."""
+
+
+@contextmanager
+def _suppress_trino_sql_logs() -> Iterator[None]:
+    """Keep Trino SQL and bound values out of benchmark output and reports."""
+
+    logger = logging.getLogger("scrapers.base.trino_manager")
+    previously_disabled = logger.disabled
+    logger.disabled = True
+    try:
+        yield
+    finally:
+        logger.disabled = previously_disabled
 
 
 class CountingTrinoTableManager(TrinoTableManager):
@@ -362,6 +378,11 @@ def _table_digests(
     digests: dict[str, TableDigest] = {}
     for table in BENCHMARK_TABLES:
         if not manager.table_exists(schema, table):
+            digests[table] = TableDigest(
+                present=False,
+                rows=None,
+                sha256=None,
+            )
             continue
         columns = manager.get_table_columns(schema, table)
         kept_columns = [
@@ -379,9 +400,58 @@ def _table_digests(
         normalized = _normalized_rows(kept_columns, rows or ())
         payload = "\n".join(normalized).encode("utf-8")
         digests[table] = TableDigest(
-            rows=len(normalized), sha256=hashlib.sha256(payload).hexdigest()
+            present=True,
+            rows=len(normalized),
+            sha256=hashlib.sha256(payload).hexdigest(),
         )
     return digests
+
+
+def _digests_equivalent(
+    sequential: Mapping[str, TableDigest], batch: Mapping[str, TableDigest]
+) -> bool:
+    """Require every expected table to exist and agree in both schemas."""
+
+    for table in BENCHMARK_TABLES:
+        left = sequential.get(table)
+        right = batch.get(table)
+        if left is None or right is None:
+            return False
+        if not left.present or not right.present:
+            return False
+        if left != right:
+            return False
+    return True
+
+
+def _validate_schema_isolation(config: BenchmarkConfig) -> None:
+    if (
+        config.batch_schema is not None
+        and config.sequential_schema.casefold() == config.batch_schema.casefold()
+    ):
+        raise ValueError(
+            "sequential and batch schemas must be case-insensitively distinct"
+        )
+
+
+def _preflight_schemas(config: BenchmarkConfig) -> None:
+    """Reject replay schemas containing any table the benchmark may touch."""
+
+    manager = CountingTrinoTableManager()
+    schemas = (config.sequential_schema,)
+    if config.batch_schema is not None:
+        schemas += (config.batch_schema,)
+    for schema in schemas:
+        present = [
+            table
+            for table in BENCHMARK_TABLES
+            if manager.table_exists(schema, table)
+        ]
+        if present:
+            raise ValueError(
+                f"benchmark schema {schema!r} must be empty; found "
+                + ", ".join(present)
+            )
 
 
 def _run_persistence(
@@ -406,57 +476,62 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkReport:
 
     if config.iterations < 1:
         raise ValueError("iterations must be at least 1")
+    _validate_schema_isolation(config)
     if config.batch_schema and not _batch_api_available():
         raise BatchPersistenceUnavailableError(
             "batch persistence API is unavailable"
         )
 
-    items = _load_replay_items(config.html_dir)
-    sequential = _run_persistence(
-        schema=config.sequential_schema,
-        items=items,
-        iterations=config.iterations,
-        runner=_run_sequential,
-    )
-    if config.batch_schema is None:
+    with _suppress_trino_sql_logs():
+        _preflight_schemas(config)
+        items = _load_replay_items(config.html_dir)
+        sequential = _run_persistence(
+            schema=config.sequential_schema,
+            items=items,
+            iterations=config.iterations,
+            runner=_run_sequential,
+        )
+        if config.batch_schema is None:
+            return BenchmarkReport(
+                matches=len(items),
+                iterations=config.iterations,
+                sequential=sequential,
+                batch=None,
+                equivalent=None,
+                proxy_requests=0,
+                proxy_bytes=0,
+                gate=None,
+            )
+
+        batch = _run_persistence(
+            schema=config.batch_schema,
+            items=items,
+            iterations=config.iterations,
+            runner=_run_batch,
+        )
+        equivalent = _digests_equivalent(
+            sequential.table_digests, batch.table_digests
+        )
+        gate = evaluate_gate(
+            sequential_seconds=sequential.seconds,
+            batch_seconds=batch.seconds,
+            matches=len(items),
+            equivalent=equivalent,
+            proxy_requests=0,
+            proxy_bytes=0,
+            min_speedup=config.min_speedup,
+            max_seconds_per_match=config.max_seconds_per_match,
+        )
         return BenchmarkReport(
             matches=len(items),
             iterations=config.iterations,
             sequential=sequential,
-            batch=None,
-            equivalent=None,
+            batch=batch,
+            equivalent=equivalent,
             proxy_requests=0,
             proxy_bytes=0,
-            gate=None,
+            gate=gate,
         )
-
-    batch = _run_persistence(
-        schema=config.batch_schema,
-        items=items,
-        iterations=config.iterations,
-        runner=_run_batch,
-    )
-    equivalent = sequential.table_digests == batch.table_digests
-    gate = evaluate_gate(
-        sequential_seconds=sequential.seconds,
-        batch_seconds=batch.seconds,
-        matches=len(items),
-        equivalent=equivalent,
-        proxy_requests=0,
-        proxy_bytes=0,
-        min_speedup=config.min_speedup,
-        max_seconds_per_match=config.max_seconds_per_match,
-    )
-    return BenchmarkReport(
-        matches=len(items),
-        iterations=config.iterations,
-        sequential=sequential,
-        batch=batch,
-        equivalent=equivalent,
-        proxy_requests=0,
-        proxy_bytes=0,
-        gate=gate,
-    )
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
