@@ -1,0 +1,51 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.espn_substitutions
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.espn_substitutions
+  description: |
+    Входящие замены ESPN: одна строка на (event_id, team_id, player_in_id).
+    Источник — bronze.espn_lineup_generation_v2, дедуплицированный по полному
+    player-match ключу и последнему _ingested_at перед фильтром subbed_in=true;
+    schedule добавляет played status и partition keys. Таблица сознательно
+    строится от вошедшего игрока: несбалансированные строки «ушёл без входящего»
+    сюда не попадают. Номера и игрок на выход из JSON имеют источник рядом с
+    subbedInFor, а не внутри athlete. _bronze_ingested_at — lineage.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: event_id
+    description: Сырой ESPN ID матча; часть PK.
+  - name: team_id
+    description: Сырой ESPN ID команды; часть PK.
+  - name: team
+    description: Название команды, выполнившей замену.
+  - name: minute
+    description: Минута выхода игрока, приведённая к integer; invalid raw значения дают NULL.
+  - name: player_in_id
+    description: Сырой ESPN ID вошедшего игрока; часть PK.
+  - name: player_in_name
+    description: Отображаемое имя вошедшего игрока.
+    tags:
+      - PII.Low
+  - name: player_out_id
+    description: Сырой ESPN ID заменённого игрока из extra_json.
+  - name: player_out_name
+    description: Отображаемое имя заменённого игрока из extra_json.
+    tags:
+      - PII.Low
+  - name: player_in_jersey
+    description: Номер вошедшего; JSON имеет приоритет над Bronze-колонкой.
+  - name: player_out_jersey
+    description: Номер заменённого игрока, лежащий рядом с subbedInFor.athlete.
+  - name: _bronze_ingested_at
+    description: Timestamp выбранной последней lineup Bronze-генерации (lineage).
+  - name: league
+    description: Competition slug ESPN; partition key из schedule.
+  - name: season
+    description: Source season year как varchar; partition key из schedule.
+  - name: _silver_created_at
+    description: Технический timestamp CTAS-раннера при материализации Silver.
+relationships: []

@@ -1,0 +1,64 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.espn_player_match_aggregate
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.espn_player_match_aggregate
+  description: |
+    Статистика игрока ESPN за сыгранный матч: одна строка на
+    (event_id, team_id, athlete_id). Append-only
+    bronze.espn_lineup_generation_v2 дедуплицируется по этому полному ключу и
+    последнему _ingested_at до JSON-операций; schedule даёт status и partition
+    keys. Один athlete_id может встретиться у двух команд в одном матче, поэтому
+    team_id обязателен. Jersey из JSON приоритетнее Bronze-колонки; неигравшие
+    запасные имеют NULL minutes_played, а отсутствие plays даёт 0 goals/assists
+    events. Позиционная группа — модельный словарь, а не raw abbreviation.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: event_id
+    description: Сырой ESPN ID матча; часть PK.
+  - name: team_id
+    description: Сырой ESPN ID команды; часть PK и защита от тёзки в двух командах.
+  - name: athlete_id
+    description: Сырой ESPN ID игрока; часть PK.
+  - name: team
+    description: Название команды игрока.
+  - name: player_name
+    description: Отображаемое имя игрока ESPN.
+    tags:
+      - PII.Low
+  - name: jersey
+    description: Номер игрока; JSON extra_json имеет приоритет над Bronze-колонкой.
+  - name: position
+    description: Raw позиция; пустая и Substitute нормализованы в NULL.
+  - name: position_group
+    description: Модельная группа GK/DF/MF/FW из raw позиции; NULL если не классифицирована.
+  - name: is_starter
+    description: TRUE если ESPN помечает игрока стартовым.
+  - name: subbed_in
+    description: TRUE если игрок вышел на замену.
+  - name: subbed_out
+    description: TRUE если игрок был заменён.
+  - name: minutes_played
+    description: Best-effort минуты только для стартера или вышедшего; extra time/penalty final использует 120.
+  - name: has_stats
+    description: TRUE при непустой statistics_json; NULL отдельных счётчиков всё ещё может означать недоступность.
+  - name: goals
+    description: Raw ESPN total_goals, приведённый к integer.
+  - name: assists
+    description: Raw ESPN goal_assists, приведённый к integer.
+  - name: goals_events
+    description: Количество lineup plays с didScore=true; отсутствие массива нормализовано в 0.
+  - name: assists_events
+    description: Количество lineup plays с didAssist=true; отсутствие массива нормализовано в 0.
+  - name: _bronze_ingested_at
+    description: Timestamp выбранной последней lineup Bronze-генерации (lineage).
+  - name: league
+    description: Competition slug ESPN; partition key из schedule.
+  - name: season
+    description: Source season year как varchar; partition key из schedule.
+  - name: _silver_created_at
+    description: Технический timestamp CTAS-раннера при материализации Silver.
+relationships: []
