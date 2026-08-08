@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
+from scrapers.fotmob.scope_codec import format_scope_token, parse_scope_groups
 from scrapers.fotmob.source_refresh import (
     REPLAY_MISSING_INPUT_PROOF_SCHEMA as REPLAY_MISSING_INPUT_SCHEMA,
 )
@@ -70,6 +71,7 @@ PUBLICATION_BINDING_ARGUMENTS = {
     "runtime_fingerprint": "publication_runtime_fingerprint",
 }
 _ACTIVE_PUBLICATION_GENERATION: str | None = None
+FOTMOB_SCOPE_JSON_ENV = "FOTMOB_SCOPE_JSON"
 
 
 def _publication_from_args(args) -> dict[str, Any] | None:
@@ -117,7 +119,7 @@ def _attest_native_runtime(args, publication: Mapping[str, Any]) -> dict[str, An
     from utils.fotmob_publication import attest_fotmob_isolated_runtime
 
     scopes = [
-        f"{competition_id}={season}"
+        format_scope_token(competition_id, season)
         for competition_id, season in _parse_scopes(args.scope)
     ]
     source_refresh = getattr(args, "source_refresh_contract", None)
@@ -234,27 +236,27 @@ def _safe_run_id(value: str) -> str:
 def _parse_scopes(values: Iterable[str]) -> tuple[tuple[int, str], ...]:
     """Parse repeatable/comma-separated exact ``competition_id=season`` scopes."""
 
-    scopes: list[tuple[int, str]] = []
-    seen: set[tuple[int, str]] = set()
-    for raw_group in values:
-        for raw_item in str(raw_group or "").split(","):
-            item = raw_item.strip()
-            if not item:
-                continue
-            competition, separator, season = item.partition("=")
-            if not separator or not competition.isascii() or not competition.isdigit():
-                raise ValueError(
-                    f"invalid --scope {item!r}; expected numeric ID=exact-season"
-                )
-            if not season or season != season.strip():
-                raise ValueError(
-                    f"invalid --scope {item!r}; season must be a non-empty exact source key"
-                )
-            identity = (int(competition), season)
-            if identity not in seen:
-                scopes.append(identity)
-                seen.add(identity)
-    return tuple(scopes)
+    try:
+        return parse_scope_groups(values)
+    except ValueError as exc:
+        raise ValueError(f"invalid --scope: {exc}") from exc
+
+
+def _scope_groups_from_environment() -> list[str]:
+    """Decode the DAG's shell-safe exact scope handoff, if configured."""
+
+    raw = os.environ.get(FOTMOB_SCOPE_JSON_ENV)
+    if raw is None:
+        return []
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{FOTMOB_SCOPE_JSON_ENV} must contain JSON") from exc
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return value
+    raise ValueError(f"{FOTMOB_SCOPE_JSON_ENV} must contain a string or string list")
 
 
 def _source_refresh_artifact_path() -> Path:
@@ -816,12 +818,15 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         # only a request where NOTHING asked for exists stays an error.
         scope_validation.skipped += len(missing_scopes)
         scope_validation.metadata["unadvertised_scopes"] = [
-            f"{comp}={season}" for comp, season in missing_scopes
+            format_scope_token(comp, season) for comp, season in missing_scopes
         ]
         if not (set(explicit_scopes) & discovered_identities):
             scope_validation.errors.append(
                 "requested exact scopes were not advertised by FotMob: "
-                + ",".join(f"{comp}={season}" for comp, season in missing_scopes)
+                + ",".join(
+                    format_scope_token(comp, season)
+                    for comp, season in missing_scopes
+                )
             )
         if scope_validation not in operations:
             operations.append(scope_validation)
@@ -901,14 +906,16 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 + ",".join(map(str, missing_current_ids))
             )
     planned_scopes = [
-        f"{item.competition_id}={item.source_season_key}" for item in work
+        format_scope_token(item.competition_id, item.source_season_key)
+        for item in work
     ]
     if args.season_limit:
         deferred = work[args.season_limit :]
         work = work[: args.season_limit]
         work_plan.skipped += len(deferred)
         work_plan.metadata["limit_deferred_scopes"] = [
-            f"{item.competition_id}={item.source_season_key}" for item in deferred
+            format_scope_token(item.competition_id, item.source_season_key)
+            for item in deferred
         ]
     work_plan.counts["planned_scopes"] = len(work)
     operations.append(work_plan)
@@ -919,7 +926,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     # the fairness boundary that prevents a season-first pass from consuming
     # the whole request budget and permanently starving child entities.
     for work_index, item in enumerate(work):
-        scope_key = f"{item.competition_id}={item.source_season_key}"
+        scope_key = format_scope_token(item.competition_id, item.source_season_key)
         scope_operations = []
         operation, bundle = service.sync_season(
             item.competition_id,
@@ -1249,7 +1256,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     payload["selection"] = {
         "entities": sorted(entities),
         "explicit_scopes": [
-            f"{competition_id}={season}" for competition_id, season in explicit_scopes
+            format_scope_token(competition_id, season)
+            for competition_id, season in explicit_scopes
         ],
         "competition_limit": args.competition_limit,
         "season_limit": args.season_limit,
@@ -1604,6 +1612,14 @@ def main():
     _deactivate_native_service()
     parser = _argument_parser()
     args = parser.parse_args()
+    try:
+        environment_scopes = _scope_groups_from_environment()
+    except ValueError as exc:
+        parser.error(f"invalid {FOTMOB_SCOPE_JSON_ENV}: {exc}")
+    if args.scope and environment_scopes:
+        parser.error("--scope and FOTMOB_SCOPE_JSON cannot both be supplied")
+    if environment_scopes:
+        args.scope = environment_scopes
     publication = _validate_args(parser, args)
     if publication is not None:
         args.publication_generation_id = publication["generation_id"]

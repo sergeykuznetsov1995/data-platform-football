@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from scrapers.fotmob.scope_codec import parse_scope_token, validate_scope_tokens
 from scrapers.fotmob.source_refresh import (
     PLAYER_SOURCE_REFRESH_ARTIFACT,
     PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB,
@@ -195,6 +196,7 @@ FOTMOB_ISOLATED_REQUIRED_RUNTIME_PATHS = frozenset(
         "dags/utils/fotmob_publication.py",
         "scrapers/fotmob/repository.py",
         "scrapers/fotmob/service.py",
+        "scrapers/fotmob/scope_codec.py",
         "scrapers/fotmob/source_refresh.py",
     }
 )
@@ -230,6 +232,7 @@ FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS = frozenset(
         "scrapers/fotmob/raw_store.py",
         "scrapers/fotmob/repository.py",
         "scrapers/fotmob/service.py",
+        "scrapers/fotmob/scope_codec.py",
         "scrapers/fotmob/source_refresh.py",
         "scrapers/fotmob/transport.py",
     }
@@ -240,7 +243,6 @@ FOTMOB_ISSUE930_WRITER_ENTITIES = frozenset(
 FOTMOB_ISSUE930_MODE_PARITY = {"backfill": 0, "replay": 1}
 
 _FULL_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
-_SCOPE_LINE_RE = re.compile(r"([1-9][0-9]*)=(\S+)")
 
 
 def _competition_ids_digest(competition_ids: Sequence[int]) -> str:
@@ -282,13 +284,14 @@ def load_fotmob_daily_competition_contract(
     scopes: list[str] = []
     competition_ids: set[int] = set()
     for line_number, line in enumerate(text.splitlines(), start=1):
-        match = _SCOPE_LINE_RE.fullmatch(line)
-        if match is None:
+        try:
+            competition_id, _source_season_key = parse_scope_token(line)
+        except ValueError as exc:
             raise ValueError(
                 f"invalid FotMob daily scope at line {line_number}: {line!r}"
-            )
+            ) from exc
         scopes.append(line)
-        competition_ids.add(int(match.group(1)))
+        competition_ids.add(competition_id)
     if len(scopes) != FOTMOB_DAILY_SCOPE_COUNT or len(set(scopes)) != len(scopes):
         raise ValueError(
             "FotMob daily scope artifact must contain exactly 158 unique scopes"
@@ -556,15 +559,16 @@ def _validate_issue930_kept_paused_writer(
             raise _airflow_exception("FotMob kept-paused ingest run identity differs")
         raw_scopes = identity.get("scopes")
         raw_scope_items = (
-            [item.strip() for item in raw_scopes.split(",") if item.strip()]
+            raw_scopes.split(",")
             if isinstance(raw_scopes, str)
             else list(raw_scopes or ())
         )
-        scope_items = (
-            raw_scope_items
-            if all(isinstance(item, str) for item in raw_scope_items)
-            else []
-        )
+        try:
+            scope_items = list(validate_scope_tokens(raw_scope_items))
+        except ValueError:
+            scope_items = []
+        if tuple(raw_scope_items) != tuple(scope_items):
+            scope_items = []
         scope_bytes = ("\n".join(scope_items) + "\n").encode("utf-8")
         raw_entities = identity.get("entities")
         entities = {
@@ -639,7 +643,6 @@ def _validate_issue930_kept_paused_writer(
         elif (
             len(scope_items) != FOTMOB_DAILY_SCOPE_COUNT
             or len(set(scope_items)) != FOTMOB_DAILY_SCOPE_COUNT
-            or any(_SCOPE_LINE_RE.fullmatch(str(item)) is None for item in scope_items)
             or hashlib.sha256(scope_bytes).hexdigest() != FOTMOB_DAILY_SCOPE_SHA256
             or entities != FOTMOB_ISSUE930_WRITER_ENTITIES
             or competition_limit != 0

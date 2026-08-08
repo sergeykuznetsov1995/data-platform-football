@@ -324,7 +324,8 @@ class TestFotmobNativeParams:
         )
 
         assert '--mode "{{ params.mode }}"' in task.bash_command
-        assert '--scope "{{ params.scope }}"' in task.bash_command
+        assert "--scope" not in task.bash_command
+        assert task.env["FOTMOB_SCOPE_JSON"] == "{{ params.scope | tojson }}"
         assert '--daily-contract "{{ params.daily_contract }}"' in task.bash_command
         assert "--competition-scope-file" in task.bash_command
         assert '--requests-per-minute "{{ params.requests_per_minute }}"' in (
@@ -650,6 +651,50 @@ class TestNativeValidation:
             "competition_limit": 0,
             "season_limit": 0,
         }
+
+    @pytest.mark.unit
+    def test_evidence_validator_accepts_spaced_exact_source_season(self, tmp_path):
+        import json
+
+        mod = _reload_dag_module()
+        report = tmp_path / "report.json"
+        payload = {
+            "run_id": "run-1",
+            "mode": "backfill",
+            "status": "success",
+            "complete": True,
+            "operations": [
+                {
+                    "entity": "competition_catalog",
+                    "status": "success",
+                    "errors": [],
+                    "retryable": [],
+                    "terminal": [],
+                    "counts": {"competitions": 1},
+                }
+            ],
+            "transport": {"attempts": 1, "direct_bytes": 1, "proxy_bytes": 0},
+            "budget": {
+                "requests": 1,
+                "max_requests": 2,
+                "direct_bytes": 1,
+                "max_direct_bytes": 2,
+                "proxy_bytes": 0,
+                "max_proxy_bytes": 0,
+            },
+            "errors": [],
+            "selection": {
+                "entities": ["season"],
+                "explicit_scopes": ["230=2025 Apertura"],
+                "competition_limit": 0,
+                "season_limit": 0,
+                "scope_plan_signature": "fmplan1-"
+                "98c9a8f98ba8eaa14bfc8232b9667682e11e4fce27e120eee5ea9572b66e0385",
+            },
+        }
+        report.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert mod.validate_data(str(report))["selection"]["explicit_scope_count"] == 1
 
     @pytest.mark.unit
     def test_native_report_requires_bounded_exact_selection_evidence(self, tmp_path):

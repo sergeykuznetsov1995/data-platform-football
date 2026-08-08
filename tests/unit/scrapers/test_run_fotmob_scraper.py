@@ -132,13 +132,15 @@ class TestFotmobNativeRunner:
     def test_scope_parser_requires_numeric_id_and_preserves_exact_season(self):
         mod = self._module()
 
-        assert mod._parse_scopes(["47=2025/2026,289=2019", "47=2025/2026"]) == (
+        assert mod._parse_scopes(
+            ["47=2025/2026,230=2025 Apertura", "47=2025/2026"]
+        ) == (
             (47, "2025/2026"),
-            (289, "2019"),
+            (230, "2025 Apertura"),
         )
-        with pytest.raises(ValueError, match="numeric ID"):
+        with pytest.raises(ValueError, match="ASCII decimal"):
             mod._parse_scopes(["ENG-Premier League=2025/2026"])
-        with pytest.raises(ValueError, match="exact source key"):
+        with pytest.raises(ValueError, match="source season key"):
             mod._parse_scopes(["47="])
 
     @pytest.mark.unit

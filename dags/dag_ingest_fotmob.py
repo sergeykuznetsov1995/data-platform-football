@@ -44,6 +44,11 @@ from utils.fotmob_publication import (
     seal_fotmob_publication,
     validate_fotmob_writer_fence,
 )
+from scrapers.fotmob.scope_codec import (
+    format_scope_token,
+    parse_scope_token,
+    validate_scope_tokens,
+)
 from scrapers.fotmob.source_refresh import (
     PLAYER_SOURCE_REFRESH_ARTIFACT,
     PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB,
@@ -104,6 +109,18 @@ SILVER_TRIGGER_RUN_ID_TEMPLATE = (
 )
 
 
+def _validated_exact_scope_evidence(value: Any) -> tuple[str, ...] | None:
+    """Return canonical unique scope evidence, or ``None`` when it is unsafe."""
+
+    if not isinstance(value, list):
+        return None
+    try:
+        tokens = validate_scope_tokens(value)
+    except ValueError:
+        return None
+    return tokens if tuple(value) == tokens else None
+
+
 def _validate_daily_selection(
     *,
     result: Dict[str, Any],
@@ -149,22 +166,14 @@ def _validate_daily_selection(
     ):
         violations.append("daily transport budget mismatch")
 
+    planned_tokens = _validated_exact_scope_evidence(planned_scopes)
     planned_pairs: list[tuple[int, str]] = []
-    if not isinstance(planned_scopes, list) or not planned_scopes:
+    if planned_tokens is None:
+        violations.append("invalid daily planned scope evidence")
+    elif not planned_tokens:
         violations.append("missing daily planned scopes")
     else:
-        for scope in planned_scopes:
-            match = (
-                re.fullmatch(r"([1-9][0-9]*)=(\S+)", scope)
-                if isinstance(scope, str)
-                else None
-            )
-            if match is None:
-                violations.append("invalid daily planned scope evidence")
-                break
-            planned_pairs.append((int(match.group(1)), match.group(2)))
-        if len(planned_pairs) != len(set(planned_pairs)):
-            violations.append("duplicate daily planned scopes")
+        planned_pairs = [parse_scope_token(scope) for scope in planned_tokens]
         if {competition_id for competition_id, _season in planned_pairs} != set(
             expected_ids
         ):
@@ -468,6 +477,7 @@ def prove_replay_missing_player_inputs(
     if not all(isinstance(value, Mapping) for value in (selection, transport, budget)):
         raise AirflowException("FotMob replay gap proof lacks typed runner evidence")
     scopes = selection.get("explicit_scopes")
+    scope_tokens = _validated_exact_scope_evidence(scopes)
     entities = selection.get("entities")
     plan_signature = selection.get("scope_plan_signature")
     typed = selection.get("replay_missing_player_inputs")
@@ -485,14 +495,7 @@ def prove_replay_missing_player_inputs(
         or result.get("complete") is not False
         or not isinstance(result.get("errors"), list)
         or not result.get("errors")
-        or not isinstance(scopes, list)
-        or not scopes
-        or any(
-            not isinstance(scope, str)
-            or re.fullmatch(r"[1-9][0-9]*=\S+", scope) is None
-            for scope in scopes
-        )
-        or len(scopes) != len(set(scopes))
+        or not scope_tokens
         or entities != ISSUE_930_REPLAY_ENTITIES
         or selection.get("competition_limit") != 0
         or selection.get("season_limit") != 0
@@ -522,7 +525,9 @@ def prove_replay_missing_player_inputs(
     contract = _source_refresh_contract()
     affected_scopes = sorted(
         {
-            f"{target['competition_id']}={target['source_season_key']}"
+            format_scope_token(
+                target["competition_id"], target["source_season_key"]
+            )
             for target in contract["targets"]
         }
     )
@@ -540,7 +545,7 @@ def prove_replay_missing_player_inputs(
         or not isinstance(completed, list)
         or len(planned) != len(set(planned))
         or len(completed) != len(set(completed))
-        or set(planned) != set(scopes)
+        or set(planned) != set(scope_tokens)
         or set(completed).intersection(affected_scopes)
         or set(completed).union(affected_scopes) != set(planned)
         or len(completed) + len(affected_scopes) != len(planned)
@@ -688,17 +693,10 @@ def validate_data(
                 violations.append("missing exact native selection evidence")
             else:
                 raw_scopes = selection.get("explicit_scopes")
+                scope_tokens = _validated_exact_scope_evidence(raw_scopes)
                 entities = selection.get("entities")
                 signature = str(selection.get("scope_plan_signature") or "")
-                if (
-                    not isinstance(raw_scopes, list)
-                    or any(
-                        not isinstance(scope, str)
-                        or re.fullmatch(r"[1-9][0-9]*=\S+", scope) is None
-                        for scope in raw_scopes
-                    )
-                    or len(raw_scopes) != len(set(raw_scopes))
-                ):
+                if scope_tokens is None:
                     violations.append("invalid exact scope selection evidence")
                 elif (
                     not isinstance(entities, list)
@@ -712,13 +710,13 @@ def validate_data(
                     violations.append("invalid native scope plan signature")
                 else:
                     scope_bytes = (
-                        ("\n".join(raw_scopes) + "\n").encode("utf-8")
-                        if raw_scopes
+                        ("\n".join(scope_tokens) + "\n").encode("utf-8")
+                        if scope_tokens
                         else b""
                     )
                     selection_summary = {
                         "entities": entities,
-                        "explicit_scope_count": len(raw_scopes),
+                        "explicit_scope_count": len(scope_tokens),
                         "explicit_scope_sha256": hashlib.sha256(
                             scope_bytes
                         ).hexdigest(),
@@ -732,7 +730,7 @@ def validate_data(
                                 result=result,
                                 selection=selection,
                                 entities=entities,
-                                raw_scopes=raw_scopes,
+                                raw_scopes=list(scope_tokens),
                                 budget=budget,
                             )
                         )
@@ -747,7 +745,7 @@ def validate_data(
                             result=result,
                             selection=selection,
                             entities=entities,
-                            raw_scopes=raw_scopes,
+                            raw_scopes=list(scope_tokens),
                             budget=budget,
                         )
                         violations.extend(daily_violations)
@@ -879,7 +877,6 @@ python dags/scripts/run_fotmob_scraper.py \\
     --publication-data-interval-end "{PUBLICATION_BINDING_TEMPLATE["data_interval_end"]}" \\
     --publication-runtime-fingerprint "{PUBLICATION_BINDING_TEMPLATE["runtime_fingerprint"]}" \\
     --mode "{{{{ params.mode }}}}" \\
-    --scope "{{{{ params.scope }}}}" \\
     --daily-contract "{{{{ params.daily_contract }}}}" \\
     --competition-scope-file "{{{{ params.competition_scope_file }}}}" \\
     --competition-scope-sha256 "{{{{ params.competition_scope_sha256 }}}}" \\
@@ -902,6 +899,7 @@ python dags/scripts/run_fotmob_scraper.py \\
     --output "{RESULT_PATH}"
 """,
         env={
+            "FOTMOB_SCOPE_JSON": "{{ params.scope | tojson }}",
             "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
             "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
             "HOME": "/home/airflow",

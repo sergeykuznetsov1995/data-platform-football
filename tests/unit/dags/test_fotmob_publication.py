@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import importlib
 import json
 import sys
@@ -547,6 +548,12 @@ def test_shared_task_and_host_admission_cover_the_same_required_runtime():
     assert publication.FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS == frozenset(
         fotmob_runtime.SHARED_REQUIRED_RUNTIME_PATHS
     )
+    assert "scrapers/fotmob/scope_codec.py" in (
+        publication.FOTMOB_ISOLATED_REQUIRED_RUNTIME_PATHS
+    )
+    assert "scrapers/fotmob/scope_codec.py" in (
+        publication.FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS
+    )
 
 
 def test_shared_runtime_attestation_rejects_drift_manual_and_stale_handoff(
@@ -792,6 +799,31 @@ def test_daily_contract_derives_exact_competitions_from_immutable_scope_bytes():
     assert contract["competition_ids_sha256"] == (
         "664f972d5d86002131293bcc8da8382f6b7378cd43a8bd37a247c321decf689a"
     )
+
+
+def test_daily_contract_codec_accepts_spaced_exact_source_season(tmp_path, monkeypatch):
+    raw = b"230=2025 Apertura\n"
+    scope_file = tmp_path / "scopes.txt"
+    scope_file.write_bytes(raw)
+    scope_sha256 = hashlib.sha256(raw).hexdigest()
+    competition_ids_sha256 = publication._competition_ids_digest((230,))
+    monkeypatch.setattr(publication, "FOTMOB_DAILY_SCOPE_SHA256", scope_sha256)
+    monkeypatch.setattr(publication, "FOTMOB_DAILY_SCOPE_COUNT", 1)
+    monkeypatch.setattr(publication, "FOTMOB_DAILY_COMPETITION_COUNT", 1)
+    monkeypatch.setattr(publication, "FOTMOB_DAILY_COMPETITION_IDS", (230,))
+    monkeypatch.setattr(
+        publication,
+        "FOTMOB_DAILY_COMPETITION_IDS_SHA256",
+        competition_ids_sha256,
+    )
+
+    contract = publication.load_fotmob_daily_competition_contract(
+        scope_file,
+        scope_sha256=scope_sha256,
+        competition_ids_sha256=competition_ids_sha256,
+    )
+
+    assert contract["competition_ids"] == [230]
 
 
 def test_daily_contract_rejects_same_count_identity_substitution(tmp_path):
