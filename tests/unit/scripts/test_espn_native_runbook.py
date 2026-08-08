@@ -89,6 +89,9 @@ def test_runbook_contracts_automatic_all_male_rollout_and_reversal():
         "espn-native-parser-v3",
         "espn-native-runtime-v4",
         "e12b85a",
+        "zero isolated active DagRuns",
+        'DagRun.state.in_(("queued", "running"))',
+        "isolated active DagRuns block deploy",
     ):
         assert required in text
 
@@ -99,6 +102,7 @@ def test_runbook_contracts_automatic_all_male_rollout_and_reversal():
     ordered_markers = (
         "airflow dags pause dag_trigger_espn_daily",
         "airflow dags pause dag_discover_espn_registry",
+        "zero isolated active DagRuns",
         "Deploy reviewed release",
         "airflow dags unpause dag_discover_espn_registry",
         "airflow dags trigger dag_discover_espn_registry",

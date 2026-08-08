@@ -106,6 +106,40 @@ master должен быть scheduled, этот rollout заблокирова�
    espn_airflow dags pause dag_discover_espn_registry
    ```
 
+   После pause и до любого `--force-recreate` fail-closed доказать
+   `zero isolated active DagRuns` для всех семи isolated DAG-ов. Проверка
+   выполняется one-off container через dedicated metadata DB, поэтому она
+   обязательна и для первого deploy; отсутствующая/неинициализированная DB,
+   ошибка запроса или хотя бы один `queued`/`running` DagRun блокируют deploy:
+
+   ```bash
+   espn_compose run --rm --no-deps airflow-scheduler python - <<'PY'
+   from airflow.models import DagRun
+   from airflow.utils.session import create_session
+
+   isolated_dag_ids = {
+       "dag_ingest_espn",
+       "dag_repair_espn",
+       "dag_backfill_espn",
+       "dag_replay_espn",
+       "dag_discover_espn_registry",
+       "dag_monitor_espn",
+       "dag_trigger_espn_daily",
+   }
+   with create_session() as session:
+       active_runs = (
+           session.query(DagRun.dag_id, DagRun.run_id, DagRun.state)
+           .filter(
+               DagRun.dag_id.in_(isolated_dag_ids),
+               DagRun.state.in_(("queued", "running")),
+           )
+           .all()
+       )
+   if active_runs:
+       raise RuntimeError(f"isolated active DagRuns block deploy: {sorted(active_runs)}")
+   PY
+   ```
+
 2. Deploy reviewed release через isolated Compose и принудительно
    пересоздать Airflow services. Обычный restart не меняет
    environment и запрещён. До discovery доказать exact isolated role

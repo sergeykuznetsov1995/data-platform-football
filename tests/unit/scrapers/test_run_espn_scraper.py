@@ -1440,6 +1440,60 @@ def test_daily_window_known_nonterminal_and_sha256_full_shard_are_deterministic(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("edge", ("before", "after"))
+def test_next_daily_plan_clamps_known_source_day_boundary_to_edition(edge):
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    scope = _scope(competition, edition)
+    event_date = (
+        scope.start_date - timedelta(days=1)
+        if edge == "before"
+        else scope.end_date + timedelta(days=1)
+    )
+    request_day = scope.start_date if edge == "before" else scope.end_date
+    binding = runner.ScopeBinding(
+        active=True,
+        initial_capture=False,
+        generation_id="generation-boundary",
+        batch_id="batch-boundary",
+        ingested_at=NOW,
+        generation_snapshot_uri="s3://artifacts/generation-boundary.json",
+        known_nonterminal_events=(
+            runner.KnownNonterminalEvent(event_id=401863559, event_date=event_date),
+        ),
+        prior=runner.PriorBinding(
+            scope_id=scope.scope_id,
+            generation_id="prior-boundary",
+            generation_signature="a" * 64,
+            manifest_sha256="b" * 64,
+            uri="s3://artifacts/prior-boundary.json",
+            artifact_sha256="c" * 64,
+        ),
+        scoreboard_max_range_days=31,
+    )
+    as_of = scope.start_date + timedelta(days=100)
+    while is_full_reconciliation_day(scope.scope_id, as_of):
+        as_of += timedelta(days=1)
+
+    requests = runner._scoreboard_requests(
+        scope,
+        binding,
+        as_of=as_of,
+        mode="daily",
+    )
+
+    assert any(
+        request.query_start == request.query_end == request_day
+        for request in requests
+    )
+    assert all(
+        scope.start_date <= request.query_start <= request.query_end <= scope.end_date
+        for request in requests
+    )
+
+
+@pytest.mark.unit
 def test_unchanged_final_event_reuses_prior_summary_during_execution(tmp_path):
     competition, edition = _competition()
     prior = _prior_generation(competition, edition)

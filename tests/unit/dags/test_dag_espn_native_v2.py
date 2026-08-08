@@ -1685,6 +1685,70 @@ def test_scheduler_runtime_gate_requires_every_v3_v4_head(monkeypatch):
         espn_native_tasks._require_scheduler_runtime_heads(target, heads)
 
 
+def test_daily_admission_reads_all_same_signature_heads_and_rejects_extra(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+
+    now = datetime(2026, 8, 2, 12, tzinfo=timezone.utc)
+    registry = _generated_registry(181)
+    target = _scope_ids(registry)
+    extra_scope = "999999:2026"
+    discovery = {
+        "discovery_state_ref": {"uri": "state", "sha256": "a" * 64},
+        "male_registry_ref": {"uri": "registry", "sha256": "b" * 64},
+        "candidate_ref": {"uri": "candidate", "sha256": "c" * 64},
+        "selection_policy": "explicit-core-gender-MALE-v1",
+        "male_scope_count": 181,
+    }
+
+    class Store:
+        def migrate(self):
+            pass
+
+        def current_time(self):
+            return now
+
+        def read_scope_heads(self, _scope_ids):
+            pytest.fail("daily admission must not filter heads to target scope IDs")
+
+        def read_scope_heads_by_registry_signature(self, signature):
+            assert signature == registry.signature()
+            return {
+                **{scope: _head(scope) for scope in target},
+                extra_scope: _head(extra_scope),
+            }
+
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: Store()),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_discovered_registry",
+        lambda *, now: (registry, discovery),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_run_identity",
+        lambda _context: ("dag_ingest_espn", "run-extra", now),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_daily_parent", lambda _context: {})
+    monkeypatch.setattr(
+        espn_native_tasks, "_daily_parent_envelope", lambda _context: {}
+    )
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_ref_for_uri",
+        lambda _uri: (_ for _ in ()).throw(FileNotFoundError()),
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match=extra_scope):
+        espn_native_tasks.validate_registry_and_admission(mode="daily", params={})
+
+
 
 def test_exact_181_scope_fixture_bounds_reconciliation_summary_map():
     from scrapers.espn.discovery import CatalogSnapshot
@@ -1803,8 +1867,8 @@ def test_daily_admission_v2_persists_exact_discovery_and_coverage(monkeypatch):
         def current_time(self):
             return now
 
-        def read_scope_heads(self, scope_ids):
-            assert tuple(scope_ids) == target
+        def read_scope_heads_by_registry_signature(self, signature):
+            assert signature == registry.signature()
             return {scope: _head(scope) for scope in target}
 
     monkeypatch.setattr(
@@ -2026,14 +2090,14 @@ def test_admission_retry_replays_exact_v2_before_mutable_reads(monkeypatch):
 
 
 @pytest.mark.parametrize("schema_version", [1, 2])
-def test_daily_admission_retry_replays_without_parent_metadata_or_mutable_db(
+def test_daily_admission_retry_revalidates_heads_without_parent_metadata(
     monkeypatch, schema_version
 ):
     from dags.utils import espn_native_tasks
 
     context, _owner = _daily_parent_context()
-    registry = _generated_registry(1)
-    scope_id = _scope_ids(registry)[0]
+    registry = _generated_registry(181)
+    target = _scope_ids(registry)
     root = "s3://artifacts/runs/frozen"
     admission_ref = {"uri": f"{root}/admission.json", "sha256": "a" * 64}
     admission = {
@@ -2048,20 +2112,35 @@ def test_daily_admission_retry_replays_without_parent_metadata_or_mutable_db(
         "parent": context["dag_run"].conf["espn_parent"],
         "registry_ref": {"uri": "registry", "sha256": "b" * 64},
         "registry_signature": registry.signature(),
-        "scope_ids": [scope_id],
+        "scope_ids": list(target),
         "artifact_root": root,
         "raw_store_uri": "s3://raw",
         "replay_sources": {},
     }
     if schema_version == 2:
         admission.update(
-            target_scope_ids=[scope_id],
-            bootstrap_scope_ids=[scope_id],
+            target_scope_ids=list(target),
+            bootstrap_scope_ids=[],
             discovery_state_ref={"uri": "state", "sha256": "c" * 64},
             candidate_ref={"uri": "candidate", "sha256": "d" * 64},
             selection_policy="explicit-core-gender-MALE-v1",
-            male_scope_count=1,
+            male_scope_count=181,
         )
+
+    class Store:
+        def migrate(self):
+            pass
+
+        def read_scope_heads_by_registry_signature(self, signature):
+            assert signature == registry.signature()
+            return {
+                scope: SimpleNamespace(
+                    snapshot_uri=f"file:///{scope}.json",
+                    snapshot_sha256="a" * 64,
+                )
+                for scope in target
+            }
+
     monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
     monkeypatch.setattr(espn_native_tasks, "_run_key", lambda *_args: "frozen")
     monkeypatch.setattr(espn_native_tasks, "_ref_for_uri", lambda _uri: admission_ref)
@@ -2075,7 +2154,7 @@ def test_daily_admission_retry_replays_without_parent_metadata_or_mutable_db(
     monkeypatch.setattr(
         espn_native_tasks.PostgresEspnControlStore,
         "from_env",
-        classmethod(lambda _cls: pytest.fail("retry must not read control store")),
+        classmethod(lambda _cls: Store()),
     )
     monkeypatch.setattr(
         espn_native_tasks,
@@ -2087,11 +2166,102 @@ def test_daily_admission_retry_replays_without_parent_metadata_or_mutable_db(
         "_raw_store_uri",
         lambda: pytest.fail("retry must preserve sealed raw store"),
     )
-
-    assert (
-        espn_native_tasks.validate_registry_and_admission(mode="daily", **context)
-        == admission_ref
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "load_scope_snapshot",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            parser_version=espn_native_tasks.runner.PARSER_VERSION,
+            runtime_version=espn_native_tasks.runner.RUNTIME_VERSION,
+        ),
     )
+
+    if schema_version == 1:
+        with pytest.raises(espn_native_tasks.OperationsError, match="current v2"):
+            espn_native_tasks.validate_registry_and_admission(mode="daily", **context)
+    else:
+        assert (
+            espn_native_tasks.validate_registry_and_admission(mode="daily", **context)
+            == admission_ref
+        )
+
+
+def test_daily_v2_admission_retry_revalidates_all_current_runtime_heads(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+
+    context, _owner = _daily_parent_context()
+    registry = _generated_registry(181)
+    target = _scope_ids(registry)
+    root = "s3://artifacts/runs/frozen"
+    admission_ref = {"uri": f"{root}/admission.json", "sha256": "a" * 64}
+    admission = {
+        "kind": "espn-airflow-admission-v2",
+        "schema_version": 2,
+        "dag_id": "dag_ingest_espn",
+        "run_id": context["run_id"],
+        "attempt": 1,
+        "mode": "daily",
+        "as_of": context["logical_date"].date().isoformat(),
+        "logical_date": context["logical_date"].isoformat(),
+        "parent": context["dag_run"].conf["espn_parent"],
+        "registry_ref": {"uri": "registry", "sha256": "b" * 64},
+        "registry_signature": registry.signature(),
+        "target_scope_ids": list(target),
+        "scope_ids": list(target),
+        "bootstrap_scope_ids": [],
+        "discovery_state_ref": {"uri": "state", "sha256": "c" * 64},
+        "candidate_ref": {"uri": "candidate", "sha256": "d" * 64},
+        "selection_policy": "explicit-core-gender-MALE-v1",
+        "male_scope_count": 181,
+        "artifact_root": root,
+        "raw_store_uri": "s3://raw",
+        "replay_sources": {},
+    }
+
+    class Store:
+        def migrate(self):
+            pass
+
+        def read_scope_heads_by_registry_signature(self, signature):
+            assert signature == registry.signature()
+            return {
+                scope: SimpleNamespace(
+                    snapshot_uri=f"file:///{scope}.json",
+                    snapshot_sha256="a" * 64,
+                )
+                for scope in target
+            }
+
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
+    monkeypatch.setattr(espn_native_tasks, "_run_key", lambda *_args: "frozen")
+    monkeypatch.setattr(espn_native_tasks, "_ref_for_uri", lambda _uri: admission_ref)
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_a, **_k: admission)
+    monkeypatch.setattr(espn_native_tasks, "_load_registry_ref", lambda _a: registry)
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: Store()),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "load_scope_snapshot",
+        lambda _uri, *, expected_scope_id, **_kwargs: SimpleNamespace(
+            parser_version=(
+                "espn-native-parser-v2"
+                if expected_scope_id == target[-1]
+                else espn_native_tasks.runner.PARSER_VERSION
+            ),
+            runtime_version=(
+                "espn-native-runtime-v3"
+                if expected_scope_id == target[-1]
+                else espn_native_tasks.runner.RUNTIME_VERSION
+            ),
+        ),
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="181/181"):
+        espn_native_tasks.validate_registry_and_admission(mode="daily", **context)
 
 
 @pytest.mark.parametrize(

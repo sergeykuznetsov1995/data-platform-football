@@ -933,6 +933,10 @@ class ScopeLeaseStore(Protocol):
         self, leases: Iterable[ScopeLease], *, now: datetime
     ) -> dict[str, ScopeHead]: ...
 
+    def read_scope_heads_by_registry_signature(
+        self, registry_signature: str
+    ) -> dict[str, ScopeHead]: ...
+
     def hydrate_head_completed_at(
         self,
         lease: ScopeLease,
@@ -1063,6 +1067,19 @@ class MemoryScopeLeaseStore:
                 scope_id: self._heads[scope_id]
                 for scope_id in scopes
                 if scope_id in self._heads
+            }
+
+    def read_scope_heads_by_registry_signature(
+        self, registry_signature: str
+    ) -> dict[str, ScopeHead]:
+        """Read every COMPLETE head bound to one frozen registry signature."""
+
+        signature = _signature(registry_signature, "registry_signature")
+        with self._lock:
+            return {
+                scope_id: head
+                for scope_id, head in self._heads.items()
+                if head.registry_signature == signature
             }
 
     def read_scope_heads_owned(
@@ -1794,6 +1811,32 @@ $espn_migration$"""
                         (list(scopes),),
                     )
                     heads = tuple(self._head_from_row(row) for row in cursor.fetchall())
+                    return {head.scope_id: head for head in heads}
+        finally:
+            connection.close()
+
+    def read_scope_heads_by_registry_signature(
+        self, registry_signature: str
+    ) -> dict[str, ScopeHead]:
+        """Read every COMPLETE head bound to one frozen registry signature."""
+
+        signature = _signature(registry_signature, "registry_signature")
+        connection = self._connect()
+        try:
+            with connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        f"SELECT dag_id, scope_id, generation_id, "
+                        f"generation_signature, "
+                        f"manifest_sha256, snapshot_uri, snapshot_sha256, "
+                        f"registry_signature, plan_signature, run_id, published_at, "
+                        f"completed_at FROM {self.HEAD_TABLE} "
+                        f"WHERE registry_signature = %s ORDER BY scope_id",
+                        (signature,),
+                    )
+                    heads = tuple(
+                        self._head_from_row(row) for row in cursor.fetchall()
+                    )
                     return {head.scope_id: head for head in heads}
         finally:
             connection.close()

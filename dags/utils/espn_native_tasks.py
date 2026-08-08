@@ -411,6 +411,16 @@ def _require_scheduler_runtime_heads(
         )
 
 
+def _validated_daily_heads(
+    store: PostgresEspnControlStore,
+    registry: Registry,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    heads = store.read_scope_heads_by_registry_signature(registry.signature())
+    target, scopes, bootstrap = _bounded_daily_scopes(registry, heads)
+    _require_scheduler_runtime_heads(target, heads)
+    return target, scopes, bootstrap
+
+
 def _frozen_discovery_state_ref() -> dict[str, str] | None:
     """Return the optional release-pinned discovery state, fail-closed."""
 
@@ -796,6 +806,27 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
         context=context,
     )
     if existing_ref is not None:
+        if mode != "daily":
+            return existing_ref
+        admission = _read_admission_ref(existing_ref)
+        if admission["kind"] != "espn-airflow-admission-v2":
+            raise OperationsError(
+                "daily admission retry requires current v2 admission schema"
+            )
+        registry = _load_registry_ref(admission)
+        store = PostgresEspnControlStore.from_env()
+        store.migrate()
+        target_scopes, scopes, bootstrap_scopes = _validated_daily_heads(
+            store, registry
+        )
+        if (
+            tuple(admission["target_scope_ids"]) != target_scopes
+            or tuple(admission["scope_ids"]) != scopes
+            or tuple(admission["bootstrap_scope_ids"]) != bootstrap_scopes
+        ):
+            raise OperationsError(
+                "daily admission retry differs from current exact head coverage"
+            )
         return existing_ref
     parent = _daily_parent(context) if mode == "daily" else None
     store = PostgresEspnControlStore.from_env()
@@ -809,9 +840,9 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
     )
     bootstrap_scopes: tuple[str, ...] = ()
     if mode == "daily":
-        heads = store.read_scope_heads(target_scopes)
-        target_scopes, scopes, bootstrap_scopes = _bounded_daily_scopes(registry, heads)
-        _require_scheduler_runtime_heads(target_scopes, heads)
+        target_scopes, scopes, bootstrap_scopes = _validated_daily_heads(
+            store, registry
+        )
     else:
         scopes = _selected_scopes(registry, mode, context.get("params") or {})
     if not scopes:

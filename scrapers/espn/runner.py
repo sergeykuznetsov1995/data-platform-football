@@ -40,7 +40,7 @@ from .parser_contracts import (
     PARSER_VERSION,
     ScheduleRow,
 )
-from .parser_common import decode_object, required_list
+from .parser_common import decode_object, required_list, source_day_contains
 from .parsers import parse_scoreboards, parse_summary
 from .raw_store import EspnRawStore
 from .registry import Registry, RegistryError, validate_registry_document
@@ -1221,12 +1221,18 @@ def _scoreboard_requests(
         if start <= end:
             ranges.add((start, end))
         for event in binding.known_nonterminal_events:
-            if not scope.start_date <= event.event_date <= scope.end_date:
+            if not source_day_contains(
+                event.event_date, scope.start_date, scope.end_date
+            ):
                 raise RunnerConfigurationError(
                     f"known non-terminal event {event.event_id} is outside {scope.scope_id}"
                 )
-            if not any(start <= event.event_date <= end for start, end in ranges):
-                ranges.add((event.event_date, event.event_date))
+            request_day = min(
+                scope.end_date,
+                max(scope.start_date, event.event_date),
+            )
+            if not any(start <= request_day <= end for start, end in ranges):
+                ranges.add((request_day, request_day))
     bounded_ranges = []
     for start, end in sorted(ranges):
         cursor = start

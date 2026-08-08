@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -825,6 +826,73 @@ def test_scope_head_equal_timestamp_retries_and_manual_runs_are_totally_ordered(
     _record_head(store, higher, owner="repair/b/1", attempt=1)
 
     assert store.read_scope_heads(("700:2026",))["700:2026"] == higher
+
+
+def test_postgres_reads_every_head_for_exact_registry_signature():
+    first = _scope_head(
+        generation_id="generation-a",
+        completed_at=datetime(2026, 8, 2, tzinfo=UTC),
+        published_at=datetime(2026, 8, 2, 1, tzinfo=UTC),
+    )
+    extra = replace(
+        first,
+        scope_id="999999:2026",
+        generation_id="generation-extra",
+        snapshot_uri="s3://artifacts/generation-extra.json",
+    )
+    executed = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=None):
+            executed.append((" ".join(sql.split()), params))
+
+        def fetchall(self):
+            return [
+                (
+                    head.dag_id,
+                    head.scope_id,
+                    head.generation_id,
+                    head.generation_signature,
+                    head.manifest_sha256,
+                    head.snapshot_uri,
+                    head.snapshot_sha256,
+                    head.registry_signature,
+                    head.plan_signature,
+                    head.run_id,
+                    head.published_at,
+                    head.completed_at,
+                )
+                for head in (first, extra)
+            ]
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+        def close(self):
+            pass
+
+    heads = PostgresEspnControlStore(
+        lambda: Connection()
+    ).read_scope_heads_by_registry_signature(first.registry_signature)
+
+    assert set(heads) == {"700:2026", "999999:2026"}
+    sql, params = executed[-1]
+    assert "WHERE registry_signature = %s ORDER BY scope_id" in sql
+    assert "scope_id = ANY" not in sql
+    assert params == (first.registry_signature,)
 
 
 def test_postgres_publication_transaction_retains_canonical_equal_time_head():
