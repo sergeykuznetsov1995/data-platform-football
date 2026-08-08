@@ -22,6 +22,7 @@ from typing import Mapping
 from scrapers.fbref.fetcher import FBrefFetcher
 from scrapers.fbref.pipeline import FBrefPipeline, PipelineSettings
 from scrapers.fbref.proxy_lease import FBREF_DAG_IDS
+from scrapers.fbref.readiness import validate_fbref_proxy_meter
 from scrapers.fbref.settings import (
     FBREF_PRODUCTION_SAFETY_BYTE_LIMIT_MIB,
     FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT,
@@ -260,7 +261,27 @@ def _run(args: argparse.Namespace) -> int:
     dagrun_bytes_spent = int(run.get("bytes_used") or 0) + int(
         run.get("bytes_reserved") or 0
     )
-    provider_byte_budget = max(0, settings.byte_limit - dagrun_bytes_spent)
+    current_run_remaining = max(
+        0, settings.byte_limit - dagrun_bytes_spent
+    )
+    meter = validate_fbref_proxy_meter(
+        proxy_control_url,
+        control_token=os.environ.get("FBREF_PROXY_CONTROL_TOKEN"),
+        required_bytes=settings.byte_limit,
+        minimum_configured_exits=(
+            4
+            if requested_profile
+            == (
+                FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT,
+                FBREF_PRODUCTION_SAFETY_BYTE_LIMIT_MIB,
+            )
+            else 1
+        ),
+    )
+    provider_byte_budget = min(
+        current_run_remaining,
+        int(meter["daily_remaining_bytes"]),
+    )
     pipeline.fetcher_factory = (
         lambda _proxy_file, max_browser_requests, max_browser_bytes: FBrefFetcher(
             max_browser_requests=max_browser_requests,

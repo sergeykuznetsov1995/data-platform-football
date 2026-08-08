@@ -7,12 +7,25 @@ import sys
 import time
 from argparse import Namespace
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 from dags.scripts import run_fbref_live_waves as runner
 from dags.scripts.run_fbref_live_waves import _arm_parent_death_containment
 from scrapers.fbref.settings import DEFAULT_DOMAIN_INTERVAL_SECONDS
+
+
+@pytest.fixture(autouse=True)
+def _healthy_proxy_meter(monkeypatch):
+    monkeypatch.setattr(
+        runner,
+        "validate_fbref_proxy_meter",
+        lambda _url, *, required_bytes, **_kwargs: {
+            "daily_remaining_bytes": required_bytes,
+        },
+        raising=False,
+    )
 
 
 def test_parent_death_signal_is_armed_before_parent_identity_is_checked():
@@ -201,6 +214,64 @@ def test_retry_attempt_requests_only_the_remaining_dagrun_budget(
 
     assert fetcher_kwargs["provider_max_bytes"] == expected_provider_max_bytes
     assert '"status": "complete"' in capsys.readouterr().out
+
+
+def test_runner_caps_new_run_to_daily_bytes_left_after_another_run(
+    monkeypatch,
+):
+    mib = 1024 * 1024
+    control = SimpleNamespace(
+        get_run=lambda _run_id: {
+            "run_type": "current",
+            "request_limit": 4096,
+            "byte_limit": 2048 * mib,
+            "metadata": {"dag_id": "dag_ingest_fbref"},
+            "bytes_used": 5 * mib,
+            "bytes_reserved": 3 * mib,
+        }
+    )
+    pipeline = SimpleNamespace(
+        control=control,
+        fetcher_factory=None,
+        run_live_waves=lambda *_args, **_kwargs: SimpleNamespace(
+            as_dict=lambda: {"status": "complete"}
+        ),
+    )
+    fetcher_kwargs = {}
+    meter = MagicMock(
+        return_value={"daily_remaining_bytes": 400 * mib}
+    )
+    monkeypatch.setenv(
+        "FBREF_PROXY_CONTROL_URL",
+        "http://fbref_proxy_filter:8899",
+    )
+    monkeypatch.setenv("FBREF_PROXY_CONTROL_TOKEN", "x" * 32)
+    monkeypatch.setattr(runner, "validate_fbref_proxy_meter", meter)
+    monkeypatch.setattr(runner.FBrefPipeline, "from_env", lambda: pipeline)
+    monkeypatch.setattr(
+        runner,
+        "FBrefFetcher",
+        lambda **kwargs: fetcher_kwargs.update(kwargs) or object(),
+    )
+    args = Namespace(
+        control_run_id="control-run",
+        worker_id="another-run-spent",
+        page_kinds="match",
+        run_type="current",
+        request_limit=4096,
+        byte_limit_mb=2048,
+        shard_size=25,
+        reservation_mb=3,
+        domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+        max_batches=80,
+    )
+
+    assert runner._run(args) == 0
+    pipeline.fetcher_factory(None, 4096, 2048 * mib)
+
+    assert fetcher_kwargs["provider_max_bytes"] == 400 * mib
+    assert meter.call_args.kwargs["required_bytes"] == 2048 * mib
+    assert meter.call_args.kwargs["minimum_configured_exits"] == 4
 
 
 def test_runner_rejects_stored_profile_mismatch_before_fetcher_construction(

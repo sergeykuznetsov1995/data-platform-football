@@ -322,6 +322,40 @@ def test_initialize_bootstrap_records_control_execution_evidence(monkeypatch):
 
 
 @pytest.mark.unit
+def test_initialize_current_requires_profile_from_execution_decision(monkeypatch):
+    pipeline = MagicMock()
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "validate_fbref_current_execution_mode",
+        MagicMock(
+            return_value={
+                "bootstrap_only": True,
+                "dag_run_type": "manual",
+                "execution_mode": "bootstrap_only",
+                "publication_eligible": False,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+
+    with pytest.raises(KeyError, match="profile"):
+        fbref_pipeline_tasks.initialize_fbref_run(
+            airflow_run_id="manual__bootstrap",
+            dag_id="dag_ingest_fbref",
+            run_type="current",
+            request_limit=4096,
+            byte_limit_mb=2048,
+            shard_size=25,
+            bootstrap_only=True,
+            dag_run_type="manual",
+        )
+
+    pipeline.initialize_run.assert_not_called()
+
+
+@pytest.mark.unit
 def test_bootstrap_validation_proves_succeeded_non_publishing_control_run(
     monkeypatch,
 ):
@@ -1715,6 +1749,104 @@ def test_replay_parse_propagates_source_run_preflight_failure(monkeypatch):
         )
 
     assert pipeline.parse_wave.call_args.kwargs["source_run_id"] == source_run_id
+
+
+def _replay_wave_result(cohort_size: int, *, claimed: int | None = None):
+    claimed_count = cohort_size if claimed is None else claimed
+    return SimpleNamespace(
+        as_dict=lambda: {
+            "cohort_size": cohort_size,
+            "claimed": claimed_count,
+            "parsed": claimed_count,
+            "typed_promoted": 0,
+            "seeded": 0,
+            "skipped_ineligible": 0,
+            "contract_quarantined": 0,
+        }
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("page_count", [201, 2001])
+def test_replay_drain_processes_every_page_beyond_old_200_page_ceiling(
+    monkeypatch, page_count
+):
+    shard_size = 25
+    full_waves, partial = divmod(page_count, shard_size)
+    results = [_replay_wave_result(shard_size) for _ in range(full_waves)]
+    if partial:
+        results.append(_replay_wave_result(partial))
+    results.append(_replay_wave_result(0))
+    pipeline = MagicMock()
+    pipeline.parse_wave.side_effect = results
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+
+    result = fbref_pipeline_tasks.drain_fbref_replay(
+        airflow_run_id="manual__large-replay",
+        dag_id="dag_replay_fbref",
+        page_kinds=["match"],
+        run_type="replay",
+        source_control_run_id="00000000-0000-4000-8000-000000000099",
+        request_limit=0,
+        byte_limit_mb=0,
+        shard_size=shard_size,
+        max_waves=len(results),
+    )
+
+    assert result["status"] == "drained"
+    assert result["claimed"] == page_count
+    assert result["waves"] == full_waves + int(bool(partial))
+    assert pipeline.parse_wave.call_count == len(results)
+
+
+@pytest.mark.unit
+def test_replay_drain_fails_fast_when_a_wave_cannot_claim_any_page(monkeypatch):
+    pipeline = MagicMock()
+    pipeline.parse_wave.return_value = _replay_wave_result(25, claimed=0)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+
+    with pytest.raises(RuntimeError, match="made no progress"):
+        fbref_pipeline_tasks.drain_fbref_replay(
+            airflow_run_id="manual__stalled-replay",
+            dag_id="dag_replay_fbref",
+            page_kinds=["match"],
+            run_type="replay",
+            source_control_run_id="00000000-0000-4000-8000-000000000099",
+            request_limit=0,
+            byte_limit_mb=0,
+            shard_size=25,
+            max_waves=10,
+        )
+
+    assert pipeline.parse_wave.call_count == 1
+
+
+@pytest.mark.unit
+def test_replay_drain_fails_loudly_at_its_finite_wave_bound(monkeypatch):
+    pipeline = MagicMock()
+    pipeline.parse_wave.return_value = _replay_wave_result(25)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+
+    with pytest.raises(RuntimeError, match="within 3 waves"):
+        fbref_pipeline_tasks.drain_fbref_replay(
+            airflow_run_id="manual__bounded-replay",
+            dag_id="dag_replay_fbref",
+            page_kinds=["match"],
+            run_type="replay",
+            source_control_run_id="00000000-0000-4000-8000-000000000099",
+            request_limit=0,
+            byte_limit_mb=0,
+            shard_size=25,
+            max_waves=3,
+        )
+
+    assert pipeline.parse_wave.call_count == 3
 
 
 @pytest.mark.unit

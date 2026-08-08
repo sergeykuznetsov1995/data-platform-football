@@ -1354,13 +1354,14 @@ def initialize_fbref_run(
             ),
             "execution_mode": normalized_run_type,
             "publication_eligible": True,
+            "profile": normalized_run_type,
         }
     control_execution = {
         "bootstrap_only": execution["bootstrap_only"],
         "dag_run_type": execution.get("dag_run_type"),
         "execution_mode": execution["execution_mode"],
         "publication_eligible": execution["publication_eligible"],
-        "runtime_profile": execution.get("profile", normalized_run_type),
+        "runtime_profile": execution["profile"],
     }
     run_id = _pipeline().initialize_run(
         airflow_run_id=airflow_run_id,
@@ -2029,6 +2030,123 @@ def parse_fbref_wave(
     return result
 
 
+def drain_fbref_replay(
+    *,
+    airflow_run_id: str,
+    dag_id: str,
+    page_kinds: Sequence[str],
+    run_type: str,
+    source_control_run_id: Optional[str] = None,
+    request_limit=0,
+    byte_limit_mb=0,
+    shard_size=DEFAULT_SHARD_SIZE,
+    reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
+    max_waves: int,
+) -> dict:
+    """Drain every eligible replay observation with a finite progress guard."""
+
+    settings = _settings(
+        run_type=run_type,
+        request_limit=request_limit,
+        byte_limit_mb=byte_limit_mb,
+        shard_size=shard_size,
+        reservation_mb=reservation_mb,
+    )
+    if settings.run_type != "replay":
+        raise ValueError("Replay drain requires run_type=replay")
+    normalized_source_run_id = (
+        None
+        if source_control_run_id is None
+        or not str(source_control_run_id).strip()
+        else str(source_control_run_id).strip()
+    )
+    if normalized_source_run_id is None:
+        raise ValueError("Replay requires source_control_run_id")
+    if type(max_waves) is int:
+        wave_limit = max_waves
+    elif isinstance(max_waves, str) and max_waves.strip().isdecimal():
+        wave_limit = int(max_waves.strip())
+    else:
+        raise ValueError("max_waves must be an integer")
+    if not 1 <= wave_limit <= FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT + 1:
+        raise ValueError(
+            "max_waves must be between 1 and "
+            f"{FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT + 1}"
+        )
+
+    pipeline = _pipeline()
+    processing_run_id = _control_run_id(
+        airflow_run_id=airflow_run_id, dag_id=dag_id
+    )
+    totals = {
+        "claimed": 0,
+        "parsed": 0,
+        "typed_promoted": 0,
+        "seeded": 0,
+        "skipped_ineligible": 0,
+        "contract_quarantined": 0,
+    }
+    completed_waves = 0
+    for _wave_number in range(1, wave_limit + 1):
+        wave = pipeline.parse_wave(
+            processing_run_id,
+            page_kinds=list(page_kinds),
+            settings=settings,
+            source_run_id=normalized_source_run_id,
+        ).as_dict()
+        try:
+            cohort_size = int(wave["cohort_size"])
+            claimed = int(wave["claimed"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "FBref replay drain returned invalid progress evidence"
+            ) from exc
+        if (
+            cohort_size < 0
+            or cohort_size > settings.shard_size
+            or claimed < 0
+            or claimed > cohort_size
+        ):
+            raise RuntimeError(
+                "FBref replay drain returned invalid progress evidence"
+            )
+        if cohort_size == 0:
+            result = {
+                "status": "drained",
+                "waves": completed_waves,
+                "max_waves": wave_limit,
+                **totals,
+            }
+            logger.info(
+                "FBref replay drain: %s",
+                json.dumps(result, sort_keys=True),
+            )
+            return result
+        if claimed == 0:
+            raise RuntimeError(
+                "FBref replay drain made no progress with "
+                f"{cohort_size} candidates still visible"
+            )
+        completed_waves += 1
+        for field in totals:
+            try:
+                value = int(wave.get(field) or 0)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "FBref replay drain returned invalid progress evidence"
+                ) from exc
+            if value < 0:
+                raise RuntimeError(
+                    "FBref replay drain returned invalid progress evidence"
+                )
+            totals[field] += value
+
+    raise RuntimeError(
+        "FBref replay did not drain within "
+        f"{wave_limit} waves; refusing to continue with raw pages unparsed"
+    )
+
+
 def validate_fbref_run(
     *,
     airflow_run_id: str,
@@ -2246,6 +2364,7 @@ __all__ = [
     "finalize_fbref_publication_lock",
     "fbref_dag_failure_callback",
     "initialize_fbref_run",
+    "drain_fbref_replay",
     "parse_fbref_wave",
     "plan_fbref_backfill",
     "release_fbref_publication_lock",
