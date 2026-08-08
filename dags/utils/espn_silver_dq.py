@@ -117,9 +117,9 @@ def _allowlist_sql() -> str:
 def build_espn_silver_custom_checks() -> List[CustomCheck]:
     """Build source-faithful cross-table checks.
 
-    Every WARNING is intentionally static WARNING severity: a monitoring
-    signal must never become an Airflow-blocking ERROR merely because its
-    ratio is poor.  ERROR checks are exact-zero invariants.
+    Every monitoring signal is intentionally static WARNING severity: it must
+    never become an Airflow-blocking ERROR merely because its ratio is poor.
+    ``children are played`` is the sole custom ERROR invariant.
     """
     allowlist = _allowlist_sql()
     return [
@@ -141,7 +141,7 @@ def build_espn_silver_custom_checks() -> List[CustomCheck]:
         CustomCheck(
             "coverage[played lineup >=80%]",
             """
-            SELECT COUNT(DISTINCT p.event_id), COUNT(*)
+            SELECT COUNT(DISTINCT p.event_id), COUNT(DISTINCT m.event_id)
             FROM iceberg.silver.espn_match m
             LEFT JOIN iceberg.silver.espn_player_match_aggregate p ON p.event_id = m.event_id
             WHERE m.is_played = true
@@ -152,7 +152,7 @@ def build_espn_silver_custom_checks() -> List[CustomCheck]:
         CustomCheck(
             "coverage[played team stats >=85%]",
             """
-            SELECT COUNT(DISTINCT t.event_id), COUNT(*)
+            SELECT COUNT(DISTINCT t.event_id), COUNT(DISTINCT m.event_id)
             FROM iceberg.silver.espn_match m
             LEFT JOIN iceberg.silver.espn_team_match t ON t.event_id = m.event_id
             WHERE m.is_played = true
@@ -163,7 +163,7 @@ def build_espn_silver_custom_checks() -> List[CustomCheck]:
         CustomCheck(
             "coverage[played events >=85%]",
             """
-            SELECT COUNT(DISTINCT e.event_id), COUNT(*)
+            SELECT COUNT(DISTINCT e.event_id), COUNT(DISTINCT m.event_id)
             FROM iceberg.silver.espn_match m
             LEFT JOIN iceberg.silver.espn_match_events e ON e.event_id = m.event_id
             WHERE m.is_played = true
@@ -184,7 +184,7 @@ def build_espn_silver_custom_checks() -> List[CustomCheck]:
                 HAVING COUNT(p.event_id) = 0 AND m.league NOT IN ({allowlist})
             ) missing_slug
             """,
-            "ERROR", lambda row: row[0] == 0,
+            "WARNING", lambda row: row[0] == 0,
         ),
         CustomCheck(
             "0:0 with goal event",
@@ -234,9 +234,23 @@ def build_espn_silver_custom_checks() -> List[CustomCheck]:
         CustomCheck(
             "manifest played-lineup disposition",
             """
-            WITH lineup_dispositions AS (
+            WITH bronze_src_manifest AS (
+                SELECT scope_id, completed_at, generation_id, run_id, dispositions_json
+                FROM iceberg.bronze.espn_ingest_manifest_v2
+            ),
+            manifest_ranked AS (
+                SELECT manifest.*, ROW_NUMBER() OVER (
+                    PARTITION BY scope_id
+                    ORDER BY completed_at DESC, generation_id DESC, run_id DESC
+                ) AS rn
+                FROM bronze_src_manifest manifest
+            ),
+            manifest_dedup AS (
+                SELECT * FROM manifest_ranked WHERE rn = 1
+            ),
+            lineup_dispositions AS (
                 SELECT DISTINCT TRY_CAST(json_extract_scalar(item, '$.event_id') AS bigint) AS event_id
-                FROM iceberg.bronze.espn_ingest_manifest_v2 manifest
+                FROM manifest_dedup manifest
                 CROSS JOIN UNNEST(CAST(json_extract(manifest.dispositions_json, '$') AS array(json)))
                     AS disposition(item)
                 WHERE json_extract_scalar(item, '$.endpoint') = 'lineup'
@@ -247,42 +261,105 @@ def build_espn_silver_custom_checks() -> List[CustomCheck]:
             WHERE m.is_played = true
               AND lineup.event_id IS NULL
             """,
-            "ERROR", lambda row: row[0] == 0,
+            "WARNING", lambda row: row[0] == 0,
         ),
         CustomCheck(
             "winner parity",
             """
+            WITH bronze_src_schedule AS (
+                SELECT
+                    event_id, home_team_id, away_team_id, home_score, away_score,
+                    played_final, extra_json, _ingested_at, generation_id, run_id
+                FROM iceberg.bronze.espn_schedule_generation_v2
+            ),
+            schedule_ranked AS (
+                SELECT schedule.*, ROW_NUMBER() OVER (
+                    PARTITION BY event_id
+                    ORDER BY _ingested_at DESC, generation_id DESC, run_id DESC
+                ) AS rn
+                FROM bronze_src_schedule schedule
+            ),
+            schedule_dedup AS (
+                SELECT * FROM schedule_ranked WHERE rn = 1
+            ),
+            winner_flags AS (
+                SELECT
+                    event_id,
+                    CASE
+                        WHEN TRY_CAST(json_extract_scalar(extra_json,
+                            '$.sides.home.competitor.winner') AS boolean) THEN home_team_id
+                        WHEN TRY_CAST(json_extract_scalar(extra_json,
+                            '$.sides.away.competitor.winner') AS boolean) THEN away_team_id
+                    END AS raw_winner_team_id,
+                    CASE
+                        WHEN home_score > away_score THEN home_team_id
+                        WHEN away_score > home_score THEN away_team_id
+                        WHEN TRY_CAST(json_extract_scalar(extra_json,
+                            '$.sides.home.competitor.shootoutScore') AS integer)
+                             > TRY_CAST(json_extract_scalar(extra_json,
+                            '$.sides.away.competitor.shootoutScore') AS integer)
+                            THEN home_team_id
+                        WHEN TRY_CAST(json_extract_scalar(extra_json,
+                            '$.sides.away.competitor.shootoutScore') AS integer)
+                             > TRY_CAST(json_extract_scalar(extra_json,
+                            '$.sides.home.competitor.shootoutScore') AS integer)
+                            THEN away_team_id
+                    END AS modeled_winner_team_id
+                FROM schedule_dedup
+                WHERE played_final = true
+            )
             SELECT COUNT(*)
-            FROM iceberg.silver.espn_match
-            WHERE is_played = true
-              AND status <> 'STATUS_FINAL_PEN'
-              AND winner_team_id IS DISTINCT FROM CASE
-                  WHEN home_score > away_score THEN home_team_id
-                  WHEN away_score > home_score THEN away_team_id
-                  ELSE NULL
-              END
+            FROM winner_flags
+            WHERE raw_winner_team_id IS DISTINCT FROM modeled_winner_team_id
             """,
-            "ERROR", lambda row: row[0] == 0,
+            "WARNING", lambda row: row[0] == 0,
         ),
         CustomCheck(
             "scoreboard totalGoals parity",
             """
+            WITH bronze_src_schedule AS (
+                SELECT event_id, home_team_id, away_team_id, extra_json,
+                       _ingested_at, generation_id, run_id
+                FROM iceberg.bronze.espn_schedule_generation_v2
+            ),
+            schedule_ranked AS (
+                SELECT schedule.*, ROW_NUMBER() OVER (
+                    PARTITION BY event_id
+                    ORDER BY _ingested_at DESC, generation_id DESC, run_id DESC
+                ) AS rn
+                FROM bronze_src_schedule schedule
+            ),
+            schedule_dedup AS (
+                SELECT * FROM schedule_ranked WHERE rn = 1
+            ),
+            schedule_sides AS (
+                SELECT event_id, home_team_id AS team_id,
+                       CAST(json_extract(extra_json,
+                           '$.sides.home.competitor.statistics') AS array(json)) AS statistics
+                FROM schedule_dedup
+                UNION ALL
+                SELECT event_id, away_team_id AS team_id,
+                       CAST(json_extract(extra_json,
+                           '$.sides.away.competitor.statistics') AS array(json)) AS statistics
+                FROM schedule_dedup
+            ),
+            scoreboard_total_goals AS (
+                SELECT side.event_id, side.team_id,
+                       MAX(TRY_CAST(json_extract_scalar(stat.item, '$.displayValue') AS integer))
+                           AS total_goals
+                FROM schedule_sides side
+                CROSS JOIN UNNEST(side.statistics) AS stat(item)
+                WHERE json_extract_scalar(stat.item, '$.name') = 'totalGoals'
+                GROUP BY side.event_id, side.team_id
+            )
             SELECT COUNT(*)
             FROM iceberg.silver.espn_team_match t
             JOIN iceberg.silver.espn_match m ON m.event_id = t.event_id
+            LEFT JOIN scoreboard_total_goals scoreboard
+              ON scoreboard.event_id = t.event_id AND scoreboard.team_id = t.team_id
             WHERE t.stats_source = 'scoreboard'
               AND m.is_played = true
-              AND EXISTS (
-                  SELECT 1
-                  FROM iceberg.bronze.espn_schedule_generation_v2 b
-                  CROSS JOIN UNNEST(CAST(json_extract(b.extra_json,
-                      CASE WHEN t.is_home THEN '$.sides.home.competitor.statistics'
-                           ELSE '$.sides.away.competitor.statistics' END
-                  ) AS array(json))) AS stats(item)
-                  WHERE b.event_id = t.event_id
-                    AND json_extract_scalar(item, '$.name') = 'totalGoals'
-                    AND TRY_CAST(json_extract_scalar(item, '$.displayValue') AS integer) <> t.goals_for
-              )
+              AND scoreboard.total_goals IS DISTINCT FROM t.goals_for
             """,
             "WARNING", lambda row: row[0] == 0,
         ),

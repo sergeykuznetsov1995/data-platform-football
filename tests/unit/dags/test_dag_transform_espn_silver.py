@@ -49,15 +49,43 @@ def test_trigger_only_dag_materializes_all_six_before_validation():
     assert tasks["validate_silver_quality"].python_callable is module._validate_silver_quality
 
 
-def test_no_ingest_or_publication_coupling_and_quality_merges_custom_results(monkeypatch):
+def test_quality_merges_warning_custom_results_and_sends_one_summary(monkeypatch):
     module = _reload()
 
     from utils.data_quality import CheckResult, RunReport
 
     report = RunReport(results=[])
+    sent = []
     monkeypatch.setattr("utils.data_quality.run_checks", lambda checks, raise_on_error: report)
     monkeypatch.setattr(
         "utils.espn_silver_dq.run_espn_silver_custom_checks",
         lambda: [CheckResult("soft", "custom", "WARNING", False)],
     )
-    assert module._validate_silver_quality()["warnings"] == ["soft"]
+    monkeypatch.setattr("utils.alerts.telegram_dq_summary", lambda value, header: sent.append((value, header)))
+
+    result = module._validate_silver_quality()
+
+    assert result["warnings"] == ["soft"]
+    assert report.results[-1].name == "soft"
+    assert sent == [(report, "ESPN Silver DQ")]
+
+
+def test_quality_raises_only_for_merged_custom_errors_and_still_sends_summary(monkeypatch):
+    module = _reload()
+
+    from airflow.exceptions import AirflowException
+    from utils.data_quality import CheckResult, RunReport
+
+    report = RunReport(results=[])
+    sent = []
+    monkeypatch.setattr("utils.data_quality.run_checks", lambda checks, raise_on_error: report)
+    monkeypatch.setattr(
+        "utils.espn_silver_dq.run_espn_silver_custom_checks",
+        lambda: [CheckResult("hard", "custom", "ERROR", False, details="broken")],
+    )
+    monkeypatch.setattr("utils.alerts.telegram_dq_summary", lambda value, header: sent.append((value, header)))
+
+    with pytest.raises(AirflowException, match="hard: broken"):
+        module._validate_silver_quality()
+
+    assert sent == [(report, "ESPN Silver DQ")]
