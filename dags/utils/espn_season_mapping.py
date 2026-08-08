@@ -24,6 +24,7 @@ VALUES_MARKER = "__ESPN_DOWNSTREAM_SCOPE_VALUES__"
 FILTER_MARKER = "__ESPN_DOWNSTREAM_SCOPE_FILTER__"
 _SCOPE_RE = re.compile(r"([1-9][0-9]*):([1-9][0-9]{3})")
 _SEASON_RE = re.compile(r"[0-9]{4}")
+_ESPN_MARKER_RE = re.compile(r"__ESPN_[A-Z0-9_]+__")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CONTAINER_CONFIG_ROOT = Path("/opt/airflow/configs")
@@ -514,24 +515,21 @@ def downstream_scope_values_sql(catalog: SeasonMappingCatalog | None = None) -> 
 
 
 def downstream_scope_filter_sql() -> str:
-    """One exact native-or-legacy join plus the reviewed edition date fence."""
+    """Exact native promotion join plus the source-day edition fence.
 
-    return """(
-        (
-            es_source.scope_id = espn_scope.scope_id
-            AND es_source.competition_id = espn_scope.espn_id
-            AND es_source.source_season_year = espn_scope.source_season_year
-        )
-        OR (
-            es_source.scope_id IS NULL
-            AND es_source.competition_id IS NULL
-            AND es_source.source_season_year IS NULL
-            AND es_source.league = espn_scope.platform_league
-            AND CAST(es_source.season AS varchar) = espn_scope.platform_season_slug
-        )
-    )
+    Legacy rows deliberately do not pass this helper.  They continue through
+    the pre-cutover canonical tables until compact6 freezes an exact Iceberg
+    archive and swaps all consumers atomically.  Treating a NULL native
+    identity as one of the six current mappings here would silently discard
+    historical seasons or admit post-freeze fallback rows.
+    """
+
+    return """es_source.scope_id = espn_scope.scope_id
+    AND es_source.competition_id = espn_scope.espn_id
+    AND es_source.source_season_year = espn_scope.source_season_year
     AND TRY_CAST(SUBSTR(CAST(es_source.game AS varchar), 1, 10) AS date)
-        BETWEEN espn_scope.effective_start_date AND espn_scope.effective_end_date"""
+        BETWEEN espn_scope.effective_start_date - INTERVAL '1' DAY
+            AND espn_scope.effective_end_date + INTERVAL '1' DAY"""
 
 
 def render_espn_downstream_sql(
@@ -541,6 +539,14 @@ def render_espn_downstream_sql(
 
     if not isinstance(sql, str):
         raise TypeError("SQL must be a string")
+    unknown_markers = set(_ESPN_MARKER_RE.findall(sql)) - {
+        VALUES_MARKER,
+        FILTER_MARKER,
+    }
+    if unknown_markers:
+        raise SeasonMappingError(
+            f"unknown ESPN downstream SQL markers: {sorted(unknown_markers)}"
+        )
     has_values = VALUES_MARKER in sql
     has_filter = FILTER_MARKER in sql
     if has_values != has_filter:
@@ -553,6 +559,11 @@ def render_espn_downstream_sql(
     rendered = rendered.replace(FILTER_MARKER, downstream_scope_filter_sql())
     if VALUES_MARKER in rendered or FILTER_MARKER in rendered:
         raise SeasonMappingError("ESPN downstream SQL markers leaked after render")
+    leaked_markers = _ESPN_MARKER_RE.findall(rendered)
+    if leaked_markers:
+        raise SeasonMappingError(
+            f"ESPN downstream SQL markers leaked after render: {sorted(set(leaked_markers))}"
+        )
     return rendered
 
 

@@ -737,7 +737,7 @@ def _collapse_call(sql: str, fn_name: str) -> str:
 
 
 _ICEBERG_TO_LOCAL = {
-    "iceberg.bronze.espn_schedule_current":  "bronze_espn_schedule",
+    "iceberg.bronze.espn_schedule":          "bronze_espn_schedule",
     "iceberg.silver.espn_lineup":            "silver_espn_lineup",
     "iceberg.silver.fbref_match_lineups":    "silver_fbref_match_lineups",
     "iceberg.silver.xref_match":             "silver_xref_match",
@@ -765,8 +765,8 @@ def _translate(sql: str) -> str:
 
 
 _LEAGUE = "ENG-Premier League"
-_SEASON = "2627"
-_GAME = "2026-08-20 Liverpool-Arsenal"   # inside the reviewed 2627 window
+_SEASON = "2526"
+_GAME = "2026-01-06 Liverpool-Arsenal"   # live format: 'YYYY-MM-DD Home-Away'
 _FB_HEX = "1a2b3c4d"                     # FBref hex match_id (fme spine)
 
 
@@ -786,9 +786,6 @@ def bridge_conn(duck_conn):
     duck_conn.execute(
         """
         CREATE TABLE bronze_espn_schedule (
-            scope_id    VARCHAR,
-            competition_id BIGINT,
-            source_season_year BIGINT,
             league       VARCHAR,
             season       VARCHAR,
             game         VARCHAR,
@@ -879,7 +876,7 @@ def _seed_espn_corpus(con, *, xref_confidence: str = "date_team_match",
 
     #867: the bridge reads silver.xref_match (source='espn', source_id=game_id).
     ``xref_confidence='orphan'`` simulates a game outside the FBref spine;
-    ``xref_season`` exercises the exact mapped-season bridge boundary.
+    ``xref_season`` proves the JOIN carries NO season predicate (#809).
     """
     con.execute(
         """
@@ -906,17 +903,12 @@ def _seed_espn_corpus(con, *, xref_confidence: str = "date_team_match",
 
 _SCHEDULE_ROW = (
     "INSERT INTO bronze_espn_schedule VALUES "
-    "(NULL, NULL, NULL, ?, ?, ?, TIMESTAMP '2026-08-20 20:00:00', "
-    "?, 'Arsenal', 401, '700', ?)"
+    "(?, ?, ?, TIMESTAMP '2026-01-06 20:00:00', ?, 'Arsenal', 401, '700', ?)"
 )
 
 
 def _run_lineup_gold(con) -> List[Dict[str, Any]]:
-    from utils.espn_season_mapping import render_espn_downstream_sql
-
-    sql = _translate(
-        render_espn_downstream_sql(SQL_PATH.read_text(encoding="utf-8"))
-    )
+    sql = _translate(SQL_PATH.read_text(encoding="utf-8"))
     cur = con.execute(sql)
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
@@ -947,24 +939,28 @@ class TestEspnBridgeDedup:
         )
         assert out[0]["match_id"] == _FB_HEX, out
 
-    def test_same_source_id_in_another_season_cannot_override_bridge(self, bridge_conn):
-        """The exact mapped season selects one canonical without fan-out."""
+    def test_duplicate_xref_match_rows_do_not_fan_out(self, bridge_conn):
+        """A second xref_match row for the same (source_id, league) must not
+        duplicate the lineup — the bridge aggregates to one row per game."""
         _seed_espn_corpus(bridge_conn)
         bridge_conn.execute(
             "INSERT INTO silver_xref_match VALUES "
             "('espn', '401', ?, ?, '2425', 'date_team_match')",
-            ["f" * 32, _LEAGUE],
+            [_FB_HEX, _LEAGUE],
         )
         bridge_conn.execute(
             _SCHEDULE_ROW,
             [_LEAGUE, _SEASON, _GAME, "Liverpool", "2026-02-01 06:00:00"],
         )
         out = _run_lineup_gold(bridge_conn)
-        assert len(out) == 1, f"cross-season xref_match fanned out: {out}"
+        assert len(out) == 1, f"xref_match fan-out duplicated the row: {out}"
         assert out[0]["match_id"] == _FB_HEX, out
 
-    def test_wrong_xref_match_season_is_not_bridged(self, bridge_conn):
-        """A canonical from another platform season cannot cross the boundary."""
+    def test_bridge_ignores_xref_match_season(self, bridge_conn):
+        """#809 regression guard: bronze.espn_schedule reuses one game_id across
+        season labels, so xref_match holds NO row for some of them. The JOIN
+        must key on (source_id, league) only — a season predicate would unbridge
+        seasons 0102/0203/0910 live."""
         _seed_espn_corpus(bridge_conn, xref_season="0001")
         bridge_conn.execute(
             _SCHEDULE_ROW,
@@ -972,7 +968,7 @@ class TestEspnBridgeDedup:
         )
         out = _run_lineup_gold(bridge_conn)
         assert len(out) == 1, out
-        assert out[0]["match_id"] == _espn_match_id(), out
+        assert out[0]["match_id"] == _FB_HEX, out
 
     def test_clean_bridge_resolves_hex(self, bridge_conn):
         """Happy path: one schedule row, resolved xref_match → one lineup row

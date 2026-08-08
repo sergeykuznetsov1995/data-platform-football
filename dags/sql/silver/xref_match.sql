@@ -60,13 +60,7 @@
 -- (league, season) predicates — otherwise multi-season fan-out 1.5-4×.
 -- =============================================================================
 
-WITH espn_downstream_scope (
-    scope_id, espn_id, source_season_year, platform_league,
-    platform_season_slug, convention, effective_start_date, effective_end_date
-) AS (VALUES
-__ESPN_DOWNSTREAM_SCOPE_VALUES__
-),
-understat_manifest_latest AS (
+WITH understat_manifest_latest AS (
     SELECT league, season, batch_id, status
     FROM (
         SELECT
@@ -370,27 +364,25 @@ es_resolved AS (
     -- in the `game` column (format: 'YYYY-MM-DD <Home>-<Away>').
     -- Extract the leading 10-char date prefix and TRY_CAST to date.
     SELECT
-        CAST(es_source.game_id AS varchar)                             AS source_id,
-        TRY_CAST(SUBSTR(es_source.game, 1, 10) AS date)                AS match_date,
-        espn_scope.platform_league                                     AS league,
-        espn_scope.platform_season_slug                                AS season,
+        CAST(s.game_id AS varchar)                                     AS source_id,
+        TRY_CAST(SUBSTR(s.game, 1, 10) AS date)                        AS match_date,
+        s.league,
+        CAST(s.season AS varchar)                                      AS season,
         xt_h.canonical_id                                              AS home_canonical_id,
         xt_a.canonical_id                                              AS away_canonical_id,
-        CONCAT(es_source.home_team, ' vs ', es_source.away_team)       AS display_name
-    FROM iceberg.bronze.espn_schedule_current es_source
-    JOIN espn_downstream_scope espn_scope ON
-__ESPN_DOWNSTREAM_SCOPE_FILTER__
+        CONCAT(s.home_team, ' vs ', s.away_team)                       AS display_name
+    FROM iceberg.bronze.espn_schedule s
     LEFT JOIN iceberg.silver.xref_team xt_h
            ON xt_h.source    = 'espn'
-          AND xt_h.source_id = es_source.home_team
-          AND xt_h.league    = espn_scope.platform_league
-          AND xt_h.season    = espn_scope.platform_season_slug
+          AND xt_h.source_id = s.home_team
+          AND xt_h.league    = s.league
+          AND xt_h.season    = CAST(s.season AS varchar)
     LEFT JOIN iceberg.silver.xref_team xt_a
            ON xt_a.source    = 'espn'
-          AND xt_a.source_id = es_source.away_team
-          AND xt_a.league    = espn_scope.platform_league
-          AND xt_a.season    = espn_scope.platform_season_slug
-    WHERE es_source.game_id IS NOT NULL
+          AND xt_a.source_id = s.away_team
+          AND xt_a.league    = s.league
+          AND xt_a.season    = CAST(s.season AS varchar)
+    WHERE s.game_id IS NOT NULL
 ),
 
 -- =============================================================================

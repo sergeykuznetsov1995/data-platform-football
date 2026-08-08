@@ -287,11 +287,12 @@ __ESPN_DOWNSTREAM_SCOPE_FILTER__
     assert rendered.count("('606:2026'") == 1
     assert rendered.count("('700:2026'") == 1
     assert "es_source.scope_id = espn_scope.scope_id" in rendered
-    assert "es_source.scope_id IS NULL" in rendered
-    assert "es_source.league = espn_scope.platform_league" in rendered
-    assert "es_source.season AS varchar" in rendered
+    assert "es_source.scope_id IS NULL" not in rendered
+    assert "es_source.league = espn_scope.platform_league" not in rendered
     assert "effective_start_date" in rendered
     assert "effective_end_date" in rendered
+    assert "effective_start_date - INTERVAL '1' DAY" in rendered
+    assert "effective_end_date + INTERVAL '1' DAY" in rendered
 
 
 @pytest.mark.unit
@@ -299,4 +300,12 @@ def test_renderer_rejects_half_wired_marker_pair() -> None:
     with pytest.raises(ValueError, match="both ESPN downstream markers"):
         _module().render_espn_downstream_sql(
             "SELECT __ESPN_DOWNSTREAM_SCOPE_VALUES__"
+        )
+
+
+@pytest.mark.unit
+def test_renderer_rejects_typoed_espn_marker_before_trino() -> None:
+    with pytest.raises(ValueError, match="unknown ESPN downstream SQL markers"):
+        _module().render_espn_downstream_sql(
+            "SELECT __ESPN_DOWNSTREAM_SCOPE_VALUSE__"
         )

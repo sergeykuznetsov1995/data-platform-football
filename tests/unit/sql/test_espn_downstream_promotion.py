@@ -1,4 +1,4 @@
-"""One explicit ESPN allowlist across every downstream promotion path."""
+"""ESPN promotion is staged without changing pre-compact legacy serving."""
 
 from __future__ import annotations
 
@@ -28,29 +28,27 @@ SQL_CONSUMERS = (
 
 @pytest.mark.unit
 @pytest.mark.parametrize("path", SQL_CONSUMERS, ids=lambda path: path.name)
-def test_every_sql_consumer_uses_current_view_and_common_filter(path: Path) -> None:
+def test_precompact_sql_consumers_stay_on_legacy_canonical_tables(path: Path) -> None:
     sql = path.read_text(encoding="utf-8")
 
-    assert VALUES_MARKER in sql
-    assert FILTER_MARKER in sql
-    assert "espn_scope.platform_league" in sql
-    assert "espn_scope.platform_season_slug" in sql
     assert "iceberg.bronze.espn_" in sql
-    assert "_current" in sql
+    assert "iceberg.bronze.espn_schedule_current" not in sql
+    assert "iceberg.bronze.espn_lineup_current" not in sql
+    assert "iceberg.bronze.espn_matchsheet_current" not in sql
+    assert VALUES_MARKER not in sql
+    assert FILTER_MARKER not in sql
 
 
 @pytest.mark.unit
-def test_player_resolver_uses_the_same_rendered_filter() -> None:
+def test_precompact_player_resolver_stays_on_legacy_lineup() -> None:
     from utils import xref_player_resolver
 
     source = inspect.getsource(xref_player_resolver._fetch_espn_players)
 
-    assert "iceberg.bronze.espn_lineup_current" in source
-    assert VALUES_MARKER in source
-    assert FILTER_MARKER in source
-    assert "render_espn_downstream_sql" in source
-    assert "espn_scope.platform_league" in source
-    assert "espn_scope.platform_season_slug" in source
+    assert "iceberg.bronze.espn_lineup" in source
+    assert "espn_lineup_current" not in source
+    assert VALUES_MARKER not in source
+    assert FILTER_MARKER not in source
 
 
 @pytest.mark.unit
@@ -62,13 +60,11 @@ def test_player_resolver_uses_the_same_rendered_filter() -> None:
     ),
     ids=lambda path: path.name,
 )
-def test_silver_outputs_preserve_native_source_identity(path: Path) -> None:
+def test_precompact_silver_does_not_require_native_only_columns(path: Path) -> None:
     sql = path.read_text(encoding="utf-8")
 
-    assert "es_source.scope_id" in sql
-    assert "AS source_scope_id" in sql
-    assert "es_source.source_season_year" in sql
-    assert "AS source_season_year" in sql
+    assert "source_scope_id" not in sql
+    assert "source_season_year" not in sql
 
 
 @pytest.mark.unit
@@ -85,19 +81,28 @@ def test_all_transform_runner_modes_use_one_rendered_select_loader() -> None:
 
 
 @pytest.mark.unit
-def test_e3_backfill_precheck_routes_espn_current_view_through_mapping() -> None:
+def test_e3_backfill_precheck_stays_on_legacy_lineup_until_compact6() -> None:
     source = (ROOT / "dags" / "dag_e3_backfill.py").read_text(encoding="utf-8")
 
-    assert "iceberg.bronze.espn_lineup_current" in source
-    assert "render_espn_downstream_sql" in source
-    assert VALUES_MARKER in source
-    assert FILTER_MARKER in source
-    assert "espn_scope.platform_season_slug = '{season_sql}'" in source
-    assert "espn_scope.platform_league = '{league_sql}'" in source
+    assert "iceberg.bronze.espn_lineup" in source
+    assert "espn_lineup_current" not in source
+    assert VALUES_MARKER not in source
+    assert FILTER_MARKER not in source
 
 
 @pytest.mark.unit
-def test_common_filter_maps_native_and_legacy_but_excludes_wrong_rows() -> None:
+def test_missing_grain_dq_arms_only_after_atomic_compact6_switch() -> None:
+    source = (ROOT / "dags" / "dag_transform_xref.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "ESPN_BRONZE_LAYOUT_MODE" in source
+    assert "espn_promoted_dq_policy" in source
+    assert "include_espn_promoted_grains=include_espn_promoted_grains" in source
+
+
+@pytest.mark.unit
+def test_common_filter_maps_only_exact_native_rows_and_source_day_edges() -> None:
     duckdb = pytest.importorskip("duckdb")
     from utils.espn_season_mapping import render_espn_downstream_sql
 
@@ -141,6 +146,10 @@ ORDER BY es_source.label
            'ENG-Premier League', '2627', '2026-08-20 Liverpool-Arsenal'),
           ('native-ok', '700:2026', 700, 2026,
            'raw-source-league', '2026', '2026-08-20 Liverpool-Arsenal'),
+          ('native-start-minus-one', '700:2026', 700, 2026,
+           'raw-source-league', '2026', '2026-08-14 A-B'),
+          ('native-end-plus-one', '700:2026', 700, 2026,
+           'raw-source-league', '2026', '2027-05-25 A-B'),
           ('wrong-scope', '701:2026', 701, 2026,
            'ENG-Premier League', '2627', '2026-08-20 Liverpool-Arsenal'),
           ('wrong-native-id', '700:2026', 701, 2026,
@@ -149,6 +158,10 @@ ORDER BY es_source.label
            'UEFA-Champions League', '2627', '2026-08-20 A-B'),
           ('outside-date', '700:2026', 700, 2026,
            'ENG-Premier League', '2627', '2026-08-01 A-B'),
+          ('start-minus-two', '700:2026', 700, 2026,
+           'ENG-Premier League', '2627', '2026-08-13 A-B'),
+          ('end-plus-two', '700:2026', 700, 2026,
+           'ENG-Premier League', '2627', '2027-05-26 A-B'),
           ('bad-date', '700:2026', 700, 2026,
            'ENG-Premier League', '2627', 'not-a-date A-B')
         """
@@ -157,6 +170,7 @@ ORDER BY es_source.label
     rows = con.execute(sql).fetchall()
 
     assert rows == [
-        ("legacy-ok", "ENG-Premier League", "2627", None, 2026),
+        ("native-end-plus-one", "ENG-Premier League", "2627", "700:2026", 2026),
         ("native-ok", "ENG-Premier League", "2627", "700:2026", 2026),
+        ("native-start-minus-one", "ENG-Premier League", "2627", "700:2026", 2026),
     ]

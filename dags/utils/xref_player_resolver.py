@@ -1579,32 +1579,19 @@ def _fetch_espn_players(
     ESPN lineups, so ``bronze_signal`` degenerates to the -1.0 sentinel (like
     Transfermarkt / Capology / SoFIFA).
     """
-    from utils.espn_season_mapping import render_espn_downstream_sql
-
-    sql = render_espn_downstream_sql(f"""
-        WITH espn_downstream_scope (
-            scope_id, espn_id, source_season_year, platform_league,
-            platform_season_slug, convention,
-            effective_start_date, effective_end_date
-        ) AS (VALUES
-__ESPN_DOWNSTREAM_SCOPE_VALUES__
-        )
+    sql = f"""
         SELECT
-            es_source.player,
-            es_source.team,
-            espn_scope.platform_league AS league,
-            espn_scope.platform_season_slug AS season
-        FROM iceberg.bronze.espn_lineup_current es_source
-        JOIN espn_downstream_scope espn_scope ON
-__ESPN_DOWNSTREAM_SCOPE_FILTER__
-        WHERE espn_scope.platform_league = '{_sql_escape(league)}'
-          AND espn_scope.platform_season_slug IN ({_seasons_in_clause(source_seasons)})
-          AND es_source.player IS NOT NULL
-          AND es_source.team IS NOT NULL
-        GROUP BY es_source.player, es_source.team,
-                 espn_scope.platform_league,
-                 espn_scope.platform_season_slug
-    """)
+            player,
+            team,
+            league,
+            CAST(season AS varchar) AS season
+        FROM iceberg.bronze.espn_lineup
+        WHERE league = '{_sql_escape(league)}'
+          AND season IN ({_seasons_in_clause(source_seasons)})
+          AND player IS NOT NULL
+          AND team IS NOT NULL
+        GROUP BY player, team, league, CAST(season AS varchar)
+    """
     rows = _execute(conn, sql, fetch=True) or []
     out: List[Dict[str, Any]] = []
     for name, team, lg, season in rows:

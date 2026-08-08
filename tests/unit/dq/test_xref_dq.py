@@ -258,7 +258,7 @@ def test_spine_predicate_is_scoped_by_league_and_season():
 
 
 def test_espn_xref_team_dq_has_exact_six_platform_grains_and_orphan_gate():
-    checks = xref_dq.build_xref_team_checks()
+    checks = xref_dq.build_xref_team_checks(include_espn_promoted_grains=True)
     counts = [c for c in checks if c.name.startswith('espn_promoted_grain[xref_team.')]
     orphans = [c for c in checks if c.name.startswith('espn_orphans[xref_team.')]
 
@@ -276,7 +276,7 @@ def test_espn_xref_team_dq_has_exact_six_platform_grains_and_orphan_gate():
 
 
 def test_espn_xref_match_dq_caps_come_from_exact_competition_grains():
-    checks = xref_dq.build_xref_match_checks()
+    checks = xref_dq.build_xref_match_checks(include_espn_promoted_grains=True)
     grains = [c for c in checks if c.name.startswith('espn_promoted_grain[xref_match.')]
 
     assert len(grains) == 6
@@ -297,7 +297,7 @@ def test_espn_xref_match_dq_caps_come_from_exact_competition_grains():
 
 
 def test_espn_xref_match_bridge_quality_is_checked_per_platform_grain():
-    checks = xref_dq.build_xref_match_checks()
+    checks = xref_dq.build_xref_match_checks(include_espn_promoted_grains=True)
     coverage = [
         c for c in checks
         if c.name.startswith('espn_bridge_coverage[xref_match.')
@@ -314,6 +314,41 @@ def test_espn_xref_match_bridge_quality_is_checked_per_platform_grain():
         and "season = '" in c.params['where']
         for c in coverage
     )
+
+
+def test_exact_espn_phase1_grains_arm_only_for_compact6() -> None:
+    legacy = xref_dq.build_all_xref_checks()
+    compact = xref_dq.build_all_xref_checks(
+        include_espn_promoted_grains=True
+    )
+
+    def promoted(checks):
+        return [
+            check.name
+            for check in checks
+            if check.name.startswith((
+                'espn_promoted_grain[',
+                'espn_orphans[',
+                'espn_bridge_coverage[',
+            ))
+        ]
+
+    assert promoted(legacy) == []
+    assert len(promoted(compact)) == 24
+
+
+def test_espn_phase1_and_phase2_policy_is_atomic_by_layout() -> None:
+    legacy_phase1, legacy_phase2 = xref_dq.espn_promoted_dq_policy('legacy14')
+    compact_phase1, compact_phase2 = xref_dq.espn_promoted_dq_policy('compact6')
+
+    assert legacy_phase1 is False
+    assert legacy_phase2 == []
+    assert compact_phase1 is True
+    assert len(compact_phase2) == 6
+    assert {grain['source'] for grain in compact_phase2} == {'espn'}
+
+    with pytest.raises(ValueError, match='unsupported ESPN_BRONZE_LAYOUT_MODE'):
+        xref_dq.espn_promoted_dq_policy('typo')
 
 
 def test_xref_referee_source_enum():
@@ -1072,7 +1107,7 @@ def test_evaluate_manager_dob_collisions_ok_when_agreeing(duck_conn):
 
 
 def test_orphan_rate_group_by_league(duck_conn):
-    """Multi-league prep: rates per (source, league), keys 'src|league',
+    """Multi-league prep: rates per (source, league, season), with the
     latest-season filter evaluated PER league (table-wide max would mask the
     league whose freshest partition is older)."""
     duck_conn.execute(
@@ -1109,12 +1144,94 @@ def test_orphan_rate_group_by_league(duck_conn):
         group_by_league=True,
     )
 
-    assert res['per_source']['understat|ENG']['verdict'] == 'OK'
-    assert res['per_source']['understat|ENG']['orphans'] == 0
-    assert res['per_source']['understat|ESP']['verdict'] == 'ERROR'
-    assert res['per_source']['understat|ESP']['orphans'] == 5
+    assert res['per_source']['understat|ENG|2526']['verdict'] == 'OK'
+    assert res['per_source']['understat|ENG|2526']['orphans'] == 0
+    assert res['per_source']['understat|ESP|2425']['verdict'] == 'ERROR'
+    assert res['per_source']['understat|ESP|2425']['orphans'] == 5
     breach = [b for b in res['breaches'] if b.get('league') == 'ESP']
-    assert len(breach) == 1 and breach[0]['source'] == 'understat'
+    assert len(breach) == 1
+    assert breach[0]['source'] == 'understat'
+    assert breach[0]['season'] == '2425'
+
+
+def test_orphan_rate_group_by_league_keeps_seasons_isolated(duck_conn):
+    """A healthy historical grain must not dilute a broken newer grain."""
+    duck_conn.execute(
+        "INSERT INTO iceberg.silver.xref_player VALUES "
+        + ", ".join(
+            f"('us_h{i}', 'understat', 'h{i}', 'P{i}', 'ENG', '2425', "
+            "'name_team', NULL)"
+            for i in range(100)
+        )
+        + ", "
+        + ", ".join(
+            f"('us_c{i}', 'understat', 'c{i}', 'P{i}', 'ENG', '2526', "
+            "'orphan', NULL)"
+            for i in range(10)
+        )
+    )
+
+    res = xref_dq.evaluate_orphan_rate_per_source(
+        table='iceberg.silver.xref_player',
+        warning_threshold=10.0,
+        error_threshold=25.0,
+        group_by_league=True,
+    )
+
+    assert res['per_source']['understat|ENG|2425']['verdict'] == 'OK'
+    current = res['per_source']['understat|ENG|2526']
+    assert current['total'] == 10
+    assert current['orphans'] == 10
+    assert current['verdict'] == 'ERROR'
+    assert any(
+        breach == {
+            'source': 'understat',
+            'league': 'ENG',
+            'season': '2526',
+            'pct': 100.0,
+            'verdict': 'ERROR',
+        }
+        for breach in res['breaches']
+    )
+
+
+def test_orphan_rate_expected_grain_reports_missing_current_source(duck_conn):
+    """An expected source with zero rows in the current grain fails closed."""
+    duck_conn.execute(
+        "INSERT INTO iceberg.silver.xref_player VALUES "
+        "('fb_c', 'fbref', 'c', 'P', 'ENG', '2526', 'exact', NULL), "
+        "('es_h', 'espn', 'h', 'P', 'ENG', '2425', 'name_team', NULL)"
+    )
+
+    res = xref_dq.evaluate_orphan_rate_per_source(
+        table='iceberg.silver.xref_player',
+        warning_threshold=10.0,
+        error_threshold=25.0,
+        current_season_only=True,
+        group_by_league=True,
+        expected_grains=[{
+            'source': 'espn',
+            'league': 'ENG',
+            'season': '2526',
+        }],
+    )
+
+    assert res['per_source']['espn|ENG|2526'] == {
+        'total': 0,
+        'orphans': 0,
+        'pct': None,
+        'verdict': 'ERROR',
+        'missing': True,
+    }
+    assert {
+        'source': 'espn',
+        'league': 'ENG',
+        'season': '2526',
+        'pct': None,
+        'verdict': 'ERROR',
+        'missing': True,
+    } in res['breaches']
+    assert res['verdict'] == 'ERROR'
 
 
 def test_orphan_rate_default_shape_unchanged(duck_conn):

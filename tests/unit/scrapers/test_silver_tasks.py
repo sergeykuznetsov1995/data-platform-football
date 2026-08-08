@@ -108,7 +108,9 @@ __ESPN_DOWNSTREAM_SCOPE_FILTER__
 
         assert "__ESPN_DOWNSTREAM" not in rendered
         assert "('700:2026'" in rendered
-        assert "es_source.scope_id IS NULL" in rendered
+        assert "es_source.scope_id = espn_scope.scope_id" in rendered
+        assert "es_source.scope_id IS NULL" not in rendered
+        assert "effective_start_date - INTERVAL '1' DAY" in rendered
 
     def test_rejects_unresolved_inline_template_marker(self):
         mod = _import_silver_tasks()

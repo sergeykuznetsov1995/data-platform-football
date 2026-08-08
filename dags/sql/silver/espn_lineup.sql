@@ -5,7 +5,7 @@
 -- Per-player lineup entries from ESPN matchsheet API (via soccerdata.ESPN).
 --
 -- Source:
---   iceberg.bronze.espn_lineup_current
+--   iceberg.bronze.espn_lineup
 --
 -- Target consumer:
 --   gold/fct_lineup (E3.5) — UNION ALL with silver.fbref_match_lineups.
@@ -80,59 +80,46 @@
 --   `CREATE TABLE iceberg.silver.espn_lineup AS ...` with partitioning by
 --   (league, season). This file MUST stay a pure SELECT.
 --
---   If iceberg.bronze.espn_lineup_current does not yet exist (R0.2c fallback is
+--   If iceberg.bronze.espn_lineup does not yet exist (R0.2c FALLBACK is still
 --   in scoping), the DAG task will fail at planning time — that is the
 --   intended behaviour: missing Bronze should surface as a hard failure, not
 --   a silent empty-Silver. Wire-up of the ESPN lineup ingestion is tracked
 --   separately in R0.2c / E3.7.
 -- =============================================================================
 
-WITH espn_downstream_scope (
-    scope_id, espn_id, source_season_year, platform_league,
-    platform_season_slug, convention, effective_start_date, effective_end_date
-) AS (VALUES
-__ESPN_DOWNSTREAM_SCOPE_VALUES__
-),
-src AS (
+WITH src AS (
     SELECT
-        espn_scope.platform_league            AS league,
-        espn_scope.platform_season_slug       AS season,
-        -- Preserve native source identity verbatim. Legacy fallback rows have
-        -- NULL native identity by contract; the mapping only supplies the
-        -- downstream platform league/season above.
-        es_source.scope_id                    AS source_scope_id,
-        es_source.source_season_year          AS source_season_year,
-        es_source.game,
-        es_source.team,
-        es_source.player,
-        es_source.position,
-        es_source.sub_in,
-        es_source._ingested_at,
+        league,
+        CAST(season AS varchar)              AS season,
+        game,
+        team,
+        player,
+        position,
+        sub_in,
+        _ingested_at,
 
         -- Deterministic match_id derivation. Same xxhash64-hex pattern used
         -- by xref_match.sql for future fixtures, prefixed 'espn_' so xref_match
         -- Phase B can filter ESPN-origin pseudo-ids and replace them with the
         -- canonical FBref hex when fuzzy bridging succeeds.
         'espn_' || LOWER(TO_HEX(XXHASH64(TO_UTF8(
-            COALESCE(espn_scope.platform_league, '')
-            || '|' || COALESCE(espn_scope.platform_season_slug, '')
-            || '|' || COALESCE(es_source.game, '')
+            COALESCE(league, '')
+            || '|' || COALESCE(CAST(season AS varchar), '')
+            || '|' || COALESCE(game, '')
         ))))                                  AS match_id,
 
         ROW_NUMBER() OVER (
             PARTITION BY
                 'espn_' || LOWER(TO_HEX(XXHASH64(TO_UTF8(
-                    COALESCE(espn_scope.platform_league, '')
-                    || '|' || COALESCE(espn_scope.platform_season_slug, '')
-                    || '|' || COALESCE(es_source.game, '')
+                    COALESCE(league, '')
+                    || '|' || COALESCE(CAST(season AS varchar), '')
+                    || '|' || COALESCE(game, '')
                 )))),
-                es_source.team,
-                es_source.player
-            ORDER BY es_source._ingested_at DESC
+                team,
+                player
+            ORDER BY _ingested_at DESC
         ) AS rn
-    FROM iceberg.bronze.espn_lineup_current es_source
-    JOIN espn_downstream_scope espn_scope ON
-__ESPN_DOWNSTREAM_SCOPE_FILTER__
+    FROM iceberg.bronze.espn_lineup
 )
 
 SELECT
@@ -140,8 +127,6 @@ SELECT
     team,
     player,
     CAST(NULL AS varchar)                     AS player_id,
-    source_scope_id,
-    source_season_year,
 
     -- ========= is_starter =========
     -- ESPN: sub_in = 'start' is the authoritative starter marker (8338 rows

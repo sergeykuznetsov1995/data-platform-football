@@ -154,6 +154,33 @@ def _espn_promoted_grains() -> List[Dict[str, Any]]:
     return grains
 
 
+def espn_promoted_orphan_grains() -> List[Dict[str, str]]:
+    """Promoted ESPN grains in the shape consumed by the orphan evaluator."""
+
+    return [
+        {
+            'source': 'espn',
+            'league': str(grain['league']),
+            'season': str(grain['season']),
+        }
+        for grain in _espn_promoted_grains()
+    ]
+
+
+def espn_promoted_dq_policy(
+    layout_mode: str,
+) -> tuple[bool, List[Dict[str, str]]]:
+    """Return the exact ESPN gates allowed by the serving topology."""
+
+    if not isinstance(layout_mode, str):
+        raise ValueError("ESPN Bronze layout mode must be a string")
+    normalized = layout_mode.strip()
+    if normalized not in {'legacy14', 'compact6'}:
+        raise ValueError(f"unsupported ESPN_BRONZE_LAYOUT_MODE={normalized!r}")
+    enabled = normalized == 'compact6'
+    return enabled, espn_promoted_orphan_grains() if enabled else []
+
+
 def _xref_match_global_cap() -> int:
     """All configured spine grains × seven sources × twofold headroom."""
 
@@ -173,7 +200,9 @@ def _xref_match_global_cap() -> int:
 # Per-table DQ definitions
 # ---------------------------------------------------------------------------
 
-def build_xref_team_checks() -> List[Check]:
+def build_xref_team_checks(
+    *, include_espn_promoted_grains: bool = False
+) -> List[Check]:
     """DQ for ``iceberg.silver.xref_team``.
 
     Orphan-rate (coverage-style) is **not** in this list — ratios cannot
@@ -218,7 +247,7 @@ def build_xref_team_checks() -> List[Check]:
             severity='ERROR',
         ),
     ]
-    for grain in _espn_promoted_grains():
+    for grain in _espn_promoted_grains() if include_espn_promoted_grains else ():
         league = str(grain['league']).replace("'", "''")
         season = str(grain['season']).replace("'", "''")
         where = (
@@ -242,7 +271,9 @@ def build_xref_team_checks() -> List[Check]:
     return checks
 
 
-def build_xref_match_checks() -> List[Check]:
+def build_xref_match_checks(
+    *, include_espn_promoted_grains: bool = False
+) -> List[Check]:
     """DQ for ``iceberg.silver.xref_match`` (Phase B — 7-source cascade).
 
     Source enum covers FBref spine + 6 cascaded sources. PK is composite
@@ -300,7 +331,7 @@ def build_xref_match_checks() -> List[Check]:
             name=f'bridge_coverage[xref_match.{src}]',
         ))
 
-    for grain in _espn_promoted_grains():
+    for grain in _espn_promoted_grains() if include_espn_promoted_grains else ():
         league = str(grain['league']).replace("'", "''")
         season = str(grain['season']).replace("'", "''")
         match_count = int(grain['match_count'])
@@ -681,11 +712,17 @@ def build_xref_player_review_checks() -> List[Check]:
     ]
 
 
-def build_all_xref_checks() -> List[Check]:
-    """Aggregate DQ checks for all 5 xref tables + review sibling."""
+def build_all_xref_checks(
+    *, include_espn_promoted_grains: bool = False
+) -> List[Check]:
+    """Aggregate DQ checks, arming exact ESPN grains only after compact6."""
     return (
-        build_xref_team_checks()
-        + build_xref_match_checks()
+        build_xref_team_checks(
+            include_espn_promoted_grains=include_espn_promoted_grains
+        )
+        + build_xref_match_checks(
+            include_espn_promoted_grains=include_espn_promoted_grains
+        )
         + build_xref_referee_checks()
         + build_xref_manager_checks()
         + build_xref_player_checks()
@@ -800,6 +837,7 @@ def evaluate_orphan_rate_per_source(
     error_threshold: float = 25.0,
     current_season_only: bool = False,
     group_by_league: bool = False,
+    expected_grains: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Compute orphan-rate per ``source`` for an xref table and classify.
 
@@ -825,19 +863,38 @@ def evaluate_orphan_rate_per_source(
     old, thin FBref spine leaves most source rows legitimately orphan (#788) —
     table-wide that inflates the rate into a false ERROR (fotmob 28.8% /
     xref_team TM 86.9%), while the current season — where the spine is thick —
-    is the meaningful resolver-health signal (1.3% / 0%). Sources absent in the
-    latest season drop out of the GROUP BY and are simply not evaluated.
+    is the meaningful resolver-health signal (1.3% / 0%).
 
     ``group_by_league`` (multi-league prep): when True, rates are computed per
-    ``(source, league)`` — ``per_source`` keys become ``'{source}|{league}'``
-    and breaches carry a ``league`` field. The latest-season filter is then
-    evaluated PER LEAGUE (a table-wide max season would mask a league whose
-    freshest data is older). When False (default) the output is byte-identical
-    to the historical single-league shape.
+    ``(source, league, season)`` — ``per_source`` keys become
+    ``'{source}|{league}|{season}'`` and breaches carry ``league`` + ``season``
+    fields. Keeping season in the grain prevents a healthy historical partition
+    from diluting a broken current one. The latest-season filter is evaluated
+    PER LEAGUE (a table-wide max season would mask a league whose freshest data
+    is older). When False (default) the output is byte-identical to the
+    historical single-league shape.
+
+    ``expected_grains`` binds explicitly promoted ``source`` / ``league`` /
+    ``season`` triples to the report. A promoted source with zero rows cannot
+    disappear from SQL's GROUP BY: it is emitted as ``missing=True`` with an
+    ERROR verdict. This is a required minimum set, not a whitelist; other
+    observed grains remain reportable. Expected grains require
+    ``group_by_league=True``.
 
     NOTE: This function does NOT raise. Callers decide whether to escalate.
     """
     qualified = _qualify(table)
+    expected = set()
+    for grain in expected_grains or []:
+        values = tuple(grain.get(field) for field in ('source', 'league', 'season'))
+        if any(value is None or str(value) == '' for value in values):
+            raise ValueError(
+                "expected_grains entries require source, league, and season"
+            )
+        expected.add(tuple(str(value) for value in values))
+    if expected and not group_by_league:
+        raise ValueError("expected_grains requires group_by_league=True")
+
     if group_by_league:
         # Per-league latest season via a window — a table-wide max(season)
         # would silently exclude any league whose freshest partition is older.
@@ -846,14 +903,29 @@ def evaluate_orphan_rate_per_source(
             "MAX(season) OVER (PARTITION BY league) AS max_season "
             f"FROM {qualified}"
         )
-        where = "WHERE season = max_season " if current_season_only else ""
+        if current_season_only:
+            selected = "season = max_season"
+            if expected:
+                expected_predicates = []
+                for source, league, season in sorted(expected):
+                    source = source.replace("'", "''")
+                    league = league.replace("'", "''")
+                    season = season.replace("'", "''")
+                    expected_predicates.append(
+                        f"(source = '{source}' AND league = '{league}' "
+                        f"AND season = '{season}')"
+                    )
+                selected += " OR " + " OR ".join(expected_predicates)
+            where = f"WHERE ({selected}) "
+        else:
+            where = ""
         sql = (
-            "SELECT source, league, "
+            "SELECT source, league, season, "
             "       COUNT(*) AS total, "
             "       COUNT_IF(confidence = 'orphan') AS orphans "
             f"FROM ({inner}) "
             f"{where}"
-            "GROUP BY source, league"
+            "GROUP BY source, league, season"
         )
     else:
         where = (
@@ -885,13 +957,19 @@ def evaluate_orphan_rate_per_source(
     overall_orphans = 0
     overall_verdict = 'OK'
 
+    observed_grains = set()
     for row in rows:
         if group_by_league:
-            src, league, total, orphans = row
-            key = f"{src}|{league}"
+            src, league, season, total, orphans = row
+            src = str(src)
+            league = str(league)
+            season = str(season)
+            observed_grains.add((src, league, season))
+            key = f"{src}|{league}|{season}"
         else:
             src, total, orphans = row
             league = None
+            season = None
             key = src
         pct = (100.0 * orphans / total) if total else 0.0
         if pct > error_threshold:
@@ -911,6 +989,7 @@ def evaluate_orphan_rate_per_source(
             breach = {'source': src, 'pct': round(pct, 2), 'verdict': verdict}
             if league is not None:
                 breach['league'] = league
+                breach['season'] = season
             breaches.append(breach)
         overall_total += int(total)
         overall_orphans += int(orphans)
@@ -920,6 +999,25 @@ def evaluate_orphan_rate_per_source(
             overall_verdict = 'ERROR'
         elif verdict == 'WARNING' and overall_verdict == 'OK':
             overall_verdict = 'WARNING'
+
+    for src, league, season in sorted(expected - observed_grains):
+        key = f"{src}|{league}|{season}"
+        per_source[key] = {
+            'total': 0,
+            'orphans': 0,
+            'pct': None,
+            'verdict': 'ERROR',
+            'missing': True,
+        }
+        breaches.append({
+            'source': src,
+            'league': league,
+            'season': season,
+            'pct': None,
+            'verdict': 'ERROR',
+            'missing': True,
+        })
+        overall_verdict = 'ERROR'
 
     overall_pct = (100.0 * overall_orphans / overall_total) if overall_total else 0.0
     return {

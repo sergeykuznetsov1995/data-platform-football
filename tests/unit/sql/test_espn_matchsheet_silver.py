@@ -37,8 +37,7 @@ def _translate(sql_text: str) -> str:
 def _bootstrap(con) -> None:
     con.execute("CREATE SCHEMA IF NOT EXISTS bronze")
     con.execute("""
-        CREATE TABLE bronze.espn_matchsheet_current (
-            scope_id VARCHAR, competition_id BIGINT, source_season_year BIGINT,
+        CREATE TABLE bronze.espn_matchsheet (
             venue VARCHAR, game VARCHAR, league VARCHAR, season VARCHAR,
             _ingested_at TIMESTAMP
         )
@@ -46,35 +45,28 @@ def _bootstrap(con) -> None:
     # One game with two snapshots (latest _ingested_at wins) + one single game
     # + NULL/blank venue rows (must be filtered).
     con.execute("""
-        INSERT INTO bronze.espn_matchsheet_current VALUES
+        INSERT INTO bronze.espn_matchsheet VALUES
         -- Etihad: older snapshot (discarded)
-        (NULL, NULL, NULL, 'Etihad Stadium', '2026-08-20 MCI-CHE',
-         'ENG-Premier League', '2627',
+        ('Etihad Stadium', '2024-08-15-MCI-CHE', 'ENG-Premier League', '2425',
          TIMESTAMP '2026-04-27 06:00:00'),
         -- Etihad: latest snapshot (wins) — note padded name to prove trim()
-        (NULL, NULL, NULL, '  Etihad Stadium  ', '2026-08-20 MCI-CHE',
-         'ENG-Premier League', '2627',
+        ('  Etihad Stadium  ', '2024-08-15-MCI-CHE', 'ENG-Premier League', '2425',
          TIMESTAMP '2026-04-27 09:00:00'),
         -- Goodison: single snapshot
-        (NULL, NULL, NULL, 'Goodison Park', '2026-08-21 EVE-LIV',
-         'ENG-Premier League', '2627',
+        ('Goodison Park', '2024-08-22-EVE-LIV', 'ENG-Premier League', '2425',
          TIMESTAMP '2026-04-27 09:00:00'),
         -- NULL venue -> filtered
-        (NULL, NULL, NULL, NULL, '2026-08-22 BRE-ARS',
-         'ENG-Premier League', '2627',
+        (NULL, '2024-08-23-BRE-ARS', 'ENG-Premier League', '2425',
          TIMESTAMP '2026-04-27 09:00:00'),
         -- blank venue -> filtered
-        (NULL, NULL, NULL, '   ', '2026-08-23 NEW-TOT',
-         'ENG-Premier League', '2627',
+        ('   ', '2024-08-24-NEW-TOT', 'ENG-Premier League', '2425',
          TIMESTAMP '2026-04-27 09:00:00')
     """)
 
 
 @pytest.fixture(scope="module")
 def silver_rows():
-    from utils.espn_season_mapping import render_espn_downstream_sql
-
-    sql_text = render_espn_downstream_sql(SQL_PATH.read_text(encoding="utf-8"))
+    sql_text = SQL_PATH.read_text(encoding="utf-8")
     try:
         translated = _translate(sql_text)
     except Exception as e:
@@ -114,8 +106,8 @@ class TestEspnMatchsheetSilver:
         """match_date = try_cast(substr(game, 1, 10) as date)."""
         etihad = next(r for r in silver_rows if r["venue"] == "Etihad Stadium")
         goodison = next(r for r in silver_rows if r["venue"] == "Goodison Park")
-        assert etihad["match_date"] == datetime.date(2026, 8, 20)
-        assert goodison["match_date"] == datetime.date(2026, 8, 21)
+        assert etihad["match_date"] == datetime.date(2024, 8, 15)
+        assert goodison["match_date"] == datetime.date(2024, 8, 22)
 
     def test_columns_renamed(self, silver_rows):
         """rename: _ingested_at -> _bronze_ingested_at; game NOT emitted."""
@@ -126,7 +118,7 @@ class TestEspnMatchsheetSilver:
 
     def test_season_slug_as_is(self, silver_rows):
         """#404: ESPN bronze season is already a slug — emitted unchanged."""
-        assert {r["season"] for r in silver_rows} == {"2627"}
+        assert {r["season"] for r in silver_rows} == {"2425"}
 
     def test_partition_keys_present(self, silver_rows):
         """league + season survive as the trailing partition keys."""
