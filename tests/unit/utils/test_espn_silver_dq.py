@@ -184,6 +184,35 @@ def test_winner_and_scoreboard_queries_preserve_the_independent_latest_generatio
     }
 
 
+def test_goal_events_parity_sums_player_aggregate_and_excludes_penalty_finals():
+    check = _checks_by_name()["goals events <= score + 2"]
+    tree = parse_one(check.sql, read="trino")
+
+    tables = {(table.name, table.alias_or_name) for table in tree.find_all(exp.Table)}
+    assert ("espn_player_match_aggregate", "p") in tables
+    assert not any(table.name == "espn_match_events" for table in tree.find_all(exp.Table))
+
+    player_goal_sum = next(tree.find_all(exp.Sum))
+    assert isinstance(player_goal_sum.this, exp.Coalesce)
+    assert (player_goal_sum.this.this.table, player_goal_sum.this.this.name) == (
+        "p", "goals_events"
+    )
+    assert player_goal_sum.this.expressions[0].this == "0"
+
+    grouped = next(tree.find_all(exp.Group))
+    assert {(column.table, column.name) for column in grouped.find_all(exp.Column)} == {
+        ("m", "event_id"), ("m", "home_score"), ("m", "away_score"),
+    }
+    penalty_final_filter = next(
+        condition for condition in tree.find_all(exp.NEQ)
+        if (condition.this.table, condition.this.name) == ("m", "status")
+    )
+    assert penalty_final_filter.expression.this == "STATUS_FINAL_PEN"
+    assert check.severity == "WARNING"
+    assert check.passed((0,)) is True
+    assert check.passed((1,)) is False
+
+
 def test_custom_results_parse_safe_rows_and_preserve_warning_severity(monkeypatch):
     from utils import espn_silver_dq as dq
 

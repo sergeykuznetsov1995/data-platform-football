@@ -213,10 +213,11 @@ def build_espn_silver_custom_checks() -> List[CustomCheck]:
             FROM (
                 SELECT m.event_id
                 FROM iceberg.silver.espn_match m
-                LEFT JOIN iceberg.silver.espn_match_events e ON e.event_id = m.event_id AND e.is_goal = true
+                LEFT JOIN iceberg.silver.espn_player_match_aggregate p
+                    ON p.event_id = m.event_id
                 WHERE m.is_played = true AND m.status <> 'STATUS_FINAL_PEN'
                 GROUP BY m.event_id, m.home_score, m.away_score
-                HAVING COUNT(e.event_id) > m.home_score + m.away_score + 2
+                HAVING SUM(COALESCE(p.goals_events, 0)) > m.home_score + m.away_score + 2
             ) overcounted
             """,
             "WARNING", lambda row: row[0] == 0,
