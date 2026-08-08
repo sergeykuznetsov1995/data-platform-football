@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -16,7 +16,7 @@ from scrapers.espn.models import (
     RequestDisposition,
     ScopePlan,
 )
-from scrapers.espn.parser_contracts import LineupRow, ScheduleRow
+from scrapers.espn.parser_contracts import PARSER_VERSION, LineupRow, ScheduleRow
 from scrapers.espn.repository import (
     CATALOG_TABLE,
     CUTOVER_TABLE,
@@ -39,6 +39,7 @@ from scrapers.espn.repository import (
 )
 from scrapers.espn.operations import LeaseLost
 from scrapers.espn.schedule_parser import parse_scoreboards
+from scrapers.espn.runner import RUNTIME_VERSION
 from scrapers.espn.summary_parser import parse_summary
 
 
@@ -144,8 +145,8 @@ def _generation(**changes) -> ScopeGeneration:
         registry_snapshot_uri="s3://raw/catalog/registry.json.gz",
         registry_signature=SIG_A,
         plan_signature=SIG_B,
-        parser_version="espn-native-parser-v2",
-        runtime_version="espn-native-runtime-v2",
+        parser_version=PARSER_VERSION,
+        runtime_version=RUNTIME_VERSION,
         ingested_at=datetime(2026, 7, 31, 9, tzinfo=UTC),
         batch_id="batch-1",
         schedule=schedule,
@@ -1205,6 +1206,33 @@ def test_success_writes_all_entities_then_manifest_and_replay_is_idempotent():
     replay = repository.publish_scope(generation)
     assert replay.state is ScopePublicationState.IDEMPOTENT
     assert len(writer.calls) == before
+
+
+@pytest.mark.unit
+def test_dq_uses_source_day_bounds_for_edition_utc_boundary() -> None:
+    generation = _generation()
+    source_day = generation.schedule[0].kickoff.date() + timedelta(days=1)
+    boundary_plan = replace(
+        generation.plan,
+        start_date=source_day,
+        end_date=source_day,
+    )
+    boundary_generation = ScopeGeneration(
+        **{**generation.constructor_values(), "plan": boundary_plan}
+    )
+
+    assert validate_scope_generation(boundary_generation).passed
+
+
+@pytest.mark.unit
+def test_scope_generation_rejects_mixed_parser_row_versions() -> None:
+    generation = _generation()
+    mixed_schedule = (
+        replace(generation.schedule[0], parser_version="espn-native-parser-v2"),
+    )
+
+    with pytest.raises(ValueError, match="schedule.parser_version conflicts"):
+        replace(generation, schedule=mixed_schedule)
 
 
 @pytest.mark.unit

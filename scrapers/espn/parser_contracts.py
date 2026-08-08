@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
-PARSER_VERSION = "espn-native-parser-v2"
+PARSER_VERSION = "espn-native-parser-v3"
 STATUS_MAP_VERSION = "espn-status-v2"
 LINEUP_STAT_MAP_VERSION = "espn-lineup-stat-map-v1"
 MATCHSHEET_STAT_MAP_VERSION = "espn-matchsheet-stat-map-v1"

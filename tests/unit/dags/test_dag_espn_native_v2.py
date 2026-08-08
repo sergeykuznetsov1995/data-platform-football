@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 from contextlib import nullcontext
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
@@ -1024,6 +1025,14 @@ def test_summary_planner_accepts_airflow_none_for_signed_zero_scoreboard_map(
     assert index["expected_map_count"] == 0
 
 
+def test_airflow_summary_planner_uses_the_runner_scoreboard_merge_contract():
+    from dags.utils import espn_native_tasks
+
+    source = inspect.getsource(espn_native_tasks.plan_summary_batch_wave)
+
+    assert "runner._merge_scoreboard_pages(parsed_pages)" in source
+
+
 def test_summary_planner_rejects_airflow_none_when_scoreboard_map_was_expected(
     monkeypatch,
 ):
@@ -1610,28 +1619,71 @@ def test_daily_admission_binds_real_exact_isolated_owner_run(monkeypatch):
     assert parent["owner_profile"] == "espn-isolated-v1"
 
 
-def test_daily_admission_pins_exact_all_male_registry_and_first_bootstrap_cohort():
-    from dags.utils.espn_native_tasks import _bounded_daily_scopes
+def test_daily_admission_rejects_partial_head_coverage_before_scheduler_enablement():
+    from dags.utils.espn_native_tasks import OperationsError, _bounded_daily_scopes
 
     registry = _generated_registry(181)
     heads = {scope: _head(scope) for scope in _scope_ids(registry)[:9]}
 
-    target, selected, bootstrap = _bounded_daily_scopes(registry, heads)
-
-    assert len(target) == 181
-    assert len(selected) == 19
-    assert bootstrap == target[9:19]
-    assert set(selected) == set(target[:19])
+    with pytest.raises(OperationsError, match="181/181"):
+        _bounded_daily_scopes(registry, heads)
 
 
-def test_daily_bootstrap_never_skips_the_first_failed_scope():
-    from dags.utils.espn_native_tasks import _bounded_daily_scopes
+def test_daily_bootstrap_is_forbidden_until_manual_full_reconciliation():
+    from dags.utils.espn_native_tasks import OperationsError, _bounded_daily_scopes
 
     registry = _generated_registry(181)
 
-    target, selected, bootstrap = _bounded_daily_scopes(registry, {})
+    with pytest.raises(OperationsError, match="181/181"):
+        _bounded_daily_scopes(registry, {})
 
-    assert selected == bootstrap == target[:10]
+
+def test_daily_admission_selects_exactly_all_181_established_scopes():
+    from dags.utils.espn_native_tasks import _bounded_daily_scopes
+
+    registry = _generated_registry(181)
+    target = _scope_ids(registry)
+
+    admitted_target, selected, bootstrap = _bounded_daily_scopes(
+        registry, {scope: _head(scope) for scope in target}
+    )
+
+    assert admitted_target == selected == target
+    assert bootstrap == ()
+
+
+def test_scheduler_runtime_gate_requires_every_v3_v4_head(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    target = _scope_ids(_generated_registry(181))
+    heads = {
+        scope: SimpleNamespace(
+            snapshot_uri=f"file:///{scope}.json",
+            snapshot_sha256="a" * 64,
+        )
+        for scope in target
+    }
+    versions = {
+        scope: (
+            espn_native_tasks.runner.PARSER_VERSION,
+            espn_native_tasks.runner.RUNTIME_VERSION,
+        )
+        for scope in target
+    }
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "load_scope_snapshot",
+        lambda _uri, *, expected_scope_id, **_kwargs: SimpleNamespace(
+            parser_version=versions[expected_scope_id][0],
+            runtime_version=versions[expected_scope_id][1],
+        ),
+    )
+
+    espn_native_tasks._require_scheduler_runtime_heads(target, heads)
+    versions[target[-1]] = ("espn-native-parser-v2", "espn-native-runtime-v3")
+    with pytest.raises(espn_native_tasks.OperationsError, match="181/181"):
+        espn_native_tasks._require_scheduler_runtime_heads(target, heads)
+
 
 
 def test_exact_181_scope_fixture_bounds_reconciliation_summary_map():
@@ -1753,7 +1805,7 @@ def test_daily_admission_v2_persists_exact_discovery_and_coverage(monkeypatch):
 
         def read_scope_heads(self, scope_ids):
             assert tuple(scope_ids) == target
-            return {scope: _head(scope) for scope in target[:9]}
+            return {scope: _head(scope) for scope in target}
 
     monkeypatch.setattr(
         espn_native_tasks.PostgresEspnControlStore,
@@ -1764,6 +1816,15 @@ def test_daily_admission_v2_persists_exact_discovery_and_coverage(monkeypatch):
         espn_native_tasks,
         "_load_discovered_registry",
         lambda *, now: (registry, discovery),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_require_scheduler_runtime_heads",
+        lambda runtime_target, heads: (
+            runtime_target == target
+            and set(heads) == set(target)
+            or pytest.fail("runtime gate received partial coverage")
+        ),
     )
     monkeypatch.setattr(
         espn_native_tasks,
@@ -1808,8 +1869,8 @@ def test_daily_admission_v2_persists_exact_discovery_and_coverage(monkeypatch):
     assert admission["selection_policy"] == "explicit-core-gender-MALE-v1"
     assert admission["male_scope_count"] == 181
     assert admission["target_scope_ids"] == list(target)
-    assert admission["scope_ids"] == list(target[:19])
-    assert admission["bootstrap_scope_ids"] == list(target[9:19])
+    assert admission["scope_ids"] == list(target)
+    assert admission["bootstrap_scope_ids"] == []
 
 
 def test_manual_admission_keeps_explicit_generated_scope_without_reading_heads(
@@ -4352,6 +4413,8 @@ def test_shipped_finished_current_scopes_plan_safely_for_every_daily_shard(
         lambda *_args, expected_scope_id, **_kwargs: SimpleNamespace(
             plan=espn_native_tasks._scope_plan(registry, expected_scope_id),
             schedule=(),
+            parser_version=espn_native_tasks.runner.PARSER_VERSION,
+            runtime_version=espn_native_tasks.runner.RUNTIME_VERSION,
         ),
     )
 

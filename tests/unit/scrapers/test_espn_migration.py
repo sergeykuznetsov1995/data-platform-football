@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from scrapers.espn import runner
 from scrapers.espn.migration import (
     ABSENCE_BASELINE_VERSION,
     BASELINE_TABLE,
@@ -42,6 +43,16 @@ from scripts.migrate_espn_native_v2 import main
 
 UTC = timezone.utc
 NOW = datetime(2026, 8, 1, 9, tzinfo=UTC)
+
+
+def test_migration_policy_requires_parser_v3_runtime_v4_heads() -> None:
+    assert runner.PARSER_VERSION == "espn-native-parser-v3"
+    assert runner.RUNTIME_VERSION == "espn-native-runtime-v4"
+    assert (runner.LEGACY_PARSER_VERSION, runner.LEGACY_RUNTIME_VERSION) == (
+        "espn-native-parser-v2",
+        "espn-native-runtime-v3",
+    )
+    assert runner.LEGACY_REPLAY_GIT_SHA == "e12b85a"
 
 
 def _write_json(path: Path, payload: object) -> dict[str, str]:

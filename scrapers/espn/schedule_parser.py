@@ -11,7 +11,6 @@ from .models import Competition, Edition
 from .parser_common import (
     EspnParseError,
     canonical_json,
-    clipped_date,
     decode_object,
     native_id,
     optional_nonnegative_int,
@@ -19,6 +18,7 @@ from .parser_common import (
     required_list,
     required_mapping,
     required_string,
+    source_day_contains,
     source_year,
     unknown_fields,
     utc_datetime,
@@ -172,11 +172,12 @@ def _event_row(
     season = required_mapping(event.get("season"), f"event[{event_id}].season")
     event_year = source_year(season.get("year"), f"event[{event_id}].season.year")
     kickoff = utc_datetime(event.get("date"), f"event[{event_id}].date")
+    kickoff_date = kickoff.date()
     if event_year != edition.source_season_year:
         return None
-    if not clipped_date(kickoff, edition.start_date, edition.end_date):
+    if not source_day_contains(kickoff_date, edition.start_date, edition.end_date):
         return None
-    if not clipped_date(kickoff, query_start, query_end):
+    if not source_day_contains(kickoff_date, query_start, query_end):
         return None
 
     status = required_mapping(event.get("status"), f"event[{event_id}].status")

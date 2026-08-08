@@ -106,7 +106,7 @@ def _physical_generation(
         registry_signature=registry_signature,
         plan_signature="f" * 64,
         parser_version=PARSER_VERSION,
-        runtime_version="espn-native-runtime-v3",
+        runtime_version=runner.RUNTIME_VERSION,
         ingested_at=datetime(2026, 7, 27, 9, tzinfo=UTC),
         batch_id="physical-batch-v3",
         schedule=(),
@@ -638,7 +638,7 @@ def test_v4_noop_sequences_qualify_against_one_physical_complete(tmp_path, state
     assert [run.state for run in evidence.green_runs] == list(states)
     assert len({run.physical_run_id for run in evidence.green_runs}) == 1
     assert all(
-        run.physical_runtime_version == "espn-native-runtime-v3"
+        run.physical_runtime_version == runner.RUNTIME_VERSION
         for run in evidence.green_runs
     )
 

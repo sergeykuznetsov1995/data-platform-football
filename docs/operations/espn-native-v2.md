@@ -304,9 +304,23 @@ master должен быть scheduled, этот rollout заблокирова�
    сначала выполнить repair/backfill его exact scope; простое наличие строки
    `scope_head_v2` не является COMPLETE evidence.
 
-5. После пустой разности запустить один manual all-scope canary через
-   `dag_backfill_espn`, передав в `scopes` exact frozen target array из
-   saved state ref/`male_registry_ref`; zero-row scope считается успешным лишь
+5. После deploy parser migration выполнить только manual full reconciliation
+   каждого scope. Новый runtime выпускает исключительно
+   `espn-native-parser-v3` / `espn-native-runtime-v4`; one-hop bridge из
+   `espn-native-parser-v2` / `espn-native-runtime-v3` разрешён только внутри
+   такого полного reconciliation. Partial daily и noop поверх v2 head
+   fail-closed. Для точного воспроизведения прежнего v2 результата единственным
+   разрешённым runtime остаётся pinned git `e12b85a`.
+
+   До снятия паузы с scheduler daily admission должен проверить exact
+   `181/181 v3/v4 heads`: полный frozen target без missing/extra scope, и каждый
+   immutable COMPLETE snapshot обязан иметь parser v3/runtime v4. Смешанные
+   версии строк, неизвестный parser/runtime transition или хотя бы один v2/v3
+   head запрещают enablement.
+
+6. После пустой разности и exact `181/181 v3/v4 heads` запустить один manual
+   all-scope canary через `dag_backfill_espn`, передав в `scopes` exact frozen
+   target array из saved state ref/`male_registry_ref`; zero-row scope считается успешным лишь
    с exact signed manifest/checkpoint evidence, а не из-за отсутствия mapped
    output. Summary reuse также требует exact signed prior evidence. Затем
    подтвердить zero active leases и zero alerts. Только после этого

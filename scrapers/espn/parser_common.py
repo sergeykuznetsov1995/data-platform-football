@@ -122,5 +122,14 @@ def unknown_fields(value: Mapping[str, Any], known: Sequence[str]) -> dict[str, 
     return {str(key): item for key, item in value.items() if key not in known_set}
 
 
-def clipped_date(value: datetime, start: date, end: date) -> bool:
-    return start <= value.date() <= end
+def source_day_bounds(start: date, end: date) -> tuple[date, date]:
+    """Translate ESPN source-calendar bounds to their admissible UTC dates."""
+
+    minimum = max(date.min.toordinal(), start.toordinal() - 1)
+    maximum = min(date.max.toordinal(), end.toordinal() + 1)
+    return date.fromordinal(minimum), date.fromordinal(maximum)
+
+
+def source_day_contains(value: date, start: date, end: date) -> bool:
+    buffered_start, buffered_end = source_day_bounds(start, end)
+    return buffered_start <= value <= buffered_end

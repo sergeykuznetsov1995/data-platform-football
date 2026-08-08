@@ -355,7 +355,7 @@ def _selected_scopes(registry: Registry, mode: str, params: Mapping[str, Any]):
 def _bounded_daily_scopes(
     registry: Registry, heads: Mapping[str, ScopeHead]
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    """Select every established scope plus the first missing onboarding cohort."""
+    """Admit daily scheduling only after the manual all-scope migration."""
 
     target = tuple(
         sorted(
@@ -365,10 +365,50 @@ def _bounded_daily_scopes(
     )
     if len(target) > MAX_INGEST_SCOPE_MAP_ITEMS:
         raise OperationsError("daily ESPN target exceeds its static map bound")
-    established = tuple(scope for scope in target if scope in heads)
+    if len(target) != 181:
+        raise OperationsError("daily ESPN enablement requires the frozen 181 scopes")
     missing = tuple(scope for scope in target if scope not in heads)
-    bootstrap = missing[:DAILY_BOOTSTRAP_SCOPE_LIMIT]
-    return target, tuple(sorted((*established, *bootstrap))), bootstrap
+    extra = tuple(sorted(set(heads) - set(target)))
+    if missing or extra:
+        raise OperationsError(
+            "daily ESPN enablement requires 181/181 COMPLETE heads; "
+            f"missing={list(missing)}, extra={list(extra)}"
+        )
+    return target, target, ()
+
+
+def _require_scheduler_runtime_heads(
+    target: Sequence[str], heads: Mapping[str, ScopeHead]
+) -> None:
+    """Prove every scheduled head is an exact parser-v3/runtime-v4 snapshot."""
+
+    if len(target) != 181 or tuple(sorted(set(target))) != tuple(target):
+        raise OperationsError(
+            "scheduler runtime target must be 181 sorted unique scopes"
+        )
+    if set(heads) != set(target):
+        raise OperationsError("scheduler runtime gate requires exact 181/181 heads")
+    mismatches = []
+    for scope_id in target:
+        head = heads[scope_id]
+        try:
+            generation = runner.load_scope_snapshot(
+                head.snapshot_uri,
+                artifact_sha256=head.snapshot_sha256,
+                expected_scope_id=scope_id,
+            )
+        except Exception as exc:
+            raise OperationsError(
+                f"scheduler runtime head {scope_id} is not exact COMPLETE: {exc}"
+            ) from exc
+        identity = (generation.parser_version, generation.runtime_version)
+        if identity != (runner.PARSER_VERSION, runner.RUNTIME_VERSION):
+            mismatches.append((scope_id, *identity))
+    if mismatches:
+        raise OperationsError(
+            "scheduler enablement requires 181/181 parser-v3/runtime-v4 heads; "
+            f"mismatches={mismatches}"
+        )
 
 
 def _frozen_discovery_state_ref() -> dict[str, str] | None:
@@ -771,6 +811,7 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
     if mode == "daily":
         heads = store.read_scope_heads(target_scopes)
         target_scopes, scopes, bootstrap_scopes = _bounded_daily_scopes(registry, heads)
+        _require_scheduler_runtime_heads(target_scopes, heads)
     else:
         scopes = _selected_scopes(registry, mode, context.get("params") or {})
     if not scopes:
@@ -830,6 +871,7 @@ def _scope_binding(
         f"espn-generation-v1\x00{run_id}\x00{attempt}\x00{scope.scope_id}\x00{mode}".encode()
     ).hexdigest()
     prior = None
+    prior_generation = None
     known = []
     if head is not None:
         generation = runner.load_scope_snapshot(
@@ -839,6 +881,7 @@ def _scope_binding(
         )
         if generation.plan != scope:
             raise OperationsError("prior scope plan differs from promoted registry")
+        prior_generation = generation
         known = [
             {"event_id": row.event_id, "event_date": row.kickoff.date().isoformat()}
             for row in generation.schedule
@@ -867,6 +910,10 @@ def _scope_binding(
         "prior": prior,
     }
     typed = runner._scope_binding(binding, scope.scope_id)
+    runner._prior_parser_transition(
+        prior_generation,
+        full=runner._full_strategy(scope, typed, mode, as_of),
+    )
     requests = runner._scoreboard_requests(
         scope,
         typed,
@@ -2007,7 +2054,7 @@ def plan_summary_batch_wave(
                 mode=runner._effective_mode(loaded),
             )
         }
-        fetched = {}
+        parsed_pages = []
         raw_store = EspnRawStore.from_uri(descriptor["raw_store_uri"])
         for record in checkpoint["requests"]:
             request = request_plan.get(record["request_id"])
@@ -2020,11 +2067,8 @@ def plan_summary_batch_wave(
                 competition=competition,
                 edition=edition,
             )
-            for row in rows:
-                existing = fetched.get(row.event_id)
-                if existing is not None and existing != row:
-                    raise OperationsError("conflicting scoreboard event")
-                fetched[row.event_id] = row
+            parsed_pages.append((request, rows))
+        fetched, _winner = runner._merge_scoreboard_pages(parsed_pages)
         missing_known = sorted(
             item.event_id
             for item in loaded.bindings[scope.scope_id].known_nonterminal_events
@@ -2039,7 +2083,21 @@ def plan_summary_batch_wave(
             if typed_binding.prior is not None
             else None
         )
-        event_ids = runner.summary_refresh_event_ids(fetched.values(), prior)
+        full = runner._full_strategy(
+            scope,
+            typed_binding,
+            runner._effective_mode(loaded),
+            loaded.plan.as_of,
+        )
+        transition = runner._prior_parser_transition(prior, full=full)
+        effective_prior = (
+            runner._bridge_v2_prior(prior)
+            if transition == "v2-to-v3" and prior is not None
+            else prior
+        )
+        event_ids = runner.summary_refresh_event_ids(
+            fetched.values(), effective_prior
+        )
         planned = make_summary_batches(
             event_ids,
             run_id=loaded.plan.run_id,

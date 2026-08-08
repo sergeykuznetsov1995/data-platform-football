@@ -8,7 +8,7 @@ aliases.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 import hashlib
@@ -69,7 +69,10 @@ from .transport_contracts import (
 )
 
 
-RUNTIME_VERSION = "espn-native-runtime-v3"
+RUNTIME_VERSION = "espn-native-runtime-v4"
+LEGACY_PARSER_VERSION = "espn-native-parser-v2"
+LEGACY_RUNTIME_VERSION = "espn-native-runtime-v3"
+LEGACY_REPLAY_GIT_SHA = "e12b85a"
 PLAN_KIND = "espn-ingest-plan-v1"
 LEGACY_RAW_MANIFEST_KIND = "espn-raw-run-manifest-v1"
 RAW_MANIFEST_KIND = "espn-raw-run-manifest-v2"
@@ -1287,6 +1290,91 @@ def _parse_scoreboard_response(
     )
 
 
+def _scoreboard_owner_key(
+    row: ScheduleRow, request: ScoreboardRequest
+) -> tuple[int, date, date, str]:
+    event_day = row.kickoff.date()
+    if event_day < request.query_start:
+        distance = request.query_start.toordinal() - event_day.toordinal()
+    elif event_day > request.query_end:
+        distance = event_day.toordinal() - request.query_end.toordinal()
+    else:
+        distance = 0
+    return (
+        distance,
+        request.query_start,
+        request.query_end,
+        request.request_id,
+    )
+
+
+def _merge_scoreboard_pages(
+    pages: Iterable[tuple[ScoreboardRequest, Iterable[ScheduleRow]]],
+) -> tuple[dict[int, ScheduleRow], dict[int, str]]:
+    """Merge exact pages deterministically and assign one Raw owner per event."""
+
+    fetched: dict[int, ScheduleRow] = {}
+    owner_keys: dict[int, tuple[int, date, date, str]] = {}
+    winners: dict[int, str] = {}
+    for request, rows in pages:
+        for row in rows:
+            existing = fetched.get(row.event_id)
+            if existing is not None and existing != row:
+                raise ScopeIncompleteError(
+                    f"conflicting scoreboard event {row.event_id}"
+                )
+            candidate = _scoreboard_owner_key(row, request)
+            if existing is None or candidate < owner_keys[row.event_id]:
+                fetched[row.event_id] = row
+                owner_keys[row.event_id] = candidate
+                winners[row.event_id] = request.request_id
+    return fetched, winners
+
+
+def _prior_parser_transition(
+    prior: ScopeGeneration | None, *, full: bool
+) -> str:
+    if prior is None:
+        return "none"
+    identity = (prior.parser_version, prior.runtime_version)
+    if identity == (PARSER_VERSION, RUNTIME_VERSION):
+        return "current"
+    if identity == (LEGACY_PARSER_VERSION, LEGACY_RUNTIME_VERSION):
+        if full:
+            return "v2-to-v3"
+        raise RunnerConfigurationError(
+            "parser v2 to v3 compatibility requires a full reconciliation"
+        )
+    raise RunnerConfigurationError(
+        "unsupported ESPN parser/runtime transition "
+        f"{prior.parser_version}/{prior.runtime_version} -> "
+        f"{PARSER_VERSION}/{RUNTIME_VERSION}; exact v2 replay remains pinned to "
+        f"git {LEGACY_REPLAY_GIT_SHA}"
+    )
+
+
+def _bridge_v2_prior(prior: ScopeGeneration) -> ScopeGeneration:
+    """One-hop row-identity bridge; immutable Summary Raw provenance is retained."""
+
+    if (prior.parser_version, prior.runtime_version) != (
+        LEGACY_PARSER_VERSION,
+        LEGACY_RUNTIME_VERSION,
+    ):
+        raise RunnerConfigurationError("v2 to v3 bridge received a non-v2 prior")
+
+    def upgraded(rows):
+        return tuple(replace(row, parser_version=PARSER_VERSION) for row in rows)
+
+    return replace(
+        prior,
+        parser_version=PARSER_VERSION,
+        runtime_version=RUNTIME_VERSION,
+        schedule=upgraded(prior.schedule),
+        lineup=upgraded(prior.lineup),
+        matchsheet=upgraded(prior.matchsheet),
+    )
+
+
 def _preflight_request_budget(
     options: ExecutionOptions,
     loaded: LoadedPlan,
@@ -1903,6 +1991,7 @@ class _PreparedScoreboard:
     winner: Mapping[int, str]
     records: tuple[Mapping[str, Any], ...]
     noop_result: Mapping[str, Any] | None = None
+    parser_bridge: bool = False
 
 
 def _noop_scope_result(scope: ScopePlan, prior: ScopeGeneration) -> dict[str, Any]:
@@ -1931,6 +2020,9 @@ def _prepare_scope_scoreboard(
     raw_store: EspnRawStore | None,
     http_client: Any | None,
 ) -> _PreparedScoreboard:
+    mode = _effective_mode(loaded)
+    full = _full_strategy(scope, binding, mode, loaded.plan.as_of)
+    transition = _prior_parser_transition(prior, full=full)
     if not binding.active:
         if prior is None:
             raise RunnerConfigurationError(
@@ -1938,7 +2030,6 @@ def _prepare_scope_scoreboard(
             )
         return _PreparedScoreboard({}, {}, (), _noop_scope_result(scope, prior))
 
-    mode = _effective_mode(loaded)
     requests = _scoreboard_requests(scope, binding, as_of=loaded.plan.as_of, mode=mode)
     if not requests:
         if prior is None:
@@ -1974,8 +2065,7 @@ def _prepare_scope_scoreboard(
             )
             _persist_raw_manifest(loaded.raw_manifest_uri, raw_manifest)
 
-    fetched_by_event: dict[int, ScheduleRow] = {}
-    winner: dict[int, str] = {}
+    parsed_pages: list[tuple[ScoreboardRequest, tuple[ScheduleRow, ...]]] = []
     scoreboard_records: list[Mapping[str, Any]] = []
     for request, body, record in scoreboard_payloads:
         rows = _parse_scoreboard_response(
@@ -1984,15 +2074,9 @@ def _prepare_scope_scoreboard(
             competition=competition,
             edition=edition,
         )
-        for row in rows:
-            existing = fetched_by_event.get(row.event_id)
-            if existing is not None and existing != row:
-                raise ScopeIncompleteError(
-                    f"conflicting scoreboard event {row.event_id}"
-                )
-            fetched_by_event[row.event_id] = row
-            winner[row.event_id] = request.request_id
+        parsed_pages.append((request, rows))
         scoreboard_records.append(record)
+    fetched_by_event, winner = _merge_scoreboard_pages(parsed_pages)
     missing_known = sorted(
         event.event_id
         for event in binding.known_nonterminal_events
@@ -2002,7 +2086,6 @@ def _prepare_scope_scoreboard(
         raise ScopeIncompleteError(
             f"known non-terminal events absent from scoreboard: {missing_known}"
         )
-    full = _full_strategy(scope, binding, mode, loaded.plan.as_of)
     if not fetched_by_event and not full:
         assert prior is not None
         return _PreparedScoreboard({}, {}, (), _noop_scope_result(scope, prior))
@@ -2010,6 +2093,7 @@ def _prepare_scope_scoreboard(
         fetched_by_event=dict(fetched_by_event),
         winner=dict(winner),
         records=tuple(scoreboard_records),
+        parser_bridge=transition == "v2-to-v3",
     )
 
 
@@ -2042,18 +2126,27 @@ def _process_prepared_scope(
     replay = loaded.mode == "replay"
     raw_index = _raw_index(raw_manifest)
     full = _full_strategy(scope, binding, mode, loaded.plan.as_of)
+    effective_prior = (
+        _bridge_v2_prior(prior)
+        if prepared.parser_bridge and prior is not None
+        else prior
+    )
     if full:
         schedule_by_event = dict(fetched_by_event)
     else:
         schedule_by_event = (
-            {row.event_id: row for row in prior.schedule} if prior is not None else {}
+            {row.event_id: row for row in effective_prior.schedule}
+            if effective_prior is not None
+            else {}
         )
         schedule_by_event.update(fetched_by_event)
     schedule = tuple(
         sorted(schedule_by_event.values(), key=lambda row: (row.kickoff, row.event_id))
     )
 
-    refresh_event_ids = set(summary_refresh_event_ids(fetched_by_event.values(), prior))
+    refresh_event_ids = set(
+        summary_refresh_event_ids(fetched_by_event.values(), effective_prior)
+    )
     eligible = tuple(
         sorted(
             (
@@ -2104,9 +2197,11 @@ def _process_prepared_scope(
         )
 
     fetched_event_ids = set(fetched_by_event)
-    prior_lineup = prior.lineup if prior is not None else ()
-    prior_matchsheet = prior.matchsheet if prior is not None else ()
-    prior_dispositions = prior.dispositions if prior is not None else ()
+    prior_lineup = effective_prior.lineup if effective_prior is not None else ()
+    prior_matchsheet = effective_prior.matchsheet if effective_prior is not None else ()
+    prior_dispositions = (
+        effective_prior.dispositions if effective_prior is not None else ()
+    )
     retained_summary_event_ids = {
         event_id
         for event_id, event in schedule_by_event.items()
@@ -2123,10 +2218,10 @@ def _process_prepared_scope(
         if item.event_id in retained_summary_event_ids
     ]
     summary_ledger: list[RawLedgerRecord] = []
-    if prior is not None:
+    if effective_prior is not None:
         summary_ledger.extend(
             item
-            for item in prior.raw_ledger
+            for item in effective_prior.raw_ledger
             if item.endpoint == "summary"
             and item.event_id in retained_summary_event_ids
         )

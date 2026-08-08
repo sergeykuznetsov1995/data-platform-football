@@ -41,7 +41,9 @@ from scrapers.espn.repository import (
 from scrapers.espn.runner import (
     ArtifactConflictError,
     ExecutionOptions,
+    RUNTIME_VERSION,
     RunnerConfigurationError,
+    ScopeIncompleteError,
     execute,
     is_full_reconciliation_day,
     scope_snapshot_bytes,
@@ -348,7 +350,7 @@ def _prior_generation(
         registry_signature="a" * 64,
         plan_signature="b" * 64,
         parser_version=PARSER_VERSION,
-        runtime_version="espn-native-runtime-v2",
+        runtime_version=RUNTIME_VERSION,
         ingested_at=NOW - timedelta(days=1),
         batch_id="prior-batch",
         schedule=schedule,
@@ -394,6 +396,22 @@ def test_changed_or_new_final_event_refreshes_summary():
     assert summary_refresh_event_ids((event,), None) == (event.event_id,)
     assert summary_refresh_event_ids((event,), missing_summary) == (event.event_id,)
     assert summary_refresh_event_ids((event,), missing_disposition) == (event.event_id,)
+
+
+def _legacy_v2_generation(generation: ScopeGeneration) -> ScopeGeneration:
+    def legacy_rows(rows):
+        return tuple(
+            replace(row, parser_version="espn-native-parser-v2") for row in rows
+        )
+
+    return replace(
+        generation,
+        parser_version="espn-native-parser-v2",
+        runtime_version="espn-native-runtime-v3",
+        schedule=legacy_rows(generation.schedule),
+        lineup=legacy_rows(generation.lineup),
+        matchsheet=legacy_rows(generation.matchsheet),
+    )
 
 
 def _plan(
@@ -741,6 +759,103 @@ def test_initial_capture_splits_calendar_longer_than_supported_scoreboard_window
         == (scope.end_date - scope.start_date).days + 1
     )
     assert all(request.params["limit"] == 1000 for request in requests)
+
+
+@pytest.mark.unit
+def test_scoreboard_merge_is_order_invariant_and_binds_only_the_nearest_page() -> None:
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    body = _scoreboard(
+        competition,
+        edition,
+        event_date="2020-09-20T00:00Z",
+    )
+    pages = []
+    for day, request_id in (
+        (date(2020, 9, 19), "scoreboard:a"),
+        (date(2020, 9, 20), "scoreboard:b"),
+    ):
+        request = runner.ScoreboardRequest(
+            scope_id=competition.scope_id(edition),
+            url="https://example.invalid/scoreboard",
+            params={"dates": day.strftime("%Y%m%d"), "limit": 1000},
+            query_start=day,
+            query_end=day,
+            request_id=request_id,
+        )
+        rows = runner._parse_scoreboard_response(
+            body,
+            request=request,
+            competition=competition,
+            edition=edition,
+        )
+        pages.append((request, rows))
+
+    first = runner._merge_scoreboard_pages(pages)
+    reversed_result = runner._merge_scoreboard_pages(reversed(pages))
+
+    assert first == reversed_result
+    fetched, winner = first
+    assert tuple(fetched) == (401000001,)
+    assert winner == {401000001: "scoreboard:b"}
+    records = tuple(
+        {
+            "request_id": request.request_id,
+            "endpoint": "scoreboard",
+            "event_id": None,
+            "raw_uri": f"s3://raw/{request.request_id}.json.gz",
+            "raw_sha256": hashlib.sha256(request.request_id.encode()).hexdigest(),
+            "fetched_at": NOW.isoformat(),
+            "direct_bytes": 100,
+            "proxy_bytes": 0,
+        }
+        for request, _rows in pages
+    )
+    ledger = runner._merge_scoreboard_ledger(
+        None,
+        full=True,
+        fetched_event_ids=set(fetched),
+        records=records,
+        winner=winner,
+    )
+    assert {item.request_id: item.event_ids for item in ledger} == {
+        "scoreboard:a": (),
+        "scoreboard:b": (401000001,),
+    }
+
+
+@pytest.mark.unit
+def test_scoreboard_merge_fails_closed_on_conflicting_equal_event_ids() -> None:
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    request = runner.ScoreboardRequest(
+        scope_id=competition.scope_id(edition),
+        url="https://example.invalid/scoreboard",
+        params={"dates": "20200920", "limit": 1000},
+        query_start=date(2020, 9, 20),
+        query_end=date(2020, 9, 20),
+        request_id="scoreboard:a",
+    )
+    row = parse_scoreboards(
+        _scoreboard(competition, edition, event_date="2020-09-20T00:00Z"),
+        competition=competition,
+        edition=edition,
+        query_start=request.query_start,
+        query_end=request.query_end,
+    )[0]
+
+    with pytest.raises(ScopeIncompleteError, match="conflicting scoreboard event"):
+        runner._merge_scoreboard_pages(
+            (
+                (request, (row,)),
+                (
+                    replace(request, request_id="scoreboard:b"),
+                    (replace(row, home_score=9),),
+                ),
+            )
+        )
 
 
 @pytest.mark.unit
@@ -1361,6 +1476,106 @@ def test_unchanged_final_event_reuses_prior_summary_during_execution(tmp_path):
         item for item in generation.raw_ledger if item.endpoint == "summary"
     ) == tuple(item for item in prior.raw_ledger if item.endpoint == "summary")
     assert validate_scope_generation(generation).passed
+
+
+@pytest.mark.unit
+def test_full_reconciliation_bridges_v2_rows_and_reuses_exact_summary_raw(tmp_path):
+    competition, edition = _competition()
+    legacy = _legacy_v2_generation(_prior_generation(competition, edition))
+    scope_id = competition.scope_id(edition)
+    options, _ = _plan(
+        tmp_path,
+        "backfill",
+        ((competition, edition),),
+        initial_capture=False,
+        priors={scope_id: legacy},
+    )
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store,
+        {competition.slug: _scoreboard(competition, edition)},
+    )
+    repository = FakeRepository()
+
+    result = execute(
+        options, repository=repository, raw_store=raw_store, http_client=client
+    )
+
+    assert result.exit_code == 0
+    generation = repository.generations[0]
+    assert (generation.parser_version, generation.runtime_version) == (
+        "espn-native-parser-v3",
+        "espn-native-runtime-v4",
+    )
+    assert all(
+        row.parser_version == generation.parser_version
+        for entity in (generation.schedule, generation.lineup, generation.matchsheet)
+        for row in entity
+    )
+    assert all(call[1] is not EndpointType.SUMMARY for call in client.calls)
+    assert tuple(
+        (item.event_id, item.raw_uri, item.raw_sha256)
+        for item in generation.raw_ledger
+        if item.endpoint == "summary"
+    ) == tuple(
+        (item.event_id, item.raw_uri, item.raw_sha256)
+        for item in legacy.raw_ledger
+        if item.endpoint == "summary"
+    )
+    assert validate_scope_generation(generation).passed
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("active", [True, False])
+def test_partial_daily_and_noop_reject_v2_to_v3_bridge_before_http(
+    tmp_path, active
+):
+    competition, edition = _competition()
+    legacy = _legacy_v2_generation(_prior_generation(competition, edition))
+    scope_id = competition.scope_id(edition)
+    as_of = date(2020, 9, 20)
+    while is_full_reconciliation_day(scope_id, as_of):
+        as_of += timedelta(days=1)
+    options, _ = _plan(
+        tmp_path,
+        "daily",
+        ((competition, edition),),
+        as_of=as_of,
+        initial_capture=False,
+        priors={scope_id: legacy},
+        active={scope_id: active},
+    )
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store,
+        {competition.slug: _scoreboard(competition, edition)},
+    )
+
+    with pytest.raises(
+        RunnerConfigurationError, match="requires a full reconciliation"
+    ):
+        execute(
+            options,
+            repository=FakeRepository(),
+            raw_store=raw_store,
+            http_client=client if active else None,
+        )
+
+    assert client.calls == []
+
+
+@pytest.mark.unit
+def test_unknown_parser_runtime_transition_points_exact_v2_replay_to_e12b85a():
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    prior = replace(
+        _prior_generation(competition, edition),
+        runtime_version="espn-native-runtime-v3",
+    )
+
+    with pytest.raises(RunnerConfigurationError, match="e12b85a"):
+        runner._prior_parser_transition(prior, full=True)
 
 
 @pytest.mark.unit

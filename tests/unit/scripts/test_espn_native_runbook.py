@@ -85,6 +85,10 @@ def test_runbook_contracts_automatic_all_male_rollout_and_reversal():
         'state["male_registry_ref"]',
         '"MALE": 181, "FEMALE": 38, "UNKNOWN": 1',
         "пока обе переменные атомарно не удалены или не заменены",
+        "181/181 v3/v4 heads",
+        "espn-native-parser-v3",
+        "espn-native-runtime-v4",
+        "e12b85a",
     ):
         assert required in text
 

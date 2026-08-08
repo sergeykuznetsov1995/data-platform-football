@@ -31,6 +31,7 @@ from scrapers.espn.parsers import (
     parse_soccer_dropdown_bytes,
     parse_summary,
 )
+from scrapers.espn.parser_common import source_day_bounds
 
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "espn"
@@ -538,6 +539,106 @@ def test_event_season_identity_and_exact_edition_window_remove_contamination(
     )
 
     assert [row.event_id for row in rows] == [401000001]
+
+
+@pytest.mark.unit
+def test_aug_5_leagues_cup_source_day_keeps_aug_6_utc_kickoffs() -> None:
+    payload = _load("native_scoreboard.json")
+    template = payload["events"][0]
+    event_ids = (401863559, 401863560, 401863562, 401863563, 401863564)
+    payload["events"] = []
+    for event_id in event_ids:
+        event = deepcopy(template)
+        event["id"] = str(event_id)
+        event["date"] = "2026-08-06T00:00Z"
+        event["season"]["year"] = 2026
+        payload["events"].append(event)
+    payload["leagues"][0].update(id="19425", slug="concacaf.leagues.cup")
+    competition, edition = _scope(
+        espn_id=19425,
+        slug="concacaf.leagues.cup",
+        year=2026,
+        start=date(2026, 1, 1),
+        end=date(2026, 12, 31),
+    )
+
+    rows = parse_scoreboards(
+        _raw(payload),
+        competition=competition,
+        edition=edition,
+        query_start=date(2026, 8, 5),
+        query_end=date(2026, 8, 5),
+    )
+
+    assert tuple(row.event_id for row in rows) == event_ids
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("kickoff", "admitted"),
+    [
+        ("2026-08-04T23:59Z", True),
+        ("2026-08-05T12:00Z", True),
+        ("2026-08-06T00:00Z", True),
+        ("2026-08-03T23:59Z", False),
+        ("2026-08-07T00:00Z", False),
+    ],
+)
+def test_source_calendar_day_buffer_is_exactly_one_utc_day(
+    kickoff: str, admitted: bool
+) -> None:
+    payload = _load("native_scoreboard.json")
+    payload["events"][0]["date"] = kickoff
+    payload["events"][0]["season"]["year"] = 2026
+    competition, edition = _scope(
+        year=2026,
+        start=date(2026, 8, 5),
+        end=date(2026, 8, 5),
+    )
+
+    rows = parse_scoreboards(
+        _raw(payload),
+        competition=competition,
+        edition=edition,
+        query_start=date(2026, 8, 5),
+        query_end=date(2026, 8, 5),
+    )
+
+    assert bool(rows) is admitted
+
+
+@pytest.mark.unit
+def test_source_calendar_buffer_is_ordinal_safe_at_date_sentinels() -> None:
+    assert source_day_bounds(date.min, date.min) == (
+        date.min,
+        date.min + date.resolution,
+    )
+    assert source_day_bounds(date.max, date.max) == (
+        date.max - date.resolution,
+        date.max,
+    )
+
+
+@pytest.mark.unit
+def test_source_calendar_buffer_never_weakens_source_season_identity() -> None:
+    payload = _load("native_scoreboard.json")
+    payload["events"][0]["date"] = "2026-08-06T00:00Z"
+    payload["events"][0]["season"]["year"] = 2025
+    competition, edition = _scope(
+        year=2026,
+        start=date(2026, 8, 5),
+        end=date(2026, 8, 5),
+    )
+
+    rows = parse_scoreboards(
+        _raw(payload),
+        competition=competition,
+        edition=edition,
+        query_start=date(2026, 8, 5),
+        query_end=date(2026, 8, 5),
+    )
+
+    assert rows == ()
 
 
 @pytest.mark.unit

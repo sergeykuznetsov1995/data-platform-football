@@ -32,6 +32,7 @@ from .models import (
     RequestDisposition,
     ScopePlan,
 )
+from .parser_common import source_day_contains
 from .parser_contracts import LineupRow, MatchsheetRow, ScheduleRow
 from .selection import (
     CURRENT_MANIFEST_ORDER_FIELDS,
@@ -1054,10 +1055,10 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
             failures.append("schedule competition slug conflicts with exact scope")
         if row.game_id != row.event_id:
             failures.append("schedule game_id must equal native event_id")
-        if (
-            not scope.start_date
-            <= row.kickoff.astimezone(timezone.utc).date()
-            <= scope.end_date
+        if not source_day_contains(
+            row.kickoff.astimezone(timezone.utc).date(),
+            scope.start_date,
+            scope.end_date,
         ):
             failures.append("edition window excludes schedule event")
         if row.date != row.kickoff or row.match_date != row.kickoff:
