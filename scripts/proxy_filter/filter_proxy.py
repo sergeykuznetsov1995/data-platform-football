@@ -1216,16 +1216,32 @@ _ACTIVE_PROVIDER_READERS = 0
 _RESERVATION_TURNOVER_WAITERS: set[asyncio.Future] = set()
 
 
+def _lease_has_active_operations(lease: Lease) -> bool:
+    """Return whether code can still mutate a lease's byte lifecycle."""
+
+    return bool(
+        lease.active_tunnels
+        or lease.active_provider_readers
+        or lease.pending_client_hellos
+        or lease.staged_client_bytes
+    )
+
+
+def _lease_has_active_lifecycle(lease: Lease) -> bool:
+    """Return whether a lease still owns I/O or unsettled byte allowance."""
+
+    return bool(
+        _lease_has_active_operations(lease)
+        or lease.reserved_bytes
+        or lease.provider_reserved_bytes
+    )
+
+
 def _lease_has_durable_terminal(lease: Lease) -> bool:
     if (
         not lease.closed
         or not lease.close_recorded
-        or lease.active_tunnels
-        or lease.reserved_bytes
-        or lease.active_provider_readers
-        or lease.provider_reserved_bytes
-        or lease.pending_client_hellos
-        or lease.staged_client_bytes
+        or _lease_has_active_lifecycle(lease)
         or lease.global_budget_escrow_bytes
         or lease.accounting_uncertain
     ):
@@ -3211,8 +3227,7 @@ def _create_lease(
         for item in LEASES.values()
         if (
             (not item.closed and not item.expired)
-            or item.active_tunnels > 0
-            or item.reserved_bytes > 0
+            or _lease_has_active_lifecycle(item)
             or item.global_budget_escrow_bytes > 0
         )
     ]
@@ -4994,8 +5009,9 @@ def _reap_expired_leases() -> int:
                     pass
             if (
                 lease.source not in {"sofascore", "whoscored"}
-                and lease.active_tunnels == 0
+                and not _lease_has_active_operations(lease)
                 and lease.reserved_bytes > 0
+                and lease.provider_reserved_bytes <= lease.reserved_bytes
                 and not lease.paid_ledger_uncertain
             ):
                 # The retained reservation is the in-process upper bound of
@@ -5016,6 +5032,10 @@ def _reap_expired_leases() -> int:
                     )
                 else:
                     _release_lease_reservation(lease, retained)
+                    # No reader or writer still owns this allowance. It has
+                    # just been conservatively charged in full, so its
+                    # provider-specific mirror is settled as well.
+                    lease.provider_reserved_bytes = 0
                     log.warning(
                         "uncertain lease %s: charged %d unproven provider "
                         "bytes conservatively; concurrency slot released",
@@ -5024,7 +5044,8 @@ def _reap_expired_leases() -> int:
                     )
             if (
                 lease.source == "sofascore"
-                and lease.active_tunnels == 0
+                and not _lease_has_active_operations(lease)
+                and lease.provider_reserved_bytes <= lease.reserved_bytes
                 and not lease.allocation_finished
                 and lease.workload_plan is not None
                 and lease.allocation_claim is not None
@@ -5081,7 +5102,7 @@ def _reap_expired_leases() -> int:
             continue
         if not lease.expired:
             continue
-        if lease.active_tunnels or lease.reserved_bytes:
+        if _lease_has_active_lifecycle(lease):
             # TTL is a wall-clock data-plane boundary, not merely a refusal for
             # the next chunk. Force-close orphan browser/provider sockets now.
             # A provider StreamReader can contain unobservable read-ahead, so

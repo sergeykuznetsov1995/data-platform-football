@@ -9,7 +9,12 @@ from scrapers.fbref.camoufox_fetch import (
     CamoufoxFbrefTransport,
     GEOIP_BYTE_RESERVATION_BYTES,
 )
-from scrapers.fbref.fetcher import FBrefFetcher, FetchError, FetchResponse
+from scrapers.fbref.fetcher import (
+    PERSISTENT_SESSION_MAX_AGE_SECONDS,
+    FBrefFetcher,
+    FetchError,
+    FetchResponse,
+)
 from scrapers.fbref.proxy_lease import (
     FBrefLeaseStats,
     FBrefProxyLease,
@@ -22,6 +27,7 @@ CONTEXT = {
     "dag_id": "dag_ingest_fbref",
     "run_id": "control-run",
     "task_id": "run_live_waves",
+    "scope": "worker-0",
     "canonical_url": "https://fbref.com/en/",
 }
 
@@ -611,6 +617,21 @@ def test_live_provider_context_cannot_fall_back_to_direct(monkeypatch):
         )
 
 
+def test_live_provider_context_requires_scope_before_any_lease():
+    incomplete = dict(CONTEXT)
+    incomplete.pop("scope")
+    client = _LeaseClient([])
+
+    with pytest.raises(FBrefProxyLeaseError, match="complete run provenance"):
+        FBrefFetcher(
+            provider_context=incomplete,
+            provider_max_bytes=1000,
+            lease_client=client,
+        )
+
+    assert client.acquired == []
+
+
 def test_persistent_session_reuses_http_and_emits_idle_page_deltas():
     client = _LeaseClient([100, 150, 160])
     fetcher = FBrefFetcher(
@@ -734,6 +755,54 @@ def test_persistent_rollover_uses_the_prior_aggregate_as_its_new_baseline():
     assert second_receipt.tail_provider_bytes == 10
     assert fetcher._provider_total_bytes == 170
     assert client.events.count("close_strict") == 2
+
+
+def test_persistent_session_rolls_before_the_provider_lease_deadline():
+    now = [100.0]
+    fetcher = FBrefFetcher(
+        proxy_file="/credentials/must-not-be-read.txt",
+        provider_context=CONTEXT,
+        provider_max_bytes=1000,
+        provider_lease_ttl_seconds=7200,
+        lease_client=_LeaseClient([]),
+        persistent_http_session=True,
+        monotonic=lambda: now[0],
+    )
+
+    fetcher.begin_metered_session("session-deadline")
+    now[0] += PERSISTENT_SESSION_MAX_AGE_SECONDS - 0.001
+    assert fetcher.persistent_session_rollover_due() is False
+
+    now[0] += 0.001
+    assert fetcher.persistent_session_rollover_due() is True
+    assert PERSISTENT_SESSION_MAX_AGE_SECONDS == 115 * 60
+    assert PERSISTENT_SESSION_MAX_AGE_SECONDS < 7200
+
+
+def test_shrunk_browser_budget_keeps_prior_provider_spend_in_next_cap():
+    client = _LeaseClient([300])
+    fetcher = FBrefFetcher(
+        proxy_file="/credentials/must-not-be-read.txt",
+        provider_context=CONTEXT,
+        provider_max_bytes=1000,
+        lease_client=client,
+        persistent_http_session=True,
+    )
+    fetcher._transport = MagicMock()
+
+    fetcher.begin_metered_session("session-before-shrink")
+    fetcher._next_proxy()
+    fetcher.finalize_metered_session()
+    fetcher.reconfigure_clearance_limits(
+        max_browser_requests=4,
+        max_browser_bytes=800,
+    )
+    fetcher.begin_metered_session("session-after-shrink")
+    fetcher._next_proxy()
+
+    assert fetcher._provider_total_bytes == 300
+    assert client.acquired[0][0] == 1000
+    assert client.acquired[1][0] == 700
 
 
 def test_persistent_finalizer_failure_keeps_provider_ownership():

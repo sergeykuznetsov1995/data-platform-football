@@ -16,6 +16,7 @@ CONTEXT = {
     "dag_id": "dag_ingest_fbref",
     "run_id": "control-run",
     "task_id": "run_live_waves",
+    "scope": "worker-0",
     "canonical_url": "https://fbref.com/en/",
 }
 
@@ -56,6 +57,9 @@ def _stats_body(**overrides):
         "source": "fbref",
         "dag_id": "dag_ingest_fbref",
         "run_id": "control-run",
+        "task_id": "run_live_waves",
+        "scope": "worker-0",
+        "canonical_url": "https://fbref.com/en/",
         "up_bytes": 40,
         "down_bytes": 60,
         "total_bytes": 100,
@@ -465,6 +469,47 @@ def test_wait_idle_requires_two_identical_open_tunnel_samples():
     assert [call[0] for call in session.calls] == ["POST", "GET", "GET"]
 
 
+@pytest.mark.parametrize(
+    "field",
+    ["source", "dag_id", "run_id", "task_id", "canonical_url", "scope"],
+)
+@pytest.mark.parametrize("mutation", ["missing", "changed"])
+def test_wait_idle_rejects_changed_provenance_in_either_stable_probe(
+    field, mutation
+):
+    stable = _stats_body(
+        active_tunnels=1,
+        active_provider_readers=1,
+        reserved_bytes=64,
+        provider_reserved_bytes=64,
+    )
+    second = dict(stable)
+    if mutation == "missing":
+        second.pop(field)
+    else:
+        second[field] = f"changed-{field}"
+    session = _Session(
+        [
+            _Response(201, _lease_body()),
+            _Response(200, stable),
+            _Response(200, second),
+        ]
+    )
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+        sleep=lambda _seconds: None,
+        monotonic=lambda: 0.0,
+    )
+    lease = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+
+    with pytest.raises(FBrefProxyLeaseError, match="schema|provenance"):
+        client.wait_idle(lease, expected=CONTEXT, expected_tunnels=1)
+
+    assert [call[0] for call in session.calls] == ["POST", "GET", "GET"]
+
+
 def test_zero_tunnel_idle_proof_rejects_any_observed_reservation():
     reserved = _stats_body(
         reserved_bytes=64,
@@ -572,6 +617,29 @@ def test_close_strict_accepts_only_zero_lifecycle_fields():
 
     assert stats.total_bytes == 125
     assert stats.close_complete is True
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["source", "dag_id", "run_id", "task_id", "canonical_url", "scope"],
+)
+@pytest.mark.parametrize("mutation", ["missing", "changed"])
+def test_close_strict_rejects_missing_or_changed_full_provenance(field, mutation):
+    final = _stats_body(closed=True, close_complete=True)
+    if mutation == "missing":
+        final.pop(field)
+    else:
+        final[field] = f"changed-{field}"
+    session = _Session([_Response(201, _lease_body()), _Response(200, final)])
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+    )
+    lease = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+
+    with pytest.raises(FBrefProxyLeaseError, match="schema|provenance"):
+        client.close_strict(lease, expected=CONTEXT)
 
 
 def test_wait_drained_rejects_uncertain_or_hidden_provider_work():

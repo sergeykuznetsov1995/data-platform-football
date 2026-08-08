@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field, replace
@@ -38,6 +39,12 @@ DEFAULT_BROWSER_BYTE_LIMIT = DEFAULT_BROWSER_BYTE_LIMIT_BYTES
 MAX_TARGET_HTTP_ATTEMPTS = 2
 RETRYABLE_HTTP_STATUSES = frozenset({500, 502, 503, 504})
 DEFAULT_STATUS_RETRY_DELAY_SECONDS = DEFAULT_DOMAIN_INTERVAL_SECONDS
+# Decodo and the local provider lease are both bounded to 120 minutes in the
+# production profile.  Stop admitting pages five minutes earlier so curl,
+# strict provider close, and durable tail settlement complete before either
+# deadline can expire.
+PERSISTENT_SESSION_MAX_AGE_SECONDS = 115 * 60
+_PERSISTENT_SESSION_CLOSE_MARGIN_SECONDS = 5 * 60
 _FAILURE_EVIDENCE_HEADERS = (
     "content-type",
     "content-length",
@@ -316,6 +323,7 @@ class FBrefFetcher:
         lease_client: Optional[FBrefProxyLeaseClient] = None,
         persistent_http_session: bool = False,
         sleep=time.sleep,
+        monotonic=time.monotonic,
     ) -> None:
         self.bootstrap_url = bootstrap_url
         self.max_html_bytes = int(max_html_bytes)
@@ -332,6 +340,9 @@ class FBrefFetcher:
         self.max_target_http_attempts = attempts
         self.status_retry_delay_seconds = retry_delay
         self._sleep = sleep
+        if not callable(monotonic):
+            raise ValueError("monotonic must be callable")
+        self._monotonic = monotonic
         self._max_browser_requests = int(max_browser_requests)
         self._max_browser_bytes = int(max_browser_bytes)
         if self._max_browser_requests <= 0 or self._max_browser_bytes <= 0:
@@ -353,6 +364,7 @@ class FBrefFetcher:
         self._persistent_baseline_provider_bytes = 0
         self._persistent_page_cursor = 0
         self._persistent_page_provider_bytes = 0
+        self._persistent_session_deadline: Optional[float] = None
         self._persistent_receipt: Optional[
             PersistentMeteredSessionReceipt
         ] = None
@@ -381,7 +393,13 @@ class FBrefFetcher:
                     control_token=proxy_control_token,
                 )
             context = dict(provider_context or {})
-            required = ("dag_id", "run_id", "task_id", "canonical_url")
+            required = (
+                "dag_id",
+                "run_id",
+                "task_id",
+                "canonical_url",
+                "scope",
+            )
             if not all(str(context.get(name) or "").strip() for name in required):
                 raise FBrefProxyLeaseError(
                     "FBref paid proxy requires complete run provenance"
@@ -395,6 +413,13 @@ class FBrefFetcher:
             )
             if maximum <= 0 or ttl <= 0:
                 raise ValueError("FBref paid proxy byte and TTL caps must be positive")
+            if (
+                self.persistent_http_session
+                and ttl <= _PERSISTENT_SESSION_CLOSE_MARGIN_SECONDS
+            ):
+                raise ValueError(
+                    "FBref persistent provider TTL must leave time for strict close"
+                )
             self._lease_client = lease_client
             self._provider_context = context
             self._provider_max_bytes = maximum
@@ -481,6 +506,59 @@ class FBrefFetcher:
         # rotations inside one transport cumulative, but do not carry the old
         # phase's spend into the newly reserved transport.
         self._provider_bootstrap_spent_bytes = 0
+        self._bootstrap_stats = None
+        self._clearance = None
+        self._transport = self._create_transport()
+
+    def reconfigure_clearance_limits(
+        self,
+        *,
+        max_browser_requests: int,
+        max_browser_bytes: int,
+    ) -> None:
+        """Rebuild the browser without forgetting authenticated provider spend."""
+
+        requests = int(max_browser_requests)
+        bytes_ = int(max_browser_bytes)
+        if requests <= 0 or bytes_ <= 0:
+            raise ValueError("browser request/byte limits must be positive")
+        if (
+            self.persistent_http_session
+            and self._persistent_session_id is not None
+            and self._persistent_receipt is None
+        ):
+            raise FBrefProxyLeaseError(
+                "FBref persistent session must be finalized before reconfigure"
+            )
+
+        close_error = None
+        if self._http_session is not None:
+            try:
+                self._http_session.close()
+            except Exception as exc:  # noqa: BLE001 - revoke provider too
+                close_error = exc
+            finally:
+                self._http_session = None
+        if self._transport is not None:
+            try:
+                self._transport.close()
+            except Exception as exc:  # noqa: BLE001 - revoke provider too
+                close_error = close_error or exc
+        try:
+            self._close_provider_lease()
+        except Exception as exc:  # noqa: BLE001 - retain exact ownership error
+            close_error = close_error or exc
+        if close_error is not None:
+            raise close_error
+
+        self._max_browser_requests = requests
+        self._max_browser_bytes = bytes_
+        provider_remaining = max(
+            0, self._provider_max_bytes - self._provider_total_bytes
+        )
+        self._provider_bootstrap_max_bytes = min(provider_remaining, bytes_)
+        self._provider_bootstrap_spent_bytes = 0
+        self._provider_http_ready = False
         self._bootstrap_stats = None
         self._clearance = None
         self._transport = self._create_transport()
@@ -713,7 +791,42 @@ class FBrefFetcher:
         self._persistent_page_cursor = baseline
         self._persistent_page_provider_bytes = 0
         self._persistent_receipt = None
+        started_at = float(self._monotonic())
+        if not math.isfinite(started_at):
+            raise FBrefProxyLeaseError(
+                "FBref persistent monotonic clock is invalid"
+            )
+        safe_age = min(
+            PERSISTENT_SESSION_MAX_AGE_SECONDS,
+            self._provider_lease_ttl_seconds
+            - _PERSISTENT_SESSION_CLOSE_MARGIN_SECONDS,
+        )
+        if safe_age <= 0:
+            raise FBrefProxyLeaseError(
+                "FBref persistent provider TTL has no safe local lifetime"
+            )
+        self._persistent_session_deadline = started_at + safe_age
         return baseline
+
+    def persistent_session_rollover_due(self) -> bool:
+        """Return true before the current provider/sticky lifetime expires."""
+
+        if (
+            self._persistent_session_id is None
+            or self._persistent_receipt is not None
+        ):
+            return False
+        deadline = self._persistent_session_deadline
+        if deadline is None or not math.isfinite(deadline):
+            raise FBrefProxyLeaseError(
+                "FBref persistent session deadline is unavailable"
+            )
+        now = float(self._monotonic())
+        if not math.isfinite(now):
+            raise FBrefProxyLeaseError(
+                "FBref persistent monotonic clock is invalid"
+            )
+        return now >= deadline
 
     def _persistent_page_checkpoint(self, *, close_tunnel: bool) -> int:
         if (
@@ -1756,6 +1869,7 @@ __all__ = [
     "FetchResponse",
     "MAX_HTML_BYTES",
     "MAX_TARGET_HTTP_ATTEMPTS",
+    "PERSISTENT_SESSION_MAX_AGE_SECONDS",
     "PersistentMeteredSessionReceipt",
     "RETRYABLE_HTTP_STATUSES",
 ]

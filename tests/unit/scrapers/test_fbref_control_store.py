@@ -100,6 +100,60 @@ def test_domain_throttle_default_cannot_bypass_the_source_minimum():
         )
 
 
+def test_open_clearance_session_locks_running_run_before_insert():
+    run_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4())
+    expires_at = datetime(2026, 8, 8, tzinfo=timezone.utc)
+
+    def handler(sql, params):
+        if (
+            "SELECT status FROM fbref_control.crawl_run" in sql
+            and "FOR UPDATE" in sql
+        ):
+            return [{"status": "running"}], 1
+        if "INSERT INTO fbref_control.clearance_session" in sql:
+            return [], 1
+        if "FROM fbref_control.clearance_session" in sql:
+            return [
+                {
+                    "run_id": run_id,
+                    "domain": "fbref.com",
+                    "session_version": "persistent-v1",
+                    "expires_at": expires_at,
+                }
+            ], 1
+        return [], 0
+
+    factory = FakeFactory(handler)
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=factory,
+    )
+
+    assert store.open_clearance_session(
+        domain="fbref.com",
+        session_version="persistent-v1",
+        expires_at=expires_at,
+        run_id=run_id,
+        session_id=session_id,
+    ) == session_id
+
+    statements = factory.connections[0].fake_cursor.executions
+    run_lock_index = next(
+        index
+        for index, (sql, _params) in enumerate(statements)
+        if "SELECT status FROM fbref_control.crawl_run" in sql
+    )
+    insert_index = next(
+        index
+        for index, (sql, _params) in enumerate(statements)
+        if "INSERT INTO fbref_control.clearance_session" in sql
+    )
+    assert "FOR UPDATE" in statements[run_lock_index][0]
+    assert statements[run_lock_index][1] == (run_id,)
+    assert run_lock_index < insert_index
+
+
 def test_control_uri_prefers_explicit_and_normalizes_airflow_driver():
     assert resolve_control_db_uri(
         {

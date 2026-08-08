@@ -56,6 +56,9 @@ class FBrefLeaseStats:
     reserved_bytes: int
     closed: bool
     budget_exceeded: bool
+    task_id: str = ""
+    canonical_url: str = ""
+    scope: str = ""
     active_provider_readers: int = 0
     provider_reserved_bytes: int = 0
     pending_client_hellos: int = 0
@@ -259,6 +262,32 @@ class FBrefProxyLeaseClient:
         *,
         expected: Mapping[str, Any],
     ) -> FBrefLeaseStats:
+        provenance_fields = (
+            "source",
+            "dag_id",
+            "run_id",
+            "task_id",
+            "canonical_url",
+            "scope",
+        )
+        if any(
+            name not in value
+            or not isinstance(value[name], str)
+            or not value[name]
+            for name in provenance_fields
+        ):
+            raise FBrefProxyLeaseError(
+                "FBref proxy meter stats schema mismatch"
+            )
+        if any(
+            name not in expected
+            or not isinstance(expected[name], str)
+            or not expected[name]
+            for name in provenance_fields
+        ):
+            raise FBrefProxyLeaseError(
+                "FBref proxy meter stats failed provenance validation"
+            )
         boolean_fields = (
             "closed",
             "expired",
@@ -309,6 +338,9 @@ class FBrefProxyLeaseClient:
                 source=str(value["source"]),
                 dag_id=str(value["dag_id"]),
                 run_id=str(value["run_id"]),
+                task_id=str(value["task_id"]),
+                canonical_url=str(value["canonical_url"]),
+                scope=str(value["scope"]),
                 up_bytes=up,
                 down_bytes=down,
                 active_tunnels=active,
@@ -343,8 +375,7 @@ class FBrefProxyLeaseClient:
             or (stats.close_complete and not stats.closed)
             or stats.lease_id != lease.lease_id
             or stats.source != "fbref"
-            or stats.dag_id != str(expected.get("dag_id") or "")
-            or stats.run_id != str(expected.get("run_id") or "")
+            or any(value[name] != expected[name] for name in provenance_fields)
             or str(value.get("meter") or "") != METER_ID
         ):
             raise FBrefProxyLeaseError(
@@ -472,6 +503,9 @@ class FBrefProxyLeaseClient:
             stats.source,
             stats.dag_id,
             stats.run_id,
+            stats.task_id,
+            stats.canonical_url,
+            stats.scope,
             stats.up_bytes,
             stats.down_bytes,
             stats.active_tunnels,

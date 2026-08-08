@@ -705,6 +705,38 @@ class _LiveFetchSession:
         self.tail_reserved = True
         self.state = "active"
 
+    def rollover_if_due(self, control) -> bool:
+        """Finalize one exact session before its paid lease can expire."""
+
+        if (
+            not self.persistent_enabled
+            or self.fetcher is None
+            or self.session_id is None
+            or self.state != "active"
+        ):
+            return False
+        due = getattr(
+            self.fetcher, "persistent_session_rollover_due", None
+        )
+        if not callable(due):
+            raise PipelineError(
+                "FBref persistent fetcher must expose rollover deadline"
+            )
+        if not bool(due()):
+            return False
+
+        # This ordering is the paid-traffic fence: strict provider close,
+        # durable tail settlement, and control close all finish before reset
+        # can prepare a browser that may ask for the next provider lease.
+        self.finalize(control, status="closed")
+        reset = getattr(self.fetcher, "reset_clearance", None)
+        if not callable(reset):
+            raise PipelineError(
+                "FBref persistent fetcher must reset after rollover"
+            )
+        reset()
+        return True
+
     def finalize(self, control, *, status: str) -> None:
         if not self.persistent_enabled:
             try:
@@ -2517,6 +2549,12 @@ class FBrefPipeline:
                             result.recovered_from_raw += 1
                             continue
 
+                    if live_session.rollover_if_due(self.control):
+                        logger.info(
+                            "FBref persistent session reached its safe local "
+                            "lifetime; exact tail settled before rollover"
+                        )
+
                     (
                         clearance_requests,
                         clearance_bytes,
@@ -2937,8 +2975,29 @@ class FBrefPipeline:
                             "reset_clearance",
                             None,
                         )
-                        if callable(reset) and not clearance_downgraded:
+                        reconfigure = getattr(
+                            live_session.fetcher,
+                            "reconfigure_clearance_limits",
+                            None,
+                        )
+                        if clearance_downgraded and callable(reconfigure):
+                            # Preserve the fetcher's cumulative authenticated
+                            # provider counter while rebuilding Camoufox with
+                            # the smaller browser allowance.
+                            reconfigure(
+                                max_browser_requests=allowed_requests,
+                                max_browser_bytes=allowed_bytes,
+                            )
+                        elif callable(reset) and not clearance_downgraded:
                             reset()
+                        elif (
+                            settings.persistent_http_session
+                            and clearance_downgraded
+                        ):
+                            raise PipelineError(
+                                "FBref persistent fetcher cannot preserve "
+                                "provider spend across browser reconfigure"
+                            )
                         else:
                             # A transport built for the old allowance would
                             # still spend it. Rebuild it against the smaller

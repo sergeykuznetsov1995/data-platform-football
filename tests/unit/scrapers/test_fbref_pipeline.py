@@ -31,6 +31,7 @@ from scrapers.fbref.control.models import (
 from scrapers.fbref.control.store import BudgetExceeded
 from scrapers.fbref.fetcher import (
     FETCHER_VERSION,
+    PERSISTENT_SESSION_MAX_AGE_SECONDS,
     FetchError,
     FetchResponse,
     PersistentMeteredSessionReceipt,
@@ -1118,6 +1119,9 @@ class PersistentFakeFetcher:
     def ensure_clearance(self):
         self.events.append("browser")
         return True
+
+    def persistent_session_rollover_due(self):
+        return False
 
     def fetch(self, url, **_kwargs):
         self.events.append("http")
@@ -7397,6 +7401,85 @@ def test_parse_wave_holds_publication_fence_through_external_writes(tmp_path):
         f"persist:{run_id}",
         f"guard:{run_id}:exit",
     ]
+
+
+def test_1501_pages_roll_over_into_multiple_exact_persistent_sessions():
+    events = []
+
+    class Fetcher:
+        persistent_http_session = True
+
+        def __init__(self):
+            self.now = 0.0
+            self.total = 0
+            self.baseline = 0
+            self.pages = 0
+            self.deadline = 0.0
+            self.session_id = None
+
+        def begin_metered_session(self, session_id):
+            self.session_id = session_id
+            self.baseline = self.total
+            self.pages = 0
+            self.deadline = self.now + PERSISTENT_SESSION_MAX_AGE_SECONDS
+            events.append(("begin", session_id))
+            return self.baseline
+
+        def persistent_session_rollover_due(self):
+            return self.now >= self.deadline
+
+        def record_page(self):
+            self.total += 10
+            self.pages += 1
+            self.now += 6.1
+
+        def finalize_metered_session(self):
+            self.total += 1
+            return PersistentMeteredSessionReceipt(
+                session_id=self.session_id,
+                meter="proxy_filter_provider_path_v2",
+                baseline_provider_bytes=self.baseline,
+                page_provider_bytes=self.pages * 10,
+                authoritative_provider_bytes=self.pages * 10 + 1,
+                tail_provider_bytes=1,
+            )
+
+        def reset_clearance(self):
+            events.append(("reset", self.session_id))
+
+    class Control:
+        def __init__(self):
+            self.receipts = []
+
+        def reserve_clearance_session_tail(self, *_args, **_kwargs):
+            return None
+
+        def settle_clearance_session_tail(self, session_id, receipt):
+            assert receipt.session_id == session_id
+            self.receipts.append(receipt)
+            return {"terminal": False}
+
+        def close_clearance_session(self, session_id, *, status):
+            events.append(("close", session_id, status))
+
+    fetcher = Fetcher()
+    control = Control()
+    live = _LiveFetchSession(fetcher=fetcher, persistent_enabled=True)
+
+    for page in range(1501):
+        if page == 0 or live.rollover_if_due(control):
+            session_id = f"session-{len(control.receipts) + 1}"
+            live.attach_control_session(session_id)
+            live.begin_persistent(control, run_id="run-1", tail_bytes=100)
+        fetcher.record_page()
+    live.finalize(control, status="closed")
+
+    assert len(control.receipts) == 2
+    assert sum(item.page_provider_bytes for item in control.receipts) == 15010
+    assert sum(item.tail_provider_bytes for item in control.receipts) == 2
+    first_close = events.index(("close", "session-1", "closed"))
+    second_begin = events.index(("begin", "session-2"))
+    assert first_close < second_begin
 
 
 def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(

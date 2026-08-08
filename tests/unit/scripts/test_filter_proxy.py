@@ -8177,6 +8177,73 @@ def test_uncertain_fbref_lease_settles_conservatively_and_frees_slot(mod):
     assert second.lease_id != lease.lease_id
 
 
+def test_cancelled_fbref_reader_reap_holds_slot_until_all_lifecycle_clears(mod):
+    mod.MAX_ACTIVE_LEASES = 1
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr)
+    assert mod._reserve_lease_bytes(lease, 64) == 64
+    lease.provider_reserved_bytes = 64
+    lease.active_provider_readers = 1
+    lease.accounting_uncertain = True
+    lease.closed = True
+
+    mod._reap_expired_leases()
+
+    assert lease.reserved_bytes == 64
+    assert lease.provider_reserved_bytes == 64
+    with pytest.raises(RuntimeError, match="concurrency"):
+        mod._create_lease(
+            mgr,
+            max_bytes=100,
+            ttl_seconds=30,
+            metadata=_fbref_context(),
+            require_context=True,
+        )
+
+    # Model the provider-reader task's cancellation finally block. The reaper
+    # may conservatively charge and release its stranded escrow only now.
+    lease.active_provider_readers = 0
+    mod._reap_expired_leases()
+
+    assert lease.reserved_bytes == 0
+    assert lease.provider_reserved_bytes == 0
+    second = mod._create_lease(
+        mgr,
+        max_bytes=100,
+        ttl_seconds=30,
+        metadata=_fbref_context(),
+        require_context=True,
+    )
+    assert second.lease_id != lease.lease_id
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "active_provider_readers",
+        "provider_reserved_bytes",
+        "pending_client_hellos",
+        "staged_client_bytes",
+    ],
+)
+def test_expired_fbref_lifecycle_field_keeps_the_serial_slot(mod, field):
+    mod.MAX_ACTIVE_LEASES = 1
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr)
+    lease.closed = True
+    lease.expires_at = time.time() - 1
+    setattr(lease, field, 1)
+
+    with pytest.raises(RuntimeError, match="concurrency"):
+        mod._create_lease(
+            mgr,
+            max_bytes=100,
+            ttl_seconds=30,
+            metadata=_fbref_context(),
+            require_context=True,
+        )
+
+
 def test_uncertain_fbref_lease_never_retries_ambiguous_ledger_append(mod, monkeypatch):
     mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
     lease = _make_fbref_lease(mod, mgr)

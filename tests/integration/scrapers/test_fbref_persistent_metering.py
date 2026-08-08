@@ -7,6 +7,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from threading import Event
 
 import pytest
 
@@ -214,6 +215,74 @@ class _FailAfterFactory:
         return _FailAfterConnection(
             self._psycopg2.connect(dsn), self, self.marker
         )
+
+
+class _PauseAfterCursor:
+    def __init__(self, cursor, owner):
+        self._cursor = cursor
+        self._owner = owner
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    @property
+    def description(self):
+        return self._cursor.description
+
+    def execute(self, sql, params=None):
+        result = self._cursor.execute(sql, params)
+        normalized = " ".join(str(sql).split())
+        if (
+            not self._owner.paused
+            and "SELECT session_id FROM fbref_control.clearance_session "
+            "WHERE run_id" in normalized
+        ):
+            self._owner.paused = True
+            self._owner.reached.set()
+            if not self._owner.release.wait(timeout=5):
+                raise RuntimeError("abort race test pause timed out")
+        return result
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def close(self):
+        self._cursor.close()
+
+
+class _PauseAfterConnection:
+    def __init__(self, connection, owner):
+        self._connection = connection
+        self._owner = owner
+
+    def cursor(self, *args, **kwargs):
+        return _PauseAfterCursor(
+            self._connection.cursor(*args, **kwargs), self._owner
+        )
+
+    def commit(self):
+        self._connection.commit()
+
+    def rollback(self):
+        self._connection.rollback()
+
+    def close(self):
+        self._connection.close()
+
+
+class _PauseAfterSessionScanFactory:
+    def __init__(self, psycopg2):
+        self._psycopg2 = psycopg2
+        self.reached = Event()
+        self.release = Event()
+        self.paused = False
+
+    def __call__(self, dsn):
+        return _PauseAfterConnection(self._psycopg2.connect(dsn), self)
 
 
 def _prepare_page_settlement(connection, store):
@@ -846,3 +915,51 @@ def test_page_settlement_and_abort_serialize_at_run_before_child_rows(
             probe.close()
         executor.shutdown(wait=True, cancel_futures=True)
         admin.close()
+
+
+def test_open_clearance_session_cannot_race_past_abort(
+    isolated_postgres_uri,  # noqa: F811
+):
+    psycopg2 = pytest.importorskip("psycopg2")
+    connection = psycopg2.connect(isolated_postgres_uri)
+    run_id, _refresh_id, _attempt_id = _seed_run_and_attempt(connection)
+    pause_factory = _PauseAfterSessionScanFactory(psycopg2)
+    abort_store = ControlStore(
+        isolated_postgres_uri, connection_factory=pause_factory
+    )
+    open_store = ControlStore(isolated_postgres_uri)
+    executor = ThreadPoolExecutor(max_workers=2)
+    abort_future = executor.submit(abort_store.abort_run, run_id)
+    open_future = None
+    try:
+        assert pause_factory.reached.wait(timeout=5)
+        open_future = executor.submit(_open_session, open_store, run_id)
+        # The opener must wait behind the abort's run-row fence.  Once the
+        # abort commits, it observes `failed` and cannot insert an active row.
+        time.sleep(0.1)
+        assert open_future.done() is False
+        pause_factory.release.set()
+
+        assert abort_future.result(timeout=8)["aborted"] is True
+        with pytest.raises(StateConflict, match="running"):
+            open_future.result(timeout=8)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT status FROM fbref_control.crawl_run WHERE run_id = %s",
+                (run_id,),
+            )
+            assert cursor.fetchone()[0] == "failed"
+            cursor.execute(
+                """
+                SELECT count(*) FROM fbref_control.clearance_session
+                WHERE run_id = %s AND status = 'active'
+                """,
+                (run_id,),
+            )
+            assert cursor.fetchone()[0] == 0
+        connection.rollback()
+    finally:
+        pause_factory.release.set()
+        executor.shutdown(wait=True, cancel_futures=True)
+        connection.close()

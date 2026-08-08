@@ -9360,6 +9360,30 @@ class ControlStore:
         session = _uuid(session_id or uuid.uuid4(), "session_id")
         run = None if run_id is None else _uuid(run_id, "run_id")
         with self._transaction() as cursor:
+            if run is not None:
+                # Run-first is the global lock order for paid FBref work.
+                # Without this fence, abort_run could scan/close sessions,
+                # commit `failed`, and a concurrent opener could insert a new
+                # active session immediately afterward through the FK.
+                cursor.execute(
+                    """
+                    SELECT status FROM fbref_control.crawl_run
+                    WHERE run_id = %s
+                    FOR UPDATE
+                    """,
+                    (run,),
+                )
+                locked_run = _fetchone(cursor)
+                if locked_run is None or locked_run["status"] != "running":
+                    installed_status = (
+                        "missing"
+                        if locked_run is None
+                        else str(locked_run["status"])
+                    )
+                    raise StateConflict(
+                        f"Run {run} must be running before opening a "
+                        f"clearance session (status={installed_status})"
+                    )
             cursor.execute(
                 """
                 INSERT INTO fbref_control.clearance_session (
