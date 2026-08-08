@@ -314,6 +314,24 @@ class _ValidatedMatchPersistItem:
     availability_rows: tuple[dict[str, object], ...]
 
 
+@dataclass(frozen=True)
+class _PreparedTypedTableWrite:
+    dataset: str
+    table: str
+    decorated: Optional[pd.DataFrame]
+    delete_filter: str
+    staging_parts: tuple[object, ...]
+
+
+@dataclass(frozen=True)
+class _PreparedMatchBatch:
+    table_writes: tuple[_PreparedTypedTableWrite, ...]
+    availability: pd.DataFrame
+    availability_filter: str
+    availability_staging_parts: tuple[object, ...]
+    counts: tuple[Dict[str, int], ...]
+
+
 def compatibility_league_alias(
     source_competition_id: str,
     *,
@@ -806,10 +824,15 @@ class FBrefTypedBronzeWriter:
         decorated: pd.DataFrame,
         delete_filter: str,
         staging_parts: Sequence[object],
+        target_column_types: Optional[Mapping[str, str]] = None,
     ) -> int:
         """Replace an exact scope with an already-decorated frame."""
 
-        target_column_types = self._ensure_table(table, decorated)
+        resolved_column_types = (
+            dict(target_column_types)
+            if target_column_types is not None
+            else self._ensure_table(table, decorated)
+        )
         staging_id = _staging_identity(*staging_parts)
         inserted = self.manager.insert_dataframe_atomic(
             self.schema,
@@ -818,7 +841,7 @@ class FBrefTypedBronzeWriter:
             delete_filter=delete_filter,
             staging_id=staging_id,
             single_statement_replace=True,
-            target_column_types=target_column_types,
+            target_column_types=resolved_column_types,
         )
         if inserted != len(decorated):
             raise TypedBronzePersistenceError(
@@ -991,11 +1014,14 @@ class FBrefTypedBronzeWriter:
             )
         return tuple(validated)
 
-    def _persist_validated_match_batch(
+    def _prepare_validated_match_batch(
         self, items: Sequence[_ValidatedMatchPersistItem]
-    ) -> list[Dict[str, int]]:
+    ) -> _PreparedMatchBatch:
+        """Materialize every frame and local schema before any manager call."""
+
         ingested_at = datetime.now(timezone.utc).replace(tzinfo=None)
         counts: list[Dict[str, int]] = [{} for _item in items]
+        table_writes: list[_PreparedTypedTableWrite] = []
 
         for dataset, table in MATCH_DATASET_TABLES.items():
             affected = [
@@ -1033,26 +1059,30 @@ class FBrefTypedBronzeWriter:
                 combined = pd.concat(
                     decorated_frames, ignore_index=True, sort=False
                 )
-                self._persist_decorated_frame(
+                # Mirror _ensure_table's local conversion now. A bad late
+                # dtype or duplicate column must fail before an earlier table
+                # can be committed.
+                pa.Table.from_pandas(combined, preserve_index=False)
+            else:
+                combined = None
+            table_writes.append(
+                _PreparedTypedTableWrite(
                     dataset=dataset,
                     table=table,
                     decorated=combined,
                     delete_filter=delete_filter,
                     staging_parts=(
                         "batch",
-                        *(validated.item.target_identity for _, validated in affected),
+                        *(
+                            validated.item.target_identity
+                            for _, validated in affected
+                        ),
                         dataset,
                         table,
                     ),
                 )
-            else:
-                self._persist_empty(
-                    table=table,
-                    delete_filter=delete_filter,
-                )
+            )
 
-        # Independent typed completion evidence remains the final Iceberg
-        # write. Each tuple is spelled out to avoid Cartesian IN-set deletes.
         availability_frames = [
             self._decorate(
                 pd.DataFrame(validated.availability_rows),
@@ -1066,6 +1096,7 @@ class FBrefTypedBronzeWriter:
         availability = pd.concat(
             availability_frames, ignore_index=True, sort=False
         )
+        pa.Table.from_pandas(availability, preserve_index=False)
         availability_filter = " OR ".join(
             "match_id = "
             f"{_sql_string(row['match_id'])} AND dataset = "
@@ -1073,19 +1104,73 @@ class FBrefTypedBronzeWriter:
             for validated in items
             for row in validated.availability_rows
         )
-        self._persist_decorated_frame(
-            dataset="dataset_availability",
-            table=MATCH_AVAILABILITY_TABLE,
-            decorated=availability,
-            delete_filter=availability_filter,
-            staging_parts=(
+        return _PreparedMatchBatch(
+            table_writes=tuple(table_writes),
+            availability=availability,
+            availability_filter=availability_filter,
+            availability_staging_parts=(
                 "batch",
                 *(validated.item.target_identity for validated in items),
                 "dataset_availability",
                 MATCH_AVAILABILITY_TABLE,
             ),
+            counts=tuple(dict(item_counts) for item_counts in counts),
         )
-        return counts
+
+    def _persist_validated_match_batch(
+        self, items: Sequence[_ValidatedMatchPersistItem]
+    ) -> list[Dict[str, int]]:
+        prepared = self._prepare_validated_match_batch(items)
+
+        # Complete every metadata/schema preflight before the first live row
+        # commit. DDL may be needed for a fresh table, but a later DESCRIBE or
+        # ALTER failure cannot follow an earlier dataset replacement.
+        target_column_types: Dict[str, Dict[str, str]] = {}
+        absent_clear_tables: set[str] = set()
+        for write in prepared.table_writes:
+            if write.decorated is not None:
+                target_column_types[write.table] = self._ensure_table(
+                    write.table, write.decorated
+                )
+                continue
+            if write.table not in self._known_tables:
+                if self.manager.table_exists(self.schema, write.table):
+                    self._known_tables.add(write.table)
+                else:
+                    absent_clear_tables.add(write.table)
+        target_column_types[MATCH_AVAILABILITY_TABLE] = self._ensure_table(
+            MATCH_AVAILABILITY_TABLE, prepared.availability
+        )
+
+        for write in prepared.table_writes:
+            if write.decorated is None:
+                if write.table in absent_clear_tables:
+                    continue
+                self._persist_empty(
+                    table=write.table,
+                    delete_filter=write.delete_filter,
+                )
+                continue
+            self._persist_decorated_frame(
+                dataset=write.dataset,
+                table=write.table,
+                decorated=write.decorated,
+                delete_filter=write.delete_filter,
+                staging_parts=write.staging_parts,
+                target_column_types=target_column_types[write.table],
+            )
+
+        # Independent typed completion evidence remains the final Iceberg
+        # write. Each tuple is spelled out to avoid Cartesian IN-set deletes.
+        self._persist_decorated_frame(
+            dataset="dataset_availability",
+            table=MATCH_AVAILABILITY_TABLE,
+            decorated=prepared.availability,
+            delete_filter=prepared.availability_filter,
+            staging_parts=prepared.availability_staging_parts,
+            target_column_types=target_column_types[MATCH_AVAILABILITY_TABLE],
+        )
+        return [dict(item_counts) for item_counts in prepared.counts]
 
     def persist_matches(
         self, items: Sequence[TypedMatchPersistItem]

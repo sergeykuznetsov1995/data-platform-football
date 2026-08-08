@@ -395,10 +395,11 @@ class FBrefGenericBronzeWriter:
     def _persist_validated_page_batch(
         self, items: Sequence[_ValidatedGenericPagePersistItem]
     ) -> list[dict[str, int]]:
-        self.ensure_tables()
         persisted_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        batch_token = _batch_token(
-            item.item.staging_identity for item in items
+        base_token = (
+            _token(items[0].item.staging_identity)
+            if len(items) == 1
+            else _batch_token(item.item.staging_identity for item in items)
         )
 
         cell_frames = [
@@ -431,25 +432,30 @@ class FBrefGenericBronzeWriter:
             manifest_frames, ignore_index=True, sort=False
         )
 
+        # Finish every local transformation before the first DDL. This keeps a
+        # malformed late page/frame from leaving preflight or earlier-table
+        # side effects behind.
+        self.ensure_tables()
+
         # The manifest is the generic completion marker and therefore remains
         # the final merge even when either preceding frame is empty.
         self._merge_dataframe(
             TABLE_CELLS_TABLE,
             cells,
             keys=GENERIC_TABLE_KEYS[TABLE_CELLS_TABLE],
-            staging_token=f"{batch_token}_c",
+            staging_token=f"{base_token}_c",
         )
         self._merge_dataframe(
             TABLE_INVENTORY_TABLE,
             inventory,
             keys=GENERIC_TABLE_KEYS[TABLE_INVENTORY_TABLE],
-            staging_token=f"{batch_token}_t",
+            staging_token=f"{base_token}_t",
         )
         self._merge_dataframe(
             PAGE_MANIFEST_TABLE,
             manifests,
             keys=GENERIC_TABLE_KEYS[PAGE_MANIFEST_TABLE],
-            staging_token=f"{batch_token}_m",
+            staging_token=f"{base_token}_m",
         )
         return [
             {

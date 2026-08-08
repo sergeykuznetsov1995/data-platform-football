@@ -468,6 +468,110 @@ def test_persist_matches_validates_late_item_before_first_write() -> None:
 
 
 @pytest.mark.unit
+def test_persist_matches_materializes_late_dataset_before_first_write(
+    monkeypatch,
+) -> None:
+    manager = RecordingManager()
+    writer = typed.FBrefTypedBronzeWriter(manager)
+    original_decorate = writer._decorate
+
+    def fail_late_decorate(frame, *, dataset, **kwargs):
+        if dataset == "match_player_stats":
+            raise TypeError("injected late dtype failure")
+        return original_decorate(frame, dataset=dataset, **kwargs)
+
+    monkeypatch.setattr(writer, "_decorate", fail_late_decorate)
+    item = _match_item(
+        "materialize-first",
+        {
+            "match_events": DatasetParseResult(
+                "match_events",
+                DatasetStatus.AVAILABLE,
+                frame=pd.DataFrame({"match_id": ["materialize-first"]}),
+            ),
+            "match_player_stats": DatasetParseResult(
+                "match_player_stats",
+                DatasetStatus.AVAILABLE,
+                frame=pd.DataFrame({"match_id": ["materialize-first"]}),
+            ),
+        },
+    )
+
+    with pytest.raises(TypeError, match="late dtype failure"):
+        writer.persist_matches([item])
+
+    assert manager.writes == []
+    assert manager.table_exists_calls == []
+    assert manager.create_calls == []
+
+
+@pytest.mark.unit
+def test_persist_matches_preflights_late_arrow_schema_before_first_write() -> None:
+    manager = RecordingManager()
+    duplicate_columns = pd.DataFrame(
+        [["materialize-first", "materialize-first"]],
+        columns=["match_id", "match_id"],
+    )
+    item = _match_item(
+        "materialize-first",
+        {
+            "match_events": DatasetParseResult(
+                "match_events",
+                DatasetStatus.AVAILABLE,
+                frame=pd.DataFrame({"match_id": ["materialize-first"]}),
+            ),
+            "match_player_stats": DatasetParseResult(
+                "match_player_stats",
+                DatasetStatus.AVAILABLE,
+                frame=duplicate_columns,
+            ),
+        },
+    )
+
+    with pytest.raises(ValueError, match="Duplicate column names"):
+        typed.FBrefTypedBronzeWriter(manager).persist_matches([item])
+
+    assert manager.writes == []
+    assert manager.table_exists_calls == []
+    assert manager.create_calls == []
+
+
+@pytest.mark.unit
+def test_persist_matches_preflights_all_target_schemas_before_live_write() -> None:
+    class LateSchemaFailureManager(RecordingManager):
+        def get_table_columns(self, schema, table):
+            if table == "fbref_match_player_stats":
+                raise RuntimeError("injected late DESCRIBE failure")
+            return super().get_table_columns(schema, table)
+
+    manager = LateSchemaFailureManager()
+    item = _match_item(
+        "schema-preflight",
+        {
+            "match_events": DatasetParseResult(
+                "match_events",
+                DatasetStatus.AVAILABLE,
+                frame=pd.DataFrame({"match_id": ["schema-preflight"]}),
+            ),
+            "match_player_stats": DatasetParseResult(
+                "match_player_stats",
+                DatasetStatus.AVAILABLE,
+                frame=pd.DataFrame({"match_id": ["schema-preflight"]}),
+            ),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="late DESCRIBE failure"):
+        typed.FBrefTypedBronzeWriter(manager).persist_matches([item])
+
+    assert manager.writes == []
+    assert manager.create_calls == [
+        "fbref_match_events",
+        "fbref_match_player_stats",
+    ]
+
+
+@pytest.mark.unit
 def test_compatibility_alias_is_projection_not_an_allowlist() -> None:
     known = typed.TypedSourceContext(
         source_competition_id="9",

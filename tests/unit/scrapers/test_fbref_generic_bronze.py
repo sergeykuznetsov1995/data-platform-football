@@ -1,4 +1,5 @@
 from dataclasses import replace
+import re
 from unittest.mock import MagicMock
 
 import pytest
@@ -91,6 +92,10 @@ def test_persist_pages_merges_each_generic_table_once_in_commit_order():
         )
         for statement in sql
     ] == [TABLE_CELLS_TABLE, TABLE_INVENTORY_TABLE, PAGE_MANIFEST_TABLE]
+    assert all(
+        re.search(r"__stg_batch_[0-9a-f]{16}_[ctm]", statement)
+        for statement in sql
+    )
 
 
 def test_persist_pages_returns_aligned_zero_counts_for_empty_valid_page():
@@ -165,6 +170,48 @@ def test_persist_page_delegates_valid_pages_to_single_item_batch(monkeypatch):
     assert counts == {"cells": 1, "tables": 1, "manifest": 1}
     assert len(captured) == 1
     assert captured[0].staging_identity == "identity"
+
+
+def test_single_page_keeps_exact_logical_refresh_stage_owner():
+    manager = _manager()
+    logical_refresh_id = "cb02b6ce-aab7-4c9a-85d0-1292a49e03a2"
+
+    FBrefGenericBronzeWriter(manager).persist_page(
+        _page(),
+        canonical_url="https://fbref.com/test",
+        run_id="run",
+        staging_identity=logical_refresh_id,
+    )
+
+    assert all(
+        "__stg_lr_cb02b6ceaab74c9a85d01292a49e03a2_" in statement
+        for statement in _merge_sql(manager)
+    )
+
+
+def test_persist_pages_materializes_every_frame_before_table_preflight(
+    monkeypatch,
+):
+    manager = _manager()
+    writer = FBrefGenericBronzeWriter(manager)
+    original_decorate = writer._decorate
+    calls = 0
+
+    def fail_late_decorate(records, run_id, persisted_at):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise TypeError("injected late concat failure")
+        return original_decorate(records, run_id, persisted_at)
+
+    monkeypatch.setattr(writer, "_decorate", fail_late_decorate)
+
+    with pytest.raises(TypeError, match="late concat failure"):
+        writer.persist_pages([_page_item("materialize-first")])
+
+    manager.create_iceberg_table.assert_not_called()
+    manager._execute.assert_not_called()
+    manager.insert_dataframe.assert_not_called()
 
 
 def test_generic_writer_merges_by_identity_and_commits_page_manifest_last():
