@@ -639,6 +639,9 @@ def _rewrite_signed_plan(options, plan: IngestPlan, mutate):
 
 
 def _bind_current_plan_artifact_chain(options) -> None:
+    from scrapers.espn import runner
+    from scrapers.espn.operations import seal_raw_batch_descriptor
+
     plan_path = Path(options.plan_uri.removeprefix("file://"))
     plan_body = plan_path.read_bytes()
     envelope = json.loads(plan_body)
@@ -658,6 +661,42 @@ def _bind_current_plan_artifact_chain(options) -> None:
         "uri": options.plan_uri,
         "sha256": hashlib.sha256(plan_body).hexdigest(),
     }
+    try:
+        loaded = runner._load_signed_plan(options.plan_uri)
+    except RunnerConfigurationError:
+        loaded = None
+    scoreboard_batch = None
+    scoreboard_checkpoint_uri = None
+    if loaded is not None and loaded.mode != "replay":
+        requests = runner._scoreboard_requests(
+            loaded.plan.scopes[0],
+            loaded.bindings[scope_id],
+            as_of=loaded.plan.as_of,
+            mode=runner._effective_mode(loaded),
+        )
+        if requests:
+            request_ids = tuple(item.request_id for item in requests)
+            batch_id = hashlib.sha256(
+                runner._canonical_bytes(
+                    {
+                        "kind": "espn-scoreboard-batch-id-v1",
+                        "scope_id": scope_id,
+                        "plan_signature": envelope["signature"],
+                        "request_ids": request_ids,
+                    }
+                )
+            ).hexdigest()
+            scoreboard_batch = seal_raw_batch_descriptor(
+                endpoint="scoreboard",
+                run_id=signed_plan["run_id"],
+                attempt=runtime["attempt"],
+                scope_id=scope_id,
+                plan_signature=envelope["signature"],
+                batch_id=batch_id,
+                request_ids=request_ids,
+                event_ids=(),
+            )
+            scoreboard_checkpoint_uri = f"{scope_root}/raw/scoreboard-{batch_id}.json"
     descriptor = {
         "kind": "espn-scope-plan-descriptor-v1",
         "schema_version": 1,
@@ -673,8 +712,8 @@ def _bind_current_plan_artifact_chain(options) -> None:
         "generation_snapshot_uri": runtime["scope_bindings"][scope_id][
             "generation_snapshot_uri"
         ],
-        "expected_scoreboard_batch": None,
-        "scoreboard_checkpoint_uri": None,
+        "expected_scoreboard_batch": scoreboard_batch,
+        "scoreboard_checkpoint_uri": scoreboard_checkpoint_uri,
         "scope_root": scope_root,
     }
     descriptor_body = json.dumps(
@@ -697,14 +736,17 @@ def _bind_current_plan_artifact_chain(options) -> None:
         "mode": runtime["mode"],
         "registry_signature": signed_plan["registry_signature"],
         "bundle_signature": hashlib.sha256(
-            json.dumps(
-                [envelope["signature"]], sort_keys=True, separators=(",", ":")
+            (
+                json.dumps(
+                    [envelope["signature"]], sort_keys=True, separators=(",", ":")
+                )
+                + "\n"
             ).encode()
         ).hexdigest(),
         "scope_ids": admission["scope_ids"],
         "scope_plan_refs": [descriptor_ref],
-        "network_scope_ids": [],
-        "expected_scoreboard_map_count": 0,
+        "network_scope_ids": [scope_id] if scoreboard_batch is not None else [],
+        "expected_scoreboard_map_count": int(scoreboard_batch is not None),
         "admission_ref": admission_ref,
         "release": admission["release"],
         "canary_claim": admission["canary_claim"],
@@ -717,6 +759,267 @@ def _bind_current_plan_artifact_chain(options) -> None:
         ),
         json.dumps(index, sort_keys=True, separators=(",", ":")).encode(),
     )
+
+
+def _extend_current_plan_bundle(options, plan, extra_competition):
+    """Add a second valid per-scope plan to the current immutable test bundle."""
+
+    from scrapers.espn import runner
+    from scrapers.espn.operations import seal_raw_batch_descriptor
+
+    extra_scope = _scope(*extra_competition)
+    current_scope = plan.scopes[0]
+    scope_ids = tuple(sorted((current_scope.scope_id, extra_scope.scope_id)))
+    plan_path = Path(options.plan_uri.removeprefix("file://"))
+    current_envelope = json.loads(plan_path.read_text())
+    current_runtime = current_envelope["plan"]["metadata"]["runtime"]
+    admission_path = Path(
+        current_runtime["admission_ref"]["uri"].removeprefix("file://")
+    )
+    admission = json.loads(admission_path.read_text())
+    release = {
+        **CampaignIdentity.create(
+            release_commit=TEST_RELEASE_COMMIT,
+            release_tree_sha256=TEST_RELEASE_TREE_SHA256,
+            registry_signature=plan.registry_signature,
+            target_scope_ids=scope_ids,
+        ).to_dict(),
+        "parser_version": PARSER_VERSION,
+        "runtime_version": RUNTIME_VERSION,
+    }
+    admission.update(
+        {
+            "target_scope_ids": list(scope_ids),
+            "scope_ids": list(scope_ids),
+            "male_scope_count": len(scope_ids),
+            "release": release,
+        }
+    )
+    admission_body = json.dumps(
+        admission, sort_keys=True, separators=(",", ":")
+    ).encode()
+    admission_path.write_bytes(admission_body)
+    admission_ref = {
+        "uri": admission_path.as_uri(),
+        "sha256": hashlib.sha256(admission_body).hexdigest(),
+    }
+
+    def bind_current(document):
+        runtime = document["metadata"]["runtime"]
+        runtime["admission_ref"] = admission_ref
+        runtime["release"] = release
+
+    current_plan = _rewrite_signed_plan(options, plan, bind_current)
+    _bind_current_plan_artifact_chain(options)
+
+    artifact_root = admission["artifact_root"].rstrip("/")
+    extra_root = f"{artifact_root}/scopes/{extra_scope.scope_id.replace(':', '-')}"
+    current_document = current_plan.to_dict()
+    current_binding = next(
+        iter(current_document["metadata"]["runtime"]["scope_bindings"].values())
+    )
+    extra_binding = {
+        **deepcopy(current_binding),
+        "generation_id": f"generation-{extra_scope.scope_id.replace(':', '-')}",
+        "batch_id": f"batch-{extra_scope.scope_id.replace(':', '-')}",
+        "generation_snapshot_uri": f"{extra_root}/generation.json",
+    }
+    extra_runtime = {
+        **deepcopy(current_document["metadata"]["runtime"]),
+        "raw_manifest_uri": f"{extra_root}/raw-manifest.json",
+        "output_uri": f"{extra_root}/runner-result.json",
+        "selected_scopes": [extra_scope.scope_id],
+        "scope_bindings": {extra_scope.scope_id: extra_binding},
+    }
+    extra_plan = IngestPlan(
+        schema_version=1,
+        run_id=current_plan.run_id,
+        as_of=current_plan.as_of,
+        registry_signature=current_plan.registry_signature,
+        scopes=(extra_scope,),
+        metadata={"runtime": extra_runtime},
+    )
+    extra_envelope = {
+        "kind": "espn-ingest-plan-v1",
+        "plan": extra_plan.to_dict(),
+        "signature": extra_plan.signature(),
+    }
+    extra_plan_body = json.dumps(
+        extra_envelope, sort_keys=True, separators=(",", ":")
+    ).encode()
+    extra_plan_uri = _write(
+        Path((f"{extra_root}/plan.json").removeprefix("file://")), extra_plan_body
+    )
+    extra_plan_ref = {
+        "uri": extra_plan_uri,
+        "sha256": hashlib.sha256(extra_plan_body).hexdigest(),
+    }
+    extra_loaded = runner._load_signed_plan(extra_plan_uri)
+    extra_requests = runner._scoreboard_requests(
+        extra_scope,
+        extra_loaded.bindings[extra_scope.scope_id],
+        as_of=extra_plan.as_of,
+        mode=runner._effective_mode(extra_loaded),
+    )
+    extra_scoreboard = None
+    extra_checkpoint_uri = None
+    if extra_requests:
+        extra_request_ids = tuple(item.request_id for item in extra_requests)
+        extra_batch_id = hashlib.sha256(
+            runner._canonical_bytes(
+                {
+                    "kind": "espn-scoreboard-batch-id-v1",
+                    "scope_id": extra_scope.scope_id,
+                    "plan_signature": extra_plan.signature(),
+                    "request_ids": extra_request_ids,
+                }
+            )
+        ).hexdigest()
+        extra_scoreboard = seal_raw_batch_descriptor(
+            endpoint="scoreboard",
+            run_id=extra_plan.run_id,
+            attempt=extra_runtime["attempt"],
+            scope_id=extra_scope.scope_id,
+            plan_signature=extra_plan.signature(),
+            batch_id=extra_batch_id,
+            request_ids=extra_request_ids,
+            event_ids=(),
+        )
+        extra_checkpoint_uri = (
+            f"{extra_root}/raw/scoreboard-{extra_batch_id}.json"
+        )
+    extra_descriptor = {
+        "kind": "espn-scope-plan-descriptor-v1",
+        "schema_version": 1,
+        "dag_id": admission["dag_id"],
+        "run_id": extra_plan.run_id,
+        "attempt": extra_runtime["attempt"],
+        "mode": extra_runtime["mode"],
+        "scope_id": extra_scope.scope_id,
+        "plan_ref": extra_plan_ref,
+        "plan_signature": extra_plan.signature(),
+        "raw_manifest_uri": extra_runtime["raw_manifest_uri"],
+        "raw_store_uri": extra_runtime["raw_store_uri"],
+        "generation_snapshot_uri": extra_binding["generation_snapshot_uri"],
+        "expected_scoreboard_batch": extra_scoreboard,
+        "scoreboard_checkpoint_uri": extra_checkpoint_uri,
+        "scope_root": extra_root,
+    }
+    extra_descriptor_body = json.dumps(
+        extra_descriptor, sort_keys=True, separators=(",", ":")
+    ).encode()
+    extra_descriptor_uri = _write(
+        Path(
+            (f"{extra_root}/scope-plan-descriptor.json").removeprefix("file://")
+        ),
+        extra_descriptor_body,
+    )
+    extra_descriptor_ref = {
+        "uri": extra_descriptor_uri,
+        "sha256": hashlib.sha256(extra_descriptor_body).hexdigest(),
+    }
+
+    current_root = (
+        f"{artifact_root}/scopes/{current_scope.scope_id.replace(':', '-')}"
+    )
+    current_descriptor_path = Path(
+        (f"{current_root}/scope-plan-descriptor.json").removeprefix("file://")
+    )
+    current_descriptor_ref = {
+        "uri": current_descriptor_path.as_uri(),
+        "sha256": hashlib.sha256(current_descriptor_path.read_bytes()).hexdigest(),
+    }
+    descriptors = {
+        current_scope.scope_id: current_descriptor_ref,
+        extra_scope.scope_id: extra_descriptor_ref,
+    }
+    signatures = {
+        current_scope.scope_id: current_plan.signature(),
+        extra_scope.scope_id: extra_plan.signature(),
+    }
+    index_path = Path((f"{artifact_root}/plan-index.json").removeprefix("file://"))
+    index = json.loads(index_path.read_text())
+    current_descriptor = json.loads(current_descriptor_path.read_text())
+    network_scope_ids = [
+        scope_id
+        for scope_id, descriptor in sorted(
+            {
+                current_scope.scope_id: current_descriptor,
+                extra_scope.scope_id: extra_descriptor,
+            }.items()
+        )
+        if descriptor["expected_scoreboard_batch"] is not None
+    ]
+    index.update(
+        {
+            "scope_ids": list(scope_ids),
+            "scope_plan_refs": [descriptors[scope_id] for scope_id in scope_ids],
+            "bundle_signature": hashlib.sha256(
+                (
+                    json.dumps(
+                        sorted(signatures.values()),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode()
+            ).hexdigest(),
+            "network_scope_ids": network_scope_ids,
+            "expected_scoreboard_map_count": len(network_scope_ids),
+        }
+    )
+    index_path.write_text(
+        json.dumps(index, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return {
+        "admission": admission,
+        "current_plan": current_plan,
+        "extra_plan": extra_plan,
+        "extra_plan_path": Path(extra_plan_uri.removeprefix("file://")),
+        "extra_descriptor_path": Path(extra_descriptor_uri.removeprefix("file://")),
+        "index_path": index_path,
+        "scope_ids": scope_ids,
+    }
+
+
+def _current_scope_lease_binding(options):
+    from scrapers.espn import runner
+    from scrapers.espn.operations import ScopeLease
+
+    loaded = runner._load_signed_plan(options.plan_uri)
+    scope_id = loaded.selected_scopes[0]
+    descriptor_path = (
+        Path(options.plan_uri.removeprefix("file://")).parent
+        / "scope-plan-descriptor.json"
+    )
+    descriptor_ref = {
+        "uri": descriptor_path.as_uri(),
+        "sha256": hashlib.sha256(descriptor_path.read_bytes()).hexdigest(),
+    }
+    lease = ScopeLease(
+        scope_id=scope_id,
+        owner_id=f"dag_ingest_espn/{loaded.plan.run_id}/{loaded.attempt}",
+        plan_signature=loaded.signature,
+        epoch=1,
+        token_sha256="d" * 64,
+        acquired_at=NOW,
+        expires_at=NOW + timedelta(hours=9),
+    )
+    from dags.utils import espn_native_tasks
+
+    binding = {
+        "kind": "espn-scope-lease-binding-v1",
+        "schema_version": 1,
+        "scope_plan_ref": descriptor_ref,
+        "lease": espn_native_tasks._lease_to_dict(lease),
+    }
+    body = (json.dumps(binding, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    uri = _write(
+        descriptor_path.parent / "lease-binding.json",
+        body,
+    )
+    return {"uri": uri, "sha256": hashlib.sha256(body).hexdigest()}
 
 
 def _bind_release_only_plan(options, plan: IngestPlan) -> IngestPlan:
@@ -1057,6 +1360,141 @@ def test_current_runner_gate_rejects_resealed_scope_binding_before_effects(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "forged_bundle",
+        "tampered_noncurrent_descriptor",
+        "tampered_noncurrent_plan",
+        "duplicate_current_missing_noncurrent",
+        "resealed_noncurrent_network_drift",
+    ),
+)
+def test_current_runner_deep_plan_chain_rejects_noncurrent_bundle_drift_before_effects(
+    tmp_path, monkeypatch, corruption
+):
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    extra = _competition(espn_id=731, slug="ita.2")
+    options, plan = _plan(tmp_path, "daily", ((competition, edition),))
+    bundle = _extend_current_plan_bundle(options, plan, extra)
+    index = json.loads(bundle["index_path"].read_text())
+    if corruption == "forged_bundle":
+        index["bundle_signature"] = "f" * 64
+    elif corruption == "tampered_noncurrent_descriptor":
+        bundle["extra_descriptor_path"].write_bytes(
+            bundle["extra_descriptor_path"].read_bytes() + b" "
+        )
+    elif corruption == "tampered_noncurrent_plan":
+        bundle["extra_plan_path"].write_bytes(
+            bundle["extra_plan_path"].read_bytes() + b" "
+        )
+    elif corruption == "duplicate_current_missing_noncurrent":
+        descriptor = json.loads(bundle["extra_descriptor_path"].read_text())
+        descriptor["scope_id"] = plan.scopes[0].scope_id
+        descriptor_body = json.dumps(
+            descriptor, sort_keys=True, separators=(",", ":")
+        ).encode()
+        bundle["extra_descriptor_path"].write_bytes(descriptor_body)
+        index["scope_plan_refs"][1] = {
+            "uri": bundle["extra_descriptor_path"].as_uri(),
+            "sha256": hashlib.sha256(descriptor_body).hexdigest(),
+        }
+    else:
+        from scrapers.espn import runner
+
+        descriptor = json.loads(bundle["extra_descriptor_path"].read_text())
+        batch = descriptor["expected_scoreboard_batch"]
+        assert batch is not None
+        request_ids = ["scoreboard:forged"]
+        batch_id = hashlib.sha256(
+            runner._canonical_bytes(
+                {
+                    "kind": "espn-scoreboard-batch-id-v1",
+                    "scope_id": descriptor["scope_id"],
+                    "plan_signature": descriptor["plan_signature"],
+                    "request_ids": request_ids,
+                }
+            )
+        ).hexdigest()
+        batch.update({"batch_id": batch_id, "request_ids": request_ids})
+        batch["descriptor_sha256"] = hashlib.sha256(
+            runner._canonical_bytes(
+                {key: value for key, value in batch.items() if key != "descriptor_sha256"}
+            )
+        ).hexdigest()
+        descriptor["scoreboard_checkpoint_uri"] = (
+            f"{descriptor['scope_root']}/raw/scoreboard-{batch_id}.json"
+        )
+        descriptor_body = json.dumps(
+            descriptor, sort_keys=True, separators=(",", ":")
+        ).encode()
+        bundle["extra_descriptor_path"].write_bytes(descriptor_body)
+        index["scope_plan_refs"][1] = {
+            "uri": bundle["extra_descriptor_path"].as_uri(),
+            "sha256": hashlib.sha256(descriptor_body).hexdigest(),
+        }
+    bundle["index_path"].write_text(
+        json.dumps(index, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        runner,
+        "_load_registry",
+        lambda *_args, **_kwargs: pytest.fail(
+            f"{corruption} reached runner registry access"
+        ),
+    )
+
+    with pytest.raises(
+        RunnerConfigurationError, match="plan index|bundle|descriptor|network"
+    ):
+        runner.execute(options)
+
+    assert not Path(options.raw_manifest_uri.removeprefix("file://")).exists()
+    assert not Path(options.output_uri.removeprefix("file://")).exists()
+    assert not Path(options.raw_store_uri.removeprefix("file://")).exists()
+
+
+@pytest.mark.unit
+def test_airflow_binding_uses_deep_plan_chain_before_control_side_effects(
+    tmp_path, monkeypatch
+):
+    from dags.utils import espn_native_tasks
+
+    competition, edition = _competition()
+    options, plan = _plan(tmp_path, "daily", ((competition, edition),))
+    bundle = _extend_current_plan_bundle(
+        options,
+        plan,
+        _competition(espn_id=731, slug="ita.2"),
+    )
+    index = json.loads(bundle["index_path"].read_text())
+    index["bundle_signature"] = "f" * 64
+    bundle["index_path"].write_text(
+        json.dumps(index, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    binding_ref = _current_scope_lease_binding(options)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_current_signed_plan_admission",
+        lambda _loaded, **_kwargs: bundle["admission"],
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(
+            lambda _cls: pytest.fail("forged plan bundle reached the control store")
+        ),
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="plan index|bundle"):
+        espn_native_tasks.fetch_scoreboard_batch(scope_binding_ref=binding_ref)
+
+
+@pytest.mark.unit
 def test_runner_current_admission_validates_single_use_canary_consumption(tmp_path):
     from scrapers.espn import runner
     from scripts.espn_canary_campaign import (
@@ -1327,6 +1765,10 @@ def test_empty_unknown_schedule_requires_second_fresh_observation():
             "request_id": first.request_id,
             "query_start": "2026-01-01",
             "query_end": "2026-01-31",
+            "requested_limit": 1000,
+            "event_count": 0,
+            "schema_valid": True,
+            "unsaturated": True,
         },
     )
     with pytest.raises(runner.EmptySchedulePending) as pending:
@@ -1350,6 +1792,10 @@ def test_empty_unknown_schedule_requires_second_fresh_observation():
                 "request_id": current.request_id,
                 "query_start": "2026-01-01",
                 "query_end": "2026-01-31",
+                "requested_limit": 1000,
+                "event_count": 0,
+                "schema_valid": True,
+                "unsaturated": True,
             },
         ),
         mode="daily",
@@ -1399,6 +1845,10 @@ def test_empty_partial_schedule_accepts_explicit_source_capability_metadata():
                 "request_id": current.request_id,
                 "query_start": "2026-01-01",
                 "query_end": "2026-01-31",
+                "requested_limit": 1000,
+                "event_count": 0,
+                "schema_valid": True,
+                "unsaturated": True,
             },
         ),
         mode="backfill",

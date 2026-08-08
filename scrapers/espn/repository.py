@@ -1025,7 +1025,12 @@ def _empty_schedule_proof_failure(
     disposition: RequestDisposition,
     scoreboard_records: tuple[RawLedgerRecord, ...],
 ) -> str | None:
-    failure = "empty unknown schedule requires a second scheduled observation"
+    capability = generation.plan.capabilities.schedule
+    failure = (
+        "empty unknown schedule requires a second scheduled observation"
+        if capability is CapabilityState.UNKNOWN
+        else "empty schedule requires one exact valid_empty proof"
+    )
     if (
         disposition.state is not DispositionState.VALID_EMPTY
         or disposition.event_id is not None
@@ -1037,15 +1042,31 @@ def _empty_schedule_proof_failure(
         return failure
     if canonical_json(proof) != disposition.detail or not isinstance(proof, dict):
         return failure
-    if set(proof) != {"kind", "method", "observations"} or (
-        proof.get("kind"), proof.get("method")
-    ) != (
-        "espn-empty-schedule-qualification-v1",
-        "second_scheduled_observation",
-    ):
+    if proof.get("kind") != "espn-empty-schedule-qualification-v1":
+        return failure
+    method = proof.get("method")
+    if method == "second_scheduled_observation":
+        if (
+            set(proof) != {"kind", "method", "observations"}
+            or capability is not CapabilityState.UNKNOWN
+        ):
+            return failure
+        expected_observations = 2
+    elif method == "explicit_source_metadata":
+        if (
+            set(proof) != {"kind", "method", "capability", "observations"}
+            or capability not in {CapabilityState.PARTIAL, CapabilityState.ABSENT}
+            or proof.get("capability") != capability.value
+        ):
+            return failure
+        expected_observations = 1
+    else:
         return failure
     observations = proof.get("observations")
-    if not isinstance(observations, list) or len(observations) != 2:
+    if (
+        not isinstance(observations, list)
+        or len(observations) != expected_observations
+    ):
         return failure
     parsed = []
     for observation in observations:
@@ -1057,8 +1078,9 @@ def _empty_schedule_proof_failure(
         }:
             return failure
         run_id = observation.get("run_id")
-        if not isinstance(run_id, str) or not run_id.startswith(
-            ("scheduled__", "espn_daily__")
+        if not isinstance(run_id, str) or not run_id or (
+            method == "second_scheduled_observation"
+            and not run_id.startswith(("scheduled__", "espn_daily__"))
         ):
             return failure
         try:
@@ -1077,6 +1099,10 @@ def _empty_schedule_proof_failure(
                 "request_id",
                 "query_start",
                 "query_end",
+                "requested_limit",
+                "event_count",
+                "schema_valid",
+                "unsaturated",
             }:
                 return failure
             try:
@@ -1084,7 +1110,15 @@ def _empty_schedule_proof_failure(
                 end = date.fromisoformat(window["query_end"])
             except (TypeError, ValueError):
                 return failure
-            if start > end or not isinstance(window["request_id"], str):
+            if (
+                start > end
+                or not isinstance(window["request_id"], str)
+                or type(window["requested_limit"]) is not int
+                or window["requested_limit"] <= 0
+                or window["event_count"] != 0
+                or window["schema_valid"] is not True
+                or window["unsaturated"] is not True
+            ):
                 return failure
             window_ids.append(window["request_id"])
         raw_ids = []
@@ -1108,14 +1142,21 @@ def _empty_schedule_proof_failure(
             ):
                 return failure
             raw_ids.append(item["request_id"])
-        if sorted(window_ids) != sorted(raw_ids) or len(set(raw_ids)) != len(raw_ids):
+        if (
+            windows != sorted(windows, key=lambda item: item["request_id"])
+            or raw != sorted(raw, key=lambda item: item["request_id"])
+            or sorted(window_ids) != sorted(raw_ids)
+            or len(set(raw_ids)) != len(raw_ids)
+        ):
             return failure
         parsed.append((run_id, observed_at, observation))
-    if parsed[0][0] == parsed[1][0] or parsed[0][1] >= parsed[1][1]:
+    if expected_observations == 2 and (
+        parsed[0][0] == parsed[1][0] or parsed[0][1] >= parsed[1][1]
+    ):
         return failure
-    if parsed[1][0] != generation.run_id:
+    if parsed[-1][0] != generation.run_id:
         return failure
-    current = parsed[1][2]
+    current = parsed[-1][2]
     expected_current_raw = [
         {
             "request_id": item.request_id,
@@ -1127,11 +1168,38 @@ def _empty_schedule_proof_failure(
     ]
     if current["raw_evidence"] != expected_current_raw:
         return failure
+    if not scoreboard_records or parsed[-1][1] != max(
+        item.fetched_at for item in scoreboard_records
+    ):
+        return failure
     if sorted(generation.planned_request_ids) != sorted(
         item["request_id"] for item in current["planned_windows"]
     ):
         return failure
     return None
+
+
+def validated_empty_schedule_proof(generation: ScopeGeneration) -> dict[str, Any]:
+    """Return the exact source-backed empty proof used by durable receipts."""
+
+    if not isinstance(generation, ScopeGeneration) or generation.schedule:
+        raise ValueError("valid_empty proof requires an empty scope generation")
+    if generation.plan.capabilities.schedule is CapabilityState.PROVEN:
+        raise ValueError("empty proven schedule capability")
+    dispositions = tuple(
+        item for item in generation.dispositions if item.endpoint == "schedule"
+    )
+    if len(dispositions) != 1:
+        raise ValueError("empty schedule requires one exact valid_empty proof")
+    scoreboard_records = tuple(
+        item for item in generation.raw_ledger if item.endpoint == "scoreboard"
+    )
+    failure = _empty_schedule_proof_failure(
+        generation, dispositions[0], scoreboard_records
+    )
+    if failure is not None:
+        raise ValueError(failure)
+    return json.loads(dispositions[0].detail)
 
 
 def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport:
@@ -1230,17 +1298,18 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
             )
         if scope.capabilities.schedule is CapabilityState.PROVEN:
             failures.append("empty proven schedule capability")
-        elif scope.capabilities.schedule is CapabilityState.UNKNOWN:
-            if len(schedule_dispositions) != 1:
-                failures.append(
-                    "empty unknown schedule requires a second scheduled observation"
-                )
-            else:
-                proof_failure = _empty_schedule_proof_failure(
-                    generation, schedule_dispositions[0], scoreboard_records
-                )
-                if proof_failure is not None:
-                    failures.append(proof_failure)
+        elif len(schedule_dispositions) != 1:
+            failures.append(
+                "empty unknown schedule requires a second scheduled observation"
+                if scope.capabilities.schedule is CapabilityState.UNKNOWN
+                else "empty schedule requires one exact valid_empty proof"
+            )
+        else:
+            proof_failure = _empty_schedule_proof_failure(
+                generation, schedule_dispositions[0], scoreboard_records
+            )
+            if proof_failure is not None:
+                failures.append(proof_failure)
     scoreboard_event_ids = [
         event_id for item in scoreboard_records for event_id in item.event_ids
     ]
@@ -3501,5 +3570,6 @@ __all__ = [
     "render_repository_ddl",
     "row_fingerprint",
     "select_current_manifest",
+    "validated_empty_schedule_proof",
     "validate_scope_generation",
 ]

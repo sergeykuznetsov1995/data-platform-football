@@ -487,7 +487,11 @@ def test_replay_offline_tasks_accept_exact_legacy_v1_raw_manifest(
         signature="f" * 64,
     )
     scope = SimpleNamespace(scope_id=scope_id)
-    monkeypatch.setattr(espn_native_tasks, "_heartbeat_scope_binding", lambda *_: None)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_heartbeat_scope_binding",
+        lambda ref: espn_native_tasks._binding(ref),
+    )
     monkeypatch.setattr(
         espn_native_tasks,
         "_binding",
@@ -955,7 +959,9 @@ def test_summary_reducer_accepts_airflow_none_only_for_signed_zero_map(monkeypat
         bindings={"700:2024": SimpleNamespace(active=False, prior=object())}
     )
     monkeypatch.setattr(
-        espn_native_tasks, "_heartbeat_scope_binding", lambda _ref: None
+        espn_native_tasks,
+        "_heartbeat_scope_binding",
+        lambda ref: espn_native_tasks._binding(ref),
     )
     monkeypatch.setattr(
         espn_native_tasks,
@@ -1080,7 +1086,9 @@ def test_summary_planner_accepts_airflow_none_for_signed_zero_scoreboard_map(
         else pytest.fail(f"unexpected plan index: {ref!r}"),
     )
     monkeypatch.setattr(
-        espn_native_tasks, "_heartbeat_scope_binding", lambda _ref: None
+        espn_native_tasks,
+        "_heartbeat_scope_binding",
+        lambda ref: espn_native_tasks._binding(ref),
     )
     monkeypatch.setattr(
         espn_native_tasks,
@@ -1255,7 +1263,9 @@ def test_native_summary_planner_rejects_exactly_saturated_scoreboard_page(
         ),
     )
     monkeypatch.setattr(
-        espn_native_tasks, "_heartbeat_scope_binding", lambda _ref: None
+        espn_native_tasks,
+        "_heartbeat_scope_binding",
+        lambda ref: espn_native_tasks._binding(ref),
     )
     monkeypatch.setattr(
         espn_native_tasks.runner,
@@ -1371,7 +1381,9 @@ def test_native_summary_planner_keeps_missing_known_event_guard(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        espn_native_tasks, "_heartbeat_scope_binding", lambda _ref: None
+        espn_native_tasks,
+        "_heartbeat_scope_binding",
+        lambda ref: espn_native_tasks._binding(ref),
     )
     monkeypatch.setattr(
         espn_native_tasks.runner,
@@ -1626,6 +1638,38 @@ def test_scope_qualification_rejects_mixed_parser_runtime(monkeypatch):
             publication={"state": "complete", "evidence_ref": {}},
             generation=generation,
             evidence_payload={},
+        )
+
+
+def test_scope_qualification_cannot_synthesize_empty_schedule_without_proof(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+
+    generation = SimpleNamespace(
+        plan=SimpleNamespace(scope_id="700:2026"),
+        generation_id="generation",
+        generation_signature="a" * 64,
+        manifest_sha256="b" * 64,
+        parser_version=espn_native_tasks.runner.PARSER_VERSION,
+        runtime_version=espn_native_tasks.runner.RUNTIME_VERSION,
+        registry_signature="c" * 64,
+        plan_signature="d" * 64,
+        schedule=(),
+        raw_ledger=(),
+        dispositions=(),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "validate_scope_generation",
+        lambda _generation: SimpleNamespace(passed=True, failures=()),
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="valid_empty proof"):
+        espn_native_tasks._scope_qualification_payload(
+            publication={"state": "complete", "evidence_ref": {}},
+            generation=generation,
+            evidence_payload={"recorded_at": "2026-08-08T12:00:00+00:00"},
         )
 
 
@@ -1991,13 +2035,7 @@ def test_scheduler_runtime_gate_requires_every_v3_v4_head(monkeypatch):
     from dags.utils import espn_native_tasks
 
     target = _scope_ids(_generated_registry(181))
-    heads = {
-        scope: SimpleNamespace(
-            snapshot_uri=f"file:///{scope}.json",
-            snapshot_sha256="a" * 64,
-        )
-        for scope in target
-    }
+    heads = {scope: SimpleNamespace(scope_id=scope) for scope in target}
     versions = {
         scope: (
             espn_native_tasks.runner.PARSER_VERSION,
@@ -2005,18 +2043,159 @@ def test_scheduler_runtime_gate_requires_every_v3_v4_head(monkeypatch):
         )
         for scope in target
     }
+    repositories = []
+
+    def repository_factory():
+        repository = object()
+        repositories.append(repository)
+        return repository
+
     monkeypatch.setattr(
-        espn_native_tasks.runner,
-        "load_scope_snapshot",
-        lambda _uri, *, expected_scope_id, **_kwargs: SimpleNamespace(
-            parser_version=versions[expected_scope_id][0],
-            runtime_version=versions[expected_scope_id][1],
+        espn_native_tasks, "EspnBronzeRepository", repository_factory
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_verified_complete_generation",
+        lambda head, *, repository: SimpleNamespace(
+            parser_version=versions[head.scope_id][0],
+            runtime_version=versions[head.scope_id][1],
         ),
     )
 
     espn_native_tasks._require_scheduler_runtime_heads(target, heads)
+    assert len(repositories) == 1
     versions[target[-1]] = ("espn-native-parser-v2", "espn-native-runtime-v3")
     with pytest.raises(espn_native_tasks.OperationsError, match="181/181"):
+        espn_native_tasks._require_scheduler_runtime_heads(target, heads)
+    assert len(repositories) == 2
+
+
+def test_scheduler_runtime_gate_rejects_uncompleted_head_before_activation(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.operations import ScopeHead
+
+    target = _scope_ids(_generated_registry(181))
+    published_at = datetime(2026, 8, 2, 12, tzinfo=timezone.utc)
+    heads = {
+        scope_id: ScopeHead(
+            dag_id="dag_ingest_espn",
+            scope_id=scope_id,
+            generation_id=f"generation-{scope_id}",
+            generation_signature=hashlib.sha256(
+                f"generation-signature:{scope_id}".encode()
+            ).hexdigest(),
+            manifest_sha256=hashlib.sha256(f"manifest:{scope_id}".encode()).hexdigest(),
+            snapshot_uri=f"file:///{scope_id}.json",
+            snapshot_sha256=hashlib.sha256(f"snapshot:{scope_id}".encode()).hexdigest(),
+            registry_signature="d" * 64,
+            plan_signature=hashlib.sha256(f"plan:{scope_id}".encode()).hexdigest(),
+            run_id="canary-run",
+            published_at=published_at,
+            completed_at=published_at,
+        )
+        for scope_id in target
+    }
+    heads[target[-1]] = replace(heads[target[-1]], completed_at=None)
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "load_scope_snapshot",
+        lambda _uri, *, expected_scope_id, **_kwargs: SimpleNamespace(
+            plan=SimpleNamespace(scope_id=expected_scope_id),
+            generation_id=heads[expected_scope_id].generation_id,
+            generation_signature=heads[expected_scope_id].generation_signature,
+            manifest_sha256=heads[expected_scope_id].manifest_sha256,
+            run_id=heads[expected_scope_id].run_id,
+            registry_signature=heads[expected_scope_id].registry_signature,
+            plan_signature=heads[expected_scope_id].plan_signature,
+            ingested_at=published_at,
+            parser_version=espn_native_tasks.runner.PARSER_VERSION,
+            runtime_version=espn_native_tasks.runner.RUNTIME_VERSION,
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "EspnBronzeRepository",
+        lambda: SimpleNamespace(
+            verify_published_scope=lambda _generation: SimpleNamespace(passed=True)
+        ),
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="COMPLETE"):
+        espn_native_tasks._require_scheduler_runtime_heads(target, heads)
+
+
+@pytest.mark.parametrize("drift", ("snapshot_identity", "physical_rows"))
+def test_scheduler_runtime_gate_rejects_snapshot_or_physical_drift(
+    monkeypatch, drift
+):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.operations import ScopeHead
+
+    target = _scope_ids(_generated_registry(181))
+    published_at = datetime(2026, 8, 2, 12, tzinfo=timezone.utc)
+    heads = {
+        scope_id: ScopeHead(
+            dag_id="dag_ingest_espn",
+            scope_id=scope_id,
+            generation_id=f"generation-{scope_id}",
+            generation_signature=hashlib.sha256(
+                f"generation-signature:{scope_id}".encode()
+            ).hexdigest(),
+            manifest_sha256=hashlib.sha256(f"manifest:{scope_id}".encode()).hexdigest(),
+            snapshot_uri=f"file:///{scope_id}.json",
+            snapshot_sha256=hashlib.sha256(f"snapshot:{scope_id}".encode()).hexdigest(),
+            registry_signature="d" * 64,
+            plan_signature=hashlib.sha256(f"plan:{scope_id}".encode()).hexdigest(),
+            run_id="canary-run",
+            published_at=published_at,
+            completed_at=published_at,
+        )
+        for scope_id in target
+    }
+    drift_scope = target[-1]
+
+    def generation_for(scope_id):
+        head = heads[scope_id]
+        return SimpleNamespace(
+            plan=SimpleNamespace(scope_id=scope_id),
+            generation_id=head.generation_id,
+            generation_signature=(
+                "f" * 64
+                if drift == "snapshot_identity" and scope_id == drift_scope
+                else head.generation_signature
+            ),
+            manifest_sha256=head.manifest_sha256,
+            run_id=head.run_id,
+            registry_signature=head.registry_signature,
+            plan_signature=head.plan_signature,
+            ingested_at=head.completed_at,
+            parser_version=espn_native_tasks.runner.PARSER_VERSION,
+            runtime_version=espn_native_tasks.runner.RUNTIME_VERSION,
+        )
+
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "load_scope_snapshot",
+        lambda _uri, *, expected_scope_id, **_kwargs: generation_for(
+            expected_scope_id
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "EspnBronzeRepository",
+        lambda: SimpleNamespace(
+            verify_published_scope=lambda generation: SimpleNamespace(
+                passed=not (
+                    drift == "physical_rows"
+                    and generation.plan.scope_id == drift_scope
+                )
+            )
+        ),
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError, match="COMPLETE"):
         espn_native_tasks._require_scheduler_runtime_heads(target, heads)
 
 
@@ -2807,6 +2986,10 @@ def test_pending_empty_control_evidence_is_strictly_loaded_for_next_plan(
                 "request_id": "scoreboard:1",
                 "query_start": "2026-01-01",
                 "query_end": "2026-01-31",
+                "requested_limit": 1000,
+                "event_count": 0,
+                "schema_valid": True,
+                "unsaturated": True,
             }
         ],
         "raw_evidence": [
@@ -5439,10 +5622,11 @@ def test_bound_lease_heartbeat_renews_at_long_running_boundary(monkeypatch):
         classmethod(lambda _cls: Store()),
     )
 
-    assert (
-        espn_native_tasks._heartbeat_scope_binding({"uri": "x", "sha256": "e" * 64})
-        == renewed
+    bound = espn_native_tasks._heartbeat_scope_binding(
+        {"uri": "x", "sha256": "e" * 64}
     )
+
+    assert bound[-1] == renewed
     assert calls[0][0] == lease
     assert calls[0][1]["ttl"] >= timedelta(hours=8)
 
@@ -5935,7 +6119,9 @@ def test_summary_mapped_retry_resumes_mixed_width_exact_requests(monkeypatch):
         lambda _ref: ({}, descriptor, loaded, scope, object()),
     )
     monkeypatch.setattr(
-        espn_native_tasks, "_heartbeat_scope_binding", lambda _ref: object()
+        espn_native_tasks,
+        "_heartbeat_scope_binding",
+        lambda ref: espn_native_tasks._binding(ref),
     )
     monkeypatch.setattr(
         espn_native_tasks.EspnRawStore, "from_uri", lambda _uri: object()
@@ -6053,7 +6239,9 @@ def test_scoreboard_mapped_retry_resumes_only_missing_exact_request(monkeypatch)
         lambda _ref: ({}, descriptor, loaded, scope, object()),
     )
     monkeypatch.setattr(
-        espn_native_tasks, "_heartbeat_scope_binding", lambda _ref: object()
+        espn_native_tasks,
+        "_heartbeat_scope_binding",
+        lambda ref: espn_native_tasks._binding(ref),
     )
     monkeypatch.setattr(
         espn_native_tasks.runner,
@@ -7023,7 +7211,13 @@ def _run_published_dq_through_terminal(monkeypatch, *, state, mutation=None):
         runtime_version=espn_native_tasks.runner.RUNTIME_VERSION,
         registry_snapshot_uri=registry_uri,
         ingested_at=recorded_at - timedelta(minutes=2),
-        schedule=(),
+        schedule=(
+            SimpleNamespace(
+                event_id=7001,
+                played_final=False,
+                summary_required=False,
+            ),
+        ),
         dispositions=(),
         raw_ledger=(),
     )
@@ -7191,6 +7385,11 @@ def _run_published_dq_through_terminal(monkeypatch, *, state, mutation=None):
     )
     monkeypatch.setattr(
         espn_native_tasks.runner, "_load_signed_plan", lambda _uri: loaded
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "_require_current_runtime_plan",
+        lambda _loaded: {"dag_id": descriptor["dag_id"]},
     )
     monkeypatch.setattr(
         espn_native_tasks, "_current_signed_plan_admission", lambda *a, **k: {}
@@ -7477,7 +7676,9 @@ def test_non_utc_scope_lease_serializes_and_binds_canonically(monkeypatch):
         espn_native_tasks.runner, "_load_signed_plan", lambda _uri: loaded
     )
     monkeypatch.setattr(
-        espn_native_tasks, "_current_signed_plan_admission", lambda *a, **k: {}
+        espn_native_tasks.runner,
+        "_require_current_runtime_plan",
+        lambda _loaded: {"dag_id": descriptor["dag_id"]},
     )
 
     *_, bound_lease = espn_native_tasks._binding(binding_ref)

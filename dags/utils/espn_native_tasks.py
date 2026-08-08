@@ -61,6 +61,7 @@ from scrapers.espn.registry import (
 from scrapers.espn.repository import (
     EspnBronzeRepository,
     ScopePublicationState,
+    validated_empty_schedule_proof,
     validate_scope_generation,
 )
 from scrapers.espn.selection import current_manifest_order_key
@@ -562,13 +563,16 @@ def _require_scheduler_runtime_heads(
     if set(heads) != set(target):
         raise OperationsError("scheduler runtime gate requires exact 181/181 heads")
     mismatches = []
+    repository = EspnBronzeRepository()
     for scope_id in target:
         head = heads[scope_id]
+        if head.scope_id != scope_id:
+            raise OperationsError(
+                f"scheduler runtime head {scope_id} has a different scope identity"
+            )
         try:
-            generation = runner.load_scope_snapshot(
-                head.snapshot_uri,
-                artifact_sha256=head.snapshot_sha256,
-                expected_scope_id=scope_id,
+            generation = _verified_complete_generation(
+                head, repository=repository
             )
         except Exception as exc:
             raise OperationsError(
@@ -2123,7 +2127,12 @@ def _binding(ref: Mapping[str, str]):
         raise OperationsError("scope descriptor scoreboard contract is invalid")
     plan_envelope = _read_ref(descriptor["plan_ref"], kind=runner.PLAN_KIND)
     loaded = runner._load_signed_plan(descriptor["plan_ref"]["uri"])
-    _current_signed_plan_admission(loaded, expected_dag_id=descriptor["dag_id"])
+    try:
+        admission = runner._require_current_runtime_plan(loaded)
+    except runner.RunnerError as exc:
+        raise OperationsError(f"current plan bundle is invalid: {exc}") from exc
+    if admission["dag_id"] != descriptor["dag_id"]:
+        raise OperationsError("signed plan admission DAG identity mismatch")
     if (
         loaded.signature,
         plan_envelope["signature"],
@@ -2279,15 +2288,16 @@ def _current_plan_index(
     return index, admission
 
 
-def _heartbeat_scope_binding(ref: Mapping[str, str]) -> ScopeLease:
-    """Extend one exact bound lease before a potentially long task boundary."""
+def _heartbeat_scope_binding(ref: Mapping[str, str]):
+    """Validate once and extend one lease before a long task boundary."""
 
-    _, _, _, _, lease = _binding(ref)
-    return PostgresEspnControlStore.from_env().renew(
+    binding, descriptor, loaded, scope, lease = _binding(ref)
+    renewed = PostgresEspnControlStore.from_env().renew(
         lease,
         now=datetime.now(UTC),
         ttl=LEASE_TTL,
     )
+    return binding, descriptor, loaded, scope, renewed
 
 
 def _http_client(
@@ -2442,8 +2452,9 @@ def fetch_scoreboard_batch(
 ) -> dict[str, str]:
     """Mapped network wave one: immutable scoreboard raw only."""
 
-    _heartbeat_scope_binding(scope_binding_ref)
-    binding, descriptor, loaded, scope, _ = _binding(scope_binding_ref)
+    binding, descriptor, loaded, scope, _ = _heartbeat_scope_binding(
+        scope_binding_ref
+    )
     if loaded.mode == "replay":
         raise OperationsError("replay must not instantiate a network operator")
     raw_store = EspnRawStore.from_uri(descriptor["raw_store_uri"])
@@ -2575,8 +2586,9 @@ def plan_summary_batch_wave(
     seen_scopes = set()
     for wrapped in scope_binding_refs:
         scope_binding_ref = wrapped["scope_binding_ref"]
-        _heartbeat_scope_binding(scope_binding_ref)
-        binding, descriptor, loaded, scope, _ = _binding(scope_binding_ref)
+        binding, descriptor, loaded, scope, _ = _heartbeat_scope_binding(
+            scope_binding_ref
+        )
         if scope.scope_id in seen_scopes:
             raise OperationsError("duplicate summary scope binding")
         seen_scopes.add(scope.scope_id)
@@ -2727,8 +2739,9 @@ def fetch_summary_batch(
     """Mapped network wave two: at most 50 immutable Summary responses."""
 
     batch = _read_ref(summary_batch_ref, kind="espn-summary-batch-plan-v1")
-    _heartbeat_scope_binding(batch["scope_binding_ref"])
-    _, descriptor, loaded, scope, _ = _binding(batch["scope_binding_ref"])
+    _, descriptor, loaded, scope, _ = _heartbeat_scope_binding(
+        batch["scope_binding_ref"]
+    )
     expected = batch["expected_batch"]
     if len(expected["event_ids"]) > 50:
         raise OperationsError("Summary network batch exceeds 50 events")
@@ -2850,8 +2863,9 @@ def reduce_raw_manifest_wave(
             raise OperationsError(
                 f"scope {scope_index['scope_id']} exhausted 100% Summary budget"
             )
-        _heartbeat_scope_binding(scope_index["scope_binding_ref"])
-        _, descriptor, loaded, scope, _ = _binding(scope_index["scope_binding_ref"])
+        _, descriptor, loaded, scope, _ = _heartbeat_scope_binding(
+            scope_index["scope_binding_ref"]
+        )
         typed_binding = loaded.bindings[scope.scope_id]
         expected_batches = []
         checkpoints = []
@@ -2919,8 +2933,9 @@ def bind_replay_raw_manifests(
     outputs = []
     for wrapped in planning["scope_binding_refs"]:
         scope_binding_ref = wrapped["scope_binding_ref"]
-        _heartbeat_scope_binding(scope_binding_ref)
-        _, descriptor, loaded, scope, _ = _binding(scope_binding_ref)
+        _, descriptor, loaded, scope, _ = _heartbeat_scope_binding(
+            scope_binding_ref
+        )
         if loaded.mode != "replay" or loaded.replay_source is None:
             raise OperationsError("replay raw binding requires replay plan identity")
         body = runner._read_artifact(descriptor["raw_manifest_uri"])
@@ -3019,8 +3034,9 @@ def offline_parse_scope(
     """Mapped zero-network parse from one exact raw manifest."""
 
     raw_phase = _read_ref(raw_phase_ref, kind="espn-raw-reduction-result-v1")
-    _heartbeat_scope_binding(raw_phase["scope_binding_ref"])
-    _, descriptor, loaded, scope, lease = _binding(raw_phase["scope_binding_ref"])
+    _, descriptor, loaded, scope, lease = _heartbeat_scope_binding(
+        raw_phase["scope_binding_ref"]
+    )
     raw_ref = raw_phase["raw_manifest_ref"]
     raw_payload = runner._validate_raw_manifest(_read_ref(raw_ref))
     if raw_ref["uri"] != descriptor["raw_manifest_uri"]:
@@ -3124,8 +3140,9 @@ def staging_dq_scope(*, offline_ref: Mapping[str, str], **_context) -> dict[str,
     """Run the full Task 4 scope validator before any append path exists."""
 
     phase = _read_ref(offline_ref, kind="espn-offline-parse-result-v1")
-    _heartbeat_scope_binding(phase["scope_binding_ref"])
-    _, descriptor, loaded, scope, _ = _binding(phase["scope_binding_ref"])
+    _, descriptor, loaded, scope, _ = _heartbeat_scope_binding(
+        phase["scope_binding_ref"]
+    )
     staging = phase["staging"]
     if staging["run_id"] != loaded.plan.run_id:
         raise OperationsError("staging run identity mismatch")
@@ -3545,6 +3562,20 @@ def _scope_qualification_payload(
         }
         for item in sorted(generation.raw_ledger, key=lambda item: item.request_id)
     ]
+    if generation.schedule:
+        schedule_qualification = {"state": "captured", "failures": []}
+    else:
+        try:
+            proof = validated_empty_schedule_proof(generation)
+        except (TypeError, ValueError) as exc:
+            raise OperationsError(
+                f"qualification valid_empty proof is invalid: {exc}"
+            ) from exc
+        schedule_qualification = {
+            "state": "valid_empty",
+            "proof": proof,
+            "failures": [],
+        }
     return {
         "scope_id": generation.plan.scope_id,
         "outcome": outcome,
@@ -3555,10 +3586,7 @@ def _scope_qualification_payload(
         "runtime_version": generation.runtime_version,
         "registry_signature": generation.registry_signature,
         "plan_signature": generation.plan_signature,
-        "schedule": {
-            "state": "captured" if generation.schedule else "valid_empty",
-            "failures": [],
-        },
+        "schedule": schedule_qualification,
         "events": events,
         "raw_evidence": raw_evidence,
         "revalidation": {
@@ -4886,43 +4914,53 @@ def _verified_complete_head(
     if head is None:
         return None, "incomplete"
     try:
-        generation = runner.load_scope_snapshot(
-            head.snapshot_uri,
-            artifact_sha256=head.snapshot_sha256,
-            expected_scope_id=head.scope_id,
-        )
-        identity = (
-            generation.plan.scope_id,
-            generation.generation_id,
-            generation.generation_signature,
-            generation.manifest_sha256,
-            generation.run_id,
-            generation.registry_signature,
-            generation.plan_signature,
-        )
-        expected = (
-            head.scope_id,
-            head.generation_id,
-            head.generation_signature,
-            head.manifest_sha256,
-            head.run_id,
-            head.registry_signature,
-            head.plan_signature,
-        )
-        if identity != expected:
-            raise OperationsError("scope head snapshot identity mismatch")
-        if (
-            head.completed_at is None
-            or generation.ingested_at != head.completed_at
-            or head.completed_at > head.published_at
-        ):
-            raise OperationsError("scope head completion timestamp mismatch")
-        report = EspnBronzeRepository().verify_published_scope(generation)
-        if not report.passed:
-            raise OperationsError("scope head COMPLETE physical parity failed")
+        _verified_complete_generation(head)
     except Exception:
         return None, "incomplete"
     return head, "complete"
+
+
+def _verified_complete_generation(
+    head: ScopeHead, *, repository: EspnBronzeRepository | None = None
+):
+    """Load one head only after exact identity, completion and Bronze parity."""
+
+    generation = runner.load_scope_snapshot(
+        head.snapshot_uri,
+        artifact_sha256=head.snapshot_sha256,
+        expected_scope_id=head.scope_id,
+    )
+    identity = (
+        generation.plan.scope_id,
+        generation.generation_id,
+        generation.generation_signature,
+        generation.manifest_sha256,
+        generation.run_id,
+        generation.registry_signature,
+        generation.plan_signature,
+    )
+    expected = (
+        head.scope_id,
+        head.generation_id,
+        head.generation_signature,
+        head.manifest_sha256,
+        head.run_id,
+        head.registry_signature,
+        head.plan_signature,
+    )
+    if identity != expected:
+        raise OperationsError("scope head snapshot identity mismatch")
+    if (
+        head.completed_at is None
+        or generation.ingested_at != head.completed_at
+        or head.completed_at > head.published_at
+    ):
+        raise OperationsError("scope head completion timestamp mismatch")
+    verifier = repository if repository is not None else EspnBronzeRepository()
+    report = verifier.verify_published_scope(generation)
+    if not report.passed:
+        raise OperationsError("scope head COMPLETE physical parity failed")
+    return generation
 
 
 def _qualified_freshness_at(

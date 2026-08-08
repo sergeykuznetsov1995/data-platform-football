@@ -1069,11 +1069,13 @@ def _require_current_plan_artifact_chain(
     admission: Mapping[str, Any],
     *,
     scope_id: str,
-    scope_root: str,
 ) -> None:
-    """Authenticate one immutable plan through its run index and descriptor."""
+    """Authenticate the complete indexed plan bundle and the current member."""
 
     artifact_root = admission["artifact_root"]
+    registry_ref = _exact_artifact_ref(
+        admission["registry_ref"], "current admission.registry_ref"
+    )
     index = _read_current_json_artifact(
         _current_artifact_uri(artifact_root, "plan-index.json"),
         "current plan index",
@@ -1112,18 +1114,11 @@ def _require_current_plan_artifact_chain(
         _exact_artifact_ref(ref, f"current plan index.scope_plan_refs[{position}]")
         for position, ref in enumerate(refs)
     )
-    expected_descriptor_uri = _current_artifact_uri(
-        scope_root, "scope-plan-descriptor.json"
-    )
-    matching_refs = tuple(
-        ref for ref in descriptor_refs if ref["uri"] == expected_descriptor_uri
-    )
     if (
         index.get("schema_version") != 1
         or index_scopes != tuple(admission["scope_ids"])
         or scope_id not in index_scopes
         or len({ref["uri"] for ref in descriptor_refs}) != len(descriptor_refs)
-        or len(matching_refs) != 1
         or not set(network_scopes).issubset(index_scopes)
         or type(index["expected_scoreboard_map_count"]) is not int
         or index["expected_scoreboard_map_count"] != len(network_scopes)
@@ -1155,12 +1150,6 @@ def _require_current_plan_artifact_chain(
         raise RunnerConfigurationError(
             "current plan index differs from immutable plan identity"
         )
-
-    descriptor = _read_exact_json_ref(
-        matching_refs[0],
-        "current plan index scope descriptor",
-        kind="espn-scope-plan-descriptor-v1",
-    )
     descriptor_fields = {
         "kind",
         "schema_version",
@@ -1178,64 +1167,263 @@ def _require_current_plan_artifact_chain(
         "scoreboard_checkpoint_uri",
         "scope_root",
     }
-    _exact_keys(descriptor, descriptor_fields, "current plan scope descriptor")
-    plan_ref = _exact_artifact_ref(
-        descriptor["plan_ref"], "current plan scope descriptor.plan_ref"
-    )
-    plan_envelope = _read_exact_json_ref(
-        plan_ref,
-        "current plan scope descriptor.plan_ref",
-        kind=PLAN_KIND,
-    )
-    _exact_keys(plan_envelope, {"kind", "plan", "signature"}, "plan envelope")
-    scoreboard_batch = descriptor["expected_scoreboard_batch"]
-    scoreboard_checkpoint_uri = descriptor["scoreboard_checkpoint_uri"]
-    if (
-        descriptor.get("schema_version") != 1
-        or plan_ref["uri"] != loaded.plan_uri
-        or plan_envelope
-        != {
-            "kind": PLAN_KIND,
-            "plan": loaded.plan.to_dict(),
-            "signature": loaded.signature,
-        }
-        or (
-            descriptor["dag_id"],
-            descriptor["run_id"],
-            descriptor["attempt"],
-            descriptor["mode"],
-            descriptor["scope_id"],
-            descriptor["plan_signature"],
-            descriptor["raw_manifest_uri"],
-            descriptor["raw_store_uri"],
-            descriptor["generation_snapshot_uri"],
-            descriptor["scope_root"],
+    signatures: list[str] = []
+    network_from_descriptors: list[str] = []
+    current_descriptor = None
+    seen_plan_uris: set[str] = set()
+    for position, (expected_scope_id, descriptor_ref) in enumerate(
+        zip(index_scopes, descriptor_refs, strict=True)
+    ):
+        expected_scope_root = _current_artifact_uri(
+            artifact_root, "scopes", expected_scope_id.replace(":", "-")
         )
-        != (
-            admission["dag_id"],
-            loaded.plan.run_id,
-            loaded.attempt,
-            loaded.mode,
-            scope_id,
-            loaded.signature,
-            loaded.raw_manifest_uri,
-            loaded.raw_store_uri,
-            loaded.bindings[scope_id].generation_snapshot_uri,
-            scope_root,
+        expected_descriptor_uri = _current_artifact_uri(
+            expected_scope_root, "scope-plan-descriptor.json"
         )
-        or (scoreboard_batch is None) != (scoreboard_checkpoint_uri is None)
-        or (
-            scoreboard_batch is not None
-            and (
-                not isinstance(scoreboard_batch, Mapping)
-                or not isinstance(scoreboard_checkpoint_uri, str)
-                or not scoreboard_checkpoint_uri
+        if descriptor_ref["uri"] != expected_descriptor_uri:
+            raise RunnerConfigurationError(
+                "current plan index descriptor order or URI is invalid"
+            )
+        descriptor = _read_exact_json_ref(
+            descriptor_ref,
+            f"current plan index scope descriptor[{position}]",
+            kind="espn-scope-plan-descriptor-v1",
+        )
+        _exact_keys(
+            descriptor,
+            descriptor_fields,
+            f"current plan scope descriptor[{position}]",
+        )
+        plan_ref = _exact_artifact_ref(
+            descriptor["plan_ref"],
+            f"current plan scope descriptor[{position}].plan_ref",
+        )
+        expected_plan_uri = _current_artifact_uri(expected_scope_root, "plan.json")
+        if plan_ref["uri"] != expected_plan_uri or plan_ref["uri"] in seen_plan_uris:
+            raise RunnerConfigurationError(
+                "current plan index plan references are duplicated or missing"
+            )
+        seen_plan_uris.add(plan_ref["uri"])
+        plan_envelope = _read_exact_json_ref(
+            plan_ref,
+            f"current plan scope descriptor[{position}].plan_ref",
+            kind=PLAN_KIND,
+        )
+        _exact_keys(
+            plan_envelope,
+            {"kind", "plan", "signature"},
+            f"current plan envelope[{position}]",
+        )
+        candidate = _load_signed_plan(plan_ref["uri"])
+        scoreboard_batch = descriptor["expected_scoreboard_batch"]
+        scoreboard_checkpoint_uri = descriptor["scoreboard_checkpoint_uri"]
+        planned_scoreboard_requests = (
+            ()
+            if candidate.mode == "replay"
+            else _scoreboard_requests(
+                candidate.plan.scopes[0],
+                candidate.bindings[expected_scope_id],
+                as_of=candidate.plan.as_of,
+                mode=_effective_mode(candidate),
             )
         )
-    ):
-        raise RunnerConfigurationError(
-            "current scope descriptor differs from immutable plan identity"
+        planned_request_ids = tuple(
+            item.request_id for item in planned_scoreboard_requests
         )
+        if bool(planned_request_ids) != (scoreboard_batch is not None):
+            raise RunnerConfigurationError(
+                "current scope scoreboard network identity is invalid"
+            )
+        if scoreboard_batch is not None:
+            batch_fields = {
+                "kind",
+                "schema_version",
+                "endpoint",
+                "run_id",
+                "attempt",
+                "scope_id",
+                "plan_signature",
+                "batch_id",
+                "request_ids",
+                "event_ids",
+                "descriptor_sha256",
+            }
+            if not isinstance(scoreboard_batch, Mapping):
+                raise RunnerConfigurationError(
+                    "current scope scoreboard descriptor must be an object"
+                )
+            _exact_keys(
+                scoreboard_batch,
+                batch_fields,
+                f"current scope scoreboard descriptor[{position}]",
+            )
+            batch_base = {
+                key: scoreboard_batch[key]
+                for key in batch_fields - {"descriptor_sha256"}
+            }
+            expected_batch_id = hashlib.sha256(
+                _canonical_bytes(
+                    {
+                        "kind": "espn-scoreboard-batch-id-v1",
+                        "scope_id": expected_scope_id,
+                        "plan_signature": candidate.signature,
+                        "request_ids": planned_request_ids,
+                    }
+                )
+            ).hexdigest()
+            if (
+                scoreboard_batch["descriptor_sha256"]
+                != hashlib.sha256(_canonical_bytes(batch_base)).hexdigest()
+                or (
+                    scoreboard_batch["kind"],
+                    scoreboard_batch["schema_version"],
+                    scoreboard_batch["endpoint"],
+                    scoreboard_batch["run_id"],
+                    scoreboard_batch["attempt"],
+                    scoreboard_batch["scope_id"],
+                    scoreboard_batch["plan_signature"],
+                    scoreboard_batch["batch_id"],
+                    scoreboard_batch["request_ids"],
+                    scoreboard_batch["event_ids"],
+                )
+                != (
+                    "espn-raw-batch-descriptor-v1",
+                    1,
+                    "scoreboard",
+                    index["run_id"],
+                    index["attempt"],
+                    expected_scope_id,
+                    candidate.signature,
+                    expected_batch_id,
+                    sorted(planned_request_ids),
+                    [],
+                )
+                or scoreboard_checkpoint_uri
+                != _current_artifact_uri(
+                    expected_scope_root,
+                    "raw",
+                    f"scoreboard-{scoreboard_batch['batch_id']}.json",
+                )
+            ):
+                raise RunnerConfigurationError(
+                    "current scope scoreboard network identity is invalid"
+                )
+            network_from_descriptors.append(expected_scope_id)
+        elif scoreboard_checkpoint_uri is not None:
+            raise RunnerConfigurationError(
+                "current scope scoreboard checkpoint lacks a descriptor"
+            )
+        if candidate.mode != "replay":
+            expected_locations = _current_artifact_uri(
+                expected_scope_root, "raw-manifest.json"
+            )
+            runtime_identity_matches = (
+                candidate.plan.as_of.isoformat() == admission["as_of"]
+                and candidate.registry_snapshot_uri == registry_ref["uri"]
+                and candidate.raw_store_uri == admission["raw_store_uri"]
+                and admission["replay_sources"] == {}
+            )
+            expected_raw_store_uri = admission["raw_store_uri"]
+        else:
+            replay_sources = _mapping(
+                admission["replay_sources"], "current admission.replay_sources"
+            )
+            if set(replay_sources) != set(index_scopes):
+                raise RunnerConfigurationError(
+                    "current replay admission source scope set is invalid"
+                )
+            source_ref = _exact_artifact_ref(
+                replay_sources.get(expected_scope_id),
+                f"current admission.replay_sources[{expected_scope_id!r}]",
+            )
+            expected_locations = source_ref["uri"]
+            runtime_identity_matches = (
+                candidate.replay_source is not None
+                and candidate.replay_source.raw_manifest_sha256
+                == source_ref["sha256"]
+            )
+            expected_raw_store_uri = candidate.raw_store_uri
+        if (
+            descriptor.get("schema_version") != 1
+            or plan_envelope
+            != {
+                "kind": PLAN_KIND,
+                "plan": candidate.plan.to_dict(),
+                "signature": candidate.signature,
+            }
+            or len(candidate.plan.scopes) != 1
+            or candidate.selected_scopes != (expected_scope_id,)
+            or tuple(candidate.bindings) != (expected_scope_id,)
+            or candidate.admission_ref != loaded.admission_ref
+            or _canonical_bytes(candidate.release)
+            != _canonical_bytes(admission["release"])
+            or _canonical_bytes(candidate.canary_claim)
+            != _canonical_bytes(admission["canary_claim"])
+            or not runtime_identity_matches
+            or (
+                descriptor["dag_id"],
+                descriptor["run_id"],
+                descriptor["attempt"],
+                descriptor["mode"],
+                descriptor["scope_id"],
+                descriptor["plan_signature"],
+                descriptor["raw_manifest_uri"],
+                descriptor["raw_store_uri"],
+                descriptor["generation_snapshot_uri"],
+                descriptor["scope_root"],
+                candidate.plan.scopes[0].scope_id,
+                candidate.plan.registry_signature,
+                candidate.plan.run_id,
+                candidate.attempt,
+                candidate.mode,
+                candidate.plan_uri,
+                candidate.raw_manifest_uri,
+                candidate.output_uri,
+                candidate.raw_store_uri,
+                candidate.bindings[expected_scope_id].generation_snapshot_uri,
+                candidate.max_events,
+            )
+            != (
+                admission["dag_id"],
+                index["run_id"],
+                index["attempt"],
+                index["mode"],
+                expected_scope_id,
+                candidate.signature,
+                expected_locations,
+                expected_raw_store_uri,
+                _current_artifact_uri(expected_scope_root, "generation.json"),
+                expected_scope_root,
+                expected_scope_id,
+                index["registry_signature"],
+                index["run_id"],
+                index["attempt"],
+                index["mode"],
+                expected_plan_uri,
+                expected_locations,
+                _current_artifact_uri(expected_scope_root, "runner-result.json"),
+                expected_raw_store_uri,
+                _current_artifact_uri(expected_scope_root, "generation.json"),
+                DEFAULT_MAX_SUMMARY_EVENTS,
+            )
+        ):
+            raise RunnerConfigurationError(
+                "current scope descriptor differs from immutable plan identity"
+            )
+        signatures.append(candidate.signature)
+        if expected_scope_id == scope_id:
+            current_descriptor = descriptor
+            if candidate.signature != loaded.signature or candidate.plan != loaded.plan:
+                raise RunnerConfigurationError(
+                    "current indexed plan differs from executing signed plan"
+                )
+    if (
+        current_descriptor is None
+        or tuple(network_from_descriptors) != network_scopes
+        or hashlib.sha256(_canonical_bytes(sorted(signatures))).hexdigest()
+        != index["bundle_signature"]
+    ):
+        raise RunnerConfigurationError("current plan index bundle identity mismatch")
 
 
 def _require_current_plan_runtime_binding(
@@ -1246,7 +1434,6 @@ def _require_current_plan_runtime_binding(
     registry_ref = _exact_artifact_ref(
         admission["registry_ref"], "current admission.registry_ref"
     )
-    _read_exact_json_ref(registry_ref, "current admission.registry_ref")
     artifact_root = _required_string(
         admission["artifact_root"], "current admission.artifact_root"
     )
@@ -1300,8 +1487,8 @@ def _require_current_plan_runtime_binding(
         loaded,
         admission,
         scope_id=scope_id,
-        scope_root=scope_root,
     )
+    _read_exact_json_ref(registry_ref, "current admission.registry_ref")
 
     if loaded.mode != "replay":
         if (
@@ -2868,6 +3055,28 @@ def _qualify_empty_schedule(
         str(item.get("request_id")) for item in planned_windows
     ):
         raise ScopeIncompleteError("empty schedule planned window/raw identity mismatch")
+    for window in planned_windows:
+        if (
+            not isinstance(window, Mapping)
+            or set(window)
+            != {
+                "request_id",
+                "query_start",
+                "query_end",
+                "requested_limit",
+                "event_count",
+                "schema_valid",
+                "unsaturated",
+            }
+            or type(window.get("requested_limit")) is not int
+            or window["requested_limit"] <= 0
+            or window.get("event_count") != 0
+            or window.get("schema_valid") is not True
+            or window.get("unsaturated") is not True
+        ):
+            raise ScopeIncompleteError(
+                "empty schedule planned window validation is incomplete"
+            )
     current_observation = {
         "run_id": current_run_id,
         "observed_at": max(item.fetched_at for item in current_scoreboard).isoformat(),
@@ -2876,6 +3085,10 @@ def _qualify_empty_schedule(
                 "request_id": str(item["request_id"]),
                 "query_start": str(item["query_start"]),
                 "query_end": str(item["query_end"]),
+                "requested_limit": item["requested_limit"],
+                "event_count": item["event_count"],
+                "schema_valid": item["schema_valid"],
+                "unsaturated": item["unsaturated"],
             }
             for item in sorted(planned_windows, key=lambda item: str(item["request_id"]))
         ],
@@ -3053,8 +3266,12 @@ def _prepare_scope_scoreboard(
                     "request_id": request.request_id,
                     "query_start": request.query_start.isoformat(),
                     "query_end": request.query_end.isoformat(),
+                    "requested_limit": request.params["limit"],
+                    "event_count": len(rows),
+                    "schema_valid": True,
+                    "unsaturated": True,
                 }
-                for request in requests
+                for request, rows in parsed_pages
             ),
             mode=mode,
             current_run_id=loaded.plan.run_id,

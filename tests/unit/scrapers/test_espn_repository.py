@@ -614,6 +614,10 @@ def test_unknown_empty_schedule_accepts_exact_distinct_scheduled_pair():
                     "request_id": scoreboard.request_id,
                     "query_start": "2020-01-01",
                     "query_end": "2020-01-31",
+                    "requested_limit": 1000,
+                    "event_count": 0,
+                    "schema_valid": True,
+                    "unsaturated": True,
                 }
             ],
             "raw_evidence": [
@@ -665,6 +669,91 @@ def test_unknown_empty_schedule_accepts_exact_distinct_scheduled_pair():
     )
 
     assert validate_scope_generation(candidate).passed
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "capability", (CapabilityState.PARTIAL, CapabilityState.ABSENT)
+)
+def test_partial_or_absent_empty_schedule_requires_exact_valid_empty_proof(
+    capability,
+):
+    generation = _generation()
+    plan = ScopePlan(
+        **{
+            **generation.plan.to_dict(),
+            "start_date": generation.plan.start_date,
+            "end_date": generation.plan.end_date,
+            "capabilities": EntityCapabilities(
+                schedule=capability,
+                lineup=CapabilityState.UNKNOWN,
+                matchsheet=CapabilityState.UNKNOWN,
+            ),
+        }
+    )
+    scoreboard = RawLedgerRecord(
+        **{**generation.raw_ledger[0].constructor_values(), "event_ids": ()}
+    )
+    values = {
+        **generation.constructor_values(),
+        "plan": plan,
+        "schedule": (),
+        "lineup": (),
+        "matchsheet": (),
+        "planned_request_ids": (scoreboard.request_id,),
+        "raw_ledger": (scoreboard,),
+        "dispositions": (),
+    }
+
+    missing = validate_scope_generation(ScopeGeneration(**values))
+
+    assert not missing.passed
+    assert "exact valid_empty proof" in " ".join(missing.failures)
+
+    proof = {
+        "kind": "espn-empty-schedule-qualification-v1",
+        "method": "explicit_source_metadata",
+        "capability": capability.value,
+        "observations": [
+            {
+                "run_id": generation.run_id,
+                "observed_at": scoreboard.fetched_at.isoformat(),
+                "planned_windows": [
+                    {
+                        "request_id": scoreboard.request_id,
+                        "query_start": "2020-01-01",
+                        "query_end": "2020-01-31",
+                        "requested_limit": 1000,
+                        "event_count": 0,
+                        "schema_valid": True,
+                        "unsaturated": True,
+                    }
+                ],
+                "raw_evidence": [
+                    {
+                        "request_id": scoreboard.request_id,
+                        "raw_uri": scoreboard.raw_uri,
+                        "raw_sha256": scoreboard.raw_sha256,
+                        "fetched_at": scoreboard.fetched_at.isoformat(),
+                    }
+                ],
+            }
+        ],
+    }
+    proven = ScopeGeneration(
+        **{
+            **values,
+            "dispositions": (
+                RequestDisposition(
+                    endpoint="schedule",
+                    state=DispositionState.VALID_EMPTY,
+                    detail=canonical_json(proof),
+                ),
+            ),
+        }
+    )
+
+    assert validate_scope_generation(proven).passed
 
 
 @pytest.mark.unit

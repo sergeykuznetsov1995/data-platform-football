@@ -88,7 +88,11 @@ def test_real_airflow_zero_summary_map_executes_actual_espn_reducer(
         bindings={scope_id: SimpleNamespace(active=False, prior=object())}
     )
     scope = SimpleNamespace(scope_id=scope_id)
-    monkeypatch.setattr(tasks, "_heartbeat_scope_binding", lambda _ref: None)
+    monkeypatch.setattr(
+        tasks,
+        "_heartbeat_scope_binding",
+        lambda ref: tasks._binding(ref),
+    )
     monkeypatch.setattr(
         tasks,
         "_binding",
