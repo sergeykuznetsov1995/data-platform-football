@@ -1217,3 +1217,75 @@ def test_real_config_floor_basis_smoke(real_config_dir):
         "INT-World Cup") == (104, 48)
     assert real_config_dir.get_competition_floor_basis(
         "GER-Bundesliga") == (306, 18)
+
+
+def test_production_team_aliases_have_no_normalized_league_collision():
+    """The SQL xref join key must map to one team inside each league."""
+    import yaml
+
+    from utils import medallion_config
+
+    doc = yaml.safe_load(
+        (PROJECT_ROOT / "configs" / "medallion" / "team_aliases.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    medallion_config._validate_team_aliases_schema(doc)
+
+
+def test_team_aliases_reject_normalized_collision_inside_one_league():
+    from utils import medallion_config
+
+    doc = {
+        "teams": [
+            {
+                "canonical_name": "Example City",
+                "canonical_id": "example_city",
+                "country": "England",
+                "short_name": "City",
+                "aliases": {"espn": ["Example City FC"]},
+                "competition_scope": ["ENG-Premier League"],
+            },
+            {
+                "canonical_name": "Different Club",
+                "canonical_id": "different_club",
+                "country": "England",
+                "short_name": "Different",
+                "aliases": {"espn": ["Éxample City"]},
+                "competition_scope": ["ENG-Premier League"],
+            },
+        ]
+    }
+
+    with pytest.raises(
+        medallion_config.MedallionConfigError,
+        match="normalized alias collision",
+    ):
+        medallion_config._validate_team_aliases_schema(doc)
+
+
+def test_same_normalized_alias_is_allowed_in_different_leagues():
+    from utils import medallion_config
+
+    doc = {
+        "teams": [
+            {
+                "canonical_name": "Example City",
+                "canonical_id": "example_city_eng",
+                "country": "England",
+                "short_name": "City",
+                "aliases": {"espn": ["Example City FC"]},
+                "competition_scope": ["ENG-Premier League"],
+            },
+            {
+                "canonical_name": "Example City",
+                "canonical_id": "example_city_esp",
+                "country": "Spain",
+                "short_name": "City",
+                "aliases": {"espn": ["Éxample City"]},
+                "competition_scope": ["ESP-La Liga"],
+            },
+        ]
+    }
+
+    medallion_config._validate_team_aliases_schema(doc)

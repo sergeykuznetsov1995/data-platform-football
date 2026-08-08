@@ -20,7 +20,7 @@
 --   iceberg.silver.xref_match            — match_id resolution (all sources incl. ESPN)
 --   iceberg.silver.xref_team             — team alias canonicalisation
 --   iceberg.silver.xref_player           — player canonical id (FBref/US/WS only)
---   iceberg.bronze.espn_schedule         — maps the ESPN `espn_<hash>` pseudo-id to
+--   iceberg.bronze.espn_schedule_current — maps the ESPN `espn_<hash>` pseudo-id to
 --                                          `game_id` (silver.espn_lineup carries no
 --                                          game_id — see silver/espn_lineup.sql:22)
 --
@@ -53,11 +53,12 @@
 --                       pseudo-id ('espn_<hash>'), preserving lineage and
 --                       letting downstream DQ surface the orphan rate.
 --
---   Footgun — do NOT add `season` to the xref_match JOIN predicate:
---     xref_match dedups to (canonical_id, source), and bronze.espn_schedule
---     reuses one game_id across season labels (#809: 0001/0102/0203, 0809/0910,
---     1920/2021), so xref_match has NO rows for seasons 0102/0203/0910. A
---     season predicate would unbridge them. (source_id, league) is unique there.
+--   Task 3 promotion boundary:
+--     The explicit ESPN season mapping admits only six exact platform grains;
+--     historical duplicate source labels from #809 remain Bronze-only. The
+--     xref_match bridge therefore keys on (source_id, league, season). This
+--     prevents a reused ESPN game_id in another season from selecting the
+--     wrong canonical or fanning out the mapped lineup grain.
 --
 -- =============================================================================
 -- ADR — player_id resolution (ESPN ↔ canonical)
@@ -135,6 +136,12 @@
 -- =============================================================================
 
 WITH
+espn_downstream_scope (
+    scope_id, espn_id, source_season_year, platform_league,
+    platform_season_slug, convention, effective_start_date, effective_end_date
+) AS (VALUES
+__ESPN_DOWNSTREAM_SCOPE_VALUES__
+),
 -- ============================================================================
 -- 1) ESPN → FBref match_id bridge
 -- ============================================================================
@@ -175,14 +182,21 @@ xref_team_dedup AS (
 -- espn_match_id below. game_id is the key into xref_match (source='espn').
 espn_schedule_dedup AS (
     SELECT
-        league, season, game, game_id,
+        espn_scope.platform_league AS league,
+        espn_scope.platform_season_slug AS season,
+        es_source.game,
+        es_source.game_id,
         ROW_NUMBER() OVER (
-            PARTITION BY league, season, game
-            ORDER BY _ingested_at DESC
+            PARTITION BY espn_scope.platform_league,
+                espn_scope.platform_season_slug,
+                es_source.game
+            ORDER BY es_source._ingested_at DESC
         ) AS rn
-    FROM iceberg.bronze.espn_schedule
-    WHERE game IS NOT NULL
-      AND game_id IS NOT NULL
+    FROM iceberg.bronze.espn_schedule_current es_source
+    JOIN espn_downstream_scope espn_scope ON
+__ESPN_DOWNSTREAM_SCOPE_FILTER__
+    WHERE es_source.game IS NOT NULL
+      AND es_source.game_id IS NOT NULL
 ),
 espn_match_bridge AS (
     SELECT
@@ -192,9 +206,9 @@ espn_match_bridge AS (
             || '|' || COALESCE(CAST(es.season AS varchar), '')
             || '|' || COALESCE(es.game, '')
         ))))                                                AS espn_match_id,
-        -- (source_id, league) is unique in xref_match(source='espn'), so MAX is
-        -- an identity over ≤1 row — it exists only to satisfy the GROUP BY that
-        -- collapses the hash seed. Orphan canonicals ('es_<game_id>') are
+        -- (source_id, league, season) is exact in xref_match(source='espn'), so
+        -- MAX is an identity over ≤1 row — it exists only to satisfy the GROUP
+        -- BY that collapses the hash seed. Orphan canonicals ('es_<game_id>') are
         -- filtered out, so a non-spine game leaves this NULL and espn_resolved
         -- falls back to the 'espn_<hash>' pseudo-id (lineage preserved).
         MAX(xm.canonical_id)                                AS fbref_match_id,
@@ -205,7 +219,7 @@ espn_match_bridge AS (
         ON  xm.source     = 'espn'
         AND xm.source_id  = CAST(es.game_id AS varchar)
         AND xm.league     = es.league
-        -- NO season predicate — see the footgun in the ADR above (#809).
+        AND xm.season     = es.season
         AND xm.confidence <> 'orphan'
     WHERE es.rn = 1
     -- #445: ordinals, NOT select aliases — Trino raises COLUMN_NOT_FOUND on

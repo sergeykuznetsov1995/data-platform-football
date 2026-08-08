@@ -102,14 +102,71 @@ def _spine_season_predicate() -> str:
         get_competition_seasons,
         get_in_scope_competitions,
     )
-    slugs = sorted({
-        f"{int(s):04d}"
-        for league in get_in_scope_competitions()
-        for s in get_competition_seasons(league)
-    })
-    if not slugs:
+    pairs = []
+    for league in get_in_scope_competitions():
+        slugs = sorted({f"{int(s):04d}" for s in get_competition_seasons(league)})
+        if not slugs:
+            continue
+        safe_league = league.replace("'", "''")
+        pairs.append(
+            f"(league = '{safe_league}' AND season IN ("
+            + ", ".join(f"'{slug}'" for slug in slugs)
+            + "))"
+        )
+    if not pairs:
         return 'TRUE'
-    return "season IN (" + ", ".join(f"'{s}'" for s in slugs) + ")"
+    return "(" + " OR ".join(pairs) + ")"
+
+
+def _espn_promoted_grains() -> List[Dict[str, Any]]:
+    """Exact reviewed ESPN platform grains with medallion-owned DQ sizes."""
+
+    from utils.espn_season_mapping import load_season_mapping
+    from utils.config import get_min_row_threshold
+    from utils.medallion_config import load_competitions
+
+    competition_rows = {
+        row['id']: row for row in load_competitions()['competitions']
+    }
+    grains: List[Dict[str, Any]] = []
+    for mapping in load_season_mapping().enabled:
+        competition = competition_rows[mapping.platform_league]
+        season = next(
+            row for row in competition['seasons']
+            if str(row['id']) == mapping.platform_season_slug
+        )
+        team_count = int(season['team_count'])
+        match_count = season.get('match_count')
+        if match_count is None:
+            match_count = team_count * (team_count - 1)
+        grains.append({
+            'league': mapping.platform_league,
+            'season': mapping.platform_season_slug,
+            'team_count': team_count,
+            'team_floor': get_min_row_threshold(
+                'sofifa_teams', mapping.platform_league
+            ),
+            'match_count': int(match_count),
+            'match_floor': get_min_row_threshold(
+                'espn_schedule', mapping.platform_league
+            ),
+        })
+    return grains
+
+
+def _xref_match_global_cap() -> int:
+    """All configured spine grains × seven sources × twofold headroom."""
+
+    from utils.medallion_config import load_competitions
+
+    total = 0
+    for competition in load_competitions()['competitions']:
+        if competition.get('in_scope') is not True:
+            continue
+        for season in competition.get('seasons') or []:
+            teams = int(season['team_count'])
+            total += int(season.get('match_count') or teams * (teams - 1))
+    return max(1900, total * 7 * 2)
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +185,7 @@ def build_xref_team_checks() -> List[Check]:
     rows would silently inflate the table; an upper bound flags it.
     """
     table = 'iceberg.silver.xref_team'
-    return [
+    checks = [
         # Row count: 8 sources × ~50 distinct teams across seasons — min 400.
         # Upper bound 5000 per in-scope league covers 5 seasons of growth
         # before triggering (E8b: ×5 leagues).
@@ -161,6 +218,28 @@ def build_xref_team_checks() -> List[Check]:
             severity='ERROR',
         ),
     ]
+    for grain in _espn_promoted_grains():
+        league = str(grain['league']).replace("'", "''")
+        season = str(grain['season']).replace("'", "''")
+        where = (
+            f"source = 'espn' AND league = '{league}' "
+            f"AND season = '{season}'"
+        )
+        checks.append(CHECK.row_count(
+            table,
+            min_rows=int(grain['team_floor']),
+            max_rows=int(grain['team_count']),
+            where=where,
+            name=f"espn_promoted_grain[xref_team.{grain['league']}.{grain['season']}]",
+        ))
+        checks.append(CHECK.row_count(
+            table,
+            min_rows=0,
+            max_rows=0,
+            where=where + " AND confidence = 'orphan'",
+            name=f"espn_orphans[xref_team.{grain['league']}.{grain['season']}]",
+        ))
+    return checks
 
 
 def build_xref_match_checks() -> List[Check]:
@@ -181,7 +260,7 @@ def build_xref_match_checks() -> List[Check]:
         # 5 seasons × ~380 fixtures × 7 sources ≈ 13K per league; cap 60K each,
         # with headroom (E8b: ×5 leagues). NB: matchhistory/espn also carry
         # pre-spine seasons, which is why the cap is generous.
-        CHECK.row_count(table, min_rows=1900, max_rows=60_000 * _in_scope_leagues()),
+        CHECK.row_count(table, min_rows=1900, max_rows=_xref_match_global_cap()),
 
         # PK is composite — bridged sources share canonical_id with FBref.
         CHECK.no_duplicates(table, pk=['canonical_id', 'source']),
@@ -219,6 +298,36 @@ def build_xref_match_checks() -> List[Check]:
             error_threshold=0.80,
             severity='WARNING',  # runner promotes to ERROR when ratio < 0.80
             name=f'bridge_coverage[xref_match.{src}]',
+        ))
+
+    for grain in _espn_promoted_grains():
+        league = str(grain['league']).replace("'", "''")
+        season = str(grain['season']).replace("'", "''")
+        match_count = int(grain['match_count'])
+        checks.append(CHECK.row_count(
+            table,
+            min_rows=int(grain['match_floor']),
+            max_rows=match_count,
+            where=(
+                f"source = 'espn' AND league = '{league}' "
+                f"AND season = '{season}'"
+            ),
+            name=f"espn_promoted_grain[xref_match.{grain['league']}.{grain['season']}]",
+        ))
+        checks.append(CHECK.coverage(
+            table=table,
+            condition="confidence != 'orphan'",
+            where=(
+                f"source = 'espn' AND league = '{league}' "
+                f"AND season = '{season}'"
+            ),
+            warn_threshold=0.95,
+            error_threshold=0.80,
+            severity='WARNING',
+            name=(
+                "espn_bridge_coverage["
+                f"xref_match.{grain['league']}.{grain['season']}]"
+            ),
         ))
 
     return checks

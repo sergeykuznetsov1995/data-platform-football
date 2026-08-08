@@ -1,0 +1,92 @@
+schema_version: 1
+mapping_version: "2026-08-08"
+default_downstream_enabled: false
+frozen_scope_reference: "tests/fixtures/espn/catalog_2026-07-31.json"
+
+# This is the downstream promotion boundary. ESPN Bronze keeps every frozen
+# source scope and its original source_season_year. A scope missing here is
+# intentionally Bronze-only.
+mappings:
+  "606:2026":
+    espn_id: 606
+    source_season_year: 2026
+    platform_league: "INT-World Cup"
+    platform_season_slug: "2026"
+    convention: "tournament"
+    effective_start_date: "2026-06-11"
+    effective_end_date: "2026-07-19"
+    downstream_enabled: true
+    approval:
+      approved_by: "data-platform-owner"
+      approved_at: "2026-08-08"
+      reference: "https://github.com/sergeykuznetsov1995/data-platform-football/issues/1148"
+
+  "700:2026":
+    espn_id: 700
+    source_season_year: 2026
+    platform_league: "ENG-Premier League"
+    platform_season_slug: "2627"
+    convention: "split_year"
+    effective_start_date: "2026-08-15"
+    effective_end_date: "2027-05-24"
+    downstream_enabled: true
+    approval:
+      approved_by: "data-platform-owner"
+      approved_at: "2026-08-08"
+      reference: "https://github.com/sergeykuznetsov1995/data-platform-football/issues/1148"
+
+  "710:2026":
+    espn_id: 710
+    source_season_year: 2026
+    platform_league: "FRA-Ligue 1"
+    platform_season_slug: "2627"
+    convention: "split_year"
+    effective_start_date: "2026-08-15"
+    effective_end_date: "2027-05-29"
+    downstream_enabled: true
+    approval:
+      approved_by: "data-platform-owner"
+      approved_at: "2026-08-08"
+      reference: "https://github.com/sergeykuznetsov1995/data-platform-football/issues/1148"
+
+  "720:2026":
+    espn_id: 720
+    source_season_year: 2026
+    platform_league: "GER-Bundesliga"
+    platform_season_slug: "2627"
+    convention: "split_year"
+    effective_start_date: "2026-08-22"
+    effective_end_date: "2027-05-25"
+    downstream_enabled: true
+    approval:
+      approved_by: "data-platform-owner"
+      approved_at: "2026-08-08"
+      reference: "https://github.com/sergeykuznetsov1995/data-platform-football/issues/1148"
+
+  "730:2026":
+    espn_id: 730
+    source_season_year: 2026
+    platform_league: "ITA-Serie A"
+    platform_season_slug: "2627"
+    convention: "split_year"
+    effective_start_date: "2026-08-23"
+    effective_end_date: "2027-05-24"
+    downstream_enabled: true
+    approval:
+      approved_by: "data-platform-owner"
+      approved_at: "2026-08-08"
+      reference: "https://github.com/sergeykuznetsov1995/data-platform-football/issues/1148"
+
+  "740:2026":
+    espn_id: 740
+    source_season_year: 2026
+    platform_league: "ESP-La Liga"
+    platform_season_slug: "2627"
+    convention: "split_year"
+    effective_start_date: "2026-08-15"
+    effective_end_date: "2027-05-24"
+    downstream_enabled: true
+    approval:
+      approved_by: "data-platform-owner"
+      approved_at: "2026-08-08"
+      reference: "https://github.com/sergeykuznetsov1995/data-platform-football/issues/1148"

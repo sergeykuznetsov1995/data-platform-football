@@ -205,9 +205,10 @@ def _read_params(context: Dict[str, Any]) -> Dict[str, Any]:
 _BRONZE_TABLES = [
     ('iceberg.bronze.whoscored_events_current', 'ERROR'),
     ('iceberg.bronze.understat_shots',  'WARNING'),
-    ('iceberg.bronze.espn_lineup',      'WARNING'),
+    ('iceberg.bronze.espn_lineup_current', 'WARNING'),
 ]
 _UNDERSTAT_SHOTS_TABLE = 'iceberg.bronze.understat_shots'
+_ESPN_LINEUP_TABLE = 'iceberg.bronze.espn_lineup_current'
 _UNDERSTAT_CONTRACT_VERSION = 'understat-bronze-v2'
 
 
@@ -224,6 +225,25 @@ def _bronze_scope_count_sql(
     is readable; a later failed/pending attempt invalidates an older complete
     batch. Scopes with no v2 attempt retain the legacy unbatched read path.
     """
+
+    if table == _ESPN_LINEUP_TABLE:
+        from utils.espn_season_mapping import render_espn_downstream_sql
+
+        return render_espn_downstream_sql(f"""
+            WITH espn_downstream_scope (
+                scope_id, espn_id, source_season_year, platform_league,
+                platform_season_slug, convention,
+                effective_start_date, effective_end_date
+            ) AS (VALUES
+__ESPN_DOWNSTREAM_SCOPE_VALUES__
+            )
+            SELECT COUNT(*)
+            FROM {_ESPN_LINEUP_TABLE} es_source
+            JOIN espn_downstream_scope espn_scope ON
+__ESPN_DOWNSTREAM_SCOPE_FILTER__
+            WHERE espn_scope.platform_season_slug = '{season_sql}'
+              AND espn_scope.platform_league = '{league_sql}'
+        """)
 
     if table != _UNDERSTAT_SHOTS_TABLE:
         return (

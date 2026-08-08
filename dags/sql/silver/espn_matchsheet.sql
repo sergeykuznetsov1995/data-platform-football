@@ -31,22 +31,37 @@
 --     capacity в dim_venue приходит из venue_aliases.yaml.
 -- =============================================================================
 
-WITH bronze_dedup AS (
+WITH espn_downstream_scope (
+    scope_id, espn_id, source_season_year, platform_league,
+    platform_season_slug, convention, effective_start_date, effective_end_date
+) AS (VALUES
+__ESPN_DOWNSTREAM_SCOPE_VALUES__
+),
+bronze_dedup AS (
     SELECT *
     FROM (
         SELECT
-            trim(venue)                              AS venue,
-            try_cast(substr(game, 1, 10) AS date)    AS match_date,
-            _ingested_at,
-            league,
-            season,
+            trim(es_source.venue)                    AS venue,
+            try_cast(substr(es_source.game, 1, 10) AS date) AS match_date,
+            es_source._ingested_at,
+            -- Native source identity remains verbatim; legacy fallback rows
+            -- intentionally retain NULL native identity.
+            es_source.scope_id                       AS source_scope_id,
+            es_source.source_season_year             AS source_season_year,
+            espn_scope.platform_league               AS league,
+            espn_scope.platform_season_slug          AS season,
             ROW_NUMBER() OVER (
-                PARTITION BY trim(venue), league, season, game
-                ORDER BY _ingested_at DESC
+                PARTITION BY trim(es_source.venue),
+                    espn_scope.platform_league,
+                    espn_scope.platform_season_slug,
+                    es_source.game
+                ORDER BY es_source._ingested_at DESC
             ) AS rn
-        FROM iceberg.bronze.espn_matchsheet
-        WHERE venue IS NOT NULL
-          AND trim(venue) <> ''
+        FROM iceberg.bronze.espn_matchsheet_current es_source
+        JOIN espn_downstream_scope espn_scope ON
+__ESPN_DOWNSTREAM_SCOPE_FILTER__
+        WHERE es_source.venue IS NOT NULL
+          AND trim(es_source.venue) <> ''
     )
     WHERE rn = 1
 )
@@ -55,6 +70,8 @@ SELECT
     -- ===== Identity =====
     venue,
     match_date,
+    source_scope_id,
+    source_season_year,
 
     -- ===== Lineage =====
     _ingested_at                                     AS _bronze_ingested_at,

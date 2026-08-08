@@ -25,6 +25,7 @@ from __future__ import annotations
 import importlib.util
 import os
 from pathlib import Path
+import sys
 from typing import Dict, Set, Tuple
 
 import sqlglot
@@ -54,6 +55,9 @@ def _find_repo_root() -> Path:
 
 _REPO_ROOT = _find_repo_root()
 _MEDALLION_CONFIG_PATH = _REPO_ROOT / "dags" / "utils" / "medallion_config.py"
+_ESPN_SEASON_MAPPING_PATH = (
+    _REPO_ROOT / "dags" / "utils" / "espn_season_mapping.py"
+)
 _TEMPLATE_DIR = _REPO_ROOT / "dags" / "sql" / "silver"
 
 
@@ -77,8 +81,26 @@ def _load_medallion_config():
     return module
 
 
+def _load_espn_season_mapping():
+    """Load the dependency-light ESPN renderer without importing Airflow utils."""
+
+    module_name = "_espn_season_mapping_test_shim"
+    spec = importlib.util.spec_from_file_location(
+        module_name, str(_ESPN_SEASON_MAPPING_PATH)
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
 def load_silver_sql(sql_path: Path) -> str:
-    """Read a Silver SQL file, rendering Jinja-style ``.sql.j2`` templates."""
+    """Read Silver SQL and apply the same source-owned renderers as runners."""
     if sql_path.suffix == ".j2":
         mc = _load_medallion_config()
         # Pass every known alias-VALUES context; render_sql_template ignores
@@ -87,14 +109,18 @@ def load_silver_sql(sql_path: Path) -> str:
             f"'{mc._escape_sql_string(lg)}'"
             for lg in mc.get_in_scope_competitions()
         )
-        return mc.render_sql_template(
+        sql = mc.render_sql_template(
             str(sql_path),
             team_aliases_values_sql=mc.get_team_alias_sql_values(),
             referee_aliases_values_sql=mc.get_referee_alias_sql_values(),
             manager_aliases_values_sql=mc.get_manager_alias_sql_values(),
             clubelo_in_scope_leagues=clubelo_leagues,
         )
-    return sql_path.read_text()
+    else:
+        sql = sql_path.read_text()
+    if "__ESPN_DOWNSTREAM" in sql:
+        sql = _load_espn_season_mapping().render_espn_downstream_sql(sql)
+    return sql
 
 
 def list_silver_sql_paths() -> list[Path]:

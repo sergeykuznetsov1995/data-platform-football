@@ -50,9 +50,9 @@ def _read_template() -> str:
 
 
 def _aliases_cte(sql: str) -> str:
-    """Slice the ``aliases`` CTE source (from ``WITH aliases AS`` up to the
+    """Slice the ``aliases`` CTE source (after the ESPN mapping CTE up to the
     next CTE ``raw_teams AS``) for #465 guard assertions."""
-    start = sql.index("WITH aliases AS")
+    start = sql.index("aliases AS")
     end = sql.index("raw_teams AS")
     return sql[start:end]
 

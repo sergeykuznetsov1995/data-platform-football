@@ -228,7 +228,10 @@ def test_xref_match_pk_composite():
 def test_xref_match_coverage_checks_per_source():
     """Six bridge_coverage checks (one per non-fbref source) with two-tier thresholds."""
     checks = xref_dq.build_xref_match_checks()
-    cov_checks = [c for c in checks if c.kind == 'coverage' and 'bridge_coverage' in c.name]
+    cov_checks = [
+        c for c in checks
+        if c.kind == 'coverage' and c.name.startswith('bridge_coverage[xref_match.')
+    ]
     assert len(cov_checks) == 6, (
         f"Expected 6 per-source coverage checks (whoscored/understat/sofascore/"
         f"fotmob/matchhistory/espn), got {len(cov_checks)}"
@@ -243,6 +246,74 @@ def test_xref_match_coverage_checks_per_source():
         assert c.params['error_threshold'] == 0.80
         assert "confidence != 'orphan'" in c.params['condition']
         assert c.params['where'].startswith("source = '")
+
+
+def test_spine_predicate_is_scoped_by_league_and_season():
+    predicate = xref_dq._spine_season_predicate()
+
+    assert "league = 'ENG-Premier League'" in predicate
+    assert "league = 'INT-World Cup'" in predicate
+    assert "season IN" in predicate
+    assert " OR " in predicate
+
+
+def test_espn_xref_team_dq_has_exact_six_platform_grains_and_orphan_gate():
+    checks = xref_dq.build_xref_team_checks()
+    counts = [c for c in checks if c.name.startswith('espn_promoted_grain[xref_team.')]
+    orphans = [c for c in checks if c.name.startswith('espn_orphans[xref_team.')]
+
+    assert len(counts) == 6
+    assert len(orphans) == 6
+    by_name = {c.name: c for c in counts}
+    epl = by_name['espn_promoted_grain[xref_team.ENG-Premier League.2627]']
+    world_cup = by_name['espn_promoted_grain[xref_team.INT-World Cup.2026]']
+    assert (epl.params['min_rows'], epl.params['max_rows']) == (18, 20)
+    assert (world_cup.params['min_rows'], world_cup.params['max_rows']) == (43, 48)
+    assert all("source = 'espn'" in c.params['where'] for c in counts + orphans)
+    assert all("league = '" in c.params['where'] and "season = '" in c.params['where']
+               for c in counts + orphans)
+    assert all(c.params['max_rows'] == 0 for c in orphans)
+
+
+def test_espn_xref_match_dq_caps_come_from_exact_competition_grains():
+    checks = xref_dq.build_xref_match_checks()
+    grains = [c for c in checks if c.name.startswith('espn_promoted_grain[xref_match.')]
+
+    assert len(grains) == 6
+    by_name = {c.name: c for c in grains}
+    expected = {
+        'espn_promoted_grain[xref_match.ENG-Premier League.2627]': (340, 380),
+        'espn_promoted_grain[xref_match.ESP-La Liga.2627]': (340, 380),
+        'espn_promoted_grain[xref_match.ITA-Serie A.2627]': (340, 380),
+        'espn_promoted_grain[xref_match.GER-Bundesliga.2627]': (273, 306),
+        'espn_promoted_grain[xref_match.FRA-Ligue 1.2627]': (273, 306),
+        'espn_promoted_grain[xref_match.INT-World Cup.2026]': (93, 104),
+    }
+    assert {
+        name: (check.params['min_rows'], check.params['max_rows'])
+        for name, check in by_name.items()
+    } == expected
+    assert '60000' not in _all_sql(checks).replace('_', '')
+
+
+def test_espn_xref_match_bridge_quality_is_checked_per_platform_grain():
+    checks = xref_dq.build_xref_match_checks()
+    coverage = [
+        c for c in checks
+        if c.name.startswith('espn_bridge_coverage[xref_match.')
+    ]
+
+    assert len(coverage) == 6
+    assert all(c.kind == 'coverage' for c in coverage)
+    assert all(c.params['condition'] == "confidence != 'orphan'" for c in coverage)
+    assert all(c.params['warn_threshold'] == 0.95 for c in coverage)
+    assert all(c.params['error_threshold'] == 0.80 for c in coverage)
+    assert all(
+        "source = 'espn'" in c.params['where']
+        and "league = '" in c.params['where']
+        and "season = '" in c.params['where']
+        for c in coverage
+    )
 
 
 def test_xref_referee_source_enum():

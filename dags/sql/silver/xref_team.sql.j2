@@ -70,7 +70,13 @@
 --   espn_schedule         : home_team, away_team, league, season (varchar)
 -- =============================================================================
 
-WITH aliases AS (
+WITH espn_downstream_scope (
+    scope_id, espn_id, source_season_year, platform_league,
+    platform_season_slug, convention, effective_start_date, effective_end_date
+) AS (VALUES
+__ESPN_DOWNSTREAM_SCOPE_VALUES__
+),
+aliases AS (
     SELECT
         -- League predicate (issue #148, #141 stage 2): each alias is tagged with
         -- the competition it applies to, so the JOIN below can guard on
@@ -334,11 +340,23 @@ END AS season  -- year-start / WC direct → slug (#404 + #913)
 
     UNION
     -- ===== espn =====
-    SELECT 'espn' AS source, home_team AS source_id, league, CAST(season AS varchar) AS season
-      FROM iceberg.bronze.espn_schedule WHERE home_team IS NOT NULL
+    SELECT 'espn' AS source,
+           es_source.home_team AS source_id,
+           espn_scope.platform_league AS league,
+           espn_scope.platform_season_slug AS season
+      FROM iceberg.bronze.espn_schedule_current es_source
+      JOIN espn_downstream_scope espn_scope ON
+__ESPN_DOWNSTREAM_SCOPE_FILTER__
+     WHERE es_source.home_team IS NOT NULL
     UNION
-    SELECT 'espn' AS source, away_team AS source_id, league, CAST(season AS varchar) AS season
-      FROM iceberg.bronze.espn_schedule WHERE away_team IS NOT NULL
+    SELECT 'espn' AS source,
+           es_source.away_team AS source_id,
+           espn_scope.platform_league AS league,
+           espn_scope.platform_season_slug AS season
+      FROM iceberg.bronze.espn_schedule_current es_source
+      JOIN espn_downstream_scope espn_scope ON
+__ESPN_DOWNSTREAM_SCOPE_FILTER__
+     WHERE es_source.away_team IS NOT NULL
 
     UNION
     -- ===== transfermarkt (native squad-membership club universe; issue #192) =====

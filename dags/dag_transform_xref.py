@@ -438,6 +438,7 @@ def _validate_xref(**context) -> Dict[str, Any]:
                 warning_threshold=warn_t,
                 error_threshold=err_t,
                 current_season_only=current_only,
+                group_by_league=True,
             )
         except Exception as e:
             logger.exception("orphan_rate evaluation failed for %s", table)

@@ -145,6 +145,17 @@ def test_whoscored_serving_views_are_explicit_in_snapshot(bronze_columns):
 
 
 @pytest.mark.unit
+def test_espn_serving_views_are_explicit_in_snapshot(bronze_columns):
+    """ESPN consumers validate the native/legacy current-view superset."""
+
+    assert {
+        "bronze.espn_schedule_current",
+        "bronze.espn_lineup_current",
+        "bronze.espn_matchsheet_current",
+    } <= set(bronze_columns)
+
+
+@pytest.mark.unit
 def test_extractor_skips_window_function_aliases():
     """``ROW_NUMBER() OVER (...) AS rn`` introduced inside an inner SELECT
     must not be reported as a Bronze column reference even when the outer
