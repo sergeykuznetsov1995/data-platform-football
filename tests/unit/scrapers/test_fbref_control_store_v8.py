@@ -138,6 +138,69 @@ def test_v9_adds_singleton_expiring_publication_generation_lock():
     assert "publication_lock_expiry_idx" in ddl
 
 
+def test_replay_pipeline_metrics_are_derived_and_atomically_anchored():
+    run_id = str(uuid.uuid4())
+    source_run_id = str(uuid.uuid4())
+    updates = []
+
+    def handler(sql, params):
+        if sql.startswith(
+            "SELECT status, run_type, metadata FROM fbref_control.crawl_run"
+        ):
+            return (
+                [
+                    {
+                        "status": "running",
+                        "run_type": "replay",
+                        "metadata": {
+                            "acceptance_replay": True,
+                            "acceptance_replay_source_run_id": source_run_id,
+                            "acceptance_trino_schema": "acceptance_seq",
+                            "acceptance_persistence_mode": "sequential",
+                        },
+                    }
+                ],
+                1,
+            )
+        if sql.startswith("SELECT target.target_id"):
+            assert params == (source_run_id,)
+            return (
+                [
+                    {
+                        "target_id": "fbref:match:m1",
+                        "match_id": "m1",
+                    },
+                    {
+                        "target_id": "fbref:match:m2",
+                        "match_id": "m2",
+                    },
+                ],
+                2,
+            )
+        if sql.startswith("UPDATE fbref_control.crawl_run"):
+            updates.append(json.loads(params[0]))
+            return ([], 1)
+        raise AssertionError(sql)
+
+    store, factory = make_store(handler)
+
+    anchored = store.record_replay_pipeline_metrics(
+        run_id,
+        schema="acceptance_seq",
+        mode="sequential",
+        elapsed_seconds=12.5,
+        statement_counts={"execute": 100, "execute_committing": 20},
+    )
+
+    assert anchored["control_run_id"] == run_id
+    assert anchored["match_count"] == 2
+    assert len(anchored["match_keys_sha256"]) == 64
+    assert len(anchored["artifact_sha256"]) == 64
+    stored = {key: value for key, value in anchored.items() if key != "idempotent"}
+    assert updates == [{"pipeline_run_metrics": stored}]
+    assert factory.connections[0].committed is True
+
+
 def test_publication_lock_acquire_is_retry_idempotent_and_owner_fenced():
     owner = str(uuid.uuid4())
     now = datetime.now(timezone.utc)

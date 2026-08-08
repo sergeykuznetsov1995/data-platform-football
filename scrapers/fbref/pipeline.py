@@ -1287,6 +1287,14 @@ def _bronze_acceptance_replay_marker(
         metadata.get("raw_audit") if isinstance(metadata, Mapping) else {}
     )
     raw_audit = raw_audit if isinstance(raw_audit, Mapping) else {}
+    pipeline_metrics = (
+        metadata.get("pipeline_run_metrics")
+        if isinstance(metadata, Mapping)
+        else {}
+    )
+    pipeline_metrics = (
+        pipeline_metrics if isinstance(pipeline_metrics, Mapping) else {}
+    )
     return {
         "schema_version": "fbref-bronze-acceptance-replay-v1",
         "status": "passed",
@@ -1311,6 +1319,9 @@ def _bronze_acceptance_replay_marker(
                 raw_audit.get("audited_attempt_count") or 0
             ),
             "raw_audit_artifact_sha256": raw_audit.get("artifact_sha256"),
+            "pipeline_metrics_artifact_sha256": pipeline_metrics.get(
+                "artifact_sha256"
+            ),
         },
     }
 

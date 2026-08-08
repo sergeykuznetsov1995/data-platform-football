@@ -75,6 +75,14 @@ def _is_sha256(value: Any) -> bool:
     )
 
 
+def _pipeline_metrics_sha256(value: Mapping[str, Any]) -> str:
+    core = {
+        key: item for key, item in value.items() if key != "artifact_sha256"
+    }
+    rendered = json.dumps(core, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class BenchmarkConfig:
     html_dir: Path
@@ -116,10 +124,37 @@ class PipelineRunMetrics:
     match_count: int
     match_keys_sha256: str
     statement_counts: StatementCounts
+    artifact_sha256: str
     schema_version: str = "fbref-pipeline-run-metrics-v1"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @classmethod
+    def anchored(
+        cls,
+        *,
+        control_run_id: str,
+        schema: str,
+        mode: str,
+        elapsed_seconds: float,
+        match_count: int,
+        match_keys_sha256: str,
+        statement_counts: StatementCounts,
+    ) -> "PipelineRunMetrics":
+        core = {
+            "schema_version": "fbref-pipeline-run-metrics-v1",
+            "control_run_id": control_run_id,
+            "schema": schema,
+            "mode": mode,
+            "elapsed_seconds": elapsed_seconds,
+            "match_count": match_count,
+            "match_keys_sha256": match_keys_sha256,
+            "statement_counts": asdict(statement_counts),
+        }
+        return cls.from_mapping(
+            {**core, "artifact_sha256": _pipeline_metrics_sha256(core)}
+        )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "PipelineRunMetrics":
@@ -132,6 +167,7 @@ class PipelineRunMetrics:
             "match_count",
             "match_keys_sha256",
             "statement_counts",
+            "artifact_sha256",
         }
         if set(value) != required_fields:
             raise ValueError("pipeline metrics fields are invalid")
@@ -143,6 +179,7 @@ class PipelineRunMetrics:
         elapsed_seconds = value.get("elapsed_seconds")
         match_count = value.get("match_count")
         match_keys_sha256 = value.get("match_keys_sha256")
+        artifact_sha256 = value.get("artifact_sha256")
         counts = value.get("statement_counts")
         if not isinstance(control_run_id, str) or not control_run_id.strip():
             raise ValueError("pipeline metrics control run ID is invalid")
@@ -165,6 +202,10 @@ class PipelineRunMetrics:
             raise ValueError("pipeline metrics match count is invalid")
         if not _is_sha256(match_keys_sha256):
             raise ValueError("pipeline metrics match digest is invalid")
+        if not _is_sha256(artifact_sha256) or artifact_sha256 != (
+            _pipeline_metrics_sha256(value)
+        ):
+            raise ValueError("pipeline metrics artifact digest is invalid")
         if not isinstance(counts, Mapping):
             raise ValueError("pipeline metrics statement counts are invalid")
         if set(counts) != {"execute", "execute_committing"}:
@@ -187,6 +228,7 @@ class PipelineRunMetrics:
                 execute=execute,
                 execute_committing=committing,
             ),
+            artifact_sha256=artifact_sha256,
         )
 
 
@@ -220,6 +262,7 @@ class ControlRunEvidence:
     dataset_manifests: int
     match_targets: int
     match_keys_sha256: str
+    pipeline_metrics: PipelineRunMetrics | None
     observation_sha256: str
     manifest_sha256: str
     latest_state_sha256: str
@@ -1079,9 +1122,9 @@ def _cursor_mapping_rows(cursor: Any) -> list[dict[str, Any]]:
 
 
 def _direct_processing_evidence(
-    control: Any, run_id: str
+    control: Any, evidence_run_id: str
 ) -> Mapping[str, Any] | None:
-    """Read this replay's own observations/manifests, not source-run aliases."""
+    """Read the immutable source observations processed by this replay."""
 
     transaction = getattr(control, "_transaction", None)
     if not callable(transaction):
@@ -1118,7 +1161,7 @@ def _direct_processing_evidence(
             WHERE observation_rank = 1
             ORDER BY ordinal
             """,
-            (run_id,),
+            (evidence_run_id,),
         )
         observations = _cursor_mapping_rows(cursor)
         cursor.execute(
@@ -1162,7 +1205,7 @@ def _direct_processing_evidence(
             ORDER BY ranked.ordinal, manifest.parser_version,
                      manifest.dataset
             """,
-            (run_id,),
+            (evidence_run_id,),
         )
         datasets = _cursor_mapping_rows(cursor)
     return {"targets": observations, "datasets": datasets}
@@ -1173,21 +1216,24 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
 
     run = control.get_run(run_id)
     summary = control.get_run_summary(run_id)
-    evidence = _direct_processing_evidence(control, run_id)
-    evidence_source = "direct_processing_rows"
-    if evidence is None:
-        evidence = control.get_acceptance_run_evidence(run_id)
-        evidence_source = "control_api_fallback"
     failures: list[str] = []
     if not isinstance(run, Mapping):
         raise ValueError("control run is missing")
     if not isinstance(summary, Mapping):
         raise ValueError("control run summary is missing")
-    if not isinstance(evidence, Mapping):
-        raise ValueError("direct control evidence is missing")
 
     metadata = run.get("metadata")
     metadata = metadata if isinstance(metadata, Mapping) else {}
+    evidence_run_id = str(
+        metadata.get("acceptance_replay_source_run_id") or run_id
+    )
+    evidence = _direct_processing_evidence(control, evidence_run_id)
+    evidence_source = "direct_processing_rows"
+    if evidence is None:
+        evidence = control.get_acceptance_run_evidence(run_id)
+        evidence_source = "control_api_fallback"
+    if not isinstance(evidence, Mapping):
+        raise ValueError("direct control evidence is missing")
     strict = metadata.get("bronze_acceptance_replay")
     strict = strict if isinstance(strict, Mapping) else {}
     strict_gates = strict.get("strict_gates")
@@ -1240,6 +1286,9 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
         or type(strict_gates.get("raw_audited_attempt_count")) is not int
         or int(strict_gates.get("raw_audited_attempt_count") or 0) <= 0
         or not _is_sha256(strict_gates.get("raw_audit_artifact_sha256"))
+        or not _is_sha256(
+            strict_gates.get("pipeline_metrics_artifact_sha256")
+        )
     ):
         failures.append("strict_acceptance_gates_invalid")
     summary_zero_metrics = (
@@ -1391,6 +1440,27 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
             failures.append("empty_dataset_has_no_reason")
             break
 
+    pipeline_metrics = None
+    metrics_value = metadata.get("pipeline_run_metrics")
+    if not isinstance(metrics_value, Mapping):
+        failures.append("pipeline_metrics_missing")
+    else:
+        try:
+            pipeline_metrics = PipelineRunMetrics.from_mapping(metrics_value)
+        except ValueError:
+            failures.append("pipeline_metrics_invalid")
+        else:
+            expected_match_sha256 = _stable_sha256(sorted(match_keys))
+            if (
+                pipeline_metrics.control_run_id != str(run_id)
+                or pipeline_metrics.match_count != len(match_keys)
+                or pipeline_metrics.match_keys_sha256
+                != expected_match_sha256
+                or strict_gates.get("pipeline_metrics_artifact_sha256")
+                != pipeline_metrics.artifact_sha256
+            ):
+                failures.append("pipeline_metrics_control_mismatch")
+
     observations = sorted(
         (
             {
@@ -1454,6 +1524,7 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
         dataset_manifests=len(datasets),
         match_targets=len(match_keys),
         match_keys_sha256=_stable_sha256(sorted(match_keys)),
+        pipeline_metrics=pipeline_metrics,
         observation_sha256=_stable_sha256(observations),
         manifest_sha256=_stable_sha256(manifests),
         latest_state_sha256=_stable_sha256(latest_state),
@@ -1763,8 +1834,6 @@ def evaluate_existing_pipeline_acceptance(
     batch_schema: str,
     sequential_control_run_id: str,
     batch_control_run_id: str,
-    sequential_metrics: PipelineRunMetrics,
-    batch_metrics: PipelineRunMetrics,
     sequential_baseline: AcceptanceBaseline,
     batch_baseline: AcceptanceBaseline,
     sentinel_match_id: str,
@@ -1794,15 +1863,20 @@ def evaluate_existing_pipeline_acceptance(
         control, sequential_control_run_id
     )
     control_batch = _control_run_evidence(control, batch_control_run_id)
+    if (
+        control_sequential.pipeline_metrics is None
+        or control_batch.pipeline_metrics is None
+    ):
+        raise ValueError("control-anchored pipeline metrics are missing")
     sequential_metrics = _validated_pipeline_metrics(
-        sequential_metrics,
+        control_sequential.pipeline_metrics,
         expected_control_run_id=sequential_control_run_id,
         expected_schema=sequential_schema,
         expected_mode="sequential",
         control_evidence=control_sequential,
     )
     batch_metrics = _validated_pipeline_metrics(
-        batch_metrics,
+        control_batch.pipeline_metrics,
         expected_control_run_id=batch_control_run_id,
         expected_schema=batch_schema,
         expected_mode="batch",
@@ -2101,8 +2175,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sentinel-match-id")
     parser.add_argument("--sequential-baseline", type=Path)
     parser.add_argument("--batch-baseline", type=Path)
-    parser.add_argument("--sequential-metrics", type=Path)
-    parser.add_argument("--batch-metrics", type=Path)
     return parser.parse_args(argv)
 
 
@@ -2116,18 +2188,6 @@ def _read_baseline(path: Path) -> AcceptanceBaseline:
     if not isinstance(payload, Mapping):
         raise ValueError("acceptance baseline is invalid")
     return AcceptanceBaseline.from_mapping(payload)
-
-
-def _read_pipeline_metrics(path: Path) -> PipelineRunMetrics:
-    try:
-        if path.stat().st_size > 1024 * 1024:
-            raise ValueError("pipeline metrics artifact is too large")
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        raise ValueError("pipeline metrics artifact is unreadable") from None
-    if not isinstance(payload, Mapping):
-        raise ValueError("pipeline metrics artifact is invalid")
-    return PipelineRunMetrics.from_mapping(payload)
 
 
 def _require_args(args: argparse.Namespace, *names: str) -> None:
@@ -2172,8 +2232,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "sentinel_match_id",
                 "sequential_baseline",
                 "batch_baseline",
-                "sequential_metrics",
-                "batch_metrics",
             )
             from scrapers.fbref.control import ControlStore
 
@@ -2189,12 +2247,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                             args.sequential_control_run_id
                         ),
                         batch_control_run_id=args.batch_control_run_id,
-                        sequential_metrics=_read_pipeline_metrics(
-                            args.sequential_metrics
-                        ),
-                        batch_metrics=_read_pipeline_metrics(
-                            args.batch_metrics
-                        ),
                         sequential_baseline=_read_baseline(
                             args.sequential_baseline
                         ),

@@ -5461,6 +5461,24 @@ def test_acceptance_replay_accepts_only_separate_strict_nonpublishing_source(
     source_run_id = str(uuid.uuid4())
     replay_run_id = str(uuid.uuid4())
     source = _accepted_nonpublishing_source(source_run_id)
+    metrics_core = {
+        "schema_version": "fbref-pipeline-run-metrics-v1",
+        "control_run_id": replay_run_id,
+        "schema": "acceptance_seq",
+        "mode": "sequential",
+        "elapsed_seconds": 1.0,
+        "match_count": 1,
+        "match_keys_sha256": "a" * 64,
+        "statement_counts": {"execute": 1, "execute_committing": 0},
+    }
+    metrics = {
+        **metrics_core,
+        "artifact_sha256": hashlib.sha256(
+            json.dumps(
+                metrics_core, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest(),
+    }
     replay_summary = control.get_run_summary(replay_run_id)
     replay_summary.update(
         run_type="replay",
@@ -5489,6 +5507,7 @@ def test_acceptance_replay_accepts_only_separate_strict_nonpublishing_source(
             "acceptance_replay_source_run_id": source_run_id,
             "publication_eligible": False,
             "bootstrap_only": False,
+            "pipeline_run_metrics": metrics,
             "raw_audit": {
                 "schema_version": "fbref-raw-audit-anchor-v1",
                 "status": "passed",
@@ -5523,6 +5542,10 @@ def test_acceptance_replay_accepts_only_separate_strict_nonpublishing_source(
     )
 
     assert "bronze_acceptance_replay_anchored" in control.events
+    marker = control.run["metadata"]["bronze_acceptance_replay"]
+    assert marker["strict_gates"][
+        "pipeline_metrics_artifact_sha256"
+    ] == metrics["artifact_sha256"]
     assert "finish:True" in control.events
 
 

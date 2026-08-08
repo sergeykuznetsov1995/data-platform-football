@@ -4,6 +4,9 @@
 -- registry/control plane is PostgreSQL while Bronze is Iceberg/Trino. Run the
 -- PostgreSQL statement first, then the Trino statement. Every returned verdict must be PASS.
 -- Save both result sets beside the accepted run ID.
+-- Copy dead_match_ids_json, dead_match_count, and dead_match_keys_md5 from the
+-- PostgreSQL TOTAL row into the same-named Trino bind parameters. This is the
+-- explicit cross-engine bridge for auditable dead match targets.
 -- A legitimately empty competition-season is one whose deduplicated schedule
 -- has zero played matches; it is not an allowlisted competition. A legitimate
 -- dead match target must be in frontier state `dead` with both error class and
@@ -12,7 +15,9 @@
 
 -- ===========================================================================
 -- ENGINE: PostgreSQL
--- Bind :control_run_id to the exact successful current/backfill/replay run.
+-- Bind :control_run_id to the exact successful publishing current/backfill
+-- run represented in iceberg.bronze. Isolated replay runs are verified by the
+-- differential replay gate and are not valid inputs to this whole-scope query.
 -- This is direct evidence: it reads observation_processing and
 -- dataset_manifest rows, not a caller-supplied summary.
 -- ===========================================================================
@@ -48,6 +53,7 @@ WITH required_seasons(source_season_id) AS (
            frontier.state AS frontier_state,
            frontier.last_error_class,
            frontier.last_error_message,
+           frontier.source_ids ->> 'match_id' AS match_id,
            frontier.source_ids ->> 'competition_id'
                AS source_competition_id,
            frontier.source_ids ->> 'season_id' AS source_season_id
@@ -66,6 +72,7 @@ WITH required_seasons(source_season_id) AS (
            match.frontier_state,
            match.last_error_class,
            match.last_error_message,
+           match.match_id,
            match.source_competition_id,
            match.source_season_id,
            observed.content_hash,
@@ -145,6 +152,7 @@ WITH required_seasons(source_season_id) AS (
                 AND manifest.invalid_dataset_decisions = 0
                THEN 'durable'
                WHEN observation.frontier_state = 'dead'
+                AND nullif(trim(observation.match_id), '') IS NOT NULL
                 AND nullif(trim(observation.last_error_class), '') IS NOT NULL
                 AND nullif(trim(observation.last_error_message), '') IS NOT NULL
                THEN 'dead'
@@ -153,6 +161,16 @@ WITH required_seasons(source_season_id) AS (
     FROM observations AS observation
     LEFT JOIN manifest_proof AS manifest
       ON manifest.logical_refresh_id = observation.logical_refresh_id
+), dead_bridge AS (
+    SELECT coalesce(
+               jsonb_agg(match_id ORDER BY match_id), '[]'::jsonb
+           )::text AS dead_match_ids_json,
+           count(*) AS dead_match_count,
+           count(DISTINCT match_id) AS dead_match_distinct_count,
+           md5(coalesce(string_agg(match_id, chr(31) ORDER BY match_id), ''))
+               AS dead_match_keys_md5
+    FROM target_proof
+    WHERE control_proof = 'dead'
 ), per_scope AS (
     SELECT expected.source_competition_id,
            expected.competition_name,
@@ -185,6 +203,7 @@ SELECT CASE
            WHEN min(installed_season_rows) = 1
             AND sum(unproved_match_targets) = 0
             AND sum(proved_match_targets) = sum(run_match_targets)
+            AND dead_match_count = dead_match_distinct_count
            THEN 'PASS' ELSE 'FAIL'
        END AS verdict,
        CASE WHEN grouping(source_competition_id) = 1
@@ -198,18 +217,26 @@ SELECT CASE
        sum(run_match_targets) AS run_match_targets,
        sum(proved_match_targets) AS proved_match_targets,
        sum(dead_match_targets) AS dead_match_targets,
-       sum(unproved_match_targets) AS unproved_match_targets
+       sum(unproved_match_targets) AS unproved_match_targets,
+       dead_match_ids_json,
+       dead_match_count,
+       dead_match_distinct_count,
+       dead_match_keys_md5
 FROM per_scope
+CROSS JOIN dead_bridge
 GROUP BY GROUPING SETS (
     (source_competition_id, competition_name, source_season_id),
     ()
-)
+), dead_match_ids_json, dead_match_count, dead_match_distinct_count,
+   dead_match_keys_md5
 ORDER BY competition_name, source_season_id;
 
 -- ===========================================================================
 -- ENGINE: Trino
 -- Bind :control_run_id to the same run. All eight physical typed match tables
 -- are referenced intentionally: a missing table is a loud acceptance failure.
+-- Bind :dead_match_ids_json, :dead_match_count, and :dead_match_keys_md5 from
+-- the PostgreSQL TOTAL row; the statement recomputes and verifies the bridge.
 -- ===========================================================================
 
 WITH required_seasons(source_season_id) AS (
@@ -224,6 +251,14 @@ WITH required_seasons(source_season_id) AS (
         ('match_officials', 'fbref_match_officials'),
         ('match_keeper_stats', 'fbref_match_keeper_stats'),
         ('match_player_stats', 'fbref_match_player_stats')
+), dead_match_bridge AS (
+    SELECT trim(value) AS match_id
+    FROM UNNEST(
+        CAST(
+            json_parse(CAST(:dead_match_ids_json AS varchar))
+            AS array(varchar)
+        )
+    ) AS bridge(value)
 ), active_male AS (
     SELECT DISTINCT scope.source_competition_id, scope.competition_name
     FROM iceberg.bronze.fbref_target_scope AS scope
@@ -265,15 +300,31 @@ WITH required_seasons(source_season_id) AS (
     FROM schedule_ranked
     WHERE schedule_rank = 1
       AND nullif(trim(score), '') IS NOT NULL
+), played_match_keys AS (
+    SELECT DISTINCT match_id FROM played
+), dead_bridge_evidence AS (
+    SELECT count(*) AS dead_match_count,
+           count(DISTINCT dead.match_id) AS dead_match_distinct_count,
+           count_if(nullif(trim(dead.match_id), '') IS NULL)
+               AS blank_dead_match_ids,
+           count_if(played.match_id IS NULL) AS orphan_dead_match_ids,
+           lower(to_hex(md5(to_utf8(coalesce(
+               array_join(
+                   array_agg(dead.match_id ORDER BY dead.match_id), chr(31)
+               ),
+               ''
+           ))))) AS dead_match_keys_md5
+    FROM dead_match_bridge AS dead
+    LEFT JOIN played_match_keys AS played ON played.match_id = dead.match_id
 ), current_run_matches AS (
     SELECT regexp_extract(
                manifest.target_id, '^fbref:match:([^:]+)$', 1
            ) AS match_id,
            count(*) AS current_run_match_rows,
            count_if(
-               manifest.parse_status <> 'succeeded'
-               OR manifest.persist_status <> 'succeeded'
-               OR manifest.validation_status <> 'succeeded'
+               manifest.parse_status <> 'success'
+               OR manifest.persist_status <> 'success'
+               OR manifest.validation_status <> 'success'
            ) AS invalid_current_run_match_rows
     FROM iceberg.bronze.fbref_page_manifest AS manifest
     WHERE manifest.run_id = CAST(:control_run_id AS varchar)
@@ -344,6 +395,8 @@ WITH required_seasons(source_season_id) AS (
                AS current_run_match_rows,
            max(coalesce(current.invalid_current_run_match_rows, 1))
                AS invalid_current_run_match_rows,
+           max(CASE WHEN dead.match_id IS NULL THEN 0 ELSE 1 END)
+               AS dead_bridge_rows,
            count_if(availability.dataset IS NOT NULL)
                AS availability_decisions,
            count_if(
@@ -378,6 +431,8 @@ WITH required_seasons(source_season_id) AS (
     CROSS JOIN match_datasets AS required
     LEFT JOIN current_run_matches AS current
       ON current.match_id = played.match_id
+    LEFT JOIN dead_match_bridge AS dead
+      ON dead.match_id = played.match_id
     LEFT JOIN availability
       ON availability.match_id = played.match_id
      AND availability.dataset = required.dataset
@@ -386,6 +441,24 @@ WITH required_seasons(source_season_id) AS (
      AND typed.dataset = required.dataset
     GROUP BY played.source_competition_id, played.source_season_id,
              played.match_id
+), classified_match_proof AS (
+    SELECT proof.*,
+           CASE
+               WHEN dead_bridge_rows = 0
+                AND current_run_match_rows = 1
+                AND invalid_current_run_match_rows = 0
+                AND availability_decisions = 8
+                AND invalid_dataset_decisions = 0
+               THEN 'durable'
+               WHEN dead_bridge_rows = 1
+                AND current_run_match_rows = 0
+                AND availability_decisions = 0
+                AND directly_materialized_datasets = 0
+                AND explicitly_empty_datasets = 0
+               THEN 'dead'
+               ELSE 'unproved'
+           END AS trino_proof
+    FROM match_proof AS proof
 ), per_scope AS (
     SELECT expected.source_competition_id,
            expected.competition_name,
@@ -393,16 +466,13 @@ WITH required_seasons(source_season_id) AS (
            count(DISTINCT published.source_season_id) AS published_scope_rows,
            count(DISTINCT played.match_id) AS played_matches,
            count(DISTINCT proof.match_id) FILTER (
-               WHERE proof.current_run_match_rows = 1
-                 AND proof.invalid_current_run_match_rows = 0
-                 AND proof.availability_decisions = 8
-                 AND proof.invalid_dataset_decisions = 0
+               WHERE proof.trino_proof IN ('durable', 'dead')
            ) AS fully_proved_matches,
            count(DISTINCT proof.match_id) FILTER (
-               WHERE proof.current_run_match_rows <> 1
-                  OR proof.invalid_current_run_match_rows <> 0
-                  OR proof.availability_decisions <> 8
-                  OR proof.invalid_dataset_decisions <> 0
+               WHERE proof.trino_proof = 'dead'
+           ) AS dead_proved_matches,
+           count(DISTINCT proof.match_id) FILTER (
+               WHERE proof.trino_proof = 'unproved'
            ) AS unproved_matches,
            (
                SELECT count(*) - count(DISTINCT match_id)
@@ -418,7 +488,7 @@ WITH required_seasons(source_season_id) AS (
     LEFT JOIN played
       ON played.source_competition_id = expected.source_competition_id
      AND played.source_season_id = expected.source_season_id
-    LEFT JOIN match_proof AS proof
+    LEFT JOIN classified_match_proof AS proof
       ON proof.source_competition_id = expected.source_competition_id
      AND proof.source_season_id = expected.source_season_id
      AND proof.match_id = played.match_id
@@ -429,6 +499,13 @@ SELECT CASE
            WHEN min(published_scope_rows) = 1
             AND sum(unproved_matches) = 0
             AND sum(fully_proved_matches) = sum(played_matches)
+            AND bridge.dead_match_count =
+                CAST(:dead_match_count AS bigint)
+            AND bridge.dead_match_distinct_count = bridge.dead_match_count
+            AND bridge.blank_dead_match_ids = 0
+            AND bridge.orphan_dead_match_ids = 0
+            AND bridge.dead_match_keys_md5 =
+                lower(CAST(:dead_match_keys_md5 AS varchar))
            THEN 'PASS' ELSE 'FAIL'
        END AS verdict,
        CASE WHEN grouping(source_competition_id) = 1
@@ -441,11 +518,20 @@ SELECT CASE
        sum(published_scope_rows) AS published_scope_rows,
        sum(played_matches) AS played_matches,
        sum(fully_proved_matches) AS fully_proved_matches,
+       sum(dead_proved_matches) AS dead_proved_matches,
        sum(unproved_matches) AS unproved_matches,
-       sum(duplicate_schedule_rows) AS duplicate_schedule_rows
+       sum(duplicate_schedule_rows) AS duplicate_schedule_rows,
+       bridge.dead_match_count,
+       bridge.dead_match_distinct_count,
+       bridge.blank_dead_match_ids,
+       bridge.orphan_dead_match_ids,
+       bridge.dead_match_keys_md5
 FROM per_scope
+CROSS JOIN dead_bridge_evidence AS bridge
 GROUP BY GROUPING SETS (
     (source_competition_id, competition_name, source_season_id),
     ()
-)
+), bridge.dead_match_count, bridge.dead_match_distinct_count,
+   bridge.blank_dead_match_ids, bridge.orphan_dead_match_ids,
+   bridge.dead_match_keys_md5
 ORDER BY competition_name, source_season_id;

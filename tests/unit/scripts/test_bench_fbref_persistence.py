@@ -568,6 +568,21 @@ class _DirectControl:
 
     def get_run(self, run_id):
         self.calls.append(("run", run_id))
+        mode = "batch" if run_id == "run-two" else "sequential"
+        schema = "batch" if mode == "batch" else "sequential"
+        metrics = PipelineRunMetrics.anchored(
+            control_run_id=run_id,
+            schema=schema,
+            mode=mode,
+            elapsed_seconds=16.0 if mode == "batch" else 80.0,
+            match_count=1,
+            match_keys_sha256=benchmark._stable_sha256(["m1"]),
+            statement_counts=(
+                StatementCounts(20, 4)
+                if mode == "batch"
+                else StatementCounts(120, 24)
+            ),
+        )
         return {
             "run_id": run_id,
             "run_type": "replay",
@@ -577,6 +592,7 @@ class _DirectControl:
             "requests_used": 0,
             "bytes_used": 0,
             "metadata": {
+                "pipeline_run_metrics": metrics.to_dict(),
                 "bronze_acceptance_replay": {
                     "schema_version": "fbref-bronze-acceptance-replay-v1",
                     "status": "passed",
@@ -593,6 +609,9 @@ class _DirectControl:
                         "raw_zero_delta_required": True,
                         "raw_audited_attempt_count": 1,
                         "raw_audit_artifact_sha256": "a" * 64,
+                        "pipeline_metrics_artifact_sha256": (
+                            metrics.artifact_sha256
+                        ),
                     },
                 }
             },
@@ -699,6 +718,7 @@ def test_control_evidence_rejects_an_incomplete_strict_gate():
 def test_postgres_control_evidence_uses_actual_replay_processing_rows():
     base = _DirectControl()
     datasets = base.get_acceptance_run_evidence("run-direct")["datasets"]
+    source_run_id = "source-run-direct"
     observations = [
         {
             "ordinal": 0,
@@ -746,6 +766,13 @@ def test_postgres_control_evidence_uses_actual_replay_processing_rows():
         def get_acceptance_run_evidence(self, _run_id):
             raise AssertionError("source-run alias evidence must not be used")
 
+        def get_run(self, run_id):
+            run = super().get_run(run_id)
+            run["metadata"]["acceptance_replay_source_run_id"] = (
+                source_run_id
+            )
+            return run
+
     control = DirectControl()
 
     evidence = _control_run_evidence(control, "run-direct")
@@ -753,49 +780,24 @@ def test_postgres_control_evidence_uses_actual_replay_processing_rows():
     assert evidence.valid is True
     assert evidence.evidence_source == "direct_processing_rows"
     assert len(control.cursor.queries) == 2
-    assert all(params == ("run-direct",) for _sql, params in control.cursor.queries)
+    assert all(
+        params == (source_run_id,) for _sql, params in control.cursor.queries
+    )
     assert "fbref_control.observation_processing" in control.cursor.queries[0][0]
     assert "fbref_control.dataset_manifest" in control.cursor.queries[1][0]
 
 
 @pytest.mark.unit
-def _run_metrics(
-    *,
-    control_run_id,
-    schema,
-    mode,
-    seconds,
-    evidence,
-    statement_counts,
-):
-    return PipelineRunMetrics(
-        control_run_id=control_run_id,
-        schema=schema,
-        mode=mode,
-        elapsed_seconds=seconds,
-        match_count=evidence.match_targets,
-        match_keys_sha256=evidence.match_keys_sha256,
-        statement_counts=statement_counts,
-    )
-
-
-@pytest.mark.unit
 def test_pipeline_metrics_reject_zero_statement_or_unbound_artifacts():
     with pytest.raises(ValueError, match="statement counts"):
-        PipelineRunMetrics.from_mapping(
-            {
-                "schema_version": "fbref-pipeline-run-metrics-v1",
-                "control_run_id": "run-one",
-                "schema": "sequential",
-                "mode": "sequential",
-                "elapsed_seconds": 80.0,
-                "match_count": 1,
-                "match_keys_sha256": "a" * 64,
-                "statement_counts": {
-                    "execute": 0,
-                    "execute_committing": 0,
-                },
-            }
+        PipelineRunMetrics.anchored(
+            control_run_id="run-one",
+            schema="sequential",
+            mode="sequential",
+            elapsed_seconds=80.0,
+            match_count=1,
+            match_keys_sha256="a" * 64,
+            statement_counts=StatementCounts(0, 0),
         )
 
 
@@ -818,9 +820,6 @@ def test_real_pipeline_evidence_mode_is_read_only_and_has_one_strict_verdict():
         sentinels=baseline_sentinels,
     )
     manager.queries.clear()
-    sequential_evidence = _control_run_evidence(_DirectControl(), "run-one")
-    batch_evidence = _control_run_evidence(_DirectControl(), "run-two")
-
     report = evaluate_existing_pipeline_acceptance(
         manager=manager,
         control=control,
@@ -828,22 +827,6 @@ def test_real_pipeline_evidence_mode_is_read_only_and_has_one_strict_verdict():
         batch_schema="batch",
         sequential_control_run_id="run-one",
         batch_control_run_id="run-two",
-        sequential_metrics=_run_metrics(
-            control_run_id="run-one",
-            schema="sequential",
-            mode="sequential",
-            seconds=80.0,
-            evidence=sequential_evidence,
-            statement_counts=StatementCounts(120, 24),
-        ),
-        batch_metrics=_run_metrics(
-            control_run_id="run-two",
-            schema="batch",
-            mode="batch",
-            seconds=16.0,
-            evidence=batch_evidence,
-            statement_counts=StatementCounts(20, 4),
-        ),
         sequential_baseline=sequential_baseline,
         batch_baseline=batch_baseline,
         sentinel_match_id=sentinel,
@@ -876,25 +859,28 @@ def test_real_pipeline_evidence_mode_is_read_only_and_has_one_strict_verdict():
 @pytest.mark.unit
 def test_real_pipeline_rejects_metrics_for_a_different_match_cohort():
     manager = _DifferentialManager()
-    control = _DirectControl()
+    class WrongCohort(_DirectControl):
+        def get_run(self, run_id):
+            run = super().get_run(run_id)
+            if run_id == "run-one":
+                run["metadata"]["pipeline_run_metrics"] = (
+                    PipelineRunMetrics.anchored(
+                        control_run_id="run-one",
+                        schema="sequential",
+                        mode="sequential",
+                        elapsed_seconds=80.0,
+                        match_count=2,
+                        match_keys_sha256=benchmark._stable_sha256(
+                            ["m1", "m2"]
+                        ),
+                        statement_counts=StatementCounts(120, 24),
+                    ).to_dict()
+                )
+            return run
+
+    control = WrongCohort()
     sentinel = "outside-match"
     sentinels = _sentinel_digests(manager, "sequential", sentinel)
-    sequential_evidence = _control_run_evidence(_DirectControl(), "run-one")
-    batch_evidence = _control_run_evidence(_DirectControl(), "run-two")
-    sequential_metrics = _run_metrics(
-        control_run_id="run-one",
-        schema="sequential",
-        mode="sequential",
-        seconds=80.0,
-        evidence=sequential_evidence,
-        statement_counts=StatementCounts(120, 24),
-    )
-    sequential_metrics = PipelineRunMetrics(
-        **{
-            **sequential_metrics.to_dict(),
-            "match_count": 2,
-        }
-    )
 
     with pytest.raises(ValueError, match="match cohort"):
         evaluate_existing_pipeline_acceptance(
@@ -904,15 +890,6 @@ def test_real_pipeline_rejects_metrics_for_a_different_match_cohort():
             batch_schema="batch",
             sequential_control_run_id="run-one",
             batch_control_run_id="run-two",
-            sequential_metrics=sequential_metrics,
-            batch_metrics=_run_metrics(
-                control_run_id="run-two",
-                schema="batch",
-                mode="batch",
-                seconds=16.0,
-                evidence=batch_evidence,
-                statement_counts=StatementCounts(20, 4),
-            ),
             sequential_baseline=AcceptanceBaseline(
                 schema="sequential",
                 sentinel_match_id=sentinel,

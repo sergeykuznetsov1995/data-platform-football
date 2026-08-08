@@ -12,9 +12,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from typing import Any
+
+from scrapers.base.sql_validator import validate_identifier
+from scrapers.base.trino_manager import TrinoTableManager
 
 
 logger = logging.getLogger(__name__)
@@ -24,6 +28,7 @@ ACCEPTANCE_BYTE_LIMIT_MB = 50
 ACCEPTANCE_SHARD_SIZE = 25
 ACCEPTANCE_RESERVATION_MB = 3
 ACCEPTANCE_MAX_BATCHES = 1
+ACCEPTANCE_REPLAY_DEFAULT_SCHEMA = "fbref_acceptance_sequential"
 # The DAG itself times out after three hours.  A four-hour lock preserves the
 # writer fence for the whole run while bounding a hard-kill orphan to hours,
 # not the eight-day publication TTL used across downstream transforms.
@@ -104,6 +109,34 @@ class FBrefAcceptanceError(RuntimeError):
     """The acceptance contract cannot be proven from durable evidence."""
 
 
+class AcceptanceReplayTrinoTableManager(TrinoTableManager):
+    """Count only statements issued by the actual acceptance replay parser."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._acceptance_execute_count = 0
+        self._acceptance_committing_count = 0
+
+    def _execute(
+        self,
+        sql: str,
+        fetch: bool = False,
+        params: tuple | None = None,
+    ) -> Any:
+        self._acceptance_execute_count += 1
+        return super()._execute(sql, fetch=fetch, params=params)
+
+    def _execute_committing(self, sql: str) -> None:
+        self._acceptance_committing_count += 1
+        return super()._execute_committing(sql)
+
+    def statement_counts(self) -> dict[str, int]:
+        return {
+            "execute": self._acceptance_execute_count,
+            "execute_committing": self._acceptance_committing_count,
+        }
+
+
 def _normalized_scope(scope: object) -> str:
     value = str(scope or "").strip().casefold()
     if value not in {"current", "history"}:
@@ -131,6 +164,47 @@ def _pipeline():
     from scrapers.fbref.pipeline import FBrefPipeline
 
     return FBrefPipeline.from_env()
+
+
+def _acceptance_replay_profile(
+    *, trino_schema: object, persistence_mode: object
+) -> tuple[str, str]:
+    schema = validate_identifier(
+        str(trino_schema or "").strip(), "schema"
+    )
+    if schema.casefold() == "bronze":
+        raise ValueError("acceptance replay requires an isolated Trino schema")
+    mode = str(persistence_mode or "").strip().casefold()
+    if mode not in {"sequential", "batch"}:
+        raise ValueError("persistence_mode must be sequential or batch")
+    return schema, mode
+
+
+def _acceptance_replay_pipeline(
+    *, trino_schema: str, persistence_mode: str
+):
+    from scrapers.fbref.bronze import FBrefGenericBronzeWriter
+    from scrapers.fbref.control import ControlStore
+    from scrapers.fbref.pipeline import FBrefPipeline
+    from scrapers.fbref.raw_store import RawPageStore
+    from scrapers.fbref.typed_bronze import (
+        FBrefTypedBronzeAdapter,
+        FBrefTypedBronzeWriter,
+    )
+
+    manager = AcceptanceReplayTrinoTableManager()
+    pipeline = FBrefPipeline(
+        ControlStore.from_env(),
+        RawPageStore.from_env(optional=False),
+        generic_writer=FBrefGenericBronzeWriter(
+            manager, schema=trino_schema
+        ),
+        typed_adapter=FBrefTypedBronzeAdapter(
+            FBrefTypedBronzeWriter(manager, schema=trino_schema)
+        ),
+    )
+    pipeline.batch_persist_enabled = persistence_mode == "batch"
+    return pipeline, manager
 
 
 def _acceptance_settings(scope: object):
@@ -442,6 +516,8 @@ def initialize_fbref_acceptance_replay_run(
     airflow_run_id: str,
     dag_id: str,
     source_control_run_id: object,
+    trino_schema: object = ACCEPTANCE_REPLAY_DEFAULT_SCHEMA,
+    persistence_mode: object = "sequential",
 ) -> str:
     """Create a zero-budget replay run with nonpublication evidence."""
 
@@ -450,6 +526,10 @@ def initialize_fbref_acceptance_replay_run(
     source = str(source_control_run_id or "").strip()
     if not source:
         raise ValueError("Replay requires source_control_run_id")
+    schema, mode = _acceptance_replay_profile(
+        trino_schema=trino_schema,
+        persistence_mode=persistence_mode,
+    )
     return _pipeline().initialize_acceptance_replay_run(
         airflow_run_id=airflow_run_id,
         dag_id=dag_id,
@@ -457,6 +537,10 @@ def initialize_fbref_acceptance_replay_run(
         settings=PipelineSettings.acceptance_replay(
             shard_size=ACCEPTANCE_SHARD_SIZE
         ),
+        execution_metadata={
+            "acceptance_trino_schema": schema,
+            "acceptance_persistence_mode": mode,
+        },
     )
 
 
@@ -549,27 +633,72 @@ def audit_fbref_acceptance_raw(
 
 
 def parse_fbref_acceptance_replay(
-    *, airflow_run_id: str, dag_id: str, source_control_run_id: object
+    *,
+    airflow_run_id: str,
+    dag_id: str,
+    source_control_run_id: object,
+    trino_schema: object = ACCEPTANCE_REPLAY_DEFAULT_SCHEMA,
+    persistence_mode: object = "sequential",
 ) -> dict[str, Any]:
-    """Parse one acceptance source cohort with a physically zero budget."""
+    """Parse and atomically anchor measurements from the actual replay."""
 
-    from utils.fbref_pipeline_tasks import parse_fbref_wave
+    from scrapers.fbref.pipeline import PipelineSettings
 
     source = str(source_control_run_id or "").strip()
     if not source:
         raise ValueError("Replay requires source_control_run_id")
-    return parse_fbref_wave(
-        airflow_run_id=airflow_run_id,
-        dag_id=dag_id,
-        page_kinds=ACCEPTANCE_PAGE_KINDS,
-        run_type="replay",
-        source_control_run_id=source,
-        request_limit=0,
-        byte_limit_mb=0,
-        shard_size=ACCEPTANCE_SHARD_SIZE,
-        reservation_mb=ACCEPTANCE_RESERVATION_MB,
-        acceptance_replay=True,
+    schema, mode = _acceptance_replay_profile(
+        trino_schema=trino_schema,
+        persistence_mode=persistence_mode,
     )
+    control_run_id = _control_run_id(
+        airflow_run_id=airflow_run_id, dag_id=dag_id
+    )
+    pipeline, manager = _acceptance_replay_pipeline(
+        trino_schema=schema, persistence_mode=mode
+    )
+    pipeline.batch_persist_enabled = mode == "batch"
+    run = pipeline.control.get_run(control_run_id)
+    metadata = run.get("metadata") if isinstance(run, Mapping) else None
+    if (
+        not isinstance(run, Mapping)
+        or str(run.get("status") or "").casefold() != "running"
+        or str(run.get("run_type") or "").casefold() != "replay"
+        or not isinstance(metadata, Mapping)
+        or str(metadata.get("acceptance_trino_schema") or "") != schema
+        or str(metadata.get("acceptance_persistence_mode") or "").casefold()
+        != mode
+    ):
+        raise FBrefAcceptanceError(
+            "Replay parser profile differs from initialized control run"
+        )
+    started = time.monotonic()
+    try:
+        result = pipeline.parse_wave(
+            control_run_id,
+            page_kinds=list(ACCEPTANCE_PAGE_KINDS),
+            settings=PipelineSettings.acceptance_replay(
+                shard_size=ACCEPTANCE_SHARD_SIZE
+            ),
+            source_run_id=source,
+            acceptance_replay=True,
+        ).as_dict()
+        elapsed_seconds = time.monotonic() - started
+        metrics = pipeline.control.record_replay_pipeline_metrics(
+            control_run_id,
+            schema=schema,
+            mode=mode,
+            elapsed_seconds=elapsed_seconds,
+            statement_counts=manager.statement_counts(),
+        )
+    finally:
+        connection = getattr(manager, "_conn", None)
+        if connection is not None:
+            try:
+                connection.close()
+            finally:
+                manager._conn = None
+    return {**result, "pipeline_metrics": metrics}
 
 
 def _validate_expected_cohort(
@@ -881,6 +1010,7 @@ __all__ = [
     "ACCEPTANCE_BYTE_LIMIT_MB",
     "ACCEPTANCE_MAX_BATCHES",
     "ACCEPTANCE_PAGE_KINDS",
+    "ACCEPTANCE_REPLAY_DEFAULT_SCHEMA",
     "ACCEPTANCE_PUBLICATION_LOCK_TTL_SECONDS",
     "ACCEPTANCE_REQUEST_LIMIT",
     "ACCEPTANCE_RESERVATION_MB",

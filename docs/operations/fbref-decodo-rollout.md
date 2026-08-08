@@ -60,15 +60,15 @@ Never point this stage at a fetch DAG or the proxy filter.
      --sentinel-match-id OUTSIDE_MATCH --output BATCH_BASELINE_JSON
    ```
 
-3. Run the actual offline replay pipeline once with `FBREF_BATCH_PERSIST=0`.
+3. Run `dag_replay_fbref_bronze` once with
+   `trino_schema=SEQUENTIAL_SCHEMA` and `persistence_mode=sequential`.
 4. Restore the identical control/raw baseline, then run it in the second
-   schema with `FBREF_BATCH_PERSIST=1`. Keep the same frozen cohort and parser
-   versions. Both replays must show zero proxy requests and zero proxy bytes.
-   The replay launcher must write a protected metrics artifact for each run;
-   hand-entered times, match counts, or statement counts are not accepted.
-   Each artifact uses schema version `fbref-pipeline-run-metrics-v1` and binds
-   its mode, Trino schema, control run ID, elapsed seconds, positive statement
-   counts, match count, and match-key SHA-256 to that exact replay.
+   schema with `trino_schema=BATCH_SCHEMA` and `persistence_mode=batch`. Keep
+   the same frozen cohort and parser versions. Both replays must show zero
+   proxy requests and zero proxy bytes. The actual parse task measures its own
+   monotonic elapsed time and Trino statements. PostgreSQL atomically stores a
+   versioned artifact plus SHA-256 in that run's protected metadata; there is
+   no hand-entered timing, match count, or statement-count input.
 5. Run the strict persistence evidence tool with both control run IDs. It must
    use dynamic installed columns, excluding only `_ingested_at` and
    `persisted_at`, and execute `EXCEPT ALL` in both directions for every one of
@@ -81,13 +81,13 @@ Never point this stage at a fetch DAG or the proxy filter.
      --batch-control-run-id BATCH_RUN_ID --sentinel-match-id OUTSIDE_MATCH \
      --sequential-baseline SEQUENTIAL_BASELINE_JSON \
      --batch-baseline BATCH_BASELINE_JSON \
-     --sequential-metrics SEQUENTIAL_METRICS_JSON \
-     --batch-metrics BATCH_METRICS_JSON --output STRICT_EVIDENCE_JSON
+     --output STRICT_EVIDENCE_JSON
    ```
 
-The evidence tool rejects a metrics file if its control run ID, mode, schema,
-match count, or match-key digest differs from direct PostgreSQL evidence. It
-also verifies that every non-sentinel Trino row carries that replay's own
+The evidence tool reads only the create-once metrics anchors from PostgreSQL
+and rejects them if their artifact digest, control run ID, mode, schema, match
+count, or match-key digest differs from direct evidence. It also verifies that
+every non-sentinel Trino row carries that replay's own
 `run_id`/`_batch_id`; only then does it map the two distinct IDs to one
 comparison token. The lineage columns remain in the comparison.
 
@@ -104,6 +104,12 @@ Run both read-only statements in
 `docs/operations/sql/fbref_male_completeness_control.sql` against their named
 engines. Every active/present male competition is crossed with source seasons
 `2025-2026` and `2026-2027`; there is no hand-written competition count.
+Bind a completed publishing current/backfill run from `iceberg.bronze`, not an
+isolated replay: replay correctness was proved against its frozen cohort in
+Step 2, while this gate proves the whole published male scope.
+Run PostgreSQL first, then copy the three dead-match bridge values from its
+`TOTAL` row into the named Trino bind parameters. Trino recomputes their count,
+distinctness, scope, and fingerprint before accepting a dead proof.
 
 Every row, including `TOTAL`, must be `PASS`. This proves deduplicated schedule
 keys, a successful current-run page manifest for every played match, all eight
@@ -134,7 +140,7 @@ expected bytes per durable match.
 
 Then, and only then:
 
-1. enable daily;
+1. set `FBREF_BATCH_PERSIST=1` in the candidate image and enable daily;
 2. observe one complete scheduled run and provider reconciliation;
 3. enable drain for the existing backlog;
 4. keep only one FBref paid run active at a time.

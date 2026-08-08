@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import uuid
 from contextlib import contextmanager
@@ -17,6 +18,7 @@ from datetime import datetime
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
+from scrapers.base.sql_validator import validate_identifier
 from scrapers.fbref.control.migrations import (
     MIGRATION_LOCK_KEY,
     MIGRATIONS,
@@ -630,6 +632,82 @@ def _bronze_acceptance_evidence(
     if sum(normalized["route_counts"].values()) != normalized["cohort_size"]:
         raise StateConflict("route_counts do not match acceptance cohort")
     return normalized
+
+
+def _validated_replay_pipeline_metrics(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    evidence = dict(value)
+    required = {
+        "schema_version",
+        "control_run_id",
+        "schema",
+        "mode",
+        "elapsed_seconds",
+        "match_count",
+        "match_keys_sha256",
+        "statement_counts",
+        "artifact_sha256",
+    }
+    if set(evidence) != required:
+        raise ValueError("replay pipeline metrics fields are invalid")
+    if evidence.get("schema_version") != "fbref-pipeline-run-metrics-v1":
+        raise StateConflict("replay pipeline metrics schema is unsupported")
+    elapsed = evidence.get("elapsed_seconds")
+    if (
+        isinstance(elapsed, bool)
+        or not isinstance(elapsed, (int, float))
+        or not math.isfinite(float(elapsed))
+        or float(elapsed) <= 0
+    ):
+        raise ValueError("elapsed_seconds must be a positive finite number")
+    match_count = evidence.get("match_count")
+    if (
+        isinstance(match_count, bool)
+        or not isinstance(match_count, int)
+        or match_count < 1
+    ):
+        raise ValueError("match_count must be a positive integer")
+    counts = evidence.get("statement_counts")
+    if not isinstance(counts, Mapping) or set(counts) != {
+        "execute",
+        "execute_committing",
+    }:
+        raise ValueError("statement_counts are invalid")
+    normalized_counts = {}
+    for key in ("execute", "execute_committing"):
+        count = counts.get(key)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("statement_counts are invalid")
+        normalized_counts[key] = count
+    if sum(normalized_counts.values()) <= 0:
+        raise ValueError("statement_counts must prove at least one statement")
+    mode = str(evidence.get("mode") or "").strip().casefold()
+    if mode not in {"sequential", "batch"}:
+        raise ValueError("replay pipeline metrics mode is invalid")
+    core = {
+        "schema_version": "fbref-pipeline-run-metrics-v1",
+        "control_run_id": _uuid(
+            evidence.get("control_run_id"), "control_run_id"
+        ),
+        "schema": validate_identifier(
+            _text(evidence.get("schema"), "schema"), "schema"
+        ),
+        "mode": mode,
+        "elapsed_seconds": float(elapsed),
+        "match_count": match_count,
+        "match_keys_sha256": _sha256_hex(
+            evidence.get("match_keys_sha256"), "match_keys_sha256"
+        ),
+        "statement_counts": normalized_counts,
+    }
+    artifact_sha256 = hashlib.sha256(_json(core).encode("utf-8")).hexdigest()
+    supplied_sha256 = _sha256_hex(
+        evidence.get("artifact_sha256"), "artifact_sha256"
+    )
+    if supplied_sha256 != artifact_sha256:
+        raise StateConflict("replay pipeline metrics digest does not match")
+    return {**core, "artifact_sha256": artifact_sha256}
 
 
 def _row_dict(cursor: Any, row: Any) -> Optional[dict]:
@@ -2400,6 +2478,16 @@ class ControlStore:
             )
             if replay:
                 raw_audit = metadata.get("raw_audit")
+                pipeline_metrics_value = metadata.get("pipeline_run_metrics")
+                pipeline_metrics = (
+                    _validated_replay_pipeline_metrics(
+                        _json_mapping(
+                            pipeline_metrics_value, "pipeline_run_metrics"
+                        )
+                    )
+                    if pipeline_metrics_value is not None
+                    else None
+                )
                 if (
                     metadata.get("acceptance_replay") is not True
                     or metadata.get("publication_eligible") is not False
@@ -2411,6 +2499,18 @@ class ControlStore:
                     or str(raw_audit.get("status") or "").casefold()
                     != "passed"
                     or raw_audit.get("zero_delta_required") is not True
+                    or pipeline_metrics is None
+                    or pipeline_metrics["control_run_id"] != run
+                    or pipeline_metrics["schema"]
+                    != str(metadata.get("acceptance_trino_schema") or "")
+                    or pipeline_metrics["mode"]
+                    != str(
+                        metadata.get("acceptance_persistence_mode") or ""
+                    ).casefold()
+                    or normalized["strict_gates"].get(
+                        "pipeline_metrics_artifact_sha256"
+                    )
+                    != pipeline_metrics["artifact_sha256"]
                 ):
                     raise StateConflict(
                         f"Run {run} lacks strict acceptance replay prerequisites"
@@ -2452,6 +2552,142 @@ class ControlStore:
             if cursor.rowcount != 1:
                 raise StateConflict(f"Acceptance run {run} disappeared")
         return {**normalized, "idempotent": False}
+
+    def record_replay_pipeline_metrics(
+        self,
+        run_id: object,
+        *,
+        schema: object,
+        mode: object,
+        elapsed_seconds: object,
+        statement_counts: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically anchor metrics produced by the actual replay parser."""
+
+        run = _uuid(run_id, "run_id")
+        normalized_schema = validate_identifier(
+            _text(schema, "schema"), "schema"
+        )
+        normalized_mode = str(mode or "").strip().casefold()
+        if normalized_mode not in {"sequential", "batch"}:
+            raise ValueError("replay pipeline metrics mode is invalid")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT status, run_type, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            row = _fetchone(cursor)
+            if row is None or row["status"] != "running" or (
+                row["run_type"] != "replay"
+            ):
+                raise StateConflict(
+                    f"Run {run} cannot anchor replay pipeline metrics"
+                )
+            metadata = _json_mapping(
+                row.get("metadata") or {}, "crawl run metadata"
+            )
+            if (
+                metadata.get("acceptance_replay") is not True
+                or str(metadata.get("acceptance_trino_schema") or "")
+                != normalized_schema
+                or str(
+                    metadata.get("acceptance_persistence_mode") or ""
+                ).casefold()
+                != normalized_mode
+            ):
+                raise StateConflict(
+                    f"Run {run} metrics differ from its pinned replay profile"
+                )
+            source_run = _uuid(
+                metadata.get("acceptance_replay_source_run_id"),
+                "acceptance_replay_source_run_id",
+            )
+            installed_value = metadata.get("pipeline_run_metrics")
+            if installed_value is not None:
+                installed = _validated_replay_pipeline_metrics(
+                    _json_mapping(
+                        installed_value, "pipeline_run_metrics"
+                    )
+                )
+                if (
+                    installed["control_run_id"] != run
+                    or installed["schema"] != normalized_schema
+                    or installed["mode"] != normalized_mode
+                ):
+                    raise StateConflict(
+                        f"Run {run} already has different replay metrics"
+                    )
+                return {**installed, "idempotent": True}
+            cursor.execute(
+                """
+                SELECT target.target_id,
+                       frontier.source_ids ->> 'match_id' AS match_id
+                FROM fbref_control.run_target AS target
+                JOIN fbref_control.page_frontier AS frontier
+                  ON frontier.target_id = target.target_id
+                WHERE target.run_id = %s
+                  AND frontier.page_kind = 'match'
+                ORDER BY match_id, target.target_id
+                """,
+                (source_run,),
+            )
+            match_keys = []
+            for target in _fetchall(cursor):
+                target_id = str(target.get("target_id") or "")
+                match_id = str(target.get("match_id") or "")
+                if target_id != f"fbref:match:{match_id}" or not match_id:
+                    raise StateConflict(
+                        f"Run {run} has an invalid match target key"
+                    )
+                match_keys.append(match_id)
+            if not match_keys or len(match_keys) != len(set(match_keys)):
+                raise StateConflict(
+                    f"Run {run} has no unique replay match cohort"
+                )
+            match_keys.sort()
+            encoded_keys = json.dumps(
+                match_keys,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            core = {
+                "schema_version": "fbref-pipeline-run-metrics-v1",
+                "control_run_id": run,
+                "schema": normalized_schema,
+                "mode": normalized_mode,
+                "elapsed_seconds": elapsed_seconds,
+                "match_count": len(match_keys),
+                "match_keys_sha256": hashlib.sha256(
+                    encoded_keys
+                ).hexdigest(),
+                "statement_counts": dict(statement_counts),
+            }
+            anchored = _validated_replay_pipeline_metrics(
+                {
+                    **core,
+                    "artifact_sha256": hashlib.sha256(
+                        _json(core).encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET metadata = metadata || %s::jsonb,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s
+                """,
+                (_json({"pipeline_run_metrics": anchored}), run),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(f"Acceptance run {run} disappeared")
+        return {**anchored, "idempotent": False}
 
     def seal_raw_fetch_attempts(self, run_id: object) -> dict[str, Any]:
         """Freeze and fingerprint the successful-attempt set before audit.
