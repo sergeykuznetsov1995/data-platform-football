@@ -5,8 +5,13 @@ import pytest
 
 from scrapers.fbref.bronze import (
     FBrefGenericBronzeWriter,
+    GenericBronzeBatchUnsupported,
+    GenericPagePersistItem,
     GenericPersistenceError,
     PAGE_MANIFEST_TABLE,
+    TABLE_CELLS_TABLE,
+    TABLE_INVENTORY_TABLE,
+    _batch_token,
     _token,
 )
 from scrapers.fbref.page_document import parse_page_document
@@ -32,16 +37,134 @@ def _manager():
     return manager
 
 
-def _page():
+def _page(target_id="fbref:season:9:2025"):
     return parse_page_document(
         """
         <table id="stats_standard"><tr><th data-stat="player">Player</th></tr>
         <tr><td data-stat="player"><a href="/en/players/1234abcd/P">P</a></td></tr>
         </table>
         """,
-        target_id="fbref:season:9:2025",
+        target_id=target_id,
         page_kind="season",
     )
+
+
+def _page_item(identity: str, *, page=None):
+    return GenericPagePersistItem(
+        page=page or _page(f"fbref:season:9:{identity}"),
+        canonical_url=f"https://fbref.com/en/comps/9/{identity}/source",
+        run_id=f"run-{identity}",
+        staging_identity=identity,
+    )
+
+
+def _merge_sql(manager):
+    return [
+        call.args[0]
+        for call in manager._execute.call_args_list
+        if call.args and call.args[0].startswith("MERGE INTO")
+    ]
+
+
+def test_persist_pages_merges_each_generic_table_once_in_commit_order():
+    manager = _manager()
+
+    counts = FBrefGenericBronzeWriter(manager).persist_pages(
+        [_page_item("a"), _page_item("b")]
+    )
+
+    assert counts == [
+        {"cells": 1, "tables": 1, "manifest": 1},
+        {"cells": 1, "tables": 1, "manifest": 1},
+    ]
+    sql = _merge_sql(manager)
+    assert len(sql) == 3
+    assert [
+        next(
+            table
+            for table in (
+                TABLE_CELLS_TABLE,
+                TABLE_INVENTORY_TABLE,
+                PAGE_MANIFEST_TABLE,
+            )
+            if f"iceberg.bronze.{table}" in statement
+        )
+        for statement in sql
+    ] == [TABLE_CELLS_TABLE, TABLE_INVENTORY_TABLE, PAGE_MANIFEST_TABLE]
+
+
+def test_persist_pages_returns_aligned_zero_counts_for_empty_valid_page():
+    manager = _manager()
+    empty = parse_page_document(
+        "<html><body></body></html>",
+        target_id="fbref:season:9:empty",
+        page_kind="season",
+    )
+
+    counts = FBrefGenericBronzeWriter(manager).persist_pages(
+        [_page_item("normal"), _page_item("empty", page=empty)]
+    )
+
+    assert counts == [
+        {"cells": 1, "tables": 1, "manifest": 1},
+        {"cells": 0, "tables": 0, "manifest": 1},
+    ]
+    assert len(_merge_sql(manager)) == 3
+
+
+def test_persist_pages_rejects_duplicate_natural_keys_before_first_ddl():
+    manager = _manager()
+    item = _page_item("duplicate")
+
+    with pytest.raises(GenericBronzeBatchUnsupported, match="duplicate"):
+        FBrefGenericBronzeWriter(manager).persist_pages([item, item])
+
+    manager.create_iceberg_table.assert_not_called()
+    manager._execute.assert_not_called()
+    manager.insert_dataframe.assert_not_called()
+
+
+def test_persist_pages_rejects_parser_errors_for_sequential_fallback():
+    manager = _manager()
+    error_page = replace(_page("fbref:season:9:error"), errors=("bad table",))
+
+    with pytest.raises(GenericBronzeBatchUnsupported, match="parser errors"):
+        FBrefGenericBronzeWriter(manager).persist_pages(
+            [_page_item("valid"), _page_item("error", page=error_page)]
+        )
+
+    manager.create_iceberg_table.assert_not_called()
+    manager._execute.assert_not_called()
+    manager.insert_dataframe.assert_not_called()
+
+
+def test_batch_stage_token_uses_complete_sorted_delimiter_safe_identity_set():
+    assert _batch_token(["b", "a"]) == _batch_token(["a", "b"])
+    assert _batch_token(["a", "b"]).startswith("batch_")
+    assert len(_batch_token(["a", "b"])) == len("batch_") + 16
+    assert _batch_token(["a", "b\x1fc"]) != _batch_token(["a\x1fb", "c"])
+
+
+def test_persist_page_delegates_valid_pages_to_single_item_batch(monkeypatch):
+    writer = FBrefGenericBronzeWriter(_manager())
+    captured = []
+
+    def persist_pages(items):
+        captured.extend(items)
+        return [{"cells": 1, "tables": 1, "manifest": 1}]
+
+    monkeypatch.setattr(writer, "persist_pages", persist_pages)
+
+    counts = writer.persist_page(
+        _page(),
+        canonical_url="https://fbref.com/test",
+        run_id="run",
+        staging_identity="identity",
+    )
+
+    assert counts == {"cells": 1, "tables": 1, "manifest": 1}
+    assert len(captured) == 1
+    assert captured[0].staging_identity == "identity"
 
 
 def test_generic_writer_merges_by_identity_and_commits_page_manifest_last():

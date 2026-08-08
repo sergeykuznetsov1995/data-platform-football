@@ -234,12 +234,26 @@ _FBREF_STAGE_RE = re.compile(
     r"^(?P<base>fbref_page_manifest|fbref_table_inventory|fbref_table_cells)"
     r"__stg_lr_(?P<refresh>[0-9a-f]{32})_[ctm]$"
 )
+_FBREF_BATCH_STAGE_RE = re.compile(
+    r"^(?P<base>fbref_page_manifest|fbref_table_inventory|fbref_table_cells)"
+    r"__stg_batch_(?P<batch>[0-9a-f]{16})_[ctm]$"
+)
 _FBREF_LEGACY_STAGE_RE = re.compile(
     r"^(?P<base>fbref_page_manifest|fbref_table_inventory|fbref_table_cells)"
     r"__stg_(?P<a>[0-9a-f]{8})_(?P<b>[0-9a-f]{4})_"
     r"(?P<c>[0-9a-f]{4})_(?P<d>[0-9a-f]{4})_"
     r"(?P<e>[0-9a-f]{12})_[0-9a-f]{12}_[ctm]$"
 )
+
+
+@dataclass(frozen=True)
+class FBrefStagingTableClassification:
+    """Public, fail-closed description of an FBref staging table name."""
+
+    family: str
+    owner_kind: str
+    live_table: str | None = None
+    logical_refresh_id: str | None = None
 
 
 def _fbref_stage_identity(table: str) -> tuple[str, str] | None:
@@ -257,20 +271,62 @@ def _fbref_stage_identity(table: str) -> tuple[str, str] | None:
     return None
 
 
-def _fbref_stage_family(table: str) -> tuple[str, str | None]:
-    """Classify every syntactically valid FBref stage without trusting it."""
+def classify_fbref_staging_table(
+    table: str,
+) -> FBrefStagingTableClassification:
+    """Classify known stage contracts without inventing observation owners."""
 
     base, separator, _suffix = table.partition("__stg_")
     if not separator or not _FBREF_ANY_STAGE_RE.fullmatch(table):
-        return "unknown", None
+        return FBrefStagingTableClassification("unknown", "unknown")
+
+    batch = _FBREF_BATCH_STAGE_RE.fullmatch(table)
+    if batch:
+        return FBrefStagingTableClassification(
+            family="generic",
+            owner_kind="batch",
+            live_table=batch.group("base"),
+        )
+
+    identity = _fbref_stage_identity(table)
+    if identity is not None:
+        live, logical_refresh_id = identity
+        return FBrefStagingTableClassification(
+            family="generic",
+            owner_kind="observation",
+            live_table=live,
+            logical_refresh_id=logical_refresh_id,
+        )
     if base in FBREF_GENERIC_STAGE_BASES:
-        return "generic", base
+        return FBrefStagingTableClassification(
+            family="generic", owner_kind="unknown", live_table=base
+        )
+
     typed = _FBREF_TYPED_STAGE_RE.fullmatch(table)
     if typed:
-        return "typed", typed.group("base")
+        return FBrefStagingTableClassification(
+            family="typed",
+            owner_kind="processing_run",
+            live_table=typed.group("base"),
+        )
     if base in FBREF_PUBLICATION_STAGE_BASES:
-        return "publication_scope", base
-    return "unknown", base
+        return FBrefStagingTableClassification(
+            family="publication_scope",
+            owner_kind="control_run",
+            live_table=base,
+        )
+    return FBrefStagingTableClassification(
+        family="unknown", owner_kind="unknown", live_table=base
+    )
+
+
+def _fbref_stage_family(table: str) -> tuple[str, str | None]:
+    """Classify every syntactically valid FBref stage without trusting it."""
+
+    classification = classify_fbref_staging_table(table)
+    if classification.owner_kind == "batch":
+        return "batch", classification.live_table
+    return classification.family, classification.live_table
 
 
 def _fetch_scalar(conn, sql: str):
@@ -444,6 +500,7 @@ def janitor_fbref_generic_stages(
                         connection, stage
                     )
                     owner_column = {
+                        "batch": "run_id",
                         "typed": "_batch_id",
                         "publication_scope": "control_run_id",
                     }.get(family)
@@ -461,7 +518,18 @@ def janitor_fbref_generic_stages(
                         )
                         decision["processing_runs"] = processing_runs
                         decision["processing_runs_terminal"] = owners_valid
-                    if family == "typed":
+                    if family == "batch":
+                        decision["age_guard_satisfied"] = (
+                            observed_at - created_at >= min_age
+                        )
+                        decision["reason"] = (
+                            "batch_stage_requires_recovery_review"
+                        )
+                        decision["recovery_action"] = (
+                            "inspect every processing run represented in the "
+                            "retained batch; no single observation owns it"
+                        )
+                    elif family == "typed":
                         decision["reason"] = (
                             "typed_stage_requires_recovery_review"
                         )
@@ -629,6 +697,7 @@ def janitor_fbref_generic_stages(
     attention_reasons = {
         "unrecognized_generic_stage",
         "unsupported_fbref_stage",
+        "batch_stage_requires_recovery_review",
         "typed_stage_requires_recovery_review",
         "publication_scope_stage_requires_recovery_review",
         "unknown_control_owner",

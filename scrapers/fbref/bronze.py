@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Iterable, Optional, Sequence
+from typing import Dict, Iterable, Mapping, Optional, Sequence
 
 import pandas as pd
 
@@ -88,6 +89,28 @@ class GenericPersistenceError(RuntimeError):
     """Generic Bronze was partial or could not be validated."""
 
 
+class GenericBronzeBatchUnsupported(GenericPersistenceError):
+    """The cohort must use the already-claimed sequential fallback."""
+
+
+@dataclass(frozen=True)
+class GenericPagePersistItem:
+    """One already-parsed generic page ready for Bronze persistence."""
+
+    page: PageDocument
+    canonical_url: str
+    run_id: str
+    staging_identity: str
+
+
+@dataclass(frozen=True)
+class _ValidatedGenericPagePersistItem:
+    item: GenericPagePersistItem
+    cells: tuple[dict, ...]
+    inventory: tuple[dict, ...]
+    manifest: Mapping[str, object]
+
+
 def _token(value: Optional[str]) -> str:
     """Return a deterministic, janitor-readable staging owner token.
 
@@ -104,6 +127,17 @@ def _token(value: Optional[str]) -> str:
     except (AttributeError, TypeError, ValueError):
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
         return f"id_{digest}"
+
+
+def _batch_token(staging_identities: Iterable[str]) -> str:
+    """Hash the complete sorted identity sequence without delimiter ambiguity."""
+
+    encoded = json.dumps(
+        sorted(str(identity) for identity in staging_identities),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"batch_{hashlib.sha256(encoded).hexdigest()[:16]}"
 
 
 class FBrefGenericBronzeWriter:
@@ -218,6 +252,34 @@ class FBrefGenericBronzeWriter:
     ) -> dict:
         """Write cells, table inventory, and the page commit marker last."""
 
+        if page.errors:
+            return self._persist_page_error_evidence(
+                page,
+                canonical_url=canonical_url,
+                run_id=run_id,
+                staging_identity=staging_identity,
+            )
+        return self.persist_pages(
+            [
+                GenericPagePersistItem(
+                    page=page,
+                    canonical_url=canonical_url,
+                    run_id=run_id,
+                    staging_identity=staging_identity or run_id,
+                )
+            ]
+        )[0]
+
+    def _persist_page_error_evidence(
+        self,
+        page: PageDocument,
+        *,
+        canonical_url: str,
+        run_id: str,
+        staging_identity: Optional[str],
+    ) -> dict:
+        """Preserve the legacy error manifest before raising to the caller."""
+
         self.ensure_tables()
         persisted_at = datetime.now(timezone.utc).replace(tzinfo=None)
         base_token = _token(staging_identity or run_id)
@@ -268,9 +330,152 @@ class FBrefGenericBronzeWriter:
             )
         return counts
 
+    @staticmethod
+    def _validate_page_batch(
+        items: Sequence[GenericPagePersistItem],
+    ) -> tuple[_ValidatedGenericPagePersistItem, ...]:
+        error_targets = [
+            item.page.target_id for item in items if item.page.errors
+        ]
+        if error_targets:
+            raise GenericBronzeBatchUnsupported(
+                "generic persistence batch contains parser errors for "
+                f"{error_targets[:3]}"
+            )
+
+        validated: list[_ValidatedGenericPagePersistItem] = []
+        for item in items:
+            cells = tuple(item.page.cell_records())
+            inventory = tuple(item.page.inventory_records())
+            validated.append(
+                _ValidatedGenericPagePersistItem(
+                    item=item,
+                    cells=cells,
+                    inventory=inventory,
+                    manifest={
+                        "target_id": item.page.target_id,
+                        "canonical_url": item.canonical_url,
+                        "page_kind": item.page.page_kind,
+                        "content_hash": item.page.content_hash,
+                        "parser_version": item.page.parser_version,
+                        "parse_status": "success",
+                        "persist_status": "success",
+                        "validation_status": "success",
+                        "table_count": len(item.page.tables),
+                        "cell_count": len(cells),
+                        "errors_json": json.dumps(
+                            item.page.errors, ensure_ascii=False
+                        ),
+                    },
+                )
+            )
+
+        records_by_table = {
+            TABLE_CELLS_TABLE: tuple(
+                record for item in validated for record in item.cells
+            ),
+            TABLE_INVENTORY_TABLE: tuple(
+                record for item in validated for record in item.inventory
+            ),
+            PAGE_MANIFEST_TABLE: tuple(item.manifest for item in validated),
+        }
+        for table, records in records_by_table.items():
+            keys = GENERIC_TABLE_KEYS[table]
+            seen: set[tuple[object, ...]] = set()
+            for record in records:
+                identity = tuple(record[key] for key in keys)
+                if identity in seen:
+                    raise GenericBronzeBatchUnsupported(
+                        f"duplicate {table} merge key in generic batch: "
+                        f"{identity!r}"
+                    )
+                seen.add(identity)
+        return tuple(validated)
+
+    def _persist_validated_page_batch(
+        self, items: Sequence[_ValidatedGenericPagePersistItem]
+    ) -> list[dict[str, int]]:
+        self.ensure_tables()
+        persisted_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        batch_token = _batch_token(
+            item.item.staging_identity for item in items
+        )
+
+        cell_frames = [
+            self._decorate(item.cells, item.item.run_id, persisted_at)
+            for item in items
+            if item.cells
+        ]
+        inventory_frames = [
+            self._decorate(item.inventory, item.item.run_id, persisted_at)
+            for item in items
+            if item.inventory
+        ]
+        manifest_frames = [
+            self._decorate(
+                (dict(item.manifest),), item.item.run_id, persisted_at
+            )
+            for item in items
+        ]
+        cells = (
+            pd.concat(cell_frames, ignore_index=True, sort=False)
+            if cell_frames
+            else pd.DataFrame()
+        )
+        inventory = (
+            pd.concat(inventory_frames, ignore_index=True, sort=False)
+            if inventory_frames
+            else pd.DataFrame()
+        )
+        manifests = pd.concat(
+            manifest_frames, ignore_index=True, sort=False
+        )
+
+        # The manifest is the generic completion marker and therefore remains
+        # the final merge even when either preceding frame is empty.
+        self._merge_dataframe(
+            TABLE_CELLS_TABLE,
+            cells,
+            keys=GENERIC_TABLE_KEYS[TABLE_CELLS_TABLE],
+            staging_token=f"{batch_token}_c",
+        )
+        self._merge_dataframe(
+            TABLE_INVENTORY_TABLE,
+            inventory,
+            keys=GENERIC_TABLE_KEYS[TABLE_INVENTORY_TABLE],
+            staging_token=f"{batch_token}_t",
+        )
+        self._merge_dataframe(
+            PAGE_MANIFEST_TABLE,
+            manifests,
+            keys=GENERIC_TABLE_KEYS[PAGE_MANIFEST_TABLE],
+            staging_token=f"{batch_token}_m",
+        )
+        return [
+            {
+                "cells": len(item.cells),
+                "tables": len(item.inventory),
+                "manifest": 1,
+            }
+            for item in items
+        ]
+
+    def persist_pages(
+        self, items: Sequence[GenericPagePersistItem]
+    ) -> list[dict[str, int]]:
+        """Persist a validated page cohort with one merge per generic table."""
+
+        materialized = tuple(items)
+        if not materialized:
+            return []
+        validated = self._validate_page_batch(materialized)
+        return self._persist_validated_page_batch(validated)
+
 
 __all__ = [
     "FBrefGenericBronzeWriter",
+    "GenericBronzeBatchUnsupported",
+    "GenericPagePersistItem",
     "GENERIC_TABLE_KEYS",
     "GENERIC_TABLE_SCHEMAS",
     "GenericPersistenceError",
