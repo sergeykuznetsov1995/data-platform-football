@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from scrapers.espn.canary_campaign import CampaignIdentity
 from scrapers.espn.models import (
     AgeClass,
     CapabilityState,
@@ -61,6 +62,14 @@ from scrapers.espn.transport_contracts import (
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "espn"
 UTC = timezone.utc
 NOW = datetime(2026, 7, 31, 9, tzinfo=UTC)
+TEST_RELEASE_COMMIT = "1" * 40
+TEST_RELEASE_TREE_SHA256 = "2" * 64
+
+
+@pytest.fixture(autouse=True)
+def _current_release_env(monkeypatch):
+    monkeypatch.setenv("ESPN_RELEASE_COMMIT", TEST_RELEASE_COMMIT)
+    monkeypatch.setenv("ESPN_RELEASE_TREE_SHA256", TEST_RELEASE_TREE_SHA256)
 
 
 def _fixture(name: str) -> dict:
@@ -431,12 +440,20 @@ def _plan(
     max_events: int = 100,
     selected_scopes: tuple[str, ...] | None = None,
     scoreboard_max_range_days: int | None = None,
+    current_runtime: bool = True,
 ) -> tuple[ExecutionOptions, IngestPlan]:
     registry_uri, registry_signature = _registry(
         tmp_path, tuple(item[0] for item in competitions)
     )
-    raw_manifest = tmp_path / "runs" / run_id / f"attempt-{attempt}" / "raw.json"
-    output = tmp_path / "runs" / run_id / f"attempt-{attempt}" / "result.json"
+    artifact_root = tmp_path / "runs" / run_id
+    if len(competitions) == 1:
+        only_scope_id = _scope(*competitions[0]).scope_id
+        scope_root = artifact_root / "scopes" / only_scope_id.replace(":", "-")
+        raw_manifest = scope_root / "raw-manifest.json"
+        output = scope_root / "runner-result.json"
+    else:
+        raw_manifest = artifact_root / f"attempt-{attempt}" / "raw.json"
+        output = artifact_root / f"attempt-{attempt}" / "result.json"
     bindings = {}
     priors = priors or {}
     active = active or {}
@@ -464,11 +481,18 @@ def _plan(
             "batch_id": f"batch-{scope.scope_id.replace(':', '-')}",
             "ingested_at": NOW.isoformat().replace("+00:00", "Z"),
             "generation_snapshot_uri": (
-                tmp_path
-                / "runs"
-                / run_id
-                / f"attempt-{attempt}"
-                / f"scope-{scope.scope_id}.json"
+                (
+                    artifact_root
+                    / "scopes"
+                    / scope.scope_id.replace(":", "-")
+                    / "generation.json"
+                )
+                if len(competitions) == 1
+                else (
+                    artifact_root
+                    / f"attempt-{attempt}"
+                    / f"scope-{scope.scope_id}.json"
+                )
             ).as_uri(),
             "known_nonterminal_events": known_nonterminal_events.get(
                 scope.scope_id, []
@@ -478,22 +502,81 @@ def _plan(
         if scoreboard_max_range_days is not None:
             binding["scoreboard_max_range_days"] = scoreboard_max_range_days
         bindings[scope.scope_id] = binding
-    metadata = {
-        "runtime": {
-            "mode": mode,
-            "attempt": attempt,
-            "registry_snapshot_uri": registry_uri,
-            "raw_manifest_uri": raw_manifest.as_uri(),
-            "output_uri": output.as_uri(),
-            "raw_store_uri": (tmp_path / "raw-store").as_uri(),
-            "max_events": max_events,
-            "selected_scopes": list(
-                selected_scopes if selected_scopes is not None else sorted(bindings)
-            ),
-            "scope_bindings": bindings,
-            "replay_source": replay_source,
-        }
+    runtime = {
+        "mode": mode,
+        "attempt": attempt,
+        "registry_snapshot_uri": registry_uri,
+        "raw_manifest_uri": raw_manifest.as_uri(),
+        "output_uri": output.as_uri(),
+        "raw_store_uri": (tmp_path / "raw-store").as_uri(),
+        "max_events": max_events,
+        "selected_scopes": list(
+            selected_scopes if selected_scopes is not None else sorted(bindings)
+        ),
+        "scope_bindings": bindings,
+        "replay_source": replay_source,
     }
+    if current_runtime:
+        target_scope_ids = tuple(sorted(bindings))
+        release = {
+            **CampaignIdentity.create(
+                release_commit=TEST_RELEASE_COMMIT,
+                release_tree_sha256=TEST_RELEASE_TREE_SHA256,
+                registry_signature=registry_signature,
+                target_scope_ids=target_scope_ids,
+            ).to_dict(),
+            "parser_version": PARSER_VERSION,
+            "runtime_version": RUNTIME_VERSION,
+        }
+        registry_body = Path(registry_uri.removeprefix("file://")).read_bytes()
+        registry_ref = {
+            "uri": registry_uri,
+            "sha256": hashlib.sha256(registry_body).hexdigest(),
+        }
+        admission = {
+            "kind": "espn-airflow-admission-v3",
+            "schema_version": 3,
+            "dag_id": "dag_ingest_espn",
+            "run_id": run_id,
+            "attempt": attempt,
+            "mode": mode,
+            "as_of": as_of.isoformat(),
+            "logical_date": datetime.combine(
+                as_of, datetime.min.time(), tzinfo=UTC
+            ).isoformat(),
+            "parent": None,
+            "registry_ref": registry_ref,
+            "registry_signature": registry_signature,
+            "target_scope_ids": list(target_scope_ids),
+            "scope_ids": list(target_scope_ids),
+            "bootstrap_scope_ids": [],
+            "discovery_state_ref": registry_ref,
+            "candidate_ref": registry_ref,
+            "selection_policy": "explicit-core-gender-MALE-v1",
+            "male_scope_count": len(target_scope_ids),
+            "release": release,
+            "canary_claim": None,
+            "artifact_root": artifact_root.as_uri(),
+            "raw_store_uri": (tmp_path / "raw-store").as_uri(),
+            "replay_sources": {},
+        }
+        admission_body = json.dumps(
+            admission, sort_keys=True, separators=(",", ":")
+        ).encode()
+        admission_uri = _write(
+            tmp_path / "runs" / run_id / "admission.json", admission_body
+        )
+        runtime.update(
+            {
+                "admission_ref": {
+                    "uri": admission_uri,
+                    "sha256": hashlib.sha256(admission_body).hexdigest(),
+                },
+                "release": release,
+                "canary_claim": None,
+            }
+        )
+    metadata = {"runtime": runtime}
     plan = IngestPlan(
         schema_version=1,
         run_id=run_id,
@@ -508,7 +591,7 @@ def _plan(
         "signature": plan.signature(),
     }
     plan_uri = _write(
-        tmp_path / "plans" / f"{run_id}.json",
+        raw_manifest.parent / "plan.json",
         json.dumps(envelope, sort_keys=True, separators=(",", ":")),
     )
     options = ExecutionOptions(
@@ -527,6 +610,8 @@ def _plan(
         raw_store_uri=(tmp_path / "raw-store").as_uri(),
         max_events=max_events,
     )
+    if current_runtime and len(competitions) == 1:
+        _bind_current_plan_artifact_chain(options)
     return options, plan
 
 
@@ -553,6 +638,108 @@ def _rewrite_signed_plan(options, plan: IngestPlan, mutate):
     return rebuilt
 
 
+def _bind_current_plan_artifact_chain(options) -> None:
+    plan_path = Path(options.plan_uri.removeprefix("file://"))
+    plan_body = plan_path.read_bytes()
+    envelope = json.loads(plan_body)
+    signed_plan = envelope["plan"]
+    runtime = signed_plan["metadata"]["runtime"]
+    admission_ref = runtime["admission_ref"]
+    admission = json.loads(
+        Path(admission_ref["uri"].removeprefix("file://")).read_text()
+    )
+    scope_id = signed_plan["scopes"][0]["scope_id"]
+    scope_root = (
+        admission["artifact_root"].rstrip("/")
+        + "/scopes/"
+        + scope_id.replace(":", "-")
+    )
+    plan_ref = {
+        "uri": options.plan_uri,
+        "sha256": hashlib.sha256(plan_body).hexdigest(),
+    }
+    descriptor = {
+        "kind": "espn-scope-plan-descriptor-v1",
+        "schema_version": 1,
+        "dag_id": admission["dag_id"],
+        "run_id": signed_plan["run_id"],
+        "attempt": runtime["attempt"],
+        "mode": runtime["mode"],
+        "scope_id": scope_id,
+        "plan_ref": plan_ref,
+        "plan_signature": envelope["signature"],
+        "raw_manifest_uri": runtime["raw_manifest_uri"],
+        "raw_store_uri": runtime["raw_store_uri"],
+        "generation_snapshot_uri": runtime["scope_bindings"][scope_id][
+            "generation_snapshot_uri"
+        ],
+        "expected_scoreboard_batch": None,
+        "scoreboard_checkpoint_uri": None,
+        "scope_root": scope_root,
+    }
+    descriptor_body = json.dumps(
+        descriptor, sort_keys=True, separators=(",", ":")
+    ).encode()
+    descriptor_uri = _write(
+        Path((scope_root + "/scope-plan-descriptor.json").removeprefix("file://")),
+        descriptor_body,
+    )
+    descriptor_ref = {
+        "uri": descriptor_uri,
+        "sha256": hashlib.sha256(descriptor_body).hexdigest(),
+    }
+    index = {
+        "kind": "espn-plan-index-v1",
+        "schema_version": 1,
+        "dag_id": admission["dag_id"],
+        "run_id": signed_plan["run_id"],
+        "attempt": runtime["attempt"],
+        "mode": runtime["mode"],
+        "registry_signature": signed_plan["registry_signature"],
+        "bundle_signature": hashlib.sha256(
+            json.dumps(
+                [envelope["signature"]], sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest(),
+        "scope_ids": admission["scope_ids"],
+        "scope_plan_refs": [descriptor_ref],
+        "network_scope_ids": [],
+        "expected_scoreboard_map_count": 0,
+        "admission_ref": admission_ref,
+        "release": admission["release"],
+        "canary_claim": admission["canary_claim"],
+    }
+    _write(
+        Path(
+            (admission["artifact_root"].rstrip("/") + "/plan-index.json").removeprefix(
+                "file://"
+            )
+        ),
+        json.dumps(index, sort_keys=True, separators=(",", ":")).encode(),
+    )
+
+
+def _bind_release_only_plan(options, plan: IngestPlan) -> IngestPlan:
+    target_scope_ids = tuple(sorted(scope.scope_id for scope in plan.scopes))
+    release = {
+        **CampaignIdentity.create(
+            release_commit=TEST_RELEASE_COMMIT,
+            release_tree_sha256=TEST_RELEASE_TREE_SHA256,
+            registry_signature=plan.registry_signature,
+            target_scope_ids=target_scope_ids,
+        ).to_dict(),
+        "parser_version": PARSER_VERSION,
+        "runtime_version": RUNTIME_VERSION,
+    }
+
+    def mutate(document):
+        runtime = document["metadata"]["runtime"]
+        runtime["release"] = release
+        runtime["canary_claim"] = None
+
+    return _rewrite_signed_plan(options, plan, mutate)
+
+
 def _reseal_raw_manifest(path: Path, mutate) -> None:
     manifest = json.loads(path.read_text())
     mutate(manifest)
@@ -568,8 +755,64 @@ def _bind_replay_to_capture(options, plan, capture_options):
         runtime = document["metadata"]["runtime"]
         runtime["raw_manifest_uri"] = capture_options.raw_manifest_uri
         runtime["raw_store_uri"] = capture_options.raw_store_uri
+        admission_ref = runtime["admission_ref"]
+        admission_path = Path(admission_ref["uri"].removeprefix("file://"))
+        admission = json.loads(admission_path.read_text())
+        scope_id = runtime["selected_scopes"][0]
+        source_envelope = json.loads(
+            Path(capture_options.plan_uri.removeprefix("file://")).read_text()
+        )
+        source_plan = source_envelope["plan"]
+        source_runtime = source_plan["metadata"]["runtime"]
+        document["as_of"] = source_plan["as_of"]
+        document["registry_signature"] = source_plan["registry_signature"]
+        runtime["registry_snapshot_uri"] = source_runtime[
+            "registry_snapshot_uri"
+        ]
+        runtime["raw_store_uri"] = source_runtime["raw_store_uri"]
+        source_binding = deepcopy(
+            source_runtime["scope_bindings"][scope_id]
+        )
+        generation_id = hashlib.sha256(
+            (
+                "espn-generation-v1\x00"
+                f"{document['run_id']}\x00{runtime['attempt']}\x00{scope_id}\x00replay"
+            ).encode()
+        ).hexdigest()
+        source_binding.update(
+            {
+                "generation_id": generation_id,
+                "batch_id": hashlib.sha256(
+                    f"espn-batch-v1\x00{generation_id}".encode()
+                ).hexdigest(),
+                "ingested_at": datetime.fromisoformat(
+                    admission["logical_date"]
+                ).isoformat().replace("+00:00", "Z"),
+                "generation_snapshot_uri": runtime["scope_bindings"][scope_id][
+                    "generation_snapshot_uri"
+                ],
+            }
+        )
+        source_binding.pop("pending_empty_observation", None)
+        runtime["scope_bindings"] = {scope_id: source_binding}
+        source_ref = {
+            "uri": capture_options.raw_manifest_uri,
+            "sha256": runtime["replay_source"]["raw_manifest_sha256"],
+        }
+        admission["replay_sources"] = {
+            scope_id: source_ref for scope_id in admission["scope_ids"]
+        }
+        admission_body = json.dumps(
+            admission, sort_keys=True, separators=(",", ":")
+        ).encode()
+        admission_path.write_bytes(admission_body)
+        runtime["admission_ref"] = {
+            "uri": admission_ref["uri"],
+            "sha256": hashlib.sha256(admission_body).hexdigest(),
+        }
 
     rebuilt = _rewrite_signed_plan(options, plan, mutate)
+    _bind_current_plan_artifact_chain(options)
     return (
         replace(
             options,
@@ -620,7 +863,348 @@ def test_cli_exposes_only_native_modes_and_rejects_legacy_flags(mode, tmp_path):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("entrypoint", ["stage", "execute"])
+@pytest.mark.parametrize("plan_generation", ["v1", "v2"])
+def test_current_runner_entrypoints_reject_authentic_pre_v3_plan_before_effects(
+    tmp_path, monkeypatch, entrypoint, plan_generation
+):
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    options, plan = _plan(
+        tmp_path,
+        "daily",
+        ((competition, edition),),
+        current_runtime=False,
+    )
+    if plan_generation == "v2":
+        _bind_release_only_plan(options, plan)
+    loaded = runner._load_signed_plan(options.plan_uri)
+    assert loaded.admission_ref is None
+    assert (loaded.release is not None) is (plan_generation == "v2")
+
+    monkeypatch.setattr(
+        runner,
+        "_load_registry",
+        lambda *_args, **_kwargs: pytest.fail(
+            f"pre-v3 plan reached {entrypoint} registry access"
+        ),
+    )
+
+    with pytest.raises(RunnerConfigurationError, match="pinned e12b85a"):
+        getattr(runner, entrypoint)(options)
+
+    assert not Path(options.raw_manifest_uri.removeprefix("file://")).exists()
+    assert not Path(options.output_uri.removeprefix("file://")).exists()
+    assert not Path(options.raw_store_uri.removeprefix("file://")).exists()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("drift", ["admission_ref", "deployment_release"])
+def test_current_runner_gate_rejects_admission_or_release_drift_before_effects(
+    tmp_path, monkeypatch, drift
+):
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    options, plan = _plan(tmp_path, "daily", ((competition, edition),))
+    if drift == "admission_ref":
+        admission_uri = plan.metadata["runtime"]["admission_ref"]["uri"]
+        admission_path = Path(admission_uri.removeprefix("file://"))
+        admission_path.write_bytes(admission_path.read_bytes() + b" ")
+        expected = "admission_ref hash mismatch"
+    else:
+        monkeypatch.setenv("ESPN_RELEASE_TREE_SHA256", "3" * 64)
+        expected = "differs from deployment"
+    monkeypatch.setattr(
+        runner,
+        "_load_registry",
+        lambda *_args, **_kwargs: pytest.fail(
+            f"{drift} reached runner registry access"
+        ),
+    )
+
+    with pytest.raises(RunnerConfigurationError, match=expected):
+        runner.execute(options)
+
+    assert not Path(options.raw_manifest_uri.removeprefix("file://")).exists()
+    assert not Path(options.output_uri.removeprefix("file://")).exists()
+    assert not Path(options.raw_store_uri.removeprefix("file://")).exists()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "drift",
+    [
+        "raw_store_uri",
+        "output_uri",
+        "registry_snapshot_uri",
+        "as_of",
+        "raw_manifest_uri",
+        "generation_snapshot_uri",
+        "max_events",
+    ],
+)
+def test_current_runner_gate_rejects_resealed_runtime_redirect_before_effects(
+    tmp_path, monkeypatch, drift
+):
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    options, plan = _plan(tmp_path, "daily", ((competition, edition),))
+    redirected = (tmp_path / "redirected" / f"{drift}.json").as_uri()
+    drifted_options = options
+
+    def mutate(document):
+        runtime = document["metadata"]["runtime"]
+        if drift == "as_of":
+            document["as_of"] = "2020-09-21"
+        elif drift == "max_events":
+            runtime[drift] = 99
+        elif drift == "generation_snapshot_uri":
+            scope_id = document["scopes"][0]["scope_id"]
+            runtime["scope_bindings"][scope_id][drift] = redirected
+        else:
+            runtime[drift] = redirected
+
+    _rewrite_signed_plan(options, plan, mutate)
+    if drift == "as_of":
+        drifted_options = replace(options, as_of=date(2020, 9, 21))
+    elif drift == "raw_store_uri":
+        drifted_options = replace(options, raw_store_uri=redirected)
+    elif drift == "output_uri":
+        drifted_options = replace(options, output_uri=redirected)
+    elif drift == "raw_manifest_uri":
+        drifted_options = replace(options, raw_manifest_uri=redirected)
+    elif drift == "max_events":
+        drifted_options = replace(options, max_events=99)
+    monkeypatch.setattr(
+        runner,
+        "_load_registry",
+        lambda *_args, **_kwargs: pytest.fail(
+            f"resealed {drift} redirect reached registry access"
+        ),
+    )
+
+    with pytest.raises(
+        RunnerConfigurationError,
+        match="exact current|plan_ref hash mismatch",
+    ):
+        runner.execute(drifted_options)
+
+    assert not Path(redirected.removeprefix("file://")).exists()
+
+
+@pytest.mark.unit
+def test_current_runner_gate_rejects_copied_plan_path_before_effects(
+    tmp_path, monkeypatch
+):
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    options, _ = _plan(tmp_path, "daily", ((competition, edition),))
+    copied_uri = _write(
+        tmp_path / "copied" / "plan.json",
+        Path(options.plan_uri.removeprefix("file://")).read_bytes(),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_load_registry",
+        lambda *_args, **_kwargs: pytest.fail(
+            "copied current plan reached registry access"
+        ),
+    )
+
+    with pytest.raises(RunnerConfigurationError, match="artifact locations"):
+        runner.execute(replace(options, plan_uri=copied_uri))
+
+    assert not Path(options.raw_manifest_uri.removeprefix("file://")).exists()
+    assert not Path(options.output_uri.removeprefix("file://")).exists()
+    assert not Path(options.raw_store_uri.removeprefix("file://")).exists()
+
+
+@pytest.mark.unit
+def test_current_runner_gate_rejects_resealed_scope_binding_before_effects(
+    tmp_path, monkeypatch
+):
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    options, plan = _plan(tmp_path, "daily", ((competition, edition),))
+
+    def mutate(document):
+        scope_id = document["scopes"][0]["scope_id"]
+        binding = document["metadata"]["runtime"]["scope_bindings"][scope_id]
+        binding["generation_id"] = "resealed-generation"
+        binding["batch_id"] = "resealed-batch"
+        binding["scoreboard_max_range_days"] = 365
+
+    _rewrite_signed_plan(options, plan, mutate)
+    monkeypatch.setattr(
+        runner,
+        "_load_registry",
+        lambda *_args, **_kwargs: pytest.fail(
+            "resealed scope binding reached registry access"
+        ),
+    )
+
+    with pytest.raises(RunnerConfigurationError, match="plan_ref hash mismatch"):
+        runner.execute(options)
+
+    assert not Path(options.raw_manifest_uri.removeprefix("file://")).exists()
+    assert not Path(options.output_uri.removeprefix("file://")).exists()
+    assert not Path(options.raw_store_uri.removeprefix("file://")).exists()
+
+
+@pytest.mark.unit
+def test_runner_current_admission_validates_single_use_canary_consumption(tmp_path):
+    from scrapers.espn import runner
+    from scripts.espn_canary_campaign import (
+        claim_campaign_attempt,
+        consume_campaign_claim,
+        finish_campaign_attempt,
+    )
+
+    target_scope_ids = tuple(f"{1000 + index}:2026" for index in range(181))
+    registry_signature = "a" * 64
+    identity = CampaignIdentity.create(
+        release_commit=TEST_RELEASE_COMMIT,
+        release_tree_sha256=TEST_RELEASE_TREE_SHA256,
+        registry_signature=registry_signature,
+        target_scope_ids=target_scope_ids,
+    )
+    release = {
+        **identity.to_dict(),
+        "parser_version": PARSER_VERSION,
+        "runtime_version": RUNTIME_VERSION,
+    }
+    ledger_path = tmp_path / "canary-ledger.json"
+    claimed = claim_campaign_attempt(
+        ledger_path=ledger_path,
+        release_commit=TEST_RELEASE_COMMIT,
+        release_tree_sha256=TEST_RELEASE_TREE_SHA256,
+        registry_signature=registry_signature,
+        target_scope_ids=target_scope_ids,
+        now=NOW,
+    )
+    artifact_ref = {"uri": (tmp_path / "artifact.json").as_uri(), "sha256": "b" * 64}
+    admission = {
+        "kind": "espn-airflow-admission-v3",
+        "schema_version": 3,
+        "dag_id": "dag_backfill_espn",
+        "run_id": "canary-run",
+        "attempt": 1,
+        "mode": "backfill",
+        "as_of": NOW.date().isoformat(),
+        "logical_date": NOW.isoformat(),
+        "parent": None,
+        "registry_ref": artifact_ref,
+        "registry_signature": registry_signature,
+        "target_scope_ids": list(target_scope_ids),
+        "scope_ids": list(target_scope_ids),
+        "bootstrap_scope_ids": [],
+        "discovery_state_ref": artifact_ref,
+        "candidate_ref": artifact_ref,
+        "selection_policy": "explicit-core-gender-MALE-v1",
+        "male_scope_count": len(target_scope_ids),
+        "release": release,
+        "canary_claim": claimed["claim_ref"],
+        "artifact_root": tmp_path.as_uri(),
+        "raw_store_uri": (tmp_path / "raw").as_uri(),
+        "replay_sources": {},
+    }
+    admission_identity = runner._canary_admission_identity(
+        admission, claimed["claim_ref"]
+    )
+    consumption_ref = consume_campaign_claim(
+        claim_ref=claimed["claim_ref"],
+        dag_id=admission["dag_id"],
+        run_id=admission["run_id"],
+        admission_identity=admission_identity,
+        now=NOW,
+    )
+    admission["canary_claim"] = {
+        "claim_ref": claimed["claim_ref"],
+        "consumption_ref": consumption_ref,
+        "admission_identity": admission_identity,
+    }
+
+    assert runner._current_admission_payload(admission)["release"] == release
+
+    active_ledger_bytes = ledger_path.read_bytes()
+    finish_campaign_attempt(
+        ledger_path=ledger_path,
+        attempt_id=claimed["attempt"]["attempt_id"],
+        terminal_ref={
+            "uri": (tmp_path / "failure.json").as_uri(),
+            "sha256": "f" * 64,
+        },
+        successful=False,
+        now=NOW + timedelta(minutes=1),
+    )
+    ledger_path.write_bytes(active_ledger_bytes)
+    with pytest.raises(RunnerConfigurationError, match="finished and revoked"):
+        runner._current_admission_payload(admission)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("plan_generation", ["v1", "v2"])
+def test_production_cli_rejects_authentic_pre_v3_plan_before_effects(
+    tmp_path, monkeypatch, caplog, plan_generation
+):
+    from dags.scripts import run_espn_scraper
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    options, plan = _plan(
+        tmp_path,
+        "daily",
+        ((competition, edition),),
+        current_runtime=False,
+    )
+    if plan_generation == "v2":
+        _bind_release_only_plan(options, plan)
+    monkeypatch.setattr(
+        runner,
+        "_load_registry",
+        lambda *_args, **_kwargs: pytest.fail("pre-v3 CLI reached registry access"),
+    )
+
+    exit_code = run_espn_scraper.main(
+        [
+            options.mode,
+            "--scope",
+            options.scopes[0],
+            "--as-of",
+            options.as_of.isoformat(),
+            "--run-id",
+            options.run_id,
+            "--attempt",
+            str(options.attempt),
+            "--plan-uri",
+            options.plan_uri,
+            "--raw-manifest-uri",
+            options.raw_manifest_uri,
+            "--output",
+            options.output_uri,
+            "--raw-store-uri",
+            options.raw_store_uri,
+            "--max-events",
+            str(options.max_events),
+        ]
+    )
+
+    assert exit_code == 2
+    assert "pinned e12b85a" in caplog.text
+    assert not Path(options.raw_manifest_uri.removeprefix("file://")).exists()
+    assert not Path(options.output_uri.removeprefix("file://")).exists()
+    assert not Path(options.raw_store_uri.removeprefix("file://")).exists()
+
+
+@pytest.mark.unit
 def test_runner_rejects_run_attempt_scope_and_registry_drift_before_io(tmp_path):
+    from scrapers.espn import runner
+
     competition, edition = _competition()
     options, _ = _plan(tmp_path, "daily", ((competition, edition),))
     raw_store = EspnRawStore.from_uri(options.raw_store_uri)
@@ -642,9 +1226,8 @@ def test_runner_rejects_run_attempt_scope_and_registry_drift_before_io(tmp_path)
     assert client.calls == []
     assert repository.generations == []
 
-    registry_path = (
-        Path(options.plan_uri.removeprefix("file://")).parents[1] / "registry.json"
-    )
+    loaded = runner._load_signed_plan(options.plan_uri)
+    registry_path = Path(loaded.registry_snapshot_uri.removeprefix("file://"))
     registry_path.write_text('{"forged":true}', encoding="utf-8")
     with pytest.raises(RunnerConfigurationError, match="registry"):
         execute(options, repository=repository, raw_store=raw_store, http_client=client)
@@ -1117,7 +1700,7 @@ def test_request_budget_allows_exact_600_and_rejects_604(
 
 
 @pytest.mark.unit
-def test_31_day_request_budget_rejects_multi_scope_overflow_before_side_effects(
+def test_current_runtime_rejects_multiscope_plan_before_side_effects(
     tmp_path,
 ):
     competitions = tuple(
@@ -1149,7 +1732,10 @@ def test_31_day_request_budget_rejects_multi_scope_overflow_before_side_effects(
     client = UnexpectedHttpClient()
     repository = FakeRepository()
 
-    with pytest.raises(RunnerConfigurationError, match="request budget"):
+    with pytest.raises(
+        RunnerConfigurationError,
+        match="exactly one admission-bound scope plan",
+    ):
         execute(options, repository=repository, http_client=client)
 
     assert client.calls == 0
@@ -1296,20 +1882,13 @@ def test_exact_scoreboard_limit_fails_before_summary_or_publication(tmp_path):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("saturated_event_count", [1000, 1001])
-def test_runwide_scoreboard_barrier_blocks_valid_first_scope_before_summary(
+def test_scoreboard_barrier_blocks_summary_before_publication(
     tmp_path,
     saturated_event_count,
 ):
-    first_competition, first_edition = _competition(
-        espn_id=100,
-        slug="first.valid",
-        source_year=2026,
-        start=date(2026, 1, 1),
-        end=date(2026, 1, 31),
-    )
-    second_competition, second_edition = _competition(
+    competition, edition = _competition(
         espn_id=200,
-        slug="second.saturated",
+        slug="saturated",
         source_year=2026,
         start=date(2026, 1, 1),
         end=date(2026, 1, 31),
@@ -1317,25 +1896,16 @@ def test_runwide_scoreboard_barrier_blocks_valid_first_scope_before_summary(
     options, _ = _plan(
         tmp_path,
         "backfill",
-        (
-            (first_competition, first_edition),
-            (second_competition, second_edition),
-        ),
+        ((competition, edition),),
         as_of=date(2026, 1, 31),
     )
     raw_store = EspnRawStore.from_uri(options.raw_store_uri)
     client = FakeHttpClient(
         raw_store,
         {
-            first_competition.slug: _scoreboard(
-                first_competition,
-                first_edition,
-                event_ids=(401_000_001,),
-                event_date="2026-01-15T12:00Z",
-            ),
-            second_competition.slug: _scoreboard(
-                second_competition,
-                second_edition,
+            competition.slug: _scoreboard(
+                competition,
+                edition,
                 event_ids=tuple(
                     range(402_000_001, 402_000_001 + saturated_event_count)
                 ),
@@ -1354,10 +1924,10 @@ def test_runwide_scoreboard_barrier_blocks_valid_first_scope_before_summary(
     )
 
     assert result.exit_code == 1
-    assert sum(call[1] is EndpointType.SCOREBOARD for call in client.calls) == 2
+    assert sum(call[1] is EndpointType.SCOREBOARD for call in client.calls) == 1
     assert all(call[1] is not EndpointType.SUMMARY for call in client.calls)
     assert repository.generations == []
-    assert "saturated" in result.payload["scopes"][1]["error"]
+    assert "saturated" in result.payload["scopes"][0]["error"]
 
 
 @pytest.mark.unit
@@ -1938,7 +2508,7 @@ def test_replay_uses_bound_exact_blobs_after_alias_moves_and_never_http(
         "plan_signature": capture_plan.signature(),
         "raw_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
     }
-    replay_options, _ = _plan(
+    replay_options, replay_plan = _plan(
         tmp_path / "replay",
         "replay",
         ((competition, edition),),
@@ -1946,34 +2516,8 @@ def test_replay_uses_bound_exact_blobs_after_alias_moves_and_never_http(
         replay_source=replay_source,
         scoreboard_max_range_days=scoreboard_max_range_days,
     )
-    replay_options = replace(
-        replay_options,
-        raw_manifest_uri=capture_options.raw_manifest_uri,
-        raw_store_uri=capture_options.raw_store_uri,
-    )
-    # Rewrite the replay plan so its signed URI matches the exact source manifest.
-    envelope_path = Path(replay_options.plan_uri.removeprefix("file://"))
-    envelope = json.loads(envelope_path.read_text())
-    envelope["plan"]["metadata"]["runtime"]["raw_manifest_uri"] = (
-        capture_options.raw_manifest_uri
-    )
-    envelope["plan"]["metadata"]["runtime"]["raw_store_uri"] = (
-        capture_options.raw_store_uri
-    )
-    unsigned = envelope["plan"]
-    # Rebuild through the public model to obtain its canonical signature.
-    replay_plan = IngestPlan(
-        schema_version=unsigned["schema_version"],
-        run_id=unsigned["run_id"],
-        as_of=date.fromisoformat(unsigned["as_of"]),
-        registry_signature=unsigned["registry_signature"],
-        scopes=tuple(_scope(competition, edition) for _ in unsigned["scopes"]),
-        metadata=unsigned["metadata"],
-    )
-    envelope["signature"] = replay_plan.signature()
-    envelope_path.write_text(
-        json.dumps(envelope, sort_keys=True, separators=(",", ":")),
-        encoding="utf-8",
+    replay_options, _ = _bind_replay_to_capture(
+        replay_options, replay_plan, capture_options
     )
 
     # Point mutable target aliases at bad JSON. Exact blob replay must ignore them.
@@ -2151,25 +2695,18 @@ def test_clean_noop_requires_bound_prior_complete_identity(tmp_path, monkeypatch
 
 
 @pytest.mark.unit
-def test_proven_empty_scope_blocks_run_before_any_scope_publishes(tmp_path):
-    first, first_edition = _competition(730, "ita.1")
-    second, second_edition = _competition(731, "eng.1")
+def test_proven_empty_scope_blocks_publication(tmp_path):
+    competition, edition = _competition(731, "eng.1")
     options, _ = _plan(
         tmp_path,
         "repair",
-        ((first, first_edition), (second, second_edition)),
+        ((competition, edition),),
     )
     raw_store = EspnRawStore.from_uri(options.raw_store_uri)
     client = FakeHttpClient(
         raw_store,
         {
-            first.slug: _scoreboard(
-                first,
-                first_edition,
-                event_ids=(401000001,),
-                status="STATUS_SCHEDULED",
-            ),
-            second.slug: _scoreboard(second, second_edition, event_ids=()),
+            competition.slug: _scoreboard(competition, edition, event_ids=()),
         },
     )
     repository = FakeRepository()
@@ -2302,7 +2839,10 @@ def test_prior_snapshot_hash_and_generation_drift_are_rejected(tmp_path, drift):
             binding["prior"]["artifact_sha256"] = hashlib.sha256(rewritten).hexdigest()
 
         _rewrite_signed_plan(options, plan, update_binding)
-    with pytest.raises(RunnerConfigurationError, match="prior .*drift"):
+    with pytest.raises(
+        RunnerConfigurationError,
+        match="prior .*drift|plan_ref hash mismatch",
+    ):
         execute(
             options,
             repository=FakeRepository(),
@@ -2311,39 +2851,31 @@ def test_prior_snapshot_hash_and_generation_drift_are_rejected(tmp_path, drift):
 
 
 @pytest.mark.unit
-def test_final_proven_summary_schema_failure_is_incomplete_while_good_scope_publishes(
-    tmp_path,
-):
-    first, first_edition = _competition(730, "ita.1")
-    second, second_edition = _competition(731, "eng.1")
+def test_final_proven_summary_schema_failure_blocks_publication(tmp_path):
+    competition, edition = _competition(731, "eng.1")
     options, _ = _plan(
         tmp_path,
         "repair",
-        ((first, first_edition), (second, second_edition)),
+        ((competition, edition),),
     )
     raw_store = EspnRawStore.from_uri(options.raw_store_uri)
-
-    def summaries(event_id: int) -> bytes:
-        return _summary(event_id) if event_id == 401000001 else b"{}"
 
     client = FakeHttpClient(
         raw_store,
         {
-            first.slug: _scoreboard(first, first_edition, event_ids=(401000001,)),
-            second.slug: _scoreboard(second, second_edition, event_ids=(401000002,)),
+            competition.slug: _scoreboard(
+                competition, edition, event_ids=(401000002,)
+            ),
         },
-        summary_factory=summaries,
+        summary_factory=lambda _event_id: b"{}",
     )
     repository = FakeRepository()
     result = execute(
         options, repository=repository, raw_store=raw_store, http_client=client
     )
     assert result.exit_code == 1
-    assert [item.plan.scope_id for item in repository.generations] == [
-        first.scope_id(first_edition)
-    ]
-    by_scope = {item["scope_id"]: item for item in result.payload["scopes"]}
-    assert by_scope[second.scope_id(second_edition)]["state"] == "incomplete"
+    assert repository.generations == []
+    assert result.payload["scopes"][0]["state"] == "incomplete"
 
 
 @pytest.mark.unit
@@ -2491,7 +3023,9 @@ def test_budget_duplicate_scope_and_signed_budget_drift_are_strict(tmp_path):
 
 
 @pytest.mark.unit
-def test_artifact_uri_collisions_fail_preflight_before_publication(tmp_path):
+def test_artifact_uri_collision_is_rejected_by_current_admission_before_publication(
+    tmp_path,
+):
     competition, edition = _competition()
     options, plan = _plan(tmp_path, "backfill", ((competition, edition),))
 
@@ -2502,7 +3036,10 @@ def test_artifact_uri_collisions_fail_preflight_before_publication(tmp_path):
     _rewrite_signed_plan(options, plan, collide)
     options = replace(options, output_uri=options.raw_manifest_uri)
     repository = FakeRepository()
-    with pytest.raises(RunnerConfigurationError, match="artifact URI collision"):
+    with pytest.raises(
+        RunnerConfigurationError,
+        match="exact current admission|plan_ref hash mismatch",
+    ):
         execute(options, repository=repository)
     assert repository.generations == []
 
@@ -2572,12 +3109,12 @@ def test_s3_artifact_resolver_does_not_reuse_across_processes(monkeypatch):
 
 
 @pytest.mark.unit
-def test_signed_scope_selection_rejects_cli_subset_and_permuted_plan(tmp_path):
+def test_current_runtime_rejects_multiscope_plan_and_permuted_selection(tmp_path):
     first, first_edition = _competition(730, "ita.1")
     second, second_edition = _competition(731, "eng.1")
     competitions = ((first, first_edition), (second, second_edition))
     options, _ = _plan(tmp_path / "subset", "repair", competitions)
-    with pytest.raises(RunnerConfigurationError, match="signed scope selection"):
+    with pytest.raises(RunnerConfigurationError, match="exactly one"):
         execute(
             replace(options, scopes=(first.scope_id(first_edition),)),
             repository=FakeRepository(),
@@ -2617,20 +3154,20 @@ def test_cli_omitted_uses_signed_selection_and_distinct_batch_plans_are_usable(
 ):
     first, first_edition = _competition(730, "ita.1")
     second, second_edition = _competition(731, "eng.1")
-    competitions = ((first, first_edition), (second, second_edition))
     scoreboard = {
         first.slug: _scoreboard(first, first_edition, status="STATUS_SCHEDULED"),
         second.slug: _scoreboard(second, second_edition, status="STATUS_SCHEDULED"),
     }
     published = []
-    for label, selected in (
-        ("a", first.scope_id(first_edition)),
-        ("b", second.scope_id(second_edition)),
+    for label, competition, edition in (
+        ("a", first, first_edition),
+        ("b", second, second_edition),
     ):
+        selected = competition.scope_id(edition)
         options, _ = _plan(
             tmp_path / label,
             "repair",
-            competitions,
+            ((competition, edition),),
             run_id=f"run-{label}",
             selected_scopes=(selected,),
         )
@@ -2650,24 +3187,30 @@ def test_cli_omitted_uses_signed_selection_and_distinct_batch_plans_are_usable(
 
 
 @pytest.mark.unit
-def test_replay_selected_scope_accepts_verified_source_manifest_superset(tmp_path):
-    first, first_edition = _competition(730, "ita.1")
-    second, second_edition = _competition(731, "eng.1")
-    competitions = ((first, first_edition), (second, second_edition))
+def test_replay_rejects_resealed_scope_binding_before_effects(tmp_path, monkeypatch):
+    from scrapers.espn import runner
+
+    competition, edition = _competition(730, "ita.1")
     capture_options, capture_plan = _plan(
-        tmp_path / "capture", "repair", competitions, run_id="capture-run"
+        tmp_path / "capture",
+        "repair",
+        ((competition, edition),),
+        run_id="capture-run",
     )
     raw_store = EspnRawStore.from_uri(capture_options.raw_store_uri)
-    source_payloads = {
-        first.slug: _scoreboard(first, first_edition, status="STATUS_SCHEDULED"),
-        second.slug: _scoreboard(second, second_edition, status="STATUS_SCHEDULED"),
-    }
     assert (
         execute(
             capture_options,
             repository=FakeRepository(),
             raw_store=raw_store,
-            http_client=FakeHttpClient(raw_store, source_payloads),
+            http_client=FakeHttpClient(
+                raw_store,
+                {
+                    competition.slug: _scoreboard(
+                        competition, edition, status="STATUS_SCHEDULED"
+                    )
+                },
+            ),
         ).exit_code
         == 0
     )
@@ -2684,20 +3227,30 @@ def test_replay_selected_scope_accepts_verified_source_manifest_superset(tmp_pat
     replay_options, replay_plan = _plan(
         tmp_path / "replay",
         "replay",
-        competitions,
+        ((competition, edition),),
         run_id="replay-run",
         replay_source=replay_source,
-        selected_scopes=(first.scope_id(first_edition),),
     )
-    replay_options, _ = _bind_replay_to_capture(
+    replay_options, replay_plan = _bind_replay_to_capture(
         replay_options, replay_plan, capture_options
     )
-    repository = FakeRepository()
-    result = execute(replay_options, repository=repository, raw_store=raw_store)
-    assert result.exit_code == 0
-    assert [item.plan.scope_id for item in repository.generations] == [
-        first.scope_id(first_edition)
-    ]
+
+    def mutate(document):
+        scope_id = document["scopes"][0]["scope_id"]
+        document["metadata"]["runtime"]["scope_bindings"][scope_id][
+            "generation_id"
+        ] = "resealed-generation"
+
+    _rewrite_signed_plan(replay_options, replay_plan, mutate)
+    monkeypatch.setattr(
+        runner,
+        "_load_registry",
+        lambda *_args, **_kwargs: pytest.fail(
+            "resealed replay binding reached registry access"
+        ),
+    )
+    with pytest.raises(RunnerConfigurationError, match="plan_ref hash mismatch"):
+        execute(replay_options, repository=FakeRepository(), raw_store=raw_store)
 
 
 @pytest.mark.unit
@@ -2742,17 +3295,21 @@ def test_final_to_postponed_refresh_removes_stale_prior_summary_entities(tmp_pat
 
 
 @pytest.mark.unit
-def test_snapshot_conflict_is_scope_incomplete_and_other_scope_still_publishes(
-    tmp_path,
-):
-    first, first_edition = _competition(730, "ita.1")
-    second, second_edition = _competition(731, "eng.1")
+def test_snapshot_conflict_is_scope_incomplete_and_blocks_publication(tmp_path):
+    competition, edition = _competition(730, "ita.1")
     options, _ = _plan(
         tmp_path,
         "repair",
-        ((first, first_edition), (second, second_edition)),
+        ((competition, edition),),
     )
-    conflicting = tmp_path / "runs" / "run-1" / "attempt-1" / "scope-730:2020.json"
+    from scrapers.espn import runner
+
+    loaded = runner._load_signed_plan(options.plan_uri)
+    conflicting = Path(
+        loaded.bindings[competition.scope_id(edition)].generation_snapshot_uri.removeprefix(
+            "file://"
+        )
+    )
     conflicting.parent.mkdir(parents=True, exist_ok=True)
     conflicting.write_text('{"forged":true}', encoding="utf-8")
     raw_store = EspnRawStore.from_uri(options.raw_store_uri)
@@ -2764,23 +3321,15 @@ def test_snapshot_conflict_is_scope_incomplete_and_other_scope_still_publishes(
         http_client=FakeHttpClient(
             raw_store,
             {
-                first.slug: _scoreboard(
-                    first, first_edition, status="STATUS_SCHEDULED"
-                ),
-                second.slug: _scoreboard(
-                    second, second_edition, status="STATUS_SCHEDULED"
+                competition.slug: _scoreboard(
+                    competition, edition, status="STATUS_SCHEDULED"
                 ),
             },
         ),
     )
     assert result.exit_code == 1
-    assert [item.plan.scope_id for item in repository.generations] == [
-        second.scope_id(second_edition)
-    ]
-    assert [item["state"] for item in result.payload["scopes"]] == [
-        "incomplete",
-        "complete",
-    ]
+    assert repository.generations == []
+    assert [item["state"] for item in result.payload["scopes"]] == ["incomplete"]
     assert Path(options.output_uri.removeprefix("file://")).is_file()
 
 
@@ -2793,9 +3342,8 @@ def test_snapshot_io_failure_happens_before_publish_and_retry_is_safe(
     competition, edition = _competition()
     options, _ = _plan(tmp_path, "backfill", ((competition, edition),))
     raw_store = EspnRawStore.from_uri(options.raw_store_uri)
-    snapshot_uri = (
-        tmp_path / "runs" / "run-1" / "attempt-1" / "scope-730:2020.json"
-    ).as_uri()
+    loaded = runner_module._load_signed_plan(options.plan_uri)
+    snapshot_uri = loaded.bindings[options.scopes[0]].generation_snapshot_uri
     real_write = runner_module._write_artifact
     failed = False
 
@@ -2915,7 +3463,10 @@ def test_replay_manifest_hash_run_and_attempt_are_exactly_bound(tmp_path):
         source["raw_manifest_sha256"] = hashlib.sha256(drifted_bytes).hexdigest()
 
     _rewrite_signed_plan(replay_options, replay_plan, bind_new_hash)
-    with pytest.raises(RunnerConfigurationError, match="identity mismatch"):
+    with pytest.raises(
+        RunnerConfigurationError,
+        match="exact current admission|plan_ref hash mismatch",
+    ):
         execute(replay_options, repository=FakeRepository(), raw_store=raw_store)
 
 

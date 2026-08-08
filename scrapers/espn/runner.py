@@ -23,6 +23,7 @@ import uuid
 from pyarrow import fs
 import yaml
 
+from .canary_campaign import CampaignError, CampaignIdentity, CampaignLedger
 from .models import (
     CapabilityState,
     Competition,
@@ -73,6 +74,12 @@ RUNTIME_VERSION = "espn-native-runtime-v4"
 LEGACY_PARSER_VERSION = "espn-native-parser-v2"
 LEGACY_RUNTIME_VERSION = "espn-native-runtime-v3"
 LEGACY_REPLAY_GIT_SHA = "e12b85a"
+CURRENT_ADMISSION_KIND = "espn-airflow-admission-v3"
+RELEASE_COMMIT_ENV = "ESPN_RELEASE_COMMIT"
+RELEASE_TREE_SHA256_ENV = "ESPN_RELEASE_TREE_SHA256"
+DISCOVERY_SELECTION_POLICY = "explicit-core-gender-MALE-v1"
+MAX_CURRENT_ADMISSION_SCOPES = 300
+EXACT_CANARY_SCOPE_COUNT = 181
 PLAN_KIND = "espn-ingest-plan-v1"
 LEGACY_RAW_MANIFEST_KIND = "espn-raw-run-manifest-v1"
 RAW_MANIFEST_KIND = "espn-raw-run-manifest-v2"
@@ -227,6 +234,7 @@ class ReplaySource:
 
 @dataclass(frozen=True, slots=True)
 class LoadedPlan:
+    plan_uri: str
     plan: IngestPlan
     signature: str
     registry_snapshot_uri: str
@@ -658,6 +666,7 @@ def _load_signed_plan(uri: str) -> LoadedPlan:
             ),
         }
     return LoadedPlan(
+        plan_uri=uri,
         plan=plan,
         signature=signature,
         registry_snapshot_uri=_required_string(
@@ -688,6 +697,775 @@ def _load_signed_plan(uri: str) -> LoadedPlan:
             else None
         ),
     )
+
+
+def _exact_artifact_ref(value: Any, field_name: str) -> dict[str, str]:
+    raw = _mapping(value, field_name)
+    _exact_keys(raw, {"uri", "sha256"}, field_name)
+    return {
+        "uri": _required_string(raw["uri"], f"{field_name}.uri"),
+        "sha256": _sha256(raw["sha256"], f"{field_name}.sha256"),
+    }
+
+
+def _read_exact_json_ref(
+    value: Any, field_name: str, *, kind: str | None = None
+) -> dict[str, Any]:
+    ref = _exact_artifact_ref(value, field_name)
+    try:
+        body = _read_artifact(ref["uri"])
+    except OSError as exc:
+        raise RunnerConfigurationError(f"{field_name} is unreadable") from exc
+    if hashlib.sha256(body).hexdigest() != ref["sha256"]:
+        raise RunnerConfigurationError(f"{field_name} hash mismatch")
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RunnerConfigurationError(f"{field_name} is not valid JSON") from exc
+    if not isinstance(payload, dict) or not all(
+        isinstance(key, str) for key in payload
+    ):
+        raise RunnerConfigurationError(f"{field_name} payload must be an object")
+    if kind is not None and payload.get("kind") != kind:
+        raise RunnerConfigurationError(f"{field_name} kind must be {kind}")
+    return payload
+
+
+def _deployment_release() -> tuple[str, str]:
+    commit = _required_string(os.environ.get(RELEASE_COMMIT_ENV), RELEASE_COMMIT_ENV)
+    if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise RunnerConfigurationError(
+            f"{RELEASE_COMMIT_ENV} must be a lowercase 40-hex commit"
+        )
+    tree = _sha256(
+        os.environ.get(RELEASE_TREE_SHA256_ENV), RELEASE_TREE_SHA256_ENV
+    )
+    return commit, tree
+
+
+def _current_release_identity(
+    value: Any,
+    *,
+    registry_signature: str,
+    target_scope_ids: Sequence[str],
+) -> dict[str, Any]:
+    raw = _mapping(value, "signed release identity")
+    fields = {
+        "release_commit",
+        "release_tree_sha256",
+        "registry_signature",
+        "target_scope_sha256",
+        "target_scope_ids",
+        "campaign_id",
+        "parser_version",
+        "runtime_version",
+    }
+    _exact_keys(raw, fields, "signed release identity")
+    try:
+        canonical = CampaignIdentity.from_dict(
+            {
+                key: raw[key]
+                for key in fields - {"parser_version", "runtime_version"}
+            }
+        )
+    except CampaignError as exc:
+        raise RunnerConfigurationError(
+            f"signed release identity is invalid: {exc}"
+        ) from exc
+    if (
+        canonical.registry_signature != registry_signature
+        or canonical.target_scope_ids != tuple(target_scope_ids)
+        or raw["parser_version"] != PARSER_VERSION
+        or raw["runtime_version"] != RUNTIME_VERSION
+    ):
+        raise RunnerConfigurationError("signed release identity drift")
+    if (
+        canonical.release_commit,
+        canonical.release_tree_sha256,
+    ) != _deployment_release():
+        raise RunnerConfigurationError(
+            "signed release identity differs from deployment"
+        )
+    return dict(raw)
+
+
+def _current_admission_scopes(
+    admission: Mapping[str, Any], field_name: str, *, allow_empty: bool
+) -> tuple[str, ...]:
+    raw = admission[field_name]
+    if not isinstance(raw, list) or not all(
+        isinstance(scope_id, str) and scope_id for scope_id in raw
+    ):
+        raise RunnerConfigurationError(
+            f"current admission {field_name} must be a string list"
+        )
+    scopes = tuple(raw)
+    if (
+        (not allow_empty and not scopes)
+        or tuple(sorted(set(scopes))) != scopes
+        or len(scopes) > MAX_CURRENT_ADMISSION_SCOPES
+    ):
+        raise RunnerConfigurationError(
+            f"current admission {field_name} must be bounded, sorted, and unique"
+        )
+    return scopes
+
+
+def _canary_admission_identity(
+    admission: Mapping[str, Any], claim_ref: Mapping[str, str]
+) -> str:
+    identity_payload = {**dict(admission), "canary_claim": dict(claim_ref)}
+    return hashlib.sha256(_canonical_bytes(identity_payload)).hexdigest()
+
+
+def _current_canary_claim(
+    value: Any,
+    *,
+    release: Mapping[str, Any],
+    target_scope_ids: Sequence[str],
+    dag_id: str,
+    run_id: str,
+    admission_identity: str,
+) -> None:
+    raw = _mapping(value, "canary claim binding")
+    _exact_keys(
+        raw,
+        {"claim_ref", "consumption_ref", "admission_identity"},
+        "canary claim binding",
+    )
+    bound_identity = _sha256(
+        raw["admission_identity"], "canary claim binding.admission_identity"
+    )
+    if bound_identity != admission_identity:
+        raise RunnerConfigurationError("canary claim admission identity drift")
+    claim_ref = _exact_artifact_ref(
+        raw["claim_ref"], "canary claim binding.claim_ref"
+    )
+    consumption_ref = _exact_artifact_ref(
+        raw["consumption_ref"], "canary claim binding.consumption_ref"
+    )
+    claim = _read_exact_json_ref(
+        claim_ref,
+        "canary claim binding.claim_ref",
+        kind="espn-canary-claim-evidence-v1",
+    )
+    _exact_keys(
+        claim,
+        {"kind", "schema_version", "ledger_ref", "ledger", "campaign", "attempt"},
+        "canary claim evidence",
+    )
+    if claim["schema_version"] != 1:
+        raise RunnerConfigurationError("canary claim evidence schema mismatch")
+    try:
+        ledger = CampaignLedger.from_dict(claim["ledger"])
+        campaign = CampaignIdentity.from_dict(claim["campaign"])
+    except CampaignError as exc:
+        raise RunnerConfigurationError(
+            f"canary claim evidence is invalid: {exc}"
+        ) from exc
+    attempts = ledger.attempts
+    if not attempts or attempts[-1].to_dict() != claim["attempt"]:
+        raise RunnerConfigurationError(
+            "canary claim is not the latest ledger attempt"
+        )
+    attempt = attempts[-1]
+    release_campaign = {
+        key: release[key]
+        for key in (
+            "release_commit",
+            "release_tree_sha256",
+            "registry_signature",
+            "target_scope_sha256",
+            "target_scope_ids",
+            "campaign_id",
+        )
+    }
+    if (
+        attempt.status != "active"
+        or attempt.ordinal not in {1, 2, 3}
+        or attempt.campaign != campaign
+        or campaign.to_dict() != release_campaign
+        or campaign.target_scope_ids != tuple(target_scope_ids)
+    ):
+        raise RunnerConfigurationError("canary claim differs from signed release")
+    current_ledger = _read_exact_json_ref(
+        claim["ledger_ref"], "canary claim evidence.ledger_ref"
+    )
+    if current_ledger != claim["ledger"]:
+        raise RunnerConfigurationError("canary claim ledger changed after claim")
+    try:
+        from scripts.espn_canary_campaign import validate_campaign_consumption
+
+        validate_campaign_consumption(
+            claim_ref=claim_ref,
+            consumption_ref=consumption_ref,
+            dag_id=dag_id,
+            run_id=run_id,
+            admission_identity=admission_identity,
+        )
+    except (CampaignError, ImportError) as exc:
+        raise RunnerConfigurationError(
+            f"canary claim consumption is invalid: {exc}"
+        ) from exc
+
+
+def _current_admission_payload(value: Any) -> dict[str, Any]:
+    admission = _mapping(value, "current admission")
+    kind = admission.get("kind")
+    if kind != CURRENT_ADMISSION_KIND or admission.get("schema_version") != 3:
+        raise RunnerConfigurationError(
+            "current runtime rejects pre-v3 admission; exact historical replay "
+            f"requires pinned {LEGACY_REPLAY_GIT_SHA}"
+        )
+    fields = {
+        "kind",
+        "schema_version",
+        "dag_id",
+        "run_id",
+        "attempt",
+        "mode",
+        "as_of",
+        "logical_date",
+        "parent",
+        "registry_ref",
+        "registry_signature",
+        "target_scope_ids",
+        "scope_ids",
+        "bootstrap_scope_ids",
+        "discovery_state_ref",
+        "candidate_ref",
+        "selection_policy",
+        "male_scope_count",
+        "release",
+        "canary_claim",
+        "artifact_root",
+        "raw_store_uri",
+        "replay_sources",
+    }
+    _exact_keys(admission, fields, "current admission")
+    for field_name in ("dag_id", "run_id", "artifact_root", "raw_store_uri"):
+        _required_string(admission[field_name], f"current admission.{field_name}")
+    _positive_int(admission["attempt"], "current admission.attempt")
+    if admission["mode"] not in _MODES:
+        raise RunnerConfigurationError("current admission mode is invalid")
+    _parse_date(admission["as_of"], "current admission.as_of")
+    _parse_datetime(admission["logical_date"], "current admission.logical_date")
+    if admission["parent"] is not None and not isinstance(
+        admission["parent"], Mapping
+    ):
+        raise RunnerConfigurationError(
+            "current admission.parent must be an object or null"
+        )
+    _exact_artifact_ref(admission["registry_ref"], "current admission.registry_ref")
+    _sha256(
+        admission["registry_signature"], "current admission.registry_signature"
+    )
+    if not isinstance(admission["replay_sources"], Mapping):
+        raise RunnerConfigurationError(
+            "current admission.replay_sources must be an object"
+        )
+    selected = _current_admission_scopes(admission, "scope_ids", allow_empty=False)
+    target = _current_admission_scopes(
+        admission, "target_scope_ids", allow_empty=False
+    )
+    bootstrap = _current_admission_scopes(
+        admission, "bootstrap_scope_ids", allow_empty=True
+    )
+    _exact_artifact_ref(
+        admission["discovery_state_ref"], "current admission.discovery_state_ref"
+    )
+    _exact_artifact_ref(
+        admission["candidate_ref"], "current admission.candidate_ref"
+    )
+    if admission["selection_policy"] != DISCOVERY_SELECTION_POLICY:
+        raise RunnerConfigurationError("current admission selection policy mismatch")
+    if (
+        type(admission["male_scope_count"]) is not int
+        or admission["male_scope_count"] != len(target)
+        or len(bootstrap) > 10
+        or not set(bootstrap).issubset(selected)
+        or not set(bootstrap).issubset(target)
+    ):
+        raise RunnerConfigurationError("current admission scope coverage is invalid")
+    if admission["mode"] == "daily" and not set(selected).issubset(target):
+        raise RunnerConfigurationError(
+            "current daily admission selects a non-target scope"
+        )
+    if admission["mode"] != "daily" and bootstrap:
+        raise RunnerConfigurationError(
+            "current manual admission cannot contain bootstrap scopes"
+        )
+    release = _current_release_identity(
+        admission["release"],
+        registry_signature=admission["registry_signature"],
+        target_scope_ids=target,
+    )
+    exact_canary = (
+        admission["mode"] == "backfill" and len(selected) == EXACT_CANARY_SCOPE_COUNT
+    )
+    if exact_canary and (
+        len(target) != EXACT_CANARY_SCOPE_COUNT or selected != target
+    ):
+        raise RunnerConfigurationError(
+            "181-scope backfill must equal the exact frozen canary target"
+        )
+    if exact_canary:
+        claim = _mapping(admission["canary_claim"], "canary claim binding")
+        admission_identity = _canary_admission_identity(
+            admission,
+            _exact_artifact_ref(
+                claim.get("claim_ref"), "canary claim binding.claim_ref"
+            ),
+        )
+        _current_canary_claim(
+            claim,
+            release=release,
+            target_scope_ids=target,
+            dag_id=admission["dag_id"],
+            run_id=admission["run_id"],
+            admission_identity=admission_identity,
+        )
+    elif admission["canary_claim"] is not None:
+        raise RunnerConfigurationError(
+            "current non-canary admission forbids a campaign claim"
+        )
+    return dict(admission)
+
+
+def _current_artifact_uri(root: str, *parts: str) -> str:
+    clean = tuple(part.strip("/") for part in parts)
+    if any(not part or "/" in part or part in {".", ".."} for part in clean):
+        raise RunnerConfigurationError("current artifact path segment is unsafe")
+    return root.rstrip("/") + "/" + "/".join(clean)
+
+
+def _require_artifact_under_root(uri: str, root: str, field_name: str) -> None:
+    canonical_uri = _canonical_artifact_identity(uri)
+    canonical_root = _canonical_artifact_identity(root).rstrip("/")
+    if not canonical_uri.startswith(canonical_root + "/"):
+        raise RunnerConfigurationError(
+            f"{field_name} differs from exact current admission artifact root"
+        )
+
+
+def _read_current_json_artifact(
+    uri: str, field_name: str, *, kind: str
+) -> dict[str, Any]:
+    try:
+        body = _read_artifact(uri)
+    except OSError as exc:
+        raise RunnerConfigurationError(f"{field_name} is unreadable") from exc
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RunnerConfigurationError(f"{field_name} is not valid JSON") from exc
+    if not isinstance(payload, dict) or payload.get("kind") != kind:
+        raise RunnerConfigurationError(f"{field_name} kind must be {kind}")
+    return payload
+
+
+def _require_current_plan_artifact_chain(
+    loaded: LoadedPlan,
+    admission: Mapping[str, Any],
+    *,
+    scope_id: str,
+    scope_root: str,
+) -> None:
+    """Authenticate one immutable plan through its run index and descriptor."""
+
+    artifact_root = admission["artifact_root"]
+    index = _read_current_json_artifact(
+        _current_artifact_uri(artifact_root, "plan-index.json"),
+        "current plan index",
+        kind="espn-plan-index-v1",
+    )
+    index_fields = {
+        "kind",
+        "schema_version",
+        "dag_id",
+        "run_id",
+        "attempt",
+        "mode",
+        "registry_signature",
+        "bundle_signature",
+        "scope_ids",
+        "scope_plan_refs",
+        "network_scope_ids",
+        "expected_scoreboard_map_count",
+        "admission_ref",
+        "release",
+        "canary_claim",
+    }
+    _exact_keys(index, index_fields, "current plan index")
+    index_scopes = _current_admission_scopes(
+        index, "scope_ids", allow_empty=False
+    )
+    network_scopes = _current_admission_scopes(
+        index, "network_scope_ids", allow_empty=True
+    )
+    refs = index["scope_plan_refs"]
+    if not isinstance(refs, list) or len(refs) != len(index_scopes):
+        raise RunnerConfigurationError(
+            "current plan index scope references are invalid"
+        )
+    descriptor_refs = tuple(
+        _exact_artifact_ref(ref, f"current plan index.scope_plan_refs[{position}]")
+        for position, ref in enumerate(refs)
+    )
+    expected_descriptor_uri = _current_artifact_uri(
+        scope_root, "scope-plan-descriptor.json"
+    )
+    matching_refs = tuple(
+        ref for ref in descriptor_refs if ref["uri"] == expected_descriptor_uri
+    )
+    if (
+        index.get("schema_version") != 1
+        or index_scopes != tuple(admission["scope_ids"])
+        or scope_id not in index_scopes
+        or len({ref["uri"] for ref in descriptor_refs}) != len(descriptor_refs)
+        or len(matching_refs) != 1
+        or not set(network_scopes).issubset(index_scopes)
+        or type(index["expected_scoreboard_map_count"]) is not int
+        or index["expected_scoreboard_map_count"] != len(network_scopes)
+        or (
+            index["dag_id"],
+            index["run_id"],
+            index["attempt"],
+            index["mode"],
+            index["registry_signature"],
+        )
+        != (
+            admission["dag_id"],
+            loaded.plan.run_id,
+            loaded.attempt,
+            loaded.mode,
+            loaded.plan.registry_signature,
+        )
+        or _sha256(index["bundle_signature"], "current plan index.bundle_signature")
+        != index["bundle_signature"]
+        or _exact_artifact_ref(
+            index["admission_ref"], "current plan index.admission_ref"
+        )
+        != loaded.admission_ref
+        or _canonical_bytes(index["release"])
+        != _canonical_bytes(admission["release"])
+        or _canonical_bytes(index["canary_claim"])
+        != _canonical_bytes(admission["canary_claim"])
+    ):
+        raise RunnerConfigurationError(
+            "current plan index differs from immutable plan identity"
+        )
+
+    descriptor = _read_exact_json_ref(
+        matching_refs[0],
+        "current plan index scope descriptor",
+        kind="espn-scope-plan-descriptor-v1",
+    )
+    descriptor_fields = {
+        "kind",
+        "schema_version",
+        "dag_id",
+        "run_id",
+        "attempt",
+        "mode",
+        "scope_id",
+        "plan_ref",
+        "plan_signature",
+        "raw_manifest_uri",
+        "raw_store_uri",
+        "generation_snapshot_uri",
+        "expected_scoreboard_batch",
+        "scoreboard_checkpoint_uri",
+        "scope_root",
+    }
+    _exact_keys(descriptor, descriptor_fields, "current plan scope descriptor")
+    plan_ref = _exact_artifact_ref(
+        descriptor["plan_ref"], "current plan scope descriptor.plan_ref"
+    )
+    plan_envelope = _read_exact_json_ref(
+        plan_ref,
+        "current plan scope descriptor.plan_ref",
+        kind=PLAN_KIND,
+    )
+    _exact_keys(plan_envelope, {"kind", "plan", "signature"}, "plan envelope")
+    scoreboard_batch = descriptor["expected_scoreboard_batch"]
+    scoreboard_checkpoint_uri = descriptor["scoreboard_checkpoint_uri"]
+    if (
+        descriptor.get("schema_version") != 1
+        or plan_ref["uri"] != loaded.plan_uri
+        or plan_envelope
+        != {
+            "kind": PLAN_KIND,
+            "plan": loaded.plan.to_dict(),
+            "signature": loaded.signature,
+        }
+        or (
+            descriptor["dag_id"],
+            descriptor["run_id"],
+            descriptor["attempt"],
+            descriptor["mode"],
+            descriptor["scope_id"],
+            descriptor["plan_signature"],
+            descriptor["raw_manifest_uri"],
+            descriptor["raw_store_uri"],
+            descriptor["generation_snapshot_uri"],
+            descriptor["scope_root"],
+        )
+        != (
+            admission["dag_id"],
+            loaded.plan.run_id,
+            loaded.attempt,
+            loaded.mode,
+            scope_id,
+            loaded.signature,
+            loaded.raw_manifest_uri,
+            loaded.raw_store_uri,
+            loaded.bindings[scope_id].generation_snapshot_uri,
+            scope_root,
+        )
+        or (scoreboard_batch is None) != (scoreboard_checkpoint_uri is None)
+        or (
+            scoreboard_batch is not None
+            and (
+                not isinstance(scoreboard_batch, Mapping)
+                or not isinstance(scoreboard_checkpoint_uri, str)
+                or not scoreboard_checkpoint_uri
+            )
+        )
+    ):
+        raise RunnerConfigurationError(
+            "current scope descriptor differs from immutable plan identity"
+        )
+
+
+def _require_current_plan_runtime_binding(
+    loaded: LoadedPlan, admission: Mapping[str, Any]
+) -> None:
+    """Bind every side-effecting runtime location to its v3 admission."""
+
+    registry_ref = _exact_artifact_ref(
+        admission["registry_ref"], "current admission.registry_ref"
+    )
+    _read_exact_json_ref(registry_ref, "current admission.registry_ref")
+    artifact_root = _required_string(
+        admission["artifact_root"], "current admission.artifact_root"
+    )
+    _require_artifact_under_root(
+        loaded.output_uri, artifact_root, "signed plan output_uri"
+    )
+    for scope_id, binding in loaded.bindings.items():
+        _require_artifact_under_root(
+            binding.generation_snapshot_uri,
+            artifact_root,
+            f"signed plan scope {scope_id} generation_snapshot_uri",
+        )
+
+    if (
+        len(loaded.plan.scopes) != 1
+        or len(loaded.selected_scopes) != 1
+        or len(loaded.bindings) != 1
+    ):
+        raise RunnerConfigurationError(
+            "current runtime requires exactly one admission-bound scope plan"
+        )
+    scope_id = loaded.plan.scopes[0].scope_id
+    if loaded.selected_scopes != (scope_id,) or tuple(loaded.bindings) != (scope_id,):
+        raise RunnerConfigurationError(
+            "current runtime scope plan identity is invalid"
+        )
+    scope_root = _current_artifact_uri(
+        artifact_root, "scopes", scope_id.replace(":", "-")
+    )
+    expected_locations = {
+        "plan_uri": _current_artifact_uri(scope_root, "plan.json"),
+        "output_uri": _current_artifact_uri(scope_root, "runner-result.json"),
+        "generation_snapshot_uri": _current_artifact_uri(
+            scope_root, "generation.json"
+        ),
+    }
+    actual_locations = {
+        "plan_uri": loaded.plan_uri,
+        "output_uri": loaded.output_uri,
+        "generation_snapshot_uri": loaded.bindings[scope_id].generation_snapshot_uri,
+    }
+    if actual_locations != expected_locations:
+        raise RunnerConfigurationError(
+            "signed plan artifact locations differ from exact current admission"
+        )
+    if loaded.max_events != DEFAULT_MAX_SUMMARY_EVENTS:
+        raise RunnerConfigurationError(
+            "signed plan max_events differs from exact current runtime"
+        )
+    _require_current_plan_artifact_chain(
+        loaded,
+        admission,
+        scope_id=scope_id,
+        scope_root=scope_root,
+    )
+
+    if loaded.mode != "replay":
+        if (
+            loaded.plan.as_of.isoformat() != admission["as_of"]
+            or loaded.registry_snapshot_uri != registry_ref["uri"]
+            or loaded.raw_store_uri != admission["raw_store_uri"]
+            or admission["replay_sources"] != {}
+        ):
+            raise RunnerConfigurationError(
+                "signed plan runtime differs from exact current admission"
+            )
+        _require_artifact_under_root(
+            loaded.raw_manifest_uri,
+            artifact_root,
+            "signed plan raw_manifest_uri",
+        )
+        expected_raw = _current_artifact_uri(scope_root, "raw-manifest.json")
+        if loaded.raw_manifest_uri != expected_raw:
+            raise RunnerConfigurationError(
+                "signed plan raw_manifest_uri differs from exact current admission"
+            )
+        return
+
+    replay_sources = _mapping(
+        admission["replay_sources"], "current admission.replay_sources"
+    )
+    if set(replay_sources) != set(admission["scope_ids"]):
+        raise RunnerConfigurationError(
+            "current replay admission source scope set is invalid"
+        )
+    if loaded.replay_source is None:
+        raise RunnerConfigurationError("current replay source binding is missing")
+    source_ref = _exact_artifact_ref(
+        replay_sources.get(scope_id),
+        f"current admission.replay_sources[{scope_id!r}]",
+    )
+    if (
+        loaded.raw_manifest_uri != source_ref["uri"]
+        or loaded.replay_source.raw_manifest_sha256 != source_ref["sha256"]
+    ):
+        raise RunnerConfigurationError(
+            "signed replay source differs from exact current admission"
+        )
+    source_manifest = _validate_raw_manifest(
+        _read_exact_json_ref(source_ref, "current replay admission source")
+    )
+    source_plan_uri = source_ref["uri"].rsplit("/", 1)[0] + "/plan.json"
+    source_plan = _load_signed_plan(source_plan_uri)
+    if source_plan.mode == "replay":
+        raise RunnerConfigurationError("current replay source cannot itself be replay")
+    _require_current_runtime_plan(source_plan)
+    source_scopes = {item.scope_id: item for item in source_plan.plan.scopes}
+    source_scope = source_scopes.get(scope_id)
+    if source_scope is None:
+        raise RunnerConfigurationError(
+            "signed replay plan differs from exact current source plan"
+        )
+    source_manifest_identity = (
+        source_manifest["run_id"],
+        source_manifest["attempt"],
+        source_manifest["mode"],
+        source_manifest["as_of"],
+        source_manifest["registry_signature"],
+        source_manifest["plan_signature"],
+    )
+    source_plan_identity = (
+        source_plan.plan.run_id,
+        source_plan.attempt,
+        source_plan.mode,
+        source_plan.plan.as_of.isoformat(),
+        source_plan.plan.registry_signature,
+        source_plan.signature,
+    )
+    source_identity = (
+        source_plan.plan.run_id,
+        source_plan.attempt,
+        source_plan.mode,
+        source_plan.signature,
+        source_plan.raw_manifest_uri,
+        source_ref["sha256"],
+    )
+    replay_identity = (
+        loaded.replay_source.run_id,
+        loaded.replay_source.attempt,
+        loaded.replay_source.mode,
+        loaded.replay_source.plan_signature,
+        loaded.raw_manifest_uri,
+        loaded.replay_source.raw_manifest_sha256,
+    )
+    generation_id = hashlib.sha256(
+        (
+            "espn-generation-v1\x00"
+            f"{loaded.plan.run_id}\x00{loaded.attempt}\x00{scope_id}\x00replay"
+        ).encode()
+    ).hexdigest()
+    expected_binding = replace(
+        source_plan.bindings[scope_id],
+        generation_id=generation_id,
+        batch_id=hashlib.sha256(
+            f"espn-batch-v1\x00{generation_id}".encode()
+        ).hexdigest(),
+        ingested_at=_parse_datetime(
+            admission["logical_date"], "current admission.logical_date"
+        ),
+        generation_snapshot_uri=expected_locations["generation_snapshot_uri"],
+        pending_empty_observation=None,
+    )
+    if (
+        scope_id not in source_manifest["selected_scopes"]
+        or source_manifest_identity != source_plan_identity
+        or loaded.plan.scopes[0] != source_scope
+        or loaded.plan.as_of != source_plan.plan.as_of
+        or loaded.plan.registry_signature != source_plan.plan.registry_signature
+        or loaded.registry_snapshot_uri != source_plan.registry_snapshot_uri
+        or loaded.raw_store_uri != source_plan.raw_store_uri
+        or loaded.bindings[scope_id] != expected_binding
+        or source_identity != replay_identity
+    ):
+        raise RunnerConfigurationError(
+            "signed replay plan differs from exact current source plan"
+        )
+
+
+def _require_current_runtime_plan(loaded: LoadedPlan) -> Mapping[str, Any]:
+    """Authenticate a parsed plan before any current-runtime side effect."""
+
+    if not isinstance(loaded, LoadedPlan):
+        raise TypeError("loaded must be LoadedPlan")
+    if loaded.admission_ref is None or loaded.release is None:
+        raise RunnerConfigurationError(
+            "current runtime rejects pre-v3 signed plan; exact historical replay "
+            f"requires pinned {LEGACY_REPLAY_GIT_SHA}"
+        )
+    admission = _current_admission_payload(
+        _read_exact_json_ref(loaded.admission_ref, "signed plan admission_ref")
+    )
+    plan_scope_ids = tuple(scope.scope_id for scope in loaded.plan.scopes)
+    if (
+        (
+            loaded.plan.run_id,
+            loaded.attempt,
+            loaded.mode,
+        )
+        != (
+            admission["run_id"],
+            admission["attempt"],
+            admission["mode"],
+        )
+        or _canonical_bytes(loaded.release)
+        != _canonical_bytes(admission["release"])
+        or _canonical_bytes(loaded.canary_claim)
+        != _canonical_bytes(admission["canary_claim"])
+        or not set(plan_scope_ids).issubset(admission["scope_ids"])
+        or not set(loaded.selected_scopes).issubset(admission["scope_ids"])
+        or (
+            loaded.mode != "replay"
+            and loaded.plan.registry_signature != admission["registry_signature"]
+        )
+    ):
+        raise RunnerConfigurationError(
+            "signed plan differs from exact current admission"
+        )
+    _require_current_plan_runtime_binding(loaded, admission)
+    return admission
 
 
 @lru_cache(maxsize=16)
@@ -2660,6 +3438,7 @@ def stage(
     if not isinstance(options, ExecutionOptions):
         raise TypeError("options must be ExecutionOptions")
     loaded = _load_signed_plan(options.plan_uri)
+    _require_current_runtime_plan(loaded)
     selected = _validate_options(options, loaded)
     _preflight_artifact_uris(options, loaded, selected)
     registry = _load_registry(
@@ -2797,6 +3576,7 @@ def execute(
     if not isinstance(options, ExecutionOptions):
         raise TypeError("options must be ExecutionOptions")
     loaded = _load_signed_plan(options.plan_uri)
+    _require_current_runtime_plan(loaded)
     selected = _validate_options(options, loaded)
     _preflight_artifact_uris(options, loaded, selected)
     registry = _load_registry(

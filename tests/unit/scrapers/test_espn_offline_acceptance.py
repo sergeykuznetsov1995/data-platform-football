@@ -13,6 +13,7 @@ import pytest
 import sqlglot
 from sqlglot import exp
 
+from scrapers.espn.canary_campaign import CampaignIdentity
 from scrapers.espn.discovery import discover_catalog
 from scrapers.espn.models import AgeClass
 from scrapers.espn.operations import (
@@ -36,11 +37,20 @@ from scrapers.espn.repository import (
 from scrapers.espn.runner import execute
 from tests.unit.scrapers.test_run_espn_scraper import (
     FakeHttpClient,
+    TEST_RELEASE_COMMIT,
+    TEST_RELEASE_TREE_SHA256,
+    _bind_current_plan_artifact_chain,
     _bind_replay_to_capture,
     _plan,
     _rewrite_signed_plan,
     _scoreboard,
 )
+
+
+@pytest.fixture(autouse=True)
+def _current_release_env(monkeypatch):
+    monkeypatch.setenv("ESPN_RELEASE_COMMIT", TEST_RELEASE_COMMIT)
+    monkeypatch.setenv("ESPN_RELEASE_TREE_SHA256", TEST_RELEASE_TREE_SHA256)
 
 
 class _DuckDbBronzeBackend:
@@ -286,17 +296,54 @@ def _discovered_registry():
 
 
 def _bind_registry(options, plan, registry):
-    registry_uri = plan.metadata["runtime"]["registry_snapshot_uri"]
-    Path(registry_uri.removeprefix("file://")).write_text(
-        registry.canonical_json(), encoding="utf-8"
+    runtime = plan.metadata["runtime"]
+    registry_uri = runtime["registry_snapshot_uri"]
+    registry_body = registry.canonical_json().encode()
+    Path(registry_uri.removeprefix("file://")).write_bytes(registry_body)
+    release = {
+        **CampaignIdentity.create(
+            release_commit=runtime["release"]["release_commit"],
+            release_tree_sha256=runtime["release"]["release_tree_sha256"],
+            registry_signature=registry.signature(),
+            target_scope_ids=runtime["release"]["target_scope_ids"],
+        ).to_dict(),
+        "parser_version": runtime["release"]["parser_version"],
+        "runtime_version": runtime["release"]["runtime_version"],
+    }
+    admission_uri = runtime["admission_ref"]["uri"]
+    admission_path = Path(admission_uri.removeprefix("file://"))
+    admission = json.loads(admission_path.read_text())
+    admission.update(
+        {
+            "registry_ref": {
+                "uri": registry_uri,
+                "sha256": hashlib.sha256(registry_body).hexdigest(),
+            },
+            "registry_signature": registry.signature(),
+            "release": release,
+        }
     )
-    return _rewrite_signed_plan(
+    admission_body = json.dumps(
+        admission, sort_keys=True, separators=(",", ":")
+    ).encode()
+    admission_path.write_bytes(admission_body)
+    admission_ref = {
+        "uri": admission_uri,
+        "sha256": hashlib.sha256(admission_body).hexdigest(),
+    }
+
+    def mutate(document):
+        document["registry_signature"] = registry.signature()
+        document["metadata"]["runtime"]["release"] = release
+        document["metadata"]["runtime"]["admission_ref"] = admission_ref
+
+    rebuilt = _rewrite_signed_plan(
         options,
         plan,
-        lambda document: document.__setitem__(
-            "registry_signature", registry.signature()
-        ),
+        mutate,
     )
+    _bind_current_plan_artifact_chain(options)
+    return rebuilt
 
 
 @pytest.mark.unit

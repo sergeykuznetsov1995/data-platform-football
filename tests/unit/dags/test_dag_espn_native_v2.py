@@ -218,6 +218,8 @@ def test_network_and_repository_work_use_bounded_dedicated_pools():
 
 def test_all_executable_entrypoints_gate_current_identity_before_side_effects():
     from dags.utils import espn_native_tasks
+    from dags.scripts import run_espn_scraper
+    from scrapers.espn import runner
 
     gates = {
         "acquire_scope_leases": "_read_admission_ref(",
@@ -255,6 +257,34 @@ def test_all_executable_entrypoints_gate_current_identity_before_side_effects():
             for effect in side_effects
             if effect in source
         ), function_name
+
+    runner_side_effects = (
+        "_validate_options(",
+        "_preflight_artifact_uris(",
+        "_load_registry(",
+        "_load_prior(",
+        "_load_raw_manifest(",
+        "EspnRawStore.from_uri(",
+        "_default_http_client(",
+        "EspnBronzeRepository(",
+        "_persist_raw_manifest(",
+        "_write_artifact(",
+    )
+    for function_name in ("stage", "execute"):
+        source = inspect.getsource(getattr(runner, function_name))
+        parse_offset = source.index("_load_signed_plan(")
+        gate_offset = source.index("_require_current_runtime_plan(")
+        assert parse_offset < gate_offset
+        assert all(
+            gate_offset < source.index(effect)
+            for effect in runner_side_effects
+            if effect in source
+        ), f"runner.{function_name}"
+
+    cli_source = inspect.getsource(run_espn_scraper.main)
+    assert cli_source.index("result = execute(options)") < cli_source.index(
+        "print(json.dumps(result.payload"
+    )
 
 
 def test_ingest_timeout_lease_and_mapping_bounds_cover_bounded_onboarding():
