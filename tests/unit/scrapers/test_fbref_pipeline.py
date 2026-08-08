@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import hashlib
 import gzip
+import gc
 import json
 import uuid
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from scrapers.fbref.camoufox_fetch import GEOIP_BYTE_RESERVATION_BYTES
+from scrapers.fbref.bronze import (
+    GenericPagePersistItem,
+    PAGE_MANIFEST_TABLE,
+    TABLE_CELLS_TABLE,
+    TABLE_INVENTORY_TABLE,
+)
 from scrapers.fbref.control import StateConflict
 from scrapers.fbref.control.models import (
     BudgetReservation,
@@ -23,6 +30,11 @@ from scrapers.fbref.control.models import (
 )
 from scrapers.fbref.control.store import BudgetExceeded
 from scrapers.fbref.fetcher import FETCHER_VERSION, FetchError, FetchResponse
+from scrapers.fbref.match_parser import (
+    DatasetParseResult,
+    DatasetStatus,
+    MatchParseResult,
+)
 from scrapers.fbref.page_document import PAGE_DOCUMENT_VERSION
 from scrapers.fbref.pipeline import (
     FBrefPipeline,
@@ -57,7 +69,13 @@ from scrapers.fbref.settings import (
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
     MIN_DOMAIN_INTERVAL_SECONDS,
 )
-from scrapers.fbref.typed_bronze import TYPED_BRONZE_PARSER_VERSION
+from scrapers.fbref.typed_bronze import (
+    MATCH_AVAILABILITY_TABLE,
+    MATCH_DATASET_TABLES,
+    TYPED_BRONZE_PARSER_VERSION,
+    TypedMatchPersistItem,
+    TypedSourceContext,
+)
 
 
 NOW = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
@@ -1045,6 +1063,463 @@ def _pipeline_with_saved_matches(tmp_path, match_ids=("0701e218", "a071faa8")):
     return pipeline, control, records, generic, typed
 
 
+GENERIC_DURABLE_STAGES = (
+    TABLE_CELLS_TABLE,
+    TABLE_INVENTORY_TABLE,
+    PAGE_MANIFEST_TABLE,
+)
+TYPED_DURABLE_STAGES = (
+    *MATCH_DATASET_TABLES.values(),
+    MATCH_AVAILABILITY_TABLE,
+)
+
+
+def _stable(value):
+    if isinstance(value, dict):
+        return tuple(
+            (str(key), _stable(item))
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_stable(item) for item in value)
+    return value
+
+
+def _digest(value):
+    rendered = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(rendered).hexdigest()
+
+
+class DurableGenericWriter:
+    """Natural-keyed generic tables with one post-commit batch fault."""
+
+    def __init__(self, *, fault_after_stage=None):
+        self.fault_after_stage = fault_after_stage
+        self.faulted = False
+        self.fault_was_durable = False
+        self.state = {stage: {} for stage in GENERIC_DURABLE_STAGES}
+        self.batch_page_ids = []
+        self.singleton_page_ids = []
+
+    @staticmethod
+    def _counts(page):
+        return {
+            "cells": len(page.cell_records()),
+            "tables": len(page.tables),
+            "manifest": 1,
+        }
+
+    def _commit(self, stage, item):
+        page = item.page
+        if stage == TABLE_CELLS_TABLE:
+            for record in page.cell_records():
+                key = (
+                    record["table_instance_id"],
+                    record["row_id"],
+                    record["cell_id"],
+                    record["parser_version"],
+                )
+                self.state[stage][key] = _digest(record)
+            return
+        if stage == TABLE_INVENTORY_TABLE:
+            for record in page.inventory_records():
+                key = (
+                    record["table_instance_id"],
+                    record["parser_version"],
+                )
+                self.state[stage][key] = _digest(record)
+            return
+        key = (page.target_id, page.content_hash, page.parser_version)
+        self.state[stage][key] = _digest({
+            "target_id": page.target_id,
+            "canonical_url": item.canonical_url,
+            "page_kind": page.page_kind,
+            "content_hash": page.content_hash,
+            "parser_version": page.parser_version,
+            "table_count": len(page.tables),
+            "cell_count": len(page.cell_records()),
+            "errors": page.errors,
+        })
+
+    def persist_page(
+        self,
+        page,
+        *,
+        canonical_url,
+        run_id,
+        staging_identity,
+    ):
+        item = GenericPagePersistItem(
+            page=page,
+            canonical_url=canonical_url,
+            run_id=run_id,
+            staging_identity=staging_identity,
+        )
+        self.singleton_page_ids.append(id(page))
+        for stage in GENERIC_DURABLE_STAGES:
+            self._commit(stage, item)
+        return self._counts(page)
+
+    def persist_pages(self, items):
+        materialized = tuple(items)
+        self.batch_page_ids.extend(id(item.page) for item in materialized)
+        for stage in GENERIC_DURABLE_STAGES:
+            for item in materialized:
+                self._commit(stage, item)
+            if not self.faulted and stage == self.fault_after_stage:
+                self.faulted = True
+                self.fault_was_durable = bool(self.state[stage])
+                raise RuntimeError(f"generic durable fault after {stage}")
+        return [self._counts(item.page) for item in materialized]
+
+    def snapshot(self):
+        return _stable(self.state)
+
+
+class DurableTypedWriter:
+    """Match/availability tables with one post-commit batch fault."""
+
+    def __init__(self, *, fault_after_stage=None, misalign=False):
+        self.fault_after_stage = fault_after_stage
+        self.misalign = misalign
+        self.faulted = False
+        self.fault_was_durable = False
+        self.state = {stage: {} for stage in TYPED_DURABLE_STAGES}
+        self.batch_parsed_ids = []
+        self.singleton_parsed_ids = []
+        self.batch_sizes = []
+
+    @staticmethod
+    def _dataset_value(result):
+        status = str(getattr(result.status, "value", result.status))
+        frame = result.frame
+        return (
+            status,
+            result.row_count,
+            result.reason,
+            result.error_type,
+            None
+            if frame is None
+            else hashlib.sha256(
+                frame.to_json(
+                    orient="split", date_format="iso", default_handler=str
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+
+    @staticmethod
+    def _counts(item):
+        return {
+            dataset: result.row_count
+            for dataset, result in item.parsed.datasets.items()
+        }
+
+    def _commit(self, stage, item):
+        if stage == MATCH_AVAILABILITY_TABLE:
+            for dataset, result in item.parsed.datasets.items():
+                self.state[stage][(item.match_id, dataset)] = (
+                    str(getattr(result.status, "value", result.status)),
+                    result.row_count,
+                    result.reason,
+                    result.error_type,
+                )
+            return
+        dataset = next(
+            name for name, table in MATCH_DATASET_TABLES.items()
+            if table == stage
+        )
+        self.state[stage][item.match_id] = self._dataset_value(
+            item.parsed.datasets[dataset]
+        )
+
+    def persist_match(
+        self,
+        parsed,
+        *,
+        match_id,
+        context,
+        run_id,
+        target_identity,
+    ):
+        item = TypedMatchPersistItem(
+            parsed=parsed,
+            match_id=match_id,
+            context=context,
+            run_id=run_id,
+            target_identity=target_identity,
+        )
+        self.singleton_parsed_ids.append(id(parsed))
+        for stage in TYPED_DURABLE_STAGES:
+            self._commit(stage, item)
+        return self._counts(item)
+
+    def persist_matches(self, items):
+        materialized = tuple(items)
+        self.batch_sizes.append(len(materialized))
+        self.batch_parsed_ids.extend(id(item.parsed) for item in materialized)
+        for stage in TYPED_DURABLE_STAGES:
+            for item in materialized:
+                self._commit(stage, item)
+            if not self.faulted and stage == self.fault_after_stage:
+                self.faulted = True
+                self.fault_was_durable = bool(self.state[stage])
+                raise RuntimeError(f"typed durable fault after {stage}")
+        counts = [self._counts(item) for item in materialized]
+        return counts[:-1] if self.misalign else counts
+
+    def snapshot(self):
+        return _stable(self.state)
+
+
+def _normalized_control_state(control):
+    manifests = {}
+    for item in control.manifests:
+        key = (
+            item["target_id"],
+            item["content_hash"],
+            item["parser_version"],
+            item["dataset"],
+        )
+        manifests[key] = _stable({
+            name: item.get(name)
+            for name in (
+                "availability",
+                "parse_status",
+                "persistence_status",
+                "validation_status",
+                "row_count",
+                "error_class",
+                "error_message",
+            )
+        })
+    observations = {
+        row["target_id"]: _stable({
+            name: row.get(name)
+            for name in ("status", "typed_status", "stateful_status")
+        })
+        for row in control.observations.values()
+    }
+    frontier = {
+        target_id: _stable({
+            name: row.get(name)
+            for name in (
+                "page_kind",
+                "source_ids",
+                "refresh_policy",
+                "state",
+                "next_fetch_at",
+            )
+        })
+        for target_id, row in control.frontier.items()
+    }
+    provenance = sorted(
+        _stable({
+            name: item.get(name)
+            for name in (
+                "parent_target_id",
+                "child_target_id",
+                "relation",
+                "carried_competition_id",
+                "carried_season_id",
+                "parent_content_hash",
+                "parser_version",
+                "metadata",
+            )
+        })
+        for item in control.provenance
+    )
+    return _stable({
+        "manifests": manifests,
+        "observations": observations,
+        "frontier": frontier,
+        "provenance": provenance,
+    })
+
+
+@dataclass(frozen=True)
+class DurableReplayCase:
+    snapshot: object
+    raw_loads: int
+    observation_claims: int
+    network_calls: int
+    same_generic_objects: bool
+    same_typed_objects: bool
+    fault_was_durable: bool
+    guard_entries: int
+
+
+class DurableReplayPipeline(FBrefPipeline):
+    """Keep the fault matrix focused on persistence, not match parsing."""
+
+    @staticmethod
+    def _parse_typed_match(_html, record):
+        context = TypedSourceContext("9", "2025-2026")
+        parsed = MatchParseResult(
+            parser_version=TYPED_BRONZE_PARSER_VERSION,
+            parsed_at="2026-08-08T00:00:00+00:00",
+            status=DatasetStatus.AVAILABLE,
+            datasets={
+                name: DatasetParseResult(name, DatasetStatus.EMPTY)
+                for name in MATCH_DATASET_TABLES
+            },
+        )
+        return parsed, str(record.source_ids["match_id"]), context
+
+    def _persist_typed(self, run_id, html, record):
+        parsed, match_id, context = self._parse_typed_match(html, record)
+        self._persist_preparsed_typed_match(
+            run_id,
+            record,
+            parsed,
+            match_id=match_id,
+            context=context,
+        )
+
+
+def _pipeline_with_small_durable_matches(path):
+    raw = _raw_store(path)
+    control = FakeControl(raw)
+    control.registry["9"] = {
+        "competition_id": "9",
+        "canonical_url": "https://fbref.com/en/comps/9/history/x",
+        "name": "Premier League",
+        "gender": "male",
+        "classification": "league:club",
+        "metadata": {},
+    }
+    records = []
+    html = """
+    <html><body><table id="match_summary">
+      <thead><tr><th data-stat="label">Label</th></tr></thead>
+      <tbody><tr><td data-stat="label">durable</td></tr></tbody>
+    </table></body></html>
+    """
+    for position, match_id in enumerate(("durable-a", "durable-b")):
+        target = PageTarget(
+            source="fbref",
+            page_kind="match",
+            target_id=f"fbref:match:{match_id}",
+            canonical_url=(
+                f"https://fbref.com/en/matches/{match_id}/x-{position}"
+            ),
+            source_ids={
+                "competition_id": "9",
+                "season_id": "2025-2026",
+                "match_id": match_id,
+            },
+        )
+        refresh, record = _commit_for_parse(raw, target, html)
+        records.append(record)
+        control.frontier[target.target_id] = {
+            "target_id": target.target_id,
+            "page_kind": "match",
+            "state": "fetched",
+            "last_content_hash": record.content_hash,
+            "last_logical_refresh_id": refresh,
+        }
+        control.fetches.append({
+            "target_id": target.target_id,
+            "page_kind": "match",
+            "logical_refresh_id": refresh,
+            "content_hash": record.content_hash,
+        })
+    pipeline = DurableReplayPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+        fetcher_factory=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("durable replay cannot fetch")
+        ),
+    )
+
+    pipeline.batch_persist_enabled = True
+    return pipeline, control, records
+
+
+def _durable_replay_case(
+    path,
+    *,
+    batch,
+    generic_fault_stage=None,
+    typed_fault_stage=None,
+    typed_misalign=False,
+):
+    pipeline, control, _records = _pipeline_with_small_durable_matches(path)
+    generic = DurableGenericWriter(fault_after_stage=generic_fault_stage)
+    typed = DurableTypedWriter(
+        fault_after_stage=typed_fault_stage,
+        misalign=typed_misalign,
+    )
+    pipeline.generic_writer = generic
+    pipeline.typed_adapter = FakeTypedAdapter(typed)
+    pipeline.batch_persist_enabled = batch
+    raw_loads = 0
+    original_load = pipeline.raw_store.load_fetch_html
+
+    def counted_load(logical_refresh_id):
+        nonlocal raw_loads
+        raw_loads += 1
+        return original_load(logical_refresh_id)
+
+    pipeline.raw_store.load_fetch_html = counted_load
+    network_calls = 0
+
+    def forbidden_transport(*_args):
+        nonlocal network_calls
+        network_calls += 1
+        raise AssertionError("durable replay must not construct a transport")
+
+    pipeline.fetcher_factory = forbidden_transport
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+    assert result.parsed == 2
+    faulted_writer = generic if generic_fault_stage else typed
+    case = DurableReplayCase(
+        snapshot=_stable({
+            "generic": generic.snapshot(),
+            "typed": typed.snapshot(),
+            "control": _normalized_control_state(control),
+        }),
+        raw_loads=raw_loads,
+        observation_claims=len(control.observation_claim_calls),
+        network_calls=network_calls,
+        same_generic_objects=(
+            generic_fault_stage is None
+            or set(generic.batch_page_ids) == set(generic.singleton_page_ids)
+        ),
+        same_typed_objects=(
+            typed_fault_stage is None and not typed_misalign
+            or set(typed.batch_parsed_ids) == set(typed.singleton_parsed_ids)
+        ),
+        fault_was_durable=(
+            False if not batch else faulted_writer.fault_was_durable
+        ),
+        guard_entries=sum(
+            event.startswith("content_guard:") for event in control.events
+        ),
+    )
+    # BeautifulSoup and parser objects contain cycles. The fault matrix runs
+    # many complete saved-HTML replays in one pytest process, so collect those
+    # bounded per-case graphs instead of retaining them until cyclic GC fires.
+    del pipeline, control, generic, typed
+    gc.collect()
+    return case
+
+
+@pytest.fixture(scope="module")
+def durable_sequential_baseline(tmp_path_factory):
+    return _durable_replay_case(
+        tmp_path_factory.mktemp("fbref-durable-baseline"), batch=False
+    )
+
+
 def test_batch_persist_configuration_is_bounded_and_default_off(monkeypatch):
     pipeline = FBrefPipeline(
         FakeControl(), object(), generic_writer=FakeWriter()
@@ -1613,6 +2088,132 @@ def test_second_batch_guard_enter_fault_closes_first_then_fails_all_leases(
     assert {
         row["status"] for row in control.observations.values()
     } == {"failed"}
+
+
+@pytest.mark.parametrize(
+    "fault_stage",
+    [TABLE_CELLS_TABLE, TABLE_INVENTORY_TABLE, PAGE_MANIFEST_TABLE],
+)
+def test_generic_partial_commit_repair_matches_sequential_durable_state(
+    tmp_path, durable_sequential_baseline, fault_stage
+):
+    repaired = _durable_replay_case(
+        tmp_path / "repaired",
+        batch=True,
+        generic_fault_stage=fault_stage,
+    )
+
+    assert repaired.snapshot == durable_sequential_baseline.snapshot
+    assert repaired.raw_loads == repaired.observation_claims == 2
+    assert repaired.same_generic_objects is True
+    assert repaired.fault_was_durable is True
+    assert repaired.network_calls == 0
+
+
+@pytest.mark.parametrize(
+    "fault_stage",
+    [*MATCH_DATASET_TABLES.values(), MATCH_AVAILABILITY_TABLE],
+)
+def test_typed_partial_commit_repair_matches_sequential_durable_state(
+    tmp_path, durable_sequential_baseline, fault_stage
+):
+    repaired = _durable_replay_case(
+        tmp_path / "repaired",
+        batch=True,
+        typed_fault_stage=fault_stage,
+    )
+
+    assert repaired.snapshot == durable_sequential_baseline.snapshot
+    assert repaired.raw_loads == repaired.observation_claims == 2
+    assert repaired.same_typed_objects is True
+    assert repaired.fault_was_durable is True
+    assert repaired.guard_entries == 2
+    assert repaired.network_calls == 0
+
+
+def test_typed_batch_count_misalignment_repairs_same_objects_under_guards(
+    tmp_path, durable_sequential_baseline
+):
+    repaired = _durable_replay_case(
+        tmp_path / "repaired", batch=True, typed_misalign=True
+    )
+
+    assert repaired.snapshot == durable_sequential_baseline.snapshot
+    assert repaired.raw_loads == repaired.observation_claims == 2
+    assert repaired.same_typed_objects is True
+    assert repaired.guard_entries == 2
+    assert repaired.network_calls == 0
+
+
+def test_guard_exit_fault_after_completion_is_loud_and_replay_claims_nothing(
+    tmp_path,
+):
+    pipeline, control, records = _pipeline_with_small_durable_matches(tmp_path)
+    generic = DurableGenericWriter()
+    typed = DurableTypedWriter()
+    pipeline.generic_writer = generic
+    pipeline.typed_adapter = FakeTypedAdapter(typed)
+    ordered = sorted(record.target_id for record in records)
+    faulted = False
+
+    @contextmanager
+    def guard_with_exit_fault(target_id, content_hash, logical_refresh_id):
+        nonlocal faulted
+        control.events.append(f"content_guard:{target_id}")
+        frontier = control.frontier[target_id]
+        verdict = (
+            frontier["last_content_hash"] == content_hash
+            and frontier["last_logical_refresh_id"] == logical_refresh_id
+        )
+        try:
+            yield verdict
+        finally:
+            control.events.append(f"content_guard_exit:{target_id}")
+            if target_id == ordered[1] and not faulted:
+                faulted = True
+                raise RuntimeError("guard exit commit fault")
+
+    control.guard_latest_content = guard_with_exit_fault
+    raw_loads = 0
+    original_load = pipeline.raw_store.load_fetch_html
+
+    def counted_load(logical_refresh_id):
+        nonlocal raw_loads
+        raw_loads += 1
+        return original_load(logical_refresh_id)
+
+    pipeline.raw_store.load_fetch_html = counted_load
+
+    with pytest.raises(ParseWaveError, match="guard exit commit fault"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+        )
+
+    before_replay = _stable({
+        "generic": generic.snapshot(),
+        "typed": typed.snapshot(),
+        "control": _normalized_control_state(control),
+    })
+    assert {
+        row["status"] for row in control.observations.values()
+    } == {"succeeded"}
+    assert not any(
+        event.startswith("observation_fail:") for event in control.events
+    )
+    assert raw_loads == len(control.observation_claim_calls) == 2
+
+    replay = pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["match"], settings=_settings()
+    )
+    after_replay = _stable({
+        "generic": generic.snapshot(),
+        "typed": typed.snapshot(),
+        "control": _normalized_control_state(control),
+    })
+
+    assert replay.cohort_size == replay.claimed == replay.parsed == 0
+    assert raw_loads == len(control.observation_claim_calls) == 2
+    assert after_replay == before_replay
 
 
 def test_completed_manifest_conflict_does_not_mask_processing_failure(
