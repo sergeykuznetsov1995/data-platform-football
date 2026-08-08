@@ -29,7 +29,12 @@ from scrapers.fbref.control.models import (
     ThrottleSlot,
 )
 from scrapers.fbref.control.store import BudgetExceeded
-from scrapers.fbref.fetcher import FETCHER_VERSION, FetchError, FetchResponse
+from scrapers.fbref.fetcher import (
+    FETCHER_VERSION,
+    FetchError,
+    FetchResponse,
+    PersistentMeteredSessionReceipt,
+)
 from scrapers.fbref.match_parser import (
     DatasetParseResult,
     DatasetStatus,
@@ -41,6 +46,7 @@ from scrapers.fbref.pipeline import (
     FETCH_LEASE_SECONDS,
     FetchWaveError,
     ParseWaveError,
+    PipelineError,
     PipelineSettings,
     RunValidationError,
     SENTINEL_COMPETITIONS,
@@ -52,6 +58,7 @@ from scrapers.fbref.pipeline import (
     page_target_from_link,
     wave_target_capacity,
     _bounded_int,
+    _LiveFetchSession,
     _session_failure,
 )
 from scrapers.fbref.discovery import (
@@ -79,6 +86,130 @@ from scrapers.fbref.typed_bronze import (
 
 
 NOW = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
+
+
+def test_persistent_tail_reservation_failure_closes_empty_control_session():
+    events = []
+
+    class Fetcher:
+        def begin_metered_session(self, session_id):
+            events.append(("begin", session_id))
+            return 0
+
+        def finalize_metered_session(self):
+            events.append("provider_finalized")
+            return {"session_id": "session-1"}
+
+    class Control:
+        def reserve_clearance_session_tail(self, *_args, **_kwargs):
+            raise RuntimeError("tail reserve unavailable")
+
+        def close_clearance_session(self, session_id, *, status):
+            events.append(("control_closed", session_id, status))
+
+        def settle_clearance_session_tail(self, *_args, **_kwargs):
+            raise AssertionError("a missing tail must not be settled")
+
+    live = _LiveFetchSession(
+        fetcher=Fetcher(), persistent_enabled=True
+    )
+    live.attach_control_session("session-1")
+
+    with pytest.raises(RuntimeError, match="tail reserve unavailable"):
+        live.begin_persistent(Control(), run_id="run-1", tail_bytes=10)
+    live.finalize(Control(), status="failed")
+
+    assert live.state == "control_closed"
+    assert events == [
+        ("begin", "session-1"),
+        "provider_finalized",
+        ("control_closed", "session-1", "failed"),
+    ]
+
+
+def test_terminal_persistent_tail_still_releases_closed_fetcher_stack():
+    events = []
+
+    class Fetcher:
+        def finalize_metered_session(self):
+            events.append("provider_finalized")
+            return {"session_id": "session-1"}
+
+    class Control:
+        def settle_clearance_session_tail(self, _session_id, _receipt):
+            events.append("tail_settled")
+            return {"terminal": True}
+
+        def close_clearance_session(self, _session_id, *, status):
+            events.append(("control_closed", status))
+
+    live = _LiveFetchSession(
+        fetcher=Fetcher(), persistent_enabled=True
+    )
+    live.attach_control_session("session-1")
+    live.state = "active"
+    live.tail_reserved = True
+    live.stack.callback(events.append, "stack_released")
+
+    with pytest.raises(FetchWaveError, match="tail exceeded"):
+        live.close(Control(), status="closed")
+
+    assert live.fetcher is None
+    assert live.session_id is None
+    assert events == [
+        "provider_finalized",
+        "tail_settled",
+        ("control_closed", "failed"),
+        "stack_released",
+    ]
+
+
+def test_persistent_rollover_waits_for_retryable_tail_and_control_close():
+    events = []
+
+    class Fetcher:
+        def begin_metered_session(self, session_id):
+            events.append(("meter_begin", session_id))
+            return 0
+
+        def finalize_metered_session(self):
+            events.append("provider_finalized")
+            return {"session_id": "session-1"}
+
+    class Control:
+        settle_attempts = 0
+
+        def reserve_clearance_session_tail(self, _run_id, session_id, **_kwargs):
+            events.append(("tail_reserved", session_id))
+
+        def settle_clearance_session_tail(self, session_id, _receipt):
+            self.settle_attempts += 1
+            events.append(("tail_settle", session_id, self.settle_attempts))
+            if self.settle_attempts == 1:
+                raise RuntimeError("temporary tail store failure")
+            return {"terminal": False}
+
+        def close_clearance_session(self, session_id, *, status):
+            events.append(("control_closed", session_id, status))
+
+    control = Control()
+    live = _LiveFetchSession(fetcher=Fetcher(), persistent_enabled=True)
+    live.attach_control_session("session-1")
+    live.begin_persistent(control, run_id="run-1", tail_bytes=10)
+
+    with pytest.raises(FetchWaveError, match="finalizer failed"):
+        live.finalize(control, status="failed")
+    with pytest.raises(PipelineError, match="not finalized"):
+        live.attach_control_session("session-2")
+
+    live.finalize(control, status="failed")
+    live.attach_control_session("session-2")
+    live.begin_persistent(control, run_id="run-1", tail_bytes=10)
+
+    assert live.state == "active"
+    assert events.index(("control_closed", "session-1", "failed")) < (
+        events.index(("meter_begin", "session-2"))
+    )
 
 
 @pytest.mark.parametrize(
@@ -145,6 +276,38 @@ def test_live_wave_capacity_uses_sequential_byte_reservations(
     assert live_wave_target_capacity(
         settings, request_remaining=100, byte_remaining=6 * 1024 * 1024
     ) == 0
+
+
+def test_persistent_capacity_funds_one_extra_zero_request_tail_reservation():
+    common = dict(
+        run_type="current",
+        request_limit=100,
+        byte_limit=1000,
+        shard_size=25,
+        request_reservation_bytes=100,
+        bootstrap_request_reservation=1,
+        bootstrap_byte_reservation=10,
+    )
+    legacy = PipelineSettings(**common, persistent_http_session=False)
+    persistent = PipelineSettings(**common, persistent_http_session=True)
+
+    assert wave_target_capacity(legacy) == 9
+    assert wave_target_capacity(persistent) == 8
+    assert live_wave_target_capacity(
+        legacy, request_remaining=100, byte_remaining=110
+    ) == 25
+    assert live_wave_target_capacity(
+        persistent, request_remaining=100, byte_remaining=110
+    ) == 0
+    assert affordable_clearance_reservation(
+        legacy, request_remaining=3, byte_remaining=110
+    ) == (1, 10)
+    assert affordable_clearance_reservation(
+        persistent, request_remaining=3, byte_remaining=110
+    ) is None
+    assert affordable_clearance_reservation(
+        persistent, request_remaining=3, byte_remaining=210
+    ) == (1, 10)
 
 
 def test_acceptance_settings_are_fixed_live_and_zero_network_profiles():
@@ -875,6 +1038,120 @@ class BudgetAwareFakeControl(FakeControl):
         super().settle_budget(reservation_id, **kwargs)
 
 
+class PersistentFakeControl(BudgetAwareFakeControl):
+    def __init__(self, raw_store=None):
+        super().__init__(raw_store)
+        self.run["metadata"] = {"persistent_http_session": True}
+        self.page_evidence = []
+        self.tail_evidence = []
+        self._tail_reserved = 0
+
+    def reserve_clearance_session_tail(
+        self,
+        run_id,
+        session_id,
+        *,
+        bytes_reserved,
+        baseline_provider_bytes,
+    ):
+        self.events.append("tail_reserve")
+        self._tail_reserved = int(bytes_reserved)
+        self.run["bytes_reserved"] += self._tail_reserved
+        return {
+            "run_id": run_id,
+            "session_id": session_id,
+            "bytes_reserved": bytes_reserved,
+            "baseline_provider_bytes": baseline_provider_bytes,
+        }
+
+    def settle_clearance_session_page(
+        self, session_id, reservation_id, **kwargs
+    ):
+        self.events.append("page_settle")
+        requests_reserved, bytes_reserved = (
+            self._open_budget_reservations.pop(reservation_id)
+        )
+        self.run["requests_reserved"] -= requests_reserved
+        self.run["bytes_reserved"] -= bytes_reserved
+        self.run["requests_used"] += int(kwargs["requests_used"])
+        self.run["bytes_used"] += int(kwargs["provider_billed_bytes"])
+        self.page_evidence.append((session_id, reservation_id, dict(kwargs)))
+        return {"budget_exceeded": False, "idempotent": False}
+
+    def settle_clearance_session_tail(self, session_id, receipt):
+        self.events.append("tail_settle")
+        self.run["bytes_reserved"] -= self._tail_reserved
+        self.run["bytes_used"] += int(receipt.tail_provider_bytes)
+        self._tail_reserved = 0
+        self.tail_evidence.append((session_id, receipt))
+        return {"terminal": False, "idempotent": False}
+
+    def assert_persistent_metering_reconciled(self, run_id):
+        assert self.run["requests_reserved"] == 0
+        assert self.run["bytes_reserved"] == 0
+        assert self.run["bytes_used"] == 130
+        self.events.append("persistent_reconcile")
+        return {"run_id": run_id, "reconciled": True}
+
+
+class PersistentFakeFetcher:
+    persistent_http_session = True
+
+    def __init__(self, events):
+        self.events = events
+        self.session_id = None
+        self.receipt = None
+
+    def __enter__(self):
+        self.events.append("fetcher_enter")
+        return self
+
+    def __exit__(self, *_args):
+        self.events.append("fetcher_exit")
+
+    def begin_metered_session(self, session_id):
+        self.session_id = session_id
+        self.receipt = None
+        self.events.append("meter_begin")
+        return 0
+
+    def ensure_clearance(self):
+        self.events.append("browser")
+        return True
+
+    def fetch(self, url, **_kwargs):
+        self.events.append("http")
+        return FetchResponse(
+            url=url,
+            status_code=200,
+            body=b"<html><table></table></html>",
+            headers={"content-type": "text/html"},
+            latency_ms=5,
+            http_wire_bytes=80,
+            decoded_html_bytes=28,
+            http_requests=1,
+            http_status_history=(200,),
+            browser_document_bytes=20,
+            browser_asset_bytes=10,
+            browser_requests=1,
+            browser_bootstrap_attempts=1,
+            provider_billed_bytes=120,
+        )
+
+    def finalize_metered_session(self):
+        if self.receipt is None:
+            self.events.append("provider_finalize")
+            self.receipt = PersistentMeteredSessionReceipt(
+                session_id=self.session_id,
+                meter="proxy_filter_provider_path_v2",
+                baseline_provider_bytes=0,
+                page_provider_bytes=120,
+                authoritative_provider_bytes=130,
+                tail_provider_bytes=10,
+            )
+        return self.receipt
+
+
 class FakeFetcher:
     def __init__(self, events, body, *, http_requests=1):
         self.events = events
@@ -965,6 +1242,93 @@ def _settings(run_type="current"):
         request_reservation_bytes=4 * 1024 * 1024,
         domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
     )
+
+
+def _persistent_settings():
+    return replace(_settings(), persistent_http_session=True)
+
+
+def test_persistent_fetch_commits_raw_before_page_tail_and_control_close(
+    tmp_path, monkeypatch
+):
+    raw = _raw_store(tmp_path)
+    control = PersistentFakeControl(raw)
+    fetcher = PersistentFakeFetcher(control.events)
+    original_commit = raw.commit_fetch
+
+    def commit_with_event(*args, **kwargs):
+        control.events.append("raw_commit")
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(raw, "commit_fetch", commit_with_event)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_args: fetcher,
+    )
+
+    result = pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="persistent-worker",
+        page_kinds=["competition_index"],
+        settings=_persistent_settings(),
+    )
+
+    assert result.fetched == 1
+    evidence = control.page_evidence[0][2]
+    assert evidence["provider_billed_bytes"] == 120
+    assert evidence["compressed_raw_bytes"] > 0
+    expected_order = (
+        "raw_commit",
+        "page_settle",
+        "provider_finalize",
+        "tail_settle",
+        "session_close",
+        "fetcher_exit",
+        "persistent_reconcile",
+    )
+    positions = [control.events.index(item) for item in expected_order]
+    assert positions == sorted(positions)
+
+
+def test_persistent_raw_store_failure_settles_authoritative_page_once(
+    tmp_path, monkeypatch
+):
+    raw = _raw_store(tmp_path)
+    control = PersistentFakeControl(raw)
+    fetcher = PersistentFakeFetcher(control.events)
+    monkeypatch.setattr(
+        raw,
+        "commit_fetch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("raw store unavailable")
+        ),
+    )
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_args: fetcher,
+    )
+
+    with pytest.raises(FetchWaveError, match="OSError"):
+        pipeline.fetch_wave(
+            str(uuid.UUID(int=1)),
+            worker_id="persistent-worker",
+            page_kinds=["competition_index"],
+            settings=_persistent_settings(),
+        )
+
+    assert len(control.page_evidence) == 1
+    evidence = control.page_evidence[0][2]
+    assert evidence["provider_billed_bytes"] == 120
+    assert evidence["compressed_raw_bytes"] == 0
+    assert control.events.index("page_settle") < control.events.index("fail")
+    assert control.events.index("fail") < control.events.index(
+        "provider_finalize"
+    )
+    assert len(control.tail_evidence) == 1
 
 
 def test_settings_cannot_underreserve_bounded_status_retry_requests():
@@ -2891,6 +3255,52 @@ def test_fetch_wave_settles_exact_provider_bytes_not_geoip_reserve(tmp_path):
     assert control.session_metrics[0][1]["provider_billed_bytes"] == 321
 
 
+def test_default_off_raw_store_failure_still_settles_authoritative_meter(
+    tmp_path,
+    monkeypatch,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+
+    class MeteredFetcher(FakeFetcher):
+        def fetch(self, url, **kwargs):
+            return replace(
+                super().fetch(url, **kwargs),
+                provider_billed_bytes=321,
+            )
+
+    monkeypatch.setattr(
+        raw,
+        "commit_fetch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("raw store unavailable")
+        ),
+    )
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: MeteredFetcher(
+            control.events, b"<html>ok</html>"
+        ),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError, match="OSError"):
+        pipeline.fetch_wave(
+            str(uuid.UUID(int=1)),
+            worker_id="worker-1",
+            page_kinds=["competition_index"],
+            settings=_settings(),
+        )
+
+    assert control.settlements[0][1]["bytes_used"] == 321
+    assert len(control.session_metrics) == 1
+    assert control.session_metrics[0][1]["provider_billed_bytes"] == 321
+    assert control.events.index("settle") < control.events.index("fail")
+
+
 def test_fetch_wave_persists_retry_failure_evidence_and_exact_request_count(
     tmp_path,
 ):
@@ -4601,6 +5011,37 @@ def test_run_live_waves_reanimates_a_failed_run_before_the_first_wave(
     assert "start_run" in control.events
 
 
+def test_persistent_aborted_run_is_rejected_before_reanimation_or_fetch(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = PersistentFakeControl(raw)
+    control.run["status"] = "failed"
+
+    def reject_inexact(_run_id):
+        control.events.append("persistent_preflight")
+        raise StateConflict("aborted persistent session")
+
+    control.assert_persistent_metering_reconciled = reject_inexact
+    control.start_run = lambda _run_id: (_ for _ in ()).throw(
+        AssertionError("an inexact persistent run must not be reanimated")
+    )
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    pipeline.fetch_wave = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("an inexact persistent run must not fetch")
+    )
+
+    with pytest.raises(StateConflict, match="aborted persistent session"):
+        pipeline.run_live_waves(
+            str(uuid.uuid4()),
+            worker_id="resume-persistent",
+            page_kinds=["competition_index"],
+            settings=_persistent_settings(),
+        )
+
+    assert control.events[-1] == "persistent_preflight"
+
+
 def test_run_live_waves_does_not_touch_a_healthy_run(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
@@ -4751,6 +5192,28 @@ def test_validation_accepts_a_clearance_re_solved_on_a_fresh_proxy(tmp_path):
     pipeline.validate_and_finish(str(uuid.uuid4()))
 
     assert "finish:True" in control.events
+
+
+def test_validation_reconciles_persistent_meter_before_finishing(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary["metadata"] = {
+        **dict(summary.get("metadata") or {}),
+        "persistent_http_session": True,
+    }
+    control.get_run_summary = lambda _, **__: summary
+    control.assert_persistent_metering_reconciled = (
+        lambda run_id: control.events.append(f"persistent_reconciled:{run_id}")
+    )
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    run_id = str(uuid.uuid4())
+
+    pipeline.validate_and_finish(run_id)
+
+    assert control.events.index(f"persistent_reconciled:{run_id}") < (
+        control.events.index("finish:True")
+    )
 
 
 def _ordinary_validation_summary(control, **traffic):

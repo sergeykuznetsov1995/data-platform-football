@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 from typing import Mapping
 
+from scrapers.fbref.control import ControlStore
 from scrapers.fbref.fetcher import FBrefFetcher
 from scrapers.fbref.pipeline import FBrefPipeline, PipelineSettings
 from scrapers.fbref.proxy_lease import FBREF_DAG_IDS
@@ -27,6 +28,7 @@ from scrapers.fbref.settings import (
     FBREF_PRODUCTION_SAFETY_BYTE_LIMIT_MIB,
     FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT,
     MIB,
+    strict_binary_flag,
 )
 
 
@@ -219,6 +221,9 @@ def _run(args: argparse.Namespace) -> int:
     if requested_profile not in live_profiles:
         raise ValueError("Unsupported FBref live safety profile")
 
+    persistent_http_session = strict_binary_flag(
+        "FBREF_PERSISTENT_HTTP_SESSION"
+    )
     settings = PipelineSettings(
         run_type=args.run_type,
         request_limit=args.request_limit,
@@ -226,9 +231,12 @@ def _run(args: argparse.Namespace) -> int:
         shard_size=args.shard_size,
         request_reservation_bytes=args.reservation_mb * MIB,
         domain_interval_seconds=args.domain_interval_seconds,
+        persistent_http_session=persistent_http_session,
     )
-    pipeline = FBrefPipeline.from_env()
-    run = pipeline.control.get_run(args.control_run_id)
+    # Validate immutable run identity before constructing Trino writers or a
+    # fetcher that could request a paid lease.
+    control = ControlStore.from_env()
+    run = control.get_run(args.control_run_id)
     if run is None:
         raise RuntimeError("FBref control run does not exist")
     raw_metadata = run.get("metadata") or {}
@@ -236,6 +244,19 @@ def _run(args: argparse.Namespace) -> int:
         raw_metadata = json.loads(raw_metadata)
     if not isinstance(raw_metadata, Mapping):
         raise RuntimeError("FBref control run metadata is invalid")
+    stored_persistent = raw_metadata.get("persistent_http_session")
+    if stored_persistent is None:
+        if persistent_http_session:
+            raise RuntimeError(
+                "FBref control run has no persistent HTTP profile marker"
+            )
+    elif (
+        not isinstance(stored_persistent, bool)
+        or stored_persistent != persistent_http_session
+    ):
+        raise RuntimeError(
+            "FBref control run persistent HTTP profile differs from live runner"
+        )
     dag_id = str(raw_metadata.get("dag_id") or "")
     if dag_id not in FBREF_DAG_IDS:
         raise RuntimeError("FBref control run has invalid paid-proxy DAG provenance")
@@ -282,6 +303,7 @@ def _run(args: argparse.Namespace) -> int:
         current_run_remaining,
         int(meter["daily_remaining_bytes"]),
     )
+    pipeline = FBrefPipeline.from_env()
     pipeline.fetcher_factory = (
         lambda _proxy_file, max_browser_requests, max_browser_bytes: FBrefFetcher(
             max_browser_requests=max_browser_requests,
@@ -289,6 +311,7 @@ def _run(args: argparse.Namespace) -> int:
             provider_context=provider_context,
             provider_max_bytes=provider_byte_budget,
             proxy_control_url=proxy_control_url,
+            persistent_http_session=persistent_http_session,
         )
     )
     result = pipeline.run_live_waves(

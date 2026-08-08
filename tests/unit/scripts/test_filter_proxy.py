@@ -5160,6 +5160,77 @@ def test_concurrent_provider_readers_keep_aggregate_upload_headroom(mod):
     assert lease.usable is True
 
 
+def test_fbref_report_exposes_every_idle_proof_counter(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr, max_bytes=100)
+    lease.active_provider_readers = 1
+    lease.provider_reserved_bytes = 7
+    lease.pending_client_hellos = 2
+    lease.staged_client_bytes = 5
+
+    report = lease.report()
+
+    assert report["active_provider_readers"] == 1
+    assert report["provider_reserved_bytes"] == 7
+    assert report["pending_client_hellos"] == 2
+    assert report["staged_client_bytes"] == 5
+
+
+def test_fbref_upload_is_visible_as_staged_until_metered_write_finishes(mod):
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = _make_fbref_lease(mod, mgr, max_bytes=100)
+
+    class Reader:
+        def __init__(self):
+            self.calls = 0
+
+        async def read(self, _size):
+            self.calls += 1
+            return b"hello" if self.calls == 1 else b""
+
+    class Writer:
+        def __init__(self, entered, release):
+            self.entered = entered
+            self.release = release
+            self.closed = False
+
+        def write(self, _chunk):
+            return None
+
+        async def drain(self):
+            self.entered.set()
+            await self.release.wait()
+
+        def close(self):
+            self.closed = True
+
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        writer = Writer(entered, release)
+        task = asyncio.create_task(
+            mod._pump(
+                Reader(),
+                writer,
+                "www.fbref.com",
+                defaultdict(int),
+                lease=lease,
+                direction="up",
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert lease.staged_client_bytes == 5
+        release.set()
+        await asyncio.wait_for(task, timeout=1)
+        return writer
+
+    writer = asyncio.run(scenario())
+
+    assert lease.staged_client_bytes == 0
+    assert lease.up_bytes == 5
+    assert writer.closed is True
+
+
 def test_cross_lease_provider_reservations_leave_shared_upload_headroom(mod):
     mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
     mod.DAILY_BUDGET_BYTES = 12
@@ -8222,6 +8293,11 @@ def test_fbref_drained_lease_extension_is_durable_before_cap_mutation(mod):
     [
         "active_tunnels",
         "reserved_bytes",
+        "active_provider_readers",
+        "provider_reserved_bytes",
+        "pending_client_hellos",
+        "staged_client_bytes",
+        "accounting_uncertain",
         "current_request_id",
         "current_endpoint",
         "closed",

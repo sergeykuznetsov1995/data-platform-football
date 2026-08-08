@@ -85,6 +85,7 @@ from scrapers.fbref.settings import (
     DEFAULT_REQUEST_LIMIT,
     DEFAULT_REQUEST_RESERVATION_BYTES,
     DEFAULT_SHARD_SIZE,
+    FBREF_PERSISTENT_HTTP_SESSION,
     MAX_CLEARANCE_SOLVE_ATTEMPTS,
     MAX_SHARD_SIZE,
     MIN_DOMAIN_INTERVAL_SECONDS,
@@ -255,6 +256,7 @@ class PipelineSettings:
     bootstrap_byte_reservation: Optional[int] = None
     target_request_reservation: int = MAX_TARGET_HTTP_ATTEMPTS
     proxy_file: Optional[str] = None
+    persistent_http_session: bool = FBREF_PERSISTENT_HTTP_SESSION
 
     @classmethod
     def acceptance(
@@ -303,6 +305,7 @@ class PipelineSettings:
             # invariant intentionally keeps reservations positive.
             bootstrap_request_reservation=1,
             bootstrap_byte_reservation=1,
+            persistent_http_session=False,
         )
 
     def __post_init__(self) -> None:
@@ -342,6 +345,10 @@ class PipelineSettings:
             raise ValueError(
                 "target_request_reservation must cover both HTTP attempts"
             )
+        if not isinstance(self.persistent_http_session, bool):
+            raise ValueError("persistent_http_session must be boolean")
+        if self.run_type == "replay" and self.persistent_http_session:
+            raise ValueError("Replay cannot enable persistent HTTP metering")
 
 
 BACKFILL_SEASON_COHORT_RESERVATION_BYTES = 7 * MIB
@@ -408,9 +415,14 @@ def wave_target_capacity(
     bootstrap_bytes = (
         settings.bootstrap_byte_reservation if bootstrap_required else 0
     )
+    tail_bytes = (
+        settings.request_reservation_bytes
+        if bootstrap_required and settings.persistent_http_session
+        else 0
+    )
     byte_capacity = max(
         0,
-        bytes_available - bootstrap_bytes,
+        bytes_available - bootstrap_bytes - tail_bytes,
     ) // settings.request_reservation_bytes
     request_capacity = (
         max(0, requests - bootstrap_requests)
@@ -449,6 +461,8 @@ def live_wave_target_capacity(
     initial_bytes = settings.request_reservation_bytes + (
         settings.bootstrap_byte_reservation if bootstrap_required else 0
     )
+    if bootstrap_required and settings.persistent_http_session:
+        initial_bytes += settings.request_reservation_bytes
     if bytes_available < initial_bytes:
         return 0
     request_capacity = max(
@@ -491,10 +505,16 @@ def affordable_clearance_reservation(
             full_requests, count * DEFAULT_BROWSER_REQUESTS_PER_SOLVE
         )
         bytes_ = min(full_bytes, count * DEFAULT_BROWSER_BYTE_LIMIT_BYTES)
+        tail_bytes = (
+            settings.request_reservation_bytes
+            if settings.persistent_http_session
+            else 0
+        )
         fits = (
             request_remaining - requests
             >= settings.target_request_reservation
-            and byte_remaining - bytes_ >= settings.request_reservation_bytes
+            and byte_remaining - bytes_
+            >= settings.request_reservation_bytes + tail_bytes
         )
         if fits:
             return requests, bytes_
@@ -624,6 +644,11 @@ class _LiveFetchSession:
     # longer fund the full reservation.  ``None`` means the settings default.
     clearance_requests: Optional[int] = None
     clearance_bytes: Optional[int] = None
+    persistent_enabled: bool = False
+    state: str = "idle"
+    receipt: Optional[object] = None
+    tail_settlement: Optional[dict] = None
+    tail_reserved: bool = False
 
     def clearance_reservation(self, settings) -> tuple[int, int]:
         return (
@@ -635,19 +660,149 @@ class _LiveFetchSession:
             else self.clearance_bytes,
         )
 
-    def close(self, control, *, status: str) -> None:
+    def attach_control_session(self, session_id: str) -> None:
+        """Install a newly opened control session before metering can start."""
+
+        if self.state not in {"idle", "control_closed"}:
+            raise PipelineError(
+                "Previous persistent clearance session is not finalized"
+            )
+        self.session_id = str(session_id)
+        self.state = "control_open"
+        self.receipt = None
+        self.tail_settlement = None
+        self.tail_reserved = False
+
+    def begin_persistent(
+        self,
+        control,
+        *,
+        run_id: str,
+        tail_bytes: int,
+    ) -> None:
+        if not self.persistent_enabled or self.fetcher is None or self.session_id is None:
+            raise PipelineError("Persistent clearance session is incomplete")
+        if self.state != "control_open":
+            raise PipelineError(
+                "Persistent control session is not ready for metering"
+            )
+        begin = getattr(self.fetcher, "begin_metered_session", None)
+        if not callable(begin):
+            raise PipelineError(
+                "FBref persistent fetcher must expose begin_metered_session"
+            )
+        baseline = int(begin(self.session_id))
+        self.state = "meter_started"
+        self.receipt = None
+        self.tail_settlement = None
+        self.tail_reserved = False
+        control.reserve_clearance_session_tail(
+            run_id,
+            self.session_id,
+            bytes_reserved=tail_bytes,
+            baseline_provider_bytes=baseline,
+        )
+        self.tail_reserved = True
+        self.state = "active"
+
+    def finalize(self, control, *, status: str) -> None:
+        if not self.persistent_enabled:
+            try:
+                self.stack.close()
+            finally:
+                self.fetcher = None
+                if self.session_id is not None:
+                    try:
+                        control.close_clearance_session(
+                            self.session_id, status=status
+                        )
+                    finally:
+                        self.session_id = None
+                self.needs_clearance = True
+            return
+        if self.session_id is None:
+            return
+        if self.fetcher is None:
+            raise FetchWaveError(
+                "hard_transport_policy: persistent fetcher ownership was lost"
+            )
         try:
-            self.stack.close()
-        finally:
-            self.fetcher = None
-            if self.session_id is not None:
-                try:
-                    control.close_clearance_session(
-                        self.session_id, status=status
+            if self.state == "control_open":
+                # Metering never started, so no provider or typed tail exists.
+                control.close_clearance_session(
+                    self.session_id, status="failed"
+                )
+                self.state = "control_closed"
+                self.needs_clearance = True
+                return
+            if self.state in {"meter_started", "active"}:
+                finalizer = getattr(
+                    self.fetcher, "finalize_metered_session", None
+                )
+                if not callable(finalizer):
+                    raise PipelineError(
+                        "FBref persistent fetcher must expose finalizer"
                     )
-                finally:
-                    self.session_id = None
-            self.needs_clearance = True
+                self.receipt = finalizer()
+                self.state = "provider_finalized"
+            if self.state == "provider_finalized":
+                if self.tail_reserved:
+                    self.tail_settlement = control.settle_clearance_session_tail(
+                        self.session_id, self.receipt
+                    )
+                    self.state = "tail_settled"
+                else:
+                    # begin_metered_session succeeded, but the durable tail
+                    # reservation did not. No socket admission was possible;
+                    # close the empty control session and let the already
+                    # reserved target budget be recovered by abort_run.
+                    control.close_clearance_session(
+                        self.session_id, status="failed"
+                    )
+                    self.state = "control_closed"
+                    self.needs_clearance = True
+                    return
+            if self.state == "tail_settled":
+                terminal = bool(
+                    (self.tail_settlement or {}).get("terminal")
+                )
+                control.close_clearance_session(
+                    self.session_id,
+                    status="failed" if terminal else status,
+                )
+                self.state = "control_closed"
+                if terminal:
+                    raise FetchWaveError(
+                        "hard_transport_policy: persistent tail exceeded "
+                        "the run safety circuit"
+                    )
+        except Exception as exc:
+            if isinstance(exc, FetchWaveError):
+                raise
+            raise FetchWaveError(
+                "hard_transport_policy: persistent session finalizer failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        self.needs_clearance = True
+
+    def close(self, control, *, status: str) -> None:
+        finalize_error = None
+        try:
+            self.finalize(control, status=status)
+        except Exception as exc:  # noqa: BLE001 - release only after closure
+            finalize_error = exc
+        releasable = self.state == "control_closed" or (
+            self.state == "idle" and self.session_id is None
+        )
+        if self.persistent_enabled and releasable:
+            try:
+                self.stack.close()
+            except Exception as exc:  # noqa: BLE001 - retain finalizer error
+                finalize_error = finalize_error or exc
+            self.fetcher = None
+            self.session_id = None
+        if finalize_error is not None:
+            raise finalize_error
 
 
 def _utcnow() -> datetime:
@@ -1583,6 +1738,29 @@ class FBrefPipeline:
             ),
         )
 
+    def _assert_persistent_profile(
+        self, run_id: str, settings: PipelineSettings
+    ) -> None:
+        run = self.control.get_run(run_id)
+        if run is None:
+            raise PipelineError(f"Unknown control run {run_id}")
+        metadata = run.get("metadata") or {}
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        if not isinstance(metadata, Mapping):
+            raise PipelineError("FBref control run metadata is invalid")
+        marker = metadata.get("persistent_http_session")
+        if marker is None:
+            if settings.persistent_http_session:
+                raise PipelineError(
+                    "Existing run has no persistent HTTP profile marker"
+                )
+            return
+        if not isinstance(marker, bool) or marker != settings.persistent_http_session:
+            raise PipelineError(
+                "Stored persistent HTTP profile differs from this worker"
+            )
+
     def initialize_run(
         self,
         *,
@@ -1613,6 +1791,7 @@ class FBrefPipeline:
             "target_request_reservation": (
                 settings.target_request_reservation
             ),
+            "persistent_http_session": settings.persistent_http_session,
         }
         extra_metadata = dict(execution_metadata or {})
         reserved = sorted(set(base_metadata) & set(extra_metadata))
@@ -1629,6 +1808,26 @@ class FBrefPipeline:
             metadata={**base_metadata, **extra_metadata},
         )
         self.control.start_run(run_id)
+        installed = self.control.get_run(run_id)
+        installed_metadata = (
+            installed.get("metadata") if isinstance(installed, Mapping) else None
+        )
+        if isinstance(installed_metadata, str):
+            installed_metadata = json.loads(installed_metadata)
+        marker = (
+            installed_metadata.get("persistent_http_session")
+            if isinstance(installed_metadata, Mapping)
+            else None
+        )
+        if marker is None:
+            if settings.persistent_http_session:
+                raise PipelineError(
+                    "Existing run has no persistent HTTP profile marker"
+                )
+        elif marker is not settings.persistent_http_session:
+            raise PipelineError(
+                "Stored persistent HTTP profile differs from this worker"
+            )
         return run_id
 
     def initialize_acceptance_run(
@@ -2075,6 +2274,95 @@ class FBrefPipeline:
             ),
         )
 
+    def _settle_live_page_evidence(
+        self,
+        *,
+        settings: PipelineSettings,
+        live_session: _LiveFetchSession,
+        lease,
+        reservation,
+        response,
+        compressed_raw_bytes: int,
+    ) -> int:
+        provider_value = getattr(response, "provider_billed_bytes", None)
+        http_wire_bytes = max(
+            0,
+            int(
+                getattr(
+                    response,
+                    "http_wire_bytes",
+                    getattr(response, "wire_bytes", 0),
+                )
+            ),
+        )
+        requests_used = int(response.http_requests) + int(
+            response.browser_requests
+        )
+        if settings.persistent_http_session:
+            if live_session.session_id is None or provider_value is None:
+                raise FetchWaveError(
+                    "hard_transport_policy: persistent page has no exact "
+                    "provider counter"
+                )
+            settled = self.control.settle_clearance_session_page(
+                live_session.session_id,
+                reservation.reservation_id,
+                attempt_id=lease.attempt_id,
+                requests_used=requests_used,
+                provider_billed_bytes=int(provider_value),
+                browser_bootstrap_attempts=(
+                    response.browser_bootstrap_attempts
+                ),
+                browser_bootstrap_requests=response.browser_requests,
+                browser_document_bytes=response.browser_document_bytes,
+                browser_asset_bytes=response.browser_asset_bytes,
+                browser_unobserved_bytes=response.browser_unobserved_bytes,
+                http_requests=response.http_requests,
+                http_wire_bytes=http_wire_bytes,
+                decoded_html_bytes=max(
+                    0, int(getattr(response, "decoded_html_bytes", 0))
+                ),
+                compressed_raw_bytes=max(0, int(compressed_raw_bytes)),
+            )
+            if bool(settled.get("budget_exceeded")):
+                raise BudgetExceeded(
+                    "Persistent page crossed the run safety circuit"
+                )
+            return int(provider_value)
+
+        billed = (
+            int(provider_value)
+            if provider_value is not None
+            else http_wire_bytes
+            + max(0, int(response.browser_document_bytes))
+            + max(0, int(response.browser_asset_bytes))
+            + max(0, int(response.browser_unobserved_bytes))
+        )
+        self.control.settle_budget(
+            reservation.reservation_id,
+            requests_used=requests_used,
+            bytes_used=billed,
+        )
+        if live_session.session_id is not None:
+            self.control.record_session_metrics(
+                live_session.session_id,
+                browser_bootstrap_requests=response.browser_requests,
+                browser_bootstrap_attempts=(
+                    response.browser_bootstrap_attempts
+                ),
+                browser_unobserved_bytes=response.browser_unobserved_bytes,
+                browser_document_bytes=response.browser_document_bytes,
+                browser_asset_bytes=response.browser_asset_bytes,
+                http_requests=response.http_requests,
+                http_wire_bytes=http_wire_bytes,
+                decoded_html_bytes=max(
+                    0, int(getattr(response, "decoded_html_bytes", 0))
+                ),
+                compressed_raw_bytes=max(0, int(compressed_raw_bytes)),
+                provider_billed_bytes=provider_value,
+            )
+        return billed
+
     def fetch_wave(
         self,
         run_id: str,
@@ -2088,6 +2376,7 @@ class FBrefPipeline:
 
         if settings.run_type == "replay":
             raise PipelineError("Replay mode cannot execute a fetch wave")
+        self._assert_persistent_profile(run_id, settings)
         result = WaveResult()
         historical = settings.run_type == "backfill"
         policies = (
@@ -2181,7 +2470,11 @@ class FBrefPipeline:
                 f"Claimed {len(leases)} of {result.cohort_size} cohort targets"
             )
         owns_session = _live_session is None
-        live_session = _live_session or _LiveFetchSession()
+        live_session = _live_session or _LiveFetchSession(
+            persistent_enabled=settings.persistent_http_session
+        )
+        if live_session.persistent_enabled != settings.persistent_http_session:
+            raise PipelineError("Live session persistent profile changed mid-run")
         try:
             for lease_index, lease in enumerate(leases):
                 # A wave owns the whole shard but processes it sequentially.
@@ -2195,6 +2488,7 @@ class FBrefPipeline:
                 target = self._page_target_for_lease(lease)
                 reservation = None
                 response = None
+                record = None
                 budget_settled = False
                 try:
                     # Exact logical-refresh crash recovery is always safe.
@@ -2254,7 +2548,30 @@ class FBrefPipeline:
                     self._wait_for_slot(slot.scheduled_at)
 
                     if live_session.needs_clearance:
-                        live_session.session_id = (
+                        if live_session.fetcher is None:
+                            live_session.fetcher = (
+                                live_session.stack.enter_context(
+                                    self.fetcher_factory(
+                                        settings.proxy_file,
+                                        clearance_requests,
+                                        clearance_bytes,
+                                    )
+                                )
+                            )
+                        fetcher_profile = getattr(
+                            live_session.fetcher,
+                            "persistent_http_session",
+                            False,
+                        )
+                        if (
+                            settings.persistent_http_session
+                            and fetcher_profile is not True
+                        ):
+                            raise PipelineError(
+                                "FBref fetcher does not match the persistent "
+                                "HTTP run profile"
+                            )
+                        opened_session_id = (
                             self.control.open_clearance_session(
                                 domain="fbref.com",
                                 session_version=FETCHER_VERSION,
@@ -2266,15 +2583,17 @@ class FBrefPipeline:
                                 metadata={"worker_id": worker_id},
                             )
                         )
-                        if live_session.fetcher is None:
-                            live_session.fetcher = (
-                                live_session.stack.enter_context(
-                                    self.fetcher_factory(
-                                        settings.proxy_file,
-                                        clearance_requests,
-                                        clearance_bytes,
-                                    )
-                                )
+                        if settings.persistent_http_session:
+                            live_session.attach_control_session(
+                                opened_session_id
+                            )
+                        else:
+                            live_session.session_id = opened_session_id
+                        if settings.persistent_http_session:
+                            live_session.begin_persistent(
+                                self.control,
+                                run_id=run_id,
+                                tail_bytes=settings.request_reservation_bytes,
                             )
                         prepare_clearance = getattr(
                             live_session.fetcher,
@@ -2333,44 +2652,15 @@ class FBrefPipeline:
                         transport_version=FETCHER_VERSION,
                         session_version=live_session.session_id,
                     )
-                    billed = (
-                        response.provider_billed_bytes
-                        if response.provider_billed_bytes is not None
-                        else response.http_wire_bytes
-                        + response.browser_document_bytes
-                        + response.browser_asset_bytes
-                        + response.browser_unobserved_bytes
-                    )
-                    self.control.settle_budget(
-                        reservation.reservation_id,
-                        requests_used=(
-                            response.http_requests + response.browser_requests
-                        ),
-                        bytes_used=billed,
+                    self._settle_live_page_evidence(
+                        settings=settings,
+                        live_session=live_session,
+                        lease=lease,
+                        reservation=reservation,
+                        response=response,
+                        compressed_raw_bytes=record.encoded_bytes,
                     )
                     budget_settled = True
-                    if live_session.session_id is not None:
-                        self.control.record_session_metrics(
-                            live_session.session_id,
-                            browser_bootstrap_requests=response.browser_requests,
-                            browser_bootstrap_attempts=(
-                                response.browser_bootstrap_attempts
-                            ),
-                            browser_unobserved_bytes=(
-                                response.browser_unobserved_bytes
-                            ),
-                            browser_document_bytes=(
-                                response.browser_document_bytes
-                            ),
-                            browser_asset_bytes=response.browser_asset_bytes,
-                            http_requests=response.http_requests,
-                            http_wire_bytes=response.http_wire_bytes,
-                            decoded_html_bytes=response.decoded_html_bytes,
-                            compressed_raw_bytes=record.encoded_bytes,
-                            provider_billed_bytes=(
-                                response.provider_billed_bytes
-                            ),
-                        )
                     self._complete_from_record(
                         lease, record, historical=historical
                     )
@@ -2410,40 +2700,23 @@ class FBrefPipeline:
                     )
                     break
                 except FetchError as exc:
-                    billed = (
-                        exc.provider_billed_bytes
-                        if exc.provider_billed_bytes is not None
-                        else max(0, int(exc.wire_bytes))
-                        + max(0, int(exc.browser_document_bytes))
-                        + max(0, int(exc.browser_asset_bytes))
-                        + max(0, int(exc.browser_unobserved_bytes))
-                    )
-                    if reservation is not None and not budget_settled:
-                        self.control.settle_budget(
-                            reservation.reservation_id,
-                            requests_used=(
-                                exc.http_requests + exc.browser_requests
-                            ),
-                            bytes_used=billed,
+                    if (
+                        reservation is not None
+                        and not budget_settled
+                        and (
+                            not settings.persistent_http_session
+                            or exc.provider_billed_bytes is not None
                         )
-                    if live_session.session_id is not None:
-                        self.control.record_session_metrics(
-                            live_session.session_id,
-                            browser_bootstrap_requests=exc.browser_requests,
-                            browser_bootstrap_attempts=(
-                                exc.browser_bootstrap_attempts
-                            ),
-                            browser_unobserved_bytes=(
-                                exc.browser_unobserved_bytes
-                            ),
-                            browser_document_bytes=(
-                                exc.browser_document_bytes
-                            ),
-                            browser_asset_bytes=exc.browser_asset_bytes,
-                            http_requests=exc.http_requests,
-                            http_wire_bytes=max(0, int(exc.wire_bytes)),
-                            provider_billed_bytes=exc.provider_billed_bytes,
+                    ):
+                        self._settle_live_page_evidence(
+                            settings=settings,
+                            live_session=live_session,
+                            lease=lease,
+                            reservation=reservation,
+                            response=exc,
+                            compressed_raw_bytes=0,
                         )
+                        budget_settled = True
                     if (
                         exc.browser_requests > 0
                         or exc.browser_bootstrap_attempts > 0
@@ -2521,6 +2794,13 @@ class FBrefPipeline:
                         )
                         live_session.consecutive_clearance_refreshes += 1
                         result.requeued_dead_clearance += 1
+                        if settings.persistent_http_session:
+                            # Page/failure evidence is durable above.  Close the
+                            # exact provider tail before budget math, reset, or
+                            # any attempt to acquire another paid lease.
+                            live_session.finalize(
+                                self.control, status="failed"
+                            )
                         run_after_failure = self.control.get_run(run_id)
                         if run_after_failure is None:
                             raise PipelineError(
@@ -2569,7 +2849,10 @@ class FBrefPipeline:
                                 requeue=True,
                                 **retry_evidence,
                             )
-                        if live_session.session_id is not None:
+                        if (
+                            not settings.persistent_http_session
+                            and live_session.session_id is not None
+                        ):
                             self.control.close_clearance_session(
                                 live_session.session_id,
                                 status="failed",
@@ -2711,28 +2994,70 @@ class FBrefPipeline:
                             transport_version=FETCHER_VERSION,
                             session_version=live_session.session_id,
                         )
+                        if settings.persistent_http_session:
+                            live_session.finalize(
+                                self.control, status="failed"
+                            )
+                            reset = getattr(
+                                live_session.fetcher,
+                                "reset_clearance",
+                                None,
+                            )
+                            if callable(reset):
+                                reset()
+                            else:
+                                live_session.stack.close()
+                                live_session.stack = ExitStack()
+                                live_session.fetcher = None
+                            live_session.needs_clearance = True
                         result.failures.append(
                             f"{lease.target_id}:{exc.error_class}"
                         )
                 except Exception as exc:
                     if reservation is not None and not budget_settled:
-                        self.control.settle_budget(
-                            reservation.reservation_id,
-                            requests_used=(
-                                0
-                                if response is None
-                                else response.http_requests
-                                + response.browser_requests
-                            ),
-                            bytes_used=(
-                                0
-                                if response is None
-                                else response.http_wire_bytes
-                                + response.browser_document_bytes
-                                + response.browser_asset_bytes
-                                + response.browser_unobserved_bytes
-                            ),
-                        )
+                        if (
+                            response is not None
+                            and (
+                                not settings.persistent_http_session
+                                or response.provider_billed_bytes is not None
+                            )
+                        ):
+                            # The response crossed the paid meter even when raw
+                            # storage raised. Install authoritative settlement
+                            # (and typed page evidence in persistent mode)
+                            # before recording the failed fetch attempt.
+                            self._settle_live_page_evidence(
+                                settings=settings,
+                                live_session=live_session,
+                                lease=lease,
+                                reservation=reservation,
+                                response=response,
+                                compressed_raw_bytes=(
+                                    0
+                                    if record is None
+                                    else record.encoded_bytes
+                                ),
+                            )
+                            budget_settled = True
+                        elif not settings.persistent_http_session:
+                            self.control.settle_budget(
+                                reservation.reservation_id,
+                                requests_used=(
+                                    0
+                                    if response is None
+                                    else response.http_requests
+                                    + response.browser_requests
+                                ),
+                                bytes_used=(
+                                    0
+                                    if response is None
+                                    else response.http_wire_bytes
+                                    + response.browser_document_bytes
+                                    + response.browser_asset_bytes
+                                    + response.browser_unobserved_bytes
+                                ),
+                            )
+                            budget_settled = True
                     self.control.fail_fetch(
                         lease,
                         error_class=type(exc).__name__,
@@ -2769,15 +3094,30 @@ class FBrefPipeline:
                             else live_session.session_id
                         ),
                     )
+                    if (
+                        settings.persistent_http_session
+                        and live_session.session_id is not None
+                        and live_session.state != "control_closed"
+                    ):
+                        live_session.finalize(
+                            self.control, status="failed"
+                        )
                     result.failures.append(
                         f"{lease.target_id}:{type(exc).__name__}"
                     )
+                    if settings.persistent_http_session:
+                        # Any unclassified failure may have left only
+                        # conservative target evidence. Stop before a second
+                        # paid session and let abort_run settle that reserve.
+                        break
         finally:
             if owns_session:
                 live_session.close(
                     self.control,
                     status="failed" if result.failures else "closed",
                 )
+                if settings.persistent_http_session and not result.failures:
+                    self.control.assert_persistent_metering_reconciled(run_id)
         if result.failures:
             raise FetchWaveError("; ".join(result.failures))
         return result
@@ -2814,7 +3154,13 @@ class FBrefPipeline:
         normalized_batches = _normalize_live_batch_count(max_batches)
 
         run = self.control.get_run(run_id)
+        self._assert_persistent_profile(run_id, settings)
         if run is not None and str(run.get("status") or "") == "failed":
+            if settings.persistent_http_session:
+                # An aborted/uncertain persistent session is conservative,
+                # not exact.  Reanimating that DagRun would allow a second
+                # paid lease before the old byte ledger can be reconciled.
+                self.control.assert_persistent_metering_reconciled(run_id)
             # ``airflow tasks clear -t run_live_waves`` re-runs only this
             # task, never initialize_run, so the #1102 reanimation must live
             # on the path every resume actually takes.  start_run itself
@@ -2822,7 +3168,9 @@ class FBrefPipeline:
             self.control.start_run(run_id)
 
         aggregate = LiveRunResult()
-        live_session = _LiveFetchSession()
+        live_session = _LiveFetchSession(
+            persistent_enabled=settings.persistent_http_session
+        )
         failed = True
         try:
             for batch in range(1, normalized_batches + 1):
@@ -2854,6 +3202,8 @@ class FBrefPipeline:
                 self.control,
                 status="failed" if failed else "closed",
             )
+            if settings.persistent_http_session and not failed:
+                self.control.assert_persistent_metering_reconciled(run_id)
 
     def _eligible_competitions(self) -> dict[str, dict]:
         return {
@@ -4806,6 +5156,23 @@ class FBrefPipeline:
         )
         if summary is None:
             raise RunValidationError(f"Unknown run {run_id}")
+        summary_metadata = summary.get("metadata") or {}
+        if isinstance(summary_metadata, str):
+            try:
+                summary_metadata = json.loads(summary_metadata)
+            except json.JSONDecodeError as exc:
+                raise RunValidationError(
+                    "persistent_http_profile_invalid"
+                ) from exc
+        if not isinstance(summary_metadata, Mapping):
+            raise RunValidationError("persistent_http_profile_invalid")
+        persistent_marker = summary_metadata.get(
+            "persistent_http_session"
+        )
+        if persistent_marker is True:
+            self.control.assert_persistent_metering_reconciled(run_id)
+        elif persistent_marker is not None and persistent_marker is not False:
+            raise RunValidationError("persistent_http_profile_invalid")
         target_counts = summary.get("target_counts") or {}
         # 'skipped' is a target the run deliberately did not fetch — it stopped
         # at its budget and handed the target back to the queue. That is the

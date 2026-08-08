@@ -17,6 +17,7 @@ from scrapers.fbref.proxy_lease import (
     FBrefProxyLease,
     FBrefProxyLeaseClient,
     FBrefProxyLeaseError,
+    METER_ID,
 )
 from scrapers.fbref.settings import (
     DEFAULT_BROWSER_BYTE_LIMIT_BYTES,
@@ -27,7 +28,7 @@ from scrapers.fbref.settings import (
 from scrapers.utils.proxy_manager import classify_error
 
 
-FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v7"
+FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v8"
 DEFAULT_BOOTSTRAP_URL = "https://fbref.com/en/"
 MAX_HTML_BYTES = DEFAULT_HTTP_BODY_LIMIT_BYTES
 # The browser cap bounds ONE clearance attempt; the run's reservation covers
@@ -277,6 +278,18 @@ class FetchResponse:
         object.__setattr__(self, "http_status_history", history)
 
 
+@dataclass(frozen=True)
+class PersistentMeteredSessionReceipt:
+    """Exact, non-secret evidence for one finalized clearance session."""
+
+    session_id: str
+    meter: str
+    baseline_provider_bytes: int
+    page_provider_bytes: int
+    authoritative_provider_bytes: int
+    tail_provider_bytes: int
+
+
 class FBrefFetcher:
     """Own one clearance lease and fetch every target through warm HTTP.
 
@@ -301,6 +314,7 @@ class FBrefFetcher:
         provider_max_bytes: Optional[int] = None,
         provider_lease_ttl_seconds: Optional[int] = None,
         lease_client: Optional[FBrefProxyLeaseClient] = None,
+        persistent_http_session: bool = False,
         sleep=time.sleep,
     ) -> None:
         self.bootstrap_url = bootstrap_url
@@ -332,6 +346,16 @@ class FBrefFetcher:
         self._provider_bootstrap_max_bytes = 0
         self._provider_bootstrap_spent_bytes = 0
         self._provider_http_ready = False
+        if not isinstance(persistent_http_session, bool):
+            raise ValueError("persistent_http_session must be boolean")
+        self.persistent_http_session = persistent_http_session
+        self._persistent_session_id: Optional[str] = None
+        self._persistent_baseline_provider_bytes = 0
+        self._persistent_page_cursor = 0
+        self._persistent_page_provider_bytes = 0
+        self._persistent_receipt: Optional[
+            PersistentMeteredSessionReceipt
+        ] = None
         self._clearance: Optional[dict] = None
         configured_control_url = str(
             proxy_control_url
@@ -406,6 +430,12 @@ class FBrefFetcher:
         return False
 
     def close(self) -> None:
+        if (
+            self.persistent_http_session
+            and self._persistent_session_id is not None
+            and self._persistent_receipt is None
+        ):
+            self.finalize_metered_session()
         close_error = None
         if self._http_session is not None:
             try:
@@ -428,6 +458,15 @@ class FBrefFetcher:
 
     def reset_clearance(self) -> None:
         """Drop a dead clearance and its sticky metered lease."""
+
+        if (
+            self.persistent_http_session
+            and self._persistent_session_id is not None
+            and self._persistent_receipt is None
+        ):
+            raise FBrefProxyLeaseError(
+                "FBref persistent session must be finalized before reset"
+            )
 
         if self._http_session is not None:
             try:
@@ -454,7 +493,36 @@ class FBrefFetcher:
         retained cookie only recreates the HTTP adapter and returns ``False``.
         """
 
-        return self._ensure_clearance()
+        if (
+            not self.persistent_http_session
+            or self._persistent_session_id is None
+            or self._persistent_receipt is not None
+        ):
+            return self._ensure_clearance()
+
+        before = int(self._persistent_page_cursor)
+        try:
+            return self._ensure_clearance()
+        except Exception as original:
+            try:
+                billed = self._persistent_page_checkpoint(close_tunnel=True)
+            except Exception as meter_error:
+                failure = self._provider_meter_failure(
+                    meter_error,
+                    original=original,
+                    before_provider_bytes=before,
+                )
+                if failure.provider_billed_bytes is not None:
+                    self._record_persistent_page_checkpoint()
+                raise failure from original
+            if isinstance(original, FetchError):
+                original.provider_billed_bytes = billed
+                raise
+            raise FetchError(
+                f"FBref clearance failed: {type(original).__name__}",
+                error_class="clearance_failed",
+                provider_billed_bytes=billed,
+            ) from original
 
     def _next_proxy(self) -> Optional[dict]:
         if self._lease_client is not None:
@@ -512,15 +580,30 @@ class FBrefFetcher:
         self._observe_provider_stats(stats)
         return stats
 
-    def _close_provider_lease(self) -> None:
+    def _close_provider_lease(self, *, strict: Optional[bool] = None) -> None:
         lease_client = getattr(self, "_lease_client", None)
         provider_lease = getattr(self, "_provider_lease", None)
         if lease_client is None or provider_lease is None:
             return
         lease = provider_lease
-        stats = lease_client.close(
-            lease,
-            expected=self._provider_context,
+        strict_close = (
+            bool(strict)
+            if strict is not None
+            else bool(
+                self.persistent_http_session
+                and self._persistent_session_id is not None
+            )
+        )
+        stats = (
+            lease_client.close_strict(
+                lease,
+                expected=self._provider_context,
+            )
+            if strict_close
+            else lease_client.close(
+                lease,
+                expected=self._provider_context,
+            )
         )
         self._observe_provider_stats(stats)
         # Clear ownership only after close + authoritative observation both
@@ -606,6 +689,129 @@ class FBrefFetcher:
             finally:
                 self._http_session = None
         self._wait_and_observe_provider()
+
+    def begin_metered_session(self, session_id: str) -> int:
+        """Capture the cumulative provider baseline before browser traffic."""
+
+        identity = str(session_id).strip()
+        if not identity:
+            raise ValueError("session_id must not be empty")
+        if not self.persistent_http_session or self._lease_client is None:
+            raise FBrefProxyLeaseError(
+                "FBref persistent metering is not enabled for this fetcher"
+            )
+        if self._persistent_session_id is not None:
+            if self._persistent_session_id == identity:
+                return self._persistent_baseline_provider_bytes
+            if self._persistent_receipt is None:
+                raise FBrefProxyLeaseError(
+                    "Previous FBref persistent session is not finalized"
+                )
+        baseline = int(self._provider_total_bytes)
+        self._persistent_session_id = identity
+        self._persistent_baseline_provider_bytes = baseline
+        self._persistent_page_cursor = baseline
+        self._persistent_page_provider_bytes = 0
+        self._persistent_receipt = None
+        return baseline
+
+    def _persistent_page_checkpoint(self, *, close_tunnel: bool) -> int:
+        if (
+            self._persistent_session_id is None
+            or self._persistent_receipt is not None
+        ):
+            raise FBrefProxyLeaseError("FBref persistent session is not active")
+        if close_tunnel:
+            close_error = None
+            if self._http_session is not None:
+                try:
+                    self._http_session.close()
+                except Exception as exc:  # noqa: BLE001 - revoke regardless
+                    close_error = exc
+                finally:
+                    self._http_session = None
+            if self._transport is not None:
+                try:
+                    self._transport.close()
+                except Exception as exc:  # noqa: BLE001 - revoke regardless
+                    close_error = close_error or exc
+            try:
+                self._close_provider_lease(strict=True)
+            except Exception as exc:  # noqa: BLE001 - preserve ownership
+                close_error = close_error or exc
+            if close_error is not None:
+                raise close_error
+        else:
+            if self._provider_lease is None or self._lease_client is None:
+                raise FBrefProxyLeaseError(
+                    "FBref persistent page has no active paid tunnel"
+                )
+            stats = self._lease_client.wait_idle(
+                self._provider_lease,
+                expected=self._provider_context,
+                expected_tunnels=1,
+            )
+            self._observe_provider_stats(stats)
+        return self._record_persistent_page_checkpoint()
+
+    def _record_persistent_page_checkpoint(self) -> int:
+        current = int(self._provider_total_bytes)
+        delta = current - int(self._persistent_page_cursor)
+        if delta < 0:
+            raise FBrefProxyLeaseError(
+                "FBref persistent provider counter moved backwards"
+            )
+        self._persistent_page_cursor = current
+        self._persistent_page_provider_bytes += delta
+        return delta
+
+    def finalize_metered_session(self) -> PersistentMeteredSessionReceipt:
+        """Close provider ownership and return retry-stable exact evidence."""
+
+        if self._persistent_receipt is not None:
+            return self._persistent_receipt
+        if self._persistent_session_id is None:
+            raise FBrefProxyLeaseError("FBref persistent session was not started")
+
+        close_error = None
+        if self._http_session is not None:
+            try:
+                self._http_session.close()
+            except Exception as exc:  # noqa: BLE001 - still revoke provider
+                close_error = exc
+            finally:
+                self._http_session = None
+        if self._transport is not None:
+            try:
+                self._transport.close()
+            except Exception as exc:  # noqa: BLE001 - still revoke provider
+                close_error = close_error or exc
+        try:
+            self._close_provider_lease(strict=True)
+        except Exception as exc:  # noqa: BLE001 - ownership remains on failure
+            close_error = close_error or exc
+        if close_error is not None:
+            raise close_error
+
+        authoritative = (
+            int(self._provider_total_bytes)
+            - int(self._persistent_baseline_provider_bytes)
+        )
+        page_bytes = int(self._persistent_page_provider_bytes)
+        tail = authoritative - page_bytes
+        if authoritative < 0 or tail < 0:
+            raise FBrefProxyLeaseError(
+                "FBref persistent session counters do not reconcile"
+            )
+        self._persistent_receipt = PersistentMeteredSessionReceipt(
+            session_id=self._persistent_session_id,
+            meter=METER_ID,
+            baseline_provider_bytes=self._persistent_baseline_provider_bytes,
+            page_provider_bytes=page_bytes,
+            authoritative_provider_bytes=authoritative,
+            tail_provider_bytes=tail,
+        )
+        return self._persistent_receipt
 
     @staticmethod
     def _proxy_url(proxy: Optional[Mapping[str, str]]) -> Optional[str]:
@@ -1408,6 +1614,68 @@ class FBrefFetcher:
             **values,
         )
 
+    def _fetch_persistent_metered(
+        self,
+        url: str,
+        *,
+        page_kind: str,
+        etag: Optional[str],
+        last_modified: Optional[str],
+    ) -> FetchResponse:
+        if self._persistent_session_id is None or self._persistent_receipt is not None:
+            raise FBrefProxyLeaseError(
+                "FBref persistent fetch requires an active metered session"
+            )
+        before = int(self._persistent_page_cursor)
+        try:
+            response = self._fetch_without_provider_meter(
+                url,
+                page_kind=page_kind,
+                etag=etag,
+                last_modified=last_modified,
+            )
+        except Exception as original:
+            try:
+                billed = self._persistent_page_checkpoint(close_tunnel=True)
+            except Exception as meter_error:
+                failure = self._provider_meter_failure(
+                    meter_error,
+                    original=original,
+                    before_provider_bytes=before,
+                )
+                if failure.provider_billed_bytes is not None:
+                    self._record_persistent_page_checkpoint()
+                raise failure from original
+            if isinstance(original, FetchError):
+                original.provider_billed_bytes = billed
+                raise
+            raise FetchError(
+                f"FBref transport failed: {type(original).__name__}",
+                error_class="transport_internal_error",
+                provider_billed_bytes=billed,
+            ) from original
+
+        try:
+            billed = self._persistent_page_checkpoint(close_tunnel=False)
+        except Exception as meter_error:
+            # The strict close is the only recovery that can turn a failed idle
+            # proof into an exact terminal counter. Close curl before asking the
+            # filter to revoke the provider side.
+            if self._http_session is not None:
+                try:
+                    self._http_session.close()
+                finally:
+                    self._http_session = None
+            failure = self._provider_meter_failure(
+                meter_error,
+                original=response,
+                before_provider_bytes=before,
+            )
+            if failure.provider_billed_bytes is not None:
+                self._record_persistent_page_checkpoint()
+            raise failure from meter_error
+        return replace(response, provider_billed_bytes=billed)
+
     def fetch(
         self,
         url: str,
@@ -1420,6 +1688,13 @@ class FBrefFetcher:
 
         if getattr(self, "_lease_client", None) is None:
             return self._fetch_without_provider_meter(
+                url,
+                page_kind=page_kind,
+                etag=etag,
+                last_modified=last_modified,
+            )
+        if self.persistent_http_session:
+            return self._fetch_persistent_metered(
                 url,
                 page_kind=page_kind,
                 etag=etag,
@@ -1481,5 +1756,6 @@ __all__ = [
     "FetchResponse",
     "MAX_HTML_BYTES",
     "MAX_TARGET_HTTP_ATTEMPTS",
+    "PersistentMeteredSessionReceipt",
     "RETRYABLE_HTTP_STATUSES",
 ]

@@ -241,6 +241,17 @@ class TestComposeFile:
         ):
             assert stale_flag not in command
 
+    def test_fbref_persistent_http_session_is_explicitly_default_off(self):
+        cfg = _compose_config_json()
+
+        assert cfg["services"]["airflow-scheduler"]["environment"][
+            "FBREF_PERSISTENT_HTTP_SESSION"
+        ] == "0"
+        env_example = (PROJECT_ROOT / ".env.example").read_text(
+            encoding="utf-8"
+        )
+        assert env_example.count("FBREF_PERSISTENT_HTTP_SESSION=0") == 1
+
     def test_required_bi_catalog_services_present(self):
         cfg = _compose_config_json()
         services = cfg.get("services", {})

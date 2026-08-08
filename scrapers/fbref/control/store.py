@@ -263,6 +263,15 @@ def make_budget_reservation_id(attempt_id: object) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"fbref-budget:{attempt}"))
 
 
+def make_clearance_tail_reservation_id(session_id: object) -> str:
+    """Return the retry-stable zero-request tail reservation identity."""
+
+    session = str(uuid.UUID(str(session_id)))
+    return str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"fbref-clearance-tail:{session}")
+    )
+
+
 def make_frontier_provenance_id(
     *,
     parent_target_id: object,
@@ -324,6 +333,12 @@ def _non_negative(value: object, name: str) -> int:
 
 def _json(value: Optional[Mapping[str, Any]]) -> str:
     return json.dumps(dict(value or {}), sort_keys=True, separators=(",", ":"))
+
+
+def _evidence_sha256(value: Mapping[str, Any]) -> str:
+    """Hash one immutable evidence object using the control JSON encoding."""
+
+    return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
 
 
 def _json_mapping(value: object, name: str) -> dict[str, Any]:
@@ -2989,6 +3004,208 @@ class ControlStore:
             if settled is None:
                 raise StateConflict(f"Reservation {reservation} lost settlement race")
             return _budget_from_row(settled)
+
+    def reserve_clearance_session_tail(
+        self,
+        run_id: object,
+        session_id: object,
+        *,
+        bytes_reserved: int,
+        baseline_provider_bytes: int,
+    ) -> dict:
+        """Reserve a retry-stable zero-request allowance for one session tail.
+
+        The run row serializes orphan detection with all later persistent
+        settlement paths.  A process may never open a second paid session
+        while another tail is still unresolved.
+        """
+
+        run = _uuid(run_id, "run_id")
+        session = _uuid(session_id, "session_id")
+        byte_count = _non_negative(bytes_reserved, "bytes_reserved")
+        if byte_count == 0:
+            raise ValueError("bytes_reserved must be positive")
+        baseline = _non_negative(
+            baseline_provider_bytes, "baseline_provider_bytes"
+        )
+        reservation = make_clearance_tail_reservation_id(session)
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.crawl_run
+                WHERE run_id = %s FOR UPDATE
+                """,
+                (run,),
+            )
+            crawl_run = _fetchone(cursor)
+            if crawl_run is None or crawl_run["status"] != "running":
+                raise StateConflict(f"Run {run} is not running")
+
+            cursor.execute(
+                """
+                SELECT session_id
+                FROM fbref_control.clearance_session
+                WHERE run_id = %s AND status = 'active'
+                  AND session_id <> %s
+                ORDER BY session_id
+                LIMIT 1
+                """,
+                (run, session),
+            )
+            active_predecessor = _fetchone(cursor)
+            if active_predecessor is not None:
+                raise StateConflict(
+                    "Another persistent clearance session is still active "
+                    f"for run {run}"
+                )
+
+            # Discovery is safe under the already-held run lock: every writer
+            # of a tail for this run takes that same lock first.
+            cursor.execute(
+                """
+                SELECT session_id
+                FROM fbref_control.clearance_session_tail_reservation
+                WHERE run_id = %s AND status = 'reserved'
+                  AND session_id <> %s
+                ORDER BY session_id
+                LIMIT 1
+                """,
+                (run, session),
+            )
+            orphan = _fetchone(cursor)
+            if orphan is not None:
+                raise StateConflict(
+                    "Another persistent clearance tail is unresolved for run "
+                    f"{run}"
+                )
+
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.budget_reservation
+                WHERE reservation_id = %s FOR UPDATE
+                """,
+                (reservation,),
+            )
+            budget_row = _fetchone(cursor)
+            cursor.execute(
+                """
+                SELECT run_id, status
+                FROM fbref_control.clearance_session
+                WHERE session_id = %s FOR UPDATE
+                """,
+                (session,),
+            )
+            clearance = _fetchone(cursor)
+            cursor.execute(
+                """
+                SELECT *
+                FROM fbref_control.clearance_session_tail_reservation
+                WHERE session_id = %s FOR UPDATE
+                """,
+                (session,),
+            )
+            tail = _fetchone(cursor)
+            clearance_run = (
+                None
+                if clearance is None or clearance["run_id"] is None
+                else str(clearance["run_id"])
+            )
+            exact_terminal_retry = bool(
+                clearance is not None
+                and tail is not None
+                and budget_row is not None
+                and tail["status"] == "settled"
+                and budget_row["status"] == "settled"
+            )
+            if (
+                clearance is None
+                or clearance_run != run
+                or (
+                    clearance["status"] != "active"
+                    and not exact_terminal_retry
+                )
+            ):
+                raise StateConflict(
+                    f"Clearance session {session} is not active for run {run}"
+                )
+
+            if budget_row is None:
+                projected_bytes = (
+                    int(crawl_run["bytes_used"])
+                    + int(crawl_run["bytes_reserved"])
+                    + byte_count
+                )
+                if projected_bytes > int(crawl_run["byte_limit"]):
+                    raise BudgetExceeded(
+                        f"Run {run} budget cannot reserve {byte_count} tail bytes"
+                    )
+                cursor.execute(
+                    """
+                    INSERT INTO fbref_control.budget_reservation (
+                        reservation_id, run_id, logical_refresh_id,
+                        requests_reserved, bytes_reserved
+                    ) VALUES (%s, %s, %s, 0, %s)
+                    RETURNING *
+                    """,
+                    (reservation, run, session, byte_count),
+                )
+                budget_row = _fetchone(cursor)
+                if budget_row is None:
+                    raise ControlStoreError(
+                        "Tail budget reservation insert returned no row"
+                    )
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.crawl_run
+                    SET bytes_reserved = bytes_reserved + %s,
+                        updated_at = clock_timestamp()
+                    WHERE run_id = %s
+                    """,
+                    (byte_count, run),
+                )
+                if cursor.rowcount != 1:
+                    raise StateConflict(
+                        f"Run {run} lost tail reservation update"
+                    )
+            else:
+                installed = _budget_from_row(budget_row)
+                if (
+                    installed.run_id != run
+                    or installed.logical_refresh_id != session
+                    or installed.requests_reserved != 0
+                    or installed.bytes_reserved != byte_count
+                ):
+                    raise StateConflict(
+                        f"Session {session} has a different tail reservation"
+                    )
+
+            if tail is None:
+                cursor.execute(
+                    """
+                    INSERT INTO
+                        fbref_control.clearance_session_tail_reservation (
+                        session_id, run_id, reservation_id,
+                        baseline_provider_bytes, bytes_reserved
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (session, run, reservation, baseline, byte_count),
+                )
+                tail = _fetchone(cursor)
+                if tail is None:
+                    raise ControlStoreError(
+                        "Tail reservation evidence insert returned no row"
+                    )
+            elif (
+                str(tail["run_id"]) != run
+                or str(tail["reservation_id"]) != reservation
+                or int(tail["baseline_provider_bytes"]) != baseline
+                or int(tail["bytes_reserved"]) != byte_count
+            ):
+                raise StateConflict(
+                    f"Session {session} has different tail evidence"
+                )
+            return dict(tail)
 
     def create_registry_snapshot(
         self,
@@ -8126,15 +8343,56 @@ class ControlStore:
             cursor.execute(
                 """
                 SELECT * FROM fbref_control.budget_reservation
-                WHERE run_id = %s AND status = 'reserved'
+                WHERE run_id = %s
                 ORDER BY reservation_id
                 FOR UPDATE
                 """,
                 (run,),
             )
             reserved_rows = _fetchall(cursor)
+            cursor.execute(
+                """
+                SELECT session_id
+                FROM fbref_control.clearance_session
+                WHERE run_id = %s
+                ORDER BY session_id
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            _fetchall(cursor)
+            cursor.execute(
+                """
+                SELECT session_id
+                FROM fbref_control.clearance_session_tail_reservation
+                WHERE run_id = %s
+                ORDER BY session_id
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            _fetchall(cursor)
+            cursor.execute(
+                """
+                SELECT reservation_id
+                FROM fbref_control.clearance_session_page_accounting
+                WHERE run_id = %s
+                ORDER BY reservation_id
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            _fetchall(cursor)
             reservations_settled = self._settle_reserved_rows_conservatively(
                 cursor, reserved_rows
+            )
+            cursor.execute(
+                """
+                UPDATE fbref_control.clearance_session_tail_reservation
+                SET status = 'aborted'
+                WHERE run_id = %s AND status = 'reserved'
+                """,
+                (run,),
             )
             cursor.execute(
                 """
@@ -9143,6 +9401,324 @@ class ControlStore:
                 raise StateConflict(f"session_id {session} has different evidence")
         return session
 
+    def settle_clearance_session_page(
+        self,
+        session_id: object,
+        reservation_id: object,
+        *,
+        attempt_id: object,
+        requests_used: int,
+        provider_billed_bytes: int,
+        browser_bootstrap_attempts: int = 0,
+        browser_bootstrap_requests: int = 0,
+        browser_document_bytes: int = 0,
+        browser_asset_bytes: int = 0,
+        browser_unobserved_bytes: int = 0,
+        http_requests: int = 0,
+        http_wire_bytes: int = 0,
+        decoded_html_bytes: int = 0,
+        compressed_raw_bytes: int = 0,
+    ) -> dict:
+        """Install page evidence and settle its budget exactly once."""
+
+        session = _uuid(session_id, "session_id")
+        reservation = _uuid(reservation_id, "reservation_id")
+        attempt = _uuid(attempt_id, "attempt_id")
+        values = {
+            "requests_used": _non_negative(requests_used, "requests_used"),
+            "browser_bootstrap_attempts": _non_negative(
+                browser_bootstrap_attempts, "browser_bootstrap_attempts"
+            ),
+            "browser_bootstrap_requests": _non_negative(
+                browser_bootstrap_requests, "browser_bootstrap_requests"
+            ),
+            "browser_document_bytes": _non_negative(
+                browser_document_bytes, "browser_document_bytes"
+            ),
+            "browser_asset_bytes": _non_negative(
+                browser_asset_bytes, "browser_asset_bytes"
+            ),
+            "browser_unobserved_bytes": _non_negative(
+                browser_unobserved_bytes, "browser_unobserved_bytes"
+            ),
+            "http_requests": _non_negative(http_requests, "http_requests"),
+            "http_wire_bytes": _non_negative(
+                http_wire_bytes, "http_wire_bytes"
+            ),
+            "decoded_html_bytes": _non_negative(
+                decoded_html_bytes, "decoded_html_bytes"
+            ),
+            "compressed_raw_bytes": _non_negative(
+                compressed_raw_bytes, "compressed_raw_bytes"
+            ),
+            "provider_billed_bytes": _non_negative(
+                provider_billed_bytes, "provider_billed_bytes"
+            ),
+        }
+        if values["requests_used"] != (
+            values["browser_bootstrap_requests"] + values["http_requests"]
+        ):
+            raise ValueError(
+                "requests_used must equal browser plus HTTP requests"
+            )
+        immutable = {
+            "session_id": session,
+            "reservation_id": reservation,
+            "attempt_id": attempt,
+            **values,
+        }
+        digest = _evidence_sha256(immutable)
+
+        with self._transaction() as cursor:
+            # Discover only; every mutation below follows the global lock order.
+            cursor.execute(
+                """
+                SELECT run_id
+                FROM fbref_control.budget_reservation
+                WHERE reservation_id = %s
+                """,
+                (reservation,),
+            )
+            discovered = _fetchone(cursor)
+            if discovered is None:
+                raise StateConflict(f"Unknown budget reservation {reservation}")
+            run = str(discovered["run_id"])
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.crawl_run
+                WHERE run_id = %s FOR UPDATE
+                """,
+                (run,),
+            )
+            crawl_run = _fetchone(cursor)
+            if crawl_run is None:
+                raise StateConflict(f"Unknown run {run}")
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.budget_reservation
+                WHERE reservation_id = %s FOR UPDATE
+                """,
+                (reservation,),
+            )
+            budget_row = _fetchone(cursor)
+            if budget_row is None or str(budget_row["run_id"]) != run:
+                raise StateConflict(
+                    f"Reservation {reservation} changed owning run"
+                )
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.clearance_session
+                WHERE session_id = %s FOR UPDATE
+                """,
+                (session,),
+            )
+            clearance = _fetchone(cursor)
+            if clearance is None or str(clearance.get("run_id")) != run:
+                raise StateConflict(
+                    f"Clearance session {session} belongs to another run"
+                )
+            cursor.execute(
+                """
+                SELECT *
+                FROM fbref_control.clearance_session_tail_reservation
+                WHERE session_id = %s FOR UPDATE
+                """,
+                (session,),
+            )
+            tail = _fetchone(cursor)
+            if tail is None or str(tail["run_id"]) != run:
+                raise StateConflict(
+                    f"Clearance session {session} has no tail reservation"
+                )
+
+            cursor.execute(
+                """
+                SELECT reservation_id, session_id, run_id, attempt_id,
+                       evidence_sha256
+                FROM fbref_control.clearance_session_page_accounting
+                WHERE reservation_id = %s OR attempt_id = %s
+                ORDER BY reservation_id
+                FOR UPDATE
+                """,
+                (reservation, attempt),
+            )
+            installed_rows = _fetchall(cursor)
+            if installed_rows:
+                if len(installed_rows) != 1:
+                    raise StateConflict("Persistent page evidence is duplicated")
+                installed = installed_rows[0]
+                if (
+                    str(installed["reservation_id"]) != reservation
+                    or str(installed["session_id"]) != session
+                    or str(installed["run_id"]) != run
+                    or str(installed["attempt_id"]) != attempt
+                    or str(installed["evidence_sha256"]) != digest
+                    or str(budget_row["status"]) != "settled"
+                    or int(budget_row["requests_used"]) != values["requests_used"]
+                    or int(budget_row["bytes_used"])
+                    != values["provider_billed_bytes"]
+                ):
+                    raise StateConflict(
+                        f"Reservation {reservation} was settled differently"
+                    )
+                return {
+                    **immutable,
+                    "run_id": run,
+                    "evidence_sha256": digest,
+                    "idempotent": True,
+                    "budget_exceeded": bool(crawl_run["budget_exceeded"]),
+                }
+
+            if clearance["status"] != "active" or tail["status"] != "reserved":
+                raise StateConflict(
+                    f"Clearance session {session} is not open for page settlement"
+                )
+            if budget_row["status"] != "reserved":
+                raise StateConflict(
+                    f"Reservation {reservation} has no page evidence"
+                )
+            cursor.execute(
+                """
+                SELECT run_id, reservation_id
+                FROM fbref_control.fetch_attempt
+                WHERE attempt_id = %s
+                """,
+                (attempt,),
+            )
+            attempt_row = _fetchone(cursor)
+            if (
+                attempt_row is None
+                or str(attempt_row["run_id"]) != run
+                or str(attempt_row.get("reservation_id")) != reservation
+            ):
+                raise StateConflict(
+                    f"Attempt {attempt} is not bound to reservation {reservation}"
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO fbref_control.clearance_session_page_accounting (
+                    reservation_id, session_id, run_id, attempt_id,
+                    requests_used, browser_bootstrap_attempts,
+                    browser_bootstrap_requests, browser_document_bytes,
+                    browser_asset_bytes, browser_unobserved_bytes,
+                    http_requests, http_wire_bytes, decoded_html_bytes,
+                    compressed_raw_bytes, provider_billed_bytes,
+                    evidence_sha256
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                """,
+                (
+                    reservation,
+                    session,
+                    run,
+                    attempt,
+                    values["requests_used"],
+                    values["browser_bootstrap_attempts"],
+                    values["browser_bootstrap_requests"],
+                    values["browser_document_bytes"],
+                    values["browser_asset_bytes"],
+                    values["browser_unobserved_bytes"],
+                    values["http_requests"],
+                    values["http_wire_bytes"],
+                    values["decoded_html_bytes"],
+                    values["compressed_raw_bytes"],
+                    values["provider_billed_bytes"],
+                    digest,
+                ),
+            )
+            cursor.execute(
+                """
+                UPDATE fbref_control.budget_reservation
+                SET status = 'settled', requests_used = %s, bytes_used = %s,
+                    settled_at = clock_timestamp()
+                WHERE reservation_id = %s AND status = 'reserved'
+                """,
+                (
+                    values["requests_used"],
+                    values["provider_billed_bytes"],
+                    reservation,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(
+                    f"Reservation {reservation} lost page settlement race"
+                )
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET requests_reserved = requests_reserved - %s,
+                    bytes_reserved = bytes_reserved - %s,
+                    requests_used = requests_used + %s,
+                    bytes_used = bytes_used + %s,
+                    budget_exceeded = budget_exceeded
+                        OR requests_used + %s > request_limit
+                        OR bytes_used + %s > byte_limit,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s
+                  AND requests_reserved >= %s
+                  AND bytes_reserved >= %s
+                RETURNING budget_exceeded
+                """,
+                (
+                    int(budget_row["requests_reserved"]),
+                    int(budget_row["bytes_reserved"]),
+                    values["requests_used"],
+                    values["provider_billed_bytes"],
+                    values["requests_used"],
+                    values["provider_billed_bytes"],
+                    run,
+                    int(budget_row["requests_reserved"]),
+                    int(budget_row["bytes_reserved"]),
+                ),
+            )
+            run_after = _fetchone(cursor)
+            if run_after is None:
+                raise StateConflict(f"Run {run} disappeared during settlement")
+            cursor.execute(
+                """
+                UPDATE fbref_control.clearance_session
+                SET browser_bootstrap_attempts =
+                        browser_bootstrap_attempts + %s,
+                    browser_bootstrap_requests =
+                        browser_bootstrap_requests + %s,
+                    browser_document_bytes = browser_document_bytes + %s,
+                    browser_asset_bytes = browser_asset_bytes + %s,
+                    browser_unobserved_bytes =
+                        browser_unobserved_bytes + %s,
+                    http_requests = http_requests + %s,
+                    http_wire_bytes = http_wire_bytes + %s,
+                    decoded_html_bytes = decoded_html_bytes + %s,
+                    compressed_raw_bytes = compressed_raw_bytes + %s
+                WHERE session_id = %s AND status = 'active'
+                """,
+                (
+                    values["browser_bootstrap_attempts"],
+                    values["browser_bootstrap_requests"],
+                    values["browser_document_bytes"],
+                    values["browser_asset_bytes"],
+                    values["browser_unobserved_bytes"],
+                    values["http_requests"],
+                    values["http_wire_bytes"],
+                    values["decoded_html_bytes"],
+                    values["compressed_raw_bytes"],
+                    session,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(
+                    f"Clearance session {session} lost page settlement race"
+                )
+            return {
+                **immutable,
+                "run_id": run,
+                "evidence_sha256": digest,
+                "idempotent": False,
+                "budget_exceeded": bool(run_after["budget_exceeded"]),
+            }
+
     def record_session_metrics(
         self,
         session_id: object,
@@ -9207,6 +9783,381 @@ class ControlStore:
             if row is None:
                 raise StateConflict(f"Clearance session {session} is not active")
             return row
+
+    def settle_clearance_session_tail(
+        self,
+        session_id: object,
+        receipt: object,
+    ) -> dict:
+        """Install one strict-close receipt and settle its exact tail once."""
+
+        session = _uuid(session_id, "session_id")
+        names = (
+            "session_id",
+            "meter",
+            "baseline_provider_bytes",
+            "page_provider_bytes",
+            "authoritative_provider_bytes",
+            "tail_provider_bytes",
+        )
+        if isinstance(receipt, Mapping):
+            supplied = {name: receipt.get(name) for name in names}
+        else:
+            supplied = {name: getattr(receipt, name, None) for name in names}
+        if _uuid(supplied["session_id"], "receipt.session_id") != session:
+            raise StateConflict("Persistent receipt belongs to another session")
+        if str(supplied["meter"] or "") != "proxy_filter_provider_path_v2":
+            raise StateConflict("Persistent receipt has an unsupported meter")
+        values = {
+            name: _non_negative(supplied[name], name)
+            for name in names[2:]
+        }
+        if values["authoritative_provider_bytes"] != (
+            values["page_provider_bytes"] + values["tail_provider_bytes"]
+        ):
+            raise StateConflict("Persistent receipt byte equation is invalid")
+        immutable = {
+            "session_id": session,
+            "meter": "proxy_filter_provider_path_v2",
+            **values,
+        }
+        digest = _evidence_sha256(immutable)
+
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT run_id, reservation_id
+                FROM fbref_control.clearance_session_tail_reservation
+                WHERE session_id = %s
+                """,
+                (session,),
+            )
+            discovered = _fetchone(cursor)
+            if discovered is None:
+                raise StateConflict(
+                    f"Clearance session {session} has no tail reservation"
+                )
+            run = str(discovered["run_id"])
+            reservation = str(discovered["reservation_id"])
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.crawl_run
+                WHERE run_id = %s FOR UPDATE
+                """,
+                (run,),
+            )
+            crawl_run = _fetchone(cursor)
+            if crawl_run is None:
+                raise StateConflict(f"Unknown run {run}")
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.budget_reservation
+                WHERE reservation_id = %s FOR UPDATE
+                """,
+                (reservation,),
+            )
+            budget_row = _fetchone(cursor)
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.clearance_session
+                WHERE session_id = %s FOR UPDATE
+                """,
+                (session,),
+            )
+            clearance = _fetchone(cursor)
+            cursor.execute(
+                """
+                SELECT *
+                FROM fbref_control.clearance_session_tail_reservation
+                WHERE session_id = %s FOR UPDATE
+                """,
+                (session,),
+            )
+            tail = _fetchone(cursor)
+            if (
+                budget_row is None
+                or clearance is None
+                or tail is None
+                or str(budget_row["run_id"]) != run
+                or str(clearance.get("run_id")) != run
+                or str(tail["run_id"]) != run
+                or str(tail["reservation_id"]) != reservation
+            ):
+                raise StateConflict(
+                    f"Clearance session {session} tail ownership changed"
+                )
+            cursor.execute(
+                """
+                SELECT reservation_id, provider_billed_bytes
+                FROM fbref_control.clearance_session_page_accounting
+                WHERE session_id = %s
+                ORDER BY reservation_id
+                FOR UPDATE
+                """,
+                (session,),
+            )
+            pages = _fetchall(cursor)
+            durable_page_sum = sum(
+                int(row["provider_billed_bytes"]) for row in pages
+            )
+            if durable_page_sum != values["page_provider_bytes"]:
+                raise StateConflict(
+                    "Persistent receipt page sum differs from durable evidence"
+                )
+            if int(tail["baseline_provider_bytes"]) != values[
+                "baseline_provider_bytes"
+            ]:
+                raise StateConflict(
+                    "Persistent receipt baseline differs from reservation"
+                )
+
+            if tail["status"] == "settled":
+                if (
+                    budget_row["status"] != "settled"
+                    or int(budget_row["requests_used"]) != 0
+                    or int(budget_row["bytes_used"])
+                    != values["tail_provider_bytes"]
+                    or int(tail["page_provider_bytes"])
+                    != values["page_provider_bytes"]
+                    or int(tail["authoritative_provider_bytes"])
+                    != values["authoritative_provider_bytes"]
+                    or int(tail["tail_provider_bytes"])
+                    != values["tail_provider_bytes"]
+                    or str(tail["settlement_sha256"]) != digest
+                    or int(clearance["provider_billed_bytes"])
+                    != values["authoritative_provider_bytes"]
+                ):
+                    raise StateConflict(
+                        f"Clearance session {session} tail was settled differently"
+                    )
+                return {
+                    **immutable,
+                    "run_id": run,
+                    "reservation_id": reservation,
+                    "settlement_sha256": digest,
+                    "idempotent": True,
+                    "terminal": bool(crawl_run["budget_exceeded"]),
+                }
+            if tail["status"] != "reserved":
+                raise StateConflict(
+                    f"Clearance session {session} tail is not settleable"
+                )
+            if clearance["status"] != "active":
+                raise StateConflict(
+                    f"Clearance session {session} closed before exact settlement"
+                )
+            if budget_row["status"] != "reserved":
+                raise StateConflict(
+                    f"Tail reservation {reservation} was settled without evidence"
+                )
+
+            cursor.execute(
+                """
+                UPDATE fbref_control.budget_reservation
+                SET status = 'settled', requests_used = 0, bytes_used = %s,
+                    settled_at = clock_timestamp()
+                WHERE reservation_id = %s AND status = 'reserved'
+                """,
+                (values["tail_provider_bytes"], reservation),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(
+                    f"Tail reservation {reservation} lost settlement race"
+                )
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET bytes_reserved = bytes_reserved - %s,
+                    bytes_used = bytes_used + %s,
+                    budget_exceeded = budget_exceeded
+                        OR bytes_used + %s > byte_limit,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s
+                  AND bytes_reserved >= %s
+                RETURNING budget_exceeded
+                """,
+                (
+                    int(budget_row["bytes_reserved"]),
+                    values["tail_provider_bytes"],
+                    values["tail_provider_bytes"],
+                    run,
+                    int(budget_row["bytes_reserved"]),
+                ),
+            )
+            run_after = _fetchone(cursor)
+            if run_after is None:
+                raise StateConflict(f"Run {run} disappeared during tail settlement")
+            cursor.execute(
+                """
+                UPDATE fbref_control.clearance_session
+                SET provider_billed_bytes = %s
+                WHERE session_id = %s AND status = 'active'
+                  AND provider_billed_bytes IS NULL
+                """,
+                (values["authoritative_provider_bytes"], session),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(
+                    f"Clearance session {session} lost final counter settlement"
+                )
+            cursor.execute(
+                """
+                UPDATE fbref_control.clearance_session_tail_reservation
+                SET status = 'settled', page_provider_bytes = %s,
+                    authoritative_provider_bytes = %s,
+                    tail_provider_bytes = %s, settlement_sha256 = %s,
+                    settled_at = clock_timestamp()
+                WHERE session_id = %s AND status = 'reserved'
+                """,
+                (
+                    values["page_provider_bytes"],
+                    values["authoritative_provider_bytes"],
+                    values["tail_provider_bytes"],
+                    digest,
+                    session,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(
+                    f"Clearance session {session} lost tail evidence settlement"
+                )
+            return {
+                **immutable,
+                "run_id": run,
+                "reservation_id": reservation,
+                "settlement_sha256": digest,
+                "idempotent": False,
+                "terminal": bool(run_after["budget_exceeded"]),
+            }
+
+    def assert_persistent_metering_reconciled(self, run_id: object) -> dict:
+        """Fail unless every persistent session and the run ledger agree."""
+
+        run = _uuid(run_id, "run_id")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT status, requests_used, bytes_used,
+                       requests_reserved, bytes_reserved, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s FOR UPDATE
+                """,
+                (run,),
+            )
+            crawl_run = _fetchone(cursor)
+            if crawl_run is None:
+                raise StateConflict(f"Unknown run {run}")
+            metadata = _json_mapping(
+                crawl_run.get("metadata") or {}, "crawl run metadata"
+            )
+            if metadata.get("persistent_http_session") is not True:
+                raise StateConflict("Run is not pinned to persistent metering")
+            cursor.execute(
+                """
+                SELECT count(*) AS sessions,
+                       count(*) FILTER (WHERE tail.status = 'reserved')
+                           AS reserved_tails,
+                       count(*) FILTER (WHERE tail.status = 'aborted')
+                           AS aborted_tails,
+                       count(*) FILTER (WHERE session.status = 'active')
+                           AS active_sessions,
+                       count(*) FILTER (
+                           WHERE tail.session_id IS NULL
+                              OR tail.status <> 'settled'
+                              OR session.provider_billed_bytes IS NULL
+                              OR tail.authoritative_provider_bytes
+                                   <> session.provider_billed_bytes
+                              OR tail.page_provider_bytes <> COALESCE((
+                                  SELECT sum(page.provider_billed_bytes)
+                                  FROM fbref_control.clearance_session_page_accounting
+                                      AS page
+                                  WHERE page.session_id = session.session_id
+                              ), 0)
+                              OR tail_budget.status <> 'settled'
+                              OR tail_budget.requests_used <> 0
+                              OR tail_budget.bytes_used
+                                   <> tail.tail_provider_bytes
+                       ) AS inexact_sessions,
+                       COALESCE(sum(
+                           CASE WHEN tail.status = 'settled'
+                                THEN tail.authoritative_provider_bytes
+                                ELSE 0 END
+                       ), 0) AS provider_bytes
+                FROM fbref_control.clearance_session AS session
+                LEFT JOIN fbref_control.clearance_session_tail_reservation AS tail
+                  ON tail.session_id = session.session_id
+                LEFT JOIN fbref_control.budget_reservation AS tail_budget
+                  ON tail_budget.reservation_id = tail.reservation_id
+                WHERE session.run_id = %s
+                """,
+                (run,),
+            )
+            sessions = _fetchone(cursor) or {}
+            if any(
+                int(sessions.get(name) or 0)
+                for name in (
+                    "reserved_tails",
+                    "aborted_tails",
+                    "active_sessions",
+                    "inexact_sessions",
+                )
+            ):
+                raise StateConflict(
+                    f"Run {run} has unresolved persistent metering"
+                )
+            cursor.execute(
+                """
+                SELECT COALESCE(sum(page.requests_used), 0) AS requests_used,
+                       count(*) AS accounted_pages,
+                       count(*) FILTER (
+                           WHERE budget.status <> 'settled'
+                              OR budget.requests_used <> page.requests_used
+                              OR budget.bytes_used
+                                   <> page.provider_billed_bytes
+                       ) AS invalid_page_budgets,
+                       (
+                           SELECT count(*)
+                           FROM fbref_control.budget_reservation AS budget
+                           LEFT JOIN
+                             fbref_control.clearance_session_tail_reservation AS tail
+                             ON tail.reservation_id = budget.reservation_id
+                           WHERE budget.run_id = %s
+                             AND tail.reservation_id IS NULL
+                       ) AS target_reservations
+                FROM fbref_control.clearance_session_page_accounting AS page
+                JOIN fbref_control.budget_reservation AS budget
+                  ON budget.reservation_id = page.reservation_id
+                WHERE page.run_id = %s
+                """,
+                (run, run),
+            )
+            pages = _fetchone(cursor) or {}
+            provider_bytes = int(sessions.get("provider_bytes") or 0)
+            requests = int(pages.get("requests_used") or 0)
+            accounted = int(pages.get("accounted_pages") or 0)
+            invalid_page_budgets = int(
+                pages.get("invalid_page_budgets") or 0
+            )
+            target_reservations = int(pages.get("target_reservations") or 0)
+            if (
+                provider_bytes != int(crawl_run["bytes_used"])
+                or requests != int(crawl_run["requests_used"])
+                or int(crawl_run["requests_reserved"]) != 0
+                or int(crawl_run["bytes_reserved"]) != 0
+                or accounted != target_reservations
+                or invalid_page_budgets != 0
+            ):
+                raise StateConflict(
+                    f"Run {run} persistent meter does not reconcile"
+                )
+            return {
+                "run_id": run,
+                "sessions": int(sessions.get("sessions") or 0),
+                "provider_billed_bytes": provider_bytes,
+                "requests_used": requests,
+                "pages": accounted,
+                "reconciled": True,
+            }
 
     def close_clearance_session(
         self,

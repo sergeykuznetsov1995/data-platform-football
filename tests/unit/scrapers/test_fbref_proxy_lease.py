@@ -61,8 +61,14 @@ def _stats_body(**overrides):
         "total_bytes": 100,
         "active_tunnels": 0,
         "reserved_bytes": 0,
+        "active_provider_readers": 0,
+        "provider_reserved_bytes": 0,
+        "pending_client_hellos": 0,
+        "staged_client_bytes": 0,
         "closed": False,
+        "expired": False,
         "budget_exceeded": False,
+        "accounting_uncertain": False,
     }
     body.update(overrides)
     return body
@@ -235,6 +241,11 @@ def test_extend_returns_same_frozen_identity_with_larger_cap():
         {"max_bytes": 1999},
         {"expires_at": 9999999998.0},
         {"active_tunnels": 1},
+        {"active_provider_readers": 1},
+        {"provider_reserved_bytes": 1},
+        {"pending_client_hellos": 1},
+        {"staged_client_bytes": 1},
+        {"accounting_uncertain": True},
         {"total_bytes": 1001, "up_bytes": 500, "down_bytes": 501},
         {"proxy_url": "http://other-filter:8900"},
     ],
@@ -277,6 +288,7 @@ def test_extend_lost_response_keeps_the_original_frozen_handle():
         {"run_id": "another-run"},
         {"total_bytes": 99},
         {"active_tunnels": -1},
+        {"close_complete": True},
     ],
 )
 def test_stats_fail_closed_on_untrusted_counter(change):
@@ -419,3 +431,166 @@ def test_close_still_times_out_on_pending_without_the_latch():
 
     with pytest.raises(FBrefProxyLeaseError, match="did not return final"):
         client.close(lease, expected=CONTEXT)
+
+
+def test_wait_idle_requires_two_identical_open_tunnel_samples():
+    first = _stats_body(
+        up_bytes=50,
+        down_bytes=75,
+        total_bytes=125,
+        active_tunnels=1,
+        active_provider_readers=1,
+        reserved_bytes=64,
+        provider_reserved_bytes=64,
+    )
+    session = _Session(
+        [
+            _Response(201, _lease_body()),
+            _Response(200, dict(first)),
+            _Response(200, dict(first)),
+        ]
+    )
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+        sleep=lambda _seconds: None,
+        monotonic=lambda: 0.0,
+    )
+    lease = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+
+    stats = client.wait_idle(lease, expected=CONTEXT, expected_tunnels=1)
+
+    assert stats.total_bytes == 125
+    assert [call[0] for call in session.calls] == ["POST", "GET", "GET"]
+
+
+def test_zero_tunnel_idle_proof_rejects_any_observed_reservation():
+    reserved = _stats_body(
+        reserved_bytes=64,
+        provider_reserved_bytes=64,
+    )
+    idle = _stats_body()
+    session = _Session(
+        [
+            _Response(201, _lease_body()),
+            _Response(200, reserved),
+            _Response(200, idle),
+            _Response(200, idle),
+        ]
+    )
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+        sleep=lambda _seconds: None,
+        monotonic=lambda: 0.0,
+    )
+    lease = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+
+    with pytest.raises(FBrefProxyLeaseError, match="unexpected.*state"):
+        client.wait_idle(lease, expected=CONTEXT, expected_tunnels=0)
+
+    assert [call[0] for call in session.calls] == ["POST", "GET"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"active_tunnels": 2, "active_provider_readers": 2},
+        {"active_tunnels": 1, "active_provider_readers": 2},
+        {
+            "active_tunnels": 1,
+            "active_provider_readers": 1,
+            "reserved_bytes": 5,
+            "provider_reserved_bytes": 4,
+        },
+        {"active_tunnels": 1, "active_provider_readers": 1,
+         "staged_client_bytes": 1},
+        {"active_tunnels": 1, "active_provider_readers": 1,
+         "accounting_uncertain": True},
+    ],
+)
+def test_wait_idle_rejects_ambiguous_open_tunnel_state(change):
+    body = _stats_body(**change)
+    session = _Session([_Response(201, _lease_body()), _Response(200, body)])
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+    )
+    lease = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+
+    with pytest.raises(FBrefProxyLeaseError, match="idle"):
+        client.wait_idle(lease, expected=CONTEXT, expected_tunnels=1)
+
+
+def test_close_strict_rejects_uncertainty_409_immediately():
+    latched = _stats_body(
+        closed=True,
+        close_complete=False,
+        accounting_uncertain=True,
+        close_error=(
+            "provider byte accounting is uncertain; durable escrow retained"
+        ),
+    )
+    session = _Session(
+        [_Response(201, _lease_body()), _Response(409, latched)]
+    )
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+    )
+    lease = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+
+    with pytest.raises(FBrefProxyLeaseError, match="rejected"):
+        client.close_strict(lease, expected=CONTEXT)
+
+    assert [call[0] for call in session.calls] == ["POST", "DELETE"]
+
+
+def test_close_strict_accepts_only_zero_lifecycle_fields():
+    final = _stats_body(
+        up_bytes=50,
+        down_bytes=75,
+        total_bytes=125,
+        closed=True,
+        close_complete=True,
+    )
+    session = _Session(
+        [_Response(201, _lease_body()), _Response(200, final)]
+    )
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+    )
+    lease = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+
+    stats = client.close_strict(lease, expected=CONTEXT)
+
+    assert stats.total_bytes == 125
+    assert stats.close_complete is True
+
+
+def test_wait_drained_rejects_uncertain_or_hidden_provider_work():
+    body = _stats_body(
+        active_provider_readers=1,
+        provider_reserved_bytes=64,
+    )
+    session = _Session(
+        [_Response(201, _lease_body()), _Response(200, body)]
+    )
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+        drain_timeout_seconds=0.01,
+        sleep=lambda _seconds: None,
+        monotonic=iter((0.0, 1.0)).__next__,
+    )
+    lease = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+
+    with pytest.raises(FBrefProxyLeaseError, match="drain"):
+        client.wait_drained(lease, expected=CONTEXT)

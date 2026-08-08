@@ -14,6 +14,7 @@ from scrapers.fbref.control import (
     StateConflict,
     TargetLease,
     make_budget_reservation_id,
+    make_clearance_tail_reservation_id,
     make_control_run_id,
     make_logical_refresh_id,
     resolve_control_db_uri,
@@ -126,6 +127,11 @@ def test_airflow_and_attempt_ids_map_to_stable_uuids():
     reservation = make_budget_reservation_id(refresh)
     assert uuid.UUID(refresh).version == 5
     assert uuid.UUID(reservation).version == 5
+    session = str(uuid.uuid4())
+    assert make_clearance_tail_reservation_id(session) == (
+        make_clearance_tail_reservation_id(session)
+    )
+    assert uuid.UUID(make_clearance_tail_reservation_id(session)).version == 5
 
 
 def test_raw_baseline_anchor_is_create_once_and_conflict_checked():
@@ -1706,6 +1712,18 @@ def test_abort_run_is_idempotent_settles_budget_and_releases_targets():
             lock_orders.append(tuple(stages))
             rows = [dict(reservation)] if reservation["status"] == "reserved" else []
             return rows, len(rows)
+        if (
+            "SELECT session_id" in sql
+            and "FROM fbref_control.clearance_session " in sql
+        ):
+            stages.append("clearance_locked")
+            return [], 0
+        if "FROM fbref_control.clearance_session_tail_reservation" in sql:
+            stages.append("tail_locked")
+            return [], 0
+        if "FROM fbref_control.clearance_session_page_accounting" in sql:
+            stages.append("page_locked")
+            return [], 0
         if "UPDATE fbref_control.budget_reservation" in sql:
             reservation.update(
                 status="settled",
@@ -1721,6 +1739,8 @@ def test_abort_run_is_idempotent_settles_budget_and_releases_targets():
             return [], 2 if state["status"] == "running" else 0
         if "UPDATE fbref_control.page_frontier" in sql:
             return [], int(state["status"] == "running")
+        if "UPDATE fbref_control.clearance_session_tail_reservation" in sql:
+            return [], 0
         if "UPDATE fbref_control.clearance_session" in sql:
             return [], int(state["status"] == "running")
         if "SET status = 'failed'" in sql:

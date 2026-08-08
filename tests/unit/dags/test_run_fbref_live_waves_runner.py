@@ -122,6 +122,7 @@ def test_bootstrap_control_run_is_allowed_through_live_transport(
         "FBREF_PROXY_CONTROL_URL",
         "http://fbref_proxy_filter:8899",
     )
+    monkeypatch.setattr(runner.ControlStore, "from_env", lambda: control)
     monkeypatch.setattr(runner.FBrefPipeline, "from_env", lambda: pipeline)
     monkeypatch.setattr(
         runner,
@@ -190,6 +191,7 @@ def test_retry_attempt_requests_only_the_remaining_dagrun_budget(
         "FBREF_PROXY_CONTROL_URL",
         "http://fbref_proxy_filter:8899",
     )
+    monkeypatch.setattr(runner.ControlStore, "from_env", lambda: control)
     monkeypatch.setattr(runner.FBrefPipeline, "from_env", lambda: pipeline)
     monkeypatch.setattr(
         runner,
@@ -246,6 +248,7 @@ def test_runner_caps_new_run_to_daily_bytes_left_after_another_run(
         "http://fbref_proxy_filter:8899",
     )
     monkeypatch.setenv("FBREF_PROXY_CONTROL_TOKEN", "x" * 32)
+    monkeypatch.setattr(runner.ControlStore, "from_env", lambda: control)
     monkeypatch.setattr(runner, "validate_fbref_proxy_meter", meter)
     monkeypatch.setattr(runner.FBrefPipeline, "from_env", lambda: pipeline)
     monkeypatch.setattr(
@@ -288,6 +291,7 @@ def test_runner_rejects_stored_profile_mismatch_before_fetcher_construction(
     )
     pipeline = SimpleNamespace(control=control, fetcher_factory=None)
     monkeypatch.setenv("FBREF_PROXY_CONTROL_URL", "http://fbref_proxy_filter:8899")
+    monkeypatch.setattr(runner.ControlStore, "from_env", lambda: control)
     monkeypatch.setattr(runner.FBrefPipeline, "from_env", lambda: pipeline)
     monkeypatch.setattr(
         runner,
@@ -312,6 +316,55 @@ def test_runner_rejects_stored_profile_mismatch_before_fetcher_construction(
 
     assert fetcher_constructed == []
     assert pipeline.fetcher_factory is None
+
+
+def test_runner_rejects_persistent_marker_mismatch_before_pipeline_or_meter(
+    monkeypatch,
+):
+    constructed = []
+    meter_calls = []
+    control = SimpleNamespace(
+        get_run=lambda _run_id: {
+            "run_type": "current",
+            "request_limit": 100,
+            "byte_limit": 50 * 1024 * 1024,
+            "metadata": {
+                "dag_id": "dag_ingest_fbref",
+                "persistent_http_session": False,
+            },
+        }
+    )
+    monkeypatch.setenv("FBREF_PROXY_CONTROL_URL", "http://fbref_proxy_filter:8899")
+    monkeypatch.setenv("FBREF_PERSISTENT_HTTP_SESSION", "1")
+    monkeypatch.setattr(runner.ControlStore, "from_env", lambda: control)
+    monkeypatch.setattr(
+        runner.FBrefPipeline,
+        "from_env",
+        lambda: constructed.append("pipeline"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "validate_fbref_proxy_meter",
+        lambda *_args, **_kwargs: meter_calls.append(True),
+    )
+    args = Namespace(
+        control_run_id="control-run",
+        worker_id="live",
+        page_kinds="match",
+        run_type="current",
+        request_limit=100,
+        byte_limit_mb=50,
+        shard_size=25,
+        reservation_mb=3,
+        domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+        max_batches=80,
+    )
+
+    with pytest.raises(RuntimeError, match="persistent HTTP profile differs"):
+        runner._run(args)
+
+    assert constructed == []
+    assert meter_calls == []
 
 
 def _dead_or_zombie(pid: int) -> bool:

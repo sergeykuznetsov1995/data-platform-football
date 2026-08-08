@@ -1002,6 +1002,10 @@ class Lease:
     active_provider_readers: int = field(default=0, repr=False)
     provider_reserved_bytes: int = field(default=0, repr=False)
     pending_client_hellos: int = field(default=0, repr=False)
+    # Bytes already read from the local client but not yet fully handed to the
+    # metered provider writer.  Idle checkpoints must see this otherwise a
+    # page could be settled while an upload prefix is still waiting for budget.
+    staged_client_bytes: int = field(default=0, repr=False)
     upstream_repins: int = 0
     closed: bool = False
     close_recorded: bool = False
@@ -1060,6 +1064,10 @@ class Lease:
             "total_bytes": self.total_bytes,
             "active_tunnels": self.active_tunnels,
             "reserved_bytes": self.reserved_bytes,
+            "active_provider_readers": self.active_provider_readers,
+            "provider_reserved_bytes": self.provider_reserved_bytes,
+            "pending_client_hellos": self.pending_client_hellos,
+            "staged_client_bytes": self.staged_client_bytes,
             "global_budget_escrow_bytes": self.global_budget_escrow_bytes,
             "upstream_repins": self.upstream_repins,
             "closed": self.closed,
@@ -1214,6 +1222,10 @@ def _lease_has_durable_terminal(lease: Lease) -> bool:
         or not lease.close_recorded
         or lease.active_tunnels
         or lease.reserved_bytes
+        or lease.active_provider_readers
+        or lease.provider_reserved_bytes
+        or lease.pending_client_hellos
+        or lease.staged_client_bytes
         or lease.global_budget_escrow_bytes
         or lease.accounting_uncertain
     ):
@@ -3602,11 +3614,20 @@ def _extend_fbref_lease(lease: Lease, new_max_bytes: int) -> dict[str, Any]:
         raise ValueError("max_bytes must be an integer")
     if lease.source != "fbref":
         raise RuntimeError("only FBref leases may be extended")
-    if lease.closed or lease.expired or lease.budget_exceeded:
+    if (
+        lease.closed
+        or lease.expired
+        or lease.budget_exceeded
+        or lease.accounting_uncertain
+    ):
         raise RuntimeError("FBref lease is not open and usable")
     if (
         lease.active_tunnels != 0
         or lease.reserved_bytes != 0
+        or lease.active_provider_readers != 0
+        or lease.provider_reserved_bytes != 0
+        or lease.pending_client_hellos != 0
+        or lease.staged_client_bytes != 0
         or bool(lease.current_request_id)
         or bool(lease.current_endpoint)
     ):
@@ -4457,33 +4478,51 @@ async def _pump(
                 # with positive authoritative capacity is temporary sibling
                 # contention, not a hard-cap failure.
                 pending = memoryview(chunk)
-                while pending:
-                    available = _lease_remaining(lease)
-                    if available <= 0:
-                        if not lease.usable:
+                staged_remaining = len(pending)
+                lease.staged_client_bytes += staged_remaining
+                try:
+                    while pending:
+                        available = _lease_remaining(lease)
+                        if available <= 0:
+                            if not lease.usable:
+                                break
+                            if _lease_authoritative_remaining(lease) <= 0:
+                                lease.budget_exceeded = True
+                                _notify_reservation_turnover()
+                                break
+                            try:
+                                await _wait_for_reservation_turnover(lease)
+                            except (asyncio.TimeoutError, TimeoutError):
+                                _latch_lease_accounting_uncertainty(lease)
+                                raise
+                            continue
+                        prefix_size = min(len(pending), available)
+                        if not await _write_upstream(
+                            writer,
+                            bytes(pending[:prefix_size]),
+                            lease=lease,
+                            host=host,
+                            direction=direction,
+                        ):
                             break
-                        if _lease_authoritative_remaining(lease) <= 0:
-                            lease.budget_exceeded = True
-                            _notify_reservation_turnover()
-                            break
-                        try:
-                            await _wait_for_reservation_turnover(lease)
-                        except (asyncio.TimeoutError, TimeoutError):
-                            _latch_lease_accounting_uncertainty(lease)
-                            raise
-                        continue
-                    prefix_size = min(len(pending), available)
-                    if not await _write_upstream(
-                        writer,
-                        bytes(pending[:prefix_size]),
-                        lease=lease,
-                        host=host,
-                        direction=direction,
-                    ):
+                        pending = pending[prefix_size:]
+                        staged_remaining -= prefix_size
+                        lease.staged_client_bytes = max(
+                            0, lease.staged_client_bytes - prefix_size
+                        )
+                    if pending:
+                        # The local prefix cannot be allowed to disappear from
+                        # the idle proof.  Permanently revoke the lease before
+                        # moving the unforwarded remainder out of the staging
+                        # counter.
+                        _latch_lease_accounting_uncertainty(lease)
                         break
-                    pending = pending[prefix_size:]
-                if pending:
-                    break
+                finally:
+                    if staged_remaining:
+                        _latch_lease_accounting_uncertainty(lease)
+                        lease.staged_client_bytes = max(
+                            0, lease.staged_client_bytes - staged_remaining
+                        )
                 continue
             try:
                 writer.write(chunk)
@@ -5200,6 +5239,10 @@ async def _close_lease(
     drained = (
         lease.active_tunnels == 0
         and lease.reserved_bytes == 0
+        and lease.active_provider_readers == 0
+        and lease.provider_reserved_bytes == 0
+        and lease.pending_client_hellos == 0
+        and lease.staged_client_bytes == 0
         and not lease.accounting_uncertain
     )
     if drained and lease.source == "whoscored":

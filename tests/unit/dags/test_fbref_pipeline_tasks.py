@@ -92,6 +92,31 @@ def test_runtime_limits_allow_only_hard_production_canary_and_replay_profiles():
 
 
 @pytest.mark.unit
+def test_persistent_http_switch_is_exact_default_off_and_replay_forced_off(
+    monkeypatch,
+):
+    monkeypatch.delenv("FBREF_PERSISTENT_HTTP_SESSION", raising=False)
+    assert fbref_pipeline_tasks._settings(
+        run_type="current", request_limit=100, byte_limit_mb=50
+    ).persistent_http_session is False
+
+    monkeypatch.setenv("FBREF_PERSISTENT_HTTP_SESSION", "1")
+    assert fbref_pipeline_tasks._settings(
+        run_type="current", request_limit=100, byte_limit_mb=50
+    ).persistent_http_session is True
+    assert fbref_pipeline_tasks._settings(
+        run_type="replay", request_limit=0, byte_limit_mb=0
+    ).persistent_http_session is False
+
+    for invalid in ("true", " 1 ", "yes", "2"):
+        monkeypatch.setenv("FBREF_PERSISTENT_HTTP_SESSION", invalid)
+        with pytest.raises(ValueError, match="exactly 0 or 1"):
+            fbref_pipeline_tasks._settings(
+                run_type="current", request_limit=100, byte_limit_mb=50
+            )
+
+
+@pytest.mark.unit
 def test_production_safety_circuit_has_worst_case_request_headroom():
     worst_case = 80 * 25 * 2 + 4 * 20
 

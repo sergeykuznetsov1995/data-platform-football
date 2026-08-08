@@ -32,6 +32,7 @@ from scrapers.fbref.settings import (
     FBREF_PRODUCTION_SAFETY_BYTE_LIMIT_MIB,
     FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT,
     MIB,
+    strict_binary_flag,
 )
 
 
@@ -272,6 +273,11 @@ def _settings(
         shard_size=int(shard_size),
         request_reservation_bytes=int(reservation_mb) * MIB,
         domain_interval_seconds=float(domain_interval_seconds),
+        persistent_http_session=(
+            False
+            if str(run_type).strip().casefold() == "replay"
+            else strict_binary_flag("FBREF_PERSISTENT_HTTP_SESSION")
+        ),
     )
 
 

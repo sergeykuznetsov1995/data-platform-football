@@ -95,7 +95,7 @@ def competition_entry(index, *, gender="male"):
 
 def test_v8_is_append_only_schema_for_provenance_aliases_and_cancellation():
     assert tuple(migration.version for migration in MIGRATIONS) == tuple(
-        range(1, 10)
+        range(1, 11)
     )
     migration = next(item for item in MIGRATIONS if item.version == 8)
     assert migration.version == 8
@@ -136,6 +136,22 @@ def test_v9_adds_singleton_expiring_publication_generation_lock():
     assert "expires_at timestamptz not null" in ddl
     assert "released_at timestamptz" in ddl
     assert "publication_lock_expiry_idx" in ddl
+
+
+def test_v10_adds_typed_persistent_http_metering_evidence():
+    migration = next(item for item in MIGRATIONS if item.version == 10)
+    ddl = "\n".join(migration.statements).lower()
+
+    assert migration.name == "persistent_http_metering"
+    assert "clearance_session_page_accounting" in ddl
+    assert "reservation_id uuid primary key" in ddl
+    assert "attempt_id uuid not null unique" in ddl
+    assert "provider_billed_bytes bigint not null" in ddl
+    assert "evidence_sha256 text not null" in ddl
+    assert "clearance_session_tail_reservation" in ddl
+    assert "status in ('reserved', 'settled', 'aborted')" in ddl
+    assert "authoritative_provider_bytes =" in ddl
+    assert "page_provider_bytes + tail_provider_bytes" in ddl
 
 
 def test_replay_pipeline_metrics_are_derived_and_atomically_anchored():

@@ -1,5 +1,10 @@
 """Import-light shared limits for the FBref control and Airflow interfaces."""
 
+from __future__ import annotations
+
+import os
+from typing import Mapping
+
 MIB = 1024 * 1024
 FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT = 4096
 FBREF_PRODUCTION_SAFETY_BYTE_LIMIT_MIB = 2048
@@ -71,6 +76,26 @@ def bootstrap_byte_reservation_for(request_limit: int) -> int:
 MAX_SHARD_SIZE = 25
 
 
+def strict_binary_flag(
+    name: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+    default: str = "0",
+) -> bool:
+    """Read one deployment switch without accepting ambiguous spellings."""
+
+    values = os.environ if environ is None else environ
+    raw = values.get(name, default)
+    if raw not in {"0", "1"}:
+        raise ValueError(f"{name} must be exactly 0 or 1")
+    return raw == "1"
+
+
+FBREF_PERSISTENT_HTTP_SESSION = strict_binary_flag(
+    "FBREF_PERSISTENT_HTTP_SESSION"
+)
+
+
 __all__ = [
     "DEFAULT_BOOTSTRAP_REQUEST_RESERVATION",
     "DEFAULT_BROWSER_REQUESTS_PER_SOLVE",
@@ -82,6 +107,7 @@ __all__ = [
     "DEFAULT_BYTE_LIMIT",
     "FBREF_PRODUCTION_SAFETY_BYTE_LIMIT_MIB",
     "FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT",
+    "FBREF_PERSISTENT_HTTP_SESSION",
     "DEFAULT_DOMAIN_INTERVAL_SECONDS",
     "DEFAULT_HTTP_BODY_LIMIT_BYTES",
     "DEFAULT_HTTP_WIRE_OVERHEAD_RESERVATION_BYTES",
@@ -91,4 +117,5 @@ __all__ = [
     "MAX_SHARD_SIZE",
     "MIN_DOMAIN_INTERVAL_SECONDS",
     "MIB",
+    "strict_binary_flag",
 ]
