@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -72,3 +74,26 @@ def test_operator_persists_failure_and_next_same_campaign_ordinal(tmp_path):
     assert second["attempt"]["ordinal"] == 2
     persisted = json.loads(path.read_text(encoding="utf-8"))
     assert [item["status"] for item in persisted["attempts"]] == ["failed", "active"]
+
+
+@pytest.mark.unit
+def test_claim_and_finish_evidence_are_content_addressed_and_immutable(tmp_path):
+    path = tmp_path / "campaigns.json"
+    claimed = _claim(path)
+    claim_ref = claimed["claim_ref"]
+    claim_path = Path(claim_ref["uri"].removeprefix("file://"))
+    original_claim = claim_path.read_bytes()
+
+    finished = finish_campaign_attempt(
+        ledger_path=path,
+        attempt_id=claimed["attempt"]["attempt_id"],
+        terminal_ref={"uri": "s3://evidence/failure.json", "sha256": "d" * 64},
+        successful=False,
+        now=NOW,
+    )
+
+    assert hashlib.sha256(original_claim).hexdigest() == claim_ref["sha256"]
+    assert claim_path.read_bytes() == original_claim
+    assert finished["finish_ref"]["uri"] != claim_ref["uri"]
+    finish_path = Path(finished["finish_ref"]["uri"].removeprefix("file://"))
+    assert hashlib.sha256(finish_path.read_bytes()).hexdigest() == finished["finish_ref"]["sha256"]

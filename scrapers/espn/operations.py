@@ -825,8 +825,10 @@ class RunManifestEvidence:
         _scope_id(self.scope_id)
         _signature(self.plan_signature, "plan_signature")
         _signature(self.registry_signature, "registry_signature")
-        if self.state not in {"complete", "noop"}:
-            raise ValueError("run manifest state must be complete or noop")
+        if self.state not in {"complete", "noop", "pending_empty"}:
+            raise ValueError(
+                "run manifest state must be complete, noop or pending_empty"
+            )
         _required(self.evidence_uri, "evidence_uri")
         _signature(self.evidence_sha256, "evidence_sha256")
         _utc(self.recorded_at, "recorded_at")
@@ -883,8 +885,8 @@ class PublicationFence:
         """Record an exact no-op run without moving the current scope head."""
 
         self()
-        if evidence.state != "noop":
-            raise ValueError("evidence-only publication must be a no-op")
+        if evidence.state not in {"noop", "pending_empty"}:
+            raise ValueError("evidence-only publication must be noop or pending_empty")
         self._record_fn(None, evidence)
 
 
@@ -1542,7 +1544,7 @@ class PostgresEspnControlStore:
     scope_id text NOT NULL,
     plan_signature char(64) NOT NULL,
     registry_signature char(64) NOT NULL,
-    state text NOT NULL CHECK (state IN ('complete', 'noop')),
+    state text NOT NULL CHECK (state IN ('complete', 'noop', 'pending_empty')),
     evidence_uri text NOT NULL,
     evidence_sha256 char(64) NOT NULL,
     recorded_at timestamptz NOT NULL,
@@ -1579,6 +1581,15 @@ class PostgresEspnControlStore:
                     )
                     cursor.execute(
                         f"ALTER TABLE {self.RUN_TABLE} ALTER COLUMN dag_id SET NOT NULL"
+                    )
+                    cursor.execute(
+                        f"ALTER TABLE {self.RUN_TABLE} DROP CONSTRAINT IF EXISTS "
+                        "run_manifest_v2_state_check"
+                    )
+                    cursor.execute(
+                        f"ALTER TABLE {self.RUN_TABLE} ADD CONSTRAINT "
+                        "run_manifest_v2_state_check CHECK "
+                        "(state IN ('complete', 'noop', 'pending_empty'))"
                     )
                     cursor.execute(
                         f"""DO $espn_migration$

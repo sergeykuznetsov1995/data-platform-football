@@ -550,6 +550,124 @@ def test_proven_schedule_rows_zero_cannot_false_green_on_raw_evidence():
 
 
 @pytest.mark.unit
+def test_unknown_empty_schedule_rejects_one_observation_without_signed_pair():
+    generation = _generation()
+    unknown_plan = ScopePlan(
+        **{
+            **generation.plan.to_dict(),
+            "start_date": generation.plan.start_date,
+            "end_date": generation.plan.end_date,
+            "capabilities": EntityCapabilities(
+                schedule=CapabilityState.UNKNOWN,
+                lineup=CapabilityState.UNKNOWN,
+                matchsheet=CapabilityState.UNKNOWN,
+            ),
+        }
+    )
+    scoreboard = RawLedgerRecord(
+        **{**generation.raw_ledger[0].constructor_values(), "event_ids": ()}
+    )
+    candidate = ScopeGeneration(
+        **{
+            **generation.constructor_values(),
+            "plan": unknown_plan,
+            "schedule": (),
+            "lineup": (),
+            "matchsheet": (),
+            "planned_request_ids": (scoreboard.request_id,),
+            "raw_ledger": (scoreboard,),
+            "dispositions": (),
+        }
+    )
+
+    report = validate_scope_generation(candidate)
+
+    assert not report.passed
+    assert "second scheduled observation" in " ".join(report.failures)
+
+
+@pytest.mark.unit
+def test_unknown_empty_schedule_accepts_exact_distinct_scheduled_pair():
+    generation = _generation()
+    unknown_plan = ScopePlan(
+        **{
+            **generation.plan.to_dict(),
+            "start_date": generation.plan.start_date,
+            "end_date": generation.plan.end_date,
+            "capabilities": EntityCapabilities(
+                schedule=CapabilityState.UNKNOWN,
+                lineup=CapabilityState.UNKNOWN,
+                matchsheet=CapabilityState.UNKNOWN,
+            ),
+        }
+    )
+    scoreboard = RawLedgerRecord(
+        **{**generation.raw_ledger[0].constructor_values(), "event_ids": ()}
+    )
+
+    def observation(run_id, fetched_at, raw_uri, raw_sha256):
+        return {
+            "run_id": run_id,
+            "observed_at": fetched_at.isoformat(),
+            "planned_windows": [
+                {
+                    "request_id": scoreboard.request_id,
+                    "query_start": "2020-01-01",
+                    "query_end": "2020-01-31",
+                }
+            ],
+            "raw_evidence": [
+                {
+                    "request_id": scoreboard.request_id,
+                    "raw_uri": raw_uri,
+                    "raw_sha256": raw_sha256,
+                    "fetched_at": fetched_at.isoformat(),
+                }
+            ],
+        }
+
+    proof = {
+        "kind": "espn-empty-schedule-qualification-v1",
+        "method": "second_scheduled_observation",
+        "observations": [
+            observation(
+                "espn_daily__prior",
+                scoreboard.fetched_at - timedelta(days=1),
+                "s3://raw/prior.json",
+                "b" * 64,
+            ),
+            observation(
+                "espn_daily__current",
+                scoreboard.fetched_at,
+                scoreboard.raw_uri,
+                scoreboard.raw_sha256,
+            ),
+        ],
+    }
+    candidate = ScopeGeneration(
+        **{
+            **generation.constructor_values(),
+            "plan": unknown_plan,
+            "run_id": "espn_daily__current",
+            "schedule": (),
+            "lineup": (),
+            "matchsheet": (),
+            "planned_request_ids": (scoreboard.request_id,),
+            "raw_ledger": (scoreboard,),
+            "dispositions": (
+                RequestDisposition(
+                    endpoint="schedule",
+                    state=DispositionState.VALID_EMPTY,
+                    detail=canonical_json(proof),
+                ),
+            ),
+        }
+    )
+
+    assert validate_scope_generation(candidate).passed
+
+
+@pytest.mark.unit
 def test_valid_empty_scoreboard_rejects_summary_or_disposition_rows():
     generation = _generation()
     scoreboard = RawLedgerRecord(
@@ -752,6 +870,38 @@ def test_terminal_nonplayed_does_not_require_summary_entities():
         }
     )
     assert validate_scope_generation(candidate).passed
+
+
+@pytest.mark.unit
+def test_authentic_pre_task2_v3_v4_nonfinal_snapshot_remains_valid():
+    generation = _generation()
+    schedule = replace(
+        generation.schedule[0],
+        status="STATUS_SCHEDULED",
+        terminal=False,
+        played_final=False,
+        terminal_nonplayed=False,
+        summary_required=False,
+        home_score=None,
+        away_score=None,
+        home_goals=None,
+        away_goals=None,
+    )
+    legacy = ScopeGeneration(
+        **{
+            **generation.constructor_values(),
+            "schedule": (schedule,),
+            "lineup": (),
+            "matchsheet": (),
+            "planned_request_ids": (generation.planned_request_ids[0],),
+            "raw_ledger": (generation.raw_ledger[0],),
+            "dispositions": (),
+        }
+    )
+
+    assert legacy.parser_version == "espn-native-parser-v3"
+    assert legacy.runtime_version == "espn-native-runtime-v4"
+    assert validate_scope_generation(legacy).passed
 
 
 @pytest.mark.unit

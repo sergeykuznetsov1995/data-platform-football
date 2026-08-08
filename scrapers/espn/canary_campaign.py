@@ -382,7 +382,8 @@ class CampaignLedger:
             remediation=predecessor_remediation,
         )
         if not guard_only:
-            self._attempts.append(attempt)
+            candidate = CampaignLedger((*self._attempts, attempt))
+            self._attempts = list(candidate.attempts)
         return attempt
 
     def _complete(

@@ -115,3 +115,33 @@ def test_campaign_claim_rejects_directly_forged_identity():
             replace(identity, campaign_id="0" * 64),
             now=NOW,
         )
+
+
+@pytest.mark.unit
+def test_only_tail_campaign_can_retry_after_successor_exists():
+    ledger = CampaignLedger.empty()
+    identity_a = _identity("a" * 40)
+    attempt_a = ledger.claim(identity_a, now=NOW)
+    ledger.fail(
+        attempt_a,
+        failure_ref={"uri": "s3://evidence/a.json", "sha256": "1" * 64},
+        now=NOW,
+    )
+    identity_b = _identity("e" * 40)
+    attempt_b = ledger.claim(
+        identity_b,
+        predecessor_failure_ref={
+            "uri": "s3://evidence/a.json",
+            "sha256": "1" * 64,
+        },
+        remediation="release B repairs A",
+        now=NOW,
+    )
+    ledger.fail(
+        attempt_b,
+        failure_ref={"uri": "s3://evidence/b.json", "sha256": "2" * 64},
+        now=NOW,
+    )
+
+    with pytest.raises(CampaignError, match="tail|successor"):
+        ledger.claim(identity_a, now=NOW)

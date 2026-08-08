@@ -1020,6 +1020,120 @@ def _ledger_dataset_hash(
     return hashlib.sha256("".join(hashes).encode("ascii")).hexdigest()
 
 
+def _empty_schedule_proof_failure(
+    generation: ScopeGeneration,
+    disposition: RequestDisposition,
+    scoreboard_records: tuple[RawLedgerRecord, ...],
+) -> str | None:
+    failure = "empty unknown schedule requires a second scheduled observation"
+    if (
+        disposition.state is not DispositionState.VALID_EMPTY
+        or disposition.event_id is not None
+    ):
+        return failure
+    try:
+        proof = json.loads(disposition.detail)
+    except json.JSONDecodeError:
+        return failure
+    if canonical_json(proof) != disposition.detail or not isinstance(proof, dict):
+        return failure
+    if set(proof) != {"kind", "method", "observations"} or (
+        proof.get("kind"), proof.get("method")
+    ) != (
+        "espn-empty-schedule-qualification-v1",
+        "second_scheduled_observation",
+    ):
+        return failure
+    observations = proof.get("observations")
+    if not isinstance(observations, list) or len(observations) != 2:
+        return failure
+    parsed = []
+    for observation in observations:
+        if not isinstance(observation, dict) or set(observation) != {
+            "run_id",
+            "observed_at",
+            "planned_windows",
+            "raw_evidence",
+        }:
+            return failure
+        run_id = observation.get("run_id")
+        if not isinstance(run_id, str) or not run_id.startswith(
+            ("scheduled__", "espn_daily__")
+        ):
+            return failure
+        try:
+            observed_at = datetime.fromisoformat(observation["observed_at"])
+        except (TypeError, ValueError):
+            return failure
+        if observed_at.tzinfo is None:
+            return failure
+        windows = observation.get("planned_windows")
+        raw = observation.get("raw_evidence")
+        if not isinstance(windows, list) or not windows or not isinstance(raw, list):
+            return failure
+        window_ids = []
+        for window in windows:
+            if not isinstance(window, dict) or set(window) != {
+                "request_id",
+                "query_start",
+                "query_end",
+            }:
+                return failure
+            try:
+                start = date.fromisoformat(window["query_start"])
+                end = date.fromisoformat(window["query_end"])
+            except (TypeError, ValueError):
+                return failure
+            if start > end or not isinstance(window["request_id"], str):
+                return failure
+            window_ids.append(window["request_id"])
+        raw_ids = []
+        for item in raw:
+            if not isinstance(item, dict) or set(item) != {
+                "request_id",
+                "raw_uri",
+                "raw_sha256",
+                "fetched_at",
+            }:
+                return failure
+            try:
+                fetched_at = datetime.fromisoformat(item["fetched_at"])
+            except (TypeError, ValueError):
+                return failure
+            if (
+                fetched_at.tzinfo is None
+                or not isinstance(item["request_id"], str)
+                or not isinstance(item["raw_uri"], str)
+                or _SHA256_RE.fullmatch(str(item["raw_sha256"])) is None
+            ):
+                return failure
+            raw_ids.append(item["request_id"])
+        if sorted(window_ids) != sorted(raw_ids) or len(set(raw_ids)) != len(raw_ids):
+            return failure
+        parsed.append((run_id, observed_at, observation))
+    if parsed[0][0] == parsed[1][0] or parsed[0][1] >= parsed[1][1]:
+        return failure
+    if parsed[1][0] != generation.run_id:
+        return failure
+    current = parsed[1][2]
+    expected_current_raw = [
+        {
+            "request_id": item.request_id,
+            "raw_uri": item.raw_uri,
+            "raw_sha256": item.raw_sha256,
+            "fetched_at": item.fetched_at.isoformat(),
+        }
+        for item in sorted(scoreboard_records, key=lambda item: item.request_id)
+    ]
+    if current["raw_evidence"] != expected_current_raw:
+        return failure
+    if sorted(generation.planned_request_ids) != sorted(
+        item["request_id"] for item in current["planned_windows"]
+    ):
+        return failure
+    return None
+
+
 def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport:
     """Run all source-semantic DQ before any physical write."""
 
@@ -1093,6 +1207,12 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
                 for item in generation.raw_ledger
             )
         )
+        schedule_dispositions = tuple(
+            item for item in generation.dispositions if item.endpoint == "schedule"
+        )
+        entity_dispositions = tuple(
+            item for item in generation.dispositions if item.endpoint != "schedule"
+        )
         empty_schedule_has_exact_evidence = (
             bool(scoreboard_records)
             and all(
@@ -1101,7 +1221,7 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
             )
             and ledger_complete
             and not any(item.endpoint == "summary" for item in generation.raw_ledger)
-            and not generation.dispositions
+            and not entity_dispositions
         )
         if not empty_schedule_has_exact_evidence:
             failures.append(
@@ -1110,6 +1230,17 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
             )
         if scope.capabilities.schedule is CapabilityState.PROVEN:
             failures.append("empty proven schedule capability")
+        elif scope.capabilities.schedule is CapabilityState.UNKNOWN:
+            if len(schedule_dispositions) != 1:
+                failures.append(
+                    "empty unknown schedule requires a second scheduled observation"
+                )
+            else:
+                proof_failure = _empty_schedule_proof_failure(
+                    generation, schedule_dispositions[0], scoreboard_records
+                )
+                if proof_failure is not None:
+                    failures.append(proof_failure)
     scoreboard_event_ids = [
         event_id for item in scoreboard_records for event_id in item.event_ids
     ]
@@ -1199,6 +1330,10 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
 
     disposition_index: dict[tuple[str, int], RequestDisposition] = {}
     for item in generation.dispositions:
+        if item.endpoint == "schedule" and item.event_id is None:
+            if generation.schedule:
+                failures.append("schedule disposition is only valid for an empty schedule")
+            continue
         if item.endpoint not in {"lineup", "matchsheet"} or item.event_id is None:
             failures.append("entity disposition has invalid endpoint or event")
             continue
@@ -1288,7 +1423,7 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
 
     for event_id, event in schedule_by_event.items():
         for entity in ("lineup", "matchsheet"):
-            if (entity, event_id) not in disposition_index:
+            if event.summary_required and (entity, event_id) not in disposition_index:
                 failures.append(
                     f"event disposition missing for {entity}/{event_id}"
                 )

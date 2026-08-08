@@ -46,6 +46,8 @@ def _render_compose(
             "LAKEKEEPER_PG_ENCRYPTION_KEY": "compose-test",
             "TRINO_ANALYST_SVC_PASSWORD": "compose-test",
             "FBREF_CAMOUFOX_GEOIP_DATABASE_HOST_PATH": "/tmp/geo.mmdb",
+            "ESPN_RELEASE_COMMIT": "a" * 40,
+            "ESPN_RELEASE_TREE_SHA256": "b" * 64,
         }
     )
     for name in (
@@ -115,6 +117,13 @@ def test_shared_stack_keeps_espn_child_trigger_only_for_compatibility() -> None:
     """The shared-stack compatibility path never schedules the child itself."""
     assert SCHEDULES["dag_ingest_espn"] is None
     assert SCHEDULES["dag_master_pipeline"] == "0 14 * * *"
+
+
+def test_shared_compose_requires_exact_espn_release_identity() -> None:
+    source = SHARED_COMPOSE.read_text(encoding="utf-8")
+
+    assert "ESPN_RELEASE_COMMIT: ${ESPN_RELEASE_COMMIT:?" in source
+    assert "ESPN_RELEASE_TREE_SHA256: ${ESPN_RELEASE_TREE_SHA256:?" in source
 
 
 def test_native_espn_factory_declares_a_nonempty_description() -> None:

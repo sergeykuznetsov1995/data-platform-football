@@ -83,6 +83,42 @@ def _persist(path: Path, ledger: CampaignLedger) -> dict[str, str]:
     return {"uri": path.resolve().as_uri(), "sha256": hashlib.sha256(body).hexdigest()}
 
 
+def _persist_immutable_evidence(
+    ledger_path: Path, payload: Mapping[str, object]
+) -> dict[str, str]:
+    body = _canonical_bytes(payload)
+    digest = hashlib.sha256(body).hexdigest()
+    evidence_path = ledger_path.with_name(ledger_path.name + ".evidence") / (
+        f"{payload['kind']}-{digest}.json"
+    )
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(
+            evidence_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
+    except FileExistsError:
+        if evidence_path.read_bytes() != body:
+            raise CampaignError("content-addressed campaign evidence conflicts")
+    else:
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            directory = os.open(evidence_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except Exception:
+            evidence_path.unlink(missing_ok=True)
+            raise
+    os.chmod(evidence_path, 0o600)
+    return {"uri": evidence_path.resolve().as_uri(), "sha256": digest}
+
+
 def claim_campaign_attempt(
     *,
     ledger_path: str | Path,
@@ -115,11 +151,27 @@ def claim_campaign_attempt(
             remediation=remediation,
         )
         ledger_ref = None if guard_only else _persist(path, ledger)
+        claim_ref = (
+            None
+            if guard_only
+            else _persist_immutable_evidence(
+                path,
+                {
+                    "kind": "espn-canary-claim-evidence-v1",
+                    "schema_version": 1,
+                    "ledger_ref": ledger_ref,
+                    "ledger": ledger.to_dict(),
+                    "campaign": identity.to_dict(),
+                    "attempt": attempt.to_dict(),
+                },
+            )
+        )
     return {
         "guard_only": guard_only,
         "campaign": identity.to_dict(),
         "attempt": attempt.to_dict(),
         "ledger_ref": ledger_ref,
+        "claim_ref": claim_ref,
     }
 
 
@@ -152,12 +204,25 @@ def finish_campaign_attempt(
                 now=now or datetime.now(UTC),
             )
         ledger_ref = _persist(path, ledger)
+        terminal_attempt = ledger.attempts[-1]
+        finish_ref = _persist_immutable_evidence(
+            path,
+            {
+                "kind": "espn-canary-finish-evidence-v1",
+                "schema_version": 1,
+                "ledger_ref": ledger_ref,
+                "ledger": ledger.to_dict(),
+                "campaign": terminal_attempt.campaign.to_dict(),
+                "attempt": terminal_attempt.to_dict(),
+            },
+        )
     return {
         "campaign_id": attempt.campaign_id,
         "attempt_id": attempt.attempt_id,
         "status": "successful" if successful else "failed",
         "terminal_ref": dict(terminal_ref),
         "ledger_ref": ledger_ref,
+        "finish_ref": finish_ref,
     }
 
 

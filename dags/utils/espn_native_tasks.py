@@ -18,7 +18,11 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from scrapers.espn.models import Gender, IngestPlan, ScopePlan
-from scrapers.espn.canary_campaign import CampaignError, CampaignIdentity
+from scrapers.espn.canary_campaign import (
+    CampaignError,
+    CampaignIdentity,
+    CampaignLedger,
+)
 from scrapers.espn.daily_owner import (
     ACTIVE_TRIGGER_STATES,
     DAILY_PARENT_FIELDS,
@@ -83,11 +87,8 @@ DISCOVERY_STATE_REF_URI_ENV = "ESPN_DISCOVERY_STATE_REF_URI"
 DISCOVERY_STATE_REF_SHA256_ENV = "ESPN_DISCOVERY_STATE_REF_SHA256"
 RELEASE_COMMIT_ENV = "ESPN_RELEASE_COMMIT"
 RELEASE_TREE_SHA256_ENV = "ESPN_RELEASE_TREE_SHA256"
-CANARY_CAMPAIGN_ID_ENV = "ESPN_CANARY_CAMPAIGN_ID"
-CANARY_ATTEMPT_ID_ENV = "ESPN_CANARY_ATTEMPT_ID"
-CANARY_ORDINAL_ENV = "ESPN_CANARY_ORDINAL"
-CANARY_LEDGER_URI_ENV = "ESPN_CANARY_LEDGER_URI"
-CANARY_LEDGER_SHA256_ENV = "ESPN_CANARY_LEDGER_SHA256"
+CANARY_CLAIM_URI_ENV = "ESPN_CANARY_CLAIM_URI"
+CANARY_CLAIM_SHA256_ENV = "ESPN_CANARY_CLAIM_SHA256"
 LEASE_TTL = timedelta(hours=12)
 DAILY_BOOTSTRAP_SCOPE_LIMIT = 10
 DISCOVERY_MAX_AGE = timedelta(days=8)
@@ -144,6 +145,134 @@ def _sha(value: object, field: str) -> str:
     if _SHA_RE.fullmatch(result) is None:
         raise OperationsError(f"{field} must be a lowercase SHA-256")
     return result
+
+
+def _release_env() -> tuple[str, str]:
+    commit = _required(os.environ.get(RELEASE_COMMIT_ENV), RELEASE_COMMIT_ENV)
+    if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise OperationsError(f"{RELEASE_COMMIT_ENV} must be a lowercase commit")
+    tree = _sha(
+        os.environ.get(RELEASE_TREE_SHA256_ENV), RELEASE_TREE_SHA256_ENV
+    )
+    return commit, tree
+
+
+def _release_identity(
+    *, registry_signature: str, target_scope_ids: Sequence[str]
+) -> dict[str, Any]:
+    commit, tree = _release_env()
+    try:
+        identity = CampaignIdentity.create(
+            release_commit=commit,
+            release_tree_sha256=tree,
+            registry_signature=registry_signature,
+            target_scope_ids=target_scope_ids,
+        )
+    except CampaignError as exc:
+        raise OperationsError(f"ESPN release identity is invalid: {exc}") from exc
+    return {
+        **identity.to_dict(),
+        "parser_version": runner.PARSER_VERSION,
+        "runtime_version": runner.RUNTIME_VERSION,
+    }
+
+
+def _validate_release_identity(
+    value: object,
+    *,
+    registry_signature: str,
+    target_scope_ids: Sequence[str],
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise OperationsError("signed release identity is missing")
+    expected_fields = {
+        "release_commit",
+        "release_tree_sha256",
+        "registry_signature",
+        "target_scope_sha256",
+        "target_scope_ids",
+        "campaign_id",
+        "parser_version",
+        "runtime_version",
+    }
+    if set(value) != expected_fields:
+        raise OperationsError("signed release identity schema mismatch")
+    try:
+        canonical = CampaignIdentity.from_dict(
+            {
+                key: value[key]
+                for key in expected_fields - {"parser_version", "runtime_version"}
+            }
+        )
+    except CampaignError as exc:
+        raise OperationsError(f"signed release identity is invalid: {exc}") from exc
+    if (
+        canonical.registry_signature != registry_signature
+        or canonical.target_scope_ids != tuple(target_scope_ids)
+        or value["parser_version"] != runner.PARSER_VERSION
+        or value["runtime_version"] != runner.RUNTIME_VERSION
+    ):
+        raise OperationsError("signed release identity drift")
+    release_commit, release_tree_sha256 = _release_env()
+    if (
+        canonical.release_commit,
+        canonical.release_tree_sha256,
+    ) != (release_commit, release_tree_sha256):
+        raise OperationsError("signed release identity differs from deployment")
+    return dict(value)
+
+
+def _validated_canary_claim(
+    ref: object,
+    *,
+    release: Mapping[str, Any],
+    target_scope_ids: Sequence[str],
+) -> dict[str, Any]:
+    claim = _read_ref(ref, kind="espn-canary-claim-evidence-v1")
+    if set(claim) != {
+        "kind",
+        "schema_version",
+        "ledger_ref",
+        "ledger",
+        "campaign",
+        "attempt",
+    } or claim.get("schema_version") != 1:
+        raise OperationsError("canary claim evidence schema mismatch")
+    try:
+        ledger = CampaignLedger.from_dict(claim["ledger"])
+        campaign = CampaignIdentity.from_dict(claim["campaign"])
+    except CampaignError as exc:
+        raise OperationsError(f"canary claim evidence is invalid: {exc}") from exc
+    attempts = ledger.attempts
+    if not attempts or attempts[-1].to_dict() != claim["attempt"]:
+        raise OperationsError("canary claim is not the latest ledger attempt")
+    attempt = attempts[-1]
+    if attempt.status != "active" or attempt.ordinal not in {1, 2, 3}:
+        raise OperationsError("canary claim attempt is not active")
+    if attempt.campaign != campaign or campaign.to_dict() != {
+        key: release[key]
+        for key in (
+            "release_commit",
+            "release_tree_sha256",
+            "registry_signature",
+            "target_scope_sha256",
+            "target_scope_ids",
+            "campaign_id",
+        )
+    }:
+        raise OperationsError("canary claim differs from signed release")
+    if campaign.target_scope_ids != tuple(target_scope_ids):
+        raise OperationsError("canary claim target scope set drift")
+    current_ledger = _read_ref(claim["ledger_ref"])
+    if current_ledger != claim["ledger"]:
+        raise OperationsError("canary claim ledger changed after claim")
+    return {
+        "claim_ref": dict(ref),
+        "campaign_id": campaign.campaign_id,
+        "attempt_id": attempt.attempt_id,
+        "ordinal": attempt.ordinal,
+        "ledger_ref": dict(claim["ledger_ref"]),
+    }
 
 
 def select_mapping_descriptors(
@@ -492,6 +621,7 @@ def _admission_payload(value: object) -> Mapping[str, Any]:
     expected = {
         "espn-airflow-admission-v1": 1,
         "espn-airflow-admission-v2": 2,
+        "espn-airflow-admission-v3": 3,
     }
     kind = value.get("kind")
     if kind not in expected or expected[kind] != value.get("schema_version"):
@@ -521,7 +651,11 @@ def _admission_payload(value: object) -> Mapping[str, Any]:
         "selection_policy",
         "male_scope_count",
     }
-    if set(value) != common | (v2 if expected[kind] == 2 else set()):
+    v3 = {"release", "canary_claim"}
+    expected_fields = common | (v2 if expected[kind] >= 2 else set()) | (
+        v3 if expected[kind] >= 3 else set()
+    )
+    if set(value) != expected_fields:
         raise OperationsError("admission artifact fields mismatch its schema")
     for field in ("dag_id", "run_id", "artifact_root", "raw_store_uri"):
         _required(value[field], f"admission {field}")
@@ -559,7 +693,7 @@ def _admission_payload(value: object) -> Mapping[str, Any]:
         return result
 
     selected = scopes("scope_ids", allow_empty=False)
-    if expected[kind] == 2:
+    if expected[kind] >= 2:
         target = scopes("target_scope_ids", allow_empty=False)
         bootstrap = scopes("bootstrap_scope_ids", allow_empty=True)
         _discovery_artifact_ref(
@@ -584,6 +718,25 @@ def _admission_payload(value: object) -> Mapping[str, Any]:
             raise OperationsError("daily admission selects a non-target scope")
         if value["mode"] in _MANUAL_MODES and bootstrap:
             raise OperationsError("manual admission cannot contain bootstrap scopes")
+        if expected[kind] >= 3:
+            release = _validate_release_identity(
+                value["release"],
+                registry_signature=value["registry_signature"],
+                target_scope_ids=target,
+            )
+            exact_canary = value["mode"] == "backfill" and len(selected) == 181
+            if exact_canary and (len(target) != 181 or selected != target):
+                raise OperationsError(
+                    "181-scope backfill must equal the exact frozen canary target"
+                )
+            if exact_canary:
+                _validated_canary_claim(
+                    value["canary_claim"],
+                    release=release,
+                    target_scope_ids=target,
+                )
+            elif value["canary_claim"] is not None:
+                raise OperationsError("non-canary admission forbids a campaign claim")
     return value
 
 
@@ -608,7 +761,10 @@ def _replay_existing_admission(
     except FileNotFoundError:
         return None
     admission = _read_admission_ref(admission_ref)
-    if admission["kind"] == "espn-airflow-admission-v2":
+    if admission["kind"] in {
+        "espn-airflow-admission-v2",
+        "espn-airflow-admission-v3",
+    }:
         registry = _load_registry_ref(admission)
         target = tuple(
             sorted(
@@ -796,6 +952,7 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
 
     if mode not in {"daily", *_MANUAL_MODES}:
         raise OperationsError("unsupported ESPN orchestration mode")
+    _release_env()
     dag_id, run_id, logical_date = _run_identity(context)
     retry_parent = _daily_parent_envelope(context) if mode == "daily" else None
     if mode != "daily":
@@ -817,7 +974,10 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
         if mode != "daily":
             return existing_ref
         admission = _read_admission_ref(existing_ref)
-        if admission["kind"] != "espn-airflow-admission-v2":
+        if admission["kind"] not in {
+            "espn-airflow-admission-v2",
+            "espn-airflow-admission-v3",
+        }:
             raise OperationsError(
                 "daily admission retry requires current v2 admission schema"
             )
@@ -855,9 +1015,39 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
         scopes = _selected_scopes(registry, mode, context.get("params") or {})
     if not scopes:
         raise OperationsError("ESPN registry has no admitted scopes")
+    release = _release_identity(
+        registry_signature=registry.signature(), target_scope_ids=target_scopes
+    )
+    exact_canary = mode == "backfill" and len(scopes) == 181
+    if exact_canary and (len(target_scopes) != 181 or scopes != target_scopes):
+        raise OperationsError(
+            "181-scope backfill must equal the exact frozen canary target"
+        )
+    claim_uri = os.environ.get(CANARY_CLAIM_URI_ENV)
+    claim_sha = os.environ.get(CANARY_CLAIM_SHA256_ENV)
+    if bool(claim_uri) != bool(claim_sha):
+        raise OperationsError("canary claim URI/SHA must be supplied together")
+    canary_claim_ref = (
+        {
+            "uri": _required(claim_uri, CANARY_CLAIM_URI_ENV),
+            "sha256": _sha(claim_sha, CANARY_CLAIM_SHA256_ENV),
+        }
+        if claim_uri is not None
+        else None
+    )
+    if exact_canary:
+        if canary_claim_ref is None:
+            raise OperationsError("exact all-181 canary requires immutable claim evidence")
+        _validated_canary_claim(
+            canary_claim_ref,
+            release=release,
+            target_scope_ids=target_scopes,
+        )
+    elif canary_claim_ref is not None:
+        raise OperationsError("non-canary admission forbids a campaign claim")
     payload = {
-        "kind": "espn-airflow-admission-v2",
-        "schema_version": 2,
+        "kind": "espn-airflow-admission-v3",
+        "schema_version": 3,
         "dag_id": dag_id,
         "run_id": run_id,
         "attempt": _attempt(context),
@@ -874,6 +1064,8 @@ def validate_registry_and_admission(*, mode: str, **context) -> dict[str, str]:
         "candidate_ref": discovery["candidate_ref"],
         "selection_policy": discovery["selection_policy"],
         "male_scope_count": discovery["male_scope_count"],
+        "release": release,
+        "canary_claim": canary_claim_ref,
         "artifact_root": root,
         "raw_store_uri": _raw_store_uri(),
         "replay_sources": (
@@ -905,6 +1097,7 @@ def _scope_binding(
     root: str,
     ingested_at: datetime,
     as_of: date,
+    pending_empty_observation: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     identity = hashlib.sha256(
         f"espn-generation-v1\x00{run_id}\x00{attempt}\x00{scope.scope_id}\x00{mode}".encode()
@@ -947,6 +1140,7 @@ def _scope_binding(
         ),
         "known_nonterminal_events": sorted(known, key=lambda item: item["event_id"]),
         "prior": prior,
+        "pending_empty_observation": pending_empty_observation,
     }
     typed = runner._scope_binding(binding, scope.scope_id)
     runner._prior_parser_transition(
@@ -962,6 +1156,88 @@ def _scope_binding(
     if not requests and prior is not None:
         binding["active"] = False
     return binding
+
+
+def _pending_empty_observation(
+    evidence: RunManifestEvidence | None,
+    *,
+    dag_id: str,
+    scope_id: str,
+    registry_signature: str,
+) -> Mapping[str, Any] | None:
+    if evidence is None or evidence.state != "pending_empty":
+        return None
+    if (
+        evidence.dag_id,
+        evidence.scope_id,
+        evidence.registry_signature,
+    ) != (dag_id, scope_id, registry_signature):
+        raise OperationsError("pending empty control identity mismatch")
+    evidence_ref = {
+        "uri": evidence.evidence_uri,
+        "sha256": evidence.evidence_sha256,
+    }
+    payload = _read_ref(evidence_ref, kind="espn-run-manifest-evidence-v1")
+    if set(payload) != {
+        "kind",
+        "schema_version",
+        "dag_id",
+        "run_id",
+        "attempt",
+        "scope_id",
+        "state",
+        "plan_signature",
+        "registry_signature",
+        "lease_epoch",
+        "raw_manifest_ref",
+        "observation",
+        "recorded_at",
+    } or (
+        payload["schema_version"],
+        payload["dag_id"],
+        payload["run_id"],
+        payload["attempt"],
+        payload["scope_id"],
+        payload["state"],
+        payload["plan_signature"],
+        payload["registry_signature"],
+        payload["recorded_at"],
+    ) != (
+        2,
+        evidence.dag_id,
+        evidence.run_id,
+        evidence.attempt,
+        evidence.scope_id,
+        "pending_empty",
+        evidence.plan_signature,
+        evidence.registry_signature,
+        evidence.recorded_at.isoformat(),
+    ):
+        raise OperationsError("pending empty evidence identity mismatch")
+    raw_manifest = runner._validate_raw_manifest(_read_ref(payload["raw_manifest_ref"]))
+    scoreboard_requests = [
+        request
+        for checkpoint in raw_manifest["checkpoints"]
+        if checkpoint["endpoint"] == "scoreboard"
+        for request in checkpoint["requests"]
+    ]
+    expected_raw = [
+        {
+            "request_id": request["request_id"],
+            "raw_uri": request["raw_uri"],
+            "raw_sha256": request["raw_sha256"],
+            "fetched_at": request["fetched_at"],
+        }
+        for request in sorted(scoreboard_requests, key=lambda item: item["request_id"])
+    ]
+    observation = payload["observation"]
+    if (
+        not isinstance(observation, Mapping)
+        or observation.get("run_id") != evidence.run_id
+        or observation.get("raw_evidence") != expected_raw
+    ):
+        raise OperationsError("pending empty Raw evidence mismatch")
+    return dict(observation)
 
 
 def _replay_binding(admission: Mapping[str, Any], scope_id: str):
@@ -1185,6 +1461,13 @@ def build_signed_scope_plans(
         )
         if hydrated is not None:
             heads[lease.scope_id] = hydrated
+    latest_evidence = (
+        store.read_latest_run_evidence_by_scope(
+            admission["scope_ids"], dag_id=admission["dag_id"]
+        )
+        if admission["mode"] == "daily"
+        else {}
+    )
     scope_refs = []
     network_scope_ids = []
     descriptors_by_scope = {}
@@ -1231,6 +1514,12 @@ def build_signed_scope_plans(
                 root=admission["artifact_root"],
                 ingested_at=ingested_at,
                 as_of=plan_as_of,
+                pending_empty_observation=_pending_empty_observation(
+                    latest_evidence.get(scope_id),
+                    dag_id=admission["dag_id"],
+                    scope_id=scope_id,
+                    registry_signature=admission["registry_signature"],
+                ),
             )
         output_uri = _join_uri(scope_root, "runner-result.json")
         runtime = {
@@ -1245,6 +1534,11 @@ def build_signed_scope_plans(
             "scope_bindings": {scope_id: binding},
             "replay_source": replay_source,
         }
+        if "release" in admission:
+            runtime.update(
+                release=admission["release"],
+                canary_claim=admission["canary_claim"],
+            )
         plan = IngestPlan(
             schema_version=1,
             run_id=admission["run_id"],
@@ -1344,6 +1638,12 @@ def build_signed_scope_plans(
         "network_scope_ids": network_scope_ids,
         "expected_scoreboard_map_count": len(network_scope_ids),
     }
+    if "release" in admission:
+        index.update(
+            admission_ref=acquisition["admission_ref"],
+            release=admission["release"],
+            canary_claim=admission["canary_claim"],
+        )
     index_ref = _write_payload(
         _join_uri(admission["artifact_root"], "plan-index.json"), index
     )
@@ -1722,6 +2022,21 @@ def _binding(ref: Mapping[str, str]):
         raise OperationsError("scope descriptor scoreboard contract is invalid")
     plan_envelope = _read_ref(descriptor["plan_ref"], kind=runner.PLAN_KIND)
     loaded = runner._load_signed_plan(descriptor["plan_ref"]["uri"])
+    loaded_release = getattr(loaded, "release", None)
+    loaded_claim = getattr(loaded, "canary_claim", None)
+    if loaded_release is not None:
+        target_scope_ids = loaded_release.get("target_scope_ids", ())
+        release = _validate_release_identity(
+            loaded_release,
+            registry_signature=loaded.plan.registry_signature,
+            target_scope_ids=target_scope_ids,
+        )
+        if loaded_claim is not None:
+            _validated_canary_claim(
+                loaded_claim,
+                release=release,
+                target_scope_ids=target_scope_ids,
+            )
     if (
         loaded.signature,
         plan_envelope["signature"],
@@ -2440,6 +2755,57 @@ def _execution_options(descriptor, loaded, scope) -> runner.ExecutionOptions:
     )
 
 
+def _record_pending_empty_observation(
+    *,
+    descriptor: Mapping[str, Any],
+    loaded,
+    scope,
+    lease: ScopeLease,
+    raw_manifest_ref: Mapping[str, str],
+    observation: Mapping[str, Any],
+) -> dict[str, str]:
+    """Fence the first unknown empty observation without moving a serving head."""
+
+    if loaded.mode != "daily" or scope.capabilities.schedule.value != "unknown":
+        raise OperationsError("pending empty evidence requires unknown daily scope")
+    store = PostgresEspnControlStore.from_env()
+    renewed = store.renew(lease, now=datetime.now(UTC), ttl=LEASE_TTL)
+    evidence_uri = _join_uri(descriptor["scope_root"], "run-evidence.json")
+    with store.publication_guard(renewed, now=datetime.now(UTC)) as fence:
+        recorded_at = fence.publication_time()
+        payload = {
+            "kind": "espn-run-manifest-evidence-v1",
+            "schema_version": 2,
+            "dag_id": descriptor["dag_id"],
+            "run_id": loaded.plan.run_id,
+            "attempt": loaded.attempt,
+            "scope_id": scope.scope_id,
+            "state": "pending_empty",
+            "plan_signature": loaded.signature,
+            "registry_signature": loaded.plan.registry_signature,
+            "lease_epoch": renewed.epoch,
+            "raw_manifest_ref": dict(raw_manifest_ref),
+            "observation": dict(observation),
+            "recorded_at": recorded_at.isoformat(),
+        }
+        evidence_ref = _write_payload(evidence_uri, payload)
+        fence.record_evidence(
+            RunManifestEvidence(
+                dag_id=descriptor["dag_id"],
+                run_id=loaded.plan.run_id,
+                attempt=loaded.attempt,
+                scope_id=scope.scope_id,
+                plan_signature=loaded.signature,
+                registry_signature=loaded.plan.registry_signature,
+                state="pending_empty",
+                evidence_uri=evidence_ref["uri"],
+                evidence_sha256=evidence_ref["sha256"],
+                recorded_at=recorded_at,
+            )
+        )
+    return evidence_ref
+
+
 def offline_parse_scope(
     *, raw_phase_ref: Mapping[str, str], **_context
 ) -> dict[str, str]:
@@ -2447,7 +2813,7 @@ def offline_parse_scope(
 
     raw_phase = _read_ref(raw_phase_ref, kind="espn-raw-reduction-result-v1")
     _heartbeat_scope_binding(raw_phase["scope_binding_ref"])
-    _, descriptor, loaded, scope, _ = _binding(raw_phase["scope_binding_ref"])
+    _, descriptor, loaded, scope, lease = _binding(raw_phase["scope_binding_ref"])
     raw_ref = raw_phase["raw_manifest_ref"]
     raw_payload = runner._validate_raw_manifest(_read_ref(raw_ref))
     if raw_ref["uri"] != descriptor["raw_manifest_uri"]:
@@ -2468,6 +2834,23 @@ def offline_parse_scope(
     phase_ref = _write_payload(
         _join_uri(descriptor["scope_root"], "offline-parse.json"), phase
     )
+    scope_result = staged.payload.get("scopes", ())
+    if (
+        staged.payload.get("state") == "pending_empty"
+        and len(scope_result) == 1
+        and scope_result[0].get("state") == "pending_empty"
+    ):
+        _record_pending_empty_observation(
+            descriptor=descriptor,
+            loaded=loaded,
+            scope=scope,
+            lease=lease,
+            raw_manifest_ref=raw_ref,
+            observation=scope_result[0]["observation"],
+        )
+        raise OperationsError(
+            f"offline ESPN parse pending second empty observation for {scope.scope_id}"
+        )
     if staged.exit_code != 0 or staged.payload["state"] == "incomplete":
         raise OperationsError(f"offline ESPN parse incomplete for {scope.scope_id}")
     return {"offline_ref": phase_ref}
@@ -2838,20 +3221,26 @@ def _qualification_state(value: object) -> str:
 def _release_qualification_identity(index: Mapping[str, Any]) -> dict[str, Any]:
     """Bind qualification to the exact immutable release and target set."""
 
-    try:
-        identity = CampaignIdentity.create(
-            release_commit=os.environ.get(RELEASE_COMMIT_ENV, ""),
-            release_tree_sha256=os.environ.get(RELEASE_TREE_SHA256_ENV, ""),
+    if "release" not in index:
+        return _release_identity(
             registry_signature=index["registry_signature"],
             target_scope_ids=index["scope_ids"],
         )
-    except (CampaignError, KeyError, TypeError) as exc:
-        raise OperationsError(f"ESPN release qualification identity is invalid: {exc}") from exc
-    return {
-        **identity.to_dict(),
-        "parser_version": runner.PARSER_VERSION,
-        "runtime_version": runner.RUNTIME_VERSION,
-    }
+    release = index["release"]
+    target_scope_ids = release.get("target_scope_ids", ()) if isinstance(release, Mapping) else ()
+    validated = _validate_release_identity(
+        release,
+        registry_signature=index["registry_signature"],
+        target_scope_ids=target_scope_ids,
+    )
+    if "admission_ref" in index:
+        admission = _read_admission_ref(index["admission_ref"])
+        if (
+            admission.get("release") != validated
+            or admission.get("canary_claim") != index.get("canary_claim")
+        ):
+            raise OperationsError("plan index release differs from signed admission")
+    return validated
 
 
 def _canary_campaign_identity(
@@ -2859,39 +3248,21 @@ def _canary_campaign_identity(
 ) -> dict[str, Any] | None:
     """Require the consumed 001-003 claim for an exact all-scope backfill."""
 
-    if index.get("mode") != "backfill" or len(index.get("scope_ids", ())) != 181:
+    claim_ref = index.get("canary_claim")
+    if claim_ref is None:
         return None
-    campaign_id = _sha(
-        os.environ.get(CANARY_CAMPAIGN_ID_ENV), CANARY_CAMPAIGN_ID_ENV
+    target_scope_ids = tuple(release["target_scope_ids"])
+    if (
+        index.get("mode") != "backfill"
+        or tuple(index.get("scope_ids", ())) != target_scope_ids
+        or len(target_scope_ids) != 181
+    ):
+        raise OperationsError("signed canary claim is outside exact all-181 target")
+    return _validated_canary_claim(
+        claim_ref,
+        release=release,
+        target_scope_ids=target_scope_ids,
     )
-    if campaign_id != release["campaign_id"]:
-        raise OperationsError("canary campaign ID differs from release identity")
-    raw_ordinal = os.environ.get(CANARY_ORDINAL_ENV)
-    try:
-        ordinal = int(raw_ordinal or "")
-    except ValueError as exc:
-        raise OperationsError("canary ordinal must be 001, 002 or 003") from exc
-    if raw_ordinal != f"{ordinal:03d}" or ordinal not in {1, 2, 3}:
-        raise OperationsError("canary ordinal must be 001, 002 or 003")
-    attempt_id = _required(
-        os.environ.get(CANARY_ATTEMPT_ID_ENV), CANARY_ATTEMPT_ID_ENV
-    )
-    if attempt_id != f"{campaign_id}-ordinal{ordinal:03d}":
-        raise OperationsError("canary attempt identity differs from campaign ordinal")
-    ledger_ref = {
-        "uri": _required(
-            os.environ.get(CANARY_LEDGER_URI_ENV), CANARY_LEDGER_URI_ENV
-        ),
-        "sha256": _sha(
-            os.environ.get(CANARY_LEDGER_SHA256_ENV), CANARY_LEDGER_SHA256_ENV
-        ),
-    }
-    return {
-        "campaign_id": campaign_id,
-        "attempt_id": attempt_id,
-        "ordinal": ordinal,
-        "ledger_ref": ledger_ref,
-    }
 
 
 def _scope_qualification_payload(
@@ -2928,6 +3299,8 @@ def _scope_qualification_payload(
         entities = {}
         for entity in ("lineup", "matchsheet"):
             state = dispositions.get((entity, event.event_id))
+            if state is None and not event.summary_required:
+                state = "not_applicable"
             allowed = (
                 {"captured", "valid_empty"}
                 if event.played_final and event.summary_required
@@ -2981,6 +3354,103 @@ def _scope_qualification_payload(
         },
         "failures": [],
     }
+
+
+def _qualification_summary(scopes: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    ordered = sorted((dict(item) for item in scopes), key=lambda item: item["scope_id"])
+    return {
+        "scope_count": len(ordered),
+        "complete_new": sum(item["outcome"] == "complete_new" for item in ordered),
+        "noop_revalidated": sum(
+            item["outcome"] == "noop_revalidated" for item in ordered
+        ),
+        "failures": [],
+        "scopes": ordered,
+    }
+
+
+def _reconstruct_durable_qualification(
+    index: Mapping[str, Any], durable: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Rebuild every nested qualification byte-for-byte from immutable leaves."""
+
+    expected_plans = {}
+    for descriptor_ref in index["scope_plan_refs"]:
+        descriptor = _read_ref(descriptor_ref, kind="espn-scope-plan-descriptor-v1")
+        expected_plans[descriptor["scope_id"]] = descriptor["plan_signature"]
+    reconstructed = []
+    seen = set()
+    for wrapped in durable.get("publication_refs", ()):
+        if not isinstance(wrapped, Mapping) or set(wrapped) != {"publication_ref"}:
+            raise OperationsError("durable publication reference schema is invalid")
+        publication = _read_ref(
+            wrapped["publication_ref"], kind="espn-publication-result-v1"
+        )
+        _, descriptor, loaded, scope, lease = _binding(
+            publication["scope_binding_ref"]
+        )
+        if scope.scope_id in seen:
+            raise OperationsError("durable qualification duplicates a scope")
+        seen.add(scope.scope_id)
+        if (
+            loaded.plan.run_id,
+            loaded.attempt,
+            loaded.plan.registry_signature,
+            loaded.signature,
+            descriptor["plan_signature"],
+        ) != (
+            index["run_id"],
+            index["attempt"],
+            index["registry_signature"],
+            expected_plans.get(scope.scope_id),
+            expected_plans.get(scope.scope_id),
+        ):
+            raise OperationsError("durable qualification plan identity mismatch")
+        generation = runner.load_scope_snapshot(
+            publication["snapshot_ref"]["uri"],
+            artifact_sha256=publication["snapshot_ref"]["sha256"],
+            expected_scope_id=scope.scope_id,
+        )
+        _validate_publication_intent_for_result(
+            publication,
+            dag_id=index["dag_id"],
+            loaded=loaded,
+            scope=scope,
+            generation=generation,
+        )
+        _assert_generation_binding(
+            generation=generation,
+            loaded=loaded,
+            scope=scope,
+            state="staged" if publication["state"] == "complete" else "noop",
+        )
+        evidence = _read_ref(
+            publication["evidence_ref"], kind="espn-run-manifest-evidence-v1"
+        )
+        _validate_evidence_payload(
+            evidence,
+            dag_id=index["dag_id"],
+            loaded=loaded,
+            scope=scope,
+            state=publication["state"],
+            generation=generation,
+            lease=lease,
+            recorded_at=datetime.fromisoformat(evidence["recorded_at"]),
+            publication_intent_ref=publication["publication_intent_ref"],
+        )
+        reconstructed.append(
+            _scope_qualification_payload(
+                publication=publication,
+                generation=generation,
+                evidence_payload=evidence,
+            )
+        )
+    if seen != set(index["scope_ids"]):
+        raise OperationsError("durable qualification scope set is incomplete")
+    expected = _qualification_summary(reconstructed)
+    if durable.get("qualification") != expected:
+        raise OperationsError("durable nested qualification differs from evidence")
+    return expected
 
 
 def _load_existing_publication_evidence(
@@ -3403,18 +3873,7 @@ def persist_run_manifests(
         "scope_ids": index["scope_ids"],
         "release": release,
         "canary_campaign": canary_campaign,
-        "qualification": {
-            "scope_count": len(ordered_qualification),
-            "complete_new": sum(
-                item["outcome"] == "complete_new" for item in ordered_qualification
-            ),
-            "noop_revalidated": sum(
-                item["outcome"] == "noop_revalidated"
-                for item in ordered_qualification
-            ),
-            "failures": [],
-            "scopes": ordered_qualification,
-        },
+        "qualification": _qualification_summary(ordered_qualification),
         "evidence": [_evidence_dict(item) for item in durable],
         "publication_refs": sorted(
             normalized_refs,
@@ -3709,6 +4168,7 @@ def terminal_verdict(
     expected_counts = {task_id: 1 for task_id in producer_task_ids}
     scope_count = 0
     index = None
+    validated_durable_manifest_ref = None
     scope_metrics: dict[str, dict[str, Any]] = {}
     try:
         if plan_index_ref is None:
@@ -3997,6 +4457,8 @@ def terminal_verdict(
                 raise OperationsError(
                     "terminal current selection differs from publication"
                 )
+        _reconstruct_durable_qualification(index, durable_manifest)
+        validated_durable_manifest_ref = dict(run_manifest_ref)
     except Exception as exc:
         failures.append(f"{type(exc).__name__}: {exc}")
     if index is not None and not scope_metrics:
@@ -4013,6 +4475,7 @@ def terminal_verdict(
         "producer_states": {key: list(value) for key, value in sorted(states.items())},
         "expected_counts": dict(sorted(expected_counts.items())),
         "scope_metrics": scope_metrics,
+        "durable_manifest_ref": validated_durable_manifest_ref,
     }
     verdict_ref = _write_payload(_join_uri(root, "terminal-verdict.json"), verdict)
     if failures:
@@ -4787,6 +5250,7 @@ def record_health_metrics(
         "verdict_ref": verdict_ref,
         "alerts": alerts,
         "scope_metrics": verdict.get("scope_metrics", {}),
+        "durable_manifest_ref": verdict.get("durable_manifest_ref"),
     }
     root = _join_uri(
         _artifact_root(),
@@ -4932,6 +5396,8 @@ def propagate_terminal_failure(
         or health["status"] != "complete"
         or health["verdict_ref"] != verdict_ref
         or health["alerts"]
+        or verdict.get("durable_manifest_ref") != durable_ref
+        or health.get("durable_manifest_ref") != durable_ref
         or release["failures"]
         or sorted(release["released"]) != sorted(index["scope_ids"])
     ):
@@ -4942,18 +5408,7 @@ def propagate_terminal_failure(
         index, durable["release"]
     ):
         raise OperationsError("success receipt canary campaign identity drift")
-    qualification = durable.get("qualification")
-    if (
-        not isinstance(qualification, Mapping)
-        or qualification.get("scope_count") != len(index["scope_ids"])
-        or qualification.get("complete_new", 0)
-        + qualification.get("noop_revalidated", 0)
-        != len(index["scope_ids"])
-        or qualification.get("failures") != []
-        or [item.get("scope_id") for item in qualification.get("scopes", [])]
-        != sorted(index["scope_ids"])
-    ):
-        raise OperationsError("success receipt qualification is incomplete")
+    qualification = _reconstruct_durable_qualification(index, durable)
     dq_refs = []
     for descriptor_ref in index["scope_plan_refs"]:
         descriptor = _read_ref(descriptor_ref, kind="espn-scope-plan-descriptor-v1")

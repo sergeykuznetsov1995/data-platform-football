@@ -738,28 +738,49 @@ def test_empty_unknown_schedule_requires_second_fresh_observation():
             event_ids=(),
         )
 
-    current = observation(NOW)
-    with pytest.raises(ScopeIncompleteError, match="second scheduled observation"):
+    first = observation(NOW - timedelta(days=1))
+    windows = (
+        {
+            "request_id": first.request_id,
+            "query_start": "2026-01-01",
+            "query_end": "2026-01-31",
+        },
+    )
+    with pytest.raises(runner.EmptySchedulePending) as pending:
         runner._qualify_empty_schedule(
             scope=scope,
             prior=None,
-            current_scoreboard=(current,),
+            current_scoreboard=(first,),
+            planned_windows=windows,
             mode="daily",
-            current_run_id="espn_daily__current",
+            current_run_id="espn_daily__prior",
+            pending_observation=None,
         )
 
-    prior = SimpleNamespace(
-        run_id="espn_daily__prior",
-        schedule=(),
-        raw_ledger=(observation(NOW - timedelta(days=1)),),
-    )
-    runner._qualify_empty_schedule(
+    current = observation(NOW)
+    disposition = runner._qualify_empty_schedule(
         scope=scope,
-        prior=prior,
+        prior=None,
         current_scoreboard=(current,),
+        planned_windows=(
+            {
+                "request_id": current.request_id,
+                "query_start": "2026-01-01",
+                "query_end": "2026-01-31",
+            },
+        ),
         mode="daily",
         current_run_id="espn_daily__current",
+        pending_observation=pending.value.observation,
     )
+
+    assert disposition.endpoint == "schedule"
+    assert disposition.state is DispositionState.VALID_EMPTY
+    proof = json.loads(disposition.detail)
+    assert [item["run_id"] for item in proof["observations"]] == [
+        "espn_daily__prior",
+        "espn_daily__current",
+    ]
 
 
 @pytest.mark.unit
@@ -790,8 +811,16 @@ def test_empty_partial_schedule_accepts_explicit_source_capability_metadata():
         scope=scope,
         prior=None,
         current_scoreboard=(current,),
+        planned_windows=(
+            {
+                "request_id": current.request_id,
+                "query_start": "2026-01-01",
+                "query_end": "2026-01-31",
+            },
+        ),
         mode="backfill",
         current_run_id="manual__backfill",
+        pending_observation=None,
     )
 
 

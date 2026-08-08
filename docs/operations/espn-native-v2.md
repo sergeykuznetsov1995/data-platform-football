@@ -374,9 +374,15 @@ master должен быть scheduled, этот rollout заблокирова�
    расходует. Active/successful/malformed campaign, registry/target/release-tree
    drift или четвёртая попытка блокируют trigger. Successor release обязан
    сослаться на exact predecessor failure URI/SHA и непустую remediation.
-   Полученные `campaign_id`, `attempt_id`, zero-padded ordinal и ledger URI/SHA
-   задать полным набором `ESPN_CANARY_*`; неполный или чужой claim отклоняется
-   durable-manifest reducer до финального receipt.
+   Claim возвращает content-addressed immutable `claim_ref`. Задать только его
+   точную пару как `ESPN_CANARY_CLAIM_URI` и `ESPN_CANARY_CLAIM_SHA256` до
+   admission. Admission strict-read проверяет bytes/SHA, canonical
+   `CampaignLedger`, latest active attempt, exact frozen scope array/target SHA
+   и текущий ledger SHA, затем включает claim ref в signed admission и каждый
+   signed plan. Неполная пара, чужой claim или изменившийся ledger блокируют run
+   до lease/fetch/write. После terminal receipt `finish_campaign_attempt`
+   публикует отдельный content-addressed immutable `finish_ref`; claim и finish
+   evidence никогда не перезаписывают друг друга.
 
    ```bash
    espn_airflow dags pause dag_backfill_espn
@@ -445,10 +451,19 @@ planned windows должны быть успешно получены, schema-va
 competition/season ownership должна совпадать, известный nonterminal event не
 может исчезнуть, а empty требует второй более свежей scheduled observation или
 явной source capability metadata. `schedule=proven` с нулём строк всегда red.
+Первая scheduled observation при `schedule=unknown` записывается как
+non-serving `pending_empty` в существующие run-manifest/control evidence: она
+связывает scheduled run ID, timestamp, exact planned windows и immutable Raw
+URI/SHA, но не двигает serving head и завершает task красным. Следующий signed
+plan strict-read восстанавливает эту observation из exact evidence/raw-manifest
+refs; только другой более поздний scheduled run может образовать каноническую
+пару и квалифицировать `valid_empty`.
 Для каждого `played_final && summary_required` lineup и matchsheet либо
 `captured` с обеими командами, либо evidence-backed `valid_empty` только при
 partial/absent/unknown capability. Каждый nonfinal event явно
-`not_applicable`.
+`not_applicable`; для аутентичных pre-Task2 parser-v3/runtime-v4 snapshots это
+состояние безопасно выводится при qualification, даже если старый физический
+snapshot ещё не содержал disposition rows.
 
 После published DQ рядом с immutable `run-evidence.json` должен лежать
 канонический sibling `qualification-attestation.json` вида
@@ -465,6 +480,11 @@ Attestation связывает текущую квалификацию с выб
 immutable scope-связью и не превращается в новый public object. Старые
 promotion evidence v2/v3 остаются complete-only и не могут квалифицировать
 новый release campaign.
+Перед verdict и ещё раз перед final receipt reducer strict-read реконструирует
+полную canonical qualification каждого scope из exact publication snapshot,
+current-run evidence, dispositions и Raw URI/SHA. Verdict и health обязаны
+нести один и тот же validated durable-manifest ref; count/scope-only совпадение
+или tamper любого nested state/Raw ref fail-closed блокирует receipt.
 
 Перед cutover нужны **три последовательных зелёных** scheduled qualification
 запуска `dag_ingest_espn` для того же scope и registry signature. В v4

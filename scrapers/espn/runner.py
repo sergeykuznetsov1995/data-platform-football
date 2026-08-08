@@ -105,6 +105,14 @@ class ScopeIncompleteError(RunnerError):
     """One scope cannot produce a COMPLETE generation."""
 
 
+class EmptySchedulePending(ScopeIncompleteError):
+    """The first unknown empty schedule observation must remain non-serving."""
+
+    def __init__(self, observation: Mapping[str, Any]) -> None:
+        super().__init__("empty schedule awaits a second scheduled observation")
+        self.observation = dict(observation)
+
+
 class ArtifactConflictError(RunnerConfigurationError):
     """An immutable artifact identity already contains different bytes."""
 
@@ -204,6 +212,7 @@ class ScopeBinding:
     generation_snapshot_uri: str
     known_nonterminal_events: tuple[KnownNonterminalEvent, ...]
     prior: PriorBinding | None
+    pending_empty_observation: Mapping[str, Any] | None = None
     scoreboard_max_range_days: int = SCOREBOARD_MAX_RANGE_DAYS
 
 
@@ -230,6 +239,8 @@ class LoadedPlan:
     selected_scopes: tuple[str, ...]
     bindings: Mapping[str, ScopeBinding]
     replay_source: ReplaySource | None
+    release: Mapping[str, Any] | None = None
+    canary_claim: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -436,12 +447,20 @@ def _scope_binding(value: Any, scope_id: str) -> ScopeBinding:
         "prior",
     }
     range_key = "scoreboard_max_range_days"
-    current_keys = legacy_keys | {range_key}
+    pending_key = "pending_empty_observation"
+    current_keys = legacy_keys | {range_key, pending_key}
     actual_keys = set(raw)
     if actual_keys == legacy_keys:
         scoreboard_max_range_days = LEGACY_SCOREBOARD_MAX_RANGE_DAYS
-    elif actual_keys == current_keys:
-        scoreboard_max_range_days = raw[range_key]
+        pending_empty_observation = None
+    elif frozenset(actual_keys) in {
+        frozenset(legacy_keys | {range_key}),
+        frozenset(legacy_keys | {pending_key}),
+        frozenset(current_keys),
+    }:
+        scoreboard_max_range_days = raw.get(
+            range_key, LEGACY_SCOREBOARD_MAX_RANGE_DAYS
+        )
         if (
             type(scoreboard_max_range_days) is not int
             or scoreboard_max_range_days not in SCOREBOARD_RANGE_DAYS
@@ -450,10 +469,15 @@ def _scope_binding(value: Any, scope_id: str) -> ScopeBinding:
                 f"{field_name}.{range_key} must be exactly one of "
                 f"{sorted(SCOREBOARD_RANGE_DAYS)}"
             )
+        pending_empty_observation = raw.get(pending_key)
+        if pending_empty_observation is not None:
+            pending_empty_observation = _mapping(
+                pending_empty_observation, f"{field_name}.{pending_key}"
+            )
     else:
         _exact_keys(
             raw,
-            current_keys if range_key in raw else legacy_keys,
+            current_keys,
             field_name,
         )
         raise AssertionError("unreachable scope binding key validation")
@@ -506,6 +530,7 @@ def _scope_binding(value: Any, scope_id: str) -> ScopeBinding:
             sorted(known, key=lambda item: (item.event_date, item.event_id))
         ),
         prior=prior,
+        pending_empty_observation=pending_empty_observation,
         scoreboard_max_range_days=scoreboard_max_range_days,
     )
 
@@ -570,9 +595,7 @@ def _load_signed_plan(uri: str) -> LoadedPlan:
     metadata = _mapping(plan.metadata, "plan.metadata")
     _exact_keys(metadata, {"runtime"}, "plan.metadata")
     runtime = _mapping(metadata["runtime"], "plan.metadata.runtime")
-    _exact_keys(
-        runtime,
-        {
+    legacy_runtime_keys = {
             "mode",
             "attempt",
             "registry_snapshot_uri",
@@ -583,9 +606,13 @@ def _load_signed_plan(uri: str) -> LoadedPlan:
             "selected_scopes",
             "scope_bindings",
             "replay_source",
-        },
-        "plan.metadata.runtime",
-    )
+    }
+    current_runtime_keys = legacy_runtime_keys | {"release", "canary_claim"}
+    if frozenset(runtime) not in {
+        frozenset(legacy_runtime_keys),
+        frozenset(current_runtime_keys),
+    }:
+        _exact_keys(runtime, current_runtime_keys, "plan.metadata.runtime")
     mode = _required_string(runtime["mode"], "plan.metadata.runtime.mode")
     if mode not in _MODES:
         raise RunnerConfigurationError("plan runtime mode is invalid")
@@ -626,6 +653,16 @@ def _load_signed_plan(uri: str) -> LoadedPlan:
         selected_scopes=selected_scopes,
         bindings=bindings,
         replay_source=replay,
+        release=(
+            _mapping(runtime["release"], "plan.metadata.runtime.release")
+            if "release" in runtime
+            else None
+        ),
+        canary_claim=(
+            _mapping(runtime["canary_claim"], "plan.metadata.runtime.canary_claim")
+            if runtime.get("canary_claim") is not None
+            else None
+        ),
     )
 
 
@@ -2002,9 +2039,11 @@ def _qualify_empty_schedule(
     scope: ScopePlan,
     prior: ScopeGeneration | None,
     current_scoreboard: Sequence[RawLedgerRecord],
+    planned_windows: Sequence[Mapping[str, Any]],
     mode: str,
     current_run_id: str,
-) -> None:
+    pending_observation: Mapping[str, Any] | None,
+) -> RequestDisposition:
     """Require source-backed empty evidence before zero rows may qualify."""
 
     capability = scope.capabilities.schedule
@@ -2014,28 +2053,76 @@ def _qualify_empty_schedule(
         CapabilityState.PARTIAL,
         CapabilityState.ABSENT,
     }
-    prior_scoreboard = (
-        tuple(item for item in prior.raw_ledger if item.endpoint == "scoreboard")
-        if prior is not None and not prior.schedule
-        else ()
+    if not current_scoreboard or any(
+        item.disposition is not DispositionState.CAPTURED
+        or item.endpoint != "scoreboard"
+        or item.raw_uri is None
+        or item.raw_sha256 is None
+        or item.fetched_at is None
+        for item in current_scoreboard
+    ):
+        raise ScopeIncompleteError("empty schedule observation raw evidence is incomplete")
+    if sorted(item.request_id for item in current_scoreboard) != sorted(
+        str(item.get("request_id")) for item in planned_windows
+    ):
+        raise ScopeIncompleteError("empty schedule planned window/raw identity mismatch")
+    current_observation = {
+        "run_id": current_run_id,
+        "observed_at": max(item.fetched_at for item in current_scoreboard).isoformat(),
+        "planned_windows": [
+            {
+                "request_id": str(item["request_id"]),
+                "query_start": str(item["query_start"]),
+                "query_end": str(item["query_end"]),
+            }
+            for item in sorted(planned_windows, key=lambda item: str(item["request_id"]))
+        ],
+        "raw_evidence": [
+            {
+                "request_id": item.request_id,
+                "raw_uri": item.raw_uri,
+                "raw_sha256": item.raw_sha256,
+                "fetched_at": item.fetched_at.isoformat(),
+            }
+            for item in sorted(current_scoreboard, key=lambda item: item.request_id)
+        ],
+    }
+    if explicit_source_metadata:
+        proof = {
+            "kind": "espn-empty-schedule-qualification-v1",
+            "method": "explicit_source_metadata",
+            "capability": capability.value,
+            "observations": [current_observation],
+        }
+    else:
+        if pending_observation is None:
+            raise EmptySchedulePending(current_observation)
+        try:
+            pending_at = datetime.fromisoformat(str(pending_observation["observed_at"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ScopeIncompleteError(
+                "pending empty observation timestamp is invalid"
+            ) from exc
+        if (
+            pending_observation.get("run_id") == current_run_id
+            or pending_at.tzinfo is None
+            or pending_at
+            >= datetime.fromisoformat(current_observation["observed_at"])
+        ):
+            raise ScopeIncompleteError(
+                "empty schedule observations require distinct scheduled runs and times"
+            )
+        proof = {
+            "kind": "espn-empty-schedule-qualification-v1",
+            "method": "second_scheduled_observation",
+            "observations": [dict(pending_observation), current_observation],
+        }
+    return RequestDisposition(
+        endpoint="schedule",
+        state=DispositionState.VALID_EMPTY,
+        detail=canonical_json(proof),
+        event_id=None,
     )
-    scheduled_pair = mode == "daily" and current_run_id.startswith(
-        ("scheduled__", "espn_daily__")
-    ) and prior is not None and prior.run_id.startswith(
-        ("scheduled__", "espn_daily__")
-    )
-    second_scheduled_observation = scheduled_pair and bool(prior_scoreboard) and all(
-        item.disposition is DispositionState.CAPTURED for item in prior_scoreboard
-    ) and all(
-        item.disposition is DispositionState.CAPTURED for item in current_scoreboard
-    ) and max(item.fetched_at for item in current_scoreboard) > max(
-        item.fetched_at for item in prior_scoreboard
-    )
-    if not (explicit_source_metadata or second_scheduled_observation):
-        raise ScopeIncompleteError(
-            "empty schedule requires a second scheduled observation or explicit "
-            "source capability metadata"
-        )
 
 
 @dataclass(slots=True)
@@ -2055,6 +2142,7 @@ class _PreparedScoreboard:
     records: tuple[Mapping[str, Any], ...]
     noop_result: Mapping[str, Any] | None = None
     parser_bridge: bool = False
+    schedule_disposition: RequestDisposition | None = None
 
 
 def _noop_scope_result(scope: ScopePlan, prior: ScopeGeneration) -> dict[str, Any]:
@@ -2149,16 +2237,26 @@ def _prepare_scope_scoreboard(
         raise ScopeIncompleteError(
             f"known non-terminal events absent from scoreboard: {missing_known}"
         )
+    schedule_disposition = None
     if not fetched_by_event and (full or (prior is not None and not prior.schedule)):
-        _qualify_empty_schedule(
+        schedule_disposition = _qualify_empty_schedule(
             scope=scope,
             prior=prior,
             current_scoreboard=tuple(
                 _ledger_from_raw(record, event_ids=())
                 for record in scoreboard_records
             ),
+            planned_windows=tuple(
+                {
+                    "request_id": request.request_id,
+                    "query_start": request.query_start.isoformat(),
+                    "query_end": request.query_end.isoformat(),
+                }
+                for request in requests
+            ),
             mode=mode,
             current_run_id=loaded.plan.run_id,
+            pending_observation=binding.pending_empty_observation,
         )
     if not fetched_by_event and not full:
         assert prior is not None
@@ -2168,6 +2266,7 @@ def _prepare_scope_scoreboard(
         winner=dict(winner),
         records=tuple(scoreboard_records),
         parser_bridge=transition == "v2-to-v3",
+        schedule_disposition=schedule_disposition,
     )
 
 
@@ -2339,6 +2438,8 @@ def _process_prepared_scope(
         if not event.summary_required
         for disposition in _not_applicable_dispositions(event)
     )
+    if prepared.schedule_disposition is not None:
+        dispositions.append(prepared.schedule_disposition)
 
     scoreboard_ledger = _merge_scoreboard_ledger(
         prior,
@@ -2461,6 +2562,12 @@ def _prepare_run_scoreboards(
             )
         except RunnerConfigurationError:
             raise
+        except EmptySchedulePending as exc:
+            failures[scope.scope_id] = {
+                "scope_id": scope.scope_id,
+                "state": "pending_empty",
+                "observation": exc.observation,
+            }
         except Exception as exc:
             failures[scope.scope_id] = {
                 "scope_id": scope.scope_id,
@@ -2613,9 +2720,18 @@ def stage(
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             scope_results.append(result)
+    pending_empty = any(item["state"] == "pending_empty" for item in scope_results)
     incomplete = any(item["state"] == "incomplete" for item in scope_results)
     staged = any(item["state"] == "staged" for item in scope_results)
-    state = "incomplete" if incomplete else ("staged" if staged else "noop")
+    state = (
+        "incomplete"
+        if incomplete
+        else "pending_empty"
+        if pending_empty
+        else "staged"
+        if staged
+        else "noop"
+    )
     payload_base = {
         "kind": "espn-native-staging-result-v1",
         "schema_version": 1,
@@ -2639,7 +2755,7 @@ def stage(
         ).hexdigest(),
     }
     return StagingResult(
-        exit_code=1 if incomplete else 0,
+        exit_code=1 if incomplete or pending_empty else 0,
         payload=payload,
         generations=generations,
     )

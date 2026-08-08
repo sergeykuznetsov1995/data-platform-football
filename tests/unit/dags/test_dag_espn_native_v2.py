@@ -20,6 +20,12 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 
 
+@pytest.fixture(autouse=True)
+def _exact_release_identity(monkeypatch):
+    monkeypatch.setenv("ESPN_RELEASE_COMMIT", "a" * 40)
+    monkeypatch.setenv("ESPN_RELEASE_TREE_SHA256", "b" * 64)
+
+
 def _reload(module_name: str):
     from airflow.operators.python import PythonOperator
 
@@ -1519,63 +1525,54 @@ def test_release_qualification_identity_binds_exact_target_and_versions(monkeypa
     assert result["runtime_version"] == "espn-native-runtime-v4"
 
 
-def test_exact_all_scope_backfill_binds_consumed_campaign_ordinal(monkeypatch):
+def test_exact_all_scope_backfill_binds_consumed_campaign_ordinal(
+    monkeypatch, tmp_path
+):
     from dags.utils import espn_native_tasks
+    from scripts.espn_canary_campaign import claim_campaign_attempt
 
     monkeypatch.setenv(espn_native_tasks.RELEASE_COMMIT_ENV, "a" * 40)
     monkeypatch.setenv(espn_native_tasks.RELEASE_TREE_SHA256_ENV, "b" * 64)
     index = {
         "mode": "backfill",
         "registry_signature": "c" * 64,
-        "scope_ids": [f"{item}:2026" for item in range(1, 182)],
+        "scope_ids": sorted(f"{item}:2026" for item in range(1, 182)),
     }
     release = espn_native_tasks._release_qualification_identity(index)
-    monkeypatch.setenv(
-        espn_native_tasks.CANARY_CAMPAIGN_ID_ENV, release["campaign_id"]
+    claimed = claim_campaign_attempt(
+        ledger_path=tmp_path / "campaigns.json",
+        release_commit=release["release_commit"],
+        release_tree_sha256=release["release_tree_sha256"],
+        registry_signature=release["registry_signature"],
+        target_scope_ids=release["target_scope_ids"],
+        now=datetime(2026, 8, 8, tzinfo=timezone.utc),
     )
-    monkeypatch.setenv(
-        espn_native_tasks.CANARY_ATTEMPT_ID_ENV,
-        f"{release['campaign_id']}-ordinal001",
-    )
-    monkeypatch.setenv(espn_native_tasks.CANARY_ORDINAL_ENV, "001")
-    monkeypatch.setenv(
-        espn_native_tasks.CANARY_LEDGER_URI_ENV, "file:///state/campaigns.json"
-    )
-    monkeypatch.setenv(espn_native_tasks.CANARY_LEDGER_SHA256_ENV, "d" * 64)
+    index["canary_claim"] = claimed["claim_ref"]
 
     result = espn_native_tasks._canary_campaign_identity(index, release)
 
-    assert result == {
-        "campaign_id": release["campaign_id"],
-        "attempt_id": f"{release['campaign_id']}-ordinal001",
-        "ordinal": 1,
-        "ledger_ref": {
-            "uri": "file:///state/campaigns.json",
-            "sha256": "d" * 64,
-        },
-    }
+    assert result["campaign_id"] == release["campaign_id"]
+    assert result["attempt_id"] == f"{release['campaign_id']}-ordinal001"
+    assert result["ordinal"] == 1
+    assert result["claim_ref"] == claimed["claim_ref"]
 
 
-def test_exact_all_scope_backfill_rejects_unpadded_or_out_of_range_ordinal(
-    monkeypatch,
-):
+def test_exact_all_scope_backfill_rejects_noncanonical_target_claim():
     from dags.utils import espn_native_tasks
 
+    target = sorted(f"{item}:2026" for item in range(1, 182))
     index = {
         "mode": "backfill",
         "registry_signature": "c" * 64,
-        "scope_ids": [f"{item}:2026" for item in range(1, 182)],
+        "scope_ids": [*target[:-1], "999:2026"],
+        "canary_claim": {"uri": "file:///claim.json", "sha256": "f" * 64},
     }
     release = {
+        "target_scope_ids": target,
         "campaign_id": "e" * 64,
     }
-    monkeypatch.setenv(espn_native_tasks.CANARY_CAMPAIGN_ID_ENV, "e" * 64)
-    monkeypatch.setenv(
-        espn_native_tasks.CANARY_ATTEMPT_ID_ENV, f"{'e' * 64}-ordinal001"
-    )
-    monkeypatch.setenv(espn_native_tasks.CANARY_ORDINAL_ENV, "1")
 
-    with pytest.raises(espn_native_tasks.OperationsError, match="001, 002 or 003"):
+    with pytest.raises(espn_native_tasks.OperationsError, match="exact all-181"):
         espn_native_tasks._canary_campaign_identity(index, release)
 
 
@@ -2114,8 +2111,8 @@ def test_daily_admission_v2_persists_exact_discovery_and_coverage(monkeypatch):
     admission_uri, admission, kwargs = writes[0]
     assert admission_uri.endswith("/admission.json")
     assert kwargs == {"immutable": True}
-    assert admission["kind"] == "espn-airflow-admission-v2"
-    assert admission["schema_version"] == 2
+    assert admission["kind"] == "espn-airflow-admission-v3"
+    assert admission["schema_version"] == 3
     assert admission["registry_ref"] == registry_ref
     assert admission["registry_signature"] == registry.signature()
     assert admission["discovery_state_ref"] == state_ref
@@ -2125,6 +2122,8 @@ def test_daily_admission_v2_persists_exact_discovery_and_coverage(monkeypatch):
     assert admission["target_scope_ids"] == list(target)
     assert admission["scope_ids"] == list(target)
     assert admission["bootstrap_scope_ids"] == []
+    assert admission["release"]["target_scope_ids"] == list(target)
+    assert admission["canary_claim"] is None
 
 
 def test_manual_admission_keeps_explicit_generated_scope_without_reading_heads(
@@ -2373,6 +2372,178 @@ def test_daily_admission_retry_revalidates_heads_without_parent_metadata(
             espn_native_tasks.validate_registry_and_admission(mode="daily", **context)
             == admission_ref
         )
+
+
+def test_missing_release_identity_fails_before_control_store(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    monkeypatch.delenv(espn_native_tasks.RELEASE_COMMIT_ENV, raising=False)
+    monkeypatch.delenv(espn_native_tasks.RELEASE_TREE_SHA256_ENV, raising=False)
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        lambda: (_ for _ in ()).throw(AssertionError("control store reached")),
+    )
+
+    with pytest.raises(Exception, match=espn_native_tasks.RELEASE_COMMIT_ENV):
+        espn_native_tasks.validate_registry_and_admission(
+            mode="repair",
+            dag=SimpleNamespace(dag_id="dag_ingest_espn_repair"),
+            dag_run=SimpleNamespace(conf={}),
+            run_id="manual__missing-release",
+            logical_date=datetime(2026, 8, 8, tzinfo=timezone.utc),
+            params={"attempt": 1, "scopes": ["700:2026"]},
+        )
+
+
+def test_signed_admission_rejects_drifted_deployment_release(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    release = espn_native_tasks._release_identity(
+        registry_signature="c" * 64,
+        target_scope_ids=("700:2026",),
+    )
+    monkeypatch.setenv(espn_native_tasks.RELEASE_COMMIT_ENV, "d" * 40)
+
+    with pytest.raises(
+        espn_native_tasks.OperationsError,
+        match="differs from deployment",
+    ):
+        espn_native_tasks._validate_release_identity(
+            release,
+            registry_signature="c" * 64,
+            target_scope_ids=("700:2026",),
+        )
+
+
+def test_canary_claim_strict_read_rejects_mutated_ledger(tmp_path):
+    from dags.utils import espn_native_tasks
+    from scripts.espn_canary_campaign import (
+        claim_campaign_attempt,
+        finish_campaign_attempt,
+    )
+
+    scopes = tuple(sorted(f"{index}:2026" for index in range(1, 182)))
+    ledger_path = tmp_path / "campaigns.json"
+    claimed = claim_campaign_attempt(
+        ledger_path=ledger_path,
+        release_commit="a" * 40,
+        release_tree_sha256="b" * 64,
+        registry_signature="c" * 64,
+        target_scope_ids=scopes,
+        now=datetime(2026, 8, 8, tzinfo=timezone.utc),
+    )
+    release = {
+        **claimed["campaign"],
+        "parser_version": "espn-native-parser-v3",
+        "runtime_version": "espn-native-runtime-v4",
+    }
+
+    validated = espn_native_tasks._validated_canary_claim(
+        claimed["claim_ref"], release=release, target_scope_ids=scopes
+    )
+    assert validated["attempt_id"].endswith("ordinal001")
+
+    finish_campaign_attempt(
+        ledger_path=ledger_path,
+        attempt_id=validated["attempt_id"],
+        terminal_ref={"uri": "s3://evidence/failure.json", "sha256": "d" * 64},
+        successful=False,
+        now=datetime(2026, 8, 8, tzinfo=timezone.utc),
+    )
+    with pytest.raises(Exception, match="hash|changed"):
+        espn_native_tasks._validated_canary_claim(
+            claimed["claim_ref"], release=release, target_scope_ids=scopes
+        )
+
+
+def test_pending_empty_control_evidence_is_strictly_loaded_for_next_plan(
+    monkeypatch,
+):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.operations import RunManifestEvidence
+
+    recorded_at = datetime(2026, 8, 7, 14, tzinfo=timezone.utc)
+    observation = {
+        "run_id": "espn_daily__prior",
+        "observed_at": recorded_at.isoformat(),
+        "planned_windows": [
+            {
+                "request_id": "scoreboard:1",
+                "query_start": "2026-01-01",
+                "query_end": "2026-01-31",
+            }
+        ],
+        "raw_evidence": [
+            {
+                "request_id": "scoreboard:1",
+                "raw_uri": "s3://raw/1.json",
+                "raw_sha256": "a" * 64,
+                "fetched_at": recorded_at.isoformat(),
+            }
+        ],
+    }
+    raw_ref = {"uri": "s3://artifacts/raw.json", "sha256": "b" * 64}
+    evidence_ref = {"uri": "s3://artifacts/evidence.json", "sha256": "c" * 64}
+    evidence = RunManifestEvidence(
+        dag_id="dag_ingest_espn",
+        run_id=observation["run_id"],
+        attempt=1,
+        scope_id="700:2026",
+        plan_signature="d" * 64,
+        registry_signature="e" * 64,
+        state="pending_empty",
+        evidence_uri=evidence_ref["uri"],
+        evidence_sha256=evidence_ref["sha256"],
+        recorded_at=recorded_at,
+    )
+    payload = {
+        "kind": "espn-run-manifest-evidence-v1",
+        "schema_version": 2,
+        "dag_id": evidence.dag_id,
+        "run_id": evidence.run_id,
+        "attempt": evidence.attempt,
+        "scope_id": evidence.scope_id,
+        "state": evidence.state,
+        "plan_signature": evidence.plan_signature,
+        "registry_signature": evidence.registry_signature,
+        "lease_epoch": 1,
+        "raw_manifest_ref": raw_ref,
+        "observation": observation,
+        "recorded_at": evidence.recorded_at.isoformat(),
+    }
+    raw_manifest = {
+        "checkpoints": [
+            {
+                "endpoint": "scoreboard",
+                "requests": [
+                    {
+                        "request_id": "scoreboard:1",
+                        "raw_uri": "s3://raw/1.json",
+                        "raw_sha256": "a" * 64,
+                        "fetched_at": recorded_at.isoformat(),
+                    }
+                ],
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_ref",
+        lambda ref, **_kwargs: payload if ref == evidence_ref else raw_manifest,
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "_validate_raw_manifest",
+        lambda value: value,
+    )
+
+    assert espn_native_tasks._pending_empty_observation(
+        evidence,
+        dag_id=evidence.dag_id,
+        scope_id=evidence.scope_id,
+        registry_signature=evidence.registry_signature,
+    ) == observation
 
 
 def test_daily_v2_admission_retry_revalidates_all_current_runtime_heads(
@@ -6264,6 +6435,9 @@ def _run_published_dq_through_terminal(monkeypatch, *, state, mutation=None):
         runtime_version=espn_native_tasks.runner.RUNTIME_VERSION,
         registry_snapshot_uri=registry_uri,
         ingested_at=recorded_at - timedelta(minutes=2),
+        schedule=(),
+        dispositions=(),
+        raw_ledger=(),
     )
     snapshot_ref = {
         "uri": "s3://artifacts/scope/generation.json",
@@ -6452,6 +6626,11 @@ def _run_published_dq_through_terminal(monkeypatch, *, state, mutation=None):
         "_quality_payload",
         lambda report: {"passed": report.passed, "failures": []},
     )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "validate_scope_generation",
+        lambda _generation: SimpleNamespace(passed=True, failures=()),
+    )
     monkeypatch.setattr(espn_native_tasks, "_scope_operational_metrics", lambda *a: {})
     monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
 
@@ -6538,6 +6717,15 @@ def _run_published_dq_through_terminal(monkeypatch, *, state, mutation=None):
         "publication_refs": [{"publication_ref": publication_ref}],
         "evidence": [espn_native_tasks._evidence_dict(evidence_row)],
     }
+    durable["qualification"] = espn_native_tasks._qualification_summary(
+        (
+            espn_native_tasks._scope_qualification_payload(
+                publication=publication,
+                generation=generation,
+                evidence_payload=evidence_payload,
+            ),
+        )
+    )
     durable_ref = _artifact_ref(
         artifacts, "s3://artifacts/durable-run-manifest.json", durable
     )
@@ -7557,6 +7745,13 @@ def test_final_leaf_seals_success_only_after_health_and_release(monkeypatch):
     def ref_for_uri(uri):
         return {"uri": uri, "sha256": hashlib.sha256(uri.encode()).hexdigest()}
 
+    run_key = espn_native_tasks._run_key("dag_ingest_espn", "child-run")
+    durable_ref = ref_for_uri(
+        f"s3://artifacts/runs/{run_key}/durable-run-manifest.json"
+    )
+    payloads["verdict"]["durable_manifest_ref"] = durable_ref
+    payloads["health.json"]["durable_manifest_ref"] = durable_ref
+
     def read_ref(ref, **_kwargs):
         return payloads[ref["uri"].rsplit("/", 1)[-1]]
 
@@ -7564,6 +7759,11 @@ def test_final_leaf_seals_success_only_after_health_and_release(monkeypatch):
     monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
     monkeypatch.setattr(espn_native_tasks, "_ref_for_uri", ref_for_uri)
     monkeypatch.setattr(espn_native_tasks, "_read_ref", read_ref)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_reconstruct_durable_qualification",
+        lambda _index, durable: durable["qualification"],
+    )
     monkeypatch.setattr(
         espn_native_tasks,
         "_write_payload",
@@ -7600,6 +7800,124 @@ def test_final_leaf_seals_success_only_after_health_and_release(monkeypatch):
     ]
     assert written["payload"]["qualification"]["complete_new"] == 1
     assert len(written["payload"]["receipt_sha256"]) == 64
+
+
+@pytest.mark.parametrize("tamper", ["schedule_state", "raw_sha256"])
+def test_receipt_reconstruction_rejects_nested_qualification_tamper(
+    monkeypatch, tamper
+):
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.models import DispositionState
+
+    scope = SimpleNamespace(scope_id="700:2026")
+    loaded = SimpleNamespace(
+        plan=SimpleNamespace(run_id="run", registry_signature="a" * 64),
+        attempt=1,
+        signature="b" * 64,
+    )
+    generation = SimpleNamespace(
+        plan=scope,
+        generation_id="generation",
+        generation_signature="c" * 64,
+        manifest_sha256="d" * 64,
+        parser_version="espn-native-parser-v3",
+        runtime_version="espn-native-runtime-v4",
+        registry_signature="a" * 64,
+        plan_signature="b" * 64,
+        schedule=(
+            SimpleNamespace(
+                event_id=1,
+                played_final=False,
+                summary_required=False,
+            ),
+        ),
+        dispositions=(),
+        raw_ledger=(
+            SimpleNamespace(
+                request_id="scoreboard:1",
+                endpoint="scoreboard",
+                event_id=None,
+                disposition=DispositionState.CAPTURED,
+                raw_uri="s3://raw/1.json",
+                raw_sha256="e" * 64,
+            ),
+        ),
+    )
+    publication = {
+        "state": "noop",
+        "scope_binding_ref": {"uri": "binding", "sha256": "1" * 64},
+        "snapshot_ref": {"uri": "snapshot", "sha256": "2" * 64},
+        "evidence_ref": {"uri": "evidence", "sha256": "3" * 64},
+        "publication_intent_ref": None,
+    }
+    evidence = {"recorded_at": "2026-08-08T00:00:00+00:00"}
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "validate_scope_generation",
+        lambda _generation: SimpleNamespace(passed=True, failures=()),
+    )
+    expected_scope = espn_native_tasks._scope_qualification_payload(
+        publication=publication,
+        generation=generation,
+        evidence_payload=evidence,
+    )
+    qualification = espn_native_tasks._qualification_summary((expected_scope,))
+    if tamper == "schedule_state":
+        qualification["scopes"][0]["schedule"]["state"] = "valid_empty"
+    else:
+        qualification["scopes"][0]["raw_evidence"][0]["raw_sha256"] = "f" * 64
+    descriptor_ref = {"uri": "descriptor", "sha256": "4" * 64}
+    publication_ref = {"uri": "publication", "sha256": "5" * 64}
+    index = {
+        "dag_id": "dag",
+        "run_id": "run",
+        "attempt": 1,
+        "registry_signature": "a" * 64,
+        "scope_ids": ["700:2026"],
+        "scope_plan_refs": [descriptor_ref],
+    }
+    durable = {
+        "publication_refs": [{"publication_ref": publication_ref}],
+        "qualification": qualification,
+    }
+
+    def read_ref(ref, **_kwargs):
+        return {
+            "descriptor": {
+                "scope_id": "700:2026",
+                "plan_signature": "b" * 64,
+            },
+            "publication": publication,
+            "evidence": evidence,
+        }[ref["uri"]]
+
+    monkeypatch.setattr(espn_native_tasks, "_read_ref", read_ref)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_binding",
+        lambda _ref: (
+            None,
+            {"plan_signature": "b" * 64},
+            loaded,
+            scope,
+            SimpleNamespace(),
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner, "load_scope_snapshot", lambda *_a, **_k: generation
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_validate_publication_intent_for_result", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_assert_generation_binding", lambda **_kwargs: None
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_validate_evidence_payload", lambda *_a, **_k: None
+    )
+
+    with pytest.raises(Exception, match="nested qualification"):
+        espn_native_tasks._reconstruct_durable_qualification(index, durable)
 
 
 def test_exact_v4_noop_attestation_refreshes_without_moving_old_head(monkeypatch):

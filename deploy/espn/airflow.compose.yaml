@@ -42,11 +42,8 @@ x-espn-airflow-common: &espn-airflow-common
     ESPN_RELEASE_COMMIT: ${ESPN_RELEASE_COMMIT:?set exact ESPN release commit}
     ESPN_RELEASE_TREE_SHA256: ${ESPN_RELEASE_TREE_SHA256:?set exact ESPN release tree SHA-256}
     # Set this complete claim only for the guarded all-181 backfill canary.
-    ESPN_CANARY_CAMPAIGN_ID:
-    ESPN_CANARY_ATTEMPT_ID:
-    ESPN_CANARY_ORDINAL:
-    ESPN_CANARY_LEDGER_URI:
-    ESPN_CANARY_LEDGER_SHA256:
+    ESPN_CANARY_CLAIM_URI:
+    ESPN_CANARY_CLAIM_SHA256:
     # Metadata is dedicated, but leases/request gates stay shared with every
     # compatible ESPN writer through this separately supplied control plane.
     ESPN_CONTROL_DATABASE_URL: ${ESPN_CONTROL_DATABASE_URL:?set shared ESPN control database URL}
