@@ -118,7 +118,7 @@ match_modeled AS (
 
 SELECT
     -- ===== Identity =====
-    event_id,
+    m.event_id,
     scope_id,
     competition_id,
 

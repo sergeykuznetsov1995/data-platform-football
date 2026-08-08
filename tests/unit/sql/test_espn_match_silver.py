@@ -121,9 +121,19 @@ class TestEspnMatchSilver:
         # production RegexpExtract nodes and literal patterns.
 
     def test_referee_is_aggregated_before_schedule_join_and_partition_keys_trail(self):
+        tree = _tree()
         sql = _sql()
         assert "referee_by_event" in sql
         assert re.search(r"GROUP BY\s+event_id", sql, re.I)
+        first_identity = tree.expressions[0]
+        assert isinstance(first_identity, exp.Column)
+        assert (first_identity.table, first_identity.name) == ("m", "event_id")
+        referee_join = next(tree.find_all(exp.Join))
+        assert (referee_join.this.name, referee_join.this.alias) == ("referee_by_event", "r")
+        assert {
+            (column.table, column.name)
+            for column in referee_join.args["on"].find_all(exp.Column)
+        } == {("r", "event_id"), ("m", "event_id")}
         final = sql.rsplit("SELECT", 1)[-1]
         assert re.search(r"competition_slug\s+AS\s+league", final, re.I)
         assert re.search(r"CAST\s*\(\s*source_season_year\s+AS\s+varchar\s*\)\s+AS\s+season", final, re.I)
