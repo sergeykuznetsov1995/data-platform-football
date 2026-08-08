@@ -2074,8 +2074,8 @@ def _validate_args(
             violations.append("legacy daily contract fields must be empty")
         if _parse_scopes(args.scope):
             violations.append("automatic exact season scope must be empty")
-        if args.mode == "replay":
-            violations.append("replay cannot create a live catalog contract")
+        if args.mode not in {"daily", "refresh", "backfill"}:
+            violations.append("mode must be daily, refresh, or backfill")
         if args.competition_limit:
             violations.append("competition limit must be zero")
         if violations:

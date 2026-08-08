@@ -343,7 +343,7 @@ def fotmob_catalog_trigger_conf(mode: str) -> dict[str, Any]:
     """Return a dynamic all-included-men profile without issue-930 inputs."""
 
     normalized_mode = str(mode).strip().casefold()
-    if normalized_mode not in {"discover", "daily", "refresh", "backfill"}:
+    if normalized_mode not in {"daily", "refresh", "backfill"}:
         raise ValueError("automatic catalog mode is not supported")
     return {
         "mode": normalized_mode,

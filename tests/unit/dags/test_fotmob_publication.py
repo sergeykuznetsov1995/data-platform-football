@@ -916,6 +916,26 @@ def test_catalog_trigger_conf_has_no_historical_issue930_scope_contract():
     } & set(conf)
 
 
+def test_catalog_trigger_conf_rejects_discover_and_preserves_live_modes():
+    with pytest.raises(ValueError, match="automatic catalog mode"):
+        publication.fotmob_catalog_trigger_conf("discover")
+
+    for mode in ("daily", "refresh", "backfill"):
+        conf = publication.fotmob_catalog_trigger_conf(mode)
+        assert conf == {
+            "mode": mode,
+            "scope": "",
+            "catalog_contract": "fotmob-catalog-v1",
+            "entities": "season,leaderboards,matches,teams,players,transfers",
+            "max_requests": 10_000,
+            "max_direct_mib": 512,
+            "max_proxy_mib": 0,
+            "competition_limit": 0,
+            "season_limit": 0,
+            "requests_per_minute": 60,
+        }
+
+
 def _binding(owner: str = "isolated", fingerprint: str = GIT_SHA):
     return publication.make_publication_binding(
         owner=owner,

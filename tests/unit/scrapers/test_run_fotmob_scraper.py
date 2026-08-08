@@ -259,6 +259,38 @@ class TestFotmobNativeRunner:
             )
 
     @pytest.mark.unit
+    def test_automatic_catalog_discover_fails_before_service_construction(
+        self, monkeypatch
+    ):
+        from utils import fotmob_publication as publication
+
+        mod = self._module()
+        monkeypatch.delenv(
+            publication.FOTMOB_DEPLOYMENT_REPORT_PATH_ENV, raising=False
+        )
+        monkeypatch.delenv(
+            publication.FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV, raising=False
+        )
+        build_service = MagicMock()
+        monkeypatch.setattr(mod, "_build_native_service", build_service)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "run_fotmob_scraper.py",
+                "--mode",
+                "discover",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+            ],
+        )
+
+        with pytest.raises(SystemExit):
+            mod.main()
+
+        build_service.assert_not_called()
+
+    @pytest.mark.unit
     def test_automatic_runner_emits_classifier_bound_contract_and_attempts(self):
         from scrapers.fotmob.catalog_contract import catalog_contract_from_dict
         from scrapers.fotmob.transport import canonicalize_target
