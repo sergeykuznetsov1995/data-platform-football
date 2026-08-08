@@ -1,754 +1,580 @@
-# FotMob: production, acceptance и rollback
+# FotMob production: automatic catalog, cleanup и rollback
 
-Этот runbook относится к source-native контуру FotMob. Контур использует
-отдельный compose-проект и отдельную Airflow metadata DB. Isolated deploy не
-создаёт DAG rows в shared metadata DB, но оба scheduler используют одну
-production `FBREF_CONTROL_DB_URI`: через неё fenced publication generation
-защищает FotMob Silver от одновременного чтения shared xref/Gold. Единственные
-явные shared-изменения cutover — заранее reviewed master gate, publication
-миграция и ownership Variable. Единственный FotMob producer schedule —
-`0 14 * * *` в `dag_trigger_fotmob_daily`.
+Это инструкция для нового production-контура FotMob.
 
-## Подготовка релиза
+Коротко: список турниров не заполняется руками. Automatic catalog сам находит
+мужские турниры, включая мужские товарищеские. Женские турниры исключаются.
+Неизвестный или противоречивый турнир не запускается, пока классификатор не
+получит однозначное доказательство.
 
-1. Создать чистый detached worktree на проверенном commit. В нём должны быть
-   `dags/dag_ingest_fotmob.py`, `dags/dag_transform_fotmob_silver.py` и
-   `dags/dag_trigger_fotmob_daily.py`.
-2. Использовать Airflow и PostgreSQL images, закреплённые полными `sha256`
-   digest. Mutable tag, включая versioned tag, admission не проходит.
-3. Создать защищённые host paths для env-файла и evidence. Не копировать
-   секреты в Git, compose или отчёты.
-   В shared `.env` задать `FOTMOB_SHARED_ADMISSION_HOST_DIR` равным тому же
-   absolute evidence directory, который будет передан isolated deploy, и
-   заранее выбрать container path отчёта, например
-   `FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH=/opt/airflow/fotmob-admission/deployment.json`.
-   Shared compose монтирует весь каталог отдельно read-only; нельзя использовать
-   file bind, потому что atomic replacement отчёта меняет inode, и нельзя
-   давать task-ам второй writable mount того же каталога или его parent/child.
-   Deploy сверяет inode и canonical paths всех writable bind/volume mounts;
-   вложенность с logs/state fail-closed. Shared scheduler
-   должен быть создан с этим mount до admission и не пересоздаваться между
-   созданием report и shared fallback: report привязан к его full container ID.
-   Каталог обязан существовать до `docker compose up` (`create_host_path=false`
-   у scheduler mount). Deploy нормализует evidence directory и вложенный report
-   directory в `0755`, в том числе при host umask `077`; секретов там быть не
-   должно. Scheduler-specific `volumes` обязан явно содержать и этот mount, и
-   `./configs/fotmob:/opt/airflow/configs/fotmob:ro`, потому что YAML sequence
-   override не наследует common volumes. Deploy через `docker inspect` требует
-   exact resolved host source, bind destination
-   `/opt/airflow/fotmob-admission`, `RW=false`, а внутри exact shared container
-   сверяет `FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH` с относительным путём
-   `--report` под этим mount. Несовпадение останавливает admission.
-4. Env-файл должен определять Airflow/Trino/S3 credentials,
-   `FOTMOB_AIRFLOW_DB_PASSWORD`, непустые `TELEGRAM_BOT_TOKEN` /
-   `TELEGRAM_CHAT_ID` и `FBREF_CONTROL_DB_URI`. Последняя обязана
-   указывать на ту же main Airflow PostgreSQL DB, что и shared scheduler, а не
-   на isolated `airflow-metadb`; пароль в URI должен быть URL-escaped. Пароль
-   isolated metadata DB генерируется только из URL-safe символов
-   `[A-Za-z0-9._~-]`, так как он входит в SQLAlchemy URI. Release root, image,
-   Git SHA и evidence path выставляет deploy-команда.
-5. Evidence path заранее создать для uid `50000`, хранить вне release worktree и
-   класть туда только non-secret отчёты. Каталог и lock должны быть
-   owner-controlled и не writable для group/others; report `0444` читается
-   scheduler-ом. Все секреты хранить отдельно в защищённом env-файле с mode
-   `0600`.
+## Что работает в Airflow
 
-Перед isolated deploy выполнить ownership handoff в shared Airflow:
+В isolated stack разрешены ровно шесть DAG:
 
-1. Развернуть в shared scheduler тот же commit, включая gate в
-   `dag_master_pipeline.py`, production consumer в
-   `dag_sofascore_pipeline.py`, fenced child DAG-и
-   `dag_transform_xref.py`, `dag_ingest_fotmob.py`,
-   `dag_transform_fotmob_silver.py`, `dag_transform_e3.py`,
-   `dag_transform_e4.py`, `dag_transform_fbref_gold.py`,
-   `dags/scripts/run_fotmob_scraper.py`, `dags/utils/fotmob_publication.py` и
-   актуальные ControlStore migrations. В root Compose задать точные
-   `FBREF_CONTROL_DB_URI` и `FOTMOB_DEPLOY_GIT_SHA`, пересоздать Airflow
-   services и убедиться, что external network `dp-backend` доступна isolated
-   stack. Shared Airflow обязан иметь read-only mount
-   `./configs/fotmob:/opt/airflow/configs/fotmob`; без exact
-   `competitions.json` и `issue-930-scopes.txt` (SHA-256
-   `f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58`)
-   native runner не допускается. Scope-файл берётся
-   только из того же clean release checkout и commit, что и deploy:
-   не генерировать, не копировать из другой ветки и не редактировать
-   его вручную. Из корня release до deploy обязательно проверить:
+| DAG | Schedule | Состояние после automatic activation |
+| --- | --- | --- |
+| `dag_orchestrate_fotmob` | `*/5 * * * *` | unpaused |
+| `dag_ingest_fotmob` | `None` | unpaused |
+| `dag_transform_fotmob_silver` | `None` | unpaused |
+| `dag_trigger_fotmob_daily` | `None` | paused |
+| `dag_refresh_fotmob` | `None` | paused |
+| `dag_backfill_fotmob` | `None` | paused |
+
+Три последних DAG — legacy. У них больше нет production schedule. Их нельзя
+включать для cutover или recovery.
+
+В shared Airflow Variable `fotmob_schedule_owner` всегда имеет значение
+`isolated`. Во время activation deploy сам включает shared
+`dag_sofascore_pipeline`. Не менять ownership Variable руками.
+
+## Перед началом
+
+Нужны:
+
+- чистый reviewed checkout нужного commit;
+- Airflow и PostgreSQL images с полным `@sha256:<64-hex>` digest;
+- защищённый env-файл с Airflow, Trino, S3, Telegram и
+  `FBREF_CONTROL_DB_URI`;
+- durable evidence directory, доступный uid `50000`;
+- shared scheduler с тем же commit и read-only mount этого evidence directory;
+- `FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH`, указывающий в shared container на тот
+  же `deployment.json`;
+- shared `dag_master_pipeline`, `dag_sofascore_pipeline`,
+  `dag_ingest_fotmob` и `dag_transform_fotmob_silver` paused, без
+  `running`/`queued` FotMob runs.
+
+Deploy сам проверяет container IDs, Git SHA, runtime files, общий control DB,
+Airflow metadata и protected evidence. При несовпадении он ничего не включает.
+
+Из корня чистого checkout один раз задайте значения:
+
+```bash
+export FOTMOB_RELEASE_ROOT="$PWD"
+export FOTMOB_RELEASE_SHA="$(git rev-parse HEAD)"
+export FOTMOB_ENV=/protected/path/fotmob.env
+export FOTMOB_TRINO_ENV=/protected/path/fotmob-host-trino.env
+export FOTMOB_EVIDENCE=/durable/path/fotmob-evidence
+export FOTMOB_DEPLOY_REPORT="$FOTMOB_EVIDENCE/deployment.json"
+export FOTMOB_CANARY_REPORT="$FOTMOB_EVIDENCE/automatic-canary.json"
+export FOTMOB_AIRFLOW_IMAGE='registry/data-platform-airflow@sha256:<64-hex>'
+export FOTMOB_POSTGRES_IMAGE='docker.io/library/postgres@sha256:<64-hex>'
+export FOTMOB_SHARED_SCHEDULER=airflow-scheduler
+mkdir -p "$FOTMOB_EVIDENCE"
+```
+
+Не копировать, не переименовывать и не редактировать evidence JSON между
+шагами.
+
+## 1. Подготовить automatic catalog, всё оставить paused
+
+Запускайте именно с `--automatic-catalog --keep-paused`:
+
+```bash
+python deploy/fotmob/deploy.py \
+  --release-root "$FOTMOB_RELEASE_ROOT" \
+  --env-file "$FOTMOB_ENV" \
+  --image "$FOTMOB_AIRFLOW_IMAGE" \
+  --postgres-image "$FOTMOB_POSTGRES_IMAGE" \
+  --evidence-dir "$FOTMOB_EVIDENCE" \
+  --shared-scheduler-container "$FOTMOB_SHARED_SCHEDULER" \
+  --automatic-catalog \
+  --keep-paused \
+  --report "$FOTMOB_DEPLOY_REPORT"
+```
+
+Ожидаемый результат:
+
+- `passed=true`;
+- `activation_state=kept_paused`;
+- `automatic_rollout.phase=awaiting_canary`;
+- все шесть DAG находятся в `paused`, а `unpaused` пуст.
+
+Проверка:
+
+```bash
+jq '{passed, activation_state, paused, unpaused, automatic_rollout}' \
+  "$FOTMOB_DEPLOY_REPORT"
+```
+
+## 2. Запустить один manual automatic canary
+
+Canary использует dynamic `fotmob-catalog-v1`, а не статический список #930.
+Он временно включает только ingest и Silver, затем снова оставляет все шесть
+DAG paused.
+
+```bash
+python scripts/fotmob_backfill.py run \
+  --mode automatic-canary \
+  --env-file "$FOTMOB_ENV" \
+  --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+  --expected-git-sha "$FOTMOB_RELEASE_SHA" \
+  --publication-attempt 1 \
+  --max-requests 10000 \
+  --max-direct-mib 512 \
+  --timeout-seconds 86400 \
+  --execute \
+  --confirm RUN_FOTMOB_AUTOMATIC_CANARY \
+  --output "$FOTMOB_CANARY_REPORT"
+```
+
+Ожидаемый результат:
+
+- `passed=true`;
+- `phase=abandoned`;
+- `recovery_required=false`;
+- ingest и Silver завершились `success`;
+- publication generation освобождена и не опубликована.
+
+```bash
+jq '{passed, phase, recovery_required, ingest_run_state, silver_run_state, final_publication}' \
+  "$FOTMOB_CANARY_REPORT"
+```
+
+Если report требует recovery, не освобождайте lock и не переключайте DAG
+руками. Выполните recovery с тем же deployment, attempt и лимитами:
+
+```bash
+python scripts/fotmob_backfill.py recover \
+  --mode automatic-canary \
+  --env-file "$FOTMOB_ENV" \
+  --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+  --recovery-report "$FOTMOB_CANARY_REPORT" \
+  --expected-git-sha "$FOTMOB_RELEASE_SHA" \
+  --publication-attempt 1 \
+  --max-requests 10000 \
+  --max-direct-mib 512 \
+  --execute \
+  --confirm RECOVER_FOTMOB_AUTOMATIC_CANARY \
+  --output "$FOTMOB_EVIDENCE/automatic-canary-recovery.json"
+
+export FOTMOB_CANARY_REPORT="$FOTMOB_EVIDENCE/automatic-canary-recovery.json"
+```
+
+Для activation передавайте последний зелёный canary report.
+
+## 3. Включить automatic owner
+
+Activation разрешён только для сегодняшней daily boundary в окне
+`13:30 <= UTC < 14:45`. Используйте тот же release, env, images, evidence,
+project, shared container и `deployment.json`, что на шаге 1.
+
+```bash
+python deploy/fotmob/deploy.py \
+  --release-root "$FOTMOB_RELEASE_ROOT" \
+  --env-file "$FOTMOB_ENV" \
+  --image "$FOTMOB_AIRFLOW_IMAGE" \
+  --postgres-image "$FOTMOB_POSTGRES_IMAGE" \
+  --evidence-dir "$FOTMOB_EVIDENCE" \
+  --shared-scheduler-container "$FOTMOB_SHARED_SCHEDULER" \
+  --automatic-catalog \
+  --activate-automatic \
+  --automatic-canary-report "$FOTMOB_CANARY_REPORT" \
+  --report "$FOTMOB_DEPLOY_REPORT"
+```
+
+Ожидаемый результат:
+
+- `passed=true`;
+- `activation_state=active`;
+- `dag_orchestrate_fotmob`, ingest и Silver unpaused;
+- три legacy DAG paused;
+- shared SofaScore consumer unpaused;
+- owner включён последним, одним проверенным переходом.
+
+```bash
+jq '{passed, activation_state, paused, unpaused, automatic_rollout, automatic_activation}' \
+  "$FOTMOB_DEPLOY_REPORT"
+```
+
+Если ошибка произошла до включения owner, deploy возвращает всё в paused и
+может остановить isolated scheduler. После исправления причины повторите ту же
+activation-команду.
+
+Если report имеет `activation_state=pending_automatic` и
+`recovery_required=true`, owner уже мог включиться. Ничего не останавливайте,
+не ставьте DAG на паузу и не правьте JSON. Повторите ту же activation-команду:
+она сначала прочитает реальное состояние и только потом безопасно завершит
+report.
+
+Если старый Sofa sensor уже истёк, повторная команда принимает только реальный
+безопасный failed-граф: wait=`failed`, три transform trigger=`upstream_failed`,
+finalizer=`failed`, активной publication нет. Старый interval не переигрывается;
+rollout продолжится со следующей живой daily boundary.
+
+## Если automatic generation упал после activation
+
+Не ждите 14 дней и не освобождайте lock руками. Возьмите exact generation ID
+из упавшего owner/ingest/Silver run и запустите recovery:
+
+```bash
+export FOTMOB_GENERATION_ID='<exact UUID>'
+export FOTMOB_RECOVERY_REPORT="$FOTMOB_EVIDENCE/automatic-recovery-$FOTMOB_GENERATION_ID.json"
+
+python scripts/fotmob_recover.py \
+  --project fotmob-airflow \
+  --compose-file deploy/fotmob/airflow.compose.yaml \
+  --env-file "$FOTMOB_ENV" \
+  --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+  --generation-id "$FOTMOB_GENERATION_ID" \
+  --execute \
+  --confirm RECOVER_FOTMOB_AUTOMATIC_PUBLICATION \
+  --output "$FOTMOB_RECOVERY_REPORT"
+```
+
+Команда сама проверяет active deployment, оба живых scheduler и exact цепочку
+owner → ingest → Silver. Затем она ставит ровно шесть isolated DAG на паузу.
+
+- `writing` или retained `failed`: только полностью остановленная цепочка
+  получает `safe_to_release=true`; cursor двигается вперёд, поэтому тот же
+  generation не откроется снова.
+- daily `ready` без consumer: lock освобождается только для exact упавшего
+  scheduled Sofa run с terminal wait/downstream proof.
+- refresh/backfill `ready` или уже `abandoned`: нужны exact успешные ingest и
+  Silver, failed owner finalizer/cursor и пустые active-run/task proofs. Команда
+  idempotent-abandon поколение и двигает fair cursor; Sofa здесь не существует.
+- `consuming`: команда ничего не освобождает и пишет красный protected report.
+  Это означает, что shared-таблицы могли измениться частично; нужен отдельный
+  reviewed repair по exact Sofa/xref/E3/E4 lineage.
+
+После зелёного recovery все шесть isolated DAG и новые Sofa schedules остаются
+paused. Проверьте `rollout_ready` в report. Если там `false`, старый shared run
+ещё спокойно заканчивает failure: не очищайте его tasks, а после terminal
+состояния повторите ту же recovery-команду. Она idempotent и обновит proof.
+Возвращайте traffic только когда `rollout_ready=true`, новым pristine automatic
+rollout начиная с шага 1. Не включайте owner или children руками.
+
+## Первый scheduled run
+
+Activation — это разрешение работать, а не доказательство успешной загрузки.
+Для первого daily interval должны завершиться `success`:
+
+- scheduled `dag_orchestrate_fotmob`;
+- его exact ingest child;
+- exact Silver child;
+- shared `dag_sofascore_pipeline`;
+- task `finalize_fotmob_publication`;
+- publication со статусом `published` и `released`.
+
+Сохраните их exact run IDs, generation ID и publication binding в protected
+artifact `fotmob-scheduled-observation-v1`.
+
+После завершения первого daily запуска создайте artifact read-only командой:
+
+```bash
+export FOTMOB_SCHEDULED_OBSERVATION="$FOTMOB_EVIDENCE/first-scheduled-observation.json"
+
+python scripts/fotmob_observe.py \
+  --project fotmob-airflow \
+  --compose-file deploy/fotmob/airflow.compose.yaml \
+  --env-file "$FOTMOB_ENV" \
+  --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+  --output "$FOTMOB_SCHEDULED_OBSERVATION"
+```
+
+Команда дважды читает обе Airflow metadata, проверяет живые container/runtime,
+общий control DB и exact цепочку owner → ingest → Silver → Sofa → finalizer.
+Она пишет только зелёный protected artifact с правами `0600`; чужой файл не
+перезаписывает. Purge затем ещё раз сверяет artifact с живыми metadata и
+control/data plane, поэтому одного JSON недостаточно.
+
+## Purge только 10557/10558
+
+Purge не является частью activation. Он жёстко ограничен ID `10557` и `10558`.
+Нельзя запускать ни plan, ни apply без текущего active deployment report и
+защищённого первого scheduled observation.
+
+Перед plan поставьте на паузу isolated, shared consumer и оба shared
+maintenance DAG. Команда проверяет, что никто из них не работает:
+
+```bash
+export FOTMOB_PAUSE_REPORT="$FOTMOB_EVIDENCE/rollback-pause.json"
+
+python scripts/fotmob_rollback.py pause \
+  --env-file "$FOTMOB_ENV" \
+  --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+  --execute \
+  --confirm PAUSE_FOTMOB_WRITERS \
+  --output "$FOTMOB_PAUSE_REPORT"
+
+export FOTMOB_PAUSE_REPORT_SHA="$(sha256sum "$FOTMOB_PAUSE_REPORT" | awk '{print $1}')"
+```
+
+Эта пауза останавливает automatic traffic и временно ставит на паузу две
+maintenance DAG. Automatic traffic можно вернуть только новым rollout; старые
+owner DAG вручную не включать. Состояние maintenance возвращается отдельной
+командой ниже.
+
+Read-only plan:
+
+```bash
+export FOTMOB_PURGE_PLAN="$FOTMOB_EVIDENCE/fotmob-10557-10558-purge-plan.json"
+
+python scripts/purge_fotmob_competitions.py \
+  --env-file "$FOTMOB_ENV" \
+  --trino-env-file "$FOTMOB_TRINO_ENV" \
+  --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+  --scheduled-observation-report "$FOTMOB_SCHEDULED_OBSERVATION" \
+  --output "$FOTMOB_PURGE_PLAN"
+
+export FOTMOB_PURGE_PLAN_SHA="$(jq -r '.plan_sha256' "$FOTMOB_PURGE_PLAN")"
+```
+
+Plan живёт один час. После отдельного review применяйте тот же файл и его
+встроенный canonical SHA-256. Команда чтения отклоняет JSON с повторяющимися
+ключами:
+
+```bash
+python scripts/purge_fotmob_competitions.py \
+  --apply \
+  --env-file "$FOTMOB_ENV" \
+  --trino-env-file "$FOTMOB_TRINO_ENV" \
+  --plan "$FOTMOB_PURGE_PLAN" \
+  --plan-sha256 "$FOTMOB_PURGE_PLAN_SHA" \
+  --journal "$FOTMOB_EVIDENCE/fotmob-10557-10558-purge-journal.json" \
+  --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+  --scheduled-observation-report "$FOTMOB_SCHEDULED_OBSERVATION"
+```
+
+Не создавать plan заново вместо review старого файла. Apply сохраняет journal
+для безопасного продолжения после прерывания.
+
+После `status=complete` вернуть только исходные состояния двух maintenance DAG:
+
+```bash
+export FOTMOB_OPERATION_REPORT="$FOTMOB_EVIDENCE/fotmob-10557-10558-purge-journal.json"
+export FOTMOB_OPERATION_REPORT_SHA="$(sha256sum "$FOTMOB_OPERATION_REPORT" | awk '{print $1}')"
+
+python scripts/fotmob_rollback.py restore-maintenance \
+  --env-file "$FOTMOB_ENV" \
+  --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+  --pause-evidence "$FOTMOB_PAUSE_REPORT" \
+  --pause-evidence-sha256 "$FOTMOB_PAUSE_REPORT_SHA" \
+  --operation-report "$FOTMOB_OPERATION_REPORT" \
+  --operation-report-sha256 "$FOTMOB_OPERATION_REPORT_SHA" \
+  --execute \
+  --confirm RESTORE_FOTMOB_MAINTENANCE \
+  --output "$FOTMOB_EVIDENCE/purge-maintenance-restore.json"
+```
+
+Если plan просмотрен, но apply точно не запускался, сначала пересчитайте SHA
+именно plan, затем используйте тот же вызов:
+
+```bash
+export FOTMOB_OPERATION_REPORT="$FOTMOB_PURGE_PLAN"
+export FOTMOB_OPERATION_REPORT_SHA="$(sha256sum "$FOTMOB_OPERATION_REPORT" | awk '{print $1}')"
+# В restore-maintenance добавить --aborted-before-mutation.
+```
+
+## Optional cleanup
+
+Cleanup удаляет только старые staging tables и при необходимости компактит
+`fotmob_field_inventory`. Он не удаляет native Bronze, raw cache,
+`fotmob_competitions`, `fotmob_competitions_current`, scope observations или их
+current view.
+
+Сначала создать read-only plan:
+
+```bash
+export FOTMOB_CLEANUP_PLAN="$FOTMOB_EVIDENCE/cleanup-plan.json"
+
+python scripts/fotmob_cleanup.py plan \
+  --trino-env-file "$FOTMOB_TRINO_ENV" \
+  --older-than-hours 24 \
+  --output "$FOTMOB_CLEANUP_PLAN"
+
+sha256sum "$FOTMOB_CLEANUP_PLAN"
+```
+
+Перед execute поставить на паузу все шесть isolated DAG и shared consumer:
+
+```bash
+export FOTMOB_PAUSE_REPORT="$FOTMOB_EVIDENCE/rollback-pause.json"
+
+python scripts/fotmob_rollback.py pause \
+  --env-file "$FOTMOB_ENV" \
+  --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+  --execute \
+  --confirm PAUSE_FOTMOB_WRITERS \
+  --output "$FOTMOB_PAUSE_REPORT"
+
+export FOTMOB_PAUSE_REPORT_SHA="$(sha256sum "$FOTMOB_PAUSE_REPORT" | awk '{print $1}')"
+```
+
+Pause report должен показывать все шесть isolated DAG paused, отсутствие
+`running`/`queued` runs и shared consumer paused в том же admitted container.
+
+После review exact plan:
+
+```bash
+export FOTMOB_CLEANUP_PLAN_SHA='<reviewed-64-hex-sha256>'
+
+python scripts/fotmob_cleanup.py execute \
+  --env-file "$FOTMOB_ENV" \
+  --trino-env-file "$FOTMOB_TRINO_ENV" \
+  --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+  --release-sha "$FOTMOB_RELEASE_SHA" \
+  --plan "$FOTMOB_CLEANUP_PLAN" \
+  --plan-sha256 "$FOTMOB_CLEANUP_PLAN_SHA" \
+  --pause-evidence "$FOTMOB_PAUSE_REPORT" \
+  --confirm EXECUTE_REVIEWED_FOTMOB_CLEANUP \
+  --output "$FOTMOB_EVIDENCE/cleanup-result.json"
+```
+
+Cleanup оставляет scheduler и shared consumer paused. После зелёного
+`cleanup-result.json` верните исходное состояние только maintenance DAG:
+
+```bash
+export FOTMOB_OPERATION_REPORT="$FOTMOB_EVIDENCE/cleanup-result.json"
+export FOTMOB_OPERATION_REPORT_SHA="$(sha256sum "$FOTMOB_OPERATION_REPORT" | awk '{print $1}')"
+
+python scripts/fotmob_rollback.py restore-maintenance \
+  --env-file "$FOTMOB_ENV" \
+  --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+  --pause-evidence "$FOTMOB_PAUSE_REPORT" \
+  --pause-evidence-sha256 "$FOTMOB_PAUSE_REPORT_SHA" \
+  --operation-report "$FOTMOB_OPERATION_REPORT" \
+  --operation-report-sha256 "$FOTMOB_OPERATION_REPORT_SHA" \
+  --execute \
+  --confirm RESTORE_FOTMOB_MAINTENANCE \
+  --output "$FOTMOB_EVIDENCE/cleanup-maintenance-restore.json"
+```
+
+Возврат automatic traffic — только новый rollout с шага 1.
+
+Если cleanup plan создан до pause, но execute точно не запускался, используйте
+его exact SHA и тот же `restore-maintenance` с
+`--operation-report "$FOTMOB_CLEANUP_PLAN" --aborted-before-mutation`. Время
+создания plan может быть раньше pause: отдельный флаг фиксирует решение
+оператора об отмене сейчас.
+
+## Rollback: только coordinator-only
+
+Rollback не включает legacy schedule и не меняет ownership обратно. Native
+Bronze, raw cache и dynamic catalog/evidence сохраняются.
+
+1. Сохранить read-only plan:
 
    ```bash
-   test "$(wc -l < configs/fotmob/issue-930-scopes.txt)" -eq 158
-   test "$(sha256sum configs/fotmob/issue-930-scopes.txt | awk '{print $1}')" = \
-     f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58
+   python scripts/fotmob_rollback.py plan \
+     --env-file "$FOTMOB_ENV" \
+     --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+     --output "$FOTMOB_EVIDENCE/rollback-plan.json"
    ```
-2. Установить shared Airflow Variable `fotmob_schedule_owner=isolated`.
-   Shared services не должны иметь `FOTMOB_ISOLATED_STACK`: при shared default
-   файл `dag_trigger_fotmob_daily.py` не materialize-ит DAG. Если от прежнего
-   parse остался stale shared DagModel `dag_trigger_fotmob_daily`, поставить его
-   на паузу.
-3. Зафиксировать реальное production orchestration state:
-   `dag_master_pipeline=paused`, `dag_sofascore_pipeline=paused`, shared
-   `dag_ingest_fotmob=paused` и shared
-   `dag_transform_fotmob_silver=paused`. Дождаться отсутствия `running` и
-   `queued` runs у master, SofaScore pipeline, shared ingest/Silver, xref, E3,
-   E4, FBref Gold и stale shared `dag_trigger_fotmob_daily`.
-   SofaScore остаётся paused через initial и final handoff: иначе после уже
-   прошедших 14:00 UTC scheduler немедленно создаст consumer без producer и
-   одновременно нарушит требование quiescence. Deploy одним metadata snapshot
-   повторно доказывает эти pause/run states,
-   exact runtime SHA, одинаковую control DB, валидные migration checksums и
-   значение Variable. Byte attestation — не частичный список файлов: report
-   содержит exact SHA-256 manifest всех source/config файлов из shared bind
-   roots `dags`, `scrapers`, `scripts`, `configs/medallion` и
-   `configs/fotmob`, а deploy требует полного совпадения local release и
-   container inventory. Сюда входят все DAG/SQL/helper/ControlStore/native
-   scraper dependencies, `configs/fotmob/competitions.json` и approved
-   `issue-930-scopes.txt`; omitted, extra или stale runtime input закрывает
-   admission. Generated
-   `__pycache__/*.pyc` не входит в manifest, остальные runtime source-файлы
-   входят по exact path и bytes. Input container name один раз resolve-ится в
-   полный 64-hex ID; все proofs выполняются по этому ID, а его замена между
-   initial/final handoff закрывает admission.
-   Serialized Sofa DAG обязан иметь
-   `wait_for_fotmob_publication -> trigger_xref_transforms` и
-   `[wait_for_fotmob_publication, trigger_e4_transforms] ->
-   finalize_fotmob_publication` (`all_done`). В serialized xref DAG все writer
-   tasks обязаны быть descendants
-   `validate_fotmob_publication_consumer` с `all_success`. Serialized E3/E4 и
-   FBref Gold также обязаны ставить тот же `all_success` preflight перед первым
-   writer root и всеми downstream tasks. Shared isolated-daily row должен
-   отсутствовать; stale row допускается только paused и без `queued`/`running`
-   runs. Isolated compose, напротив, задаёт exact
-   `FOTMOB_ISOLATED_STACK=1`, а fresh isolated DagBag обязан содержать scheduled
-   daily DAG. Без этих доказательств isolated DAG-и не unpause.
 
-Пример запуска из корня release worktree:
-
-```bash
-python deploy/fotmob/deploy.py \
-  --release-root /absolute/path/to/clean-release \
-  --env-file /protected/path/fotmob.env \
-  --image registry/data-platform-airflow-scheduler@sha256:<64-hex> \
-  --postgres-image docker.io/library/postgres@sha256:<64-hex> \
-  --evidence-dir /durable/path/fotmob-evidence \
-  --shared-scheduler-container airflow-scheduler \
-  --report /durable/path/fotmob-evidence/deployment.json
-```
-
-`--report` обязан находиться внутри `--evidence-dir`: deploy передаёт его exact
-container path через `FOTMOB_DEPLOYMENT_REPORT_PATH`, а scheduled preflight
-читает те же durable bytes через evidence bind mount.
-
-Deploy прекращается до unpause при любом нарушении. Для admission обязательны:
-
-- scheduler health check проходит;
-- DagBag содержит ровно `dag_ingest_fotmob`,
-  `dag_transform_fotmob_silver`, `dag_trigger_fotmob_daily`;
-- `airflow dags list-import-errors --output json` возвращает пустой массив;
-- до admission все три DAG доказанно paused и не имеют active runs;
-- shared SofaScore consumer доказанно paused и не имеет active runs;
-- exact следующие `logical_date`, `data_interval_start`, `data_interval_end` и
-  `run_after` у shared `dag_sofascore_pipeline` и isolated
-  `dag_trigger_fotmob_daily` совпадают в initial/final snapshots и ещё раз
-  непосредственно на commit edge;
-- shared и isolated scheduler подключены к одной migration-complete control DB;
-- Telegram delivery credentials непусты и повторно проверены внутри admitted
-  scheduler; report содержит только два presence boolean, не значения;
-- точный deployment marker записан и повторно прочитан в целевой Trino/Iceberg
-  data plane;
-- release checkout, DagBag projection, полные container IDs и immutable image
-  IDs повторно сверены у schedule boundary;
-- до commit edge остаётся не меньше
-  `max(15 минут, --timeout-seconds + 5 минут)` до следующей границы 14:00 UTC;
-- deploy сначала durable фиксирует `pending_consumer`, затем idempotently
-  включает ingest, Silver, isolated daily и exact shared SofaScore container;
-- `active` фиксируется только после появления у producer и consumer двух exact
-  `run_type=scheduled` DagRun с одинаковыми run ID, logical date и interval.
-
-`activation_state=active` доказывает только ownership одного exact scheduled
-interval и его пары producer/consumer. Это не доказательство успешной обработки
-данных: DagRun уже может быть `failed`. Для закрытия #930 отдельно обязательны
-terminal `success` producer, ingest, Silver, consumer/finalizer и delivery alert.
-
-До первого production run отдельно проверить реальную доставку из admitted
-container. Команда не печатает credentials; её JSON output сохранить в durable
-evidence и визуально подтвердить получение exact message в целевом Telegram
-chat:
-
-```bash
-set -o pipefail
-docker exec <full-scheduler-container-id-from-deployment.json> python -c 'import json,secrets; from datetime import datetime,timezone; from utils.alerts import send_telegram_message; ts=datetime.now(timezone.utc).isoformat(); message=f"FotMob #930 delivery preflight | timestamp_utc={ts} | nonce={secrets.token_hex(8)}"; ok=send_telegram_message(message,level="info"); print(json.dumps({"timestamp_utc":ts,"message":message,"send_telegram_message_returned":ok},sort_keys=True)); raise SystemExit(not ok)' \
-  | tee /durable/path/fotmob-evidence/telegram-delivery.json
-```
-
-`send_telegram_message_returned=true` — обязательный preflight, но не замена
-delivery proof: оператор сохраняет timestamp/message evidence и подтверждение
-фактически полученного сообщения до закрытия #930.
-
-Operational команды принимают только `fotmob-deploy-v2`: report обязан
-содержать оба exact shared-handoff snapshot, полный hash set и serialized
-topology/quiescence proofs. Старый v1 или частичный report fail-closed.
-
-Непосредственно перед unpause deploy ещё раз читает обе schedule boundary и
-атомарно записывает `deployment.json` с
-`activation_state=pending_consumer`. В этом durable cut ingest и Silver уже
-unpaused, isolated daily ещё paused, а shared SofaScore всё ещё paused. После
-этого один idempotent state machine включает isolated daily, затем shared
-SofaScore по полному 64-hex container ID и ждёт exact scheduled run proof.
-Только этот proof атомарно переводит report в `activation_state=active`.
-
-Если процесс упал или timeout закончился после `pending_consumer`, producer не
-останавливать, DAG-и вручную не переключать и обычный deploy не повторять.
-Это отдельное incident state: исходный `deployment.json` нельзя переносить,
-исправлять или перезаписывать. Если его exact proof цел, запустить ту же команду
-с теми же аргументами и добавить `--resume-pending`.
-Resume сверяет release, оба полных container ID, commit-edge interval и safety
-window, повторяет только idempotent unpause/poll и либо создаёт `active`, либо
-оставляет durable `pending_consumer` с `resume_required=true`. Если exact runs
-ещё не должны появиться до следующего 14:00 UTC, это ожидаемое состояние:
-повторить resume после создания scheduled runs. Повторный resume уже зелёного
-`active` report ничего не меняет.
-Использовать только исходный host report path: его relative path обязан точно
-совпасть с isolated/shared container report paths и обоими admitted bind-mount
-proof. Копия `deployment.json` в другом каталоге отклоняется, чтобы host не
-записал `active` в файл, который scheduler не читает. Обычный deploy при
-существующем зелёном `pending_consumer` также fail-closed требует
-`--resume-pending` и не меняет ни одного байта исходного report.
-
-Если pending proof повреждён, exact container исчез/заменён, существующий exact
-scheduled producer/consumer не совпадает или live boundary уже сдвинулся, resume
-тоже обязан остановиться без cleanup. Простое отсутствие одного или обоих run до
-границы нормально: resume повторно доказывает тот же live boundary и safety
-window, делает idempotent unpause/poll и продолжает ждать. Incident начинается,
-только когда эту exact identity/boundary безопасность доказать уже нельзя. Тогда
-не останавливать потенциально пишущий producer, не снимать паузы вручную и не
-пытаться «починить» JSON.
-Сохранить report и Docker/Airflow/ControlStore evidence и вести восстановление в
-[отдельной P2 recovery-задаче #997](https://github.com/sergeykuznetsov1995/data-platform-football/issues/997).
-До реализации и отдельной проверки этого протокола автоматического abort/rebind
-в deploy нет.
-
-До durable `pending_consumer` любая ошибка best-effort ставит isolated DAG-и на
-паузу, останавливает scheduler и сохраняет красный отчёт. Ошибка после pending
-никогда не запускает этот generic cleanup, потому что producer уже мог начать
-exact generation. Для `--keep-paused` фиксируется
-`activation_state=kept_paused`; такой deploy также обязан получить настоящий
-второй shared snapshot, а не копию initial proof.
-Каждый atomic replacement принудительно выставляет report mode `0444`, поэтому
-файл, созданный host deploy от `root`, читается scheduler-ом с uid `50000`.
-World-readable допустим только потому, что deployment report является
-non-secret certificate: в нём есть IDs, hashes и два credential-presence
-boolean, но нет token/password/chat-id/control URI. Секреты остаются только в
-защищённом env-файле. Directory permissions всё равно должны разрешать uid
-`50000` traversal/read через isolated mount.
-
-Deploy создаёт byte-exact read-only projection из трёх versioned DAG-файлов и
-`deploy/fotmob/.airflowignore`, а compose монтирует projection поверх всего
-`/opt/airflow/dags`. Поэтому DAG-и, запечённые в image, не могут попасть в
-DagBag. Каталоги `utils`, `sql` и `scripts` монтируются внутрь projection только
-для импортов и исключены из парсинга.
-
-## Первый daily и acceptance
-
-Scheduled daily использует один versioned `fotmob-daily-v1` contract из
-`fotmob_daily_trigger_conf()`: exact approved 158-scope artifact с SHA-256
-`f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58`
-динамически сворачивается в 21 competition ID (ID-set SHA-256
-`664f972d5d86002131293bcc8da8382f6b7378cd43a8bd37a247c321decf689a`),
-а selected/latest season берётся у source. Daily запускает все шесть entities,
-включая current `transfers`, с `max_requests=10000`, `max_direct_mib=512`,
-`requests_per_minute=60`, без competition/season limit. Parent trigger имеет
-14-часовой timeout, SofaScore publication sensor — 16 часов. Восьмичасовой
-ingest writer имеет `retries=0`: HTTP retries ограниченно выполняются внутри
-runner, поэтому child не может пережить parent через унаследованные Airflow
-retries. Это отдельный scheduled contract: one-time replay/backfill closure
-ниже намеренно исключает transfer refresh.
-
-Первый task каждого daily run принимает только Airflow `run_type=scheduled` и
-до ControlStore initializer повторно сверяет exact
-deployment/Git/container/image identity и SHA-256 каждого фактически
-смонтированного DAG/helper/SQL/scraper/script/config файла с deployment report.
-`active` допускается только с proved producer/consumer handoff. Короткое
-`pending_consumer` окно допускает лишь exact scheduled producer того же
-commit-edge interval и его exact publication-bound child writers; любой другой
-run или interval отклоняется.
-Isolated writer preflight повторяет ту же byte attestation непосредственно до
-writer guard, а Bronze runner делает ещё одну in-process проверку сразу перед
-ControlStore guard/write. `kept_paused` принимается только writer-ами exact
-coordinator namespace `issue930_(replay|backfill)_aN`: binding interval/attempt,
-approved 158-scope SHA, пять closure entities, ingest/Silver run ID и generation
-обязаны совпасть. Единственное исключение — byte-exact
-`issue930-player-source-refresh-v1`: только семь полных
-competition/season/team/player tuple из immutable JSON, пустой scope, только
-`players`, 64 requests и 8 MiB. Daily/manual и любой другой профиль в этом
-состоянии отклоняется. Любая
-правка host bind checkout после admission останавливает run до Bronze/Silver
-write; не исправлять manifest/report вручную, а выполнить новый deploy из clean
-release. Manual daily run fail-closed до создания generation.
-
-Shared-owner fallback использует свежий `kept_paused` deployment report как
-read-only trust certificate; `active` report для fallback всегда отклоняется.
-`shared_handoff_final.runtime_code_sha256` содержит полный exact manifest shared
-bind roots, включая `dags/.airflowignore`. Initializer scheduled master, каждый
-Silver writer и Bronze runner сверяют manifest, Git SHA, shared scheduler
-container ID, exact report mount и ControlStore admission до guard/write, а
-writer повторяет byte attestation после последней normal/salvage операции, пока
-guard ещё удерживается. Drift делает run красным и не позволяет seal/publish.
-Отсутствующий/stale/writable-only report, manual master run или пересозданный
-shared scheduler fail-closed; требуется новый handoff/deploy, а не ручное
-редактирование certificate.
-
-Первый issue-930 closure lifecycle выполняется до включения schedule. Для этого
-первый deploy запустить с `--keep-paused` и тем же стабильным runtime report
-`/durable/path/fotmob-evidence/deployment.json`; все три isolated DAG должны
-остаться paused. Затем
-предпочтительно выполнить `replay`: он offline перепарсит уже заполненный raw
-store в v2 без нового network crawl. Координатор запускает только parent ingest,
-передаёт ему reviewed exact 158 scope и пять closure entities (`season`,
-`leaderboards`, `matches`, `teams`, `players`), ждёт exact Silver child и
-abandon-ит unclaimed candidate только после terminal/quiescence proof:
-
-```bash
-python scripts/fotmob_backfill.py run \
-  --mode replay \
-  --publication-attempt 1 \
-  --scopes configs/fotmob/issue-930-scopes.txt \
-  --scope-sha256 f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58 \
-  --expected-git-sha <full-deployed-40-hex-sha> \
-  --max-requests 2000 \
-  --max-direct-mib 256 \
-  --timeout-seconds 86400 \
-  --env-file /protected/path/fotmob.env \
-  --deployment-report /durable/path/fotmob-evidence/deployment.json \
-  --execute --confirm RUN_FOTMOB_ISSUE_930_BACKFILL \
-  --output /durable/path/fotmob-evidence/replay.json
-```
-
-Если отчёт требует recovery, не освобождать generation и не запускать новый
-attempt вручную:
-
-```bash
-python scripts/fotmob_backfill.py recover \
-  --publication-attempt 1 \
-  --scopes configs/fotmob/issue-930-scopes.txt \
-  --scope-sha256 f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58 \
-  --expected-git-sha <full-deployed-40-hex-sha> \
-  --env-file /protected/path/fotmob.env \
-  --deployment-report /durable/path/fotmob-evidence/deployment.json \
-  --recovery-report /durable/path/fotmob-evidence/replay.json \
-  --execute --confirm RECOVER_FOTMOB_ISSUE_930_BACKFILL \
-  --output /durable/path/fotmob-evidence/replay-recovery.json
-```
-
-Absent/non-terminal run после неоднозначного trigger сохраняет singleton
-generation, пока recovery не докажет writer quiescence и точное terminal
-состояние. Новый `--publication-attempt 2` разрешён только после отчёта с
-доказанным terminal failure и released generation; дальше номер монотонно
-увеличивается.
-
-Source refresh запрещён до формального первого replay. Красный replay сам по
-себе ничего не разрешает: после безопасного release его terminal report должен
-содержать типизированное доказательство ровно семи отсутствующих player
-raw/manifest inputs. Только если их ID совпадают с
-`configs/fotmob/issue-930-player-source-refresh.json` (SHA-256
-`f6cb854c6d60463c899fd9077b61a71d8d0f817741c3a9d6423925b32949045b`),
-можно выполнить отдельный bounded запуск. Он не читает catalog, scope или squad и не
-принимает ID из CLI; `64` покрывает worst case с ротацией Next build, но target
-set всё равно остаётся ровно семь:
-
-```bash
-# Выбрать terminal report: replay.json либо результат обязательного recover.
-REPLAY_PREREQUISITE=/durable/path/fotmob-evidence/replay.json
-jq -e '
-  .passed == false and
-  .phase == "failed_generation_released" and
-  .recovery_required == false and
-  .mode == "replay" and
-  .publication_attempt == 1 and
-  .publication_state.active == false and
-  .publication_state.released == true and
-  .replay_missing_input_proof.schema_version ==
-    "fotmob-replay-missing-player-inputs-v1" and
-  .replay_missing_input_proof.status == "source_refresh_required" and
-  .replay_missing_input_proof.target_count == 7
-' "$REPLAY_PREREQUISITE"
-```
-
-Этот `jq` только помогает оператору. Настоящий gate ниже ещё раз читает файл
-через защищённый file descriptor, сверяет его SHA-256, deployment/Git/scope,
-released generation и все семь полных target tuples до первого Docker/Airflow
-действия.
-
-```bash
-python scripts/fotmob_backfill.py run \
-  --mode backfill \
-  --source-refresh-profile issue930-player-source-refresh-v1 \
-  --source-refresh-targets-sha256 f6cb854c6d60463c899fd9077b61a71d8d0f817741c3a9d6423925b32949045b \
-  --prerequisite-replay-report "$REPLAY_PREREQUISITE" \
-  --publication-attempt 1 \
-  --scopes configs/fotmob/issue-930-scopes.txt \
-  --scope-sha256 f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58 \
-  --expected-git-sha <full-deployed-40-hex-sha> \
-  --max-requests 64 \
-  --max-direct-mib 8 \
-  --timeout-seconds 86400 \
-  --env-file /protected/path/fotmob.env \
-  --deployment-report /durable/path/fotmob-evidence/deployment.json \
-  --execute --confirm RUN_FOTMOB_ISSUE_930_BACKFILL \
-  --output /durable/path/fotmob-evidence/source-refresh-players.json
-```
-
-Зелёный отчёт обязан содержать ровно семь `target_outcomes`, каждый только
-`success` или source-proven `not_available`; `skipped`, произвольный 404 или
-восьмой target делают запуск красным. При `recovery_required=true` использовать
-те же profile, SHA и budgets:
-
-```bash
-python scripts/fotmob_backfill.py recover \
-  --mode backfill \
-  --source-refresh-profile issue930-player-source-refresh-v1 \
-  --source-refresh-targets-sha256 f6cb854c6d60463c899fd9077b61a71d8d0f817741c3a9d6423925b32949045b \
-  --prerequisite-replay-report "$REPLAY_PREREQUISITE" \
-  --publication-attempt 1 \
-  --scopes configs/fotmob/issue-930-scopes.txt \
-  --scope-sha256 f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58 \
-  --expected-git-sha <full-deployed-40-hex-sha> \
-  --max-requests 64 \
-  --max-direct-mib 8 \
-  --env-file /protected/path/fotmob.env \
-  --deployment-report /durable/path/fotmob-evidence/deployment.json \
-  --recovery-report /durable/path/fotmob-evidence/source-refresh-players.json \
-  --execute --confirm RECOVER_FOTMOB_ISSUE_930_BACKFILL \
-  --output /durable/path/fotmob-evidence/source-refresh-players-recovery.json
-```
-
-После `phase=abandoned` source refresh обязательно запустить второй строго
-offline replay этой exact командой:
-
-```bash
-python scripts/fotmob_backfill.py run \
-  --mode replay \
-  --publication-attempt 2 \
-  --scopes configs/fotmob/issue-930-scopes.txt \
-  --scope-sha256 f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58 \
-  --expected-git-sha <full-deployed-40-hex-sha> \
-  --max-requests 2000 \
-  --max-direct-mib 256 \
-  --timeout-seconds 86400 \
-  --env-file /protected/path/fotmob.env \
-  --deployment-report /durable/path/fotmob-evidence/deployment.json \
-  --execute --confirm RUN_FOTMOB_ISSUE_930_BACKFILL \
-  --output /durable/path/fotmob-evidence/replay-after-source-refresh.json
-```
-
-После source refresh только зелёный
-`/durable/path/fotmob-evidence/replay-after-source-refresh.json` допускается к
-verify/parity closure gates; network source-refresh/backfill report никогда не
-принимается как lifecycle evidence.
-Backfill/replay не
-пересекаются между собой и с rollback synthetic intervals. Они намеренно не
-refresh-ят `transfers`: свежий all-history transfer crawl не входит в closure
-задачи #930, а parity проверяет frozen legacy union и уже существующие native
-transfer данные. После зелёного `phase=abandoned` принятого offline replay
-(`replay.json`, если refresh не требовался; иначе только
-`replay-after-source-refresh.json`) сразу выполнить verify и parity ниже, пока
-исходный kept-paused
-deployment остаётся запущен. Лишь после двух зелёных acceptance-
-отчётов выполнить обычный deploy без `--keep-paused`: он atomically заменит тот
-же `deployment.json` на `pending_consumer`, включает isolated producer, затем
-сам включает shared SofaScore по exact container ID и ждёт два одинаковых
-scheduled run. Shared SofaScore остаётся paused только в initial/final/commit
-proof; после durable pending его unpause принадлежит deploy state machine.
-Deploy fail-closed сверяет, что следующий scheduled interval byte-for-byte по
-четырём timestamp совпадает у producer и consumer.
-Runtime filename не версионируется и не меняется между admission: audit archive
-сохраняется в downstream `replay.json`, `verify.json`, `parity.json` и их
-встроенных deployment summaries, а не в альтернативном certificate path.
-
-Ручной `airflow dags unpause` запрещён. Если первый deploy вернул код 1 и
-`deployment.json` содержит `activation_state=pending_consumer`, выполнить ту же
-deploy-команду с дополнительным флагом:
-
-```bash
-python deploy/fotmob/deploy.py \
-  <те же exact аргументы исходного deploy> \
-  --resume-pending
-```
-
-Producer запускается первым, а готовая generation безопасно ждёт exact
-consumer в общей ControlStore. Pending report разрешён только этому exact
-scheduled producer и его exact child writers; host acceptance/verify/parity
-его не принимают. SofaScore sensor deployment report не читает: он ждёт и
-атомарно claim-ит только generation с тем же interval binding в ControlStore.
-Проверить `activation_state=active`: report уже содержит два доказанных
-`run_type=scheduled` run с одним `scheduled__...` run ID и одинаковым data
-interval для isolated `dag_trigger_fotmob_daily` и shared
-`dag_sofascore_pipeline`. Перед новым обычным deploy (не resume) снова поставить
-SofaScore на паузу и дождаться quiescence.
-
-Не запускать manual daily как предварительную проверку: он может создать
-`ready` generation без exact scheduled consumer и удержать singleton lock.
-Первым production evidence должен быть реальный scheduled run в 14:00 UTC и
-соответствующий ему exact SofaScore consumer, дошедший до finalizer. Не закрывать
-cutover до их terminal success; в отчёте зафиксировать release SHA, producer
-run ID, Silver run ID, consumer run ID и abandoned/published generation state.
-
-Verify использует versioned файл
-`configs/fotmob/issue-930-scopes.txt` (`competition_id=source_season_key`): это
-ровно утверждённые для #930 **158 scope** (124 mandatory + добор top-5 и ЧМ).
-Acceptance сверяет не только count и переданный hash, но и exact identity set с
-этим артефактом; SHA-256 самого артефакта также закреплён в коде. Исторический
-обход полного каталога (~493 турнира) не является гейтом #930; не подменять им
-acceptance scope этого cutover.
-
-Parity имеет отдельный, исполнимый контракт: exact пять legacy-consumer лиг за
-сезон 2025/26 находятся в
-`deploy/fotmob/issue-930-parity-scopes.json`. JSON дополнительно содержит
-`legacy_league` и `legacy_season`. Международные mandatory scope не имеют
-эквивалента в замороженном legacy и поэтому не должны искусственно входить в
-parity; их полноту закрывает verify 158/158.
-
-Обе команды принимают один и тот же byte-exact lifecycle-отчёт на
-все 158 scope, даже если parity сравнивает только пять лиг. Acceptance
-требует `passed=true`, `phase=abandoned`, `recovery_required=false`,
-exact deployment ID/Git SHA, утверждённый 158-scope artifact, пять closure
-entities и abandoned/released/unpublished publication state. Plan signature,
-начало ingest и native runner generation извлекаются из этого отчёта;
-отдельные operator knobs для них не допускаются. Команды запускаются
-на deployment host, где доступны
-Docker CLI, release checkout и host-reachable Trino endpoint. `--env-file` — это
-env isolated Compose, а отдельный `--trino-env-file` содержит только `TRINO_*`
-с адресом, достижимым с host (Docker DNS `trino` здесь обычно непригоден).
-Ambient `TRINO_*` не считаются доказательством и заменяются explicit host-env:
-
-```bash
-python scripts/fotmob_acceptance.py verify \
-  --scopes configs/fotmob/issue-930-scopes.txt \
-  --scope-sha256 f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58 \
-  --lifecycle-report /durable/path/fotmob-evidence/replay.json \
-  --env-file /protected/path/fotmob.env \
-  --trino-env-file /protected/path/fotmob-host-trino.env \
-  --deployment-report /durable/path/fotmob-evidence/deployment.json \
-  --output /durable/path/fotmob-evidence/verify.json
-
-python scripts/fotmob_acceptance.py parity \
-  --scopes deploy/fotmob/issue-930-parity-scopes.json \
-  --scope-sha256 2fceb11fd69dcd136f4879b6dad85193924b1a7d7484cf00fc9f7f4a7305568d \
-  --lifecycle-report /durable/path/fotmob-evidence/replay.json \
-  --env-file /protected/path/fotmob.env \
-  --trino-env-file /protected/path/fotmob-host-trino.env \
-  --deployment-report /durable/path/fotmob-evidence/deployment.json \
-  --output /durable/path/fotmob-evidence/parity.json
-```
-
-До и после SQL обе команды повторно доказывают current Compose service IDs,
-container/image/nonce/mount identity, clean release/projection, exact durable
-deployment marker в Trino и exact abandoned generation в ControlStore. JSON сохраняет
-SHA-256 и компактное summary lifecycle-отчёта вместе с двумя live
-ControlStore proofs. Команды fail-closed и возвращают ненулевой exit code при
-SQL error, отсутствующем результате или красном check. Verify проверяет:
-
-- completion каждого target scope с точным lifecycle runner run ID, plan
-  signature и timestamp,
-  полным набором expected counts/identity hashes, а также совпадение
-  `coverage_hash` с их каноническим содержимым;
-- независимый пересчёт count и identity hash для leaderboards, finished
-  matches, teams и players из точных physical batches, выбранных v2
-  manifest на момент completion каждого scope;
-- latest target manifests только candidate runs без
-  retry/schema-drift/review-required состояний;
-- нулевой `proxy_bytes` только в candidate lineage;
-- отсутствие unknown/invalid/duplicate field-inventory rows в утверждённых
-  scope и global snapshot targets; inventory может сохранять committed v1
-  batch identity из-за run-persistent дедупликации;
-- существование всех current views, уникальность natural keys и наличие
-  committed v1/v2 manifest для каждой строки (v1 разрешён только как
-  предусмотренный rolling fallback; scope-completion остаётся строго v2).
-
-Parity требует exact set equality для matches, match payloads и standings;
-roster покрывает минимум 90% legacy `(team_id, player_id)` и выводит явные
-diff samples; каждый legacy transfer identity должен присутствовать в итоговой
-Silver-таблице. JSON валиден как обычный документ, counts записываются числами.
-
-До закрытия задачи также приложить evidence доставки тестового Telegram alert и
-успешного scheduled daily. Наличие токена в окружении само по себе не является
-доказательством доставки.
-
-## Optional cleanup staging и field inventory (#994)
-
-Cleanup не является closure gate задачи #930. Compaction field inventory и
-удаление staging вынесены в follow-up #994; до его отдельного review объекты
-сохраняются. Если #994 выполняется позже, writers ставятся на паузу, cleanup
-исполняется только по reviewed plan, затем обычный deploy повторяет admission и
-unpause, а verify/parity запускаются заново.
-
-Планирование всегда read-only:
-
-```bash
-python scripts/fotmob_cleanup.py plan \
-  --older-than-hours 24 \
-  --trino-env-file /protected/path/fotmob-host-trino.env \
-  --output /durable/path/fotmob-evidence/cleanup-plan.json
-sha256sum /durable/path/fotmob-evidence/cleanup-plan.json
-```
-
-План содержит только точные таблицы формата `fotmob_*__stg_*`, их row count и
-последний Iceberg snapshot. Неизвестные имена и свежие таблицы исключаются.
-Field inventory компактизируется через отдельную shadow table и swap только
-если найдены дубликаты natural key.
-
-Перед execute остановить writers командой rollback `pause`, проверить JSON и
-передать его как evidence. Execute разрешён только с byte-exact SHA-256
-просмотренного плана:
-
-```bash
-python scripts/fotmob_cleanup.py execute \
-  --plan /durable/path/fotmob-evidence/cleanup-plan.json \
-  --plan-sha256 <reviewed-sha256> \
-  --pause-evidence /durable/path/fotmob-evidence/rollback-pause.json \
-  --env-file /protected/path/fotmob.env \
-  --deployment-report /durable/path/fotmob-evidence/deployment.json \
-  --project fotmob-airflow \
-  --release-sha <full-deployed-40-hex-sha> \
-  --trino-env-file /protected/path/fotmob-host-trino.env \
-  --confirm EXECUTE_REVIEWED_FOTMOB_CLEANUP \
-  --output /durable/path/fotmob-evidence/cleanup-result.json
-```
-
-Инструмент live повторно сверяет paused/no-active state, exact deployment
-container/image/mount identity, затем останавливает isolated scheduler. Перед
-первым DDL и перед зелёным завершением он через byte-exact shared runtime
-вызывает read-only `assert_no_active_publication_generation(source='fotmob')`.
-Активный writer или consumer publication generation блокирует cleanup; команда
-никогда не освобождает чужой lease. После этого повторно сверяются schema, row
-counts и snapshots. При drift операция останавливается до первого `DROP`.
-Нельзя подменять plan wildcard-именами или использовать evidence старше часа.
-
-Inventory swap двухфазный: promoted snapshot сначала сохраняется в атомарный
-`fsync` journal с `phase=inventory_promoted_backup_retained`, и только затем
-удаляется точный reviewed backup. После crash повтор той же команды с теми же
-plan bytes/SHA проверяет journal, snapshot и содержимое compaction и безопасно
-завершает backup DROP; иной backup по совпавшему имени не принимается. Scheduler
-остаётся остановленным и после success, и после ошибки cleanup; обязательный
-следующий шаг — обычный deploy с полным admission.
-
-## Rollback
-
-Native Bronze и raw cache при rollback не удаляются. Сначала сохранить план:
-
-```bash
-python scripts/fotmob_rollback.py plan \
-  --env-file /protected/path/fotmob.env \
-  --deployment-report /durable/path/fotmob-evidence/deployment.json \
-  --output /durable/path/fotmob-evidence/rollback-plan.json
-```
-
-Далее выполнить строго в указанном порядке:
-
-1. Поставить writers на паузу и убедиться, что active runs отсутствуют:
+2. Поставить на паузу exact six DAG и shared consumer:
 
    ```bash
    python scripts/fotmob_rollback.py pause \
-     --env-file /protected/path/fotmob.env \
-     --deployment-report /durable/path/fotmob-evidence/deployment.json \
-     --execute --confirm PAUSE_FOTMOB_WRITERS \
-     --output /durable/path/fotmob-evidence/rollback-pause.json
+     --env-file "$FOTMOB_ENV" \
+     --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+     --execute \
+     --confirm PAUSE_FOTMOB_WRITERS \
+     --output "$FOTMOB_EVIDENCE/rollback-pause.json"
+
+   export FOTMOB_PAUSE_REPORT_SHA="$(sha256sum "$FOTMOB_EVIDENCE/rollback-pause.json" | awk '{print $1}')"
    ```
 
-   Pause helper пытается поставить на паузу все три DAG независимо от ошибки
-   отдельного Airflow CLI вызова (daily всегда последний и всегда attempted),
-   затем выполняет единый metadata snapshot pause/`queued`/`running` state и
-   возвращает агрегированную ошибку. Частичный CLI success не является
-   разрешением продолжать rollback.
-
-2. Развернуть reviewed immutable commit, который возвращает consumers на
-   frozen legacy Bronze, обязательно с `deploy.py --keep-paused` и стабильным
-   `--report .../deployment.json`. Deploy atomically заменяет текущий runtime
-   certificate; отдельное rollback-имя несовместимо с exact path, закреплённым
-   в shared scheduler. Откат SQL должен быть выполнен до
-   любых изменений native storage. Все runtime bind paths восстанавливаются из
-   этого deployment report; вручную их угадывать нельзя.
-3. Создать synthetic publication generation и запустить ровно один fenced
-   Silver/DQ run через rollback coordinator. Команда сама записывает durable
-   write-ahead identity до acquire, использует детерминированный run ID,
-   временно unpause только Silver, передаёт exact publication conf и снова
-   доказывает pause/no-active. После terminal success generation seal-ится и
-   безопасно abandon-ится; native данные не публикуются потребителю:
+3. Из pristine checkout reviewed consumer-revert commit выполнить
+   coordinator-only deploy. Сначала развернуть тот же revert commit в shared
+   Airflow, сохранив shared consumer paused и ownership `isolated`. Затем из
+   корня revert checkout заново зафиксировать его путь и SHA. Использовать
+   `--keep-paused` без `--automatic-catalog` и без activation flags:
 
    ```bash
-   python scripts/fotmob_rollback.py run-silver \
-     --env-file /protected/path/fotmob.env \
-     --deployment-report /durable/path/fotmob-evidence/deployment.json \
-     --expected-consumer-sha <full-40-hex-sha> \
-     --publication-attempt 1 \
-     --execute --confirm RUN_FOTMOB_ROLLBACK_VALIDATION_SILVER \
-     --timeout-seconds 43200 \
-     --output /durable/path/fotmob-evidence/rollback-publication.json
+   export FOTMOB_RELEASE_ROOT="$PWD"
+   export FOTMOB_RELEASE_SHA="$(git rev-parse HEAD)"
+
+   python deploy/fotmob/deploy.py \
+     --release-root "$FOTMOB_RELEASE_ROOT" \
+     --env-file "$FOTMOB_ENV" \
+     --image "$FOTMOB_AIRFLOW_IMAGE" \
+     --postgres-image "$FOTMOB_POSTGRES_IMAGE" \
+     --evidence-dir "$FOTMOB_EVIDENCE" \
+     --shared-scheduler-container "$FOTMOB_SHARED_SCHEDULER" \
+     --keep-paused \
+     --report "$FOTMOB_DEPLOY_REPORT"
    ```
 
-   Если отчёт имеет `phase=acquire_ambiguous` или
-   `lock_retained_pending_terminal_proof`, не освобождать lock вручную. После
-   проверки точного Silver run выполнить recovery:
+   Ожидается `coordinator_rollout.phase=kept_paused`, все шесть DAG paused,
+   shared consumer paused и `fotmob_schedule_owner=isolated`.
+
+4. Запустить exact fenced Silver/DQ на revert commit:
+
+   ```bash
+   export FOTMOB_ROLLBACK_SHA="$FOTMOB_RELEASE_SHA"
+   export FOTMOB_ROLLBACK_PUBLICATION="$FOTMOB_EVIDENCE/rollback-publication.json"
+
+   python scripts/fotmob_rollback.py run-silver \
+     --env-file "$FOTMOB_ENV" \
+     --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+     --expected-consumer-sha "$FOTMOB_ROLLBACK_SHA" \
+     --publication-attempt 1 \
+     --timeout-seconds 43200 \
+     --execute \
+     --confirm RUN_FOTMOB_ROLLBACK_VALIDATION_SILVER \
+     --output "$FOTMOB_ROLLBACK_PUBLICATION"
+   ```
+
+   При ambiguous результате не освобождать lock вручную. Использовать:
 
    ```bash
    python scripts/fotmob_rollback.py recover-publication \
-     --env-file /protected/path/fotmob.env \
-     --deployment-report /durable/path/fotmob-evidence/deployment.json \
-     --publication-report /durable/path/fotmob-evidence/rollback-publication.json \
+     --env-file "$FOTMOB_ENV" \
+     --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+     --publication-report "$FOTMOB_ROLLBACK_PUBLICATION" \
      --publication-attempt 1 \
-     --execute --confirm RECOVER_FOTMOB_ROLLBACK_PUBLICATION \
-     --output /durable/path/fotmob-evidence/rollback-publication-recovery.json
+     --execute \
+     --confirm RECOVER_FOTMOB_ROLLBACK_PUBLICATION \
+     --output "$FOTMOB_EVIDENCE/rollback-publication-recovery.json"
+
+   export FOTMOB_ROLLBACK_PUBLICATION="$FOTMOB_EVIDENCE/rollback-publication-recovery.json"
    ```
 
-   Non-terminal run всегда сохраняет lock. Отсутствующий exact run позволяет
-   снять lock только если write-ahead phase доказывает pre-trigger окно, все
-   writers paused/no-active, а control DB содержит exact active `writing`
-   generation; после `silver_running` отсутствие остаётся ambiguous. Terminal
-   failure позволяет безопасно освободить generation, но следующий
-   `run-silver` обязан использовать увеличенный `--publication-attempt 2`
-   (далее 3, 4, ...). Если pre-acquire recovery доказывает, что и generation,
-   и Silver run отсутствуют (`phase=no_generation_acquired`), тот же attempt
-   можно повторить. Recovery и validate всегда получают тот же attempt, что
-   указан в их publication report. Только terminal success с exact candidate
-   позволяет seal и abandon; для validate использовать последний зелёный
-   publication report.
+   После recovery используйте последний зелёный publication report.
 
-4. Подтвердить revision, paused writers, успешный Silver/DQ run и доступность
-   всех девяти legacy-таблиц:
+5. Проверить revert, Silver/DQ, abandoned generation и frozen legacy tables:
 
    ```bash
    python scripts/fotmob_rollback.py validate \
-     --env-file /protected/path/fotmob.env \
-     --trino-env-file /protected/path/fotmob-host-trino.env \
-     --deployment-report /durable/path/fotmob-evidence/deployment.json \
-     --publication-report /durable/path/fotmob-evidence/rollback-publication.json \
-     --expected-consumer-sha <full-40-hex-sha> \
+     --env-file "$FOTMOB_ENV" \
+     --trino-env-file "$FOTMOB_TRINO_ENV" \
+     --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+     --publication-report "$FOTMOB_ROLLBACK_PUBLICATION" \
+     --expected-consumer-sha "$FOTMOB_ROLLBACK_SHA" \
      --publication-attempt 1 \
-     --silver-run-id <run-id-from-publication-report> \
-     --output /durable/path/fotmob-evidence/rollback-validate.json
+     --silver-run-id '<run-id-from-publication-report>' \
+     --output "$FOTMOB_EVIDENCE/rollback-validate.json"
    ```
 
-Validate принимает только Silver run со `start_date` не раньше текущего
-`deployment.json.generated_at`, проверяет отсутствие и `running`, и
-`queued` runs, exact deployed SHA и exact Trino deployment marker до/после
-чтения legacy. Он также требует exact зелёный rollback-publication report,
-совпадающий candidate digest и durable `abandoned`/inactive generation в общей
-control DB. До проверки и в самом конце validate требует отсутствие active
-FotMob publication writer/consumer, re-attesting shared code, SHA и одинаковый
-control URI; lease при этом не освобождается. Старый зелёный или прямой manual
-run без synthetic binding не является rollback evidence.
+6. После зелёного validate вернуть исходное состояние только двух maintenance
+   DAG. SHA берётся от exact проверенного файла:
 
-Если после pause остался running/queued run, не убивать его и не переключать
-consumers: дождаться terminal state либо отдельно расследовать зависшую запись.
-Возвращать ownership shared scheduler можно только после доказанного pause и
-нулевых active runs isolated stack. Сначала pause isolated и дождаться
-quiescence, затем непосредственно перед ownership flip выполнить новый deploy
-exact release с `--keep-paused`, теми же `--evidence-dir`/`--report` и exact
-shared scheduler container. Проверить, что свежий report имеет
-`activation_state=kept_paused`, содержит все три exact DAG в `paused` и пустой
-`unpaused`; старый `active` report не является fallback admission. Только после
-этого установить shared Variable `fotmob_schedule_owner=shared`.
-`FOTMOB_SHARED_ADMISSION_HOST_DIR` должен оставаться read-only mount exact
-evidence directory, а report path — совпадать с
-`FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH`; deploy и scheduled master проверяют это
-fail-closed. После устранения инцидента
-возвращать native traffic только новым deploy с теми же admission и acceptance
-gates.
+   ```bash
+   export FOTMOB_OPERATION_REPORT="$FOTMOB_EVIDENCE/rollback-validate.json"
+   export FOTMOB_OPERATION_REPORT_SHA="$(sha256sum "$FOTMOB_OPERATION_REPORT" | awk '{print $1}')"
+
+   python scripts/fotmob_rollback.py restore-maintenance \
+     --env-file "$FOTMOB_ENV" \
+     --deployment-report "$FOTMOB_DEPLOY_REPORT" \
+     --pause-evidence "$FOTMOB_EVIDENCE/rollback-pause.json" \
+     --pause-evidence-sha256 "$FOTMOB_PAUSE_REPORT_SHA" \
+     --operation-report "$FOTMOB_OPERATION_REPORT" \
+     --operation-report-sha256 "$FOTMOB_OPERATION_REPORT_SHA" \
+     --execute \
+     --confirm RESTORE_FOTMOB_MAINTENANCE \
+     --output "$FOTMOB_EVIDENCE/rollback-maintenance-restore.json"
+   ```
+
+После validate все шесть DAG и shared consumer остаются paused. Чтобы снова
+запустить production, нужен новый pristine automatic rollout с шага 1.
+
+## Historical issue #930
+
+Static `fotmob-daily-v1`, старый список из 158 scopes и прежние
+backfill/replay процедуры сохранены только как историческое evidence. Artifact
+`configs/fotmob/issue-930-scopes.txt` имеет SHA-256
+`f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58`.
+
+Этот historical contract не является исполняемой инструкцией для production,
+activation или rollback: он может содержать female IDs. Не запускать legacy
+schedule и не использовать static #930 scope вместо automatic catalog.

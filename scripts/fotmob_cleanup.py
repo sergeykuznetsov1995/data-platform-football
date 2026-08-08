@@ -41,10 +41,23 @@ INVENTORY_KEYS = (
     "disposition",
 )
 PAUSED_DAGS = {
+    "dag_orchestrate_fotmob",
     "dag_ingest_fotmob",
     "dag_transform_fotmob_silver",
     "dag_trigger_fotmob_daily",
+    "dag_refresh_fotmob",
+    "dag_backfill_fotmob",
 }
+# Dynamic catalog rows and structural-decision evidence are rollback inputs,
+# never cleanup targets. Keep their current views protected as well.
+PRESERVED_DYNAMIC_CATALOG_EVIDENCE = frozenset(
+    {
+        "fotmob_competitions",
+        "fotmob_competitions_current",
+        "fotmob_competition_scope_observations",
+        "fotmob_competition_scope_observations_current",
+    }
+)
 CONFIRM_EXECUTE = "EXECUTE_REVIEWED_FOTMOB_CLEANUP"
 
 
@@ -255,6 +268,10 @@ def build_plan(
         "dry_run": True,
         "staging_targets": staging,
         "rejected_candidates": rejected,
+        "dynamic_catalog_evidence_action": "retain",
+        "dynamic_catalog_evidence_objects": sorted(
+            PRESERVED_DYNAMIC_CATALOG_EVIDENCE
+        ),
         "inventory_compaction": {
             "source_table": INVENTORY,
             "source_rows": int(source_rows),
@@ -282,7 +299,7 @@ def _validate_pause_evidence(
     schema: str,
     project: str,
     release_sha: str,
-) -> None:
+) -> Mapping[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -318,11 +335,32 @@ def _validate_pause_evidence(
         raise CleanupError("pause evidence timestamp is in the future")
     if now - generated > timedelta(hours=1):
         raise CleanupError("pause evidence is older than one hour")
+    shared = payload.get("shared_consumer_pause")
+    expected_pause_states = dict(
+        runtime_binding.DESTRUCTIVE_SHARED_PAUSE_STATES
+    )
+    container_id = (
+        str(shared.get("shared_scheduler_container_id") or "")
+        if isinstance(shared, Mapping)
+        else ""
+    )
+    if (
+        not isinstance(shared, Mapping)
+        or re.fullmatch(r"[0-9a-f]{64}", container_id) is None
+        or shared.get("schedule_owner") != "isolated"
+        or shared.get("pause_states_after") != expected_pause_states
+        or shared.get("active_runs") != []
+        or shared.get("active_task_instances") != []
+        or shared.get("atomic_metadata_transaction") is not True
+    ):
+        raise CleanupError("pause evidence shared_consumer_pause is incomplete")
+    return payload
 
 
 def _quiesce_isolated_scheduler(
     args: argparse.Namespace,
     *,
+    shared_consumer_pause: Mapping[str, Any] | None = None,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
     try:
@@ -341,6 +379,8 @@ def _quiesce_isolated_scheduler(
     writer_state: Mapping[str, Any] = {
         "pause_states": {dag_id: True for dag_id in runtime.DAGS},
         "active_runs": {},
+        "active_task_instances": [],
+        "atomic_metadata_snapshot": True,
     }
     environment = runtime._compose_environment(args)
     base = runtime._compose_base(args)
@@ -365,6 +405,17 @@ def _quiesce_isolated_scheduler(
         )
     if live_identity["scheduler_running"]:
         raise CleanupError("isolated scheduler is still running after stop")
+    shared_readback = None
+    if shared_consumer_pause is not None:
+        expected_id = str(
+            shared_consumer_pause.get("shared_scheduler_container_id") or ""
+        )
+        try:
+            shared_readback = runtime.inspect_shared_consumer_pause(
+                args, expected_container_id=expected_id, run=run
+            )
+        except runtime.RollbackError as exc:
+            raise CleanupError(f"shared consumer live quiescence failed: {exc}") from exc
     return {
         "project": args.project,
         "git_sha": args.release_sha,
@@ -372,6 +423,7 @@ def _quiesce_isolated_scheduler(
         "active_runs": writer_state["active_runs"],
         "scheduler_stopped": True,
         "live_deployment": live_identity,
+        "shared_consumer_readback": shared_readback,
     }
 
 
@@ -392,6 +444,10 @@ def _validate_plan_shape(plan: Mapping[str, Any], *, clock: Callable[[], datetim
     _identifier(schema)
     if plan.get("dry_run") is not True:
         raise CleanupError("cleanup plan must originate from a dry-run plan")
+    if plan.get("dynamic_catalog_evidence_action") != "retain" or plan.get(
+        "dynamic_catalog_evidence_objects"
+    ) != sorted(PRESERVED_DYNAMIC_CATALOG_EVIDENCE):
+        raise CleanupError("cleanup plan does not preserve dynamic catalog/evidence")
     targets = plan.get("staging_targets")
     if not isinstance(targets, list):
         raise CleanupError("staging_targets must be a list")
@@ -411,11 +467,15 @@ def _validate_plan_shape(plan: Mapping[str, Any], *, clock: Callable[[], datetim
         ):
             raise CleanupError(f"{name}: invalid reviewed table metadata")
         names.add(name)
+    if names & PRESERVED_DYNAMIC_CATALOG_EVIDENCE:
+        raise CleanupError("cleanup plan targets preserved dynamic catalog/evidence")
     inventory = plan.get("inventory_compaction")
     if not isinstance(inventory, Mapping):
         raise CleanupError("inventory_compaction must be an object")
     if inventory.get("source_table") != INVENTORY:
         raise CleanupError("inventory plan does not target the canonical table")
+    if inventory.get("source_table") in PRESERVED_DYNAMIC_CATALOG_EVIDENCE:
+        raise CleanupError("cleanup plan targets preserved dynamic catalog/evidence")
     action = inventory.get("action")
     if action not in {"none", "shadow_swap"}:
         raise CleanupError("inventory plan contains an unsupported action")
@@ -996,6 +1056,10 @@ def execute_plan(
         ),
         "dropped_staging": dropped,
         "inventory_compaction": inventory,
+        "dynamic_catalog_evidence_action": "retain",
+        "dynamic_catalog_evidence_objects": sorted(
+            PRESERVED_DYNAMIC_CATALOG_EVIDENCE
+        ),
     }
 
 
@@ -1095,7 +1159,7 @@ def main(
                 raise CleanupError(
                     f"reviewed plan SHA-256 mismatch: expected {actual_sha}"
                 )
-            _validate_pause_evidence(
+            pause_evidence = _validate_pause_evidence(
                 args.pause_evidence,
                 clock=_now_dt,
                 catalog=args.catalog,
@@ -1110,7 +1174,11 @@ def main(
             if plan.get("catalog") != args.catalog or plan.get("schema") != args.schema:
                 raise CleanupError("CLI catalog/schema do not match reviewed plan")
             _validate_plan_shape(plan, clock=_now_dt)
-            quiescence = _quiesce_isolated_scheduler(args, run=run)
+            quiescence = _quiesce_isolated_scheduler(
+                args,
+                shared_consumer_pause=pause_evidence["shared_consumer_pause"],
+                run=run,
+            )
             if not args.trino_env_file:
                 raise CleanupError("execute requires --trino-env-file")
             try:
@@ -1179,7 +1247,11 @@ def main(
                 marker_after = runtime_binding.validate_data_plane_marker(client, context)
             except runtime_binding.RuntimeBindingError as exc:
                 raise CleanupError(str(exc)) from exc
-            post_quiescence = _quiesce_isolated_scheduler(args, run=run)
+            post_quiescence = _quiesce_isolated_scheduler(
+                args,
+                shared_consumer_pause=pause_evidence["shared_consumer_pause"],
+                run=run,
+            )
             try:
                 publication_after = (
                     runtime_binding.assert_no_active_fotmob_publication(

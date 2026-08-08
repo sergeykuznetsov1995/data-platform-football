@@ -133,7 +133,10 @@ def _attest_native_runtime(args, publication: Mapping[str, Any]) -> dict[str, An
         allow_kept_paused_writer=True,
         writer_identity={
             "component": "bronze_runner",
+            "dag_id": os.environ.get("AIRFLOW_CTX_DAG_ID"),
+            "run_id": os.environ.get("AIRFLOW_CTX_DAG_RUN_ID"),
             "mode": args.mode,
+            "catalog_contract": args.catalog_contract,
             "scopes": scopes,
             "entities": sorted(_selected_native_entities(args)),
             "competition_limit": args.competition_limit,
@@ -146,6 +149,7 @@ def _attest_native_runtime(args, publication: Mapping[str, Any]) -> dict[str, An
             "max_proxy_mib": args.max_proxy_mib,
             "requests_per_minute": args.requests_per_minute,
             "max_attempts": args.max_attempts,
+            "deadline": args.deadline,
             "next_build_id": args.next_build_id,
             "source_refresh_profile": (
                 source_refresh.get("profile")

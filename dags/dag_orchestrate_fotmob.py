@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Mapping
 
 from airflow import DAG
@@ -25,7 +25,6 @@ from utils.fotmob_publication import (
     FOTMOB_DEPLOYMENT_REPORT_PATH_ENV,
     FOTMOB_PUBLICATION_SOURCE,
     attest_fotmob_isolated_runtime,
-    fail_unsealed_fotmob_publication,
     fotmob_ceremony_configured,
     initialize_fotmob_publication,
 )
@@ -38,6 +37,9 @@ INGEST_DAG_ID = "dag_ingest_fotmob"
 OWNER_DAG_ID = "dag_orchestrate_fotmob"
 AUTOMATIC_ADMITTED_DAGS = frozenset(
     {OWNER_DAG_ID, "dag_ingest_fotmob", "dag_transform_fotmob_silver"}
+)
+LEGACY_PAUSED_DAGS = frozenset(
+    {"dag_trigger_fotmob_daily", "dag_refresh_fotmob", "dag_backfill_fotmob"}
 )
 DECISION_TASK_ID = "choose_fotmob_lane"
 INITIALIZER_TASK_ID = "initialize_fotmob_publication"
@@ -171,7 +173,7 @@ def _attest_owner_runtime(**context: Any) -> dict[str, Any]:
             not isinstance(report, Mapping)
             or report.get("activation_state") != "active"
             or report.get("unpaused") != sorted(AUTOMATIC_ADMITTED_DAGS)
-            or report.get("paused") != []
+            or report.get("paused") != sorted(LEGACY_PAUSED_DAGS)
         ):
             # Task 7 rotates deployment admission from the legacy daily owner
             # to this exact set.  Until that evidence exists, remain paused
@@ -261,10 +263,20 @@ def initialize_admitted_publication(**context: Any) -> dict[str, Any] | bool:
 
     if not _launch_still_admitted(context):
         return False
+    raw, _selected_state, lane = _selected_launch(context)
+    publication_context = dict(context)
+    if lane is FotMobLane.DAILY:
+        # The shared consumer is a 14:00 UTC daily DAG.  A five-minute owner
+        # tick must mint the exact same 24-hour binding, otherwise the shared
+        # consumer can never claim the ready generation.
+        selected_date = date.fromisoformat(str(raw["selected_date"]))
+        interval_end = datetime.combine(selected_date, time(14, 0), tzinfo=UTC)
+        publication_context["data_interval_start"] = interval_end - timedelta(days=1)
+        publication_context["data_interval_end"] = interval_end
     return initialize_fotmob_publication(
         publication_owner="isolated",
         require_scheduled_owner=False,
-        **context,
+        **publication_context,
     )
 
 
@@ -345,12 +357,73 @@ def finalize_or_skip_rejected_launch(**context: Any) -> dict[str, Any]:
         if verdict == "failed":
             raise AirflowException("FotMob child launch failed before child trigger")
         raise AirflowException("FotMob rejected launch verdict is invalid")
-    return fail_unsealed_fotmob_publication(
-        publication_owner="isolated",
-        success_task_id=TRIGGER_TASK_ID,
-        writer_task_ids=[TRIGGER_TASK_ID],
-        **context,
+    ti = context.get("ti")
+    publication = (
+        ti.xcom_pull(task_ids=INITIALIZER_TASK_ID) if ti is not None else None
     )
+    if not isinstance(publication, Mapping) or not publication.get("generation_id"):
+        raise AirflowException("FotMob initialized publication XCom is missing")
+    states = {
+        str(getattr(item, "task_id", "")): str(
+            getattr(getattr(item, "state", None), "value", getattr(item, "state", ""))
+            or "missing"
+        ).casefold()
+        for item in (
+            context.get("dag_run").get_task_instances()
+            if context.get("dag_run") is not None
+            else ()
+        )
+    }
+    if states.get(TRIGGER_TASK_ID) != "success":
+        # Preserve the existing terminal-red behavior and the ambiguous child
+        # lock.  Pass the exact initialized generation instead of recomputing
+        # it from the owner's five-minute interval.
+        if not fotmob_ceremony_configured():
+            raise AirflowException("FotMob generation did not reach ready")
+        from scrapers.fbref.control import ControlStore
+
+        state = ControlStore.from_env().fail_publication_generation(
+            publication["generation_id"],
+            safe_to_release=False,
+            source=FOTMOB_PUBLICATION_SOURCE,
+        )
+        raise AirflowException(
+            "FotMob generation did not reach ready; lock retained because "
+            f"child-writer state is ambiguous (state={state})"
+        )
+
+    raw, _selected_state, lane = _selected_launch(context)
+    if lane is FotMobLane.DAILY or not fotmob_ceremony_configured():
+        return {
+            "status": "ready",
+            "generation_id": publication["generation_id"],
+            "lane": lane.value,
+        }
+
+    # Refresh/backfill has no shared consumer.  It must release its ready
+    # source lock before the next owner tick; otherwise one background run
+    # stalls every later run until the long publication TTL expires.
+    from scrapers.fbref.control import ControlStore
+
+    abandoned = ControlStore.from_env().complete_publication_generation(
+        publication["generation_id"],
+        published=False,
+        source=FOTMOB_PUBLICATION_SOURCE,
+    )
+    if (
+        abandoned.get("phase") != "abandoned"
+        or abandoned.get("active") is not False
+        or abandoned.get("released") is not True
+        or abandoned.get("published") is not False
+    ):
+        raise AirflowException("FotMob background generation was not abandoned safely")
+    return {
+        "status": "abandoned",
+        "generation_id": publication["generation_id"],
+        "lane": lane.value,
+        "publication_state": abandoned,
+        "selected_date": raw.get("selected_date"),
+    }
 
 
 def advance_fotmob_scheduler_state(**context: Any) -> dict[str, Any]:

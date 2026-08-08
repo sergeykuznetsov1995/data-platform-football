@@ -20,6 +20,8 @@ import hashlib
 import json
 import os
 import re
+import stat
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -29,12 +31,19 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 
+try:
+    from scripts import fotmob_runtime as runtime_binding
+except ModuleNotFoundError:  # pragma: no cover - direct script execution
+    import fotmob_runtime as runtime_binding
 
-PLAN_SCHEMA_VERSION = "fotmob-competition-purge-plan-v1"
+
+PLAN_SCHEMA_VERSION = "fotmob-competition-purge-plan-v2"
 JOURNAL_SCHEMA_VERSION = "fotmob-competition-purge-journal-v1"
+SCHEDULED_OBSERVATION_SCHEMA_VERSION = "fotmob-scheduled-observation-v1"
 PURGE_COMPETITION_IDS = (10557, 10558)
 PLAN_TTL = timedelta(hours=1)
 MAX_EVIDENCE_AGE = timedelta(days=30)
+MAX_PROTECTED_REPORT_BYTES = 2 * 1024 * 1024
 WRITER_DAG_IDS = (
     "dag_orchestrate_fotmob",
     "dag_trigger_fotmob_daily",
@@ -42,6 +51,30 @@ WRITER_DAG_IDS = (
     "dag_backfill_fotmob",
     "dag_ingest_fotmob",
     "dag_transform_fotmob_silver",
+    "dag_iceberg_maintenance",
+    "dag_iceberg_maintenance_daily",
+)
+SHARED_PAUSE_STATES = {
+    "dag_master_pipeline": True,
+    "dag_sofascore_pipeline": True,
+    "dag_ingest_fotmob": True,
+    "dag_transform_fotmob_silver": True,
+    "dag_iceberg_maintenance": True,
+    "dag_iceberg_maintenance_daily": True,
+}
+SHARED_STATE_DAGS = (
+    "dag_backfill_fotmob",
+    "dag_ingest_fotmob",
+    "dag_master_pipeline",
+    "dag_orchestrate_fotmob",
+    "dag_refresh_fotmob",
+    "dag_sofascore_pipeline",
+    "dag_transform_e3",
+    "dag_transform_e4",
+    "dag_transform_fbref_gold",
+    "dag_transform_fotmob_silver",
+    "dag_transform_xref",
+    "dag_trigger_fotmob_daily",
     "dag_iceberg_maintenance",
     "dag_iceberg_maintenance_daily",
 )
@@ -88,6 +121,20 @@ class PurgeRefused(RuntimeError):
 
 class PostDeleteVerificationError(RuntimeError):
     """A DELETE may have committed but ownership or post-state is unproven."""
+
+
+@dataclass(frozen=True)
+class ScheduledObservation:
+    path: str
+    sha256: str
+    deployment_report_path: str
+    deployment_report_sha256: str
+    deployment_id: str
+    git_sha: str
+    scheduler_container_id: str
+    generation_id: str
+    publication_binding: Mapping[str, str]
+    runs: Mapping[str, Mapping[str, str]]
 
 
 @dataclass(frozen=True)
@@ -157,6 +204,10 @@ class RawTargetObject:
 class PurgeBackend(Protocol):
     def assert_quiescent(
         self, writer_dag_ids: Sequence[str], *, source: str
+    ) -> None: ...
+
+    def assert_live_scheduled_observation(
+        self, observation: ScheduledObservation
     ) -> None: ...
 
     def acquire_apply_fence(
@@ -246,6 +297,253 @@ def _nonempty(value: object, *, field: str) -> str:
     if not text or text != text.strip():
         raise PurgeRefused(f"{field} must be non-empty and canonical")
     return text
+
+
+def _unique_json_object(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in output:
+            raise ValueError(f"duplicate JSON key: {key}")
+        output[key] = value
+    return output
+
+
+def _read_protected_json_report(
+    path: Path, *, label: str
+) -> tuple[bytes, dict[str, Any]]:
+    """Read one stable, non-writable regular report without following a link."""
+
+    try:
+        resolved = Path(path).resolve(strict=True)
+        before = resolved.lstat()
+        raw = resolved.read_bytes()
+        after = resolved.lstat()
+    except OSError as exc:
+        raise PurgeRefused(f"cannot read protected {label}: {exc}") from exc
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or not raw
+        or len(raw) != before.st_size
+        or len(raw) > MAX_PROTECTED_REPORT_BYTES
+        or stat.S_IMODE(before.st_mode) & 0o022
+    ):
+        raise PurgeRefused(f"protected {label} is not a stable regular file")
+    try:
+        payload = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_unique_json_object
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise PurgeRefused(f"protected {label} is invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise PurgeRefused(f"protected {label} must contain a JSON object")
+    return raw, payload
+
+
+def _validated_deployment_payload(
+    raw: bytes, payload: Mapping[str, Any]
+) -> tuple[str, dict[str, str], dict[str, Any]]:
+    """Validate one exact active report and expose its canonical rollout edge."""
+
+    if (
+        payload.get("schema_version") != "fotmob-deploy-v2"
+        or payload.get("passed") is not True
+        or payload.get("activation_state") != "active"
+        or payload.get("kept_paused") is not False
+    ):
+        raise PurgeRefused("protected deployment report is not active automatic")
+    deployment_id = str(payload.get("deployment_id") or "")
+    git_sha = str(payload.get("git_sha") or "")
+    scheduler_container_id = str(payload.get("scheduler_container_id") or "")
+    if (
+        re.fullmatch(r"[0-9a-f]{32}", deployment_id) is None
+        or re.fullmatch(r"[0-9a-f]{40}", git_sha) is None
+        or re.fullmatch(r"[0-9a-f]{64}", scheduler_container_id) is None
+    ):
+        raise PurgeRefused("protected deployment report has an invalid live identity")
+    admission = payload.get("automatic_catalog_admission")
+    try:
+        normalized_admission = runtime_binding.validate_automatic_catalog_admission(
+            admission,
+            now=_timestamp(payload.get("generated_at"), field="deployment.generated_at"),
+        )
+        canary = admission.get("canary") if isinstance(admission, Mapping) else None
+        if (
+            not isinstance(canary, Mapping)
+            or canary.get("deployment_id") != deployment_id
+            or canary.get("git_sha") != git_sha
+            or canary.get("scheduler_container_id") != scheduler_container_id
+        ):
+            raise runtime_binding.RuntimeBindingError(
+                "automatic canary identity differs from deployment"
+            )
+        rollout = runtime_binding.validate_automatic_rollout_activation(
+            payload,
+            normalized_admission,
+        )
+    except (PurgeRefused, runtime_binding.RuntimeBindingError) as exc:
+        raise PurgeRefused(
+            "protected deployment report has no canonical active automatic ceremony"
+        ) from exc
+    return _sha256(raw), {
+        "deployment_id": deployment_id,
+        "git_sha": git_sha,
+        "scheduler_container_id": scheduler_container_id,
+    }, rollout
+
+
+def _deployment_identity(path: Path) -> tuple[str, dict[str, str]]:
+    raw, payload = _read_protected_json_report(path, label="deployment report")
+    digest, identity, _rollout = _validated_deployment_payload(raw, payload)
+    return digest, identity
+
+
+def _canonical_binding_timestamp(value: object, *, field: str) -> datetime:
+    parsed = _timestamp(value, field=field)
+    canonical = parsed.isoformat(timespec="microseconds")
+    if str(value) != canonical:
+        raise PurgeRefused(f"{field} is not an exact UTC timestamp")
+    return parsed
+
+
+def _scheduled_generation_id(binding: Mapping[str, Any]) -> str:
+    payload = json.dumps(dict(binding), sort_keys=True, separators=(",", ":"))
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"fotmob-publication:{payload}"))
+
+
+def _scheduled_observation(
+    path: Path, *, deployment_report: Path
+) -> ScheduledObservation:
+    deployment_sha256, deployment = _deployment_identity(deployment_report)
+    raw, payload = _read_protected_json_report(
+        path, label="scheduled observation report"
+    )
+    identity = payload.get("deployment")
+    runs = payload.get("runs")
+    publication = payload.get("publication")
+    if (
+        payload.get("schema_version") != SCHEDULED_OBSERVATION_SCHEMA_VERSION
+        or payload.get("passed") is not True
+        or not isinstance(identity, Mapping)
+        or dict(identity) != deployment
+        or not isinstance(runs, Mapping)
+        or set(runs) != {"owner", "ingest", "silver", "sofascore", "finalizer"}
+        or not isinstance(publication, Mapping)
+    ):
+        raise PurgeRefused("scheduled observation is not bound to the live deployment")
+    binding = publication.get("binding")
+    generation_id = str(publication.get("generation_id") or "")
+    if not isinstance(binding, Mapping) or set(binding) != {
+        "schema",
+        "source",
+        "owner",
+        "data_interval_start",
+        "data_interval_end",
+        "runtime_fingerprint",
+    }:
+        raise PurgeRefused("scheduled observation publication binding is incomplete")
+    start = _canonical_binding_timestamp(
+        binding.get("data_interval_start"), field="publication.data_interval_start"
+    )
+    end = _canonical_binding_timestamp(
+        binding.get("data_interval_end"), field="publication.data_interval_end"
+    )
+    if (
+        binding.get("schema") != "fotmob-publication-v1"
+        or binding.get("source") != "fotmob"
+        or binding.get("owner") != "isolated"
+        or binding.get("runtime_fingerprint") != deployment["git_sha"]
+        or start.hour != 14
+        or start.minute != 0
+        or start.second != 0
+        or start.microsecond != 0
+        or end - start != timedelta(hours=24)
+        or end.hour != 14
+        or end.minute != 0
+        or end.second != 0
+        or end.microsecond != 0
+    ):
+        raise PurgeRefused(
+            "scheduled observation binding is not the exact 14:00 UTC daily"
+        )
+    try:
+        if str(uuid.UUID(generation_id)) != generation_id:
+            raise ValueError("non-canonical UUID")
+    except (TypeError, ValueError) as exc:
+        raise PurgeRefused("scheduled observation generation ID is invalid") from exc
+    if generation_id != _scheduled_generation_id(binding):
+        raise PurgeRefused("scheduled observation generation does not match binding")
+    if (
+        publication.get("status") != "succeeded"
+        or publication.get("phase") != "published"
+        or publication.get("active") is not False
+        or publication.get("published") is not True
+        or publication.get("released") is not True
+    ):
+        raise PurgeRefused(
+            "scheduled observation publication was not published and released"
+        )
+
+    expected_runs = {
+        "owner": {
+            "dag_id": "dag_orchestrate_fotmob",
+            "run_type": "scheduled",
+            "state": "success",
+        },
+        "ingest": {"dag_id": "dag_ingest_fotmob", "state": "success"},
+        "silver": {"dag_id": "dag_transform_fotmob_silver", "state": "success"},
+        "sofascore": {"dag_id": "dag_sofascore_pipeline", "state": "success"},
+        "finalizer": {
+            "dag_id": "dag_sofascore_pipeline",
+            "task_id": "finalize_fotmob_publication",
+            "state": "success",
+        },
+    }
+    for name, expected in expected_runs.items():
+        item = runs.get(name)
+        if not isinstance(item, Mapping) or any(
+            item.get(key) != value for key, value in expected.items()
+        ):
+            raise PurgeRefused(
+                f"scheduled observation {name} did not succeed exactly"
+            )
+        _nonempty(item.get("run_id"), field=f"runs.{name}.run_id")
+        if item.get("generation_id") != generation_id:
+            raise PurgeRefused(f"scheduled observation {name} generation differs")
+    if (
+        runs["ingest"].get("run_id")
+        != f"fotmob_orchestrated__{generation_id}"
+        or runs["silver"].get("run_id") != f"fotmob_silver__{generation_id}"
+        or runs["ingest"].get("owner_run_id") != runs["owner"].get("run_id")
+        or runs["silver"].get("ingest_run_id") != runs["ingest"].get("run_id")
+        or runs["finalizer"].get("run_id") != runs["sofascore"].get("run_id")
+    ):
+        raise PurgeRefused("scheduled observation run lineage is not exact")
+    return ScheduledObservation(
+        path=str(Path(path).resolve()),
+        sha256=_sha256(raw),
+        deployment_report_path=str(Path(deployment_report).resolve()),
+        deployment_report_sha256=deployment_sha256,
+        deployment_id=deployment["deployment_id"],
+        git_sha=deployment["git_sha"],
+        scheduler_container_id=deployment["scheduler_container_id"],
+        generation_id=generation_id,
+        publication_binding={str(key): str(value) for key, value in binding.items()},
+        runs={
+            str(name): {str(key): str(value) for key, value in item.items()}
+            for name, item in runs.items()
+            if isinstance(item, Mapping)
+        },
+    )
+
+
+def _scheduled_observation_document(value: ScheduledObservation) -> dict[str, str]:
+    return asdict(value)
 
 
 def _sql_literal(value: object) -> str:
@@ -571,6 +869,8 @@ def with_plan_hash(plan: Mapping[str, Any]) -> dict[str, Any]:
 def build_plan(
     backend: PurgeBackend,
     *,
+    deployment_report: Path,
+    scheduled_observation_report: Path,
     now: datetime | None = None,
     ttl: timedelta = PLAN_TTL,
 ) -> dict[str, Any]:
@@ -579,6 +879,10 @@ def build_plan(
     clock = _utc(now or datetime.now(timezone.utc), field="now")
     if not isinstance(ttl, timedelta) or not timedelta(0) < ttl <= PLAN_TTL:
         raise PurgeRefused(f"plan TTL must be positive and at most {PLAN_TTL}")
+    scheduled_observation = _scheduled_observation(
+        scheduled_observation_report, deployment_report=deployment_report
+    )
+    backend.assert_live_scheduled_observation(scheduled_observation)
     backend.assert_quiescent(WRITER_DAG_IDS, source="fotmob")
     evidence = _validate_protected_evidence(
         backend.load_protected_evidence(PURGE_COMPETITION_IDS), now=clock
@@ -848,6 +1152,9 @@ def build_plan(
         "expires_at": _iso(clock + ttl),
         "competition_ids": list(PURGE_COMPETITION_IDS),
         "writer_dag_ids": list(WRITER_DAG_IDS),
+        "scheduled_observation": _scheduled_observation_document(
+            scheduled_observation
+        ),
         "protected_evidence": [_evidence_document(item) for item in evidence],
         "global_preservation": {
             "team_ids": list(team_ids),
@@ -903,6 +1210,84 @@ def _plan_evidence(plan: Mapping[str, Any]) -> tuple[ProtectedEvidence, ...]:
     if tuple(item.competition_id for item in output) != PURGE_COMPETITION_IDS:
         raise PurgeRefused("plan evidence is not ordered for the exact purge IDs")
     return tuple(output)
+
+
+def _plan_scheduled_observation(plan: Mapping[str, Any]) -> ScheduledObservation:
+    value = plan.get("scheduled_observation")
+    if not isinstance(value, Mapping):
+        raise PurgeRefused("plan scheduled observation is absent")
+    try:
+        observation = ScheduledObservation(
+            path=str(value["path"]),
+            sha256=_require_sha256(
+                value["sha256"], field="scheduled observation SHA-256"
+            ),
+            deployment_report_path=str(value["deployment_report_path"]),
+            deployment_report_sha256=_require_sha256(
+                value["deployment_report_sha256"],
+                field="scheduled observation deployment report SHA-256",
+            ),
+            deployment_id=str(value["deployment_id"]),
+            git_sha=str(value["git_sha"]),
+            scheduler_container_id=str(value["scheduler_container_id"]),
+            generation_id=str(value["generation_id"]),
+            publication_binding={
+                str(key): str(item)
+                for key, item in dict(value["publication_binding"]).items()
+            },
+            runs={
+                str(name): {
+                    str(key): str(item)
+                    for key, item in dict(run).items()
+                }
+                for name, run in dict(value["runs"]).items()
+            },
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PurgeRefused("plan scheduled observation is malformed") from exc
+    if (
+        not Path(observation.path).is_absolute()
+        or not Path(observation.deployment_report_path).is_absolute()
+        or re.fullmatch(r"[0-9a-f]{32}", observation.deployment_id) is None
+        or re.fullmatch(r"[0-9a-f]{40}", observation.git_sha) is None
+        or re.fullmatch(r"[0-9a-f]{64}", observation.scheduler_container_id) is None
+        or set(observation.publication_binding)
+        != {
+            "schema",
+            "source",
+            "owner",
+            "data_interval_start",
+            "data_interval_end",
+            "runtime_fingerprint",
+        }
+        or set(observation.runs)
+        != {"owner", "ingest", "silver", "sofascore", "finalizer"}
+    ):
+        raise PurgeRefused("plan scheduled observation identity is invalid")
+    try:
+        if str(uuid.UUID(observation.generation_id)) != observation.generation_id:
+            raise ValueError("non-canonical")
+    except (TypeError, ValueError) as exc:
+        raise PurgeRefused("plan scheduled observation generation is invalid") from exc
+    return observation
+
+
+def _revalidate_scheduled_observation(
+    plan: Mapping[str, Any],
+    *,
+    deployment_report: Path | None = None,
+    scheduled_observation_report: Path | None = None,
+) -> ScheduledObservation:
+    expected = _plan_scheduled_observation(plan)
+    observed = _scheduled_observation(
+        scheduled_observation_report or Path(expected.path),
+        deployment_report=deployment_report or Path(expected.deployment_report_path),
+    )
+    if observed != expected:
+        raise PurgeRefused(
+            "scheduled observation digest or live deployment identity drifted"
+        )
+    return observed
 
 
 def _plan_operations(
@@ -973,6 +1358,7 @@ def _validate_plan(
         raise PurgeRefused("plan competition IDs are not the immutable purge pair")
     if plan.get("writer_dag_ids") != list(WRITER_DAG_IDS):
         raise PurgeRefused("plan writer DAG inventory is incomplete")
+    _plan_scheduled_observation(plan)
     created = _timestamp(plan.get("created_at"), field="created_at")
     expires = _timestamp(plan.get("expires_at"), field="expires_at")
     clock = _utc(now, field="now")
@@ -1443,6 +1829,8 @@ def apply_plan(
     *,
     supplied_sha256: str,
     journal_path: Path,
+    deployment_report: Path | None = None,
+    scheduled_observation_report: Path | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Apply an exact plan with crash-safe two-phase journal checkpoints."""
@@ -1454,6 +1842,12 @@ def apply_plan(
         now=clock,
         allow_expired_recovery=True,
     )
+    _revalidate_scheduled_observation(
+        plan,
+        deployment_report=deployment_report,
+        scheduled_observation_report=scheduled_observation_report,
+    )
+    backend.assert_live_scheduled_observation(_plan_scheduled_observation(plan))
     plan_sha256 = str(plan["plan_sha256"])
     expired = clock >= _timestamp(plan.get("expires_at"), field="expires_at")
     if expired and not Path(journal_path).exists():
@@ -1527,7 +1921,15 @@ def apply_plan(
             # only this live reconstruction proves the submitted plan was actually
             # derived from current Bronze/raw reachability rather than hand-forged.
             try:
-                fresh = build_plan(backend, now=clock)
+                expected_observation = _plan_scheduled_observation(plan)
+                fresh = build_plan(
+                    backend,
+                    now=clock,
+                    deployment_report=deployment_report
+                    or Path(expected_observation.deployment_report_path),
+                    scheduled_observation_report=scheduled_observation_report
+                    or Path(expected_observation.path),
+                )
             except PurgeRefused as exc:
                 raise PurgeRefused(
                     f"live plan reconstruction drifted: {exc}"
@@ -1608,7 +2010,15 @@ def apply_plan(
         fence_token = acquire_journaled_fence()
         try:
             backend.invalidate_raw_inventory()
-            fresh_after_fence = build_plan(backend, now=clock)
+            expected_observation = _plan_scheduled_observation(plan)
+            fresh_after_fence = build_plan(
+                backend,
+                now=clock,
+                deployment_report=deployment_report
+                or Path(expected_observation.deployment_report_path),
+                scheduled_observation_report=scheduled_observation_report
+                or Path(expected_observation.path),
+            )
             for section in (
                 "protected_evidence",
                 "global_preservation",
@@ -1954,6 +2364,7 @@ class TrinoAirflowRawBackend:
         *,
         catalog: str = "iceberg",
         schema: str = "bronze",
+        run: Callable[..., Any] = subprocess.run,
     ) -> None:
         if _IDENTIFIER_RE.fullmatch(catalog) is None or _IDENTIFIER_RE.fullmatch(
             schema
@@ -1968,6 +2379,7 @@ class TrinoAirflowRawBackend:
         self._raw_targets_cache: dict[str, RawTargetObject] | None = None
         self._validated_raw_targets: set[str] = set()
         self._validated_raw_blobs: set[str] = set()
+        self._run = run
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "TrinoAirflowRawBackend":
@@ -2025,80 +2437,261 @@ class TrinoAirflowRawBackend:
             summary={str(key): str(value) for key, value in summary.items()},
         )
 
+    def assert_live_scheduled_observation(
+        self, observation: ScheduledObservation
+    ) -> None:
+        """Independently prove report lineage from live scheduler/control state.
+
+        The protected JSON is an audit artifact, not an authority: a forged
+        success row cannot pass this database/control-plane readback.
+        """
+
+        marker_rows = self._query(
+            'SELECT COUNT(*) FROM '
+            f'"{self.catalog}"."{self.schema}"."fotmob_runtime_deployments" '
+            f"WHERE deployment_id = {_sql_literal(observation.deployment_id)} "
+            f"AND git_sha = {_sql_literal(observation.git_sha)} "
+            "AND scheduler_container_id = "
+            f"{_sql_literal(observation.scheduler_container_id)}"
+        )
+        if (
+            len(marker_rows) != 1
+            or len(marker_rows[0]) != 1
+            or int(marker_rows[0][0]) != 1
+        ):
+            raise PurgeRefused("live automatic deployment identity differs from report")
+
+        # The CLI host is deliberately not an Airflow authority.  The isolated
+        # and shared metadata databases are separate, so execute each exact
+        # query in the immutable container ID admitted by the deployment report.
+        deployment_raw, deployment = _read_protected_json_report(
+            Path(observation.deployment_report_path), label="deployment report"
+        )
+        deployment_sha256, deployment_identity, rollout = (
+            _validated_deployment_payload(deployment_raw, deployment)
+        )
+        if (
+            deployment_sha256 != observation.deployment_report_sha256
+            or deployment_identity
+            != {
+                "deployment_id": observation.deployment_id,
+                "git_sha": observation.git_sha,
+                "scheduler_container_id": observation.scheduler_container_id,
+            }
+        ):
+            raise PurgeRefused(
+                "live scheduled observation deployment report drifted"
+            )
+        handoff = deployment.get("shared_handoff_final")
+        shared_id = (
+            handoff.get("shared_scheduler_container")
+            if isinstance(handoff, Mapping)
+            else None
+        )
+        if re.fullmatch(r"[0-9a-f]{64}", str(shared_id or "")) is None:
+            raise PurgeRefused("deployment report has no admitted shared scheduler")
+        activation_at = _timestamp(
+            rollout.get("owner_at"), field="automatic rollout owner_at"
+        ).isoformat()
+        isolated = self._container_proof(
+            observation.scheduler_container_id,
+            self._isolated_observation_script(observation, activation_at=activation_at),
+        )
+        shared = self._container_proof(
+            str(shared_id), self._shared_observation_script(observation)
+        )
+        if isolated.get("passed") is not True or shared.get("passed") is not True:
+            raise PurgeRefused("live scheduled automatic observation is unproven")
+        self._live_isolated_scheduler_id = observation.scheduler_container_id
+        self._live_shared_scheduler_id = str(shared_id)
+
+    def _container_proof(self, container_id: str, script: str) -> Mapping[str, Any]:
+        """Run a read-only proof inside one exact scheduler container."""
+
+        try:
+            completed = self._run(
+                ("docker", "exec", container_id, "python", "-c", script),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except Exception as exc:
+            raise PurgeRefused(
+                "cannot independently read admitted scheduler container"
+            ) from exc
+        prefix = "FOTMOB_PURGE_PROOF="
+        for line in reversed(str(getattr(completed, "stdout", "")).splitlines()):
+            if line.startswith(prefix):
+                try:
+                    payload = json.loads(line[len(prefix) :])
+                except json.JSONDecodeError as exc:
+                    raise PurgeRefused("admitted scheduler proof is invalid JSON") from exc
+                if isinstance(payload, Mapping):
+                    return payload
+        raise PurgeRefused("admitted scheduler did not emit a proof")
+
+    @staticmethod
+    def _proof_script(expected: Mapping[str, Any], checks: str) -> str:
+        # All expected values are JSON literals; the generated program performs
+        # exact run-id/XCom comparisons inside the metadata DB, not host state.
+        return "\n".join(
+            (
+                "import json, os",
+                "from datetime import datetime, timezone",
+                "from airflow.models import DagRun, TaskInstance, XCom",
+                "from airflow.settings import Session",
+                "from scrapers.fbref.control import ControlStore",
+                f"expected = json.loads({json.dumps(dict(expected), sort_keys=True)!r})",
+                "def state(v): return str(getattr(v, 'value', v or '')).lower()",
+                "def instant(v): return v.astimezone(timezone.utc).isoformat(timespec='microseconds') if v is not None else None",
+                "def run(session, dag_id, run_id):",
+                "    return session.query(DagRun).filter(DagRun.dag_id == dag_id, DagRun.run_id == run_id).one_or_none()",
+                "def task(session, dag_id, run_id, task_id):",
+                "    return session.query(TaskInstance).filter(TaskInstance.dag_id == dag_id, TaskInstance.run_id == run_id, TaskInstance.task_id == task_id).one_or_none()",
+                "def xcom(session, dag_id, run_id, task_id):",
+                "    row = session.query(XCom).filter(XCom.dag_id == dag_id, XCom.run_id == run_id, XCom.task_id == task_id, XCom.key == 'return_value').order_by(XCom.timestamp.desc()).first()",
+                "    return XCom.deserialize_value(row) if row is not None else None",
+                "def first_admitted_daily_owner(session, activation_at):",
+                "    rows = session.query(DagRun).filter(DagRun.dag_id == 'dag_orchestrate_fotmob', DagRun.state == 'success').order_by(DagRun.start_date.asc()).all()",
+                "    for candidate in rows:",
+                "        attested = task(session, candidate.dag_id, candidate.run_id, 'attest_isolated_runtime')",
+                "        decision = xcom(session, candidate.dag_id, candidate.run_id, 'choose_fotmob_lane')",
+                "        initialized = xcom(session, candidate.dag_id, candidate.run_id, 'initialize_fotmob_publication')",
+                "        if state(candidate.run_type) == 'scheduled' and attested is not None and state(attested.state) == 'success' and attested.start_date is not None and attested.start_date.isoformat() >= activation_at and isinstance(decision, dict) and decision.get('lane') == 'daily' and isinstance(initialized, dict) and initialized.get('generation_id') and isinstance(initialized.get('binding'), dict):",
+                "            return candidate",
+                "    return None",
+                "session = Session()",
+                "try:",
+                "    passed = bool(" + checks + ")",
+                "finally:",
+                "    session.close()",
+                "print('FOTMOB_PURGE_PROOF=' + json.dumps({'passed': passed}, sort_keys=True))",
+            )
+        )
+
+    def _isolated_observation_script(
+        self, observation: ScheduledObservation, *, activation_at: str
+    ) -> str:
+        expected = {
+            "deployment_id": observation.deployment_id,
+            "git_sha": observation.git_sha,
+            "scheduler_container_id": observation.scheduler_container_id,
+            "generation_id": observation.generation_id,
+            "binding": dict(observation.publication_binding),
+            "runs": observation.runs,
+            "activation_at": activation_at,
+        }
+        checks = " and ".join(
+            (
+                "os.environ.get('FOTMOB_ISOLATED_STACK') == '1'",
+                "os.environ.get('FOTMOB_DEPLOYMENT_ID') == expected['deployment_id']",
+                "os.environ.get('FOTMOB_DEPLOY_GIT_SHA') == expected['git_sha']",
+                "(owner := run(session, 'dag_orchestrate_fotmob', expected['runs']['owner']['run_id'])) is not None",
+                "state(owner.state) == 'success' and state(owner.run_type) == 'scheduled'",
+                "(attest_task := task(session, 'dag_orchestrate_fotmob', owner.run_id, 'attest_isolated_runtime')) is not None and state(attest_task.state) == 'success' and attest_task.start_date is not None and attest_task.start_date.isoformat() >= expected['activation_at']",
+                "(earliest := first_admitted_daily_owner(session, expected['activation_at'])) is not None and earliest.run_id == owner.run_id",
+                "(lane := xcom(session, 'dag_orchestrate_fotmob', owner.run_id, 'choose_fotmob_lane')) is not None and lane.get('lane') == 'daily'",
+                "(attestation := xcom(session, 'dag_orchestrate_fotmob', owner.run_id, 'attest_isolated_runtime')) is not None and all(attestation.get(k) == expected[k] for k in ('deployment_id', 'git_sha', 'scheduler_container_id'))",
+                "(initializer := xcom(session, 'dag_orchestrate_fotmob', owner.run_id, 'initialize_fotmob_publication')) is not None and initializer.get('generation_id') == expected['generation_id'] and initializer.get('binding') == expected['binding']",
+                "all((child := run(session, expected['runs'][name]['dag_id'], expected['runs'][name]['run_id'])) is not None and state(child.state) == 'success' and isinstance(child.conf, dict) and child.conf.get('fotmob_publication', {}).get('generation_id') == expected['generation_id'] and child.conf.get('fotmob_publication', {}).get('binding') == expected['binding'] for name in ('ingest', 'silver'))",
+                "(publication := ControlStore.from_env().get_publication_generation(expected['generation_id'], source='fotmob')) is not None and publication.get('generation_id') == expected['generation_id'] and publication.get('source') == 'fotmob' and publication.get('binding') == expected['binding'] and publication.get('status') == 'succeeded' and publication.get('phase') == 'published' and publication.get('active') is False and publication.get('lock_active') is False and publication.get('consumer') == {'dag_id': 'dag_sofascore_pipeline', 'run_id': expected['runs']['sofascore']['run_id']}",
+            )
+        )
+        return self._proof_script(expected, checks)
+
+    def _shared_observation_script(self, observation: ScheduledObservation) -> str:
+        expected = {
+            "generation_id": observation.generation_id,
+            "binding": dict(observation.publication_binding),
+            "runs": observation.runs,
+        }
+        checks = " and ".join(
+            (
+                "(sofa := run(session, 'dag_sofascore_pipeline', expected['runs']['sofascore']['run_id'])) is not None and state(sofa.state) == 'success' and state(sofa.run_type) == 'scheduled' and instant(sofa.logical_date) == expected['binding']['data_interval_start'] and instant(sofa.data_interval_start) == expected['binding']['data_interval_start'] and instant(sofa.data_interval_end) == expected['binding']['data_interval_end']",
+                "(finalizer := task(session, 'dag_sofascore_pipeline', sofa.run_id, 'finalize_fotmob_publication')) is not None and state(finalizer.state) == 'success'",
+                "(final_state := xcom(session, 'dag_sofascore_pipeline', sofa.run_id, 'finalize_fotmob_publication')) is not None and final_state.get('generation_id') == expected['generation_id'] and final_state.get('phase') == 'published' and final_state.get('released') is True",
+            )
+        )
+        return self._proof_script(expected, checks)
+
+    def _quiescence_script(
+        self,
+        dag_ids: Sequence[str],
+        *,
+        control: bool,
+        active_dag_ids: Sequence[str] | None = None,
+        expected_pause_states: Mapping[str, bool] | None = None,
+    ) -> str:
+        expected = {
+            "dag_ids": list(dag_ids),
+            "active_dag_ids": list(active_dag_ids or dag_ids),
+            "expected_pause_states": dict(expected_pause_states or {
+                dag_id: True for dag_id in dag_ids
+            }),
+            "fence_generation": self._apply_fence_generation,
+            "fence_binding": self._apply_fence_binding,
+        }
+        control_lines = (
+            (
+                "    publication = ControlStore.from_env().assert_no_active_publication_generation(source='fotmob')",
+                "    control_ok = publication.get('safe') is True and publication.get('active') is not True",
+            )
+            if self._apply_fence_generation is None
+            else (
+                "    publication = ControlStore.from_env().get_publication_generation(expected['fence_generation'], source='fotmob')",
+                "    control_ok = isinstance(publication, dict) and publication.get('generation_id') == expected['fence_generation'] and publication.get('binding') == expected['fence_binding'] and publication.get('status') == 'running' and publication.get('phase') == 'writing' and publication.get('active') is True and publication.get('owner_dag_id') == 'fotmob_legacy_purge'",
+            )
+        ) if control else ("    control_ok = True",)
+        return "\n".join(
+            (
+                "import json",
+                "from airflow.models import DagModel, DagRun, TaskInstance",
+                "from airflow.settings import Session",
+                "from sqlalchemy import text",
+                "from scrapers.fbref.control import ControlStore",
+                f"expected = json.loads({json.dumps(expected, sort_keys=True)!r})",
+                "session = Session()",
+                "try:",
+                "    session.execute(text('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY'))",
+                "    dag_ids = expected['dag_ids']",
+                "    models = {row.dag_id: bool(row.is_paused) for row in session.query(DagModel).filter(DagModel.dag_id.in_(dag_ids)).all()}",
+                "    active = session.query(DagRun).filter(DagRun.dag_id.in_(expected['active_dag_ids']), DagRun.state.in_(('queued', 'running'))).count()",
+                "    active_tasks = session.query(TaskInstance).filter(TaskInstance.dag_id.in_(expected['active_dag_ids']), TaskInstance.state.in_(('queued', 'running', 'scheduled', 'deferred', 'up_for_retry', 'up_for_reschedule', 'restarting'))).count()",
+                *control_lines,
+                "    passed = models == expected['expected_pause_states'] and active == 0 and active_tasks == 0 and control_ok",
+                "    session.commit()",
+                "except Exception:",
+                "    session.rollback()",
+                "    raise",
+                "finally:",
+                "    session.close()",
+                "print('FOTMOB_PURGE_PROOF=' + json.dumps({'passed': passed}, sort_keys=True))",
+            )
+        )
+
     def assert_quiescent(
         self, writer_dag_ids: Sequence[str], *, source: str
     ) -> None:
         if tuple(writer_dag_ids) != WRITER_DAG_IDS or source != "fotmob":
             raise PurgeRefused("quiescence request differs from the FotMob writer set")
-        try:
-            from airflow.models import DagModel, DagRun
-            from airflow.settings import Session
-            from scrapers.fbref.control import ControlStore
-
-            session = Session()
-            try:
-                active_rows = (
-                    session.query(DagRun.dag_id, DagRun.run_id, DagRun.state)
-                    .filter(
-                        DagRun.dag_id.in_(WRITER_DAG_IDS),
-                        DagRun.state.in_(("queued", "running")),
-                    )
-                    .all()
-                )
-                dag_rows = (
-                    session.query(DagModel.dag_id, DagModel.is_paused)
-                    .filter(DagModel.dag_id.in_(WRITER_DAG_IDS))
-                    .all()
-                )
-            finally:
-                session.close()
-            dag_pause_state = {str(row[0]): bool(row[1]) for row in dag_rows}
-            if set(dag_pause_state) != set(WRITER_DAG_IDS):
-                missing = sorted(set(WRITER_DAG_IDS) - set(dag_pause_state))
-                raise PurgeRefused(
-                    "cannot prove all writer/maintenance DAGs are paused: "
-                    + ", ".join(missing)
-                )
-            unpaused = sorted(
-                dag_id for dag_id, is_paused in dag_pause_state.items() if not is_paused
-            )
-            if unpaused:
-                raise PurgeRefused(
-                    "writer/maintenance DAGs are not paused: " + ", ".join(unpaused)
-                )
-            if active_rows:
-                active = sorted(
-                    f"{row[0]}:{row[1]}:{row[2]}" for row in active_rows
-                )
-                raise PurgeRefused("active writer DAGs: " + ", ".join(active))
-            control = ControlStore.from_env()
-            if self._apply_fence_generation is None:
-                publication = control.assert_no_active_publication_generation(
-                    source="fotmob"
-                )
-            else:
-                publication = control.get_publication_generation(
-                    self._apply_fence_generation, source="fotmob"
-                )
-        except PurgeRefused:
-            raise
-        except Exception as exc:
-            raise PurgeRefused(
-                "cannot prove Airflow writer/publication quiescence"
-            ) from exc
-        if self._apply_fence_generation is None:
-            if publication.get("safe") is not True or publication.get("active") is True:
-                raise PurgeRefused("active FotMob publication lease")
-        elif (
-            not isinstance(publication, Mapping)
-            or publication.get("generation_id") != self._apply_fence_generation
-            or publication.get("binding") != self._apply_fence_binding
-            or publication.get("status") != "running"
-            or publication.get("phase") != "writing"
-            or publication.get("active") is not True
-            or publication.get("owner_dag_id") != "fotmob_legacy_purge"
-        ):
-            raise PurgeRefused("FotMob purge apply fence is not active and exact")
+        isolated_id = getattr(self, "_live_isolated_scheduler_id", None)
+        shared_id = getattr(self, "_live_shared_scheduler_id", None)
+        if not isolated_id or not shared_id:
+            raise PurgeRefused("quiescence has no admitted scheduler identities")
+        isolated = self._container_proof(
+            isolated_id, self._quiescence_script(WRITER_DAG_IDS[:6], control=True)
+        )
+        shared = self._container_proof(
+            shared_id,
+            self._quiescence_script(
+                tuple(SHARED_PAUSE_STATES),
+                control=False,
+                active_dag_ids=SHARED_STATE_DAGS,
+                expected_pause_states=SHARED_PAUSE_STATES,
+            ),
+        )
+        if isolated.get("passed") is not True or shared.get("passed") is not True:
+            raise PurgeRefused("cannot prove dual-metadata writer/publication quiescence")
 
     @staticmethod
     def _fence_identity(
@@ -2118,6 +2711,69 @@ class TrinoAirflowRawBackend:
         }
         return generation_id, binding
 
+    def _container_fence_state(
+        self,
+        *,
+        action: str,
+        generation_id: str,
+        binding: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        """Mutate/read ControlStore only inside the admitted isolated runtime."""
+
+        container_id = getattr(self, "_live_isolated_scheduler_id", None)
+        if not container_id:
+            raise PurgeRefused("purge fence has no admitted isolated scheduler")
+        if action == "initialize":
+            expression = (
+                "store.initialize_publication_generation("
+                "generation_id,dag_id='fotmob_legacy_purge',binding=binding,"
+                "source='fotmob',ttl_seconds=14*24*60*60)"
+            )
+        elif action == "get":
+            expression = (
+                "store.get_publication_generation(generation_id,source='fotmob')"
+            )
+        elif action == "release":
+            expression = (
+                "store.fail_publication_generation("
+                "generation_id,safe_to_release=True,source='fotmob')"
+            )
+        else:  # pragma: no cover - internal callers use the closed set above
+            raise PurgeRefused("unknown purge fence action")
+        marker = "FOTMOB_PURGE_FENCE="
+        code = "\n".join(
+            (
+                "import json",
+                "from scrapers.fbref.control import ControlStore",
+                f"generation_id = {generation_id!r}",
+                f"binding = json.loads({json.dumps(dict(binding), sort_keys=True)!r})",
+                "store = ControlStore.from_env()",
+                f"state = {expression}",
+                f"print({marker!r} + json.dumps(state, default=str, sort_keys=True))",
+            )
+        )
+        try:
+            completed = self._run(
+                ("docker", "exec", container_id, "python", "-c", code),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except Exception as exc:
+            raise PurgeRefused(
+                f"cannot {action} the FotMob purge apply fence"
+            ) from exc
+        for line in reversed(str(completed.stdout).splitlines()):
+            if not line.startswith(marker):
+                continue
+            try:
+                state = json.loads(line.removeprefix(marker))
+            except json.JSONDecodeError as exc:
+                raise PurgeRefused("purge fence returned invalid JSON") from exc
+            if state is None or isinstance(state, Mapping):
+                return state
+        raise PurgeRefused("purge fence returned no exact state")
+
     def acquire_apply_fence(
         self, plan_sha256: str, fence_generation_id: str
     ) -> str:
@@ -2128,18 +2784,13 @@ class TrinoAirflowRawBackend:
         generation_id, binding = self._fence_identity(
             plan_sha256, fence_generation_id
         )
-        try:
-            from scrapers.fbref.control import ControlStore
-
-            state = ControlStore.from_env().initialize_publication_generation(
-                generation_id,
-                dag_id="fotmob_legacy_purge",
-                binding=binding,
-                source="fotmob",
-                ttl_seconds=14 * 24 * 60 * 60,
-            )
-        except Exception as exc:
-            raise PurgeRefused("cannot acquire the FotMob purge apply fence") from exc
+        state = self._container_fence_state(
+            action="initialize",
+            generation_id=generation_id,
+            binding=binding,
+        )
+        if not isinstance(state, Mapping):
+            raise PurgeRefused("FotMob purge apply fence acquisition is absent")
         if (
             state.get("generation_id") != generation_id
             or state.get("binding") != binding
@@ -2172,14 +2823,9 @@ class TrinoAirflowRawBackend:
         generation_id, binding = self._fence_identity(
             plan_sha256, fence_generation_id
         )
-        try:
-            from scrapers.fbref.control import ControlStore
-
-            state = ControlStore.from_env().get_publication_generation(
-                generation_id, source="fotmob"
-            )
-        except Exception as exc:
-            raise PurgeRefused("cannot inspect the FotMob purge apply fence") from exc
+        state = self._container_fence_state(
+            action="get", generation_id=generation_id, binding=binding
+        )
         if state is None:
             return None
         if state.get("binding") != binding:
@@ -2208,16 +2854,14 @@ class TrinoAirflowRawBackend:
 
         if fence_token != self._apply_fence_generation:
             raise PurgeRefused("cannot release a different purge apply fence")
-        try:
-            from scrapers.fbref.control import ControlStore
-
-            state = ControlStore.from_env().fail_publication_generation(
-                fence_token,
-                safe_to_release=True,
-                source="fotmob",
-            )
-        except Exception as exc:
-            raise PurgeRefused("cannot release the FotMob purge apply fence") from exc
+        binding = self._apply_fence_binding
+        if not isinstance(binding, Mapping):
+            raise PurgeRefused("purge apply fence binding is absent")
+        state = self._container_fence_state(
+            action="release", generation_id=fence_token, binding=binding
+        )
+        if not isinstance(state, Mapping):
+            raise PurgeRefused("FotMob purge apply fence release is absent")
         if state.get("released") is not True or state.get("active") is True:
             raise PurgeRefused("FotMob purge apply fence release is unproven")
         self._apply_fence_generation = None
@@ -2675,12 +3319,139 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--catalog", default="iceberg")
     parser.add_argument("--schema", default="bronze")
     parser.add_argument("--raw-store-uri")
+    parser.add_argument("--env-file", type=Path, required=True)
+    parser.add_argument("--trino-env-file", type=Path, required=True)
+    parser.add_argument(
+        "--compose-file",
+        type=Path,
+        default=runtime_binding.REPOSITORY_ROOT
+        / "deploy"
+        / "fotmob"
+        / "airflow.compose.yaml",
+    )
+    parser.add_argument("--project", default="fotmob-airflow")
+    parser.add_argument(
+        "--deployment-report",
+        type=Path,
+        required=True,
+        help="Protected current FotMob deployment report",
+    )
+    parser.add_argument(
+        "--scheduled-observation-report",
+        type=Path,
+        required=True,
+        help="Protected first successful scheduled automatic-daily report",
+    )
     return parser
 
 
-def _read_plan(path: Path) -> Mapping[str, Any]:
+def _load_purge_environment(args: argparse.Namespace) -> str:
+    """Load only explicit raw/Trino settings and discard ambient authority."""
+
     try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        lines = args.env_file.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise PurgeRefused(f"cannot read purge env file: {exc}") from exc
+    allowed = set(runtime_binding.PURGE_RAW_ENV_KEYS) | {"ICEBERG_WAREHOUSE"}
+    parsed: dict[str, str] = {}
+    for line_number, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key not in allowed:
+            continue
+        value = value.strip()
+        if value[:1] in {"'", '"'}:
+            if len(value) < 2 or value[-1] != value[0]:
+                raise PurgeRefused(
+                    f"{args.env_file}:{line_number}: unterminated {key} value"
+                )
+            value = value[1:-1]
+        parsed[key] = value
+    raw_uri = str(args.raw_store_uri or parsed.get("FOTMOB_RAW_STORE_URI") or "")
+    if not raw_uri:
+        warehouse = parsed.get("ICEBERG_WAREHOUSE", "").strip().strip("/")
+        if warehouse:
+            raw_uri = f"s3://{warehouse}/raw/fotmob"
+    values = {
+        "FOTMOB_RAW_STORE_URI": raw_uri,
+        "FOTMOB_RAW_S3_ENDPOINT": parsed.get(
+            "FOTMOB_RAW_S3_ENDPOINT", "seaweedfs:8333"
+        ),
+        "FOTMOB_RAW_S3_SCHEME": parsed.get("FOTMOB_RAW_S3_SCHEME", "http"),
+        "FOTMOB_RAW_S3_REGION": parsed.get("FOTMOB_RAW_S3_REGION", "us-east-1"),
+        "S3_ACCESS_KEY": parsed.get("S3_ACCESS_KEY", ""),
+        "S3_SECRET_KEY": parsed.get("S3_SECRET_KEY", ""),
+    }
+    if not values["FOTMOB_RAW_STORE_URI"]:
+        raise PurgeRefused("purge env file does not define the raw-store URI")
+    if not values["S3_ACCESS_KEY"] or not values["S3_SECRET_KEY"]:
+        raise PurgeRefused("purge env file does not define S3 credentials")
+    for key in runtime_binding.PURGE_RAW_ENV_KEYS:
+        os.environ.pop(key, None)
+    os.environ.update(values)
+    try:
+        runtime_binding.load_host_trino_environment(args.trino_env_file)
+    except runtime_binding.RuntimeBindingError as exc:
+        raise PurgeRefused(str(exc)) from exc
+    return values["FOTMOB_RAW_STORE_URI"]
+
+
+def validate_purge_runtime(
+    args: argparse.Namespace,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    """Re-attest both runtimes and bind explicit host data-plane settings."""
+
+    raw_uri = _load_purge_environment(args)
+    try:
+        context = runtime_binding.load_deployment_context(
+            args.deployment_report,
+            project=args.project,
+            compose_file=args.compose_file,
+        )
+        isolated = runtime_binding.validate_live_deployment(
+            context,
+            project=args.project,
+            compose_file=args.compose_file,
+            env_file=args.env_file,
+            require_running=True,
+            run=run,
+        )
+        shared = runtime_binding.validate_live_shared_runtime(context, run=run)
+        data = runtime_binding.validate_live_purge_data_bindings(
+            context, raw_store_uri=raw_uri, run=run
+        )
+    except runtime_binding.RuntimeBindingError as exc:
+        raise PurgeRefused(str(exc)) from exc
+    return {"isolated": isolated, "shared": shared, "data": data, "passed": True}
+
+
+def _read_plan(path: Path) -> Mapping[str, Any]:
+    def reject_duplicate_keys(
+        pairs: Sequence[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in payload:
+                raise PurgeRefused(f"plan contains duplicate JSON key: {key}")
+            payload[key] = value
+        return payload
+
+    try:
+        payload = json.loads(
+            Path(path).read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+        )
+    except PurgeRefused:
+        raise
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PurgeRefused("plan file is unreadable") from exc
     if not isinstance(payload, Mapping):
@@ -2693,6 +3464,9 @@ def main(
     *,
     backend_factory: Callable[[argparse.Namespace], PurgeBackend] = (
         TrinoAirflowRawBackend.from_args
+    ),
+    runtime_preflight: Callable[[argparse.Namespace], Mapping[str, Any]] = (
+        validate_purge_runtime
     ),
 ) -> int:
     args = build_parser().parse_args(argv)
@@ -2730,6 +3504,7 @@ def main(
                     raise PurgeRefused("purge plan has expired")
         elif args.plan is not None or args.plan_sha256 is not None or args.journal:
             raise PurgeRefused("plan/hash/journal arguments are valid only with --apply")
+        runtime_preflight(args)
         backend = backend_factory(args)
         if args.apply:
             if plan is None:  # pragma: no cover - guarded by the apply branch
@@ -2739,9 +3514,15 @@ def main(
                 backend,
                 supplied_sha256=args.plan_sha256,
                 journal_path=args.journal,
+                deployment_report=args.deployment_report,
+                scheduled_observation_report=args.scheduled_observation_report,
             )
         else:
-            result = build_plan(backend)
+            result = build_plan(
+                backend,
+                deployment_report=args.deployment_report,
+                scheduled_observation_report=args.scheduled_observation_report,
+            )
             _atomic_json(args.output, result)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0

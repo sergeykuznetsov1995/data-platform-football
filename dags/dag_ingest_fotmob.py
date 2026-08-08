@@ -606,11 +606,13 @@ def validate_data(
 
     logger = logging.getLogger(__name__)
     try:
-        with open(result_path, "r", encoding="utf-8") as stream:
-            result = json.load(stream)
+        raw_result = Path(result_path).read_bytes()
+        if not raw_result or len(raw_result) > 32 * 1024 * 1024:
+            raise AirflowException("FotMob report has an unsafe byte size")
+        result = json.loads(raw_result.decode("utf-8"))
     except FileNotFoundError as exc:
         raise AirflowException(f"FotMob report not found: {result_path}") from exc
-    except json.JSONDecodeError as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise AirflowException(
             f"Invalid FotMob report JSON at {result_path}: {exc}"
         ) from exc
@@ -839,6 +841,13 @@ def validate_data(
             "transport": transport,
             "budget": budget,
             "selection": selection_summary,
+            # The kept-paused automatic-canary coordinator reads this exact
+            # file from the admitted scheduler and re-hashes it before it can
+            # become rollout evidence.  XCom carries only the locator/digest,
+            # never an unbounded copy of the full catalog report.
+            "runner_report_path": str(Path(result_path)),
+            "runner_report_sha256": hashlib.sha256(raw_result).hexdigest(),
+            "runner_report_bytes": len(raw_result),
         }
         logger.info("FotMob native validation complete: %s", summary)
         return summary

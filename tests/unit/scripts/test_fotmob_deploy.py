@@ -1,14 +1,18 @@
+import copy
 import importlib.util
 import json
 import os
 import subprocess
-from datetime import datetime, timezone
+import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from scripts import fotmob_runtime
+from scrapers.fotmob.catalog_contract import build_catalog_contract
 
 
 SCRIPT = Path(__file__).resolve().parents[3] / "deploy/fotmob/deploy.py"
@@ -68,6 +72,788 @@ def test_image_reference_must_be_versioned():
         with pytest.raises(mod.DeploymentError):
             mod.validate_image_reference(value)
     mod.validate_image_reference("registry/image@sha256:" + "a" * 64)
+
+
+def _automatic_catalog_admission(
+    *,
+    deployment_id: str = "f" * 32,
+    git_sha: str = "a" * 40,
+    scheduler_container_id: str = "1" * 64,
+    now: datetime | None = None,
+) -> dict:
+    entities = (
+        "leaderboards",
+        "matches",
+        "players",
+        "season",
+        "teams",
+        "transfers",
+    )
+    entity_policy = {
+        "match_policy": "finished_only",
+        "leaderboard_policy": "all_advertised",
+        "team_policy": "global_observed_snapshot",
+        "player_policy": "global_observed_snapshot",
+        "transfer_policy": {
+            "window": "1year",
+            "pagination": "unique_hits",
+            "completion_scope": "included_ids",
+            "completion_signature": "catalog_contract",
+        },
+    }
+    contract = build_catalog_contract(
+        catalog_batch_id="batch-1",
+        catalog_content_hash="a" * 64,
+        classifier_version="fotmob-men-v1",
+        included_ids=[47],
+        scopes=[(47, "2025 Apertura")],
+        entities=entities,
+        entity_policy=entity_policy,
+    ).as_dict()
+    now = now or datetime.now(timezone.utc)
+    generation_id = "11111111-1111-1111-1111-111111111111"
+    runner_report = {
+        "run_id": generation_id,
+        "mode": "daily",
+        "status": "success",
+        "complete": True,
+        "completed_at": now.isoformat(),
+        "transport": {"proxy_bytes": 0},
+        "budget": {
+            "requests": 1,
+            "direct_bytes": 1024,
+            "proxy_bytes": 0,
+            "max_requests": 10_000,
+            "max_direct_bytes": 512 * 1024 * 1024,
+            "max_proxy_bytes": 0,
+        },
+        "selection": {
+            "scope_lane": "current",
+            "catalog_contract": contract,
+            "entities": list(entities),
+            "explicit_scopes": [],
+            "competition_limit": 0,
+            "season_limit": 0,
+            "requests_per_minute": 60,
+            "catalog_ids": [47],
+            "catalog_decisions": [
+                {
+                    "competition_id": 47,
+                    "catalog_name": "Premier League",
+                    "profile_name": "Premier League",
+                    "source_gender": "male",
+                    "source_age_group": "adult",
+                    "source_type": "league",
+                    "probe_status": "success",
+                    "decision": "included",
+                    "reason": "structurally confirmed adult men's competition",
+                    "policy_rule": "include_structural_male_adult",
+                    "classifier_version": "fotmob-men-v1",
+                    "profile_target_key": "leagues?id=47",
+                    "profile_content_hash": "b" * 64,
+                }
+            ],
+            "scope_plan_signature": contract["plan_signature"],
+            "planned_scopes": ["47=2025 Apertura"],
+            "scope_attempts": [
+                {
+                    "competition_id": 47,
+                    "source_season_key": "2025 Apertura",
+                    "plan_signature": contract["plan_signature"],
+                    "attempt_count": 1,
+                    "last_attempt_at": now.isoformat(),
+                    "next_retry_at": None,
+                    "outcome": "success",
+                    "reason": "scope completed",
+                    "attempt_identities": [],
+                }
+            ],
+            "completed_transfer_competition_ids": [47],
+            "transfer_plan_signature": contract["plan_signature"],
+            "deferrals": [],
+        },
+    }
+    catalog_sha = fotmob_runtime._automatic_id_digest([47], label="catalog")[1]
+    decision_sha = fotmob_runtime.automatic_decision_digest(
+        runner_report["selection"]["catalog_decisions"]
+    )[1]
+    candidate = {
+        "generation_id": generation_id,
+        "digest": "d" * 64,
+        "transform_task_ids": ["silver_transforms.example"],
+    }
+    publication = {
+        "generation_id": generation_id,
+        "binding": {
+            "schema": "fotmob-publication-v1",
+            "source": "fotmob",
+            "owner": "isolated",
+            "data_interval_start": now.isoformat(),
+            "data_interval_end": now.isoformat(),
+            "runtime_fingerprint": git_sha,
+        },
+    }
+    return {
+        "schema_version": "fotmob-automatic-admission-v1",
+        "validated_at": now.isoformat(),
+        "classifier_version": "fotmob-men-v1",
+        "contract_schema": "fotmob-catalog-v1",
+        "scope_observations": {
+            "table": "fotmob_competition_scope_observations",
+            "table_exists": True,
+            "current_view": "fotmob_competition_scope_observations_current",
+            "current_view_exists": True,
+            "snapshot_run_id": generation_id,
+            "catalog_batch_id": contract["catalog_batch_id"],
+            "catalog_content_hash": contract["catalog_content_hash"],
+            "catalog_id_count": 1,
+            "catalog_ids_sha256": catalog_sha,
+            "decision_count": 1,
+            "decision_ids_sha256": catalog_sha,
+            "decision_evidence_sha256": decision_sha,
+            "duplicate_decision_count": 0,
+            "classifier_version": "fotmob-men-v1",
+            "included_id_count": 1,
+            "included_ids_sha256": contract["included_ids_sha256"],
+        },
+        "writer_snapshot": {
+            "schema_version": "fotmob-writer-snapshot-v1",
+            "transaction_id": "e" * 32,
+            "observed_at": now.isoformat(),
+            "pause_states": {dag_id: True for dag_id in fotmob_runtime.EXPECTED_DAGS},
+            "active_runs": {},
+        },
+        "legacy_owners": {
+            dag_id: {"schedule": None, "is_paused": True}
+            for dag_id in (
+                "dag_trigger_fotmob_daily",
+                "dag_refresh_fotmob",
+                "dag_backfill_fotmob",
+            )
+        },
+        "lane_budgets": {
+            lane: {"max_proxy_mib": 0}
+            for lane in ("daily", "refresh", "backfill")
+        },
+        "active_writers": [],
+        "current_run_reports": [runner_report],
+        "canary": {
+            "schema_version": "fotmob-automatic-canary-v1",
+            "deployment_id": deployment_id,
+            "git_sha": git_sha,
+            "scheduler_container_id": scheduler_container_id,
+            "generation_id": generation_id,
+            "ingest_run_state": "success",
+            "silver_run_state": "success",
+            "candidate_digest": candidate["digest"],
+            "runner_report_sha256": "c" * 64,
+            "publication": publication,
+            "final_publication": {
+                "generation_id": generation_id,
+                "status": "succeeded",
+                "phase": "abandoned",
+                "active": False,
+                "released": True,
+                "published": False,
+                "candidate": candidate,
+            },
+        },
+    }
+
+
+def _automatic_activation_fixture(tmp_path):
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    report_path = evidence_dir / "deployment.json"
+    canary_path = evidence_dir / "automatic-canary.json"
+    isolated = "1" * 64
+    shared = "9" * 64
+    immutable_handoff = {
+        "shared_scheduler_container": shared,
+        "shared_admission_mount": {"read_only": True},
+        "runtime_code_sha256": {"dags/example.py": "e" * 64},
+        "runtime_git_sha": "a" * 40,
+        "control_database": {"same_shared_database": True},
+        "schedule_owner": "isolated",
+        "next_scheduled_interval": NEXT_SCHEDULE_BOUNDARY,
+        "passed": True,
+    }
+    deployment = {
+        "schema_version": "fotmob-deploy-v2",
+        "passed": True,
+        "activation_state": "kept_paused",
+        "kept_paused": True,
+        "paused": sorted(mod.EXPECTED_DAGS),
+        "unpaused": [],
+        "deployment_id": "f" * 32,
+        "git_sha": "a" * 40,
+        "scheduler_container_id": isolated,
+        "evidence_dir": str(evidence_dir.resolve()),
+        "shared_handoff_initial": copy.deepcopy(immutable_handoff),
+        "shared_handoff_final": copy.deepcopy(immutable_handoff),
+        "automatic_rollout": {
+            "schema_version": mod.AUTOMATIC_ROLLOUT_SCHEMA,
+            "phase": "awaiting_canary",
+            "scope_observation_bootstrap": {
+                "table": fotmob_runtime.SCOPE_OBSERVATIONS_TABLE,
+                "table_exists": True,
+                "current_view": fotmob_runtime.SCOPE_OBSERVATIONS_CURRENT_VIEW,
+                "current_view_exists": True,
+            },
+        },
+    }
+    report_path.write_text(json.dumps(deployment), encoding="utf-8")
+    canary_path.write_text("{}", encoding="utf-8")
+    args = SimpleNamespace(
+        keep_paused=False,
+        resume_pending=False,
+        automatic_catalog=True,
+        automatic_canary_report=canary_path,
+        report=report_path,
+        evidence_dir=evidence_dir,
+        release_root=SCRIPT.parents[2],
+        compose_file=tmp_path / "compose.yaml",
+        env_file=tmp_path / "fotmob.env",
+        project="fotmob-airflow",
+        image="registry/image@sha256:" + "b" * 64,
+        postgres_image="postgres@sha256:" + "c" * 64,
+    )
+    return args, deployment, isolated, shared, immutable_handoff
+
+
+def _automatic_rollout_certificate(admission, *, evidence_dir, handoff):
+    raw_boundary = handoff.get("next_scheduled_interval") or {}
+    start = datetime.fromisoformat(
+        str(raw_boundary.get("data_interval_start", "2026-08-07T14:00:00+00:00"))
+    )
+    end = datetime.fromisoformat(
+        str(raw_boundary.get("data_interval_end", "2026-08-08T14:00:00+00:00"))
+    )
+    boundary = {
+        "schema_version": "fotmob-automatic-boundary-v1",
+        "checked_at": (end - timedelta(minutes=30)).isoformat(),
+        "selected_date": end.date().isoformat(),
+        "state": "future",
+        "data_interval_start": start.isoformat(),
+        "data_interval_end": end.isoformat(),
+        "safe_start": (end - timedelta(minutes=30)).isoformat(),
+        "safe_cutoff": (end + timedelta(minutes=45)).isoformat(),
+        "passed": True,
+    }
+    scheduler_state = {
+        "next_background_lane": "refresh",
+        "daily_date": None,
+        "generation": 0,
+        "updated_at": "1970-01-01T00:00:00+00:00",
+    }
+    all_paused = {dag_id: True for dag_id in fotmob_runtime.AUTOMATIC_DAGBAG_DAGS}
+    children_paused = {
+        dag_id: dag_id
+        not in {"dag_ingest_fotmob", "dag_transform_fotmob_silver"}
+        for dag_id in fotmob_runtime.AUTOMATIC_DAGBAG_DAGS
+    }
+    active_paused = {
+        dag_id: dag_id in fotmob_runtime.LEGACY_OWNER_DAGS
+        for dag_id in fotmob_runtime.AUTOMATIC_DAGBAG_DAGS
+    }
+
+    def isolated_tx(phase, before, after, minute):
+        return {
+            "schema_version": "fotmob-writer-snapshot-v1",
+            "transaction_id": f"{minute:x}"[-1] * 32,
+            "observed_at": (end - timedelta(minutes=minute)).isoformat(),
+            "pause_states": before,
+            "active_runs": {},
+            "pause_states_after": after,
+            "phase": phase,
+            "scheduler_state": scheduler_state,
+        }
+
+    shared_before = dict(fotmob_runtime.EXPECTED_SHARED_PAUSE_STATES)
+    shared_after = dict(shared_before)
+    shared_after[fotmob_runtime.SHARED_CONSUMER_DAG_ID] = False
+
+    def shared_tx(phase, before, minute):
+        return {
+            "schema_version": "fotmob-shared-consumer-snapshot-v1",
+            "transaction_id": f"{minute:x}"[-1] * 32,
+            "observed_at": (end - timedelta(minutes=minute)).isoformat(),
+            "dag_id": fotmob_runtime.SHARED_CONSUMER_DAG_ID,
+            "phase": phase,
+            "pause_states_before": before,
+            "pause_states_after": shared_after,
+            "schedule_owner": "isolated",
+            "active_runs": [],
+        }
+
+    return {
+        "automatic_rollout": {
+            "schema_version": fotmob_runtime.AUTOMATIC_ROLLOUT_SCHEMA,
+            "phase": "active",
+            "scope_observation_bootstrap": {
+                "table": fotmob_runtime.SCOPE_OBSERVATIONS_TABLE,
+                "table_exists": True,
+                "current_view": fotmob_runtime.SCOPE_OBSERVATIONS_CURRENT_VIEW,
+                "current_view_exists": True,
+            },
+            "canary_report": str(Path(evidence_dir) / "automatic-canary.json"),
+        },
+        "automatic_activation": {
+            "fresh_shared_handoff": {**copy.deepcopy(handoff), "passed": True},
+            "daily_boundary_initial": boundary,
+            "daily_boundary_commit": dict(boundary),
+            "quiescence_before": {"source": "fotmob", "safe": True, "active": False},
+            "live_canary": {
+                "runner_sha256": admission["canary"]["runner_report_sha256"],
+                "runner_bytes": 123,
+            },
+            "children_transaction": isolated_tx(
+                "children", all_paused, children_paused, 28
+            ),
+            "shared_consumer_unpaused": True,
+            "shared_consumer_transaction": shared_tx(
+                "unpause", shared_before, 27
+            ),
+            "shared_consumer_readback": shared_tx(
+                "inspect_unpaused", shared_after, 26
+            ),
+            "control_quiescence_at_commit": {
+                "source": "fotmob",
+                "safe": True,
+                "active": False,
+            },
+            "owner_unpaused_last": True,
+            "owner_transaction": isolated_tx(
+                "owner", children_paused, active_paused, 25
+            ),
+        },
+    }
+
+
+def test_automatic_catalog_admission_accepts_one_recomputed_contract():
+    payload = _automatic_catalog_admission()
+
+    assert mod.validate_automatic_catalog_admission(payload) == (
+        fotmob_runtime.validate_automatic_catalog_admission(payload)
+    )
+
+
+def test_active_automatic_rollout_requires_complete_ordered_ceremony(tmp_path):
+    _args, deployment, _isolated, _shared, handoff = _automatic_activation_fixture(
+        tmp_path
+    )
+    admission = _automatic_catalog_admission(
+        now=datetime(2026, 7, 21, 13, 35, tzinfo=timezone.utc)
+    )
+    certificate = _automatic_rollout_certificate(
+        admission,
+        evidence_dir=tmp_path / "evidence",
+        handoff=handoff,
+    )
+    payload = {
+        **deployment,
+        "evidence_dir": str((tmp_path / "evidence").resolve()),
+        "shared_handoff_final": handoff,
+        **certificate,
+    }
+
+    result = fotmob_runtime.validate_automatic_rollout_activation(
+        payload, admission
+    )
+    assert result["passed"] is True
+    assert result["recovered"] is False
+
+    mutations = []
+    missing_activation = copy.deepcopy(payload)
+    missing_activation.pop("automatic_activation")
+    mutations.append(missing_activation)
+    missing_owner = copy.deepcopy(payload)
+    missing_owner["automatic_activation"].pop("owner_transaction")
+    mutations.append(missing_owner)
+    swapped_order = copy.deepcopy(payload)
+    swapped_order["automatic_activation"]["owner_transaction"]["observed_at"] = (
+        "2026-07-21T13:31:00+00:00"
+    )
+    mutations.append(swapped_order)
+    stale_scheduler = copy.deepcopy(payload)
+    stale_scheduler["automatic_activation"]["children_transaction"][
+        "scheduler_state"
+    ]["daily_date"] = payload["automatic_activation"]["daily_boundary_commit"][
+        "selected_date"
+    ]
+    mutations.append(stale_scheduler)
+    malformed_scheduler = copy.deepcopy(payload)
+    malformed_scheduler["automatic_activation"]["children_transaction"][
+        "scheduler_state"
+    ]["updated_at"] = "not-a-date"
+    mutations.append(malformed_scheduler)
+    wrong_shared_interval = copy.deepcopy(payload)
+    wrong_shared_interval["automatic_activation"]["fresh_shared_handoff"][
+        "next_scheduled_interval"
+    ]["data_interval_end"] = "2026-08-09T14:00:00+00:00"
+    mutations.append(wrong_shared_interval)
+
+    for mutated in mutations:
+        with pytest.raises(fotmob_runtime.RuntimeBindingError):
+            fotmob_runtime.validate_automatic_rollout_activation(
+                mutated, admission
+            )
+
+
+def test_live_shared_runtime_rechecks_exact_container_mount_env_and_bytes(
+    tmp_path, monkeypatch
+):
+    release = tmp_path / "release"
+    release.mkdir()
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    shared_id = "9" * 64
+    isolated_id = "1" * 64
+    manifest = {"dags/example.py": "e" * 64}
+    report_path = str(
+        fotmob_runtime.SHARED_CONTAINER_EVIDENCE_ROOT / "deployment.json"
+    )
+    context = {
+        "release_root": str(release),
+        "evidence_dir": str(evidence),
+        "git_sha": "a" * 40,
+        "scheduler_container_id": isolated_id,
+        "shared_container_report_path": report_path,
+        "shared_handoff_final": {
+            "shared_scheduler_container": shared_id,
+            "runtime_code_sha256": manifest,
+        },
+    }
+    isolated = {
+        "Id": isolated_id,
+        "State": {"Running": True},
+        "Config": {"Env": ["FBREF_CONTROL_DB_URI=postgresql://control"]},
+        "Mounts": [],
+    }
+    shared = {
+        "Id": shared_id,
+        "State": {"Running": True},
+        "Config": {
+            "Env": [
+                "FBREF_CONTROL_DB_URI=postgresql://control",
+                "FOTMOB_DEPLOY_GIT_SHA=" + "a" * 40,
+                "FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH=" + report_path,
+            ]
+        },
+        "Mounts": [
+            {
+                "Source": str(evidence.resolve()),
+                "Destination": str(
+                    fotmob_runtime.SHARED_CONTAINER_EVIDENCE_ROOT
+                ),
+                "RW": False,
+            }
+        ],
+    }
+    containers = {shared_id: shared, isolated_id: isolated}
+    monkeypatch.setattr(
+        fotmob_runtime,
+        "_inspect_container",
+        lambda container_id, **_kwargs: copy.deepcopy(containers[container_id]),
+    )
+    monkeypatch.setattr(
+        fotmob_runtime, "shared_runtime_manifest", lambda _release: manifest
+    )
+
+    def run(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_ACTIVE_SHARED_MANIFEST_JSON=" + json.dumps(manifest),
+            stderr="",
+        )
+
+    assert fotmob_runtime.validate_live_shared_runtime(context, run=run)[
+        "passed"
+    ] is True
+
+    mutations = []
+    wrong_id = copy.deepcopy(containers)
+    wrong_id[shared_id]["Id"] = "8" * 64
+    mutations.append(wrong_id)
+    stopped = copy.deepcopy(containers)
+    stopped[shared_id]["State"]["Running"] = False
+    mutations.append(stopped)
+    wrong_control = copy.deepcopy(containers)
+    wrong_control[shared_id]["Config"]["Env"][0] = (
+        "FBREF_CONTROL_DB_URI=postgresql://other"
+    )
+    mutations.append(wrong_control)
+    wrong_git = copy.deepcopy(containers)
+    wrong_git[shared_id]["Config"]["Env"][1] = "FOTMOB_DEPLOY_GIT_SHA=" + "b" * 40
+    mutations.append(wrong_git)
+    writable_mount = copy.deepcopy(containers)
+    writable_mount[shared_id]["Mounts"][0]["RW"] = True
+    mutations.append(writable_mount)
+    wrong_mount = copy.deepcopy(containers)
+    wrong_mount[shared_id]["Mounts"][0]["Source"] = str(tmp_path / "other")
+    mutations.append(wrong_mount)
+
+    for mutated in mutations:
+        monkeypatch.setattr(
+            fotmob_runtime,
+            "_inspect_container",
+            lambda container_id, _items=mutated, **_kwargs: copy.deepcopy(
+                _items[container_id]
+            ),
+        )
+        with pytest.raises(fotmob_runtime.RuntimeBindingError):
+            fotmob_runtime.validate_live_shared_runtime(context, run=run)
+
+    monkeypatch.setattr(
+        fotmob_runtime,
+        "_inspect_container",
+        lambda container_id, **_kwargs: copy.deepcopy(containers[container_id]),
+    )
+    context_drift = copy.deepcopy(context)
+    context_drift["shared_handoff_final"]["runtime_code_sha256"] = {
+        "dags/example.py": "d" * 64
+    }
+    with pytest.raises(fotmob_runtime.RuntimeBindingError, match="manifest"):
+        fotmob_runtime.validate_live_shared_runtime(context_drift, run=run)
+
+    def drifted_run(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_ACTIVE_SHARED_MANIFEST_JSON="
+            + json.dumps({"dags/example.py": "d" * 64}),
+            stderr="",
+        )
+
+    with pytest.raises(fotmob_runtime.RuntimeBindingError, match="bytes"):
+        fotmob_runtime.validate_live_shared_runtime(context, run=drifted_run)
+
+
+def test_automatic_catalog_admission_rejects_self_consistent_but_stale_evidence():
+    payload = _automatic_catalog_admission()
+    stale = "2020-01-01T00:00:00+00:00"
+    payload["validated_at"] = stale
+    report = payload["current_run_reports"][0]
+    report["completed_at"] = stale
+    report["selection"]["scope_attempts"][0]["last_attempt_at"] = stale
+
+    with pytest.raises(mod.DeploymentError, match="stale|old|72"):
+        mod.validate_automatic_catalog_admission(payload)
+
+
+def test_automatic_catalog_admission_rejects_stale_canary_with_fresh_stamp():
+    payload = _automatic_catalog_admission()
+    payload["current_run_reports"][0]["completed_at"] = (
+        "2020-01-01T00:00:00+00:00"
+    )
+
+    with pytest.raises(mod.DeploymentError, match="canary.*stale"):
+        mod.validate_automatic_catalog_admission(payload)
+
+
+def test_automatic_catalog_admission_rejects_alternate_entity_policy():
+    payload = _automatic_catalog_admission()
+    report = payload["current_run_reports"][0]
+    selection = report["selection"]
+    policy = copy.deepcopy(selection["catalog_contract"]["entity_policy"])
+    policy["team_policy"] = "incremental"
+    contract = build_catalog_contract(
+        catalog_batch_id="batch-1",
+        catalog_content_hash="a" * 64,
+        classifier_version="fotmob-men-v1",
+        included_ids=[47],
+        scopes=[(47, "2025 Apertura")],
+        entities=selection["entities"],
+        entity_policy=policy,
+    ).as_dict()
+    selection["catalog_contract"] = contract
+    selection["scope_plan_signature"] = contract["plan_signature"]
+    selection["scope_attempts"][0]["plan_signature"] = contract["plan_signature"]
+    selection["transfer_plan_signature"] = contract["plan_signature"]
+
+    with pytest.raises(mod.DeploymentError, match="unsafe entity profile"):
+        mod.validate_automatic_catalog_admission(payload)
+
+
+def test_automatic_admission_imports_work_for_direct_scripts_outside_repo(tmp_path):
+    admission = tmp_path / "admission.json"
+    admission.write_text(json.dumps(_automatic_catalog_admission()), encoding="utf-8")
+    scripts = SCRIPT.parents[2] / "scripts"
+    code = (
+        "import json,sys; "
+        f"sys.path.insert(0,{str(scripts)!r}); "
+        "import fotmob_runtime; "
+        f"p=json.load(open({str(admission)!r},encoding='utf-8')); "
+        "assert fotmob_runtime.validate_automatic_catalog_admission(p)['passed']"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (
+            lambda value: value.update({"classifier_version": "fotmob-men-v2"}),
+            "classifier",
+        ),
+        (
+            lambda value: value["scope_observations"].update(
+                {"current_view_exists": False}
+            ),
+            "scope-observation",
+        ),
+        (
+            lambda value: value["legacy_owners"][
+                "dag_refresh_fotmob"
+            ].update({"schedule": "@continuous", "is_paused": False}),
+            "legacy owner",
+        ),
+        (
+            lambda value: value["current_run_reports"][0].update(
+                {"mode": "refresh"}
+            ),
+            "daily/current",
+        ),
+        (
+            lambda value: value["lane_budgets"]["daily"].update(
+                {"max_proxy_mib": 1}
+            ),
+            "proxy",
+        ),
+        (
+            lambda value: value["current_run_reports"][0]["budget"].update(
+                {"max_requests": 9_999}
+            ),
+            "daily.*budget",
+        ),
+        (
+            lambda value: value["current_run_reports"][0]["selection"].update(
+                {"requests_per_minute": 59}
+            ),
+            "daily.*profile",
+        ),
+        (
+            lambda value: value["active_writers"].append(
+                {
+                    "dag_id": "dag_orchestrate_fotmob",
+                    "run_id": "scheduled__2026-08-08T12:00:00+00:00",
+                    "state": "running",
+                }
+            ),
+            "active writer",
+        ),
+        (
+            lambda value: value["current_run_reports"][0]["selection"].update(
+                {"catalog_decisions": []}
+            ),
+            "dynamic acceptance",
+        ),
+    ),
+)
+def test_automatic_catalog_admission_fails_closed(mutation, message):
+    payload = _automatic_catalog_admission()
+    mutation(payload)
+
+    with pytest.raises(mod.DeploymentError, match=message):
+        mod.validate_automatic_catalog_admission(payload)
+
+
+def test_automatic_catalog_admission_rejects_any_second_or_legacy_report():
+    payload = _automatic_catalog_admission()
+    payload["current_run_reports"].append(
+        {
+            "selection": {
+                "daily_contract": "fotmob-daily-v1",
+                "competition_scope": {"sha256": "b" * 64},
+            },
+            "transport": {"proxy_bytes": 0},
+            "budget": {"proxy_bytes": 0, "max_proxy_bytes": 0},
+        }
+    )
+    with pytest.raises(mod.DeploymentError, match="exactly one canary"):
+        mod.validate_automatic_catalog_admission(payload)
+
+    payload = _automatic_catalog_admission()
+    second = copy.deepcopy(payload["current_run_reports"][0])
+    second_contract = build_catalog_contract(
+        catalog_batch_id="batch-2",
+        catalog_content_hash="b" * 64,
+        classifier_version="fotmob-men-v1",
+        included_ids=[47],
+        scopes=[(47, "2025 Apertura")],
+        entities=payload["current_run_reports"][0]["selection"]["entities"],
+        entity_policy=payload["current_run_reports"][0]["selection"][
+            "catalog_contract"
+        ]["entity_policy"],
+    ).as_dict()
+    second["selection"]["catalog_contract"] = second_contract
+    second["selection"]["scope_plan_signature"] = second_contract[
+        "plan_signature"
+    ]
+    second["selection"]["scope_attempts"][0]["plan_signature"] = second_contract[
+        "plan_signature"
+    ]
+    second["selection"]["transfer_plan_signature"] = second_contract[
+        "plan_signature"
+    ]
+    payload["current_run_reports"].append(second)
+    with pytest.raises(mod.DeploymentError, match="exactly one canary"):
+        mod.validate_automatic_catalog_admission(payload)
+
+
+def test_scope_observation_bootstrap_creates_table_and_current_view_before_cutover():
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                "FOTMOB_AUTOMATIC_SCOPE_JSON="
+                + json.dumps(_automatic_catalog_admission()["scope_observations"])
+            ),
+            stderr="",
+        )
+
+    evidence = mod.bootstrap_automatic_scope_observations("1" * 64, run=run)
+
+    assert evidence["table_exists"] is True
+    assert evidence["current_view_exists"] is True
+    assert calls[0][:3] == ("docker", "exec", "1" * 64)
+    code = calls[0][-1]
+    assert "ensure_schema" in code
+    assert "ensure_current_views" in code
+    assert "r.schema" in code
+    assert "created" in code
+    assert "fotmob_competition_scope_observations_current" in code
+    compile(code, "<automatic-scope-bootstrap>", "exec")
+
+
+def test_scope_observation_bootstrap_rejects_missing_view():
+    evidence = _automatic_catalog_admission()["scope_observations"]
+    evidence["current_view_exists"] = False
+
+    def run(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_AUTOMATIC_SCOPE_JSON=" + json.dumps(evidence),
+            stderr="",
+        )
+
+    with pytest.raises(mod.DeploymentError, match="scope-observation"):
+        mod.bootstrap_automatic_scope_observations("1" * 64, run=run)
 
 
 def test_database_password_must_be_safe_for_sqlalchemy_uri(tmp_path):
@@ -305,6 +1091,8 @@ def test_exact_scheduled_run_rejects_forged_run_id():
             run=run,
         )
     assert "DagRun.generate_run_id(DagRunType.SCHEDULED,r.logical_date)" in calls[0][-1]
+    assert "DagRun.execution_date.desc()" in calls[0][-1]
+    assert "DagRun.logical_date.desc()" not in calls[0][-1]
     compile(calls[0][-1], "<scheduled-run-proof>", "exec")
 
 
@@ -446,6 +1234,9 @@ def test_prepare_dagbag_contains_exact_root_files_and_detects_tampering(tmp_path
     evidence = tmp_path / "evidence"
     for relative in (
         "dags/dag_ingest_fotmob.py",
+        "dags/dag_orchestrate_fotmob.py",
+        "dags/dag_refresh_fotmob.py",
+        "dags/dag_backfill_fotmob.py",
         "dags/dag_transform_fotmob_silver.py",
         "dags/dag_trigger_fotmob_daily.py",
         "deploy/fotmob/.airflowignore",
@@ -455,9 +1246,12 @@ def test_prepare_dagbag_contains_exact_root_files_and_detects_tampering(tmp_path
         path.write_text(relative)
     projection = mod.prepare_dagbag(release, evidence, "a" * 40)
     assert {path.name for path in projection.iterdir()} == {
+        "dag_orchestrate_fotmob.py",
         "dag_ingest_fotmob.py",
         "dag_transform_fotmob_silver.py",
         "dag_trigger_fotmob_daily.py",
+        "dag_refresh_fotmob.py",
+        "dag_backfill_fotmob.py",
         ".airflowignore",
         "utils",
         "sql",
@@ -1240,12 +2034,11 @@ def test_redeploy_aborts_before_pause_or_stop_when_isolated_run_is_active(
             stdout = ""
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
-    with pytest.raises(mod.DeploymentError, match="active runs"):
+    with pytest.raises(
+        mod.DeploymentError, match="legacy scheduled activation is retired"
+    ):
         mod.deploy(arguments, run=run, sleeper=lambda _: None)
-    flattened = [part for command in calls for part in command]
-    assert "up" not in flattened
-    assert "stop" not in flattened
-    assert "pause" not in flattened
+    assert calls == []
 
 
 def test_admission_failure_stops_scheduler_when_repause_cannot_be_proven(
@@ -1341,9 +2134,11 @@ def test_admission_failure_stops_scheduler_when_repause_cannot_be_proven(
             stdout = ""
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
-    with pytest.raises(mod.DeploymentError, match="image ID"):
+    with pytest.raises(
+        mod.DeploymentError, match="legacy scheduled activation is retired"
+    ):
         mod.deploy(arguments, run=run, sleeper=lambda _: None)
-    assert any("stop" in command for command in calls)
+    assert calls == []
 
 
 def test_partial_compose_up_failure_still_stops_scheduler(tmp_path, monkeypatch):
@@ -1389,11 +2184,11 @@ def test_partial_compose_up_failure_still_stops_scheduler(tmp_path, monkeypatch)
             raise subprocess.CalledProcessError(1, command)
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
-    with pytest.raises(subprocess.CalledProcessError):
+    with pytest.raises(
+        mod.DeploymentError, match="legacy scheduled activation is retired"
+    ):
         mod.deploy(arguments, run=run, sleeper=lambda _: None)
-    assert any(
-        "stop" in command and "airflow-scheduler" in command for command in calls
-    )
+    assert calls == []
 
 
 def test_trigger_activation_commits_pending_then_proves_both_runs(
@@ -2456,3 +3251,945 @@ def test_keep_paused_deploy_takes_a_real_second_shared_handoff_snapshot(
     assert result["activation_state"] == "kept_paused"
     assert result["shared_handoff_initial"]["snapshot_number"] == 1
     assert result["shared_handoff_final"]["snapshot_number"] == 2
+
+
+def test_automatic_activation_boundary_matches_owner_daily_binding():
+    before = mod.validate_automatic_activation_boundary(
+        NEXT_SCHEDULE_BOUNDARY,
+        now=datetime(2026, 7, 21, 13, 30, tzinfo=timezone.utc),
+    )
+    during = mod.validate_automatic_activation_boundary(
+        NEXT_SCHEDULE_BOUNDARY,
+        now=datetime(2026, 7, 21, 14, 30, tzinfo=timezone.utc),
+    )
+
+    assert before["state"] == "future"
+    assert during["state"] == "daily_window_open"
+    assert before["data_interval_start"] == "2026-07-20T14:00:00.000000+00:00"
+    assert before["data_interval_end"] == "2026-07-21T14:00:00.000000+00:00"
+
+
+def test_owner_committed_shared_recovery_accepts_only_exact_wait_sensor_run():
+    expected_run_id = mod._scheduled_run_id(NEXT_SCHEDULE_BOUNDARY["logical_date"])
+    downstream = {
+        "trigger_xref_transforms": None,
+        "trigger_e3_transforms": None,
+        "trigger_e4_transforms": None,
+        "finalize_fotmob_publication": None,
+    }
+    consumer = {
+        "dag_id": mod.SHARED_CONSUMER_DAG_ID,
+        "run_id": expected_run_id,
+        "run_type": "scheduled",
+        "state": "running",
+        "logical_date": "2026-07-20T14:00:00.000000+00:00",
+        "data_interval_start": "2026-07-20T14:00:00.000000+00:00",
+        "data_interval_end": "2026-07-21T14:00:00.000000+00:00",
+        "task_states": {
+            "wait_for_fotmob_publication": "up_for_reschedule",
+            **downstream,
+        },
+    }
+    snapshot = {
+        "active_runs": [
+            {
+                "dag_id": mod.SHARED_CONSUMER_DAG_ID,
+                "run_id": expected_run_id,
+                "state": "running",
+            }
+        ],
+        "consumer_runs": [consumer],
+    }
+
+    proof = mod.validate_owner_committed_shared_recovery(
+        snapshot,
+        stored_boundary=NEXT_SCHEDULE_BOUNDARY,
+        live_boundary=ADVANCED_SCHEDULE_BOUNDARY,
+    )
+    assert proof["mode"] == "scheduled_wait_sensor"
+
+    terminal = copy.deepcopy(snapshot)
+    terminal["active_runs"] = []
+    terminal["consumer_runs"][0]["state"] = "failed"
+    terminal["consumer_runs"][0]["task_states"][
+        "wait_for_fotmob_publication"
+    ] = "failed"
+    terminal["consumer_runs"][0]["task_states"].update(
+        {
+            "trigger_xref_transforms": "upstream_failed",
+            "trigger_e3_transforms": "upstream_failed",
+            "trigger_e4_transforms": "upstream_failed",
+            "finalize_fotmob_publication": "failed",
+        }
+    )
+    terminal_proof = mod.validate_owner_committed_shared_recovery(
+        terminal,
+        stored_boundary=NEXT_SCHEDULE_BOUNDARY,
+        live_boundary=ADVANCED_SCHEDULE_BOUNDARY,
+    )
+    assert terminal_proof["mode"] == "terminal_wait_sensor_failed"
+    impossible_terminal = copy.deepcopy(terminal)
+    impossible_terminal["consumer_runs"][0]["task_states"][
+        "finalize_fotmob_publication"
+    ] = None
+    with pytest.raises(mod.DeploymentError, match="wait-only failed"):
+        mod.validate_owner_committed_shared_recovery(
+            impossible_terminal,
+            stored_boundary=NEXT_SCHEDULE_BOUNDARY,
+            live_boundary=ADVANCED_SCHEDULE_BOUNDARY,
+        )
+
+    mutations = []
+    wrong_run = copy.deepcopy(snapshot)
+    wrong_run["active_runs"][0]["run_id"] = "scheduled__wrong"
+    mutations.append(wrong_run)
+    wrong_type = copy.deepcopy(snapshot)
+    wrong_type["consumer_runs"][0]["run_type"] = "manual"
+    mutations.append(wrong_type)
+    wrong_interval = copy.deepcopy(snapshot)
+    wrong_interval["consumer_runs"][0]["data_interval_end"] = (
+        "2026-07-21T14:00:01.000000+00:00"
+    )
+    mutations.append(wrong_interval)
+    downstream_active = copy.deepcopy(snapshot)
+    downstream_active["consumer_runs"][0]["task_states"][
+        "trigger_xref_transforms"
+    ] = "running"
+    mutations.append(downstream_active)
+
+    for mutated in mutations:
+        with pytest.raises(mod.DeploymentError):
+            mod.validate_owner_committed_shared_recovery(
+                mutated,
+                stored_boundary=NEXT_SCHEDULE_BOUNDARY,
+                live_boundary=ADVANCED_SCHEDULE_BOUNDARY,
+            )
+
+    with pytest.raises(mod.DeploymentError, match="exactly one"):
+        mod.validate_owner_committed_shared_recovery(
+            snapshot,
+            stored_boundary=NEXT_SCHEDULE_BOUNDARY,
+            live_boundary={
+                key: (
+                    datetime.fromisoformat(value) + timedelta(days=2)
+                ).isoformat()
+                for key, value in NEXT_SCHEDULE_BOUNDARY.items()
+            },
+        )
+@pytest.mark.parametrize(
+    ("boundary", "now"),
+    (
+        (NEXT_SCHEDULE_BOUNDARY, datetime(2026, 7, 21, 13, 29, tzinfo=timezone.utc)),
+        (NEXT_SCHEDULE_BOUNDARY, datetime(2026, 7, 21, 14, 45, tzinfo=timezone.utc)),
+        (NEXT_SCHEDULE_BOUNDARY, datetime(2026, 7, 21, 15, 0, tzinfo=timezone.utc)),
+        (NEXT_SCHEDULE_BOUNDARY, datetime(2026, 7, 22, 13, 0, tzinfo=timezone.utc)),
+        (
+            {
+                **NEXT_SCHEDULE_BOUNDARY,
+                "data_interval_start": "2026-07-21T13:00:00+00:00",
+                "logical_date": "2026-07-21T13:00:00+00:00",
+            },
+            datetime(2026, 7, 21, 13, 0, tzinfo=timezone.utc),
+        ),
+        (
+            {
+                **NEXT_SCHEDULE_BOUNDARY,
+                "data_interval_end": "2026-07-21T15:00:00+00:00",
+                "run_after": "2026-07-21T15:00:00+00:00",
+            },
+            datetime(2026, 7, 21, 13, 0, tzinfo=timezone.utc),
+        ),
+    ),
+)
+def test_automatic_activation_boundary_rejects_unsafe_daily_cut(boundary, now):
+    with pytest.raises(mod.DeploymentError, match="safe 14:00"):
+        mod.validate_automatic_activation_boundary(boundary, now=now)
+
+
+def test_atomic_writer_transaction_names_exact_six_and_rejects_partial_result():
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        payload = {
+            "schema_version": "fotmob-writer-snapshot-v1",
+            "transaction_id": "e" * 32,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "pause_states": {dag_id: True for dag_id in mod.EXPECTED_DAGS},
+            "active_runs": {},
+            "pause_states_after": {
+                dag_id: dag_id
+                not in {"dag_ingest_fotmob", "dag_transform_fotmob_silver"}
+                for dag_id in mod.EXPECTED_DAGS
+            },
+            "phase": "children",
+            "scheduler_state": {
+                "next_background_lane": "refresh",
+                "daily_date": None,
+                "generation": 0,
+                "updated_at": "1970-01-01T00:00:00+00:00",
+            },
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_AUTOMATIC_WRITER_TX_JSON=" + json.dumps(payload),
+            stderr="",
+        )
+
+    result = mod.atomic_automatic_writer_transition(
+        "1" * 64, phase="children", selected_date="2026-07-21", run=run
+    )
+    code = commands[0][-1]
+    compile(code, "<automatic-writer-transaction>", "exec")
+    assert f"ids = {sorted(mod.EXPECTED_DAGS)!r}" in code
+    assert "SERIALIZABLE" in code
+    assert "with_for_update" in code
+    assert result["active_runs"] == {}
+
+    def partial(command, **_kwargs):
+        payload = dict(result)
+        payload["pause_states"] = {"dag_orchestrate_fotmob": True}
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_AUTOMATIC_WRITER_TX_JSON=" + json.dumps(payload),
+            stderr="",
+        )
+
+    with pytest.raises(mod.DeploymentError, match="incomplete"):
+        mod.atomic_automatic_writer_transition(
+            "1" * 64,
+            phase="children",
+            selected_date="2026-07-21",
+            run=partial,
+        )
+
+
+def test_atomic_shared_cutover_locks_full_shared_inventory():
+    commands = []
+    after = dict(fotmob_runtime.EXPECTED_SHARED_PAUSE_STATES)
+    after[mod.SHARED_CONSUMER_DAG_ID] = False
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        payload = {
+            "schema_version": "fotmob-shared-consumer-snapshot-v1",
+            "transaction_id": "e" * 32,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "dag_id": mod.SHARED_CONSUMER_DAG_ID,
+            "phase": "unpause",
+            "pause_states_before": dict(
+                fotmob_runtime.EXPECTED_SHARED_PAUSE_STATES
+            ),
+            "pause_states_after": after,
+            "schedule_owner": "isolated",
+            "active_runs": [],
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_SHARED_CONSUMER_TX_JSON=" + json.dumps(payload),
+            stderr="",
+        )
+
+    mod.atomic_shared_consumer_transition("9" * 64, phase="unpause", run=run)
+    code = commands[0][-1]
+    compile(code, "<shared-consumer-transaction>", "exec")
+    assert f"active_ids = {sorted(fotmob_runtime.SHARED_STATE_DAGS)!r}" in code
+    assert "fotmob_schedule_owner" in code
+    assert "from airflow.models import DagModel, DagRun, TaskInstance, Variable" in code
+    assert "consumer_runs" in code
+    assert "with_for_update" in code
+    assert "SERIALIZABLE" in code
+
+
+def _install_automatic_activation_mocks(
+    monkeypatch, args, deployment, isolated, shared, handoff
+):
+    events = []
+    admission = _automatic_catalog_admission(
+        deployment_id=deployment["deployment_id"],
+        git_sha=deployment["git_sha"],
+        scheduler_container_id=deployment["scheduler_container_id"],
+    )
+    activation = _automatic_rollout_certificate(
+        admission,
+        evidence_dir=args.evidence_dir,
+        handoff=handoff,
+    )["automatic_activation"]
+    canary = {
+        "current_run_reports": admission["current_run_reports"],
+        "runner_report_sha256": admission["canary"]["runner_report_sha256"],
+        "runner_report_bytes": 123,
+    }
+    monkeypatch.setattr(
+        mod,
+        "_validate_resume_identity",
+        lambda *_args, **_kwargs: (args.report, isolated, shared),
+    )
+    monkeypatch.setattr(
+        mod, "load_automatic_canary_report", lambda *_args, **_kwargs: canary
+    )
+    monkeypatch.setattr(
+        mod.runtime_binding,
+        "load_deployment_context",
+        lambda *_args, **_kwargs: deployment,
+    )
+    monkeypatch.setattr(
+        mod.runtime_binding,
+        "validate_live_deployment",
+        lambda *_args, **_kwargs: events.append("live_deployment"),
+    )
+    monkeypatch.setattr(
+        mod.runtime_binding,
+        "validate_live_shared_runtime",
+        lambda *_args, **_kwargs: events.append("live_shared_runtime"),
+    )
+    monkeypatch.setattr(
+        mod.runtime_binding,
+        "assert_no_active_fotmob_publication",
+        lambda *_args, **_kwargs: events.append("full_quiescence")
+        or copy.deepcopy(activation["quiescence_before"]),
+    )
+    monkeypatch.setattr(
+        mod,
+        "validate_shared_handoff",
+        lambda *_args, **_kwargs: events.append("fresh_shared_snapshot")
+        or copy.deepcopy(handoff),
+    )
+    monkeypatch.setattr(
+        mod,
+        "validate_automatic_activation_boundary",
+        lambda *_args, **_kwargs: copy.deepcopy(
+            activation["daily_boundary_initial"]
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "validate_live_automatic_canary",
+        lambda *_args, **_kwargs: events.append("live_canary")
+        or copy.deepcopy(activation["live_canary"]),
+    )
+    monkeypatch.setattr(
+        mod,
+        "collect_automatic_scope_observations",
+        lambda *_args, **_kwargs: events.append("scope_snapshot") or {},
+    )
+    monkeypatch.setattr(
+        mod,
+        "build_automatic_catalog_admission",
+        lambda *_args, **_kwargs: copy.deepcopy(admission),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_configured_env_value",
+        lambda *_args, **_kwargs: "postgresql://control",
+    )
+
+    def isolated_transition(_container, *, phase, selected_date=None, run):
+        events.append("isolated_" + phase)
+        if phase in {"children", "owner"}:
+            return copy.deepcopy(activation[f"{phase}_transaction"])
+        return {
+            "schema_version": "fotmob-writer-snapshot-v1",
+            "transaction_id": "e" * 32,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "pause_states": {dag_id: True for dag_id in mod.EXPECTED_DAGS},
+            "active_runs": {},
+            "pause_states_after": {},
+            "phase": phase,
+            "scheduler_state": {
+                "next_background_lane": "refresh",
+                "daily_date": None,
+                "generation": 0,
+                "updated_at": "1970-01-01T00:00:00+00:00",
+            },
+        }
+
+    def shared_transition(_container, *, phase, recovery_boundary=None, run):
+        events.append("shared_" + phase)
+        if phase == "unpause":
+            return copy.deepcopy(activation["shared_consumer_transaction"])
+        if phase == "inspect_unpaused":
+            return copy.deepcopy(activation["shared_consumer_readback"])
+        return {"phase": phase, "pause_states_after": {}, "active_runs": []}
+
+    monkeypatch.setattr(mod, "atomic_automatic_writer_transition", isolated_transition)
+    monkeypatch.setattr(mod, "atomic_shared_consumer_transition", shared_transition)
+    monkeypatch.setattr(
+        mod,
+        "assert_no_active_control_publication",
+        lambda *_args, **_kwargs: events.append("control_quiescence")
+        or copy.deepcopy(activation["control_quiescence_at_commit"]),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_atomic_json",
+        lambda _path, payload: events.append("write_" + payload["activation_state"]),
+    )
+    return events
+
+
+def test_automatic_activation_enables_children_shared_then_owner_last(
+    tmp_path, monkeypatch
+):
+    args, deployment, isolated, shared, handoff = _automatic_activation_fixture(
+        tmp_path
+    )
+    events = _install_automatic_activation_mocks(
+        monkeypatch, args, deployment, isolated, shared, handoff
+    )
+
+    def run(command, **_kwargs):
+        assert command[:4] == (
+            "docker",
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="true\n", stderr="")
+
+    result = mod.activate_automatic_catalog(args, run=run)
+
+    assert result["activation_state"] == "active"
+    assert result["paused"] == sorted(mod.LEGACY_OWNER_DAGS)
+    assert result["unpaused"] == sorted(mod.AUTOMATIC_ACTIVE_DAGS)
+    assert events.index("fresh_shared_snapshot") < events.index("full_quiescence")
+    assert events.index("full_quiescence") < events.index("live_canary")
+    assert events.index("scope_snapshot") < events.index("isolated_children")
+    assert events.index("write_pending_automatic") < events.index("shared_unpause")
+    assert events.index("shared_inspect_unpaused") < events.index("isolated_owner")
+    assert events.index("isolated_owner") < events.index("write_active")
+
+
+def test_automatic_activation_owner_failure_preserves_shared_pending_state(
+    tmp_path, monkeypatch
+):
+    args, deployment, isolated, shared, handoff = _automatic_activation_fixture(
+        tmp_path
+    )
+    events = _install_automatic_activation_mocks(
+        monkeypatch, args, deployment, isolated, shared, handoff
+    )
+    original = mod.atomic_automatic_writer_transition
+
+    def fail_owner(container, *, phase, selected_date=None, run):
+        if phase == "owner":
+            events.append("isolated_owner_failed")
+            raise mod.DeploymentError("owner failed")
+        return original(
+            container, phase=phase, selected_date=selected_date, run=run
+        )
+
+    monkeypatch.setattr(mod, "atomic_automatic_writer_transition", fail_owner)
+
+    def run(command, **_kwargs):
+        if command[:4] == (
+            "docker",
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+        ):
+            return subprocess.CompletedProcess(command, 0, stdout="true\n", stderr="")
+        if command[:2] == ("docker", "stop"):
+            events.append("scheduler_stop")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        raise AssertionError(command)
+
+    result = mod.activate_automatic_catalog(args, run=run)
+
+    assert result["activation_state"] == "pending_automatic"
+    assert result["durable_pending_report_preserved"] is True
+    assert "isolated_pause_all" not in events
+    assert "shared_pause" not in events
+    assert "scheduler_stop" not in events
+
+
+def test_automatic_activation_preserves_pending_when_shared_response_is_lost(
+    tmp_path, monkeypatch
+):
+    args, deployment, isolated, shared, handoff = _automatic_activation_fixture(
+        tmp_path
+    )
+    events = _install_automatic_activation_mocks(
+        monkeypatch, args, deployment, isolated, shared, handoff
+    )
+    original = mod.atomic_shared_consumer_transition
+
+    def lose_unpause_response(container, *, phase, run):
+        evidence = original(container, phase=phase, run=run)
+        if phase == "unpause":
+            raise OSError("docker response lost after shared commit")
+        return evidence
+
+    monkeypatch.setattr(
+        mod, "atomic_shared_consumer_transition", lose_unpause_response
+    )
+
+    def run(command, **_kwargs):
+        if command[:4] == (
+            "docker",
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+        ):
+            return subprocess.CompletedProcess(command, 0, stdout="true\n", stderr="")
+        raise AssertionError(command)
+
+    result = mod.activate_automatic_catalog(args, run=run)
+
+    assert result["activation_state"] == "pending_automatic"
+    assert result["durable_pending_report_preserved"] is True
+    assert result["automatic_rollout"]["phase"] == (
+        "shared_committed_pending_owner"
+    )
+    assert "isolated_pause_all" not in events
+    assert "shared_pause" not in events
+
+
+def test_automatic_activation_preserves_pending_when_owner_response_is_lost(
+    tmp_path, monkeypatch
+):
+    args, deployment, isolated, shared, handoff = _automatic_activation_fixture(
+        tmp_path
+    )
+    events = _install_automatic_activation_mocks(
+        monkeypatch, args, deployment, isolated, shared, handoff
+    )
+    original = mod.atomic_automatic_writer_transition
+    active_pause_shape = {
+        dag_id: dag_id in mod.LEGACY_OWNER_DAGS for dag_id in mod.EXPECTED_DAGS
+    }
+
+    def lose_owner_response(container, *, phase, selected_date=None, run):
+        evidence = original(
+            container, phase=phase, selected_date=selected_date, run=run
+        )
+        if phase == "owner":
+            raise OSError("docker response lost after owner commit")
+        return evidence
+
+    monkeypatch.setattr(
+        mod, "atomic_automatic_writer_transition", lose_owner_response
+    )
+    monkeypatch.setattr(
+        mod,
+        "inspect_automatic_writer_pause_shape",
+        lambda *_args, **_kwargs: {
+            "pause_states": active_pause_shape,
+            "active_runs": [],
+            "atomic_metadata_snapshot": True,
+        },
+    )
+
+    def run(command, **_kwargs):
+        if command[:4] == (
+            "docker",
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+        ):
+            return subprocess.CompletedProcess(command, 0, stdout="true\n", stderr="")
+        raise AssertionError(command)
+
+    result = mod.activate_automatic_catalog(args, run=run)
+
+    assert result["activation_state"] == "pending_automatic"
+    assert result["durable_pending_report_preserved"] is True
+    assert result["automatic_rollout"]["phase"] == (
+        "owner_committed_pending_report"
+    )
+    assert "isolated_pause_all" not in events
+    assert "shared_pause" not in events
+
+
+def test_automatic_activation_never_stops_after_owner_commit(
+    tmp_path, monkeypatch
+):
+    args, deployment, isolated, shared, handoff = _automatic_activation_fixture(
+        tmp_path
+    )
+    events = _install_automatic_activation_mocks(
+        monkeypatch, args, deployment, isolated, shared, handoff
+    )
+
+    def write(_path, payload):
+        events.append("write_" + payload["activation_state"])
+        if payload["activation_state"] == "active":
+            raise OSError("disk full")
+
+    monkeypatch.setattr(mod, "_atomic_json", write)
+
+    def run(command, **_kwargs):
+        if command[:4] == (
+            "docker",
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+        ):
+            return subprocess.CompletedProcess(command, 0, stdout="true\n", stderr="")
+        if command[:2] == ("docker", "stop"):
+            events.append("scheduler_stop")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        raise AssertionError(command)
+
+    result = mod.activate_automatic_catalog(args, run=run)
+
+    assert result["activation_state"] == "pending_automatic"
+    assert result["recovery_required"] is True
+    assert result["durable_pending_report_preserved"] is True
+    assert events.count("write_pending_automatic") == 1
+    assert "isolated_pause_all" not in events
+    assert "shared_pause" not in events
+    assert "scheduler_stop" not in events
+
+
+def test_main_preserves_wait_only_pending_file_after_final_active_write_failure(
+    tmp_path, monkeypatch
+):
+    args, deployment, isolated, shared, handoff = _automatic_activation_fixture(
+        tmp_path
+    )
+    args.activate_automatic = True
+    real_atomic_json = mod._atomic_json
+    _install_automatic_activation_mocks(
+        monkeypatch, args, deployment, isolated, shared, handoff
+    )
+
+    def write(path, payload):
+        if payload["activation_state"] == "active":
+            raise OSError("disk full")
+        real_atomic_json(path, payload)
+
+    monkeypatch.setattr(mod, "_atomic_json", write)
+
+    def run(command, **_kwargs):
+        if command[:4] == (
+            "docker",
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+        ):
+            return subprocess.CompletedProcess(command, 0, stdout="true\n", stderr="")
+        raise AssertionError(command)
+
+    activate = mod.activate_automatic_catalog
+    monkeypatch.setattr(
+        mod,
+        "activate_automatic_catalog",
+        lambda selected_args: activate(selected_args, run=run),
+    )
+
+    assert mod._main_locked(args) == 1
+    durable = json.loads(args.report.read_text(encoding="utf-8"))
+    assert durable["passed"] is True
+    assert durable["activation_state"] == "pending_automatic"
+    assert durable["automatic_rollout"]["phase"] == "pending_owner"
+    assert "durable_pending_report_preserved" not in durable
+
+
+def test_automatic_activation_refuses_invalid_final_certificate_after_owner(
+    tmp_path, monkeypatch
+):
+    args, deployment, isolated, shared, handoff = _automatic_activation_fixture(
+        tmp_path
+    )
+    events = _install_automatic_activation_mocks(
+        monkeypatch, args, deployment, isolated, shared, handoff
+    )
+    original = mod.atomic_automatic_writer_transition
+
+    def corrupt_owner(container, *, phase, selected_date=None, run):
+        evidence = original(
+            container,
+            phase=phase,
+            selected_date=selected_date,
+            run=run,
+        )
+        if phase == "owner":
+            evidence["transaction_id"] = "not-a-transaction"
+        return evidence
+
+    monkeypatch.setattr(mod, "atomic_automatic_writer_transition", corrupt_owner)
+
+    def run(command, **_kwargs):
+        if command[:4] == (
+            "docker",
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+        ):
+            return subprocess.CompletedProcess(command, 0, stdout="true\n", stderr="")
+        raise AssertionError(command)
+
+    result = mod.activate_automatic_catalog(args, run=run)
+
+    assert result["activation_state"] == "pending_automatic"
+    assert result["recovery_required"] is True
+    assert "write_active" not in events
+    assert "scheduler_stop" not in events
+
+
+@pytest.mark.parametrize("failure", ("changed_boundary", "active_isolated_run"))
+def test_owner_committed_recovery_rejects_unsafe_live_state(
+    tmp_path, monkeypatch, failure
+):
+    args, deployment, isolated, shared, handoff = _automatic_activation_fixture(
+        tmp_path
+    )
+    admission = _automatic_catalog_admission()
+    certificate = _automatic_rollout_certificate(
+        admission,
+        evidence_dir=args.evidence_dir,
+        handoff=handoff,
+    )
+    deployment.update(
+        {
+            "activation_state": "pending_automatic",
+            "generated_at": "2026-07-21T13:36:00+00:00",
+            "automatic_catalog_admission": admission,
+            "automatic_rollout": {
+                **certificate["automatic_rollout"],
+                "phase": "owner_committed_pending_report",
+            },
+            "automatic_activation": certificate["automatic_activation"],
+        }
+    )
+    args.report.write_text(json.dumps(deployment), encoding="utf-8")
+    events = _install_automatic_activation_mocks(
+        monkeypatch, args, deployment, isolated, shared, handoff
+    )
+    active_pause_shape = {
+        dag_id: dag_id in mod.LEGACY_OWNER_DAGS for dag_id in mod.EXPECTED_DAGS
+    }
+    monkeypatch.setattr(
+        mod,
+        "inspect_automatic_writer_pause_shape",
+        lambda *_args, **_kwargs: {
+            "pause_states": active_pause_shape,
+            "active_runs": (
+                [
+                    {
+                        "dag_id": "dag_ingest_fotmob",
+                        "run_id": "manual__unsafe",
+                        "state": "running",
+                    }
+                ]
+                if failure == "active_isolated_run"
+                else []
+            ),
+            "atomic_metadata_snapshot": True,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "read_schedule_boundary",
+        lambda *_args, **_kwargs: copy.deepcopy(
+            ADVANCED_SCHEDULE_BOUNDARY
+            if failure == "changed_boundary"
+            else NEXT_SCHEDULE_BOUNDARY
+        ),
+    )
+
+    def run(command, **_kwargs):
+        if command[:4] == (
+            "docker",
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+        ):
+            return subprocess.CompletedProcess(command, 0, stdout="true\n", stderr="")
+        raise AssertionError(command)
+
+    result = mod.activate_automatic_catalog(args, run=run)
+
+    assert result["activation_state"] == "pending_automatic"
+    assert result["recovery_required"] is True
+    expected_error = "changed" if failure == "changed_boundary" else "active isolated"
+    assert expected_error in result["error"]
+    assert "write_active" not in events
+    assert "scheduler_stop" not in events
+
+
+@pytest.mark.parametrize(
+    ("lost_owner_evidence", "shared_state"),
+    (
+        (False, "idle"),
+        (True, "idle"),
+        (True, "active_wait"),
+        (True, "terminal_failed"),
+    ),
+)
+def test_owner_committed_recovery_promotes_only_exact_shared_state(
+    tmp_path, monkeypatch, lost_owner_evidence, shared_state
+):
+    args, deployment, isolated, shared, handoff = _automatic_activation_fixture(
+        tmp_path
+    )
+    admission = _automatic_catalog_admission(
+        now=datetime(2026, 7, 21, 13, 35, tzinfo=timezone.utc)
+    )
+    certificate = _automatic_rollout_certificate(
+        admission,
+        evidence_dir=args.evidence_dir,
+        handoff=handoff,
+    )
+    activation = copy.deepcopy(certificate["automatic_activation"])
+    if lost_owner_evidence:
+        for key in (
+            "shared_consumer_transaction",
+            "shared_consumer_readback",
+            "control_quiescence_at_commit",
+            "owner_transaction",
+        ):
+            activation.pop(key)
+        activation["shared_consumer_unpaused"] = False
+        activation["owner_unpaused_last"] = False
+    deployment.update(
+        {
+            "activation_state": "pending_automatic",
+            "generated_at": "2026-07-21T13:36:00+00:00",
+            "automatic_catalog_admission": admission,
+            "automatic_rollout": {
+                **certificate["automatic_rollout"],
+                "phase": "pending_owner",
+            },
+            "automatic_activation": activation,
+        }
+    )
+    args.report.write_text(json.dumps(deployment), encoding="utf-8")
+    events = _install_automatic_activation_mocks(
+        monkeypatch, args, deployment, isolated, shared, handoff
+    )
+    if shared_state != "idle":
+        monkeypatch.setattr(
+            mod, "_now", lambda: "2026-07-21T16:00:00+00:00"
+        )
+    active_pause_shape = {
+        dag_id: dag_id in mod.LEGACY_OWNER_DAGS for dag_id in mod.EXPECTED_DAGS
+    }
+    monkeypatch.setattr(
+        mod,
+        "inspect_automatic_writer_pause_shape",
+        lambda *_args, **_kwargs: {
+            "pause_states": active_pause_shape,
+            "active_runs": [],
+            "atomic_metadata_snapshot": True,
+        },
+    )
+    if shared_state != "idle":
+        shared_readback = copy.deepcopy(
+            certificate["automatic_activation"]["shared_consumer_readback"]
+        )
+        expected_run_id = mod._scheduled_run_id(
+            NEXT_SCHEDULE_BOUNDARY["logical_date"]
+        )
+        consumer = {
+            "dag_id": mod.SHARED_CONSUMER_DAG_ID,
+            "run_id": expected_run_id,
+            "run_type": "scheduled",
+            "state": "failed" if shared_state == "terminal_failed" else "running",
+            "logical_date": "2026-07-20T14:00:00.000000+00:00",
+            "data_interval_start": "2026-07-20T14:00:00.000000+00:00",
+            "data_interval_end": "2026-07-21T14:00:00.000000+00:00",
+            "task_states": {
+                "wait_for_fotmob_publication": (
+                    "failed"
+                    if shared_state == "terminal_failed"
+                    else "up_for_reschedule"
+                ),
+                "trigger_xref_transforms": None,
+                "trigger_e3_transforms": None,
+                "trigger_e4_transforms": None,
+                "finalize_fotmob_publication": None,
+            },
+        }
+        if shared_state == "terminal_failed":
+            consumer["task_states"].update(
+                {
+                    "trigger_xref_transforms": "upstream_failed",
+                    "trigger_e3_transforms": "upstream_failed",
+                    "trigger_e4_transforms": "upstream_failed",
+                    "finalize_fotmob_publication": "failed",
+                }
+            )
+        shared_readback["active_runs"] = (
+            []
+            if shared_state == "terminal_failed"
+            else [
+                {
+                    "dag_id": mod.SHARED_CONSUMER_DAG_ID,
+                    "run_id": expected_run_id,
+                    "state": "running",
+                }
+            ]
+        )
+        shared_readback["consumer_runs"] = [consumer]
+        original_shared = mod.atomic_shared_consumer_transition
+
+        def shared_transition(container, *, phase, recovery_boundary=None, run):
+            if phase == "inspect_unpaused":
+                events.append("shared_" + phase)
+                return copy.deepcopy(shared_readback)
+            return original_shared(
+                container,
+                phase=phase,
+                recovery_boundary=recovery_boundary,
+                run=run,
+            )
+
+        monkeypatch.setattr(
+            mod, "atomic_shared_consumer_transition", shared_transition
+        )
+    monkeypatch.setattr(
+        mod,
+        "read_schedule_boundary",
+        lambda *_args, **_kwargs: copy.deepcopy(
+            ADVANCED_SCHEDULE_BOUNDARY
+            if shared_state != "idle"
+            else NEXT_SCHEDULE_BOUNDARY
+        ),
+    )
+
+    def run(command, **_kwargs):
+        if command[:4] == (
+            "docker",
+            "inspect",
+            "--format",
+            "{{.State.Running}}",
+        ):
+            return subprocess.CompletedProcess(command, 0, stdout="true\n", stderr="")
+        raise AssertionError(command)
+
+    result = mod.activate_automatic_catalog(args, run=run)
+
+    assert result["activation_state"] == "active"
+    summary = fotmob_runtime.validate_automatic_rollout_activation(
+        result, admission
+    )
+    assert summary["recovered"] is True
+    assert "write_active" in events
+    assert "isolated_pause_all" not in events
+    assert "shared_pause" not in events
+    assert "scheduler_stop" not in events
+
+
+def test_ordinary_deploy_cannot_overwrite_pending_automatic_bytes(tmp_path):
+    report = tmp_path / "deployment.json"
+    payload = {
+        "schema_version": "fotmob-deploy-v2",
+        "passed": False,
+        "activation_state": "pending_automatic",
+        "automatic_rollout": {
+            "schema_version": mod.AUTOMATIC_ROLLOUT_SCHEMA,
+            "phase": "owner_committed_pending_report",
+        },
+    }
+    report.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    original = report.read_bytes()
+
+    with pytest.raises(mod.DeploymentError, match="activate-automatic"):
+        mod._guard_existing_pending_activation(report)
+
+    assert report.read_bytes() == original

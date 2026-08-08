@@ -15,7 +15,6 @@ from scrapers.fotmob.repository import (
 )
 from tests.unit.scripts.fotmob_runtime_fixture import (
     isolated_runtime_proof,
-    schedule_boundary_proof,
     shared_handoff_proof,
 )
 
@@ -52,12 +51,15 @@ def runtime_options(tmp_path):
                 "passed": True,
                 "activation_state": "kept_paused",
                 "kept_paused": True,
-                "paused": [
-                    "dag_ingest_fotmob",
-                    "dag_transform_fotmob_silver",
-                    "dag_trigger_fotmob_daily",
-                ],
+                "paused": sorted(mod.runtime_binding.EXPECTED_DAGS),
                 "unpaused": [],
+                "coordinator_rollout": {
+                    "schema_version": (
+                        mod.runtime_binding.COORDINATOR_ROLLOUT_SCHEMA
+                    ),
+                    "phase": "kept_paused",
+                    "legacy_activation_retired": True,
+                },
                 "generated_at": "2026-07-21T10:00:00Z",
                 "project": "fotmob-airflow",
                 "compose_file": str(compose.resolve()),
@@ -105,7 +107,6 @@ def runtime_options(tmp_path):
                 "shared_handoff_final": shared_handoff_proof(
                     shared_control, release_root=tmp_path
                 ),
-                "schedule_boundary": schedule_boundary_proof(),
             }
         )
     )
@@ -610,28 +611,22 @@ def test_runtime_binding_rejects_pending_trigger_activation(tmp_path):
         raise AssertionError("pending trigger activation was accepted as complete")
 
 
-def test_runtime_binding_rejects_mismatched_scheduled_consumer_interval(tmp_path):
+def test_runtime_binding_accepts_coordinator_without_retired_schedule_proof(tmp_path):
     options = runtime_options(tmp_path)
     deployment_path = Path(options[options.index("--deployment-report") + 1])
     compose_path = Path(options[options.index("--compose-file") + 1])
-    payload = json.loads(deployment_path.read_text(encoding="utf-8"))
-    payload["schedule_boundary"]["isolated_final"] = {
-        "logical_date": "2026-07-21T14:00:00+00:00",
-        "data_interval_start": "2026-07-21T14:00:00+00:00",
-        "data_interval_end": "2026-07-22T14:00:00+00:00",
-        "run_after": "2026-07-22T14:00:00+00:00",
-    }
-    deployment_path.write_text(json.dumps(payload), encoding="utf-8")
+    context = mod.runtime_binding.load_deployment_context(
+        deployment_path,
+        project="fotmob-airflow",
+        compose_file=compose_path,
+    )
 
-    with pytest.raises(
-        mod.runtime_binding.RuntimeBindingError,
-        match="next scheduled intervals differ",
-    ):
-        mod.runtime_binding.load_deployment_context(
-            deployment_path,
-            project="fotmob-airflow",
-            compose_file=compose_path,
-        )
+    assert "schedule_boundary" not in context
+    assert context["coordinator_rollout"] == {
+        "schema_version": mod.runtime_binding.COORDINATOR_ROLLOUT_SCHEMA,
+        "phase": "kept_paused",
+        "legacy_activation_retired": True,
+    }
 
 
 def _active_schedule_report(logical_date: datetime) -> tuple[dict, dict[str, str]]:

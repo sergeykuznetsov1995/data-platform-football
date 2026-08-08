@@ -1,11 +1,22 @@
 import hashlib
 import json
+import os
+import subprocess
+import sys
+import tempfile
+import uuid
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import ModuleType
 
 import pytest
 
 from scripts import purge_fotmob_competitions as mod
+from tests.unit.scripts.test_fotmob_deploy import (
+    _automatic_catalog_admission,
+    _automatic_rollout_certificate,
+)
 
 
 NOW = datetime(2026, 8, 8, 10, 0, tzinfo=timezone.utc)
@@ -31,11 +42,777 @@ def _evidence(competition_id: int) -> mod.ProtectedEvidence:
     )
 
 
+def _scheduled_observation_payload(
+    *, evidence_dir: Path = Path("/protected/fotmob-evidence")
+) -> tuple[dict, dict]:
+    deployment_id = "a" * 32
+    git_sha = "b" * 40
+    isolated_id = "c" * 64
+    shared_id = "d" * 64
+    next_interval = {
+        "logical_date": "2026-08-06T14:00:00+00:00",
+        "data_interval_start": "2026-08-06T14:00:00+00:00",
+        "data_interval_end": "2026-08-07T14:00:00+00:00",
+        "run_after": "2026-08-07T14:00:00+00:00",
+    }
+    handoff = {
+        "shared_scheduler_container": shared_id,
+        "shared_admission_mount": {"read_only": True},
+        "runtime_code_sha256": {"dags/example.py": "e" * 64},
+        "runtime_git_sha": git_sha,
+        "control_database": {"same_shared_database": True},
+        "schedule_owner": "isolated",
+        "next_scheduled_interval": next_interval,
+        "passed": True,
+    }
+    admission = _automatic_catalog_admission(
+        deployment_id=deployment_id,
+        git_sha=git_sha,
+        scheduler_container_id=isolated_id,
+        now=datetime(2026, 8, 7, 13, 30, tzinfo=timezone.utc),
+    )
+    certificate = _automatic_rollout_certificate(
+        admission,
+        evidence_dir=evidence_dir,
+        handoff=handoff,
+    )
+    deployment = {
+        "schema_version": "fotmob-deploy-v2",
+        "passed": True,
+        "activation_state": "active",
+        "kept_paused": False,
+        "generated_at": "2026-08-07T13:36:00+00:00",
+        "evidence_dir": str(evidence_dir.resolve()),
+        "automatic_catalog_admission": admission,
+        "deployment_id": deployment_id,
+        "git_sha": git_sha,
+        "scheduler_container_id": isolated_id,
+        "shared_handoff_final": handoff,
+        **certificate,
+    }
+    binding = {
+        "schema": "fotmob-publication-v1",
+        "source": "fotmob",
+        "owner": "isolated",
+        "data_interval_start": "2026-08-06T14:00:00.000000+00:00",
+        "data_interval_end": "2026-08-07T14:00:00.000000+00:00",
+        "runtime_fingerprint": deployment["git_sha"],
+    }
+    generation_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            "fotmob-publication:"
+            + json.dumps(binding, sort_keys=True, separators=(",", ":")),
+        )
+    )
+    observation = {
+        "schema_version": "fotmob-scheduled-observation-v1",
+        "passed": True,
+        "deployment": {
+            key: deployment[key]
+            for key in ("deployment_id", "git_sha", "scheduler_container_id")
+        },
+        "runs": {
+            "owner": {
+                "dag_id": "dag_orchestrate_fotmob",
+                "run_id": "scheduled__2026-08-07T14:00:00+00:00",
+                "run_type": "scheduled",
+                "generation_id": generation_id,
+                "state": "success",
+            },
+            "ingest": {
+                "dag_id": "dag_ingest_fotmob",
+                "run_id": f"fotmob_orchestrated__{generation_id}",
+                "owner_run_id": "scheduled__2026-08-07T14:00:00+00:00",
+                "generation_id": generation_id,
+                "state": "success",
+            },
+            "silver": {
+                "dag_id": "dag_transform_fotmob_silver",
+                "run_id": f"fotmob_silver__{generation_id}",
+                "ingest_run_id": f"fotmob_orchestrated__{generation_id}",
+                "generation_id": generation_id,
+                "state": "success",
+            },
+            "sofascore": {
+                "dag_id": "dag_sofascore_pipeline",
+                "run_id": "sofa-1",
+                "generation_id": generation_id,
+                "state": "success",
+            },
+            "finalizer": {
+                "dag_id": "dag_sofascore_pipeline",
+                "run_id": "sofa-1",
+                "task_id": "finalize_fotmob_publication",
+                "generation_id": generation_id,
+                "state": "success",
+            },
+        },
+        "publication": {
+            "generation_id": generation_id,
+            "binding": binding,
+            "status": "succeeded",
+            "phase": "published",
+            "active": False,
+            "published": True,
+            "released": True,
+        },
+    }
+    return deployment, observation
+
+
+def _write_scheduled_observation(tmp_path: Path) -> tuple[Path, Path]:
+    deployment, observation = _scheduled_observation_payload(evidence_dir=tmp_path)
+    deployment_path = tmp_path / "deployment.json"
+    observation_path = tmp_path / "scheduled-observation.json"
+    deployment_path.write_text(json.dumps(deployment), encoding="utf-8")
+    observation_path.write_text(json.dumps(observation), encoding="utf-8")
+    return deployment_path, observation_path
+
+
+def test_plan_requires_exact_protected_scheduled_automatic_observation(tmp_path):
+    deployment_path, observation_path = _write_scheduled_observation(tmp_path)
+
+    plan = mod.build_plan(
+        FakeBackend(),
+        now=NOW,
+        ttl=timedelta(hours=1),
+        deployment_report=deployment_path,
+        scheduled_observation_report=observation_path,
+    )
+
+    fence = plan["scheduled_observation"]
+    assert fence["sha256"] == hashlib.sha256(observation_path.read_bytes()).hexdigest()
+    assert fence["deployment_id"] == "a" * 32
+    assert fence["generation_id"] == _scheduled_observation_payload()[1]["publication"][
+        "generation_id"
+    ]
+
+
+@pytest.mark.parametrize("mutation", ("missing_ceremony", "wrong_canary_identity"))
+def test_purge_rejects_noncanonical_active_deployment_certificate(
+    tmp_path, mutation
+):
+    deployment_path, observation_path = _write_scheduled_observation(tmp_path)
+    deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+    if mutation == "missing_ceremony":
+        deployment.pop("automatic_activation")
+    else:
+        deployment["automatic_catalog_admission"]["canary"][
+            "scheduler_container_id"
+        ] = "f" * 64
+    deployment_path.write_text(json.dumps(deployment), encoding="utf-8")
+
+    with pytest.raises(mod.PurgeRefused, match="canonical active automatic"):
+        mod.build_plan(
+            FakeBackend(),
+            now=NOW,
+            ttl=timedelta(hours=1),
+            deployment_report=deployment_path,
+            scheduled_observation_report=observation_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "target, path, value, message",
+    (
+        ("deployment", ("kept_paused",), True, "active automatic"),
+        ("observation", ("runs", "owner", "state"), "failed", "owner did not succeed"),
+        ("observation", ("publication", "released"), False, "published and released"),
+    ),
+)
+def test_plan_rejects_kept_paused_or_failed_scheduled_observation(
+    tmp_path, target, path, value, message
+):
+    deployment_path, observation_path = _write_scheduled_observation(tmp_path)
+    report_path = deployment_path if target == "deployment" else observation_path
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    cursor = payload
+    for key in path[:-1]:
+        cursor = cursor[key]
+    cursor[path[-1]] = value
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(mod.PurgeRefused, match=message):
+        mod.build_plan(
+            FakeBackend(),
+            now=NOW,
+            ttl=timedelta(hours=1),
+            deployment_report=deployment_path,
+            scheduled_observation_report=observation_path,
+        )
+
+
+def test_apply_rejects_tampered_report_or_live_observation_drift(tmp_path):
+    backend = FakeBackend()
+    deployment_path, observation_path = _write_scheduled_observation(tmp_path)
+    plan = mod.build_plan(
+        backend,
+        now=NOW,
+        ttl=timedelta(hours=1),
+        deployment_report=deployment_path,
+        scheduled_observation_report=observation_path,
+    )
+    payload = json.loads(observation_path.read_text(encoding="utf-8"))
+    payload["runs"]["silver"]["run_id"] = "tampered"
+    observation_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(
+        mod.PurgeRefused,
+        match="digest or live deployment identity|run lineage",
+    ):
+        mod.apply_plan(
+            plan,
+            backend,
+            supplied_sha256=plan["plan_sha256"],
+            journal_path=tmp_path / "journal.json",
+            now=NOW,
+        )
+
+    deployment_path, observation_path = _write_scheduled_observation(tmp_path)
+    plan = mod.build_plan(
+        backend,
+        now=NOW,
+        ttl=timedelta(hours=1),
+        deployment_report=deployment_path,
+        scheduled_observation_report=observation_path,
+    )
+    expected = mod._plan_scheduled_observation(plan)
+    backend.live_scheduled_observation = replace(expected, generation_id=str(uuid.uuid4()))
+    with pytest.raises(mod.PurgeRefused, match="live scheduled observation differs"):
+        mod.apply_plan(
+            plan,
+            backend,
+            supplied_sha256=plan["plan_sha256"],
+            journal_path=tmp_path / "journal-live.json",
+            now=NOW,
+        )
+
+
+def test_production_observation_requeries_exact_isolated_and_shared_containers(tmp_path):
+    """The evidence file is only an assertion; both scheduler DBs are authority."""
+
+    deployment_path, observation_path = _write_scheduled_observation(tmp_path)
+    observation = mod._scheduled_observation(
+        observation_path, deployment_report=deployment_path
+    )
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        # Each container script emits the marker followed by a JSON proof.
+        if command[2] == "c" * 64:
+            output = 'FOTMOB_PURGE_PROOF={"passed": true}\n'
+        else:
+            output = 'FOTMOB_PURGE_PROOF={"passed": true}\n'
+        return type("Completed", (), {"stdout": output})()
+
+    backend = mod.TrinoAirflowRawBackend(
+        connection=object(), raw_store=object(), run=run
+    )
+    backend._query = lambda sql: [(1,)]  # data-plane deployment marker
+
+    backend.assert_live_scheduled_observation(observation)
+
+    assert [call[0][:3] for call in calls] == [
+        ("docker", "exec", "c" * 64),
+        ("docker", "exec", "d" * 64),
+    ]
+    isolated_script = calls[0][0][-1]
+    shared_script = calls[1][0][-1]
+    assert "dag_orchestrate_fotmob" in isolated_script
+    assert "choose_fotmob_lane" in isolated_script
+    assert "attest_isolated_runtime" in isolated_script
+    assert "dag_ingest_fotmob" in isolated_script
+    assert "dag_transform_fotmob_silver" in isolated_script
+    assert "dag_sofascore_pipeline" in shared_script
+    assert "finalize_fotmob_publication" in shared_script
+    assert "ControlStore" in isolated_script
+    # Owner admission is committed before the final active report write.  A
+    # task may start in that small gap, so the validated owner transaction is
+    # the live lineage fence, not the later deployment.generated_at value.
+    assert '"activation_at": "2026-08-07T13:35:00+00:00"' in isolated_script
+    assert '"activation_at": "2026-08-07T13:36:00+00:00"' not in isolated_script
+    quiescence = backend._quiescence_script(
+        tuple(mod.SHARED_PAUSE_STATES),
+        control=False,
+        active_dag_ids=mod.SHARED_STATE_DAGS,
+        expected_pause_states=mod.SHARED_PAUSE_STATES,
+    )
+    assert "dag_sofascore_pipeline" in quiescence
+    assert "dag_transform_xref" in quiescence
+    assert "dag_iceberg_maintenance" in quiescence
+    assert "dag_iceberg_maintenance_daily" in quiescence
+    assert "expected_pause_states" in quiescence
+    assert "TaskInstance" in quiescence
+    assert "up_for_reschedule" in quiescence
+    assert "active_tasks == 0" in quiescence
+    assert "REPEATABLE READ, READ ONLY" in quiescence
+
+
+def test_production_observation_refuses_failed_live_container_proof(tmp_path):
+    deployment_path, observation_path = _write_scheduled_observation(tmp_path)
+    observation = mod._scheduled_observation(
+        observation_path, deployment_report=deployment_path
+    )
+
+    def run(_command, **_kwargs):
+        return type("Completed", (), {"stdout": 'FOTMOB_PURGE_PROOF={"passed": false}\n'})()
+
+    backend = mod.TrinoAirflowRawBackend(
+        connection=object(), raw_store=object(), run=run
+    )
+    backend._query = lambda sql: [(1,)]
+
+    with pytest.raises(mod.PurgeRefused, match="unproven"):
+        backend.assert_live_scheduled_observation(observation)
+
+
+def test_generated_scheduled_observation_scripts_execute_exact_lineage(
+    tmp_path, monkeypatch, capsys
+):
+    deployment_path, observation_path = _write_scheduled_observation(tmp_path)
+    observation = mod._scheduled_observation(
+        observation_path, deployment_report=deployment_path
+    )
+    deployment = json.loads(deployment_path.read_text(encoding="utf-8"))
+    activation_at = datetime.fromisoformat(deployment["generated_at"])
+    binding = observation.publication_binding
+
+    class Field:
+        def __init__(self, name):
+            self.name = name
+
+        def __eq__(self, value):
+            return ("eq", self.name, value)
+
+        def in_(self, values):
+            return ("in", self.name, tuple(values))
+
+        def asc(self):
+            return ("asc", self.name)
+
+        def desc(self):
+            return ("desc", self.name)
+
+    class DagRun:
+        dag_id = Field("dag_id")
+        run_id = Field("run_id")
+        state = Field("state")
+        start_date = Field("start_date")
+
+    class DagModel:
+        dag_id = Field("dag_id")
+
+    class TaskInstance:
+        dag_id = Field("dag_id")
+        run_id = Field("run_id")
+        task_id = Field("task_id")
+        state = Field("state")
+
+    class XCom:
+        dag_id = Field("dag_id")
+        run_id = Field("run_id")
+        task_id = Field("task_id")
+        key = Field("key")
+        timestamp = Field("timestamp")
+
+        @staticmethod
+        def deserialize_value(row):
+            return row.value
+
+    def row(model, **values):
+        item = model()
+        for key, value in values.items():
+            setattr(item, key, value)
+        return item
+
+    owner_run_id = observation.runs["owner"]["run_id"]
+    ingest_run_id = observation.runs["ingest"]["run_id"]
+    silver_run_id = observation.runs["silver"]["run_id"]
+    sofa_run_id = observation.runs["sofascore"]["run_id"]
+    start = datetime.fromisoformat(binding["data_interval_start"])
+    end = datetime.fromisoformat(binding["data_interval_end"])
+    noop_owner_run_id = "scheduled__2026-08-08T13:40:00+00:00"
+    dag_runs = [
+        row(
+            DagRun,
+            dag_id="dag_orchestrate_fotmob",
+            run_id=noop_owner_run_id,
+            state="success",
+            run_type="scheduled",
+            start_date=activation_at + timedelta(minutes=4),
+            conf={},
+            logical_date=end - timedelta(minutes=20),
+            data_interval_start=end - timedelta(minutes=25),
+            data_interval_end=end - timedelta(minutes=20),
+        ),
+        row(
+            DagRun,
+            dag_id="dag_orchestrate_fotmob",
+            run_id=owner_run_id,
+            state="success",
+            run_type="scheduled",
+            start_date=end,
+            conf={},
+            logical_date=end,
+            data_interval_start=end - timedelta(minutes=5),
+            data_interval_end=end,
+        ),
+        row(
+            DagRun,
+            dag_id="dag_ingest_fotmob",
+            run_id=ingest_run_id,
+            state="success",
+            run_type="manual",
+            start_date=end,
+            conf={"fotmob_publication": {"generation_id": observation.generation_id, "binding": binding}},
+        ),
+        row(
+            DagRun,
+            dag_id="dag_transform_fotmob_silver",
+            run_id=silver_run_id,
+            state="success",
+            run_type="manual",
+            start_date=end,
+            conf={"fotmob_publication": {"generation_id": observation.generation_id, "binding": binding}},
+        ),
+        row(
+            DagRun,
+            dag_id="dag_sofascore_pipeline",
+            run_id=sofa_run_id,
+            state="success",
+            run_type="scheduled",
+            start_date=end,
+            conf={},
+            logical_date=start,
+            data_interval_start=start,
+            data_interval_end=end,
+        ),
+    ]
+    task_instances = [
+        row(
+            TaskInstance,
+            dag_id="dag_orchestrate_fotmob",
+            run_id=noop_owner_run_id,
+            task_id="attest_isolated_runtime",
+            state="success",
+            start_date=activation_at + timedelta(minutes=4, seconds=1),
+        ),
+        row(
+            TaskInstance,
+            dag_id="dag_orchestrate_fotmob",
+            run_id=owner_run_id,
+            task_id="attest_isolated_runtime",
+            state="success",
+            start_date=end + timedelta(seconds=1),
+        ),
+        row(
+            TaskInstance,
+            dag_id="dag_sofascore_pipeline",
+            run_id=sofa_run_id,
+            task_id="finalize_fotmob_publication",
+            state="success",
+            start_date=end,
+        ),
+    ]
+    xcom_values = {
+        ("dag_orchestrate_fotmob", noop_owner_run_id, "choose_fotmob_lane"): {
+            "lane": None
+        },
+        ("dag_orchestrate_fotmob", owner_run_id, "choose_fotmob_lane"): {
+            "lane": "daily"
+        },
+        ("dag_orchestrate_fotmob", owner_run_id, "attest_isolated_runtime"): {
+            "deployment_id": observation.deployment_id,
+            "git_sha": observation.git_sha,
+            "scheduler_container_id": observation.scheduler_container_id,
+        },
+        ("dag_orchestrate_fotmob", owner_run_id, "initialize_fotmob_publication"): {
+            "generation_id": observation.generation_id,
+            "binding": binding,
+        },
+        ("dag_sofascore_pipeline", sofa_run_id, "finalize_fotmob_publication"): {
+            "generation_id": observation.generation_id,
+            "phase": "published",
+            "released": True,
+        },
+    }
+    xcom_rows = [
+        row(
+            XCom,
+            dag_id=dag_id,
+            run_id=run_id,
+            task_id=task_id,
+            key="return_value",
+            timestamp=activation_at,
+            value=value,
+        )
+        for (dag_id, run_id, task_id), value in xcom_values.items()
+    ]
+    dag_models = [
+        row(DagModel, dag_id=dag_id, is_paused=paused)
+        for dag_id, paused in mod.SHARED_PAUSE_STATES.items()
+    ]
+
+    class Query:
+        def __init__(self, items):
+            self.items = list(items)
+            self.order = None
+
+        def filter(self, *predicates):
+            for operator, name, expected in predicates:
+                if operator == "eq":
+                    self.items = [
+                        item for item in self.items if getattr(item, name) == expected
+                    ]
+                else:
+                    self.items = [
+                        item for item in self.items if getattr(item, name) in expected
+                    ]
+            return self
+
+        def order_by(self, ordering):
+            self.order = ordering
+            return self
+
+        def all(self):
+            if self.order is not None:
+                direction, name = self.order
+                self.items.sort(
+                    key=lambda item: getattr(item, name), reverse=direction == "desc"
+                )
+            return list(self.items)
+
+        def first(self):
+            values = self.all()
+            return values[0] if values else None
+
+        def one_or_none(self):
+            values = self.all()
+            return values[0] if len(values) == 1 else None
+
+        def count(self):
+            return len(self.all())
+
+    class FakeSession:
+        def query(self, model):
+            return Query(
+                dag_runs if model is DagRun else
+                task_instances if model is TaskInstance else
+                xcom_rows if model is XCom else
+                dag_models
+            )
+
+        def close(self):
+            return None
+
+        def execute(self, _statement):
+            return None
+
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
+    class ControlStore:
+        fence_state = None
+
+        @classmethod
+        def from_env(cls):
+            return cls()
+
+        def get_publication_generation(self, *_args, **_kwargs):
+            if self.fence_state is not None:
+                return self.fence_state
+            return {
+                "generation_id": observation.generation_id,
+                "source": "fotmob",
+                "binding": binding,
+                "status": "succeeded",
+                "phase": "published",
+                "active": False,
+                "lock_active": False,
+                "consumer": {
+                    "dag_id": "dag_sofascore_pipeline",
+                    "run_id": observation.runs["sofascore"]["run_id"],
+                },
+            }
+
+    airflow_models = ModuleType("airflow.models")
+    airflow_models.DagModel = DagModel
+    airflow_models.DagRun = DagRun
+    airflow_models.TaskInstance = TaskInstance
+    airflow_models.XCom = XCom
+    airflow_settings = ModuleType("airflow.settings")
+    airflow_settings.Session = FakeSession
+    control_module = ModuleType("scrapers.fbref.control")
+    control_module.ControlStore = ControlStore
+    sqlalchemy_module = ModuleType("sqlalchemy")
+    sqlalchemy_module.text = lambda value: value
+    monkeypatch.setitem(sys.modules, "airflow.models", airflow_models)
+    monkeypatch.setitem(sys.modules, "airflow.settings", airflow_settings)
+    monkeypatch.setitem(sys.modules, "scrapers.fbref.control", control_module)
+    monkeypatch.setitem(sys.modules, "sqlalchemy", sqlalchemy_module)
+    monkeypatch.setenv("FOTMOB_ISOLATED_STACK", "1")
+    monkeypatch.setenv("FOTMOB_DEPLOYMENT_ID", observation.deployment_id)
+    monkeypatch.setenv("FOTMOB_DEPLOY_GIT_SHA", observation.git_sha)
+    backend = mod.TrinoAirflowRawBackend(connection=object(), raw_store=object())
+
+    isolated_script = backend._isolated_observation_script(
+        observation,
+        activation_at=activation_at.isoformat(),
+    )
+    shared_script = backend._shared_observation_script(observation)
+    compile(isolated_script, "<purge-isolated-observation>", "exec")
+    compile(shared_script, "<purge-shared-observation>", "exec")
+    exec(isolated_script, {})
+    exec(shared_script, {})
+    output = capsys.readouterr().out
+    assert output.count('FOTMOB_PURGE_PROOF={"passed": true}') == 2
+
+    # The durable ControlStore readback does not expose the transient
+    # ``published``/``released`` response flags.  Prove release through its
+    # real persisted shape and reject a generation borrowed by another
+    # consumer even when the phase itself says published.
+    ControlStore.fence_state = {
+        "generation_id": observation.generation_id,
+        "source": "fotmob",
+        "binding": binding,
+        "status": "succeeded",
+        "phase": "published",
+        "active": False,
+        "lock_active": False,
+        "consumer": {"dag_id": "other", "run_id": sofa_run_id},
+    }
+    exec(isolated_script, {})
+    assert 'FOTMOB_PURGE_PROOF={"passed": false}' in capsys.readouterr().out
+    ControlStore.fence_state = None
+
+    # A successful no-op owner before 14:00 is ignored. An actual earlier
+    # daily publication owner makes the later artifact non-first and rejects.
+    xcom_rows.extend(
+        [
+            row(
+                XCom,
+                dag_id="dag_orchestrate_fotmob",
+                run_id=noop_owner_run_id,
+                task_id="initialize_fotmob_publication",
+                key="return_value",
+                timestamp=activation_at + timedelta(minutes=4),
+                value={"generation_id": "earlier", "binding": dict(binding)},
+            )
+        ]
+    )
+    next(
+        item
+        for item in xcom_rows
+        if item.run_id == noop_owner_run_id
+        and item.task_id == "choose_fotmob_lane"
+    ).value = {"lane": "daily"}
+    exec(isolated_script, {})
+    assert 'FOTMOB_PURGE_PROOF={"passed": false}' in capsys.readouterr().out
+
+    dag_runs[-1].run_type = "manual"
+    exec(shared_script, {})
+    assert 'FOTMOB_PURGE_PROOF={"passed": false}' in capsys.readouterr().out
+
+    backend._apply_fence_generation = "11111111-1111-1111-1111-111111111111"
+    backend._apply_fence_binding = {"plan": "exact"}
+    ControlStore.fence_state = {
+        "generation_id": backend._apply_fence_generation,
+        "binding": backend._apply_fence_binding,
+        "status": "running",
+        "phase": "writing",
+        "active": True,
+        "owner_dag_id": "fotmob_legacy_purge",
+    }
+    quiescence_script = backend._quiescence_script(
+        tuple(mod.SHARED_PAUSE_STATES),
+        control=True,
+        active_dag_ids=mod.SHARED_STATE_DAGS,
+        expected_pause_states=mod.SHARED_PAUSE_STATES,
+    )
+    compile(quiescence_script, "<purge-quiescence>", "exec")
+    exec(quiescence_script, {})
+    assert 'FOTMOB_PURGE_PROOF={"passed": true}' in capsys.readouterr().out
+
+    # A manually-terminal DagRun is still unsafe while one of its task
+    # instances remains runnable.
+    task_instances.append(
+        row(
+            TaskInstance,
+            dag_id="dag_transform_xref",
+            run_id="terminal-but-task-running",
+            task_id="xref_player",
+            state="up_for_retry",
+        )
+    )
+    exec(quiescence_script, {})
+    assert 'FOTMOB_PURGE_PROOF={"passed": false}' in capsys.readouterr().out
+
+
+def test_production_purge_fence_runs_only_in_admitted_isolated_container():
+    isolated = "1" * 64
+    commands = []
+    generation_id = "11111111-1111-4111-8111-111111111111"
+    plan_sha = "a" * 64
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        code = command[-1]
+        binding = {
+            "schema_version": "fotmob-legacy-purge-fence-v1",
+            "plan_sha256": plan_sha,
+            "competition_ids": [10557, 10558],
+        }
+        if "initialize_publication_generation" in code:
+            state = {
+                "generation_id": generation_id,
+                "binding": binding,
+                "status": "running",
+                "phase": "writing",
+                "active": True,
+                "owner_dag_id": "fotmob_legacy_purge",
+            }
+        elif "fail_publication_generation" in code:
+            state = {
+                "generation_id": generation_id,
+                "binding": binding,
+                "status": "failed",
+                "phase": "failed",
+                "active": False,
+                "released": True,
+            }
+        else:  # pragma: no cover - the test covers acquire and release
+            raise AssertionError(code)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_PURGE_FENCE=" + json.dumps(state),
+            stderr="",
+        )
+
+    backend = mod.TrinoAirflowRawBackend(
+        connection=object(), raw_store=object(), run=run
+    )
+    backend._live_isolated_scheduler_id = isolated
+    backend.assert_quiescent = lambda *_args, **_kwargs: None
+
+    assert backend.acquire_apply_fence(plan_sha, generation_id) == generation_id
+    backend.release_apply_fence(generation_id)
+
+    assert len(commands) == 2
+    assert all(command[:3] == ("docker", "exec", isolated) for command in commands)
+    assert all("ControlStore.from_env()" in command[-1] for command in commands)
+
+
 class FakeBackend:
     def __init__(self, *, journal_path=None):
         self.journal_path = journal_path
         self.active_dags = set()
         self.paused_dags = set(mod.WRITER_DAG_IDS)
+        self.live_scheduled_observation = None
         self.lease_active = False
         self.apply_fence = None
         self.evidence = {
@@ -215,6 +992,14 @@ class FakeBackend:
         if self.lease_active and self.apply_fence is None:
             raise mod.PurgeRefused("active FotMob publication lease")
 
+    def assert_live_scheduled_observation(self, observation):
+        self.events.append(("scheduled-observation", observation.generation_id))
+        if (
+            self.live_scheduled_observation is not None
+            and observation != self.live_scheduled_observation
+        ):
+            raise mod.PurgeRefused("live scheduled observation differs from report")
+
     def acquire_apply_fence(self, plan_sha256, fence_generation_id):
         assert len(plan_sha256) == 64
         expected = fence_generation_id
@@ -379,18 +1164,120 @@ class FakeBackend:
 
 
 def _plan(backend=None):
+    backend = backend or FakeBackend()
+    report_dir = Path(tempfile.mkdtemp(prefix="fotmob-purge-observation-"))
+    deployment_path, observation_path = _write_scheduled_observation(report_dir)
     return mod.build_plan(
-        backend or FakeBackend(),
+        backend,
         now=NOW,
         ttl=timedelta(hours=1),
+        deployment_report=deployment_path,
+        scheduled_observation_report=observation_path,
     )
 
 
-def test_parser_defaults_to_read_only_plan_mode():
-    args = mod.build_parser().parse_args([])
+def test_parser_requires_protected_reports_and_defaults_to_read_only_plan_mode():
+    with pytest.raises(SystemExit):
+        mod.build_parser().parse_args([])
+    args = mod.build_parser().parse_args(
+        [
+            "--env-file",
+            "/protected/fotmob.env",
+            "--trino-env-file",
+            "/protected/trino.env",
+            "--deployment-report",
+            "/protected/deployment.json",
+            "--scheduled-observation-report",
+            "/protected/scheduled.json",
+        ]
+    )
     assert args.apply is False
     assert args.plan is None
     assert args.plan_sha256 is None
+
+
+def test_purge_environment_ignores_ambient_and_loads_explicit_files(
+    tmp_path, monkeypatch
+):
+    env_file = tmp_path / "fotmob.env"
+    env_file.write_text(
+        "ICEBERG_WAREHOUSE=warehouse\n"
+        "S3_ACCESS_KEY=admitted-access\n"
+        "S3_SECRET_KEY=admitted-secret\n",
+        encoding="utf-8",
+    )
+    trino_file = tmp_path / "trino.env"
+    trino_file.write_text(
+        "TRINO_HOST=127.0.0.1\n"
+        "TRINO_PORT=8443\n"
+        "TRINO_USER=airflow\n"
+        "TRINO_PASSWORD=admitted-trino\n"
+        "TRINO_HTTP_SCHEME=https\n"
+        "TRINO_TLS_VERIFY=true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FOTMOB_RAW_STORE_URI", "s3://ambient/wrong")
+    monkeypatch.setenv("TRINO_HOST", "ambient-wrong")
+    args = mod.build_parser().parse_args(
+        [
+            "--env-file",
+            str(env_file),
+            "--trino-env-file",
+            str(trino_file),
+            "--deployment-report",
+            str(tmp_path / "deployment.json"),
+            "--scheduled-observation-report",
+            str(tmp_path / "scheduled.json"),
+        ]
+    )
+
+    assert mod._load_purge_environment(args) == "s3://warehouse/raw/fotmob"
+    assert os.environ["FOTMOB_RAW_STORE_URI"] == "s3://warehouse/raw/fotmob"
+    assert os.environ["TRINO_HOST"] == "127.0.0.1"
+
+
+def test_live_purge_data_binding_rejects_raw_or_trino_security_drift(monkeypatch):
+    isolated = "1" * 64
+    context = {"scheduler_container_id": isolated}
+    env = {
+        "FOTMOB_RAW_STORE_URI": "s3://warehouse/raw/fotmob",
+        "FOTMOB_RAW_S3_ENDPOINT": "seaweedfs:8333",
+        "FOTMOB_RAW_S3_SCHEME": "http",
+        "FOTMOB_RAW_S3_REGION": "us-east-1",
+        "S3_ACCESS_KEY": "access",
+        "S3_SECRET_KEY": "secret",
+        "TRINO_HOST": "trino",
+        "TRINO_PORT": "8443",
+        "TRINO_USER": "airflow",
+        "TRINO_PASSWORD": "trino-secret",
+        "TRINO_HTTP_SCHEME": "https",
+        "TRINO_TLS_VERIFY": "true",
+    }
+    monkeypatch.setattr(
+        mod.runtime_binding,
+        "_inspect_container",
+        lambda container_id, **_kwargs: {
+            "Id": container_id,
+            "Config": {"Env": [f"{key}={value}" for key, value in env.items()]},
+        },
+    )
+    for key, value in env.items():
+        monkeypatch.setenv(key, "127.0.0.1" if key == "TRINO_HOST" else value)
+
+    proof = mod.runtime_binding.validate_live_purge_data_bindings(
+        context,
+        raw_store_uri="s3://warehouse/raw/fotmob",
+        run=lambda *_args, **_kwargs: None,
+    )
+    assert proof["passed"] is True
+
+    monkeypatch.setenv("S3_SECRET_KEY", "wrong")
+    with pytest.raises(mod.runtime_binding.RuntimeBindingError, match="raw-store"):
+        mod.runtime_binding.validate_live_purge_data_bindings(
+            context,
+            raw_store_uri="s3://warehouse/raw/fotmob",
+            run=lambda *_args, **_kwargs: None,
+        )
 
 
 @pytest.mark.parametrize("active", ["dag_orchestrate_fotmob", "dag_refresh_fotmob"])
@@ -1101,13 +1988,43 @@ def test_journal_cannot_skip_live_reconstruction_with_an_extraneous_receipt(
 def test_cli_dry_run_writes_plan_without_mutation(tmp_path):
     backend = FakeBackend()
     output = tmp_path / "plan.json"
+    deployment_path, observation_path = _write_scheduled_observation(tmp_path)
     code = mod.main(
-        ["--output", str(output)],
+        [
+            "--env-file",
+            str(tmp_path / "fotmob.env"),
+            "--trino-env-file",
+            str(tmp_path / "trino.env"),
+            "--output",
+            str(output),
+            "--deployment-report",
+            str(deployment_path),
+            "--scheduled-observation-report",
+            str(observation_path),
+        ],
         backend_factory=lambda _args: backend,
+        runtime_preflight=lambda _args: {"passed": True},
     )
     assert code == 0
-    assert json.loads(output.read_text())["competition_ids"] == [10557, 10558]
+    payload = mod._read_plan(output)
+    assert payload["competition_ids"] == [10557, 10558]
+    assert payload["plan_sha256"] == hashlib.sha256(
+        mod.canonical_plan_bytes(payload)
+    ).hexdigest()
+    mod._validate_plan(
+        payload,
+        supplied_sha256=payload["plan_sha256"],
+        now=datetime.now(timezone.utc),
+    )
     assert not any(event[0].startswith("delete") for event in backend.events)
+
+
+def test_read_plan_rejects_duplicate_json_keys(tmp_path):
+    path = tmp_path / "plan.json"
+    path.write_text('{"schema_version":"one","schema_version":"two"}')
+
+    with pytest.raises(mod.PurgeRefused, match="duplicate JSON key"):
+        mod._read_plan(path)
 
 
 @pytest.mark.parametrize("failure", ["wrong_hash", "expired"])
@@ -1135,6 +2052,10 @@ def test_cli_rejects_invalid_plan_before_constructing_writer_backend(
 
     code = mod.main(
         [
+            "--env-file",
+            str(tmp_path / "fotmob.env"),
+            "--trino-env-file",
+            str(tmp_path / "trino.env"),
             "--apply",
             "--plan",
             str(plan_path),
@@ -1142,8 +2063,13 @@ def test_cli_rejects_invalid_plan_before_constructing_writer_backend(
             supplied,
             "--journal",
             str(tmp_path / "journal.json"),
+            "--deployment-report",
+            plan["scheduled_observation"]["deployment_report_path"],
+            "--scheduled-observation-report",
+            plan["scheduled_observation"]["path"],
         ],
         backend_factory=factory,
+        runtime_preflight=lambda _args: {"passed": True},
     )
     assert code == 2
     assert called is False
@@ -1174,6 +2100,10 @@ def test_cli_expired_empty_journal_recovers_and_releases_journaled_fence(tmp_pat
 
     code = mod.main(
         [
+            "--env-file",
+            str(tmp_path / "fotmob.env"),
+            "--trino-env-file",
+            str(tmp_path / "trino.env"),
             "--apply",
             "--plan",
             str(plan_path),
@@ -1181,8 +2111,13 @@ def test_cli_expired_empty_journal_recovers_and_releases_journaled_fence(tmp_pat
             plan["plan_sha256"],
             "--journal",
             str(journal_path),
+            "--deployment-report",
+            plan["scheduled_observation"]["deployment_report_path"],
+            "--scheduled-observation-report",
+            plan["scheduled_observation"]["path"],
         ],
         backend_factory=factory,
+        runtime_preflight=lambda _args: {"passed": True},
     )
     assert code == 2
     assert called is True

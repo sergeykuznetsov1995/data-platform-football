@@ -10,6 +10,122 @@ from scrapers.fotmob.repository import DEDUP_KEYS
 NOW = datetime(2026, 7, 21, 12, tzinfo=timezone.utc)
 
 
+def _shared_consumer_pause():
+    return {
+        "shared_scheduler_container_id": "b" * 64,
+        "schedule_owner": "isolated",
+        "pause_states_before": {
+            **mod.runtime_binding.DESTRUCTIVE_SHARED_PAUSE_STATES,
+            "dag_sofascore_pipeline": False,
+        },
+        "pause_states_after": dict(
+            mod.runtime_binding.DESTRUCTIVE_SHARED_PAUSE_STATES
+        ),
+        "active_runs": [],
+        "active_task_instances": [],
+        "atomic_metadata_transaction": True,
+    }
+
+
+def test_cleanup_pause_evidence_requires_atomic_shared_consumer_fence(tmp_path):
+    evidence = tmp_path / "pause.json"
+    evidence.write_text(
+        __import__("json").dumps(
+            {
+                "passed": True,
+                "paused": sorted(mod.PAUSED_DAGS),
+                "pause_states": {dag_id: True for dag_id in mod.PAUSED_DAGS},
+                "running_runs": {},
+                "queued_runs": {},
+                "catalog": "iceberg",
+                "schema": "bronze",
+                "project": "fotmob-airflow",
+                "git_sha": "a" * 40,
+                "generated_at": NOW.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(mod.CleanupError, match="shared_consumer_pause"):
+        mod._validate_pause_evidence(
+            evidence,
+            clock=lambda: NOW,
+            catalog="iceberg",
+            schema="bronze",
+            project="fotmob-airflow",
+            release_sha="a" * 40,
+        )
+
+
+def test_cleanup_pause_evidence_covers_exact_six_writer_inventory(tmp_path):
+    expected = {
+        "dag_orchestrate_fotmob",
+        "dag_ingest_fotmob",
+        "dag_transform_fotmob_silver",
+        "dag_trigger_fotmob_daily",
+        "dag_refresh_fotmob",
+        "dag_backfill_fotmob",
+    }
+    assert mod.PAUSED_DAGS == expected
+
+    evidence = tmp_path / "pause.json"
+    payload = {
+        "passed": True,
+        "paused": sorted(expected - {"dag_backfill_fotmob"}),
+        "pause_states": {
+            dag_id: True for dag_id in expected - {"dag_backfill_fotmob"}
+        },
+        "running_runs": {},
+        "queued_runs": {},
+        "catalog": "iceberg",
+        "schema": "bronze",
+        "project": "fotmob-airflow",
+        "git_sha": "a" * 40,
+        "generated_at": NOW.isoformat(),
+    }
+    evidence.write_text(__import__("json").dumps(payload), encoding="utf-8")
+
+    with pytest.raises(mod.CleanupError, match="every FotMob writer"):
+        mod._validate_pause_evidence(
+            evidence,
+            clock=lambda: NOW,
+            catalog="iceberg",
+            schema="bronze",
+            project="fotmob-airflow",
+            release_sha="a" * 40,
+        )
+
+
+@pytest.mark.parametrize("active_key", ("running_runs", "queued_runs"))
+def test_cleanup_pause_evidence_rejects_any_active_six_writer(tmp_path, active_key):
+    evidence = tmp_path / "pause.json"
+    payload = {
+        "passed": True,
+        "paused": sorted(mod.PAUSED_DAGS),
+        "pause_states": {dag_id: True for dag_id in mod.PAUSED_DAGS},
+        "running_runs": {},
+        "queued_runs": {},
+        "catalog": "iceberg",
+        "schema": "bronze",
+        "project": "fotmob-airflow",
+        "git_sha": "a" * 40,
+        "generated_at": NOW.isoformat(),
+    }
+    payload[active_key] = {"dag_backfill_fotmob": ["run-1"]}
+    evidence.write_text(__import__("json").dumps(payload), encoding="utf-8")
+
+    with pytest.raises(mod.CleanupError, match="active writer runs"):
+        mod._validate_pause_evidence(
+            evidence,
+            clock=lambda: NOW,
+            catalog="iceberg",
+            schema="bronze",
+            project="fotmob-airflow",
+            release_sha="a" * 40,
+        )
+
+
 def test_inventory_key_tracks_repository_dedup_contract():
     assert mod.INVENTORY_KEYS == DEDUP_KEYS["fotmob_field_inventory"]
 
@@ -71,6 +187,10 @@ def test_cleanup_plan_has_only_explicit_old_owned_targets():
     assert compact["duplicate_rows"] == 25
     assert compact["action"] == "shadow_swap"
     assert plan["dry_run"] is True
+    assert plan["dynamic_catalog_evidence_action"] == "retain"
+    assert plan["dynamic_catalog_evidence_objects"] == sorted(
+        mod.PRESERVED_DYNAMIC_CATALOG_EVIDENCE
+    )
 
 
 def _plan(*, row_count=7):
@@ -81,6 +201,10 @@ def _plan(*, row_count=7):
         "catalog": "iceberg",
         "schema": "bronze",
         "dry_run": True,
+        "dynamic_catalog_evidence_action": "retain",
+        "dynamic_catalog_evidence_objects": sorted(
+            mod.PRESERVED_DYNAMIC_CATALOG_EVIDENCE
+        ),
         "staging_targets": [
             {
                 "table": "fotmob_matches__stg_0123456789ab",
@@ -222,6 +346,46 @@ def test_cleanup_rechecks_live_writer_state_and_stops_scheduler(tmp_path, monkey
     evidence = mod._quiesce_isolated_scheduler(arguments, run=run)
     assert evidence["scheduler_stopped"] is True
     assert calls == [("compose", "stop", "airflow-scheduler")]
+
+
+def test_cleanup_live_readback_rejects_changed_shared_container(tmp_path, monkeypatch):
+    from scripts import fotmob_rollback as runtime
+
+    arguments = type(
+        "Args",
+        (),
+        {
+            "env_file": tmp_path / "fotmob.env",
+            "deployment_report": tmp_path / "deployment.json",
+            "release_sha": "a" * 40,
+            "project": "fotmob-airflow",
+            "compose_file": tmp_path / "compose.yaml",
+        },
+    )()
+    monkeypatch.setattr(runtime, "_deployment_context", lambda _args: {"git_sha": "a" * 40})
+    monkeypatch.setattr(
+        runtime,
+        "validate_live_deployment",
+        lambda *_a, **_k: {"scheduler_running": False, "mounts_verified": True},
+    )
+    monkeypatch.setattr(runtime, "_compose_environment", lambda _args: {})
+    monkeypatch.setattr(runtime, "_compose_base", lambda _args: ("compose",))
+    monkeypatch.setattr(
+        runtime,
+        "inspect_shared_consumer_pause",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            runtime.RollbackError("shared scheduler identity changed after pause evidence")
+        ),
+    )
+
+    with pytest.raises(mod.CleanupError, match="shared consumer live quiescence"):
+        mod._quiesce_isolated_scheduler(
+            arguments,
+            shared_consumer_pause=_shared_consumer_pause(),
+            run=lambda *_a, **_k: (_ for _ in ()).throw(
+                AssertionError("scheduler is already stopped")
+            ),
+        )
 
 
 @pytest.mark.parametrize(
@@ -460,6 +624,7 @@ def test_pause_evidence_must_cover_all_writers_and_be_fresh(tmp_path):
                 "schema": "bronze",
                 "project": "fotmob-airflow",
                 "git_sha": "a" * 40,
+                "shared_consumer_pause": _shared_consumer_pause(),
             }
         )
     )
@@ -489,6 +654,7 @@ def test_pause_evidence_rejects_future_or_wrong_stack(tmp_path):
         "schema": "bronze",
         "project": "wrong",
         "git_sha": "a" * 40,
+        "shared_consumer_pause": _shared_consumer_pause(),
     }
     evidence.write_text(__import__("json").dumps(payload))
     with pytest.raises(mod.CleanupError, match="stack identity mismatch"):

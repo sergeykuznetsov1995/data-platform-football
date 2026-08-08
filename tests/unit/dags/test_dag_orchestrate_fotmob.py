@@ -244,6 +244,151 @@ def test_background_launch_rechecks_1330_before_initializing(monkeypatch):
     assert len(initialized) == 1
 
 
+def test_daily_initializer_mints_exact_shared_1400_interval(monkeypatch):
+    module = _reload_owner(monkeypatch, isolated=False)
+    state = module.FotMobSchedulerState.initial()
+    decision = {
+        "lane": "daily",
+        "selected_date": "2026-08-08",
+        "state": state.to_dict(),
+    }
+    ti = SimpleNamespace(xcom_pull=lambda **_kwargs: decision)
+    observed = []
+    monkeypatch.setattr(module, "_launch_still_admitted", lambda _context: True)
+    monkeypatch.setattr(
+        module,
+        "initialize_fotmob_publication",
+        lambda **context: observed.append(context) or {"generation_id": "daily"},
+    )
+
+    result = module.initialize_admitted_publication(
+        ti=ti,
+        data_interval_start=datetime(2026, 8, 8, 14, 0, tzinfo=timezone.utc),
+        data_interval_end=datetime(2026, 8, 8, 14, 5, tzinfo=timezone.utc),
+    )
+
+    assert result == {"generation_id": "daily"}
+    assert observed[0]["data_interval_start"] == datetime(
+        2026, 8, 7, 14, 0, tzinfo=timezone.utc
+    )
+    assert observed[0]["data_interval_end"] == datetime(
+        2026, 8, 8, 14, 0, tzinfo=timezone.utc
+    )
+
+
+@pytest.mark.parametrize("lane", ("refresh", "backfill"))
+def test_background_success_abandons_and_releases_generation(
+    monkeypatch, lane
+):
+    import scrapers.fbref.control as control_module
+
+    module = _reload_owner(monkeypatch, isolated=False)
+    state = module.FotMobSchedulerState.initial()
+    decision = {
+        "lane": lane,
+        "selected_date": "2026-08-08",
+        "state": state.to_dict(),
+    }
+
+    class TI:
+        def xcom_pull(self, *, task_ids, **_kwargs):
+            if task_ids == module.INITIALIZER_TASK_ID:
+                return {"generation_id": "background-generation"}
+            if task_ids == module.DECISION_TASK_ID:
+                return decision
+            return None
+
+    complete = []
+
+    class Store:
+        def complete_publication_generation(self, generation_id, **kwargs):
+            complete.append((generation_id, kwargs))
+            return {
+                "phase": "abandoned",
+                "active": False,
+                "released": True,
+                "published": False,
+            }
+
+    monkeypatch.setattr(module, "fotmob_ceremony_configured", lambda *args: True)
+    monkeypatch.setattr(
+        control_module.ControlStore, "from_env", lambda: Store(), raising=False
+    )
+    dag_run = SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(task_id=module.TRIGGER_TASK_ID, state="success")
+        ]
+    )
+
+    result = module.finalize_or_skip_rejected_launch(ti=TI(), dag_run=dag_run)
+
+    assert result["status"] == "abandoned"
+    assert result["publication_state"]["released"] is True
+    assert complete == [
+        (
+            "background-generation",
+            {"published": False, "source": module.FOTMOB_PUBLICATION_SOURCE},
+        )
+    ]
+
+
+def test_daily_success_stays_ready_and_bad_background_terminal_is_rejected(
+    monkeypatch,
+):
+    import scrapers.fbref.control as control_module
+
+    module = _reload_owner(monkeypatch, isolated=False)
+    state = module.FotMobSchedulerState.initial()
+    lane = {"value": "daily"}
+
+    class TI:
+        def xcom_pull(self, *, task_ids, **_kwargs):
+            if task_ids == module.INITIALIZER_TASK_ID:
+                return {"generation_id": "generation-one"}
+            if task_ids == module.DECISION_TASK_ID:
+                return {
+                    "lane": lane["value"],
+                    "selected_date": "2026-08-08",
+                    "state": state.to_dict(),
+                }
+            return None
+
+    complete = []
+
+    class Store:
+        def complete_publication_generation(self, *_args, **_kwargs):
+            complete.append(True)
+            return {
+                "phase": "ready",
+                "active": True,
+                "released": False,
+                "published": False,
+            }
+
+    monkeypatch.setattr(module, "fotmob_ceremony_configured", lambda *args: True)
+    monkeypatch.setattr(
+        control_module.ControlStore, "from_env", lambda: Store(), raising=False
+    )
+    dag_run = SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(task_id=module.TRIGGER_TASK_ID, state="success")
+        ]
+    )
+
+    assert module.finalize_or_skip_rejected_launch(
+        ti=TI(), dag_run=dag_run
+    ) == {
+        "status": "ready",
+        "generation_id": "generation-one",
+        "lane": "daily",
+    }
+    assert complete == []
+
+    lane["value"] = "refresh"
+    with pytest.raises(Exception, match="not abandoned safely"):
+        module.finalize_or_skip_rejected_launch(ti=TI(), dag_run=dag_run)
+
+
 def test_pretrigger_cutoff_safely_releases_without_child_or_state_advance(
     monkeypatch,
 ):
@@ -311,11 +456,6 @@ def test_pretrigger_cutoff_safely_releases_without_child_or_state_advance(
         "state_advanced": False,
         "verdict": "skipped",
     }
-    monkeypatch.setattr(
-        module,
-        "fail_unsealed_fotmob_publication",
-        lambda **context: pytest.fail("rejected launch must not finalize"),
-    )
     with pytest.raises(AirflowSkipException, match="safely rejected"):
         module.finalize_or_skip_rejected_launch(ti=ti)
 
@@ -590,9 +730,9 @@ def test_deployed_runtime_rejects_legacy_owner_admission(monkeypatch, tmp_path):
     report.write_text(
         json.dumps(
             {
-                "activation_state": "active",
-                "unpaused": sorted(module.AUTOMATIC_ADMITTED_DAGS),
-                "paused": [],
+                    "activation_state": "active",
+                    "unpaused": sorted(module.AUTOMATIC_ADMITTED_DAGS),
+                    "paused": sorted(module.LEGACY_PAUSED_DAGS),
             }
         ),
         encoding="utf-8",
