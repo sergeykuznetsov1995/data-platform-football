@@ -203,11 +203,18 @@ def profile_probe_delay(
 
 def _catalog_fingerprint(
     competition: CompetitionRef,
-    conflict_fields: Sequence[str] = (),
+    conflict_variants: Sequence[CompetitionRef] = (),
 ) -> str:
     values = asdict(competition)
     values.pop("source_paths", None)
-    values["conflict_fields"] = sorted(str(value) for value in conflict_fields)
+    normalized_variants: set[str] = set()
+    for variant in conflict_variants:
+        variant_values = asdict(variant)
+        variant_values.pop("source_paths", None)
+        normalized_variants.add(_json(variant_values))
+    values["conflict_variants"] = [
+        json.loads(rendered) for rendered in sorted(normalized_variants)
+    ]
     return hashlib.sha256(_json(values).encode("utf-8")).hexdigest()
 
 
@@ -271,15 +278,11 @@ def _next_profile_attempt(
     if (
         previous is None
         or previous.catalog_fingerprint != catalog_fingerprint
-        or previous.next_probe_at is None
+        or previous.classifier_version != CLASSIFIER_VERSION
+        or previous.probe_status not in {ProbeStatus.PENDING, ProbeStatus.NOT_FOUND}
     ):
         return 1
-    prior_delay = previous.next_probe_at - previous.observed_at
-    if prior_delay < timedelta(minutes=45):
-        return 2
-    if prior_delay < timedelta(hours=3):
-        return 3
-    return 4
+    return min(max(0, previous.probe_attempt_count) + 1, len(_PROFILE_BACKOFF))
 
 
 def _event_year(value: Any, fallback: int) -> int:
@@ -782,6 +785,10 @@ class FotMobIngestService:
             and previous.catalog_fingerprint == catalog_fingerprint
         )
         miss_count = previous.authoritative_miss_count if same_catalog else 0
+        probe_attempt_count = _next_profile_attempt(
+            previous,
+            catalog_fingerprint=catalog_fingerprint,
+        )
         profile_target_key = fetch.target_key or canonicalize_target(
             "leagues", {"id": competition.competition_id}
         ).target_key
@@ -818,6 +825,7 @@ class FotMobIngestService:
                     authoritative_miss_count=miss_count,
                     next_probe_at=observed_at + _PROFILE_REVIEW_INTERVAL,
                     observed_at=observed_at,
+                    probe_attempt_count=0,
                 )
                 return evidence, classification, None
             if conflict_fields:
@@ -852,6 +860,7 @@ class FotMobIngestService:
                 authoritative_miss_count=0,
                 next_probe_at=next_probe_at,
                 observed_at=observed_at,
+                probe_attempt_count=0,
             )
             payload = (
                 fetch.data
@@ -860,11 +869,19 @@ class FotMobIngestService:
             )
             return evidence, classification, payload
 
+        source_validated_null = (
+            fetch.json_data is None
+            and fetch.http_status is not None
+            and (
+                fetch.http_status == 304
+                or 200 <= fetch.http_status <= 299
+            )
+        )
         authoritative_absence = (
             fetch.outcome == FetchOutcome.NOT_AVAILABLE
             and fetch.attempts > 0
             and not fetch.stale
-            and (fetch.http_status in {204, 404} or fetch.json_data is None)
+            and (fetch.http_status in {204, 404} or source_validated_null)
         )
         if authoritative_absence:
             miss_count += 1
@@ -886,7 +903,7 @@ class FotMobIngestService:
                 )
                 probe_status = ProbeStatus.NOT_FOUND
                 next_probe_at = observed_at + profile_probe_delay(
-                    miss_count, competition.competition_id
+                    probe_attempt_count, competition.competition_id
                 )
         else:
             classification = ScopeClassification(
@@ -897,11 +914,9 @@ class FotMobIngestService:
             )
             probe_status = ProbeStatus.PENDING
             next_probe_at = observed_at + profile_probe_delay(
-                _next_profile_attempt(
-                    previous,
-                    catalog_fingerprint=catalog_fingerprint,
-                ),
+                probe_attempt_count,
                 competition.competition_id,
+                retry_after=fetch.retry_after,
             )
         carried = previous if same_catalog else None
         evidence = CompetitionScopeEvidence(
@@ -922,6 +937,7 @@ class FotMobIngestService:
             authoritative_miss_count=miss_count,
             next_probe_at=next_probe_at,
             observed_at=observed_at,
+            probe_attempt_count=probe_attempt_count,
         )
         return evidence, classification, None
 
@@ -1043,7 +1059,7 @@ class FotMobIngestService:
                 item.competition_id: _catalog_fingerprint(
                     item,
                     (
-                        conflicts[item.competition_id].fields
+                        conflicts[item.competition_id].variants
                         if item.competition_id in conflicts
                         else ()
                     ),

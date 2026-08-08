@@ -164,6 +164,7 @@ class CompetitionScopeEvidence:
     authoritative_miss_count: int
     next_probe_at: Optional[datetime]
     observed_at: datetime
+    probe_attempt_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)

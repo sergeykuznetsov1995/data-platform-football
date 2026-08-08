@@ -229,6 +229,18 @@ def test_retry_after_retryable_statuses_then_success_are_counted():
     assert stats.status_counts == {"429": 1, "503": 1, "200": 1}
 
 
+def test_exhausted_429_preserves_final_retry_after_for_caller():
+    transport, _session = _transport(
+        [FakeResponse(429, b"rate", {"Retry-After": "7200"})],
+        max_attempts=1,
+    )
+
+    result = transport.fetch_json("leagues", {"id": 47})
+
+    assert result.outcome == FetchOutcome.RETRYABLE_FAILURE
+    assert result.retry_after == timedelta(hours=2)
+
+
 def test_exhausted_retryable_response_replays_valid_stale_cache(tmp_path):
     store = _store(tmp_path)
     target = canonicalize_target("leagues", {"id": 42, "season": "2025/2026"})
@@ -311,7 +323,7 @@ def test_revalidated_null_cache_stays_not_available(tmp_path):
     assert result.json_data is None and result.body is None
 
 
-def test_stale_replay_of_null_cache_stays_not_available(tmp_path):
+def test_stale_replay_of_null_cache_preserves_stale_provenance(tmp_path):
     store = _store(tmp_path)
     target = canonicalize_target("leagues", {"id": 285})
     store.store(target, b"null", etag='"dead-v1"')
@@ -324,7 +336,9 @@ def test_stale_replay_of_null_cache_stays_not_available(tmp_path):
     result = transport.fetch_json("leagues", {"id": 285})
 
     assert result.outcome == FetchOutcome.NOT_AVAILABLE
-    assert result.terminal and not result.ok and not result.stale
+    assert not result.terminal and not result.ok
+    assert result.cache_hit and result.stale
+    assert result.http_status == 503
     assert result.json_data is None and result.body is None
 
 

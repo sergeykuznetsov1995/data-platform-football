@@ -113,6 +113,7 @@ class ScopeEvidenceTrino:
                 "c" * 64,
                 "d" * 64,
                 0,
+                0,
                 None,
                 datetime(2026, 8, 8, 10),
             )
@@ -209,11 +210,14 @@ def test_repository_creates_stable_scope_evidence_schema_before_first_probe():
 
     FotMobRepository(writer=writer).ensure_schema()
 
-    assert len(writer.trino.sql) == 2
+    assert len(writer.trino.sql) == 3
     evidence_sql = " ".join(writer.trino.sql[1].split())
     assert "fotmob_competition_scope_observations" in evidence_sql
     assert "authoritative_miss_count INTEGER" in evidence_sql
+    assert "probe_attempt_count INTEGER" in evidence_sql
     assert "partitioning = ARRAY['competition_id']" in evidence_sql
+    migration_sql = " ".join(writer.trino.sql[2].split())
+    assert "ADD COLUMN IF NOT EXISTS probe_attempt_count INTEGER" in migration_sql
     assert CURRENT_VIEW_SPECS["fotmob_competition_scope_observations"] == (
         "competition_profile",
         ("competition_id",),

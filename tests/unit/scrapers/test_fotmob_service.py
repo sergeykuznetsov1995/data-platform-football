@@ -21,6 +21,7 @@ from scrapers.fotmob.service import (
 from scrapers.fotmob.transport import (
     FetchOutcome,
     FetchResult,
+    FotMobTransport,
     TransportStats,
     canonicalize_target,
 )
@@ -341,8 +342,39 @@ def test_timeout_is_pending_with_first_backoff_and_never_dead():
     assert catalog.classifications[0].decision is ScopeDecision.PENDING_PROBE
     assert evidence.probe_status is ProbeStatus.PENDING
     assert evidence.authoritative_miss_count == 0
+    assert evidence.probe_attempt_count == 1
     delay = evidence.next_probe_at - evidence.observed_at
     assert timedelta(minutes=15) <= delay < timedelta(minutes=16)
+
+
+def test_final_429_retry_after_controls_persisted_profile_schedule():
+    from tests.unit.scrapers.test_fotmob_transport import FakeResponse, FakeSession
+
+    competition_id = 70006
+    all_leagues = {
+        "countries": [{"leagues": [{"id": competition_id, "name": "Senior Cup"}]}]
+    }
+    retry_after = timedelta(hours=2)
+    profile_fetch = FotMobTransport(
+        session=FakeSession(
+            [FakeResponse(429, b"rate", {"Retry-After": "7200"})]
+        ),
+        max_attempts=1,
+        sleep_fn=lambda _delay: None,
+        jitter_fn=lambda _low, _high: 0.0,
+    ).fetch_json("leagues", {"id": competition_id})
+    service, _, repository = _service(
+        {
+            canonicalize_target("allLeagues").canonical_url: all_leagues,
+            canonicalize_target("leagues", {"id": competition_id}).canonical_url: profile_fetch,
+        }
+    )
+
+    service.discover_catalog()
+    evidence = repository.latest_scope_evidence([competition_id])[competition_id]
+
+    assert evidence.probe_attempt_count == 1
+    assert evidence.next_probe_at - evidence.observed_at == retry_after
 
 
 def test_successive_5xx_profiles_back_off_without_ever_becoming_dead(monkeypatch):
@@ -355,6 +387,7 @@ def test_successive_5xx_profiles_back_off_without_ever_becoming_dead(monkeypatch
     )
     service.discover_catalog()
     prior = repository.latest_scope_evidence([competition_id])[competition_id]
+    assert prior.probe_attempt_count == 1
     monkeypatch.setattr("scrapers.fotmob.service.utc_now", lambda: prior.next_probe_at + timedelta(seconds=1))
     second_service = FotMobIngestService(
         transport=StubTransport(
@@ -370,6 +403,7 @@ def test_successive_5xx_profiles_back_off_without_ever_becoming_dead(monkeypatch
 
     assert evidence.probe_status is ProbeStatus.PENDING
     assert evidence.authoritative_miss_count == 0
+    assert evidence.probe_attempt_count == 2
     delay = evidence.next_probe_at - evidence.observed_at
     assert timedelta(hours=1) <= delay < timedelta(hours=1, minutes=1)
 
@@ -434,6 +468,121 @@ def test_stale_profile_replay_does_not_advance_authoritative_miss_count(monkeypa
 
     assert evidence.probe_status is ProbeStatus.PENDING
     assert evidence.authoritative_miss_count == 1
+    assert evidence.probe_attempt_count == 2
+
+
+def test_transport_shaped_stale_null_does_not_advance_authoritative_miss(monkeypatch):
+    competition_id = 70007
+    all_leagues = {
+        "countries": [{"leagues": [{"id": competition_id, "name": "Senior Cup"}]}]
+    }
+    catalog_url = canonicalize_target("allLeagues").canonical_url
+    profile_target = canonicalize_target("leagues", {"id": competition_id})
+    service, _, repository = _service(
+        {
+            catalog_url: all_leagues,
+            profile_target.canonical_url: _failed_profile(
+                competition_id,
+                FetchOutcome.NOT_AVAILABLE,
+                200,
+            ),
+        }
+    )
+    service.discover_catalog()
+    prior = repository.latest_scope_evidence([competition_id])[competition_id]
+    assert prior.probe_status is ProbeStatus.NOT_FOUND
+    assert prior.authoritative_miss_count == 1
+    monkeypatch.setattr(
+        "scrapers.fotmob.service.utc_now",
+        lambda: prior.next_probe_at + timedelta(seconds=1),
+    )
+    stale_null = FotMobTransport()._result(
+        outcome=FetchOutcome.STALE_REPLAY,
+        target=profile_target,
+        http_status=503,
+        body=b"null",
+        json_data=None,
+        attempts=2,
+        network_bytes=8,
+        cache_hit=True,
+        stale=True,
+        error="FotMob returned retryable HTTP 503",
+    )
+    second_service = FotMobIngestService(
+        transport=StubTransport(
+            {catalog_url: all_leagues, profile_target.canonical_url: stale_null}
+        ),
+        repository=repository,
+        budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+        run_id="stale-null-run",
+    )
+
+    second = second_service.discover_catalog()
+    evidence = repository.latest_scope_evidence([competition_id])[competition_id]
+
+    assert second.classifications[0].decision is ScopeDecision.PENDING_PROBE
+    assert evidence.probe_status is ProbeStatus.PENDING
+    assert evidence.authoritative_miss_count == 1
+
+
+@pytest.mark.parametrize(
+    ("profile_kwargs", "expected_decision"),
+    [
+        ({"gender": "female"}, ScopeDecision.EXCLUDED),
+        ({"competition_type": "unknown"}, ScopeDecision.REVIEW_REQUIRED),
+    ],
+)
+def test_transient_after_30_day_profile_review_restarts_at_first_backoff(
+    monkeypatch,
+    profile_kwargs,
+    expected_decision,
+):
+    competition_id = 70008
+    all_leagues = {
+        "countries": [{"leagues": [{"id": competition_id, "name": "Senior Cup"}]}]
+    }
+    catalog_url = canonicalize_target("allLeagues").canonical_url
+    profile_url = canonicalize_target("leagues", {"id": competition_id}).canonical_url
+    service, _, repository = _service(
+        {
+            catalog_url: all_leagues,
+            profile_url: _competition_payload(
+                competition_id,
+                "Senior Cup",
+                **profile_kwargs,
+            ),
+        }
+    )
+    first = service.discover_catalog()
+    assert first.classifications[0].decision is expected_decision
+    prior = repository.latest_scope_evidence([competition_id])[competition_id]
+    monkeypatch.setattr(
+        "scrapers.fotmob.service.utc_now",
+        lambda: prior.next_probe_at + timedelta(seconds=1),
+    )
+    second_service = FotMobIngestService(
+        transport=StubTransport(
+            {
+                catalog_url: all_leagues,
+                profile_url: _failed_profile(
+                    competition_id,
+                    FetchOutcome.RETRYABLE_FAILURE,
+                    503,
+                ),
+            }
+        ),
+        repository=repository,
+        budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+        run_id=f"review-retry-{expected_decision.value}",
+    )
+
+    second_service.discover_catalog()
+    evidence = repository.latest_scope_evidence([competition_id])[competition_id]
+
+    assert evidence.probe_status is ProbeStatus.PENDING
+    assert evidence.probe_attempt_count == 1
+    delay = evidence.next_probe_at - evidence.observed_at
+    assert timedelta(minutes=15) <= delay < timedelta(minutes=16)
 
 
 def test_unchanged_excluded_evidence_is_cached_but_catalog_change_forces_probe():
@@ -466,6 +615,49 @@ def test_unchanged_excluded_evidence_is_cached_but_catalog_change_forces_probe()
         run_id="changed-run",
     )
     changed_service.discover_catalog()
+    assert [url for url, _ in changed_transport.calls] == [catalog_url, profile_url]
+
+
+def test_conflict_variant_only_metadata_change_forces_profile_reprobe():
+    competition_id = 10559
+    catalog_url = canonicalize_target("allLeagues").canonical_url
+    profile_url = canonicalize_target("leagues", {"id": competition_id}).canonical_url
+
+    def catalog(alias_name):
+        return {
+            "countries": [
+                {
+                    "name": "Canonical Country",
+                    "leagues": [
+                        {"id": competition_id, "name": "Canonical Senior Cup"}
+                    ]
+                },
+                {
+                    "name": "Alias Country",
+                    "leagues": [{"id": competition_id, "name": alias_name}],
+                },
+            ]
+        }
+
+    profile = _competition_payload(competition_id, "Canonical Senior Cup")
+    service, _, repository = _service(
+        {catalog_url: catalog("Alias A"), profile_url: profile}
+    )
+    first = service.discover_catalog()
+    assert first.classifications[0].decision is ScopeDecision.REVIEW_REQUIRED
+
+    changed_transport = StubTransport(
+        {catalog_url: catalog("Alias B"), profile_url: profile}
+    )
+    changed_service = FotMobIngestService(
+        transport=changed_transport,
+        repository=repository,
+        budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+        run_id="variant-only-change",
+    )
+
+    changed_service.discover_catalog()
+
     assert [url for url, _ in changed_transport.calls] == [catalog_url, profile_url]
 
 

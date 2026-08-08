@@ -60,6 +60,7 @@ _SCOPE_EVIDENCE_FIELDS = (
     "profile_content_hash",
     "catalog_fingerprint",
     "authoritative_miss_count",
+    "probe_attempt_count",
     "next_probe_at",
     "observed_at",
 )
@@ -166,6 +167,7 @@ def _scope_evidence_from_row(
         ),
         catalog_fingerprint=str(row.get("catalog_fingerprint") or ""),
         authoritative_miss_count=int(row.get("authoritative_miss_count") or 0),
+        probe_attempt_count=int(row.get("probe_attempt_count") or 0),
         next_probe_at=_evidence_datetime(row.get("next_probe_at")),
         observed_at=observed_at,
     )
@@ -1531,6 +1533,7 @@ class FotMobRepository:
                 profile_content_hash VARCHAR,
                 catalog_fingerprint VARCHAR,
                 authoritative_miss_count INTEGER,
+                probe_attempt_count INTEGER,
                 next_probe_at TIMESTAMP(6),
                 observed_at TIMESTAMP(6),
                 discovery_run_id VARCHAR,
@@ -1543,6 +1546,12 @@ class FotMobRepository:
                 _entity_type VARCHAR,
                 _ingested_at TIMESTAMP(6)
             ) WITH (partitioning = ARRAY['competition_id'])
+            """
+        )
+        trino._execute(
+            f"""
+            ALTER TABLE {self.catalog}.{self.schema}.{SCOPE_OBSERVATIONS_TABLE}
+            ADD COLUMN IF NOT EXISTS probe_attempt_count INTEGER
             """
         )
 
