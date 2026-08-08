@@ -124,7 +124,17 @@ def test_structurally_male_adult_friendlies_are_included(name):
     assert result.policy_rule == "include_structural_male_adult"
 
 
-@pytest.mark.parametrize("name", ["Charity Match", "Legends Show", "Player Testimonial"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Charity Match",
+        "Legends Show",
+        "Player Testimonial",
+        "Player Testimonials",
+        "Preseason Exhibition",
+        "Preseason Exhibitions",
+    ],
+)
 def test_show_matches_are_excluded_even_when_profile_is_male(name):
     profile = CompetitionRef(70003, name, gender="male", competition_type="league")
     result = classify_competition(profile, profile)

@@ -76,7 +76,7 @@ _FRIENDLY_RE = re.compile(
     re.IGNORECASE,
 )
 _SHOW_RE = re.compile(
-    r"(?:\bcharity\b|\btestimonial\b|\bexhibition\b|\bshows?\b|\blegends?\b)",
+    r"(?:\bcharity\b|\btestimonials?\b|\bexhibitions?\b|\bshows?\b|\blegends?\b)",
     re.IGNORECASE,
 )
 
