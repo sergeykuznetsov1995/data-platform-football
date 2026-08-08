@@ -337,21 +337,31 @@ class TestTrinoTableManagerInsertDataFrame:
         assert result is None
         manager._execute.assert_not_called()
 
-    def test_validate_dataframe_values_rejects_incompatible_value_without_io(
-        self,
+    def test_validate_dataframe_values_sanitizes_incompatible_value_without_io(
+        self, caplog
     ):
         from scrapers.base.trino_manager import TrinoTableManager
 
         manager = TrinoTableManager()
         manager._execute = MagicMock()
+        manager._execute_committing = MagicMock()
+        secret = "secret-sentinel-do-not-expose"
 
-        with pytest.raises(ValueError, match="incompatible with BIGINT"):
+        with pytest.raises(ValueError) as captured:
             manager.validate_dataframe_values(
-                pd.DataFrame({"metric": ["not-a-number"]}),
+                pd.DataFrame({"metric": [secret]}),
                 {"metric": "BIGINT"},
             )
 
+        message = str(captured.value)
+        assert "metric" in message
+        assert "BIGINT" in message
+        assert secret not in message
+        assert secret not in caplog.text
         manager._execute.assert_not_called()
+        manager._execute_committing.assert_not_called()
+        assert secret not in str(manager._execute.mock_calls)
+        assert secret not in str(manager._execute_committing.mock_calls)
 
     def test_insert_dataframe_basic(self):
         """Test basic DataFrame insertion."""

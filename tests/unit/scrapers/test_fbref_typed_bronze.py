@@ -225,15 +225,12 @@ class RecordingManager:
         frame: pd.DataFrame,
         column_types: dict[str, str],
     ) -> None:
-        normalized = {
-            str(name).casefold(): str(column_type)
-            for name, column_type in column_types.items()
-        }
-        for values in frame.itertuples(index=False, name=None):
-            for column, value in zip(frame.columns, values):
-                TrinoTableManager._format_sql_value(
-                    self, value, normalized.get(str(column).casefold(), "")
-                )
+        TrinoTableManager.validate_dataframe_values(
+            self, frame, column_types
+        )
+
+    def _format_sql_value(self, value, target_type=""):
+        return TrinoTableManager._format_sql_value(self, value, target_type)
 
 
 def _match_item(
@@ -590,6 +587,7 @@ def test_persist_matches_preflights_all_target_schemas_before_live_write() -> No
 @pytest.mark.unit
 def test_persist_matches_preflights_late_target_value_coercion() -> None:
     manager = RecordingManager()
+    secret = "secret-sentinel-do-not-expose"
     manager.columns["fbref_match_events"] = {"match_id": "VARCHAR"}
     manager.columns["fbref_match_player_stats"] = {
         "match_id": "VARCHAR",
@@ -609,16 +607,19 @@ def test_persist_matches_preflights_late_target_value_coercion() -> None:
                 frame=pd.DataFrame(
                     {
                         "match_id": ["value-preflight"],
-                        "numeric_metric": ["not-a-number"],
+                        "numeric_metric": [secret],
                     }
                 ),
             ),
         },
     )
 
-    with pytest.raises(ValueError, match="incompatible with BIGINT"):
+    with pytest.raises(ValueError) as captured:
         typed.FBrefTypedBronzeWriter(manager).persist_matches([item])
 
+    assert "numeric_metric" in str(captured.value)
+    assert "BIGINT" in str(captured.value)
+    assert secret not in str(captured.value)
     assert manager.writes == []
 
 

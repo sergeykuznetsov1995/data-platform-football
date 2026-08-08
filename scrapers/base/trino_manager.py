@@ -707,10 +707,38 @@ WITH (
         }
         for source_values in df.itertuples(index=False, name=None):
             for column, value in zip(df.columns, source_values):
-                self._format_sql_value(
-                    value,
-                    normalized_types.get(str(column).casefold(), ""),
+                column_name = str(column)
+                target_type = normalized_types.get(
+                    column_name.casefold(), ""
                 )
+                try:
+                    safe_column = validate_identifier(
+                        column_name, "dataframe column"
+                    )
+                except Exception:
+                    safe_column = "<invalid>"
+                normalized_target_type = " ".join(
+                    str(target_type).strip().upper().split()
+                )
+                safe_target_type = (
+                    normalized_target_type
+                    if normalized_target_type
+                    and len(normalized_target_type) <= 128
+                    and all(
+                        character.isalnum()
+                        or character in "_(), "
+                        for character in normalized_target_type
+                    )
+                    else "<unknown>"
+                )
+                try:
+                    self._format_sql_value(value, target_type)
+                except Exception:
+                    raise ValueError(
+                        "dataframe value is incompatible with target schema: "
+                        f"column={safe_column!r}, "
+                        f"target_type={safe_target_type!r}"
+                    ) from None
 
     def insert_dataframe(
         self,
