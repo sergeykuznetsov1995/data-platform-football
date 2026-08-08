@@ -18,10 +18,10 @@ Command (from `/root/dpf-1150-espn-silver`):
 ```
 
 Result before the SQL files existed: `10 failed, 2 passed in 0.60s`.
-Nine contract failures were `FileNotFoundError` for the three requested SQL
-files. The remaining RED failure exposed a DuckDB fixture bug: direct `CAST` of
-an absent added-time regex capture. The test was corrected to `TRY_CAST`, which
-matches the required production behavior, before implementation began.
+Nine contract failures were `FileNotFoundError` reads of the three requested SQL
+files. Independently, the first DuckDB scalar fixture used a direct `CAST` for
+an absent added-time regex capture; it was corrected to `TRY_CAST` so the
+fixture matched the required production expression.
 
 ## GREEN
 
@@ -73,3 +73,24 @@ Expected non-blocking new R5 reviews are present exactly for
 - This is static/offline verification only. No live Trino CTAS or production
   row-count validation was run because those are explicitly part of final live
   acceptance, not Task 2.
+
+## Fix round 1
+
+Reviewer feedback found that the initial events SQL stored two backslashes in
+the Trino regex literals. In a SQL string literal those are two regex
+backslashes, so the expressions would match a literal backslash rather than
+the `90'+3'` clock digits. The production literals are now exactly
+`'^(\d+)'` and `'\+(\d+)'` (one stored backslash each).
+
+The focused event contracts now bind each output alias to its production AST:
+clock input/path, pattern, capture group, event/player JSON paths, goal flags,
+and ordinality lineage. Substitution tests similarly bind output fields,
+inbound/played predicate, join, and team-qualified dedup key; venue tests bind
+the output address/name nodes and each row-number stage. DuckDB remains only a
+scalar-behavior fixture, with AST tests preventing divergence from production.
+
+Focused verification after the fix: `14 passed in 0.39s`. A direct live Trino
+scalar query was not possible in this checkout because `TRINO_HOST` and
+`TRINO_USER` credentials are unavailable; the AST checks assert the exact
+single-backslash production literal and the DuckDB fixture confirms
+`90'+3'` yields minute `90` and plus-minute `3`.

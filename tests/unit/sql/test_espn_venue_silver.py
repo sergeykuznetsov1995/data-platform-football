@@ -25,6 +25,10 @@ def _tree() -> exp.Select:
     return sqlglot.parse_one(_sql(), read="trino")
 
 
+def _output(tree: exp.Select, name: str) -> exp.Expression:
+    return next(expression for expression in tree.expressions if expression.alias_or_name == name)
+
+
 class TestEspnVenueSilver:
     def test_schedule_then_venue_latest_dedup_and_non_null_venue_id(self):
         sql = _sql()
@@ -35,18 +39,30 @@ class TestEspnVenueSilver:
         assert body.index("schedule_dedup") < body.index("venue_dedup")
         assert re.search(r"WHERE\s+venue_id\s+IS\s+NOT\s+NULL", body, re.I)
 
-    def test_ast_binds_bronze_name_and_json_address_paths(self):
+    def test_ast_binds_venue_outputs_and_both_latest_row_number_stages(self):
         tree = _tree()
-        paths = {
-            node.expression.sql(dialect="trino")
-            for node in tree.find_all(exp.JSONExtractScalar)
-        }
-        assert {"'$.venue.address.city'", "'$.venue.address.country'"} <= paths
-        name = next(alias for alias in tree.find_all(exp.Alias) if alias.alias == "venue_name")
+        name = _output(tree, "venue_name")
         assert isinstance(name.this, exp.Trim)
         assert isinstance(name.this.this, exp.Column) and name.this.this.name == "venue"
+        for alias, path in (("city", "'$.venue.address.city'"), ("country", "'$.venue.address.country'")):
+            scalar = next(_output(tree, alias).find_all(exp.JSONExtractScalar))
+            assert scalar.expression.sql(dialect="trino") == path
+            assert isinstance(scalar.this, exp.Column) and scalar.this.name == "extra_json"
+
+        schedule_dedup = next(cte.this for cte in tree.args["with_"].expressions if cte.alias_or_name == "schedule_dedup")
+        venue_dedup = next(cte.this for cte in tree.args["with_"].expressions if cte.alias_or_name == "venue_dedup")
+        for cte, partition, ordered_column in (
+            (schedule_dedup, "event_id", "_ingested_at"),
+            (venue_dedup, "venue_id", "_ingested_at"),
+        ):
+            window = next(cte.find_all(exp.Window))
+            assert isinstance(window.this, exp.RowNumber)
+            assert [column.name for column in window.args["partition_by"]] == [partition]
+            ordered = window.args["order"].expressions[0]
+            assert ordered.this.name == ordered_column and ordered.args["desc"] is True
 
     def test_executable_two_stage_latest_selection(self):
+        """DuckDB checks two-stage latest behavior; AST binds production stages."""
         duckdb = pytest.importorskip("duckdb")
         con = duckdb.connect(":memory:")
         rows = con.execute("""

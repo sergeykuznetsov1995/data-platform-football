@@ -25,6 +25,14 @@ def _tree() -> exp.Select:
     return sqlglot.parse_one(_sql(), read="trino")
 
 
+def _output(tree: exp.Select, name: str) -> exp.Expression:
+    return next(expression for expression in tree.expressions if expression.alias_or_name == name)
+
+
+def _scalar_path(expression: exp.Expression) -> exp.JSONExtractScalar:
+    return next(expression.find_all(exp.JSONExtractScalar))
+
+
 class TestEspnSubstitutionsSilver:
     def test_native_sources_dedup_before_inbound_filter_and_schedule_played_join(self):
         sql = _sql()
@@ -37,23 +45,54 @@ class TestEspnSubstitutionsSilver:
         assert re.search(r"JOIN\s+schedule_dedup\s+s\s+ON\s+s\.event_id\s*=\s+l\.event_id", body, re.I)
         assert re.search(r"WHERE\s+s\.played_final\s+AND\s+l\.subbed_in", body, re.I)
 
-    def test_ast_binds_inbound_pair_and_sibling_jersey_paths(self):
+    def test_ast_binds_each_inbound_output_to_the_exact_source_or_json_path(self):
         tree = _tree()
-        paths = {
-            node.expression.sql(dialect="trino")
-            for node in tree.find_all(exp.JSONExtractScalar)
-        }
-        assert {
-            "'$.subbedInFor.athlete.id'", "'$.subbedInFor.athlete.displayName'",
-            "'$.jersey'", "'$.subbedInFor.jersey'",
-        } <= paths
-        assert "'$.subbedInFor.athlete.jersey'" not in paths
+        for alias, column in {
+            "event_id": "event_id", "team_id": "team_id", "team": "team",
+            "player_in_id": "athlete_id", "player_in_name": "player",
+        }.items():
+            output = _output(tree, alias)
+            source = output.this if isinstance(output, exp.Alias) else output
+            assert isinstance(source, exp.Column)
+            assert (source.table, source.name) == ("l", column)
 
-        final = sqlglot.parse_one(_sql(), read="trino")
-        player_in = next(alias for alias in final.find_all(exp.Alias) if alias.alias == "player_in_id")
-        assert isinstance(player_in.this, exp.Column) and player_in.this.name == "athlete_id"
+        for alias, path in {
+            "player_out_id": "'$.subbedInFor.athlete.id'",
+            "player_out_name": "'$.subbedInFor.athlete.displayName'",
+            "player_out_jersey": "'$.subbedInFor.jersey'",
+        }.items():
+            scalar = _scalar_path(_output(tree, alias))
+            assert scalar.expression.sql(dialect="trino") == path
+            assert (scalar.this.table, scalar.this.name) == ("l", "extra_json")
+
+        player_in_jersey = _output(tree, "player_in_jersey")
+        jersey_scalar = _scalar_path(player_in_jersey)
+        assert jersey_scalar.expression.sql(dialect="trino") == "'$.jersey'"
+        assert (jersey_scalar.this.table, jersey_scalar.this.name) == ("l", "extra_json")
+        nullif = next(player_in_jersey.find_all(exp.Nullif))
+        assert (nullif.this.table, nullif.this.name) == ("l", "jersey")
+        assert "'$.subbedInFor.athlete.jersey'" not in {
+            node.expression.sql(dialect="trino") for node in player_in_jersey.find_all(exp.JSONExtractScalar)
+        }
+
+    def test_inbound_cte_binds_played_schedule_join_predicate_and_team_qualified_pk(self):
+        tree = _tree()
+        inbound = next(cte.this for cte in tree.args["with_"].expressions if cte.alias_or_name == "inbound_substitutions")
+        join = next(inbound.find_all(exp.Join))
+        assert join.this.name == "schedule_dedup" and join.this.alias == "s"
+        join_columns = {(column.table, column.name) for column in join.args["on"].find_all(exp.Column)}
+        assert join_columns == {("s", "event_id"), ("l", "event_id")}
+        predicate_columns = {(column.table, column.name) for column in inbound.args["where"].this.find_all(exp.Column)}
+        assert predicate_columns == {("s", "played_final"), ("l", "subbed_in")}
+
+        lineup_dedup = next(cte.this for cte in tree.args["with_"].expressions if cte.alias_or_name == "lineup_dedup")
+        window = next(lineup_dedup.find_all(exp.Window))
+        assert [column.name for column in window.args["partition_by"]] == ["event_id", "team_id", "athlete_id"]
+        ordered = window.args["order"].expressions[0]
+        assert ordered.this.name == "_ingested_at" and ordered.args["desc"] is True
 
     def test_executable_dedup_inbound_only_pairing_and_json_jersey_priority(self):
+        """DuckDB checks scalar behavior; AST assertions bind the production paths."""
         duckdb = pytest.importorskip("duckdb")
         con = duckdb.connect(":memory:")
         rows = con.execute("""
