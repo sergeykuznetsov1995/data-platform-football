@@ -170,7 +170,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shard-size", type=int, required=True)
     parser.add_argument("--reservation-mb", type=int, required=True)
     parser.add_argument("--domain-interval-seconds", type=float, required=True)
-    parser.add_argument("--max-batches", type=int, default=16)
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        choices=range(1, 81),
+        default=80,
+    )
     return parser
 
 

@@ -79,6 +79,12 @@ def test_acceptance_dag_is_one_strictly_sequential_live_batch(acceptance_dag):
     assert tasks["run_live_wave"].python_callable.__name__ == (
         "run_fbref_acceptance_live_wave"
     )
+    assert tasks["run_live_wave"]._init_kwargs["pool"] == (
+        "fbref_scraper_pool"
+    )
+    assert tasks["run_live_wave"]._init_kwargs[
+        "execution_timeout"
+    ].total_seconds() == 6 * 60 * 60 + 5 * 60
     assert tasks["acquire_publication_lock"].python_callable.__name__ == (
         "acquire_fbref_acceptance_publication_lock"
     )

@@ -19,13 +19,14 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from scrapers.fbref.settings import DEFAULT_DOMAIN_INTERVAL_SECONDS
 
-from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
+from utils.default_args import DEFAULT_ARGS
 from utils.fbref_pipeline_tasks import (
     FBREF_CANARY_BYTE_LIMIT_MB,
     FBREF_CANARY_REQUEST_LIMIT,
     FBREF_MAX_WARM_SESSION_TARGETS,
     FBREF_PRODUCTION_BYTE_LIMIT_MB,
     FBREF_PRODUCTION_REQUEST_LIMIT,
+    FBREF_SCRAPER_POOL,
     acquire_fbref_publication_lock,
     audit_fbref_raw_integrity,
     capture_fbref_raw_baseline,
@@ -58,7 +59,7 @@ BACKFILL_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT
 BACKFILL_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB
 DEFAULT_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
 MAX_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
-BACKFILL_MAX_BATCHES = 16
+BACKFILL_MAX_BATCHES = 80
 
 AIRFLOW_RUN_ID = "{{ run_id }}"
 DAG_ID = "{{ dag.dag_id }}"
@@ -118,7 +119,7 @@ with DAG(
 
     Manual only. The DAG selects the next bounded unfinished page of
     non-current seasons from the source-discovered male registry, then runs
-    up to sixteen raw-first batches in one warm process under a
+    up to eighty raw-first batches in one warm process under a
     200-request/100-MiB hard cap.
     A `100/50` canary profile is available through Params or DagRun conf.
     Set `dry_run=true` to inspect the exact next cohort without creating a
@@ -259,8 +260,8 @@ with DAG(
             "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
             "max_batches": BACKFILL_MAX_BATCHES,
         },
-        pool=INGEST_SCRAPER_POOL,
-        execution_timeout=timedelta(minutes=120),
+        pool=FBREF_SCRAPER_POOL,
+        execution_timeout=timedelta(hours=6, minutes=5),
         retries=0,
         trigger_rule="all_success",
     )

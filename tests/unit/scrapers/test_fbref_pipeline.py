@@ -4723,10 +4723,170 @@ def test_validation_accepts_a_clearance_re_solved_on_a_fresh_proxy(tmp_path):
     assert "finish:True" in control.events
 
 
-def test_current_publication_blocks_pending_match_backlog(tmp_path):
+def _ordinary_validation_summary(control, **traffic):
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary.update(
+        target_counts={"succeeded": 19},
+        promotion_pending_match_count=0,
+        traffic_totals={
+            "network_attempts": 20,
+            "warm_http_successes": 19,
+            "warm_http_success_rate": 0.95,
+            "unclassified_failures": 0,
+            "unclassified_failure_rate": 0.0,
+            "duplicate_fetch_violations": 0,
+            **traffic,
+        },
+        session_metrics={"max_bootstraps_per_session": 1},
+    )
+    return summary
+
+
+def test_productive_run_warns_on_partial_warm_http_success(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
-    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary = _ordinary_validation_summary(
+        control,
+        warm_http_success_rate=0.9494,
+    )
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    result = pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert result["warnings"]["warm_http_success_rate"] == pytest.approx(
+        0.9494
+    )
+    assert "finish:True" in control.events
+
+
+@pytest.mark.parametrize("success_rate", [0.5, 0.949999])
+def test_productive_run_warns_at_partial_success_boundaries(
+    tmp_path, success_rate
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = _ordinary_validation_summary(
+        control,
+        warm_http_success_rate=success_rate,
+    )
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    result = pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert result["warnings"]["warm_http_success_rate"] == pytest.approx(
+        success_rate
+    )
+
+
+def test_ninety_five_percent_warm_success_needs_no_warning(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = _ordinary_validation_summary(control)
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    result = pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "warnings" not in result
+
+
+def test_partial_warm_success_with_unresolved_claim_is_hard(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = _ordinary_validation_summary(
+        control,
+        warm_http_success_rate=0.9494,
+    )
+    summary["target_counts"]["leased"] = 1
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(
+        RunValidationError,
+        match="partial_warm_http_success_without_recoverable_progress",
+    ):
+        pipeline.validate_and_finish(str(uuid.uuid4()))
+
+
+def test_zero_warm_success_after_attempts_is_a_hard_failure(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = _ordinary_validation_summary(
+        control,
+        warm_http_successes=0,
+        warm_http_success_rate=0.0,
+    )
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(RunValidationError, match="zero warm HTTP successes"):
+        pipeline.validate_and_finish(str(uuid.uuid4()))
+
+
+def test_warm_success_below_half_is_a_hard_failure(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = _ordinary_validation_summary(
+        control,
+        warm_http_success_rate=0.499999,
+    )
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(RunValidationError, match="warm_http_success_rate"):
+        pipeline.validate_and_finish(str(uuid.uuid4()))
+
+
+def test_claimed_work_without_durable_progress_is_a_hard_failure(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = _ordinary_validation_summary(control)
+    summary["target_counts"] = {"failed": 20}
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(RunValidationError, match="no_durable_progress"):
+        pipeline.validate_and_finish(str(uuid.uuid4()))
+
+
+def test_any_unclassified_failure_remains_hard(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = _ordinary_validation_summary(
+        control,
+        unclassified_failures=1,
+        unclassified_failure_rate=0.0001,
+    )
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(RunValidationError, match="unclassified_failures=1"):
+        pipeline.validate_and_finish(str(uuid.uuid4()))
+
+
+def test_productive_current_run_warns_on_recoverable_promotion_backlog(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = _ordinary_validation_summary(control)
+    summary["promotion_pending_match_count"] = 26
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    result = pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert result["warnings"]["promotion_pending_match_count"] == 26
+    assert "finish:True" in control.events
+
+
+def test_unproductive_current_run_blocks_promotion_backlog(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = _ordinary_validation_summary(control)
+    summary["target_counts"] = {"failed": 20}
     summary["promotion_pending_match_count"] = 26
     control.get_run_summary = lambda _, **__: summary
     pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
@@ -4736,7 +4896,19 @@ def test_current_publication_blocks_pending_match_backlog(tmp_path):
     ):
         pipeline.validate_and_finish(str(uuid.uuid4()))
 
-    assert "finish:False" not in control.events
+
+def test_current_publication_warns_on_productive_pending_match_backlog(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary["promotion_pending_match_count"] = 26
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    result = pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert result["warnings"]["promotion_pending_match_count"] == 26
+    assert "finish:True" in control.events
 
 
 @pytest.mark.parametrize(
@@ -6311,7 +6483,7 @@ def test_live_runner_reuses_one_fetch_session_and_parses_after_each_raw_batch(
         worker_id="current-live",
         page_kinds=["competition_index"],
         settings=_settings(),
-        max_batches=16,
+        max_batches=80,
     )
 
     assert events == ["fetch", "parse", "fetch", "parse"]
@@ -6320,6 +6492,24 @@ def test_live_runner_reuses_one_fetch_session_and_parses_after_each_raw_batch(
     assert result.frontier_closed is True
     assert result.fetch.fetched == 1
     assert result.parse.parsed == 1
+
+
+@pytest.mark.parametrize("invalid", [0, 81])
+def test_live_runner_accepts_only_one_to_eighty_batches(tmp_path, invalid):
+    pipeline = FBrefPipeline(
+        FakeControl(_raw_store(tmp_path)),
+        _raw_store(tmp_path),
+        generic_writer=FakeWriter(),
+    )
+
+    with pytest.raises(ValueError, match="between 1 and 80"):
+        pipeline.run_live_waves(
+            str(uuid.uuid4()),
+            worker_id="current-live",
+            page_kinds=["match"],
+            settings=_settings(),
+            max_batches=invalid,
+        )
 
 
 def test_productive_refreshes_do_not_accumulate_into_session_exhaustion(

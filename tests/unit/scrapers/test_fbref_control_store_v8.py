@@ -699,8 +699,166 @@ def test_global_unprocessed_raw_includes_failed_source_runs_oldest_first():
         "page-v2",
         "typed-v3",
         "stateful-v4",
+        "page-v2",
+        "typed-v3",
+        "stateful-v4",
+        "page-v2",
+        "typed-v3",
+        "stateful-v4",
         10,
     )
+
+
+def test_unprocessed_fetches_skip_only_provably_superseded_failed_observation():
+    captured = {}
+
+    def handler(sql, params):
+        captured["sql"] = " ".join(sql.split())
+        captured["params"] = params
+        return [], 0
+
+    store, _ = make_store(handler)
+    assert store.list_unprocessed_fetches(
+        parser_version="page-v2",
+        typed_parser_version="typed-v3",
+        stateful_parser_version="stateful-v4",
+        page_kinds=["match"],
+        limit=100,
+    ) == []
+
+    sql = captured["sql"]
+    assert "failed_observed.status = 'failed'" in sql
+    assert "newer_attempt.target_id = attempt.target_id" in sql
+    assert "newer_attempt.lease_epoch > attempt.lease_epoch" in sql
+    assert "newer_attempt.status = 'succeeded'" in sql
+    assert "newer_observed.status = 'succeeded'" in sql
+    assert "newer_observed.generic_status = 'succeeded'" in sql
+    assert "newer_observed.typed_status IN ( 'succeeded', 'skipped' )" in sql
+    assert "newer_observed.stateful_status IN ( 'succeeded', 'skipped' )" in sql
+    assert "newer_observed.validation_status = 'succeeded'" in sql
+    assert "newer_attempt.content_hash <> attempt.content_hash" not in sql
+    # Exact parser triples are required for both the current failure and the
+    # newer success. A different-version success must remain visible.
+    assert captured["params"].count("page-v2") == 3
+    assert captured["params"].count("typed-v3") == 3
+    assert captured["params"].count("stateful-v4") == 3
+
+
+def test_unprocessed_list_and_summary_use_the_same_superseded_rule():
+    cohort = " ".join(inspect.getsource(ControlStore.list_unprocessed_fetches).split())
+    summary = " ".join(inspect.getsource(ControlStore.get_run_summary).split())
+    required = (
+        "failed_observed.status = 'failed'",
+        "newer_attempt.target_id = attempt.target_id",
+        "newer_attempt.lease_epoch > attempt.lease_epoch",
+        "newer_attempt.status = 'succeeded'",
+        "newer_observed.status = 'succeeded'",
+        "newer_observed.generic_status = 'succeeded'",
+        "newer_observed.typed_status IN ( 'succeeded', 'skipped' )",
+        "newer_observed.stateful_status IN ( 'succeeded', 'skipped' )",
+        "newer_observed.validation_status = 'succeeded'",
+    )
+
+    for clause in required:
+        assert clause in cohort
+        assert clause in summary
+    # This is what preserves A -> B -> A: chronology is the fenced lease
+    # sequence, never a timestamp or a comparison of repeated content hashes.
+    assert "newer_attempt.finished_at > attempt.finished_at" not in cohort
+    assert "newer_attempt.content_hash <> attempt.content_hash" not in cohort
+    assert "failed_observed.status <> 'succeeded'" not in cohort
+
+
+def _faithful_recovery_visibility(
+    *, old_status, newer, requested=("page-v2", "typed-v3", "stateful-v4")
+):
+    """Tiny in-memory copy of the SQL contract for adversarial fixtures."""
+
+    if old_status != "failed":
+        return True
+    for item in newer:
+        complete = (
+            item["lease_epoch"] > 1
+            and item["attempt_status"] == "succeeded"
+            and item["versions"] == requested
+            and item["status"] == "succeeded"
+            and item["generic_status"] == "succeeded"
+            and item["typed_status"] in {"succeeded", "skipped"}
+            and item["stateful_status"] in {"succeeded", "skipped"}
+            and item["validation_status"] == "succeeded"
+        )
+        if complete:
+            return False
+    return True
+
+
+def _newer_recovery_observation(**overrides):
+    item = {
+        "lease_epoch": 2,
+        "attempt_status": "succeeded",
+        "versions": ("page-v2", "typed-v3", "stateful-v4"),
+        "status": "succeeded",
+        "generic_status": "succeeded",
+        "typed_status": "succeeded",
+        "stateful_status": "succeeded",
+        "validation_status": "succeeded",
+        "content_hash": "b" * 64,
+    }
+    item.update(overrides)
+    return item
+
+
+@pytest.mark.parametrize(
+    ("old_status", "newer", "visible"),
+    [
+        ("failed", [], True),
+        (
+            "failed",
+            [
+                _newer_recovery_observation(
+                    versions=("page-v9", "typed-v9", "stateful-v9")
+                )
+            ],
+            True,
+        ),
+        (
+            "failed",
+            [_newer_recovery_observation(typed_status="processing")],
+            True,
+        ),
+        (
+            "failed",
+            [_newer_recovery_observation(attempt_status="claimed")],
+            True,
+        ),
+        (
+            "processing",
+            [_newer_recovery_observation()],
+            True,
+        ),
+        (
+            "failed",
+            [
+                _newer_recovery_observation(
+                    lease_epoch=2, content_hash="b" * 64, status="failed"
+                ),
+                _newer_recovery_observation(
+                    lease_epoch=3, content_hash="a" * 64
+                ),
+            ],
+            False,
+        ),
+    ],
+)
+def test_recovery_supersession_behavior_with_faithful_fake(
+    old_status, newer, visible
+):
+    # The final fixture is A -> B -> A. Repeating the old hash does not make
+    # chronology ambiguous because the decision uses lease_epoch only.
+    assert _faithful_recovery_visibility(
+        old_status=old_status,
+        newer=newer,
+    ) is visible
 
 
 def test_registry_unknown_gender_is_durably_quarantined_then_blocks_caller():

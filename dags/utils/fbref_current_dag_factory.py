@@ -11,7 +11,7 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from scrapers.fbref.settings import DEFAULT_DOMAIN_INTERVAL_SECONDS
 
-from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
+from utils.default_args import DEFAULT_ARGS
 from utils.fbref_pipeline_tasks import (
     FBREF_CANARY_BYTE_LIMIT_MB,
     FBREF_CANARY_REQUEST_LIMIT,
@@ -19,6 +19,7 @@ from utils.fbref_pipeline_tasks import (
     FBREF_MAX_WARM_SESSION_TARGETS,
     FBREF_PRODUCTION_BYTE_LIMIT_MB,
     FBREF_PRODUCTION_REQUEST_LIMIT,
+    FBREF_SCRAPER_POOL,
     acquire_fbref_publication_lock,
     audit_fbref_raw_integrity,
     capture_fbref_raw_baseline,
@@ -56,7 +57,7 @@ PAGE_KINDS = (
 
 # One unforked process advances bounded raw-first batches while retaining the
 # same clearance and proxy quarantine for the run.
-CURRENT_MAX_BATCHES = 16
+CURRENT_MAX_BATCHES = 80
 CURRENT_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT
 CURRENT_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB
 DEFAULT_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
@@ -104,7 +105,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
     if bootstrap_only:
         dag_id = BOOTSTRAP_DAG_ID
         schedule = None
-        dagrun_timeout = timedelta(hours=3)
+        dagrun_timeout = timedelta(hours=8)
         request_limit = FBREF_PRODUCTION_REQUEST_LIMIT
         byte_limit_mb = FBREF_PRODUCTION_BYTE_LIMIT_MB
         shard_size = FBREF_MAX_WARM_SESSION_TARGETS
@@ -260,8 +261,8 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
                 "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
                 "max_batches": CURRENT_MAX_BATCHES,
             },
-            pool=INGEST_SCRAPER_POOL,
-            execution_timeout=timedelta(minutes=120),
+            pool=FBREF_SCRAPER_POOL,
+            execution_timeout=timedelta(hours=6, minutes=5),
             retries=0,
             trigger_rule="all_success",
         )

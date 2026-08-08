@@ -8,7 +8,7 @@ from airflow import DAG
 from airflow.models.param import Param
 from airflow.operators.python import PythonOperator
 
-from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
+from utils.default_args import DEFAULT_ARGS
 from utils.fbref_bronze_acceptance_tasks import (
     acquire_fbref_acceptance_publication_lock,
     audit_fbref_acceptance_raw,
@@ -19,6 +19,7 @@ from utils.fbref_bronze_acceptance_tasks import (
     validate_fbref_acceptance_run,
 )
 from utils.fbref_pipeline_tasks import (
+    FBREF_SCRAPER_POOL,
     capture_fbref_raw_baseline,
     fbref_dag_failure_callback,
     release_fbref_publication_lock,
@@ -118,8 +119,8 @@ with DAG(
             "dag_id": DAG_ID,
             "scope": SCOPE,
         },
-        pool=INGEST_SCRAPER_POOL,
-        execution_timeout=timedelta(minutes=120),
+        pool=FBREF_SCRAPER_POOL,
+        execution_timeout=timedelta(hours=6, minutes=5),
         retries=0,
         trigger_rule="all_success",
     )

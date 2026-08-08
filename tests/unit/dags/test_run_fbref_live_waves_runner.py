@@ -36,6 +36,16 @@ def test_parent_death_race_fails_before_any_paid_work():
         )
 
 
+def test_parser_defaults_to_eighty_live_batches():
+    action = next(
+        item
+        for item in runner.build_parser()._actions
+        if item.dest == "max_batches"
+    )
+    assert action.default == 80
+    assert tuple(action.choices) == tuple(range(1, 81))
+
+
 def test_bootstrap_control_run_is_allowed_through_live_transport(
     monkeypatch,
     capsys,

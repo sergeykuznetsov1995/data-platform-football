@@ -79,7 +79,7 @@ class TestFBrefBackfillTopology:
 
     def test_one_warm_live_runner_is_bounded(self, loaded_dag):
         module, tasks = loaded_dag
-        assert module.BACKFILL_MAX_BATCHES == 16
+        assert module.BACKFILL_MAX_BATCHES == 80
         assert module.BACKFILL_REQUEST_LIMIT == 200
         assert len(tasks) == 16
         assert tasks["initialize_run"].downstream_task_ids == {
@@ -111,11 +111,12 @@ class TestFBrefBackfillTopology:
         live = tasks["run_live_waves"]
         assert live.python_callable.__name__ == "run_fbref_live_waves"
         assert live.op_kwargs["run_type"] == "backfill"
-        assert live.op_kwargs["max_batches"] == 16
+        assert live.op_kwargs["max_batches"] == 80
         assert live.op_kwargs["reservation_mb"] == 3
         assert live._captured_kwargs["execution_timeout"].total_seconds() == (
-            120 * 60
+            6 * 60 * 60 + 5 * 60
         )
+        assert live._captured_kwargs["pool"] == "fbref_scraper_pool"
         assert live._captured_kwargs["retries"] == 0
         assert live.downstream_task_ids == {
             "audit_raw_integrity"

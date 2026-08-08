@@ -697,6 +697,7 @@ services:
         # two browser/FlareSolverr scrapers at once exhaust VM swap → scheduler
         # stalls → live tasks get orphan-reset (#671). Idempotent (create/update).
         airflow pools set 'ingest_scraper_pool' 1 'Serialize heavy ingest scrapers to avoid VM swap (#671)'
+        airflow pools set 'fbref_scraper_pool' 1 'Serialize paid FBref live work without sharing unrelated scraper queues'
         # FotMob is lightweight direct HTTP.  A separate bounded pool prevents
         # browser scrapers from serializing it while limiting source fan-out.
         airflow pools set 'fotmob_http_pool' 4 'Bounded direct FotMob HTTP work'

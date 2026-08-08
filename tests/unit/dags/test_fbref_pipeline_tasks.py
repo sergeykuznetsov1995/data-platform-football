@@ -75,6 +75,28 @@ def test_runtime_limits_allow_only_hard_production_canary_and_replay_profiles():
             byte_limit_mb=50,
             shard_size=25,
         )
+
+
+@pytest.mark.unit
+def test_live_wave_limits_allow_exactly_eighty_batches():
+    assert fbref_pipeline_tasks.FBREF_MAX_LIVE_BATCHES == 80
+    assert fbref_pipeline_tasks.LIVE_WAVES_TIMEOUT_SECONDS == 6 * 60 * 60
+    assert fbref_pipeline_tasks.FBREF_SCRAPER_POOL == "fbref_scraper_pool"
+    assert fbref_pipeline_tasks.FBREF_MAX_LIVE_BATCHES * 25 == 2_000
+
+    for invalid in (0, 81):
+        with pytest.raises(ValueError, match="between 1 and 80"):
+            fbref_pipeline_tasks.run_fbref_live_waves(
+                airflow_run_id="manual__invalid_batches",
+                dag_id="dag_ingest_fbref",
+                worker_id="current-live",
+                page_kinds=["match"],
+                run_type="current",
+                request_limit=200,
+                byte_limit_mb=100,
+                shard_size=25,
+                max_batches=invalid,
+            )
     with pytest.raises(ValueError, match="between 1 and 25"):
         fbref_pipeline_tasks.validate_fbref_runtime_limits(
             run_type="current",
@@ -1780,7 +1802,7 @@ def test_live_waves_use_one_process_group_for_all_batches(monkeypatch):
     assert command[command.index("--parent-pid") + 1] == str(
         fbref_pipeline_tasks.os.getpid()
     )
-    assert command[command.index("--max-batches") + 1] == "16"
+    assert command[command.index("--max-batches") + 1] == "80"
     assert command[command.index("--reservation-mb") + 1] == "3"
 
 
@@ -1943,7 +1965,7 @@ def test_live_waves_timeout_terminates_the_complete_process_group(monkeypatch):
         airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
         dag_id="dag_ingest_fbref",
         error_class="LiveWavesSubprocessTimeout",
-        error_message="FBref live runner exceeded 6600s",
+        error_message="FBref live runner exceeded 21600s",
     )
 
 

@@ -2749,7 +2749,7 @@ class FBrefPipeline:
         worker_id: str,
         page_kinds: Sequence[str],
         settings: PipelineSettings,
-        max_batches: int = 16,
+        max_batches: int = 80,
     ) -> LiveRunResult:
         """Fetch raw and parse offline in one warm, bounded process.
 
@@ -2761,8 +2761,8 @@ class FBrefPipeline:
         if settings.run_type == "replay":
             raise PipelineError("Replay mode cannot execute live waves")
         normalized_batches = int(max_batches)
-        if not 1 <= normalized_batches <= 16:
-            raise ValueError("max_batches must be between 1 and 16")
+        if not 1 <= normalized_batches <= 80:
+            raise ValueError("max_batches must be between 1 and 80")
 
         run = self.control.get_run(run_id)
         if run is not None and str(run.get("status") or "") == "failed":
@@ -4592,6 +4592,21 @@ class FBrefPipeline:
             if status not in {"succeeded", "skipped"}
         )
         errors = []
+        warnings: dict[str, object] = {}
+        traffic = summary.get("traffic_totals") or {}
+        network_attempts = int(traffic.get("network_attempts") or 0)
+        warm_successes = int(traffic.get("warm_http_successes") or 0)
+        success_rate = traffic.get("warm_http_success_rate")
+        durable_progress = int(target_counts.get("succeeded") or 0)
+        unresolved_claims = bool(incomplete) or any(
+            int(summary.get(metric) or 0) != 0
+            for metric in ("requests_reserved", "bytes_reserved")
+        )
+        productive_recoverable = (
+            durable_progress > 0
+            and not unresolved_claims
+            and int(summary.get("unprocessed_raw_count") or 0) == 0
+        )
         if live_acceptance:
             errors.extend(_acceptance_summary_errors(summary))
             raw_error = _accepted_raw_audit_error(run_id, summary)
@@ -4669,10 +4684,20 @@ class FBrefPipeline:
             and str(summary.get("run_type") or "").casefold() == "current"
             and int(summary.get("promotion_pending_match_count") or 0) != 0
         ):
-            errors.append(
-                "promotion_pending_match_count="
-                f"{int(summary['promotion_pending_match_count'])}"
-            )
+            pending_matches = int(summary["promotion_pending_match_count"])
+            if productive_recoverable:
+                warnings["promotion_pending_match_count"] = pending_matches
+                logger.warning(
+                    "Run %s completed durable work with %d recoverable "
+                    "promotion-pending match(es)",
+                    run_id,
+                    pending_matches,
+                )
+            else:
+                errors.append(
+                    "promotion_pending_match_count="
+                    f"{pending_matches}"
+                )
         if bool(summary.get("budget_exceeded")):
             errors.append("budget_exceeded=true")
         if int(summary.get("requests_used") or 0) > int(
@@ -4683,16 +4708,37 @@ class FBrefPipeline:
             summary.get("byte_limit") or 0
         ):
             errors.append("byte_limit_exceeded")
-        traffic = summary.get("traffic_totals") or {}
-        success_rate = traffic.get("warm_http_success_rate")
-        if success_rate is not None and float(success_rate) < 0.95:
+        if not isolated_acceptance and str(
+            summary.get("run_type") or ""
+        ).casefold() != "replay":
+            if network_attempts > 0 and warm_successes == 0:
+                errors.append("zero warm HTTP successes after network attempts")
+            if network_attempts > 0 and success_rate is None:
+                errors.append("warm_http_success_rate_missing")
+            elif success_rate is not None and float(success_rate) < 0.5:
+                errors.append(
+                    f"warm_http_success_rate={float(success_rate):.4f}<0.5"
+                )
+            elif success_rate is not None and float(success_rate) < 0.95:
+                if durable_progress > 0 and not unresolved_claims:
+                    warnings["warm_http_success_rate"] = float(success_rate)
+                    logger.warning(
+                        "Run %s completed durable work with partial warm HTTP "
+                        "success rate %.4f",
+                        run_id,
+                        float(success_rate),
+                    )
+                else:
+                    errors.append(
+                        "partial_warm_http_success_without_recoverable_progress="
+                        f"{float(success_rate):.4f}"
+                    )
+            if network_attempts > 0 and durable_progress <= 0:
+                errors.append("no_durable_progress_after_claimed_work")
+        if int(traffic.get("unclassified_failures") or 0) != 0:
             errors.append(
-                f"warm_http_success_rate={float(success_rate):.4f}<0.95"
-            )
-        if float(traffic.get("unclassified_failure_rate") or 0.0) >= 0.005:
-            errors.append(
-                "unclassified_failure_rate="
-                f"{float(traffic['unclassified_failure_rate']):.4f}>=0.005"
+                "unclassified_failures="
+                f"{int(traffic['unclassified_failures'])}"
             )
         if int(traffic.get("duplicate_fetch_violations") or 0) != 0:
             errors.append(
@@ -4854,6 +4900,8 @@ class FBrefPipeline:
             # the run is finishing right now, and reopened 'retry' rows would
             # linger in a succeeded run forever.
             self.control.start_run(run_id, reopen_targets=False)
+        if warnings:
+            summary["warnings"] = warnings
         self.control.finish_run(run_id, succeeded=True)
         return summary
 

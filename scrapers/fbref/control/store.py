@@ -6350,6 +6350,42 @@ class ControlStore:
                           )
                           AND observed.validation_status = 'succeeded'
                       )
+                      AND NOT (
+                        EXISTS (
+                          SELECT 1
+                          FROM fbref_control.observation_processing
+                               AS failed_observed
+                          WHERE failed_observed.logical_refresh_id =
+                                attempt.logical_refresh_id
+                            AND failed_observed.parser_version = %s
+                            AND failed_observed.typed_parser_version = %s
+                            AND failed_observed.stateful_parser_version = %s
+                            AND failed_observed.status = 'failed'
+                        )
+                        AND EXISTS (
+                          SELECT 1
+                          FROM fbref_control.fetch_attempt AS newer_attempt
+                          JOIN fbref_control.observation_processing
+                               AS newer_observed
+                            ON newer_observed.logical_refresh_id =
+                               newer_attempt.logical_refresh_id
+                          WHERE newer_attempt.target_id = attempt.target_id
+                            AND newer_attempt.lease_epoch > attempt.lease_epoch
+                            AND newer_attempt.status = 'succeeded'
+                            AND newer_observed.parser_version = %s
+                            AND newer_observed.typed_parser_version = %s
+                            AND newer_observed.stateful_parser_version = %s
+                            AND newer_observed.status = 'succeeded'
+                            AND newer_observed.generic_status = 'succeeded'
+                            AND newer_observed.typed_status IN (
+                                'succeeded', 'skipped'
+                            )
+                            AND newer_observed.stateful_status IN (
+                                'succeeded', 'skipped'
+                            )
+                            AND newer_observed.validation_status = 'succeeded'
+                        )
+                      )
                     )
                   )
                 GROUP BY frontier.page_kind
@@ -6361,6 +6397,12 @@ class ControlStore:
                     run,
                     parser,
                     parser,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
                     parser,
                     typed_parser,
                     stateful_parser,
@@ -7092,6 +7134,42 @@ class ControlStore:
                       )
                       AND observed.validation_status = 'succeeded'
                   )
+                  AND NOT (
+                    EXISTS (
+                      SELECT 1
+                      FROM fbref_control.observation_processing
+                           AS failed_observed
+                      WHERE failed_observed.logical_refresh_id =
+                            attempt.logical_refresh_id
+                        AND failed_observed.parser_version = %s
+                        AND failed_observed.typed_parser_version = %s
+                        AND failed_observed.stateful_parser_version = %s
+                        AND failed_observed.status = 'failed'
+                    )
+                    AND EXISTS (
+                      SELECT 1
+                      FROM fbref_control.fetch_attempt AS newer_attempt
+                      JOIN fbref_control.observation_processing
+                           AS newer_observed
+                        ON newer_observed.logical_refresh_id =
+                           newer_attempt.logical_refresh_id
+                      WHERE newer_attempt.target_id = attempt.target_id
+                        AND newer_attempt.lease_epoch > attempt.lease_epoch
+                        AND newer_attempt.status = 'succeeded'
+                        AND newer_observed.parser_version = %s
+                        AND newer_observed.typed_parser_version = %s
+                        AND newer_observed.stateful_parser_version = %s
+                        AND newer_observed.status = 'succeeded'
+                        AND newer_observed.generic_status = 'succeeded'
+                        AND newer_observed.typed_status IN (
+                            'succeeded', 'skipped'
+                        )
+                        AND newer_observed.stateful_status IN (
+                            'succeeded', 'skipped'
+                        )
+                        AND newer_observed.validation_status = 'succeeded'
+                    )
+                  )
                 ORDER BY COALESCE(
                     attempt.finished_at, attempt.started_at
                 ), attempt.attempt_id
@@ -7101,6 +7179,12 @@ class ControlStore:
                     _text(source, "source"),
                     kinds,
                     kinds,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
                     parser,
                     typed_parser,
                     stateful_parser,
