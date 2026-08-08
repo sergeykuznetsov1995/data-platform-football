@@ -167,7 +167,11 @@ def _scope_evidence_from_row(
         ),
         catalog_fingerprint=str(row.get("catalog_fingerprint") or ""),
         authoritative_miss_count=int(row.get("authoritative_miss_count") or 0),
-        probe_attempt_count=int(row.get("probe_attempt_count") or 0),
+        probe_attempt_count=(
+            int(row["probe_attempt_count"])
+            if row.get("probe_attempt_count") is not None
+            else None
+        ),
         next_probe_at=_evidence_datetime(row.get("next_probe_at")),
         observed_at=observed_at,
     )

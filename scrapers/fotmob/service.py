@@ -282,7 +282,15 @@ def _next_profile_attempt(
         or previous.probe_status not in {ProbeStatus.PENDING, ProbeStatus.NOT_FOUND}
     ):
         return 1
-    return min(max(0, previous.probe_attempt_count) + 1, len(_PROFILE_BACKOFF))
+    if previous.probe_attempt_count is not None:
+        return min(max(0, previous.probe_attempt_count) + 1, len(_PROFILE_BACKOFF))
+    if previous.next_probe_at is None:
+        return 1
+    legacy_delay = previous.next_probe_at - previous.observed_at
+    for index, base in enumerate(_PROFILE_BACKOFF):
+        if base <= legacy_delay < base + timedelta(minutes=1):
+            return min(index + 2, len(_PROFILE_BACKOFF))
+    return 1
 
 
 def _event_year(value: Any, fallback: int) -> int:

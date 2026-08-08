@@ -88,8 +88,9 @@ class CatalogSnapshotWriter(RecordingWriter):
 
 
 class ScopeEvidenceTrino:
-    def __init__(self):
+    def __init__(self, probe_attempt_count=0):
         self.sql = []
+        self.probe_attempt_count = probe_attempt_count
 
     def table_exists(self, schema, table):
         return table == "fotmob_competition_scope_observations"
@@ -113,7 +114,7 @@ class ScopeEvidenceTrino:
                 "c" * 64,
                 "d" * 64,
                 0,
-                0,
+                self.probe_attempt_count,
                 None,
                 datetime(2026, 8, 8, 10),
             )
@@ -121,9 +122,9 @@ class ScopeEvidenceTrino:
 
 
 class ScopeEvidenceWriter(RecordingWriter):
-    def __init__(self):
+    def __init__(self, probe_attempt_count=0):
         super().__init__()
-        self.trino = ScopeEvidenceTrino()
+        self.trino = ScopeEvidenceTrino(probe_attempt_count)
 
     def _get_trino_manager(self):
         return self.trino
@@ -280,6 +281,14 @@ def test_iceberg_latest_scope_evidence_joins_only_committed_profile_manifests():
     assert "status IN ('success', 'not_modified')" in sql
     assert "m.batch_id = e._target_batch_id" in sql
     assert "PARTITION BY e.competition_id" in sql
+
+
+def test_latest_scope_evidence_preserves_legacy_null_probe_attempt_count():
+    repository = FotMobRepository(writer=ScopeEvidenceWriter(None))
+
+    latest = repository.latest_scope_evidence([47])
+
+    assert latest[47].probe_attempt_count is None
 
 
 def test_repository_writes_physical_rows_before_success_manifest():

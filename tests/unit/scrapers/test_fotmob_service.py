@@ -408,6 +408,78 @@ def test_successive_5xx_profiles_back_off_without_ever_becoming_dead(monkeypatch
     assert timedelta(hours=1) <= delay < timedelta(hours=1, minutes=1)
 
 
+@pytest.mark.parametrize("probe_status", [ProbeStatus.PENDING, ProbeStatus.NOT_FOUND])
+@pytest.mark.parametrize(
+    ("legacy_delay", "expected_attempt_count", "expected_delay"),
+    [
+        (timedelta(minutes=15, seconds=30), 2, timedelta(hours=1)),
+        (timedelta(hours=1, seconds=30), 3, timedelta(hours=6)),
+        (timedelta(hours=6, seconds=30), 4, timedelta(hours=24)),
+        (timedelta(hours=24, seconds=30), 4, timedelta(hours=24)),
+    ],
+)
+def test_legacy_null_probe_attempt_continues_recognizable_backoff_rung(
+    monkeypatch,
+    probe_status,
+    legacy_delay,
+    expected_attempt_count,
+    expected_delay,
+):
+    competition_id = 70009
+    all_leagues = {
+        "countries": [{"leagues": [{"id": competition_id, "name": "Senior Cup"}]}]
+    }
+    catalog_url = canonicalize_target("allLeagues").canonical_url
+    profile_url = canonicalize_target("leagues", {"id": competition_id}).canonical_url
+    service, _, repository = _service(
+        {
+            catalog_url: all_leagues,
+            profile_url: _failed_profile(
+                competition_id,
+                FetchOutcome.RETRYABLE_FAILURE,
+                503,
+            ),
+        }
+    )
+    service.discover_catalog()
+    prior = repository.latest_scope_evidence([competition_id])[competition_id]
+    legacy_row = repository.tables["fotmob_competition_scope_observations"][-1]
+    legacy_row["probe_attempt_count"] = None
+    legacy_row["probe_status"] = probe_status.value
+    legacy_row["authoritative_miss_count"] = (
+        1 if probe_status is ProbeStatus.NOT_FOUND else 0
+    )
+    legacy_row["next_probe_at"] = prior.observed_at + legacy_delay
+    monkeypatch.setattr(
+        "scrapers.fotmob.service.utc_now",
+        lambda: prior.observed_at + legacy_delay + timedelta(seconds=1),
+    )
+    second_service = FotMobIngestService(
+        transport=StubTransport(
+            {
+                catalog_url: all_leagues,
+                profile_url: _failed_profile(
+                    competition_id,
+                    FetchOutcome.RETRYABLE_FAILURE,
+                    503,
+                ),
+            }
+        ),
+        repository=repository,
+        budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+        run_id=(
+            f"legacy-{probe_status.value}-{expected_attempt_count}"
+        ),
+    )
+
+    second_service.discover_catalog()
+    evidence = repository.latest_scope_evidence([competition_id])[competition_id]
+
+    assert evidence.probe_attempt_count == expected_attempt_count
+    delay = evidence.next_probe_at - evidence.observed_at
+    assert expected_delay <= delay < expected_delay + timedelta(minutes=1)
+
+
 def test_two_authoritative_not_found_observations_become_dead_but_5xx_does_not(monkeypatch):
     competition_id = 70002
     all_leagues = {"countries": [{"leagues": [{"id": competition_id, "name": "Senior Cup"}]}]}
