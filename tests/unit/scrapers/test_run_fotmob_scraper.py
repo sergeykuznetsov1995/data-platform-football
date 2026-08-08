@@ -6,7 +6,7 @@ import importlib
 import json
 import sys
 from contextlib import contextmanager, nullcontext
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -370,6 +370,247 @@ class TestFotmobNativeRunner:
         assert rc == 1
         assert report["status"] == "incomplete"
         assert report["selection"]["scope_attempts"][0]["outcome"] == "terminal"
+
+    @pytest.mark.unit
+    def test_automatic_http_retry_remains_incomplete_and_nonzero(self):
+        from scrapers.fotmob.service import OperationResult
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+        }
+        service, _, _ = _service(responses)
+        service.sync_season = MagicMock(
+            return_value=(
+                OperationResult(
+                    "season_bundle",
+                    attempted=1,
+                    retryable=["HTTP 503 from FotMob"],
+                ),
+                None,
+            )
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 1
+        assert report["status"] == "incomplete"
+        assert report["complete"] is False
+        assert report["selection"]["scope_attempts"][0]["outcome"] == "retryable"
+
+    @pytest.mark.unit
+    def test_automatic_source_gap_requires_two_distinct_missing_match_runs(
+        self, monkeypatch
+    ):
+        from scrapers.fotmob import planner
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import StubTransport, _league_payload
+
+        mod = self._module()
+        missing_match = {"error": True, "message": "Data not found", "matchId": "100"}
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url: missing_match,
+        }
+        repository = MemoryFotMobRepository()
+
+        def make_service(run_id):
+            return FotMobIngestService(
+                transport=StubTransport(dict(responses)),
+                repository=repository,
+                mode=RunMode.DAILY,
+                budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+                run_id=run_id,
+                max_workers=2,
+            )
+
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season,matches",
+                "--run-id",
+                "missing-match-1",
+            ]
+        )
+        first_rc, first_report = _run_native_admitted(
+            mod, args, service=make_service("missing-match-1")
+        )
+
+        assert first_rc == 1
+        assert first_report["status"] == "incomplete"
+        assert first_report["selection"]["scope_attempts"][0]["outcome"] == "retryable"
+
+        real_datetime = datetime
+
+        class FutureDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = real_datetime.now(tz)
+                return value + timedelta(hours=1)
+
+        monkeypatch.setattr(planner, "datetime", FutureDatetime)
+        args.run_id = "missing-match-2"
+        second_rc, second_report = _run_native_admitted(
+            mod, args, service=make_service("missing-match-2")
+        )
+
+        assert second_rc == 0, second_report["errors"]
+        assert second_report["status"] == "success"
+        attempt = second_report["selection"]["scope_attempts"][0]
+        assert attempt["outcome"] == "source_gap"
+        assert attempt["attempt_count"] == 2
+        assert len(attempt["attempt_identities"]) == 2
+        assert len(set(attempt["attempt_identities"])) == 2
+
+    @pytest.mark.unit
+    def test_automatic_competition_budget_rotates_after_repeated_failed_attempts(self):
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _competition_payload,
+        )
+
+        mod = self._module()
+        payloads = {
+            competition_id: _competition_payload(
+                competition_id, f"Competition {competition_id}"
+            )
+            for competition_id in (47, 48, 49)
+        }
+        payloads[47]["allAvailableSeasons"] = "invalid"
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [
+                    {
+                        "leagues": [
+                            {"id": competition_id, "name": f"Competition {competition_id}"}
+                            for competition_id in (47, 48, 49)
+                        ]
+                    }
+                ]
+            },
+            **{
+                canonicalize_target("leagues", {"id": competition_id}).canonical_url: payload
+                for competition_id, payload in payloads.items()
+            },
+        }
+        repository = MemoryFotMobRepository()
+        attempted_prefixes = []
+
+        def run_once(index, max_requests):
+            service = FotMobIngestService(
+                transport=StubTransport(dict(responses)),
+                repository=repository,
+                mode=RunMode.DAILY,
+                budget=TransportBudget(
+                    max_requests=max_requests,
+                    max_direct_bytes=10_000_000,
+                ),
+                run_id=f"fair-{index}",
+                max_workers=3,
+            )
+            discover = service.discover_competitions
+
+            def capture(candidates, **kwargs):
+                attempted_prefixes.append(
+                    [item.competition.competition_id for item in candidates]
+                )
+                return discover(candidates, **kwargs)
+
+            service.discover_competitions = MagicMock(side_effect=capture)
+            args = mod._argument_parser().parse_args(
+                [
+                    "--mode",
+                    "refresh",
+                    "--catalog-contract",
+                    "fotmob-catalog-v1",
+                    "--entities",
+                    "season",
+                    "--run-id",
+                    f"fair-{index}",
+                ]
+            )
+            return _run_native_admitted(mod, args, service=service)
+
+        results = [run_once(1, 5), *(run_once(index, 2) for index in range(2, 6))]
+
+        assert attempted_prefixes == [[47], [48], [49], [47], [48]]
+        assert results[0][0] == 1  # malformed low-ID root is still a hard failure
+        assert repository.latest_entity_attempt("competition_seasons", 47)[
+            "status"
+        ] == "schema_drift"
+
+    @pytest.mark.unit
+    def test_automatic_transfer_completion_uses_catalog_contract_signature(self):
+        from scrapers.fotmob.catalog_contract import catalog_contract_from_dict
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target(
+                "transfers", {"leagueIds": "47", "page": 1, "last": "1year"}
+            ).canonical_url: {"hits": 0, "page": 1, "transfers": []},
+        }
+        service, _, repository = _service(responses)
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season,transfers",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0, report["errors"]
+        selection = report["selection"]
+        contract = catalog_contract_from_dict(selection["catalog_contract"])
+        assert contract.entities == ("season", "transfers")
+        assert contract.entity_policy["transfer_policy"] == {
+            "window": "1year",
+            "pagination": "unique_hits",
+            "completion_scope": "included_ids",
+            "completion_signature": "catalog_contract",
+        }
+        assert selection["transfer_plan_signature"] == contract.plan_signature
+        assert selection["completed_transfer_competition_ids"] == [47]
+        assert repository.completed_competition_ids(contract.plan_signature) == {47}
 
     @pytest.mark.unit
     def test_direct_cli_requires_exact_publication_and_matching_run_id(

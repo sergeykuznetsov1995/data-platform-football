@@ -20,7 +20,7 @@ import hashlib
 import json
 import logging
 from dataclasses import asdict, dataclass, field, is_dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Iterable, Mapping, Optional, Protocol, Sequence
 
@@ -2032,6 +2032,92 @@ class FotMobRepository:
         view = dict(zip(columns, rows[0]))
         return view if view.get("status") in SUCCESS_STATES else None
 
+    def latest_entity_attempt(
+        self,
+        target_type: str,
+        entity_id: str | int,
+        *,
+        run_id: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Return the newest scheduler attempt, including failure states."""
+
+        normalized_type = str(target_type)
+        normalized_id = str(entity_id)
+        normalized_run_id = str(run_id).strip() if run_id is not None else None
+        if run_id is not None and not normalized_run_id:
+            raise ValueError("run_id must not be empty")
+
+        pending = [
+            row
+            for row in self._pending_manifest
+            if row.get("parser_version") == PARSER_VERSION
+            and str(row.get("target_type")) == normalized_type
+            and str(row.get("entity_id")) == normalized_id
+            and (
+                normalized_run_id is None
+                or str(row.get("run_id") or "") == normalized_run_id
+            )
+        ]
+        pending_view = None
+        if pending:
+            newest = max(
+                pending,
+                key=lambda row: (
+                    _completed_at_key(row),
+                    str(row.get("batch_id") or ""),
+                ),
+            )
+            pending_view = {
+                column: newest.get(column) for column in self._READ_COLUMNS
+            }
+            pending_view["run_id"] = newest.get("run_id")
+
+        manager_getter = getattr(self.writer, "_get_trino_manager", None)
+        if manager_getter is None:
+            return pending_view
+        trino = manager_getter()
+        safe_type = normalized_type.replace("'", "''")
+        safe_id = normalized_id.replace("'", "''")
+        safe_version = PARSER_VERSION.replace("'", "''")
+        safe_statuses = ", ".join(
+            f"'{status.value}'" for status in ManifestStatus
+        )
+        run_filter = (
+            ""
+            if normalized_run_id is None
+            else "\n              AND run_id = '"
+            + normalized_run_id.replace("'", "''")
+            + "'"
+        )
+        columns = ", ".join(self._READ_COLUMNS)
+        rows = trino.execute_query(
+            f"""
+            SELECT {columns}
+            FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+            WHERE target_type = '{safe_type}'
+              AND entity_id = '{safe_id}'
+              AND parser_version = '{safe_version}'
+              AND status IN ({safe_statuses})
+              {run_filter}
+            ORDER BY completed_at DESC, batch_id DESC
+            LIMIT 1
+            """
+        )
+        durable_view = (
+            dict(zip(self._READ_COLUMNS, rows[0])) if rows else None
+        )
+        if pending_view is None:
+            return durable_view
+        if durable_view is None:
+            return pending_view
+        return max(
+            (pending_view, durable_view),
+            key=lambda view: (
+                _completed_at_key(view),
+                str(view.get("batch_id") or ""),
+            ),
+        )
+
     def latest_entity_raw_target(
         self, target_type: str, entity_id: str | int
     ) -> Optional[dict[str, Any]]:
@@ -2621,6 +2707,42 @@ class MemoryFotMobRepository:
                     else None
                 )
         return None
+
+    def latest_entity_attempt(
+        self,
+        target_type: str,
+        entity_id: str | int,
+        *,
+        run_id: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        normalized_run_id = str(run_id).strip() if run_id is not None else None
+        if run_id is not None and not normalized_run_id:
+            raise ValueError("run_id must not be empty")
+        candidates = [
+            (index, commit)
+            for index, commit in enumerate(self.commits)
+            if commit.target_type == str(target_type)
+            and commit.entity_id == str(entity_id)
+            and commit.parser_version == PARSER_VERSION
+            and (
+                normalized_run_id is None or commit.run_id == normalized_run_id
+            )
+        ]
+        if not candidates:
+            return None
+        latest_index, latest = max(
+            candidates,
+            key=lambda indexed: (
+                str(indexed[1].completed_at or ""),
+                indexed[0],
+            ),
+        )
+        view = latest.manifest_row()
+        if latest.completed_at is None:
+            view["completed_at"] = datetime.min + timedelta(
+                microseconds=latest_index + 1
+            )
+        return view
 
     def latest_entity_raw_target(
         self, target_type: str, entity_id: str | int

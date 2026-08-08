@@ -791,26 +791,6 @@ def validate_data(
 
             acceptance = validate_report(result)
             acceptance_errors = list(acceptance.errors)
-            if result.get("status") == "partial_success" and (
-                isinstance(selection, dict)
-                and selection.get("scope_lane") == "current"
-            ):
-                acceptance_errors = [
-                    error
-                    for error in acceptance_errors
-                    if not (
-                        error.startswith(
-                            "every current contract scope must have terminal"
-                        )
-                        or (
-                            error.startswith("current scope ")
-                            and (
-                                " is not terminal" in error
-                                or "older than 72 hours" in error
-                            )
-                        )
-                    )
-                ]
             if acceptance_errors:
                 violations.append(
                     "automatic catalog evidence failed: "

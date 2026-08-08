@@ -401,6 +401,122 @@ class TestDynamicDiscoveryDag:
 
 class TestNativeValidation:
     @pytest.mark.unit
+    def test_automatic_catalog_uses_real_acceptance_gate(self, tmp_path):
+        import json
+        from datetime import datetime, timezone
+
+        from airflow.exceptions import AirflowException
+        from scrapers.fotmob.catalog_contract import build_catalog_contract
+
+        mod = _reload_dag_module()
+        now = datetime.now(timezone.utc)
+        contract = build_catalog_contract(
+            catalog_batch_id="catalog-batch",
+            catalog_content_hash="a" * 64,
+            classifier_version="fotmob-men-v1",
+            parser_version="fotmob-native-v2",
+            entities=["season"],
+            entity_policy={},
+            included_ids=[47],
+            scopes=[(47, "2025/2026")],
+        ).as_dict()
+        payload = {
+            "run_id": "automatic-run",
+            "mode": "refresh",
+            "status": "success",
+            "complete": True,
+            "operations": [
+                {
+                    "entity": "competition_catalog",
+                    "status": "success",
+                    "errors": [],
+                    "retryable": [],
+                    "terminal": [],
+                    "counts": {"competitions": 2},
+                }
+            ],
+            "transport": {"attempts": 1, "direct_bytes": 1, "proxy_bytes": 0},
+            "budget": {
+                "requests": 1,
+                "max_requests": 2,
+                "direct_bytes": 1,
+                "max_direct_bytes": 2,
+                "proxy_bytes": 0,
+                "max_proxy_bytes": 0,
+            },
+            "errors": [],
+            "selection": {
+                "entities": ["season"],
+                "explicit_scopes": [],
+                "competition_limit": 0,
+                "season_limit": 0,
+                "scope_lane": "current",
+                "scope_plan_signature": contract["plan_signature"],
+                "catalog_contract": contract,
+                "catalog_ids": [47, 88],
+                "catalog_decisions": [
+                    {
+                        "competition_id": 47,
+                        "catalog_name": "Premier League",
+                        "profile_name": "Premier League",
+                        "source_gender": "male",
+                        "source_age_group": "adult",
+                        "source_type": "league",
+                        "probe_status": "success",
+                        "decision": "included",
+                        "reason": "structurally confirmed adult men's competition",
+                        "policy_rule": "include_structural_male_adult",
+                        "classifier_version": "fotmob-men-v1",
+                        "profile_target_key": "leagues?id=47",
+                        "profile_content_hash": "b" * 64,
+                    },
+                    {
+                        "competition_id": 88,
+                        "catalog_name": "Women's League",
+                        "profile_name": "Women's League",
+                        "source_gender": "female",
+                        "source_age_group": "adult",
+                        "source_type": "league",
+                        "probe_status": "success",
+                        "decision": "excluded",
+                        "reason": "women/female competition",
+                        "policy_rule": "exclude_female",
+                        "classifier_version": "fotmob-men-v1",
+                        "profile_target_key": "leagues?id=88",
+                        "profile_content_hash": "c" * 64,
+                    },
+                ],
+                "planned_scopes": ["47=2025/2026"],
+                "completed_scopes": ["47=2025/2026"],
+                "scope_attempts": [
+                    {
+                        "competition_id": 47,
+                        "source_season_key": "2025/2026",
+                        "plan_signature": contract["plan_signature"],
+                        "attempt_count": 1,
+                        "last_attempt_at": now.isoformat(),
+                        "next_retry_at": None,
+                        "outcome": "success",
+                        "reason": "scope completion committed",
+                        "attempt_identities": ["automatic-run:47=2025/2026"],
+                    }
+                ],
+                "completed_transfer_competition_ids": [],
+                "transfer_plan_signature": None,
+                "deferrals": [],
+            },
+        }
+        report = tmp_path / "automatic.json"
+        report.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert mod.validate_data(str(report))["status"] == "success"
+
+        payload["selection"]["scope_plan_signature"] = "fmplan1-" + "0" * 64
+        report.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(AirflowException, match="automatic catalog evidence failed"):
+            mod.validate_data(str(report))
+
+    @pytest.mark.unit
     def test_source_refresh_accepts_exact_seven_terminal_targets_without_catalog(
         self, tmp_path
     ):

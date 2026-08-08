@@ -37,10 +37,20 @@ def _canonical_scopes(
 ) -> tuple[str, ...]:
     parsed: list[tuple[int, str]] = []
     for value in values:
-        scope = parse_scope_token(value) if isinstance(value, str) else tuple(value)
-        if len(scope) != 2:
+        if isinstance(value, str):
+            scope = parse_scope_token(value)
+        elif isinstance(value, (tuple, list)) and len(value) == 2:
+            competition_id, source_season_key = value
+            if type(competition_id) is not int or type(source_season_key) is not str:
+                raise ValueError(
+                    "scope competition ID must be an integer and season must be a string"
+                )
+            scope = parse_scope_token(
+                format_scope_token(competition_id, source_season_key)
+            )
+        else:
             raise ValueError("scope must contain competition ID and exact season")
-        parsed.append((int(scope[0]), str(scope[1])))
+        parsed.append(scope)
     if len(parsed) != len(set(parsed)):
         raise ValueError("scopes contain a duplicate")
     return tuple(format_scope_token(*scope) for scope in sorted(parsed))

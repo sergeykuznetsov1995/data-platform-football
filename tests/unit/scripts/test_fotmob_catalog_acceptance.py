@@ -24,7 +24,12 @@ def _contract_dict(value: Any) -> dict[str, Any]:
     return dict(value)
 
 
-def _contract(*, scopes=((47, "2025/2026"),)) -> dict[str, Any]:
+def _contract(
+    *,
+    scopes=((47, "2025/2026"),),
+    entities=("season",),
+    entity_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return _contract_dict(
         build_catalog_contract(
             catalog_batch_id="catalog-batch-1",
@@ -32,6 +37,8 @@ def _contract(*, scopes=((47, "2025/2026"),)) -> dict[str, Any]:
             classifier_version="fotmob-men-v1",
             included_ids=[47],
             scopes=scopes,
+            entities=entities,
+            entity_policy=entity_policy or {},
         )
     )
 
@@ -101,15 +108,21 @@ def _report(*, lane: str = "current") -> dict[str, Any]:
         "run_id": "run-1",
         "mode": "refresh" if lane == "current" else "backfill",
         "status": "success",
+        "complete": True,
         "completed_at": NOW.isoformat(),
         "budget": {"proxy_bytes": 0},
         "selection": {
             "scope_lane": lane,
             "catalog_contract": contract,
+            "entities": ["season"],
             "catalog_ids": [47, 88],
             "catalog_decisions": [_included_decision(), _excluded_decision()],
+            "scope_plan_signature": contract["plan_signature"],
             "planned_scopes": ["47=2025/2026"],
             "scope_attempts": [_attempt(contract)],
+            "completed_transfer_competition_ids": [],
+            "transfer_plan_signature": None,
+            "deferrals": [],
         },
     }
 
@@ -194,8 +207,11 @@ def test_validate_report_requires_successful_structural_male_evidence(
     [
         ("catalog_name", "Super Women's Cup"),
         ("profile_name", "National U-19 League"),
+        ("profile_name", "Premier League U‑19"),
         ("profile_name", "Premier League Reserves"),
+        ("profile_name", "Premier League Ｒｅｓｅｒｖｅｓ"),
         ("source_type", "exhibition"),
+        ("profile_name", "Legends—Show"),
     ],
 )
 def test_validate_report_rejects_planned_female_youth_reserve_or_show_evidence(
@@ -230,10 +246,11 @@ def test_validate_report_requires_current_terminal_evidence_within_72_hours() ->
     assert any("older than 72 hours" in error for error in errors)
 
 
-def test_validate_report_accepts_explicit_history_retry_evidence() -> None:
+def test_validate_report_rejects_generic_history_retry_as_incomplete() -> None:
     report = _report(lane="history")
     contract = report["selection"]["catalog_contract"]
     report["status"] = "partial_success"
+    report["complete"] = False
     report["selection"]["scope_attempts"] = [
         _attempt(
             contract,
@@ -241,6 +258,42 @@ def test_validate_report_accepts_explicit_history_retry_evidence() -> None:
             reason="upstream returned 503",
             next_retry_at=NOW + timedelta(hours=1),
         )
+    ]
+
+    errors = _errors(report)
+
+    assert any("retryable scope" in error for error in errors)
+    assert any("budget or deadline deferral" in error for error in errors)
+
+
+@pytest.mark.parametrize("kind", ["budget", "deadline"])
+def test_validate_report_accepts_only_explicit_authorized_partial_deferral(
+    kind: str,
+) -> None:
+    report = _report(lane="history")
+    contract = report["selection"]["catalog_contract"]
+    reason = (
+        "request budget deferred scope"
+        if kind == "budget"
+        else "run deadline deferred scope"
+    )
+    report["status"] = "partial_success"
+    report["complete"] = False
+    report["selection"]["scope_attempts"] = [
+        _attempt(
+            contract,
+            outcome="deferred",
+            reason=reason,
+            next_retry_at=NOW + timedelta(minutes=1),
+        )
+    ]
+    report["selection"]["deferrals"] = [
+        {
+            "kind": kind,
+            "target_type": "scope",
+            "targets": ["47=2025/2026"],
+            "reason": reason,
+        }
     ]
 
     assert acceptance.validate_report(report, now=NOW).ok is True
@@ -293,6 +346,7 @@ def test_validate_report_rejects_terminal_schema_or_commit_failure() -> None:
     report = _report()
     contract = report["selection"]["catalog_contract"]
     report["status"] = "partial_success"
+    report["complete"] = False
     report["selection"]["scope_attempts"] = [
         _attempt(contract, outcome="terminal", reason="schema drift")
     ]
@@ -316,6 +370,73 @@ def test_validate_report_rejects_scope_attempt_bound_to_another_plan() -> None:
     errors = _errors(report)
 
     assert any("plan signature" in error for error in errors)
+
+
+def test_validate_report_rejects_selection_signature_different_from_contract() -> None:
+    report = _report()
+    report["selection"]["scope_plan_signature"] = "fmplan1-other"
+
+    errors = _errors(report)
+
+    assert any("selection.scope_plan_signature" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("status", "complete"),
+    [
+        ("success", False),
+        ("partial_success", True),
+        ("partial_success", False),
+    ],
+)
+def test_validate_report_enforces_status_complete_and_partial_evidence_shape(
+    status: str, complete: bool
+) -> None:
+    report = _report()
+    report["status"] = status
+    report["complete"] = complete
+
+    errors = _errors(report)
+
+    assert any(
+        "status/complete" in error or "budget or deadline deferral" in error
+        for error in errors
+    )
+
+
+def test_validate_report_binds_transfer_completion_to_catalog_contract() -> None:
+    report = _report()
+    transfer_policy = {
+        "window": "1year",
+        "pagination": "unique_hits",
+        "completion_scope": "included_ids",
+        "completion_signature": "catalog_contract",
+    }
+    contract = _contract(
+        entities=("season", "transfers"),
+        entity_policy={"transfer_policy": transfer_policy},
+    )
+    report["selection"].update(
+        {
+            "catalog_contract": contract,
+            "entities": ["season", "transfers"],
+            "scope_plan_signature": contract["plan_signature"],
+            "scope_attempts": [_attempt(contract)],
+            "completed_transfer_competition_ids": [47],
+            "transfer_plan_signature": contract["plan_signature"],
+        }
+    )
+
+    assert acceptance.validate_report(report, now=NOW).ok is True
+
+    report["selection"]["completed_transfer_competition_ids"] = []
+    errors = _errors(report)
+    assert any("transfer completion" in error for error in errors)
+
+    report["selection"]["completed_transfer_competition_ids"] = [47]
+    report["selection"]["transfer_plan_signature"] = "fmplan1-separate"
+    errors = _errors(report)
+    assert any("transfer plan signature" in error for error in errors)
 
 
 @pytest.mark.parametrize(

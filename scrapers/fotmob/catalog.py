@@ -115,6 +115,26 @@ def _classifier_text(value: Any) -> str:
     ).strip()
 
 
+def forbidden_competition_signal(*values: Any) -> Optional[str]:
+    """Return the first conservative non-adult-men text signal.
+
+    This is the shared policy boundary for classification and independent
+    acceptance.  Keeping Unicode normalization here prevents the report gate
+    from accepting spellings that the runtime classifier excludes.
+    """
+
+    text = _classifier_text(" ".join(str(value or "") for value in values))
+    for label, pattern in (
+        ("female", _FEMALE_RE),
+        ("youth", _YOUTH_RE),
+        ("reserve", _RESERVE_RE),
+        ("show", _SHOW_RE),
+    ):
+        if pattern.search(text):
+            return label
+    return None
+
+
 def _structural_conflict_fields(
     catalog_ref: CompetitionRef, profile_ref: CompetitionRef
 ) -> tuple[str, ...]:
@@ -367,19 +387,20 @@ def classify_competition(
         if part
     ))
     gender = _classifier_text(profile_ref.gender)
-    if gender in _FEMALE_GENDERS or _FEMALE_RE.search(text):
+    forbidden_signal = forbidden_competition_signal(text)
+    if gender in _FEMALE_GENDERS or forbidden_signal == "female":
         return ScopeClassification(
             profile_ref, ScopeDecision.EXCLUDED, "women/female competition", "exclude_female"
         )
-    if _YOUTH_RE.search(text):
+    if forbidden_signal == "youth":
         return ScopeClassification(
             profile_ref, ScopeDecision.EXCLUDED, "youth competition", "exclude_youth"
         )
-    if _RESERVE_RE.search(text):
+    if forbidden_signal == "reserve":
         return ScopeClassification(
             profile_ref, ScopeDecision.EXCLUDED, "reserve/development competition", "exclude_reserve"
         )
-    if _SHOW_RE.search(text):
+    if forbidden_signal == "show":
         return ScopeClassification(
             profile_ref,
             ScopeDecision.EXCLUDED,
@@ -564,6 +585,7 @@ __all__ = [
     "classify_competition",
     "competition_from_league_payload",
     "discover_competitions",
+    "forbidden_competition_signal",
     "parse_seasons",
     "validate_selected_season",
 ]

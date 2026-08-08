@@ -22,6 +22,7 @@ from scrapers.fotmob.catalog_contract import (
     CatalogContract,
     catalog_contract_from_dict,
 )
+from scrapers.fotmob.catalog import forbidden_competition_signal
 from scrapers.fotmob.scope_codec import format_scope_token, parse_scope_token
 
 
@@ -37,26 +38,6 @@ _KNOWN_TYPES = frozenset(
 _TERMINAL_SCOPE_OUTCOMES = frozenset({"success", "source_gap"})
 _KNOWN_SCOPE_OUTCOMES = _TERMINAL_SCOPE_OUTCOMES | frozenset(
     {"retryable", "deferred", "terminal"}
-)
-_FEMALE_RE = re.compile(
-    r"(?:\bwomen(?:'s)?\b|\bwoman\b|\bfemale\b|\bfeminine\b|"
-    r"\bfemenin[oa]\b|\bfrauen\b|\bdamer\b|\bdonne\b|\bladies\b)",
-    re.IGNORECASE,
-)
-_YOUTH_RE = re.compile(
-    r"(?:\bu\s*-?\s*\d+\b|\bunder\s*-?\s*\d+\b|\byouth\b|"
-    r"\bacademy\b|\bjunior(?:s)?\b|\bjuvenil\b|\bprimavera\b)",
-    re.IGNORECASE,
-)
-_RESERVE_RE = re.compile(
-    r"(?:\breserve(?:s)?\b|\bdevelopment\b|\bsecond teams?\b|"
-    r"\bii teams?\b|\bpremier league 2(?:\s+div(?:ision)?\s+\d+)?\b)",
-    re.IGNORECASE,
-)
-_SHOW_RE = re.compile(
-    r"(?:\bcharit(?:y|ies)\b|\btestimonials?\b|\bexhibitions?\b|"
-    r"\bshows?\b|\blegends?\b)",
-    re.IGNORECASE,
 )
 
 
@@ -201,26 +182,19 @@ def _has_structural_male_evidence(
 
 
 def _forbidden_signal(decision: Mapping[str, Any]) -> str | None:
-    text = " ".join(
-        str(decision.get(field) or "")
-        for field in (
-            "catalog_name",
-            "profile_name",
-            "source_gender",
-            "source_age_group",
-            "source_type",
-            "reason",
+    return forbidden_competition_signal(
+        *(
+            decision.get(field)
+            for field in (
+                "catalog_name",
+                "profile_name",
+                "source_gender",
+                "source_age_group",
+                "source_type",
+                "reason",
+            )
         )
     )
-    for label, pattern in (
-        ("female", _FEMALE_RE),
-        ("youth", _YOUTH_RE),
-        ("reserve", _RESERVE_RE),
-        ("show", _SHOW_RE),
-    ):
-        if pattern.search(text):
-            return label
-    return None
 
 
 def _planned_scopes(
@@ -257,21 +231,100 @@ def _planned_scopes(
     return tuple(parsed)
 
 
+def _deferrals(
+    value: Any,
+    *,
+    contract_scopes: set[str],
+    included_ids: set[int],
+    errors: list[str],
+) -> dict[str, dict[Any, Mapping[str, Any]]]:
+    authorized: dict[str, dict[Any, Mapping[str, Any]]] = {
+        "scope": {},
+        "competition_discovery": {},
+        "transfer": {},
+    }
+    if not isinstance(value, list):
+        errors.append("selection.deferrals must be an array")
+        return authorized
+    for index, raw in enumerate(value):
+        deferral = _mapping(raw)
+        if deferral is None:
+            errors.append(f"deferral #{index} must be an object")
+            continue
+        if set(deferral) != {"kind", "target_type", "targets", "reason"}:
+            errors.append(f"deferral #{index} has an invalid evidence shape")
+            continue
+        kind = deferral.get("kind")
+        target_type = deferral.get("target_type")
+        reason = _nonempty_string(deferral.get("reason"))
+        targets = deferral.get("targets")
+        if kind not in {"budget", "deadline"}:
+            errors.append(f"deferral #{index} must identify budget or deadline")
+            continue
+        if target_type not in authorized:
+            errors.append(f"deferral #{index} has unknown target_type {target_type!r}")
+            continue
+        if reason is None or kind not in reason.casefold():
+            errors.append(
+                f"deferral #{index} reason must explicitly identify its {kind} cause"
+            )
+        if not isinstance(targets, list) or not targets:
+            errors.append(f"deferral #{index} targets must be a non-empty array")
+            continue
+        parsed_targets: list[Any] = []
+        for raw_target in targets:
+            if target_type == "scope":
+                try:
+                    target = format_scope_token(*parse_scope_token(raw_target))
+                except (TypeError, ValueError) as exc:
+                    errors.append(f"deferral #{index} has invalid scope target: {exc}")
+                    continue
+                if target not in contract_scopes:
+                    errors.append(
+                        f"deferral #{index} scope {target!r} is outside the contract"
+                    )
+                    continue
+            else:
+                if type(raw_target) is not int or raw_target <= 0:
+                    errors.append(
+                        f"deferral #{index} competition targets must be positive integers"
+                    )
+                    continue
+                target = raw_target
+                if target not in included_ids:
+                    errors.append(
+                        f"deferral #{index} competition {target} is outside included IDs"
+                    )
+                    continue
+            parsed_targets.append(target)
+        if len(parsed_targets) != len(set(parsed_targets)):
+            errors.append(f"deferral #{index} contains duplicate targets")
+        for target in parsed_targets:
+            if target in authorized[target_type]:
+                errors.append(
+                    f"deferral target {target!r} has duplicate {target_type} evidence"
+                )
+            else:
+                authorized[target_type][target] = deferral
+    return authorized
+
+
 def _scope_attempts(
     value: Any,
     *,
     contract_scopes: set[str],
     plan_signature: str | None,
     planned_scopes: set[str],
+    authorized_deferrals: Mapping[str, Mapping[str, Any]],
     lane: str | None,
     now: datetime,
     errors: list[str],
-) -> dict[str, Mapping[str, Any]]:
+) -> tuple[dict[str, Mapping[str, Any]], bool]:
     if not isinstance(value, list):
         errors.append("selection.scope_attempts must be an array")
-        return {}
+        return {}, False
     by_scope: dict[str, Mapping[str, Any]] = {}
-    soft_outcomes = False
+    retryable_outcomes = False
     for index, raw in enumerate(value):
         attempt = _mapping(raw)
         if attempt is None:
@@ -309,9 +362,8 @@ def _scope_attempts(
             errors.append(f"scope attempt {token!r} has unknown outcome {outcome!r}")
             continue
         reason = _nonempty_string(attempt.get("reason"))
-        if outcome in {"retryable", "deferred"}:
-            soft_outcomes = True
         if outcome == "retryable":
+            retryable_outcomes = True
             next_retry_at = _parse_timestamp(
                 attempt.get("next_retry_at"),
                 field=f"retryable scope {token!r} next_retry_at",
@@ -319,6 +371,9 @@ def _scope_attempts(
             )
             if reason is None:
                 errors.append(f"retryable scope {token!r} must record an explicit reason")
+            errors.append(
+                f"retryable scope {token!r} is incomplete and cannot be accepted"
+            )
             if (
                 next_retry_at is not None
                 and last_attempt_at is not None
@@ -349,8 +404,31 @@ def _scope_attempts(
             errors.append(f"terminal scope {token!r} is a hard failure")
             if reason is None:
                 errors.append(f"terminal scope {token!r} must record an explicit reason")
-        elif outcome == "deferred" and reason is None:
-            errors.append(f"{outcome} scope {token!r} must record an explicit reason")
+        elif outcome == "deferred":
+            next_retry_at = _parse_timestamp(
+                attempt.get("next_retry_at"),
+                field=f"deferred scope {token!r} next_retry_at",
+                errors=errors,
+            )
+            if reason is None:
+                errors.append(f"deferred scope {token!r} must record an explicit reason")
+            evidence = authorized_deferrals.get(token)
+            if evidence is None:
+                errors.append(
+                    f"deferred scope {token!r} lacks explicit budget/deadline evidence"
+                )
+            elif reason != evidence.get("reason"):
+                errors.append(
+                    f"deferred scope {token!r} reason differs from deferral evidence"
+                )
+            if (
+                next_retry_at is not None
+                and last_attempt_at is not None
+                and next_retry_at <= last_attempt_at
+            ):
+                errors.append(
+                    f"deferred scope {token!r} next_retry_at must follow its attempt"
+                )
 
     missing_planned = sorted(planned_scopes.difference(by_scope))
     if missing_planned:
@@ -368,7 +446,10 @@ def _scope_attempts(
             )
         for token in sorted(contract_scopes.intersection(by_scope)):
             attempt = by_scope[token]
-            if attempt.get("outcome") not in _TERMINAL_SCOPE_OUTCOMES:
+            outcome = attempt.get("outcome")
+            if outcome == "deferred" and token in authorized_deferrals:
+                continue
+            if outcome not in _TERMINAL_SCOPE_OUTCOMES:
                 errors.append(f"current scope {token!r} is not terminal")
                 continue
             last_attempt_at = _parse_timestamp(
@@ -379,11 +460,108 @@ def _scope_attempts(
             if last_attempt_at is not None and now - last_attempt_at > CURRENT_COMPLETION_MAX_AGE:
                 errors.append(f"current scope {token!r} completion is older than 72 hours")
 
-    # ``soft_outcomes`` is returned through a reserved sentinel so the caller
-    # can verify the report-level status without widening this public helper.
-    if soft_outcomes:
-        by_scope["\0soft"] = {}
-    return by_scope
+    return by_scope, retryable_outcomes
+
+
+def _transfer_completion(
+    selection: Mapping[str, Any],
+    *,
+    contract: CatalogContract | None,
+    included_ids: set[int],
+    lane: str | None,
+    status: Any,
+    transfer_deferrals: Mapping[int, Mapping[str, Any]],
+    errors: list[str],
+) -> None:
+    raw_completed = selection.get("completed_transfer_competition_ids")
+    if not isinstance(raw_completed, list):
+        errors.append(
+            "selection.completed_transfer_competition_ids must be an array"
+        )
+        completed: list[int] = []
+    else:
+        completed = raw_completed
+        if not all(type(value) is int and value > 0 for value in completed):
+            errors.append(
+                "transfer completion IDs must contain only positive integers"
+            )
+            completed = [
+                value for value in completed if type(value) is int and value > 0
+            ]
+        if completed != sorted(set(completed)):
+            errors.append("transfer completion IDs must be unique and sorted")
+
+    contract_entities = set(contract.entities if contract is not None else ())
+    transfer_policy = (
+        contract.entity_policy.get("transfer_policy")
+        if contract is not None
+        else None
+    )
+    transfer_signature = selection.get("transfer_plan_signature")
+    if "transfers" not in contract_entities:
+        if completed:
+            errors.append("transfer completion evidence exists outside entity policy")
+        if transfer_signature is not None:
+            errors.append("transfer plan signature must be null when transfers are absent")
+        if transfer_policy is not None:
+            errors.append("transfer policy exists while transfers are absent")
+        if transfer_deferrals:
+            errors.append("transfer deferrals exist while transfers are absent")
+        return
+
+    expected_policy = {
+        "window": "1year" if lane == "current" else "all",
+        "pagination": "unique_hits",
+        "completion_scope": "included_ids",
+        "completion_signature": "catalog_contract",
+    }
+    if transfer_policy != expected_policy:
+        errors.append("catalog transfer completion policy is not exact")
+    if contract is not None and transfer_signature != contract.plan_signature:
+        errors.append("selection transfer plan signature differs from catalog contract")
+    completed_set = set(completed)
+    outside = sorted(completed_set - included_ids)
+    if outside:
+        errors.append(f"transfer completion IDs are outside included IDs: {outside}")
+    missing = included_ids - completed_set
+    if status == "success" and missing:
+        errors.append(
+            "transfer completion evidence is incomplete for included IDs: "
+            + ", ".join(map(str, sorted(missing)))
+        )
+    if status == "partial_success":
+        unexplained = missing - set(transfer_deferrals)
+        if unexplained:
+            errors.append(
+                "missing transfer completion lacks budget/deadline deferral: "
+                + ", ".join(map(str, sorted(unexplained)))
+            )
+
+
+def _validate_operation_retry_evidence(
+    value: Any, *, errors: list[str]
+) -> None:
+    if not isinstance(value, list):
+        errors.append("runner report operations must be an array")
+        return
+    for index, raw in enumerate(value):
+        operation = _mapping(raw)
+        if operation is None:
+            errors.append(f"operation #{index} must be an object")
+            continue
+        retryable = operation.get("retryable") or []
+        if not isinstance(retryable, list):
+            errors.append(f"operation #{index} retryable evidence must be an array")
+            continue
+        for reason in retryable:
+            text = str(reason).casefold()
+            if not (
+                ("budget" in text and ("request" in text or "byte" in text))
+                or "deadline" in text
+            ):
+                errors.append(
+                    f"operation #{index} has non-deferral retryable failure: {reason}"
+                )
 
 
 def validate_report(
@@ -409,6 +587,12 @@ def validate_report(
     status = report.get("status")
     if status not in {"success", "partial_success"}:
         errors.append("automatic report status must be success or partial_success")
+    complete = report.get("complete")
+    if not (
+        (status == "success" and complete is True)
+        or (status == "partial_success" and complete is False)
+    ):
+        errors.append("automatic report status/complete evidence is inconsistent")
 
     selection = _mapping(report.get("selection"))
     if selection is None:
@@ -446,6 +630,20 @@ def validate_report(
     )
     if classifier_version != CLASSIFIER_VERSION:
         errors.append(f"automatic acceptance requires classifier {CLASSIFIER_VERSION}")
+    selection_signature = _nonempty_string(selection.get("scope_plan_signature"))
+    if plan_signature is not None and selection_signature != plan_signature:
+        errors.append(
+            "selection.scope_plan_signature differs from recomputed catalog contract"
+        )
+    raw_entities = selection.get("entities")
+    if (
+        not isinstance(raw_entities, list)
+        or not all(isinstance(value, str) and value for value in raw_entities)
+        or raw_entities != sorted(set(raw_entities))
+    ):
+        errors.append("selection.entities must be canonical sorted strings")
+    elif contract is not None and tuple(raw_entities) != contract.entities:
+        errors.append("selection.entities differ from catalog contract entities")
 
     ids = _catalog_ids(selection.get("catalog_ids"), errors)
     decisions, decision_by_id = _decision_ids(
@@ -475,17 +673,42 @@ def validate_report(
         decision_by_id=decision_by_id,
         errors=errors,
     )
-    attempts = _scope_attempts(
+    deferrals = _deferrals(
+        selection.get("deferrals"),
+        contract_scopes=contract_scopes,
+        included_ids=included_ids,
+        errors=errors,
+    )
+    attempts, retryable_attempts = _scope_attempts(
         selection.get("scope_attempts"),
         contract_scopes=contract_scopes,
         plan_signature=plan_signature,
         planned_scopes=set(planned),
+        authorized_deferrals=deferrals["scope"],
         lane=lane,
         now=checked_at,
         errors=errors,
     )
-    if "\0soft" in attempts and status != "partial_success":
-        errors.append("retryable or deferred scopes require partial_success status")
+    deferral_count = sum(len(values) for values in deferrals.values())
+    if status == "partial_success" and deferral_count == 0:
+        errors.append(
+            "partial_success requires explicit budget or deadline deferral evidence"
+        )
+    if status == "success" and deferral_count:
+        errors.append("success cannot contain budget or deadline deferrals")
+    if retryable_attempts:
+        errors.append("retryable scope evidence requires incomplete report status")
+
+    _transfer_completion(
+        selection,
+        contract=contract,
+        included_ids=included_ids,
+        lane=lane,
+        status=status,
+        transfer_deferrals=deferrals["transfer"],
+        errors=errors,
+    )
+    _validate_operation_retry_evidence(report.get("operations", []), errors=errors)
 
     budget = _mapping(report.get("budget"))
     if budget is None or type(budget.get("proxy_bytes")) is not int:

@@ -651,6 +651,24 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     automatic_lane = None
     catalog_ids_evidence: list[int] = []
     catalog_decisions_evidence: list[dict[str, Any]] = []
+    automatic_deferrals: list[dict[str, Any]] = []
+
+    def add_automatic_deferral(
+        *, kind: str, target_type: str, targets: Iterable[Any], reason: str
+    ) -> None:
+        if not automatic_catalog:
+            return
+        normalized_targets = list(targets)
+        if not normalized_targets:
+            return
+        automatic_deferrals.append(
+            {
+                "kind": kind,
+                "target_type": target_type,
+                "targets": normalized_targets,
+                "reason": reason,
+            }
+        )
 
     def finish() -> tuple[int, dict[str, Any]]:
         # Buffered commits are only durable once flushed. Every exit path of
@@ -846,15 +864,15 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     ]
     if automatic_catalog:
         discovery_times: dict[int, datetime] = {}
-        latest_entity_success = getattr(
-            service.repository, "latest_entity_success", None
+        latest_entity_attempt = getattr(
+            service.repository, "latest_entity_attempt", None
         )
         for item in candidates:
             previous = (
-                latest_entity_success(
+                latest_entity_attempt(
                     "competition_seasons", item.competition.competition_id
                 )
-                if latest_entity_success is not None
+                if latest_entity_attempt is not None
                 else None
             )
             raw_completed_at = previous.get("completed_at") if previous else None
@@ -893,6 +911,12 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         discovery_plan.metadata["deferred_competition_ids"] = [
             item.competition.competition_id for item in deferred
         ]
+        add_automatic_deferral(
+            kind="budget",
+            target_type="competition_discovery",
+            targets=discovery_plan.metadata["deferred_competition_ids"],
+            reason="configured competition budget deferred discovery",
+        )
     discovery_plan.counts["planned_competitions"] = len(candidates)
     operations.append(discovery_plan)
 
@@ -910,6 +934,12 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         discovery_plan.metadata["budget_deferred_competition_ids"] = [
             item.competition.competition_id for item in budget_deferred
         ]
+        add_automatic_deferral(
+            kind="budget",
+            target_type="competition_discovery",
+            targets=discovery_plan.metadata["budget_deferred_competition_ids"],
+            reason="request budget deferred competition discovery",
+        )
     candidate_profile_payloads = {
         item.competition.competition_id: catalog.profile_payloads[
             item.competition.competition_id
@@ -954,12 +984,21 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
 
     mode = RunMode("daily" if args.mode == "refresh" else args.mode)
     scope_entities = frozenset({"season", *(entities - {"transfers"})})
+    contract_entities = frozenset({*scope_entities, *(entities & {"transfers"})})
+    transfer_window = "1year" if mode == RunMode.DAILY else "all"
     scope_policy = {
         "match_policy": "finished_only",
         "leaderboard_policy": "all_advertised",
         "team_policy": "global_observed_snapshot",
         "player_policy": "global_observed_snapshot",
     }
+    if "transfers" in entities:
+        scope_policy["transfer_policy"] = {
+            "window": transfer_window,
+            "pagination": "unique_hits",
+            "completion_scope": "included_ids",
+            "completion_signature": "catalog_contract",
+        }
     automatic_lane = (
         ScopeLane.HISTORY
         if mode == RunMode.BACKFILL
@@ -995,7 +1034,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 catalog_content_hash=catalog.fetch.content_hash,
                 classifier_version=CLASSIFIER_VERSION,
                 parser_version=PARSER_VERSION,
-                entities=scope_entities,
+                entities=contract_entities,
                 entity_policy=scope_policy,
                 included_ids=[
                     item.competition.competition_id
@@ -1009,14 +1048,14 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     scope_plan_signature = (
         automatic_contract.plan_signature
         if automatic_contract is not None
-        else deterministic_plan_signature(scope_entities, policy=scope_policy)
+        else deterministic_plan_signature(contract_entities, policy=scope_policy)
     )
 
     if args.mode == RunMode.DISCOVER.value:
         rc, payload = finish()
         if automatic_contract is not None:
             payload["selection"] = {
-                "entities": sorted(entities),
+                "entities": list(automatic_contract.entities),
                 "explicit_scopes": [],
                 "competition_limit": 0,
                 "season_limit": args.season_limit,
@@ -1030,6 +1069,10 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 "catalog_ids": catalog_ids_evidence,
                 "catalog_decisions": catalog_decisions_evidence,
                 "scope_attempts": [],
+                "transfer_plan_signature": (
+                    scope_plan_signature if "transfers" in entities else None
+                ),
+                "deferrals": automatic_deferrals,
             }
         return rc, payload
     previously_complete: set[tuple[int, str]] = set()
@@ -1152,11 +1195,21 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             for item in deferred
         ]
         deferred_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        deferred_tokens = [
+            format_scope_token(item.competition_id, item.source_season_key)
+            for item in deferred
+        ]
+        add_automatic_deferral(
+            kind="budget",
+            target_type="scope",
+            targets=deferred_tokens,
+            reason="configured season budget deferred scope",
+        )
         for deferred_item in deferred:
             record_automatic_attempt(
                 deferred_item,
                 outcome="deferred",
-                reason="season limit deferred scope",
+                reason="configured season budget deferred scope",
                 next_retry_at=deferred_at + timedelta(minutes=1),
             )
     work_plan.counts["planned_scopes"] = len(work)
@@ -1184,6 +1237,15 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             work_plan.metadata.setdefault("runtime_deferred_scopes", []).extend(
                 format_scope_token(value.competition_id, value.source_season_key)
                 for value in deferred
+            )
+            add_automatic_deferral(
+                kind=("deadline" if "deadline" in deferred_reason else "budget"),
+                target_type="scope",
+                targets=[
+                    format_scope_token(value.competition_id, value.source_season_key)
+                    for value in deferred
+                ],
+                reason=deferred_reason,
             )
             for deferred_item in deferred:
                 record_automatic_attempt(
@@ -1494,23 +1556,32 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     reason="request budget deferred scope",
                     next_retry_at=deferred_at + timedelta(minutes=1),
                 )
+            add_automatic_deferral(
+                kind="budget",
+                target_type="scope",
+                targets=[
+                    format_scope_token(
+                        deferred_item.competition_id,
+                        deferred_item.source_season_key,
+                    )
+                    for deferred_item in deferred
+                ],
+                reason="request budget deferred scope",
+            )
             break
 
     if "transfers" in entities:
-        transfer_window = "1year" if mode == RunMode.DAILY else "all"
-        transfer_policy = {"window": transfer_window, "pagination": "unique_hits"}
         if automatic_contract is not None:
-            transfer_policy.update(
-                {
-                    "classifier_version": CLASSIFIER_VERSION,
-                    "parser_version": PARSER_VERSION,
-                    "included_ids_sha256": automatic_contract.included_ids_sha256,
-                }
+            transfer_signature = scope_plan_signature
+        else:
+            transfer_policy = {
+                "window": transfer_window,
+                "pagination": "unique_hits",
+            }
+            transfer_signature = deterministic_plan_signature(
+                {"transfers"},
+                policy=transfer_policy,
             )
-        transfer_signature = deterministic_plan_signature(
-            {"transfers"},
-            policy=transfer_policy,
-        )
         completed_transfer_ids = set()
         transfer_completion_times = {}
         if mode == RunMode.BACKFILL:
@@ -1551,8 +1622,29 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         )
         transfer_plan.skipped = len(deferred_by_limit)
         operations.append(transfer_plan)
-        completed_transfer_competition_ids: list[int] = []
+        add_automatic_deferral(
+            kind="budget",
+            target_type="transfer",
+            targets=deferred_by_limit,
+            reason="configured competition budget deferred transfer",
+        )
+        completed_transfer_competition_ids: list[int] = sorted(
+            completed_transfer_ids
+        )
         for index, competition_id in enumerate(competition_ids):
+            observed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            deadline_at = getattr(args, "deadline_at", None)
+            if deadline_at is not None and observed_at >= deadline_at:
+                deferred = competition_ids[index:]
+                transfer_plan.skipped += len(deferred)
+                transfer_plan.metadata["deadline_deferred_competition_ids"] = deferred
+                add_automatic_deferral(
+                    kind="deadline",
+                    target_type="transfer",
+                    targets=deferred,
+                    reason="run deadline deferred transfer",
+                )
+                break
             capacity = service.ledger.remaining_requests // max_attempts
             max_pages = min(args.transfer_max_pages, capacity)
             if not max_pages:
@@ -1562,6 +1654,12 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     f"request budget deferred {len(deferred)} transfer streams"
                 )
                 transfer_plan.metadata["budget_deferred_competition_ids"] = deferred
+                add_automatic_deferral(
+                    kind="budget",
+                    target_type="transfer",
+                    targets=deferred,
+                    reason="request budget deferred transfer",
+                )
                 break
             transfer_operation = service.sync_transfers(
                 competition_id,
@@ -1615,6 +1713,9 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 transfer_plan.retryable.append(
                     f"competition {competition_id} transfer stream incomplete"
                 )
+        completed_transfer_competition_ids = sorted(
+            set(completed_transfer_competition_ids)
+        )
     else:
         completed_transfer_competition_ids = []
 
@@ -1623,6 +1724,36 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         if automatic_catalog and automatic_contract is not None
         else {}
     )
+    deferred_scope_targets = {
+        target
+        for evidence in automatic_deferrals
+        if evidence.get("target_type") == "scope"
+        for target in evidence.get("targets", [])
+    }
+    unauthorized_deferred_attempts = False
+    for state in automatic_attempts.values():
+        if state.outcome != "deferred" or format_scope_token(
+            state.competition_id, state.source_season_key
+        ) in deferred_scope_targets:
+            continue
+        reason = state.reason.casefold()
+        if "deadline" in reason:
+            kind = "deadline"
+        elif "budget" in reason:
+            kind = "budget"
+        else:
+            kind = None
+        if kind is None:
+            unauthorized_deferred_attempts = True
+            continue
+        token = format_scope_token(state.competition_id, state.source_season_key)
+        add_automatic_deferral(
+            kind=kind,
+            target_type="scope",
+            targets=[token],
+            reason=state.reason,
+        )
+        deferred_scope_targets.add(token)
     rc, payload = finish()
     replay_missing_inputs = (
         _replay_missing_raw_evidence(
@@ -1658,6 +1789,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     if automatic_contract is not None:
         payload["selection"].update(
             {
+                "entities": list(automatic_contract.entities),
                 "scope_lane": automatic_lane.value,
                 "catalog_contract": automatic_contract.as_dict(),
                 "catalog_ids": catalog_ids_evidence,
@@ -1666,14 +1798,24 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     _scope_attempt_payload(state)
                     for _identity, state in sorted(automatic_attempts.items())
                 ],
+                "transfer_plan_signature": (
+                    scope_plan_signature if "transfers" in entities else None
+                ),
+                "deferrals": automatic_deferrals,
             }
         )
-        soft_outcomes = any(
-            state.outcome in {"retryable", "deferred"}
+        retryable_attempts = any(
+            state.outcome == "retryable"
             for state in automatic_attempts.values()
         )
-        soft_outcomes = soft_outcomes or any(
-            operation.retryable for operation in operations
+        terminal_attempts = any(
+            state.outcome == "terminal"
+            for state in automatic_attempts.values()
+        )
+        unauthorized_operation_retries = any(
+            not _is_budget_deferral_error(reason)
+            for operation in operations
+            for reason in operation.retryable
         )
         hard_failures = any(
             operation.terminal
@@ -1683,7 +1825,16 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             )
             for operation in operations
         )
-        if soft_outcomes and not hard_failures:
+        if (
+            retryable_attempts
+            or terminal_attempts
+            or unauthorized_deferred_attempts
+            or unauthorized_operation_retries
+        ):
+            payload["status"] = "incomplete"
+            payload["complete"] = False
+            rc = 1
+        elif automatic_deferrals and not hard_failures:
             payload["status"] = "partial_success"
             payload["complete"] = False
             rc = 0

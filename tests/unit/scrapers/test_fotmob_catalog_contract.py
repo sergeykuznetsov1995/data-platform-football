@@ -65,6 +65,36 @@ def test_contract_binds_catalog_parser_policy_ids_and_exact_scopes():
     assert baseline != _contract(catalog_content_hash="b" * 64)
 
 
+def test_contract_binds_transfer_entity_and_completion_policy():
+    baseline = _contract()
+    transfer_policy = {
+        "match_policy": "finished_only",
+        "transfer_policy": {
+            "window": "1year",
+            "pagination": "unique_hits",
+            "completion_scope": "included_ids",
+            "completion_signature": "catalog_contract",
+        },
+    }
+
+    with_transfers = _contract(
+        entities=["matches", "season", "transfers"],
+        entity_policy=transfer_policy,
+    )
+
+    assert with_transfers.plan_signature != baseline.plan_signature
+    assert with_transfers.plan_signature != _contract(
+        entities=["matches", "season", "transfers"],
+        entity_policy={
+            **transfer_policy,
+            "transfer_policy": {
+                **transfer_policy["transfer_policy"],
+                "completion_signature": "separate-unbound-plan",
+            },
+        },
+    ).plan_signature
+
+
 def test_contract_round_trip_recomputes_all_counts_hashes_and_signature():
     contract = _contract()
     payload = contract.as_dict()
@@ -92,3 +122,16 @@ def test_contract_rejects_duplicate_or_noncanonical_scope_evidence():
         catalog_contract_from_dict(payload)
     with pytest.raises(ValueError, match="included ID"):
         _contract(included_ids=[47], scopes=[(48, "2025 Apertura")])
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        (True, "2025/2026"),
+        (47.9, "2025/2026"),
+        (47, 2025),
+    ],
+)
+def test_contract_rejects_coerced_scope_component_types(scope):
+    with pytest.raises(ValueError, match="scope"):
+        _contract(included_ids=[47], scopes=[scope])

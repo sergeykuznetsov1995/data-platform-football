@@ -130,6 +130,37 @@ class ScopeEvidenceWriter(RecordingWriter):
         return self.trino
 
 
+class EntityAttemptTrino:
+    def __init__(self):
+        self.sql = []
+
+    def execute_query(self, sql):
+        self.sql.append(sql)
+        return [
+            (
+                "target-key",
+                "batch-id",
+                None,
+                None,
+                PARSER_VERSION,
+                "retryable_failure",
+                datetime(2026, 8, 8, 9),
+                datetime(2026, 8, 8, 10),
+                "{}",
+                "{}",
+            )
+        ]
+
+
+class EntityAttemptWriter(RecordingWriter):
+    def __init__(self):
+        super().__init__()
+        self.trino = EntityAttemptTrino()
+
+    def _get_trino_manager(self):
+        return self.trino
+
+
 def _commit(**overrides):
     values = {
         "run_id": "run-1",
@@ -510,6 +541,22 @@ def test_entity_tombstone_supersedes_previous_success_for_skip_state():
 
     assert repository.latest_success("match-1") is None
     assert repository.latest_entity_success("match", "1") is None
+
+
+def test_iceberg_latest_entity_attempt_includes_failure_statuses():
+    writer = EntityAttemptWriter()
+    repository = FotMobRepository(writer=writer)
+
+    latest = repository.latest_entity_attempt("competition_seasons", 47)
+
+    assert latest is not None
+    assert latest["status"] == "retryable_failure"
+    assert latest["completed_at"] == datetime(2026, 8, 8, 10)
+    sql = " ".join(writer.trino.sql[0].split())
+    assert "target_type = 'competition_seasons'" in sql
+    assert "entity_id = '47'" in sql
+    assert "retryable_failure" in sql
+    assert "schema_drift" in sql
 
 
 def test_memory_latest_success_can_be_scoped_to_current_writer_run():
