@@ -65,6 +65,20 @@ from scrapers.fotmob.source_refresh import (
 
 RESULT_PATH = "/tmp/fotmob_result_{{ ts_nodash }}.json"
 NATIVE_MODES = frozenset({"discover", "daily", "backfill", "replay", "refresh"})
+FOTMOB_SILVER_BRONZE_INPUTS = frozenset(
+    {
+        "iceberg.bronze.fotmob_competition_seasons",
+        "iceberg.bronze.fotmob_season_teams",
+        "iceberg.bronze.fotmob_matches",
+        "iceberg.bronze.fotmob_match_payloads",
+        "iceberg.bronze.fotmob_standings",
+        "iceberg.bronze.fotmob_leaderboards",
+        "iceberg.bronze.fotmob_squad_snapshots",
+        "iceberg.bronze.fotmob_player_snapshots",
+        "iceberg.bronze.fotmob_team_snapshots",
+        "iceberg.bronze.fotmob_transfer_events",
+    }
+)
 ISSUE_930_REPLAY_ENTITIES = [
     "leaderboards",
     "matches",
@@ -800,12 +814,27 @@ def validate_data(
             raise AirflowException(
                 "Incomplete FotMob native ingest: " + "; ".join(violations)
             )
+        raw_tables = result.get("tables")
+        if raw_tables is None:
+            raw_tables = []
+        if not isinstance(raw_tables, list) or any(
+            not isinstance(table, str) for table in raw_tables
+        ):
+            raise AirflowException("FotMob committed table evidence is invalid")
+        bronze_inputs_changed = sorted(
+            {
+                table.strip().casefold()
+                for table in raw_tables
+                if table.strip().casefold().startswith("iceberg.bronze.")
+            }
+        )
         summary = {
             "status": result.get("status"),
             "run_id": result.get("run_id"),
             "mode": mode,
             "rows": result.get("rows") or {},
-            "tables": result.get("tables") or [],
+            "tables": raw_tables,
+            "bronze_inputs_changed": bronze_inputs_changed,
             "transport": transport,
             "budget": budget,
             "selection": selection_summary,
@@ -814,10 +843,20 @@ def validate_data(
         return summary
 
 
-def _should_transform(mode: str) -> bool:
-    """Catalog-only discovery has no season facts for Silver to consume."""
+def _should_transform(**context: Any) -> bool:
+    """Run Silver only when validated committed Bronze inputs changed."""
 
-    return str(mode) != "discover"
+    ti = context.get("ti")
+    validation = ti.xcom_pull(task_ids="validate_data") if ti is not None else None
+    if not isinstance(validation, Mapping):
+        raise AirflowException("FotMob validate_data XCom is missing")
+    changed = validation.get("bronze_inputs_changed")
+    if not isinstance(changed, list) or any(
+        not isinstance(table, str) for table in changed
+    ):
+        raise AirflowException("FotMob changed Bronze input evidence is invalid")
+    normalized = {table.strip().casefold() for table in changed}
+    return bool(normalized & FOTMOB_SILVER_BRONZE_INPUTS)
 
 
 with DAG(
@@ -981,7 +1020,7 @@ python dags/scripts/run_fotmob_scraper.py \\
     transform_gate = ShortCircuitOperator(
         task_id="season_data_available",
         python_callable=_should_transform,
-        op_kwargs={"mode": "{{ params.mode }}"},
+        ignore_downstream_trigger_rules=False,
     )
 
     trigger_silver = TriggerDagRunOperator(
@@ -1007,6 +1046,7 @@ python dags/scripts/run_fotmob_scraper.py \\
     seal_publication = PythonOperator(
         task_id="seal_fotmob_publication_ready",
         python_callable=seal_fotmob_publication,
+        trigger_rule="none_failed_min_one_success",
         retries=0,
     )
 
@@ -1024,13 +1064,7 @@ python dags/scripts/run_fotmob_scraper.py \\
         retries=0,
     )
 
-    (
-        publication_preflight
-        >> scrape_data_task
-        >> validate_data_task
-        >> transform_gate
-        >> trigger_silver
-        >> seal_publication
-        >> finalize_publication
-    )
+    publication_preflight >> scrape_data_task >> validate_data_task >> transform_gate
+    transform_gate >> trigger_silver
+    [validate_data_task, trigger_silver] >> seal_publication >> finalize_publication
     scrape_data_task >> replay_missing_inputs_proof >> finalize_publication

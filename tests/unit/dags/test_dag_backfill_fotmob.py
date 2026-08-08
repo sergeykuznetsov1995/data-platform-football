@@ -25,15 +25,14 @@ def test_shared_default_does_not_materialize_backfill_dag(monkeypatch):
     assert PythonOperator._instances == []
 
 
-def test_exact_isolated_opt_in_materializes_continuous_backfill(monkeypatch):
+def test_exact_isolated_opt_in_materializes_manual_backfill(monkeypatch):
     module = _reload_backfill(monkeypatch, isolated=True)
     from airflow.operators.python import PythonOperator
 
     assert module.dag is not None
     assert module.dag.dag_id == "dag_backfill_fotmob"
-    # Self-draining backfill: continuous, single-flight, paused until an
-    # operator opts in — never catches up historical logical dates.
-    assert module.dag.schedule == "@continuous"
+    # Retained as a single-flight manual rollback owner.
+    assert module.dag.schedule is None
     assert module.dag._dag_kwargs["is_paused_upon_creation"] is True
     assert module.dag._dag_kwargs["max_active_runs"] == 1
     assert module.dag._dag_kwargs["catchup"] is False

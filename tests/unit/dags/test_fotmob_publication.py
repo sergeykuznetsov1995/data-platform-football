@@ -1501,7 +1501,7 @@ def test_isolated_owner_initializes_before_deterministic_exact_trigger(
     assert "execution_date" not in trigger._init_kwargs
     assert finalizer.upstream_task_ids == {trigger.task_id}
     assert finalizer._init_kwargs["trigger_rule"] == "all_done"
-    assert module.dag._dag_kwargs["schedule"] == "0 14 * * *"
+    assert module.dag._dag_kwargs["schedule"] is None
 
 
 # ---------------------------------------------------------------------------

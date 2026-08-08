@@ -1,11 +1,10 @@
-"""Keep the whole FotMob men's catalog's current seasons fresh, on rotation.
+"""Manual rollback path for refreshing men's current seasons on rotation.
 
 The pinned daily owner (``dag_trigger_fotmob_daily``) only refreshes the 21
 core competitions every 14:00 — the full ~494-competition men's catalog cannot
-finish inside one direct-only slot.  This continuous companion closes that gap:
-each run refreshes the CURRENT (selected/latest) season of the ``season_limit``
-STALEST included men's competitions, then cools down, so over a couple of days
-every men's competition's current season is re-pulled and the cycle repeats.
+finish inside one direct-only slot.  ``dag_orchestrate_fotmob`` now owns that
+automatic rotation.  This legacy DAG retains the same bounded refresh chain
+with ``schedule=None`` so an operator can explicitly use it for rollback.
 
 It reuses the runner's ``refresh`` mode, which plans and writes exactly like
 ``daily`` (current seasons, stalest-first, men's-only via
@@ -17,14 +16,10 @@ advertises are picked up automatically.
 Like the other owners it runs through the parent ingest DAG (never a writer
 child directly) so the publication writer fence stays intact, mints one exact
 generation per run, is direct-only (proxy bytes fenced to zero), and only
-materializes under ``FOTMOB_ISOLATED_STACK=1``.  Paused on creation: unpause to
-start the rotation, pause to stop.
+materializes under ``FOTMOB_ISOLATED_STACK=1`` and never self-schedules.
 
-Trade-off (documented): routing through ``dag_ingest_fotmob`` rebuilds Silver
-each chunk, and every run re-discovers the full catalog to rank staleness.
-Chunks are therefore deliberately coarse (``REFRESH_SEASON_LIMIT``) with a
-multi-minute cooldown so Silver and discovery cost are amortized, not paid per
-competition.
+Every run re-discovers the full catalog to rank staleness.  Silver is rebuilt
+only when one of its existing Bronze inputs changed.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -34,7 +29,6 @@ from typing import Any
 
 from airflow import DAG
 from airflow.exceptions import AirflowException
-from airflow.models.param import Param
 from airflow.operators.python import PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.sensors.python import PythonSensor
@@ -178,7 +172,9 @@ if os.environ.get(ISOLATED_STACK_ENV) == "1":
         dag_id="dag_refresh_fotmob",
         description="Continuous stalest-first refresh of the men's catalog's current seasons",
         default_args={**DEFAULT_ARGS, "retries": 0},
-        schedule="@continuous",
+        # Retained only as a manual rollback owner.  Automatic rotation is
+        # exclusively scheduled by dag_orchestrate_fotmob.
+        schedule=None,
         start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
         catchup=False,
         max_active_runs=1,

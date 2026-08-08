@@ -981,7 +981,70 @@ class TestNativeValidation:
 
 class TestSilverDependency:
     @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("tables", "expected"),
+        [
+            ([], False),
+            (["iceberg.bronze.fotmob_competition_scope_observations"], False),
+            (["iceberg.bronze.fotmob_catalog_batches"], False),
+            (["iceberg.bronze.fotmob_ingest_manifest"], False),
+            (["iceberg.bronze.fotmob_matches"], True),
+            (["iceberg.bronze.fotmob_transfer_events"], True),
+        ],
+    )
+    def test_silver_gate_reads_validated_committed_inputs(self, tables, expected):
+        mod = _reload_dag_module()
+
+        class _TI:
+            def xcom_pull(self, *, task_ids):
+                assert task_ids == "validate_data"
+                return {"bronze_inputs_changed": tables}
+
+        assert mod._should_transform(ti=_TI()) is expected
+
+    @pytest.mark.unit
+    def test_validation_normalizes_changed_bronze_inputs(self, tmp_path):
+        import json
+
+        mod = _reload_dag_module()
+        payload = _daily_report(mod)
+        payload["tables"] = [
+            "iceberg.bronze.fotmob_matches",
+            " iceberg.bronze.fotmob_matches ",
+            "iceberg.bronze.fotmob_competition_scope_observations",
+        ]
+        report = tmp_path / "result.json"
+        report.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert mod.validate_data(str(report))["bronze_inputs_changed"] == [
+            "iceberg.bronze.fotmob_competition_scope_observations",
+            "iceberg.bronze.fotmob_matches",
+        ]
+
+    @pytest.mark.unit
+    def test_existing_silver_input_set_is_complete_and_native(self):
+        mod = _reload_dag_module()
+
+        assert mod.FOTMOB_SILVER_BRONZE_INPUTS == frozenset(
+            {
+                "iceberg.bronze.fotmob_competition_seasons",
+                "iceberg.bronze.fotmob_season_teams",
+                "iceberg.bronze.fotmob_matches",
+                "iceberg.bronze.fotmob_match_payloads",
+                "iceberg.bronze.fotmob_standings",
+                "iceberg.bronze.fotmob_leaderboards",
+                "iceberg.bronze.fotmob_squad_snapshots",
+                "iceberg.bronze.fotmob_player_snapshots",
+                "iceberg.bronze.fotmob_team_snapshots",
+                "iceberg.bronze.fotmob_transfer_events",
+            }
+        )
+
+    @pytest.mark.unit
     def test_ingest_waits_for_silver_before_master_can_start_xref(self):
+        from airflow.operators.python import PythonOperator
+
+        PythonOperator._instances.clear()
         mod = _reload_dag_module()
 
         assert mod.trigger_silver._init_kwargs["wait_for_completion"] is True
@@ -992,5 +1055,22 @@ class TestSilverDependency:
         assert mod.trigger_silver._init_kwargs["logical_date"] == (
             "{{ logical_date.isoformat() }}"
         )
-        assert mod.seal_publication.upstream_task_ids == {"trigger_silver_transform"}
+        silver_triggers = [
+            task
+            for task in PythonOperator._instances
+            if task.task_id == "trigger_silver_transform"
+        ]
+        assert silver_triggers == [mod.trigger_silver]
+        assert mod.transform_gate._init_kwargs["ignore_downstream_trigger_rules"] is False
+        assert mod.transform_gate._init_kwargs.get("op_kwargs", {}) == {}
+        assert mod.seal_publication.upstream_task_ids == {
+            "validate_data",
+            "trigger_silver_transform",
+        }
+        assert mod.seal_publication._init_kwargs["trigger_rule"] == (
+            "none_failed_min_one_success"
+        )
+        # The Silver child is synchronous and failed DQ is explicitly a failed
+        # state, so the seal cannot publish readiness after DQ failure.
+        assert mod.trigger_silver._init_kwargs["failed_states"] == ["failed"]
         assert mod.finalize_publication._init_kwargs["trigger_rule"] == "all_done"
