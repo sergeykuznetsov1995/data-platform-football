@@ -69,6 +69,7 @@ WITH required_seasons(source_season_id) AS (
            match.source_competition_id,
            match.source_season_id,
            observed.content_hash,
+           observed.typed_parser_version,
            observed.status AS observation_status,
            observed.generic_status,
            observed.typed_status,
@@ -103,7 +104,9 @@ WITH required_seasons(source_season_id) AS (
                   OR manifest.parse_status <> 'succeeded'
                   OR manifest.persistence_status NOT IN ('succeeded', 'skipped')
                   OR manifest.validation_status NOT IN ('succeeded', 'skipped')
-                  OR manifest.availability IN ('unknown', 'error')
+                  OR manifest.availability NOT IN (
+                      'available', 'empty', 'restricted', 'not_applicable'
+                  )
                   OR (
                       manifest.availability = 'available'
                       AND manifest.row_count <= 0
@@ -123,6 +126,7 @@ WITH required_seasons(source_season_id) AS (
       ON manifest.target_id = observation.target_id
      AND manifest.content_hash = observation.content_hash
      AND manifest.dataset = required.dataset
+     AND manifest.parser_version = observation.typed_parser_version
     GROUP BY observation.logical_refresh_id
 ), target_proof AS (
     SELECT observation.*,
@@ -178,13 +182,28 @@ WITH required_seasons(source_season_id) AS (
              expected.source_season_id
 )
 SELECT CASE
-           WHEN installed_season_rows = 1
-            AND unproved_match_targets = 0
-            AND proved_match_targets = run_match_targets
+           WHEN min(installed_season_rows) = 1
+            AND sum(unproved_match_targets) = 0
+            AND sum(proved_match_targets) = sum(run_match_targets)
            THEN 'PASS' ELSE 'FAIL'
        END AS verdict,
-       *
+       CASE WHEN grouping(source_competition_id) = 1
+            THEN 'TOTAL' ELSE source_competition_id END
+           AS source_competition_id,
+       CASE WHEN grouping(competition_name) = 1
+            THEN 'TOTAL' ELSE competition_name END AS competition_name,
+       CASE WHEN grouping(source_season_id) = 1
+            THEN 'TOTAL' ELSE source_season_id END AS source_season_id,
+       sum(installed_season_rows) AS installed_season_rows,
+       sum(run_match_targets) AS run_match_targets,
+       sum(proved_match_targets) AS proved_match_targets,
+       sum(dead_match_targets) AS dead_match_targets,
+       sum(unproved_match_targets) AS unproved_match_targets
 FROM per_scope
+GROUP BY GROUPING SETS (
+    (source_competition_id, competition_name, source_season_id),
+    ()
+)
 ORDER BY competition_name, source_season_id;
 
 -- ===========================================================================
@@ -289,7 +308,9 @@ WITH required_seasons(source_season_id) AS (
                AS availability_decisions,
            count_if(
                availability.dataset IS NULL
-               OR availability.availability IN ('unknown', 'error')
+               OR availability.availability NOT IN (
+                   'available', 'empty', 'restricted', 'not_applicable'
+               )
                OR (
                    availability.availability = 'available'
                    AND coalesce(typed.typed_rows, 0) <= 0

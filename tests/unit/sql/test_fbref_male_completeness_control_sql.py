@@ -55,11 +55,17 @@ def test_gate_requires_all_eight_dataset_decisions_and_direct_or_empty_proof():
     assert "availability = 'available'" in sql
     assert "typed_rows > 0" in sql
     assert re.search(
+        r"availability\s+not\s+in\s*\(\s*'available',\s*'empty',"
+        r"\s*'restricted',\s*'not_applicable'\s*\)",
+        sql,
+    )
+    assert re.search(
         r"availability\s+in\s*\('empty', 'restricted', 'not_applicable'\)",
         sql,
     )
     assert "nullif(trim(availability.reason), '') is not null" in sql
     assert all(f"fbref_{dataset}" in sql for dataset in datasets)
+    assert "manifest.parser_version = observation.typed_parser_version" in sql
 
 
 @pytest.mark.unit
@@ -74,3 +80,4 @@ def test_companion_control_query_proves_success_or_auditable_dead_target():
     assert "nullif(trim(observation.last_error_class), '') is not null" in sql
     assert "control_proof in ('durable', 'dead')" in sql
     assert "every returned verdict must be pass" in sql
+    assert sql.count("group by grouping sets") == 2
