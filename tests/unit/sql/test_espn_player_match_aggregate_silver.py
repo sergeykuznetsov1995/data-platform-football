@@ -37,6 +37,35 @@ class TestEspnPlayerMatchAggregateSilver:
         assert re.search(r"JOIN\s+schedule_dedup\s+s\s+ON\s+s\.event_id\s*=\s+l\.event_id", body, re.I)
         assert re.search(r"WHERE\s+s\.played_final", body, re.I)
 
+    def test_schedule_partition_fields_are_aliased_before_lineup_passthrough(self):
+        tree = _tree()
+        lineup_played = next(
+            cte.this
+            for cte in tree.args["with_"].expressions
+            if cte.alias_or_name == "lineup_played"
+        )
+        aliases = {
+            expression.alias: expression.this
+            for expression in lineup_played.expressions
+            if isinstance(expression, exp.Alias)
+        }
+        assert {
+            "schedule_competition_slug": ("s", "competition_slug"),
+            "schedule_source_season_year": ("s", "source_season_year"),
+        } == {
+            name: (source.table, source.name)
+            for name, source in aliases.items()
+            if name.startswith("schedule_")
+        }
+
+        output = {
+            expression.alias: expression.this
+            for expression in tree.expressions
+            if isinstance(expression, exp.Alias)
+        }
+        assert output["league"].name == "schedule_competition_slug"
+        assert output["season"].this.name == "schedule_source_season_year"
+
     def test_json_jersey_position_groups_and_best_effort_minutes(self):
         tree = _tree()
         jersey_coalesce = next(

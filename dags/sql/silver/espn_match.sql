@@ -108,7 +108,7 @@ match_modeled AS (
         CASE
             WHEN regexp_extract(source_season_display_name, '(\d{4})\s*[-/]\s*(\d{2}|\d{4})', 1) <> ''
             THEN substr(regexp_extract(source_season_display_name, '(\d{4})\s*[-/]\s*(\d{2}|\d{4})', 1), 3, 2)
-                 || right(regexp_extract(source_season_display_name, '(\d{4})\s*[-/]\s*(\d{2}|\d{4})', 2), 2)
+                 || substr(regexp_extract(source_season_display_name, '(\d{4})\s*[-/]\s*(\d{2}|\d{4})', 2), -2)
             WHEN regexp_extract(source_season_display_name, '(\d{4})', 1) <> ''
             THEN regexp_extract(source_season_display_name, '(\d{4})', 1)
             ELSE CAST(source_season_year AS varchar)

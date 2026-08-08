@@ -91,6 +91,35 @@ class TestEspnSubstitutionsSilver:
         ordered = window.args["order"].expressions[0]
         assert ordered.this.name == "_ingested_at" and ordered.args["desc"] is True
 
+    def test_schedule_partition_fields_are_aliased_before_lineup_passthrough(self):
+        tree = _tree()
+        inbound = next(
+            cte.this
+            for cte in tree.args["with_"].expressions
+            if cte.alias_or_name == "inbound_substitutions"
+        )
+        aliases = {
+            expression.alias: expression.this
+            for expression in inbound.expressions
+            if isinstance(expression, exp.Alias)
+        }
+        assert {
+            "schedule_competition_slug": ("s", "competition_slug"),
+            "schedule_source_season_year": ("s", "source_season_year"),
+        } == {
+            name: (source.table, source.name)
+            for name, source in aliases.items()
+            if name.startswith("schedule_")
+        }
+
+        output = {
+            expression.alias: expression.this
+            for expression in tree.expressions
+            if isinstance(expression, exp.Alias)
+        }
+        assert output["league"].this.name == "schedule_competition_slug"
+        assert output["season"].this.this.name == "schedule_source_season_year"
+
     def test_executable_dedup_inbound_only_pairing_and_json_jersey_priority(self):
         """DuckDB checks scalar behavior; AST assertions bind the production paths."""
         duckdb = pytest.importorskip("duckdb")
@@ -119,5 +148,5 @@ class TestEspnSubstitutionsSilver:
         assert "outgoing-only" in sql.lower()
         final = sql.rsplit("SELECT", 1)[-1]
         assert re.search(r"l\._ingested_at\s+AS\s+_bronze_ingested_at", final, re.I)
-        assert re.search(r"l\.competition_slug\s+AS\s+league", final, re.I)
-        assert re.search(r"CAST\s*\(\s*l\.source_season_year\s+AS\s+varchar\s*\)\s+AS\s+season", final, re.I)
+        assert re.search(r"l\.schedule_competition_slug\s+AS\s+league", final, re.I)
+        assert re.search(r"CAST\s*\(\s*l\.schedule_source_season_year\s+AS\s+varchar\s*\)\s+AS\s+season", final, re.I)

@@ -69,6 +69,21 @@ class TestEspnMatchSilver:
             "2",
         ) in regexes
 
+        season_slug_platform = next(
+            alias.this
+            for alias in tree.find_all(exp.Alias)
+            if alias.alias == "season_slug_platform"
+        )
+        assert not list(season_slug_platform.find_all(exp.Right))
+        second_year_suffix = next(
+            node
+            for node in season_slug_platform.find_all(exp.Substring)
+            if isinstance(node.this, exp.RegexpExtract)
+            and node.this.args["group"].this == "2"
+        )
+        assert second_year_suffix.args["start"].sql(dialect="trino") == "-2"
+        assert second_year_suffix.args.get("length") is None
+
     def test_executable_latest_snapshot_season_slug_and_group_parsing(self):
         """DuckDB fixture exercises the same scalar expressions as the Trino SQL.
 

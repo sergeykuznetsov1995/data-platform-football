@@ -37,7 +37,11 @@ lineup_dedup AS (
     ) WHERE rn = 1
 ),
 lineup_played AS (
-    SELECT l.*, s.status, s.competition_slug, s.source_season_year
+    SELECT
+        l.*,
+        s.status,
+        s.competition_slug AS schedule_competition_slug,
+        s.source_season_year AS schedule_source_season_year
     FROM lineup_dedup l
     JOIN schedule_dedup s ON s.event_id = l.event_id
     WHERE s.played_final
@@ -153,6 +157,6 @@ SELECT
     _ingested_at AS _bronze_ingested_at,
 
     -- ===== Partition keys =====
-    competition_slug AS league,
-    CAST(source_season_year AS varchar) AS season
+    schedule_competition_slug AS league,
+    CAST(schedule_source_season_year AS varchar) AS season
 FROM player_modeled
