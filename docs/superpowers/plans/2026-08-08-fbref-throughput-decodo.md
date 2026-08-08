@@ -431,8 +431,8 @@ git commit -m "perf(fbref): persist match waves in safe batches"
 - Modify: `tests/unit/dags/test_dag_bootstrap_fbref.py`
 - Modify: `tests/unit/dags/test_dag_ingest_fbref.py`
 - Modify: `tests/unit/dags/test_dag_backfill_fbref.py`
-- Modify: `tests/unit/dags/test_dag_accept_fbref_bronze.py`
-- Modify: `tests/unit/dags/test_run_fbref_live_waves.py`
+- Modify: `tests/unit/dags/test_fbref_bronze_acceptance_dags.py`
+- Modify: `tests/unit/dags/test_run_fbref_live_waves_runner.py`
 - Modify: `tests/unit/scrapers/test_fbref_pipeline.py`
 - Modify: `tests/unit/scrapers/test_fbref_control_store_v8.py`
 
@@ -489,7 +489,7 @@ Cover unresolved failure, newer success with a different parser-version triple, 
 
 - [ ] **Step 4: Run focused tests and confirm failures**
 
-Run: `/root/.venvs/dpf-test/bin/pytest tests/unit/dags/test_fbref_pipeline_tasks.py tests/unit/dags/test_dag_bootstrap_fbref.py tests/unit/dags/test_dag_ingest_fbref.py tests/unit/dags/test_dag_backfill_fbref.py tests/unit/dags/test_dag_accept_fbref_bronze.py tests/unit/dags/test_run_fbref_live_waves.py tests/unit/scrapers/test_fbref_pipeline.py tests/unit/scrapers/test_fbref_control_store_v8.py -q`
+Run: `/root/.venvs/dpf-test/bin/pytest tests/unit/dags/test_fbref_pipeline_tasks.py tests/unit/dags/test_dag_bootstrap_fbref.py tests/unit/dags/test_dag_ingest_fbref.py tests/unit/dags/test_dag_backfill_fbref.py tests/unit/dags/test_fbref_bronze_acceptance_dags.py tests/unit/dags/test_run_fbref_live_waves_runner.py tests/unit/scrapers/test_fbref_pipeline.py tests/unit/scrapers/test_fbref_control_store_v8.py -q`
 
 Expected: FAIL on current pool/timeouts, success thresholds, and poison-row selection.
 
@@ -513,7 +513,7 @@ Modify `list_unprocessed_fetches` and its count companion with the same `NOT EXI
 
 - [ ] **Step 8: Run focused tests**
 
-Run: `/root/.venvs/dpf-test/bin/pytest tests/unit/dags/test_fbref_pipeline_tasks.py tests/unit/dags/test_dag_bootstrap_fbref.py tests/unit/dags/test_dag_ingest_fbref.py tests/unit/dags/test_dag_backfill_fbref.py tests/unit/dags/test_dag_accept_fbref_bronze.py tests/unit/dags/test_run_fbref_live_waves.py tests/unit/scrapers/test_fbref_pipeline.py tests/unit/scrapers/test_fbref_control_store_v8.py -q`
+Run: `/root/.venvs/dpf-test/bin/pytest tests/unit/dags/test_fbref_pipeline_tasks.py tests/unit/dags/test_dag_bootstrap_fbref.py tests/unit/dags/test_dag_ingest_fbref.py tests/unit/dags/test_dag_backfill_fbref.py tests/unit/dags/test_fbref_bronze_acceptance_dags.py tests/unit/dags/test_run_fbref_live_waves_runner.py tests/unit/scrapers/test_fbref_pipeline.py tests/unit/scrapers/test_fbref_control_store_v8.py -q`
 
 Expected: PASS.
 
