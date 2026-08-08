@@ -312,6 +312,47 @@ class TestTrinoTableManagerCreateIcebergTable:
 class TestTrinoTableManagerInsertDataFrame:
     """Tests for insert_dataframe operation."""
 
+    def test_validate_dataframe_values_uses_target_types_without_io(self):
+        from scrapers.base.trino_manager import TrinoTableManager
+
+        manager = TrinoTableManager()
+        manager._execute = MagicMock()
+        frame = pd.DataFrame(
+            {
+                "match_id": ["match-a", "match-b"],
+                "minute": [1, None],
+                "available": ["true", "false"],
+            }
+        )
+
+        result = manager.validate_dataframe_values(
+            frame,
+            {
+                "MATCH_ID": "VARCHAR",
+                "minute": "BIGINT",
+                "available": "BOOLEAN",
+            },
+        )
+
+        assert result is None
+        manager._execute.assert_not_called()
+
+    def test_validate_dataframe_values_rejects_incompatible_value_without_io(
+        self,
+    ):
+        from scrapers.base.trino_manager import TrinoTableManager
+
+        manager = TrinoTableManager()
+        manager._execute = MagicMock()
+
+        with pytest.raises(ValueError, match="incompatible with BIGINT"):
+            manager.validate_dataframe_values(
+                pd.DataFrame({"metric": ["not-a-number"]}),
+                {"metric": "BIGINT"},
+            )
+
+        manager._execute.assert_not_called()
+
     def test_insert_dataframe_basic(self):
         """Test basic DataFrame insertion."""
         import pandas as pd

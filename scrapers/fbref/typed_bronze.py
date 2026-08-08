@@ -245,6 +245,12 @@ class _TrinoManager(Protocol):
         target_column_types: Optional[Mapping[str, str]] = None,
     ) -> int: ...
 
+    def validate_dataframe_values(
+        self,
+        df: pd.DataFrame,
+        column_types: Mapping[str, str],
+    ) -> None: ...
+
 
 @dataclass(frozen=True)
 class TypedSourceContext:
@@ -724,6 +730,27 @@ class FBrefTypedBronzeWriter:
             for name, column_type in columns.items()
         }
 
+    @staticmethod
+    def _require_textual_scope_columns(
+        table: str,
+        columns: Mapping[str, str],
+        required: Sequence[str],
+    ) -> None:
+        normalized = FBrefTypedBronzeWriter._normalized_columns(columns)
+        invalid = [
+            column
+            for column in required
+            if column.casefold() not in normalized
+            or not normalized[column.casefold()].strip().upper().startswith(
+                ("VARCHAR", "CHAR")
+            )
+        ]
+        if invalid:
+            names = ", ".join(invalid)
+            raise TypedBronzePersistenceError(
+                f"{table} requires textual {names} for its delete scope"
+            )
+
     def _cached_table_columns(self, table: str) -> Dict[str, str]:
         cached = self._table_columns.get(table)
         if cached is not None:
@@ -1138,8 +1165,38 @@ class FBrefTypedBronzeWriter:
                     self._known_tables.add(write.table)
                 else:
                     absent_clear_tables.add(write.table)
+            if write.table not in absent_clear_tables:
+                target_column_types[write.table] = (
+                    self._cached_table_columns(write.table)
+                )
         target_column_types[MATCH_AVAILABILITY_TABLE] = self._ensure_table(
             MATCH_AVAILABILITY_TABLE, prepared.availability
+        )
+
+        for write in prepared.table_writes:
+            if write.table in absent_clear_tables:
+                continue
+            self._require_textual_scope_columns(
+                write.table,
+                target_column_types[write.table],
+                ("match_id",),
+            )
+        self._require_textual_scope_columns(
+            MATCH_AVAILABILITY_TABLE,
+            target_column_types[MATCH_AVAILABILITY_TABLE],
+            ("match_id", "dataset"),
+        )
+
+        # Exercise the exact production scalar formatter for the complete
+        # cohort after schemas are authoritative and before any live write.
+        for write in prepared.table_writes:
+            if write.decorated is not None:
+                self.manager.validate_dataframe_values(
+                    write.decorated, target_column_types[write.table]
+                )
+        self.manager.validate_dataframe_values(
+            prepared.availability,
+            target_column_types[MATCH_AVAILABILITY_TABLE],
         )
 
         for write in prepared.table_writes:

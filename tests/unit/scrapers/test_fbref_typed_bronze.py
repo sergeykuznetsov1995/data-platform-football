@@ -12,6 +12,7 @@ import pytest
 
 import scrapers.fbref.typed_bronze as typed
 import scrapers.fbref.match_parser as match_parser
+from scrapers.base.trino_manager import TrinoTableManager
 from scrapers.fbref.match_parser import (
     DatasetParseResult,
     DatasetStatus,
@@ -218,6 +219,21 @@ class RecordingManager:
             }
         )
         return len(frame)
+
+    def validate_dataframe_values(
+        self,
+        frame: pd.DataFrame,
+        column_types: dict[str, str],
+    ) -> None:
+        normalized = {
+            str(name).casefold(): str(column_type)
+            for name, column_type in column_types.items()
+        }
+        for values in frame.itertuples(index=False, name=None):
+            for column, value in zip(frame.columns, values):
+                TrinoTableManager._format_sql_value(
+                    self, value, normalized.get(str(column).casefold(), "")
+                )
 
 
 def _match_item(
@@ -569,6 +585,99 @@ def test_persist_matches_preflights_all_target_schemas_before_live_write() -> No
         "fbref_match_events",
         "fbref_match_player_stats",
     ]
+
+
+@pytest.mark.unit
+def test_persist_matches_preflights_late_target_value_coercion() -> None:
+    manager = RecordingManager()
+    manager.columns["fbref_match_events"] = {"match_id": "VARCHAR"}
+    manager.columns["fbref_match_player_stats"] = {
+        "match_id": "VARCHAR",
+        "numeric_metric": "BIGINT",
+    }
+    item = _match_item(
+        "value-preflight",
+        {
+            "match_events": DatasetParseResult(
+                "match_events",
+                DatasetStatus.AVAILABLE,
+                frame=pd.DataFrame({"match_id": ["value-preflight"]}),
+            ),
+            "match_player_stats": DatasetParseResult(
+                "match_player_stats",
+                DatasetStatus.AVAILABLE,
+                frame=pd.DataFrame(
+                    {
+                        "match_id": ["value-preflight"],
+                        "numeric_metric": ["not-a-number"],
+                    }
+                ),
+            ),
+        },
+    )
+
+    with pytest.raises(ValueError, match="incompatible with BIGINT"):
+        typed.FBrefTypedBronzeWriter(manager).persist_matches([item])
+
+    assert manager.writes == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "clear_columns",
+    [
+        {},
+        {"match_id": "BIGINT"},
+    ],
+    ids=["missing-match-id", "non-textual-match-id"],
+)
+def test_persist_matches_preflights_late_clear_delete_column_contract(
+    clear_columns,
+) -> None:
+    manager = RecordingManager()
+    manager.columns["fbref_match_events"] = {"match_id": "VARCHAR"}
+    manager.columns["fbref_match_player_stats"] = dict(clear_columns)
+    item = _match_item(
+        "clear-preflight",
+        {
+            "match_events": DatasetParseResult(
+                "match_events",
+                DatasetStatus.AVAILABLE,
+                frame=pd.DataFrame({"match_id": ["clear-preflight"]}),
+            ),
+            "match_player_stats": DatasetParseResult(
+                "match_player_stats", DatasetStatus.EMPTY
+            ),
+        },
+    )
+
+    with pytest.raises(
+        typed.TypedBronzePersistenceError,
+        match="textual match_id",
+    ):
+        typed.FBrefTypedBronzeWriter(manager).persist_matches([item])
+
+    assert manager.writes == []
+
+
+@pytest.mark.unit
+def test_persist_matches_requires_textual_availability_delete_columns() -> None:
+    manager = RecordingManager()
+    manager.columns["fbref_match_events"] = {"match_id": "VARCHAR"}
+    manager.columns[typed.MATCH_AVAILABILITY_TABLE] = {
+        "match_id": "VARCHAR",
+        "dataset": "BIGINT",
+    }
+
+    with pytest.raises(
+        typed.TypedBronzePersistenceError,
+        match="textual dataset",
+    ):
+        typed.FBrefTypedBronzeWriter(manager).persist_matches(
+            [_match_item("availability-contract")]
+        )
+
+    assert manager.writes == []
 
 
 @pytest.mark.unit

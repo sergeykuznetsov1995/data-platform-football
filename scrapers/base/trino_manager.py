@@ -688,6 +688,30 @@ WITH (
             escaped = str(val).replace("'", "''")
             return f"'{escaped}'"
 
+    def validate_dataframe_values(
+        self,
+        df: pd.DataFrame,
+        column_types: Mapping[str, str],
+    ) -> None:
+        """Validate every cell with the production SQL-literal formatter.
+
+        This is deliberately zero-I/O and discards each rendered literal. It
+        lets callers prove target-type compatibility for a complete write
+        cohort before any table receives live rows, without logging or
+        retaining values or generated SQL.
+        """
+
+        normalized_types = {
+            str(name).casefold(): str(column_type)
+            for name, column_type in column_types.items()
+        }
+        for source_values in df.itertuples(index=False, name=None):
+            for column, value in zip(df.columns, source_values):
+                self._format_sql_value(
+                    value,
+                    normalized_types.get(str(column).casefold(), ""),
+                )
+
     def insert_dataframe(
         self,
         schema: str,
