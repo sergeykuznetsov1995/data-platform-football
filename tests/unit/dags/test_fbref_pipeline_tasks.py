@@ -427,6 +427,7 @@ def test_bootstrap_validation_proves_succeeded_non_publishing_control_run(
 
     assert evidence["control_status"] == "succeeded"
     assert evidence["publication_eligible"] is False
+    assert evidence["runtime_profile"] == "production"
     validate.assert_called_once_with(
         airflow_run_id="manual__bootstrap",
         dag_id="dag_ingest_fbref",

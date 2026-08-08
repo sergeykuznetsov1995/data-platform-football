@@ -2227,7 +2227,7 @@ def validate_fbref_bootstrap_run(
         "control_status": "succeeded",
         "execution_mode": "bootstrap_only",
         "publication_eligible": False,
-        "runtime_profile": "production_200_requests_100_mib_shard_25",
+        "runtime_profile": execution["profile"],
         "validation_summary": summary,
     }
     logger.info("FBref bootstrap evidence: %s", json.dumps(evidence, default=str))
