@@ -1019,6 +1019,355 @@ def _scope_values(scopes: Sequence[Scope]) -> str:
     )
 
 
+_PLAIN_SEASON_RE = re.compile(r"[0-9]{4}(?:/[0-9]{4})?", re.ASCII)
+
+
+def _coverage_count(value: Any, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a non-negative integer")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a non-negative integer") from exc
+    if normalized < 0 or str(value).strip() not in {
+        str(normalized),
+        f"+{normalized}",
+    }:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return normalized
+
+
+def standings_match_denominator(rows: Sequence[Mapping[str, Any]]) -> int:
+    """Return one non-overlapping match denominator from ``table_type=all``.
+
+    FotMob may expose overall, opening, and closing tables for the same team.
+    Summing every table therefore double-counts matches.  We retain exactly the
+    maximum ``played`` observation per team; stable table identifiers break an
+    equal-played tie so this helper and the SQL implementation are deterministic.
+    """
+
+    selected: dict[str, tuple[int, str, str]] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise TypeError("standings rows must be mappings")
+        if str(row.get("table_type") or "").casefold() != "all":
+            continue
+        raw_team_id = row.get("team_id")
+        if raw_team_id is None or not str(raw_team_id).strip():
+            continue
+        played = _coverage_count(row.get("played"), field="standings played")
+        candidate = (
+            played,
+            str(row.get("table_id") or ""),
+            str(row.get("table_name") or ""),
+        )
+        team_id = str(raw_team_id)
+        current = selected.get(team_id)
+        if current is None or (-candidate[0], candidate[1], candidate[2]) < (
+            -current[0],
+            current[1],
+            current[2],
+        ):
+            selected[team_id] = candidate
+    total_played = sum(item[0] for item in selected.values())
+    if total_played % 2:
+        raise ValueError(
+            "deduplicated standings played total is odd; match denominator is unsafe"
+        )
+    return total_played // 2
+
+
+def classify_scope_coverage(
+    *,
+    source_season_key: str,
+    match_count: int,
+    finished_match_count: int,
+    payload_match_count: int,
+    table_advertised: bool | None,
+    standings_match_count: int | None,
+    terminal_completion: bool,
+) -> str:
+    """Classify one scope into exactly one acceptance category."""
+
+    return _scope_coverage_classification(
+        source_season_key=source_season_key,
+        match_count=match_count,
+        finished_match_count=finished_match_count,
+        payload_match_count=payload_match_count,
+        table_advertised=table_advertised,
+        standings_match_count=standings_match_count,
+        terminal_completion=terminal_completion,
+    )[0]
+
+
+def _scope_coverage_classification(
+    *,
+    source_season_key: str,
+    match_count: int,
+    finished_match_count: int,
+    payload_match_count: int,
+    table_advertised: bool | None,
+    standings_match_count: int | None,
+    terminal_completion: bool,
+) -> tuple[str, str]:
+    """Return the exclusive category plus its first decisive reason."""
+
+    season = str(source_season_key)
+    if not season or season != season.strip():
+        raise ValueError("source_season_key must be non-empty and canonical")
+    matches = _coverage_count(match_count, field="match_count")
+    finished = _coverage_count(
+        finished_match_count, field="finished_match_count"
+    )
+    payloads = _coverage_count(payload_match_count, field="payload_match_count")
+    if finished > matches:
+        raise ValueError("finished_match_count cannot exceed match_count")
+    if payloads > finished:
+        raise ValueError("payload_match_count cannot exceed finished_match_count")
+    if table_advertised is not None and not isinstance(table_advertised, bool):
+        raise ValueError("table_advertised must be a boolean or null")
+    if not isinstance(terminal_completion, bool):
+        raise ValueError("terminal_completion must be a boolean")
+    standings = (
+        None
+        if standings_match_count is None
+        else _coverage_count(
+            standings_match_count, field="standings_match_count"
+        )
+    )
+
+    # This order is the mutual-exclusion contract.  In particular, a terminal
+    # spaced-season completion is legitimate empty evidence, never unreachable.
+    if matches == 0 and terminal_completion:
+        return "empty_but_closed", "terminal_empty_completion"
+    if matches == 0 and _PLAIN_SEASON_RE.fullmatch(season) is None:
+        return "unreachable_token", "nonplain_without_completion"
+    if matches == 0:
+        return "no_matches", "plain_scope_without_matches"
+    if payloads != finished:
+        return "partial", "finished_payload_gap"
+    if table_advertised is None:
+        return "partial", "table_advertised_capability_unknown"
+    effective_standings = 0 if standings is None and finished == 0 else standings
+    if table_advertised and effective_standings != finished:
+        return "partial", "advertised_table_standings_gap"
+    return "satisfied", "finished_payloads_complete"
+
+
+def _scope_coverage_status_sql(
+    scopes: Sequence[Scope],
+    *,
+    manifest: str,
+    matches: str,
+    payloads: str,
+    standings: str,
+    parser_version: str,
+) -> str:
+    """Build the current, source-capability-aware scope coverage query."""
+
+    return f"""-- acceptance:scope-status
+    WITH expected(competition_id, source_season_key) AS (
+        VALUES {_scope_values(scopes)}
+    ), league_season_ranked AS (
+        SELECT CAST(m.competition_id AS BIGINT) competition_id,
+               m.source_season_key,
+               TRY_CAST(json_extract_scalar(m.capabilities_json,
+                   '$.table_advertised') AS BOOLEAN) table_advertised,
+               ROW_NUMBER() OVER (
+                   PARTITION BY m.competition_id, m.source_season_key
+                   ORDER BY m.completed_at DESC, m.batch_id DESC,
+                            m.target_key DESC
+               ) manifest_rn
+        FROM {manifest} m
+        JOIN expected e
+          ON e.competition_id = CAST(m.competition_id AS BIGINT)
+         AND e.source_season_key = m.source_season_key
+        WHERE m.target_type = 'league_season'
+          AND m.status IN ({', '.join(_literal(value) for value in sorted(TERMINAL_STATUSES))})
+          AND m.parser_version = {_literal(parser_version)}
+    ), latest_league_season AS (
+        SELECT competition_id, source_season_key,
+               table_advertised
+        FROM league_season_ranked
+        WHERE manifest_rn = 1
+    ), completion_ranked AS (
+        SELECT CAST(m.competition_id AS BIGINT) competition_id,
+               m.source_season_key,
+               ROW_NUMBER() OVER (
+                   PARTITION BY m.competition_id, m.source_season_key
+                   ORDER BY m.completed_at DESC, m.batch_id DESC,
+                            m.target_key DESC
+               ) completion_rn
+        FROM {manifest} m
+        JOIN expected e
+          ON e.competition_id = CAST(m.competition_id AS BIGINT)
+         AND e.source_season_key = m.source_season_key
+        WHERE m.target_type = 'scope_completion'
+          AND m.status IN ({', '.join(_literal(value) for value in sorted(TERMINAL_STATUSES))})
+          AND m.parser_version = {_literal(parser_version)}
+    ), terminal_completions AS (
+        SELECT competition_id, source_season_key
+        FROM completion_ranked
+        WHERE completion_rn = 1
+    ), match_grain AS (
+        SELECT e.competition_id, e.source_season_key,
+               CAST(match_row.match_id AS VARCHAR) match_id,
+               CASE WHEN COALESCE(match_row.finished, FALSE)
+                    THEN CAST(match_row.match_id AS VARCHAR)
+               END finished_match_id
+        FROM expected e
+        LEFT JOIN {matches} match_row
+          ON CAST(match_row.competition_id AS BIGINT) = e.competition_id
+         AND match_row.source_season_key = e.source_season_key
+    ), match_counts AS (
+        SELECT competition_id, source_season_key,
+               COUNT(DISTINCT match_id) match_count,
+               COUNT(DISTINCT finished_match_id) finished_match_count
+        FROM match_grain
+        GROUP BY 1, 2
+    ), finished_match_ids AS (
+        SELECT DISTINCT competition_id, source_season_key,
+               finished_match_id match_id
+        FROM match_grain
+        WHERE finished_match_id IS NOT NULL
+    ), payload_grain AS (
+        SELECT DISTINCT finished.competition_id,
+               finished.source_season_key,
+               CAST(payload_row.match_id AS VARCHAR) payload_match_id
+        FROM finished_match_ids finished
+        JOIN {payloads} payload_row
+          ON CAST(payload_row.competition_id AS BIGINT) =
+             finished.competition_id
+         AND payload_row.source_season_key = finished.source_season_key
+         AND CAST(payload_row.match_id AS VARCHAR) = finished.match_id
+    ), payload_counts AS (
+        SELECT competition_id, source_season_key,
+               COUNT(DISTINCT payload_match_id) payload_match_count
+        FROM payload_grain
+        GROUP BY 1, 2
+    ), standings_grain AS (
+        SELECT CAST(standings_row.competition_id AS BIGINT) competition_id,
+               standings_row.source_season_key,
+               CAST(standings_row.team_id AS VARCHAR) team_id,
+               TRY_CAST(standings_row.played AS BIGINT) played,
+               COALESCE(CAST(standings_row.table_id AS VARCHAR), '') table_id,
+               COALESCE(CAST(standings_row.table_name AS VARCHAR), '') table_name
+        FROM {standings} standings_row
+        JOIN expected e
+          ON e.competition_id = CAST(standings_row.competition_id AS BIGINT)
+         AND e.source_season_key = standings_row.source_season_key
+        WHERE LOWER(standings_row.table_type) = 'all'
+          AND standings_row.team_id IS NOT NULL
+    ), standings_candidates AS (
+        SELECT competition_id, source_season_key, team_id, played,
+               ROW_NUMBER() OVER (
+                   PARTITION BY competition_id, source_season_key, team_id
+                   ORDER BY played DESC, table_id, table_name
+               ) standings_rn
+        FROM standings_grain
+    ), standings_denominators AS (
+        SELECT competition_id, source_season_key,
+               CASE WHEN COUNT_IF(played IS NULL) = 0
+                          AND MOD(SUM(played), 2) = 0
+                    THEN SUM(played) / 2
+               END standings_match_count
+        FROM standings_candidates
+        WHERE standings_rn = 1
+        GROUP BY 1, 2
+    )
+    SELECT e.competition_id, e.source_season_key,
+           COALESCE(matches.match_count, 0) match_count,
+           COALESCE(matches.finished_match_count, 0) finished_match_count,
+           COALESCE(payloads.payload_match_count, 0) payload_match_count,
+           capabilities.table_advertised,
+           standings.standings_match_count,
+           completion.competition_id IS NOT NULL terminal_completion
+    FROM expected e
+    LEFT JOIN match_counts matches USING (competition_id, source_season_key)
+    LEFT JOIN payload_counts payloads USING (competition_id, source_season_key)
+    LEFT JOIN latest_league_season capabilities
+      USING (competition_id, source_season_key)
+    LEFT JOIN standings_denominators standings
+      USING (competition_id, source_season_key)
+    LEFT JOIN terminal_completions completion
+      USING (competition_id, source_season_key)
+    ORDER BY 1, 2
+    """
+
+
+def _scope_coverage_status_check(
+    client: QueryClient,
+    scopes: Sequence[Scope],
+    *,
+    manifest: str,
+    matches: str,
+    payloads: str,
+    standings: str,
+    parser_version: str,
+) -> Mapping[str, Any]:
+    expected = {(scope.competition_id, scope.source_season_key) for scope in scopes}
+    rows = client.query(
+        _scope_coverage_status_sql(
+            scopes,
+            manifest=manifest,
+            matches=matches,
+            payloads=payloads,
+            standings=standings,
+            parser_version=parser_version,
+        )
+    )
+    if len(rows) != len(scopes) or any(len(row) != 8 for row in rows):
+        raise RuntimeError(
+            "scope status query returned an invalid shape: "
+            f"rows={len(rows)}, expected={len(scopes)}"
+        )
+    observed: set[tuple[int, str]] = set()
+    items: list[dict[str, Any]] = []
+    categories: dict[str, int] = {}
+    for row in rows:
+        identity = (int(row[0]), str(row[1]))
+        if identity not in expected or identity in observed:
+            raise RuntimeError(
+                f"scope status query returned invalid identity {identity!r}"
+            )
+        observed.add(identity)
+        if (row[5] is not None and not isinstance(row[5], bool)) or not isinstance(
+            row[7], bool
+        ):
+            raise RuntimeError("scope status query returned a non-boolean capability")
+        category, reason = _scope_coverage_classification(
+            source_season_key=identity[1],
+            match_count=row[2],
+            finished_match_count=row[3],
+            payload_match_count=row[4],
+            table_advertised=row[5],
+            standings_match_count=row[6],
+            terminal_completion=row[7],
+        )
+        categories[category] = categories.get(category, 0) + 1
+        items.append(
+            {
+                "scope": f"{identity[0]}={identity[1]}",
+                "category": category,
+                "reason": reason,
+                "match_count": int(row[2]),
+                "finished_match_count": int(row[3]),
+                "payload_match_count": int(row[4]),
+                "table_advertised": row[5],
+                "standings_match_count": (
+                    None if row[6] is None else int(row[6])
+                ),
+                "terminal_completion": row[7],
+            }
+        )
+    passing_categories = {"satisfied", "empty_but_closed"}
+    return {
+        "passed": all(item["category"] in passing_categories for item in items),
+        "categories": dict(sorted(categories.items())),
+        "scopes": items,
+    }
+
+
 def _scope_coverage_hash(
     coverage: Mapping[str, Any],
     counts: Mapping[str, int],
@@ -1583,6 +1932,26 @@ def verify(
                 runner_run_id=lineage.runner_run_id,
                 catalog=catalog,
                 schema=bronze_schema,
+            ),
+        )
+    )
+    checks.append(
+        _run_check(
+            "scope_coverage_status",
+            lambda: _scope_coverage_status_check(
+                client,
+                scopes,
+                manifest=manifest,
+                matches=_qualified(
+                    catalog, bronze_schema, "fotmob_matches_current"
+                ),
+                payloads=_qualified(
+                    catalog, bronze_schema, "fotmob_match_payloads_current"
+                ),
+                standings=_qualified(
+                    catalog, bronze_schema, "fotmob_standings_current"
+                ),
+                parser_version=parser_version,
             ),
         )
     )
