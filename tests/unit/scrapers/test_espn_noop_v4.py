@@ -23,7 +23,15 @@ from scrapers.espn.migration import (
     load_promotion_evidence,
     RepositoryMigrationBackend,
 )
-from scrapers.espn.models import DispositionState, IngestPlan, ScopePlan
+from scrapers.espn.models import (
+    Competition,
+    DispositionState,
+    Edition,
+    IngestPlan,
+    RequestDisposition,
+    ScopePlan,
+)
+from scrapers.espn.parsers import parse_scoreboards
 from scrapers.espn.parser_contracts import PARSER_VERSION
 from scrapers.espn.registry import build_discovered_male_registry, load_registry
 from scrapers.espn.repository import (
@@ -84,8 +92,30 @@ def _scope(registry) -> ScopePlan:
 
 
 def _physical_generation(
-    *, scope: ScopePlan, registry_ref: dict[str, str], registry_signature: str
+    *,
+    scope: ScopePlan,
+    competition: Competition,
+    edition: Edition,
+    registry_ref: dict[str, str],
+    registry_signature: str,
 ) -> ScopeGeneration:
+    scoreboard = json.loads((FIXTURES / "native_scoreboard.json").read_text())
+    scoreboard["leagues"][0]["id"] = str(competition.espn_id)
+    scoreboard["leagues"][0]["slug"] = competition.slug
+    event = scoreboard["events"][0]
+    event["season"]["year"] = edition.source_season_year
+    event["date"] = f"{edition.start_date.isoformat()}T12:00Z"
+    event["status"]["type"].update(name="STATUS_SCHEDULED", completed=False)
+    for side in event["competitions"][0]["competitors"]:
+        side.pop("score", None)
+    schedule = parse_scoreboards(
+        json.dumps(scoreboard).encode(),
+        competition=competition,
+        edition=edition,
+        query_start=edition.start_date,
+        query_end=edition.end_date,
+    )
+    event_id = schedule[0].event_id
     ledger = RawLedgerRecord(
         request_id="scoreboard:physical-v3",
         endpoint="scoreboard",
@@ -96,7 +126,7 @@ def _physical_generation(
         fetched_at=datetime(2026, 7, 27, 8, tzinfo=UTC),
         direct_bytes=100,
         proxy_bytes=0,
-        event_ids=(),
+        event_ids=(event_id,),
     )
     generation = ScopeGeneration(
         plan=scope,
@@ -109,12 +139,20 @@ def _physical_generation(
         runtime_version=runner.RUNTIME_VERSION,
         ingested_at=datetime(2026, 7, 27, 9, tzinfo=UTC),
         batch_id="physical-batch-v3",
-        schedule=(),
+        schedule=schedule,
         lineup=(),
         matchsheet=(),
         planned_request_ids=(ledger.request_id,),
         raw_ledger=(ledger,),
-        dispositions=(),
+        dispositions=tuple(
+            RequestDisposition(
+                endpoint=entity,
+                state=DispositionState.NOT_APPLICABLE,
+                detail="nonfinal schedule event",
+                event_id=event_id,
+            )
+            for entity in ("lineup", "matchsheet")
+        ),
     )
     assert validate_scope_generation(generation).passed
     return generation
@@ -210,6 +248,8 @@ def _v4_evidence(
     scope = _scope(registry)
     physical = _physical_generation(
         scope=scope,
+        competition=registry.by_id[scope.espn_id],
+        edition=registry.by_id[scope.espn_id].current_edition,
         registry_ref=registry_ref,
         registry_signature=registry_signature,
     )

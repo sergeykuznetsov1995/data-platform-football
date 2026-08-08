@@ -1108,6 +1108,8 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
                 "empty schedule requires complete successful scoreboard raw evidence "
                 "and no Summary/disposition rows"
             )
+        if scope.capabilities.schedule is CapabilityState.PROVEN:
+            failures.append("empty proven schedule capability")
     scoreboard_event_ids = [
         event_id for item in scoreboard_records for event_id in item.event_ids
     ]
@@ -1241,6 +1243,16 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
         )
         capability = getattr(scope.capabilities, entity)
         summary_count = captured_summary_counts.get(event_id, 0)
+        if not event.summary_required:
+            if disposition.state is not DispositionState.NOT_APPLICABLE:
+                failures.append(
+                    f"nonfinal {entity} must be not_applicable for {event_id}"
+                )
+            if summary_count or sides:
+                failures.append(
+                    f"not_applicable {entity} contains Summary/rows for {event_id}"
+                )
+            continue
         if disposition.state is DispositionState.CAPTURED:
             if summary_count != 1:
                 failures.append(
@@ -1275,12 +1287,10 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
                 )
 
     for event_id, event in schedule_by_event.items():
-        if not event.played_final:
-            continue
         for entity in ("lineup", "matchsheet"):
             if (entity, event_id) not in disposition_index:
                 failures.append(
-                    f"played-final disposition missing for {entity}/{event_id}"
+                    f"event disposition missing for {entity}/{event_id}"
                 )
 
     generation_signature = generation.generation_signature

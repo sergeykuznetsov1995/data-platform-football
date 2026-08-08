@@ -173,6 +173,18 @@ def _generation(**changes) -> ScopeGeneration:
     return ScopeGeneration(**values)
 
 
+def _not_applicable(event: ScheduleRow) -> tuple[RequestDisposition, ...]:
+    return tuple(
+        RequestDisposition(
+            endpoint=entity,
+            state=DispositionState.NOT_APPLICABLE,
+            detail="nonfinal",
+            event_id=event.event_id,
+        )
+        for entity in ("lineup", "matchsheet")
+    )
+
+
 def _track_generation_signature_reads(monkeypatch) -> list[ScopeGeneration]:
     original_getter = ScopeGeneration.generation_signature.fget
     assert original_getter is not None
@@ -502,7 +514,7 @@ def test_exact_scope_dq_accepts_parsed_fixture_and_binds_hashes():
 
 
 @pytest.mark.unit
-def test_valid_empty_scoreboard_requires_complete_exact_raw_evidence():
+def test_proven_schedule_rows_zero_cannot_false_green_on_raw_evidence():
     generation = _generation()
     scoreboard = RawLedgerRecord(
         **{**generation.raw_ledger[0].constructor_values(), "event_ids": ()}
@@ -519,7 +531,9 @@ def test_valid_empty_scoreboard_requires_complete_exact_raw_evidence():
         }
     )
 
-    assert validate_scope_generation(valid_empty).passed
+    report = validate_scope_generation(valid_empty)
+    assert not report.passed
+    assert "empty proven schedule capability" in report.failures
 
     without_scoreboard = ScopeGeneration(
         **{
@@ -528,9 +542,11 @@ def test_valid_empty_scoreboard_requires_complete_exact_raw_evidence():
             "raw_ledger": (),
         }
     )
-    report = validate_scope_generation(without_scoreboard)
-    assert not report.passed
-    assert "successful scoreboard raw evidence" in " ".join(report.failures)
+    missing_report = validate_scope_generation(without_scoreboard)
+    assert not missing_report.passed
+    assert "successful scoreboard raw evidence" in " ".join(
+        missing_report.failures
+    )
 
 
 @pytest.mark.unit
@@ -698,7 +714,7 @@ def test_physical_verification_reads_generation_signature_once(monkeypatch):
             "entity schedule FK",
         ),
         (lambda g: {"matchsheet": (g.matchsheet[0],)}, "matchsheet two-side"),
-        (lambda g: {"dispositions": ()}, "played-final disposition"),
+        (lambda g: {"dispositions": ()}, "event disposition"),
     ],
 )
 def test_dq_negative_branches_fail_closed(mutator, failure):
@@ -732,7 +748,7 @@ def test_terminal_nonplayed_does_not_require_summary_entities():
             "matchsheet": (),
             "planned_request_ids": (generation.planned_request_ids[0],),
             "raw_ledger": (generation.raw_ledger[0],),
-            "dispositions": (),
+            "dispositions": _not_applicable(schedule),
         }
     )
     assert validate_scope_generation(candidate).passed
@@ -777,7 +793,7 @@ def test_terminal_nonplayed_preserves_source_administrative_or_partial_scores(
             "matchsheet": (),
             "planned_request_ids": (generation.planned_request_ids[0],),
             "raw_ledger": (generation.raw_ledger[0],),
-            "dispositions": (),
+            "dispositions": _not_applicable(schedule),
         }
     )
     assert validate_scope_generation(candidate).passed
@@ -1605,7 +1621,7 @@ def test_dq_validates_every_disposition_and_every_emitted_group():
     )
     report = validate_scope_generation(invalid_empty)
     assert not report.passed
-    assert "valid_empty is forbidden for proven lineup" in report.failures
+    assert "nonfinal lineup must be not_applicable for 401000001" in report.failures
 
     one_side = ScopeGeneration(
         **{

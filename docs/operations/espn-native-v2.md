@@ -63,6 +63,8 @@ Compose жёстко задаёт `ESPN_ISOLATED_STACK=1`; fresh DagBag projecti
 export ESPN_RELEASE_ROOT='/absolute/immutable/espn-release-<git-sha>'
 export ESPN_DAGBAG_ROOT='/absolute/new/espn-dagbag-<git-sha>'
 export ESPN_ENV_FILE='/protected/path/espn.env'
+export ESPN_RELEASE_COMMIT='<exact-40-hex-release-commit>'
+export ESPN_RELEASE_TREE_SHA256='<sha256-of-reviewed-release-tree>'
 python scripts/build_espn_dagbag_projection.py \
   --release-root "$ESPN_RELEASE_ROOT" \
   --output "$ESPN_DAGBAG_ROOT"
@@ -363,6 +365,19 @@ master должен быть scheduled, этот rollout заблокирова�
    после них — с daily owner. Этот порядок обязателен после
    init/recreate, когда все ESPN DAG-и могли быть поставлены на паузу:
 
+   Перед trigger атомарно claim exact canary через
+   `scripts.espn_canary_campaign.claim_campaign_attempt`. Identity равен
+   `(ESPN_RELEASE_COMMIT, ESPN_RELEASE_TREE_SHA256, registry_signature,
+   target_scope_sha256)`. Новый release начинает `ordinal001`; продолжение того
+   же campaign может использовать только `ordinal002` и `ordinal003` после
+   immutable failure receipt. `guard_only=True` ledger не меняет и ordinal не
+   расходует. Active/successful/malformed campaign, registry/target/release-tree
+   drift или четвёртая попытка блокируют trigger. Successor release обязан
+   сослаться на exact predecessor failure URI/SHA и непустую remediation.
+   Полученные `campaign_id`, `attempt_id`, zero-padded ordinal и ledger URI/SHA
+   задать полным набором `ESPN_CANARY_*`; неполный или чужой claim отклоняется
+   durable-manifest reducer до финального receipt.
+
    ```bash
    espn_airflow dags pause dag_backfill_espn
    espn_airflow dags pause dag_repair_espn
@@ -409,12 +424,31 @@ offline parse, DQ, COMPLETE manifest, publication evidence и health artifact
 только после зелёного published DQ, пустого списка alerts и успешного release
 lease. Одного durable manifest недостаточно — он создаётся раньше этих проверок.
 
-Production qualification использует `espn-v2-promotion-evidence-v4` и
-`espn-native-runtime-v3`. Для каждого scheduled scope состояние должно быть
+Production qualification использует parser v3/runtime v4. Для каждого
+scheduled scope состояние должно быть
 одинаковым в durable summary, неизменённом `espn-run-manifest-evidence-v1` и
 publication: только `complete` или `noop`. `complete` публикует новую физическую
 COMPLETE generation. `noop` заново проверяет уже выбранную COMPLETE generation,
 но не двигает `ScopeHead.published_at` и не притворяется новой generation.
+
+`espn-durable-run-manifest-v1` теперь содержит встроенные `release` и
+`qualification`, не создавая седьмой public Bronze object. Release связывает
+exact commit/tree, parser/runtime, registry, sorted target SHA и campaign ID.
+Каждый scope получает outcome `complete_new` или `noop_revalidated`; fresh
+no-op обязан содержать текущий signed run-evidence URI/SHA и `recorded_at`.
+Schedule/entity/event dispositions используют только `captured`,
+`valid_empty`, `not_applicable` и структурированные failures на каждом уровне.
+Raw evidence сохраняет exact URI/SHA.
+
+Пустой schedule не может стать зелёным только из-за `rows=0`: все подписанные
+planned windows должны быть успешно получены, schema-valid и unsaturated,
+competition/season ownership должна совпадать, известный nonterminal event не
+может исчезнуть, а empty требует второй более свежей scheduled observation или
+явной source capability metadata. `schedule=proven` с нулём строк всегда red.
+Для каждого `played_final && summary_required` lineup и matchsheet либо
+`captured` с обеими командами, либо evidence-backed `valid_empty` только при
+partial/absent/unknown capability. Каждый nonfinal event явно
+`not_applicable`.
 
 После published DQ рядом с immutable `run-evidence.json` должен лежать
 канонический sibling `qualification-attestation.json` вида
@@ -425,10 +459,12 @@ COMPLETE generation. `noop` заново проверяет уже выбран�
 Attestation связывает текущую квалификацию с выбранной физической generation,
 её registry/parser/runtime, signed plan, lease, publication и DQ.
 
-Все v1 receipts остаются byte-for-byte прежними. В частности,
-`espn-run-success-receipt-v1` не получает поле attestation: receipt доказывает
-успешный финал запуска, а canonical sibling отдельно доказывает связь scope с
-физическими данными. Старые promotion evidence v2/v3 остаются complete-only.
+`espn-run-success-receipt-v1` расширен теми же embedded `release`,
+`canary_campaign` и `qualification`; `receipt_sha256` подписывает их вместе с
+остальным финальным evidence. Canonical sibling attestation остаётся отдельной
+immutable scope-связью и не превращается в новый public object. Старые
+promotion evidence v2/v3 остаются complete-only и не могут квалифицировать
+новый release campaign.
 
 Перед cutover нужны **три последовательных зелёных** scheduled qualification
 запуска `dag_ingest_espn` для того же scope и registry signature. В v4

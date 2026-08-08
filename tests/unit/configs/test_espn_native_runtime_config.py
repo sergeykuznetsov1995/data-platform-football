@@ -95,6 +95,8 @@ def _isolated_environment() -> dict[str, str]:
         "ESPN_POSTGRES_IMAGE": "postgres@example.test/espn@sha256:" + "2" * 64,
         "ESPN_RELEASE_ROOT": "/tmp/espn-release",
         "ESPN_DAGBAG_ROOT": "/tmp/espn-dagbag",
+        "ESPN_RELEASE_COMMIT": "a" * 40,
+        "ESPN_RELEASE_TREE_SHA256": "b" * 64,
         "ESPN_AIRFLOW_DB_PASSWORD": "compose-test",
         "ESPN_AIRFLOW_DATABASE_URL": (
             "postgresql+psycopg2://airflow:compose-test@airflow-metadb:5432/airflow"

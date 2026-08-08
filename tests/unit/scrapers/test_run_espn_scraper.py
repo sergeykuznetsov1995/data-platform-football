@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -685,7 +686,7 @@ def test_initial_capture_fetches_full_calendar_and_one_summary_for_both_entities
 
 
 @pytest.mark.unit
-def test_initial_identity_valid_empty_scoreboard_publishes_complete_generation(
+def test_initial_proven_schedule_rows_zero_fails_closed(
     tmp_path,
 ):
     competition, edition = _competition()
@@ -704,15 +705,94 @@ def test_initial_identity_valid_empty_scoreboard_publishes_complete_generation(
         http_client=client,
     )
 
-    assert result.exit_code == 0
-    generation = repository.generations[0]
-    assert generation.schedule == ()
-    assert generation.lineup == generation.matchsheet == generation.dispositions == ()
-    assert len(generation.raw_ledger) == 1
-    assert generation.raw_ledger[0].endpoint == "scoreboard"
-    assert generation.raw_ledger[0].event_ids == ()
-    assert validate_scope_generation(generation).passed
+    assert result.exit_code == 1
+    assert result.payload["state"] == "incomplete"
+    assert "empty proven schedule capability" in result.payload["scopes"][0]["error"]
+    assert repository.generations == []
     assert all(call[1] is not EndpointType.SUMMARY for call in client.calls)
+
+
+@pytest.mark.unit
+def test_empty_unknown_schedule_requires_second_fresh_observation():
+    from scrapers.espn import runner
+
+    capabilities = EntityCapabilities(
+        schedule=CapabilityState.UNKNOWN,
+        lineup=CapabilityState.UNKNOWN,
+        matchsheet=CapabilityState.UNKNOWN,
+    )
+    competition, edition = _competition(capabilities=capabilities)
+    scope = _scope(competition, edition)
+
+    def observation(fetched_at):
+        return RawLedgerRecord(
+            request_id=f"scoreboard:{fetched_at.isoformat()}",
+            endpoint="scoreboard",
+            event_id=None,
+            disposition=DispositionState.CAPTURED,
+            raw_uri=f"s3://raw/{fetched_at.timestamp()}.json",
+            raw_sha256="a" * 64,
+            fetched_at=fetched_at,
+            direct_bytes=10,
+            proxy_bytes=0,
+            event_ids=(),
+        )
+
+    current = observation(NOW)
+    with pytest.raises(ScopeIncompleteError, match="second scheduled observation"):
+        runner._qualify_empty_schedule(
+            scope=scope,
+            prior=None,
+            current_scoreboard=(current,),
+            mode="daily",
+            current_run_id="espn_daily__current",
+        )
+
+    prior = SimpleNamespace(
+        run_id="espn_daily__prior",
+        schedule=(),
+        raw_ledger=(observation(NOW - timedelta(days=1)),),
+    )
+    runner._qualify_empty_schedule(
+        scope=scope,
+        prior=prior,
+        current_scoreboard=(current,),
+        mode="daily",
+        current_run_id="espn_daily__current",
+    )
+
+
+@pytest.mark.unit
+def test_empty_partial_schedule_accepts_explicit_source_capability_metadata():
+    from scrapers.espn import runner
+
+    capabilities = EntityCapabilities(
+        schedule=CapabilityState.PARTIAL,
+        lineup=CapabilityState.UNKNOWN,
+        matchsheet=CapabilityState.UNKNOWN,
+    )
+    competition, edition = _competition(capabilities=capabilities)
+    scope = _scope(competition, edition)
+    current = RawLedgerRecord(
+        request_id="scoreboard:metadata-empty",
+        endpoint="scoreboard",
+        event_id=None,
+        disposition=DispositionState.CAPTURED,
+        raw_uri="s3://raw/metadata-empty.json",
+        raw_sha256="a" * 64,
+        fetched_at=NOW,
+        direct_bytes=10,
+        proxy_bytes=0,
+        event_ids=(),
+    )
+
+    runner._qualify_empty_schedule(
+        scope=scope,
+        prior=None,
+        current_scoreboard=(current,),
+        mode="backfill",
+        current_run_id="manual__backfill",
+    )
 
 
 @pytest.mark.unit
@@ -2042,7 +2122,7 @@ def test_clean_noop_requires_bound_prior_complete_identity(tmp_path, monkeypatch
 
 
 @pytest.mark.unit
-def test_empty_initial_scope_and_good_scope_publish_independently(tmp_path):
+def test_proven_empty_scope_blocks_run_before_any_scope_publishes(tmp_path):
     first, first_edition = _competition(730, "ita.1")
     second, second_edition = _competition(731, "eng.1")
     options, _ = _plan(
@@ -2069,14 +2149,12 @@ def test_empty_initial_scope_and_good_scope_publish_independently(tmp_path):
         options, repository=repository, raw_store=raw_store, http_client=client
     )
 
-    assert result.exit_code == 0
-    assert [item.plan.scope_id for item in repository.generations] == [
-        first.scope_id(first_edition),
-        second.scope_id(second_edition),
-    ]
-    states = {item["scope_id"]: item["state"] for item in result.payload["scopes"]}
-    assert states[first.scope_id(first_edition)] == "complete"
-    assert states[second.scope_id(second_edition)] == "complete"
+    assert result.exit_code == 1
+    assert result.payload["state"] == "incomplete"
+    assert "empty proven schedule capability" in " ".join(
+        item.get("error", "") for item in result.payload["scopes"]
+    )
+    assert repository.generations == []
 
 
 @pytest.mark.unit
@@ -2626,7 +2704,11 @@ def test_final_to_postponed_refresh_removes_stale_prior_summary_entities(tmp_pat
         == 0
     )
     generation = repository.generations[0]
-    assert generation.lineup == generation.matchsheet == generation.dispositions == ()
+    assert generation.lineup == generation.matchsheet == ()
+    assert [item.state for item in generation.dispositions] == [
+        DispositionState.NOT_APPLICABLE,
+        DispositionState.NOT_APPLICABLE,
+    ]
     assert all(item.endpoint != "summary" for item in generation.raw_ledger)
 
 

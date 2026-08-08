@@ -1981,6 +1981,63 @@ def _disposition(
     )
 
 
+def _not_applicable_dispositions(event: ScheduleRow) -> tuple[RequestDisposition, ...]:
+    if event.summary_required or event.played_final:
+        raise ScopeIncompleteError(
+            f"final event {event.event_id} cannot be not_applicable"
+        )
+    return tuple(
+        RequestDisposition(
+            endpoint=entity,
+            state=DispositionState.NOT_APPLICABLE,
+            detail="nonfinal schedule event does not require Summary",
+            event_id=event.event_id,
+        )
+        for entity in ("lineup", "matchsheet")
+    )
+
+
+def _qualify_empty_schedule(
+    *,
+    scope: ScopePlan,
+    prior: ScopeGeneration | None,
+    current_scoreboard: Sequence[RawLedgerRecord],
+    mode: str,
+    current_run_id: str,
+) -> None:
+    """Require source-backed empty evidence before zero rows may qualify."""
+
+    capability = scope.capabilities.schedule
+    if capability is CapabilityState.PROVEN:
+        raise ScopeIncompleteError("empty proven schedule capability")
+    explicit_source_metadata = capability in {
+        CapabilityState.PARTIAL,
+        CapabilityState.ABSENT,
+    }
+    prior_scoreboard = (
+        tuple(item for item in prior.raw_ledger if item.endpoint == "scoreboard")
+        if prior is not None and not prior.schedule
+        else ()
+    )
+    scheduled_pair = mode == "daily" and current_run_id.startswith(
+        ("scheduled__", "espn_daily__")
+    ) and prior is not None and prior.run_id.startswith(
+        ("scheduled__", "espn_daily__")
+    )
+    second_scheduled_observation = scheduled_pair and bool(prior_scoreboard) and all(
+        item.disposition is DispositionState.CAPTURED for item in prior_scoreboard
+    ) and all(
+        item.disposition is DispositionState.CAPTURED for item in current_scoreboard
+    ) and max(item.fetched_at for item in current_scoreboard) > max(
+        item.fetched_at for item in prior_scoreboard
+    )
+    if not (explicit_source_metadata or second_scheduled_observation):
+        raise ScopeIncompleteError(
+            "empty schedule requires a second scheduled observation or explicit "
+            "source capability metadata"
+        )
+
+
 @dataclass(slots=True)
 class _BudgetState:
     max_events: int
@@ -2091,6 +2148,17 @@ def _prepare_scope_scoreboard(
     if missing_known:
         raise ScopeIncompleteError(
             f"known non-terminal events absent from scoreboard: {missing_known}"
+        )
+    if not fetched_by_event and (full or (prior is not None and not prior.schedule)):
+        _qualify_empty_schedule(
+            scope=scope,
+            prior=prior,
+            current_scoreboard=tuple(
+                _ledger_from_raw(record, event_ids=())
+                for record in scoreboard_records
+            ),
+            mode=mode,
+            current_run_id=loaded.plan.run_id,
         )
     if not fetched_by_event and not full:
         assert prior is not None
@@ -2212,6 +2280,7 @@ def _process_prepared_scope(
         event_id
         for event_id, event in schedule_by_event.items()
         if event_id not in refresh_event_ids
+        and event.summary_required
         and (event_id not in fetched_event_ids or event.played_final)
     }
     lineup = [row for row in prior_lineup if row.event_id in retained_summary_event_ids]
@@ -2263,6 +2332,13 @@ def _process_prepared_scope(
             )
         )
         summary_ledger.append(_ledger_from_raw(record))
+
+    dispositions.extend(
+        disposition
+        for event in schedule
+        if not event.summary_required
+        for disposition in _not_applicable_dispositions(event)
+    )
 
     scoreboard_ledger = _merge_scoreboard_ledger(
         prior,

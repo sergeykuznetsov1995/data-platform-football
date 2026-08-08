@@ -18,6 +18,7 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from scrapers.espn.models import Gender, IngestPlan, ScopePlan
+from scrapers.espn.canary_campaign import CampaignError, CampaignIdentity
 from scrapers.espn.daily_owner import (
     ACTIVE_TRIGGER_STATES,
     DAILY_PARENT_FIELDS,
@@ -80,6 +81,13 @@ ARTIFACT_ROOT_ENV = "ESPN_ARTIFACT_ROOT_URI"
 RAW_STORE_ENV = "ESPN_RAW_STORE_URI"
 DISCOVERY_STATE_REF_URI_ENV = "ESPN_DISCOVERY_STATE_REF_URI"
 DISCOVERY_STATE_REF_SHA256_ENV = "ESPN_DISCOVERY_STATE_REF_SHA256"
+RELEASE_COMMIT_ENV = "ESPN_RELEASE_COMMIT"
+RELEASE_TREE_SHA256_ENV = "ESPN_RELEASE_TREE_SHA256"
+CANARY_CAMPAIGN_ID_ENV = "ESPN_CANARY_CAMPAIGN_ID"
+CANARY_ATTEMPT_ID_ENV = "ESPN_CANARY_ATTEMPT_ID"
+CANARY_ORDINAL_ENV = "ESPN_CANARY_ORDINAL"
+CANARY_LEDGER_URI_ENV = "ESPN_CANARY_LEDGER_URI"
+CANARY_LEDGER_SHA256_ENV = "ESPN_CANARY_LEDGER_SHA256"
 LEASE_TTL = timedelta(hours=12)
 DAILY_BOOTSTRAP_SCOPE_LIMIT = 10
 DISCOVERY_MAX_AGE = timedelta(days=8)
@@ -2827,6 +2835,154 @@ def _qualification_state(value: object) -> str:
     return value
 
 
+def _release_qualification_identity(index: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind qualification to the exact immutable release and target set."""
+
+    try:
+        identity = CampaignIdentity.create(
+            release_commit=os.environ.get(RELEASE_COMMIT_ENV, ""),
+            release_tree_sha256=os.environ.get(RELEASE_TREE_SHA256_ENV, ""),
+            registry_signature=index["registry_signature"],
+            target_scope_ids=index["scope_ids"],
+        )
+    except (CampaignError, KeyError, TypeError) as exc:
+        raise OperationsError(f"ESPN release qualification identity is invalid: {exc}") from exc
+    return {
+        **identity.to_dict(),
+        "parser_version": runner.PARSER_VERSION,
+        "runtime_version": runner.RUNTIME_VERSION,
+    }
+
+
+def _canary_campaign_identity(
+    index: Mapping[str, Any], release: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Require the consumed 001-003 claim for an exact all-scope backfill."""
+
+    if index.get("mode") != "backfill" or len(index.get("scope_ids", ())) != 181:
+        return None
+    campaign_id = _sha(
+        os.environ.get(CANARY_CAMPAIGN_ID_ENV), CANARY_CAMPAIGN_ID_ENV
+    )
+    if campaign_id != release["campaign_id"]:
+        raise OperationsError("canary campaign ID differs from release identity")
+    raw_ordinal = os.environ.get(CANARY_ORDINAL_ENV)
+    try:
+        ordinal = int(raw_ordinal or "")
+    except ValueError as exc:
+        raise OperationsError("canary ordinal must be 001, 002 or 003") from exc
+    if raw_ordinal != f"{ordinal:03d}" or ordinal not in {1, 2, 3}:
+        raise OperationsError("canary ordinal must be 001, 002 or 003")
+    attempt_id = _required(
+        os.environ.get(CANARY_ATTEMPT_ID_ENV), CANARY_ATTEMPT_ID_ENV
+    )
+    if attempt_id != f"{campaign_id}-ordinal{ordinal:03d}":
+        raise OperationsError("canary attempt identity differs from campaign ordinal")
+    ledger_ref = {
+        "uri": _required(
+            os.environ.get(CANARY_LEDGER_URI_ENV), CANARY_LEDGER_URI_ENV
+        ),
+        "sha256": _sha(
+            os.environ.get(CANARY_LEDGER_SHA256_ENV), CANARY_LEDGER_SHA256_ENV
+        ),
+    }
+    return {
+        "campaign_id": campaign_id,
+        "attempt_id": attempt_id,
+        "ordinal": ordinal,
+        "ledger_ref": ledger_ref,
+    }
+
+
+def _scope_qualification_payload(
+    *,
+    publication: Mapping[str, Any],
+    generation,
+    evidence_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build evidence-led dispositions for the existing durable manifest."""
+
+    report = validate_scope_generation(generation)
+    if not report.passed:
+        raise OperationsError(
+            "qualification generation failed DQ: " + "; ".join(report.failures)
+        )
+    if (
+        generation.parser_version,
+        generation.runtime_version,
+    ) != (runner.PARSER_VERSION, runner.RUNTIME_VERSION):
+        raise OperationsError("qualification requires parser-v3/runtime-v4 generation")
+    publication_state = publication["state"]
+    if publication_state == "complete":
+        outcome = "complete_new"
+    elif publication_state == "noop":
+        outcome = "noop_revalidated"
+    else:
+        raise OperationsError("qualification publication outcome is invalid")
+    dispositions = {
+        (item.endpoint, item.event_id): item.state.value
+        for item in generation.dispositions
+    }
+    events = []
+    for event in sorted(generation.schedule, key=lambda item: item.event_id):
+        entities = {}
+        for entity in ("lineup", "matchsheet"):
+            state = dispositions.get((entity, event.event_id))
+            allowed = (
+                {"captured", "valid_empty"}
+                if event.played_final and event.summary_required
+                else {"not_applicable"}
+            )
+            if state not in allowed:
+                raise OperationsError(
+                    f"qualification disposition is unresolved for "
+                    f"{generation.plan.scope_id}/{event.event_id}/{entity}"
+                )
+            entities[entity] = {"state": state, "failures": []}
+        events.append(
+            {
+                "event_id": event.event_id,
+                "played_final": event.played_final,
+                "summary_required": event.summary_required,
+                "entities": entities,
+                "failures": [],
+            }
+        )
+    raw_evidence = [
+        {
+            "request_id": item.request_id,
+            "endpoint": item.endpoint,
+            "event_id": item.event_id,
+            "state": item.disposition.value,
+            "raw_uri": item.raw_uri,
+            "raw_sha256": item.raw_sha256,
+        }
+        for item in sorted(generation.raw_ledger, key=lambda item: item.request_id)
+    ]
+    return {
+        "scope_id": generation.plan.scope_id,
+        "outcome": outcome,
+        "generation_id": generation.generation_id,
+        "generation_signature": generation.generation_signature,
+        "manifest_sha256": generation.manifest_sha256,
+        "parser_version": generation.parser_version,
+        "runtime_version": generation.runtime_version,
+        "registry_signature": generation.registry_signature,
+        "plan_signature": generation.plan_signature,
+        "schedule": {
+            "state": "captured" if generation.schedule else "valid_empty",
+            "failures": [],
+        },
+        "events": events,
+        "raw_evidence": raw_evidence,
+        "revalidation": {
+            "evidence_ref": publication["evidence_ref"],
+            "recorded_at": evidence_payload["recorded_at"],
+        },
+        "failures": [],
+    }
+
+
 def _load_existing_publication_evidence(
     *,
     uri: str,
@@ -3130,6 +3286,7 @@ def persist_run_manifests(
         raise OperationsError("plan index scope descriptor set is incomplete")
     by_scope = {}
     normalized_refs = []
+    scope_qualifications = []
     for wrapped in publication_refs:
         publication_ref = wrapped["publication_ref"]
         publication = _read_ref(publication_ref, kind="espn-publication-result-v1")
@@ -3186,6 +3343,13 @@ def persist_run_manifests(
             raise OperationsError("duplicate scope publication result")
         by_scope[scope.scope_id] = publication
         normalized_refs.append({"publication_ref": publication_ref})
+        scope_qualifications.append(
+            _scope_qualification_payload(
+                publication=publication,
+                generation=generation,
+                evidence_payload=evidence_payload,
+            )
+        )
     if set(by_scope) != set(index["scope_ids"]):
         raise OperationsError("publication result scope set is incomplete")
     durable = PostgresEspnControlStore.from_env().read_run_evidence(
@@ -3224,6 +3388,11 @@ def persist_run_manifests(
     root = _read_ref(index["scope_plan_refs"][0], kind="espn-scope-plan-descriptor-v1")[
         "scope_root"
     ].rsplit("/scopes/", 1)[0]
+    release = _release_qualification_identity(index)
+    canary_campaign = _canary_campaign_identity(index, release)
+    ordered_qualification = sorted(
+        scope_qualifications, key=lambda item: item["scope_id"]
+    )
     manifest = {
         "kind": "espn-durable-run-manifest-v1",
         "schema_version": 1,
@@ -3232,6 +3401,20 @@ def persist_run_manifests(
         "attempt": index["attempt"],
         "registry_signature": index["registry_signature"],
         "scope_ids": index["scope_ids"],
+        "release": release,
+        "canary_campaign": canary_campaign,
+        "qualification": {
+            "scope_count": len(ordered_qualification),
+            "complete_new": sum(
+                item["outcome"] == "complete_new" for item in ordered_qualification
+            ),
+            "noop_revalidated": sum(
+                item["outcome"] == "noop_revalidated"
+                for item in ordered_qualification
+            ),
+            "failures": [],
+            "scopes": ordered_qualification,
+        },
         "evidence": [_evidence_dict(item) for item in durable],
         "publication_refs": sorted(
             normalized_refs,
@@ -4753,6 +4936,24 @@ def propagate_terminal_failure(
         or sorted(release["released"]) != sorted(index["scope_ids"])
     ):
         raise OperationsError("success receipt inputs are not fully green")
+    if durable.get("release") != _release_qualification_identity(index):
+        raise OperationsError("success receipt release identity drift")
+    if durable.get("canary_campaign") != _canary_campaign_identity(
+        index, durable["release"]
+    ):
+        raise OperationsError("success receipt canary campaign identity drift")
+    qualification = durable.get("qualification")
+    if (
+        not isinstance(qualification, Mapping)
+        or qualification.get("scope_count") != len(index["scope_ids"])
+        or qualification.get("complete_new", 0)
+        + qualification.get("noop_revalidated", 0)
+        != len(index["scope_ids"])
+        or qualification.get("failures") != []
+        or [item.get("scope_id") for item in qualification.get("scopes", [])]
+        != sorted(index["scope_ids"])
+    ):
+        raise OperationsError("success receipt qualification is incomplete")
     dq_refs = []
     for descriptor_ref in index["scope_plan_refs"]:
         descriptor = _read_ref(descriptor_ref, kind="espn-scope-plan-descriptor-v1")
@@ -4777,6 +4978,9 @@ def propagate_terminal_failure(
         "scope_ids": index["scope_ids"],
         "registry_ref": admission["registry_ref"],
         "registry_signature": index["registry_signature"],
+        "release": durable["release"],
+        "canary_campaign": durable["canary_campaign"],
+        "qualification": durable["qualification"],
         "admission_ref": admission_ref,
         "plan_index_ref": plan_index_ref,
         "durable_manifest_ref": durable_ref,

@@ -74,6 +74,7 @@ class DispositionState(str, Enum):
     PLANNED = "planned"
     CAPTURED = "captured"
     VALID_EMPTY = "valid_empty"
+    NOT_APPLICABLE = "not_applicable"
     FAILED = "failed"
     SKIPPED = "skipped"
     QUARANTINED = "quarantined"
