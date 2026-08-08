@@ -144,6 +144,30 @@ class TestFotmobNativeRunner:
             mod._parse_scopes(["47="])
 
     @pytest.mark.unit
+    def test_scope_parser_normalizes_only_the_optional_empty_scope_sentinel(self):
+        mod = self._module()
+
+        assert mod._parse_scopes([""]) == ()
+        with pytest.raises(ValueError, match="empty scope fragment"):
+            mod._parse_scopes(["230=2025,"])
+
+    @pytest.mark.unit
+    def test_runner_and_daily_evidence_share_ordered_deduplicated_scopes(self):
+        mod = self._module()
+        daily = importlib.import_module("dag_ingest_fotmob")
+        expected_pairs = ((230, "2025 Apertura"), (47, "2024/2025"))
+        expected_tokens = ("230=2025 Apertura", "47=2024/2025")
+        raw_groups = ["230=2025 Apertura,47=2024/2025", "230=2025 Apertura"]
+
+        assert mod._parse_scopes(raw_groups) == expected_pairs
+        assert daily.validate_scope_tokens(
+            [*expected_tokens, expected_tokens[0]]
+        ) == expected_tokens
+        assert daily._validated_exact_scope_evidence(list(expected_tokens)) == (
+            expected_tokens
+        )
+
+    @pytest.mark.unit
     def test_max_buffered_rows_defaults_high_and_rejects_non_positive(self):
         # The repository's 20k default flushed every ~4 matches once
         # field-inventory rows piled up, defeating --commit-batch-size (#930).

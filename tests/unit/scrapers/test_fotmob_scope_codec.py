@@ -46,3 +46,18 @@ def test_scope_groups_split_commas_once_and_deduplicate_without_reordering():
     assert validate_scope_tokens(
         ["230=2025 Apertura", "47=2024/2025", "230=2025 Apertura"]
     ) == ("230=2025 Apertura", "47=2024/2025")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "values",
+    [
+        ["230=2025,"],
+        [",230=2025"],
+        ["230=2025,,47=2024/2025"],
+        [""],
+    ],
+)
+def test_scope_groups_reject_empty_comma_fragments(values):
+    with pytest.raises(ValueError, match="empty scope fragment"):
+        parse_scope_groups(values)

@@ -497,6 +497,130 @@ class TestNativeValidation:
         )
 
     @pytest.mark.unit
+    def test_daily_evidence_validator_accepts_spaced_source_season(self):
+        mod = _reload_dag_module()
+        payload = _daily_report(mod)
+        original = payload["selection"]["planned_scopes"][0]
+        spaced = "42=2025 Apertura"
+        payload["selection"]["planned_scopes"][0] = spaced
+        payload["selection"]["completed_scopes"][0] = spaced
+        for operation in payload["operations"]:
+            metadata = operation.get("metadata") or {}
+            if metadata.get("scope") == original:
+                metadata["scope"] = spaced
+
+        violations, summary = mod._validate_daily_selection(
+            result=payload,
+            selection=payload["selection"],
+            entities=sorted(mod.FOTMOB_DAILY_ENTITIES),
+            raw_scopes=[],
+            budget=payload["budget"],
+        )
+
+        assert violations == []
+        assert summary["planned_scopes"][0] == spaced
+
+    @pytest.mark.unit
+    def test_replay_evidence_validator_accepts_spaced_source_season(
+        self, tmp_path, monkeypatch
+    ):
+        import json
+
+        from scrapers.fotmob.planner import deterministic_plan_signature
+
+        mod = _reload_dag_module()
+        scope = "230=2025 Apertura"
+        scope_sha256 = hashlib.sha256(f"{scope}\n".encode("utf-8")).hexdigest()
+        contract = {
+            "sha256": "a" * 64,
+            "target_count": 1,
+            "player_ids": [123],
+            "targets": [
+                {
+                    "competition_id": 230,
+                    "source_season_key": "2025 Apertura",
+                    "team_id": 9,
+                    "player_id": 123,
+                }
+            ],
+        }
+        monkeypatch.setattr(mod, "_source_refresh_contract", lambda: contract)
+        monkeypatch.setattr(mod, "FOTMOB_DAILY_SCOPE_COUNT", 1)
+        monkeypatch.setattr(mod, "FOTMOB_DAILY_SCOPE_SHA256", scope_sha256)
+        generation_id = "11111111-1111-4111-8111-111111111111"
+        payload = {
+            "run_id": generation_id,
+            "mode": "replay",
+            "status": "incomplete",
+            "complete": False,
+            "errors": ["missing raw player input"],
+            "selection": {
+                "entities": mod.ISSUE_930_REPLAY_ENTITIES,
+                "explicit_scopes": [scope],
+                "competition_limit": 0,
+                "season_limit": 0,
+                "scope_plan_signature": deterministic_plan_signature(
+                    mod.ISSUE_930_REPLAY_ENTITIES,
+                    policy={
+                        "match_policy": "finished_only",
+                        "leaderboard_policy": "all_advertised",
+                        "team_policy": "global_observed_snapshot",
+                        "player_policy": "global_observed_snapshot",
+                    },
+                ),
+                "planned_scopes": [scope],
+                "completed_scopes": [],
+                "replay_missing_player_inputs": {
+                    "schema": mod.REPLAY_MISSING_INPUT_SCHEMA,
+                    "failure_class": "missing_player_raw_inputs_only",
+                    "missing_player_ids": [123],
+                    "affected_scopes": [scope],
+                },
+            },
+            "transport": {"attempts": 0, "direct_bytes": 0, "proxy_bytes": 0},
+            "budget": {
+                "requests": 0,
+                "max_requests": 2_000,
+                "direct_bytes": 0,
+                "max_direct_bytes": 256 * 1024 * 1024,
+                "proxy_bytes": 0,
+                "max_proxy_bytes": 0,
+            },
+        }
+        result_path = tmp_path / "replay.json"
+        result_path.write_text(json.dumps(payload), encoding="utf-8")
+        task_states = {
+            "validate_publication_writer_fence": ("success", 1),
+            "scrape_fotmob_data": ("failed", 1),
+        }
+        dag_run = type(
+            "ReplayDagRun",
+            (),
+            {
+                "conf": {"fotmob_publication": {"generation_id": generation_id}},
+                "run_id": "issue930_replay_a1__" + generation_id.replace("-", ""),
+                "get_task_instance": lambda _self, task_id: type(
+                    "TaskInstance",
+                    (),
+                    {"state": task_states[task_id][0], "try_number": task_states[task_id][1]},
+                )(),
+            },
+        )()
+
+        proof = mod.prove_replay_missing_player_inputs(
+            str(result_path),
+            dag_run=dag_run,
+            ti=type(
+                "TaskInstance",
+                (),
+                {"task_id": mod.REPLAY_MISSING_INPUT_PROOF_TASK_ID, "try_number": 1},
+            )(),
+        )
+
+        assert proof["scope_count"] == 1
+        assert proof["scope_sha256"] == scope_sha256
+
+    @pytest.mark.unit
     @pytest.mark.parametrize(
         ("mutation", "message"),
         [

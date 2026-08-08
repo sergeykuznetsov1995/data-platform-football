@@ -55,11 +55,9 @@ def parse_scope_groups(values: Iterable[str]) -> tuple[tuple[int, str], ...]:
     for group in values:
         if not isinstance(group, str):
             raise ValueError("scope group must be a string")
-        if not group:
-            continue
         for token in group.split(","):
             if not token:
-                continue
+                raise ValueError("scope group contains an empty scope fragment")
             scope = parse_scope_token(token)
             if scope not in seen:
                 scopes.append(scope)

@@ -774,6 +774,42 @@ def test_kept_paused_attestation_binds_exact_source_refresh_profile(tmp_path):
             )
 
 
+def test_kept_paused_validator_accepts_spaced_exact_source_season(monkeypatch):
+    scope = "230=2025 Apertura"
+    scope_sha256 = hashlib.sha256(f"{scope}\n".encode("utf-8")).hexdigest()
+    monkeypatch.setattr(publication, "FOTMOB_DAILY_SCOPE_COUNT", 1)
+    monkeypatch.setattr(publication, "FOTMOB_DAILY_SCOPE_SHA256", scope_sha256)
+    binding = publication.make_publication_binding(
+        owner="isolated",
+        data_interval_start=START + timedelta(days=1),
+        data_interval_end=START + timedelta(days=1, seconds=1),
+        fingerprint=GIT_SHA,
+    )
+    lifecycle_publication = {
+        "generation_id": publication.make_generation_id(binding),
+        "binding": binding,
+    }
+
+    lifecycle = publication._validate_issue930_kept_paused_writer(
+        {"git_sha": GIT_SHA, "generated_at": START.isoformat()},
+        {
+            "component": "bronze_runner",
+            "mode": "backfill",
+            "scopes": [scope],
+            "entities": sorted(publication.FOTMOB_ISSUE930_WRITER_ENTITIES),
+            "competition_limit": 0,
+            "season_limit": 0,
+            "publication": lifecycle_publication,
+        },
+    )
+
+    assert lifecycle == {
+        "mode": "backfill",
+        "attempt": 1,
+        "generation_id": lifecycle_publication["generation_id"],
+    }
+
+
 def test_isolated_owner_missing_role_env_never_skips_attestation(tmp_path):
     roots, _path, _report, environment, dag_run = _isolated_runtime_evidence(tmp_path)
     environment.pop(publication.FOTMOB_ISOLATED_STACK_ENV)

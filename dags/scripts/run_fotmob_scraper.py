@@ -237,7 +237,13 @@ def _parse_scopes(values: Iterable[str]) -> tuple[tuple[int, str], ...]:
     """Parse repeatable/comma-separated exact ``competition_id=season`` scopes."""
 
     try:
-        return parse_scope_groups(values)
+        groups = tuple(values)
+        # The BashOperator hands the optional default through JSON as one
+        # empty string. Normalize only that sentinel before the strict codec;
+        # an empty item anywhere else is malformed scope input.
+        if groups == ("",):
+            return ()
+        return parse_scope_groups(groups)
     except ValueError as exc:
         raise ValueError(f"invalid --scope: {exc}") from exc
 

@@ -559,7 +559,9 @@ def _validate_issue930_kept_paused_writer(
             raise _airflow_exception("FotMob kept-paused ingest run identity differs")
         raw_scopes = identity.get("scopes")
         raw_scope_items = (
-            raw_scopes.split(",")
+            []
+            if raw_scopes == ""
+            else raw_scopes.split(",")
             if isinstance(raw_scopes, str)
             else list(raw_scopes or ())
         )
