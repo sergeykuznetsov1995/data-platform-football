@@ -29,6 +29,8 @@ from scrapers.fbref.settings import (
     DEFAULT_REQUEST_LIMIT,
     DEFAULT_REQUEST_RESERVATION_BYTES,
     DEFAULT_SHARD_SIZE,
+    FBREF_PRODUCTION_SAFETY_BYTE_LIMIT_MIB,
+    FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT,
     MIB,
 )
 
@@ -96,10 +98,10 @@ def _install_live_runner_sigterm_handler() -> tuple[dict, object]:
 
 # Runtime limits are repeated here intentionally: the Airflow boundary must
 # reject an unsafe dag_run.conf even when Param validation is bypassed.  The
-# only supported live profiles are the measured production budget and the
-# separately bounded canary budget.
-FBREF_PRODUCTION_REQUEST_LIMIT = 200
-FBREF_PRODUCTION_BYTE_LIMIT_MB = 100
+# only supported live profiles are the production emergency circuit and the
+# separately bounded, non-publishing canary.
+FBREF_PRODUCTION_REQUEST_LIMIT = FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT
+FBREF_PRODUCTION_BYTE_LIMIT_MB = FBREF_PRODUCTION_SAFETY_BYTE_LIMIT_MIB
 FBREF_CANARY_REQUEST_LIMIT = 100
 FBREF_CANARY_BYTE_LIMIT_MB = 50
 FBREF_MAX_WARM_SESSION_TARGETS = 25
@@ -307,7 +309,7 @@ def validate_fbref_runtime_limits(
                 for requests, bytes_mb in FBREF_LIVE_BUDGET_PROFILES
             )
             raise ValueError(
-                "Unsupported FBref live budget; use one hard profile: "
+                "Unsupported FBref live safety profile; use one exact profile: "
                 f"{allowed}"
             )
     return {
@@ -448,8 +450,8 @@ def validate_fbref_current_execution_mode(
             or limits["shard_size"] != FBREF_MAX_WARM_SESSION_TARGETS
         ):
             raise ValueError(
-                "FBref bootstrap_only requires exactly 200 requests, "
-                "100 MiB, and shard_size 25"
+                "FBref bootstrap_only requires exactly 4096 requests, "
+                "2048 MiB, and shard_size 25"
             )
         execution_mode = "bootstrap_only"
         publication_eligible = False

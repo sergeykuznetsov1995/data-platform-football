@@ -22,7 +22,11 @@ from typing import Mapping
 from scrapers.fbref.fetcher import FBrefFetcher
 from scrapers.fbref.pipeline import FBrefPipeline, PipelineSettings
 from scrapers.fbref.proxy_lease import FBREF_DAG_IDS
-from scrapers.fbref.settings import MIB
+from scrapers.fbref.settings import (
+    FBREF_PRODUCTION_SAFETY_BYTE_LIMIT_MIB,
+    FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT,
+    MIB,
+)
 
 
 RESULT_PREFIX = "FBREF_LIVE_WAVES_RESULT:"
@@ -206,6 +210,14 @@ def _run(args: argparse.Namespace) -> int:
             "FBREF_PROXY_CONTROL_URL is required; live FBref cannot run direct"
         )
 
+    live_profiles = {
+        (FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT, FBREF_PRODUCTION_SAFETY_BYTE_LIMIT_MIB),
+        (100, 50),
+    }
+    requested_profile = (int(args.request_limit), int(args.byte_limit_mb))
+    if requested_profile not in live_profiles:
+        raise ValueError("Unsupported FBref live safety profile")
+
     settings = PipelineSettings(
         run_type=args.run_type,
         request_limit=args.request_limit,
@@ -228,6 +240,11 @@ def _run(args: argparse.Namespace) -> int:
         raise RuntimeError("FBref control run has invalid paid-proxy DAG provenance")
     if str(run.get("run_type") or "") != args.run_type:
         raise RuntimeError("FBref control run type differs from live runner")
+    if (
+        int(run.get("request_limit") or -1) != settings.request_limit
+        or int(run.get("byte_limit") or -1) != settings.byte_limit
+    ):
+        raise RuntimeError("FBref control run safety profile differs from live runner")
     provider_context = {
         "source": "fbref",
         "dag_id": dag_id,

@@ -4304,6 +4304,36 @@ def test_strict_acceptance_passes_explicit_absence_and_ignores_global_backlog(
 
 
 @pytest.mark.parametrize(
+    ("requests_used", "bytes_used"),
+    [
+        (4096, 128),
+        (1, 2048 * 1024 * 1024),
+    ],
+)
+def test_production_reaching_either_safety_circuit_fails_validation(
+    tmp_path, requests_used, bytes_used
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    run_id = str(uuid.uuid4())
+    summary = _strict_acceptance_summary(control, run_id)
+    summary.update(
+        run_type="current",
+        request_limit=4096,
+        byte_limit=2048 * 1024 * 1024,
+        requests_used=requests_used,
+        bytes_used=bytes_used,
+    )
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(RunValidationError, match="production_safety_circuit_reached"):
+        pipeline.validate_and_finish(run_id, publication_eligible=False)
+
+    assert "finish:True" not in control.events
+
+
+@pytest.mark.parametrize(
     ("mutation", "error"),
     [
         (
@@ -5252,8 +5282,8 @@ def _accepted_replay_source(source_run_id, *, run_type="current"):
     return {
         "run_type": run_type,
         "status": "succeeded",
-        "request_limit": 200,
-        "byte_limit": 100 * 1024 * 1024,
+        "request_limit": 4096,
+        "byte_limit": 2048 * 1024 * 1024,
         "metadata": {
             "execution_mode": "publishing",
             "bootstrap_only": False,
@@ -7156,10 +7186,7 @@ def test_a_warm_session_failure_late_in_a_run_re_solves_on_a_smaller_budget(
     assert control.run["requests_used"] <= 200
 
 
-def test_a_run_that_hits_its_budget_requeues_its_targets_and_ends_clean(tmp_path):
-    """The budget is a ceiling the crawler is meant to stop at. Failing the
-    untouched targets made every day that spent its budget a red run — and left
-    them backing off instead of ready for the next run."""
+def test_canary_that_hits_its_budget_requeues_and_ends_clean(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
     run_id = str(uuid.UUID(int=1))
@@ -7204,7 +7231,13 @@ def test_a_run_that_hits_its_budget_requeues_its_targets_and_ends_clean(tmp_path
         run_id,
         worker_id="worker-1",
         page_kinds=["competition"],
-        settings=_settings(),
+        settings=PipelineSettings(
+            run_type="current",
+            request_limit=100,
+            byte_limit=50 * 1024 * 1024,
+            shard_size=4,
+            domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+        ),
     )
 
     assert result.failures == []
@@ -7214,6 +7247,58 @@ def test_a_run_that_hits_its_budget_requeues_its_targets_and_ends_clean(tmp_path
         "fbref:competition:9",
         "fbref:competition:12",
     ]
+
+
+def test_production_safety_circuit_exhaustion_is_loud_after_requeue(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    run_id = str(uuid.UUID(int=1))
+    requeued = []
+    lease = TargetLease(
+        attempt_id=str(uuid.UUID(int=71)),
+        run_id=run_id,
+        target_id="fbref:competition:9",
+        logical_refresh_id=str(uuid.UUID(int=72)),
+        canonical_url="https://fbref.com/en/comps/9/history/x-Seasons",
+        page_kind="competition",
+        source_ids={"competition_id": "9"},
+        claim_token=str(uuid.UUID(int=73)),
+        lease_epoch=1,
+        attempt_number=1,
+        leased_by="worker-1",
+        lease_expires_at=NOW + timedelta(minutes=10),
+    )
+    control.claim_targets = lambda *args, **kwargs: [lease]
+    control.reserve_budget = lambda *args, **kwargs: (_ for _ in ()).throw(
+        BudgetExceeded("request safety circuit exhausted")
+    )
+    control.requeue_unfetched_targets = lambda items: (
+        requeued.extend(items) or len(items)
+    )
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeFetcher(control.events, b"<html>ok</html>"),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError, match="production_safety_circuit_exhausted"):
+        pipeline.fetch_wave(
+            run_id,
+            worker_id="worker-1",
+            page_kinds=["competition"],
+            settings=PipelineSettings(
+                run_type="current",
+                request_limit=4096,
+                byte_limit=2048 * 1024 * 1024,
+                shard_size=25,
+                domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+            ),
+        )
+
+    assert [item.target_id for item in requeued] == [lease.target_id]
 
 
 def test_the_browser_may_only_spend_the_requests_the_run_reserved(tmp_path):

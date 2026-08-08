@@ -276,7 +276,10 @@ def validate_fbref_proxy_meter(
         or payload.get("fbref_source_ready") is not True
         or payload.get("fbref_dag_ids") != sorted(FBREF_DAG_IDS)
         or daily_total + daily_remaining != daily_budget
-        or min(daily_remaining, dagrun_budget, url_budget, max_lease) < requested
+        # Capability is configured capacity, not today's unused allowance.  A
+        # partly spent day is valid when every ceiling can still represent the
+        # emergency circuit and the counters reconcile exactly.
+        or min(daily_budget, dagrun_budget, url_budget, max_lease) < requested
         or max_ttl < required_ttl
         or max_active != 1
         or configured < minimum

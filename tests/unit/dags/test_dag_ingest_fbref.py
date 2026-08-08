@@ -58,10 +58,10 @@ class TestFBrefCurrentTopology:
     def test_global_budget_and_shard_bounds(self, loaded_dag):
         module, tasks = loaded_dag
         params = module.dag._dag_kwargs["params"]
-        assert params["request_limit"].default == 200
-        assert params["request_limit"]._kw["enum"] == [100, 200]
-        assert params["byte_limit_mb"].default == 100
-        assert params["byte_limit_mb"]._kw["enum"] == [50, 100]
+        assert params["request_limit"].default == 4096
+        assert params["request_limit"]._kw["enum"] == [100, 4096]
+        assert params["byte_limit_mb"].default == 2048
+        assert params["byte_limit_mb"]._kw["enum"] == [50, 2048]
         assert params["shard_size"].default == 25
         assert params["shard_size"]._kw["minimum"] == 1
         assert params["shard_size"]._kw["maximum"] == 25

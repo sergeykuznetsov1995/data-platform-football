@@ -126,8 +126,8 @@ PROCESSING_LEASE_SECONDS = 60 * 60
 # source contract rejection stops looking like a few unusable archived pages
 # and starts looking like FBref having changed its markup.
 MAX_ROUTINE_CONTRACT_QUARANTINES = 5
-REPLAY_SOURCE_REQUEST_LIMIT = 200
-REPLAY_SOURCE_BYTE_LIMIT = 100 * MIB
+REPLAY_SOURCE_REQUEST_LIMIT = DEFAULT_REQUEST_LIMIT
+REPLAY_SOURCE_BYTE_LIMIT = DEFAULT_BYTE_LIMIT
 ACCEPTANCE_REQUEST_LIMIT = 100
 ACCEPTANCE_BYTE_LIMIT = 50 * MIB
 ACCEPTANCE_SHARD_SIZE = 25
@@ -472,9 +472,9 @@ def affordable_clearance_reservation(
     """Return the largest clearance reservation the rest of a run can fund.
 
     The full bootstrap reservation buys every proxy rotation the transport is
-    allowed to try — four solves for a 200-request daily run.  Demanding all
+    allowed to try — four solves for a production run.  Demanding all
     four before a mid-run re-solve is what left ~40 % of the request budget
-    unspent: a warm-session failure at request 120 of 200 could not book
+    unspent: a warm-session failure late in a run could not book
     80 + 2, so the wave handed its remaining targets back even though a solve
     measures ~19 requests.  Offer the retry the largest whole number of
     rotations that still fits alongside one target; the browser is then capped
@@ -499,6 +499,14 @@ def affordable_clearance_reservation(
         if fits:
             return requests, bytes_
     return None
+
+
+def _uses_production_safety_circuit(settings: "PipelineSettings") -> bool:
+    return (
+        settings.run_type in {"current", "backfill"}
+        and settings.request_limit == DEFAULT_REQUEST_LIMIT
+        and settings.byte_limit == DEFAULT_BYTE_LIMIT
+    )
 
 
 @dataclass(frozen=True)
@@ -2359,16 +2367,19 @@ class FBrefPipeline:
                         response.browser_bootstrap_attempts
                     )
                 except BudgetExceeded as exc:
-                    # The budget is a ceiling the crawler is meant to stop at,
-                    # not a fault. Failing these targets made every day that
-                    # spent its budget a red run — and the pages had not even
-                    # been touched. Hand them back to the queue and end the wave
-                    # cleanly; the next run picks them up.
+                    # Canary exhaustion is its expected bounded stop. Reaching
+                    # the much larger production circuit means the run is
+                    # incomplete/runaway and must fail loudly after returning
+                    # every untouched claim to the durable queue.
                     unfetched = leases[lease_index:]
                     result.requeued_at_budget = (
                         self.control.requeue_unfetched_targets(unfetched)
                     )
                     result.budget_exhausted = True
+                    if _uses_production_safety_circuit(settings):
+                        result.failures.append(
+                            "production_safety_circuit_exhausted"
+                        )
                     logger.warning(
                         "FBref run budget exhausted (%s) — %d unfetched "
                         "target(s) returned to the queue for the next run",
@@ -2550,6 +2561,10 @@ class FBrefPipeline:
                             )
                             result.requeued_at_budget += 1 + returned
                             result.budget_exhausted = True
+                            if _uses_production_safety_circuit(settings):
+                                result.failures.append(
+                                    "production_safety_circuit_exhausted"
+                                )
                             logger.warning(
                                 "FBref clearance failed (%s, HTTP %s), but "
                                 "the remaining run budget cannot fund another "
@@ -4719,14 +4734,25 @@ class FBrefPipeline:
                 errors.append(
                     f"{reservation_metric}={reservation_value}"
                 )
-        if int(summary.get("requests_used") or 0) > int(
-            summary.get("request_limit") or 0
+        request_limit = int(summary.get("request_limit") or 0)
+        byte_limit = int(summary.get("byte_limit") or 0)
+        requests_used = int(summary.get("requests_used") or 0)
+        bytes_used = int(summary.get("bytes_used") or 0)
+        production_safety_profile = (
+            str(summary.get("run_type") or "").casefold()
+            in {"current", "backfill"}
+            and request_limit == DEFAULT_REQUEST_LIMIT
+            and byte_limit == DEFAULT_BYTE_LIMIT
+        )
+        if production_safety_profile and (
+            requests_used >= request_limit or bytes_used >= byte_limit
         ):
-            errors.append("request_limit_exceeded")
-        if int(summary.get("bytes_used") or 0) > int(
-            summary.get("byte_limit") or 0
-        ):
-            errors.append("byte_limit_exceeded")
+            errors.append("production_safety_circuit_reached")
+        else:
+            if requests_used > request_limit:
+                errors.append("request_limit_exceeded")
+            if bytes_used > byte_limit:
+                errors.append("byte_limit_exceeded")
         if not isolated_acceptance and str(
             summary.get("run_type") or ""
         ).casefold() != "replay":

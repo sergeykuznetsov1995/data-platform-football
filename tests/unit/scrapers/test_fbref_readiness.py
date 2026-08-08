@@ -146,17 +146,18 @@ def test_camoufox_runtime_rejects_missing_fontconfig(tmp_path):
 
 
 def _meter_payload(**changes):
+    circuit = 2048 * 1024 * 1024
     payload = {
         "status": "ok",
         "meter": "proxy_filter_provider_path_v2",
-        "daily_total_bytes": 10,
-        "daily_budget_bytes": 300_000_000,
-        "daily_remaining_bytes": 299_999_990,
-        "max_lease_bytes": 104_857_600,
+        "daily_total_bytes": circuit - 1024,
+        "daily_budget_bytes": circuit,
+        "daily_remaining_bytes": 1024,
+        "max_lease_bytes": circuit,
         "max_lease_ttl_seconds": 7200,
         "max_active_leases": 1,
-        "dagrun_budget_bytes": 104_857_600,
-        "url_budget_bytes": 104_857_600,
+        "dagrun_budget_bytes": circuit,
+        "url_budget_bytes": circuit,
         "lease_proxy_url": "http://fbref_proxy_filter:8900",
         "configured_pool_count": 4,
         "fbref_source_ready": True,
@@ -191,7 +192,7 @@ def test_proxy_meter_preflight_is_authenticated_secret_safe_and_zero_paid():
     result = validate_fbref_proxy_meter(
         "http://fbref_proxy_filter:8899",
         control_token="s" * 32,
-        required_bytes=100 * 1024 * 1024,
+        required_bytes=2048 * 1024 * 1024,
         minimum_configured_exits=4,
         session=session,
     )
@@ -215,6 +216,7 @@ def test_proxy_meter_preflight_is_authenticated_secret_safe_and_zero_paid():
     [
         (_meter_payload(), 401),
         (_meter_payload(dagrun_budget_bytes=99), 200),
+        (_meter_payload(max_lease_bytes=2048 * 1024 * 1024 - 1), 200),
         (_meter_payload(max_active_leases=2), 200),
         (_meter_payload(lease_proxy_url="http://shared-proxy:8900"), 200),
         (_meter_payload(configured_pool_count=3), 200),
@@ -225,7 +227,7 @@ def test_proxy_meter_preflight_fails_closed(payload, status):
         validate_fbref_proxy_meter(
             "http://fbref_proxy_filter:8899",
             control_token="s" * 32,
-            required_bytes=100 * 1024 * 1024,
+            required_bytes=2048 * 1024 * 1024,
             minimum_configured_exits=4,
             session=_MeterSession(payload, status=status),
         )

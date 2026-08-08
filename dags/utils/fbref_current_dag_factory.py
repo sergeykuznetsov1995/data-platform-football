@@ -81,13 +81,13 @@ def _scheduled_params() -> dict:
             CURRENT_REQUEST_LIMIT,
             type="integer",
             enum=[FBREF_CANARY_REQUEST_LIMIT, CURRENT_REQUEST_LIMIT],
-            description="Hard canary (100) or production (200) request cap",
+            description="Canary (100) or production safety circuit (4096)",
         ),
         "byte_limit_mb": Param(
             CURRENT_BYTE_LIMIT_MB,
             type="integer",
             enum=[FBREF_CANARY_BYTE_LIMIT_MB, CURRENT_BYTE_LIMIT_MB],
-            description="Hard canary (50) or production (100) MiB cap",
+            description="Canary (50) or production safety circuit (2048 MiB)",
         ),
         "shard_size": Param(
             DEFAULT_SHARD_SIZE,
@@ -115,7 +115,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         ## FBref manual bootstrap
 
         This DAG has no schedule and is safe to leave unpaused. It always uses
-        the exact production `200 requests / 100 MiB / shard 25` profile. It
+        the exact production `4096 requests / 2048 MiB / shard 25` safety profile. It
         performs raw recovery, live fetch, parse, and integrity validation,
         then releases the publication lock. Freshness, scope export, canary,
         and Silver tasks do not exist in this DAG.
@@ -138,7 +138,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         shared PostgreSQL request/byte budget and commits raw bytes before
         parsing. Silver starts only after final completeness/traffic
         validation passes. DagRun conf may select only the measured `100/50`
-        canary profile or the default `200/100` production profile; every warm
+        canary profile or the default `4096/2048` production safety profile; every warm
         session claims at most 25 targets. A content-hashed raw inventory is
         captured before recovery/fetch, and publication is gated by a
         persisted integrity artifact. ALERT_ENV must be `prod` before the

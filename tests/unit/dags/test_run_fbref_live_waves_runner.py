@@ -46,6 +46,45 @@ def test_parser_defaults_to_eighty_live_batches():
     assert tuple(action.choices) == tuple(range(1, 81))
 
 
+@pytest.mark.parametrize(
+    ("request_limit", "byte_limit_mb"),
+    [
+        (4096, 50),
+        (100, 2048),
+        (4097, 2048),
+        (4096, 2049),
+        (200, 100),
+    ],
+)
+def test_runner_rejects_non_profile_pair_before_pipeline_construction(
+    monkeypatch, request_limit, byte_limit_mb
+):
+    constructed = []
+    monkeypatch.setenv("FBREF_PROXY_CONTROL_URL", "http://fbref_proxy_filter:8899")
+    monkeypatch.setattr(
+        runner.FBrefPipeline,
+        "from_env",
+        lambda: constructed.append(True),
+    )
+    args = Namespace(
+        control_run_id="control-run",
+        worker_id="live",
+        page_kinds="match",
+        run_type="current",
+        request_limit=request_limit,
+        byte_limit_mb=byte_limit_mb,
+        shard_size=25,
+        reservation_mb=3,
+        domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+        max_batches=80,
+    )
+
+    with pytest.raises(ValueError, match="Unsupported FBref live"):
+        runner._run(args)
+
+    assert constructed == []
+
+
 def test_bootstrap_control_run_is_allowed_through_live_transport(
     monkeypatch,
     capsys,
@@ -53,6 +92,8 @@ def test_bootstrap_control_run_is_allowed_through_live_transport(
     control = SimpleNamespace(
         get_run=lambda _run_id: {
             "run_type": "current",
+            "request_limit": 4096,
+            "byte_limit": 2048 * 1024 * 1024,
             "metadata": {"dag_id": "dag_bootstrap_fbref"},
         }
     )
@@ -79,8 +120,8 @@ def test_bootstrap_control_run_is_allowed_through_live_transport(
         worker_id="bootstrap-live",
         page_kinds="competition_index,competition",
         run_type="current",
-        request_limit=200,
-        byte_limit_mb=100,
+        request_limit=4096,
+        byte_limit_mb=2048,
         shard_size=25,
         reservation_mb=3,
         domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
@@ -88,20 +129,20 @@ def test_bootstrap_control_run_is_allowed_through_live_transport(
     )
 
     assert runner._run(args) == 0
-    pipeline.fetcher_factory(None, 200, 100 * 1024 * 1024)
+    pipeline.fetcher_factory(None, 4096, 2048 * 1024 * 1024)
 
     assert fetcher_kwargs["provider_context"]["dag_id"] == (
         "dag_bootstrap_fbref"
     )
-    assert fetcher_kwargs["provider_max_bytes"] == 100 * 1024 * 1024
+    assert fetcher_kwargs["provider_max_bytes"] == 2048 * 1024 * 1024
     assert '"status": "complete"' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
     ("bytes_used", "bytes_reserved", "expected_provider_max_bytes"),
     [
-        (5_400_000, 100_000, 100 * 1024 * 1024 - 5_500_000),
-        (100 * 1024 * 1024, 1, 0),
+        (5_400_000, 100_000, 2048 * 1024 * 1024 - 5_500_000),
+        (2048 * 1024 * 1024, 1, 0),
     ],
 )
 def test_retry_attempt_requests_only_the_remaining_dagrun_budget(
@@ -117,6 +158,8 @@ def test_retry_attempt_requests_only_the_remaining_dagrun_budget(
     control = SimpleNamespace(
         get_run=lambda _run_id: {
             "run_type": "current",
+            "request_limit": 4096,
+            "byte_limit": 2048 * 1024 * 1024,
             "metadata": {"dag_id": "dag_ingest_fbref"},
             "bytes_used": bytes_used,
             "bytes_reserved": bytes_reserved,
@@ -145,8 +188,8 @@ def test_retry_attempt_requests_only_the_remaining_dagrun_budget(
         worker_id="retry-live",
         page_kinds="competition_index,competition",
         run_type="current",
-        request_limit=200,
-        byte_limit_mb=100,
+        request_limit=4096,
+        byte_limit_mb=2048,
         shard_size=25,
         reservation_mb=3,
         domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
@@ -154,10 +197,50 @@ def test_retry_attempt_requests_only_the_remaining_dagrun_budget(
     )
 
     assert runner._run(args) == 0
-    pipeline.fetcher_factory(None, 200, 100 * 1024 * 1024)
+    pipeline.fetcher_factory(None, 4096, 2048 * 1024 * 1024)
 
     assert fetcher_kwargs["provider_max_bytes"] == expected_provider_max_bytes
     assert '"status": "complete"' in capsys.readouterr().out
+
+
+def test_runner_rejects_stored_profile_mismatch_before_fetcher_construction(
+    monkeypatch,
+):
+    fetcher_constructed = []
+    control = SimpleNamespace(
+        get_run=lambda _run_id: {
+            "run_type": "current",
+            "request_limit": 100,
+            "byte_limit": 50 * 1024 * 1024,
+            "metadata": {"dag_id": "dag_ingest_fbref"},
+        }
+    )
+    pipeline = SimpleNamespace(control=control, fetcher_factory=None)
+    monkeypatch.setenv("FBREF_PROXY_CONTROL_URL", "http://fbref_proxy_filter:8899")
+    monkeypatch.setattr(runner.FBrefPipeline, "from_env", lambda: pipeline)
+    monkeypatch.setattr(
+        runner,
+        "FBrefFetcher",
+        lambda **_kwargs: fetcher_constructed.append(True),
+    )
+    args = Namespace(
+        control_run_id="control-run",
+        worker_id="live",
+        page_kinds="match",
+        run_type="current",
+        request_limit=4096,
+        byte_limit_mb=2048,
+        shard_size=25,
+        reservation_mb=3,
+        domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+        max_batches=80,
+    )
+
+    with pytest.raises(RuntimeError, match="profile differs"):
+        runner._run(args)
+
+    assert fetcher_constructed == []
+    assert pipeline.fetcher_factory is None
 
 
 def _dead_or_zombie(pid: int) -> bool:

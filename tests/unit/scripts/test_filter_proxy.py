@@ -1969,8 +1969,11 @@ def test_fbref_has_an_isolated_metered_proxy_service():
     assert "PROXY_FILTER_CONTROL_TOKEN: ${FBREF_PROXY_CONTROL_TOKEN:-}" in service
     assert "SOFASCORE_PROXY_CONTROL_TOKEN" not in service
     assert "http://fbref_proxy_filter:8900" in service
-    assert "${FBREF_PROXY_DAGRUN_BUDGET_BYTES:-104857600}" in service
-    assert "${FBREF_PROXY_URL_BUDGET_BYTES:-104857600}" in service
+    assert service.count("${FBREF_PROXY_SAFETY_CIRCUIT_MIB:-2048}") == 1
+    assert "FBREF_PROXY_DAILY_BUDGET_MB" not in service
+    assert "FBREF_PROXY_MAX_LEASE_MB" not in service
+    assert "FBREF_PROXY_DAGRUN_BUDGET_BYTES" not in service
+    assert "FBREF_PROXY_URL_BUDGET_BYTES" not in service
     assert '\n      - "1"' in service
     assert "/logs/fbref/proxy_filter/unused_sofascore_claims.jsonl" in service
     assert "/logs/proxy_filter/sofascore_allocation_claims.jsonl" not in service
@@ -1985,6 +1988,16 @@ def test_fbref_control_secret_is_explicit_in_airflow_and_example_env():
     assert "FBREF_PROXY_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}" not in (
         compose
     )
+
+    example = _ENV_EXAMPLE_PATH.read_text()
+    assert "FBREF_PROXY_SAFETY_CIRCUIT_MIB=2048" in example
+    for stale in (
+        "FBREF_PROXY_DAILY_BUDGET_MB",
+        "FBREF_PROXY_MAX_LEASE_MB",
+        "FBREF_PROXY_DAGRUN_BUDGET_BYTES",
+        "FBREF_PROXY_URL_BUDGET_BYTES",
+    ):
+        assert stale not in example
 
     example = _ENV_EXAMPLE_PATH.read_text()
     assert "\nFBREF_PROXY_CONTROL_TOKEN=\n" in example
@@ -6802,6 +6815,7 @@ def test_fbref_never_retries_zero_byte_tcp_dial_failure(mod, monkeypatch):
     assert lease.upstream_repins == 0
     assert lease.upstream == ("pool.invalid", 10000, "u", "p")
     assert mgr.calls == 0
+    assert mod._upstream_identity(lease.upstream) in mod._fbref_failed_until
 
 
 def test_lease_connect_failover_is_refused_after_first_provider_payload_byte(
@@ -7839,6 +7853,210 @@ def _make_fbref_lease(mod, mgr, *, max_bytes=1000):
         metadata=_fbref_context(),
         require_context=True,
     )
+
+
+def test_fbref_selector_distinguishes_username_and_skips_failed_identity(mod):
+    mgr = _FakeManager(
+        [
+            "http://session-a:password-a@POOL.invalid:10000",
+            "http://session-b:password-b@pool.invalid:10000",
+        ]
+    )
+
+    first = mod._fbref_select_upstream(mgr)
+    mod._record_fbref_upstream_failure(first)
+    second = mod._fbref_select_upstream(mgr)
+
+    assert first[:2] == second[:2]
+    assert first[2] != second[2]
+    assert mod._fbref_upstream_fingerprint(first) != mod._fbref_upstream_fingerprint(second)
+
+
+def test_fbref_selector_is_bounded_and_rejects_one_entry_until_cooldown(mod):
+    mgr = _FakeManager(["http://private-user:private-pass@pool.invalid:10000"])
+    first = mod._fbref_select_upstream(mgr)
+    mod._record_fbref_upstream_failure(first)
+
+    with pytest.raises(mod.FBrefUpstreamUnavailable, match="upstream unavailable"):
+        mod._fbref_select_upstream(mgr)
+
+    assert mgr.calls <= mgr.total_count
+
+
+def test_fbref_selector_treats_host_case_duplicate_as_same_identity(mod):
+    mgr = _FakeManager(
+        [
+            "http://same-user:password-a@POOL.invalid:10000",
+            "http://same-user:password-b@pool.INVALID:10000",
+        ]
+    )
+    first = mod._fbref_select_upstream(mgr)
+    mod._record_fbref_upstream_failure(first)
+
+    with pytest.raises(mod.FBrefUpstreamUnavailable):
+        mod._fbref_select_upstream(mgr)
+
+
+def test_fbref_selector_stops_after_every_unique_identity_is_unhealthy(mod):
+    mgr = _FakeManager(
+        [
+            "http://session-a:password-a@pool.invalid:10000",
+            "http://session-b:password-b@pool.invalid:10001",
+        ]
+    )
+    first = mod._fbref_select_upstream(mgr)
+    mod._record_fbref_upstream_failure(first)
+    second = mod._fbref_select_upstream(mgr)
+    mod._record_fbref_upstream_failure(second)
+
+    with pytest.raises(mod.FBrefUpstreamUnavailable):
+        mod._fbref_select_upstream(mgr)
+
+    assert len(mod._fbref_failed_until) == 2
+    assert mgr.calls == 0
+
+
+def test_fbref_one_entry_reuses_only_after_cooldown(mod, monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(mod, "_wall_time", lambda: now[0])
+    mgr = _FakeManager(["http://private-user:private-pass@pool.invalid:10000"])
+    first = mod._fbref_select_upstream(mgr)
+    mod._record_fbref_upstream_failure(first)
+
+    with pytest.raises(mod.FBrefUpstreamUnavailable):
+        mod._fbref_select_upstream(mgr)
+    now[0] += mod.FBREF_UPSTREAM_COOLDOWN_SECONDS
+
+    assert mod._upstream_identity(mod._fbref_select_upstream(mgr)) == (
+        mod._upstream_identity(first)
+    )
+    assert mod._fbref_failed_until == {}
+
+
+def test_fbref_selector_skips_manager_banned_entries_and_bounds_state(mod):
+    class Candidate:
+        def __init__(self, username, *, banned=False):
+            self.host = "pool.invalid"
+            self.port = 10000
+            self.username = username
+            self.password = "not-for-output"
+            self.is_banned = banned
+
+    class Manager:
+        _proxies = [Candidate("banned-user", banned=True), Candidate("healthy-user")]
+        total_count = 2
+
+    selected = mod._fbref_select_upstream(Manager())
+    assert selected[2] == "healthy-user"
+    mod._fbref_failed_until[("removed.invalid", 9, "removed-user")] = 9999999999.0
+    mod._record_fbref_upstream_failure(selected)
+
+    with pytest.raises(mod.FBrefUpstreamUnavailable):
+        mod._fbref_select_upstream(Manager())
+
+    assert set(mod._fbref_failed_until) == {mod._upstream_identity(selected)}
+
+
+def test_fbref_failure_log_and_error_are_session_hash_only(mod, caplog):
+    upstream = ("192.0.2.44", 10000, "private-user", "private-password")
+    with caplog.at_level("WARNING"):
+        mod._record_fbref_upstream_failure(upstream)
+    rendered = caplog.text + repr(mod.FBrefUpstreamUnavailable())
+
+    assert mod._fbref_upstream_fingerprint(upstream) in rendered
+    for secret in ("192.0.2.44", "private-user", "private-password", "http://"):
+        assert secret not in rendered
+
+
+def test_fbref_lease_report_returns_only_session_hash(mod):
+    mgr = _FakeManager(
+        ["http://private-user:private-pass@pool.invalid:10000"]
+    )
+    lease = _make_fbref_lease(mod, mgr)
+    report = lease.report()
+    rendered = repr(report)
+
+    assert report["upstream_fingerprint"] == mod._fbref_upstream_fingerprint(
+        lease.upstream
+    )
+    for secret in ("pool.invalid", "private-user", "private-pass", "http://"):
+        assert secret not in rendered
+
+
+def test_non_fbref_fingerprint_and_random_selection_contract_are_unchanged(mod):
+    first = ("pool.invalid", 10000, "session-a", "password-a")
+    second = ("pool.invalid", 10000, "session-b", "password-b")
+    mgr = _FakeManager(
+        [
+            "http://session-a:password-a@pool.invalid:10000",
+            "http://session-b:password-b@pool.invalid:10000",
+        ]
+    )
+
+    assert mod._upstream_fingerprint(first) == mod._upstream_fingerprint(second)
+    assert mod._pick_upstream(mgr)[2] == "session-a"
+    assert mod._pick_upstream(mgr)[2] == "session-b"
+    assert mgr.calls == 2
+
+
+def test_all_unhealthy_fbref_pool_returns_redacted_503_not_budget_429(mod):
+    mgr = _FakeManager(
+        ["http://private-user:private-pass@pool.invalid:10000"]
+    )
+    failed = mod._fbref_select_upstream(mgr)
+    mod._record_fbref_upstream_failure(failed)
+    mod.DAILY_BUDGET_BYTES = 5000
+    mod.DAGRUN_BUDGET_BYTES = 5000
+    mod.URL_BUDGET_BYTES = 5000
+    mod.MAX_LEASE_BYTES = 5000
+    request = json.dumps(
+        {
+            **_fbref_context(),
+            "max_bytes": 1000,
+            "ttl_seconds": 30,
+        }
+    ).encode()
+
+    class Reader:
+        async def readexactly(self, length):
+            assert length == len(request)
+            return request
+
+    class Writer:
+        def __init__(self):
+            self.payload = bytearray()
+
+        def write(self, value):
+            self.payload.extend(value)
+
+        async def drain(self):
+            return None
+
+        def close(self):
+            return None
+
+    writer = Writer()
+    handled = asyncio.run(
+        mod._handle_control(
+            "POST",
+            "/v1/leases",
+            {
+                "content-length": str(len(request)),
+                "x-proxy-control-token": mod.CONTROL_TOKEN,
+            },
+            Reader(),
+            writer,
+            mgr,
+        )
+    )
+    payload = bytes(writer.payload)
+
+    assert handled is True
+    assert b"503 Service Unavailable" in payload
+    assert b'"code":"upstream_unavailable"' in payload
+    assert b"429 Too Many Requests" not in payload
+    for secret in (b"pool.invalid", b"private-user", b"private-pass", b"http://"):
+        assert secret not in payload
 
 
 def test_uncertain_fbref_lease_settles_conservatively_and_frees_slot(mod):

@@ -5811,9 +5811,7 @@ class ControlStore:
                 # Abort bookkeeping stamps in-flight attempts with the classes
                 # below (#1102).  They are deliberate run-lifecycle evidence,
                 # not unclassified surprises — without them here a resumed run
-                # was branded red by the accounting of its own abort (one
-                # stamped attempt over a 200-request profile is exactly the
-                # 0.005 gate threshold).
+                # was branded red by the accounting of its own abort.
                 "AirflowDagFailure",
                 "RunAborted",
                 "LiveWavesSubprocessTimeout",

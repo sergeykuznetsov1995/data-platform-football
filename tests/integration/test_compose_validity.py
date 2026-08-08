@@ -226,6 +226,21 @@ class TestComposeFile:
         )
         assert scheduler["healthcheck"]["test"][0] == "CMD-SHELL"
 
+    def test_fbref_filter_renders_one_production_safety_circuit(self):
+        cfg = _compose_config_json()
+        service = cfg["services"]["fbref_proxy_filter"]
+        command = service["command"]
+
+        assert service["environment"]["FBREF_PROXY_SAFETY_CIRCUIT_MIB"] == "2048"
+        assert command[command.index("--max-active-leases") + 1] == "1"
+        for stale_flag in (
+            "--daily-budget-mb",
+            "--max-lease-mb",
+            "--dagrun-budget-bytes",
+            "--url-budget-bytes",
+        ):
+            assert stale_flag not in command
+
     def test_required_bi_catalog_services_present(self):
         cfg = _compose_config_json()
         services = cfg.get("services", {})

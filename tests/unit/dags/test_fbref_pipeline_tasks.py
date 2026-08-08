@@ -55,7 +55,7 @@ def _freshness_summary(*, stale_kind: str | None = None) -> dict:
 @pytest.mark.unit
 def test_runtime_limits_allow_only_hard_production_canary_and_replay_profiles():
     production = fbref_pipeline_tasks.validate_fbref_runtime_limits(
-        run_type="current", request_limit=200, byte_limit_mb=100, shard_size=25
+        run_type="current", request_limit=4096, byte_limit_mb=2048, shard_size=25
     )
     canary = fbref_pipeline_tasks.validate_fbref_runtime_limits(
         run_type="backfill", request_limit=100, byte_limit_mb=50, shard_size=1
@@ -68,27 +68,41 @@ def test_runtime_limits_allow_only_hard_production_canary_and_replay_profiles():
     assert canary["profile"] == "canary"
     assert replay["profile"] == "replay"
 
-    with pytest.raises(ValueError, match="Unsupported FBref live budget"):
+    with pytest.raises(ValueError, match="Unsupported FBref live safety profile"):
         fbref_pipeline_tasks.validate_fbref_runtime_limits(
             run_type="current",
-            request_limit=200,
+            request_limit=4096,
             byte_limit_mb=50,
             shard_size=25,
         )
     with pytest.raises(ValueError, match="between 1 and 25"):
         fbref_pipeline_tasks.validate_fbref_runtime_limits(
             run_type="current",
-            request_limit=200,
-            byte_limit_mb=100,
+            request_limit=4096,
+            byte_limit_mb=2048,
             shard_size=26,
         )
     with pytest.raises(ValueError, match="Unknown FBref run_type"):
         fbref_pipeline_tasks.validate_fbref_runtime_limits(
             run_type="adhoc",
-            request_limit=200,
-            byte_limit_mb=100,
+            request_limit=4096,
+            byte_limit_mb=2048,
             shard_size=25,
         )
+
+
+@pytest.mark.unit
+def test_production_safety_circuit_has_worst_case_request_headroom():
+    worst_case = 80 * 25 * 2 + 4 * 20
+
+    assert worst_case == 4080
+    assert worst_case < fbref_pipeline_tasks.FBREF_PRODUCTION_REQUEST_LIMIT
+    assert fbref_pipeline_tasks.FBREF_PRODUCTION_REQUEST_LIMIT == 4096
+    assert fbref_pipeline_tasks.FBREF_PRODUCTION_BYTE_LIMIT_MB == 2048
+    assert (
+        fbref_pipeline_tasks.FBREF_CANARY_REQUEST_LIMIT,
+        fbref_pipeline_tasks.FBREF_CANARY_BYTE_LIMIT_MB,
+    ) == (100, 50)
 
 
 @pytest.mark.unit
@@ -115,8 +129,8 @@ def test_live_wave_limits_allow_exactly_eighty_batches(monkeypatch):
                 worker_id="current-live",
                 page_kinds=["match"],
                 run_type="current",
-                request_limit=200,
-                byte_limit_mb=100,
+                request_limit=4096,
+                byte_limit_mb=2048,
                 shard_size=25,
                 max_batches=invalid,
             )
@@ -159,8 +173,8 @@ def test_live_wave_wrapper_accepts_int_and_templated_int_string(
         worker_id="current-live",
         page_kinds=["match"],
         run_type="current",
-        request_limit=200,
-        byte_limit_mb=100,
+        request_limit=4096,
+        byte_limit_mb=2048,
         shard_size=25,
         max_batches=max_batches,
     )
@@ -180,7 +194,7 @@ def test_canary_publication_path_is_non_publishing():
     )
     assert (
         fbref_pipeline_tasks.choose_fbref_publication_path(
-            request_limit=200, byte_limit_mb=100
+            request_limit=4096, byte_limit_mb=2048
         )
         == "validate_current_scope_freshness"
     )
@@ -191,15 +205,15 @@ def test_bootstrap_mode_is_manual_exact_and_non_publishing():
     scheduled = fbref_pipeline_tasks.validate_fbref_current_execution_mode(
         bootstrap_only=False,
         dag_run_type="scheduled",
-        request_limit=200,
-        byte_limit_mb=100,
+        request_limit=4096,
+        byte_limit_mb=2048,
         shard_size=25,
     )
     bootstrap = fbref_pipeline_tasks.validate_fbref_current_execution_mode(
         bootstrap_only=True,
         dag_run_type="manual",
-        request_limit=200,
-        byte_limit_mb=100,
+        request_limit=4096,
+        byte_limit_mb=2048,
         shard_size=25,
     )
     canary = fbref_pipeline_tasks.validate_fbref_current_execution_mode(
@@ -220,8 +234,8 @@ def test_bootstrap_mode_is_manual_exact_and_non_publishing():
         {
             "bootstrap_only": True,
             "dag_run_type": "scheduled",
-            "request_limit": 200,
-            "byte_limit_mb": 100,
+            "request_limit": 4096,
+            "byte_limit_mb": 2048,
             "shard_size": 25,
         },
         {
@@ -234,8 +248,8 @@ def test_bootstrap_mode_is_manual_exact_and_non_publishing():
         {
             "bootstrap_only": True,
             "dag_run_type": "manual",
-            "request_limit": 200,
-            "byte_limit_mb": 100,
+            "request_limit": 4096,
+            "byte_limit_mb": 2048,
             "shard_size": 24,
         },
     )
@@ -248,8 +262,8 @@ def test_bootstrap_mode_is_manual_exact_and_non_publishing():
         fbref_pipeline_tasks.validate_fbref_current_execution_mode(
             bootstrap_only="sometimes",
             dag_run_type="manual",
-            request_limit=200,
-            byte_limit_mb=100,
+            request_limit=4096,
+            byte_limit_mb=2048,
             shard_size=25,
         )
 
@@ -266,8 +280,8 @@ def test_readiness_rejects_scheduled_bootstrap_before_dependency_checks(
     with pytest.raises(ValueError, match="requires a manual DagRun"):
         fbref_pipeline_tasks.validate_fbref_production_readiness(
             run_type="current",
-            request_limit=200,
-            byte_limit_mb=100,
+            request_limit=4096,
+            byte_limit_mb=2048,
             shard_size=25,
             bootstrap_only=True,
             dag_run_type="scheduled",
@@ -290,8 +304,8 @@ def test_initialize_bootstrap_records_control_execution_evidence(monkeypatch):
         airflow_run_id="manual__bootstrap",
         dag_id="dag_ingest_fbref",
         run_type="current",
-        request_limit=200,
-        byte_limit_mb=100,
+        request_limit=4096,
+        byte_limit_mb=2048,
         shard_size=25,
         bootstrap_only=True,
         dag_run_type="manual",
@@ -326,15 +340,15 @@ def test_bootstrap_validation_proves_succeeded_non_publishing_control_run(
         {
             "status": "running",
             "run_type": "current",
-            "request_limit": 200,
-            "byte_limit": 100 * 1024 * 1024,
+            "request_limit": 4096,
+            "byte_limit": 2048 * 1024 * 1024,
             "metadata": metadata,
         },
         {
             "status": "succeeded",
             "run_type": "current",
-            "request_limit": 200,
-            "byte_limit": 100 * 1024 * 1024,
+            "request_limit": 4096,
+            "byte_limit": 2048 * 1024 * 1024,
             "metadata": metadata,
         },
     ]
@@ -347,8 +361,8 @@ def test_bootstrap_validation_proves_succeeded_non_publishing_control_run(
         dag_id="dag_ingest_fbref",
         bootstrap_only=True,
         dag_run_type="manual",
-        request_limit=200,
-        byte_limit_mb=100,
+        request_limit=4096,
+        byte_limit_mb=2048,
         shard_size=25,
     )
 
@@ -369,8 +383,8 @@ def test_bootstrap_validation_checks_control_mode_before_finishing(monkeypatch):
     control.get_run.return_value = {
         "status": "running",
         "run_type": "current",
-        "request_limit": 200,
-        "byte_limit": 100 * 1024 * 1024,
+        "request_limit": 4096,
+        "byte_limit": 2048 * 1024 * 1024,
         "metadata": {
             "execution_mode": "publishing",
             "bootstrap_only": False,
@@ -390,8 +404,8 @@ def test_bootstrap_validation_checks_control_mode_before_finishing(monkeypatch):
             dag_id="dag_ingest_fbref",
             bootstrap_only=True,
             dag_run_type="manual",
-            request_limit=200,
-            byte_limit_mb=100,
+            request_limit=4096,
+            byte_limit_mb=2048,
             shard_size=25,
         )
 
@@ -424,8 +438,8 @@ def test_bootstrap_validation_proves_persisted_exact_profile_before_finish(
     control_run = {
         "status": "running",
         "run_type": "current",
-        "request_limit": 200,
-        "byte_limit": 100 * 1024 * 1024,
+        "request_limit": 4096,
+        "byte_limit": 2048 * 1024 * 1024,
         "metadata": metadata,
     }
     if run_field == "shard_size":
@@ -444,8 +458,8 @@ def test_bootstrap_validation_proves_persisted_exact_profile_before_finish(
             dag_id="dag_ingest_fbref",
             bootstrap_only=True,
             dag_run_type="manual",
-            request_limit=200,
-            byte_limit_mb=100,
+            request_limit=4096,
+            byte_limit_mb=2048,
             shard_size=25,
         )
 
@@ -531,8 +545,8 @@ def test_production_readiness_combines_alert_env_and_runtime_limits(monkeypatch)
 
     result = fbref_pipeline_tasks.validate_fbref_production_readiness(
         run_type="current",
-        request_limit=200,
-        byte_limit_mb=100,
+        request_limit=4096,
+        byte_limit_mb=2048,
         shard_size=25,
     )
 
@@ -556,7 +570,7 @@ def test_production_readiness_combines_alert_env_and_runtime_limits(monkeypatch)
     proxy_check.assert_called_once_with(
         "http://fbref_proxy_filter:8899",
         control_token="t" * 32,
-        required_bytes=100 * fbref_pipeline_tasks.MIB,
+            required_bytes=2048 * fbref_pipeline_tasks.MIB,
         minimum_configured_exits=4,
     )
 
@@ -580,8 +594,8 @@ def test_production_readiness_combines_alert_env_and_runtime_limits(monkeypatch)
     with pytest.raises(RuntimeError, match="broken browser"):
         fbref_pipeline_tasks.validate_fbref_production_readiness(
             run_type="current",
-            request_limit=200,
-            byte_limit_mb=100,
+            request_limit=4096,
+            byte_limit_mb=2048,
             shard_size=25,
         )
     # A broken local browser must stop the run before the paid proxy is probed.
@@ -1406,8 +1420,8 @@ def test_recovery_wave_reuses_raw_before_live_fetch(monkeypatch):
         dag_id="dag_backfill_fbref",
         page_kinds=["schedule", "match"],
         run_type="backfill",
-        request_limit=200,
-        byte_limit_mb=100,
+        request_limit=4096,
+        byte_limit_mb=2048,
         shard_size=25,
     )
 
@@ -1417,7 +1431,7 @@ def test_recovery_wave_reuses_raw_before_live_fetch(monkeypatch):
     assert pipeline.recover_unprocessed_wave.call_count == 2
     call = pipeline.recover_unprocessed_wave.call_args_list[0]
     assert call.kwargs["page_kinds"] == ["schedule", "match"]
-    assert call.kwargs["settings"].request_limit == 200
+    assert call.kwargs["settings"].request_limit == 4096
     pipeline.fetch_wave.assert_not_called()
 
 
@@ -1443,8 +1457,8 @@ def test_recovery_drain_fails_before_transport_when_processing_is_stalled(
             dag_id="dag_backfill_fbref",
             page_kinds=["match"],
             run_type="backfill",
-            request_limit=200,
-            byte_limit_mb=100,
+            request_limit=4096,
+            byte_limit_mb=2048,
             shard_size=25,
         )
 
@@ -1475,8 +1489,8 @@ def test_recovery_drain_counts_a_retired_target_as_progress(monkeypatch):
         dag_id="dag_ingest_fbref",
         page_kinds=["season"],
         run_type="current",
-        request_limit=200,
-        byte_limit_mb=100,
+        request_limit=4096,
+        byte_limit_mb=2048,
         shard_size=25,
     )
 
@@ -1839,8 +1853,8 @@ def test_live_waves_use_one_process_group_for_all_batches(monkeypatch):
         worker_id="current-live",
         page_kinds=["competition", "season"],
         run_type="current",
-        request_limit=200,
-        byte_limit_mb=100,
+        request_limit=4096,
+        byte_limit_mb=2048,
         shard_size=25,
     )
 
@@ -1855,7 +1869,8 @@ def test_live_waves_use_one_process_group_for_all_batches(monkeypatch):
     assert command[1] == fbref_pipeline_tasks.LIVE_WAVES_RUNNER
     assert "--page-kinds" in command
     assert command[command.index("--page-kinds") + 1] == "competition,season"
-    assert command[command.index("--request-limit") + 1] == "200"
+    assert command[command.index("--request-limit") + 1] == "4096"
+    assert command[command.index("--byte-limit-mb") + 1] == "2048"
     assert command[command.index("--parent-pid") + 1] == str(
         fbref_pipeline_tasks.os.getpid()
     )
@@ -1956,8 +1971,8 @@ def test_live_waves_reject_success_with_a_surviving_descendant(monkeypatch):
             worker_id="current-live",
             page_kinds=["competition"],
             run_type="current",
-            request_limit=200,
-            byte_limit_mb=100,
+            request_limit=4096,
+            byte_limit_mb=2048,
             shard_size=25,
         )
 
@@ -2012,8 +2027,8 @@ def test_live_waves_timeout_terminates_the_complete_process_group(monkeypatch):
             worker_id="current-live",
             page_kinds=["competition"],
             run_type="current",
-            request_limit=200,
-            byte_limit_mb=100,
+            request_limit=4096,
+            byte_limit_mb=2048,
             shard_size=25,
         )
 
@@ -2069,8 +2084,8 @@ def test_live_waves_external_interruption_terminates_process_group(monkeypatch):
             worker_id="current-live",
             page_kinds=["competition"],
             run_type="current",
-            request_limit=200,
-            byte_limit_mb=100,
+            request_limit=4096,
+            byte_limit_mb=2048,
             shard_size=25,
         )
 
@@ -2135,8 +2150,8 @@ def test_live_waves_sigterm_reaps_child_and_restores_signal_handlers(
             worker_id="current-live",
             page_kinds=["competition"],
             run_type="current",
-            request_limit=200,
-            byte_limit_mb=100,
+            request_limit=4096,
+            byte_limit_mb=2048,
             shard_size=25,
         )
 
@@ -2212,8 +2227,8 @@ def test_live_waves_repeated_sigterm_cannot_interrupt_group_cleanup(
             worker_id="current-live",
             page_kinds=["competition"],
             run_type="current",
-            request_limit=200,
-            byte_limit_mb=100,
+            request_limit=4096,
+            byte_limit_mb=2048,
             shard_size=25,
         )
 
@@ -2301,8 +2316,8 @@ def test_live_waves_sigterm_on_timeout_handler_boundary_still_reaps_group(
                 worker_id="current-live",
                 page_kinds=["competition"],
                 run_type="current",
-                request_limit=200,
-                byte_limit_mb=100,
+                request_limit=4096,
+                byte_limit_mb=2048,
                 shard_size=25,
             )
     finally:
@@ -2365,8 +2380,8 @@ def test_live_waves_sigterm_during_handler_restore_is_not_lost(monkeypatch):
             worker_id="current-live",
             page_kinds=["competition"],
             run_type="current",
-            request_limit=200,
-            byte_limit_mb=100,
+            request_limit=4096,
+            byte_limit_mb=2048,
             shard_size=25,
         )
 
@@ -2425,8 +2440,8 @@ def test_live_waves_sigterm_during_spawn_reaps_the_returned_group(monkeypatch):
             worker_id="current-live",
             page_kinds=["competition"],
             run_type="current",
-            request_limit=200,
-            byte_limit_mb=100,
+            request_limit=4096,
+            byte_limit_mb=2048,
             shard_size=25,
         )
 
@@ -2522,8 +2537,8 @@ def test_live_waves_sigterm_on_spawn_return_bytecode_reaps_group(monkeypatch):
                 worker_id="current-live",
                 page_kinds=["competition"],
                 run_type="current",
-                request_limit=200,
-                byte_limit_mb=100,
+                request_limit=4096,
+                byte_limit_mb=2048,
                 shard_size=25,
             )
     finally:

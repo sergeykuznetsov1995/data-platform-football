@@ -2,8 +2,8 @@
 
 The current-refresh DAG owns registry discovery.  This DAG takes the next
 unfinished page of historical seasons from that durable registry and advances
-their frontier under the same hard 200-request/100-MiB production budget as
-current ingestion (or the hard 100/50 canary profile). Repeated manual runs
+their frontier under the same 4096-request/2048-MiB production safety circuit as
+current ingestion (or the bounded 100/50 canary profile). Repeated manual runs
 resume automatically from PostgreSQL and immutable raw storage; no league list,
 operator cursor, or filesystem handoff is accepted.
 """
@@ -98,13 +98,13 @@ with DAG(
             BACKFILL_REQUEST_LIMIT,
             type="integer",
             enum=[FBREF_CANARY_REQUEST_LIMIT, BACKFILL_REQUEST_LIMIT],
-            description="Hard canary (100) or production (200) request cap",
+            description="Canary (100) or production safety circuit (4096)",
         ),
         "byte_limit_mb": Param(
             BACKFILL_BYTE_LIMIT_MB,
             type="integer",
             enum=[FBREF_CANARY_BYTE_LIMIT_MB, BACKFILL_BYTE_LIMIT_MB],
-            description="Hard canary (50) or production (100) MiB cap",
+            description="Canary (50) or production safety circuit (2048 MiB)",
         ),
         "shard_size": Param(
             DEFAULT_SHARD_SIZE,
@@ -120,7 +120,7 @@ with DAG(
     Manual only. The DAG selects the next bounded unfinished page of
     non-current seasons from the source-discovered male registry, then runs
     up to eighty raw-first batches in one warm process under a
-    200-request/100-MiB hard cap.
+    4096-request/2048-MiB emergency safety circuit.
     A `100/50` canary profile is available through Params or DagRun conf.
     Set `dry_run=true` to inspect the exact next cohort without creating a
     control run, opening a proxy session, or changing frontier state.

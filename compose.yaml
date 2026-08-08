@@ -1520,6 +1520,7 @@ services:
       # Deliberately separate from the shared paid pool below.
       PROXY_POOL_JSON: ""
       PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"
+      FBREF_PROXY_SAFETY_CIRCUIT_MIB: ${FBREF_PROXY_SAFETY_CIRCUIT_MIB:-2048}
     command:
       - python
       - /opt/airflow/scripts/proxy_filter/filter_proxy.py
@@ -1536,16 +1537,8 @@ services:
       - /opt/airflow/configs/proxy_filter/blocklist.txt
       - --out
       - /opt/airflow/logs/fbref/proxy_filter/bytes.json
-      - --daily-budget-mb
-      - ${FBREF_PROXY_DAILY_BUDGET_MB:-300}
-      - --max-lease-mb
-      - ${FBREF_PROXY_MAX_LEASE_MB:-100}
       - --max-lease-ttl-seconds
       - ${FBREF_PROXY_MAX_LEASE_TTL_SECONDS:-7200}
-      - --dagrun-budget-bytes
-      - ${FBREF_PROXY_DAGRUN_BUDGET_BYTES:-104857600}
-      - --url-budget-bytes
-      - ${FBREF_PROXY_URL_BUDGET_BYTES:-104857600}
       - --max-active-leases
       - "1"
       - --ledger

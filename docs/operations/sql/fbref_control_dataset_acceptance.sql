@@ -2,8 +2,8 @@
 -- Set :control_run_id to the same UUID used by the Trino acceptance script.
 -- Bind :expected_run_type, :expected_request_limit, and
 -- :expected_byte_limit_mb to the exact Airflow profile. Supported acceptance
--- bindings are current/100/50 for canary, current/200/100 for production,
--- backfill/200/100 for a live historical batch, and replay/0/0 for offline
+-- bindings are current/100/50 for canary, current/4096/2048 for production,
+-- backfill/4096/2048 for a live historical batch, and replay/0/0 for offline
 -- replay.
 -- This control-plane evidence is required because a legitimate empty typed
 -- dataset intentionally does not create an Iceberg table.
@@ -56,8 +56,8 @@ SELECT
                      WHERE evidence_run.run_id = audited_control_run_id
                        AND evidence_run.status = 'succeeded'
                        AND evidence_run.run_type IN ('current', 'backfill')
-                       AND evidence_run.request_limit = 200
-                       AND evidence_run.byte_limit = 100 * 1048576
+                       AND evidence_run.request_limit = 4096
+                       AND evidence_run.byte_limit = 2048 * 1048576
                  )
              )
          )

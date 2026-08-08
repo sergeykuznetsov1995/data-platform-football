@@ -95,8 +95,8 @@ class TestFBrefBootstrapTopology:
             "validate_bootstrap_run",
         ):
             kwargs = tasks[task_id].op_kwargs
-            assert kwargs["request_limit"] == 200
-            assert kwargs["byte_limit_mb"] == 100
+            assert kwargs["request_limit"] == 4096
+            assert kwargs["byte_limit_mb"] == 2048
             assert kwargs["shard_size"] == 25
         for task_id in (
             "validate_production_readiness",
