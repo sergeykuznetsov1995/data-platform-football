@@ -1,20 +1,29 @@
 """Contract coverage for the offline FBref persistence benchmark."""
 
 import logging
+from contextlib import contextmanager
 
 import pytest
 
 import scripts.research.bench_fbref_persistence as benchmark
 from scripts.research.bench_fbref_persistence import (
     BENCHMARK_TABLES,
+    AcceptanceBaseline,
     BenchmarkConfig,
+    ControlRunEvidence,
     PersistenceRun,
     StatementCounts,
     TableDigest,
+    _bidirectional_table_diffs,
+    _control_run_evidence,
+    capture_acceptance_baseline,
     _digests_equivalent,
+    _snapshot_ids,
+    _sentinel_digests,
     _mean_iteration_seconds,
     _table_digests,
     evaluate_gate,
+    evaluate_existing_pipeline_acceptance,
     run_benchmark,
 )
 
@@ -137,6 +146,8 @@ class _ProvisionedManager:
         return self.signatures.get((schema, table), {"identity": "VARCHAR"})
 
     def _execute(self, sql, fetch=False):
+        if "EXCEPT ALL" in sql:
+            return [(0,)]
         table = next(table for table in BENCHMARK_TABLES if table in sql)
         schema = next(
             schema for schema in ("sequential", "batch") if f".{schema}." in sql
@@ -251,6 +262,8 @@ def test_fully_provisioned_empty_pair_proceeds_and_can_turn_green(
     assert report.equivalent is True
     assert report.gate is not None
     assert report.gate.passed is True
+    assert report.passed is True
+    assert set(report.table_diffs or {}) == set(BENCHMARK_TABLES)
 
 
 @pytest.mark.unit
@@ -367,3 +380,323 @@ def test_benchmark_restores_trino_logger_when_persistence_fails(
     assert logger.disabled is original_disabled
     logger.error("trino failure logging restored")
     assert "trino failure logging restored" in caplog.text
+
+
+class _DifferentialManager:
+    catalog = "iceberg"
+
+    def __init__(self, *, nonzero_query=None):
+        self.queries = []
+        self.nonzero_query = nonzero_query
+
+    def table_exists(self, _schema, _table):
+        return True
+
+    def get_table_columns(self, _schema, _table):
+        return {
+            "target_id": "VARCHAR",
+            "match_id": "VARCHAR",
+            "_batch_id": "VARCHAR",
+            "_ingested_at": "TIMESTAMP(6)",
+            "persisted_at": "TIMESTAMP(6)",
+        }
+
+    def _execute(self, sql, fetch=False, params=None):
+        self.queries.append((sql, params))
+        if '$snapshots"' in sql:
+            return [(101,)]
+        if "WHERE target_id = ?" in sql or "WHERE match_id = ?" in sql:
+            return [("sentinel", "batch")]
+        value = 1 if self.nonzero_query and self.nonzero_query in sql else 0
+        return [(value,)]
+
+
+@pytest.mark.unit
+def test_all_12_tables_use_dynamic_columns_and_bidirectional_except_all():
+    manager = _DifferentialManager()
+
+    diffs = _bidirectional_table_diffs(manager, "sequential", "batch")
+
+    assert len(BENCHMARK_TABLES) == 12
+    assert set(diffs) == set(BENCHMARK_TABLES)
+    queries = [sql for sql, _params in manager.queries]
+    assert len(queries) == 24
+    assert all("EXCEPT ALL" in sql for sql in queries)
+    assert all('"match_id"' in sql and '"_batch_id"' in sql for sql in queries)
+    assert all('"_ingested_at"' not in sql for sql in queries)
+    assert all('"persisted_at"' not in sql for sql in queries)
+    assert all(diff.sequential_minus_batch == 0 for diff in diffs.values())
+    assert all(diff.batch_minus_sequential == 0 for diff in diffs.values())
+
+
+@pytest.mark.unit
+def test_one_directional_difference_cannot_be_hidden_by_digest_equality():
+    manager = _DifferentialManager(nonzero_query="FROM iceberg.batch")
+
+    diffs = _bidirectional_table_diffs(manager, "sequential", "batch")
+
+    assert any(diff.batch_minus_sequential == 1 for diff in diffs.values())
+
+
+@pytest.mark.unit
+def test_snapshot_evidence_is_collected_for_every_table():
+    manager = _DifferentialManager()
+
+    snapshots = _snapshot_ids(manager, "batch")
+
+    assert snapshots == {table: 101 for table in BENCHMARK_TABLES}
+    assert len(manager.queries) == 12
+    assert all('$snapshots"' in sql for sql, _params in manager.queries)
+
+
+@pytest.mark.unit
+def test_outside_cohort_sentinel_uses_target_id_for_generic_and_match_id_for_typed():
+    manager = _DifferentialManager()
+
+    sentinels = _sentinel_digests(manager, "batch", "outside-match")
+
+    assert set(sentinels) == set(BENCHMARK_TABLES)
+    assert all(item.present and item.rows == 1 for item in sentinels.values())
+    generic_queries = manager.queries[:3]
+    typed_queries = manager.queries[3:]
+    assert all("WHERE target_id = ?" in sql for sql, _params in generic_queries)
+    assert all(params == ("fbref:match:outside-match",) for _sql, params in generic_queries)
+    assert all("WHERE match_id = ?" in sql for sql, _params in typed_queries)
+    assert all(params == ("outside-match",) for _sql, params in typed_queries)
+
+
+@pytest.mark.unit
+def test_strict_acceptance_requires_control_ids_and_outside_sentinel(tmp_path):
+    with pytest.raises(ValueError, match="strict acceptance requires"):
+        run_benchmark(
+            BenchmarkConfig(
+                tmp_path,
+                "sequential",
+                "batch",
+                strict_acceptance=True,
+            )
+        )
+
+
+class _DirectControl:
+    def __init__(self):
+        self.calls = []
+
+    def get_run(self, run_id):
+        self.calls.append(("run", run_id))
+        return {
+            "run_id": run_id,
+            "run_type": "replay",
+            "status": "succeeded",
+            "request_limit": 0,
+            "byte_limit": 0,
+            "requests_used": 0,
+            "bytes_used": 0,
+            "metadata": {
+                "bronze_acceptance_replay": {
+                    "status": "passed",
+                    "processing_control_run_id": run_id,
+                }
+            },
+        }
+
+    def get_run_summary(self, run_id):
+        self.calls.append(("summary", run_id))
+        return {
+            "requests_reserved": 0,
+            "bytes_reserved": 0,
+            "unprocessed_raw_count": 0,
+            "traffic_totals": {"network_attempts": 0},
+        }
+
+    def get_acceptance_run_evidence(self, run_id):
+        self.calls.append(("evidence", run_id))
+        return {
+            "targets": [
+                {
+                    "target_id": "fbref:match:m1",
+                    "logical_refresh_id": f"refresh-{run_id}",
+                    "status": "succeeded",
+                    "page_kind": "match",
+                    "source_ids": {"match_id": "m1"},
+                    "evidence_class": "full_match",
+                }
+            ],
+            "datasets": [
+                {
+                    "target_id": "fbref:match:m1",
+                    "dataset": f"typed:{dataset}",
+                    "availability": "available",
+                    "parse_status": "succeeded",
+                    "persistence_status": "succeeded",
+                    "validation_status": "succeeded",
+                    "row_count": 3,
+                }
+                for dataset in (
+                    "shot_events",
+                    "match_events",
+                    "lineups",
+                    "match_team_stats",
+                    "match_managers",
+                    "match_officials",
+                    "match_keeper_stats",
+                    "match_player_stats",
+                )
+            ],
+        }
+
+
+@pytest.mark.unit
+def test_control_evidence_reads_run_summary_and_rows_directly():
+    control = _DirectControl()
+
+    evidence = _control_run_evidence(control, "run-one")
+
+    assert isinstance(evidence, ControlRunEvidence)
+    assert control.calls == [
+        ("run", "run-one"),
+        ("summary", "run-one"),
+        ("evidence", "run-one"),
+    ]
+    assert evidence.valid is True
+    assert evidence.logical_refreshes == 1
+    assert evidence.dataset_manifests == 8
+    assert evidence.observation_sha256
+    assert evidence.manifest_sha256
+    assert evidence.latest_state_sha256
+
+
+@pytest.mark.unit
+def test_postgres_control_evidence_uses_actual_replay_processing_rows():
+    base = _DirectControl()
+    datasets = base.get_acceptance_run_evidence("run-direct")["datasets"]
+    observations = [
+        {
+            "ordinal": 0,
+            "target_id": "fbref:match:m1",
+            "logical_refresh_id": "refresh-direct",
+            "target_status": "succeeded",
+            "page_kind": "match",
+            "source_ids": {"match_id": "m1"},
+            "frontier_state": "fetched",
+            "last_content_hash": "a" * 64,
+            "content_hash": "a" * 64,
+            "observation_status": "succeeded",
+            "generic_status": "succeeded",
+            "typed_status": "succeeded",
+            "stateful_status": "skipped",
+            "validation_status": "succeeded",
+        }
+    ]
+
+    class Cursor:
+        def __init__(self):
+            self.queries = []
+            self.rows = []
+
+        def execute(self, sql, params):
+            self.queries.append((sql, params))
+            self.rows = (
+                observations
+                if "SELECT * FROM ranked" in sql
+                else datasets
+            )
+
+        def fetchall(self):
+            return self.rows
+
+    class DirectControl(_DirectControl):
+        def __init__(self):
+            super().__init__()
+            self.cursor = Cursor()
+
+        @contextmanager
+        def _transaction(self):
+            yield self.cursor
+
+        def get_acceptance_run_evidence(self, _run_id):
+            raise AssertionError("source-run alias evidence must not be used")
+
+    control = DirectControl()
+
+    evidence = _control_run_evidence(control, "run-direct")
+
+    assert evidence.valid is True
+    assert evidence.evidence_source == "direct_processing_rows"
+    assert len(control.cursor.queries) == 2
+    assert all(params == ("run-direct",) for _sql, params in control.cursor.queries)
+    assert "fbref_control.observation_processing" in control.cursor.queries[0][0]
+    assert "fbref_control.dataset_manifest" in control.cursor.queries[1][0]
+
+
+@pytest.mark.unit
+def test_real_pipeline_evidence_mode_is_read_only_and_has_one_strict_verdict():
+    manager = _DifferentialManager()
+    control = _DirectControl()
+    sentinel = "outside-match"
+    baseline_sentinels = _sentinel_digests(manager, "sequential", sentinel)
+    sequential_baseline = AcceptanceBaseline(
+        schema="sequential",
+        sentinel_match_id=sentinel,
+        snapshots={table: 100 for table in BENCHMARK_TABLES},
+        sentinels=baseline_sentinels,
+    )
+    batch_baseline = AcceptanceBaseline(
+        schema="batch",
+        sentinel_match_id=sentinel,
+        snapshots={table: 100 for table in BENCHMARK_TABLES},
+        sentinels=baseline_sentinels,
+    )
+    manager.queries.clear()
+
+    report = evaluate_existing_pipeline_acceptance(
+        manager=manager,
+        control=control,
+        sequential_schema="sequential",
+        batch_schema="batch",
+        sequential_control_run_id="run-one",
+        batch_control_run_id="run-two",
+        sequential_seconds=80.0,
+        batch_seconds=16.0,
+        matches=2,
+        sequential_statement_counts=StatementCounts(120, 24),
+        batch_statement_counts=StatementCounts(20, 4),
+        sequential_baseline=sequential_baseline,
+        batch_baseline=batch_baseline,
+        sentinel_match_id=sentinel,
+    )
+    rendered = report.to_dict()
+
+    assert rendered["passed"] is True
+    assert len(rendered["table_diffs"]) == 12
+    assert rendered["sentinels_preserved"] is True
+    assert rendered["control_equivalent"] is True
+    assert rendered["sequential"]["snapshots_before"]
+    assert rendered["sequential"]["snapshots_after"]
+    assert all(
+        delta["changed"]
+        for delta in rendered["sequential"]["snapshot_deltas"].values()
+    )
+    assert rendered["sequential"]["statement_counts"] == {
+        "execute": 120,
+        "execute_committing": 24,
+    }
+    assert all(
+        not sql.lstrip().upper().startswith(
+            ("INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "ALTER", "DROP")
+        )
+        for sql, _params in manager.queries
+    )
+
+
+@pytest.mark.unit
+def test_acceptance_baseline_captures_all_snapshots_and_sentinels():
+    manager = _DifferentialManager()
+
+    baseline = capture_acceptance_baseline(
+        manager, schema="sequential", sentinel_match_id="outside-match"
+    )
+
+    assert baseline.schema == "sequential"
+    assert set(baseline.snapshots) == set(BENCHMARK_TABLES)
+    assert set(baseline.sentinels) == set(BENCHMARK_TABLES)
