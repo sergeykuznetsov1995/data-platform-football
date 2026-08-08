@@ -536,17 +536,26 @@ git commit -m "fix(fbref): remove false stalls from productive runs"
 **Files:**
 - Modify: `scrapers/fbref/settings.py`
 - Modify: `scrapers/fbref/readiness.py`
+- Modify: `scrapers/fbref/pipeline.py`
 - Modify: `dags/utils/fbref_pipeline_tasks.py`
 - Modify: `dags/utils/fbref_current_dag_factory.py`
 - Modify: `dags/dag_backfill_fbref.py`
 - Modify: `dags/scripts/run_fbref_live_waves.py`
 - Modify: `scripts/proxy_filter/filter_proxy.py`
 - Modify: `compose.yaml`
+- Modify: `.env.example`
+- Modify: `docs/operations/fbref-paid-transport.md`
+- Modify: `docs/operations/sql/fbref_control_dataset_acceptance.sql`
+- Modify: `docs/operations/sql/fbref_production_acceptance.sql`
 - Modify: `tests/unit/dags/test_fbref_pipeline_tasks.py`
+- Modify: `tests/unit/dags/test_dag_bootstrap_fbref.py`
 - Modify: `tests/unit/dags/test_dag_ingest_fbref.py`
 - Modify: `tests/unit/dags/test_dag_backfill_fbref.py`
+- Modify: `tests/unit/dags/test_run_fbref_live_waves_runner.py`
 - Modify: `tests/unit/scrapers/test_fbref_readiness.py`
+- Modify: `tests/unit/scrapers/test_fbref_pipeline.py`
 - Modify: `tests/unit/scripts/test_filter_proxy.py`
+- Modify: `tests/unit/sql/test_fbref_production_acceptance_sql.py`
 - Modify: `tests/integration/test_compose_validity.py`
 
 **Interfaces:**
@@ -555,11 +564,11 @@ git commit -m "fix(fbref): remove false stalls from productive runs"
 
 - [ ] **Step 1: Add failing capacity and breaker tests**
 
-Assert that production uses `4096` requests and `2048 MiB` only as an emergency circuit breaker, while the non-publishing canary remains exactly `100/50`. Keep the stored `request_limit`/`byte_limit` fields for schema compatibility, but remove wording and validation that treats the production values as an acceptable tariff budget. Prove that `80 * 25 == 2000` targets fit below the request breaker and that validation still rejects values above the configured safety circuit.
+Assert that production uses `4096` requests and `2048 MiB` only as an emergency circuit breaker, while the non-publishing canary remains exactly `100/50`. Keep the stored `request_limit`/`byte_limit` fields for schema compatibility, but remove wording and validation that treats the production values as an acceptable tariff budget. Prove the worst-case request headroom: `80 * 25 * 2 + 4 * 20 == 4080 < 4096`. Direct CLI values must match one exact profile and the already-created control run before any fetcher/network construction. Production reaching the circuit exactly or exhausting it is a loud incomplete-run failure; canary exhaustion remains a clean non-publishing bounded stop.
 
 - [ ] **Step 2: Add failing Decodo rotation tests**
 
-For the dedicated FBref proxy-filter service, prove that a failed lease cannot immediately select the same normalized proxy/session identity when another healthy identity exists. Selection must be deterministic and bounded, must never repin an active lease, and must not change the random-selection contract for other proxy-filter consumers. Tests and errors may contain only a redacted identity hash, never username, password, full proxy URL, or exit IP.
+For the dedicated FBref proxy-filter service, prove that a failed lease cannot immediately select the same normalized `(host casefolded, integer port, username)` session identity when another healthy identity exists. Selection must be deterministic and bounded, must never repin an active lease, and must not change the random-selection contract for other proxy-filter consumers. The safe fingerprint includes username/session identity but never password. Tests and errors may contain only that hash, never username, password, full proxy URL, or exit IP. A one-entry pool may reuse its identity only after the FBref cooldown; all-unhealthy returns a redacted `503 upstream_unavailable`, never the generic `429 budget` classification.
 
 - [ ] **Step 3: Replace business profiles with safety controls**
 
@@ -570,19 +579,19 @@ FBREF_CANARY_REQUEST_LIMIT = 100
 FBREF_CANARY_BYTE_LIMIT_MIB = 50
 ```
 
-The production constants are circuit breakers, not success gates. A run that reaches either breaker fails loudly as a runaway/incomplete run; ordinary acceptance compares bytes per durable match without an absolute-MB pass threshold. Keep max response size, one active lease, 6.1-second interval, raw-first commit, and all reservation settlement checks. Readiness verifies that the filter is configured for at least the safety circuit, not that a provider tariff balance is available.
+The production constants are circuit breakers, not success gates. Keep `DEFAULT_REQUEST_LIMIT`/`DEFAULT_BYTE_LIMIT` as compatibility aliases to the production safety values. Update the production replay-source profile too. A run that reaches either breaker fails loudly as a runaway/incomplete run; ordinary acceptance compares bytes per durable match without an absolute-MB pass threshold. Keep max response size, one active lease, 6.1-second interval, raw-first commit, and all reservation settlement checks. Readiness verifies that `min(daily, run, URL, max-lease)` configured capacity reaches the safety circuit; it still reconciles the provider counters but must not reject a capable filter merely because some of today's allowance is already spent.
 
 - [ ] **Step 4: Align proxy-filter safety configuration**
 
-Expose one secret-free `FBREF_PROXY_SAFETY_CIRCUIT_MIB` Compose setting, default `2048`, and use it for the dedicated FBref daily/run/URL filter ceilings. Do not increase limits for other scrapers. Keep `--max-active-leases 1`. Production credentials remain only in the deployment-owned `0640` proxy file mounted into the proxy filter; Airflow workers continue to see only the local filter endpoint.
+Expose one secret-free `FBREF_PROXY_SAFETY_CIRCUIT_MIB` Compose setting, default `2048`, and use it for the dedicated FBref daily/run/URL and max-lease filter ceilings. Replace the four stale FBref cap variables in `.env.example`; do not increase limits for other scrapers or isolated `100/50` acceptance. Keep `--max-active-leases 1`. Production credentials remain only in the deployment-owned `0640` proxy file mounted into the proxy filter; Airflow workers continue to see only the local filter endpoint.
 
 - [ ] **Step 5: Implement no-immediate-repeat session rotation**
 
-Track a bounded FBref-only cursor/last failed normalized session identity in the filter's lease allocator. On a new lease after failure, exclude the prior identity when another candidate exists; exhaustively fail if no candidate is healthy. Do not silently switch upstream inside an active lease. A one-entry pool may reuse its sole identity only after the normal cooldown/health policy permits it.
+Track a bounded FBref-only cursor/last failed normalized session identity in the filter's lease allocator. On a new lease after failure, scan at most the unique candidate count, exclude the prior identity when another healthy candidate exists, and fail safely if none is healthy. Record CONNECT and direct-dial failures before rethrowing. Do not call the shared host/port-only `ProxyManager.record_result`, do not silently switch upstream inside an active lease, and leave non-FBref random selection untouched. In-memory no-repeat state may reset with the filter process; document that residual rather than claiming cross-restart exclusion.
 
 - [ ] **Step 6: Run focused tests**
 
-Run: `/root/.venvs/dpf-test/bin/pytest tests/unit/dags/test_fbref_pipeline_tasks.py tests/unit/dags/test_dag_ingest_fbref.py tests/unit/dags/test_dag_backfill_fbref.py tests/unit/scrapers/test_fbref_readiness.py tests/unit/scripts/test_filter_proxy.py tests/integration/test_compose_validity.py -q`
+Run: `/root/.venvs/dpf-test/bin/pytest tests/unit/dags/test_fbref_pipeline_tasks.py tests/unit/dags/test_dag_bootstrap_fbref.py tests/unit/dags/test_dag_ingest_fbref.py tests/unit/dags/test_dag_backfill_fbref.py tests/unit/dags/test_run_fbref_live_waves_runner.py tests/unit/scrapers/test_fbref_readiness.py tests/unit/scrapers/test_fbref_pipeline.py tests/unit/scripts/test_filter_proxy.py tests/unit/sql/test_fbref_production_acceptance_sql.py tests/integration/test_compose_validity.py -q`
 
 Expected: PASS with no credential-bearing output.
 
@@ -605,11 +614,13 @@ git commit -m "perf(fbref): replace tariff caps with safety circuit"
 - Modify: `scrapers/fbref/fetcher.py`
 - Modify: `scrapers/fbref/pipeline.py`
 - Modify: `scrapers/fbref/control/store.py`
+- Modify: `scripts/proxy_filter/filter_proxy.py`
 - Modify: `compose.yaml`
 - Modify: `tests/unit/scrapers/test_fbref_proxy_lease.py`
 - Modify: `tests/unit/scrapers/test_fbref_metered_fetcher.py`
 - Modify: `tests/unit/scrapers/test_fbref_pipeline.py`
 - Modify: `tests/unit/scrapers/test_fbref_control_store_v8.py`
+- Modify: `tests/unit/scripts/test_filter_proxy.py`
 
 **Interfaces:**
 - Consumes: the existing serial `curl_cffi.Session`, authoritative proxy-filter counters, and Task 5's safety circuit.
@@ -621,7 +632,7 @@ Behind `FBREF_PERSISTENT_HTTP_SESSION=0` by default, two successful pages must u
 
 - [ ] **Step 2: Add failing exact-accounting tests**
 
-Add a proxy-lease `wait_idle()` checkpoint which requires page reservations to drain while allowing the one expected persistent tunnel. Require two stable authoritative samples before settlement. Prove:
+Add non-secret proxy-filter stats for `active_provider_readers`, `provider_reserved_bytes`, and `pending_client_hellos`. Add a proxy-lease `wait_idle()` checkpoint and require two identical authoritative samples. With zero tunnels every reservation must be zero. With one expected tunnel, exactly one provider reader may exist, `reserved_bytes == provider_reserved_bytes`, and there must be no pending client hello. Any other reservation cannot be proven idle and fails closed. Prove:
 
 ```text
 sum(page provider deltas) + final connection tail == authoritative close total
@@ -635,15 +646,15 @@ Replace success-path per-page close/drain with the new serial idle checkpoint. K
 
 - [ ] **Step 4: Settle final connection overhead idempotently**
 
-Create a run-scoped, zero-request session-tail reservation keyed by a non-secret session identity before opening the persistent connection. On `_LiveFetchSession.close()`, finalize the fetcher's provider accounting before closing the clearance session, settle the exact final delta once, and record it in both run and session metrics. Repeated close/finalize calls must be no-ops. Never attribute tail bytes to an arbitrary page or leave them uncounted.
+Create a run-scoped, zero-request session-tail reservation keyed deterministically from the non-secret clearance `session_id` before opening the persistent connection; reserve the existing conservative per-target byte amount. Add one atomic `settle_clearance_session_tail()` control API which locks run, reservation, and clearance session in that order, proves `page provider sum + tail == authoritative close total`, settles the reservation, sets the session total absolutely, and stores idempotency evidence. Identical repeats are no-ops; a different repeat conflicts. On `_LiveFetchSession.close()`, close curl and the provider lease, settle the exact tail, then close the control clearance session. An orphan tail blocks a new paid lease and is conservatively charged by run abort. Never attribute tail bytes to an arbitrary page or leave them uncounted.
 
 - [ ] **Step 5: Preserve zero-network recovery**
 
-Any failure after immutable raw commit retries parsing/persistence only from raw. A healthy target never rotates merely to obtain a new IP. A rollover may happen only on a raw boundary and must settle the old session completely before opening the next lease.
+Any failure after immutable raw commit retries parsing/persistence only from raw. A healthy target never rotates merely to obtain a new IP. A rollover may happen only on a raw boundary and must settle the old session completely before opening the next lease. Fix the adjacent response-obtained/raw-store-failure path to settle authoritative `provider_billed_bytes` and session metrics rather than only local wire bytes.
 
 - [ ] **Step 6: Run focused tests**
 
-Run: `/root/.venvs/dpf-test/bin/pytest tests/unit/scrapers/test_fbref_proxy_lease.py tests/unit/scrapers/test_fbref_metered_fetcher.py tests/unit/scrapers/test_fbref_pipeline.py tests/unit/scrapers/test_fbref_control_store_v8.py -q`
+Run: `/root/.venvs/dpf-test/bin/pytest tests/unit/scrapers/test_fbref_proxy_lease.py tests/unit/scrapers/test_fbref_metered_fetcher.py tests/unit/scrapers/test_fbref_pipeline.py tests/unit/scrapers/test_fbref_control_store_v8.py tests/unit/scripts/test_filter_proxy.py -q`
 
 Expected: PASS, including the pre-existing hard-transport-policy and raw-first ordering tests.
 
@@ -651,8 +662,9 @@ Expected: PASS, including the pre-existing hard-transport-policy and raw-first o
 
 ```bash
 git add scrapers/fbref/proxy_lease.py scrapers/fbref/fetcher.py \
-  scrapers/fbref/pipeline.py scrapers/fbref/control/store.py compose.yaml \
-  tests/unit/scrapers
+  scrapers/fbref/pipeline.py scrapers/fbref/control/store.py \
+  scripts/proxy_filter/filter_proxy.py compose.yaml tests/unit/scrapers \
+  tests/unit/scripts/test_filter_proxy.py
 git commit -m "perf(fbref): reuse metered proxy sessions across pages"
 ```
 
