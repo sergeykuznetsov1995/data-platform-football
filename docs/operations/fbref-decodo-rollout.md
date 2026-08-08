@@ -66,9 +66,12 @@ Never point this stage at a fetch DAG or the proxy filter.
    schema with `trino_schema=BATCH_SCHEMA` and `persistence_mode=batch`. Keep
    the same frozen cohort and parser versions. Both replays must show zero
    proxy requests and zero proxy bytes. The actual parse task measures its own
-   monotonic elapsed time and Trino statements. PostgreSQL atomically stores a
-   versioned artifact plus SHA-256 in that run's protected metadata; there is
-   no hand-entered timing, match count, or statement-count input.
+   monotonic elapsed time and Trino statements. It force-reprocesses every
+   frozen successful match even though the accepted source already has a
+   completed parser fence; it does not modify that source fence or its control
+   manifests. PostgreSQL atomically stores a versioned artifact plus SHA-256
+   in that run's protected metadata; there is no hand-entered timing, match
+   count, or statement-count input.
 5. Run the strict persistence evidence tool with both control run IDs. It must
    use dynamic installed columns, excluding only `_ingested_at` and
    `persisted_at`, and execute `EXCEPT ALL` in both directions for every one of

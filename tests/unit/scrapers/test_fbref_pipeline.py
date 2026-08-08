@@ -5549,6 +5549,100 @@ def test_acceptance_replay_accepts_only_separate_strict_nonpublishing_source(
     assert "finish:True" in control.events
 
 
+def test_acceptance_replay_reprocesses_already_observed_source_matches(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry["9"] = {
+        "competition_id": "9",
+        "canonical_url": "https://fbref.com/en/comps/9/history/x",
+        "name": "Premier League",
+        "gender": "male",
+        "classification": "league:club",
+        "metadata": {},
+    }
+    match_id = "0701e218"
+    target = PageTarget(
+        source="fbref",
+        page_kind="match",
+        target_id=f"fbref:match:{match_id}",
+        canonical_url=f"https://fbref.com/en/matches/{match_id}/x",
+        source_ids={
+            "competition_id": "9",
+            "season_id": "2025-2026",
+            "match_id": match_id,
+        },
+    )
+    html = gzip.decompress(MATCH_FIXTURE.read_bytes()).decode("utf-8")
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.fetches = [
+        {
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "logical_refresh_id": refresh,
+            "content_hash": record.content_hash,
+        }
+    ]
+    control.observations[
+        (
+            refresh,
+            PAGE_DOCUMENT_VERSION,
+            TYPED_BRONZE_PARSER_VERSION,
+            DISCOVERY_PARSER_VERSION,
+        )
+    ] = {"status": "succeeded"}
+    source_run_id = str(uuid.uuid4())
+    source = _accepted_nonpublishing_source(source_run_id)
+    source["metadata"]["bronze_acceptance"]["page_kind_counts"] = {
+        "match": 1
+    }
+    control.get_run = lambda run_id: (
+        source if str(run_id) == source_run_id else control.run
+    )
+    generic = FakeWriter()
+    typed = FakeTypedWriter()
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=generic,
+        typed_adapter=FakeTypedAdapter(typed),
+        fetcher_factory=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("acceptance replay must remain zero-network")
+        ),
+    )
+    sequential_run_id = str(uuid.uuid4())
+    batch_run_id = str(uuid.uuid4())
+
+    pipeline.batch_persist_enabled = False
+    sequential = pipeline.replay_acceptance_matches(
+        sequential_run_id,
+        source_run_id=source_run_id,
+        settings=PipelineSettings.acceptance_replay(shard_size=25),
+    )
+    pipeline.batch_persist_enabled = True
+    batch = pipeline.replay_acceptance_matches(
+        batch_run_id,
+        source_run_id=source_run_id,
+        settings=PipelineSettings.acceptance_replay(shard_size=25),
+    )
+
+    assert sequential.cohort_size == sequential.parsed == 1
+    assert batch.cohort_size == batch.parsed == 1
+    assert control.observation_claim_calls == []
+    assert control.manifests == []
+    assert [item[1]["run_id"] for item in generic.pages] == [
+        sequential_run_id,
+        batch_run_id,
+    ]
+    assert [item[2]["run_id"] for item in typed.calls] == [
+        sequential_run_id,
+        batch_run_id,
+    ]
+    assert generic.batch_sizes == [1]
+    assert typed.batch_sizes == [1]
+
+
 @pytest.mark.parametrize("latest", [False, True, None])
 @pytest.mark.parametrize("run_type", ["current", "replay"])
 def test_typed_promotion_is_guarded_for_live_and_replay(

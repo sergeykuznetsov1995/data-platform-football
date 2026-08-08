@@ -674,14 +674,12 @@ def parse_fbref_acceptance_replay(
         )
     started = time.monotonic()
     try:
-        result = pipeline.parse_wave(
+        result = pipeline.replay_acceptance_matches(
             control_run_id,
-            page_kinds=list(ACCEPTANCE_PAGE_KINDS),
             settings=PipelineSettings.acceptance_replay(
                 shard_size=ACCEPTANCE_SHARD_SIZE
             ),
             source_run_id=source,
-            acceptance_replay=True,
         ).as_dict()
         elapsed_seconds = time.monotonic() - started
         metrics = pipeline.control.record_replay_pipeline_metrics(

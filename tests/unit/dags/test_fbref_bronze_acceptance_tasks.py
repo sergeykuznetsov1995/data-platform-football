@@ -354,7 +354,7 @@ def test_replay_initializer_and_parser_are_physically_zero_network(monkeypatch):
     replay_pipeline = SimpleNamespace(
         control=control,
         batch_persist_enabled=True,
-        parse_wave=MagicMock(return_value=wave),
+        replay_acceptance_matches=MagicMock(return_value=wave),
     )
     manager = SimpleNamespace(
         statement_counts=MagicMock(
@@ -385,8 +385,7 @@ def test_replay_initializer_and_parser_are_physically_zero_network(monkeypatch):
         "pipeline_metrics": {"artifact_sha256": "a" * 64},
     }
     assert replay_pipeline.batch_persist_enabled is False
-    parse_kwargs = replay_pipeline.parse_wave.call_args.kwargs
-    assert parse_kwargs["acceptance_replay"] is True
+    parse_kwargs = replay_pipeline.replay_acceptance_matches.call_args.kwargs
     assert parse_kwargs["source_run_id"] == source_id
     record = control.record_replay_pipeline_metrics.call_args
     assert record.args == ("replay-run",)

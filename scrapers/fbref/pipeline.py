@@ -586,6 +586,17 @@ class _ClaimedMatchObservation:
         }
 
 
+@dataclass(frozen=True)
+class _AcceptanceReplayMatch:
+    """Prepared frozen match with no global observation-fence mutation."""
+
+    record: RawFetchRecord
+    page: PageDocument
+    typed_match: MatchParseResult
+    typed_context: TypedSourceContext
+    match_id: str
+
+
 @dataclass
 class LiveRunResult:
     batches: int = 0
@@ -4345,6 +4356,202 @@ class FBrefPipeline:
         result.skipped_ineligible += outcome.skipped_ineligible
         result.contract_quarantined += outcome.contract_quarantined
         result.failures.extend(outcome.failures)
+
+    def _prepare_acceptance_replay_match(
+        self, item: Mapping[str, object]
+    ) -> _AcceptanceReplayMatch:
+        """Load and parse frozen raw without touching global parse fences."""
+
+        logical_refresh_id = str(item["logical_refresh_id"])
+        html, record = self.raw_store.load_fetch_html(logical_refresh_id)
+        if (
+            record.logical_refresh_id != logical_refresh_id
+            or record.target_id != str(item["target_id"])
+            or record.page_kind != "match"
+            or (
+                item.get("content_hash")
+                and record.content_hash != str(item["content_hash"])
+            )
+        ):
+            raise ParseWaveError(
+                f"Acceptance replay raw/control mismatch for {logical_refresh_id}"
+            )
+        page = self._parse_generic(html, record)
+        typed_match, match_id, typed_context = self._parse_typed_match(
+            html, record
+        )
+        if (
+            page.errors
+            or typed_match.has_errors
+            or record.target_id != f"fbref:match:{match_id}"
+        ):
+            raise ParseWaveError(
+                f"Acceptance replay match contract failed for {record.target_id}"
+            )
+        return _AcceptanceReplayMatch(
+            record=record,
+            page=page,
+            typed_match=typed_match,
+            typed_context=typed_context,
+            match_id=match_id,
+        )
+
+    def _persist_acceptance_replay_match(
+        self, run_id: str, item: _AcceptanceReplayMatch
+    ) -> None:
+        self.generic_writer.persist_page(
+            item.page,
+            canonical_url=item.record.canonical_url,
+            run_id=run_id,
+            staging_identity=item.record.logical_refresh_id,
+        )
+        self.typed_adapter.writer.persist_match(
+            item.typed_match,
+            match_id=item.match_id,
+            context=item.typed_context,
+            run_id=run_id,
+            target_identity=item.record.logical_refresh_id,
+        )
+
+    def _persist_acceptance_replay_match_batch(
+        self, run_id: str, items: Sequence[_AcceptanceReplayMatch]
+    ) -> None:
+        generic_counts = self.generic_writer.persist_pages(
+            [
+                GenericPagePersistItem(
+                    page=item.page,
+                    canonical_url=item.record.canonical_url,
+                    run_id=run_id,
+                    staging_identity=item.record.logical_refresh_id,
+                )
+                for item in items
+            ]
+        )
+        if len(generic_counts) != len(items):
+            raise ParseWaveError(
+                "Acceptance generic batch returned misaligned item counts"
+            )
+        typed_counts = self.typed_adapter.writer.persist_matches(
+            [
+                TypedMatchPersistItem(
+                    parsed=item.typed_match,
+                    match_id=item.match_id,
+                    context=item.typed_context,
+                    run_id=run_id,
+                    target_identity=item.record.logical_refresh_id,
+                )
+                for item in items
+            ]
+        )
+        if len(typed_counts) != len(items):
+            raise TypedBronzeError(
+                "Acceptance typed batch returned misaligned item counts"
+            )
+
+    def replay_acceptance_matches(
+        self,
+        run_id: str,
+        *,
+        source_run_id: str,
+        settings: PipelineSettings,
+    ) -> WaveResult:
+        """Force one isolated zero-network replay of the frozen match cohort.
+
+        The accepted source already owns successful global observation fences.
+        Reusing the ordinary replay selector would therefore select nothing.
+        This path deliberately reads every frozen successful match attempt and
+        writes only the isolated Trino outputs under ``run_id``; it does not
+        mutate source observations, manifests, discovery, or frontier state.
+        """
+
+        if (
+            settings.run_type != "replay"
+            or settings.request_limit != 0
+            or settings.byte_limit != 0
+            or settings.shard_size != ACCEPTANCE_SHARD_SIZE
+        ):
+            raise ParseWaveError("acceptance_replay_profile_invalid")
+        source_error = self._acceptance_replay_source_error(source_run_id)
+        if source_error is not None:
+            raise ParseWaveError(source_error)
+        source_run = self.control.get_run(source_run_id)
+        metadata = source_run.get("metadata") or {}
+        marker = metadata.get("bronze_acceptance") or {}
+        page_kind_counts = marker.get("page_kind_counts") or {}
+        try:
+            expected_matches = int(page_kind_counts.get("match"))
+        except (TypeError, ValueError):
+            expected_matches = 0
+        if not 1 <= expected_matches <= settings.shard_size:
+            raise ParseWaveError("acceptance_replay_match_cohort_invalid")
+
+        with self.control.guard_publication_lock(run_id, source="fbref"):
+            fetches = self.control.list_run_fetches(
+                source_run_id,
+                page_kinds=["match"],
+                only_unparsed=False,
+                limit=settings.shard_size,
+            )
+            if len(fetches) != expected_matches:
+                raise ParseWaveError(
+                    "acceptance_replay_match_cohort_mismatch"
+                )
+            prepared = [
+                self._prepare_acceptance_replay_match(item)
+                for item in fetches
+            ]
+            target_ids = [item.record.target_id for item in prepared]
+            match_ids = [item.match_id for item in prepared]
+            if (
+                len(target_ids) != len(set(target_ids))
+                or len(match_ids) != len(set(match_ids))
+            ):
+                raise ParseWaveError(
+                    "acceptance_replay_match_identity_duplicate"
+                )
+
+            if not self.batch_persist_enabled:
+                for item in prepared:
+                    self._persist_acceptance_replay_match(run_id, item)
+            else:
+                batch: list[_AcceptanceReplayMatch] = []
+                batch_cells = 0
+
+                def flush() -> None:
+                    nonlocal batch, batch_cells
+                    if batch:
+                        self._persist_acceptance_replay_match_batch(
+                            run_id, batch
+                        )
+                        batch = []
+                        batch_cells = 0
+
+                for item in prepared:
+                    item_cells = len(item.page.cell_records()) + sum(
+                        int(dataset.frame.size)
+                        for dataset in item.typed_match.datasets.values()
+                        if dataset.frame is not None
+                    )
+                    if item_cells > self.batch_persist_max_cells:
+                        flush()
+                        self._persist_acceptance_replay_match(run_id, item)
+                        continue
+                    if batch and (
+                        len(batch) == self.batch_persist_matches
+                        or batch_cells + item_cells
+                        > self.batch_persist_max_cells
+                    ):
+                        flush()
+                    batch.append(item)
+                    batch_cells += item_cells
+                flush()
+
+        return WaveResult(
+            cohort_size=len(prepared),
+            claimed=len(prepared),
+            parsed=len(prepared),
+            typed_promoted=len(prepared),
+        )
 
     def parse_wave(
         self,
