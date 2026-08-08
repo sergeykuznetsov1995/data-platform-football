@@ -100,6 +100,7 @@ _GENERATION_ID_RE = re.compile(
 EXPECTED_SCOPE_COUNT_KEYS = frozenset({"leaderboards", "matches", "teams", "players"})
 CURRENT_VIEW_KEYS: Mapping[str, tuple[str, ...]] = {
     "fotmob_competitions": ("competition_id",),
+    "fotmob_competition_scope_observations": ("competition_id",),
     "fotmob_competition_seasons": ("competition_id", "source_season_key"),
     "fotmob_competition_season_history": (
         "competition_id",

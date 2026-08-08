@@ -61,6 +61,7 @@ FOTMOB_PUBLICATION_BINDING_FIELDS = (
 # dynamically.  This avoids freezing season strings while preventing an
 # accidental ~493-competition crawl from entering the 14:00 publication slot.
 FOTMOB_DAILY_CONTRACT_SCHEMA = "fotmob-daily-v1"
+FOTMOB_CATALOG_CONTRACT_SCHEMA = "fotmob-catalog-v1"
 FOTMOB_DAILY_SCOPE_FILE = "/opt/airflow/configs/fotmob/issue-930-scopes.txt"
 FOTMOB_DAILY_SCOPE_SHA256 = (
     "f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58"
@@ -332,6 +333,26 @@ def fotmob_daily_trigger_conf() -> dict[str, Any]:
         "entities": ",".join(FOTMOB_DAILY_ENTITIES),
         "max_requests": FOTMOB_DAILY_MAX_REQUESTS,
         "max_direct_mib": FOTMOB_DAILY_MAX_DIRECT_MIB,
+        "competition_limit": 0,
+        "season_limit": 0,
+        "requests_per_minute": FOTMOB_DAILY_REQUESTS_PER_MINUTE,
+    }
+
+
+def fotmob_catalog_trigger_conf(mode: str) -> dict[str, Any]:
+    """Return a dynamic all-included-men profile without issue-930 inputs."""
+
+    normalized_mode = str(mode).strip().casefold()
+    if normalized_mode not in {"discover", "daily", "refresh", "backfill"}:
+        raise ValueError("automatic catalog mode is not supported")
+    return {
+        "mode": normalized_mode,
+        "scope": "",
+        "catalog_contract": FOTMOB_CATALOG_CONTRACT_SCHEMA,
+        "entities": ",".join(FOTMOB_DAILY_ENTITIES),
+        "max_requests": FOTMOB_DAILY_MAX_REQUESTS,
+        "max_direct_mib": FOTMOB_DAILY_MAX_DIRECT_MIB,
+        "max_proxy_mib": 0,
         "competition_limit": 0,
         "season_limit": 0,
         "requests_per_minute": FOTMOB_DAILY_REQUESTS_PER_MINUTE,

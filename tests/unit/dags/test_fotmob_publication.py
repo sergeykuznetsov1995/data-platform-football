@@ -902,6 +902,20 @@ def test_daily_trigger_conf_is_exact_all_entity_profile():
     }
 
 
+def test_catalog_trigger_conf_has_no_historical_issue930_scope_contract():
+    conf = publication.fotmob_catalog_trigger_conf("refresh")
+
+    assert conf["mode"] == "refresh"
+    assert conf["catalog_contract"] == "fotmob-catalog-v1"
+    assert conf["scope"] == ""
+    assert not {
+        "daily_contract",
+        "competition_scope_file",
+        "competition_scope_sha256",
+        "competition_ids_sha256",
+    } & set(conf)
+
+
 def _binding(owner: str = "isolated", fingerprint: str = GIT_SHA):
     return publication.make_publication_binding(
         owner=owner,

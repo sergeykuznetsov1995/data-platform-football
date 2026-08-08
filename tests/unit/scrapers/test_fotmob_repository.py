@@ -1,5 +1,5 @@
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -150,6 +150,68 @@ def test_target_batch_id_is_replay_stable_and_parser_sensitive():
     first = deterministic_target_batch_id("target", "hash", "parser-v1")
     assert first == deterministic_target_batch_id("target", "hash", "parser-v1")
     assert first != deterministic_target_batch_id("target", "hash", "parser-v2")
+
+
+def test_memory_scope_attempts_are_durable_contract_bound_and_incremented():
+    repository = MemoryFotMobRepository()
+    attempted_at = datetime(2026, 8, 8, 10)
+    first = repository.record_scope_attempt(
+        run_id="run-1",
+        competition_id=47,
+        source_season_key="2025 Apertura",
+        plan_signature="fmplan1-one",
+        outcome="retryable",
+        reason="HTTP 503",
+        last_attempt_at=attempted_at,
+        next_retry_at=attempted_at + timedelta(minutes=15),
+        attempt_identities=("raw-attempt-1",),
+    )
+    second = repository.record_scope_attempt(
+        run_id="run-2",
+        competition_id=47,
+        source_season_key="2025 Apertura",
+        plan_signature="fmplan1-one",
+        outcome="success",
+        reason="scope completion committed",
+        last_attempt_at=attempted_at + timedelta(minutes=20),
+        attempt_identities=("raw-attempt-2",),
+    )
+
+    assert first.attempt_count == 1
+    assert second.attempt_count == 2
+    assert repository.scope_attempt_states("fmplan1-one") == {
+        (47, "2025 Apertura"): second
+    }
+    assert repository.scope_attempt_states("fmplan1-other") == {}
+    commits = [c for c in repository.commits if c.target_type == "scope_attempt"]
+    assert [c.entity_id for c in commits] == ["fmplan1-one", "fmplan1-one"]
+    assert commits[0].attempts == 0  # transport retry counters are not overloaded
+
+    retried_same_run = repository.record_scope_attempt(
+        run_id="run-2",
+        competition_id=47,
+        source_season_key="2025 Apertura",
+        plan_signature="fmplan1-one",
+        outcome="success",
+        reason="Airflow retried the same generation",
+        last_attempt_at=attempted_at + timedelta(minutes=21),
+    )
+    assert retried_same_run.attempt_count == 2
+
+
+def test_source_gap_requires_two_distinct_successful_attempt_identities():
+    repository = MemoryFotMobRepository()
+
+    with pytest.raises(ValueError, match="two distinct"):
+        repository.record_scope_attempt(
+            run_id="run-1",
+            competition_id=47,
+            source_season_key="2025/2026",
+            plan_signature="fmplan1-one",
+            outcome="source_gap",
+            reason="finished match payload absent",
+            attempt_identities=("only-one",),
+        )
 
 
 def test_catalog_observation_identity_is_separate_from_content_identity():

@@ -29,6 +29,7 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from utils.config import DAG_TAGS, FOTMOB_HTTP_POOL, SCHEDULES
 from utils.default_args import SCRAPER_ARGS
 from utils.fotmob_publication import (
+    FOTMOB_CATALOG_CONTRACT_SCHEMA,
     FOTMOB_DAILY_COMPETITION_COUNT,
     FOTMOB_DAILY_COMPETITION_IDS,
     FOTMOB_DAILY_COMPETITION_IDS_SHA256,
@@ -605,6 +606,16 @@ def validate_data(
             f"Unsupported FotMob report mode {mode!r}; native mode is required"
         )
     if mode in NATIVE_MODES:
+        selection = result.get("selection")
+        contract_evidence = (
+            selection.get("catalog_contract")
+            if isinstance(selection, dict)
+            else None
+        )
+        automatic_catalog = (
+            isinstance(contract_evidence, dict)
+            and contract_evidence.get("schema") == FOTMOB_CATALOG_CONTRACT_SCHEMA
+        )
         operation_failures = []
         for operation in result.get("operations") or []:
             if (
@@ -644,14 +655,40 @@ def validate_data(
             violations.append(f"missing transport metrics={missing_transport!r}")
         if missing_budget:
             violations.append(f"missing budget metrics={missing_budget!r}")
-        if result.get("status") != "success" or result.get("complete") is not True:
+        if automatic_catalog:
+            valid_status_shape = (
+                result.get("status") == "success"
+                and result.get("complete") is True
+            ) or (
+                result.get("status") == "partial_success"
+                and result.get("complete") is False
+            )
+            if not valid_status_shape:
+                violations.append(
+                    "automatic status/complete evidence is inconsistent"
+                )
+        elif result.get("status") != "success" or result.get("complete") is not True:
             violations.append(
                 f"status={result.get('status')!r}, complete={result.get('complete')!r}"
             )
-        if result.get("errors"):
+        if result.get("errors") and not automatic_catalog:
             violations.append(f"runner errors={result['errors']!r}")
-        if operation_failures:
+        if operation_failures and not automatic_catalog:
             violations.append(f"operation failures={operation_failures!r}")
+        if automatic_catalog:
+            for failure in operation_failures:
+                hard_errors = [
+                    error
+                    for error in failure["errors"]
+                    if "request budget" not in str(error).casefold()
+                    and "direct-byte budget" not in str(error).casefold()
+                ]
+                if hard_errors or failure["terminal"]:
+                    violations.append(
+                        "automatic hard operation failure="
+                        f"{failure['entity']!r}: errors={hard_errors!r}, "
+                        f"terminal={failure['terminal']!r}"
+                    )
         if int(transport.get("proxy_bytes") or 0) != 0:
             violations.append(
                 f"proxy_bytes={transport.get('proxy_bytes')} (direct-only invariant)"
@@ -673,7 +710,6 @@ def validate_data(
             violations.append("proxy-byte budget exceeded")
         if not result.get("operations"):
             violations.append("no native operations recorded")
-        selection = result.get("selection")
         selection_profile = (
             str(selection.get("profile") or "").strip()
             if isinstance(selection, dict)
@@ -740,7 +776,7 @@ def validate_data(
                             )
                         violations.extend(source_violations)
                         selection_summary.update(source_summary)
-                    elif mode == "daily":
+                    elif mode == "daily" and not automatic_catalog:
                         daily_violations, daily_summary = _validate_daily_selection(
                             result=result,
                             selection=selection,
@@ -750,12 +786,42 @@ def validate_data(
                         )
                         violations.extend(daily_violations)
                         selection_summary.update(daily_summary)
+        if automatic_catalog:
+            from scripts.fotmob_catalog_acceptance import validate_report
+
+            acceptance = validate_report(result)
+            acceptance_errors = list(acceptance.errors)
+            if result.get("status") == "partial_success" and (
+                isinstance(selection, dict)
+                and selection.get("scope_lane") == "current"
+            ):
+                acceptance_errors = [
+                    error
+                    for error in acceptance_errors
+                    if not (
+                        error.startswith(
+                            "every current contract scope must have terminal"
+                        )
+                        or (
+                            error.startswith("current scope ")
+                            and (
+                                " is not terminal" in error
+                                or "older than 72 hours" in error
+                            )
+                        )
+                    )
+                ]
+            if acceptance_errors:
+                violations.append(
+                    "automatic catalog evidence failed: "
+                    + "; ".join(acceptance_errors)
+                )
         if violations:
             raise AirflowException(
                 "Incomplete FotMob native ingest: " + "; ".join(violations)
             )
         summary = {
-            "status": "success",
+            "status": result.get("status"),
             "run_id": result.get("run_id"),
             "mode": mode,
             "rows": result.get("rows") or {},
@@ -796,6 +862,11 @@ with DAG(
             title="Exact scopes",
             description="Optional comma-separated FotMob ID=season keys",
         ),
+        "catalog_contract": Param(
+            default="",
+            type="string",
+            enum=["", FOTMOB_CATALOG_CONTRACT_SCHEMA],
+        ),
         "daily_contract": Param(default="", type="string"),
         "competition_scope_file": Param(default="", type="string"),
         "competition_scope_sha256": Param(default="", type="string"),
@@ -811,6 +882,7 @@ with DAG(
             type="integer",
             enum=[0, PLAYER_SOURCE_REFRESH_TARGET_COUNT],
         ),
+        "deadline": Param(default="", type="string"),
         "entities": Param(
             default="season,leaderboards,matches,teams,players,transfers",
             type="string",
@@ -877,6 +949,7 @@ python dags/scripts/run_fotmob_scraper.py \\
     --publication-data-interval-end "{PUBLICATION_BINDING_TEMPLATE["data_interval_end"]}" \\
     --publication-runtime-fingerprint "{PUBLICATION_BINDING_TEMPLATE["runtime_fingerprint"]}" \\
     --mode "{{{{ params.mode }}}}" \\
+    --catalog-contract "{{{{ params.catalog_contract }}}}" \\
     --daily-contract "{{{{ params.daily_contract }}}}" \\
     --competition-scope-file "{{{{ params.competition_scope_file }}}}" \\
     --competition-scope-sha256 "{{{{ params.competition_scope_sha256 }}}}" \\
@@ -895,6 +968,7 @@ python dags/scripts/run_fotmob_scraper.py \\
     --max-attempts "{{{{ params.max_attempts }}}}" \\
     --next-build-id "" \\
     --requests-per-minute "{{{{ params.requests_per_minute }}}}" \\
+    --deadline "{{{{ params.deadline }}}}" \\
     --workers 4 \\
     --output "{RESULT_PATH}"
 """,

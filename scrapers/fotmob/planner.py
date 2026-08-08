@@ -45,6 +45,32 @@ class RunMode(str, Enum):
     REPLAY = "replay"
 
 
+class ScopeLane(str, Enum):
+    """Disjoint automatic queues for source-current and historical seasons."""
+
+    CURRENT = "current"
+    HISTORY = "history"
+
+
+@dataclass(frozen=True, slots=True)
+class ScopeAttemptState:
+    """Latest durable scheduler result for one exact contract-bound scope."""
+
+    competition_id: int
+    source_season_key: str
+    plan_signature: str
+    attempt_count: int
+    last_attempt_at: datetime
+    next_retry_at: Optional[datetime]
+    outcome: str
+    reason: str
+    attempt_identities: tuple[str, ...] = ()
+
+    @property
+    def identity(self) -> tuple[int, str]:
+        return self.competition_id, self.source_season_key
+
+
 SCOPE_PLAN_SIGNATURE_VERSION = "fotmob-scope-plan-v1"
 
 
@@ -172,7 +198,7 @@ class BudgetLedger:
 class SeasonWorkItem:
     competition_id: int
     source_season_key: str
-    priority: tuple[int, int, int, str]
+    priority: tuple[Any, ...]
     is_latest: bool
     reason: str
 
@@ -196,14 +222,17 @@ def plan_seasons(
     mode: RunMode,
     previously_successful: Iterable[tuple[int, str]] = (),
     explicit_scopes: Optional[Iterable[tuple[int, str]]] = None,
+    lane: Optional[ScopeLane] = None,
+    attempt_states: Mapping[tuple[int, str], ScopeAttemptState] | None = None,
+    now: Optional[datetime] = None,
 ) -> list[SeasonWorkItem]:
     """Build a stable full-catalog/daily/backfill plan.
 
     Included adult men's competitions are eligible.  Excluded and ambiguous
     competitions remain in the discovery catalog but never enter an ingest
-    plan.  Backfill order is mandatory sentinels first, then source-selected
-    (active/latest) seasons, then older source order.  Exact season strings are
-    passed through unchanged.
+    plan. Current and history lanes are disjoint. A durable retry that is not
+    due is skipped without blocking later ready work. Exact season strings are
+    passed through unchanged and no hardcoded competition cohort affects order.
     """
 
     included = {
@@ -217,6 +246,10 @@ def plan_seasons(
         if explicit_scopes is not None
         else None
     )
+    attempts = dict(attempt_states or {})
+    observed_now = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    if observed_now.tzinfo is not None:
+        observed_now = observed_now.astimezone(timezone.utc).replace(tzinfo=None)
 
     output: list[SeasonWorkItem] = []
     seen: set[tuple[int, str]] = set()
@@ -229,6 +262,11 @@ def plan_seasons(
             continue
         if requested is not None and identity not in requested:
             continue
+        is_current = bool(season.is_selected or season.is_latest)
+        if lane == ScopeLane.CURRENT and not is_current:
+            continue
+        if lane == ScopeLane.HISTORY and is_current:
+            continue
         if mode == RunMode.DAILY and not (season.is_selected or season.is_latest):
             continue
         if mode == RunMode.BACKFILL and identity in success:
@@ -237,23 +275,33 @@ def plan_seasons(
             # Replay is bounded to known raw identities, not a network backfill.
             continue
 
-        mandatory_rank = 0 if season.competition_id in MANDATORY_COMPETITION_IDS else 1
+        attempt = attempts.get(identity)
+        if attempt is not None:
+            if attempt.outcome == "terminal" or (
+                attempt.outcome in {"success", "source_gap"}
+                and lane != ScopeLane.CURRENT
+            ):
+                continue
+            retry_at = attempt.next_retry_at
+            if retry_at is not None:
+                if retry_at.tzinfo is not None:
+                    retry_at = retry_at.astimezone(timezone.utc).replace(tzinfo=None)
+                if retry_at > observed_now:
+                    continue
+
         active_rank = 0 if (season.is_selected or season.is_latest) else 1
         recency = _season_recency_key(season)
-        reason = (
-            "mandatory_acceptance_sentinel"
-            if mandatory_rank == 0
-            else "active_or_latest"
-            if active_rank == 0
-            else "historical_backfill"
-        )
+        reason = "active_or_latest" if active_rank == 0 else "historical_backfill"
+        last_attempt = attempt.last_attempt_at if attempt is not None else datetime.min
+        if last_attempt.tzinfo is not None:
+            last_attempt = last_attempt.astimezone(timezone.utc).replace(tzinfo=None)
         output.append(
             SeasonWorkItem(
                 competition_id=season.competition_id,
                 source_season_key=season.source_season_key,
                 priority=(
-                    mandatory_rank,
                     active_rank,
+                    last_attempt,
                     recency,
                     season.source_season_key,
                 ),
@@ -295,6 +343,8 @@ __all__ = [
     "BudgetExceeded",
     "BudgetLedger",
     "RunMode",
+    "ScopeAttemptState",
+    "ScopeLane",
     "SeasonWorkItem",
     "TransportBudget",
     "deterministic_plan_signature",

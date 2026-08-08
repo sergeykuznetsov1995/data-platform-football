@@ -212,6 +212,166 @@ class TestFotmobNativeRunner:
                 parser.parse_args(argv)
 
     @pytest.mark.unit
+    def test_automatic_catalog_profile_never_loads_issue930_scope_file(
+        self, monkeypatch
+    ):
+        mod = self._module()
+        parser = mod._argument_parser()
+        from utils import fotmob_publication as publication
+
+        monkeypatch.setattr(
+            publication,
+            "load_fotmob_daily_competition_contract",
+            lambda *_args, **_kwargs: pytest.fail("legacy scope file was read"),
+        )
+        args = parser.parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--deadline",
+                "2026-08-08T12:00:00Z",
+            ]
+        )
+
+        assert mod._validate_args(parser, args) is None
+        assert args.catalog_contract == "fotmob-catalog-v1"
+        assert args.deadline_at == datetime(2026, 8, 8, 12)
+
+    @pytest.mark.unit
+    def test_automatic_catalog_profile_rejects_legacy_contract_fields(self):
+        mod = self._module()
+        parser = mod._argument_parser()
+        with pytest.raises(SystemExit):
+            mod._validate_args(
+                parser,
+                parser.parse_args(
+                    [
+                        "--mode",
+                        "refresh",
+                        "--catalog-contract",
+                        "fotmob-catalog-v1",
+                        "--daily-contract",
+                        "fotmob-daily-v1",
+                    ]
+                ),
+            )
+
+    @pytest.mark.unit
+    def test_automatic_runner_emits_classifier_bound_contract_and_attempts(self):
+        from scrapers.fotmob.catalog_contract import catalog_contract_from_dict
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+        }
+        service, _, _ = _service(responses)
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0, report["errors"]
+        selection = report["selection"]
+        contract = catalog_contract_from_dict(selection["catalog_contract"])
+        assert contract.classifier_version == "fotmob-men-v1"
+        assert contract.included_ids == (47,)
+        assert contract.scopes == ("47=2025/2026",)
+        assert selection["scope_lane"] == "current"
+        assert selection["catalog_ids"] == [47]
+        assert selection["catalog_decisions"][0]["decision"] == "included"
+        assert selection["scope_attempts"][0]["outcome"] == "success"
+
+    @pytest.mark.unit
+    def test_automatic_deadline_deferral_is_partial_success_with_evidence(self):
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+        }
+        service, _, _ = _service(responses)
+        service.sync_season = MagicMock(wraps=service.sync_season)
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season",
+            ]
+        )
+        args.deadline_at = datetime(2020, 1, 1)
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0
+        assert report["status"] == "partial_success"
+        assert report["complete"] is False
+        assert report["selection"]["scope_attempts"][0]["outcome"] == "deferred"
+        service.sync_season.assert_not_called()
+
+    @pytest.mark.unit
+    def test_automatic_schema_failure_remains_hard(self):
+        from scrapers.fotmob.service import OperationResult
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+        }
+        service, _, _ = _service(responses)
+        service.sync_season = MagicMock(
+            return_value=(
+                OperationResult(
+                    "season_bundle",
+                    attempted=1,
+                    errors=["schema drift: missing required match identity"],
+                ),
+                None,
+            )
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 1
+        assert report["status"] == "incomplete"
+        assert report["selection"]["scope_attempts"][0]["outcome"] == "terminal"
+
+    @pytest.mark.unit
     def test_direct_cli_requires_exact_publication_and_matching_run_id(
         self, monkeypatch
     ):

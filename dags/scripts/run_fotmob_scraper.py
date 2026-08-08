@@ -20,7 +20,8 @@ import signal
 import sys
 import tempfile
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 
@@ -61,6 +62,10 @@ NATIVE_PRIMARY_COUNTS = {
     "current_views": "views",
 }
 _MISSING_PLAYER_RAW_ERROR = "no raw-bearing v1/v2 player manifest for offline replay"
+_SOURCE_GAP_RETRY_REASON = "source-advertised finished match payloads absent"
+_SOURCE_GAP_REASON = (
+    "two successful fetches lacked source-advertised finished match payloads"
+)
 
 PUBLICATION_BINDING_ARGUMENTS = {
     "schema": "publication_schema",
@@ -451,6 +456,47 @@ def _identity_hash(values: Iterable[Any]) -> str:
     return hashlib.sha256(material).hexdigest()
 
 
+def _catalog_decision_payload(evidence) -> dict[str, Any]:
+    payload = asdict(evidence)
+    for field in ("probe_status", "decision"):
+        value = payload.get(field)
+        payload[field] = getattr(value, "value", value)
+    for field in ("next_probe_at", "observed_at"):
+        value = payload.get(field)
+        payload[field] = value.isoformat() if isinstance(value, datetime) else value
+    return payload
+
+
+def _scope_attempt_payload(state) -> dict[str, Any]:
+    return {
+        "competition_id": state.competition_id,
+        "source_season_key": state.source_season_key,
+        "plan_signature": state.plan_signature,
+        "attempt_count": state.attempt_count,
+        "last_attempt_at": state.last_attempt_at.replace(
+            tzinfo=timezone.utc
+        ).isoformat(),
+        "next_retry_at": (
+            state.next_retry_at.replace(tzinfo=timezone.utc).isoformat()
+            if state.next_retry_at is not None
+            else None
+        ),
+        "outcome": state.outcome,
+        "reason": state.reason,
+        "attempt_identities": list(state.attempt_identities),
+    }
+
+
+def _scope_retry_due(attempt_count: int, observed_at: datetime) -> datetime:
+    delays = (timedelta(minutes=15), timedelta(hours=1), timedelta(hours=6), timedelta(hours=24))
+    return observed_at + delays[min(max(int(attempt_count), 1), len(delays)) - 1]
+
+
+def _is_budget_deferral_error(value: Any) -> bool:
+    text = str(value).casefold()
+    return "budget" in text and ("request" in text or "byte" in text)
+
+
 def _native_output_payload(report) -> dict[str, Any]:
     payload = report.as_dict()
     tables: list[str] = []
@@ -578,8 +624,15 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     from scrapers.fotmob.planner import (
         MANDATORY_COMPETITION_IDS,
         RunMode,
+        ScopeLane,
         deterministic_plan_signature,
         plan_seasons,
+    )
+    from scrapers.fotmob.catalog import CLASSIFIER_VERSION
+    from scrapers.fotmob.catalog_contract import build_catalog_contract
+    from scrapers.fotmob.repository import (
+        PARSER_VERSION,
+        deterministic_target_batch_id,
     )
     from scrapers.fotmob.service import OperationResult
     from scrapers.fotmob.transport import canonicalize_target
@@ -591,6 +644,13 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     global _ACTIVE_NATIVE_SERVICE
     _ACTIVE_NATIVE_SERVICE = service
     operations = []
+    automatic_catalog = (
+        getattr(args, "catalog_contract", "") == "fotmob-catalog-v1"
+    )
+    automatic_contract = None
+    automatic_lane = None
+    catalog_ids_evidence: list[int] = []
+    catalog_decisions_evidence: list[dict[str, Any]] = []
 
     def finish() -> tuple[int, dict[str, Any]]:
         # Buffered commits are only durable once flushed. Every exit path of
@@ -741,6 +801,20 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     classifications = list(catalog.classifications)
     catalog_ids = {item.competition.competition_id for item in classifications}
     scope_validation = OperationResult("scope_validation")
+    if automatic_catalog:
+        catalog_ids_evidence = sorted(catalog_ids)
+        evidence_by_id = dict(getattr(catalog, "evidence", {}) or {})
+        missing_evidence = sorted(catalog_ids - set(evidence_by_id))
+        if missing_evidence:
+            scope_validation.errors.append(
+                "automatic catalog IDs lack durable profile evidence: "
+                + ",".join(map(str, missing_evidence))
+            )
+        catalog_decisions_evidence = [
+            _catalog_decision_payload(evidence_by_id[competition_id])
+            for competition_id in catalog_ids_evidence
+            if competition_id in evidence_by_id
+        ]
     unknown_ids = sorted(requested_competition_ids - catalog_ids)
     if unknown_ids:
         scope_validation.errors.append(
@@ -770,12 +844,46 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             and item.decision.value == "included"
         )
     ]
-    candidates.sort(
-        key=lambda item: (
-            item.competition.competition_id not in MANDATORY_COMPETITION_IDS,
-            item.competition.competition_id,
+    if automatic_catalog:
+        discovery_times: dict[int, datetime] = {}
+        latest_entity_success = getattr(
+            service.repository, "latest_entity_success", None
         )
-    )
+        for item in candidates:
+            previous = (
+                latest_entity_success(
+                    "competition_seasons", item.competition.competition_id
+                )
+                if latest_entity_success is not None
+                else None
+            )
+            raw_completed_at = previous.get("completed_at") if previous else None
+            try:
+                completed_at = (
+                    raw_completed_at
+                    if isinstance(raw_completed_at, datetime)
+                    else datetime.fromisoformat(str(raw_completed_at))
+                )
+                if completed_at.tzinfo is not None:
+                    completed_at = completed_at.astimezone(timezone.utc).replace(
+                        tzinfo=None
+                    )
+            except (TypeError, ValueError):
+                completed_at = datetime.min
+            discovery_times[item.competition.competition_id] = completed_at
+        candidates.sort(
+            key=lambda item: (
+                discovery_times[item.competition.competition_id],
+                item.competition.competition_id,
+            )
+        )
+    else:
+        candidates.sort(
+            key=lambda item: (
+                item.competition.competition_id not in MANDATORY_COMPETITION_IDS,
+                item.competition.competition_id,
+            )
+        )
     all_candidates = list(candidates)
     discovery_plan = OperationResult("competition_discovery_plan")
     if args.competition_limit:
@@ -820,9 +928,6 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 discovered.fetch
             )
 
-    if args.mode == RunMode.DISCOVER.value:
-        return finish()
-
     discovered_identities = {season.identity for season in seasons}
     missing_scopes = sorted(set(explicit_scopes) - discovered_identities)
     if missing_scopes:
@@ -849,15 +954,84 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
 
     mode = RunMode("daily" if args.mode == "refresh" else args.mode)
     scope_entities = frozenset({"season", *(entities - {"transfers"})})
-    scope_plan_signature = deterministic_plan_signature(
-        scope_entities,
-        policy={
-            "match_policy": "finished_only",
-            "leaderboard_policy": "all_advertised",
-            "team_policy": "global_observed_snapshot",
-            "player_policy": "global_observed_snapshot",
-        },
+    scope_policy = {
+        "match_policy": "finished_only",
+        "leaderboard_policy": "all_advertised",
+        "team_policy": "global_observed_snapshot",
+        "player_policy": "global_observed_snapshot",
+    }
+    automatic_lane = (
+        ScopeLane.HISTORY
+        if mode == RunMode.BACKFILL
+        else ScopeLane.CURRENT
     )
+    if automatic_catalog:
+        contract_items = (
+            []
+            if mode == RunMode.DISCOVER
+            else plan_seasons(
+                classifications,
+                seasons,
+                mode=mode,
+                lane=automatic_lane,
+            )
+        )
+        if (
+            catalog.fetch is None
+            or not catalog.fetch.content_hash
+            or not catalog.fetch.target_key
+        ):
+            scope_validation.errors.append(
+                "automatic catalog contract lacks immutable allLeagues identity"
+            )
+        else:
+            automatic_contract = build_catalog_contract(
+                catalog_batch_id=deterministic_target_batch_id(
+                    catalog.fetch.target_key,
+                    catalog.fetch.content_hash,
+                    PARSER_VERSION,
+                    getattr(service, "run_id", run_id),
+                ),
+                catalog_content_hash=catalog.fetch.content_hash,
+                classifier_version=CLASSIFIER_VERSION,
+                parser_version=PARSER_VERSION,
+                entities=scope_entities,
+                entity_policy=scope_policy,
+                included_ids=[
+                    item.competition.competition_id
+                    for item in classifications
+                    if item.decision.value == "included"
+                ],
+                scopes=[item.identity for item in contract_items],
+            )
+        if scope_validation.errors and scope_validation not in operations:
+            operations.append(scope_validation)
+    scope_plan_signature = (
+        automatic_contract.plan_signature
+        if automatic_contract is not None
+        else deterministic_plan_signature(scope_entities, policy=scope_policy)
+    )
+
+    if args.mode == RunMode.DISCOVER.value:
+        rc, payload = finish()
+        if automatic_contract is not None:
+            payload["selection"] = {
+                "entities": sorted(entities),
+                "explicit_scopes": [],
+                "competition_limit": 0,
+                "season_limit": args.season_limit,
+                "scope_plan_signature": scope_plan_signature,
+                "planned_scopes": [],
+                "completed_scopes": [],
+                "completed_transfer_competition_ids": [],
+                "requests_per_minute": args.requests_per_minute,
+                "scope_lane": automatic_lane.value,
+                "catalog_contract": automatic_contract.as_dict(),
+                "catalog_ids": catalog_ids_evidence,
+                "catalog_decisions": catalog_decisions_evidence,
+                "scope_attempts": [],
+            }
+        return rc, payload
     previously_complete: set[tuple[int, str]] = set()
     if mode == RunMode.BACKFILL:
         # No run_id filter on purpose: service.run_id is the publication
@@ -880,15 +1054,23 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             if raw_store is not None and raw_store.has_target(target):
                 previously_complete.add(season.identity)
 
+    attempt_states = (
+        service.repository.scope_attempt_states(scope_plan_signature)
+        if automatic_catalog and automatic_contract is not None
+        else {}
+    )
+
     work = plan_seasons(
         classifications,
         seasons,
         mode=mode,
         previously_successful=previously_complete,
         explicit_scopes=(explicit_scopes or None),
+        lane=(automatic_lane if automatic_catalog else None),
+        attempt_states=attempt_states,
     )
     daily_scope_times = {}
-    if mode == RunMode.DAILY:
+    if mode == RunMode.DAILY and not automatic_catalog:
         daily_scope_times = service.repository.scope_completion_times(
             scope_plan_signature
         )
@@ -909,7 +1091,11 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             "daily_completion_timestamps": len(daily_scope_times),
         },
     )
-    if not work and mode in {RunMode.DAILY, RunMode.REPLAY}:
+    if (
+        not work
+        and mode in {RunMode.DAILY, RunMode.REPLAY}
+        and not automatic_catalog
+    ):
         work_plan.errors.append(
             f"{mode.value} discovered no eligible exact season targets"
         )
@@ -925,6 +1111,38 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         format_scope_token(item.competition_id, item.source_season_key)
         for item in work
     ]
+    attempt_operation = OperationResult("scope_attempts")
+
+    def record_automatic_attempt(
+        item,
+        *,
+        outcome: str,
+        reason: str,
+        next_retry_at: datetime | None = None,
+        attempt_identities: tuple[str, ...] = (),
+    ) -> None:
+        if not automatic_catalog or automatic_contract is None:
+            return
+        attempt_operation.attempted += 1
+        try:
+            state = service.record_scope_attempt(
+                item.competition_id,
+                item.source_season_key,
+                plan_signature=scope_plan_signature,
+                outcome=outcome,
+                reason=reason,
+                next_retry_at=next_retry_at,
+                attempt_identities=attempt_identities,
+            )
+            attempt_operation.succeeded += 1
+            attempt_operation.metadata.setdefault("outcomes", []).append(
+                _scope_attempt_payload(state)
+            )
+        except Exception as exc:
+            attempt_operation.errors.append(
+                f"scope attempt {item.identity}: {type(exc).__name__}: {exc}"
+            )
+
     if args.season_limit:
         deferred = work[args.season_limit :]
         work = work[: args.season_limit]
@@ -933,8 +1151,18 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             format_scope_token(item.competition_id, item.source_season_key)
             for item in deferred
         ]
+        deferred_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        for deferred_item in deferred:
+            record_automatic_attempt(
+                deferred_item,
+                outcome="deferred",
+                reason="season limit deferred scope",
+                next_retry_at=deferred_at + timedelta(minutes=1),
+            )
     work_plan.counts["planned_scopes"] = len(work)
     operations.append(work_plan)
+    if automatic_catalog:
+        operations.append(attempt_operation)
     completed_scopes: list[str] = []
     replay_gap_entries: list[dict[str, Any]] = []
 
@@ -943,6 +1171,28 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     # the whole request budget and permanently starving child entities.
     for work_index, item in enumerate(work):
         scope_key = format_scope_token(item.competition_id, item.source_season_key)
+        observed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        deadline_at = getattr(args, "deadline_at", None)
+        deferred_reason = None
+        if deadline_at is not None and observed_at >= deadline_at:
+            deferred_reason = "run deadline deferred scope"
+        elif automatic_catalog and service.ledger.remaining_requests < max_attempts:
+            deferred_reason = "request budget deferred scope"
+        if deferred_reason is not None:
+            deferred = work[work_index:]
+            work_plan.skipped += len(deferred)
+            work_plan.metadata.setdefault("runtime_deferred_scopes", []).extend(
+                format_scope_token(value.competition_id, value.source_season_key)
+                for value in deferred
+            )
+            for deferred_item in deferred:
+                record_automatic_attempt(
+                    deferred_item,
+                    outcome="deferred",
+                    reason=deferred_reason,
+                    next_retry_at=observed_at + timedelta(minutes=1),
+                )
+            break
         scope_operations = []
         operation, bundle = service.sync_season(
             item.competition_id,
@@ -1015,10 +1265,16 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             for item in scope_operations
             if _outstanding_targets(item)
         }
+        source_missing_matches = sum(
+            int(operation.metadata.get("intentional_not_available") or 0)
+            for operation in scope_operations
+            if operation.entity == "match_payloads"
+        )
         scope_ok = (
             bool(bundle is not None)
             and all(item.ok for item in scope_operations)
             and not outstanding
+            and source_missing_matches == 0
         )
         if scope_ok and bundle is not None:
             descriptors = (
@@ -1085,16 +1341,101 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 completion.counts["scopes"] = 1
                 work_plan.succeeded += 1
                 completed_scopes.append(scope_key)
+                record_automatic_attempt(
+                    item,
+                    outcome="success",
+                    reason="scope completion committed",
+                    next_retry_at=(
+                        observed_at + timedelta(hours=48)
+                        if automatic_lane == ScopeLane.CURRENT
+                        else None
+                    ),
+                    attempt_identities=(f"{run_id}:{scope_key}",),
+                )
             except Exception as exc:
                 completion.errors.append(
                     f"scope {scope_key}: {type(exc).__name__}: {exc}"
                 )
+                record_automatic_attempt(
+                    item,
+                    outcome="terminal",
+                    reason=f"scope completion commit failed: {type(exc).__name__}",
+                    attempt_identities=(f"{run_id}:{scope_key}",),
+                )
             operations.append(completion)
         else:
+            previous_attempt = attempt_states.get(item.identity)
+            attempt_identity = f"{run_id}:{scope_key}"
+            prior_identities = (
+                previous_attempt.attempt_identities
+                if previous_attempt is not None
+                else ()
+            )
+            source_gap = (
+                automatic_catalog
+                and source_missing_matches > 0
+                and bool(bundle is not None)
+                and all(operation.ok for operation in scope_operations)
+                and not outstanding
+                and previous_attempt is not None
+                and previous_attempt.outcome in {"retryable", "source_gap"}
+                and previous_attempt.reason
+                in {_SOURCE_GAP_RETRY_REASON, _SOURCE_GAP_REASON}
+                and len(set((*prior_identities, attempt_identity))) >= 2
+            )
+            budget_failure = any(
+                _is_budget_deferral_error(error)
+                for operation in scope_operations
+                for error in operation.errors
+            )
+            hard_failure = any(operation.terminal for operation in scope_operations) or any(
+                not _is_budget_deferral_error(error)
+                for operation in scope_operations
+                for error in operation.errors
+            )
             work_plan_retryable = (
                 f"scope {scope_key} incomplete; outstanding={outstanding}"
             )
-            work_plan.retryable.append(work_plan_retryable)
+            if source_gap:
+                gap_identities = tuple(
+                    dict.fromkeys((*prior_identities, attempt_identity))
+                )[-2:]
+                record_automatic_attempt(
+                    item,
+                    outcome="source_gap",
+                    reason=_SOURCE_GAP_REASON,
+                    next_retry_at=(
+                        observed_at + timedelta(hours=48)
+                        if automatic_lane == ScopeLane.CURRENT
+                        else None
+                    ),
+                    attempt_identities=gap_identities,
+                )
+                work_plan.succeeded += 1
+            else:
+                if not hard_failure or not automatic_catalog:
+                    work_plan.retryable.append(work_plan_retryable)
+                next_due = _scope_retry_due(
+                    (previous_attempt.attempt_count + 1 if previous_attempt else 1),
+                    observed_at,
+                )
+                record_automatic_attempt(
+                    item,
+                    outcome="terminal" if hard_failure else "retryable",
+                    reason=(
+                        "schema or entity processing failure"
+                        if hard_failure
+                        else (
+                            _SOURCE_GAP_RETRY_REASON
+                            if source_missing_matches and not outstanding
+                            else work_plan_retryable
+                        )
+                    ),
+                    next_retry_at=None if hard_failure else next_due,
+                    attempt_identities=tuple(
+                        dict.fromkeys((*prior_identities, attempt_identity))
+                    ),
+                )
             work_plan.metadata.setdefault("incomplete_scopes", []).append(
                 {"scope": scope_key, "outstanding": outstanding}
             )
@@ -1130,7 +1471,10 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
 
         if (
             not scope_ok
-            and service.ledger.remaining_requests < max_attempts
+            and (
+                service.ledger.remaining_requests < max_attempts
+                or budget_failure
+            )
             and work_index + 1 < len(work)
         ):
             deferred = work[work_index + 1 :]
@@ -1142,13 +1486,30 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             work_plan.retryable.append(
                 f"request budget deferred {len(deferred)} remaining scopes"
             )
+            deferred_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            for deferred_item in deferred:
+                record_automatic_attempt(
+                    deferred_item,
+                    outcome="deferred",
+                    reason="request budget deferred scope",
+                    next_retry_at=deferred_at + timedelta(minutes=1),
+                )
             break
 
     if "transfers" in entities:
         transfer_window = "1year" if mode == RunMode.DAILY else "all"
+        transfer_policy = {"window": transfer_window, "pagination": "unique_hits"}
+        if automatic_contract is not None:
+            transfer_policy.update(
+                {
+                    "classifier_version": CLASSIFIER_VERSION,
+                    "parser_version": PARSER_VERSION,
+                    "included_ids_sha256": automatic_contract.included_ids_sha256,
+                }
+            )
         transfer_signature = deterministic_plan_signature(
             {"transfers"},
-            policy={"window": transfer_window, "pagination": "unique_hits"},
+            policy=transfer_policy,
         )
         completed_transfer_ids = set()
         transfer_completion_times = {}
@@ -1257,6 +1618,11 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     else:
         completed_transfer_competition_ids = []
 
+    automatic_attempts = (
+        service.repository.scope_attempt_states(scope_plan_signature)
+        if automatic_catalog and automatic_contract is not None
+        else {}
+    )
     rc, payload = finish()
     replay_missing_inputs = (
         _replay_missing_raw_evidence(
@@ -1289,6 +1655,38 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     if daily_contract:
         payload["selection"]["daily_contract"] = daily_contract["schema"]
         payload["selection"]["competition_scope"] = daily_contract
+    if automatic_contract is not None:
+        payload["selection"].update(
+            {
+                "scope_lane": automatic_lane.value,
+                "catalog_contract": automatic_contract.as_dict(),
+                "catalog_ids": catalog_ids_evidence,
+                "catalog_decisions": catalog_decisions_evidence,
+                "scope_attempts": [
+                    _scope_attempt_payload(state)
+                    for _identity, state in sorted(automatic_attempts.items())
+                ],
+            }
+        )
+        soft_outcomes = any(
+            state.outcome in {"retryable", "deferred"}
+            for state in automatic_attempts.values()
+        )
+        soft_outcomes = soft_outcomes or any(
+            operation.retryable for operation in operations
+        )
+        hard_failures = any(
+            operation.terminal
+            or any(
+                not _is_budget_deferral_error(error)
+                for error in operation.errors
+            )
+            for operation in operations
+        )
+        if soft_outcomes and not hard_failures:
+            payload["status"] = "partial_success"
+            payload["complete"] = False
+            rc = 0
     return rc, payload
 
 
@@ -1325,6 +1723,11 @@ def _argument_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="ID=SEASON",
         help="Exact native scope; repeat or comma-separate (e.g. 47=2025/2026)",
+    )
+    parser.add_argument(
+        "--catalog-contract",
+        default="",
+        help="Dynamic automatic catalog contract schema",
     )
     parser.add_argument(
         "--daily-contract",
@@ -1394,6 +1797,11 @@ def _argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--transfer-max-pages", type=int, default=250)
     parser.add_argument(
+        "--deadline",
+        default="",
+        help="Cooperative UTC deadline (ISO-8601); remaining scopes are deferred",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="",
@@ -1440,6 +1848,19 @@ def _validate_args(
         parser.error("--next-build-id contains unsupported characters")
     if args.workers > 16:
         parser.error("--workers must be <= 16")
+    args.deadline_at = None
+    if args.deadline:
+        try:
+            deadline = datetime.fromisoformat(str(args.deadline).replace("Z", "+00:00"))
+        except ValueError:
+            parser.error("--deadline must be an ISO-8601 timestamp")
+        if deadline.tzinfo is None or deadline.utcoffset() is None:
+            parser.error("--deadline must include a UTC offset")
+        deadline = deadline.astimezone(timezone.utc).replace(tzinfo=None)
+        args.deadline_at = deadline
+    automatic_catalog = bool(str(args.catalog_contract or "").strip())
+    if automatic_catalog and args.catalog_contract != "fotmob-catalog-v1":
+        parser.error("--catalog-contract must be fotmob-catalog-v1")
     try:
         source_refresh = _load_source_refresh_contract(args)
     except ValueError as exc:
@@ -1456,6 +1877,8 @@ def _validate_args(
             if item.strip()
         )
         violations = []
+        if automatic_catalog:
+            violations.append("catalog contract must be empty")
         if args.mode != "backfill":
             violations.append("mode must be backfill")
         if _parse_scopes(args.scope):
@@ -1494,7 +1917,23 @@ def _validate_args(
         args.competition_scope_sha256,
         args.competition_ids_sha256,
     )
-    if args.mode == "daily":
+    if automatic_catalog:
+        violations = []
+        if any(daily_contract_fields):
+            violations.append("legacy daily contract fields must be empty")
+        if _parse_scopes(args.scope):
+            violations.append("automatic exact season scope must be empty")
+        if args.mode == "replay":
+            violations.append("replay cannot create a live catalog contract")
+        if args.competition_limit:
+            violations.append("competition limit must be zero")
+        if violations:
+            parser.error(
+                "invalid FotMob automatic catalog profile: " + ", ".join(violations)
+            )
+        args.daily_competition_contract = None
+        args.daily_competition_ids = ()
+    elif args.mode == "daily":
         from utils.fotmob_publication import (
             FOTMOB_DAILY_COMPETITION_IDS_SHA256,
             FOTMOB_DAILY_CONTRACT_SCHEMA,

@@ -420,6 +420,7 @@ class CatalogResult:
     classifications: tuple[ScopeClassification, ...] = ()
     fetch: Optional[FetchResult] = None
     profile_payloads: Mapping[int, Mapping[str, Any]] = field(default_factory=dict)
+    evidence: Mapping[int, CompetitionScopeEvidence] = field(default_factory=dict)
 
 
 @dataclass
@@ -1101,6 +1102,7 @@ class FotMobIngestService:
 
             classifications: list[ScopeClassification] = []
             profile_payloads: dict[int, Mapping[str, Any]] = {}
+            catalog_evidence: dict[int, CompetitionScopeEvidence] = {}
             self._catalog_profile_fetches = {}
             due_ids = {item.competition_id for item in due}
             for competition in discovery.competitions:
@@ -1130,6 +1132,7 @@ class FotMobIngestService:
                     result.tables.extend(
                         self._persist_profile_evidence(profile_fetch, evidence)
                     )
+                    catalog_evidence[competition.competition_id] = evidence
                     if payload is not None:
                         profile_payloads[competition.competition_id] = payload
                         self._catalog_profile_fetches[
@@ -1139,6 +1142,7 @@ class FotMobIngestService:
                     classification = _classification_from_evidence(
                         competition, previous
                     )
+                    catalog_evidence[competition.competition_id] = previous
                 else:  # defensive: every missing evidence item is due
                     classification = classify_competition(competition)
                 classifications.append(classification)
@@ -1237,6 +1241,7 @@ class FotMobIngestService:
                 tuple(classifications),
                 fetch,
                 profile_payloads,
+                catalog_evidence,
             )
         except Exception as exc:
             result.errors.append(f"allLeagues parse: {type(exc).__name__}: {exc}")
@@ -1268,6 +1273,7 @@ class FotMobIngestService:
                 target_type="competition_seasons",
                 target_key=target.target_key,
                 competition_id=str(competition.competition_id),
+                entity_id=str(competition.competition_id),
                 status=(
                     ManifestStatus.EXCLUDED
                     if classification.decision == ScopeDecision.EXCLUDED
@@ -1311,6 +1317,7 @@ class FotMobIngestService:
                     target_type="competition_seasons",
                     status=ManifestStatus.EXCLUDED,
                     competition_id=competition.competition_id,
+                    entity_id=competition.competition_id,
                     exclusions=(
                         {
                             "reason": "dead_catalog_entry",
@@ -1331,6 +1338,7 @@ class FotMobIngestService:
                 fetch,
                 target_type="competition_seasons",
                 competition_id=competition.competition_id,
+                entity_id=competition.competition_id,
             )
             self._record_failure(result, fetch.url, fetch)
             return CompetitionDiscoveryResult(
@@ -1442,6 +1450,7 @@ class FotMobIngestService:
                 fetch,
                 target_type="competition_seasons",
                 competition_id=competition.competition_id,
+                entity_id=competition.competition_id,
                 datasets=[
                     TableRows(
                         "fotmob_competition_seasons",
@@ -1494,6 +1503,7 @@ class FotMobIngestService:
                 target_type="competition_seasons",
                 status=_failure_status(exc),
                 competition_id=competition.competition_id,
+                entity_id=competition.competition_id,
                 error_code=type(exc).__name__,
                 error=str(exc),
             )
@@ -3017,6 +3027,31 @@ class FotMobIngestService:
             completed_at=utc_now(),
         )
         return self.repository.commit(commit)
+
+    def record_scope_attempt(
+        self,
+        competition_id: int,
+        source_season_key: str,
+        *,
+        plan_signature: str,
+        outcome: str,
+        reason: str,
+        next_retry_at: Optional[datetime] = None,
+        attempt_identities: Iterable[str] = (),
+    ):
+        """Persist one automatic scheduler result in the ingest manifest."""
+
+        return self.repository.record_scope_attempt(
+            run_id=self.run_id,
+            competition_id=int(competition_id),
+            source_season_key=source_season_key,
+            plan_signature=plan_signature,
+            outcome=outcome,
+            reason=reason,
+            last_attempt_at=utc_now(),
+            next_retry_at=next_retry_at,
+            attempt_identities=attempt_identities,
+        )
 
     def record_competition_completion(
         self,
