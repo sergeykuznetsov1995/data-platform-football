@@ -259,36 +259,195 @@ def test_whoscored_contract_requires_logical_commit_column_for_every_dataset():
 
 
 # --- ESPN native-v2 contract guard -------------------------------------------
-def test_espn_contract_is_loaded_from_dependency_free_v2_inventory():
-    assert mod.EXPECTED_TABLES["espn"] == {
-        table: set(columns)
-        for table, columns in mod.ESPN_CONTRACT.REQUIRED_COLUMNS.items()
+class _EspnInventoryCursor:
+    """Minimal information-schema + DESCRIBE cursor for topology audit tests."""
+
+    def __init__(self, relations):
+        self.relations = list(relations)
+        self.statements = []
+        self._result = []
+
+    def execute(self, sql):
+        self.statements.append(sql)
+        if "information_schema.tables" in sql:
+            self._result = [
+                (relation["schema"], relation["name"], relation["kind"])
+                for relation in self.relations
+            ]
+            return
+        if sql.startswith("DESCRIBE iceberg."):
+            _, schema, name = sql.rsplit(".", 2)
+            relation = next(
+                item
+                for item in self.relations
+                if (item["schema"], item["name"]) == (schema, name)
+            )
+            self._result = [(column, "varchar") for column in relation["columns"]]
+            return
+        raise AssertionError(f"unexpected SQL: {sql}")
+
+    def fetchall(self):
+        return self._result
+
+
+def _compact6_inventory(*, extra=()):
+    return [
+        {
+            "schema": relation.schema,
+            "name": relation.name,
+            "kind": relation.kind,
+            "columns": relation.required_columns,
+        }
+        for relation in mod.ESPN_CONTRACT.required_layout_relations("compact6")
+    ] + list(extra)
+
+
+def test_espn_layout_contract_scans_public_and_internal_inventory_exactly():
+    cursor = _EspnInventoryCursor(_compact6_inventory())
+
+    observed = mod.audit_espn_layout_contract(cursor, "compact6")
+
+    assert {(relation.schema, relation.name) for relation in observed} == {
+        (relation.schema, relation.name)
+        for relation in mod.ESPN_CONTRACT.required_layout_relations("compact6")
     }
-
-
-def test_espn_contract_lists_legacy_native_current_and_control_objects():
-    assert set(mod.EXPECTED_TABLES["espn"]) == (
-        set(mod.ESPN_CONTRACT.LEGACY_TABLES)
-        | set(mod.ESPN_CONTRACT.GENERATION_TABLES)
-        | set(mod.ESPN_CONTRACT.CURRENT_VIEWS)
-        | set(mod.ESPN_CONTRACT.CONTROL_TABLES)
+    assert any("iceberg.information_schema.tables" in sql for sql in cursor.statements)
+    assert any("DESCRIBE iceberg.bronze.espn_schedule" == sql for sql in cursor.statements)
+    assert any(
+        "DESCRIBE iceberg.espn_internal.espn_schedule_legacy_archive_v1" == sql
+        for sql in cursor.statements
     )
 
 
+def test_espn_layout_contract_rejects_an_extra_internal_relation():
+    cursor = _EspnInventoryCursor(
+        _compact6_inventory(
+            extra=(
+                {
+                    "schema": "espn_internal",
+                    "name": "espn_unreviewed_table",
+                    "kind": "BASE TABLE",
+                    "columns": {"id"},
+                },
+            )
+        )
+    )
+
+    with pytest.raises(mod.ESPN_CONTRACT.ObjectInventoryError, match="unexpected"):
+        mod.audit_espn_layout_contract(cursor, "compact6")
+
+
+def test_espn_internal_archive_reuses_the_canonical_quality_allowlist():
+    assert (
+        mod._espn_quality_table_name("espn_matchsheet_legacy_archive_v1")
+        == "espn_matchsheet"
+    )
+    assert (
+        mod._espn_quality_table_name("espn_lineup_compact6_shadow_v1")
+        == "espn_lineup"
+    )
+    assert mod._espn_quality_table_name("espn_legacy_archive_manifest_v1") == (
+        "espn_legacy_archive_manifest_v1"
+    )
+
+
+def test_espn_layout_mode_is_mandatory_for_the_source_audit(monkeypatch):
+    monkeypatch.delenv("ESPN_BRONZE_LAYOUT_MODE", raising=False)
+    with pytest.raises(ValueError, match="ESPN_BRONZE_LAYOUT_MODE is required"):
+        mod.require_espn_layout_mode()
+
+    assert mod.require_espn_layout_mode(
+        environ={"ESPN_BRONZE_LAYOUT_MODE": "compact6"}
+    ) == "compact6"
+
+
+def test_espn_main_rejects_missing_layout_before_opening_trino(monkeypatch, tmp_path):
+    monkeypatch.delenv("ESPN_BRONZE_LAYOUT_MODE", raising=False)
+    monkeypatch.setattr(
+        mod,
+        "_get_trino_connection",
+        lambda: (_ for _ in ()).throw(AssertionError("Trino must not be opened")),
+    )
+
+    assert mod.main(["--source", "espn", "--output", str(tmp_path / "audit.md")]) == 2
+
+
+def test_espn_main_uses_cross_schema_inventory_not_bronze_only(
+    monkeypatch, tmp_path
+):
+    cursor = _EspnInventoryCursor(_compact6_inventory())
+    monkeypatch.setenv("ESPN_BRONZE_LAYOUT_MODE", "compact6")
+    monkeypatch.setattr(mod, "_get_trino_connection", lambda: _MainConnection(cursor))
+    monkeypatch.setattr(mod, "_audit_espn_relations", lambda *_args: {})
+
+    assert mod.main(["--source", "espn", "--output", str(tmp_path / "audit.md")]) == 0
+    assert not any(sql == "SHOW TABLES FROM iceberg.bronze" for sql in cursor.statements)
+
+
+def test_espn_contract_is_loaded_from_dependency_free_v2_inventory():
+    # ESPN no longer uses the bronze-only ``EXPECTED_TABLES`` map: that map
+    # cannot express compact6 internal relations or public view kinds.
+    assert "espn" not in mod.EXPECTED_TABLES
+    assert "espn" in mod.SOURCE_PREFIXES
+    assert callable(mod.ESPN_CONTRACT.audit_layout_inventory)
+
+
+def test_espn_contract_lists_legacy_native_current_and_control_objects():
+    legacy = mod.ESPN_CONTRACT.required_layout_relations("legacy14")
+    compact = mod.ESPN_CONTRACT.required_layout_relations("compact6")
+    public_compact = [
+        relation
+        for relation in compact
+        if relation.schema == mod.ESPN_CONTRACT.BRONZE_SCHEMA
+    ]
+
+    assert len(legacy) == 14
+    assert {(relation.schema, relation.name, relation.kind) for relation in public_compact} == {
+        ("bronze", "espn_schedule", "VIEW"),
+        ("bronze", "espn_lineup", "VIEW"),
+        ("bronze", "espn_matchsheet", "VIEW"),
+        ("bronze", "espn_ingest_manifest_v2", "BASE TABLE"),
+        ("bronze", "espn_request_ledger_generation_v2", "BASE TABLE"),
+        ("bronze", "espn_catalog_snapshot_v2", "BASE TABLE"),
+    }
+
+
 def test_espn_standings_excluded_from_contract():
-    assert "espn_standings" not in mod.EXPECTED_TABLES["espn"]
+    assert all(
+        relation.name != "espn_standings"
+        for layout in ("legacy14", "compact6")
+        for relation in mod.ESPN_CONTRACT.required_layout_relations(layout)
+    )
 
 
-def test_capability_gated_empty_espn_entity_is_structurally_audited(monkeypatch):
-    table = "espn_lineup_generation_v2"
-    required = mod.EXPECTED_TABLES["espn"][table]
-    cursor = _FakeCursor({table: [(column, "varchar") for column in required]})
+def test_capability_gated_empty_espn_entity_remains_a_nonfatal_quality_finding(
+    monkeypatch,
+):
+    relation = next(
+        relation
+        for relation in mod.ESPN_CONTRACT.required_layout_relations("compact6")
+        if relation.name == "espn_lineup_generation_v2"
+    )
+    monkeypatch.setattr(
+        mod,
+        "audit_table",
+        lambda *_args, **_kwargs: (
+            0,
+            [
+                {
+                    "table": relation.name,
+                    "col": "*",
+                    "sev": "INFO",
+                    "detail": "table is empty",
+                }
+            ],
+        ),
+    )
 
-    diff = mod.diff_contract(cursor, "espn", {table}, {table: (0, [])})
+    per_relation = mod._audit_espn_relations(object(), (relation,))
 
-    assert (table, "present but empty — capability-gated") in diff["expected_empty"]
-    assert all(item[0] != table for item in diff["missing_tables"])
-    assert all(item[0] != table for item in diff["missing_columns"])
+    assert per_relation["espn_internal.espn_lineup_generation_v2"][0] == 0
+    assert per_relation["espn_internal.espn_lineup_generation_v2"][1][0]["sev"] == "INFO"
 
 
 # --- SofaScore contract presence guard (#280) ------------------------------

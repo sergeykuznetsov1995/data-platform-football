@@ -32,6 +32,22 @@ from .models import (
     RequestDisposition,
     ScopePlan,
 )
+from .layout import (
+    ARCHIVE_MANIFEST_COLUMNS,
+    ARCHIVE_MANIFEST_VERSION,
+    COMPACT6,
+    INTERNAL_SCHEMA,
+    LEGACY14,
+    LEGACY_ARCHIVE_TABLES,
+    LEGACY_DISPOSITION_TABLE,
+    LAYOUT_STATE_COLUMNS,
+    LAYOUT_STATE_TABLE,
+    LAYOUT_STATE_VERSION,
+    REVIEWED_NATIVE_REPLACEMENTS,
+    relation_location,
+    require_layout_mode,
+    validate_query_catalog_layout,
+)
 from .parser_common import source_day_contains
 from .parser_contracts import LineupRow, MatchsheetRow, ScheduleRow
 from .selection import (
@@ -1063,10 +1079,7 @@ def _empty_schedule_proof_failure(
     else:
         return failure
     observations = proof.get("observations")
-    if (
-        not isinstance(observations, list)
-        or len(observations) != expected_observations
-    ):
+    if not isinstance(observations, list) or len(observations) != expected_observations:
         return failure
     parsed = []
     for observation in observations:
@@ -1078,9 +1091,13 @@ def _empty_schedule_proof_failure(
         }:
             return failure
         run_id = observation.get("run_id")
-        if not isinstance(run_id, str) or not run_id or (
-            method == "second_scheduled_observation"
-            and not run_id.startswith(("scheduled__", "espn_daily__"))
+        if (
+            not isinstance(run_id, str)
+            or not run_id
+            or (
+                method == "second_scheduled_observation"
+                and not run_id.startswith(("scheduled__", "espn_daily__"))
+            )
         ):
             return failure
         try:
@@ -1401,7 +1418,9 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
     for item in generation.dispositions:
         if item.endpoint == "schedule" and item.event_id is None:
             if generation.schedule:
-                failures.append("schedule disposition is only valid for an empty schedule")
+                failures.append(
+                    "schedule disposition is only valid for an empty schedule"
+                )
             continue
         if item.endpoint not in {"lineup", "matchsheet"} or item.event_id is None:
             failures.append("entity disposition has invalid endpoint or event")
@@ -1493,9 +1512,7 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
     for event_id, event in schedule_by_event.items():
         for entity in ("lineup", "matchsheet"):
             if event.summary_required and (entity, event_id) not in disposition_index:
-                failures.append(
-                    f"event disposition missing for {entity}/{event_id}"
-                )
+                failures.append(f"event disposition missing for {entity}/{event_id}")
 
     generation_signature = generation.generation_signature
     row_hashes: dict[str, str] = {}
@@ -1955,11 +1972,16 @@ class EspnBronzeRepository:
         query: QueryProtocol | None = None,
         catalog: str = "iceberg",
         schema: str = "bronze",
+        internal_schema: str = INTERNAL_SCHEMA,
+        layout_mode: str = LEGACY14,
+        validate_catalog_layout_on_write: bool = False,
         verify_physical: bool = True,
         ensure_objects_on_write: bool = True,
     ) -> None:
         self.catalog = _identifier(catalog, "catalog")
         self.schema = _identifier(schema, "schema")
+        self.internal_schema = _identifier(internal_schema, "internal_schema")
+        self.layout_mode = require_layout_mode(layout_mode)
         if writer is None:
             from scrapers.base.iceberg_writer import IcebergWriter
 
@@ -1975,9 +1997,30 @@ class EspnBronzeRepository:
             raise TypeError("verify_physical must be boolean")
         if type(ensure_objects_on_write) is not bool:
             raise TypeError("ensure_objects_on_write must be boolean")
+        if type(validate_catalog_layout_on_write) is not bool:
+            raise TypeError("validate_catalog_layout_on_write must be boolean")
         self.verify_physical = verify_physical
         self.ensure_objects_on_write = ensure_objects_on_write
+        self.validate_catalog_layout_on_write = validate_catalog_layout_on_write
+        self._catalog_layout_attested = False
         self._objects_ensured = False
+
+    @classmethod
+    def from_env(
+        cls,
+        *,
+        environ: Mapping[str, str] | None = None,
+        **kwargs: Any,
+    ) -> "EspnBronzeRepository":
+        """Construct the production writer with a mandatory layout fence."""
+
+        if "layout_mode" in kwargs:
+            raise TypeError("from_env owns layout_mode")
+        return cls(
+            layout_mode=require_layout_mode(environ=environ),
+            validate_catalog_layout_on_write=True,
+            **kwargs,
+        )
 
     def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> Sequence[Any]:
         execute = getattr(self.query, "execute_query", None)
@@ -1985,15 +2028,356 @@ class EspnBronzeRepository:
             raise TypeError("query adapter must expose execute_query")
         return execute(sql, params=params) or []
 
+    def _schema_for(self, table: str) -> str:
+        default_schema, _ = relation_location(table, self.layout_mode)
+        return self.schema if default_schema == "bronze" else self.internal_schema
+
+    def _qualified(self, table: str) -> str:
+        return f"{self.catalog}.{self._schema_for(table)}.{table}"
+
+    def _assert_catalog_layout(self) -> None:
+        if self.validate_catalog_layout_on_write and not self._catalog_layout_attested:
+            validate_query_catalog_layout(
+                self.query,
+                self.layout_mode,
+                catalog=self.catalog,
+            )
+            # One repository instance is task-local.  The compact6 release
+            # guard pauses every writer before topology mutation, so a valid
+            # inventory can be reused throughout one multi-table publication.
+            self._catalog_layout_attested = True
+
+    def _compact_archive_contract(self) -> Mapping[str, Any]:
+        columns = ", ".join(f'"{column}"' for column in ARCHIVE_MANIFEST_COLUMNS)
+        rows = self._execute(
+            f"SELECT {columns} "
+            f"FROM {self._qualified('espn_legacy_archive_manifest_v1')}"
+        )
+        if len(rows) != 1:
+            raise PublicationError(
+                "compact6 requires one immutable global legacy archive manifest"
+            )
+        raw = rows[0]
+        values = (
+            tuple(raw.get(column) for column in ARCHIVE_MANIFEST_COLUMNS)
+            if isinstance(raw, Mapping)
+            else tuple(raw)
+        )
+        if len(values) != len(ARCHIVE_MANIFEST_COLUMNS):
+            raise PublicationError("compact6 archive manifest row is malformed")
+        manifest = dict(zip(ARCHIVE_MANIFEST_COLUMNS, values))
+        version = manifest["manifest_version"]
+        archive_id = manifest["archive_id"]
+        if (
+            version != ARCHIVE_MANIFEST_VERSION
+            or not isinstance(archive_id, str)
+            or not archive_id
+        ):
+            raise PublicationError("compact6 archive manifest identity is invalid")
+
+        decoded: dict[str, Any] = {}
+        for field_name in (
+            "legacy_snapshot_ids_json",
+            "archive_snapshot_ids_json",
+            "whole_rowset_metrics_json",
+            "legacy_disposition_metrics_json",
+            "legacy_dispositions_json",
+            "native_replacements_json",
+        ):
+            raw_json = manifest[field_name]
+            try:
+                value = json.loads(raw_json)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise PublicationError(
+                    f"compact6 archive manifest {field_name} is invalid"
+                ) from exc
+            if canonical_json(value) != raw_json:
+                raise PublicationError(
+                    f"compact6 archive manifest {field_name} is not canonical"
+                )
+            decoded[field_name] = value
+
+        snapshots = decoded["archive_snapshot_ids_json"]
+        expected = set(LEGACY_ARCHIVE_TABLES)
+        if (
+            not isinstance(snapshots, dict)
+            or set(snapshots) != expected
+            or any(type(value) is not int or value <= 0 for value in snapshots.values())
+        ):
+            raise PublicationError("compact6 archive snapshot set is incomplete")
+        legacy_snapshots = decoded["legacy_snapshot_ids_json"]
+        if (
+            not isinstance(legacy_snapshots, dict)
+            or set(legacy_snapshots) != {f"espn_{entity}" for entity in _ENTITIES}
+            or any(
+                type(value) is not int or value <= 0
+                for value in legacy_snapshots.values()
+            )
+        ):
+            raise PublicationError("compact6 legacy snapshot set is incomplete")
+        whole_metrics = decoded["whole_rowset_metrics_json"]
+        if not isinstance(whole_metrics, dict) or set(whole_metrics) != set(_ENTITIES):
+            raise PublicationError("compact6 whole-rowset metrics are incomplete")
+        normalized_whole_metrics: dict[str, dict[str, Any]] = {}
+        for entity, raw_metrics in whole_metrics.items():
+            if not isinstance(raw_metrics, dict) or set(raw_metrics) != {
+                "row_count",
+                "row_hash",
+                "distinct_key_count",
+            }:
+                raise PublicationError(
+                    f"compact6 {entity} whole-rowset metrics are invalid"
+                )
+            row_count_value = raw_metrics["row_count"]
+            distinct_value = raw_metrics["distinct_key_count"]
+            if (
+                type(row_count_value) is not int
+                or row_count_value < 0
+                or type(distinct_value) is not int
+                or not 0 <= distinct_value <= row_count_value
+            ):
+                raise PublicationError(
+                    f"compact6 {entity} whole-rowset counts are invalid"
+                )
+            try:
+                metric_hash = _sha256(
+                    raw_metrics["row_hash"], f"compact6 {entity} row hash"
+                )
+            except ValueError as exc:
+                raise PublicationError(
+                    f"compact6 {entity} whole-rowset hash is invalid"
+                ) from exc
+            normalized_whole_metrics[entity] = {
+                "row_count": row_count_value,
+                "row_hash": metric_hash,
+                "distinct_key_count": distinct_value,
+            }
+        try:
+            _sha256(manifest["registry_signature"], "archive registry signature")
+            _sha256(manifest["plan_sha256"], "archive plan SHA-256")
+            _sha256(manifest["manifest_sha256"], "archive manifest SHA-256")
+        except ValueError as exc:
+            raise PublicationError("compact6 archive manifest hash is invalid") from exc
+        captured_at = manifest["captured_at"]
+        try:
+            manifest["captured_at"] = _stored_utc(captured_at, "archive captured_at")
+        except ValueError as exc:
+            raise PublicationError("compact6 archive timestamp is invalid") from exc
+        base = {
+            key: value for key, value in manifest.items() if key != "manifest_sha256"
+        }
+        if canonical_sha256(base) != manifest["manifest_sha256"]:
+            raise PublicationError("compact6 archive manifest hash does not match")
+
+        replacements = decoded["native_replacements_json"]
+        expected_replacements = [
+            {
+                "scope_id": scope_id,
+                "legacy_league": league,
+                "legacy_season": season,
+            }
+            for scope_id, league, season in REVIEWED_NATIVE_REPLACEMENTS
+        ]
+        if replacements != expected_replacements:
+            raise PublicationError(
+                "compact6 archive manifest replacements differ from the reviewed six"
+            )
+        disposition_snapshot_id = manifest["legacy_disposition_snapshot_id"]
+        if type(disposition_snapshot_id) is not int or disposition_snapshot_id <= 0:
+            raise PublicationError("compact6 disposition snapshot ID is invalid")
+        metrics = decoded["legacy_disposition_metrics_json"]
+        if not isinstance(metrics, dict) or set(metrics) != {"row_count", "row_hash"}:
+            raise PublicationError("compact6 disposition metrics are invalid")
+        row_count = metrics["row_count"]
+        if type(row_count) is not int or row_count <= 0:
+            raise PublicationError("compact6 disposition row count is invalid")
+        try:
+            row_hash = _sha256(metrics["row_hash"], "disposition row hash")
+        except ValueError as exc:
+            raise PublicationError("compact6 disposition row hash is invalid") from exc
+        dispositions = decoded["legacy_dispositions_json"]
+        if not isinstance(dispositions, list) or len(dispositions) != row_count:
+            raise PublicationError("compact6 disposition inventory is incomplete")
+        disposition_columns = (
+            "archive_id",
+            "league",
+            "season",
+            "disposition",
+            "replacement_scope_id",
+            "observed_entities_json",
+            "disposition_sha256",
+        )
+        projection = ", ".join(f'"{column}"' for column in disposition_columns)
+        stored_rows = self._execute(
+            f"SELECT {projection} FROM "
+            f"{self._qualified(LEGACY_DISPOSITION_TABLE)} "
+            f"FOR VERSION AS OF {disposition_snapshot_id}"
+        )
+        normalized: list[dict[str, Any]] = []
+        seen_disposition_pairs: set[tuple[object, object]] = set()
+        for stored in stored_rows:
+            stored_values = (
+                tuple(stored.get(column) for column in disposition_columns)
+                if isinstance(stored, Mapping)
+                else tuple(stored)
+            )
+            if len(stored_values) != len(disposition_columns):
+                raise PublicationError("compact6 disposition row is malformed")
+            row = dict(zip(disposition_columns, stored_values))
+            if row["archive_id"] != archive_id:
+                raise PublicationError("compact6 disposition archive identity differs")
+            pair = (row["league"], row["season"])
+            if pair in seen_disposition_pairs:
+                raise PublicationError(
+                    "compact6 disposition snapshot contains a duplicate pair"
+                )
+            seen_disposition_pairs.add(pair)
+            if row["disposition"] not in {
+                "compatibility_only",
+                "native_current_replaced",
+                "quarantined",
+            }:
+                raise PublicationError("compact6 disposition value is invalid")
+            has_null_pair = row["league"] is None or row["season"] is None
+            if has_null_pair != (row["disposition"] == "quarantined"):
+                raise PublicationError("compact6 NULL legacy pairs must be quarantined")
+            if row["disposition"] == "native_current_replaced":
+                if not isinstance(row["replacement_scope_id"], str):
+                    raise PublicationError(
+                        "compact6 replacement disposition has no scope"
+                    )
+            elif row["replacement_scope_id"] is not None:
+                raise PublicationError(
+                    "compact6 non-replacement disposition names a scope"
+                )
+            observed_json = row["observed_entities_json"]
+            try:
+                observed_entities = json.loads(observed_json)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise PublicationError(
+                    "compact6 disposition observed entities are invalid"
+                ) from exc
+            if canonical_json(observed_entities) != observed_json:
+                raise PublicationError(
+                    "compact6 disposition observed entities are not canonical"
+                )
+            row_base = {
+                key: value for key, value in row.items() if key != "disposition_sha256"
+            }
+            if canonical_sha256(row_base) != row["disposition_sha256"]:
+                raise PublicationError("compact6 disposition hash does not match")
+            normalized.append(row)
+        normalized.sort(
+            key=lambda item: (
+                item["league"] is None,
+                "" if item["league"] is None else str(item["league"]),
+                item["season"] is None,
+                "" if item["season"] is None else str(item["season"]),
+            )
+        )
+        if normalized != dispositions:
+            raise PublicationError(
+                "compact6 disposition snapshot differs from the global manifest"
+            )
+        actual_hash = hashlib.sha256(
+            "".join(sorted(row["disposition_sha256"] for row in normalized)).encode(
+                "ascii"
+            )
+        ).hexdigest()
+        if len(normalized) != row_count or actual_hash != row_hash:
+            raise PublicationError("compact6 disposition multiset parity failed")
+
+        replacement_rows = {
+            (
+                row["replacement_scope_id"],
+                row["league"],
+                row["season"],
+            )
+            for row in normalized
+            if row["disposition"] == "native_current_replaced"
+        }
+        if replacement_rows != set(REVIEWED_NATIVE_REPLACEMENTS):
+            raise PublicationError(
+                "compact6 disposition replacements differ from the reviewed six"
+            )
+        state_projection = ", ".join(f'"{column}"' for column in LAYOUT_STATE_COLUMNS)
+        state_rows = self._execute(
+            f"SELECT {state_projection} FROM {self._qualified(LAYOUT_STATE_TABLE)}"
+        )
+        if len(state_rows) != 1:
+            raise PublicationError(
+                "compact6 requires one manifest-bound layout-state attestation"
+            )
+        raw_state = state_rows[0]
+        state_values = (
+            tuple(raw_state.get(column) for column in LAYOUT_STATE_COLUMNS)
+            if isinstance(raw_state, Mapping)
+            else tuple(raw_state)
+        )
+        if len(state_values) != len(LAYOUT_STATE_COLUMNS):
+            raise PublicationError("compact6 layout-state row is malformed")
+        state = dict(zip(LAYOUT_STATE_COLUMNS, state_values))
+        if (
+            state["layout_version"] != LAYOUT_STATE_VERSION
+            or state["layout_mode"] != COMPACT6
+            or state["archive_id"] != archive_id
+            or state["plan_sha256"] != manifest["plan_sha256"]
+            or state["archive_manifest_sha256"] != manifest["manifest_sha256"]
+            or not isinstance(state["transition_id"], str)
+            or not state["transition_id"]
+        ):
+            raise PublicationError(
+                "compact6 layout-state identity differs from the archive manifest"
+            )
+        try:
+            state["effective_at"] = _stored_utc(
+                state["effective_at"], "layout-state effective_at"
+            )
+            _sha256(state["state_sha256"], "layout-state SHA-256")
+        except ValueError as exc:
+            raise PublicationError("compact6 layout-state evidence is invalid") from exc
+        state_base = {
+            key: value for key, value in state.items() if key != "state_sha256"
+        }
+        if canonical_sha256(state_base) != state["state_sha256"]:
+            raise PublicationError("compact6 layout-state hash does not match")
+        return MappingProxyType(
+            {
+                "archive_snapshot_ids": MappingProxyType(
+                    {
+                        entity: snapshots[LEGACY_ARCHIVE_TABLES[index]]
+                        for index, entity in enumerate(_ENTITIES)
+                    }
+                ),
+                "legacy_snapshot_ids": MappingProxyType(dict(legacy_snapshots)),
+                "whole_rowset_metrics": MappingProxyType(normalized_whole_metrics),
+                "archive_id": archive_id,
+                "manifest_sha256": manifest["manifest_sha256"],
+                "plan_sha256": manifest["plan_sha256"],
+                "layout_state_sha256": state["state_sha256"],
+                "disposition_snapshot_id": disposition_snapshot_id,
+                "disposition_count": row_count,
+                "disposition_hash": row_hash,
+            }
+        )
+
     def ensure_objects(self) -> None:
         if self._objects_ensured:
             return
+        self._assert_catalog_layout()
         self._execute(f"CREATE SCHEMA IF NOT EXISTS {self.catalog}.{self.schema}")
+        if self.layout_mode == COMPACT6:
+            self._execute(
+                f"CREATE SCHEMA IF NOT EXISTS {self.catalog}.{self.internal_schema}"
+            )
         for sql in render_repository_ddl(
-            catalog=self.catalog, schema=self.schema
+            catalog=self.catalog,
+            schema=self.schema,
+            internal_schema=self.internal_schema,
+            layout_mode=self.layout_mode,
         ).values():
             self._execute(sql)
-        qualified_cutover = f"{self.catalog}.{self.schema}.{CUTOVER_TABLE}"
+        qualified_cutover = self._qualified(CUTOVER_TABLE)
         for column, column_type in _CUTOVER_ANCESTRY_COLUMNS:
             self._execute(
                 f"ALTER TABLE {qualified_cutover} ADD COLUMN IF NOT EXISTS "
@@ -2006,10 +2390,30 @@ class EspnBronzeRepository:
             f"FROM {qualified_cutover}"
         )
         _validate_stored_cutover_graph(stored_cutover_graph)
+        archive_contract: Mapping[str, Any] = {}
+        if self.layout_mode == COMPACT6:
+            archive_contract = self._compact_archive_contract()
         for entity in _ENTITIES:
             self._execute(
                 render_current_view_sql(
-                    entity, catalog=self.catalog, schema=self.schema
+                    entity,
+                    catalog=self.catalog,
+                    schema=self.schema,
+                    internal_schema=self.internal_schema,
+                    layout_mode=self.layout_mode,
+                    archive_snapshot_id=(
+                        archive_contract.get("archive_snapshot_ids", {}).get(entity)
+                    ),
+                    disposition_snapshot_id=archive_contract.get(
+                        "disposition_snapshot_id"
+                    ),
+                    disposition_count=archive_contract.get("disposition_count"),
+                    disposition_hash=archive_contract.get("disposition_hash"),
+                    archive_id=archive_contract.get("archive_id"),
+                    archive_manifest_sha256=archive_contract.get("manifest_sha256"),
+                    whole_rowset_metrics=archive_contract.get("whole_rowset_metrics"),
+                    archive_plan_sha256=archive_contract.get("plan_sha256"),
+                    layout_state_sha256=archive_contract.get("layout_state_sha256"),
                 )
             )
         self._objects_ensured = True
@@ -2019,7 +2423,7 @@ class EspnBronzeRepository:
     ) -> Mapping[str, Any] | None:
         columns = ", ".join(f'"{column}"' for column in MANIFEST_COLUMNS)
         rows = self._execute(
-            f"SELECT {columns} FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE} "
+            f"SELECT {columns} FROM {self._qualified(MANIFEST_TABLE)} "
             'WHERE "scope_id" = ? AND "generation_id" = ? '
             "AND \"status\" = 'complete' "
             'ORDER BY "completed_at" DESC, "manifest_sha256" DESC',
@@ -2056,13 +2460,14 @@ class EspnBronzeRepository:
         if table not in TABLE_PARTITIONS:
             raise ValueError(f"unsupported ESPN repository table {table!r}")
         if not rows:
-            return f"{self.catalog}.{self.schema}.{table}"
+            return self._qualified(table)
+        self._assert_catalog_layout()
         frame = pd.DataFrame(list(rows))
         if table == LEDGER_TABLE and "event_id" in frame:
             frame["event_id"] = frame["event_id"].astype("Int64")
         return self.writer.write_dataframe(
             frame,
-            database=self.schema,
+            database=self._schema_for(table),
             table=table,
             partition_spec=[(column, "identity") for column in TABLE_PARTITIONS[table]],
             mode="append",
@@ -2078,7 +2483,7 @@ class EspnBronzeRepository:
         table = LEDGER_TABLE if entity == "ledger" else ENTITY_TABLES[entity]
         rows = self._execute(
             f'SELECT DISTINCT "generation_signature", "_row_sha256" '
-            f"FROM {self.catalog}.{self.schema}.{table} "
+            f"FROM {self._qualified(table)} "
             'WHERE "scope_id" = ? AND "generation_id" = ?',
             (
                 generation.plan.scope_id,
@@ -2112,7 +2517,7 @@ class EspnBronzeRepository:
                 f"SELECT '{entity}' AS entity, COUNT(DISTINCT \"_row_sha256\") AS row_count, "
                 "COALESCE(lower(to_hex(sha256(to_utf8(array_join(array_sort(array_distinct(array_agg(\"_row_sha256\"))), ''))))), "
                 "lower(to_hex(sha256(to_utf8(''))))) AS row_hash "
-                f"FROM {self.catalog}.{self.schema}.{table} "
+                f"FROM {self._qualified(table)} "
                 'WHERE "scope_id" = ? AND "generation_id" = ? AND "run_id" = ? '
                 'AND "generation_signature" = ? AND "_batch_id" = ? '
                 'AND "registry_signature" = ? AND "plan_signature" = ?'
@@ -2241,7 +2646,7 @@ class EspnBronzeRepository:
                 f"SELECT '{entity}' AS entity, COUNT(DISTINCT \"_row_sha256\") AS row_count, "
                 "COALESCE(lower(to_hex(sha256(to_utf8(array_join(array_sort(array_distinct(array_agg(\"_row_sha256\"))), ''))))), "
                 "lower(to_hex(sha256(to_utf8(''))))) AS row_hash "
-                f"FROM {self.catalog}.{self.schema}.{table} "
+                f"FROM {self._qualified(table)} "
                 f"WHERE {predicates} /* stored_manifest_physical */"
             )
             params.extend(identity[column] for column in _PHYSICAL_IDENTITY_COLUMNS)
@@ -2277,11 +2682,11 @@ class EspnBronzeRepository:
         rows = self._execute(
             f"""WITH scope_cutovers AS (
     SELECT *
-    FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE}
+    FROM {self._qualified(CUTOVER_TABLE)}
     WHERE "scope_id" = ?
 ), conflicting_ids AS (
     SELECT "cutover_id"
-    FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE}
+    FROM {self._qualified(CUTOVER_TABLE)}
     GROUP BY "cutover_id"
     HAVING COUNT(DISTINCT "cutover_sha256") > 1
 ), conflicting_predecessors AS (
@@ -2464,7 +2869,7 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
             rows = self._execute(
                 'SELECT "generation_id", "generation_signature", "run_id", '
                 '"registry_signature", "plan_signature", COUNT(*) AS row_count '
-                f"FROM {self.catalog}.{self.schema}.{view} "
+                f"FROM {self._qualified(view)} "
                 'WHERE "scope_id" = ? GROUP BY 1, 2, 3, 4, 5',
                 (generation.plan.scope_id,),
             )
@@ -2513,8 +2918,7 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
             raise ValueError("scope_id is invalid")
         projection = ", ".join(f'"{column}"' for column in _CUTOVER_ROUTE_COLUMNS)
         stored_routes = self._execute(
-            f"SELECT DISTINCT {projection} "
-            f"FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE}"
+            f"SELECT DISTINCT {projection} FROM {self._qualified(CUTOVER_TABLE)}"
         )
         normalized: list[tuple[Any, ...]] = []
         for raw in stored_routes:
@@ -2647,7 +3051,7 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
         for entity, view in CURRENT_VIEWS.items():
             rows = self._execute(
                 f'SELECT COUNT(*) AS "row_count" '
-                f"FROM {self.catalog}.{self.schema}.{view} "
+                f"FROM {self._qualified(view)} "
                 'WHERE "scope_id" = ?',
                 (scope_id,),
             )
@@ -2732,7 +3136,7 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
             self.ensure_objects()
         stored = self._execute(
             f'SELECT "competition_id", "record_sha256", "snapshot_signature" '
-            f"FROM {self.catalog}.{self.schema}.{CATALOG_TABLE} "
+            f"FROM {self._qualified(CATALOG_TABLE)} "
             'WHERE "snapshot_id" = ?',
             (snapshot.snapshot_id,),
         )
@@ -2778,7 +3182,7 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
         if self.ensure_objects_on_write:
             self.ensure_objects()
         existing_rows = self._execute(
-            f'SELECT "cutover_sha256" FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE} '
+            f'SELECT "cutover_sha256" FROM {self._qualified(CUTOVER_TABLE)} '
             'WHERE "cutover_id" = ?',
             (cutover.cutover_id,),
         )
@@ -2791,7 +3195,7 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
         }
         if existing_hashes:
             if existing_hashes == {cutover.cutover_sha256}:
-                return f"{self.catalog}.{self.schema}.{CUTOVER_TABLE}"
+                return self._qualified(CUTOVER_TABLE)
             raise ManifestConflictError("same cutover_id has conflicting content")
         if self._scope_has_unresolved_cutover_fork(cutover.scope_id):
             raise ManifestConflictError(
@@ -2799,7 +3203,7 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
             )
         slot_rows = self._execute(
             f'SELECT "cutover_id", "cutover_sha256" '
-            f"FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE} "
+            f"FROM {self._qualified(CUTOVER_TABLE)} "
             'WHERE "scope_id" = ? '
             'AND "predecessor_cutover_sha256" IS NOT DISTINCT FROM ?',
             (cutover.scope_id, cutover.predecessor_cutover_sha256),
@@ -2828,7 +3232,7 @@ SELECT "cutover_sha256" FROM unresolved_cutover_forks LIMIT 1""",
             f'SELECT "cutover_id", "cutover_sha256", "active_source", "effective_at", '
             '"ancestor_cutover_sha256_json", "ancestor_lineage_sha256", '
             '"legacy_league", "legacy_season" '
-            f"FROM {self.catalog}.{self.schema}.{CUTOVER_TABLE} "
+            f"FROM {self._qualified(CUTOVER_TABLE)} "
             'WHERE "scope_id" = ? '
             'ORDER BY "effective_at" DESC, "cutover_id" DESC, "cutover_sha256" DESC '
             "LIMIT 1",
@@ -3032,11 +3436,40 @@ def _table_ddl(
     )
 
 
+def _layout_qualified(
+    table: str,
+    *,
+    catalog: str,
+    schema: str,
+    internal_schema: str,
+    layout_mode: str,
+) -> str:
+    default_schema, physical_name = relation_location(table, layout_mode)
+    physical_schema = schema if default_schema == "bronze" else internal_schema
+    return f"{catalog}.{physical_schema}.{physical_name}"
+
+
 def render_repository_ddl(
-    *, catalog: str = "iceberg", schema: str = "bronze"
+    *,
+    catalog: str = "iceberg",
+    schema: str = "bronze",
+    internal_schema: str = INTERNAL_SCHEMA,
+    layout_mode: str = LEGACY14,
 ) -> Mapping[str, str]:
     catalog = _identifier(catalog, "catalog")
     schema = _identifier(schema, "schema")
+    internal_schema = _identifier(internal_schema, "internal_schema")
+    layout_mode = require_layout_mode(layout_mode)
+
+    def qualified(table: str) -> str:
+        return _layout_qualified(
+            table,
+            catalog=catalog,
+            schema=schema,
+            internal_schema=internal_schema,
+            layout_mode=layout_mode,
+        )
+
     statements: dict[str, str] = {}
     for entity, table in ENTITY_TABLES.items():
         columns = [
@@ -3045,11 +3478,9 @@ def render_repository_ddl(
         for column in PROVENANCE_COLUMNS:
             if column not in {name for name, _ in columns}:
                 columns.append((column, _column_type(entity, column)))
-        statements[table] = _table_ddl(
-            f"{catalog}.{schema}.{table}", columns, "scope_id"
-        )
+        statements[table] = _table_ddl(qualified(table), columns, "scope_id")
     statements[LEDGER_TABLE] = _table_ddl(
-        f"{catalog}.{schema}.{LEDGER_TABLE}",
+        qualified(LEDGER_TABLE),
         (
             ("scope_id", "varchar"),
             ("competition_id", "bigint"),
@@ -3082,7 +3513,7 @@ def render_repository_ddl(
         "scope_id",
     )
     statements[CATALOG_TABLE] = _table_ddl(
-        f"{catalog}.{schema}.{CATALOG_TABLE}",
+        qualified(CATALOG_TABLE),
         (
             ("snapshot_id", "varchar"),
             ("snapshot_signature", "varchar"),
@@ -3113,7 +3544,7 @@ def render_repository_ddl(
         "completed_at": "timestamp(6)",
     }
     statements[MANIFEST_TABLE] = _table_ddl(
-        f"{catalog}.{schema}.{MANIFEST_TABLE}",
+        qualified(MANIFEST_TABLE),
         tuple(
             (column, manifest_types.get(column, "varchar"))
             for column in MANIFEST_COLUMNS
@@ -3121,7 +3552,7 @@ def render_repository_ddl(
         "scope_id",
     )
     statements[CUTOVER_TABLE] = _table_ddl(
-        f"{catalog}.{schema}.{CUTOVER_TABLE}",
+        qualified(CUTOVER_TABLE),
         (
             ("cutover_id", "varchar"),
             ("scope_id", "varchar"),
@@ -3145,7 +3576,7 @@ def render_repository_ddl(
         "scope_id",
     )
     statements[BASELINE_TABLE] = _table_ddl(
-        f"{catalog}.{schema}.{BASELINE_TABLE}",
+        qualified(BASELINE_TABLE),
         (
             ("baseline_version", "varchar"),
             ("scope_id", "varchar"),
@@ -3279,13 +3710,97 @@ _LEGACY_COLUMNS = MappingProxyType(
 
 
 def render_current_view_sql(
-    entity: str, *, catalog: str = "iceberg", schema: str = "bronze"
+    entity: str,
+    *,
+    catalog: str = "iceberg",
+    schema: str = "bronze",
+    internal_schema: str = INTERNAL_SCHEMA,
+    layout_mode: str = LEGACY14,
+    archive_snapshot_id: int | None = None,
+    disposition_snapshot_id: int | None = None,
+    disposition_count: int | None = None,
+    disposition_hash: str | None = None,
+    archive_id: str | None = None,
+    archive_manifest_sha256: str | None = None,
+    whole_rowset_metrics: Mapping[str, Mapping[str, Any]] | None = None,
+    archive_plan_sha256: str | None = None,
+    layout_state_sha256: str | None = None,
 ) -> str:
     if entity not in ENTITY_TABLES:
         raise ValueError(f"unknown ESPN entity {entity!r}")
     catalog = _identifier(catalog, "catalog")
     schema = _identifier(schema, "schema")
+    internal_schema = _identifier(internal_schema, "internal_schema")
+    layout_mode = require_layout_mode(layout_mode)
+    if layout_mode == COMPACT6 and (
+        type(archive_snapshot_id) is not int or archive_snapshot_id <= 0
+    ):
+        raise ValueError(
+            "compact6 current view requires a positive archive snapshot ID"
+        )
+    if layout_mode == COMPACT6:
+        if type(disposition_snapshot_id) is not int or disposition_snapshot_id <= 0:
+            raise ValueError(
+                "compact6 current view requires a positive disposition snapshot ID"
+            )
+        if type(disposition_count) is not int or disposition_count <= 0:
+            raise ValueError(
+                "compact6 current view requires a positive disposition row count"
+            )
+        _sha256(disposition_hash, "compact6 disposition hash")
+        _required_string(archive_id, "compact6 archive ID")
+        _sha256(
+            archive_manifest_sha256,
+            "compact6 archive manifest SHA-256",
+        )
+        _sha256(archive_plan_sha256, "compact6 archive plan SHA-256")
+        _sha256(layout_state_sha256, "compact6 layout-state SHA-256")
+        if not isinstance(whole_rowset_metrics, Mapping) or set(
+            whole_rowset_metrics
+        ) != set(_ENTITIES):
+            raise ValueError("compact6 current view requires all whole-rowset metrics")
+        canonical_whole_metrics = canonical_json(whole_rowset_metrics)
+    elif any(
+        value is not None
+        for value in (
+            archive_snapshot_id,
+            disposition_snapshot_id,
+            disposition_count,
+            disposition_hash,
+            archive_id,
+            archive_manifest_sha256,
+            whole_rowset_metrics,
+            archive_plan_sha256,
+            layout_state_sha256,
+        )
+    ):
+        raise ValueError("legacy14 current view must not receive archive evidence")
     view = CURRENT_VIEWS[entity]
+
+    def qualified(table: str) -> str:
+        return _layout_qualified(
+            table,
+            catalog=catalog,
+            schema=schema,
+            internal_schema=internal_schema,
+            layout_mode=layout_mode,
+        )
+
+    view_qualified = qualified(view)
+    manifest_qualified = qualified(MANIFEST_TABLE)
+    cutover_qualified = qualified(CUTOVER_TABLE)
+    if layout_mode == COMPACT6:
+        archive_table = LEGACY_ARCHIVE_TABLES[_ENTITIES.index(entity)]
+        legacy_relation = (
+            f"{catalog}.{internal_schema}.{archive_table} "
+            f"FOR VERSION AS OF {archive_snapshot_id}"
+        )
+        disposition_relation = (
+            f"{catalog}.{internal_schema}.{LEGACY_DISPOSITION_TABLE} "
+            f"FOR VERSION AS OF {disposition_snapshot_id}"
+        )
+    else:
+        legacy_relation = f"{catalog}.{schema}.espn_{entity}"
     columns = tuple(dict.fromkeys((*_row_columns(entity), *PROVENANCE_COLUMNS)))
     native_projection = ",\n        ".join(f'g."{column}"' for column in columns)
     legacy_projection = ",\n        ".join(
@@ -3316,7 +3831,7 @@ def render_current_view_sql(
                PARTITION BY {ranked_identity_projection}, r."_row_sha256"
                ORDER BY r."_ingested_at" DESC, r."_row_sha256" DESC
            ) AS physical_rn
-    FROM {catalog}.{schema}.{relation_table} r
+    FROM {qualified(relation_table)} r
     JOIN candidate_generation_identities candidate
       ON {candidate_join}
 ), {relation}_rows AS (
@@ -3357,10 +3872,140 @@ def render_current_view_sql(
         f"LEFT JOIN {relation}_fence\n      ON {fence_join(relation)}"
         for relation in relation_tables
     )
-    return f"""CREATE OR REPLACE VIEW {catalog}.{schema}.{view} AS
+    if layout_mode == COMPACT6:
+        archive_manifest = (
+            f"{catalog}.{internal_schema}.espn_legacy_archive_manifest_v1"
+        )
+        layout_state = f"{catalog}.{internal_schema}.espn_layout_state_v2"
+        disposition_metrics_json = canonical_json(
+            {"row_count": disposition_count, "row_hash": disposition_hash}
+        )
+        replacements_json = canonical_json(
+            [
+                {
+                    "scope_id": scope_id,
+                    "legacy_league": league,
+                    "legacy_season": season,
+                }
+                for scope_id, league, season in REVIEWED_NATIVE_REPLACEMENTS
+            ]
+        )
+        reviewed_values = ",\n        ".join(
+            "("
+            + ", ".join("'" + value.replace("'", "''") + "'" for value in item)
+            + ")"
+            for item in REVIEWED_NATIVE_REPLACEMENTS
+        )
+        replacement_ctes = f""", layout_state_gate AS (
+    SELECT archive_id
+    FROM {layout_state}
+    WHERE layout_version = 'espn-layout-state-v2'
+      AND layout_mode = 'compact6'
+      AND archive_id = '{archive_id.replace("'", "''")}'
+      AND plan_sha256 = '{archive_plan_sha256}'
+      AND archive_manifest_sha256 = '{archive_manifest_sha256}'
+      AND state_sha256 = '{layout_state_sha256}'
+      AND (SELECT COUNT(*) FROM {layout_state}) = 1
+    GROUP BY archive_id
+    HAVING COUNT(*) = 1
+), archive_manifest_state AS (
+    SELECT manifest.archive_id
+    FROM {archive_manifest} AS manifest
+    CROSS JOIN layout_state_gate layout
+    WHERE manifest.manifest_version = 'espn-legacy-archive-manifest-v1'
+      AND manifest.archive_id = layout.archive_id
+      AND manifest.archive_id = '{archive_id.replace("'", "''")}'
+      AND manifest.manifest_sha256 = '{archive_manifest_sha256}'
+      AND manifest.whole_rowset_metrics_json = '{canonical_whole_metrics}'
+      AND manifest.legacy_disposition_snapshot_id = {disposition_snapshot_id}
+      AND manifest.legacy_disposition_metrics_json = '{disposition_metrics_json}'
+      AND manifest.native_replacements_json = '{replacements_json}'
+      AND (SELECT COUNT(*) FROM {archive_manifest}) = 1
+    GROUP BY manifest.archive_id
+    HAVING COUNT(*) = 1 AND COUNT(DISTINCT manifest_sha256) = 1
+), disposition_candidates AS (
+    SELECT d.*,
+           COALESCE(d.league, '<NULL>') || chr(31) ||
+               COALESCE(d.season, '<NULL>') AS legacy_pair_key
+    FROM {disposition_relation} d
+    JOIN archive_manifest_state archive ON archive.archive_id = d.archive_id
+    WHERE d.disposition IN (
+        'compatibility_only', 'native_current_replaced', 'quarantined'
+    )
+      AND regexp_like(d.disposition_sha256, '^[0-9a-f]{{64}}$')
+), disposition_set_gate AS (
+    SELECT archive_id
+    FROM disposition_candidates
+    GROUP BY archive_id
+    HAVING COUNT(*) = {disposition_count}
+       AND COUNT(*) = COUNT(DISTINCT legacy_pair_key)
+       AND lower(to_hex(sha256(to_utf8(array_join(
+               array_sort(array_agg(disposition_sha256)), ''
+           ))))) = '{disposition_hash}'
+), disposition_integrity_gate AS (
+    SELECT archive_id FROM disposition_set_gate
+), approved_legacy_dispositions AS (
+    SELECT d.*
+    FROM disposition_candidates d
+    JOIN disposition_set_gate gate ON gate.archive_id = d.archive_id
+), reviewed_replacements (
+    replacement_scope_id, league, season
+) AS (
+    VALUES {reviewed_values}
+), native_replacement_inventory AS (
+    SELECT archive_id, replacement_scope_id, league, season, legacy_pair_key
+    FROM approved_legacy_dispositions
+    WHERE disposition = 'native_current_replaced'
+      AND replacement_scope_id IS NOT NULL
+      AND league IS NOT NULL
+      AND season IS NOT NULL
+), replacement_candidates AS (
+    SELECT candidate.*
+    FROM native_replacement_inventory candidate
+    JOIN reviewed_replacements reviewed
+      ON reviewed.replacement_scope_id = candidate.replacement_scope_id
+     AND reviewed.league = candidate.league
+     AND reviewed.season = candidate.season
+), replacement_set_gate AS (
+    SELECT inventory.archive_id
+    FROM native_replacement_inventory inventory
+    LEFT JOIN replacement_candidates replacement
+      ON replacement.archive_id = inventory.archive_id
+     AND replacement.replacement_scope_id = inventory.replacement_scope_id
+     AND replacement.legacy_pair_key = inventory.legacy_pair_key
+    GROUP BY inventory.archive_id
+    HAVING COUNT(*) = 6
+       AND COUNT(replacement.replacement_scope_id) = 6
+       AND COUNT(DISTINCT replacement.replacement_scope_id) = 6
+       AND COUNT(DISTINCT replacement.legacy_pair_key) = 6
+), replacement_dispositions AS (
+    SELECT replacement.*
+    FROM replacement_candidates replacement
+    JOIN replacement_set_gate gate
+      ON gate.archive_id = replacement.archive_id
+)"""
+        replacement_join = """LEFT JOIN replacement_dispositions replacement
+      ON replacement.replacement_scope_id = c.scope_id
+     AND replacement.league = c.legacy_league
+     AND replacement.season = c.legacy_season
+    CROSS JOIN disposition_integrity_gate disposition_gate"""
+        replacement_predicate = """AND (
+          c.previous_source = 'absent'
+          OR replacement.replacement_scope_id IS NOT NULL
+      )"""
+        legacy_disposition_join = """JOIN approved_legacy_dispositions disposition
+     ON disposition.league IS NOT DISTINCT FROM l.league
+     AND disposition.season IS NOT DISTINCT FROM CAST(l.season AS varchar)
+     AND disposition.disposition = 'compatibility_only'"""
+    else:
+        replacement_ctes = ""
+        replacement_join = ""
+        replacement_predicate = ""
+        legacy_disposition_join = ""
+    return f"""CREATE OR REPLACE VIEW {view_qualified} AS
 WITH complete_manifest_candidates AS (
     SELECT *
-    FROM {catalog}.{schema}.{MANIFEST_TABLE}
+    FROM {manifest_qualified}
     WHERE status = 'complete'
 ), candidate_generation_identities AS (
     SELECT DISTINCT {identity_projection}
@@ -3390,13 +4035,13 @@ validated_complete AS (
     FROM validated_complete m
 ), latest_validated AS (
     SELECT * FROM ranked_manifests WHERE rn = 1
-), cutover_records AS (
+){replacement_ctes}, cutover_records AS (
     SELECT parsed.*
     FROM (
         SELECT c.*,
                TRY(CAST(json_parse(c.ancestor_cutover_sha256_json) AS array(varchar)))
                    AS ancestor_cutover_sha256s
-        FROM {catalog}.{schema}.{CUTOVER_TABLE} c
+        FROM {cutover_qualified} c
     ) parsed
     WHERE parsed.ancestor_cutover_sha256s IS NOT NULL
       AND json_format(CAST(parsed.ancestor_cutover_sha256s AS JSON))
@@ -3451,22 +4096,22 @@ validated_complete AS (
     SELECT cutover_sha256 FROM lineage_valid_cutovers
 ), conflicting_cutover_ids AS (
     SELECT cutover_id
-    FROM {catalog}.{schema}.{CUTOVER_TABLE}
+    FROM {cutover_qualified}
     GROUP BY cutover_id
     HAVING COUNT(DISTINCT cutover_sha256) > 1
 ), conflicting_cutover_predecessors AS (
     SELECT scope_id, predecessor_cutover_sha256
-    FROM {catalog}.{schema}.{CUTOVER_TABLE}
+    FROM {cutover_qualified}
     GROUP BY scope_id, predecessor_cutover_sha256
     HAVING COUNT(DISTINCT cutover_sha256) > 1
 ), bad_cutover_hashes AS (
     SELECT DISTINCT c.cutover_sha256
-    FROM {catalog}.{schema}.{CUTOVER_TABLE} c
+    FROM {cutover_qualified} c
     JOIN conflicting_cutover_ids conflict
       ON conflict.cutover_id = c.cutover_id
     UNION
     SELECT DISTINCT c.cutover_sha256
-    FROM {catalog}.{schema}.{CUTOVER_TABLE} c
+    FROM {cutover_qualified} c
     JOIN conflicting_cutover_predecessors fork
       ON fork.scope_id = c.scope_id
      AND fork.predecessor_cutover_sha256 IS NOT DISTINCT FROM c.predecessor_cutover_sha256
@@ -3493,6 +4138,7 @@ validated_complete AS (
 ), native_ready AS (
     SELECT c.*
     FROM latest_cutover c
+    {replacement_join}
     WHERE c.active_source = 'native'
       AND (
           (
@@ -3506,6 +4152,7 @@ validated_complete AS (
               AND c.legacy_season IS NULL
           )
       )
+      {replacement_predicate}
       AND EXISTS (
           SELECT 1
           FROM validated_complete ready_manifest
@@ -3525,7 +4172,8 @@ validated_complete AS (
 ), legacy_rows AS (
     SELECT
         {legacy_projection}
-    FROM {catalog}.{schema}.espn_{entity} l
+    FROM {legacy_relation} l
+    {legacy_disposition_join}
     WHERE NOT EXISTS (
         SELECT 1 FROM native_ready c
         WHERE c.legacy_league IS NOT NULL
@@ -3537,6 +4185,28 @@ validated_complete AS (
 SELECT * FROM native_rows
 UNION ALL
 SELECT * FROM legacy_rows"""
+
+
+def render_public_canonical_view_sql(
+    entity: str,
+    *,
+    catalog: str = "iceberg",
+    schema: str = "bronze",
+    internal_schema: str = INTERNAL_SCHEMA,
+) -> str:
+    """Render one compact6 public wrapper with the exact current contract."""
+
+    if entity not in ENTITY_TABLES:
+        raise ValueError(f"unknown ESPN entity {entity!r}")
+    catalog = _identifier(catalog, "catalog")
+    schema = _identifier(schema, "schema")
+    internal_schema = _identifier(internal_schema, "internal_schema")
+    columns = tuple(dict.fromkeys((*_row_columns(entity), *PROVENANCE_COLUMNS)))
+    projection = ",\n    ".join(f'"{column}"' for column in columns)
+    return f"""CREATE OR REPLACE VIEW {catalog}.{schema}.espn_{entity} SECURITY DEFINER AS
+SELECT
+    {projection}
+FROM {catalog}.{internal_schema}.espn_{entity}_current"""
 
 
 __all__ = [
@@ -3567,6 +4237,7 @@ __all__ = [
     "canonical_sha256",
     "ledger_row_fingerprint",
     "render_current_view_sql",
+    "render_public_canonical_view_sql",
     "render_repository_ddl",
     "row_fingerprint",
     "select_current_manifest",

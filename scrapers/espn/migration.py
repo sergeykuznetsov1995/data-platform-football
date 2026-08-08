@@ -30,6 +30,14 @@ from .daily_owner import (
     standard_scheduled_run_id,
 )
 from .operations import PostgresEspnControlStore
+from .layout import (
+    COMPACT6,
+    INTERNAL_SCHEMA,
+    LEGACY14,
+    LEGACY_ARCHIVE_TABLES,
+    relation_location,
+    require_layout_mode,
+)
 from .repository import (
     BASELINE_TABLE,
     CUTOVER_TABLE,
@@ -1930,22 +1938,37 @@ def load_promotion_evidence(
 
 
 def migration_statements(
-    *, catalog: str = "iceberg", schema: str = "bronze"
+    *,
+    catalog: str = "iceberg",
+    schema: str = "bronze",
+    internal_schema: str = INTERNAL_SCHEMA,
+    layout_mode: str = LEGACY14,
 ) -> tuple[str, ...]:
-    repository_ddl = render_repository_ddl(catalog=catalog, schema=schema)
+    layout_mode = require_layout_mode(layout_mode)
+    repository_ddl = render_repository_ddl(
+        catalog=catalog,
+        schema=schema,
+        internal_schema=internal_schema,
+        layout_mode=layout_mode,
+    )
     statements = [f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}"]
+    if layout_mode == COMPACT6:
+        statements.append(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{internal_schema}")
     statements.extend(repository_ddl.values())
-    cutover = f"{catalog}.{schema}.{CUTOVER_TABLE}"
+    cutover_default_schema, _ = relation_location(CUTOVER_TABLE, layout_mode)
+    cutover_schema = schema if cutover_default_schema == "bronze" else internal_schema
+    cutover = f"{catalog}.{cutover_schema}.{CUTOVER_TABLE}"
     statements.extend(
         (
             f'ALTER TABLE {cutover} ADD COLUMN IF NOT EXISTS "ancestor_cutover_sha256_json" varchar',
             f'ALTER TABLE {cutover} ADD COLUMN IF NOT EXISTS "ancestor_lineage_sha256" varchar',
         )
     )
-    statements.extend(
-        render_current_view_sql(entity, catalog=catalog, schema=schema)
-        for entity in ("schedule", "lineup", "matchsheet")
-    )
+    if layout_mode == LEGACY14:
+        statements.extend(
+            render_current_view_sql(entity, catalog=catalog, schema=schema)
+            for entity in ("schedule", "lineup", "matchsheet")
+        )
     destructive = re.compile(r"\b(?:DROP|DELETE|TRUNCATE)\b", re.IGNORECASE)
     if any(destructive.search(statement) for statement in statements):
         raise MigrationError("migration DDL contains a destructive statement")
@@ -2035,11 +2058,18 @@ def build_promotion_plan(
     output_path: str | Path,
     catalog: str = "iceberg",
     schema: str = "bronze",
+    internal_schema: str = INTERNAL_SCHEMA,
+    layout_mode: str = LEGACY14,
 ) -> dict[str, Any]:
     if not isinstance(evidence, PromotionEvidence):
         raise TypeError("evidence must be PromotionEvidence")
     _validate_promotion_evidence_runtime_shape(evidence)
     output = Path(output_path)
+    resolved_layout = require_layout_mode(layout_mode)
+    baseline_default_schema, baseline_name = relation_location(
+        BASELINE_TABLE, resolved_layout
+    )
+    baseline_schema = schema if baseline_default_schema == "bronze" else internal_schema
     result = {
         "schema_version": _migration_version(evidence),
         "mode": "dry_run",
@@ -2051,9 +2081,17 @@ def build_promotion_plan(
         "trust_label": evidence.trust_label,
         "green_runs": [_run_dict(evidence, item) for item in evidence.green_runs],
         "candidate": _candidate(evidence),
-        "statements": list(migration_statements(catalog=catalog, schema=schema)),
+        "layout_mode": resolved_layout,
+        "statements": list(
+            migration_statements(
+                catalog=catalog,
+                schema=schema,
+                internal_schema=internal_schema,
+                layout_mode=layout_mode,
+            )
+        ),
         "baseline": {
-            "table": f"{catalog}.{schema}.{BASELINE_TABLE}",
+            "table": f"{catalog}.{baseline_schema}.{baseline_name}",
             "status": "planned",
             "kind": evidence.fallback.kind,
             "entities": ["schedule", "lineup", "matchsheet"],
@@ -2991,7 +3029,17 @@ class RepositoryMigrationBackend:
     def ensure_objects(self) -> None:
         self.repository.ensure_objects()
 
+    def _qualified(self, table: str) -> str:
+        resolver = getattr(self.repository, "_qualified", None)
+        if callable(resolver):
+            return resolver(table)
+        return f"{self.repository.catalog}.{self.repository.schema}.{table}"
+
     def absence_baseline(self) -> Mapping[str, int]:
+        if getattr(self.repository, "layout_mode", LEGACY14) == COMPACT6:
+            return dict(
+                self.repository._compact_archive_contract()["legacy_snapshot_ids"]
+            )
         snapshot_ids: dict[str, int] = {}
         for entity in self._LEGACY_KEYS:
             table = f"espn_{entity}"
@@ -3017,9 +3065,28 @@ class RepositoryMigrationBackend:
     ) -> tuple[Mapping[str, Mapping[str, Any]], Mapping[str, int]]:
         output = {}
         snapshot_ids = dict(self.absence_baseline())
+        archive_contract = (
+            self.repository._compact_archive_contract()
+            if getattr(self.repository, "layout_mode", LEGACY14) == COMPACT6
+            else None
+        )
         for entity, key_sql in self._LEGACY_KEYS.items():
             table = f"espn_{entity}"
             snapshot_id = snapshot_ids[table]
+            if archive_contract is None:
+                source_relation = (
+                    f"{self.repository.catalog}.{self.repository.schema}.{table}"
+                )
+                source_snapshot_id = snapshot_id
+            else:
+                archive_table = LEGACY_ARCHIVE_TABLES[
+                    tuple(self._LEGACY_KEYS).index(entity)
+                ]
+                source_relation = (
+                    f"{self.repository.catalog}.{self.repository.internal_schema}."
+                    f"{archive_table}"
+                )
+                source_snapshot_id = archive_contract["archive_snapshot_ids"][entity]
             rows = self.repository._execute(
                 f"""SELECT COUNT(*) AS row_count,
 COUNT(DISTINCT {key_sql}) AS distinct_key_count,
@@ -3027,7 +3094,7 @@ COUNT_IF({key_sql} IS NULL) AS null_key_count,
 CAST(MIN(match_date) AS varchar) AS min_match_date,
 CAST(MAX(match_date) AS varchar) AS max_match_date,
 CAST(MAX(_ingested_at) AS varchar) AS max_ingested_at
-FROM {self.repository.catalog}.{self.repository.schema}.{table} FOR VERSION AS OF {snapshot_id}
+FROM {source_relation} FOR VERSION AS OF {source_snapshot_id}
 WHERE league = ? AND CAST(season AS varchar) = ?"""
                 if entity == "schedule"
                 else f"""SELECT COUNT(*) AS row_count,
@@ -3036,7 +3103,7 @@ COUNT_IF({key_sql} IS NULL) AS null_key_count,
 CAST(NULL AS varchar) AS min_match_date,
 CAST(NULL AS varchar) AS max_match_date,
 CAST(MAX(_ingested_at) AS varchar) AS max_ingested_at
-FROM {self.repository.catalog}.{self.repository.schema}.{table} FOR VERSION AS OF {snapshot_id}
+FROM {source_relation} FOR VERSION AS OF {source_snapshot_id}
 WHERE league = ? AND CAST(season AS varchar) = ?""",
                 (league, season),
             )
@@ -3186,7 +3253,7 @@ WHERE league = ? AND CAST(season AS varchar) = ?""",
         rows = self.repository._execute(
             "SELECT "
             + ", ".join(f'"{name}"' for name in _MANIFEST_IDENTITY_COLUMNS)
-            + f" FROM {self.repository.catalog}.{self.repository.schema}.{MANIFEST_TABLE} "
+            + f" FROM {self._qualified(MANIFEST_TABLE)} "
             + 'WHERE "scope_id" = ? AND "status" = \'complete\' '
             + 'ORDER BY "completed_at" DESC, "generation_id" DESC, "manifest_sha256" DESC LIMIT 1',
             (scope_id,),
@@ -3207,7 +3274,7 @@ WHERE league = ? AND CAST(season AS varchar) = ?""",
         rows = self.repository._execute(
             "SELECT "
             + ", ".join(f'"{name}"' for name in _V4_MANIFEST_IDENTITY_COLUMNS)
-            + f" FROM {self.repository.catalog}.{self.repository.schema}.{MANIFEST_TABLE} "
+            + f" FROM {self._qualified(MANIFEST_TABLE)} "
             + 'WHERE "scope_id" = ? AND "status" = \'complete\' '
             + 'ORDER BY "completed_at" DESC, "generation_id" DESC, "manifest_sha256" DESC LIMIT 1',
             (scope_id,),
@@ -3228,7 +3295,7 @@ WHERE league = ? AND CAST(season AS varchar) = ?""",
         rows = self.repository._execute(
             "SELECT "
             + ", ".join(f'"{name}"' for name in _BASELINE_COLUMNS)
-            + f" FROM {self.repository.catalog}.{self.repository.schema}.{BASELINE_TABLE} "
+            + f" FROM {self._qualified(BASELINE_TABLE)} "
             + 'WHERE "scope_id" = ?',
             (scope_id,),
         )
@@ -3275,7 +3342,7 @@ WHERE league = ? AND CAST(season AS varchar) = ?""",
         rows = self.repository._execute(
             "SELECT "
             + ", ".join(f'"{name}"' for name in columns)
-            + f" FROM {self.repository.catalog}.{self.repository.schema}.{CUTOVER_TABLE} "
+            + f" FROM {self._qualified(CUTOVER_TABLE)} "
             + 'WHERE "scope_id" = ? ORDER BY "effective_at" DESC, "cutover_id" DESC, "cutover_sha256" DESC LIMIT 1',
             (scope_id,),
         )

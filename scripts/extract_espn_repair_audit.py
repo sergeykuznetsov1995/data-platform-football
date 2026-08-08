@@ -14,6 +14,10 @@ from scrapers.espn.repair import Top5SnapshotExtractor
 from scrapers.espn.repository import EspnBronzeRepository
 
 
+def _repository_from_env() -> EspnBronzeRepository:
+    return EspnBronzeRepository.from_env()
+
+
 def _atomic_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(
@@ -41,12 +45,13 @@ def _atomic_json(path: Path, payload: object) -> None:
 
 
 def main(
-    argv: list[str] | None = None, *, repository_factory=EspnBronzeRepository
+    argv: list[str] | None = None, *, repository_factory=None
 ) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
     try:
+        repository_factory = repository_factory or _repository_from_env
         evidence = Top5SnapshotExtractor(repository_factory()).extract()
         _atomic_json(args.output, evidence)
         print(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from scrapers.espn.repository import (
     build_catalog_snapshot,
     canonical_json,
     render_current_view_sql,
+    render_public_canonical_view_sql,
     render_repository_ddl,
     row_fingerprint,
     validate_scope_generation,
@@ -427,6 +429,366 @@ def test_ddl_and_views_have_append_only_contract_and_full_join_identity():
 
 
 @pytest.mark.unit
+def test_compact6_ddl_routes_writer_state_internal_and_public_controls_bronze():
+    ddl = render_repository_ddl(layout_mode="compact6")
+
+    for table in ENTITY_TABLES.values():
+        assert f"iceberg.espn_internal.{table}" in ddl[table]
+    assert "iceberg.espn_internal.espn_scope_cutover_v2" in ddl[CUTOVER_TABLE]
+    assert (
+        "iceberg.espn_internal.espn_legacy_baseline_v2"
+        in ddl["espn_legacy_baseline_v2"]
+    )
+    for table in (
+        MANIFEST_TABLE,
+        "espn_request_ledger_generation_v2",
+        CATALOG_TABLE,
+    ):
+        assert f"iceberg.bronze.{table}" in ddl[table]
+
+
+@pytest.mark.unit
+def test_compact6_serving_and_public_views_are_explicit_archive_pinned_definers():
+    sql = render_current_view_sql(
+        "schedule",
+        layout_mode="compact6",
+        archive_snapshot_id=912345,
+        disposition_snapshot_id=923456,
+        disposition_count=17,
+        disposition_hash="d" * 64,
+        archive_id="archive-1",
+        archive_manifest_sha256="e" * 64,
+        archive_plan_sha256="f" * 64,
+        layout_state_sha256="9" * 64,
+        whole_rowset_metrics={
+            entity: {
+                "row_count": 10,
+                "row_hash": digit * 64,
+                "distinct_key_count": 9,
+            }
+            for entity, digit in zip(
+                ("schedule", "lineup", "matchsheet"), ("1", "2", "3")
+            )
+        },
+    )
+    assert sql.startswith(
+        "CREATE OR REPLACE VIEW iceberg.espn_internal.espn_schedule_current AS"
+    )
+    assert (
+        "iceberg.espn_internal.espn_schedule_legacy_archive_v1 "
+        "FOR VERSION AS OF 912345" in sql
+    )
+    assert "iceberg.espn_internal.espn_schedule_generation_v2" in sql
+    assert "iceberg.bronze.espn_ingest_manifest_v2" in sql
+    assert "iceberg.espn_internal.espn_legacy_disposition_v1" in sql
+    assert "FOR VERSION AS OF 923456" in sql
+    assert "state_sha256 = '" + "9" * 64 + "'" in sql
+    assert "compatibility_only" in sql
+    assert "native_current_replaced" in sql
+    assert "quarantined" in sql
+    legacy_branch = sql.split("legacy_rows AS (", 1)[1]
+    assert "disposition.disposition = 'compatibility_only'" in legacy_branch
+    assert "native_current_replaced'\n     )" not in legacy_branch
+    assert (
+        "(SELECT COUNT(*) FROM iceberg.espn_internal.espn_layout_state_v2) = 1" in sql
+    )
+    assert "LEFT JOIN replacement_dispositions replacement" in sql
+    assert "c.previous_source = 'absent'" in sql
+    assert "CROSS JOIN disposition_integrity_gate" in sql
+    assert "archive_id = 'archive-1'" in sql
+    assert "manifest_sha256 = '" + "e" * 64 + "'" in sql
+    assert "whole_rowset_metrics_json = '" in sql
+    assert "FROM iceberg.espn_internal.espn_layout_state_v2" in sql
+    assert "plan_sha256 = '" + "f" * 64 + "'" in sql
+    assert "COUNT(DISTINCT replacement.replacement_scope_id) = 6" in sql
+    assert "COUNT(DISTINCT replacement.legacy_pair_key) = 6" in sql
+    assert "('606:2026', 'INT-World Cup', '2026')" in sql
+    assert "('740:2026', 'ESP-La Liga', '2627')" in sql
+    assert "legacy_untrusted" not in sql
+    assert "< '1617'" not in sql
+
+    wrapper = render_public_canonical_view_sql("schedule")
+    assert wrapper.startswith(
+        "CREATE OR REPLACE VIEW iceberg.bronze.espn_schedule SECURITY DEFINER AS"
+    )
+    assert "SELECT *" not in wrapper
+    assert "FROM iceberg.espn_internal.espn_schedule_current" in wrapper
+
+
+def _compact_archive_rows():
+    from scrapers.espn.layout import (
+        ARCHIVE_MANIFEST_COLUMNS,
+        ARCHIVE_MANIFEST_VERSION,
+        LEGACY_ARCHIVE_TABLES,
+        REVIEWED_NATIVE_REPLACEMENTS,
+    )
+    from scripts.compact_espn_bronze_v2 import build_dispositions
+
+    observed = [
+        {
+            "league": league,
+            "season": season,
+            "observed_entities": ["schedule", "lineup", "matchsheet"],
+        }
+        for _scope, league, season in REVIEWED_NATIVE_REPLACEMENTS
+    ]
+    observed.extend(
+        [
+            {
+                "league": "ENG-Premier League",
+                "season": "0001",
+                "observed_entities": ["schedule"],
+            },
+            {
+                "league": None,
+                "season": None,
+                "observed_entities": ["lineup"],
+            },
+        ]
+    )
+    dispositions = build_dispositions("archive-1", observed)
+    disposition_hash = hashlib.sha256(
+        "".join(sorted(row["disposition_sha256"] for row in dispositions)).encode(
+            "ascii"
+        )
+    ).hexdigest()
+    base = {
+        "manifest_version": ARCHIVE_MANIFEST_VERSION,
+        "archive_id": "archive-1",
+        "captured_at": datetime(2026, 8, 8, 12, tzinfo=UTC),
+        "registry_signature": "a" * 64,
+        "legacy_snapshot_ids_json": canonical_json(
+            {
+                "espn_schedule": 101,
+                "espn_lineup": 102,
+                "espn_matchsheet": 103,
+            }
+        ),
+        "archive_snapshot_ids_json": canonical_json(
+            {table: 201 + index for index, table in enumerate(LEGACY_ARCHIVE_TABLES)}
+        ),
+        "whole_rowset_metrics_json": canonical_json(
+            {
+                entity: {
+                    "row_count": 10,
+                    "row_hash": str(index) * 64,
+                    "distinct_key_count": 9,
+                }
+                for index, entity in enumerate(("schedule", "lineup", "matchsheet"), 1)
+            }
+        ),
+        "legacy_disposition_snapshot_id": 301,
+        "legacy_disposition_metrics_json": canonical_json(
+            {"row_count": len(dispositions), "row_hash": disposition_hash}
+        ),
+        "legacy_dispositions_json": canonical_json(dispositions),
+        "native_replacements_json": canonical_json(
+            [
+                {
+                    "scope_id": scope,
+                    "legacy_league": league,
+                    "legacy_season": season,
+                }
+                for scope, league, season in REVIEWED_NATIVE_REPLACEMENTS
+            ]
+        ),
+        "plan_sha256": "b" * 64,
+    }
+    manifest = {**base, "manifest_sha256": repository_module.canonical_sha256(base)}
+    assert set(manifest) == set(ARCHIVE_MANIFEST_COLUMNS)
+    return manifest, dispositions
+
+
+class CompactArchiveQuery(FakeQuery):
+    def __init__(self, manifest, dispositions):
+        super().__init__()
+        self.manifest = manifest
+        self.dispositions = dispositions
+        state_base = {
+            "layout_version": "espn-layout-state-v2",
+            "layout_mode": "compact6",
+            "archive_id": manifest["archive_id"],
+            "transition_id": "transition-1",
+            "effective_at": manifest["captured_at"],
+            "plan_sha256": manifest["plan_sha256"],
+            "archive_manifest_sha256": manifest["manifest_sha256"],
+        }
+        self.layout_state = {
+            **state_base,
+            "state_sha256": repository_module.canonical_sha256(state_base),
+        }
+
+    def execute_query(self, sql, params=None):
+        self.calls.append((sql, params))
+        if "espn_legacy_archive_manifest_v1" in sql:
+            return [self.manifest]
+        if "espn_legacy_disposition_v1" in sql:
+            return list(self.dispositions)
+        if "espn_layout_state_v2" in sql:
+            return [self.layout_state]
+        return []
+
+
+@pytest.mark.unit
+def test_compact_archive_runtime_gate_validates_full_pinned_contract() -> None:
+    manifest, dispositions = _compact_archive_rows()
+    repository = EspnBronzeRepository(
+        writer=FakeWriter(),
+        query=CompactArchiveQuery(manifest, dispositions),
+        layout_mode="compact6",
+        ensure_objects_on_write=False,
+    )
+
+    contract = repository._compact_archive_contract()
+
+    assert contract["archive_snapshot_ids"] == {
+        "schedule": 201,
+        "lineup": 202,
+        "matchsheet": 203,
+    }
+    assert contract["whole_rowset_metrics"]["schedule"]["row_count"] == 10
+    assert contract["disposition_count"] == len(dispositions)
+    assert (
+        contract["layout_state_sha256"]
+        == (repository.query.layout_state["state_sha256"])
+    )
+
+
+@pytest.mark.unit
+def test_compact_archive_runtime_gate_requires_valid_layout_state_attestation() -> None:
+    manifest, dispositions = _compact_archive_rows()
+    query = CompactArchiveQuery(manifest, dispositions)
+    query.layout_state["state_sha256"] = "f" * 64
+    repository = EspnBronzeRepository(
+        writer=FakeWriter(),
+        query=query,
+        layout_mode="compact6",
+        ensure_objects_on_write=False,
+    )
+
+    with pytest.raises(PublicationError, match="layout-state hash"):
+        repository._compact_archive_contract()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "manifest_sha",
+        "missing_disposition",
+        "tampered_disposition",
+        "whole_metrics",
+        "replacements",
+    ),
+)
+def test_compact_archive_runtime_gate_fails_closed_on_tamper(mutation: str) -> None:
+    manifest, dispositions = _compact_archive_rows()
+    manifest = dict(manifest)
+    dispositions = [dict(row) for row in dispositions]
+    if mutation == "manifest_sha":
+        manifest["manifest_sha256"] = "f" * 64
+    elif mutation == "missing_disposition":
+        dispositions.pop()
+    elif mutation == "tampered_disposition":
+        dispositions[0]["season"] = "tampered"
+    elif mutation == "whole_metrics":
+        manifest["whole_rowset_metrics_json"] = canonical_json(
+            {"schedule": {"row_count": -1}}
+        )
+        manifest["manifest_sha256"] = repository_module.canonical_sha256(
+            {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+        )
+    else:
+        replacements = json.loads(manifest["native_replacements_json"])
+        replacements[0]["scope_id"] = "9999:2026"
+        manifest["native_replacements_json"] = canonical_json(replacements)
+        manifest["manifest_sha256"] = repository_module.canonical_sha256(
+            {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+        )
+
+    repository = EspnBronzeRepository(
+        writer=FakeWriter(),
+        query=CompactArchiveQuery(manifest, dispositions),
+        layout_mode="compact6",
+        ensure_objects_on_write=False,
+    )
+    with pytest.raises(PublicationError, match="compact6"):
+        repository._compact_archive_contract()
+
+
+@pytest.mark.unit
+def test_production_repository_requires_layout_env_before_catalog_or_writer() -> None:
+    from scrapers.espn.layout import LayoutError
+
+    with pytest.raises(LayoutError, match="ESPN_BRONZE_LAYOUT_MODE is required"):
+        EspnBronzeRepository.from_env(
+            writer=FakeWriter(), query=FakeQuery(), environ={}
+        )
+
+
+@pytest.mark.unit
+def test_catalog_mode_mismatch_blocks_before_dataframe_writer_side_effect() -> None:
+    from scrapers.espn.layout import LEGACY14_PUBLIC_OBJECTS, LayoutError
+
+    class InventoryQuery(FakeQuery):
+        def execute_query(self, sql, params=None):
+            if "information_schema.tables" in sql:
+                return [
+                    ("bronze", name, kind)
+                    for name, kind in LEGACY14_PUBLIC_OBJECTS.items()
+                ]
+            return super().execute_query(sql, params=params)
+
+    writer = FakeWriter()
+    repository = EspnBronzeRepository.from_env(
+        writer=writer,
+        query=InventoryQuery(),
+        environ={"ESPN_BRONZE_LAYOUT_MODE": "compact6"},
+        ensure_objects_on_write=False,
+    )
+
+    with pytest.raises(LayoutError, match="catalog does not match compact6"):
+        repository._write(MANIFEST_TABLE, [{"scope_id": "700:2026"}])
+    assert writer.calls == []
+
+
+@pytest.mark.unit
+def test_catalog_layout_attestation_is_cached_across_task_local_writes() -> None:
+    from scrapers.espn.layout import LEGACY14_PUBLIC_OBJECTS
+
+    class InventoryQuery(FakeQuery):
+        def execute_query(self, sql, params=None):
+            if "information_schema.tables" in sql:
+                self.calls.append((sql, params))
+                return [
+                    ("bronze", name, kind)
+                    for name, kind in LEGACY14_PUBLIC_OBJECTS.items()
+                ]
+            return super().execute_query(sql, params=params)
+
+    writer = FakeWriter()
+    query = InventoryQuery()
+    repository = EspnBronzeRepository.from_env(
+        writer=writer,
+        query=query,
+        environ={"ESPN_BRONZE_LAYOUT_MODE": "legacy14"},
+        ensure_objects_on_write=False,
+    )
+
+    repository._write(MANIFEST_TABLE, [{"scope_id": "700:2026"}])
+    repository._write(CATALOG_TABLE, [{"snapshot_id": "snapshot-1"}])
+
+    inventory_queries = [
+        sql for sql, _params in query.calls if "information_schema.tables" in sql
+    ]
+    assert len(inventory_queries) == 1
+    assert [table for table, _frame in writer.calls] == [
+        MANIFEST_TABLE,
+        CATALOG_TABLE,
+    ]
+
+
+@pytest.mark.unit
 def test_ensure_objects_evolves_cutover_ancestry_before_creating_views():
     query = FakeQuery()
     repository = EspnBronzeRepository(writer=FakeWriter(), query=query)
@@ -544,9 +906,7 @@ def test_proven_schedule_rows_zero_cannot_false_green_on_raw_evidence():
     )
     missing_report = validate_scope_generation(without_scoreboard)
     assert not missing_report.passed
-    assert "successful scoreboard raw evidence" in " ".join(
-        missing_report.failures
-    )
+    assert "successful scoreboard raw evidence" in " ".join(missing_report.failures)
 
 
 @pytest.mark.unit

@@ -48,6 +48,7 @@ def _render_compose(
             "FBREF_CAMOUFOX_GEOIP_DATABASE_HOST_PATH": "/tmp/geo.mmdb",
             "ESPN_RELEASE_COMMIT": "a" * 40,
             "ESPN_RELEASE_TREE_SHA256": "b" * 64,
+            "ESPN_BRONZE_LAYOUT_MODE": "legacy14",
         }
     )
     for name in (
@@ -99,6 +100,7 @@ def _isolated_environment() -> dict[str, str]:
         "ESPN_DAGBAG_ROOT": "/tmp/espn-dagbag",
         "ESPN_RELEASE_COMMIT": "a" * 40,
         "ESPN_RELEASE_TREE_SHA256": "b" * 64,
+        "ESPN_BRONZE_LAYOUT_MODE": "legacy14",
         "ESPN_AIRFLOW_DB_PASSWORD": "compose-test",
         "ESPN_AIRFLOW_DATABASE_URL": (
             "postgresql+psycopg2://airflow:compose-test@airflow-metadb:5432/airflow"
@@ -124,6 +126,20 @@ def test_shared_compose_requires_exact_espn_release_identity() -> None:
 
     assert "ESPN_RELEASE_COMMIT: ${ESPN_RELEASE_COMMIT:?" in source
     assert "ESPN_RELEASE_TREE_SHA256: ${ESPN_RELEASE_TREE_SHA256:?" in source
+
+
+def test_every_runtime_compose_requires_an_explicit_espn_layout_mode() -> None:
+    """A process must never silently fall back to the legacy physical layout."""
+    required = (
+        "ESPN_BRONZE_LAYOUT_MODE: ${ESPN_BRONZE_LAYOUT_MODE:?"
+        "set exact ESPN Bronze layout mode (legacy14 or compact6)}"
+    )
+
+    for compose_file in (SHARED_COMPOSE, ISOLATED_COMPOSE):
+        assert required in compose_file.read_text(encoding="utf-8")
+
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "# ESPN_BRONZE_LAYOUT_MODE=legacy14" in example
 
 
 def test_native_espn_factory_declares_a_nonempty_description() -> None:
@@ -156,6 +172,7 @@ def test_rendered_airflow_compose_uses_authoritative_core_catalog() -> None:
 
     for name in AIRFLOW_SERVICES:
         environment = services[name]["environment"]
+        assert environment["ESPN_BRONZE_LAYOUT_MODE"] == "legacy14"
         assert environment["ESPN_DISCOVERY_CATALOG_URL"] == CORE_CATALOG_URL
         assert "site.api.espn.com/apis/site/v2/sports/soccer/leagues" not in str(
             environment
@@ -296,6 +313,7 @@ def test_rendered_isolated_espn_compose_proves_role_projection_and_freeze() -> N
         service = services[name]
         environment = service["environment"]
         assert environment["ESPN_ISOLATED_STACK"] == "1"
+        assert environment["ESPN_BRONZE_LAYOUT_MODE"] == "legacy14"
         assert environment["ESPN_DISCOVERY_CATALOG_URL"] == CORE_CATALOG_URL
         assert environment["ESPN_DISCOVERY_STATE_REF_URI"] == frozen_ref[0]
         assert environment["ESPN_DISCOVERY_STATE_REF_SHA256"] == frozen_ref[1]

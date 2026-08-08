@@ -4,15 +4,30 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.bronze.espn_matchsheet
   description: |
-    Retained legacy ESPN matchsheet, frozen as rollback evidence and fallback
-    for scopes not yet promoted to Native Bronze v2. The native production
-    writer never changes or drops this object; consumers should use
-    bronze.espn_matchsheet_current during the one-scope-at-a-time cutover.
+    Canonical public ESPN matchsheet serving view for compact6. It exposes the
+    reviewed native/legacy row superset: native rows require an exact COMPLETE
+    manifest and approved cutover, while frozen archive rows remain the
+    compatibility fallback. Consumers query bronze.espn_matchsheet only;
+    transition and archive relations are restricted internal state.
   tags:
     - Tier.Bronze
     - Domain.Football
     - PII.Low
 columns:
+  - name: scope_id
+    description: Native competition/edition scope; null on archived legacy fallback rows.
+  - name: competition_id
+    description: Authoritative numeric ESPN competition ID; null on legacy fallback rows.
+  - name: event_id
+    description: Authoritative numeric ESPN event ID; null on legacy fallback rows.
+  - name: team_id
+    description: Authoritative numeric ESPN team ID; null on legacy fallback rows.
+  - name: generation_id
+    description: COMPLETE native generation identity; null on legacy fallback rows.
+  - name: raw_uri
+    description: Immutable Raw source URI for a native row; null on archived legacy fallback rows.
+  - name: raw_sha256
+    description: SHA-256 of the native Raw source; null on archived legacy fallback rows.
   - name: league
     description: Лига (e.g. 'ENG-Premier League'); partition key.
   - name: season

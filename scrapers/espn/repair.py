@@ -12,6 +12,8 @@ from typing import Any, Mapping
 
 import yaml
 
+from .layout import COMPACT6, INTERNAL_SCHEMA, LEGACY14, LayoutError, require_layout_mode
+
 
 REPAIR_SEED_PATH = (
     Path(__file__).resolve().parents[2] / "configs" / "espn" / "repair_seed.yaml"
@@ -42,6 +44,7 @@ TOP5_SEASONS = (
     "2526",
 )
 REPAIR_EXTRACTOR_VERSION = "espn-top5-snapshot-extractor-v1"
+COMPACT6_REPAIR_EXTRACTOR_VERSION = "espn-top5-snapshot-extractor-v2"
 SNAPSHOT_TABLES = ("espn_schedule", "espn_lineup", "espn_matchsheet")
 
 
@@ -366,6 +369,16 @@ def _identifier(value: str, field: str) -> str:
     return value
 
 
+def _audit_layout_mode(value: object) -> str:
+    """Validate an explicit layout without consulting an ambient environment."""
+    if not isinstance(value, str):
+        raise RepairAuditError("repair audit layout mode is required")
+    try:
+        return require_layout_mode(value)
+    except LayoutError as exc:
+        raise RepairAuditError(str(exc)) from exc
+
+
 def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
@@ -387,12 +400,29 @@ def render_top5_audit_sql(
     *,
     catalog: str = "iceberg",
     schema: str = "bronze",
+    layout_mode: str = LEGACY14,
+    archive_schema: str = INTERNAL_SCHEMA,
 ) -> str:
     """Render the one read-only query bound to three exact Iceberg snapshots."""
 
     snapshots = _snapshot_ids(snapshot_ids)
     catalog = _identifier(catalog, "catalog")
     schema = _identifier(schema, "schema")
+    layout_mode = _audit_layout_mode(layout_mode)
+    archive_schema = _identifier(archive_schema, "archive_schema")
+    if layout_mode == COMPACT6:
+        if archive_schema == schema:
+            raise RepairAuditError(
+                "compact6 archive schema must differ from the public schema"
+            )
+        relations = {
+            table: f"{catalog}.{archive_schema}.{table}_legacy_archive_v1"
+            for table in SNAPSHOT_TABLES
+        }
+    else:
+        relations = {
+            table: f"{catalog}.{schema}.{table}" for table in SNAPSHOT_TABLES
+        }
     expected = ",\n".join(
         "("
         + ", ".join(
@@ -419,13 +449,13 @@ VALUES
 SELECT league, CAST(season AS varchar) AS season, game, TRY_CAST(game_id AS bigint) AS game_id,
        CAST(match_date AS date) AS match_date, status, home_team, away_team,
        home_goals, away_goals
-FROM {catalog}.{schema}.espn_schedule FOR VERSION AS OF {snapshots["espn_schedule"]}
+FROM {relations["espn_schedule"]} FOR VERSION AS OF {snapshots["espn_schedule"]}
 ), lineup AS (
 SELECT league, CAST(season AS varchar) AS season, game, team, player
-FROM {catalog}.{schema}.espn_lineup FOR VERSION AS OF {snapshots["espn_lineup"]}
+FROM {relations["espn_lineup"]} FOR VERSION AS OF {snapshots["espn_lineup"]}
 ), matchsheet AS (
 SELECT league, CAST(season AS varchar) AS season, game, team, is_home
-FROM {catalog}.{schema}.espn_matchsheet FOR VERSION AS OF {snapshots["espn_matchsheet"]}
+FROM {relations["espn_matchsheet"]} FOR VERSION AS OF {snapshots["espn_matchsheet"]}
 ), schedule_stats AS (
 SELECT e.scope_id,
        COUNT(s.league) AS event_count,
@@ -503,24 +533,49 @@ def seal_top5_audit_input(
     as_of: datetime,
     catalog: str = "iceberg",
     schema: str = "bronze",
+    layout_mode: str = LEGACY14,
+    archive_schema: str = INTERNAL_SCHEMA,
 ) -> dict[str, Any]:
     if not isinstance(as_of, datetime) or as_of.tzinfo is None:
         raise RepairAuditError("extractor as_of must be timezone-aware")
     snapshots = _snapshot_ids(snapshot_ids)
-    sql = render_top5_audit_sql(snapshots, catalog=catalog, schema=schema)
+    catalog = _identifier(catalog, "catalog")
+    schema = _identifier(schema, "schema")
+    layout_mode = _audit_layout_mode(layout_mode)
+    archive_schema = _identifier(archive_schema, "archive_schema")
+    sql = render_top5_audit_sql(
+        snapshots,
+        catalog=catalog,
+        schema=schema,
+        layout_mode=layout_mode,
+        archive_schema=archive_schema,
+    )
     normalized_records = [dict(record) for record in records]
+    evidence = {
+        "catalog": catalog,
+        "schema": schema,
+        "tables": snapshots,
+        "query_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+        "records_sha256": hashlib.sha256(_canonical_bytes(normalized_records)).hexdigest(),
+    }
+    if layout_mode == COMPACT6:
+        return {
+            "schema_version": "espn-top5-audit-input-v3",
+            "as_of": as_of.astimezone(timezone.utc).isoformat(),
+            "snapshot_evidence": {
+                "extractor_version": COMPACT6_REPAIR_EXTRACTOR_VERSION,
+                "layout_mode": layout_mode,
+                "archive_schema": archive_schema,
+                **evidence,
+            },
+            "records": normalized_records,
+        }
     return {
         "schema_version": "espn-top5-audit-input-v2",
         "as_of": as_of.astimezone(timezone.utc).isoformat(),
         "snapshot_evidence": {
             "extractor_version": REPAIR_EXTRACTOR_VERSION,
-            "catalog": catalog,
-            "schema": schema,
-            "tables": snapshots,
-            "query_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
-            "records_sha256": hashlib.sha256(
-                _canonical_bytes(normalized_records)
-            ).hexdigest(),
+            **evidence,
         },
         "records": normalized_records,
     }
@@ -556,7 +611,27 @@ class Top5SnapshotExtractor:
     def __init__(self, repository: Any) -> None:
         self.repository = repository
 
-    def _main_snapshots(self) -> dict[str, int]:
+    def _layout_mode(self) -> str:
+        # Production repositories always expose the mandatory mode.  The
+        # fallback keeps the existing dependency-free legacy extractor API
+        # usable for historical evidence and narrow test adapters.
+        return _audit_layout_mode(getattr(self.repository, "layout_mode", LEGACY14))
+
+    def _main_snapshots(self, layout_mode: str) -> dict[str, int]:
+        if layout_mode == COMPACT6:
+            archive_contract = self.repository._compact_archive_contract()
+            if not isinstance(archive_contract, Mapping):
+                raise RepairAuditError("compact6 archive contract is malformed")
+            archive_snapshots = archive_contract.get("archive_snapshot_ids")
+            if not isinstance(archive_snapshots, Mapping):
+                raise RepairAuditError("compact6 archive snapshot set is incomplete")
+            return _snapshot_ids(
+                {
+                    table: archive_snapshots.get(table.removeprefix("espn_"))
+                    for table in SNAPSHOT_TABLES
+                }
+            )
+
         output = {}
         for table in SNAPSHOT_TABLES:
             rows = self.repository._execute(
@@ -571,11 +646,15 @@ class Top5SnapshotExtractor:
         return _snapshot_ids(output)
 
     def extract(self) -> dict[str, Any]:
-        snapshots = self._main_snapshots()
+        layout_mode = self._layout_mode()
+        snapshots = self._main_snapshots(layout_mode)
+        archive_schema = getattr(self.repository, "internal_schema", INTERNAL_SCHEMA)
         sql = render_top5_audit_sql(
             snapshots,
             catalog=self.repository.catalog,
             schema=self.repository.schema,
+            layout_mode=layout_mode,
+            archive_schema=archive_schema,
         )
         rows = self.repository._execute(sql)
         records = []
@@ -612,6 +691,8 @@ class Top5SnapshotExtractor:
             as_of=observed_at,
             catalog=self.repository.catalog,
             schema=self.repository.schema,
+            layout_mode=layout_mode,
+            archive_schema=archive_schema,
         )
 
 
@@ -623,7 +704,11 @@ def audit_top5(document: Mapping[str, Any]) -> dict[str, Any]:
         "records",
     }:
         raise RepairAuditError("Top-5 audit input schema mismatch")
-    if document["schema_version"] != "espn-top5-audit-input-v2":
+    schema_version = document["schema_version"]
+    if schema_version not in {
+        "espn-top5-audit-input-v2",
+        "espn-top5-audit-input-v3",
+    }:
         raise RepairAuditError("unsupported Top-5 audit input schema")
     try:
         as_of = datetime.fromisoformat(document["as_of"])
@@ -643,15 +728,32 @@ def audit_top5(document: Mapping[str, Any]) -> dict[str, Any]:
         "query_sha256",
         "records_sha256",
     }
+    if schema_version == "espn-top5-audit-input-v3":
+        expected_snapshot_keys |= {"layout_mode", "archive_schema"}
     if not isinstance(snapshot, Mapping) or set(snapshot) != expected_snapshot_keys:
         raise RepairAuditError("Top-5 snapshot evidence schema mismatch")
-    if snapshot["extractor_version"] != REPAIR_EXTRACTOR_VERSION:
+    expected_extractor_version = (
+        COMPACT6_REPAIR_EXTRACTOR_VERSION
+        if schema_version == "espn-top5-audit-input-v3"
+        else REPAIR_EXTRACTOR_VERSION
+    )
+    if snapshot["extractor_version"] != expected_extractor_version:
         raise RepairAuditError("unsupported Top-5 snapshot extractor")
+    if schema_version == "espn-top5-audit-input-v3":
+        layout_mode = _audit_layout_mode(snapshot["layout_mode"])
+        if layout_mode != COMPACT6:
+            raise RepairAuditError("Top-5 v3 evidence must be bound to compact6")
+        archive_schema = _identifier(snapshot["archive_schema"], "archive_schema")
+    else:
+        layout_mode = LEGACY14
+        archive_schema = INTERNAL_SCHEMA
     tables = _snapshot_ids(snapshot["tables"])
     sql = render_top5_audit_sql(
         tables,
         catalog=_identifier(snapshot["catalog"], "snapshot catalog"),
         schema=_identifier(snapshot["schema"], "snapshot schema"),
+        layout_mode=layout_mode,
+        archive_schema=archive_schema,
     )
     if snapshot["query_sha256"] != hashlib.sha256(sql.encode("utf-8")).hexdigest():
         raise RepairAuditError("Top-5 snapshot query hash mismatch")

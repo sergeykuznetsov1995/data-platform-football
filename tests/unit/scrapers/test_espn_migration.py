@@ -553,6 +553,22 @@ def test_dry_run_is_single_scope_non_mutating_and_binds_exact_artifacts(tmp_path
     assert str((tmp_path / "promotion-result.json").resolve()) in rendered
 
 
+def test_compact6_promotion_plan_routes_baseline_evidence_internal(tmp_path):
+    evidence_path, _ = _evidence(tmp_path)
+    evidence = load_promotion_evidence(evidence_path)
+
+    report = build_promotion_plan(
+        evidence,
+        output_path=tmp_path / "promotion-result.json",
+        layout_mode="compact6",
+    )
+
+    assert report["layout_mode"] == "compact6"
+    assert report["baseline"]["table"] == (
+        "iceberg.espn_internal.espn_legacy_baseline_v2"
+    )
+
+
 def test_migration_statements_never_mutate_legacy_objects():
     rendered = "\n".join(migration_statements()).upper()
     assert "DROP " not in rendered
@@ -683,7 +699,10 @@ def test_programmatic_legacy_green_run_subclass_keeps_non_v4_routing(
     assert "verify_physical_candidate" in backend.actions
 
 
-def test_cli_defaults_to_dry_run_and_does_not_construct_live_adapters(tmp_path):
+def test_cli_defaults_to_dry_run_and_does_not_construct_live_adapters(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("ESPN_BRONZE_LAYOUT_MODE", "legacy14")
     evidence_path, _ = _evidence(tmp_path)
     output = tmp_path / "migration.json"
 
@@ -712,7 +731,10 @@ def test_cli_defaults_to_dry_run_and_does_not_construct_live_adapters(tmp_path):
     assert os.access(script, os.X_OK)
 
 
-def test_apply_cli_emits_honest_machine_failure_when_live_adapter_breaks(tmp_path):
+def test_apply_cli_emits_honest_machine_failure_when_live_adapter_breaks(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("ESPN_BRONZE_LAYOUT_MODE", "legacy14")
     evidence_path, _ = _evidence(tmp_path)
     output = tmp_path / "migration-failure.json"
 

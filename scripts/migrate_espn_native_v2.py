@@ -27,6 +27,7 @@ from scrapers.espn.migration import (
 )
 from scrapers.espn.operations import PostgresEspnControlStore
 from scrapers.espn.repository import EspnBronzeRepository, canonical_sha256
+from scrapers.espn.layout import INTERNAL_SCHEMA, require_layout_mode
 
 
 def _atomic_json(path: Path, payload: object) -> None:
@@ -63,6 +64,7 @@ def _parser() -> argparse.ArgumentParser:
     promote.add_argument("--output", required=True, type=Path)
     promote.add_argument("--catalog", default="iceberg")
     promote.add_argument("--schema", default="bronze")
+    promote.add_argument("--internal-schema", default=INTERNAL_SCHEMA)
     promote.add_argument("--apply", action="store_true")
 
     rollback = subparsers.add_parser(
@@ -76,7 +78,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _live_backend() -> RepositoryMigrationBackend:
-    return RepositoryMigrationBackend(EspnBronzeRepository())
+    return RepositoryMigrationBackend(EspnBronzeRepository.from_env())
 
 
 def _live_lease() -> ProductionLeaseStore:
@@ -93,6 +95,7 @@ def main(
     backend_factory = backend_factory or _live_backend
     lease_factory = lease_factory or _live_lease
     try:
+        layout_mode = require_layout_mode()
         if args.command == "promote":
             evidence = load_promotion_evidence(args.evidence)
             if args.apply:
@@ -112,6 +115,8 @@ def main(
                     output_path=args.output,
                     catalog=args.catalog,
                     schema=args.schema,
+                    internal_schema=args.internal_schema,
+                    layout_mode=layout_mode,
                 )["rollback"]
                 result.pop("result_sha256", None)
                 result["result_sha256"] = canonical_sha256(result)
@@ -121,6 +126,8 @@ def main(
                     output_path=args.output,
                     catalog=args.catalog,
                     schema=args.schema,
+                    internal_schema=args.internal_schema,
+                    layout_mode=layout_mode,
                 )
         else:
             promotion = json.loads(args.promotion_report.read_text(encoding="utf-8"))

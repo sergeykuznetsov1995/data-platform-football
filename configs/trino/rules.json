@@ -6,6 +6,12 @@
     { "allow": "none" }
   ],
   "schemas": [
+    {
+      "user": "superset|openmetadata",
+      "catalog": "iceberg",
+      "schema": "espn_internal",
+      "owner": false
+    },
     { "user": "airflow|superset|openmetadata", "owner": true },
     { "group": "platform-admins", "owner": true },
     { "owner": false }
@@ -14,6 +20,12 @@
     {
       "user": "airflow",
       "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]
+    },
+    {
+      "user": "superset|openmetadata",
+      "catalog": "iceberg",
+      "schema": "espn_internal",
+      "privileges": []
     },
     {
       "user": "superset|openmetadata",

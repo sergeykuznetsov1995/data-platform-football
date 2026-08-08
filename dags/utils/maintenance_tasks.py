@@ -784,6 +784,64 @@ def _list_tables(conn, schema: str) -> List[str]:
     return [r[0] for r in rows]
 
 
+def _validate_compact6_maintenance_relations(conn) -> None:
+    """Fail closed unless public views and internal generations have exact kinds."""
+
+    from scrapers.espn import layout as espn_layout
+
+    expected = {
+        **{
+            (espn_layout.BRONZE_SCHEMA, name): "VIEW"
+            for name in espn_layout.LEGACY_TABLES
+        },
+        **{
+            (espn_layout.INTERNAL_SCHEMA, name): "BASE TABLE"
+            for name in espn_layout.GENERATION_TABLES
+        },
+    }
+    public_names = ", ".join(f"'{name}'" for name in espn_layout.LEGACY_TABLES)
+    generation_names = ", ".join(
+        f"'{name}'" for name in espn_layout.GENERATION_TABLES
+    )
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT table_schema, table_name, table_type "
+            "FROM iceberg.information_schema.tables WHERE "
+            f"(table_schema = '{espn_layout.BRONZE_SCHEMA}' "
+            f"AND table_name IN ({public_names})) OR "
+            f"(table_schema = '{espn_layout.INTERNAL_SCHEMA}' "
+            f"AND table_name IN ({generation_names}))"
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+
+    observed: dict[tuple[str, str], str] = {}
+    for row in rows:
+        if not isinstance(row, (tuple, list)) or len(row) != 3:
+            raise espn_layout.LayoutError(
+                "compact6 maintenance catalog inventory is malformed"
+            )
+        key = (str(row[0]), str(row[1]))
+        if key in observed:
+            raise espn_layout.LayoutError(
+                f"duplicate compact6 maintenance relation {key[0]}.{key[1]}"
+            )
+        observed[key] = str(row[2]).strip().upper()
+    if observed != expected:
+        missing = sorted(f"{s}.{n}" for s, n in set(expected) - set(observed))
+        wrong = sorted(
+            f"{s}.{n}={observed[(s, n)]}"
+            for s, n in set(expected) & set(observed)
+            if observed[(s, n)] != expected[(s, n)]
+        )
+        raise espn_layout.LayoutError(
+            "compact6 maintenance relations do not match the catalog contract; "
+            f"missing={missing}, wrong_kind={wrong}"
+        )
+
+
 def cleanup_whoscored_dq_stage_partitions() -> dict:
     """Apply wall-clock retention to frozen-DQ logical partitions.
 
@@ -1229,6 +1287,12 @@ def maintain_iceberg_tables(
 ) -> dict:
     """Run bounded compaction and retention maintenance on Iceberg tables.
 
+    ESPN Bronze mutations require an explicit authoritative layout mode. In
+    ``compact6`` the public canonical relations are views and are excluded;
+    their logical filter names route to the physical ``espn_internal``
+    generation tables. Calls whose filters cannot touch ESPN remain independent
+    of that deployment setting.
+
     Args:
         schemas: which Iceberg schemas to walk (default bronze/silver/gold).
         retention_threshold: '30d' for weekly, shorter values for the split
@@ -1245,7 +1309,23 @@ def maintain_iceberg_tables(
             weekly DAGs pass ``ordinal // 7``. Defaults to today's ordinal for
             direct/manual invocations.
     """
+    from scrapers.espn import layout as espn_layout
+
     filter_set = set(table_filter) if table_filter is not None else None
+    schemas_to_scan = list(dict.fromkeys(schemas))
+    espn_schema_requested = bool(
+        {espn_layout.BRONZE_SCHEMA, espn_layout.INTERNAL_SCHEMA}.intersection(
+            schemas_to_scan
+        )
+    )
+    espn_target_requested = filter_set is None or any(
+        str(table).startswith("espn_") for table in filter_set
+    )
+    espn_layout_mode = (
+        espn_layout.require_layout_mode()
+        if espn_schema_requested and espn_target_requested
+        else None
+    )
     if filter_set is None or filter_set.intersection(WHOSCORED_HIGH_CHURN):
         from scrapers.whoscored.runtime_contract import (
             require_production_runtime_class,
@@ -1260,6 +1340,28 @@ def maintain_iceberg_tables(
         compaction_rotation = date.today().toordinal()
     if type(compaction_rotation) is not int or compaction_rotation < 0:
         raise ValueError("compaction_rotation must be a non-negative integer")
+
+    effective_filter_set = None if filter_set is None else set(filter_set)
+    if espn_layout_mode == espn_layout.COMPACT6:
+        generation_by_canonical = dict(
+            zip(espn_layout.LEGACY_TABLES, espn_layout.GENERATION_TABLES)
+        )
+        if effective_filter_set is not None:
+            effective_filter_set.update(
+                generation
+                for canonical, generation in generation_by_canonical.items()
+                if canonical in filter_set
+            )
+        needs_internal = filter_set is None or bool(
+            filter_set.intersection(generation_by_canonical)
+            or filter_set.intersection(espn_layout.GENERATION_TABLES)
+        )
+        if (
+            "bronze" in schemas_to_scan
+            and needs_internal
+            and espn_layout.INTERNAL_SCHEMA not in schemas_to_scan
+        ):
+            schemas_to_scan.append(espn_layout.INTERNAL_SCHEMA)
 
     conn = _connect()
     total_tables = 0
@@ -1295,11 +1397,15 @@ def maintain_iceberg_tables(
         except Exception:
             pass
         conn = _connect()
+        if espn_layout_mode == espn_layout.COMPACT6:
+            _validate_compact6_maintenance_relations(conn)
 
     try:
+        if espn_layout_mode == espn_layout.COMPACT6:
+            _validate_compact6_maintenance_relations(conn)
         # Enumerate first so compaction selection is independent of SHOW TABLES
         # order and retention can still run for every discovered target.
-        for schema in schemas:
+        for schema in schemas_to_scan:
             try:
                 tables = _list_tables(conn, schema)
             except Exception as e:
@@ -1310,7 +1416,22 @@ def maintain_iceberg_tables(
                 continue
 
             for table in tables:
-                if filter_set is not None and table not in filter_set:
+                if (
+                    espn_layout_mode == espn_layout.COMPACT6
+                    and schema == espn_layout.BRONZE_SCHEMA
+                    and table in espn_layout.LEGACY_TABLES
+                ):
+                    continue
+                if (
+                    espn_layout_mode == espn_layout.COMPACT6
+                    and schema == espn_layout.INTERNAL_SCHEMA
+                    and table not in espn_layout.GENERATION_TABLES
+                ):
+                    continue
+                if (
+                    effective_filter_set is not None
+                    and table not in effective_filter_set
+                ):
                     continue
                 display_name = f"iceberg.{schema}.{table}"
                 sql_name = (

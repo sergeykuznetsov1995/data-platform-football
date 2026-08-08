@@ -563,7 +563,7 @@ def _require_scheduler_runtime_heads(
     if set(heads) != set(target):
         raise OperationsError("scheduler runtime gate requires exact 181/181 heads")
     mismatches = []
-    repository = EspnBronzeRepository()
+    repository = EspnBronzeRepository.from_env()
     for scope_id in target:
         head = heads[scope_id]
         if head.scope_id != scope_id:
@@ -1893,7 +1893,11 @@ def _hydrate_legacy_scope_head(
     if head is None or head.completed_at is not None:
         return head
     generation = _load_exact_scope_head_snapshot(head)
-    verifier = repository if repository is not None else EspnBronzeRepository()
+    verifier = (
+        repository
+        if repository is not None
+        else EspnBronzeRepository.from_env()
+    )
     try:
         verifier.verify_current_scope_selection(generation)
     except Exception as exc:
@@ -3759,7 +3763,7 @@ def ensure_repository_objects(
         raise OperationsError(
             f"ESPN repository pool must have exactly {REPOSITORY_POOL_SLOTS} slots"
         )
-    repository = EspnBronzeRepository()
+    repository = EspnBronzeRepository.from_env()
     repository.ensure_objects()
     return {"state": "ready"}
 
@@ -3767,7 +3771,7 @@ def ensure_repository_objects(
 def _publication_repository() -> EspnBronzeRepository:
     """Return a writer that trusts the exclusive upstream DDL preflight."""
 
-    return EspnBronzeRepository(ensure_objects_on_write=False)
+    return EspnBronzeRepository.from_env(ensure_objects_on_write=False)
 
 
 def publish_scope(*, staging_dq_ref: Mapping[str, str], **_context) -> dict[str, str]:
@@ -4185,7 +4189,7 @@ def published_dq_scope(
         head.completed_at,
     ):
         raise OperationsError("selected scope head snapshot identity mismatch")
-    repository = EspnBronzeRepository()
+    repository = EspnBronzeRepository.from_env()
     if publication["state"] == "complete":
         _assert_generation_binding(
             generation=generation, loaded=loaded, scope=scope, state="staged"
@@ -4956,7 +4960,11 @@ def _verified_complete_generation(
         or head.completed_at > head.published_at
     ):
         raise OperationsError("scope head completion timestamp mismatch")
-    verifier = repository if repository is not None else EspnBronzeRepository()
+    verifier = (
+        repository
+        if repository is not None
+        else EspnBronzeRepository.from_env()
+    )
     report = verifier.verify_published_scope(generation)
     if not report.passed:
         raise OperationsError("scope head COMPLETE physical parity failed")
@@ -5659,7 +5667,7 @@ def propagate_terminal_failure(
         index, durable["release"]
     ):
         raise OperationsError("success receipt canary campaign identity drift")
-    qualification = _reconstruct_durable_qualification(index, durable)
+    _reconstruct_durable_qualification(index, durable)
     dq_refs = []
     for descriptor_ref in index["scope_plan_refs"]:
         descriptor = _read_ref(descriptor_ref, kind="espn-scope-plan-descriptor-v1")

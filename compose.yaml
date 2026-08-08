@@ -204,6 +204,10 @@ x-airflow-common: &airflow-common
     # ESPN Native v2 is direct-only and shares PostgreSQL for its fenced
     # scope leases, exact run evidence and global 30 rpm request gate.
     ESPN_REGISTRY_PATH: /opt/airflow/configs/espn/registry.yaml
+    # Every writer and reader must agree on the physical ESPN relation layout.
+    # Runtime code fails closed rather than silently interpreting compact6 as
+    # legacy14, so deployment must supply this exact release decision.
+    ESPN_BRONZE_LAYOUT_MODE: ${ESPN_BRONZE_LAYOUT_MODE:?set exact ESPN Bronze layout mode (legacy14 or compact6)}
     ESPN_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/espn
     ESPN_ARTIFACT_ROOT_URI: s3://${ICEBERG_WAREHOUSE}/artifacts/espn
     ESPN_RELEASE_COMMIT: ${ESPN_RELEASE_COMMIT:?set exact ESPN release commit}

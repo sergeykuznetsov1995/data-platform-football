@@ -145,14 +145,47 @@ def test_whoscored_serving_views_are_explicit_in_snapshot(bronze_columns):
 
 
 @pytest.mark.unit
-def test_espn_serving_views_are_explicit_in_snapshot(bronze_columns):
-    """ESPN consumers validate the native/legacy current-view superset."""
+def test_espn_compact6_public_surface_is_exact_and_canonical_is_a_superset(
+    bronze_columns,
+):
+    """Only the six compact6 public objects remain in Bronze."""
+    public = {
+        name
+        for name in bronze_columns
+        if name.startswith("bronze.espn_")
+    }
+    assert public == {
+        "bronze.espn_schedule",
+        "bronze.espn_lineup",
+        "bronze.espn_matchsheet",
+        "bronze.espn_ingest_manifest_v2",
+        "bronze.espn_request_ledger_generation_v2",
+        "bronze.espn_catalog_snapshot_v2",
+    }
+    for entity, native_column in (
+        ("schedule", "event_id"),
+        ("lineup", "athlete_id"),
+        ("matchsheet", "team_id"),
+    ):
+        columns = bronze_columns[f"bronze.espn_{entity}"]
+        assert {"league", "season", "game", "scope_id", native_column, "raw_uri"} <= columns
 
-    assert {
-        "bronze.espn_schedule_current",
-        "bronze.espn_lineup_current",
-        "bronze.espn_matchsheet_current",
-    } <= set(bronze_columns)
+
+@pytest.mark.unit
+def test_compact6_layout_state_fixture_binds_the_archive_manifest(fixture):
+    columns = fixture["tables"]["espn_internal.espn_layout_state_v2"]["columns"]
+
+    assert set(columns) == {
+        "layout_version",
+        "layout_mode",
+        "archive_id",
+        "transition_id",
+        "effective_at",
+        "plan_sha256",
+        "archive_manifest_sha256",
+        "state_sha256",
+    }
+    assert columns["archive_manifest_sha256"] == "varchar"
 
 
 @pytest.mark.unit

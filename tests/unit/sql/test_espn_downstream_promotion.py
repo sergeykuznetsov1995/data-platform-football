@@ -96,7 +96,9 @@ def test_missing_grain_dq_arms_only_after_atomic_compact6_switch() -> None:
         encoding="utf-8"
     )
 
-    assert "ESPN_BRONZE_LAYOUT_MODE" in source
+    assert "from scrapers.espn.layout import LayoutError, require_layout_mode" in source
+    assert "require_layout_mode()" in source
+    assert "os.environ.get('ESPN_BRONZE_LAYOUT_MODE', 'legacy14')" not in source
     assert "espn_promoted_dq_policy" in source
     assert "include_espn_promoted_grains=include_espn_promoted_grains" in source
 

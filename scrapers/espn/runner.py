@@ -3836,7 +3836,7 @@ def execute(
         )
     else:
         if active and repository is None:
-            repository = EspnBronzeRepository()
+            repository = EspnBronzeRepository.from_env()
         scope_results = []
         for scope in selected:
             competition, edition = registry_scopes[scope.scope_id]

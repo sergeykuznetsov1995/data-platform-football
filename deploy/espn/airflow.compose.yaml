@@ -37,6 +37,9 @@ x-espn-airflow-common: &espn-airflow-common
     S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3 access key}
     S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3 secret key}
     ESPN_REGISTRY_PATH: /opt/airflow/configs/espn/registry.yaml
+    # Keep the isolated Airflow runtime on the same explicit topology contract
+    # as all compatible shared-stack writers and maintenance jobs.
+    ESPN_BRONZE_LAYOUT_MODE: ${ESPN_BRONZE_LAYOUT_MODE:?set exact ESPN Bronze layout mode (legacy14 or compact6)}
     ESPN_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/espn
     ESPN_ARTIFACT_ROOT_URI: s3://${ICEBERG_WAREHOUSE}/artifacts/espn
     ESPN_RELEASE_COMMIT: ${ESPN_RELEASE_COMMIT:?set exact ESPN release commit}

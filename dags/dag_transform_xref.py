@@ -392,6 +392,12 @@ def _validate_xref(**context) -> Dict[str, Any]:
       * key=``orphan_teams``    — dict {total_orphans, per_source, rows} (issue #141)
     """
     from airflow.exceptions import AirflowException
+    from scrapers.espn.layout import LayoutError, require_layout_mode
+
+    try:
+        espn_layout_mode = require_layout_mode()
+    except LayoutError as exc:
+        raise AirflowException(str(exc)) from exc
 
     from utils.alerts import telegram_dq_summary
     from utils.data_quality import CheckResult, run_checks
@@ -407,9 +413,7 @@ def _validate_xref(**context) -> Dict[str, Any]:
 
     try:
         include_espn_promoted_grains, promoted_espn_grains = (
-            espn_promoted_dq_policy(
-                os.environ.get('ESPN_BRONZE_LAYOUT_MODE', 'legacy14')
-            )
+            espn_promoted_dq_policy(espn_layout_mode)
         )
     except ValueError as exc:
         raise AirflowException(str(exc)) from exc

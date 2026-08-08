@@ -9,6 +9,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
+from scrapers.espn.layout import COMPACT6
 from scrapers.espn.repair import (
     REPAIR_SEED_PATH,
     TOP5_COMPETITIONS,
@@ -436,3 +437,103 @@ def test_live_extractor_resolves_main_refs_then_seals_query_rows(tmp_path):
         Path(__file__).resolve().parents[3] / "scripts/extract_espn_repair_audit.py"
     )
     assert os.access(script, os.X_OK)
+    source = script.read_text(encoding="utf-8")
+    assert "EspnBronzeRepository.from_env()" in source
+    assert "repository_factory=EspnBronzeRepository" not in source
+
+
+def test_compact6_extractor_reads_manifest_pinned_internal_archives_only():
+    """Compact6 repair evidence must not time-travel public serving views."""
+    records = _green_records()
+    order = (
+        "scope_id",
+        "legacy_league",
+        "legacy_season",
+        "source_season_year",
+        "trust_label",
+        "event_count",
+        "observed_min_date",
+        "observed_max_date",
+        "out_of_window_events",
+        "null_schedule_game_ids",
+        "duplicate_event_ids",
+        "null_lineup_keys",
+        "duplicate_lineup_keys",
+        "null_matchsheet_keys",
+        "duplicate_matchsheet_keys",
+        "matchsheet_two_side_failures",
+        "final_events",
+        "unresolved_final_scores",
+        "summary_required_events",
+        "summary_covered_events",
+    )
+
+    class Repository:
+        catalog = "iceberg"
+        schema = "bronze"
+        internal_schema = "espn_internal"
+        layout_mode = COMPACT6
+
+        def __init__(self):
+            self.statements = []
+            self.archive_contract_calls = 0
+
+        def _compact_archive_contract(self):
+            self.archive_contract_calls += 1
+            return {
+                "archive_snapshot_ids": {
+                    "schedule": 201,
+                    "lineup": 202,
+                    "matchsheet": 203,
+                }
+            }
+
+        def _execute(self, sql, params=()):
+            self.statements.append(sql)
+            if "$refs" in sql:
+                raise AssertionError("compact6 repair audit must not read public refs")
+            if sql == "SELECT current_timestamp":
+                return [(datetime(2026, 8, 1, 9, tzinfo=timezone.utc),)]
+            return [tuple(record[name] for name in order) for record in records]
+
+    repository = Repository()
+    evidence = Top5SnapshotExtractor(repository).extract()
+
+    assert repository.archive_contract_calls == 1
+    assert evidence["schema_version"] == "espn-top5-audit-input-v3"
+    assert evidence["snapshot_evidence"]["layout_mode"] == "compact6"
+    assert evidence["snapshot_evidence"]["archive_schema"] == "espn_internal"
+    assert evidence["snapshot_evidence"]["tables"] == {
+        "espn_schedule": 201,
+        "espn_lineup": 202,
+        "espn_matchsheet": 203,
+    }
+    assert audit_top5(evidence)["status"] == "passed"
+    query = next(sql for sql in repository.statements if "WITH expected" in sql)
+    assert (
+        "iceberg.espn_internal.espn_schedule_legacy_archive_v1 FOR VERSION AS OF 201"
+        in query
+    )
+    assert (
+        "iceberg.espn_internal.espn_lineup_legacy_archive_v1 FOR VERSION AS OF 202"
+        in query
+    )
+    assert (
+        "iceberg.espn_internal.espn_matchsheet_legacy_archive_v1 FOR VERSION AS OF 203"
+        in query
+    )
+    assert "iceberg.bronze.espn_schedule" not in query
+
+
+def test_compact6_repair_sql_rejects_a_public_archive_schema():
+    with pytest.raises(RepairAuditError, match="archive schema must differ"):
+        render_top5_audit_sql(
+            {
+                "espn_schedule": 201,
+                "espn_lineup": 202,
+                "espn_matchsheet": 203,
+            },
+            layout_mode=COMPACT6,
+            schema="bronze",
+            archive_schema="bronze",
+        )
