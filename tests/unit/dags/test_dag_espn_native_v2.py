@@ -216,6 +216,47 @@ def test_network_and_repository_work_use_bounded_dedicated_pools():
     assert tasks["publish_scopes"]._init_kwargs["pool_slots"] == 1
 
 
+def test_all_executable_entrypoints_gate_current_identity_before_side_effects():
+    from dags.utils import espn_native_tasks
+
+    gates = {
+        "acquire_scope_leases": "_read_admission_ref(",
+        "build_signed_scope_plans": "_read_admission_ref(",
+        "plan_summary_batch_wave": "_current_plan_index(",
+        "fetch_scoreboard_batch": "_heartbeat_scope_binding(",
+        "fetch_summary_batch": "_heartbeat_scope_binding(",
+        "reduce_raw_manifest_wave": "_heartbeat_scope_binding(",
+        "bind_replay_raw_manifests": "_heartbeat_scope_binding(",
+        "offline_parse_scope": "_heartbeat_scope_binding(",
+        "staging_dq_scope": "_heartbeat_scope_binding(",
+        "ensure_repository_objects": "_current_plan_index(",
+        "publish_scope": "_binding(",
+        "persist_run_manifests": "_current_plan_index(",
+        "published_dq_scope": "_binding(",
+        "terminal_verdict": "_current_plan_index(",
+        "record_health_metrics": "_current_plan_index(",
+        "release_scope_leases": "_read_admission_ref(",
+        "propagate_terminal_failure": "_read_admission_ref(",
+    }
+    side_effects = (
+        "PostgresEspnControlStore.from_env(",
+        "EspnRawStore.from_uri(",
+        "runner._read_artifact(",
+        "runner.stage(",
+        "EspnBronzeRepository(",
+        "_publication_repository(",
+        "_write_payload(",
+    )
+    for function_name, gate in gates.items():
+        source = inspect.getsource(getattr(espn_native_tasks, function_name))
+        gate_offset = source.index(gate)
+        assert all(
+            gate_offset < source.index(effect)
+            for effect in side_effects
+            if effect in source
+        ), function_name
+
+
 def test_ingest_timeout_lease_and_mapping_bounds_cover_bounded_onboarding():
     from dags.utils import espn_native_tasks
 
@@ -271,7 +312,14 @@ def test_terminal_health_release_and_propagator_cannot_mask_failure():
     }
     assert tasks["terminal_verdict"].upstream_task_ids == producer_task_ids
     assert set(tasks["terminal_verdict"]._init_kwargs["op_kwargs"]) == {
-        "producer_task_ids"
+        "producer_task_ids",
+        "plan_index_ref",
+    }
+    assert set(tasks["record_health_metrics"]._init_kwargs["op_kwargs"]) == {
+        "plan_index_ref"
+    }
+    assert set(tasks["ensure_repository_objects"]._init_kwargs["op_kwargs"]) == {
+        "plan_index_ref"
     }
     assert set(tasks["release_scope_leases"]._init_kwargs["op_kwargs"]) == {
         "lease_acquisition_ref"
@@ -995,6 +1043,13 @@ def test_summary_planner_accepts_airflow_none_for_signed_zero_scoreboard_map(
         ),
     )
     monkeypatch.setattr(
+        espn_native_tasks,
+        "_current_plan_index",
+        lambda ref: (plan_index, {})
+        if ref == plan_index_ref
+        else pytest.fail(f"unexpected plan index: {ref!r}"),
+    )
+    monkeypatch.setattr(
         espn_native_tasks, "_heartbeat_scope_binding", lambda _ref: None
     )
     monkeypatch.setattr(
@@ -1059,6 +1114,22 @@ def test_summary_planner_rejects_airflow_none_when_scoreboard_map_was_expected(
             if ref == plan_index_ref and kind == "espn-plan-index-v1"
             else pytest.fail(f"unexpected artifact read: {ref!r}, {kind!r}")
         ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_current_plan_index",
+        lambda ref: (
+            {
+                "kind": "espn-plan-index-v1",
+                "schema_version": 1,
+                "scope_ids": ["700:2026"],
+                "network_scope_ids": ["700:2026"],
+                "expected_scoreboard_map_count": 1,
+            },
+            {},
+        )
+        if ref == plan_index_ref
+        else pytest.fail(f"unexpected plan index: {ref!r}"),
     )
 
     with pytest.raises(espn_native_tasks.OperationsError, match="scoreboard phase"):
@@ -1137,6 +1208,13 @@ def test_native_summary_planner_rejects_exactly_saturated_scoreboard_page(
         pytest.fail(f"unexpected artifact read: {ref!r}, {kind!r}")
 
     monkeypatch.setattr(espn_native_tasks, "_read_ref", read_ref)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_current_plan_index",
+        lambda ref: (plan_index, {})
+        if ref == plan_index_ref
+        else pytest.fail(f"unexpected plan index: {ref!r}"),
+    )
     monkeypatch.setattr(
         espn_native_tasks,
         "_binding",
@@ -1246,6 +1324,13 @@ def test_native_summary_planner_keeps_missing_known_event_guard(monkeypatch):
         pytest.fail(f"unexpected artifact read: {ref!r}, {kind!r}")
 
     monkeypatch.setattr(espn_native_tasks, "_read_ref", read_ref)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_current_plan_index",
+        lambda ref: (plan_index, {})
+        if ref == plan_index_ref
+        else pytest.fail(f"unexpected plan index: {ref!r}"),
+    )
     monkeypatch.setattr(
         espn_native_tasks,
         "_binding",
@@ -1386,6 +1471,16 @@ def test_publication_reducer_runs_after_zero_map_and_rejects_none(monkeypatch):
             if ref == plan_index_ref and kind == "espn-plan-index-v1"
             else pytest.fail(f"unexpected artifact read: {ref!r}, {kind!r}")
         ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_current_plan_index",
+        lambda ref: (
+            {"kind": "espn-plan-index-v1", "scope_ids": ["700:2026"]},
+            {},
+        )
+        if ref == plan_index_ref
+        else pytest.fail(f"unexpected plan index: {ref!r}"),
     )
 
     with pytest.raises(espn_native_tasks.OperationsError, match="publication"):
@@ -1722,8 +1817,14 @@ def test_repository_preflight_runs_ddl_once_and_publish_factory_disables_it(
         "_repository_pool_slots",
         lambda: espn_native_tasks.REPOSITORY_POOL_SLOTS,
     )
+    plan_index_ref = {"uri": "plan-index", "sha256": "a" * 64}
+    monkeypatch.setattr(
+        espn_native_tasks, "_current_plan_index", lambda ref: ({}, {})
+    )
 
-    assert espn_native_tasks.ensure_repository_objects() == {"state": "ready"}
+    assert espn_native_tasks.ensure_repository_objects(
+        plan_index_ref=plan_index_ref
+    ) == {"state": "ready"}
     publication_repository = espn_native_tasks._publication_repository()
 
     assert len(instances) == 2
@@ -1734,7 +1835,7 @@ def test_repository_preflight_runs_ddl_once_and_publish_factory_disables_it(
 
     monkeypatch.setattr(espn_native_tasks, "_repository_pool_slots", lambda: 15)
     with pytest.raises(espn_native_tasks.OperationsError, match="exactly 16"):
-        espn_native_tasks.ensure_repository_objects()
+        espn_native_tasks.ensure_repository_objects(plan_index_ref=plan_index_ref)
 
 
 @pytest.mark.parametrize(
@@ -5340,6 +5441,8 @@ def test_stale_cleanup_cannot_release_same_owner_reclaimed_epoch(monkeypatch):
     acquisition = {
         "kind": "espn-lease-acquisition-v2",
         "schema_version": 2,
+        "admission_ref": {"uri": "admission", "sha256": "d" * 64},
+        "admission_signature": "d" * 64,
         "owner_id": owner,
         "scope_ids": ["700:2026"],
         "leases": [espn_native_tasks._lease_to_dict(old)],
@@ -5348,6 +5451,16 @@ def test_stale_cleanup_cannot_release_same_owner_reclaimed_epoch(monkeypatch):
         espn_native_tasks,
         "_read_ref",
         lambda *_args, **_kwargs: acquisition,
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_admission_ref",
+        lambda _ref: {
+            "dag_id": "dag_ingest_espn",
+            "run_id": "run-1",
+            "attempt": 1,
+            "scope_ids": ["700:2026"],
+        },
     )
     monkeypatch.setattr(
         espn_native_tasks.PostgresEspnControlStore,
@@ -5499,6 +5612,235 @@ def _artifact_ref(artifacts, uri, payload):
     body = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
     artifacts[uri] = body
     return {"uri": uri, "sha256": hashlib.sha256(body).hexdigest()}
+
+
+def _authentic_v2_scope_binding(artifacts):
+    """Build the pre-release signed scope contract emitted by e12b85a."""
+
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.models import IngestPlan
+    from scrapers.espn.operations import ScopeLease
+
+    registry = _generated_registry(1)
+    scope_id = _scope_ids(registry)[0]
+    scope = espn_native_tasks._scope_plan(registry, scope_id)
+    run_id = "legacy-v2-run"
+    root = "s3://artifacts/runs/legacy-v2-run"
+    ingested_at = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+    scope_binding = espn_native_tasks._scope_binding(
+        head=None,
+        scope=scope,
+        run_id=run_id,
+        attempt=1,
+        mode="daily",
+        root=root,
+        ingested_at=ingested_at,
+        as_of=ingested_at.date(),
+    )
+    scope_root = f"{root}/scopes/{scope_id.replace(':', '-')}"
+    raw_manifest_uri = f"{scope_root}/raw-manifest.json"
+    plan = IngestPlan(
+        schema_version=1,
+        run_id=run_id,
+        as_of=ingested_at.date(),
+        registry_signature=registry.signature(),
+        scopes=(scope,),
+        metadata={
+            "runtime": {
+                "mode": "daily",
+                "attempt": 1,
+                "registry_snapshot_uri": f"{root}/registry.json",
+                "raw_manifest_uri": raw_manifest_uri,
+                "output_uri": f"{scope_root}/runner-result.json",
+                "raw_store_uri": "s3://raw",
+                "max_events": 100,
+                "selected_scopes": [scope_id],
+                "scope_bindings": {scope_id: scope_binding},
+                "replay_source": None,
+            }
+        },
+    )
+    plan_ref = _artifact_ref(
+        artifacts,
+        f"{scope_root}/plan.json",
+        {
+            "kind": espn_native_tasks.runner.PLAN_KIND,
+            "plan": plan.to_dict(),
+            "signature": plan.signature(),
+        },
+    )
+    requests = espn_native_tasks.runner._scoreboard_requests(
+        scope,
+        espn_native_tasks.runner._scope_binding(scope_binding, scope_id),
+        as_of=plan.as_of,
+        mode="daily",
+    )
+    expected_scoreboard = espn_native_tasks.seal_raw_batch_descriptor(
+        endpoint="scoreboard",
+        run_id=run_id,
+        attempt=1,
+        scope_id=scope_id,
+        plan_signature=plan.signature(),
+        batch_id="c" * 64,
+        request_ids=tuple(item.request_id for item in requests),
+        event_ids=(),
+    )
+    descriptor = {
+        "kind": "espn-scope-plan-descriptor-v1",
+        "schema_version": 1,
+        "dag_id": "dag_ingest_espn",
+        "run_id": run_id,
+        "attempt": 1,
+        "mode": "daily",
+        "scope_id": scope_id,
+        "plan_ref": plan_ref,
+        "plan_signature": plan.signature(),
+        "raw_manifest_uri": raw_manifest_uri,
+        "raw_store_uri": "s3://raw",
+        "generation_snapshot_uri": scope_binding["generation_snapshot_uri"],
+        "expected_scoreboard_batch": expected_scoreboard,
+        "scoreboard_checkpoint_uri": f"{scope_root}/scoreboard.json",
+        "scope_root": scope_root,
+    }
+    descriptor_ref = _artifact_ref(
+        artifacts, f"{scope_root}/scope-plan-descriptor.json", descriptor
+    )
+    lease = ScopeLease(
+        scope_id=scope_id,
+        owner_id=f"dag_ingest_espn/{run_id}/1",
+        plan_signature=plan.signature(),
+        epoch=1,
+        token_sha256="d" * 64,
+        acquired_at=ingested_at,
+        expires_at=ingested_at + timedelta(hours=9),
+    )
+    binding_ref = _artifact_ref(
+        artifacts,
+        f"{scope_root}/lease-binding.json",
+        {
+            "kind": "espn-scope-lease-binding-v1",
+            "schema_version": 1,
+            "scope_plan_ref": descriptor_ref,
+            "lease": espn_native_tasks._lease_to_dict(lease),
+        },
+    )
+    return binding_ref, descriptor_ref, plan
+
+
+@pytest.mark.parametrize("entrypoint", ["fetch", "offline"])
+def test_current_data_plane_rejects_authentic_v2_binding_before_side_effects(
+    monkeypatch, entrypoint
+):
+    from dags.utils import espn_native_tasks
+
+    artifacts = {}
+    binding_ref, _descriptor_ref, _plan = _authentic_v2_scope_binding(artifacts)
+    monkeypatch.setattr(
+        espn_native_tasks.runner, "_read_artifact", lambda uri: artifacts[uri]
+    )
+
+    def forbidden_store(_cls):
+        pytest.fail("v2 binding reached the control store")
+
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(forbidden_store),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        classmethod(lambda _cls, _uri: pytest.fail("v2 binding reached Raw")),
+    )
+    if entrypoint == "fetch":
+        invoke = lambda: espn_native_tasks.fetch_scoreboard_batch(
+            scope_binding_ref=binding_ref
+        )
+    else:
+        raw_phase_ref = _artifact_ref(
+            artifacts,
+            "s3://artifacts/raw-phase.json",
+            {
+                "kind": "espn-raw-reduction-result-v1",
+                "schema_version": 1,
+                "scope_binding_ref": binding_ref,
+                "raw_manifest_ref": {
+                    "uri": "s3://raw/forbidden.json",
+                    "sha256": "e" * 64,
+                },
+            },
+        )
+        invoke = lambda: espn_native_tasks.offline_parse_scope(
+            raw_phase_ref=raw_phase_ref
+        )
+
+    with pytest.raises(
+        espn_native_tasks.OperationsError, match="pinned e12b85a"
+    ):
+        invoke()
+
+
+def test_health_rejects_authentic_v2_plan_before_control_store(monkeypatch):
+    from dags.utils import espn_native_tasks
+
+    artifacts = {}
+    _binding_ref, descriptor_ref, plan = _authentic_v2_scope_binding(artifacts)
+    index_ref = _artifact_ref(
+        artifacts,
+        "s3://artifacts/plan-index.json",
+        {
+            "kind": "espn-plan-index-v1",
+            "schema_version": 1,
+            "dag_id": "dag_ingest_espn",
+            "run_id": plan.run_id,
+            "attempt": 1,
+            "mode": "daily",
+            "registry_signature": plan.registry_signature,
+            "bundle_signature": hashlib.sha256(
+                espn_native_tasks._canonical_bytes([plan.signature()])
+            ).hexdigest(),
+            "scope_ids": [plan.scopes[0].scope_id],
+            "scope_plan_refs": [descriptor_ref],
+            "network_scope_ids": [plan.scopes[0].scope_id],
+            "expected_scoreboard_map_count": 1,
+        },
+    )
+    verdict_ref = _artifact_ref(
+        artifacts,
+        "s3://artifacts/verdict.json",
+        {
+            "kind": "espn-terminal-verdict-v1",
+            "schema_version": 1,
+            "dag_id": "dag_ingest_espn",
+            "run_id": plan.run_id,
+            "attempt": 1,
+            "status": "failed",
+            "failures": ["legacy"],
+            "scope_metrics": {},
+            "durable_manifest_ref": None,
+        },
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner, "_read_artifact", lambda uri: artifacts[uri]
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: pytest.fail("v2 health reached control store")),
+    )
+    context = {
+        "dag": SimpleNamespace(dag_id="dag_ingest_espn"),
+        "run_id": plan.run_id,
+        "logical_date": datetime(2026, 8, 1, 12, tzinfo=timezone.utc),
+        "params": {"attempt": 1},
+    }
+
+    with pytest.raises(
+        espn_native_tasks.OperationsError, match="pinned e12b85a"
+    ):
+        espn_native_tasks.record_health_metrics(
+            plan_index_ref=index_ref, verdict_ref=verdict_ref, **context
+        )
 
 
 def test_summary_mapped_retry_resumes_mixed_width_exact_requests(monkeypatch):
@@ -6821,6 +7163,9 @@ def _run_published_dq_through_terminal(monkeypatch, *, state, mutation=None):
         espn_native_tasks.runner, "_load_signed_plan", lambda _uri: loaded
     )
     monkeypatch.setattr(
+        espn_native_tasks, "_current_signed_plan_admission", lambda *a, **k: {}
+    )
+    monkeypatch.setattr(
         espn_native_tasks.PostgresEspnControlStore,
         "from_env",
         classmethod(lambda _cls: Store()),
@@ -6955,6 +7300,13 @@ def _run_published_dq_through_terminal(monkeypatch, *, state, mutation=None):
         "scope_plan_refs": [descriptor_ref],
     }
     index_ref = _artifact_ref(artifacts, "s3://artifacts/plan-index.json", index)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_current_plan_index",
+        lambda ref: (index, {})
+        if ref == index_ref
+        else pytest.fail(f"unexpected plan index: {ref!r}"),
+    )
     context = {
         "dag": SimpleNamespace(dag_id="dag_ingest_espn"),
         "dag_run": SimpleNamespace(get_task_instances=lambda: ()),
@@ -7093,6 +7445,9 @@ def test_non_utc_scope_lease_serializes_and_binds_canonically(monkeypatch):
     monkeypatch.setattr(espn_native_tasks, "_read_ref", read_ref)
     monkeypatch.setattr(
         espn_native_tasks.runner, "_load_signed_plan", lambda _uri: loaded
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_current_signed_plan_admission", lambda *a, **k: {}
     )
 
     *_, bound_lease = espn_native_tasks._binding(binding_ref)
@@ -7858,6 +8213,9 @@ def test_terminal_rejects_stale_or_prior_plan_artifact(
     monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
     monkeypatch.setattr(espn_native_tasks, "_read_ref", lambda *_args, **_kwargs: index)
     monkeypatch.setattr(
+        espn_native_tasks, "_current_plan_index", lambda _ref: (index, {})
+    )
+    monkeypatch.setattr(
         espn_native_tasks,
         "_write_payload",
         lambda uri, payload, **_kwargs: {"uri": uri, "sha256": "f" * 64},
@@ -7986,6 +8344,11 @@ def test_final_leaf_seals_success_only_after_health_and_release(monkeypatch):
     monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: "s3://artifacts")
     monkeypatch.setattr(espn_native_tasks, "_ref_for_uri", ref_for_uri)
     monkeypatch.setattr(espn_native_tasks, "_read_ref", read_ref)
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_current_plan_index",
+        lambda _ref: (payloads["plan-index.json"], payloads["admission.json"]),
+    )
     monkeypatch.setattr(
         espn_native_tasks,
         "_reconstruct_durable_qualification",

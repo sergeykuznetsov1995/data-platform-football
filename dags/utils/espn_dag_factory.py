@@ -153,6 +153,7 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
         repository_ready = PythonOperator(
             task_id="ensure_repository_objects",
             python_callable=tasks.ensure_repository_objects,
+            op_kwargs={"plan_index_ref": planning.output["plan_index_ref"]},
             pool=tasks.REPOSITORY_POOL,
             pool_slots=tasks.REPOSITORY_POOL_SLOTS,
             trigger_rule="none_failed",
@@ -223,6 +224,7 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
             python_callable=tasks.terminal_verdict,
             op_kwargs={
                 "producer_task_ids": producer_task_ids,
+                "plan_index_ref": planning.output["plan_index_ref"],
             },
             trigger_rule="all_done",
             retries=0,
@@ -230,7 +232,7 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
         health = PythonOperator(
             task_id="record_health_metrics",
             python_callable=tasks.record_health_metrics,
-            op_kwargs={},
+            op_kwargs={"plan_index_ref": planning.output["plan_index_ref"]},
             trigger_rule="all_done",
             retries=0,
         )

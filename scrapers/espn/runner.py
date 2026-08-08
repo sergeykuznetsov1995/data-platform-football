@@ -239,6 +239,7 @@ class LoadedPlan:
     selected_scopes: tuple[str, ...]
     bindings: Mapping[str, ScopeBinding]
     replay_source: ReplaySource | None
+    admission_ref: Mapping[str, str] | None = None
     release: Mapping[str, Any] | None = None
     canary_claim: Mapping[str, Any] | None = None
 
@@ -607,9 +608,11 @@ def _load_signed_plan(uri: str) -> LoadedPlan:
             "scope_bindings",
             "replay_source",
     }
-    current_runtime_keys = legacy_runtime_keys | {"release", "canary_claim"}
+    release_runtime_keys = legacy_runtime_keys | {"release", "canary_claim"}
+    current_runtime_keys = release_runtime_keys | {"admission_ref"}
     if frozenset(runtime) not in {
         frozenset(legacy_runtime_keys),
+        frozenset(release_runtime_keys),
         frozenset(current_runtime_keys),
     }:
         _exact_keys(runtime, current_runtime_keys, "plan.metadata.runtime")
@@ -634,6 +637,26 @@ def _load_signed_plan(uri: str) -> LoadedPlan:
         raise RunnerConfigurationError(
             "replay mode requires replay_source and other modes forbid it"
         )
+    admission_ref = None
+    if "admission_ref" in runtime:
+        raw_admission_ref = _mapping(
+            runtime["admission_ref"], "plan.metadata.runtime.admission_ref"
+        )
+        _exact_keys(
+            raw_admission_ref,
+            {"uri", "sha256"},
+            "plan.metadata.runtime.admission_ref",
+        )
+        admission_ref = {
+            "uri": _required_string(
+                raw_admission_ref["uri"],
+                "plan.metadata.runtime.admission_ref.uri",
+            ),
+            "sha256": _sha256(
+                raw_admission_ref["sha256"],
+                "plan.metadata.runtime.admission_ref.sha256",
+            ),
+        }
     return LoadedPlan(
         plan=plan,
         signature=signature,
@@ -653,6 +676,7 @@ def _load_signed_plan(uri: str) -> LoadedPlan:
         selected_scopes=selected_scopes,
         bindings=bindings,
         replay_source=replay,
+        admission_ref=admission_ref,
         release=(
             _mapping(runtime["release"], "plan.metadata.runtime.release")
             if "release" in runtime

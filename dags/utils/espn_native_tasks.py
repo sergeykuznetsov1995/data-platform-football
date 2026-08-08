@@ -798,6 +798,45 @@ def _read_admission_ref(ref: Mapping[str, str]) -> Mapping[str, Any]:
     return admission
 
 
+def _current_signed_plan_admission(
+    loaded: runner.LoadedPlan, *, expected_dag_id: str | None = None
+) -> Mapping[str, Any]:
+    """Authenticate one executable plan against its exact current admission."""
+
+    admission_ref = getattr(loaded, "admission_ref", None)
+    release = getattr(loaded, "release", None)
+    if admission_ref is None or release is None:
+        raise OperationsError(
+            "current runtime rejects pre-v3 signed plan; exact historical replay "
+            "requires pinned e12b85a"
+        )
+    admission = _read_admission_ref(admission_ref)
+    if expected_dag_id is not None and admission["dag_id"] != expected_dag_id:
+        raise OperationsError("signed plan admission DAG identity mismatch")
+    selected_scopes = tuple(loaded.selected_scopes)
+    if len(selected_scopes) != 1 or len(loaded.plan.scopes) != 1 or (
+        loaded.plan.scopes[0].scope_id != selected_scopes[0]
+    ):
+        raise OperationsError("current signed plan must bind exactly one scope")
+    if (
+        loaded.plan.run_id,
+        loaded.attempt,
+        loaded.mode,
+        loaded.plan.registry_signature,
+        dict(release),
+        getattr(loaded, "canary_claim", None),
+    ) != (
+        admission["run_id"],
+        admission["attempt"],
+        admission["mode"],
+        admission["registry_signature"],
+        admission["release"],
+        admission["canary_claim"],
+    ) or not set(selected_scopes).issubset(admission["scope_ids"]):
+        raise OperationsError("signed plan differs from exact current admission")
+    return admission
+
+
 def _replay_existing_admission(
     *,
     admission_uri: str,
@@ -1314,6 +1353,9 @@ def _replay_binding(admission: Mapping[str, Any], scope_id: str):
         )
     uri = _required(source["uri"], "replay raw manifest uri")
     expected = _sha(source["sha256"], "replay raw manifest sha256")
+    source_plan_uri = uri.rsplit("/", 1)[0] + "/plan.json"
+    source_plan = runner._load_signed_plan(source_plan_uri)
+    _current_signed_plan_admission(source_plan)
     body = runner._read_artifact(uri)
     if hashlib.sha256(body).hexdigest() != expected:
         raise OperationsError("replay raw manifest artifact hash mismatch")
@@ -1324,8 +1366,6 @@ def _replay_binding(admission: Mapping[str, Any], scope_id: str):
     validated = runner._validate_raw_manifest(manifest)
     if scope_id not in validated["selected_scopes"]:
         raise OperationsError("replay raw manifest does not contain scope")
-    source_plan_uri = uri.rsplit("/", 1)[0] + "/plan.json"
-    source_plan = runner._load_signed_plan(source_plan_uri)
     source_scopes = {item.scope_id: item for item in source_plan.plan.scopes}
     source_scope = source_scopes.get(scope_id)
     if source_scope is None:
@@ -1599,12 +1639,10 @@ def build_signed_scope_plans(
             "selected_scopes": [scope_id],
             "scope_bindings": {scope_id: binding},
             "replay_source": replay_source,
+            "admission_ref": acquisition["admission_ref"],
+            "release": admission["release"],
+            "canary_claim": admission["canary_claim"],
         }
-        if "release" in admission:
-            runtime.update(
-                release=admission["release"],
-                canary_claim=admission["canary_claim"],
-            )
         plan = IngestPlan(
             schema_version=1,
             run_id=admission["run_id"],
@@ -1703,13 +1741,10 @@ def build_signed_scope_plans(
         "scope_plan_refs": [item["scope_plan_ref"] for item in scope_refs],
         "network_scope_ids": network_scope_ids,
         "expected_scoreboard_map_count": len(network_scope_ids),
+        "admission_ref": acquisition["admission_ref"],
+        "release": admission["release"],
+        "canary_claim": admission["canary_claim"],
     }
-    if "release" in admission:
-        index.update(
-            admission_ref=acquisition["admission_ref"],
-            release=admission["release"],
-            canary_claim=admission["canary_claim"],
-        )
     index_ref = _write_payload(
         _join_uri(admission["artifact_root"], "plan-index.json"), index
     )
@@ -2088,27 +2123,7 @@ def _binding(ref: Mapping[str, str]):
         raise OperationsError("scope descriptor scoreboard contract is invalid")
     plan_envelope = _read_ref(descriptor["plan_ref"], kind=runner.PLAN_KIND)
     loaded = runner._load_signed_plan(descriptor["plan_ref"]["uri"])
-    loaded_release = getattr(loaded, "release", None)
-    loaded_claim = getattr(loaded, "canary_claim", None)
-    if loaded_release is not None:
-        target_scope_ids = loaded_release.get("target_scope_ids", ())
-        release = _validate_release_identity(
-            loaded_release,
-            registry_signature=loaded.plan.registry_signature,
-            target_scope_ids=target_scope_ids,
-        )
-        if loaded_claim is not None:
-            _validated_canary_claim(
-                loaded_claim,
-                release=release,
-                target_scope_ids=target_scope_ids,
-                dag_id=descriptor["dag_id"],
-                run_id=loaded.plan.run_id,
-                admission_identity=_sha(
-                    loaded_claim.get("admission_identity"),
-                    "signed plan canary admission identity",
-                ),
-            )
+    _current_signed_plan_admission(loaded, expected_dag_id=descriptor["dag_id"])
     if (
         loaded.signature,
         plan_envelope["signature"],
@@ -2142,6 +2157,126 @@ def _binding(ref: Mapping[str, str]):
     if lease.plan_signature != loaded.signature:
         raise OperationsError("lease is not fenced to the exact signed scope plan")
     return binding, descriptor, loaded, scope, lease
+
+
+_CURRENT_PLAN_INDEX_FIELDS = {
+    "kind",
+    "schema_version",
+    "dag_id",
+    "run_id",
+    "attempt",
+    "mode",
+    "registry_signature",
+    "bundle_signature",
+    "scope_ids",
+    "scope_plan_refs",
+    "network_scope_ids",
+    "expected_scoreboard_map_count",
+    "admission_ref",
+    "release",
+    "canary_claim",
+}
+
+
+def _current_plan_index(
+    ref: Mapping[str, str],
+) -> tuple[dict[str, Any], Mapping[str, Any]]:
+    """Strict-read a current plan bundle before executable side effects."""
+
+    index = _read_ref(ref, kind="espn-plan-index-v1")
+    if "admission_ref" not in index or "release" not in index:
+        raise OperationsError(
+            "current runtime rejects pre-v3 signed plan; exact historical replay "
+            "requires pinned e12b85a"
+        )
+    if (
+        set(index) != _CURRENT_PLAN_INDEX_FIELDS
+        or type(index.get("schema_version")) is not int
+        or index.get("schema_version") != 1
+        or type(index.get("attempt")) is not int
+        or index.get("attempt", 0) < 1
+    ):
+        raise OperationsError("current plan index schema mismatch")
+    admission = _read_admission_ref(index["admission_ref"])
+    scope_ids = index.get("scope_ids")
+    scope_plan_refs = index.get("scope_plan_refs")
+    network_scope_ids = index.get("network_scope_ids")
+    if (
+        not isinstance(scope_ids, list)
+        or not scope_ids
+        or not all(isinstance(item, str) and item for item in scope_ids)
+        or tuple(scope_ids) != tuple(sorted(set(scope_ids)))
+        or not isinstance(scope_plan_refs, list)
+        or len(scope_plan_refs) != len(scope_ids)
+        or not isinstance(network_scope_ids, list)
+        or not all(isinstance(item, str) and item for item in network_scope_ids)
+        or tuple(network_scope_ids) != tuple(sorted(set(network_scope_ids)))
+        or not set(network_scope_ids).issubset(scope_ids)
+        or type(index.get("expected_scoreboard_map_count")) is not int
+        or index["expected_scoreboard_map_count"] != len(network_scope_ids)
+    ):
+        raise OperationsError("current plan index scope contract is invalid")
+    if (
+        index["dag_id"],
+        index["run_id"],
+        index["attempt"],
+        index["mode"],
+        index["registry_signature"],
+        index["scope_ids"],
+        index["release"],
+        index["canary_claim"],
+    ) != (
+        admission["dag_id"],
+        admission["run_id"],
+        admission["attempt"],
+        admission["mode"],
+        admission["registry_signature"],
+        admission["scope_ids"],
+        admission["release"],
+        admission["canary_claim"],
+    ):
+        raise OperationsError("current plan index differs from exact admission")
+    signatures = []
+    seen_scope_ids = []
+    for descriptor_ref in scope_plan_refs:
+        descriptor = _read_ref(
+            descriptor_ref, kind="espn-scope-plan-descriptor-v1"
+        )
+        if (
+            set(descriptor) != _SCOPE_PLAN_DESCRIPTOR_FIELDS
+            or type(descriptor.get("schema_version")) is not int
+            or descriptor.get("schema_version") != 1
+            or type(descriptor.get("attempt")) is not int
+            or descriptor.get("attempt", 0) < 1
+        ):
+            raise OperationsError("current plan index scope descriptor is invalid")
+        loaded = runner._load_signed_plan(descriptor["plan_ref"]["uri"])
+        signed_admission = _current_signed_plan_admission(
+            loaded, expected_dag_id=index["dag_id"]
+        )
+        if signed_admission != admission or (
+            descriptor.get("run_id"),
+            descriptor.get("attempt"),
+            descriptor.get("mode"),
+            descriptor.get("scope_id"),
+            descriptor.get("plan_signature"),
+            loaded.plan.registry_signature,
+        ) != (
+            index["run_id"],
+            index["attempt"],
+            index["mode"],
+            loaded.selected_scopes[0],
+            loaded.signature,
+            index["registry_signature"],
+        ):
+            raise OperationsError("current plan index signed scope identity mismatch")
+        seen_scope_ids.append(descriptor["scope_id"])
+        signatures.append(loaded.signature)
+    if seen_scope_ids != scope_ids or hashlib.sha256(
+        _canonical_bytes(sorted(signatures))
+    ).hexdigest() != index["bundle_signature"]:
+        raise OperationsError("current plan index bundle identity mismatch")
+    return index, admission
 
 
 def _heartbeat_scope_binding(ref: Mapping[str, str]) -> ScopeLease:
@@ -2397,7 +2532,7 @@ def plan_summary_batch_wave(
 ) -> dict[str, Any]:
     """Offline enumerate wave-two IDs and persist each <=50 descriptor."""
 
-    plan_index = _read_ref(plan_index_ref, kind="espn-plan-index-v1")
+    plan_index, _ = _current_plan_index(plan_index_ref)
     indexed_scope_ids = plan_index.get("scope_ids")
     network_scope_ids = plan_index.get("network_scope_ids")
     expected_scoreboard_count = plan_index.get("expected_scoreboard_map_count")
@@ -3586,9 +3721,12 @@ def _repository_pool_slots() -> int:
     return pool.slots
 
 
-def ensure_repository_objects(**_context) -> dict[str, str]:
+def ensure_repository_objects(
+    *, plan_index_ref: Mapping[str, str], **_context
+) -> dict[str, str]:
     """Create/evolve shared ESPN objects once before parallel publication."""
 
+    _current_plan_index(plan_index_ref)
     if _repository_pool_slots() != REPOSITORY_POOL_SLOTS:
         raise OperationsError(
             f"ESPN repository pool must have exactly {REPOSITORY_POOL_SLOTS} slots"
@@ -3804,7 +3942,7 @@ def persist_run_manifests(
 ) -> dict[str, Any]:
     """Seal exact current-run durable evidence; never consult a latest pointer."""
 
-    index = _read_ref(plan_index_ref, kind="espn-plan-index-v1")
+    index, _ = _current_plan_index(plan_index_ref)
     scope_ids = index.get("scope_ids")
     if (
         not isinstance(scope_ids, list)
@@ -4251,7 +4389,7 @@ def terminal_verdict(
     try:
         if plan_index_ref is None:
             plan_index_ref = _ref_for_uri(_join_uri(root, "plan-index.json"))
-        index = _read_ref(plan_index_ref, kind="espn-plan-index-v1")
+        index, _ = _current_plan_index(plan_index_ref)
         if (index["dag_id"], index["run_id"], index["attempt"]) != (
             dag_id,
             run_id,
@@ -4263,6 +4401,9 @@ def terminal_verdict(
         for descriptor_ref in index["scope_plan_refs"]:
             descriptor = _read_ref(descriptor_ref, kind="espn-scope-plan-descriptor-v1")
             loaded_plan = runner._load_signed_plan(descriptor["plan_ref"]["uri"])
+            _current_signed_plan_admission(
+                loaded_plan, expected_dag_id=descriptor["dag_id"]
+            )
             scope_id = descriptor["scope_id"]
             if scope_id in plan_identities:
                 raise OperationsError("terminal plan index duplicates a scope")
@@ -5135,8 +5276,9 @@ def record_health_metrics(
     plan_signatures: dict[str, str] = {}
     observer_dag_id, observer_run_id, _ = _run_identity(context)
     fallback_identity = None
+    admission = None
     if plan_index_ref is not None:
-        index = _read_ref(plan_index_ref, kind="espn-plan-index-v1")
+        index, admission = _current_plan_index(plan_index_ref)
         plan_signatures = {
             descriptor["scope_id"]: descriptor["plan_signature"]
             for descriptor in (
@@ -5146,52 +5288,21 @@ def record_health_metrics(
         }
     else:
         dag_id, run_id, _ = _run_identity(context)
-        admission = _optional_payload(
-            _join_uri(
-                _artifact_root(),
-                "runs",
-                _run_key(dag_id, run_id),
-                "admission.json",
-            ),
+        admission_uri = _join_uri(
+            _artifact_root(),
+            "runs",
+            _run_key(dag_id, run_id),
+            "admission.json",
         )
-        if admission is not None:
-            admission = _admission_payload(admission)
-        index = (
-            None
-            if admission is None
-            else {
-                "dag_id": admission["dag_id"],
-                "run_id": admission["run_id"],
-                "scope_ids": admission["scope_ids"],
-                "registry_signature": admission["registry_signature"],
-            }
-        )
-        if admission is not None:
-            fallback_identity = _ref_for_uri(
-                _join_uri(
-                    _artifact_root(),
-                    "runs",
-                    _run_key(observer_dag_id, observer_run_id),
-                    "admission.json",
-                )
-            )["sha256"]
+        try:
+            admission_ref = _ref_for_uri(admission_uri)
+        except FileNotFoundError:
+            admission_ref = None
+        if admission_ref is not None:
+            admission = _read_admission_ref(admission_ref)
+            fallback_identity = admission_ref["sha256"]
+        index = None
     if index is not None:
-        store = PostgresEspnControlStore.from_env()
-        store.migrate()
-        scope_ids = tuple(index["scope_ids"])
-        if scope_ids != tuple(sorted(set(scope_ids))):
-            raise OperationsError("health scope set must be sorted and unique")
-        heads = store.read_scope_heads(scope_ids)
-        latest_daily_evidence = _latest_daily_evidence_or_empty(store, scope_ids)
-        admission_ref = _ref_for_uri(
-            _join_uri(
-                _artifact_root(),
-                "runs",
-                _run_key(verdict["dag_id"], verdict["run_id"]),
-                "admission.json",
-            )
-        )
-        admission = _read_admission_ref(admission_ref)
         if (
             admission["dag_id"],
             admission["run_id"],
@@ -5202,10 +5313,17 @@ def record_health_metrics(
             verdict["dag_id"],
             verdict["run_id"],
             verdict["attempt"],
-            list(scope_ids),
+            index["scope_ids"],
             index["registry_signature"],
         ):
             raise OperationsError("health admission identity mismatch")
+        store = PostgresEspnControlStore.from_env()
+        store.migrate()
+        scope_ids = tuple(index["scope_ids"])
+        if scope_ids != tuple(sorted(set(scope_ids))):
+            raise OperationsError("health scope set must be sorted and unique")
+        heads = store.read_scope_heads(scope_ids)
+        latest_daily_evidence = _latest_daily_evidence_or_empty(store, scope_ids)
         registry_ref = _exact_artifact_ref(
             admission["registry_ref"], label="health registry reference"
         )
@@ -5316,7 +5434,7 @@ def record_health_metrics(
                     "unpromoted_current_season": False,
                     "unresolved_discovery_diffs": False,
                 },
-                observed_at=PostgresEspnControlStore.from_env().current_time(),
+                observed_at=datetime.now(UTC),
             )
         )
     health = {
@@ -5348,22 +5466,38 @@ def release_scope_leases(
 ) -> dict[str, Any]:
     """Release only the exact acquired owner/epoch/token identities."""
 
-    store = PostgresEspnControlStore.from_env()
-    if hasattr(store, "migrate"):
-        store.migrate()
     dag_id, run_id, _ = _run_identity(context)
     owner_id = f"{dag_id}/{run_id}/{_attempt(context)}"
     acquisition = None
     if lease_acquisition_ref is not None:
         acquisition = _read_ref(lease_acquisition_ref)
-        if acquisition.get("kind") not in {
-            "espn-lease-acquisition-v1",
-            "espn-lease-acquisition-v2",
-            "espn-bound-lease-bundle-v1",
-        }:
-            raise OperationsError("lease cleanup artifact kind is invalid")
-        if acquisition["owner_id"] != owner_id:
+        if acquisition.get("kind") != "espn-lease-acquisition-v2" or not isinstance(
+            acquisition.get("admission_ref"), Mapping
+        ):
+            raise OperationsError(
+                "current runtime rejects pre-v3 lease acquisition; exact historical "
+                "replay requires pinned e12b85a"
+            )
+        admission = _read_admission_ref(acquisition["admission_ref"])
+        if (
+            acquisition["owner_id"],
+            acquisition.get("admission_signature"),
+            acquisition.get("scope_ids"),
+            admission["dag_id"],
+            admission["run_id"],
+            admission["attempt"],
+        ) != (
+            owner_id,
+            acquisition["admission_ref"]["sha256"],
+            admission["scope_ids"],
+            dag_id,
+            run_id,
+            _attempt(context),
+        ):
             raise OperationsError("lease cleanup owner identity mismatch")
+        store = PostgresEspnControlStore.from_env()
+        if hasattr(store, "migrate"):
+            store.migrate()
         if "leases" in acquisition:
             issued_leases = tuple(
                 _lease_from_dict(item) for item in acquisition["leases"]
@@ -5372,25 +5506,24 @@ def release_scope_leases(
                 acquisition["scope_ids"]
             ):
                 raise OperationsError("lease cleanup exact scope set mismatch")
-            if acquisition["kind"] == "espn-lease-acquisition-v2":
-                current_by_scope = {
-                    item.scope_id: item for item in store.read_owner_leases(owner_id)
-                }
-                leases = tuple(
-                    current_by_scope.get(issued.scope_id)
-                    if current_by_scope.get(issued.scope_id) is not None
-                    and current_by_scope[issued.scope_id].epoch == issued.epoch
-                    else issued
-                    for issued in issued_leases
-                )
-            else:
-                leases = issued_leases
+            current_by_scope = {
+                item.scope_id: item for item in store.read_owner_leases(owner_id)
+            }
+            leases = tuple(
+                current_by_scope.get(issued.scope_id)
+                if current_by_scope.get(issued.scope_id) is not None
+                and current_by_scope[issued.scope_id].epoch == issued.epoch
+                else issued
+                for issued in issued_leases
+            )
         else:
             leases = store.read_owner_leases(owner_id)
             if {item.scope_id for item in leases} != set(acquisition["scope_ids"]):
                 raise OperationsError("current owner leases differ from acquisition")
     else:
-        leases = store.read_owner_leases(owner_id)
+        raise OperationsError(
+            "current runtime requires a v3-bound lease acquisition before cleanup"
+        )
     released = []
     failures = []
     for lease in leases:
@@ -5453,7 +5586,9 @@ def propagate_terminal_failure(
     admission_ref = _ref_for_uri(_join_uri(root, "admission.json"))
     admission = _read_admission_ref(admission_ref)
     plan_index_ref = _ref_for_uri(_join_uri(root, "plan-index.json"))
-    index = _read_ref(plan_index_ref, kind="espn-plan-index-v1")
+    index, indexed_admission = _current_plan_index(plan_index_ref)
+    if indexed_admission != admission:
+        raise OperationsError("receipt plan index admission identity drift")
     durable_ref = _ref_for_uri(_join_uri(root, "durable-run-manifest.json"))
     durable = _read_ref(durable_ref, kind="espn-durable-run-manifest-v1")
     health_ref = _ref_for_uri(_join_uri(root, "health.json"))
