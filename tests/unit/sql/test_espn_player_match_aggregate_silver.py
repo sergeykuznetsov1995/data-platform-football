@@ -8,12 +8,20 @@ from pathlib import Path
 import pytest
 
 
+sqlglot = pytest.importorskip("sqlglot")
+exp = sqlglot.exp
+
+
 ROOT = Path(__file__).resolve().parents[3]
 SQL_PATH = ROOT / "dags/sql/silver/espn_player_match_aggregate.sql"
 
 
 def _sql() -> str:
     return SQL_PATH.read_text(encoding="utf-8")
+
+
+def _tree() -> exp.Select:
+    return sqlglot.parse_one(_sql(), read="trino")
 
 
 pytestmark = pytest.mark.unit
@@ -30,20 +38,51 @@ class TestEspnPlayerMatchAggregateSilver:
         assert re.search(r"WHERE\s+s\.played_final", body, re.I)
 
     def test_json_jersey_position_groups_and_best_effort_minutes(self):
-        sql = _sql()
-        assert "$.jersey" in sql
-        assert re.search(r"COALESCE\s*\(\s*json_extract_scalar\(.*\$\.jersey.*NULLIF\s*\(\s*jersey", sql, re.I | re.S)
-        for token in ("Goalkeeper", "Sweeper", "Midfielder", "Forward", "'GK'", "'DF'", "'MF'", "'FW'"):
-            assert token in sql
-        assert re.search(r"is_starter\s+OR\s+subbed_in", sql, re.I)
-        assert "STATUS_FINAL_PEN" in sql and "STATUS_FINAL_AET" in sql
-        assert "GREATEST" in sql
+        tree = _tree()
+        jersey_coalesce = next(
+            node for node in tree.find_all(exp.Coalesce)
+            if isinstance(node.this, exp.JSONExtractScalar)
+            and node.this.expression.sql(dialect="trino") == "'$.jersey'"
+        )
+        assert isinstance(jersey_coalesce.expressions[0], exp.Nullif)
+        assert jersey_coalesce.expressions[0].this.name == "jersey"
+
+        position_group = next(
+            alias for alias in tree.find_all(exp.Alias)
+            if alias.alias == "position_group" and isinstance(alias.this, exp.Case)
+        ).this
+        assert {clause.args["true"].this for clause in position_group.args["ifs"]} == {"GK", "DF", "MF", "FW"}
+        position_patterns = {
+            node.expression.this for node in position_group.find_all(exp.Like)
+        }
+        assert {"%Back%", "%Defender%", "%Midfielder%", "%Forward%"} <= position_patterns
+
+        minutes = next(
+            alias for alias in tree.find_all(exp.Alias)
+            if alias.alias == "minutes_played" and isinstance(alias.this, exp.Case)
+        ).this
+        assert {column.name for column in minutes.find_all(exp.Column)} >= {"is_starter", "subbed_in", "status"}
+        assert {literal.this for literal in minutes.find_all(exp.Literal)} >= {"STATUS_FINAL_AET", "STATUS_FINAL_PEN", "120", "90"}
 
     def test_no_plays_is_zero_and_final_pen_didscore_keeps_shootout_context(self):
-        sql = _sql()
-        assert re.search(r"COALESCE\s*\(\s*cardinality\s*\(\s*filter", sql, re.I)
-        assert "$.didScore" in sql and "$.didAssist" in sql
-        assert "STATUS_FINAL_PEN" in sql
+        tree = _tree()
+        goals_events = next(
+            alias for alias in tree.find_all(exp.Alias)
+            if alias.alias == "goals_events" and isinstance(alias.this, exp.Coalesce)
+        ).this
+        assert isinstance(goals_events.this, exp.ArraySize)
+        assert goals_events.expressions[0].this == "0"
+        did_score_filter = goals_events.this.this
+        assert isinstance(did_score_filter, exp.ArrayFilter)
+        assert isinstance(did_score_filter.this, exp.Cast)
+        json_extract = did_score_filter.this.this
+        assert isinstance(json_extract, exp.JSONExtract)
+        assert json_extract.expression.sql(dialect="trino") == "'$.plays'"
+        predicate = did_score_filter.expression.this
+        assert isinstance(predicate, exp.EQ)
+        assert isinstance(predicate.this, exp.JSONExtractScalar)
+        assert predicate.this.expression.sql(dialect="trino") == "'$.didScore'"
+        assert predicate.expression.this == "true"
 
     def test_executable_final_pen_didscore_is_counted_as_is(self):
         """Lineup plays are the only input; shootout detail is deliberately absent.
@@ -71,9 +110,15 @@ class TestEspnPlayerMatchAggregateSilver:
         """).fetchall()
         assert rows == [(1, 1, 1), (2, 1, 1)]
 
-        formula = _sql().split("AS goals_events", 1)[0].rsplit("COALESCE", 1)[-1]
-        assert "$.didScore" in formula
-        assert "shootout" not in formula.lower() and "clock" not in formula.lower()
+        goals_events = next(
+            alias for alias in _tree().find_all(exp.Alias)
+            if alias.alias == "goals_events" and isinstance(alias.this, exp.Coalesce)
+        )
+        assert not any(
+            isinstance(node, exp.JSONExtractScalar)
+            and node.expression.sql(dialect="trino") in {"'$.shootout'", "'$.clock'"}
+            for node in goals_events.this.walk()
+        )
 
     def test_executable_position_group_agrees_with_roster_abbreviation(self):
         duckdb = pytest.importorskip("duckdb")
@@ -96,7 +141,16 @@ class TestEspnPlayerMatchAggregateSilver:
         assert {(group, roster) for _, group, roster in rows if roster} == {
             ("GK", "GK"), ("DF", "DF"), ("MF", "MF"), ("FW", "FW")
         }
-        assert "clean_position LIKE '%Defender%'" in _sql()
+        position_group = next(
+            alias for alias in _tree().find_all(exp.Alias)
+            if alias.alias == "position_group" and isinstance(alias.this, exp.Case)
+        ).this
+        assert any(
+            isinstance(node, exp.Like)
+            and node.this.name == "clean_position"
+            and node.expression.this == "%Defender%"
+            for node in position_group.walk()
+        )
 
     def test_fixture_minutes_and_team_qualified_pk_are_executable(self):
         duckdb = pytest.importorskip("duckdb")

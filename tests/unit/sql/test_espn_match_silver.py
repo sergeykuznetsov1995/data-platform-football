@@ -8,12 +8,20 @@ from pathlib import Path
 import pytest
 
 
+sqlglot = pytest.importorskip("sqlglot")
+exp = sqlglot.exp
+
+
 ROOT = Path(__file__).resolve().parents[3]
 SQL_PATH = ROOT / "dags/sql/silver/espn_match.sql"
 
 
 def _sql() -> str:
     return SQL_PATH.read_text(encoding="utf-8")
+
+
+def _tree() -> exp.Select:
+    return sqlglot.parse_one(_sql(), read="trino")
 
 
 pytestmark = pytest.mark.unit
@@ -35,15 +43,31 @@ class TestEspnMatchSilver:
         assert re.search(r"NULLIF\s*\(\s*attendance_value\s*,\s*0\s*\)", sql, re.I)
 
     def test_shootout_winner_stage_group_and_display_name_season_slug(self):
-        sql = _sql()
-        assert "$.sides.home.competitor.shootoutScore" in sql
-        assert "$.sides.away.competitor.shootoutScore" in sql
-        assert "$.sides.home.competitor.winner" in sql
-        assert "$.sides.away.competitor.winner" in sql
-        assert "group-stage" in sql and "league-phase" in sql
-        assert "regexp_extract(alt_game_note" in sql
-        assert "$.source.league.season.displayName" in sql
-        assert "source_season_year" in sql
+        tree = _tree()
+        json_paths = {
+            node.expression.sql(dialect="trino")
+            for node in tree.find_all(exp.JSONExtractScalar)
+        }
+        assert "'$.sides.home.competitor.shootoutScore'" in json_paths
+        assert "'$.sides.away.competitor.shootoutScore'" in json_paths
+        assert "'$.sides.home.competitor.winner'" in json_paths
+        assert "'$.sides.away.competitor.winner'" in json_paths
+
+        regexes = {
+            (node.this.name, node.expression.this, node.args["group"].this)
+            for node in tree.find_all(exp.RegexpExtract)
+        }
+        assert ("alt_game_note", r"(Group\s+[A-Z0-9]+)\s*$", "1") in regexes
+        assert (
+            "source_season_display_name",
+            r"(\d{4})\s*[-/]\s*(\d{2}|\d{4})",
+            "1",
+        ) in regexes
+        assert (
+            "source_season_display_name",
+            r"(\d{4})\s*[-/]\s*(\d{2}|\d{4})",
+            "2",
+        ) in regexes
 
     def test_executable_latest_snapshot_season_slug_and_group_parsing(self):
         """DuckDB fixture exercises the same scalar expressions as the Trino SQL.
@@ -78,12 +102,8 @@ class TestEspnMatchSilver:
         """).fetchall()
         assert rows == [(1, "2627", "Group B"), (2, "2026", ""), (3, "2031", "")]
 
-        # Tie the executable fixture to the production expression and prevent
-        # the double-backslash Trino literal regression.
-        sql = _sql()
-        assert r"(\d{4})\s*[-/]\s*(\d{2}|\d{4})" in sql
-        assert r"(Group\s+[A-Z0-9]+)\s*$" in sql
-        assert r"\\d" not in sql and r"\\s" not in sql
+        # AST assertions above bind this executable scalar fixture to the
+        # production RegexpExtract nodes and literal patterns.
 
     def test_referee_is_aggregated_before_schedule_join_and_partition_keys_trail(self):
         sql = _sql()

@@ -8,12 +8,20 @@ from pathlib import Path
 import pytest
 
 
+sqlglot = pytest.importorskip("sqlglot")
+exp = sqlglot.exp
+
+
 ROOT = Path(__file__).resolve().parents[3]
 SQL_PATH = ROOT / "dags/sql/silver/espn_team_match.sql"
 
 
 def _sql() -> str:
     return SQL_PATH.read_text(encoding="utf-8")
+
+
+def _tree() -> exp.Select:
+    return sqlglot.parse_one(_sql(), read="trino")
 
 
 pytestmark = pytest.mark.unit
@@ -89,6 +97,32 @@ class TestEspnTeamMatchSilver:
         """).fetchall()
         assert rows == [(1, 10, 3, 4), (1, 20, 4, 3), (2, 30, 5, 6), (2, 40, 6, 5)]
 
-        sql = _sql()
-        assert "LEFT JOIN matchsheet_dedup opponent" in sql
-        assert re.search(r"COALESCE\s*\(\s*opponent\.score", sql, re.I)
+        tree = _tree()
+        opponent_join = next(
+            join
+            for join in tree.find_all(exp.Join)
+            if isinstance(join.this, exp.Table)
+            and join.this.name == "matchsheet_dedup"
+            and join.this.alias == "opponent"
+        )
+        assert isinstance(opponent_join.args["on"], exp.And)
+        join_columns = {(column.table, column.name) for column in opponent_join.args["on"].find_all(exp.Column)}
+        assert {
+            ("opponent", "event_id"),
+            ("opponent", "team_id"),
+            ("m", "event_id"),
+            ("s", "home_team_id"),
+            ("s", "away_team_id"),
+        } <= join_columns
+        assert any(isinstance(node, exp.Case) for node in opponent_join.args["on"].walk())
+
+        opponent_score = next(
+            alias
+            for alias in tree.find_all(exp.Alias)
+            if alias.alias == "goals_against"
+            and isinstance(alias.this, exp.Coalesce)
+            and isinstance(alias.this.this, exp.Column)
+            and alias.this.this.table == "opponent"
+        )
+        assert opponent_score.this.this.name == "score"
+        assert isinstance(opponent_score.this.expressions[0], exp.Case)
