@@ -4792,6 +4792,28 @@ def test_ninety_five_percent_warm_success_needs_no_warning(tmp_path):
     assert "warnings" not in result
 
 
+@pytest.mark.parametrize(
+    ("metric", "value"),
+    [("requests_reserved", 1), ("bytes_reserved", 1)],
+)
+def test_clean_productive_run_hard_fails_open_reservations(
+    tmp_path, metric, value
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = _ordinary_validation_summary(
+        control,
+        warm_http_successes=20,
+        warm_http_success_rate=1.0,
+    )
+    summary[metric] = value
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(RunValidationError, match=rf"{metric}={value}"):
+        pipeline.validate_and_finish(str(uuid.uuid4()))
+
+
 def test_partial_warm_success_with_unresolved_claim_is_hard(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
@@ -4849,6 +4871,43 @@ def test_claimed_work_without_durable_progress_is_a_hard_failure(tmp_path):
 
     with pytest.raises(RunValidationError, match="no_durable_progress"):
         pipeline.validate_and_finish(str(uuid.uuid4()))
+
+
+def test_failed_cohort_without_network_still_has_no_durable_progress(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = _ordinary_validation_summary(
+        control,
+        network_attempts=0,
+        warm_http_successes=0,
+        warm_http_success_rate=None,
+    )
+    summary["target_counts"] = {"failed": 1}
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(RunValidationError, match="no_durable_progress"):
+        pipeline.validate_and_finish(str(uuid.uuid4()))
+
+
+def test_truly_empty_zero_network_run_is_valid_no_work(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = _ordinary_validation_summary(
+        control,
+        network_attempts=0,
+        warm_http_successes=0,
+        warm_http_success_rate=None,
+    )
+    summary["target_counts"] = {}
+    summary["dataset_validation_counts"] = {}
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    result = pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:True" in control.events
+    assert "warnings" not in result
 
 
 def test_any_unclassified_failure_remains_hard(tmp_path):
@@ -6494,15 +6553,24 @@ def test_live_runner_reuses_one_fetch_session_and_parses_after_each_raw_batch(
     assert result.parse.parsed == 1
 
 
-@pytest.mark.parametrize("invalid", [0, 81])
-def test_live_runner_accepts_only_one_to_eighty_batches(tmp_path, invalid):
+@pytest.mark.parametrize("invalid", [False, True, 0, 81, 1.5, "1.5"])
+def test_live_runner_accepts_only_strict_one_to_eighty_batches(
+    tmp_path, invalid
+):
     pipeline = FBrefPipeline(
         FakeControl(_raw_store(tmp_path)),
         _raw_store(tmp_path),
         generic_writer=FakeWriter(),
     )
+    side_effects = []
+    pipeline.control.get_run = lambda *_args, **_kwargs: side_effects.append(
+        "get_run"
+    )
 
-    with pytest.raises(ValueError, match="between 1 and 80"):
+    with pytest.raises(
+        ValueError,
+        match=r"max_batches must be (?:an integer|between 1 and 80)",
+    ):
         pipeline.run_live_waves(
             str(uuid.uuid4()),
             worker_id="current-live",
@@ -6510,6 +6578,28 @@ def test_live_runner_accepts_only_one_to_eighty_batches(tmp_path, invalid):
             settings=_settings(),
             max_batches=invalid,
         )
+    assert side_effects == []
+
+
+@pytest.mark.parametrize("max_batches", [1, 80, "1", "80"])
+def test_live_runner_accepts_int_and_templated_int_string(
+    tmp_path, max_batches
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    pipeline.fetch_wave = lambda *_args, **_kwargs: WaveResult()
+    pipeline.parse_wave = lambda *_args, **_kwargs: WaveResult()
+
+    result = pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="current-live",
+        page_kinds=["match"],
+        settings=_settings(),
+        max_batches=max_batches,
+    )
+
+    assert result.batches == 1
 
 
 def test_productive_refreshes_do_not_accumulate_into_session_exhaustion(

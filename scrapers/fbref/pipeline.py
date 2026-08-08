@@ -165,6 +165,20 @@ def _bounded_int(
     return value
 
 
+def _normalize_live_batch_count(value: object) -> int:
+    """Accept only an integer or a templated decimal integer string."""
+
+    if type(value) is int:
+        normalized = value
+    elif isinstance(value, str) and value.strip().isdecimal():
+        normalized = int(value.strip())
+    else:
+        raise ValueError("max_batches must be an integer")
+    if not 1 <= normalized <= 80:
+        raise ValueError("max_batches must be between 1 and 80")
+    return normalized
+
+
 FBREF_BATCH_PERSIST = os.environ.get("FBREF_BATCH_PERSIST", "0") == "1"
 FBREF_BATCH_PERSIST_MATCHES = _bounded_int(
     "FBREF_BATCH_PERSIST_MATCHES", default=8, lower=2, upper=25
@@ -2760,9 +2774,7 @@ class FBrefPipeline:
 
         if settings.run_type == "replay":
             raise PipelineError("Replay mode cannot execute live waves")
-        normalized_batches = int(max_batches)
-        if not 1 <= normalized_batches <= 80:
-            raise ValueError("max_batches must be between 1 and 80")
+        normalized_batches = _normalize_live_batch_count(max_batches)
 
         run = self.control.get_run(run_id)
         if run is not None and str(run.get("status") or "") == "failed":
@@ -4598,6 +4610,7 @@ class FBrefPipeline:
         warm_successes = int(traffic.get("warm_http_successes") or 0)
         success_rate = traffic.get("warm_http_success_rate")
         durable_progress = int(target_counts.get("succeeded") or 0)
+        cohort_work = sum(int(count or 0) for count in target_counts.values())
         unresolved_claims = bool(incomplete) or any(
             int(summary.get(metric) or 0) != 0
             for metric in ("requests_reserved", "bytes_reserved")
@@ -4700,6 +4713,12 @@ class FBrefPipeline:
                 )
         if bool(summary.get("budget_exceeded")):
             errors.append("budget_exceeded=true")
+        for reservation_metric in ("requests_reserved", "bytes_reserved"):
+            reservation_value = int(summary.get(reservation_metric) or 0)
+            if reservation_value != 0:
+                errors.append(
+                    f"{reservation_metric}={reservation_value}"
+                )
         if int(summary.get("requests_used") or 0) > int(
             summary.get("request_limit") or 0
         ):
@@ -4733,7 +4752,10 @@ class FBrefPipeline:
                         "partial_warm_http_success_without_recoverable_progress="
                         f"{float(success_rate):.4f}"
                     )
-            if network_attempts > 0 and durable_progress <= 0:
+            if (
+                durable_progress <= 0
+                and (network_attempts > 0 or cohort_work > 0)
+            ):
                 errors.append("no_durable_progress_after_claimed_work")
         if int(traffic.get("unclassified_failures") or 0) != 0:
             errors.append(

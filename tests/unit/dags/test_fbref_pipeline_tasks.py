@@ -75,28 +75,6 @@ def test_runtime_limits_allow_only_hard_production_canary_and_replay_profiles():
             byte_limit_mb=50,
             shard_size=25,
         )
-
-
-@pytest.mark.unit
-def test_live_wave_limits_allow_exactly_eighty_batches():
-    assert fbref_pipeline_tasks.FBREF_MAX_LIVE_BATCHES == 80
-    assert fbref_pipeline_tasks.LIVE_WAVES_TIMEOUT_SECONDS == 6 * 60 * 60
-    assert fbref_pipeline_tasks.FBREF_SCRAPER_POOL == "fbref_scraper_pool"
-    assert fbref_pipeline_tasks.FBREF_MAX_LIVE_BATCHES * 25 == 2_000
-
-    for invalid in (0, 81):
-        with pytest.raises(ValueError, match="between 1 and 80"):
-            fbref_pipeline_tasks.run_fbref_live_waves(
-                airflow_run_id="manual__invalid_batches",
-                dag_id="dag_ingest_fbref",
-                worker_id="current-live",
-                page_kinds=["match"],
-                run_type="current",
-                request_limit=200,
-                byte_limit_mb=100,
-                shard_size=25,
-                max_batches=invalid,
-            )
     with pytest.raises(ValueError, match="between 1 and 25"):
         fbref_pipeline_tasks.validate_fbref_runtime_limits(
             run_type="current",
@@ -111,6 +89,85 @@ def test_live_wave_limits_allow_exactly_eighty_batches():
             byte_limit_mb=100,
             shard_size=25,
         )
+
+
+@pytest.mark.unit
+def test_live_wave_limits_allow_exactly_eighty_batches(monkeypatch):
+    assert fbref_pipeline_tasks.FBREF_MAX_LIVE_BATCHES == 80
+    assert fbref_pipeline_tasks.LIVE_WAVES_TIMEOUT_SECONDS == 6 * 60 * 60
+    assert fbref_pipeline_tasks.FBREF_SCRAPER_POOL == "fbref_scraper_pool"
+    assert fbref_pipeline_tasks.FBREF_MAX_LIVE_BATCHES * 25 == 2_000
+    spawn = MagicMock()
+    interpreter = MagicMock(return_value=sys.executable)
+    monkeypatch.setattr(fbref_pipeline_tasks.subprocess, "Popen", spawn)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_legacy_scraper_python", interpreter
+    )
+
+    for invalid in (False, True, 0, 81, 1.5, "1.5"):
+        with pytest.raises(
+            ValueError,
+            match=r"max_batches must be (?:an integer|between 1 and 80)",
+        ):
+            fbref_pipeline_tasks.run_fbref_live_waves(
+                airflow_run_id="manual__invalid_batches",
+                dag_id="dag_ingest_fbref",
+                worker_id="current-live",
+                page_kinds=["match"],
+                run_type="current",
+                request_limit=200,
+                byte_limit_mb=100,
+                shard_size=25,
+                max_batches=invalid,
+            )
+    interpreter.assert_not_called()
+    spawn.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("max_batches", [1, 80, "1", "80"])
+def test_live_wave_wrapper_accepts_int_and_templated_int_string(
+    monkeypatch, max_batches
+):
+    captured = {}
+
+    class Process:
+        pid = 1234
+        returncode = 0
+
+        def communicate(self, *, timeout=None):
+            return (
+                'FBREF_LIVE_WAVES_RESULT:{"batches": 1, '
+                '"frontier_closed": true}\n',
+                "",
+            )
+
+    def popen(command, **_kwargs):
+        captured["command"] = command
+        return Process()
+
+    monkeypatch.setattr(fbref_pipeline_tasks.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        fbref_pipeline_tasks,
+        "_process_group_exists",
+        lambda _process_group_id: False,
+    )
+
+    fbref_pipeline_tasks.run_fbref_live_waves(
+        airflow_run_id="manual__valid_batches",
+        dag_id="dag_ingest_fbref",
+        worker_id="current-live",
+        page_kinds=["match"],
+        run_type="current",
+        request_limit=200,
+        byte_limit_mb=100,
+        shard_size=25,
+        max_batches=max_batches,
+    )
+
+    assert captured["command"][
+        captured["command"].index("--max-batches") + 1
+    ] == str(int(max_batches))
 
 
 @pytest.mark.unit

@@ -126,6 +126,22 @@ FBREF_LIVE_BUDGET_PROFILES = {
 }
 
 
+def _normalize_live_batch_count(value: object) -> int:
+    """Accept only an integer or a templated decimal integer string."""
+
+    if type(value) is int:
+        normalized = value
+    elif isinstance(value, str) and value.strip().isdecimal():
+        normalized = int(value.strip())
+    else:
+        raise ValueError("max_batches must be an integer")
+    if not 1 <= normalized <= FBREF_MAX_LIVE_BATCHES:
+        raise ValueError(
+            f"max_batches must be between 1 and {FBREF_MAX_LIVE_BATCHES}"
+        )
+    return normalized
+
+
 def _legacy_scraper_python() -> str:
     """Return the explicit isolated browser runner or fail before claiming work."""
 
@@ -1781,11 +1797,7 @@ def run_fbref_live_waves(
         byte_limit_mb=byte_limit_mb,
         shard_size=shard_size,
     )
-    normalized_batches = int(max_batches)
-    if not 1 <= normalized_batches <= FBREF_MAX_LIVE_BATCHES:
-        raise ValueError(
-            f"max_batches must be between 1 and {FBREF_MAX_LIVE_BATCHES}"
-        )
+    normalized_batches = _normalize_live_batch_count(max_batches)
     command = [
         _legacy_scraper_python(),
         LIVE_WAVES_RUNNER,
