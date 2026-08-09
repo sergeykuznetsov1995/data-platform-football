@@ -16,6 +16,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from utils.silver_tasks import (
+    _load_transform_select_sql,
     _resolve_sql_path,
     check_bronze_table_exists,
     run_silver_transform,
@@ -231,11 +232,7 @@ def run_gold_partition_insert_wrapped(
 
     # Read SELECT body
     sql_path = _resolve_sql_path(sql_file)
-    select_sql = sql_path.read_text(encoding='utf-8').strip()
-    if not select_sql:
-        raise ValueError(f"SQL file is empty: {sql_path}")
-    if select_sql.endswith(';'):
-        select_sql = select_sql[:-1].rstrip()
+    select_sql = _load_transform_select_sql(str(sql_path))
 
     result: Dict[str, Any] = {
         'table': full_table,

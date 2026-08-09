@@ -1,0 +1,7 @@
+# ESPN rollout observer v1. UTC :10 samples the [13:50,14:15) arm window
+# without colliding with the daily owner at :00 or the platform journal at :05.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CRON_TZ=UTC
+
+10 * * * * root /root/.venvs/dpf-test/bin/python -B /root/watchdog/espn_watchdog_adapter_v1.py --release-root /root/watchdog/releases/espn-release-c2225657d354ee2a21f8c2e22daf5e233a25a3c0 --observer hourly --format lines

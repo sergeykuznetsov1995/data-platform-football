@@ -4,7 +4,7 @@
 -- Grain/PK: one row per ESPN event_id. Native v2 schedule is append-only and is
 -- deduplicated before any JSON parsing; matchsheet is joined only through the
 -- per-event referee aggregate, so it cannot fan out a match.
--- Sources (native v2): schedule event rows (event_id bigint, status varchar,
+-- Sources (native v2): compact6 canonical schedule event rows (event_id bigint, status varchar,
 -- played_final boolean, score integers, extra_json varchar); matchsheet team rows
 -- (event_id/team_id bigint, referee varchar, extra_json varchar).
 -- Notes: schedule supplies the match grain and all partition keys; matchsheet is
@@ -15,9 +15,21 @@
 -- DAG integration: run_silver_transform wraps this pure SELECT in CTAS.
 -- =============================================================================
 
-WITH bronze_src_schedule AS (
-    SELECT *
-    FROM iceberg.bronze.espn_schedule_generation_v2
+WITH espn_downstream_scope (
+    scope_id, espn_id, source_season_year, platform_league,
+    platform_season_slug, convention, effective_start_date, effective_end_date
+) AS (VALUES
+__ESPN_DOWNSTREAM_SCOPE_VALUES__
+),
+
+bronze_src_schedule AS (
+    SELECT
+        es_source.*,
+        espn_scope.platform_league AS platform_league,
+        espn_scope.platform_season_slug AS platform_season_slug
+    FROM iceberg.bronze.espn_schedule AS es_source
+    JOIN espn_downstream_scope espn_scope ON
+__ESPN_DOWNSTREAM_SCOPE_FILTER__
 ),
 
 schedule_dedup AS (
@@ -32,8 +44,10 @@ schedule_dedup AS (
 ),
 
 bronze_src_matchsheet AS (
-    SELECT *
-    FROM iceberg.bronze.espn_matchsheet_generation_v2
+    SELECT es_source.*
+    FROM iceberg.bronze.espn_matchsheet AS es_source
+    JOIN espn_downstream_scope espn_scope ON
+__ESPN_DOWNSTREAM_SCOPE_FILTER__
 ),
 
 matchsheet_dedup AS (
@@ -168,7 +182,7 @@ SELECT
     m._ingested_at AS _bronze_ingested_at,
 
     -- ===== Partition keys =====
-    competition_slug AS league,
-    CAST(source_season_year AS varchar) AS season
+    m.platform_league AS league,
+    m.platform_season_slug AS season
 FROM match_modeled m
 LEFT JOIN referee_by_event r ON r.event_id = m.event_id

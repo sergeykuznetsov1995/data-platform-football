@@ -16,6 +16,13 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _explicit_legacy_espn_layout(monkeypatch):
+    """Existing maintenance tests exercise the pre-cutover physical layout."""
+
+    monkeypatch.setenv("ESPN_BRONZE_LAYOUT_MODE", "legacy14")
+
+
 @pytest.mark.unit
 class TestHighChurnBronzeAllowlist:
     """Verify the daily-VACUUM allowlist contains every known
@@ -396,6 +403,198 @@ def _candidate_probe_result(maintenance, table: str, *, skipped: int = 0):
         ),
         skipped,
     )
+
+
+@pytest.mark.unit
+class TestEspnLayoutMaintenanceBoundary:
+    CANONICAL = ("espn_schedule", "espn_lineup", "espn_matchsheet")
+
+    def test_compact6_canonical_views_never_reach_alter_paths(
+        self, monkeypatch
+    ):
+        from scrapers.espn import layout
+        import utils.maintenance_tasks as maintenance
+
+        monkeypatch.setenv("ESPN_BRONZE_LAYOUT_MODE", "compact6")
+        conn = _MetadataConnection(
+            [
+                *[("bronze", name, "VIEW") for name in layout.LEGACY_TABLES],
+                *[
+                    ("espn_internal", name, "BASE TABLE")
+                    for name in layout.GENERATION_TABLES
+                ],
+            ]
+        )
+        monkeypatch.setattr(maintenance, "_connect", lambda: conn)
+        bronze_tables = [
+            *self.CANONICAL,
+            "espn_ingest_manifest_v2",
+            "unrelated_bronze_table",
+        ]
+        internal_tables = [*layout.GENERATION_TABLES, *layout.CURRENT_VIEWS]
+        monkeypatch.setattr(
+            maintenance,
+            "_list_tables",
+            lambda _conn, schema: (
+                bronze_tables if schema == "bronze" else internal_tables
+            ),
+        )
+
+        probed: list[str] = []
+        retained: list[str] = []
+
+        def _probe(_conn, *, table, **_kwargs):
+            probed.append(table)
+            return maintenance._CompactionProbeResult((), 0)
+
+        def _retain(_conn, fq, _retention):
+            retained.append(fq)
+            return {}
+
+        monkeypatch.setattr(maintenance, "_compaction_candidates", _probe)
+        monkeypatch.setattr(maintenance, "_maintain_one", _retain)
+
+        result = maintenance.maintain_iceberg_tables(
+            schemas=("bronze",),
+            table_filter=set(bronze_tables),
+            compact_live_files=True,
+            compaction_rotation=0,
+        )
+
+        expected_probed = [
+            "espn_ingest_manifest_v2",
+            "unrelated_bronze_table",
+            *layout.GENERATION_TABLES,
+        ]
+        assert probed == expected_probed
+        assert retained == [
+            'iceberg."bronze"."espn_ingest_manifest_v2"',
+            'iceberg."bronze"."unrelated_bronze_table"',
+            *[
+                f'iceberg."espn_internal"."{table}"'
+                for table in layout.GENERATION_TABLES
+            ],
+        ]
+        assert result["tables_processed"] == len(expected_probed)
+        assert not any(
+            f'"{view}"' in fq
+            for fq in retained
+            for view in (*self.CANONICAL, *layout.CURRENT_VIEWS)
+        )
+
+    def test_compact6_catalog_kind_drift_fails_before_enumeration(
+        self, monkeypatch
+    ):
+        from scrapers.espn import layout
+        import utils.maintenance_tasks as maintenance
+
+        monkeypatch.setenv("ESPN_BRONZE_LAYOUT_MODE", "compact6")
+        conn = _MetadataConnection(
+            [
+                *[
+                    (
+                        "bronze",
+                        name,
+                        "BASE TABLE" if name == "espn_schedule" else "VIEW",
+                    )
+                    for name in layout.LEGACY_TABLES
+                ],
+                *[
+                    ("espn_internal", name, "BASE TABLE")
+                    for name in layout.GENERATION_TABLES
+                ],
+            ]
+        )
+        monkeypatch.setattr(maintenance, "_connect", lambda: conn)
+        monkeypatch.setattr(
+            maintenance,
+            "_list_tables",
+            lambda *_args: pytest.fail("kind drift must fail before enumeration"),
+        )
+
+        with pytest.raises(layout.LayoutError, match="wrong_kind"):
+            maintenance.maintain_iceberg_tables(
+                schemas=("bronze",),
+                table_filter={"espn_schedule"},
+            )
+
+        assert conn.closed is True
+
+    def test_legacy14_physical_canonical_table_still_receives_maintenance(
+        self, monkeypatch
+    ):
+        import utils.maintenance_tasks as maintenance
+
+        conn = _MetadataConnection()
+        monkeypatch.setattr(maintenance, "_connect", lambda: conn)
+        monkeypatch.setattr(
+            maintenance,
+            "_list_tables",
+            lambda *_args: ["espn_schedule"],
+        )
+        retained: list[str] = []
+        monkeypatch.setattr(
+            maintenance,
+            "_maintain_one",
+            lambda _conn, fq, _retention: retained.append(fq) or {},
+        )
+
+        maintenance.maintain_iceberg_tables(
+            schemas=("bronze",),
+            table_filter={"espn_schedule"},
+        )
+
+        assert retained == ['iceberg."bronze"."espn_schedule"']
+
+    @pytest.mark.parametrize("layout_mode", [None, "future7"])
+    def test_missing_or_unknown_layout_fails_before_connecting(
+        self, monkeypatch, layout_mode
+    ):
+        from scrapers.espn.layout import LayoutError
+        import utils.maintenance_tasks as maintenance
+
+        if layout_mode is None:
+            monkeypatch.delenv("ESPN_BRONZE_LAYOUT_MODE", raising=False)
+        else:
+            monkeypatch.setenv("ESPN_BRONZE_LAYOUT_MODE", layout_mode)
+        monkeypatch.setattr(
+            maintenance,
+            "_connect",
+            lambda: pytest.fail("invalid layout must fail before connecting"),
+        )
+
+        with pytest.raises(LayoutError):
+            maintenance.maintain_iceberg_tables(
+                schemas=("bronze",),
+                table_filter={"espn_schedule"},
+            )
+
+    def test_unrelated_bronze_maintenance_does_not_require_espn_mode(
+        self, monkeypatch
+    ):
+        import utils.maintenance_tasks as maintenance
+
+        monkeypatch.delenv("ESPN_BRONZE_LAYOUT_MODE", raising=False)
+        conn = _MetadataConnection()
+        monkeypatch.setattr(maintenance, "_connect", lambda: conn)
+        monkeypatch.setattr(
+            maintenance,
+            "_list_tables",
+            lambda *_args: ["unrelated_bronze_table"],
+        )
+        retained: list[str] = []
+        monkeypatch.setattr(
+            maintenance,
+            "_maintain_one",
+            lambda _conn, fq, _retention: retained.append(fq) or {},
+        )
+
+        maintenance.maintain_iceberg_tables(
+            schemas=("bronze",),
+            table_filter={"unrelated_bronze_table"},
+        )
+
+        assert retained == ['iceberg."bronze"."unrelated_bronze_table"']
 
 
 @pytest.mark.unit

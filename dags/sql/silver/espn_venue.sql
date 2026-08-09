@@ -2,7 +2,7 @@
 -- Silver: espn_venue (native v2)
 -- =============================================================================
 -- Grain/PK: one row per ESPN venue_id, latest canonical event observation.
--- Sources (native v2): schedule event rows (event_id/venue_id bigint, venue
+-- Sources (native v2): compact6 canonical schedule rows (event_id/venue_id bigint, venue
 -- varchar, competition_slug varchar, source_season_year bigint, extra_json
 -- varchar, _ingested_at timestamp(6)).
 -- Notes: event snapshots are deduplicated first, then venue observations are
@@ -12,9 +12,21 @@
 -- DAG integration: run_silver_transform wraps this pure SELECT in CTAS.
 -- =============================================================================
 
-WITH bronze_src_schedule AS (
-    SELECT *
-    FROM iceberg.bronze.espn_schedule_generation_v2
+WITH espn_downstream_scope (
+    scope_id, espn_id, source_season_year, platform_league,
+    platform_season_slug, convention, effective_start_date, effective_end_date
+) AS (VALUES
+__ESPN_DOWNSTREAM_SCOPE_VALUES__
+),
+
+bronze_src_schedule AS (
+    SELECT
+        es_source.*,
+        espn_scope.platform_league AS platform_league,
+        espn_scope.platform_season_slug AS platform_season_slug
+    FROM iceberg.bronze.espn_schedule AS es_source
+    JOIN espn_downstream_scope espn_scope ON
+__ESPN_DOWNSTREAM_SCOPE_FILTER__
 ),
 
 schedule_dedup AS (
@@ -53,6 +65,6 @@ SELECT
     _ingested_at AS _bronze_ingested_at,
 
     -- ===== Partition keys =====
-    competition_slug AS league,
-    CAST(source_season_year AS varchar) AS season
+    platform_league AS league,
+    platform_season_slug AS season
 FROM venue_dedup

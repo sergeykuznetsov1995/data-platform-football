@@ -91,6 +91,43 @@ class TestResolveSqlPath:
             mod._resolve_sql_path("nonexistent_dir/nonexistent_file.sql")
 
 
+class TestTransformSqlRendering:
+    def test_renders_espn_markers_before_execution(self):
+        mod = _import_silver_tasks()
+        sql = """WITH espn_downstream_scope (
+scope_id, espn_id, source_season_year, platform_league,
+platform_season_slug, convention, effective_start_date, effective_end_date
+) AS (VALUES
+__ESPN_DOWNSTREAM_SCOPE_VALUES__
+)
+SELECT * FROM source es_source JOIN espn_downstream_scope espn_scope ON
+__ESPN_DOWNSTREAM_SCOPE_FILTER__
+"""
+
+        rendered = mod._render_transform_select_sql(sql)
+
+        assert "__ESPN_DOWNSTREAM" not in rendered
+        assert "('700:2026'" in rendered
+        assert "es_source.scope_id = espn_scope.scope_id" in rendered
+        assert "es_source.scope_id IS NULL" not in rendered
+        assert "effective_start_date - INTERVAL '1' DAY" in rendered
+
+    def test_rejects_unresolved_inline_template_marker(self):
+        mod = _import_silver_tasks()
+
+        with pytest.raises(ValueError, match="unresolved inline"):
+            mod._render_transform_select_sql(
+                "SELECT {{ unresolved_expression }} AS value"
+            )
+
+    def test_template_marker_inside_comment_is_not_executable(self):
+        mod = _import_silver_tasks()
+
+        assert mod._render_transform_select_sql(
+            "-- docs mention {{ harmless }}\nSELECT 1"
+        ).endswith("SELECT 1")
+
+
 class TestFbrefScopeContext:
     def test_accepts_and_normalizes_pinned_control_run_uuid(self):
         mod = _import_silver_tasks()

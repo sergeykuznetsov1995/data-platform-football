@@ -60,6 +60,35 @@ def test_xref_docs_forbid_unfenced_direct_trigger():
 
 
 @pytest.mark.parametrize(
+    ("layout_mode", "message"),
+    [(None, "ESPN_BRONZE_LAYOUT_MODE is required"), ("unknown", "legacy14 or compact6")],
+)
+def test_xref_dq_rejects_missing_or_unknown_espn_layout_before_trino(
+    monkeypatch, layout_mode, message
+):
+    """Topology ambiguity must stop before the DQ runner can open Trino."""
+    module = _reload_xref()
+    import utils.data_quality as data_quality
+    from airflow.exceptions import AirflowException
+
+    calls = []
+    monkeypatch.setattr(
+        data_quality,
+        "run_checks",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    if layout_mode is None:
+        monkeypatch.delenv("ESPN_BRONZE_LAYOUT_MODE", raising=False)
+    else:
+        monkeypatch.setenv("ESPN_BRONZE_LAYOUT_MODE", layout_mode)
+
+    with pytest.raises(AirflowException, match=message):
+        module._validate_xref()
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
     ("module_name", "first_writer"),
     [
         ("dag_transform_e3", "silver_e3.whoscored_events_spadl"),

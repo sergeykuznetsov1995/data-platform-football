@@ -215,7 +215,7 @@
         "to": "timestamp(6)"
       }
     },
-    "bronze.espn_lineup": {
+    "espn_internal.espn_lineup_legacy_main_retained_v1": {
       "columns": {
         "_batch_id": "varchar",
         "_entity_type": "varchar",
@@ -248,7 +248,7 @@
         "yellow_cards": "double"
       }
     },
-    "bronze.espn_lineup_generation_v2": {
+    "bronze.espn_lineup": {
       "columns": {
         "_batch_id": "varchar",
         "_entity_type": "varchar",
@@ -309,7 +309,7 @@
         "yellow_cards": "double"
       }
     },
-    "bronze.espn_matchsheet": {
+    "espn_internal.espn_matchsheet_legacy_main_retained_v1": {
       "columns": {
         "_batch_id": "varchar",
         "_entity_type": "varchar",
@@ -358,7 +358,7 @@
         "yellow_cards": "varchar"
       }
     },
-    "bronze.espn_matchsheet_generation_v2": {
+    "bronze.espn_matchsheet": {
       "columns": {
         "_batch_id": "varchar",
         "_entity_type": "varchar",
@@ -433,7 +433,7 @@
         "yellow_cards": "varchar"
       }
     },
-    "bronze.espn_schedule": {
+    "espn_internal.espn_schedule_legacy_main_retained_v1": {
       "columns": {
         "_batch_id": "varchar",
         "_entity_type": "varchar",
@@ -456,7 +456,19 @@
         "venue": "varchar"
       }
     },
-    "bronze.espn_schedule_generation_v2": {
+    "espn_internal.espn_layout_state_v2": {
+      "columns": {
+        "archive_id": "varchar",
+        "archive_manifest_sha256": "varchar",
+        "effective_at": "timestamp(6)",
+        "layout_mode": "varchar",
+        "layout_version": "varchar",
+        "plan_sha256": "varchar",
+        "state_sha256": "varchar",
+        "transition_id": "varchar"
+      }
+    },
+    "bronze.espn_schedule": {
       "columns": {
         "_batch_id": "varchar",
         "_entity_type": "varchar",
@@ -506,6 +518,90 @@
         "terminal_nonplayed": "boolean",
         "venue": "varchar",
         "venue_id": "bigint"
+      }
+    },
+    "bronze.espn_catalog_snapshot_v2": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_source": "varchar",
+        "_source_fetched_at": "timestamp(6)",
+        "captured_at": "timestamp(6)",
+        "competition_id": "bigint",
+        "competition_slug": "varchar",
+        "parser_version": "varchar",
+        "raw_sha256": "varchar",
+        "raw_uri": "varchar",
+        "record_json": "varchar",
+        "record_sha256": "varchar",
+        "registry_signature": "varchar",
+        "run_id": "varchar",
+        "runtime_version": "varchar",
+        "snapshot_content_sha256": "varchar",
+        "snapshot_id": "varchar",
+        "snapshot_signature": "varchar"
+      }
+    },
+    "bronze.espn_ingest_manifest_v2": {
+      "columns": {
+        "_batch_id": "varchar",
+        "competition_id": "bigint",
+        "completed_at": "timestamp(6)",
+        "dispositions_json": "varchar",
+        "generation_id": "varchar",
+        "generation_signature": "varchar",
+        "ledger_count": "bigint",
+        "ledger_hash": "varchar",
+        "manifest_sha256": "varchar",
+        "manifest_version": "varchar",
+        "parser_version": "varchar",
+        "plan_signature": "varchar",
+        "planned_request_ids_json": "varchar",
+        "planned_request_ids_sha256": "varchar",
+        "quality_json": "varchar",
+        "raw_ledger_sha256": "varchar",
+        "registry_signature": "varchar",
+        "registry_snapshot_uri": "varchar",
+        "repository_version": "varchar",
+        "row_counts_json": "varchar",
+        "row_hashes_json": "varchar",
+        "run_id": "varchar",
+        "runtime_version": "varchar",
+        "scope_id": "varchar",
+        "source_season_year": "bigint",
+        "status": "varchar"
+      }
+    },
+    "bronze.espn_request_ledger_generation_v2": {
+      "columns": {
+        "_batch_id": "varchar",
+        "_entity_type": "varchar",
+        "_ingested_at": "timestamp(6)",
+        "_row_sha256": "varchar",
+        "_source": "varchar",
+        "competition_id": "bigint",
+        "direct_bytes": "bigint",
+        "disposition": "varchar",
+        "endpoint": "varchar",
+        "event_id": "bigint",
+        "event_ids_json": "varchar",
+        "fetched_at": "timestamp(6)",
+        "generation_id": "varchar",
+        "generation_signature": "varchar",
+        "parser_version": "varchar",
+        "plan_signature": "varchar",
+        "planned": "boolean",
+        "proxy_bytes": "bigint",
+        "raw_sha256": "varchar",
+        "raw_uri": "varchar",
+        "registry_signature": "varchar",
+        "registry_snapshot_uri": "varchar",
+        "request_id": "varchar",
+        "run_id": "varchar",
+        "runtime_version": "varchar",
+        "scope_id": "varchar",
+        "source_season_year": "bigint"
       }
     },
     "bronze.fbref_dataset_availability": {

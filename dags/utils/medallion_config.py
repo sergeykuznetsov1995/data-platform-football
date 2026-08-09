@@ -52,6 +52,7 @@ import datetime
 
 import os
 import re
+import unicodedata
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -100,7 +101,7 @@ class MedallionConfigError(ValueError):
 
 
 def _validate_team_aliases_schema(doc: Dict) -> None:
-    """Minimal structural validation. Does not enforce alias content."""
+    """Validate structure and the exact normalized xref-team join key."""
     if not isinstance(doc, dict) or 'teams' not in doc:
         raise MedallionConfigError(
             "team_aliases.yaml: missing top-level 'teams' key"
@@ -111,6 +112,7 @@ def _validate_team_aliases_schema(doc: Dict) -> None:
             "team_aliases.yaml: 'teams' must be a list"
         )
     seen_ids: set = set()
+    normalized_owners: Dict[Tuple[str, str], Tuple[str, str]] = {}
     for i, t in enumerate(teams):
         if not isinstance(t, dict):
             raise MedallionConfigError(
@@ -158,6 +160,42 @@ def _validate_team_aliases_schema(doc: Dict) -> None:
                 f"missing/invalid 'competition_scope' (required non-empty list of str; "
                 f"no more silent APL default)"
             )
+        for bucket, aliases in t['aliases'].items():
+            if not isinstance(bucket, str) or not bucket:
+                raise MedallionConfigError(
+                    f"team_aliases.yaml: teams[{i}] has invalid alias bucket"
+                )
+            if not isinstance(aliases, list) or not all(
+                isinstance(alias, str) and alias.strip() for alias in aliases
+            ):
+                raise MedallionConfigError(
+                    f"team_aliases.yaml: teams[{i}] ({t.get('canonical_name')}) "
+                    f"alias bucket {bucket!r} must be a non-empty-string list"
+                )
+            for alias in aliases:
+                normalized = ''.join(
+                    char
+                    for char in unicodedata.normalize('NFD', alias.lower())
+                    if unicodedata.category(char) != 'Mn'
+                )
+                normalized = re.sub(r'\s+(fc|afc|cf)$', '', normalized)
+                normalized = re.sub(r'[^a-z0-9]+', '', normalized)
+                if not normalized:
+                    raise MedallionConfigError(
+                        f"team_aliases.yaml: teams[{i}] alias {alias!r} "
+                        f"has an empty normalized join key"
+                    )
+                for league in scope:
+                    key = (league, normalized)
+                    owner = normalized_owners.get(key)
+                    current = (cid, t['canonical_name'])
+                    if owner is not None and owner != current:
+                        raise MedallionConfigError(
+                            "team_aliases.yaml: normalized alias collision "
+                            f"for league={league!r}, key={normalized!r}: "
+                            f"{owner[0]!r} vs {cid!r}"
+                        )
+                    normalized_owners[key] = current
 
 
 def _validate_referee_aliases_schema(doc: Dict) -> None:

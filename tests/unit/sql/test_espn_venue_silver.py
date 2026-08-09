@@ -17,8 +17,14 @@ SQL_PATH = ROOT / "dags/sql/silver/espn_venue.sql"
 pytestmark = pytest.mark.unit
 
 
-def _sql() -> str:
+def _template() -> str:
     return SQL_PATH.read_text(encoding="utf-8")
+
+
+def _sql() -> str:
+    from utils.espn_season_mapping import render_espn_downstream_sql
+
+    return render_espn_downstream_sql(_template())
 
 
 def _tree() -> exp.Select:
@@ -33,7 +39,7 @@ class TestEspnVenueSilver:
     def test_schedule_then_venue_latest_dedup_and_non_null_venue_id(self):
         sql = _sql()
         body = "\n".join(line for line in sql.splitlines() if not line.lstrip().startswith("--"))
-        assert body.count("iceberg.bronze.espn_schedule_generation_v2") == 1
+        assert body.count("iceberg.bronze.espn_schedule AS es_source") == 1
         assert re.search(r"PARTITION BY\s+event_id\s+ORDER BY\s+_ingested_at\s+DESC", body, re.I)
         assert re.search(r"PARTITION BY\s+venue_id\s+ORDER BY\s+_ingested_at\s+DESC", body, re.I)
         assert body.index("schedule_dedup") < body.index("venue_dedup")
@@ -88,5 +94,5 @@ class TestEspnVenueSilver:
         assert "-- Notes:" in sql and "-- Footguns:" in sql and "-- DAG integration:" in sql
         final = sql.rsplit("SELECT", 1)[-1]
         assert re.search(r"_ingested_at\s+AS\s+_bronze_ingested_at", final, re.I)
-        assert re.search(r"competition_slug\s+AS\s+league", final, re.I)
-        assert re.search(r"CAST\s*\(\s*source_season_year\s+AS\s+varchar\s*\)\s+AS\s+season", final, re.I)
+        assert re.search(r"platform_league\s+AS\s+league", final, re.I)
+        assert re.search(r"platform_season_slug\s+AS\s+season", final, re.I)

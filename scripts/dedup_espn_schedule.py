@@ -18,12 +18,18 @@ network):
 
     docker compose exec airflow-webserver \
         python /opt/airflow/scripts/dedup_espn_schedule.py
+
+Safety boundary: this script is legacy14-only.  In compact6 the canonical
+``iceberg.bronze.espn_schedule`` relation is a view over an internal immutable
+generation and must never be rebuilt by this one-shot migration.
 """
 
 import logging
 import os
 import sys
 import warnings
+
+from scrapers.espn import layout as espn_layout
 
 warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 
@@ -60,9 +66,34 @@ def execute(c, sql):
     return c.fetchall()
 
 
+def require_legacy14_schedule_table(c) -> None:
+    """Prove the destructive target is the legacy physical Iceberg table."""
+
+    rows = execute(
+        c,
+        "SELECT table_type "
+        "FROM iceberg.information_schema.tables "
+        "WHERE table_schema = 'bronze' "
+        "AND table_name = 'espn_schedule'",
+    )
+    if rows != [("BASE TABLE",)]:
+        observed = rows[0][0] if len(rows) == 1 and rows[0] else None
+        raise RuntimeError(
+            "dedup_espn_schedule requires verified legacy14 BASE TABLE "
+            f"iceberg.bronze.espn_schedule; observed {observed!r}"
+        )
+
+
 def main():
+    layout_mode = espn_layout.require_layout_mode()
+    if layout_mode != espn_layout.LEGACY14:
+        raise RuntimeError(
+            "dedup_espn_schedule is legacy14-only and refuses compact6 views"
+        )
+
     conn = get_conn()
     c = conn.cursor()
+    require_legacy14_schedule_table(c)
 
     # Baseline counts
     rows = execute(

@@ -16,8 +16,14 @@ ROOT = Path(__file__).resolve().parents[3]
 SQL_PATH = ROOT / "dags/sql/silver/espn_team_match.sql"
 
 
-def _sql() -> str:
+def _template() -> str:
     return SQL_PATH.read_text(encoding="utf-8")
+
+
+def _sql() -> str:
+    from utils.espn_season_mapping import render_espn_downstream_sql
+
+    return render_espn_downstream_sql(_template())
 
 
 def _tree() -> exp.Select:
@@ -31,8 +37,8 @@ class TestEspnTeamMatchSilver:
     def test_native_sources_are_deduped_before_json_unnest(self):
         sql = _sql()
         body = "\n".join(x for x in sql.splitlines() if not x.lstrip().startswith("--"))
-        assert body.count("iceberg.bronze.espn_schedule_generation_v2") == 1
-        assert body.count("iceberg.bronze.espn_matchsheet_generation_v2") == 1
+        assert body.count("iceberg.bronze.espn_schedule AS es_source") == 1
+        assert body.count("iceberg.bronze.espn_matchsheet AS es_source") == 1
         assert re.search(r"PARTITION BY\s+event_id\s+ORDER BY\s+_ingested_at\s+DESC", body, re.I)
         assert re.search(r"PARTITION BY\s+event_id\s*,\s*team_id\s+ORDER BY\s+_ingested_at\s+DESC", body, re.I)
         assert body.index("schedule_dedup") < body.index("CROSS JOIN UNNEST")

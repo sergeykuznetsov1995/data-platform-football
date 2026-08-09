@@ -8,16 +8,21 @@ from sqlglot import exp, parse_one
 pytestmark = pytest.mark.unit
 
 
-def test_standard_checks_pin_keys_floors_and_never_add_freshness():
-    from utils.espn_silver_dq import SILVER_MIN_ROWS, build_espn_silver_checks
+def test_standard_checks_pin_keys_evidence_safe_floors_and_never_add_freshness():
+    from utils.espn_silver_dq import (
+        EXPECTED_DOWNSTREAM_GRAINS,
+        SILVER_MIN_ROWS,
+        build_espn_silver_checks,
+    )
 
+    assert EXPECTED_DOWNSTREAM_GRAINS == 6
     assert SILVER_MIN_ROWS == {
-        "espn_match": 20_000,
-        "espn_team_match": 14_000,
-        "espn_player_match_aggregate": 300_000,
-        "espn_match_events": 50_000,
-        "espn_substitutions": 65_000,
-        "espn_venue": 1_000,
+        "espn_match": 6,
+        "espn_team_match": 0,
+        "espn_player_match_aggregate": 0,
+        "espn_match_events": 0,
+        "espn_substitutions": 0,
+        "espn_venue": 0,
     }
     checks = build_espn_silver_checks()
     assert all(check.kind != "freshness" for check in checks)
@@ -30,7 +35,8 @@ def test_standard_checks_pin_keys_floors_and_never_add_freshness():
         "event_id", "league", "season", "kickoff", "status", "home_team_id", "away_team_id"
     ]
     assert by_name["score_present_for_played"].params["where"] == "is_played = true"
-    assert by_name["row_floor[silver.espn_substitutions]"].params["min_rows"] == 65_000
+    assert by_name["row_floor[silver.espn_match]"].params["min_rows"] == 6
+    assert by_name["row_floor[silver.espn_substitutions]"].params["min_rows"] == 0
 
 
 def test_standard_checks_cover_child_references_played_constraint_and_ranges():
@@ -51,28 +57,19 @@ def test_standard_checks_cover_child_references_played_constraint_and_ranges():
 
 
 def _checks_by_name():
-    from utils.espn_silver_dq import (
-        LINEUP_ZERO_COVERAGE_ALLOWLIST,
-        build_espn_silver_custom_checks,
-    )
+    from utils.espn_silver_dq import build_espn_silver_custom_checks
 
-    assert LINEUP_ZERO_COVERAGE_ALLOWLIST == frozenset({
-        "arg.3", "caf.championship_qual", "fifa.conmebol.olympicsq",
-        "ned.3.promotion.relegation", "global.gulf_cup", "caf.nations_qual",
-        "slv.1", "sco.tennents_qual", "hon.1", "rus.1.promotion.relegation",
-        "chi.super_cup", "bol.ply.rel", "arg.trofeo_de_la_campeones",
-    })
     return {check.name: check for check in build_espn_silver_custom_checks()}
 
 
 def test_custom_checks_pin_exact_severity_map_and_thresholds():
     checks = _checks_by_name()
     assert {name: check.severity for name, check in checks.items()} == {
+        "exact six schedule/match grains": "ERROR",
         "children are played": "ERROR",
         "coverage[played lineup >=80%]": "WARNING",
         "coverage[played team stats >=85%]": "WARNING",
         "coverage[played events >=85%]": "WARNING",
-        "lineup zero coverage outside allowlist": "WARNING",
         "0:0 with goal event": "WARNING",
         "played 0:0 share <=15%": "WARNING",
         "goals events <= score + 2": "WARNING",
@@ -104,7 +101,9 @@ def test_ratio_predicates_use_covered_and_distinct_played_match_denominators(
 
     assert check.passed(passing) is True
     assert check.passed(failing) is False
-    assert check.passed((0, 0)) is False
+    # Pre-season has no played denominator yet. Absence of evidence is not a
+    # coverage regression and must not emit a false warning.
+    assert check.passed((0, 0)) is True
 
     if requires_distinct_played_match_denominator:
         tree = parse_one(check.sql, read="trino")
@@ -118,17 +117,26 @@ def test_ratio_predicates_use_covered_and_distinct_played_match_denominators(
         assert isinstance(denominator.this, exp.Distinct)
 
 
-def test_every_custom_query_parses_as_trino_and_latest_ctes_precede_unnest():
+def test_every_custom_query_parses_as_trino_and_uses_only_public_canonical_bronze():
     checks = _checks_by_name()
 
     for check in checks.values():
-        assert parse_one(check.sql, read="trino") is not None
+        tree = parse_one(check.sql, read="trino")
+        assert tree is not None
+        assert "__ESPN_DOWNSTREAM" not in check.sql
+        assert "espn_internal" not in check.sql
+        assert "_generation_v2" not in check.sql
+        bronze_tables = {
+            table.name
+            for table in tree.find_all(exp.Table)
+            if table.db == "bronze"
+        }
+        assert bronze_tables <= {"espn_schedule", "espn_ingest_manifest_v2"}
 
     for name in ("manifest played-lineup disposition", "winner parity", "scoreboard totalGoals parity"):
         tree = parse_one(checks[name].sql, read="trino")
         ctes = {cte.alias_or_name: cte for cte in tree.find_all(exp.CTE)}
-        source_name = "bronze_src_manifest" if name.startswith("manifest") else "bronze_src_schedule"
-        assert source_name in ctes
+        assert {"espn_downstream_scope", "bronze_src_schedule"} <= set(ctes)
         assert any("dedup" in cte_name for cte_name in ctes)
         windows = list(tree.find_all(exp.Window))
         assert windows
@@ -147,7 +155,37 @@ def test_every_custom_query_parses_as_trino_and_latest_ctes_precede_unnest():
     }
 
 
-def test_winner_and_scoreboard_queries_preserve_the_independent_latest_generation_contract():
+def test_exact_six_scope_gate_requires_source_silver_grains_and_event_parity():
+    check = _checks_by_name()["exact six schedule/match grains"]
+
+    assert check.passed((6, 6, 6, 0, 0)) is True
+    for bad in (
+        (7, 6, 6, 0, 0),
+        (6, 5, 6, 0, 0),
+        (6, 6, 5, 0, 0),
+        (6, 6, 6, 1, 0),
+        (6, 6, 6, 0, 1),
+    ):
+        assert check.passed(bad) is False
+
+    tree = parse_one(check.sql, read="trino")
+    ctes = {cte.alias_or_name: cte for cte in tree.find_all(exp.CTE)}
+    assert {
+        "espn_downstream_scope",
+        "bronze_src_schedule",
+        "schedule_dedup",
+        "schedule_grains",
+        "match_grains",
+        "grain_violations",
+        "event_violations",
+    } <= set(ctes)
+    literals = {literal.this for literal in tree.find_all(exp.Literal)}
+    assert {"606:2026", "700:2026", "710:2026", "720:2026", "730:2026", "740:2026"} <= literals
+    assert "espn_schedule" in {table.name for table in tree.find_all(exp.Table)}
+    assert "espn_match" in {table.name for table in tree.find_all(exp.Table)}
+
+
+def test_winner_and_scoreboard_queries_preserve_independent_latest_public_snapshot_contract():
     checks = _checks_by_name()
 
     winner = parse_one(checks["winner parity"].sql, read="trino")

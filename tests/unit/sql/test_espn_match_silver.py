@@ -16,8 +16,14 @@ ROOT = Path(__file__).resolve().parents[3]
 SQL_PATH = ROOT / "dags/sql/silver/espn_match.sql"
 
 
-def _sql() -> str:
+def _template() -> str:
     return SQL_PATH.read_text(encoding="utf-8")
+
+
+def _sql() -> str:
+    from utils.espn_season_mapping import render_espn_downstream_sql
+
+    return render_espn_downstream_sql(_template())
 
 
 def _tree() -> exp.Select:
@@ -31,7 +37,8 @@ class TestEspnMatchSilver:
     def test_native_source_dedup_and_pure_select(self):
         sql = _sql()
         body = "\n".join(x for x in sql.splitlines() if not x.lstrip().startswith("--"))
-        assert body.count("iceberg.bronze.espn_schedule_generation_v2") == 1
+        assert body.count("iceberg.bronze.espn_schedule AS es_source") == 1
+        assert body.count("iceberg.bronze.espn_matchsheet AS es_source") == 1
         assert "bronze_src_schedule" in body
         assert re.search(r"PARTITION BY\s+event_id\s+ORDER BY\s+_ingested_at\s+DESC", body, re.I)
         assert "CREATE TABLE" not in body.upper()
@@ -128,15 +135,19 @@ class TestEspnMatchSilver:
         first_identity = tree.expressions[0]
         assert isinstance(first_identity, exp.Column)
         assert (first_identity.table, first_identity.name) == ("m", "event_id")
-        referee_join = next(tree.find_all(exp.Join))
+        referee_join = next(
+            join
+            for join in tree.find_all(exp.Join)
+            if join.this.name == "referee_by_event"
+        )
         assert (referee_join.this.name, referee_join.this.alias) == ("referee_by_event", "r")
         assert {
             (column.table, column.name)
             for column in referee_join.args["on"].find_all(exp.Column)
         } == {("r", "event_id"), ("m", "event_id")}
         final = sql.rsplit("SELECT", 1)[-1]
-        assert re.search(r"competition_slug\s+AS\s+league", final, re.I)
-        assert re.search(r"CAST\s*\(\s*source_season_year\s+AS\s+varchar\s*\)\s+AS\s+season", final, re.I)
+        assert re.search(r"m\.platform_league\s+AS\s+league", final, re.I)
+        assert re.search(r"m\.platform_season_slug\s+AS\s+season", final, re.I)
 
     def test_all_native_v2_transforms_have_required_header_sections(self):
         for name in (

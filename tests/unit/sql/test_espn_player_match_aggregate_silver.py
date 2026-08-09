@@ -16,8 +16,14 @@ ROOT = Path(__file__).resolve().parents[3]
 SQL_PATH = ROOT / "dags/sql/silver/espn_player_match_aggregate.sql"
 
 
-def _sql() -> str:
+def _template() -> str:
     return SQL_PATH.read_text(encoding="utf-8")
+
+
+def _sql() -> str:
+    from utils.espn_season_mapping import render_espn_downstream_sql
+
+    return render_espn_downstream_sql(_template())
 
 
 def _tree() -> exp.Select:
@@ -31,40 +37,33 @@ class TestEspnPlayerMatchAggregateSilver:
     def test_native_lineup_dedup_is_team_qualified_and_joined_to_schedule(self):
         sql = _sql()
         body = "\n".join(x for x in sql.splitlines() if not x.lstrip().startswith("--"))
-        assert body.count("iceberg.bronze.espn_lineup_generation_v2") == 1
-        assert body.count("iceberg.bronze.espn_schedule_generation_v2") == 1
+        assert body.count("iceberg.bronze.espn_lineup AS es_source") == 1
+        assert body.count("iceberg.bronze.espn_schedule AS es_source") == 1
         assert re.search(r"PARTITION BY\s+event_id\s*,\s*team_id\s*,\s*athlete_id", body, re.I)
         assert re.search(r"JOIN\s+schedule_dedup\s+s\s+ON\s+s\.event_id\s*=\s+l\.event_id", body, re.I)
         assert re.search(r"WHERE\s+s\.played_final", body, re.I)
 
-    def test_schedule_partition_fields_are_aliased_before_lineup_passthrough(self):
+    def test_schedule_platform_partitions_are_bound_before_lineup_passthrough(self):
         tree = _tree()
         lineup_played = next(
             cte.this
             for cte in tree.args["with_"].expressions
             if cte.alias_or_name == "lineup_played"
         )
-        aliases = {
-            expression.alias: expression.this
-            for expression in lineup_played.expressions
-            if isinstance(expression, exp.Alias)
+        passthrough = {
+            (source.table, source.name)
+            for source in lineup_played.expressions
+            if isinstance(source, exp.Column) and source.table == "s"
         }
-        assert {
-            "schedule_competition_slug": ("s", "competition_slug"),
-            "schedule_source_season_year": ("s", "source_season_year"),
-        } == {
-            name: (source.table, source.name)
-            for name, source in aliases.items()
-            if name.startswith("schedule_")
-        }
+        assert {("s", "platform_league"), ("s", "platform_season_slug")} <= passthrough
 
         output = {
             expression.alias: expression.this
             for expression in tree.expressions
             if isinstance(expression, exp.Alias)
         }
-        assert output["league"].name == "schedule_competition_slug"
-        assert output["season"].this.name == "schedule_source_season_year"
+        assert output["league"].name == "platform_league"
+        assert output["season"].name == "platform_season_slug"
 
     def test_json_jersey_position_groups_and_best_effort_minutes(self):
         tree = _tree()

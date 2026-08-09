@@ -1,8 +1,10 @@
-"""Data-quality contracts for the native ESPN v2 Silver layer.
+"""Data-quality contracts for the exact-six native ESPN v2 Silver layer.
 
 The standard checks use :mod:`utils.data_quality`; cross-table semantics are
 kept as small read-only SQL checks because their denominators span tables.
-There is deliberately no freshness gate while the ESPN v2 ingest is paused.
+Bronze comparisons use only compact6 public canonical relations and the
+reviewed season-mapping renderer. There is deliberately no freshness gate
+while the ESPN v2 ingest is paused.
 """
 
 from __future__ import annotations
@@ -11,32 +13,25 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from utils.data_quality import CHECK, Check, CheckResult, _get_conn
+from utils.espn_season_mapping import (
+    SeasonMappingCatalog,
+    load_season_mapping,
+    render_espn_downstream_sql,
+)
 
 
+EXPECTED_DOWNSTREAM_GRAINS = 6
 SILVER_MIN_ROWS = {
-    "espn_match": 20_000,
-    "espn_team_match": 14_000,
-    "espn_player_match_aggregate": 300_000,
-    "espn_match_events": 50_000,
-    "espn_substitutions": 65_000,
-    "espn_venue": 1_000,
+    # The schedule is the only source that must exist before promotion: one
+    # row per reviewed grain is the smallest useful fail-closed floor. Played
+    # children and venues can legitimately be empty before a season starts.
+    "espn_match": EXPECTED_DOWNSTREAM_GRAINS,
+    "espn_team_match": 0,
+    "espn_player_match_aggregate": 0,
+    "espn_match_events": 0,
+    "espn_substitutions": 0,
+    "espn_venue": 0,
 }
-
-LINEUP_ZERO_COVERAGE_ALLOWLIST = frozenset({
-    "arg.3",
-    "caf.championship_qual",
-    "fifa.conmebol.olympicsq",
-    "ned.3.promotion.relegation",
-    "global.gulf_cup",
-    "caf.nations_qual",
-    "slv.1",
-    "sco.tennents_qual",
-    "hon.1",
-    "rus.1.promotion.relegation",
-    "chi.super_cup",
-    "bol.ply.rel",
-    "arg.trofeo_de_la_campeones",
-})
 
 _TABLE_KEYS = {
     "espn_match": ["event_id"],
@@ -110,19 +105,179 @@ class CustomCheck:
     threshold: Optional[float] = None
 
 
-def _allowlist_sql() -> str:
-    return ", ".join("'" + slug.replace("'", "''") + "'" for slug in sorted(LINEUP_ZERO_COVERAGE_ALLOWLIST))
+_SCHEDULE_SCOPE_CTES = """
+WITH espn_downstream_scope (
+    scope_id,
+    espn_id,
+    source_season_year,
+    platform_league,
+    platform_season_slug,
+    convention,
+    effective_start_date,
+    effective_end_date
+) AS (
+    VALUES
+__ESPN_DOWNSTREAM_SCOPE_VALUES__
+),
+bronze_src_schedule AS (
+    SELECT
+        es_source.*,
+        espn_scope.platform_league,
+        espn_scope.platform_season_slug
+    FROM iceberg.bronze.espn_schedule es_source
+    JOIN espn_downstream_scope espn_scope ON
+__ESPN_DOWNSTREAM_SCOPE_FILTER__
+)
+"""
+
+
+def _schedule_scoped_sql(
+    tail: str, *, catalog: SeasonMappingCatalog
+) -> str:
+    """Render a public-canonical schedule query for the reviewed six scopes."""
+
+    return render_espn_downstream_sql(_SCHEDULE_SCOPE_CTES + tail, catalog=catalog)
+
+
+def _ratio_at_least(row: Tuple[int, ...], threshold: float) -> bool:
+    """Treat an empty played denominator as valid pre-season evidence."""
+
+    return row[1] == 0 or row[0] / row[1] >= threshold
+
+
+def _ratio_at_most(row: Tuple[int, ...], threshold: float) -> bool:
+    """Treat an empty played denominator as valid pre-season evidence."""
+
+    return row[1] == 0 or row[0] / row[1] <= threshold
 
 
 def build_espn_silver_custom_checks() -> List[CustomCheck]:
-    """Build source-faithful cross-table checks.
+    """Build exact-six, source-faithful cross-table checks.
 
     Every monitoring signal is intentionally static WARNING severity: it must
     never become an Airflow-blocking ERROR merely because its ratio is poor.
-    ``children are played`` is the sole custom ERROR invariant.
+    The schedule/match boundary and played-child semantics are ERROR invariants.
     """
-    allowlist = _allowlist_sql()
+    catalog = load_season_mapping()
     return [
+        CustomCheck(
+            "exact six schedule/match grains",
+            _schedule_scoped_sql(
+                """,
+schedule_ranked AS (
+    SELECT schedule.*, ROW_NUMBER() OVER (
+        PARTITION BY event_id
+        ORDER BY _ingested_at DESC, generation_id DESC, run_id DESC
+    ) AS rn
+    FROM bronze_src_schedule schedule
+),
+schedule_dedup AS (
+    SELECT * FROM schedule_ranked WHERE rn = 1
+),
+schedule_grains AS (
+    SELECT
+        scope_id,
+        competition_id AS espn_id,
+        source_season_year,
+        platform_league,
+        platform_season_slug
+    FROM schedule_dedup
+    GROUP BY
+        scope_id,
+        competition_id,
+        source_season_year,
+        platform_league,
+        platform_season_slug
+),
+match_grains AS (
+    SELECT
+        scope_id,
+        competition_id AS espn_id,
+        source_season_year,
+        league AS platform_league,
+        season AS platform_season_slug
+    FROM iceberg.silver.espn_match
+    GROUP BY scope_id, competition_id, source_season_year, league, season
+),
+grain_violations AS (
+    SELECT espn_scope.scope_id
+    FROM espn_downstream_scope espn_scope
+    LEFT JOIN schedule_grains schedule ON
+        schedule.scope_id = espn_scope.scope_id
+        AND schedule.espn_id = espn_scope.espn_id
+        AND schedule.source_season_year = espn_scope.source_season_year
+        AND schedule.platform_league = espn_scope.platform_league
+        AND schedule.platform_season_slug = espn_scope.platform_season_slug
+    WHERE schedule.scope_id IS NULL
+
+    UNION ALL
+
+    SELECT espn_scope.scope_id
+    FROM espn_downstream_scope espn_scope
+    LEFT JOIN match_grains silver_match ON
+        silver_match.scope_id = espn_scope.scope_id
+        AND silver_match.espn_id = espn_scope.espn_id
+        AND silver_match.source_season_year = espn_scope.source_season_year
+        AND silver_match.platform_league = espn_scope.platform_league
+        AND silver_match.platform_season_slug = espn_scope.platform_season_slug
+    WHERE silver_match.scope_id IS NULL
+
+    UNION ALL
+
+    SELECT silver_match.scope_id
+    FROM match_grains silver_match
+    LEFT JOIN espn_downstream_scope espn_scope ON
+        silver_match.scope_id = espn_scope.scope_id
+        AND silver_match.espn_id = espn_scope.espn_id
+        AND silver_match.source_season_year = espn_scope.source_season_year
+        AND silver_match.platform_league = espn_scope.platform_league
+        AND silver_match.platform_season_slug = espn_scope.platform_season_slug
+    WHERE espn_scope.scope_id IS NULL
+),
+event_violations AS (
+    SELECT schedule.event_id
+    FROM schedule_dedup schedule
+    LEFT JOIN iceberg.silver.espn_match silver_match ON
+        silver_match.event_id = schedule.event_id
+        AND silver_match.scope_id = schedule.scope_id
+        AND silver_match.competition_id = schedule.competition_id
+        AND silver_match.source_season_year = schedule.source_season_year
+        AND silver_match.league = schedule.platform_league
+        AND silver_match.season = schedule.platform_season_slug
+    WHERE silver_match.event_id IS NULL
+
+    UNION ALL
+
+    SELECT silver_match.event_id
+    FROM iceberg.silver.espn_match silver_match
+    LEFT JOIN schedule_dedup schedule ON
+        silver_match.event_id = schedule.event_id
+        AND silver_match.scope_id = schedule.scope_id
+        AND silver_match.competition_id = schedule.competition_id
+        AND silver_match.source_season_year = schedule.source_season_year
+        AND silver_match.league = schedule.platform_league
+        AND silver_match.season = schedule.platform_season_slug
+    WHERE schedule.event_id IS NULL
+)
+SELECT
+    (SELECT COUNT(*) FROM espn_downstream_scope),
+    (SELECT COUNT(*) FROM schedule_grains),
+    (SELECT COUNT(*) FROM match_grains),
+    (SELECT COUNT(*) FROM grain_violations),
+    (SELECT COUNT(*) FROM event_violations)
+""",
+                catalog=catalog,
+            ),
+            "ERROR",
+            lambda row: row
+            == (
+                EXPECTED_DOWNSTREAM_GRAINS,
+                EXPECTED_DOWNSTREAM_GRAINS,
+                EXPECTED_DOWNSTREAM_GRAINS,
+                0,
+                0,
+            ),
+        ),
         CustomCheck(
             "children are played",
             """
@@ -146,7 +301,7 @@ def build_espn_silver_custom_checks() -> List[CustomCheck]:
             LEFT JOIN iceberg.silver.espn_player_match_aggregate p ON p.event_id = m.event_id
             WHERE m.is_played = true
             """,
-            "WARNING", lambda row: row[1] > 0 and row[0] / row[1] >= 0.80,
+            "WARNING", lambda row: _ratio_at_least(row, 0.80),
             threshold=0.80,
         ),
         CustomCheck(
@@ -157,7 +312,7 @@ def build_espn_silver_custom_checks() -> List[CustomCheck]:
             LEFT JOIN iceberg.silver.espn_team_match t ON t.event_id = m.event_id
             WHERE m.is_played = true
             """,
-            "WARNING", lambda row: row[1] > 0 and row[0] / row[1] >= 0.85,
+            "WARNING", lambda row: _ratio_at_least(row, 0.85),
             threshold=0.85,
         ),
         CustomCheck(
@@ -168,23 +323,8 @@ def build_espn_silver_custom_checks() -> List[CustomCheck]:
             LEFT JOIN iceberg.silver.espn_match_events e ON e.event_id = m.event_id
             WHERE m.is_played = true
             """,
-            "WARNING", lambda row: row[1] > 0 and row[0] / row[1] >= 0.85,
+            "WARNING", lambda row: _ratio_at_least(row, 0.85),
             threshold=0.85,
-        ),
-        CustomCheck(
-            "lineup zero coverage outside allowlist",
-            f"""
-            SELECT COUNT(*)
-            FROM (
-                SELECT m.league
-                FROM iceberg.silver.espn_match m
-                LEFT JOIN iceberg.silver.espn_player_match_aggregate p ON p.event_id = m.event_id
-                WHERE m.is_played = true
-                GROUP BY m.league
-                HAVING COUNT(p.event_id) = 0 AND m.league NOT IN ({allowlist})
-            ) missing_slug
-            """,
-            "WARNING", lambda row: row[0] == 0,
         ),
         CustomCheck(
             "0:0 with goal event",
@@ -203,7 +343,7 @@ def build_espn_silver_custom_checks() -> List[CustomCheck]:
             FROM iceberg.silver.espn_match
             WHERE is_played = true
             """,
-            "WARNING", lambda row: row[1] > 0 and row[0] / row[1] <= 0.15,
+            "WARNING", lambda row: _ratio_at_most(row, 0.15),
             threshold=0.15,
         ),
         CustomCheck(
@@ -229,15 +369,35 @@ def build_espn_silver_custom_checks() -> List[CustomCheck]:
             FROM iceberg.silver.espn_match
             WHERE is_played = true
             """,
-            "WARNING", lambda row: row[1] > 0 and row[0] / row[1] >= 0.15,
+            "WARNING", lambda row: _ratio_at_least(row, 0.15),
             threshold=0.15,
         ),
         CustomCheck(
             "manifest played-lineup disposition",
-            """
-            WITH bronze_src_manifest AS (
-                SELECT scope_id, completed_at, generation_id, run_id, dispositions_json
-                FROM iceberg.bronze.espn_ingest_manifest_v2
+            _schedule_scoped_sql(
+                """,
+            schedule_ranked AS (
+                SELECT schedule.*, ROW_NUMBER() OVER (
+                    PARTITION BY event_id
+                    ORDER BY _ingested_at DESC, generation_id DESC, run_id DESC
+                ) AS rn
+                FROM bronze_src_schedule schedule
+            ),
+            schedule_dedup AS (
+                SELECT * FROM schedule_ranked WHERE rn = 1
+            ),
+            selected_scopes AS (
+                SELECT DISTINCT scope_id FROM schedule_dedup
+            ),
+            bronze_src_manifest AS (
+                SELECT
+                    manifest.scope_id,
+                    manifest.completed_at,
+                    manifest.generation_id,
+                    manifest.run_id,
+                    manifest.dispositions_json
+                FROM iceberg.bronze.espn_ingest_manifest_v2 manifest
+                JOIN selected_scopes selected ON selected.scope_id = manifest.scope_id
             ),
             manifest_ranked AS (
                 SELECT manifest.*, ROW_NUMBER() OVER (
@@ -262,17 +422,14 @@ def build_espn_silver_custom_checks() -> List[CustomCheck]:
             WHERE m.is_played = true
               AND lineup.event_id IS NULL
             """,
+                catalog=catalog,
+            ),
             "WARNING", lambda row: row[0] == 0,
         ),
         CustomCheck(
             "winner parity",
-            """
-            WITH bronze_src_schedule AS (
-                SELECT
-                    event_id, home_team_id, away_team_id, home_score, away_score,
-                    played_final, extra_json, _ingested_at, generation_id, run_id
-                FROM iceberg.bronze.espn_schedule_generation_v2
-            ),
+            _schedule_scoped_sql(
+                """,
             schedule_ranked AS (
                 SELECT schedule.*, ROW_NUMBER() OVER (
                     PARTITION BY event_id
@@ -313,16 +470,14 @@ def build_espn_silver_custom_checks() -> List[CustomCheck]:
             FROM winner_flags
             WHERE raw_winner_team_id IS DISTINCT FROM modeled_winner_team_id
             """,
+                catalog=catalog,
+            ),
             "WARNING", lambda row: row[0] == 0,
         ),
         CustomCheck(
             "scoreboard totalGoals parity",
-            """
-            WITH bronze_src_schedule AS (
-                SELECT event_id, home_team_id, away_team_id, extra_json,
-                       _ingested_at, generation_id, run_id
-                FROM iceberg.bronze.espn_schedule_generation_v2
-            ),
+            _schedule_scoped_sql(
+                """,
             schedule_ranked AS (
                 SELECT schedule.*, ROW_NUMBER() OVER (
                     PARTITION BY event_id
@@ -362,6 +517,8 @@ def build_espn_silver_custom_checks() -> List[CustomCheck]:
               AND m.is_played = true
               AND scoreboard.total_goals IS DISTINCT FROM t.goals_for
             """,
+                catalog=catalog,
+            ),
             "WARNING", lambda row: row[0] == 0,
         ),
     ]

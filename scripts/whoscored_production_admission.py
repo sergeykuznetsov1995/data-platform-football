@@ -937,6 +937,7 @@ _CRITICAL_IMAGE_PATHS = {
 _ALLOWED_VOLUME_TARGETS = {
     "airflow-scheduler": {
         "/home/airflow/soccerdata": ("volume", False),
+        "/opt/airflow/configs/espn": ("bind", True),
         "/opt/airflow/configs/fotmob": ("bind", True),
         "/opt/airflow/configs/medallion": ("bind", True),
         "/opt/airflow/configs/proxy_filter": ("bind", True),
@@ -980,6 +981,7 @@ _ALLOWED_VOLUME_TARGETS = {
 }
 _RELEASE_BIND_TARGETS = {
     "airflow-scheduler": {
+        "/opt/airflow/configs/espn": "configs/espn",
         "/opt/airflow/configs/fotmob": "configs/fotmob",
         "/opt/airflow/configs/medallion": "configs/medallion",
         "/opt/airflow/configs/proxy_filter": "configs/proxy_filter",
@@ -1474,7 +1476,14 @@ _SCHEDULER_ENVIRONMENT_NAMES = frozenset(
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION AIRFLOW__CORE__EXECUTOR
     AIRFLOW__CORE__FERNET_KEY AIRFLOW__CORE__LOAD_EXAMPLES
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN AIRFLOW__WEBSERVER__EXPOSE_CONFIG
-    AIRFLOW__WEBSERVER__SECRET_KEY ALERT_ENV FBREF_PROXY_CONTROL_TOKEN
+    AIRFLOW__WEBSERVER__SECRET_KEY ALERT_ENV
+    ESPN_ARTIFACT_ROOT_URI ESPN_ARTIFACT_S3_ENDPOINT ESPN_ARTIFACT_S3_SCHEME
+    ESPN_BRONZE_LAYOUT_MODE ESPN_CANARY_CLAIM_SHA256 ESPN_CANARY_CLAIM_URI
+    ESPN_CONTROL_DATABASE_URL ESPN_DISCOVERY_CATALOG_URL
+    ESPN_DISCOVERY_STATE_REF_SHA256 ESPN_DISCOVERY_STATE_REF_URI
+    ESPN_RAW_S3_ENDPOINT ESPN_RAW_S3_SCHEME ESPN_RAW_STORE_URI
+    ESPN_REGISTRY_PATH ESPN_RELEASE_COMMIT ESPN_RELEASE_TREE_SHA256
+    FBREF_PROXY_CONTROL_TOKEN
     FBREF_CAMOUFOX_GEOIP_DATABASE_PATH FBREF_CONTROL_DB_URI FOTMOB_DEPLOY_GIT_SHA
     FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH
     FBREF_PROXY_CONTROL_URL FBREF_PROXY_LEASE_TTL_SECONDS FBREF_RAW_S3_ENDPOINT
@@ -1540,6 +1549,14 @@ _SCHEDULER_ENVIRONMENT_NAMES = frozenset(
     WHOSCORED_SOURCE_CIRCUIT_PATH WHOSCORED_SOURCE_CIRCUIT_WAIT
     WHOSCORED_SOURCE_POOL_SLOTS WHOSCORED_STRUCTURED_REQUESTS_PER_MINUTE
     """.split()
+)
+_NULLABLE_SCHEDULER_ENVIRONMENT_NAMES = frozenset(
+    {
+        "ESPN_CANARY_CLAIM_SHA256",
+        "ESPN_CANARY_CLAIM_URI",
+        "ESPN_DISCOVERY_STATE_REF_SHA256",
+        "ESPN_DISCOVERY_STATE_REF_URI",
+    }
 )
 _EXPECTED_ENVIRONMENT_NAMES = {
     "airflow-scheduler": _SCHEDULER_ENVIRONMENT_NAMES,
@@ -2885,7 +2902,15 @@ def verify_rendered_compose(
         if not isinstance(environment, dict):
             raise AdmissionError(f"rendered environment policy differs: {service}")
         if any(
-            not isinstance(name, str) or not isinstance(value, str)
+            not isinstance(name, str)
+            or (
+                not isinstance(value, str)
+                and not (
+                    service == "airflow-scheduler"
+                    and name in _NULLABLE_SCHEDULER_ENVIRONMENT_NAMES
+                    and value is None
+                )
+            )
             for name, value in environment.items()
         ):
             raise AdmissionError(f"rendered environment values differ: {service}")
@@ -2993,7 +3018,9 @@ def verify_rendered_compose(
             "cap_add": cap_add,
             "cap_drop": cap_drop,
             "command": effective_command,
-            "environment": dict(environment),
+            "environment": {
+                name: value for name, value in environment.items() if value is not None
+            },
             "healthcheck": _healthcheck_projection(model, service=service),
             "port_bindings": _EXPECTED_PORT_BINDINGS[service],
             "network_names": tuple(

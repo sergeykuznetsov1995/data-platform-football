@@ -1,0 +1,22 @@
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.bronze.espn_ingest_manifest_v2
+  description: |
+    Append-only logical commit log for ESPN Native Bronze v2. Only COMPLETE
+    rows whose exact row/hash parity validates may feed current views;
+    manifest_sha256 binds generation, registry, plan, Raw ledger and DQ.
+  tags: [Tier.Bronze, Domain.Football, PII.None]
+columns:
+  - name: scope_id
+    description: Exact native competition/edition scope.
+  - name: generation_id
+    description: Exact physical generation identity.
+  - name: status
+    description: Logical state; only complete is eligible for visibility.
+  - name: registry_signature
+    description: Exact registry SHA-256.
+  - name: plan_signature
+    description: Exact signed-plan SHA-256.
+  - name: row_hashes_json
+    description: Exact per-entity physical row hashes.
+  - name: manifest_sha256
+    description: Immutable manifest fingerprint.

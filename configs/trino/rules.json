@@ -6,18 +6,34 @@
     { "allow": "none" }
   ],
   "schemas": [
+    {
+      "user": "superset|openmetadata",
+      "catalog": "iceberg",
+      "schema": "espn_internal",
+      "owner": false
+    },
     { "user": "airflow|superset|openmetadata", "owner": true },
     { "group": "platform-admins", "owner": true },
     { "owner": false }
   ],
   "tables": [
     {
-      "user": "airflow|superset|openmetadata",
+      "user": "airflow",
+      "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]
+    },
+    {
+      "user": "superset|openmetadata",
+      "catalog": "iceberg",
+      "schema": "espn_internal",
+      "privileges": []
+    },
+    {
+      "user": "superset|openmetadata",
       "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP"]
     },
     {
       "group": "platform-admins",
-      "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP"]
+      "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]
     },
     {
       "catalog": "iceberg",

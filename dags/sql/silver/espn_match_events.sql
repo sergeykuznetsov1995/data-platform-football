@@ -2,7 +2,7 @@
 -- Silver: espn_match_events (native v2)
 -- =============================================================================
 -- Grain/PK: one row per (event_id, seq); seq is ESPN details-array ordinality.
--- Sources (native v2): schedule event rows (event_id bigint, played_final
+-- Sources (native v2): compact6 canonical schedule rows (event_id bigint, played_final
 -- boolean, competition_slug varchar, source_season_year bigint, extra_json
 -- varchar, _ingested_at timestamp(6)).
 -- Notes: the append-only schedule snapshot is canonicalized before JSON details
@@ -12,9 +12,21 @@
 -- DAG integration: run_silver_transform wraps this pure SELECT in CTAS.
 -- =============================================================================
 
-WITH bronze_src_schedule AS (
-    SELECT *
-    FROM iceberg.bronze.espn_schedule_generation_v2
+WITH espn_downstream_scope (
+    scope_id, espn_id, source_season_year, platform_league,
+    platform_season_slug, convention, effective_start_date, effective_end_date
+) AS (VALUES
+__ESPN_DOWNSTREAM_SCOPE_VALUES__
+),
+
+bronze_src_schedule AS (
+    SELECT
+        es_source.*,
+        espn_scope.platform_league AS platform_league,
+        espn_scope.platform_season_slug AS platform_season_slug
+    FROM iceberg.bronze.espn_schedule AS es_source
+    JOIN espn_downstream_scope espn_scope ON
+__ESPN_DOWNSTREAM_SCOPE_FILTER__
 ),
 
 schedule_dedup AS (
@@ -70,6 +82,6 @@ SELECT
     s._ingested_at AS _bronze_ingested_at,
 
     -- ===== Partition keys =====
-    s.competition_slug AS league,
-    CAST(s.source_season_year AS varchar) AS season
+    s.platform_league AS league,
+    s.platform_season_slug AS season
 FROM event_details s

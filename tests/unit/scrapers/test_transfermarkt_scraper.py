@@ -831,6 +831,53 @@ class TestPartialScrapeRatio:
         df = scraper.read_players(league='ENG-Premier League', season=2025)
         assert df['player_id'].nunique() == 9
 
+    _EMPTY_ROSTER_HTML = (
+        '<html><h1 class="data-header__headline-wrapper">FC Lienden</h1>'
+        '<div>No data available</div></html>'
+    )
+
+    def test_empty_roster_clubs_count_as_success(self, scraper, monkeypatch):
+        # Dissolved amateur clubs (FC Lienden 2011/12): a valid club page with
+        # no squad table is data truth, not a failed fetch — 2 of 10 empty
+        # must not trip the 0.9 ratio (#936 daily-red on TM-511).
+        import scrapers.transfermarkt.scraper as tm
+        self._patch_players_pipeline(
+            monkeypatch, scraper,
+            [self._EMPTY_ROSTER_HTML] * 2 + ['<html/>'] * 8,
+        )
+        monkeypatch.setattr(
+            tm, '_parse_squad_page',
+            lambda html, club_id: []
+            if html == self._EMPTY_ROSTER_HTML
+            else [{'player_id': f'p{club_id}',
+                   'player_slug': f'player-{club_id}',
+                   'name': f'P{club_id}', 'club_id': club_id,
+                   'market_value_eur': None}],
+        )
+        df = scraper.read_players(league='ENG-Premier League', season=2025)
+        assert df['player_id'].nunique() == 8
+        capture = scraper.get_scope_capture() or {}
+        # the closed manifest field set must stay intact; empty clubs are 'ok'
+        assert 'empty_squad_club_ids' not in capture
+        statuses = capture.get('endpoint_status_by_team') or {}
+        assert statuses.get('0') == 'ok' and statuses.get('1') == 'ok'
+        # the fetch validator must accept the same page instead of burning
+        # six attempts on 'missing table.items'
+        validator = scraper._endpoint_validator('squad', False)
+        assert validator(self._EMPTY_ROSTER_HTML) is None
+
+    def test_empty_roster_detector_requires_club_header(self):
+        from scrapers.transfermarkt.scraper import _squad_page_is_empty_roster
+
+        assert _squad_page_is_empty_roster(self._EMPTY_ROSTER_HTML)
+        # a page that still carries player links stays a schema error
+        assert not _squad_page_is_empty_roster(
+            '<html><h1 class="data-header__headline-wrapper">X</h1>'
+            '<a href="/a/profil/spieler/1">A</a></html>'
+        )
+        # an interstitial/error page without the club header is not "empty"
+        assert not _squad_page_is_empty_roster('<html>blocked</html>')
+
     def test_read_mv_history_raises_on_low_success_ratio(
         self, scraper, monkeypatch,
     ):

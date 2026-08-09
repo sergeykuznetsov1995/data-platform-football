@@ -1,0 +1,185 @@
+schema_version: 1
+registry_version: "2026-07-31"
+as_of: "2026-07-31"
+
+# This file is the sole promotion boundary. Discovery snapshots never edit it.
+competitions:
+  - espn_id: 700
+    slug: eng.1
+    name: English Premier League
+    enabled: true
+    gender: MALE
+    age_class: SENIOR
+    gender_evidence: ["ESPN detail metadata reviewed 2026-07-31: MALE"]
+    age_class_evidence: ["manual review 2026-07-31: senior first teams"]
+    legacy:
+      league: ENG-Premier League
+      league_aliases: [ENG-Premier League, English Premier League]
+      season_aliases: {2026: ["2627", "2026"]}
+    editions:
+      - source_season_year: 2026
+        display_name: 2026-27 English Premier League
+        start_date: "2026-06-01"
+        end_date: "2027-06-01"
+        current: true
+        capabilities: {schedule: proven, lineup: proven, matchsheet: proven}
+
+  - espn_id: 740
+    slug: esp.1
+    name: Spanish LALIGA
+    enabled: true
+    gender: MALE
+    age_class: SENIOR
+    gender_evidence: ["ESPN detail metadata reviewed 2026-07-31: MALE"]
+    age_class_evidence: ["manual review 2026-07-31: senior first teams"]
+    legacy:
+      league: ESP-La Liga
+      league_aliases: [ESP-La Liga, Spanish La Liga, Spanish LALIGA]
+      season_aliases: {2026: ["2627", "2026"]}
+    editions:
+      - source_season_year: 2026
+        display_name: 2026-27 Spanish LALIGA
+        start_date: "2026-06-01"
+        end_date: "2027-06-01"
+        current: true
+        capabilities: {schedule: proven, lineup: proven, matchsheet: proven}
+
+  - espn_id: 720
+    slug: ger.1
+    name: German Bundesliga
+    enabled: true
+    gender: MALE
+    age_class: SENIOR
+    gender_evidence: ["ESPN detail metadata reviewed 2026-07-31: MALE"]
+    age_class_evidence: ["manual review 2026-07-31: senior first teams"]
+    legacy:
+      league: GER-Bundesliga
+      league_aliases: [GER-Bundesliga, German Bundesliga]
+      season_aliases: {2026: ["2627", "2026"]}
+    editions:
+      - source_season_year: 2026
+        display_name: 2026-27 German Bundesliga
+        start_date: "2026-07-01"
+        end_date: "2027-07-01"
+        current: true
+        capabilities: {schedule: proven, lineup: proven, matchsheet: proven}
+
+  - espn_id: 730
+    slug: ita.1
+    name: Italian Serie A
+    enabled: true
+    gender: MALE
+    age_class: SENIOR
+    gender_evidence: ["ESPN detail metadata reviewed 2026-07-31: MALE"]
+    age_class_evidence: ["manual review 2026-07-31: senior first teams"]
+    legacy:
+      league: ITA-Serie A
+      league_aliases: [ITA-Serie A, Italian Serie A]
+      season_aliases: {2026: ["2627", "2026"]}
+    editions:
+      - source_season_year: 2026
+        display_name: 2026-27 Italian Serie A
+        start_date: "2026-06-05"
+        end_date: "2027-07-01"
+        current: true
+        capabilities: {schedule: proven, lineup: proven, matchsheet: proven}
+
+  - espn_id: 710
+    slug: fra.1
+    name: French Ligue 1
+    enabled: true
+    gender: MALE
+    age_class: SENIOR
+    gender_evidence: ["ESPN detail metadata reviewed 2026-07-31: MALE"]
+    age_class_evidence: ["manual review 2026-07-31: senior first teams"]
+    legacy:
+      league: FRA-Ligue 1
+      league_aliases: [FRA-Ligue 1, French Ligue 1]
+      season_aliases: {2026: ["2627", "2026"]}
+    editions:
+      - source_season_year: 2026
+        display_name: 2026-27 French Ligue 1
+        start_date: "2026-06-01"
+        end_date: "2027-06-01"
+        current: true
+        capabilities: {schedule: proven, lineup: proven, matchsheet: proven}
+
+  - espn_id: 606
+    slug: fifa.world
+    name: FIFA World Cup
+    enabled: true
+    gender: MALE
+    age_class: SENIOR
+    gender_evidence: ["ESPN detail metadata reviewed 2026-07-31: MALE"]
+    age_class_evidence: ["manual review 2026-07-31: senior national teams"]
+    legacy:
+      league: INT-World Cup
+      league_aliases: [INT-World Cup, FIFA World Cup]
+      season_aliases: {2026: ["2026"]}
+    editions:
+      - source_season_year: 2026
+        display_name: 2026 FIFA World Cup
+        start_date: "2026-06-11"
+        end_date: "2026-12-31"
+        current: true
+        capabilities: {schedule: proven, lineup: proven, matchsheet: proven}
+
+  - espn_id: 781
+    slug: uefa.euro
+    name: UEFA European Championship
+    enabled: true
+    gender: MALE
+    age_class: SENIOR
+    gender_evidence: ["ESPN detail metadata reviewed 2026-07-31: MALE"]
+    age_class_evidence: ["manual review 2026-07-31: senior national teams"]
+    legacy:
+      league: INT-European Championship
+      league_aliases: [INT-European Championship, UEFA European Championship]
+      season_aliases: {2024: ["2024"]}
+    editions:
+      - source_season_year: 2024
+        display_name: 2024 European Championship
+        start_date: "2024-06-01"
+        end_date: "2024-07-31"
+        current: true
+        capabilities: {schedule: proven, lineup: proven, matchsheet: proven}
+
+  - espn_id: 3908
+    slug: caf.nations
+    name: Africa Cup of Nations
+    enabled: true
+    gender: MALE
+    age_class: SENIOR
+    gender_evidence: ["ESPN detail metadata reviewed 2026-07-31: MALE"]
+    age_class_evidence: ["manual review 2026-07-31: senior national teams"]
+    legacy:
+      league: INT-Africa Cup of Nations
+      league_aliases: [INT-Africa Cup of Nations, Africa Cup of Nations]
+      season_aliases: {2025: ["2025"]}
+    editions:
+      - source_season_year: 2025
+        display_name: 2025 Africa Cup of Nations
+        start_date: "2025-12-21"
+        end_date: "2026-12-31"
+        current: true
+        capabilities: {schedule: proven, lineup: proven, matchsheet: proven}
+
+  - espn_id: 780
+    slug: conmebol.america
+    name: Copa América
+    enabled: true
+    gender: MALE
+    age_class: SENIOR
+    gender_evidence: ["ESPN detail metadata reviewed 2026-07-31: MALE"]
+    age_class_evidence: ["manual review 2026-07-31: senior national teams"]
+    legacy:
+      league: INT-Copa America
+      league_aliases: [INT-Copa America, Copa América, Copa America]
+      season_aliases: {2024: ["2024"]}
+    editions:
+      - source_season_year: 2024
+        display_name: 2024 Copa América
+        start_date: "2024-01-01"
+        end_date: "2024-12-31"
+        current: true
+        capabilities: {schedule: proven, lineup: proven, matchsheet: proven}

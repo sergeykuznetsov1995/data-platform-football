@@ -2,7 +2,7 @@
 -- Silver: espn_substitutions (native v2)
 -- =============================================================================
 -- Grain/PK: one row per (event_id, team_id, player_in_id), played final only.
--- Sources (native v2): lineup player rows (event_id/team_id/athlete_id bigint,
+-- Sources (native v2): compact6 canonical lineup rows (event_id/team_id/athlete_id bigint,
 -- subbed_in boolean, sub_in varchar, jersey varchar, extra_json varchar,
 -- _ingested_at timestamp(6)); schedule rows (event_id bigint, played_final
 -- boolean, competition_slug varchar, source_season_year bigint, _ingested_at).
@@ -13,9 +13,21 @@
 -- DAG integration: run_silver_transform wraps this pure SELECT in CTAS.
 -- =============================================================================
 
-WITH bronze_src_schedule AS (
-    SELECT *
-    FROM iceberg.bronze.espn_schedule_generation_v2
+WITH espn_downstream_scope (
+    scope_id, espn_id, source_season_year, platform_league,
+    platform_season_slug, convention, effective_start_date, effective_end_date
+) AS (VALUES
+__ESPN_DOWNSTREAM_SCOPE_VALUES__
+),
+
+bronze_src_schedule AS (
+    SELECT
+        es_source.*,
+        espn_scope.platform_league AS platform_league,
+        espn_scope.platform_season_slug AS platform_season_slug
+    FROM iceberg.bronze.espn_schedule AS es_source
+    JOIN espn_downstream_scope espn_scope ON
+__ESPN_DOWNSTREAM_SCOPE_FILTER__
 ),
 
 schedule_dedup AS (
@@ -30,8 +42,10 @@ schedule_dedup AS (
 ),
 
 bronze_src_lineup AS (
-    SELECT *
-    FROM iceberg.bronze.espn_lineup_generation_v2
+    SELECT es_source.*
+    FROM iceberg.bronze.espn_lineup AS es_source
+    JOIN espn_downstream_scope espn_scope ON
+__ESPN_DOWNSTREAM_SCOPE_FILTER__
 ),
 
 lineup_dedup AS (
@@ -48,8 +62,8 @@ lineup_dedup AS (
 inbound_substitutions AS (
     SELECT
         l.*,
-        s.competition_slug AS schedule_competition_slug,
-        s.source_season_year AS schedule_source_season_year
+        s.platform_league,
+        s.platform_season_slug
     FROM lineup_dedup l
     JOIN schedule_dedup s ON s.event_id = l.event_id
     WHERE s.played_final AND l.subbed_in
@@ -72,6 +86,6 @@ SELECT
     l._ingested_at AS _bronze_ingested_at,
 
     -- ===== Partition keys =====
-    l.schedule_competition_slug AS league,
-    CAST(l.schedule_source_season_year AS varchar) AS season
+    l.platform_league AS league,
+    l.platform_season_slug AS season
 FROM inbound_substitutions l

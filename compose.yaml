@@ -201,6 +201,30 @@ x-airflow-common: &airflow-common
     FOTMOB_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/fotmob
     FOTMOB_RAW_S3_ENDPOINT: seaweedfs:8333
     FOTMOB_RAW_S3_SCHEME: http
+    # ESPN Native v2 is direct-only and shares PostgreSQL for its fenced
+    # scope leases, exact run evidence and global 30 rpm request gate.
+    ESPN_REGISTRY_PATH: /opt/airflow/configs/espn/registry.yaml
+    # Every writer and reader must agree on the physical ESPN relation layout.
+    # Runtime code fails closed rather than silently interpreting compact6 as
+    # legacy14, so deployment must supply this exact release decision.
+    ESPN_BRONZE_LAYOUT_MODE: ${ESPN_BRONZE_LAYOUT_MODE:?set exact ESPN Bronze layout mode (legacy14 or compact6)}
+    ESPN_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE}/raw/espn
+    ESPN_ARTIFACT_ROOT_URI: s3://${ICEBERG_WAREHOUSE}/artifacts/espn
+    ESPN_RELEASE_COMMIT: ${ESPN_RELEASE_COMMIT:?set exact ESPN release commit}
+    ESPN_RELEASE_TREE_SHA256: ${ESPN_RELEASE_TREE_SHA256:?set exact ESPN release tree SHA-256}
+    ESPN_CANARY_CLAIM_URI:
+    ESPN_CANARY_CLAIM_SHA256:
+    ESPN_CONTROL_DATABASE_URL: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}
+    ESPN_RAW_S3_ENDPOINT: seaweedfs:8333
+    ESPN_RAW_S3_SCHEME: http
+    ESPN_ARTIFACT_S3_ENDPOINT: seaweedfs:8333
+    ESPN_ARTIFACT_S3_SCHEME: http
+    ESPN_DISCOVERY_CATALOG_URL: ${ESPN_DISCOVERY_CATALOG_URL:-https://sports.core.api.espn.com/v2/sports/soccer/leagues?limit=500&lang=en&region=us}
+    # Optional rollout freeze. Null Compose values inherit a host value when
+    # configured and omit the key entirely when absent; blank strings are not
+    # valid because the runtime requires either both exact values or neither.
+    ESPN_DISCOVERY_STATE_REF_URI:
+    ESPN_DISCOVERY_STATE_REF_SHA256:
     # Development-only legacy FlareSolverr proxy URL. Production keeps this
     # blank: port 8899 requires a lease unless --allow-legacy-noauth is added.
     PROXY_FILTER_URL: ${PROXY_FILTER_URL:-}
@@ -218,6 +242,7 @@ x-airflow-common: &airflow-common
     # FotMob Silver/xref SQL. Keep the shared scheduler on the same reviewed
     # bytes as the isolated cutover stack.
     - ./configs/fotmob:/opt/airflow/configs/fotmob:ro
+    - ./configs/espn:/opt/airflow/configs/espn:ro
     # #920 Phase 3: versioned soccerdata league_dict fragment (ESPN/WhoScored
     # tournament ids). Read by scrapers/base/soccerdata_config.py, which
     # merges it into ~/soccerdata/config/league_dict.json inside the
@@ -700,6 +725,8 @@ services:
         # FotMob is lightweight direct HTTP.  A separate bounded pool prevents
         # browser scrapers from serializing it while limiting source fan-out.
         airflow pools set 'fotmob_http_pool' 4 'Bounded direct FotMob HTTP work'
+        airflow pools set 'espn_http_pool' 1 'ESPN direct-only mapped HTTP waves; global rate gate is PostgreSQL-backed'
+        airflow pools set 'espn_repository_pool' 16 'ESPN repository DDL/write coordination'
         airflow pools set 'transfermarkt_proxy' 1 'Transfermarkt production and registry proxy work'
         # Backfill has its own single-slot pool; production scheduling remains
         # independent and receives priority in proxy request permits.
@@ -804,6 +831,12 @@ services:
       - type: bind
         source: ./configs/fotmob
         target: /opt/airflow/configs/fotmob
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./configs/espn
+        target: /opt/airflow/configs/espn
         read_only: true
         bind:
           create_host_path: false
@@ -1011,17 +1044,20 @@ services:
     deploy:
       resources:
         limits:
-          # 5G caused silent memcg-OOM restarts every 20-50 min under bronze
-          # write load (#847): JVM RSS = 3.5G heap + parquet/direct buffers +
-          # metaspace + code cache > 5G; the kernel kills java, the launcher
+          # The former 5G limit caused silent memcg-OOM restarts every 20-50
+          # min under bronze write load (#847): heap, parquet/direct buffers,
+          # metaspace, and code cache exceeded the cgroup; the kernel kills
+          # java, the launcher
           # (PID 1) exits 0, so Docker never sets OOMKilled — it looks like an
-          # external restart. 8G left ~4G native headroom over the 4G heap
-          # (configs/trino/jvm.config) — but OpenMetadata table profiling
-          # (heavy profile) pushed RSS to 8.3G and OOM'd twice; 12G covers the
-          # profiling-driven off-heap spikes.
-          memory: 12G
+          # external restart. SECURITY DEFINER integrity views peak higher.
+          # 20G leaves native/off-heap room around the 8G JVM heap without
+          # increasing query limits.
+          memory: 20G
         reservations:
           memory: 1G
+    # Docker MemorySwap is total memory plus swap; retain the live 20G + 10G
+    # swap cgroup limit when this service is recreated.
+    memswap_limit: 30G
 
   # ===========================================================================
   # Superset - BI / Dashboards

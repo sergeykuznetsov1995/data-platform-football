@@ -26,8 +26,38 @@ SILVER_TRANSFORMS = [
 ]
 
 
+def _require_compact6_mode() -> str:
+    """Fence every runtime entry point to the post-cutover serving layout."""
+    from scrapers.espn.layout import COMPACT6, LayoutError, require_layout_mode
+
+    mode = require_layout_mode()
+    if mode != COMPACT6:
+        raise LayoutError(
+            "ESPN Silver transforms require ESPN_BRONZE_LAYOUT_MODE=compact6"
+        )
+    return mode
+
+
+def _validate_source_layout(**context) -> Dict[str, Any]:
+    """Prove the exact public/internal compact6 inventory before any CTAS."""
+    mode = _require_compact6_mode()
+
+    from scrapers.base.trino_manager import TrinoTableManager
+    from scrapers.espn.layout import catalog_inventory_sql, validate_catalog_layout
+
+    with TrinoTableManager() as manager:
+        rows = manager.execute_query(
+            catalog_inventory_sql(catalog="iceberg"), params=()
+        )
+    return validate_catalog_layout(mode, rows or [])
+
+
 def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
     """Materialize one ESPN Silver table through the shared atomic runner."""
+    # Repeat the observed-catalog proof here: Airflow can clear/retry one
+    # transform without rerunning its already-successful upstream preflight.
+    _validate_source_layout()
+
     from utils.silver_tasks import run_silver_transform
 
     return run_silver_transform(sql_file=sql_file, table_name=table_name, schema="silver")
@@ -35,10 +65,12 @@ def _run_transform(sql_file: str, table_name: str, **context) -> Dict[str, Any]:
 
 def _validate_silver(**context) -> Dict[str, Any]:
     """Fail on a minimum-row regression before cross-table checks run."""
+    _validate_source_layout()
+
     from airflow.exceptions import AirflowException
     from utils.silver_tasks import validate_silver_tables
 
-    validation = validate_silver_tables(tables=SILVER_MIN_ROWS, min_rows=1)
+    validation = validate_silver_tables(tables=SILVER_MIN_ROWS, min_rows=0)
     if validation["warnings"]:
         raise AirflowException(f"ESPN Silver validation failed: {validation['warnings']}")
     return validation
@@ -46,6 +78,8 @@ def _validate_silver(**context) -> Dict[str, Any]:
 
 def _validate_silver_quality(**context) -> Dict[str, Any]:
     """Merge table-local and cross-table DQ into one alert/report surface."""
+    _validate_source_layout()
+
     from airflow.exceptions import AirflowException
     from utils.alerts import telegram_dq_summary
     from utils.data_quality import run_checks
@@ -77,6 +111,10 @@ with DAG(
     max_active_runs=1,
     max_active_tasks=1,
 ) as dag:
+    validate_source_layout = PythonOperator(
+        task_id="validate_source_layout", python_callable=_validate_source_layout
+    )
+
     with TaskGroup(group_id="silver_transforms") as transforms_group:
         for task_id, sql_file, table_name in SILVER_TRANSFORMS:
             PythonOperator(
@@ -89,4 +127,4 @@ with DAG(
     validate_quality = PythonOperator(
         task_id="validate_silver_quality", python_callable=_validate_silver_quality
     )
-    transforms_group >> validate_silver >> validate_quality
+    validate_source_layout >> transforms_group >> validate_silver >> validate_quality

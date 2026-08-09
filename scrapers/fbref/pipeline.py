@@ -3991,10 +3991,56 @@ class FBrefPipeline:
             and str(summary.get("run_type") or "").casefold() == "current"
             and int(summary.get("promotion_pending_match_count") or 0) != 0
         ):
-            errors.append(
-                "promotion_pending_match_count="
-                f"{int(summary['promotion_pending_match_count'])}"
+            pending = int(summary["promotion_pending_match_count"])
+            # A budget-bounded current run legitimately leaves completed
+            # matches queued: 'skipped' targets were handed back when the
+            # budget ran out mid-wave, and a run whose remaining budget
+            # cannot fund one more claim stopped between batches without
+            # skipping anything. Both are the designed steady state of a
+            # budgeted crawler — the next run drains the backlog, and a
+            # backlog that stalls is caught by the 24h freshness SLA.
+            # Pending matches while budget remained means targets hung
+            # without a reason, which stays fatal.
+            skipped = int(target_counts.get("skipped") or 0)
+            request_remaining = max(
+                0,
+                int(summary.get("request_limit") or 0)
+                - int(summary.get("requests_used") or 0)
+                - int(summary.get("requests_reserved") or 0),
             )
+            byte_remaining = max(
+                0,
+                int(summary.get("byte_limit") or 0)
+                - int(summary.get("bytes_used") or 0)
+                - int(summary.get("bytes_reserved") or 0),
+            )
+            budget_stopped = skipped > 0 or (
+                live_wave_target_capacity(
+                    PipelineSettings(
+                        run_type="current",
+                        request_limit=int(summary.get("request_limit") or 0),
+                        byte_limit=int(summary.get("byte_limit") or 0),
+                        bootstrap_request_reservation=1,
+                        bootstrap_byte_reservation=1,
+                    ),
+                    request_remaining=request_remaining,
+                    byte_remaining=byte_remaining,
+                    bootstrap_required=False,
+                )
+                == 0
+            )
+            if budget_stopped:
+                logger.warning(
+                    "promotion_pending_match_count=%d tolerated: the run "
+                    "stopped at its budget (skipped=%d, "
+                    "request_remaining=%d, byte_remaining=%d)",
+                    pending,
+                    skipped,
+                    request_remaining,
+                    byte_remaining,
+                )
+            else:
+                errors.append(f"promotion_pending_match_count={pending}")
         if bool(summary.get("budget_exceeded")):
             errors.append("budget_exceeded=true")
         if int(summary.get("requests_used") or 0) > int(
@@ -4006,10 +4052,17 @@ class FBrefPipeline:
         ):
             errors.append("byte_limit_exceeded")
         traffic = summary.get("traffic_totals") or {}
-        success_rate = traffic.get("warm_http_success_rate")
+        # The health gate is per logical fetch unit, not per HTTP request: a
+        # residential exit can eat a one-off 403 that the very same run
+        # re-fetches successfully moments later (96% of observed 403s), and
+        # per-request accounting would count that recovered page as failure —
+        # pushing the expected rate below the threshold at the provider's
+        # baseline noise. A unit only succeeds when some attempt returned
+        # 200/304, so a genuinely banned page still fails the run.
+        success_rate = traffic.get("warm_fetch_unit_success_rate")
         if success_rate is not None and float(success_rate) < 0.95:
             errors.append(
-                f"warm_http_success_rate={float(success_rate):.4f}<0.95"
+                f"warm_fetch_unit_success_rate={float(success_rate):.4f}<0.95"
             )
         if float(traffic.get("unclassified_failure_rate") or 0.0) >= 0.005:
             errors.append(

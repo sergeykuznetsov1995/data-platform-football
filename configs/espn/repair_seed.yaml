@@ -1,0 +1,45 @@
+schema_version: espn-repair-seed-v1
+trust_policy:
+  automatic_cutover_min_source_year: 2016
+  pre_2016: legacy_untrusted
+scopes:
+  - legacy_league: ITA-Serie A
+    legacy_season: "2021"
+    scope_id: "730:2020"
+    source_season_year: 2020
+    trust_label: trusted_candidate
+    registry_promotion_required: true
+    checks: [date, duplicate, final_score, summary_coverage]
+    reason: COVID season anchor contamination
+  - legacy_league: ESP-La Liga
+    legacy_season: "2021"
+    scope_id: "740:2020"
+    source_season_year: 2020
+    trust_label: trusted_candidate
+    registry_promotion_required: true
+    checks: [date, duplicate, final_score, summary_coverage]
+    reason: COVID season anchor contamination
+  - legacy_league: ESP-La Liga
+    legacy_season: "2324"
+    scope_id: "740:2023"
+    source_season_year: 2023
+    trust_label: trusted_candidate
+    registry_promotion_required: true
+    checks: [date, duplicate, final_score, summary_coverage]
+    reason: overlapping calendar contamination
+  - legacy_league: INT-World Cup
+    legacy_season: "2022"
+    scope_id: "606:2022"
+    source_season_year: 2022
+    trust_label: trusted_candidate
+    registry_promotion_required: true
+    checks: [date, duplicate, final_score, summary_coverage]
+    reason: stage-shaped calendar repair
+  - legacy_league: FRA-Ligue 1
+    legacy_season: "1920"
+    scope_id: "710:2019"
+    source_season_year: 2019
+    trust_label: trusted_candidate
+    registry_promotion_required: true
+    checks: [date, duplicate, final_score, summary_coverage]
+    reason: shortened COVID season completeness repair

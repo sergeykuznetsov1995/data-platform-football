@@ -27,14 +27,14 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-_SCRIPT_PATH = REPO_ROOT / 'scripts' / 'audit_bronze_columns.py'
+_SCRIPT_PATH = REPO_ROOT / "scripts" / "audit_bronze_columns.py"
 
 
 def _load_module():
-    spec = importlib.util.spec_from_file_location('audit_bronze_columns', _SCRIPT_PATH)
-    assert spec is not None and spec.loader is not None, f'cannot load {_SCRIPT_PATH}'
+    spec = importlib.util.spec_from_file_location("audit_bronze_columns", _SCRIPT_PATH)
+    assert spec is not None and spec.loader is not None, f"cannot load {_SCRIPT_PATH}"
     mod = importlib.util.module_from_spec(spec)
-    sys.modules['audit_bronze_columns'] = mod
+    sys.modules["audit_bronze_columns"] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -51,7 +51,7 @@ class _FakeCursor:
 
     def execute(self, sql: str):
         # diff_contract only uses the cursor via describe() -> "DESCRIBE iceberg.bronze.<t>"
-        self._last_table = sql.rsplit('.', 1)[-1].strip()
+        self._last_table = sql.rsplit(".", 1)[-1].strip()
 
     def fetchall(self):
         return self._describe_rows.get(self._last_table, [])
@@ -62,80 +62,168 @@ def patched_contract(monkeypatch):
     """A synthetic 'testsrc' contract so tests don't couple to the live fbref one."""
     monkeypatch.setitem(
         mod.EXPECTED_TABLES,
-        'testsrc',
+        "testsrc",
         {
-            'testsrc_present': {'league', 'season', 'value'},
-            'testsrc_gone': {'league', 'season'},
-            'testsrc_restricted': {'league', 'season'},
+            "testsrc_present": {"league", "season", "value"},
+            "testsrc_gone": {"league", "season"},
+            "testsrc_restricted": {"league", "season"},
         },
     )
-    monkeypatch.setitem(mod.EXPECTED_ABSENT, 'testsrc', {'testsrc_restricted'})
+    monkeypatch.setitem(mod.EXPECTED_ABSENT, "testsrc", {"testsrc_restricted"})
+    monkeypatch.setitem(mod.SOURCE_PREFIXES, "testsrc", "testsrc_")
 
 
 def test_expected_absent_table_absent_is_not_a_failure(patched_contract):
-    cur = _FakeCursor({'testsrc_present': [('league', 'varchar'), ('season', 'varchar'),
-                                           ('value', 'bigint')]})
-    live = {'testsrc_present'}  # both _gone and _restricted absent
-    per_table = {'testsrc_present': (10, [])}
+    cur = _FakeCursor(
+        {
+            "testsrc_present": [
+                ("league", "varchar"),
+                ("season", "varchar"),
+                ("value", "bigint"),
+            ]
+        }
+    )
+    live = {"testsrc_present"}  # both _gone and _restricted absent
+    per_table = {"testsrc_present": (10, [])}
 
-    diff = mod.diff_contract(cur, 'testsrc', live, per_table)
+    diff = mod.diff_contract(cur, "testsrc", live, per_table)
 
-    assert ('testsrc_restricted', 'absent — expected (upstream restriction)') \
-        in diff['expected_absent']
-    assert ('testsrc_gone', 'absent from bronze') in diff['missing_tables']
+    assert ("testsrc_restricted", "absent — expected (upstream restriction)") in diff[
+        "expected_absent"
+    ]
+    assert ("testsrc_gone", "absent from bronze") in diff["missing_tables"]
     # restricted must NOT leak into missing_tables
-    assert all(t != 'testsrc_restricted' for t, _ in diff['missing_tables'])
+    assert all(t != "testsrc_restricted" for t, _ in diff["missing_tables"])
 
 
 def test_expected_absent_present_but_empty_is_ok(patched_contract):
-    cur = _FakeCursor({'testsrc_present': [('league', 'varchar'), ('season', 'varchar'),
-                                           ('value', 'bigint')]})
-    live = {'testsrc_present', 'testsrc_restricted', 'testsrc_gone'}
+    cur = _FakeCursor(
+        {
+            "testsrc_present": [
+                ("league", "varchar"),
+                ("season", "varchar"),
+                ("value", "bigint"),
+            ]
+        }
+    )
+    live = {"testsrc_present", "testsrc_restricted", "testsrc_gone"}
     per_table = {
-        'testsrc_present': (10, []),
-        'testsrc_restricted': (0, []),  # materialised but empty
-        'testsrc_gone': (0, []),        # empty + NOT in EXPECTED_ABSENT
+        "testsrc_present": (10, []),
+        "testsrc_restricted": (0, []),  # materialised but empty
+        "testsrc_gone": (0, []),  # empty + NOT in EXPECTED_ABSENT
     }
 
-    diff = mod.diff_contract(cur, 'testsrc', live, per_table)
+    diff = mod.diff_contract(cur, "testsrc", live, per_table)
 
-    assert ('testsrc_restricted', 'present but empty — expected') in diff['expected_absent']
-    assert ('testsrc_gone', 'present but empty (0 rows)') in diff['missing_tables']
+    assert ("testsrc_restricted", "present but empty — expected") in diff[
+        "expected_absent"
+    ]
+    assert ("testsrc_gone", "present but empty (0 rows)") in diff["missing_tables"]
 
 
 def test_missing_column_and_all_null_passthrough(patched_contract):
     # 'value' is dropped from the live DESCRIBE -> missing column.
-    cur = _FakeCursor({'testsrc_present': [('league', 'varchar'), ('season', 'varchar')]})
-    live = {'testsrc_present'}
+    cur = _FakeCursor(
+        {"testsrc_present": [("league", "varchar"), ("season", "varchar")]}
+    )
+    live = {"testsrc_present"}
     per_table = {
-        'testsrc_present': (
+        "testsrc_present": (
             10,
-            [{'table': 'testsrc_present', 'col': 'value', 'sev': 'ERROR',
-              'detail': 'ALL_NULL — 0 of 10 non-NULL (bigint)'}],
+            [
+                {
+                    "table": "testsrc_present",
+                    "col": "value",
+                    "sev": "ERROR",
+                    "detail": "ALL_NULL — 0 of 10 non-NULL (bigint)",
+                }
+            ],
         ),
     }
 
-    diff = mod.diff_contract(cur, 'testsrc', live, per_table)
+    diff = mod.diff_contract(cur, "testsrc", live, per_table)
 
-    assert ('testsrc_present', 'value') in diff['missing_columns']
-    assert ('testsrc_present', 'value',
-            'ALL_NULL — 0 of 10 non-NULL (bigint)') in diff['all_null_columns']
+    assert ("testsrc_present", "value") in diff["missing_columns"]
+    assert ("testsrc_present", "value", "ALL_NULL — 0 of 10 non-NULL (bigint)") in diff[
+        "all_null_columns"
+    ]
+
+
+class _MainCursor(_FakeCursor):
+    def __init__(self, tables, describe_rows):
+        super().__init__(describe_rows)
+        self._tables = tables
+        self._show_tables = False
+
+    def execute(self, sql: str):
+        self._show_tables = sql == "SHOW TABLES FROM iceberg.bronze"
+        if not self._show_tables:
+            super().execute(sql)
+
+    def fetchall(self):
+        if self._show_tables:
+            return [(table,) for table in self._tables]
+        return super().fetchall()
+
+
+class _MainConnection:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def cursor(self):
+        return self._cursor
+
+
+def test_main_returns_nonzero_for_machine_readable_contract_failure(
+    patched_contract, monkeypatch, tmp_path
+):
+    cursor = _MainCursor([], {})
+    monkeypatch.setattr(mod, "_get_trino_connection", lambda: _MainConnection(cursor))
+    monkeypatch.setattr(mod, "audit_table", lambda *_args: (1, []))
+
+    status = mod.main(["--source", "testsrc", "--output", str(tmp_path / "failed.md")])
+
+    assert status != 0
+
+
+def test_main_returns_zero_only_for_clean_contract(
+    patched_contract, monkeypatch, tmp_path
+):
+    describe_rows = {
+        "testsrc_present": [
+            ("league", "varchar"),
+            ("season", "varchar"),
+            ("value", "bigint"),
+        ],
+        "testsrc_gone": [("league", "varchar"), ("season", "varchar")],
+        "testsrc_restricted": [("league", "varchar"), ("season", "varchar")],
+    }
+    cursor = _MainCursor(sorted(describe_rows), describe_rows)
+    monkeypatch.setattr(mod, "_get_trino_connection", lambda: _MainConnection(cursor))
+    monkeypatch.setattr(mod, "audit_table", lambda *_args: (1, []))
+
+    status = mod.main(["--source", "testsrc", "--output", str(tmp_path / "clean.md")])
+
+    assert status == 0
 
 
 # --- Understat contract presence guard (#277) ------------------------------
 # Regression guard: all 7 native Understat Bronze tables must stay in the contract so
 # the --source understat audit keeps verifying full coverage.
-@pytest.mark.parametrize('table', [
-    'understat_schedule',
-    'understat_shots',
-    'understat_players',
-    'understat_team_match_stats',
-    'understat_player_match_stats',
-    'understat_player_team_season_stats',
-    'understat_team_season_breakdowns',
-])
+@pytest.mark.parametrize(
+    "table",
+    [
+        "understat_schedule",
+        "understat_shots",
+        "understat_players",
+        "understat_team_match_stats",
+        "understat_player_match_stats",
+        "understat_player_team_season_stats",
+        "understat_team_season_breakdowns",
+    ],
+)
 def test_understat_contract_lists_all_seven_tables(table):
-    assert table in mod.EXPECTED_TABLES['understat']
+    assert table in mod.EXPECTED_TABLES["understat"]
 
 
 def test_understat_audit_contract_is_loaded_from_native_registry():
@@ -144,7 +232,7 @@ def test_understat_audit_contract_is_loaded_from_native_registry():
         for contract in mod.UNDERSTAT_CONTRACT.TABLE_CONTRACTS
     }
 
-    assert mod.EXPECTED_TABLES['understat'] == expected
+    assert mod.EXPECTED_TABLES["understat"] == expected
 
 
 # --- WhoScored contract presence guard (#278) ------------------------------
@@ -156,39 +244,210 @@ def test_whoscored_contract_lists_complete_v2_inventory():
         mod.WHOSCORED_CONTRACT.MANIFEST_TABLES
     )
 
-    assert set(mod.EXPECTED_TABLES['whoscored']) == expected
+    assert set(mod.EXPECTED_TABLES["whoscored"]) == expected
     assert len(mod.WHOSCORED_CONTRACT.BUSINESS_TABLES) == 25
-    assert 'whoscored_season_stages' not in expected
-    assert 'whoscored_player_profile' not in expected
+    assert "whoscored_season_stages" not in expected
+    assert "whoscored_player_profile" not in expected
 
 
 def test_whoscored_contract_requires_logical_commit_column_for_every_dataset():
-    contract = mod.EXPECTED_TABLES['whoscored']
+    contract = mod.EXPECTED_TABLES["whoscored"]
 
     for table, batch_column in mod.WHOSCORED_CONTRACT.BATCH_COLUMN_BY_TABLE.items():
         assert batch_column in contract[table]
         assert mod.META_COLS <= contract[table]
 
 
-# --- ESPN contract presence guard (#279, #298) ------------------------------
-# Regression guard: the 3 ESPN bronze tables must stay in the contract so the
-# --source espn audit keeps verifying full coverage. espn_standings is NOT in
-# the contract — soccerdata's ESPN reader has no read_standings, so the table
-# never materialises (would be a permanent false-positive); the dead scrape
-# path was removed in #354. espn_matchsheet was legacy/ad-hoc but its write-path
-# is now in the daily DAG runner (ESPNScraper.read_matchsheet, soccerdata
-# read_matchsheet — #298/#713; one DAG writes all three ESPN tables).
-@pytest.mark.parametrize('table', [
-    'espn_schedule',
-    'espn_lineup',
-    'espn_matchsheet',
-])
-def test_espn_contract_lists_all_tables(table):
-    assert table in mod.EXPECTED_TABLES['espn']
+# --- ESPN native-v2 contract guard -------------------------------------------
+class _EspnInventoryCursor:
+    """Minimal information-schema + DESCRIBE cursor for topology audit tests."""
+
+    def __init__(self, relations):
+        self.relations = list(relations)
+        self.statements = []
+        self._result = []
+
+    def execute(self, sql):
+        self.statements.append(sql)
+        if "information_schema.tables" in sql:
+            self._result = [
+                (relation["schema"], relation["name"], relation["kind"])
+                for relation in self.relations
+            ]
+            return
+        if sql.startswith("DESCRIBE iceberg."):
+            _, schema, name = sql.rsplit(".", 2)
+            relation = next(
+                item
+                for item in self.relations
+                if (item["schema"], item["name"]) == (schema, name)
+            )
+            self._result = [(column, "varchar") for column in relation["columns"]]
+            return
+        raise AssertionError(f"unexpected SQL: {sql}")
+
+    def fetchall(self):
+        return self._result
+
+
+def _compact6_inventory(*, extra=()):
+    return [
+        {
+            "schema": relation.schema,
+            "name": relation.name,
+            "kind": relation.kind,
+            "columns": relation.required_columns,
+        }
+        for relation in mod.ESPN_CONTRACT.required_layout_relations("compact6")
+    ] + list(extra)
+
+
+def test_espn_layout_contract_scans_public_and_internal_inventory_exactly():
+    cursor = _EspnInventoryCursor(_compact6_inventory())
+
+    observed = mod.audit_espn_layout_contract(cursor, "compact6")
+
+    assert {(relation.schema, relation.name) for relation in observed} == {
+        (relation.schema, relation.name)
+        for relation in mod.ESPN_CONTRACT.required_layout_relations("compact6")
+    }
+    assert any("iceberg.information_schema.tables" in sql for sql in cursor.statements)
+    assert any("DESCRIBE iceberg.bronze.espn_schedule" == sql for sql in cursor.statements)
+    assert any(
+        "DESCRIBE iceberg.espn_internal.espn_schedule_legacy_archive_v1" == sql
+        for sql in cursor.statements
+    )
+
+
+def test_espn_layout_contract_rejects_an_extra_internal_relation():
+    cursor = _EspnInventoryCursor(
+        _compact6_inventory(
+            extra=(
+                {
+                    "schema": "espn_internal",
+                    "name": "espn_unreviewed_table",
+                    "kind": "BASE TABLE",
+                    "columns": {"id"},
+                },
+            )
+        )
+    )
+
+    with pytest.raises(mod.ESPN_CONTRACT.ObjectInventoryError, match="unexpected"):
+        mod.audit_espn_layout_contract(cursor, "compact6")
+
+
+def test_espn_internal_archive_reuses_the_canonical_quality_allowlist():
+    assert (
+        mod._espn_quality_table_name("espn_matchsheet_legacy_archive_v1")
+        == "espn_matchsheet"
+    )
+    assert (
+        mod._espn_quality_table_name("espn_lineup_compact6_shadow_v1")
+        == "espn_lineup"
+    )
+    assert mod._espn_quality_table_name("espn_legacy_archive_manifest_v1") == (
+        "espn_legacy_archive_manifest_v1"
+    )
+
+
+def test_espn_layout_mode_is_mandatory_for_the_source_audit(monkeypatch):
+    monkeypatch.delenv("ESPN_BRONZE_LAYOUT_MODE", raising=False)
+    with pytest.raises(ValueError, match="ESPN_BRONZE_LAYOUT_MODE is required"):
+        mod.require_espn_layout_mode()
+
+    assert mod.require_espn_layout_mode(
+        environ={"ESPN_BRONZE_LAYOUT_MODE": "compact6"}
+    ) == "compact6"
+
+
+def test_espn_main_rejects_missing_layout_before_opening_trino(monkeypatch, tmp_path):
+    monkeypatch.delenv("ESPN_BRONZE_LAYOUT_MODE", raising=False)
+    monkeypatch.setattr(
+        mod,
+        "_get_trino_connection",
+        lambda: (_ for _ in ()).throw(AssertionError("Trino must not be opened")),
+    )
+
+    assert mod.main(["--source", "espn", "--output", str(tmp_path / "audit.md")]) == 2
+
+
+def test_espn_main_uses_cross_schema_inventory_not_bronze_only(
+    monkeypatch, tmp_path
+):
+    cursor = _EspnInventoryCursor(_compact6_inventory())
+    monkeypatch.setenv("ESPN_BRONZE_LAYOUT_MODE", "compact6")
+    monkeypatch.setattr(mod, "_get_trino_connection", lambda: _MainConnection(cursor))
+    monkeypatch.setattr(mod, "_audit_espn_relations", lambda *_args: {})
+
+    assert mod.main(["--source", "espn", "--output", str(tmp_path / "audit.md")]) == 0
+    assert not any(sql == "SHOW TABLES FROM iceberg.bronze" for sql in cursor.statements)
+
+
+def test_espn_contract_is_loaded_from_dependency_free_v2_inventory():
+    # ESPN no longer uses the bronze-only ``EXPECTED_TABLES`` map: that map
+    # cannot express compact6 internal relations or public view kinds.
+    assert "espn" not in mod.EXPECTED_TABLES
+    assert "espn" in mod.SOURCE_PREFIXES
+    assert callable(mod.ESPN_CONTRACT.audit_layout_inventory)
+
+
+def test_espn_contract_lists_legacy_native_current_and_control_objects():
+    legacy = mod.ESPN_CONTRACT.required_layout_relations("legacy14")
+    compact = mod.ESPN_CONTRACT.required_layout_relations("compact6")
+    public_compact = [
+        relation
+        for relation in compact
+        if relation.schema == mod.ESPN_CONTRACT.BRONZE_SCHEMA
+    ]
+
+    assert len(legacy) == 14
+    assert {(relation.schema, relation.name, relation.kind) for relation in public_compact} == {
+        ("bronze", "espn_schedule", "VIEW"),
+        ("bronze", "espn_lineup", "VIEW"),
+        ("bronze", "espn_matchsheet", "VIEW"),
+        ("bronze", "espn_ingest_manifest_v2", "BASE TABLE"),
+        ("bronze", "espn_request_ledger_generation_v2", "BASE TABLE"),
+        ("bronze", "espn_catalog_snapshot_v2", "BASE TABLE"),
+    }
 
 
 def test_espn_standings_excluded_from_contract():
-    assert 'espn_standings' not in mod.EXPECTED_TABLES['espn']
+    assert all(
+        relation.name != "espn_standings"
+        for layout in ("legacy14", "compact6")
+        for relation in mod.ESPN_CONTRACT.required_layout_relations(layout)
+    )
+
+
+def test_capability_gated_empty_espn_entity_remains_a_nonfatal_quality_finding(
+    monkeypatch,
+):
+    relation = next(
+        relation
+        for relation in mod.ESPN_CONTRACT.required_layout_relations("compact6")
+        if relation.name == "espn_lineup_generation_v2"
+    )
+    monkeypatch.setattr(
+        mod,
+        "audit_table",
+        lambda *_args, **_kwargs: (
+            0,
+            [
+                {
+                    "table": relation.name,
+                    "col": "*",
+                    "sev": "INFO",
+                    "detail": "table is empty",
+                }
+            ],
+        ),
+    )
+
+    per_relation = mod._audit_espn_relations(object(), (relation,))
+
+    assert per_relation["espn_internal.espn_lineup_generation_v2"][0] == 0
+    assert per_relation["espn_internal.espn_lineup_generation_v2"][1][0]["sev"] == "INFO"
 
 
 # --- SofaScore contract presence guard (#280) ------------------------------
@@ -196,18 +455,21 @@ def test_espn_standings_excluded_from_contract():
 # the --source sofascore audit keeps verifying full coverage. All 8 materialise
 # and are non-empty live (verified 2026-06-04, #280): the 2 soccerdata tables
 # (schedule, league_table) + 6 cherry-pick JSON-API tables.
-@pytest.mark.parametrize('table', [
-    'sofascore_schedule',
-    'sofascore_league_table',
-    'sofascore_player_ratings',
-    'sofascore_player_season_stats',
-    'sofascore_player_profile',
-    'sofascore_event_shotmap',
-    'sofascore_event_player_stats',
-    'sofascore_match_stats',
-])
+@pytest.mark.parametrize(
+    "table",
+    [
+        "sofascore_schedule",
+        "sofascore_league_table",
+        "sofascore_player_ratings",
+        "sofascore_player_season_stats",
+        "sofascore_player_profile",
+        "sofascore_event_shotmap",
+        "sofascore_event_player_stats",
+        "sofascore_match_stats",
+    ],
+)
 def test_sofascore_contract_lists_all_eight_tables(table):
-    assert table in mod.EXPECTED_TABLES['sofascore']
+    assert table in mod.EXPECTED_TABLES["sofascore"]
 
 
 # --- FotMob contract presence guard (#281) ---------------------------------
@@ -218,19 +480,22 @@ def test_sofascore_contract_lists_all_eight_tables(table):
 # transfers 100, match_details 380, player_details 607 rows. 14 columns are
 # 100% NULL (10 dead-legacy drift -> followup #304, 4 upstream-missing) and live
 # in EXPECTED_NULL so the contract audit stays green.
-@pytest.mark.parametrize('table', [
-    'fotmob_schedule',
-    'fotmob_team_stats',
-    'fotmob_player_stats',
-    'fotmob_team_profile',
-    'fotmob_team_squad',
-    'fotmob_team_leaderboards',
-    'fotmob_transfers',
-    'fotmob_match_details',
-    'fotmob_player_details',
-])
+@pytest.mark.parametrize(
+    "table",
+    [
+        "fotmob_schedule",
+        "fotmob_team_stats",
+        "fotmob_player_stats",
+        "fotmob_team_profile",
+        "fotmob_team_squad",
+        "fotmob_team_leaderboards",
+        "fotmob_transfers",
+        "fotmob_match_details",
+        "fotmob_player_details",
+    ],
+)
 def test_fotmob_contract_lists_all_nine_tables(table):
-    assert table in mod.EXPECTED_TABLES['fotmob']
+    assert table in mod.EXPECTED_TABLES["fotmob"]
 
 
 # --- ClubElo contract presence guard (#283) --------------------------------
@@ -242,12 +507,15 @@ def test_fotmob_contract_lists_all_nine_tables(table):
 # replace_partitions=['rating_date'] + weekly cadence, neutralizing the
 # daily-APPEND HDFS-overflow footgun (2026-05-04 incident). clubelo_team_history
 # was dropped in #604 (write-only, never read).
-@pytest.mark.parametrize('table', [
-    'clubelo_ratings',
-    'clubelo_ratings_historical',
-])
+@pytest.mark.parametrize(
+    "table",
+    [
+        "clubelo_ratings",
+        "clubelo_ratings_historical",
+    ],
+)
 def test_clubelo_contract_lists_both_tables(table):
-    assert table in mod.EXPECTED_TABLES['clubelo']
+    assert table in mod.EXPECTED_TABLES["clubelo"]
 
 
 # --- MatchHistory contract presence guard (#282) ---------------------------
@@ -255,11 +523,14 @@ def test_clubelo_contract_lists_both_tables(table):
 # контракте, чтобы --source matchhistory продолжал проверять покрытие. matchhistory_results
 # материализуется и не пустая live (verified 2026-06-04, #282): сезоны 2021-2025, ~380/сезон.
 # 0 all-NULL колонок. #307 RESOLVED: silver мигрирован на matchhistory_results, games дропнут.
-@pytest.mark.parametrize('table', [
-    'matchhistory_results',
-])
+@pytest.mark.parametrize(
+    "table",
+    [
+        "matchhistory_results",
+    ],
+)
 def test_matchhistory_contract_lists_all_tables(table):
-    assert table in mod.EXPECTED_TABLES['matchhistory']
+    assert table in mod.EXPECTED_TABLES["matchhistory"]
 
 
 # --- SoFIFA contract presence guard (#284) ---------------------------------
@@ -271,38 +542,44 @@ def test_matchhistory_contract_lists_all_tables(table):
 # team_ratings 20, teams 20, versions 852, leagues 1. The 15 dead FC-26
 # sofifa_team_ratings cols (build_up/chance_creation/defence/...) were removed
 # from the parser + Bronze (#601), so there is no longer an EXPECTED_NULL entry.
-@pytest.mark.parametrize('table', [
-    'sofifa_players',
-    'sofifa_teams',
-    'sofifa_player_ratings',
-    'sofifa_team_ratings',
-    'sofifa_versions',
-    'sofifa_leagues',
-])
+@pytest.mark.parametrize(
+    "table",
+    [
+        "sofifa_players",
+        "sofifa_teams",
+        "sofifa_player_ratings",
+        "sofifa_team_ratings",
+        "sofifa_versions",
+        "sofifa_leagues",
+    ],
+)
 def test_sofifa_contract_lists_all_six_tables(table):
-    assert table in mod.EXPECTED_TABLES['sofifa']
+    assert table in mod.EXPECTED_TABLES["sofifa"]
 
 
 # --- Transfermarkt native-v2 + transition contract presence guard ----------
 # Four legacy tables stay audited for the dual-write rollback window; six
 # native tables encode honest season/global grains.
-@pytest.mark.parametrize('table', [
-    'transfermarkt_players',
-    'transfermarkt_market_value_history',
-    'transfermarkt_transfers',
-    'transfermarkt_coaches',
-    'transfermarkt_squad_memberships',
-    'transfermarkt_player_attribute_observations',
-    'transfermarkt_player_contract_observations',
-    'transfermarkt_market_value_points',
-    'transfermarkt_transfer_events',
-    'transfermarkt_coach_profiles',
-    'transfermarkt_coach_stints',
-    'transfermarkt_competitions',
-    'transfermarkt_competition_editions',
-])
+@pytest.mark.parametrize(
+    "table",
+    [
+        "transfermarkt_players",
+        "transfermarkt_market_value_history",
+        "transfermarkt_transfers",
+        "transfermarkt_coaches",
+        "transfermarkt_squad_memberships",
+        "transfermarkt_player_attribute_observations",
+        "transfermarkt_player_contract_observations",
+        "transfermarkt_market_value_points",
+        "transfermarkt_transfer_events",
+        "transfermarkt_coach_profiles",
+        "transfermarkt_coach_stints",
+        "transfermarkt_competitions",
+        "transfermarkt_competition_editions",
+    ],
+)
 def test_transfermarkt_contract_lists_transition_and_native_tables(table):
-    assert table in mod.EXPECTED_TABLES['transfermarkt']
+    assert table in mod.EXPECTED_TABLES["transfermarkt"]
 
 
 # --- Capology contract presence guard (#321) -------------------------------
@@ -314,11 +591,14 @@ def test_transfermarkt_contract_lists_transition_and_native_tables(table):
 # season backfill populates adjusted_total_*, resolving #319) -> no
 # EXPECTED_NULL entry. Positional payroll split d/f/k/m is Capology-Pro-locked
 # upstream and intentionally not ingested.
-@pytest.mark.parametrize('table', [
-    'capology_player_salaries',
-    'capology_team_payrolls',
-    'capology_contract_extensions',
-    'capology_transfer_window',
-])
+@pytest.mark.parametrize(
+    "table",
+    [
+        "capology_player_salaries",
+        "capology_team_payrolls",
+        "capology_contract_extensions",
+        "capology_transfer_window",
+    ],
+)
 def test_capology_contract_lists_all_four_tables(table):
-    assert table in mod.EXPECTED_TABLES['capology']
+    assert table in mod.EXPECTED_TABLES["capology"]

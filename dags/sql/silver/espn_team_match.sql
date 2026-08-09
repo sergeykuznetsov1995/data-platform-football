@@ -2,7 +2,7 @@
 -- Silver: espn_team_match (native v2)
 -- =============================================================================
 -- Grain/PK: one row per (event_id, team_id), played final matches only.
--- Sources (native v2): schedule event rows (event_id/team ids bigint, score
+-- Sources (native v2): compact6 canonical schedule event rows (event_id/team ids bigint, score
 -- integers, played_final boolean, extra_json varchar); matchsheet team rows
 -- (event_id/team_id bigint, score integer, measured stat varchars).
 -- Notes: matchsheet is authoritative for both sides' score when available; the
@@ -17,8 +17,20 @@
 -- DAG integration: run_silver_transform wraps this pure SELECT in CTAS.
 -- =============================================================================
 
-WITH bronze_src_schedule AS (
-    SELECT * FROM iceberg.bronze.espn_schedule_generation_v2
+WITH espn_downstream_scope (
+    scope_id, espn_id, source_season_year, platform_league,
+    platform_season_slug, convention, effective_start_date, effective_end_date
+) AS (VALUES
+__ESPN_DOWNSTREAM_SCOPE_VALUES__
+),
+bronze_src_schedule AS (
+    SELECT
+        es_source.*,
+        espn_scope.platform_league AS platform_league,
+        espn_scope.platform_season_slug AS platform_season_slug
+    FROM iceberg.bronze.espn_schedule AS es_source
+    JOIN espn_downstream_scope espn_scope ON
+__ESPN_DOWNSTREAM_SCOPE_FILTER__
 ),
 schedule_dedup AS (
     SELECT * FROM (
@@ -27,7 +39,10 @@ schedule_dedup AS (
     ) WHERE rn = 1
 ),
 bronze_src_matchsheet AS (
-    SELECT * FROM iceberg.bronze.espn_matchsheet_generation_v2
+    SELECT es_source.*
+    FROM iceberg.bronze.espn_matchsheet AS es_source
+    JOIN espn_downstream_scope espn_scope ON
+__ESPN_DOWNSTREAM_SCOPE_FILTER__
 ),
 matchsheet_dedup AS (
     SELECT * FROM (
@@ -76,8 +91,8 @@ matchsheet_rows AS (
         TRY_CAST(m.red_cards AS integer) AS red_cards,
         'matchsheet' AS stats_source,
         m._ingested_at AS _bronze_ingested_at,
-        s.competition_slug,
-        s.source_season_year
+        s.platform_league,
+        s.platform_season_slug
     FROM matchsheet_dedup m
     JOIN schedule_dedup s ON s.event_id = m.event_id
     LEFT JOIN matchsheet_dedup opponent
@@ -89,7 +104,7 @@ matchsheet_rows AS (
     WHERE s.played_final
 ),
 scoreboard_home_flat AS (
-    SELECT s.event_id, s._ingested_at, s.competition_slug, s.source_season_year,
+    SELECT s.event_id, s._ingested_at, s.platform_league, s.platform_season_slug,
            s.home_team_id AS team_id, s.home_team AS team, s.away_team_id AS opponent_team_id,
            TRUE AS is_home, s.home_score AS goals_for, s.away_score AS goals_against,
            json_extract_scalar(stat, '$.name') AS stat_name,
@@ -100,7 +115,7 @@ scoreboard_home_flat AS (
     WHERE s.played_final AND m.event_id IS NULL
 ),
 scoreboard_away_flat AS (
-    SELECT s.event_id, s._ingested_at, s.competition_slug, s.source_season_year,
+    SELECT s.event_id, s._ingested_at, s.platform_league, s.platform_season_slug,
            s.away_team_id AS team_id, s.away_team AS team, s.home_team_id AS opponent_team_id,
            FALSE AS is_home, s.away_score AS goals_for, s.home_score AS goals_against,
            json_extract_scalar(stat, '$.name') AS stat_name,
@@ -139,8 +154,8 @@ scoreboard_rows AS (
         CAST(NULL AS integer) AS red_cards,
         'scoreboard' AS stats_source,
         MAX(_ingested_at) AS _bronze_ingested_at,
-        MAX(competition_slug) AS competition_slug,
-        MAX(source_season_year) AS source_season_year
+        MAX(platform_league) AS platform_league,
+        MAX(platform_season_slug) AS platform_season_slug
     FROM (
         SELECT * FROM scoreboard_home_flat
         UNION ALL
@@ -172,6 +187,6 @@ SELECT
     -- ===== Lineage =====
     _bronze_ingested_at,
     -- ===== Partition keys =====
-    competition_slug AS league,
-    CAST(source_season_year AS varchar) AS season
+    platform_league AS league,
+    platform_season_slug AS season
 FROM unioned

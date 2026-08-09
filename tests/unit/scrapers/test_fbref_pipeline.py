@@ -52,6 +52,7 @@ from scrapers.fbref.raw_store import (
 )
 from scrapers.fbref.settings import (
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
+    DEFAULT_REQUEST_RESERVATION_BYTES,
     MIN_DOMAIN_INTERVAL_SECONDS,
 )
 from scrapers.fbref.typed_bronze import TYPED_BRONZE_PARSER_VERSION
@@ -3436,6 +3437,65 @@ def test_validation_accepts_a_clearance_re_solved_on_a_fresh_proxy(tmp_path):
     assert "finish:True" in control.events
 
 
+def test_validation_forgives_a_403_recovered_by_a_same_run_refetch(tmp_path):
+    """A one-off residential 403 that the same run re-fetches to 200 is a
+    healthy fetch unit. Per-request accounting counted the wasted 403 as a
+    failure and sank the warm rate below 0.95 at the provider's baseline
+    noise; the gate is per logical fetch unit, so a recovered page passes."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    # 40 pages, one of which needed a 403 then a 200 retry: 41 HTTP requests,
+    # 40 warm successes → per-request rate 0.9756 (<0.95 once a few recur),
+    # per-unit rate 1.0.
+    summary["traffic_totals"] = {
+        "network_attempts": 41,
+        "warm_http_successes": 40,
+        "warm_http_success_rate": 40 / 41,
+        "warm_fetch_units": 40,
+        "warm_fetch_units_succeeded": 40,
+        "warm_fetch_unit_success_rate": 1.0,
+        "unclassified_failures": 0,
+        "unclassified_failure_rate": 0.0,
+        "duplicate_fetch_violations": 0,
+    }
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:True" in control.events
+
+
+def test_validation_still_fails_a_genuinely_banned_fetch_unit(tmp_path):
+    """A page that never returns 200/304 in any attempt is a real failure and
+    must still sink the run — the per-unit gate does not mask true bans."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    # 40 units, 3 never recovered → per-unit rate 0.925 < 0.95.
+    summary["traffic_totals"] = {
+        "network_attempts": 44,
+        "warm_http_successes": 37,
+        "warm_http_success_rate": 37 / 44,
+        "warm_fetch_units": 40,
+        "warm_fetch_units_succeeded": 37,
+        "warm_fetch_unit_success_rate": 37 / 40,
+        "unclassified_failures": 0,
+        "unclassified_failure_rate": 0.0,
+        "duplicate_fetch_violations": 0,
+    }
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(
+        RunValidationError, match="warm_fetch_unit_success_rate=0.9250<0.95"
+    ):
+        pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:False" not in control.events
+
+
 def test_current_publication_blocks_pending_match_backlog(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
@@ -3447,6 +3507,70 @@ def test_current_publication_blocks_pending_match_backlog(tmp_path):
     with pytest.raises(
         RunValidationError, match="promotion_pending_match_count=26"
     ):
+        pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:False" not in control.events
+
+
+def test_current_publication_tolerates_pending_after_budget_requeue(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary["promotion_pending_match_count"] = 26
+    summary["target_counts"] = {"succeeded": 5, "skipped": 3}
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:True" in control.events
+
+
+def test_current_publication_tolerates_pending_when_request_budget_spent(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.run["requests_used"] = control.run["request_limit"]
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary["promotion_pending_match_count"] = 26
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:True" in control.events
+
+
+def test_current_publication_tolerates_pending_when_byte_budget_cannot_fund_a_fetch(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.run["bytes_used"] = (
+        control.run["byte_limit"] - DEFAULT_REQUEST_RESERVATION_BYTES + 1
+    )
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary["promotion_pending_match_count"] = 26
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:True" in control.events
+
+
+def test_budget_stopped_pending_run_still_fails_on_budget_overrun(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary["promotion_pending_match_count"] = 26
+    summary["target_counts"] = {"succeeded": 5, "skipped": 3}
+    summary["budget_exceeded"] = True
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(RunValidationError, match="budget_exceeded=true"):
         pipeline.validate_and_finish(str(uuid.uuid4()))
 
     assert "finish:False" not in control.events

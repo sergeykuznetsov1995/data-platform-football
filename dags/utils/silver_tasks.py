@@ -54,6 +54,44 @@ _FBREF_BRONZE_READ_RE = re.compile(
     r"iceberg\.bronze\.(?P<table>fbref_(?!target_scope\b)[a-z0-9_]+)\b",
     re.IGNORECASE,
 )
+_INLINE_TEMPLATE_RE = re.compile(r"\{\{[^{}]+\}\}")
+_SQL_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_SQL_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
+
+
+def _render_transform_select_sql(select_sql: str) -> str:
+    """Apply every source-owned SQL renderer and reject live placeholders."""
+
+    if not isinstance(select_sql, str) or not select_sql.strip():
+        raise ValueError("transform SQL must be a non-empty string")
+    rendered = select_sql.strip()
+    if "{{ fotmob_league_map_values_sql }}" in rendered:
+        from scrapers.fotmob.constants import render_fotmob_sql
+
+        rendered = render_fotmob_sql(rendered)
+
+    from utils.espn_season_mapping import render_espn_downstream_sql
+
+    rendered = render_espn_downstream_sql(rendered)
+    executable = _SQL_BLOCK_COMMENT_RE.sub("", rendered)
+    executable = _SQL_LINE_COMMENT_RE.sub("", executable)
+    unresolved = sorted(set(_INLINE_TEMPLATE_RE.findall(executable)))
+    if unresolved:
+        raise ValueError(
+            "transform SQL contains unresolved inline template markers: "
+            + ", ".join(unresolved)
+        )
+    if rendered.endswith(';'):
+        rendered = rendered[:-1].rstrip()
+    return rendered
+
+
+def _load_transform_select_sql(sql_file: str) -> str:
+    sql_path = _resolve_sql_path(sql_file)
+    select_sql = sql_path.read_text(encoding='utf-8')
+    if not select_sql.strip():
+        raise ValueError(f"SQL file is empty: {sql_path}")
+    return _render_transform_select_sql(select_sql)
 
 
 def fbref_control_run_id_from_context(context: Mapping[str, Any]) -> str:
@@ -296,19 +334,7 @@ def run_silver_transform(
     # --- 1. Read SQL file ---
     sql_path = _resolve_sql_path(sql_file)
     logger.info(f"Reading SQL from {sql_path}")
-    select_sql = sql_path.read_text(encoding='utf-8').strip()
-
-    if not select_sql:
-        raise ValueError(f"SQL file is empty: {sql_path}")
-
-    if "{{ fotmob_league_map_values_sql }}" in select_sql:
-        from scrapers.fotmob.constants import render_fotmob_sql
-
-        select_sql = render_fotmob_sql(select_sql)
-
-    # Remove trailing semicolon if present (Trino CTAS doesn't need it)
-    if select_sql.endswith(';'):
-        select_sql = select_sql[:-1].rstrip()
+    select_sql = _load_transform_select_sql(str(sql_path))
     select_sql = _scope_fbref_bronze_reads(
         select_sql, control_run_id=fbref_control_run_id
     )
@@ -500,11 +526,7 @@ def run_silver_transform_partition_staged(
         raise ValueError("source_version_sql must have a deterministic ORDER BY")
 
     sql_path = _resolve_sql_path(sql_file)
-    select_sql = sql_path.read_text(encoding='utf-8').strip()
-    if not select_sql:
-        raise ValueError(f"SQL file is empty: {sql_path}")
-    if select_sql.endswith(';'):
-        select_sql = select_sql[:-1].rstrip()
+    select_sql = _load_transform_select_sql(str(sql_path))
 
     full_table = f"{catalog}.{schema}.{table_name}"
     staging_name = f"{table_name}_stage"
@@ -891,11 +913,7 @@ def run_silver_partition_insert(
 
     # Read SELECT body
     sql_path = _resolve_sql_path(sql_file)
-    select_sql = sql_path.read_text(encoding='utf-8').strip()
-    if not select_sql:
-        raise ValueError(f"SQL file is empty: {sql_path}")
-    if select_sql.endswith(';'):
-        select_sql = select_sql[:-1].rstrip()
+    select_sql = _load_transform_select_sql(str(sql_path))
 
     result: Dict[str, Any] = {
         'table': full_table,

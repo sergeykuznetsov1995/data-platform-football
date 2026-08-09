@@ -10,19 +10,24 @@ Scans every column in every `iceberg.bronze.*` table and flags:
 Usage (inside airflow-webserver container):
     python /opt/airflow/scripts/audit_bronze_columns.py --output /tmp/audit.md
 
-Uses the lightweight Silver Trino helper and never imports scraper runtimes.
+``--source espn`` additionally requires ``ESPN_BRONZE_LAYOUT_MODE`` and
+audits the exact reviewed relation inventory across ``bronze`` and
+``espn_internal``.  It still uses only the dependency-free ESPN contract, not
+scraper runtimes.
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
+import os
 import re
 import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 sys.path.insert(0, "/opt/airflow/dags")
 from utils.silver_tasks import _get_trino_connection
@@ -52,10 +57,34 @@ def _load_whoscored_contract():
 WHOSCORED_CONTRACT = _load_whoscored_contract()
 
 
+def _load_espn_contract():
+    """Load the dependency-free retained/native/current ESPN inventory."""
+
+    path = Path(__file__).with_name("espn_v2_object_contract.py")
+    spec = importlib.util.spec_from_file_location(
+        "_audit_espn_v2_object_contract",
+        path,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load ESPN object contract: {path}")
+    module = importlib.util.module_from_spec(spec)
+    # ``RelationContract`` / ``RelationInventory`` are dataclasses.  Their
+    # forward-annotation resolution requires the dynamically loaded module to
+    # be visible while its decorators run.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+ESPN_CONTRACT = _load_espn_contract()
+
+
 def _load_understat_contract():
     """Load the dependency-free native seven-table registry directly."""
 
-    path = Path(__file__).resolve().parents[1] / "scrapers" / "understat" / "contracts.py"
+    path = (
+        Path(__file__).resolve().parents[1] / "scrapers" / "understat" / "contracts.py"
+    )
     module_name = "_audit_understat_contract"
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
@@ -491,59 +520,10 @@ if set(WHOSCORED_IDENTITY_COLUMNS) != set(WHOSCORED_CONTRACT.BUSINESS_TABLES):
 # without importing optional browser runtimes. Semantics: listed columns are the
 # minimal required set; extra
 # live columns are NOT errors. Used by the `--source` contract-diff mode.
-# #274 seeds espn only; other sources filled in #276-#286.
+# ESPN uses a separate exact public/internal relation contract below because a
+# bronze-only name→column map cannot represent compact6 serving views or moved
+# operational relations. Other source contracts were filled in #276-#286.
 EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
-    "espn": {
-        # Reliably-produced set (verified vs live bronze 2026-06-03). The
-        # _standardize_schedule renames (home_score->home_goals, venue, attendance)
-        # are conditional on raw soccerdata columns that ESPN never supplies, so
-        # those targets never materialise — contract lists what actually lands.
-        "espn_schedule": {
-            "league",
-            "season",
-            "game",
-            "match_date",
-            "home_team",
-            "away_team",
-            "game_id",
-            "league_id",
-            *META_COLS,
-        },
-        # Producer: ESPNScraper.read_lineup (dags/scripts/run_espn_scraper.py
-        # lineup branch). Extra stat columns also land, but only these are
-        # required.
-        "espn_lineup": {
-            "league",
-            "season",
-            "game",
-            "team",
-            "player",
-            "position",
-            "formation_place",
-            "sub_in",
-            "sub_out",
-            *META_COLS,
-        },
-        # Producer: ESPNScraper.read_matchsheet (run_espn_scraper.py matchsheet
-        # branch; soccerdata read_matchsheet — #298). One row per (game, team) with
-        # venue + ~35 team stat columns; only identity + venue are required
-        # (extra stat columns are NOT errors; `capacity` is 100%-NULL and lives
-        # in EXPECTED_NULL, so it is not listed here).
-        "espn_matchsheet": {
-            "league",
-            "season",
-            "game",
-            "team",
-            "is_home",
-            "venue",
-            "attendance",
-            *META_COLS,
-        },
-        # NOTE: espn_standings is NOT in the contract — soccerdata's ESPN reader
-        # has no read_standings, so the table is never materialised. The dead
-        # scrape path was removed in #354. Listing it here would be a permanent
-        # false-positive.
-    },
     "fbref": {
         # Minimal required set per table — identity keys + a few core metrics
         # (FBref schemas are wide & volatile; extra live columns are NOT errors,
@@ -1413,6 +1393,9 @@ EXPECTED_TABLES: dict[str, dict[str, set[str]]] = {
     },
 }
 
+CAPABILITY_EMPTY_ALLOWED: dict[str, set[str]] = {
+}
+
 # Tables a source's contract names but that are intentionally NOT materialised
 # (upstream restriction). Absent / empty == PASS, surfaced as "expected absent (OK)"
 # instead of a missing-table failure.
@@ -1434,8 +1417,8 @@ SOURCE_GROUPS = [
 ]
 
 
-# CLI slug -> live bronze table prefix. Slug == key in EXPECTED_TABLES.
-# (SOURCE_GROUPS is label-oriented for the full-scan report; --source needs a slug.)
+# CLI slug -> live bronze table prefix. ESPN is the one exception: its
+# ``--source`` path uses the exact layout contract across two schemas.
 SOURCE_PREFIXES: dict[str, str] = {
     "fbref": "fbref_",
     "understat": "understat_",
@@ -1458,6 +1441,37 @@ def source_of(table: str) -> str:
     return "Other"
 
 
+ESPN_LAYOUT_MODE_ENV = "ESPN_BRONZE_LAYOUT_MODE"
+
+
+def _validate_espn_layout_mode(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{ESPN_LAYOUT_MODE_ENV} is required")
+    normalized = value.strip()
+    if normalized not in ESPN_CONTRACT.LAYOUT_MODES:
+        raise ValueError(
+            f"{ESPN_LAYOUT_MODE_ENV} must be legacy14 or compact6, got {normalized!r}"
+        )
+    return normalized
+
+
+def require_espn_layout_mode(
+    *, environ: Mapping[str, str] | None = None
+) -> str:
+    """Resolve the exact topology for an ESPN-only audit, never a default."""
+    source = os.environ if environ is None else environ
+    return _validate_espn_layout_mode(source.get(ESPN_LAYOUT_MODE_ENV))
+
+
+def _espn_quality_table_name(table: str) -> str:
+    """Map compact6 physical entity relations to existing quality allowlists."""
+    for entity in ("schedule", "lineup", "matchsheet"):
+        canonical = f"espn_{entity}"
+        if table == canonical or table.startswith(canonical + "_"):
+            return canonical
+    return table
+
+
 # ---- Helpers ----
 
 _PARTITIONING_RE = re.compile(
@@ -1465,8 +1479,16 @@ _PARTITIONING_RE = re.compile(
 )
 
 
-def get_partition_cols(cur, table: str) -> set[str]:
-    cur.execute(f"SHOW CREATE TABLE iceberg.bronze.{table}")
+def get_partition_cols(
+    cur,
+    table: str,
+    *,
+    schema: str = "bronze",
+    relation_kind: str = "BASE TABLE",
+) -> set[str]:
+    if relation_kind != "BASE TABLE":
+        return set()
+    cur.execute(f"SHOW CREATE TABLE iceberg.{schema}.{table}")
     ddl = cur.fetchall()[0][0]
     m = _PARTITIONING_RE.search(ddl)
     if not m:
@@ -1474,9 +1496,55 @@ def get_partition_cols(cur, table: str) -> set[str]:
     return {x.strip().strip("'\"") for x in m.group(1).split(",") if x.strip()}
 
 
-def describe(cur, table: str) -> list[tuple[str, str]]:
-    cur.execute(f"DESCRIBE iceberg.bronze.{table}")
+def describe(cur, table: str, *, schema: str = "bronze") -> list[tuple[str, str]]:
+    cur.execute(f"DESCRIBE iceberg.{schema}.{table}")
     return [(r[0], r[1]) for r in cur.fetchall()]
+
+
+def espn_layout_inventory(cur) -> tuple:
+    """Read the complete ESPN-only inventory from public and internal schemas."""
+    cur.execute(
+        "SELECT table_schema, table_name, table_type "
+        "FROM iceberg.information_schema.tables "
+        "WHERE table_schema IN ('bronze', 'espn_internal') "
+        "AND substr(table_name, 1, 5) = 'espn_'"
+    )
+    inventory = []
+    for raw in cur.fetchall():
+        if isinstance(raw, Mapping):
+            schema = raw.get("table_schema")
+            name = raw.get("table_name")
+            kind = raw.get("table_type")
+        else:
+            values = tuple(raw)
+            if len(values) != 3:
+                raise ESPN_CONTRACT.ObjectInventoryError(
+                    "information-schema relation row is malformed"
+                )
+            schema, name, kind = values
+        try:
+            columns = frozenset(column for column, _ in describe(cur, name, schema=schema))
+            inventory.append(
+                ESPN_CONTRACT.RelationInventory(
+                    schema=schema,
+                    name=name,
+                    kind=kind,
+                    columns=columns,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ESPN_CONTRACT.ObjectInventoryError(
+                f"invalid ESPN relation inventory for {schema}.{name}"
+            ) from exc
+    return tuple(inventory)
+
+
+def audit_espn_layout_contract(cur, layout_mode: str) -> tuple:
+    """Fail closed on any ESPN topology or required-column drift."""
+    layout_mode = _validate_espn_layout_mode(layout_mode)
+    inventory = espn_layout_inventory(cur)
+    ESPN_CONTRACT.audit_layout_inventory(layout_mode, inventory)
+    return inventory
 
 
 def safe_alias(col: str, idx: int) -> str:
@@ -1504,13 +1572,25 @@ def is_skip_distinct(typ: str) -> bool:
 # ---- Audit ----
 
 
-def audit_table(cur, table: str) -> tuple[int, list[dict]]:
+def audit_table(
+    cur,
+    table: str,
+    *,
+    schema: str = "bronze",
+    relation_kind: str = "BASE TABLE",
+    quality_table: str | None = None,
+) -> tuple[int, list[dict]]:
     """Return (total_rows, findings) for one table."""
-    cols = describe(cur, table)
+    cols = describe(cur, table, schema=schema)
     if not cols:
         return 0, []
     try:
-        partition_cols = get_partition_cols(cur, table)
+        partition_cols = get_partition_cols(
+            cur,
+            table,
+            schema=schema,
+            relation_kind=relation_kind,
+        )
     except Exception as e:
         print(f"  ! get_partition_cols({table}) failed: {e}", file=sys.stderr)
         partition_cols = set()
@@ -1533,7 +1613,7 @@ def audit_table(cur, table: str) -> tuple[int, list[dict]]:
             )
         plan.append((col, typ, alias, do_es))
 
-    sql = f"SELECT {', '.join(select_parts)} FROM iceberg.bronze.{table}"
+    sql = f"SELECT {', '.join(select_parts)} FROM iceberg.{schema}.{table}"
     cur.execute(sql)
     desc = [d[0] for d in cur.description]
     row = cur.fetchall()[0]
@@ -1546,8 +1626,9 @@ def audit_table(cur, table: str) -> tuple[int, list[dict]]:
         ]
 
     findings: list[dict] = []
-    allow_for_table = EXPECTED_NULL.get(table, set())
-    allow_constant = EXPECTED_CONSTANT.get(table, set())
+    quality_table = table if quality_table is None else quality_table
+    allow_for_table = EXPECTED_NULL.get(quality_table, set())
+    allow_constant = EXPECTED_CONSTANT.get(quality_table, set())
 
     for col, typ, alias, do_es in plan:
         nn = int(res.get(f"{alias}__nn", 0) or 0)
@@ -1652,8 +1733,10 @@ def diff_contract(
     """
     contract = EXPECTED_TABLES.get(source, {})
     absent_ok = EXPECTED_ABSENT.get(source, set())
+    capability_empty_ok = CAPABILITY_EMPTY_ALLOWED.get(source, set())
     missing_tables: list[tuple[str, str]] = []
     expected_absent: list[tuple[str, str]] = []
+    expected_empty: list[tuple[str, str]] = []
     missing_columns: list[tuple[str, str]] = []
     all_null_columns: list[tuple[str, str, str]] = []
 
@@ -1676,9 +1759,12 @@ def diff_contract(
         if total == 0:
             if in_absent_ok:
                 expected_absent.append((table, "present but empty — expected"))
+                continue
+            if table in capability_empty_ok:
+                expected_empty.append((table, "present but empty — capability-gated"))
             else:
                 missing_tables.append((table, "present but empty (0 rows)"))
-            continue
+                continue
         live_cols = {c.lower() for c, _ in describe(cur, table)}
         for col in sorted(expected_cols):
             if col.lower() not in live_cols:
@@ -1694,6 +1780,7 @@ def diff_contract(
     return {
         "missing_tables": missing_tables,
         "expected_absent": expected_absent,
+        "expected_empty": expected_empty,
         "missing_columns": missing_columns,
         "all_null_columns": all_null_columns,
     }
@@ -1817,6 +1904,7 @@ def render_source_report(
     """Per-source contract report: missing tables / columns / all-NULL columns."""
     missing_tables = diff["missing_tables"]
     expected_absent = diff.get("expected_absent", [])
+    expected_empty = diff.get("expected_empty", [])
     missing_columns = diff["missing_columns"]
     all_null_columns = diff["all_null_columns"]
     contract = EXPECTED_TABLES.get(source, {})
@@ -1835,6 +1923,7 @@ def render_source_report(
         f"- Contract tables: **{len(contract)}**",
         f"- Missing tables: **{len(missing_tables)}**",
         f"- Expected absent (OK): **{len(expected_absent)}**",
+        f"- Capability-gated empty (OK): **{len(expected_empty)}**",
         f"- Missing columns: **{len(missing_columns)}**",
         f"- All-NULL columns: **{len(all_null_columns)}**",
         "",
@@ -1866,6 +1955,19 @@ def render_source_report(
         lines.append("| Table | Reason |")
         lines.append("|---|---|")
         for table, reason in expected_absent:
+            lines.append(f"| `{table}` | {reason} |")
+    else:
+        lines.append("(none)")
+    lines.append("")
+
+    # 1c. Entity availability is decided by the signed edition capability and
+    # exact manifest DQ, not by a global non-empty table heuristic.
+    lines.append("## Capability-gated empty (OK)")
+    lines.append("")
+    if expected_empty:
+        lines.append("| Table | Reason |")
+        lines.append("|---|---|")
+        for table, reason in expected_empty:
             lines.append(f"| `{table}` | {reason} |")
     else:
         lines.append("(none)")
@@ -1913,10 +2015,116 @@ def render_source_report(
     output.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _audit_espn_relations(cur, inventory: tuple) -> dict[str, tuple[int, list[dict]]]:
+    """Run the normal quality checks after exact topology validation succeeds."""
+    per_relation: dict[str, tuple[int, list[dict]]] = {}
+    for relation in sorted(inventory, key=lambda item: (item.schema, item.name)):
+        label = f"{relation.schema}.{relation.name}"
+        try:
+            total, findings = audit_table(
+                cur,
+                relation.name,
+                schema=relation.schema,
+                relation_kind=relation.kind,
+                quality_table=_espn_quality_table_name(relation.name),
+            )
+            per_relation[label] = (
+                total,
+                [{**finding, "table": label} for finding in findings],
+            )
+        except Exception as exc:
+            per_relation[label] = (
+                -1,
+                [
+                    {
+                        "table": label,
+                        "col": "*",
+                        "sev": "ERROR",
+                        "detail": f"audit script failed: {type(exc).__name__}: {exc}",
+                    }
+                ],
+            )
+    return per_relation
+
+
+def render_espn_layout_report(
+    *,
+    layout_mode: str,
+    inventory: tuple,
+    per_relation: dict[str, tuple[int, list[dict]]],
+    output: Path,
+    topology_error: str | None = None,
+) -> None:
+    """Report the exact public/internal ESPN surface and its column checks."""
+    public_count = sum(
+        relation.schema == ESPN_CONTRACT.BRONZE_SCHEMA for relation in inventory
+    )
+    internal_count = sum(
+        relation.schema == ESPN_CONTRACT.INTERNAL_SCHEMA for relation in inventory
+    )
+    findings = [
+        finding
+        for _, relation_findings in per_relation.values()
+        for finding in relation_findings
+    ]
+    errors = [finding for finding in findings if finding["sev"] == "ERROR"]
+    warnings = [finding for finding in findings if finding["sev"] == "WARN"]
+    lines = [
+        f"# ESPN layout and column audit — {datetime.utcnow():%Y-%m-%d}",
+        "",
+        f"- Requested layout: **{layout_mode}**",
+        f"- Observed public ESPN relations: **{public_count}**",
+        f"- Observed internal ESPN relations: **{internal_count}**",
+        "- Inventory policy: exact schema/name/kind set plus required columns.",
+        "",
+        "## Topology",
+        "",
+    ]
+    if topology_error:
+        lines.extend((f"❌ {topology_error}", ""))
+    else:
+        lines.extend(("✅ Exact reviewed layout inventory is present.", ""))
+
+    lines.extend(
+        (
+            "## Relation inventory",
+            "",
+            "| Schema | Relation | Kind |",
+            "|---|---|---|",
+        )
+    )
+    for relation in sorted(inventory, key=lambda item: (item.schema, item.name)):
+        lines.append(f"| `{relation.schema}` | `{relation.name}` | {relation.kind} |")
+    if not inventory:
+        lines.append("(none)")
+    lines.extend(("", "## Column-quality summary", ""))
+    lines.extend(
+        (
+            f"- ERROR findings: **{len(errors)}**",
+            f"- WARN findings: **{len(warnings)}**",
+            "",
+        )
+    )
+    if findings:
+        lines.extend(("| Relation | Column | Severity | Detail |", "|---|---|---|---|"))
+        for finding in sorted(
+            findings,
+            key=lambda item: (SEV_ORDER[item["sev"]], item["table"], item["col"]),
+        ):
+            lines.append(
+                f"| `{finding['table']}` | `{finding['col']}` | "
+                f"**{finding['sev']}** | {finding['detail']} |"
+            )
+    else:
+        lines.append("(none)")
+    lines.append("")
+    output.write_text("\n".join(lines), encoding="utf-8")
+
+
 # ---- Main ----
 
 
-def main():
+def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser()
     p.add_argument(
         "--output", default=f"/tmp/bronze_column_audit_{datetime.utcnow():%Y-%m-%d}.md"
@@ -1924,19 +2132,83 @@ def main():
     p.add_argument(
         "--source",
         default=None,
-        help="slug (espn, fbref, ...) — scan only {source}_* tables and "
-        "diff against the parser contract (EXPECTED_TABLES)",
+        help="slug (espn, fbref, ...) — diff against the parser contract; ESPN "
+        "requires ESPN_BRONZE_LAYOUT_MODE and audits bronze + espn_internal",
     )
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     source: Optional[str] = None
     if args.source:
         source = args.source.lower()
         if source not in SOURCE_PREFIXES:
             sys.exit(f"unknown source '{source}'; known: {sorted(SOURCE_PREFIXES)}")
+    espn_layout_mode: str | None = None
+    if source == "espn":
+        try:
+            espn_layout_mode = require_espn_layout_mode()
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
 
     conn = _get_trino_connection()
     cur = conn.cursor()
+    output = Path(args.output)
+    if source == "espn":
+        inventory: tuple = ()
+        try:
+            inventory = espn_layout_inventory(cur)
+            ESPN_CONTRACT.audit_layout_inventory(espn_layout_mode, inventory)
+        except Exception as exc:
+            render_espn_layout_report(
+                layout_mode=espn_layout_mode,
+                inventory=inventory,
+                per_relation={},
+                output=output,
+                topology_error=f"{type(exc).__name__}: {exc}",
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "contract_findings": 1,
+                        "audit_findings": 0,
+                        "report": str(output),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            print(f"\nReport written to: {output}", file=sys.stderr)
+            return 1
+
+        per_relation = _audit_espn_relations(cur, inventory)
+        render_espn_layout_report(
+            layout_mode=espn_layout_mode,
+            inventory=inventory,
+            per_relation=per_relation,
+            output=output,
+        )
+        audit_failures = sum(
+            finding.get("sev") in {"ERROR", "WARN"}
+            for _, findings in per_relation.values()
+            for finding in findings
+        )
+        status = 1 if audit_failures else 0
+        print(
+            json.dumps(
+                {
+                    "status": "failed" if status else "clean",
+                    "contract_findings": 0,
+                    "audit_findings": audit_failures,
+                    "report": str(output),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        print(f"\nReport written to: {output}", file=sys.stderr)
+        return status
+
     cur.execute("SHOW TABLES FROM iceberg.bronze")
     all_tables = sorted(r[0] for r in cur.fetchall())
 
@@ -1967,14 +2239,37 @@ def main():
                 ],
             )
 
-    output = Path(args.output)
+    contract_failures = 0
     if source:
         diff = diff_contract(cur, source, set(all_tables), per_table)
         render_source_report(source, diff, per_table, output)
+        contract_failures = sum(
+            len(diff[key])
+            for key in ("missing_tables", "missing_columns", "all_null_columns")
+        )
     else:
         render_report(per_table, output)
+    audit_failures = sum(
+        finding.get("sev") in {"ERROR", "WARN"}
+        for _, findings in per_table.values()
+        for finding in findings
+    )
+    status = 1 if contract_failures or audit_failures else 0
+    print(
+        json.dumps(
+            {
+                "status": "failed" if status else "clean",
+                "contract_findings": contract_failures,
+                "audit_findings": audit_failures,
+                "report": str(output),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
     print(f"\nReport written to: {output}", file=sys.stderr)
+    return status
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

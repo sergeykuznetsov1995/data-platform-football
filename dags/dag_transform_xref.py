@@ -377,8 +377,9 @@ def _validate_xref(**context) -> Dict[str, Any]:
     """Run extended DQ for the 5 xref tables (T6).
 
     Phase 1 — standard DQ via :mod:`utils.xref_dq.build_all_xref_checks`
-    Phase 2 — orphan-rate per source for xref_team / xref_player / xref_referee
-              / xref_manager (synthetic CheckResults appended to the report)
+    Phase 2 — orphan-rate per source / league / season for xref_team /
+              xref_player / xref_referee / xref_manager (synthetic
+              CheckResults appended to the report)
 
     Severity model:
       * Phase 1 ERROR-checks raise ``AirflowException``.
@@ -387,10 +388,16 @@ def _validate_xref(**context) -> Dict[str, Any]:
 
     XCom outputs:
       * key=``orphan_rates``    — dict {team, player, referee, manager →
-                                  per-source verdicts}
+                                  per-source/league/season verdicts}
       * key=``orphan_teams``    — dict {total_orphans, per_source, rows} (issue #141)
     """
     from airflow.exceptions import AirflowException
+    from scrapers.espn.layout import LayoutError, require_layout_mode
+
+    try:
+        espn_layout_mode = require_layout_mode()
+    except LayoutError as exc:
+        raise AirflowException(str(exc)) from exc
 
     from utils.alerts import telegram_dq_summary
     from utils.data_quality import CheckResult, run_checks
@@ -400,17 +407,31 @@ def _validate_xref(**context) -> Dict[str, Any]:
         evaluate_dob_conflicts,
         evaluate_manager_dob_collisions,
         evaluate_orphan_rate_per_source,
+        espn_promoted_dq_policy,
         report_orphan_teams,
     )
+
+    try:
+        include_espn_promoted_grains, promoted_espn_grains = (
+            espn_promoted_dq_policy(espn_layout_mode)
+        )
+    except ValueError as exc:
+        raise AirflowException(str(exc)) from exc
 
     # ------------------------------------------------------------------
     # Phase 1 — standard DQ on all 5 xref tables (16+ checks)
     # ------------------------------------------------------------------
-    report = run_checks(build_all_xref_checks(), raise_on_error=False)
+    report = run_checks(
+        build_all_xref_checks(
+            include_espn_promoted_grains=include_espn_promoted_grains
+        ),
+        raise_on_error=False,
+    )
     logger.info("Phase 1 — xref DQ: %s", report.summary())
 
     # ------------------------------------------------------------------
-    # Phase 2 — orphan-rate per source (team + player + referee + manager)
+    # Phase 2 — orphan-rate per source/league/season
+    #           (team + player + referee + manager)
     # Per-entity (warn, err) bands: referee feeds (#143) and manager FotMob
     # coaches (#144) are noisier than team/player, so they get looser bands —
     # surfaced in the report, but won't fail the DAG below the error threshold.
@@ -423,6 +444,11 @@ def _validate_xref(**context) -> Dict[str, Any]:
     # Referee/manager stay table-wide: looser bands, not season-historized the
     # same way, and not breaching — left untouched pending their own evidence.
     orphan_rates: Dict[str, Any] = {}
+    # SQL GROUP BY cannot emit zero-row sources, so compact6 binds the reviewed
+    # ESPN platform grains explicitly.  legacy14 must not arm this gate before
+    # the atomic archive/native swap: several 2627 lineup grains are
+    # legitimately not materialised yet and existing downstream still serves
+    # the legacy physical tables.
     for entity, table, warn_t, err_t, current_only in (
         ('team', 'iceberg.silver.xref_team', 10.0, 25.0, True),
         ('player', 'iceberg.silver.xref_player', 10.0, 25.0, True),
@@ -438,6 +464,12 @@ def _validate_xref(**context) -> Dict[str, Any]:
                 warning_threshold=warn_t,
                 error_threshold=err_t,
                 current_season_only=current_only,
+                group_by_league=True,
+                expected_grains=(
+                    promoted_espn_grains
+                    if entity in {'team', 'player'}
+                    else None
+                ),
             )
         except Exception as e:
             logger.exception("orphan_rate evaluation failed for %s", table)
