@@ -5113,6 +5113,27 @@ class FBrefPipeline:
             expected_matches = 0
         if not 1 <= expected_matches <= settings.shard_size:
             raise ParseWaveError("acceptance_replay_match_cohort_invalid")
+        cohort = metadata.get("acceptance_cohort") or {}
+        coverage_slots = (
+            cohort.get("coverage_slots")
+            if isinstance(cohort, Mapping)
+            else None
+        )
+        if not isinstance(coverage_slots, Mapping):
+            raise ParseWaveError(
+                "acceptance_replay_match_classification_missing"
+            )
+        match_evidence_classes: dict[str, str] = {}
+        for slot, evidence_class in (
+            ("match_full", "full_match"),
+            ("match_sparse", "sparse_match"),
+        ):
+            target_id = str(coverage_slots.get(slot) or "").strip()
+            if not target_id or target_id in match_evidence_classes:
+                raise ParseWaveError(
+                    "acceptance_replay_match_classification_invalid"
+                )
+            match_evidence_classes[target_id] = evidence_class
 
         with self.control.guard_publication_lock(run_id, source="fbref"):
             fetches = self.control.list_run_fetches(
@@ -5138,6 +5159,10 @@ class FBrefPipeline:
                 raise ParseWaveError(
                     "acceptance_replay_match_identity_duplicate"
                 )
+            if set(target_ids) != set(match_evidence_classes):
+                raise ParseWaveError(
+                    "acceptance_replay_match_classification_mismatch"
+                )
 
             mode = (
                 "batch" if self.batch_persist_enabled else "sequential"
@@ -5154,7 +5179,9 @@ class FBrefPipeline:
                     "parser_version": PAGE_DOCUMENT_VERSION,
                     "typed_parser_version": TYPED_BRONZE_PARSER_VERSION,
                     "stateful_parser_version": DISCOVERY_PARSER_VERSION,
-                    "evidence_class": "full_match",
+                    "evidence_class": match_evidence_classes[
+                        item.record.target_id
+                    ],
                 }
                 for ordinal, item in enumerate(prepared)
             ]

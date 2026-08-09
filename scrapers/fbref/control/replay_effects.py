@@ -224,7 +224,7 @@ def _normalized_dataset(
     if target_id not in target_ordinals:
         raise ValueError("replay control dataset target is unknown")
     ordinal = value.get("ordinal")
-    if ordinal != target_ordinals[target_id]:
+    if isinstance(ordinal, bool) or ordinal != target_ordinals[target_id]:
         raise ValueError("replay control dataset ordinal is invalid")
     replay_target_id = _text(
         value.get("replay_target_id"), "dataset replay_target_id"

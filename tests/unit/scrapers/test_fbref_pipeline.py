@@ -6388,9 +6388,29 @@ def test_acceptance_replay_reprocesses_already_observed_source_matches(
         ] = {"status": "succeeded"}
     source_run_id = str(uuid.uuid4())
     source = _accepted_nonpublishing_source(source_run_id)
-    source["metadata"]["bronze_acceptance"]["page_kind_counts"] = {
-        "match": 2
-    }
+    source_target_ids = [item["target_id"] for item in control.fetches]
+    source_cohort_sha256 = hashlib.sha256(
+        json.dumps(
+            source_target_ids,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    ).hexdigest()
+    source["metadata"]["acceptance_cohort"].update(
+        cohort_size=2,
+        cohort_sha256=source_cohort_sha256,
+        target_ids=source_target_ids,
+        required_page_kinds=["match"],
+        coverage_slots={
+            "match_full": source_target_ids[0],
+            "match_sparse": source_target_ids[1],
+        },
+    )
+    source["metadata"]["bronze_acceptance"].update(
+        cohort_size=2,
+        cohort_sha256=source_cohort_sha256,
+        page_kind_counts={"match": 2},
+    )
     control.get_run = lambda run_id: (
         source if str(run_id) == source_run_id else control.run
     )
@@ -6434,6 +6454,10 @@ def test_acceptance_replay_reprocesses_already_observed_source_matches(
         2,
         2,
     ]
+    assert [
+        [target["evidence_class"] for target in replay.targets]
+        for replay in control.replay_control_runs
+    ] == [["full_match", "sparse_match"]] * 2
     for replay in control.replay_control_runs:
         datasets = {item["dataset"] for item in replay.manifests}
         assert "__page__" in datasets

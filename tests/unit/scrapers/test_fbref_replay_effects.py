@@ -150,3 +150,19 @@ def test_replay_effects_preserve_incomplete_actual_outcomes_for_the_gate():
     assert incomplete["targets"][0]["observation_status"] == "processing"
     assert incomplete["targets"][0]["latest_guarded"] is False
     assert len(incomplete["datasets"]) == len(effects["datasets"]) - 1
+
+
+@pytest.mark.unit
+def test_replay_effects_reject_boolean_dataset_ordinal():
+    effects = _effects(targets=1)
+    datasets = copy.deepcopy(effects["datasets"])
+    datasets[0]["ordinal"] = False
+
+    with pytest.raises(ValueError, match="dataset ordinal"):
+        build_replay_control_effects(
+            control_run_id=effects["control_run_id"],
+            source_run_id=effects["source_run_id"],
+            mode=effects["mode"],
+            targets=effects["targets"],
+            datasets=datasets,
+        )
