@@ -44,6 +44,12 @@ COMPOSE_TEST_ENV = {
     "LAKEKEEPER_DB_PASSWORD": "ci-not-a-secret",
     "LAKEKEEPER_PG_ENCRYPTION_KEY": "0" * 32,
     "SEAWEEDFS_VOLUME_SIZE_LIMIT_MB": "1024",
+    # Required deployment-owned ESPN identity. These non-secret sentinel
+    # values exercise fail-closed Compose interpolation without borrowing a
+    # production release decision from the runner environment.
+    "ESPN_BRONZE_LAYOUT_MODE": "legacy14",
+    "ESPN_RELEASE_COMMIT": "a" * 40,
+    "ESPN_RELEASE_TREE_SHA256": "b" * 64,
     # Required deployment-owned SofaScore binds.  Config rendering does not
     # start containers; explicit dummy sources keep this test independent of a
     # production host layout while exercising fail-closed interpolation.
