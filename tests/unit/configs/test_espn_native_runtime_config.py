@@ -369,3 +369,32 @@ def test_rendered_isolated_espn_compose_proves_role_projection_and_freeze() -> N
     assert rendered["volumes"]["espn_airflow_metadata"]["name"] == (
         "espn-airflow_espn_airflow_metadata"
     )
+
+
+def test_isolated_espn_compose_reuses_only_the_production_logs_volume() -> None:
+    """The release keeps logs writable without rebinding its dedicated metadb."""
+    rendered = _render_compose(
+        compose_file=ISOLATED_COMPOSE,
+        extra_environment=_isolated_environment(),
+        profiles=("ui",),
+    )
+
+    assert rendered["volumes"]["espn_airflow_logs"] == {
+        "external": True,
+        "name": "espn_airflow_logs",
+    }
+    assert rendered["volumes"]["espn_airflow_metadata"] == {
+        "name": "espn-airflow_espn_airflow_metadata",
+    }
+    for name in AIRFLOW_SERVICES:
+        logs_mount = next(
+            volume
+            for volume in rendered["services"][name]["volumes"]
+            if volume["target"] == "/opt/airflow/logs"
+        )
+        assert logs_mount == {
+            "type": "volume",
+            "source": "espn_airflow_logs",
+            "target": "/opt/airflow/logs",
+            "volume": {},
+        }

@@ -203,7 +203,9 @@ services:
 
 volumes:
   espn_airflow_metadata: {}
-  espn_airflow_logs: {}
+  espn_airflow_logs:
+    external: true
+    name: espn_airflow_logs
 
 networks:
   default: {}
