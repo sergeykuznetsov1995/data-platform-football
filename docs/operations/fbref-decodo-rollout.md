@@ -2,7 +2,9 @@
 
 This is an operator checklist, not permission to deploy. No live or paid
 request was made while this document was prepared. Each stage needs saved
-evidence and an explicit GO before the next stage.
+evidence and an explicit GO before the next stage. The persistent session is
+default-off: every existing environment keeps
+`FBREF_PERSISTENT_HTTP_SESSION=0` until the dedicated stage below is accepted.
 
 ## 0. Protect the account
 
@@ -107,26 +109,46 @@ Run both read-only statements in
 `docs/operations/sql/fbref_male_completeness_control.sql` against their named
 engines. Every active/present male competition is crossed with source seasons
 `2025-2026` and `2026-2027`; there is no hand-written competition count.
-Bind a completed publishing current/backfill run from `iceberg.bronze`, not an
-isolated replay: replay correctness was proved against its frozen cohort in
-Step 2, while this gate proves the whole published male scope.
-Run PostgreSQL first, then copy the three dead-match bridge values from its
-`TOTAL` row into the named Trino bind parameters. Trino recomputes their count,
-distinctness, scope, and fingerprint before accepting a dead proof.
+
+Give PostgreSQL a JSON list containing every successful publishing
+current/backfill control run needed for the complete bounded workload, plus
+the exact publication run ID. A single run is fine; when the workload is more
+than one bounded run (including more than 2,000 targets), list every run. The
+selected run is not an isolated replay: replay correctness was proved against
+its frozen cohort in Step 2, while this gate proves the whole published male
+scope.
+
+Run PostgreSQL first. From its `TOTAL` row copy the canonical accepted-run,
+expected-scope, and dead-match JSON/count/fingerprint bridge values into the
+named Trino parameters. Trino recomputes each bridge. It also requires the
+PostgreSQL competition-season set to equal the chosen publication generation,
+requires every selected run to own a separate complete immutable scope export,
+and rejects a duplicate, omitted, or stale run.
 
 Every row, including `TOTAL`, must be `PASS`. This proves deduplicated schedule
-keys, a successful current-run page manifest for every played match, all eight
-current-run dataset decisions per played match, current-run physical rows for
-`available`, a nonblank reason plus zero rows for explicit empty results, and
-direct durable/dead control evidence. Save both result sets with the replay
-JSON.
+keys, that the latest page manifest for every played match belongs to the
+accepted run set, all eight same-run dataset decisions, same-run physical rows
+for `available`, a nonblank reason plus zero rows for explicit empty results,
+and direct latest durable/dead control evidence. Save both result sets with the
+replay JSON.
 
 ## 4. Bounded live canary
 
 Use the isolated, non-publishing acceptance project first. Keep its unchanged
 limit of **100 requests / 50 MiB**, one active paid lease, the 6.1-second source
-interval, and raw-first writes. Confirm the selected exit hash stays fixed for
-the lease and every reservation is settled. Hitting either limit is NO-GO.
+interval, and raw-first writes.
+
+1. Run the existing path with `FBREF_PERSISTENT_HTTP_SESSION=0` and save its
+   evidence as the baseline.
+2. In the candidate acceptance image only, keep `FBREF_BATCH_PERSIST=0`, set
+   `FBREF_PERSISTENT_HTTP_SESSION=1`, and run the same bounded cohort. This is
+   the persistent-session stage; it is not a global configuration change.
+3. Observe one session being reused only inside its lease, a fixed exit hash,
+   per-page request/byte accounting, terminal tail settlement, and zero active
+   reservations after the run. Any mid-lease repin, unmetered request, missing
+   raw document, unsettled reservation, or completeness failure is NO-GO.
+
+Hitting either safety limit is also NO-GO.
 
 Reconcile Decodo dashboard bytes after its reporting delay against the local
 provider-billed ledger. Compare **bytes per durable match** with the saved
@@ -143,18 +165,21 @@ expected bytes per durable match.
 
 Then, and only then:
 
-1. set `FBREF_BATCH_PERSIST=1` in the candidate image and enable daily;
-2. observe one complete scheduled run and provider reconciliation;
+1. set `FBREF_PERSISTENT_HTTP_SESSION=1` and `FBREF_BATCH_PERSIST=1` in the
+   candidate image and enable daily;
+2. observe one complete scheduled run, its persistent-session accounting, and
+   provider reconciliation;
 3. enable drain for the existing backlog;
 4. keep only one FBref paid run active at a time.
 
 ## Rollback
 
 Stop new FBref runs, let the one active lease close, and verify all reservations
-are settled. Set `FBREF_BATCH_PERSIST=0`, restore the **previous proxy file**
-and **previous image digest**, and keep the raw/control evidence. Do not delete
-raw documents or successful manifests. Re-run the zero-network completeness
-gate before resuming the old path.
+are settled. Set `FBREF_PERSISTENT_HTTP_SESSION=0` and
+`FBREF_BATCH_PERSIST=0`, restore the **previous proxy file** and
+**previous image digest**, and keep the raw/control evidence. Do not delete raw
+documents or successful manifests. Re-run the zero-network completeness gate
+before resuming the old path.
 
 Rollback is complete only when there is no active lease, no reserved byte or
 request balance, and the previous image/file fingerprints are recorded. If a

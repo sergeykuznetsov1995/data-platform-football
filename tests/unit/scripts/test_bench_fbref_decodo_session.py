@@ -36,9 +36,10 @@ def test_exit_identity_is_hashed_and_raw_ip_never_enters_report():
     rendered = json.dumps(report, sort_keys=True)
 
     assert observed_ip not in rendered
-    assert report["observations"][0]["exit_hash"] == hashlib.sha256(
-        observed_ip.encode("ascii")
-    ).hexdigest()
+    assert (
+        report["observations"][0]["exit_hash"]
+        == hashlib.sha256(observed_ip.encode("ascii")).hexdigest()
+    )
     assert report["sticky_passed"] is True
     assert report["recommended_provider_sticky_minutes"] == 120
     assert report["recommended_local_lease_minutes"] == 115
@@ -182,8 +183,7 @@ def test_probe_failure_is_redacted(tmp_path):
 @pytest.mark.unit
 def test_rollout_runbook_has_staged_go_and_rollback_contract():
     path = (
-        Path(__file__).resolve().parents[3]
-        / "docs/operations/fbref-decodo-rollout.md"
+        Path(__file__).resolve().parents[3] / "docs/operations/fbref-decodo-rollout.md"
     )
     text = path.read_text(encoding="utf-8")
     lowered = text.casefold()
@@ -198,6 +198,10 @@ def test_rollout_runbook_has_staged_go_and_rollback_contract():
     assert "0/10/30/60/90/120" in text
     assert "fbref_batch_persist=0" in lowered
     assert "fbref_batch_persist=1" in lowered
+    assert "fbref_persistent_http_session=0" in lowered
+    assert "fbref_persistent_http_session=1" in lowered
+    assert "persistent session is default-off" in normalized
+    assert "persistent-session" in lowered and "observe" in lowered
     assert "except all" in lowered
     assert "12" in text and "sentinel" in lowered and "snapshot" in lowered
     assert "dag_replay_fbref_bronze" in lowered
@@ -208,7 +212,8 @@ def test_rollout_runbook_has_staged_go_and_rollback_contract():
     assert "--batch-metrics" not in lowered
     assert "--sequential-seconds" not in lowered
     assert "match-key digest" in lowered
-    assert "current-run page manifest" in lowered
+    assert "latest page manifest" in lowered
+    assert "accepted run set" in lowered
     assert "not an isolated replay" in normalized
     assert "4×" in text and "20 seconds" in lowered
     assert "1,500" in text
