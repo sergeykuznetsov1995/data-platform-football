@@ -1803,6 +1803,48 @@ def _assert_postdeploy_fingerprint(
     for name, payload in containers.items():
         if payload.get("image_reference") != expected_images[name]:
             raise DeployError(f"post-deploy {name} image reference drifted")
+
+    def require_volume(
+        payload: Mapping[str, object],
+        *,
+        destination: str,
+        name: str,
+        label: str,
+    ) -> None:
+        mounts = payload.get("mounts")
+        if not isinstance(mounts, list):
+            raise DeployError(f"post-deploy {label} volume inventory is malformed")
+        matches = [
+            item
+            for item in mounts
+            if isinstance(item, dict) and item.get("Destination") == destination
+        ]
+        if len(matches) != 1:
+            raise DeployError(f"post-deploy {label} volume identity drifted")
+        mount = matches[0]
+        if (
+            mount.get("Type") != "volume"
+            or mount.get("Name") != name
+            or mount.get("RW") is not True
+        ):
+            raise DeployError(f"post-deploy {label} volume identity drifted")
+
+    require_volume(
+        metadb,
+        destination="/var/lib/postgresql/data",
+        name="espn_airflow_pgdata",
+        label="metadata",
+    )
+    for payload, label in (
+        (scheduler, "scheduler logs"),
+        (webserver, "webserver logs"),
+    ):
+        require_volume(
+            payload,
+            destination="/opt/airflow/logs",
+            name="espn_airflow_logs",
+            label=label,
+        )
     expected_mounts = {
         "/opt/airflow/dags": Path(str(plan["dagbag_root"])).resolve(),
         "/opt/espn-source/dags": Path(str(plan["release_root"])).resolve() / "dags",

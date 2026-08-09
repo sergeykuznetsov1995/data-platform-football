@@ -1228,7 +1228,7 @@ def test_unjournaled_fingerprint_capture_can_retry_without_log_collision(
     assert set(observed_logs[:3]).isdisjoint(observed_logs[3:])
 
 
-def test_postdeploy_fingerprint_requires_all_six_exact_read_only_binds(
+def test_postdeploy_fingerprint_requires_release_and_state_mounts(
     tmp_path: Path,
 ) -> None:
     plan = deploy.build_plan(_spec(tmp_path))
@@ -1252,18 +1252,35 @@ def test_postdeploy_fingerprint_requires_all_six_exact_read_only_binds(
             ),
         )
     ]
+    airflow_mounts = [
+        *mounts,
+        {
+            "Type": "volume",
+            "Name": "espn_airflow_logs",
+            "RW": True,
+            "Destination": "/opt/airflow/logs",
+        },
+    ]
     fingerprint = {
         "containers": {
             "espn-airflow-airflow-metadb-1": {
                 "status": "running",
                 "health": "healthy",
                 "image_reference": plan["postgres_image"],
+                "mounts": [
+                    {
+                        "Type": "volume",
+                        "Name": "espn_airflow_pgdata",
+                        "RW": True,
+                        "Destination": "/var/lib/postgresql/data",
+                    }
+                ],
             },
             "espn-airflow-airflow-scheduler-1": {
                 "status": "running",
                 "health": "healthy",
                 "image_reference": plan["airflow_image"],
-                "mounts": mounts,
+                "mounts": airflow_mounts,
             },
             "espn-airflow-airflow-webserver-1": {
                 "status": "running",
@@ -1272,7 +1289,7 @@ def test_postdeploy_fingerprint_requires_all_six_exact_read_only_binds(
                 "port_bindings": {
                     "8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8086"}]
                 },
-                "mounts": mounts,
+                "mounts": airflow_mounts,
             },
         }
     }
@@ -1281,6 +1298,20 @@ def test_postdeploy_fingerprint_requires_all_six_exact_read_only_binds(
     drifted = json.loads(json.dumps(fingerprint))
     drifted["containers"]["espn-airflow-airflow-scheduler-1"]["mounts"][2]["RW"] = True
     with pytest.raises(deploy.DeployError, match="exact read-only binds"):
+        deploy._assert_postdeploy_fingerprint(plan, drifted)
+
+    drifted = json.loads(json.dumps(fingerprint))
+    drifted["containers"]["espn-airflow-airflow-metadb-1"]["mounts"][0]["Name"] = (
+        "unexpected_metadata"
+    )
+    with pytest.raises(deploy.DeployError, match="metadata volume"):
+        deploy._assert_postdeploy_fingerprint(plan, drifted)
+
+    drifted = json.loads(json.dumps(fingerprint))
+    drifted["containers"]["espn-airflow-airflow-scheduler-1"]["mounts"][-1]["Name"] = (
+        "unexpected_logs"
+    )
+    with pytest.raises(deploy.DeployError, match="logs volume"):
         deploy._assert_postdeploy_fingerprint(plan, drifted)
 
 
@@ -1465,10 +1496,10 @@ if args[0] == "inspect":
             {"Type": "bind", "RW": False, "Destination": "/opt/airflow/scripts", "Source": os.environ["FAKE_RELEASE_ROOT"] + "/scripts"},
             {"Type": "bind", "RW": False, "Destination": "/opt/airflow/configs/espn", "Source": os.environ["FAKE_RELEASE_ROOT"] + "/configs/espn"},
             {"Type": "bind", "RW": False, "Destination": "/opt/airflow/configs/medallion", "Source": os.environ["FAKE_RELEASE_ROOT"] + "/configs/medallion"},
-            {"Type": "volume", "RW": True, "Destination": "/opt/airflow/logs", "Source": "/var/lib/docker/volumes/logs"},
+            {"Type": "volume", "Name": "espn_airflow_logs", "RW": True, "Destination": "/opt/airflow/logs", "Source": "/var/lib/docker/volumes/logs"},
         ]
     else:
-        mounts = [{"Destination": "/var/lib/postgresql/data", "Source": "/var/lib/docker/volumes/pg"}]
+        mounts = [{"Type": "volume", "Name": "espn_airflow_pgdata", "RW": True, "Destination": "/var/lib/postgresql/data", "Source": "/var/lib/docker/volumes/pg"}]
     binding = {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8086"}]} if web else {}
     for value in (
         "id-" + name,

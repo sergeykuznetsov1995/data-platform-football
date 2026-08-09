@@ -202,7 +202,9 @@ services:
         condition: service_completed_successfully
 
 volumes:
-  espn_airflow_metadata: {}
+  espn_airflow_metadata:
+    external: true
+    name: espn_airflow_pgdata
   espn_airflow_logs:
     external: true
     name: espn_airflow_logs

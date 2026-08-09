@@ -366,13 +366,14 @@ def test_rendered_isolated_espn_compose_proves_role_projection_and_freeze() -> N
         "POSTGRES_USER": "airflow",
     }
     assert set(metadb["networks"]) == {"default"}
-    assert rendered["volumes"]["espn_airflow_metadata"]["name"] == (
-        "espn-airflow_espn_airflow_metadata"
-    )
+    assert rendered["volumes"]["espn_airflow_metadata"] == {
+        "external": True,
+        "name": "espn_airflow_pgdata",
+    }
 
 
-def test_isolated_espn_compose_reuses_only_the_production_logs_volume() -> None:
-    """The release keeps logs writable without rebinding its dedicated metadb."""
+def test_isolated_espn_compose_reuses_the_production_state_volumes() -> None:
+    """The sealed manifest preserves the live metadb and writable logs."""
     rendered = _render_compose(
         compose_file=ISOLATED_COMPOSE,
         extra_environment=_isolated_environment(),
@@ -384,7 +385,8 @@ def test_isolated_espn_compose_reuses_only_the_production_logs_volume() -> None:
         "name": "espn_airflow_logs",
     }
     assert rendered["volumes"]["espn_airflow_metadata"] == {
-        "name": "espn-airflow_espn_airflow_metadata",
+        "external": True,
+        "name": "espn_airflow_pgdata",
     }
     for name in AIRFLOW_SERVICES:
         logs_mount = next(

@@ -174,9 +174,12 @@ heartbeat/ETA сохраняется с интервалом не более 60 
 journals, checkpoint, backup/TOC/restore proof и immutable result.
 Перед result operator повторно валидирует SHA/ownership каждого successful
 Compose action log и связывает exact checksummed heartbeat path/SHA с result.
-Post-deploy fingerprint требует digest-pinned images, exact UI bind и все шесть
-release/DagBag mounts как `Type=bind`, `RW=false`; missing/RW mount блокирует
-завершение.
+Post-deploy fingerprint требует digest-pinned images, exact UI bind, все шесть
+release/DagBag mounts как `Type=bind`, `RW=false`, metadata volume
+`espn_airflow_pgdata` и logs volume `espn_airflow_logs`; missing/RW/wrong-name
+mount блокирует завершение. Оба state volume объявлены в sealed Compose как
+external, поэтому single-manifest deploy не создаёт пустую metadata DB и не
+теряет исторические логи.
 
 До продолжения убедиться, что checkpoint связывает exact dump/TOC SHA и успешный
 full restore в disposable `network=none` tmpfs container. Отсутствующий restore
