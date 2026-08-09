@@ -2641,8 +2641,12 @@ def test_parser_rows_explicitly_cover_every_existing_legacy_bronze_column() -> N
             Path(__file__).resolve().parents[2] / "fixtures" / "bronze_schemas.json"
         ).read_text()
     )["tables"]
-    metadata = {"_batch_id", "_entity_type", "_ingested_at", "_source"}
     from scrapers.espn.parser_contracts import LineupRow, MatchsheetRow, ScheduleRow
+    from scrapers.espn.repository import PROVENANCE_COLUMNS
+
+    # The parser owns scope/parser identity; the repository enriches parsed
+    # rows with the remaining generation, Raw, runtime, and write metadata.
+    repository_metadata = set(PROVENANCE_COLUMNS) - {"scope_id", "parser_version"}
 
     actual = {
         "bronze.espn_schedule": {field.name for field in fields(ScheduleRow)},
@@ -2650,7 +2654,7 @@ def test_parser_rows_explicitly_cover_every_existing_legacy_bronze_column() -> N
         "bronze.espn_matchsheet": {field.name for field in fields(MatchsheetRow)},
     }
     for table, row_fields in actual.items():
-        expected = set(schema[table]["columns"]) - metadata
+        expected = set(schema[table]["columns"]) - repository_metadata
         assert expected <= row_fields, (
             f"{table} missing {sorted(expected - row_fields)}"
         )

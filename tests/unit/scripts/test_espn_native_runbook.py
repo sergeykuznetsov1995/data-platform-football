@@ -15,116 +15,144 @@ def test_runbook_covers_every_operator_path_and_retention_boundary():
         "dag_monitor_espn",
         "scripts/audit_espn_repair.py",
         "scripts/migrate_espn_native_v2.py",
-        "--apply",
+        "deploy/espn/deploy.py apply",
         "90 дней",
         "365 дней",
         "бессрочно",
-        "три последовательных зелёных",
+        "Three scheduler-created parent/child receipts",
         "legacy_untrusted",
         "append-only",
     ):
         assert required in text
 
 
-def test_runbook_makes_dry_run_and_one_scope_cutover_explicit():
+def test_runbook_makes_release_and_compact6_plans_reviewable_before_apply():
     text = RUNBOOK.read_text(encoding="utf-8")
 
-    assert "по умолчанию dry-run" in text
-    assert "ровно один `scope_id`" in text
+    assert "deploy/espn/deploy.py plan" in text
+    assert "deploy/espn/deploy.py apply" in text
+    assert "deploy/espn/deploy.py resume" in text
+    assert "canonical `plan_sha256`" in text
+    assert "строго non-mutating" in text
+    assert "restore proof" in text
+    assert "scripts/compact_espn_bronze_v2.py plan" in text
+    assert "scripts/compact_espn_bronze_v2.py apply" in text
     assert "не удаляет legacy" in text
     assert "DROP TABLE" not in text
 
 
-def test_runbook_contracts_automatic_all_male_rollout_and_reversal():
+def test_runbook_contracts_ordered_all_male_rollout_and_reversal():
     text = " ".join(RUNBOOK.read_text(encoding="utf-8").split())
-    automatic_rollout = text.split("## Automatic all-male rollout", 1)[1].split(
-        "## Canary и три зелёных запуска", 1
+    rollout_steps = text.split("## Gated production ceremony", 1)[1].split(
+        "## Replay и repair", 1
     )[0]
-    rollout_steps = automatic_rollout.split("### Rollback expanded registry", 1)[0]
 
     for required in (
         "explicit-core-gender-MALE-v1",
         "2026-08-02: 181 MALE / 38 FEMALE / 1 UNKNOWN",
-        "первые 10 отсутствующих scope",
-        "exact coverage reconciliation",
-        "target_scope_ids - COMPLETE scope_head_v2",
         "zero duplicate IDs/slugs",
         "last good immutable discovery-state ref",
-        "latest-state.json никогда не является registry запуска",
+        "`latest-state.json` никогда не является registry запуска",
         "dag_trigger_espn_daily",
-        "три новых scheduled green",
         "ESPN_DISCOVERY_STATE_REF_URI",
         "ESPN_DISCOVERY_STATE_REF_SHA256",
-        "dag_backfill_espn",
-        "explicit <=10 cohort",
-        "airflow dags pause dag_discover_espn_registry",
-        "airflow dags unpause dag_discover_espn_registry",
-        "airflow dags unpause dag_backfill_espn",
-        "airflow dags pause dag_backfill_espn",
-        "airflow dags unpause dag_ingest_espn",
-        "airflow dags unpause dag_monitor_espn",
         "deploy/espn/airflow.compose.yaml",
         "scripts/build_espn_dagbag_projection.py",
         "ESPN_ISOLATED_STACK=1",
         "dag_master_pipeline",
         "--force-recreate",
-        "exec -T airflow-scheduler",
-        "printenv ESPN_DISCOVERY_STATE_REF_URI",
-        "printenv ESPN_DISCOVERY_STATE_REF_SHA256",
         "ESPN_AIRFLOW_DATABASE_URL",
         "ESPN_CONTROL_DATABASE_URL",
-        "первый deploy",
-        "DAGS_ARE_PAUSED_AT_CREATION=true",
+        "второй reviewed deploy transition",
+        "временно unpause только `dag_discover_espn_registry`",
+        "third reviewed deploy transition",
+        "fourth reviewed deploy transition",
+        "временно unpause **только** `dag_backfill_espn`",
+        "posture намеренно hard-red для probe",
+        "тем же global `stack_lock_root`",
         "--wait-timeout",
-        "airflow jobs check",
-        "bag.import_errors == {}",
-        "set(bag.dags) == expected_dag_ids",
         "scripts/verify_espn_database_topology.py",
         "connected server/database identity",
-        'state["candidate_ref"]',
-        'state["male_registry_ref"]',
-        '"MALE": 181, "FEMALE": 38, "UNKNOWN": 1',
         "пока обе переменные атомарно не удалены или не заменены",
         "181/181 v3/v4 heads",
         "espn-native-parser-v3",
         "espn-native-runtime-v4",
         "e12b85a",
         "zero isolated active DagRuns",
-        'DagRun.state.in_(("queued", "running"))',
-        "isolated active DagRuns block deploy",
+        "ordinal001",
+        "`canary_campaign=null`",
+        "sealed successful ordinal001 campaign artifact",
+        "401863559",
+        "401863560",
+        "401863562",
+        "401863563",
+        "401863564",
+        "captured",
+        "valid_empty",
+        "not_applicable",
+        "exact 48h",
+        "compact6",
+        "exactly six public Bronze objects",
+        "E3/xref/Gold",
+        "secret-safe",
     ):
         assert required in text
 
-    assert "airflow dags trigger dag_trigger_espn_daily" not in automatic_rollout
-    assert "docker compose restart" not in automatic_rollout
-    assert "WHERE dag_id" not in automatic_rollout
+    assert "airflow dags trigger dag_trigger_espn_daily" not in rollout_steps
+    assert "docker compose restart" not in rollout_steps
+    assert "ровно один `scope_id`" not in rollout_steps
 
     ordered_markers = (
-        "airflow dags pause dag_trigger_espn_daily",
-        "airflow dags pause dag_discover_espn_registry",
-        "zero isolated active DagRuns",
-        "Deploy reviewed release",
-        "airflow dags unpause dag_discover_espn_registry",
-        "airflow dags trigger dag_discover_espn_registry",
-        "airflow dags pause dag_discover_espn_registry",
-        "ESPN_DISCOVERY_STATE_REF_URI",
-        "--force-recreate",
-        "printenv ESPN_DISCOVERY_STATE_REF_URI",
-        "printenv ESPN_DISCOVERY_STATE_REF_SHA256",
-        "Запускать bounded bootstrap",
-        "airflow dags unpause dag_backfill_espn",
-        "airflow dags trigger dag_backfill_espn",
-        "Выполнить exact coverage reconciliation",
-        "запустить один manual all-scope canary",
-        "airflow dags pause dag_backfill_espn",
-        "airflow dags unpause dag_ingest_espn",
-        "airflow dags unpause dag_monitor_espn",
-        "airflow dags unpause dag_discover_espn_registry",
-        "airflow dags unpause dag_trigger_espn_daily",
-        "три новых scheduled green",
+        "1. Reviewed deploy plan and restore proof",
+        "2. Fresh campaign ordinal001",
+        "3. Full 181-scope v2→v3 reconciliation",
+        "4. Exact 181/181 v3/v4 gate",
+        "5. All-181 canary",
+        "6. Three scheduler-created parent/child receipts",
+        "7. compact6 ACL and rollback proof",
+        "8. One post-cutover scheduled cycle",
+        "9. Six-scope E3/xref/Gold reconciliation",
+        "10. Rollback and secret-safe security evidence",
     )
     cursor = 0
     for marker in ordered_markers:
         position = rollout_steps.find(marker, cursor)
         assert position >= 0, marker
         cursor = position + len(marker)
+
+
+def test_runbook_pause_posture_is_transient_and_returns_to_all_paused():
+    text = " ".join(RUNBOOK.read_text(encoding="utf-8").split())
+
+    assert "13:50–14:15 UTC" in text
+    assert "ingest → monitor → discovery → parent" in text
+    assert "parent снова paused" in text
+    assert "exact derived child" in text
+    assert "все семь DAG-ов paused" in text
+    assert "четыре DAG-а постоянно unpaused" not in text
+
+
+def test_runbook_documents_six_guard_attempts_and_probe_contract():
+    text = RUNBOOK.read_text(encoding="utf-8")
+
+    for phase in (
+        "initial_state",
+        "pre_backup",
+        "pre_checkpoint_mutation",
+        "pre_airflow_init",
+        "pre_recreate",
+        "post_deploy",
+    ):
+        assert phase in text
+    assert "1,800 секунд" in text
+    assert "10,800 секунд" in text
+    assert "с интервалом не более 60 секунд" in text
+    assert "started-only" in text
+    assert "scripts/espn_rollout_probe_v1.py" in text
+    assert "--snapshot /protected/read-only/espn-rollout-snapshot.json" in text
+
+    canary = text.split("### 5. All-181 canary", 1)[1].split(
+        "### 6. Three scheduler-created parent/child receipts", 1
+    )[0]
+    assert "entry DAG `dag_backfill_espn`" in canary
+    assert "entry DAG `dag_ingest_espn`" not in canary

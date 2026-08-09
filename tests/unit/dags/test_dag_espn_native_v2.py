@@ -146,6 +146,16 @@ def _head(scope_id: str):
     return SimpleNamespace(scope_id=scope_id)
 
 
+def _patch_repository_from_env(monkeypatch, espn_native_tasks, factory):
+    """Inject a repository without bypassing the production layout factory."""
+
+    monkeypatch.setattr(
+        espn_native_tasks.EspnBronzeRepository,
+        "from_env",
+        classmethod(lambda _cls, **kwargs: factory(**kwargs)),
+    )
+
+
 def test_daily_has_one_isolated_owner_and_real_two_wave_chain():
     module = _reload("dag_ingest_espn")
     tasks = _tasks()
@@ -1885,7 +1895,7 @@ def test_repository_preflight_runs_ddl_once_and_publish_factory_disables_it(
         def ensure_objects(self):
             self.ensure_calls += 1
 
-    monkeypatch.setattr(espn_native_tasks, "EspnBronzeRepository", Repository)
+    _patch_repository_from_env(monkeypatch, espn_native_tasks, Repository)
     monkeypatch.setattr(
         espn_native_tasks,
         "_repository_pool_slots",
@@ -2050,9 +2060,7 @@ def test_scheduler_runtime_gate_requires_every_v3_v4_head(monkeypatch):
         repositories.append(repository)
         return repository
 
-    monkeypatch.setattr(
-        espn_native_tasks, "EspnBronzeRepository", repository_factory
-    )
+    _patch_repository_from_env(monkeypatch, espn_native_tasks, repository_factory)
     monkeypatch.setattr(
         espn_native_tasks,
         "_verified_complete_generation",
@@ -2114,9 +2122,9 @@ def test_scheduler_runtime_gate_rejects_uncompleted_head_before_activation(
             runtime_version=espn_native_tasks.runner.RUNTIME_VERSION,
         ),
     )
-    monkeypatch.setattr(
+    _patch_repository_from_env(
+        monkeypatch,
         espn_native_tasks,
-        "EspnBronzeRepository",
         lambda: SimpleNamespace(
             verify_published_scope=lambda _generation: SimpleNamespace(passed=True)
         ),
@@ -2182,9 +2190,9 @@ def test_scheduler_runtime_gate_rejects_snapshot_or_physical_drift(
             expected_scope_id
         ),
     )
-    monkeypatch.setattr(
+    _patch_repository_from_env(
+        monkeypatch,
         espn_native_tasks,
-        "EspnBronzeRepository",
         lambda: SimpleNamespace(
             verify_published_scope=lambda generation: SimpleNamespace(
                 passed=not (
@@ -5967,9 +5975,11 @@ def test_current_data_plane_rejects_authentic_v2_binding_before_side_effects(
         classmethod(lambda _cls, _uri: pytest.fail("v2 binding reached Raw")),
     )
     if entrypoint == "fetch":
-        invoke = lambda: espn_native_tasks.fetch_scoreboard_batch(
-            scope_binding_ref=binding_ref
-        )
+        def invoke():
+            return espn_native_tasks.fetch_scoreboard_batch(
+                scope_binding_ref=binding_ref
+            )
+
     else:
         raw_phase_ref = _artifact_ref(
             artifacts,
@@ -5984,9 +5994,10 @@ def test_current_data_plane_rejects_authentic_v2_binding_before_side_effects(
                 },
             },
         )
-        invoke = lambda: espn_native_tasks.offline_parse_scope(
-            raw_phase_ref=raw_phase_ref
-        )
+        def invoke():
+            return espn_native_tasks.offline_parse_scope(
+                raw_phase_ref=raw_phase_ref
+            )
 
     with pytest.raises(
         espn_native_tasks.OperationsError, match="pinned e12b85a"
@@ -6327,9 +6338,9 @@ def test_complete_head_requires_exact_snapshot_and_physical_complete(monkeypatch
         "load_scope_snapshot",
         lambda *_args, **_kwargs: generation,
     )
-    monkeypatch.setattr(
+    _patch_repository_from_env(
+        monkeypatch,
         espn_native_tasks,
-        "EspnBronzeRepository",
         lambda: SimpleNamespace(
             verify_published_scope=lambda value: SimpleNamespace(
                 passed=value is generation
@@ -7065,7 +7076,7 @@ def test_published_dq_verifies_current_views_for_the_active_route(
         "from_env",
         classmethod(lambda _cls: Store()),
     )
-    monkeypatch.setattr(espn_native_tasks, "EspnBronzeRepository", Repository)
+    _patch_repository_from_env(monkeypatch, espn_native_tasks, Repository)
     monkeypatch.setattr(
         espn_native_tasks,
         "_ref_for_uri",
@@ -7399,7 +7410,7 @@ def _run_published_dq_through_terminal(monkeypatch, *, state, mutation=None):
         "from_env",
         classmethod(lambda _cls: Store()),
     )
-    monkeypatch.setattr(espn_native_tasks, "EspnBronzeRepository", Repository)
+    _patch_repository_from_env(monkeypatch, espn_native_tasks, Repository)
     monkeypatch.setattr(
         espn_native_tasks,
         "_validate_publication_intent_for_result",

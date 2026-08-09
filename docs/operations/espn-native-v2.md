@@ -1,627 +1,478 @@
-# ESPN Native Bronze v2: runbook
+# ESPN Native Bronze v2: guarded release and compact6 runbook
 
-Этот runbook относится только к ESPN Bronze. Legacy-таблицы остаются
-read-only запасным путём: миграция не удаляет legacy и rollback всегда
-append-only. Silver и Gold этим процессом не меняются.
+Этот runbook задаёт один fail-closed порядок для release deploy, полного
+181-scope обновления, compact6 и последующей проверки E3/xref/Gold. Legacy
+остаётся только immutable rollback evidence: процедура не удаляет legacy,
+native generations, archive manifests, journals или raw. Все изменения
+append-only либо recoverable через явно зафиксированный checkpoint.
 
-## Перед запуском
+Никакая команда из документа не является разрешением на production mutation.
+До Task 6 выполняются только offline tests и построение планов. Production
+`apply`, Airflow triggers, compact6 и rollback требуют отдельного peer review
+точных canonical bytes и назначенного окна.
 
-Работать из проверенного release commit. Сначала сохранить SHA commit,
-`configs/espn/registry.yaml`, входных evidence и всех полученных JSON-отчётов.
-Не использовать URI с `latest`: только неизменяемые URI и SHA-256. Проверить,
-что DAG-и импортируются, Airflow pool для ESPN существует, а секреты Trino,
-S3 и control DB доступны только runtime. Одновременно разрешён один оператор
-cutover для одного scope.
+## Неподвижные границы
 
-## Discovery и явное promotion registry
+- Работать только из immutable detached release root. Сохранить exact
+  40-символьный commit, release-tree SHA-256, DagBag SHA-256, Compose SHA-256,
+  image digest, registry signature, sorted target SHA и каждый URI/SHA evidence.
+- Не использовать `latest` как вход. `latest-state.json` никогда не является
+  registry запуска: admission использует frozen run-scoped
+  `discovery_state_ref`, который связывает exact `male_registry_ref`.
+- Selection policy равна `explicit-core-gender-MALE-v1`. Reviewed baseline —
+  `2026-08-02: 181 MALE / 38 FEMALE / 1 UNKNOWN`; generated target содержит
+  ровно 181 explicit-MALE scope, zero duplicate IDs/slugs и не содержит FEMALE
+  или UNKNOWN.
+- Runtime — только isolated `deploy/espn/airflow.compose.yaml` с
+  `ESPN_ISOLATED_STACK=1`. Fresh projection содержит ровно семь root DAG-ов:
+  `dag_ingest_espn`, `dag_monitor_espn`, `dag_discover_espn_registry`,
+  `dag_trigger_espn_daily`, `dag_backfill_espn`, `dag_repair_espn` и
+  `dag_replay_espn`. `dag_master_pipeline` отсутствует; shared master остаётся
+  paused и не имеет active run.
+- Dedicated metadata container имеет exact имя
+  `espn-airflow-airflow-metadb-1`; UI слушает только `127.0.0.1:8086`.
+  `ESPN_AIRFLOW_DATABASE_URL` и `ESPN_CONTROL_DATABASE_URL` обязаны указывать
+  на разные connected server/database identity. `airflow-init` проверяет это
+  через `scripts/verify_espn_database_topology.py` до migration.
+- Перед mutation все семь DAG-ов paused и `zero isolated active DagRuns`:
+  отсутствие metadata, ошибка чтения либо любой `queued`/`running` run — hard
+  failure. Не использовать broad `docker compose up/down`, `restart`, ручной
+  `dag_trigger_espn_daily` или shell pipe как correctness boundary.
+- До compact6 runtime работает с `ESPN_BRONZE_LAYOUT_MODE=legacy14`; после
+  cutover — только `compact6`. Unknown/mixed layout блокирует readers и writers.
 
-1. Запустить `dag_discover_espn_registry` и дождаться зелёных
-   `fetch_discovery_catalog` и `publish_discovered_male_registry`.
-2. Скачать immutable discovery snapshot и review diff. Сверить ESPN ID, slug,
-   мужской пол, age class, edition, даты и три capability. Discovery никогда
-   сам не меняет registry.
-3. В отдельном reviewed PR применить `scrapers.espn.registry.promote_candidate`
-   к точному candidate и `configs/espn/registry.yaml`. Сохранить evidence для
-   gender/age class, затем проверить `validate_registry_document` и SHA-256.
-4. Capability `absent` означает, что соответствующая native сущность может
-   быть пустой. `CapabilityState.UNKNOWN` допускается для явно MALE кандидата,
-   но не доказывает отсутствие сущности; `Gender.UNKNOWN` не даёт права на
-   автоматическое включение.
+## Release-specific deploy operator
 
-## Automatic all-male rollout
+### Подготовка immutable inputs
 
-Эта процедура управляет automatic all-male registry, а не ручным списком
-соревнований. Политика selection должна быть ровно
-`explicit-core-gender-MALE-v1`. Датированный rollout baseline:
-`2026-08-02: 181 MALE / 38 FEMALE / 1 UNKNOWN`. FEMALE и UNKNOWN —
-исключения; в generated registry допускаются только явно подтверждённые MALE
-записи. Любой другой count, duplicate ID/slug или malformed explicit-MALE
-record останавливает rollout.
-
-Сохранять нужно immutable `male_registry_ref` (`uri` и SHA-256), candidate,
-review и `discovery_state_ref`, который возвращает успешный
-`publish_discovered_male_registry`. Его URI имеет run-scoped вид
-`<ESPN_ARTIFACT_ROOT_URI>/discovery/<run-key>/discovery-state.json`.
-`latest-state.json`
-является лишь mutable discovery pointer: `latest-state.json никогда не является
-registry запуска`. Он может помочь найти state, но admission, bootstrap,
-canary и rollback используют frozen immutable discovery-state ref, который
-сам связывает `male_registry_ref`. Reducer сначала публикует immutable state,
-а затем копирует в alias те же canonical bytes; более новый weekly run меняет
-только alias и не делает старый run-scoped ref нечитаемым.
-
-Выполнять шаги строго в этом порядке.
-
-Этот rollout выполняется только в отдельном ESPN Airflow stack из
-versioned `deploy/espn/airflow.compose.yaml`, а не в shared `compose.yaml`.
-Compose жёстко задаёт `ESPN_ISOLATED_STACK=1`; fresh DagBag projection
-содержит ровно семь ESPN root DAG-ов и не содержит
-`dag_master_pipeline`. Создать новый, не переиспользуемый projection
-из exact immutable release и задать compose wrapper:
+Создать fresh DagBag projection до планирования. Этот builder создаёт каталог;
+сам deploy `plan` его не создаёт.
 
 ```bash
-export ESPN_RELEASE_ROOT='/absolute/immutable/espn-release-<git-sha>'
-export ESPN_DAGBAG_ROOT='/absolute/new/espn-dagbag-<git-sha>'
-export ESPN_ENV_FILE='/protected/path/espn.env'
-export ESPN_RELEASE_COMMIT='<exact-40-hex-release-commit>'
-export ESPN_RELEASE_TREE_SHA256='<sha256-of-reviewed-release-tree>'
-python scripts/build_espn_dagbag_projection.py \
+export ESPN_RELEASE_ROOT='/absolute/immutable/espn-release-<40hex>'
+export ESPN_DAGBAG_ROOT='/absolute/new/espn-dagbag-<40hex>'
+export ESPN_ENV_FILE='/protected/espn/espn.env'
+export ESPN_RELEASE_COMMIT='<exact-40-hex-commit>'
+export ESPN_RELEASE_TREE_SHA256='<exact-packaging-tree-sha256>'
+export ESPN_AIRFLOW_IMAGE='registry/airflow@sha256:<64hex>'
+export ESPN_POSTGRES_IMAGE='registry/postgres@sha256:<64hex>'
+export ESPN_STACK_LOCK_ROOT='/durable/espn/deploy-stack-lock'
+export ESPN_DEPLOY_STATE='/durable/espn/deploy/<transition-id>'
+export ESPN_BACKUP_ROOT='/durable/espn/backups'
+export ESPN_RELEASE_GUARD='/absolute/immutable/espn-release-guard-<sha>.py'
+
+/root/.venvs/dpf-test/bin/python scripts/build_espn_dagbag_projection.py \
   --release-root "$ESPN_RELEASE_ROOT" \
   --output "$ESPN_DAGBAG_ROOT"
-espn_compose() {
-  docker compose --env-file "$ESPN_ENV_FILE" --project-name espn-airflow \
-    -f deploy/espn/airflow.compose.yaml "$@"
-}
-espn_airflow() {
-  espn_compose exec -T airflow-scheduler airflow "$@"
-}
-espn_compose config --quiet
 ```
 
-Protected env file обязан задать dedicated metadata
-`ESPN_AIRFLOW_DATABASE_URL` с URL-encoded password и отдельный raw
-`ESPN_AIRFLOW_DB_PASSWORD` для Postgres container. Оба относятся
-только к dedicated `airflow-metadb`. Отдельный
-`ESPN_CONTROL_DATABASE_URL` обязан указывать на shared ESPN control
-DB для lease/rate/publication fences; metadata и control DSN не могут
-быть одинаковыми. Перед любой migration/startup `airflow-init`
-запускает `scripts/verify_espn_database_topology.py`: preflight
-реально открывает оба DSN и доказывает разный connected server/database identity
-по `server address + port + current_database()`. Два разных hostname,
-которые ведут в одну БД, fail-closed останавливают init.
+Guard должен быть отдельным reviewed strict-read-only release guard. Его argv
+не исполняется shell-ом, а все участвующие файлы перечисляются повторяемым
+`--guard-artifact`. Пример JSON argv нужно заменить exact CLI запакованного
+guard; нельзя подставлять mutable wrapper.
 
-До первого шага сохранить cross-stack evidence, что shared
-`dag_master_pipeline` остаётся paused и не имеет active run. Если shared
-master должен быть scheduled, этот rollout заблокирован до
-отдельного reviewed release, удаляющего его ESPN trigger. Не допускать
-два daily owner в разных metadata DB.
+### 1. Построить и проверить plan
 
-1. Если isolated project уже работает, до deploy поставить на
-   паузу daily owner и discovery; не запускать daily owner вручную.
-   Если это первый deploy и scheduler ещё не существует, команды
-   `exec` не выполнять: `DAGS_ARE_PAUSED_AT_CREATION=true` и init
-   поставят все семь DAG-ов на паузу, а шаг 2 повторит
-   явные pause после health/topology checks:
-
-   ```bash
-   espn_airflow dags pause dag_trigger_espn_daily
-   espn_airflow dags pause dag_discover_espn_registry
-   ```
-
-   После pause и до любого `--force-recreate` fail-closed доказать
-   `zero isolated active DagRuns` для всех семи isolated DAG-ов. Проверка
-   выполняется one-off container через dedicated metadata DB, поэтому она
-   обязательна и для первого deploy; отсутствующая/неинициализированная DB,
-   ошибка запроса или хотя бы один `queued`/`running` DagRun блокируют deploy:
-
-   ```bash
-   espn_compose run --rm --no-deps airflow-scheduler python - <<'PY'
-   from airflow.models import DagRun
-   from airflow.utils.session import create_session
-
-   isolated_dag_ids = {
-       "dag_ingest_espn",
-       "dag_repair_espn",
-       "dag_backfill_espn",
-       "dag_replay_espn",
-       "dag_discover_espn_registry",
-       "dag_monitor_espn",
-       "dag_trigger_espn_daily",
-   }
-   with create_session() as session:
-       active_runs = (
-           session.query(DagRun.dag_id, DagRun.run_id, DagRun.state)
-           .filter(
-               DagRun.dag_id.in_(isolated_dag_ids),
-               DagRun.state.in_(("queued", "running")),
-           )
-           .all()
-       )
-   if active_runs:
-       raise RuntimeError(f"isolated active DagRuns block deploy: {sorted(active_runs)}")
-   PY
-   ```
-
-2. Deploy reviewed release через isolated Compose и принудительно
-   пересоздать Airflow services. Обычный restart не меняет
-   environment и запрещён. До discovery доказать exact isolated role
-   в фактическом scheduler container и проверить, что `airflow dags list`
-   содержит ровно семь reviewed ESPN DAG-ов, включая owner, и не
-   содержит `dag_master_pipeline`:
-
-   ```bash
-   espn_compose --profile ui up -d --wait --wait-timeout 180 --force-recreate \
-     airflow-init airflow-scheduler airflow-webserver
-   espn_compose exec -T airflow-scheduler airflow jobs check \
-     --job-type SchedulerJob
-   test "$(espn_compose exec -T airflow-scheduler \
-     printenv ESPN_ISOLATED_STACK)" = '1'
-   espn_compose exec -T airflow-scheduler python - <<'PY'
-   from airflow.models import DagBag
-
-   expected_dag_ids = {
-       "dag_ingest_espn",
-       "dag_repair_espn",
-       "dag_backfill_espn",
-       "dag_replay_espn",
-       "dag_discover_espn_registry",
-       "dag_monitor_espn",
-       "dag_trigger_espn_daily",
-   }
-   bag = DagBag(
-       dag_folder="/opt/airflow/dags",
-       include_examples=False,
-       safe_mode=True,
-   )
-   assert bag.import_errors == {}, bag.import_errors
-   assert set(bag.dags) == expected_dag_ids, sorted(bag.dags)
-   assert "dag_master_pipeline" not in bag.dags
-   PY
-   espn_airflow dags pause dag_trigger_espn_daily
-   espn_airflow dags pause dag_discover_espn_registry
-   ```
-
-   Ручной run поставленного на паузу DAG
-   остаётся `queued`, поэтому для одного exact weekly discovery run
-   временно снять паузу и задать явный run ID:
-
-   ```bash
-   export DISCOVERY_RUN_ID='all-male-rollout-<UTC-timestamp>'
-   espn_airflow dags unpause dag_discover_espn_registry
-   espn_airflow dags trigger dag_discover_espn_registry --run-id "$DISCOVERY_RUN_ID"
-   ```
-
-   Дождаться terminal success именно `$DISCOVERY_RUN_ID` и его
-   `publish_discovered_male_registry`, затем сразу вернуть discovery
-   на паузу до финальной активации:
-
-   ```bash
-   espn_airflow dags pause dag_discover_espn_registry
-   ```
-
-   Сохранить возвращённый
-   immutable `discovery_state_ref`,
-   SHA-256, registry signature и count. Подтвердить baseline `181/38/1`, exact
-   Core coverage и zero duplicate IDs/slugs. Сохранить immutable state ref и
-   `male_registry_ref` из этого run; state ref — frozen input, связывающий
-   exact generated registry. Настроить оба значения в environment
-   isolated Compose для `airflow-init`, `airflow-scheduler` и
-   `airflow-webserver`; LocalExecutor task subprocesses наследуют их от
-   scheduler. Неполная пара запрещена. После export обязательно
-   выполнить force-recreate, затем до bootstrap сравнить оба
-   фактических container values с exact saved values:
-
-   ```bash
-   export ESPN_DISCOVERY_STATE_REF_URI='s3://.../discovery/<run-key>/discovery-state.json'
-   export ESPN_DISCOVERY_STATE_REF_SHA256='...lowercase-64-hex...'
-   espn_compose --profile ui up -d --wait --wait-timeout 180 --force-recreate \
-     airflow-init airflow-scheduler airflow-webserver
-   espn_compose exec -T airflow-scheduler airflow jobs check \
-     --job-type SchedulerJob
-   test "$(espn_compose exec -T airflow-scheduler \
-     printenv ESPN_DISCOVERY_STATE_REF_URI)" = "$ESPN_DISCOVERY_STATE_REF_URI"
-   test "$(espn_compose exec -T airflow-scheduler \
-     printenv ESPN_DISCOVERY_STATE_REF_SHA256)" = "$ESPN_DISCOVERY_STATE_REF_SHA256"
-   test "$(espn_compose exec -T airflow-scheduler \
-     printenv ESPN_ISOLATED_STACK)" = '1'
-   ```
-
-   С включённой парой admission читает только этот exact state ref и никогда
-   не fallback-ит к mutable pointer. Frozen ref не имеет 8-дневного срока и
-   остаётся valid, пока обе переменные атомарно не удалены или не заменены
-   новой полной парой; неполная замена fail-closed. Не менять пару до окончания
-   rollout или rollback.
-
-3. Запускать bounded bootstrap через `dag_backfill_espn`, не через daily
-   owner. Перед первым cohort снять паузу только с manual
-   `dag_backfill_espn`; его `schedule=None`, и он остаётся unpaused только
-   до завершения all-scope canary:
-
-   ```bash
-   espn_airflow dags unpause dag_backfill_espn
-   ```
-
-   После каждой exact coverage reconciliation вычислить deterministic
-   `sorted(target - COMPLETE)` и передать только первые 10 отсутствующих scope
-   как явный `scopes` (explicit <=10 cohort); это ten-scope bootstrap rule, а
-   не разрешение расширить map/lease limit. Дождаться terminal success и
-   release leases перед следующим cohort.
-
-   ```bash
-   COHORT_CONF='{"scopes":["<first-missing-scope>","..."]}'
-   espn_airflow dags trigger dag_backfill_espn --conf "$COHORT_CONF"
-   ```
-
-   Не продолжать, если admission не закрепил state ref, связанный
-   `male_registry_ref` и registry signature, либо если любой selected scope
-   не опубликовал exact COMPLETE head.
-
-4. Выполнить exact coverage reconciliation. В environment с теми же
-   `ESPN_ARTIFACT_ROOT_URI`, control-DB и credentials положить сохранённые
-   immutable URI/SHA в переменные и выполнить команду ниже. Она доказывает
-   `discovered MALE target == generated registry target == union of COMPLETE
-   heads` и явно требует zero duplicates.
-
-   ```bash
-   python - <<'PY'
-   from collections import Counter
-   import json
-   import os
-   from dags.utils.espn_native_tasks import _read_ref, _verified_complete_head
-   from scrapers.espn.discovery import CatalogSnapshot
-   from scrapers.espn.operations import PostgresEspnControlStore
-   from scrapers.espn.registry import Gender, validate_registry_document
-
-   state_ref = {
-       "uri": os.environ["ESPN_DISCOVERY_STATE_REF_URI"],
-       "sha256": os.environ["ESPN_DISCOVERY_STATE_REF_SHA256"],
-   }
-   state = _read_ref(state_ref, kind="espn-discovery-state-v2")
-   candidate_ref = state["candidate_ref"]
-   registry_ref = state["male_registry_ref"]
-   candidate = CatalogSnapshot.from_dict(_read_ref(candidate_ref))
-   registry = validate_registry_document(_read_ref(registry_ref))
-   candidate_ids = [item.espn_id for item in candidate.candidates]
-   candidate_slugs = [item.slug for item in candidate.candidates]
-   assert len(candidate_ids) == len(set(candidate_ids)), "duplicate candidate IDs"
-   assert len(candidate_slugs) == len(set(candidate_slugs)), "duplicate candidate slugs"
-   gender_counts = Counter(item.gender.value for item in candidate.candidates)
-   assert gender_counts == {"MALE": 181, "FEMALE": 38, "UNKNOWN": 1}, gender_counts
-   discovered_male_scope_ids = {
-       f"{item.espn_id}:{item.source_season_year}"
-       for item in candidate.candidates
-       if item.gender is Gender.MALE
-   }
-   generated_scope_ids = {
-       competition.scope_id(competition.current_edition)
-       for competition in registry.promoted
-   }
-   assert len(discovered_male_scope_ids) == len(generated_scope_ids), "count drift"
-   assert len(registry.by_id) == len(registry.competitions), "duplicate IDs"
-   assert len(registry.by_slug) == len(registry.competitions), "duplicate slugs"
-   store = PostgresEspnControlStore.from_env()
-   with store._connect() as connection:
-       with connection.cursor() as cursor:
-           cursor.execute(
-               f"SELECT scope_id FROM {store.HEAD_TABLE} "
-               "WHERE registry_signature = %s",
-               (registry.signature(),),
-           )
-           head_scope_ids = {row[0] for row in cursor.fetchall()}
-   complete_scope_ids = {
-       scope_id
-       for scope_id, head in store.read_scope_heads(head_scope_ids).items()
-       if _verified_complete_head(head)[1] == "complete"
-   }
-   assert discovered_male_scope_ids == generated_scope_ids, {
-       "discovered_minus_generated": sorted(
-           discovered_male_scope_ids - generated_scope_ids
-       ),
-       "generated_minus_discovered": sorted(
-           generated_scope_ids - discovered_male_scope_ids
-       ),
-   }
-   missing = sorted(generated_scope_ids - complete_scope_ids)
-   extra = sorted(complete_scope_ids - generated_scope_ids)
-   assert not extra, {"complete_minus_generated": extra}
-   print(
-       "exact coverage reconciliation: "
-       f"{len(missing)} missing, 0 extra, 0 duplicate IDs/slugs"
-   )
-   print(json.dumps({"scopes": missing[:10]}))
-   PY
-   ```
-
-   В handoff/evidence записать результат как
-   `target_scope_ids - COMPLETE scope_head_v2 = empty`; не подменять exact set
-   одним count. Пока разность не пуста, взять последнюю JSON-строку как
-   `COHORT_CONF`, запустить ровно этот `dag_backfill_espn` cohort и повторить
-   reconciliation. Если любой head не проходит physical COMPLETE verification,
-   сначала выполнить repair/backfill его exact scope; простое наличие строки
-   `scope_head_v2` не является COMPLETE evidence.
-
-5. После deploy parser migration выполнить только manual full reconciliation
-   каждого scope. Новый runtime выпускает исключительно
-   `espn-native-parser-v3` / `espn-native-runtime-v4`; one-hop bridge из
-   `espn-native-parser-v2` / `espn-native-runtime-v3` разрешён только внутри
-   такого полного reconciliation. Partial daily и noop поверх v2 head
-   fail-closed. Для точного воспроизведения прежнего v2 результата единственным
-   разрешённым runtime остаётся pinned git `e12b85a`.
-
-   До снятия паузы с scheduler daily admission должен проверить exact
-   `181/181 v3/v4 heads`: полный frozen target без missing/extra scope, и каждый
-   immutable COMPLETE snapshot обязан иметь parser v3/runtime v4. Смешанные
-   версии строк, неизвестный parser/runtime transition или хотя бы один v2/v3
-   head запрещают enablement.
-
-6. После пустой разности и exact `181/181 v3/v4 heads` запустить один manual
-   all-scope canary через `dag_backfill_espn`, передав в `scopes` exact frozen
-   target array из saved state ref/`male_registry_ref`; zero-row scope считается успешным лишь
-   с exact signed manifest/checkpoint evidence, а не из-за отсутствия mapped
-   output. Summary reuse также требует exact signed prior evidence. Затем
-   подтвердить zero active leases и zero alerts. Только после этого
-   вернуть manual backfill на паузу, оставить repair/replay на паузе,
-   снять паузу с child ingest и monitoring, затем с discovery и лишь
-   после них — с daily owner. Этот порядок обязателен после
-   init/recreate, когда все ESPN DAG-и могли быть поставлены на паузу:
-
-   Перед trigger атомарно claim exact canary через
-   `scripts.espn_canary_campaign.claim_campaign_attempt`. Identity равен
-   `(ESPN_RELEASE_COMMIT, ESPN_RELEASE_TREE_SHA256, registry_signature,
-   target_scope_sha256)`. Новый release начинает `ordinal001`; продолжение того
-   же campaign может использовать только `ordinal002` и `ordinal003` после
-   immutable failure receipt. `guard_only=True` ledger не меняет и ordinal не
-   расходует. Active/successful/malformed campaign, registry/target/release-tree
-   drift или четвёртая попытка блокируют trigger. Successor release обязан
-   сослаться на exact predecessor failure URI/SHA и непустую remediation.
-   Claim возвращает content-addressed immutable `claim_ref`. Задать только его
-   точную пару как `ESPN_CANARY_CLAIM_URI` и `ESPN_CANARY_CLAIM_SHA256` до
-   admission. Admission strict-read проверяет bytes/SHA, canonical
-   `CampaignLedger`, latest active attempt, exact frozen scope array/target SHA
-   и текущий ledger SHA. До первого control-store access admission атомарно
-   создаёт immutable single-use consumption marker, связанный с exact
-   `(dag_id, run_id, canonical admission identity)`, и включает claim,
-   consumption ref и admission identity в signed admission и каждый signed
-   plan. Retry того же exact run идемпотентен; concurrent или последовательный
-   другой run с тем же claim всегда блокируется до lease/fetch/write. После
-   terminal receipt `finish_campaign_attempt` публикует отдельный immutable
-   deterministic `finish_ref`; он монотонно отзывает claim, поэтому даже
-   восстановление старых active ledger bytes не возвращает authorization.
-   Claim, consumption и finish evidence никогда не перезаписывают друг друга.
-   Текущий runtime исполняет только `espn-airflow-admission-v3`; authentic v1/v2
-   можно разобрать для аудита, но их execution/retry требует pinned `e12b85a` и
-   fail-closed отклоняется до registry/control/network/publication.
-
-   ```bash
-   espn_airflow dags pause dag_backfill_espn
-   espn_airflow dags pause dag_repair_espn
-   espn_airflow dags pause dag_replay_espn
-   espn_airflow dags unpause dag_ingest_espn
-   espn_airflow dags unpause dag_monitor_espn
-   espn_airflow dags unpause dag_discover_espn_registry
-   espn_airflow dags unpause dag_trigger_espn_daily
-   ```
-
-   Из-за нового registry signature обязательны три новых scheduled green
-   parent/child runs. Для v4 день считается зелёным при точной квалификации
-   каждого scope в состоянии `complete` **или** `noop`; manual bootstrap/canary
-   не засчитываются в эти три.
-
-### Rollback expanded registry
-
-При regression или hard alert немедленно поставить owner на паузу. Сохранить
-immutable raw/generation/reconciliation evidence; ничего из него не удалять.
-Затем восстановить last reviewed release и **freeze the last good immutable
-discovery-state ref, binding the last good `male_registry_ref`** в rollback
-record/admission evidence. Установить сохранённые
-`ESPN_DISCOVERY_STATE_REF_URI` и `ESPN_DISCOVERY_STATE_REF_SHA256` во всех
-Airflow компонентах и повторить exact `espn_compose ... up -d
---force-recreate` и container `printenv` проверки из rollout. Не выбирать
-текущий `latest-state.json` и
-не генерировать новый registry во время rollback: last good frozen state ref
-и его `male_registry_ref` остаются неизменяемым target до отдельного reviewed
-rollout.
+`deploy/espn/deploy.py plan` строго non-mutating: он не берёт locks, не делает
+`mkdir`, не создаёт files/journals, не запускает guards, backup/restore или
+Compose. Он читает только reviewed release/DagBag/Compose/guard bytes и печатает
+canonical JSON stdout. Перенаправление stdout в новый файл выполняет оператор,
+а не команда `plan`.
 
 ```bash
-espn_airflow dags pause dag_trigger_espn_daily
-espn_airflow dags pause dag_discover_espn_registry
-# deploy last reviewed release; retain immutable raw and generation artifacts
+/root/.venvs/dpf-test/bin/python deploy/espn/deploy.py plan \
+  --transition-id 'issue-1148-release-ordinal001' \
+  --release-commit "$ESPN_RELEASE_COMMIT" \
+  --release-tree-sha256 "$ESPN_RELEASE_TREE_SHA256" \
+  --release-root "$ESPN_RELEASE_ROOT" \
+  --dagbag-root "$ESPN_DAGBAG_ROOT" \
+  --compose-file "$ESPN_RELEASE_ROOT/deploy/espn/airflow.compose.yaml" \
+  --env-file "$ESPN_ENV_FILE" \
+  --stack-lock-root "$ESPN_STACK_LOCK_ROOT" \
+  --state-root "$ESPN_DEPLOY_STATE" \
+  --backup-root "$ESPN_BACKUP_ROOT" \
+  --airflow-image "$ESPN_AIRFLOW_IMAGE" \
+  --postgres-image "$ESPN_POSTGRES_IMAGE" \
+  --layout-mode legacy14 \
+  --guard-argv-json \
+    '["/root/.venvs/dpf-test/bin/python","/absolute/immutable/espn-release-guard-<sha>.py","guard","--poll-seconds","15"]' \
+  --guard-artifact "$ESPN_RELEASE_GUARD" \
+  > /durable/espn/review/issue-1148-release-plan.json
 ```
 
-## Canary и три зелёных запуска
+Peer review сверяет `mutates=false`, все absolute paths, exact image digests,
+release/DagBag/Compose/guard/operator hashes, layout, commands, backup target,
+шесть phases и canonical `plan_sha256`. `release_commit` сверяется с внешней
+immutable packaging attestation для того же release root/tree; одно лишь
+40-hex значение не считается provenance proof. Plan должен воспроизводиться
+byte-for-byte.
+`stack_lock_root` — один фиксированный owner-only root для всего Compose project
+`espn-airflow`; он не меняется между transition IDs и находится вне их state
+roots. Именно этот global lock сериализует любые apply/resume одного stack.
+Не редактировать JSON вручную и не извлекать SHA через `tee`/pipeline.
+Reviewed commands обязаны содержать `--force-recreate` для init/runtime и
+bounded Compose `--wait-timeout`; обычный restart или unbounded wait запрещён.
 
-Сначала выбрать ровно один `scope_id` вида `<espn_id>:<source_year>` и запустить
-его через `dag_ingest_espn`. Canary считается зелёным, только если capture,
-offline parse, DQ, COMPLETE manifest, publication evidence и health artifact
-связаны с одинаковыми registry/plan/generation signatures и точными URI/SHA.
-Последняя задача должна записать `espn-run-success-receipt-v1`: он появляется
-только после зелёного published DQ, пустого списка alerts и успешного release
-lease. Одного durable manifest недостаточно — он создаётся раньше этих проверок.
+### 2. Apply или resume exact plan
 
-Production qualification использует parser v3/runtime v4. Для каждого
-scheduled scope состояние должно быть
-одинаковым в durable summary, неизменённом `espn-run-manifest-evidence-v1` и
-publication: только `complete` или `noop`. `complete` публикует новую физическую
-COMPLETE generation. `noop` заново проверяет уже выбранную COMPLETE generation,
-но не двигает `ScopeHead.published_at` и не притворяется новой generation.
-
-`espn-durable-run-manifest-v1` теперь содержит встроенные `release` и
-`qualification`, не создавая седьмой public Bronze object. Release связывает
-exact commit/tree, parser/runtime, registry, sorted target SHA и campaign ID.
-Каждый scope получает outcome `complete_new` или `noop_revalidated`; fresh
-no-op обязан содержать текущий signed run-evidence URI/SHA и `recorded_at`.
-Schedule/entity/event dispositions используют только `captured`,
-`valid_empty`, `not_applicable` и структурированные failures на каждом уровне.
-Raw evidence сохраняет exact URI/SHA.
-
-Пустой schedule не может стать зелёным только из-за `rows=0`: все подписанные
-planned windows должны быть успешно получены, schema-valid и unsaturated,
-competition/season ownership должна совпадать, известный nonterminal event не
-может исчезнуть, а empty требует второй более свежей scheduled observation или
-явной source capability metadata. `schedule=proven` с нулём строк всегда red.
-Первая scheduled observation при `schedule=unknown` записывается как
-non-serving `pending_empty` в существующие run-manifest/control evidence: она
-связывает scheduled run ID, timestamp, exact planned windows и immutable Raw
-URI/SHA, но не двигает serving head и завершает task красным. Следующий signed
-plan strict-read восстанавливает эту observation из exact evidence/raw-manifest
-refs; только другой более поздний scheduled run может образовать каноническую
-пару и квалифицировать `valid_empty`.
-Для каждого `played_final && summary_required` lineup и matchsheet либо
-`captured` с обеими командами, либо evidence-backed `valid_empty` только при
-partial/absent/unknown capability. Каждый nonfinal event явно
-`not_applicable`; для аутентичных pre-Task2 parser-v3/runtime-v4 snapshots это
-состояние безопасно выводится при qualification, даже если старый физический
-snapshot ещё не содержал disposition rows.
-
-После published DQ рядом с immutable `run-evidence.json` должен лежать
-канонический sibling `qualification-attestation.json` вида
-`espn-scope-qualification-attestation-v1`. Сборщик для каждого scope обязан
-получить exact URI/SHA этого sibling только заменой конечного имени
-`run-evidence.json`, проверить его и положить ссылку в
-`qualification_attestation_ref`; `latest` и поиск по префиксу запрещены.
-Attestation связывает текущую квалификацию с выбранной физической generation,
-её registry/parser/runtime, signed plan, lease, publication и DQ.
-
-`espn-run-success-receipt-v1` расширен теми же embedded `release`,
-`canary_campaign` и `qualification`; `receipt_sha256` подписывает их вместе с
-остальным финальным evidence. Canonical sibling attestation остаётся отдельной
-immutable scope-связью и не превращается в новый public object. Старые
-promotion evidence v2/v3 остаются complete-only и не могут квалифицировать
-новый release campaign.
-Перед verdict и ещё раз перед final receipt reducer strict-read реконструирует
-полную canonical qualification каждого scope из exact publication snapshot,
-current-run evidence, dispositions и Raw URI/SHA. Verdict и health обязаны
-нести один и тот же validated durable-manifest ref; count/scope-only совпадение
-или tamper любого nested state/Raw ref fail-closed блокирует receipt.
-
-Перед cutover нужны **три последовательных зелёных** scheduled qualification
-запуска `dag_ingest_espn` для того же scope и registry signature. В v4
-разрешены последовательности из `complete|noop`, например
-`complete, noop, noop` или `noop, noop, noop`, если каждый `noop` полностью
-перепроверил exact current COMPLETE head. В promotion evidence положить exact
-registry snapshot URI/SHA, а для каждого запуска — durable/raw, published-DQ,
-qualification-attestation, terminal-verdict, health, lease-release и final
-success receipt URI/SHA. Три master data interval должны соприкасаться без
-пропуска. Кандидатом становится физическая COMPLETE generation, выбранная
-третьей квалификацией; сам `noop` новой generation не создаёт. Ошибка, warning,
-stale manifest, неподходящий parser/runtime, пропущенный день или другой
-registry signature обнуляют серию.
-
-Сначала выполнить план — команда по умолчанию dry-run и не открывает БД:
+Внести в change record exact SHA из peer-reviewed plan, затем передать и plan,
+и SHA. Другие runtime arguments у mutating modes отсутствуют.
 
 ```bash
-python scripts/migrate_espn_native_v2.py promote \
-  --evidence /durable/espn/700-2026-promotion-evidence.json \
-  --output /durable/espn/700-2026-promotion-plan.json
+export ESPN_DEPLOY_PLAN='/durable/espn/review/issue-1148-release-plan.json'
+export ESPN_DEPLOY_PLAN_SHA256='<exact-plan_sha256-from-reviewed-json>'
+
+/root/.venvs/dpf-test/bin/python deploy/espn/deploy.py apply \
+  --plan "$ESPN_DEPLOY_PLAN" \
+  --plan-sha256 "$ESPN_DEPLOY_PLAN_SHA256"
 ```
 
-Проверить `mutates=false`, один scope, три exact green-run refs, создание V2
-objects/current views, baseline и конкретную rollback command. Только после
-peer review применить тот же файл:
+После interruption не запускать новый apply и не менять plan. Продолжить только
+так:
 
 ```bash
-python scripts/migrate_espn_native_v2.py promote \
-  --evidence /durable/espn/700-2026-promotion-evidence.json \
-  --output /durable/espn/700-2026-promotion-result.json \
-  --apply
+/root/.venvs/dpf-test/bin/python deploy/espn/deploy.py resume \
+  --plan "$ESPN_DEPLOY_PLAN" \
+  --plan-sha256 "$ESPN_DEPLOY_PLAN_SHA256"
 ```
 
-Успех — `status=promoted`, valid `result_sha256`, baseline всех трёх legacy
-таблиц со snapshot IDs из Iceberg `main` refs и метриками, прочитанными через
-`FOR VERSION AS OF` этих exact snapshots, и один native cutover, привязанный к
-физически перепроверенной COMPLETE generation. Проверить current views
-запросами только для этого scope.
-Повтор команды должен вернуть тот же результат, а не второй переход.
+Operator выполняет guards в порядке `initial_state`, `pre_backup`,
+`pre_checkpoint_mutation`, `pre_airflow_init`, `pre_recreate`, `post_deploy`.
+Для каждого guard checksummed `guard-attempt-journal.json` отдельно от
+checksummed transition journal хранит `started|succeeded|failed`, attempt,
+duration, физический fingerprint и SHA owned regular log. Оба журнала взаимно
+связаны transition/guard event SHA, transition ID и exact plan SHA. Completed
+attempt identities immutable; `started-only` phase после crash запускается как
+новый attempt, не переписывая старый record.
 
-## Replay
+Каждый guard ограничен **1,800 секунд**, а весь deploy — **10,800 секунд**,
+включая static preflight, backup, full disposable restore proof, checkpoint,
+`airflow-init`, Compose recreation и final evidence. Child запускается отдельной
+process group; timeout посылает SIGTERM, затем SIGKILL всей группе. stdout/stderr
+никогда не являются pipe: они идут прямо в owner-only regular logs. Durable
+heartbeat/ETA сохраняется с интервалом не более 60 секунд и на границах
+операций. Console EPIPE не влияет на status; источники истины — checksummed
+journals, checkpoint, backup/TOC/restore proof и immutable result.
+Перед result operator повторно валидирует SHA/ownership каждого successful
+Compose action log и связывает exact checksummed heartbeat path/SHA с result.
+Post-deploy fingerprint требует digest-pinned images, exact UI bind и все шесть
+release/DagBag mounts как `Type=bind`, `RW=false`; missing/RW mount блокирует
+завершение.
 
-Для расследования взять `replay_raw_manifest_uri` и SHA из promotion result или
-failed-run evidence. Запустить `dag_replay_espn` с exact signed replay plan и
-raw manifest. Replay не ходит в ESPN: он читает только сохранённые raw bytes,
-повторно проверяет SHA и публикует новую immutable generation. Никогда не
-перезаписывать исходный raw manifest.
+До продолжения убедиться, что checkpoint связывает exact dump/TOC SHA и успешный
+full restore в disposable `network=none` tmpfs container. Отсутствующий restore
+proof, повреждённый checksum, unsafe ownership/mode, plan/hash drift или
+неполная journal pair блокируют deployment.
 
-## Repair
+## Read-only rollout probe и pause posture
 
-Seed находится в `configs/espn/repair_seed.yaml`. Для полной матрицы Top-5
-сезонов `1617`–`2526` сначала получить read-only input прямо из exact Iceberg
-snapshots (ручной JSON не является evidence), затем выполнить validator:
+Версионный probe не открывает writers и не делает DDL/migration. Task 6 host
+adapter собирает read-only snapshot; repository probe только проверяет input и
+печатает независимые результаты. Запуск из immutable release:
 
 ```bash
-python scripts/extract_espn_repair_audit.py \
+/root/.venvs/dpf-test/bin/python scripts/espn_rollout_probe_v1.py \
+  --snapshot /protected/read-only/espn-rollout-snapshot.json \
+  --observed-at '<aware-ISO8601>'
+```
+
+Ожидать `kind=espn-rollout-probe-v1`, `status=ok`, 14 независимых result codes и
+`counts.fail=0`, `counts.unknown=0`. Любой `fail|unknown` — hard failure; один
+зелёный check не скрывает другой красный.
+
+Нормальная green posture — **все семь DAG-ов paused**. Единственное green
+исключение — arm window `13:50–14:15 UTC`. В нём разрешён только ordered prefix
+`ingest → monitor → discovery → parent`: следующий DAG можно unpause лишь после
+read-only подтверждения предыдущего. После scheduler creation exact parent run
+parent снова paused; первые три могут оставаться unpaused только пока его
+`exact derived child` находится `queued|running`. После terminal child немедленно
+вернуть все семь DAG-ов paused. Вне window, при неизвестном prerequisite,
+лишнем unpaused DAG, wrong parent/child identity или failed child posture hard
+red. Утренний report 07:00 этого окна не видит, поэтому Task 6 устанавливает
+hourly observer; morning report даёт лишь next-day detection.
+
+## Gated production ceremony
+
+Ни один следующий шаг не начинается без immutable green evidence предыдущего.
+Именно этот numbered order является rollout contract.
+
+### 1. Reviewed deploy plan and restore proof
+
+Проверить shared-owner fence, all-seven-paused и zero active runs; затем
+peer-review exact deploy plan и применить его единожды. Сохранить canonical plan,
+`plan_sha256`, transition journal, отдельный guard-attempt journal, heartbeat,
+backup, TOC, full restore proof и result. Probe должен подтвердить exact metadb,
+`127.0.0.1:8086`, scheduler/metadb healthy, exact seven-DAG inventory и
+`legacy14`. Полный rollout probe ещё может быть red на campaign/receipt gates,
+которые создаются следующими шагами; это ожидаемо и не превращается в green.
+`airflow-init`/recreate вручную не повторять в обход operator.
+
+### 2. Fresh campaign ordinal001
+
+Получить fresh immutable discovery state и registry review для нового release.
+Начать с green all-seven-paused/zero-active evidence, затем в bounded reviewed
+maintenance interval временно unpause только `dag_discover_espn_registry`,
+создать exact manual discovery run, дождаться terminal publish и немедленно
+снова pause/подтвердить zero active. Probe ожидаемо hard-red только внутри этого
+interval; до и после он обязан вернуть all-seven-paused green.
+Сохранить `candidate_ref`, `male_registry_ref`, `discovery_state_ref`, registry
+signature и exact sorted 181 target SHA. Claim campaign identity равен
+`(release_commit, release_tree_sha256, registry_signature,
+target_scope_sha256)` и для нового release обязан быть `ordinal001`.
+`guard_only=True` не расходует ordinal; active/successful/malformed campaign,
+old-release claim, drift или ordinal002 без immutable predecessor failure
+блокируют rollout. Admission использует только exact single-use
+`ESPN_CANARY_CLAIM_URI`/`ESPN_CANARY_CLAIM_SHA256`; consumption и finish refs
+append-only и не переиспользуются. На этом шаге claim pair сохраняется как
+immutable evidence, но **не устанавливается** в runtime env: non-canary
+reconciliation отвергает любой присутствующий canary claim.
+
+Во всех Airflow roles атомарно задать exact pair
+`ESPN_DISCOVERY_STATE_REF_URI`/`ESPN_DISCOVERY_STATE_REF_SHA256`. Frozen ref
+остаётся действующим, пока обе переменные атомарно не удалены или не заменены
+другой reviewed pair; partial pair и mutable pointer fail closed.
+
+Чтобы pair действительно попал в уже созданные containers, после его установки
+в protected env выполнить **второй reviewed deploy transition** через тот же
+`deploy/espn/deploy.py plan` → peer review → `apply`, с новым transition ID/state
+root, тем же global `stack_lock_root` и exact release/images/layout. Secret-safe
+manifest с URI/SHA пары включить в reviewed guard artifacts; guard проверяет
+наличие exact pair без печати env values. Сохранить второй backup/restore proof
+и все шесть guards. Ручной `compose recreate` запрещён: только этот operator
+может перенести pair во все Airflow roles. Шаг 3 не начинается до его immutable
+result и read-only подтверждения pair во всех roles.
+
+### 3. Full 181-scope v2→v3 reconciliation
+
+Пока все scheduled DAG-и paused, выполнить manual **full reconciliation** всех
+181 frozen scopes через bounded `dag_backfill_espn` cohorts не более 10 scopes.
+Перед каждым cohort сохранить green all-paused/zero-active evidence, затем в
+явно одобренном maintenance interval временно unpause **только**
+`dag_backfill_espn`, создать один exact manual DagRun и держать его unpaused до
+terminal state. Такая posture намеренно hard-red для probe и не считается
+исключением/green gate; alert override ограничен exact change record и временем.
+Сразу после terminal снова pause DAG, подтвердить zero active runs и вернуть
+all-seven-paused green до следующего cohort. Остальные шесть не unpause никогда.
+Каждый schedule row повторно парсится из exact scoreboard Raw; unchanged Summary
+сохраняет exact URI/SHA. Единственный разрешённый bridge —
+`espn-native-parser-v2`/`espn-native-runtime-v3` →
+`espn-native-parser-v3`/`espn-native-runtime-v4` внутри full reconciliation.
+Partial daily, noop поверх v2, mixed/unknown transition запрещены. Pinned
+`e12b85a` разрешён только для exact исторического v2 replay и никогда не
+возвращается как serving runtime.
+
+После каждого cohort вычислять exact set difference
+`target_scope_ids - COMPLETE scope_head_v2`; брать deterministic первые 10
+missing scopes, ждать terminal success и zero leases. Count без exact set,
+непроверенный head или extra same-signature head не являются evidence.
+
+### 4. Exact 181/181 v3/v4 gate
+
+Strict-read проверить `discovered target == generated registry target == 181
+physical COMPLETE heads`, без missing/extra/duplicate. Каждый head связывает
+exact immutable snapshot, physical Bronze parity, parser v3/runtime v4 и тот же
+registry signature. Любые 180/181, 182/181, mixed version, stale receipt или
+registry/target mismatch блокируют canary и scheduler.
+Evidence формулируется как `exact 181/181 v3/v4 heads`, а не только count.
+
+### 5. All-181 canary
+
+После exact-181 gate атомарно установить exact single-use
+`ESPN_CANARY_CLAIM_URI`/`ESPN_CANARY_CLAIM_SHA256` и выполнить отдельный
+**third reviewed deploy transition** с новым transition ID/state root, тем же
+global lock/release/images/layout и secret-safe claim-pair manifest в guard
+artifacts. Только его immutable result подтверждает, что claim pair попал во
+все scheduler/worker roles; direct env injection или ручной recreate запрещены.
+
+Запустить один manual all-scope canary с exact frozen 181-element target array
+и fresh ordinal001 claim. Как и reconciliation, сначала сохранить green
+all-paused/zero-active evidence, затем временно unpause только reviewed canary
+entry DAG `dag_backfill_espn`, держать до terminal и немедленно снова pause.
+Во время него probe обязан быть hard-red, а после — снова all-seven-paused green.
+Это не per-scope canary. Успех требует для всех 181
+`complete_new|noop_revalidated`, final `espn-run-success-receipt-v1`, exact
+durable-manifest ref, physical head parity, zero alerts и zero active leases.
+
+После terminal canary и sealed consumption/finish evidence атомарно удалить
+**обе** `ESPN_CANARY_CLAIM_*` переменные и выполнить отдельный **fourth reviewed
+deploy transition** через тот же operator/global lock. Daily non-canary runs
+запрещены, пока read-only guard не подтвердит отсутствие claim pair во всех
+roles, all-seven-paused и zero active runs. Partial removal hard-fails.
+
+Отдельно проверить known scope `19425:2026` и exact Leagues Cup IDs
+`401863559`, `401863560`, `401863562`, `401863563`, `401863564`. Для каждого
+event/entity допускаются только `captured`, evidence-backed `valid_empty` либо
+`not_applicable`: structured failure, missing ID или неизвестная disposition —
+red. `played_final && summary_required` требует lineup и matchsheet с обеими
+teams либо capability-backed valid-empty; nonfinal явно `not_applicable`.
+
+`rows=0` сам по себе никогда не green. Empty schedule требует unsaturated
+schema-valid coverage всех signed windows, правильную competition/season
+ownership, отсутствие пропавшего known nonterminal event и вторую более свежую
+scheduled observation либо explicit source capability metadata. Fresh noop
+strict-read перепроверяет exact COMPLETE generation и подписывает новый
+run-evidence; он не двигает `ScopeHead.published_at`.
+
+### 6. Three scheduler-created parent/child receipts
+
+В три соседних UTC-дня использовать только arm-window state machine выше.
+Parent создаёт scheduler, не CLI/manual trigger. Сохранить exact parent receipt,
+derived-child identity и child final receipt для каждого дня. Три data interval
+соприкасаются без gap/overlap; первый и третий start разделены на **exact 48h**.
+Все три относятся к одному release/tree/registry/target и имеют explicit
+`canary_campaign=null`: после удаления claim pair scheduled daily admission не
+может и не должен наследовать canary campaign identity. Ceremony evidence
+отдельно связывает эти receipts с ранее sealed successful ordinal001 campaign
+artifact, не возвращая `ESPN_CANARY_CLAIM_*` в runtime. Каждый receipt имеет
+`complete|noop` qualification для всех 181, zero warnings/alerts/leases и один
+validated durable-manifest ref. Manual bootstrap/canary не засчитываются.
+После каждого child terminal вернуть все семь DAG-ов paused.
+
+### 7. compact6 ACL and rollback proof
+
+Сначала получить fresh transition/plan-bound run-guard evidence, где ESPN,
+legacy, E3, xref и Gold paused и active runs zero. Затем capture exact legacy14
+snapshots и immutable global archive manifest; plan review предшествует apply.
+
+```bash
+ESPN_BRONZE_LAYOUT_MODE=legacy14 \
+/root/.venvs/dpf-test/bin/python scripts/compact_espn_bronze_v2.py plan \
+  --plan /durable/espn/compact6/plan.json \
+  --capture \
+  --transition-id '<exact-transition-id>' \
+  --registry-snapshot-uri '<immutable-registry-uri>' \
+  --registry-snapshot-sha256 '<registry-sha256>' \
+  --registry-signature '<registry-signature>' \
+  --target-scopes /durable/espn/compact6/exact-181-target.json \
+  --run-guard /durable/espn/compact6/run-guard.json
+```
+
+Review exact archive snapshot IDs/counts/multiset hashes, dispositions, six
+replacements, 181 physical heads, every rendered step/postcondition,
+`plan_sha256`, emergency views and logical rollback. Затем:
+
+```bash
+ESPN_BRONZE_LAYOUT_MODE=legacy14 \
+/root/.venvs/dpf-test/bin/python scripts/compact_espn_bronze_v2.py apply \
+  --plan /durable/espn/compact6/plan.json \
+  --manifest /durable/espn/compact6/archive-manifest.json \
+  --journal /durable/espn/compact6/journal.json \
+  --run-guard /durable/espn/compact6/run-guard.json \
+  --execute
+```
+
+После interruption использовать ту же plan/manifest/journal triple и
+`scripts/compact_espn_bronze_v2.py resume --resume-operation apply --execute`.
+Не создавать fork. Подтвердить **exactly six public Bronze objects**: три
+explicit-column SECURITY DEFINER canonical views и три physical controls.
+Обычные Airflow/analyst roles не читают `iceberg.espn_internal`; platform admin
+читает archives/journal. Проверить emergency logical rollback и repromotion на
+frozen archive, а не на live legacy main. После cutover задать всем runtime
+`ESPN_BRONZE_LAYOUT_MODE=compact6`; e12b85a rollback запрещён.
+
+Изменение protected env само по себе running containers не обновляет. Поэтому
+до шага 8 построить новый reviewed deploy-operator plan с
+`--layout-mode compact6`, новым transition ID/state root, тем же global
+`stack_lock_root`, release и digest-pinned images; затем выполнить только его
+`apply`. Сохранить новый backup/full-restore proof, шесть guards и immutable
+result. Read-only probe должен подтвердить compact6 exact-six/parity во всех
+roles; manual Compose recreate по-прежнему запрещён.
+
+### 8. One post-cutover scheduled cycle
+
+В следующем arm window провести ровно один scheduler-created parent/derived
+child cycle уже в compact6. Probe должен показать compact6 layout, exact-six
+inventory, internal/public parity, fresh all-181 final receipt, known five IDs,
+valid dispositions, zero alerts/leases и затем all-seven-paused posture. До
+этого цикла downstream promotion запрещён.
+
+### 9. Six-scope E3/xref/Gold reconciliation
+
+Продвигать только exact mapped allowlist `606:2026`, `700:2026`, `710:2026`,
+`720:2026`, `730:2026`, `740:2026`; остальные 175 остаются Bronze-only.
+Выполнить E3/xref/Gold reconciliation для exact platform `(league, season)`:
+E3 input parity, collision-free aliases, `xref_team`, `xref_match`,
+`fct_lineup`, Gold row/hash parity и pair-scoped DQ. Missing mapping, legacy
+fallback для этих шести, 175-scope leakage, fanout, orphan или cap/floor из
+`181 * 60000` блокируют завершение.
+
+### 10. Rollback and secret-safe security evidence
+
+Сделать reviewed rollback rehearsal до закрытия окна. compact6 rollback читает
+только frozen global archive/disposition manifest и пишет durable journal;
+никогда не выбирает live legacy main и ничего не удаляет. Сохранить rollback
+SQL/hash, emergency-view parity, result и repromotion proof. Для pre-compact
+release incident использовать exact deploy checkpoint/backup и отдельно
+reviewed restore procedure; не угадывать команды и не менять original plan.
+Rollback registry фиксирует `last good immutable discovery-state ref` и
+связанный `male_registry_ref`, никогда текущий `latest-state.json`.
+
+Security evidence должно быть `secret-safe`: записывать только имена checked
+locations, commit/path, ownership/mode, digest и verdict — никогда token,
+password, DSN credential или raw env value. Проверить active PostgreSQL/Trino
+secrets против public Git history, backups и logs без печати значений.
+Confirmed active external exposure немедленно блокирует production и требует
+same-day отдельной rotation; если exposure не подтверждён, сохранить dedicated
+tracker и coordinated rotation deadline не позднее семи дней.
+
+## Replay и repair
+
+Replay использует exact `replay_raw_manifest_uri`/SHA из failed или successful
+evidence и `dag_replay_espn`. Он не ходит в ESPN, повторно проверяет immutable
+Raw bytes и публикует новую generation, не перезаписывая original manifest.
+Authentic v1/v2 artifact можно читать для audit, но current execution допускает
+только admission v3; исторический v2 replay выполняется pinned e12b85a.
+
+Для Top-5 repair сначала получить read-only input из exact Iceberg snapshots,
+затем валидировать полную 50-scope matrix:
+
+```bash
+/root/.venvs/dpf-test/bin/python scripts/extract_espn_repair_audit.py \
   --output /durable/espn/top5-audit-input.json
-```
-
-Затем:
-
-```bash
-python scripts/audit_espn_repair.py \
+/root/.venvs/dpf-test/bin/python scripts/audit_espn_repair.py \
   --input /durable/espn/top5-audit-input.json \
   --output /durable/espn/top5-repair-queue.json
 ```
 
-Проверить все 50 scopes и причины date, duplicate, final-score и Summary
-coverage. Missing scope тоже обязан попасть в очередь. Запускать выбранные
-строки через `dag_repair_espn`, сохраняя failure/repair evidence. Данные до
-2016 имеют метку `legacy_untrusted`: их можно исследовать и replay, но нельзя
-автоматически переводить в trusted cutover.
-
-## Rollback
-
-При regression, stale data или hard alert взять неизменённый promotion result
-и сначала построить план без `--apply`:
-
-```bash
-python scripts/migrate_espn_native_v2.py rollback \
-  --promotion-report /durable/espn/700-2026-promotion-result.json \
-  --reason 'canary-regression-INC-123' \
-  --output /durable/espn/700-2026-rollback-plan.json
-```
-
-После review повторить с `--apply`. Rollback добавляет legacy successor,
-проверяет predecessor hash и ancestry, но не меняет и не удаляет прошлые
-cutovers, native generations или legacy objects. Затем проверить current views
-для одного scope и запустить `dag_monitor_espn`.
-
-После repair разрешено повторное promotion. Оно требует новую тройку зелёных
-дней и новый `cutover_id` вида
-`espn-native-<espn_id>-<year>-repromote-<первые 16 символов rollback SHA>`.
-Новый native cutover обязан назвать rollback predecessor и продолжить ancestry;
-старый root ID повторно использовать нельзя. Новый promotion result снова
-служит единственным входом для следующего rollback.
+Missing scope тоже входит в queue. Pre-2016 `legacy_untrusted` можно исследовать
+и replay, но нельзя автоматически повышать до trusted serving. Старый
+`scripts/migrate_espn_native_v2.py` сохраняется для чтения исторических
+promotion/rollback evidence, но не заменяет all-181 + compact6 ceremony.
 
 ## Alerts и incident response
 
-`dag_monitor_espn` следит за 36-часовой свежестью. Health-задачи также
-поднимают hard alerts для исчерпанного proxy budget, schema drift,
-publication/cutover conflict, unpromoted current season и failed DQ. Warning не
-разрешает cutover. Hard alert сохраняется как identity-bound JSON до падения
-задачи. Оператор сохраняет alert SHA, ставит затронутый scope на паузу,
-выполняет rollback при риске для current views и использует replay/repair для
-диагностики. Не перезапускать capture вслепую.
+`dag_monitor_espn` и versioned rollout probe сообщают каждый failure class
+отдельно: topology/health, inventory, posture, parent-child identity/state,
+receipt, registry/target, physical versions, dispositions, freshness, leases,
+known events и serving parity. Unknown — hard, не green. При regression сначала
+все семь DAG-ов paused, затем сохраняются exact alert/evidence SHA; replay,
+repair или reviewed logical rollback выбирается по фактам. Не перезапускать
+capture вслепую и не вызывать writer из probe.
 
 ## Retention
 
 - Raw успешного COMPLETE запуска хранить минимум **90 дней**.
 - Raw и evidence failed/repair запуска хранить минимум **365 дней**.
-- Raw manifests, generation manifests, cutovers, baselines, health/alert и
-  promotion/rollback отчёты хранить **бессрочно**.
+- Raw manifests, generation manifests, receipts, claims/consumption/finish,
+  deploy/guard/compact journals, archives, cutovers, baselines, health/alert и
+  rollback/security reports хранить **бессрочно**.
 
-Cleanup обязан сначала доказать terminal state и retention class. Cutover или
-manifest без доступного exact replay evidence считается incident, а не
-кандидатом на очистку.
+Cleanup обязан доказать terminal state и retention class. Missing exact replay,
+restore или rollback evidence — incident, а не кандидат на очистку.
 
 ## Release gates
 
-До production apply сохранить точный вывод:
+До production apply сохранить полный вывод без secret values:
 
 ```bash
+/root/.venvs/dpf-test/bin/pytest tests/unit/scripts/test_espn_release_deploy.py -q
+/root/.venvs/dpf-test/bin/pytest tests/unit/scripts/test_espn_rollout_probe_v1.py -q
+/root/.venvs/dpf-test/bin/pytest tests/unit/scripts/test_espn_native_runbook.py -q
 /root/.venvs/dpf-test/bin/pytest tests/unit/scrapers tests/unit/dags -q
-/root/.venvs/dpf-test/bin/pytest tests/unit -q
-/root/.venvs/dpf-test/bin/pytest tests/unit/scripts/test_audit_bronze_columns.py -q
-/root/.venvs/dpf-test/bin/pytest tests/unit/dags/test_dag_espn_native_v2.py -q
-python scripts/audit_espn_runtime_imports.py
+/root/.venvs/dpf-test/bin/pytest tests/unit -k espn -q
+/root/.venvs/dpf-test/bin/python scripts/audit_espn_runtime_imports.py
 ```
 
-Любой non-zero gate запрещает cutover. Эти offline проверки не заменяют
-отдельные live preflight, canary observation и peer review production evidence.
+Любой non-zero запрещает cutover. Offline gates не заменяют live read-only
+probe, exact plan review, restore/rollback rehearsal и peer-reviewed production
+evidence.
