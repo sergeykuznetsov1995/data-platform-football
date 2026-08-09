@@ -717,6 +717,148 @@ def _ignored_owner_decision(values: Any) -> bool:
     }
 
 
+def _validate_daily_pipeline(
+    identity: Mapping[str, str],
+    activation: datetime,
+    item: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate one admitted DAILY lineage and identify its exact branch."""
+
+    owner = item.get("owner")
+    if not isinstance(owner, Mapping):
+        raise ObservationError("daily owner evidence is malformed")
+    owner_logical = _instant(owner.get("logical_date"), label="owner logical date")
+    if (
+        owner.get("dag_id") != OWNER_DAG_ID
+        or owner.get("state") != "success"
+        or owner.get("run_id") != _scheduled_run_id(owner_logical)
+    ):
+        raise ObservationError("earliest scheduled DAILY owner identity is invalid")
+
+    if (
+        _one(item.get("attest_task_states"), label="owner attestation task")
+        != "success"
+    ):
+        raise ObservationError("owner attestation task did not succeed")
+    attest_started = _instant(
+        _one(item.get("attest_task_start_dates"), label="owner attestation start"),
+        label="owner attestation start",
+    )
+    if attest_started < activation:
+        raise ObservationError("owner attestation predates automatic activation")
+    attestation = _one(item.get("attestations"), label="owner attestation XCom")
+    if not isinstance(attestation, Mapping) or any(
+        attestation.get(key) != value for key, value in identity.items()
+    ):
+        raise ObservationError("owner attestation XCom differs from deployment")
+
+    decision = _one(item.get("decisions"), label="owner decision XCom")
+    if not isinstance(decision, Mapping) or decision.get("lane") != "daily":
+        raise ObservationError("owner decision is not exact DAILY evidence")
+    decision_conf = decision.get("conf")
+    if not isinstance(decision_conf, Mapping) or decision_conf.get("mode") != "daily":
+        raise ObservationError("daily owner child conf is incomplete")
+    try:
+        selected_date = date.fromisoformat(str(decision.get("selected_date") or ""))
+    except ValueError as exc:
+        raise ObservationError("daily owner selected date is invalid") from exc
+    if selected_date.isoformat() != decision.get("selected_date"):
+        raise ObservationError("daily owner selected date is not canonical")
+
+    initializer = _one(item.get("initializers"), label="owner initializer XCom")
+    if not isinstance(initializer, Mapping):
+        raise ObservationError("owner initializer XCom is malformed")
+    binding = _canonical_binding(
+        initializer.get("binding"), git_sha=identity["git_sha"]
+    )
+    generation_id = str(initializer.get("generation_id") or "")
+    try:
+        if str(uuid.UUID(generation_id)) != generation_id:
+            raise ValueError("non-canonical UUID")
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ObservationError("initializer generation ID is invalid") from exc
+    if generation_id != make_generation_id(binding):
+        raise ObservationError("initializer generation differs from exact binding")
+    if (
+        _instant(binding["data_interval_end"], label="publication interval end").date()
+        != selected_date
+    ):
+        raise ObservationError("daily binding differs from owner selected date")
+    publication = {"generation_id": generation_id, "binding": binding}
+
+    _require_no_active_tasks(item.get("active_tasks"), label="owner run")
+    if _one(item.get("trigger_states"), label="owner ingest trigger") != "success":
+        raise ObservationError("owner ingest trigger did not succeed")
+
+    ingest = _one(item.get("ingest_runs"), label="ingest child run")
+    ingest_run_id = f"fotmob_orchestrated__{generation_id}"
+    expected_ingest_conf = {**dict(decision_conf), PUBLICATION_CONF_KEY: publication}
+    if (
+        not isinstance(ingest, Mapping)
+        or ingest.get("dag_id") != INGEST_DAG_ID
+        or ingest.get("run_id") != ingest_run_id
+        or _state(ingest.get("run_type")) != "manual"
+        or ingest.get("state") != "success"
+        or ingest.get("conf") != expected_ingest_conf
+    ):
+        raise ObservationError("ingest child success/conf lineage differs")
+    _require_no_active_tasks(item.get("ingest_active_tasks"), label="ingest run")
+
+    silver_trigger_state = _state(
+        _one(item.get("ingest_trigger_states"), label="ingest Silver trigger")
+    )
+    silver_run_id: str | None
+    if silver_trigger_state == "success":
+        silver = _one(item.get("silver_runs"), label="Silver child run")
+        silver_run_id = f"fotmob_silver__{generation_id}"
+        if (
+            not isinstance(silver, Mapping)
+            or silver.get("dag_id") != SILVER_DAG_ID
+            or silver.get("run_id") != silver_run_id
+            or _state(silver.get("run_type")) != "manual"
+            or silver.get("state") != "success"
+            or silver.get("conf") != {PUBLICATION_CONF_KEY: publication}
+        ):
+            raise ObservationError("Silver child success/conf lineage differs")
+        _require_no_active_tasks(item.get("silver_active_tasks"), label="Silver run")
+    elif silver_trigger_state == "skipped":
+        if item.get("silver_runs") != []:
+            raise ObservationError(
+                "Bronze-only daily unexpectedly has a Silver child run"
+            )
+        _require_no_active_tasks(item.get("silver_active_tasks"), label="Silver run")
+        silver_run_id = None
+    else:
+        raise ObservationError("ingest Silver trigger did not succeed or skip")
+
+    control = item.get("publication")
+    sofa_run_id = _scheduled_run_id(binding["data_interval_start"])
+    if (
+        not isinstance(control, Mapping)
+        or control.get("generation_id") != generation_id
+        or control.get("source") != "fotmob"
+        or control.get("status") != "succeeded"
+        or control.get("phase") != "published"
+        or control.get("binding") != binding
+        or control.get("active") is not False
+        or control.get("lock_active") is not False
+        or control.get("published", True) is not True
+        or control.get("released", True) is not True
+        or control.get("consumer") != {"dag_id": SOFA_DAG_ID, "run_id": sofa_run_id}
+    ):
+        raise ObservationError(
+            "ControlStore publication is not published, released and inactive"
+        )
+    return {
+        "generation_id": generation_id,
+        "binding": binding,
+        "owner_run_id": str(owner["run_id"]),
+        "ingest_run_id": ingest_run_id,
+        "silver_run_id": silver_run_id,
+        "sofa_run_id": sofa_run_id,
+    }
+
+
 def _validate_isolated_snapshot(
     context: Mapping[str, Any], snapshot: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -812,132 +954,16 @@ def _validate_isolated_snapshot(
         )
 
     candidates.sort(key=owner_order)
-    earliest_key = owner_order(candidates[0])[:2]
-    if sum(owner_order(item)[:2] == earliest_key for item in candidates) != 1:
-        raise ObservationError("earliest scheduled DAILY owner is ambiguous")
-    item = candidates[0]
-    owner = item["owner"]
-    owner_logical = _instant(owner.get("logical_date"), label="owner logical date")
-    if (
-        owner.get("dag_id") != OWNER_DAG_ID
-        or owner.get("state") != "success"
-        or owner.get("run_id") != _scheduled_run_id(owner_logical)
-    ):
-        raise ObservationError("earliest scheduled DAILY owner identity is invalid")
-
-    if (
-        _one(item.get("attest_task_states"), label="owner attestation task")
-        != "success"
-    ):
-        raise ObservationError("owner attestation task did not succeed")
-    attest_started = _instant(
-        _one(item.get("attest_task_start_dates"), label="owner attestation start"),
-        label="owner attestation start",
+    for item in candidates:
+        candidate_key = owner_order(item)[:2]
+        if sum(owner_order(other)[:2] == candidate_key for other in candidates) != 1:
+            raise ObservationError("earliest scheduled DAILY owner is ambiguous")
+        selected = _validate_daily_pipeline(identity, activation, item)
+        if selected["silver_run_id"] is not None:
+            return selected
+    raise ObservationError(
+        "no successful scheduled DAILY Silver lineage exists after activation"
     )
-    if attest_started < activation:
-        raise ObservationError("owner attestation predates automatic activation")
-    attestation = _one(item.get("attestations"), label="owner attestation XCom")
-    if not isinstance(attestation, Mapping) or any(
-        attestation.get(key) != value for key, value in identity.items()
-    ):
-        raise ObservationError("owner attestation XCom differs from deployment")
-
-    decision = _one(item.get("decisions"), label="owner decision XCom")
-    if not isinstance(decision, Mapping) or decision.get("lane") != "daily":
-        raise ObservationError("owner decision is not exact DAILY evidence")
-    decision_conf = decision.get("conf")
-    if not isinstance(decision_conf, Mapping) or decision_conf.get("mode") != "daily":
-        raise ObservationError("daily owner child conf is incomplete")
-    try:
-        selected_date = date.fromisoformat(str(decision.get("selected_date") or ""))
-    except ValueError as exc:
-        raise ObservationError("daily owner selected date is invalid") from exc
-    if selected_date.isoformat() != decision.get("selected_date"):
-        raise ObservationError("daily owner selected date is not canonical")
-
-    initializer = _one(item.get("initializers"), label="owner initializer XCom")
-    if not isinstance(initializer, Mapping):
-        raise ObservationError("owner initializer XCom is malformed")
-    binding = _canonical_binding(
-        initializer.get("binding"), git_sha=identity["git_sha"]
-    )
-    generation_id = str(initializer.get("generation_id") or "")
-    try:
-        if str(uuid.UUID(generation_id)) != generation_id:
-            raise ValueError("non-canonical UUID")
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise ObservationError("initializer generation ID is invalid") from exc
-    if generation_id != make_generation_id(binding):
-        raise ObservationError("initializer generation differs from exact binding")
-    if (
-        _instant(binding["data_interval_end"], label="publication interval end").date()
-        != selected_date
-    ):
-        raise ObservationError("daily binding differs from owner selected date")
-    publication = {"generation_id": generation_id, "binding": binding}
-
-    _require_no_active_tasks(item.get("active_tasks"), label="owner run")
-    if _one(item.get("trigger_states"), label="owner ingest trigger") != "success":
-        raise ObservationError("owner ingest trigger did not succeed")
-
-    ingest = _one(item.get("ingest_runs"), label="ingest child run")
-    ingest_run_id = f"fotmob_orchestrated__{generation_id}"
-    expected_ingest_conf = {**dict(decision_conf), PUBLICATION_CONF_KEY: publication}
-    if (
-        not isinstance(ingest, Mapping)
-        or ingest.get("dag_id") != INGEST_DAG_ID
-        or ingest.get("run_id") != ingest_run_id
-        or _state(ingest.get("run_type")) != "manual"
-        or ingest.get("state") != "success"
-        or ingest.get("conf") != expected_ingest_conf
-    ):
-        raise ObservationError("ingest child success/conf lineage differs")
-    _require_no_active_tasks(item.get("ingest_active_tasks"), label="ingest run")
-    if (
-        _one(item.get("ingest_trigger_states"), label="ingest Silver trigger")
-        != "success"
-    ):
-        raise ObservationError("ingest Silver trigger did not succeed")
-
-    silver = _one(item.get("silver_runs"), label="Silver child run")
-    silver_run_id = f"fotmob_silver__{generation_id}"
-    if (
-        not isinstance(silver, Mapping)
-        or silver.get("dag_id") != SILVER_DAG_ID
-        or silver.get("run_id") != silver_run_id
-        or _state(silver.get("run_type")) != "manual"
-        or silver.get("state") != "success"
-        or silver.get("conf") != {PUBLICATION_CONF_KEY: publication}
-    ):
-        raise ObservationError("Silver child success/conf lineage differs")
-    _require_no_active_tasks(item.get("silver_active_tasks"), label="Silver run")
-
-    control = item.get("publication")
-    sofa_run_id = _scheduled_run_id(binding["data_interval_start"])
-    if (
-        not isinstance(control, Mapping)
-        or control.get("generation_id") != generation_id
-        or control.get("source") != "fotmob"
-        or control.get("status") != "succeeded"
-        or control.get("phase") != "published"
-        or control.get("binding") != binding
-        or control.get("active") is not False
-        or control.get("lock_active") is not False
-        or control.get("published", True) is not True
-        or control.get("released", True) is not True
-        or control.get("consumer") != {"dag_id": SOFA_DAG_ID, "run_id": sofa_run_id}
-    ):
-        raise ObservationError(
-            "ControlStore publication is not published, released and inactive"
-        )
-    return {
-        "generation_id": generation_id,
-        "binding": binding,
-        "owner_run_id": str(owner["run_id"]),
-        "ingest_run_id": ingest_run_id,
-        "silver_run_id": silver_run_id,
-        "sofa_run_id": sofa_run_id,
-    }
 
 
 def _validate_shared_snapshot(

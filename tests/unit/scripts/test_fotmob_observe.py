@@ -182,6 +182,74 @@ def _shared_snapshot() -> dict:
     }
 
 
+def _later_complete_snapshots() -> tuple[dict, dict]:
+    """Build the next day's exact Silver-backed publication lineage."""
+
+    isolated = _isolated_snapshot()
+    item = isolated["daily_runs"][0]
+    old_generation = item["initializers"][0]["generation_id"]
+    binding = {
+        **_binding(),
+        "data_interval_start": "2026-08-07T14:00:00.000000+00:00",
+        "data_interval_end": "2026-08-08T14:00:00.000000+00:00",
+    }
+    publication = {
+        "generation_id": _generation_id(binding),
+        "binding": binding,
+    }
+    generation_id = publication["generation_id"]
+    owner_run_id = "scheduled__2026-08-08T14:00:00+00:00"
+    sofa_run_id = "scheduled__2026-08-07T14:00:00+00:00"
+
+    item["owner"].update(
+        run_id=owner_run_id,
+        logical_date="2026-08-08T14:00:00+00:00",
+        data_interval_start="2026-08-08T13:55:00+00:00",
+        data_interval_end="2026-08-08T14:00:00+00:00",
+        start_date="2026-08-08T14:00:01+00:00",
+    )
+    item["attest_task_start_dates"] = ["2026-08-08T14:00:02+00:00"]
+    item["decisions"][0]["selected_date"] = "2026-08-08"
+    item["initializers"] = [{**publication, "state": {"phase": "writing"}}]
+    item["ingest_runs"][0].update(
+        run_id=f"fotmob_orchestrated__{generation_id}",
+        conf={
+            **item["decisions"][0]["conf"],
+            "fotmob_publication": publication,
+        },
+    )
+    item["silver_runs"][0].update(
+        run_id=f"fotmob_silver__{generation_id}",
+        conf={"fotmob_publication": publication},
+    )
+    item["publication"].update(
+        **publication,
+        consumer={"dag_id": mod.SOFA_DAG_ID, "run_id": sofa_run_id},
+    )
+    assert generation_id != old_generation
+
+    shared = _shared_snapshot()
+    shared["expected"] = publication
+    shared["runs"][0].update(
+        run_id=sofa_run_id,
+        logical_date=binding["data_interval_start"],
+        data_interval_start=binding["data_interval_start"],
+        data_interval_end=binding["data_interval_end"],
+        finalizer_xcoms=[
+            {
+                **publication,
+                "source": "fotmob",
+                "status": "succeeded",
+                "phase": "published",
+                "active": False,
+                "published": True,
+                "released": True,
+            }
+        ],
+    )
+    return isolated, shared
+
+
 def test_validate_observation_emits_exact_purge_schema(tmp_path):
     report = mod.validate_observation(
         _context(tmp_path), _isolated_snapshot(), _shared_snapshot()
@@ -305,6 +373,32 @@ def test_earliest_admitted_daily_owner_is_selected(tmp_path):
     report = mod.validate_observation(_context(tmp_path), isolated, _shared_snapshot())
 
     assert report["runs"]["owner"]["run_id"] == OWNER_RUN_ID
+
+
+def test_bronze_only_first_daily_does_not_block_later_silver_observation(tmp_path):
+    isolated = _isolated_snapshot()
+    bronze_only = isolated["daily_runs"][0]
+    bronze_only["ingest_trigger_states"] = ["skipped"]
+    bronze_only["silver_runs"] = []
+    bronze_only["silver_active_tasks"] = []
+    later, shared = _later_complete_snapshots()
+    isolated["daily_runs"].extend(later["daily_runs"])
+
+    report = mod.validate_observation(_context(tmp_path), isolated, shared)
+
+    assert report["runs"]["owner"]["run_id"] == (
+        "scheduled__2026-08-08T14:00:00+00:00"
+    )
+
+
+def test_malformed_missing_silver_first_daily_still_fails_closed(tmp_path):
+    isolated = _isolated_snapshot()
+    isolated["daily_runs"][0]["silver_runs"] = []
+    later, shared = _later_complete_snapshots()
+    isolated["daily_runs"].extend(later["daily_runs"])
+
+    with pytest.raises(mod.ObservationError, match="Silver child"):
+        mod.validate_observation(_context(tmp_path), isolated, shared)
 
 
 def test_owner_dagrun_may_start_before_owner_readback_when_attestation_is_after(
