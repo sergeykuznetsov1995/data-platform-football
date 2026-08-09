@@ -44,6 +44,10 @@ x-espn-airflow-common: &espn-airflow-common
     ESPN_ARTIFACT_ROOT_URI: s3://${ICEBERG_WAREHOUSE}/artifacts/espn
     ESPN_RELEASE_COMMIT: ${ESPN_RELEASE_COMMIT:?set exact ESPN release commit}
     ESPN_RELEASE_TREE_SHA256: ${ESPN_RELEASE_TREE_SHA256:?set exact ESPN release tree SHA-256}
+    # The operator CLI and every LocalExecutor child use this identical host
+    # and container path. Consequently an immutable file:// claim URI needs no
+    # unsafe namespace translation after scheduler recreation.
+    ESPN_CANARY_STATE_ROOT: /durable/espn/canary-state
     # Set this complete claim only for the guarded all-181 backfill canary.
     ESPN_CANARY_CLAIM_URI:
     ESPN_CANARY_CLAIM_SHA256:
@@ -66,6 +70,14 @@ x-espn-airflow-common: &espn-airflow-common
     JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
   volumes:
     - espn_airflow_logs:/opt/airflow/logs
+    - type: bind
+      source: /durable/espn/canary-state
+      target: /durable/espn/canary-state
+      read_only: false
+      bind:
+        # Pre-create root:0 mode 0770. A missing protected namespace is a
+        # deployment error; Docker must not invent one with different ACLs.
+        create_host_path: false
     - type: bind
       source: ${ESPN_DAGBAG_ROOT:?set a fresh exact ESPN DagBag projection}
       target: /opt/airflow/dags

@@ -60,6 +60,12 @@ export ESPN_STACK_LOCK_ROOT='/durable/espn/deploy-stack-lock'
 export ESPN_DEPLOY_STATE='/durable/espn/deploy/<transition-id>'
 export ESPN_BACKUP_ROOT='/durable/espn/backups'
 export ESPN_RELEASE_GUARD='/absolute/immutable/espn-release-guard-<sha>.py'
+export AIRFLOW_UID="${AIRFLOW_UID:-50000}"
+export ESPN_CANARY_STATE_ROOT=/durable/espn/canary-state
+
+# Один раз до первого deploy: source и target bind имеют этот же absolute path.
+# Airflow services уже запускаются как ${AIRFLOW_UID}:0; other не получает прав.
+install -d -o root -g 0 -m 0770 "$ESPN_CANARY_STATE_ROOT"
 
 /root/.venvs/dpf-test/bin/python scripts/build_espn_dagbag_projection.py \
   --release-root "$ESPN_RELEASE_ROOT" \
@@ -227,6 +233,83 @@ append-only и не переиспользуются. На этом шаге cla
 immutable evidence, но **не устанавливается** в runtime env: non-canary
 reconciliation отвергает любой присутствующий canary claim.
 
+`deploy/espn/airflow.compose.yaml` bind-mount-ит
+`/durable/espn/canary-state` в тот же путь для всех Airflow roles и передаёт
+`ESPN_CANARY_STATE_ROOT`. Поэтому host operator и пересозданный scheduler читают
+одинаковый absolute `file://` URI без переписывания namespace. Каталог заранее
+создан `root:0` mode `0770`; mutable ledger имеет mode `0660`, evidence-каталог
+— sticky mode `1770`, а immutable evidence-файлы — mode `0440`. Поэтому host
+root и Airflow `${AIRFLOW_UID}:0` используют один inode namespace, scheduler
+может атомарно добавить свой consumption marker, но не изменить или удалить
+root-owned claim/finish evidence; other не имеет доступа. Docker не создаёт
+каталог автоматически.
+CLI принимает только один canonical ledger
+`$ESPN_CANARY_STATE_ROOT/campaigns.json`: alternate/nested path, symlink и
+non-regular leaf hard-fail, а `--guard-only` не создаёт каталогов или файлов.
+Claim transition fsync-ит новый evidence-каталог в state root;
+immutable evidence раньше active ledger. Existing marker при retry/recover заново
+проверяется через no-follow regular-file descriptor и fsync-ится вместе с
+evidence-каталогом/state root до любого ledger promotion.
+После SIGKILL между любыми persistence boundaries единственный разрешённый
+путь — `recover`; повторный `claim`, включая `--guard-only`, fail closed.
+
+Из immutable release root задать exact reviewed inputs. Target file содержит
+JSON array либо объект с `target_scope_ids`; state ledger не является public
+Bronze object. Сначала выполнить read-only guard, затем ровно один consuming
+claim. Redirect targets должны быть новыми owner-only файлами; не использовать
+pipe/`tee` как correctness boundary.
+
+```bash
+umask 077
+set -o noclobber
+export ESPN_CANARY_TARGETS='/durable/espn/canary/exact-181-target.json'
+export ESPN_CANARY_LEDGER="$ESPN_CANARY_STATE_ROOT/campaigns.json"
+export ESPN_CANARY_GUARD_RESULT='/durable/espn/canary/ordinal001-guard.json'
+export ESPN_CANARY_CLAIM_RESULT='/durable/espn/canary/ordinal001-claim.json'
+
+/root/.venvs/dpf-test/bin/python -m scripts.espn_canary_campaign claim \
+  --ledger-path "$ESPN_CANARY_LEDGER" \
+  --release-commit "$ESPN_RELEASE_COMMIT" \
+  --release-tree-sha256 "$ESPN_RELEASE_TREE_SHA256" \
+  --registry-signature '<exact-registry-signature>' \
+  --target-scopes "$ESPN_CANARY_TARGETS" \
+  --guard-only > "$ESPN_CANARY_GUARD_RESULT"
+
+/root/.venvs/dpf-test/bin/python -m scripts.espn_canary_campaign claim \
+  --ledger-path "$ESPN_CANARY_LEDGER" \
+  --release-commit "$ESPN_RELEASE_COMMIT" \
+  --release-tree-sha256 "$ESPN_RELEASE_TREE_SHA256" \
+  --registry-signature '<exact-registry-signature>' \
+  --target-scopes "$ESPN_CANARY_TARGETS" \
+  > "$ESPN_CANARY_CLAIM_RESULT"
+```
+
+Peer-review canonical claim result и exact nested `claim_ref`. Только затем
+скопировать его URI/SHA в protected env как complete pair; result file или
+ledger path сами по себе admission не дают. Если claim process был прерван и
+terminal stdout неизвестен, не запускать claim снова. Сохранить recovery output:
+
+```bash
+export ESPN_CANARY_RECOVERY_RESULT='/durable/espn/canary/<new-unique-recovery-id>.json'
+/root/.venvs/dpf-test/bin/python -m scripts.espn_canary_campaign recover \
+  --ledger-path "$ESPN_CANARY_LEDGER" \
+  > "$ESPN_CANARY_RECOVERY_RESULT"
+```
+
+`recover` только converges already-durable claim/finish evidence (либо создаёт
+claim evidence для legacy ledger-first active state); он не выделяет следующий
+ordinal. Corrupt, forked или ambiguous evidence остаётся hard failure.
+Same-campaign retry после immutable failed finish использует тот же `claim`
+command и получает только `ordinal002`, затем максимум `ordinal003`. Fresh
+successor campaign снова получает `ordinal001`, но его claim command обязан
+добавить все три reviewed arguments; partial link запрещён:
+
+```bash
+  --predecessor-failure-uri '<exact-predecessor-failure-uri>' \
+  --predecessor-failure-sha256 '<exact-predecessor-failure-sha256>' \
+  --remediation '<reviewed-remediation-summary>'
+```
+
 Во всех Airflow roles атомарно задать exact pair
 `ESPN_DISCOVERY_STATE_REF_URI`/`ESPN_DISCOVERY_STATE_REF_SHA256`. Frozen ref
 остаётся действующим, пока обе переменные атомарно не удалены или не заменены
@@ -298,6 +381,36 @@ durable-manifest ref, physical head parity, zero alerts и zero active leases.
 deploy transition** через тот же operator/global lock. Daily non-canary runs
 запрещены, пока read-only guard не подтвердит отсутствие claim pair во всех
 roles, all-seven-paused и zero active runs. Partial removal hard-fails.
+
+До удаления runtime claim pair закрыть exact attempt ровно одной из следующих
+команд. `ESPN_CANARY_ATTEMPT_ID` берётся byte-for-byte из reviewed claim result,
+а terminal URI/SHA указывает на immutable final receipt или failure evidence.
+
+Успех:
+
+```bash
+/root/.venvs/dpf-test/bin/python -m scripts.espn_canary_campaign finish \
+  --ledger-path "$ESPN_CANARY_LEDGER" \
+  --attempt-id "$ESPN_CANARY_ATTEMPT_ID" \
+  --terminal-uri "$ESPN_CANARY_TERMINAL_URI" \
+  --terminal-sha256 "$ESPN_CANARY_TERMINAL_SHA256" \
+  --successful > '/durable/espn/canary/ordinal001-finish-success.json'
+```
+
+Fail-closed terminal outcome:
+
+```bash
+/root/.venvs/dpf-test/bin/python -m scripts.espn_canary_campaign finish \
+  --ledger-path "$ESPN_CANARY_LEDGER" \
+  --attempt-id "$ESPN_CANARY_ATTEMPT_ID" \
+  --terminal-uri "$ESPN_CANARY_TERMINAL_URI" \
+  --terminal-sha256 "$ESPN_CANARY_TERMINAL_SHA256" \
+  --failed > '/durable/espn/canary/ordinal001-finish-failed.json'
+```
+
+Interruption любого `finish` также продолжается только с теми же identity/ref
+arguments и новым result filename либо `recover`; immutable finish marker
+делает оба пути idempotent и не позволяет сменить terminal outcome/ref.
 
 Отдельно проверить known scope `19425:2026` и exact Leagues Cup IDs
 `401863559`, `401863560`, `401863562`, `401863563`, `401863564`. Для каждого

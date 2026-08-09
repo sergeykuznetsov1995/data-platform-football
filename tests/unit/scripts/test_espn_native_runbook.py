@@ -156,3 +156,25 @@ def test_runbook_documents_six_guard_attempts_and_probe_contract():
     )[0]
     assert "entry DAG `dag_backfill_espn`" in canary
     assert "entry DAG `dag_ingest_espn`" not in canary
+
+
+def test_runbook_has_exact_crash_recoverable_shared_canary_cli_commands():
+    text = RUNBOOK.read_text(encoding="utf-8")
+
+    for required in (
+        "ESPN_CANARY_STATE_ROOT=/durable/espn/canary-state",
+        "-m scripts.espn_canary_campaign claim",
+        "-m scripts.espn_canary_campaign finish",
+        "-m scripts.espn_canary_campaign recover",
+        "--target-scopes \"$ESPN_CANARY_TARGETS\"",
+        "--ledger-path \"$ESPN_CANARY_LEDGER\"",
+        "--successful",
+        "--failed",
+        "--predecessor-failure-uri",
+        "--predecessor-failure-sha256",
+        "--remediation",
+        "максимум `ordinal003`",
+        "immutable evidence раньше active ledger",
+        "одинаковый absolute `file://` URI",
+    ):
+        assert required in text

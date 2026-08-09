@@ -1,0 +1,29 @@
+--- morning_report.py
++++ morning_report.py
+@@ -429,17 +429,26 @@
+ def main():
++    from espn_watchdog_adapter_v1 import morning_report_lines as espn_rollout_lines
++
+     now = datetime.now().strftime("%d.%m %H:%M")
+     fresh_lines, _ = freshness()
+     msg_parts = [
+         f"🌅 Сводка платформы {now}",
+         "🖥 Хост и хранилище:", *host_health(),
+         "📦 Дозагрузки:", *runners(),
+         "🥉 Свежесть сырья (часов с последней загрузки):", *fresh_lines,
+         gold_age(),
+         "📊 Полнота (собрано / в афише источника):", *completeness(),
+         *sofascore_player_age(),
+         "🔴 Красные раны за 24ч:", *red_runs(),
+         "🎭 Зелёное врёт:", *green_lies(),
+         "⏸ На паузе:", *paused(),
++        "⚽ ESPN rollout:",
++        *espn_rollout_lines(
++            release_root=(
++                "/root/watchdog/releases/"
++                "espn-release-c2225657d354ee2a21f8c2e22daf5e233a25a3c0"
++            ),
++        ),
+         "🌐 Прокси:", *proxy_incidents(),
+         "☠️ Потерянные страницы (fbref):", *fbref_dead_letters(),
+     ]

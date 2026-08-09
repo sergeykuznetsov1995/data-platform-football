@@ -4912,13 +4912,15 @@ def _parse_qualification_attestation(
 
 def _verified_complete_head(
     head: ScopeHead | None,
+    *,
+    repository: EspnBronzeRepository | None = None,
 ) -> tuple[ScopeHead | None, str]:
     """Accept freshness only after exact snapshot, COMPLETE and physical parity."""
 
     if head is None:
         return None, "incomplete"
     try:
-        _verified_complete_generation(head)
+        _verified_complete_generation(head, repository=repository)
     except Exception:
         return None, "incomplete"
     return head, "complete"
@@ -4978,10 +4980,15 @@ def _qualified_freshness_at(
     expected_registry_ref: Mapping[str, str],
     expected_registry_signature: str,
     observed_at: datetime,
+    repository: EspnBronzeRepository | None = None,
 ) -> tuple[ScopeHead | None, str, datetime | None]:
     """Derive freshness without mutating the physical COMPLETE control head."""
 
-    verified, state = _verified_complete_head(head)
+    verified, state = (
+        _verified_complete_head(head)
+        if repository is None
+        else _verified_complete_head(head, repository=repository)
+    )
     if verified is None:
         return None, state, None
     fallback = verified.published_at

@@ -2672,6 +2672,8 @@ def apply_compaction(
         or manifest_path.exists()
     ):
         raise Compact6Error("apply refuses existing transition artifacts; use resume")
+    if command == "apply":
+        _assert_plan_source_main_snapshots(client, plan)
     checkpoint_sink = IcebergJournalSink(
         client,
         catalog=plan["catalog"],
@@ -2713,6 +2715,12 @@ def apply_compaction(
                 "SCHEMA_NOT_FOUND",
             }:
                 raise
+
+    if command == "resume" and (
+        full_checkpoint is None
+        or not _journal_payload_public_swap_started(full_checkpoint)
+    ):
+        _assert_plan_source_main_snapshots(client, plan)
 
     if full_checkpoint is not None:
         manifest = _bound_manifest_from_checkpoint(full_checkpoint, plan)
@@ -3552,6 +3560,8 @@ def run_journaled_steps(
     fail_after_execute_step: int | None = None,
     fail_after_compensation: bool = False,
     before_step: Callable[[MigrationStep], None] | None = None,
+    before_execute: Callable[[MigrationStep], None] | None = None,
+    after_journal_load: Callable[[Mapping[str, Any]], None] | None = None,
     compensation_steps: Sequence[MigrationStep] = (),
     compensation_callback: Callable[[], None] | None = None,
     compensate_after_step: int = 0,
@@ -3677,6 +3687,8 @@ def run_journaled_steps(
         "complete",
     }:
         raise Compact6Error("journal status is invalid")
+    if after_journal_load is not None:
+        after_journal_load(journal)
     if journal.get("status") == "compensating":
         if compensation_callback is None and not compensation_steps:
             raise Compact6Error(
@@ -3709,6 +3721,7 @@ def run_journaled_steps(
             ) from compensation_exc
 
     start = len(journal["completed_steps"])
+    replaying_compensated_swap = journal.get("status") == "compensated"
     pending_started = journal.get("started_step")
     for step in steps[start:]:
         destructive_effect_preexists = any(
@@ -3719,8 +3732,6 @@ def run_journaled_steps(
         )
         statement_may_have_executed = False
         try:
-            if before_step is not None:
-                before_step(step)
             if pending_started is not None:
                 if not isinstance(pending_started, Mapping) or (
                     pending_started.get("index") != step.index
@@ -3730,6 +3741,8 @@ def run_journaled_steps(
                     raise Compact6Error(
                         "journal started-step identity does not match plan"
                     )
+            if before_step is not None:
+                before_step(step)
             # Persist intent first.  On restart an exact postcondition may seal a
             # DDL that succeeded before the completion checkpoint reached disk.
             journal = _journal_payload(
@@ -3751,13 +3764,15 @@ def run_journaled_steps(
             if checkpoint_sink is not None:
                 checkpoint_sink.record(journal)
             # A started-step probe closes the SQL-success/checkpoint-loss
-            # window.  Future public base drops are also safe to probe because
-            # their information-schema predicate lets resume advance from
-            # automatic emergency views.  Fresh CTAS/audit steps must execute:
-            # their targets may not exist yet and some audit postconditions are
-            # intentionally only one part of the full statement.
-            may_precheck = pending_started is not None or step.name.startswith(
-                "drop_legacy_main_"
+            # window.  Compensated public drops are also safe to probe because
+            # their information-schema predicate advances past the automatic
+            # emergency views.  A fresh public drop must execute so its live
+            # source-ref gate runs after durable intent and immediately before
+            # SQL; an externally missing table cannot masquerade as recovered
+            # work.  Fresh CTAS/audit steps likewise must execute.
+            may_precheck = pending_started is not None or (
+                replaying_compensated_swap
+                and step.name.startswith("drop_legacy_main_")
             )
             recovered = may_precheck and _postcondition_satisfied(step, client)
             if recovered and step.index >= compensate_after_step:
@@ -3768,6 +3783,8 @@ def run_journaled_steps(
                     raise InjectedFailure(
                         f"injected failure after intent before SQL for {step.name}"
                     )
+                if before_execute is not None:
+                    before_execute(step)
                 statement_may_have_executed = True
                 statement_rows = _execute(client, step.sql)
                 if step.result_must_be_empty and statement_rows:
@@ -3808,6 +3825,11 @@ def run_journaled_steps(
             pending_started = None
         except Exception:
             try:
+                clear_unexecuted_fresh_intent = (
+                    pending_started is None
+                    and not statement_may_have_executed
+                    and not destructive_effect_preexists
+                )
                 journal = _journal_payload(
                     {
                         **{
@@ -3816,6 +3838,11 @@ def run_journaled_steps(
                             if key != "journal_sha256"
                         },
                         "status": "interrupted",
+                        "started_step": (
+                            None
+                            if clear_unexecuted_fresh_intent
+                            else journal.get("started_step")
+                        ),
                     }
                 )
                 _write_journal(journal_path, journal)
@@ -3954,6 +3981,73 @@ def _validate_run_guard(
         raise Compact6Error("compact6 requires zero active runs")
 
 
+def _plan_source_main_snapshots(plan: Mapping[str, Any]) -> dict[str, int]:
+    """Return only the live Bronze refs whose identities seal the plan.
+
+    Materialisation creates and later appends to same-named relations in the
+    internal schema.  Those expected writes are deliberately not part of this
+    set: the immutable plan is bound to the nine source relations in Bronze.
+    """
+
+    validate_plan(plan)
+    catalog = plan["catalog"]
+    bronze = plan["bronze_schema"]
+    expected = {
+        _qualified(catalog, bronze, table["source_table"]): table["snapshot_id"]
+        for table in plan["legacy_tables"].values()
+    }
+    expected.update(
+        {
+            _qualified(catalog, bronze, relation): snapshot_id
+            for relation, snapshot_id in plan["state_snapshots"].items()
+        }
+    )
+    expected[_qualified(catalog, bronze, MANIFEST_TABLE)] = plan[
+        "manifest_snapshot_id"
+    ]
+    if len(expected) != 9:
+        raise Compact6Error("plan-bound source main snapshot set is incomplete")
+    return dict(sorted(expected.items()))
+
+
+def _assert_plan_source_main_snapshots(
+    client: object, plan: Mapping[str, Any]
+) -> None:
+    """Fail unless every plan-bound source still has its exact ``main`` ref.
+
+    One UNION query makes missing, stale, duplicate, and forked ``main`` rows
+    visible as an exact multiset mismatch while ignoring unrelated Iceberg
+    tags and branches.
+    """
+
+    expected = _plan_source_main_snapshots(plan)
+    selects = []
+    for qualified in expected:
+        catalog, schema, relation = qualified.split(".")
+        selects.append(
+            f"SELECT {_sql_string(qualified)} AS source_relation, snapshot_id "
+            f'FROM {catalog}.{schema}."{relation}$refs" '
+            "WHERE name = 'main' AND type = 'BRANCH'"
+        )
+    rows = _mapping_rows(
+        _execute(client, "\nUNION ALL\n".join(selects)),
+        ("source_relation", "snapshot_id"),
+        field="plan-bound source main snapshots",
+    )
+    observed = sorted(
+        (
+            _require_text(row["source_relation"], "source main relation"),
+            _require_positive_int(row["snapshot_id"], "source main snapshot ID"),
+        )
+        for row in rows
+    )
+    if observed != sorted(expected.items()):
+        raise Compact6Error(
+            "plan-bound source main snapshot drift: a source is stale, missing, "
+            "extra, or forked"
+        )
+
+
 def apply_with_guard(
     *,
     plan: Mapping[str, Any],
@@ -4011,6 +4105,19 @@ def apply_with_guard(
         )
     )
     compensate_after = min(swap_indexes) if swap_indexes else len(steps) + 1
+    if resolved_command == "apply":
+        _assert_plan_source_main_snapshots(client, plan)
+
+    def recheck_source_on_resume(journal: Mapping[str, Any]) -> None:
+        if resolved_command == "resume" and not _journal_payload_public_swap_started(
+            journal
+        ):
+            _assert_plan_source_main_snapshots(client, plan)
+
+    def recheck_source_before_first_swap(step: MigrationStep) -> None:
+        if swap_indexes and step.index == compensate_after:
+            _assert_plan_source_main_snapshots(client, plan)
+
     return run_journaled_steps(
         plan_sha256=plan["plan_sha256"],
         transition_id=plan["transition_id"],
@@ -4023,6 +4130,8 @@ def apply_with_guard(
         fail_after_execute_step=fail_after_execute_step,
         fail_after_compensation=fail_after_compensation,
         before_step=recheck,
+        before_execute=recheck_source_before_first_swap,
+        after_journal_load=recheck_source_on_resume,
         compensation_steps=resolved_compensation,
         compensation_callback=compensation_callback,
         compensate_after_step=compensate_after,
@@ -4515,9 +4624,10 @@ def _journal_payload_public_swap_started(journal: Mapping[str, Any]) -> bool:
         )
         if isinstance(record, Mapping)
     }
-    started = journal.get("started_step")
-    if isinstance(started, Mapping):
-        names.add(started.get("name"))
+    # A durable started-step is only write intent.  Process death can happen
+    # before the source-ref callback or DROP reaches Trino, so intent alone
+    # must not bypass live source validation on resume.  Only a completed DROP
+    # checkpoint (or explicit compensation state) proves public mutation.
     return any(
         isinstance(name, str) and name.startswith("drop_legacy_main_") for name in names
     )

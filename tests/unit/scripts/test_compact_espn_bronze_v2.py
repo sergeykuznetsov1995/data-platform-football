@@ -281,6 +281,31 @@ def _run_guard(*, active_runs=None, paused_dags=None, plan=None, captured_at=Non
     )
 
 
+def _plan_source_main_rows(plan=None) -> list[tuple[str, int]]:
+    plan = _plan() if plan is None else plan
+    rows = [
+        (
+            f"{plan['catalog']}.{plan['bronze_schema']}.{table['source_table']}",
+            table["snapshot_id"],
+        )
+        for table in plan["legacy_tables"].values()
+    ]
+    rows.extend(
+        (
+            f"{plan['catalog']}.{plan['bronze_schema']}.{relation}",
+            snapshot_id,
+        )
+        for relation, snapshot_id in plan["state_snapshots"].items()
+    )
+    rows.append(
+        (
+            f"{plan['catalog']}.{plan['bronze_schema']}.espn_ingest_manifest_v2",
+            plan["manifest_snapshot_id"],
+        )
+    )
+    return sorted(rows)
+
+
 def test_dispositions_preserve_historical_rows_and_quarantine_null_scope() -> None:
     from scripts.compact_espn_bronze_v2 import build_dispositions
 
@@ -672,6 +697,8 @@ class _Client:
 
     def query(self, sql: str):
         self.sql.append(sql)
+        if "$refs" in sql:
+            return _plan_source_main_rows()
         return []
 
 
@@ -897,6 +924,674 @@ def test_run_guard_is_fresh_and_bound_to_exact_transition(
             run_guard=lambda: guard,
         )
     assert client.sql == []
+
+
+@pytest.mark.parametrize("mutation", ["stale", "missing", "extra", "fork"])
+def test_plan_source_main_snapshot_guard_requires_exact_multiset(
+    mutation: str,
+) -> None:
+    import scripts.compact_espn_bronze_v2 as compact
+
+    plan = _plan()
+    rows = _plan_source_main_rows(plan)
+    if mutation == "stale":
+        relation, snapshot_id = rows[0]
+        rows[0] = (relation, snapshot_id + 1)
+    elif mutation == "missing":
+        rows.pop()
+    elif mutation == "extra":
+        relation, snapshot_id = rows[0]
+        rows.append((relation, snapshot_id + 1000))
+    else:
+        rows.append(rows[0])
+
+    class Client:
+        def __init__(self) -> None:
+            self.sql = []
+
+        def query(self, sql):
+            self.sql.append(sql)
+            return rows
+
+    client = Client()
+    with pytest.raises(compact.Compact6Error, match="source main snapshot drift"):
+        compact._assert_plan_source_main_snapshots(client, plan)
+
+    assert len(client.sql) == 1
+    assert client.sql[0].count('$refs"') == 9
+
+
+def test_plan_source_main_snapshot_guard_reads_only_bronze_sources() -> None:
+    import scripts.compact_espn_bronze_v2 as compact
+
+    plan = _plan()
+
+    class Client:
+        def __init__(self) -> None:
+            self.sql = []
+
+        def query(self, sql):
+            self.sql.append(sql)
+            return _plan_source_main_rows(plan)
+
+    client = Client()
+    compact._assert_plan_source_main_snapshots(client, plan)
+
+    assert len(client.sql) == 1
+    assert "iceberg.espn_internal" not in client.sql[0]
+    assert client.sql[0].count("WHERE name = 'main' AND type = 'BRANCH'") == 9
+    for relation, _snapshot_id in _plan_source_main_rows(plan):
+        assert relation.replace("iceberg.bronze.", "") in client.sql[0]
+
+
+def test_apply_rejects_post_review_source_write_before_first_mutation(
+    tmp_path: Path,
+) -> None:
+    from scripts.compact_espn_bronze_v2 import (
+        Compact6Error,
+        MigrationStep,
+        apply_with_guard,
+    )
+
+    plan = _plan()
+    stale_rows = _plan_source_main_rows(plan)
+    relation, snapshot_id = stale_rows[0]
+    stale_rows[0] = (relation, snapshot_id + 1)
+
+    class Client:
+        def __init__(self) -> None:
+            self.mutations = []
+
+        def query(self, sql):
+            if "$refs" in sql:
+                return stale_rows
+            self.mutations.append(sql)
+            return []
+
+    client = Client()
+    journal = tmp_path / "post-review-write.json"
+    with pytest.raises(Compact6Error, match="source main snapshot drift"):
+        apply_with_guard(
+            plan=plan,
+            steps=(MigrationStep(0, "archive_schedule", "ARCHIVE"),),
+            client=client,
+            journal_path=journal,
+            run_guard=lambda: _run_guard(plan=plan),
+            command="apply",
+        )
+
+    assert client.mutations == []
+    assert not journal.exists()
+
+
+def test_compaction_apply_checks_source_refs_before_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.compact_espn_bronze_v2 as compact
+
+    plan = _plan()
+    rows = _plan_source_main_rows(plan)
+    relation, snapshot_id = rows[-1]
+    rows[-1] = (relation, snapshot_id + 1)
+
+    class Client:
+        def query(self, sql):
+            assert "$refs" in sql
+            return rows
+
+    class ForbiddenSink:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("materialization setup preceded the source guard")
+
+    monkeypatch.setattr(compact, "IcebergJournalSink", ForbiddenSink)
+    with pytest.raises(compact.Compact6Error, match="source main snapshot drift"):
+        compact.apply_compaction(
+            plan=plan,
+            client=Client(),
+            run_guard=lambda: _run_guard(plan=plan),
+            journal_path=tmp_path / "apply.json",
+            manifest_path=tmp_path / "manifest.json",
+            command="apply",
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_first_public_swap_rechecks_source_refs_after_preflight(
+    tmp_path: Path,
+) -> None:
+    from scripts.compact_espn_bronze_v2 import (
+        Compact6Error,
+        MigrationStep,
+        apply_with_guard,
+    )
+
+    plan = _plan()
+
+    class Client:
+        def __init__(self) -> None:
+            self.drifted = False
+            self.dropped = False
+            self.mutations = []
+            self.source_checks = 0
+
+        def query(self, sql):
+            if "$refs" in sql:
+                self.source_checks += 1
+                rows = _plan_source_main_rows(plan)
+                if self.drifted:
+                    relation, snapshot_id = rows[0]
+                    rows[0] = (relation, snapshot_id + 1)
+                return rows
+            if sql == "PREFLIGHT":
+                self.mutations.append(sql)
+                self.drifted = True
+                return []
+            if sql == "DROP LEGACY":
+                self.mutations.append(sql)
+                self.dropped = True
+                return []
+            if sql == "POST DROP":
+                return [(self.dropped,)]
+            raise AssertionError(sql)
+
+    client = Client()
+    with pytest.raises(Compact6Error, match="source main snapshot drift"):
+        apply_with_guard(
+            plan=plan,
+            steps=(
+                MigrationStep(0, "preflight_archive_manifest", "PREFLIGHT"),
+                MigrationStep(
+                    1,
+                    "drop_legacy_main_schedule",
+                    "DROP LEGACY",
+                    postcondition_sql="POST DROP",
+                ),
+            ),
+            client=client,
+            journal_path=tmp_path / "preflight-race.json",
+            run_guard=lambda: _run_guard(plan=plan),
+            command="apply",
+            compensation_steps=(MigrationStep(0, "recover", "RECOVER"),),
+        )
+
+    assert client.source_checks == 2
+    assert client.mutations == ["PREFLIGHT"]
+
+
+def test_first_drop_cannot_recover_an_externally_missing_source(
+    tmp_path: Path,
+) -> None:
+    from scripts.compact_espn_bronze_v2 import (
+        Compact6Error,
+        MigrationStep,
+        apply_with_guard,
+    )
+
+    plan = _plan()
+
+    class Client:
+        def __init__(self) -> None:
+            self.missing = False
+            self.mutations = []
+
+        def query(self, sql):
+            if "$refs" in sql:
+                rows = _plan_source_main_rows(plan)
+                return rows[1:] if self.missing else rows
+            if sql == "PREFLIGHT":
+                self.mutations.append(sql)
+                self.missing = True
+                return []
+            if sql == "POST DROP":
+                return [(self.missing,)]
+            if sql == "DROP LEGACY":
+                self.mutations.append(sql)
+                return []
+            raise AssertionError(sql)
+
+    client = Client()
+    journal = tmp_path / "missing-before-drop.json"
+    with pytest.raises(Compact6Error, match="source main snapshot drift"):
+        apply_with_guard(
+            plan=plan,
+            steps=(
+                MigrationStep(0, "preflight", "PREFLIGHT"),
+                MigrationStep(
+                    1,
+                    "drop_legacy_main_schedule",
+                    "DROP LEGACY",
+                    postcondition_sql="POST DROP",
+                ),
+            ),
+            client=client,
+            journal_path=journal,
+            run_guard=lambda: _run_guard(plan=plan),
+            command="apply",
+            compensation_steps=(MigrationStep(0, "recover", "RECOVER"),),
+        )
+
+    interrupted = json.loads(journal.read_text(encoding="utf-8"))
+    assert interrupted["started_step"] is None
+    with pytest.raises(Compact6Error, match="source main snapshot drift"):
+        apply_with_guard(
+            plan=plan,
+            steps=(
+                MigrationStep(0, "preflight", "PREFLIGHT"),
+                MigrationStep(
+                    1,
+                    "drop_legacy_main_schedule",
+                    "DROP LEGACY",
+                    postcondition_sql="POST DROP",
+                ),
+            ),
+            client=client,
+            journal_path=journal,
+            run_guard=lambda: _run_guard(plan=plan),
+            command="resume",
+            compensation_steps=(MigrationStep(0, "recover", "RECOVER"),),
+        )
+
+    assert client.mutations == ["PREFLIGHT"]
+
+
+def test_first_drop_rechecks_after_durable_intent_checkpoint(
+    tmp_path: Path,
+) -> None:
+    from scripts.compact_espn_bronze_v2 import (
+        Compact6Error,
+        MigrationStep,
+        apply_with_guard,
+    )
+
+    plan = _plan()
+
+    class Client:
+        def __init__(self) -> None:
+            self.drifted = False
+            self.dropped = False
+
+        def query(self, sql):
+            if "$refs" in sql:
+                rows = _plan_source_main_rows(plan)
+                if self.drifted:
+                    relation, snapshot_id = rows[0]
+                    rows[0] = (relation, snapshot_id + 1)
+                return rows
+            if sql == "POST DROP":
+                return [(self.dropped,)]
+            if sql == "DROP LEGACY":
+                self.dropped = True
+                return []
+            raise AssertionError(sql)
+
+    client = Client()
+
+    class Sink:
+        def record(self, journal):
+            started = journal.get("started_step")
+            if isinstance(started, dict) and started.get("name") == (
+                "drop_legacy_main_schedule"
+            ):
+                client.drifted = True
+
+        def load(self, **_identity):
+            return None
+
+    with pytest.raises(Compact6Error, match="source main snapshot drift"):
+        apply_with_guard(
+            plan=plan,
+            steps=(
+                MigrationStep(
+                    0,
+                    "drop_legacy_main_schedule",
+                    "DROP LEGACY",
+                    postcondition_sql="POST DROP",
+                ),
+            ),
+            client=client,
+            journal_path=tmp_path / "drift-after-intent.json",
+            run_guard=lambda: _run_guard(plan=plan),
+            command="apply",
+            compensation_steps=(MigrationStep(0, "recover", "RECOVER"),),
+            checkpoint_sink=Sink(),
+        )
+
+    assert client.dropped is False
+
+
+def test_resume_rechecks_after_failure_between_intent_and_drop(
+    tmp_path: Path,
+) -> None:
+    from scripts.compact_espn_bronze_v2 import (
+        Compact6Error,
+        InjectedFailure,
+        MigrationStep,
+        apply_with_guard,
+    )
+
+    plan = _plan()
+
+    class Client:
+        def __init__(self) -> None:
+            self.missing = False
+            self.dropped = False
+
+        def query(self, sql):
+            if "$refs" in sql:
+                rows = _plan_source_main_rows(plan)
+                return rows[1:] if self.missing else rows
+            if sql == "POST DROP":
+                return [(self.missing or self.dropped,)]
+            if sql == "DROP LEGACY":
+                self.dropped = True
+                return []
+            raise AssertionError(sql)
+
+    step = MigrationStep(
+        0,
+        "drop_legacy_main_schedule",
+        "DROP LEGACY",
+        postcondition_sql="POST DROP",
+    )
+    compensation = (MigrationStep(0, "recover", "RECOVER"),)
+    client = Client()
+    journal = tmp_path / "failure-before-drop.json"
+    with pytest.raises(InjectedFailure, match="after intent before SQL"):
+        apply_with_guard(
+            plan=plan,
+            steps=(step,),
+            client=client,
+            journal_path=journal,
+            run_guard=lambda: _run_guard(plan=plan),
+            command="apply",
+            fail_before_execute_step=0,
+            compensation_steps=compensation,
+        )
+
+    interrupted = json.loads(journal.read_text(encoding="utf-8"))
+    assert interrupted["started_step"] is None
+    client.missing = True
+    with pytest.raises(Compact6Error, match="source main snapshot drift"):
+        apply_with_guard(
+            plan=plan,
+            steps=(step,),
+            client=client,
+            journal_path=journal,
+            run_guard=lambda: _run_guard(plan=plan),
+            command="resume",
+            compensation_steps=compensation,
+        )
+
+    assert client.dropped is False
+
+
+def test_uncheckpointed_first_drop_intent_is_not_postswap_proof(
+    tmp_path: Path,
+) -> None:
+    import scripts.compact_espn_bronze_v2 as compact
+
+    plan = _plan()
+    step = compact.MigrationStep(
+        0,
+        "drop_legacy_main_schedule",
+        "DROP LEGACY",
+        postcondition_sql="POST DROP",
+    )
+
+    class Client:
+        def __init__(self) -> None:
+            self.ref_checks = 0
+            self.dropped = False
+
+        def query(self, sql):
+            if "$refs" in sql:
+                self.ref_checks += 1
+                return _plan_source_main_rows(plan)[1:]
+            if sql == "POST DROP":
+                return [(True,)]
+            if sql == "DROP LEGACY":
+                self.dropped = True
+                return []
+            raise AssertionError(sql)
+
+    journal = tmp_path / "uncheckpointed-drop-intent.json"
+    compact._write_journal(
+        journal,
+        compact._journal_payload(
+            {
+                "journal_version": compact.JOURNAL_VERSION,
+                "transition_id": plan["transition_id"],
+                "command": "apply",
+                "plan_sha256": plan["plan_sha256"],
+                "status": "running",
+                "context": {},
+                "started_step": {
+                    "index": step.index,
+                    "name": step.name,
+                    "sql_sha256": step.sql_sha256,
+                },
+                "completed_steps": [],
+            }
+        ),
+    )
+    client = Client()
+    with pytest.raises(compact.Compact6Error, match="source main snapshot drift"):
+        compact.apply_with_guard(
+            plan=plan,
+            steps=(step,),
+            client=client,
+            journal_path=journal,
+            run_guard=lambda: _run_guard(plan=plan),
+            command="resume",
+            compensation_steps=(compact.MigrationStep(0, "recover", "RECOVER"),),
+        )
+
+    assert client.ref_checks == 1
+    assert client.dropped is False
+
+
+def test_resume_ignores_expected_internal_snapshot_writes(
+    tmp_path: Path,
+) -> None:
+    from scripts.compact_espn_bronze_v2 import (
+        InjectedFailure,
+        MigrationStep,
+        apply_with_guard,
+    )
+
+    plan = _plan()
+
+    class Client:
+        def __init__(self) -> None:
+            self.internal_snapshot_id = plan["state_snapshots"][
+                "espn_scope_cutover_v2"
+            ]
+            self.finished = False
+            self.source_checks = 0
+
+        def query(self, sql):
+            if "$refs" in sql:
+                self.source_checks += 1
+                assert "iceberg.espn_internal" not in sql
+                return _plan_source_main_rows(plan)
+            if sql == "WRITE INTERNAL":
+                self.internal_snapshot_id += 1
+                return []
+            if sql == "POST INTERNAL":
+                return [(self.internal_snapshot_id > 204,)]
+            if sql == "FINISH":
+                self.finished = True
+                return []
+            raise AssertionError(sql)
+
+    steps = (
+        MigrationStep(
+            0,
+            "append_exact_181_native_routes",
+            "WRITE INTERNAL",
+            postcondition_sql="POST INTERNAL",
+        ),
+        MigrationStep(1, "finish_preflight", "FINISH"),
+    )
+    client = Client()
+    journal = tmp_path / "internal-write-resume.json"
+    with pytest.raises(InjectedFailure, match="append_exact_181_native_routes"):
+        apply_with_guard(
+            plan=plan,
+            steps=steps,
+            client=client,
+            journal_path=journal,
+            run_guard=lambda: _run_guard(plan=plan),
+            command="apply",
+            fail_after_step=0,
+        )
+
+    result = apply_with_guard(
+        plan=plan,
+        steps=steps,
+        client=client,
+        journal_path=journal,
+        run_guard=lambda: _run_guard(plan=plan),
+        command="resume",
+    )
+
+    assert result["status"] == "complete"
+    assert client.source_checks == 2
+    assert client.finished is True
+
+
+def test_resume_rejects_source_drift_after_preflight_crash(tmp_path: Path) -> None:
+    from scripts.compact_espn_bronze_v2 import (
+        Compact6Error,
+        InjectedFailure,
+        MigrationStep,
+        apply_with_guard,
+    )
+
+    plan = _plan()
+
+    class Client:
+        def __init__(self) -> None:
+            self.rows = _plan_source_main_rows(plan)
+            self.finished = False
+
+        def query(self, sql):
+            if "$refs" in sql:
+                return self.rows
+            if sql == "PREFLIGHT":
+                return []
+            if sql == "FINISH":
+                self.finished = True
+                return []
+            raise AssertionError(sql)
+
+    steps = (
+        MigrationStep(0, "preflight", "PREFLIGHT"),
+        MigrationStep(1, "finish", "FINISH"),
+    )
+    client = Client()
+    journal = tmp_path / "stale-resume.json"
+    with pytest.raises(InjectedFailure, match="preflight"):
+        apply_with_guard(
+            plan=plan,
+            steps=steps,
+            client=client,
+            journal_path=journal,
+            run_guard=lambda: _run_guard(plan=plan),
+            command="apply",
+            fail_after_step=0,
+        )
+    relation, snapshot_id = client.rows[0]
+    client.rows[0] = (relation, snapshot_id + 1)
+
+    with pytest.raises(Compact6Error, match="source main snapshot drift"):
+        apply_with_guard(
+            plan=plan,
+            steps=steps,
+            client=client,
+            journal_path=journal,
+            run_guard=lambda: _run_guard(plan=plan),
+            command="resume",
+        )
+
+    assert client.finished is False
+
+
+def test_resume_revalidates_sources_after_local_journal_loss(tmp_path: Path) -> None:
+    from scripts.compact_espn_bronze_v2 import (
+        Compact6Error,
+        InjectedFailure,
+        MigrationStep,
+        apply_with_guard,
+    )
+
+    plan = _plan()
+
+    class Sink:
+        def __init__(self) -> None:
+            self.latest = None
+
+        def record(self, journal):
+            self.latest = json.loads(json.dumps(journal))
+
+        def load(self, *, transition_id, plan_sha256, command):
+            assert (transition_id, plan_sha256, command) == (
+                plan["transition_id"],
+                plan["plan_sha256"],
+                "apply",
+            )
+            return self.latest
+
+    class Client:
+        def __init__(self) -> None:
+            self.rows = _plan_source_main_rows(plan)
+            self.finished = False
+
+        def query(self, sql):
+            if "$refs" in sql:
+                return self.rows
+            if sql == "PREFLIGHT":
+                return []
+            if sql == "FINISH":
+                self.finished = True
+                return []
+            raise AssertionError(sql)
+
+    steps = (
+        MigrationStep(0, "preflight", "PREFLIGHT"),
+        MigrationStep(1, "finish", "FINISH"),
+    )
+    client = Client()
+    sink = Sink()
+    journal = tmp_path / "lost-local-source-guard.json"
+    with pytest.raises(InjectedFailure, match="preflight"):
+        apply_with_guard(
+            plan=plan,
+            steps=steps,
+            client=client,
+            journal_path=journal,
+            run_guard=lambda: _run_guard(plan=plan),
+            command="apply",
+            fail_after_step=0,
+            checkpoint_sink=sink,
+        )
+    journal.unlink()
+    relation, snapshot_id = client.rows[-1]
+    client.rows[-1] = (relation, snapshot_id + 1)
+
+    with pytest.raises(Compact6Error, match="source main snapshot drift"):
+        apply_with_guard(
+            plan=plan,
+            steps=steps,
+            client=client,
+            journal_path=journal,
+            run_guard=lambda: _run_guard(plan=plan),
+            command="resume",
+            checkpoint_sink=sink,
+        )
+
+    assert client.finished is False
 
 
 def test_rollback_selects_frozen_emergency_archive_and_never_runtime_v2() -> None:
@@ -1416,6 +2111,11 @@ def test_resume_from_prephase_starts_a_new_full_apply_journal(
         def load(self, *, command, **_identity):
             return {"durable": True} if command == "materialize" else None
 
+    class Client:
+        def query(self, sql):
+            assert "$refs" in sql
+            return _plan_source_main_rows(plan)
+
     observed = {}
 
     monkeypatch.setattr(compact, "IcebergJournalSink", Sink)
@@ -1445,7 +2145,7 @@ def test_resume_from_prephase_starts_a_new_full_apply_journal(
     monkeypatch.setattr(compact, "apply_with_guard", finish)
     result = compact.apply_compaction(
         plan=plan,
-        client=object(),
+        client=Client(),
         run_guard=lambda: _run_guard(plan=plan),
         journal_path=tmp_path / "full.json",
         manifest_path=tmp_path / "manifest.json",
@@ -1689,6 +2389,8 @@ def test_interrupted_public_swap_automatically_points_all_wrappers_to_emergency(
 
         def query(self, sql):
             self.sql.append(sql)
+            if "$refs" in sql:
+                return _plan_source_main_rows(plan)
             if sql == "BROKEN PUBLISH":
                 raise RuntimeError("injected publish failure")
             if sql == "DROP TABLE legacy_schedule":
@@ -1798,6 +2500,8 @@ def test_compensated_public_swap_rewinds_and_successfully_resumes(
             self.emergency_ready = set()
 
         def query(self, sql):
+            if "$refs" in sql:
+                return _plan_source_main_rows(plan)
             if "VIEW iceberg.espn_internal.espn_" in sql and (
                 "_emergency_legacy_v1 SECURITY DEFINER AS" in sql
             ):
@@ -1941,6 +2645,8 @@ def test_compensating_intent_survives_local_loss_and_rewinds_final_step(
             self.compensation_count = 0
 
         def query(self, sql):
+            if "$refs" in sql:
+                return _plan_source_main_rows(plan)
             if sql == "DROP LEGACY":
                 self.target = "missing"
                 return []
@@ -2073,7 +2779,8 @@ def test_guard_failure_before_first_drop_never_triggers_compensation(
             command="apply",
             emergency_manifest=_manifest(plan),
         )
-    assert client.sql == []
+    assert client.sql
+    assert all("$refs" in sql for sql in client.sql)
 
 
 def test_dynamic_archive_snapshot_capture_is_exact() -> None:
