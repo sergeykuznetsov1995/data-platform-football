@@ -1771,11 +1771,12 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
         f"fbref:acceptance-replay:{run_id}:"
     )
     if any(
-        not str(item.get("replay_target_id") or "").startswith(
-            expected_replay_target_prefix
+        str(item.get("replay_target_id") or "")
+        != expected_replay_target_prefix
+        + str(item.get("target_id") or "")
+        or not str(item.get("logical_refresh_id") or "").startswith(
+            f"{run_id}:"
         )
-        or str(item.get("replay_target_id") or "")
-        == str(item.get("target_id") or "")
         for item in targets
     ):
         failures.append("replay_control_target_not_isolated")
@@ -1789,6 +1790,13 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
     manifest_target_ids = {
         str(item.get("target_id") or "") for item in datasets
     }
+    if any(
+        str(item.get("replay_target_id") or "")
+        != expected_replay_target_prefix
+        + str(item.get("target_id") or "")
+        for item in datasets
+    ):
+        failures.append("replay_control_manifest_not_isolated")
     if target_ids - manifest_target_ids:
         failures.append("target_dataset_manifest_missing")
     required_match_datasets = {

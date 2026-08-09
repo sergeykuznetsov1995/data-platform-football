@@ -913,7 +913,8 @@ def test_control_equivalence_rejects_a_divergent_batch_transaction(defect):
                 {
                     **dict(item),
                     "replay_target_id": (
-                        f"fbref:acceptance-replay:{replay_run_id}:m1"
+                        f"fbref:acceptance-replay:{replay_run_id}:"
+                        f"{item['target_id']}"
                     ),
                     "logical_refresh_id": f"{replay_run_id}:refresh-m1",
                     "target_status": "succeeded",
@@ -928,7 +929,16 @@ def test_control_equivalence_rejects_a_divergent_batch_transaction(defect):
                 }
                 for item in targets
             ]
-            replay_datasets = [dict(item) for item in datasets]
+            replay_datasets = [
+                {
+                    **dict(item),
+                    "replay_target_id": (
+                        f"fbref:acceptance-replay:{replay_run_id}:"
+                        f"{item['target_id']}"
+                    ),
+                }
+                for item in datasets
+            ]
             if mode == "batch" and defect == "observation_completion":
                 replay_targets[0]["observation_status"] = "processing"
             elif mode == "batch" and defect == "dataset_manifest":
