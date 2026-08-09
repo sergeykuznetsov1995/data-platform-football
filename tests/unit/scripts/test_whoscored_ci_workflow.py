@@ -19,6 +19,19 @@ def test_every_pull_request_runs_the_cross_boundary_contract():
     assert "paths:" not in trigger
 
 
+def test_compose_render_uses_nonsecret_espn_release_sentinels():
+    text = _workflow_text()
+    render_step = text.split("- name: Render production compose", 1)[1].split(
+        "- name: Validate declared WhoScored build-provenance state", 1
+    )[0]
+
+    assert "ESPN_BRONZE_LAYOUT_MODE: legacy14" in render_step
+    assert (
+        "ESPN_RELEASE_COMMIT: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in render_step
+    )
+    assert "ESPN_RELEASE_TREE_SHA256: " + "b" * 64 in render_step
+
+
 def test_real_airflow_211_import_gate_is_not_a_stub_only_test():
     text = _workflow_text()
     job = text.split("  real-airflow-dag-import:\n", 1)[1]

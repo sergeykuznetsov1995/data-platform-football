@@ -1022,6 +1022,9 @@ jobs:
       - name: Render production compose
         if: ${{ !cancelled() }}
         env:
+          ESPN_BRONZE_LAYOUT_MODE: legacy14
+          ESPN_RELEASE_COMMIT: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          ESPN_RELEASE_TREE_SHA256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
           OIDC_ISSUER: https://ci.invalid
           PUBLIC_IP: 127.0.0.1
           KC_PUBLIC_URL: https://auth.ci.invalid
