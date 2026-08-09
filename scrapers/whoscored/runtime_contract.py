@@ -86,6 +86,7 @@ EXPECTED_RUNTIME_FILES = (
     "scrapers/fbref/control/__init__.py",
     "scrapers/fbref/control/migrations.py",
     "scrapers/fbref/control/models.py",
+    "scrapers/fbref/control/replay_effects.py",
     "scrapers/fbref/control/store.py",
     "scrapers/fbref/policy.py",
     "scrapers/fbref/settings.py",
