@@ -1,11 +1,17 @@
 """Contract coverage for the offline FBref persistence benchmark."""
 
+import json
 import logging
-from contextlib import contextmanager
+import uuid
 
 import pytest
 
 import scripts.research.bench_fbref_persistence as benchmark
+from scrapers.fbref.control.replay_effects import (
+    build_replay_control_effects,
+    make_replay_control_refresh_id,
+    make_replay_control_target_id,
+)
 from scripts.research.bench_fbref_persistence import (
     BENCHMARK_TABLES,
     AcceptanceBaseline,
@@ -20,7 +26,6 @@ from scripts.research.bench_fbref_persistence import (
     _control_run_evidence,
     capture_acceptance_baseline,
     _digests_equivalent,
-    _isolated_replay_control_evidence,
     _snapshot_ids,
     _sentinel_digests,
     _mean_iteration_seconds,
@@ -30,6 +35,13 @@ from scripts.research.bench_fbref_persistence import (
     evaluate_existing_pipeline_acceptance,
     run_benchmark,
 )
+
+
+RUN_ONE_ID = str(uuid.UUID(int=101))
+RUN_TWO_ID = str(uuid.UUID(int=102))
+SOURCE_RUN_ID = str(uuid.UUID(int=103))
+OTHER_SOURCE_RUN_ID = str(uuid.UUID(int=104))
+SOURCE_REFRESH_ID = str(uuid.UUID(int=105))
 
 
 @pytest.mark.unit
@@ -420,7 +432,7 @@ class _DifferentialManager:
             return [("sentinel", "batch")]
         if sql.startswith("SELECT ") and "SELECT count(*)" not in sql:
             table = next(table for table in BENCHMARK_TABLES if table in sql)
-            run_id = "run-one" if ".sequential." in sql else "run-two"
+            run_id = RUN_ONE_ID if ".sequential." in sql else RUN_TWO_ID
             identity = (
                 "fbref:match:m1"
                 if table in BENCHMARK_TABLES[:3]
@@ -461,8 +473,8 @@ def test_distinct_control_run_ids_are_verified_then_canonicalized_in_diffs():
         manager,
         "sequential",
         "batch",
-        sequential_run_id="run-one",
-        batch_run_id="run-two",
+        sequential_run_id=RUN_ONE_ID,
+        batch_run_id=RUN_TWO_ID,
         sentinel_match_id="outside-match",
     )
 
@@ -481,8 +493,8 @@ def test_distinct_control_run_ids_are_verified_then_canonicalized_in_diffs():
     assert len(diff_queries) == 24
     assert all("CASE WHEN" in sql for sql, _params in diff_queries)
     assert all("__fbref_acceptance_run__" in sql for sql, _params in diff_queries)
-    assert any("run-one" in params for _sql, params in diff_queries)
-    assert any("run-two" in params for _sql, params in diff_queries)
+    assert any(RUN_ONE_ID in params for _sql, params in diff_queries)
+    assert any(RUN_TWO_ID in params for _sql, params in diff_queries)
 
 
 @pytest.mark.unit
@@ -494,22 +506,22 @@ def test_unexpected_cohort_lineage_fails_closed_before_comparison():
             manager,
             "sequential",
             "batch",
-            sequential_run_id="run-one",
-            batch_run_id="run-two",
+            sequential_run_id=RUN_ONE_ID,
+            batch_run_id=RUN_TWO_ID,
             sentinel_match_id="outside-match",
         )
 
 
 @pytest.mark.unit
 def test_trino_page_manifest_must_equal_the_direct_control_match_cohort():
-    evidence = _control_run_evidence(_DirectControl(), "run-one")
+    evidence = _control_run_evidence(_DirectControl(), RUN_ONE_ID)
     manager = _DifferentialManager(trino_match_ids=())
 
     with pytest.raises(ValueError, match="Trino match cohort"):
         _validate_trino_match_cohort(
             manager,
             schema="sequential",
-            expected_run_id="run-one",
+            expected_run_id=RUN_ONE_ID,
             sentinel_match_id="outside-match",
             control_evidence=evidence,
         )
@@ -568,9 +580,77 @@ class _DirectControl:
     def __init__(self):
         self.calls = []
 
+    @staticmethod
+    def _effects(run_id, mode):
+        replay_target_id = make_replay_control_target_id(
+            run_id, "fbref:match:m1"
+        )
+        replay_refresh_id = make_replay_control_refresh_id(
+            run_id, SOURCE_REFRESH_ID
+        )
+        targets = [
+            {
+                "ordinal": 0,
+                "target_id": "fbref:match:m1",
+                "replay_target_id": replay_target_id,
+                "source_logical_refresh_id": SOURCE_REFRESH_ID,
+                "logical_refresh_id": replay_refresh_id,
+                "status": "succeeded",
+                "target_status": "succeeded",
+                "page_kind": "match",
+                "source_ids": {"match_id": "m1"},
+                "frontier_state": "fetched",
+                "last_content_hash": "a" * 64,
+                "content_hash": "a" * 64,
+                "parser_version": "generic-v1",
+                "typed_parser_version": "typed-v1",
+                "stateful_parser_version": "stateful-v1",
+                "observation_status": "succeeded",
+                "generic_status": "succeeded",
+                "typed_status": "succeeded",
+                "stateful_status": "skipped",
+                "validation_status": "succeeded",
+                "evidence_class": "full_match",
+                "latest_guarded": True,
+            }
+        ]
+        datasets = [
+            {
+                "ordinal": 0,
+                "target_id": "fbref:match:m1",
+                "replay_target_id": replay_target_id,
+                "content_hash": "a" * 64,
+                "parser_version": "typed-v1",
+                "dataset": f"typed:{dataset}",
+                "availability": "available",
+                "parse_status": "succeeded",
+                "persistence_status": "succeeded",
+                "validation_status": "succeeded",
+                "row_count": 3,
+                "empty_reason": None,
+            }
+            for dataset in (
+                "shot_events",
+                "match_events",
+                "lineups",
+                "match_team_stats",
+                "match_managers",
+                "match_officials",
+                "match_keeper_stats",
+                "match_player_stats",
+            )
+        ]
+        return build_replay_control_effects(
+            control_run_id=run_id,
+            source_run_id=SOURCE_RUN_ID,
+            mode=mode,
+            targets=targets,
+            datasets=datasets,
+        )
+
     def get_run(self, run_id):
         self.calls.append(("run", run_id))
-        mode = "batch" if run_id == "run-two" else "sequential"
+        mode = "batch" if run_id == RUN_TWO_ID else "sequential"
         schema = "batch" if mode == "batch" else "sequential"
         metrics = PipelineRunMetrics.anchored(
             control_run_id=run_id,
@@ -594,8 +674,11 @@ class _DirectControl:
             "requests_used": 0,
             "bytes_used": 0,
             "metadata": {
-                "acceptance_replay_source_run_id": "source-run",
+                "acceptance_replay_source_run_id": SOURCE_RUN_ID,
                 "acceptance_persistence_mode": mode,
+                "acceptance_replay_control_effects": self._effects(
+                    run_id, mode
+                ),
                 "pipeline_run_metrics": metrics.to_dict(),
                 "bronze_acceptance_replay": {
                     "schema_version": "fbref-bronze-acceptance-replay-v1",
@@ -617,7 +700,7 @@ class _DirectControl:
                             metrics.artifact_sha256
                         ),
                     },
-                }
+                },
             },
         }
 
@@ -630,107 +713,26 @@ class _DirectControl:
             "traffic_totals": {"network_attempts": 0},
         }
 
-    def get_acceptance_run_evidence(self, run_id):
-        self.calls.append(("evidence", run_id))
-        return {
-            "targets": [
-                {
-                    "target_id": "fbref:match:m1",
-                    "logical_refresh_id": f"refresh-{run_id}",
-                    "status": "succeeded",
-                    "target_status": "succeeded",
-                    "page_kind": "match",
-                    "source_ids": {"match_id": "m1"},
-                    "frontier_state": "fetched",
-                    "last_content_hash": "a" * 64,
-                    "content_hash": "a" * 64,
-                    "parser_version": "generic-v1",
-                    "typed_parser_version": "typed-v1",
-                    "stateful_parser_version": "stateful-v1",
-                    "observation_status": "succeeded",
-                    "generic_status": "succeeded",
-                    "typed_status": "succeeded",
-                    "stateful_status": "skipped",
-                    "validation_status": "succeeded",
-                    "evidence_class": "full_match",
-                }
-            ],
-            "datasets": [
-                {
-                    "target_id": "fbref:match:m1",
-                    "content_hash": "a" * 64,
-                    "parser_version": "typed-v1",
-                    "dataset": f"typed:{dataset}",
-                    "availability": "available",
-                    "parse_status": "succeeded",
-                    "persistence_status": "succeeded",
-                    "validation_status": "succeeded",
-                    "row_count": 3,
-                }
-                for dataset in (
-                    "shot_events",
-                    "match_events",
-                    "lineups",
-                    "match_team_stats",
-                    "match_managers",
-                    "match_officials",
-                    "match_keeper_stats",
-                    "match_player_stats",
-                )
-            ],
-        }
-
-    def replay_control_transaction_evidence(
-        self,
-        *,
-        replay_run_id,
-        source_run_id,
-        mode,
-        targets,
-        datasets,
-    ):
-        self.calls.append(
-            ("control_replay", replay_run_id, source_run_id, mode)
-        )
-        replay_targets = [
-            {
-                **dict(item),
-                "replay_target_id": (
-                    f"fbref:acceptance-replay:{replay_run_id}:"
-                    f"{item['target_id']}"
-                ),
-                "logical_refresh_id": (
-                    f"{replay_run_id}:{item['logical_refresh_id']}"
-                ),
-            }
-            for item in targets
-        ]
-        replay_datasets = [
-            {
-                **dict(item),
-                "replay_target_id": (
-                    f"fbref:acceptance-replay:{replay_run_id}:"
-                    f"{item['target_id']}"
-                ),
-            }
-            for item in datasets
-        ]
-        return {"targets": replay_targets, "datasets": replay_datasets}
-
+    def get_replay_control_effects(self, run_id):
+        self.calls.append(("effects", run_id))
+        mode = "batch" if run_id == RUN_TWO_ID else "sequential"
+        return self._effects(run_id, mode)
 
 @pytest.mark.unit
-def test_control_evidence_uses_an_isolated_transaction_outcome():
+def test_control_evidence_uses_anchored_actual_replay_effects():
     control = _DirectControl()
 
-    evidence = _control_run_evidence(control, "run-one")
+    evidence = _control_run_evidence(control, RUN_ONE_ID)
 
     assert isinstance(evidence, ControlRunEvidence)
     assert control.calls == [
-        ("run", "run-one"),
-        ("summary", "run-one"),
-        ("evidence", "source-run"),
-        ("control_replay", "run-one", "source-run", "sequential"),
+        ("run", RUN_ONE_ID),
+        ("summary", RUN_ONE_ID),
+        ("effects", RUN_ONE_ID),
     ]
+    assert evidence.evidence_source == (
+        "anchored_actual_replay_control_effects"
+    )
     assert evidence.valid is True
     assert evidence.logical_refreshes == 1
     assert evidence.dataset_manifests == 8
@@ -744,31 +746,33 @@ def test_control_evidence_uses_an_isolated_transaction_outcome():
 @pytest.mark.unit
 def test_source_hashes_alone_cannot_claim_replay_control_equivalence():
     class SourceOnlyControl(_DirectControl):
-        replay_control_transaction_evidence = None
+        get_replay_control_effects = None
+
+        def get_run(self, run_id):
+            run = super().get_run(run_id)
+            del run["metadata"]["acceptance_replay_control_effects"]
+            return run
 
     with pytest.raises(
-        ValueError, match="isolated replay control transaction is unavailable"
+        ValueError, match="anchored replay control effects are missing"
     ):
-        _control_run_evidence(SourceOnlyControl(), "run-one")
+        _control_run_evidence(SourceOnlyControl(), RUN_ONE_ID)
 
 
 @pytest.mark.unit
-def test_control_equivalence_requires_the_same_frozen_source_run():
+def test_control_artifact_must_match_its_frozen_source_run():
     class DifferentSourceControl(_DirectControl):
         def get_run(self, run_id):
             run = super().get_run(run_id)
-            if run_id == "run-two":
-                run["metadata"]["acceptance_replay_source_run_id"] = (
-                    "other-source-run"
-                )
+            run["metadata"]["acceptance_replay_source_run_id"] = (
+                OTHER_SOURCE_RUN_ID
+            )
             return run
 
-    control = DifferentSourceControl()
-    sequential = _control_run_evidence(control, "run-one")
-    batch = _control_run_evidence(control, "run-two")
-
-    assert sequential.observation_sha256 == batch.observation_sha256
-    assert _control_evidence_equivalent(sequential, batch) is False
+    with pytest.raises(
+        ValueError, match="control effects differ from run"
+    ):
+        _control_run_evidence(DifferentSourceControl(), RUN_ONE_ID)
 
 
 @pytest.mark.unit
@@ -779,7 +783,7 @@ def test_control_evidence_rejects_an_unversioned_strict_marker():
             del run["metadata"]["bronze_acceptance_replay"]["schema_version"]
             return run
 
-    evidence = _control_run_evidence(Unversioned(), "run-one")
+    evidence = _control_run_evidence(Unversioned(), RUN_ONE_ID)
 
     assert evidence.valid is False
     assert "strict_acceptance_missing" in evidence.failures
@@ -794,326 +798,102 @@ def test_control_evidence_rejects_an_incomplete_strict_gate():
             del strict["strict_gates"]["network_attempts"]
             return run
 
-    evidence = _control_run_evidence(Incomplete(), "run-one")
+    evidence = _control_run_evidence(Incomplete(), RUN_ONE_ID)
 
     assert evidence.valid is False
     assert "strict_acceptance_gates_invalid" in evidence.failures
 
 
 @pytest.mark.unit
-def test_postgres_source_rows_seed_an_isolated_replay_control_transaction():
-    base = _DirectControl()
-    datasets = base.get_acceptance_run_evidence("run-direct")["datasets"]
-    source_run_id = "source-run-direct"
-    observations = [
-        {
-            "ordinal": 0,
-            "target_id": "fbref:match:m1",
-            "logical_refresh_id": "refresh-direct",
-            "target_status": "succeeded",
-            "page_kind": "match",
-            "source_ids": {"match_id": "m1"},
-            "frontier_state": "fetched",
-            "last_content_hash": "a" * 64,
-            "content_hash": "a" * 64,
-            "parser_version": "generic-v1",
-            "typed_parser_version": "typed-v1",
-            "stateful_parser_version": "stateful-v1",
-            "observation_status": "succeeded",
-            "generic_status": "succeeded",
-            "typed_status": "succeeded",
-            "stateful_status": "skipped",
-            "validation_status": "succeeded",
-        }
-    ]
+def test_metadata_fallback_reads_only_the_anchored_replay_artifact():
+    class MetadataControl(_DirectControl):
+        get_replay_control_effects = None
 
-    class Cursor:
-        def __init__(self):
-            self.queries = []
-            self.rows = []
+    control = MetadataControl()
 
-        def execute(self, sql, params):
-            self.queries.append((sql, params))
-            self.rows = (
-                observations
-                if "SELECT * FROM ranked" in sql
-                else datasets
-            )
-
-        def fetchall(self):
-            return self.rows
-
-    class DirectControl(_DirectControl):
-        def __init__(self):
-            super().__init__()
-            self.cursor = Cursor()
-
-        @contextmanager
-        def _transaction(self):
-            yield self.cursor
-
-        def get_acceptance_run_evidence(self, _run_id):
-            raise AssertionError("source-run alias evidence must not be used")
-
-        def get_run(self, run_id):
-            run = super().get_run(run_id)
-            run["metadata"]["acceptance_replay_source_run_id"] = (
-                source_run_id
-            )
-            return run
-
-    control = DirectControl()
-
-    evidence = _control_run_evidence(control, "run-direct")
+    evidence = _control_run_evidence(control, RUN_ONE_ID)
 
     assert evidence.valid is True
-    assert evidence.evidence_source == "isolated_replay_control_transaction"
-    assert (
-        "control_replay",
-        "run-direct",
-        source_run_id,
-        "sequential",
-    ) in control.calls
-    assert len(control.cursor.queries) == 2
-    assert all(
-        params == (source_run_id,) for _sql, params in control.cursor.queries
-    )
-    assert "fbref_control.observation_processing" in control.cursor.queries[0][0]
-    assert "fbref_control.dataset_manifest" in control.cursor.queries[1][0]
+    assert control.calls == [
+        ("run", RUN_ONE_ID),
+        ("summary", RUN_ONE_ID),
+    ]
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "defect",
-    ("observation_completion", "dataset_manifest", "latest_frontier"),
+    ("observation_completion", "dataset_manifest", "latest_guard"),
 )
-def test_control_equivalence_rejects_a_divergent_batch_transaction(defect):
+def test_control_equivalence_rejects_a_divergent_batch_artifact(defect):
     """A shared source snapshot must not hide a broken batch completion."""
 
     class DivergentBatchControl(_DirectControl):
-        def get_run(self, run_id):
-            run = super().get_run(run_id)
-            run["metadata"]["acceptance_replay_source_run_id"] = "source-run"
-            run["metadata"]["acceptance_persistence_mode"] = (
-                "batch" if run_id == "run-two" else "sequential"
+        def get_replay_control_effects(self, run_id):
+            value = json.loads(
+                json.dumps(
+                    super().get_replay_control_effects(run_id)
+                )
             )
-            return run
-
-        def replay_control_transaction_evidence(
-            self,
-            *,
-            replay_run_id,
-            source_run_id,
-            mode,
-            targets,
-            datasets,
-        ):
-            del source_run_id
-            replay_targets = [
-                {
-                    **dict(item),
-                    "replay_target_id": (
-                        f"fbref:acceptance-replay:{replay_run_id}:"
-                        f"{item['target_id']}"
-                    ),
-                    "logical_refresh_id": f"{replay_run_id}:refresh-m1",
-                    "target_status": "succeeded",
-                    "frontier_state": "fetched",
-                    "last_content_hash": "a" * 64,
-                    "content_hash": "a" * 64,
-                    "observation_status": "succeeded",
-                    "generic_status": "succeeded",
-                    "typed_status": "succeeded",
-                    "stateful_status": "skipped",
-                    "validation_status": "succeeded",
-                }
-                for item in targets
-            ]
-            replay_datasets = [
-                {
-                    **dict(item),
-                    "replay_target_id": (
-                        f"fbref:acceptance-replay:{replay_run_id}:"
-                        f"{item['target_id']}"
-                    ),
-                }
-                for item in datasets
-            ]
-            if mode == "batch" and defect == "observation_completion":
-                replay_targets[0]["observation_status"] = "processing"
-            elif mode == "batch" and defect == "dataset_manifest":
-                replay_datasets.pop()
-            elif mode == "batch" and defect == "latest_frontier":
-                replay_targets[0]["last_content_hash"] = "b" * 64
-            return {"targets": replay_targets, "datasets": replay_datasets}
+            if run_id != RUN_TWO_ID:
+                return value
+            if defect == "observation_completion":
+                value["targets"][0]["observation_status"] = "processing"
+            elif defect == "dataset_manifest":
+                value["datasets"].pop()
+            else:
+                value["targets"][0]["latest_guarded"] = False
+            return build_replay_control_effects(
+                control_run_id=value["control_run_id"],
+                source_run_id=value["source_run_id"],
+                mode=value["mode"],
+                targets=value["targets"],
+                datasets=value["datasets"],
+            )
 
     control = DivergentBatchControl()
 
-    sequential = _control_run_evidence(control, "run-one")
-    batch = _control_run_evidence(control, "run-two")
+    sequential = _control_run_evidence(control, RUN_ONE_ID)
+    batch = _control_run_evidence(control, RUN_TWO_ID)
 
+    assert batch.valid is False
     assert _control_evidence_equivalent(sequential, batch) is False
 
 
 @pytest.mark.unit
-def test_isolated_control_sql_uses_distinct_paths_and_only_temp_tables():
-    source = _DirectControl().get_acceptance_run_evidence("source-run")
-    second_target = {
-        **source["targets"][0],
-        "ordinal": 1,
-        "target_id": "fbref:match:m2",
-        "logical_refresh_id": "refresh-source-run-m2",
-        "source_ids": {"match_id": "m2"},
-    }
-    source["targets"][0]["ordinal"] = 0
-    source["targets"].append(second_target)
-    source["datasets"].extend(
-        {
-            **dict(item),
-            "target_id": "fbref:match:m2",
-        }
-        for item in list(source["datasets"])
-    )
+def test_control_effects_require_exact_source_to_replay_refresh_mapping():
+    value = _DirectControl._effects(RUN_ONE_ID, "sequential")
+    targets = json.loads(json.dumps(value["targets"]))
+    targets[0]["logical_refresh_id"] = str(uuid.uuid4())
 
-    class Cursor:
-        def __init__(self, replay_run_id):
-            self.replay_run_id = replay_run_id
-            self.executions = []
-            self.rows = []
-
-        def execute(self, sql, params=None):
-            normalized = " ".join(sql.split())
-            self.executions.append((normalized, params))
-            if "observation.status AS observation_status" in normalized:
-                self.rows = [
-                    {
-                        **dict(item),
-                        "replay_target_id": (
-                            "fbref:acceptance-replay:"
-                            f"{self.replay_run_id}:{item['target_id']}"
-                        ),
-                        "logical_refresh_id": (
-                            f"{self.replay_run_id}:"
-                            f"{item['logical_refresh_id']}"
-                        ),
-                    }
-                    for item in source["targets"]
-                ]
-            elif "manifest.dataset" in normalized:
-                self.rows = [
-                    {
-                        **dict(item),
-                        "replay_target_id": (
-                            "fbref:acceptance-replay:"
-                            f"{self.replay_run_id}:{item['target_id']}"
-                        ),
-                    }
-                    for item in source["datasets"]
-                ]
-            else:
-                self.rows = []
-
-        def fetchall(self):
-            return list(self.rows)
-
-    class Control:
-        def __init__(self, replay_run_id):
-            self.cursor = Cursor(replay_run_id)
-
-        @contextmanager
-        def _transaction(self):
-            yield self.cursor
-
-    sequential_control = Control("sequential-run")
-    batch_control = Control("batch-run")
-
-    sequential = _isolated_replay_control_evidence(
-        sequential_control,
-        replay_run_id="sequential-run",
-        source_run_id="source-run",
-        mode="sequential",
-        source_evidence=source,
-    )
-    batch = _isolated_replay_control_evidence(
-        batch_control,
-        replay_run_id="batch-run",
-        source_run_id="source-run",
-        mode="batch",
-        source_evidence=source,
-    )
-
-    def normalized(evidence):
-        return {
-            "targets": [
-                {
-                    key: value
-                    for key, value in item.items()
-                    if key not in {"replay_target_id", "logical_refresh_id"}
-                }
-                for item in evidence["targets"]
-            ],
-            "datasets": [
-                {
-                    key: value
-                    for key, value in item.items()
-                    if key != "replay_target_id"
-                }
-                for item in evidence["datasets"]
-            ],
-        }
-
-    assert normalized(sequential) == normalized(batch)
-    sequential_sql = [sql for sql, _params in sequential_control.cursor.executions]
-    batch_sql = [sql for sql, _params in batch_control.cursor.executions]
-    assert sum(
-        sql.startswith(
-            "UPDATE pg_temp.fbref_acceptance_control_observation"
+    with pytest.raises(ValueError, match="logical refresh identity"):
+        build_replay_control_effects(
+            control_run_id=RUN_ONE_ID,
+            source_run_id=SOURCE_RUN_ID,
+            mode="sequential",
+            targets=targets,
+            datasets=value["datasets"],
         )
-        for sql in sequential_sql
-    ) == 2
-    assert sum(
-        sql.startswith(
-            "UPDATE pg_temp.fbref_acceptance_control_observation"
-        )
-        for sql in batch_sql
-    ) == 1
-    assert sum(
-        sql.startswith(
-            "INSERT INTO pg_temp.fbref_acceptance_control_manifest ("
-        )
-        for sql in sequential_sql
-    ) == 2
-    assert sum(
-        sql.startswith(
-            "INSERT INTO pg_temp.fbref_acceptance_control_manifest ("
-        )
-        for sql in batch_sql
-    ) == 1
-    assert sum(
-        sql.startswith(
-            "UPDATE pg_temp.fbref_acceptance_control_target AS target"
-        )
-        for sql in sequential_sql
-    ) == 2
-    assert sum(
-        sql.startswith(
-            "UPDATE pg_temp.fbref_acceptance_control_target AS target"
-        )
-        for sql in batch_sql
-    ) == 1
-    for sql in (*sequential_sql, *batch_sql):
-        if sql.startswith(("INSERT", "UPDATE")):
-            assert "pg_temp.fbref_acceptance_control_" in sql
-        if sql.startswith("CREATE"):
-            assert sql.startswith("CREATE TEMP TABLE")
-        assert "fbref_control." not in sql
+
+
+@pytest.mark.unit
+def test_control_evidence_rejects_a_corrupted_artifact_digest():
+    class Corrupted(_DirectControl):
+        def get_replay_control_effects(self, run_id):
+            value = super().get_replay_control_effects(run_id)
+            return {**value, "artifact_sha256": "0" * 64}
+
+    with pytest.raises(
+        ValueError, match="anchored replay control effects are invalid"
+    ):
+        _control_run_evidence(Corrupted(), RUN_ONE_ID)
 
 
 @pytest.mark.unit
 def test_pipeline_metrics_reject_zero_statement_or_unbound_artifacts():
     with pytest.raises(ValueError, match="statement counts"):
         PipelineRunMetrics.anchored(
-            control_run_id="run-one",
+            control_run_id=RUN_ONE_ID,
             schema="sequential",
             mode="sequential",
             elapsed_seconds=80.0,
@@ -1147,8 +927,8 @@ def test_real_pipeline_evidence_has_no_trino_writes_and_one_strict_verdict():
         control=control,
         sequential_schema="sequential",
         batch_schema="batch",
-        sequential_control_run_id="run-one",
-        batch_control_run_id="run-two",
+        sequential_control_run_id=RUN_ONE_ID,
+        batch_control_run_id=RUN_TWO_ID,
         sequential_baseline=sequential_baseline,
         batch_baseline=batch_baseline,
         sentinel_match_id=sentinel,
@@ -1181,13 +961,14 @@ def test_real_pipeline_evidence_has_no_trino_writes_and_one_strict_verdict():
 @pytest.mark.unit
 def test_real_pipeline_rejects_metrics_for_a_different_match_cohort():
     manager = _DifferentialManager()
+
     class WrongCohort(_DirectControl):
         def get_run(self, run_id):
             run = super().get_run(run_id)
-            if run_id == "run-one":
+            if run_id == RUN_ONE_ID:
                 run["metadata"]["pipeline_run_metrics"] = (
                     PipelineRunMetrics.anchored(
-                        control_run_id="run-one",
+                        control_run_id=RUN_ONE_ID,
                         schema="sequential",
                         mode="sequential",
                         elapsed_seconds=80.0,
@@ -1210,8 +991,8 @@ def test_real_pipeline_rejects_metrics_for_a_different_match_cohort():
             control=control,
             sequential_schema="sequential",
             batch_schema="batch",
-            sequential_control_run_id="run-one",
-            batch_control_run_id="run-two",
+            sequential_control_run_id=RUN_ONE_ID,
+            batch_control_run_id=RUN_TWO_ID,
             sequential_baseline=AcceptanceBaseline(
                 schema="sequential",
                 sentinel_match_id=sentinel,

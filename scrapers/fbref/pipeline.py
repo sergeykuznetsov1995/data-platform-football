@@ -3929,10 +3929,15 @@ class FBrefPipeline:
         self._record_generic_table_results(record, page)
 
     def _record_generic_table_results(
-        self, record: RawFetchRecord, page: PageDocument
+        self,
+        record: RawFetchRecord,
+        page: PageDocument,
+        *,
+        control=None,
     ) -> None:
+        control_store = self.control if control is None else control
         for table in page.tables:
-            self.control.record_dataset_manifest(
+            control_store.record_dataset_manifest(
                 target_id=record.target_id,
                 content_hash=record.content_hash,
                 parser_version=page.parser_version,
@@ -4017,7 +4022,9 @@ class FBrefPipeline:
         parsed: Mapping[str, object],
         *,
         persisted: Optional[Mapping[str, int]],
+        control=None,
     ) -> None:
+        control_store = self.control if control is None else control
         for name, dataset in parsed.items():
             status = str(getattr(dataset.status, "value", dataset.status))
             requires_persistence = typed_result_requires_persistence(dataset)
@@ -4025,7 +4032,7 @@ class FBrefPipeline:
                 requires_persistence and persisted is None
             )
             was_persisted = bool(persisted is not None and name in persisted)
-            self.control.record_dataset_manifest(
+            control_store.record_dataset_manifest(
                 target_id=record.target_id,
                 content_hash=record.content_hash,
                 parser_version=TYPED_BRONZE_PARSER_VERSION,
@@ -4055,10 +4062,13 @@ class FBrefPipeline:
     def _record_typed_completion(
         self,
         record: RawFetchRecord,
+        *,
+        control=None,
     ) -> None:
         """Cache typed success only after every dataset result."""
 
-        self.control.record_dataset_manifest(
+        control_store = self.control if control is None else control
+        control_store.record_dataset_manifest(
             target_id=record.target_id,
             content_hash=record.content_hash,
             parser_version=TYPED_BRONZE_PARSER_VERSION,
@@ -4212,8 +4222,10 @@ class FBrefPipeline:
         succeeded: bool,
         error: Optional[Exception] = None,
         parse_succeeded: bool = False,
+        control=None,
     ) -> None:
-        self.control.record_dataset_manifest(
+        control_store = self.control if control is None else control
+        control_store.record_dataset_manifest(
             target_id=record.target_id,
             content_hash=record.content_hash,
             parser_version=PAGE_DOCUMENT_VERSION,
@@ -4911,56 +4923,158 @@ class FBrefPipeline:
         )
 
     def _persist_acceptance_replay_match(
-        self, run_id: str, item: _AcceptanceReplayMatch
+        self,
+        run_id: str,
+        item: _AcceptanceReplayMatch,
+        *,
+        replay_control,
     ) -> None:
-        self.generic_writer.persist_page(
-            item.page,
-            canonical_url=item.record.canonical_url,
-            run_id=run_id,
-            staging_identity=item.record.logical_refresh_id,
-        )
-        self.typed_adapter.writer.persist_match(
-            item.typed_match,
-            match_id=item.match_id,
-            context=item.typed_context,
-            run_id=run_id,
-            target_identity=item.record.logical_refresh_id,
-        )
-
-    def _persist_acceptance_replay_match_batch(
-        self, run_id: str, items: Sequence[_AcceptanceReplayMatch]
-    ) -> None:
-        generic_counts = self.generic_writer.persist_pages(
-            [
-                GenericPagePersistItem(
-                    page=item.page,
-                    canonical_url=item.record.canonical_url,
-                    run_id=run_id,
-                    staging_identity=item.record.logical_refresh_id,
+        with replay_control.guard_latest_content(
+            item.record.target_id,
+            item.record.content_hash,
+            item.record.logical_refresh_id,
+        ) as latest:
+            if latest is not True:
+                raise ParseWaveError(
+                    "acceptance_replay_control_latest_guard_failed"
                 )
-                for item in items
-            ]
-        )
-        if len(generic_counts) != len(items):
-            raise ParseWaveError(
-                "Acceptance generic batch returned misaligned item counts"
+            self.generic_writer.persist_page(
+                item.page,
+                canonical_url=item.record.canonical_url,
+                run_id=run_id,
+                staging_identity=item.record.logical_refresh_id,
             )
-        typed_counts = self.typed_adapter.writer.persist_matches(
-            [
-                TypedMatchPersistItem(
-                    parsed=item.typed_match,
+            self._record_generic_table_results(
+                item.record, item.page, control=replay_control
+            )
+            try:
+                typed_counts = self.typed_adapter.writer.persist_match(
+                    item.typed_match,
                     match_id=item.match_id,
                     context=item.typed_context,
                     run_id=run_id,
                     target_identity=item.record.logical_refresh_id,
                 )
-                for item in items
-            ]
-        )
-        if len(typed_counts) != len(items):
-            raise TypedBronzeError(
-                "Acceptance typed batch returned misaligned item counts"
+            except Exception:
+                self._record_typed_results(
+                    item.record,
+                    item.typed_match.datasets,
+                    persisted=None,
+                    control=replay_control,
+                )
+                raise
+            self._finish_acceptance_replay_control(
+                item, typed_counts, replay_control=replay_control
             )
+
+    def _finish_acceptance_replay_control(
+        self,
+        item: _AcceptanceReplayMatch,
+        typed_counts: Mapping[str, int],
+        *,
+        replay_control,
+    ) -> None:
+        self._record_typed_results(
+            item.record,
+            item.typed_match.datasets,
+            persisted=typed_counts,
+            control=replay_control,
+        )
+        self._record_typed_completion(
+            item.record, control=replay_control
+        )
+        self._record_page_completion(
+            item.record,
+            item.page,
+            succeeded=True,
+            control=replay_control,
+        )
+        replay_control.complete_observation_processing(
+            replay_control.observation_lease(
+                item.record.logical_refresh_id
+            ),
+            typed_status="succeeded",
+            stateful_status="skipped",
+        )
+
+    def _persist_acceptance_replay_match_batch(
+        self,
+        run_id: str,
+        items: Sequence[_AcceptanceReplayMatch],
+        *,
+        replay_control,
+    ) -> None:
+        lock_errors: list[Exception] = []
+        with _captured_exit_stack(lock_errors) as stack:
+            verdicts = {
+                item.record.target_id: stack.enter_context(
+                    replay_control.guard_latest_content(
+                        item.record.target_id,
+                        item.record.content_hash,
+                        item.record.logical_refresh_id,
+                    )
+                )
+                for item in sorted(
+                    items, key=lambda value: value.record.target_id
+                )
+            }
+            if any(verdict is not True for verdict in verdicts.values()):
+                raise ParseWaveError(
+                    "acceptance_replay_control_latest_guard_failed"
+                )
+            generic_counts = self.generic_writer.persist_pages(
+                [
+                    GenericPagePersistItem(
+                        page=item.page,
+                        canonical_url=item.record.canonical_url,
+                        run_id=run_id,
+                        staging_identity=item.record.logical_refresh_id,
+                    )
+                    for item in items
+                ]
+            )
+            if len(generic_counts) != len(items):
+                raise ParseWaveError(
+                    "Acceptance generic batch returned misaligned item counts"
+                )
+            for item in items:
+                self._record_generic_table_results(
+                    item.record, item.page, control=replay_control
+                )
+            try:
+                typed_counts = self.typed_adapter.writer.persist_matches(
+                    [
+                        TypedMatchPersistItem(
+                            parsed=item.typed_match,
+                            match_id=item.match_id,
+                            context=item.typed_context,
+                            run_id=run_id,
+                            target_identity=(
+                                item.record.logical_refresh_id
+                            ),
+                        )
+                        for item in items
+                    ]
+                )
+            except Exception:
+                for item in items:
+                    self._record_typed_results(
+                        item.record,
+                        item.typed_match.datasets,
+                        persisted=None,
+                        control=replay_control,
+                    )
+                raise
+            if len(typed_counts) != len(items):
+                raise TypedBronzeError(
+                    "Acceptance typed batch returned misaligned item counts"
+                )
+            for item, counts in zip(items, typed_counts):
+                self._finish_acceptance_replay_control(
+                    item, counts, replay_control=replay_control
+                )
+        if lock_errors:
+            raise lock_errors[0]
 
     def replay_acceptance_matches(
         self,
@@ -4974,8 +5088,9 @@ class FBrefPipeline:
         The accepted source already owns successful global observation fences.
         Reusing the ordinary replay selector would therefore select nothing.
         This path deliberately reads every frozen successful match attempt and
-        writes only the isolated Trino outputs under ``run_id``; it does not
-        mutate source observations, manifests, discovery, or frontier state.
+        writes only the isolated Trino outputs under ``run_id``.  Real control
+        methods run on replay-scoped clones in a rollback-only transaction, so
+        source observations, manifests, discovery, and frontier stay unchanged.
         """
 
         if (
@@ -5024,41 +5139,74 @@ class FBrefPipeline:
                     "acceptance_replay_match_identity_duplicate"
                 )
 
-            if not self.batch_persist_enabled:
-                for item in prepared:
-                    self._persist_acceptance_replay_match(run_id, item)
-            else:
-                batch: list[_AcceptanceReplayMatch] = []
-                batch_cells = 0
-
-                def flush() -> None:
-                    nonlocal batch, batch_cells
-                    if batch:
-                        self._persist_acceptance_replay_match_batch(
-                            run_id, batch
+            mode = (
+                "batch" if self.batch_persist_enabled else "sequential"
+            )
+            control_targets = [
+                {
+                    "ordinal": ordinal,
+                    "target_id": item.record.target_id,
+                    "logical_refresh_id": item.record.logical_refresh_id,
+                    "page_kind": item.record.page_kind,
+                    "source_ids": dict(item.record.source_ids),
+                    "canonical_url": item.record.canonical_url,
+                    "content_hash": item.record.content_hash,
+                    "parser_version": PAGE_DOCUMENT_VERSION,
+                    "typed_parser_version": TYPED_BRONZE_PARSER_VERSION,
+                    "stateful_parser_version": DISCOVERY_PARSER_VERSION,
+                    "evidence_class": "full_match",
+                }
+                for ordinal, item in enumerate(prepared)
+            ]
+            with self.control.replay_control_transaction(
+                replay_run_id=run_id,
+                source_run_id=source_run_id,
+                mode=mode,
+                targets=control_targets,
+            ) as replay_control:
+                if not self.batch_persist_enabled:
+                    for item in prepared:
+                        self._persist_acceptance_replay_match(
+                            run_id, item, replay_control=replay_control
                         )
-                        batch = []
-                        batch_cells = 0
+                else:
+                    batch: list[_AcceptanceReplayMatch] = []
+                    batch_cells = 0
 
-                for item in prepared:
-                    item_cells = len(item.page.cell_records()) + sum(
-                        int(dataset.frame.size)
-                        for dataset in item.typed_match.datasets.values()
-                        if dataset.frame is not None
-                    )
-                    if item_cells > self.batch_persist_max_cells:
-                        flush()
-                        self._persist_acceptance_replay_match(run_id, item)
-                        continue
-                    if batch and (
-                        len(batch) == self.batch_persist_matches
-                        or batch_cells + item_cells
-                        > self.batch_persist_max_cells
-                    ):
-                        flush()
-                    batch.append(item)
-                    batch_cells += item_cells
-                flush()
+                    def flush() -> None:
+                        nonlocal batch, batch_cells
+                        if batch:
+                            self._persist_acceptance_replay_match_batch(
+                                run_id,
+                                batch,
+                                replay_control=replay_control,
+                            )
+                            batch = []
+                            batch_cells = 0
+
+                    for item in prepared:
+                        item_cells = len(item.page.cell_records()) + sum(
+                            int(dataset.frame.size)
+                            for dataset in item.typed_match.datasets.values()
+                            if dataset.frame is not None
+                        )
+                        if item_cells > self.batch_persist_max_cells:
+                            flush()
+                            self._persist_acceptance_replay_match(
+                                run_id,
+                                item,
+                                replay_control=replay_control,
+                            )
+                            continue
+                        if batch and (
+                            len(batch) == self.batch_persist_matches
+                            or batch_cells + item_cells
+                            > self.batch_persist_max_cells
+                        ):
+                            flush()
+                        batch.append(item)
+                        batch_cells += item_cells
+                    flush()
 
         return WaveResult(
             cohort_size=len(prepared),

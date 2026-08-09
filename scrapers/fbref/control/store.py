@@ -36,6 +36,12 @@ from scrapers.fbref.control.models import (
     TargetLease,
     ThrottleSlot,
 )
+from scrapers.fbref.control.replay_effects import (
+    build_replay_control_effects,
+    make_replay_control_refresh_id,
+    make_replay_control_target_id,
+    normalize_replay_control_effects,
+)
 from scrapers.fbref.policy import (
     DISCOVERY_SPINE_PAGE_KINDS,
     OTHER_PUBLICATION_CRITICAL_PAGE_KINDS,
@@ -364,6 +370,86 @@ def _detached_json_mapping(value: object, name: str) -> dict[str, Any]:
     if not isinstance(detached, dict):  # pragma: no cover - _json guarantees it
         raise ValueError(f"{name} must be a JSON object")
     return detached
+
+
+_REPLAY_CONTROL_TARGET_FIELDS = {
+    "ordinal",
+    "target_id",
+    "logical_refresh_id",
+    "page_kind",
+    "source_ids",
+    "canonical_url",
+    "content_hash",
+    "parser_version",
+    "typed_parser_version",
+    "stateful_parser_version",
+    "evidence_class",
+}
+
+
+def _replay_control_targets(
+    values: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        raise ValueError("replay control targets must be a sequence")
+    if not 1 <= len(values) <= 25:
+        raise ValueError("replay control target count must be between 1 and 25")
+    normalized = []
+    for expected_ordinal, value in enumerate(values):
+        if not isinstance(value, Mapping) or set(value) != (
+            _REPLAY_CONTROL_TARGET_FIELDS
+        ):
+            raise ValueError("replay control target fields are invalid")
+        ordinal = value.get("ordinal")
+        if ordinal != expected_ordinal:
+            raise ValueError("replay control target ordinals must be contiguous")
+        target_id = _text(value.get("target_id"), "target_id")
+        page_kind = _text(value.get("page_kind"), "page_kind").casefold()
+        source_ids = _detached_json_mapping(
+            value.get("source_ids"), "source_ids"
+        )
+        match_id = _text(source_ids.get("match_id"), "match_id")
+        if page_kind != "match" or target_id != f"fbref:match:{match_id}":
+            raise ValueError("replay control target must be a canonical match")
+        normalized.append(
+            {
+                "ordinal": expected_ordinal,
+                "target_id": target_id,
+                "logical_refresh_id": _uuid(
+                    value.get("logical_refresh_id"),
+                    "logical_refresh_id",
+                ),
+                "page_kind": page_kind,
+                "source_ids": source_ids,
+                "canonical_url": _text(
+                    value.get("canonical_url"), "canonical_url"
+                ),
+                "content_hash": _text(
+                    value.get("content_hash"), "content_hash"
+                ),
+                "parser_version": _text(
+                    value.get("parser_version"), "parser_version"
+                ),
+                "typed_parser_version": _text(
+                    value.get("typed_parser_version"),
+                    "typed_parser_version",
+                ),
+                "stateful_parser_version": _text(
+                    value.get("stateful_parser_version"),
+                    "stateful_parser_version",
+                ),
+                "evidence_class": _text(
+                    value.get("evidence_class"), "evidence_class"
+                ),
+            }
+        )
+    identities = (
+        [item["target_id"] for item in normalized],
+        [item["logical_refresh_id"] for item in normalized],
+    )
+    if any(len(items) != len(set(items)) for items in identities):
+        raise ValueError("replay control target identity is duplicate")
+    return normalized
 
 
 def _publication_metadata(
@@ -2567,6 +2653,344 @@ class ControlStore:
             if cursor.rowcount != 1:
                 raise StateConflict(f"Acceptance run {run} disappeared")
         return {**normalized, "idempotent": False}
+
+    def record_replay_control_effects(
+        self,
+        run_id: object,
+        evidence: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Anchor actual rollback-only replay control effects create-once."""
+
+        run = _uuid(run_id, "run_id")
+        normalized = normalize_replay_control_effects(evidence)
+        if normalized["control_run_id"] != run:
+            raise StateConflict(
+                "replay control effects do not belong to their control run"
+            )
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT status, run_type, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            row = _fetchone(cursor)
+            if (
+                row is None
+                or row["status"] != "running"
+                or row["run_type"] != "replay"
+            ):
+                raise StateConflict(
+                    f"Run {run} cannot anchor replay control effects"
+                )
+            metadata = _json_mapping(
+                row.get("metadata") or {}, "crawl run metadata"
+            )
+            if (
+                metadata.get("acceptance_replay") is not True
+                or _uuid(
+                    metadata.get("acceptance_replay_source_run_id"),
+                    "acceptance_replay_source_run_id",
+                )
+                != normalized["source_run_id"]
+                or str(
+                    metadata.get("acceptance_persistence_mode") or ""
+                ).casefold()
+                != normalized["mode"]
+            ):
+                raise StateConflict(
+                    f"Run {run} control effects differ from its replay profile"
+                )
+            installed_value = metadata.get(
+                "acceptance_replay_control_effects"
+            )
+            if installed_value is not None:
+                installed = normalize_replay_control_effects(
+                    _json_mapping(
+                        installed_value,
+                        "acceptance_replay_control_effects",
+                    )
+                )
+                if installed != normalized:
+                    raise StateConflict(
+                        f"Run {run} already has different replay control effects"
+                    )
+                return installed
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET metadata = metadata || %s::jsonb,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s
+                """,
+                (
+                    _json(
+                        {
+                            "acceptance_replay_control_effects": normalized
+                        }
+                    ),
+                    run,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(f"Acceptance run {run} disappeared")
+        return normalized
+
+    def get_replay_control_effects(
+        self, run_id: object
+    ) -> Optional[dict[str, Any]]:
+        """Read one validated run-bound actual control-effects artifact."""
+
+        run = _uuid(run_id, "run_id")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT metadata -> 'acceptance_replay_control_effects'
+                           AS effects
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                """,
+                (run,),
+            )
+            row = _fetchone(cursor)
+        if row is None:
+            raise StateConflict(f"Acceptance run {run} does not exist")
+        value = row.get("effects")
+        if value is None:
+            return None
+        return normalize_replay_control_effects(
+            _json_mapping(value, "acceptance_replay_control_effects")
+        )
+
+    @contextmanager
+    def replay_control_transaction(
+        self,
+        *,
+        replay_run_id: object,
+        source_run_id: object,
+        mode: object,
+        targets: Sequence[Mapping[str, Any]],
+    ):
+        """Run real ControlStore methods on clones, then always roll them back."""
+
+        replay_run = _uuid(replay_run_id, "replay_run_id")
+        source_run = _uuid(source_run_id, "source_run_id")
+        if replay_run == source_run:
+            raise ValueError("replay and source control runs must be distinct")
+        normalized_mode = _text(mode, "mode").casefold()
+        if normalized_mode not in {"sequential", "batch"}:
+            raise ValueError("replay control mode is invalid")
+        normalized_targets = _replay_control_targets(targets)
+        connection = self._connect()
+        cursor = self._cursor(connection)
+        replay_control = None
+        effects = None
+        try:
+            cursor.execute(
+                """
+                SELECT run_id, status, run_type, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id IN (%s, %s)
+                ORDER BY run_id
+                FOR SHARE
+                """,
+                (source_run, replay_run),
+            )
+            runs = {
+                str(row["run_id"]): row for row in _fetchall(cursor)
+            }
+            replay_row = runs.get(replay_run)
+            source_row = runs.get(source_run)
+            replay_metadata = (
+                {}
+                if replay_row is None
+                else _json_mapping(
+                    replay_row.get("metadata") or {},
+                    "replay crawl run metadata",
+                )
+            )
+            if (
+                source_row is None
+                or source_row["status"] != "succeeded"
+                or replay_row is None
+                or replay_row["status"] != "running"
+                or replay_row["run_type"] != "replay"
+                or replay_metadata.get("acceptance_replay") is not True
+                or _uuid(
+                    replay_metadata.get("acceptance_replay_source_run_id"),
+                    "acceptance_replay_source_run_id",
+                )
+                != source_run
+                or str(
+                    replay_metadata.get("acceptance_persistence_mode") or ""
+                ).casefold()
+                != normalized_mode
+            ):
+                raise StateConflict("replay control transaction profile is invalid")
+            cursor.execute(
+                """
+                WITH ranked_attempt AS (
+                    SELECT attempt.run_id, attempt.target_id,
+                           attempt.logical_refresh_id, attempt.content_hash,
+                           row_number() OVER (
+                               PARTITION BY attempt.target_id,
+                                            attempt.logical_refresh_id
+                               ORDER BY attempt.lease_epoch DESC,
+                                        attempt.attempt_number DESC,
+                                        attempt.attempt_id DESC
+                           ) AS attempt_rank
+                    FROM fbref_control.fetch_attempt AS attempt
+                    WHERE attempt.run_id = %s
+                      AND attempt.status = 'succeeded'
+                )
+                SELECT target.target_id, target.logical_refresh_id,
+                       frontier.page_kind, frontier.source_ids,
+                       frontier.canonical_url, attempt.content_hash
+                FROM fbref_control.run_target AS target
+                JOIN fbref_control.page_frontier AS frontier
+                  ON frontier.target_id = target.target_id
+                JOIN ranked_attempt AS attempt
+                  ON attempt.run_id = target.run_id
+                 AND attempt.target_id = target.target_id
+                 AND attempt.logical_refresh_id = target.logical_refresh_id
+                 AND attempt.attempt_rank = 1
+                WHERE target.run_id = %s
+                  AND frontier.page_kind = 'match'
+                ORDER BY target.ordinal, target.target_id
+                """,
+                (source_run, source_run),
+            )
+            source_targets = _fetchall(cursor)
+            if len(source_targets) != len(normalized_targets):
+                raise StateConflict(
+                    "replay control targets differ from the source match cohort"
+                )
+            for expected, actual in zip(normalized_targets, source_targets):
+                actual_source_ids = _json_mapping(
+                    actual.get("source_ids") or {}, "source target source_ids"
+                )
+                if (
+                    str(actual.get("target_id") or "")
+                    != expected["target_id"]
+                    or str(actual.get("logical_refresh_id") or "")
+                    != expected["logical_refresh_id"]
+                    or str(actual.get("page_kind") or "").casefold()
+                    != expected["page_kind"]
+                    or actual_source_ids != expected["source_ids"]
+                    or str(actual.get("canonical_url") or "")
+                    != expected["canonical_url"]
+                    or str(actual.get("content_hash") or "")
+                    != expected["content_hash"]
+                ):
+                    raise StateConflict(
+                        "replay control target differs from immutable source"
+                    )
+
+            replay_uuid = uuid.UUID(replay_run)
+            for target in normalized_targets:
+                replay_target = make_replay_control_target_id(
+                    replay_run, target["target_id"]
+                )
+                replay_refresh = make_replay_control_refresh_id(
+                    replay_run, target["logical_refresh_id"]
+                )
+                attempt_id = str(
+                    uuid.uuid5(
+                        replay_uuid,
+                        "fbref-acceptance-control-attempt:"
+                        + target["logical_refresh_id"],
+                    )
+                )
+                claim_token = str(
+                    uuid.uuid5(
+                        replay_uuid,
+                        "fbref-acceptance-control-fetch-token:"
+                        + target["logical_refresh_id"],
+                    )
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO fbref_control.page_frontier (
+                        target_id, source, page_kind, canonical_url,
+                        source_ids, refresh_policy, state, priority,
+                        lease_epoch, last_fetched_at, last_http_status,
+                        last_content_hash
+                    ) VALUES (
+                        %s, 'fbref', 'match', %s, %s::jsonb,
+                        'historical_once', 'fetched', 0, 1,
+                        clock_timestamp(), 200, %s
+                    )
+                    """,
+                    (
+                        replay_target,
+                        "https://acceptance.invalid/fbref-control/"
+                        f"{replay_run}/{target['ordinal']}",
+                        _json(target["source_ids"]),
+                        target["content_hash"],
+                    ),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO fbref_control.run_target (
+                        run_id, target_id, logical_refresh_id, ordinal, status
+                    ) VALUES (%s, %s, %s, %s, 'succeeded')
+                    """,
+                    (
+                        replay_run,
+                        replay_target,
+                        replay_refresh,
+                        target["ordinal"],
+                    ),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO fbref_control.fetch_attempt (
+                        attempt_id, run_id, target_id, logical_refresh_id,
+                        attempt_number, claim_token, lease_epoch, status,
+                        http_status, content_hash, raw_manifest_key,
+                        finished_at
+                    ) VALUES (
+                        %s, %s, %s, %s, 1, %s, 1, 'succeeded', 200, %s,
+                        %s, clock_timestamp()
+                    )
+                    """,
+                    (
+                        attempt_id,
+                        replay_run,
+                        replay_target,
+                        replay_refresh,
+                        claim_token,
+                        target["content_hash"],
+                        f"acceptance-replay-control://{replay_refresh}",
+                    ),
+                )
+            replay_control = _CursorBoundReplayControlStore(
+                base=self,
+                cursor=cursor,
+                replay_run_id=replay_run,
+                source_run_id=source_run,
+                mode=normalized_mode,
+                targets=normalized_targets,
+            )
+            replay_control._claim_all()
+            yield replay_control
+            effects = replay_control._capture_effects()
+        except BaseException:
+            connection.rollback()
+            raise
+        else:
+            connection.rollback()
+        finally:
+            cursor.close()
+            connection.close()
+        if replay_control is None or effects is None:  # pragma: no cover
+            raise ControlStoreError("replay control transaction produced no effects")
+        replay_control.effects = self.record_replay_control_effects(
+            replay_run, effects
+        )
 
     def record_replay_pipeline_metrics(
         self,
@@ -10326,3 +10750,308 @@ class ControlStore:
                 lease_epoch=int(row["lease_epoch"]),
                 scheduled_at=row["scheduled_at"],
             )
+
+
+class _CursorBoundReplayControlStore(ControlStore):
+    """Map source identities to disposable replay rows on one transaction."""
+
+    def __init__(
+        self,
+        *,
+        base: ControlStore,
+        cursor: Any,
+        replay_run_id: str,
+        source_run_id: str,
+        mode: str,
+        targets: Sequence[Mapping[str, Any]],
+    ) -> None:
+        super().__init__(
+            base.db_uri, connection_factory=base._connection_factory
+        )
+        self._bound_cursor = cursor
+        self._replay_run_id = replay_run_id
+        self._source_run_id = source_run_id
+        self._mode = mode
+        self._targets = [dict(target) for target in targets]
+        self._target_by_source = {
+            target["target_id"]: target for target in self._targets
+        }
+        self._replay_target_by_source = {
+            target["target_id"]: make_replay_control_target_id(
+                replay_run_id, target["target_id"]
+            )
+            for target in self._targets
+        }
+        self._source_target_by_replay = {
+            replay_target: source_target
+            for source_target, replay_target in (
+                self._replay_target_by_source.items()
+            )
+        }
+        self._replay_refresh_by_source = {
+            target["logical_refresh_id"]: make_replay_control_refresh_id(
+                replay_run_id, target["logical_refresh_id"]
+            )
+            for target in self._targets
+        }
+        self._leases: dict[str, ObservationLease] = {}
+        self._guarded_targets: set[str] = set()
+        self.effects: Optional[dict[str, Any]] = None
+
+    @contextmanager
+    def _transaction(self, existing_cursor: Any = None):
+        if existing_cursor not in {None, self._bound_cursor}:
+            raise ControlStoreError(
+                "replay control transaction cannot change its cursor"
+            )
+        yield self._bound_cursor
+
+    def _source_target(self, target_id: object) -> str:
+        target = _text(target_id, "target_id")
+        if target not in self._replay_target_by_source:
+            raise StateConflict("replay control target is outside its cohort")
+        return target
+
+    def _source_refresh(self, logical_refresh_id: object) -> str:
+        refresh = _uuid(logical_refresh_id, "logical_refresh_id")
+        if refresh not in self._replay_refresh_by_source:
+            raise StateConflict(
+                "replay control logical refresh is outside its cohort"
+            )
+        return refresh
+
+    def claim_observation_processing(
+        self,
+        *,
+        logical_refresh_id: object,
+        target_id: object,
+        content_hash: object,
+        parser_version: object,
+        typed_parser_version: object,
+        stateful_parser_version: object,
+        lease_seconds: int = 3600,
+    ) -> Optional[ObservationLease]:
+        source_target = self._source_target(target_id)
+        source_refresh = self._source_refresh(logical_refresh_id)
+        descriptor = self._target_by_source[source_target]
+        if (
+            descriptor["logical_refresh_id"] != source_refresh
+            or descriptor["content_hash"]
+            != _text(content_hash, "content_hash")
+        ):
+            raise StateConflict("replay observation differs from its source")
+        return super().claim_observation_processing(
+            logical_refresh_id=self._replay_refresh_by_source[source_refresh],
+            target_id=self._replay_target_by_source[source_target],
+            content_hash=content_hash,
+            parser_version=parser_version,
+            typed_parser_version=typed_parser_version,
+            stateful_parser_version=stateful_parser_version,
+            lease_seconds=lease_seconds,
+        )
+
+    def _claim_all(self) -> None:
+        for target in self._targets:
+            lease = self.claim_observation_processing(
+                logical_refresh_id=target["logical_refresh_id"],
+                target_id=target["target_id"],
+                content_hash=target["content_hash"],
+                parser_version=target["parser_version"],
+                typed_parser_version=target["typed_parser_version"],
+                stateful_parser_version=target[
+                    "stateful_parser_version"
+                ],
+            )
+            if lease is None:
+                raise StateConflict(
+                    "disposable replay observation could not be claimed"
+                )
+            self._leases[target["logical_refresh_id"]] = lease
+
+    def observation_lease(
+        self, source_logical_refresh_id: object
+    ) -> ObservationLease:
+        source_refresh = self._source_refresh(source_logical_refresh_id)
+        try:
+            return self._leases[source_refresh]
+        except KeyError as exc:  # pragma: no cover - _claim_all is exhaustive
+            raise StateConflict("replay observation lease is missing") from exc
+
+    @contextmanager
+    def guard_latest_content(
+        self,
+        target_id: object,
+        content_hash: object,
+        logical_refresh_id: object,
+    ):
+        source_target = self._source_target(target_id)
+        source_refresh = self._source_refresh(logical_refresh_id)
+        descriptor = self._target_by_source[source_target]
+        if descriptor["logical_refresh_id"] != source_refresh:
+            raise StateConflict("replay latest guard differs from its source")
+        with super().guard_latest_content(
+            self._replay_target_by_source[source_target],
+            content_hash,
+            self._replay_refresh_by_source[source_refresh],
+        ) as latest:
+            if latest is True:
+                self._guarded_targets.add(source_target)
+            yield latest
+
+    def record_dataset_manifest(
+        self,
+        *,
+        target_id: object,
+        content_hash: object,
+        parser_version: object,
+        dataset: object,
+        availability: str,
+        parse_status: str,
+        persistence_status: str,
+        validation_status: str,
+        row_count: int = 0,
+        manifest_key: Optional[str] = None,
+        error_class: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        source_target = self._source_target(target_id)
+        super().record_dataset_manifest(
+            target_id=self._replay_target_by_source[source_target],
+            content_hash=content_hash,
+            parser_version=parser_version,
+            dataset=dataset,
+            availability=availability,
+            parse_status=parse_status,
+            persistence_status=persistence_status,
+            validation_status=validation_status,
+            row_count=row_count,
+            manifest_key=manifest_key,
+            error_class=error_class,
+            error_message=error_message,
+        )
+
+    def _capture_effects(self) -> dict[str, Any]:
+        replay_targets = set(self._source_target_by_replay)
+        self._bound_cursor.execute(
+            """
+            SELECT target.ordinal, target.target_id AS replay_target_id,
+                   target.logical_refresh_id,
+                   target.status AS target_status,
+                   frontier.page_kind, frontier.source_ids,
+                   frontier.state AS frontier_state,
+                   frontier.last_content_hash,
+                   observation.content_hash,
+                   observation.parser_version,
+                   observation.typed_parser_version,
+                   observation.stateful_parser_version,
+                   observation.status AS observation_status,
+                   observation.generic_status, observation.typed_status,
+                   observation.stateful_status,
+                   observation.validation_status
+            FROM fbref_control.run_target AS target
+            JOIN fbref_control.page_frontier AS frontier
+              ON frontier.target_id = target.target_id
+            JOIN fbref_control.observation_processing AS observation
+              ON observation.logical_refresh_id = target.logical_refresh_id
+            WHERE target.run_id = %s
+            ORDER BY target.ordinal, target.target_id
+            """,
+            (self._replay_run_id,),
+        )
+        rows = _fetchall(self._bound_cursor)
+        if len(rows) != len(self._targets) or {
+            str(row["replay_target_id"]) for row in rows
+        } != replay_targets:
+            raise StateConflict("replay target effects are incomplete")
+        targets = []
+        for row in rows:
+            replay_target = str(row["replay_target_id"])
+            source_target = self._source_target_by_replay[replay_target]
+            descriptor = self._target_by_source[source_target]
+            target_status = str(row["target_status"])
+            targets.append(
+                {
+                    "ordinal": int(row["ordinal"]),
+                    "target_id": source_target,
+                    "replay_target_id": replay_target,
+                    "source_logical_refresh_id": descriptor[
+                        "logical_refresh_id"
+                    ],
+                    "logical_refresh_id": str(row["logical_refresh_id"]),
+                    "status": target_status,
+                    "target_status": target_status,
+                    "page_kind": str(row["page_kind"]),
+                    "source_ids": _json_mapping(
+                        row.get("source_ids") or {}, "replay source_ids"
+                    ),
+                    "frontier_state": str(row["frontier_state"]),
+                    "last_content_hash": str(row["last_content_hash"]),
+                    "content_hash": str(row["content_hash"]),
+                    "parser_version": str(row["parser_version"]),
+                    "typed_parser_version": str(
+                        row["typed_parser_version"]
+                    ),
+                    "stateful_parser_version": str(
+                        row["stateful_parser_version"]
+                    ),
+                    "observation_status": str(row["observation_status"]),
+                    "generic_status": str(row["generic_status"]),
+                    "typed_status": str(row["typed_status"]),
+                    "stateful_status": str(row["stateful_status"]),
+                    "validation_status": str(row["validation_status"]),
+                    "evidence_class": descriptor["evidence_class"],
+                    "latest_guarded": source_target
+                    in self._guarded_targets,
+                }
+            )
+        self._bound_cursor.execute(
+            """
+            SELECT manifest.target_id AS replay_target_id,
+                   manifest.content_hash, manifest.parser_version,
+                   manifest.dataset, manifest.availability,
+                   manifest.parse_status, manifest.persistence_status,
+                   manifest.validation_status, manifest.row_count,
+                   CASE
+                     WHEN manifest.availability IN (
+                         'empty', 'restricted', 'not_applicable'
+                     ) THEN manifest.error_message
+                     ELSE NULL
+                   END AS empty_reason
+            FROM fbref_control.dataset_manifest AS manifest
+            WHERE manifest.target_id = ANY(%s)
+            ORDER BY manifest.target_id, manifest.parser_version,
+                     manifest.dataset
+            """,
+            (list(replay_targets),),
+        )
+        datasets = []
+        for row in _fetchall(self._bound_cursor):
+            replay_target = str(row["replay_target_id"])
+            source_target = self._source_target_by_replay[replay_target]
+            datasets.append(
+                {
+                    "ordinal": self._target_by_source[source_target][
+                        "ordinal"
+                    ],
+                    "target_id": source_target,
+                    "replay_target_id": replay_target,
+                    "content_hash": str(row["content_hash"]),
+                    "parser_version": str(row["parser_version"]),
+                    "dataset": str(row["dataset"]),
+                    "availability": str(row["availability"]),
+                    "parse_status": str(row["parse_status"]),
+                    "persistence_status": str(
+                        row["persistence_status"]
+                    ),
+                    "validation_status": str(row["validation_status"]),
+                    "row_count": int(row["row_count"]),
+                    "empty_reason": row.get("empty_reason"),
+                }
+            )
+        return build_replay_control_effects(
+            control_run_id=self._replay_run_id,
+            source_run_id=self._source_run_id,
+            mode=self._mode,
+            targets=targets,
+            datasets=datasets,
+        )

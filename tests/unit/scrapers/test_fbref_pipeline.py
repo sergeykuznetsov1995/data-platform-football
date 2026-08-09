@@ -440,6 +440,49 @@ class FakeTypedAdapter:
         self.writer = writer
 
 
+class FakeReplayControl:
+    def __init__(self, run_id, source_run_id, mode, targets):
+        self.run_id = str(run_id)
+        self.source_run_id = str(source_run_id)
+        self.mode = str(mode)
+        self.targets = [dict(target) for target in targets]
+        self.guards = []
+        self.manifests = []
+        self.completed = []
+
+    @contextmanager
+    def guard_latest_content(
+        self, target_id, content_hash, logical_refresh_id
+    ):
+        self.guards.append(
+            (str(target_id), str(content_hash), str(logical_refresh_id))
+        )
+        yield True
+
+    def observation_lease(self, logical_refresh_id):
+        target = next(
+            item
+            for item in self.targets
+            if item["logical_refresh_id"] == str(logical_refresh_id)
+        )
+        return ObservationLease(
+            logical_refresh_id=str(logical_refresh_id),
+            target_id=target["target_id"],
+            content_hash=target["content_hash"],
+            parser_version=target["parser_version"],
+            typed_parser_version=target["typed_parser_version"],
+            stateful_parser_version=target["stateful_parser_version"],
+            claim_token=str(uuid.uuid4()),
+            lease_expires_at=NOW + timedelta(hours=1),
+        )
+
+    def record_dataset_manifest(self, **kwargs):
+        self.manifests.append(dict(kwargs))
+
+    def complete_observation_processing(self, lease, **kwargs):
+        self.completed.append((lease, dict(kwargs)))
+
+
 class FakeControl:
     def __init__(self, raw_store=None):
         self.raw_store = raw_store
@@ -463,6 +506,7 @@ class FakeControl:
         self.heartbeats = []
         self.claim_calls = []
         self.observation_claim_calls = []
+        self.replay_control_runs = []
         self.eligible_competition_calls = 0
         self.run = {
             "run_type": "current",
@@ -645,6 +689,16 @@ class FakeControl:
     def guard_publication_lock(self, run_id, *, source="fbref"):
         assert source == "fbref"
         yield {"owner_run_id": run_id, "active": True}
+
+    @contextmanager
+    def replay_control_transaction(
+        self, *, replay_run_id, source_run_id, mode, targets
+    ):
+        replay = FakeReplayControl(
+            replay_run_id, source_run_id, mode, targets
+        )
+        self.replay_control_runs.append(replay)
+        yield replay
 
     def close_clearance_session(self, session_id, **kwargs):
         self.events.append("session_close")
@@ -6302,40 +6356,40 @@ def test_acceptance_replay_reprocesses_already_observed_source_matches(
         "classification": "league:club",
         "metadata": {},
     }
-    match_id = "0701e218"
-    target = PageTarget(
-        source="fbref",
-        page_kind="match",
-        target_id=f"fbref:match:{match_id}",
-        canonical_url=f"https://fbref.com/en/matches/{match_id}/x",
-        source_ids={
-            "competition_id": "9",
-            "season_id": "2025-2026",
-            "match_id": match_id,
-        },
-    )
     html = gzip.decompress(MATCH_FIXTURE.read_bytes()).decode("utf-8")
-    refresh, record = _commit_for_parse(raw, target, html)
-    control.fetches = [
-        {
-            "target_id": record.target_id,
-            "page_kind": record.page_kind,
-            "logical_refresh_id": refresh,
-            "content_hash": record.content_hash,
-        }
-    ]
-    control.observations[
-        (
-            refresh,
-            PAGE_DOCUMENT_VERSION,
-            TYPED_BRONZE_PARSER_VERSION,
-            DISCOVERY_PARSER_VERSION,
+    for match_id in ("0701e218", "1701e218"):
+        target = PageTarget(
+            source="fbref",
+            page_kind="match",
+            target_id=f"fbref:match:{match_id}",
+            canonical_url=f"https://fbref.com/en/matches/{match_id}/x",
+            source_ids={
+                "competition_id": "9",
+                "season_id": "2025-2026",
+                "match_id": match_id,
+            },
         )
-    ] = {"status": "succeeded"}
+        refresh, record = _commit_for_parse(raw, target, html)
+        control.fetches.append(
+            {
+                "target_id": record.target_id,
+                "page_kind": record.page_kind,
+                "logical_refresh_id": refresh,
+                "content_hash": record.content_hash,
+            }
+        )
+        control.observations[
+            (
+                refresh,
+                PAGE_DOCUMENT_VERSION,
+                TYPED_BRONZE_PARSER_VERSION,
+                DISCOVERY_PARSER_VERSION,
+            )
+        ] = {"status": "succeeded"}
     source_run_id = str(uuid.uuid4())
     source = _accepted_nonpublishing_source(source_run_id)
     source["metadata"]["bronze_acceptance"]["page_kind_counts"] = {
-        "match": 1
+        "match": 2
     }
     control.get_run = lambda run_id: (
         source if str(run_id) == source_run_id else control.run
@@ -6367,20 +6421,38 @@ def test_acceptance_replay_reprocesses_already_observed_source_matches(
         settings=PipelineSettings.acceptance_replay(shard_size=25),
     )
 
-    assert sequential.cohort_size == sequential.parsed == 1
-    assert batch.cohort_size == batch.parsed == 1
+    assert sequential.cohort_size == sequential.parsed == 2
+    assert batch.cohort_size == batch.parsed == 2
     assert control.observation_claim_calls == []
     assert control.manifests == []
+    assert [item.mode for item in control.replay_control_runs] == [
+        "sequential",
+        "batch",
+    ]
+    assert [len(item.guards) for item in control.replay_control_runs] == [2, 2]
+    assert [len(item.completed) for item in control.replay_control_runs] == [
+        2,
+        2,
+    ]
+    for replay in control.replay_control_runs:
+        datasets = {item["dataset"] for item in replay.manifests}
+        assert "__page__" in datasets
+        assert "typed:__complete__" in datasets
+        assert {f"typed:{name}" for name in MATCH_DATASET_TABLES} <= datasets
     assert [item[1]["run_id"] for item in generic.pages] == [
         sequential_run_id,
+        sequential_run_id,
+        batch_run_id,
         batch_run_id,
     ]
     assert [item[2]["run_id"] for item in typed.calls] == [
         sequential_run_id,
+        sequential_run_id,
+        batch_run_id,
         batch_run_id,
     ]
-    assert generic.batch_sizes == [1]
-    assert typed.batch_sizes == [1]
+    assert generic.batch_sizes == [2]
+    assert typed.batch_sizes == [2]
 
 
 @pytest.mark.parametrize("latest", [False, True, None])

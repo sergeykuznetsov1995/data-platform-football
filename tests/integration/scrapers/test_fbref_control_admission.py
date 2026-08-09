@@ -13,8 +13,8 @@ from urllib.parse import urlsplit, urlunsplit
 import pytest
 
 from scrapers.fbref.control import ControlStore, StateConflict
-from scripts.research.bench_fbref_persistence import (
-    _isolated_replay_control_evidence,
+from scrapers.fbref.control.replay_effects import (
+    normalize_replay_control_effects,
 )
 
 
@@ -104,112 +104,243 @@ def test_acceptance_replay_control_transactions_are_disposable_and_equal(
     isolated_postgres_uri,
 ):
     store = ControlStore(isolated_postgres_uri)
-    source = {
-        "targets": [
-            {
-                "ordinal": 0,
-                "target_id": "fbref:match:control-probe",
-                "logical_refresh_id": "source-refresh-control-probe",
-                "page_kind": "match",
-                "source_ids": {"match_id": "control-probe"},
-                "content_hash": "a" * 64,
-                "parser_version": "generic-v1",
-                "typed_parser_version": "typed-v1",
-                "stateful_parser_version": "stateful-v1",
-                "typed_status": "succeeded",
-                "stateful_status": "skipped",
-                "evidence_class": "full_match",
-            }
-        ],
-        "datasets": [
-            {
-                "target_id": "fbref:match:control-probe",
-                "content_hash": "a" * 64,
-                "parser_version": "typed-v1",
-                "dataset": f"typed:{dataset}",
-                "availability": "available",
-                "parse_status": "succeeded",
-                "persistence_status": "succeeded",
-                "validation_status": "succeeded",
-                "row_count": 1,
-                "empty_reason": None,
-            }
-            for dataset in (
-                "shot_events",
-                "match_events",
-                "lineups",
-                "match_team_stats",
-                "match_managers",
-                "match_officials",
-                "match_keeper_stats",
-                "match_player_stats",
+    source_run_id = str(uuid.uuid4())
+    sequential_run_id = str(uuid.uuid4())
+    batch_run_id = str(uuid.uuid4())
+    targets = []
+    with store._transaction() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO fbref_control.crawl_run (
+                run_id, run_type, status, request_limit, byte_limit,
+                metadata, started_at, finished_at
+            ) VALUES
+                (%s, 'current', 'succeeded', 100, 52428800,
+                 '{}'::jsonb, clock_timestamp(), clock_timestamp()),
+                (%s, 'replay', 'running', 0, 0, %s::jsonb,
+                 clock_timestamp(), NULL),
+                (%s, 'replay', 'running', 0, 0, %s::jsonb,
+                 clock_timestamp(), NULL)
+            """,
+            (
+                source_run_id,
+                sequential_run_id,
+                json.dumps(
+                    {
+                        "acceptance_replay": True,
+                        "acceptance_replay_source_run_id": source_run_id,
+                        "acceptance_persistence_mode": "sequential",
+                    }
+                ),
+                batch_run_id,
+                json.dumps(
+                    {
+                        "acceptance_replay": True,
+                        "acceptance_replay_source_run_id": source_run_id,
+                        "acceptance_persistence_mode": "batch",
+                    }
+                ),
+            ),
+        )
+        for ordinal in range(2):
+            match_id = f"control-probe-{ordinal}"
+            target_id = f"fbref:match:{match_id}"
+            refresh_id = str(uuid.uuid4())
+            attempt_id = str(uuid.uuid4())
+            claim_token = str(uuid.uuid4())
+            content_hash = f"{ordinal + 1:x}" * 64
+            source_ids = {"match_id": match_id}
+            cursor.execute(
+                """
+                INSERT INTO fbref_control.page_frontier (
+                    target_id, source, page_kind, canonical_url, source_ids,
+                    refresh_policy, state, lease_epoch, last_fetched_at,
+                    last_http_status, last_content_hash
+                ) VALUES (
+                    %s, 'fbref', 'match', %s, %s::jsonb, 'daily', 'fetched',
+                    1, clock_timestamp(), 200, %s
+                )
+                """,
+                (
+                    target_id,
+                    f"https://fbref.test/matches/{match_id}",
+                    json.dumps(source_ids),
+                    content_hash,
+                ),
             )
-        ],
-    }
+            cursor.execute(
+                """
+                INSERT INTO fbref_control.run_target (
+                    run_id, target_id, logical_refresh_id, ordinal, status
+                ) VALUES (%s, %s, %s, %s, 'succeeded')
+                """,
+                (source_run_id, target_id, refresh_id, ordinal),
+            )
+            cursor.execute(
+                """
+                INSERT INTO fbref_control.fetch_attempt (
+                    attempt_id, run_id, target_id, logical_refresh_id,
+                    attempt_number, claim_token, lease_epoch, status,
+                    http_status, content_hash, raw_manifest_key, finished_at
+                ) VALUES (
+                    %s, %s, %s, %s, 1, %s, 1, 'succeeded', 200, %s,
+                    %s, clock_timestamp()
+                )
+                """,
+                (
+                    attempt_id,
+                    source_run_id,
+                    target_id,
+                    refresh_id,
+                    claim_token,
+                    content_hash,
+                    f"raw://{refresh_id}",
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO fbref_control.observation_processing (
+                    logical_refresh_id, parser_version,
+                    typed_parser_version, stateful_parser_version,
+                    target_id, content_hash, status, generic_status,
+                    typed_status, stateful_status, validation_status,
+                    completed_at
+                ) VALUES (
+                    %s, 'generic-v1', 'typed-v1', 'stateful-v1', %s, %s,
+                    'succeeded', 'succeeded', 'succeeded', 'skipped',
+                    'succeeded', clock_timestamp()
+                )
+                """,
+                (refresh_id, target_id, content_hash),
+            )
+            cursor.execute(
+                """
+                INSERT INTO fbref_control.dataset_manifest (
+                    target_id, content_hash, parser_version, dataset,
+                    availability, parse_status, persistence_status,
+                    validation_status, row_count, completed_at
+                ) VALUES (
+                    %s, %s, 'typed-v1', 'typed:source_sentinel',
+                    'available', 'succeeded', 'succeeded', 'succeeded', 1,
+                    clock_timestamp()
+                )
+                """,
+                (target_id, content_hash),
+            )
+            targets.append(
+                {
+                    "ordinal": ordinal,
+                    "target_id": target_id,
+                    "logical_refresh_id": refresh_id,
+                    "page_kind": "match",
+                    "source_ids": source_ids,
+                    "canonical_url": f"https://fbref.test/matches/{match_id}",
+                    "content_hash": content_hash,
+                    "parser_version": "generic-v1",
+                    "typed_parser_version": "typed-v1",
+                    "stateful_parser_version": "stateful-v1",
+                    "evidence_class": "full_match",
+                }
+            )
 
-    def durable_counts():
-        counts = {}
+    def durable_snapshot():
+        snapshot = {}
         with store._transaction() as cursor:
             for table in (
                 "page_frontier",
                 "run_target",
+                "fetch_attempt",
                 "observation_processing",
                 "dataset_manifest",
             ):
                 cursor.execute(
-                    f"SELECT count(*) AS rows FROM fbref_control.{table}"
+                    f"SELECT to_jsonb(source_row) AS value "
+                    f"FROM fbref_control.{table} AS source_row "
+                    "ORDER BY to_jsonb(source_row)::text"
                 )
-                row = cursor.fetchone()
-                counts[table] = int(
-                    row["rows"] if isinstance(row, dict) else row[0]
+                snapshot[table] = [row["value"] for row in cursor.fetchall()]
+        return snapshot
+
+    def execute(replay_run_id, mode):
+        with store.replay_control_transaction(
+            replay_run_id=replay_run_id,
+            source_run_id=source_run_id,
+            mode=mode,
+            targets=targets,
+        ) as replay:
+            for target in targets:
+                with replay.guard_latest_content(
+                    target["target_id"],
+                    target["content_hash"],
+                    target["logical_refresh_id"],
+                ) as latest:
+                    assert latest is True
+                for dataset in (
+                    "shot_events",
+                    "match_events",
+                    "lineups",
+                    "match_team_stats",
+                    "match_managers",
+                    "match_officials",
+                    "match_keeper_stats",
+                    "match_player_stats",
+                ):
+                    replay.record_dataset_manifest(
+                        target_id=target["target_id"],
+                        content_hash=target["content_hash"],
+                        parser_version="typed-v1",
+                        dataset=f"typed:{dataset}",
+                        availability="available",
+                        parse_status="succeeded",
+                        persistence_status="succeeded",
+                        validation_status="succeeded",
+                        row_count=1,
+                    )
+                replay.complete_observation_processing(
+                    replay.observation_lease(target["logical_refresh_id"]),
+                    typed_status="succeeded",
+                    stateful_status="skipped",
                 )
-        return counts
+        return normalize_replay_control_effects(replay.effects)
 
-    before = durable_counts()
-    sequential_run_id = str(uuid.uuid4())
-    batch_run_id = str(uuid.uuid4())
-    sequential = _isolated_replay_control_evidence(
-        store,
-        replay_run_id=sequential_run_id,
-        source_run_id=str(uuid.uuid4()),
-        mode="sequential",
-        source_evidence=source,
-    )
-    batch = _isolated_replay_control_evidence(
-        store,
-        replay_run_id=batch_run_id,
-        source_run_id=str(uuid.uuid4()),
-        mode="batch",
-        source_evidence=source,
-    )
+    before = durable_snapshot()
+    sequential = execute(sequential_run_id, "sequential")
+    batch = execute(batch_run_id, "batch")
 
-    def normalized(evidence):
-        targets = [
-            {
-                key: value
-                for key, value in item.items()
-                if key not in {"replay_target_id", "logical_refresh_id"}
-            }
-            for item in evidence["targets"]
-        ]
-        datasets = [
-            {
-                key: value
-                for key, value in item.items()
-                if key != "replay_target_id"
-            }
-            for item in evidence["datasets"]
-        ]
-        return {"targets": targets, "datasets": datasets}
+    def normalized_rows(evidence):
+        return {
+            "targets": [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {
+                        "replay_target_id",
+                        "logical_refresh_id",
+                    }
+                }
+                for item in evidence["targets"]
+            ],
+            "datasets": [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key != "replay_target_id"
+                }
+                for item in evidence["datasets"]
+            ],
+        }
 
-    assert normalized(sequential) == normalized(batch)
-    assert sequential["targets"][0]["replay_target_id"].startswith(
-        f"fbref:acceptance-replay:{sequential_run_id}:"
-    )
-    assert batch["targets"][0]["replay_target_id"].startswith(
-        f"fbref:acceptance-replay:{batch_run_id}:"
-    )
-    assert durable_counts() == before
+    assert normalized_rows(sequential) == normalized_rows(batch)
+    assert durable_snapshot() == before
+    with store._transaction() as cursor:
+        cursor.execute(
+            """
+            SELECT count(*) AS rows
+            FROM fbref_control.page_frontier
+            WHERE target_id LIKE 'fbref:acceptance-replay:%'
+            """
+        )
+        assert int(cursor.fetchone()["rows"]) == 0
 
 
 def test_current_matches_are_admitted_before_older_enrichment_backlog():

@@ -37,6 +37,9 @@ from scrapers.fbref.bronze import (  # noqa: E402
     TABLE_CELLS_TABLE,
     TABLE_INVENTORY_TABLE,
 )
+from scrapers.fbref.control.replay_effects import (  # noqa: E402
+    normalize_replay_control_effects,
+)
 from scrapers.fbref.page_document import parse_page_document  # noqa: E402
 from scrapers.fbref.typed_bronze import (  # noqa: E402
     FBrefTypedBronzeWriter,
@@ -1112,509 +1115,8 @@ def _stable_sha256(value: Any) -> str:
     return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
 
 
-def _cursor_mapping_rows(cursor: Any) -> list[dict[str, Any]]:
-    rows = list(cursor.fetchall() or ())
-    if not rows:
-        return []
-    if isinstance(rows[0], Mapping):
-        return [dict(row) for row in rows]
-    names = [str(item[0]) for item in cursor.description]
-    return [dict(zip(names, row)) for row in rows]
-
-
-def _direct_processing_evidence(
-    control: Any, evidence_run_id: str
-) -> Mapping[str, Any] | None:
-    """Read immutable source observations that seed an isolated replay."""
-
-    transaction = getattr(control, "_transaction", None)
-    if not callable(transaction):
-        return None
-    with transaction() as cursor:
-        cursor.execute(
-            """
-            WITH ranked AS (
-                SELECT target.ordinal, target.target_id,
-                       target.logical_refresh_id,
-                       target.status AS target_status,
-                       frontier.page_kind, frontier.source_ids,
-                       frontier.state AS frontier_state,
-                       frontier.last_content_hash,
-                       observed.content_hash, observed.parser_version,
-                       observed.typed_parser_version,
-                       observed.stateful_parser_version,
-                       observed.status AS observation_status,
-                       observed.generic_status, observed.typed_status,
-                       observed.stateful_status, observed.validation_status,
-                       row_number() OVER (
-                           PARTITION BY target.logical_refresh_id
-                           ORDER BY observed.completed_at DESC NULLS LAST,
-                                    observed.updated_at DESC NULLS LAST,
-                                    observed.parser_version DESC,
-                                    observed.typed_parser_version DESC
-                       ) AS observation_rank
-                FROM fbref_control.run_target AS target
-                JOIN fbref_control.page_frontier AS frontier
-                  ON frontier.target_id = target.target_id
-                LEFT JOIN fbref_control.observation_processing AS observed
-                  ON observed.logical_refresh_id = target.logical_refresh_id
-                WHERE target.run_id = %s::uuid
-            )
-            SELECT * FROM ranked
-            WHERE observation_rank = 1
-            ORDER BY ordinal
-            """,
-            (evidence_run_id,),
-        )
-        observations = _cursor_mapping_rows(cursor)
-        cursor.execute(
-            """
-            WITH ranked AS (
-                SELECT target.ordinal, target.target_id,
-                       target.logical_refresh_id,
-                       observed.content_hash, observed.parser_version,
-                       observed.typed_parser_version,
-                       observed.stateful_parser_version,
-                       row_number() OVER (
-                           PARTITION BY target.logical_refresh_id
-                           ORDER BY observed.completed_at DESC NULLS LAST,
-                                    observed.updated_at DESC NULLS LAST,
-                                    observed.parser_version DESC,
-                                    observed.typed_parser_version DESC
-                       ) AS observation_rank
-                FROM fbref_control.run_target AS target
-                JOIN fbref_control.observation_processing AS observed
-                  ON observed.logical_refresh_id = target.logical_refresh_id
-                WHERE target.run_id = %s::uuid
-            )
-            SELECT ranked.ordinal, ranked.target_id,
-                   ranked.logical_refresh_id, ranked.content_hash,
-                   manifest.parser_version, manifest.dataset,
-                   manifest.availability, manifest.parse_status,
-                   manifest.persistence_status, manifest.validation_status,
-                   manifest.row_count,
-                   CASE
-                       WHEN manifest.availability IN (
-                           'empty', 'restricted', 'not_applicable'
-                       )
-                       THEN manifest.error_message
-                   END AS empty_reason
-            FROM ranked
-            JOIN fbref_control.dataset_manifest AS manifest
-              ON manifest.target_id = ranked.target_id
-             AND manifest.content_hash = ranked.content_hash
-             AND manifest.parser_version IN (
-                 ranked.parser_version, ranked.typed_parser_version,
-                 ranked.stateful_parser_version
-             )
-            WHERE ranked.observation_rank = 1
-            ORDER BY ranked.ordinal, manifest.parser_version,
-                     manifest.dataset
-            """,
-            (evidence_run_id,),
-        )
-        datasets = _cursor_mapping_rows(cursor)
-    return {"targets": observations, "datasets": datasets}
-
-
-def _isolated_replay_control_evidence(
-    control: Any,
-    *,
-    replay_run_id: str,
-    source_run_id: str,
-    mode: str,
-    source_evidence: Mapping[str, Any],
-) -> Mapping[str, Any]:
-    """Apply replay completion to disposable PostgreSQL control targets.
-
-    The frozen source rows are inputs only.  Every target, observation and
-    manifest mutation below is confined to ``pg_temp`` and disappears on
-    commit.  Sequential and batch therefore exercise distinct transactional
-    control paths without touching production fences.
-    """
-
-    normalized_mode = str(mode).strip().casefold()
-    if normalized_mode not in {"sequential", "batch"}:
-        raise ValueError("acceptance control replay mode is invalid")
-    source_targets = source_evidence.get("targets")
-    source_datasets = source_evidence.get("datasets")
-    if not isinstance(source_targets, Sequence) or isinstance(
-        source_targets, (str, bytes)
-    ):
-        raise ValueError("source control targets are missing")
-    if not isinstance(source_datasets, Sequence) or isinstance(
-        source_datasets, (str, bytes)
-    ):
-        raise ValueError("source control manifests are missing")
-
-    test_transaction = getattr(
-        control, "replay_control_transaction_evidence", None
-    )
-    if callable(test_transaction):
-        evidence = test_transaction(
-            replay_run_id=str(replay_run_id),
-            source_run_id=str(source_run_id),
-            mode=normalized_mode,
-            targets=source_targets,
-            datasets=source_datasets,
-        )
-        if not isinstance(evidence, Mapping):
-            raise ValueError("isolated replay control evidence is invalid")
-        return evidence
-
-    transaction = getattr(control, "_transaction", None)
-    if not callable(transaction):
-        raise ValueError(
-            "isolated replay control transaction is unavailable"
-        )
-
-    target_payload = []
-    target_defaults: dict[str, dict[str, str]] = {}
-    for position, item in enumerate(source_targets):
-        if not isinstance(item, Mapping):
-            raise ValueError("source control target is invalid")
-        target_id = str(item.get("target_id") or "")
-        content_hash = str(item.get("content_hash") or "")
-        parser_version = str(item.get("parser_version") or "")
-        typed_parser_version = str(
-            item.get("typed_parser_version") or ""
-        )
-        stateful_parser_version = str(
-            item.get("stateful_parser_version") or ""
-        )
-        target_defaults[target_id] = {
-            "content_hash": content_hash,
-            "parser_version": parser_version,
-            "typed_parser_version": typed_parser_version,
-            "stateful_parser_version": stateful_parser_version,
-        }
-        target_payload.append(
-            {
-                "ordinal": int(item.get("ordinal", position)),
-                "target_id": target_id,
-                "logical_refresh_id": str(
-                    item.get("logical_refresh_id") or ""
-                ),
-                "page_kind": str(item.get("page_kind") or ""),
-                "source_ids": (
-                    dict(item.get("source_ids") or {})
-                    if isinstance(item.get("source_ids"), Mapping)
-                    else {}
-                ),
-                "content_hash": content_hash,
-                "parser_version": parser_version,
-                "typed_parser_version": typed_parser_version,
-                "stateful_parser_version": stateful_parser_version,
-                "typed_status": str(item.get("typed_status") or ""),
-                "stateful_status": str(
-                    item.get("stateful_status") or ""
-                ),
-                "evidence_class": (
-                    None
-                    if item.get("evidence_class") is None
-                    else str(item.get("evidence_class"))
-                ),
-            }
-        )
-    dataset_payload = []
-    for item in source_datasets:
-        if not isinstance(item, Mapping):
-            raise ValueError("source control manifest is invalid")
-        target_id = str(item.get("target_id") or "")
-        defaults = target_defaults.get(target_id, {})
-        dataset = str(item.get("dataset") or "")
-        parser_version = str(item.get("parser_version") or "")
-        if not parser_version:
-            parser_version = str(
-                defaults.get(
-                    (
-                        "typed_parser_version"
-                        if dataset.startswith("typed:")
-                        else "stateful_parser_version"
-                        if dataset.startswith("stateful:")
-                        else "parser_version"
-                    ),
-                    "",
-                )
-            )
-        dataset_payload.append(
-            {
-                "target_id": target_id,
-                "content_hash": str(
-                    item.get("content_hash")
-                    or defaults.get("content_hash")
-                    or ""
-                ),
-                "parser_version": parser_version,
-                "dataset": dataset,
-                "availability": str(item.get("availability") or ""),
-                "parse_status": str(item.get("parse_status") or ""),
-                "persistence_status": str(
-                    item.get("persistence_status") or ""
-                ),
-                "validation_status": str(
-                    item.get("validation_status") or ""
-                ),
-                "row_count": int(item.get("row_count") or 0),
-                "empty_reason": (
-                    None
-                    if item.get("empty_reason") is None
-                    else str(item.get("empty_reason"))
-                ),
-            }
-        )
-
-    target_json = json.dumps(
-        target_payload, default=str, sort_keys=True, separators=(",", ":")
-    )
-    dataset_json = json.dumps(
-        dataset_payload, default=str, sort_keys=True, separators=(",", ":")
-    )
-    with transaction() as cursor:
-        cursor.execute(
-            """
-            CREATE TEMP TABLE fbref_acceptance_control_target (
-                ordinal bigint NOT NULL,
-                source_target_id text PRIMARY KEY,
-                replay_target_id text UNIQUE NOT NULL,
-                source_logical_refresh_id text NOT NULL,
-                replay_logical_refresh_id text UNIQUE NOT NULL,
-                page_kind text NOT NULL,
-                source_ids jsonb NOT NULL,
-                content_hash text NOT NULL,
-                parser_version text NOT NULL,
-                typed_parser_version text NOT NULL,
-                stateful_parser_version text NOT NULL,
-                desired_typed_status text NOT NULL,
-                desired_stateful_status text NOT NULL,
-                evidence_class text,
-                target_status text NOT NULL DEFAULT 'pending',
-                frontier_state text NOT NULL DEFAULT 'queued',
-                last_content_hash text
-            ) ON COMMIT DROP
-            """
-        )
-        cursor.execute(
-            """
-            CREATE TEMP TABLE fbref_acceptance_control_observation (
-                replay_logical_refresh_id text PRIMARY KEY,
-                replay_target_id text UNIQUE NOT NULL,
-                content_hash text NOT NULL,
-                parser_version text NOT NULL,
-                typed_parser_version text NOT NULL,
-                stateful_parser_version text NOT NULL,
-                status text NOT NULL DEFAULT 'processing',
-                generic_status text NOT NULL DEFAULT 'pending',
-                typed_status text NOT NULL DEFAULT 'pending',
-                stateful_status text NOT NULL DEFAULT 'pending',
-                validation_status text NOT NULL DEFAULT 'pending'
-            ) ON COMMIT DROP
-            """
-        )
-        cursor.execute(
-            """
-            CREATE TEMP TABLE fbref_acceptance_control_manifest_seed (
-                source_target_id text NOT NULL,
-                content_hash text NOT NULL,
-                parser_version text NOT NULL,
-                dataset text NOT NULL,
-                availability text NOT NULL,
-                parse_status text NOT NULL,
-                persistence_status text NOT NULL,
-                validation_status text NOT NULL,
-                row_count bigint NOT NULL,
-                empty_reason text,
-                PRIMARY KEY (
-                    source_target_id, content_hash, parser_version, dataset
-                )
-            ) ON COMMIT DROP
-            """
-        )
-        cursor.execute(
-            """
-            CREATE TEMP TABLE fbref_acceptance_control_manifest (
-                source_target_id text NOT NULL,
-                replay_target_id text NOT NULL,
-                content_hash text NOT NULL,
-                parser_version text NOT NULL,
-                dataset text NOT NULL,
-                availability text NOT NULL,
-                parse_status text NOT NULL,
-                persistence_status text NOT NULL,
-                validation_status text NOT NULL,
-                row_count bigint NOT NULL,
-                empty_reason text,
-                PRIMARY KEY (
-                    replay_target_id, content_hash, parser_version, dataset
-                )
-            ) ON COMMIT DROP
-            """
-        )
-        cursor.execute(
-            """
-            INSERT INTO pg_temp.fbref_acceptance_control_target (
-                ordinal, source_target_id, replay_target_id,
-                source_logical_refresh_id, replay_logical_refresh_id,
-                page_kind, source_ids, content_hash, parser_version,
-                typed_parser_version, stateful_parser_version,
-                desired_typed_status, desired_stateful_status,
-                evidence_class
-            )
-            SELECT source.ordinal, source.target_id,
-                   'fbref:acceptance-replay:' || %s || ':'
-                       || source.target_id,
-                   source.logical_refresh_id,
-                   %s || ':' || source.logical_refresh_id,
-                   source.page_kind, source.source_ids, source.content_hash,
-                   source.parser_version, source.typed_parser_version,
-                   source.stateful_parser_version, source.typed_status,
-                   source.stateful_status, source.evidence_class
-            FROM jsonb_to_recordset(%s::jsonb) AS source(
-                ordinal bigint, target_id text, logical_refresh_id text,
-                page_kind text, source_ids jsonb, content_hash text,
-                parser_version text, typed_parser_version text,
-                stateful_parser_version text, typed_status text,
-                stateful_status text, evidence_class text
-            )
-            """,
-            (str(replay_run_id), str(replay_run_id), target_json),
-        )
-        cursor.execute(
-            """
-            INSERT INTO pg_temp.fbref_acceptance_control_observation (
-                replay_logical_refresh_id, replay_target_id, content_hash,
-                parser_version, typed_parser_version,
-                stateful_parser_version
-            )
-            SELECT replay_logical_refresh_id, replay_target_id, content_hash,
-                   parser_version, typed_parser_version,
-                   stateful_parser_version
-            FROM pg_temp.fbref_acceptance_control_target
-            """
-        )
-        cursor.execute(
-            """
-            INSERT INTO pg_temp.fbref_acceptance_control_manifest_seed (
-                source_target_id, content_hash, parser_version, dataset,
-                availability, parse_status, persistence_status,
-                validation_status, row_count, empty_reason
-            )
-            SELECT source.target_id, source.content_hash,
-                   source.parser_version, source.dataset,
-                   source.availability, source.parse_status,
-                   source.persistence_status, source.validation_status,
-                   source.row_count, source.empty_reason
-            FROM jsonb_to_recordset(%s::jsonb) AS source(
-                target_id text, content_hash text, parser_version text,
-                dataset text, availability text, parse_status text,
-                persistence_status text, validation_status text,
-                row_count bigint, empty_reason text
-            )
-            """,
-            (dataset_json,),
-        )
-
-        target_ids = [item["target_id"] for item in target_payload]
-        completion_target_ids = (
-            target_ids if normalized_mode == "sequential" else [None]
-        )
-        for target_id in completion_target_ids:
-            target_predicate = (
-                " AND target.source_target_id = %s"
-                if target_id is not None
-                else ""
-            )
-            params = () if target_id is None else (target_id,)
-            cursor.execute(
-                """
-                UPDATE pg_temp.fbref_acceptance_control_observation
-                       AS observation
-                SET status = 'succeeded', generic_status = 'succeeded',
-                    typed_status = target.desired_typed_status,
-                    stateful_status = target.desired_stateful_status,
-                    validation_status = 'succeeded'
-                FROM pg_temp.fbref_acceptance_control_target AS target
-                WHERE observation.replay_target_id = target.replay_target_id
-                """
-                + target_predicate,
-                params,
-            )
-            cursor.execute(
-                """
-                INSERT INTO pg_temp.fbref_acceptance_control_manifest (
-                    source_target_id, replay_target_id, content_hash,
-                    parser_version, dataset, availability, parse_status,
-                    persistence_status, validation_status, row_count,
-                    empty_reason
-                )
-                SELECT seed.source_target_id, target.replay_target_id,
-                       seed.content_hash, seed.parser_version, seed.dataset,
-                       seed.availability, seed.parse_status,
-                       seed.persistence_status, seed.validation_status,
-                       seed.row_count, seed.empty_reason
-                FROM pg_temp.fbref_acceptance_control_manifest_seed AS seed
-                JOIN pg_temp.fbref_acceptance_control_target AS target
-                  ON target.source_target_id = seed.source_target_id
-                WHERE true
-                """
-                + target_predicate,
-                params,
-            )
-            cursor.execute(
-                """
-                UPDATE pg_temp.fbref_acceptance_control_target AS target
-                SET target_status = 'succeeded', frontier_state = 'fetched',
-                    last_content_hash = target.content_hash
-                WHERE true
-                """
-                + target_predicate,
-                params,
-            )
-
-        cursor.execute(
-            """
-            SELECT target.ordinal,
-                   target.source_target_id AS target_id,
-                   target.replay_target_id,
-                   target.replay_logical_refresh_id AS logical_refresh_id,
-                   target.target_status AS status, target.target_status,
-                   target.page_kind, target.source_ids,
-                   target.frontier_state, target.last_content_hash,
-                   target.content_hash, observation.parser_version,
-                   observation.typed_parser_version,
-                   observation.stateful_parser_version,
-                   observation.status AS observation_status,
-                   observation.generic_status, observation.typed_status,
-                   observation.stateful_status,
-                   observation.validation_status, target.evidence_class
-            FROM pg_temp.fbref_acceptance_control_target AS target
-            JOIN pg_temp.fbref_acceptance_control_observation AS observation
-              ON observation.replay_target_id = target.replay_target_id
-            ORDER BY target.ordinal
-            """
-        )
-        replay_targets = _cursor_mapping_rows(cursor)
-        cursor.execute(
-            """
-            SELECT target.ordinal, manifest.source_target_id AS target_id,
-                   manifest.replay_target_id, manifest.content_hash,
-                   manifest.parser_version, manifest.dataset,
-                   manifest.availability, manifest.parse_status,
-                   manifest.persistence_status, manifest.validation_status,
-                   manifest.row_count, manifest.empty_reason
-            FROM pg_temp.fbref_acceptance_control_manifest AS manifest
-            JOIN pg_temp.fbref_acceptance_control_target AS target
-              ON target.replay_target_id = manifest.replay_target_id
-            ORDER BY target.ordinal, manifest.parser_version,
-                     manifest.dataset
-            """
-        )
-        replay_datasets = _cursor_mapping_rows(cursor)
-    return {"targets": replay_targets, "datasets": replay_datasets}
-
-
 def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
-    """Exercise and read disposable replay control completion state."""
+    """Read run-bound effects captured by the actual replay control path."""
 
     run = control.get_run(run_id)
     summary = control.get_run_summary(run_id)
@@ -1629,13 +1131,6 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
     evidence_run_id = str(
         metadata.get("acceptance_replay_source_run_id") or run_id
     )
-    source_evidence = _direct_processing_evidence(control, evidence_run_id)
-    if source_evidence is None:
-        source_evidence = control.get_acceptance_run_evidence(
-            evidence_run_id
-        )
-    if not isinstance(source_evidence, Mapping):
-        raise ValueError("source control evidence is missing")
     metrics_value = metadata.get("pipeline_run_metrics")
     replay_mode = str(
         metadata.get("acceptance_persistence_mode")
@@ -1646,14 +1141,25 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
         )
         or ""
     ).casefold()
-    evidence = _isolated_replay_control_evidence(
-        control,
-        replay_run_id=str(run_id),
-        source_run_id=evidence_run_id,
-        mode=replay_mode,
-        source_evidence=source_evidence,
+    read_effects = getattr(control, "get_replay_control_effects", None)
+    evidence_value = (
+        read_effects(run_id)
+        if callable(read_effects)
+        else metadata.get("acceptance_replay_control_effects")
     )
-    evidence_source = "isolated_replay_control_transaction"
+    if not isinstance(evidence_value, Mapping):
+        raise ValueError("anchored replay control effects are missing")
+    try:
+        evidence = normalize_replay_control_effects(evidence_value)
+    except ValueError as exc:
+        raise ValueError("anchored replay control effects are invalid") from exc
+    if (
+        evidence["control_run_id"] != str(run_id)
+        or evidence["source_run_id"] != evidence_run_id
+        or evidence["mode"] != replay_mode
+    ):
+        raise ValueError("anchored replay control effects differ from run")
+    evidence_source = "anchored_actual_replay_control_effects"
     strict = metadata.get("bronze_acceptance_replay")
     strict = strict if isinstance(strict, Mapping) else {}
     strict_gates = strict.get("strict_gates")
@@ -1735,10 +1241,14 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
     targets = evidence.get("targets")
     datasets = evidence.get("datasets")
     if not isinstance(targets, Sequence) or isinstance(targets, (str, bytes)):
-        raise ValueError("isolated target evidence is missing")
+        raise ValueError("anchored target evidence is missing")
     if not isinstance(datasets, Sequence) or isinstance(datasets, (str, bytes)):
-        raise ValueError("isolated dataset evidence is missing")
+        raise ValueError("anchored dataset evidence is missing")
     refresh_ids = [str(item.get("logical_refresh_id") or "") for item in targets]
+    source_refresh_ids = [
+        str(item.get("source_logical_refresh_id") or "")
+        for item in targets
+    ]
     match_keys = []
     for item in targets:
         if str(item.get("page_kind") or "").casefold() != "match":
@@ -1767,6 +1277,8 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
         failures.append("logical_refresh_id_missing")
     if len(set(refresh_ids)) != len(refresh_ids):
         failures.append("logical_refresh_id_duplicate")
+    if len(set(source_refresh_ids)) != len(source_refresh_ids):
+        failures.append("source_logical_refresh_id_duplicate")
     expected_replay_target_prefix = (
         f"fbref:acceptance-replay:{run_id}:"
     )
@@ -1774,12 +1286,11 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
         str(item.get("replay_target_id") or "")
         != expected_replay_target_prefix
         + str(item.get("target_id") or "")
-        or not str(item.get("logical_refresh_id") or "").startswith(
-            f"{run_id}:"
-        )
         for item in targets
     ):
         failures.append("replay_control_target_not_isolated")
+    if any(item.get("latest_guarded") is not True for item in targets):
+        failures.append("latest_content_not_guarded")
     if not match_keys:
         failures.append("match_target_evidence_empty")
     if len(set(match_keys)) != len(match_keys):
@@ -1910,6 +1421,9 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
         (
             {
                 "target_id": item.get("target_id"),
+                "source_logical_refresh_id": item.get(
+                    "source_logical_refresh_id"
+                ),
                 "status": item.get("status"),
                 "target_status": item.get("target_status"),
                 "page_kind": item.get("page_kind"),
@@ -1959,11 +1473,15 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
         (
             {
                 "target_id": item.get("target_id"),
+                "source_logical_refresh_id": item.get(
+                    "source_logical_refresh_id"
+                ),
                 "status": item.get("status"),
                 "target_status": item.get("target_status"),
                 "frontier_state": item.get("frontier_state"),
                 "last_content_hash": item.get("last_content_hash"),
                 "evidence_class": item.get("evidence_class"),
+                "latest_guarded": item.get("latest_guarded"),
             }
             for item in targets
         ),
@@ -2199,7 +1717,7 @@ def _control_evidence_equivalent(
         and batch.valid
         and sequential.evidence_source
         == batch.evidence_source
-        == "isolated_replay_control_transaction"
+        == "anchored_actual_replay_control_effects"
         and sequential.source_run_id == batch.source_run_id
         and sequential.logical_refreshes == batch.logical_refreshes
         and sequential.dataset_manifests == batch.dataset_manifests
