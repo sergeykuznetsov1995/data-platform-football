@@ -1666,19 +1666,16 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     competition_id,
                 )
             )
-        if automatic_catalog:
-            profile_validation_deferred = [
-                competition_id
-                for competition_id in competition_ids
-                if competition_id not in freshly_validated_included_ids
-            ]
-            competition_ids = [
-                competition_id
-                for competition_id in competition_ids
-                if competition_id in freshly_validated_included_ids
-            ]
-        else:
-            profile_validation_deferred = []
+        profile_validation_deferred = [
+            competition_id
+            for competition_id in competition_ids
+            if competition_id not in freshly_validated_included_ids
+        ]
+        competition_ids = [
+            competition_id
+            for competition_id in competition_ids
+            if competition_id in freshly_validated_included_ids
+        ]
         if args.competition_limit:
             deferred_by_limit = competition_ids[args.competition_limit :]
             competition_ids = competition_ids[: args.competition_limit]

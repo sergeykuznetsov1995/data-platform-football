@@ -426,7 +426,10 @@ class TestFotmobNativeRunner:
         service.sync_transfers.assert_not_called()
 
     @pytest.mark.unit
-    def test_automatic_transfer_waits_for_fresh_profile_validation(self):
+    @pytest.mark.parametrize("automatic_catalog", [True, False])
+    def test_transfer_waits_for_fresh_profile_validation(
+        self, automatic_catalog
+    ):
         from scrapers.fotmob.planner import RunMode, TransportBudget
         from scrapers.fotmob.repository import MemoryFotMobRepository
         from scrapers.fotmob.service import FotMobIngestService, OperationResult
@@ -512,18 +515,17 @@ class TestFotmobNativeRunner:
                 metadata={"source_hits": 0},
             )
         )
-        args = mod._argument_parser().parse_args(
-            [
-                "--mode",
-                "backfill",
-                "--catalog-contract",
-                "fotmob-catalog-v1",
-                "--entities",
-                "transfers",
-                "--competition-limit",
-                "1",
-            ]
-        )
+        argv = [
+            "--mode",
+            "backfill",
+            "--entities",
+            "transfers",
+            "--competition-limit",
+            "1",
+        ]
+        if automatic_catalog:
+            argv.extend(("--catalog-contract", "fotmob-catalog-v1"))
+        args = mod._argument_parser().parse_args(argv)
 
         rc, report = _run_native_admitted(mod, args, service=service)
 
@@ -532,12 +534,21 @@ class TestFotmobNativeRunner:
         assert not any(
             url == deferred_profile_url for url, _replay in current_transport.calls
         )
-        transfer_deferrals = [
+        if automatic_catalog:
+            transfer_deferrals = [
+                item
+                for item in report["selection"]["deferrals"]
+                if item["target_type"] == "transfer"
+            ]
+            assert [item["targets"] for item in transfer_deferrals] == [[48]]
+        transfer_plan = next(
             item
-            for item in report["selection"]["deferrals"]
-            if item["target_type"] == "transfer"
-        ]
-        assert [item["targets"] for item in transfer_deferrals] == [[48]]
+            for item in report["operations"]
+            if item["entity"] == "transfer_work_plan"
+        )
+        assert transfer_plan["metadata"][
+            "profile_validation_deferred_competition_ids"
+        ] == [48]
 
     @pytest.mark.unit
     def test_automatic_deadline_deferral_is_partial_success_with_evidence(self):
