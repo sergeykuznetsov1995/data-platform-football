@@ -1011,6 +1011,14 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             for competition_id in catalog_ids_evidence
             if competition_id in evidence_by_id
         ]
+    freshly_validated_included_ids = {
+        int(competition_id) for competition_id in catalog.profile_payloads
+    }
+    freshly_validated_included_ids.update(
+        competition_id
+        for competition_id, classification in revalidated_by_id.items()
+        if classification.decision.value == "included"
+    )
 
     discovered_identities = {season.identity for season in seasons}
     missing_scopes = sorted(set(explicit_scopes) - discovered_identities)
@@ -1658,6 +1666,19 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     competition_id,
                 )
             )
+        if automatic_catalog:
+            profile_validation_deferred = [
+                competition_id
+                for competition_id in competition_ids
+                if competition_id not in freshly_validated_included_ids
+            ]
+            competition_ids = [
+                competition_id
+                for competition_id in competition_ids
+                if competition_id in freshly_validated_included_ids
+            ]
+        else:
+            profile_validation_deferred = []
         if args.competition_limit:
             deferred_by_limit = competition_ids[args.competition_limit :]
             competition_ids = competition_ids[: args.competition_limit]
@@ -1672,10 +1693,24 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 "already_complete_competitions": len(completed_transfer_ids),
                 "daily_completion_timestamps": len(transfer_completion_times),
                 "limit_deferred_competition_ids": deferred_by_limit,
+                "profile_validation_deferred_competition_ids": (
+                    profile_validation_deferred
+                ),
             },
         )
-        transfer_plan.skipped = len(deferred_by_limit)
+        transfer_plan.skipped = len(deferred_by_limit) + len(
+            profile_validation_deferred
+        )
         operations.append(transfer_plan)
+        add_automatic_deferral(
+            kind="budget",
+            target_type="transfer",
+            targets=profile_validation_deferred,
+            reason=(
+                "competition discovery budget deferred fresh profile "
+                "validation for transfer"
+            ),
+        )
         add_automatic_deferral(
             kind="budget",
             target_type="transfer",

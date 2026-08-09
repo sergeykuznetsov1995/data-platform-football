@@ -426,6 +426,120 @@ class TestFotmobNativeRunner:
         service.sync_transfers.assert_not_called()
 
     @pytest.mark.unit
+    def test_automatic_transfer_waits_for_fresh_profile_validation(self):
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService, OperationResult
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _competition_payload,
+        )
+
+        mod = self._module()
+        competition_ids = (47, 48)
+        all_leagues = {
+            "countries": [
+                {
+                    "leagues": [
+                        {"id": competition_id, "name": f"League {competition_id}"}
+                        for competition_id in competition_ids
+                    ]
+                }
+            ]
+        }
+        catalog_url = canonicalize_target("allLeagues").canonical_url
+
+        def profile(competition_id: int, *, gender: str = "male"):
+            payload = _competition_payload(
+                competition_id,
+                f"League {competition_id}",
+                gender=gender,
+            )
+            payload["allAvailableSeasons"] = []
+            return payload
+
+        repository = MemoryFotMobRepository()
+        seed_service = FotMobIngestService(
+            transport=StubTransport(
+                {
+                    catalog_url: all_leagues,
+                    **{
+                        canonicalize_target(
+                            "leagues", {"id": competition_id}
+                        ).canonical_url: profile(competition_id)
+                        for competition_id in competition_ids
+                    },
+                }
+            ),
+            repository=repository,
+            mode=RunMode.BACKFILL,
+            budget=TransportBudget(
+                max_requests=100, max_direct_bytes=10_000_000
+            ),
+            run_id="seed-two-male-profiles",
+        )
+        seed_service.discover_catalog()
+
+        deferred_profile_url = canonicalize_target(
+            "leagues", {"id": 48}
+        ).canonical_url
+        current_transport = StubTransport(
+            {
+                catalog_url: all_leagues,
+                canonicalize_target(
+                    "leagues", {"id": 47}
+                ).canonical_url: profile(47),
+                deferred_profile_url: profile(48, gender="female"),
+            }
+        )
+        service = FotMobIngestService(
+            transport=current_transport,
+            repository=repository,
+            mode=RunMode.BACKFILL,
+            budget=TransportBudget(
+                max_requests=100, max_direct_bytes=10_000_000
+            ),
+            run_id="bounded-profile-validation",
+        )
+        repository.completed_competition_ids = MagicMock(return_value={47})
+        service.sync_transfers = MagicMock(
+            return_value=OperationResult(
+                "transfer_events",
+                attempted=1,
+                succeeded=1,
+                counts={"events": 0},
+                metadata={"source_hits": 0},
+            )
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "backfill",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "transfers",
+                "--competition-limit",
+                "1",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0, report["errors"]
+        service.sync_transfers.assert_not_called()
+        assert not any(
+            url == deferred_profile_url for url, _replay in current_transport.calls
+        )
+        transfer_deferrals = [
+            item
+            for item in report["selection"]["deferrals"]
+            if item["target_type"] == "transfer"
+        ]
+        assert [item["targets"] for item in transfer_deferrals] == [[48]]
+
+    @pytest.mark.unit
     def test_automatic_deadline_deferral_is_partial_success_with_evidence(self):
         from scrapers.fotmob.transport import canonicalize_target
         from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
