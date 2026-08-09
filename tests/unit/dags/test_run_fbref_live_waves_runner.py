@@ -87,10 +87,79 @@ def test_bootstrap_control_run_is_allowed_through_live_transport(
     assert '"status": "complete"' in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    ("bytes_used", "bytes_reserved", "expected_provider_max_bytes"),
+    [
+        (5_400_000, 100_000, 100 * 1024 * 1024 - 5_500_000),
+        (100 * 1024 * 1024, 1, 0),
+    ],
+)
+def test_retry_attempt_requests_only_the_remaining_dagrun_budget(
+    monkeypatch,
+    capsys,
+    bytes_used,
+    bytes_reserved,
+    expected_provider_max_bytes,
+):
+    # The filter budget is shared per dagrun across attempts (#1107): a retry
+    # subprocess must subtract what earlier attempts already spent instead of
+    # re-requesting the full CLI cap and dying on a deterministic extend 409.
+    control = SimpleNamespace(
+        get_run=lambda _run_id: {
+            "run_type": "current",
+            "metadata": {"dag_id": "dag_ingest_fbref"},
+            "bytes_used": bytes_used,
+            "bytes_reserved": bytes_reserved,
+        }
+    )
+    result = SimpleNamespace(as_dict=lambda: {"status": "complete"})
+    pipeline = SimpleNamespace(
+        control=control,
+        fetcher_factory=None,
+        run_live_waves=lambda *_args, **_kwargs: result,
+    )
+    fetcher_kwargs = {}
+
+    monkeypatch.setenv(
+        "FBREF_PROXY_CONTROL_URL",
+        "http://fbref_proxy_filter:8899",
+    )
+    monkeypatch.setattr(runner.FBrefPipeline, "from_env", lambda: pipeline)
+    monkeypatch.setattr(
+        runner,
+        "FBrefFetcher",
+        lambda **kwargs: fetcher_kwargs.update(kwargs) or object(),
+    )
+    args = Namespace(
+        control_run_id="control-run",
+        worker_id="retry-live",
+        page_kinds="competition_index,competition",
+        run_type="current",
+        request_limit=200,
+        byte_limit_mb=100,
+        shard_size=25,
+        reservation_mb=3,
+        domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+        max_batches=16,
+    )
+
+    assert runner._run(args) == 0
+    pipeline.fetcher_factory(None, 200, 100 * 1024 * 1024)
+
+    assert fetcher_kwargs["provider_max_bytes"] == expected_provider_max_bytes
+    assert '"status": "complete"' in capsys.readouterr().out
+
+
 def _dead_or_zombie(pid: int) -> bool:
     try:
         state = open(f"/proc/{pid}/stat", encoding="utf-8").read().split()[2]
     except FileNotFoundError:
+        return True
+    except ProcessLookupError:
+        # The pid directory outlived the process it describes: /proc answers
+        # ESRCH rather than ENOENT for the window between exit and teardown.
+        # That is the condition this helper is asked about, so it must report
+        # it instead of tearing the test down on its own success.
         return True
     return state == "Z"
 

@@ -717,6 +717,32 @@ def extract_json_parse_property(source: str, property_name: str) -> Any:
         ) from exc
 
 
+def _matchcentre_data_explicitly_null(
+    html: str, patterns: tuple[re.Pattern[str], ...]
+) -> bool:
+    """Return whether every inline ``matchCentreData`` value is literal null.
+
+    Some shell pages (issue #1101: FA Cup ties flagged Opta without inline
+    data) publish the exact idiom ``matchCentreData: null``. That literal is
+    a source-owned statement of unavailability, not a malformed payload, but
+    only when no occurrence carries any other value.
+    """
+
+    seen = False
+    for pattern in patterns:
+        for match in pattern.finditer(html):
+            end = match.end()
+            while end < len(html) and html[end].isspace():
+                end += 1
+            if not html.startswith("null", end):
+                return False
+            tail = end + 4
+            if tail < len(html) and (html[tail].isalnum() or html[tail] in "_$"):
+                return False
+            seen = True
+    return seen
+
+
 def extract_matchcentre_data(html: str) -> dict[str, Any]:
     """Extract the inline ``matchCentreData`` object from a match page."""
 
@@ -759,6 +785,10 @@ def extract_matchcentre_data(html: str) -> dict[str, Any]:
                 raise WhoScoredParseError("matchCentreData must be an object")
             return value
     if parse_errors:
+        if _matchcentre_data_explicitly_null(
+            html, (property_pattern, assignment_pattern)
+        ):
+            raise MatchCentreDataAbsent("matchCentreData is explicitly null")
         raise WhoScoredParseError(
             "matchCentreData is present but malformed or unsupported"
         ) from parse_errors[0]
@@ -774,6 +804,9 @@ def is_valid_match_page_without_matchcentre(html: str, *, game_id: int) -> bool:
     A real non-Opta live page contains two independent source-owned match-id
     markers even though it omits ``matchCentreData``. Requiring both markers
     prevents an unrelated shell from becoming a durable ``not_available``.
+    A second real variant (issue #1101) omits ``initialMatchDataForScrappers``
+    but inlines an explicit ``matchCentreData: null`` in the same args block
+    as its match id; that null is accepted as the second marker.
     """
 
     if not isinstance(html, str) or not html:
@@ -801,6 +834,15 @@ def is_valid_match_page_without_matchcentre(html: str, *, game_id: int) -> bool:
         html,
         re.IGNORECASE | re.DOTALL,
     )
+    if scraper is None:
+        scraper = re.search(
+            r"require\.config\.params\[['\"]args['\"]\]\s*=\s*"
+            r"\{(?:(?!</script>).){0,8000}?\bmatchId\s*:\s*([1-9][0-9]*)"
+            r"(?:(?!</script>).){0,8000}?"
+            r"\bmatchCentreData\s*:\s*null(?![A-Za-z0-9_$])",
+            html,
+            re.IGNORECASE | re.DOTALL,
+        )
     return bool(
         header
         and scraper
@@ -1016,7 +1058,7 @@ def parse_events(
     occupied_source_ids = set(raw_source_ids)
     rows: list[dict[str, Any]] = []
     seen_source_ids: set[int] = set()
-    seen_team_event_ids: set[tuple[Optional[int], int]] = set()
+    seen_records: set[tuple[int, Optional[int], int]] = set()
     identity = _identity_fields(scope, _required_int(game_id, "game_id"), game)
     for index, event in enumerate(raw_events):
         if not isinstance(event, Mapping):
@@ -1057,13 +1099,23 @@ def parse_events(
                 f"Duplicate technical event id {source_event_id} in game {game_id}"
             )
         seen_source_ids.add(source_event_id)
-        team_event_key = (team_id, team_event_id)
-        if team_event_key in seen_team_event_ids:
+        # ``(teamId, eventId)`` alone is not an identity: it is a per-team
+        # counter that the feed reuses for genuinely distinct actions.  Game
+        # 1901279 files a Save by one player and a BallRecovery by another under
+        # ``(75, 838)`` -- each with its own Opta ``id`` -- and rejecting the
+        # repeat discarded the whole match and deadlocked the backfill (#1080).
+        #
+        # The record is the counter *plus* the Opta ``id``.  A repeat of that
+        # triple is one source record delivered twice, which stays fatal -- and
+        # it is the only reachable way for two records to ask the surrogate
+        # above for the same token, so refusing it keeps minted ids a function
+        # of the record rather than of its position in the feed.
+        record_key = (opta_event_id, team_id, team_event_id)
+        if record_key in seen_records:
             raise WhoScoredParseError(
-                "Duplicate team-local event identity "
-                f"{team_event_key!r} in game {game_id}"
+                f"Duplicate source event record {record_key!r} in game {game_id}"
             )
-        seen_team_event_ids.add(team_event_key)
+        seen_records.add(record_key)
         player_id = _optional_int(event.get("playerId"), f"events[{index}].playerId")
         qualifiers = event.get("qualifiers")
         if qualifiers is None:

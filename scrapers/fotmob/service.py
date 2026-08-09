@@ -99,6 +99,14 @@ MATCH_CONTENT_SECTIONS = (
     "momentum",
 )
 
+# The source's own ``hits`` counter for a transfer stream routinely overstates
+# the number of events it actually serves by one or two (#1074: six
+# competitions, every page fetched and parsed cleanly, zero duplicates, and
+# still 1-2 events short of ``hits``). A deficit within this tolerance on a
+# fully exhausted stream is the source disagreeing with itself, not missing
+# collection work.
+TRANSFER_SOURCE_HITS_TOLERANCE = 2
+
 _BLOCKING_PARSE_ISSUES = frozenset(
     {
         "invalid_match",
@@ -199,6 +207,21 @@ def _is_source_missing_player(data: Any) -> bool:
         and "data" in container
         and container.get("data") is None
         for container in containers
+    )
+
+
+def _is_not_found_stub(data: Any) -> bool:
+    """FotMob answers HTTP 200 with a bare routing stub for a team it has no
+    page for — an unfilled future bracket advertises ``team_id`` 0 and gets one
+    every run. Fail closed: only the stub on its own counts, so a payload that
+    carries a team alongside it keeps falling through to schema drift."""
+
+    action = data.get("action") if isinstance(data, Mapping) else None
+    return (
+        isinstance(data, Mapping)
+        and set(data) == {"action"}
+        and isinstance(action, Mapping)
+        and "notFound" in action
     )
 
 
@@ -812,6 +835,34 @@ class FotMobIngestService:
             result.errors.append(f"competition {competition.competition_id}: {exc}")
             return CompetitionDiscoveryResult(competition, classification, result)
         if not fetch.ok:
+            if fetch.outcome == FetchOutcome.NOT_AVAILABLE:
+                # Dead catalog entry (#1070): allLeagues keeps advertising the
+                # id while ``/leagues`` answers a null body (placeholder/promo
+                # competitions) or 204/404. That is a fact about the source's
+                # catalog, not a collection failure. The entry stays advertised
+                # so every cycle re-proves the absence for free (304
+                # revalidation of the cached null).
+                self._commit_for_fetch(
+                    fetch,
+                    target_type="competition_seasons",
+                    status=ManifestStatus.EXCLUDED,
+                    competition_id=competition.competition_id,
+                    exclusions=(
+                        {
+                            "reason": "dead_catalog_entry",
+                            "competition_id": str(competition.competition_id),
+                        },
+                    ),
+                    error_code="source_dead_catalog_entry",
+                    error="advertised competition serves no season payload",
+                )
+                result.not_available += 1
+                result.metadata["intentional_not_available"] = (
+                    int(result.metadata.get("intentional_not_available", 0)) + 1
+                )
+                return CompetitionDiscoveryResult(
+                    competition, classification, result, fetch=fetch
+                )
             self._commit_for_fetch(
                 fetch,
                 target_type="competition_seasons",
@@ -1449,6 +1500,7 @@ class FotMobIngestService:
         page_one_changed = False
         resumed_pages = 0
         network_pages = 0
+        stream_exhausted = False
         page = 1
         resume_allowed = self.mode == RunMode.BACKFILL
         page_one_params: dict[str, Any] = {
@@ -1587,6 +1639,7 @@ class FotMobIngestService:
                 if expected_hits is not None and len(unique_ids) >= expected_hits:
                     break
                 if not rows:
+                    stream_exhausted = True
                     break
                 page += 1
             except Exception as exc:
@@ -1608,15 +1661,31 @@ class FotMobIngestService:
                 "transfer pagination incomplete: source hits is missing"
             )
         elif len(unique_ids) < expected_hits:
-            result.errors.append(
-                "transfer pagination incomplete: "
-                f"unique={len(unique_ids)} source_hits={expected_hits}"
-            )
+            deficit = expected_hits - len(unique_ids)
+            if (
+                stream_exhausted
+                and result.ok
+                and deficit <= TRANSFER_SOURCE_HITS_TOLERANCE
+            ):
+                # #1074: every page fetched and parsed, the stream ran dry,
+                # and the shortfall to the source's own ``hits`` counter is
+                # within its known 1-2 event self-disagreement. There is no
+                # missing page to fetch — record the deficit, not an error.
+                result.metadata["source_hits_deficit"] = deficit
+            else:
+                result.errors.append(
+                    "transfer pagination incomplete: "
+                    f"unique={len(unique_ids)} source_hits={expected_hits}"
+                )
         result.metadata["source_hits"] = expected_hits
         result.metadata["page_one_changed"] = page_one_changed
         result.metadata["resumed_raw_pages"] = resumed_pages
         result.metadata["network_pages"] = network_pages
-        if expected_hits is not None and len(unique_ids) < expected_hits:
+        if (
+            expected_hits is not None
+            and len(unique_ids) < expected_hits
+            and "source_hits_deficit" not in result.metadata
+        ):
             result.metadata["next_missing_page"] = page
         return result
 
@@ -1953,16 +2022,30 @@ class FotMobIngestService:
                 result.errors.append(f"team {key}: {outcome}")
                 continue
             fetch = outcome
-            if not fetch.ok:
-                if (
+            # A team the source has no page for is not always a transport
+            # absence: /teams answers 200 with a not-found stub for it, and an
+            # unfilled future bracket advertises team_id 0 that way every run
+            # (#1112).  The stub carries no team, so it is the same absence the
+            # branch below resolves -- classifying it here keeps CatalogShapeError
+            # strict for JSON shapes that really do carry a team.
+            stub_absence = (
+                allow_advertised_absence
+                and fetch.ok
+                and _is_not_found_stub(fetch.data)
+            )
+            if not fetch.ok or stub_absence:
+                if stub_absence or (
                     allow_advertised_absence
                     and fetch.outcome == FetchOutcome.NOT_AVAILABLE
                 ):
-                    # Historical season payloads can advertise teams whose
-                    # global /teams endpoint has since been removed. Resolve
-                    # that proven deep-history absence without publishing a
-                    # NOT_AVAILABLE tombstone: a last-good global snapshot may
-                    # still be serving a current season and must remain visible.
+                    # A season payload can advertise teams whose global /teams
+                    # endpoint serves nothing — removed deep-history clubs, but
+                    # also live small-cup entrants and bracket placeholders the
+                    # source never gave a page (#1070 evidence: 96 such teams
+                    # in current seasons, all null bodies). Resolve the proven
+                    # absence without publishing a NOT_AVAILABLE tombstone: a
+                    # last-good global snapshot may still be serving another
+                    # season and must remain visible.
                     self._commit_for_fetch(
                         fetch,
                         target_type="team",
@@ -1972,16 +2055,16 @@ class FotMobIngestService:
                         entity_id=key,
                         exclusions=(
                             {
-                                "reason": "advertised_historical_team_unavailable",
+                                "reason": "advertised_team_unavailable",
                                 "scope": (
                                     f"{bundle.scope.competition_id}="
                                     f"{bundle.scope.source_season_key}"
                                 ),
                             },
                         ),
-                        error_code="source_historical_team_unavailable",
+                        error_code="source_team_unavailable",
                         error=(
-                            "advertised historical team has no global source payload"
+                            "advertised team has no global source payload"
                         ),
                     )
                     result.not_available += 1

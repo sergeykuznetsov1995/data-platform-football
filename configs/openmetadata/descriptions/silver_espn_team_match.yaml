@@ -1,0 +1,66 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.espn_team_match
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.espn_team_match
+  description: |
+    Командная статистика ESPN: одна строка на (event_id, team_id), только для
+    сыгранных матчей. Последняя generation-v2 schedule и matchsheet выбирается
+    по _ingested_at до JSON expansion. Matchsheet является авторитетной
+    wide-веткой; scoreboard statistics из schedule используются целиком только
+    когда matchsheet для события отсутствует. ESPN zero может быть измеренным
+    значением или означать metric not tracked в зависимости от соревнования;
+    Silver сохраняет raw zero, а не угадывает NULL. Percentages Bronze не
+    переносятся и пересчитываются из счётчиков.
+    goals_against предпочитает score противоположной matchsheet-строки.
+    _bronze_ingested_at — lineage, league/season — partition keys.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: event_id
+    description: Сырой ESPN ID матча; часть PK.
+  - name: team_id
+    description: Сырой ESPN ID команды; часть PK.
+  - name: team
+    description: Название команды из schedule, чтобы обе ветки использовали один вариант имени.
+  - name: opponent_team_id
+    description: Сырой ESPN ID соперника.
+  - name: is_home
+    description: TRUE для домашней стороны.
+  - name: goals_for
+    description: Голы команды; matchsheet score с fallback к schedule.
+  - name: goals_against
+    description: Голы соперника; score противоположной matchsheet-строки с fallback к schedule.
+  - name: possession_pct
+    description: Владение мячом, %, как измерено ESPN.
+  - name: total_shots
+    description: Удары команды, всего.
+  - name: shots_on_target
+    description: Удары команды в створ.
+  - name: total_passes
+    description: Передачи команды, всего.
+  - name: accurate_passes
+    description: Точные передачи команды.
+  - name: pass_pct
+    description: Вычислено как 100 * accurate_passes / total_passes с защитой от деления на ноль.
+  - name: yellow_cards
+    description: Жёлтые карточки команды.
+  - name: red_cards
+    description: Красные карточки команды.
+  - name: stats_source
+    description: "'matchsheet' для авторитетной ветки или 'scoreboard' для JSON fallback."
+  - name: _bronze_ingested_at
+    description: Timestamp выбранной Bronze-генерации (lineage).
+  - name: league
+    description: Competition slug ESPN; partition key из schedule.
+  - name: season
+    description: Source season year как varchar; partition key из schedule.
+  - name: _silver_created_at
+    description: Технический timestamp CTAS-раннера при материализации Silver.
+relationships:
+  - from: event_id
+    to: trino_iceberg.iceberg.silver.espn_match.event_id
+    type: FOREIGN_KEY
+    description: N:1 — дочерняя запись относится к одному матчу ESPN.

@@ -88,6 +88,10 @@ _MAX_BLOCKED_ATTEMPTS = 4
 # grant without allowing an orphaned ticket to outlive the proxy queue.
 TRANSFERMARKT_REQUEST_PERMIT_MAX_WAIT_SECONDS = 65.0
 
+
+class TransportStatusError(ConnectionError):
+    """A pseudo-response carried no real HTTP status (tls-client quirk)."""
+
 _URL_CREDENTIALS_RE = re.compile(
     r"(?P<scheme>(?:https?|socks[45])://)(?P<credentials>[^/@\s]+)@",
     re.IGNORECASE,
@@ -258,14 +262,14 @@ class ProxyFilterLeaseProvider:
             self._control_client = requests.Session()
         return self._control_client
 
-    def _request(
+    def _exchange(
         self,
         method: str,
         path: str,
         *,
         token: Optional[str] = None,
         payload: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
+    ) -> tuple[int, Any]:
         # The control plane authenticates the caller by its own token; a lease's
         # bearer token only proves which lease the call is about.
         headers = {"X-Proxy-Control-Token": self._control_token}
@@ -285,8 +289,23 @@ class ProxyFilterLeaseProvider:
             raise TrafficMeterError(
                 f"proxy lease API returned invalid JSON (HTTP {status})"
             ) from exc
+        return status, body
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        token: Optional[str] = None,
+        payload: Optional[Mapping[str, Any]] = None,
+    ) -> Mapping[str, Any]:
+        status, body = self._exchange(method, path, token=token, payload=payload)
         if status < 200 or status >= 300 or not isinstance(body, dict):
-            error = redact_sensitive(body.get("error", "unknown error"))
+            error = redact_sensitive(
+                body.get("error", "unknown error")
+                if isinstance(body, dict)
+                else "unknown error"
+            )
             raise ProxyRequiredError(
                 f"proxy lease API rejected {method} {path} "
                 f"(HTTP {status}): {error}"
@@ -417,9 +436,56 @@ class ProxyFilterLeaseProvider:
             raise TrafficMeterError("invalid proxy lease traffic counters") from exc
 
     def close(self, lease: ProxyLease) -> LeaseTrafficSnapshot:
-        body = self._request(
-            "DELETE", f"/v1/leases/{lease.lease_id}/close", token=lease.token,
-        )
+        """Close the lease, absorbing both shapes of ``lease_close_pending``.
+
+        proxy-filter answers ``409 lease_close_pending`` while
+        ``close_complete`` is false.  That covers two distinct situations:
+
+        * a teardown race — the filter waits at most 2 s for its own tunnels
+          to drain, so a close issued right after the transport was discarded
+          can arrive early; a short retry turns it into a clean 200;
+        * a permanent uncertainty latch — one mid-response abort marks the
+          lease ``accounting_uncertain`` forever, the filter retains the
+          unproven byte tail as durable escrow and by design never reports
+          ``close_complete``.  The counters in the 409 body are the final
+          client-visible ledger, so failing the whole sub-cycle here would
+          discard finished work without protecting any budget (#1096).
+        """
+        path = f"/v1/leases/{lease.lease_id}/close"
+        body: Any = {}
+        for delay in (0.2, 0.5, 1.0, 2.0, None):
+            status, body = self._exchange("DELETE", path, token=lease.token)
+            if 200 <= status < 300 and isinstance(body, dict):
+                break
+            pending = (
+                status == 409
+                and isinstance(body, dict)
+                and body.get("code") == "lease_close_pending"
+            )
+            if not pending:
+                error = redact_sensitive(
+                    body.get("error", "unknown error")
+                    if isinstance(body, dict)
+                    else "unknown error"
+                )
+                raise ProxyRequiredError(
+                    f"proxy lease API rejected DELETE {path} "
+                    f"(HTTP {status}): {error}"
+                )
+            close_error = str(body.get("close_error", ""))
+            if close_error.startswith("provider byte accounting is uncertain"):
+                logger.warning(
+                    "lease %s closed with uncertain provider accounting; "
+                    "filter retains the unproven tail as durable escrow",
+                    lease.lease_id,
+                )
+                break
+            if delay is None:
+                raise ProxyRequiredError(
+                    f"proxy lease API rejected DELETE {path} (HTTP 409): "
+                    "lease close stayed pending after drain retries"
+                )
+            self._sleep(delay)
         try:
             return LeaseTrafficSnapshot.from_mapping(body)
         except (TypeError, ValueError) as exc:
@@ -1620,6 +1686,17 @@ class TransfermarktHttpClient:
                 attempt_duration_for_endpoint += elapsed
                 status_code = int(getattr(resp, "status_code", 0) or 0)
                 last_status = status_code
+                if not 100 <= status_code <= 599:
+                    # tls-client reports some transport-level failures as a
+                    # pseudo-response with status 0 instead of raising.  The
+                    # raw store only accepts real HTTP statuses (100..599), so
+                    # committing such a response fails the whole cycle closed
+                    # (#1092).  Route it through the transport-error path,
+                    # which retries on a fresh exit like any other
+                    # connection failure.
+                    raise TransportStatusError(
+                        f"transport failure: pseudo HTTP status {status_code}"
+                    )
                 body = self._response_bytes(resp)
                 body_n = len(body)
                 decoded_for_endpoint += body_n

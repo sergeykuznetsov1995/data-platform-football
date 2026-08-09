@@ -31,6 +31,7 @@ from scrapers.fbref.pipeline import (
     RunValidationError,
     SENTINEL_COMPETITIONS,
     WaveResult,
+    affordable_clearance_reservation,
     backfill_season_cohort_capacity,
     frontier_target,
     live_wave_target_capacity,
@@ -499,7 +500,28 @@ class FakeControl:
                 **item,
             }
             for item in rows
+            if self.frontier.get(
+                str(item["target_id"]), {}
+            ).get("state") != "quarantined"
         ]
+
+    def quarantine_contract_rejected_target(
+        self, target_id, *, content_hash, reason
+    ):
+        row = self.frontier.get(str(target_id))
+        if row is None or row.get("state") in {"leased", "dead"}:
+            return False
+        if str(row.get("last_content_hash") or "") != str(content_hash):
+            return False
+        row.update(
+            state="quarantined",
+            next_fetch_at=None,
+            retry_after=None,
+            last_error_class="ParseContractQuarantined",
+            last_error_message=str(reason),
+        )
+        self.events.append(f"contract_quarantine:{target_id}")
+        return True
 
     def claim_observation_processing(self, **kwargs):
         key = (
@@ -611,7 +633,13 @@ class FakeControl:
     def upsert_season_alias(self, alias, *, snapshot_id=None):
         key = (alias.source, alias.competition_id, alias.alias)
         previous = self.season_aliases.get(key)
-        if previous is not None and previous[0].season_id != alias.season_id:
+        # A display label follows its season rollover; only an identity token
+        # refuses to be remapped.  Mirrors ControlStore.upsert_season_alias.
+        if (
+            previous is not None
+            and previous[0].season_id != alias.season_id
+            and previous[0].alias_kind != "label"
+        ):
             raise StateConflict(
                 f"Season alias {alias.competition_id}/{alias.alias} "
                 "is already mapped to a different season"
@@ -2442,6 +2470,277 @@ def test_zero_table_source_shell_fails_before_typed_promotion(tmp_path):
 
     assert generic_writer.pages[0][0].tables == ()
     assert typed_writer.calls == []
+    # A shell that cannot prove its own identity may be a challenge page or a
+    # truncated capture: fresher bytes can still parse, so it must never be
+    # retired on this evidence.
+    assert control.frontier[record.target_id]["state"] == "fetched"
+
+
+def _schedule_less_season_wave(tmp_path):
+    """Cohort of the production shape plus a healthy season page.
+
+    A dead league's archived edition (NASL 2017) publishes squad tables but no
+    Scores & Fixtures link at all, which no retry can change.
+    """
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    for competition_id, name in (("76", "NASL"), ("122", "UEFA Super Cup")):
+        control.registry[competition_id] = {
+            "competition_id": competition_id,
+            "canonical_url": (
+                f"https://fbref.com/en/comps/{competition_id}/history/x"
+            ),
+            "name": name,
+            "gender": "male",
+            "classification": "cup:club",
+            "metadata": {},
+        }
+    rejected = page_target_from_link(DiscoveredPageLink(
+        page_kind="season",
+        canonical_url="https://fbref.com/en/comps/76/2017/2017-NASL-Stats",
+        source_ids={"competition_id": "76", "season_id": "2017"},
+    ))
+    healthy = page_target_from_link(DiscoveredPageLink(
+        page_kind="season",
+        canonical_url=(
+            "https://fbref.com/en/comps/122/2013-2014/"
+            "2013-UEFA-Super-Cup-Stats"
+        ),
+        source_ids={"competition_id": "122", "season_id": "2013-2014"},
+    ))
+    pages = [
+        (rejected, """
+        <div id="content"><h1>2017 NASL Stats</h1>
+          <a href="/en/comps/76/history/NASL-Seasons">Seasons</a>
+          <table id="stats_squads_standard_for">
+            <thead><tr><th data-stat="team">Squad</th></tr></thead>
+            <tbody><tr><td data-stat="team">New York Cosmos</td></tr></tbody>
+          </table>
+        </div>
+        """),
+        (healthy, """
+        <div id="content"><h1>2013 UEFA Super Cup Stats</h1>
+          <a href="/en/comps/122/history/UEFA-Super-Cup-Seasons">Seasons</a>
+        </div>
+        """),
+    ]
+    records = {}
+    for target, html in pages:
+        refresh, record = _commit_for_parse(raw, target, html)
+        records[target.target_id] = record
+        control.frontier[record.target_id] = {
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "source_ids": dict(record.source_ids),
+            "state": "fetched",
+            "last_content_hash": record.content_hash,
+        }
+        control.fetches.append({
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "logical_refresh_id": refresh,
+        })
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=ContractWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+    return control, pipeline, rejected.target_id, healthy.target_id
+
+
+def test_schedule_less_season_page_is_retired_without_failing_its_cohort(
+    tmp_path,
+):
+    control, pipeline, rejected_id, healthy_id = _schedule_less_season_wave(
+        tmp_path
+    )
+
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season"],
+        settings=_settings("current"),
+    )
+
+    assert result.failures == []
+    assert result.contract_quarantined == 1
+    # The healthy sibling in the same cohort is not held hostage.
+    assert result.parsed == 1
+    assert control.frontier[healthy_id]["state"] == "fetched"
+    rejected = control.frontier[rejected_id]
+    assert rejected["state"] == "quarantined"
+    assert rejected["last_error_class"] == "ParseContractQuarantined"
+    assert rejected["last_error_message"] == "schedule_link_missing"
+    assert rejected["next_fetch_at"] is None
+
+
+def test_contract_quarantine_drops_the_target_from_the_recovery_cohort(
+    tmp_path,
+):
+    control, pipeline, rejected_id, _ = _schedule_less_season_wave(tmp_path)
+
+    first = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season"],
+        settings=_settings("current"),
+    )
+    second = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season"],
+        settings=_settings("current"),
+    )
+
+    assert first.cohort_size == 2
+    # Without the retirement the same raw is re-selected by every later run,
+    # which is what blocked the daily DAG behind three archived seasons.
+    assert second.cohort_size == 0
+    assert control.frontier[rejected_id]["state"] == "quarantined"
+
+
+def test_unretired_contract_rejection_still_fails_the_wave(tmp_path):
+    control, pipeline, rejected_id, _ = _schedule_less_season_wave(tmp_path)
+    # A target that raced into a lease cannot be retired, and claiming progress
+    # that did not shrink the cohort would spin the recovery drain forever.
+    control.quarantine_contract_rejected_target = (
+        lambda target_id, *, reason: False
+    )
+
+    with pytest.raises(ParseWaveError, match="Season source contract failed"):
+        pipeline.recover_unprocessed_wave(
+            str(uuid.uuid4()),
+            page_kinds=["season"],
+            settings=_settings("current"),
+        )
+
+    assert control.frontier[rejected_id]["state"] == "fetched"
+
+
+def test_schedule_less_page_without_source_identity_is_never_retired(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="season",
+        canonical_url="https://fbref.com/en/comps/76/2017/2017-NASL-Stats",
+        source_ids={"competition_id": "76", "season_id": "2017"},
+    ))
+    # Tables but no competition-history backlink: a truncated or challenged
+    # capture looks exactly like this, and fresher bytes can still parse.
+    html = """
+    <div id="content"><h1>2017 NASL Stats</h1>
+      <table id="stats_squads_standard_for">
+        <thead><tr><th data-stat="team">Squad</th></tr></thead>
+        <tbody><tr><td data-stat="team">New York Cosmos</td></tr></tbody>
+      </table>
+    </div>
+    """
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    }]
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=ContractWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+
+    with pytest.raises(ParseWaveError, match="Season source contract failed"):
+        pipeline.recover_unprocessed_wave(
+            str(uuid.uuid4()),
+            page_kinds=["season"],
+            settings=_settings("current"),
+        )
+
+    assert control.frontier[record.target_id]["state"] == "fetched"
+
+
+def test_superseded_raw_of_a_rejecting_page_is_skipped_not_retired(tmp_path):
+    control, pipeline, rejected_id, _ = _schedule_less_season_wave(tmp_path)
+    # A newer fetch already replaced these bytes.  The content guard classifies
+    # the observation as stale before the contract is ever consulted, so the
+    # verdict is never formed against superseded evidence.
+    control.frontier[rejected_id]["last_content_hash"] = "a" * 64
+
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season"],
+        settings=_settings("current"),
+    )
+
+    assert result.failures == []
+    assert result.contract_quarantined == 0
+    assert result.stale_typed_observations_skipped == 1
+    assert control.frontier[rejected_id]["state"] == "fetched"
+
+
+def test_mass_contract_rejection_fails_the_wave_instead_of_shrinking_scope():
+    from scrapers.fbref.pipeline import _is_mass_contract_rejection
+
+    # A few unusable archived editions: routine, the wave carries on.
+    assert not _is_mass_contract_rejection(
+        WaveResult(cohort_size=25, contract_quarantined=3)
+    )
+    # Retirements dominate a live cohort: the source moved, not the pages.
+    assert _is_mass_contract_rejection(
+        WaveResult(cohort_size=25, contract_quarantined=25)
+    )
+    # Dominant but still small stays routine, so a short backlog can drain.
+    assert not _is_mass_contract_rejection(
+        WaveResult(cohort_size=5, contract_quarantined=5)
+    )
+    # Many retirements that do not dominate stay routine too.
+    assert not _is_mass_contract_rejection(
+        WaveResult(cohort_size=25, contract_quarantined=10)
+    )
+
+
+def test_wave_result_publishes_the_counter_the_recovery_drain_reads(tmp_path):
+    # The drain reads this key off as_dict(); the DAG-side test mocks the dict,
+    # so bind the name here.
+    assert "contract_quarantined" in WaveResult().as_dict()
+
+
+def test_non_contract_parse_failure_still_fails_the_whole_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="season",
+        canonical_url="https://fbref.com/en/comps/76/2017/2017-NASL-Stats",
+        source_ids={"competition_id": "76", "season_id": "2017"},
+    ))
+    refresh, record = _commit_for_parse(raw, target, "<html></html>")
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "target_id": "fbref:season:76:9999",
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    }]
+    pipeline = FBrefPipeline(control, raw, generic_writer=ContractWriter())
+
+    with pytest.raises(ParseWaveError, match="target mismatch"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["season"],
+            settings=_settings("current"),
+        )
+
+    assert control.frontier[record.target_id]["state"] == "fetched"
 
 
 def test_duplicate_display_label_selects_one_canonical_current_edition(
@@ -2910,6 +3209,101 @@ def test_validation_fails_closed_on_partial_target_state(tmp_path):
     with pytest.raises(RunValidationError, match="incomplete_targets"):
         pipeline.validate_and_finish(str(uuid.uuid4()))
     assert "finish:False" not in control.events
+
+
+def test_validation_treats_failed_targets_as_returned_to_queue(tmp_path):
+    """Mirror of the wave gate for #1102: a terminally failed target is the
+    frontier's problem now, not this run's — validation must not brand the
+    resumed run incomplete over it. Traffic gates still police run quality."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    base_summary = control.get_run_summary(str(uuid.uuid4()))
+    control.get_run_summary = lambda _, **__: {
+        **base_summary,
+        "target_counts": {"succeeded": 1, "failed": 1},
+        "traffic_totals": {"warm_http_success_rate": 1.0},
+    }
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:True" in control.events
+
+
+def test_lone_validate_clear_reanimates_before_finishing_green(tmp_path):
+    """Clearing only the validate task never re-runs the waves; when the
+    gates pass on a 'failed' run, validation itself must reanimate before
+    finish_run, or the resume dies on StateConflict (#1102)."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.run["status"] = "failed"
+    captured = {}
+
+    def start_run(run_id, **kwargs):
+        control.events.append("start_run")
+        captured.update(kwargs)
+        control.run["status"] = "running"
+
+    control.start_run = start_run
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "start_run" in control.events
+    assert "finish:True" in control.events
+    # The run is finishing right now — reopened 'retry' targets would linger
+    # in a succeeded run forever.
+    assert captured == {"reopen_targets": False}
+
+
+def test_run_live_waves_reanimates_a_failed_run_before_the_first_wave(
+    tmp_path,
+):
+    """``airflow tasks clear -t run_live_waves`` re-runs only this task,
+    never initialize_run, so the waves themselves must reanimate the aborted
+    control run (#1102)."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.run["status"] = "failed"
+
+    def start_run(run_id):
+        control.events.append("start_run")
+        control.run["status"] = "running"
+
+    control.start_run = start_run
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    pipeline.fetch_wave = lambda *a, **k: WaveResult()
+    pipeline.parse_wave = lambda *a, **k: WaveResult()
+
+    pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="resume-live",
+        page_kinds=["competition_index"],
+        settings=_settings(),
+    )
+
+    assert "start_run" in control.events
+
+
+def test_run_live_waves_does_not_touch_a_healthy_run(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.run["status"] = "running"
+
+    def start_run(run_id):
+        raise AssertionError("healthy runs must not be restarted mid-flight")
+
+    control.start_run = start_run
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    pipeline.fetch_wave = lambda *a, **k: WaveResult()
+    pipeline.parse_wave = lambda *a, **k: WaveResult()
+
+    pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="resume-live",
+        page_kinds=["competition_index"],
+        settings=_settings(),
+    )
 
 
 def test_validation_accepts_complete_eligible_sentinel_coverage(tmp_path):
@@ -5129,6 +5523,196 @@ def test_dead_clearance_at_budget_boundary_stops_cleanly(
     assert control.events.count(f"requeue:{untouched.target_id}") == 1
 
 
+def test_a_late_re_solve_reserves_the_rotations_it_can_still_afford():
+    """A daily run reserves four proxy rotations for a clearance, but a solve
+    measures ~19 requests. Demanding all four before a mid-run re-solve ended
+    every run with ~40 % of its request budget unspent (#1129)."""
+
+    daily = PipelineSettings(
+        run_type="current",
+        request_limit=200,
+        byte_limit=100 * 1024 * 1024,
+        shard_size=25,
+    )
+    assert daily.bootstrap_request_reservation == 80
+
+    plenty = 90 * 1024 * 1024
+    assert affordable_clearance_reservation(
+        daily, request_remaining=200, byte_remaining=plenty
+    ) == (80, 16 * 1024 * 1024)
+    # 78 left: the old guard needed 82 and stopped the run right here.
+    assert affordable_clearance_reservation(
+        daily, request_remaining=78, byte_remaining=plenty
+    ) == (60, 12 * 1024 * 1024)
+    assert affordable_clearance_reservation(
+        daily, request_remaining=25, byte_remaining=plenty
+    ) == (20, 4 * 1024 * 1024)
+    # One solve plus one target is the floor; below it the ceiling is real.
+    assert (
+        affordable_clearance_reservation(
+            daily, request_remaining=21, byte_remaining=plenty
+        )
+        is None
+    )
+    # Bytes bind the same way.
+    assert affordable_clearance_reservation(
+        daily, request_remaining=200, byte_remaining=8 * 1024 * 1024
+    ) == (20, 4 * 1024 * 1024)
+    assert (
+        affordable_clearance_reservation(
+            daily, request_remaining=200, byte_remaining=6 * 1024 * 1024
+        )
+        is None
+    )
+
+    # A run that only ever reserved one solve keeps its old boundary exactly.
+    small = PipelineSettings(
+        run_type="current",
+        request_limit=120,
+        byte_limit=100 * 1024 * 1024,
+        shard_size=4,
+    )
+    assert small.bootstrap_request_reservation == 20
+    assert affordable_clearance_reservation(
+        small, request_remaining=22, byte_remaining=plenty
+    ) == (20, 4 * 1024 * 1024)
+    assert (
+        affordable_clearance_reservation(
+            small, request_remaining=21, byte_remaining=plenty
+        )
+        is None
+    )
+
+
+def test_a_warm_session_failure_late_in_a_run_re_solves_on_a_smaller_budget(
+    tmp_path,
+):
+    """The run had 78 requests left and a dead warm session. It could pay for
+    three rotations, but the guard asked for four and handed the rest of the
+    shard back — 2-10 times a day, on the drain runner too (#1129)."""
+
+    raw = _raw_store(tmp_path)
+    control = BudgetAwareFakeControl(raw)
+    control.run.update(
+        request_limit=200,
+        requests_used=40,
+        byte_limit=100 * 1024 * 1024,
+    )
+    run_id = str(uuid.UUID(int=1))
+
+    def make_lease(attempt, target, refresh, epoch):
+        return TargetLease(
+            attempt_id=str(uuid.UUID(int=attempt)),
+            run_id=run_id,
+            target_id=target,
+            logical_refresh_id=str(uuid.UUID(int=refresh)),
+            canonical_url="https://fbref.com/en/comps/",
+            page_kind="competition_index",
+            source_ids={"competition_index": "all"},
+            claim_token=str(uuid.UUID(int=attempt + 100)),
+            lease_epoch=epoch,
+            attempt_number=epoch,
+            leased_by="worker-1",
+            lease_expires_at=NOW + timedelta(minutes=10),
+        )
+
+    warm_up = make_lease(191, "fbref:competition_index:all", 191, 1)
+    rejected = make_lease(192, "fbref:competition_index:all", 192, 1)
+    retry = make_lease(193, rejected.target_id, 192, 2)
+    claims = iter(([warm_up, rejected], [retry]))
+    control.claim_targets = lambda *args, **kwargs: next(claims)
+
+    class LateFailureFetcher:
+        """The clearance spends its whole allowance, then the session dies."""
+
+        def __init__(self, events):
+            self.events = events
+            self.calls = 0
+
+        def __enter__(self):
+            self.events.append("fetcher_enter")
+            return self
+
+        def __exit__(self, *args):
+            self.events.append("fetcher_exit")
+
+        def ensure_clearance(self):
+            self.events.append("browser")
+            return True
+
+        def fetch(self, url, **kwargs):
+            self.calls += 1
+            self.events.append("http")
+            if self.calls == 2:
+                raise FetchError(
+                    "FBref warm session lost its connection",
+                    error_class="warm_session_connection",
+                    http_status=None,
+                    wire_bytes=200,
+                    browser_requests=0,
+                    target_requests=1,
+                    http_requests=1,
+                    http_status_history=(),
+                    latency_ms=100,
+                )
+            body = b"<html>ok</html>"
+            http_requests = 78 if self.calls == 1 else 1
+            return FetchResponse(
+                url=url,
+                status_code=200,
+                body=body,
+                headers={"etag": '"v1"'},
+                latency_ms=10,
+                http_wire_bytes=len(body) + 120,
+                decoded_html_bytes=len(body),
+                http_requests=http_requests,
+                http_status_history=(200,) * http_requests,
+                browser_document_bytes=500,
+                browser_asset_bytes=100,
+                browser_requests=1,
+                browser_bootstrap_attempts=1,
+            )
+
+    allowances = []
+
+    def factory(proxy_file, max_browser_requests, max_browser_bytes):
+        allowances.append((max_browser_requests, max_browser_bytes))
+        return LateFailureFetcher(control.events)
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=factory,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="worker-1",
+        page_kinds=["competition_index"],
+        settings=PipelineSettings(
+            run_type="current",
+            request_limit=200,
+            byte_limit=100 * 1024 * 1024,
+            shard_size=4,
+            domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+        ),
+    )
+
+    # The wave finished its shard instead of returning it at a false ceiling.
+    assert result.budget_exhausted is False
+    assert result.requeued_at_budget == 0
+    assert result.requeued_dead_clearance == 1
+    assert result.failures == []
+    # First solve got the full reservation, the re-solve got what still fit,
+    # and the transport was rebuilt so it cannot outspend the smaller booking.
+    assert allowances == [(80, 16 * 1024 * 1024), (60, 12 * 1024 * 1024)]
+    assert control.reservations[-1][1]["requests"] == 62
+    assert control.run["requests_used"] <= 200
+
+
 def test_a_run_that_hits_its_budget_requeues_its_targets_and_ends_clean(tmp_path):
     """The budget is a ceiling the crawler is meant to stop at. Failing the
     untouched targets made every day that spent its budget a red run — and left
@@ -5272,6 +5856,71 @@ def test_a_wave_after_the_budget_stop_no_ops_instead_of_raising(tmp_path):
 
     assert result.claimed == 0
     assert result.failures == []
+
+
+def test_a_resumed_run_with_terminally_failed_targets_no_ops_instead_of_deadlocking(
+    tmp_path,
+):
+    """A 'failed' target is terminal for its run: it is not claimable and can
+    never re-enter this run's cohort, while the page itself is already back in
+    the frontier for later runs. Counting it as unfinished deadlocked every
+    resumed run on the same FetchWaveError forever (#1102)."""
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.claim_targets = lambda *args, **kwargs: []
+    control.create_due_run_cohort = lambda *args, **kwargs: []
+    control.get_run_summary = lambda *args, **kwargs: {
+        "target_counts": {"succeeded": 29, "skipped": 20, "failed": 1},
+    }
+
+    def forbidden(*_):
+        raise AssertionError("no fetcher for an empty wave")
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=forbidden,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="worker-1",
+        page_kinds=["competition"],
+        settings=_settings(),
+    )
+
+    assert result.claimed == 0
+    assert result.failures == []
+
+
+def test_a_wave_with_claimable_backlog_still_raises_the_unfinished_gate(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.claim_targets = lambda *args, **kwargs: []
+    control.create_due_run_cohort = lambda *args, **kwargs: []
+    control.get_run_summary = lambda *args, **kwargs: {
+        "target_counts": {"succeeded": 1, "pending": 2, "leased": 1},
+    }
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError, match="3 unfinished"):
+        pipeline.fetch_wave(
+            str(uuid.UUID(int=1)),
+            worker_id="worker-1",
+            page_kinds=["competition"],
+            settings=_settings(),
+        )
 
 
 def test_the_bootstrap_allowance_follows_the_run_budget_everywhere():

@@ -10,6 +10,7 @@ from scrapers.sofascore.workload_plan import (
     WorkloadClassBudget,
     WorkloadPlanError,
     WorkloadPolicyUnavailable,
+    allocation_budget_bytes,
     match_workload_class,
     player_workload_class,
     production_match_shape,
@@ -135,7 +136,12 @@ def test_partitioned_plan_never_mixes_competitions_and_keeps_full_universe():
     assert [target_ids(item) for item in wc_matches] == [("100", "101")]
     assert set(target_ids(epl_matches[0])).isdisjoint(target_ids(wc_matches[0]))
     assert len(plan.player_universe_ids) == 55
-    assert plan.run_cap_bytes == 3 * 1_000 + 3 * 2_000 + 2 * 3_000
+    # Каждая аллокация = замеренный максимум класса + структурный headroom (#1044).
+    assert plan.run_cap_bytes == (
+        3 * allocation_budget_bytes(1_000)
+        + 3 * allocation_budget_bytes(2_000)
+        + 2 * allocation_budget_bytes(3_000)
+    )
     # Match/player bytes are shape-driven, so both competitions share one class.
     assert {item.workload_class for item in epl_matches + wc_matches} == {
         match_workload_class()

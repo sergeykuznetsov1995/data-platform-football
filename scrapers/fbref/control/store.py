@@ -101,6 +101,15 @@ _PAGE_KIND_SLA_VALUES = ", ".join(
     for page_kind, seconds in sorted(_PAGE_KIND_SLA_SECONDS.items())
 )
 _PENDING_MATCH_SAMPLE_LIMIT = 10
+# A season handover only moves addresses that carry the season in their path:
+# the season overview and the per-season subpages FBref publishes under the
+# bare competition URL while that edition is the current one.
+_ROLLOVER_RELEASABLE_PAGE_KINDS = {
+    "season",
+    "schedule",
+    "standings",
+    "season_stats",
+}
 _MAX_FRONTIER_DISCOVERY_TARGETS = 1000
 _MAX_FRONTIER_DISCOVERY_EDGES = 5000
 _PUBLICATION_SCHEMA_VERSION = "publication-generation-v1"
@@ -868,21 +877,112 @@ class ControlStore:
                 )
         return normalized_run_id
 
-    def start_run(self, run_id: object) -> None:
+    def start_run(
+        self, run_id: object, *, reopen_targets: bool = True
+    ) -> None:
         normalized = _uuid(run_id, "run_id")
         with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT status, run_type, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                FOR UPDATE
+                """,
+                (normalized,),
+            )
+            row = _fetchone(cursor)
+            if row is None:
+                raise StateConflict(f"Run {normalized} cannot be started")
+            status = str(row["status"] or "")
+            if status in {"pending", "running"}:
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.crawl_run
+                    SET status = 'running',
+                        started_at = COALESCE(started_at, clock_timestamp()),
+                        updated_at = clock_timestamp()
+                    WHERE run_id = %s AND status IN ('pending', 'running')
+                    """,
+                    (normalized,),
+                )
+                if cursor.rowcount != 1:
+                    raise StateConflict(f"Run {normalized} cannot be started")
+                return
+            metadata = _json_mapping(row["metadata"], "crawl run metadata")
+            if (
+                status != "failed"
+                or str(row["run_type"] or "") == "publication"
+                or "raw_fetch_attempt_snapshot" in metadata
+            ):
+                raise StateConflict(f"Run {normalized} cannot be started")
+            # A rerun after ``airflow tasks clear`` hits the same
+            # deterministic run_id that abort_run left 'failed' (#1102).
+            # Reanimation flips only status/finished_at: the monotonic ledger
+            # columns (requests_used/bytes_used/budget_exceeded) and metadata
+            # carry the previous attempts' spend that the retry subprocess
+            # subtracts from its budget (#1107).  'succeeded' stays terminal,
+            # publication generations keep their own terminal 'failed', and a
+            # sealed run must not re-open — its raw-audit snapshot is
+            # create-once and fresh fetches would break the seal.
             cursor.execute(
                 """
                 UPDATE fbref_control.crawl_run
                 SET status = 'running',
                     started_at = COALESCE(started_at, clock_timestamp()),
+                    finished_at = NULL,
                     updated_at = clock_timestamp()
-                WHERE run_id = %s AND status IN ('pending', 'running')
+                WHERE run_id = %s AND status = 'failed'
                 """,
                 (normalized,),
             )
             if cursor.rowcount != 1:
                 raise StateConflict(f"Run {normalized} cannot be started")
+            if not reopen_targets:
+                return
+            # Give the reanimated run its interrupted work back.  The abort
+            # marked open targets 'failed' (and a budget stop marked handed-
+            # back ones 'skipped') while returning the pages themselves to the
+            # frontier.  Only pages that are claimable RIGHT NOW come back as
+            # 'retry': the page must be due (no future backoff — a backed-off
+            # page would re-wedge the wave gate as unfinished-but-unclaimable)
+            # and must not be open in any other live run (the cohort admission
+            # guard below is mirrored so one page is never open in two runs).
+            # Dead-lettered pages ('dead') and pages other runs already
+            # handled stay behind — the wave/validation gates exclude them
+            # instead of deadlocking on them.
+            cursor.execute(
+                """
+                UPDATE fbref_control.run_target AS target
+                SET status = 'retry', updated_at = clock_timestamp()
+                FROM fbref_control.page_frontier AS frontier
+                WHERE target.run_id = %s
+                  AND target.status IN ('failed', 'skipped')
+                  AND frontier.target_id = target.target_id
+                  AND frontier.state IN ('queued', 'retry')
+                  AND (
+                    frontier.retry_after IS NULL
+                    OR frontier.retry_after <= clock_timestamp()
+                  )
+                  AND (
+                    frontier.next_fetch_at IS NULL
+                    OR frontier.next_fetch_at <= clock_timestamp()
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM fbref_control.run_target AS outstanding
+                      JOIN fbref_control.crawl_run AS outstanding_run
+                        ON outstanding_run.run_id = outstanding.run_id
+                      WHERE outstanding.target_id = target.target_id
+                        AND outstanding.run_id <> target.run_id
+                        AND outstanding.status IN (
+                            'pending', 'leased', 'retry'
+                        )
+                        AND outstanding_run.status IN ('pending', 'running')
+                  )
+                """,
+                (normalized,),
+            )
 
     @staticmethod
     def _publication_generation_result(
@@ -3219,6 +3319,44 @@ class ControlStore:
                     """,
                     (source, competition, incoming_current),
                 )
+            if seasons:
+                # A season rollover hands one URL to another edition: FBref
+                # publishes the running season on the bare competition URL and
+                # moves the outgoing season onto its dated URL.  UNIQUE
+                # (source, canonical_url) is not an upsert arbiter here, so
+                # release every incoming URL still held by a different season
+                # of this competition before the loop below claims it.  The
+                # release deliberately stops at the competition even though the
+                # constraint is global: only the sweep below can retire a parked
+                # row, it is scoped to this competition too, and a parked URL is
+                # not inert -- canonicalisation drops the fragment, so a row
+                # left published on a sentinel would be seeded straight back
+                # onto the live URL.  A cross-competition handover therefore
+                # still fails loudly instead of corrupting another registry.  The
+                # outgoing season is normally republished in the same snapshot
+                # with its dated URL; anything left on the sentinel is swept to
+                # not-present below and is therefore never seeded again.  The
+                # sentinel carries the parked season's own id, so it stays
+                # unique no matter how often one URL changes hands: two seasons
+                # of one competition can never share a base URL to begin with.
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.season_registry AS season
+                    SET canonical_url = season.canonical_url || '#superseded:'
+                        || season.competition_id || ':' || season.season_id
+                    FROM unnest(%s::text[], %s::text[])
+                        AS incoming(season_id, canonical_url)
+                    WHERE season.source = %s AND season.competition_id = %s
+                      AND season.canonical_url = incoming.canonical_url
+                      AND season.season_id <> incoming.season_id
+                    """,
+                    (
+                        [entry.season_id for entry in seasons],
+                        [entry.canonical_url for entry in seasons],
+                        source,
+                        competition,
+                    ),
+                )
             for entry in seasons:
                 seen_ids.append(entry.season_id)
                 current_count += int(entry.is_current)
@@ -3364,6 +3502,7 @@ class ControlStore:
                     %s, %s, %s, %s, %s, %s, %s, %s::jsonb
                 )
                 ON CONFLICT (source, competition_id, alias) DO UPDATE SET
+                    season_id = EXCLUDED.season_id,
                     alias_kind = EXCLUDED.alias_kind,
                     last_snapshot_id = COALESCE(
                         EXCLUDED.last_snapshot_id,
@@ -3371,7 +3510,16 @@ class ControlStore:
                     ),
                     metadata = EXCLUDED.metadata,
                     last_seen_at = clock_timestamp()
+                -- A display label is a shop window, not an identity: FBref
+                -- reuses one label across editions, so a season rollover
+                -- legitimately hands it to the incoming season.  Rebinding a
+                -- label is therefore allowed -- refusing it would abort the
+                -- parse of the whole competition.  Every other kind stays
+                -- fail-closed: a 'source' token is the season's own id, and
+                -- letting a label steal it would silently re-scope the targets
+                -- of the season that owns it.
                 WHERE fbref_control.season_alias.season_id = EXCLUDED.season_id
+                   OR fbref_control.season_alias.alias_kind = 'label'
                 RETURNING season_id
                 """,
                 (
@@ -3538,6 +3686,11 @@ class ControlStore:
                   AND NOT season.is_current
                   AND season.metadata ->> 'direct_match_only'
                       IS DISTINCT FROM 'true'
+                  -- A season whose URL was handed to another edition is parked
+                  -- on a sentinel.  Never mint a target from one: canonical
+                  -- URLs drop the fragment, so the cohort would fetch the live
+                  -- page of whichever edition owns it now.
+                  AND strpos(season.canonical_url, '#superseded:') = 0
                   AND competition.gender = 'male'
                   AND competition.crawl_state = 'active'
                   AND competition.lifecycle_state IN (
@@ -3567,6 +3720,163 @@ class ControlStore:
             )
             return _fetchall(cursor)
 
+    @staticmethod
+    def _dated_rollover_subpage_url(
+        holder_url: str,
+        outgoing_season_url: str,
+        current_season_url: str,
+    ) -> Optional[str]:
+        """Read an outgoing subpage's dated address off two registry rows.
+
+        ``season_registry`` addresses seasons, not the schedule/standings/stats
+        subpages of a season, so a handed-over subpage has no registry row to
+        copy.  Its address is not invented either: it is derived from the two
+        neighbouring rows of the same competition, the way the manual rollover
+        unblockers do it.  The current season sits on the bare URL and spells
+        the competition slug; the outgoing season sits on the dated URL and
+        spells that same slug behind the segment and slug prefix FBref stamps
+        on every page of that edition (the prefix is not the season id --
+        tournament editions label themselves by the year they finish).  The
+        subpage keeps its own route and slug and moves under that proven
+        segment and prefix.  Any shape that is not the observed one -- a holder
+        that is already dated, a current season that is not on a bare URL, a
+        slug pair that does not share its tail on a segment boundary, a
+        different origin -- yields nothing, so the caller fails closed instead
+        of pointing a target at a guessed page.
+        """
+        holder = urlsplit(holder_url)
+        outgoing = urlsplit(outgoing_season_url)
+        current = urlsplit(current_season_url)
+        addresses = (holder, outgoing, current)
+        if len({(item.scheme, item.netloc) for item in addresses}) != 1:
+            return None
+        holder_parts = [part for part in holder.path.split("/") if part]
+        outgoing_parts = [part for part in outgoing.path.split("/") if part]
+        current_parts = [part for part in current.path.split("/") if part]
+        # /en/comps/<id>/<route>/<slug>, /en/comps/<id>/<season>/<dated slug>
+        # and /en/comps/<id>/<slug> respectively.
+        if (
+            len(holder_parts) != 5
+            or len(outgoing_parts) != 5
+            or len(current_parts) != 4
+        ):
+            return None
+        scope = holder_parts[:3]
+        if (
+            scope[:2] != ["en", "comps"]
+            or outgoing_parts[:3] != scope
+            or current_parts[:3] != scope
+        ):
+            return None
+        season_segment = outgoing_parts[3]
+        if holder_parts[3] == season_segment:
+            return None
+        bare_slug = current_parts[3]
+        dated_slug = outgoing_parts[4]
+        if not dated_slug.endswith(bare_slug):
+            return None
+        prefix = dated_slug[: -len(bare_slug)]
+        if not prefix.endswith("-"):
+            return None
+        segments = [
+            *scope, season_segment, holder_parts[3], prefix + holder_parts[4]
+        ]
+        return urlunsplit(
+            (holder.scheme, holder.netloc, "/" + "/".join(segments), "", "")
+        )
+
+    @classmethod
+    def _release_rolled_over_season_url(
+        cls,
+        cursor: Any,
+        row: Mapping[str, Any],
+        canonical_url: str,
+    ) -> bool:
+        """Move an outgoing season's page onto the address it moved to.
+
+        A season rollover republishes the bare competition URL under the new
+        edition, so the outgoing season no longer owns it -- neither for its
+        overview nor for the schedule/standings/stats pages that hang off the
+        same bare address.  ``reconcile_seasons`` runs before discovery seeds
+        the frontier, so the registry already holds the dated URL the outgoing
+        season moved to: install exactly that for the overview, and for a
+        subpage the address derived from that row and the current season's row.
+        Anything else -- a stale claim on a URL the registry still assigns to
+        its current holder, a leased identity, a registry row that is itself
+        parked or no longer published, a competition with no current season to
+        prove the shape, or a destination another target already owns --
+        releases nothing and leaves the caller to fail closed.  The move points
+        the target at a different resource, so the conditional-request
+        validators of the URL it is leaving must go with it: a stale
+        ``If-None-Match`` would answer 304 for a page that was never fetched.
+        ``last_content_hash`` deliberately stays: it fences the observation
+        already in flight for this target.
+        """
+        if str(row["state"]) == "leased":
+            return False
+        page_kind = str(row["page_kind"])
+        if page_kind not in _ROLLOVER_RELEASABLE_PAGE_KINDS:
+            return False
+        cursor.execute(
+            """
+            SELECT season.canonical_url AS outgoing_url,
+                   current_season.canonical_url AS current_url
+            FROM fbref_control.page_frontier AS outgoing
+            JOIN fbref_control.season_registry AS season
+              ON season.source = outgoing.source
+             AND season.competition_id =
+                 outgoing.source_ids ->> 'competition_id'
+             AND season.season_id = outgoing.source_ids ->> 'season_id'
+            LEFT JOIN fbref_control.season_registry AS current_season
+              ON current_season.source = outgoing.source
+             AND current_season.competition_id =
+                 outgoing.source_ids ->> 'competition_id'
+             AND current_season.is_current
+             AND current_season.present
+             AND strpos(current_season.canonical_url, '#superseded:') = 0
+            WHERE outgoing.target_id = %s
+              AND season.present AND season.lifecycle_state = 'present'
+              AND season.metadata ->> 'direct_match_only'
+                  IS DISTINCT FROM 'true'
+              AND strpos(season.canonical_url, '#superseded:') = 0
+              AND season.canonical_url <> outgoing.canonical_url
+              AND season.canonical_url <> %s
+            """,
+            (row["target_id"], canonical_url),
+        )
+        registry = _fetchone(cursor)
+        if registry is None:
+            return False
+        if page_kind == "season":
+            destination = str(registry["outgoing_url"])
+        elif registry["current_url"] is None:
+            return False
+        else:
+            destination = cls._dated_rollover_subpage_url(
+                str(row["canonical_url"]),
+                str(registry["outgoing_url"]),
+                str(registry["current_url"]),
+            )
+        if not destination:
+            return False
+        cursor.execute(
+            """
+            UPDATE fbref_control.page_frontier AS outgoing
+            SET canonical_url = %s,
+                last_etag = NULL,
+                last_modified = NULL,
+                updated_at = clock_timestamp()
+            WHERE outgoing.target_id = %s
+              AND outgoing.canonical_url = %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM fbref_control.page_frontier AS holder
+                  WHERE holder.canonical_url = %s
+              )
+            """,
+            (destination, row["target_id"], row["canonical_url"], destination),
+        )
+        return cursor.rowcount == 1
+
     def upsert_frontier_target(
         self,
         target: FrontierTarget,
@@ -3593,6 +3903,17 @@ class ControlStore:
             rows = _fetchall(cursor)
             for row in rows:
                 if row["target_id"] != target_id:
+                    # A rollover handover is tried first, whatever the holder's
+                    # state: a season that is out of scope for the current
+                    # crawl is quarantined, not deleted, and parking it on a
+                    # sentinel would leave it on a fetchable address it no
+                    # longer owns (canonicalisation drops the fragment).  Only
+                    # an identity the registry cannot place -- the pre-#949
+                    # mis-mints -- falls through to the sentinel below.
+                    if self._release_rolled_over_season_url(
+                        cursor, row, canonical_url
+                    ):
+                        continue
                     if str(row["state"]) == "quarantined":
                         # A quarantined, mis-classified target still holds this
                         # canonical URL (e.g. pre-#949 discovery minted the
@@ -4123,6 +4444,47 @@ class ControlStore:
     ) -> dict[str, int]:
         """Compatibility alias for full frontier scope reconciliation."""
         return self.reconcile_frontier_scope(source=source)
+
+    def quarantine_contract_rejected_target(
+        self,
+        target_id: object,
+        *,
+        content_hash: object,
+        reason: object,
+    ) -> bool:
+        """Retire one target whose own published shape the parser cannot use.
+
+        Fenced to the exact bytes that were rejected: a fetch that landed newer
+        content while the verdict was being formed must not be retired on a
+        stale reading.  Callers treat ``False`` as "not retired" and fail their
+        wave, so a lost race is reported rather than silently swallowed.
+
+        Deliberately a different ``last_error_class`` than the scope quarantine:
+        scope reconciliation reopens only its own verdict, so a page the parser
+        has proven unusable is not resurrected by the next registry sweep.
+        Reopening this verdict is an out-of-band decision, by design -- the
+        source shape has to change first.
+        """
+
+        target = _text(target_id, "target_id")
+        digest = _text(content_hash, "content_hash")
+        detail = _text(reason, "reason")[:1000]
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                UPDATE fbref_control.page_frontier
+                SET state = 'quarantined', next_fetch_at = NULL,
+                    retry_after = NULL,
+                    last_error_class = 'ParseContractQuarantined',
+                    last_error_message = %s,
+                    updated_at = clock_timestamp()
+                WHERE target_id = %s
+                  AND last_content_hash = %s
+                  AND state NOT IN ('leased', 'dead')
+                """,
+                (detail, target, digest),
+            )
+            return bool(cursor.rowcount)
 
     def list_acceptance_candidates(
         self,
@@ -4895,6 +5257,9 @@ class ControlStore:
         # Admission tiers keep the publication spine ahead of an arbitrarily
         # old enrichment backlog.  In particular, a newly discovered current
         # match must not need a previous fetch before it becomes critical.
+        # The escape hatch above the match drain is deliberate: a spine page
+        # that is overdue by more than a whole freshness SLA has stopped
+        # discovering the very matches the drain feeds on, so it preempts it.
         cohort = []
         with self._transaction() as cursor:
             cursor.execute(
@@ -4909,7 +5274,10 @@ class ControlStore:
                 raise StateConflict(f"Run {run} cannot accept a due cohort")
             cursor.execute(
                 _FRONTIER_SCOPE_CTE
-                + """
+                + f"""
+                , sla(page_kind, sla_seconds) AS (
+                    VALUES {_PAGE_KIND_SLA_VALUES}
+                )
                 , eligible AS MATERIALIZED (
                   SELECT frontier.target_id, frontier.page_kind,
                          frontier.last_fetched_at, frontier.created_at,
@@ -4923,21 +5291,33 @@ class ControlStore:
                          CASE
                            WHEN frontier.page_kind = 'competition_index'
                              THEN 0
+                           WHEN frontier.page_kind = ANY(%s::text[])
+                            AND frontier.refresh_policy <> 'historical_once'
+                            AND COALESCE(
+                                  frontier.retry_after,
+                                  frontier.next_fetch_at,
+                                  frontier.last_fetched_at,
+                                  frontier.created_at
+                                ) < clock_timestamp()
+                                    - (sla.sla_seconds * interval '1 second')
+                             THEN 1
                            WHEN frontier.page_kind = 'match'
                             AND frontier.refresh_policy <> 'historical_once'
                             AND COALESCE(scope.has_current_season, false)
-                             THEN 1
-                           WHEN frontier.page_kind = ANY(%s::text[])
-                            AND frontier.refresh_policy <> 'historical_once'
                              THEN 2
                            WHEN frontier.page_kind = ANY(%s::text[])
                             AND frontier.refresh_policy <> 'historical_once'
                              THEN 3
-                           ELSE 4
+                           WHEN frontier.page_kind = ANY(%s::text[])
+                            AND frontier.refresh_policy <> 'historical_once'
+                             THEN 4
+                           ELSE 5
                          END AS admission_tier
                   FROM fbref_control.page_frontier AS frontier
                   LEFT JOIN scope_rollup AS scope
                     ON scope.target_id = frontier.target_id
+                  LEFT JOIN sla
+                    ON sla.page_kind = frontier.page_kind
                   WHERE (
                         frontier.state IN ('queued', 'retry')
                         OR (
@@ -5000,6 +5380,7 @@ class ControlStore:
                 FOR UPDATE OF frontier SKIP LOCKED
                 """,
                 (
+                    list(DISCOVERY_SPINE_PAGE_KINDS),
                     list(DISCOVERY_SPINE_PAGE_KINDS),
                     list(OTHER_PUBLICATION_CRITICAL_PAGE_KINDS),
                     kinds,
@@ -5417,6 +5798,27 @@ class ControlStore:
                 "response_too_large",
                 "invalid_encoding",
                 "invalid_content_type",
+                # A clearance/transport failure names the session, not a
+                # surprise: the wave resolves it by re-solving on a fresh proxy
+                # and re-claiming the same lease, and the attempt is kept as
+                # traffic evidence. Counting it unclassified made the run red
+                # for handling a dead proxy exactly as designed (#1122).
+                "warm_session_cloudflare",
+                "warm_session_connection",
+                "warm_session_forbidden",
+                "warm_session_rate_limit",
+                "warm_session_timeout",
+                # Abort bookkeeping stamps in-flight attempts with the classes
+                # below (#1102).  They are deliberate run-lifecycle evidence,
+                # not unclassified surprises — without them here a resumed run
+                # was branded red by the accounting of its own abort (one
+                # stamped attempt over a 200-request profile is exactly the
+                # 0.005 gate threshold).
+                "AirflowDagFailure",
+                "RunAborted",
+                "LiveWavesSubprocessTimeout",
+                "LiveWavesSubprocessFailure",
+                "LiveWavesResultMissing",
             ]
             cursor.execute(
                 """
@@ -5474,7 +5876,14 @@ class ControlStore:
                                        attempt.logical_refresh_id
                                    AND prior.attempt_number <
                                        attempt.attempt_number
-                                   AND prior.status IN ('failed', 'expired')
+                                   -- 'cancelled' priors are consciously
+                                   -- returned-unfetched claims (budget stop
+                                   -- / UnfetchedRequeue); a reanimated run
+                                   -- re-claiming them (#1102) is not a
+                                   -- duplicate paid fetch.
+                                   AND prior.status IN (
+                                       'failed', 'expired', 'cancelled'
+                                   )
                                    AND prior.error_class IS NOT NULL
                              )
                        )
@@ -5934,6 +6343,11 @@ class ControlStore:
                 WHERE attempt.status = 'succeeded'
                   AND attempt.raw_manifest_key IS NOT NULL
                   AND attempt.content_hash IS NOT NULL
+                  -- Raw behind a retired target is out of scope by the same
+                  -- decision that retired it, exactly as in the recovery
+                  -- cohort.  Without this the run would clear recovery and
+                  -- then fail its own unprocessed-raw gate on the same bytes.
+                  AND frontier.state <> 'quarantined'
                   AND (
                     (
                       %s::text IS NULL
@@ -6651,6 +7065,11 @@ class ControlStore:
         a successful immutable raw commit remains recoverable when a later task
         made its parent run fail or get cancelled.  Oldest raw is drained first
         so repeated bounded calls cannot starve earlier observations.
+
+        Quarantined targets are excluded: their raw is out of scope by the same
+        decision that retired them, and without this a page the parser has
+        already proven unusable would be re-selected by every later run.
+        Reopening a target requeues it and makes its raw eligible again.
         """
         parser = _text(parser_version, "parser_version")
         typed_parser = _text(typed_parser_version, "typed_parser_version")
@@ -6684,6 +7103,7 @@ class ControlStore:
                 JOIN fbref_control.page_frontier AS frontier
                   ON frontier.target_id = attempt.target_id
                 WHERE frontier.source = %s
+                  AND frontier.state <> 'quarantined'
                   AND attempt.status = 'succeeded'
                   AND attempt.raw_manifest_key IS NOT NULL
                   AND attempt.content_hash IS NOT NULL

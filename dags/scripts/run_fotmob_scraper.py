@@ -438,21 +438,6 @@ def _replay_missing_raw_evidence(
     }
 
 
-def _scope_is_historical(source_season_key: str, *, reference_year: int) -> bool:
-    """Identify a source season that ended before the run's UTC year.
-
-    FotMob can keep an old season selected for a discontinued competition, so
-    ``is_latest`` alone is not proof that its globally addressed teams still
-    exist. Unknown season formats stay fail-closed.
-    """
-
-    years = [
-        int(value)
-        for value in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", str(source_season_key))
-    ]
-    return bool(years) and max(years) < int(reference_year)
-
-
 def _identity_hash(values: Iterable[Any]) -> str:
     material = "\0".join(sorted(str(value) for value in values)).encode("utf-8")
     return hashlib.sha256(material).hexdigest()
@@ -823,10 +808,21 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     discovered_identities = {season.identity for season in seasons}
     missing_scopes = sorted(set(explicit_scopes) - discovered_identities)
     if missing_scopes:
-        scope_validation.errors.append(
-            "requested exact scopes were not advertised by FotMob: "
-            + ",".join(f"{comp}={season}" for comp, season in missing_scopes)
-        )
+        # FotMob simply does not advertise every requested ID=season pair (a
+        # competition that did not run that season). That is a property of the
+        # source, not a run failure: turning it into an error made a whole
+        # backfill chunk red even when every other requested scope was
+        # collected. Unadvertised pairs are therefore reported as skipped, and
+        # only a request where NOTHING asked for exists stays an error.
+        scope_validation.skipped += len(missing_scopes)
+        scope_validation.metadata["unadvertised_scopes"] = [
+            f"{comp}={season}" for comp, season in missing_scopes
+        ]
+        if not (set(explicit_scopes) & discovered_identities):
+            scope_validation.errors.append(
+                "requested exact scopes were not advertised by FotMob: "
+                + ",".join(f"{comp}={season}" for comp, season in missing_scopes)
+            )
         if scope_validation not in operations:
             operations.append(scope_validation)
 
@@ -843,9 +839,13 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     )
     previously_complete: set[tuple[int, str]] = set()
     if mode == RunMode.BACKFILL:
+        # No run_id filter on purpose: service.run_id is the publication
+        # generation_id, unique per DagRun, so scoping the resume set to it made
+        # every @continuous drain iteration replan the very first chunk forever.
+        # The drain resumes across DagRuns on plan_signature + parser_version;
+        # a parser bump still reprocesses everything.
         previously_complete = service.repository.completed_scope_keys(
             scope_plan_signature,
-            run_id=service.run_id,
         )
     elif mode == RunMode.REPLAY:
         for season in seasons:
@@ -953,17 +953,14 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 team_operation, player_ids = service.sync_team_snapshots(
                     bundle,
                     limit=min(per_run_limit, capacity),
-                    # A team advertised only by a historical season can have
-                    # a deliberately removed global endpoint. Resolve that
-                    # absence without tombstoning a last-good global snapshot;
-                    # current or unparseable latest seasons remain fail-closed.
-                    allow_advertised_absence=(
-                        not item.is_latest
-                        or _scope_is_historical(
-                            item.source_season_key,
-                            reference_year=started_at.year,
-                        )
-                    ),
+                    # An advertised team without a global /teams payload is a
+                    # fact about the source in ANY season: besides removed
+                    # deep-history clubs, current small-cup entrants and
+                    # bracket placeholders (e.g. team id -1) never get a page
+                    # (#1070: 96 proven null-body teams in latest seasons).
+                    # The absence path commits EXCLUDED without tombstoning a
+                    # last-good snapshot, so latest seasons are safe too.
+                    allow_advertised_absence=True,
                 )
                 operations.append(team_operation)
                 scope_operations.append(team_operation)
@@ -1135,7 +1132,6 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         if mode == RunMode.BACKFILL:
             completed_transfer_ids = service.repository.completed_competition_ids(
                 transfer_signature,
-                run_id=service.run_id,
             )
         elif mode == RunMode.DAILY:
             transfer_completion_times = service.repository.competition_completion_times(
@@ -1191,10 +1187,13 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             operations.append(transfer_operation)
             expected_hits = transfer_operation.metadata.get("source_hits")
             observed_events = int(transfer_operation.counts.get("events") or 0)
+            tolerated_deficit = int(
+                transfer_operation.metadata.get("source_hits_deficit") or 0
+            )
             complete_stream = (
                 transfer_operation.ok
                 and expected_hits is not None
-                and observed_events >= int(expected_hits)
+                and observed_events + tolerated_deficit >= int(expected_hits)
             )
             if complete_stream:
                 completion = OperationResult(
@@ -1214,6 +1213,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                                 "window": transfer_window,
                                 "source_hits": int(expected_hits),
                                 "observed_events": observed_events,
+                                "source_hits_deficit": tolerated_deficit,
                             },
                             counts={"events": observed_events},
                         )

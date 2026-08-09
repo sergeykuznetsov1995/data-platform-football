@@ -1222,6 +1222,52 @@ def _table_for_entity(entity: str, tables: Sequence[str]) -> Optional[str]:
     )
 
 
+def _replay_free_child_projection(
+    probe_seen: Mapping[str, Any],
+    child_value: Any,
+) -> Any:
+    """Drop child entries byte-identical to an earlier probe contribution.
+
+    A probe work item and the match chunk that later covers the same frozen
+    game_ids replay identical immutable raw payloads, so their deterministic
+    commit ids and attempted snapshots repeat exactly.  Only that probe
+    provenance is forgiven: ``probe_seen`` accumulates probe children alone,
+    so for every other work-item pairing a repeated identity still fails
+    closed in the strict merge below.
+    """
+
+    if not isinstance(child_value, Mapping) or not probe_seen:
+        return child_value
+    projected: dict[str, Any] = {}
+    for key, value in child_value.items():
+        if not isinstance(value, list):
+            projected[key] = value
+            continue
+        # Multiset removal: one probe contribution forgives exactly one
+        # repeat, so a child's own internal duplicate survives the filter
+        # and still fails closed in the strict merge below.
+        remaining = list(probe_seen.get(key, []))
+        kept: list[Any] = []
+        for item in value:
+            if item in remaining:
+                remaining.remove(item)
+            else:
+                kept.append(item)
+        projected[key] = kept
+    return projected
+
+
+def _note_probe_child_projection(
+    probe_seen: dict[str, list[Any]],
+    child_value: Any,
+) -> None:
+    if not isinstance(child_value, Mapping):
+        return
+    for key, value in child_value.items():
+        if isinstance(value, list):
+            probe_seen.setdefault(key, []).extend(value)
+
+
 def _merge_producer_commits(
     report: MutableMapping[str, Any],
     raw_commits: Any,
@@ -2364,6 +2410,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             plan_id = str(plan["plan_id"])
             work_count = 0
             output_dir = Path(args.output).parent
+            probe_commit_replays: dict[str, list[Any]] = {}
+            probe_attempt_replays: dict[str, list[Any]] = {}
             while work_count < int(args.max_work_items):
                 batch_id = f"cli-{report['run_id']}-{work_count:06d}"
                 batch = state.create_batch(
@@ -2411,14 +2459,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     )
                     _merge_producer_commits(
                         report,
-                        child.get("producer_commits"),
+                        _replay_free_child_projection(
+                            probe_commit_replays,
+                            child.get("producer_commits"),
+                        ),
                         report_projection=True,
                     )
                     _merge_producer_attempts(
                         report,
-                        child.get("producer_attempts"),
+                        _replay_free_child_projection(
+                            probe_attempt_replays,
+                            child.get("producer_attempts"),
+                        ),
                         report_projection=True,
                     )
+                    if str(item["kind"]) == "probe":
+                        _note_probe_child_projection(
+                            probe_commit_replays,
+                            child.get("producer_commits"),
+                        )
+                        _note_probe_child_projection(
+                            probe_attempt_replays,
+                            child.get("producer_attempts"),
+                        )
                     child_traffic = child.get("traffic")
                     if isinstance(child_traffic, Mapping):
                         _merge_traffic(report["traffic"], child_traffic)

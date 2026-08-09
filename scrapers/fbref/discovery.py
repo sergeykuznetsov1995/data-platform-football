@@ -402,6 +402,39 @@ def _has_page_owned_table(documents: Sequence[BeautifulSoup]) -> bool:
     )
 
 
+def _has_competition_history_backlink(
+    documents: Sequence[BeautifulSoup], competition_id: str
+) -> bool:
+    expected = f"/en/comps/{str(competition_id).strip()}/history".casefold()
+    return any(
+        path == expected or path.startswith(expected + "/")
+        for path in (
+            _href_path(str(anchor.get("href") or "")).rstrip("/").casefold()
+            for document in documents
+            for anchor in _discovery_anchors(document)
+        )
+    )
+
+
+def season_page_is_complete_without_schedule(
+    html: str, *, competition_id: str
+) -> bool:
+    """Prove a schedule-less season page is the source's own finished shape.
+
+    Archived editions of defunct leagues publish their full result and squad
+    tables but advertise no Scores & Fixtures link at all.  A truncated or
+    challenged response can lack the link too, and treating that as terminal
+    would retire a live season, so require two positive signals the source
+    itself must supply: the page's own tables, and a source-content backlink to
+    the expected competition history.  Navigation comments never count.
+    """
+
+    documents = _document_soups(html)
+    if not _has_page_owned_table(documents):
+        return False
+    return _has_competition_history_backlink(documents, competition_id)
+
+
 def _text(value: Optional[Tag]) -> Optional[str]:
     if value is None:
         return None
@@ -445,19 +478,7 @@ def has_valid_zero_table_season_signature(
 
     expected_competition_id = str(competition_id).strip()
     expected_season_id = str(season_id).strip()
-    expected_history = (
-        f"/en/comps/{expected_competition_id}/history"
-    ).casefold()
-    history_paths = (
-        _href_path(str(anchor.get("href") or "")).rstrip("/").casefold()
-        for document in documents
-        for anchor in _discovery_anchors(document)
-    )
-    has_history_backlink = any(
-        path == expected_history or path.startswith(expected_history + "/")
-        for path in history_paths
-    )
-    if not has_history_backlink:
+    if not _has_competition_history_backlink(documents, expected_competition_id):
         return False
 
     identity_values = " ".join(

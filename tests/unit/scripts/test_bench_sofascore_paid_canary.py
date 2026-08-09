@@ -384,7 +384,12 @@ def test_shipped_candidate_has_exact_required_v3_classes_and_shapes():
     }
     # Wave 1 (#951): the top-5 club leagues plus the two measured tournaments,
     # extended with the Russian Premier League (t203) by the owner's decision.
-    assert enabled_ids == {8, 16, 17, 23, 34, 35, 203}
+    # Wave 2 (#1090, owner's decision 2026-08-04): eight split_year/16_20
+    # leagues covered by the by-shape transfer rule (37, 38, 44, 52, 53, 182,
+    # 202, 238).
+    assert enabled_ids == {
+        8, 16, 17, 23, 34, 35, 37, 38, 44, 52, 53, 182, 202, 203, 238,
+    }
     # Only t16/t17 carry paid canary samples; the other enabled leagues rely on
     # the by-shape transfer rule, which needs at least two measured tournaments.
     assert len(MEASURED_TOURNAMENT_IDS) >= MIN_MEASURED_TOURNAMENTS_FOR_TRANSFER

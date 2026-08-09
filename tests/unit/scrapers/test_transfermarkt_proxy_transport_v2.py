@@ -1255,3 +1255,179 @@ def test_a_page_paid_for_by_one_cycle_is_not_paid_for_again():
     stats = second.get_traffic_stats()
     assert stats["cache_hits"] == 1
     assert stats["provider_metered_bytes"] == 0
+
+
+@pytest.mark.unit
+def test_pseudo_status_zero_retries_on_a_fresh_exit_instead_of_failing_closed():
+    """#1092: tls-client may surface a transport failure as a pseudo-response
+    with status 0.  That response must never reach the raw store (it only
+    accepts real HTTP statuses and would fail the whole cycle closed) — the
+    attempt retries on a fresh exit like any other connection failure."""
+    provider = _FakeLeaseProvider([])
+    factory = _TlsFactory([
+        _Response(b"", status=0),
+        _Response(b"recovered"),
+    ])
+    client = TransfermarktHttpClient(
+        lease_provider=provider,
+        traffic_ledger=SharedTrafficLedger(),
+        lease_metadata=_metadata(),
+        client_factory=factory,
+        sleep_fn=lambda _s: None,
+    )
+
+    outcome = client.fetch(
+        "https://www.transfermarkt.us/a", as_json=False, label="squads",
+    )
+
+    assert outcome.status is FetchStatus.OK
+    stats = client.get_traffic_stats()
+    assert stats["failed_attempts"] == 1
+    assert stats["successful_attempts"] == 1
+    assert stats["status_counts"] == {"0": 1, "200": 1}
+
+
+@pytest.mark.unit
+def test_pseudo_status_zero_exhausts_retries_without_a_raw_store_error():
+    provider = _FakeLeaseProvider([])
+    factory = _TlsFactory([_Response(b"", status=0)] * 8)
+    client = TransfermarktHttpClient(
+        lease_provider=provider,
+        traffic_ledger=SharedTrafficLedger(),
+        lease_metadata=_metadata(),
+        client_factory=factory,
+        sleep_fn=lambda _s: None,
+    )
+
+    outcome = client.fetch(
+        "https://www.transfermarkt.us/a", as_json=False, label="squads",
+    )
+
+    assert outcome.status is FetchStatus.RETRY_EXHAUSTED
+    assert outcome.status_code == 0
+    assert "transport" in (outcome.error or "")
+
+
+def _closable_lease():
+    return ProxyLease(
+        lease_id="abc",
+        token="secret",
+        proxy_url="http://proxy_filter:8900",
+        max_bytes=1234,
+        expires_at=123.0,
+    )
+
+
+@pytest.mark.unit
+def test_lease_close_retries_the_teardown_race_then_succeeds():
+    # The filter waits at most 2s for its own tunnels to drain, so a close
+    # issued right after the transport was discarded can race it (#1096).
+    control = _ControlClient([
+        _ControlResponse(409, {
+            "code": "lease_close_pending",
+            "error": "lease provider counters are not final",
+            "up_bytes": 10,
+            "down_bytes": 80,
+            "total_bytes": 90,
+        }),
+        _ControlResponse(200, {
+            "up_bytes": 10,
+            "down_bytes": 90,
+            "total_bytes": 100,
+            "closed": True,
+        }),
+    ])
+    naps = []
+    provider = ProxyFilterLeaseProvider(
+        "http://proxy_filter:8899",
+        control_client=control,
+        control_token=CONTROL_TOKEN,
+        sleep_fn=naps.append,
+    )
+
+    snapshot = provider.close(_closable_lease())
+
+    assert snapshot.provider_bytes == 100
+    assert snapshot.closed is True
+    assert naps == [0.2]
+    assert [call[0] for call in control.calls] == ["DELETE", "DELETE"]
+
+
+@pytest.mark.unit
+def test_lease_close_accepts_the_permanent_uncertainty_latch():
+    # One mid-response abort latches accounting_uncertain forever; the filter
+    # retains the unproven tail as durable escrow and by design never answers
+    # 200 for that lease. Its 409 counters are the final client-visible
+    # ledger, so the finished sub-cycle work must not be discarded (#1096).
+    control = _ControlClient([
+        _ControlResponse(409, {
+            "code": "lease_close_pending",
+            "error": "lease provider counters are not final",
+            "close_error": (
+                "provider byte accounting is uncertain; durable escrow retained"
+            ),
+            "up_bytes": 10,
+            "down_bytes": 80,
+            "total_bytes": 90,
+            "closed": True,
+        }),
+    ])
+    naps = []
+    provider = ProxyFilterLeaseProvider(
+        "http://proxy_filter:8899",
+        control_client=control,
+        control_token=CONTROL_TOKEN,
+        sleep_fn=naps.append,
+    )
+
+    snapshot = provider.close(_closable_lease())
+
+    assert snapshot.provider_bytes == 90
+    assert naps == []
+    assert len(control.calls) == 1
+
+
+@pytest.mark.unit
+def test_lease_close_still_fails_closed_on_other_conflicts():
+    control = _ControlClient([
+        _ControlResponse(409, {
+            "code": "allocation_close_rejected",
+            "error": "allocation ledger refused the close",
+        }),
+    ])
+    provider = ProxyFilterLeaseProvider(
+        "http://proxy_filter:8899",
+        control_client=control,
+        control_token=CONTROL_TOKEN,
+        sleep_fn=lambda seconds: None,
+    )
+
+    with pytest.raises(ProxyRequiredError, match="allocation ledger refused"):
+        provider.close(_closable_lease())
+
+
+@pytest.mark.unit
+def test_lease_close_gives_up_when_the_drain_never_settles():
+    pending = {
+        "code": "lease_close_pending",
+        "error": "lease provider counters are not final",
+        "up_bytes": 0,
+        "down_bytes": 0,
+        "total_bytes": 0,
+    }
+    control = _ControlClient(
+        [_ControlResponse(409, dict(pending)) for _ in range(5)]
+    )
+    naps = []
+    provider = ProxyFilterLeaseProvider(
+        "http://proxy_filter:8899",
+        control_client=control,
+        control_token=CONTROL_TOKEN,
+        sleep_fn=naps.append,
+    )
+
+    with pytest.raises(ProxyRequiredError, match="stayed pending"):
+        provider.close(_closable_lease())
+
+    assert naps == [0.2, 0.5, 1.0, 2.0]
+    assert len(control.calls) == 5

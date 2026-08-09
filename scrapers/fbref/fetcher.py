@@ -55,6 +55,45 @@ try:  # pragma: no cover - curl_cffi is installed in the production image
 except ImportError:  # pragma: no cover - exercised by the import-light suite
     _CURL_WRITEFUNC_ERROR = 0xFFFFFFFF
 
+# A dead proxy raises a transport exception whose libcurl prose ("Could not
+# connect to proxy", "Recv failure") matches none of the substrings the text
+# classifier looks for, so the sessionwide failure used to be filed as an
+# unclassified per-target one and failed the whole wave (#1122). The exception
+# TYPE says what the text does not. Same guarded-import pattern as above so the
+# import-light suite keeps working without the optional transport.
+def _transport_error_types(*names: str) -> tuple[type[BaseException], ...]:
+    """Collect the transport exception types this curl_cffi actually ships.
+
+    Resolved name by name: a renamed or dropped class costs its own coverage,
+    never the whole tuple, so an upgrade cannot silently restore #1122.
+    """
+    try:  # pragma: no cover - curl_cffi is installed in the production image
+        from curl_cffi.requests import exceptions as curl_exceptions
+    except ImportError:  # pragma: no cover - exercised by import-light suite
+        return ()
+    found = tuple(
+        resolved
+        for resolved in (getattr(curl_exceptions, name, None) for name in names)
+        if isinstance(resolved, type) and issubclass(resolved, BaseException)
+    )
+    missing = [name for name in names if not hasattr(curl_exceptions, name)]
+    if missing:  # pragma: no cover - only on a transport upgrade
+        logging.getLogger(__name__).warning(
+            "curl_cffi no longer exposes %s; transport failures using it fall "
+            "back to text classification",
+            ", ".join(missing),
+        )
+    return found
+
+
+# ProxyError and friends are what a dead proxy raises. Their subclasses come
+# along by isinstance: SSLError and DNSError extend ConnectionError,
+# ConnectTimeout and ReadTimeout extend Timeout.
+_TRANSPORT_TIMEOUT_ERRORS = _transport_error_types("Timeout")
+_TRANSPORT_CONNECTION_ERRORS = _transport_error_types(
+    "ProxyError", "ConnectionError"
+)
+
 
 class _CumulativeBodyBuffer:
     """Bound response bodies across every HTTP attempt for one logical fetch."""
@@ -817,9 +856,13 @@ class FBrefFetcher:
         try:
             self._extend_provider_lease_for_http()
         except Exception as exc:
+            # fetch_attempt.error_message only ever stores str(FetchError), so
+            # the chained cause text must be inlined here or it is lost (#1107).
+            cause_text = str(exc)[:300]
             raise FetchError(
                 "FBref browser/HTTP provider phase boundary failed: "
-                f"{type(exc).__name__}",
+                f"{type(exc).__name__}"
+                + (f": {cause_text}" if cause_text else ""),
                 error_class="hard_transport_policy",
                 browser_document_bytes=breakdown[0],
                 browser_asset_bytes=breakdown[1],
@@ -921,6 +964,18 @@ class FBrefFetcher:
         error_type = status_types.get(partial_status)
         if error_type is None:
             error_type = classify_error(str(exc))
+        if error_type == "unknown":
+            # The prose stays the primary signal: a proxy that reports "HTTP
+            # code 429 after CONNECT" carries no response object, so its only
+            # evidence of rate limiting is that sentence. The exception type is
+            # the fallback for the prose libcurl writes when a proxy is simply
+            # dead -- "Could not connect to proxy", which matches none of the
+            # classifier's substrings and used to be filed as an unclassified
+            # per-target failure that killed the whole wave (#1122).
+            if isinstance(exc, _TRANSPORT_TIMEOUT_ERRORS):
+                error_type = "timeout"
+            elif isinstance(exc, _TRANSPORT_CONNECTION_ERRORS):
+                error_type = "connection"
         if error_type in {
             "cloudflare",
             "connection",

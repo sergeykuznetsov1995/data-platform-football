@@ -343,7 +343,7 @@ class TestMatchParser:
         with pytest.raises(WhoScoredParseError, match=r"events\[1\]\.id is required"):
             parse_matchcentre_data(data, scope=CLUB_SCOPE, game_id=1)
 
-    def test_team_local_event_ids_can_repeat_only_across_teams(self):
+    def test_team_local_event_ids_may_repeat_within_a_team(self):
         data = _matchcentre()
         data["events"][1]["eventId"] = data["events"][0]["eventId"]
         data["events"][1]["teamId"] = 167
@@ -353,9 +353,61 @@ class TestMatchParser:
         assert [row["source_event_id"] for row in events] == [4_100_001, 4_100_002]
         assert [row["team_event_id"] for row in events] == [41, 41]
 
+        # The counter is source-side bookkeeping, so one team reuses it too
+        # (#1080).  Both actions keep their own Opta id and both survive.
         data["events"][1]["teamId"] = 26
-        with pytest.raises(WhoScoredParseError, match="team-local event identity"):
+        repeated = parse_matchcentre_data(
+            data, scope=CLUB_SCOPE, game_id=1
+        ).events.rows
+
+        assert [row["source_event_id"] for row in repeated] == [4_100_001, 4_100_002]
+        assert [row["team_id"] for row in repeated] == [26, 26]
+        assert [row["team_event_id"] for row in repeated] == [41, 41]
+
+    def test_same_record_delivered_twice_stays_fatal(self):
+        data = _matchcentre()
+        data["events"][1]["id"] = data["events"][0]["id"]
+        data["events"][1]["eventId"] = data["events"][0]["eventId"]
+        data["events"][1]["teamId"] = data["events"][0]["teamId"]
+
+        with pytest.raises(
+            WhoScoredParseError, match="Duplicate source event record"
+        ):
             parse_matchcentre_data(data, scope=CLUB_SCOPE, game_id=1)
+
+    def test_minted_ids_stay_derived_from_stable_inputs(self):
+        # Two distinct records share one Opta id, so both get a surrogate.  The
+        # surrogate must not depend on anything that drifts between scrapes:
+        # re-parsing the same match with re-spelled names and a later-filled
+        # coordinate must publish the same ids.
+        def _ids(player_name, extra):
+            data = _matchcentre()
+            data["playerIdNameDictionary"] = {"11": player_name, "12": player_name}
+            data["events"] = [
+                {
+                    "id": 2_929_955_323.0,
+                    "eventId": 838,
+                    "minute": 84,
+                    "teamId": 26,
+                    "playerId": 11,
+                    "type": {"displayName": "Save"},
+                    **extra,
+                },
+                {
+                    "id": 2_929_955_323.0,
+                    "eventId": 839,
+                    "minute": 84,
+                    "teamId": 26,
+                    "playerId": 12,
+                    "type": {"displayName": "BallRecovery"},
+                },
+            ]
+            rows = parse_matchcentre_data(
+                data, scope=CLUB_SCOPE, game_id=1901279
+            ).events.rows
+            return [row["source_event_id"] for row in rows]
+
+        assert _ids("Starter", {}) == _ids("A. Starter", {"x": 25.0})
 
     def test_global_event_id_uses_bigint_without_float_rounding(self):
         data = _matchcentre()

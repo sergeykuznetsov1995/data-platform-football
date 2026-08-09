@@ -829,3 +829,21 @@ def test_pending_players_must_come_from_full_universe(tmp_path):
 def test_duplicate_ids_fail_instead_of_being_silently_dropped(field_values):
     with pytest.raises(WorkloadPlanError, match="duplicate IDs"):
         stable_partitions(field_values, 25)
+
+
+def test_allocation_budget_carries_structural_headroom_over_evidence():
+    # #1044: замеренный максимум остаётся честным (hard_task_bytes = max
+    # сэмплов, гард артефакта не тронут), но enforcement-кап несёт запас —
+    # сезонные классы дрейфуют между сезонами и исчерпывались досуха.
+    from scrapers.sofascore.workload_plan import (
+        ALLOCATION_BUDGET_HEADROOM_PERCENT,
+        allocation_budget_bytes,
+    )
+
+    assert ALLOCATION_BUDGET_HEADROOM_PERCENT == 15
+    assert allocation_budget_bytes(100) == 115
+    assert allocation_budget_bytes(456_951) == 525_494  # класс ENG из #1044
+    # ceil-деление: остаток всегда округляется вверх, кап не ниже замера
+    assert allocation_budget_bytes(1) == 2
+    with pytest.raises(WorkloadPlanError, match="must be positive"):
+        allocation_budget_bytes(0)

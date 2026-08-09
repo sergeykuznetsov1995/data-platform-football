@@ -188,6 +188,50 @@ class TestBronzeFreshnessGate:
         assert result["status"] == "success"
         assert any(entry.endswith(":noop") for entry in result["checked"])
 
+    def test_manifest_dq_accepts_a_season_that_has_not_started(
+        self, dag_module, monkeypatch
+    ):
+        """#1109: nothing played yet means the capture engine never ran, so it
+        cannot stamp completeness. Without this exemption every league waiting
+        for its first matchday keeps the whole daily run red."""
+
+        def load(path, logger):
+            if "match_capture" in path:
+                return {
+                    "matches_total": 0,
+                    "matches_skipped_existing": 0,
+                    "rows": 0,
+                    "errors": [],
+                    "fallback": False,
+                    "fallback_reason": "season_has_no_finished_matches",
+                }
+            return {"endpoint_completeness": 1.0, "errors": []}
+
+        monkeypatch.setattr(dag_module, "_load_result", load)
+        result = dag_module.run_sofascore_dq()
+        assert result["status"] == "success"
+        assert any(entry.endswith(":unstarted") for entry in result["checked"])
+
+    def test_manifest_dq_rejects_an_empty_capture_without_that_reason(
+        self, dag_module, monkeypatch
+    ):
+        """A capture that wrote nothing for any other reason still fails."""
+
+        def load(path, logger):
+            if "match_capture" in path:
+                return {
+                    "matches_total": 0,
+                    "matches_skipped_existing": 0,
+                    "rows": 0,
+                    "errors": [],
+                    "fallback": False,
+                }
+            return {"endpoint_completeness": 1.0, "errors": []}
+
+        monkeypatch.setattr(dag_module, "_load_result", load)
+        with pytest.raises(Exception, match="canonical endpoint completeness failed"):
+            dag_module.run_sofascore_dq()
+
     def test_manifest_dq_rejects_partial_skip_without_completeness(
         self, dag_module, monkeypatch
     ):
@@ -734,10 +778,17 @@ class TestPlayerRotationGate:
             assert gate._init_kwargs["ignore_downstream_trigger_rules"] is False
 
     def test_todays_two_league_scope_keeps_its_weekly_cadence(
-        self, dag_module, rotation_env
+        self, dag_module, monkeypatch, rotation_env
     ):
         # Regression: below the threshold the rotation is a no-op — EPL and the
-        # World Cup still run on every Saturday.
+        # World Cup still run on every Saturday. The shipped scope crossed the
+        # threshold in wave 2 (#1090), so the narrow bootstrap pair is
+        # simulated explicitly, mirroring ``_wide_scope``.
+        monkeypatch.setattr(
+            dag_module, "SOFASCORE_LEAGUES", ["ENG-Premier League", "INT-World Cup"]
+        )
+        monkeypatch.setattr(dag_module, "CLUB_LEAGUES", ["ENG-Premier League"])
+        monkeypatch.setattr(dag_module, "TOURNAMENT_LEAGUES", ["INT-World Cup"])
         for week in range(4):
             boundary = datetime(2026, 1, 10 + 7 * week)
             due = dag_module._due_player_leagues(
@@ -950,16 +1001,32 @@ class TestRegistryActivation:
             "FRA-Ligue 1",  # 34
             "GER-Bundesliga",  # 35
             "RUS-Premier League",  # 203 (#951+, решение владельца 2026-07-16)
+            "BEL-Pro League",  # 38 (#1090 волна 2, решение владельца 2026-08-04)
+            "FRA-Ligue 2",  # 182 (#1090 волна 2)
+            "GER-2. Bundesliga",  # 44 (#1090 волна 2)
+            "ITA-Serie B",  # 53 (#1090 волна 2)
+            "NED-Eredivisie",  # 37 (#1090 волна 2)
+            "POL-Ekstraklasa",  # 202 (#1090 волна 2)
+            "POR-Liga Portugal",  # 238 (#1090 волна 2)
+            "TUR-Süper Lig",  # 52 (#1090 волна 2)
         }
         # EPL stays the primary club (legacy task ids / result paths); the rest
         # follow the registry's canonical-id sort order.
         assert dag_module.CLUB_LEAGUES == [
             "ENG-Premier League",
+            "BEL-Pro League",
             "ESP-La Liga",
             "FRA-Ligue 1",
+            "FRA-Ligue 2",
+            "GER-2. Bundesliga",
             "GER-Bundesliga",
             "ITA-Serie A",
+            "ITA-Serie B",
+            "NED-Eredivisie",
+            "POL-Ekstraklasa",
+            "POR-Liga Portugal",
             "RUS-Premier League",
+            "TUR-Süper Lig",
         ]
         assert dag_module.TOURNAMENT_LEAGUES == ["INT-World Cup"]
 
@@ -1326,6 +1393,46 @@ class TestValidatePlayerData:
         out = dag_module.validate_player_data()
         assert out["status"] == "success"  # low rows are WARN-only, not failed
         assert any("Low player_profile" in w for w in out["warnings"])
+
+    def test_unstarted_season_is_not_judged_on_coverage(
+        self,
+        dag_module,
+        monkeypatch,
+        tmp_path,
+    ):
+        """#1109: a league with no squad yet published never ran a capture.
+
+        Reading its empty universe as 0% coverage reddens the run for the
+        whole rollover, which is exactly what the quiet zero exists to stop.
+        """
+        quiet_zero = {
+            "rows": 0,
+            "profile_players": 0,
+            "fallback": False,
+            "errors": [],
+            "fallback_reason": "season_has_no_finished_matches",
+        }
+        monkeypatch.setattr(
+            dag_module,
+            "_load_result",
+            lambda path, logger: (
+                {
+                    "rows": 500,
+                    "profile_players": 500,
+                    "players_total": 500,
+                    "fallback": False,
+                    "tables": ["t"],
+                    "errors": [],
+                }
+                if path == dag_module.PLAYER_CAPTURE_RESULT_PATH
+                else quiet_zero
+            ),
+        )
+
+        out = dag_module.validate_player_data()
+
+        assert out["status"] == "success"
+        assert not any("below 95%" in warning for warning in out["warnings"])
 
     def test_fallback_with_some_rows_hard_fails(
         self,

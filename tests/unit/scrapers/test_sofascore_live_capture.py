@@ -20,7 +20,7 @@ from scrapers.sofascore.live_capture import (
 from scrapers.sofascore.manifest import InMemoryManifestStore, ManifestKey
 from scrapers.sofascore.pipeline import CaptureRuntime, DeferredCaptureSink
 from scrapers.sofascore.raw_store import RawPayloadStore
-from scripts.proxy_filter.budget import BudgetAccountingError
+from scripts.proxy_filter.budget import BudgetAccountingError, ProxyBudgetExceeded
 from scrapers.sofascore.workload_plan import WorkloadAllocation, _signed_plan
 
 
@@ -1163,3 +1163,40 @@ def test_dead_exit_retry_accepts_drifted_fingerprint_with_repins_increment(tmp_p
     assert len(results) == 1
     assert capture.enter_calls == 2  # dead-exit launch retried with a new dial
     assert traffic["provider_total_bytes"] == 120
+
+
+def test_starved_lease_names_budget_exhaustion_not_dead_exit(tmp_path):
+    # #1044: шлюз урезает аренду до ОСТАТКА аллокации; после почти полного
+    # исчерпания попытка получала «валидную» аренду на 29 байт и умирала на
+    # первом же платном запросе под чужим именем InvalidProxy. Теперь транспорт
+    # называет причину честно и не открывает браузер вовсе.
+    runtime, _ = _runtime(tmp_path)
+
+    class StarvedClient(_LeaseClient):
+        def acquire(self, **kwargs):
+            lease = super().acquire(**kwargs)
+            lease.max_bytes = 29
+            return lease
+
+        def _stats(self, total, **values):
+            stats = super()._stats(total, **values)
+            stats.max_bytes = 29
+            stats.allocation_remaining_provider_bytes = 29
+            return stats
+
+    client = StarvedClient([0], final_total=0)
+    capture = _Capture([_record(b'{"items":[]}')])
+    factory = _TransportFactory(client, capture)
+
+    with pytest.raises(ProxyBudgetExceeded, match="budget is exhausted"):
+        capture_live_specs(
+            runtime,
+            [_spec(1)],
+            canonical_url="https://www.sofascore.com/event/1",
+            scope="ENG-Premier League:2526",
+            entity="match_capture",
+            transport_factory=factory,
+        )
+
+    assert client.close_calls == 1
+    assert capture.enter_calls == 0

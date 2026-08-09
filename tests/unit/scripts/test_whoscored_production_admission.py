@@ -3832,6 +3832,9 @@ def test_checked_in_compose_model_matches_admission_policy(tmp_path: Path) -> No
         "SEAWEEDFS_DATA_VOLUME_NAME": "seaweedfs_data",
         "SEAWEEDFS_VOLUME_SIZE_LIMIT_MB": "1024",
         "FBREF_PROXY_CONTROL_TOKEN": "b" * 64,
+        "ESPN_BRONZE_LAYOUT_MODE": "legacy14",
+        "ESPN_RELEASE_COMMIT": "a" * 40,
+        "ESPN_RELEASE_TREE_SHA256": "b" * 64,
         "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID": "d" * 64,
         "SOFASCORE_PROXY_CONTROL_TOKEN": "b" * 64,
         "TRINO_PUBLIC_HOST": "trino.ci.invalid",
@@ -3891,6 +3894,50 @@ def test_checked_in_compose_model_matches_admission_policy(tmp_path: Path) -> No
     assert files[admission.COMMON_PROJECT][-1] == common_override
     assert files[admission.GATEWAY_PROJECT][-1] == gateway_override
     assert set(rendered) == {admission.COMMON_PROJECT, admission.GATEWAY_PROJECT}
+    scheduler_environment = rendered[admission.COMMON_PROJECT]["services"][
+        "airflow-scheduler"
+    ]["environment"]
+    rendered_espn_names = {
+        name for name in scheduler_environment if name.startswith("ESPN_")
+    }
+    policy_espn_names = {
+        name
+        for name in admission._SCHEDULER_ENVIRONMENT_NAMES
+        if name.startswith("ESPN_")
+    }
+    assert rendered_espn_names == policy_espn_names == {
+        "ESPN_ARTIFACT_ROOT_URI",
+        "ESPN_ARTIFACT_S3_ENDPOINT",
+        "ESPN_ARTIFACT_S3_SCHEME",
+        "ESPN_BRONZE_LAYOUT_MODE",
+        "ESPN_CANARY_CLAIM_SHA256",
+        "ESPN_CANARY_CLAIM_URI",
+        "ESPN_CONTROL_DATABASE_URL",
+        "ESPN_DISCOVERY_CATALOG_URL",
+        "ESPN_DISCOVERY_STATE_REF_SHA256",
+        "ESPN_DISCOVERY_STATE_REF_URI",
+        "ESPN_RAW_S3_ENDPOINT",
+        "ESPN_RAW_S3_SCHEME",
+        "ESPN_RAW_STORE_URI",
+        "ESPN_REGISTRY_PATH",
+        "ESPN_RELEASE_COMMIT",
+        "ESPN_RELEASE_TREE_SHA256",
+    }
+    assert admission._NULLABLE_SCHEDULER_ENVIRONMENT_NAMES == {
+        name for name in rendered_espn_names if scheduler_environment[name] is None
+    }
+    projected_scheduler_environment = projections["airflow-scheduler"]["environment"]
+    assert not (
+        admission._NULLABLE_SCHEDULER_ENVIRONMENT_NAMES
+        & projected_scheduler_environment.keys()
+    )
+    scheduler_volume_targets = {
+        target: (kind, read_only)
+        for kind, _source, target, read_only in projections["airflow-scheduler"][
+            "volumes"
+        ]
+    }
+    assert scheduler_volume_targets["/opt/airflow/configs/espn"] == ("bind", True)
 
     common_projections, common_hashes, common_files, common_rendered = (
         admission.render_attested_common_project(

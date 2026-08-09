@@ -255,7 +255,8 @@ def test_season_phase_signs_only_the_bounded_season_allocation(tmp_path, monkeyp
     assert signed.allocations[0].workload_class == season_workload_class(
         EPL_SEASON_SHAPE
     )
-    assert signed.run_cap_bytes == 300
+    # Замер 300 + структурный headroom 15% (#1044).
+    assert signed.run_cap_bytes == 345
     assert dict(signed.freshness_keys) == {
         "season": "day-fixed",
         "match": "final",
@@ -491,6 +492,69 @@ def test_players_phase_rereads_fresh_match_universe_then_signs_all_players(
     assert len(signed.player_universe_ids) == 55
     assert signed.dq_dependencies[0] == "materialize_full_player_universe"
     observed_probe.assert_called_once_with("ENG-Premier League", "2526")
+
+
+def _players_phase_without_a_universe(tmp_path, matches):
+    """Plan the players phase for a league nobody can be captured for."""
+    patches = _common_patches(SimpleNamespace(missing_raw_keys=()))
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patch(
+            "dags.scripts.prepare_sofascore_workload.squad_player_ids",
+            return_value=(),
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._observed_player_ids",
+            return_value=set(),
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._finished_match_ids",
+            return_value=matches,
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._pending_targets",
+            return_value=(),
+        ),
+    ):
+        return prepare_workload_plan(
+            dag_id="dag_ingest_sofascore",
+            base_run_id="scheduled-1",
+            phase="players",
+            competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=tmp_path / "player-plan.json",
+        )
+
+
+def test_players_phase_plans_an_unstarted_league_empty_instead_of_refusing(
+    tmp_path, monkeypatch
+):
+    """#1109: nothing played yet is the calendar, and the calendar is planned.
+
+    Refusing here kept every waiting league red through the whole rollover,
+    which is the failure the quiet zero exists to end. The runner still proves
+    the season really has not started before capturing nothing.
+    """
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+
+    path = _players_phase_without_a_universe(tmp_path, matches=set())
+
+    signed = load_plan(path, control_token=TOKEN)
+    assert signed.player_universe_ids == ()
+    assert not [item for item in signed.allocations if item.scope == "player"]
+
+
+def test_players_phase_still_refuses_when_played_matches_have_no_players(
+    tmp_path, monkeypatch
+):
+    """Finished matches without a single player mean evidence was lost."""
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+
+    with pytest.raises(RuntimeError, match="player universe is empty"):
+        _players_phase_without_a_universe(tmp_path, matches={"7"})
 
 
 def test_target_phase_fails_before_ids_if_season_raw_is_incomplete(

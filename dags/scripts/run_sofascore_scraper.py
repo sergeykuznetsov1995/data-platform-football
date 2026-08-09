@@ -214,6 +214,94 @@ def _resolve_match_ids_from_bronze(
             pass
 
 
+def _schedule_is_pending(league: str, season: str) -> bool:
+    """Prove a season is waiting for its first matchday, not silently broken.
+
+    ``_resolve_match_ids_from_bronze`` filters on ``status_type = 'finished'``,
+    so it returns ``[]`` both for a league whose season has not kicked off yet
+    and for one whose schedule is missing entirely. The first is the calendar
+    and must resolve to a quiet zero; the second has to keep failing closed,
+    because capturing without the common raw manifest means paid standalone
+    rediscovery. Operational storage errors are raised for the same reason.
+
+    Presence alone would not be proof: a frozen schedule, a ``status_type``
+    that drifts to NULL, or a dead source season would all keep rows around
+    while real matches go uncaptured. So the answer is positive only when the
+    partition also holds no match whose kickoff is long past while it still
+    claims to be upcoming.
+    """
+    conn = _trino_connect()
+    if conn is None:
+        raise RuntimeError("Trino unavailable during schedule presence probe")
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT count(*), "
+            # bronze stores the kickoff as epoch seconds in a ``double``, the
+            # way the source ships it, so the comparison has to convert before
+            # it compares -- Trino rejects ``double < timestamp`` outright and
+            # the raised error would be swallowed into "refusing as before",
+            # putting every unstarted league back where #1109 found it.
+            # A missing kickoff counts as overdue for the same reason the whole
+            # probe exists: only evidence may buy a quiet zero, and a NULL is
+            # the absence of it (comparisons against NULL would abstain).
+            "count_if((start_timestamp IS NULL "
+            "          OR from_unixtime(start_timestamp) "
+            "             < current_timestamp - interval '6' hour) "
+            "         AND coalesce(status_type, 'unknown') "
+            "             NOT IN ('finished', 'postponed', 'canceled')) "
+            "FROM iceberg.bronze.sofascore_schedule "
+            "WHERE league = ? AND CAST(season AS varchar) = ?",
+            (league, season),
+        )
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return False
+        return not row[1]
+    except Exception as e:
+        message = str(e).upper()
+        if any(
+            marker in message
+            for marker in ("TABLE_NOT_FOUND", "TABLE NOT FOUND", "DOES NOT EXIST")
+        ):
+            logger.info("bronze.sofascore_schedule does not exist yet.")
+            return False
+        raise RuntimeError(f"schedule presence probe failed: {e}") from e
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# A capture/player phase that resolved nothing because the source has not
+# played anything yet stamps this reason. dag_ingest_sofascore exempts it from
+# the endpoint-completeness barrier: the engine never ran, so there is no
+# completeness to claim either way (#1109).
+UNSTARTED_SEASON_REASON = "season_has_no_finished_matches"
+
+
+def _season_is_unstarted(league: str, season, season_short: str) -> bool:
+    """Decide whether an empty result is the calendar speaking (#1109).
+
+    Probes the canonical partition and, when the season has a legacy alias,
+    that one too. The probe only ever *permits* a quiet zero, so an
+    unanswerable probe returns ``False``: a storage hiccup must never be read
+    as "the season has not started".
+    """
+    try:
+        if _schedule_is_pending(league, season_short):
+            return True
+        alias = _compatible_legacy_season_alias(league, season, season_short)
+        return bool(alias and _schedule_is_pending(league, alias))
+    except Exception as probe_error:
+        logger.warning(
+            "schedule presence probe failed, refusing as before: %s",
+            probe_error,
+        )
+        return False
+
+
 def _compatible_legacy_season_alias(
     league: str,
     season,
@@ -677,6 +765,31 @@ def _run_match_capture(
         )
 
         if not match_ids:
+            # A season that has not kicked off yet publishes a schedule whose
+            # matches are all upcoming: "nothing finished to capture" is the
+            # calendar speaking, not a producer failure, and must not redden the
+            # run for every league waiting for its first matchday (#1109).
+            # A schedule that is absent altogether still refuses -- that is the
+            # case the raw-manifest guard exists for.
+            if _season_is_unstarted(league, season, season_short):
+                logger.info(
+                    "No finished matches for league=%s season=%s yet — "
+                    "season has not started; capturing nothing.",
+                    league,
+                    season_short,
+                )
+                results["fallback_reason"] = UNSTARTED_SEASON_REASON
+                results["traffic"] = {
+                    "paid_proxy_bytes": 0,
+                    "paid_proxy_mb": 0.0,
+                    "browser_sessions": 0,
+                    "browser_navigations": 0,
+                    "request_count": 0,
+                    "cache_hit_rate": 1.0,
+                    "endpoint_completeness": 1.0,
+                }
+                _write_results(output_path, results)
+                return 0
             raise RuntimeError(
                 "bronze schedule has no finished event ids; refusing "
                 "browser/source fallback outside the common raw manifest"
@@ -1308,10 +1421,12 @@ def _run_player_capture(
                     ),
                     key=int,
                 )
-                if not planned_universe:
-                    raise RuntimeError(
-                        "signed player universe is empty for this partition"
-                    )
+                # An empty signature is not automatically a broken one: a
+                # league still waiting for its first matchday is planned empty
+                # on purpose (prepare_sofascore_workload). Falling through
+                # leaves the decision to the schedule probe below, and the
+                # unplanned-local check right after still refuses the case
+                # that matters -- a plan that dropped players we can see.
                 missing_local = set(planned_universe) - set(full_player_ids)
                 if missing_local:
                     raise RuntimeError(
@@ -1334,6 +1449,31 @@ def _run_player_capture(
             if limit:
                 player_ids = player_ids[: int(limit)]
             if not player_ids:
+                # Same calendar case as the capture phase (#1109): a league
+                # whose season has not kicked off has neither finished matches
+                # nor a registered squad yet, and the signed season manifest is
+                # complete -- the source simply published nobody. Refusing here
+                # would keep the run red for every waiting league. A universe
+                # that is empty for any other reason still fails closed.
+                if _season_is_unstarted(league, season, season_short):
+                    logger.info(
+                        "No player universe for league=%s season=%s yet — "
+                        "season has not started; capturing nothing.",
+                        league,
+                        season_short,
+                    )
+                    results["fallback_reason"] = UNSTARTED_SEASON_REASON
+                    results["traffic"] = {
+                        "paid_proxy_bytes": 0,
+                        "paid_proxy_mb": 0.0,
+                        "browser_sessions": 0,
+                        "browser_navigations": 0,
+                        "request_count": 0,
+                        "cache_hit_rate": 1.0,
+                        "endpoint_completeness": 1.0,
+                    }
+                    _write_results(output_path, results)
+                    return 0
                 raise RuntimeError(
                     "player universe is empty; refusing source/browser "
                     "fallback outside the common manifest"

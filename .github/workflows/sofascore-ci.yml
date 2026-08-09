@@ -58,10 +58,13 @@ jobs:
           # every upstream release into an unreviewed change to that gate.
           # 0.16.0 widened the default rule set and made this job fail on
           # untouched master (565 findings here, 844 in fbref-ci).
+          # sqlglot resolves column types in the schedule-probe SQL contract:
+          # the probe compares an epoch double to a timestamp only once, and a
+          # substring assertion cannot tell that apart from a working query.
           python -m pip install --disable-pip-version-check \
             pytest "ruff==0.15.20" pandas numpy pyarrow trino requests PyYAML jinja2 \
             jsonschema "tls-client-python==1.15.1" python-dotenv tenacity pybreaker \
-            rapidfuzz Unidecode nicknames
+            rapidfuzz Unidecode nicknames "sqlglot==30.12.0"
 
       - name: Static checks
         run: |

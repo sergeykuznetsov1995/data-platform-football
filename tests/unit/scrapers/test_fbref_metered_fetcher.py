@@ -407,6 +407,10 @@ def test_phase_boundary_failure_is_terminal_and_never_builds_http(
         fetcher._ensure_clearance()
 
     assert raised.value.error_class == "hard_transport_policy"
+    if failure_stage == "provider_drain":
+        assert "provider drain timed out" in str(raised.value)
+    elif failure_stage == "extend":
+        assert "extension response lost" in str(raised.value)
     assert fetcher._provider_lease is original_lease
     assert fetcher._provider_http_ready is False
     assert client.extended == []

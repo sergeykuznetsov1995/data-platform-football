@@ -1567,3 +1567,79 @@ def test_maintenance_audit_mode_fails_when_drop_eligible_stage_remains(
         maintenance.maintain_fbref_generic_stages(mode="audit")
 
     assert finished == [False]
+
+
+@pytest.mark.unit
+class TestUnpartitionedCompactionProbe:
+    def test_column_not_found_falls_back_to_whole_table_probe(self):
+        # #1054: у непартиционированной таблицы в $files нет колонки partition —
+        # проба падала COLUMN_NOT_FOUND и валила maintain_whoscored_bronze.
+        import utils.maintenance_tasks as maintenance
+
+        class _UnpartitionedConnection(_MetadataConnection):
+            def cursor(self):
+                cursor = _MetadataCursor(self)
+                if not self.statements:
+                    original = cursor.execute
+
+                    def failing_execute(sql):
+                        original(sql)
+                        raise RuntimeError(
+                            "TrinoUserError(type=USER_ERROR, name=COLUMN_NOT_FOUND, "
+                            "message=\"line 4:21: Column 'partition' cannot be resolved\")"
+                        )
+
+                    cursor.execute = failing_execute
+                return cursor
+
+        conn = _UnpartitionedConnection(
+            [
+                ("s3://bucket/a.parquet", 10, 0),
+                ("s3://bucket/b.parquet", 20, 0),
+            ]
+        )
+
+        probe = maintenance._compaction_candidates(
+            conn,
+            schema="bronze",
+            table="whoscored_seasons",
+            max_input_bytes=maintenance.COMPACTION_MAX_INPUT_BYTES_PER_TABLE,
+        )
+
+        assert probe == maintenance._CompactionProbeResult(
+            (
+                ("s3://bucket/a.parquet", 10),
+                ("s3://bucket/b.parquet", 20),
+            ),
+            0,
+        )
+        assert conn.closed_cursors == 2
+        first = " ".join(conn.statements[0].split())
+        second = " ".join(conn.statements[1].split())
+        assert "GROUP BY partition" in first
+        assert "GROUP BY partition" not in second
+        assert "partition," not in second
+        assert "CROSS JOIN candidate_partition" in second
+        assert "delete_files_count = 0" in second
+        assert f"LIMIT {maintenance.COMPACTION_DISCOVERY_MAX_FILES}" in second
+
+    def test_other_probe_errors_still_propagate(self):
+        import utils.maintenance_tasks as maintenance
+
+        class _BrokenConnection(_MetadataConnection):
+            def cursor(self):
+                cursor = _MetadataCursor(self)
+
+                def failing_execute(sql):
+                    raise RuntimeError("io error")
+
+                cursor.execute = failing_execute
+                return cursor
+
+        with pytest.raises(RuntimeError, match="io error"):
+            maintenance._compaction_candidates(
+                _BrokenConnection(),
+                schema="bronze",
+                table="whoscored_seasons",
+                max_input_bytes=maintenance.COMPACTION_MAX_INPUT_BYTES_PER_TABLE,
+            )

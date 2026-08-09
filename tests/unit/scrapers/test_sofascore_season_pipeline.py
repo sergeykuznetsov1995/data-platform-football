@@ -192,6 +192,7 @@ def _seed_full_event_referee(
     event_id: int,
     referee_id: int,
     freshness_key: str = FRESHNESS,
+    referee_slug: str | None = None,
 ) -> None:
     target = PayloadTarget(
         source_tournament_id=str(TOURNAMENT_ID),
@@ -201,11 +202,14 @@ def _seed_full_event_referee(
         endpoint="event",
         freshness_key=freshness_key,
     )
+    referee: dict = {"id": referee_id, "name": f"Referee {referee_id}"}
+    if referee_slug is not None:
+        referee["slug"] = referee_slug
     payload = {
         "event": {
             "id": event_id,
             "season": {"id": SEASON_ID},
-            "referee": {"id": referee_id, "name": f"Referee {referee_id}"},
+            "referee": referee,
         }
     }
     store.store_bytes(
@@ -217,18 +221,31 @@ def _seed_full_event_referee(
     )
 
 
+def _stamp_user_counts(event: dict, *, home: int, away: int, tournament: int) -> None:
+    """Attach the popularity counters SofaScore stamps on every live event."""
+
+    event["homeTeam"]["userCount"] = home
+    event["awayTeam"]["userCount"] = away
+    event.setdefault("tournament", {}).setdefault("uniqueTournament", {})[
+        "userCount"
+    ] = tournament
+
+
 def _seed_complete_partition_roots(
     store: RawPayloadStore,
     *,
+    schedule_last_payload=None,
     schedule_next_payload=None,
 ) -> None:
     evidence = _payload(PLAYER_EVIDENCE_CASES)
+    if schedule_last_payload is None:
+        schedule_last_payload = _payload(FIXTURE_PATHS["schedule_last"])
     if schedule_next_payload is None:
         schedule_next_payload = _payload(FIXTURE_PATHS["schedule_next"])
     roots = [
         (
             build_schedule_page_spec(direction="last", page=0, **_common()),
-            _payload(FIXTURE_PATHS["schedule_last"]),
+            schedule_last_payload,
         ),
         (
             build_schedule_page_spec(direction="next", page=0, **_common()),
@@ -653,6 +670,94 @@ def test_planner_expands_squads_and_referees_from_stored_evidence(tmp_path):
         for spec in plan.specs
         if spec.key.endpoint == "referee_profile"
     ] == ["900"]
+
+
+@pytest.mark.unit
+def test_referee_profile_accepts_the_sources_own_canonicalised_id():
+    # ``/referee/786094`` answers 200 with the merged profile 774129, carrying
+    # the slug the source itself embeds as 786094 in its event pages (#1081).
+    canonicalised = {"referee": {"id": 774129, "slug": "benoit-millot"}}
+    with_evidence = build_referee_profile_spec(
+        referee_id=786094,
+        expected_slugs=("benoit-millot",),
+        **_common(),
+    )
+    without_evidence = build_referee_profile_spec(referee_id=786094, **_common())
+
+    assert with_evidence.schema_validator(canonicalised) is True
+    # No slug evidence leaves the strict id check as the only guard there is.
+    assert without_evidence.schema_validator(canonicalised) is False
+    # The alias never becomes the target: we still asked 786094 and file it there.
+    assert with_evidence.key.target_id == "786094"
+    assert with_evidence.url.endswith("/referee/786094")
+
+
+@pytest.mark.unit
+def test_referee_profile_still_rejects_another_referees_page():
+    spec = build_referee_profile_spec(
+        referee_id=786094,
+        expected_slugs=("benoit-millot",),
+        **_common(),
+    )
+
+    # A proxy handing us somebody else's page carries somebody else's slug.
+    assert (
+        spec.schema_validator({"referee": {"id": 52599, "slug": "clement-turpin"}})
+        is False
+    )
+    # A foreign id with no slug at all proves nothing and stays rejected.
+    assert spec.schema_validator({"referee": {"id": 774129}}) is False
+    assert spec.schema_validator({"referee": {"id": 786094}}) is True
+    assert spec.schema_validator({"referee": None}) is True
+    assert spec.schema_validator({"other": 1}) is False
+
+
+@pytest.mark.unit
+def test_stored_canonicalised_referee_profile_does_not_abort_planning(tmp_path):
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="last", page=0, **_common()),
+        _schedule_payload([14000001], has_next=False),
+    )
+    _seed_json(
+        raw_store,
+        build_schedule_page_spec(direction="next", page=0, **_common()),
+        _schedule_payload([], has_next=False),
+    )
+    _seed_full_event_referee(
+        raw_store,
+        event_id=14000001,
+        referee_id=786094,
+        freshness_key="event-final-v2",
+        referee_slug="benoit-millot",
+    )
+    _seed_json(
+        raw_store,
+        build_referee_profile_spec(referee_id=786094, **_common()),
+        {"referee": {"id": 774129, "slug": "benoit-millot", "name": "Benoît Millot"}},
+    )
+
+    # Before #1081 this raised SeasonPlanningError and took the whole DAG down.
+    plan = plan_season_partition(
+        raw_store,
+        manifest,
+        event_freshness_key="event-final-v2",
+        **_common(),
+    )
+
+    spec = next(
+        item for item in plan.specs if item.key.endpoint == "referee_profile"
+    )
+    assert plan.referee_ids == ("786094",)
+    assert spec.key.target_id == "786094"
+    assert spec.schema_validator(
+        {"referee": {"id": 774129, "slug": "benoit-millot"}}
+    ) is True
+    # The stored payload now reads as usable evidence, so it replays instead of
+    # asking the paid pool for a page the source will canonicalise again.
+    assert spec.key not in plan.missing_raw_keys
 
 
 @pytest.mark.unit
@@ -1528,6 +1633,128 @@ def test_runner_live_player_reports_committed_not_deferred_completeness(
     assert payload["traffic"]["endpoint_completeness"] == 1.0
 
 
+def _signed_plan_without_players():
+    """The signature a league gets while it waits for its first matchday."""
+    return SimpleNamespace(
+        player_universe_ids=(),
+        freshness_key=lambda scope: {
+            "season": FRESHNESS,
+            "match": "final",
+            "player": "fixture-week",
+        }[scope],
+    )
+
+
+def _schedule_probe(count, stale=0):
+    """Fake Trino for the schedule probe: ``stale`` overdue rows of ``count``."""
+
+    def connect():
+        cursor = MagicMock()
+        cursor.fetchone.return_value = (count, stale)
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+        return connection
+
+    return connect
+
+
+def _player_capture_with_an_empty_signature(tmp_path, monkeypatch, probe, output_name):
+    from dags.scripts import run_sofascore_scraper as runner
+
+    engine = SimpleNamespace(
+        run_id="scheduled-1::players",
+        metrics=SimpleNamespace(snapshot=lambda: {"paid_proxy_bytes": 0}),
+    )
+    runtime = SimpleNamespace(
+        engine=engine,
+        raw_store=MagicMock(),
+        manifest_store=MagicMock(),
+    )
+    scraper = MagicMock()
+    scraper.__enter__.return_value = scraper
+    scraper.__exit__.return_value = False
+    scraper._resolve_player_ids_from_bronze.return_value = []
+    output = tmp_path / output_name
+    monkeypatch.setattr(
+        runner,
+        "_source_context",
+        lambda *args: (TOURNAMENT_ID, SEASON_ID),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_tournament_canonical_url",
+        lambda *args: "https://www.sofascore.com/tournament/premier-league/17",
+    )
+    monkeypatch.setattr(runner, "_trino_connect", probe)
+
+    with (
+        patch(
+            "scrapers.sofascore.season_pipeline.plan_season_partition",
+            return_value=SimpleNamespace(complete=True),
+        ),
+        patch(
+            "scrapers.sofascore.season_pipeline.squad_player_ids",
+            return_value=(),
+        ),
+        patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper),
+    ):
+        rc = runner._run_player_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=_signed_plan_without_players(),
+            workload_allocations=(),
+            offline_replay=False,
+        )
+
+    return rc, json.loads(output.read_text(encoding="utf-8")), scraper
+
+
+@pytest.mark.unit
+def test_empty_signature_for_an_unstarted_season_captures_nothing_quietly(
+    tmp_path,
+    monkeypatch,
+):
+    """#1109 has to survive the signed plan, which is all production ever uses.
+
+    The planner signs a waiting league with an empty universe on purpose, so
+    an empty signature must reach the schedule probe instead of being read as
+    a broken one.
+    """
+    rc, payload, scraper = _player_capture_with_an_empty_signature(
+        tmp_path,
+        monkeypatch,
+        probe=_schedule_probe(380),
+        output_name="player-signed-unstarted.json",
+    )
+
+    assert rc == 0
+    assert payload["errors"] == []
+    assert payload["fallback_reason"] == "season_has_no_finished_matches"
+    assert payload["traffic"]["request_count"] == 0
+    scraper.save_to_iceberg.assert_not_called()
+
+
+@pytest.mark.unit
+def test_empty_signature_in_a_running_season_still_fails_closed(
+    tmp_path,
+    monkeypatch,
+):
+    """Nobody to capture while matches are overdue means evidence was lost."""
+    rc, payload, scraper = _player_capture_with_an_empty_signature(
+        tmp_path,
+        monkeypatch,
+        probe=_schedule_probe(380, stale=12),
+        output_name="player-signed-running.json",
+    )
+
+    assert rc == 1
+    assert any("player universe is empty" in error for error in payload["errors"])
+    scraper.save_to_iceberg.assert_not_called()
+
+
 @pytest.mark.unit
 def test_runner_refuses_new_local_player_outside_signed_post_match_plan(
     tmp_path,
@@ -1643,21 +1870,35 @@ def test_partition_materializer_rejects_duplicate_schedule_natural_key(tmp_path)
         )
 
 
-def _replayed_partition_with_cross_page_repeat(tmp_path, *, mutate=False):
+def _replayed_partition_with_cross_page_repeat(
+    tmp_path,
+    *,
+    mutate=False,
+    user_count_tick=False,
+):
     """Partition whose live-feed pages repeat event 14000001 on BOTH pages.
 
     A live paginated feed (e.g. the World Cup knockout stage) can shift a
     settled match between page windows, so the same event legally appears on
     two different pages with an identical payload (#951). ``mutate`` makes the
     repeat's payload disagree — a data conflict that must stay a hard error.
+    ``user_count_tick`` moves only the popularity counters between the two
+    fetches, which is what the source really does (#1071).
     """
     raw_store = _raw_store(tmp_path)
     manifest = InMemoryManifestStore()
     event = _schedule_event(14000001)
     if mutate:
         event["startTimestamp"] = int(event.get("startTimestamp") or 0) + 3600
+    schedule_last_payload = None
+    if user_count_tick:
+        schedule_last_payload = _payload(FIXTURE_PATHS["schedule_last"])
+        for seeded in schedule_last_payload["events"]:
+            _stamp_user_counts(seeded, home=59171, away=8138, tournament=32989)
+        _stamp_user_counts(event, home=59115, away=8142, tournament=32953)
     _seed_complete_partition_roots(
         raw_store,
+        schedule_last_payload=schedule_last_payload,
         schedule_next_payload={"events": [event], "hasNextPage": False},
     )
     plan = plan_season_partition(raw_store, manifest, **_common())
@@ -1702,6 +1943,35 @@ def test_partition_materializer_collapses_cross_page_schedule_repeat(tmp_path):
 
 
 @pytest.mark.unit
+def test_partition_materializer_collapses_cross_page_repeat_with_ticking_user_counts(
+    tmp_path,
+):
+    """#1071: the source's follower counters move between two page fetches of
+    one run. That is not a data conflict — the match itself is identical — and
+    it must not drop the whole season."""
+    plan, results = _replayed_partition_with_cross_page_repeat(
+        tmp_path,
+        user_count_tick=True,
+    )
+    materialization = materialize_season_partition(
+        plan,
+        results,
+        canonical_league="ENG-Premier League",
+        canonical_season="2025/26",
+    )
+    repeats = [
+        row
+        for row in materialization.schedule_rows
+        if str(row["game_id"]) == "14000001"
+    ]
+    assert len(repeats) == 1
+    # The first-seen page wins, counters included.
+    assert repeats[0]["source_page_direction"] == "last"
+    assert repeats[0]["home_team_user_count"] == 59171
+    assert repeats[0]["tournament_unique_tournament_user_count"] == 32989
+
+
+@pytest.mark.unit
 def test_partition_materializer_rejects_cross_page_payload_conflict(tmp_path):
     """A cross-page repeat whose match payload disagrees is a data conflict,
     not pagination noise — it must remain a hard error."""
@@ -1716,6 +1986,28 @@ def test_partition_materializer_rejects_cross_page_payload_conflict(tmp_path):
             canonical_league="ENG-Premier League",
             canonical_season="2025/26",
         )
+
+
+@pytest.mark.unit
+def test_partition_materializer_conflict_names_the_disagreeing_columns(tmp_path):
+    """A conflict must say WHICH columns disagree: without that the next
+    occurrence costs a raw-store forensic dig before anyone can tell a
+    live-feed race from a parser defect (#1071)."""
+    plan, results = _replayed_partition_with_cross_page_repeat(
+        tmp_path,
+        mutate=True,
+    )
+    with pytest.raises(SeasonMaterializationError) as excinfo:
+        materialize_season_partition(
+            plan,
+            results,
+            canonical_league="ENG-Premier League",
+            canonical_season="2025/26",
+        )
+    message = str(excinfo.value)
+    assert "conflicting columns" in message
+    assert "start_timestamp" in message
+    assert "user_count" not in message
 
 
 @pytest.mark.unit

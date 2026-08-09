@@ -48,6 +48,7 @@ from scrapers.fbref.discovery import (
     parse_competition_index_html,
     parse_schedule_html,
     parse_season_html,
+    season_page_is_complete_without_schedule,
     sentinel_coverage,
 )
 from scrapers.fbref.fetcher import (
@@ -72,6 +73,8 @@ from scrapers.fbref.raw_store import (
     season_page_target,
 )
 from scrapers.fbref.settings import (
+    DEFAULT_BROWSER_BYTE_LIMIT_BYTES,
+    DEFAULT_BROWSER_REQUESTS_PER_SOLVE,
     DEFAULT_BYTE_LIMIT,
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
     DEFAULT_REQUEST_LIMIT,
@@ -112,6 +115,10 @@ SENTINEL_COMPETITIONS = (
 # fence and renew all outstanding sequential leases before every target.
 FETCH_LEASE_SECONDS = 60 * 60
 PROCESSING_LEASE_SECONDS = 60 * 60
+# Above this count, and only when retirements also dominate their wave, a
+# source contract rejection stops looking like a few unusable archived pages
+# and starts looking like FBref having changed its markup.
+MAX_ROUTINE_CONTRACT_QUARANTINES = 5
 REPLAY_SOURCE_REQUEST_LIMIT = 200
 REPLAY_SOURCE_BYTE_LIMIT = 100 * MIB
 ACCEPTANCE_REQUEST_LIMIT = 100
@@ -152,6 +159,24 @@ class RunValidationError(PipelineError):
 
 class TypedPromotionDeferred(PipelineError):
     """An active target refresh prevents an atomic typed promotion."""
+
+
+class SourceContractRejected(ParseWaveError):
+    """One page's own published shape can never satisfy its parser contract.
+
+    A ``ParseWaveError`` subclass so every caller outside the parse wave keeps
+    failing closed.  Inside the wave it is the one failure isolated to its own
+    target: retrying the same immutable bytes cannot change the verdict, so the
+    target is retired instead of stalling every other page behind it.
+    """
+
+    def __init__(
+        self, message: str, *, target_id: str, content_hash: str, reason: str
+    ) -> None:
+        super().__init__(message)
+        self.target_id = target_id
+        self.content_hash = content_hash
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -374,6 +399,44 @@ def live_wave_target_capacity(
     return min(settings.shard_size, request_capacity)
 
 
+def affordable_clearance_reservation(
+    settings: PipelineSettings,
+    *,
+    request_remaining: int,
+    byte_remaining: int,
+) -> Optional[tuple[int, int]]:
+    """Return the largest clearance reservation the rest of a run can fund.
+
+    The full bootstrap reservation buys every proxy rotation the transport is
+    allowed to try — four solves for a 200-request daily run.  Demanding all
+    four before a mid-run re-solve is what left ~40 % of the request budget
+    unspent: a warm-session failure at request 120 of 200 could not book
+    80 + 2, so the wave handed its remaining targets back even though a solve
+    measures ~19 requests.  Offer the retry the largest whole number of
+    rotations that still fits alongside one target; the browser is then capped
+    at exactly what was reserved, so a shrunken allowance still cannot
+    overspend the run.  ``None`` means not even a single solve fits, which is
+    the same clean budget boundary as before.
+    """
+
+    full_requests = int(settings.bootstrap_request_reservation)
+    full_bytes = int(settings.bootstrap_byte_reservation)
+    rotations = max(1, full_requests // DEFAULT_BROWSER_REQUESTS_PER_SOLVE)
+    for count in range(rotations, 0, -1):
+        requests = min(
+            full_requests, count * DEFAULT_BROWSER_REQUESTS_PER_SOLVE
+        )
+        bytes_ = min(full_bytes, count * DEFAULT_BROWSER_BYTE_LIMIT_BYTES)
+        fits = (
+            request_remaining - requests
+            >= settings.target_request_reservation
+            and byte_remaining - bytes_ >= settings.request_reservation_bytes
+        )
+        if fits:
+            return requests, bytes_
+    return None
+
+
 @dataclass(frozen=True)
 class _FrontierSeedCandidate:
     link: DiscoveredPageLink
@@ -402,6 +465,7 @@ class WaveResult:
     requeued_at_budget: int = 0
     requeued_dead_clearance: int = 0
     requeued_session_exhaustion: int = 0
+    contract_quarantined: int = 0
     failures: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -431,6 +495,20 @@ class _LiveFetchSession:
     session_id: Optional[str] = None
     consecutive_clearance_refreshes: int = 0
     needs_clearance: bool = True
+    # What the next solve may spend, once the run's remaining budget can no
+    # longer fund the full reservation.  ``None`` means the settings default.
+    clearance_requests: Optional[int] = None
+    clearance_bytes: Optional[int] = None
+
+    def clearance_reservation(self, settings) -> tuple[int, int]:
+        return (
+            settings.bootstrap_request_reservation
+            if self.clearance_requests is None
+            else self.clearance_requests,
+            settings.bootstrap_byte_reservation
+            if self.clearance_bytes is None
+            else self.clearance_bytes,
+        )
 
     def close(self, control, *, status: str) -> None:
         try:
@@ -1196,6 +1274,16 @@ def page_target_from_link(link: DiscoveredPageLink) -> PageTarget:
     )
 
 
+def _is_mass_contract_rejection(result: "WaveResult") -> bool:
+    """Tell a few unusable archived pages from the source changing shape."""
+
+    retired = result.contract_quarantined
+    return (
+        retired > MAX_ROUTINE_CONTRACT_QUARANTINES
+        and retired * 2 > result.cohort_size
+    )
+
+
 def _frontier_policy(page_kind: str, *, historical: bool) -> tuple[str, int]:
     if historical:
         return "historical_once", 10
@@ -1891,11 +1979,28 @@ class FBrefPipeline:
             # stopped at its budget. Counting it as unfinished made the wave
             # after the budget stop raise instead of no-opping, so a run that
             # spent its budget still went red.
+            # 'failed' is unreachable for this run: reanimation (#1102) has
+            # already returned every claimable aborted target to 'retry', so
+            # what remains 'failed' has no living frontier page behind it —
+            # typically a permanent dead-letter that NO run will ever refetch.
+            # Counting it as unfinished deadlocked every resumed run; instead
+            # the loss is logged loudly below and run quality stays with the
+            # traffic gates in validate_and_finish.
             unfinished = sum(
                 int(count)
                 for status, count in target_counts.items()
-                if status not in {"succeeded", "skipped"}
+                if status not in {"succeeded", "skipped", "failed"}
             )
+            terminally_failed = int(target_counts.get("failed") or 0)
+            if terminally_failed:
+                logger.warning(
+                    "Run %s ends its waves with %d terminally failed "
+                    "target(s); this run will not refetch them — each page "
+                    "is either dead-lettered, backed off, or already handled "
+                    "by another run (frontier state is authoritative)",
+                    run_id,
+                    terminally_failed,
+                )
             if unfinished:
                 raise FetchWaveError(
                     f"Run has {unfinished} unfinished target(s) that are not claimable"
@@ -1977,13 +2082,17 @@ class FBrefPipeline:
                             result.recovered_from_raw += 1
                             continue
 
+                    (
+                        clearance_requests,
+                        clearance_bytes,
+                    ) = live_session.clearance_reservation(settings)
                     reserved_requests = settings.target_request_reservation + (
-                        settings.bootstrap_request_reservation
+                        clearance_requests
                         if live_session.needs_clearance
                         else 0
                     )
                     reserved_bytes = settings.request_reservation_bytes + (
-                        settings.bootstrap_byte_reservation
+                        clearance_bytes
                         if live_session.needs_clearance
                         else 0
                     )
@@ -2021,8 +2130,8 @@ class FBrefPipeline:
                                 live_session.stack.enter_context(
                                     self.fetcher_factory(
                                         settings.proxy_file,
-                                        settings.bootstrap_request_reservation,
-                                        settings.bootstrap_byte_reservation,
+                                        clearance_requests,
+                                        clearance_bytes,
                                     )
                                 )
                             )
@@ -2292,12 +2401,12 @@ class FBrefPipeline:
                                 run_after_failure.get("bytes_reserved") or 0
                             ),
                         )
-                        retry_fits_budget = wave_target_capacity(
+                        retry_reservation = affordable_clearance_reservation(
                             settings,
                             request_remaining=request_remaining,
                             byte_remaining=byte_remaining,
-                            bootstrap_required=True,
-                        ) > 0
+                        )
+                        retry_fits_budget = retry_reservation is not None
                         if retry_fits_budget:
                             self.control.retry_session_fetch(
                                 lease,
@@ -2340,6 +2449,20 @@ class FBrefPipeline:
                                 1 + returned,
                             )
                             break
+                        (
+                            allowed_requests,
+                            allowed_bytes,
+                        ) = retry_reservation
+                        (
+                            previous_requests,
+                            previous_bytes,
+                        ) = live_session.clearance_reservation(settings)
+                        clearance_downgraded = (
+                            allowed_requests < previous_requests
+                            or allowed_bytes < previous_bytes
+                        )
+                        live_session.clearance_requests = allowed_requests
+                        live_session.clearance_bytes = allowed_bytes
                         logger.warning(
                             "FBref clearance failed (%s, HTTP %s) — "
                             "%s stays in this run and the session is being "
@@ -2351,6 +2474,17 @@ class FBrefPipeline:
                             live_session.consecutive_clearance_refreshes,
                             MAX_CONSECUTIVE_CLEARANCE_REFRESHES,
                         )
+                        if clearance_downgraded:
+                            logger.warning(
+                                "FBref re-solve reserves %d request(s) and "
+                                "%d byte(s) instead of %d/%d — the rest of "
+                                "the run can no longer fund every proxy "
+                                "rotation",
+                                allowed_requests,
+                                allowed_bytes,
+                                previous_requests,
+                                previous_bytes,
+                            )
                         if (
                             live_session.consecutive_clearance_refreshes
                             > MAX_CONSECUTIVE_CLEARANCE_REFRESHES
@@ -2372,9 +2506,12 @@ class FBrefPipeline:
                             "reset_clearance",
                             None,
                         )
-                        if callable(reset):
+                        if callable(reset) and not clearance_downgraded:
                             reset()
                         else:
+                            # A transport built for the old allowance would
+                            # still spend it. Rebuild it against the smaller
+                            # reservation the run just booked.
                             live_session.stack.close()
                             live_session.stack = ExitStack()
                             live_session.fetcher = None
@@ -2529,6 +2666,14 @@ class FBrefPipeline:
         normalized_batches = int(max_batches)
         if not 1 <= normalized_batches <= 16:
             raise ValueError("max_batches must be between 1 and 16")
+
+        run = self.control.get_run(run_id)
+        if run is not None and str(run.get("status") or "") == "failed":
+            # ``airflow tasks clear -t run_live_waves`` re-runs only this
+            # task, never initialize_run, so the #1102 reanimation must live
+            # on the path every resume actually takes.  start_run itself
+            # refuses terminal runs (succeeded/publication/sealed).
+            self.control.start_run(run_id)
 
         aggregate = LiveRunResult()
         live_session = _LiveFetchSession()
@@ -3392,10 +3537,35 @@ class FBrefPipeline:
         if record.page_kind != "season":
             return
         parsed = parse_season_html(html, self._season_ref(record))
-        if parsed.has_errors:
-            raise ParseWaveError(
-                f"Season source contract failed for {record.target_id}"
+        if not parsed.has_errors:
+            return
+        reason = ",".join(
+            sorted(
+                {
+                    str(dataset.reason or dataset.error_type or "unknown")
+                    for dataset in parsed.datasets.values()
+                    if dataset.status.value == "error"
+                }
             )
+        )
+        # Only a shape the source itself proves finished may retire its target.
+        # Every other contract failure -- a table-free shell that cannot prove
+        # its identity, a link the parser could not canonicalize -- stays a loud
+        # wave failure, because a retry of fresher bytes can still succeed.
+        if reason == "schedule_link_missing" and (
+            season_page_is_complete_without_schedule(
+                html, competition_id=str(record.source_ids["competition_id"])
+            )
+        ):
+            raise SourceContractRejected(
+                f"Season source contract failed for {record.target_id}",
+                target_id=record.target_id,
+                content_hash=record.content_hash,
+                reason=reason,
+            )
+        raise ParseWaveError(
+            f"Season source contract failed for {record.target_id}"
+        )
 
     def parse_wave(
         self,
@@ -3620,11 +3790,49 @@ class FBrefPipeline:
                             f"{item['target_id']}:observation_fence:"
                             f"{type(fence_exc).__name__}:{fence_exc}"
                         )
+                if isinstance(exc, SourceContractRejected):
+                    # The verdict is a property of these immutable bytes, so
+                    # the target is retired here rather than left to block the
+                    # recovery cohort of every later run.  Quarantining runs
+                    # after the content guard released its frontier row lock.
+                    retired = False
+                    try:
+                        retired = self.control.quarantine_contract_rejected_target(
+                            exc.target_id,
+                            content_hash=exc.content_hash,
+                            reason=exc.reason,
+                        )
+                    except Exception as quarantine_exc:
+                        result.failures.append(
+                            f"{item['target_id']}:contract_quarantine:"
+                            f"{type(quarantine_exc).__name__}:{quarantine_exc}"
+                        )
+                    if retired:
+                        logger.warning(
+                            "Quarantined %s after source contract rejection: %s",
+                            exc.target_id,
+                            exc.reason,
+                        )
+                        result.contract_quarantined += 1
+                        continue
+                    # A target raced into a lease or was already retired stays
+                    # a wave failure: reporting progress that did not shrink
+                    # the cohort would spin the recovery drain forever.
                 result.failures.append(
                     f"{item['target_id']}:{type(exc).__name__}:{exc}"
                 )
         if result.failures:
             raise ParseWaveError("; ".join(result.failures))
+        if _is_mass_contract_rejection(result):
+            # Retiring a handful of archived editions is routine.  Retiring the
+            # bulk of a live cohort is not a property of those pages -- it is
+            # the source's markup having moved under the parser -- and silently
+            # shrinking the crawl scope is the one outcome worse than stopping.
+            raise ParseWaveError(
+                "Mass source contract rejection: "
+                f"{result.contract_quarantined} of {result.cohort_size} "
+                "targets retired in one wave"
+            )
         return result
 
     def recover_unprocessed_wave(
@@ -3679,11 +3887,26 @@ class FBrefPipeline:
         # 'skipped' is a target the run deliberately did not fetch — it stopped
         # at its budget and handed the target back to the queue. That is the
         # designed steady state of a budgeted crawler, not an incomplete run.
+        # 'failed' mirrors the wave gate (#1102): reanimation already returned
+        # every claimable aborted target to 'retry', so a remaining 'failed'
+        # has no living page behind it and this run cannot act on it any more.
+        # It is not "incomplete" here either — the loss is logged loudly and a
+        # genuinely unhealthy run is still rejected by the traffic gates below.
         incomplete = {
             status: count
             for status, count in target_counts.items()
-            if status not in {"succeeded", "skipped"} and int(count) > 0
+            if status not in {"succeeded", "skipped", "failed"}
+            and int(count) > 0
         }
+        if int(target_counts.get("failed") or 0) > 0:
+            logger.warning(
+                "Run %s finishes with %d terminally failed target(s); this "
+                "run will not refetch them — each page is either "
+                "dead-lettered, backed off, or already handled by another "
+                "run (frontier state is authoritative)",
+                run_id,
+                int(target_counts.get("failed") or 0),
+            )
         dataset_counts = summary.get("dataset_validation_counts") or {}
         dataset_failures = sum(
             int(count)
@@ -3996,6 +4219,16 @@ class FBrefPipeline:
                 ),
                 replay=True,
             )
+        run_row = self.control.get_run(run_id)
+        if run_row is not None and str(run_row.get("status") or "") == "failed":
+            # A lone ``clear`` of the validate task never re-runs the waves,
+            # so the reanimation (#1102) must also live here: the gates above
+            # have just passed, and finishing a 'failed' run raises
+            # StateConflict otherwise.  start_run keeps refusing terminal
+            # runs (succeeded/publication/sealed).  No targets are reopened —
+            # the run is finishing right now, and reopened 'retry' rows would
+            # linger in a succeeded run forever.
+            self.control.start_run(run_id, reopen_targets=False)
         self.control.finish_run(run_id, succeeded=True)
         return summary
 

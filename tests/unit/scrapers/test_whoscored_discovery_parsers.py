@@ -24,6 +24,7 @@ from scrapers.whoscored.domain import (
 )
 from scrapers.whoscored.parsers import (
     DatasetStatus,
+    MatchCentreDataAbsent,
     PlayerStageStatisticsPage,
     WhoScoredParseError,
     extract_matchcentre_data,
@@ -82,6 +83,42 @@ def test_matchcentre_unavailability_requires_two_matching_source_markers():
     assert not is_valid_match_page_without_matchcentre(
         unsupported, game_id=1973523
     )
+
+
+@pytest.mark.unit
+def test_explicit_null_matchcentre_shell_is_source_unavailability_evidence():
+    # Verbatim idiom from FA Cup 2025/26 shell pages (issue #1101): the
+    # match-centre app shell inlines ``matchCentreData: null`` and omits
+    # ``initialMatchDataForScrappers`` entirely.
+    shell = """
+    <script>require.config.params['matchheader'] = {
+      input: [6106,173,'Eastleigh','Walsall','02/11/2025 14:15:00',
+              '02/11/2025 00:00:00',6,'FT','0 : 1','0 : 3',,,'0 : 3',
+              'England','England'], matchId: 1950777
+    };</script>
+    <script>require.config.params["args"] = {
+            matchId:1950777,
+            matchCentreData: null,
+            matchCentreEventTypeJson: {"shotSixYardBox":0,"shotPenaltyArea":1}
+    };</script>
+    """
+    with pytest.raises(MatchCentreDataAbsent):
+        extract_matchcentre_data(shell)
+    assert is_valid_match_page_without_matchcentre(shell, game_id=1950777)
+    # A mismatched game id must never become a durable ``not_available``.
+    assert not is_valid_match_page_without_matchcentre(shell, game_id=1950778)
+
+    # Without the independent matchheader marker the null shell proves
+    # nothing about the requested match.
+    args_only = shell.replace("matchheader", "someotherblock")
+    assert not is_valid_match_page_without_matchcentre(args_only, game_id=1950777)
+
+    # An explicit null does not excuse a malformed object elsewhere: every
+    # inline occurrence must be a literal null to count as absence.
+    mixed = shell + "<script>var matchCentreData = {broken;</script>"
+    with pytest.raises(WhoScoredParseError, match="present but malformed"):
+        extract_matchcentre_data(mixed)
+    assert not is_valid_match_page_without_matchcentre(mixed, game_id=1950777)
 
 
 @pytest.mark.unit

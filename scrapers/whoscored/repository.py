@@ -3768,6 +3768,32 @@ class WhoScoredRepository:
             include_all_completed=True,
         )
 
+    def list_match_ingest_states(
+        self,
+        league: str,
+        season: str,
+        *,
+        match_ids: Iterable[int],
+    ) -> dict[int, str]:
+        """Return the latest manifest state per requested game.
+
+        The probe deferral decision must rest on verdicts the source already
+        proved (``not_available`` rows require raw evidence at write time), so
+        this reads the deduplicated ingest view instead of any in-process
+        bookkeeping.  Games without a manifest row are simply absent.
+        """
+        ids = sorted({int(value) for value in match_ids})
+        if not ids:
+            return {}
+        latest = f"{self.catalog}.{self.schema}.whoscored_match_ingest_latest"
+        rows = self.trino.execute_query(
+            f"SELECT CAST(game_id AS BIGINT), state FROM {latest} "
+            f"WHERE league = {_sql_string(league)} "
+            f"AND season = {_sql_string(season)} "
+            "AND game_id IN (" + ",".join(str(value) for value in ids) + ")"
+        )
+        return {int(row[0]): str(row[1]) for row in rows}
+
     def latest_source_season_id(self, league: str, season: str) -> Optional[int]:
         if not self.trino.table_exists(self.schema, "whoscored_seasons"):
             return None
@@ -4749,12 +4775,28 @@ class WhoScoredRepository:
             for value in team_event_ids
         ):
             raise ValueError(f"game {commit.game_id} has invalid team_event_id")
-        team_event_keys = [
-            (row.get("team_id"), row.get("team_event_id")) for row in commit.events
+        # The team-local counter is not an identity on its own -- the source
+        # reuses it for distinct actions (#1080).  A source record is the
+        # counter plus the Opta id, so the Opta id is load-bearing here and gets
+        # the same null/range check as the two columns above: were it ever to
+        # arrive missing, this key would silently collapse back to the pair and
+        # bring the deadlock back under a new message.
+        opta_event_ids = [row.get("opta_event_id") for row in commit.events]
+        if any(
+            value is None
+            or isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in opta_event_ids
+        ):
+            raise ValueError(f"game {commit.game_id} has invalid opta_event_id")
+        record_keys = [
+            (row.get("opta_event_id"), row.get("team_id"), row.get("team_event_id"))
+            for row in commit.events
         ]
-        if len(team_event_keys) != len(set(team_event_keys)):
+        if len(record_keys) != len(set(record_keys)):
             raise ValueError(
-                f"game {commit.game_id} has duplicate team-local event identity"
+                f"game {commit.game_id} has duplicate source event records"
             )
         if bool(commit.lineups) != bool(commit.lineups_available):
             raise ValueError(

@@ -29,6 +29,7 @@ from scrapers.sofascore.manifest import (
     utc_now_iso,
 )
 from scrapers.sofascore.raw_store import PayloadTarget, RawPayloadStore
+from scrapers.sofascore.workload_plan import allocation_budget_bytes
 from scripts.proxy_filter.budget import (
     ProductionBudgetUnavailable,
     SharedBudgetLedger,
@@ -75,6 +76,28 @@ class DeferredCaptureSink(CaptureSink):
         raise DeferredMaterialization(
             f'endpoint {key.endpoint} awaits atomic Bronze MERGE'
         )
+
+
+def _with_allocation_headroom(policy):
+    """Give the local ledger the same enforcement cap as the signed allocation.
+
+    The artifact keeps the honest measured maximum; every ENFORCEMENT cap on
+    the paid path is that maximum plus the structural headroom (#1044).  The
+    signed plan already applies it to ``WorkloadAllocation.budget_bytes``, so
+    the class-scoped local policy has to agree byte for byte: otherwise
+    ``_AllocationBudgetView`` rejects the run as a provenance mismatch, and
+    even if it did not, the local run/endpoint caps would still trip at the
+    bare measured maximum and the headroom would buy nothing.
+    """
+
+    return replace(
+        policy,
+        hard_run_bytes=allocation_budget_bytes(policy.hard_run_bytes),
+        endpoint_reservation_bytes={
+            endpoint: allocation_budget_bytes(value)
+            for endpoint, value in policy.endpoint_reservation_bytes.items()
+        },
+    )
 
 
 def build_capture_runtime(
@@ -131,13 +154,16 @@ def build_capture_runtime(
         )
     elif artifact_path:
         try:
-            budget = SharedBudgetLedger(
-                ledger_path,
-                load_verified_policy(
-                    artifact_path,
-                    workload_class=workload_class,
-                ),
+            policy = load_verified_policy(
+                artifact_path,
+                workload_class=workload_class,
             )
+            # ``workload_class`` is set exactly when a signed allocation drives
+            # this run (the runner derives it from the plan), so this is the
+            # one seam where the local caps must match the plan's budget.
+            if workload_class:
+                policy = _with_allocation_headroom(policy)
+            budget = SharedBudgetLedger(ledger_path, policy)
         except ProductionBudgetUnavailable as exc:
             # A bad/unreviewed canary must not disable raw replay or exact
             # no-op runs. Paid EndpointSpecs still fail closed because the
@@ -405,9 +431,15 @@ def build_event_spec(
         parsers=_parsers(endpoint, target),
         paid_proxy=paid_proxy,
         # Every event endpoint in the coverage contract is required for a
-        # scheduled event. A 404 is therefore a retryable failure, never a
-        # terminal "unsupported" cache entry that endpoint resume would skip.
-        not_supported_http_statuses=(),
+        # scheduled event, so before the final whistle a 404 means "not
+        # published yet, retry later" and stays retryable. For a FINISHED
+        # match (freshness_key == 'final') the same 404 is the source stating
+        # it never published this endpoint and never will (#1039: historical
+        # seasons carry permanent lineups holes) — a terminal NOT_SUPPORTED
+        # that endpoint resume skips instead of retrying forever.
+        not_supported_http_statuses=(
+            (404,) if str(freshness_key) == 'final' else ()
+        ),
     )
 
 
