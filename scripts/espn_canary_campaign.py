@@ -38,6 +38,12 @@ _EVIDENCE_FILE_MODE = 0o440
 _LEDGER_MODE = 0o660
 
 
+def _required_shared_owner() -> tuple[int, int]:
+    """Return the fail-closed owner required for protected shared state."""
+
+    return 0, 0
+
+
 def _persistence_boundary(_name: str) -> None:
     """No-op fault-injection seam immediately after one durable boundary."""
 
@@ -86,6 +92,7 @@ def _assert_in_configured_state_root(path: Path, field: str) -> Path:
 
 def _require_shared_state_root(path: Path) -> Path:
     original = _without_symlink_components(path, "canary state root")
+    required_uid, required_gid = _required_shared_owner()
     try:
         details = original.lstat()
     except OSError as exc:
@@ -93,8 +100,8 @@ def _require_shared_state_root(path: Path) -> Path:
     if (
         not stat.S_ISDIR(details.st_mode)
         or original.is_symlink()
-        or details.st_uid != 0
-        or details.st_gid != 0
+        or details.st_uid != required_uid
+        or details.st_gid != required_gid
         or stat.S_IMODE(details.st_mode) != _STATE_ROOT_MODE
     ):
         raise CampaignError(
@@ -348,6 +355,7 @@ def _persist_immutable_at(
 ) -> dict[str, str]:
     path = _assert_in_configured_state_root(path, "campaign evidence path")
     body = _canonical_bytes(payload)
+    required_uid, required_gid = _required_shared_owner()
     try:
         path.parent.mkdir(mode=_EVIDENCE_DIR_MODE)
     except FileExistsError:
@@ -359,8 +367,8 @@ def _persist_immutable_at(
         if (
             not stat.S_ISDIR(parent_details.st_mode)
             or path.parent.is_symlink()
-            or parent_details.st_uid not in {0, os.geteuid()}
-            or parent_details.st_gid != 0
+            or parent_details.st_uid not in {required_uid, os.geteuid()}
+            or parent_details.st_gid != required_gid
         ):
             raise OSError("unsafe evidence directory")
         if stat.S_IMODE(parent_details.st_mode) != _EVIDENCE_DIR_MODE:

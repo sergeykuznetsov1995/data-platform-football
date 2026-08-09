@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import threading
@@ -24,6 +25,15 @@ from scrapers.espn.canary_campaign import CampaignError
 UTC = timezone.utc
 NOW = datetime(2026, 8, 8, 12, tzinfo=UTC)
 ROOT = Path(__file__).resolve().parents[3]
+pytestmark = pytest.mark.usefixtures("espn_canary_test_owner")
+_TEST_OWNER_PRELUDE = """
+import os
+import sys
+import scripts.espn_canary_campaign as campaign_operator
+
+assert campaign_operator._required_shared_owner() == (0, 0)
+campaign_operator._required_shared_owner = lambda: (os.geteuid(), os.getegid())
+"""
 
 
 class InjectedCrash(RuntimeError):
@@ -756,6 +766,33 @@ def test_runtime_rejects_unprotected_configured_state_root(tmp_path, monkeypatch
 
 
 @pytest.mark.unit
+def test_runtime_rejects_non_root_owner_even_with_exact_state_root_mode(
+    tmp_path, monkeypatch
+):
+    state_root = tmp_path / "configured"
+    state_root.mkdir()
+    state_root.chmod(0o770)
+    assert stat.S_IMODE(state_root.stat().st_mode) == 0o770
+    real_lstat = Path.lstat
+
+    def synthetic_non_root_lstat(path):
+        details = real_lstat(path)
+        if path != state_root:
+            return details
+        values = list(details)
+        values[4] = 1001
+        values[5] = 1001
+        return os.stat_result(values)
+
+    monkeypatch.setattr(campaign_operator, "_required_shared_owner", lambda: (0, 0))
+    monkeypatch.setattr(Path, "lstat", synthetic_non_root_lstat)
+    monkeypatch.setenv("ESPN_CANARY_STATE_ROOT", str(state_root))
+
+    with pytest.raises(CampaignError, match="root:0.*0770"):
+        _claim(state_root / "campaigns.json")
+
+
+@pytest.mark.unit
 def test_runtime_rejects_symlinked_claim_evidence_inside_state_root(
     tmp_path, monkeypatch
 ):
@@ -868,6 +905,39 @@ def test_cli_guard_only_rejects_noncanonical_ledger_without_creating_state(
 
 
 @pytest.mark.unit
+def test_real_module_entrypoint_fails_closed_without_protected_state(tmp_path):
+    state_root = tmp_path / "missing-canary-state"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.espn_canary_campaign",
+            "recover",
+            "--ledger-path",
+            str(state_root / "campaigns.json"),
+        ],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(ROOT),
+            "ESPN_CANARY_STATE_ROOT": str(state_root),
+        },
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == (
+        "ESPN canary campaign refused: "
+        "canary state root is missing or unreadable\n"
+    )
+    assert not state_root.exists()
+
+
+@pytest.mark.unit
 def test_cli_rejects_fifo_ledger_without_blocking(tmp_path):
     state_root = tmp_path / "shared-canary-state"
     state_root.mkdir()
@@ -883,8 +953,9 @@ def test_cli_rejects_fifo_ledger_without_blocking(tmp_path):
     completed = subprocess.run(
         [
             sys.executable,
-            "-m",
-            "scripts.espn_canary_campaign",
+            "-c",
+            _TEST_OWNER_PRELUDE
+            + "\nraise SystemExit(campaign_operator.main(sys.argv[1:]))",
             "recover",
             "--ledger-path",
             str(ledger_path),
@@ -916,8 +987,9 @@ def test_cli_process_recreate_reads_consumes_finishes_and_recovers(tmp_path):
     }
     claim_command = [
         sys.executable,
-        "-m",
-        "scripts.espn_canary_campaign",
+        "-c",
+        _TEST_OWNER_PRELUDE
+        + "\nraise SystemExit(campaign_operator.main(sys.argv[1:]))",
         "claim",
         "--ledger-path",
         str(ledger_path),
@@ -945,7 +1017,9 @@ def test_cli_process_recreate_reads_consumes_finishes_and_recovers(tmp_path):
 
     # A fresh interpreter stands in for a recreated LocalExecutor scheduler;
     # it must consume the exact host-produced file URI without translation.
-    consume_program = """
+    consume_program = (
+        _TEST_OWNER_PRELUDE
+        + """
 import json
 import sys
 from scripts.espn_canary_campaign import consume_campaign_claim
@@ -959,6 +1033,7 @@ result = consume_campaign_claim(
 )
 print(json.dumps(result, sort_keys=True))
 """
+    )
     consumed_process = subprocess.run(
         [sys.executable, "-c", consume_program, json.dumps(claimed["claim_ref"])],
         cwd=ROOT,
@@ -972,8 +1047,9 @@ print(json.dumps(result, sort_keys=True))
 
     finish_command = [
         sys.executable,
-        "-m",
-        "scripts.espn_canary_campaign",
+        "-c",
+        _TEST_OWNER_PRELUDE
+        + "\nraise SystemExit(campaign_operator.main(sys.argv[1:]))",
         "finish",
         "--ledger-path",
         str(ledger_path),
@@ -998,8 +1074,9 @@ print(json.dumps(result, sort_keys=True))
     recovered_process = subprocess.run(
         [
             sys.executable,
-            "-m",
-            "scripts.espn_canary_campaign",
+            "-c",
+            _TEST_OWNER_PRELUDE
+            + "\nraise SystemExit(campaign_operator.main(sys.argv[1:]))",
             "recover",
             "--ledger-path",
             str(ledger_path),

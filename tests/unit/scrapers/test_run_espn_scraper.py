@@ -11,7 +11,6 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from types import SimpleNamespace
 
 import pytest
 
@@ -1495,7 +1494,9 @@ def test_airflow_binding_uses_deep_plan_chain_before_control_side_effects(
 
 
 @pytest.mark.unit
-def test_runner_current_admission_validates_single_use_canary_consumption(tmp_path):
+def test_runner_current_admission_validates_single_use_canary_consumption(
+    tmp_path, espn_canary_test_owner
+):
     from scrapers.espn import runner
     from scripts.espn_canary_campaign import (
         claim_campaign_attempt,

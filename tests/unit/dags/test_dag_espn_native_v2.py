@@ -1705,7 +1705,7 @@ def test_release_qualification_identity_binds_exact_target_and_versions(monkeypa
 
 
 def test_exact_all_scope_backfill_binds_consumed_campaign_ordinal(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, espn_canary_test_owner
 ):
     from dags.utils import espn_native_tasks
     from scripts.espn_canary_campaign import (
@@ -2815,7 +2815,9 @@ def test_signed_admission_rejects_drifted_deployment_release(monkeypatch):
         )
 
 
-def test_canary_claim_strict_read_rejects_mutated_ledger(tmp_path):
+def test_canary_claim_strict_read_rejects_mutated_ledger(
+    tmp_path, espn_canary_test_owner
+):
     from dags.utils import espn_native_tasks
     from scripts.espn_canary_campaign import (
         claim_campaign_attempt,
@@ -2881,7 +2883,7 @@ def test_canary_claim_strict_read_rejects_mutated_ledger(tmp_path):
 
 
 def test_exact_v3_canary_admission_consumes_claim_before_control_and_is_idempotent(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, espn_canary_test_owner
 ):
     from dags.utils import espn_native_tasks
     from scripts.espn_canary_campaign import claim_campaign_attempt
