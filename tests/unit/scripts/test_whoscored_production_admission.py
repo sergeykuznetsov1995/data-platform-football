@@ -914,6 +914,10 @@ def _rendered_environment(service: str) -> dict[str, str]:
         environment.update(
             {
                 "FBREF_PROXY_CONTROL_TOKEN": "b" * 64,
+                "FBREF_BATCH_PERSIST": "0",
+                "FBREF_BATCH_PERSIST_MATCHES": "8",
+                "FBREF_BATCH_PERSIST_MAX_CELLS": "150000",
+                "FBREF_PERSISTENT_HTTP_SESSION": "0",
                 "ICEBERG_WAREHOUSE": "football",
                 "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID": "d" * 64,
                 "TM_NATIVE_V2_ENABLED": "false",
@@ -3412,6 +3416,53 @@ def test_scheduler_admission_derives_source_stores_from_warehouse_bucket():
     )
     assert environment["WHOSCORED_RAW_STORE_URI"] == ("s3://football/raw/whoscored")
     assert environment["WHOSCORED_OPS_STORE_URI"] == ("s3://football/ops/whoscored")
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("FBREF_BATCH_PERSIST", "1"),
+        ("FBREF_BATCH_PERSIST_MATCHES", "25"),
+        ("FBREF_BATCH_PERSIST_MAX_CELLS", "500000"),
+        ("FBREF_PERSISTENT_HTTP_SESSION", "1"),
+    ),
+)
+def test_scheduler_admission_accepts_reviewed_fbref_runtime_controls(
+    name: str,
+    value: str,
+):
+    environment = _rendered_environment("airflow-scheduler")
+    environment[name] = value
+
+    admission._validate_rendered_environment(
+        environment,
+        service="airflow-scheduler",
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("FBREF_BATCH_PERSIST", "true"),
+        ("FBREF_BATCH_PERSIST_MATCHES", "1"),
+        ("FBREF_BATCH_PERSIST_MATCHES", "26"),
+        ("FBREF_BATCH_PERSIST_MAX_CELLS", "999"),
+        ("FBREF_BATCH_PERSIST_MAX_CELLS", "500001"),
+        ("FBREF_PERSISTENT_HTTP_SESSION", "true"),
+    ),
+)
+def test_scheduler_admission_rejects_unreviewed_fbref_runtime_controls(
+    name: str,
+    value: str,
+):
+    environment = _rendered_environment("airflow-scheduler")
+    environment[name] = value
+
+    with pytest.raises(admission.AdmissionError, match="FBref runtime controls"):
+        admission._validate_rendered_environment(
+            environment,
+            service="airflow-scheduler",
+        )
 
 
 @pytest.mark.parametrize(

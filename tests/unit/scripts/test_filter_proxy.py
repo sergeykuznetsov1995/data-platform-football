@@ -1,4 +1,4 @@
-"""Unit tests for scripts/proxy_filter/filter_proxy.py (#652).
+"""Unit tests for the dedicated scripts/fbref_proxy/filter_proxy.py runtime.
 
 ``filter_proxy`` is a standalone script (not a package). Its only container-only
 import (``scrapers.utils.proxy_manager``) is lazy — inside ``_residential`` — so the
@@ -67,7 +67,7 @@ MATCH_WORKLOAD_CLASS = match_workload_class()
 PLAYER_WORKLOAD_CLASS = player_workload_class()
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-_SCRIPT_PATH = REPO_ROOT / "scripts" / "proxy_filter" / "filter_proxy.py"
+_SCRIPT_PATH = REPO_ROOT / "scripts" / "fbref_proxy" / "filter_proxy.py"
 _BLOCKLIST_PATH = REPO_ROOT / "configs" / "proxy_filter" / "blocklist.txt"
 _COMPOSE_PATH = REPO_ROOT / "compose.yaml"
 # #951 (инцидент 2026-07-17): выделенный SofaScore-шлюз вынесен в СВОЙ
@@ -2052,7 +2052,7 @@ def test_fbref_acceptance_image_is_built_from_one_exact_git_archive():
     assert "sha256sum -c -" in dockerfile
     assert "rm -rf /opt/airflow/dags /opt/airflow/scrapers" in dockerfile
     assert "verify_fbref_acceptance_image.py" in dockerfile
-    assert "filter_proxy.py --help" in dockerfile
+    assert "fbref_proxy/filter_proxy.py --help" in dockerfile
     assert "org.opencontainers.image.revision" in dockerfile
     assert "COPY dags" not in dockerfile
     assert 'git -C "$repo_root" archive --format=tar "$git_sha"' in builder

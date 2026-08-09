@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Filtering passthrough proxy for FlareSolverr residential traffic (#652).
+"""Dedicated FBref metering proxy, isolated from paid SofaScore evidence.
 
 Chain: Chrome (FlareSolverr) -> THIS proxy -> residential upstream -> internet.
 
@@ -13,8 +13,8 @@ else (the target site, Cloudflare challenge, fonts) tunnels through unchanged.
 The observe run (no --blocklist) showed ~90% of WhoScored and ~60% of SoFIFA
 residential bytes are third-party ad-tech — see docs/research/flaresolverr-proxy-traffic-audit.md.
 
-Run as the dedicated compose service (reaches the residential pool and Airflow):
-    python scripts/proxy_filter/filter_proxy.py \
+Run as the dedicated FBref compose service:
+    python scripts/fbref_proxy/filter_proxy.py --source-mode fbref-only \
         --listen 0.0.0.0:8899 --lease-listen 0.0.0.0:8900 \
         --blocklist configs/proxy_filter/blocklist.txt
 
@@ -208,6 +208,10 @@ FBREF_DAG_IDS = frozenset(
         "dag_accept_fbref_bronze",
     }
 )
+FBREF_UPSTREAM_COOLDOWN_SECONDS = 60.0
+_fbref_upstream_cursor = 0
+_fbref_failed_until: dict[tuple[str, int, str], float] = {}
+_fbref_last_failed_identity: tuple[str, int, str] | None = None
 SOFASCORE_DAG_IDS = frozenset({"dag_ingest_sofascore"})
 SOFASCORE_CANARY_DAG_IDS = frozenset({"dag_canary_sofascore_proxy"})
 # Registry discovery is a non-signed, metered JSON scan of the public catalog.
@@ -394,6 +398,13 @@ class UpstreamHeadTimeout(RuntimeError):
 
 class UpstreamHeadIncomplete(RuntimeError):
     """The residential upstream closed before a complete response head arrived."""
+
+
+class FBrefUpstreamUnavailable(RuntimeError):
+    """Every dedicated FBref session identity is cooling down."""
+
+    def __init__(self) -> None:
+        super().__init__("FBref upstream unavailable")
 
 
 class _LeaseBudgetRefused(Exception):
@@ -885,10 +896,28 @@ def _load_pinned_sofascore_workload_policy(artifact_path: str):
 
 
 def _upstream_fingerprint(upstream: tuple[str, int, str, str]) -> str:
-    """Return a non-reversible pool-entry identifier, never credentials."""
-    return hashlib.sha256(f"{upstream[0]}:{upstream[1]}".encode("utf-8")).hexdigest()[
-        :16
-    ]
+    """Return the legacy non-reversible host/port identifier."""
+    return hashlib.sha256(
+        f"{upstream[0]}:{upstream[1]}".encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _fbref_upstream_fingerprint(upstream: tuple[str, int, str, str]) -> str:
+    """Return a non-reversible FBref session identifier, never a password."""
+    host, port, username = _upstream_identity(upstream)
+    material = f"{host}\0{port}\0{username}".encode("utf-8")
+    return hashlib.sha256(material).hexdigest()[:16]
+
+
+def _upstream_identity(
+    upstream: tuple[str, int, str, str],
+) -> tuple[str, int, str]:
+    """Normalize the provider session identity without its secret."""
+    return (
+        str(upstream[0] or "").strip().casefold(),
+        int(upstream[1]),
+        str(upstream[2] or ""),
+    )
 
 
 def _lease_budget_policy_id(lease: "Lease") -> str:
@@ -973,6 +1002,10 @@ class Lease:
     active_provider_readers: int = field(default=0, repr=False)
     provider_reserved_bytes: int = field(default=0, repr=False)
     pending_client_hellos: int = field(default=0, repr=False)
+    # Bytes already read from the local client but not yet fully handed to the
+    # metered provider writer.  Idle checkpoints must see this otherwise a
+    # page could be settled while an upload prefix is still waiting for budget.
+    staged_client_bytes: int = field(default=0, repr=False)
     upstream_repins: int = 0
     closed: bool = False
     close_recorded: bool = False
@@ -1031,6 +1064,10 @@ class Lease:
             "total_bytes": self.total_bytes,
             "active_tunnels": self.active_tunnels,
             "reserved_bytes": self.reserved_bytes,
+            "active_provider_readers": self.active_provider_readers,
+            "provider_reserved_bytes": self.provider_reserved_bytes,
+            "pending_client_hellos": self.pending_client_hellos,
+            "staged_client_bytes": self.staged_client_bytes,
             "global_budget_escrow_bytes": self.global_budget_escrow_bytes,
             "upstream_repins": self.upstream_repins,
             "closed": self.closed,
@@ -1054,7 +1091,11 @@ class Lease:
             "source": self.source,
             "traffic_class": self.source,
             "budget_namespace": _budget_namespace_for_source(self.source),
-            "upstream_fingerprint": _upstream_fingerprint(self.upstream),
+            "upstream_fingerprint": (
+                _fbref_upstream_fingerprint(self.upstream)
+                if self.source == "fbref"
+                else _upstream_fingerprint(self.upstream)
+            ),
             "dagrun_total_bytes": _run_total_bytes(self.dagrun_key),
             "dagrun_budget_bytes": _lease_dagrun_budget_bytes(self),
             "url_total_bytes": _url_total_bytes(self.dagrun_key, self.canonical_url),
@@ -1175,12 +1216,32 @@ _ACTIVE_PROVIDER_READERS = 0
 _RESERVATION_TURNOVER_WAITERS: set[asyncio.Future] = set()
 
 
+def _lease_has_active_operations(lease: Lease) -> bool:
+    """Return whether code can still mutate a lease's byte lifecycle."""
+
+    return bool(
+        lease.active_tunnels
+        or lease.active_provider_readers
+        or lease.pending_client_hellos
+        or lease.staged_client_bytes
+    )
+
+
+def _lease_has_active_lifecycle(lease: Lease) -> bool:
+    """Return whether a lease still owns I/O or unsettled byte allowance."""
+
+    return bool(
+        _lease_has_active_operations(lease)
+        or lease.reserved_bytes
+        or lease.provider_reserved_bytes
+    )
+
+
 def _lease_has_durable_terminal(lease: Lease) -> bool:
     if (
         not lease.closed
         or not lease.close_recorded
-        or lease.active_tunnels
-        or lease.reserved_bytes
+        or _lease_has_active_lifecycle(lease)
         or lease.global_budget_escrow_bytes
         or lease.accounting_uncertain
     ):
@@ -1565,6 +1626,87 @@ def _pick_upstream(mgr):
         return selected.host, selected.port, selected.username, selected.password
     u = urlsplit(selected.url)  # Compatibility with the minimal unit-test fake.
     return u.hostname, u.port, u.username, u.password
+
+
+def _manager_upstream_candidates(mgr) -> list[tuple[str, int, str, str]]:
+    """Return a stable, unique pool snapshot without using random selection."""
+    reactivate = getattr(mgr, "_reactivate_expired_bans", None)
+    if callable(reactivate):
+        reactivate()
+    raw_candidates = getattr(mgr, "_proxies", None)
+    if raw_candidates is not None:
+        candidates = [
+            (item.host, item.port, item.username, item.password)
+            for item in list(raw_candidates)
+            if not bool(getattr(item, "is_banned", False))
+        ]
+    else:
+        # Compatibility with the small test/development manager. Production's
+        # ProxyManager always exposes its already-validated pool objects.
+        raw_urls = list(getattr(mgr, "_urls", ()))
+        candidates = []
+        for value in raw_urls:
+            parsed = urlsplit(str(value))
+            candidates.append(
+                (parsed.hostname, parsed.port, parsed.username, parsed.password)
+            )
+    unique: dict[tuple[str, int, str], tuple[str, int, str, str]] = {}
+    for candidate in candidates:
+        identity = _upstream_identity(candidate)
+        unique.setdefault(identity, candidate)
+    return list(unique.values())
+
+
+def _fbref_select_upstream(mgr) -> tuple[str, int, str, str]:
+    """Choose one healthy FBref identity in stable bounded order."""
+    global _fbref_last_failed_identity, _fbref_upstream_cursor
+    candidates = _manager_upstream_candidates(mgr)
+    if not candidates:
+        raise FBrefUpstreamUnavailable()
+    now = _wall_time()
+    identities = [_upstream_identity(candidate) for candidate in candidates]
+    current_identities = set(identities)
+    if not current_identities:
+        _fbref_failed_until.clear()
+    for identity in tuple(_fbref_failed_until):
+        if (
+            identity not in current_identities
+            or _fbref_failed_until[identity] <= now
+        ):
+            _fbref_failed_until.pop(identity, None)
+    if _fbref_last_failed_identity not in _fbref_failed_until:
+        _fbref_last_failed_identity = None
+    healthy = {
+        identity
+        for identity in identities
+        if _fbref_failed_until.get(identity, 0.0) <= now
+    }
+    if not healthy:
+        raise FBrefUpstreamUnavailable()
+    count = len(candidates)
+    for offset in range(count):
+        index = (_fbref_upstream_cursor + offset) % count
+        if identities[index] in healthy:
+            _fbref_upstream_cursor = (index + 1) % count
+            return candidates[index]
+    raise FBrefUpstreamUnavailable()
+
+
+def _record_fbref_upstream_failure(
+    upstream: tuple[str, int, str, str],
+) -> None:
+    """Quarantine one FBref session identity without touching shared health."""
+    global _fbref_last_failed_identity
+    identity = _upstream_identity(upstream)
+    now = _wall_time()
+    if _fbref_failed_until.get(identity, 0.0) > now:
+        return
+    _fbref_failed_until[identity] = now + FBREF_UPSTREAM_COOLDOWN_SECONDS
+    _fbref_last_failed_identity = identity
+    log.warning(
+        "FBref upstream transport failed: session=%s",
+        _fbref_upstream_fingerprint(upstream),
+    )
 
 
 def _utc_day() -> str:
@@ -2995,6 +3137,8 @@ def _create_lease(
         raise ProxyCampaignValidationError(
             "WhoScored leases require the dedicated provider service"
         )
+    if source != "fbref" and SOURCE_MODE == "fbref-only":
+        raise ValueError("dedicated FBref service rejects every other source")
     if source != "whoscored" and SOURCE_MODE == "whoscored-only":
         raise ValueError("dedicated WhoScored service rejects every other source")
     proxy_campaign_approval: ProxyCampaignApproval | None = None
@@ -3085,8 +3229,7 @@ def _create_lease(
         for item in LEASES.values()
         if (
             (not item.closed and not item.expired)
-            or item.active_tunnels > 0
-            or item.reserved_bytes > 0
+            or _lease_has_active_lifecycle(item)
             or item.global_budget_escrow_bytes > 0
         )
     ]
@@ -3229,7 +3372,11 @@ def _create_lease(
         lease = Lease(
             lease_id=lease_id,
             token=secrets.token_urlsafe(24),
-            upstream=_pick_upstream(lease_manager),
+            upstream=(
+                _fbref_select_upstream(lease_manager)
+                if source == "fbref"
+                else _pick_upstream(lease_manager)
+            ),
             created_at=now,
             expires_at=effective_expires_at,
             max_bytes=min(max_bytes, available),
@@ -3399,7 +3546,11 @@ def _create_lease(
         "lease %s created: source=%s upstream=%s max_bytes=%d ttl=%ds",
         lease.lease_id,
         lease.source or "legacy",
-        _upstream_fingerprint(lease.upstream),
+        (
+            _fbref_upstream_fingerprint(lease.upstream)
+            if lease.source == "fbref"
+            else _upstream_fingerprint(lease.upstream)
+        ),
         lease.max_bytes,
         ttl_seconds,
     )
@@ -3480,11 +3631,20 @@ def _extend_fbref_lease(lease: Lease, new_max_bytes: int) -> dict[str, Any]:
         raise ValueError("max_bytes must be an integer")
     if lease.source != "fbref":
         raise RuntimeError("only FBref leases may be extended")
-    if lease.closed or lease.expired or lease.budget_exceeded:
+    if (
+        lease.closed
+        or lease.expired
+        or lease.budget_exceeded
+        or lease.accounting_uncertain
+    ):
         raise RuntimeError("FBref lease is not open and usable")
     if (
         lease.active_tunnels != 0
         or lease.reserved_bytes != 0
+        or lease.active_provider_readers != 0
+        or lease.provider_reserved_bytes != 0
+        or lease.pending_client_hellos != 0
+        or lease.staged_client_bytes != 0
         or bool(lease.current_request_id)
         or bool(lease.current_endpoint)
     ):
@@ -4335,33 +4495,51 @@ async def _pump(
                 # with positive authoritative capacity is temporary sibling
                 # contention, not a hard-cap failure.
                 pending = memoryview(chunk)
-                while pending:
-                    available = _lease_remaining(lease)
-                    if available <= 0:
-                        if not lease.usable:
+                staged_remaining = len(pending)
+                lease.staged_client_bytes += staged_remaining
+                try:
+                    while pending:
+                        available = _lease_remaining(lease)
+                        if available <= 0:
+                            if not lease.usable:
+                                break
+                            if _lease_authoritative_remaining(lease) <= 0:
+                                lease.budget_exceeded = True
+                                _notify_reservation_turnover()
+                                break
+                            try:
+                                await _wait_for_reservation_turnover(lease)
+                            except (asyncio.TimeoutError, TimeoutError):
+                                _latch_lease_accounting_uncertainty(lease)
+                                raise
+                            continue
+                        prefix_size = min(len(pending), available)
+                        if not await _write_upstream(
+                            writer,
+                            bytes(pending[:prefix_size]),
+                            lease=lease,
+                            host=host,
+                            direction=direction,
+                        ):
                             break
-                        if _lease_authoritative_remaining(lease) <= 0:
-                            lease.budget_exceeded = True
-                            _notify_reservation_turnover()
-                            break
-                        try:
-                            await _wait_for_reservation_turnover(lease)
-                        except (asyncio.TimeoutError, TimeoutError):
-                            _latch_lease_accounting_uncertainty(lease)
-                            raise
-                        continue
-                    prefix_size = min(len(pending), available)
-                    if not await _write_upstream(
-                        writer,
-                        bytes(pending[:prefix_size]),
-                        lease=lease,
-                        host=host,
-                        direction=direction,
-                    ):
+                        pending = pending[prefix_size:]
+                        staged_remaining -= prefix_size
+                        lease.staged_client_bytes = max(
+                            0, lease.staged_client_bytes - prefix_size
+                        )
+                    if pending:
+                        # The local prefix cannot be allowed to disappear from
+                        # the idle proof.  Permanently revoke the lease before
+                        # moving the unforwarded remainder out of the staging
+                        # counter.
+                        _latch_lease_accounting_uncertainty(lease)
                         break
-                    pending = pending[prefix_size:]
-                if pending:
-                    break
+                finally:
+                    if staged_remaining:
+                        _latch_lease_accounting_uncertainty(lease)
+                        lease.staged_client_bytes = max(
+                            0, lease.staged_client_bytes - staged_remaining
+                        )
                 continue
             try:
                 writer.write(chunk)
@@ -4833,8 +5011,9 @@ def _reap_expired_leases() -> int:
                     pass
             if (
                 lease.source not in {"sofascore", "whoscored"}
-                and lease.active_tunnels == 0
+                and not _lease_has_active_operations(lease)
                 and lease.reserved_bytes > 0
+                and lease.provider_reserved_bytes <= lease.reserved_bytes
                 and not lease.paid_ledger_uncertain
             ):
                 # The retained reservation is the in-process upper bound of
@@ -4855,6 +5034,10 @@ def _reap_expired_leases() -> int:
                     )
                 else:
                     _release_lease_reservation(lease, retained)
+                    # No reader or writer still owns this allowance. It has
+                    # just been conservatively charged in full, so its
+                    # provider-specific mirror is settled as well.
+                    lease.provider_reserved_bytes = 0
                     log.warning(
                         "uncertain lease %s: charged %d unproven provider "
                         "bytes conservatively; concurrency slot released",
@@ -4863,7 +5046,8 @@ def _reap_expired_leases() -> int:
                     )
             if (
                 lease.source == "sofascore"
-                and lease.active_tunnels == 0
+                and not _lease_has_active_operations(lease)
+                and lease.provider_reserved_bytes <= lease.reserved_bytes
                 and not lease.allocation_finished
                 and lease.workload_plan is not None
                 and lease.allocation_claim is not None
@@ -4920,7 +5104,7 @@ def _reap_expired_leases() -> int:
             continue
         if not lease.expired:
             continue
-        if lease.active_tunnels or lease.reserved_bytes:
+        if _lease_has_active_lifecycle(lease):
             # TTL is a wall-clock data-plane boundary, not merely a refusal for
             # the next chunk. Force-close orphan browser/provider sockets now.
             # A provider StreamReader can contain unobservable read-ahead, so
@@ -5078,6 +5262,10 @@ async def _close_lease(
     drained = (
         lease.active_tunnels == 0
         and lease.reserved_bytes == 0
+        and lease.active_provider_readers == 0
+        and lease.provider_reserved_bytes == 0
+        and lease.pending_client_hellos == 0
+        and lease.staged_client_bytes == 0
         and not lease.accounting_uncertain
     )
     if drained and lease.source == "whoscored":
@@ -5671,6 +5859,16 @@ async def _handle_control(
                 {"code": "campaign_rejected", "error": str(exc)},
             )
             return True
+        except FBrefUpstreamUnavailable:
+            await _send_json(
+                writer,
+                503,
+                {
+                    "code": "upstream_unavailable",
+                    "error": "FBref upstream unavailable",
+                },
+            )
+            return True
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             await _send_json(writer, 400, {"error": str(exc)})
             return True
@@ -6067,6 +6265,8 @@ async def _open_lease_upstream_tunnel(
                 # Budget refusals (429), over-budget heads and cancellation are
                 # not dead-exit signals: never failover, surface them as before.
                 raise
+            if lease.source == "fbref":
+                _record_fbref_upstream_failure(lease.upstream)
             last_error = exc
         # FBref must never spend a second paid CONNECT attempt. SofaScore's
         # separately bounded dead-exit policy remains response-byte based.
@@ -6397,6 +6597,8 @@ async def handle(
                             if not local_connect_established:
                                 client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                         finally:
+                            if lease.source == "fbref":
+                                _record_fbref_upstream_failure(lease.upstream)
                             # A complete non-200/invalid head can already have a
                             # response body in StreamReader read-ahead.  Retain
                             # the whole remaining escrow rather than discarding
@@ -6466,6 +6668,8 @@ async def handle(
                     client_w.close()
                     return
                 except (asyncio.TimeoutError, TimeoutError, OSError):
+                    if lease is not None and lease.source == "fbref":
+                        _record_fbref_upstream_failure(lease.upstream)
                     client_w.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                     await client_w.drain()
                     client_w.close()
@@ -6682,7 +6886,7 @@ async def main() -> None:
     ap.add_argument("--listen", default="0.0.0.0:8899")
     ap.add_argument(
         "--source-mode",
-        choices=("shared-no-whoscored", "whoscored-only"),
+        choices=("shared-no-whoscored", "fbref-only", "whoscored-only"),
         default="shared-no-whoscored",
     )
     ap.add_argument(
@@ -6935,6 +7139,12 @@ async def main() -> None:
     ap.add_argument("--budget-workload-class")
     args = ap.parse_args()
 
+    fbref_safety_circuit_mib = int(
+        os.environ.get("FBREF_PROXY_SAFETY_CIRCUIT_MIB", "0") or 0
+    )
+    if fbref_safety_circuit_mib < 0:
+        raise SystemExit("FBREF_PROXY_SAFETY_CIRCUIT_MIB must be non-negative")
+
     if str(args.source_mode) == "whoscored-only" and bool(
         getattr(args, "allow_legacy_noauth", False)
     ):
@@ -7185,6 +7395,12 @@ async def main() -> None:
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from None
     URL_BUDGET_BYTES = url_budget_bytes
+    if fbref_safety_circuit_mib and SOURCE_MODE != "whoscored-only":
+        circuit_bytes = fbref_safety_circuit_mib * 1024 * 1024
+        DAILY_BUDGET_BYTES = circuit_bytes
+        MAX_LEASE_BYTES = circuit_bytes
+        DAGRUN_BUDGET_BYTES = circuit_bytes
+        URL_BUDGET_BYTES = circuit_bytes
     MAX_ACTIVE_LEASES = max_active_leases
     LEASE_UPSTREAM_CONNECT_TIMEOUT_SECONDS = lease_connect_timeout_seconds
     LEASE_PROVIDER_HEAD_TIMEOUT_SECONDS = lease_head_timeout_seconds

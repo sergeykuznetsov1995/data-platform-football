@@ -544,6 +544,7 @@ _CAPACITY_RUNTIME_FILE_PATHS = frozenset(
         "scripts/audit_seaweedfs_control_network.py",
         "scripts/audit_seaweedfs_runtime_container.py",
         "scripts/compose.sh",
+        "scripts/fbref_proxy/filter_proxy.py",
         "scripts/flaresolverr_extended.py",
         "scripts/proxy_filter/filter_proxy.py",
         "scripts/research/bench_whoscored_capacity.py",
@@ -584,6 +585,7 @@ _CAPACITY_SEALED_RUNTIME_PATHS = frozenset(
         "scrapers/whoscored/source_circuit.py",
         "scrapers/whoscored/stage_feeds.py",
         "scrapers/whoscored/transport.py",
+        "scripts/fbref_proxy/filter_proxy.py",
         "scripts/research/bench_whoscored_workflow.py",
         "scripts/research/whoscored_capacity_worker_exec.py",
     }
@@ -1475,7 +1477,9 @@ _SCHEDULER_ENVIRONMENT_NAMES = frozenset(
     AIRFLOW__CORE__FERNET_KEY AIRFLOW__CORE__LOAD_EXAMPLES
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN AIRFLOW__WEBSERVER__EXPOSE_CONFIG
     AIRFLOW__WEBSERVER__SECRET_KEY ALERT_ENV FBREF_PROXY_CONTROL_TOKEN
-    FBREF_CAMOUFOX_GEOIP_DATABASE_PATH FBREF_CONTROL_DB_URI FOTMOB_DEPLOY_GIT_SHA
+    FBREF_BATCH_PERSIST FBREF_BATCH_PERSIST_MATCHES FBREF_BATCH_PERSIST_MAX_CELLS
+    FBREF_CAMOUFOX_GEOIP_DATABASE_PATH FBREF_CONTROL_DB_URI
+    FBREF_PERSISTENT_HTTP_SESSION FOTMOB_DEPLOY_GIT_SHA
     FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH
     FBREF_PROXY_CONTROL_URL FBREF_PROXY_LEASE_TTL_SECONDS FBREF_RAW_S3_ENDPOINT
     FBREF_RAW_S3_SCHEME FBREF_RAW_STORE_URI FBREF_STAGE_JANITOR_MODE
@@ -2383,6 +2387,26 @@ def _validate_scheduler_store_uris(environment: Mapping[str, str]) -> None:
         )
 
 
+def _validate_fbref_scheduler_runtime_controls(
+    environment: Mapping[str, str],
+) -> None:
+    """Admit only the bounded FBref controls inherited by LocalExecutor tasks."""
+
+    if any(
+        environment.get(name) not in {"0", "1"}
+        for name in ("FBREF_BATCH_PERSIST", "FBREF_PERSISTENT_HTTP_SESSION")
+    ):
+        raise AdmissionError("rendered FBref runtime controls differ")
+    bounded = (
+        ("FBREF_BATCH_PERSIST_MATCHES", 2, 25),
+        ("FBREF_BATCH_PERSIST_MAX_CELLS", 1000, 500000),
+    )
+    for name, lower, upper in bounded:
+        raw = environment.get(name, "")
+        if not raw.isdecimal() or not lower <= int(raw) <= upper:
+            raise AdmissionError("rendered FBref runtime controls differ")
+
+
 def _validate_rendered_environment(
     environment: Mapping[str, str],
     *,
@@ -2423,6 +2447,7 @@ def _validate_rendered_environment(
     ) not in {"0", "1"}:
         raise AdmissionError("rendered WhoScored paid-batch control differs")
     if service == "airflow-scheduler":
+        _validate_fbref_scheduler_runtime_controls(environment)
         _validate_scheduler_store_uris(environment)
         expected_sofascore_artifact_id = environment.get(
             "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID", ""

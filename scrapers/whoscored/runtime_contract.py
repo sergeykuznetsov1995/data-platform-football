@@ -113,6 +113,7 @@ EXPECTED_RUNTIME_FILES = (
     "scrapers/whoscored/stage_feeds.py",
     "scrapers/whoscored/transport.py",
     "scripts/__init__.py",
+    "scripts/fbref_proxy/filter_proxy.py",
     "scripts/flaresolverr_extended.py",
     "scripts/proxy_filter/__init__.py",
     "scripts/proxy_filter/budget.py",
