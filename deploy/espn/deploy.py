@@ -63,7 +63,7 @@ GUARD_PHASES = (
 )
 GUARD_REPORT_KIND = "espn-release-guard-v1"
 GUARD_REPORT_SCHEMA_VERSION = 1
-GUARD_PYTHON_PATH = "/root/.venvs/dpf-test/bin/python"
+GUARD_PYTHON_PATH = sys.executable
 GUARD_SCRIPT_RELATIVE_PATH = Path("scripts/espn_release_guard_v1.py")
 GUARD_DOCKER_PATH = "/usr/bin/docker"
 GUARD_POLL_SECONDS = "15"

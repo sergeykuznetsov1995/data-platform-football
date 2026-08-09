@@ -322,11 +322,16 @@ def test_injected_deploy_identity_is_strictly_validated(
 def test_cli_output_is_one_canonical_json_document(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
-    monkeypatch.setattr(
-        guard,
-        "_run_command",
-        lambda *_args, **_kwargs: _completed(_snapshot()),
-    )
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def forbidden_subprocess_run(*_args, **_kwargs):
+        pytest.fail("CLI test crossed the real subprocess boundary")
+
+    def run_command(argv, **kwargs):
+        calls.append((list(argv), dict(kwargs)))
+        return _completed(_snapshot())
+
+    monkeypatch.setattr(guard.subprocess, "run", forbidden_subprocess_run)
 
     status = guard.main(
         [
@@ -339,10 +344,13 @@ def test_cli_output_is_one_canonical_json_document(
             "1740",
         ],
         environ=_environment(),
+        run_command=run_command,
     )
     output = capsys.readouterr()
 
     assert status == 0
+    assert len(calls) == 1
+    assert calls[0][0][0] == str(DOCKER)
     assert output.err == ""
     decoded = json.loads(output.out)
     assert output.out.encode() == guard.canonical_bytes(decoded)

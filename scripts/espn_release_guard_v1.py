@@ -378,13 +378,14 @@ def run_guard(
     docker_path: str | Path,
     poll_seconds: int = DEFAULT_POLL_SECONDS,
     max_wait_seconds: int = MAX_WAIT_SECONDS,
-    run_command: CommandRunner = _run_command,
+    run_command: CommandRunner | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> dict[str, object]:
     """Poll the read-only snapshot until quiescent or the bounded deadline."""
 
     _validate_limits(poll_seconds, max_wait_seconds)
+    command_runner = _run_command if run_command is None else run_command
     started = clock()
     deadline = started + max_wait_seconds
     last_error = "snapshot_unavailable"
@@ -412,7 +413,7 @@ def run_guard(
         try:
             snapshot = read_snapshot(
                 docker_path,
-                run_command=run_command,
+                run_command=command_runner,
                 timeout_seconds=query_timeout,
             )
         except GuardError as exc:
@@ -463,7 +464,10 @@ def _emit(value: object) -> None:
 
 
 def main(
-    argv: Sequence[str] | None = None, *, environ: Mapping[str, str] | None = None
+    argv: Sequence[str] | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    run_command: CommandRunner | None = None,
 ) -> int:
     try:
         args = build_parser().parse_args(argv)
@@ -474,6 +478,7 @@ def main(
             docker_path=args.docker_path,
             poll_seconds=args.poll_seconds,
             max_wait_seconds=args.max_wait_seconds,
+            run_command=run_command,
         )
     except Exception:
         report = {

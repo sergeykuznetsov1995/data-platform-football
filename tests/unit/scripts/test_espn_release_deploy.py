@@ -220,8 +220,38 @@ def test_plan_cli_seals_the_current_operator_and_guard_executable(
 
     assert plan["operator_path"] == str(SCRIPT.resolve())
     assert plan["operator_sha256"] == hashlib.sha256(SCRIPT.read_bytes()).hexdigest()
+    assert deploy.GUARD_PYTHON_PATH == sys.executable
+    assert plan["guard"]["argv"][0] == sys.executable
     assert plan["guard"]["executable"]["path"] == sys.executable
     assert plan["guard"]["artifacts"][0]["path"] == spec["guard_artifacts"][0]
+
+
+def test_guard_interpreter_binding_follows_the_operator_interpreter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    interpreter = tmp_path / "ci-python"
+    interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    interpreter.chmod(0o755)
+    module_name = "espn_release_deploy_ci_interpreter"
+    alternate_spec = importlib.util.spec_from_file_location(module_name, SCRIPT)
+    assert alternate_spec is not None and alternate_spec.loader is not None
+
+    with monkeypatch.context() as scoped_patch:
+        scoped_patch.setattr(sys, "executable", str(interpreter))
+        alternate_deploy = importlib.util.module_from_spec(alternate_spec)
+        sys.modules[module_name] = alternate_deploy
+        try:
+            alternate_spec.loader.exec_module(alternate_deploy)
+        finally:
+            sys.modules.pop(module_name, None)
+
+    spec = _spec(tmp_path)
+    spec["guard_argv"] = [str(interpreter), *spec["guard_argv"][1:]]
+
+    assert alternate_deploy.GUARD_PYTHON_PATH == str(interpreter)
+    plan = alternate_deploy.build_plan(spec)
+    assert plan["guard"]["argv"][0] == str(interpreter)
+    assert plan["guard"]["executable"]["path"] == str(interpreter)
 
 
 def test_release_plan_seals_the_exact_versioned_guard_and_docker_bytes(
@@ -266,6 +296,7 @@ def test_release_plan_seals_the_exact_versioned_guard_and_docker_bytes(
 @pytest.mark.parametrize(
     ("index", "replacement"),
     [
+        (0, "/alternate/python"),
         (1, "-I"),
         (2, "/absolute/other/guard.py"),
         (3, "observe"),
