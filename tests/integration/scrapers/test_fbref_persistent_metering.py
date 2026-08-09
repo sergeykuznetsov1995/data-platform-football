@@ -746,10 +746,99 @@ def test_tail_over_reservation_is_charged_and_latches_terminal(
     settled = store.settle_clearance_session_tail(session_id, receipt)
 
     assert settled["terminal"] is True
+    assert settled["budget_exceeded_by_tail"] is True
+    assert settled["tail_over_reservation"] is True
     run = store.get_run(run_id)
     assert run["bytes_used"] == 10
     assert run["bytes_reserved"] == 0
     assert run["budget_exceeded"] is True
+    connection.close()
+
+
+def test_tail_over_reservation_is_terminal_even_with_run_budget_headroom(
+    isolated_postgres_uri,  # noqa: F811
+):
+    psycopg2 = pytest.importorskip("psycopg2")
+    connection = psycopg2.connect(isolated_postgres_uri)
+    store = ControlStore(isolated_postgres_uri)
+    run_id, _refresh_id, _attempt_id = _seed_run_and_attempt(
+        connection, byte_limit=100
+    )
+    session_id = _open_session(store, run_id)
+    store.reserve_clearance_session_tail(
+        run_id,
+        session_id,
+        bytes_reserved=5,
+        baseline_provider_bytes=0,
+    )
+
+    settled = store.settle_clearance_session_tail(
+        session_id,
+        PersistentMeteredSessionReceipt(
+            session_id=session_id,
+            meter=METER_ID,
+            baseline_provider_bytes=0,
+            page_provider_bytes=0,
+            authoritative_provider_bytes=10,
+            tail_provider_bytes=10,
+        ),
+    )
+
+    assert settled["terminal"] is True
+    assert settled["budget_exceeded_by_tail"] is False
+    assert settled["tail_over_reservation"] is True
+    assert store.get_run(run_id)["budget_exceeded"] is False
+    connection.close()
+
+
+def test_page_budget_latch_is_not_relabelled_as_tail_overrun(
+    isolated_postgres_uri,  # noqa: F811
+):
+    psycopg2 = pytest.importorskip("psycopg2")
+    connection = psycopg2.connect(isolated_postgres_uri)
+    store = ControlStore(isolated_postgres_uri)
+    (
+        run_id,
+        session_id,
+        reservation,
+        _tail,
+        page_kwargs,
+    ) = _prepare_page_settlement(connection, store)
+    with connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET byte_limit = 600
+                WHERE run_id = %s
+                """,
+                (run_id,),
+            )
+
+    page = store.settle_clearance_session_page(
+        session_id,
+        reservation.reservation_id,
+        **{**page_kwargs, "provider_billed_bytes": 650},
+    )
+    tail = store.settle_clearance_session_tail(
+        session_id,
+        PersistentMeteredSessionReceipt(
+            session_id=session_id,
+            meter=METER_ID,
+            baseline_provider_bytes=0,
+            page_provider_bytes=650,
+            authoritative_provider_bytes=650,
+            tail_provider_bytes=0,
+        ),
+    )
+
+    assert page["budget_exceeded"] is True
+    assert page["budget_exceeded_by_page"] is True
+    assert page["page_over_reservation"] is True
+    assert tail["terminal"] is True
+    assert tail["budget_exceeded_before_tail"] is True
+    assert tail["budget_exceeded_by_tail"] is False
+    assert tail["tail_over_reservation"] is False
     connection.close()
 
 

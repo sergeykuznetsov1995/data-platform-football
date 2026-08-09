@@ -367,6 +367,110 @@ def test_runner_rejects_persistent_marker_mismatch_before_pipeline_or_meter(
     assert meter_calls == []
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux signals")
+def test_sigterm_unwinds_strict_tail_and_control_finalizers(tmp_path):
+    journal = tmp_path / "finalizers.log"
+    code = r'''
+import os
+import signal
+import sys
+import time
+from types import SimpleNamespace
+
+from dags.scripts import run_fbref_live_waves as runner
+from scrapers.fbref.pipeline import _LiveFetchSession
+
+journal = sys.argv[1]
+
+def record(value):
+    with open(journal, "a", encoding="utf-8") as stream:
+        stream.write(value + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+class Fetcher:
+    def finalize_metered_session(self):
+        record("strict_close")
+        # A repeated TERM during exact provider close must be latched, not
+        # allowed to interrupt tail/control settlement.
+        os.kill(os.getpid(), signal.SIGTERM)
+        return SimpleNamespace(session_id="session")
+
+class Control:
+    def settle_clearance_session_tail(self, session_id, receipt):
+        assert session_id == "session"
+        assert receipt.session_id == "session"
+        record("tail_settle")
+        return {"terminal": False}
+
+    def close_clearance_session(self, session_id, *, status):
+        assert session_id == "session"
+        assert status == "failed"
+        record("control_close")
+
+class Watchdog:
+    def disarm(self):
+        record("watchdog_disarm")
+
+runner._arm_parent_death_containment = lambda _pid: None
+runner._ProcessGroupWatchdog.start = classmethod(lambda _cls: Watchdog())
+
+def run(_args):
+    live = _LiveFetchSession(
+        fetcher=Fetcher(),
+        session_id="session",
+        persistent_enabled=True,
+        state="active",
+        tail_reserved=True,
+    )
+    print("READY", flush=True)
+    try:
+        while True:
+            time.sleep(1)
+    finally:
+        live.close(Control(), status="failed")
+
+runner._run = run
+runner.main([
+    "--control-run-id", "control-run",
+    "--parent-pid", str(os.getppid()),
+    "--worker-id", "live",
+    "--page-kinds", "match",
+    "--run-type", "current",
+    "--request-limit", "100",
+    "--byte-limit-mb", "50",
+    "--shard-size", "25",
+    "--reservation-mb", "3",
+    "--domain-interval-seconds", "3",
+])
+'''
+    process = subprocess.Popen(
+        [sys.executable, "-c", code, str(journal)],
+        cwd=os.getcwd(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    assert process.stdout is not None
+    assert process.stdout.readline().strip() == "READY"
+    try:
+        os.kill(process.pid, signal.SIGTERM)
+        _, stderr = process.communicate(timeout=10)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
+
+    assert process.returncode == 128 + signal.SIGTERM, stderr
+    assert journal.read_text(encoding="utf-8").splitlines() == [
+        "strict_close",
+        "tail_settle",
+        "control_close",
+        "watchdog_disarm",
+    ]
+
+
 def _dead_or_zombie(pid: int) -> bool:
     try:
         state = open(f"/proc/{pid}/stat", encoding="utf-8").read().split()[2]

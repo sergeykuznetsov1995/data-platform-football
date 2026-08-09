@@ -2234,6 +2234,8 @@ def test_live_waves_external_interruption_terminates_process_group(monkeypatch):
         "_wait_for_process_group_exit",
         lambda *args, **kwargs: True,
     )
+    abort = MagicMock()
+    monkeypatch.setattr(fbref_pipeline_tasks, "abort_fbref_run", abort)
 
     with pytest.raises(KeyboardInterrupt):
         fbref_pipeline_tasks.run_fbref_live_waves(
@@ -2249,6 +2251,12 @@ def test_live_waves_external_interruption_terminates_process_group(monkeypatch):
 
     assert calls == 2
     assert killed == [(5432, fbref_pipeline_tasks.signal.SIGTERM)]
+    abort.assert_called_once_with(
+        airflow_run_id="scheduled__2026-07-12T06:00:00+00:00",
+        dag_id="dag_ingest_fbref",
+        error_class="LiveWavesExternalInterruption",
+        error_message="FBref live runner was interrupted by KeyboardInterrupt",
+    )
 
 
 @pytest.mark.unit

@@ -1046,6 +1046,8 @@ class PersistentFakeControl(BudgetAwareFakeControl):
         self.page_evidence = []
         self.tail_evidence = []
         self._tail_reserved = 0
+        self.force_page_budget_exceeded = False
+        self.force_tail_over_reservation = False
 
     def reserve_clearance_session_tail(
         self,
@@ -1077,7 +1079,10 @@ class PersistentFakeControl(BudgetAwareFakeControl):
         self.run["requests_used"] += int(kwargs["requests_used"])
         self.run["bytes_used"] += int(kwargs["provider_billed_bytes"])
         self.page_evidence.append((session_id, reservation_id, dict(kwargs)))
-        return {"budget_exceeded": False, "idempotent": False}
+        return {
+            "budget_exceeded": self.force_page_budget_exceeded,
+            "idempotent": False,
+        }
 
     def settle_clearance_session_tail(self, session_id, receipt):
         self.events.append("tail_settle")
@@ -1085,7 +1090,15 @@ class PersistentFakeControl(BudgetAwareFakeControl):
         self.run["bytes_used"] += int(receipt.tail_provider_bytes)
         self._tail_reserved = 0
         self.tail_evidence.append((session_id, receipt))
-        return {"terminal": False, "idempotent": False}
+        return {
+            "terminal": (
+                self.force_page_budget_exceeded
+                or self.force_tail_over_reservation
+            ),
+            "budget_exceeded_by_tail": self.force_tail_over_reservation,
+            "tail_over_reservation": self.force_tail_over_reservation,
+            "idempotent": False,
+        }
 
     def assert_persistent_metering_reconciled(self, run_id):
         assert self.run["requests_reserved"] == 0
@@ -1334,6 +1347,196 @@ def test_persistent_raw_store_failure_settles_authoritative_page_once(
         "provider_finalize"
     )
     assert len(control.tail_evidence) == 1
+
+
+def _persistent_budget_leases(run_id):
+    return [
+        TargetLease(
+            attempt_id=str(uuid.UUID(int=610 + number)),
+            run_id=run_id,
+            target_id=f"fbref:competition:{number}",
+            logical_refresh_id=str(uuid.UUID(int=620 + number)),
+            canonical_url=(
+                f"https://fbref.com/en/comps/{number}/history/x-Seasons"
+            ),
+            page_kind="competition",
+            source_ids={"competition_id": str(number)},
+            claim_token=str(uuid.UUID(int=630 + number)),
+            lease_epoch=1,
+            attempt_number=1,
+            leased_by="persistent-budget",
+            lease_expires_at=NOW + timedelta(minutes=10),
+        )
+        for number in (9, 12)
+    ]
+
+
+def test_persistent_canary_page_overrun_completes_success_and_requeues_rest(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = PersistentFakeControl(raw)
+    control.force_page_budget_exceeded = True
+    run_id = str(uuid.UUID(int=1))
+    leases = _persistent_budget_leases(run_id)
+    control.claim_targets = lambda *_args, **_kwargs: leases
+    fetcher = PersistentFakeFetcher(control.events)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_args: fetcher,
+        sleep=lambda _seconds: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="persistent-budget",
+        page_kinds=["competition"],
+        settings=_persistent_settings(),
+    )
+
+    assert result.fetched == 1
+    assert result.budget_exhausted is True
+    assert result.requeued_at_budget == 1
+    assert result.failures == []
+    assert [item[0].target_id for item in control.completed] == [
+        leases[0].target_id
+    ]
+    assert f"requeue:{leases[1].target_id}" in control.events
+    assert len(control.tail_evidence) == 1
+
+
+def test_persistent_canary_fetch_error_overrun_requeues_current_and_rest(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = PersistentFakeControl(raw)
+    control.force_page_budget_exceeded = True
+    run_id = str(uuid.UUID(int=1))
+    leases = _persistent_budget_leases(run_id)
+    control.claim_targets = lambda *_args, **_kwargs: leases
+
+    class ErrorFetcher(PersistentFakeFetcher):
+        def fetch(self, url, **_kwargs):
+            self.events.append("http_error")
+            raise FetchError(
+                "clearance rejected at the canary boundary",
+                error_class="http_status",
+                http_status=403,
+                wire_bytes=80,
+                browser_document_bytes=20,
+                browser_asset_bytes=10,
+                browser_requests=1,
+                browser_bootstrap_attempts=1,
+                provider_billed_bytes=120,
+                target_requests=1,
+                http_status_history=(403,),
+            )
+
+    fetcher = ErrorFetcher(control.events)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_args: fetcher,
+        sleep=lambda _seconds: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="persistent-budget",
+        page_kinds=["competition"],
+        settings=_persistent_settings(),
+    )
+
+    assert result.budget_exhausted is True
+    assert result.requeued_at_budget == 2
+    assert result.failures == []
+    assert control.failed[0][1]["requeue"] is True
+    assert control.failed[0][1]["provider_billed_bytes"] == 120
+    assert f"requeue:{leases[1].target_id}" in control.events
+    assert len(control.tail_evidence) == 1
+
+
+def test_persistent_production_page_overrun_is_loud_after_exact_close(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = PersistentFakeControl(raw)
+    settings = replace(
+        PipelineSettings(), persistent_http_session=True, shard_size=2
+    )
+    control.run.update(
+        request_limit=settings.request_limit,
+        byte_limit=settings.byte_limit,
+    )
+    control.force_page_budget_exceeded = True
+    run_id = str(uuid.UUID(int=1))
+    leases = _persistent_budget_leases(run_id)
+    control.claim_targets = lambda *_args, **_kwargs: leases
+    fetcher = PersistentFakeFetcher(control.events)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_args: fetcher,
+        sleep=lambda _seconds: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(
+        FetchWaveError, match="production_safety_circuit_exhausted"
+    ):
+        pipeline.fetch_wave(
+            run_id,
+            worker_id="persistent-budget",
+            page_kinds=["competition"],
+            settings=settings,
+        )
+
+    assert f"requeue:{leases[1].target_id}" in control.events
+    assert control.events.index("tail_settle") < control.events.index(
+        "session_close"
+    )
+
+
+def test_page_budget_latch_does_not_hide_true_tail_over_reservation():
+    events = []
+
+    class Fetcher:
+        def finalize_metered_session(self):
+            events.append("provider_finalized")
+            return {"session_id": "session-1"}
+
+    class Control:
+        def settle_clearance_session_tail(self, _session_id, _receipt):
+            events.append("tail_settled")
+            return {
+                "terminal": True,
+                "budget_exceeded_by_tail": True,
+                "tail_over_reservation": True,
+            }
+
+        def close_clearance_session(self, _session_id, *, status):
+            events.append(("control_closed", status))
+
+    live = _LiveFetchSession(fetcher=Fetcher(), persistent_enabled=True)
+    live.attach_control_session("session-1")
+    live.state = "active"
+    live.tail_reserved = True
+    live.page_budget_latched = True
+
+    with pytest.raises(FetchWaveError, match="tail exceeded"):
+        live.close(Control(), status="closed")
+
+    assert events == [
+        "provider_finalized",
+        "tail_settled",
+        ("control_closed", "failed"),
+    ]
 
 
 def test_settings_cannot_underreserve_bounded_status_retry_requests():

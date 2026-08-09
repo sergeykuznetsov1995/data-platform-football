@@ -612,6 +612,12 @@ class _ClaimedMatchObservation:
 
 
 @dataclass(frozen=True)
+class _LivePageSettlement:
+    provider_billed_bytes: int
+    budget_exceeded: bool = False
+
+
+@dataclass(frozen=True)
 class _AcceptanceReplayMatch:
     """Prepared frozen match with no global observation-fence mutation."""
 
@@ -654,6 +660,7 @@ class _LiveFetchSession:
     receipt: Optional[object] = None
     tail_settlement: Optional[dict] = None
     tail_reserved: bool = False
+    page_budget_latched: bool = False
 
     def clearance_reservation(self, settings) -> tuple[int, int]:
         return (
@@ -677,6 +684,7 @@ class _LiveFetchSession:
         self.receipt = None
         self.tail_settlement = None
         self.tail_reserved = False
+        self.page_budget_latched = False
 
     def begin_persistent(
         self,
@@ -802,8 +810,14 @@ class _LiveFetchSession:
                     self.needs_clearance = True
                     return
             if self.state == "tail_settled":
-                terminal = bool(
-                    (self.tail_settlement or {}).get("terminal")
+                tail_result = self.tail_settlement or {}
+                explicit_tail_overrun = bool(
+                    tail_result.get("budget_exceeded_by_tail")
+                    or tail_result.get("tail_over_reservation")
+                )
+                terminal = explicit_tail_overrun or bool(
+                    tail_result.get("terminal")
+                    and not self.page_budget_latched
                 )
                 control.close_clearance_session(
                     self.session_id,
@@ -2322,7 +2336,7 @@ class FBrefPipeline:
         reservation,
         response,
         compressed_raw_bytes: int,
-    ) -> int:
+    ) -> _LivePageSettlement:
         provider_value = getattr(response, "provider_billed_bytes", None)
         http_wire_bytes = max(
             0,
@@ -2363,11 +2377,13 @@ class FBrefPipeline:
                 ),
                 compressed_raw_bytes=max(0, int(compressed_raw_bytes)),
             )
-            if bool(settled.get("budget_exceeded")):
-                raise BudgetExceeded(
-                    "Persistent page crossed the run safety circuit"
-                )
-            return int(provider_value)
+            budget_exceeded = bool(settled.get("budget_exceeded"))
+            if budget_exceeded:
+                live_session.page_budget_latched = True
+            return _LivePageSettlement(
+                provider_billed_bytes=int(provider_value),
+                budget_exceeded=budget_exceeded,
+            )
 
         billed = (
             int(provider_value)
@@ -2400,7 +2416,30 @@ class FBrefPipeline:
                 compressed_raw_bytes=max(0, int(compressed_raw_bytes)),
                 provider_billed_bytes=provider_value,
             )
-        return billed
+        return _LivePageSettlement(provider_billed_bytes=billed)
+
+    def _record_live_budget_stop(
+        self,
+        *,
+        result: WaveResult,
+        settings: PipelineSettings,
+        leases: Sequence[object],
+        start_index: int,
+        reason: object,
+        already_requeued: int = 0,
+    ) -> None:
+        untouched = leases[start_index:]
+        returned = self.control.requeue_unfetched_targets(untouched)
+        result.requeued_at_budget += int(already_requeued) + int(returned)
+        result.budget_exhausted = True
+        if _uses_production_safety_circuit(settings):
+            result.failures.append("production_safety_circuit_exhausted")
+        logger.warning(
+            "FBref run budget exhausted (%s) — %d target(s) returned "
+            "for the next run",
+            reason,
+            int(already_requeued) + int(returned),
+        )
 
     def fetch_wave(
         self,
@@ -2696,7 +2735,7 @@ class FBrefPipeline:
                         transport_version=FETCHER_VERSION,
                         session_version=live_session.session_id,
                     )
-                    self._settle_live_page_evidence(
+                    page_settlement = self._settle_live_page_evidence(
                         settings=settings,
                         live_session=live_session,
                         lease=lease,
@@ -2722,28 +2761,32 @@ class FBrefPipeline:
                     result.browser_bootstraps += (
                         response.browser_bootstrap_attempts
                     )
+                    if page_settlement.budget_exceeded:
+                        self._record_live_budget_stop(
+                            result=result,
+                            settings=settings,
+                            leases=leases,
+                            start_index=lease_index + 1,
+                            reason=(
+                                "persistent page crossed the run safety circuit"
+                            ),
+                        )
+                        break
                 except BudgetExceeded as exc:
                     # Canary exhaustion is its expected bounded stop. Reaching
                     # the much larger production circuit means the run is
                     # incomplete/runaway and must fail loudly after returning
                     # every untouched claim to the durable queue.
-                    unfetched = leases[lease_index:]
-                    result.requeued_at_budget = (
-                        self.control.requeue_unfetched_targets(unfetched)
-                    )
-                    result.budget_exhausted = True
-                    if _uses_production_safety_circuit(settings):
-                        result.failures.append(
-                            "production_safety_circuit_exhausted"
-                        )
-                    logger.warning(
-                        "FBref run budget exhausted (%s) — %d unfetched "
-                        "target(s) returned to the queue for the next run",
-                        exc,
-                        result.requeued_at_budget,
+                    self._record_live_budget_stop(
+                        result=result,
+                        settings=settings,
+                        leases=leases,
+                        start_index=lease_index,
+                        reason=exc,
                     )
                     break
                 except FetchError as exc:
+                    page_settlement = None
                     if (
                         reservation is not None
                         and not budget_settled
@@ -2752,7 +2795,7 @@ class FBrefPipeline:
                             or exc.provider_billed_bytes is not None
                         )
                     ):
-                        self._settle_live_page_evidence(
+                        page_settlement = self._settle_live_page_evidence(
                             settings=settings,
                             live_session=live_session,
                             lease=lease,
@@ -2788,6 +2831,45 @@ class FBrefPipeline:
                     result.browser_bootstraps += (
                         exc.browser_bootstrap_attempts
                     )
+                    if (
+                        page_settlement is not None
+                        and page_settlement.budget_exceeded
+                        and exc.error_class != "hard_transport_policy"
+                    ):
+                        if settings.persistent_http_session:
+                            live_session.finalize(
+                                self.control, status="failed"
+                            )
+                        self.control.fail_fetch(
+                            lease,
+                            error_class=exc.error_class,
+                            error_message=str(exc),
+                            retry_delay_seconds=0,
+                            permanent=False,
+                            requeue=True,
+                            http_status=exc.http_status,
+                            http_request_count=exc.http_requests,
+                            http_status_history=exc.http_status_history,
+                            wire_bytes=exc.wire_bytes,
+                            provider_billed_bytes=exc.provider_billed_bytes,
+                            latency_ms=exc.latency_ms,
+                            transport_version=FETCHER_VERSION,
+                            session_version=live_session.session_id,
+                        )
+                        if _session_failure(exc):
+                            result.requeued_dead_clearance += 1
+                        self._record_live_budget_stop(
+                            result=result,
+                            settings=settings,
+                            leases=leases,
+                            start_index=lease_index + 1,
+                            already_requeued=1,
+                            reason=(
+                                "persistent failed page crossed the run "
+                                "safety circuit"
+                            ),
+                        )
+                        break
                     if exc.error_class == "hard_transport_policy":
                         # This is a run-level paid-transport invariant, not a
                         # bad target or a clearance that may be re-solved. Save

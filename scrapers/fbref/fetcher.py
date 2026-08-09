@@ -456,9 +456,9 @@ class FBrefFetcher:
 
     def close(self) -> None:
         if (
-            self.persistent_http_session
-            and self._persistent_session_id is not None
-            and self._persistent_receipt is None
+            getattr(self, "persistent_http_session", False)
+            and getattr(self, "_persistent_session_id", None) is not None
+            and getattr(self, "_persistent_receipt", None) is None
         ):
             self.finalize_metered_session()
         close_error = None
@@ -485,9 +485,9 @@ class FBrefFetcher:
         """Drop a dead clearance and its sticky metered lease."""
 
         if (
-            self.persistent_http_session
-            and self._persistent_session_id is not None
-            and self._persistent_receipt is None
+            getattr(self, "persistent_http_session", False)
+            and getattr(self, "_persistent_session_id", None) is not None
+            and getattr(self, "_persistent_receipt", None) is None
         ):
             raise FBrefProxyLeaseError(
                 "FBref persistent session must be finalized before reset"
@@ -523,9 +523,9 @@ class FBrefFetcher:
         if requests <= 0 or bytes_ <= 0:
             raise ValueError("browser request/byte limits must be positive")
         if (
-            self.persistent_http_session
-            and self._persistent_session_id is not None
-            and self._persistent_receipt is None
+            getattr(self, "persistent_http_session", False)
+            and getattr(self, "_persistent_session_id", None) is not None
+            and getattr(self, "_persistent_receipt", None) is None
         ):
             raise FBrefProxyLeaseError(
                 "FBref persistent session must be finalized before reconfigure"
@@ -572,9 +572,9 @@ class FBrefFetcher:
         """
 
         if (
-            not self.persistent_http_session
-            or self._persistent_session_id is None
-            or self._persistent_receipt is not None
+            not getattr(self, "persistent_http_session", False)
+            or getattr(self, "_persistent_session_id", None) is None
+            or getattr(self, "_persistent_receipt", None) is not None
         ):
             return self._ensure_clearance()
 
@@ -668,8 +668,8 @@ class FBrefFetcher:
             bool(strict)
             if strict is not None
             else bool(
-                self.persistent_http_session
-                and self._persistent_session_id is not None
+                getattr(self, "persistent_http_session", False)
+                and getattr(self, "_persistent_session_id", None) is not None
             )
         )
         stats = (
@@ -774,7 +774,10 @@ class FBrefFetcher:
         identity = str(session_id).strip()
         if not identity:
             raise ValueError("session_id must not be empty")
-        if not self.persistent_http_session or self._lease_client is None:
+        if (
+            not getattr(self, "persistent_http_session", False)
+            or getattr(self, "_lease_client", None) is None
+        ):
             raise FBrefProxyLeaseError(
                 "FBref persistent metering is not enabled for this fetcher"
             )
@@ -1813,7 +1816,7 @@ class FBrefFetcher:
                 etag=etag,
                 last_modified=last_modified,
             )
-        if self.persistent_http_session:
+        if getattr(self, "persistent_http_session", False):
             return self._fetch_persistent_metered(
                 url,
                 page_kind=page_kind,

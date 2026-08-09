@@ -44,7 +44,7 @@ LIVE_WAVES_RUNNER = "/opt/airflow/dags/scripts/run_fbref_live_waves.py"
 LIVE_WAVES_PYTHONPATH = "/opt/airflow"
 LIVE_WAVES_RESULT_PREFIX = "FBREF_LIVE_WAVES_RESULT:"
 LIVE_WAVES_TIMEOUT_SECONDS = 6 * 60 * 60
-LIVE_WAVES_TERMINATION_GRACE_SECONDS = 10
+LIVE_WAVES_TERMINATION_GRACE_SECONDS = 30
 LIVE_WAVES_KILL_GRACE_SECONDS = 10
 FBREF_MAX_LIVE_BATCHES = 80
 FBREF_SCRAPER_POOL = "fbref_scraper_pool"
@@ -1837,6 +1837,7 @@ def run_fbref_live_waves(
     stdout = ""
     stderr = ""
     process_group_terminated = False
+    synchronous_abort_attempted = False
     try:
         try:
             # The spawn and every instruction after it execute inside this
@@ -1886,10 +1887,11 @@ def run_fbref_live_waves(
                 error_class="LiveWavesSubprocessTimeout",
                 error_message=message,
             )
+            synchronous_abort_attempted = True
             raise RuntimeError(
                 message + " and its process group was killed"
             ) from exc
-    except BaseException:
+    except BaseException as exc:
         if lifecycle.handler_state is not None:
             lifecycle.handler_state["armed"] = False
         process = lifecycle.process
@@ -1906,6 +1908,16 @@ def run_fbref_live_waves(
                 "group was terminated.\nstdout:\n%s\nstderr:\n%s",
                 _decoded_stream(stdout),
                 _decoded_stream(stderr),
+            )
+        if not synchronous_abort_attempted:
+            _abort_failed_live_subprocess(
+                airflow_run_id=airflow_run_id,
+                dag_id=dag_id,
+                error_class="LiveWavesExternalInterruption",
+                error_message=(
+                    "FBref live runner was interrupted by "
+                    f"{type(exc).__name__}"
+                ),
             )
         raise
     finally:

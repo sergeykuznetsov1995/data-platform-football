@@ -9585,12 +9585,21 @@ class ControlStore:
                     raise StateConflict(
                         f"Reservation {reservation} was settled differently"
                     )
+                page_over_reservation = (
+                    values["requests_used"]
+                    > int(budget_row["requests_reserved"])
+                    or values["provider_billed_bytes"]
+                    > int(budget_row["bytes_reserved"])
+                )
                 return {
                     **immutable,
                     "run_id": run,
                     "evidence_sha256": digest,
                     "idempotent": True,
                     "budget_exceeded": bool(crawl_run["budget_exceeded"]),
+                    "budget_exceeded_before_page": None,
+                    "budget_exceeded_by_page": False,
+                    "page_over_reservation": page_over_reservation,
                 }
 
             if clearance["status"] != "active" or tail["status"] != "reserved":
@@ -9601,6 +9610,15 @@ class ControlStore:
                 raise StateConflict(
                     f"Reservation {reservation} has no page evidence"
                 )
+            budget_exceeded_before_page = bool(
+                crawl_run["budget_exceeded"]
+            )
+            page_over_reservation = (
+                values["requests_used"]
+                > int(budget_row["requests_reserved"])
+                or values["provider_billed_bytes"]
+                > int(budget_row["bytes_reserved"])
+            )
             cursor.execute(
                 """
                 SELECT run_id, reservation_id
@@ -9735,12 +9753,23 @@ class ControlStore:
                 raise StateConflict(
                     f"Clearance session {session} lost page settlement race"
                 )
+            budget_exceeded_after_page = bool(
+                run_after["budget_exceeded"]
+            )
             return {
                 **immutable,
                 "run_id": run,
                 "evidence_sha256": digest,
                 "idempotent": False,
-                "budget_exceeded": bool(run_after["budget_exceeded"]),
+                "budget_exceeded": budget_exceeded_after_page,
+                "budget_exceeded_before_page": (
+                    budget_exceeded_before_page
+                ),
+                "budget_exceeded_by_page": (
+                    not budget_exceeded_before_page
+                    and budget_exceeded_after_page
+                ),
+                "page_over_reservation": page_over_reservation,
             }
 
     def record_session_metrics(
@@ -9954,13 +9983,23 @@ class ControlStore:
                     raise StateConflict(
                         f"Clearance session {session} tail was settled differently"
                     )
+                tail_over_reservation = (
+                    values["tail_provider_bytes"]
+                    > int(budget_row["bytes_reserved"])
+                )
                 return {
                     **immutable,
                     "run_id": run,
                     "reservation_id": reservation,
                     "settlement_sha256": digest,
                     "idempotent": True,
-                    "terminal": bool(crawl_run["budget_exceeded"]),
+                    "budget_exceeded_before_tail": None,
+                    "budget_exceeded_by_tail": False,
+                    "tail_over_reservation": tail_over_reservation,
+                    "terminal": (
+                        bool(crawl_run["budget_exceeded"])
+                        or tail_over_reservation
+                    ),
                 }
             if tail["status"] != "reserved":
                 raise StateConflict(
@@ -9975,6 +10014,13 @@ class ControlStore:
                     f"Tail reservation {reservation} was settled without evidence"
                 )
 
+            budget_exceeded_before_tail = bool(
+                crawl_run["budget_exceeded"]
+            )
+            tail_over_reservation = (
+                values["tail_provider_bytes"]
+                > int(budget_row["bytes_reserved"])
+            )
             cursor.execute(
                 """
                 UPDATE fbref_control.budget_reservation
@@ -10045,13 +10091,27 @@ class ControlStore:
                 raise StateConflict(
                     f"Clearance session {session} lost tail evidence settlement"
                 )
+            budget_exceeded_after_tail = bool(
+                run_after["budget_exceeded"]
+            )
+            budget_exceeded_by_tail = (
+                not budget_exceeded_before_tail
+                and budget_exceeded_after_tail
+            )
             return {
                 **immutable,
                 "run_id": run,
                 "reservation_id": reservation,
                 "settlement_sha256": digest,
                 "idempotent": False,
-                "terminal": bool(run_after["budget_exceeded"]),
+                "budget_exceeded_before_tail": (
+                    budget_exceeded_before_tail
+                ),
+                "budget_exceeded_by_tail": budget_exceeded_by_tail,
+                "tail_over_reservation": tail_over_reservation,
+                "terminal": (
+                    budget_exceeded_after_tail or tail_over_reservation
+                ),
             }
 
     def assert_persistent_metering_reconciled(self, run_id: object) -> dict:

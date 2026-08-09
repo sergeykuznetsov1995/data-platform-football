@@ -36,6 +36,39 @@ RESULT_PREFIX = "FBREF_LIVE_WAVES_RESULT:"
 _PR_SET_PDEATHSIG = 1
 
 
+class _RunnerTermination(SystemExit):
+    """Request normal Python unwinding after the runner receives SIGTERM."""
+
+    def __init__(self, signum: int) -> None:
+        self.signum = int(signum)
+        super().__init__(128 + self.signum)
+
+
+def _install_sigterm_unwind_handler() -> tuple[dict, object]:
+    """Raise once, then latch later TERM signals during exact finalization."""
+
+    previous = signal.getsignal(signal.SIGTERM)
+    state = {"termination_started": False, "pending_signum": None}
+
+    def handle(signum, _frame) -> None:
+        normalized = int(signum)
+        if not state["termination_started"]:
+            state["termination_started"] = True
+            raise _RunnerTermination(normalized)
+        # Strict provider close and durable tail/control settlement must be
+        # one uninterrupted sequence. The outer task owns the bounded grace
+        # period and SIGKILL fallback if that sequence cannot finish.
+        state["pending_signum"] = normalized
+
+    try:
+        signal.signal(signal.SIGTERM, handle)
+    except ValueError as exc:
+        raise RuntimeError(
+            "FBref live runner must execute in the main thread"
+        ) from exc
+    return state, previous
+
+
 def _set_parent_death_signal(signum: int) -> None:
     """Ask Linux to kill this runner when its Airflow task parent dies."""
 
@@ -193,12 +226,18 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     args = build_parser().parse_args(argv)
-    _arm_parent_death_containment(args.parent_pid)
-    watchdog = _ProcessGroupWatchdog.start()
+    _sigterm_state, previous_sigterm = _install_sigterm_unwind_handler()
+    watchdog = None
     try:
+        _arm_parent_death_containment(args.parent_pid)
+        watchdog = _ProcessGroupWatchdog.start()
         return _run(args)
     finally:
-        watchdog.disarm()
+        try:
+            if watchdog is not None:
+                watchdog.disarm()
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def _run(args: argparse.Namespace) -> int:
