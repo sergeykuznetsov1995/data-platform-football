@@ -16,9 +16,15 @@ import json
 import os
 import re
 import subprocess
-from datetime import datetime, timezone
+import sys
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
 
 TRINO_ENV_KEYS = (
@@ -29,19 +35,33 @@ TRINO_ENV_KEYS = (
     "TRINO_HTTP_SCHEME",
     "TRINO_TLS_VERIFY",
 )
+PURGE_RAW_ENV_KEYS = (
+    "FOTMOB_RAW_STORE_URI",
+    "FOTMOB_RAW_S3_ENDPOINT",
+    "FOTMOB_RAW_S3_SCHEME",
+    "FOTMOB_RAW_S3_REGION",
+    "S3_ACCESS_KEY",
+    "S3_SECRET_KEY",
+)
 PROJECTION_SOURCES = {
+    "dag_orchestrate_fotmob.py": "dags/dag_orchestrate_fotmob.py",
     "dag_ingest_fotmob.py": "dags/dag_ingest_fotmob.py",
     "dag_transform_fotmob_silver.py": "dags/dag_transform_fotmob_silver.py",
     "dag_trigger_fotmob_daily.py": "dags/dag_trigger_fotmob_daily.py",
+    "dag_refresh_fotmob.py": "dags/dag_refresh_fotmob.py",
+    "dag_backfill_fotmob.py": "dags/dag_backfill_fotmob.py",
     ".airflowignore": "deploy/fotmob/.airflowignore",
 }
 PROJECTION_DIRECTORIES = {"utils", "sql", "scripts"}
 CONTAINER_EVIDENCE_ROOT = Path("/opt/airflow/logs/fotmob")
 SHARED_CONTAINER_EVIDENCE_ROOT = Path("/opt/airflow/fotmob-admission")
 EXPECTED_DAGS = {
+    "dag_orchestrate_fotmob",
     "dag_ingest_fotmob",
     "dag_transform_fotmob_silver",
     "dag_trigger_fotmob_daily",
+    "dag_refresh_fotmob",
+    "dag_backfill_fotmob",
 }
 SCHEDULE_BOUNDARY_FIELDS = (
     "logical_date",
@@ -74,9 +94,12 @@ SHARED_RUNTIME_SUFFIXES = (
     ".txt",
 )
 ISOLATED_DAG_ROOT_PATHS = {
+    "dags/dag_orchestrate_fotmob.py",
     "dags/dag_ingest_fotmob.py",
     "dags/dag_transform_fotmob_silver.py",
     "dags/dag_trigger_fotmob_daily.py",
+    "dags/dag_refresh_fotmob.py",
+    "dags/dag_backfill_fotmob.py",
 }
 ISOLATED_DAG_PREFIXES = (
     "dags/scripts/",
@@ -90,6 +113,9 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "configs/fotmob/issue-930-scopes.txt",
     "dags/.airflowignore",
     "dags/dag_ingest_fotmob.py",
+    "dags/dag_orchestrate_fotmob.py",
+    "dags/dag_refresh_fotmob.py",
+    "dags/dag_backfill_fotmob.py",
     "dags/dag_master_pipeline.py",
     "dags/dag_sofascore_pipeline.py",
     "dags/dag_trigger_fotmob_daily.py",
@@ -105,6 +131,7 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "dags/sql/silver/fotmob_player_season_profile.sql",
     "dags/sql/silver/xref_manager.sql.j2",
     "dags/utils/fotmob_publication.py",
+    "dags/utils/fotmob_orchestration.py",
     "dags/utils/maintenance_tasks.py",
     "dags/utils/silver_tasks.py",
     "dags/utils/xref_player_resolver.py",
@@ -112,9 +139,13 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "scrapers/base/trino_manager.py",
     "scrapers/fbref/control/store.py",
     "scrapers/fotmob/constants.py",
+    "scrapers/fotmob/catalog.py",
+    "scrapers/fotmob/catalog_contract.py",
+    "scrapers/fotmob/domain.py",
     "scrapers/fotmob/raw_store.py",
     "scrapers/fotmob/repository.py",
     "scrapers/fotmob/service.py",
+    "scrapers/fotmob/scope_codec.py",
     "scrapers/fotmob/source_refresh.py",
     "scrapers/fotmob/transport.py",
 }
@@ -137,6 +168,9 @@ SHARED_STATE_DAGS = {
     "dag_transform_e4",
     "dag_transform_fbref_gold",
     "dag_trigger_fotmob_daily",
+    "dag_refresh_fotmob",
+    "dag_backfill_fotmob",
+    "dag_orchestrate_fotmob",
 }
 EXPECTED_SHARED_PAUSE_STATES = {
     "dag_master_pipeline": True,
@@ -144,10 +178,467 @@ EXPECTED_SHARED_PAUSE_STATES = {
     "dag_ingest_fotmob": True,
     "dag_transform_fotmob_silver": True,
 }
+SHARED_MAINTENANCE_DAGS = {
+    "dag_iceberg_maintenance",
+    "dag_iceberg_maintenance_daily",
+}
+DESTRUCTIVE_SHARED_STATE_DAGS = SHARED_STATE_DAGS | SHARED_MAINTENANCE_DAGS
+DESTRUCTIVE_SHARED_PAUSE_STATES = {
+    **EXPECTED_SHARED_PAUSE_STATES,
+    **{dag_id: True for dag_id in SHARED_MAINTENANCE_DAGS},
+}
+
+AUTOMATIC_ADMISSION_SCHEMA = "fotmob-automatic-admission-v1"
+AUTOMATIC_ROLLOUT_SCHEMA = "fotmob-automatic-rollout-v1"
+COORDINATOR_ROLLOUT_SCHEMA = "fotmob-coordinator-rollout-v1"
+AUTOMATIC_CONTRACT_SCHEMA = "fotmob-catalog-v1"
+AUTOMATIC_CLASSIFIER_VERSION = "fotmob-men-v1"
+SCOPE_OBSERVATIONS_TABLE = "fotmob_competition_scope_observations"
+SCOPE_OBSERVATIONS_CURRENT_VIEW = (
+    "fotmob_competition_scope_observations_current"
+)
+LEGACY_OWNER_DAGS = frozenset(
+    {
+        "dag_trigger_fotmob_daily",
+        "dag_refresh_fotmob",
+        "dag_backfill_fotmob",
+    }
+)
+AUTOMATIC_ACTIVE_DAGS = frozenset(
+    {
+        "dag_orchestrate_fotmob",
+        "dag_ingest_fotmob",
+        "dag_transform_fotmob_silver",
+    }
+)
+AUTOMATIC_DAGBAG_DAGS = AUTOMATIC_ACTIVE_DAGS | LEGACY_OWNER_DAGS
+AUTOMATIC_EXPECTED_SCHEDULES = {
+    "dag_orchestrate_fotmob": "*/5 * * * *",
+    "dag_ingest_fotmob": "None",
+    "dag_transform_fotmob_silver": "None",
+    "dag_trigger_fotmob_daily": "None",
+    "dag_refresh_fotmob": "None",
+    "dag_backfill_fotmob": "None",
+}
+AUTOMATIC_LANES = frozenset({"daily", "refresh", "backfill"})
+AUTOMATIC_ADMISSION_MAX_AGE = timedelta(minutes=15)
+AUTOMATIC_ADMISSION_FUTURE_TOLERANCE = timedelta(minutes=1)
+AUTOMATIC_DAILY_ENTITIES = (
+    "leaderboards",
+    "matches",
+    "players",
+    "season",
+    "teams",
+    "transfers",
+)
+AUTOMATIC_DAILY_ENTITY_POLICY = {
+    "match_policy": "finished_only",
+    "leaderboard_policy": "all_advertised",
+    "team_policy": "global_observed_snapshot",
+    "player_policy": "global_observed_snapshot",
+    "transfer_policy": {
+        "window": "1year",
+        "pagination": "unique_hits",
+        "completion_scope": "included_ids",
+        "completion_signature": "catalog_contract",
+    },
+}
+AUTOMATIC_DAILY_MAX_REQUESTS = 10_000
+AUTOMATIC_DAILY_MAX_DIRECT_BYTES = 512 * 1024 * 1024
+AUTOMATIC_DAILY_REQUESTS_PER_MINUTE = 60
 
 
 class RuntimeBindingError(RuntimeError):
     pass
+
+
+def _automatic_id_digest(values: Any, *, label: str) -> tuple[int, str]:
+    if not isinstance(values, list) or any(
+        type(value) is not int or value <= 0 for value in values
+    ):
+        raise RuntimeBindingError(f"automatic {label} IDs are invalid")
+    if values != sorted(set(values)):
+        raise RuntimeBindingError(f"automatic {label} IDs are not canonical")
+    raw = "".join(f"{value}\n" for value in values).encode("ascii")
+    return len(values), hashlib.sha256(raw).hexdigest()
+
+
+AUTOMATIC_DECISION_DIGEST_FIELDS = (
+    "competition_id",
+    "decision",
+    "reason",
+    "policy_rule",
+    "classifier_version",
+    "probe_status",
+    "profile_content_hash",
+)
+
+
+def automatic_decision_digest(values: Any) -> tuple[int, str]:
+    """Hash the durable decision fields shared by runner and current view."""
+
+    if not isinstance(values, list) or any(not isinstance(item, Mapping) for item in values):
+        raise RuntimeBindingError("automatic decision evidence is invalid")
+    normalized = [
+        {field: item.get(field) for field in AUTOMATIC_DECISION_DIGEST_FIELDS}
+        for item in values
+    ]
+    if any(type(item["competition_id"]) is not int for item in normalized):
+        raise RuntimeBindingError("automatic decision IDs are invalid")
+    if [item["competition_id"] for item in normalized] != sorted(
+        {item["competition_id"] for item in normalized}
+    ):
+        raise RuntimeBindingError("automatic decision evidence is not canonical")
+    raw = json.dumps(
+        normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return len(normalized), hashlib.sha256(raw).hexdigest()
+
+
+def validate_automatic_catalog_admission(
+    value: Mapping[str, Any], *, now: datetime | None = None
+) -> dict[str, Any]:
+    """Validate the durable gate used before enabling the automatic owner.
+
+    The scope-observation view proves that structural decisions can be read
+    after a restart.  Contract hashes come from the full runner report instead
+    of per-competition fingerprints, which legitimately differ by ID.
+    """
+
+    if not isinstance(value, Mapping):
+        raise RuntimeBindingError("automatic admission must be an object")
+    if value.get("schema_version") != AUTOMATIC_ADMISSION_SCHEMA:
+        raise RuntimeBindingError("automatic admission schema is unsupported")
+    if value.get("classifier_version") != AUTOMATIC_CLASSIFIER_VERSION:
+        raise RuntimeBindingError("automatic classifier version drifted")
+    if value.get("contract_schema") != AUTOMATIC_CONTRACT_SCHEMA:
+        raise RuntimeBindingError("automatic contract schema drifted")
+    validated_at = _timestamp(value.get("validated_at"))
+    checked_at = now or datetime.now(timezone.utc)
+    if checked_at.tzinfo is None or checked_at.utcoffset() is None:
+        raise RuntimeBindingError("automatic admission check time has no timezone")
+    checked_at = checked_at.astimezone(timezone.utc)
+    if validated_at > checked_at + AUTOMATIC_ADMISSION_FUTURE_TOLERANCE:
+        raise RuntimeBindingError("automatic admission evidence is from the future")
+    if checked_at - validated_at > AUTOMATIC_ADMISSION_MAX_AGE:
+        raise RuntimeBindingError("automatic admission evidence is stale")
+
+    writer_snapshot = value.get("writer_snapshot")
+    if not isinstance(writer_snapshot, Mapping):
+        raise RuntimeBindingError("automatic atomic writer snapshot is missing")
+    snapshot_at = _timestamp(writer_snapshot.get("observed_at"))
+    if snapshot_at > validated_at or (
+        validated_at - snapshot_at > AUTOMATIC_ADMISSION_FUTURE_TOLERANCE
+    ):
+        raise RuntimeBindingError("automatic writer snapshot is not the cutover edge")
+    pause_states = writer_snapshot.get("pause_states")
+    if (
+        writer_snapshot.get("schema_version") != "fotmob-writer-snapshot-v1"
+        or re.fullmatch(
+            r"[0-9a-f]{32}", str(writer_snapshot.get("transaction_id") or "")
+        )
+        is None
+        or not isinstance(pause_states, Mapping)
+        or set(pause_states) != AUTOMATIC_DAGBAG_DAGS
+        or any(pause_states.get(dag_id) is not True for dag_id in pause_states)
+        or writer_snapshot.get("active_runs") != {}
+    ):
+        raise RuntimeBindingError(
+            "automatic writer snapshot is not one atomic paused six-DAG view"
+        )
+
+    legacy = value.get("legacy_owners")
+    if not isinstance(legacy, Mapping) or set(legacy) != LEGACY_OWNER_DAGS:
+        raise RuntimeBindingError("automatic legacy owner evidence is incomplete")
+    for dag_id in sorted(LEGACY_OWNER_DAGS):
+        state = legacy.get(dag_id)
+        if (
+            not isinstance(state, Mapping)
+            or state.get("schedule") is not None
+            or state.get("is_paused") is not True
+        ):
+            raise RuntimeBindingError(
+                f"automatic legacy owner {dag_id} is scheduled or unpaused"
+            )
+
+    lane_budgets = value.get("lane_budgets")
+    if not isinstance(lane_budgets, Mapping) or set(lane_budgets) != AUTOMATIC_LANES:
+        raise RuntimeBindingError("automatic lane budget evidence is incomplete")
+    for lane in sorted(AUTOMATIC_LANES):
+        budget = lane_budgets.get(lane)
+        if (
+            not isinstance(budget, Mapping)
+            or type(budget.get("max_proxy_mib")) is not int
+            or budget.get("max_proxy_mib") != 0
+            or (
+                "max_proxy_bytes" in budget
+                and (
+                    type(budget.get("max_proxy_bytes")) is not int
+                    or budget.get("max_proxy_bytes") != 0
+                )
+            )
+        ):
+            raise RuntimeBindingError(
+                f"automatic {lane} proxy budget must be exactly zero"
+            )
+
+    active_writers = value.get("active_writers")
+    if not isinstance(active_writers, list) or any(
+        not isinstance(item, Mapping) for item in active_writers
+    ):
+        raise RuntimeBindingError("automatic active writer evidence is invalid")
+    if active_writers:
+        raise RuntimeBindingError("automatic admission found an active writer")
+
+    reports = value.get("current_run_reports")
+    if (
+        not isinstance(reports, list)
+        or len(reports) != 1
+        or any(not isinstance(item, Mapping) for item in reports)
+    ):
+        raise RuntimeBindingError("automatic admission requires exactly one canary report")
+    contract_identities: set[tuple[str, str, str, str]] = set()
+    for index, report in enumerate(reports):
+        selection = report.get("selection")
+        if not isinstance(selection, Mapping):
+            raise RuntimeBindingError(
+                f"automatic current-run report {index} has no selection"
+            )
+        if (
+            "daily_contract" in selection
+            or "competition_scope" in selection
+            or selection.get("catalog_contract") is None
+        ):
+            raise RuntimeBindingError(
+                "automatic admission rejects legacy daily contract evidence"
+            )
+        if report.get("mode") != "daily" or selection.get("scope_lane") != "current":
+            raise RuntimeBindingError(
+                "automatic admission requires one daily/current canary report"
+            )
+        completed_at = _timestamp(report.get("completed_at"))
+        if completed_at > validated_at + AUTOMATIC_ADMISSION_FUTURE_TOLERANCE:
+            raise RuntimeBindingError("automatic canary completed after validation")
+        if validated_at - completed_at > AUTOMATIC_ADMISSION_MAX_AGE:
+            raise RuntimeBindingError("automatic canary report is stale")
+        try:
+            from scrapers.fotmob.catalog_contract import catalog_contract_from_dict
+
+            contract = catalog_contract_from_dict(selection["catalog_contract"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeBindingError(
+                f"automatic current-run contract {index} is invalid: {exc}"
+            ) from exc
+        if (
+            contract.schema != AUTOMATIC_CONTRACT_SCHEMA
+            or contract.classifier_version != AUTOMATIC_CLASSIFIER_VERSION
+        ):
+            raise RuntimeBindingError(
+                "automatic current-run classifier/contract version drifted"
+            )
+        if (
+            contract.entities != AUTOMATIC_DAILY_ENTITIES
+            or contract.entity_policy != AUTOMATIC_DAILY_ENTITY_POLICY
+        ):
+            raise RuntimeBindingError(
+                "automatic daily contract has an unsafe entity profile"
+            )
+        transport = report.get("transport")
+        budget = report.get("budget")
+        if (
+            not isinstance(transport, Mapping)
+            or not isinstance(budget, Mapping)
+            or type(transport.get("proxy_bytes")) is not int
+            or transport.get("proxy_bytes") != 0
+            or type(budget.get("proxy_bytes")) is not int
+            or budget.get("proxy_bytes") != 0
+            or type(budget.get("max_proxy_bytes")) is not int
+            or budget.get("max_proxy_bytes") != 0
+        ):
+            raise RuntimeBindingError(
+                "automatic current-run proxy evidence must be exactly zero"
+            )
+        if (
+            budget.get("max_requests") != AUTOMATIC_DAILY_MAX_REQUESTS
+            or budget.get("max_direct_bytes") != AUTOMATIC_DAILY_MAX_DIRECT_BYTES
+            or selection.get("requests_per_minute")
+            != AUTOMATIC_DAILY_REQUESTS_PER_MINUTE
+            or selection.get("competition_limit") != 0
+            or selection.get("season_limit") != 0
+            or selection.get("explicit_scopes") != []
+        ):
+            raise RuntimeBindingError(
+                "automatic daily profile or budget differs from the admitted caps"
+            )
+        try:
+            from scripts.fotmob_catalog_acceptance import validate_report
+
+            acceptance = validate_report(report, now=checked_at)
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise RuntimeBindingError(
+                f"automatic current-run report {index} cannot be validated: {exc}"
+            ) from exc
+        if not acceptance.ok:
+            raise RuntimeBindingError(
+                "automatic current-run report failed dynamic acceptance: "
+                + "; ".join(acceptance.errors)
+            )
+        contract_identities.add(
+            (
+                contract.catalog_content_hash,
+                contract.included_ids_sha256,
+                contract.scope_sha256,
+                contract.plan_signature,
+            )
+        )
+        catalog_count, catalog_ids_sha256 = _automatic_id_digest(
+            selection.get("catalog_ids"), label="catalog"
+        )
+        decisions = selection.get("catalog_decisions")
+        if not isinstance(decisions, list) or any(
+            not isinstance(item, Mapping) for item in decisions
+        ):
+            raise RuntimeBindingError("automatic catalog decisions are invalid")
+        decision_ids = [item.get("competition_id") for item in decisions]
+        decision_count, decision_ids_sha256 = _automatic_id_digest(
+            decision_ids, label="decision"
+        )
+        _decision_count, decision_evidence_sha256 = automatic_decision_digest(
+            decisions
+        )
+        if decision_ids != selection.get("catalog_ids"):
+            raise RuntimeBindingError(
+                "automatic decisions do not cover the exact catalog IDs"
+            )
+
+        observation = value.get("scope_observations")
+        expected_observation = {
+            "table": SCOPE_OBSERVATIONS_TABLE,
+            "current_view": SCOPE_OBSERVATIONS_CURRENT_VIEW,
+            "table_exists": True,
+            "current_view_exists": True,
+            "snapshot_run_id": report.get("run_id"),
+            "catalog_batch_id": contract.catalog_batch_id,
+            "catalog_content_hash": contract.catalog_content_hash,
+            "catalog_id_count": catalog_count,
+            "catalog_ids_sha256": catalog_ids_sha256,
+            "decision_count": decision_count,
+            "decision_ids_sha256": decision_ids_sha256,
+            "decision_evidence_sha256": decision_evidence_sha256,
+            "duplicate_decision_count": 0,
+            "classifier_version": AUTOMATIC_CLASSIFIER_VERSION,
+            "included_id_count": contract.included_count,
+            "included_ids_sha256": contract.included_ids_sha256,
+        }
+        if not isinstance(observation, Mapping) or any(
+            observation.get(key) != expected
+            for key, expected in expected_observation.items()
+        ):
+            raise RuntimeBindingError(
+                "automatic durable scope-observation snapshot differs from canary"
+            )
+    if len(contract_identities) > 1:
+        raise RuntimeBindingError(
+            "automatic current-run evidence contains mixed catalog/selection hashes"
+        )
+    identity = next(iter(contract_identities), None)
+    canary = value.get("canary")
+    report = reports[0]
+    final_publication = (
+        canary.get("final_publication") if isinstance(canary, Mapping) else None
+    )
+    final_candidate = (
+        final_publication.get("candidate")
+        if isinstance(final_publication, Mapping)
+        else None
+    )
+    transform_task_ids = (
+        final_candidate.get("transform_task_ids")
+        if isinstance(final_candidate, Mapping)
+        else None
+    )
+    canary_publication = (
+        canary.get("publication") if isinstance(canary, Mapping) else None
+    )
+    canary_binding = (
+        canary_publication.get("binding")
+        if isinstance(canary_publication, Mapping)
+        else None
+    )
+    if (
+        not isinstance(canary, Mapping)
+        or canary.get("schema_version") != "fotmob-automatic-canary-v1"
+        or re.fullmatch(r"[0-9a-f]{32}", str(canary.get("deployment_id") or ""))
+        is None
+        or re.fullmatch(r"[0-9a-f]{40}", str(canary.get("git_sha") or "")) is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(canary.get("scheduler_container_id") or "")
+        )
+        is None
+        or str(canary.get("generation_id") or "") != str(report.get("run_id") or "")
+        or canary.get("ingest_run_state") != "success"
+        or canary.get("silver_run_state") != "success"
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(canary.get("candidate_digest") or "")
+        )
+        is None
+        or not isinstance(canary_publication, Mapping)
+        or canary_publication.get("generation_id") != canary.get("generation_id")
+        or not isinstance(canary_binding, Mapping)
+        or canary_binding.get("schema") != "fotmob-publication-v1"
+        or canary_binding.get("source") != "fotmob"
+        or canary_binding.get("owner") != "isolated"
+        or canary_binding.get("runtime_fingerprint") != canary.get("git_sha")
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(canary.get("runner_report_sha256") or "")
+        )
+        is None
+        or not isinstance(final_publication, Mapping)
+        or final_publication.get("generation_id") != canary.get("generation_id")
+        or final_publication.get("phase") != "abandoned"
+        or final_publication.get("active") is not False
+        or final_publication.get("released") is not True
+        or final_publication.get("published") is not False
+        or not isinstance(final_candidate, Mapping)
+        or final_candidate.get("generation_id") != canary.get("generation_id")
+        or final_candidate.get("digest") != canary.get("candidate_digest")
+        or not isinstance(transform_task_ids, list)
+        or not transform_task_ids
+        or any(not isinstance(task_id, str) or not task_id for task_id in transform_task_ids)
+        or transform_task_ids != sorted(set(transform_task_ids))
+    ):
+        raise RuntimeBindingError(
+            "automatic canary is not bound to an abandoned exact publication"
+        )
+    return {
+        "schema_version": AUTOMATIC_ADMISSION_SCHEMA,
+        "classifier_version": AUTOMATIC_CLASSIFIER_VERSION,
+        "contract_schema": AUTOMATIC_CONTRACT_SCHEMA,
+        "validated_at": validated_at.isoformat(),
+        "scope_observation_ready": True,
+        "legacy_owners_paused": sorted(LEGACY_OWNER_DAGS),
+        "active_writers": [],
+        "proxy_budget_bytes": 0,
+        "current_run_report_count": len(reports),
+        "current_contract_identity": (
+            None
+            if identity is None
+            else {
+                "catalog_content_hash": identity[0],
+                "included_ids_sha256": identity[1],
+                "scope_sha256": identity[2],
+                "plan_signature": identity[3],
+            }
+        ),
+        "canary": {
+            "deployment_id": canary["deployment_id"],
+            "git_sha": canary["git_sha"],
+            "scheduler_container_id": canary["scheduler_container_id"],
+            "generation_id": canary["generation_id"],
+            "runner_report_sha256": canary["runner_report_sha256"],
+        },
+        "passed": True,
+    }
 
 
 def _is_generated_bytecode_path(value: str) -> bool:
@@ -577,6 +1068,698 @@ def _timestamp(value: Any) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def validate_automatic_rollout_activation(
+    payload: Mapping[str, Any],
+    admission: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the ordered cutover ceremony carried by an active report."""
+
+    rollout = payload.get("automatic_rollout")
+    bootstrap = {
+        "table": SCOPE_OBSERVATIONS_TABLE,
+        "table_exists": True,
+        "current_view": SCOPE_OBSERVATIONS_CURRENT_VIEW,
+        "current_view_exists": True,
+    }
+    if (
+        not isinstance(rollout, Mapping)
+        or set(rollout)
+        != {"schema_version", "phase", "scope_observation_bootstrap", "canary_report"}
+        or rollout.get("schema_version") != AUTOMATIC_ROLLOUT_SCHEMA
+        or rollout.get("phase") != "active"
+        or rollout.get("scope_observation_bootstrap") != bootstrap
+    ):
+        raise RuntimeBindingError("active automatic rollout certificate is invalid")
+    canary_path = Path(str(rollout.get("canary_report") or ""))
+    evidence_dir = Path(str(payload.get("evidence_dir") or ""))
+    try:
+        canary_path.resolve().relative_to(evidence_dir.resolve())
+    except (OSError, ValueError) as exc:
+        raise RuntimeBindingError(
+            "active automatic canary path is outside evidence directory"
+        ) from exc
+
+    activation = payload.get("automatic_activation")
+    if not isinstance(activation, Mapping):
+        raise RuntimeBindingError("active automatic cutover evidence is missing")
+    required = {
+        "fresh_shared_handoff",
+        "daily_boundary_initial",
+        "daily_boundary_commit",
+        "quiescence_before",
+        "live_canary",
+        "children_transaction",
+        "shared_consumer_unpaused",
+        "shared_consumer_readback",
+        "owner_unpaused_last",
+    }
+    if not required.issubset(activation):
+        raise RuntimeBindingError("active automatic cutover evidence is incomplete")
+
+    final_handoff = payload.get("shared_handoff_final")
+    fresh_handoff = activation.get("fresh_shared_handoff")
+    immutable_handoff_fields = {
+        "shared_scheduler_container",
+        "shared_admission_mount",
+        "runtime_code_sha256",
+        "runtime_git_sha",
+        "control_database",
+        "schedule_owner",
+    }
+    if (
+        not isinstance(final_handoff, Mapping)
+        or not isinstance(fresh_handoff, Mapping)
+        or fresh_handoff.get("passed") is not True
+        or any(
+            fresh_handoff.get(field) != final_handoff.get(field)
+            for field in immutable_handoff_fields
+        )
+    ):
+        raise RuntimeBindingError("active automatic shared handoff differs")
+
+    def daily_boundary(value: Any, *, label: str) -> dict[str, str]:
+        expected_keys = {
+            "schema_version",
+            "checked_at",
+            "selected_date",
+            "state",
+            "data_interval_start",
+            "data_interval_end",
+            "safe_start",
+            "safe_cutoff",
+            "passed",
+        }
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != expected_keys
+            or value.get("schema_version") != "fotmob-automatic-boundary-v1"
+            or value.get("passed") is not True
+            or value.get("state") not in {"future", "daily_window_open"}
+        ):
+            raise RuntimeBindingError(f"{label} automatic daily boundary is invalid")
+        checked = _timestamp(value.get("checked_at"))
+        start = _timestamp(value.get("data_interval_start"))
+        end = _timestamp(value.get("data_interval_end"))
+        cutoff = _timestamp(value.get("safe_cutoff"))
+        safe_start = _timestamp(value.get("safe_start"))
+        if (
+            end - start != timedelta(days=1)
+            or (end.hour, end.minute, end.second, end.microsecond) != (14, 0, 0, 0)
+            or value.get("selected_date") != end.date().isoformat()
+            or safe_start != end - timedelta(minutes=30)
+            or cutoff != end + timedelta(minutes=45)
+            or checked < safe_start
+            or checked >= cutoff
+        ):
+            raise RuntimeBindingError(f"{label} automatic daily boundary differs")
+        return {
+            "checked_at": checked.isoformat(timespec="microseconds"),
+            "data_interval_start": start.isoformat(timespec="microseconds"),
+            "data_interval_end": end.isoformat(timespec="microseconds"),
+            "safe_cutoff": cutoff.isoformat(timespec="microseconds"),
+        }
+
+    initial_boundary = daily_boundary(
+        activation.get("daily_boundary_initial"), label="initial"
+    )
+    commit_boundary = daily_boundary(
+        activation.get("daily_boundary_commit"), label="commit"
+    )
+    if (
+        initial_boundary["data_interval_start"]
+        != commit_boundary["data_interval_start"]
+        or initial_boundary["data_interval_end"]
+        != commit_boundary["data_interval_end"]
+        or _timestamp(commit_boundary["checked_at"])
+        < _timestamp(initial_boundary["checked_at"])
+    ):
+        raise RuntimeBindingError("automatic daily boundary changed during cutover")
+    shared_boundary = _normalize_schedule_boundary(
+        fresh_handoff.get("next_scheduled_interval"),
+        label="automatic fresh shared handoff",
+    )
+    if (
+        shared_boundary["logical_date"] != commit_boundary["data_interval_start"]
+        or shared_boundary["data_interval_start"]
+        != commit_boundary["data_interval_start"]
+        or shared_boundary["data_interval_end"]
+        != commit_boundary["data_interval_end"]
+        or shared_boundary["run_after"] != commit_boundary["data_interval_end"]
+    ):
+        raise RuntimeBindingError(
+            "automatic daily boundary differs from fresh shared interval"
+        )
+
+    all_paused = {dag_id: True for dag_id in AUTOMATIC_DAGBAG_DAGS}
+    children_paused = {
+        dag_id: dag_id
+        not in {"dag_ingest_fotmob", "dag_transform_fotmob_silver"}
+        for dag_id in AUTOMATIC_DAGBAG_DAGS
+    }
+    active_paused = {
+        dag_id: dag_id in LEGACY_OWNER_DAGS for dag_id in AUTOMATIC_DAGBAG_DAGS
+    }
+
+    def isolated_tx(value: Any, *, phase: str, before: Mapping[str, bool], after: Mapping[str, bool]) -> datetime:
+        scheduler_state = value.get("scheduler_state") if isinstance(value, Mapping) else None
+        if (
+            not isinstance(value, Mapping)
+            or value.get("schema_version") != "fotmob-writer-snapshot-v1"
+            or value.get("phase") != phase
+            or value.get("pause_states") != dict(before)
+            or value.get("pause_states_after") != dict(after)
+            or value.get("active_runs") != {}
+            or not isinstance(scheduler_state, Mapping)
+            or set(scheduler_state)
+            != {"next_background_lane", "daily_date", "generation", "updated_at"}
+            or scheduler_state.get("next_background_lane") not in {"refresh", "backfill"}
+            or scheduler_state.get("daily_date")
+            == str((activation.get("daily_boundary_commit") or {}).get("selected_date"))
+            or isinstance(scheduler_state.get("generation"), bool)
+            or not isinstance(scheduler_state.get("generation"), int)
+            or scheduler_state["generation"] < 0
+            or re.fullmatch(r"[0-9a-f]{32}", str(value.get("transaction_id") or "")) is None
+        ):
+            raise RuntimeBindingError(f"automatic {phase} writer transaction differs")
+        try:
+            if scheduler_state.get("daily_date") is not None:
+                parsed_daily = date.fromisoformat(str(scheduler_state["daily_date"]))
+                if parsed_daily.isoformat() != scheduler_state["daily_date"]:
+                    raise ValueError("non-canonical daily date")
+            _timestamp(scheduler_state.get("updated_at"))
+        except (TypeError, ValueError, RuntimeBindingError) as exc:
+            raise RuntimeBindingError(
+                f"automatic {phase} scheduler state is malformed"
+            ) from exc
+        return _timestamp(value.get("observed_at"))
+
+    children_at = isolated_tx(
+        activation.get("children_transaction"),
+        phase="children",
+        before=all_paused,
+        after=children_paused,
+    )
+    shared_before = dict(EXPECTED_SHARED_PAUSE_STATES)
+    shared_after = dict(shared_before)
+    shared_after[SHARED_CONSUMER_DAG_ID] = False
+
+    def shared_tx(value: Any, *, phase: str, expected_before: Mapping[str, bool]) -> datetime:
+        if (
+            not isinstance(value, Mapping)
+            or value.get("schema_version")
+            != "fotmob-shared-consumer-snapshot-v1"
+            or value.get("phase") != phase
+            or value.get("pause_states_before") != dict(expected_before)
+            or value.get("pause_states_after") != shared_after
+            or value.get("schedule_owner") != "isolated"
+            or not isinstance(value.get("active_runs"), list)
+            or re.fullmatch(r"[0-9a-f]{32}", str(value.get("transaction_id") or "")) is None
+        ):
+            raise RuntimeBindingError(f"automatic shared {phase} transaction differs")
+        if phase == "unpause" and value.get("active_runs") != []:
+            raise RuntimeBindingError("automatic shared cutover was not idle")
+        return _timestamp(value.get("observed_at"))
+
+    readback_at = shared_tx(
+        activation.get("shared_consumer_readback"),
+        phase="inspect_unpaused",
+        expected_before=shared_after,
+    )
+
+    def validate_shared_recovery() -> datetime:
+        shared_readback = activation.get("shared_consumer_readback")
+        shared_recovery = activation.get("shared_recovery")
+        if not isinstance(shared_readback, Mapping) or not isinstance(
+            shared_recovery, Mapping
+        ):
+            raise RuntimeBindingError(
+                "automatic recovered owner has no shared recovery proof"
+            )
+        expected_stored_boundary = {
+            "logical_date": commit_boundary["data_interval_start"],
+            "data_interval_start": commit_boundary["data_interval_start"],
+            "data_interval_end": commit_boundary["data_interval_end"],
+            "run_after": commit_boundary["data_interval_end"],
+        }
+        try:
+            stored_recovery_boundary = _normalize_schedule_boundary(
+                shared_recovery.get("stored_boundary"),
+                label="automatic recovered stored shared interval",
+            )
+            live_recovery_boundary = _normalize_schedule_boundary(
+                shared_recovery.get("live_boundary"),
+                label="automatic recovered live shared interval",
+            )
+        except RuntimeBindingError:
+            raise
+        if (
+            shared_recovery.get("schema_version")
+            != "fotmob-shared-recovery-v1"
+            or shared_recovery.get("passed") is not True
+            or stored_recovery_boundary != expected_stored_boundary
+        ):
+            raise RuntimeBindingError(
+                "automatic recovered shared interval differs from commit"
+            )
+        recovery_mode = shared_recovery.get("mode")
+        if recovery_mode == "idle_before_scheduled_run":
+            if (
+                shared_readback.get("active_runs") != []
+                or live_recovery_boundary != stored_recovery_boundary
+                or "consumer_run" in shared_recovery
+            ):
+                raise RuntimeBindingError(
+                    "automatic idle shared recovery proof differs"
+                )
+        elif recovery_mode in {
+            "scheduled_wait_sensor",
+            "terminal_wait_sensor_failed",
+        }:
+            expected_run_id = _scheduled_run_id(
+                stored_recovery_boundary["logical_date"]
+            )
+            active_runs = shared_readback.get("active_runs")
+            consumer = shared_recovery.get("consumer_run")
+            task_states = consumer.get("task_states") if isinstance(consumer, Mapping) else None
+            downstream = {
+                "trigger_xref_transforms",
+                "trigger_e3_transforms",
+                "trigger_e4_transforms",
+                "finalize_fotmob_publication",
+            }
+            expected_tasks = downstream | {"wait_for_fotmob_publication"}
+            observed_consumer_runs = shared_readback.get("consumer_runs")
+            expected_active = {
+                "dag_id": SHARED_CONSUMER_DAG_ID,
+                "run_id": expected_run_id,
+            }
+            shifted = {
+                key: (
+                    _timestamp(value) + timedelta(days=1)
+                ).isoformat(timespec="microseconds")
+                for key, value in stored_recovery_boundary.items()
+            }
+            terminal = recovery_mode == "terminal_wait_sensor_failed"
+            expected_run_state = "failed" if terminal else {"queued", "running"}
+            expected_wait_state = (
+                {"failed"}
+                if terminal
+                else {
+                    "queued",
+                    "running",
+                    "scheduled",
+                    "up_for_reschedule",
+                    "deferred",
+                }
+            )
+            terminal_downstream = {
+                "trigger_xref_transforms": "upstream_failed",
+                "trigger_e3_transforms": "upstream_failed",
+                "trigger_e4_transforms": "upstream_failed",
+                "finalize_fotmob_publication": "failed",
+            }
+            if (
+                not isinstance(active_runs, list)
+                or (
+                    terminal
+                    and active_runs != []
+                )
+                or (
+                    not terminal
+                    and (
+                        len(active_runs) != 1
+                        or any(
+                            active_runs[0].get(key) != value
+                            for key, value in expected_active.items()
+                        )
+                        or active_runs[0].get("state") not in expected_run_state
+                    )
+                )
+                or not isinstance(observed_consumer_runs, list)
+                or observed_consumer_runs != [consumer]
+                or not isinstance(consumer, Mapping)
+                or any(
+                    consumer.get(key) != value
+                    for key, value in expected_active.items()
+                )
+                or consumer.get("run_type") != "scheduled"
+                or (
+                    consumer.get("state") != expected_run_state
+                    if terminal
+                    else consumer.get("state") not in expected_run_state
+                )
+                or consumer.get("logical_date")
+                != stored_recovery_boundary["logical_date"]
+                or consumer.get("data_interval_start")
+                != stored_recovery_boundary["data_interval_start"]
+                or consumer.get("data_interval_end")
+                != stored_recovery_boundary["data_interval_end"]
+                or not isinstance(task_states, Mapping)
+                or set(task_states) != expected_tasks
+                or task_states.get("wait_for_fotmob_publication")
+                not in expected_wait_state
+                or (
+                    terminal
+                    and any(
+                        task_states.get(task_id) != state
+                        for task_id, state in terminal_downstream.items()
+                    )
+                )
+                or (
+                    not terminal
+                    and any(
+                        task_states.get(task_id) is not None
+                        for task_id in downstream
+                    )
+                )
+                or live_recovery_boundary != shifted
+                or (
+                    terminal
+                    and (
+                        shared_recovery.get("roll_forward") is not True
+                        or shared_recovery.get("next_scheduled_boundary")
+                        != live_recovery_boundary
+                    )
+                )
+            ):
+                raise RuntimeBindingError(
+                    "automatic scheduled shared recovery is not wait-only"
+                )
+        else:
+            raise RuntimeBindingError("automatic shared recovery mode is invalid")
+        recovery_control = activation.get("control_quiescence_at_recovery")
+        if (
+            not isinstance(recovery_control, Mapping)
+            or recovery_control.get("source") != "fotmob"
+            or recovery_control.get("safe") is not True
+            or recovery_control.get("active") is not False
+        ):
+            raise RuntimeBindingError(
+                "automatic recovered owner has no current ControlStore proof"
+            )
+        recovery_boundary = daily_boundary(
+            activation.get("daily_boundary_recovery"), label="recovery"
+        )
+        recovered_at = _timestamp(activation.get("recovered_at"))
+        if (
+            recovery_boundary["data_interval_start"]
+            != commit_boundary["data_interval_start"]
+            or recovery_boundary["data_interval_end"]
+            != commit_boundary["data_interval_end"]
+            or _timestamp(recovery_boundary["checked_at"])
+            < _timestamp(commit_boundary["checked_at"])
+            or recovered_at < _timestamp(commit_boundary["checked_at"])
+        ):
+            raise RuntimeBindingError(
+                "automatic recovered daily boundary differs from commit"
+            )
+        return readback_at
+
+    owner_value = activation.get("owner_transaction")
+    shared_transition_value = activation.get("shared_consumer_transaction")
+    if owner_value is not None:
+        shared_at = (
+            shared_tx(
+                shared_transition_value,
+                phase="unpause",
+                expected_before=shared_before,
+            )
+            if shared_transition_value is not None
+            else validate_shared_recovery()
+        )
+        owner_at = isolated_tx(
+            owner_value,
+            phase="owner",
+            before=children_paused,
+            after=active_paused,
+        )
+    else:
+        recovery = activation.get("owner_recovery_snapshot")
+        if (
+            not isinstance(recovery, Mapping)
+            or recovery.get("pause_states") != active_paused
+            or recovery.get("atomic_metadata_snapshot") is not True
+            or recovery.get("active_runs") != []
+        ):
+            raise RuntimeBindingError("automatic owner commit proof is missing")
+        shared_at = validate_shared_recovery()
+        owner_at = readback_at
+    if not (children_at <= shared_at <= readback_at <= owner_at):
+        raise RuntimeBindingError("automatic activation transaction order differs")
+
+    quiescence = activation.get("quiescence_before")
+    control = (
+        activation.get("control_quiescence_at_commit")
+        if shared_transition_value is not None
+        else activation.get("control_quiescence_at_recovery")
+    )
+    live_canary = activation.get("live_canary")
+    canary = admission.get("canary")
+    if (
+        not isinstance(quiescence, Mapping)
+        or quiescence.get("safe") is not True
+        or quiescence.get("active") is not False
+        or not isinstance(control, Mapping)
+        or control.get("source") != "fotmob"
+        or control.get("safe") is not True
+        or control.get("active") is not False
+        or not isinstance(live_canary, Mapping)
+        or not isinstance(canary, Mapping)
+        or live_canary.get("runner_sha256") != canary.get("runner_report_sha256")
+        or not isinstance(live_canary.get("runner_bytes"), int)
+        or live_canary["runner_bytes"] <= 0
+        or activation.get("shared_consumer_unpaused") is not True
+        or activation.get("owner_unpaused_last") is not True
+    ):
+        raise RuntimeBindingError("automatic activation final evidence differs")
+    return {
+        "schema_version": AUTOMATIC_ROLLOUT_SCHEMA,
+        "phase": "active",
+        "daily_interval": {
+            "start": commit_boundary["data_interval_start"],
+            "end": commit_boundary["data_interval_end"],
+        },
+        "children_at": children_at.isoformat(),
+        "shared_at": shared_at.isoformat(),
+        "owner_at": owner_at.isoformat(),
+        "recovered": activation.get("shared_recovery") is not None,
+        "passed": True,
+    }
+
+
+def validate_pending_automatic_shared_wait(
+    payload: Mapping[str, Any],
+    admission: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Admit only a wait-only Sofa sensor during the atomic cutover gap.
+
+    This certificate deliberately grants no claim, finalizer, producer, or
+    writer authority.  The sensor may only keep poking until the same report
+    is atomically replaced by a fully validated active certificate.
+    """
+
+    rollout = payload.get("automatic_rollout")
+    bootstrap = {
+        "table": SCOPE_OBSERVATIONS_TABLE,
+        "table_exists": True,
+        "current_view": SCOPE_OBSERVATIONS_CURRENT_VIEW,
+        "current_view_exists": True,
+    }
+    if (
+        not isinstance(rollout, Mapping)
+        or set(rollout)
+        != {"schema_version", "phase", "scope_observation_bootstrap", "canary_report"}
+        or rollout.get("schema_version") != AUTOMATIC_ROLLOUT_SCHEMA
+        or rollout.get("phase") != "pending_owner"
+        or rollout.get("scope_observation_bootstrap") != bootstrap
+    ):
+        raise RuntimeBindingError("pending automatic wait rollout is invalid")
+    evidence_dir = Path(str(payload.get("evidence_dir") or ""))
+    canary_path = Path(str(rollout.get("canary_report") or ""))
+    try:
+        canary_path.resolve().relative_to(evidence_dir.resolve())
+    except (OSError, ValueError) as exc:
+        raise RuntimeBindingError(
+            "pending automatic wait canary is outside evidence directory"
+        ) from exc
+
+    activation = payload.get("automatic_activation")
+    expected_activation_keys = {
+        "fresh_shared_handoff",
+        "daily_boundary_initial",
+        "daily_boundary_commit",
+        "quiescence_before",
+        "live_canary",
+        "children_transaction",
+        "shared_consumer_unpaused",
+        "owner_unpaused_last",
+    }
+    if not isinstance(activation, Mapping) or set(activation) != expected_activation_keys:
+        raise RuntimeBindingError("pending automatic wait ceremony is incomplete")
+    if (
+        activation.get("shared_consumer_unpaused") is not False
+        or activation.get("owner_unpaused_last") is not False
+    ):
+        raise RuntimeBindingError("pending automatic wait claims a completed cutover")
+
+    fresh_handoff = activation.get("fresh_shared_handoff")
+    final_handoff = payload.get("shared_handoff_final")
+    immutable_handoff_fields = {
+        "shared_scheduler_container",
+        "shared_admission_mount",
+        "runtime_code_sha256",
+        "runtime_git_sha",
+        "control_database",
+        "schedule_owner",
+    }
+    if (
+        not isinstance(fresh_handoff, Mapping)
+        or fresh_handoff.get("passed") is not True
+        or not isinstance(final_handoff, Mapping)
+        or any(
+            fresh_handoff.get(field) != final_handoff.get(field)
+            for field in immutable_handoff_fields
+        )
+    ):
+        raise RuntimeBindingError("pending automatic shared handoff differs")
+
+    def boundary(value: Any, *, label: str) -> tuple[datetime, datetime, datetime]:
+        expected_keys = {
+            "schema_version",
+            "checked_at",
+            "selected_date",
+            "state",
+            "data_interval_start",
+            "data_interval_end",
+            "safe_start",
+            "safe_cutoff",
+            "passed",
+        }
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != expected_keys
+            or value.get("schema_version") != "fotmob-automatic-boundary-v1"
+            or value.get("passed") is not True
+            or value.get("state") not in {"future", "daily_window_open"}
+        ):
+            raise RuntimeBindingError(f"pending {label} daily boundary is invalid")
+        checked = _timestamp(value.get("checked_at"))
+        start = _timestamp(value.get("data_interval_start"))
+        end = _timestamp(value.get("data_interval_end"))
+        safe_start = _timestamp(value.get("safe_start"))
+        cutoff = _timestamp(value.get("safe_cutoff"))
+        if (
+            end - start != timedelta(days=1)
+            or (end.hour, end.minute, end.second, end.microsecond) != (14, 0, 0, 0)
+            or value.get("selected_date") != end.date().isoformat()
+            or safe_start != end - timedelta(minutes=30)
+            or cutoff != end + timedelta(minutes=45)
+            or checked < safe_start
+            or checked >= cutoff
+        ):
+            raise RuntimeBindingError(f"pending {label} daily boundary differs")
+        return checked, start, end
+
+    initial_checked, initial_start, initial_end = boundary(
+        activation.get("daily_boundary_initial"), label="initial"
+    )
+    commit_checked, commit_start, commit_end = boundary(
+        activation.get("daily_boundary_commit"), label="commit"
+    )
+    shared_boundary = _normalize_schedule_boundary(
+        fresh_handoff.get("next_scheduled_interval"),
+        label="pending automatic shared handoff",
+    )
+    if (
+        (initial_start, initial_end) != (commit_start, commit_end)
+        or commit_checked < initial_checked
+        or shared_boundary["logical_date"]
+        != commit_start.isoformat(timespec="microseconds")
+        or shared_boundary["data_interval_start"]
+        != commit_start.isoformat(timespec="microseconds")
+        or shared_boundary["data_interval_end"]
+        != commit_end.isoformat(timespec="microseconds")
+        or shared_boundary["run_after"]
+        != commit_end.isoformat(timespec="microseconds")
+    ):
+        raise RuntimeBindingError("pending automatic shared interval differs")
+
+    all_paused = {dag_id: True for dag_id in AUTOMATIC_DAGBAG_DAGS}
+    children_paused = {
+        dag_id: dag_id
+        not in {"dag_ingest_fotmob", "dag_transform_fotmob_silver"}
+        for dag_id in AUTOMATIC_DAGBAG_DAGS
+    }
+    transaction = activation.get("children_transaction")
+    scheduler_state = (
+        transaction.get("scheduler_state") if isinstance(transaction, Mapping) else None
+    )
+    if (
+        not isinstance(transaction, Mapping)
+        or transaction.get("schema_version") != "fotmob-writer-snapshot-v1"
+        or transaction.get("phase") != "children"
+        or transaction.get("pause_states") != all_paused
+        or transaction.get("pause_states_after") != children_paused
+        or transaction.get("active_runs") != {}
+        or re.fullmatch(
+            r"[0-9a-f]{32}", str(transaction.get("transaction_id") or "")
+        )
+        is None
+        or not isinstance(scheduler_state, Mapping)
+        or set(scheduler_state)
+        != {"next_background_lane", "daily_date", "generation", "updated_at"}
+        or scheduler_state.get("next_background_lane") not in {"refresh", "backfill"}
+        or scheduler_state.get("daily_date") == commit_end.date().isoformat()
+        or isinstance(scheduler_state.get("generation"), bool)
+        or not isinstance(scheduler_state.get("generation"), int)
+        or scheduler_state["generation"] < 0
+    ):
+        raise RuntimeBindingError("pending automatic children transaction differs")
+    try:
+        if scheduler_state.get("daily_date") is not None:
+            parsed_daily = date.fromisoformat(str(scheduler_state["daily_date"]))
+            if parsed_daily.isoformat() != scheduler_state["daily_date"]:
+                raise ValueError("non-canonical daily date")
+        _timestamp(scheduler_state.get("updated_at"))
+        transaction_at = _timestamp(transaction.get("observed_at"))
+        generated_at = _timestamp(payload.get("generated_at"))
+    except (TypeError, ValueError, RuntimeBindingError) as exc:
+        raise RuntimeBindingError(
+            "pending automatic children transaction is malformed"
+        ) from exc
+    if transaction_at < initial_checked or transaction_at > generated_at:
+        raise RuntimeBindingError("pending automatic transaction ordering differs")
+
+    quiescence = activation.get("quiescence_before")
+    live_canary = activation.get("live_canary")
+    canary = admission.get("canary")
+    if (
+        not isinstance(quiescence, Mapping)
+        or quiescence.get("safe") is not True
+        or quiescence.get("active") is not False
+        or not isinstance(live_canary, Mapping)
+        or not isinstance(canary, Mapping)
+        or live_canary.get("runner_sha256") != canary.get("runner_report_sha256")
+        or not isinstance(live_canary.get("runner_bytes"), int)
+        or live_canary["runner_bytes"] <= 0
+        or canary.get("deployment_id") != payload.get("deployment_id")
+        or canary.get("git_sha") != payload.get("git_sha")
+        or canary.get("scheduler_container_id")
+        != payload.get("scheduler_container_id")
+    ):
+        raise RuntimeBindingError("pending automatic wait evidence differs")
+    return {
+        "schema_version": AUTOMATIC_ROLLOUT_SCHEMA,
+        "phase": "pending_owner",
+        "wait_only": True,
+        "daily_interval": {
+            "start": commit_start.isoformat(timespec="microseconds"),
+            "end": commit_end.isoformat(timespec="microseconds"),
+        },
+        "passed": True,
+    }
+
+
 def load_deployment_context(
     deployment_report: Path,
     *,
@@ -600,7 +1783,75 @@ def load_deployment_context(
         raise RuntimeBindingError("deployment report has no completed activation state")
     paused = payload.get("paused")
     unpaused = payload.get("unpaused")
-    if activation_state == "active":
+    raw_automatic_admission = payload.get("automatic_catalog_admission")
+    raw_automatic_rollout = payload.get("automatic_rollout")
+    raw_coordinator_rollout = payload.get("coordinator_rollout")
+    deployment_generated_at = (
+        _timestamp(payload.get("generated_at"))
+        if raw_automatic_admission is not None
+        else None
+    )
+    automatic_admission = (
+        validate_automatic_catalog_admission(
+            raw_automatic_admission, now=deployment_generated_at
+        )
+        if raw_automatic_admission is not None
+        else None
+    )
+    automatic_bootstrap = (
+        isinstance(raw_automatic_rollout, Mapping)
+        and raw_automatic_rollout.get("schema_version") == AUTOMATIC_ROLLOUT_SCHEMA
+        and raw_automatic_rollout.get("phase") == "awaiting_canary"
+        and raw_automatic_rollout.get("scope_observation_bootstrap")
+        == {
+            "table": SCOPE_OBSERVATIONS_TABLE,
+            "table_exists": True,
+            "current_view": SCOPE_OBSERVATIONS_CURRENT_VIEW,
+            "current_view_exists": True,
+        }
+    )
+    if raw_automatic_rollout is not None and not automatic_bootstrap and (
+        automatic_admission is None
+    ):
+        raise RuntimeBindingError("automatic rollout bootstrap evidence is invalid")
+    automatic_profile = automatic_admission is not None or automatic_bootstrap
+    coordinator_profile = (
+        activation_state == "kept_paused"
+        and isinstance(raw_coordinator_rollout, Mapping)
+        and raw_coordinator_rollout
+        == {
+            "schema_version": COORDINATOR_ROLLOUT_SCHEMA,
+            "phase": "kept_paused",
+            "legacy_activation_retired": True,
+        }
+    )
+    if automatic_admission is not None and activation_state == "active":
+        if (
+            automatic_admission["current_run_report_count"] != 1
+            or automatic_admission["current_contract_identity"] is None
+            or payload.get("kept_paused") is not False
+            or not isinstance(paused, list)
+            or set(paused) != LEGACY_OWNER_DAGS
+            or not isinstance(unpaused, list)
+            or set(unpaused) != AUTOMATIC_ACTIVE_DAGS
+        ):
+            raise RuntimeBindingError(
+                "automatic active deployment pause state is inconsistent"
+            )
+        payload["automatic_rollout_summary"] = validate_automatic_rollout_activation(
+            payload, automatic_admission
+        )
+    elif automatic_profile:
+        if (
+            payload.get("kept_paused") is not True
+            or not isinstance(paused, list)
+            or set(paused) != AUTOMATIC_DAGBAG_DAGS
+            or unpaused != []
+        ):
+            raise RuntimeBindingError(
+                "automatic kept-paused deployment state is inconsistent"
+            )
+    elif activation_state == "active":
         if (
             payload.get("kept_paused") is not False
             or paused != []
@@ -637,9 +1888,10 @@ def load_deployment_context(
         "control_database",
         "shared_handoff_initial",
         "shared_handoff_final",
-        "schedule_boundary",
         "generated_at",
     )
+    if not automatic_profile and not coordinator_profile:
+        required = (*required, "schedule_boundary")
     missing = [key for key in required if not str(payload.get(key, "")).strip()]
     if missing:
         raise RuntimeBindingError(
@@ -756,61 +2008,62 @@ def load_deployment_context(
         expected_runtime_manifest=expected_runtime_manifest,
         expected_admission_mount=expected_admission_mount,
     )
-    schedule_boundary = payload.get("schedule_boundary")
-    expected_boundary_keys = {
-        "shared_dag_id",
-        "isolated_dag_id",
-        "shared_initial",
-        "shared_final",
-        "isolated_initial",
-        "isolated_final",
-        "exact_match",
-    }
-    if activation_state == "active":
-        expected_boundary_keys.update({"shared_commit", "isolated_commit"})
-    if (
-        not isinstance(schedule_boundary, Mapping)
-        or set(schedule_boundary) != expected_boundary_keys
-        or schedule_boundary.get("shared_dag_id") != SHARED_CONSUMER_DAG_ID
-        or schedule_boundary.get("isolated_dag_id") != ISOLATED_DAILY_DAG_ID
-        or schedule_boundary.get("exact_match") is not True
-    ):
-        raise RuntimeBindingError(
-            "deployment report has no exact producer/consumer schedule proof"
-        )
-    boundary_names = [
-        "shared_initial",
-        "shared_final",
-        "isolated_initial",
-        "isolated_final",
-    ]
-    if activation_state == "active":
-        boundary_names.extend(["shared_commit", "isolated_commit"])
-    normalized_boundaries = {
-        key: _normalize_schedule_boundary(
-            schedule_boundary.get(key), label=f"deployment {key}"
-        )
-        for key in boundary_names
-    }
-    expected_boundary = normalized_boundaries["shared_initial"]
-    if (
-        any(value != expected_boundary for value in normalized_boundaries.values())
-        or _normalize_schedule_boundary(
-            initial_handoff.get("next_scheduled_interval"),
-            label="initial shared handoff",
-        )
-        != expected_boundary
-        or _normalize_schedule_boundary(
-            final_handoff.get("next_scheduled_interval"),
-            label="final shared handoff",
-        )
-        != expected_boundary
-    ):
-        raise RuntimeBindingError(
-            "deployment producer/consumer next scheduled intervals differ"
-        )
-    if activation_state == "active":
-        _validate_active_schedule_proof(payload, expected_boundary)
+    if not automatic_profile and not coordinator_profile:
+        schedule_boundary = payload.get("schedule_boundary")
+        expected_boundary_keys = {
+            "shared_dag_id",
+            "isolated_dag_id",
+            "shared_initial",
+            "shared_final",
+            "isolated_initial",
+            "isolated_final",
+            "exact_match",
+        }
+        if activation_state == "active":
+            expected_boundary_keys.update({"shared_commit", "isolated_commit"})
+        if (
+            not isinstance(schedule_boundary, Mapping)
+            or set(schedule_boundary) != expected_boundary_keys
+            or schedule_boundary.get("shared_dag_id") != SHARED_CONSUMER_DAG_ID
+            or schedule_boundary.get("isolated_dag_id") != ISOLATED_DAILY_DAG_ID
+            or schedule_boundary.get("exact_match") is not True
+        ):
+            raise RuntimeBindingError(
+                "deployment report has no exact producer/consumer schedule proof"
+            )
+        boundary_names = [
+            "shared_initial",
+            "shared_final",
+            "isolated_initial",
+            "isolated_final",
+        ]
+        if activation_state == "active":
+            boundary_names.extend(["shared_commit", "isolated_commit"])
+        normalized_boundaries = {
+            key: _normalize_schedule_boundary(
+                schedule_boundary.get(key), label=f"deployment {key}"
+            )
+            for key in boundary_names
+        }
+        expected_boundary = normalized_boundaries["shared_initial"]
+        if (
+            any(value != expected_boundary for value in normalized_boundaries.values())
+            or _normalize_schedule_boundary(
+                initial_handoff.get("next_scheduled_interval"),
+                label="initial shared handoff",
+            )
+            != expected_boundary
+            or _normalize_schedule_boundary(
+                final_handoff.get("next_scheduled_interval"),
+                label="final shared handoff",
+            )
+            != expected_boundary
+        ):
+            raise RuntimeBindingError(
+                "deployment producer/consumer next scheduled intervals differ"
+            )
+        if activation_state == "active":
+            _validate_active_schedule_proof(payload, expected_boundary)
     if (
         initial_handoff["shared_scheduler_container"]
         != final_handoff["shared_scheduler_container"]
@@ -829,6 +2082,19 @@ def load_deployment_context(
             "deployment report isolated runtime manifest differs from admitted release"
         )
     _timestamp(payload["generated_at"])
+    if automatic_admission is not None:
+        canary_summary = automatic_admission.get("canary")
+        if (
+            not isinstance(canary_summary, Mapping)
+            or canary_summary.get("deployment_id") != payload["deployment_id"]
+            or canary_summary.get("git_sha") != payload["git_sha"]
+            or canary_summary.get("scheduler_container_id")
+            != payload["scheduler_container_id"]
+        ):
+            raise RuntimeBindingError(
+                "automatic canary identity differs from deployment report"
+            )
+        payload["automatic_catalog_admission_summary"] = automatic_admission
     return payload
 
 
@@ -1340,6 +2606,158 @@ def assert_no_active_fotmob_publication(
         "active_run_checks": dict(payload["active_run_checks"]),
         "shared_daily_trigger": dict(payload["shared_daily_trigger"]),
         "control_database_bound": True,
+        "control_database_fingerprint": hashlib.sha256(
+            control_uri.encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def validate_live_shared_runtime(
+    context: Mapping[str, Any],
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    """Re-attest the active shared container without assuming Sofa is paused."""
+
+    handoff = context.get("shared_handoff_final")
+    if not isinstance(handoff, Mapping):
+        raise RuntimeBindingError("deployment report has no shared handoff proof")
+    container_id = str(handoff.get("shared_scheduler_container") or "")
+    shared = _inspect_container(container_id, run=run)
+    isolated = _inspect_container(str(context.get("scheduler_container_id") or ""), run=run)
+    if (
+        shared.get("Id") != container_id
+        or not bool((shared.get("State") or {}).get("Running"))
+        or isolated.get("Id") != context.get("scheduler_container_id")
+    ):
+        raise RuntimeBindingError("shared/isolated scheduler identity drifted")
+    shared_env = _parsed_environment(shared)
+    isolated_env = _parsed_environment(isolated)
+    control_uri = isolated_env.get("FBREF_CONTROL_DB_URI", "")
+    if (
+        not control_uri
+        or "airflow-metadb" in control_uri.lower()
+        or shared_env.get("FBREF_CONTROL_DB_URI") != control_uri
+        or shared_env.get("FOTMOB_DEPLOY_GIT_SHA") != context.get("git_sha")
+        or shared_env.get("FOTMOB_ISOLATED_STACK", "")
+        or shared_env.get("FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH")
+        != context.get("shared_container_report_path")
+    ):
+        raise RuntimeBindingError("active shared runtime environment drifted")
+    expected_mount = {
+        "Source": str(Path(str(context.get("evidence_dir") or "")).resolve()),
+        "Destination": str(SHARED_CONTAINER_EVIDENCE_ROOT),
+    }
+    matching_mounts = [
+        mount
+        for mount in shared.get("Mounts") or ()
+        if isinstance(mount, Mapping)
+        and mount.get("Destination") == expected_mount["Destination"]
+    ]
+    if (
+        len(matching_mounts) != 1
+        or str(matching_mounts[0].get("Source") or "") != expected_mount["Source"]
+        or matching_mounts[0].get("RW") is not False
+    ):
+        raise RuntimeBindingError("active shared admission mount drifted")
+    release = Path(str(context.get("release_root") or ""))
+    expected_manifest = shared_runtime_manifest(release)
+    if handoff.get("runtime_code_sha256") != expected_manifest:
+        raise RuntimeBindingError("active shared report manifest drifted")
+    marker = "FOTMOB_ACTIVE_SHARED_MANIFEST_JSON="
+    code = (
+        "import hashlib,json\n"
+        "from pathlib import Path\n"
+        f"roots={SHARED_RUNTIME_ROOTS!r}\n"
+        f"suffixes={SHARED_RUNTIME_SUFFIXES!r}\n"
+        "manifest={}\n"
+        "for prefix, root_name in roots.items():\n"
+        "    root=Path(root_name)\n"
+        "    for path in sorted(root.rglob('*')):\n"
+        "        if path.is_symlink(): raise RuntimeError('shared runtime symlink')\n"
+        "        if path.is_file() and '__pycache__' not in path.parts and "
+        "(path.name == '.airflowignore' or path.name.endswith(suffixes)):\n"
+        "            key=prefix+'/'+path.relative_to(root).as_posix()\n"
+        "            manifest[key]=hashlib.sha256(path.read_bytes()).hexdigest()\n"
+        f"print('{marker}'+json.dumps(manifest,sort_keys=True))\n"
+    )
+    output = run(
+        ("docker", "exec", container_id, "python", "-c", code),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    remote_manifest = None
+    for line in reversed(output.splitlines()):
+        if line.startswith(marker):
+            try:
+                remote_manifest = json.loads(line.removeprefix(marker))
+            except json.JSONDecodeError as exc:
+                raise RuntimeBindingError(
+                    "active shared runtime manifest is invalid"
+                ) from exc
+            break
+    if remote_manifest != expected_manifest:
+        raise RuntimeBindingError("active shared runtime bytes drifted")
+    return {
+        "shared_scheduler_container_id": container_id,
+        "runtime_git_sha": context.get("git_sha"),
+        "runtime_code_sha256": expected_manifest,
+        "control_database_bound": True,
+        "control_database_fingerprint": hashlib.sha256(
+            control_uri.encode("utf-8")
+        ).hexdigest(),
+        "admission_mount_read_only": True,
+        "passed": True,
+    }
+
+
+def validate_live_purge_data_bindings(
+    context: Mapping[str, Any],
+    *,
+    raw_store_uri: str,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    """Bind destructive host raw access to the admitted isolated runtime."""
+
+    isolated = _inspect_container(str(context.get("scheduler_container_id") or ""), run=run)
+    if isolated.get("Id") != context.get("scheduler_container_id"):
+        raise RuntimeBindingError("purge isolated scheduler identity drifted")
+    admitted = _parsed_environment(isolated)
+    host_raw = str(raw_store_uri).strip()
+    if not host_raw or admitted.get("FOTMOB_RAW_STORE_URI") != host_raw:
+        raise RuntimeBindingError("purge raw-store URI differs from admitted runtime")
+    mismatches = [
+        key
+        for key in PURGE_RAW_ENV_KEYS[1:]
+        if os.environ.get(key, "") != admitted.get(key, "")
+    ]
+    if mismatches:
+        raise RuntimeBindingError(
+            f"purge raw-store credentials/endpoint differ: {mismatches!r}"
+        )
+    host_trino = {key: os.environ.get(key, "") for key in TRINO_ENV_KEYS}
+    # A host-reachable DNS name may differ from Docker DNS.  The immutable
+    # deployment marker proves the data plane; every other endpoint/security
+    # property and the credential must be the admitted value.
+    trino_mismatches = [
+        key
+        for key in TRINO_ENV_KEYS
+        if key != "TRINO_HOST" and host_trino[key] != admitted.get(key, "")
+    ]
+    if trino_mismatches:
+        raise RuntimeBindingError(
+            f"purge Trino security binding differs: {trino_mismatches!r}"
+        )
+    if not host_trino["TRINO_HOST"]:
+        raise RuntimeBindingError("purge host Trino endpoint is missing")
+    return {
+        "scheduler_container_id": context.get("scheduler_container_id"),
+        "raw_store_uri": host_raw,
+        "raw_store_bound": True,
+        "trino_host": host_trino["TRINO_HOST"],
+        "trino_security_bound": True,
+        "passed": True,
     }
 
 

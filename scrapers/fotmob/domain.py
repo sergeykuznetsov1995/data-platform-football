@@ -9,6 +9,7 @@ Human-readable names and slugs are presentation metadata.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 import re
 import unicodedata
@@ -25,6 +26,17 @@ class ScopeDecision(str, Enum):
     INCLUDED = "included"
     EXCLUDED = "excluded"
     REVIEW_REQUIRED = "review_required"
+    PENDING_PROBE = "pending_probe"
+
+
+class ProbeStatus(str, Enum):
+    """State of the authoritative ``/leagues`` profile probe."""
+
+    SUCCESS = "success"
+    PENDING = "pending"
+    NOT_FOUND = "not_found"
+    DEAD = "dead"
+    INVALID = "invalid"
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +144,30 @@ class ScopeClassification:
 
 
 @dataclass(frozen=True, slots=True)
+class CompetitionScopeEvidence:
+    """Durable evidence behind one automatic competition-scope decision."""
+
+    competition_id: int
+    catalog_name: str
+    profile_name: Optional[str]
+    source_gender: Optional[str]
+    source_age_group: Optional[str]
+    source_type: Optional[str]
+    probe_status: ProbeStatus
+    decision: ScopeDecision
+    reason: str
+    policy_rule: str
+    classifier_version: str
+    profile_target_key: Optional[str]
+    profile_content_hash: Optional[str]
+    catalog_fingerprint: str
+    authoritative_miss_count: int
+    next_probe_at: Optional[datetime]
+    observed_at: datetime
+    probe_attempt_count: Optional[int] = 0
+
+
+@dataclass(frozen=True, slots=True)
 class LeaderboardCategoryRef:
     """A leaderboard advertised by a league payload.
 
@@ -192,9 +228,11 @@ def competition_slug(competition_id: int, value: str) -> str:
 
 __all__ = [
     "CompetitionRef",
+    "CompetitionScopeEvidence",
     "JsonRow",
     "LeaderboardCategoryRef",
     "ParseIssue",
+    "ProbeStatus",
     "Rows",
     "ScopeClassification",
     "ScopeDecision",

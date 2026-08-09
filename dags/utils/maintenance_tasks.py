@@ -144,6 +144,7 @@ WHOSCORED_HIGH_CHURN: Tuple[str, ...] = (
 # aligned with scrapers.fotmob.repository.TABLE_PARTITIONS; views are excluded.
 FOTMOB_NATIVE_HIGH_CHURN: Tuple[str, ...] = (
     "fotmob_competitions",
+    "fotmob_competition_scope_observations",
     "fotmob_competition_seasons",
     "fotmob_competition_season_history",
     "fotmob_season_stages",

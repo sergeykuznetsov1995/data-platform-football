@@ -104,6 +104,35 @@ def _quiet() -> dict:
     }
 
 
+def test_writer_fence_covers_automatic_owner_and_all_manual_legacy_owners():
+    assert set(mod.DAGS) == {
+        "dag_orchestrate_fotmob",
+        "dag_ingest_fotmob",
+        "dag_transform_fotmob_silver",
+        "dag_trigger_fotmob_daily",
+        "dag_refresh_fotmob",
+        "dag_backfill_fotmob",
+    }
+    assert set(mod.DAGS).issubset(mod.runtime_binding.SHARED_STATE_DAGS)
+
+
+@pytest.mark.parametrize(
+    "dag_id",
+    (
+        "dag_orchestrate_fotmob",
+        "dag_trigger_fotmob_daily",
+        "dag_refresh_fotmob",
+        "dag_backfill_fotmob",
+    ),
+)
+def test_writer_fence_rejects_any_active_owner(dag_id):
+    state = _quiet()
+    state["active_runs"] = {dag_id: {"running": ["run-1"]}}
+
+    with pytest.raises(mod.BackfillError, match="active runs"):
+        mod._require_writers_stopped(state)
+
+
 def _candidate() -> dict:
     return {
         "generation_id": GENERATION_ID,

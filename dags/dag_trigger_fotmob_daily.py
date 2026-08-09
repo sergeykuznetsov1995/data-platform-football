@@ -1,9 +1,7 @@
-"""Own the 14:00 UTC FotMob schedule in the isolated production stack.
+"""Manual rollback owner for the isolated production FotMob daily run.
 
-``dag_ingest_fotmob`` is intentionally trigger-only because the shared stack
-normally schedules it through the master DAG.  The isolated FotMob stack does
-not load that master DAG, so this minimal owner is the only scheduled object.
-It must be paused before moving the workload back to the shared scheduler.
+``dag_orchestrate_fotmob`` now owns the isolated automatic schedule.  This DAG
+keeps the former daily path available for an explicit rollback trigger only.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -62,7 +60,7 @@ if os.environ.get(ISOLATED_STACK_ENV) == "1":
     with DAG(
         dag_id="dag_trigger_fotmob_daily",
         description="Daily 14:00 UTC source-native FotMob trigger",
-        schedule="0 14 * * *",
+        schedule=None,
         start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
         catchup=False,
         max_active_runs=1,

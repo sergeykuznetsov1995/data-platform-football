@@ -1,4 +1,4 @@
-# Only support directories exist beside the three explicitly mounted DAG files.
+# Only support directories exist beside the six explicitly mounted DAG files.
 # These anchored RE2 patterns prevent Airflow from parsing imported Python files
 # as DAG sources.  The deploy validator additionally requires an exact DAG-id set.
 ^scripts/

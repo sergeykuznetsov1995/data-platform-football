@@ -1,3 +1,4 @@
+import hashlib
 import subprocess
 import json
 
@@ -84,11 +85,7 @@ def args(tmp_path, **overrides):
                 ),
                 "schedule_boundary": schedule_boundary_proof(),
                 "kept_paused": True,
-                "paused": [
-                    "dag_ingest_fotmob",
-                    "dag_transform_fotmob_silver",
-                    "dag_trigger_fotmob_daily",
-                ],
+                "paused": list(mod.DAGS),
                 "unpaused": [],
             }
         )
@@ -99,6 +96,11 @@ def args(tmp_path, **overrides):
         "env_file": env_file,
         "deployment_report": deployment_report,
         "publication_report": None,
+        "pause_evidence": None,
+        "pause_evidence_sha256": "",
+        "operation_report": None,
+        "operation_report_sha256": "",
+        "aborted_before_mutation": False,
         "trino_env_file": env_file,
         "output": tmp_path / "rollback-output.json",
         "execute": False,
@@ -114,18 +116,151 @@ def args(tmp_path, **overrides):
     return type("Args", (), values)()
 
 
+def _maintenance_pause_evidence(tmp_path, *, before=None):
+    arguments = args(tmp_path)
+    deployment = json.loads(arguments.deployment_report.read_text(encoding="utf-8"))
+    expected = dict(mod.runtime_binding.DESTRUCTIVE_SHARED_PAUSE_STATES)
+    before = dict(before or expected)
+    path = tmp_path / "pause-evidence.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "fotmob-rollback-v1",
+                "generated_at": "2026-07-21T10:01:00Z",
+                "passed": True,
+                "mode": "pause",
+                "project": "fotmob-airflow",
+                "git_sha": "a" * 40,
+                "paused": list(mod.DAGS),
+                "pause_states": {dag_id: True for dag_id in mod.DAGS},
+                "running_runs": {},
+                "queued_runs": {},
+                "shared_consumer_pause": {
+                    "shared_scheduler_container_id": deployment[
+                        "shared_handoff_final"
+                    ]["shared_scheduler_container"],
+                    "schedule_owner": "isolated",
+                    "pause_states_before": before,
+                    "pause_states_after": expected,
+                    "active_runs": [],
+                    "active_task_instances": [],
+                    "atomic_metadata_transaction": True,
+                },
+                "deployment_identity": {
+                    "deployment_id": deployment["deployment_id"],
+                    "git_sha": deployment["git_sha"],
+                    "scheduler_container_id": deployment[
+                        "scheduler_container_id"
+                    ],
+                    "shared_scheduler_container_id": deployment[
+                        "shared_handoff_final"
+                    ]["shared_scheduler_container"],
+                    "control_database_bound": True,
+                    "control_database_fingerprint": "c" * 64,
+                    "deployment_report_sha256": hashlib.sha256(
+                        arguments.deployment_report.read_bytes()
+                    ).hexdigest(),
+                },
+                "publication_quiescence_after": {
+                    "safe": True,
+                    "active": False,
+                    "shared_scheduler_container_id": deployment[
+                        "shared_handoff_final"
+                    ]["shared_scheduler_container"],
+                    "control_database_bound": True,
+                    "control_database_fingerprint": "c" * 64,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _terminal_operation_report(tmp_path, payload=None):
+    path = tmp_path / "terminal-operation.json"
+    path.write_text(
+        json.dumps(
+            payload
+            or {
+                "schema_version": "fotmob-cleanup-execution-v1",
+                "generated_at": "2026-07-21T10:02:00Z",
+                "passed": True,
+                "phase": "complete",
+                "writer_quiescence_after": {
+                    "pause_states": {dag_id: True for dag_id in mod.DAGS},
+                    "active_runs": {},
+                    "active_task_instances": [],
+                    "atomic_metadata_snapshot": True,
+                    "scheduler_stopped": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_rollback_plan_explicitly_retains_native_objects(tmp_path):
     report = mod.rollback_plan(args(tmp_path))
     assert report["passed"] is True
     assert report["mutated"] is False
     assert report["deployed_git_sha"] == "a" * 40
     assert report["native_objects_action"] == "retain"
+    assert report["dynamic_catalog_evidence_action"] == "retain"
+    assert report["dynamic_catalog_evidence_objects"] == sorted(
+        mod.PRESERVED_DYNAMIC_CATALOG_EVIDENCE
+    )
+    assert report["rollback_mode"] == "coordinator_only"
     assert [step["action"] for step in report["steps"]] == [
         "pause_writers",
         "deploy_consumer_revert",
         "run_fenced_legacy_silver_and_dq",
         "validate",
+        "restore_maintenance",
     ]
+    assert not hasattr(mod, "restore_legacy_owners")
+
+
+def test_rollback_writer_fence_covers_exact_six_writer_inventory():
+    assert mod.DAGS == (
+        "dag_orchestrate_fotmob",
+        "dag_ingest_fotmob",
+        "dag_transform_fotmob_silver",
+        "dag_trigger_fotmob_daily",
+        "dag_refresh_fotmob",
+        "dag_backfill_fotmob",
+    )
+
+
+@pytest.mark.parametrize("state", ("running", "queued"))
+def test_rollback_rejects_any_active_writer_from_atomic_six_dag_snapshot(state):
+    writer_state = {
+        "pause_states": {dag_id: True for dag_id in mod.DAGS},
+        "active_runs": {"dag_backfill_fotmob": {state: ["run-1"]}},
+    }
+
+    with pytest.raises(mod.RollbackError, match="active runs"):
+        mod.require_writers_stopped(writer_state)
+
+
+def test_rollback_rejects_terminal_writer_run_with_active_task_instance():
+    writer_state = {
+        "pause_states": {dag_id: True for dag_id in mod.DAGS},
+        "active_runs": {},
+        "active_task_instances": [
+            {
+                "dag_id": "dag_ingest_fotmob",
+                "run_id": "terminal-but-ambiguous",
+                "task_id": "bronze_runner",
+                "state": "up_for_retry",
+            }
+        ],
+        "atomic_metadata_snapshot": True,
+    }
+
+    with pytest.raises(mod.RollbackError, match="active task instances"):
+        mod.require_writers_stopped(writer_state)
 
 
 def test_runtime_rejects_v1_or_incomplete_shared_handoff_report(tmp_path):
@@ -233,15 +368,12 @@ def test_pause_pauses_all_dags_and_proves_no_running_runs(tmp_path, monkeypatch)
         calls.append(command)
         if "FOTMOB_WRITER_STATE_JSON=" in command[-1]:
             stdout = "FOTMOB_WRITER_STATE_JSON=" + json.dumps(
-                [
-                    {
-                        "dag_id": dag_id,
-                        "is_paused": True,
-                        "run_id": None,
-                        "state": None,
-                    }
-                    for dag_id in mod.DAGS
-                ]
+                {
+                    "pause_states": {dag_id: True for dag_id in mod.DAGS},
+                    "active_runs": [],
+                    "active_task_instances": [],
+                    "atomic_metadata_snapshot": True,
+                }
             )
         elif "printenv FOTMOB_DEPLOY_GIT_SHA" in command:
             stdout = "a" * 40
@@ -253,6 +385,27 @@ def test_pause_pauses_all_dags_and_proves_no_running_runs(tmp_path, monkeypatch)
         mod,
         "validate_live_deployment",
         lambda *_args, **_kwargs: {"mounts_verified": True},
+    )
+    monkeypatch.setattr(
+        mod,
+        "require_no_active_fotmob_publication",
+        lambda *_args, **_kwargs: {
+            "safe": True,
+            "active": False,
+            "shared_scheduler_container_id": "3" * 64,
+            "control_database_bound": True,
+            "control_database_fingerprint": "c" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "pause_shared_consumer",
+        lambda *_args, **_kwargs: {
+            "shared_scheduler_container_id": "3" * 64,
+            "pause_states_after": dict(
+                mod.runtime_binding.DESTRUCTIVE_SHARED_PAUSE_STATES
+            ),
+        },
     )
     report = mod.pause_writers(
         args(
@@ -268,6 +421,160 @@ def test_pause_pauses_all_dags_and_proves_no_running_runs(tmp_path, monkeypatch)
     assert sum("FOTMOB_WRITER_STATE_JSON=" in command[-1] for command in calls) == 2
     assert report["pause_states"] == {dag_id: True for dag_id in mod.DAGS}
     assert report["project"] == "fotmob-airflow"
+    writer_scripts = [
+        command[-1]
+        for command in calls
+        if "FOTMOB_WRITER_STATE_JSON=" in command[-1]
+    ]
+    assert len(writer_scripts) == 2
+    for code in writer_scripts:
+        compile(code, "<isolated-writer-snapshot>", "exec")
+        assert "REPEATABLE READ, READ ONLY" in code
+        assert "TaskInstance" in code
+        assert "up_for_reschedule" in code
+
+
+def test_pause_refuses_generation_started_during_pause_window(tmp_path, monkeypatch):
+    arguments = args(
+        tmp_path,
+        execute=True,
+        confirm=mod.CONFIRM_PAUSE,
+    )
+    checks = iter(({"safe": True, "active": False}, mod.RollbackError("active")))
+
+    def publication_check(*_args, **_kwargs):
+        result = next(checks)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(mod, "require_no_active_fotmob_publication", publication_check)
+    monkeypatch.setattr(
+        mod,
+        "validate_live_deployment",
+        lambda *_args, **_kwargs: {"passed": True, "scheduler_running": False},
+    )
+    monkeypatch.setattr(
+        mod,
+        "pause_shared_consumer",
+        lambda *_args, **_kwargs: {"pause_states_after": {}},
+    )
+    monkeypatch.setattr(mod, "_pause_all_writers", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, "_container_deploy_sha", lambda *_args, **_kwargs: "a" * 40)
+    monkeypatch.setattr(
+        mod,
+        "inspect_writer_state",
+        lambda *_args, **_kwargs: {
+            "pause_states": {dag_id: True for dag_id in mod.DAGS},
+            "active_runs": {},
+            "active_task_instances": [],
+            "atomic_metadata_snapshot": True,
+        },
+    )
+
+    with pytest.raises(mod.RollbackError, match="active"):
+        mod.pause_writers(arguments, run=lambda *_args, **_kwargs: None)
+
+
+def test_shared_consumer_pause_uses_exact_admitted_container_and_full_snapshot(
+    tmp_path,
+):
+    arguments = args(tmp_path)
+    expected = dict(mod.runtime_binding.DESTRUCTIVE_SHARED_PAUSE_STATES)
+    deployment = json.loads(arguments.deployment_report.read_text(encoding="utf-8"))
+    shared_id = deployment["shared_handoff_final"]["shared_scheduler_container"]
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        payload = {
+            "shared_scheduler_container_id": shared_id,
+            "schedule_owner": "isolated",
+            "pause_states_before": {**expected, "dag_sofascore_pipeline": False},
+            "pause_states_after": expected,
+            "active_runs": [],
+            "active_task_instances": [],
+            "atomic_metadata_transaction": True,
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_ROLLBACK_SHARED_PAUSE_JSON=" + json.dumps(payload),
+            stderr="",
+        )
+
+    proof = mod.pause_shared_consumer(arguments, run=run)
+
+    assert commands[0][:3] == ("docker", "exec", shared_id)
+    code = commands[0][-1]
+    compile(code, "<rollback-shared-pause>", "exec")
+    assert f"active_ids = {tuple(sorted(mod.runtime_binding.DESTRUCTIVE_SHARED_STATE_DAGS))!r}" in code
+    assert "fotmob_schedule_owner" in code
+    assert "TaskInstance" in code
+    assert "up_for_reschedule" in code
+    assert "SERIALIZABLE" in code
+    assert proof["pause_states_after"] == expected
+
+
+def test_shared_consumer_readback_is_one_repeatable_read_snapshot(tmp_path):
+    arguments = args(tmp_path)
+    expected = dict(mod.runtime_binding.DESTRUCTIVE_SHARED_PAUSE_STATES)
+    deployment = json.loads(arguments.deployment_report.read_text(encoding="utf-8"))
+    shared_id = deployment["shared_handoff_final"]["shared_scheduler_container"]
+    commands = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        payload = {
+            "shared_scheduler_container_id": shared_id,
+            "schedule_owner": "isolated",
+            "pause_states": expected,
+            "active_runs": [],
+            "active_task_instances": [],
+            "atomic_metadata_snapshot": True,
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_ROLLBACK_SHARED_READBACK_JSON=" + json.dumps(payload),
+            stderr="",
+        )
+
+    proof = mod.inspect_shared_consumer_pause(
+        arguments,
+        expected_container_id=shared_id,
+        run=run,
+    )
+
+    code = commands[0][-1]
+    compile(code, "<rollback-shared-readback>", "exec")
+    assert "REPEATABLE READ, READ ONLY" in code
+    assert "TaskInstance" in code
+    assert "s.commit()" in code
+    assert "s.rollback()" in code
+    assert proof["atomic_metadata_snapshot"] is True
+
+    def incomplete(command, **_kwargs):
+        payload = {
+            "shared_scheduler_container_id": shared_id,
+            "schedule_owner": "isolated",
+            "pause_states": {"dag_sofascore_pipeline": True},
+            "active_runs": [],
+            "atomic_metadata_snapshot": True,
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_ROLLBACK_SHARED_READBACK_JSON=" + json.dumps(payload),
+            stderr="",
+        )
+
+    with pytest.raises(mod.RollbackError, match="not paused and idle"):
+        mod.inspect_shared_consumer_pause(
+            arguments,
+            expected_container_id=shared_id,
+            run=incomplete,
+        )
 
 
 def test_pause_all_writers_attempts_every_dag_and_aggregates_safely(monkeypatch):
@@ -306,7 +613,7 @@ def test_pause_all_writers_attempts_every_dag_and_aggregates_safely(monkeypatch)
         mod._pause_all_writers(object(), run=lambda *_a, **_k: None)
 
     assert attempted == list(mod.DAGS)
-    assert mod.DAGS[-1] == "dag_trigger_fotmob_daily"
+    assert mod.DAGS[-1] == "dag_backfill_fotmob"
     assert inspected == [True]
     assert verified == [writer_state]
     message = str(raised.value)
@@ -560,6 +867,8 @@ def test_run_silver_persists_acquire_before_exact_fenced_trigger(tmp_path, monke
     writer_state = {
         "pause_states": {dag_id: True for dag_id in mod.DAGS},
         "active_runs": {},
+        "active_task_instances": [],
+        "atomic_metadata_snapshot": True,
     }
     phases = []
     airflow_calls = []
@@ -649,6 +958,8 @@ def test_run_silver_retains_lock_after_ambiguous_trigger(tmp_path, monkeypatch):
     writer_state = {
         "pause_states": {dag_id: True for dag_id in mod.DAGS},
         "active_runs": {},
+        "active_task_instances": [],
+        "atomic_metadata_snapshot": True,
     }
     transitions = []
     monkeypatch.setattr(mod, "validate_live_deployment", lambda *_a, **_k: {})
@@ -1006,15 +1317,12 @@ def test_validate_rejects_successful_silver_run_from_before_rollback_deploy(
             stdout = "a" * 40
         elif "FOTMOB_WRITER_STATE_JSON=" in command[-1]:
             stdout = "FOTMOB_WRITER_STATE_JSON=" + json.dumps(
-                [
-                    {
-                        "dag_id": dag_id,
-                        "is_paused": True,
-                        "run_id": None,
-                        "state": None,
-                    }
-                    for dag_id in mod.DAGS
-                ]
+                {
+                    "pause_states": {dag_id: True for dag_id in mod.DAGS},
+                    "active_runs": [],
+                    "active_task_instances": [],
+                    "atomic_metadata_snapshot": True,
+                }
             )
         elif "config" in command and "get-value" in command:
             stdout = "/opt/airflow/dags\n"
@@ -1150,3 +1458,537 @@ def test_live_deployment_identity_binds_container_images_nonce_and_mounts(tmp_pa
     scheduler["Mounts"][0]["Source"] = str((tmp_path / "stale-dagbag").resolve())
     with pytest.raises(mod.RollbackError, match="mount source differs"):
         mod.validate_live_deployment(arguments, require_running=True, run=run)
+
+
+def test_restore_maintenance_requires_exact_confirmation_before_reading_evidence(
+    tmp_path,
+):
+    arguments = args(tmp_path)
+
+    with pytest.raises(mod.RollbackError, match="nothing changed"):
+        mod.restore_maintenance(arguments)
+
+
+def test_restore_maintenance_restores_only_recorded_states_in_one_transaction(
+    tmp_path, monkeypatch
+):
+    maintenance = tuple(sorted(mod.runtime_binding.SHARED_MAINTENANCE_DAGS))
+    original = {maintenance[0]: False, maintenance[1]: True}
+    pause_path = _maintenance_pause_evidence(
+        tmp_path,
+        before={
+            **mod.runtime_binding.DESTRUCTIVE_SHARED_PAUSE_STATES,
+            **original,
+        },
+    )
+    operation_path = _terminal_operation_report(tmp_path)
+    operation_sha = hashlib.sha256(operation_path.read_bytes()).hexdigest()
+    arguments = args(
+        tmp_path,
+        execute=True,
+        confirm=mod.CONFIRM_RESTORE_MAINTENANCE,
+        pause_evidence=pause_path,
+        pause_evidence_sha256=hashlib.sha256(pause_path.read_bytes()).hexdigest(),
+        operation_report=operation_path,
+        operation_report_sha256=operation_sha,
+    )
+    deployment = json.loads(arguments.deployment_report.read_text(encoding="utf-8"))
+    shared_id = deployment["shared_handoff_final"]["shared_scheduler_container"]
+    calls = []
+
+    monkeypatch.setattr(
+        mod,
+        "validate_live_deployment",
+        lambda *_args, **_kwargs: {"passed": True, "scheduler_running": False},
+    )
+    monkeypatch.setattr(
+        mod,
+        "validate_live_shared_runtime",
+        lambda *_args, **_kwargs: {
+            "passed": True,
+            "control_database_fingerprint": "c" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "inspect_writer_state",
+        lambda *_args, **_kwargs: {
+            "pause_states": {dag_id: True for dag_id in mod.DAGS},
+            "active_runs": {},
+            "active_task_instances": [],
+            "atomic_metadata_snapshot": True,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "inspect_shared_consumer_pause",
+        lambda *_args, **_kwargs: {
+            "pause_states": dict(
+                mod.runtime_binding.DESTRUCTIVE_SHARED_PAUSE_STATES
+            ),
+            "active_runs": [],
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "require_no_active_fotmob_publication",
+        lambda *_args, **_kwargs: {"safe": True, "active": False},
+    )
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        desired = {
+            **mod.runtime_binding.DESTRUCTIVE_SHARED_PAUSE_STATES,
+            **original,
+        }
+        payload = {
+            "shared_scheduler_container_id": shared_id,
+            "schedule_owner": "isolated",
+            "pause_states_before": dict(
+                mod.runtime_binding.DESTRUCTIVE_SHARED_PAUSE_STATES
+            ),
+            "pause_states_after": desired,
+            "active_runs": [],
+            "active_task_instances": [],
+            "allowed_maintenance_runs": [],
+            "allowed_maintenance_task_instances": [],
+            "restored_dag_ids": list(maintenance),
+            "atomic_metadata_transaction": True,
+            "already_restored": False,
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_MAINTENANCE_RESTORE_JSON=" + json.dumps(payload),
+            stderr="",
+        )
+
+    report = mod.restore_maintenance(arguments, run=run)
+
+    assert report["passed"] is True
+    assert report["maintenance_pause_states_restored"] == original
+    assert report["operation_report_sha256"] == operation_sha
+    assert calls[0][:3] == ("docker", "exec", shared_id)
+    code = calls[0][-1]
+    compile(code, "<restore-maintenance>", "exec")
+    assert "SERIALIZABLE" in code
+    assert "with_for_update" in code
+    assert "model.is_paused = desired[dag_id]" in code
+    for dag_id in maintenance:
+        assert dag_id in code
+
+
+def test_restore_maintenance_rejects_tampered_terminal_report_before_mutation(
+    tmp_path, monkeypatch
+):
+    pause_path = _maintenance_pause_evidence(tmp_path)
+    operation_path = _terminal_operation_report(tmp_path)
+    operation_sha = hashlib.sha256(operation_path.read_bytes()).hexdigest()
+    operation_path.write_text('{"passed":true}', encoding="utf-8")
+    mutated = False
+
+    def run(*_args, **_kwargs):
+        nonlocal mutated
+        mutated = True
+        raise AssertionError("must not mutate")
+
+    with pytest.raises(mod.RollbackError, match="SHA-256"):
+        mod.restore_maintenance(
+            args(
+                tmp_path,
+                execute=True,
+                confirm=mod.CONFIRM_RESTORE_MAINTENANCE,
+                pause_evidence=pause_path,
+                pause_evidence_sha256=hashlib.sha256(
+                    pause_path.read_bytes()
+                ).hexdigest(),
+                operation_report=operation_path,
+                operation_report_sha256=operation_sha,
+            ),
+            run=run,
+        )
+    assert mutated is False
+
+
+def test_restore_maintenance_rejects_tampered_pause_evidence(tmp_path):
+    pause_path = _maintenance_pause_evidence(tmp_path)
+    pause_sha = hashlib.sha256(pause_path.read_bytes()).hexdigest()
+    payload = json.loads(pause_path.read_text(encoding="utf-8"))
+    maintenance = sorted(mod.runtime_binding.SHARED_MAINTENANCE_DAGS)[0]
+    payload["shared_consumer_pause"]["pause_states_before"][maintenance] = False
+    pause_path.write_text(json.dumps(payload), encoding="utf-8")
+    operation_path = _terminal_operation_report(tmp_path)
+
+    with pytest.raises(mod.RollbackError, match="pause evidence SHA-256"):
+        mod.restore_maintenance(
+            args(
+                tmp_path,
+                execute=True,
+                confirm=mod.CONFIRM_RESTORE_MAINTENANCE,
+                pause_evidence=pause_path,
+                pause_evidence_sha256=pause_sha,
+                operation_report=operation_path,
+                operation_report_sha256=hashlib.sha256(
+                    operation_path.read_bytes()
+                ).hexdigest(),
+            )
+        )
+
+
+def test_restore_maintenance_rejects_active_publication_before_transition(
+    tmp_path, monkeypatch
+):
+    pause_path = _maintenance_pause_evidence(tmp_path)
+    operation_path = _terminal_operation_report(tmp_path)
+    arguments = args(
+        tmp_path,
+        execute=True,
+        confirm=mod.CONFIRM_RESTORE_MAINTENANCE,
+        pause_evidence=pause_path,
+        pause_evidence_sha256=hashlib.sha256(pause_path.read_bytes()).hexdigest(),
+        operation_report=operation_path,
+        operation_report_sha256=hashlib.sha256(operation_path.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setattr(
+        mod,
+        "validate_live_deployment",
+        lambda *_args, **_kwargs: {"passed": True, "scheduler_running": False},
+    )
+    monkeypatch.setattr(
+        mod,
+        "validate_live_shared_runtime",
+        lambda *_args, **_kwargs: {
+            "passed": True,
+            "control_database_fingerprint": "c" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "inspect_writer_state",
+        lambda *_args, **_kwargs: {
+            "pause_states": {dag_id: True for dag_id in mod.DAGS},
+            "active_runs": {},
+            "active_task_instances": [],
+            "atomic_metadata_snapshot": True,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "inspect_shared_consumer_pause",
+        lambda *_args, **_kwargs: {"active_runs": []},
+    )
+    monkeypatch.setattr(
+        mod,
+        "require_no_active_fotmob_publication",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            mod.RollbackError("active publication")
+        ),
+    )
+
+    with pytest.raises(mod.RollbackError, match="active publication"):
+        mod.restore_maintenance(
+            arguments,
+            run=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("must not restore")
+            ),
+        )
+
+
+def test_restore_maintenance_accepts_only_terminal_or_explicitly_aborted_plan(
+    tmp_path,
+):
+    pause_path = _maintenance_pause_evidence(tmp_path)
+    incomplete = _terminal_operation_report(
+        tmp_path,
+        {
+            "schema_version": "fotmob-competition-purge-journal-v1",
+            "status": "phase_b",
+        },
+    )
+    arguments = args(
+        tmp_path,
+        execute=True,
+        confirm=mod.CONFIRM_RESTORE_MAINTENANCE,
+        pause_evidence=pause_path,
+        pause_evidence_sha256=hashlib.sha256(pause_path.read_bytes()).hexdigest(),
+        operation_report=incomplete,
+        operation_report_sha256=hashlib.sha256(incomplete.read_bytes()).hexdigest(),
+    )
+
+    with pytest.raises(mod.RollbackError, match="not terminal"):
+        mod.restore_maintenance(arguments)
+
+    plan = _terminal_operation_report(
+        tmp_path,
+        {
+            "schema_version": "fotmob-competition-purge-plan-v2",
+            "created_at": "2026-07-21T10:02:00Z",
+            "plan_sha256": "b" * 64,
+        },
+    )
+    plan_args = args(
+        tmp_path,
+        execute=True,
+        confirm=mod.CONFIRM_RESTORE_MAINTENANCE,
+        pause_evidence=pause_path,
+        pause_evidence_sha256=hashlib.sha256(pause_path.read_bytes()).hexdigest(),
+        operation_report=plan,
+        operation_report_sha256=hashlib.sha256(plan.read_bytes()).hexdigest(),
+        aborted_before_mutation=False,
+    )
+    with pytest.raises(mod.RollbackError, match="aborted-before-mutation"):
+        mod.restore_maintenance(plan_args)
+
+    admitted_abort = mod._validate_terminal_maintenance_operation(
+        args(
+            tmp_path,
+            operation_report=plan,
+            operation_report_sha256=hashlib.sha256(plan.read_bytes()).hexdigest(),
+            aborted_before_mutation=True,
+        ),
+        paused_at=mod._timestamp("2026-07-21T10:01:00Z"),
+    )
+    assert admitted_abort["kind"] == "reviewed_plan_aborted"
+    assert admitted_abort["artifact_created_at"] == "2026-07-21T10:02:00Z"
+
+
+def test_restore_maintenance_retry_accepts_live_recorded_maintenance_run(
+    tmp_path, monkeypatch
+):
+    maintenance = tuple(sorted(mod.runtime_binding.SHARED_MAINTENANCE_DAGS))
+    original = {maintenance[0]: False, maintenance[1]: True}
+    pause_path = _maintenance_pause_evidence(
+        tmp_path,
+        before={
+            **mod.runtime_binding.DESTRUCTIVE_SHARED_PAUSE_STATES,
+            **original,
+        },
+    )
+    operation_path = _terminal_operation_report(tmp_path)
+    arguments = args(
+        tmp_path,
+        execute=True,
+        confirm=mod.CONFIRM_RESTORE_MAINTENANCE,
+        pause_evidence=pause_path,
+        pause_evidence_sha256=hashlib.sha256(pause_path.read_bytes()).hexdigest(),
+        operation_report=operation_path,
+        operation_report_sha256=hashlib.sha256(operation_path.read_bytes()).hexdigest(),
+    )
+    context = json.loads(arguments.deployment_report.read_text(encoding="utf-8"))
+    shared_id = context["shared_handoff_final"]["shared_scheduler_container"]
+    active = [
+        {"dag_id": maintenance[0], "run_id": "scheduled-maintenance", "state": "running"}
+    ]
+    active_tasks = [
+        {
+            "dag_id": maintenance[0],
+            "run_id": "scheduled-maintenance",
+            "task_id": "maintain_tables",
+            "state": "running",
+        }
+    ]
+    desired = {
+        **mod.runtime_binding.DESTRUCTIVE_SHARED_PAUSE_STATES,
+        **original,
+    }
+    monkeypatch.setattr(
+        mod,
+        "validate_live_deployment",
+        lambda *_args, **_kwargs: {"scheduler_running": False},
+    )
+    monkeypatch.setattr(
+        mod,
+        "validate_live_shared_runtime",
+        lambda *_args, **_kwargs: {
+            "passed": True,
+            "control_database_fingerprint": "c" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "inspect_writer_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stopped cleanup scheduler must not be exec'd")
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "require_no_active_fotmob_publication",
+        lambda *_args, **_kwargs: {"safe": True, "active": False},
+    )
+
+    def run(command, **_kwargs):
+        payload = {
+            "shared_scheduler_container_id": shared_id,
+            "schedule_owner": "isolated",
+            "pause_states_before": desired,
+            "pause_states_after": desired,
+            "active_runs": active,
+            "active_task_instances": active_tasks,
+            "allowed_maintenance_runs": active,
+            "allowed_maintenance_task_instances": active_tasks,
+            "restored_dag_ids": list(maintenance),
+            "atomic_metadata_transaction": True,
+            "already_restored": True,
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_MAINTENANCE_RESTORE_JSON=" + json.dumps(payload),
+            stderr="",
+        )
+
+    report = mod.restore_maintenance(arguments, run=run)
+    assert report["passed"] is True
+    assert report["atomic_restore"]["already_restored"] is True
+    assert report["atomic_restore"]["allowed_maintenance_runs"] == active
+    assert (
+        report["atomic_restore"]["allowed_maintenance_task_instances"]
+        == active_tasks
+    )
+
+
+def test_restore_maintenance_rejects_orphan_active_maintenance_task(tmp_path):
+    arguments = args(tmp_path)
+    context = json.loads(arguments.deployment_report.read_text(encoding="utf-8"))
+    shared_id = context["shared_handoff_final"]["shared_scheduler_container"]
+    maintenance = tuple(sorted(mod.runtime_binding.SHARED_MAINTENANCE_DAGS))
+    desired_maintenance = {maintenance[0]: False, maintenance[1]: True}
+    desired = {
+        **mod.runtime_binding.DESTRUCTIVE_SHARED_PAUSE_STATES,
+        **desired_maintenance,
+    }
+    orphan = [
+        {
+            "dag_id": maintenance[0],
+            "run_id": "already-terminal",
+            "task_id": "still-running",
+            "state": "running",
+        }
+    ]
+
+    def run(command, **_kwargs):
+        payload = {
+            "shared_scheduler_container_id": shared_id,
+            "schedule_owner": "isolated",
+            "pause_states_before": desired,
+            "pause_states_after": desired,
+            "active_runs": [],
+            "active_task_instances": orphan,
+            "allowed_maintenance_runs": [],
+            "allowed_maintenance_task_instances": orphan,
+            "restored_dag_ids": list(maintenance),
+            "atomic_metadata_transaction": True,
+            "already_restored": True,
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_MAINTENANCE_RESTORE_JSON=" + json.dumps(payload),
+            stderr="",
+        )
+
+    with pytest.raises(mod.RollbackError, match="transaction evidence"):
+        mod._restore_shared_maintenance_transaction(
+            arguments,
+            desired_maintenance_states=desired_maintenance,
+            run=run,
+        )
+
+
+def test_restore_maintenance_allows_validated_shared_container_rotation(
+    tmp_path, monkeypatch
+):
+    pause_path = _maintenance_pause_evidence(tmp_path)
+    arguments = args(tmp_path)
+    current = json.loads(arguments.deployment_report.read_text(encoding="utf-8"))
+    old_shared = current["shared_handoff_final"]["shared_scheduler_container"]
+    new_shared = "4" * 64
+    assert old_shared != new_shared
+    current["shared_handoff_initial"]["shared_scheduler_container"] = new_shared
+    current["shared_handoff_final"]["shared_scheduler_container"] = new_shared
+    arguments.deployment_report.write_text(json.dumps(current), encoding="utf-8")
+    operation_path = _terminal_operation_report(
+        tmp_path,
+        {
+            "schema_version": "fotmob-rollback-v1",
+            "generated_at": "2026-07-21T10:03:00Z",
+            "passed": True,
+            "mode": "validate",
+            "writers_paused": list(mod.DAGS),
+            "deployment_identity": {
+                "deployment_id": current["deployment_id"],
+                "git_sha": current["git_sha"],
+                "scheduler_container_id": current["scheduler_container_id"],
+                "shared_scheduler_container_id": new_shared,
+                "control_database_bound": True,
+                "control_database_fingerprint": "c" * 64,
+            },
+        },
+    )
+    arguments = args(
+        tmp_path,
+        execute=True,
+        confirm=mod.CONFIRM_RESTORE_MAINTENANCE,
+        pause_evidence=pause_path,
+        pause_evidence_sha256=hashlib.sha256(pause_path.read_bytes()).hexdigest(),
+        operation_report=operation_path,
+        operation_report_sha256=hashlib.sha256(operation_path.read_bytes()).hexdigest(),
+    )
+    arguments.deployment_report.write_text(json.dumps(current), encoding="utf-8")
+    monkeypatch.setattr(
+        mod,
+        "validate_live_deployment",
+        lambda *_args, **_kwargs: {"scheduler_running": True},
+    )
+    monkeypatch.setattr(
+        mod,
+        "validate_live_shared_runtime",
+        lambda *_args, **_kwargs: {
+            "passed": True,
+            "control_database_fingerprint": "c" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "inspect_writer_state",
+        lambda *_args, **_kwargs: {
+            "pause_states": {dag_id: True for dag_id in mod.DAGS},
+            "active_runs": {},
+            "active_task_instances": [],
+            "atomic_metadata_snapshot": True,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "require_no_active_fotmob_publication",
+        lambda *_args, **_kwargs: {"safe": True, "active": False},
+    )
+
+    def run(command, **_kwargs):
+        desired = dict(mod.runtime_binding.DESTRUCTIVE_SHARED_PAUSE_STATES)
+        payload = {
+            "shared_scheduler_container_id": new_shared,
+            "schedule_owner": "isolated",
+            "pause_states_before": desired,
+            "pause_states_after": desired,
+            "active_runs": [],
+            "active_task_instances": [],
+            "allowed_maintenance_runs": [],
+            "allowed_maintenance_task_instances": [],
+            "restored_dag_ids": sorted(
+                mod.runtime_binding.SHARED_MAINTENANCE_DAGS
+            ),
+            "atomic_metadata_transaction": True,
+            "already_restored": True,
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="FOTMOB_MAINTENANCE_RESTORE_JSON=" + json.dumps(payload),
+            stderr="",
+        )
+
+    report = mod.restore_maintenance(arguments, run=run)
+    assert report["passed"] is True
+    assert report["atomic_restore"]["shared_scheduler_container_id"] == new_shared

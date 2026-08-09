@@ -31,7 +31,7 @@ def test_exact_isolated_opt_in_materializes_daily_dag(monkeypatch):
 
     assert module.dag is not None
     assert module.dag.dag_id == "dag_trigger_fotmob_daily"
-    assert module.dag.schedule == "0 14 * * *"
+    assert module.dag.schedule is None
     assert {task.task_id for task in PythonOperator._instances} == {
         "attest_isolated_runtime",
         "initialize_fotmob_publication",

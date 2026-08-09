@@ -1,5 +1,5 @@
 # Isolated source-native FotMob scheduler.  Every bind source comes from one
-# immutable release checkout; the DAG folder receives exactly three root DAGs.
+# immutable release checkout; the DAG folder receives exactly six root DAGs.
 # Secrets are supplied by --env-file and are never committed here.
 name: fotmob-airflow
 
@@ -50,7 +50,7 @@ x-airflow-common: &airflow-common
   volumes:
     - type: bind
       # A deploy-generated, hash-checked projection masks every DAG baked into
-      # the image. It contains only three root DAGs plus .airflowignore.
+      # the image. It contains only six root DAGs plus .airflowignore.
       source: ${FOTMOB_DAGBAG_ROOT:?set exact generated DagBag projection}
       target: /opt/airflow/dags
       read_only: true
@@ -134,6 +134,9 @@ services:
         airflow dags pause dag_ingest_fotmob || true
         airflow dags pause dag_transform_fotmob_silver || true
         airflow dags pause dag_trigger_fotmob_daily || true
+        airflow dags pause dag_refresh_fotmob || true
+        airflow dags pause dag_backfill_fotmob || true
+        airflow dags pause dag_orchestrate_fotmob || true
     depends_on:
       airflow-metadb:
         condition: service_healthy

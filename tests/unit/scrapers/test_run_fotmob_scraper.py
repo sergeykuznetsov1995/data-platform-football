@@ -6,9 +6,10 @@ import importlib
 import json
 import sys
 from contextlib import contextmanager, nullcontext
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -132,14 +133,45 @@ class TestFotmobNativeRunner:
     def test_scope_parser_requires_numeric_id_and_preserves_exact_season(self):
         mod = self._module()
 
-        assert mod._parse_scopes(["47=2025/2026,289=2019", "47=2025/2026"]) == (
+        assert mod._parse_scopes(
+            ["47=2025/2026,230=2025 Apertura", "47=2025/2026"]
+        ) == (
             (47, "2025/2026"),
-            (289, "2019"),
+            (230, "2025 Apertura"),
         )
-        with pytest.raises(ValueError, match="numeric ID"):
+        with pytest.raises(ValueError, match="ASCII decimal"):
             mod._parse_scopes(["ENG-Premier League=2025/2026"])
-        with pytest.raises(ValueError, match="exact source key"):
+        with pytest.raises(ValueError, match="source season key"):
             mod._parse_scopes(["47="])
+
+    @pytest.mark.unit
+    def test_scope_parser_normalizes_only_the_optional_empty_scope_sentinel(self):
+        mod = self._module()
+
+        assert mod._parse_scopes([""]) == ()
+        with pytest.raises(ValueError, match="empty scope fragment"):
+            mod._parse_scopes(["230=2025,"])
+
+    @pytest.mark.unit
+    def test_runner_and_daily_evidence_share_ordered_deduplicated_scopes(self):
+        mod = self._module()
+        # This focused scraper suite does not collect tests/unit/dags, whose
+        # conftest normally installs the host-side Airflow API stubs.
+        from tests.unit.dags.conftest import _install_airflow_stubs
+
+        _install_airflow_stubs()
+        daily = importlib.import_module("dag_ingest_fotmob")
+        expected_pairs = ((230, "2025 Apertura"), (47, "2024/2025"))
+        expected_tokens = ("230=2025 Apertura", "47=2024/2025")
+        raw_groups = ["230=2025 Apertura,47=2024/2025", "230=2025 Apertura"]
+
+        assert mod._parse_scopes(raw_groups) == expected_pairs
+        assert daily.validate_scope_tokens(
+            [*expected_tokens, expected_tokens[0]]
+        ) == expected_tokens
+        assert daily._validated_exact_scope_evidence(list(expected_tokens)) == (
+            expected_tokens
+        )
 
     @pytest.mark.unit
     def test_max_buffered_rows_defaults_high_and_rejects_non_positive(self):
@@ -178,6 +210,661 @@ class TestFotmobNativeRunner:
                 argv.append(value)
             with pytest.raises(SystemExit):
                 parser.parse_args(argv)
+
+    @pytest.mark.unit
+    def test_automatic_catalog_profile_never_loads_issue930_scope_file(
+        self, monkeypatch
+    ):
+        mod = self._module()
+        parser = mod._argument_parser()
+        from utils import fotmob_publication as publication
+
+        monkeypatch.setattr(
+            publication,
+            "load_fotmob_daily_competition_contract",
+            lambda *_args, **_kwargs: pytest.fail("legacy scope file was read"),
+        )
+        args = parser.parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--deadline",
+                "2026-08-08T12:00:00Z",
+            ]
+        )
+
+        assert mod._validate_args(parser, args) is None
+        assert args.catalog_contract == "fotmob-catalog-v1"
+        assert args.deadline_at == datetime(2026, 8, 8, 12)
+
+    @pytest.mark.unit
+    def test_automatic_catalog_profile_rejects_legacy_contract_fields(self):
+        mod = self._module()
+        parser = mod._argument_parser()
+        with pytest.raises(SystemExit):
+            mod._validate_args(
+                parser,
+                parser.parse_args(
+                    [
+                        "--mode",
+                        "refresh",
+                        "--catalog-contract",
+                        "fotmob-catalog-v1",
+                        "--daily-contract",
+                        "fotmob-daily-v1",
+                    ]
+                ),
+            )
+
+    @pytest.mark.unit
+    def test_automatic_catalog_discover_fails_before_service_construction(
+        self, monkeypatch
+    ):
+        from utils import fotmob_publication as publication
+
+        mod = self._module()
+        monkeypatch.delenv(
+            publication.FOTMOB_DEPLOYMENT_REPORT_PATH_ENV, raising=False
+        )
+        monkeypatch.delenv(
+            publication.FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV, raising=False
+        )
+        build_service = MagicMock()
+        monkeypatch.setattr(mod, "_build_native_service", build_service)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "run_fotmob_scraper.py",
+                "--mode",
+                "discover",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+            ],
+        )
+
+        with pytest.raises(SystemExit):
+            mod.main()
+
+        build_service.assert_not_called()
+
+    @pytest.mark.unit
+    def test_automatic_runner_emits_classifier_bound_contract_and_attempts(self):
+        from scrapers.fotmob.catalog_contract import catalog_contract_from_dict
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+        }
+        service, _, _ = _service(responses)
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0, report["errors"]
+        selection = report["selection"]
+        contract = catalog_contract_from_dict(selection["catalog_contract"])
+        assert contract.classifier_version == "fotmob-men-v1"
+        assert contract.included_ids == (47,)
+        assert contract.scopes == ("47=2025/2026",)
+        assert selection["scope_lane"] == "current"
+        assert selection["catalog_ids"] == [47]
+        assert selection["catalog_decisions"][0]["decision"] == "included"
+        assert selection["scope_attempts"][0]["outcome"] == "success"
+
+    @pytest.mark.unit
+    def test_automatic_runner_removes_now_female_cached_inclusion_before_fanout(
+        self,
+    ):
+        from scrapers.fotmob.catalog_contract import catalog_contract_from_dict
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService, OperationResult
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _competition_payload,
+        )
+
+        mod = self._module()
+        competition_id = 47
+        all_leagues = {
+            "countries": [
+                {
+                    "leagues": [
+                        {"id": competition_id, "name": "Premier League"}
+                    ]
+                }
+            ]
+        }
+        catalog_url = canonicalize_target("allLeagues").canonical_url
+        profile_url = canonicalize_target(
+            "leagues", {"id": competition_id}
+        ).canonical_url
+        repository = MemoryFotMobRepository()
+        seed_service = FotMobIngestService(
+            transport=StubTransport(
+                {
+                    catalog_url: all_leagues,
+                    profile_url: _competition_payload(
+                        competition_id, "Premier League", gender="male"
+                    ),
+                }
+            ),
+            repository=repository,
+            mode=RunMode.DAILY,
+            budget=TransportBudget(
+                max_requests=100, max_direct_bytes=10_000_000
+            ),
+            run_id="seed-male-evidence",
+        )
+        seed_service.discover_catalog()
+
+        service = FotMobIngestService(
+            transport=StubTransport(
+                {
+                    catalog_url: all_leagues,
+                    profile_url: _competition_payload(
+                        competition_id, "Premier League", gender="female"
+                    ),
+                }
+            ),
+            repository=repository,
+            mode=RunMode.DAILY,
+            budget=TransportBudget(
+                max_requests=100, max_direct_bytes=10_000_000
+            ),
+            run_id="fresh-female-evidence",
+        )
+        service.sync_transfers = MagicMock(
+            return_value=OperationResult(
+                "transfer_events",
+                attempted=1,
+                succeeded=1,
+                counts={"events": 0},
+                metadata={"source_hits": 0},
+            )
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season,transfers",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        contract = catalog_contract_from_dict(
+            report["selection"]["catalog_contract"]
+        )
+        assert rc == 0, report["errors"]
+        assert contract.included_ids == ()
+        assert contract.scopes == ()
+        assert report["selection"]["planned_scopes"] == []
+        assert report["selection"]["catalog_decisions"][0]["decision"] == "excluded"
+        assert report["selection"]["catalog_decisions"][0]["source_gender"] == "female"
+        service.sync_transfers.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("automatic_catalog", [True, False])
+    def test_transfer_waits_for_fresh_profile_validation(
+        self, automatic_catalog
+    ):
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService, OperationResult
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _competition_payload,
+        )
+
+        mod = self._module()
+        competition_ids = (47, 48)
+        all_leagues = {
+            "countries": [
+                {
+                    "leagues": [
+                        {"id": competition_id, "name": f"League {competition_id}"}
+                        for competition_id in competition_ids
+                    ]
+                }
+            ]
+        }
+        catalog_url = canonicalize_target("allLeagues").canonical_url
+
+        def profile(competition_id: int, *, gender: str = "male"):
+            payload = _competition_payload(
+                competition_id,
+                f"League {competition_id}",
+                gender=gender,
+            )
+            payload["allAvailableSeasons"] = []
+            return payload
+
+        repository = MemoryFotMobRepository()
+        seed_service = FotMobIngestService(
+            transport=StubTransport(
+                {
+                    catalog_url: all_leagues,
+                    **{
+                        canonicalize_target(
+                            "leagues", {"id": competition_id}
+                        ).canonical_url: profile(competition_id)
+                        for competition_id in competition_ids
+                    },
+                }
+            ),
+            repository=repository,
+            mode=RunMode.BACKFILL,
+            budget=TransportBudget(
+                max_requests=100, max_direct_bytes=10_000_000
+            ),
+            run_id="seed-two-male-profiles",
+        )
+        seed_service.discover_catalog()
+
+        deferred_profile_url = canonicalize_target(
+            "leagues", {"id": 48}
+        ).canonical_url
+        current_transport = StubTransport(
+            {
+                catalog_url: all_leagues,
+                canonicalize_target(
+                    "leagues", {"id": 47}
+                ).canonical_url: profile(47),
+                deferred_profile_url: profile(48, gender="female"),
+            }
+        )
+        service = FotMobIngestService(
+            transport=current_transport,
+            repository=repository,
+            mode=RunMode.BACKFILL,
+            budget=TransportBudget(
+                max_requests=100, max_direct_bytes=10_000_000
+            ),
+            run_id="bounded-profile-validation",
+        )
+        repository.completed_competition_ids = MagicMock(return_value={47})
+        service.sync_transfers = MagicMock(
+            return_value=OperationResult(
+                "transfer_events",
+                attempted=1,
+                succeeded=1,
+                counts={"events": 0},
+                metadata={"source_hits": 0},
+            )
+        )
+        argv = [
+            "--mode",
+            "backfill",
+            "--entities",
+            "transfers",
+            "--competition-limit",
+            "1",
+        ]
+        if automatic_catalog:
+            argv.extend(("--catalog-contract", "fotmob-catalog-v1"))
+        args = mod._argument_parser().parse_args(argv)
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0, report["errors"]
+        service.sync_transfers.assert_not_called()
+        assert not any(
+            url == deferred_profile_url for url, _replay in current_transport.calls
+        )
+        if automatic_catalog:
+            transfer_deferrals = [
+                item
+                for item in report["selection"]["deferrals"]
+                if item["target_type"] == "transfer"
+            ]
+            assert [item["targets"] for item in transfer_deferrals] == [[48]]
+        transfer_plan = next(
+            item
+            for item in report["operations"]
+            if item["entity"] == "transfer_work_plan"
+        )
+        assert transfer_plan["metadata"][
+            "profile_validation_deferred_competition_ids"
+        ] == [48]
+
+    @pytest.mark.unit
+    def test_automatic_deadline_deferral_is_partial_success_with_evidence(self):
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+        }
+        service, _, _ = _service(responses)
+        service.sync_season = MagicMock(wraps=service.sync_season)
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season",
+            ]
+        )
+        args.deadline_at = datetime(2020, 1, 1)
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0
+        assert report["status"] == "partial_success"
+        assert report["complete"] is False
+        assert report["selection"]["scope_attempts"][0]["outcome"] == "deferred"
+        service.sync_season.assert_not_called()
+
+    @pytest.mark.unit
+    def test_automatic_schema_failure_remains_hard(self):
+        from scrapers.fotmob.service import OperationResult
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+        }
+        service, _, _ = _service(responses)
+        service.sync_season = MagicMock(
+            return_value=(
+                OperationResult(
+                    "season_bundle",
+                    attempted=1,
+                    errors=["schema drift: missing required match identity"],
+                ),
+                None,
+            )
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 1
+        assert report["status"] == "incomplete"
+        assert report["selection"]["scope_attempts"][0]["outcome"] == "terminal"
+
+    @pytest.mark.unit
+    def test_automatic_http_retry_remains_incomplete_and_nonzero(self):
+        from scrapers.fotmob.service import OperationResult
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+        }
+        service, _, _ = _service(responses)
+        service.sync_season = MagicMock(
+            return_value=(
+                OperationResult(
+                    "season_bundle",
+                    attempted=1,
+                    retryable=["HTTP 503 from FotMob"],
+                ),
+                None,
+            )
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 1
+        assert report["status"] == "incomplete"
+        assert report["complete"] is False
+        assert report["selection"]["scope_attempts"][0]["outcome"] == "retryable"
+
+    @pytest.mark.unit
+    def test_automatic_source_gap_requires_two_distinct_missing_match_runs(
+        self, monkeypatch
+    ):
+        from scrapers.fotmob import planner
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import StubTransport, _league_payload
+
+        mod = self._module()
+        missing_match = {"error": True, "message": "Data not found", "matchId": "100"}
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url: missing_match,
+        }
+        repository = MemoryFotMobRepository()
+
+        def make_service(run_id):
+            return FotMobIngestService(
+                transport=StubTransport(dict(responses)),
+                repository=repository,
+                mode=RunMode.DAILY,
+                budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+                run_id=run_id,
+                max_workers=2,
+            )
+
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season,matches",
+                "--run-id",
+                "missing-match-1",
+            ]
+        )
+        first_rc, first_report = _run_native_admitted(
+            mod, args, service=make_service("missing-match-1")
+        )
+
+        assert first_rc == 1
+        assert first_report["status"] == "incomplete"
+        assert first_report["selection"]["scope_attempts"][0]["outcome"] == "retryable"
+
+        real_datetime = datetime
+
+        class FutureDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                value = real_datetime.now(tz)
+                return value + timedelta(hours=1)
+
+        monkeypatch.setattr(planner, "datetime", FutureDatetime)
+        args.run_id = "missing-match-2"
+        second_rc, second_report = _run_native_admitted(
+            mod, args, service=make_service("missing-match-2")
+        )
+
+        assert second_rc == 0, second_report["errors"]
+        assert second_report["status"] == "success"
+        attempt = second_report["selection"]["scope_attempts"][0]
+        assert attempt["outcome"] == "source_gap"
+        assert attempt["attempt_count"] == 2
+        assert len(attempt["attempt_identities"]) == 2
+        assert len(set(attempt["attempt_identities"])) == 2
+
+    @pytest.mark.unit
+    def test_automatic_competition_budget_rotates_after_repeated_failed_attempts(self):
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _competition_payload,
+        )
+
+        mod = self._module()
+        payloads = {
+            competition_id: _competition_payload(
+                competition_id, f"Competition {competition_id}"
+            )
+            for competition_id in (47, 48, 49)
+        }
+        payloads[47]["allAvailableSeasons"] = "invalid"
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [
+                    {
+                        "leagues": [
+                            {"id": competition_id, "name": f"Competition {competition_id}"}
+                            for competition_id in (47, 48, 49)
+                        ]
+                    }
+                ]
+            },
+            **{
+                canonicalize_target("leagues", {"id": competition_id}).canonical_url: payload
+                for competition_id, payload in payloads.items()
+            },
+        }
+        repository = MemoryFotMobRepository()
+        attempted_prefixes = []
+
+        def run_once(index, max_requests):
+            service = FotMobIngestService(
+                transport=StubTransport(dict(responses)),
+                repository=repository,
+                mode=RunMode.DAILY,
+                budget=TransportBudget(
+                    max_requests=max_requests,
+                    max_direct_bytes=10_000_000,
+                ),
+                run_id=f"fair-{index}",
+                max_workers=3,
+            )
+            discover = service.discover_competitions
+
+            def capture(candidates, **kwargs):
+                attempted_prefixes.append(
+                    [item.competition.competition_id for item in candidates]
+                )
+                return discover(candidates, **kwargs)
+
+            service.discover_competitions = MagicMock(side_effect=capture)
+            args = mod._argument_parser().parse_args(
+                [
+                    "--mode",
+                    "refresh",
+                    "--catalog-contract",
+                    "fotmob-catalog-v1",
+                    "--entities",
+                    "season",
+                    "--run-id",
+                    f"fair-{index}",
+                ]
+            )
+            return _run_native_admitted(mod, args, service=service)
+
+        results = [run_once(1, 5), *(run_once(index, 2) for index in range(2, 6))]
+
+        assert attempted_prefixes == [[47], [48], [49], [47], [48]]
+        assert results[0][0] == 1  # malformed low-ID root is still a hard failure
+        assert repository.latest_entity_attempt("competition_seasons", 47)[
+            "status"
+        ] == "schema_drift"
+
+    @pytest.mark.unit
+    def test_automatic_transfer_completion_uses_catalog_contract_signature(self):
+        from scrapers.fotmob.catalog_contract import catalog_contract_from_dict
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target(
+                "transfers", {"leagueIds": "47", "page": 1, "last": "1year"}
+            ).canonical_url: {"hits": 0, "page": 1, "transfers": []},
+        }
+        service, _, repository = _service(responses)
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season,transfers",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0, report["errors"]
+        selection = report["selection"]
+        contract = catalog_contract_from_dict(selection["catalog_contract"])
+        assert contract.entities == ("season", "transfers")
+        assert contract.entity_policy["transfer_policy"] == {
+            "window": "1year",
+            "pagination": "unique_hits",
+            "completion_scope": "included_ids",
+            "completion_signature": "catalog_contract",
+        }
+        assert selection["transfer_plan_signature"] == contract.plan_signature
+        assert selection["completed_transfer_competition_ids"] == [47]
+        assert repository.completed_competition_ids(contract.plan_signature) == {47}
 
     @pytest.mark.unit
     def test_direct_cli_requires_exact_publication_and_matching_run_id(
@@ -810,7 +1497,11 @@ class TestFotmobNativeRunner:
     @pytest.mark.unit
     def test_transfer_competition_limit_applies_after_completion_filter(self):
         from scrapers.fotmob.transport import canonicalize_target
-        from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
+        from tests.unit.scrapers.test_fotmob_service import (
+            _competition_payload,
+            _league_payload,
+            _service,
+        )
 
         mod = self._module()
         responses = {
@@ -825,6 +1516,9 @@ class TestFotmobNativeRunner:
                 ]
             },
             canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target("leagues", {"id": 48}).canonical_url: (
+                _competition_payload(48, "Competition 48")
+            ),
             canonicalize_target(
                 "transfers", {"leagueIds": "48", "page": 1}
             ).canonical_url: {"hits": 0, "page": 1, "transfers": []},
@@ -1182,7 +1876,7 @@ class TestFotmobNativeRunner:
         )
         discovered_ids = []
 
-        def discover_competitions(candidates):
+        def discover_competitions(candidates, **_kwargs):
             discovered_ids.extend(
                 item.competition.competition_id for item in candidates
             )
@@ -1414,7 +2108,7 @@ class TestFotmobNativeRunner:
         rc, report = _run_native_admitted(mod, args, service=service)
 
         assert rc == 0
-        repository.flush.assert_called_once_with()
+        assert repository.flush.call_count == 2
 
     @pytest.mark.unit
     def test_failed_flush_turns_the_run_red_instead_of_losing_targets(self):

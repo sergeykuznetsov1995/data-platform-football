@@ -324,7 +324,8 @@ class TestFotmobNativeParams:
         )
 
         assert '--mode "{{ params.mode }}"' in task.bash_command
-        assert '--scope "{{ params.scope }}"' in task.bash_command
+        assert "--scope" not in task.bash_command
+        assert task.env["FOTMOB_SCOPE_JSON"] == "{{ params.scope | tojson }}"
         assert '--daily-contract "{{ params.daily_contract }}"' in task.bash_command
         assert "--competition-scope-file" in task.bash_command
         assert '--requests-per-minute "{{ params.requests_per_minute }}"' in (
@@ -399,6 +400,122 @@ class TestDynamicDiscoveryDag:
 
 
 class TestNativeValidation:
+    @pytest.mark.unit
+    def test_automatic_catalog_uses_real_acceptance_gate(self, tmp_path):
+        import json
+        from datetime import datetime, timezone
+
+        from airflow.exceptions import AirflowException
+        from scrapers.fotmob.catalog_contract import build_catalog_contract
+
+        mod = _reload_dag_module()
+        now = datetime.now(timezone.utc)
+        contract = build_catalog_contract(
+            catalog_batch_id="catalog-batch",
+            catalog_content_hash="a" * 64,
+            classifier_version="fotmob-men-v1",
+            parser_version="fotmob-native-v2",
+            entities=["season"],
+            entity_policy={},
+            included_ids=[47],
+            scopes=[(47, "2025/2026")],
+        ).as_dict()
+        payload = {
+            "run_id": "automatic-run",
+            "mode": "refresh",
+            "status": "success",
+            "complete": True,
+            "operations": [
+                {
+                    "entity": "competition_catalog",
+                    "status": "success",
+                    "errors": [],
+                    "retryable": [],
+                    "terminal": [],
+                    "counts": {"competitions": 2},
+                }
+            ],
+            "transport": {"attempts": 1, "direct_bytes": 1, "proxy_bytes": 0},
+            "budget": {
+                "requests": 1,
+                "max_requests": 2,
+                "direct_bytes": 1,
+                "max_direct_bytes": 2,
+                "proxy_bytes": 0,
+                "max_proxy_bytes": 0,
+            },
+            "errors": [],
+            "selection": {
+                "entities": ["season"],
+                "explicit_scopes": [],
+                "competition_limit": 0,
+                "season_limit": 0,
+                "scope_lane": "current",
+                "scope_plan_signature": contract["plan_signature"],
+                "catalog_contract": contract,
+                "catalog_ids": [47, 88],
+                "catalog_decisions": [
+                    {
+                        "competition_id": 47,
+                        "catalog_name": "Premier League",
+                        "profile_name": "Premier League",
+                        "source_gender": "male",
+                        "source_age_group": "adult",
+                        "source_type": "league",
+                        "probe_status": "success",
+                        "decision": "included",
+                        "reason": "structurally confirmed adult men's competition",
+                        "policy_rule": "include_structural_male_adult",
+                        "classifier_version": "fotmob-men-v1",
+                        "profile_target_key": "leagues?id=47",
+                        "profile_content_hash": "b" * 64,
+                    },
+                    {
+                        "competition_id": 88,
+                        "catalog_name": "Women's League",
+                        "profile_name": "Women's League",
+                        "source_gender": "female",
+                        "source_age_group": "adult",
+                        "source_type": "league",
+                        "probe_status": "success",
+                        "decision": "excluded",
+                        "reason": "women/female competition",
+                        "policy_rule": "exclude_female",
+                        "classifier_version": "fotmob-men-v1",
+                        "profile_target_key": "leagues?id=88",
+                        "profile_content_hash": "c" * 64,
+                    },
+                ],
+                "planned_scopes": ["47=2025/2026"],
+                "completed_scopes": ["47=2025/2026"],
+                "scope_attempts": [
+                    {
+                        "competition_id": 47,
+                        "source_season_key": "2025/2026",
+                        "plan_signature": contract["plan_signature"],
+                        "attempt_count": 1,
+                        "last_attempt_at": now.isoformat(),
+                        "next_retry_at": None,
+                        "outcome": "success",
+                        "reason": "scope completion committed",
+                        "attempt_identities": ["automatic-run:47=2025/2026"],
+                    }
+                ],
+                "completed_transfer_competition_ids": [],
+                "transfer_plan_signature": None,
+                "deferrals": [],
+            },
+        }
+        report = tmp_path / "automatic.json"
+        report.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert mod.validate_data(str(report))["status"] == "success"
+
+        payload["selection"]["scope_plan_signature"] = "fmplan1-" + "0" * 64
+        report.write_text(json.dumps(payload), encoding="utf-8")
+        with pytest.raises(AirflowException, match="automatic catalog evidence failed"):
+            mod.validate_data(str(report))
+
     @pytest.mark.unit
     def test_source_refresh_accepts_exact_seven_terminal_targets_without_catalog(
         self, tmp_path
@@ -494,6 +611,130 @@ class TestNativeValidation:
             summary["selection"]["completed_scopes"]
             == summary["selection"]["planned_scopes"]
         )
+
+    @pytest.mark.unit
+    def test_daily_evidence_validator_accepts_spaced_source_season(self):
+        mod = _reload_dag_module()
+        payload = _daily_report(mod)
+        original = payload["selection"]["planned_scopes"][0]
+        spaced = "42=2025 Apertura"
+        payload["selection"]["planned_scopes"][0] = spaced
+        payload["selection"]["completed_scopes"][0] = spaced
+        for operation in payload["operations"]:
+            metadata = operation.get("metadata") or {}
+            if metadata.get("scope") == original:
+                metadata["scope"] = spaced
+
+        violations, summary = mod._validate_daily_selection(
+            result=payload,
+            selection=payload["selection"],
+            entities=sorted(mod.FOTMOB_DAILY_ENTITIES),
+            raw_scopes=[],
+            budget=payload["budget"],
+        )
+
+        assert violations == []
+        assert summary["planned_scopes"][0] == spaced
+
+    @pytest.mark.unit
+    def test_replay_evidence_validator_accepts_spaced_source_season(
+        self, tmp_path, monkeypatch
+    ):
+        import json
+
+        from scrapers.fotmob.planner import deterministic_plan_signature
+
+        mod = _reload_dag_module()
+        scope = "230=2025 Apertura"
+        scope_sha256 = hashlib.sha256(f"{scope}\n".encode("utf-8")).hexdigest()
+        contract = {
+            "sha256": "a" * 64,
+            "target_count": 1,
+            "player_ids": [123],
+            "targets": [
+                {
+                    "competition_id": 230,
+                    "source_season_key": "2025 Apertura",
+                    "team_id": 9,
+                    "player_id": 123,
+                }
+            ],
+        }
+        monkeypatch.setattr(mod, "_source_refresh_contract", lambda: contract)
+        monkeypatch.setattr(mod, "FOTMOB_DAILY_SCOPE_COUNT", 1)
+        monkeypatch.setattr(mod, "FOTMOB_DAILY_SCOPE_SHA256", scope_sha256)
+        generation_id = "11111111-1111-4111-8111-111111111111"
+        payload = {
+            "run_id": generation_id,
+            "mode": "replay",
+            "status": "incomplete",
+            "complete": False,
+            "errors": ["missing raw player input"],
+            "selection": {
+                "entities": mod.ISSUE_930_REPLAY_ENTITIES,
+                "explicit_scopes": [scope],
+                "competition_limit": 0,
+                "season_limit": 0,
+                "scope_plan_signature": deterministic_plan_signature(
+                    mod.ISSUE_930_REPLAY_ENTITIES,
+                    policy={
+                        "match_policy": "finished_only",
+                        "leaderboard_policy": "all_advertised",
+                        "team_policy": "global_observed_snapshot",
+                        "player_policy": "global_observed_snapshot",
+                    },
+                ),
+                "planned_scopes": [scope],
+                "completed_scopes": [],
+                "replay_missing_player_inputs": {
+                    "schema": mod.REPLAY_MISSING_INPUT_SCHEMA,
+                    "failure_class": "missing_player_raw_inputs_only",
+                    "missing_player_ids": [123],
+                    "affected_scopes": [scope],
+                },
+            },
+            "transport": {"attempts": 0, "direct_bytes": 0, "proxy_bytes": 0},
+            "budget": {
+                "requests": 0,
+                "max_requests": 2_000,
+                "direct_bytes": 0,
+                "max_direct_bytes": 256 * 1024 * 1024,
+                "proxy_bytes": 0,
+                "max_proxy_bytes": 0,
+            },
+        }
+        result_path = tmp_path / "replay.json"
+        result_path.write_text(json.dumps(payload), encoding="utf-8")
+        task_states = {
+            "validate_publication_writer_fence": ("success", 1),
+            "scrape_fotmob_data": ("failed", 1),
+        }
+        dag_run = type(
+            "ReplayDagRun",
+            (),
+            {
+                "conf": {"fotmob_publication": {"generation_id": generation_id}},
+                "run_id": "issue930_replay_a1__" + generation_id.replace("-", ""),
+                "get_task_instance": lambda _self, task_id: type(
+                    "TaskInstance",
+                    (),
+                    {"state": task_states[task_id][0], "try_number": task_states[task_id][1]},
+                )(),
+            },
+        )()
+
+        proof = mod.prove_replay_missing_player_inputs(
+            str(result_path),
+            dag_run=dag_run,
+            ti=type(
+                "TaskInstance",
+                (),
+                {"task_id": mod.REPLAY_MISSING_INPUT_PROOF_TASK_ID, "try_number": 1},
+            )(),
+        )
+
+        assert proof["scope_count"] == 1
+        assert proof["scope_sha256"] == scope_sha256
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
@@ -652,6 +893,50 @@ class TestNativeValidation:
         }
 
     @pytest.mark.unit
+    def test_evidence_validator_accepts_spaced_exact_source_season(self, tmp_path):
+        import json
+
+        mod = _reload_dag_module()
+        report = tmp_path / "report.json"
+        payload = {
+            "run_id": "run-1",
+            "mode": "backfill",
+            "status": "success",
+            "complete": True,
+            "operations": [
+                {
+                    "entity": "competition_catalog",
+                    "status": "success",
+                    "errors": [],
+                    "retryable": [],
+                    "terminal": [],
+                    "counts": {"competitions": 1},
+                }
+            ],
+            "transport": {"attempts": 1, "direct_bytes": 1, "proxy_bytes": 0},
+            "budget": {
+                "requests": 1,
+                "max_requests": 2,
+                "direct_bytes": 1,
+                "max_direct_bytes": 2,
+                "proxy_bytes": 0,
+                "max_proxy_bytes": 0,
+            },
+            "errors": [],
+            "selection": {
+                "entities": ["season"],
+                "explicit_scopes": ["230=2025 Apertura"],
+                "competition_limit": 0,
+                "season_limit": 0,
+                "scope_plan_signature": "fmplan1-"
+                "98c9a8f98ba8eaa14bfc8232b9667682e11e4fce27e120eee5ea9572b66e0385",
+            },
+        }
+        report.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert mod.validate_data(str(report))["selection"]["explicit_scope_count"] == 1
+
+    @pytest.mark.unit
     def test_native_report_requires_bounded_exact_selection_evidence(self, tmp_path):
         import json
 
@@ -696,7 +981,70 @@ class TestNativeValidation:
 
 class TestSilverDependency:
     @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("tables", "expected"),
+        [
+            ([], False),
+            (["iceberg.bronze.fotmob_competition_scope_observations"], False),
+            (["iceberg.bronze.fotmob_catalog_batches"], False),
+            (["iceberg.bronze.fotmob_ingest_manifest"], False),
+            (["iceberg.bronze.fotmob_matches"], True),
+            (["iceberg.bronze.fotmob_transfer_events"], True),
+        ],
+    )
+    def test_silver_gate_reads_validated_committed_inputs(self, tables, expected):
+        mod = _reload_dag_module()
+
+        class _TI:
+            def xcom_pull(self, *, task_ids):
+                assert task_ids == "validate_data"
+                return {"bronze_inputs_changed": tables}
+
+        assert mod._should_transform(ti=_TI()) is expected
+
+    @pytest.mark.unit
+    def test_validation_normalizes_changed_bronze_inputs(self, tmp_path):
+        import json
+
+        mod = _reload_dag_module()
+        payload = _daily_report(mod)
+        payload["tables"] = [
+            "iceberg.bronze.fotmob_matches",
+            " iceberg.bronze.fotmob_matches ",
+            "iceberg.bronze.fotmob_competition_scope_observations",
+        ]
+        report = tmp_path / "result.json"
+        report.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert mod.validate_data(str(report))["bronze_inputs_changed"] == [
+            "iceberg.bronze.fotmob_competition_scope_observations",
+            "iceberg.bronze.fotmob_matches",
+        ]
+
+    @pytest.mark.unit
+    def test_existing_silver_input_set_is_complete_and_native(self):
+        mod = _reload_dag_module()
+
+        assert mod.FOTMOB_SILVER_BRONZE_INPUTS == frozenset(
+            {
+                "iceberg.bronze.fotmob_competition_seasons",
+                "iceberg.bronze.fotmob_season_teams",
+                "iceberg.bronze.fotmob_matches",
+                "iceberg.bronze.fotmob_match_payloads",
+                "iceberg.bronze.fotmob_standings",
+                "iceberg.bronze.fotmob_leaderboards",
+                "iceberg.bronze.fotmob_squad_snapshots",
+                "iceberg.bronze.fotmob_player_snapshots",
+                "iceberg.bronze.fotmob_team_snapshots",
+                "iceberg.bronze.fotmob_transfer_events",
+            }
+        )
+
+    @pytest.mark.unit
     def test_ingest_waits_for_silver_before_master_can_start_xref(self):
+        from airflow.operators.python import PythonOperator
+
+        PythonOperator._instances.clear()
         mod = _reload_dag_module()
 
         assert mod.trigger_silver._init_kwargs["wait_for_completion"] is True
@@ -707,5 +1055,35 @@ class TestSilverDependency:
         assert mod.trigger_silver._init_kwargs["logical_date"] == (
             "{{ logical_date.isoformat() }}"
         )
-        assert mod.seal_publication.upstream_task_ids == {"trigger_silver_transform"}
+        silver_triggers = [
+            task
+            for task in PythonOperator._instances
+            if task.task_id == "trigger_silver_transform"
+        ]
+        assert silver_triggers == [mod.trigger_silver]
+        assert mod.transform_gate._init_kwargs["ignore_downstream_trigger_rules"] is False
+        assert mod.transform_gate._init_kwargs.get("op_kwargs", {}) == {}
+        bronze_candidate = next(
+            task
+            for task in PythonOperator._instances
+            if task.task_id == "record_bronze_only_publication_candidate"
+        )
+        assert bronze_candidate.python_callable is (
+            mod.record_fotmob_bronze_only_candidate
+        )
+        assert bronze_candidate.upstream_task_ids == {"validate_data"}
+        assert bronze_candidate._init_kwargs["op_kwargs"] == {
+            "validation_task_id": "validate_data",
+            "silver_input_tables": sorted(mod.FOTMOB_SILVER_BRONZE_INPUTS),
+        }
+        assert mod.seal_publication.upstream_task_ids == {
+            "record_bronze_only_publication_candidate",
+            "trigger_silver_transform",
+        }
+        assert mod.seal_publication._init_kwargs["trigger_rule"] == (
+            "none_failed_min_one_success"
+        )
+        # The Silver child is synchronous and failed DQ is explicitly a failed
+        # state, so the seal cannot publish readiness after DQ failure.
+        assert mod.trigger_silver._init_kwargs["failed_states"] == ["failed"]
         assert mod.finalize_publication._init_kwargs["trigger_rule"] == "all_done"

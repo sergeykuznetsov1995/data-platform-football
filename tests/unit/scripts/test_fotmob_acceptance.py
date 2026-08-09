@@ -15,7 +15,6 @@ from scrapers.fotmob.repository import (
 )
 from tests.unit.scripts.fotmob_runtime_fixture import (
     isolated_runtime_proof,
-    schedule_boundary_proof,
     shared_handoff_proof,
 )
 
@@ -52,12 +51,15 @@ def runtime_options(tmp_path):
                 "passed": True,
                 "activation_state": "kept_paused",
                 "kept_paused": True,
-                "paused": [
-                    "dag_ingest_fotmob",
-                    "dag_transform_fotmob_silver",
-                    "dag_trigger_fotmob_daily",
-                ],
+                "paused": sorted(mod.runtime_binding.EXPECTED_DAGS),
                 "unpaused": [],
+                "coordinator_rollout": {
+                    "schema_version": (
+                        mod.runtime_binding.COORDINATOR_ROLLOUT_SCHEMA
+                    ),
+                    "phase": "kept_paused",
+                    "legacy_activation_retired": True,
+                },
                 "generated_at": "2026-07-21T10:00:00Z",
                 "project": "fotmob-airflow",
                 "compose_file": str(compose.resolve()),
@@ -105,7 +107,6 @@ def runtime_options(tmp_path):
                 "shared_handoff_final": shared_handoff_proof(
                     shared_control, release_root=tmp_path
                 ),
-                "schedule_boundary": schedule_boundary_proof(),
             }
         )
     )
@@ -390,6 +391,11 @@ class FakeAcceptanceClient:
                 )
                 for competition_id, season_key in self.scope_identities
             ]
+        if "acceptance:scope-status" in sql:
+            return [
+                (competition_id, season_key, 1, 1, 1, False, None, True)
+                for competition_id, season_key in self.scope_identities
+            ]
         coverage_rows = fake_scope_coverage_rows(sql, self.scope_identities)
         if coverage_rows is not None:
             return coverage_rows
@@ -605,28 +611,22 @@ def test_runtime_binding_rejects_pending_trigger_activation(tmp_path):
         raise AssertionError("pending trigger activation was accepted as complete")
 
 
-def test_runtime_binding_rejects_mismatched_scheduled_consumer_interval(tmp_path):
+def test_runtime_binding_accepts_coordinator_without_retired_schedule_proof(tmp_path):
     options = runtime_options(tmp_path)
     deployment_path = Path(options[options.index("--deployment-report") + 1])
     compose_path = Path(options[options.index("--compose-file") + 1])
-    payload = json.loads(deployment_path.read_text(encoding="utf-8"))
-    payload["schedule_boundary"]["isolated_final"] = {
-        "logical_date": "2026-07-21T14:00:00+00:00",
-        "data_interval_start": "2026-07-21T14:00:00+00:00",
-        "data_interval_end": "2026-07-22T14:00:00+00:00",
-        "run_after": "2026-07-22T14:00:00+00:00",
-    }
-    deployment_path.write_text(json.dumps(payload), encoding="utf-8")
+    context = mod.runtime_binding.load_deployment_context(
+        deployment_path,
+        project="fotmob-airflow",
+        compose_file=compose_path,
+    )
 
-    with pytest.raises(
-        mod.runtime_binding.RuntimeBindingError,
-        match="next scheduled intervals differ",
-    ):
-        mod.runtime_binding.load_deployment_context(
-            deployment_path,
-            project="fotmob-airflow",
-            compose_file=compose_path,
-        )
+    assert "schedule_boundary" not in context
+    assert context["coordinator_rollout"] == {
+        "schema_version": mod.runtime_binding.COORDINATOR_ROLLOUT_SCHEMA,
+        "phase": "kept_paused",
+        "legacy_activation_retired": True,
+    }
 
 
 def _active_schedule_report(logical_date: datetime) -> tuple[dict, dict[str, str]]:
@@ -922,10 +922,14 @@ def test_verify_checks_every_current_view_and_is_green():
     )
     assert report["passed"] is True
     assert report["summary"] == {
-        "checks": 5 + len(mod.CURRENT_VIEW_KEYS),
-        "passed": 5 + len(mod.CURRENT_VIEW_KEYS),
+        "checks": 6 + len(mod.CURRENT_VIEW_KEYS),
+        "passed": 6 + len(mod.CURRENT_VIEW_KEYS),
         "failed": 0,
     }
+    coverage_check = next(
+        check for check in report["checks"] if check["name"] == "scope_coverage_status"
+    )
+    assert coverage_check["details"]["categories"] == {"satisfied": 1}
     checked_views = [sql for sql in client.sql if "acceptance:current-view:" in sql]
     assert len(checked_views) == len(mod.CURRENT_VIEW_KEYS)
 
@@ -1376,3 +1380,237 @@ def test_verify_scopes_completion_to_exact_plan_parser_and_time():
     player_coverage_sql = next(sql for sql in coverage_sql if ":players" in sql)
     assert "team_manifest_ranked" in player_coverage_sql
     assert "m.completed_at <= completion.completed_at" in player_coverage_sql
+
+
+@pytest.mark.parametrize(
+    ("standings", "expected"),
+    [
+        (
+            [
+                {
+                    "team_id": team_id,
+                    "played": played,
+                    "table_id": table_id,
+                    "table_name": table_name,
+                    "table_type": "all",
+                }
+                for team_id in ("10", "20")
+                for played, table_id, table_name in (
+                    (10, "overall", "Overall"),
+                    (6, "opening", "Opening"),
+                    (4, "closing", "Closing"),
+                )
+            ],
+            10,
+        ),
+        (
+            [
+                {
+                    "team_id": team_id,
+                    "played": 8,
+                    "table_id": table_id,
+                    "table_name": table_name,
+                    "table_type": "ALL",
+                }
+                for team_id in ("10", "20")
+                for table_id, table_name in (("z", "Zulu"), ("a", "Alpha"))
+            ],
+            8,
+        ),
+        (
+            [
+                {
+                    "team_id": team_id,
+                    "played": 6,
+                    "table_id": f"group-{team_id}",
+                    "table_name": f"Group {team_id}",
+                    "table_type": "all",
+                }
+                for team_id in ("10", "20", "30", "40")
+            ],
+            12,
+        ),
+        (
+            [
+                {
+                    "team_id": team_id,
+                    "played": 5,
+                    "table_id": "overall",
+                    "table_name": "Overall",
+                    "table_type": "all",
+                }
+                for team_id in ("10", "20")
+            ]
+            + [
+                {
+                    "team_id": "10",
+                    "played": 99,
+                    "table_id": "home",
+                    "table_name": "Home",
+                    "table_type": "home",
+                },
+                {
+                    "team_id": None,
+                    "played": 99,
+                    "table_id": "invalid",
+                    "table_name": "Invalid",
+                    "table_type": "all",
+                },
+            ],
+            5,
+        ),
+        (
+            [
+                {
+                    "team_id": team_id,
+                    "played": played,
+                    "table_id": None,
+                    "table_name": "Overall",
+                    "table_type": "all",
+                }
+                for team_id, played in (("10", "3"), ("20", 3))
+            ],
+            3,
+        ),
+    ],
+)
+def test_overlapping_all_stage_standings_dedupe_to_one_max_played_row_per_team(
+    standings, expected
+):
+    denominator = mod.standings_match_denominator(standings)
+    assert denominator == expected
+    assert (
+        mod.classify_scope_coverage(
+            source_season_key="2025",
+            match_count=expected,
+            finished_match_count=expected,
+            payload_match_count=expected,
+            table_advertised=True,
+            standings_match_count=denominator,
+            terminal_completion=True,
+        )
+        == "satisfied"
+    )
+
+
+def test_true_271_of_316_source_gap_remains_partial():
+    assert (
+        mod.classify_scope_coverage(
+            source_season_key="2025/2026",
+            match_count=316,
+            finished_match_count=316,
+            payload_match_count=271,
+            table_advertised=True,
+            standings_match_count=316,
+            terminal_completion=False,
+        )
+        == "partial"
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "season",
+        "matches",
+        "finished",
+        "payloads",
+        "advertised",
+        "standings",
+        "closed",
+        "expected",
+    ),
+    [
+        ("2025 Apertura", 0, 0, 0, False, None, True, "empty_but_closed"),
+        ("2025 Apertura", 0, 0, 0, False, None, False, "unreachable_token"),
+        ("2025", 0, 0, 0, False, None, False, "no_matches"),
+        # Future-only fixtures are not an empty scope.
+        ("2025 Apertura", 3, 0, 0, False, None, False, "satisfied"),
+        ("2025", 3, 0, 0, True, None, False, "satisfied"),
+        ("2025", 8, 8, 7, False, None, True, "partial"),
+        ("2025", 8, 8, 8, True, None, True, "partial"),
+        # An absent/malformed latest league-season capability is not proof that
+        # the source is a no-table friendly.
+        ("2025", 8, 8, 8, None, None, True, "partial"),
+        # Source-confirmed friendlies advertise no standings table.  Matching
+        # finished/payload IDs are therefore complete without a denominator.
+        ("2025 Club Friendlies", 8, 8, 8, False, None, True, "satisfied"),
+        (
+            "2025 National Team Friendlies",
+            8,
+            8,
+            8,
+            False,
+            None,
+            True,
+            "satisfied",
+        ),
+    ],
+)
+def test_scope_coverage_categories_are_mutually_exclusive(
+    season, matches, finished, payloads, advertised, standings, closed, expected
+):
+    assert (
+        mod.classify_scope_coverage(
+            source_season_key=season,
+            match_count=matches,
+            finished_match_count=finished,
+            payload_match_count=payloads,
+            table_advertised=advertised,
+            standings_match_count=standings,
+            terminal_completion=closed,
+        )
+        == expected
+    )
+
+
+def test_scope_coverage_sql_uses_final_distinct_grain_and_capability_gate():
+    sql = mod._scope_coverage_status_sql(
+        [scope()],
+        manifest='"iceberg"."bronze"."fotmob_ingest_manifest"',
+        matches='"iceberg"."bronze"."fotmob_matches_current"',
+        payloads='"iceberg"."bronze"."fotmob_match_payloads_current"',
+        standings='"iceberg"."bronze"."fotmob_standings_current"',
+        parser_version=mod.PARSER_VERSION,
+    )
+    normalized = " ".join(sql.casefold().split())
+
+    assert "count(distinct match_id)" in normalized
+    assert "count(distinct finished_match_id)" in normalized
+    assert "count(distinct payload_match_id)" in normalized
+    assert "coalesce(match_row.finished, false)" in normalized
+    assert "partition by competition_id, source_season_key, team_id" in normalized
+    assert "played desc" in normalized
+    assert "table_id" in normalized and "table_name" in normalized
+    assert "table_advertised" in normalized
+    assert "lower(standings_row.table_type) = 'all'" in normalized
+    assert "from finished_match_ids finished join" in normalized
+    assert "payload_row.match_id" in normalized
+    assert "m.target_type = 'league_season'" in normalized
+    assert "json_extract_scalar(m.capabilities_json, '$.table_advertised')" in normalized
+    assert "row_number() over" in normalized
+    assert "m.status in ('excluded', 'not_available', 'not_modified', 'success')" in normalized
+
+
+def test_verify_fails_closed_and_reports_a_real_payload_gap():
+    class PartialClient(FakeAcceptanceClient):
+        def query(self, sql):
+            if "acceptance:scope-status" in sql:
+                self.sql.append(sql)
+                return [(47, "2025/2026", 316, 316, 271, True, 316, True)]
+            return super().query(sql)
+
+    report = mod.verify(
+        PartialClient(),
+        [scope()],
+        catalog="iceberg",
+        bronze_schema="bronze",
+        parser_version=mod.PARSER_VERSION,
+        lineage=fake_lineage(),
+    )
+    check = next(
+        item for item in report["checks"] if item["name"] == "scope_coverage_status"
+    )
+    assert check["passed"] is False
+    assert check["details"]["categories"] == {"partial": 1}
+    assert check["details"]["scopes"][0]["category"] == "partial"
+    assert check["details"]["scopes"][0]["reason"] == "finished_payload_gap"
