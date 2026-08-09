@@ -1,0 +1,70 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.espn_match
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.espn_match
+  description: |
+    Матч ESPN: одна строка на raw `event_id`. Источник — append-only
+    bronze.espn_schedule_generation_v2; последняя генерация события выбирается
+    ROW_NUMBER по event_id и _ingested_at. Судья — best-effort LEFT JOIN к
+    так же дедуплицированному bronze.espn_matchsheet_generation_v2. Raw ESPN
+    numeric IDs сохраняются без xref. `is_played` отделяет завершённые матчи:
+    для остальных 0:0 scoreboard намеренно превращён в NULL. Победитель
+    учитывает competitor.winner и shootout score; season_slug не всегда сезон,
+    а может быть стадией. _bronze_ingested_at — lineage, league/season —
+    завершающие partition keys.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: event_id
+    description: Сырой ESPN ID события; PK таблицы.
+  - name: scope_id
+    description: ESPN scope источника события.
+  - name: competition_id
+    description: Сырой ESPN ID соревнования.
+  - name: kickoff
+    description: UTC timestamp начала матча.
+  - name: status
+    description: ESPN STATUS_* из schedule.
+  - name: is_played
+    description: TRUE только для played_final; определяет применимость счёта.
+  - name: home_team_id
+    description: Сырой ESPN ID домашней команды.
+  - name: away_team_id
+    description: Сырой ESPN ID гостевой команды.
+  - name: home_score
+    description: Счёт хозяев только у сыгранного матча; иначе NULL, не ложный 0.
+  - name: away_score
+    description: Счёт гостей только у сыгранного матча; иначе NULL, не ложный 0.
+  - name: home_shootout_score
+    description: Голы хозяев в серии пенальти; это отдельный от основного счёта факт.
+  - name: away_shootout_score
+    description: Голы гостей в серии пенальти; это отдельный от основного счёта факт.
+  - name: winner_team_id
+    description: Сырой ESPN ID победителя, включая разрешение серии пенальти.
+  - name: stage
+    description: Нормализованная стадия только для разрешённых season_slug; иначе NULL.
+  - name: season_slug_platform
+    description: |
+      Платформенный сезон, отличный от partition `season`: displayName формата
+      YYYY-YY или YYYY-YYYY преобразуется в YYZZ; отдельное edition YYYY
+      сохраняется как YYYY; при отсутствии обоих используется source_season_year.
+  - name: group_name
+    description: Группа, извлечённая из хвоста alt_game_note; NULL если не применимо.
+  - name: attendance
+    description: Посещаемость; sentinel 0 из Bronze преобразован в NULL как неизвестный.
+  - name: referee
+    description: Имя судьи, best-effort из matchsheet или его JSON fallback.
+    tags:
+      - PII.Low
+  - name: _bronze_ingested_at
+    description: Timestamp выбранной последней Bronze-генерации (lineage).
+  - name: league
+    description: Competition slug ESPN; partition key.
+  - name: season
+    description: Source season year как varchar; partition key.
+  - name: _silver_created_at
+    description: Технический timestamp CTAS-раннера при материализации Silver.
+relationships: []

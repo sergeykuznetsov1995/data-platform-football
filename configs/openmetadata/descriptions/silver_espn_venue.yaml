@@ -1,0 +1,35 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.espn_venue
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.espn_venue
+  description: |
+    Справочник арен ESPN: одна строка на venue_id. Источник — append-only
+    bronze.espn_schedule_generation_v2; последняя строка площадки выбирается
+    по venue_id и _ingested_at, записи без venue_id исключены. venue_name
+    берётся из колонки schedule: JSON venue содержит только address, поэтому не
+    является fallback для названия. Последний матч определяет lineage и
+    league/season partition keys, хотя они для справочника не являются
+    бизнес-грейном.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.None
+columns:
+  - name: venue_id
+    description: Сырой ESPN ID арены; PK таблицы.
+  - name: venue_name
+    description: Обрезанное название арены из колонки schedule.venue.
+  - name: city
+    description: Город арены из extra_json venue.address.
+  - name: country
+    description: Страна арены из extra_json venue.address.
+  - name: _bronze_ingested_at
+    description: Timestamp последней schedule Bronze-генерации для venue (lineage).
+  - name: league
+    description: Competition slug последнего матча; partition key.
+  - name: season
+    description: Source season year последнего матча как varchar; partition key.
+  - name: _silver_created_at
+    description: Технический timestamp CTAS-раннера при материализации Silver.
+relationships: []
