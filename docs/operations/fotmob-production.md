@@ -225,8 +225,12 @@ python scripts/fotmob_recover.py \
 owner → ingest → Silver. Затем она ставит ровно шесть isolated DAG на паузу.
 
 - `writing` или retained `failed`: только полностью остановленная цепочка
-  получает `safe_to_release=true`; cursor двигается вперёд, поэтому тот же
-  generation не откроется снова.
+  получает `safe_to_release=true`. Cursor остаётся без изменений, но terminal
+  generation никогда не открывается повторно. Daily не повторяется в тот же
+  день: он снова станет доступен на следующей календарной границе 14:00 UTC с
+  новыми generation/child run ID. Refresh/backfill сохраняет ту же lane и
+  повторяется на следующем допустимом пятиминутном owner interval, тоже с
+  новыми ID.
 - daily `ready` без consumer: lock освобождается только для exact упавшего
   scheduled Sofa run с terminal wait/downstream proof.
 - refresh/backfill `ready` или уже `abandoned`: нужны exact успешные ingest и

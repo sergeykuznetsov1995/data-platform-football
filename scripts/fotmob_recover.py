@@ -11,7 +11,10 @@ Two recoveries are intentionally narrow:
 
 * a terminal isolated producer in ``writing``/retained ``failed`` is marked
   failed with ``safe_to_release=True`` while its scheduler cursor remains
-  unchanged, so the same daily/refresh/backfill lane stays due;
+  unchanged.  A terminal generation is never reopened: daily becomes eligible
+  at the next calendar 14:00 UTC boundary, while refresh/backfill keeps the
+  same lane for the next eligible five-minute owner interval.  Both use fresh
+  generation and child-run identities;
 * an exact terminal SofaScore wait against ``ready`` and unclaimed evidence is
   abandoned.
 
@@ -32,7 +35,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -163,6 +166,97 @@ def _normalize_state(value: Any) -> str:
 
 def _publication(generation_id: str, binding: Mapping[str, Any]) -> dict[str, Any]:
     return {"generation_id": generation_id, "binding": dict(binding)}
+
+
+def _next_eligible_boundary(
+    decision: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    *,
+    generation_id: str,
+    observed_at: Any,
+) -> dict[str, Any]:
+    """Describe the first safe retry identity without reopening a terminal run."""
+
+    normalized = _canonical_binding(binding)
+    if make_generation_id(normalized) != generation_id:
+        raise RecoveryError("terminal generation differs from its exact binding")
+    # This validates the complete persisted scheduler decision without changing
+    # it.  The returned advanced state is deliberately ignored for a failed
+    # producer: only a successful publication may move that cursor.
+    expected_advanced_state(
+        decision,
+        recovered_at=_canonical_instant(
+            observed_at, label="retry boundary observation"
+        ),
+    )
+    lane = str(decision.get("lane") or "").casefold()
+    common = {
+        "policy": "next_eligible_boundary",
+        "lane": lane,
+    }
+    if lane in {"refresh", "backfill"}:
+        start = _instant(
+            normalized["data_interval_start"],
+            label="terminal background interval start",
+        )
+        end = _instant(
+            normalized["data_interval_end"],
+            label="terminal background interval end",
+        )
+        if end - start != timedelta(minutes=5):
+            raise RecoveryError("terminal background binding is not one owner interval")
+        return {
+            **common,
+            "timing": "next_eligible_owner_5_minute_interval",
+            "identity_source": "next_scheduled_owner_data_interval",
+            "requires_new_generation_id": True,
+            "requires_new_child_run_ids": True,
+        }
+
+    selected_date = str(decision.get("selected_date") or "")
+    try:
+        failed_date = datetime.fromisoformat(selected_date).date()
+    except ValueError as exc:  # already guarded above; keep this helper total
+        raise RecoveryError("automatic owner selected date is invalid") from exc
+    old_end = _instant(
+        normalized["data_interval_end"], label="terminal daily interval end"
+    )
+    old_start = _instant(
+        normalized["data_interval_start"], label="terminal daily interval start"
+    )
+    if (
+        old_end - old_start != timedelta(days=1)
+        or old_end.date() != failed_date
+        or old_end.time() != time(14, 0)
+    ):
+        raise RecoveryError("terminal daily binding differs from selected boundary")
+
+    observed = _instant(observed_at, label="retry boundary observation")
+    next_date = failed_date + timedelta(days=1)
+    boundary = datetime.combine(next_date, time(14, 0), tzinfo=timezone.utc)
+    while boundary <= observed:
+        boundary += timedelta(days=1)
+    next_binding = {
+        **normalized,
+        "data_interval_start": (boundary - timedelta(days=1)).isoformat(
+            timespec="microseconds"
+        ),
+        "data_interval_end": boundary.isoformat(timespec="microseconds"),
+    }
+    next_generation_id = make_generation_id(next_binding)
+    if next_generation_id == generation_id:  # pragma: no cover - UUID input differs
+        raise RecoveryError("next daily boundary reused terminal generation")
+    return {
+        **common,
+        "timing": "next_calendar_daily_1400_utc",
+        "same_day_retry_allowed": False,
+        "earliest_at": boundary.isoformat(timespec="microseconds"),
+        "next_data_interval_start": next_binding["data_interval_start"],
+        "next_data_interval_end": next_binding["data_interval_end"],
+        "identity_source": "next_daily_binding_and_rollout_runtime_fingerprint",
+        "requires_new_generation_id": True,
+        "requires_new_child_run_ids": True,
+    }
 
 
 def expected_advanced_state(
@@ -1450,10 +1544,7 @@ def recover_automatic_failure(
             generation_id=generation_id,
             git_sha=str(mutation_context["git_sha"]),
         )
-        if (
-            post_owner.get("run_id") != owner.get("run_id")
-            or post_decision != decision
-        ):
+        if post_owner.get("run_id") != owner.get("run_id") or post_decision != decision:
             raise RecoveryError("failed producer lineage changed after release")
         shared_pause = _pause_shared_for_rollout(mutation_context, run=run)
         _post_context, post_live = _revalidate_mutation_boundary(
@@ -1477,8 +1568,13 @@ def recover_automatic_failure(
             "roll_forward": {
                 "cursor_transition": None,
                 "scheduler_state_unchanged": dict(decision["state"]),
-                "retry_lane": decision["lane"],
-                "same_generation_reopen_allowed": False,
+                "next_eligible_boundary": _next_eligible_boundary(
+                    decision,
+                    binding,
+                    generation_id=generation_id,
+                    observed_at=post_release_isolated["observed_at"],
+                ),
+                "terminal_generation_reopen_allowed": False,
                 "resume": "new_pristine_automatic_rollout_required",
             },
         }
@@ -1561,7 +1657,7 @@ def recover_automatic_failure(
             "rollout_ready": shared_pause["rollout_ready"],
             "roll_forward": {
                 "cursor_transition": cursor,
-                "same_generation_reopen_allowed": False,
+                "terminal_generation_reopen_allowed": False,
                 "resume": "new_pristine_automatic_rollout_required",
             },
         }
@@ -1653,7 +1749,7 @@ def recover_automatic_failure(
             "rollout_ready": shared_pause["rollout_ready"],
             "roll_forward": {
                 "cursor_transition": cursor,
-                "same_generation_reopen_allowed": False,
+                "terminal_generation_reopen_allowed": False,
                 "resume": "new_pristine_automatic_rollout_required",
             },
         }

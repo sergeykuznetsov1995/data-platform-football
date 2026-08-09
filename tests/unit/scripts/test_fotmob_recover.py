@@ -1,11 +1,13 @@
 import copy
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from scripts import fotmob_recover as mod
+from scrapers.fbref.control import StateConflict
+from tests.unit.scrapers.test_publication_generation_store import make_store
 from utils.fotmob_orchestration import FotMobSchedulerState, choose_lane
 
 
@@ -402,32 +404,59 @@ def _writing_snapshot_for_lane(lane):
     return snapshot
 
 
-@pytest.mark.parametrize(
-    ("lane", "next_tick_at"),
-    (
-        ("daily", datetime(2026, 8, 8, 14, 10, tzinfo=timezone.utc)),
-        ("refresh", datetime(2026, 8, 8, 12, 10, tzinfo=timezone.utc)),
-        ("backfill", datetime(2026, 8, 8, 12, 10, tzinfo=timezone.utc)),
-    ),
-)
-def test_writing_failure_releases_without_advancing_and_same_lane_retries(
-    tmp_path, monkeypatch, lane, next_tick_at
+def _writing_case_for_lane(lane):
+    snapshot = _writing_snapshot_for_lane(lane)
+    binding = _binding()
+    if lane in {"refresh", "backfill"}:
+        binding = {
+            **binding,
+            "data_interval_start": "2026-08-08T12:00:00.000000+00:00",
+            "data_interval_end": "2026-08-08T12:05:00.000000+00:00",
+        }
+    generation_id = mod.make_generation_id(binding)
+    publication = {"generation_id": generation_id, "binding": binding}
+    owner = snapshot["owner_matches"][0]
+    owner.update(
+        data_interval_start=binding["data_interval_start"],
+        data_interval_end=binding["data_interval_end"],
+        initializer={**publication, "state": {"phase": "writing"}},
+    )
+    snapshot["ingest"].update(
+        run_id=f"fotmob_orchestrated__{generation_id}",
+        conf={mod.PUBLICATION_CONF_KEY: publication},
+    )
+    snapshot["silver"].update(
+        run_id=f"fotmob_silver__{generation_id}",
+        conf={mod.PUBLICATION_CONF_KEY: publication},
+    )
+    control = {
+        **_control(),
+        "generation_id": generation_id,
+        "binding": binding,
+    }
+    return generation_id, snapshot, control
+
+
+def test_writing_daily_failure_waits_for_next_calendar_boundary_with_new_ids(
+    tmp_path, monkeypatch
 ):
+    lane = "daily"
+    generation_id, snapshot, control = _writing_case_for_lane(lane)
     released = {
-        **_control(phase="failed", status="failed", active=False),
+        **control,
+        "phase": "failed",
+        "status": "failed",
+        "active": False,
+        "lock_active": False,
         "released": True,
         "released_at": "2026-08-08T18:01:00+00:00",
         "safe_to_release": True,
     }
-    snapshots = [
-        _writing_snapshot_for_lane(lane),
-        _writing_snapshot_for_lane(lane),
-        _writing_snapshot_for_lane(lane),
-    ]
+    snapshots = [copy.deepcopy(snapshot) for _ in range(3)]
     _install_common(
         monkeypatch,
         tmp_path,
-        controls=[_control(), _control(), released],
+        controls=[control, control, released],
         snapshots=snapshots,
     )
     events = []
@@ -442,25 +471,199 @@ def test_writing_failure_releases_without_advancing_and_same_lane_retries(
         lambda *_args, **_kwargs: events.append("release") or released,
     )
 
-    report = mod.recover_automatic_failure(_arguments(tmp_path))
+    report = mod.recover_automatic_failure(
+        _arguments(tmp_path, generation_id=generation_id)
+    )
 
     selected_state = snapshots[0]["owner_matches"][0]["decision"]["state"]
+    same_day = choose_lane(
+        datetime(2026, 8, 8, 18, 5, tzinfo=timezone.utc),
+        FotMobSchedulerState.from_dict(selected_state),
+        False,
+    )
     next_tick = choose_lane(
-        next_tick_at,
+        datetime(2026, 8, 9, 14, 0, tzinfo=timezone.utc),
         FotMobSchedulerState.from_dict(selected_state),
         False,
     )
     assert events == ["release"]
+    assert same_day.lane is None
     assert next_tick.lane is not None
     assert next_tick.lane.value == lane
     assert report["passed"] is True
     assert report["phase"] == "failed_generation_released"
     assert report["roll_forward"]["cursor_transition"] is None
     assert report["roll_forward"]["scheduler_state_unchanged"] == selected_state
-    assert report["roll_forward"]["retry_lane"] == lane
-    assert report["roll_forward"]["same_generation_reopen_allowed"] is False
+    assert "retry_lane" not in report["roll_forward"]
+    assert "same_generation_reopen_allowed" not in report["roll_forward"]
+    retry = report["roll_forward"]["next_eligible_boundary"]
+    assert retry["policy"] == "next_eligible_boundary"
+    assert retry["lane"] == lane
+    assert retry["timing"] == "next_calendar_daily_1400_utc"
+    assert retry["same_day_retry_allowed"] is False
+    assert retry["earliest_at"] == "2026-08-09T14:00:00.000000+00:00"
+    assert retry["next_data_interval_start"] == ("2026-08-08T14:00:00.000000+00:00")
+    assert retry["next_data_interval_end"] == "2026-08-09T14:00:00.000000+00:00"
+    assert retry["identity_source"] == (
+        "next_daily_binding_and_rollout_runtime_fingerprint"
+    )
+    next_binding = {
+        **control["binding"],
+        "data_interval_start": retry["next_data_interval_start"],
+        "data_interval_end": retry["next_data_interval_end"],
+    }
+    next_generation_id = mod.make_generation_id(next_binding)
+    assert next_generation_id != generation_id
+    assert f"fotmob_orchestrated__{next_generation_id}" != (
+        f"fotmob_orchestrated__{generation_id}"
+    )
+    assert f"fotmob_silver__{next_generation_id}" != (f"fotmob_silver__{generation_id}")
+    assert retry["requires_new_generation_id"] is True
+    assert retry["requires_new_child_run_ids"] is True
+    assert report["roll_forward"]["terminal_generation_reopen_allowed"] is False
     assert report["isolated_writers_paused"] is True
     assert json.loads(_arguments(tmp_path).output.read_text())["passed"] is True
+
+
+def test_terminal_daily_never_reuses_the_remaining_same_day_window():
+    retry = mod._next_eligible_boundary(
+        _owner()["decision"],
+        _binding(),
+        generation_id=GENERATION_ID,
+        observed_at="2026-08-08T14:10:00+00:00",
+    )
+
+    assert retry["same_day_retry_allowed"] is False
+    assert retry["earliest_at"] == "2026-08-09T14:00:00.000000+00:00"
+
+
+@pytest.mark.parametrize("lane", ("refresh", "backfill"))
+def test_writing_background_failure_keeps_lane_for_next_owner_interval(
+    tmp_path, monkeypatch, lane
+):
+    generation_id, snapshot, control = _writing_case_for_lane(lane)
+    released = {
+        **control,
+        "phase": "failed",
+        "status": "failed",
+        "active": False,
+        "lock_active": False,
+        "released": True,
+        "released_at": "2026-08-08T18:01:00+00:00",
+        "safe_to_release": True,
+    }
+    snapshots = [copy.deepcopy(snapshot) for _ in range(3)]
+    _install_common(
+        monkeypatch,
+        tmp_path,
+        controls=[control, control, released],
+        snapshots=snapshots,
+    )
+    events = []
+    monkeypatch.setattr(
+        mod,
+        "_advance_scheduler_cursor",
+        lambda *_args, **_kwargs: pytest.fail("failed work must not move the cursor"),
+    )
+    monkeypatch.setattr(
+        mod,
+        "_fail_and_release",
+        lambda *_args, **_kwargs: events.append("release") or released,
+    )
+
+    report = mod.recover_automatic_failure(
+        _arguments(tmp_path, generation_id=generation_id)
+    )
+
+    selected_state = snapshots[0]["owner_matches"][0]["decision"]["state"]
+    next_tick = choose_lane(
+        datetime(2026, 8, 9, 12, 10, tzinfo=timezone.utc),
+        FotMobSchedulerState.from_dict(selected_state),
+        False,
+    )
+    assert events == ["release"]
+    assert next_tick.lane is not None
+    assert next_tick.lane.value == lane
+    retry = report["roll_forward"]["next_eligible_boundary"]
+    assert retry == {
+        "policy": "next_eligible_boundary",
+        "lane": lane,
+        "timing": "next_eligible_owner_5_minute_interval",
+        "identity_source": "next_scheduled_owner_data_interval",
+        "requires_new_generation_id": True,
+        "requires_new_child_run_ids": True,
+    }
+    assert report["roll_forward"]["terminal_generation_reopen_allowed"] is False
+
+
+@pytest.mark.parametrize(
+    ("lane", "binding_shift"),
+    (("daily", timedelta(days=1)), ("refresh", timedelta(minutes=5))),
+)
+def test_terminal_generation_rejects_reopen_but_next_interval_id_initializes(
+    lane, binding_shift
+):
+    old_binding = _binding()
+    if lane == "refresh":
+        old_binding.update(
+            data_interval_start="2026-08-08T12:00:00.000000+00:00",
+            data_interval_end="2026-08-08T12:05:00.000000+00:00",
+        )
+    old_publication = {
+        "generation_id": mod.make_generation_id(old_binding),
+        "binding": old_binding,
+    }
+    old_store, old_database, _old_factory = make_store()
+    old_store.initialize_publication_generation(
+        old_publication["generation_id"],
+        dag_id=mod.OWNER_DAG_ID,
+        binding=old_publication["binding"],
+        source="fotmob",
+    )
+    old_store.fail_publication_generation(
+        old_publication["generation_id"],
+        safe_to_release=True,
+        source="fotmob",
+    )
+
+    with pytest.raises(StateConflict, match="Terminal publication generation"):
+        old_store.initialize_publication_generation(
+            old_publication["generation_id"],
+            dag_id=mod.OWNER_DAG_ID,
+            binding=old_publication["binding"],
+            source="fotmob",
+        )
+
+    next_binding = {
+        **old_publication["binding"],
+        "data_interval_start": (
+            datetime.fromisoformat(old_publication["binding"]["data_interval_start"])
+            + binding_shift
+        ).isoformat(timespec="microseconds"),
+        "data_interval_end": (
+            datetime.fromisoformat(old_publication["binding"]["data_interval_end"])
+            + binding_shift
+        ).isoformat(timespec="microseconds"),
+    }
+    next_generation_id = mod.make_generation_id(next_binding)
+    assert next_generation_id != old_publication["generation_id"]
+
+    fresh_store, fresh_database, _fresh_factory = make_store()
+    # The small test store models one crawl row, so carry the real released
+    # singleton lock into the fresh-generation store.  This exercises the
+    # production lock-takeover branch without pretending the old terminal row
+    # can be initialized again.
+    fresh_database.lock = copy.deepcopy(old_database.lock)
+    initialized = fresh_store.initialize_publication_generation(
+        next_generation_id,
+        dag_id=mod.OWNER_DAG_ID,
+        binding=next_binding,
+        source="fotmob",
+    )
+    assert initialized["generation_id"] == next_generation_id
+    assert initialized["phase"] == "writing"
+    assert initialized["status"] == "running"
+    assert initialized["active"] is True
 
 
 def test_failed_release_retry_after_lost_response_is_idempotent_and_keeps_cursor(
@@ -489,7 +692,9 @@ def test_failed_release_retry_after_lost_response_is_idempotent_and_keeps_cursor
     monkeypatch.setattr(
         mod,
         "_advance_scheduler_cursor",
-        lambda *_args, **_kwargs: pytest.fail("recovery retry must not move the cursor"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "recovery retry must not move the cursor"
+        ),
     )
     monkeypatch.setattr(mod, "_fail_and_release", lambda *_args, **_kwargs: released)
 
@@ -499,6 +704,7 @@ def test_failed_release_retry_after_lost_response_is_idempotent_and_keeps_cursor
     assert report["publication_transition"]["idempotent"] is True
     assert report["roll_forward"]["cursor_transition"] is None
     assert report["roll_forward"]["scheduler_state_unchanged"] == _selected_state()
+    assert report["roll_forward"]["next_eligible_boundary"]["lane"] == "daily"
 
 
 def test_writing_release_requires_unchanged_cursor_readback_after_mutation(
