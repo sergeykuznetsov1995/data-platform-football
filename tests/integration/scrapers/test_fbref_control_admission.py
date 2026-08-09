@@ -13,6 +13,9 @@ from urllib.parse import urlsplit, urlunsplit
 import pytest
 
 from scrapers.fbref.control import ControlStore, StateConflict
+from scripts.research.bench_fbref_persistence import (
+    _isolated_replay_control_evidence,
+)
 
 
 pytestmark = pytest.mark.integration
@@ -95,6 +98,118 @@ def isolated_postgres_uri():
                 )
             )
         admin.close()
+
+
+def test_acceptance_replay_control_transactions_are_disposable_and_equal(
+    isolated_postgres_uri,
+):
+    store = ControlStore(isolated_postgres_uri)
+    source = {
+        "targets": [
+            {
+                "ordinal": 0,
+                "target_id": "fbref:match:control-probe",
+                "logical_refresh_id": "source-refresh-control-probe",
+                "page_kind": "match",
+                "source_ids": {"match_id": "control-probe"},
+                "content_hash": "a" * 64,
+                "parser_version": "generic-v1",
+                "typed_parser_version": "typed-v1",
+                "stateful_parser_version": "stateful-v1",
+                "typed_status": "succeeded",
+                "stateful_status": "skipped",
+                "evidence_class": "full_match",
+            }
+        ],
+        "datasets": [
+            {
+                "target_id": "fbref:match:control-probe",
+                "content_hash": "a" * 64,
+                "parser_version": "typed-v1",
+                "dataset": f"typed:{dataset}",
+                "availability": "available",
+                "parse_status": "succeeded",
+                "persistence_status": "succeeded",
+                "validation_status": "succeeded",
+                "row_count": 1,
+                "empty_reason": None,
+            }
+            for dataset in (
+                "shot_events",
+                "match_events",
+                "lineups",
+                "match_team_stats",
+                "match_managers",
+                "match_officials",
+                "match_keeper_stats",
+                "match_player_stats",
+            )
+        ],
+    }
+
+    def durable_counts():
+        counts = {}
+        with store._transaction() as cursor:
+            for table in (
+                "page_frontier",
+                "run_target",
+                "observation_processing",
+                "dataset_manifest",
+            ):
+                cursor.execute(
+                    f"SELECT count(*) AS rows FROM fbref_control.{table}"
+                )
+                row = cursor.fetchone()
+                counts[table] = int(
+                    row["rows"] if isinstance(row, dict) else row[0]
+                )
+        return counts
+
+    before = durable_counts()
+    sequential_run_id = str(uuid.uuid4())
+    batch_run_id = str(uuid.uuid4())
+    sequential = _isolated_replay_control_evidence(
+        store,
+        replay_run_id=sequential_run_id,
+        source_run_id=str(uuid.uuid4()),
+        mode="sequential",
+        source_evidence=source,
+    )
+    batch = _isolated_replay_control_evidence(
+        store,
+        replay_run_id=batch_run_id,
+        source_run_id=str(uuid.uuid4()),
+        mode="batch",
+        source_evidence=source,
+    )
+
+    def normalized(evidence):
+        targets = [
+            {
+                key: value
+                for key, value in item.items()
+                if key not in {"replay_target_id", "logical_refresh_id"}
+            }
+            for item in evidence["targets"]
+        ]
+        datasets = [
+            {
+                key: value
+                for key, value in item.items()
+                if key != "replay_target_id"
+            }
+            for item in evidence["datasets"]
+        ]
+        return {"targets": targets, "datasets": datasets}
+
+    assert normalized(sequential) == normalized(batch)
+    assert sequential["targets"][0]["replay_target_id"].startswith(
+        f"fbref:acceptance-replay:{sequential_run_id}:"
+    )
+    assert batch["targets"][0]["replay_target_id"].startswith(
+        f"fbref:acceptance-replay:{batch_run_id}:"
+    )
+    assert durable_counts() == before
 
 
 def test_current_matches_are_admitted_before_older_enrichment_backlog():

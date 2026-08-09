@@ -256,6 +256,7 @@ class SnapshotDelta:
 class ControlRunEvidence:
     run_id: str
     evidence_source: str
+    source_run_id: str
     proxy_requests: int
     proxy_bytes: int
     logical_refreshes: int
@@ -1124,7 +1125,7 @@ def _cursor_mapping_rows(cursor: Any) -> list[dict[str, Any]]:
 def _direct_processing_evidence(
     control: Any, evidence_run_id: str
 ) -> Mapping[str, Any] | None:
-    """Read the immutable source observations processed by this replay."""
+    """Read immutable source observations that seed an isolated replay."""
 
     transaction = getattr(control, "_transaction", None)
     if not callable(transaction):
@@ -1139,7 +1140,9 @@ def _direct_processing_evidence(
                        frontier.page_kind, frontier.source_ids,
                        frontier.state AS frontier_state,
                        frontier.last_content_hash,
-                       observed.content_hash,
+                       observed.content_hash, observed.parser_version,
+                       observed.typed_parser_version,
+                       observed.stateful_parser_version,
                        observed.status AS observation_status,
                        observed.generic_status, observed.typed_status,
                        observed.stateful_status, observed.validation_status,
@@ -1171,6 +1174,7 @@ def _direct_processing_evidence(
                        target.logical_refresh_id,
                        observed.content_hash, observed.parser_version,
                        observed.typed_parser_version,
+                       observed.stateful_parser_version,
                        row_number() OVER (
                            PARTITION BY target.logical_refresh_id
                            ORDER BY observed.completed_at DESC NULLS LAST,
@@ -1184,7 +1188,8 @@ def _direct_processing_evidence(
                 WHERE target.run_id = %s::uuid
             )
             SELECT ranked.ordinal, ranked.target_id,
-                   ranked.logical_refresh_id, manifest.dataset,
+                   ranked.logical_refresh_id, ranked.content_hash,
+                   manifest.parser_version, manifest.dataset,
                    manifest.availability, manifest.parse_status,
                    manifest.persistence_status, manifest.validation_status,
                    manifest.row_count,
@@ -1199,7 +1204,8 @@ def _direct_processing_evidence(
               ON manifest.target_id = ranked.target_id
              AND manifest.content_hash = ranked.content_hash
              AND manifest.parser_version IN (
-                 ranked.parser_version, ranked.typed_parser_version
+                 ranked.parser_version, ranked.typed_parser_version,
+                 ranked.stateful_parser_version
              )
             WHERE ranked.observation_rank = 1
             ORDER BY ranked.ordinal, manifest.parser_version,
@@ -1211,8 +1217,404 @@ def _direct_processing_evidence(
     return {"targets": observations, "datasets": datasets}
 
 
+def _isolated_replay_control_evidence(
+    control: Any,
+    *,
+    replay_run_id: str,
+    source_run_id: str,
+    mode: str,
+    source_evidence: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Apply replay completion to disposable PostgreSQL control targets.
+
+    The frozen source rows are inputs only.  Every target, observation and
+    manifest mutation below is confined to ``pg_temp`` and disappears on
+    commit.  Sequential and batch therefore exercise distinct transactional
+    control paths without touching production fences.
+    """
+
+    normalized_mode = str(mode).strip().casefold()
+    if normalized_mode not in {"sequential", "batch"}:
+        raise ValueError("acceptance control replay mode is invalid")
+    source_targets = source_evidence.get("targets")
+    source_datasets = source_evidence.get("datasets")
+    if not isinstance(source_targets, Sequence) or isinstance(
+        source_targets, (str, bytes)
+    ):
+        raise ValueError("source control targets are missing")
+    if not isinstance(source_datasets, Sequence) or isinstance(
+        source_datasets, (str, bytes)
+    ):
+        raise ValueError("source control manifests are missing")
+
+    test_transaction = getattr(
+        control, "replay_control_transaction_evidence", None
+    )
+    if callable(test_transaction):
+        evidence = test_transaction(
+            replay_run_id=str(replay_run_id),
+            source_run_id=str(source_run_id),
+            mode=normalized_mode,
+            targets=source_targets,
+            datasets=source_datasets,
+        )
+        if not isinstance(evidence, Mapping):
+            raise ValueError("isolated replay control evidence is invalid")
+        return evidence
+
+    transaction = getattr(control, "_transaction", None)
+    if not callable(transaction):
+        raise ValueError(
+            "isolated replay control transaction is unavailable"
+        )
+
+    target_payload = []
+    target_defaults: dict[str, dict[str, str]] = {}
+    for position, item in enumerate(source_targets):
+        if not isinstance(item, Mapping):
+            raise ValueError("source control target is invalid")
+        target_id = str(item.get("target_id") or "")
+        content_hash = str(item.get("content_hash") or "")
+        parser_version = str(item.get("parser_version") or "")
+        typed_parser_version = str(
+            item.get("typed_parser_version") or ""
+        )
+        stateful_parser_version = str(
+            item.get("stateful_parser_version") or ""
+        )
+        target_defaults[target_id] = {
+            "content_hash": content_hash,
+            "parser_version": parser_version,
+            "typed_parser_version": typed_parser_version,
+            "stateful_parser_version": stateful_parser_version,
+        }
+        target_payload.append(
+            {
+                "ordinal": int(item.get("ordinal", position)),
+                "target_id": target_id,
+                "logical_refresh_id": str(
+                    item.get("logical_refresh_id") or ""
+                ),
+                "page_kind": str(item.get("page_kind") or ""),
+                "source_ids": (
+                    dict(item.get("source_ids") or {})
+                    if isinstance(item.get("source_ids"), Mapping)
+                    else {}
+                ),
+                "content_hash": content_hash,
+                "parser_version": parser_version,
+                "typed_parser_version": typed_parser_version,
+                "stateful_parser_version": stateful_parser_version,
+                "typed_status": str(item.get("typed_status") or ""),
+                "stateful_status": str(
+                    item.get("stateful_status") or ""
+                ),
+                "evidence_class": (
+                    None
+                    if item.get("evidence_class") is None
+                    else str(item.get("evidence_class"))
+                ),
+            }
+        )
+    dataset_payload = []
+    for item in source_datasets:
+        if not isinstance(item, Mapping):
+            raise ValueError("source control manifest is invalid")
+        target_id = str(item.get("target_id") or "")
+        defaults = target_defaults.get(target_id, {})
+        dataset = str(item.get("dataset") or "")
+        parser_version = str(item.get("parser_version") or "")
+        if not parser_version:
+            parser_version = str(
+                defaults.get(
+                    (
+                        "typed_parser_version"
+                        if dataset.startswith("typed:")
+                        else "stateful_parser_version"
+                        if dataset.startswith("stateful:")
+                        else "parser_version"
+                    ),
+                    "",
+                )
+            )
+        dataset_payload.append(
+            {
+                "target_id": target_id,
+                "content_hash": str(
+                    item.get("content_hash")
+                    or defaults.get("content_hash")
+                    or ""
+                ),
+                "parser_version": parser_version,
+                "dataset": dataset,
+                "availability": str(item.get("availability") or ""),
+                "parse_status": str(item.get("parse_status") or ""),
+                "persistence_status": str(
+                    item.get("persistence_status") or ""
+                ),
+                "validation_status": str(
+                    item.get("validation_status") or ""
+                ),
+                "row_count": int(item.get("row_count") or 0),
+                "empty_reason": (
+                    None
+                    if item.get("empty_reason") is None
+                    else str(item.get("empty_reason"))
+                ),
+            }
+        )
+
+    target_json = json.dumps(
+        target_payload, default=str, sort_keys=True, separators=(",", ":")
+    )
+    dataset_json = json.dumps(
+        dataset_payload, default=str, sort_keys=True, separators=(",", ":")
+    )
+    with transaction() as cursor:
+        cursor.execute(
+            """
+            CREATE TEMP TABLE fbref_acceptance_control_target (
+                ordinal bigint NOT NULL,
+                source_target_id text PRIMARY KEY,
+                replay_target_id text UNIQUE NOT NULL,
+                source_logical_refresh_id text NOT NULL,
+                replay_logical_refresh_id text UNIQUE NOT NULL,
+                page_kind text NOT NULL,
+                source_ids jsonb NOT NULL,
+                content_hash text NOT NULL,
+                parser_version text NOT NULL,
+                typed_parser_version text NOT NULL,
+                stateful_parser_version text NOT NULL,
+                desired_typed_status text NOT NULL,
+                desired_stateful_status text NOT NULL,
+                evidence_class text,
+                target_status text NOT NULL DEFAULT 'pending',
+                frontier_state text NOT NULL DEFAULT 'queued',
+                last_content_hash text
+            ) ON COMMIT DROP
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TEMP TABLE fbref_acceptance_control_observation (
+                replay_logical_refresh_id text PRIMARY KEY,
+                replay_target_id text UNIQUE NOT NULL,
+                content_hash text NOT NULL,
+                parser_version text NOT NULL,
+                typed_parser_version text NOT NULL,
+                stateful_parser_version text NOT NULL,
+                status text NOT NULL DEFAULT 'processing',
+                generic_status text NOT NULL DEFAULT 'pending',
+                typed_status text NOT NULL DEFAULT 'pending',
+                stateful_status text NOT NULL DEFAULT 'pending',
+                validation_status text NOT NULL DEFAULT 'pending'
+            ) ON COMMIT DROP
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TEMP TABLE fbref_acceptance_control_manifest_seed (
+                source_target_id text NOT NULL,
+                content_hash text NOT NULL,
+                parser_version text NOT NULL,
+                dataset text NOT NULL,
+                availability text NOT NULL,
+                parse_status text NOT NULL,
+                persistence_status text NOT NULL,
+                validation_status text NOT NULL,
+                row_count bigint NOT NULL,
+                empty_reason text,
+                PRIMARY KEY (
+                    source_target_id, content_hash, parser_version, dataset
+                )
+            ) ON COMMIT DROP
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TEMP TABLE fbref_acceptance_control_manifest (
+                source_target_id text NOT NULL,
+                replay_target_id text NOT NULL,
+                content_hash text NOT NULL,
+                parser_version text NOT NULL,
+                dataset text NOT NULL,
+                availability text NOT NULL,
+                parse_status text NOT NULL,
+                persistence_status text NOT NULL,
+                validation_status text NOT NULL,
+                row_count bigint NOT NULL,
+                empty_reason text,
+                PRIMARY KEY (
+                    replay_target_id, content_hash, parser_version, dataset
+                )
+            ) ON COMMIT DROP
+            """
+        )
+        cursor.execute(
+            """
+            INSERT INTO pg_temp.fbref_acceptance_control_target (
+                ordinal, source_target_id, replay_target_id,
+                source_logical_refresh_id, replay_logical_refresh_id,
+                page_kind, source_ids, content_hash, parser_version,
+                typed_parser_version, stateful_parser_version,
+                desired_typed_status, desired_stateful_status,
+                evidence_class
+            )
+            SELECT source.ordinal, source.target_id,
+                   'fbref:acceptance-replay:' || %s || ':'
+                       || source.target_id,
+                   source.logical_refresh_id,
+                   %s || ':' || source.logical_refresh_id,
+                   source.page_kind, source.source_ids, source.content_hash,
+                   source.parser_version, source.typed_parser_version,
+                   source.stateful_parser_version, source.typed_status,
+                   source.stateful_status, source.evidence_class
+            FROM jsonb_to_recordset(%s::jsonb) AS source(
+                ordinal bigint, target_id text, logical_refresh_id text,
+                page_kind text, source_ids jsonb, content_hash text,
+                parser_version text, typed_parser_version text,
+                stateful_parser_version text, typed_status text,
+                stateful_status text, evidence_class text
+            )
+            """,
+            (str(replay_run_id), str(replay_run_id), target_json),
+        )
+        cursor.execute(
+            """
+            INSERT INTO pg_temp.fbref_acceptance_control_observation (
+                replay_logical_refresh_id, replay_target_id, content_hash,
+                parser_version, typed_parser_version,
+                stateful_parser_version
+            )
+            SELECT replay_logical_refresh_id, replay_target_id, content_hash,
+                   parser_version, typed_parser_version,
+                   stateful_parser_version
+            FROM pg_temp.fbref_acceptance_control_target
+            """
+        )
+        cursor.execute(
+            """
+            INSERT INTO pg_temp.fbref_acceptance_control_manifest_seed (
+                source_target_id, content_hash, parser_version, dataset,
+                availability, parse_status, persistence_status,
+                validation_status, row_count, empty_reason
+            )
+            SELECT source.target_id, source.content_hash,
+                   source.parser_version, source.dataset,
+                   source.availability, source.parse_status,
+                   source.persistence_status, source.validation_status,
+                   source.row_count, source.empty_reason
+            FROM jsonb_to_recordset(%s::jsonb) AS source(
+                target_id text, content_hash text, parser_version text,
+                dataset text, availability text, parse_status text,
+                persistence_status text, validation_status text,
+                row_count bigint, empty_reason text
+            )
+            """,
+            (dataset_json,),
+        )
+
+        target_ids = [item["target_id"] for item in target_payload]
+        completion_target_ids = (
+            target_ids if normalized_mode == "sequential" else [None]
+        )
+        for target_id in completion_target_ids:
+            target_predicate = (
+                " AND target.source_target_id = %s"
+                if target_id is not None
+                else ""
+            )
+            params = () if target_id is None else (target_id,)
+            cursor.execute(
+                """
+                UPDATE pg_temp.fbref_acceptance_control_observation
+                       AS observation
+                SET status = 'succeeded', generic_status = 'succeeded',
+                    typed_status = target.desired_typed_status,
+                    stateful_status = target.desired_stateful_status,
+                    validation_status = 'succeeded'
+                FROM pg_temp.fbref_acceptance_control_target AS target
+                WHERE observation.replay_target_id = target.replay_target_id
+                """
+                + target_predicate,
+                params,
+            )
+            cursor.execute(
+                """
+                INSERT INTO pg_temp.fbref_acceptance_control_manifest (
+                    source_target_id, replay_target_id, content_hash,
+                    parser_version, dataset, availability, parse_status,
+                    persistence_status, validation_status, row_count,
+                    empty_reason
+                )
+                SELECT seed.source_target_id, target.replay_target_id,
+                       seed.content_hash, seed.parser_version, seed.dataset,
+                       seed.availability, seed.parse_status,
+                       seed.persistence_status, seed.validation_status,
+                       seed.row_count, seed.empty_reason
+                FROM pg_temp.fbref_acceptance_control_manifest_seed AS seed
+                JOIN pg_temp.fbref_acceptance_control_target AS target
+                  ON target.source_target_id = seed.source_target_id
+                WHERE true
+                """
+                + target_predicate,
+                params,
+            )
+            cursor.execute(
+                """
+                UPDATE pg_temp.fbref_acceptance_control_target AS target
+                SET target_status = 'succeeded', frontier_state = 'fetched',
+                    last_content_hash = target.content_hash
+                WHERE true
+                """
+                + target_predicate,
+                params,
+            )
+
+        cursor.execute(
+            """
+            SELECT target.ordinal,
+                   target.source_target_id AS target_id,
+                   target.replay_target_id,
+                   target.replay_logical_refresh_id AS logical_refresh_id,
+                   target.target_status AS status, target.target_status,
+                   target.page_kind, target.source_ids,
+                   target.frontier_state, target.last_content_hash,
+                   target.content_hash, observation.parser_version,
+                   observation.typed_parser_version,
+                   observation.stateful_parser_version,
+                   observation.status AS observation_status,
+                   observation.generic_status, observation.typed_status,
+                   observation.stateful_status,
+                   observation.validation_status, target.evidence_class
+            FROM pg_temp.fbref_acceptance_control_target AS target
+            JOIN pg_temp.fbref_acceptance_control_observation AS observation
+              ON observation.replay_target_id = target.replay_target_id
+            ORDER BY target.ordinal
+            """
+        )
+        replay_targets = _cursor_mapping_rows(cursor)
+        cursor.execute(
+            """
+            SELECT target.ordinal, manifest.source_target_id AS target_id,
+                   manifest.replay_target_id, manifest.content_hash,
+                   manifest.parser_version, manifest.dataset,
+                   manifest.availability, manifest.parse_status,
+                   manifest.persistence_status, manifest.validation_status,
+                   manifest.row_count, manifest.empty_reason
+            FROM pg_temp.fbref_acceptance_control_manifest AS manifest
+            JOIN pg_temp.fbref_acceptance_control_target AS target
+              ON target.replay_target_id = manifest.replay_target_id
+            ORDER BY target.ordinal, manifest.parser_version,
+                     manifest.dataset
+            """
+        )
+        replay_datasets = _cursor_mapping_rows(cursor)
+    return {"targets": replay_targets, "datasets": replay_datasets}
+
+
 def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
-    """Read acceptance state directly from PostgreSQL-backed ControlStore."""
+    """Exercise and read disposable replay control completion state."""
 
     run = control.get_run(run_id)
     summary = control.get_run_summary(run_id)
@@ -1227,13 +1629,31 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
     evidence_run_id = str(
         metadata.get("acceptance_replay_source_run_id") or run_id
     )
-    evidence = _direct_processing_evidence(control, evidence_run_id)
-    evidence_source = "direct_processing_rows"
-    if evidence is None:
-        evidence = control.get_acceptance_run_evidence(run_id)
-        evidence_source = "control_api_fallback"
-    if not isinstance(evidence, Mapping):
-        raise ValueError("direct control evidence is missing")
+    source_evidence = _direct_processing_evidence(control, evidence_run_id)
+    if source_evidence is None:
+        source_evidence = control.get_acceptance_run_evidence(
+            evidence_run_id
+        )
+    if not isinstance(source_evidence, Mapping):
+        raise ValueError("source control evidence is missing")
+    metrics_value = metadata.get("pipeline_run_metrics")
+    replay_mode = str(
+        metadata.get("acceptance_persistence_mode")
+        or (
+            metrics_value.get("mode")
+            if isinstance(metrics_value, Mapping)
+            else ""
+        )
+        or ""
+    ).casefold()
+    evidence = _isolated_replay_control_evidence(
+        control,
+        replay_run_id=str(run_id),
+        source_run_id=evidence_run_id,
+        mode=replay_mode,
+        source_evidence=source_evidence,
+    )
+    evidence_source = "isolated_replay_control_transaction"
     strict = metadata.get("bronze_acceptance_replay")
     strict = strict if isinstance(strict, Mapping) else {}
     strict_gates = strict.get("strict_gates")
@@ -1315,9 +1735,9 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
     targets = evidence.get("targets")
     datasets = evidence.get("datasets")
     if not isinstance(targets, Sequence) or isinstance(targets, (str, bytes)):
-        raise ValueError("direct target evidence is missing")
+        raise ValueError("isolated target evidence is missing")
     if not isinstance(datasets, Sequence) or isinstance(datasets, (str, bytes)):
-        raise ValueError("direct dataset evidence is missing")
+        raise ValueError("isolated dataset evidence is missing")
     refresh_ids = [str(item.get("logical_refresh_id") or "") for item in targets]
     match_keys = []
     for item in targets:
@@ -1347,6 +1767,18 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
         failures.append("logical_refresh_id_missing")
     if len(set(refresh_ids)) != len(refresh_ids):
         failures.append("logical_refresh_id_duplicate")
+    expected_replay_target_prefix = (
+        f"fbref:acceptance-replay:{run_id}:"
+    )
+    if any(
+        not str(item.get("replay_target_id") or "").startswith(
+            expected_replay_target_prefix
+        )
+        or str(item.get("replay_target_id") or "")
+        == str(item.get("target_id") or "")
+        for item in targets
+    ):
+        failures.append("replay_control_target_not_isolated")
     if not match_keys:
         failures.append("match_target_evidence_empty")
     if len(set(match_keys)) != len(match_keys):
@@ -1387,12 +1819,17 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
         if str(target_status or "").casefold() != "succeeded":
             failures.append("target_not_succeeded")
             break
+        if (
+            str(item.get("frontier_state") or "").casefold() != "fetched"
+            or not str(item.get("content_hash") or "")
+            or str(item.get("last_content_hash") or "")
+            != str(item.get("content_hash") or "")
+        ):
+            failures.append("latest_frontier_not_completed")
+            break
     for item in targets:
         observation_status = item.get("observation_status")
-        if (
-            evidence_source == "direct_processing_rows"
-            and observation_status is None
-        ):
+        if observation_status is None:
             failures.append("observation_missing")
             break
         if observation_status is not None and (
@@ -1441,7 +1878,6 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
             break
 
     pipeline_metrics = None
-    metrics_value = metadata.get("pipeline_run_metrics")
     if not isinstance(metrics_value, Mapping):
         failures.append("pipeline_metrics_missing")
     else:
@@ -1453,6 +1889,7 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
             expected_match_sha256 = _stable_sha256(sorted(match_keys))
             if (
                 pipeline_metrics.control_run_id != str(run_id)
+                or pipeline_metrics.mode != replay_mode
                 or pipeline_metrics.match_count != len(match_keys)
                 or pipeline_metrics.match_keys_sha256
                 != expected_match_sha256
@@ -1470,6 +1907,11 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
                 "page_kind": item.get("page_kind"),
                 "source_ids": item.get("source_ids"),
                 "content_hash": item.get("content_hash"),
+                "parser_version": item.get("parser_version"),
+                "typed_parser_version": item.get("typed_parser_version"),
+                "stateful_parser_version": item.get(
+                    "stateful_parser_version"
+                ),
                 "observation_status": item.get("observation_status"),
                 "generic_status": item.get("generic_status"),
                 "typed_status": item.get("typed_status"),
@@ -1486,18 +1928,22 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
                 key: item.get(key)
                 for key in (
                     "target_id",
+                    "content_hash",
+                    "parser_version",
                     "dataset",
                     "availability",
                     "parse_status",
                     "persistence_status",
                     "validation_status",
                     "row_count",
+                    "empty_reason",
                 )
             }
             for item in datasets
         ),
         key=lambda item: (
             str(item.get("target_id") or ""),
+            str(item.get("parser_version") or ""),
             str(item.get("dataset") or ""),
         ),
     )
@@ -1518,6 +1964,7 @@ def _control_run_evidence(control: Any, run_id: str) -> ControlRunEvidence:
     return ControlRunEvidence(
         run_id=str(run_id),
         evidence_source=evidence_source,
+        source_run_id=evidence_run_id,
         proxy_requests=int(run.get("requests_used") or 0),
         proxy_bytes=int(run.get("bytes_used") or 0),
         logical_refreshes=len(refresh_ids),
@@ -1742,6 +2189,10 @@ def _control_evidence_equivalent(
     return (
         sequential.valid
         and batch.valid
+        and sequential.evidence_source
+        == batch.evidence_source
+        == "isolated_replay_control_transaction"
+        and sequential.source_run_id == batch.source_run_id
         and sequential.logical_refreshes == batch.logical_refreshes
         and sequential.dataset_manifests == batch.dataset_manifests
         and sequential.match_targets == batch.match_targets
@@ -1840,7 +2291,7 @@ def evaluate_existing_pipeline_acceptance(
     min_speedup: float = 4.0,
     max_seconds_per_match: float = 20.0,
 ) -> BenchmarkReport:
-    """Verify two already-completed real pipeline replays without writes."""
+    """Verify two real replays with no durable acceptance-side writes."""
 
     if sequential_schema.casefold() == batch_schema.casefold():
         raise ValueError(
