@@ -1,0 +1,68 @@
+# =============================================================================
+# OpenMetadata description: iceberg.silver.espn_match_events
+# =============================================================================
+table:
+  fullyQualifiedName: trino_iceberg.iceberg.silver.espn_match_events
+  description: |
+    Лента значимых событий ESPN: одна строка на (event_id, seq), где seq —
+    JSON-array ordinality. Последняя запись
+    bronze.espn_schedule_generation_v2 выбирается по event_id/_ingested_at до
+    UNNEST competition.details; несыгранные матчи исключены. is_goal требует
+    scoringPlay и NOT shootout, поэтому удары серии не становятся игровыми
+    голами. Clock display может содержать добавленное время (например 90+1),
+    которое разложено на minute и plus_minute. _bronze_ingested_at — lineage,
+    league/season — partition keys.
+  tags:
+    - Tier.Silver
+    - Domain.Football
+    - PII.Low
+columns:
+  - name: event_id
+    description: Сырой ESPN ID матча; часть PK.
+  - name: seq
+    description: Порядковый номер события в competition.details; часть PK.
+  - name: event_type
+    description: Текстовый тип ESPN события.
+  - name: event_type_id
+    description: Числовой ID типа ESPN события.
+  - name: clock_display
+    description: Raw отображение времени ESPN, включая добавленное время.
+  - name: minute
+    description: Основная минута, извлечённая из clock_display.
+  - name: plus_minute
+    description: Добавленные минуты из clock_display; NULL вне added time.
+  - name: team_id
+    description: Сырой ESPN ID команды события.
+  - name: athlete_id
+    description: Сырой ESPN ID основного участника события.
+  - name: player_name
+    description: Отображаемое имя участника события.
+    tags:
+      - PII.Low
+  - name: is_goal
+    description: TRUE для игрового scoringPlay, исключая shootout.
+  - name: is_shootout
+    description: TRUE для удара серии пенальти.
+  - name: score_value
+    description: Значение счёта из ESPN события.
+  - name: is_own_goal
+    description: TRUE для автогола.
+  - name: is_penalty
+    description: Raw penaltyKick flag; он включает shootout rows, поэтому для игрового пенальти потребители комбинируют его с is_shootout.
+  - name: is_yellow_card
+    description: TRUE для жёлтой карточки.
+  - name: is_red_card
+    description: TRUE для красной карточки.
+  - name: _bronze_ingested_at
+    description: Timestamp выбранной последней schedule Bronze-генерации (lineage).
+  - name: league
+    description: Competition slug ESPN; partition key.
+  - name: season
+    description: Source season year как varchar; partition key.
+  - name: _silver_created_at
+    description: Технический timestamp CTAS-раннера при материализации Silver.
+relationships:
+  - from: event_id
+    to: trino_iceberg.iceberg.silver.espn_match.event_id
+    type: FOREIGN_KEY
+    description: N:1 — дочерняя запись относится к одному матчу ESPN.
