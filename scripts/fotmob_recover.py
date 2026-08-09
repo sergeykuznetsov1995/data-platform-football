@@ -10,7 +10,8 @@ the deterministic owner -> ingest -> Silver lineage.
 Two recoveries are intentionally narrow:
 
 * a terminal isolated producer in ``writing``/retained ``failed`` is marked
-  failed with ``safe_to_release=True`` after its scheduler cursor is advanced;
+  failed with ``safe_to_release=True`` while its scheduler cursor remains
+  unchanged, so the same daily/refresh/backfill lane stays due;
 * an exact terminal SofaScore wait against ``ready`` and unclaimed evidence is
   abandoned.
 
@@ -1076,12 +1077,8 @@ def _validate_producer_failure(
         binding=binding,
         producer_failed=True,
     )
-    current = isolated.get("scheduler_state")
-    target = expected_advanced_state(decision, recovered_at=isolated["observed_at"])
-    if current != decision.get("state") and not _state_matches_advanced(
-        current, target
-    ):
-        raise RecoveryError("automatic scheduler cursor changed outside failed lineage")
+    if isolated.get("scheduler_state") != decision.get("state"):
+        raise RecoveryError("failed producer scheduler cursor did not stay unchanged")
     return owner, decision, binding
 
 
@@ -1436,21 +1433,6 @@ def recover_automatic_failure(
         )
         if not _same_control_state(initial_control, current_control):
             raise RecoveryError("ControlStore generation changed during recovery proof")
-        recovered_at = _now()
-        cursor = _advance_scheduler_cursor(
-            args,
-            mutation_context,
-            decision,
-            recovered_at=recovered_at,
-            run=run,
-        )
-        target = expected_advanced_state(decision, recovered_at=recovered_at)
-        if (
-            not isinstance(cursor, Mapping)
-            or cursor.get("schema_version") != CURSOR_TRANSITION_SCHEMA
-            or not _state_matches_advanced(cursor.get("after"), target)
-        ):
-            raise RecoveryError("automatic scheduler cursor did not roll forward")
         transition = _fail_and_release(args, mutation_context, generation_id, run=run)
         readback = _get_control_state(args, mutation_context, generation_id, run=run)
         _validate_release_result(
@@ -1459,6 +1441,20 @@ def recover_automatic_failure(
             generation_id=generation_id,
             binding=binding,
         )
+        post_release_isolated = _observe_isolated(
+            args, mutation_context, generation_id, pause=False, run=run
+        )
+        post_owner, post_decision, _post_binding = _validate_producer_failure(
+            post_release_isolated,
+            readback,
+            generation_id=generation_id,
+            git_sha=str(mutation_context["git_sha"]),
+        )
+        if (
+            post_owner.get("run_id") != owner.get("run_id")
+            or post_decision != decision
+        ):
+            raise RecoveryError("failed producer lineage changed after release")
         shared_pause = _pause_shared_for_rollout(mutation_context, run=run)
         _post_context, post_live = _revalidate_mutation_boundary(
             args, mutation_context, run=run
@@ -1469,7 +1465,7 @@ def recover_automatic_failure(
             "phase": "failed_generation_released",
             "recovery_required": False,
             "isolated_writers_paused": True,
-            "isolated_terminal_proof": second_isolated,
+            "isolated_terminal_proof": post_release_isolated,
             "owner_run_id": owner.get("run_id"),
             "publication_before": initial_control,
             "publication_transition": transition,
@@ -1479,7 +1475,9 @@ def recover_automatic_failure(
             "shared_rollout_pause": shared_pause,
             "rollout_ready": shared_pause["rollout_ready"],
             "roll_forward": {
-                "cursor_transition": cursor,
+                "cursor_transition": None,
+                "scheduler_state_unchanged": dict(decision["state"]),
+                "retry_lane": decision["lane"],
                 "same_generation_reopen_allowed": False,
                 "resume": "new_pristine_automatic_rollout_required",
             },

@@ -226,7 +226,11 @@ def _background_case(lane, *, phase, finalize_state, advance_state):
 
 
 def _install_common(monkeypatch, tmp_path, *, controls, snapshots=None):
-    snapshots = snapshots or [_isolated_snapshot(), _isolated_snapshot()]
+    snapshots = snapshots or [
+        _isolated_snapshot(),
+        _isolated_snapshot(),
+        _isolated_snapshot(),
+    ]
     monkeypatch.setattr(mod, "_deployment_context", lambda _args: _context(tmp_path))
     monkeypatch.setattr(
         mod,
@@ -387,8 +391,27 @@ def test_generated_shared_rollout_pause_is_atomic(tmp_path, monkeypatch):
     assert "with_for_update" in captured["code"]
 
 
-def test_writing_failure_pauses_advances_then_releases_and_proves_readback(
-    tmp_path, monkeypatch
+def _writing_snapshot_for_lane(lane):
+    snapshot = _isolated_snapshot()
+    decision = snapshot["owner_matches"][0]["decision"]
+    decision["lane"] = lane
+    decision["conf"]["mode"] = lane
+    if lane in {"refresh", "backfill"}:
+        decision["state"]["next_background_lane"] = lane
+        snapshot["scheduler_state"]["next_background_lane"] = lane
+    return snapshot
+
+
+@pytest.mark.parametrize(
+    ("lane", "next_tick_at"),
+    (
+        ("daily", datetime(2026, 8, 8, 14, 10, tzinfo=timezone.utc)),
+        ("refresh", datetime(2026, 8, 8, 12, 10, tzinfo=timezone.utc)),
+        ("backfill", datetime(2026, 8, 8, 12, 10, tzinfo=timezone.utc)),
+    ),
+)
+def test_writing_failure_releases_without_advancing_and_same_lane_retries(
+    tmp_path, monkeypatch, lane, next_tick_at
 ):
     released = {
         **_control(phase="failed", status="failed", active=False),
@@ -396,26 +419,22 @@ def test_writing_failure_pauses_advances_then_releases_and_proves_readback(
         "released_at": "2026-08-08T18:01:00+00:00",
         "safe_to_release": True,
     }
+    snapshots = [
+        _writing_snapshot_for_lane(lane),
+        _writing_snapshot_for_lane(lane),
+        _writing_snapshot_for_lane(lane),
+    ]
     _install_common(
         monkeypatch,
         tmp_path,
         controls=[_control(), _control(), released],
+        snapshots=snapshots,
     )
     events = []
     monkeypatch.setattr(
         mod,
         "_advance_scheduler_cursor",
-        lambda *_args, **_kwargs: (
-            events.append("advance")
-            or {
-                "schema_version": mod.CURSOR_TRANSITION_SCHEMA,
-                "before": _selected_state(),
-                "after": mod.expected_advanced_state(
-                    _owner()["decision"], recovered_at="2026-08-08T18:00:00+00:00"
-                ),
-                "idempotent": False,
-            }
-        ),
+        lambda *_args, **_kwargs: pytest.fail("failed work must not move the cursor"),
     )
     monkeypatch.setattr(
         mod,
@@ -425,15 +444,26 @@ def test_writing_failure_pauses_advances_then_releases_and_proves_readback(
 
     report = mod.recover_automatic_failure(_arguments(tmp_path))
 
-    assert events == ["advance", "release"]
+    selected_state = snapshots[0]["owner_matches"][0]["decision"]["state"]
+    next_tick = choose_lane(
+        next_tick_at,
+        FotMobSchedulerState.from_dict(selected_state),
+        False,
+    )
+    assert events == ["release"]
+    assert next_tick.lane is not None
+    assert next_tick.lane.value == lane
     assert report["passed"] is True
     assert report["phase"] == "failed_generation_released"
+    assert report["roll_forward"]["cursor_transition"] is None
+    assert report["roll_forward"]["scheduler_state_unchanged"] == selected_state
+    assert report["roll_forward"]["retry_lane"] == lane
     assert report["roll_forward"]["same_generation_reopen_allowed"] is False
     assert report["isolated_writers_paused"] is True
     assert json.loads(_arguments(tmp_path).output.read_text())["passed"] is True
 
 
-def test_failed_release_retry_is_idempotent_and_still_proves_cursor(
+def test_failed_release_retry_after_lost_response_is_idempotent_and_keeps_cursor(
     tmp_path, monkeypatch
 ):
     released = {
@@ -443,12 +473,12 @@ def test_failed_release_retry_is_idempotent_and_still_proves_cursor(
         "safe_to_release": True,
         "idempotent": True,
     }
-    advanced = mod.expected_advanced_state(
-        _owner()["decision"], recovered_at="2026-08-08T18:00:00+00:00"
-    )
-    snapshots = [_isolated_snapshot(), _isolated_snapshot()]
+    snapshots = [
+        _isolated_snapshot(),
+        _isolated_snapshot(),
+        _isolated_snapshot(),
+    ]
     for snapshot in snapshots:
-        snapshot["scheduler_state"] = dict(advanced)
         snapshot["pause_states_before"] = dict(mod.ALL_PAUSED_STATES)
     _install_common(
         monkeypatch,
@@ -459,12 +489,7 @@ def test_failed_release_retry_is_idempotent_and_still_proves_cursor(
     monkeypatch.setattr(
         mod,
         "_advance_scheduler_cursor",
-        lambda *_args, **_kwargs: {
-            "schema_version": mod.CURSOR_TRANSITION_SCHEMA,
-            "before": advanced,
-            "after": advanced,
-            "idempotent": True,
-        },
+        lambda *_args, **_kwargs: pytest.fail("recovery retry must not move the cursor"),
     )
     monkeypatch.setattr(mod, "_fail_and_release", lambda *_args, **_kwargs: released)
 
@@ -472,6 +497,41 @@ def test_failed_release_retry_is_idempotent_and_still_proves_cursor(
 
     assert report["passed"] is True
     assert report["publication_transition"]["idempotent"] is True
+    assert report["roll_forward"]["cursor_transition"] is None
+    assert report["roll_forward"]["scheduler_state_unchanged"] == _selected_state()
+
+
+def test_writing_release_requires_unchanged_cursor_readback_after_mutation(
+    tmp_path, monkeypatch
+):
+    released = {
+        **_control(phase="failed", status="failed", active=False),
+        "released": True,
+        "released_at": "2026-08-08T18:01:00+00:00",
+        "safe_to_release": True,
+    }
+    after_release = _isolated_snapshot()
+    after_release["pause_states_before"] = dict(mod.ALL_PAUSED_STATES)
+    after_release["scheduler_state"] = mod.expected_advanced_state(
+        _owner()["decision"], recovered_at="2026-08-08T18:00:00+00:00"
+    )
+    _install_common(
+        monkeypatch,
+        tmp_path,
+        controls=[_control(), _control(), released],
+        snapshots=[_isolated_snapshot(), _isolated_snapshot(), after_release],
+    )
+    events = []
+    monkeypatch.setattr(
+        mod,
+        "_fail_and_release",
+        lambda *_args, **_kwargs: events.append("release") or released,
+    )
+
+    with pytest.raises(mod.RecoveryError, match="cursor did not stay unchanged"):
+        mod.recover_automatic_failure(_arguments(tmp_path))
+
+    assert events == ["release"]
 
 
 def test_recovery_rejects_active_isolated_writer_before_cursor_or_release(
