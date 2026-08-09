@@ -951,16 +951,66 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         for item in candidates
         if item.competition.competition_id in catalog.profile_payloads
     }
-    for discovered in service.discover_competitions(
+    discovery_results = service.discover_competitions(
         candidates,
         profile_payloads=candidate_profile_payloads,
-    ):
+    )
+    revalidated_by_id = {
+        discovered.competition.competition_id: discovered.classification
+        for discovered in discovery_results
+    }
+    for discovered in discovery_results:
         operations.append(discovered.operation)
         seasons.extend(discovered.seasons)
         if discovered.selected_bundle is not None and discovered.fetch is not None:
             selected_fetches[discovered.selected_bundle.scope.identity[:2]] = (
                 discovered.fetch
             )
+
+    if revalidated_by_id:
+        classifications = [
+            revalidated_by_id.get(
+                item.competition.competition_id, item
+            )
+            for item in classifications
+        ]
+        all_candidates = [
+            revalidated_by_id.get(
+                item.competition.competition_id, item
+            )
+            for item in all_candidates
+            if revalidated_by_id.get(
+                item.competition.competition_id, item
+            ).decision.value
+            == "included"
+        ]
+        for competition_id in sorted(requested_competition_ids & catalog_ids):
+            revalidated = revalidated_by_id.get(competition_id)
+            if revalidated is None or revalidated.decision.value == "included":
+                continue
+            scope_validation.errors.append(
+                f"requested competition {competition_id} became "
+                f"{revalidated.decision.value} after fresh profile validation: "
+                f"{revalidated.reason}"
+            )
+        if scope_validation.errors and scope_validation not in operations:
+            operations.append(scope_validation)
+
+    if automatic_catalog:
+        evidence_by_id = service.repository.latest_scope_evidence(catalog_ids)
+        missing_evidence = sorted(catalog_ids - set(evidence_by_id))
+        if missing_evidence:
+            scope_validation.errors.append(
+                "automatic catalog IDs lack durable post-discovery profile evidence: "
+                + ",".join(map(str, missing_evidence))
+            )
+            if scope_validation not in operations:
+                operations.append(scope_validation)
+        catalog_decisions_evidence = [
+            _catalog_decision_payload(evidence_by_id[competition_id])
+            for competition_id in catalog_ids_evidence
+            if competition_id in evidence_by_id
+        ]
 
     discovered_identities = {season.identity for season in seasons}
     missing_scopes = sorted(set(explicit_scopes) - discovered_identities)

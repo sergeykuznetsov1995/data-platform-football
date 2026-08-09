@@ -493,6 +493,10 @@ class FotMobIngestService:
         self._cancelled = threading.Event()
         self._next_build_id: Optional[str] = None
         self._catalog_profile_fetches: dict[int, FetchResult] = {}
+        self._catalog_refs: dict[int, CompetitionRef] = {}
+        self._catalog_fingerprints: dict[int, str] = {}
+        self._catalog_conflict_fields: dict[int, tuple[str, ...]] = {}
+        self._catalog_evidence: dict[int, CompetitionScopeEvidence] = {}
         self.repository.ensure_schema()
         # One query up front replaces one per target: incremental planning asks
         # the manifest about every single target it considers.
@@ -989,8 +993,69 @@ class FotMobIngestService:
             retry_after=evidence.next_probe_at,
         )
 
+    def _revalidate_included_profile(
+        self,
+        classification: ScopeClassification,
+        fetch: FetchResult,
+    ) -> tuple[ScopeClassification, list[str]]:
+        """Reclassify a cached inclusion from the root payload used for fan-out.
+
+        First-seen/due profiles were already classified and persisted by
+        ``discover_catalog``.  Cached included evidence is different: season
+        discovery necessarily fetches a newer ``/leagues`` root, so that root
+        must replace the cached policy decision before any child target is
+        scheduled.  Failed validation is persisted through the same bounded
+        probe ladder as catalog-time probing.
+        """
+
+        competition_id = classification.competition.competition_id
+        if classification.decision != ScopeDecision.INCLUDED:
+            return classification, []
+        # Direct/legacy callers may supply a trusted classification without
+        # running catalog discovery on this service.  The stale-evidence risk
+        # exists only for an inclusion loaded into this catalog context.
+        if competition_id not in self._catalog_refs:
+            return classification, []
+        if self._catalog_profile_fetches.get(competition_id) is fetch:
+            return classification, []
+
+        catalog = self._catalog_refs.get(
+            competition_id, classification.competition
+        )
+        catalog_fingerprint = self._catalog_fingerprints.get(
+            competition_id, _catalog_fingerprint(catalog)
+        )
+        previous = self._catalog_evidence.get(competition_id)
+        if previous is None:
+            previous = self.repository.latest_scope_evidence(
+                [competition_id]
+            ).get(competition_id)
+        evidence, revalidated, payload = self._profile_evidence(
+            catalog,
+            catalog_fingerprint=catalog_fingerprint,
+            conflict_fields=self._catalog_conflict_fields.get(
+                competition_id, ()
+            ),
+            previous=previous,
+            fetch=fetch,
+            observed_at=utc_now(),
+        )
+        paths = self._persist_profile_evidence(fetch, evidence)
+        # Scope evidence must be durable before the same payload can authorize
+        # season or transfer fan-out.
+        paths.extend(self.repository.flush())
+        self._catalog_evidence[competition_id] = evidence
+        if payload is not None:
+            self._catalog_profile_fetches[competition_id] = fetch
+        return revalidated, paths
+
     def discover_catalog(self) -> CatalogResult:
         result = OperationResult("competition_catalog", attempted=1)
+        self._catalog_profile_fetches = {}
+        self._catalog_refs = {}
+        self._catalog_fingerprints = {}
+        self._catalog_conflict_fields = {}
+        self._catalog_evidence = {}
         try:
             fetch = self._fetch("allLeagues")
         except Exception as exc:
@@ -1075,6 +1140,15 @@ class FotMobIngestService:
                 )
                 for item in discovery.competitions
             }
+            self._catalog_refs = {
+                item.competition_id: item for item in discovery.competitions
+            }
+            self._catalog_fingerprints = dict(fingerprints)
+            self._catalog_conflict_fields = {
+                competition_id: conflict.fields
+                for competition_id, conflict in conflicts.items()
+            }
+            self._catalog_evidence = dict(latest_evidence)
             due = [
                 item
                 for item in discovery.competitions
@@ -1102,8 +1176,7 @@ class FotMobIngestService:
 
             classifications: list[ScopeClassification] = []
             profile_payloads: dict[int, Mapping[str, Any]] = {}
-            catalog_evidence: dict[int, CompetitionScopeEvidence] = {}
-            self._catalog_profile_fetches = {}
+            catalog_evidence = self._catalog_evidence
             due_ids = {item.competition_id for item in due}
             for competition in discovery.competitions:
                 conflict = conflicts.get(competition.competition_id)
@@ -1133,6 +1206,7 @@ class FotMobIngestService:
                         self._persist_profile_evidence(profile_fetch, evidence)
                     )
                     catalog_evidence[competition.competition_id] = evidence
+                    self._catalog_evidence[competition.competition_id] = evidence
                     if payload is not None:
                         profile_payloads[competition.competition_id] = payload
                         self._catalog_profile_fetches[
@@ -1143,6 +1217,7 @@ class FotMobIngestService:
                         competition, previous
                     )
                     catalog_evidence[competition.competition_id] = previous
+                    self._catalog_evidence[competition.competition_id] = previous
                 else:  # defensive: every missing evidence item is due
                     classification = classify_competition(competition)
                 classifications.append(classification)
@@ -1304,6 +1379,34 @@ class FotMobIngestService:
         except Exception as exc:
             result.errors.append(f"competition {competition.competition_id}: {exc}")
             return CompetitionDiscoveryResult(competition, classification, result)
+        try:
+            classification, evidence_tables = self._revalidate_included_profile(
+                classification, fetch
+            )
+            result.tables.extend(evidence_tables)
+            competition = classification.competition
+        except Exception as exc:
+            failed_classification = ScopeClassification(
+                competition,
+                ScopeDecision.REVIEW_REQUIRED,
+                "fresh profile evidence could not be persisted",
+                "review_profile_evidence_persistence",
+            )
+            result.errors.append(
+                f"competition {competition.competition_id} profile evidence: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return CompetitionDiscoveryResult(
+                competition, failed_classification, result, fetch=fetch
+            )
+        if classification.decision != ScopeDecision.INCLUDED:
+            result.skipped = 1
+            result.metadata["scope_decision"] = classification.decision.value
+            if classification.decision == ScopeDecision.REVIEW_REQUIRED:
+                result.review_required = 1
+            return CompetitionDiscoveryResult(
+                competition, classification, result, fetch=fetch
+            )
         if not fetch.ok:
             if fetch.outcome == FetchOutcome.NOT_AVAILABLE:
                 # Dead catalog entry (#1070): allLeagues keeps advertising the
@@ -1576,16 +1679,18 @@ class FotMobIngestService:
             if isinstance(value, FetchResult):
                 output.append(self.discover_competition(item, prefetched=value))
                 continue
-            operation = OperationResult(
-                "competition_seasons",
-                attempted=1,
-                errors=[
-                    f"competition {item.competition.competition_id}: "
-                    f"{type(value).__name__}: {value}"
-                ],
-                metadata={"competition_id": item.competition.competition_id},
+            failed_fetch = self._failed_profile_fetch(
+                item.competition.competition_id,
+                (
+                    value
+                    if isinstance(value, BaseException)
+                    else RuntimeError("profile fetch returned no result")
+                ),
+                utc_now(),
             )
-            output.append(CompetitionDiscoveryResult(item.competition, item, operation))
+            output.append(
+                self.discover_competition(item, prefetched=failed_fetch)
+            )
         return output
 
     def sync_season(

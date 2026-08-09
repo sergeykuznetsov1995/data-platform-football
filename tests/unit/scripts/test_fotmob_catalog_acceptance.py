@@ -202,6 +202,45 @@ def test_validate_report_requires_successful_structural_male_evidence(
     assert any("included competition 47" in error for error in errors)
 
 
+@pytest.mark.parametrize("source_type", ["league", "friendly"])
+def test_validate_report_rejects_excluded_structural_adult_male_evidence(
+    source_type: str,
+) -> None:
+    report = _report()
+    excluded = report["selection"]["catalog_decisions"][1]
+    excluded.update(
+        {
+            "catalog_name": "Senior Competition",
+            "profile_name": "Club Friendlies" if source_type == "friendly" else "Senior Competition",
+            "source_gender": "male",
+            "source_age_group": "adult",
+            "source_type": source_type,
+        }
+    )
+
+    errors = _errors(report)
+
+    assert any(
+        "excluded competition 88" in error and "adult male" in error
+        for error in errors
+    )
+
+
+def test_validate_report_keeps_structural_adult_male_friendlies_included() -> None:
+    report = _report()
+    included = report["selection"]["catalog_decisions"][0]
+    included.update(
+        {
+            "catalog_name": "Club Friendlies",
+            "profile_name": "Club Friendlies",
+            "source_type": "friendly",
+            "reason": "structurally confirmed adult men's friendly",
+        }
+    )
+
+    assert acceptance.validate_report(report, now=NOW).ok is True
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [

@@ -329,6 +329,103 @@ class TestFotmobNativeRunner:
         assert selection["scope_attempts"][0]["outcome"] == "success"
 
     @pytest.mark.unit
+    def test_automatic_runner_removes_now_female_cached_inclusion_before_fanout(
+        self,
+    ):
+        from scrapers.fotmob.catalog_contract import catalog_contract_from_dict
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService, OperationResult
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _competition_payload,
+        )
+
+        mod = self._module()
+        competition_id = 47
+        all_leagues = {
+            "countries": [
+                {
+                    "leagues": [
+                        {"id": competition_id, "name": "Premier League"}
+                    ]
+                }
+            ]
+        }
+        catalog_url = canonicalize_target("allLeagues").canonical_url
+        profile_url = canonicalize_target(
+            "leagues", {"id": competition_id}
+        ).canonical_url
+        repository = MemoryFotMobRepository()
+        seed_service = FotMobIngestService(
+            transport=StubTransport(
+                {
+                    catalog_url: all_leagues,
+                    profile_url: _competition_payload(
+                        competition_id, "Premier League", gender="male"
+                    ),
+                }
+            ),
+            repository=repository,
+            mode=RunMode.DAILY,
+            budget=TransportBudget(
+                max_requests=100, max_direct_bytes=10_000_000
+            ),
+            run_id="seed-male-evidence",
+        )
+        seed_service.discover_catalog()
+
+        service = FotMobIngestService(
+            transport=StubTransport(
+                {
+                    catalog_url: all_leagues,
+                    profile_url: _competition_payload(
+                        competition_id, "Premier League", gender="female"
+                    ),
+                }
+            ),
+            repository=repository,
+            mode=RunMode.DAILY,
+            budget=TransportBudget(
+                max_requests=100, max_direct_bytes=10_000_000
+            ),
+            run_id="fresh-female-evidence",
+        )
+        service.sync_transfers = MagicMock(
+            return_value=OperationResult(
+                "transfer_events",
+                attempted=1,
+                succeeded=1,
+                counts={"events": 0},
+                metadata={"source_hits": 0},
+            )
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season,transfers",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        contract = catalog_contract_from_dict(
+            report["selection"]["catalog_contract"]
+        )
+        assert rc == 0, report["errors"]
+        assert contract.included_ids == ()
+        assert contract.scopes == ()
+        assert report["selection"]["planned_scopes"] == []
+        assert report["selection"]["catalog_decisions"][0]["decision"] == "excluded"
+        assert report["selection"]["catalog_decisions"][0]["source_gender"] == "female"
+        service.sync_transfers.assert_not_called()
+
+    @pytest.mark.unit
     def test_automatic_deadline_deferral_is_partial_success_with_evidence(self):
         from scrapers.fotmob.transport import canonicalize_target
         from tests.unit.scrapers.test_fotmob_service import _league_payload, _service

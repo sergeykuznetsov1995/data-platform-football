@@ -160,7 +160,7 @@ def _decision_ids(
     }
 
 
-def _has_structural_male_evidence(
+def _has_structural_adult_male_source_evidence(
     decision: Mapping[str, Any], *, classifier_version: str
 ) -> bool:
     gender = str(decision.get("source_gender") or "").strip().casefold()
@@ -168,16 +168,34 @@ def _has_structural_male_evidence(
     source_type = str(decision.get("source_type") or "").strip().casefold()
     content_hash = str(decision.get("profile_content_hash") or "")
     return bool(
-        decision.get("decision") == "included"
-        and decision.get("probe_status") == "success"
+        decision.get("probe_status") == "success"
         and decision.get("classifier_version") == classifier_version
-        and decision.get("policy_rule") == "include_structural_male_adult"
         and gender in _MALE_GENDERS
         and (not age_group or age_group in _ADULT_AGE_GROUPS)
         and source_type in _KNOWN_TYPES
         and _nonempty_string(decision.get("profile_name"))
         and _nonempty_string(decision.get("profile_target_key"))
         and re.fullmatch(r"[0-9a-f]{64}", content_hash)
+        and forbidden_competition_signal(
+            decision.get("catalog_name"),
+            decision.get("profile_name"),
+            decision.get("source_gender"),
+            decision.get("source_age_group"),
+            decision.get("source_type"),
+        )
+        is None
+    )
+
+
+def _has_structural_male_evidence(
+    decision: Mapping[str, Any], *, classifier_version: str
+) -> bool:
+    return bool(
+        decision.get("decision") == "included"
+        and decision.get("policy_rule") == "include_structural_male_adult"
+        and _has_structural_adult_male_source_evidence(
+            decision, classifier_version=classifier_version
+        )
     )
 
 
@@ -665,6 +683,17 @@ def validate_report(
         ):
             errors.append(
                 f"included competition {competition_id} lacks successful structural male evidence"
+            )
+    for decision in decisions:
+        competition_id = int(decision["competition_id"])
+        if (
+            decision.get("decision") == "excluded"
+            and _has_structural_adult_male_source_evidence(
+                decision, classifier_version=classifier_version
+            )
+        ):
+            errors.append(
+                f"excluded competition {competition_id} has structural adult male evidence"
             )
 
     planned = _planned_scopes(

@@ -270,6 +270,116 @@ def test_first_seen_male_profile_is_included_and_reused_for_season_discovery():
     assert repository.commits[-1].target_type == "competition_seasons"
 
 
+def test_fresh_profile_revalidates_cached_male_before_season_fanout():
+    competition_id = 47
+    all_leagues = {
+        "countries": [
+            {"leagues": [{"id": competition_id, "name": "Premier League"}]}
+        ]
+    }
+    catalog_url = canonicalize_target("allLeagues").canonical_url
+    profile_url = canonicalize_target(
+        "leagues", {"id": competition_id}
+    ).canonical_url
+    first_service, _, repository = _service(
+        {
+            catalog_url: all_leagues,
+            profile_url: _competition_payload(
+                competition_id, "Premier League", gender="male"
+            ),
+        }
+    )
+    first_service.discover_catalog()
+
+    second_transport = StubTransport(
+        {
+            catalog_url: all_leagues,
+            profile_url: _competition_payload(
+                competition_id, "Premier League", gender="female"
+            ),
+        }
+    )
+    second_service = FotMobIngestService(
+        transport=second_transport,
+        repository=repository,
+        budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+        run_id="fresh-female-profile",
+    )
+
+    cached = second_service.discover_catalog()
+    discovered = second_service.discover_competitions(cached.classifications)
+    evidence = repository.latest_scope_evidence([competition_id])[competition_id]
+
+    assert cached.classifications[0].decision is ScopeDecision.INCLUDED
+    assert discovered[0].classification.decision is ScopeDecision.EXCLUDED
+    assert discovered[0].classification.policy_rule == "exclude_female"
+    assert discovered[0].seasons == ()
+    assert evidence.decision is ScopeDecision.EXCLUDED
+    assert evidence.source_gender == "female"
+    assert not any(
+        commit.run_id == "fresh-female-profile"
+        and commit.target_type == "competition_seasons"
+        for commit in repository.commits
+    )
+
+
+def test_failed_fresh_revalidation_uses_profile_backoff_before_retry():
+    competition_id = 47
+    all_leagues = {
+        "countries": [
+            {"leagues": [{"id": competition_id, "name": "Premier League"}]}
+        ]
+    }
+    catalog_url = canonicalize_target("allLeagues").canonical_url
+    profile_url = canonicalize_target(
+        "leagues", {"id": competition_id}
+    ).canonical_url
+    first_service, _, repository = _service(
+        {
+            catalog_url: all_leagues,
+            profile_url: _competition_payload(competition_id, "Premier League"),
+        }
+    )
+    first_service.discover_catalog()
+    failed_transport = StubTransport(
+        {
+            catalog_url: all_leagues,
+            profile_url: _failed_profile(
+                competition_id, FetchOutcome.RETRYABLE_FAILURE, 503
+            ),
+        }
+    )
+    failed_service = FotMobIngestService(
+        transport=failed_transport,
+        repository=repository,
+        budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+        run_id="fresh-profile-503",
+    )
+
+    cached = failed_service.discover_catalog()
+    discovered = failed_service.discover_competitions(cached.classifications)
+    pending = repository.latest_scope_evidence([competition_id])[competition_id]
+
+    assert discovered[0].classification.decision is ScopeDecision.PENDING_PROBE
+    assert pending.probe_status is ProbeStatus.PENDING
+    assert pending.probe_attempt_count == 1
+    assert timedelta(minutes=15) <= (
+        pending.next_probe_at - pending.observed_at
+    ) < timedelta(minutes=16)
+
+    before_due_transport = StubTransport({catalog_url: all_leagues})
+    before_due_service = FotMobIngestService(
+        transport=before_due_transport,
+        repository=repository,
+        budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+        run_id="before-fresh-profile-retry",
+    )
+    before_due = before_due_service.discover_catalog()
+
+    assert before_due.classifications[0].decision is ScopeDecision.PENDING_PROBE
+    assert [url for url, _ in before_due_transport.calls] == [catalog_url]
+
+
 def test_first_seen_female_persists_evidence_but_never_creates_seasons_or_matches():
     competition_id = 10557
     all_leagues = {"countries": [{"leagues": [{"id": competition_id, "name": "Premier League"}]}]}
