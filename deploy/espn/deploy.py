@@ -48,6 +48,7 @@ RESULT_VERSION = "espn-release-deploy-result-v1"
 FINGERPRINT_VERSION = "espn-release-deploy-physical-fingerprint-v1"
 
 GUARD_TIMEOUT_SECONDS = 1_800
+GUARD_PROCESS_TIMEOUT_SECONDS = 1_740
 TOTAL_TIMEOUT_SECONDS = 10_800
 HEARTBEAT_INTERVAL_SECONDS = 60
 TERMINATION_GRACE_SECONDS = 10
@@ -59,6 +60,19 @@ GUARD_PHASES = (
     "pre_airflow_init",
     "pre_recreate",
     "post_deploy",
+)
+GUARD_REPORT_KIND = "espn-release-guard-v1"
+GUARD_REPORT_SCHEMA_VERSION = 1
+GUARD_PYTHON_PATH = "/root/.venvs/dpf-test/bin/python"
+GUARD_SCRIPT_RELATIVE_PATH = Path("scripts/espn_release_guard_v1.py")
+GUARD_DOCKER_PATH = "/usr/bin/docker"
+GUARD_POLL_SECONDS = "15"
+GUARD_MAX_WAIT_SECONDS = "1740"
+GUARD_SUCCESS_CHECKS = (
+    "exact_dag_inventory",
+    "all_dags_paused",
+    "zero_active_dagruns",
+    "transaction_read_only",
 )
 FINGERPRINT_CONTAINERS = (
     "espn-airflow-airflow-metadb-1",
@@ -323,8 +337,29 @@ def build_plan(spec: Mapping[str, object]) -> dict[str, object]:
     ):
         raise DeployError("guard_argv must be a non-empty JSON argv array")
     reviewed_guards = _guard_artifacts(spec["guard_artifacts"])
+    guard_script = release_root / GUARD_SCRIPT_RELATIVE_PATH
+    expected_guard_argv = [
+        GUARD_PYTHON_PATH,
+        "-B",
+        str(guard_script),
+        "guard",
+        "--docker-path",
+        GUARD_DOCKER_PATH,
+        "--poll-seconds",
+        GUARD_POLL_SECONDS,
+        "--max-wait-seconds",
+        GUARD_MAX_WAIT_SECONDS,
+    ]
+    if guard_argv != expected_guard_argv:
+        raise DeployError("guard_argv must be the exact versioned release guard argv")
     executable = _executable_identity(guard_argv[0])
     artifact_paths = {item["path"] for item in reviewed_guards}
+    required_guard_artifacts = {str(guard_script), GUARD_DOCKER_PATH}
+    if not required_guard_artifacts.issubset(artifact_paths):
+        raise DeployError(
+            "guard_artifacts must include the required artifact set: "
+            "versioned guard script and Docker executable"
+        )
     if not any(value in artifact_paths for value in guard_argv[1:]):
         raise DeployError("guard argv must directly name at least one hashed artifact")
     for value in guard_argv[1:]:
@@ -1814,6 +1849,57 @@ def _validate_owned_regular_hash(path: Path, digest: object, *, label: str) -> N
         raise DeployError(f"{label} ownership/mode/content drifted")
 
 
+def _validate_guard_success_report(
+    plan: Mapping[str, object],
+    *,
+    phase: str,
+    attempt: int,
+    log_path: Path,
+    log_sha256: object,
+) -> None:
+    """Accept only the exact canonical, plan-bound v1 success envelope."""
+
+    _validate_owned_regular_hash(log_path, log_sha256, label="guard success report")
+    payload = log_path.read_bytes()
+    try:
+        report = json.loads(payload)
+        canonical = canonical_bytes(report)
+    except (UnicodeDecodeError, json.JSONDecodeError, DeployError) as exc:
+        raise DeployError("guard success report is not canonical JSON") from exc
+    expected_fields = {
+        "kind",
+        "schema_version",
+        "status",
+        "phase",
+        "attempt",
+        "transition_id",
+        "plan_sha256",
+        "checks",
+    }
+    if (
+        not isinstance(report, dict)
+        or set(report) != expected_fields
+        or payload != canonical
+        or report.get("kind") != GUARD_REPORT_KIND
+        or type(report.get("schema_version")) is not int
+        or report.get("schema_version") != GUARD_REPORT_SCHEMA_VERSION
+        or report.get("status") != "ok"
+        or report.get("phase") != phase
+        or type(report.get("attempt")) is not int
+        or report.get("attempt") != attempt
+        or report.get("transition_id") != plan.get("transition_id")
+        or report.get("plan_sha256") != plan.get("plan_sha256")
+    ):
+        raise DeployError("guard success report identity or status drifted")
+    checks = report.get("checks")
+    if (
+        not isinstance(checks, dict)
+        or set(checks) != set(GUARD_SUCCESS_CHECKS)
+        or any(checks[name] is not True for name in GUARD_SUCCESS_CHECKS)
+    ):
+        raise DeployError("guard success report checks did not all pass")
+
+
 def _validate_physical_fingerprint_evidence(
     plan: Mapping[str, object], guards: Mapping[str, object]
 ) -> None:
@@ -1954,8 +2040,15 @@ def _run_guard_phase(context: ExecutionContext, phase: str) -> None:
             guard["argv"],
             operation=f"{phase} quiescence guard",
             log_path=log_path,
-            timeout_seconds=remaining,
+            timeout_seconds=min(remaining, GUARD_PROCESS_TIMEOUT_SECONDS),
             env=environment,
+        )
+        _validate_guard_success_report(
+            context.plan,
+            phase=phase,
+            attempt=attempt,
+            log_path=log_path,
+            log_sha256=result.log_sha256,
         )
         terminal_fingerprint = _capture_physical_fingerprint(
             context,

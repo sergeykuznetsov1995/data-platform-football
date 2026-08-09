@@ -2,6 +2,7 @@ from pathlib import Path
 
 
 RUNBOOK = Path("docs/operations/espn-native-v2.md")
+RELEASE_GUARD = Path("scripts/espn_release_guard_v1.py")
 
 
 def test_runbook_covers_every_operator_path_and_retention_boundary():
@@ -158,6 +159,25 @@ def test_runbook_documents_six_guard_attempts_and_probe_contract():
     assert "entry DAG `dag_ingest_espn`" not in canary
 
 
+def test_runbook_binds_the_packaged_readonly_guard_and_docker_artifacts():
+    text = RUNBOOK.read_text(encoding="utf-8")
+    source = RELEASE_GUARD.read_text(encoding="utf-8")
+
+    assert RELEASE_GUARD.is_file()
+    assert "scripts/espn_release_guard_v1.py" in text
+    assert "espn-release-guard-<sha>.py" not in text
+    assert 'export ESPN_DOCKER="/usr/bin/docker"' in text
+    assert '\\"--poll-seconds\\",\\"15\\",\\"--max-wait-seconds\\",\\"1740\\"' in text
+    assert '--guard-artifact "$ESPN_RELEASE_GUARD"' in text
+    assert '--guard-artifact "$ESPN_DOCKER"' in text
+    assert "ESPN_DEPLOY_GUARD_PHASE" in source
+    assert "ESPN_DEPLOY_GUARD_ATTEMPT" in source
+    assert "ESPN_DEPLOY_TRANSITION_ID" in source
+    assert "ESPN_DEPLOY_PLAN_SHA256" in source
+    assert "BEGIN TRANSACTION READ ONLY" in source
+    assert "MAX_WAIT_SECONDS = 1_740" in source
+
+
 def test_runbook_has_exact_crash_recoverable_shared_canary_cli_commands():
     text = RUNBOOK.read_text(encoding="utf-8")
 
@@ -166,8 +186,8 @@ def test_runbook_has_exact_crash_recoverable_shared_canary_cli_commands():
         "-m scripts.espn_canary_campaign claim",
         "-m scripts.espn_canary_campaign finish",
         "-m scripts.espn_canary_campaign recover",
-        "--target-scopes \"$ESPN_CANARY_TARGETS\"",
-        "--ledger-path \"$ESPN_CANARY_LEDGER\"",
+        '--target-scopes "$ESPN_CANARY_TARGETS"',
+        '--ledger-path "$ESPN_CANARY_LEDGER"',
         "--successful",
         "--failed",
         "--predecessor-failure-uri",

@@ -59,7 +59,8 @@ export ESPN_POSTGRES_IMAGE='registry/postgres@sha256:<64hex>'
 export ESPN_STACK_LOCK_ROOT='/durable/espn/deploy-stack-lock'
 export ESPN_DEPLOY_STATE='/durable/espn/deploy/<transition-id>'
 export ESPN_BACKUP_ROOT='/durable/espn/backups'
-export ESPN_RELEASE_GUARD='/absolute/immutable/espn-release-guard-<sha>.py'
+export ESPN_RELEASE_GUARD="$ESPN_RELEASE_ROOT/scripts/espn_release_guard_v1.py"
+export ESPN_DOCKER="/usr/bin/docker"
 export AIRFLOW_UID="${AIRFLOW_UID:-50000}"
 export ESPN_CANARY_STATE_ROOT=/durable/espn/canary-state
 
@@ -72,10 +73,21 @@ install -d -o root -g 0 -m 0770 "$ESPN_CANARY_STATE_ROOT"
   --output "$ESPN_DAGBAG_ROOT"
 ```
 
-Guard должен быть отдельным reviewed strict-read-only release guard. Его argv
-не исполняется shell-ом, а все участвующие файлы перечисляются повторяемым
-`--guard-artifact`. Пример JSON argv нужно заменить exact CLI запакованного
-guard; нельзя подставлять mutable wrapper.
+Запакованный `scripts/espn_release_guard_v1.py` — единственный reviewed
+strict-read-only release guard. Он валидирует injected phase/attempt/transition/
+plan identity, вызывает exact reviewed `/usr/bin/docker` без shell и внутри
+digest-pinned metadata container выполняет только explicit read-only PostgreSQL
+transaction. Green требует exact seven active metadata DAG IDs, все семь paused
+(включая fail-closed обработку SQL `NULL`), отсутствие любого другого metadata
+DAG и zero isolated `queued|running` DagRuns. Guard печатает только canonical
+secret-safe JSON и весь polling/query budget bounded до 1,740 секунд, то есть
+завершается раньше 1,800-секундного outer phase timeout. Deploy принимает exit
+status 0 только вместе с единственным canonical report, где совпадают
+phase/attempt/transition/plan identity и все четыре checks равны `true`. Его
+exact argv не исполняется shell-ом; script и host Docker binary отдельно
+перечисляются повторяемым `--guard-artifact`, поэтому plan и каждый spawn
+повторно связывают обоих SHA-256. Mutable wrapper или полный rollout probe здесь
+запрещены.
 
 ### 1. Построить и проверить plan
 
@@ -101,13 +113,14 @@ canonical JSON stdout. Перенаправление stdout в новый фа�
   --postgres-image "$ESPN_POSTGRES_IMAGE" \
   --layout-mode legacy14 \
   --guard-argv-json \
-    '["/root/.venvs/dpf-test/bin/python","/absolute/immutable/espn-release-guard-<sha>.py","guard","--poll-seconds","15"]' \
+    "[\"/root/.venvs/dpf-test/bin/python\",\"-B\",\"${ESPN_RELEASE_GUARD}\",\"guard\",\"--docker-path\",\"${ESPN_DOCKER}\",\"--poll-seconds\",\"15\",\"--max-wait-seconds\",\"1740\"]" \
   --guard-artifact "$ESPN_RELEASE_GUARD" \
+  --guard-artifact "$ESPN_DOCKER" \
   > /durable/espn/review/issue-1148-release-plan.json
 ```
 
 Peer review сверяет `mutates=false`, все absolute paths, exact image digests,
-release/DagBag/Compose/guard/operator hashes, layout, commands, backup target,
+release/DagBag/Compose/guard/Docker/operator hashes, layout, commands, backup target,
 шесть phases и canonical `plan_sha256`. `release_commit` сверяется с внешней
 immutable packaging attestation для того же release root/tree; одно лишь
 40-hex значение не считается provenance proof. Plan должен воспроизводиться

@@ -41,8 +41,30 @@ def _spec(tmp_path: Path) -> dict[str, object]:
     _release_tree(release_root)
     dagbag_root.mkdir()
     (dagbag_root / ".airflowignore").write_text("ignored\n", encoding="utf-8")
-    guard = tmp_path / "guard.py"
-    guard.write_text("raise SystemExit(0)\n", encoding="utf-8")
+    guard = release_root / "scripts/espn_release_guard_v1.py"
+    guard.write_text(
+        """import json
+import os
+
+report = {
+    "kind": "espn-release-guard-v1",
+    "schema_version": 1,
+    "status": "ok",
+    "phase": os.environ["ESPN_DEPLOY_GUARD_PHASE"],
+    "attempt": int(os.environ["ESPN_DEPLOY_GUARD_ATTEMPT"]),
+    "transition_id": os.environ["ESPN_DEPLOY_TRANSITION_ID"],
+    "plan_sha256": os.environ["ESPN_DEPLOY_PLAN_SHA256"],
+    "checks": {
+        "exact_dag_inventory": True,
+        "all_dags_paused": True,
+        "zero_active_dagruns": True,
+        "transaction_read_only": True,
+    },
+}
+print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+""",
+        encoding="utf-8",
+    )
     compose = release_root / "deploy/espn/airflow.compose.yaml"
     compose.parent.mkdir(parents=True)
     compose.write_text("services: {}\n", encoding="utf-8")
@@ -63,8 +85,39 @@ def _spec(tmp_path: Path) -> dict[str, object]:
         "airflow_image": "registry.example/espn/airflow@sha256:" + "b" * 64,
         "postgres_image": "registry.example/espn/postgres@sha256:" + "c" * 64,
         "layout_mode": "legacy14",
-        "guard_argv": [sys.executable, str(guard)],
-        "guard_artifacts": [str(guard)],
+        "guard_argv": [
+            sys.executable,
+            "-B",
+            str(guard),
+            "guard",
+            "--docker-path",
+            "/usr/bin/docker",
+            "--poll-seconds",
+            "15",
+            "--max-wait-seconds",
+            "1740",
+        ],
+        "guard_artifacts": [str(guard), "/usr/bin/docker"],
+    }
+
+
+def _guard_report(
+    plan: dict[str, object], *, phase: str, attempt: int
+) -> dict[str, object]:
+    return {
+        "kind": "espn-release-guard-v1",
+        "schema_version": 1,
+        "status": "ok",
+        "phase": phase,
+        "attempt": attempt,
+        "transition_id": plan["transition_id"],
+        "plan_sha256": plan["plan_sha256"],
+        "checks": {
+            "exact_dag_inventory": True,
+            "all_dags_paused": True,
+            "zero_active_dagruns": True,
+            "transaction_read_only": True,
+        },
     }
 
 
@@ -158,9 +211,9 @@ def test_plan_cli_seals_the_current_operator_and_guard_executable(
         str(spec["layout_mode"]),
         "--guard-argv-json",
         json.dumps(spec["guard_argv"]),
-        "--guard-artifact",
-        str(spec["guard_artifacts"][0]),
     ]
+    for artifact in spec["guard_artifacts"]:
+        argv.extend(("--guard-artifact", str(artifact)))
 
     assert deploy.main(argv) == 0
     plan = json.loads(capsys.readouterr().out)
@@ -169,6 +222,163 @@ def test_plan_cli_seals_the_current_operator_and_guard_executable(
     assert plan["operator_sha256"] == hashlib.sha256(SCRIPT.read_bytes()).hexdigest()
     assert plan["guard"]["executable"]["path"] == sys.executable
     assert plan["guard"]["artifacts"][0]["path"] == spec["guard_artifacts"][0]
+
+
+def test_release_plan_seals_the_exact_versioned_guard_and_docker_bytes(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    guard_path = (ROOT / "scripts/espn_release_guard_v1.py").resolve()
+    docker_path = Path("/usr/bin/docker")
+    spec["release_root"] = str(ROOT)
+    spec["release_tree_sha256"] = deploy.release_tree_sha256(ROOT)
+    guard_argv = [
+        sys.executable,
+        "-B",
+        str(guard_path),
+        "guard",
+        "--docker-path",
+        str(docker_path),
+        "--poll-seconds",
+        "15",
+        "--max-wait-seconds",
+        "1740",
+    ]
+    spec["guard_argv"] = guard_argv
+    spec["guard_artifacts"] = [str(guard_path), str(docker_path)]
+
+    plan = deploy.build_plan(spec)
+
+    assert plan["guard"]["argv"] == guard_argv
+    assert plan["guard"]["artifacts"] == [
+        {
+            "path": str(guard_path),
+            "sha256": hashlib.sha256(guard_path.read_bytes()).hexdigest(),
+        },
+        {
+            "path": str(docker_path),
+            "sha256": hashlib.sha256(docker_path.read_bytes()).hexdigest(),
+        },
+    ]
+    assert plan["guard"]["executable"]["path"] == sys.executable
+
+
+@pytest.mark.parametrize(
+    ("index", "replacement"),
+    [
+        (1, "-I"),
+        (2, "/absolute/other/guard.py"),
+        (3, "observe"),
+        (5, "/usr/local/bin/docker"),
+        (7, "30"),
+        (9, "1710"),
+    ],
+)
+def test_plan_rejects_any_nonversioned_guard_argv(
+    tmp_path: Path, index: int, replacement: str
+) -> None:
+    spec = _spec(tmp_path)
+    argv = list(spec["guard_argv"])
+    argv[index] = replacement
+    spec["guard_argv"] = argv
+
+    with pytest.raises(deploy.DeployError, match="versioned release guard argv"):
+        deploy.build_plan(spec)
+
+
+def test_plan_requires_guard_script_and_docker_in_hashed_artifacts(
+    tmp_path: Path,
+) -> None:
+    spec = _spec(tmp_path)
+    spec["guard_artifacts"] = [str(spec["guard_artifacts"][0])]
+
+    with pytest.raises(deploy.DeployError, match="required artifact set"):
+        deploy.build_plan(spec)
+
+
+def test_guard_success_report_is_canonical_exact_and_plan_bound(tmp_path: Path) -> None:
+    plan = deploy.build_plan(_spec(tmp_path))
+    log_path = tmp_path / "guard.log"
+    payload = deploy.canonical_bytes(
+        _guard_report(plan, phase="initial_state", attempt=1)
+    )
+    deploy._exclusive_regular_write(log_path, payload)
+    digest = hashlib.sha256(payload).hexdigest()
+
+    deploy._validate_guard_success_report(
+        plan,
+        phase="initial_state",
+        attempt=1,
+        log_path=log_path,
+        log_sha256=digest,
+    )
+
+    invalid_reports = [
+        b"",
+        json.dumps(
+            _guard_report(plan, phase="initial_state", attempt=1), indent=2
+        ).encode(),
+    ]
+    for mutation in (
+        {"status": "failed"},
+        {"phase": "pre_backup"},
+        {"attempt": 2},
+        {"transition_id": "other-transition"},
+        {"plan_sha256": "f" * 64},
+        {
+            "checks": {
+                **_guard_report(plan, phase="initial_state", attempt=1)["checks"],
+                "all_dags_paused": False,
+            }
+        },
+        {"extra": True},
+    ):
+        report = _guard_report(plan, phase="initial_state", attempt=1)
+        report.update(mutation)
+        invalid_reports.append(deploy.canonical_bytes(report))
+
+    for index, invalid in enumerate(invalid_reports):
+        invalid_path = tmp_path / f"invalid-guard-{index}.log"
+        deploy._exclusive_regular_write(invalid_path, invalid)
+        with pytest.raises(deploy.DeployError, match="guard success report"):
+            deploy._validate_guard_success_report(
+                plan,
+                phase="initial_state",
+                attempt=1,
+                log_path=invalid_path,
+                log_sha256=hashlib.sha256(invalid).hexdigest(),
+            )
+
+
+def test_exit_zero_without_canonical_guard_report_is_journaled_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = deploy.build_plan(_spec(tmp_path))
+    context = deploy._load_or_initialize_context(
+        plan, "apply", clock=deploy.time.time, sleeper=lambda _seconds: None
+    )
+    monkeypatch.setattr(
+        deploy,
+        "_capture_physical_fingerprint",
+        lambda *_args, **_kwargs: {
+            "fingerprint_sha256": "d" * 64,
+            "evidence_path": "/durable/mock-fingerprint.json",
+        },
+    )
+
+    def fake_noop(_context, _argv, *, log_path, **_kwargs):
+        deploy._exclusive_regular_write(log_path, b"")
+        return deploy.ProcessResult(0, 0.1, hashlib.sha256(b"").hexdigest())
+
+    monkeypatch.setattr(deploy, "_run_process", fake_noop)
+
+    with pytest.raises(deploy.DeployError, match="guard success report"):
+        deploy._run_guard_phase(context, "initial_state")
+
+    assert [event["status"] for event in context.guards["events"]] == [
+        "started",
+        "failed",
+    ]
 
 
 def test_apply_and_resume_load_only_the_exact_canonical_plan(tmp_path: Path) -> None:
@@ -896,6 +1106,7 @@ def test_guard_process_contract_has_real_group_timeout_and_no_pipe_boundary() ->
     assert "stderr=subprocess.PIPE" not in source
     assert "shell=True" not in source
     assert deploy.GUARD_TIMEOUT_SECONDS == 1800
+    assert deploy.GUARD_PROCESS_TIMEOUT_SECONDS == 1740
     assert deploy.TOTAL_TIMEOUT_SECONDS == 10800
     assert 0 < deploy.HEARTBEAT_INTERVAL_SECONDS <= 60
     assert deploy.GUARD_PHASES == (
@@ -1113,11 +1324,22 @@ def test_postdeploy_fingerprint_failure_is_journaled_failed_before_resume_skip(
             "evidence_path": "/durable/mock-fingerprint.json",
         },
     )
-    monkeypatch.setattr(
-        deploy,
-        "_run_process",
-        lambda *_args, **_kwargs: deploy.ProcessResult(0, 1, "f" * 64),
-    )
+
+    observed_timeouts: list[float] = []
+
+    def successful_guard(_context, _argv, *, log_path, env, timeout_seconds, **_kwargs):
+        observed_timeouts.append(timeout_seconds)
+        payload = deploy.canonical_bytes(
+            _guard_report(
+                plan,
+                phase=env["ESPN_DEPLOY_GUARD_PHASE"],
+                attempt=int(env["ESPN_DEPLOY_GUARD_ATTEMPT"]),
+            )
+        )
+        deploy._exclusive_regular_write(log_path, payload)
+        return deploy.ProcessResult(0, 1, hashlib.sha256(payload).hexdigest())
+
+    monkeypatch.setattr(deploy, "_run_process", successful_guard)
 
     def reject_postdeploy(_plan, _fingerprint):
         raise deploy.DeployError("post-deploy bind drifted")
@@ -1133,6 +1355,7 @@ def test_postdeploy_fingerprint_failure_is_journaled_failed_before_resume_skip(
         if event["phase"] == "post_deploy"
     ]
     assert statuses == ["started", "failed"]
+    assert observed_timeouts == [deploy.GUARD_PROCESS_TIMEOUT_SECONDS]
     assert deploy.guard_phase_succeeded(context.guards, "post_deploy") is False
     assert deploy.next_guard_attempt(context.guards, "post_deploy") == 2
 
