@@ -1401,6 +1401,7 @@ def test_session_transport_failures_are_classified_not_unclassified():
         "warm_session_rate_limit",
         "warm_session_forbidden",
         "warm_session_cloudflare",
+        "LiveWavesExternalInterruption",
     ):
         assert error_class in classified[0]
 

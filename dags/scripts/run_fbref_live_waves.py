@@ -16,6 +16,7 @@ import os
 import signal
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -67,6 +68,42 @@ def _install_sigterm_unwind_handler() -> tuple[dict, object]:
             "FBref live runner must execute in the main thread"
         ) from exc
     return state, previous
+
+
+@contextmanager
+def _defer_sigterm_during_finalization():
+    """Latch TERM until provider, tail, and control ownership are closed."""
+
+    previous = signal.getsignal(signal.SIGTERM)
+    pending_signals: list[int] = []
+
+    def latch(signum, _frame) -> None:
+        pending_signals.append(int(signum))
+
+    try:
+        signal.signal(signal.SIGTERM, latch)
+    except ValueError:
+        # Only the main thread can own Python signal handlers. Alternate
+        # in-process callers retain their surrounding interruption policy.
+        yield
+        return
+
+    failed = False
+    try:
+        yield
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        if pending_signals and not failed:
+            signum = pending_signals[-1]
+            if previous is signal.SIG_IGN:
+                return
+            if previous is signal.SIG_DFL:
+                os.kill(os.getpid(), signum)
+            else:
+                previous(signum, None)
 
 
 def _set_parent_death_signal(signum: int) -> None:
@@ -343,6 +380,7 @@ def _run(args: argparse.Namespace) -> int:
         int(meter["daily_remaining_bytes"]),
     )
     pipeline = FBrefPipeline.from_env()
+    pipeline.finalization_guard = _defer_sigterm_during_finalization
     pipeline.fetcher_factory = (
         lambda _proxy_file, max_browser_requests, max_browser_bytes: FBrefFetcher(
             max_browser_requests=max_browser_requests,

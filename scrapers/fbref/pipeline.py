@@ -14,7 +14,7 @@ import logging
 import os
 import time
 import uuid
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Mapping, Optional, Sequence
@@ -661,6 +661,7 @@ class _LiveFetchSession:
     tail_settlement: Optional[dict] = None
     tail_reserved: bool = False
     page_budget_latched: bool = False
+    finalization_guard: Callable[[], object] = nullcontext
 
     def clearance_reservation(self, settings) -> tuple[int, int]:
         return (
@@ -753,6 +754,10 @@ class _LiveFetchSession:
         return True
 
     def finalize(self, control, *, status: str) -> None:
+        with self.finalization_guard():
+            self._finalize(control, status=status)
+
+    def _finalize(self, control, *, status: str) -> None:
         if not self.persistent_enabled:
             try:
                 self.stack.close()
@@ -839,9 +844,13 @@ class _LiveFetchSession:
         self.needs_clearance = True
 
     def close(self, control, *, status: str) -> None:
+        with self.finalization_guard():
+            self._close(control, status=status)
+
+    def _close(self, control, *, status: str) -> None:
         finalize_error = None
         try:
-            self.finalize(control, status=status)
+            self._finalize(control, status=status)
         except Exception as exc:  # noqa: BLE001 - release only after closure
             finalize_error = exc
         releasable = self.state == "control_closed" or (
@@ -1757,6 +1766,7 @@ class FBrefPipeline:
         fetcher_factory: Optional[Callable[..., object]] = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], datetime] = _utcnow,
+        finalization_guard: Callable[[], object] = nullcontext,
     ) -> None:
         self.control = control
         self.raw_store = raw_store
@@ -1771,6 +1781,7 @@ class FBrefPipeline:
         )
         self.sleep = sleep
         self.clock = clock
+        self.finalization_guard = finalization_guard
         # Instance fields make the default-off rollout and bounded cohort
         # policy directly inspectable and overridable in deterministic tests.
         self.batch_persist_enabled = FBREF_BATCH_PERSIST
@@ -2549,7 +2560,8 @@ class FBrefPipeline:
             )
         owns_session = _live_session is None
         live_session = _live_session or _LiveFetchSession(
-            persistent_enabled=settings.persistent_http_session
+            persistent_enabled=settings.persistent_http_session,
+            finalization_guard=self.finalization_guard,
         )
         if live_session.persistent_enabled != settings.persistent_http_session:
             raise PipelineError("Live session persistent profile changed mid-run")
@@ -3316,7 +3328,8 @@ class FBrefPipeline:
 
         aggregate = LiveRunResult()
         live_session = _LiveFetchSession(
-            persistent_enabled=settings.persistent_http_session
+            persistent_enabled=settings.persistent_http_session,
+            finalization_guard=self.finalization_guard,
         )
         failed = True
         try:

@@ -145,6 +145,9 @@ def test_bootstrap_control_run_is_allowed_through_live_transport(
     assert runner._run(args) == 0
     pipeline.fetcher_factory(None, 4096, 2048 * 1024 * 1024)
 
+    assert pipeline.finalization_guard is (
+        runner._defer_sigterm_during_finalization
+    )
     assert fetcher_kwargs["provider_context"]["dag_id"] == (
         "dag_bootstrap_fbref"
     )
@@ -465,6 +468,107 @@ runner.main([
     assert process.returncode == 128 + signal.SIGTERM, stderr
     assert journal.read_text(encoding="utf-8").splitlines() == [
         "strict_close",
+        "tail_settle",
+        "control_close",
+        "watchdog_disarm",
+    ]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux signals")
+def test_first_sigterm_during_existing_finalizer_is_deferred(tmp_path):
+    journal = tmp_path / "existing-finalizer.log"
+    code = r'''
+import os
+import signal
+import sys
+import time
+from types import SimpleNamespace
+
+from dags.scripts import run_fbref_live_waves as runner
+from scrapers.fbref.pipeline import _LiveFetchSession
+
+journal = sys.argv[1]
+
+def record(value):
+    with open(journal, "a", encoding="utf-8") as stream:
+        stream.write(value + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+class Fetcher:
+    def finalize_metered_session(self):
+        record("provider_close_started")
+        print("FINALIZING", flush=True)
+        time.sleep(0.3)
+        record("strict_close_finished")
+        return SimpleNamespace(session_id="session")
+
+class Control:
+    def settle_clearance_session_tail(self, session_id, receipt):
+        assert session_id == receipt.session_id == "session"
+        record("tail_settle")
+        return {"terminal": False}
+
+    def close_clearance_session(self, session_id, *, status):
+        assert session_id == "session"
+        assert status == "closed"
+        record("control_close")
+
+class Watchdog:
+    def disarm(self):
+        record("watchdog_disarm")
+
+runner._arm_parent_death_containment = lambda _pid: None
+runner._ProcessGroupWatchdog.start = classmethod(lambda _cls: Watchdog())
+
+def run(_args):
+    live = _LiveFetchSession(
+        fetcher=Fetcher(),
+        session_id="session",
+        persistent_enabled=True,
+        state="active",
+        tail_reserved=True,
+        finalization_guard=runner._defer_sigterm_during_finalization,
+    )
+    live.close(Control(), status="closed")
+    raise AssertionError("deferred SIGTERM was not replayed")
+
+runner._run = run
+runner.main([
+    "--control-run-id", "control-run",
+    "--parent-pid", str(os.getppid()),
+    "--worker-id", "live",
+    "--page-kinds", "match",
+    "--run-type", "current",
+    "--request-limit", "100",
+    "--byte-limit-mb", "50",
+    "--shard-size", "25",
+    "--reservation-mb", "3",
+    "--domain-interval-seconds", "3",
+])
+'''
+    process = subprocess.Popen(
+        [sys.executable, "-c", code, str(journal)],
+        cwd=os.getcwd(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    assert process.stdout is not None
+    assert process.stdout.readline().strip() == "FINALIZING"
+    try:
+        os.kill(process.pid, signal.SIGTERM)
+        _, stderr = process.communicate(timeout=10)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
+
+    assert process.returncode == 128 + signal.SIGTERM, stderr
+    assert journal.read_text(encoding="utf-8").splitlines() == [
+        "provider_close_started",
+        "strict_close_finished",
         "tail_settle",
         "control_close",
         "watchdog_disarm",

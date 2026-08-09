@@ -6270,6 +6270,7 @@ class ControlStore:
                 "LiveWavesSubprocessTimeout",
                 "LiveWavesSubprocessFailure",
                 "LiveWavesResultMissing",
+                "LiveWavesExternalInterruption",
             ]
             cursor.execute(
                 """
