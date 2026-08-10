@@ -72,7 +72,10 @@ from .transport_contracts import (
 
 RUNTIME_VERSION = "espn-native-runtime-v4"
 LEGACY_PARSER_VERSION = "espn-native-parser-v2"
-LEGACY_RUNTIME_VERSION = "espn-native-runtime-v3"
+# Every runtime that ever stamped a parser-v2 head. Bronze only holds v2: the
+# release that stamped v3 (e12b85a) failed its canary and published nothing, so
+# naming v3 alone left the bridge waiting on an epoch that never materialised.
+LEGACY_RUNTIME_VERSIONS = ("espn-native-runtime-v2", "espn-native-runtime-v3")
 LEGACY_REPLAY_GIT_SHA = "e12b85a"
 CURRENT_ADMISSION_KIND = "espn-airflow-admission-v3"
 RELEASE_COMMIT_ENV = "ESPN_RELEASE_COMMIT"
@@ -2371,7 +2374,7 @@ def _prior_parser_transition(
     identity = (prior.parser_version, prior.runtime_version)
     if identity == (PARSER_VERSION, RUNTIME_VERSION):
         return "current"
-    if identity == (LEGACY_PARSER_VERSION, LEGACY_RUNTIME_VERSION):
+    if identity[0] == LEGACY_PARSER_VERSION and identity[1] in LEGACY_RUNTIME_VERSIONS:
         if full:
             return "v2-to-v3"
         raise RunnerConfigurationError(
@@ -2388,9 +2391,9 @@ def _prior_parser_transition(
 def _bridge_v2_prior(prior: ScopeGeneration) -> ScopeGeneration:
     """One-hop row-identity bridge; immutable Summary Raw provenance is retained."""
 
-    if (prior.parser_version, prior.runtime_version) != (
-        LEGACY_PARSER_VERSION,
-        LEGACY_RUNTIME_VERSION,
+    if (
+        prior.parser_version != LEGACY_PARSER_VERSION
+        or prior.runtime_version not in LEGACY_RUNTIME_VERSIONS
     ):
         raise RunnerConfigurationError("v2 to v3 bridge received a non-v2 prior")
 

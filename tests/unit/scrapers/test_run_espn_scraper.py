@@ -407,7 +407,11 @@ def test_changed_or_new_final_event_refreshes_summary():
     assert summary_refresh_event_ids((event,), missing_disposition) == (event.event_id,)
 
 
-def _legacy_v2_generation(generation: ScopeGeneration) -> ScopeGeneration:
+def _legacy_v2_generation(
+    generation: ScopeGeneration,
+    *,
+    runtime_version: str = "espn-native-runtime-v3",
+) -> ScopeGeneration:
     def legacy_rows(rows):
         return tuple(
             replace(row, parser_version="espn-native-parser-v2") for row in rows
@@ -416,7 +420,7 @@ def _legacy_v2_generation(generation: ScopeGeneration) -> ScopeGeneration:
     return replace(
         generation,
         parser_version="espn-native-parser-v2",
-        runtime_version="espn-native-runtime-v3",
+        runtime_version=runtime_version,
         schedule=legacy_rows(generation.schedule),
         lineup=legacy_rows(generation.lineup),
         matchsheet=legacy_rows(generation.matchsheet),
@@ -2760,6 +2764,32 @@ def test_unknown_parser_runtime_transition_points_exact_v2_replay_to_e12b85a():
 
     with pytest.raises(RunnerConfigurationError, match="e12b85a"):
         runner._prior_parser_transition(prior, full=True)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "legacy_runtime", ("espn-native-runtime-v2", "espn-native-runtime-v3")
+)
+def test_full_reconciliation_bridges_every_published_legacy_runtime(legacy_runtime):
+    # Bronze only ever carried runtime-v2: the release that stamped runtime-v3
+    # (e12b85a) failed its canary three times and published nothing. Accepting
+    # v3 alone left the bridge waiting on an epoch that does not exist, so a
+    # reconciliation of the real heads aborted before its first request.
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    prior = _legacy_v2_generation(
+        _prior_generation(competition, edition), runtime_version=legacy_runtime
+    )
+
+    assert runner._prior_parser_transition(prior, full=True) == "v2-to-v3"
+
+    bridged = runner._bridge_v2_prior(prior)
+    assert bridged.parser_version == runner.PARSER_VERSION
+    assert bridged.runtime_version == runner.RUNTIME_VERSION
+    assert all(row.parser_version == runner.PARSER_VERSION for row in bridged.schedule)
+    # A re-stamp, not a re-parse: Raw provenance survives untouched.
+    assert bridged.raw_ledger == prior.raw_ledger
 
 
 @pytest.mark.unit

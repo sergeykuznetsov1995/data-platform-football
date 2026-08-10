@@ -48,8 +48,9 @@ NOW = datetime(2026, 8, 1, 9, tzinfo=UTC)
 def test_migration_policy_requires_parser_v3_runtime_v4_heads() -> None:
     assert runner.PARSER_VERSION == "espn-native-parser-v3"
     assert runner.RUNTIME_VERSION == "espn-native-runtime-v4"
-    assert (runner.LEGACY_PARSER_VERSION, runner.LEGACY_RUNTIME_VERSION) == (
-        "espn-native-parser-v2",
+    assert runner.LEGACY_PARSER_VERSION == "espn-native-parser-v2"
+    assert runner.LEGACY_RUNTIME_VERSIONS == (
+        "espn-native-runtime-v2",
         "espn-native-runtime-v3",
     )
     assert runner.LEGACY_REPLAY_GIT_SHA == "e12b85a"
