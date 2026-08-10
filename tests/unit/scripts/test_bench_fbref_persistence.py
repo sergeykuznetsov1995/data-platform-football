@@ -443,6 +443,58 @@ class _DifferentialManager:
         return [(value,)]
 
 
+class _SourceHeaderManager(_DifferentialManager):
+    """Columns as FBref actually lands them in Bronze: spaces and a percent."""
+
+    def __init__(self, *, extra_column=None):
+        super().__init__()
+        self.extra_column = extra_column
+
+    def get_table_columns(self, _schema, _table):
+        columns = {
+            "match_id": "VARCHAR",
+            "_batch_id": "VARCHAR",
+            "shot stopping_sota": "VARCHAR",
+            "shot stopping_save%": "VARCHAR",
+            "_ingested_at": "TIMESTAMP(6)",
+        }
+        if self.extra_column:
+            columns[self.extra_column] = "VARCHAR"
+        return columns
+
+
+@pytest.mark.unit
+def test_comparison_accepts_source_header_columns_and_quotes_them():
+    manager = _SourceHeaderManager()
+
+    columns = benchmark._comparison_columns(
+        manager, "sequential", "batch", "fbref_match_keeper_stats"
+    )
+
+    assert "shot stopping_sota" in columns
+    assert "shot stopping_save%" in columns
+    assert "_ingested_at" not in columns
+    projection, params = benchmark._comparison_projection(
+        columns,
+        table="fbref_match_keeper_stats",
+        expected_run_id=None,
+        sentinel_match_id=None,
+    )
+    assert '"shot stopping_sota"' in projection
+    assert '"shot stopping_save%"' in projection
+    assert params == ()
+
+
+@pytest.mark.unit
+def test_comparison_rejects_a_column_name_that_breaks_out_of_its_quotes():
+    manager = _SourceHeaderManager(extra_column='bad" OR 1=1 --')
+
+    with pytest.raises(ValueError, match="unquotable column name"):
+        benchmark._comparison_columns(
+            manager, "sequential", "batch", "fbref_match_keeper_stats"
+        )
+
+
 @pytest.mark.unit
 def test_all_12_tables_use_dynamic_columns_and_bidirectional_except_all():
     manager = _DifferentialManager()

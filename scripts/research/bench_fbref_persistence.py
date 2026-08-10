@@ -729,8 +729,28 @@ def _comparison_columns(
     if not columns:
         raise ValueError(f"benchmark table {table!r} has no stable columns")
     for column in columns:
-        validate_identifier(column, "column")
+        _validate_quoted_column(column, table=table)
     return columns
+
+
+def _validate_quoted_column(column: str, *, table: str) -> str:
+    """Guard a column name that the comparison always emits double-quoted.
+
+    FBref carries the source's own header text into Bronze, so live columns
+    look like ``shot stopping_sota`` and ``shot stopping_save%`` — legal in
+    Trino when quoted, rejected by ``validate_identifier``.  The writers quote
+    unconditionally too (``trino_manager.py:1160``), so requiring a bare
+    identifier here made the benchmark unable to compare the very tables it
+    was written for.  A quoted name can only escape its quotes through a quote
+    character, so that is the one thing worth refusing.
+    """
+
+    if not column or '"' in column:
+        raise ValueError(
+            f"benchmark table {table!r} has an unquotable column name: "
+            f"{column!r}"
+        )
+    return column
 
 
 def _lineage_column(table: str) -> str:
