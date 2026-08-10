@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 import pytest
 
 from scrapers.fotmob.domain import (
@@ -10,6 +12,8 @@ from scrapers.fotmob.planner import (
     BudgetExceeded,
     BudgetLedger,
     RunMode,
+    ScopeAttemptState,
+    ScopeLane,
     TransportBudget,
     deterministic_plan_signature,
     plan_seasons,
@@ -26,7 +30,7 @@ def _classified(competition_id, decision=ScopeDecision.INCLUDED):
     )
 
 
-def test_backfill_prioritizes_required_competitions_and_preserves_exact_seasons():
+def test_backfill_uses_source_order_not_a_hardcoded_competition_allowlist():
     plan = plan_seasons(
         [_classified(289), _classified(999)],
         [
@@ -37,10 +41,11 @@ def test_backfill_prioritizes_required_competitions_and_preserves_exact_seasons(
         mode=RunMode.BACKFILL,
     )
     assert [item.identity for item in plan] == [
+        (999, "2025/2026"),
         (289, "2017/2018"),
         (289, "2017/2019"),
-        (999, "2025/2026"),
     ]
+    assert all(item.reason != "mandatory_acceptance_sentinel" for item in plan)
 
 
 def test_daily_only_plans_source_selected_or_latest_seasons():
@@ -53,6 +58,52 @@ def test_daily_only_plans_source_selected_or_latest_seasons():
         mode=RunMode.DAILY,
     )
     assert [item.source_season_key for item in plan] == ["2025/2026"]
+
+
+def test_automatic_current_and_history_lanes_are_disjoint():
+    seasons = [
+        SeasonRef(47, "2025/2026", is_selected=True, source_order=0),
+        SeasonRef(47, "2024/2025", source_order=1),
+    ]
+    current = plan_seasons(
+        [_classified(47)], seasons, mode=RunMode.DAILY, lane=ScopeLane.CURRENT
+    )
+    history = plan_seasons(
+        [_classified(47)], seasons, mode=RunMode.BACKFILL, lane=ScopeLane.HISTORY
+    )
+
+    assert [item.identity for item in current] == [(47, "2025/2026")]
+    assert [item.identity for item in history] == [(47, "2024/2025")]
+
+
+def test_retryable_scope_not_due_does_not_starve_later_ready_scopes():
+    now = datetime(2026, 8, 8, 10)
+    attempts = {
+        (47, "2025/2026"): ScopeAttemptState(
+            competition_id=47,
+            source_season_key="2025/2026",
+            plan_signature="fmplan1-test",
+            attempt_count=1,
+            last_attempt_at=now - timedelta(minutes=5),
+            next_retry_at=now + timedelta(minutes=10),
+            outcome="retryable",
+            reason="HTTP 503",
+        )
+    }
+    plan = plan_seasons(
+        [_classified(47), _classified(48), _classified(49)],
+        [
+            SeasonRef(47, "2025/2026", is_selected=True),
+            SeasonRef(48, "2025/2026", is_selected=True),
+            SeasonRef(49, "2025/2026", is_selected=True),
+        ],
+        mode=RunMode.DAILY,
+        lane=ScopeLane.CURRENT,
+        attempt_states=attempts,
+        now=now,
+    )
+
+    assert [item.competition_id for item in plan] == [48, 49]
 
 
 def test_excluded_and_review_required_competitions_stay_out_of_ingest_plan():

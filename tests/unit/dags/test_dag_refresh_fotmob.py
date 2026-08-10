@@ -25,13 +25,13 @@ def test_shared_default_does_not_materialize_refresh_dag(monkeypatch):
     assert PythonOperator._instances == []
 
 
-def test_exact_isolated_opt_in_materializes_continuous_refresh(monkeypatch):
+def test_exact_isolated_opt_in_materializes_manual_refresh(monkeypatch):
     module = _reload_refresh(monkeypatch, isolated=True)
     from airflow.operators.python import PythonOperator
 
     assert module.dag is not None
     assert module.dag.dag_id == "dag_refresh_fotmob"
-    assert module.dag.schedule == "@continuous"
+    assert module.dag.schedule is None
     assert module.dag._dag_kwargs["is_paused_upon_creation"] is True
     assert module.dag._dag_kwargs["max_active_runs"] == 1
     assert module.dag._dag_kwargs["catchup"] is False

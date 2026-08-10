@@ -22,15 +22,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from .catalog import (
+    CLASSIFIER_VERSION,
     CatalogDiscovery,
     CatalogShapeError,
     SelectedSeasonMismatch,
     classify_competition,
+    competition_from_league_payload,
     discover_competitions,
     parse_seasons,
 )
 from .domain import (
     CompetitionRef,
+    CompetitionScopeEvidence,
+    ProbeStatus,
     ScopeClassification,
     ScopeDecision,
     ScopeRef,
@@ -54,6 +58,7 @@ from .planner import (
 )
 from .repository import (
     PARSER_VERSION,
+    SCOPE_OBSERVATIONS_TABLE,
     ManifestStatus,
     TableRows,
     TargetCommit,
@@ -165,6 +170,127 @@ def _json(value: Any) -> str:
         separators=(",", ":"),
         default=str,
     )
+
+
+_PROFILE_BACKOFF = (
+    timedelta(minutes=15),
+    timedelta(hours=1),
+    timedelta(hours=6),
+    timedelta(hours=24),
+)
+_PROFILE_REVIEW_INTERVAL = timedelta(days=30)
+
+
+def profile_probe_delay(
+    attempt_count: int,
+    competition_id: int,
+    retry_after: Optional[timedelta] = None,
+) -> timedelta:
+    """Return the bounded profile retry ladder with stable per-id jitter."""
+
+    if retry_after is not None:
+        if retry_after < timedelta(0):
+            raise ValueError("retry_after must not be negative")
+        return retry_after
+    if int(attempt_count) < 1:
+        raise ValueError("attempt_count must be positive")
+    base = _PROFILE_BACKOFF[min(int(attempt_count), len(_PROFILE_BACKOFF)) - 1]
+    digest = hashlib.sha256(
+        f"{int(competition_id)}:{int(attempt_count)}".encode("ascii")
+    ).digest()
+    return base + timedelta(seconds=int.from_bytes(digest[:2], "big") % 60)
+
+
+def _catalog_fingerprint(
+    competition: CompetitionRef,
+    conflict_variants: Sequence[CompetitionRef] = (),
+) -> str:
+    values = asdict(competition)
+    values.pop("source_paths", None)
+    normalized_variants: set[str] = set()
+    for variant in conflict_variants:
+        variant_values = asdict(variant)
+        variant_values.pop("source_paths", None)
+        normalized_variants.add(_json(variant_values))
+    values["conflict_variants"] = [
+        json.loads(rendered) for rendered in sorted(normalized_variants)
+    ]
+    return hashlib.sha256(_json(values).encode("utf-8")).hexdigest()
+
+
+def _profile_ref_from_evidence(
+    catalog: CompetitionRef, evidence: CompetitionScopeEvidence
+) -> CompetitionRef:
+    if evidence.profile_name is None:
+        return catalog
+    return replace(
+        catalog,
+        name=evidence.profile_name,
+        gender=evidence.source_gender,
+        age_group=evidence.source_age_group,
+        competition_type=evidence.source_type,
+        source_paths=("$.details",),
+    )
+
+
+def _classification_from_evidence(
+    catalog: CompetitionRef, evidence: CompetitionScopeEvidence
+) -> ScopeClassification:
+    return ScopeClassification(
+        _profile_ref_from_evidence(catalog, evidence),
+        evidence.decision,
+        evidence.reason,
+        evidence.policy_rule,
+    )
+
+
+def _profile_probe_due(
+    evidence: Optional[CompetitionScopeEvidence],
+    *,
+    catalog_fingerprint: str,
+    observed_at: datetime,
+) -> bool:
+    if evidence is None:
+        return True
+    if (
+        evidence.classifier_version != CLASSIFIER_VERSION
+        or evidence.catalog_fingerprint != catalog_fingerprint
+    ):
+        return True
+    if evidence.probe_status in {ProbeStatus.PENDING, ProbeStatus.NOT_FOUND}:
+        return evidence.next_probe_at is None or evidence.next_probe_at <= observed_at
+    if evidence.decision in {
+        ScopeDecision.EXCLUDED,
+        ScopeDecision.REVIEW_REQUIRED,
+    }:
+        due = evidence.next_probe_at or (
+            evidence.observed_at + _PROFILE_REVIEW_INTERVAL
+        )
+        return due <= observed_at
+    return False
+
+
+def _next_profile_attempt(
+    previous: Optional[CompetitionScopeEvidence],
+    *,
+    catalog_fingerprint: str,
+) -> int:
+    if (
+        previous is None
+        or previous.catalog_fingerprint != catalog_fingerprint
+        or previous.classifier_version != CLASSIFIER_VERSION
+        or previous.probe_status not in {ProbeStatus.PENDING, ProbeStatus.NOT_FOUND}
+    ):
+        return 1
+    if previous.probe_attempt_count is not None:
+        return min(max(0, previous.probe_attempt_count) + 1, len(_PROFILE_BACKOFF))
+    if previous.next_probe_at is None:
+        return 1
+    legacy_delay = previous.next_probe_at - previous.observed_at
+    for index, base in enumerate(_PROFILE_BACKOFF):
+        if base <= legacy_delay < base + timedelta(minutes=1):
+            return min(index + 2, len(_PROFILE_BACKOFF))
+    return 1
 
 
 def _event_year(value: Any, fallback: int) -> int:
@@ -293,6 +419,8 @@ class CatalogResult:
     discovery: Optional[CatalogDiscovery] = None
     classifications: tuple[ScopeClassification, ...] = ()
     fetch: Optional[FetchResult] = None
+    profile_payloads: Mapping[int, Mapping[str, Any]] = field(default_factory=dict)
+    evidence: Mapping[int, CompetitionScopeEvidence] = field(default_factory=dict)
 
 
 @dataclass
@@ -364,6 +492,11 @@ class FotMobIngestService:
         self._budget_lock = threading.Lock()
         self._cancelled = threading.Event()
         self._next_build_id: Optional[str] = None
+        self._catalog_profile_fetches: dict[int, FetchResult] = {}
+        self._catalog_refs: dict[int, CompetitionRef] = {}
+        self._catalog_fingerprints: dict[int, str] = {}
+        self._catalog_conflict_fields: dict[int, tuple[str, ...]] = {}
+        self._catalog_evidence: dict[int, CompetitionScopeEvidence] = {}
         self.repository.ensure_schema()
         # One query up front replaces one per target: incremental planning asks
         # the manifest about every single target it considers.
@@ -511,6 +644,8 @@ class FotMobIngestService:
         unknown_paths: Sequence[str] = (),
         error_code: Optional[str] = None,
         error: Optional[str] = None,
+        observation_id: Optional[str] = None,
+        retry_after: Optional[datetime] = None,
     ) -> list[str]:
         manifest_status = status or _fetch_manifest_status(fetch)
         commit = TargetCommit(
@@ -524,7 +659,11 @@ class FotMobIngestService:
             source_season_key=source_season_key,
             entity_id=(str(entity_id) if entity_id is not None else None),
             content_hash=fetch.content_hash,
-            observation_id=self.run_id if target_type == "all_leagues" else None,
+            observation_id=(
+                observation_id
+                if observation_id is not None
+                else (self.run_id if target_type == "all_leagues" else None)
+            ),
             raw_uri=fetch.raw_uri,
             fetch_outcome=fetch.status,
             http_status=fetch.http_status,
@@ -533,6 +672,7 @@ class FotMobIngestService:
             cache_hit=fetch.cache_hit,
             stale=fetch.stale,
             fetched_at=_aware_datetime(fetch.fetched_at),
+            retry_after=retry_after,
             direct_bytes=fetch.direct_bytes,
             proxy_bytes=fetch.proxy_bytes,
             encoded_bytes=fetch.encoded_bytes,
@@ -608,8 +748,314 @@ class FotMobIngestService:
             )
         return rows, coverage.unknown
 
+    @staticmethod
+    def _failed_profile_fetch(
+        competition_id: int,
+        error: BaseException,
+        observed_at: datetime,
+    ) -> FetchResult:
+        target = canonicalize_target("leagues", {"id": competition_id})
+        return FetchResult(
+            outcome=FetchOutcome.RETRYABLE_FAILURE,
+            target_key=target.target_key,
+            url=target.canonical_url,
+            http_status=None,
+            json_data=None,
+            body=None,
+            attempts=0,
+            retries=0,
+            cache_hit=False,
+            stale=False,
+            terminal=False,
+            etag=None,
+            last_modified=None,
+            raw_uri=None,
+            content_hash=None,
+            fetched_at=observed_at.isoformat(),
+            encoded_bytes=0,
+            decoded_bytes=0,
+            direct_bytes=0,
+            proxy_bytes=0,
+            error=f"{type(error).__name__}: {error}",
+        )
+
+    @staticmethod
+    def _profile_evidence(
+        competition: CompetitionRef,
+        *,
+        catalog_fingerprint: str,
+        conflict_fields: Sequence[str],
+        previous: Optional[CompetitionScopeEvidence],
+        fetch: FetchResult,
+        observed_at: datetime,
+    ) -> tuple[
+        CompetitionScopeEvidence,
+        ScopeClassification,
+        Optional[Mapping[str, Any]],
+    ]:
+        same_catalog = (
+            previous is not None
+            and previous.catalog_fingerprint == catalog_fingerprint
+        )
+        miss_count = previous.authoritative_miss_count if same_catalog else 0
+        probe_attempt_count = _next_profile_attempt(
+            previous,
+            catalog_fingerprint=catalog_fingerprint,
+        )
+        profile_target_key = fetch.target_key or canonicalize_target(
+            "leagues", {"id": competition.competition_id}
+        ).target_key
+        successful_outcome = fetch.outcome in {
+            FetchOutcome.SUCCESS,
+            FetchOutcome.NOT_MODIFIED,
+        }
+        if successful_outcome and isinstance(fetch.data, Mapping):
+            try:
+                profile = competition_from_league_payload(fetch.data)
+                classification = classify_competition(competition, profile)
+            except (CatalogShapeError, TypeError, ValueError) as exc:
+                classification = ScopeClassification(
+                    competition,
+                    ScopeDecision.REVIEW_REQUIRED,
+                    f"invalid identity-matching profile: {type(exc).__name__}: {exc}",
+                    "review_invalid_profile",
+                )
+                evidence = CompetitionScopeEvidence(
+                    competition_id=competition.competition_id,
+                    catalog_name=competition.name,
+                    profile_name=None,
+                    source_gender=None,
+                    source_age_group=None,
+                    source_type=None,
+                    probe_status=ProbeStatus.INVALID,
+                    decision=classification.decision,
+                    reason=classification.reason,
+                    policy_rule=classification.policy_rule,
+                    classifier_version=CLASSIFIER_VERSION,
+                    profile_target_key=profile_target_key,
+                    profile_content_hash=fetch.content_hash,
+                    catalog_fingerprint=catalog_fingerprint,
+                    authoritative_miss_count=miss_count,
+                    next_probe_at=observed_at + _PROFILE_REVIEW_INTERVAL,
+                    observed_at=observed_at,
+                    probe_attempt_count=0,
+                )
+                return evidence, classification, None
+            if conflict_fields:
+                classification = ScopeClassification(
+                    profile,
+                    ScopeDecision.REVIEW_REQUIRED,
+                    "conflicting allLeagues metadata: "
+                    + ",".join(conflict_fields),
+                    "review_catalog_conflict",
+                )
+            next_probe_at = (
+                observed_at + _PROFILE_REVIEW_INTERVAL
+                if classification.decision
+                in {ScopeDecision.EXCLUDED, ScopeDecision.REVIEW_REQUIRED}
+                else None
+            )
+            evidence = CompetitionScopeEvidence(
+                competition_id=competition.competition_id,
+                catalog_name=competition.name,
+                profile_name=profile.name,
+                source_gender=profile.gender,
+                source_age_group=profile.age_group,
+                source_type=profile.competition_type,
+                probe_status=ProbeStatus.SUCCESS,
+                decision=classification.decision,
+                reason=classification.reason,
+                policy_rule=classification.policy_rule,
+                classifier_version=CLASSIFIER_VERSION,
+                profile_target_key=profile_target_key,
+                profile_content_hash=fetch.content_hash,
+                catalog_fingerprint=catalog_fingerprint,
+                authoritative_miss_count=0,
+                next_probe_at=next_probe_at,
+                observed_at=observed_at,
+                probe_attempt_count=0,
+            )
+            payload = (
+                fetch.data
+                if classification.decision == ScopeDecision.INCLUDED
+                else None
+            )
+            return evidence, classification, payload
+
+        source_validated_null = (
+            fetch.json_data is None
+            and fetch.http_status is not None
+            and (
+                fetch.http_status == 304
+                or 200 <= fetch.http_status <= 299
+            )
+        )
+        authoritative_absence = (
+            fetch.outcome == FetchOutcome.NOT_AVAILABLE
+            and fetch.attempts > 0
+            and not fetch.stale
+            and (fetch.http_status in {204, 404} or source_validated_null)
+        )
+        if authoritative_absence:
+            miss_count += 1
+            if miss_count >= 2:
+                classification = ScopeClassification(
+                    competition,
+                    ScopeDecision.EXCLUDED,
+                    "identity-matching /leagues profile was authoritatively absent twice",
+                    "exclude_dead_profile",
+                )
+                probe_status = ProbeStatus.DEAD
+                next_probe_at = None
+            else:
+                classification = ScopeClassification(
+                    competition,
+                    ScopeDecision.PENDING_PROBE,
+                    "identity-matching /leagues profile was authoritatively absent once",
+                    "probe_not_found",
+                )
+                probe_status = ProbeStatus.NOT_FOUND
+                next_probe_at = observed_at + profile_probe_delay(
+                    probe_attempt_count, competition.competition_id
+                )
+        else:
+            classification = ScopeClassification(
+                competition,
+                ScopeDecision.PENDING_PROBE,
+                "identity-matching /leagues profile probe is pending after a transient failure",
+                "probe_retryable",
+            )
+            probe_status = ProbeStatus.PENDING
+            next_probe_at = observed_at + profile_probe_delay(
+                probe_attempt_count,
+                competition.competition_id,
+                retry_after=fetch.retry_after,
+            )
+        carried = previous if same_catalog else None
+        evidence = CompetitionScopeEvidence(
+            competition_id=competition.competition_id,
+            catalog_name=competition.name,
+            profile_name=carried.profile_name if carried else None,
+            source_gender=carried.source_gender if carried else None,
+            source_age_group=carried.source_age_group if carried else None,
+            source_type=carried.source_type if carried else None,
+            probe_status=probe_status,
+            decision=classification.decision,
+            reason=classification.reason,
+            policy_rule=classification.policy_rule,
+            classifier_version=CLASSIFIER_VERSION,
+            profile_target_key=profile_target_key,
+            profile_content_hash=fetch.content_hash,
+            catalog_fingerprint=catalog_fingerprint,
+            authoritative_miss_count=miss_count,
+            next_probe_at=next_probe_at,
+            observed_at=observed_at,
+            probe_attempt_count=probe_attempt_count,
+        )
+        return evidence, classification, None
+
+    def _persist_profile_evidence(
+        self,
+        fetch: FetchResult,
+        evidence: CompetitionScopeEvidence,
+    ) -> list[str]:
+        row = {
+            **asdict(evidence),
+            "competition_id": str(evidence.competition_id),
+            "discovery_run_id": self.run_id,
+            "_observed_at": evidence.observed_at,
+        }
+        return self._commit_for_fetch(
+            fetch,
+            target_type="competition_profile",
+            status=ManifestStatus.SUCCESS,
+            competition_id=evidence.competition_id,
+            entity_id=evidence.competition_id,
+            datasets=(
+                TableRows(
+                    SCOPE_OBSERVATIONS_TABLE,
+                    (row,),
+                    "competition_scope_observations",
+                ),
+            ),
+            expected_counts={"competition_scope_observations": 1},
+            capabilities={
+                "probe_status": evidence.probe_status.value,
+                "scope_decision": evidence.decision.value,
+                "authoritative_miss_count": evidence.authoritative_miss_count,
+            },
+            error_code=(
+                None
+                if evidence.probe_status == ProbeStatus.SUCCESS
+                else f"profile_{evidence.probe_status.value}"
+            ),
+            observation_id=f"{self.run_id}:{evidence.competition_id}",
+            retry_after=evidence.next_probe_at,
+        )
+
+    def _revalidate_included_profile(
+        self,
+        classification: ScopeClassification,
+        fetch: FetchResult,
+    ) -> tuple[ScopeClassification, list[str]]:
+        """Reclassify a cached inclusion from the root payload used for fan-out.
+
+        First-seen/due profiles were already classified and persisted by
+        ``discover_catalog``.  Cached included evidence is different: season
+        discovery necessarily fetches a newer ``/leagues`` root, so that root
+        must replace the cached policy decision before any child target is
+        scheduled.  Failed validation is persisted through the same bounded
+        probe ladder as catalog-time probing.
+        """
+
+        competition_id = classification.competition.competition_id
+        if classification.decision != ScopeDecision.INCLUDED:
+            return classification, []
+        # Direct/legacy callers may supply a trusted classification without
+        # running catalog discovery on this service.  The stale-evidence risk
+        # exists only for an inclusion loaded into this catalog context.
+        if competition_id not in self._catalog_refs:
+            return classification, []
+        if self._catalog_profile_fetches.get(competition_id) is fetch:
+            return classification, []
+
+        catalog = self._catalog_refs.get(
+            competition_id, classification.competition
+        )
+        catalog_fingerprint = self._catalog_fingerprints.get(
+            competition_id, _catalog_fingerprint(catalog)
+        )
+        previous = self._catalog_evidence.get(competition_id)
+        if previous is None:
+            previous = self.repository.latest_scope_evidence(
+                [competition_id]
+            ).get(competition_id)
+        evidence, revalidated, payload = self._profile_evidence(
+            catalog,
+            catalog_fingerprint=catalog_fingerprint,
+            conflict_fields=self._catalog_conflict_fields.get(
+                competition_id, ()
+            ),
+            previous=previous,
+            fetch=fetch,
+            observed_at=utc_now(),
+        )
+        paths = self._persist_profile_evidence(fetch, evidence)
+        # Scope evidence must be durable before the same payload can authorize
+        # season or transfer fan-out.
+        paths.extend(self.repository.flush())
+        self._catalog_evidence[competition_id] = evidence
+        if payload is not None:
+            self._catalog_profile_fetches[competition_id] = fetch
+        return revalidated, paths
+
     def discover_catalog(self) -> CatalogResult:
         result = OperationResult("competition_catalog", attempted=1)
+        self._catalog_profile_fetches = {}
+        self._catalog_refs = {}
+        self._catalog_fingerprints = {}
+        self._catalog_conflict_fields = {}
+        self._catalog_evidence = {}
         try:
             fetch = self._fetch("allLeagues")
         except Exception as exc:
@@ -641,8 +1087,16 @@ class FotMobIngestService:
                     "invalid catalog entries: "
                     + "; ".join(issue.message for issue in discovery.issues)
                 )
+            paths = inventory_json_paths(fetch.data)
+            inventory, unknown = self._inventory_rows("all_leagues", paths)
+            if unknown:
+                raise CatalogShapeError(
+                    f"unclassified allLeagues JSON paths: {list(unknown)}"
+                )
+            for row in inventory:
+                row["discovery_run_id"] = self.run_id
+
             conflicts = {item.competition_id: item for item in discovery.conflicts}
-            classifications: list[ScopeClassification] = []
             # Each validated discovery is a new catalog snapshot even when a
             # 304 reuses an older immutable body.  Source fetch time remains
             # in the manifest; ordering/tombstone logic uses observation time.
@@ -673,16 +1127,99 @@ class FotMobIngestService:
             result.metadata["authoritative_source_observation"] = (
                 authoritative_observation
             )
+
+            latest_evidence = self.repository.latest_scope_evidence(current_ids)
+            fingerprints = {
+                item.competition_id: _catalog_fingerprint(
+                    item,
+                    (
+                        conflicts[item.competition_id].variants
+                        if item.competition_id in conflicts
+                        else ()
+                    ),
+                )
+                for item in discovery.competitions
+            }
+            self._catalog_refs = {
+                item.competition_id: item for item in discovery.competitions
+            }
+            self._catalog_fingerprints = dict(fingerprints)
+            self._catalog_conflict_fields = {
+                competition_id: conflict.fields
+                for competition_id, conflict in conflicts.items()
+            }
+            self._catalog_evidence = dict(latest_evidence)
+            due = [
+                item
+                for item in discovery.competitions
+                if _profile_probe_due(
+                    latest_evidence.get(item.competition_id),
+                    catalog_fingerprint=fingerprints[item.competition_id],
+                    observed_at=observed,
+                )
+            ]
+            try:
+                fetched_profiles = self._fetch_many(
+                    [
+                        (
+                            str(item.competition_id),
+                            "leagues",
+                            {"id": item.competition_id},
+                        )
+                        for item in due
+                    ]
+                )
+            except BudgetExceeded as exc:
+                fetched_profiles = {
+                    str(item.competition_id): exc for item in due
+                }
+
+            classifications: list[ScopeClassification] = []
+            profile_payloads: dict[int, Mapping[str, Any]] = {}
+            catalog_evidence = self._catalog_evidence
+            due_ids = {item.competition_id for item in due}
             for competition in discovery.competitions:
-                classification = classify_competition(competition)
                 conflict = conflicts.get(competition.competition_id)
-                if conflict is not None:
-                    classification = ScopeClassification(
-                        competition,
-                        ScopeDecision.REVIEW_REQUIRED,
-                        "conflicting allLeagues metadata: " + ",".join(conflict.fields),
-                        "review_catalog_conflict",
+                previous = latest_evidence.get(competition.competition_id)
+                if competition.competition_id in due_ids:
+                    fetched = fetched_profiles.get(str(competition.competition_id))
+                    profile_fetch = (
+                        fetched
+                        if isinstance(fetched, FetchResult)
+                        else self._failed_profile_fetch(
+                            competition.competition_id,
+                            fetched
+                            if isinstance(fetched, BaseException)
+                            else RuntimeError("profile probe returned no result"),
+                            observed,
+                        )
                     )
+                    evidence, classification, payload = self._profile_evidence(
+                        competition,
+                        catalog_fingerprint=fingerprints[competition.competition_id],
+                        conflict_fields=(conflict.fields if conflict else ()),
+                        previous=previous,
+                        fetch=profile_fetch,
+                        observed_at=observed,
+                    )
+                    result.tables.extend(
+                        self._persist_profile_evidence(profile_fetch, evidence)
+                    )
+                    catalog_evidence[competition.competition_id] = evidence
+                    self._catalog_evidence[competition.competition_id] = evidence
+                    if payload is not None:
+                        profile_payloads[competition.competition_id] = payload
+                        self._catalog_profile_fetches[
+                            competition.competition_id
+                        ] = profile_fetch
+                elif previous is not None:
+                    classification = _classification_from_evidence(
+                        competition, previous
+                    )
+                    catalog_evidence[competition.competition_id] = previous
+                    self._catalog_evidence[competition.competition_id] = previous
+                else:  # defensive: every missing evidence item is due
+                    classification = classify_competition(competition)
                 classifications.append(classification)
                 rows.append(
                     {
@@ -702,6 +1239,11 @@ class FotMobIngestService:
                         "discovery_date": observed.date().isoformat(),
                     }
                 )
+            if due:
+                # Profile raw objects are stored by transport, and these
+                # evidence rows/manifests must be durable before the catalog
+                # snapshot can authorize any downstream fan-out.
+                result.tables.extend(self.repository.flush())
             rows.extend(
                 {
                     "competition_id": str(competition_id),
@@ -719,14 +1261,6 @@ class FotMobIngestService:
                 }
                 for competition_id in sorted(tombstoned_ids)
             )
-            paths = inventory_json_paths(fetch.data)
-            inventory, unknown = self._inventory_rows("all_leagues", paths)
-            if unknown:
-                raise CatalogShapeError(
-                    f"unclassified allLeagues JSON paths: {list(unknown)}"
-                )
-            for row in inventory:
-                row["discovery_run_id"] = self.run_id
             datasets = [
                 TableRows("fotmob_competitions", rows, "competitions"),
                 TableRows(
@@ -767,6 +1301,10 @@ class FotMobIngestService:
                         for item in classifications
                     ),
                     "review_required": result.review_required,
+                    "pending_probe": sum(
+                        item.decision == ScopeDecision.PENDING_PROBE
+                        for item in classifications
+                    ),
                     "conflicts": len(discovery.conflicts),
                     "tombstones": len(tombstoned_ids),
                     "json_paths": len(paths),
@@ -777,6 +1315,8 @@ class FotMobIngestService:
                 discovery,
                 tuple(classifications),
                 fetch,
+                profile_payloads,
+                catalog_evidence,
             )
         except Exception as exc:
             result.errors.append(f"allLeagues parse: {type(exc).__name__}: {exc}")
@@ -808,10 +1348,15 @@ class FotMobIngestService:
                 target_type="competition_seasons",
                 target_key=target.target_key,
                 competition_id=str(competition.competition_id),
+                entity_id=str(competition.competition_id),
                 status=(
                     ManifestStatus.EXCLUDED
                     if classification.decision == ScopeDecision.EXCLUDED
-                    else ManifestStatus.REVIEW_REQUIRED
+                    else (
+                        ManifestStatus.REVIEW_REQUIRED
+                        if classification.decision == ScopeDecision.REVIEW_REQUIRED
+                        else ManifestStatus.RETRYABLE_FAILURE
+                    )
                 ),
                 exclusions=(
                     {
@@ -834,6 +1379,34 @@ class FotMobIngestService:
         except Exception as exc:
             result.errors.append(f"competition {competition.competition_id}: {exc}")
             return CompetitionDiscoveryResult(competition, classification, result)
+        try:
+            classification, evidence_tables = self._revalidate_included_profile(
+                classification, fetch
+            )
+            result.tables.extend(evidence_tables)
+            competition = classification.competition
+        except Exception as exc:
+            failed_classification = ScopeClassification(
+                competition,
+                ScopeDecision.REVIEW_REQUIRED,
+                "fresh profile evidence could not be persisted",
+                "review_profile_evidence_persistence",
+            )
+            result.errors.append(
+                f"competition {competition.competition_id} profile evidence: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return CompetitionDiscoveryResult(
+                competition, failed_classification, result, fetch=fetch
+            )
+        if classification.decision != ScopeDecision.INCLUDED:
+            result.skipped = 1
+            result.metadata["scope_decision"] = classification.decision.value
+            if classification.decision == ScopeDecision.REVIEW_REQUIRED:
+                result.review_required = 1
+            return CompetitionDiscoveryResult(
+                competition, classification, result, fetch=fetch
+            )
         if not fetch.ok:
             if fetch.outcome == FetchOutcome.NOT_AVAILABLE:
                 # Dead catalog entry (#1070): allLeagues keeps advertising the
@@ -847,6 +1420,7 @@ class FotMobIngestService:
                     target_type="competition_seasons",
                     status=ManifestStatus.EXCLUDED,
                     competition_id=competition.competition_id,
+                    entity_id=competition.competition_id,
                     exclusions=(
                         {
                             "reason": "dead_catalog_entry",
@@ -867,6 +1441,7 @@ class FotMobIngestService:
                 fetch,
                 target_type="competition_seasons",
                 competition_id=competition.competition_id,
+                entity_id=competition.competition_id,
             )
             self._record_failure(result, fetch.url, fetch)
             return CompetitionDiscoveryResult(
@@ -978,6 +1553,7 @@ class FotMobIngestService:
                 fetch,
                 target_type="competition_seasons",
                 competition_id=competition.competition_id,
+                entity_id=competition.competition_id,
                 datasets=[
                     TableRows(
                         "fotmob_competition_seasons",
@@ -1030,6 +1606,7 @@ class FotMobIngestService:
                 target_type="competition_seasons",
                 status=_failure_status(exc),
                 competition_id=competition.competition_id,
+                entity_id=competition.competition_id,
                 error_code=type(exc).__name__,
                 error=str(exc),
             )
@@ -1040,9 +1617,24 @@ class FotMobIngestService:
     def discover_competitions(
         self,
         classifications: Sequence[ScopeClassification],
+        *,
+        profile_payloads: Optional[Mapping[int, Mapping[str, Any]]] = None,
     ) -> list[CompetitionDiscoveryResult]:
         """Fetch included competition roots concurrently, commit sequentially."""
 
+        supplied_profiles = profile_payloads or {}
+        reusable: dict[str, FetchResult] = {}
+        for item in classifications:
+            competition_id = item.competition.competition_id
+            saved = self._catalog_profile_fetches.get(competition_id)
+            supplied = supplied_profiles.get(competition_id)
+            if (
+                item.decision == ScopeDecision.INCLUDED
+                and saved is not None
+                and supplied is not None
+                and (saved.data is supplied or saved.data == supplied)
+            ):
+                reusable[str(competition_id)] = saved
         requests = [
             (
                 str(item.competition.competition_id),
@@ -1051,6 +1643,7 @@ class FotMobIngestService:
             )
             for item in classifications
             if item.decision == ScopeDecision.INCLUDED
+            and str(item.competition.competition_id) not in reusable
         ]
         try:
             fetched = self._fetch_many(requests)
@@ -1060,25 +1653,44 @@ class FotMobIngestService:
                 for item in classifications
                 if item.decision == ScopeDecision.INCLUDED
             }
+        fetched.update(reusable)
         output: list[CompetitionDiscoveryResult] = []
         for item in classifications:
             if item.decision != ScopeDecision.INCLUDED:
-                output.append(self.discover_competition(item))
+                operation = OperationResult(
+                    "competition_seasons",
+                    attempted=1,
+                    skipped=1,
+                    review_required=(
+                        1
+                        if item.decision == ScopeDecision.REVIEW_REQUIRED
+                        else 0
+                    ),
+                    metadata={
+                        "competition_id": item.competition.competition_id,
+                        "scope_decision": item.decision.value,
+                    },
+                )
+                output.append(
+                    CompetitionDiscoveryResult(item.competition, item, operation)
+                )
                 continue
             value = fetched.get(str(item.competition.competition_id))
             if isinstance(value, FetchResult):
                 output.append(self.discover_competition(item, prefetched=value))
                 continue
-            operation = OperationResult(
-                "competition_seasons",
-                attempted=1,
-                errors=[
-                    f"competition {item.competition.competition_id}: "
-                    f"{type(value).__name__}: {value}"
-                ],
-                metadata={"competition_id": item.competition.competition_id},
+            failed_fetch = self._failed_profile_fetch(
+                item.competition.competition_id,
+                (
+                    value
+                    if isinstance(value, BaseException)
+                    else RuntimeError("profile fetch returned no result")
+                ),
+                utc_now(),
             )
-            output.append(CompetitionDiscoveryResult(item.competition, item, operation))
+            output.append(
+                self.discover_competition(item, prefetched=failed_fetch)
+            )
         return output
 
     def sync_season(
@@ -2521,6 +3133,31 @@ class FotMobIngestService:
         )
         return self.repository.commit(commit)
 
+    def record_scope_attempt(
+        self,
+        competition_id: int,
+        source_season_key: str,
+        *,
+        plan_signature: str,
+        outcome: str,
+        reason: str,
+        next_retry_at: Optional[datetime] = None,
+        attempt_identities: Iterable[str] = (),
+    ):
+        """Persist one automatic scheduler result in the ingest manifest."""
+
+        return self.repository.record_scope_attempt(
+            run_id=self.run_id,
+            competition_id=int(competition_id),
+            source_season_key=source_season_key,
+            plan_signature=plan_signature,
+            outcome=outcome,
+            reason=reason,
+            last_attempt_at=utc_now(),
+            next_retry_at=next_retry_at,
+            attempt_identities=attempt_identities,
+        )
+
     def record_competition_completion(
         self,
         competition_id: int,
@@ -2596,4 +3233,5 @@ __all__ = [
     "FotMobIngestService",
     "OperationResult",
     "RunReport",
+    "profile_probe_delay",
 ]

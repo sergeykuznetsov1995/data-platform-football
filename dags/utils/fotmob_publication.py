@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from scrapers.fotmob.scope_codec import parse_scope_token, validate_scope_tokens
 from scrapers.fotmob.source_refresh import (
     PLAYER_SOURCE_REFRESH_ARTIFACT,
     PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB,
@@ -60,6 +61,7 @@ FOTMOB_PUBLICATION_BINDING_FIELDS = (
 # dynamically.  This avoids freezing season strings while preventing an
 # accidental ~493-competition crawl from entering the 14:00 publication slot.
 FOTMOB_DAILY_CONTRACT_SCHEMA = "fotmob-daily-v1"
+FOTMOB_CATALOG_CONTRACT_SCHEMA = "fotmob-catalog-v1"
 FOTMOB_DAILY_SCOPE_FILE = "/opt/airflow/configs/fotmob/issue-930-scopes.txt"
 FOTMOB_DAILY_SCOPE_SHA256 = (
     "f1d95f916c78ed80e5784e2cd5bda7263cece37d9fde6d52fb2a1a4d9e97cb58"
@@ -110,13 +112,12 @@ FOTMOB_DEPLOYMENT_REPORT_PATH_ENV = "FOTMOB_DEPLOYMENT_REPORT_PATH"
 FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV = "FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH"
 FOTMOB_SHARED_EVIDENCE_ROOT = "/opt/airflow/fotmob-admission"
 FOTMOB_ISOLATED_DAILY_DAG_ID = "dag_trigger_fotmob_daily"
+FOTMOB_AUTOMATIC_OWNER_DAG_ID = "dag_orchestrate_fotmob"
 # Every isolated schedule owner allowed to mint a publication generation.
 # ``@continuous`` refresh/backfill DagRuns are ``scheduled`` runs too.
 FOTMOB_ISOLATED_OWNER_DAG_IDS = frozenset(
     {
-        FOTMOB_ISOLATED_DAILY_DAG_ID,
-        "dag_refresh_fotmob",
-        "dag_backfill_fotmob",
+        FOTMOB_AUTOMATIC_OWNER_DAG_ID,
     }
 )
 FOTMOB_SHARED_CONSUMER_DAG_ID = "dag_sofascore_pipeline"
@@ -157,9 +158,12 @@ FOTMOB_MIN_ACTIVATION_SAFETY_SECONDS = 15 * 60
 FOTMOB_ACTIVATION_TIMEOUT_MARGIN_SECONDS = 5 * 60
 FOTMOB_EXPECTED_ISOLATED_DAGS = frozenset(
     {
+        FOTMOB_AUTOMATIC_OWNER_DAG_ID,
         "dag_ingest_fotmob",
         "dag_transform_fotmob_silver",
         FOTMOB_ISOLATED_DAILY_DAG_ID,
+        "dag_refresh_fotmob",
+        "dag_backfill_fotmob",
     }
 )
 FOTMOB_ISOLATED_RUNTIME_ROOTS = {
@@ -189,12 +193,20 @@ FOTMOB_ISOLATED_REQUIRED_RUNTIME_PATHS = frozenset(
         "configs/fotmob/issue-930-scopes.txt",
         "dags/.airflowignore",
         "dags/dag_ingest_fotmob.py",
+        "dags/dag_orchestrate_fotmob.py",
+        "dags/dag_refresh_fotmob.py",
+        "dags/dag_backfill_fotmob.py",
         "dags/dag_transform_fotmob_silver.py",
         "dags/dag_trigger_fotmob_daily.py",
         "dags/scripts/run_fotmob_scraper.py",
         "dags/utils/fotmob_publication.py",
+        "dags/utils/fotmob_orchestration.py",
+        "scrapers/fotmob/catalog.py",
+        "scrapers/fotmob/catalog_contract.py",
+        "scrapers/fotmob/domain.py",
         "scrapers/fotmob/repository.py",
         "scrapers/fotmob/service.py",
+        "scrapers/fotmob/scope_codec.py",
         "scrapers/fotmob/source_refresh.py",
     }
 )
@@ -205,6 +217,9 @@ FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS = frozenset(
         "configs/fotmob/issue-930-scopes.txt",
         "dags/.airflowignore",
         "dags/dag_ingest_fotmob.py",
+        "dags/dag_orchestrate_fotmob.py",
+        "dags/dag_refresh_fotmob.py",
+        "dags/dag_backfill_fotmob.py",
         "dags/dag_master_pipeline.py",
         "dags/dag_sofascore_pipeline.py",
         "dags/dag_trigger_fotmob_daily.py",
@@ -220,6 +235,7 @@ FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS = frozenset(
         "dags/sql/silver/fotmob_player_season_profile.sql",
         "dags/sql/silver/xref_manager.sql.j2",
         "dags/utils/fotmob_publication.py",
+        "dags/utils/fotmob_orchestration.py",
         "dags/utils/maintenance_tasks.py",
         "dags/utils/silver_tasks.py",
         "dags/utils/xref_player_resolver.py",
@@ -227,9 +243,13 @@ FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS = frozenset(
         "scrapers/base/trino_manager.py",
         "scrapers/fbref/control/store.py",
         "scrapers/fotmob/constants.py",
+        "scrapers/fotmob/catalog.py",
+        "scrapers/fotmob/catalog_contract.py",
+        "scrapers/fotmob/domain.py",
         "scrapers/fotmob/raw_store.py",
         "scrapers/fotmob/repository.py",
         "scrapers/fotmob/service.py",
+        "scrapers/fotmob/scope_codec.py",
         "scrapers/fotmob/source_refresh.py",
         "scrapers/fotmob/transport.py",
     }
@@ -238,9 +258,9 @@ FOTMOB_ISSUE930_WRITER_ENTITIES = frozenset(
     {"season", "leaderboards", "matches", "teams", "players"}
 )
 FOTMOB_ISSUE930_MODE_PARITY = {"backfill": 0, "replay": 1}
+FOTMOB_AUTOMATIC_CANARY_SLOT = 2
 
 _FULL_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
-_SCOPE_LINE_RE = re.compile(r"([1-9][0-9]*)=(\S+)")
 
 
 def _competition_ids_digest(competition_ids: Sequence[int]) -> str:
@@ -282,13 +302,14 @@ def load_fotmob_daily_competition_contract(
     scopes: list[str] = []
     competition_ids: set[int] = set()
     for line_number, line in enumerate(text.splitlines(), start=1):
-        match = _SCOPE_LINE_RE.fullmatch(line)
-        if match is None:
+        try:
+            competition_id, _source_season_key = parse_scope_token(line)
+        except ValueError as exc:
             raise ValueError(
                 f"invalid FotMob daily scope at line {line_number}: {line!r}"
-            )
+            ) from exc
         scopes.append(line)
-        competition_ids.add(int(match.group(1)))
+        competition_ids.add(competition_id)
     if len(scopes) != FOTMOB_DAILY_SCOPE_COUNT or len(set(scopes)) != len(scopes):
         raise ValueError(
             "FotMob daily scope artifact must contain exactly 158 unique scopes"
@@ -329,6 +350,26 @@ def fotmob_daily_trigger_conf() -> dict[str, Any]:
         "entities": ",".join(FOTMOB_DAILY_ENTITIES),
         "max_requests": FOTMOB_DAILY_MAX_REQUESTS,
         "max_direct_mib": FOTMOB_DAILY_MAX_DIRECT_MIB,
+        "competition_limit": 0,
+        "season_limit": 0,
+        "requests_per_minute": FOTMOB_DAILY_REQUESTS_PER_MINUTE,
+    }
+
+
+def fotmob_catalog_trigger_conf(mode: str) -> dict[str, Any]:
+    """Return a dynamic all-included-men profile without issue-930 inputs."""
+
+    normalized_mode = str(mode).strip().casefold()
+    if normalized_mode not in {"daily", "refresh", "backfill"}:
+        raise ValueError("automatic catalog mode is not supported")
+    return {
+        "mode": normalized_mode,
+        "scope": "",
+        "catalog_contract": FOTMOB_CATALOG_CONTRACT_SCHEMA,
+        "entities": ",".join(FOTMOB_DAILY_ENTITIES),
+        "max_requests": FOTMOB_DAILY_MAX_REQUESTS,
+        "max_direct_mib": FOTMOB_DAILY_MAX_DIRECT_MIB,
+        "max_proxy_mib": 0,
         "competition_limit": 0,
         "season_limit": 0,
         "requests_per_minute": FOTMOB_DAILY_REQUESTS_PER_MINUTE,
@@ -456,6 +497,7 @@ def _issue930_writer_identity_from_context(
         "dag_id": getattr(dag_run, "dag_id", None),
         "run_id": getattr(dag_run, "run_id", None),
         "mode": conf.get("mode"),
+        "catalog_contract": conf.get("catalog_contract"),
         "scopes": conf.get("scope"),
         "entities": conf.get("entities"),
         "competition_limit": conf.get("competition_limit"),
@@ -472,7 +514,436 @@ def _issue930_writer_identity_from_context(
         "source_refresh_profile": conf.get("source_refresh_profile"),
         "source_refresh_targets_sha256": conf.get("source_refresh_targets_sha256"),
         "source_refresh_target_count": conf.get("source_refresh_target_count"),
+        "deadline": conf.get("deadline"),
         "publication": conf.get(FOTMOB_PUBLICATION_CONF_KEY),
+    }
+
+
+def _active_owner_writer_authorization(
+    generation_id: str,
+    publication: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Read the exact scheduled owner/parent lineage from Airflow metadata."""
+
+    from airflow.models import DagRun, TaskInstance, XCom
+    from airflow.settings import Session
+
+    def state(value: Any) -> str:
+        return str(getattr(value, "value", value) or "").casefold()
+
+    def xcom_value(session: Any, run_id: str, task_id: str) -> Any:
+        row = (
+            session.query(XCom)
+            .filter(
+                XCom.dag_id == FOTMOB_AUTOMATIC_OWNER_DAG_ID,
+                XCom.run_id == run_id,
+                XCom.task_id == task_id,
+                XCom.key == "return_value",
+            )
+            .order_by(XCom.timestamp.desc())
+            .first()
+        )
+        return XCom.deserialize_value(row) if row is not None else None
+
+    session = Session()
+    try:
+        initializer_rows = (
+            session.query(XCom)
+            .filter(
+                XCom.dag_id == FOTMOB_AUTOMATIC_OWNER_DAG_ID,
+                XCom.task_id == "initialize_fotmob_publication",
+                XCom.key == "return_value",
+            )
+            .order_by(XCom.timestamp.desc())
+            .limit(50)
+            .all()
+        )
+        matches: list[tuple[str, Mapping[str, Any]]] = []
+        for row in initializer_rows:
+            value = XCom.deserialize_value(row)
+            if (
+                isinstance(value, Mapping)
+                and value.get("generation_id") == generation_id
+                and value.get("binding") == publication.get("binding")
+            ):
+                matches.append((str(row.run_id), value))
+        if len(matches) != 1:
+            raise _airflow_exception(
+                "FotMob writer has no unique scheduled owner authorization"
+            )
+        owner_run_id = matches[0][0]
+        owner = (
+            session.query(DagRun)
+            .filter(
+                DagRun.dag_id == FOTMOB_AUTOMATIC_OWNER_DAG_ID,
+                DagRun.run_id == owner_run_id,
+            )
+            .one_or_none()
+        )
+        trigger = (
+            session.query(TaskInstance)
+            .filter(
+                TaskInstance.dag_id == FOTMOB_AUTOMATIC_OWNER_DAG_ID,
+                TaskInstance.run_id == owner_run_id,
+                TaskInstance.task_id == "trigger_fotmob_ingest",
+            )
+            .one_or_none()
+        )
+        decision = xcom_value(session, owner_run_id, "choose_fotmob_lane")
+        conf = decision.get("conf") if isinstance(decision, Mapping) else None
+        lane = str(decision.get("lane") or "") if isinstance(decision, Mapping) else ""
+        if (
+            owner is None
+            or state(owner.run_type) != "scheduled"
+            or state(owner.state) not in {"running", "success"}
+            or trigger is None
+            or state(trigger.state)
+            not in {"running", "success", "deferred", "up_for_reschedule"}
+            or not isinstance(conf, Mapping)
+            or lane not in {"daily", "refresh", "backfill"}
+            or conf.get("mode") != lane
+        ):
+            raise _airflow_exception(
+                "FotMob writer owner decision/trigger lineage is incomplete"
+            )
+        ingest_run_id = f"fotmob_orchestrated__{generation_id}"
+        ingest = (
+            session.query(DagRun)
+            .filter(
+                DagRun.dag_id == "dag_ingest_fotmob",
+                DagRun.run_id == ingest_run_id,
+            )
+            .one_or_none()
+        )
+        if (
+            ingest is None
+            or state(ingest.state) not in {"queued", "running", "success"}
+            or not isinstance(ingest.conf, Mapping)
+            or ingest.conf.get(FOTMOB_PUBLICATION_CONF_KEY) != publication
+        ):
+            raise _airflow_exception("FotMob writer ingest lineage is incomplete")
+        silver_trigger = (
+            session.query(TaskInstance)
+            .filter(
+                TaskInstance.dag_id == "dag_ingest_fotmob",
+                TaskInstance.run_id == ingest_run_id,
+                TaskInstance.task_id == "trigger_silver_transform",
+            )
+            .one_or_none()
+        )
+        return {
+            "owner_run_id": owner_run_id,
+            "ingest_run_id": ingest_run_id,
+            "lane": lane,
+            "conf": dict(conf),
+            "silver_trigger_state": (
+                None if silver_trigger is None else state(silver_trigger.state)
+            ),
+        }
+    finally:
+        session.close()
+
+
+def _validate_active_automatic_writer(
+    identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authorize only the scheduled owner's exact child and lane profile."""
+
+    raw_publication = identity.get("publication")
+    raw_binding = (
+        raw_publication.get("binding")
+        if isinstance(raw_publication, Mapping)
+        else None
+    )
+    if not isinstance(raw_binding, Mapping):
+        raise _airflow_exception("FotMob active writer publication is missing")
+    binding = make_publication_binding(
+        owner=raw_binding.get("owner"),
+        data_interval_start=raw_binding.get("data_interval_start"),
+        data_interval_end=raw_binding.get("data_interval_end"),
+        fingerprint=raw_binding.get("runtime_fingerprint"),
+    )
+    try:
+        generation_id = str(uuid.UUID(str(raw_publication.get("generation_id"))))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise _airflow_exception("FotMob active writer generation is invalid") from exc
+    publication = {"generation_id": generation_id, "binding": binding}
+    if (
+        dict(raw_binding) != binding
+        or binding["owner"] != "isolated"
+        or generation_id != make_generation_id(binding)
+    ):
+        raise _airflow_exception("FotMob active writer publication differs")
+    authorization = _active_owner_writer_authorization(generation_id, publication)
+    authorized_conf = authorization.get("conf")
+    if not isinstance(authorized_conf, Mapping):
+        raise _airflow_exception("FotMob active writer profile is missing")
+    component = str(identity.get("component") or "")
+    dag_id = str(identity.get("dag_id") or "")
+    run_id = str(identity.get("run_id") or "")
+    expected_ingest = str(authorization["ingest_run_id"])
+    expected_silver = f"fotmob_silver__{generation_id}"
+    if component == "bronze_runner":
+        if dag_id != "dag_ingest_fotmob" or run_id != expected_ingest:
+            raise _airflow_exception("FotMob active Bronze run identity differs")
+    elif component == "airflow_task" and dag_id == "dag_ingest_fotmob":
+        if run_id != expected_ingest:
+            raise _airflow_exception("FotMob active ingest run identity differs")
+    elif component == "airflow_task" and dag_id == "dag_transform_fotmob_silver":
+        if (
+            run_id != expected_silver
+            or authorization.get("silver_trigger_state")
+            not in {"running", "success", "deferred", "up_for_reschedule"}
+        ):
+            raise _airflow_exception("FotMob active Silver lineage differs")
+        return {
+            "generation_id": generation_id,
+            "owner_run_id": authorization["owner_run_id"],
+            "ingest_run_id": expected_ingest,
+            "lane": authorization["lane"],
+        }
+    else:
+        raise _airflow_exception("FotMob active writer component is not authorized")
+
+    raw_scopes = identity.get("scopes")
+    scopes = (
+        [item for item in raw_scopes.split(",") if item]
+        if isinstance(raw_scopes, str)
+        else list(raw_scopes or ())
+    )
+    raw_entities = identity.get("entities")
+    entities = sorted(
+        str(item).strip().casefold()
+        for item in (
+            raw_entities.split(",")
+            if isinstance(raw_entities, str)
+            else raw_entities or ()
+        )
+        if str(item).strip()
+    )
+    expected_entities = sorted(
+        item.strip().casefold()
+        for item in str(authorized_conf.get("entities") or "").split(",")
+        if item.strip()
+    )
+    required = (
+        "mode",
+        "catalog_contract",
+        "max_requests",
+        "max_direct_mib",
+        "max_proxy_mib",
+        "competition_limit",
+        "season_limit",
+        "requests_per_minute",
+        "deadline",
+    )
+    if (
+        scopes
+        or entities != expected_entities
+        or any(identity.get(key) != authorized_conf.get(key) for key in required)
+    ):
+        raise _airflow_exception("FotMob active Bronze profile differs from owner")
+    if component == "bronze_runner" and (
+        any(
+            int(identity.get(key, -1)) != 0
+            for key in ("match_limit", "team_limit", "player_limit")
+        )
+        or int(identity.get("max_attempts", -1)) != 4
+        or str(identity.get("next_build_id") or "")
+        or str(identity.get("source_refresh_profile") or "")
+        or str(identity.get("source_refresh_targets_sha256") or "")
+        or identity.get("source_refresh_target_count") not in {None, "", 0, "0"}
+    ):
+        raise _airflow_exception("FotMob active Bronze runner profile differs")
+    return {
+        "generation_id": generation_id,
+        "owner_run_id": authorization["owner_run_id"],
+        "ingest_run_id": expected_ingest,
+        "lane": authorization["lane"],
+    }
+
+
+def _validate_automatic_kept_paused_writer(
+    report: Mapping[str, Any], identity: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Admit only the exact manual automatic-daily canary namespace.
+
+    The canary is the sole dynamic writer allowed while all six DAGs remain
+    paused.  It may temporarily enable only ingest and Silver; the scheduled
+    orchestrator and every legacy owner remain paused throughout.
+    """
+
+    raw_publication = identity.get("publication")
+    raw_binding = (
+        raw_publication.get("binding")
+        if isinstance(raw_publication, Mapping)
+        else None
+    )
+    if not isinstance(raw_binding, Mapping):
+        return None
+    try:
+        binding = make_publication_binding(
+            owner=raw_binding.get("owner"),
+            data_interval_start=raw_binding.get("data_interval_start"),
+            data_interval_end=raw_binding.get("data_interval_end"),
+            fingerprint=raw_binding.get("runtime_fingerprint"),
+        )
+        generation_id = str(uuid.UUID(str(raw_publication.get("generation_id"))))
+        generated_at = datetime.fromisoformat(
+            str(report.get("generated_at", "")).replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+        start = datetime.fromisoformat(binding["data_interval_start"]).astimezone(
+            timezone.utc
+        )
+        end = datetime.fromisoformat(binding["data_interval_end"]).astimezone(
+            timezone.utc
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    offset = (start - generated_at).total_seconds() - 86_400
+    if (
+        dict(raw_binding) != binding
+        or generation_id != make_generation_id(binding)
+        or binding["runtime_fingerprint"] != report.get("git_sha")
+        or end - start != timedelta(seconds=2)
+        or offset < FOTMOB_AUTOMATIC_CANARY_SLOT
+        or not offset.is_integer()
+        or (int(offset) - FOTMOB_AUTOMATIC_CANARY_SLOT) % 2
+    ):
+        return None
+    attempt = (int(offset) - FOTMOB_AUTOMATIC_CANARY_SLOT) // 2 + 1
+    compact = generation_id.replace("-", "")
+    component = str(identity.get("component") or "")
+    dag_id = str(identity.get("dag_id") or "")
+    run_id = str(identity.get("run_id") or "")
+    if component == "airflow_task" and dag_id == "dag_transform_fotmob_silver":
+        if run_id != f"fotmob_silver__{generation_id}":
+            raise _airflow_exception("FotMob automatic canary Silver identity differs")
+    elif (
+        component == "airflow_task" and dag_id == "dag_ingest_fotmob"
+    ) or component == "bronze_runner":
+        if component == "airflow_task" and run_id != (
+            f"automatic_canary_a{attempt}__{compact}"
+        ):
+            raise _airflow_exception("FotMob automatic canary ingest identity differs")
+        raw_scopes = identity.get("scopes")
+        scopes = (
+            [item for item in raw_scopes.split(",") if item]
+            if isinstance(raw_scopes, str)
+            else list(raw_scopes or ())
+        )
+        raw_entities = identity.get("entities")
+        entities = sorted(
+            {
+                str(item).strip().casefold()
+                for item in (
+                    raw_entities.split(",")
+                    if isinstance(raw_entities, str)
+                    else raw_entities or ()
+                )
+                if str(item).strip()
+            }
+        )
+        integer_fields = (
+            "competition_limit",
+            "season_limit",
+            "match_limit",
+            "team_limit",
+            "player_limit",
+        )
+        try:
+            limits = [int(identity.get(field, -1)) for field in integer_fields]
+            max_requests = int(identity.get("max_requests", -1))
+            max_direct_mib = float(identity.get("max_direct_mib", -1))
+            max_proxy_mib = float(identity.get("max_proxy_mib", -1))
+            request_rate = int(identity.get("requests_per_minute", -1))
+            max_attempts = int(identity.get("max_attempts", -1))
+        except (TypeError, ValueError) as exc:
+            raise _airflow_exception(
+                "FotMob automatic canary profile has invalid numeric fields"
+            ) from exc
+        if (
+            str(identity.get("mode") or "").strip().casefold() != "daily"
+            or identity.get("catalog_contract") != FOTMOB_CATALOG_CONTRACT_SCHEMA
+            or scopes
+            or entities != sorted(FOTMOB_DAILY_ENTITIES)
+            or any(limits)
+            or max_requests != FOTMOB_DAILY_MAX_REQUESTS
+            or max_direct_mib != FOTMOB_DAILY_MAX_DIRECT_MIB
+            or max_proxy_mib != 0
+            or request_rate != FOTMOB_DAILY_REQUESTS_PER_MINUTE
+            or max_attempts != 4
+            or str(identity.get("next_build_id") or "")
+            or str(identity.get("source_refresh_profile") or "")
+            or str(identity.get("source_refresh_targets_sha256") or "")
+            or identity.get("source_refresh_target_count") not in {None, "", 0, "0"}
+        ):
+            raise _airflow_exception("FotMob automatic canary profile differs")
+    else:
+        raise _airflow_exception(
+            "FotMob automatic canary writer component is not coordinator-owned"
+        )
+    return {
+        "mode": "daily",
+        "attempt": attempt,
+        "generation_id": generation_id,
+        "catalog_contract": FOTMOB_CATALOG_CONTRACT_SCHEMA,
+    }
+
+
+def _validate_rollback_kept_paused_writer(
+    report: Mapping[str, Any], identity: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Admit only the rollback coordinator's exact Silver-only namespace."""
+
+    raw_publication = identity.get("publication")
+    raw_binding = (
+        raw_publication.get("binding")
+        if isinstance(raw_publication, Mapping)
+        else None
+    )
+    if not isinstance(raw_binding, Mapping):
+        return None
+    try:
+        binding = make_publication_binding(
+            owner=raw_binding.get("owner"),
+            data_interval_start=raw_binding.get("data_interval_start"),
+            data_interval_end=raw_binding.get("data_interval_end"),
+            fingerprint=raw_binding.get("runtime_fingerprint"),
+        )
+        generation_id = str(uuid.UUID(str(raw_publication.get("generation_id"))))
+        generated_at = datetime.fromisoformat(
+            str(report.get("generated_at", "")).replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+        start = datetime.fromisoformat(binding["data_interval_start"]).astimezone(
+            timezone.utc
+        )
+        end = datetime.fromisoformat(binding["data_interval_end"]).astimezone(
+            timezone.utc
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    offset = (start - generated_at).total_seconds()
+    component = str(identity.get("component") or "")
+    dag_id = str(identity.get("dag_id") or "")
+    run_id = str(identity.get("run_id") or "")
+    expected_run_id = "rollback_silver__" + generation_id.replace("-", "")
+    if (
+        dict(raw_binding) != binding
+        or generation_id != make_generation_id(binding)
+        or binding["runtime_fingerprint"] != report.get("git_sha")
+        or end - start != timedelta(seconds=1)
+        or offset <= 0
+        or not offset.is_integer()
+        or component != "airflow_task"
+        or dag_id != "dag_transform_fotmob_silver"
+        or run_id != expected_run_id
+    ):
+        return None
+    return {
+        "mode": "rollback-silver",
+        "attempt": int(offset),
+        "generation_id": generation_id,
     }
 
 
@@ -556,15 +1027,17 @@ def _validate_issue930_kept_paused_writer(
             raise _airflow_exception("FotMob kept-paused ingest run identity differs")
         raw_scopes = identity.get("scopes")
         raw_scope_items = (
-            [item.strip() for item in raw_scopes.split(",") if item.strip()]
+            raw_scopes.split(",")
             if isinstance(raw_scopes, str)
             else list(raw_scopes or ())
         )
-        scope_items = (
-            raw_scope_items
-            if all(isinstance(item, str) for item in raw_scope_items)
-            else []
-        )
+        try:
+            scope_items = list(validate_scope_tokens(raw_scope_items))
+        except ValueError:
+            scope_items = []
+        scope_evidence_valid = tuple(raw_scope_items) == tuple(scope_items)
+        if not scope_evidence_valid:
+            scope_items = []
         scope_bytes = ("\n".join(scope_items) + "\n").encode("utf-8")
         raw_entities = identity.get("entities")
         entities = {
@@ -611,6 +1084,7 @@ def _validate_issue930_kept_paused_writer(
                 )
             if (
                 mode != "backfill"
+                or not scope_evidence_valid
                 or scope_items
                 or entities != {"players"}
                 or any(
@@ -637,9 +1111,9 @@ def _validate_issue930_kept_paused_writer(
                     "FotMob kept-paused source-refresh contract differs"
                 )
         elif (
-            len(scope_items) != FOTMOB_DAILY_SCOPE_COUNT
+            not scope_evidence_valid
+            or len(scope_items) != FOTMOB_DAILY_SCOPE_COUNT
             or len(set(scope_items)) != FOTMOB_DAILY_SCOPE_COUNT
-            or any(_SCOPE_LINE_RE.fullmatch(str(item)) is None for item in scope_items)
             or hashlib.sha256(scope_bytes).hexdigest() != FOTMOB_DAILY_SCOPE_SHA256
             or entities != FOTMOB_ISSUE930_WRITER_ENTITIES
             or competition_limit != 0
@@ -920,8 +1394,22 @@ def attest_fotmob_isolated_runtime(
         common_admission
         and report.get("activation_state") == "active"
         and report.get("kept_paused") is False
-        and report_paused == []
-        and report_unpaused == sorted(FOTMOB_EXPECTED_ISOLATED_DAGS)
+        and report_paused
+        == sorted(
+            {
+                FOTMOB_ISOLATED_DAILY_DAG_ID,
+                "dag_refresh_fotmob",
+                "dag_backfill_fotmob",
+            }
+        )
+        and report_unpaused
+        == sorted(
+            {
+                FOTMOB_AUTOMATIC_OWNER_DAG_ID,
+                "dag_ingest_fotmob",
+                "dag_transform_fotmob_silver",
+            }
+        )
     )
     pending_consumer_admission = (
         common_admission
@@ -948,6 +1436,37 @@ def attest_fotmob_isolated_runtime(
         )
     if report.get("container_report_path") != configured_path:
         raise _airflow_exception("FotMob deployment report path identity differs")
+
+    automatic_admission = None
+    if active_admission:
+        try:
+            from scripts.fotmob_runtime import (
+                validate_automatic_catalog_admission,
+                validate_automatic_rollout_activation,
+            )
+
+            report_time = datetime.fromisoformat(
+                str(report.get("generated_at", "")).replace("Z", "+00:00")
+            )
+            automatic_admission = validate_automatic_catalog_admission(
+                report.get("automatic_catalog_admission"), now=report_time
+            )
+            validate_automatic_rollout_activation(report, automatic_admission)
+        except Exception as exc:
+            raise _airflow_exception(
+                "FotMob active automatic admission is missing or invalid"
+            ) from exc
+        canary = automatic_admission.get("canary")
+        if (
+            not isinstance(canary, Mapping)
+            or canary.get("deployment_id") != report.get("deployment_id")
+            or canary.get("git_sha") != report.get("git_sha")
+            or canary.get("scheduler_container_id")
+            != report.get("scheduler_container_id")
+        ):
+            raise _airflow_exception(
+                "FotMob active canary identity differs from deployment"
+            )
 
     deployment_id = str(runtime_env.get(FOTMOB_DEPLOYMENT_ID_ENV, "")).strip()
     git_sha = str(runtime_env.get(FOTMOB_RUNTIME_FINGERPRINT_ENV, "")).strip()
@@ -977,10 +1496,12 @@ def attest_fotmob_isolated_runtime(
         dag_id = getattr(dag_run, "dag_id", None)
         run_type = getattr(dag_run, "run_type", None)
         normalized_run_type = str(getattr(run_type, "value", run_type) or "").casefold()
-        if (
-            dag_id not in FOTMOB_ISOLATED_OWNER_DAG_IDS
-            or normalized_run_type != "scheduled"
-        ):
+        admitted_owner_ids = (
+            {FOTMOB_ISOLATED_DAILY_DAG_ID}
+            if pending_consumer_admission
+            else FOTMOB_ISOLATED_OWNER_DAG_IDS
+        )
+        if dag_id not in admitted_owner_ids or normalized_run_type != "scheduled":
             raise _airflow_exception(
                 "FotMob daily producer requires an exact scheduled DagRun"
             )
@@ -993,11 +1514,16 @@ def attest_fotmob_isolated_runtime(
             context=context,
             runtime_fingerprint_value=git_sha,
         )
+    elif active_admission and not require_scheduled_owner:
+        identity = writer_identity or _issue930_writer_identity_from_context(context)
+        lifecycle = _validate_active_automatic_writer(identity)
     elif kept_paused_admission:
-        lifecycle = _validate_issue930_kept_paused_writer(
-            report,
-            writer_identity or _issue930_writer_identity_from_context(context),
-        )
+        identity = writer_identity or _issue930_writer_identity_from_context(context)
+        lifecycle = _validate_automatic_kept_paused_writer(report, identity)
+        if lifecycle is None:
+            lifecycle = _validate_rollback_kept_paused_writer(report, identity)
+        if lifecycle is None:
+            lifecycle = _validate_issue930_kept_paused_writer(report, identity)
 
     expected_manifest = report.get("isolated_runtime_sha256")
     if not isinstance(expected_manifest, Mapping) or any(
@@ -1021,9 +1547,16 @@ def attest_fotmob_isolated_runtime(
         "runtime_manifest_sha256": _runtime_manifest_digest(observed_manifest),
     }
     if lifecycle is not None:
-        result[
-            "pending_consumer" if pending_consumer_admission else "issue930_lifecycle"
-        ] = lifecycle
+        if active_admission:
+            result["automatic_writer_lifecycle"] = lifecycle
+        elif pending_consumer_admission:
+            result["pending_consumer"] = lifecycle
+        elif lifecycle.get("catalog_contract") == FOTMOB_CATALOG_CONTRACT_SCHEMA:
+            result["automatic_canary_lifecycle"] = lifecycle
+        else:
+            result["issue930_lifecycle"] = lifecycle
+    if automatic_admission is not None:
+        result["automatic_catalog_admission"] = automatic_admission
     return result
 
 
@@ -1034,6 +1567,7 @@ def attest_fotmob_shared_runtime(
     hostname: str | None = None,
     roots: Mapping[str, str | os.PathLike[str]] | None = None,
     require_scheduled_owner: bool = True,
+    allow_pending_wait: bool = False,
     **context: Any,
 ) -> dict[str, Any]:
     """Re-attest the shared host bind mounts against isolated admission.
@@ -1078,12 +1612,110 @@ def attest_fotmob_shared_runtime(
         and set(paused) == FOTMOB_EXPECTED_ISOLATED_DAGS
         and unpaused == []
     )
+    active_automatic_admission = (
+        activation_state == "active"
+        and report.get("kept_paused") is False
+        and isinstance(paused, list)
+        and set(paused)
+        == {
+            FOTMOB_ISOLATED_DAILY_DAG_ID,
+            "dag_refresh_fotmob",
+            "dag_backfill_fotmob",
+        }
+        and isinstance(unpaused, list)
+        and set(unpaused)
+        == {
+            FOTMOB_AUTOMATIC_OWNER_DAG_ID,
+            "dag_ingest_fotmob",
+            "dag_transform_fotmob_silver",
+        }
+    )
+    pending_automatic_wait_admission = (
+        allow_pending_wait
+        and not require_scheduled_owner
+        and activation_state == "pending_automatic"
+        and report.get("kept_paused") is False
+        and isinstance(paused, list)
+        and set(paused)
+        == {
+            FOTMOB_AUTOMATIC_OWNER_DAG_ID,
+            FOTMOB_ISOLATED_DAILY_DAG_ID,
+            "dag_refresh_fotmob",
+            "dag_backfill_fotmob",
+        }
+        and isinstance(unpaused, list)
+        and set(unpaused)
+        == {"dag_ingest_fotmob", "dag_transform_fotmob_silver"}
+    )
+    automatic_admission = None
+    automatic_rollout = None
+    if active_automatic_admission or pending_automatic_wait_admission:
+        try:
+            from scripts.fotmob_runtime import (
+                validate_automatic_catalog_admission,
+                validate_pending_automatic_shared_wait,
+                validate_automatic_rollout_activation,
+            )
+
+            report_time = datetime.fromisoformat(
+                str(report.get("generated_at", "")).replace("Z", "+00:00")
+            )
+            automatic_admission = validate_automatic_catalog_admission(
+                report.get("automatic_catalog_admission"), now=report_time
+            )
+            automatic_rollout = (
+                validate_pending_automatic_shared_wait(report, automatic_admission)
+                if pending_automatic_wait_admission
+                else validate_automatic_rollout_activation(
+                    report, automatic_admission
+                )
+            )
+        except Exception as exc:
+            raise _airflow_exception(
+                "FotMob shared automatic admission is missing or invalid"
+            ) from exc
+        canary = automatic_admission.get("canary")
+        if (
+            not isinstance(canary, Mapping)
+            or canary.get("deployment_id") != report.get("deployment_id")
+            or canary.get("git_sha") != report.get("git_sha")
+            or canary.get("scheduler_container_id")
+            != report.get("scheduler_container_id")
+        ):
+            raise _airflow_exception(
+                "FotMob shared canary identity differs from deployment"
+            )
+    if pending_automatic_wait_admission:
+        dag_run = context.get("dag_run")
+        run_type = getattr(dag_run, "run_type", None)
+        normalized_run_type = str(
+            getattr(run_type, "value", run_type) or ""
+        ).casefold()
+        task_instance = context.get("ti") or context.get("task_instance")
+        task = context.get("task")
+        task_id = str(
+            getattr(task_instance, "task_id", None)
+            or getattr(task, "task_id", None)
+            or ""
+        )
+        if (
+            getattr(dag_run, "dag_id", None) != FOTMOB_SHARED_CONSUMER_DAG_ID
+            or normalized_run_type != "scheduled"
+            or task_id != "wait_for_fotmob_publication"
+        ):
+            raise _airflow_exception(
+                "pending automatic admission is wait-sensor-only"
+            )
     deployment_id = str(report.get("deployment_id", "")).strip()
     git_sha = str(runtime_env.get(FOTMOB_RUNTIME_FINGERPRINT_ENV, "")).strip()
     if (
         report.get("schema_version") != "fotmob-deploy-v2"
         or report.get("passed") is not True
-        or not kept_paused_admission
+        or not (
+            kept_paused_admission
+            or active_automatic_admission
+            or pending_automatic_wait_admission
+        )
         or re.fullmatch(r"[0-9a-f]{32}", deployment_id) is None
         or report.get("git_sha") != runtime_fingerprint(git_sha)
         or runtime_env.get(FOTMOB_ISOLATED_STACK_ENV) not in {None, ""}
@@ -1162,6 +1794,14 @@ def attest_fotmob_shared_runtime(
         )
 
     if require_scheduled_owner:
+        if (
+            active_automatic_admission
+            or report.get("automatic_rollout") is not None
+            or report.get("coordinator_rollout") is not None
+        ):
+            raise _airflow_exception(
+                "FotMob automatic/coordinator rollout forbids the shared producer"
+            )
         dag_run = context.get("dag_run")
         dag_id = getattr(dag_run, "dag_id", None)
         run_type = getattr(dag_run, "run_type", None)
@@ -1178,7 +1818,7 @@ def attest_fotmob_shared_runtime(
         raise _airflow_exception(
             "FotMob shared runtime bytes differ from deployment report"
         )
-    return {
+    result = {
         "deployment_id": deployment_id,
         "git_sha": git_sha,
         "shared_scheduler_container_id": container_id,
@@ -1186,6 +1826,15 @@ def attest_fotmob_shared_runtime(
         "runtime_manifest_sha256": _runtime_manifest_digest(observed_manifest),
         "control_database_bound": True,
     }
+    if automatic_admission is not None:
+        result["automatic_catalog_admission"] = automatic_admission
+        result["automatic_rollout"] = automatic_rollout
+    if pending_automatic_wait_admission:
+        result["pending_automatic_wait"] = {
+            "wait_only": True,
+            "phase": "pending_owner",
+        }
+    return result
 
 
 def runtime_fingerprint(value: Any = None) -> str:
@@ -1567,6 +2216,79 @@ def record_fotmob_silver_candidate(
     return evidence
 
 
+def record_fotmob_bronze_only_candidate(
+    *,
+    validation_task_id: str,
+    silver_input_tables: Sequence[str],
+    **context: Any,
+) -> dict[str, Any]:
+    """Record the validated Bronze candidate when no Silver input changed."""
+
+    publication = publication_from_context(context) or {}
+    task_instance = context.get("ti")
+    if task_instance is None:
+        raise _airflow_exception("FotMob Bronze candidate task has no task instance")
+    normalized_task_id = str(validation_task_id or "").strip()
+    if not normalized_task_id:
+        raise _airflow_exception("FotMob Bronze validation task id is invalid")
+    validation = task_instance.xcom_pull(task_ids=normalized_task_id)
+    if not isinstance(validation, Mapping) or validation.get("status") not in {
+        "success",
+        "partial_success",
+    }:
+        raise _airflow_exception("FotMob validated Bronze evidence is not successful")
+
+    changed = validation.get("bronze_inputs_changed")
+    if not isinstance(changed, list) or any(
+        not isinstance(table, str) or not table.strip() for table in changed
+    ):
+        raise _airflow_exception("FotMob changed Bronze input evidence is invalid")
+    normalized_changed = sorted({table.strip().casefold() for table in changed})
+    if isinstance(silver_input_tables, (str, bytes)) or not isinstance(
+        silver_input_tables, Sequence
+    ):
+        raise _airflow_exception("FotMob Silver input table set is invalid")
+    if any(
+        not isinstance(table, str) or not table.strip()
+        for table in silver_input_tables
+    ):
+        raise _airflow_exception("FotMob Silver input table set is invalid")
+    normalized_silver_inputs = sorted(
+        {table.strip().casefold() for table in silver_input_tables}
+    )
+    if not normalized_silver_inputs:
+        raise _airflow_exception("FotMob Silver input table set is invalid")
+    if set(normalized_changed).intersection(normalized_silver_inputs):
+        return {
+            "status": "silver_required",
+            "recorded": False,
+            "bronze_inputs_changed": normalized_changed,
+        }
+
+    validated_bronze = dict(validation)
+    validated_bronze["bronze_inputs_changed"] = normalized_changed
+    validated_bronze = json.loads(
+        json.dumps(validated_bronze, sort_keys=True, separators=(",", ":"))
+    )
+    evidence = {
+        "schema": FOTMOB_PUBLICATION_SCHEMA,
+        "generation_id": publication.get("generation_id"),
+        "candidate_kind": "bronze_only",
+        "validation_task_id": normalized_task_id,
+        "validated_bronze": _normalize_candidate_value(validated_bronze),
+    }
+    evidence["digest"] = hashlib.sha256(
+        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if fotmob_ceremony_configured():
+        _control_store().record_publication_candidate(
+            publication["generation_id"],
+            evidence,
+            source=FOTMOB_PUBLICATION_SOURCE,
+        )
+    return evidence
+
+
 def seal_fotmob_publication(**context: Any) -> dict[str, Any]:
     """Move ``writing`` to ``ready`` only after the Silver child succeeded."""
 
@@ -1666,6 +2388,14 @@ def wait_and_claim_fotmob_publication(
 ) -> bool:
     """PythonSensor poke: wait for exact ``ready`` then claim atomically."""
 
+    runtime = attest_fotmob_shared_runtime(
+        require_scheduled_owner=False,
+        allow_pending_wait=True,
+        **context,
+    )
+    if runtime.get("pending_automatic_wait") is not None:
+        logger.info("FotMob automatic activation is pending; sensor remains waiting")
+        return False
     publication = expected_publication(publication_owner, context)
     state = _control_store().get_publication_generation(
         publication["generation_id"], source=FOTMOB_PUBLICATION_SOURCE
@@ -1706,6 +2436,13 @@ def wait_and_claim_fotmob_publication(
 def validate_fotmob_consumer_fence(**context: Any) -> dict[str, Any]:
     """Fail unless this child belongs to the exact active claiming parent."""
 
+    # ControlStore proves the publication lock, while the shared runtime
+    # attestation independently proves that this task still executes the
+    # admitted bytes/container/report.  Both trust boundaries are required.
+    runtime = attest_fotmob_shared_runtime(
+        require_scheduled_owner=False,
+        **context,
+    )
     publication = publication_from_context(context)
     conf = _dag_run_conf(context)
     parent_dag_id = str(conf.get("publication_owner") or "").strip()
@@ -1739,6 +2476,7 @@ def validate_fotmob_consumer_fence(**context: Any) -> dict[str, Any]:
             "FotMob consumer fence rejected child: " + "; ".join(violations)
         )
     return {
+        "runtime": runtime,
         "generation_id": publication["generation_id"],
         "binding": publication["binding"],
         "consumer": expected_consumer,
@@ -1757,6 +2495,7 @@ def finalize_fotmob_publication_consumer(
 ) -> dict[str, Any]:
     """Publish+release after the consumer, or fail without an unsafe unlock."""
 
+    attest_fotmob_shared_runtime(require_scheduled_owner=False, **context)
     publication = expected_publication(publication_owner, context)
     store = _control_store()
     state = store.get_publication_generation(

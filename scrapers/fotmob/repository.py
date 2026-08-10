@@ -20,13 +20,19 @@ import hashlib
 import json
 import logging
 from dataclasses import asdict, dataclass, field, is_dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Iterable, Mapping, Optional, Protocol, Sequence
 
 import pandas as pd
 
 from scrapers.base.iceberg_writer import IcebergWriter
+from scrapers.fotmob.domain import (
+    CompetitionScopeEvidence,
+    ProbeStatus,
+    ScopeDecision,
+)
+from scrapers.fotmob.planner import ScopeAttemptState
 
 
 logger = logging.getLogger(__name__)
@@ -37,6 +43,32 @@ PARSER_VERSION = "fotmob-native-v2"
 # successful v2 replacement or an explicit v2 tombstone exists.
 LEGACY_PARSER_VERSION = "fotmob-native-v1"
 MANIFEST_TABLE = "fotmob_ingest_manifest"
+SCOPE_OBSERVATIONS_TABLE = "fotmob_competition_scope_observations"
+
+SCOPE_ATTEMPT_OUTCOMES = frozenset(
+    {"success", "retryable", "terminal", "source_gap", "deferred"}
+)
+
+_SCOPE_EVIDENCE_FIELDS = (
+    "competition_id",
+    "catalog_name",
+    "profile_name",
+    "source_gender",
+    "source_age_group",
+    "source_type",
+    "probe_status",
+    "decision",
+    "reason",
+    "policy_rule",
+    "classifier_version",
+    "profile_target_key",
+    "profile_content_hash",
+    "catalog_fingerprint",
+    "authoritative_miss_count",
+    "probe_attempt_count",
+    "next_probe_at",
+    "observed_at",
+)
 
 
 class ManifestStatus(str, Enum):
@@ -83,6 +115,73 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _evidence_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _scope_evidence_from_row(
+    row: Mapping[str, Any],
+) -> CompetitionScopeEvidence:
+    def enum_value(value: Any) -> str:
+        return str(value.value if isinstance(value, Enum) else value)
+
+    observed_at = _evidence_datetime(row.get("observed_at"))
+    if observed_at is None:
+        raise ValueError("scope evidence observed_at is required")
+    return CompetitionScopeEvidence(
+        competition_id=int(row["competition_id"]),
+        catalog_name=str(row.get("catalog_name") or ""),
+        profile_name=(
+            str(row["profile_name"]) if row.get("profile_name") is not None else None
+        ),
+        source_gender=(
+            str(row["source_gender"])
+            if row.get("source_gender") is not None
+            else None
+        ),
+        source_age_group=(
+            str(row["source_age_group"])
+            if row.get("source_age_group") is not None
+            else None
+        ),
+        source_type=(
+            str(row["source_type"]) if row.get("source_type") is not None else None
+        ),
+        probe_status=ProbeStatus(enum_value(row["probe_status"])),
+        decision=ScopeDecision(enum_value(row["decision"])),
+        reason=str(row.get("reason") or ""),
+        policy_rule=str(row.get("policy_rule") or ""),
+        classifier_version=str(row.get("classifier_version") or ""),
+        profile_target_key=(
+            str(row["profile_target_key"])
+            if row.get("profile_target_key") is not None
+            else None
+        ),
+        profile_content_hash=(
+            str(row["profile_content_hash"])
+            if row.get("profile_content_hash") is not None
+            else None
+        ),
+        catalog_fingerprint=str(row.get("catalog_fingerprint") or ""),
+        authoritative_miss_count=int(row.get("authoritative_miss_count") or 0),
+        probe_attempt_count=(
+            int(row["probe_attempt_count"])
+            if row.get("probe_attempt_count") is not None
+            else None
+        ),
+        next_probe_at=_evidence_datetime(row.get("next_probe_at")),
+        observed_at=observed_at,
+    )
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
@@ -103,6 +202,143 @@ def stable_json(value: Any) -> str:
         separators=(",", ":"),
         default=_json_default,
     )
+
+
+def _scope_attempt_target_key(
+    competition_id: int, source_season_key: str, plan_signature: str
+) -> str:
+    material = stable_json(
+        {
+            "competition_id": int(competition_id),
+            "source_season_key": str(source_season_key),
+            "plan_signature": str(plan_signature),
+            "target_type": "scope_attempt",
+        }
+    ).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _scope_attempt_state_from_values(
+    *,
+    competition_id: Any,
+    source_season_key: Any,
+    plan_signature: Any,
+    completed_at: Any,
+    retry_after: Any,
+    capabilities: Any,
+) -> Optional[ScopeAttemptState]:
+    try:
+        values = (
+            json.loads(capabilities)
+            if isinstance(capabilities, str)
+            else dict(capabilities or {})
+        )
+        last_attempt_at = _evidence_datetime(
+            values.get("last_attempt_at") or completed_at
+        )
+        if last_attempt_at is None:
+            return None
+        next_retry_at = _evidence_datetime(
+            values.get("next_retry_at") or retry_after
+        )
+        return ScopeAttemptState(
+            competition_id=int(competition_id),
+            source_season_key=str(source_season_key),
+            plan_signature=str(plan_signature),
+            attempt_count=int(values["attempt_count"]),
+            last_attempt_at=last_attempt_at,
+            next_retry_at=next_retry_at,
+            outcome=str(values["outcome"]),
+            reason=str(values.get("reason") or ""),
+            attempt_identities=tuple(
+                str(value) for value in values.get("attempt_identities") or ()
+            ),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _scope_attempt_commit(
+    *,
+    run_id: str,
+    competition_id: int,
+    source_season_key: str,
+    plan_signature: str,
+    attempt_count: int,
+    outcome: str,
+    reason: str,
+    last_attempt_at: Optional[datetime],
+    next_retry_at: Optional[datetime],
+    attempt_identities: Iterable[str],
+) -> tuple[TargetCommit, ScopeAttemptState]:
+    # Defined below TargetCommit at runtime; annotations are postponed.
+    normalized_outcome = str(outcome).strip().casefold()
+    if normalized_outcome not in SCOPE_ATTEMPT_OUTCOMES:
+        raise ValueError(f"unsupported scope attempt outcome: {outcome!r}")
+    signature = str(plan_signature).strip()
+    season = str(source_season_key)
+    normalized_reason = str(reason).strip()
+    if not signature or not season or not normalized_reason:
+        raise ValueError("scope attempt signature, season, and reason are required")
+    if type(competition_id) is not int or competition_id <= 0:
+        raise ValueError("scope attempt competition ID must be positive")
+    if int(attempt_count) <= 0:
+        raise ValueError("scope attempt count must be positive")
+    attempted_at = _evidence_datetime(last_attempt_at) or utc_now()
+    due_at = _evidence_datetime(next_retry_at)
+    if normalized_outcome in {"retryable", "deferred"} and due_at is None:
+        raise ValueError(f"{normalized_outcome} scope attempt requires next_retry_at")
+    identities = tuple(dict.fromkeys(str(value).strip() for value in attempt_identities))
+    if any(not value for value in identities):
+        raise ValueError("scope attempt identities must not be empty")
+    if normalized_outcome == "source_gap" and len(identities) < 2:
+        raise ValueError("source_gap requires two distinct attempt identities")
+    state = ScopeAttemptState(
+        competition_id=competition_id,
+        source_season_key=season,
+        plan_signature=signature,
+        attempt_count=int(attempt_count),
+        last_attempt_at=attempted_at,
+        next_retry_at=due_at,
+        outcome=normalized_outcome,
+        reason=normalized_reason,
+        attempt_identities=identities,
+    )
+    capabilities = {
+        "plan_signature": signature,
+        "attempt_count": state.attempt_count,
+        "last_attempt_at": attempted_at.isoformat(),
+        "next_retry_at": due_at.isoformat() if due_at else None,
+        "outcome": normalized_outcome,
+        "reason": normalized_reason,
+        "attempt_identities": list(identities),
+        "run_id": str(run_id),
+    }
+    status = {
+        "success": ManifestStatus.SUCCESS,
+        "retryable": ManifestStatus.RETRYABLE_FAILURE,
+        "deferred": ManifestStatus.RETRYABLE_FAILURE,
+        "terminal": ManifestStatus.TERMINAL_FAILURE,
+        "source_gap": ManifestStatus.NOT_AVAILABLE,
+    }[normalized_outcome]
+    rendered = stable_json(capabilities)
+    commit = TargetCommit(
+        run_id=str(run_id),
+        target_type="scope_attempt",
+        target_key=_scope_attempt_target_key(competition_id, season, signature),
+        status=status,
+        competition_id=str(competition_id),
+        source_season_key=season,
+        entity_id=signature,
+        content_hash=hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+        observation_id=str(run_id),
+        capabilities=capabilities,
+        error_code=(None if normalized_outcome == "success" else normalized_outcome),
+        error=(None if normalized_outcome == "success" else normalized_reason),
+        retry_after=due_at,
+        completed_at=attempted_at,
+    )
+    return commit, state
 
 
 def deterministic_target_batch_id(
@@ -359,6 +595,7 @@ class TargetCommit:
 # source_season_key is VARCHAR and is never derived from a year integer.
 TABLE_PARTITIONS: dict[str, tuple[str, ...]] = {
     "fotmob_competitions": ("discovery_date",),
+    SCOPE_OBSERVATIONS_TABLE: ("competition_id",),
     "fotmob_competition_seasons": ("competition_id",),
     "fotmob_competition_season_history": ("competition_id",),
     "fotmob_season_stages": ("competition_id", "source_season_key"),
@@ -380,6 +617,7 @@ TABLE_PARTITIONS: dict[str, tuple[str, ...]] = {
 
 CURRENT_VIEW_SPECS: dict[str, tuple[str, tuple[str, ...]]] = {
     "fotmob_competitions": ("all_leagues", ("competition_id",)),
+    SCOPE_OBSERVATIONS_TABLE: ("competition_profile", ("competition_id",)),
     "fotmob_competition_seasons": (
         "competition_seasons",
         ("competition_id", "source_season_key"),
@@ -603,6 +841,7 @@ class FotMobRepository:
         self._run_entity_index: dict[tuple[str, str], dict[str, Any]] = {}
         self._preloaded_run_id: Optional[str] = None
         self._raw_entity_index: dict[tuple[str, str], dict[str, Any]] = {}
+        self._scope_attempt_run_ids: dict[tuple[str, int, str], str] = {}
         self._preloaded = False
 
     def _write(
@@ -1369,11 +1608,12 @@ class FotMobRepository:
         return paths[-1] if paths else ""
 
     def ensure_schema(self) -> None:
-        """Create the stable manifest and current logical views.
+        """Create stable manifest/evidence tables used before entity fan-out.
 
         Entity tables are created by their first typed dataframe because some
-        FotMob capabilities are competition-specific.  The manifest schema is
-        fixed so even a completely unavailable run remains observable.
+        FotMob capabilities are competition-specific.  Manifest and scope
+        evidence schemas are fixed so an unavailable first profile cannot
+        create an unusable all-NULL inferred table.
         """
 
         manager_getter = getattr(self.writer, "_get_trino_manager", None)
@@ -1420,6 +1660,45 @@ class FotMobRepository:
                 _entity_type VARCHAR,
                 _ingested_at TIMESTAMP(6)
             ) WITH (partitioning = ARRAY['target_type'])
+            """
+        )
+        trino._execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.catalog}.{self.schema}.{SCOPE_OBSERVATIONS_TABLE} (
+                competition_id VARCHAR,
+                catalog_name VARCHAR,
+                profile_name VARCHAR,
+                source_gender VARCHAR,
+                source_age_group VARCHAR,
+                source_type VARCHAR,
+                probe_status VARCHAR,
+                decision VARCHAR,
+                reason VARCHAR,
+                policy_rule VARCHAR,
+                classifier_version VARCHAR,
+                profile_target_key VARCHAR,
+                profile_content_hash VARCHAR,
+                catalog_fingerprint VARCHAR,
+                authoritative_miss_count INTEGER,
+                probe_attempt_count INTEGER,
+                next_probe_at TIMESTAMP(6),
+                observed_at TIMESTAMP(6),
+                discovery_run_id VARCHAR,
+                _target_batch_id VARCHAR,
+                _payload_sha256 VARCHAR,
+                _parser_version VARCHAR,
+                _raw_uri VARCHAR,
+                _observed_at TIMESTAMP(6),
+                _source VARCHAR,
+                _entity_type VARCHAR,
+                _ingested_at TIMESTAMP(6)
+            ) WITH (partitioning = ARRAY['competition_id'])
+            """
+        )
+        trino._execute(
+            f"""
+            ALTER TABLE {self.catalog}.{self.schema}.{SCOPE_OBSERVATIONS_TABLE}
+            ADD COLUMN IF NOT EXISTS probe_attempt_count INTEGER
             """
         )
 
@@ -1546,6 +1825,63 @@ class FotMobRepository:
             )
             created.append(f"{self.catalog}.{self.schema}.{view}")
         return created
+
+    def latest_scope_evidence(
+        self, competition_ids: Iterable[int]
+    ) -> dict[int, CompetitionScopeEvidence]:
+        """Return newest manifest-committed profile evidence for each id."""
+
+        wanted = sorted({int(value) for value in competition_ids})
+        if not wanted:
+            return {}
+        manager_getter = getattr(self.writer, "_get_trino_manager", None)
+        if manager_getter is None:
+            return {}
+        trino = manager_getter()
+        if not trino.table_exists(self.schema, SCOPE_OBSERVATIONS_TABLE):
+            return {}
+        safe_version = PARSER_VERSION.replace("'", "''")
+        id_values = ", ".join(f"'{value}'" for value in wanted)
+        selected = ", ".join(f'e."{field}"' for field in _SCOPE_EVIDENCE_FIELDS)
+        rows = trino.execute_query(
+            f"""
+            WITH committed AS (
+                SELECT DISTINCT batch_id
+                FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+                WHERE target_type = 'competition_profile'
+                  AND parser_version = '{safe_version}'
+                  AND status IN ('success', 'not_modified')
+            ), ranked AS (
+                SELECT {selected},
+                       ROW_NUMBER() OVER (
+                           PARTITION BY e.competition_id
+                           ORDER BY e.observed_at DESC,
+                                    e._ingested_at DESC,
+                                    e._target_batch_id DESC
+                       ) AS evidence_rn
+                FROM {self.catalog}.{self.schema}.{SCOPE_OBSERVATIONS_TABLE} e
+                INNER JOIN committed m
+                    ON m.batch_id = e._target_batch_id
+                WHERE CAST(e.competition_id AS VARCHAR) IN ({id_values})
+            )
+            SELECT {', '.join(f'"{field}"' for field in _SCOPE_EVIDENCE_FIELDS)}
+            FROM ranked
+            WHERE evidence_rn = 1
+            """
+        )
+        output: dict[int, CompetitionScopeEvidence] = {}
+        for raw in rows:
+            if isinstance(raw, Mapping):
+                row = {str(key).lower(): value for key, value in raw.items()}
+            else:
+                row = dict(zip(_SCOPE_EVIDENCE_FIELDS, raw))
+            try:
+                evidence = _scope_evidence_from_row(row)
+            except (KeyError, TypeError, ValueError):
+                logger.warning("ignoring malformed FotMob scope evidence row")
+                continue
+            output[evidence.competition_id] = evidence
+        return output
 
     def latest_success(
         self, target_key: str, *, run_id: Optional[str] = None
@@ -1696,6 +2032,92 @@ class FotMobRepository:
         view = dict(zip(columns, rows[0]))
         return view if view.get("status") in SUCCESS_STATES else None
 
+    def latest_entity_attempt(
+        self,
+        target_type: str,
+        entity_id: str | int,
+        *,
+        run_id: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Return the newest scheduler attempt, including failure states."""
+
+        normalized_type = str(target_type)
+        normalized_id = str(entity_id)
+        normalized_run_id = str(run_id).strip() if run_id is not None else None
+        if run_id is not None and not normalized_run_id:
+            raise ValueError("run_id must not be empty")
+
+        pending = [
+            row
+            for row in self._pending_manifest
+            if row.get("parser_version") == PARSER_VERSION
+            and str(row.get("target_type")) == normalized_type
+            and str(row.get("entity_id")) == normalized_id
+            and (
+                normalized_run_id is None
+                or str(row.get("run_id") or "") == normalized_run_id
+            )
+        ]
+        pending_view = None
+        if pending:
+            newest = max(
+                pending,
+                key=lambda row: (
+                    _completed_at_key(row),
+                    str(row.get("batch_id") or ""),
+                ),
+            )
+            pending_view = {
+                column: newest.get(column) for column in self._READ_COLUMNS
+            }
+            pending_view["run_id"] = newest.get("run_id")
+
+        manager_getter = getattr(self.writer, "_get_trino_manager", None)
+        if manager_getter is None:
+            return pending_view
+        trino = manager_getter()
+        safe_type = normalized_type.replace("'", "''")
+        safe_id = normalized_id.replace("'", "''")
+        safe_version = PARSER_VERSION.replace("'", "''")
+        safe_statuses = ", ".join(
+            f"'{status.value}'" for status in ManifestStatus
+        )
+        run_filter = (
+            ""
+            if normalized_run_id is None
+            else "\n              AND run_id = '"
+            + normalized_run_id.replace("'", "''")
+            + "'"
+        )
+        columns = ", ".join(self._READ_COLUMNS)
+        rows = trino.execute_query(
+            f"""
+            SELECT {columns}
+            FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+            WHERE target_type = '{safe_type}'
+              AND entity_id = '{safe_id}'
+              AND parser_version = '{safe_version}'
+              AND status IN ({safe_statuses})
+              {run_filter}
+            ORDER BY completed_at DESC, batch_id DESC
+            LIMIT 1
+            """
+        )
+        durable_view = (
+            dict(zip(self._READ_COLUMNS, rows[0])) if rows else None
+        )
+        if pending_view is None:
+            return durable_view
+        if durable_view is None:
+            return pending_view
+        return max(
+            (pending_view, durable_view),
+            key=lambda view: (
+                _completed_at_key(view),
+                str(view.get("batch_id") or ""),
+            ),
+        )
+
     def latest_entity_raw_target(
         self, target_type: str, entity_id: str | int
     ) -> Optional[dict[str, Any]]:
@@ -1799,6 +2221,133 @@ class FotMobRepository:
             except (TypeError, ValueError):
                 continue
         return output
+
+    def scope_attempt_states(
+        self,
+        plan_signature: str,
+        *,
+        parser_version: str = PARSER_VERSION,
+    ) -> dict[tuple[int, str], ScopeAttemptState]:
+        """Return the latest outcome for every exact scope, including failures."""
+
+        signature = str(plan_signature).strip()
+        if not signature:
+            raise ValueError("plan_signature must not be empty")
+        output: dict[tuple[int, str], ScopeAttemptState] = {}
+        manager_getter = getattr(self.writer, "_get_trino_manager", None)
+        if manager_getter is not None:
+            trino = manager_getter()
+            safe_signature = signature.replace("'", "''")
+            safe_version = str(parser_version).replace("'", "''")
+            rows = trino.execute_query(
+                f"""
+                SELECT competition_id, source_season_key, entity_id,
+                       completed_at, retry_after, capabilities_json
+                FROM (
+                    SELECT competition_id, source_season_key, entity_id,
+                           completed_at, retry_after, capabilities_json,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY competition_id, source_season_key
+                               ORDER BY completed_at DESC, batch_id DESC
+                           ) AS row_number
+                    FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+                    WHERE target_type = 'scope_attempt'
+                      AND entity_id = '{safe_signature}'
+                      AND parser_version = '{safe_version}'
+                      AND competition_id IS NOT NULL
+                      AND source_season_key IS NOT NULL
+                ) ranked
+                WHERE row_number = 1
+                """
+            )
+            for row in rows:
+                state = _scope_attempt_state_from_values(
+                    competition_id=row[0],
+                    source_season_key=row[1],
+                    plan_signature=row[2],
+                    completed_at=row[3],
+                    retry_after=row[4],
+                    capabilities=row[5],
+                )
+                if state is not None:
+                    output[state.identity] = state
+                    try:
+                        values = json.loads(row[5]) if isinstance(row[5], str) else row[5]
+                        self._scope_attempt_run_ids[
+                            (signature, *state.identity)
+                        ] = str((values or {}).get("run_id") or "")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        pass
+        for row in self._pending_manifest:
+            if row.get("target_type") != "scope_attempt" or row.get(
+                "entity_id"
+            ) != signature:
+                continue
+            state = _scope_attempt_state_from_values(
+                competition_id=row.get("competition_id"),
+                source_season_key=row.get("source_season_key"),
+                plan_signature=row.get("entity_id"),
+                completed_at=row.get("completed_at"),
+                retry_after=row.get("retry_after"),
+                capabilities=row.get("capabilities_json"),
+            )
+            current = output.get(state.identity) if state is not None else None
+            if state is not None and (
+                current is None
+                or (state.last_attempt_at, state.attempt_count)
+                >= (current.last_attempt_at, current.attempt_count)
+            ):
+                output[state.identity] = state
+                try:
+                    values = json.loads(row.get("capabilities_json") or "{}")
+                    self._scope_attempt_run_ids[
+                        (signature, *state.identity)
+                    ] = str(values.get("run_id") or "")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+        return output
+
+    def record_scope_attempt(
+        self,
+        *,
+        run_id: str,
+        competition_id: int,
+        source_season_key: str,
+        plan_signature: str,
+        outcome: str,
+        reason: str,
+        last_attempt_at: Optional[datetime] = None,
+        next_retry_at: Optional[datetime] = None,
+        attempt_identities: Iterable[str] = (),
+    ) -> ScopeAttemptState:
+        """Append one scheduler outcome without reusing HTTP attempt counters."""
+
+        previous = self.scope_attempt_states(plan_signature).get(
+            (int(competition_id), str(source_season_key))
+        )
+        previous_run_id = self._scope_attempt_run_ids.get(
+            (str(plan_signature), int(competition_id), str(source_season_key))
+        )
+        commit, state = _scope_attempt_commit(
+            run_id=run_id,
+            competition_id=competition_id,
+            source_season_key=source_season_key,
+            plan_signature=plan_signature,
+            attempt_count=(
+                previous.attempt_count
+                if previous is not None and previous_run_id == str(run_id)
+                else previous.attempt_count + 1
+                if previous is not None
+                else 1
+            ),
+            outcome=outcome,
+            reason=reason,
+            last_attempt_at=last_attempt_at,
+            next_retry_at=next_retry_at,
+            attempt_identities=attempt_identities,
+        )
+        self.commit(commit)
+        return state
 
     def scope_completion_times(
         self,
@@ -2037,6 +2586,39 @@ class MemoryFotMobRepository:
     def ensure_current_views(self) -> list[str]:
         return []
 
+    def latest_scope_evidence(
+        self, competition_ids: Iterable[int]
+    ) -> dict[int, CompetitionScopeEvidence]:
+        wanted = {int(value) for value in competition_ids}
+        if not wanted:
+            return {}
+        committed_batches = {
+            commit.batch_id
+            for commit in self.commits
+            if commit.target_type == "competition_profile"
+            and commit.parser_version == PARSER_VERSION
+            and commit.status.value in SUCCESS_STATES
+        }
+        selected: dict[int, tuple[tuple[datetime, str, str], CompetitionScopeEvidence]] = {}
+        for row in self.tables.get(SCOPE_OBSERVATIONS_TABLE, []):
+            if row.get("_target_batch_id") not in committed_batches:
+                continue
+            try:
+                evidence = _scope_evidence_from_row(row)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if evidence.competition_id not in wanted:
+                continue
+            rank = (
+                evidence.observed_at,
+                str(row.get("_ingested_at") or ""),
+                str(row.get("_target_batch_id") or ""),
+            )
+            current = selected.get(evidence.competition_id)
+            if current is None or rank >= current[0]:
+                selected[evidence.competition_id] = (rank, evidence)
+        return {competition_id: value[1] for competition_id, value in selected.items()}
+
     def flush(self) -> list[str]:
         return []
 
@@ -2126,6 +2708,42 @@ class MemoryFotMobRepository:
                 )
         return None
 
+    def latest_entity_attempt(
+        self,
+        target_type: str,
+        entity_id: str | int,
+        *,
+        run_id: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        normalized_run_id = str(run_id).strip() if run_id is not None else None
+        if run_id is not None and not normalized_run_id:
+            raise ValueError("run_id must not be empty")
+        candidates = [
+            (index, commit)
+            for index, commit in enumerate(self.commits)
+            if commit.target_type == str(target_type)
+            and commit.entity_id == str(entity_id)
+            and commit.parser_version == PARSER_VERSION
+            and (
+                normalized_run_id is None or commit.run_id == normalized_run_id
+            )
+        ]
+        if not candidates:
+            return None
+        latest_index, latest = max(
+            candidates,
+            key=lambda indexed: (
+                str(indexed[1].completed_at or ""),
+                indexed[0],
+            ),
+        )
+        view = latest.manifest_row()
+        if latest.completed_at is None:
+            view["completed_at"] = datetime.min + timedelta(
+                microseconds=latest_index + 1
+            )
+        return view
+
     def latest_entity_raw_target(
         self, target_type: str, entity_id: str | int
     ) -> Optional[dict[str, Any]]:
@@ -2164,6 +2782,90 @@ class MemoryFotMobRepository:
             and commit.competition_id is not None
             and commit.source_season_key is not None
         }
+
+    def scope_attempt_states(
+        self,
+        plan_signature: str,
+        *,
+        parser_version: str = PARSER_VERSION,
+    ) -> dict[tuple[int, str], ScopeAttemptState]:
+        signature = str(plan_signature).strip()
+        if not signature:
+            raise ValueError("plan_signature must not be empty")
+        output: dict[tuple[int, str], ScopeAttemptState] = {}
+        for commit in self.commits:
+            if (
+                commit.target_type != "scope_attempt"
+                or commit.entity_id != signature
+                or commit.parser_version != parser_version
+                or commit.competition_id is None
+                or commit.source_season_key is None
+            ):
+                continue
+            state = _scope_attempt_state_from_values(
+                competition_id=commit.competition_id,
+                source_season_key=commit.source_season_key,
+                plan_signature=commit.entity_id,
+                completed_at=commit.completed_at,
+                retry_after=commit.retry_after,
+                capabilities=commit.capabilities,
+            )
+            current = output.get(state.identity) if state is not None else None
+            if state is not None and (
+                current is None
+                or (state.last_attempt_at, state.attempt_count)
+                >= (current.last_attempt_at, current.attempt_count)
+            ):
+                output[state.identity] = state
+        return output
+
+    def record_scope_attempt(
+        self,
+        *,
+        run_id: str,
+        competition_id: int,
+        source_season_key: str,
+        plan_signature: str,
+        outcome: str,
+        reason: str,
+        last_attempt_at: Optional[datetime] = None,
+        next_retry_at: Optional[datetime] = None,
+        attempt_identities: Iterable[str] = (),
+    ) -> ScopeAttemptState:
+        previous = self.scope_attempt_states(plan_signature).get(
+            (int(competition_id), str(source_season_key))
+        )
+        previous_run_id = next(
+            (
+                str(commit.capabilities.get("run_id") or commit.run_id)
+                for commit in reversed(self.commits)
+                if commit.target_type == "scope_attempt"
+                and commit.entity_id == str(plan_signature)
+                and commit.competition_id == str(competition_id)
+                and commit.source_season_key == str(source_season_key)
+            ),
+            None,
+        )
+        commit, state = _scope_attempt_commit(
+            run_id=run_id,
+            competition_id=competition_id,
+            source_season_key=source_season_key,
+            plan_signature=plan_signature,
+            attempt_count=(
+                previous.attempt_count
+                if previous is not None and previous_run_id == str(run_id)
+                else previous.attempt_count + 1
+                if previous is not None
+                else 1
+            ),
+            outcome=outcome,
+            reason=reason,
+            last_attempt_at=last_attempt_at,
+            next_retry_at=next_retry_at,
+            attempt_identities=attempt_identities,
+        )
+        self.commit(commit)
+        return state
 
     def scope_completion_times(
         self,

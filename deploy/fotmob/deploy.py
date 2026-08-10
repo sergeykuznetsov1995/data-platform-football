@@ -2,8 +2,8 @@
 """Deploy and admit the isolated FotMob Airflow stack.
 
 Admission is deliberately fail-closed: the scheduler must be healthy, its
-DagBag must contain exactly the three expected DAGs, and import errors must be
-empty before any DAG is unpaused.  A JSON report is written for every attempt.
+DagBag must contain exactly the six FotMob DAGs, and import errors must be empty
+before any DAG is unpaused.  A JSON report is written for every attempt.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -18,31 +19,57 @@ import secrets
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+runtime_binding = importlib.import_module("scripts.fotmob_runtime")
 
 
 EXPECTED_DAGS = frozenset(
     {
+        "dag_orchestrate_fotmob",
         "dag_ingest_fotmob",
         "dag_transform_fotmob_silver",
         "dag_trigger_fotmob_daily",
+        "dag_refresh_fotmob",
+        "dag_backfill_fotmob",
     }
 )
 EXPECTED_DAG_FILES = {
+    "dag_orchestrate_fotmob": "/opt/airflow/dags/dag_orchestrate_fotmob.py",
     "dag_ingest_fotmob": "/opt/airflow/dags/dag_ingest_fotmob.py",
     "dag_transform_fotmob_silver": ("/opt/airflow/dags/dag_transform_fotmob_silver.py"),
     "dag_trigger_fotmob_daily": "/opt/airflow/dags/dag_trigger_fotmob_daily.py",
+    "dag_refresh_fotmob": "/opt/airflow/dags/dag_refresh_fotmob.py",
+    "dag_backfill_fotmob": "/opt/airflow/dags/dag_backfill_fotmob.py",
 }
 EXPECTED_SCHEDULES = {
+    "dag_orchestrate_fotmob": "*/5 * * * *",
     "dag_ingest_fotmob": "None",
     "dag_transform_fotmob_silver": "None",
-    "dag_trigger_fotmob_daily": "0 14 * * *",
+    "dag_trigger_fotmob_daily": "None",
+    "dag_refresh_fotmob": "None",
+    "dag_backfill_fotmob": "None",
 }
+AUTOMATIC_OWNER_DAG_ID = "dag_orchestrate_fotmob"
+LEGACY_OWNER_DAGS = frozenset(
+    {"dag_trigger_fotmob_daily", "dag_refresh_fotmob", "dag_backfill_fotmob"}
+)
+AUTOMATIC_ACTIVE_DAGS = frozenset(
+    {AUTOMATIC_OWNER_DAG_ID, "dag_ingest_fotmob", "dag_transform_fotmob_silver"}
+)
+AUTOMATIC_CANARY_SCHEMA = "fotmob-automatic-canary-v1"
+AUTOMATIC_ROLLOUT_SCHEMA = "fotmob-automatic-rollout-v1"
+COORDINATOR_ROLLOUT_SCHEMA = "fotmob-coordinator-rollout-v1"
 ACTIVE_STATES = ("running", "queued")
 # This proves a real scheduled DagRun identity, not business/data success.  A
 # failed terminal run still owns the exact admitted interval and must never be
@@ -109,9 +136,12 @@ SHARED_RUNTIME_SUFFIXES = (
     ".txt",
 )
 ISOLATED_DAG_ROOT_PATHS = {
+    "dags/dag_orchestrate_fotmob.py",
     "dags/dag_ingest_fotmob.py",
     "dags/dag_transform_fotmob_silver.py",
     "dags/dag_trigger_fotmob_daily.py",
+    "dags/dag_refresh_fotmob.py",
+    "dags/dag_backfill_fotmob.py",
 }
 ISOLATED_DAG_PREFIXES = (
     "dags/scripts/",
@@ -128,6 +158,9 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "configs/fotmob/issue-930-scopes.txt",
     "dags/.airflowignore",
     "dags/dag_ingest_fotmob.py",
+    "dags/dag_orchestrate_fotmob.py",
+    "dags/dag_refresh_fotmob.py",
+    "dags/dag_backfill_fotmob.py",
     "dags/dag_master_pipeline.py",
     "dags/dag_sofascore_pipeline.py",
     "dags/dag_trigger_fotmob_daily.py",
@@ -143,6 +176,7 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "dags/sql/silver/fotmob_player_season_profile.sql",
     "dags/sql/silver/xref_manager.sql.j2",
     "dags/utils/fotmob_publication.py",
+    "dags/utils/fotmob_orchestration.py",
     "dags/utils/maintenance_tasks.py",
     "dags/utils/silver_tasks.py",
     "dags/utils/xref_player_resolver.py",
@@ -150,9 +184,13 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "scrapers/base/trino_manager.py",
     "scrapers/fbref/control/store.py",
     "scrapers/fotmob/constants.py",
+    "scrapers/fotmob/catalog.py",
+    "scrapers/fotmob/catalog_contract.py",
+    "scrapers/fotmob/domain.py",
     "scrapers/fotmob/raw_store.py",
     "scrapers/fotmob/repository.py",
     "scrapers/fotmob/service.py",
+    "scrapers/fotmob/scope_codec.py",
     "scrapers/fotmob/source_refresh.py",
     "scrapers/fotmob/transport.py",
 }
@@ -178,6 +216,160 @@ _RUNTIME_MUTATION_STARTED_ATTR = "_fotmob_runtime_mutation_started"
 
 class DeploymentError(RuntimeError):
     pass
+
+
+def validate_automatic_catalog_admission(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose the runtime gate with deploy-specific error semantics."""
+
+    try:
+        return runtime_binding.validate_automatic_catalog_admission(value)
+    except runtime_binding.RuntimeBindingError as exc:
+        raise DeploymentError(str(exc)) from exc
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise DeploymentError(f"duplicate JSON key in rollout evidence: {key!r}")
+        value[key] = item
+    return value
+
+
+def load_automatic_canary_report(
+    path: Path,
+    *,
+    evidence_dir: Path,
+    deployment: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Load one protected canary bound to this exact deployment."""
+
+    absolute = path.resolve()
+    try:
+        relative = absolute.relative_to(evidence_dir.resolve())
+    except ValueError as exc:
+        raise DeploymentError("automatic canary report must be inside evidence dir") from exc
+    if not relative.parts or absolute == (evidence_dir / "deployment.json").resolve():
+        raise DeploymentError("automatic canary report path is unsafe")
+    try:
+        entry = path.lstat()
+        raw = path.read_bytes()
+        after = path.lstat()
+    except OSError as exc:
+        raise DeploymentError(f"cannot read automatic canary report: {exc}") from exc
+    if (
+        stat.S_ISLNK(entry.st_mode)
+        or not stat.S_ISREG(entry.st_mode)
+        or entry.st_nlink != 1
+        or entry.st_dev != after.st_dev
+        or entry.st_ino != after.st_ino
+        or entry.st_size != after.st_size
+        or entry.st_mtime_ns != after.st_mtime_ns
+        or not raw
+        or len(raw) != entry.st_size
+        or len(raw) > 64 * 1024 * 1024
+        or stat.S_IMODE(entry.st_mode) & 0o022
+    ):
+        raise DeploymentError("automatic canary report is not a protected regular file")
+    try:
+        payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_json_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DeploymentError(f"automatic canary report is invalid JSON: {exc}") from exc
+    publication = payload.get("publication") if isinstance(payload, Mapping) else None
+    binding = publication.get("binding") if isinstance(publication, Mapping) else None
+    final_publication = (
+        payload.get("final_publication") if isinstance(payload, Mapping) else None
+    )
+    current_run_reports = (
+        payload.get("current_run_reports") if isinstance(payload, Mapping) else None
+    )
+    current_run_report = (
+        current_run_reports[0]
+        if isinstance(current_run_reports, list)
+        and len(current_run_reports) == 1
+        and isinstance(current_run_reports[0], Mapping)
+        else None
+    )
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != AUTOMATIC_CANARY_SCHEMA
+        or payload.get("passed") is not True
+        or payload.get("phase") != "abandoned"
+        or payload.get("recovery_required") is not False
+        or payload.get("mode") != "automatic-canary"
+        or payload.get("deployment_id") != deployment.get("deployment_id")
+        or payload.get("git_sha") != deployment.get("git_sha")
+        or payload.get("scheduler_container_id")
+        != deployment.get("scheduler_container_id")
+        or not isinstance(binding, Mapping)
+        or binding.get("runtime_fingerprint") != deployment.get("git_sha")
+        or publication.get("generation_id") != payload.get("generation_id")
+        or payload.get("ingest_run_state") != "success"
+        or payload.get("silver_run_state") != "success"
+        or not isinstance(final_publication, Mapping)
+        or final_publication.get("generation_id") != payload.get("generation_id")
+        or final_publication.get("phase") != "abandoned"
+        or final_publication.get("active") is not False
+        or final_publication.get("released") is not True
+        or final_publication.get("published") is not False
+        or not isinstance(current_run_report, Mapping)
+        or current_run_report.get("run_id") != payload.get("generation_id")
+    ):
+        raise DeploymentError("automatic canary is not bound to this deployment")
+    return payload
+
+
+def build_automatic_catalog_admission(
+    deployment: Mapping[str, Any],
+    canary: Mapping[str, Any],
+    *,
+    writer_snapshot: Mapping[str, Any],
+    scope_observations: Mapping[str, Any],
+    validated_at: str | None = None,
+) -> dict[str, Any]:
+    """Compose and validate the only certificate that may enable the owner."""
+
+    candidate = canary.get("candidate")
+    if not isinstance(candidate, Mapping):
+        raise DeploymentError("automatic canary has no Silver candidate")
+    if any(
+        canary.get(key) != deployment.get(key)
+        for key in ("deployment_id", "git_sha", "scheduler_container_id")
+    ):
+        raise DeploymentError("automatic canary deployment identity differs")
+    admission = {
+        "schema_version": runtime_binding.AUTOMATIC_ADMISSION_SCHEMA,
+        "validated_at": validated_at or _now(),
+        "classifier_version": runtime_binding.AUTOMATIC_CLASSIFIER_VERSION,
+        "contract_schema": runtime_binding.AUTOMATIC_CONTRACT_SCHEMA,
+        "writer_snapshot": dict(writer_snapshot),
+        "scope_observations": dict(scope_observations),
+        "legacy_owners": {
+            dag_id: {"schedule": None, "is_paused": True}
+            for dag_id in sorted(LEGACY_OWNER_DAGS)
+        },
+        "lane_budgets": {
+            lane: {"max_proxy_mib": 0, "max_proxy_bytes": 0}
+            for lane in sorted(runtime_binding.AUTOMATIC_LANES)
+        },
+        "active_writers": [],
+        "current_run_reports": [dict(canary["current_run_reports"][0])],
+        "canary": {
+            "schema_version": AUTOMATIC_CANARY_SCHEMA,
+            "deployment_id": canary["deployment_id"],
+            "git_sha": canary["git_sha"],
+            "scheduler_container_id": canary["scheduler_container_id"],
+            "generation_id": canary["generation_id"],
+            "ingest_run_state": canary["ingest_run_state"],
+            "silver_run_state": canary["silver_run_state"],
+            "candidate_digest": canary["candidate_digest"],
+            "runner_report_sha256": canary["runner_report_sha256"],
+            "publication": dict(canary["publication"]),
+            "final_publication": dict(canary["final_publication"]),
+        },
+    }
+    validate_automatic_catalog_admission(admission)
+    return admission
 
 
 class PendingConsumerError(DeploymentError):
@@ -502,11 +694,15 @@ def prepare_dagbag(release_root: Path, evidence_dir: Path, sha: str) -> Path:
     """Create/reuse an exact read-only projection that masks image-baked DAGs."""
 
     sources = {
+        "dag_orchestrate_fotmob.py": release_root
+        / "dags/dag_orchestrate_fotmob.py",
         "dag_ingest_fotmob.py": release_root / "dags/dag_ingest_fotmob.py",
         "dag_transform_fotmob_silver.py": release_root
         / "dags/dag_transform_fotmob_silver.py",
         "dag_trigger_fotmob_daily.py": release_root
         / "dags/dag_trigger_fotmob_daily.py",
+        "dag_refresh_fotmob.py": release_root / "dags/dag_refresh_fotmob.py",
+        "dag_backfill_fotmob.py": release_root / "dags/dag_backfill_fotmob.py",
         ".airflowignore": release_root / "deploy/fotmob/.airflowignore",
     }
     missing = [str(path) for path in sources.values() if not path.is_file()]
@@ -574,6 +770,857 @@ def parse_marker_json(output: str, marker: str) -> Any:
             except json.JSONDecodeError as exc:
                 raise DeploymentError(f"invalid {marker} payload") from exc
     raise DeploymentError(f"command did not emit required {marker} evidence")
+
+
+def bootstrap_automatic_scope_observations(
+    container_id: str,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, Any]:
+    """Create and prove the durable structural-decision table and current view."""
+
+    marker = "FOTMOB_AUTOMATIC_SCOPE_JSON="
+    table = runtime_binding.SCOPE_OBSERVATIONS_TABLE
+    current_view = runtime_binding.SCOPE_OBSERVATIONS_CURRENT_VIEW
+    code = (
+        "import json; "
+        "from scrapers.fotmob.repository import FotMobRepository; "
+        "r=FotMobRepository(); r.ensure_schema(); created=r.ensure_current_views(); "
+        "t=r.writer._get_trino_manager(); "
+        f"p={{'table':{table!r},'table_exists':bool(t.table_exists(r.schema,{table!r})),"
+        f"'current_view':{current_view!r},"
+        f"'current_view_exists':f'{{r.catalog}}.{{r.schema}}.{current_view}' in created}}; "
+        f"print('{marker}'+json.dumps(p,sort_keys=True))"
+    )
+    output = run(
+        ("docker", "exec", container_id, "python", "-c", code),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    payload = parse_marker_json(output, marker)
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("table") != table
+        or payload.get("current_view") != current_view
+        or payload.get("table_exists") is not True
+        or payload.get("current_view_exists") is not True
+    ):
+        raise DeploymentError(
+            "automatic scope-observation table/current view bootstrap failed"
+        )
+    return dict(payload)
+
+
+def collect_automatic_scope_observations(
+    container_id: str,
+    runner_report: Mapping[str, Any],
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, Any]:
+    """Read the durable current catalog and decision content for one canary."""
+
+    selection = runner_report.get("selection")
+    if not isinstance(selection, Mapping):
+        raise DeploymentError("automatic canary has no selection evidence")
+    try:
+        from scrapers.fotmob.catalog_contract import catalog_contract_from_dict
+
+        contract = catalog_contract_from_dict(selection.get("catalog_contract"))
+        catalog_ids = [int(value) for value in selection.get("catalog_ids") or ()]
+    except (TypeError, ValueError) as exc:
+        raise DeploymentError("automatic canary contract is invalid") from exc
+    if catalog_ids != sorted(set(catalog_ids)) or not catalog_ids:
+        raise DeploymentError("automatic canary catalog IDs are not canonical")
+    generation_id = str(runner_report.get("run_id") or "")
+    if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", generation_id) is None:
+        raise DeploymentError("automatic canary generation identity is invalid")
+    marker = "FOTMOB_AUTOMATIC_SCOPE_SNAPSHOT_JSON="
+    fields = runtime_binding.AUTOMATIC_DECISION_DIGEST_FIELDS
+    code = f"""
+import hashlib
+import json
+from scrapers.fotmob.repository import FotMobRepository
+
+repo = FotMobRepository()
+trino = repo.writer._get_trino_manager()
+catalog_ids = {catalog_ids!r}
+wanted = set(catalog_ids)
+generation_id = {generation_id!r}
+batch_id = {contract.catalog_batch_id!r}
+content_hash = {contract.catalog_content_hash!r}
+fields = {fields!r}
+catalog_rows = trino.execute_query(
+    f"SELECT competition_id FROM {{repo.catalog}}.{{repo.schema}}.fotmob_competitions_current "
+    "WHERE discovery_run_id = '" + generation_id.replace("'", "''") + "'"
+)
+observed_catalog = sorted(int(row[0]) for row in catalog_rows)
+decision_rows = trino.execute_query(
+    "SELECT " + ",".join(fields) + " FROM "
+    f"{{repo.catalog}}.{{repo.schema}}.{runtime_binding.SCOPE_OBSERVATIONS_CURRENT_VIEW}"
+)
+decisions = []
+for row in decision_rows:
+    item = dict(zip(fields, row))
+    try:
+        item['competition_id'] = int(item['competition_id'])
+    except (TypeError, ValueError):
+        continue
+    if item['competition_id'] in wanted:
+        decisions.append(item)
+decisions.sort(key=lambda item: item['competition_id'])
+decision_ids = [item['competition_id'] for item in decisions]
+canonical = json.dumps(
+    decisions, ensure_ascii=False, sort_keys=True, separators=(',', ':')
+).encode('utf-8')
+manifest_rows = trino.execute_query(
+    "SELECT batch_id,content_hash FROM "
+    f"{{repo.catalog}}.{{repo.schema}}.fotmob_ingest_manifest "
+    "WHERE target_type='all_leagues' AND batch_id='" + batch_id.replace("'", "''")
+    + "' AND content_hash='" + content_hash.replace("'", "''")
+    + "' AND run_id='" + generation_id.replace("'", "''")
+    + "' AND status IN ('success','not_modified')"
+)
+def id_digest(values):
+    raw = ''.join(str(value) + '\\n' for value in values).encode('ascii')
+    return hashlib.sha256(raw).hexdigest()
+included = [item['competition_id'] for item in decisions if item['decision'] == 'included']
+payload = {{
+    'table': {runtime_binding.SCOPE_OBSERVATIONS_TABLE!r},
+    'table_exists': True,
+    'current_view': {runtime_binding.SCOPE_OBSERVATIONS_CURRENT_VIEW!r},
+    'current_view_exists': True,
+    'snapshot_run_id': generation_id,
+    'catalog_batch_id': batch_id,
+    'catalog_content_hash': content_hash,
+    'catalog_manifest_match_count': len(manifest_rows),
+    'catalog_id_count': len(observed_catalog),
+    'catalog_ids_sha256': id_digest(observed_catalog),
+    'decision_count': len(decisions),
+    'decision_ids_sha256': id_digest(decision_ids),
+    'decision_evidence_sha256': hashlib.sha256(canonical).hexdigest(),
+    'duplicate_decision_count': len(decisions) - len(set(decision_ids)),
+    'classifier_version': (
+        next(iter(set(item['classifier_version'] for item in decisions)), None)
+        if len(set(item['classifier_version'] for item in decisions)) <= 1 else None
+    ),
+    'included_id_count': len(included),
+    'included_ids_sha256': id_digest(included),
+}}
+print({marker!r} + json.dumps(payload, sort_keys=True))
+"""
+    output = run(
+        ("docker", "exec", container_id, "python", "-c", code),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    payload = parse_marker_json(output, marker)
+    if not isinstance(payload, Mapping) or payload.get("catalog_manifest_match_count") != 1:
+        raise DeploymentError("automatic catalog manifest snapshot is incomplete")
+    normalized = dict(payload)
+    normalized.pop("catalog_manifest_match_count", None)
+    return normalized
+
+
+def validate_live_automatic_canary(
+    container_id: str,
+    canary: Mapping[str, Any],
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, Any]:
+    """Recheck exact DagRuns, XCom bytes, and released ControlStore state."""
+
+    runner_path = str(canary.get("runner_report_path") or "")
+    if re.fullmatch(r"/tmp/fotmob_result_[A-Za-z0-9_.:+-]+\.json", runner_path) is None:
+        raise DeploymentError("automatic canary runner path is invalid")
+    marker = "FOTMOB_AUTOMATIC_CANARY_LIVE_JSON="
+    code = f"""
+import hashlib
+import json
+from pathlib import Path
+from airflow.models import DagRun
+from airflow.models.xcom import XCom
+from airflow.settings import Session
+from scrapers.fbref.control import ControlStore
+
+s = Session()
+expected = {{
+    'dag_ingest_fotmob': {str(canary.get('ingest_run_id'))!r},
+    'dag_transform_fotmob_silver': {str(canary.get('silver_run_id'))!r},
+}}
+rows = s.query(DagRun.dag_id, DagRun.run_id, DagRun.state).filter(
+    DagRun.dag_id.in_(tuple(expected)), DagRun.run_id.in_(tuple(expected.values()))
+).all()
+xcom = XCom.get_one(
+    run_id=expected['dag_ingest_fotmob'], dag_id='dag_ingest_fotmob',
+    task_id='validate_data', key='return_value', session=s
+)
+s.close()
+raw = Path({runner_path!r}).read_bytes()
+runner = json.loads(raw.decode('utf-8'))
+control = ControlStore.from_env().get_publication_generation(
+    {str(canary.get('generation_id'))!r}, source='fotmob'
+)
+payload = {{
+    'runs': [{{'dag_id': d, 'run_id': str(r), 'state': str(getattr(st, 'value', st)).lower()}}
+             for d, r, st in rows],
+    'validation': xcom,
+    'runner_sha256': hashlib.sha256(raw).hexdigest(),
+    'runner_bytes': len(raw),
+    'runner_report': runner,
+    'publication': control,
+}}
+print({marker!r} + json.dumps(payload, default=str, sort_keys=True))
+"""
+    output = run(
+        ("docker", "exec", container_id, "python", "-c", code),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    payload = parse_marker_json(output, marker)
+    if not isinstance(payload, Mapping):
+        raise DeploymentError("automatic canary live evidence is invalid")
+    expected_runs = {
+        ("dag_ingest_fotmob", str(canary.get("ingest_run_id")), "success"),
+        ("dag_transform_fotmob_silver", str(canary.get("silver_run_id")), "success"),
+    }
+    observed_runs = {
+        (str(item.get("dag_id")), str(item.get("run_id")), str(item.get("state")))
+        for item in payload.get("runs") or ()
+        if isinstance(item, Mapping)
+    }
+    validation = payload.get("validation")
+    publication = payload.get("publication")
+    final_publication = canary.get("final_publication")
+    candidate = publication.get("candidate") if isinstance(publication, Mapping) else None
+    if (
+        observed_runs != expected_runs
+        or not isinstance(validation, Mapping)
+        or validation.get("runner_report_path") != runner_path
+        or validation.get("runner_report_sha256") != canary.get("runner_report_sha256")
+        or validation.get("runner_report_bytes") != canary.get("runner_report_bytes")
+        or payload.get("runner_sha256") != canary.get("runner_report_sha256")
+        or payload.get("runner_bytes") != canary.get("runner_report_bytes")
+        or payload.get("runner_report") != canary.get("current_run_reports", [None])[0]
+        or not isinstance(publication, Mapping)
+        or publication.get("generation_id") != canary.get("generation_id")
+        or publication.get("phase") != "abandoned"
+        or publication.get("active") is not False
+        or not publication.get("released_at")
+        or not isinstance(candidate, Mapping)
+        or candidate.get("digest") != canary.get("candidate_digest")
+        or not isinstance(final_publication, Mapping)
+        or candidate != final_publication.get("candidate")
+    ):
+        raise DeploymentError("automatic canary live provenance differs")
+    return dict(payload)
+
+
+def atomic_automatic_writer_transition(
+    container_id: str,
+    *,
+    phase: str,
+    selected_date: str | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, Any]:
+    """Validate and update all six DagModel rows in one metadata transaction."""
+
+    if phase not in {"children", "owner", "pause_all"}:
+        raise DeploymentError("unknown automatic writer transition")
+    if phase in {"children", "owner"}:
+        try:
+            date.fromisoformat(str(selected_date))
+        except (TypeError, ValueError) as exc:
+            raise DeploymentError(
+                "automatic writer transition requires selected daily date"
+            ) from exc
+    marker = "FOTMOB_AUTOMATIC_WRITER_TX_JSON="
+    code = f"""
+import json
+import secrets
+from datetime import date, datetime, timezone
+from airflow.models import DagModel, DagRun, Variable
+from airflow.settings import Session
+from sqlalchemy import text
+
+ids = {sorted(EXPECTED_DAGS)!r}
+active_ids = {sorted(AUTOMATIC_ACTIVE_DAGS)!r}
+legacy_ids = {sorted(LEGACY_OWNER_DAGS)!r}
+phase = {phase!r}
+selected_date = {selected_date!r}
+s = Session()
+try:
+    s.execute(text('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE'))
+    models = s.query(DagModel).filter(DagModel.dag_id.in_(ids)).with_for_update().all()
+    by_id = {{model.dag_id: model for model in models}}
+    if set(by_id) != set(ids):
+        raise RuntimeError('exact six DagModel rows are required')
+    run_rows = s.query(DagRun.dag_id, DagRun.run_id, DagRun.state).filter(
+        DagRun.dag_id.in_(ids), DagRun.state.in_(('running', 'queued'))
+    ).with_for_update().all()
+    active = {{}}
+    for dag_id, run_id, state in run_rows:
+        state = str(getattr(state, 'value', state)).lower()
+        active.setdefault(dag_id, {{}}).setdefault(state, []).append(str(run_id))
+    before = {{dag_id: bool(by_id[dag_id].is_paused) for dag_id in ids}}
+    if active:
+        raise RuntimeError('queued/running FotMob writer exists')
+    scheduler_state = None
+    if phase in ('children', 'owner'):
+        state_row = s.query(Variable).filter(
+            Variable.key == 'fotmob.scheduler.state.v1'
+        ).with_for_update().one_or_none()
+        scheduler_state = (
+            {{'next_background_lane':'refresh','daily_date':None,'generation':0,
+              'updated_at':'1970-01-01T00:00:00+00:00'}}
+            if state_row is None else json.loads(state_row.get_val())
+        )
+        try:
+            parsed_daily_date = (
+                None if scheduler_state.get('daily_date') is None
+                else date.fromisoformat(str(scheduler_state.get('daily_date')))
+            )
+            parsed_updated_at = datetime.fromisoformat(
+                str(scheduler_state.get('updated_at')).replace('Z','+00:00')
+            )
+            if parsed_updated_at.tzinfo is None or parsed_updated_at.utcoffset() is None:
+                raise ValueError('naive updated_at')
+        except (AttributeError, TypeError, ValueError):
+            raise RuntimeError('FotMob scheduler state is malformed')
+        if (
+            not isinstance(scheduler_state, dict)
+            or set(scheduler_state) != {{'next_background_lane','daily_date','generation','updated_at'}}
+            or scheduler_state['next_background_lane'] not in ('refresh','backfill')
+            or scheduler_state['daily_date'] == selected_date
+            or (parsed_daily_date is not None and parsed_daily_date.isoformat() != scheduler_state['daily_date'])
+            or isinstance(scheduler_state['generation'], bool)
+            or not isinstance(scheduler_state['generation'], int)
+            or scheduler_state['generation'] < 0
+            or not isinstance(scheduler_state['updated_at'], str)
+        ):
+            raise RuntimeError('FotMob scheduler state blocks first automatic daily')
+    all_paused = all(before.values())
+    children_shape = all(
+        before[dag_id] is (dag_id not in {{'dag_ingest_fotmob', 'dag_transform_fotmob_silver'}})
+        for dag_id in ids
+    )
+    if phase == 'children' and not all_paused:
+        raise RuntimeError('children transition requires all six paused')
+    if phase == 'owner' and not children_shape:
+        raise RuntimeError('owner transition has unexpected pause shape')
+    for dag_id, model in by_id.items():
+        if phase == 'pause_all':
+            model.is_paused = True
+        elif phase == 'children':
+            model.is_paused = dag_id not in {{'dag_ingest_fotmob', 'dag_transform_fotmob_silver'}}
+        else:
+            model.is_paused = dag_id in set(legacy_ids)
+    s.flush()
+    after = {{dag_id: bool(by_id[dag_id].is_paused) for dag_id in ids}}
+    observed_at = datetime.now(timezone.utc).isoformat()
+    transaction_id = secrets.token_hex(16)
+    s.commit()
+except Exception:
+    s.rollback()
+    raise
+finally:
+    s.close()
+payload = {{
+    'schema_version': 'fotmob-writer-snapshot-v1',
+    'transaction_id': transaction_id,
+    'observed_at': observed_at,
+    'pause_states': before,
+    'active_runs': active,
+    'pause_states_after': after,
+    'phase': phase,
+    'scheduler_state': scheduler_state,
+}}
+print({marker!r} + json.dumps(payload, sort_keys=True))
+"""
+    output = run(
+        ("docker", "exec", container_id, "python", "-c", code),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    payload = parse_marker_json(output, marker)
+    scheduler_state = payload.get("scheduler_state") if isinstance(payload, Mapping) else None
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload.get("pause_states") or {}) != EXPECTED_DAGS
+        or (
+            phase in {"children", "owner"}
+            and (
+                not isinstance(scheduler_state, Mapping)
+                or scheduler_state.get("daily_date") == selected_date
+            )
+        )
+    ):
+        raise DeploymentError("automatic writer transaction returned incomplete evidence")
+    return dict(payload)
+
+
+def inspect_automatic_writer_pause_shape(
+    container_id: str,
+    *,
+    expected_paused: set[str] | None,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, Any]:
+    """Read all six live DagModel rows without trusting the report snapshot."""
+
+    if expected_paused is not None and not expected_paused.issubset(EXPECTED_DAGS):
+        raise DeploymentError("automatic writer pause expectation is invalid")
+    marker = "FOTMOB_AUTOMATIC_WRITER_LIVE_JSON="
+    code = f"""
+import json
+from airflow.models import DagModel, DagRun
+from airflow.settings import Session
+from sqlalchemy import text
+
+ids = {sorted(EXPECTED_DAGS)!r}
+s = Session()
+try:
+    s.execute(text('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY'))
+    models = s.query(DagModel.dag_id, DagModel.is_paused).filter(
+        DagModel.dag_id.in_(ids)
+    ).all()
+    runs = s.query(DagRun.dag_id, DagRun.run_id, DagRun.state).filter(
+        DagRun.dag_id.in_(ids), DagRun.state.in_(('running', 'queued'))
+    ).all()
+    payload = {{
+        'pause_states': {{dag_id: bool(paused) for dag_id, paused in models}},
+        'active_runs': [
+            {{'dag_id': dag_id, 'run_id': str(run_id),
+              'state': str(getattr(state, 'value', state)).lower()}}
+            for dag_id, run_id, state in runs
+        ],
+        'atomic_metadata_snapshot': True,
+    }}
+finally:
+    s.close()
+print({marker!r} + json.dumps(payload, sort_keys=True))
+"""
+    output = run(
+        ("docker", "exec", container_id, "python", "-c", code),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    payload = parse_marker_json(output, marker)
+    pause_states = payload.get("pause_states") if isinstance(payload, Mapping) else None
+    expected = (
+        None
+        if expected_paused is None
+        else {
+            dag_id: dag_id in expected_paused for dag_id in sorted(EXPECTED_DAGS)
+        }
+    )
+    if (
+        not isinstance(payload, Mapping)
+        or (expected is not None and pause_states != expected)
+        or payload.get("atomic_metadata_snapshot") is not True
+        or not isinstance(payload.get("active_runs"), list)
+    ):
+        raise DeploymentError("live automatic writer pause shape differs")
+    return dict(payload)
+
+
+def atomic_shared_consumer_transition(
+    container_id: str,
+    *,
+    phase: str,
+    recovery_boundary: Mapping[str, Any] | None = None,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, Any]:
+    """Lock, verify and update the shared daily consumer in one transaction."""
+
+    if phase not in {"unpause", "pause", "inspect_unpaused"}:
+        raise DeploymentError("unknown shared consumer transition")
+    normalized_recovery_boundary = (
+        validate_schedule_boundary(
+            recovery_boundary, label="shared recovery interval"
+        )
+        if recovery_boundary is not None
+        else None
+    )
+    recovery_run_id = (
+        _scheduled_run_id(normalized_recovery_boundary["logical_date"])
+        if normalized_recovery_boundary is not None
+        else None
+    )
+    marker = "FOTMOB_SHARED_CONSUMER_TX_JSON="
+    code = f"""
+import json
+import secrets
+from datetime import datetime, timezone
+from airflow.models import DagModel, DagRun, TaskInstance, Variable
+from airflow.settings import Session
+from sqlalchemy import text
+
+dag_id = {SHARED_CONSUMER_DAG_ID!r}
+pause_ids = {sorted(runtime_binding.EXPECTED_SHARED_PAUSE_STATES)!r}
+active_ids = {sorted(runtime_binding.SHARED_STATE_DAGS)!r}
+consumer_task_ids = {[
+    "wait_for_fotmob_publication",
+    "trigger_xref_transforms",
+    "trigger_e3_transforms",
+    "trigger_e4_transforms",
+    "finalize_fotmob_publication",
+]!r}
+phase = {phase!r}
+recovery_run_id = {recovery_run_id!r}
+s = Session()
+try:
+    s.execute(text('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE'))
+    models = s.query(DagModel).filter(
+        DagModel.dag_id.in_(pause_ids)
+    ).with_for_update().all()
+    by_id = {{model.dag_id: model for model in models}}
+    if set(by_id) != set(pause_ids):
+        raise RuntimeError('exact shared DagModel rows are required')
+    owner = s.query(Variable).filter(
+        Variable.key == 'fotmob_schedule_owner'
+    ).with_for_update().one_or_none()
+    if owner is None or str(owner.val).strip().lower() != 'isolated':
+        raise RuntimeError('shared schedule owner is not isolated')
+    runs = s.query(DagRun).filter(
+        DagRun.dag_id.in_(active_ids), DagRun.state.in_(('running', 'queued'))
+    ).with_for_update().all()
+    active = [
+        {{'dag_id': item.dag_id, 'run_id': str(item.run_id),
+          'state': str(getattr(item.state, 'value', item.state)).lower()}}
+        for item in runs
+    ]
+    observed_runs = list(runs)
+    if recovery_run_id is not None and not any(
+        item.dag_id == dag_id and str(item.run_id) == recovery_run_id
+        for item in observed_runs
+    ):
+        recovery_run = s.query(DagRun).filter(
+            DagRun.dag_id == dag_id, DagRun.run_id == recovery_run_id
+        ).with_for_update().one_or_none()
+        if recovery_run is not None:
+            observed_runs.append(recovery_run)
+    consumer_runs = []
+    for item in observed_runs:
+        if item.dag_id != dag_id:
+            continue
+        task_rows = s.query(TaskInstance.task_id, TaskInstance.state).filter(
+            TaskInstance.dag_id == dag_id,
+            TaskInstance.run_id == item.run_id,
+            TaskInstance.task_id.in_(consumer_task_ids),
+        ).with_for_update().all()
+        task_states = {{task_id: None for task_id in consumer_task_ids}}
+        for task_id, state in task_rows:
+            task_states[task_id] = (
+                None if state is None
+                else str(getattr(state, 'value', state)).lower()
+            )
+        iso = lambda value: value.isoformat() if value is not None else None
+        consumer_runs.append({{
+            'dag_id': item.dag_id,
+            'run_id': str(item.run_id),
+            'run_type': str(getattr(item.run_type, 'value', item.run_type)).lower(),
+            'state': str(getattr(item.state, 'value', item.state)).lower(),
+            'logical_date': iso(item.logical_date),
+            'data_interval_start': iso(item.data_interval_start),
+            'data_interval_end': iso(item.data_interval_end),
+            'task_states': task_states,
+        }})
+    before = {{item_id: bool(by_id[item_id].is_paused) for item_id in pause_ids}}
+    expected_paused = {{item_id: True for item_id in pause_ids}}
+    expected_active = dict(expected_paused)
+    expected_active[dag_id] = False
+    if phase == 'unpause':
+        if before != expected_paused or active:
+            raise RuntimeError('shared consumer cutover requires paused and idle state')
+        by_id[dag_id].is_paused = False
+    elif phase == 'pause':
+        by_id[dag_id].is_paused = True
+    elif before != expected_active:
+        raise RuntimeError('shared consumer pause shape differs')
+    s.flush()
+    after = {{item_id: bool(by_id[item_id].is_paused) for item_id in pause_ids}}
+    observed_at = datetime.now(timezone.utc).isoformat()
+    transaction_id = secrets.token_hex(16)
+    s.commit()
+except Exception:
+    s.rollback()
+    raise
+finally:
+    s.close()
+payload = {{
+    'schema_version': 'fotmob-shared-consumer-snapshot-v1',
+    'transaction_id': transaction_id,
+    'observed_at': observed_at,
+    'dag_id': dag_id,
+    'phase': phase,
+    'pause_states_before': before,
+    'pause_states_after': after,
+    'schedule_owner': str(owner.val).strip().lower(),
+    'active_runs': active,
+    'consumer_runs': consumer_runs,
+}}
+print({marker!r} + json.dumps(payload, sort_keys=True))
+"""
+    output = run(
+        ("docker", "exec", container_id, "python", "-c", code),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    payload = parse_marker_json(output, marker)
+    expected_after = dict(runtime_binding.EXPECTED_SHARED_PAUSE_STATES)
+    if phase != "pause":
+        expected_after[SHARED_CONSUMER_DAG_ID] = False
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("dag_id") != SHARED_CONSUMER_DAG_ID
+        or payload.get("phase") != phase
+        or payload.get("pause_states_after") != expected_after
+        or payload.get("schedule_owner") != "isolated"
+        or not isinstance(payload.get("active_runs"), list)
+    ):
+        raise DeploymentError("shared consumer transition returned invalid evidence")
+    return dict(payload)
+
+
+def assert_no_active_control_publication(
+    shared_container: str,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> dict[str, Any]:
+    """Check only the shared ControlStore after the consumer is enabled."""
+
+    marker = "FOTMOB_CONTROL_ONLY_QUIESCENCE_JSON="
+    code = (
+        "import json; from scrapers.fbref.control import ControlStore; "
+        "p=dict(ControlStore.from_env().assert_no_active_publication_generation("
+        "source='fotmob')); "
+        f"print({marker!r}+json.dumps(p,default=str,sort_keys=True))"
+    )
+    output = run(
+        ("docker", "exec", shared_container, "python", "-c", code),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    payload = parse_marker_json(output, marker)
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("source") != "fotmob"
+        or payload.get("safe") is not True
+        or payload.get("active") is not False
+    ):
+        raise DeploymentError("FotMob ControlStore is not quiescent")
+    return dict(payload)
+
+
+def validate_automatic_activation_boundary(
+    raw: Any,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Bind cutover to the daily interval the five-minute owner will mint."""
+
+    boundary = validate_schedule_boundary(
+        raw,
+        label=f"automatic {SHARED_CONSUMER_DAG_ID}",
+    )
+    raw_now = now or datetime.now(timezone.utc)
+    if raw_now.tzinfo is None or raw_now.utcoffset() is None:
+        raise DeploymentError("automatic cutover clock must include a timezone")
+    checked_at = raw_now.astimezone(timezone.utc)
+    start = datetime.fromisoformat(boundary["data_interval_start"])
+    end = datetime.fromisoformat(boundary["data_interval_end"])
+    logical_date = datetime.fromisoformat(boundary["logical_date"])
+    run_after = datetime.fromisoformat(boundary["run_after"])
+    daily_window_end = end + timedelta(hours=1)
+    safe_cutoff = daily_window_end - timedelta(
+        seconds=MIN_ACTIVATION_SAFETY_SECONDS
+    )
+    safe_start = end - timedelta(minutes=30)
+    if (
+        end - start != timedelta(days=1)
+        or logical_date != start
+        or run_after != end
+        or (end.hour, end.minute, end.second, end.microsecond) != (14, 0, 0, 0)
+        or end.date() != checked_at.date()
+        or checked_at < safe_start
+        or checked_at >= safe_cutoff
+    ):
+        raise DeploymentError(
+            "automatic cutover does not match today's safe 14:00 UTC daily interval"
+        )
+    return {
+        "schema_version": "fotmob-automatic-boundary-v1",
+        "checked_at": checked_at.isoformat(),
+        "selected_date": end.date().isoformat(),
+        "state": "future" if checked_at < end else "daily_window_open",
+        "data_interval_start": boundary["data_interval_start"],
+        "data_interval_end": boundary["data_interval_end"],
+        "safe_cutoff": safe_cutoff.isoformat(),
+        "safe_start": safe_start.isoformat(),
+        "passed": True,
+    }
+
+
+def validate_owner_committed_shared_recovery(
+    shared_snapshot: Mapping[str, Any],
+    *,
+    stored_boundary: Mapping[str, Any],
+    live_boundary: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Accept only an idle edge or the exact pending-safe Sofa sensor run."""
+
+    stored = validate_schedule_boundary(
+        stored_boundary, label="stored owner-committed shared interval"
+    )
+    live = validate_schedule_boundary(
+        live_boundary, label="live owner-committed shared interval"
+    )
+    active_runs = shared_snapshot.get("active_runs")
+    consumer_runs = shared_snapshot.get("consumer_runs")
+    if active_runs == [] and consumer_runs in (None, []):
+        if live != stored:
+            raise DeploymentError(
+                "idle owner-committed shared daily boundary changed"
+            )
+        return {
+            "schema_version": "fotmob-shared-recovery-v1",
+            "mode": "idle_before_scheduled_run",
+            "stored_boundary": stored,
+            "live_boundary": live,
+            "passed": True,
+        }
+
+    expected_run_id = _scheduled_run_id(stored["logical_date"])
+    expected_active = {
+        "dag_id": SHARED_CONSUMER_DAG_ID,
+        "run_id": expected_run_id,
+    }
+    shifted = {
+        key: (
+            datetime.fromisoformat(value) + timedelta(days=1)
+        ).isoformat(timespec="microseconds")
+        for key, value in stored.items()
+    }
+    if active_runs == []:
+        if not isinstance(consumer_runs, list) or len(consumer_runs) != 1:
+            raise DeploymentError(
+                "terminal shared recovery requires one exact consumer run"
+            )
+        consumer = consumer_runs[0]
+        task_states = consumer.get("task_states")
+        downstream = {
+            "trigger_xref_transforms",
+            "trigger_e3_transforms",
+            "trigger_e4_transforms",
+            "finalize_fotmob_publication",
+        }
+        expected_task_ids = downstream | {"wait_for_fotmob_publication"}
+        terminal_downstream = {
+            "trigger_xref_transforms": "upstream_failed",
+            "trigger_e3_transforms": "upstream_failed",
+            "trigger_e4_transforms": "upstream_failed",
+            "finalize_fotmob_publication": "failed",
+        }
+        if (
+            any(consumer.get(key) != value for key, value in expected_active.items())
+            or consumer.get("run_type") != "scheduled"
+            or consumer.get("state") != "failed"
+            or validate_schedule_boundary(
+                {
+                    "logical_date": consumer.get("logical_date"),
+                    "data_interval_start": consumer.get("data_interval_start"),
+                    "data_interval_end": consumer.get("data_interval_end"),
+                    "run_after": consumer.get("data_interval_end"),
+                },
+                label="terminal owner-committed Sofa run",
+            )
+            != stored
+            or not isinstance(task_states, Mapping)
+            or set(task_states) != expected_task_ids
+            or task_states.get("wait_for_fotmob_publication") != "failed"
+            or any(
+                task_states.get(task_id) != state
+                for task_id, state in terminal_downstream.items()
+            )
+            or live != shifted
+        ):
+            raise DeploymentError(
+                "terminal owner-committed Sofa run is not wait-only failed"
+            )
+        return {
+            "schema_version": "fotmob-shared-recovery-v1",
+            "mode": "terminal_wait_sensor_failed",
+            "stored_boundary": stored,
+            "live_boundary": live,
+            "consumer_run": dict(consumer),
+            "roll_forward": True,
+            "next_scheduled_boundary": live,
+            "passed": True,
+        }
+    if (
+        not isinstance(active_runs, list)
+        or len(active_runs) != 1
+        or any(
+            active_runs[0].get(key) != value
+            for key, value in expected_active.items()
+        )
+        or active_runs[0].get("state") not in {"queued", "running"}
+        or not isinstance(consumer_runs, list)
+        or len(consumer_runs) != 1
+    ):
+        raise DeploymentError(
+            "owner-committed shared recovery has an unexpected active run"
+        )
+    consumer = consumer_runs[0]
+    task_states = consumer.get("task_states")
+    downstream = {
+        "trigger_xref_transforms",
+        "trigger_e3_transforms",
+        "trigger_e4_transforms",
+        "finalize_fotmob_publication",
+    }
+    expected_task_ids = downstream | {"wait_for_fotmob_publication"}
+    if (
+        any(consumer.get(key) != value for key, value in expected_active.items())
+        or consumer.get("run_type") != "scheduled"
+        or consumer.get("state") not in {"queued", "running"}
+        or validate_schedule_boundary(
+            {
+                "logical_date": consumer.get("logical_date"),
+                "data_interval_start": consumer.get("data_interval_start"),
+                "data_interval_end": consumer.get("data_interval_end"),
+                "run_after": consumer.get("data_interval_end"),
+            },
+            label="active owner-committed Sofa run",
+        )
+        != stored
+        or not isinstance(task_states, Mapping)
+        or set(task_states) != expected_task_ids
+        or task_states.get("wait_for_fotmob_publication")
+        not in {"queued", "running", "scheduled", "up_for_reschedule", "deferred"}
+        or any(task_states.get(task_id) is not None for task_id in downstream)
+    ):
+        raise DeploymentError(
+            "owner-committed Sofa run is not wait-sensor-only"
+        )
+    if live != shifted:
+        raise DeploymentError(
+            "owner-committed Sofa run did not advance exactly one daily interval"
+        )
+    return {
+        "schema_version": "fotmob-shared-recovery-v1",
+        "mode": "scheduled_wait_sensor",
+        "stored_boundary": stored,
+        "live_boundary": live,
+        "consumer_run": dict(consumer),
+        "passed": True,
+    }
 
 
 def validate_schedule_boundary(raw: Any, *, label: str) -> dict[str, str]:
@@ -767,7 +1814,7 @@ def read_exact_scheduled_run(
         "from airflow.settings import Session; "
         "from airflow.utils.types import DagRunType; "
         f"s=Session(); rows=s.query(DagRun).filter(DagRun.dag_id=={dag_id!r})"
-        ".order_by(DagRun.logical_date.desc()).limit(20).all(); "
+        ".order_by(DagRun.execution_date.desc()).limit(20).all(); "
         "iso=lambda v: v.isoformat() if v is not None else None; "
         "p=[{'run_id':str(r.run_id),'expected_run_id':DagRun.generate_run_id(DagRunType.SCHEDULED,r.logical_date),"
         "'run_type':str(getattr(r.run_type,'value',r.run_type)),"
@@ -1475,6 +2522,9 @@ active_ids = (
     'dag_transform_e4',
     'dag_transform_fbref_gold',
     'dag_trigger_fotmob_daily',
+    'dag_refresh_fotmob',
+    'dag_backfill_fotmob',
+    'dag_orchestrate_fotmob',
 )
 pause_rows = s.query(DagModel.dag_id, DagModel.is_paused).filter(
     DagModel.dag_id.in_(pause_ids)
@@ -1808,6 +2858,9 @@ s.close()
             "dag_transform_e4",
             "dag_transform_fbref_gold",
             "dag_trigger_fotmob_daily",
+            "dag_refresh_fotmob",
+            "dag_backfill_fotmob",
+            "dag_orchestrate_fotmob",
         )
     }
     return {
@@ -1878,6 +2931,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume-pending",
         action="store_true",
         help="Idempotently finish an admitted pending_consumer activation",
+    )
+    parser.add_argument(
+        "--automatic-catalog",
+        action="store_true",
+        help="Prepare the six-DAG automatic catalog rollout (must stay paused)",
+    )
+    parser.add_argument(
+        "--activate-automatic",
+        action="store_true",
+        help="Activate a prepared automatic rollout after one exact canary",
+    )
+    parser.add_argument(
+        "--automatic-canary-report",
+        type=Path,
+        help="Durable automatic-canary report used only with --activate-automatic",
     )
     parser.add_argument("--timeout-seconds", type=int, default=300)
     parser.add_argument("--report", type=Path)
@@ -2288,10 +3356,21 @@ def _guard_existing_pending_activation(report_path: Path) -> None:
         raise DeploymentError(
             "existing deployment report is invalid JSON; leave it unchanged for incident recovery"
         ) from exc
+    if not isinstance(payload, Mapping) or payload.get("schema_version") != "fotmob-deploy-v2":
+        return
+    automatic_rollout = payload.get("automatic_rollout")
     if (
-        not isinstance(payload, Mapping)
-        or payload.get("schema_version") != "fotmob-deploy-v2"
-        or payload.get("passed") is not True
+        payload.get("activation_state")
+        in {"kept_paused", "pending_automatic", "automatic_activation_failed"}
+        and isinstance(automatic_rollout, Mapping)
+        and automatic_rollout.get("schema_version") == AUTOMATIC_ROLLOUT_SCHEMA
+    ):
+        raise DeploymentError(
+            "automatic rollout evidence is resumable; only the exact "
+            "--activate-automatic command may continue it"
+        )
+    if (
+        payload.get("passed") is not True
         or payload.get("activation_state") != "pending_consumer"
     ):
         return
@@ -2347,6 +3426,18 @@ def deploy(
     sleeper: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     setattr(args, _RUNTIME_MUTATION_STARTED_ATTR, False)
+    automatic_catalog = bool(getattr(args, "automatic_catalog", False))
+    if automatic_catalog and not args.keep_paused:
+        raise DeploymentError("--automatic-catalog requires --keep-paused")
+    if not automatic_catalog and not args.keep_paused:
+        raise DeploymentError(
+            "legacy scheduled activation is retired; deploy coordinator-only "
+            "with --keep-paused"
+        )
+    if automatic_catalog and args.release_root.resolve() != REPOSITORY_ROOT.resolve():
+        raise DeploymentError(
+            "automatic deploy must run from the same pristine --release-root checkout"
+        )
     evidence_dir = args.evidence_dir.resolve()
     configured_report = getattr(args, "report", None)
     report_path = (
@@ -2599,19 +3690,22 @@ def deploy(
             container_id, control_db_uri, run=run
         )
         delivery_credentials = validate_delivery_runtime(container_id, run=run)
-        isolated_schedule_initial = read_schedule_boundary(
-            container_id,
-            ISOLATED_DAILY_DAG_ID,
-            run=run,
-        )
-        # Both paused schedulers must already agree before any isolated DAG is
-        # unpaused.  The final check below repeats this at the commit boundary.
-        validate_matching_schedule_boundaries(
-            shared_initial=initial_handoff.get("next_scheduled_interval"),
-            shared_final=initial_handoff.get("next_scheduled_interval"),
-            isolated_initial=isolated_schedule_initial,
-            isolated_final=isolated_schedule_initial,
-        )
+        isolated_schedule_initial = None
+        if not automatic_catalog and not args.keep_paused:
+            isolated_schedule_initial = read_schedule_boundary(
+                container_id,
+                ISOLATED_DAILY_DAG_ID,
+                run=run,
+            )
+            # Legacy activation binds the old daily producer to the shared
+            # consumer.  Automatic rollout binds its daily generation inside
+            # the orchestrator and deliberately has no legacy boundary.
+            validate_matching_schedule_boundaries(
+                shared_initial=initial_handoff.get("next_scheduled_interval"),
+                shared_final=initial_handoff.get("next_scheduled_interval"),
+                isolated_initial=isolated_schedule_initial,
+                isolated_final=isolated_schedule_initial,
+            )
         marker_create_sql = f"""CREATE TABLE IF NOT EXISTS {RUNTIME_MARKER_TABLE} (
             deployment_id VARCHAR,
             git_sha VARCHAR,
@@ -2662,6 +3756,11 @@ def deploy(
             "scheduler_container_id": container_id,
             "scheduler_image_id": image_id,
         }
+        automatic_scope_bootstrap = (
+            bootstrap_automatic_scope_observations(container_id, run=run)
+            if automatic_catalog
+            else None
+        )
         if not args.keep_paused:
             for dag_id in (
                 "dag_ingest_fotmob",
@@ -2678,11 +3777,13 @@ def deploy(
             expected_isolated_runtime_manifest(release_root, dagbag_root),
             run=run,
         )
-        isolated_schedule_final = read_schedule_boundary(
-            container_id,
-            ISOLATED_DAILY_DAG_ID,
-            run=run,
-        )
+        isolated_schedule_final = None
+        if not automatic_catalog and not args.keep_paused:
+            isolated_schedule_final = read_schedule_boundary(
+                container_id,
+                ISOLATED_DAILY_DAG_ID,
+                run=run,
+            )
         # The second shared snapshot is the final handoff edge, not a copied
         # preflight result.  Take it only after the durable marker and exact
         # isolated runtime/schedule checks have completed.
@@ -2699,12 +3800,14 @@ def deploy(
             raise DeploymentError("release Git SHA changed before final admission")
         if prepare_dagbag(release_root, evidence_dir, sha) != dagbag_root:
             raise DeploymentError("DagBag projection changed before final admission")
-        schedule_boundary = validate_matching_schedule_boundaries(
-            shared_initial=initial_handoff.get("next_scheduled_interval"),
-            shared_final=final_handoff.get("next_scheduled_interval"),
-            isolated_initial=isolated_schedule_initial,
-            isolated_final=isolated_schedule_final,
-        )
+        schedule_boundary = None
+        if not automatic_catalog and not args.keep_paused:
+            schedule_boundary = validate_matching_schedule_boundaries(
+                shared_initial=initial_handoff.get("next_scheduled_interval"),
+                shared_final=final_handoff.get("next_scheduled_interval"),
+                isolated_initial=isolated_schedule_initial,
+                isolated_final=isolated_schedule_final,
+            )
         report = {
             "schema_version": "fotmob-deploy-v2",
             "generated_at": _now(),
@@ -2739,8 +3842,21 @@ def deploy(
             "import_errors": 0,
             "shared_handoff_initial": initial_handoff,
             "shared_handoff_final": final_handoff,
-            "schedule_boundary": schedule_boundary,
         }
+        if automatic_catalog:
+            report["automatic_rollout"] = {
+                "schema_version": AUTOMATIC_ROLLOUT_SCHEMA,
+                "phase": "awaiting_canary",
+                "scope_observation_bootstrap": automatic_scope_bootstrap,
+            }
+        elif not args.keep_paused:
+            report["schedule_boundary"] = schedule_boundary
+        else:
+            report["coordinator_rollout"] = {
+                "schema_version": COORDINATOR_ROLLOUT_SCHEMA,
+                "phase": "kept_paused",
+                "legacy_activation_retired": True,
+            }
         if args.keep_paused:
             kept_paused = {
                 **report,
@@ -2773,14 +3889,9 @@ def deploy(
                 except Exception:
                     pass
             try:
-                # Best-effort confirmation is useful in command logs even
-                # though the scheduler is stopped unconditionally below.
                 assert_paused(set(EXPECTED_DAGS))
             except Exception:
                 pass
-            # An already-created LocalExecutor task can keep running after a
-            # successful metadata pause. A failed admission never leaves the
-            # scheduler alive, irrespective of pause command outcome.
             try:
                 command("stop", "airflow-scheduler", check=False)
             except Exception:
@@ -2801,12 +3912,737 @@ def deploy(
         try:
             _atomic_json(report_path, failure_report)
         except Exception:
-            # Preserve the original admission failure.  main() makes a second
-            # best-effort report write, while all schedulers are already safe.
             pass
         raise
 
 
+def activate_automatic_catalog(
+    args: argparse.Namespace,
+    *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    """Resume-only automatic cutover for the exact prepared deployment."""
+
+    if args.keep_paused or args.resume_pending or not args.automatic_catalog:
+        raise DeploymentError(
+            "--activate-automatic requires --automatic-catalog and no legacy flags"
+        )
+    if args.automatic_canary_report is None:
+        raise DeploymentError("--activate-automatic requires --automatic-canary-report")
+    report_path = (args.report or args.evidence_dir / "deployment.json").resolve()
+    try:
+        deployment = json.loads(
+            report_path.read_text(encoding="utf-8"),
+            object_pairs_hook=_unique_json_object,
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeploymentError(f"cannot read automatic deployment report: {exc}") from exc
+    if not isinstance(deployment, dict) or deployment.get("schema_version") != "fotmob-deploy-v2":
+        raise DeploymentError("automatic activation requires a fotmob-deploy-v2 report")
+    if (
+        deployment.get("activation_state") == "active"
+        and deployment.get("automatic_catalog_admission") is not None
+    ):
+        _report, isolated_container, shared_container = _validate_resume_identity(
+            args, deployment, run=run
+        )
+        active_rollout = deployment.get("automatic_rollout")
+        if (
+            not isinstance(active_rollout, Mapping)
+            or active_rollout.get("phase") != "active"
+            or active_rollout.get("canary_report")
+            != str(args.automatic_canary_report.resolve())
+        ):
+            raise DeploymentError("active automatic canary identity differs")
+        load_automatic_canary_report(
+            args.automatic_canary_report,
+            evidence_dir=args.evidence_dir,
+            deployment=deployment,
+        )
+        try:
+            context = runtime_binding.load_deployment_context(
+                report_path,
+                project=args.project,
+                compose_file=args.compose_file,
+            )
+            runtime_binding.validate_live_deployment(
+                context,
+                project=args.project,
+                compose_file=args.compose_file,
+                env_file=args.env_file,
+                require_running=True,
+                run=run,
+            )
+            runtime_binding.validate_live_shared_runtime(context, run=run)
+        except runtime_binding.RuntimeBindingError as exc:
+            raise DeploymentError(str(exc)) from exc
+        inspect_automatic_writer_pause_shape(
+            isolated_container,
+            expected_paused=set(LEGACY_OWNER_DAGS),
+            run=run,
+        )
+        atomic_shared_consumer_transition(
+            shared_container,
+            phase="inspect_unpaused",
+            run=run,
+        )
+        return dict(deployment)
+    allowed_states = {
+        "kept_paused",
+        "pending_automatic",
+        "automatic_activation_failed",
+    }
+    if deployment.get("activation_state") not in allowed_states:
+        raise DeploymentError("deployment is not awaiting automatic activation")
+    rollout = deployment.get("automatic_rollout")
+    if (
+        not isinstance(rollout, Mapping)
+        or rollout.get("schema_version") != AUTOMATIC_ROLLOUT_SCHEMA
+        or rollout.get("scope_observation_bootstrap")
+        != {
+            "table": runtime_binding.SCOPE_OBSERVATIONS_TABLE,
+            "table_exists": True,
+            "current_view": runtime_binding.SCOPE_OBSERVATIONS_CURRENT_VIEW,
+            "current_view_exists": True,
+        }
+    ):
+        raise DeploymentError("deployment has no exact automatic bootstrap evidence")
+    _report, isolated_container, shared_container = _validate_resume_identity(
+        args, deployment, run=run
+    )
+    canary = load_automatic_canary_report(
+        args.automatic_canary_report,
+        evidence_dir=args.evidence_dir,
+        deployment=deployment,
+    )
+    owner_committed = False
+    owner_transition_attempted = False
+    shared_committed = False
+    shared_transition_attempted = False
+    pending_report: dict[str, Any] | None = None
+    owner_commit_evidence: dict[str, Any] = {}
+
+    try:
+        # A failed prior attempt stopped this exact container after pausing all
+        # writers. Restarting it is resume, not a redeploy, and preserves identity.
+        running = run(
+            (
+                "docker",
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                isolated_container,
+            ),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip().casefold()
+        if running == "false":
+            _mark_runtime_mutation_started(args)
+            run(
+                ("docker", "start", isolated_container),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        elif running != "true":
+            raise DeploymentError("cannot determine automatic scheduler state")
+
+        try:
+            context = runtime_binding.load_deployment_context(
+                report_path,
+                project=args.project,
+                compose_file=args.compose_file,
+            )
+        except runtime_binding.RuntimeBindingError:
+            # Pending/failure reports are not runtime authority, but their
+            # immutable identities can still be re-attested before recovery.
+            context = dict(deployment)
+        runtime_binding.validate_live_deployment(
+            context,
+            project=args.project,
+            compose_file=args.compose_file,
+            env_file=args.env_file,
+            require_running=True,
+            run=run,
+        )
+        runtime_binding.validate_live_shared_runtime(context, run=run)
+
+        # If the owner transaction committed but the final file write failed,
+        # recover by observation. Never pause/stop a possibly scheduled owner.
+        if deployment.get("activation_state") != "kept_paused":
+            resume_snapshot = inspect_automatic_writer_pause_shape(
+                isolated_container,
+                expected_paused=None,
+                run=run,
+            )
+            active_pause_shape = {
+                dag_id: dag_id in LEGACY_OWNER_DAGS
+                for dag_id in sorted(EXPECTED_DAGS)
+            }
+            if resume_snapshot["pause_states"] == active_pause_shape:
+                owner_committed = True
+                if resume_snapshot.get("active_runs") != []:
+                    raise DeploymentError(
+                        "owner-committed recovery has active isolated runs"
+                    )
+                stored_activation = deployment.get("automatic_activation")
+                stored_handoff = (
+                    stored_activation.get("fresh_shared_handoff")
+                    if isinstance(stored_activation, Mapping)
+                    else None
+                )
+                if not isinstance(stored_handoff, Mapping):
+                    raise DeploymentError(
+                        "owner-committed daily boundary evidence is missing"
+                    )
+                shared_readback = atomic_shared_consumer_transition(
+                    shared_container,
+                    phase="inspect_unpaused",
+                    recovery_boundary=stored_handoff.get(
+                        "next_scheduled_interval"
+                    ),
+                    run=run,
+                )
+                live_shared_boundary = read_schedule_boundary(
+                    shared_container,
+                    SHARED_CONSUMER_DAG_ID,
+                    require_paused=False,
+                    run=run,
+                )
+                shared_recovery = validate_owner_committed_shared_recovery(
+                    shared_readback,
+                    stored_boundary=stored_handoff.get("next_scheduled_interval"),
+                    live_boundary=live_shared_boundary,
+                )
+                stored_commit_boundary = (
+                    stored_activation.get("daily_boundary_commit")
+                    if isinstance(stored_activation, Mapping)
+                    else None
+                )
+                if not isinstance(stored_commit_boundary, Mapping):
+                    raise DeploymentError(
+                        "owner-committed boundary certificate is missing"
+                    )
+                recovery_boundary = dict(stored_commit_boundary)
+                recovered_at = _now()
+                admission = deployment.get("automatic_catalog_admission")
+                try:
+                    admission_time = datetime.fromisoformat(
+                        str(
+                            (admission or {}).get("validated_at", "")
+                            if isinstance(admission, Mapping)
+                            else ""
+                        ).replace("Z", "+00:00")
+                    )
+                    runtime_binding.validate_automatic_catalog_admission(
+                        admission,
+                        now=admission_time,
+                    )
+                except Exception as exc:
+                    raise DeploymentError(
+                        "owner-committed admission is missing or invalid"
+                    ) from exc
+                control_quiescence = assert_no_active_control_publication(
+                    shared_container,
+                    run=run,
+                )
+                recovered = {
+                    **deployment,
+                    # Keep the admitted cutover timestamp stable.  Admission
+                    # freshness is evaluated at that immutable edge; the
+                    # later recovery time is recorded separately below.
+                    "generated_at": deployment.get("generated_at"),
+                    "passed": True,
+                    "activation_state": "active",
+                    "kept_paused": False,
+                    "paused": sorted(LEGACY_OWNER_DAGS),
+                    "unpaused": sorted(AUTOMATIC_ACTIVE_DAGS),
+                    "automatic_rollout": {
+                        **dict(rollout),
+                        "phase": "active",
+                        "canary_report": str(
+                            args.automatic_canary_report.resolve()
+                        ),
+                    },
+                    "automatic_activation": {
+                        **dict(deployment.get("automatic_activation") or {}),
+                        "shared_consumer_unpaused": True,
+                        "shared_consumer_readback": shared_readback,
+                        "owner_unpaused_last": True,
+                        "owner_recovery_snapshot": resume_snapshot,
+                        "shared_recovery": shared_recovery,
+                        "control_quiescence_at_recovery": control_quiescence,
+                        "daily_boundary_recovery": recovery_boundary,
+                        "recovered_at": recovered_at,
+                    },
+                }
+                runtime_binding.validate_automatic_rollout_activation(
+                    recovered,
+                    runtime_binding.validate_automatic_catalog_admission(
+                        admission,
+                        now=admission_time,
+                    ),
+                )
+                _atomic_json(report_path, recovered)
+                return recovered
+
+            children_pause_shape = {
+                dag_id: dag_id
+                not in {"dag_ingest_fotmob", "dag_transform_fotmob_silver"}
+                for dag_id in sorted(EXPECTED_DAGS)
+            }
+            if resume_snapshot["pause_states"] == children_pause_shape:
+                shared_committed = True
+                if resume_snapshot.get("active_runs") != []:
+                    raise DeploymentError(
+                        "shared-committed recovery has active isolated runs"
+                    )
+                stored_activation = deployment.get("automatic_activation")
+                stored_handoff = (
+                    stored_activation.get("fresh_shared_handoff")
+                    if isinstance(stored_activation, Mapping)
+                    else None
+                )
+                if not isinstance(stored_handoff, Mapping):
+                    raise DeploymentError(
+                        "shared-committed daily boundary evidence is missing"
+                    )
+                # The durable pending certificate is intentionally ambiguous
+                # about whether the shared transaction response was lost.
+                # Until an exact readback or a successful atomic pause proves
+                # otherwise, preserve its wait-only authority.
+                try:
+                    shared_readback = atomic_shared_consumer_transition(
+                        shared_container,
+                        phase="inspect_unpaused",
+                        recovery_boundary=stored_handoff.get(
+                            "next_scheduled_interval"
+                        ),
+                        run=run,
+                    )
+                except Exception:
+                    atomic_shared_consumer_transition(
+                        shared_container,
+                        phase="pause",
+                        run=run,
+                    )
+                    shared_committed = False
+                    shared_readback = None
+                if isinstance(shared_readback, Mapping):
+                    live_shared_boundary = read_schedule_boundary(
+                        shared_container,
+                        SHARED_CONSUMER_DAG_ID,
+                        require_paused=False,
+                        run=run,
+                    )
+                    shared_recovery = validate_owner_committed_shared_recovery(
+                        shared_readback,
+                        stored_boundary=stored_handoff.get(
+                            "next_scheduled_interval"
+                        ),
+                        live_boundary=live_shared_boundary,
+                    )
+                    shared_committed = True
+                    admission = deployment.get("automatic_catalog_admission")
+                    try:
+                        admission_time = datetime.fromisoformat(
+                            str(
+                                (admission or {}).get("validated_at", "")
+                                if isinstance(admission, Mapping)
+                                else ""
+                            ).replace("Z", "+00:00")
+                        )
+                        normalized_admission = (
+                            runtime_binding.validate_automatic_catalog_admission(
+                                admission,
+                                now=admission_time,
+                            )
+                        )
+                    except Exception as exc:
+                        raise DeploymentError(
+                            "shared-committed admission is missing or invalid"
+                        ) from exc
+                    control_quiescence = assert_no_active_control_publication(
+                        shared_container,
+                        run=run,
+                    )
+                    owner_transition_attempted = True
+                    owner_transition = atomic_automatic_writer_transition(
+                        isolated_container,
+                        phase="owner",
+                        selected_date=str(
+                            stored_activation.get("daily_boundary_commit", {}).get(
+                                "selected_date"
+                            )
+                        ),
+                        run=run,
+                    )
+                    owner_committed = True
+                    owner_commit_evidence = {
+                        "shared_consumer_unpaused": True,
+                        "shared_consumer_readback": shared_readback,
+                        "shared_recovery": shared_recovery,
+                        "control_quiescence_at_recovery": control_quiescence,
+                        "daily_boundary_recovery": dict(
+                            stored_activation.get("daily_boundary_commit") or {}
+                        ),
+                        "recovered_at": _now(),
+                        "owner_unpaused_last": True,
+                        "owner_transaction": owner_transition,
+                    }
+                    recovered = {
+                        **deployment,
+                        "passed": True,
+                        "activation_state": "active",
+                        "kept_paused": False,
+                        "paused": sorted(LEGACY_OWNER_DAGS),
+                        "unpaused": sorted(AUTOMATIC_ACTIVE_DAGS),
+                        "automatic_rollout": {
+                            **dict(rollout),
+                            "phase": "active",
+                            "canary_report": str(
+                                args.automatic_canary_report.resolve()
+                            ),
+                        },
+                        "automatic_activation": {
+                            **dict(stored_activation),
+                            **owner_commit_evidence,
+                        },
+                    }
+                    runtime_binding.validate_automatic_rollout_activation(
+                        recovered,
+                        normalized_admission,
+                    )
+                    _atomic_json(report_path, recovered)
+                    return recovered
+
+            # A pre-owner retry can be normalized back to the safe all-paused
+            # edge. The transaction rejects any queued/running writer.
+            _mark_runtime_mutation_started(args)
+            atomic_automatic_writer_transition(
+                isolated_container, phase="pause_all", run=run
+            )
+            atomic_shared_consumer_transition(
+                shared_container, phase="pause", run=run
+            )
+        control_db_uri = _configured_env_value(
+            args.env_file, os.environ, "FBREF_CONTROL_DB_URI"
+        )
+        report_relative_path = report_path.relative_to(args.evidence_dir.resolve())
+        fresh_shared_handoff = validate_shared_handoff(
+            args.release_root.resolve(),
+            shared_container,
+            control_db_uri,
+            evidence_dir=args.evidence_dir.resolve(),
+            report_relative_path=report_relative_path,
+            run=run,
+        )
+        previous_shared_handoff = deployment.get("shared_handoff_final")
+        immutable_shared_fields = (
+            "shared_scheduler_container",
+            "shared_admission_mount",
+            "runtime_code_sha256",
+            "runtime_git_sha",
+            "control_database",
+            "schedule_owner",
+        )
+        if (
+            not isinstance(previous_shared_handoff, Mapping)
+            or any(
+                fresh_shared_handoff.get(field)
+                != previous_shared_handoff.get(field)
+                for field in immutable_shared_fields
+            )
+        ):
+            raise DeploymentError("shared runtime identity changed before cutover")
+        automatic_boundary = validate_automatic_activation_boundary(
+            fresh_shared_handoff.get("next_scheduled_interval")
+        )
+        quiescence_before = runtime_binding.assert_no_active_fotmob_publication(
+            context, run=run
+        )
+        live_canary = validate_live_automatic_canary(
+            isolated_container, canary, run=run
+        )
+        scope_observations = collect_automatic_scope_observations(
+            isolated_container,
+            canary["current_run_reports"][0],
+            run=run,
+        )
+        _mark_runtime_mutation_started(args)
+        transition = atomic_automatic_writer_transition(
+            isolated_container,
+            phase="children",
+            selected_date=automatic_boundary["selected_date"],
+            run=run,
+        )
+        writer_snapshot = {
+            key: transition[key]
+            for key in (
+                "schema_version",
+                "transaction_id",
+                "observed_at",
+                "pause_states",
+                "active_runs",
+            )
+        }
+        admission = build_automatic_catalog_admission(
+            deployment,
+            canary,
+            writer_snapshot=writer_snapshot,
+            scope_observations=scope_observations,
+        )
+        commit_boundary = validate_automatic_activation_boundary(
+            fresh_shared_handoff.get("next_scheduled_interval")
+        )
+        pending = {
+            **deployment,
+            "generated_at": _now(),
+            "passed": True,
+            "activation_state": "pending_automatic",
+            "kept_paused": False,
+            "paused": sorted(LEGACY_OWNER_DAGS | {AUTOMATIC_OWNER_DAG_ID}),
+            "unpaused": sorted(
+                AUTOMATIC_ACTIVE_DAGS - {AUTOMATIC_OWNER_DAG_ID}
+            ),
+            "automatic_catalog_admission": admission,
+            "automatic_rollout": {
+                **dict(rollout),
+                "phase": "pending_owner",
+                "canary_report": str(args.automatic_canary_report.resolve()),
+            },
+            "automatic_activation": {
+                "fresh_shared_handoff": fresh_shared_handoff,
+                "daily_boundary_initial": automatic_boundary,
+                "daily_boundary_commit": commit_boundary,
+                "quiescence_before": quiescence_before,
+                "live_canary": {
+                    "runner_sha256": live_canary["runner_sha256"],
+                    "runner_bytes": live_canary["runner_bytes"],
+                },
+                "children_transaction": transition,
+                "shared_consumer_unpaused": False,
+                "owner_unpaused_last": False,
+            },
+        }
+        pending_report = pending
+        _atomic_json(report_path, pending)
+        shared_transition_attempted = True
+        shared_transition = atomic_shared_consumer_transition(
+            shared_container, phase="unpause", run=run
+        )
+        shared_committed = True
+        shared_readback = atomic_shared_consumer_transition(
+            shared_container, phase="inspect_unpaused", run=run
+        )
+        control_quiescence_at_commit = assert_no_active_control_publication(
+            shared_container, run=run
+        )
+        owner_transition_attempted = True
+        owner_transition = atomic_automatic_writer_transition(
+            isolated_container,
+            phase="owner",
+            selected_date=commit_boundary["selected_date"],
+            run=run,
+        )
+        owner_committed = True
+        owner_commit_evidence = {
+            "shared_consumer_unpaused": True,
+            "shared_consumer_transaction": shared_transition,
+            "shared_consumer_readback": shared_readback,
+            "control_quiescence_at_commit": control_quiescence_at_commit,
+            "owner_unpaused_last": True,
+            "owner_transaction": owner_transition,
+        }
+        active = {
+            **pending,
+            "generated_at": _now(),
+            "activation_state": "active",
+            "kept_paused": False,
+            "paused": sorted(LEGACY_OWNER_DAGS),
+            "unpaused": sorted(AUTOMATIC_ACTIVE_DAGS),
+            "automatic_rollout": {
+                **dict(pending["automatic_rollout"]),
+                "phase": "active",
+            },
+            "automatic_activation": {
+                **dict(pending["automatic_activation"]),
+                **owner_commit_evidence,
+            },
+        }
+        try:
+            active_generated_at = datetime.fromisoformat(
+                str(active["generated_at"]).replace("Z", "+00:00")
+            )
+            normalized_admission = (
+                runtime_binding.validate_automatic_catalog_admission(
+                    admission,
+                    now=active_generated_at,
+                )
+            )
+            runtime_binding.validate_automatic_rollout_activation(
+                active,
+                normalized_admission,
+            )
+        except (TypeError, ValueError, runtime_binding.RuntimeBindingError) as exc:
+            raise DeploymentError(
+                "automatic activation certificate is invalid"
+            ) from exc
+        _atomic_json(report_path, active)
+        return active
+    except Exception as exc:
+        if shared_transition_attempted and not shared_committed:
+            # A committed shared transaction with a lost docker response is
+            # indistinguishable from a failed inspection here. Preserve the
+            # durable wait-only certificate and resolve it on exact retry.
+            try:
+                atomic_shared_consumer_transition(
+                    shared_container,
+                    phase="inspect_unpaused",
+                    run=run,
+                )
+            except Exception:
+                pass
+            shared_committed = True
+        if owner_transition_attempted and not owner_committed:
+            try:
+                observed_owner = inspect_automatic_writer_pause_shape(
+                    isolated_container,
+                    expected_paused=None,
+                    run=run,
+                )
+                active_pause_shape = {
+                    dag_id: dag_id in LEGACY_OWNER_DAGS
+                    for dag_id in sorted(EXPECTED_DAGS)
+                }
+                if observed_owner.get("pause_states") == active_pause_shape:
+                    owner_committed = True
+                    owner_commit_evidence = {
+                        **owner_commit_evidence,
+                        "owner_recovery_snapshot": observed_owner,
+                        "owner_unpaused_last": True,
+                    }
+            except Exception:
+                # The owner commit is ambiguous.  Never kill or overwrite the
+                # wait-only pending certificate until a later exact readback.
+                owner_committed = True
+        if owner_committed:
+            # The atomic owner cut is the point of no return.  Scheduled work
+            # still fails closed on a pending report; killing the scheduler
+            # here could interrupt a writer whose state is ambiguous.
+            incident_base = pending_report or deployment
+            incident = {
+                **incident_base,
+                "generated_at": _now(),
+                "passed": False,
+                "activation_state": "pending_automatic",
+                "kept_paused": False,
+                "paused": sorted(LEGACY_OWNER_DAGS),
+                "unpaused": sorted(AUTOMATIC_ACTIVE_DAGS),
+                "error": f"{type(exc).__name__}: {exc}",
+                "recovery_required": True,
+                "automatic_rollout": {
+                    **dict(rollout),
+                    "phase": "owner_committed_pending_report",
+                    "canary_report": str(
+                        args.automatic_canary_report.resolve()
+                    ),
+                },
+                "automatic_activation": {
+                    **dict(incident_base.get("automatic_activation") or {}),
+                    **owner_commit_evidence,
+                    "owner_unpaused_last": True,
+                    "resume_required": True,
+                },
+            }
+            # Keep the already-durable, passed=true ``pending_owner`` report
+            # byte-for-byte.  It grants the exact Sofa sensor wait-only
+            # authority, so replacing it with a red incident would make the
+            # one scheduled consumer run fail before recovery.  The returned
+            # incident is operator output; the next exact activation command
+            # recovers by observing the live atomic pause shape.
+            incident["durable_pending_report_preserved"] = True
+            return incident
+
+        if shared_committed:
+            incident_base = pending_report or deployment
+            return {
+                **incident_base,
+                "generated_at": _now(),
+                "passed": False,
+                "activation_state": "pending_automatic",
+                "kept_paused": False,
+                "paused": sorted(LEGACY_OWNER_DAGS | {AUTOMATIC_OWNER_DAG_ID}),
+                "unpaused": sorted(
+                    AUTOMATIC_ACTIVE_DAGS - {AUTOMATIC_OWNER_DAG_ID}
+                ),
+                "error": f"{type(exc).__name__}: {exc}",
+                "recovery_required": True,
+                "durable_pending_report_preserved": True,
+                "automatic_rollout": {
+                    **dict(rollout),
+                    "phase": "shared_committed_pending_owner",
+                    "canary_report": str(
+                        args.automatic_canary_report.resolve()
+                    ),
+                },
+                "automatic_activation": {
+                    **dict(incident_base.get("automatic_activation") or {}),
+                    "shared_consumer_unpaused": True,
+                    "owner_unpaused_last": False,
+                    "resume_required": True,
+                },
+            }
+
+        cleanup_errors: list[str] = []
+        isolated_paused = False
+        try:
+            atomic_automatic_writer_transition(
+                isolated_container, phase="pause_all", run=run
+            )
+            isolated_paused = True
+        except Exception as cleanup_exc:
+            cleanup_errors.append(f"isolated pause: {cleanup_exc}")
+        try:
+            atomic_shared_consumer_transition(
+                shared_container, phase="pause", run=run
+            )
+        except Exception as cleanup_exc:
+            cleanup_errors.append(f"shared pause: {cleanup_exc}")
+        if isolated_paused:
+            try:
+                run(
+                    ("docker", "stop", isolated_container),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            except Exception as cleanup_exc:
+                cleanup_errors.append(f"scheduler stop: {cleanup_exc}")
+        else:
+            cleanup_errors.append(
+                "scheduler stop skipped: writer quiescence was not proved"
+            )
+        failure_base = pending_report or deployment
+        failed = {
+            **failure_base,
+            "generated_at": _now(),
+            "passed": False,
+            "activation_state": "automatic_activation_failed",
+            "kept_paused": True,
+            "paused": sorted(EXPECTED_DAGS),
+            "unpaused": [],
+            "error": f"{type(exc).__name__}: {exc}",
+            "cleanup_errors": cleanup_errors,
+            "automatic_rollout": {
+                **dict(rollout),
+                "phase": "activation_failed",
+                "canary_report": str(args.automatic_canary_report.resolve()),
+            },
+        }
+        _atomic_json(report_path, failed)
+        return failed
 def _main_locked(args: argparse.Namespace) -> int:
     report_path = args.report or args.evidence_dir / "deployment.json"
     setattr(args, _RUNTIME_MUTATION_STARTED_ATTR, False)
@@ -2814,11 +4650,20 @@ def _main_locked(args: argparse.Namespace) -> int:
         None if args.resume_pending else _existing_report_before_upgrade(report_path)
     )
     try:
-        if not args.resume_pending:
+        activate_automatic = bool(getattr(args, "activate_automatic", False))
+        if not args.resume_pending and not activate_automatic:
             _guard_existing_pending_activation(report_path)
-        report = (
-            resume_pending_activation(args) if args.resume_pending else deploy(args)
-        )
+        canary_report = getattr(args, "automatic_canary_report", None)
+        if canary_report is not None and not activate_automatic:
+            raise DeploymentError(
+                "--automatic-canary-report requires --activate-automatic"
+            )
+        if activate_automatic:
+            report = activate_automatic_catalog(args)
+        else:
+            report = (
+                resume_pending_activation(args) if args.resume_pending else deploy(args)
+            )
     except PendingConsumerError as exc:
         # The durable pending report is intentionally preserved verbatim.  A
         # generic red report or scheduler stop would destroy resumability.
@@ -2867,6 +4712,9 @@ def _main_locked(args: argparse.Namespace) -> int:
             "passed": False,
             "error": f"{type(exc).__name__}: {exc}",
         }
+    if report.get("durable_pending_report_preserved") is True:
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        return 1
     _atomic_json(report_path, report)
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0 if report.get("passed") is True else 1

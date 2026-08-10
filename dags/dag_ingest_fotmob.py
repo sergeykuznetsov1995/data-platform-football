@@ -29,6 +29,7 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from utils.config import DAG_TAGS, FOTMOB_HTTP_POOL, SCHEDULES
 from utils.default_args import SCRAPER_ARGS
 from utils.fotmob_publication import (
+    FOTMOB_CATALOG_CONTRACT_SCHEMA,
     FOTMOB_DAILY_COMPETITION_COUNT,
     FOTMOB_DAILY_COMPETITION_IDS,
     FOTMOB_DAILY_COMPETITION_IDS_SHA256,
@@ -41,8 +42,14 @@ from utils.fotmob_publication import (
     FOTMOB_DAILY_SCOPE_FILE,
     FOTMOB_DAILY_SCOPE_SHA256,
     fail_unsealed_fotmob_publication,
+    record_fotmob_bronze_only_candidate,
     seal_fotmob_publication,
     validate_fotmob_writer_fence,
+)
+from scrapers.fotmob.scope_codec import (
+    format_scope_token,
+    parse_scope_token,
+    validate_scope_tokens,
 )
 from scrapers.fotmob.source_refresh import (
     PLAYER_SOURCE_REFRESH_ARTIFACT,
@@ -59,6 +66,20 @@ from scrapers.fotmob.source_refresh import (
 
 RESULT_PATH = "/tmp/fotmob_result_{{ ts_nodash }}.json"
 NATIVE_MODES = frozenset({"discover", "daily", "backfill", "replay", "refresh"})
+FOTMOB_SILVER_BRONZE_INPUTS = frozenset(
+    {
+        "iceberg.bronze.fotmob_competition_seasons",
+        "iceberg.bronze.fotmob_season_teams",
+        "iceberg.bronze.fotmob_matches",
+        "iceberg.bronze.fotmob_match_payloads",
+        "iceberg.bronze.fotmob_standings",
+        "iceberg.bronze.fotmob_leaderboards",
+        "iceberg.bronze.fotmob_squad_snapshots",
+        "iceberg.bronze.fotmob_player_snapshots",
+        "iceberg.bronze.fotmob_team_snapshots",
+        "iceberg.bronze.fotmob_transfer_events",
+    }
+)
 ISSUE_930_REPLAY_ENTITIES = [
     "leaderboards",
     "matches",
@@ -102,6 +123,18 @@ SILVER_TRIGGER_RUN_ID_TEMPLATE = (
     + PUBLICATION_CONF_EXPR
     + ".get('generation_id') or run_id) }}"
 )
+
+
+def _validated_exact_scope_evidence(value: Any) -> tuple[str, ...] | None:
+    """Return canonical unique scope evidence, or ``None`` when it is unsafe."""
+
+    if not isinstance(value, list):
+        return None
+    try:
+        tokens = validate_scope_tokens(value)
+    except ValueError:
+        return None
+    return tokens if tuple(value) == tokens else None
 
 
 def _validate_daily_selection(
@@ -149,22 +182,14 @@ def _validate_daily_selection(
     ):
         violations.append("daily transport budget mismatch")
 
+    planned_tokens = _validated_exact_scope_evidence(planned_scopes)
     planned_pairs: list[tuple[int, str]] = []
-    if not isinstance(planned_scopes, list) or not planned_scopes:
+    if planned_tokens is None:
+        violations.append("invalid daily planned scope evidence")
+    elif not planned_tokens:
         violations.append("missing daily planned scopes")
     else:
-        for scope in planned_scopes:
-            match = (
-                re.fullmatch(r"([1-9][0-9]*)=(\S+)", scope)
-                if isinstance(scope, str)
-                else None
-            )
-            if match is None:
-                violations.append("invalid daily planned scope evidence")
-                break
-            planned_pairs.append((int(match.group(1)), match.group(2)))
-        if len(planned_pairs) != len(set(planned_pairs)):
-            violations.append("duplicate daily planned scopes")
+        planned_pairs = [parse_scope_token(scope) for scope in planned_tokens]
         if {competition_id for competition_id, _season in planned_pairs} != set(
             expected_ids
         ):
@@ -468,6 +493,7 @@ def prove_replay_missing_player_inputs(
     if not all(isinstance(value, Mapping) for value in (selection, transport, budget)):
         raise AirflowException("FotMob replay gap proof lacks typed runner evidence")
     scopes = selection.get("explicit_scopes")
+    scope_tokens = _validated_exact_scope_evidence(scopes)
     entities = selection.get("entities")
     plan_signature = selection.get("scope_plan_signature")
     typed = selection.get("replay_missing_player_inputs")
@@ -485,14 +511,7 @@ def prove_replay_missing_player_inputs(
         or result.get("complete") is not False
         or not isinstance(result.get("errors"), list)
         or not result.get("errors")
-        or not isinstance(scopes, list)
-        or not scopes
-        or any(
-            not isinstance(scope, str)
-            or re.fullmatch(r"[1-9][0-9]*=\S+", scope) is None
-            for scope in scopes
-        )
-        or len(scopes) != len(set(scopes))
+        or not scope_tokens
         or entities != ISSUE_930_REPLAY_ENTITIES
         or selection.get("competition_limit") != 0
         or selection.get("season_limit") != 0
@@ -522,7 +541,9 @@ def prove_replay_missing_player_inputs(
     contract = _source_refresh_contract()
     affected_scopes = sorted(
         {
-            f"{target['competition_id']}={target['source_season_key']}"
+            format_scope_token(
+                target["competition_id"], target["source_season_key"]
+            )
             for target in contract["targets"]
         }
     )
@@ -540,7 +561,7 @@ def prove_replay_missing_player_inputs(
         or not isinstance(completed, list)
         or len(planned) != len(set(planned))
         or len(completed) != len(set(completed))
-        or set(planned) != set(scopes)
+        or set(planned) != set(scope_tokens)
         or set(completed).intersection(affected_scopes)
         or set(completed).union(affected_scopes) != set(planned)
         or len(completed) + len(affected_scopes) != len(planned)
@@ -585,11 +606,13 @@ def validate_data(
 
     logger = logging.getLogger(__name__)
     try:
-        with open(result_path, "r", encoding="utf-8") as stream:
-            result = json.load(stream)
+        raw_result = Path(result_path).read_bytes()
+        if not raw_result or len(raw_result) > 32 * 1024 * 1024:
+            raise AirflowException("FotMob report has an unsafe byte size")
+        result = json.loads(raw_result.decode("utf-8"))
     except FileNotFoundError as exc:
         raise AirflowException(f"FotMob report not found: {result_path}") from exc
-    except json.JSONDecodeError as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise AirflowException(
             f"Invalid FotMob report JSON at {result_path}: {exc}"
         ) from exc
@@ -600,6 +623,16 @@ def validate_data(
             f"Unsupported FotMob report mode {mode!r}; native mode is required"
         )
     if mode in NATIVE_MODES:
+        selection = result.get("selection")
+        contract_evidence = (
+            selection.get("catalog_contract")
+            if isinstance(selection, dict)
+            else None
+        )
+        automatic_catalog = (
+            isinstance(contract_evidence, dict)
+            and contract_evidence.get("schema") == FOTMOB_CATALOG_CONTRACT_SCHEMA
+        )
         operation_failures = []
         for operation in result.get("operations") or []:
             if (
@@ -639,14 +672,40 @@ def validate_data(
             violations.append(f"missing transport metrics={missing_transport!r}")
         if missing_budget:
             violations.append(f"missing budget metrics={missing_budget!r}")
-        if result.get("status") != "success" or result.get("complete") is not True:
+        if automatic_catalog:
+            valid_status_shape = (
+                result.get("status") == "success"
+                and result.get("complete") is True
+            ) or (
+                result.get("status") == "partial_success"
+                and result.get("complete") is False
+            )
+            if not valid_status_shape:
+                violations.append(
+                    "automatic status/complete evidence is inconsistent"
+                )
+        elif result.get("status") != "success" or result.get("complete") is not True:
             violations.append(
                 f"status={result.get('status')!r}, complete={result.get('complete')!r}"
             )
-        if result.get("errors"):
+        if result.get("errors") and not automatic_catalog:
             violations.append(f"runner errors={result['errors']!r}")
-        if operation_failures:
+        if operation_failures and not automatic_catalog:
             violations.append(f"operation failures={operation_failures!r}")
+        if automatic_catalog:
+            for failure in operation_failures:
+                hard_errors = [
+                    error
+                    for error in failure["errors"]
+                    if "request budget" not in str(error).casefold()
+                    and "direct-byte budget" not in str(error).casefold()
+                ]
+                if hard_errors or failure["terminal"]:
+                    violations.append(
+                        "automatic hard operation failure="
+                        f"{failure['entity']!r}: errors={hard_errors!r}, "
+                        f"terminal={failure['terminal']!r}"
+                    )
         if int(transport.get("proxy_bytes") or 0) != 0:
             violations.append(
                 f"proxy_bytes={transport.get('proxy_bytes')} (direct-only invariant)"
@@ -668,7 +727,6 @@ def validate_data(
             violations.append("proxy-byte budget exceeded")
         if not result.get("operations"):
             violations.append("no native operations recorded")
-        selection = result.get("selection")
         selection_profile = (
             str(selection.get("profile") or "").strip()
             if isinstance(selection, dict)
@@ -688,17 +746,10 @@ def validate_data(
                 violations.append("missing exact native selection evidence")
             else:
                 raw_scopes = selection.get("explicit_scopes")
+                scope_tokens = _validated_exact_scope_evidence(raw_scopes)
                 entities = selection.get("entities")
                 signature = str(selection.get("scope_plan_signature") or "")
-                if (
-                    not isinstance(raw_scopes, list)
-                    or any(
-                        not isinstance(scope, str)
-                        or re.fullmatch(r"[1-9][0-9]*=\S+", scope) is None
-                        for scope in raw_scopes
-                    )
-                    or len(raw_scopes) != len(set(raw_scopes))
-                ):
+                if scope_tokens is None:
                     violations.append("invalid exact scope selection evidence")
                 elif (
                     not isinstance(entities, list)
@@ -712,13 +763,13 @@ def validate_data(
                     violations.append("invalid native scope plan signature")
                 else:
                     scope_bytes = (
-                        ("\n".join(raw_scopes) + "\n").encode("utf-8")
-                        if raw_scopes
+                        ("\n".join(scope_tokens) + "\n").encode("utf-8")
+                        if scope_tokens
                         else b""
                     )
                     selection_summary = {
                         "entities": entities,
-                        "explicit_scope_count": len(raw_scopes),
+                        "explicit_scope_count": len(scope_tokens),
                         "explicit_scope_sha256": hashlib.sha256(
                             scope_bytes
                         ).hexdigest(),
@@ -732,7 +783,7 @@ def validate_data(
                                 result=result,
                                 selection=selection,
                                 entities=entities,
-                                raw_scopes=raw_scopes,
+                                raw_scopes=list(scope_tokens),
                                 budget=budget,
                             )
                         )
@@ -742,38 +793,80 @@ def validate_data(
                             )
                         violations.extend(source_violations)
                         selection_summary.update(source_summary)
-                    elif mode == "daily":
+                    elif mode == "daily" and not automatic_catalog:
                         daily_violations, daily_summary = _validate_daily_selection(
                             result=result,
                             selection=selection,
                             entities=entities,
-                            raw_scopes=raw_scopes,
+                            raw_scopes=list(scope_tokens),
                             budget=budget,
                         )
                         violations.extend(daily_violations)
                         selection_summary.update(daily_summary)
+        if automatic_catalog:
+            from scripts.fotmob_catalog_acceptance import validate_report
+
+            acceptance = validate_report(result)
+            acceptance_errors = list(acceptance.errors)
+            if acceptance_errors:
+                violations.append(
+                    "automatic catalog evidence failed: "
+                    + "; ".join(acceptance_errors)
+                )
         if violations:
             raise AirflowException(
                 "Incomplete FotMob native ingest: " + "; ".join(violations)
             )
+        raw_tables = result.get("tables")
+        if raw_tables is None:
+            raw_tables = []
+        if not isinstance(raw_tables, list) or any(
+            not isinstance(table, str) for table in raw_tables
+        ):
+            raise AirflowException("FotMob committed table evidence is invalid")
+        bronze_inputs_changed = sorted(
+            {
+                table.strip().casefold()
+                for table in raw_tables
+                if table.strip().casefold().startswith("iceberg.bronze.")
+            }
+        )
         summary = {
-            "status": "success",
+            "status": result.get("status"),
             "run_id": result.get("run_id"),
             "mode": mode,
             "rows": result.get("rows") or {},
-            "tables": result.get("tables") or [],
+            "tables": raw_tables,
+            "bronze_inputs_changed": bronze_inputs_changed,
             "transport": transport,
             "budget": budget,
             "selection": selection_summary,
+            # The kept-paused automatic-canary coordinator reads this exact
+            # file from the admitted scheduler and re-hashes it before it can
+            # become rollout evidence.  XCom carries only the locator/digest,
+            # never an unbounded copy of the full catalog report.
+            "runner_report_path": str(Path(result_path)),
+            "runner_report_sha256": hashlib.sha256(raw_result).hexdigest(),
+            "runner_report_bytes": len(raw_result),
         }
         logger.info("FotMob native validation complete: %s", summary)
         return summary
 
 
-def _should_transform(mode: str) -> bool:
-    """Catalog-only discovery has no season facts for Silver to consume."""
+def _should_transform(**context: Any) -> bool:
+    """Run Silver only when validated committed Bronze inputs changed."""
 
-    return str(mode) != "discover"
+    ti = context.get("ti")
+    validation = ti.xcom_pull(task_ids="validate_data") if ti is not None else None
+    if not isinstance(validation, Mapping):
+        raise AirflowException("FotMob validate_data XCom is missing")
+    changed = validation.get("bronze_inputs_changed")
+    if not isinstance(changed, list) or any(
+        not isinstance(table, str) for table in changed
+    ):
+        raise AirflowException("FotMob changed Bronze input evidence is invalid")
+    normalized = {table.strip().casefold() for table in changed}
+    return bool(normalized & FOTMOB_SILVER_BRONZE_INPUTS)
 
 
 with DAG(
@@ -798,6 +891,11 @@ with DAG(
             title="Exact scopes",
             description="Optional comma-separated FotMob ID=season keys",
         ),
+        "catalog_contract": Param(
+            default="",
+            type="string",
+            enum=["", FOTMOB_CATALOG_CONTRACT_SCHEMA],
+        ),
         "daily_contract": Param(default="", type="string"),
         "competition_scope_file": Param(default="", type="string"),
         "competition_scope_sha256": Param(default="", type="string"),
@@ -813,6 +911,7 @@ with DAG(
             type="integer",
             enum=[0, PLAYER_SOURCE_REFRESH_TARGET_COUNT],
         ),
+        "deadline": Param(default="", type="string"),
         "entities": Param(
             default="season,leaderboards,matches,teams,players,transfers",
             type="string",
@@ -879,7 +978,7 @@ python dags/scripts/run_fotmob_scraper.py \\
     --publication-data-interval-end "{PUBLICATION_BINDING_TEMPLATE["data_interval_end"]}" \\
     --publication-runtime-fingerprint "{PUBLICATION_BINDING_TEMPLATE["runtime_fingerprint"]}" \\
     --mode "{{{{ params.mode }}}}" \\
-    --scope "{{{{ params.scope }}}}" \\
+    --catalog-contract "{{{{ params.catalog_contract }}}}" \\
     --daily-contract "{{{{ params.daily_contract }}}}" \\
     --competition-scope-file "{{{{ params.competition_scope_file }}}}" \\
     --competition-scope-sha256 "{{{{ params.competition_scope_sha256 }}}}" \\
@@ -898,10 +997,12 @@ python dags/scripts/run_fotmob_scraper.py \\
     --max-attempts "{{{{ params.max_attempts }}}}" \\
     --next-build-id "" \\
     --requests-per-minute "{{{{ params.requests_per_minute }}}}" \\
+    --deadline "{{{{ params.deadline }}}}" \\
     --workers 4 \\
     --output "{RESULT_PATH}"
 """,
         env={
+            "FOTMOB_SCOPE_JSON": "{{ params.scope | tojson }}",
             "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
             "PATH": "/usr/local/bin:/usr/bin:/bin:/home/airflow/.local/bin",
             "HOME": "/home/airflow",
@@ -929,7 +1030,17 @@ python dags/scripts/run_fotmob_scraper.py \\
     transform_gate = ShortCircuitOperator(
         task_id="season_data_available",
         python_callable=_should_transform,
-        op_kwargs={"mode": "{{ params.mode }}"},
+        ignore_downstream_trigger_rules=False,
+    )
+
+    record_bronze_only_candidate = PythonOperator(
+        task_id="record_bronze_only_publication_candidate",
+        python_callable=record_fotmob_bronze_only_candidate,
+        op_kwargs={
+            "validation_task_id": "validate_data",
+            "silver_input_tables": sorted(FOTMOB_SILVER_BRONZE_INPUTS),
+        },
+        retries=0,
     )
 
     trigger_silver = TriggerDagRunOperator(
@@ -955,6 +1066,7 @@ python dags/scripts/run_fotmob_scraper.py \\
     seal_publication = PythonOperator(
         task_id="seal_fotmob_publication_ready",
         python_callable=seal_fotmob_publication,
+        trigger_rule="none_failed_min_one_success",
         retries=0,
     )
 
@@ -972,13 +1084,10 @@ python dags/scripts/run_fotmob_scraper.py \\
         retries=0,
     )
 
-    (
-        publication_preflight
-        >> scrape_data_task
-        >> validate_data_task
-        >> transform_gate
-        >> trigger_silver
-        >> seal_publication
-        >> finalize_publication
-    )
+    publication_preflight >> scrape_data_task >> validate_data_task
+    validate_data_task >> record_bronze_only_candidate
+    validate_data_task >> transform_gate
+    transform_gate >> trigger_silver
+    [record_bronze_only_candidate, trigger_silver] >> seal_publication
+    seal_publication >> finalize_publication
     scrape_data_task >> replay_missing_inputs_proof >> finalize_publication

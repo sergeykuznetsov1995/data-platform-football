@@ -79,6 +79,11 @@ FIELD_RULES: Mapping[str, tuple[FieldRule, ...]] = {
         FieldRule("popular.*", FieldDisposition.RAW_ONLY, "competitions", "duplicate presentation list; numeric ids deduplicated against countries"),
         FieldRule("international.*", FieldDisposition.RAW_ONLY, "competitions", "variant index grouping retained raw"),
     ),
+    "competition_profile": (
+        FieldRule("", FieldDisposition.RAW_ONLY, "competition_profile_raw", "JSON document root"),
+        FieldRule("details.*", FieldDisposition.TYPED, "competition_scope_observations", "authoritative competition identity and structural scope metadata"),
+        FieldRule(".*", FieldDisposition.RAW_ONLY, "competition_profile_raw", "season and presentation data is retained raw for later fan-out"),
+    ),
     "league_season": (
         FieldRule("", FieldDisposition.RAW_ONLY, "season_raw", "JSON document root"),
         FieldRule("details.*", FieldDisposition.TYPED, "competition_seasons", "season identity and source metadata"),

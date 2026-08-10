@@ -1,4 +1,5 @@
-from datetime import datetime
+from dataclasses import asdict
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -12,10 +13,16 @@ from scrapers.fotmob.repository import (
     FotMobRepository,
     ManifestStatus,
     MemoryFotMobRepository,
+    TABLE_PARTITIONS,
     TableRows,
     TargetCommit,
     deterministic_target_batch_id,
     normalize_rows,
+)
+from scrapers.fotmob.domain import (
+    CompetitionScopeEvidence,
+    ProbeStatus,
+    ScopeDecision,
 )
 
 
@@ -80,6 +87,80 @@ class CatalogSnapshotWriter(RecordingWriter):
         return self.trino
 
 
+class ScopeEvidenceTrino:
+    def __init__(self, probe_attempt_count=0):
+        self.sql = []
+        self.probe_attempt_count = probe_attempt_count
+
+    def table_exists(self, schema, table):
+        return table == "fotmob_competition_scope_observations"
+
+    def execute_query(self, sql):
+        self.sql.append(sql)
+        return [
+            (
+                "47",
+                "Premier League",
+                "Premier League",
+                "male",
+                "adult",
+                "league",
+                "success",
+                "included",
+                "structurally confirmed adult men's competition",
+                "include_structural_male_adult",
+                "fotmob-men-v1",
+                "b" * 64,
+                "c" * 64,
+                "d" * 64,
+                0,
+                self.probe_attempt_count,
+                None,
+                datetime(2026, 8, 8, 10),
+            )
+        ]
+
+
+class ScopeEvidenceWriter(RecordingWriter):
+    def __init__(self, probe_attempt_count=0):
+        super().__init__()
+        self.trino = ScopeEvidenceTrino(probe_attempt_count)
+
+    def _get_trino_manager(self):
+        return self.trino
+
+
+class EntityAttemptTrino:
+    def __init__(self):
+        self.sql = []
+
+    def execute_query(self, sql):
+        self.sql.append(sql)
+        return [
+            (
+                "target-key",
+                "batch-id",
+                None,
+                None,
+                PARSER_VERSION,
+                "retryable_failure",
+                datetime(2026, 8, 8, 9),
+                datetime(2026, 8, 8, 10),
+                "{}",
+                "{}",
+            )
+        ]
+
+
+class EntityAttemptWriter(RecordingWriter):
+    def __init__(self):
+        super().__init__()
+        self.trino = EntityAttemptTrino()
+
+    def _get_trino_manager(self):
+        return self.trino
+
+
 def _commit(**overrides):
     values = {
         "run_id": "run-1",
@@ -102,6 +183,68 @@ def test_target_batch_id_is_replay_stable_and_parser_sensitive():
     assert first != deterministic_target_batch_id("target", "hash", "parser-v2")
 
 
+def test_memory_scope_attempts_are_durable_contract_bound_and_incremented():
+    repository = MemoryFotMobRepository()
+    attempted_at = datetime(2026, 8, 8, 10)
+    first = repository.record_scope_attempt(
+        run_id="run-1",
+        competition_id=47,
+        source_season_key="2025 Apertura",
+        plan_signature="fmplan1-one",
+        outcome="retryable",
+        reason="HTTP 503",
+        last_attempt_at=attempted_at,
+        next_retry_at=attempted_at + timedelta(minutes=15),
+        attempt_identities=("raw-attempt-1",),
+    )
+    second = repository.record_scope_attempt(
+        run_id="run-2",
+        competition_id=47,
+        source_season_key="2025 Apertura",
+        plan_signature="fmplan1-one",
+        outcome="success",
+        reason="scope completion committed",
+        last_attempt_at=attempted_at + timedelta(minutes=20),
+        attempt_identities=("raw-attempt-2",),
+    )
+
+    assert first.attempt_count == 1
+    assert second.attempt_count == 2
+    assert repository.scope_attempt_states("fmplan1-one") == {
+        (47, "2025 Apertura"): second
+    }
+    assert repository.scope_attempt_states("fmplan1-other") == {}
+    commits = [c for c in repository.commits if c.target_type == "scope_attempt"]
+    assert [c.entity_id for c in commits] == ["fmplan1-one", "fmplan1-one"]
+    assert commits[0].attempts == 0  # transport retry counters are not overloaded
+
+    retried_same_run = repository.record_scope_attempt(
+        run_id="run-2",
+        competition_id=47,
+        source_season_key="2025 Apertura",
+        plan_signature="fmplan1-one",
+        outcome="success",
+        reason="Airflow retried the same generation",
+        last_attempt_at=attempted_at + timedelta(minutes=21),
+    )
+    assert retried_same_run.attempt_count == 2
+
+
+def test_source_gap_requires_two_distinct_successful_attempt_identities():
+    repository = MemoryFotMobRepository()
+
+    with pytest.raises(ValueError, match="two distinct"):
+        repository.record_scope_attempt(
+            run_id="run-1",
+            competition_id=47,
+            source_season_key="2025/2026",
+            plan_signature="fmplan1-one",
+            outcome="source_gap",
+            reason="finished match payload absent",
+            attempt_identities=("only-one",),
+        )
+
+
 def test_catalog_observation_identity_is_separate_from_content_identity():
     first = deterministic_target_batch_id(
         "catalog", "same-content", PARSER_VERSION, "run-1"
@@ -121,6 +264,124 @@ def test_native_parser_contract_is_v2_and_playoff_key_uses_match_ids():
         "source_season_key",
         "entity_id",
     )
+
+
+def _scope_evidence(
+    competition_id=47,
+    *,
+    observed_at=datetime(2026, 8, 8, 10),
+    decision=ScopeDecision.INCLUDED,
+):
+    return CompetitionScopeEvidence(
+        competition_id=competition_id,
+        catalog_name="Premier League",
+        profile_name="Premier League",
+        source_gender="male",
+        source_age_group="adult",
+        source_type="league",
+        probe_status=ProbeStatus.SUCCESS,
+        decision=decision,
+        reason="structurally confirmed adult men's competition",
+        policy_rule="include_structural_male_adult",
+        classifier_version="fotmob-men-v1",
+        profile_target_key="b" * 64,
+        profile_content_hash="c" * 64,
+        catalog_fingerprint="d" * 64,
+        authoritative_miss_count=0,
+        next_probe_at=None,
+        observed_at=observed_at,
+    )
+
+
+def test_scope_observation_table_and_current_view_are_profile_manifest_gated():
+    assert TABLE_PARTITIONS["fotmob_competition_scope_observations"] == (
+        "competition_id",
+    )
+
+
+def test_repository_creates_stable_scope_evidence_schema_before_first_probe():
+    writer = ViewWriter()
+
+    FotMobRepository(writer=writer).ensure_schema()
+
+    assert len(writer.trino.sql) == 3
+    evidence_sql = " ".join(writer.trino.sql[1].split())
+    assert "fotmob_competition_scope_observations" in evidence_sql
+    assert "authoritative_miss_count INTEGER" in evidence_sql
+    assert "probe_attempt_count INTEGER" in evidence_sql
+    assert "partitioning = ARRAY['competition_id']" in evidence_sql
+    migration_sql = " ".join(writer.trino.sql[2].split())
+    assert "ADD COLUMN IF NOT EXISTS probe_attempt_count INTEGER" in migration_sql
+    assert CURRENT_VIEW_SPECS["fotmob_competition_scope_observations"] == (
+        "competition_profile",
+        ("competition_id",),
+    )
+
+
+def test_memory_latest_scope_evidence_ignores_uncommitted_rows_and_selects_latest():
+    repository = MemoryFotMobRepository()
+    older = _scope_evidence(observed_at=datetime(2026, 8, 7, 10))
+    newer = _scope_evidence(
+        observed_at=datetime(2026, 8, 8, 10),
+        decision=ScopeDecision.EXCLUDED,
+    )
+    for run_id, evidence in (("old", older), ("new", newer)):
+        commit = _commit(
+            run_id=run_id,
+            target_type="competition_profile",
+            target_key=evidence.profile_target_key,
+            competition_id=str(evidence.competition_id),
+            content_hash=evidence.profile_content_hash,
+            observation_id=run_id,
+        )
+        repository.commit(
+            commit,
+            [
+                TableRows(
+                    "fotmob_competition_scope_observations",
+                    [{**asdict(evidence), "discovery_run_id": run_id}],
+                    "competition_scope_observations",
+                )
+            ],
+        )
+    repository.tables["fotmob_competition_scope_observations"].append(
+        {
+            **asdict(
+                _scope_evidence(
+                    observed_at=datetime(2026, 8, 9, 10),
+                    decision=ScopeDecision.REVIEW_REQUIRED,
+                )
+            ),
+            "discovery_run_id": "crashed",
+            "_target_batch_id": "never-committed",
+        }
+    )
+
+    latest = repository.latest_scope_evidence([47, 999])
+
+    assert latest == {47: newer}
+
+
+def test_iceberg_latest_scope_evidence_joins_only_committed_profile_manifests():
+    writer = ScopeEvidenceWriter()
+    repository = FotMobRepository(writer=writer)
+
+    latest = repository.latest_scope_evidence([47, 999])
+
+    assert latest[47] == _scope_evidence()
+    sql = " ".join(writer.trino.sql[0].split())
+    assert "target_type = 'competition_profile'" in sql
+    assert "status IN ('success', 'not_modified')" in sql
+    assert "m.batch_id = e._target_batch_id" in sql
+    assert "PARTITION BY e.competition_id" in sql
+
+
+def test_latest_scope_evidence_preserves_legacy_null_probe_attempt_count():
+    repository = FotMobRepository(writer=ScopeEvidenceWriter(None))
+
+    latest = repository.latest_scope_evidence([47])
+
+    assert latest[47].probe_attempt_count is None
 
 
 def test_repository_writes_physical_rows_before_success_manifest():
@@ -280,6 +541,22 @@ def test_entity_tombstone_supersedes_previous_success_for_skip_state():
 
     assert repository.latest_success("match-1") is None
     assert repository.latest_entity_success("match", "1") is None
+
+
+def test_iceberg_latest_entity_attempt_includes_failure_statuses():
+    writer = EntityAttemptWriter()
+    repository = FotMobRepository(writer=writer)
+
+    latest = repository.latest_entity_attempt("competition_seasons", 47)
+
+    assert latest is not None
+    assert latest["status"] == "retryable_failure"
+    assert latest["completed_at"] == datetime(2026, 8, 8, 10)
+    sql = " ".join(writer.trino.sql[0].split())
+    assert "target_type = 'competition_seasons'" in sql
+    assert "entity_id = '47'" in sql
+    assert "retryable_failure" in sql
+    assert "schema_drift" in sql
 
 
 def test_memory_latest_success_can_be_scoped_to_current_writer_run():

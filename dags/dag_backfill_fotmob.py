@@ -1,11 +1,9 @@
-"""Drain the full FotMob men's-competition history in the isolated stack.
+"""Manual rollback path for draining the men's-competition history.
 
 Companion to ``dag_trigger_fotmob_daily`` (which owns the 14:00 UTC current
-window): this DAG self-drains every historical season FotMob exposes for the
-included senior-men catalog.  Each continuous run mints one exact publication
-generation, triggers ``dag_ingest_fotmob`` in ``backfill`` mode over a bounded
-chunk, then cools down — short while the chunk still moved rows, long once the
-plan is drained so an idle DAG does not hot-spin the shared scheduler.
+window): ``dag_orchestrate_fotmob`` now owns the automatic history drain.  This
+legacy DAG retains the bounded trigger/finalize chain with ``schedule=None`` so
+an operator can explicitly use it for rollback.
 
 Resume is durable and free: the runner skips scopes already terminal in
 ``bronze.fotmob_ingest_manifest``, so successive bounded chunks advance the
@@ -18,14 +16,9 @@ men's catalog and never a women's competition.
 Like the daily owner, this must run through the parent ingest DAG (never a
 writer child directly) so the publication writer fence stays intact, and it
 only materializes under ``FOTMOB_ISOLATED_STACK=1``.  Traffic is direct-only
-(proxy bytes are fenced to zero).  Paused on creation: unpause to start
-draining, pause to stop.
+(proxy bytes are fenced to zero), and the DAG never self-schedules.
 
-Trade-off (documented): routing through ``dag_ingest_fotmob`` means every chunk
-also rebuilds Silver (``_should_transform`` is true for backfill).  Chunks are
-therefore deliberately coarse (``BACKFILL_SEASON_LIMIT``) with a multi-minute
-active cooldown so Silver is rebuilt at most a few times per hour while
-history drains, not once per season.
+Silver is rebuilt only when one of its existing Bronze inputs changed.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -174,7 +167,9 @@ if os.environ.get(ISOLATED_STACK_ENV) == "1":
         dag_id="dag_backfill_fotmob",
         description="Self-draining source-native FotMob men's-history backfill",
         default_args={**DEFAULT_ARGS, "retries": 0},
-        schedule="@continuous",
+        # Retained only as a manual rollback owner.  Automatic draining is
+        # exclusively scheduled by dag_orchestrate_fotmob.
+        schedule=None,
         start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
         catchup=False,
         max_active_runs=1,

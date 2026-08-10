@@ -2,10 +2,12 @@ import copy
 import json
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from scrapers.fbref.control import ControlStore, StateConflict
+from utils import fotmob_publication as publication
 
 
 class MemoryPublicationDB:
@@ -359,6 +361,94 @@ def test_candidate_is_immutable_and_seal_requires_candidate():
     with pytest.raises(StateConflict, match="recorded differently"):
         store.record_publication_candidate(
             generation_id, candidate={"status": "failed"}, source="fotmob"
+        )
+
+
+def test_bronze_only_helper_completes_real_store_lifecycle_and_silver_failure_cannot_seal(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        publication.FOTMOB_DEPLOYMENT_REPORT_PATH_ENV,
+        "/deployment-report.json",
+    )
+    monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, "a" * 40)
+    start = datetime(2026, 8, 8, 8, tzinfo=timezone.utc)
+    end = datetime(2026, 8, 8, 8, 5, tzinfo=timezone.utc)
+    binding = publication.make_publication_binding(
+        owner="isolated",
+        data_interval_start=start,
+        data_interval_end=end,
+    )
+
+    def _context(generation_id, validation):
+        return {
+            "dag_run": SimpleNamespace(
+                conf={
+                    "fotmob_publication": {
+                        "generation_id": generation_id,
+                        "binding": binding,
+                    }
+                }
+            ),
+            "ti": SimpleNamespace(xcom_pull=lambda **kwargs: validation),
+        }
+
+    store, _database, _factory = make_store()
+    generation_id = publication.make_generation_id(binding)
+    store.initialize_publication_generation(
+        generation_id,
+        dag_id="dag_orchestrate_fotmob",
+        binding=binding,
+        source="fotmob",
+    )
+    monkeypatch.setattr(publication, "_control_store", lambda: store)
+    no_op_validation = {
+        "status": "success",
+        "run_id": "no-op",
+        "mode": "refresh",
+        "rows": {},
+        "tables": ["iceberg.bronze.fotmob_competition_profiles"],
+        "bronze_inputs_changed": [
+            "iceberg.bronze.fotmob_competition_profiles"
+        ],
+    }
+    candidate = publication.record_fotmob_bronze_only_candidate(
+        validation_task_id="validate_data",
+        silver_input_tables=["iceberg.bronze.fotmob_matches"],
+        **_context(generation_id, no_op_validation),
+    )
+    ready = publication.seal_fotmob_publication(
+        **_context(generation_id, no_op_validation)
+    )
+
+    assert candidate["candidate_kind"] == "bronze_only"
+    assert ready["phase"] == "ready"
+    assert ready["candidate"] == candidate
+
+    silver_store, _database, _factory = make_store()
+    # A separate store may reuse the same canonical generation identity; the
+    # payload UUID must continue to match its immutable binding.
+    silver_generation_id = generation_id
+    silver_store.initialize_publication_generation(
+        silver_generation_id,
+        dag_id="dag_orchestrate_fotmob",
+        binding=binding,
+        source="fotmob",
+    )
+    monkeypatch.setattr(publication, "_control_store", lambda: silver_store)
+    silver_validation = {
+        "status": "success",
+        "bronze_inputs_changed": ["iceberg.bronze.fotmob_matches"],
+    }
+    deferred = publication.record_fotmob_bronze_only_candidate(
+        validation_task_id="validate_data",
+        silver_input_tables=["iceberg.bronze.fotmob_matches"],
+        **_context(silver_generation_id, silver_validation),
+    )
+    assert deferred["status"] == "silver_required"
+    with pytest.raises(StateConflict, match="without a candidate"):
+        publication.seal_fotmob_publication(
+            **_context(silver_generation_id, silver_validation)
         )
 
 

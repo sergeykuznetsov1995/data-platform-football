@@ -10,7 +10,7 @@ import threading
 import time
 import zlib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from enum import Enum
 from typing import Any, Callable, Mapping, Optional, Sequence, Union
@@ -79,6 +79,7 @@ class FetchResult:
     direct_bytes: int
     proxy_bytes: int
     error: Optional[str] = None
+    retry_after: Optional[timedelta] = None
 
     @property
     def status(self) -> str:
@@ -371,7 +372,7 @@ class FotMobTransport:
             self._stats["proxy_bytes"] += result.proxy_bytes
             if result.cache_hit:
                 self._stats["cache_hits"] += 1
-            if result.outcome == FetchOutcome.STALE_REPLAY:
+            if result.stale:
                 self._stats["stale_replays"] += 1
             if result.outcome == FetchOutcome.NOT_MODIFIED:
                 self._stats["not_modified"] += 1
@@ -446,13 +447,15 @@ class FotMobTransport:
         record: Optional[RawJsonRecord] = None,
         error: Optional[str] = None,
         expects_json: bool = True,
+        retry_after: Optional[timedelta] = None,
     ) -> FetchResult:
         # FotMob answers HTTP 200 with a literal JSON ``null`` body for dead
         # catalog entries (placeholder/promo competitions).  A null payload
         # carries no data for any parser, so every data-bearing outcome —
-        # fresh 200, 304 replay or stale replay — degrades to the same
-        # terminal NOT_AVAILABLE state as a 204/404 instead of crashing a
-        # downstream parser into a false schema_drift.
+        # fresh 200, 304 replay or stale replay — degrades to NOT_AVAILABLE
+        # instead of crashing a downstream parser into false schema drift.
+        # A stale replay retains its provenance: it is not a new authoritative
+        # source observation even though its cached payload is still null.
         if (
             expects_json
             and json_data is None
@@ -463,11 +466,15 @@ class FotMobTransport:
                 FetchOutcome.STALE_REPLAY,
             }
         ):
+            stale_null_replay = outcome == FetchOutcome.STALE_REPLAY and stale
             outcome = FetchOutcome.NOT_AVAILABLE
             body = None
-            cache_hit = False
-            stale = False
-            terminal = True
+            if stale_null_replay:
+                terminal = False
+            else:
+                cache_hit = False
+                stale = False
+                terminal = True
             error = error or "FotMob returned a null JSON body"
         fields = self._cache_fields(record)
         return FetchResult(
@@ -487,6 +494,7 @@ class FotMobTransport:
             direct_bytes=network_bytes,
             proxy_bytes=0,
             error=error,
+            retry_after=retry_after,
             **fields,
         )
 
@@ -501,6 +509,7 @@ class FotMobTransport:
         cached_record: Optional[RawJsonRecord],
         allow_stale_on_error: bool,
         error: str,
+        retry_after: Optional[timedelta] = None,
     ) -> FetchResult:
         if (
             allow_stale_on_error
@@ -520,6 +529,7 @@ class FotMobTransport:
                     stale=True,
                     record=cached_record,
                     error=error,
+                    retry_after=retry_after,
                 )
             )
         return self._finish(
@@ -533,6 +543,7 @@ class FotMobTransport:
                 network_bytes=network_bytes,
                 record=cached_record,
                 error=error,
+                retry_after=retry_after,
             )
         )
 
@@ -590,6 +601,11 @@ class FotMobTransport:
             specified = self.backoff_base * (2 ** max(0, attempt - 1))
         jitter = self.jitter_fn(0.0, self.jitter_seconds)
         return min(self.max_retry_delay, max(0.0, specified + jitter))
+
+    @staticmethod
+    def _retry_after_duration(value: Optional[str]) -> Optional[timedelta]:
+        seconds = _parse_retry_after(value, datetime.now(timezone.utc))
+        return None if seconds is None else timedelta(seconds=seconds)
 
     def replay_json(
         self,
@@ -796,6 +812,9 @@ class FotMobTransport:
                             attempts=attempts,
                             network_bytes=network_bytes,
                             error=last_error,
+                            retry_after=self._retry_after_duration(
+                                response.headers.get("Retry-After")
+                            ),
                         )
                     )
                 if not 200 <= last_status <= 299:
@@ -1024,6 +1043,9 @@ class FotMobTransport:
                         cached_record=cached_record,
                         allow_stale_on_error=allow_stale_on_error,
                         error=last_error,
+                        retry_after=self._retry_after_duration(
+                            response.headers.get("Retry-After")
+                        ),
                     )
 
                 if not 200 <= last_status <= 299:

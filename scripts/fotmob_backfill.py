@@ -84,16 +84,33 @@ except ModuleNotFoundError:  # direct ``python scripts/fotmob_backfill.py``
 
 
 SCHEMA_VERSION = "fotmob-issue-930-backfill-v1"
+AUTOMATIC_CANARY_SCHEMA = "fotmob-automatic-canary-v1"
 MAX_PREREQUISITE_REPORT_BYTES = 2 * 1024 * 1024
+MAX_AUTOMATIC_RUNNER_REPORT_BYTES = 32 * 1024 * 1024
 CONFIRM_RUN = "RUN_FOTMOB_ISSUE_930_BACKFILL"
 CONFIRM_RECOVER = "RECOVER_FOTMOB_ISSUE_930_BACKFILL"
+CONFIRM_AUTOMATIC_CANARY = "RUN_FOTMOB_AUTOMATIC_CANARY"
+CONFIRM_RECOVER_AUTOMATIC_CANARY = "RECOVER_FOTMOB_AUTOMATIC_CANARY"
 PUBLICATION_OWNER_DAG_ID = "fotmob_issue_930_backfill"
 PUBLICATION_TTL_SECONDS = 14 * 24 * 60 * 60
 INGEST_DAG_ID = "dag_ingest_fotmob"
 SILVER_DAG_ID = "dag_transform_fotmob_silver"
 DAILY_DAG_ID = "dag_trigger_fotmob_daily"
-DAGS = (INGEST_DAG_ID, SILVER_DAG_ID, DAILY_DAG_ID)
-MODES = frozenset({"backfill", "replay"})
+AUTOMATIC_OWNER_DAG_ID = "dag_orchestrate_fotmob"
+REFRESH_DAG_ID = "dag_refresh_fotmob"
+BACKFILL_DAG_ID = "dag_backfill_fotmob"
+# Quiescence is wider than the two DAGs temporarily enabled by this historical
+# coordinator.  Any automatic or rollback owner could trigger the same writer.
+DAGS = (
+    AUTOMATIC_OWNER_DAG_ID,
+    INGEST_DAG_ID,
+    SILVER_DAG_ID,
+    DAILY_DAG_ID,
+    REFRESH_DAG_ID,
+    BACKFILL_DAG_ID,
+)
+AUTOMATIC_CANARY_MODE = "automatic-canary"
+MODES = frozenset({"backfill", "replay", AUTOMATIC_CANARY_MODE})
 ISSUE_930_SCOPE_ENTITIES = (
     "season",
     "leaderboards",
@@ -103,7 +120,18 @@ ISSUE_930_SCOPE_ENTITIES = (
 )
 if frozenset(ISSUE_930_SCOPE_ENTITIES) != REQUIRED_SCOPE_ENTITIES:
     raise RuntimeError("issue-930 backfill entities differ from acceptance contract")
-_MODE_INTERVAL_PARITY = {"backfill": 0, "replay": 1}
+_MODE_INTERVAL_PARITY = {"backfill": 0, "replay": 1, AUTOMATIC_CANARY_MODE: 2}
+AUTOMATIC_CANARY_ENTITIES = (
+    "leaderboards",
+    "matches",
+    "players",
+    "season",
+    "teams",
+    "transfers",
+)
+AUTOMATIC_CANARY_MAX_REQUESTS = 10_000
+AUTOMATIC_CANARY_MAX_DIRECT_MIB = 512
+AUTOMATIC_CANARY_REQUESTS_PER_MINUTE = 60
 _PLAN_SIGNATURE_RE = re.compile(r"fmplan1-[0-9a-f]{64}")
 
 
@@ -121,6 +149,16 @@ def _expected_plan_signature() -> str:
 
 class BackfillError(RuntimeError):
     pass
+
+
+def _automatic_scope_contract() -> dict[str, Any]:
+    return {
+        "name": "automatic-adult-men-current",
+        "artifact": None,
+        "sha256": hashlib.sha256(b"").hexdigest(),
+        "count": 0,
+        "identities": [],
+    }
 
 
 def _now() -> str:
@@ -606,7 +644,7 @@ def inspect_writer_state(
     *,
     run: Callable[..., subprocess.CompletedProcess[str]],
 ) -> dict[str, Any]:
-    """Read all three pause flags and active runs in one metadata transaction."""
+    """Read every FotMob owner/writer flag and active run in one transaction."""
 
     marker = "FOTMOB_BACKFILL_WRITER_STATE_JSON="
     code = (
@@ -685,7 +723,11 @@ def _expected_publication_envelope(
     start = _timestamp(context["generated_at"]) + timedelta(
         seconds=86_400 + (attempt - 1) * 2 + _MODE_INTERVAL_PARITY[mode]
     )
-    end = start + timedelta(seconds=1)
+    # A two-second interval gives the automatic canary a disjoint UUID
+    # namespace from every historical issue-930 attempt (all one second).
+    end = start + timedelta(
+        seconds=2 if mode == AUTOMATIC_CANARY_MODE else 1
+    )
     binding = {
         "schema": "fotmob-publication-v1",
         "source": "fotmob",
@@ -897,6 +939,60 @@ def _validation_xcom(
     return payload
 
 
+def _automatic_runner_report(
+    args: argparse.Namespace,
+    validation: Mapping[str, Any],
+    *,
+    generation_id: str,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> tuple[dict[str, Any], str, int]:
+    """Read and re-hash the exact canary report inside the admitted scheduler."""
+
+    path = str(validation.get("runner_report_path") or "")
+    digest = str(validation.get("runner_report_sha256") or "").casefold()
+    byte_count = validation.get("runner_report_bytes")
+    if (
+        re.fullmatch(r"/tmp/fotmob_result_[A-Za-z0-9_.:+-]+\.json", path) is None
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or type(byte_count) is not int
+        or byte_count <= 0
+        or byte_count > MAX_AUTOMATIC_RUNNER_REPORT_BYTES
+    ):
+        raise BackfillError("automatic runner report locator/digest is invalid")
+    marker = "FOTMOB_AUTOMATIC_RUNNER_JSON="
+    code = (
+        "import hashlib,json; from pathlib import Path; "
+        f"p=Path({path!r}); b=p.read_bytes(); "
+        f"assert 0<len(b)<={MAX_AUTOMATIC_RUNNER_REPORT_BYTES}; "
+        "r=json.loads(b.decode('utf-8')); assert isinstance(r,dict); "
+        f"print('{marker}'+json.dumps({{'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest(),"
+        "'report':r}},sort_keys=True,separators=(',',':')))"
+    )
+    payload = _container_python_json(args, code=code, marker=marker, run=run)
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("sha256") != digest
+        or payload.get("bytes") != byte_count
+        or not isinstance(payload.get("report"), Mapping)
+    ):
+        raise BackfillError("automatic runner report changed after validation")
+    report = dict(payload["report"])
+    if report.get("run_id") != generation_id:
+        raise BackfillError("automatic runner report has a different generation")
+    try:
+        from scripts.fotmob_catalog_acceptance import validate_report
+
+        acceptance = validate_report(report)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BackfillError(f"automatic runner report is invalid: {exc}") from exc
+    if not acceptance.ok:
+        raise BackfillError(
+            "automatic runner report failed dynamic acceptance: "
+            + "; ".join(acceptance.errors)
+        )
+    return report, digest, byte_count
+
+
 def _replay_missing_input_xcom(
     args: argparse.Namespace,
     ingest_run_id: str,
@@ -1027,6 +1123,48 @@ def _validation_summary(
     source_refresh_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     selection = payload.get("selection")
+    if mode == AUTOMATIC_CANARY_MODE:
+        budget = payload.get("budget")
+        transport = payload.get("transport")
+        empty_scope_sha = hashlib.sha256(b"").hexdigest()
+        if (
+            source_refresh_contract is not None
+            or payload.get("status") != "success"
+            or payload.get("run_id") != generation_id
+            or payload.get("mode") != "daily"
+            or not isinstance(selection, Mapping)
+            or selection.get("entities") != list(AUTOMATIC_CANARY_ENTITIES)
+            or selection.get("explicit_scope_count") != 0
+            or selection.get("explicit_scope_sha256") != empty_scope_sha
+            or selection.get("competition_limit") != 0
+            or selection.get("season_limit") != 0
+            or _PLAN_SIGNATURE_RE.fullmatch(
+                str(selection.get("scope_plan_signature") or "")
+            )
+            is None
+            or not isinstance(budget, Mapping)
+            or budget.get("max_requests") != AUTOMATIC_CANARY_MAX_REQUESTS
+            or budget.get("max_direct_bytes")
+            != AUTOMATIC_CANARY_MAX_DIRECT_MIB * 1024 * 1024
+            or budget.get("max_proxy_bytes") != 0
+            or budget.get("proxy_bytes") != 0
+            or not isinstance(transport, Mapping)
+            or transport.get("proxy_bytes") != 0
+        ):
+            raise BackfillError(
+                "ingest XCom is not the exact automatic daily canary"
+            )
+        return {
+            "run_id": generation_id,
+            "mode": "daily",
+            "catalog_contract": "fotmob-catalog-v1",
+            "scope_count": 0,
+            "scope_sha256": empty_scope_sha,
+            "entities": list(AUTOMATIC_CANARY_ENTITIES),
+            "plan_signature": selection["scope_plan_signature"],
+            "transport": dict(transport),
+            "budget": dict(budget),
+        }
     if source_refresh_contract is not None:
         budget = payload.get("budget")
         transport = payload.get("transport")
@@ -1140,9 +1278,10 @@ def _validation_summary(
 
 def _run_ids(publication: Mapping[str, Any], mode: str, attempt: int) -> dict[str, str]:
     compact = str(publication["generation_id"]).replace("-", "")
+    prefix = "automatic_canary" if mode == AUTOMATIC_CANARY_MODE else f"issue930_{mode}"
     return {
         "ingest_dag_id": INGEST_DAG_ID,
-        "ingest_run_id": f"issue930_{mode}_a{attempt}__{compact}",
+        "ingest_run_id": f"{prefix}_a{attempt}__{compact}",
         "silver_dag_id": SILVER_DAG_ID,
         "silver_run_id": f"fotmob_silver__{publication['generation_id']}",
         "native_runner_run_id": str(publication["generation_id"]),
@@ -1161,8 +1300,11 @@ def _base_report(
     bounded_scope = {
         key: scope_contract[key] for key in ("name", "artifact", "sha256", "count")
     }
+    automatic_canary = mode == AUTOMATIC_CANARY_MODE
     report = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": (
+            AUTOMATIC_CANARY_SCHEMA if automatic_canary else SCHEMA_VERSION
+        ),
         "generated_at": _now(),
         "passed": False,
         "command": "run",
@@ -1176,9 +1318,13 @@ def _base_report(
         "git_sha": context["git_sha"],
         "scope": bounded_scope,
         "entities": (
-            ["players"]
-            if isinstance(source_refresh, Mapping)
-            else list(ISSUE_930_SCOPE_ENTITIES)
+            list(AUTOMATIC_CANARY_ENTITIES)
+            if automatic_canary
+            else (
+                ["players"]
+                if isinstance(source_refresh, Mapping)
+                else list(ISSUE_930_SCOPE_ENTITIES)
+            )
         ),
         "publication": dict(publication),
         "runs": _run_ids(publication, mode, int(args.publication_attempt)),
@@ -1188,11 +1334,18 @@ def _base_report(
             "competition_limit": 0,
             "season_limit": 0,
             "executed_scope_count": (
-                0 if isinstance(source_refresh, Mapping) else scope_contract["count"]
+                0
+                if automatic_canary or isinstance(source_refresh, Mapping)
+                else scope_contract["count"]
             ),
         },
         "publication_action": "abandon_unclaimed_candidate",
     }
+    if automatic_canary:
+        scheduler_container_id = str(context.get("scheduler_container_id") or "")
+        if re.fullmatch(r"[0-9a-f]{64}", scheduler_container_id) is None:
+            raise BackfillError("automatic canary lacks exact scheduler identity")
+        report["scheduler_container_id"] = scheduler_container_id
     if isinstance(source_refresh, Mapping):
         report["profile"] = source_refresh["profile"]
         report["source_refresh"] = {
@@ -1338,13 +1491,56 @@ def _resolve_quiet_generation(
         raise BackfillError("successful ingest lost its publication generation")
 
     candidate = _candidate(state, publication)
+    validation_payload = _validation_xcom(args, ids["ingest_run_id"], run=run)
     validation = _validation_summary(
-        _validation_xcom(args, ids["ingest_run_id"], run=run),
+        validation_payload,
         mode=report["mode"],
         generation_id=str(publication["generation_id"]),
         scope_contract=scope_contract,
         source_refresh_contract=getattr(args, "_source_refresh_contract", None),
     )
+    automatic_evidence: dict[str, Any] = {}
+    if report.get("mode") == AUTOMATIC_CANARY_MODE:
+        stored_reports = report.get("current_run_reports")
+        stored_sha = str(report.get("runner_report_sha256") or "")
+        stored_bytes = report.get("runner_report_bytes")
+        if (
+            isinstance(stored_reports, list)
+            and len(stored_reports) == 1
+            and isinstance(stored_reports[0], Mapping)
+            and re.fullmatch(r"[0-9a-f]{64}", stored_sha)
+            and type(stored_bytes) is int
+            and stored_bytes > 0
+        ):
+            runner_report = dict(stored_reports[0])
+            if runner_report.get("run_id") != publication["generation_id"]:
+                raise BackfillError("stored automatic runner generation differs")
+            from scripts.fotmob_catalog_acceptance import validate_report
+
+            acceptance = validate_report(runner_report)
+            if not acceptance.ok:
+                raise BackfillError("stored automatic runner evidence is invalid")
+            runner_sha = stored_sha
+            runner_bytes = stored_bytes
+        else:
+            runner_report, runner_sha, runner_bytes = _automatic_runner_report(
+                args,
+                validation_payload,
+                generation_id=str(publication["generation_id"]),
+                run=run,
+            )
+        automatic_evidence = {
+            "generation_id": str(publication["generation_id"]),
+            "ingest_run_id": ids["ingest_run_id"],
+            "ingest_run_state": ingest_state,
+            "silver_run_id": ids["silver_run_id"],
+            "silver_run_state": silver_state,
+            "candidate_digest": candidate["digest"],
+            "runner_report_sha256": runner_sha,
+            "runner_report_bytes": runner_bytes,
+            "runner_report_path": validation_payload["runner_report_path"],
+            "current_run_reports": [runner_report],
+        }
     phase = str(state.get("phase") or "").casefold()
     if phase == "ready":
         if state.get("status") != "succeeded" or state.get("active") is not True:
@@ -1352,7 +1548,11 @@ def _resolve_quiet_generation(
         _write_phase(
             report,
             args.output,
-            "ready_pending_abandon",
+            (
+                "ready_validated_pending_abandon"
+                if automatic_evidence
+                else "ready_pending_abandon"
+            ),
             validation=validation,
             plan_signature=validation["plan_signature"],
             candidate={
@@ -1361,6 +1561,7 @@ def _resolve_quiet_generation(
                 "transform_task_ids": candidate.get("transform_task_ids"),
             },
             publication_state=_publication_summary(state),
+            **automatic_evidence,
         )
         state = _transition_publication(
             args,
@@ -1383,6 +1584,8 @@ def _resolve_quiet_generation(
         or state.get("published") is not False
     ):
         raise BackfillError("successful generation was not abandoned safely")
+    if automatic_evidence:
+        automatic_evidence["final_publication"] = _publication_summary(state)
     _write_phase(
         report,
         args.output,
@@ -1397,6 +1600,7 @@ def _resolve_quiet_generation(
             "transform_task_ids": candidate.get("transform_task_ids"),
         },
         publication_state=_publication_summary(state),
+        **automatic_evidence,
     )
     return report
 
@@ -1408,16 +1612,22 @@ def run_backfill(
     sleeper: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
-    if not args.execute or args.confirm != CONFIRM_RUN:
-        raise BackfillError(f"run requires --execute --confirm {CONFIRM_RUN}")
     mode = str(args.mode or "").casefold()
     if mode not in MODES:
-        raise BackfillError("run requires --mode backfill or --mode replay")
+        raise BackfillError(
+            "run requires --mode backfill, --mode replay, or --mode automatic-canary"
+        )
+    automatic_canary = mode == AUTOMATIC_CANARY_MODE
+    expected_confirm = CONFIRM_AUTOMATIC_CANARY if automatic_canary else CONFIRM_RUN
+    if not args.execute or args.confirm != expected_confirm:
+        raise BackfillError(f"run requires --execute --confirm {expected_confirm}")
     if int(args.publication_attempt) <= 0:
         raise BackfillError("--publication-attempt must be a positive integer")
     if args.max_requests <= 0 or args.max_direct_mib <= 0:
         raise BackfillError("request and direct-byte limits must be positive")
     source_refresh = _load_source_refresh_contract(args)
+    if automatic_canary and source_refresh is not None:
+        raise BackfillError("automatic canary cannot use source refresh")
     if source_refresh is not None and (
         mode != "backfill"
         or args.max_requests != PLAYER_SOURCE_REFRESH_MAX_REQUESTS
@@ -1427,7 +1637,17 @@ def run_backfill(
             "source refresh requires backfill mode and its exact reviewed budgets"
         )
     expected_sha = _validate_sha(args.expected_git_sha)
-    scope_contract = _load_scope_contract(args.scopes, args.scope_sha256)
+    if automatic_canary:
+        if args.scope_sha256:
+            raise BackfillError("automatic canary does not accept a static scope hash")
+        if (
+            args.max_requests != AUTOMATIC_CANARY_MAX_REQUESTS
+            or args.max_direct_mib != AUTOMATIC_CANARY_MAX_DIRECT_MIB
+        ):
+            raise BackfillError("automatic canary requires exact 10000/512 budgets")
+        scope_contract = _automatic_scope_contract()
+    else:
+        scope_contract = _load_scope_contract(args.scopes, args.scope_sha256)
     context = _deployment_context(args)
     if context.get("kept_paused") is not True or context["git_sha"] != expected_sha:
         raise BackfillError("run requires the exact admitted --keep-paused deployment")
@@ -1480,16 +1700,23 @@ def run_backfill(
         _airflow(args, "dags", "unpause", INGEST_DAG_ID, run=run)
         conf = {
             "fotmob_publication": publication,
-            "mode": mode,
+            "mode": "daily" if automatic_canary else mode,
             "scope": (
                 ""
-                if source_refresh is not None
+                if automatic_canary or source_refresh is not None
                 else ",".join(scope_contract["identities"])
             ),
             "entities": (
-                "players"
-                if source_refresh is not None
-                else ",".join(ISSUE_930_SCOPE_ENTITIES)
+                ",".join(AUTOMATIC_CANARY_ENTITIES)
+                if automatic_canary
+                else (
+                    "players"
+                    if source_refresh is not None
+                    else ",".join(ISSUE_930_SCOPE_ENTITIES)
+                )
+            ),
+            "catalog_contract": (
+                "fotmob-catalog-v1" if automatic_canary else ""
             ),
             "max_requests": args.max_requests,
             "max_direct_mib": args.max_direct_mib,
@@ -1499,7 +1726,9 @@ def run_backfill(
             "match_limit": 0,
             "team_limit": 0,
             "player_limit": 0,
-            "requests_per_minute": 30,
+            "requests_per_minute": (
+                AUTOMATIC_CANARY_REQUESTS_PER_MINUTE if automatic_canary else 30
+            ),
             "max_attempts": 4,
             "next_build_id": "",
             "source_refresh_profile": (
@@ -1623,10 +1852,15 @@ def _load_recovery_report(
         raise BackfillError(f"invalid recovery report: {exc}") from exc
     context = _deployment_context(args)
     source_refresh = getattr(args, "_source_refresh_contract", None)
+    automatic_canary = getattr(args, "mode", None) == AUTOMATIC_CANARY_MODE
     expected_entities = (
-        ["players"]
-        if isinstance(source_refresh, Mapping)
-        else list(ISSUE_930_SCOPE_ENTITIES)
+        list(AUTOMATIC_CANARY_ENTITIES)
+        if automatic_canary
+        else (
+            ["players"]
+            if isinstance(source_refresh, Mapping)
+            else list(ISSUE_930_SCOPE_ENTITIES)
+        )
     )
     expected_source = (
         {
@@ -1650,12 +1884,14 @@ def _load_recovery_report(
     )
     if (
         not isinstance(report, dict)
-        or report.get("schema_version") != SCHEMA_VERSION
+        or report.get("schema_version")
+        != (AUTOMATIC_CANARY_SCHEMA if automatic_canary else SCHEMA_VERSION)
         or report.get("project") != args.project
         or report.get("deployment_report") != str(args.deployment_report.resolve())
         or report.get("deployment_id") != context["deployment_id"]
         or report.get("git_sha") != context["git_sha"]
         or report.get("mode") not in MODES
+        or (automatic_canary and report.get("mode") != AUTOMATIC_CANARY_MODE)
         or report.get("publication_attempt") != int(args.publication_attempt)
         or report.get("entities") != expected_entities
         or report.get("profile")
@@ -1684,8 +1920,12 @@ def recover_backfill(
     *,
     run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
-    if not args.execute or args.confirm != CONFIRM_RECOVER:
-        raise BackfillError(f"recover requires --execute --confirm {CONFIRM_RECOVER}")
+    automatic_canary = getattr(args, "mode", None) == AUTOMATIC_CANARY_MODE
+    expected_confirm = (
+        CONFIRM_RECOVER_AUTOMATIC_CANARY if automatic_canary else CONFIRM_RECOVER
+    )
+    if not args.execute or args.confirm != expected_confirm:
+        raise BackfillError(f"recover requires --execute --confirm {expected_confirm}")
     source_refresh = _load_source_refresh_contract(args)
     if source_refresh is not None and (
         getattr(args, "mode", None) not in {None, "backfill"}
@@ -1701,7 +1941,17 @@ def recover_backfill(
         )
     if int(args.publication_attempt) <= 0:
         raise BackfillError("--publication-attempt must be a positive integer")
-    scope_contract = _load_scope_contract(args.scopes, args.scope_sha256)
+    if automatic_canary:
+        if args.scope_sha256:
+            raise BackfillError("automatic canary does not accept a static scope hash")
+        if (
+            args.max_requests != AUTOMATIC_CANARY_MAX_REQUESTS
+            or args.max_direct_mib != AUTOMATIC_CANARY_MAX_DIRECT_MIB
+        ):
+            raise BackfillError("automatic canary requires exact 10000/512 budgets")
+        scope_contract = _automatic_scope_contract()
+    else:
+        scope_contract = _load_scope_contract(args.scopes, args.scope_sha256)
     _load_source_refresh_prerequisite(
         args,
         source_refresh=source_refresh,
@@ -1794,7 +2044,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--scopes", type=Path, default=APPROVED_SCOPE_ARTIFACT)
-    parser.add_argument("--scope-sha256", required=True)
+    parser.add_argument(
+        "--scope-sha256",
+        default="",
+        help="Reviewed issue-930 scope hash; must be empty for automatic-canary",
+    )
     parser.add_argument("--source-refresh-profile", default="")
     parser.add_argument("--source-refresh-targets-sha256", default="")
     parser.add_argument(
@@ -1822,15 +2076,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         existing: dict[str, Any] = {}
         try:
             candidate = json.loads(args.output.read_text(encoding="utf-8"))
-            if isinstance(candidate, dict) and candidate.get("schema_version") == (
-                SCHEMA_VERSION
-            ):
+            if isinstance(candidate, dict) and candidate.get("schema_version") in {
+                SCHEMA_VERSION,
+                AUTOMATIC_CANARY_SCHEMA,
+            }:
                 existing = candidate
         except (OSError, json.JSONDecodeError):
             pass
         report = {
             **existing,
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": (
+                AUTOMATIC_CANARY_SCHEMA
+                if getattr(args, "mode", None) == AUTOMATIC_CANARY_MODE
+                else SCHEMA_VERSION
+            ),
             "generated_at": _now(),
             "passed": False,
             "command": args.command,

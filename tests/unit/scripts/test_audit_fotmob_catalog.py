@@ -42,8 +42,8 @@ def test_catalog_report_deduplicates_ids_and_exposes_scope_decisions(monkeypatch
 
     assert report["complete"]
     assert report["catalog"]["unique_competitions"] == 2
-    assert report["catalog"]["decision_counts"] == {
-        "excluded": 1,
-        "included": 1,
-    }
+    # The allLeagues payload is only the discovery layer.  A competition is
+    # admitted or excluded after its profile probe, so the no-write catalog
+    # audit must not pretend the name alone is a final gender decision.
+    assert report["catalog"]["decision_counts"] == {"pending_probe": 2}
     assert report["transport"]["proxy_bytes"] == 0

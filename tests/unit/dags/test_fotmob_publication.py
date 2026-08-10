@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import importlib
 import json
 import sys
@@ -14,6 +15,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from scripts import fotmob_runtime
+from tests.unit.scripts.test_fotmob_deploy import (
+    _automatic_catalog_admission,
+    _automatic_rollout_certificate,
+)
 from utils import fotmob_publication as publication
 
 
@@ -82,20 +87,61 @@ def _isolated_runtime_evidence(tmp_path: Path):
     report_path = (tmp_path / "deployment.json").resolve()
     deployment_id = "f" * 32
     container_id = "1" * 64
+    automatic_admission = _automatic_catalog_admission(
+        deployment_id=deployment_id,
+        git_sha=GIT_SHA,
+        scheduler_container_id=container_id,
+    )
+    handoff = {
+        "passed": True,
+        "shared_scheduler_container": "3" * 64,
+        "shared_admission_mount": {"read_only": True},
+        "runtime_code_sha256": {"dags/example.py": "e" * 64},
+        "runtime_git_sha": GIT_SHA,
+        "control_database": {"same_shared_database": True},
+        "schedule_owner": "isolated",
+        "next_scheduled_interval": {
+            "logical_date": "2026-08-07T14:00:00+00:00",
+            "data_interval_start": "2026-08-07T14:00:00+00:00",
+            "data_interval_end": "2026-08-08T14:00:00+00:00",
+            "run_after": "2026-08-08T14:00:00+00:00",
+        },
+    }
+    rollout = _automatic_rollout_certificate(
+        automatic_admission,
+        evidence_dir=tmp_path,
+        handoff=handoff,
+    )
     report = {
         "schema_version": "fotmob-deploy-v2",
         "passed": True,
         "activation_state": "active",
         "kept_paused": False,
-        "paused": [],
-        "unpaused": sorted(publication.FOTMOB_EXPECTED_ISOLATED_DAGS),
+        "paused": sorted(
+            {
+                publication.FOTMOB_ISOLATED_DAILY_DAG_ID,
+                "dag_refresh_fotmob",
+                "dag_backfill_fotmob",
+            }
+        ),
+        "unpaused": sorted(
+            {
+                publication.FOTMOB_AUTOMATIC_OWNER_DAG_ID,
+                "dag_ingest_fotmob",
+                "dag_transform_fotmob_silver",
+            }
+        ),
         "container_report_path": str(report_path),
-        "generated_at": "2026-07-21T10:00:00Z",
+        "evidence_dir": str(tmp_path.resolve()),
+        "generated_at": automatic_admission["validated_at"],
         "deployment_id": deployment_id,
         "git_sha": GIT_SHA,
         "scheduler_container_id": container_id,
         "resolved_image_id": "sha256:" + "2" * 64,
         "isolated_runtime_sha256": manifest,
+        "shared_handoff_final": handoff,
+        "automatic_catalog_admission": automatic_admission,
+        **rollout,
     }
     report_path.write_text(json.dumps(report), encoding="utf-8")
     environment = {
@@ -106,7 +152,7 @@ def _isolated_runtime_evidence(tmp_path: Path):
         "TELEGRAM_BOT_TOKEN": "must-not-appear",
     }
     dag_run = SimpleNamespace(
-        dag_id=publication.FOTMOB_ISOLATED_DAILY_DAG_ID,
+        dag_id=publication.FOTMOB_AUTOMATIC_OWNER_DAG_ID,
         run_type="scheduled",
     )
     return roots, report_path, report, environment, dag_run
@@ -197,6 +243,71 @@ def _shared_runtime_evidence(tmp_path: Path):
         run_type="scheduled",
     )
     return roots, report_path, report, environment, dag_run
+
+
+def _pending_automatic_shared_wait_report(tmp_path: Path, report: dict) -> dict:
+    deployment_id = report["deployment_id"]
+    isolated_id = "1" * 64
+    handoff = dict(report["shared_handoff_final"])
+    handoff["next_scheduled_interval"] = {
+        "logical_date": "2026-08-07T14:00:00+00:00",
+        "data_interval_start": "2026-08-07T14:00:00+00:00",
+        "data_interval_end": "2026-08-08T14:00:00+00:00",
+        "run_after": "2026-08-08T14:00:00+00:00",
+    }
+    admission = _automatic_catalog_admission(
+        deployment_id=deployment_id,
+        git_sha=GIT_SHA,
+        scheduler_container_id=isolated_id,
+        now=datetime(2026, 8, 8, 13, 35, tzinfo=timezone.utc),
+    )
+    certificate = _automatic_rollout_certificate(
+        admission,
+        evidence_dir=tmp_path,
+        handoff=handoff,
+    )
+    full_activation = certificate["automatic_activation"]
+    pending_activation = {
+        key: full_activation[key]
+        for key in (
+            "fresh_shared_handoff",
+            "daily_boundary_initial",
+            "daily_boundary_commit",
+            "quiescence_before",
+            "live_canary",
+            "children_transaction",
+        )
+    }
+    pending_activation.update(
+        shared_consumer_unpaused=False,
+        owner_unpaused_last=False,
+    )
+    report.update(
+        activation_state="pending_automatic",
+        kept_paused=False,
+        passed=True,
+        paused=sorted(
+            {
+                publication.FOTMOB_AUTOMATIC_OWNER_DAG_ID,
+                publication.FOTMOB_ISOLATED_DAILY_DAG_ID,
+                "dag_refresh_fotmob",
+                "dag_backfill_fotmob",
+            }
+        ),
+        unpaused=["dag_ingest_fotmob", "dag_transform_fotmob_silver"],
+        evidence_dir=str(tmp_path.resolve()),
+        generated_at="2026-08-08T13:36:00+00:00",
+        scheduler_container_id=isolated_id,
+        shared_handoff_initial=handoff,
+        shared_handoff_final=handoff,
+        automatic_catalog_admission=admission,
+        automatic_rollout={
+            **certificate["automatic_rollout"],
+            "phase": "pending_owner",
+        },
+        automatic_activation=pending_activation,
+    )
+    return certificate
 
 
 def _pending_consumer_report(report: dict) -> dict[str, str]:
@@ -374,6 +485,139 @@ def test_scheduled_runtime_attestation_binds_report_container_and_manifest(tmp_p
     assert "must-not-appear" not in json.dumps(result)
 
 
+def test_active_automatic_writer_requires_exact_child_ids_and_owner_profile(
+    tmp_path, monkeypatch
+):
+    roots, _report_path, _report, environment, _dag_run = (
+        _isolated_runtime_evidence(tmp_path)
+    )
+    binding = _binding()
+    generation_id = publication.make_generation_id(binding)
+    payload = {"generation_id": generation_id, "binding": binding}
+    profile = {
+        "mode": "daily",
+        "scope": "",
+        "catalog_contract": publication.FOTMOB_CATALOG_CONTRACT_SCHEMA,
+        "entities": ",".join(publication.FOTMOB_DAILY_ENTITIES),
+        "max_requests": publication.FOTMOB_DAILY_MAX_REQUESTS,
+        "max_direct_mib": publication.FOTMOB_DAILY_MAX_DIRECT_MIB,
+        "max_proxy_mib": 0,
+        "competition_limit": 0,
+        "season_limit": 0,
+        "requests_per_minute": publication.FOTMOB_DAILY_REQUESTS_PER_MINUTE,
+        "deadline": "",
+    }
+    authorization = {
+        "owner_run_id": "scheduled__owner",
+        "ingest_run_id": f"fotmob_orchestrated__{generation_id}",
+        "lane": "daily",
+        "conf": profile,
+        "silver_trigger_state": "running",
+    }
+    monkeypatch.setattr(
+        publication,
+        "_active_owner_writer_authorization",
+        lambda *_args, **_kwargs: dict(authorization),
+    )
+
+    ingest = SimpleNamespace(
+        dag_id="dag_ingest_fotmob",
+        run_id=authorization["ingest_run_id"],
+        conf={**profile, publication.FOTMOB_PUBLICATION_CONF_KEY: payload},
+    )
+    admitted = publication.attest_fotmob_isolated_runtime(
+        environ=environment,
+        hostname="1" * 12,
+        roots=roots,
+        require_scheduled_owner=False,
+        dag_run=ingest,
+    )
+    assert admitted["automatic_writer_lifecycle"]["lane"] == "daily"
+
+    for mutation in (
+        {"run_id": "manual__borrowed"},
+        {"entities": "season,matches"},
+        {"max_requests": publication.FOTMOB_DAILY_MAX_REQUESTS - 1},
+        {"season_limit": 1},
+        {"deadline": "2026-08-08T13:30:00+00:00"},
+    ):
+        candidate = SimpleNamespace(
+            dag_id="dag_ingest_fotmob",
+            run_id=mutation.get("run_id", authorization["ingest_run_id"]),
+            conf={
+                **profile,
+                **{key: value for key, value in mutation.items() if key != "run_id"},
+                publication.FOTMOB_PUBLICATION_CONF_KEY: payload,
+            },
+        )
+        with pytest.raises(Exception, match="identity differs|profile differs"):
+            publication.attest_fotmob_isolated_runtime(
+                environ=environment,
+                hostname="1" * 12,
+                roots=roots,
+                require_scheduled_owner=False,
+                dag_run=candidate,
+            )
+
+    runner_identity = {
+        "component": "bronze_runner",
+        "dag_id": "dag_ingest_fotmob",
+        "run_id": authorization["ingest_run_id"],
+        "scopes": [],
+        "entities": list(publication.FOTMOB_DAILY_ENTITIES),
+        **profile,
+        "match_limit": 0,
+        "team_limit": 0,
+        "player_limit": 0,
+        "max_attempts": 4,
+        "next_build_id": "",
+        "source_refresh_profile": None,
+        "source_refresh_targets_sha256": None,
+        "source_refresh_target_count": None,
+        "publication": payload,
+    }
+    runner = publication.attest_fotmob_isolated_runtime(
+        environ=environment,
+        hostname="1" * 12,
+        roots=roots,
+        require_scheduled_owner=False,
+        writer_identity=runner_identity,
+    )
+    assert runner["automatic_writer_lifecycle"]["ingest_run_id"] == (
+        authorization["ingest_run_id"]
+    )
+    with pytest.raises(Exception, match="runner profile differs"):
+        publication.attest_fotmob_isolated_runtime(
+            environ=environment,
+            hostname="1" * 12,
+            roots=roots,
+            require_scheduled_owner=False,
+            writer_identity={**runner_identity, "player_limit": 1},
+        )
+
+    silver = SimpleNamespace(
+        dag_id="dag_transform_fotmob_silver",
+        run_id=f"fotmob_silver__{generation_id}",
+        conf={publication.FOTMOB_PUBLICATION_CONF_KEY: payload},
+    )
+    publication.attest_fotmob_isolated_runtime(
+        environ=environment,
+        hostname="1" * 12,
+        roots=roots,
+        require_scheduled_owner=False,
+        dag_run=silver,
+    )
+    silver.run_id = f"manual__{generation_id}"
+    with pytest.raises(Exception, match="Silver lineage differs"):
+        publication.attest_fotmob_isolated_runtime(
+            environ=environment,
+            hostname="1" * 12,
+            roots=roots,
+            require_scheduled_owner=False,
+            dag_run=silver,
+        )
+
+
 def test_pending_runtime_allows_only_the_exact_scheduled_producer(
     tmp_path, monkeypatch
 ):
@@ -547,6 +791,12 @@ def test_shared_task_and_host_admission_cover_the_same_required_runtime():
     assert publication.FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS == frozenset(
         fotmob_runtime.SHARED_REQUIRED_RUNTIME_PATHS
     )
+    assert "scrapers/fotmob/scope_codec.py" in (
+        publication.FOTMOB_ISOLATED_REQUIRED_RUNTIME_PATHS
+    )
+    assert "scrapers/fotmob/scope_codec.py" in (
+        publication.FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS
+    )
 
 
 def test_shared_runtime_attestation_rejects_drift_manual_and_stale_handoff(
@@ -609,6 +859,100 @@ def test_shared_runtime_attestation_rejects_active_isolated_admission(tmp_path):
         )
 
 
+def test_pending_automatic_sofa_sensor_waits_without_claim_then_active_claims(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
+    roots, report_path, report, environment, _dag_run = _shared_runtime_evidence(
+        tmp_path
+    )
+    certificate = _pending_automatic_shared_wait_report(tmp_path, report)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    context = _context()
+    context["dag_run"].dag_id = publication.FOTMOB_SHARED_CONSUMER_DAG_ID
+    context["dag_run"].run_type = "scheduled"
+    context["ti"].task_id = "wait_for_fotmob_publication"
+    context.update(environ=environment, hostname="3" * 12, roots=roots)
+    store = SimpleNamespace(
+        get_publication_generation=MagicMock(),
+        claim_publication_generation=MagicMock(),
+    )
+    monkeypatch.setattr(publication, "_control_store", lambda: store)
+
+    assert (
+        publication.wait_and_claim_fotmob_publication(
+            publication_owner="isolated", **context
+        )
+        is False
+    )
+    store.get_publication_generation.assert_not_called()
+    store.claim_publication_generation.assert_not_called()
+
+    report.update(
+        activation_state="active",
+        paused=sorted(
+            {
+                publication.FOTMOB_ISOLATED_DAILY_DAG_ID,
+                "dag_refresh_fotmob",
+                "dag_backfill_fotmob",
+            }
+        ),
+        unpaused=sorted(
+            {
+                publication.FOTMOB_AUTOMATIC_OWNER_DAG_ID,
+                "dag_ingest_fotmob",
+                "dag_transform_fotmob_silver",
+            }
+        ),
+        automatic_rollout=certificate["automatic_rollout"],
+        automatic_activation=certificate["automatic_activation"],
+    )
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    binding = _binding()
+    store.get_publication_generation.return_value = {
+        "binding": binding,
+        "phase": "ready",
+        "status": "succeeded",
+        "active": True,
+    }
+    store.claim_publication_generation.return_value = {
+        "binding": binding,
+        "phase": "consuming",
+        "status": "succeeded",
+        "active": True,
+    }
+
+    assert (
+        publication.wait_and_claim_fotmob_publication(
+            publication_owner="isolated", **context
+        )
+        is True
+    )
+    store.claim_publication_generation.assert_called_once()
+
+
+def test_pending_automatic_report_never_authorizes_non_sensor_task(tmp_path):
+    roots, report_path, report, environment, _dag_run = _shared_runtime_evidence(
+        tmp_path
+    )
+    _pending_automatic_shared_wait_report(tmp_path, report)
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    with pytest.raises(Exception, match="wait-sensor-only"):
+        publication.attest_fotmob_shared_runtime(
+            environ=environment,
+            hostname="3" * 12,
+            roots=roots,
+            allow_pending_wait=True,
+            require_scheduled_owner=False,
+            dag_run=SimpleNamespace(
+                dag_id=publication.FOTMOB_SHARED_CONSUMER_DAG_ID,
+                run_type="scheduled",
+            ),
+            ti=SimpleNamespace(task_id="finalize_fotmob_publication"),
+        )
+
+
 def test_kept_paused_attestation_allows_only_exact_issue930_bronze_and_silver(
     tmp_path,
 ):
@@ -620,6 +964,7 @@ def test_kept_paused_attestation_allows_only_exact_issue930_bronze_and_silver(
         kept_paused=True,
         paused=sorted(publication.FOTMOB_EXPECTED_ISOLATED_DAGS),
         unpaused=[],
+        generated_at="2026-07-21T10:00:00Z",
     )
     start = datetime(2026, 7, 22, 10, 0, 1, tzinfo=timezone.utc)
     binding = publication.make_publication_binding(
@@ -686,6 +1031,66 @@ def test_kept_paused_attestation_allows_only_exact_issue930_bronze_and_silver(
         )
 
 
+def test_kept_paused_attestation_accepts_exact_rollback_silver_only(tmp_path):
+    roots, report_path, report, environment, _dag_run = _isolated_runtime_evidence(
+        tmp_path
+    )
+    report.update(
+        activation_state="kept_paused",
+        kept_paused=True,
+        paused=sorted(publication.FOTMOB_EXPECTED_ISOLATED_DAGS),
+        unpaused=[],
+        generated_at="2026-07-21T10:00:00Z",
+    )
+    start = datetime(2026, 7, 21, 10, 0, 3, tzinfo=timezone.utc)
+    binding = publication.make_publication_binding(
+        owner="isolated",
+        data_interval_start=start,
+        data_interval_end=start + timedelta(seconds=1),
+        fingerprint=GIT_SHA,
+    )
+    lifecycle_publication = {
+        "generation_id": publication.make_generation_id(binding),
+        "binding": binding,
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    run_id = "rollback_silver__" + lifecycle_publication["generation_id"].replace(
+        "-", ""
+    )
+    admitted = publication.attest_fotmob_isolated_runtime(
+        environ=environment,
+        hostname="1" * 12,
+        roots=roots,
+        require_scheduled_owner=False,
+        allow_kept_paused_writer=True,
+        dag_run=SimpleNamespace(
+            dag_id="dag_transform_fotmob_silver",
+            run_id=run_id,
+            conf={"fotmob_publication": lifecycle_publication},
+        ),
+    )
+
+    assert admitted["issue930_lifecycle"] == {
+        "mode": "rollback-silver",
+        "attempt": 3,
+        "generation_id": lifecycle_publication["generation_id"],
+    }
+
+    with pytest.raises(Exception, match="coordinator namespace"):
+        publication.attest_fotmob_isolated_runtime(
+            environ=environment,
+            hostname="1" * 12,
+            roots=roots,
+            require_scheduled_owner=False,
+            allow_kept_paused_writer=True,
+            dag_run=SimpleNamespace(
+                dag_id="dag_ingest_fotmob",
+                run_id=run_id,
+                conf={"fotmob_publication": lifecycle_publication},
+            ),
+        )
+
+
 def test_kept_paused_attestation_binds_exact_source_refresh_profile(tmp_path):
     roots, report_path, report, environment, _dag_run = _isolated_runtime_evidence(
         tmp_path
@@ -695,6 +1100,7 @@ def test_kept_paused_attestation_binds_exact_source_refresh_profile(tmp_path):
         kept_paused=True,
         paused=sorted(publication.FOTMOB_EXPECTED_ISOLATED_DAGS),
         unpaused=[],
+        generated_at="2026-07-21T10:00:00Z",
     )
     start = datetime(2026, 7, 22, 10, 0, 0, tzinfo=timezone.utc)
     binding = publication.make_publication_binding(
@@ -766,6 +1172,52 @@ def test_kept_paused_attestation_binds_exact_source_refresh_profile(tmp_path):
                 writer_identity={**identity, field: value},
             )
 
+    with pytest.raises(Exception, match="source-refresh contract differs"):
+        publication.attest_fotmob_isolated_runtime(
+            environ=environment,
+            hostname="1" * 12,
+            roots=roots,
+            require_scheduled_owner=False,
+            allow_kept_paused_writer=True,
+            writer_identity={**identity, "scopes": ""},
+        )
+
+
+def test_kept_paused_validator_accepts_spaced_exact_source_season(monkeypatch):
+    scope = "230=2025 Apertura"
+    scope_sha256 = hashlib.sha256(f"{scope}\n".encode("utf-8")).hexdigest()
+    monkeypatch.setattr(publication, "FOTMOB_DAILY_SCOPE_COUNT", 1)
+    monkeypatch.setattr(publication, "FOTMOB_DAILY_SCOPE_SHA256", scope_sha256)
+    binding = publication.make_publication_binding(
+        owner="isolated",
+        data_interval_start=START + timedelta(days=1),
+        data_interval_end=START + timedelta(days=1, seconds=1),
+        fingerprint=GIT_SHA,
+    )
+    lifecycle_publication = {
+        "generation_id": publication.make_generation_id(binding),
+        "binding": binding,
+    }
+
+    lifecycle = publication._validate_issue930_kept_paused_writer(
+        {"git_sha": GIT_SHA, "generated_at": START.isoformat()},
+        {
+            "component": "bronze_runner",
+            "mode": "backfill",
+            "scopes": [scope],
+            "entities": sorted(publication.FOTMOB_ISSUE930_WRITER_ENTITIES),
+            "competition_limit": 0,
+            "season_limit": 0,
+            "publication": lifecycle_publication,
+        },
+    )
+
+    assert lifecycle == {
+        "mode": "backfill",
+        "attempt": 1,
+        "generation_id": lifecycle_publication["generation_id"],
+    }
+
 
 def test_isolated_owner_missing_role_env_never_skips_attestation(tmp_path):
     roots, _path, _report, environment, dag_run = _isolated_runtime_evidence(tmp_path)
@@ -792,6 +1244,31 @@ def test_daily_contract_derives_exact_competitions_from_immutable_scope_bytes():
     assert contract["competition_ids_sha256"] == (
         "664f972d5d86002131293bcc8da8382f6b7378cd43a8bd37a247c321decf689a"
     )
+
+
+def test_daily_contract_codec_accepts_spaced_exact_source_season(tmp_path, monkeypatch):
+    raw = b"230=2025 Apertura\n"
+    scope_file = tmp_path / "scopes.txt"
+    scope_file.write_bytes(raw)
+    scope_sha256 = hashlib.sha256(raw).hexdigest()
+    competition_ids_sha256 = publication._competition_ids_digest((230,))
+    monkeypatch.setattr(publication, "FOTMOB_DAILY_SCOPE_SHA256", scope_sha256)
+    monkeypatch.setattr(publication, "FOTMOB_DAILY_SCOPE_COUNT", 1)
+    monkeypatch.setattr(publication, "FOTMOB_DAILY_COMPETITION_COUNT", 1)
+    monkeypatch.setattr(publication, "FOTMOB_DAILY_COMPETITION_IDS", (230,))
+    monkeypatch.setattr(
+        publication,
+        "FOTMOB_DAILY_COMPETITION_IDS_SHA256",
+        competition_ids_sha256,
+    )
+
+    contract = publication.load_fotmob_daily_competition_contract(
+        scope_file,
+        scope_sha256=scope_sha256,
+        competition_ids_sha256=competition_ids_sha256,
+    )
+
+    assert contract["competition_ids"] == [230]
 
 
 def test_daily_contract_rejects_same_count_identity_substitution(tmp_path):
@@ -822,6 +1299,40 @@ def test_daily_trigger_conf_is_exact_all_entity_profile():
         "season_limit": 0,
         "requests_per_minute": 60,
     }
+
+
+def test_catalog_trigger_conf_has_no_historical_issue930_scope_contract():
+    conf = publication.fotmob_catalog_trigger_conf("refresh")
+
+    assert conf["mode"] == "refresh"
+    assert conf["catalog_contract"] == "fotmob-catalog-v1"
+    assert conf["scope"] == ""
+    assert not {
+        "daily_contract",
+        "competition_scope_file",
+        "competition_scope_sha256",
+        "competition_ids_sha256",
+    } & set(conf)
+
+
+def test_catalog_trigger_conf_rejects_discover_and_preserves_live_modes():
+    with pytest.raises(ValueError, match="automatic catalog mode"):
+        publication.fotmob_catalog_trigger_conf("discover")
+
+    for mode in ("daily", "refresh", "backfill"):
+        conf = publication.fotmob_catalog_trigger_conf(mode)
+        assert conf == {
+            "mode": mode,
+            "scope": "",
+            "catalog_contract": "fotmob-catalog-v1",
+            "entities": "season,leaderboards,matches,teams,players,transfers",
+            "max_requests": 10_000,
+            "max_direct_mib": 512,
+            "max_proxy_mib": 0,
+            "competition_limit": 0,
+            "season_limit": 0,
+            "requests_per_minute": 60,
+        }
 
 
 def _binding(owner: str = "isolated", fingerprint: str = GIT_SHA):
@@ -930,6 +1441,9 @@ def test_master_waits_for_writing_and_claims_only_exact_ready(monkeypatch):
         claim_publication_generation=MagicMock(),
     )
     monkeypatch.setattr(publication, "_control_store", lambda: store)
+    monkeypatch.setattr(
+        publication, "attest_fotmob_shared_runtime", lambda **_kwargs: {}
+    )
 
     assert (
         publication.wait_and_claim_fotmob_publication(
@@ -1189,6 +1703,80 @@ def test_candidate_is_exact_digested_and_seal_renews_full_lease(monkeypatch):
     assert seal.call_args.kwargs["ttl_seconds"] == 14 * 24 * 60 * 60
 
 
+def test_bronze_only_candidate_is_deterministic_from_validated_evidence(monkeypatch):
+    _ceremony_env(monkeypatch)
+    monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
+    record = MagicMock(return_value={"phase": "writing"})
+    monkeypatch.setattr(
+        publication,
+        "_control_store",
+        lambda: SimpleNamespace(record_publication_candidate=record),
+    )
+    validation = {
+        "status": "success",
+        "run_id": "bronze-no-op",
+        "mode": "refresh",
+        "rows": {},
+        "tables": ["iceberg.bronze.fotmob_competition_profiles"],
+        "bronze_inputs_changed": [
+            "iceberg.bronze.fotmob_competition_profiles"
+        ],
+        "selection": {"scope_plan_signature": "fmplan1-" + "a" * 64},
+        "transport": {"attempts": 1, "direct_bytes": 1, "proxy_bytes": 0},
+        "budget": {"requests": 1, "max_requests": 10_000},
+    }
+    context = _context()
+    context["ti"].xcom_pull.return_value = validation
+    silver_inputs = ["iceberg.bronze.fotmob_matches"]
+
+    first = publication.record_fotmob_bronze_only_candidate(
+        validation_task_id="validate_data",
+        silver_input_tables=silver_inputs,
+        **context,
+    )
+    second = publication.record_fotmob_bronze_only_candidate(
+        validation_task_id="validate_data",
+        silver_input_tables=silver_inputs,
+        **context,
+    )
+
+    assert first == second
+    assert first["candidate_kind"] == "bronze_only"
+    assert first["validated_bronze"] == validation
+    assert len(first["digest"]) == 64
+    assert [call.args[1] for call in record.call_args_list] == [first, first]
+    assert all(call.kwargs["source"] == "fotmob" for call in record.call_args_list)
+
+
+def test_bronze_candidate_defers_to_silver_without_record_conflict(monkeypatch):
+    _ceremony_env(monkeypatch)
+    monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
+    record = MagicMock()
+    monkeypatch.setattr(
+        publication,
+        "_control_store",
+        lambda: SimpleNamespace(record_publication_candidate=record),
+    )
+    context = _context()
+    context["ti"].xcom_pull.return_value = {
+        "status": "success",
+        "bronze_inputs_changed": ["iceberg.bronze.fotmob_player_snapshots"],
+    }
+
+    result = publication.record_fotmob_bronze_only_candidate(
+        validation_task_id="validate_data",
+        silver_input_tables=["iceberg.bronze.fotmob_player_snapshots"],
+        **context,
+    )
+
+    assert result == {
+        "status": "silver_required",
+        "recorded": False,
+        "bronze_inputs_changed": ["iceberg.bronze.fotmob_player_snapshots"],
+    }
+    record.assert_not_called()
+
+
 def test_xref_consumer_preflight_requires_full_active_claim(monkeypatch):
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     context = _context()
@@ -1212,10 +1800,16 @@ def test_xref_consumer_preflight_requires_full_active_claim(monkeypatch):
         )
     )
     monkeypatch.setattr(publication, "_control_store", lambda: store)
+    runtime_attestation = MagicMock(return_value={"deployment_id": "admitted"})
+    monkeypatch.setattr(
+        publication, "attest_fotmob_shared_runtime", runtime_attestation
+    )
 
     result = publication.validate_fotmob_consumer_fence(**context)
     assert result["consumer"] == consumer
     assert result["phase"] == "consuming"
+    assert result["runtime"] == {"deployment_id": "admitted"}
+    assert runtime_attestation.call_args.kwargs["require_scheduled_owner"] is False
 
     store.get_publication_generation.return_value["consumer"] = {
         "dag_id": "dag_master_pipeline",
@@ -1230,6 +1824,9 @@ def test_raw_manual_xref_has_no_publication_authority(monkeypatch):
     monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
     context = _context()
     context["dag_run"].conf = {}
+    monkeypatch.setattr(
+        publication, "attest_fotmob_shared_runtime", lambda **_kwargs: {}
+    )
 
     with pytest.raises(Exception, match="DagRun conf requires fotmob_publication"):
         publication.validate_fotmob_consumer_fence(**context)
@@ -1252,6 +1849,9 @@ def test_master_rejects_failed_or_already_published_generation(
         }
     )
     monkeypatch.setattr(publication, "_control_store", lambda: store)
+    monkeypatch.setattr(
+        publication, "attest_fotmob_shared_runtime", lambda **_kwargs: {}
+    )
 
     with pytest.raises(Exception, match="terminal or invalid"):
         publication.wait_and_claim_fotmob_publication(
@@ -1297,6 +1897,9 @@ def test_master_publishes_and_releases_only_after_sensor_and_report(monkeypatch)
         complete_publication_generation=complete,
     )
     monkeypatch.setattr(publication, "_control_store", lambda: store)
+    monkeypatch.setattr(
+        publication, "attest_fotmob_shared_runtime", lambda **_kwargs: {}
+    )
     context = _context(
         wait_for_fotmob_publication="success",
         generate_pipeline_report="success",
@@ -1332,6 +1935,9 @@ def test_sofascore_failure_retains_ready_or_consuming_lock(monkeypatch, phase):
         fail_publication_generation=fail,
     )
     monkeypatch.setattr(publication, "_control_store", lambda: store)
+    monkeypatch.setattr(
+        publication, "attest_fotmob_shared_runtime", lambda **_kwargs: {}
+    )
     context = _context(
         wait_for_fotmob_publication=("failed" if phase == "ready" else "success"),
         trigger_e4_transforms="failed",
@@ -1389,7 +1995,7 @@ def test_isolated_owner_initializes_before_deterministic_exact_trigger(
     assert "execution_date" not in trigger._init_kwargs
     assert finalizer.upstream_task_ids == {trigger.task_id}
     assert finalizer._init_kwargs["trigger_rule"] == "all_done"
-    assert module.dag._dag_kwargs["schedule"] == "0 14 * * *"
+    assert module.dag._dag_kwargs["schedule"] is None
 
 
 # ---------------------------------------------------------------------------
