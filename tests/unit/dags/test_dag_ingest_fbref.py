@@ -58,10 +58,10 @@ class TestFBrefCurrentTopology:
     def test_global_budget_and_shard_bounds(self, loaded_dag):
         module, tasks = loaded_dag
         params = module.dag._dag_kwargs["params"]
-        assert params["request_limit"].default == 200
-        assert params["request_limit"]._kw["enum"] == [100, 200]
-        assert params["byte_limit_mb"].default == 100
-        assert params["byte_limit_mb"]._kw["enum"] == [50, 100]
+        assert params["request_limit"].default == 4096
+        assert params["request_limit"]._kw["enum"] == [100, 4096]
+        assert params["byte_limit_mb"].default == 2048
+        assert params["byte_limit_mb"]._kw["enum"] == [50, 2048]
         assert params["shard_size"].default == 25
         assert params["shard_size"]._kw["minimum"] == 1
         assert params["shard_size"]._kw["maximum"] == 25
@@ -80,7 +80,7 @@ class TestFBrefCurrentTopology:
 
     def test_one_warm_live_runner_replaces_cold_wave_tasks(self, loaded_dag):
         module, tasks = loaded_dag
-        assert module.CURRENT_MAX_BATCHES == 16
+        assert module.CURRENT_MAX_BATCHES == 80
         assert len(tasks) == 16
         assert tasks["validate_production_readiness"].downstream_task_ids == {
             "initialize_run"
@@ -106,10 +106,11 @@ class TestFBrefCurrentTopology:
         assert live.python_callable.__name__ == "run_fbref_live_waves"
         assert live._captured_kwargs["retries"] == 0
         assert live._captured_kwargs["execution_timeout"].total_seconds() == (
-            120 * 60
+            6 * 60 * 60 + 5 * 60
         )
+        assert live._captured_kwargs["pool"] == "fbref_scraper_pool"
         assert live.op_kwargs["page_kinds"] == module.PAGE_KINDS
-        assert live.op_kwargs["max_batches"] == 16
+        assert live.op_kwargs["max_batches"] == 80
         assert live.op_kwargs["reservation_mb"] == 3
         assert live.downstream_task_ids == {"audit_raw_integrity"}
         raw_audit = tasks["audit_raw_integrity"]

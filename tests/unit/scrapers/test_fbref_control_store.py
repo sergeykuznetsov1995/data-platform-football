@@ -14,6 +14,7 @@ from scrapers.fbref.control import (
     StateConflict,
     TargetLease,
     make_budget_reservation_id,
+    make_clearance_tail_reservation_id,
     make_control_run_id,
     make_logical_refresh_id,
     resolve_control_db_uri,
@@ -99,6 +100,60 @@ def test_domain_throttle_default_cannot_bypass_the_source_minimum():
         )
 
 
+def test_open_clearance_session_locks_running_run_before_insert():
+    run_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4())
+    expires_at = datetime(2026, 8, 8, tzinfo=timezone.utc)
+
+    def handler(sql, params):
+        if (
+            "SELECT status FROM fbref_control.crawl_run" in sql
+            and "FOR UPDATE" in sql
+        ):
+            return [{"status": "running"}], 1
+        if "INSERT INTO fbref_control.clearance_session" in sql:
+            return [], 1
+        if "FROM fbref_control.clearance_session" in sql:
+            return [
+                {
+                    "run_id": run_id,
+                    "domain": "fbref.com",
+                    "session_version": "persistent-v1",
+                    "expires_at": expires_at,
+                }
+            ], 1
+        return [], 0
+
+    factory = FakeFactory(handler)
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=factory,
+    )
+
+    assert store.open_clearance_session(
+        domain="fbref.com",
+        session_version="persistent-v1",
+        expires_at=expires_at,
+        run_id=run_id,
+        session_id=session_id,
+    ) == session_id
+
+    statements = factory.connections[0].fake_cursor.executions
+    run_lock_index = next(
+        index
+        for index, (sql, _params) in enumerate(statements)
+        if "SELECT status FROM fbref_control.crawl_run" in sql
+    )
+    insert_index = next(
+        index
+        for index, (sql, _params) in enumerate(statements)
+        if "INSERT INTO fbref_control.clearance_session" in sql
+    )
+    assert "FOR UPDATE" in statements[run_lock_index][0]
+    assert statements[run_lock_index][1] == (run_id,)
+    assert run_lock_index < insert_index
+
+
 def test_control_uri_prefers_explicit_and_normalizes_airflow_driver():
     assert resolve_control_db_uri(
         {
@@ -126,6 +181,11 @@ def test_airflow_and_attempt_ids_map_to_stable_uuids():
     reservation = make_budget_reservation_id(refresh)
     assert uuid.UUID(refresh).version == 5
     assert uuid.UUID(reservation).version == 5
+    session = str(uuid.uuid4())
+    assert make_clearance_tail_reservation_id(session) == (
+        make_clearance_tail_reservation_id(session)
+    )
+    assert uuid.UUID(make_clearance_tail_reservation_id(session)).version == 5
 
 
 def test_raw_baseline_anchor_is_create_once_and_conflict_checked():
@@ -1341,6 +1401,7 @@ def test_session_transport_failures_are_classified_not_unclassified():
         "warm_session_rate_limit",
         "warm_session_forbidden",
         "warm_session_cloudflare",
+        "LiveWavesExternalInterruption",
     ):
         assert error_class in classified[0]
 
@@ -1706,6 +1767,18 @@ def test_abort_run_is_idempotent_settles_budget_and_releases_targets():
             lock_orders.append(tuple(stages))
             rows = [dict(reservation)] if reservation["status"] == "reserved" else []
             return rows, len(rows)
+        if (
+            "SELECT session_id" in sql
+            and "FROM fbref_control.clearance_session " in sql
+        ):
+            stages.append("clearance_locked")
+            return [], 0
+        if "FROM fbref_control.clearance_session_tail_reservation" in sql:
+            stages.append("tail_locked")
+            return [], 0
+        if "FROM fbref_control.clearance_session_page_accounting" in sql:
+            stages.append("page_locked")
+            return [], 0
         if "UPDATE fbref_control.budget_reservation" in sql:
             reservation.update(
                 status="settled",
@@ -1721,6 +1794,8 @@ def test_abort_run_is_idempotent_settles_budget_and_releases_targets():
             return [], 2 if state["status"] == "running" else 0
         if "UPDATE fbref_control.page_frontier" in sql:
             return [], int(state["status"] == "running")
+        if "UPDATE fbref_control.clearance_session_tail_reservation" in sql:
+            return [], 0
         if "UPDATE fbref_control.clearance_session" in sql:
             return [], int(state["status"] == "running")
         if "SET status = 'failed'" in sql:

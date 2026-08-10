@@ -2,8 +2,8 @@
 
 The current-refresh DAG owns registry discovery.  This DAG takes the next
 unfinished page of historical seasons from that durable registry and advances
-their frontier under the same hard 200-request/100-MiB production budget as
-current ingestion (or the hard 100/50 canary profile). Repeated manual runs
+their frontier under the same 4096-request/2048-MiB production safety circuit as
+current ingestion (or the bounded 100/50 canary profile). Repeated manual runs
 resume automatically from PostgreSQL and immutable raw storage; no league list,
 operator cursor, or filesystem handoff is accepted.
 """
@@ -19,13 +19,14 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from scrapers.fbref.settings import DEFAULT_DOMAIN_INTERVAL_SECONDS
 
-from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
+from utils.default_args import DEFAULT_ARGS
 from utils.fbref_pipeline_tasks import (
     FBREF_CANARY_BYTE_LIMIT_MB,
     FBREF_CANARY_REQUEST_LIMIT,
     FBREF_MAX_WARM_SESSION_TARGETS,
     FBREF_PRODUCTION_BYTE_LIMIT_MB,
     FBREF_PRODUCTION_REQUEST_LIMIT,
+    FBREF_SCRAPER_POOL,
     acquire_fbref_publication_lock,
     audit_fbref_raw_integrity,
     capture_fbref_raw_baseline,
@@ -58,7 +59,7 @@ BACKFILL_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT
 BACKFILL_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB
 DEFAULT_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
 MAX_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
-BACKFILL_MAX_BATCHES = 16
+BACKFILL_MAX_BATCHES = 80
 
 AIRFLOW_RUN_ID = "{{ run_id }}"
 DAG_ID = "{{ dag.dag_id }}"
@@ -97,13 +98,13 @@ with DAG(
             BACKFILL_REQUEST_LIMIT,
             type="integer",
             enum=[FBREF_CANARY_REQUEST_LIMIT, BACKFILL_REQUEST_LIMIT],
-            description="Hard canary (100) or production (200) request cap",
+            description="Canary (100) or production safety circuit (4096)",
         ),
         "byte_limit_mb": Param(
             BACKFILL_BYTE_LIMIT_MB,
             type="integer",
             enum=[FBREF_CANARY_BYTE_LIMIT_MB, BACKFILL_BYTE_LIMIT_MB],
-            description="Hard canary (50) or production (100) MiB cap",
+            description="Canary (50) or production safety circuit (2048 MiB)",
         ),
         "shard_size": Param(
             DEFAULT_SHARD_SIZE,
@@ -118,8 +119,8 @@ with DAG(
 
     Manual only. The DAG selects the next bounded unfinished page of
     non-current seasons from the source-discovered male registry, then runs
-    up to sixteen raw-first batches in one warm process under a
-    200-request/100-MiB hard cap.
+    up to eighty raw-first batches in one warm process under a
+    4096-request/2048-MiB emergency safety circuit.
     A `100/50` canary profile is available through Params or DagRun conf.
     Set `dry_run=true` to inspect the exact next cohort without creating a
     control run, opening a proxy session, or changing frontier state.
@@ -259,8 +260,8 @@ with DAG(
             "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
             "max_batches": BACKFILL_MAX_BATCHES,
         },
-        pool=INGEST_SCRAPER_POOL,
-        execution_timeout=timedelta(minutes=120),
+        pool=FBREF_SCRAPER_POOL,
+        execution_timeout=timedelta(hours=6, minutes=5),
         retries=0,
         trigger_rule="all_success",
     )

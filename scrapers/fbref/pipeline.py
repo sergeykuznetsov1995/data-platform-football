@@ -11,14 +11,18 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
-from contextlib import ExitStack
-from dataclasses import asdict, dataclass, field
+from contextlib import ExitStack, contextmanager, nullcontext
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 
-from scrapers.fbref.bronze import FBrefGenericBronzeWriter
+from scrapers.fbref.bronze import (
+    FBrefGenericBronzeWriter,
+    GenericPagePersistItem,
+)
 from scrapers.fbref.control import (
     BudgetExceeded,
     CompetitionRegistryEntry,
@@ -31,7 +35,7 @@ from scrapers.fbref.control import (
     make_control_run_id,
     make_logical_refresh_id,
 )
-from scrapers.fbref.control.models import CohortTarget
+from scrapers.fbref.control.models import CohortTarget, ObservationLease
 from scrapers.fbref.discovery import (
     DISCOVERY_PARSER_VERSION,
     CalendarType,
@@ -60,6 +64,7 @@ from scrapers.fbref.fetcher import (
 from scrapers.fbref.page_document import (
     PAGE_DOCUMENT_VERSION,
     Availability,
+    PageDocument,
     parse_page_document,
 )
 from scrapers.fbref.raw_store import (
@@ -80,6 +85,7 @@ from scrapers.fbref.settings import (
     DEFAULT_REQUEST_LIMIT,
     DEFAULT_REQUEST_RESERVATION_BYTES,
     DEFAULT_SHARD_SIZE,
+    FBREF_PERSISTENT_HTTP_SESSION,
     MAX_CLEARANCE_SOLVE_ATTEMPTS,
     MAX_SHARD_SIZE,
     MIN_DOMAIN_INTERVAL_SECONDS,
@@ -91,6 +97,7 @@ from scrapers.fbref.typed_bronze import (
     TYPED_BRONZE_PARSER_VERSION,
     FBrefTypedBronzeAdapter,
     FBrefTypedBronzeWriter,
+    TypedMatchPersistItem,
     TypedBronzeError,
     TypedSourceContext,
     parse_match_html as parse_typed_match_html,
@@ -98,6 +105,7 @@ from scrapers.fbref.typed_bronze import (
     parse_season_stats_html as parse_typed_season_stats_html,
     typed_result_requires_persistence,
 )
+from scrapers.fbref.match_parser import MatchParseResult
 
 
 SENTINEL_COMPETITIONS = (
@@ -119,8 +127,8 @@ PROCESSING_LEASE_SECONDS = 60 * 60
 # source contract rejection stops looking like a few unusable archived pages
 # and starts looking like FBref having changed its markup.
 MAX_ROUTINE_CONTRACT_QUARANTINES = 5
-REPLAY_SOURCE_REQUEST_LIMIT = 200
-REPLAY_SOURCE_BYTE_LIMIT = 100 * MIB
+REPLAY_SOURCE_REQUEST_LIMIT = DEFAULT_REQUEST_LIMIT
+REPLAY_SOURCE_BYTE_LIMIT = DEFAULT_BYTE_LIMIT
 ACCEPTANCE_REQUEST_LIMIT = 100
 ACCEPTANCE_BYTE_LIMIT = 50 * MIB
 ACCEPTANCE_SHARD_SIZE = 25
@@ -137,8 +145,70 @@ CLEARANCE_REJECTED_STATUSES = frozenset({401, 403, 429})
 # expiry is independent transport churn, not evidence that the source rejects
 # every fresh clearance.
 MAX_CONSECUTIVE_CLEARANCE_REFRESHES = 2
+# One production parse batch may consume the accepted 20 seconds per match for
+# all 25 targets (500s). Add 100s for scheduler/strict-close variance, and
+# finalize before entering that offline gap whenever the 115-minute local
+# session deadline is this close.
+PERSISTENT_PARSE_GUARD_SECONDS = 10 * 60
 
 logger = logging.getLogger(__name__)
+
+
+def _bounded_int(
+    name: str, *, default: int, lower: int, upper: int
+) -> int:
+    """Read an integer environment setting and reject unsafe bounds."""
+
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if not lower <= value <= upper:
+        raise ValueError(f"{name} must be between {lower} and {upper}")
+    return value
+
+
+def _normalize_live_batch_count(value: object) -> int:
+    """Accept only an integer or a templated decimal integer string."""
+
+    if type(value) is int:
+        normalized = value
+    elif isinstance(value, str) and value.strip().isdecimal():
+        normalized = int(value.strip())
+    else:
+        raise ValueError("max_batches must be an integer")
+    if not 1 <= normalized <= 80:
+        raise ValueError("max_batches must be between 1 and 80")
+    return normalized
+
+
+FBREF_BATCH_PERSIST = os.environ.get("FBREF_BATCH_PERSIST", "0") == "1"
+FBREF_BATCH_PERSIST_MATCHES = _bounded_int(
+    "FBREF_BATCH_PERSIST_MATCHES", default=8, lower=2, upper=25
+)
+FBREF_BATCH_PERSIST_MAX_CELLS = _bounded_int(
+    "FBREF_BATCH_PERSIST_MAX_CELLS",
+    default=150000,
+    lower=1000,
+    upper=500000,
+)
+
+
+@contextmanager
+def _captured_exit_stack(errors: list[Exception]):
+    """Unwind with the real exception, then defer it to lease fencing."""
+
+    try:
+        # The exception must cross ExitStack.__exit__ before it is captured so
+        # database guard contexts see the real exc_info and roll back rather
+        # than treating a failed second lock entry as a successful body.
+        with ExitStack() as stack:
+            yield stack
+    except Exception as exc:
+        errors.append(exc)
 
 
 class PipelineError(RuntimeError):
@@ -191,6 +261,7 @@ class PipelineSettings:
     bootstrap_byte_reservation: Optional[int] = None
     target_request_reservation: int = MAX_TARGET_HTTP_ATTEMPTS
     proxy_file: Optional[str] = None
+    persistent_http_session: bool = FBREF_PERSISTENT_HTTP_SESSION
 
     @classmethod
     def acceptance(
@@ -239,6 +310,7 @@ class PipelineSettings:
             # invariant intentionally keeps reservations positive.
             bootstrap_request_reservation=1,
             bootstrap_byte_reservation=1,
+            persistent_http_session=False,
         )
 
     def __post_init__(self) -> None:
@@ -278,6 +350,10 @@ class PipelineSettings:
             raise ValueError(
                 "target_request_reservation must cover both HTTP attempts"
             )
+        if not isinstance(self.persistent_http_session, bool):
+            raise ValueError("persistent_http_session must be boolean")
+        if self.run_type == "replay" and self.persistent_http_session:
+            raise ValueError("Replay cannot enable persistent HTTP metering")
 
 
 BACKFILL_SEASON_COHORT_RESERVATION_BYTES = 7 * MIB
@@ -344,9 +420,14 @@ def wave_target_capacity(
     bootstrap_bytes = (
         settings.bootstrap_byte_reservation if bootstrap_required else 0
     )
+    tail_bytes = (
+        settings.request_reservation_bytes
+        if bootstrap_required and settings.persistent_http_session
+        else 0
+    )
     byte_capacity = max(
         0,
-        bytes_available - bootstrap_bytes,
+        bytes_available - bootstrap_bytes - tail_bytes,
     ) // settings.request_reservation_bytes
     request_capacity = (
         max(0, requests - bootstrap_requests)
@@ -385,6 +466,8 @@ def live_wave_target_capacity(
     initial_bytes = settings.request_reservation_bytes + (
         settings.bootstrap_byte_reservation if bootstrap_required else 0
     )
+    if bootstrap_required and settings.persistent_http_session:
+        initial_bytes += settings.request_reservation_bytes
     if bytes_available < initial_bytes:
         return 0
     request_capacity = max(
@@ -408,9 +491,9 @@ def affordable_clearance_reservation(
     """Return the largest clearance reservation the rest of a run can fund.
 
     The full bootstrap reservation buys every proxy rotation the transport is
-    allowed to try — four solves for a 200-request daily run.  Demanding all
+    allowed to try — four solves for a production run.  Demanding all
     four before a mid-run re-solve is what left ~40 % of the request budget
-    unspent: a warm-session failure at request 120 of 200 could not book
+    unspent: a warm-session failure late in a run could not book
     80 + 2, so the wave handed its remaining targets back even though a solve
     measures ~19 requests.  Offer the retry the largest whole number of
     rotations that still fits alongside one target; the browser is then capped
@@ -427,14 +510,28 @@ def affordable_clearance_reservation(
             full_requests, count * DEFAULT_BROWSER_REQUESTS_PER_SOLVE
         )
         bytes_ = min(full_bytes, count * DEFAULT_BROWSER_BYTE_LIMIT_BYTES)
+        tail_bytes = (
+            settings.request_reservation_bytes
+            if settings.persistent_http_session
+            else 0
+        )
         fits = (
             request_remaining - requests
             >= settings.target_request_reservation
-            and byte_remaining - bytes_ >= settings.request_reservation_bytes
+            and byte_remaining - bytes_
+            >= settings.request_reservation_bytes + tail_bytes
         )
         if fits:
             return requests, bytes_
     return None
+
+
+def _uses_production_safety_circuit(settings: "PipelineSettings") -> bool:
+    return (
+        settings.run_type in {"current", "backfill"}
+        and settings.request_limit == DEFAULT_REQUEST_LIMIT
+        and settings.byte_limit == DEFAULT_BYTE_LIMIT
+    )
 
 
 @dataclass(frozen=True)
@@ -472,6 +569,65 @@ class WaveResult:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class _ProcessedObservation:
+    """Per-lease outcome which can be aggregated without stopping a cohort."""
+
+    parsed: int = 0
+    typed_promoted: int = 0
+    stale_typed_observations_skipped: int = 0
+    seeded: int = 0
+    skipped_ineligible: int = 0
+    contract_quarantined: int = 0
+    failures: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _ClaimedMatchObservation:
+    run_id: str
+    html: str
+    record: RawFetchRecord
+    observation_lease: ObservationLease
+    page: PageDocument
+    typed_match: MatchParseResult
+    typed_context: TypedSourceContext
+    match_id: str
+    stateful_run_id: str
+    stateful_run_type: str
+
+    def sequential_args(self, *, generic_persisted: bool = False) -> dict:
+        return {
+            "run_id": self.run_id,
+            "html": self.html,
+            "record": self.record,
+            "observation_lease": self.observation_lease,
+            "page": self.page,
+            "typed_match": self.typed_match,
+            "typed_context": self.typed_context,
+            "match_id": self.match_id,
+            "generic_persisted": generic_persisted,
+            "stateful_run_id": self.stateful_run_id,
+            "stateful_run_type": self.stateful_run_type,
+        }
+
+
+@dataclass(frozen=True)
+class _LivePageSettlement:
+    provider_billed_bytes: int
+    budget_exceeded: bool = False
+
+
+@dataclass(frozen=True)
+class _AcceptanceReplayMatch:
+    """Prepared frozen match with no global observation-fence mutation."""
+
+    record: RawFetchRecord
+    page: PageDocument
+    typed_match: MatchParseResult
+    typed_context: TypedSourceContext
+    match_id: str
+
+
 @dataclass
 class LiveRunResult:
     batches: int = 0
@@ -499,6 +655,13 @@ class _LiveFetchSession:
     # longer fund the full reservation.  ``None`` means the settings default.
     clearance_requests: Optional[int] = None
     clearance_bytes: Optional[int] = None
+    persistent_enabled: bool = False
+    state: str = "idle"
+    receipt: Optional[object] = None
+    tail_settlement: Optional[dict] = None
+    tail_reserved: bool = False
+    page_budget_latched: bool = False
+    finalization_guard: Callable[[], object] = nullcontext
 
     def clearance_reservation(self, settings) -> tuple[int, int]:
         return (
@@ -510,19 +673,198 @@ class _LiveFetchSession:
             else self.clearance_bytes,
         )
 
-    def close(self, control, *, status: str) -> None:
+    def attach_control_session(self, session_id: str) -> None:
+        """Install a newly opened control session before metering can start."""
+
+        if self.state not in {"idle", "control_closed"}:
+            raise PipelineError(
+                "Previous persistent clearance session is not finalized"
+            )
+        self.session_id = str(session_id)
+        self.state = "control_open"
+        self.receipt = None
+        self.tail_settlement = None
+        self.tail_reserved = False
+        self.page_budget_latched = False
+
+    def begin_persistent(
+        self,
+        control,
+        *,
+        run_id: str,
+        tail_bytes: int,
+    ) -> None:
+        if not self.persistent_enabled or self.fetcher is None or self.session_id is None:
+            raise PipelineError("Persistent clearance session is incomplete")
+        if self.state != "control_open":
+            raise PipelineError(
+                "Persistent control session is not ready for metering"
+            )
+        begin = getattr(self.fetcher, "begin_metered_session", None)
+        if not callable(begin):
+            raise PipelineError(
+                "FBref persistent fetcher must expose begin_metered_session"
+            )
+        baseline = int(begin(self.session_id))
+        self.state = "meter_started"
+        self.receipt = None
+        self.tail_settlement = None
+        self.tail_reserved = False
+        control.reserve_clearance_session_tail(
+            run_id,
+            self.session_id,
+            bytes_reserved=tail_bytes,
+            baseline_provider_bytes=baseline,
+        )
+        self.tail_reserved = True
+        self.state = "active"
+
+    def rollover_if_due(
+        self, control, *, within_seconds: float = 0.0
+    ) -> bool:
+        """Finalize one exact session before its paid lease can expire."""
+
+        if (
+            not self.persistent_enabled
+            or self.fetcher is None
+            or self.session_id is None
+            or self.state != "active"
+        ):
+            return False
+        due = getattr(
+            self.fetcher, "persistent_session_rollover_due", None
+        )
+        if not callable(due):
+            raise PipelineError(
+                "FBref persistent fetcher must expose rollover deadline"
+            )
+        if not bool(due(within_seconds=within_seconds)):
+            return False
+
+        # This ordering is the paid-traffic fence: strict provider close,
+        # durable tail settlement, and control close all finish before reset
+        # can prepare a browser that may ask for the next provider lease.
+        self.finalize(control, status="closed")
+        reset = getattr(self.fetcher, "reset_clearance", None)
+        if not callable(reset):
+            raise PipelineError(
+                "FBref persistent fetcher must reset after rollover"
+            )
+        reset()
+        return True
+
+    def finalize(self, control, *, status: str) -> None:
+        with self.finalization_guard():
+            self._finalize(control, status=status)
+
+    def _finalize(self, control, *, status: str) -> None:
+        if not self.persistent_enabled:
+            try:
+                self.stack.close()
+            finally:
+                self.fetcher = None
+                if self.session_id is not None:
+                    try:
+                        control.close_clearance_session(
+                            self.session_id, status=status
+                        )
+                    finally:
+                        self.session_id = None
+                self.needs_clearance = True
+            return
+        if self.session_id is None:
+            return
+        if self.fetcher is None:
+            raise FetchWaveError(
+                "hard_transport_policy: persistent fetcher ownership was lost"
+            )
         try:
-            self.stack.close()
-        finally:
-            self.fetcher = None
-            if self.session_id is not None:
-                try:
-                    control.close_clearance_session(
-                        self.session_id, status=status
+            if self.state == "control_open":
+                # Metering never started, so no provider or typed tail exists.
+                control.close_clearance_session(
+                    self.session_id, status="failed"
+                )
+                self.state = "control_closed"
+                self.needs_clearance = True
+                return
+            if self.state in {"meter_started", "active"}:
+                finalizer = getattr(
+                    self.fetcher, "finalize_metered_session", None
+                )
+                if not callable(finalizer):
+                    raise PipelineError(
+                        "FBref persistent fetcher must expose finalizer"
                     )
-                finally:
-                    self.session_id = None
-            self.needs_clearance = True
+                self.receipt = finalizer()
+                self.state = "provider_finalized"
+            if self.state == "provider_finalized":
+                if self.tail_reserved:
+                    self.tail_settlement = control.settle_clearance_session_tail(
+                        self.session_id, self.receipt
+                    )
+                    self.state = "tail_settled"
+                else:
+                    # begin_metered_session succeeded, but the durable tail
+                    # reservation did not. No socket admission was possible;
+                    # close the empty control session and let the already
+                    # reserved target budget be recovered by abort_run.
+                    control.close_clearance_session(
+                        self.session_id, status="failed"
+                    )
+                    self.state = "control_closed"
+                    self.needs_clearance = True
+                    return
+            if self.state == "tail_settled":
+                tail_result = self.tail_settlement or {}
+                explicit_tail_overrun = bool(
+                    tail_result.get("budget_exceeded_by_tail")
+                    or tail_result.get("tail_over_reservation")
+                )
+                terminal = explicit_tail_overrun or bool(
+                    tail_result.get("terminal")
+                    and not self.page_budget_latched
+                )
+                control.close_clearance_session(
+                    self.session_id,
+                    status="failed" if terminal else status,
+                )
+                self.state = "control_closed"
+                if terminal:
+                    raise FetchWaveError(
+                        "hard_transport_policy: persistent tail exceeded "
+                        "the run safety circuit"
+                    )
+        except Exception as exc:
+            if isinstance(exc, FetchWaveError):
+                raise
+            raise FetchWaveError(
+                "hard_transport_policy: persistent session finalizer failed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        self.needs_clearance = True
+
+    def close(self, control, *, status: str) -> None:
+        with self.finalization_guard():
+            self._close(control, status=status)
+
+    def _close(self, control, *, status: str) -> None:
+        finalize_error = None
+        try:
+            self._finalize(control, status=status)
+        except Exception as exc:  # noqa: BLE001 - release only after closure
+            finalize_error = exc
+        releasable = self.state == "control_closed" or (
+            self.state == "idle" and self.session_id is None
+        )
+        if self.persistent_enabled and releasable:
+            try:
+                self.stack.close()
+            except Exception as exc:  # noqa: BLE001 - retain finalizer error
+                finalize_error = finalize_error or exc
+            self.fetcher = None
+            self.session_id = None
+        if finalize_error is not None:
+            raise finalize_error
 
 
 def _utcnow() -> datetime:
@@ -1173,6 +1515,14 @@ def _bronze_acceptance_replay_marker(
         metadata.get("raw_audit") if isinstance(metadata, Mapping) else {}
     )
     raw_audit = raw_audit if isinstance(raw_audit, Mapping) else {}
+    pipeline_metrics = (
+        metadata.get("pipeline_run_metrics")
+        if isinstance(metadata, Mapping)
+        else {}
+    )
+    pipeline_metrics = (
+        pipeline_metrics if isinstance(pipeline_metrics, Mapping) else {}
+    )
     return {
         "schema_version": "fbref-bronze-acceptance-replay-v1",
         "status": "passed",
@@ -1197,6 +1547,9 @@ def _bronze_acceptance_replay_marker(
                 raw_audit.get("audited_attempt_count") or 0
             ),
             "raw_audit_artifact_sha256": raw_audit.get("artifact_sha256"),
+            "pipeline_metrics_artifact_sha256": pipeline_metrics.get(
+                "artifact_sha256"
+            ),
         },
     }
 
@@ -1413,6 +1766,7 @@ class FBrefPipeline:
         fetcher_factory: Optional[Callable[..., object]] = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], datetime] = _utcnow,
+        finalization_guard: Callable[[], object] = nullcontext,
     ) -> None:
         self.control = control
         self.raw_store = raw_store
@@ -1427,6 +1781,12 @@ class FBrefPipeline:
         )
         self.sleep = sleep
         self.clock = clock
+        self.finalization_guard = finalization_guard
+        # Instance fields make the default-off rollout and bounded cohort
+        # policy directly inspectable and overridable in deterministic tests.
+        self.batch_persist_enabled = FBREF_BATCH_PERSIST
+        self.batch_persist_matches = FBREF_BATCH_PERSIST_MATCHES
+        self.batch_persist_max_cells = FBREF_BATCH_PERSIST_MAX_CELLS
 
     @classmethod
     def from_env(cls) -> "FBrefPipeline":
@@ -1441,6 +1801,29 @@ class FBrefPipeline:
                 FBrefTypedBronzeWriter(manager)
             ),
         )
+
+    def _assert_persistent_profile(
+        self, run_id: str, settings: PipelineSettings
+    ) -> None:
+        run = self.control.get_run(run_id)
+        if run is None:
+            raise PipelineError(f"Unknown control run {run_id}")
+        metadata = run.get("metadata") or {}
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        if not isinstance(metadata, Mapping):
+            raise PipelineError("FBref control run metadata is invalid")
+        marker = metadata.get("persistent_http_session")
+        if marker is None:
+            if settings.persistent_http_session:
+                raise PipelineError(
+                    "Existing run has no persistent HTTP profile marker"
+                )
+            return
+        if not isinstance(marker, bool) or marker != settings.persistent_http_session:
+            raise PipelineError(
+                "Stored persistent HTTP profile differs from this worker"
+            )
 
     def initialize_run(
         self,
@@ -1472,6 +1855,7 @@ class FBrefPipeline:
             "target_request_reservation": (
                 settings.target_request_reservation
             ),
+            "persistent_http_session": settings.persistent_http_session,
         }
         extra_metadata = dict(execution_metadata or {})
         reserved = sorted(set(base_metadata) & set(extra_metadata))
@@ -1488,6 +1872,26 @@ class FBrefPipeline:
             metadata={**base_metadata, **extra_metadata},
         )
         self.control.start_run(run_id)
+        installed = self.control.get_run(run_id)
+        installed_metadata = (
+            installed.get("metadata") if isinstance(installed, Mapping) else None
+        )
+        if isinstance(installed_metadata, str):
+            installed_metadata = json.loads(installed_metadata)
+        marker = (
+            installed_metadata.get("persistent_http_session")
+            if isinstance(installed_metadata, Mapping)
+            else None
+        )
+        if marker is None:
+            if settings.persistent_http_session:
+                raise PipelineError(
+                    "Existing run has no persistent HTTP profile marker"
+                )
+        elif marker is not settings.persistent_http_session:
+            raise PipelineError(
+                "Stored persistent HTTP profile differs from this worker"
+            )
         return run_id
 
     def initialize_acceptance_run(
@@ -1934,6 +2338,120 @@ class FBrefPipeline:
             ),
         )
 
+    def _settle_live_page_evidence(
+        self,
+        *,
+        settings: PipelineSettings,
+        live_session: _LiveFetchSession,
+        lease,
+        reservation,
+        response,
+        compressed_raw_bytes: int,
+    ) -> _LivePageSettlement:
+        provider_value = getattr(response, "provider_billed_bytes", None)
+        http_wire_bytes = max(
+            0,
+            int(
+                getattr(
+                    response,
+                    "http_wire_bytes",
+                    getattr(response, "wire_bytes", 0),
+                )
+            ),
+        )
+        requests_used = int(response.http_requests) + int(
+            response.browser_requests
+        )
+        if settings.persistent_http_session:
+            if live_session.session_id is None or provider_value is None:
+                raise FetchWaveError(
+                    "hard_transport_policy: persistent page has no exact "
+                    "provider counter"
+                )
+            settled = self.control.settle_clearance_session_page(
+                live_session.session_id,
+                reservation.reservation_id,
+                attempt_id=lease.attempt_id,
+                requests_used=requests_used,
+                provider_billed_bytes=int(provider_value),
+                browser_bootstrap_attempts=(
+                    response.browser_bootstrap_attempts
+                ),
+                browser_bootstrap_requests=response.browser_requests,
+                browser_document_bytes=response.browser_document_bytes,
+                browser_asset_bytes=response.browser_asset_bytes,
+                browser_unobserved_bytes=response.browser_unobserved_bytes,
+                http_requests=response.http_requests,
+                http_wire_bytes=http_wire_bytes,
+                decoded_html_bytes=max(
+                    0, int(getattr(response, "decoded_html_bytes", 0))
+                ),
+                compressed_raw_bytes=max(0, int(compressed_raw_bytes)),
+            )
+            budget_exceeded = bool(settled.get("budget_exceeded"))
+            if budget_exceeded:
+                live_session.page_budget_latched = True
+            return _LivePageSettlement(
+                provider_billed_bytes=int(provider_value),
+                budget_exceeded=budget_exceeded,
+            )
+
+        billed = (
+            int(provider_value)
+            if provider_value is not None
+            else http_wire_bytes
+            + max(0, int(response.browser_document_bytes))
+            + max(0, int(response.browser_asset_bytes))
+            + max(0, int(response.browser_unobserved_bytes))
+        )
+        self.control.settle_budget(
+            reservation.reservation_id,
+            requests_used=requests_used,
+            bytes_used=billed,
+        )
+        if live_session.session_id is not None:
+            self.control.record_session_metrics(
+                live_session.session_id,
+                browser_bootstrap_requests=response.browser_requests,
+                browser_bootstrap_attempts=(
+                    response.browser_bootstrap_attempts
+                ),
+                browser_unobserved_bytes=response.browser_unobserved_bytes,
+                browser_document_bytes=response.browser_document_bytes,
+                browser_asset_bytes=response.browser_asset_bytes,
+                http_requests=response.http_requests,
+                http_wire_bytes=http_wire_bytes,
+                decoded_html_bytes=max(
+                    0, int(getattr(response, "decoded_html_bytes", 0))
+                ),
+                compressed_raw_bytes=max(0, int(compressed_raw_bytes)),
+                provider_billed_bytes=provider_value,
+            )
+        return _LivePageSettlement(provider_billed_bytes=billed)
+
+    def _record_live_budget_stop(
+        self,
+        *,
+        result: WaveResult,
+        settings: PipelineSettings,
+        leases: Sequence[object],
+        start_index: int,
+        reason: object,
+        already_requeued: int = 0,
+    ) -> None:
+        untouched = leases[start_index:]
+        returned = self.control.requeue_unfetched_targets(untouched)
+        result.requeued_at_budget += int(already_requeued) + int(returned)
+        result.budget_exhausted = True
+        if _uses_production_safety_circuit(settings):
+            result.failures.append("production_safety_circuit_exhausted")
+        logger.warning(
+            "FBref run budget exhausted (%s) — %d target(s) returned "
+            "for the next run",
+            reason,
+            int(already_requeued) + int(returned),
+        )
+
     def fetch_wave(
         self,
         run_id: str,
@@ -1947,6 +2465,7 @@ class FBrefPipeline:
 
         if settings.run_type == "replay":
             raise PipelineError("Replay mode cannot execute a fetch wave")
+        self._assert_persistent_profile(run_id, settings)
         result = WaveResult()
         historical = settings.run_type == "backfill"
         policies = (
@@ -2040,7 +2559,12 @@ class FBrefPipeline:
                 f"Claimed {len(leases)} of {result.cohort_size} cohort targets"
             )
         owns_session = _live_session is None
-        live_session = _live_session or _LiveFetchSession()
+        live_session = _live_session or _LiveFetchSession(
+            persistent_enabled=settings.persistent_http_session,
+            finalization_guard=self.finalization_guard,
+        )
+        if live_session.persistent_enabled != settings.persistent_http_session:
+            raise PipelineError("Live session persistent profile changed mid-run")
         try:
             for lease_index, lease in enumerate(leases):
                 # A wave owns the whole shard but processes it sequentially.
@@ -2054,8 +2578,14 @@ class FBrefPipeline:
                 target = self._page_target_for_lease(lease)
                 reservation = None
                 response = None
+                record = None
                 budget_settled = False
                 try:
+                    if live_session.rollover_if_due(self.control):
+                        logger.info(
+                            "FBref persistent session reached its safe local "
+                            "lifetime; exact tail settled before rollover"
+                        )
                     # Exact logical-refresh crash recovery is always safe.
                     # Historical targets are immutable by contract, so they
                     # may additionally adopt the latest verified raw-v2 (or
@@ -2113,7 +2643,30 @@ class FBrefPipeline:
                     self._wait_for_slot(slot.scheduled_at)
 
                     if live_session.needs_clearance:
-                        live_session.session_id = (
+                        if live_session.fetcher is None:
+                            live_session.fetcher = (
+                                live_session.stack.enter_context(
+                                    self.fetcher_factory(
+                                        settings.proxy_file,
+                                        clearance_requests,
+                                        clearance_bytes,
+                                    )
+                                )
+                            )
+                        fetcher_profile = getattr(
+                            live_session.fetcher,
+                            "persistent_http_session",
+                            False,
+                        )
+                        if (
+                            settings.persistent_http_session
+                            and fetcher_profile is not True
+                        ):
+                            raise PipelineError(
+                                "FBref fetcher does not match the persistent "
+                                "HTTP run profile"
+                            )
+                        opened_session_id = (
                             self.control.open_clearance_session(
                                 domain="fbref.com",
                                 session_version=FETCHER_VERSION,
@@ -2125,15 +2678,17 @@ class FBrefPipeline:
                                 metadata={"worker_id": worker_id},
                             )
                         )
-                        if live_session.fetcher is None:
-                            live_session.fetcher = (
-                                live_session.stack.enter_context(
-                                    self.fetcher_factory(
-                                        settings.proxy_file,
-                                        clearance_requests,
-                                        clearance_bytes,
-                                    )
-                                )
+                        if settings.persistent_http_session:
+                            live_session.attach_control_session(
+                                opened_session_id
+                            )
+                        else:
+                            live_session.session_id = opened_session_id
+                        if settings.persistent_http_session:
+                            live_session.begin_persistent(
+                                self.control,
+                                run_id=run_id,
+                                tail_bytes=settings.request_reservation_bytes,
                             )
                         prepare_clearance = getattr(
                             live_session.fetcher,
@@ -2192,44 +2747,15 @@ class FBrefPipeline:
                         transport_version=FETCHER_VERSION,
                         session_version=live_session.session_id,
                     )
-                    billed = (
-                        response.provider_billed_bytes
-                        if response.provider_billed_bytes is not None
-                        else response.http_wire_bytes
-                        + response.browser_document_bytes
-                        + response.browser_asset_bytes
-                        + response.browser_unobserved_bytes
-                    )
-                    self.control.settle_budget(
-                        reservation.reservation_id,
-                        requests_used=(
-                            response.http_requests + response.browser_requests
-                        ),
-                        bytes_used=billed,
+                    page_settlement = self._settle_live_page_evidence(
+                        settings=settings,
+                        live_session=live_session,
+                        lease=lease,
+                        reservation=reservation,
+                        response=response,
+                        compressed_raw_bytes=record.encoded_bytes,
                     )
                     budget_settled = True
-                    if live_session.session_id is not None:
-                        self.control.record_session_metrics(
-                            live_session.session_id,
-                            browser_bootstrap_requests=response.browser_requests,
-                            browser_bootstrap_attempts=(
-                                response.browser_bootstrap_attempts
-                            ),
-                            browser_unobserved_bytes=(
-                                response.browser_unobserved_bytes
-                            ),
-                            browser_document_bytes=(
-                                response.browser_document_bytes
-                            ),
-                            browser_asset_bytes=response.browser_asset_bytes,
-                            http_requests=response.http_requests,
-                            http_wire_bytes=response.http_wire_bytes,
-                            decoded_html_bytes=response.decoded_html_bytes,
-                            compressed_raw_bytes=record.encoded_bytes,
-                            provider_billed_bytes=(
-                                response.provider_billed_bytes
-                            ),
-                        )
                     self._complete_from_record(
                         lease, record, historical=historical
                     )
@@ -2247,59 +2773,49 @@ class FBrefPipeline:
                     result.browser_bootstraps += (
                         response.browser_bootstrap_attempts
                     )
+                    if page_settlement.budget_exceeded:
+                        self._record_live_budget_stop(
+                            result=result,
+                            settings=settings,
+                            leases=leases,
+                            start_index=lease_index + 1,
+                            reason=(
+                                "persistent page crossed the run safety circuit"
+                            ),
+                        )
+                        break
                 except BudgetExceeded as exc:
-                    # The budget is a ceiling the crawler is meant to stop at,
-                    # not a fault. Failing these targets made every day that
-                    # spent its budget a red run — and the pages had not even
-                    # been touched. Hand them back to the queue and end the wave
-                    # cleanly; the next run picks them up.
-                    unfetched = leases[lease_index:]
-                    result.requeued_at_budget = (
-                        self.control.requeue_unfetched_targets(unfetched)
-                    )
-                    result.budget_exhausted = True
-                    logger.warning(
-                        "FBref run budget exhausted (%s) — %d unfetched "
-                        "target(s) returned to the queue for the next run",
-                        exc,
-                        result.requeued_at_budget,
+                    # Canary exhaustion is its expected bounded stop. Reaching
+                    # the much larger production circuit means the run is
+                    # incomplete/runaway and must fail loudly after returning
+                    # every untouched claim to the durable queue.
+                    self._record_live_budget_stop(
+                        result=result,
+                        settings=settings,
+                        leases=leases,
+                        start_index=lease_index,
+                        reason=exc,
                     )
                     break
                 except FetchError as exc:
-                    billed = (
-                        exc.provider_billed_bytes
-                        if exc.provider_billed_bytes is not None
-                        else max(0, int(exc.wire_bytes))
-                        + max(0, int(exc.browser_document_bytes))
-                        + max(0, int(exc.browser_asset_bytes))
-                        + max(0, int(exc.browser_unobserved_bytes))
-                    )
-                    if reservation is not None and not budget_settled:
-                        self.control.settle_budget(
-                            reservation.reservation_id,
-                            requests_used=(
-                                exc.http_requests + exc.browser_requests
-                            ),
-                            bytes_used=billed,
+                    page_settlement = None
+                    if (
+                        reservation is not None
+                        and not budget_settled
+                        and (
+                            not settings.persistent_http_session
+                            or exc.provider_billed_bytes is not None
                         )
-                    if live_session.session_id is not None:
-                        self.control.record_session_metrics(
-                            live_session.session_id,
-                            browser_bootstrap_requests=exc.browser_requests,
-                            browser_bootstrap_attempts=(
-                                exc.browser_bootstrap_attempts
-                            ),
-                            browser_unobserved_bytes=(
-                                exc.browser_unobserved_bytes
-                            ),
-                            browser_document_bytes=(
-                                exc.browser_document_bytes
-                            ),
-                            browser_asset_bytes=exc.browser_asset_bytes,
-                            http_requests=exc.http_requests,
-                            http_wire_bytes=max(0, int(exc.wire_bytes)),
-                            provider_billed_bytes=exc.provider_billed_bytes,
+                    ):
+                        page_settlement = self._settle_live_page_evidence(
+                            settings=settings,
+                            live_session=live_session,
+                            lease=lease,
+                            reservation=reservation,
+                            response=exc,
+                            compressed_raw_bytes=0,
                         )
+                        budget_settled = True
                     if (
                         exc.browser_requests > 0
                         or exc.browser_bootstrap_attempts > 0
@@ -2327,6 +2843,45 @@ class FBrefPipeline:
                     result.browser_bootstraps += (
                         exc.browser_bootstrap_attempts
                     )
+                    if (
+                        page_settlement is not None
+                        and page_settlement.budget_exceeded
+                        and exc.error_class != "hard_transport_policy"
+                    ):
+                        if settings.persistent_http_session:
+                            live_session.finalize(
+                                self.control, status="failed"
+                            )
+                        self.control.fail_fetch(
+                            lease,
+                            error_class=exc.error_class,
+                            error_message=str(exc),
+                            retry_delay_seconds=0,
+                            permanent=False,
+                            requeue=True,
+                            http_status=exc.http_status,
+                            http_request_count=exc.http_requests,
+                            http_status_history=exc.http_status_history,
+                            wire_bytes=exc.wire_bytes,
+                            provider_billed_bytes=exc.provider_billed_bytes,
+                            latency_ms=exc.latency_ms,
+                            transport_version=FETCHER_VERSION,
+                            session_version=live_session.session_id,
+                        )
+                        if _session_failure(exc):
+                            result.requeued_dead_clearance += 1
+                        self._record_live_budget_stop(
+                            result=result,
+                            settings=settings,
+                            leases=leases,
+                            start_index=lease_index + 1,
+                            already_requeued=1,
+                            reason=(
+                                "persistent failed page crossed the run "
+                                "safety circuit"
+                            ),
+                        )
+                        break
                     if exc.error_class == "hard_transport_policy":
                         # This is a run-level paid-transport invariant, not a
                         # bad target or a clearance that may be re-solved. Save
@@ -2377,6 +2932,13 @@ class FBrefPipeline:
                         )
                         live_session.consecutive_clearance_refreshes += 1
                         result.requeued_dead_clearance += 1
+                        if settings.persistent_http_session:
+                            # Page/failure evidence is durable above.  Close the
+                            # exact provider tail before budget math, reset, or
+                            # any attempt to acquire another paid lease.
+                            live_session.finalize(
+                                self.control, status="failed"
+                            )
                         run_after_failure = self.control.get_run(run_id)
                         if run_after_failure is None:
                             raise PipelineError(
@@ -2425,7 +2987,10 @@ class FBrefPipeline:
                                 requeue=True,
                                 **retry_evidence,
                             )
-                        if live_session.session_id is not None:
+                        if (
+                            not settings.persistent_http_session
+                            and live_session.session_id is not None
+                        ):
                             self.control.close_clearance_session(
                                 live_session.session_id,
                                 status="failed",
@@ -2439,6 +3004,10 @@ class FBrefPipeline:
                             )
                             result.requeued_at_budget += 1 + returned
                             result.budget_exhausted = True
+                            if _uses_production_safety_circuit(settings):
+                                result.failures.append(
+                                    "production_safety_circuit_exhausted"
+                                )
                             logger.warning(
                                 "FBref clearance failed (%s, HTTP %s), but "
                                 "the remaining run budget cannot fund another "
@@ -2506,8 +3075,29 @@ class FBrefPipeline:
                             "reset_clearance",
                             None,
                         )
-                        if callable(reset) and not clearance_downgraded:
+                        reconfigure = getattr(
+                            live_session.fetcher,
+                            "reconfigure_clearance_limits",
+                            None,
+                        )
+                        if clearance_downgraded and callable(reconfigure):
+                            # Preserve the fetcher's cumulative authenticated
+                            # provider counter while rebuilding Camoufox with
+                            # the smaller browser allowance.
+                            reconfigure(
+                                max_browser_requests=allowed_requests,
+                                max_browser_bytes=allowed_bytes,
+                            )
+                        elif callable(reset) and not clearance_downgraded:
                             reset()
+                        elif (
+                            settings.persistent_http_session
+                            and clearance_downgraded
+                        ):
+                            raise PipelineError(
+                                "FBref persistent fetcher cannot preserve "
+                                "provider spend across browser reconfigure"
+                            )
                         else:
                             # A transport built for the old allowance would
                             # still spend it. Rebuild it against the smaller
@@ -2563,28 +3153,70 @@ class FBrefPipeline:
                             transport_version=FETCHER_VERSION,
                             session_version=live_session.session_id,
                         )
+                        if settings.persistent_http_session:
+                            live_session.finalize(
+                                self.control, status="failed"
+                            )
+                            reset = getattr(
+                                live_session.fetcher,
+                                "reset_clearance",
+                                None,
+                            )
+                            if callable(reset):
+                                reset()
+                            else:
+                                live_session.stack.close()
+                                live_session.stack = ExitStack()
+                                live_session.fetcher = None
+                            live_session.needs_clearance = True
                         result.failures.append(
                             f"{lease.target_id}:{exc.error_class}"
                         )
                 except Exception as exc:
                     if reservation is not None and not budget_settled:
-                        self.control.settle_budget(
-                            reservation.reservation_id,
-                            requests_used=(
-                                0
-                                if response is None
-                                else response.http_requests
-                                + response.browser_requests
-                            ),
-                            bytes_used=(
-                                0
-                                if response is None
-                                else response.http_wire_bytes
-                                + response.browser_document_bytes
-                                + response.browser_asset_bytes
-                                + response.browser_unobserved_bytes
-                            ),
-                        )
+                        if (
+                            response is not None
+                            and (
+                                not settings.persistent_http_session
+                                or response.provider_billed_bytes is not None
+                            )
+                        ):
+                            # The response crossed the paid meter even when raw
+                            # storage raised. Install authoritative settlement
+                            # (and typed page evidence in persistent mode)
+                            # before recording the failed fetch attempt.
+                            self._settle_live_page_evidence(
+                                settings=settings,
+                                live_session=live_session,
+                                lease=lease,
+                                reservation=reservation,
+                                response=response,
+                                compressed_raw_bytes=(
+                                    0
+                                    if record is None
+                                    else record.encoded_bytes
+                                ),
+                            )
+                            budget_settled = True
+                        elif not settings.persistent_http_session:
+                            self.control.settle_budget(
+                                reservation.reservation_id,
+                                requests_used=(
+                                    0
+                                    if response is None
+                                    else response.http_requests
+                                    + response.browser_requests
+                                ),
+                                bytes_used=(
+                                    0
+                                    if response is None
+                                    else response.http_wire_bytes
+                                    + response.browser_document_bytes
+                                    + response.browser_asset_bytes
+                                    + response.browser_unobserved_bytes
+                                ),
+                            )
+                            budget_settled = True
                     self.control.fail_fetch(
                         lease,
                         error_class=type(exc).__name__,
@@ -2621,15 +3253,30 @@ class FBrefPipeline:
                             else live_session.session_id
                         ),
                     )
+                    if (
+                        settings.persistent_http_session
+                        and live_session.session_id is not None
+                        and live_session.state != "control_closed"
+                    ):
+                        live_session.finalize(
+                            self.control, status="failed"
+                        )
                     result.failures.append(
                         f"{lease.target_id}:{type(exc).__name__}"
                     )
+                    if settings.persistent_http_session:
+                        # Any unclassified failure may have left only
+                        # conservative target evidence. Stop before a second
+                        # paid session and let abort_run settle that reserve.
+                        break
         finally:
             if owns_session:
                 live_session.close(
                     self.control,
                     status="failed" if result.failures else "closed",
                 )
+                if settings.persistent_http_session and not result.failures:
+                    self.control.assert_persistent_metering_reconciled(run_id)
         if result.failures:
             raise FetchWaveError("; ".join(result.failures))
         return result
@@ -2652,7 +3299,7 @@ class FBrefPipeline:
         worker_id: str,
         page_kinds: Sequence[str],
         settings: PipelineSettings,
-        max_batches: int = 16,
+        max_batches: int = 80,
     ) -> LiveRunResult:
         """Fetch raw and parse offline in one warm, bounded process.
 
@@ -2663,12 +3310,16 @@ class FBrefPipeline:
 
         if settings.run_type == "replay":
             raise PipelineError("Replay mode cannot execute live waves")
-        normalized_batches = int(max_batches)
-        if not 1 <= normalized_batches <= 16:
-            raise ValueError("max_batches must be between 1 and 16")
+        normalized_batches = _normalize_live_batch_count(max_batches)
 
         run = self.control.get_run(run_id)
+        self._assert_persistent_profile(run_id, settings)
         if run is not None and str(run.get("status") or "") == "failed":
+            if settings.persistent_http_session:
+                # An aborted/uncertain persistent session is conservative,
+                # not exact.  Reanimating that DagRun would allow a second
+                # paid lease before the old byte ledger can be reconciled.
+                self.control.assert_persistent_metering_reconciled(run_id)
             # ``airflow tasks clear -t run_live_waves`` re-runs only this
             # task, never initialize_run, so the #1102 reanimation must live
             # on the path every resume actually takes.  start_run itself
@@ -2676,7 +3327,10 @@ class FBrefPipeline:
             self.control.start_run(run_id)
 
         aggregate = LiveRunResult()
-        live_session = _LiveFetchSession()
+        live_session = _LiveFetchSession(
+            persistent_enabled=settings.persistent_http_session,
+            finalization_guard=self.finalization_guard,
+        )
         failed = True
         try:
             for batch in range(1, normalized_batches + 1):
@@ -2686,6 +3340,10 @@ class FBrefPipeline:
                     page_kinds=page_kinds,
                     settings=settings,
                     _live_session=live_session,
+                )
+                live_session.rollover_if_due(
+                    self.control,
+                    within_seconds=PERSISTENT_PARSE_GUARD_SECONDS,
                 )
                 parsed = self.parse_wave(
                     run_id,
@@ -2708,6 +3366,8 @@ class FBrefPipeline:
                 self.control,
                 status="failed" if failed else "closed",
             )
+            if settings.persistent_http_session and not failed:
+                self.control.assert_persistent_metering_reconciled(run_id)
 
     def _eligible_competitions(self) -> dict[str, dict]:
         return {
@@ -3206,6 +3866,14 @@ class FBrefPipeline:
         html: str,
         record: RawFetchRecord,
     ):
+        page = self._parse_generic(html, record)
+        self._persist_generic_page(
+            run_id, page, record, record_failure=True
+        )
+        return page
+
+    @staticmethod
+    def _parse_generic(html: str, record: RawFetchRecord) -> PageDocument:
         page = parse_page_document(
             html,
             target_id=record.target_id,
@@ -3213,6 +3881,25 @@ class FBrefPipeline:
             source_ids=record.source_ids,
             content_hash=record.content_hash,
         )
+        if (
+            page.target_id != record.target_id
+            or page.page_kind != record.page_kind
+            or page.content_hash != record.content_hash
+            or page.parser_version != PAGE_DOCUMENT_VERSION
+        ):
+            raise ParseWaveError(
+                f"Generic parser identity mismatch for {record.target_id}"
+            )
+        return page
+
+    def _persist_generic_page(
+        self,
+        run_id: str,
+        page: PageDocument,
+        record: RawFetchRecord,
+        *,
+        record_failure: bool,
+    ) -> None:
         try:
             self.generic_writer.persist_page(
                 page,
@@ -3221,32 +3908,36 @@ class FBrefPipeline:
                 staging_identity=record.logical_refresh_id,
             )
         except Exception as exc:
-            try:
-                self.control.record_dataset_manifest(
-                    target_id=record.target_id,
-                    content_hash=record.content_hash,
-                    parser_version=PAGE_DOCUMENT_VERSION,
-                    dataset="__page__",
-                    availability=Availability.ERROR.value,
-                    parse_status=("failed" if page.errors else "succeeded"),
-                    persistence_status="failed",
-                    validation_status="failed",
-                    row_count=0,
-                    error_class=type(exc).__name__,
-                    error_message=str(exc),
-                )
-            except StateConflict:
-                # These exact bytes already have a completed manifest from an
-                # earlier parse by this exact parser; that evidence stands.
-                # Recording a failure over it must never replace the error that
-                # actually broke this parse — the diagnosis is what we need.
-                logger.warning(
-                    "Failure manifest for %s not recorded: the generic "
-                    "manifest is already completed", record.target_id,
-                )
+            if record_failure:
+                try:
+                    self._record_page_completion(
+                        record,
+                        page,
+                        succeeded=False,
+                        error=exc,
+                        parse_succeeded=not page.errors,
+                    )
+                except StateConflict:
+                    # These exact bytes already have a completed manifest from
+                    # an earlier retry; immutable completion evidence stands.
+                    logger.warning(
+                        "Failure manifest for %s not recorded: the generic "
+                        "manifest is already completed",
+                        record.target_id,
+                    )
             raise
+        self._record_generic_table_results(record, page)
+
+    def _record_generic_table_results(
+        self,
+        record: RawFetchRecord,
+        page: PageDocument,
+        *,
+        control=None,
+    ) -> None:
+        control_store = self.control if control is None else control
         for table in page.tables:
-            self.control.record_dataset_manifest(
+            control_store.record_dataset_manifest(
                 target_id=record.target_id,
                 content_hash=record.content_hash,
                 parser_version=page.parser_version,
@@ -3258,7 +3949,6 @@ class FBrefPipeline:
                 row_count=table.row_count,
                 error_message=table.reason,
             )
-        return page
 
     def _typed_context(
         self, record: RawFetchRecord
@@ -3277,13 +3967,64 @@ class FBrefPipeline:
             season_label=str(season_id),
         )
 
+    def _parse_typed_match(
+        self, html: str, record: RawFetchRecord
+    ) -> tuple[MatchParseResult, str, TypedSourceContext]:
+        context = self._typed_context(record)
+        if context is None:
+            raise TypedBronzeError(
+                "Typed page requires source competition_id and season_id"
+            )
+        match_id = str(record.source_ids.get("match_id") or "").strip()
+        if not match_id:
+            raise TypedBronzeError("Match target has no source match_id")
+        parsed = parse_typed_match_html(
+            html,
+            match_id=match_id,
+            context=context,
+            require_player_contract=False,
+        )
+        if not isinstance(parsed, MatchParseResult):
+            raise TypedBronzeError("Typed match parser returned invalid result")
+        return parsed, match_id, context
+
+    def _persist_preparsed_typed_match(
+        self,
+        run_id: str,
+        record: RawFetchRecord,
+        parsed: MatchParseResult,
+        *,
+        match_id: str,
+        context: TypedSourceContext,
+    ) -> None:
+        counts: Optional[Mapping[str, int]] = None
+        try:
+            if parsed.has_errors:
+                raise TypedBronzeError("Typed match parser failed")
+            counts = self.typed_adapter.writer.persist_match(
+                parsed,
+                match_id=match_id,
+                context=context,
+                run_id=run_id,
+                target_identity=record.logical_refresh_id,
+            )
+        except Exception:
+            self._record_typed_results(
+                record, parsed.datasets, persisted=None
+            )
+            raise
+        self._record_typed_results(record, parsed.datasets, persisted=counts)
+        self._record_typed_completion(record)
+
     def _record_typed_results(
         self,
         record: RawFetchRecord,
         parsed: Mapping[str, object],
         *,
         persisted: Optional[Mapping[str, int]],
+        control=None,
     ) -> None:
+        control_store = self.control if control is None else control
         for name, dataset in parsed.items():
             status = str(getattr(dataset.status, "value", dataset.status))
             requires_persistence = typed_result_requires_persistence(dataset)
@@ -3291,7 +4032,7 @@ class FBrefPipeline:
                 requires_persistence and persisted is None
             )
             was_persisted = bool(persisted is not None and name in persisted)
-            self.control.record_dataset_manifest(
+            control_store.record_dataset_manifest(
                 target_id=record.target_id,
                 content_hash=record.content_hash,
                 parser_version=TYPED_BRONZE_PARSER_VERSION,
@@ -3321,10 +4062,13 @@ class FBrefPipeline:
     def _record_typed_completion(
         self,
         record: RawFetchRecord,
+        *,
+        control=None,
     ) -> None:
         """Cache typed success only after every dataset result."""
 
-        self.control.record_dataset_manifest(
+        control_store = self.control if control is None else control
+        control_store.record_dataset_manifest(
             target_id=record.target_id,
             content_hash=record.content_hash,
             parser_version=TYPED_BRONZE_PARSER_VERSION,
@@ -3477,8 +4221,11 @@ class FBrefPipeline:
         *,
         succeeded: bool,
         error: Optional[Exception] = None,
+        parse_succeeded: bool = False,
+        control=None,
     ) -> None:
-        self.control.record_dataset_manifest(
+        control_store = self.control if control is None else control
+        control_store.record_dataset_manifest(
             target_id=record.target_id,
             content_hash=record.content_hash,
             parser_version=PAGE_DOCUMENT_VERSION,
@@ -3490,7 +4237,9 @@ class FBrefPipeline:
                 if page is not None and page.tables
                 else Availability.EMPTY.value
             ),
-            parse_status="succeeded" if succeeded else "failed",
+            parse_status=(
+                "succeeded" if succeeded or parse_succeeded else "failed"
+            ),
             persistence_status="succeeded" if succeeded else "failed",
             validation_status="succeeded" if succeeded else "failed",
             row_count=(
@@ -3565,6 +4314,932 @@ class FBrefPipeline:
             )
         raise ParseWaveError(
             f"Season source contract failed for {record.target_id}"
+        )
+
+    def _failed_claimed_observation(
+        self,
+        *,
+        record: RawFetchRecord,
+        page: Optional[PageDocument],
+        observation_lease: ObservationLease,
+        exc: Exception,
+        parse_succeeded: bool = False,
+        typed_promoted: int = 0,
+        stale_typed_observations_skipped: int = 0,
+    ) -> _ProcessedObservation:
+        failures: list[str] = []
+        if not isinstance(exc, TypedPromotionDeferred):
+            try:
+                self._record_page_completion(
+                    record,
+                    page,
+                    succeeded=False,
+                    error=exc,
+                    parse_succeeded=parse_succeeded,
+                )
+            except StateConflict:
+                logger.warning(
+                    "Failure completion marker for %s already exists",
+                    record.target_id,
+                )
+            except Exception as manifest_exc:
+                failures.append(
+                    f"{record.target_id}:manifest:"
+                    f"{type(manifest_exc).__name__}:{manifest_exc}"
+                )
+        try:
+            self.control.fail_observation_processing(
+                observation_lease,
+                error_class=type(exc).__name__,
+                error_message=str(exc),
+            )
+        except Exception as fence_exc:
+            failures.append(
+                f"{record.target_id}:observation_fence:"
+                f"{type(fence_exc).__name__}:{fence_exc}"
+            )
+        if isinstance(exc, SourceContractRejected):
+            retired = False
+            try:
+                retired = self.control.quarantine_contract_rejected_target(
+                    exc.target_id,
+                    content_hash=exc.content_hash,
+                    reason=exc.reason,
+                )
+            except Exception as quarantine_exc:
+                failures.append(
+                    f"{record.target_id}:contract_quarantine:"
+                    f"{type(quarantine_exc).__name__}:{quarantine_exc}"
+                )
+            if retired:
+                logger.warning(
+                    "Quarantined %s after source contract rejection: %s",
+                    exc.target_id,
+                    exc.reason,
+                )
+                return _ProcessedObservation(
+                    typed_promoted=typed_promoted,
+                    stale_typed_observations_skipped=(
+                        stale_typed_observations_skipped
+                    ),
+                    contract_quarantined=1,
+                    failures=tuple(failures),
+                )
+        failures.append(f"{record.target_id}:{type(exc).__name__}:{exc}")
+        return _ProcessedObservation(
+            typed_promoted=typed_promoted,
+            stale_typed_observations_skipped=(
+                stale_typed_observations_skipped
+            ),
+            failures=tuple(failures),
+        )
+
+    def _finish_claimed_observation(
+        self,
+        *,
+        run_id: str,
+        html: str,
+        record: RawFetchRecord,
+        observation_lease: ObservationLease,
+        page: PageDocument,
+        typed_match: Optional[MatchParseResult],
+        typed_context: Optional[TypedSourceContext],
+        match_id: Optional[str],
+        is_latest: Optional[bool],
+        stateful_run_id: str,
+        stateful_run_type: str,
+        typed_batch_counts: Optional[Mapping[str, int]] = None,
+        progress: Optional[dict[str, int]] = None,
+    ) -> _ProcessedObservation:
+        """Finish one supplied lease under an already-held frontier verdict."""
+
+        typed_page = record.page_kind in {
+            "schedule",
+            "season",
+            "season_stats",
+            "match",
+        }
+        if is_latest is None:
+            raise TypedPromotionDeferred(
+                f"Stateful promotion deferred for active target {record.target_id}"
+            )
+        if is_latest:
+            self._validate_pre_promotion_contract(html, record)
+            typed_promoted = 0
+            if typed_page:
+                if record.page_kind == "match" and typed_match is not None:
+                    if typed_context is None or not match_id:
+                        raise TypedBronzeError(
+                            "Prepared match is missing typed identity"
+                        )
+                    if typed_batch_counts is None:
+                        self._persist_preparsed_typed_match(
+                            run_id,
+                            record,
+                            typed_match,
+                            match_id=match_id,
+                            context=typed_context,
+                        )
+                    else:
+                        self._record_typed_results(
+                            record,
+                            typed_match.datasets,
+                            persisted=typed_batch_counts,
+                        )
+                        self._record_typed_completion(record)
+                else:
+                    if self._typed_context(record) is None:
+                        raise TypedBronzeError(
+                            "Typed page requires source competition_id and "
+                            "season_id"
+                        )
+                    self._persist_typed(run_id, html, record)
+                typed_promoted = 1
+                if progress is not None:
+                    progress["typed_promoted"] = 1
+                typed_status = "succeeded"
+            else:
+                typed_status = "skipped"
+            seeded, skipped = self._apply_stateful_effects(
+                stateful_run_id,
+                html,
+                record,
+                run_type=stateful_run_type,
+                historical=stateful_run_type == "backfill",
+            )
+            stateful_status = "succeeded"
+            stale = 0
+        else:
+            seeded, skipped = 0, 0
+            typed_promoted = 0
+            stale = int(typed_page)
+            stateful_status = "skipped"
+            typed_status = "skipped"
+            if typed_page:
+                self._record_stale_typed_observation(record)
+                if progress is not None:
+                    progress["stale_typed_observations_skipped"] = 1
+        self._record_page_completion(record, page, succeeded=True)
+        self.control.complete_observation_processing(
+            observation_lease,
+            typed_status=typed_status,
+            stateful_status=stateful_status,
+        )
+        return _ProcessedObservation(
+            parsed=1,
+            typed_promoted=typed_promoted,
+            stale_typed_observations_skipped=stale,
+            seeded=seeded,
+            skipped_ineligible=skipped,
+        )
+
+    def _process_claimed_observation(
+        self,
+        *,
+        run_id: str,
+        html: str,
+        record: RawFetchRecord,
+        observation_lease: ObservationLease,
+        page: Optional[PageDocument],
+        typed_match: Optional[MatchParseResult],
+        stateful_run_id: str,
+        stateful_run_type: str,
+        typed_context: Optional[TypedSourceContext] = None,
+        match_id: Optional[str] = None,
+        generic_persisted: bool = False,
+    ) -> _ProcessedObservation:
+        """Persist and finish an already-claimed observation without I/O."""
+
+        prepared_page = page
+        try:
+            if prepared_page is None:
+                prepared_page = self._parse_generic(html, record)
+        except Exception as exc:
+            return self._failed_claimed_observation(
+                record=record,
+                page=prepared_page,
+                observation_lease=observation_lease,
+                exc=exc,
+            )
+        try:
+            if not generic_persisted:
+                self._persist_generic_page(
+                    run_id,
+                    prepared_page,
+                    record,
+                    record_failure=False,
+                )
+        except Exception as exc:
+            return self._failed_claimed_observation(
+                record=record,
+                page=prepared_page,
+                observation_lease=observation_lease,
+                exc=exc,
+                parse_succeeded=not prepared_page.errors,
+            )
+        try:
+            progress: dict[str, int] = {}
+            with self.control.guard_latest_content(
+                record.target_id,
+                record.content_hash,
+                record.logical_refresh_id,
+            ) as is_latest:
+                return self._finish_claimed_observation(
+                    run_id=run_id,
+                    html=html,
+                    record=record,
+                    observation_lease=observation_lease,
+                    page=prepared_page,
+                    typed_match=typed_match,
+                    typed_context=typed_context,
+                    match_id=match_id,
+                    is_latest=is_latest,
+                    stateful_run_id=stateful_run_id,
+                    stateful_run_type=stateful_run_type,
+                    progress=progress,
+                )
+        except Exception as exc:
+            return self._failed_claimed_observation(
+                record=record,
+                page=prepared_page,
+                observation_lease=observation_lease,
+                exc=exc,
+                typed_promoted=progress.get("typed_promoted", 0),
+                stale_typed_observations_skipped=progress.get(
+                    "stale_typed_observations_skipped", 0
+                ),
+            )
+
+    @staticmethod
+    def _batch_has_duplicate_identity(
+        items: Sequence[_ClaimedMatchObservation],
+    ) -> bool:
+        target_ids = [item.record.target_id for item in items]
+        match_ids = [item.match_id for item in items]
+        return len(target_ids) != len(set(target_ids)) or len(match_ids) != len(
+            set(match_ids)
+        )
+
+    @staticmethod
+    def _match_item_cells(item: _ClaimedMatchObservation) -> int:
+        # Bound both lossless generic cells and materialized typed dataframe
+        # cells. The latter is conservative but prevents a small HTML table
+        # inventory from hiding a very wide typed cohort.
+        return len(item.page.cell_records()) + sum(
+            int(dataset.frame.size)
+            for dataset in item.typed_match.datasets.values()
+            if dataset.frame is not None
+        )
+
+    def _match_batch_cells(
+        self, items: Sequence[_ClaimedMatchObservation]
+    ) -> int:
+        return sum(self._match_item_cells(item) for item in items)
+
+    def _process_claimed_match_batch(
+        self, items: Sequence[_ClaimedMatchObservation]
+    ) -> list[_ProcessedObservation]:
+        materialized = tuple(items)
+        if not materialized:
+            return []
+        if self._batch_has_duplicate_identity(materialized):
+            return [
+                self._process_claimed_observation(**item.sequential_args())
+                for item in materialized
+            ]
+        outcomes: list[_ProcessedObservation] = []
+        cohort: list[_ClaimedMatchObservation] = []
+        cohort_cells = 0
+
+        def flush_cohort() -> None:
+            nonlocal cohort, cohort_cells
+            if cohort:
+                outcomes.extend(self._persist_and_finish_match_batch(cohort))
+                cohort = []
+                cohort_cells = 0
+
+        for item in materialized:
+            item_cells = self._match_item_cells(item)
+            if item.page.errors or item.typed_match.has_errors:
+                flush_cohort()
+                outcomes.append(
+                    self._process_claimed_observation(
+                        **item.sequential_args()
+                    )
+                )
+                continue
+            if item_cells > self.batch_persist_max_cells:
+                flush_cohort()
+                outcomes.append(
+                    self._process_claimed_observation(
+                        **item.sequential_args()
+                    )
+                )
+                continue
+            if cohort and (
+                len(cohort) == self.batch_persist_matches
+                or cohort_cells + item_cells
+                > self.batch_persist_max_cells
+            ):
+                flush_cohort()
+            cohort.append(item)
+            cohort_cells += item_cells
+        flush_cohort()
+        return outcomes
+
+    def _persist_and_finish_match_batch(
+        self, items: Sequence[_ClaimedMatchObservation]
+    ) -> list[_ProcessedObservation]:
+        try:
+            generic_counts = self.generic_writer.persist_pages(
+                [
+                    GenericPagePersistItem(
+                        page=item.page,
+                        canonical_url=item.record.canonical_url,
+                        run_id=item.run_id,
+                        staging_identity=item.record.logical_refresh_id,
+                    )
+                    for item in items
+                ]
+            )
+            if len(generic_counts) != len(items):
+                raise ParseWaveError(
+                    "Generic batch returned misaligned item counts"
+                )
+        except Exception:
+            # The generic writer may have committed a prefix. Re-run each
+            # parsed page idempotently, using the same lease and immutable raw.
+            return [
+                self._process_claimed_observation(**item.sequential_args())
+                for item in items
+            ]
+
+        outcomes: dict[str, _ProcessedObservation] = {}
+        active_items = []
+        for item in items:
+            try:
+                self._record_generic_table_results(item.record, item.page)
+            except Exception as exc:
+                outcomes[item.record.logical_refresh_id] = (
+                    self._failed_claimed_observation(
+                        record=item.record,
+                        page=item.page,
+                        observation_lease=item.observation_lease,
+                        exc=exc,
+                    )
+                )
+            else:
+                active_items.append(item)
+        finish_failures: list[
+            tuple[_ClaimedMatchObservation, Exception, dict[str, int]]
+        ] = []
+        lock_errors: list[Exception] = []
+        with _captured_exit_stack(lock_errors) as stack:
+            verdicts = {
+                target_id: stack.enter_context(
+                    self.control.guard_latest_content(
+                        item.record.target_id,
+                        item.record.content_hash,
+                        item.record.logical_refresh_id,
+                    )
+                )
+                for target_id, item in sorted(
+                    (
+                        (item.record.target_id, item)
+                        for item in active_items
+                    ),
+                    key=lambda pair: pair[0],
+                )
+            }
+            eligible = [
+                item
+                for item in active_items
+                if verdicts[item.record.target_id] is True
+            ]
+            counts_by_refresh: dict[str, Mapping[str, int]] = {}
+            batch_error: Optional[Exception] = None
+            if eligible:
+                try:
+                    batch_counts = self.typed_adapter.writer.persist_matches(
+                        [
+                            TypedMatchPersistItem(
+                                parsed=item.typed_match,
+                                match_id=item.match_id,
+                                context=item.typed_context,
+                                run_id=item.run_id,
+                                target_identity=(
+                                    item.record.logical_refresh_id
+                                ),
+                            )
+                            for item in eligible
+                        ]
+                    )
+                    if len(batch_counts) != len(eligible):
+                        raise TypedBronzeError(
+                            "Typed batch returned misaligned item counts"
+                        )
+                    counts_by_refresh = {
+                        item.record.logical_refresh_id: count
+                        for item, count in zip(eligible, batch_counts)
+                    }
+                except Exception as exc:
+                    batch_error = exc
+
+            for item in active_items:
+                verdict = verdicts[item.record.target_id]
+                if verdict is None:
+                    finish_failures.append((
+                        item,
+                        TypedPromotionDeferred(
+                            "Stateful promotion deferred for active target "
+                            f"{item.record.target_id}"
+                        ),
+                        {},
+                    ))
+                    continue
+                try:
+                    # A typed batch error is repaired under the same captured
+                    # verdict and locks. Re-entering the guard would deadlock;
+                    # releasing first would let a newer raw commit race the
+                    # repair of partially replaced old typed tables.
+                    typed_counts = (
+                        None
+                        if batch_error is not None
+                        else counts_by_refresh.get(
+                            item.record.logical_refresh_id
+                        )
+                    )
+                    progress: dict[str, int] = {}
+                    outcomes[item.record.logical_refresh_id] = (
+                        self._finish_claimed_observation(
+                            run_id=item.run_id,
+                            html=item.html,
+                            record=item.record,
+                            observation_lease=item.observation_lease,
+                            page=item.page,
+                            typed_match=item.typed_match,
+                            typed_context=item.typed_context,
+                            match_id=item.match_id,
+                            is_latest=verdict,
+                            stateful_run_id=item.stateful_run_id,
+                            stateful_run_type=item.stateful_run_type,
+                            typed_batch_counts=typed_counts,
+                            progress=progress,
+                        )
+                    )
+                except Exception as exc:
+                    finish_failures.append((item, exc, progress))
+
+        if lock_errors:
+            scheduled = {
+                item.record.logical_refresh_id
+                for item, _exc, _progress in finish_failures
+            }
+            unfinished = [
+                item
+                for item in active_items
+                if item.record.logical_refresh_id not in outcomes
+                and item.record.logical_refresh_id not in scheduled
+            ]
+            for item in unfinished:
+                finish_failures.append((item, lock_errors[0], {}))
+            if not unfinished and outcomes:
+                # An exit failure after durable completion cannot safely turn
+                # a succeeded lease back into failed. Keep its state, but make
+                # the wave report the frontier-fence failure loudly.
+                first_key = next(iter(outcomes))
+                first = outcomes[first_key]
+                lock_error = lock_errors[0]
+                outcomes[first_key] = replace(
+                    first,
+                    failures=first.failures
+                    + (
+                        f"{items[0].record.target_id}:content_guard:"
+                        f"{type(lock_error).__name__}:{lock_error}",
+                    ),
+                )
+
+        # Failure fencing uses its own control transaction, so it must happen
+        # only after every frontier lock is gone. This includes ordinary
+        # per-item failures as well as deferred latest verdicts.
+        for item, exc, progress in finish_failures:
+            outcomes[item.record.logical_refresh_id] = (
+                self._failed_claimed_observation(
+                    record=item.record,
+                    page=item.page,
+                    observation_lease=item.observation_lease,
+                    exc=exc,
+                    typed_promoted=progress.get("typed_promoted", 0),
+                    stale_typed_observations_skipped=progress.get(
+                        "stale_typed_observations_skipped", 0
+                    ),
+                )
+            )
+        return [outcomes[item.record.logical_refresh_id] for item in items]
+
+    def _load_and_claim_observation(
+        self, item: Mapping[str, object]
+    ) -> Optional[tuple[str, RawFetchRecord, ObservationLease]]:
+        logical_refresh_id = str(item["logical_refresh_id"])
+        html, record = self.raw_store.load_fetch_html(logical_refresh_id)
+        if record.logical_refresh_id != logical_refresh_id:
+            raise ParseWaveError(
+                f"Raw/control refresh mismatch for {logical_refresh_id}"
+            )
+        if record.target_id != str(item["target_id"]):
+            raise ParseWaveError(
+                f"Raw/control target mismatch for {logical_refresh_id}"
+            )
+        if item.get("content_hash") and record.content_hash != str(
+            item["content_hash"]
+        ):
+            raise ParseWaveError(
+                f"Raw/control content mismatch for {logical_refresh_id}"
+            )
+        lease = self.control.claim_observation_processing(
+            logical_refresh_id=logical_refresh_id,
+            target_id=record.target_id,
+            content_hash=record.content_hash,
+            parser_version=PAGE_DOCUMENT_VERSION,
+            typed_parser_version=TYPED_BRONZE_PARSER_VERSION,
+            stateful_parser_version=DISCOVERY_PARSER_VERSION,
+            lease_seconds=PROCESSING_LEASE_SECONDS,
+        )
+        if lease is None:
+            return None
+        return html, record, lease
+
+    @staticmethod
+    def _merge_processed_result(
+        result: WaveResult, outcome: _ProcessedObservation
+    ) -> None:
+        result.parsed += outcome.parsed
+        result.typed_promoted += outcome.typed_promoted
+        result.stale_typed_observations_skipped += (
+            outcome.stale_typed_observations_skipped
+        )
+        result.seeded += outcome.seeded
+        result.skipped_ineligible += outcome.skipped_ineligible
+        result.contract_quarantined += outcome.contract_quarantined
+        result.failures.extend(outcome.failures)
+
+    def _prepare_acceptance_replay_match(
+        self, item: Mapping[str, object]
+    ) -> _AcceptanceReplayMatch:
+        """Load and parse frozen raw without touching global parse fences."""
+
+        logical_refresh_id = str(item["logical_refresh_id"])
+        html, record = self.raw_store.load_fetch_html(logical_refresh_id)
+        if (
+            record.logical_refresh_id != logical_refresh_id
+            or record.target_id != str(item["target_id"])
+            or record.page_kind != "match"
+            or (
+                item.get("content_hash")
+                and record.content_hash != str(item["content_hash"])
+            )
+        ):
+            raise ParseWaveError(
+                f"Acceptance replay raw/control mismatch for {logical_refresh_id}"
+            )
+        page = self._parse_generic(html, record)
+        typed_match, match_id, typed_context = self._parse_typed_match(
+            html, record
+        )
+        if (
+            page.errors
+            or typed_match.has_errors
+            or record.target_id != f"fbref:match:{match_id}"
+        ):
+            raise ParseWaveError(
+                f"Acceptance replay match contract failed for {record.target_id}"
+            )
+        return _AcceptanceReplayMatch(
+            record=record,
+            page=page,
+            typed_match=typed_match,
+            typed_context=typed_context,
+            match_id=match_id,
+        )
+
+    def _persist_acceptance_replay_match(
+        self,
+        run_id: str,
+        item: _AcceptanceReplayMatch,
+        *,
+        replay_control,
+    ) -> None:
+        with replay_control.guard_latest_content(
+            item.record.target_id,
+            item.record.content_hash,
+            item.record.logical_refresh_id,
+        ) as latest:
+            if latest is not True:
+                raise ParseWaveError(
+                    "acceptance_replay_control_latest_guard_failed"
+                )
+            self.generic_writer.persist_page(
+                item.page,
+                canonical_url=item.record.canonical_url,
+                run_id=run_id,
+                staging_identity=item.record.logical_refresh_id,
+            )
+            self._record_generic_table_results(
+                item.record, item.page, control=replay_control
+            )
+            try:
+                typed_counts = self.typed_adapter.writer.persist_match(
+                    item.typed_match,
+                    match_id=item.match_id,
+                    context=item.typed_context,
+                    run_id=run_id,
+                    target_identity=item.record.logical_refresh_id,
+                )
+            except Exception:
+                self._record_typed_results(
+                    item.record,
+                    item.typed_match.datasets,
+                    persisted=None,
+                    control=replay_control,
+                )
+                raise
+            self._finish_acceptance_replay_control(
+                item, typed_counts, replay_control=replay_control
+            )
+
+    def _finish_acceptance_replay_control(
+        self,
+        item: _AcceptanceReplayMatch,
+        typed_counts: Mapping[str, int],
+        *,
+        replay_control,
+    ) -> None:
+        self._record_typed_results(
+            item.record,
+            item.typed_match.datasets,
+            persisted=typed_counts,
+            control=replay_control,
+        )
+        self._record_typed_completion(
+            item.record, control=replay_control
+        )
+        self._record_page_completion(
+            item.record,
+            item.page,
+            succeeded=True,
+            control=replay_control,
+        )
+        replay_control.complete_observation_processing(
+            replay_control.observation_lease(
+                item.record.logical_refresh_id
+            ),
+            typed_status="succeeded",
+            stateful_status="skipped",
+        )
+
+    def _persist_acceptance_replay_match_batch(
+        self,
+        run_id: str,
+        items: Sequence[_AcceptanceReplayMatch],
+        *,
+        replay_control,
+    ) -> None:
+        lock_errors: list[Exception] = []
+        with _captured_exit_stack(lock_errors) as stack:
+            verdicts = {
+                item.record.target_id: stack.enter_context(
+                    replay_control.guard_latest_content(
+                        item.record.target_id,
+                        item.record.content_hash,
+                        item.record.logical_refresh_id,
+                    )
+                )
+                for item in sorted(
+                    items, key=lambda value: value.record.target_id
+                )
+            }
+            if any(verdict is not True for verdict in verdicts.values()):
+                raise ParseWaveError(
+                    "acceptance_replay_control_latest_guard_failed"
+                )
+            generic_counts = self.generic_writer.persist_pages(
+                [
+                    GenericPagePersistItem(
+                        page=item.page,
+                        canonical_url=item.record.canonical_url,
+                        run_id=run_id,
+                        staging_identity=item.record.logical_refresh_id,
+                    )
+                    for item in items
+                ]
+            )
+            if len(generic_counts) != len(items):
+                raise ParseWaveError(
+                    "Acceptance generic batch returned misaligned item counts"
+                )
+            for item in items:
+                self._record_generic_table_results(
+                    item.record, item.page, control=replay_control
+                )
+            try:
+                typed_counts = self.typed_adapter.writer.persist_matches(
+                    [
+                        TypedMatchPersistItem(
+                            parsed=item.typed_match,
+                            match_id=item.match_id,
+                            context=item.typed_context,
+                            run_id=run_id,
+                            target_identity=(
+                                item.record.logical_refresh_id
+                            ),
+                        )
+                        for item in items
+                    ]
+                )
+            except Exception:
+                for item in items:
+                    self._record_typed_results(
+                        item.record,
+                        item.typed_match.datasets,
+                        persisted=None,
+                        control=replay_control,
+                    )
+                raise
+            if len(typed_counts) != len(items):
+                raise TypedBronzeError(
+                    "Acceptance typed batch returned misaligned item counts"
+                )
+            for item, counts in zip(items, typed_counts):
+                self._finish_acceptance_replay_control(
+                    item, counts, replay_control=replay_control
+                )
+        if lock_errors:
+            raise lock_errors[0]
+
+    def replay_acceptance_matches(
+        self,
+        run_id: str,
+        *,
+        source_run_id: str,
+        settings: PipelineSettings,
+    ) -> WaveResult:
+        """Force one isolated zero-network replay of the frozen match cohort.
+
+        The accepted source already owns successful global observation fences.
+        Reusing the ordinary replay selector would therefore select nothing.
+        This path deliberately reads every frozen successful match attempt and
+        writes only the isolated Trino outputs under ``run_id``.  Real control
+        methods run on replay-scoped clones in a rollback-only transaction, so
+        source observations, manifests, discovery, and frontier stay unchanged.
+        """
+
+        if (
+            settings.run_type != "replay"
+            or settings.request_limit != 0
+            or settings.byte_limit != 0
+            or settings.shard_size != ACCEPTANCE_SHARD_SIZE
+        ):
+            raise ParseWaveError("acceptance_replay_profile_invalid")
+        source_error = self._acceptance_replay_source_error(source_run_id)
+        if source_error is not None:
+            raise ParseWaveError(source_error)
+        source_run = self.control.get_run(source_run_id)
+        metadata = source_run.get("metadata") or {}
+        marker = metadata.get("bronze_acceptance") or {}
+        page_kind_counts = marker.get("page_kind_counts") or {}
+        try:
+            expected_matches = int(page_kind_counts.get("match"))
+        except (TypeError, ValueError):
+            expected_matches = 0
+        if not 1 <= expected_matches <= settings.shard_size:
+            raise ParseWaveError("acceptance_replay_match_cohort_invalid")
+        cohort = metadata.get("acceptance_cohort") or {}
+        coverage_slots = (
+            cohort.get("coverage_slots")
+            if isinstance(cohort, Mapping)
+            else None
+        )
+        if not isinstance(coverage_slots, Mapping):
+            raise ParseWaveError(
+                "acceptance_replay_match_classification_missing"
+            )
+        match_evidence_classes: dict[str, str] = {}
+        for slot, evidence_class in (
+            ("match_full", "full_match"),
+            ("match_sparse", "sparse_match"),
+        ):
+            target_id = str(coverage_slots.get(slot) or "").strip()
+            if not target_id or target_id in match_evidence_classes:
+                raise ParseWaveError(
+                    "acceptance_replay_match_classification_invalid"
+                )
+            match_evidence_classes[target_id] = evidence_class
+
+        with self.control.guard_publication_lock(run_id, source="fbref"):
+            fetches = self.control.list_run_fetches(
+                source_run_id,
+                page_kinds=["match"],
+                only_unparsed=False,
+                limit=settings.shard_size,
+            )
+            if len(fetches) != expected_matches:
+                raise ParseWaveError(
+                    "acceptance_replay_match_cohort_mismatch"
+                )
+            prepared = [
+                self._prepare_acceptance_replay_match(item)
+                for item in fetches
+            ]
+            target_ids = [item.record.target_id for item in prepared]
+            match_ids = [item.match_id for item in prepared]
+            if (
+                len(target_ids) != len(set(target_ids))
+                or len(match_ids) != len(set(match_ids))
+            ):
+                raise ParseWaveError(
+                    "acceptance_replay_match_identity_duplicate"
+                )
+            if set(target_ids) != set(match_evidence_classes):
+                raise ParseWaveError(
+                    "acceptance_replay_match_classification_mismatch"
+                )
+
+            mode = (
+                "batch" if self.batch_persist_enabled else "sequential"
+            )
+            control_targets = [
+                {
+                    "ordinal": ordinal,
+                    "target_id": item.record.target_id,
+                    "logical_refresh_id": item.record.logical_refresh_id,
+                    "page_kind": item.record.page_kind,
+                    "source_ids": dict(item.record.source_ids),
+                    "canonical_url": item.record.canonical_url,
+                    "content_hash": item.record.content_hash,
+                    "parser_version": PAGE_DOCUMENT_VERSION,
+                    "typed_parser_version": TYPED_BRONZE_PARSER_VERSION,
+                    "stateful_parser_version": DISCOVERY_PARSER_VERSION,
+                    "evidence_class": match_evidence_classes[
+                        item.record.target_id
+                    ],
+                }
+                for ordinal, item in enumerate(prepared)
+            ]
+            with self.control.replay_control_transaction(
+                replay_run_id=run_id,
+                source_run_id=source_run_id,
+                mode=mode,
+                targets=control_targets,
+            ) as replay_control:
+                if not self.batch_persist_enabled:
+                    for item in prepared:
+                        self._persist_acceptance_replay_match(
+                            run_id, item, replay_control=replay_control
+                        )
+                else:
+                    batch: list[_AcceptanceReplayMatch] = []
+                    batch_cells = 0
+
+                    def flush() -> None:
+                        nonlocal batch, batch_cells
+                        if batch:
+                            self._persist_acceptance_replay_match_batch(
+                                run_id,
+                                batch,
+                                replay_control=replay_control,
+                            )
+                            batch = []
+                            batch_cells = 0
+
+                    for item in prepared:
+                        item_cells = len(item.page.cell_records()) + sum(
+                            int(dataset.frame.size)
+                            for dataset in item.typed_match.datasets.values()
+                            if dataset.frame is not None
+                        )
+                        if item_cells > self.batch_persist_max_cells:
+                            flush()
+                            self._persist_acceptance_replay_match(
+                                run_id,
+                                item,
+                                replay_control=replay_control,
+                            )
+                            continue
+                        if batch and (
+                            len(batch) == self.batch_persist_matches
+                            or batch_cells + item_cells
+                            > self.batch_persist_max_cells
+                        ):
+                            flush()
+                        batch.append(item)
+                        batch_cells += item_cells
+                    flush()
+
+        return WaveResult(
+            cohort_size=len(prepared),
+            claimed=len(prepared),
+            parsed=len(prepared),
+            typed_promoted=len(prepared),
         )
 
     def parse_wave(
@@ -3649,7 +5324,8 @@ class FBrefPipeline:
                 limit=settings.shard_size,
             )
         result.cohort_size = len(fetches)
-        for item in fetches:
+
+        def stateful_identity(item):
             item_stateful_run_id = stateful_run_id
             item_stateful_run_type = stateful_run_type
             if _recover_cross_run:
@@ -3661,166 +5337,102 @@ class FBrefPipeline:
                     ).get("run_type")
                     or "current"
                 )
-            historical = item_stateful_run_type == "backfill"
-            logical_refresh_id = str(item["logical_refresh_id"])
-            record = None
-            page = None
-            observation_lease = None
+            return item_stateful_run_id, item_stateful_run_type
+
+        def process_sequential_item(item):
             try:
-                html, record = self.raw_store.load_fetch_html(
-                    logical_refresh_id
-                )
-                if record.logical_refresh_id != logical_refresh_id:
-                    raise ParseWaveError(
-                        f"Raw/control refresh mismatch for {logical_refresh_id}"
-                    )
-                if record.target_id != str(item["target_id"]):
-                    raise ParseWaveError(
-                        f"Raw/control target mismatch for {logical_refresh_id}"
-                    )
-                if item.get("content_hash") and record.content_hash != str(
-                    item["content_hash"]
-                ):
-                    raise ParseWaveError(
-                        f"Raw/control content mismatch for {logical_refresh_id}"
-                    )
-                observation_lease = self.control.claim_observation_processing(
-                    logical_refresh_id=logical_refresh_id,
-                    target_id=record.target_id,
-                    content_hash=record.content_hash,
-                    parser_version=PAGE_DOCUMENT_VERSION,
-                    typed_parser_version=TYPED_BRONZE_PARSER_VERSION,
-                    stateful_parser_version=DISCOVERY_PARSER_VERSION,
-                    lease_seconds=PROCESSING_LEASE_SECONDS,
-                )
-                if observation_lease is None:
-                    continue
-                result.claimed += 1
-                page = self._persist_generic(run_id, html, record)
-                typed_page = record.page_kind in {
-                    "schedule",
-                    "season",
-                    "season_stats",
-                    "match",
-                }
-                # One frontier lock linearizes typed output, stateful parser
-                # effects, and completion against the next fetch.  Replay is
-                # offline but intentionally rebuilds state from latest raw
-                # when its discovery parser version changes.
-                with self.control.guard_latest_content(
-                    record.target_id,
-                    record.content_hash,
-                    record.logical_refresh_id,
-                ) as is_latest:
-                    if is_latest is None:
-                        raise TypedPromotionDeferred(
-                            "Stateful promotion deferred for active target "
-                            f"{record.target_id}"
-                        )
-                    if is_latest:
-                        self._validate_pre_promotion_contract(html, record)
-                        if typed_page:
-                            if self._typed_context(record) is None:
-                                raise TypedBronzeError(
-                                    "Typed page requires source "
-                                    "competition_id and season_id"
-                                )
-                            self._persist_typed(run_id, html, record)
-                            result.typed_promoted += 1
-                            typed_status = "succeeded"
-                        else:
-                            typed_status = "skipped"
-                        seeded, skipped = self._apply_stateful_effects(
-                            item_stateful_run_id,
-                            html,
-                            record,
-                            run_type=item_stateful_run_type,
-                            historical=historical,
-                        )
-                        stateful_status = "succeeded"
-                    else:
-                        seeded, skipped = 0, 0
-                        stateful_status = "skipped"
-                        typed_status = "skipped"
-                        if typed_page:
-                            self._record_stale_typed_observation(record)
-                            result.stale_typed_observations_skipped += 1
-                    self._record_page_completion(
-                        record, page, succeeded=True
-                    )
-                    self.control.complete_observation_processing(
-                        observation_lease,
-                        typed_status=typed_status,
-                        stateful_status=stateful_status,
-                    )
-                result.seeded += seeded
-                result.skipped_ineligible += skipped
-                result.parsed += 1
+                claimed = self._load_and_claim_observation(item)
             except Exception as exc:
-                if record is not None and not isinstance(
-                    exc, TypedPromotionDeferred
-                ):
-                    try:
-                        self._record_page_completion(
-                            record, page, succeeded=False, error=exc
-                        )
-                    except StateConflict:
-                        # A prior retry may already have committed immutable
-                        # completion evidence for these exact bytes/parser.
-                        # Preserve it and, critically, do not mask the error
-                        # that caused this processing attempt to fail.
-                        logger.warning(
-                            "Failure completion marker for %s already exists",
-                            record.target_id,
-                        )
-                    except Exception as manifest_exc:
-                        result.failures.append(
-                            f"{item['target_id']}:manifest:"
-                            f"{type(manifest_exc).__name__}:{manifest_exc}"
-                        )
-                if observation_lease is not None:
-                    try:
-                        self.control.fail_observation_processing(
-                            observation_lease,
-                            error_class=type(exc).__name__,
-                            error_message=str(exc),
-                        )
-                    except Exception as fence_exc:
-                        result.failures.append(
-                            f"{item['target_id']}:observation_fence:"
-                            f"{type(fence_exc).__name__}:{fence_exc}"
-                        )
-                if isinstance(exc, SourceContractRejected):
-                    # The verdict is a property of these immutable bytes, so
-                    # the target is retired here rather than left to block the
-                    # recovery cohort of every later run.  Quarantining runs
-                    # after the content guard released its frontier row lock.
-                    retired = False
-                    try:
-                        retired = self.control.quarantine_contract_rejected_target(
-                            exc.target_id,
-                            content_hash=exc.content_hash,
-                            reason=exc.reason,
-                        )
-                    except Exception as quarantine_exc:
-                        result.failures.append(
-                            f"{item['target_id']}:contract_quarantine:"
-                            f"{type(quarantine_exc).__name__}:{quarantine_exc}"
-                        )
-                    if retired:
-                        logger.warning(
-                            "Quarantined %s after source contract rejection: %s",
-                            exc.target_id,
-                            exc.reason,
-                        )
-                        result.contract_quarantined += 1
-                        continue
-                    # A target raced into a lease or was already retired stays
-                    # a wave failure: reporting progress that did not shrink
-                    # the cohort would spin the recovery drain forever.
                 result.failures.append(
                     f"{item['target_id']}:{type(exc).__name__}:{exc}"
                 )
+                return
+            if claimed is None:
+                return
+            result.claimed += 1
+            html, record, observation_lease = claimed
+            item_run_id, item_run_type = stateful_identity(item)
+            outcome = self._process_claimed_observation(
+                run_id=run_id,
+                html=html,
+                record=record,
+                observation_lease=observation_lease,
+                page=None,
+                typed_match=None,
+                stateful_run_id=item_run_id,
+                stateful_run_type=item_run_type,
+            )
+            self._merge_processed_result(result, outcome)
+
+        def flush_match_items(buffer):
+            prepared: list[_ClaimedMatchObservation] = []
+            for item in buffer:
+                try:
+                    claimed = self._load_and_claim_observation(item)
+                except Exception as exc:
+                    result.failures.append(
+                        f"{item['target_id']}:{type(exc).__name__}:{exc}"
+                    )
+                    continue
+                if claimed is None:
+                    continue
+                result.claimed += 1
+                html, record, observation_lease = claimed
+                item_run_id, item_run_type = stateful_identity(item)
+                page: Optional[PageDocument] = None
+                try:
+                    page = self._parse_generic(html, record)
+                    typed_match, match_id, typed_context = (
+                        self._parse_typed_match(html, record)
+                    )
+                except Exception:
+                    # Preparation validation failed. Preserve the legacy
+                    # sequential evidence path using this same lease/raw.
+                    outcome = self._process_claimed_observation(
+                        run_id=run_id,
+                        html=html,
+                        record=record,
+                        observation_lease=observation_lease,
+                        page=page,
+                        typed_match=None,
+                        stateful_run_id=item_run_id,
+                        stateful_run_type=item_run_type,
+                    )
+                    self._merge_processed_result(result, outcome)
+                    continue
+                prepared.append(_ClaimedMatchObservation(
+                    run_id=run_id,
+                    html=html,
+                    record=record,
+                    observation_lease=observation_lease,
+                    page=page,
+                    typed_match=typed_match,
+                    typed_context=typed_context,
+                    match_id=match_id,
+                    stateful_run_id=item_run_id,
+                    stateful_run_type=item_run_type,
+                ))
+            for outcome in self._process_claimed_match_batch(prepared):
+                self._merge_processed_result(result, outcome)
+
+        if not self.batch_persist_enabled:
+            for item in fetches:
+                process_sequential_item(item)
+        else:
+            match_buffer = []
+            for item in fetches:
+                if str(item.get("page_kind") or "") == "match":
+                    match_buffer.append(item)
+                    if len(match_buffer) == self.batch_persist_matches:
+                        flush_match_items(match_buffer)
+                        match_buffer = []
+                    continue
+                if match_buffer:
+                    flush_match_items(match_buffer)
+                    match_buffer = []
+                process_sequential_item(item)
+            if match_buffer:
+                flush_match_items(match_buffer)
         if result.failures:
             raise ParseWaveError("; ".join(result.failures))
         if _is_mass_contract_rejection(result):
@@ -3883,6 +5495,23 @@ class FBrefPipeline:
         )
         if summary is None:
             raise RunValidationError(f"Unknown run {run_id}")
+        summary_metadata = summary.get("metadata") or {}
+        if isinstance(summary_metadata, str):
+            try:
+                summary_metadata = json.loads(summary_metadata)
+            except json.JSONDecodeError as exc:
+                raise RunValidationError(
+                    "persistent_http_profile_invalid"
+                ) from exc
+        if not isinstance(summary_metadata, Mapping):
+            raise RunValidationError("persistent_http_profile_invalid")
+        persistent_marker = summary_metadata.get(
+            "persistent_http_session"
+        )
+        if persistent_marker is True:
+            self.control.assert_persistent_metering_reconciled(run_id)
+        elif persistent_marker is not None and persistent_marker is not False:
+            raise RunValidationError("persistent_http_profile_invalid")
         target_counts = summary.get("target_counts") or {}
         # 'skipped' is a target the run deliberately did not fetch — it stopped
         # at its budget and handed the target back to the queue. That is the
@@ -3914,6 +5543,22 @@ class FBrefPipeline:
             if status not in {"succeeded", "skipped"}
         )
         errors = []
+        warnings: dict[str, object] = {}
+        traffic = summary.get("traffic_totals") or {}
+        network_attempts = int(traffic.get("network_attempts") or 0)
+        warm_successes = int(traffic.get("warm_http_successes") or 0)
+        success_rate = traffic.get("warm_http_success_rate")
+        durable_progress = int(target_counts.get("succeeded") or 0)
+        cohort_work = sum(int(count or 0) for count in target_counts.values())
+        unresolved_claims = bool(incomplete) or any(
+            int(summary.get(metric) or 0) != 0
+            for metric in ("requests_reserved", "bytes_reserved")
+        )
+        productive_recoverable = (
+            durable_progress > 0
+            and not unresolved_claims
+            and int(summary.get("unprocessed_raw_count") or 0) == 0
+        )
         if live_acceptance:
             errors.extend(_acceptance_summary_errors(summary))
             raw_error = _accepted_raw_audit_error(run_id, summary)
@@ -3991,30 +5636,81 @@ class FBrefPipeline:
             and str(summary.get("run_type") or "").casefold() == "current"
             and int(summary.get("promotion_pending_match_count") or 0) != 0
         ):
-            errors.append(
-                "promotion_pending_match_count="
-                f"{int(summary['promotion_pending_match_count'])}"
-            )
+            pending_matches = int(summary["promotion_pending_match_count"])
+            if productive_recoverable:
+                warnings["promotion_pending_match_count"] = pending_matches
+                logger.warning(
+                    "Run %s completed durable work with %d recoverable "
+                    "promotion-pending match(es)",
+                    run_id,
+                    pending_matches,
+                )
+            else:
+                errors.append(
+                    "promotion_pending_match_count="
+                    f"{pending_matches}"
+                )
         if bool(summary.get("budget_exceeded")):
             errors.append("budget_exceeded=true")
-        if int(summary.get("requests_used") or 0) > int(
-            summary.get("request_limit") or 0
+        for reservation_metric in ("requests_reserved", "bytes_reserved"):
+            reservation_value = int(summary.get(reservation_metric) or 0)
+            if reservation_value != 0:
+                errors.append(
+                    f"{reservation_metric}={reservation_value}"
+                )
+        request_limit = int(summary.get("request_limit") or 0)
+        byte_limit = int(summary.get("byte_limit") or 0)
+        requests_used = int(summary.get("requests_used") or 0)
+        bytes_used = int(summary.get("bytes_used") or 0)
+        production_safety_profile = (
+            str(summary.get("run_type") or "").casefold()
+            in {"current", "backfill"}
+            and request_limit == DEFAULT_REQUEST_LIMIT
+            and byte_limit == DEFAULT_BYTE_LIMIT
+        )
+        if production_safety_profile and (
+            requests_used >= request_limit or bytes_used >= byte_limit
         ):
-            errors.append("request_limit_exceeded")
-        if int(summary.get("bytes_used") or 0) > int(
-            summary.get("byte_limit") or 0
-        ):
-            errors.append("byte_limit_exceeded")
-        traffic = summary.get("traffic_totals") or {}
-        success_rate = traffic.get("warm_http_success_rate")
-        if success_rate is not None and float(success_rate) < 0.95:
+            errors.append("production_safety_circuit_reached")
+        else:
+            if requests_used > request_limit:
+                errors.append("request_limit_exceeded")
+            if bytes_used > byte_limit:
+                errors.append("byte_limit_exceeded")
+        if not isolated_acceptance and str(
+            summary.get("run_type") or ""
+        ).casefold() != "replay":
+            if network_attempts > 0 and warm_successes == 0:
+                errors.append("zero warm HTTP successes after network attempts")
+            if network_attempts > 0 and success_rate is None:
+                errors.append("warm_http_success_rate_missing")
+            elif success_rate is not None and float(success_rate) < 0.5:
+                errors.append(
+                    f"warm_http_success_rate={float(success_rate):.4f}<0.5"
+                )
+            elif success_rate is not None and float(success_rate) < 0.95:
+                if durable_progress > 0 and not unresolved_claims:
+                    warnings["warm_http_success_rate"] = float(success_rate)
+                    logger.warning(
+                        "Run %s completed durable work with partial warm HTTP "
+                        "success rate %.4f",
+                        run_id,
+                        float(success_rate),
+                    )
+                else:
+                    errors.append(
+                        "partial_warm_http_success_without_recoverable_progress="
+                        f"{float(success_rate):.4f}"
+                    )
+            if (
+                durable_progress <= 0
+                and (network_attempts > 0 or cohort_work > 0)
+            ):
+                errors.append("no_durable_progress_after_claimed_work")
+        if int(traffic.get("unclassified_failures") or 0) != 0:
             errors.append(
-                f"warm_http_success_rate={float(success_rate):.4f}<0.95"
-            )
-        if float(traffic.get("unclassified_failure_rate") or 0.0) >= 0.005:
-            errors.append(
-                "unclassified_failure_rate="
-                f"{float(traffic['unclassified_failure_rate']):.4f}>=0.005"
+                "unclassified_failures="
+                f"{int(traffic['unclassified_failures'])}"
             )
         if int(traffic.get("duplicate_fetch_violations") or 0) != 0:
             errors.append(
@@ -4176,6 +5872,8 @@ class FBrefPipeline:
             # the run is finishing right now, and reopened 'retry' rows would
             # linger in a succeeded run forever.
             self.control.start_run(run_id, reopen_targets=False)
+        if warnings:
+            summary["warnings"] = warnings
         self.control.finish_run(run_id, succeeded=True)
         return summary
 

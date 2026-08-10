@@ -12,6 +12,13 @@ from scrapers.fbref.control.models import (
     TargetLease,
     ThrottleSlot,
 )
+from scrapers.fbref.control.replay_effects import (
+    REPLAY_CONTROL_EFFECTS_SCHEMA_VERSION,
+    build_replay_control_effects,
+    make_replay_control_refresh_id,
+    make_replay_control_target_id,
+    normalize_replay_control_effects,
+)
 from scrapers.fbref.control.store import (
     BudgetExceeded,
     ControlStore,
@@ -21,6 +28,7 @@ from scrapers.fbref.control.store import (
     MigrationError,
     StateConflict,
     make_budget_reservation_id,
+    make_clearance_tail_reservation_id,
     make_control_run_id,
     make_frontier_provenance_id,
     make_logical_refresh_id,
@@ -40,14 +48,20 @@ __all__ = [
     "LeaseLost",
     "MigrationError",
     "ObservationLease",
+    "REPLAY_CONTROL_EFFECTS_SCHEMA_VERSION",
     "SeasonRegistryEntry",
     "SeasonAlias",
     "StateConflict",
     "TargetLease",
     "ThrottleSlot",
     "make_budget_reservation_id",
+    "make_clearance_tail_reservation_id",
     "make_control_run_id",
     "make_frontier_provenance_id",
     "make_logical_refresh_id",
+    "make_replay_control_refresh_id",
+    "make_replay_control_target_id",
+    "build_replay_control_effects",
+    "normalize_replay_control_effects",
     "resolve_control_db_uri",
 ]

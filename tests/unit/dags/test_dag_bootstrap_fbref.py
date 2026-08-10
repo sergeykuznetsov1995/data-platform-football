@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -56,10 +57,32 @@ class TestFBrefBootstrapTopology:
         assert module.dag._dag_kwargs["max_active_runs"] == 1
         assert module.dag._dag_kwargs["max_active_tasks"] == 1
         assert module.dag._dag_kwargs["dagrun_timeout"].total_seconds() == (
-            3 * 60 * 60
+            8 * 60 * 60
         )
         assert module.dag._dag_kwargs.get("params", {}) == {}
         assert set(tasks) == EXPECTED_TASK_IDS
+
+        live = tasks["run_live_waves"]
+        assert live._captured_kwargs["pool"] == "fbref_scraper_pool"
+        assert live._captured_kwargs["execution_timeout"].total_seconds() == (
+            6 * 60 * 60 + 5 * 60
+        )
+        assert live.op_kwargs["max_batches"] == 80
+
+    def test_dedicated_pool_is_created_idempotently(self):
+        compose = (
+            Path(__file__).resolve().parents[3] / "compose.yaml"
+        ).read_text(encoding="utf-8")
+        command = compose.split("airflow-init:", 1)[1].split(
+            "airflow-webserver:", 1
+        )[0]
+
+        assert command.count(
+            "airflow pools set 'fbref_scraper_pool' 1"
+        ) == 1
+        assert command.count(
+            "airflow pools set 'ingest_scraper_pool' 1"
+        ) == 1
 
     def test_exact_profile_is_literal_and_not_conf_overridable(self, loaded_dag):
         _, tasks = loaded_dag
@@ -72,8 +95,8 @@ class TestFBrefBootstrapTopology:
             "validate_bootstrap_run",
         ):
             kwargs = tasks[task_id].op_kwargs
-            assert kwargs["request_limit"] == 200
-            assert kwargs["byte_limit_mb"] == 100
+            assert kwargs["request_limit"] == 4096
+            assert kwargs["byte_limit_mb"] == 2048
             assert kwargs["shard_size"] == 25
         for task_id in (
             "validate_production_readiness",

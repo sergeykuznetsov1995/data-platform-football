@@ -80,7 +80,7 @@ class TestFBrefReplayTopology:
 
     def test_graph_contains_no_fetch_or_seed_task(self, loaded_dag):
         module, tasks = loaded_dag
-        assert len(tasks) == module.REPLAY_WAVE_COUNT + 9
+        assert len(tasks) == 10
         assert not any(task_id.startswith("fetch") for task_id in tasks)
         assert not any(task_id.startswith("seed") for task_id in tasks)
         assert "recover_raw_before_fetch" not in tasks
@@ -95,8 +95,8 @@ class TestFBrefReplayTopology:
             "acquire_fbref_publication_lock",
             "audit_fbref_raw_integrity",
             "capture_fbref_raw_baseline",
+            "drain_fbref_replay",
             "export_fbref_publication_scope",
-            "parse_fbref_wave",
             "finalize_fbref_publication_lock",
             "validate_fbref_production_readiness",
             "validate_fbref_run",
@@ -110,7 +110,7 @@ class TestFBrefReplayTopology:
         assert initialize.op_kwargs["byte_limit_mb"] == 0
         assert initialize.op_kwargs["reservation_mb"] == 3
         for task_id, task in tasks.items():
-            if task_id.startswith("parse_wave_"):
+            if task_id == "drain_replay":
                 assert task.op_kwargs["run_type"] == "replay"
                 assert task.op_kwargs["request_limit"] == 0
                 assert task.op_kwargs["byte_limit_mb"] == 0
@@ -131,16 +131,15 @@ class TestFBrefReplayTopology:
             "capture_raw_baseline"
         }
         assert tasks["capture_raw_baseline"].downstream_task_ids == {
-            "parse_wave_01"
+            "drain_replay"
         }
-        for number in range(1, module.REPLAY_WAVE_COUNT + 1):
-            task = tasks[f"parse_wave_{number:02d}"]
-            expected_next = (
-                f"parse_wave_{number + 1:02d}"
-                if number < module.REPLAY_WAVE_COUNT
-                else "audit_raw_integrity"
-            )
-            assert task.downstream_task_ids == {expected_next}
+        assert tasks["drain_replay"].downstream_task_ids == {
+            "audit_raw_integrity"
+        }
+        assert tasks["drain_replay"].op_kwargs["max_waves"] == (
+            module.REPLAY_MAX_WAVES
+        )
+        assert module.REPLAY_MAX_WAVES * module.REPLAY_SHARD_SIZE > 2000
         assert tasks["audit_raw_integrity"].downstream_task_ids == {
             "validate_run"
         }

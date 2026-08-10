@@ -79,6 +79,12 @@ def test_acceptance_dag_is_one_strictly_sequential_live_batch(acceptance_dag):
     assert tasks["run_live_wave"].python_callable.__name__ == (
         "run_fbref_acceptance_live_wave"
     )
+    assert tasks["run_live_wave"]._init_kwargs["pool"] == (
+        "fbref_scraper_pool"
+    )
+    assert tasks["run_live_wave"]._init_kwargs[
+        "execution_timeout"
+    ].total_seconds() == 6 * 60 * 60 + 5 * 60
     assert tasks["acquire_publication_lock"].python_callable.__name__ == (
         "acquire_fbref_acceptance_publication_lock"
     )
@@ -115,6 +121,13 @@ def test_replay_dag_has_required_source_and_no_network_tasks(replay_dag):
     assert source.default is None
     assert source._kw["type"] == ["null", "string"]
     assert source._kw["minLength"] == source._kw["maxLength"] == 36
+    assert module.dag._dag_kwargs["params"]["trino_schema"].default == (
+        "fbref_acceptance_sequential"
+    )
+    assert (
+        module.dag._dag_kwargs["params"]["persistence_mode"]._kw["enum"]
+        == ["sequential", "batch"]
+    )
 
 
 @pytest.mark.unit
@@ -143,6 +156,9 @@ def test_replay_budget_is_physically_zero_and_topology_is_sequential(replay_dag)
     assert tasks["parse_source_cohort"].python_callable.__name__ == (
         "parse_fbref_acceptance_replay"
     )
+    for task_id in ("initialize_run", "parse_source_cohort"):
+        assert tasks[task_id].op_kwargs["trino_schema"]
+        assert tasks[task_id].op_kwargs["persistence_mode"]
     assert tasks["acquire_publication_lock"].python_callable.__name__ == (
         "acquire_fbref_acceptance_publication_lock"
     )

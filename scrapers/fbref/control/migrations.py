@@ -769,6 +769,109 @@ MIGRATIONS = (
             """,
         ),
     ),
+    Migration(
+        version=10,
+        name="persistent_http_metering",
+        statements=(
+            """
+            CREATE TABLE IF NOT EXISTS
+                fbref_control.clearance_session_page_accounting (
+                reservation_id uuid PRIMARY KEY
+                    REFERENCES fbref_control.budget_reservation(reservation_id),
+                session_id uuid NOT NULL
+                    REFERENCES fbref_control.clearance_session(session_id),
+                run_id uuid NOT NULL
+                    REFERENCES fbref_control.crawl_run(run_id),
+                attempt_id uuid NOT NULL UNIQUE
+                    REFERENCES fbref_control.fetch_attempt(attempt_id),
+                requests_used bigint NOT NULL CHECK (requests_used >= 0),
+                browser_bootstrap_attempts bigint NOT NULL
+                    CHECK (browser_bootstrap_attempts >= 0),
+                browser_bootstrap_requests bigint NOT NULL
+                    CHECK (browser_bootstrap_requests >= 0),
+                browser_document_bytes bigint NOT NULL
+                    CHECK (browser_document_bytes >= 0),
+                browser_asset_bytes bigint NOT NULL
+                    CHECK (browser_asset_bytes >= 0),
+                browser_unobserved_bytes bigint NOT NULL
+                    CHECK (browser_unobserved_bytes >= 0),
+                http_requests bigint NOT NULL CHECK (http_requests >= 0),
+                http_wire_bytes bigint NOT NULL CHECK (http_wire_bytes >= 0),
+                decoded_html_bytes bigint NOT NULL
+                    CHECK (decoded_html_bytes >= 0),
+                compressed_raw_bytes bigint NOT NULL
+                    CHECK (compressed_raw_bytes >= 0),
+                provider_billed_bytes bigint NOT NULL
+                    CHECK (provider_billed_bytes >= 0),
+                evidence_sha256 text NOT NULL
+                    CHECK (evidence_sha256 ~ '^[0-9a-f]{64}$'),
+                created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS
+                clearance_session_page_accounting_session_idx
+            ON fbref_control.clearance_session_page_accounting (
+                session_id, reservation_id
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS
+                fbref_control.clearance_session_tail_reservation (
+                session_id uuid PRIMARY KEY
+                    REFERENCES fbref_control.clearance_session(session_id),
+                run_id uuid NOT NULL
+                    REFERENCES fbref_control.crawl_run(run_id),
+                reservation_id uuid NOT NULL UNIQUE
+                    REFERENCES fbref_control.budget_reservation(reservation_id),
+                baseline_provider_bytes bigint NOT NULL
+                    CHECK (baseline_provider_bytes >= 0),
+                bytes_reserved bigint NOT NULL CHECK (bytes_reserved >= 0),
+                status text NOT NULL DEFAULT 'reserved'
+                    CHECK (status IN ('reserved', 'settled', 'aborted')),
+                page_provider_bytes bigint CHECK (page_provider_bytes >= 0),
+                authoritative_provider_bytes bigint
+                    CHECK (authoritative_provider_bytes >= 0),
+                tail_provider_bytes bigint CHECK (tail_provider_bytes >= 0),
+                settlement_sha256 text
+                    CHECK (
+                        settlement_sha256 IS NULL
+                        OR settlement_sha256 ~ '^[0-9a-f]{64}$'
+                    ),
+                created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                settled_at timestamptz,
+                CHECK (
+                    (
+                        status = 'settled'
+                        AND page_provider_bytes IS NOT NULL
+                        AND authoritative_provider_bytes IS NOT NULL
+                        AND tail_provider_bytes IS NOT NULL
+                        AND settlement_sha256 IS NOT NULL
+                        AND settled_at IS NOT NULL
+                        AND authoritative_provider_bytes =
+                            page_provider_bytes + tail_provider_bytes
+                    )
+                    OR
+                    (
+                        status IN ('reserved', 'aborted')
+                        AND page_provider_bytes IS NULL
+                        AND authoritative_provider_bytes IS NULL
+                        AND tail_provider_bytes IS NULL
+                        AND settlement_sha256 IS NULL
+                        AND settled_at IS NULL
+                    )
+                )
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS
+                clearance_session_tail_reservation_run_status_idx
+            ON fbref_control.clearance_session_tail_reservation (
+                run_id, status, session_id
+            )
+            """,
+        ),
+    ),
 )
 
 

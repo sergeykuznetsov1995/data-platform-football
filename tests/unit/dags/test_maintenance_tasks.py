@@ -1215,6 +1215,69 @@ class TestFBrefGenericStageJanitor:
         assert family == "typed"
         assert live == "fbref_future_dataset"
 
+    def test_batch_stage_names_have_distinct_public_classification(self):
+        import utils.maintenance_tasks as maintenance
+
+        classification = maintenance.classify_fbref_staging_table(
+            "fbref_table_cells__stg_batch_0123456789abcdef_c"
+        )
+
+        assert classification.family == "generic"
+        assert classification.owner_kind == "batch"
+        assert classification.live_table == "fbref_table_cells"
+        assert classification.logical_refresh_id is None
+
+    def test_retained_batch_stage_is_age_guarded_and_never_owner_attributed(
+        self, monkeypatch
+    ):
+        import utils.maintenance_tasks as maintenance
+
+        stage = "fbref_table_cells__stg_batch_0123456789abcdef_c"
+        replay_runs = (
+            "8ca16a99-4039-44a6-a47d-206037f11e70",
+            "e42eeb80-0aa9-42b4-ad0f-ea334698884c",
+        )
+        monkeypatch.setattr(maintenance, "_list_tables", lambda *_args: [stage])
+        monkeypatch.setattr(
+            maintenance,
+            "_fbref_stage_created_at",
+            lambda *_args: self.NOW - timedelta(hours=48),
+        )
+        monkeypatch.setattr(
+            maintenance, "_fbref_stage_row_count", lambda *_args: 7
+        )
+        monkeypatch.setattr(
+            maintenance,
+            "_fbref_stage_owner_evidence",
+            lambda *_args, **_kwargs: {
+                "row_count": 7,
+                "null_owner_rows": 0,
+                "run_ids": replay_runs,
+            },
+        )
+        owner_lookups = []
+
+        result = maintenance.janitor_fbref_generic_stages(
+            conn=object(),
+            owner_lookup=lambda refresh: owner_lookups.append(refresh),
+            run_lookup=self._run,
+            before_drop=lambda *_args: pytest.fail(
+                "batch stage must never enter automatic drop"
+            ),
+            apply=True,
+            now=self.NOW,
+        )
+
+        assert owner_lookups == []
+        assert result["protected_count"] == 1
+        decision = result["decisions"][0]
+        assert decision["stage_family"] == "batch"
+        assert decision["stage_row_count"] == 7
+        assert decision["age_guard_satisfied"] is True
+        assert decision["stage_run_ids"] == list(replay_runs)
+        assert decision["reason"] == "batch_stage_requires_recovery_review"
+        assert result["attention_required_count"] == 1
+
     def test_apply_fences_immediately_before_drop(self, monkeypatch):
         maintenance = self._wire(monkeypatch, [self.STAGE])
         events = []

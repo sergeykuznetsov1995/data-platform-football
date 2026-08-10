@@ -307,8 +307,6 @@ def test_live_wrapper_has_one_exact_paid_batch(monkeypatch):
 
 @pytest.mark.unit
 def test_replay_initializer_and_parser_are_physically_zero_network(monkeypatch):
-    import utils.fbref_pipeline_tasks as pipeline_tasks
-
     pipeline = SimpleNamespace(
         initialize_acceptance_replay_run=MagicMock(return_value="replay-run")
     )
@@ -319,6 +317,8 @@ def test_replay_initializer_and_parser_are_physically_zero_network(monkeypatch):
         airflow_run_id="manual__replay",
         dag_id="dag_replay_fbref_bronze",
         source_control_run_id=source_id,
+        trino_schema="acceptance_sequential",
+        persistence_mode="sequential",
     )
 
     assert result == "replay-run"
@@ -328,18 +328,81 @@ def test_replay_initializer_and_parser_are_physically_zero_network(monkeypatch):
     assert settings.run_type == "replay"
     assert settings.request_limit == settings.byte_limit == 0
     assert settings.shard_size == 25
+    assert pipeline.initialize_acceptance_replay_run.call_args.kwargs[
+        "execution_metadata"
+    ] == {
+        "acceptance_trino_schema": "acceptance_sequential",
+        "acceptance_persistence_mode": "sequential",
+    }
 
-    parse = MagicMock(return_value={"parsed": 0})
-    monkeypatch.setattr(pipeline_tasks, "parse_fbref_wave", parse)
-    assert acceptance.parse_fbref_acceptance_replay(
+    control = SimpleNamespace(
+        get_run=MagicMock(
+            return_value={
+                "status": "running",
+                "run_type": "replay",
+                "metadata": {
+                    "acceptance_trino_schema": "acceptance_sequential",
+                    "acceptance_persistence_mode": "sequential",
+                },
+            }
+        ),
+        record_replay_pipeline_metrics=MagicMock(
+            return_value={"artifact_sha256": "a" * 64}
+        ),
+    )
+    wave = SimpleNamespace(as_dict=MagicMock(return_value={"parsed": 1}))
+    replay_pipeline = SimpleNamespace(
+        control=control,
+        batch_persist_enabled=True,
+        replay_acceptance_matches=MagicMock(return_value=wave),
+    )
+    manager = SimpleNamespace(
+        statement_counts=MagicMock(
+            return_value={"execute": 12, "execute_committing": 3}
+        )
+    )
+    monkeypatch.setattr(
+        acceptance,
+        "_acceptance_replay_pipeline",
+        lambda **_kwargs: (replay_pipeline, manager),
+    )
+    times = iter((10.0, 14.5))
+    monkeypatch.setattr(acceptance.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(
+        acceptance, "_control_run_id", lambda **_kwargs: "replay-run"
+    )
+
+    parsed = acceptance.parse_fbref_acceptance_replay(
         airflow_run_id="manual__replay",
         dag_id="dag_replay_fbref_bronze",
         source_control_run_id=source_id,
-    ) == {"parsed": 0}
-    kwargs = parse.call_args.kwargs
-    assert kwargs["acceptance_replay"] is True
-    assert kwargs["request_limit"] == kwargs["byte_limit_mb"] == 0
-    assert kwargs["shard_size"] == 25
+        trino_schema="acceptance_sequential",
+        persistence_mode="sequential",
+    )
+
+    assert parsed == {
+        "parsed": 1,
+        "pipeline_metrics": {"artifact_sha256": "a" * 64},
+    }
+    assert replay_pipeline.batch_persist_enabled is False
+    parse_kwargs = replay_pipeline.replay_acceptance_matches.call_args.kwargs
+    assert parse_kwargs["source_run_id"] == source_id
+    record = control.record_replay_pipeline_metrics.call_args
+    assert record.args == ("replay-run",)
+    assert record.kwargs == {
+        "schema": "acceptance_sequential",
+        "mode": "sequential",
+        "elapsed_seconds": 4.5,
+        "statement_counts": {"execute": 12, "execute_committing": 3},
+    }
+
+
+@pytest.mark.unit
+def test_replay_parser_refuses_the_production_bronze_schema():
+    with pytest.raises(ValueError, match="isolated"):
+        acceptance._acceptance_replay_profile(
+            trino_schema="bronze", persistence_mode="sequential"
+        )
 
 
 @pytest.mark.unit

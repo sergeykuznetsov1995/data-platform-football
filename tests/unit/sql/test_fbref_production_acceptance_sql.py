@@ -237,7 +237,7 @@ def test_postgres_companion_proves_explicit_empty_season_manifests():
     assert "frontier.page_kind IN ('season', 'season_stats')" in CONTROL_SQL
     assert "frontier.page_kind = 'season' THEN 'standard'" in CONTROL_SQL
     assert "match_control_manifest_matrix" in CONTROL_SQL
-    assert "backfill/200/100" in CONTROL_SQL
+    assert "backfill/4096/2048" in CONTROL_SQL
     assert "reviewed_live_transport" in CONTROL_SQL
     assert "fbref-camoufox-metered-warm-http-v7" in CONTROL_SQL
     assert "successful_warm_http_attempts > 0" in CONTROL_SQL
@@ -316,8 +316,8 @@ def test_postgres_replay_uses_audited_source_run_evidence():
     assert "audited_control_run_id <> run_id" in control_gate
     assert "evidence_run.status = 'succeeded'" in control_gate
     assert "evidence_run.run_type IN ('current', 'backfill')" in control_gate
-    assert "evidence_run.request_limit = 200" in control_gate
-    assert "evidence_run.byte_limit = 100 * 1048576" in control_gate
+    assert "evidence_run.request_limit = 4096" in control_gate
+    assert "evidence_run.byte_limit = 2048 * 1048576" in control_gate
     assert "->> 'run_type' = run_type" in control_gate
     assert "->> 'zero_delta_required'" in control_gate
     assert "run_type = 'replay' THEN 'true' ELSE 'false'" in control_gate
@@ -363,7 +363,7 @@ def test_silver_freshness_uses_oldest_row_not_one_fresh_row():
 
 def test_profile_specific_acceptance_scripts_are_routed_explicitly():
     header = "\n".join(SQL.splitlines()[:8])
-    assert "only for the publishing 200-request / 100-MiB" in header
+    assert "only for the publishing 4096-request / 2048-MiB" in header
     assert "use fbref_canary_acceptance.sql" in header
     assert "`fbref_canary_acceptance.sql`" in READINESS
     assert "`fbref_production_acceptance.sql`" in READINESS

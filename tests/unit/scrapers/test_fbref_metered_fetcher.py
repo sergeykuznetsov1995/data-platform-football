@@ -9,7 +9,12 @@ from scrapers.fbref.camoufox_fetch import (
     CamoufoxFbrefTransport,
     GEOIP_BYTE_RESERVATION_BYTES,
 )
-from scrapers.fbref.fetcher import FBrefFetcher, FetchError, FetchResponse
+from scrapers.fbref.fetcher import (
+    PERSISTENT_SESSION_MAX_AGE_SECONDS,
+    FBrefFetcher,
+    FetchError,
+    FetchResponse,
+)
 from scrapers.fbref.proxy_lease import (
     FBrefLeaseStats,
     FBrefProxyLease,
@@ -22,11 +27,17 @@ CONTEXT = {
     "dag_id": "dag_ingest_fbref",
     "run_id": "control-run",
     "task_id": "run_live_waves",
+    "scope": "worker-0",
     "canonical_url": "https://fbref.com/en/",
 }
 
 
-def _stats(total: int, *, closed: bool = False) -> FBrefLeaseStats:
+def _stats(
+    total: int,
+    *,
+    closed: bool = False,
+    active_tunnels: int = 0,
+) -> FBrefLeaseStats:
     return FBrefLeaseStats(
         lease_id="lease-1",
         source="fbref",
@@ -34,10 +45,12 @@ def _stats(total: int, *, closed: bool = False) -> FBrefLeaseStats:
         run_id="control-run",
         up_bytes=total // 2,
         down_bytes=total - total // 2,
-        active_tunnels=0,
-        reserved_bytes=0,
+        active_tunnels=active_tunnels,
+        reserved_bytes=64 if active_tunnels else 0,
         closed=closed,
         budget_exceeded=False,
+        active_provider_readers=active_tunnels,
+        provider_reserved_bytes=64 if active_tunnels else 0,
         close_complete=closed,
     )
 
@@ -84,6 +97,16 @@ class _LeaseClient:
 
     def close(self, lease, *, expected):
         self.events.append("close")
+        self.closed.append(lease.lease_id)
+        return _stats(next(self.totals), closed=True)
+
+    def wait_idle(self, lease, *, expected, expected_tunnels=1):
+        assert expected_tunnels == 1
+        self.events.append("wait_idle")
+        return _stats(next(self.totals), active_tunnels=1)
+
+    def close_strict(self, lease, *, expected):
+        self.events.append("close_strict")
         self.closed.append(lease.lease_id)
         return _stats(next(self.totals), closed=True)
 
@@ -592,3 +615,302 @@ def test_live_provider_context_cannot_fall_back_to_direct(monkeypatch):
             provider_context=CONTEXT,
             provider_max_bytes=1000,
         )
+
+
+def test_live_provider_context_requires_scope_before_any_lease():
+    incomplete = dict(CONTEXT)
+    incomplete.pop("scope")
+    client = _LeaseClient([])
+
+    with pytest.raises(FBrefProxyLeaseError, match="complete run provenance"):
+        FBrefFetcher(
+            provider_context=incomplete,
+            provider_max_bytes=1000,
+            lease_client=client,
+        )
+
+    assert client.acquired == []
+
+
+def test_persistent_session_reuses_http_and_emits_idle_page_deltas():
+    client = _LeaseClient([100, 150, 160])
+    fetcher = FBrefFetcher(
+        proxy_file="/credentials/must-not-be-read.txt",
+        provider_context=CONTEXT,
+        provider_max_bytes=1000,
+        lease_client=client,
+        persistent_http_session=True,
+    )
+    fetcher._next_proxy()
+    fetcher._provider_http_ready = True
+    session = MagicMock()
+    fetcher._http_session = session
+    fetcher._fetch_without_provider_meter = MagicMock(return_value=_response())
+
+    assert fetcher.begin_metered_session("session-a") == 0
+    first = fetcher.fetch(
+        "https://fbref.com/en/comps/9", page_kind="competition"
+    )
+    second = fetcher.fetch(
+        "https://fbref.com/en/comps/9", page_kind="competition"
+    )
+    receipt = fetcher.finalize_metered_session()
+    repeated = fetcher.finalize_metered_session()
+
+    assert first.provider_billed_bytes == 100
+    assert second.provider_billed_bytes == 50
+    assert receipt is repeated
+    assert receipt.session_id == "session-a"
+    assert receipt.baseline_provider_bytes == 0
+    assert receipt.page_provider_bytes == 150
+    assert receipt.authoritative_provider_bytes == 160
+    assert receipt.tail_provider_bytes == 10
+    assert client.events.count("wait_idle") == 2
+    assert client.events.count("close_strict") == 1
+    session.close.assert_called_once_with()
+
+
+def test_persistent_clearance_reuses_the_existing_curl_session():
+    client = _LeaseClient([])
+    fetcher = FBrefFetcher(
+        proxy_file="/credentials/must-not-be-read.txt",
+        provider_context=CONTEXT,
+        provider_max_bytes=1000,
+        lease_client=client,
+        persistent_http_session=True,
+    )
+    existing = MagicMock()
+    fetcher._clearance = {"cookies": [], "headers": {}, "proxy": None}
+    fetcher._http_session = existing
+    fetcher._provider_http_ready = True
+    fetcher._create_http_session = MagicMock()
+
+    assert fetcher._ensure_clearance() is False
+    assert fetcher._ensure_clearance() is False
+
+    assert fetcher._http_session is existing
+    fetcher._create_http_session.assert_not_called()
+
+
+def test_persistent_first_page_includes_strictly_closed_bootstrap_rotations():
+    client = _LeaseClient([30, 70])
+    fetcher = FBrefFetcher(
+        proxy_file="/credentials/must-not-be-read.txt",
+        provider_context=CONTEXT,
+        provider_max_bytes=1000,
+        lease_client=client,
+        persistent_http_session=True,
+    )
+    fetcher.begin_metered_session("session-bootstrap")
+    fetcher._next_proxy()
+    fetcher._close_provider_lease()
+    fetcher._next_proxy()
+    fetcher._provider_http_ready = True
+    fetcher._http_session = MagicMock()
+    fetcher._fetch_without_provider_meter = MagicMock(return_value=_response())
+
+    response = fetcher.fetch(
+        "https://fbref.com/en/comps/9", page_kind="competition"
+    )
+
+    assert response.provider_billed_bytes == 100
+    assert client.events.count("close_strict") == 1
+
+
+def test_persistent_rollover_uses_the_prior_aggregate_as_its_new_baseline():
+    client = _LeaseClient([100, 110, 50, 60])
+    fetcher = FBrefFetcher(
+        proxy_file="/credentials/must-not-be-read.txt",
+        provider_context=CONTEXT,
+        provider_max_bytes=1000,
+        lease_client=client,
+        persistent_http_session=True,
+    )
+    fetcher._fetch_without_provider_meter = MagicMock(return_value=_response())
+
+    assert fetcher.begin_metered_session("session-a") == 0
+    fetcher._next_proxy()
+    fetcher._provider_http_ready = True
+    fetcher._http_session = MagicMock()
+    first = fetcher.fetch(
+        "https://fbref.com/en/comps/9", page_kind="competition"
+    )
+    first_receipt = fetcher.finalize_metered_session()
+
+    assert fetcher.begin_metered_session("session-b") == 110
+    fetcher._next_proxy()
+    fetcher._provider_http_ready = True
+    fetcher._http_session = MagicMock()
+    second = fetcher.fetch(
+        "https://fbref.com/en/comps/12", page_kind="competition"
+    )
+    second_receipt = fetcher.finalize_metered_session()
+
+    assert first.provider_billed_bytes == 100
+    assert first_receipt.authoritative_provider_bytes == 110
+    assert first_receipt.tail_provider_bytes == 10
+    assert second.provider_billed_bytes == 50
+    assert second_receipt.baseline_provider_bytes == 110
+    assert second_receipt.authoritative_provider_bytes == 60
+    assert second_receipt.tail_provider_bytes == 10
+    assert fetcher._provider_total_bytes == 170
+    assert client.events.count("close_strict") == 2
+
+
+def test_persistent_session_rolls_before_the_provider_lease_deadline():
+    now = [100.0]
+    fetcher = FBrefFetcher(
+        proxy_file="/credentials/must-not-be-read.txt",
+        provider_context=CONTEXT,
+        provider_max_bytes=1000,
+        provider_lease_ttl_seconds=7200,
+        lease_client=_LeaseClient([]),
+        persistent_http_session=True,
+        monotonic=lambda: now[0],
+    )
+
+    fetcher.begin_metered_session("session-deadline")
+    now[0] += PERSISTENT_SESSION_MAX_AGE_SECONDS - 500
+    assert fetcher.persistent_session_rollover_due() is False
+    assert fetcher.persistent_session_rollover_due(
+        within_seconds=600
+    ) is True
+
+    now[0] += 500
+    assert fetcher.persistent_session_rollover_due() is True
+    assert PERSISTENT_SESSION_MAX_AGE_SECONDS == 115 * 60
+    assert PERSISTENT_SESSION_MAX_AGE_SECONDS < 7200
+
+
+def test_shrunk_browser_budget_keeps_prior_provider_spend_in_next_cap():
+    client = _LeaseClient([300])
+    fetcher = FBrefFetcher(
+        proxy_file="/credentials/must-not-be-read.txt",
+        provider_context=CONTEXT,
+        provider_max_bytes=1000,
+        lease_client=client,
+        persistent_http_session=True,
+    )
+    fetcher._transport = MagicMock()
+
+    fetcher.begin_metered_session("session-before-shrink")
+    fetcher._next_proxy()
+    fetcher.finalize_metered_session()
+    fetcher.reconfigure_clearance_limits(
+        max_browser_requests=4,
+        max_browser_bytes=800,
+    )
+    fetcher.begin_metered_session("session-after-shrink")
+    fetcher._next_proxy()
+
+    assert fetcher._provider_total_bytes == 300
+    assert client.acquired[0][0] == 1000
+    assert client.acquired[1][0] == 700
+
+
+def test_persistent_finalizer_failure_keeps_provider_ownership():
+    client = _LeaseClient([])
+    fetcher = FBrefFetcher(
+        proxy_file="/credentials/must-not-be-read.txt",
+        provider_context=CONTEXT,
+        provider_max_bytes=1000,
+        lease_client=client,
+        persistent_http_session=True,
+    )
+    fetcher.begin_metered_session("session-a")
+    fetcher._next_proxy()
+    original = fetcher._provider_lease
+    fetcher._http_session = MagicMock()
+    client.close_strict = MagicMock(
+        side_effect=FBrefProxyLeaseError("strict close unavailable")
+    )
+
+    with pytest.raises(FBrefProxyLeaseError, match="strict close unavailable"):
+        fetcher.finalize_metered_session()
+
+    assert fetcher._provider_lease is original
+    assert fetcher._persistent_receipt is None
+
+
+def test_persistent_clearance_failure_is_checkpointed_as_page_evidence():
+    client = _LeaseClient([45])
+    fetcher = FBrefFetcher(
+        proxy_file="/credentials/must-not-be-read.txt",
+        provider_context=CONTEXT,
+        provider_max_bytes=1000,
+        lease_client=client,
+        persistent_http_session=True,
+    )
+    fetcher.begin_metered_session("session-bootstrap-failure")
+    fetcher._next_proxy()
+    transport = MagicMock()
+    fetcher._transport = transport
+    fetcher._ensure_clearance = MagicMock(
+        side_effect=FetchError(
+            "browser rejected",
+            error_class="clearance_failed",
+            browser_requests=2,
+            browser_bootstrap_attempts=1,
+        )
+    )
+
+    with pytest.raises(FetchError) as raised:
+        fetcher.ensure_clearance()
+
+    assert raised.value.provider_billed_bytes == 45
+    assert raised.value.browser_requests == 2
+    assert fetcher._persistent_page_provider_bytes == 45
+    assert client.events.count("close_strict") == 1
+    transport.close.assert_called_once_with()
+    receipt = fetcher.finalize_metered_session()
+    assert receipt.page_provider_bytes == 45
+    assert receipt.tail_provider_bytes == 0
+
+
+@pytest.mark.parametrize(
+    ("error_class", "http_status"),
+    [
+        ("http_status", 403),
+        ("rate_limit", 429),
+        ("warm_session_connection", None),
+        ("raw_contract_cloudflare_challenge", 200),
+    ],
+)
+def test_persistent_target_poison_strictly_closes_before_rollover(
+    error_class,
+    http_status,
+):
+    client = _LeaseClient([45])
+    fetcher = FBrefFetcher(
+        proxy_file="/credentials/must-not-be-read.txt",
+        provider_context=CONTEXT,
+        provider_max_bytes=1000,
+        lease_client=client,
+        persistent_http_session=True,
+    )
+    fetcher.begin_metered_session("session-poisoned")
+    fetcher._next_proxy()
+    fetcher._provider_http_ready = True
+    fetcher._http_session = MagicMock()
+    fetcher._fetch_without_provider_meter = MagicMock(
+        side_effect=FetchError(
+            "poisoned target session",
+            error_class=error_class,
+            http_status=http_status,
+            wire_bytes=20,
+            target_requests=1,
+            http_status_history=(
+                () if http_status is None else (http_status,)
+            ),
+        )
+    )
+
+    with pytest.raises(FetchError) as raised:
+        fetcher.fetch(
+            "https://fbref.com/en/comps/9", page_kind="competition"
+        )
+
+    assert raised.value.provider_billed_bytes == 45
+    assert fetcher._provider_lease is None
+    assert client.events.count("close_strict") == 1
+    assert fetcher.finalize_metered_session().page_provider_bytes == 45

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import uuid
 from contextlib import contextmanager
@@ -17,6 +18,7 @@ from datetime import datetime
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
+from scrapers.base.sql_validator import validate_identifier
 from scrapers.fbref.control.migrations import (
     MIGRATION_LOCK_KEY,
     MIGRATIONS,
@@ -33,6 +35,12 @@ from scrapers.fbref.control.models import (
     SeasonRegistryEntry,
     TargetLease,
     ThrottleSlot,
+)
+from scrapers.fbref.control.replay_effects import (
+    build_replay_control_effects,
+    make_replay_control_refresh_id,
+    make_replay_control_target_id,
+    normalize_replay_control_effects,
 )
 from scrapers.fbref.policy import (
     DISCOVERY_SPINE_PAGE_KINDS,
@@ -261,6 +269,15 @@ def make_budget_reservation_id(attempt_id: object) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"fbref-budget:{attempt}"))
 
 
+def make_clearance_tail_reservation_id(session_id: object) -> str:
+    """Return the retry-stable zero-request tail reservation identity."""
+
+    session = str(uuid.UUID(str(session_id)))
+    return str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"fbref-clearance-tail:{session}")
+    )
+
+
 def make_frontier_provenance_id(
     *,
     parent_target_id: object,
@@ -324,6 +341,12 @@ def _json(value: Optional[Mapping[str, Any]]) -> str:
     return json.dumps(dict(value or {}), sort_keys=True, separators=(",", ":"))
 
 
+def _evidence_sha256(value: Mapping[str, Any]) -> str:
+    """Hash one immutable evidence object using the control JSON encoding."""
+
+    return hashlib.sha256(_json(value).encode("utf-8")).hexdigest()
+
+
 def _json_mapping(value: object, name: str) -> dict[str, Any]:
     if isinstance(value, str):
         try:
@@ -347,6 +370,86 @@ def _detached_json_mapping(value: object, name: str) -> dict[str, Any]:
     if not isinstance(detached, dict):  # pragma: no cover - _json guarantees it
         raise ValueError(f"{name} must be a JSON object")
     return detached
+
+
+_REPLAY_CONTROL_TARGET_FIELDS = {
+    "ordinal",
+    "target_id",
+    "logical_refresh_id",
+    "page_kind",
+    "source_ids",
+    "canonical_url",
+    "content_hash",
+    "parser_version",
+    "typed_parser_version",
+    "stateful_parser_version",
+    "evidence_class",
+}
+
+
+def _replay_control_targets(
+    values: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        raise ValueError("replay control targets must be a sequence")
+    if not 1 <= len(values) <= 25:
+        raise ValueError("replay control target count must be between 1 and 25")
+    normalized = []
+    for expected_ordinal, value in enumerate(values):
+        if not isinstance(value, Mapping) or set(value) != (
+            _REPLAY_CONTROL_TARGET_FIELDS
+        ):
+            raise ValueError("replay control target fields are invalid")
+        ordinal = value.get("ordinal")
+        if ordinal != expected_ordinal:
+            raise ValueError("replay control target ordinals must be contiguous")
+        target_id = _text(value.get("target_id"), "target_id")
+        page_kind = _text(value.get("page_kind"), "page_kind").casefold()
+        source_ids = _detached_json_mapping(
+            value.get("source_ids"), "source_ids"
+        )
+        match_id = _text(source_ids.get("match_id"), "match_id")
+        if page_kind != "match" or target_id != f"fbref:match:{match_id}":
+            raise ValueError("replay control target must be a canonical match")
+        normalized.append(
+            {
+                "ordinal": expected_ordinal,
+                "target_id": target_id,
+                "logical_refresh_id": _uuid(
+                    value.get("logical_refresh_id"),
+                    "logical_refresh_id",
+                ),
+                "page_kind": page_kind,
+                "source_ids": source_ids,
+                "canonical_url": _text(
+                    value.get("canonical_url"), "canonical_url"
+                ),
+                "content_hash": _text(
+                    value.get("content_hash"), "content_hash"
+                ),
+                "parser_version": _text(
+                    value.get("parser_version"), "parser_version"
+                ),
+                "typed_parser_version": _text(
+                    value.get("typed_parser_version"),
+                    "typed_parser_version",
+                ),
+                "stateful_parser_version": _text(
+                    value.get("stateful_parser_version"),
+                    "stateful_parser_version",
+                ),
+                "evidence_class": _text(
+                    value.get("evidence_class"), "evidence_class"
+                ),
+            }
+        )
+    identities = (
+        [item["target_id"] for item in normalized],
+        [item["logical_refresh_id"] for item in normalized],
+    )
+    if any(len(items) != len(set(items)) for items in identities):
+        raise ValueError("replay control target identity is duplicate")
+    return normalized
 
 
 def _publication_metadata(
@@ -630,6 +733,82 @@ def _bronze_acceptance_evidence(
     if sum(normalized["route_counts"].values()) != normalized["cohort_size"]:
         raise StateConflict("route_counts do not match acceptance cohort")
     return normalized
+
+
+def _validated_replay_pipeline_metrics(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    evidence = dict(value)
+    required = {
+        "schema_version",
+        "control_run_id",
+        "schema",
+        "mode",
+        "elapsed_seconds",
+        "match_count",
+        "match_keys_sha256",
+        "statement_counts",
+        "artifact_sha256",
+    }
+    if set(evidence) != required:
+        raise ValueError("replay pipeline metrics fields are invalid")
+    if evidence.get("schema_version") != "fbref-pipeline-run-metrics-v1":
+        raise StateConflict("replay pipeline metrics schema is unsupported")
+    elapsed = evidence.get("elapsed_seconds")
+    if (
+        isinstance(elapsed, bool)
+        or not isinstance(elapsed, (int, float))
+        or not math.isfinite(float(elapsed))
+        or float(elapsed) <= 0
+    ):
+        raise ValueError("elapsed_seconds must be a positive finite number")
+    match_count = evidence.get("match_count")
+    if (
+        isinstance(match_count, bool)
+        or not isinstance(match_count, int)
+        or match_count < 1
+    ):
+        raise ValueError("match_count must be a positive integer")
+    counts = evidence.get("statement_counts")
+    if not isinstance(counts, Mapping) or set(counts) != {
+        "execute",
+        "execute_committing",
+    }:
+        raise ValueError("statement_counts are invalid")
+    normalized_counts = {}
+    for key in ("execute", "execute_committing"):
+        count = counts.get(key)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("statement_counts are invalid")
+        normalized_counts[key] = count
+    if sum(normalized_counts.values()) <= 0:
+        raise ValueError("statement_counts must prove at least one statement")
+    mode = str(evidence.get("mode") or "").strip().casefold()
+    if mode not in {"sequential", "batch"}:
+        raise ValueError("replay pipeline metrics mode is invalid")
+    core = {
+        "schema_version": "fbref-pipeline-run-metrics-v1",
+        "control_run_id": _uuid(
+            evidence.get("control_run_id"), "control_run_id"
+        ),
+        "schema": validate_identifier(
+            _text(evidence.get("schema"), "schema"), "schema"
+        ),
+        "mode": mode,
+        "elapsed_seconds": float(elapsed),
+        "match_count": match_count,
+        "match_keys_sha256": _sha256_hex(
+            evidence.get("match_keys_sha256"), "match_keys_sha256"
+        ),
+        "statement_counts": normalized_counts,
+    }
+    artifact_sha256 = hashlib.sha256(_json(core).encode("utf-8")).hexdigest()
+    supplied_sha256 = _sha256_hex(
+        evidence.get("artifact_sha256"), "artifact_sha256"
+    )
+    if supplied_sha256 != artifact_sha256:
+        raise StateConflict("replay pipeline metrics digest does not match")
+    return {**core, "artifact_sha256": artifact_sha256}
 
 
 def _row_dict(cursor: Any, row: Any) -> Optional[dict]:
@@ -2400,6 +2579,16 @@ class ControlStore:
             )
             if replay:
                 raw_audit = metadata.get("raw_audit")
+                pipeline_metrics_value = metadata.get("pipeline_run_metrics")
+                pipeline_metrics = (
+                    _validated_replay_pipeline_metrics(
+                        _json_mapping(
+                            pipeline_metrics_value, "pipeline_run_metrics"
+                        )
+                    )
+                    if pipeline_metrics_value is not None
+                    else None
+                )
                 if (
                     metadata.get("acceptance_replay") is not True
                     or metadata.get("publication_eligible") is not False
@@ -2411,6 +2600,18 @@ class ControlStore:
                     or str(raw_audit.get("status") or "").casefold()
                     != "passed"
                     or raw_audit.get("zero_delta_required") is not True
+                    or pipeline_metrics is None
+                    or pipeline_metrics["control_run_id"] != run
+                    or pipeline_metrics["schema"]
+                    != str(metadata.get("acceptance_trino_schema") or "")
+                    or pipeline_metrics["mode"]
+                    != str(
+                        metadata.get("acceptance_persistence_mode") or ""
+                    ).casefold()
+                    or normalized["strict_gates"].get(
+                        "pipeline_metrics_artifact_sha256"
+                    )
+                    != pipeline_metrics["artifact_sha256"]
                 ):
                     raise StateConflict(
                         f"Run {run} lacks strict acceptance replay prerequisites"
@@ -2452,6 +2653,480 @@ class ControlStore:
             if cursor.rowcount != 1:
                 raise StateConflict(f"Acceptance run {run} disappeared")
         return {**normalized, "idempotent": False}
+
+    def record_replay_control_effects(
+        self,
+        run_id: object,
+        evidence: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Anchor actual rollback-only replay control effects create-once."""
+
+        run = _uuid(run_id, "run_id")
+        normalized = normalize_replay_control_effects(evidence)
+        if normalized["control_run_id"] != run:
+            raise StateConflict(
+                "replay control effects do not belong to their control run"
+            )
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT status, run_type, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            row = _fetchone(cursor)
+            if (
+                row is None
+                or row["status"] != "running"
+                or row["run_type"] != "replay"
+            ):
+                raise StateConflict(
+                    f"Run {run} cannot anchor replay control effects"
+                )
+            metadata = _json_mapping(
+                row.get("metadata") or {}, "crawl run metadata"
+            )
+            if (
+                metadata.get("acceptance_replay") is not True
+                or _uuid(
+                    metadata.get("acceptance_replay_source_run_id"),
+                    "acceptance_replay_source_run_id",
+                )
+                != normalized["source_run_id"]
+                or str(
+                    metadata.get("acceptance_persistence_mode") or ""
+                ).casefold()
+                != normalized["mode"]
+            ):
+                raise StateConflict(
+                    f"Run {run} control effects differ from its replay profile"
+                )
+            installed_value = metadata.get(
+                "acceptance_replay_control_effects"
+            )
+            if installed_value is not None:
+                installed = normalize_replay_control_effects(
+                    _json_mapping(
+                        installed_value,
+                        "acceptance_replay_control_effects",
+                    )
+                )
+                if installed != normalized:
+                    raise StateConflict(
+                        f"Run {run} already has different replay control effects"
+                    )
+                return installed
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET metadata = metadata || %s::jsonb,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s
+                """,
+                (
+                    _json(
+                        {
+                            "acceptance_replay_control_effects": normalized
+                        }
+                    ),
+                    run,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(f"Acceptance run {run} disappeared")
+        return normalized
+
+    def get_replay_control_effects(
+        self, run_id: object
+    ) -> Optional[dict[str, Any]]:
+        """Read one validated run-bound actual control-effects artifact."""
+
+        run = _uuid(run_id, "run_id")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT metadata -> 'acceptance_replay_control_effects'
+                           AS effects
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                """,
+                (run,),
+            )
+            row = _fetchone(cursor)
+        if row is None:
+            raise StateConflict(f"Acceptance run {run} does not exist")
+        value = row.get("effects")
+        if value is None:
+            return None
+        return normalize_replay_control_effects(
+            _json_mapping(value, "acceptance_replay_control_effects")
+        )
+
+    @contextmanager
+    def replay_control_transaction(
+        self,
+        *,
+        replay_run_id: object,
+        source_run_id: object,
+        mode: object,
+        targets: Sequence[Mapping[str, Any]],
+    ):
+        """Run real ControlStore methods on clones, then always roll them back."""
+
+        replay_run = _uuid(replay_run_id, "replay_run_id")
+        source_run = _uuid(source_run_id, "source_run_id")
+        if replay_run == source_run:
+            raise ValueError("replay and source control runs must be distinct")
+        normalized_mode = _text(mode, "mode").casefold()
+        if normalized_mode not in {"sequential", "batch"}:
+            raise ValueError("replay control mode is invalid")
+        normalized_targets = _replay_control_targets(targets)
+        connection = self._connect()
+        cursor = self._cursor(connection)
+        replay_control = None
+        effects = None
+        try:
+            cursor.execute(
+                """
+                SELECT run_id, status, run_type, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id IN (%s, %s)
+                ORDER BY run_id
+                FOR SHARE
+                """,
+                (source_run, replay_run),
+            )
+            runs = {
+                str(row["run_id"]): row for row in _fetchall(cursor)
+            }
+            replay_row = runs.get(replay_run)
+            source_row = runs.get(source_run)
+            replay_metadata = (
+                {}
+                if replay_row is None
+                else _json_mapping(
+                    replay_row.get("metadata") or {},
+                    "replay crawl run metadata",
+                )
+            )
+            if (
+                source_row is None
+                or source_row["status"] != "succeeded"
+                or replay_row is None
+                or replay_row["status"] != "running"
+                or replay_row["run_type"] != "replay"
+                or replay_metadata.get("acceptance_replay") is not True
+                or _uuid(
+                    replay_metadata.get("acceptance_replay_source_run_id"),
+                    "acceptance_replay_source_run_id",
+                )
+                != source_run
+                or str(
+                    replay_metadata.get("acceptance_persistence_mode") or ""
+                ).casefold()
+                != normalized_mode
+            ):
+                raise StateConflict("replay control transaction profile is invalid")
+            cursor.execute(
+                """
+                WITH ranked_attempt AS (
+                    SELECT attempt.run_id, attempt.target_id,
+                           attempt.logical_refresh_id, attempt.content_hash,
+                           row_number() OVER (
+                               PARTITION BY attempt.target_id,
+                                            attempt.logical_refresh_id
+                               ORDER BY attempt.lease_epoch DESC,
+                                        attempt.attempt_number DESC,
+                                        attempt.attempt_id DESC
+                           ) AS attempt_rank
+                    FROM fbref_control.fetch_attempt AS attempt
+                    WHERE attempt.run_id = %s
+                      AND attempt.status = 'succeeded'
+                )
+                SELECT target.target_id, target.logical_refresh_id,
+                       frontier.page_kind, frontier.source_ids,
+                       frontier.canonical_url, attempt.content_hash
+                FROM fbref_control.run_target AS target
+                JOIN fbref_control.page_frontier AS frontier
+                  ON frontier.target_id = target.target_id
+                JOIN ranked_attempt AS attempt
+                  ON attempt.run_id = target.run_id
+                 AND attempt.target_id = target.target_id
+                 AND attempt.logical_refresh_id = target.logical_refresh_id
+                 AND attempt.attempt_rank = 1
+                WHERE target.run_id = %s
+                  AND frontier.page_kind = 'match'
+                ORDER BY target.ordinal, target.target_id
+                """,
+                (source_run, source_run),
+            )
+            source_targets = _fetchall(cursor)
+            if len(source_targets) != len(normalized_targets):
+                raise StateConflict(
+                    "replay control targets differ from the source match cohort"
+                )
+            for expected, actual in zip(normalized_targets, source_targets):
+                actual_source_ids = _json_mapping(
+                    actual.get("source_ids") or {}, "source target source_ids"
+                )
+                if (
+                    str(actual.get("target_id") or "")
+                    != expected["target_id"]
+                    or str(actual.get("logical_refresh_id") or "")
+                    != expected["logical_refresh_id"]
+                    or str(actual.get("page_kind") or "").casefold()
+                    != expected["page_kind"]
+                    or actual_source_ids != expected["source_ids"]
+                    or str(actual.get("canonical_url") or "")
+                    != expected["canonical_url"]
+                    or str(actual.get("content_hash") or "")
+                    != expected["content_hash"]
+                ):
+                    raise StateConflict(
+                        "replay control target differs from immutable source"
+                    )
+
+            replay_uuid = uuid.UUID(replay_run)
+            for target in normalized_targets:
+                replay_target = make_replay_control_target_id(
+                    replay_run, target["target_id"]
+                )
+                replay_refresh = make_replay_control_refresh_id(
+                    replay_run, target["logical_refresh_id"]
+                )
+                attempt_id = str(
+                    uuid.uuid5(
+                        replay_uuid,
+                        "fbref-acceptance-control-attempt:"
+                        + target["logical_refresh_id"],
+                    )
+                )
+                claim_token = str(
+                    uuid.uuid5(
+                        replay_uuid,
+                        "fbref-acceptance-control-fetch-token:"
+                        + target["logical_refresh_id"],
+                    )
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO fbref_control.page_frontier (
+                        target_id, source, page_kind, canonical_url,
+                        source_ids, refresh_policy, state, priority,
+                        lease_epoch, last_fetched_at, last_http_status,
+                        last_content_hash
+                    ) VALUES (
+                        %s, 'fbref', 'match', %s, %s::jsonb,
+                        'historical_once', 'fetched', 0, 1,
+                        clock_timestamp(), 200, %s
+                    )
+                    """,
+                    (
+                        replay_target,
+                        "https://acceptance.invalid/fbref-control/"
+                        f"{replay_run}/{target['ordinal']}",
+                        _json(target["source_ids"]),
+                        target["content_hash"],
+                    ),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO fbref_control.run_target (
+                        run_id, target_id, logical_refresh_id, ordinal, status
+                    ) VALUES (%s, %s, %s, %s, 'succeeded')
+                    """,
+                    (
+                        replay_run,
+                        replay_target,
+                        replay_refresh,
+                        target["ordinal"],
+                    ),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO fbref_control.fetch_attempt (
+                        attempt_id, run_id, target_id, logical_refresh_id,
+                        attempt_number, claim_token, lease_epoch, status,
+                        http_status, content_hash, raw_manifest_key,
+                        finished_at
+                    ) VALUES (
+                        %s, %s, %s, %s, 1, %s, 1, 'succeeded', 200, %s,
+                        %s, clock_timestamp()
+                    )
+                    """,
+                    (
+                        attempt_id,
+                        replay_run,
+                        replay_target,
+                        replay_refresh,
+                        claim_token,
+                        target["content_hash"],
+                        f"acceptance-replay-control://{replay_refresh}",
+                    ),
+                )
+            replay_control = _CursorBoundReplayControlStore(
+                base=self,
+                cursor=cursor,
+                replay_run_id=replay_run,
+                source_run_id=source_run,
+                mode=normalized_mode,
+                targets=normalized_targets,
+            )
+            replay_control._claim_all()
+            yield replay_control
+            effects = replay_control._capture_effects()
+        except BaseException:
+            connection.rollback()
+            raise
+        else:
+            connection.rollback()
+        finally:
+            cursor.close()
+            connection.close()
+        if replay_control is None or effects is None:  # pragma: no cover
+            raise ControlStoreError("replay control transaction produced no effects")
+        replay_control.effects = self.record_replay_control_effects(
+            replay_run, effects
+        )
+
+    def record_replay_pipeline_metrics(
+        self,
+        run_id: object,
+        *,
+        schema: object,
+        mode: object,
+        elapsed_seconds: object,
+        statement_counts: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically anchor metrics produced by the actual replay parser."""
+
+        run = _uuid(run_id, "run_id")
+        normalized_schema = validate_identifier(
+            _text(schema, "schema"), "schema"
+        )
+        normalized_mode = str(mode or "").strip().casefold()
+        if normalized_mode not in {"sequential", "batch"}:
+            raise ValueError("replay pipeline metrics mode is invalid")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT status, run_type, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            row = _fetchone(cursor)
+            if row is None or row["status"] != "running" or (
+                row["run_type"] != "replay"
+            ):
+                raise StateConflict(
+                    f"Run {run} cannot anchor replay pipeline metrics"
+                )
+            metadata = _json_mapping(
+                row.get("metadata") or {}, "crawl run metadata"
+            )
+            if (
+                metadata.get("acceptance_replay") is not True
+                or str(metadata.get("acceptance_trino_schema") or "")
+                != normalized_schema
+                or str(
+                    metadata.get("acceptance_persistence_mode") or ""
+                ).casefold()
+                != normalized_mode
+            ):
+                raise StateConflict(
+                    f"Run {run} metrics differ from its pinned replay profile"
+                )
+            source_run = _uuid(
+                metadata.get("acceptance_replay_source_run_id"),
+                "acceptance_replay_source_run_id",
+            )
+            installed_value = metadata.get("pipeline_run_metrics")
+            if installed_value is not None:
+                installed = _validated_replay_pipeline_metrics(
+                    _json_mapping(
+                        installed_value, "pipeline_run_metrics"
+                    )
+                )
+                if (
+                    installed["control_run_id"] != run
+                    or installed["schema"] != normalized_schema
+                    or installed["mode"] != normalized_mode
+                ):
+                    raise StateConflict(
+                        f"Run {run} already has different replay metrics"
+                    )
+                return {**installed, "idempotent": True}
+            cursor.execute(
+                """
+                SELECT target.target_id,
+                       frontier.source_ids ->> 'match_id' AS match_id
+                FROM fbref_control.run_target AS target
+                JOIN fbref_control.page_frontier AS frontier
+                  ON frontier.target_id = target.target_id
+                WHERE target.run_id = %s
+                  AND frontier.page_kind = 'match'
+                ORDER BY match_id, target.target_id
+                """,
+                (source_run,),
+            )
+            match_keys = []
+            for target in _fetchall(cursor):
+                target_id = str(target.get("target_id") or "")
+                match_id = str(target.get("match_id") or "")
+                if target_id != f"fbref:match:{match_id}" or not match_id:
+                    raise StateConflict(
+                        f"Run {run} has an invalid match target key"
+                    )
+                match_keys.append(match_id)
+            if not match_keys or len(match_keys) != len(set(match_keys)):
+                raise StateConflict(
+                    f"Run {run} has no unique replay match cohort"
+                )
+            match_keys.sort()
+            encoded_keys = json.dumps(
+                match_keys,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            core = {
+                "schema_version": "fbref-pipeline-run-metrics-v1",
+                "control_run_id": run,
+                "schema": normalized_schema,
+                "mode": normalized_mode,
+                "elapsed_seconds": elapsed_seconds,
+                "match_count": len(match_keys),
+                "match_keys_sha256": hashlib.sha256(
+                    encoded_keys
+                ).hexdigest(),
+                "statement_counts": dict(statement_counts),
+            }
+            anchored = _validated_replay_pipeline_metrics(
+                {
+                    **core,
+                    "artifact_sha256": hashlib.sha256(
+                        _json(core).encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET metadata = metadata || %s::jsonb,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s
+                """,
+                (_json({"pipeline_run_metrics": anchored}), run),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(f"Acceptance run {run} disappeared")
+        return {**anchored, "idempotent": False}
 
     def seal_raw_fetch_attempts(self, run_id: object) -> dict[str, Any]:
         """Freeze and fingerprint the successful-attempt set before audit.
@@ -2753,6 +3428,208 @@ class ControlStore:
             if settled is None:
                 raise StateConflict(f"Reservation {reservation} lost settlement race")
             return _budget_from_row(settled)
+
+    def reserve_clearance_session_tail(
+        self,
+        run_id: object,
+        session_id: object,
+        *,
+        bytes_reserved: int,
+        baseline_provider_bytes: int,
+    ) -> dict:
+        """Reserve a retry-stable zero-request allowance for one session tail.
+
+        The run row serializes orphan detection with all later persistent
+        settlement paths.  A process may never open a second paid session
+        while another tail is still unresolved.
+        """
+
+        run = _uuid(run_id, "run_id")
+        session = _uuid(session_id, "session_id")
+        byte_count = _non_negative(bytes_reserved, "bytes_reserved")
+        if byte_count == 0:
+            raise ValueError("bytes_reserved must be positive")
+        baseline = _non_negative(
+            baseline_provider_bytes, "baseline_provider_bytes"
+        )
+        reservation = make_clearance_tail_reservation_id(session)
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.crawl_run
+                WHERE run_id = %s FOR UPDATE
+                """,
+                (run,),
+            )
+            crawl_run = _fetchone(cursor)
+            if crawl_run is None or crawl_run["status"] != "running":
+                raise StateConflict(f"Run {run} is not running")
+
+            cursor.execute(
+                """
+                SELECT session_id
+                FROM fbref_control.clearance_session
+                WHERE run_id = %s AND status = 'active'
+                  AND session_id <> %s
+                ORDER BY session_id
+                LIMIT 1
+                """,
+                (run, session),
+            )
+            active_predecessor = _fetchone(cursor)
+            if active_predecessor is not None:
+                raise StateConflict(
+                    "Another persistent clearance session is still active "
+                    f"for run {run}"
+                )
+
+            # Discovery is safe under the already-held run lock: every writer
+            # of a tail for this run takes that same lock first.
+            cursor.execute(
+                """
+                SELECT session_id
+                FROM fbref_control.clearance_session_tail_reservation
+                WHERE run_id = %s AND status = 'reserved'
+                  AND session_id <> %s
+                ORDER BY session_id
+                LIMIT 1
+                """,
+                (run, session),
+            )
+            orphan = _fetchone(cursor)
+            if orphan is not None:
+                raise StateConflict(
+                    "Another persistent clearance tail is unresolved for run "
+                    f"{run}"
+                )
+
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.budget_reservation
+                WHERE reservation_id = %s FOR UPDATE
+                """,
+                (reservation,),
+            )
+            budget_row = _fetchone(cursor)
+            cursor.execute(
+                """
+                SELECT run_id, status
+                FROM fbref_control.clearance_session
+                WHERE session_id = %s FOR UPDATE
+                """,
+                (session,),
+            )
+            clearance = _fetchone(cursor)
+            cursor.execute(
+                """
+                SELECT *
+                FROM fbref_control.clearance_session_tail_reservation
+                WHERE session_id = %s FOR UPDATE
+                """,
+                (session,),
+            )
+            tail = _fetchone(cursor)
+            clearance_run = (
+                None
+                if clearance is None or clearance["run_id"] is None
+                else str(clearance["run_id"])
+            )
+            exact_terminal_retry = bool(
+                clearance is not None
+                and tail is not None
+                and budget_row is not None
+                and tail["status"] == "settled"
+                and budget_row["status"] == "settled"
+            )
+            if (
+                clearance is None
+                or clearance_run != run
+                or (
+                    clearance["status"] != "active"
+                    and not exact_terminal_retry
+                )
+            ):
+                raise StateConflict(
+                    f"Clearance session {session} is not active for run {run}"
+                )
+
+            if budget_row is None:
+                projected_bytes = (
+                    int(crawl_run["bytes_used"])
+                    + int(crawl_run["bytes_reserved"])
+                    + byte_count
+                )
+                if projected_bytes > int(crawl_run["byte_limit"]):
+                    raise BudgetExceeded(
+                        f"Run {run} budget cannot reserve {byte_count} tail bytes"
+                    )
+                cursor.execute(
+                    """
+                    INSERT INTO fbref_control.budget_reservation (
+                        reservation_id, run_id, logical_refresh_id,
+                        requests_reserved, bytes_reserved
+                    ) VALUES (%s, %s, %s, 0, %s)
+                    RETURNING *
+                    """,
+                    (reservation, run, session, byte_count),
+                )
+                budget_row = _fetchone(cursor)
+                if budget_row is None:
+                    raise ControlStoreError(
+                        "Tail budget reservation insert returned no row"
+                    )
+                cursor.execute(
+                    """
+                    UPDATE fbref_control.crawl_run
+                    SET bytes_reserved = bytes_reserved + %s,
+                        updated_at = clock_timestamp()
+                    WHERE run_id = %s
+                    """,
+                    (byte_count, run),
+                )
+                if cursor.rowcount != 1:
+                    raise StateConflict(
+                        f"Run {run} lost tail reservation update"
+                    )
+            else:
+                installed = _budget_from_row(budget_row)
+                if (
+                    installed.run_id != run
+                    or installed.logical_refresh_id != session
+                    or installed.requests_reserved != 0
+                    or installed.bytes_reserved != byte_count
+                ):
+                    raise StateConflict(
+                        f"Session {session} has a different tail reservation"
+                    )
+
+            if tail is None:
+                cursor.execute(
+                    """
+                    INSERT INTO
+                        fbref_control.clearance_session_tail_reservation (
+                        session_id, run_id, reservation_id,
+                        baseline_provider_bytes, bytes_reserved
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    RETURNING *
+                    """,
+                    (session, run, reservation, baseline, byte_count),
+                )
+                tail = _fetchone(cursor)
+                if tail is None:
+                    raise ControlStoreError(
+                        "Tail reservation evidence insert returned no row"
+                    )
+            elif (
+                str(tail["run_id"]) != run
+                or str(tail["reservation_id"]) != reservation
+                or int(tail["baseline_provider_bytes"]) != baseline
+                or int(tail["bytes_reserved"]) != byte_count
+            ):
+                raise StateConflict(
+                    f"Session {session} has different tail evidence"
+                )
+            return dict(tail)
 
     def create_registry_snapshot(
         self,
@@ -5811,14 +6688,13 @@ class ControlStore:
                 # Abort bookkeeping stamps in-flight attempts with the classes
                 # below (#1102).  They are deliberate run-lifecycle evidence,
                 # not unclassified surprises — without them here a resumed run
-                # was branded red by the accounting of its own abort (one
-                # stamped attempt over a 200-request profile is exactly the
-                # 0.005 gate threshold).
+                # was branded red by the accounting of its own abort.
                 "AirflowDagFailure",
                 "RunAborted",
                 "LiveWavesSubprocessTimeout",
                 "LiveWavesSubprocessFailure",
                 "LiveWavesResultMissing",
+                "LiveWavesExternalInterruption",
             ]
             cursor.execute(
                 """
@@ -6350,6 +7226,42 @@ class ControlStore:
                           )
                           AND observed.validation_status = 'succeeded'
                       )
+                      AND NOT (
+                        EXISTS (
+                          SELECT 1
+                          FROM fbref_control.observation_processing
+                               AS failed_observed
+                          WHERE failed_observed.logical_refresh_id =
+                                attempt.logical_refresh_id
+                            AND failed_observed.parser_version = %s
+                            AND failed_observed.typed_parser_version = %s
+                            AND failed_observed.stateful_parser_version = %s
+                            AND failed_observed.status = 'failed'
+                        )
+                        AND EXISTS (
+                          SELECT 1
+                          FROM fbref_control.fetch_attempt AS newer_attempt
+                          JOIN fbref_control.observation_processing
+                               AS newer_observed
+                            ON newer_observed.logical_refresh_id =
+                               newer_attempt.logical_refresh_id
+                          WHERE newer_attempt.target_id = attempt.target_id
+                            AND newer_attempt.lease_epoch > attempt.lease_epoch
+                            AND newer_attempt.status = 'succeeded'
+                            AND newer_observed.parser_version = %s
+                            AND newer_observed.typed_parser_version = %s
+                            AND newer_observed.stateful_parser_version = %s
+                            AND newer_observed.status = 'succeeded'
+                            AND newer_observed.generic_status = 'succeeded'
+                            AND newer_observed.typed_status IN (
+                                'succeeded', 'skipped'
+                            )
+                            AND newer_observed.stateful_status IN (
+                                'succeeded', 'skipped'
+                            )
+                            AND newer_observed.validation_status = 'succeeded'
+                        )
+                      )
                     )
                   )
                 GROUP BY frontier.page_kind
@@ -6361,6 +7273,12 @@ class ControlStore:
                     run,
                     parser,
                     parser,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
                     parser,
                     typed_parser,
                     stateful_parser,
@@ -7092,6 +8010,42 @@ class ControlStore:
                       )
                       AND observed.validation_status = 'succeeded'
                   )
+                  AND NOT (
+                    EXISTS (
+                      SELECT 1
+                      FROM fbref_control.observation_processing
+                           AS failed_observed
+                      WHERE failed_observed.logical_refresh_id =
+                            attempt.logical_refresh_id
+                        AND failed_observed.parser_version = %s
+                        AND failed_observed.typed_parser_version = %s
+                        AND failed_observed.stateful_parser_version = %s
+                        AND failed_observed.status = 'failed'
+                    )
+                    AND EXISTS (
+                      SELECT 1
+                      FROM fbref_control.fetch_attempt AS newer_attempt
+                      JOIN fbref_control.observation_processing
+                           AS newer_observed
+                        ON newer_observed.logical_refresh_id =
+                           newer_attempt.logical_refresh_id
+                      WHERE newer_attempt.target_id = attempt.target_id
+                        AND newer_attempt.lease_epoch > attempt.lease_epoch
+                        AND newer_attempt.status = 'succeeded'
+                        AND newer_observed.parser_version = %s
+                        AND newer_observed.typed_parser_version = %s
+                        AND newer_observed.stateful_parser_version = %s
+                        AND newer_observed.status = 'succeeded'
+                        AND newer_observed.generic_status = 'succeeded'
+                        AND newer_observed.typed_status IN (
+                            'succeeded', 'skipped'
+                        )
+                        AND newer_observed.stateful_status IN (
+                            'succeeded', 'skipped'
+                        )
+                        AND newer_observed.validation_status = 'succeeded'
+                    )
+                  )
                 ORDER BY COALESCE(
                     attempt.finished_at, attempt.started_at
                 ), attempt.attempt_id
@@ -7101,6 +8055,12 @@ class ControlStore:
                     _text(source, "source"),
                     kinds,
                     kinds,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
+                    parser,
+                    typed_parser,
+                    stateful_parser,
                     parser,
                     typed_parser,
                     stateful_parser,
@@ -7808,15 +8768,56 @@ class ControlStore:
             cursor.execute(
                 """
                 SELECT * FROM fbref_control.budget_reservation
-                WHERE run_id = %s AND status = 'reserved'
+                WHERE run_id = %s
                 ORDER BY reservation_id
                 FOR UPDATE
                 """,
                 (run,),
             )
             reserved_rows = _fetchall(cursor)
+            cursor.execute(
+                """
+                SELECT session_id
+                FROM fbref_control.clearance_session
+                WHERE run_id = %s
+                ORDER BY session_id
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            _fetchall(cursor)
+            cursor.execute(
+                """
+                SELECT session_id
+                FROM fbref_control.clearance_session_tail_reservation
+                WHERE run_id = %s
+                ORDER BY session_id
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            _fetchall(cursor)
+            cursor.execute(
+                """
+                SELECT reservation_id
+                FROM fbref_control.clearance_session_page_accounting
+                WHERE run_id = %s
+                ORDER BY reservation_id
+                FOR UPDATE
+                """,
+                (run,),
+            )
+            _fetchall(cursor)
             reservations_settled = self._settle_reserved_rows_conservatively(
                 cursor, reserved_rows
+            )
+            cursor.execute(
+                """
+                UPDATE fbref_control.clearance_session_tail_reservation
+                SET status = 'aborted'
+                WHERE run_id = %s AND status = 'reserved'
+                """,
+                (run,),
             )
             cursor.execute(
                 """
@@ -8784,6 +9785,30 @@ class ControlStore:
         session = _uuid(session_id or uuid.uuid4(), "session_id")
         run = None if run_id is None else _uuid(run_id, "run_id")
         with self._transaction() as cursor:
+            if run is not None:
+                # Run-first is the global lock order for paid FBref work.
+                # Without this fence, abort_run could scan/close sessions,
+                # commit `failed`, and a concurrent opener could insert a new
+                # active session immediately afterward through the FK.
+                cursor.execute(
+                    """
+                    SELECT status FROM fbref_control.crawl_run
+                    WHERE run_id = %s
+                    FOR UPDATE
+                    """,
+                    (run,),
+                )
+                locked_run = _fetchone(cursor)
+                if locked_run is None or locked_run["status"] != "running":
+                    installed_status = (
+                        "missing"
+                        if locked_run is None
+                        else str(locked_run["status"])
+                    )
+                    raise StateConflict(
+                        f"Run {run} must be running before opening a "
+                        f"clearance session (status={installed_status})"
+                    )
             cursor.execute(
                 """
                 INSERT INTO fbref_control.clearance_session (
@@ -8824,6 +9849,353 @@ class ControlStore:
             ):
                 raise StateConflict(f"session_id {session} has different evidence")
         return session
+
+    def settle_clearance_session_page(
+        self,
+        session_id: object,
+        reservation_id: object,
+        *,
+        attempt_id: object,
+        requests_used: int,
+        provider_billed_bytes: int,
+        browser_bootstrap_attempts: int = 0,
+        browser_bootstrap_requests: int = 0,
+        browser_document_bytes: int = 0,
+        browser_asset_bytes: int = 0,
+        browser_unobserved_bytes: int = 0,
+        http_requests: int = 0,
+        http_wire_bytes: int = 0,
+        decoded_html_bytes: int = 0,
+        compressed_raw_bytes: int = 0,
+    ) -> dict:
+        """Install page evidence and settle its budget exactly once."""
+
+        session = _uuid(session_id, "session_id")
+        reservation = _uuid(reservation_id, "reservation_id")
+        attempt = _uuid(attempt_id, "attempt_id")
+        values = {
+            "requests_used": _non_negative(requests_used, "requests_used"),
+            "browser_bootstrap_attempts": _non_negative(
+                browser_bootstrap_attempts, "browser_bootstrap_attempts"
+            ),
+            "browser_bootstrap_requests": _non_negative(
+                browser_bootstrap_requests, "browser_bootstrap_requests"
+            ),
+            "browser_document_bytes": _non_negative(
+                browser_document_bytes, "browser_document_bytes"
+            ),
+            "browser_asset_bytes": _non_negative(
+                browser_asset_bytes, "browser_asset_bytes"
+            ),
+            "browser_unobserved_bytes": _non_negative(
+                browser_unobserved_bytes, "browser_unobserved_bytes"
+            ),
+            "http_requests": _non_negative(http_requests, "http_requests"),
+            "http_wire_bytes": _non_negative(
+                http_wire_bytes, "http_wire_bytes"
+            ),
+            "decoded_html_bytes": _non_negative(
+                decoded_html_bytes, "decoded_html_bytes"
+            ),
+            "compressed_raw_bytes": _non_negative(
+                compressed_raw_bytes, "compressed_raw_bytes"
+            ),
+            "provider_billed_bytes": _non_negative(
+                provider_billed_bytes, "provider_billed_bytes"
+            ),
+        }
+        if values["requests_used"] != (
+            values["browser_bootstrap_requests"] + values["http_requests"]
+        ):
+            raise ValueError(
+                "requests_used must equal browser plus HTTP requests"
+            )
+        immutable = {
+            "session_id": session,
+            "reservation_id": reservation,
+            "attempt_id": attempt,
+            **values,
+        }
+        digest = _evidence_sha256(immutable)
+
+        with self._transaction() as cursor:
+            # Discover only; every mutation below follows the global lock order.
+            cursor.execute(
+                """
+                SELECT run_id
+                FROM fbref_control.budget_reservation
+                WHERE reservation_id = %s
+                """,
+                (reservation,),
+            )
+            discovered = _fetchone(cursor)
+            if discovered is None:
+                raise StateConflict(f"Unknown budget reservation {reservation}")
+            run = str(discovered["run_id"])
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.crawl_run
+                WHERE run_id = %s FOR UPDATE
+                """,
+                (run,),
+            )
+            crawl_run = _fetchone(cursor)
+            if crawl_run is None:
+                raise StateConflict(f"Unknown run {run}")
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.budget_reservation
+                WHERE reservation_id = %s FOR UPDATE
+                """,
+                (reservation,),
+            )
+            budget_row = _fetchone(cursor)
+            if budget_row is None or str(budget_row["run_id"]) != run:
+                raise StateConflict(
+                    f"Reservation {reservation} changed owning run"
+                )
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.clearance_session
+                WHERE session_id = %s FOR UPDATE
+                """,
+                (session,),
+            )
+            clearance = _fetchone(cursor)
+            if clearance is None or str(clearance.get("run_id")) != run:
+                raise StateConflict(
+                    f"Clearance session {session} belongs to another run"
+                )
+            cursor.execute(
+                """
+                SELECT *
+                FROM fbref_control.clearance_session_tail_reservation
+                WHERE session_id = %s FOR UPDATE
+                """,
+                (session,),
+            )
+            tail = _fetchone(cursor)
+            if tail is None or str(tail["run_id"]) != run:
+                raise StateConflict(
+                    f"Clearance session {session} has no tail reservation"
+                )
+
+            cursor.execute(
+                """
+                SELECT reservation_id, session_id, run_id, attempt_id,
+                       evidence_sha256
+                FROM fbref_control.clearance_session_page_accounting
+                WHERE reservation_id = %s OR attempt_id = %s
+                ORDER BY reservation_id
+                FOR UPDATE
+                """,
+                (reservation, attempt),
+            )
+            installed_rows = _fetchall(cursor)
+            if installed_rows:
+                if len(installed_rows) != 1:
+                    raise StateConflict("Persistent page evidence is duplicated")
+                installed = installed_rows[0]
+                if (
+                    str(installed["reservation_id"]) != reservation
+                    or str(installed["session_id"]) != session
+                    or str(installed["run_id"]) != run
+                    or str(installed["attempt_id"]) != attempt
+                    or str(installed["evidence_sha256"]) != digest
+                    or str(budget_row["status"]) != "settled"
+                    or int(budget_row["requests_used"]) != values["requests_used"]
+                    or int(budget_row["bytes_used"])
+                    != values["provider_billed_bytes"]
+                ):
+                    raise StateConflict(
+                        f"Reservation {reservation} was settled differently"
+                    )
+                page_over_reservation = (
+                    values["requests_used"]
+                    > int(budget_row["requests_reserved"])
+                    or values["provider_billed_bytes"]
+                    > int(budget_row["bytes_reserved"])
+                )
+                return {
+                    **immutable,
+                    "run_id": run,
+                    "evidence_sha256": digest,
+                    "idempotent": True,
+                    "budget_exceeded": bool(crawl_run["budget_exceeded"]),
+                    "budget_exceeded_before_page": None,
+                    "budget_exceeded_by_page": False,
+                    "page_over_reservation": page_over_reservation,
+                }
+
+            if clearance["status"] != "active" or tail["status"] != "reserved":
+                raise StateConflict(
+                    f"Clearance session {session} is not open for page settlement"
+                )
+            if budget_row["status"] != "reserved":
+                raise StateConflict(
+                    f"Reservation {reservation} has no page evidence"
+                )
+            budget_exceeded_before_page = bool(
+                crawl_run["budget_exceeded"]
+            )
+            page_over_reservation = (
+                values["requests_used"]
+                > int(budget_row["requests_reserved"])
+                or values["provider_billed_bytes"]
+                > int(budget_row["bytes_reserved"])
+            )
+            cursor.execute(
+                """
+                SELECT run_id, reservation_id
+                FROM fbref_control.fetch_attempt
+                WHERE attempt_id = %s
+                """,
+                (attempt,),
+            )
+            attempt_row = _fetchone(cursor)
+            if (
+                attempt_row is None
+                or str(attempt_row["run_id"]) != run
+                or str(attempt_row.get("reservation_id")) != reservation
+            ):
+                raise StateConflict(
+                    f"Attempt {attempt} is not bound to reservation {reservation}"
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO fbref_control.clearance_session_page_accounting (
+                    reservation_id, session_id, run_id, attempt_id,
+                    requests_used, browser_bootstrap_attempts,
+                    browser_bootstrap_requests, browser_document_bytes,
+                    browser_asset_bytes, browser_unobserved_bytes,
+                    http_requests, http_wire_bytes, decoded_html_bytes,
+                    compressed_raw_bytes, provider_billed_bytes,
+                    evidence_sha256
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                """,
+                (
+                    reservation,
+                    session,
+                    run,
+                    attempt,
+                    values["requests_used"],
+                    values["browser_bootstrap_attempts"],
+                    values["browser_bootstrap_requests"],
+                    values["browser_document_bytes"],
+                    values["browser_asset_bytes"],
+                    values["browser_unobserved_bytes"],
+                    values["http_requests"],
+                    values["http_wire_bytes"],
+                    values["decoded_html_bytes"],
+                    values["compressed_raw_bytes"],
+                    values["provider_billed_bytes"],
+                    digest,
+                ),
+            )
+            cursor.execute(
+                """
+                UPDATE fbref_control.budget_reservation
+                SET status = 'settled', requests_used = %s, bytes_used = %s,
+                    settled_at = clock_timestamp()
+                WHERE reservation_id = %s AND status = 'reserved'
+                """,
+                (
+                    values["requests_used"],
+                    values["provider_billed_bytes"],
+                    reservation,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(
+                    f"Reservation {reservation} lost page settlement race"
+                )
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET requests_reserved = requests_reserved - %s,
+                    bytes_reserved = bytes_reserved - %s,
+                    requests_used = requests_used + %s,
+                    bytes_used = bytes_used + %s,
+                    budget_exceeded = budget_exceeded
+                        OR requests_used + %s > request_limit
+                        OR bytes_used + %s > byte_limit,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s
+                  AND requests_reserved >= %s
+                  AND bytes_reserved >= %s
+                RETURNING budget_exceeded
+                """,
+                (
+                    int(budget_row["requests_reserved"]),
+                    int(budget_row["bytes_reserved"]),
+                    values["requests_used"],
+                    values["provider_billed_bytes"],
+                    values["requests_used"],
+                    values["provider_billed_bytes"],
+                    run,
+                    int(budget_row["requests_reserved"]),
+                    int(budget_row["bytes_reserved"]),
+                ),
+            )
+            run_after = _fetchone(cursor)
+            if run_after is None:
+                raise StateConflict(f"Run {run} disappeared during settlement")
+            cursor.execute(
+                """
+                UPDATE fbref_control.clearance_session
+                SET browser_bootstrap_attempts =
+                        browser_bootstrap_attempts + %s,
+                    browser_bootstrap_requests =
+                        browser_bootstrap_requests + %s,
+                    browser_document_bytes = browser_document_bytes + %s,
+                    browser_asset_bytes = browser_asset_bytes + %s,
+                    browser_unobserved_bytes =
+                        browser_unobserved_bytes + %s,
+                    http_requests = http_requests + %s,
+                    http_wire_bytes = http_wire_bytes + %s,
+                    decoded_html_bytes = decoded_html_bytes + %s,
+                    compressed_raw_bytes = compressed_raw_bytes + %s
+                WHERE session_id = %s AND status = 'active'
+                """,
+                (
+                    values["browser_bootstrap_attempts"],
+                    values["browser_bootstrap_requests"],
+                    values["browser_document_bytes"],
+                    values["browser_asset_bytes"],
+                    values["browser_unobserved_bytes"],
+                    values["http_requests"],
+                    values["http_wire_bytes"],
+                    values["decoded_html_bytes"],
+                    values["compressed_raw_bytes"],
+                    session,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(
+                    f"Clearance session {session} lost page settlement race"
+                )
+            budget_exceeded_after_page = bool(
+                run_after["budget_exceeded"]
+            )
+            return {
+                **immutable,
+                "run_id": run,
+                "evidence_sha256": digest,
+                "idempotent": False,
+                "budget_exceeded": budget_exceeded_after_page,
+                "budget_exceeded_before_page": (
+                    budget_exceeded_before_page
+                ),
+                "budget_exceeded_by_page": (
+                    not budget_exceeded_before_page
+                    and budget_exceeded_after_page
+                ),
+                "page_over_reservation": page_over_reservation,
+            }
 
     def record_session_metrics(
         self,
@@ -8889,6 +10261,412 @@ class ControlStore:
             if row is None:
                 raise StateConflict(f"Clearance session {session} is not active")
             return row
+
+    def settle_clearance_session_tail(
+        self,
+        session_id: object,
+        receipt: object,
+    ) -> dict:
+        """Install one strict-close receipt and settle its exact tail once."""
+
+        session = _uuid(session_id, "session_id")
+        names = (
+            "session_id",
+            "meter",
+            "baseline_provider_bytes",
+            "page_provider_bytes",
+            "authoritative_provider_bytes",
+            "tail_provider_bytes",
+        )
+        if isinstance(receipt, Mapping):
+            supplied = {name: receipt.get(name) for name in names}
+        else:
+            supplied = {name: getattr(receipt, name, None) for name in names}
+        if _uuid(supplied["session_id"], "receipt.session_id") != session:
+            raise StateConflict("Persistent receipt belongs to another session")
+        if str(supplied["meter"] or "") != "proxy_filter_provider_path_v2":
+            raise StateConflict("Persistent receipt has an unsupported meter")
+        values = {
+            name: _non_negative(supplied[name], name)
+            for name in names[2:]
+        }
+        if values["authoritative_provider_bytes"] != (
+            values["page_provider_bytes"] + values["tail_provider_bytes"]
+        ):
+            raise StateConflict("Persistent receipt byte equation is invalid")
+        immutable = {
+            "session_id": session,
+            "meter": "proxy_filter_provider_path_v2",
+            **values,
+        }
+        digest = _evidence_sha256(immutable)
+
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT run_id, reservation_id
+                FROM fbref_control.clearance_session_tail_reservation
+                WHERE session_id = %s
+                """,
+                (session,),
+            )
+            discovered = _fetchone(cursor)
+            if discovered is None:
+                raise StateConflict(
+                    f"Clearance session {session} has no tail reservation"
+                )
+            run = str(discovered["run_id"])
+            reservation = str(discovered["reservation_id"])
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.crawl_run
+                WHERE run_id = %s FOR UPDATE
+                """,
+                (run,),
+            )
+            crawl_run = _fetchone(cursor)
+            if crawl_run is None:
+                raise StateConflict(f"Unknown run {run}")
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.budget_reservation
+                WHERE reservation_id = %s FOR UPDATE
+                """,
+                (reservation,),
+            )
+            budget_row = _fetchone(cursor)
+            cursor.execute(
+                """
+                SELECT * FROM fbref_control.clearance_session
+                WHERE session_id = %s FOR UPDATE
+                """,
+                (session,),
+            )
+            clearance = _fetchone(cursor)
+            cursor.execute(
+                """
+                SELECT *
+                FROM fbref_control.clearance_session_tail_reservation
+                WHERE session_id = %s FOR UPDATE
+                """,
+                (session,),
+            )
+            tail = _fetchone(cursor)
+            if (
+                budget_row is None
+                or clearance is None
+                or tail is None
+                or str(budget_row["run_id"]) != run
+                or str(clearance.get("run_id")) != run
+                or str(tail["run_id"]) != run
+                or str(tail["reservation_id"]) != reservation
+            ):
+                raise StateConflict(
+                    f"Clearance session {session} tail ownership changed"
+                )
+            cursor.execute(
+                """
+                SELECT reservation_id, provider_billed_bytes
+                FROM fbref_control.clearance_session_page_accounting
+                WHERE session_id = %s
+                ORDER BY reservation_id
+                FOR UPDATE
+                """,
+                (session,),
+            )
+            pages = _fetchall(cursor)
+            durable_page_sum = sum(
+                int(row["provider_billed_bytes"]) for row in pages
+            )
+            if durable_page_sum != values["page_provider_bytes"]:
+                raise StateConflict(
+                    "Persistent receipt page sum differs from durable evidence"
+                )
+            if int(tail["baseline_provider_bytes"]) != values[
+                "baseline_provider_bytes"
+            ]:
+                raise StateConflict(
+                    "Persistent receipt baseline differs from reservation"
+                )
+
+            if tail["status"] == "settled":
+                if (
+                    budget_row["status"] != "settled"
+                    or int(budget_row["requests_used"]) != 0
+                    or int(budget_row["bytes_used"])
+                    != values["tail_provider_bytes"]
+                    or int(tail["page_provider_bytes"])
+                    != values["page_provider_bytes"]
+                    or int(tail["authoritative_provider_bytes"])
+                    != values["authoritative_provider_bytes"]
+                    or int(tail["tail_provider_bytes"])
+                    != values["tail_provider_bytes"]
+                    or str(tail["settlement_sha256"]) != digest
+                    or int(clearance["provider_billed_bytes"])
+                    != values["authoritative_provider_bytes"]
+                ):
+                    raise StateConflict(
+                        f"Clearance session {session} tail was settled differently"
+                    )
+                tail_over_reservation = (
+                    values["tail_provider_bytes"]
+                    > int(budget_row["bytes_reserved"])
+                )
+                return {
+                    **immutable,
+                    "run_id": run,
+                    "reservation_id": reservation,
+                    "settlement_sha256": digest,
+                    "idempotent": True,
+                    "budget_exceeded_before_tail": None,
+                    "budget_exceeded_by_tail": False,
+                    "tail_over_reservation": tail_over_reservation,
+                    "terminal": (
+                        bool(crawl_run["budget_exceeded"])
+                        or tail_over_reservation
+                    ),
+                }
+            if tail["status"] != "reserved":
+                raise StateConflict(
+                    f"Clearance session {session} tail is not settleable"
+                )
+            if clearance["status"] != "active":
+                raise StateConflict(
+                    f"Clearance session {session} closed before exact settlement"
+                )
+            if budget_row["status"] != "reserved":
+                raise StateConflict(
+                    f"Tail reservation {reservation} was settled without evidence"
+                )
+
+            budget_exceeded_before_tail = bool(
+                crawl_run["budget_exceeded"]
+            )
+            tail_over_reservation = (
+                values["tail_provider_bytes"]
+                > int(budget_row["bytes_reserved"])
+            )
+            cursor.execute(
+                """
+                UPDATE fbref_control.budget_reservation
+                SET status = 'settled', requests_used = 0, bytes_used = %s,
+                    settled_at = clock_timestamp()
+                WHERE reservation_id = %s AND status = 'reserved'
+                """,
+                (values["tail_provider_bytes"], reservation),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(
+                    f"Tail reservation {reservation} lost settlement race"
+                )
+            cursor.execute(
+                """
+                UPDATE fbref_control.crawl_run
+                SET bytes_reserved = bytes_reserved - %s,
+                    bytes_used = bytes_used + %s,
+                    budget_exceeded = budget_exceeded
+                        OR bytes_used + %s > byte_limit,
+                    updated_at = clock_timestamp()
+                WHERE run_id = %s
+                  AND bytes_reserved >= %s
+                RETURNING budget_exceeded
+                """,
+                (
+                    int(budget_row["bytes_reserved"]),
+                    values["tail_provider_bytes"],
+                    values["tail_provider_bytes"],
+                    run,
+                    int(budget_row["bytes_reserved"]),
+                ),
+            )
+            run_after = _fetchone(cursor)
+            if run_after is None:
+                raise StateConflict(f"Run {run} disappeared during tail settlement")
+            cursor.execute(
+                """
+                UPDATE fbref_control.clearance_session
+                SET provider_billed_bytes = %s
+                WHERE session_id = %s AND status = 'active'
+                  AND provider_billed_bytes IS NULL
+                """,
+                (values["authoritative_provider_bytes"], session),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(
+                    f"Clearance session {session} lost final counter settlement"
+                )
+            cursor.execute(
+                """
+                UPDATE fbref_control.clearance_session_tail_reservation
+                SET status = 'settled', page_provider_bytes = %s,
+                    authoritative_provider_bytes = %s,
+                    tail_provider_bytes = %s, settlement_sha256 = %s,
+                    settled_at = clock_timestamp()
+                WHERE session_id = %s AND status = 'reserved'
+                """,
+                (
+                    values["page_provider_bytes"],
+                    values["authoritative_provider_bytes"],
+                    values["tail_provider_bytes"],
+                    digest,
+                    session,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StateConflict(
+                    f"Clearance session {session} lost tail evidence settlement"
+                )
+            budget_exceeded_after_tail = bool(
+                run_after["budget_exceeded"]
+            )
+            budget_exceeded_by_tail = (
+                not budget_exceeded_before_tail
+                and budget_exceeded_after_tail
+            )
+            return {
+                **immutable,
+                "run_id": run,
+                "reservation_id": reservation,
+                "settlement_sha256": digest,
+                "idempotent": False,
+                "budget_exceeded_before_tail": (
+                    budget_exceeded_before_tail
+                ),
+                "budget_exceeded_by_tail": budget_exceeded_by_tail,
+                "tail_over_reservation": tail_over_reservation,
+                "terminal": (
+                    budget_exceeded_after_tail or tail_over_reservation
+                ),
+            }
+
+    def assert_persistent_metering_reconciled(self, run_id: object) -> dict:
+        """Fail unless every persistent session and the run ledger agree."""
+
+        run = _uuid(run_id, "run_id")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT status, requests_used, bytes_used,
+                       requests_reserved, bytes_reserved, metadata
+                FROM fbref_control.crawl_run
+                WHERE run_id = %s FOR UPDATE
+                """,
+                (run,),
+            )
+            crawl_run = _fetchone(cursor)
+            if crawl_run is None:
+                raise StateConflict(f"Unknown run {run}")
+            metadata = _json_mapping(
+                crawl_run.get("metadata") or {}, "crawl run metadata"
+            )
+            if metadata.get("persistent_http_session") is not True:
+                raise StateConflict("Run is not pinned to persistent metering")
+            cursor.execute(
+                """
+                SELECT count(*) AS sessions,
+                       count(*) FILTER (WHERE tail.status = 'reserved')
+                           AS reserved_tails,
+                       count(*) FILTER (WHERE tail.status = 'aborted')
+                           AS aborted_tails,
+                       count(*) FILTER (WHERE session.status = 'active')
+                           AS active_sessions,
+                       count(*) FILTER (
+                           WHERE tail.session_id IS NULL
+                              OR tail.status <> 'settled'
+                              OR session.provider_billed_bytes IS NULL
+                              OR tail.authoritative_provider_bytes
+                                   <> session.provider_billed_bytes
+                              OR tail.page_provider_bytes <> COALESCE((
+                                  SELECT sum(page.provider_billed_bytes)
+                                  FROM fbref_control.clearance_session_page_accounting
+                                      AS page
+                                  WHERE page.session_id = session.session_id
+                              ), 0)
+                              OR tail_budget.status <> 'settled'
+                              OR tail_budget.requests_used <> 0
+                              OR tail_budget.bytes_used
+                                   <> tail.tail_provider_bytes
+                       ) AS inexact_sessions,
+                       COALESCE(sum(
+                           CASE WHEN tail.status = 'settled'
+                                THEN tail.authoritative_provider_bytes
+                                ELSE 0 END
+                       ), 0) AS provider_bytes
+                FROM fbref_control.clearance_session AS session
+                LEFT JOIN fbref_control.clearance_session_tail_reservation AS tail
+                  ON tail.session_id = session.session_id
+                LEFT JOIN fbref_control.budget_reservation AS tail_budget
+                  ON tail_budget.reservation_id = tail.reservation_id
+                WHERE session.run_id = %s
+                """,
+                (run,),
+            )
+            sessions = _fetchone(cursor) or {}
+            if any(
+                int(sessions.get(name) or 0)
+                for name in (
+                    "reserved_tails",
+                    "aborted_tails",
+                    "active_sessions",
+                    "inexact_sessions",
+                )
+            ):
+                raise StateConflict(
+                    f"Run {run} has unresolved persistent metering"
+                )
+            cursor.execute(
+                """
+                SELECT COALESCE(sum(page.requests_used), 0) AS requests_used,
+                       count(*) AS accounted_pages,
+                       count(*) FILTER (
+                           WHERE budget.status <> 'settled'
+                              OR budget.requests_used <> page.requests_used
+                              OR budget.bytes_used
+                                   <> page.provider_billed_bytes
+                       ) AS invalid_page_budgets,
+                       (
+                           SELECT count(*)
+                           FROM fbref_control.budget_reservation AS budget
+                           LEFT JOIN
+                             fbref_control.clearance_session_tail_reservation AS tail
+                             ON tail.reservation_id = budget.reservation_id
+                           WHERE budget.run_id = %s
+                             AND tail.reservation_id IS NULL
+                       ) AS target_reservations
+                FROM fbref_control.clearance_session_page_accounting AS page
+                JOIN fbref_control.budget_reservation AS budget
+                  ON budget.reservation_id = page.reservation_id
+                WHERE page.run_id = %s
+                """,
+                (run, run),
+            )
+            pages = _fetchone(cursor) or {}
+            provider_bytes = int(sessions.get("provider_bytes") or 0)
+            requests = int(pages.get("requests_used") or 0)
+            accounted = int(pages.get("accounted_pages") or 0)
+            invalid_page_budgets = int(
+                pages.get("invalid_page_budgets") or 0
+            )
+            target_reservations = int(pages.get("target_reservations") or 0)
+            if (
+                provider_bytes != int(crawl_run["bytes_used"])
+                or requests != int(crawl_run["requests_used"])
+                or int(crawl_run["requests_reserved"]) != 0
+                or int(crawl_run["bytes_reserved"]) != 0
+                or accounted != target_reservations
+                or invalid_page_budgets != 0
+            ):
+                raise StateConflict(
+                    f"Run {run} persistent meter does not reconcile"
+                )
+            return {
+                "run_id": run,
+                "sessions": int(sessions.get("sessions") or 0),
+                "provider_billed_bytes": provider_bytes,
+                "requests_used": requests,
+                "pages": accounted,
+                "reconciled": True,
+            }
 
     def close_clearance_session(
         self,
@@ -8972,3 +10750,308 @@ class ControlStore:
                 lease_epoch=int(row["lease_epoch"]),
                 scheduled_at=row["scheduled_at"],
             )
+
+
+class _CursorBoundReplayControlStore(ControlStore):
+    """Map source identities to disposable replay rows on one transaction."""
+
+    def __init__(
+        self,
+        *,
+        base: ControlStore,
+        cursor: Any,
+        replay_run_id: str,
+        source_run_id: str,
+        mode: str,
+        targets: Sequence[Mapping[str, Any]],
+    ) -> None:
+        super().__init__(
+            base.db_uri, connection_factory=base._connection_factory
+        )
+        self._bound_cursor = cursor
+        self._replay_run_id = replay_run_id
+        self._source_run_id = source_run_id
+        self._mode = mode
+        self._targets = [dict(target) for target in targets]
+        self._target_by_source = {
+            target["target_id"]: target for target in self._targets
+        }
+        self._replay_target_by_source = {
+            target["target_id"]: make_replay_control_target_id(
+                replay_run_id, target["target_id"]
+            )
+            for target in self._targets
+        }
+        self._source_target_by_replay = {
+            replay_target: source_target
+            for source_target, replay_target in (
+                self._replay_target_by_source.items()
+            )
+        }
+        self._replay_refresh_by_source = {
+            target["logical_refresh_id"]: make_replay_control_refresh_id(
+                replay_run_id, target["logical_refresh_id"]
+            )
+            for target in self._targets
+        }
+        self._leases: dict[str, ObservationLease] = {}
+        self._guarded_targets: set[str] = set()
+        self.effects: Optional[dict[str, Any]] = None
+
+    @contextmanager
+    def _transaction(self, existing_cursor: Any = None):
+        if existing_cursor not in {None, self._bound_cursor}:
+            raise ControlStoreError(
+                "replay control transaction cannot change its cursor"
+            )
+        yield self._bound_cursor
+
+    def _source_target(self, target_id: object) -> str:
+        target = _text(target_id, "target_id")
+        if target not in self._replay_target_by_source:
+            raise StateConflict("replay control target is outside its cohort")
+        return target
+
+    def _source_refresh(self, logical_refresh_id: object) -> str:
+        refresh = _uuid(logical_refresh_id, "logical_refresh_id")
+        if refresh not in self._replay_refresh_by_source:
+            raise StateConflict(
+                "replay control logical refresh is outside its cohort"
+            )
+        return refresh
+
+    def claim_observation_processing(
+        self,
+        *,
+        logical_refresh_id: object,
+        target_id: object,
+        content_hash: object,
+        parser_version: object,
+        typed_parser_version: object,
+        stateful_parser_version: object,
+        lease_seconds: int = 3600,
+    ) -> Optional[ObservationLease]:
+        source_target = self._source_target(target_id)
+        source_refresh = self._source_refresh(logical_refresh_id)
+        descriptor = self._target_by_source[source_target]
+        if (
+            descriptor["logical_refresh_id"] != source_refresh
+            or descriptor["content_hash"]
+            != _text(content_hash, "content_hash")
+        ):
+            raise StateConflict("replay observation differs from its source")
+        return super().claim_observation_processing(
+            logical_refresh_id=self._replay_refresh_by_source[source_refresh],
+            target_id=self._replay_target_by_source[source_target],
+            content_hash=content_hash,
+            parser_version=parser_version,
+            typed_parser_version=typed_parser_version,
+            stateful_parser_version=stateful_parser_version,
+            lease_seconds=lease_seconds,
+        )
+
+    def _claim_all(self) -> None:
+        for target in self._targets:
+            lease = self.claim_observation_processing(
+                logical_refresh_id=target["logical_refresh_id"],
+                target_id=target["target_id"],
+                content_hash=target["content_hash"],
+                parser_version=target["parser_version"],
+                typed_parser_version=target["typed_parser_version"],
+                stateful_parser_version=target[
+                    "stateful_parser_version"
+                ],
+            )
+            if lease is None:
+                raise StateConflict(
+                    "disposable replay observation could not be claimed"
+                )
+            self._leases[target["logical_refresh_id"]] = lease
+
+    def observation_lease(
+        self, source_logical_refresh_id: object
+    ) -> ObservationLease:
+        source_refresh = self._source_refresh(source_logical_refresh_id)
+        try:
+            return self._leases[source_refresh]
+        except KeyError as exc:  # pragma: no cover - _claim_all is exhaustive
+            raise StateConflict("replay observation lease is missing") from exc
+
+    @contextmanager
+    def guard_latest_content(
+        self,
+        target_id: object,
+        content_hash: object,
+        logical_refresh_id: object,
+    ):
+        source_target = self._source_target(target_id)
+        source_refresh = self._source_refresh(logical_refresh_id)
+        descriptor = self._target_by_source[source_target]
+        if descriptor["logical_refresh_id"] != source_refresh:
+            raise StateConflict("replay latest guard differs from its source")
+        with super().guard_latest_content(
+            self._replay_target_by_source[source_target],
+            content_hash,
+            self._replay_refresh_by_source[source_refresh],
+        ) as latest:
+            if latest is True:
+                self._guarded_targets.add(source_target)
+            yield latest
+
+    def record_dataset_manifest(
+        self,
+        *,
+        target_id: object,
+        content_hash: object,
+        parser_version: object,
+        dataset: object,
+        availability: str,
+        parse_status: str,
+        persistence_status: str,
+        validation_status: str,
+        row_count: int = 0,
+        manifest_key: Optional[str] = None,
+        error_class: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        source_target = self._source_target(target_id)
+        super().record_dataset_manifest(
+            target_id=self._replay_target_by_source[source_target],
+            content_hash=content_hash,
+            parser_version=parser_version,
+            dataset=dataset,
+            availability=availability,
+            parse_status=parse_status,
+            persistence_status=persistence_status,
+            validation_status=validation_status,
+            row_count=row_count,
+            manifest_key=manifest_key,
+            error_class=error_class,
+            error_message=error_message,
+        )
+
+    def _capture_effects(self) -> dict[str, Any]:
+        replay_targets = set(self._source_target_by_replay)
+        self._bound_cursor.execute(
+            """
+            SELECT target.ordinal, target.target_id AS replay_target_id,
+                   target.logical_refresh_id,
+                   target.status AS target_status,
+                   frontier.page_kind, frontier.source_ids,
+                   frontier.state AS frontier_state,
+                   frontier.last_content_hash,
+                   observation.content_hash,
+                   observation.parser_version,
+                   observation.typed_parser_version,
+                   observation.stateful_parser_version,
+                   observation.status AS observation_status,
+                   observation.generic_status, observation.typed_status,
+                   observation.stateful_status,
+                   observation.validation_status
+            FROM fbref_control.run_target AS target
+            JOIN fbref_control.page_frontier AS frontier
+              ON frontier.target_id = target.target_id
+            JOIN fbref_control.observation_processing AS observation
+              ON observation.logical_refresh_id = target.logical_refresh_id
+            WHERE target.run_id = %s
+            ORDER BY target.ordinal, target.target_id
+            """,
+            (self._replay_run_id,),
+        )
+        rows = _fetchall(self._bound_cursor)
+        if len(rows) != len(self._targets) or {
+            str(row["replay_target_id"]) for row in rows
+        } != replay_targets:
+            raise StateConflict("replay target effects are incomplete")
+        targets = []
+        for row in rows:
+            replay_target = str(row["replay_target_id"])
+            source_target = self._source_target_by_replay[replay_target]
+            descriptor = self._target_by_source[source_target]
+            target_status = str(row["target_status"])
+            targets.append(
+                {
+                    "ordinal": int(row["ordinal"]),
+                    "target_id": source_target,
+                    "replay_target_id": replay_target,
+                    "source_logical_refresh_id": descriptor[
+                        "logical_refresh_id"
+                    ],
+                    "logical_refresh_id": str(row["logical_refresh_id"]),
+                    "status": target_status,
+                    "target_status": target_status,
+                    "page_kind": str(row["page_kind"]),
+                    "source_ids": _json_mapping(
+                        row.get("source_ids") or {}, "replay source_ids"
+                    ),
+                    "frontier_state": str(row["frontier_state"]),
+                    "last_content_hash": str(row["last_content_hash"]),
+                    "content_hash": str(row["content_hash"]),
+                    "parser_version": str(row["parser_version"]),
+                    "typed_parser_version": str(
+                        row["typed_parser_version"]
+                    ),
+                    "stateful_parser_version": str(
+                        row["stateful_parser_version"]
+                    ),
+                    "observation_status": str(row["observation_status"]),
+                    "generic_status": str(row["generic_status"]),
+                    "typed_status": str(row["typed_status"]),
+                    "stateful_status": str(row["stateful_status"]),
+                    "validation_status": str(row["validation_status"]),
+                    "evidence_class": descriptor["evidence_class"],
+                    "latest_guarded": source_target
+                    in self._guarded_targets,
+                }
+            )
+        self._bound_cursor.execute(
+            """
+            SELECT manifest.target_id AS replay_target_id,
+                   manifest.content_hash, manifest.parser_version,
+                   manifest.dataset, manifest.availability,
+                   manifest.parse_status, manifest.persistence_status,
+                   manifest.validation_status, manifest.row_count,
+                   CASE
+                     WHEN manifest.availability IN (
+                         'empty', 'restricted', 'not_applicable'
+                     ) THEN manifest.error_message
+                     ELSE NULL
+                   END AS empty_reason
+            FROM fbref_control.dataset_manifest AS manifest
+            WHERE manifest.target_id = ANY(%s)
+            ORDER BY manifest.target_id, manifest.parser_version,
+                     manifest.dataset
+            """,
+            (list(replay_targets),),
+        )
+        datasets = []
+        for row in _fetchall(self._bound_cursor):
+            replay_target = str(row["replay_target_id"])
+            source_target = self._source_target_by_replay[replay_target]
+            datasets.append(
+                {
+                    "ordinal": self._target_by_source[source_target][
+                        "ordinal"
+                    ],
+                    "target_id": source_target,
+                    "replay_target_id": replay_target,
+                    "content_hash": str(row["content_hash"]),
+                    "parser_version": str(row["parser_version"]),
+                    "dataset": str(row["dataset"]),
+                    "availability": str(row["availability"]),
+                    "parse_status": str(row["parse_status"]),
+                    "persistence_status": str(
+                        row["persistence_status"]
+                    ),
+                    "validation_status": str(row["validation_status"]),
+                    "row_count": int(row["row_count"]),
+                    "empty_reason": row.get("empty_reason"),
+                }
+            )
+        return build_replay_control_effects(
+            control_run_id=self._replay_run_id,
+            source_run_id=self._source_run_id,
+            mode=self._mode,
+            targets=targets,
+            datasets=datasets,
+        )

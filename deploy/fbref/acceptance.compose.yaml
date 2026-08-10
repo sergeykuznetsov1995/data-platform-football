@@ -80,7 +80,9 @@ services:
       PROXY_FILTER_ALLOW_FILE_FALLBACK: "true"
     command:
       - python
-      - /opt/airflow/scripts/proxy_filter/filter_proxy.py
+      - /opt/airflow/scripts/fbref_proxy/filter_proxy.py
+      - --source-mode
+      - fbref-only
       - --listen
       - 0.0.0.0:8899
       - --lease-listen

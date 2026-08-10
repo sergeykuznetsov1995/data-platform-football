@@ -312,6 +312,57 @@ class TestTrinoTableManagerCreateIcebergTable:
 class TestTrinoTableManagerInsertDataFrame:
     """Tests for insert_dataframe operation."""
 
+    def test_validate_dataframe_values_uses_target_types_without_io(self):
+        from scrapers.base.trino_manager import TrinoTableManager
+
+        manager = TrinoTableManager()
+        manager._execute = MagicMock()
+        frame = pd.DataFrame(
+            {
+                "match_id": ["match-a", "match-b"],
+                "minute": [1, None],
+                "available": ["true", "false"],
+            }
+        )
+
+        result = manager.validate_dataframe_values(
+            frame,
+            {
+                "MATCH_ID": "VARCHAR",
+                "minute": "BIGINT",
+                "available": "BOOLEAN",
+            },
+        )
+
+        assert result is None
+        manager._execute.assert_not_called()
+
+    def test_validate_dataframe_values_sanitizes_incompatible_value_without_io(
+        self, caplog
+    ):
+        from scrapers.base.trino_manager import TrinoTableManager
+
+        manager = TrinoTableManager()
+        manager._execute = MagicMock()
+        manager._execute_committing = MagicMock()
+        secret = "secret-sentinel-do-not-expose"
+
+        with pytest.raises(ValueError) as captured:
+            manager.validate_dataframe_values(
+                pd.DataFrame({"metric": [secret]}),
+                {"metric": "BIGINT"},
+            )
+
+        message = str(captured.value)
+        assert "metric" in message
+        assert "BIGINT" in message
+        assert secret not in message
+        assert secret not in caplog.text
+        manager._execute.assert_not_called()
+        manager._execute_committing.assert_not_called()
+        assert secret not in str(manager._execute.mock_calls)
+        assert secret not in str(manager._execute_committing.mock_calls)
+
     def test_insert_dataframe_basic(self):
         """Test basic DataFrame insertion."""
         import pandas as pd

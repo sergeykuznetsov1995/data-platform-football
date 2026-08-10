@@ -16,17 +16,94 @@ import os
 import signal
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Mapping
 
+from scrapers.fbref.control import ControlStore
 from scrapers.fbref.fetcher import FBrefFetcher
 from scrapers.fbref.pipeline import FBrefPipeline, PipelineSettings
 from scrapers.fbref.proxy_lease import FBREF_DAG_IDS
-from scrapers.fbref.settings import MIB
+from scrapers.fbref.readiness import validate_fbref_proxy_meter
+from scrapers.fbref.settings import (
+    FBREF_PRODUCTION_SAFETY_BYTE_LIMIT_MIB,
+    FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT,
+    MIB,
+    strict_binary_flag,
+)
 
 
 RESULT_PREFIX = "FBREF_LIVE_WAVES_RESULT:"
 _PR_SET_PDEATHSIG = 1
+
+
+class _RunnerTermination(SystemExit):
+    """Request normal Python unwinding after the runner receives SIGTERM."""
+
+    def __init__(self, signum: int) -> None:
+        self.signum = int(signum)
+        super().__init__(128 + self.signum)
+
+
+def _install_sigterm_unwind_handler() -> tuple[dict, object]:
+    """Raise once, then latch later TERM signals during exact finalization."""
+
+    previous = signal.getsignal(signal.SIGTERM)
+    state = {"termination_started": False, "pending_signum": None}
+
+    def handle(signum, _frame) -> None:
+        normalized = int(signum)
+        if not state["termination_started"]:
+            state["termination_started"] = True
+            raise _RunnerTermination(normalized)
+        # Strict provider close and durable tail/control settlement must be
+        # one uninterrupted sequence. The outer task owns the bounded grace
+        # period and SIGKILL fallback if that sequence cannot finish.
+        state["pending_signum"] = normalized
+
+    try:
+        signal.signal(signal.SIGTERM, handle)
+    except ValueError as exc:
+        raise RuntimeError(
+            "FBref live runner must execute in the main thread"
+        ) from exc
+    return state, previous
+
+
+@contextmanager
+def _defer_sigterm_during_finalization():
+    """Latch TERM until provider, tail, and control ownership are closed."""
+
+    previous = signal.getsignal(signal.SIGTERM)
+    pending_signals: list[int] = []
+
+    def latch(signum, _frame) -> None:
+        pending_signals.append(int(signum))
+
+    try:
+        signal.signal(signal.SIGTERM, latch)
+    except ValueError:
+        # Only the main thread can own Python signal handlers. Alternate
+        # in-process callers retain their surrounding interruption policy.
+        yield
+        return
+
+    failed = False
+    try:
+        yield
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        if pending_signals and not failed:
+            signum = pending_signals[-1]
+            if previous is signal.SIG_IGN:
+                return
+            if previous is signal.SIG_DFL:
+                os.kill(os.getpid(), signum)
+            else:
+                previous(signum, None)
 
 
 def _set_parent_death_signal(signum: int) -> None:
@@ -170,7 +247,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shard-size", type=int, required=True)
     parser.add_argument("--reservation-mb", type=int, required=True)
     parser.add_argument("--domain-interval-seconds", type=float, required=True)
-    parser.add_argument("--max-batches", type=int, default=16)
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        choices=range(1, 81),
+        default=80,
+    )
     return parser
 
 
@@ -181,12 +263,18 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     args = build_parser().parse_args(argv)
-    _arm_parent_death_containment(args.parent_pid)
-    watchdog = _ProcessGroupWatchdog.start()
+    _sigterm_state, previous_sigterm = _install_sigterm_unwind_handler()
+    watchdog = None
     try:
+        _arm_parent_death_containment(args.parent_pid)
+        watchdog = _ProcessGroupWatchdog.start()
         return _run(args)
     finally:
-        watchdog.disarm()
+        try:
+            if watchdog is not None:
+                watchdog.disarm()
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -201,6 +289,17 @@ def _run(args: argparse.Namespace) -> int:
             "FBREF_PROXY_CONTROL_URL is required; live FBref cannot run direct"
         )
 
+    live_profiles = {
+        (FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT, FBREF_PRODUCTION_SAFETY_BYTE_LIMIT_MIB),
+        (100, 50),
+    }
+    requested_profile = (int(args.request_limit), int(args.byte_limit_mb))
+    if requested_profile not in live_profiles:
+        raise ValueError("Unsupported FBref live safety profile")
+
+    persistent_http_session = strict_binary_flag(
+        "FBREF_PERSISTENT_HTTP_SESSION"
+    )
     settings = PipelineSettings(
         run_type=args.run_type,
         request_limit=args.request_limit,
@@ -208,9 +307,12 @@ def _run(args: argparse.Namespace) -> int:
         shard_size=args.shard_size,
         request_reservation_bytes=args.reservation_mb * MIB,
         domain_interval_seconds=args.domain_interval_seconds,
+        persistent_http_session=persistent_http_session,
     )
-    pipeline = FBrefPipeline.from_env()
-    run = pipeline.control.get_run(args.control_run_id)
+    # Validate immutable run identity before constructing Trino writers or a
+    # fetcher that could request a paid lease.
+    control = ControlStore.from_env()
+    run = control.get_run(args.control_run_id)
     if run is None:
         raise RuntimeError("FBref control run does not exist")
     raw_metadata = run.get("metadata") or {}
@@ -218,11 +320,29 @@ def _run(args: argparse.Namespace) -> int:
         raw_metadata = json.loads(raw_metadata)
     if not isinstance(raw_metadata, Mapping):
         raise RuntimeError("FBref control run metadata is invalid")
+    stored_persistent = raw_metadata.get("persistent_http_session")
+    if stored_persistent is None:
+        if persistent_http_session:
+            raise RuntimeError(
+                "FBref control run has no persistent HTTP profile marker"
+            )
+    elif (
+        not isinstance(stored_persistent, bool)
+        or stored_persistent != persistent_http_session
+    ):
+        raise RuntimeError(
+            "FBref control run persistent HTTP profile differs from live runner"
+        )
     dag_id = str(raw_metadata.get("dag_id") or "")
     if dag_id not in FBREF_DAG_IDS:
         raise RuntimeError("FBref control run has invalid paid-proxy DAG provenance")
     if str(run.get("run_type") or "") != args.run_type:
         raise RuntimeError("FBref control run type differs from live runner")
+    if (
+        int(run.get("request_limit") or -1) != settings.request_limit
+        or int(run.get("byte_limit") or -1) != settings.byte_limit
+    ):
+        raise RuntimeError("FBref control run safety profile differs from live runner")
     provider_context = {
         "source": "fbref",
         "dag_id": dag_id,
@@ -238,7 +358,29 @@ def _run(args: argparse.Namespace) -> int:
     dagrun_bytes_spent = int(run.get("bytes_used") or 0) + int(
         run.get("bytes_reserved") or 0
     )
-    provider_byte_budget = max(0, settings.byte_limit - dagrun_bytes_spent)
+    current_run_remaining = max(
+        0, settings.byte_limit - dagrun_bytes_spent
+    )
+    meter = validate_fbref_proxy_meter(
+        proxy_control_url,
+        control_token=os.environ.get("FBREF_PROXY_CONTROL_TOKEN"),
+        required_bytes=settings.byte_limit,
+        minimum_configured_exits=(
+            4
+            if requested_profile
+            == (
+                FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT,
+                FBREF_PRODUCTION_SAFETY_BYTE_LIMIT_MIB,
+            )
+            else 1
+        ),
+    )
+    provider_byte_budget = min(
+        current_run_remaining,
+        int(meter["daily_remaining_bytes"]),
+    )
+    pipeline = FBrefPipeline.from_env()
+    pipeline.finalization_guard = _defer_sigterm_during_finalization
     pipeline.fetcher_factory = (
         lambda _proxy_file, max_browser_requests, max_browser_bytes: FBrefFetcher(
             max_browser_requests=max_browser_requests,
@@ -246,6 +388,7 @@ def _run(args: argparse.Namespace) -> int:
             provider_context=provider_context,
             provider_max_bytes=provider_byte_budget,
             proxy_control_url=proxy_control_url,
+            persistent_http_session=persistent_http_session,
         )
     )
     result = pipeline.run_live_waves(

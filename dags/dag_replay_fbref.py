@@ -15,17 +15,18 @@ from airflow.operators.python import PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from scrapers.fbref.settings import DEFAULT_DOMAIN_INTERVAL_SECONDS
+from scrapers.fbref.settings import FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT
 
 from utils.default_args import DEFAULT_ARGS
 from utils.fbref_pipeline_tasks import (
     acquire_fbref_publication_lock,
     audit_fbref_raw_integrity,
     capture_fbref_raw_baseline,
+    drain_fbref_replay,
     export_fbref_publication_scope,
     fbref_dag_failure_callback,
     finalize_fbref_publication_lock,
     initialize_fbref_run,
-    parse_fbref_wave,
     validate_fbref_production_readiness,
     validate_fbref_run,
 )
@@ -44,10 +45,12 @@ REPLAY_PAGE_KINDS = (
     "match",
 )
 
-# Current production runs are capped at 200 fetches. Eight offline shards of
-# 25 drain one complete source run while memory stays bounded by one shard.
-REPLAY_WAVE_COUNT = 8
 REPLAY_SHARD_SIZE = 25
+# A production source cannot contain more successful raw observations than
+# its request circuit. One extra call proves the candidate queue is empty.
+REPLAY_MAX_WAVES = (
+    FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT + REPLAY_SHARD_SIZE - 1
+) // REPLAY_SHARD_SIZE + 1
 
 AIRFLOW_RUN_ID = "{{ run_id }}"
 DAG_ID = "{{ dag.dag_id }}"
@@ -141,26 +144,25 @@ with DAG(
 
     validate_production_readiness >> initialize_run
     initialize_run >> acquire_publication_lock >> capture_raw_baseline
-    previous = capture_raw_baseline
-    for wave_number in range(1, REPLAY_WAVE_COUNT + 1):
-        parse = PythonOperator(
-            task_id=f"parse_wave_{wave_number:02d}",
-            python_callable=parse_fbref_wave,
-            op_kwargs={
-                "airflow_run_id": AIRFLOW_RUN_ID,
-                "dag_id": DAG_ID,
-                "page_kinds": REPLAY_PAGE_KINDS,
-                "run_type": "replay",
-                "source_control_run_id": SOURCE_CONTROL_RUN_ID,
-                "request_limit": 0,
-                "byte_limit_mb": 0,
-                "shard_size": REPLAY_SHARD_SIZE,
-                "reservation_mb": 3,
-            },
-            trigger_rule="all_success",
-        )
-        previous >> parse
-        previous = parse
+    drain_replay = PythonOperator(
+        task_id="drain_replay",
+        python_callable=drain_fbref_replay,
+        op_kwargs={
+            "airflow_run_id": AIRFLOW_RUN_ID,
+            "dag_id": DAG_ID,
+            "page_kinds": REPLAY_PAGE_KINDS,
+            "run_type": "replay",
+            "source_control_run_id": SOURCE_CONTROL_RUN_ID,
+            "request_limit": 0,
+            "byte_limit_mb": 0,
+            "shard_size": REPLAY_SHARD_SIZE,
+            "reservation_mb": 3,
+            "max_waves": REPLAY_MAX_WAVES,
+        },
+        trigger_rule="all_success",
+    )
+    capture_raw_baseline >> drain_replay
+    previous = drain_replay
 
     audit_raw_integrity = PythonOperator(
         task_id="audit_raw_integrity",

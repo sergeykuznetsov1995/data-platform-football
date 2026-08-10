@@ -45,10 +45,10 @@ class TestFBrefBackfillTopology:
         )
         params = module.dag._dag_kwargs["params"]
         assert params["dry_run"].default is False
-        assert params["request_limit"].default == 200
-        assert params["request_limit"]._kw["enum"] == [100, 200]
-        assert params["byte_limit_mb"].default == 100
-        assert params["byte_limit_mb"]._kw["enum"] == [50, 100]
+        assert params["request_limit"].default == 4096
+        assert params["request_limit"]._kw["enum"] == [100, 4096]
+        assert params["byte_limit_mb"].default == 2048
+        assert params["byte_limit_mb"]._kw["enum"] == [50, 2048]
         assert params["shard_size"].default == 25
         assert params["shard_size"]._kw["maximum"] == 25
         assert tasks["initialize_run"].op_kwargs["run_type"] == "backfill"
@@ -79,8 +79,8 @@ class TestFBrefBackfillTopology:
 
     def test_one_warm_live_runner_is_bounded(self, loaded_dag):
         module, tasks = loaded_dag
-        assert module.BACKFILL_MAX_BATCHES == 16
-        assert module.BACKFILL_REQUEST_LIMIT == 200
+        assert module.BACKFILL_MAX_BATCHES == 80
+        assert module.BACKFILL_REQUEST_LIMIT == 4096
         assert len(tasks) == 16
         assert tasks["initialize_run"].downstream_task_ids == {
             "validate_current_scope_freshness_preflight"
@@ -111,11 +111,12 @@ class TestFBrefBackfillTopology:
         live = tasks["run_live_waves"]
         assert live.python_callable.__name__ == "run_fbref_live_waves"
         assert live.op_kwargs["run_type"] == "backfill"
-        assert live.op_kwargs["max_batches"] == 16
+        assert live.op_kwargs["max_batches"] == 80
         assert live.op_kwargs["reservation_mb"] == 3
         assert live._captured_kwargs["execution_timeout"].total_seconds() == (
-            120 * 60
+            6 * 60 * 60 + 5 * 60
         )
+        assert live._captured_kwargs["pool"] == "fbref_scraper_pool"
         assert live._captured_kwargs["retries"] == 0
         assert live.downstream_task_ids == {
             "audit_raw_integrity"

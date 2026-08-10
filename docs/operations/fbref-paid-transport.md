@@ -12,7 +12,10 @@ or daily hard cap can be crossed. The exact delta is stored as
 still use the shared `/opt/airflow/proxys.txt` mount; this guarantee applies to
 the FBref code path and its separately mounted production pool.
 
-The default hard limits are 100 MiB per DagRun/lease and 300 MiB per UTC day.
+Production has one 2048 MiB emergency safety circuit for the UTC day, DagRun,
+URL, and lease. It is not a tariff allowance or an ordinary acceptance target:
+reaching it makes the run incomplete and fails loudly. Normal acceptance tracks
+provider bytes per durable match and has no lower absolute-MiB pass gate.
 Only one FBref lease may be active. The data plane allows FBref, Cloudflare
 Turnstile, and one bounded Camoufox IP-location endpoint; every other host gets
 403 before an upstream connection is opened.
@@ -243,10 +246,16 @@ airflow dags trigger dag_bootstrap_fbref
 
 `dag_bootstrap_fbref` has `schedule=None`, so it is safe to leave unpaused: it
 can create only an explicitly triggered manual DagRun. Its tasks contain
-literal `200 requests / 100 MiB / shard 25` limits and literal
+literal `4096 requests / 2048 MiB / shard 25` safety limits and literal
 `bootstrap_only=true`; DagRun conf cannot change them. The scheduled
 `dag_ingest_fbref` keeps its original daily schedule, parameters, and
 publishing default. The existing `100/50` canary remains a separate path.
+
+FBref chooses Decodo session identities in a stable bounded order. A transport
+failure cools down only the normalized host/port/username identity, never logs
+the username or password, and the next lease uses another healthy identity when
+one exists. An active lease is never repinned. This memory resets if the proxy
+filter process restarts; cross-restart exclusion is intentionally not claimed.
 
 A successful bootstrap has these three pieces of evidence:
 

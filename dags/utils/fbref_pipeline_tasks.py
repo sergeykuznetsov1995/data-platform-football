@@ -29,7 +29,10 @@ from scrapers.fbref.settings import (
     DEFAULT_REQUEST_LIMIT,
     DEFAULT_REQUEST_RESERVATION_BYTES,
     DEFAULT_SHARD_SIZE,
+    FBREF_PRODUCTION_SAFETY_BYTE_LIMIT_MIB,
+    FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT,
     MIB,
+    strict_binary_flag,
 )
 
 
@@ -40,10 +43,11 @@ DEFAULT_LEGACY_SCRAPER_PYTHON = "/opt/legacy-scraper-venv/bin/python"
 LIVE_WAVES_RUNNER = "/opt/airflow/dags/scripts/run_fbref_live_waves.py"
 LIVE_WAVES_PYTHONPATH = "/opt/airflow"
 LIVE_WAVES_RESULT_PREFIX = "FBREF_LIVE_WAVES_RESULT:"
-LIVE_WAVES_TIMEOUT_SECONDS = 110 * 60
-LIVE_WAVES_TERMINATION_GRACE_SECONDS = 10
+LIVE_WAVES_TIMEOUT_SECONDS = 6 * 60 * 60
+LIVE_WAVES_TERMINATION_GRACE_SECONDS = 30
 LIVE_WAVES_KILL_GRACE_SECONDS = 10
-FBREF_MAX_LIVE_BATCHES = 16
+FBREF_MAX_LIVE_BATCHES = 80
+FBREF_SCRAPER_POOL = "fbref_scraper_pool"
 FBREF_ACCEPTANCE_OUTPUT_ROOT_ENV = "FBREF_ACCEPTANCE_OUTPUT_ROOT"
 DEFAULT_FBREF_ACCEPTANCE_OUTPUT_ROOT = (
     "/opt/airflow/logs/fbref_acceptance"
@@ -95,10 +99,10 @@ def _install_live_runner_sigterm_handler() -> tuple[dict, object]:
 
 # Runtime limits are repeated here intentionally: the Airflow boundary must
 # reject an unsafe dag_run.conf even when Param validation is bypassed.  The
-# only supported live profiles are the measured production budget and the
-# separately bounded canary budget.
-FBREF_PRODUCTION_REQUEST_LIMIT = 200
-FBREF_PRODUCTION_BYTE_LIMIT_MB = 100
+# only supported live profiles are the production emergency circuit and the
+# separately bounded, non-publishing canary.
+FBREF_PRODUCTION_REQUEST_LIMIT = FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT
+FBREF_PRODUCTION_BYTE_LIMIT_MB = FBREF_PRODUCTION_SAFETY_BYTE_LIMIT_MIB
 FBREF_CANARY_REQUEST_LIMIT = 100
 FBREF_CANARY_BYTE_LIMIT_MB = 50
 FBREF_MAX_WARM_SESSION_TARGETS = 25
@@ -123,6 +127,22 @@ FBREF_LIVE_BUDGET_PROFILES = {
     ),
     (FBREF_CANARY_REQUEST_LIMIT, FBREF_CANARY_BYTE_LIMIT_MB): "canary",
 }
+
+
+def _normalize_live_batch_count(value: object) -> int:
+    """Accept only an integer or a templated decimal integer string."""
+
+    if type(value) is int:
+        normalized = value
+    elif isinstance(value, str) and value.strip().isdecimal():
+        normalized = int(value.strip())
+    else:
+        raise ValueError("max_batches must be an integer")
+    if not 1 <= normalized <= FBREF_MAX_LIVE_BATCHES:
+        raise ValueError(
+            f"max_batches must be between 1 and {FBREF_MAX_LIVE_BATCHES}"
+        )
+    return normalized
 
 
 def _legacy_scraper_python() -> str:
@@ -253,6 +273,11 @@ def _settings(
         shard_size=int(shard_size),
         request_reservation_bytes=int(reservation_mb) * MIB,
         domain_interval_seconds=float(domain_interval_seconds),
+        persistent_http_session=(
+            False
+            if str(run_type).strip().casefold() == "replay"
+            else strict_binary_flag("FBREF_PERSISTENT_HTTP_SESSION")
+        ),
     )
 
 
@@ -290,7 +315,7 @@ def validate_fbref_runtime_limits(
                 for requests, bytes_mb in FBREF_LIVE_BUDGET_PROFILES
             )
             raise ValueError(
-                "Unsupported FBref live budget; use one hard profile: "
+                "Unsupported FBref live safety profile; use one exact profile: "
                 f"{allowed}"
             )
     return {
@@ -431,8 +456,8 @@ def validate_fbref_current_execution_mode(
             or limits["shard_size"] != FBREF_MAX_WARM_SESSION_TARGETS
         ):
             raise ValueError(
-                "FBref bootstrap_only requires exactly 200 requests, "
-                "100 MiB, and shard_size 25"
+                "FBref bootstrap_only requires exactly 4096 requests, "
+                "2048 MiB, and shard_size 25"
             )
         execution_mode = "bootstrap_only"
         publication_eligible = False
@@ -1335,13 +1360,14 @@ def initialize_fbref_run(
             ),
             "execution_mode": normalized_run_type,
             "publication_eligible": True,
+            "profile": normalized_run_type,
         }
     control_execution = {
         "bootstrap_only": execution["bootstrap_only"],
         "dag_run_type": execution.get("dag_run_type"),
         "execution_mode": execution["execution_mode"],
         "publication_eligible": execution["publication_eligible"],
-        "runtime_profile": execution.get("profile", normalized_run_type),
+        "runtime_profile": execution["profile"],
     }
     run_id = _pipeline().initialize_run(
         airflow_run_id=airflow_run_id,
@@ -1780,11 +1806,7 @@ def run_fbref_live_waves(
         byte_limit_mb=byte_limit_mb,
         shard_size=shard_size,
     )
-    normalized_batches = int(max_batches)
-    if not 1 <= normalized_batches <= FBREF_MAX_LIVE_BATCHES:
-        raise ValueError(
-            f"max_batches must be between 1 and {FBREF_MAX_LIVE_BATCHES}"
-        )
+    normalized_batches = _normalize_live_batch_count(max_batches)
     command = [
         _legacy_scraper_python(),
         LIVE_WAVES_RUNNER,
@@ -1815,6 +1837,7 @@ def run_fbref_live_waves(
     stdout = ""
     stderr = ""
     process_group_terminated = False
+    synchronous_abort_attempted = False
     try:
         try:
             # The spawn and every instruction after it execute inside this
@@ -1864,10 +1887,11 @@ def run_fbref_live_waves(
                 error_class="LiveWavesSubprocessTimeout",
                 error_message=message,
             )
+            synchronous_abort_attempted = True
             raise RuntimeError(
                 message + " and its process group was killed"
             ) from exc
-    except BaseException:
+    except BaseException as exc:
         if lifecycle.handler_state is not None:
             lifecycle.handler_state["armed"] = False
         process = lifecycle.process
@@ -1884,6 +1908,16 @@ def run_fbref_live_waves(
                 "group was terminated.\nstdout:\n%s\nstderr:\n%s",
                 _decoded_stream(stdout),
                 _decoded_stream(stderr),
+            )
+        if not synchronous_abort_attempted:
+            _abort_failed_live_subprocess(
+                airflow_run_id=airflow_run_id,
+                dag_id=dag_id,
+                error_class="LiveWavesExternalInterruption",
+                error_message=(
+                    "FBref live runner was interrupted by "
+                    f"{type(exc).__name__}"
+                ),
             )
         raise
     finally:
@@ -2014,6 +2048,123 @@ def parse_fbref_wave(
     return result
 
 
+def drain_fbref_replay(
+    *,
+    airflow_run_id: str,
+    dag_id: str,
+    page_kinds: Sequence[str],
+    run_type: str,
+    source_control_run_id: Optional[str] = None,
+    request_limit=0,
+    byte_limit_mb=0,
+    shard_size=DEFAULT_SHARD_SIZE,
+    reservation_mb=DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
+    max_waves: int,
+) -> dict:
+    """Drain every eligible replay observation with a finite progress guard."""
+
+    settings = _settings(
+        run_type=run_type,
+        request_limit=request_limit,
+        byte_limit_mb=byte_limit_mb,
+        shard_size=shard_size,
+        reservation_mb=reservation_mb,
+    )
+    if settings.run_type != "replay":
+        raise ValueError("Replay drain requires run_type=replay")
+    normalized_source_run_id = (
+        None
+        if source_control_run_id is None
+        or not str(source_control_run_id).strip()
+        else str(source_control_run_id).strip()
+    )
+    if normalized_source_run_id is None:
+        raise ValueError("Replay requires source_control_run_id")
+    if type(max_waves) is int:
+        wave_limit = max_waves
+    elif isinstance(max_waves, str) and max_waves.strip().isdecimal():
+        wave_limit = int(max_waves.strip())
+    else:
+        raise ValueError("max_waves must be an integer")
+    if not 1 <= wave_limit <= FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT + 1:
+        raise ValueError(
+            "max_waves must be between 1 and "
+            f"{FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT + 1}"
+        )
+
+    pipeline = _pipeline()
+    processing_run_id = _control_run_id(
+        airflow_run_id=airflow_run_id, dag_id=dag_id
+    )
+    totals = {
+        "claimed": 0,
+        "parsed": 0,
+        "typed_promoted": 0,
+        "seeded": 0,
+        "skipped_ineligible": 0,
+        "contract_quarantined": 0,
+    }
+    completed_waves = 0
+    for _wave_number in range(1, wave_limit + 1):
+        wave = pipeline.parse_wave(
+            processing_run_id,
+            page_kinds=list(page_kinds),
+            settings=settings,
+            source_run_id=normalized_source_run_id,
+        ).as_dict()
+        try:
+            cohort_size = int(wave["cohort_size"])
+            claimed = int(wave["claimed"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "FBref replay drain returned invalid progress evidence"
+            ) from exc
+        if (
+            cohort_size < 0
+            or cohort_size > settings.shard_size
+            or claimed < 0
+            or claimed > cohort_size
+        ):
+            raise RuntimeError(
+                "FBref replay drain returned invalid progress evidence"
+            )
+        if cohort_size == 0:
+            result = {
+                "status": "drained",
+                "waves": completed_waves,
+                "max_waves": wave_limit,
+                **totals,
+            }
+            logger.info(
+                "FBref replay drain: %s",
+                json.dumps(result, sort_keys=True),
+            )
+            return result
+        if claimed == 0:
+            raise RuntimeError(
+                "FBref replay drain made no progress with "
+                f"{cohort_size} candidates still visible"
+            )
+        completed_waves += 1
+        for field in totals:
+            try:
+                value = int(wave.get(field) or 0)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "FBref replay drain returned invalid progress evidence"
+                ) from exc
+            if value < 0:
+                raise RuntimeError(
+                    "FBref replay drain returned invalid progress evidence"
+                )
+            totals[field] += value
+
+    raise RuntimeError(
+        "FBref replay did not drain within "
+        f"{wave_limit} waves; refusing to continue with raw pages unparsed"
+    )
+
+
 def validate_fbref_run(
     *,
     airflow_run_id: str,
@@ -2088,7 +2239,7 @@ def validate_fbref_bootstrap_run(
         "control_status": "succeeded",
         "execution_mode": "bootstrap_only",
         "publication_eligible": False,
-        "runtime_profile": "production_200_requests_100_mib_shard_25",
+        "runtime_profile": execution["profile"],
         "validation_summary": summary,
     }
     logger.info("FBref bootstrap evidence: %s", json.dumps(evidence, default=str))
@@ -2231,6 +2382,7 @@ __all__ = [
     "finalize_fbref_publication_lock",
     "fbref_dag_failure_callback",
     "initialize_fbref_run",
+    "drain_fbref_replay",
     "parse_fbref_wave",
     "plan_fbref_backfill",
     "release_fbref_publication_lock",

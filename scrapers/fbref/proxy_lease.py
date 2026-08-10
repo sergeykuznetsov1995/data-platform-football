@@ -56,6 +56,15 @@ class FBrefLeaseStats:
     reserved_bytes: int
     closed: bool
     budget_exceeded: bool
+    task_id: str = ""
+    canonical_url: str = ""
+    scope: str = ""
+    active_provider_readers: int = 0
+    provider_reserved_bytes: int = 0
+    pending_client_hellos: int = 0
+    staged_client_bytes: int = 0
+    expired: bool = False
+    accounting_uncertain: bool = False
     close_complete: bool = False
 
     @property
@@ -253,37 +262,120 @@ class FBrefProxyLeaseClient:
         *,
         expected: Mapping[str, Any],
     ) -> FBrefLeaseStats:
+        provenance_fields = (
+            "source",
+            "dag_id",
+            "run_id",
+            "task_id",
+            "canonical_url",
+            "scope",
+        )
+        if any(
+            name not in value
+            or not isinstance(value[name], str)
+            or not value[name]
+            for name in provenance_fields
+        ):
+            raise FBrefProxyLeaseError(
+                "FBref proxy meter stats schema mismatch"
+            )
+        if any(
+            name not in expected
+            or not isinstance(expected[name], str)
+            or not expected[name]
+            for name in provenance_fields
+        ):
+            raise FBrefProxyLeaseError(
+                "FBref proxy meter stats failed provenance validation"
+            )
+        boolean_fields = (
+            "closed",
+            "expired",
+            "budget_exceeded",
+            "accounting_uncertain",
+        )
+        if any(
+            name not in value or not isinstance(value[name], bool)
+            for name in boolean_fields
+        ) or (
+            "close_complete" in value
+            and not isinstance(value["close_complete"], bool)
+        ):
+            raise FBrefProxyLeaseError(
+                "FBref proxy meter stats schema mismatch"
+            )
         try:
-            up = int(value["up_bytes"])
-            down = int(value["down_bytes"])
-            active = int(value["active_tunnels"])
-            reserved = int(value["reserved_bytes"])
-            total = int(value["total_bytes"])
+            integer_names = (
+                "up_bytes",
+                "down_bytes",
+                "active_tunnels",
+                "reserved_bytes",
+                "active_provider_readers",
+                "provider_reserved_bytes",
+                "pending_client_hellos",
+                "staged_client_bytes",
+                "total_bytes",
+            )
+            if any(
+                isinstance(value[name], bool)
+                or not isinstance(value[name], int)
+                for name in integer_names
+            ):
+                raise TypeError("meter counters must be integers")
+            (
+                up,
+                down,
+                active,
+                reserved,
+                readers,
+                provider_reserved,
+                pending_hellos,
+                staged_client,
+                total,
+            ) = (value[name] for name in integer_names)
             stats = FBrefLeaseStats(
                 lease_id=str(value["id"]),
                 source=str(value["source"]),
                 dag_id=str(value["dag_id"]),
                 run_id=str(value["run_id"]),
+                task_id=str(value["task_id"]),
+                canonical_url=str(value["canonical_url"]),
+                scope=str(value["scope"]),
                 up_bytes=up,
                 down_bytes=down,
                 active_tunnels=active,
                 reserved_bytes=reserved,
-                closed=bool(value["closed"]),
-                budget_exceeded=bool(value["budget_exceeded"]),
-                close_complete=bool(value.get("close_complete", False)),
+                closed=value["closed"],
+                budget_exceeded=value["budget_exceeded"],
+                active_provider_readers=readers,
+                provider_reserved_bytes=provider_reserved,
+                pending_client_hellos=pending_hellos,
+                staged_client_bytes=staged_client,
+                expired=value["expired"],
+                accounting_uncertain=value["accounting_uncertain"],
+                close_complete=value.get("close_complete", False),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise FBrefProxyLeaseError(
                 "FBref proxy meter stats schema mismatch"
             ) from exc
         if (
-            min(up, down, active, reserved) < 0
+            min(
+                up,
+                down,
+                active,
+                reserved,
+                readers,
+                provider_reserved,
+                pending_hellos,
+                staged_client,
+            ) < 0
             or total != stats.total_bytes
             or stats.total_bytes > lease.max_bytes
+            or (stats.close_complete and not stats.closed)
             or stats.lease_id != lease.lease_id
             or stats.source != "fbref"
-            or stats.dag_id != str(expected.get("dag_id") or "")
-            or stats.run_id != str(expected.get("run_id") or "")
+            or any(value[name] != expected[name] for name in provenance_fields)
             or str(value.get("meter") or "") != METER_ID
         ):
             raise FBrefProxyLeaseError(
@@ -324,15 +416,11 @@ class FBrefProxyLeaseClient:
         try:
             returned_max = body["max_bytes"]
             returned_expiry = body["expires_at"]
-            up = int(body["up_bytes"])
-            down = int(body["down_bytes"])
-            total = int(body["total_bytes"])
-            active = int(body["active_tunnels"])
-            reserved = int(body["reserved_bytes"])
         except (KeyError, TypeError, ValueError) as exc:
             raise FBrefProxyLeaseError(
                 "FBref proxy meter extension schema mismatch"
             ) from exc
+        stats = self._stats_from_mapping(lease, body, expected=expected)
         if (
             isinstance(returned_max, bool)
             or not isinstance(returned_max, int)
@@ -345,14 +433,16 @@ class FBrefProxyLeaseClient:
             or str(body.get("source") or "") != "fbref"
             or str(body.get("dag_id") or "") != str(expected.get("dag_id") or "")
             or str(body.get("run_id") or "") != str(expected.get("run_id") or "")
-            or min(up, down, active, reserved) < 0
-            or total != up + down
-            or total > lease.max_bytes
-            or active != 0
-            or reserved != 0
-            or bool(body.get("closed"))
-            or bool(body.get("expired"))
-            or bool(body.get("budget_exceeded"))
+            or stats.active_tunnels != 0
+            or stats.reserved_bytes != 0
+            or stats.active_provider_readers != 0
+            or stats.provider_reserved_bytes != 0
+            or stats.pending_client_hellos != 0
+            or stats.staged_client_bytes != 0
+            or stats.closed
+            or stats.expired
+            or stats.budget_exceeded
+            or stats.accounting_uncertain
             or (
                 "token" in body
                 and str(body.get("token") or "") != lease.token
@@ -382,11 +472,129 @@ class FBrefProxyLeaseClient:
         deadline = self._monotonic() + self.drain_timeout_seconds
         while True:
             stats = self.stats(lease, expected=expected)
-            if stats.active_tunnels == 0 and stats.reserved_bytes == 0:
+            if (
+                stats.accounting_uncertain
+                or stats.budget_exceeded
+                or stats.expired
+                or stats.closed
+            ):
+                raise FBrefProxyLeaseError(
+                    "FBref paid proxy drain found terminal accounting state"
+                )
+            if (
+                stats.active_tunnels == 0
+                and stats.reserved_bytes == 0
+                and stats.active_provider_readers == 0
+                and stats.provider_reserved_bytes == 0
+                and stats.pending_client_hellos == 0
+                and stats.staged_client_bytes == 0
+            ):
                 return stats
             if self._monotonic() >= deadline:
                 raise FBrefProxyLeaseError(
                     "FBref paid proxy tunnels did not drain before accounting"
+                )
+            self._sleep(0.05)
+
+    @staticmethod
+    def _idle_tuple(stats: FBrefLeaseStats) -> tuple[object, ...]:
+        return (
+            stats.lease_id,
+            stats.source,
+            stats.dag_id,
+            stats.run_id,
+            stats.task_id,
+            stats.canonical_url,
+            stats.scope,
+            stats.up_bytes,
+            stats.down_bytes,
+            stats.active_tunnels,
+            stats.reserved_bytes,
+            stats.active_provider_readers,
+            stats.provider_reserved_bytes,
+            stats.pending_client_hellos,
+            stats.staged_client_bytes,
+            stats.closed,
+            stats.expired,
+            stats.budget_exceeded,
+            stats.accounting_uncertain,
+            stats.close_complete,
+        )
+
+    def wait_idle(
+        self,
+        lease: FBrefProxyLease,
+        *,
+        expected: Mapping[str, Any],
+        expected_tunnels: int = 1,
+    ) -> FBrefLeaseStats:
+        """Prove one stable exact checkpoint without closing its tunnel."""
+
+        if expected_tunnels not in {0, 1}:
+            raise ValueError("expected_tunnels must be zero or one")
+        deadline = self._monotonic() + self.drain_timeout_seconds
+        previous: Optional[FBrefLeaseStats] = None
+        stable_samples = 0
+        last_up = -1
+        last_down = -1
+        while True:
+            stats = self.stats(lease, expected=expected)
+            if stats.up_bytes < last_up or stats.down_bytes < last_down:
+                raise FBrefProxyLeaseError(
+                    "FBref paid proxy idle counter moved backwards"
+                )
+            last_up, last_down = stats.up_bytes, stats.down_bytes
+            if (
+                stats.budget_exceeded
+                or stats.accounting_uncertain
+                or stats.expired
+                or stats.closed
+                or stats.pending_client_hellos != 0
+                or stats.staged_client_bytes != 0
+            ):
+                raise FBrefProxyLeaseError(
+                    "FBref paid proxy idle proof found terminal or staged work"
+                )
+            if expected_tunnels == 0:
+                impossible = (
+                    stats.active_tunnels != 0
+                    or stats.active_provider_readers != 0
+                    or stats.reserved_bytes != 0
+                    or stats.provider_reserved_bytes != 0
+                )
+                idle = not impossible
+            else:
+                idle = (
+                    stats.active_tunnels == 1
+                    and stats.active_provider_readers == 1
+                    and stats.reserved_bytes == stats.provider_reserved_bytes
+                )
+                impossible = (
+                    stats.active_tunnels != 1
+                    or stats.active_provider_readers != 1
+                    or stats.reserved_bytes != stats.provider_reserved_bytes
+                )
+            if impossible:
+                raise FBrefProxyLeaseError(
+                    "FBref paid proxy idle proof found unexpected tunnel state"
+                )
+            if idle:
+                if (
+                    previous is not None
+                    and self._idle_tuple(previous) == self._idle_tuple(stats)
+                ):
+                    stable_samples += 1
+                else:
+                    stable_samples = 1
+                previous = stats
+                if stable_samples >= 2:
+                    return stats
+            else:
+                previous = None
+                stable_samples = 0
+            if self._monotonic() >= deadline:
+                raise FBrefProxyLeaseError(
+                    "FBref paid proxy did not reach a stable idle checkpoint"
                 )
             self._sleep(0.05)
 
@@ -430,6 +638,39 @@ class FBrefProxyLeaseClient:
                     "FBref paid lease close did not return final counters"
                 )
             self._sleep(0.05)
+
+    def close_strict(
+        self,
+        lease: FBrefProxyLease,
+        *,
+        expected: Mapping[str, Any],
+    ) -> FBrefLeaseStats:
+        """Close once and accept only complete, exact, zero-lifecycle proof."""
+
+        _, body = self._request(
+            "DELETE",
+            f"/v1/leases/{lease.lease_id}/close",
+            lease=lease,
+            payload={"completed": True},
+        )
+        stats = self._stats_from_mapping(lease, body, expected=expected)
+        if (
+            not stats.closed
+            or not stats.close_complete
+            or stats.active_tunnels != 0
+            or stats.active_provider_readers != 0
+            or stats.reserved_bytes != 0
+            or stats.provider_reserved_bytes != 0
+            or stats.pending_client_hellos != 0
+            or stats.staged_client_bytes != 0
+            or stats.expired
+            or stats.budget_exceeded
+            or stats.accounting_uncertain
+        ):
+            raise FBrefProxyLeaseError(
+                "FBref paid lease strict close returned incomplete counters"
+            )
+        return stats
 
 
 __all__ = [

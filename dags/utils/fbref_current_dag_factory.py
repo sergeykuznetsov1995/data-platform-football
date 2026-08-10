@@ -11,7 +11,7 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from scrapers.fbref.settings import DEFAULT_DOMAIN_INTERVAL_SECONDS
 
-from utils.default_args import DEFAULT_ARGS, INGEST_SCRAPER_POOL
+from utils.default_args import DEFAULT_ARGS
 from utils.fbref_pipeline_tasks import (
     FBREF_CANARY_BYTE_LIMIT_MB,
     FBREF_CANARY_REQUEST_LIMIT,
@@ -19,6 +19,7 @@ from utils.fbref_pipeline_tasks import (
     FBREF_MAX_WARM_SESSION_TARGETS,
     FBREF_PRODUCTION_BYTE_LIMIT_MB,
     FBREF_PRODUCTION_REQUEST_LIMIT,
+    FBREF_SCRAPER_POOL,
     acquire_fbref_publication_lock,
     audit_fbref_raw_integrity,
     capture_fbref_raw_baseline,
@@ -56,7 +57,7 @@ PAGE_KINDS = (
 
 # One unforked process advances bounded raw-first batches while retaining the
 # same clearance and proxy quarantine for the run.
-CURRENT_MAX_BATCHES = 16
+CURRENT_MAX_BATCHES = 80
 CURRENT_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT
 CURRENT_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB
 DEFAULT_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
@@ -80,13 +81,13 @@ def _scheduled_params() -> dict:
             CURRENT_REQUEST_LIMIT,
             type="integer",
             enum=[FBREF_CANARY_REQUEST_LIMIT, CURRENT_REQUEST_LIMIT],
-            description="Hard canary (100) or production (200) request cap",
+            description="Canary (100) or production safety circuit (4096)",
         ),
         "byte_limit_mb": Param(
             CURRENT_BYTE_LIMIT_MB,
             type="integer",
             enum=[FBREF_CANARY_BYTE_LIMIT_MB, CURRENT_BYTE_LIMIT_MB],
-            description="Hard canary (50) or production (100) MiB cap",
+            description="Canary (50) or production safety circuit (2048 MiB)",
         ),
         "shard_size": Param(
             DEFAULT_SHARD_SIZE,
@@ -104,7 +105,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
     if bootstrap_only:
         dag_id = BOOTSTRAP_DAG_ID
         schedule = None
-        dagrun_timeout = timedelta(hours=3)
+        dagrun_timeout = timedelta(hours=8)
         request_limit = FBREF_PRODUCTION_REQUEST_LIMIT
         byte_limit_mb = FBREF_PRODUCTION_BYTE_LIMIT_MB
         shard_size = FBREF_MAX_WARM_SESSION_TARGETS
@@ -114,7 +115,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         ## FBref manual bootstrap
 
         This DAG has no schedule and is safe to leave unpaused. It always uses
-        the exact production `200 requests / 100 MiB / shard 25` profile. It
+        the exact production `4096 requests / 2048 MiB / shard 25` safety profile. It
         performs raw recovery, live fetch, parse, and integrity validation,
         then releases the publication lock. Freshness, scope export, canary,
         and Silver tasks do not exist in this DAG.
@@ -137,7 +138,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
         shared PostgreSQL request/byte budget and commits raw bytes before
         parsing. Silver starts only after final completeness/traffic
         validation passes. DagRun conf may select only the measured `100/50`
-        canary profile or the default `200/100` production profile; every warm
+        canary profile or the default `4096/2048` production safety profile; every warm
         session claims at most 25 targets. A content-hashed raw inventory is
         captured before recovery/fetch, and publication is gated by a
         persisted integrity artifact. ALERT_ENV must be `prod` before the
@@ -260,8 +261,8 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
                 "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
                 "max_batches": CURRENT_MAX_BATCHES,
             },
-            pool=INGEST_SCRAPER_POOL,
-            execution_timeout=timedelta(minutes=120),
+            pool=FBREF_SCRAPER_POOL,
+            execution_timeout=timedelta(hours=6, minutes=5),
             retries=0,
             trigger_rule="all_success",
         )

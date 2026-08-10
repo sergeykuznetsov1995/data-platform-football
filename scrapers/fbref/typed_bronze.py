@@ -147,6 +147,10 @@ class TypedBronzePersistenceError(TypedBronzeError):
     """A typed dataset could not be committed safely."""
 
 
+class TypedBronzeBatchUnsupported(TypedBronzePersistenceError):
+    """The cohort must use the already-claimed sequential fallback."""
+
+
 _CLEAR_TO_EMPTY_STATUSES = frozenset(
     {
         DatasetStatus.EMPTY.value,
@@ -241,6 +245,12 @@ class _TrinoManager(Protocol):
         target_column_types: Optional[Mapping[str, str]] = None,
     ) -> int: ...
 
+    def validate_dataframe_values(
+        self,
+        df: pd.DataFrame,
+        column_types: Mapping[str, str],
+    ) -> None: ...
+
 
 @dataclass(frozen=True)
 class TypedSourceContext:
@@ -290,6 +300,42 @@ class TypedSourceContext:
             if match:
                 return int(match.group("start"))
         return None
+
+
+@dataclass(frozen=True)
+class TypedMatchPersistItem:
+    """One already-parsed match observation ready for typed persistence."""
+
+    parsed: MatchParseResult
+    match_id: str
+    context: TypedSourceContext
+    run_id: str
+    target_identity: str
+
+
+@dataclass(frozen=True)
+class _ValidatedMatchPersistItem:
+    item: TypedMatchPersistItem
+    actions: Mapping[str, str]
+    availability_rows: tuple[dict[str, object], ...]
+
+
+@dataclass(frozen=True)
+class _PreparedTypedTableWrite:
+    dataset: str
+    table: str
+    decorated: Optional[pd.DataFrame]
+    delete_filter: str
+    staging_parts: tuple[object, ...]
+
+
+@dataclass(frozen=True)
+class _PreparedMatchBatch:
+    table_writes: tuple[_PreparedTypedTableWrite, ...]
+    availability: pd.DataFrame
+    availability_filter: str
+    availability_staging_parts: tuple[object, ...]
+    counts: tuple[Dict[str, int], ...]
 
 
 def compatibility_league_alias(
@@ -684,6 +730,27 @@ class FBrefTypedBronzeWriter:
             for name, column_type in columns.items()
         }
 
+    @staticmethod
+    def _require_textual_scope_columns(
+        table: str,
+        columns: Mapping[str, str],
+        required: Sequence[str],
+    ) -> None:
+        normalized = FBrefTypedBronzeWriter._normalized_columns(columns)
+        invalid = [
+            column
+            for column in required
+            if column.casefold() not in normalized
+            or not normalized[column.casefold()].strip().upper().startswith(
+                ("VARCHAR", "CHAR")
+            )
+        ]
+        if invalid:
+            names = ", ".join(invalid)
+            raise TypedBronzePersistenceError(
+                f"{table} requires textual {names} for its delete scope"
+            )
+
     def _cached_table_columns(self, table: str) -> Dict[str, str]:
         cached = self._table_columns.get(table)
         if cached is not None:
@@ -768,10 +835,32 @@ class FBrefTypedBronzeWriter:
             run_id=run_id,
             ingested_at=ingested_at,
         )
-        target_column_types = self._ensure_table(table, decorated)
-        staging_id = _staging_identity(
-            run_id, target_identity, dataset, table
+        return self._persist_decorated_frame(
+            dataset=dataset,
+            table=table,
+            decorated=decorated,
+            delete_filter=delete_filter,
+            staging_parts=(run_id, target_identity, dataset, table),
         )
+
+    def _persist_decorated_frame(
+        self,
+        *,
+        dataset: str,
+        table: str,
+        decorated: pd.DataFrame,
+        delete_filter: str,
+        staging_parts: Sequence[object],
+        target_column_types: Optional[Mapping[str, str]] = None,
+    ) -> int:
+        """Replace an exact scope with an already-decorated frame."""
+
+        resolved_column_types = (
+            dict(target_column_types)
+            if target_column_types is not None
+            else self._ensure_table(table, decorated)
+        )
+        staging_id = _staging_identity(*staging_parts)
         inserted = self.manager.insert_dataframe_atomic(
             self.schema,
             table,
@@ -779,7 +868,7 @@ class FBrefTypedBronzeWriter:
             delete_filter=delete_filter,
             staging_id=staging_id,
             single_statement_replace=True,
-            target_column_types=target_column_types,
+            target_column_types=resolved_column_types,
         )
         if inserted != len(decorated):
             raise TypedBronzePersistenceError(
@@ -821,6 +910,7 @@ class FBrefTypedBronzeWriter:
             table,
             pd.DataFrame(),
             delete_filter=delete_filter,
+            single_statement_replace=True,
         )
         if deleted != 0:
             raise TypedBronzePersistenceError(
@@ -871,99 +961,284 @@ class FBrefTypedBronzeWriter:
         run_id: str,
         target_identity: str,
     ) -> Dict[str, int]:
-        errors = [
-            name
-            for name, dataset in parsed.datasets.items()
-            if str(getattr(dataset.status, "value", dataset.status)).casefold()
-            == DatasetStatus.ERROR.value
-        ]
-        if parsed.has_errors or errors:
-            raise MatchPageParseError(
-                f"Refusing partial typed persistence; parser errors: {errors}"
-            )
-
-        actions: Dict[str, str] = {}
-        for name, result in parsed.datasets.items():
-            action = _persistence_action(result)
-            if action == "skip":
-                continue
-            if name not in MATCH_DATASET_TABLES:
-                raise TypedBronzePersistenceError(
-                    f"No typed Bronze table mapping for {name}"
-                )
-            actions[name] = action
-
-        ordered = [
-            dataset
-            for dataset in MATCH_DATASET_TABLES
-            if dataset in actions
-        ]
-
-        ingested_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        counts: Dict[str, int] = {}
-        for dataset in ordered:
-            table = MATCH_DATASET_TABLES[dataset]
-            delete_filter = f"match_id = {_sql_string(match_id)}"
-            if actions[dataset] == "clear":
-                counts[dataset] = self._persist_empty(
-                    table=table,
-                    delete_filter=delete_filter,
-                )
-            else:
-                frame = parsed.datasets[dataset].frame
-                assert frame is not None
-                counts[dataset] = self._persist_frame(
-                    dataset=dataset,
-                    table=table,
-                    frame=frame,
+        return self.persist_matches(
+            [
+                TypedMatchPersistItem(
+                    parsed=parsed,
+                    match_id=match_id,
                     context=context,
                     run_id=run_id,
                     target_identity=target_identity,
-                    delete_filter=delete_filter,
-                    ingested_at=ingested_at,
+                )
+            ]
+        )[0]
+
+    @staticmethod
+    def _validate_match_batch(
+        items: Sequence[TypedMatchPersistItem],
+    ) -> tuple[_ValidatedMatchPersistItem, ...]:
+        match_ids = [str(item.match_id) for item in items]
+        target_identities = [str(item.target_identity) for item in items]
+        if len(match_ids) != len(set(match_ids)):
+            raise TypedBronzeBatchUnsupported(
+                "duplicate match_id in typed persistence batch"
+            )
+        if len(target_identities) != len(set(target_identities)):
+            raise TypedBronzeBatchUnsupported(
+                "duplicate target_identity in typed persistence batch"
+            )
+
+        validated: list[_ValidatedMatchPersistItem] = []
+        for item in items:
+            errors = [
+                name
+                for name, dataset in item.parsed.datasets.items()
+                if str(
+                    getattr(dataset.status, "value", dataset.status)
+                ).casefold()
+                == DatasetStatus.ERROR.value
+            ]
+            if item.parsed.has_errors or errors:
+                raise MatchPageParseError(
+                    "Refusing partial typed persistence; parser errors: "
+                    f"{errors}"
                 )
 
-        # Independent typed completion evidence is always committed last.
-        # A page that legitimately lacks match_player_stats can therefore
-        # complete without deleting that table. Partial remediation updates
-        # only the requested dataset keys and cannot overwrite availability
-        # recorded by the full-page parser.
-        availability_rows = [
-            {
-                "match_id": str(match_id),
-                "dataset": name,
-                "availability": str(
-                    getattr(result.status, "value", result.status)
-                ).casefold(),
-                "reason": result.reason,
-            }
-            for name, result in parsed.datasets.items()
-            if str(result.reason or "").casefold()
-            not in _NOT_REQUESTED_REASONS
-        ]
-        if not availability_rows:
-            raise TypedBronzePersistenceError(
-                "Match parser produced no requested dataset availability"
+            actions: Dict[str, str] = {}
+            for name, result in item.parsed.datasets.items():
+                action = _persistence_action(result)
+                if action == "skip":
+                    continue
+                if name not in MATCH_DATASET_TABLES:
+                    raise TypedBronzePersistenceError(
+                        f"No typed Bronze table mapping for {name}"
+                    )
+                actions[name] = action
+
+            availability_rows = tuple(
+                {
+                    "match_id": str(item.match_id),
+                    "dataset": name,
+                    "availability": str(
+                        getattr(result.status, "value", result.status)
+                    ).casefold(),
+                    "reason": result.reason,
+                }
+                for name, result in item.parsed.datasets.items()
+                if str(result.reason or "").casefold()
+                not in _NOT_REQUESTED_REASONS
             )
-        availability = pd.DataFrame(availability_rows)
-        dataset_filter = ", ".join(
-            _sql_string(row["dataset"])
-            for row in availability_rows
+            if not availability_rows:
+                raise TypedBronzePersistenceError(
+                    "Match parser produced no requested dataset availability"
+                )
+            validated.append(
+                _ValidatedMatchPersistItem(
+                    item=item,
+                    actions=MappingProxyType(dict(actions)),
+                    availability_rows=availability_rows,
+                )
+            )
+        return tuple(validated)
+
+    def _prepare_validated_match_batch(
+        self, items: Sequence[_ValidatedMatchPersistItem]
+    ) -> _PreparedMatchBatch:
+        """Materialize every frame and local schema before any manager call."""
+
+        ingested_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        counts: list[Dict[str, int]] = [{} for _item in items]
+        table_writes: list[_PreparedTypedTableWrite] = []
+
+        for dataset, table in MATCH_DATASET_TABLES.items():
+            affected = [
+                (index, validated)
+                for index, validated in enumerate(items)
+                if dataset in validated.actions
+            ]
+            if not affected:
+                continue
+
+            decorated_frames: list[pd.DataFrame] = []
+            for index, validated in affected:
+                action = validated.actions[dataset]
+                if action == "clear":
+                    counts[index][dataset] = 0
+                    continue
+                frame = validated.item.parsed.datasets[dataset].frame
+                assert frame is not None
+                decorated_frames.append(
+                    self._decorate(
+                        frame,
+                        dataset=dataset,
+                        context=validated.item.context,
+                        run_id=validated.item.run_id,
+                        ingested_at=ingested_at,
+                    )
+                )
+                counts[index][dataset] = len(frame)
+
+            delete_filter = " OR ".join(
+                f"match_id = {_sql_string(validated.item.match_id)}"
+                for _index, validated in affected
+            )
+            if decorated_frames:
+                combined = pd.concat(
+                    decorated_frames, ignore_index=True, sort=False
+                )
+                # Mirror _ensure_table's local conversion now. A bad late
+                # dtype or duplicate column must fail before an earlier table
+                # can be committed.
+                pa.Table.from_pandas(combined, preserve_index=False)
+            else:
+                combined = None
+            table_writes.append(
+                _PreparedTypedTableWrite(
+                    dataset=dataset,
+                    table=table,
+                    decorated=combined,
+                    delete_filter=delete_filter,
+                    staging_parts=(
+                        "batch",
+                        *(
+                            validated.item.target_identity
+                            for _, validated in affected
+                        ),
+                        dataset,
+                        table,
+                    ),
+                )
+            )
+
+        availability_frames = [
+            self._decorate(
+                pd.DataFrame(validated.availability_rows),
+                dataset="dataset_availability",
+                context=validated.item.context,
+                run_id=validated.item.run_id,
+                ingested_at=ingested_at,
+            )
+            for validated in items
+        ]
+        availability = pd.concat(
+            availability_frames, ignore_index=True, sort=False
         )
-        self._persist_frame(
+        pa.Table.from_pandas(availability, preserve_index=False)
+        availability_filter = " OR ".join(
+            "match_id = "
+            f"{_sql_string(row['match_id'])} AND dataset = "
+            f"{_sql_string(row['dataset'])}"
+            for validated in items
+            for row in validated.availability_rows
+        )
+        return _PreparedMatchBatch(
+            table_writes=tuple(table_writes),
+            availability=availability,
+            availability_filter=availability_filter,
+            availability_staging_parts=(
+                "batch",
+                *(validated.item.target_identity for validated in items),
+                "dataset_availability",
+                MATCH_AVAILABILITY_TABLE,
+            ),
+            counts=tuple(dict(item_counts) for item_counts in counts),
+        )
+
+    def _persist_validated_match_batch(
+        self, items: Sequence[_ValidatedMatchPersistItem]
+    ) -> list[Dict[str, int]]:
+        prepared = self._prepare_validated_match_batch(items)
+
+        # Complete every metadata/schema preflight before the first live row
+        # commit. DDL may be needed for a fresh table, but a later DESCRIBE or
+        # ALTER failure cannot follow an earlier dataset replacement.
+        target_column_types: Dict[str, Dict[str, str]] = {}
+        absent_clear_tables: set[str] = set()
+        for write in prepared.table_writes:
+            if write.decorated is not None:
+                target_column_types[write.table] = self._ensure_table(
+                    write.table, write.decorated
+                )
+                continue
+            if write.table not in self._known_tables:
+                if self.manager.table_exists(self.schema, write.table):
+                    self._known_tables.add(write.table)
+                else:
+                    absent_clear_tables.add(write.table)
+            if write.table not in absent_clear_tables:
+                target_column_types[write.table] = (
+                    self._cached_table_columns(write.table)
+                )
+        target_column_types[MATCH_AVAILABILITY_TABLE] = self._ensure_table(
+            MATCH_AVAILABILITY_TABLE, prepared.availability
+        )
+
+        for write in prepared.table_writes:
+            if write.table in absent_clear_tables:
+                continue
+            self._require_textual_scope_columns(
+                write.table,
+                target_column_types[write.table],
+                ("match_id",),
+            )
+        self._require_textual_scope_columns(
+            MATCH_AVAILABILITY_TABLE,
+            target_column_types[MATCH_AVAILABILITY_TABLE],
+            ("match_id", "dataset"),
+        )
+
+        # Exercise the exact production scalar formatter for the complete
+        # cohort after schemas are authoritative and before any live write.
+        for write in prepared.table_writes:
+            if write.decorated is not None:
+                self.manager.validate_dataframe_values(
+                    write.decorated, target_column_types[write.table]
+                )
+        self.manager.validate_dataframe_values(
+            prepared.availability,
+            target_column_types[MATCH_AVAILABILITY_TABLE],
+        )
+
+        for write in prepared.table_writes:
+            if write.decorated is None:
+                if write.table in absent_clear_tables:
+                    continue
+                self._persist_empty(
+                    table=write.table,
+                    delete_filter=write.delete_filter,
+                )
+                continue
+            self._persist_decorated_frame(
+                dataset=write.dataset,
+                table=write.table,
+                decorated=write.decorated,
+                delete_filter=write.delete_filter,
+                staging_parts=write.staging_parts,
+                target_column_types=target_column_types[write.table],
+            )
+
+        # Independent typed completion evidence remains the final Iceberg
+        # write. Each tuple is spelled out to avoid Cartesian IN-set deletes.
+        self._persist_decorated_frame(
             dataset="dataset_availability",
             table=MATCH_AVAILABILITY_TABLE,
-            frame=availability,
-            context=context,
-            run_id=run_id,
-            target_identity=target_identity,
-            delete_filter=(
-                f"match_id = {_sql_string(match_id)} "
-                f"AND dataset IN ({dataset_filter})"
-            ),
-            ingested_at=ingested_at,
+            decorated=prepared.availability,
+            delete_filter=prepared.availability_filter,
+            staging_parts=prepared.availability_staging_parts,
+            target_column_types=target_column_types[MATCH_AVAILABILITY_TABLE],
         )
-        return counts
+        return [dict(item_counts) for item_counts in prepared.counts]
+
+    def persist_matches(
+        self, items: Sequence[TypedMatchPersistItem]
+    ) -> list[Dict[str, int]]:
+        """Persist a validated match cohort with one replacement per table."""
+
+        materialized = tuple(items)
+        if not materialized:
+            return []
+        validated = self._validate_match_batch(materialized)
+        return self._persist_validated_match_batch(validated)
 
     def persist_season_stats(
         self,
@@ -1107,7 +1382,9 @@ __all__ = [
     "SEASON_ROUTE_DATASETS",
     "TYPED_BRONZE_PARSER_VERSION",
     "TypedBronzeError",
+    "TypedBronzeBatchUnsupported",
     "TypedBronzePersistenceError",
+    "TypedMatchPersistItem",
     "TypedSourceContext",
     "compatibility_league_alias",
     "parse_match_html",

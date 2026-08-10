@@ -12,6 +12,7 @@ import pytest
 
 import scrapers.fbref.typed_bronze as typed
 import scrapers.fbref.match_parser as match_parser
+from scrapers.base.trino_manager import TrinoTableManager
 from scrapers.fbref.match_parser import (
     DatasetParseResult,
     DatasetStatus,
@@ -218,6 +219,466 @@ class RecordingManager:
             }
         )
         return len(frame)
+
+    def validate_dataframe_values(
+        self,
+        frame: pd.DataFrame,
+        column_types: dict[str, str],
+    ) -> None:
+        TrinoTableManager.validate_dataframe_values(
+            self, frame, column_types
+        )
+
+    def _format_sql_value(self, value, target_type=""):
+        return TrinoTableManager._format_sql_value(self, value, target_type)
+
+
+def _match_item(
+    match_id: str,
+    datasets: dict[str, DatasetParseResult] | None = None,
+    *,
+    target_identity: str | None = None,
+) -> typed.TypedMatchPersistItem:
+    resolved = datasets or {
+        "match_events": DatasetParseResult(
+            "match_events",
+            DatasetStatus.AVAILABLE,
+            frame=pd.DataFrame({"match_id": [match_id], "minute": [1]}),
+        ),
+        "match_player_stats": DatasetParseResult(
+            "match_player_stats", DatasetStatus.EMPTY
+        ),
+    }
+    return typed.TypedMatchPersistItem(
+        parsed=MatchParseResult(
+            parser_version="test",
+            parsed_at="2026-08-08T00:00:00+00:00",
+            status=DatasetStatus.AVAILABLE,
+            datasets=resolved,
+        ),
+        match_id=match_id,
+        context=typed.TypedSourceContext("9", "2025-2026"),
+        run_id=f"run-{match_id}",
+        target_identity=target_identity or f"match:{match_id}",
+    )
+
+
+@pytest.mark.unit
+def test_persist_matches_writes_each_table_once_and_aligns_item_counts() -> None:
+    manager = RecordingManager()
+    writer = typed.FBrefTypedBronzeWriter(manager)
+
+    counts = writer.persist_matches(
+        [_match_item("match-a"), _match_item("match-b")]
+    )
+
+    assert counts == [
+        {"match_events": 1, "match_player_stats": 0},
+        {"match_events": 1, "match_player_stats": 0},
+    ]
+    assert [call["table"] for call in manager.writes] == [
+        "fbref_match_events",
+        "fbref_dataset_availability",
+    ]
+    assert len(manager.writes[0]["frame"]) == 2
+    assert manager.writes[-1]["table"] == typed.MATCH_AVAILABILITY_TABLE
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "items",
+    [
+        [_match_item("match-a"), _match_item("match-a")],
+        [
+            _match_item("match-a", target_identity="duplicate-target"),
+            _match_item("match-b", target_identity="duplicate-target"),
+        ],
+    ],
+)
+def test_persist_matches_rejects_duplicate_match_or_target_identity_before_ddl(
+    items,
+) -> None:
+    manager = RecordingManager()
+
+    with pytest.raises(typed.TypedBronzeBatchUnsupported, match="duplicate"):
+        typed.FBrefTypedBronzeWriter(manager).persist_matches(items)
+
+    assert manager.writes == []
+    assert manager.table_exists_calls == []
+    assert manager.create_calls == []
+
+
+@pytest.mark.unit
+def test_persist_matches_mixed_write_clear_skip_uses_only_exact_table_scope() -> None:
+    manager = RecordingManager()
+    manager.columns["fbref_lineups"] = {"match_id": "VARCHAR"}
+    items = [
+        _match_item(
+            "match-write",
+            {
+                "lineups": DatasetParseResult(
+                    "lineups",
+                    DatasetStatus.AVAILABLE,
+                    frame=pd.DataFrame({"match_id": ["match-write"]}),
+                )
+            },
+        ),
+        _match_item(
+            "match-clear",
+            {"lineups": DatasetParseResult("lineups", DatasetStatus.EMPTY)},
+        ),
+        _match_item(
+            "match-skip",
+            {
+                "lineups": DatasetParseResult(
+                    "lineups",
+                    DatasetStatus.NOT_APPLICABLE,
+                    reason="dataset_not_requested",
+                ),
+                "match_player_stats": DatasetParseResult(
+                    "match_player_stats",
+                    DatasetStatus.NOT_APPLICABLE,
+                    reason="source_container_not_published",
+                ),
+            },
+        ),
+    ]
+
+    counts = typed.FBrefTypedBronzeWriter(manager).persist_matches(items)
+
+    assert counts == [{"lineups": 1}, {"lineups": 0}, {}]
+    lineup_call = manager.writes[0]
+    assert lineup_call["table"] == "fbref_lineups"
+    assert set(lineup_call["frame"]["match_id"]) == {"match-write"}
+    assert "match_id = 'match-write'" in lineup_call["delete_filter"]
+    assert "match_id = 'match-clear'" in lineup_call["delete_filter"]
+    assert "match-skip" not in lineup_call["delete_filter"]
+    assert lineup_call["single_statement_replace"] is True
+
+
+@pytest.mark.unit
+def test_persist_matches_availability_delete_is_exact_pair_disjunction() -> None:
+    manager = RecordingManager()
+    items = [
+        _match_item(
+            "match-a",
+            {"lineups": DatasetParseResult("lineups", DatasetStatus.EMPTY)},
+        ),
+        _match_item(
+            "match-b",
+            {
+                "match_events": DatasetParseResult(
+                    "match_events", DatasetStatus.EMPTY
+                )
+            },
+        ),
+    ]
+
+    typed.FBrefTypedBronzeWriter(manager).persist_matches(items)
+
+    delete_filter = manager.writes[-1]["delete_filter"]
+    assert "match_id IN" not in delete_filter
+    assert "dataset IN" not in delete_filter
+    assert "match_id = 'match-a' AND dataset = 'lineups'" in delete_filter
+    assert "match_id = 'match-b' AND dataset = 'match_events'" in delete_filter
+    assert "match_id = 'match-a' AND dataset = 'match_events'" not in delete_filter
+    assert "match_id = 'match-b' AND dataset = 'lineups'" not in delete_filter
+
+
+@pytest.mark.unit
+def test_persist_matches_preserves_disjoint_nullable_extension_dtypes() -> None:
+    manager = RecordingManager()
+    first = pd.DataFrame(
+        {
+            "match_id": ["match-a"],
+            "nullable_metric": pd.Series([7], dtype="Int64"),
+        }
+    )
+    second = pd.DataFrame(
+        {
+            "match_id": ["match-b"],
+            "nullable_label": pd.Series(["value"], dtype="string"),
+        }
+    )
+
+    typed.FBrefTypedBronzeWriter(manager).persist_matches(
+        [
+            _match_item(
+                "match-a",
+                {
+                    "match_events": DatasetParseResult(
+                        "match_events", DatasetStatus.AVAILABLE, frame=first
+                    )
+                },
+            ),
+            _match_item(
+                "match-b",
+                {
+                    "match_events": DatasetParseResult(
+                        "match_events", DatasetStatus.AVAILABLE, frame=second
+                    )
+                },
+            ),
+        ]
+    )
+
+    frame = manager.writes[0]["frame"]
+    assert str(frame["nullable_metric"].dtype) == "Int64"
+    assert str(frame["nullable_label"].dtype) == "string"
+    assert frame["nullable_metric"].isna().tolist() == [False, True]
+    assert frame["nullable_label"].isna().tolist() == [True, False]
+
+
+@pytest.mark.unit
+def test_persist_matches_all_clear_batches_replace_each_table_only_once() -> None:
+    manager = RecordingManager()
+    manager.columns["fbref_match_events"] = {"match_id": "VARCHAR"}
+
+    counts = typed.FBrefTypedBronzeWriter(manager).persist_matches(
+        [
+            _match_item(
+                match_id,
+                {
+                    "match_events": DatasetParseResult(
+                        "match_events", DatasetStatus.EMPTY
+                    )
+                },
+            )
+            for match_id in ("match-a", "match-b")
+        ]
+    )
+
+    assert counts == [{"match_events": 0}, {"match_events": 0}]
+    assert [call["table"] for call in manager.writes] == [
+        "fbref_match_events",
+        "fbref_dataset_availability",
+    ]
+    assert manager.writes[0]["frame"].empty
+    assert "match-a" in manager.writes[0]["delete_filter"]
+    assert "match-b" in manager.writes[0]["delete_filter"]
+
+
+@pytest.mark.unit
+def test_persist_matches_validates_late_item_before_first_write() -> None:
+    manager = RecordingManager()
+    unsafe = _match_item(
+        "unsafe-match",
+        {
+            "match_events": DatasetParseResult(
+                "match_events", DatasetStatus.ERROR
+            )
+        },
+    )
+
+    with pytest.raises(MatchPageParseError):
+        typed.FBrefTypedBronzeWriter(manager).persist_matches(
+            [_match_item("valid-match"), unsafe]
+        )
+
+    assert manager.writes == []
+    assert manager.table_exists_calls == []
+    assert manager.create_calls == []
+
+
+@pytest.mark.unit
+def test_persist_matches_materializes_late_dataset_before_first_write(
+    monkeypatch,
+) -> None:
+    manager = RecordingManager()
+    writer = typed.FBrefTypedBronzeWriter(manager)
+    original_decorate = writer._decorate
+
+    def fail_late_decorate(frame, *, dataset, **kwargs):
+        if dataset == "match_player_stats":
+            raise TypeError("injected late dtype failure")
+        return original_decorate(frame, dataset=dataset, **kwargs)
+
+    monkeypatch.setattr(writer, "_decorate", fail_late_decorate)
+    item = _match_item(
+        "materialize-first",
+        {
+            "match_events": DatasetParseResult(
+                "match_events",
+                DatasetStatus.AVAILABLE,
+                frame=pd.DataFrame({"match_id": ["materialize-first"]}),
+            ),
+            "match_player_stats": DatasetParseResult(
+                "match_player_stats",
+                DatasetStatus.AVAILABLE,
+                frame=pd.DataFrame({"match_id": ["materialize-first"]}),
+            ),
+        },
+    )
+
+    with pytest.raises(TypeError, match="late dtype failure"):
+        writer.persist_matches([item])
+
+    assert manager.writes == []
+    assert manager.table_exists_calls == []
+    assert manager.create_calls == []
+
+
+@pytest.mark.unit
+def test_persist_matches_preflights_late_arrow_schema_before_first_write() -> None:
+    manager = RecordingManager()
+    duplicate_columns = pd.DataFrame(
+        [["materialize-first", "materialize-first"]],
+        columns=["match_id", "match_id"],
+    )
+    item = _match_item(
+        "materialize-first",
+        {
+            "match_events": DatasetParseResult(
+                "match_events",
+                DatasetStatus.AVAILABLE,
+                frame=pd.DataFrame({"match_id": ["materialize-first"]}),
+            ),
+            "match_player_stats": DatasetParseResult(
+                "match_player_stats",
+                DatasetStatus.AVAILABLE,
+                frame=duplicate_columns,
+            ),
+        },
+    )
+
+    with pytest.raises(ValueError, match="Duplicate column names"):
+        typed.FBrefTypedBronzeWriter(manager).persist_matches([item])
+
+    assert manager.writes == []
+    assert manager.table_exists_calls == []
+    assert manager.create_calls == []
+
+
+@pytest.mark.unit
+def test_persist_matches_preflights_all_target_schemas_before_live_write() -> None:
+    class LateSchemaFailureManager(RecordingManager):
+        def get_table_columns(self, schema, table):
+            if table == "fbref_match_player_stats":
+                raise RuntimeError("injected late DESCRIBE failure")
+            return super().get_table_columns(schema, table)
+
+    manager = LateSchemaFailureManager()
+    item = _match_item(
+        "schema-preflight",
+        {
+            "match_events": DatasetParseResult(
+                "match_events",
+                DatasetStatus.AVAILABLE,
+                frame=pd.DataFrame({"match_id": ["schema-preflight"]}),
+            ),
+            "match_player_stats": DatasetParseResult(
+                "match_player_stats",
+                DatasetStatus.AVAILABLE,
+                frame=pd.DataFrame({"match_id": ["schema-preflight"]}),
+            ),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="late DESCRIBE failure"):
+        typed.FBrefTypedBronzeWriter(manager).persist_matches([item])
+
+    assert manager.writes == []
+    assert manager.create_calls == [
+        "fbref_match_events",
+        "fbref_match_player_stats",
+    ]
+
+
+@pytest.mark.unit
+def test_persist_matches_preflights_late_target_value_coercion() -> None:
+    manager = RecordingManager()
+    secret = "secret-sentinel-do-not-expose"
+    manager.columns["fbref_match_events"] = {"match_id": "VARCHAR"}
+    manager.columns["fbref_match_player_stats"] = {
+        "match_id": "VARCHAR",
+        "numeric_metric": "BIGINT",
+    }
+    item = _match_item(
+        "value-preflight",
+        {
+            "match_events": DatasetParseResult(
+                "match_events",
+                DatasetStatus.AVAILABLE,
+                frame=pd.DataFrame({"match_id": ["value-preflight"]}),
+            ),
+            "match_player_stats": DatasetParseResult(
+                "match_player_stats",
+                DatasetStatus.AVAILABLE,
+                frame=pd.DataFrame(
+                    {
+                        "match_id": ["value-preflight"],
+                        "numeric_metric": [secret],
+                    }
+                ),
+            ),
+        },
+    )
+
+    with pytest.raises(ValueError) as captured:
+        typed.FBrefTypedBronzeWriter(manager).persist_matches([item])
+
+    assert "numeric_metric" in str(captured.value)
+    assert "BIGINT" in str(captured.value)
+    assert secret not in str(captured.value)
+    assert manager.writes == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "clear_columns",
+    [
+        {},
+        {"match_id": "BIGINT"},
+    ],
+    ids=["missing-match-id", "non-textual-match-id"],
+)
+def test_persist_matches_preflights_late_clear_delete_column_contract(
+    clear_columns,
+) -> None:
+    manager = RecordingManager()
+    manager.columns["fbref_match_events"] = {"match_id": "VARCHAR"}
+    manager.columns["fbref_match_player_stats"] = dict(clear_columns)
+    item = _match_item(
+        "clear-preflight",
+        {
+            "match_events": DatasetParseResult(
+                "match_events",
+                DatasetStatus.AVAILABLE,
+                frame=pd.DataFrame({"match_id": ["clear-preflight"]}),
+            ),
+            "match_player_stats": DatasetParseResult(
+                "match_player_stats", DatasetStatus.EMPTY
+            ),
+        },
+    )
+
+    with pytest.raises(
+        typed.TypedBronzePersistenceError,
+        match="textual match_id",
+    ):
+        typed.FBrefTypedBronzeWriter(manager).persist_matches([item])
+
+    assert manager.writes == []
+
+
+@pytest.mark.unit
+def test_persist_matches_requires_textual_availability_delete_columns() -> None:
+    manager = RecordingManager()
+    manager.columns["fbref_match_events"] = {"match_id": "VARCHAR"}
+    manager.columns[typed.MATCH_AVAILABILITY_TABLE] = {
+        "match_id": "VARCHAR",
+        "dataset": "BIGINT",
+    }
+
+    with pytest.raises(
+        typed.TypedBronzePersistenceError,
+        match="textual dataset",
+    ):
+        typed.FBrefTypedBronzeWriter(manager).persist_matches(
+            [_match_item("availability-contract")]
+        )
+
+    assert manager.writes == []
 
 
 @pytest.mark.unit

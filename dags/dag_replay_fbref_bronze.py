@@ -10,6 +10,7 @@ from airflow.operators.python import PythonOperator
 
 from utils.default_args import DEFAULT_ARGS
 from utils.fbref_bronze_acceptance_tasks import (
+    ACCEPTANCE_REPLAY_DEFAULT_SCHEMA,
     acquire_fbref_acceptance_publication_lock,
     initialize_fbref_acceptance_replay_run,
     parse_fbref_acceptance_replay,
@@ -29,6 +30,12 @@ DAG_ID = "{{ dag.dag_id }}"
 SOURCE_CONTROL_RUN_ID = (
     "{{ dag_run.conf.get('source_control_run_id', "
     "params.source_control_run_id) }}"
+)
+TRINO_SCHEMA = (
+    "{{ dag_run.conf.get('trino_schema', params.trino_schema) }}"
+)
+PERSISTENCE_MODE = (
+    "{{ dag_run.conf.get('persistence_mode', params.persistence_mode) }}"
 )
 
 
@@ -56,7 +63,21 @@ with DAG(
                 "[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
             ),
             description="Required successful acceptance crawl_run UUID",
-        )
+        ),
+        "trino_schema": Param(
+            default=ACCEPTANCE_REPLAY_DEFAULT_SCHEMA,
+            type="string",
+            minLength=1,
+            maxLength=128,
+            pattern="^[A-Za-z_][A-Za-z0-9_]*$",
+            description="Isolated Trino schema for this replay",
+        ),
+        "persistence_mode": Param(
+            default="sequential",
+            type="string",
+            enum=["sequential", "batch"],
+            description="Pinned persistence implementation for this replay",
+        ),
     },
     doc_md="""
     ## FBref Bronze acceptance replay
@@ -81,6 +102,8 @@ with DAG(
             "airflow_run_id": AIRFLOW_RUN_ID,
             "dag_id": DAG_ID,
             "source_control_run_id": SOURCE_CONTROL_RUN_ID,
+            "trino_schema": TRINO_SCHEMA,
+            "persistence_mode": PERSISTENCE_MODE,
         },
         retries=0,
         trigger_rule="all_success",
@@ -108,6 +131,8 @@ with DAG(
             "airflow_run_id": AIRFLOW_RUN_ID,
             "dag_id": DAG_ID,
             "source_control_run_id": SOURCE_CONTROL_RUN_ID,
+            "trino_schema": TRINO_SCHEMA,
+            "persistence_mode": PERSISTENCE_MODE,
         },
         retries=0,
         trigger_rule="all_success",
