@@ -1668,7 +1668,8 @@ def _fingerprint_command(container: str) -> list[str]:
         "{{json .Id}}\n{{json .Image}}\n{{json .Config.Image}}\n"
         "{{json .State.Status}}\n"
         "{{json .State.StartedAt}}\n"
-        '{{if .State.Health}}{{json .State.Health.Status}}{{else}}"none"{{end}}\n'
+        '{{if index .State "Health"}}{{json .State.Health.Status}}'
+        '{{else}}"none"{{end}}\n'
         "{{json .HostConfig.PortBindings}}\n{{json .Mounts}}"
     )
     return ["docker", "inspect", "--type", "container", "--format", template, container]

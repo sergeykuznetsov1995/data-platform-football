@@ -254,6 +254,19 @@ def test_guard_interpreter_binding_follows_the_operator_interpreter(
     assert plan["guard"]["executable"]["path"] == str(interpreter)
 
 
+def test_fingerprint_template_survives_a_container_without_a_healthcheck() -> None:
+    # `docker inspect --format` renders .State as a map, so a bare
+    # `{{if .State.Health}}` aborts with "map has no entry for key Health" on any
+    # container that declares no healthcheck. The webserver role declares none,
+    # so the unsafe form made every post-deploy fingerprint report the container
+    # as absent and failed the transition after the recreate had already landed.
+    command = deploy._fingerprint_command("espn-airflow-airflow-webserver-1")
+    template = command[command.index("--format") + 1]
+
+    assert "{{if .State.Health}}" not in template
+    assert 'index .State "Health"' in template or "with .State.Health" in template
+
+
 def test_release_plan_seals_the_exact_versioned_guard_and_docker_bytes(
     tmp_path: Path,
 ) -> None:
