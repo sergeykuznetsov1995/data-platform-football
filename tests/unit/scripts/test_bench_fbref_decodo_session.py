@@ -13,8 +13,16 @@ import scripts.research.bench_fbref_decodo_session as canary
 
 
 @pytest.mark.unit
-def test_probe_schedule_includes_0_10_30_60_90_and_120_minutes():
-    assert canary.PROBE_OFFSETS_SECONDS == (0, 600, 1800, 3600, 5400, 7200)
+def test_probe_schedule_includes_local_lease_and_provider_boundary():
+    assert canary.PROBE_OFFSETS_SECONDS == (
+        0,
+        600,
+        1800,
+        3600,
+        5400,
+        6900,
+        7200,
+    )
     assert canary.PROVIDER_STICKY_MINUTES == 120
     assert canary.LOCAL_LEASE_MINUTES == 115
 
@@ -68,6 +76,52 @@ def test_report_fails_closed_when_probe_is_more_than_60_seconds_late():
 
 
 @pytest.mark.unit
+def test_provider_boundary_rotation_passes_when_local_lease_stayed_stable():
+    stable_hash = canary.hash_exit_identity("203.0.113.10")
+    boundary_hash = canary.hash_exit_identity("203.0.113.11")
+    observations = tuple(
+        canary.ProbeObservation(
+            offset_seconds=offset,
+            elapsed_seconds=float(offset),
+            observed_at="2026-08-08T00:00:00+00:00",
+            exit_hash=(boundary_hash if offset == 7200 else stable_hash),
+        )
+        for offset in canary.PROBE_OFFSETS_SECONDS
+    )
+
+    report = canary.build_probe_report(observations)
+
+    assert report["local_lease_stable"] is True
+    assert report["provider_boundary_changed"] is True
+    assert report["sticky_passed"] is True
+    assert report["failures"] == []
+    assert report["recommended_provider_sticky_minutes"] == 120
+    assert report["recommended_local_lease_minutes"] == 115
+
+
+@pytest.mark.unit
+def test_rotation_by_local_lease_boundary_fails_closed():
+    stable_hash = canary.hash_exit_identity("203.0.113.10")
+    early_hash = canary.hash_exit_identity("203.0.113.11")
+    observations = tuple(
+        canary.ProbeObservation(
+            offset_seconds=offset,
+            elapsed_seconds=float(offset),
+            observed_at="2026-08-08T00:00:00+00:00",
+            exit_hash=(early_hash if offset >= 6900 else stable_hash),
+        )
+        for offset in canary.PROBE_OFFSETS_SECONDS
+    )
+
+    report = canary.build_probe_report(observations)
+
+    assert report["local_lease_stable"] is False
+    assert report["provider_boundary_changed"] is False
+    assert report["sticky_passed"] is False
+    assert "exit_changed_before_local_lease_end" in report["failures"]
+
+
+@pytest.mark.unit
 def test_provider_counter_lag_is_explicit_and_not_misreported_as_zero_usage():
     exit_hash = canary.hash_exit_identity("2001:db8::1")
     observations = tuple(
@@ -89,6 +143,20 @@ def test_provider_counter_lag_is_explicit_and_not_misreported_as_zero_usage():
     assert report["provider_counter"]["status"] == "pending"
     assert report["provider_counter"]["delta_bytes"] is None
     assert report["sticky_passed"] is True
+
+
+@pytest.mark.unit
+def test_current_decodo_ip_check_response_extracts_nested_proxy_ip():
+    assert (
+        canary.extract_ip_check_identity(
+            {
+                "browser": {"name": "Firefox"},
+                "proxy": {"ip": "203.0.113.24"},
+                "country": {"code": "US"},
+            }
+        )
+        == "203.0.113.24"
+    )
 
 
 @pytest.mark.unit
@@ -158,6 +226,80 @@ def test_canary_runs_only_scheduled_ip_check_probes_without_leaking_proxy(
 
 
 @pytest.mark.unit
+def test_canary_checkpoints_completed_probes_and_redacted_failure_offset(tmp_path):
+    proxy_file = tmp_path / "decodo.txt"
+    proxy_file.write_text(
+        "gate.decodo.com:7000:session-user:runtime-secret\n",
+        encoding="utf-8",
+    )
+    proxy_file.chmod(0o600)
+    clock_value = [1000.0]
+    probe_calls = [0]
+    checkpoints = []
+
+    def clock():
+        return clock_value[0]
+
+    def sleep(seconds):
+        clock_value[0] += seconds
+
+    def probe(**_kwargs):
+        probe_calls[0] += 1
+        if probe_calls[0] == 3:
+            raise canary.CanaryProbeError("redacted")
+        return "203.0.113.20"
+
+    def checkpoint(observations, failed_offset_seconds):
+        checkpoints.append(
+            (
+                tuple(item.offset_seconds for item in observations),
+                failed_offset_seconds,
+            )
+        )
+
+    with pytest.raises(canary.CanaryProbeError):
+        canary.run_canary(
+            proxy_file=proxy_file,
+            clock=clock,
+            sleep=sleep,
+            probe=probe,
+            checkpoint=checkpoint,
+        )
+
+    assert checkpoints == [
+        ((0,), None),
+        ((0, 600), None),
+        ((0, 600), 1800),
+    ]
+
+
+@pytest.mark.unit
+def test_probe_checkpoint_contains_hashes_only_and_is_owner_readable(tmp_path):
+    output = tmp_path / "checkpoint.json"
+    raw_ip = "203.0.113.20"
+    observation = canary.ProbeObservation(
+        offset_seconds=0,
+        elapsed_seconds=1.0,
+        observed_at="2026-08-08T00:00:00+00:00",
+        exit_hash=canary.hash_exit_identity(raw_ip),
+    )
+
+    canary.write_probe_checkpoint(
+        output,
+        (observation,),
+        failed_offset_seconds=600,
+    )
+
+    rendered = output.read_text(encoding="utf-8")
+    payload = json.loads(rendered)
+    assert raw_ip not in rendered
+    assert payload["status"] == "failed"
+    assert payload["completed_offsets_seconds"] == [0]
+    assert payload["failed_offset_seconds"] == 600
+    assert output.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.unit
 def test_probe_failure_is_redacted(tmp_path):
     proxy_file = tmp_path / "decodo.txt"
     secret = "runtime-secret"
@@ -195,7 +337,7 @@ def test_rollout_runbook_has_staged_go_and_rollback_contract():
     assert "120-minute provider" in normalized
     assert "115-minute local" in normalized
     assert "0640" in text
-    assert "0/10/30/60/90/120" in text
+    assert "0/10/30/60/90/115/120" in text
     assert "fbref_batch_persist=0" in lowered
     assert "fbref_batch_persist=1" in lowered
     assert "fbref_persistent_http_session=0" in lowered

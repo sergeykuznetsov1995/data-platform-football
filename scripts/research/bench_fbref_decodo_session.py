@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Probe one Decodo sticky exit without contacting FBref or exposing secrets.
 
-The command performs six requests to Decodo's IP-check endpoint over two
-hours.  Only a SHA-256 digest of the observed exit is retained.  Proxy
+The command performs seven requests to Decodo's IP-check endpoint over two
+hours. Only a SHA-256 digest of the observed exit is retained. Proxy
 credentials stay in the protected input file and are never rendered.
 """
 
@@ -24,7 +24,7 @@ from urllib.parse import quote, urlsplit
 
 
 DECODO_IP_CHECK_URL = "https://ip.decodo.com/json"
-PROBE_OFFSETS_SECONDS = (0, 600, 1800, 3600, 5400, 7200)
+PROBE_OFFSETS_SECONDS = (0, 600, 1800, 3600, 5400, 6900, 7200)
 STICKY_CANDIDATE_MINUTES = (60, 90, 120)
 PROVIDER_STICKY_MINUTES = 120
 LOCAL_LEASE_MINUTES = 115
@@ -120,6 +120,20 @@ def read_single_proxy_url(path: Path) -> str:
     return _proxy_url(entries[0])
 
 
+def extract_ip_check_identity(payload: Any) -> str:
+    """Extract the exit IP from supported Decodo IP-check response shapes."""
+
+    if isinstance(payload, Mapping):
+        nested_proxy = payload.get("proxy")
+        if isinstance(nested_proxy, Mapping) and nested_proxy.get("ip"):
+            return str(nested_proxy["ip"]).strip()
+        for key in ("ip", "proxy", "address"):
+            if payload.get(key) and not isinstance(payload[key], Mapping):
+                return str(payload[key]).strip()
+        raise ValueError("missing IP")
+    return str(payload).strip()
+
+
 def _default_probe(*, proxy_url: str, check_url: str) -> str:
     """Perform one bounded IP-check request through the supplied proxy."""
 
@@ -143,12 +157,7 @@ def _default_probe(*, proxy_url: str, check_url: str) -> str:
             payload: Any = response.json()
         except ValueError:
             payload = response.text.strip()
-        if isinstance(payload, Mapping):
-            for key in ("ip", "proxy", "address"):
-                if payload.get(key):
-                    return str(payload[key]).strip()
-            raise ValueError("missing IP")
-        return str(payload).strip()
+        return extract_ip_check_identity(payload)
     except Exception:
         raise CanaryProbeError("Decodo IP-check probe failed") from None
     finally:
@@ -194,7 +203,6 @@ def build_probe_report(
     offsets = tuple(item.offset_seconds for item in normalized)
     if offsets != PROBE_OFFSETS_SECONDS:
         raise CanaryConfigurationError("probe observations are incomplete")
-    hashes = {item.exit_hash for item in normalized}
     if any(
         len(item.exit_hash) != 64
         or any(character not in "0123456789abcdef" for character in item.exit_hash)
@@ -206,13 +214,21 @@ def build_probe_report(
         <= SCHEDULE_TOLERANCE_SECONDS
         for item in normalized
     )
-    stable = len(hashes) == 1
+    local_lease_hashes = {
+        item.exit_hash
+        for item in normalized
+        if item.offset_seconds <= LOCAL_LEASE_MINUTES * 60
+    }
+    local_lease_stable = len(local_lease_hashes) == 1
+    provider_boundary_changed = (
+        normalized[-1].exit_hash != normalized[-2].exit_hash
+    )
     failures = []
     if not schedule_ok:
         failures.append("probe_schedule_late")
-    if not stable:
-        failures.append("exit_changed")
-    sticky_passed = schedule_ok and stable
+    if not local_lease_stable:
+        failures.append("exit_changed_before_local_lease_end")
+    sticky_passed = schedule_ok and local_lease_stable
     candidate_stability = {
         str(minutes): (
             schedule_ok
@@ -228,12 +244,14 @@ def build_probe_report(
         for minutes in STICKY_CANDIDATE_MINUTES
     }
     return {
-        "schema_version": "fbref-decodo-sticky-canary-v1",
+        "schema_version": "fbref-decodo-sticky-canary-v2",
         "endpoint_class": "decodo_ip_check_only",
         "probe_offsets_seconds": list(PROBE_OFFSETS_SECONDS),
         "schedule_tolerance_seconds": SCHEDULE_TOLERANCE_SECONDS,
         "schedule_within_tolerance": schedule_ok,
         "candidate_stability": candidate_stability,
+        "local_lease_stable": local_lease_stable,
+        "provider_boundary_changed": provider_boundary_changed,
         "sticky_passed": sticky_passed,
         "failures": failures,
         "recommended_provider_sticky_minutes": (
@@ -258,8 +276,12 @@ def run_canary(
     sleep: Callable[[float], None] = time.sleep,
     probe: Callable[..., str] = _default_probe,
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    checkpoint: Callable[
+        [Sequence[ProbeObservation], int | None], None
+    ]
+    | None = None,
 ) -> dict[str, Any]:
-    """Execute exactly the six scheduled Decodo IP-check probes."""
+    """Execute exactly the seven scheduled Decodo IP-check probes."""
 
     proxy_url = read_single_proxy_url(proxy_file)
     started = clock()
@@ -275,8 +297,12 @@ def run_canary(
             )
             exit_hash = hash_exit_identity(observed_ip)
         except CanaryProbeError:
+            if checkpoint is not None:
+                checkpoint(tuple(observations), offset)
             raise
         except Exception:
+            if checkpoint is not None:
+                checkpoint(tuple(observations), offset)
             raise CanaryProbeError("Decodo IP-check probe failed") from None
         observations.append(
             ProbeObservation(
@@ -286,10 +312,49 @@ def run_canary(
                 exit_hash=exit_hash,
             )
         )
+        if checkpoint is not None:
+            checkpoint(tuple(observations), None)
     return build_probe_report(
         observations,
         provider_bytes_before=provider_bytes_before,
         provider_bytes_after=provider_bytes_after,
+    )
+
+
+def _write_secure_json(path: Path, payload: Mapping[str, Any]) -> None:
+    rendered = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(rendered)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    os.chmod(path, 0o600)
+
+
+def write_probe_checkpoint(
+    path: Path,
+    observations: Sequence[ProbeObservation],
+    *,
+    failed_offset_seconds: int | None,
+) -> None:
+    """Persist redacted progress so a failed long canary remains diagnosable."""
+
+    _write_secure_json(
+        Path(path),
+        {
+            "schema_version": "fbref-decodo-sticky-checkpoint-v1",
+            "status": "failed" if failed_offset_seconds is not None else "running",
+            "completed_offsets_seconds": [
+                item.offset_seconds for item in observations
+            ],
+            "failed_offset_seconds": failed_offset_seconds,
+            "observations": [asdict(item) for item in observations],
+        },
     )
 
 
@@ -304,11 +369,23 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
+
+    def checkpoint(
+        observations: Sequence[ProbeObservation], failed_offset: int | None
+    ) -> None:
+        if args.output is not None:
+            write_probe_checkpoint(
+                args.output,
+                observations,
+                failed_offset_seconds=failed_offset,
+            )
+
     try:
         report = run_canary(
             proxy_file=args.proxy_file,
             provider_bytes_before=args.provider_bytes_before,
             provider_bytes_after=args.provider_bytes_after,
+            checkpoint=checkpoint if args.output is not None else None,
         )
     except (CanaryConfigurationError, CanaryProbeError):
         print("Decodo sticky-session canary failed", file=sys.stderr)
@@ -316,8 +393,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.output is not None:
         try:
-            args.output.write_text(rendered + "\n", encoding="utf-8")
-            os.chmod(args.output, 0o600)
+            _write_secure_json(args.output, report)
         except OSError:
             print("Could not write canary report", file=sys.stderr)
             return 2

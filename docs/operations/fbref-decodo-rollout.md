@@ -22,7 +22,7 @@ default-off: every existing environment keeps
 
 Create separate protected candidate files for 60 minute, 90 minute, and 120
 minute custom-sticky sessions. Test them one at a time. The probe schedule is
-`0/10/30/60/90/120` minutes and the only destination is Decodo's IP-check
+`0/10/30/60/90/115/120` minutes and the only destination is Decodo's IP-check
 service:
 
 ```bash
@@ -33,9 +33,12 @@ service:
 ```
 
 The report may contain timestamps and exit hashes only. Any missed probe by
-more than 60 seconds, raw IP, changed exit, request to FBref, or secret in the
-artifact is NO-GO. A provider counter that has not moved yet is `pending`, not
-zero usage; wait for its normal reporting delay and capture the later counter.
+more than 60 seconds, raw IP, changed exit on or before the 115-minute local
+lease boundary, request to FBref, or secret in the artifact is NO-GO. A change
+at the provider's exact 120-minute expiry is recorded but does not fail the
+115-minute local-safety gate. A provider counter that has not moved yet is
+`pending`, not zero usage; wait for its normal reporting delay and capture the
+later counter.
 
 The recommended configuration is a **120-minute provider sticky session** and
 a **115-minute local lease**. The five-minute margin closes locally before the
