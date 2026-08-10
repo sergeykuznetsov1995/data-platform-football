@@ -15,11 +15,8 @@ import logging
 import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
 from typing import Any
-
-from scrapers.base.sql_validator import validate_identifier
-from scrapers.base.trino_manager import TrinoTableManager
-
 
 logger = logging.getLogger(__name__)
 
@@ -109,32 +106,40 @@ class FBrefAcceptanceError(RuntimeError):
     """The acceptance contract cannot be proven from durable evidence."""
 
 
-class AcceptanceReplayTrinoTableManager(TrinoTableManager):
-    """Count only statements issued by the actual acceptance replay parser."""
+@lru_cache(maxsize=1)
+def _acceptance_replay_manager_cls() -> type:
+    """Build the counting manager lazily: TrinoTableManager pulls numpy."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._acceptance_execute_count = 0
-        self._acceptance_committing_count = 0
+    from scrapers.base.trino_manager import TrinoTableManager
 
-    def _execute(
-        self,
-        sql: str,
-        fetch: bool = False,
-        params: tuple | None = None,
-    ) -> Any:
-        self._acceptance_execute_count += 1
-        return super()._execute(sql, fetch=fetch, params=params)
+    class AcceptanceReplayTrinoTableManager(TrinoTableManager):
+        """Count only statements issued by the actual acceptance replay parser."""
 
-    def _execute_committing(self, sql: str) -> None:
-        self._acceptance_committing_count += 1
-        return super()._execute_committing(sql)
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._acceptance_execute_count = 0
+            self._acceptance_committing_count = 0
 
-    def statement_counts(self) -> dict[str, int]:
-        return {
-            "execute": self._acceptance_execute_count,
-            "execute_committing": self._acceptance_committing_count,
-        }
+        def _execute(
+            self,
+            sql: str,
+            fetch: bool = False,
+            params: tuple | None = None,
+        ) -> Any:
+            self._acceptance_execute_count += 1
+            return super()._execute(sql, fetch=fetch, params=params)
+
+        def _execute_committing(self, sql: str) -> None:
+            self._acceptance_committing_count += 1
+            return super()._execute_committing(sql)
+
+        def statement_counts(self) -> dict[str, int]:
+            return {
+                "execute": self._acceptance_execute_count,
+                "execute_committing": self._acceptance_committing_count,
+            }
+
+    return AcceptanceReplayTrinoTableManager
 
 
 def _normalized_scope(scope: object) -> str:
@@ -169,6 +174,8 @@ def _pipeline():
 def _acceptance_replay_profile(
     *, trino_schema: object, persistence_mode: object
 ) -> tuple[str, str]:
+    from scrapers.base.sql_validator import validate_identifier
+
     schema = validate_identifier(
         str(trino_schema or "").strip(), "schema"
     )
@@ -192,7 +199,7 @@ def _acceptance_replay_pipeline(
         FBrefTypedBronzeWriter,
     )
 
-    manager = AcceptanceReplayTrinoTableManager()
+    manager = _acceptance_replay_manager_cls()()
     pipeline = FBrefPipeline(
         ControlStore.from_env(),
         RawPageStore.from_env(optional=False),
