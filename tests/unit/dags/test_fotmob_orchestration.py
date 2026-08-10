@@ -96,9 +96,9 @@ def test_persisted_daily_date_rejects_non_null_non_date_values(raw_daily_date):
 @pytest.mark.parametrize(
     ("lane", "max_requests", "max_direct_mib", "rpm"),
     [
-        (FotMobLane.DAILY, 10_000, 512, 60),
-        (FotMobLane.REFRESH, 15_000, 1_024, 60),
-        (FotMobLane.BACKFILL, 10_000, 512, 45),
+        (FotMobLane.DAILY, 80_000, 5_120, 60),
+        (FotMobLane.REFRESH, 80_000, 5_120, 60),
+        (FotMobLane.BACKFILL, 40_000, 2_048, 45),
     ],
 )
 def test_child_conf_uses_dynamic_contract_and_exact_caps(
