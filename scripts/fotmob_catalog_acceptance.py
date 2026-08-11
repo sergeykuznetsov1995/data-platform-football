@@ -337,6 +337,7 @@ def _scope_attempts(
     lane: str | None,
     now: datetime,
     errors: list[str],
+    require_full_completion: bool = True,
 ) -> tuple[dict[str, Mapping[str, Any]], bool]:
     if not isinstance(value, list):
         errors.append("selection.scope_attempts must be an array")
@@ -389,9 +390,10 @@ def _scope_attempts(
             )
             if reason is None:
                 errors.append(f"retryable scope {token!r} must record an explicit reason")
-            errors.append(
-                f"retryable scope {token!r} is incomplete and cannot be accepted"
-            )
+            if require_full_completion:
+                errors.append(
+                    f"retryable scope {token!r} is incomplete and cannot be accepted"
+                )
             if (
                 next_retry_at is not None
                 and last_attempt_at is not None
@@ -419,7 +421,14 @@ def _scope_attempts(
             if reason is None:
                 errors.append(f"source_gap scope {token!r} must record an explicit reason")
         elif outcome == "terminal":
-            errors.append(f"terminal scope {token!r} is a hard failure")
+            # selection.scope_attempts — это перечитанная карта состояний по
+            # подписи плана, то есть ИСТОРИЯ, а не работа этого рана. У кампании
+            # история и есть предмет приёмки. У непрерывной полосы терминальный
+            # исход прошлого рана уже покрасил ТОТ ран (гейт раннера считает
+            # исходы своего рана), и повторно краснеть на нём вечно нельзя —
+            # иначе одна разовая ошибка коммита навсегда останавливает silver.
+            if require_full_completion:
+                errors.append(f"terminal scope {token!r} is a hard failure")
             if reason is None:
                 errors.append(f"terminal scope {token!r} must record an explicit reason")
         elif outcome == "deferred":
@@ -455,7 +464,13 @@ def _scope_attempts(
             + ", ".join(missing_planned)
         )
 
-    if lane == "current":
+    # Требование «каждый скоуп контракта закрыт терминально и свежее 72 часов»
+    # — это вопрос кампании ко ВСЕМУ обязательству. Непрерывная полоса за одно
+    # окно трогает десятки скоупов из ~450, поэтому к ней применима только
+    # проверка выше: каждый ЗАПЛАНИРОВАННЫЙ в этом ране скоуп оставил
+    # доказательство. Полноту покрытия у непрерывной полосы меряют по данным
+    # (долг «сыграно без деталей»), а не по одному отчёту.
+    if lane == "current" and require_full_completion:
         missing_current = sorted(contract_scopes.difference(by_scope))
         if missing_current:
             errors.append(
@@ -490,6 +505,7 @@ def _transfer_completion(
     status: Any,
     transfer_deferrals: Mapping[int, Mapping[str, Any]],
     errors: list[str],
+    require_full_completion: bool = True,
 ) -> None:
     raw_completed = selection.get("completed_transfer_competition_ids")
     if not isinstance(raw_completed, list):
@@ -547,7 +563,12 @@ def _transfer_completion(
             "transfer completion evidence is incomplete for included IDs: "
             + ", ".join(map(str, sorted(missing)))
         )
-    if status == "partial_success":
+    if status == "partial_success" and require_full_completion:
+        # Незакрытый поток трансферов раннер не оформляет отсрочкой: он кладёт
+        # `competition N transfer stream incomplete` в retryable операции
+        # (run_fotmob_scraper.py) и идёт дальше. У кампании это отказ, у
+        # непрерывной полосы — недобранный на этот раз хвост, который добирается
+        # следующим окном.
         unexplained = missing - set(transfer_deferrals)
         if unexplained:
             errors.append(
@@ -557,7 +578,7 @@ def _transfer_completion(
 
 
 def _validate_operation_retry_evidence(
-    value: Any, *, errors: list[str]
+    value: Any, *, errors: list[str], require_full_completion: bool = True
 ) -> None:
     if not isinstance(value, list):
         errors.append("runner report operations must be an array")
@@ -571,6 +592,11 @@ def _validate_operation_retry_evidence(
         if not isinstance(retryable, list):
             errors.append(f"operation #{index} retryable evidence must be an array")
             continue
+        if not require_full_completion:
+            # Непрерывная полоса: повтор на уровне операции — то же штатное
+            # промежуточное состояние, что и retryable-скоуп. Структуру списка
+            # проверяем всегда, содержимое трактуем как отказ только у кампании.
+            continue
         for reason in retryable:
             text = str(reason).casefold()
             if not (
@@ -583,9 +609,29 @@ def _validate_operation_retry_evidence(
 
 
 def validate_report(
-    report: Mapping[str, Any], *, now: datetime | None = None
+    report: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+    require_full_completion: bool = True,
 ) -> CatalogAcceptanceResult:
-    """Validate one automatic runner report without performing any I/O."""
+    """Validate one automatic runner report without performing any I/O.
+
+    ``require_full_completion`` distinguishes two different questions asked of
+    the same evidence.  A campaign or canary asks "is the whole obligation
+    met?", so any scope still awaiting a retry invalidates the report.  A
+    continuous lane asks "is this run's evidence honest?": it walks a ~450
+    scope catalog under a time budget and can never close every scope in one
+    window, so a scheduled retry is a normal intermediate state.
+
+    Structural checks — contract membership, plan signature, timestamps, retry
+    ordering, mandatory reasons, evidence for every scope the run planned —
+    stay identical in both modes.  What the continuous mode drops are the
+    completeness judgements over the *journal*: full catalog coverage, freshness
+    of every scope, and the verdicts on retryable/terminal states left by other
+    runs.  Those states already coloured the run that produced them, because the
+    runner's own gate counts its own outcomes.  The one journal-only signal that
+    survives is a stalled lane: nothing planned and nothing ever completed.
+    """
 
     errors: list[str] = []
     if not isinstance(report, Mapping):
@@ -717,16 +763,39 @@ def validate_report(
         lane=lane,
         now=checked_at,
         errors=errors,
+        require_full_completion=require_full_completion,
     )
     deferral_count = sum(len(values) for values in deferrals.values())
-    if status == "partial_success" and deferral_count == 0:
+    # У непрерывной полосы partial_success — ожидаемый исход почти каждого рана,
+    # и доказательством неполноты служит сам факт незакрытого каталога, а не
+    # обязательно бюджетная отсрочка. Требовать отсрочку значит красить ран,
+    # который честно сказал «сделал часть».
+    if status == "partial_success" and deferral_count == 0 and require_full_completion:
         errors.append(
             "partial_success requires explicit budget or deadline deferral evidence"
         )
     if status == "success" and deferral_count:
         errors.append("success cannot contain budget or deadline deferrals")
-    if retryable_attempts:
+    # Здесь тоже история, а не работа рана: карта состояний хранит повторы,
+    # назначенные прошлыми ранами (бэкофф до 24 ч). Требовать из-за них
+    # incomplete у ТЕКУЩЕГО рана — значит краснеть за чужую работу; полноту
+    # обхода у непрерывной полосы судит гейт раннера по своим исходам.
+    #
+    # Но есть один случай, когда история — единственный свидетель: источник лёг,
+    # все скоупы ушли в повтор с бэкоффом, и следующий ран планирует ПУСТОЙ
+    # список. Своих исходов у него нет, гейт раннера молчит, и без этой проверки
+    # получился бы зелёный ран при нулевом сборе. Признак застоя: ран ничего не
+    # планировал И в журнале нет ни одного закрытого скоупа.
+    journal_has_completion = any(
+        attempt.get("outcome") in {"success", "source_gap"}
+        for attempt in attempts.values()
+    )
+    if retryable_attempts and require_full_completion:
         errors.append("retryable scope evidence requires incomplete report status")
+    elif retryable_attempts and not (planned or journal_has_completion):
+        errors.append(
+            "retryable scope evidence with no planned or completed scope: lane is stalled"
+        )
 
     _transfer_completion(
         selection,
@@ -736,8 +805,13 @@ def validate_report(
         status=status,
         transfer_deferrals=deferrals["transfer"],
         errors=errors,
+        require_full_completion=require_full_completion,
     )
-    _validate_operation_retry_evidence(report.get("operations", []), errors=errors)
+    _validate_operation_retry_evidence(
+        report.get("operations", []),
+        errors=errors,
+        require_full_completion=require_full_completion,
+    )
 
     budget = _mapping(report.get("budget"))
     if budget is None or type(budget.get("proxy_bytes")) is not int:

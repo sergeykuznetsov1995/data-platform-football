@@ -1890,14 +1890,31 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 "deferrals": automatic_deferrals,
             }
         )
-        retryable_attempts = any(
-            state.outcome == "retryable"
-            for state in automatic_attempts.values()
+        # Исходы ЭТОГО рана, а не срез истории подписи: automatic_attempts —
+        # это перечитанная карта состояний, куда попадают и скоупы, которых в
+        # текущем плане не было. Гейт обязан судить ран по тому, что сделал он.
+        run_outcomes = tuple(
+            str(entry.get("outcome"))
+            for entry in attempt_operation.metadata.get("outcomes", ())
+            if isinstance(entry, Mapping)
         )
-        terminal_attempts = any(
-            state.outcome == "terminal"
-            for state in automatic_attempts.values()
+        retryable_attempts = "retryable" in run_outcomes
+        terminal_attempts = "terminal" in run_outcomes
+        # Закрытый скоуп — единственное доказательство, что ран вообще работал.
+        # source_gap закрывает скоуп с признанной дырой источника, это тоже
+        # продвижение обхода.
+        scope_progress = any(
+            outcome in {"success", "source_gap"} for outcome in run_outcomes
         )
+        # Продвижение рана числом, а не только цветом: цвет отвечает на вопрос
+        # «ран сломан?», а мониторингу нужен вопрос «сколько он закрыл из того,
+        # что планировал». Один закрытый скоуп из двухсот — формально жёлтый
+        # ран, но по этим числам он виден сразу.
+        payload["selection"]["scope_outcome_counts"] = {
+            outcome: run_outcomes.count(outcome)
+            for outcome in sorted(set(run_outcomes))
+        }
+        payload["selection"]["planned_scope_count"] = len(planned_scopes)
         unauthorized_operation_retries = any(
             not _is_budget_deferral_error(reason)
             for operation in operations
@@ -1911,16 +1928,35 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             )
             for operation in operations
         )
+        # Непрерывная полоса по автоматическому каталогу физически не может
+        # закрыть все ~450 скоупов за одно окно: скоуп, отложенный на повтор
+        # (retryable), — это штатное промежуточное состояние обхода, а не отказ
+        # рана. Красным ран делают только неустранимые исходы: terminal,
+        # жёсткие ошибки операций и отсрочка без бюджетного/дедлайнового
+        # основания (последнее — проверка честности доказательств).
+        #
+        # ВАЖНО: послабление действует только когда ран реально продвинулся.
+        # Ран, не закрывший НИ ОДНОГО скоупа и собравший одни повторы (источник
+        # лёг, прокси мёртв, сеть отрезана), обязан остаться красным — иначе
+        # получается зелёный ран при нулевом сборе, ровно та слепота, из-за
+        # которой простой контура дважды находили через сутки.
+        no_progress_failure = (
+            retryable_attempts or unauthorized_operation_retries
+        ) and not scope_progress
         if (
-            retryable_attempts
-            or terminal_attempts
+            terminal_attempts
             or unauthorized_deferred_attempts
-            or unauthorized_operation_retries
+            or hard_failures
+            or no_progress_failure
         ):
             payload["status"] = "incomplete"
             payload["complete"] = False
             rc = 1
-        elif automatic_deferrals and not hard_failures:
+        elif (
+            retryable_attempts
+            or unauthorized_operation_retries
+            or automatic_deferrals
+        ):
             payload["status"] = "partial_success"
             payload["complete"] = False
             rc = 0

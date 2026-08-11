@@ -742,6 +742,106 @@ class TestFotmobNativeRunner:
         assert len(set(attempt["attempt_identities"])) == 2
 
     @pytest.mark.unit
+    def test_automatic_run_with_progress_defers_retry_without_failing(self):
+        """Отложенный повтор рядом с закрытым скоупом — жёлтый ран, не красный.
+
+        Непрерывная полоса обходит ~450 скоупов под временным бюджетом и не может
+        закрыть их все за одно окно. Пока ран продвигается (хотя бы один скоуп
+        закрыт), скоуп, поставленный на повтор, — штатное промежуточное
+        состояние: rc=0 и partial_success, иначе silver никогда не триггерится.
+        Парный инвариант «ран без единого закрытого скоупа остаётся красным»
+        держит test_automatic_http_retry_remains_incomplete_and_nonzero.
+        """
+
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _competition_payload,
+        )
+
+        mod = self._module()
+        healthy = _competition_payload(48, "Second League")
+        healthy["fixtures"]["allMatches"][0]["id"] = 200
+        healthy["fixtures"]["allMatches"][0]["pageUrl"] = "/matches/alpha-vs-beta/x#200"
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [
+                    {
+                        "leagues": [
+                            {"id": 47, "name": "Premier League"},
+                            {"id": 48, "name": "Second League"},
+                        ]
+                    }
+                ]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: (
+                _competition_payload(47, "Premier League")
+            ),
+            canonicalize_target("leagues", {"id": 48}).canonical_url: healthy,
+            canonicalize_target(
+                "matchDetails", {"matchId": "100"}
+            ).canonical_url: {
+                "error": True,
+                "message": "Data not found",
+                "matchId": "100",
+            },
+            canonicalize_target(
+                "matchDetails", {"matchId": "200"}
+            ).canonical_url: {
+                "content": {"matchFacts": {"events": []}, "stats": {"x": 1}}
+            },
+        }
+        service = FotMobIngestService(
+            transport=StubTransport(dict(responses)),
+            repository=MemoryFotMobRepository(),
+            mode=RunMode.DAILY,
+            budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+            run_id="mixed-1",
+            max_workers=2,
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season,matches",
+                "--run-id",
+                "mixed-1",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        outcomes = {
+            attempt["competition_id"]: attempt["outcome"]
+            for attempt in report["selection"]["scope_attempts"]
+        }
+        assert outcomes[47] == "retryable"
+        assert outcomes[48] == "success"
+        assert rc == 0, report["errors"]
+        assert report["status"] == "partial_success"
+        assert report["complete"] is False
+        assert report["selection"]["scope_outcome_counts"] == {
+            "retryable": 1,
+            "success": 1,
+        }
+        assert report["selection"]["planned_scope_count"] == 2
+
+        # Гейт раннера и приёмка отчёта — два независимых барьера на пути к
+        # silver: покрасить может любой. Поэтому НАСТОЯЩИЙ отчёт этого рана
+        # прогоняется через тот же валидатор, что зовёт validate_data.
+        from scripts.fotmob_catalog_acceptance import validate_report
+
+        assert validate_report(report, require_full_completion=True).ok is False
+        continuous = validate_report(report, require_full_completion=False)
+        assert continuous.ok is True, continuous.errors
+
+    @pytest.mark.unit
     def test_automatic_competition_budget_rotates_after_repeated_failed_attempts(self):
         from scrapers.fotmob.planner import RunMode, TransportBudget
         from scrapers.fotmob.repository import MemoryFotMobRepository

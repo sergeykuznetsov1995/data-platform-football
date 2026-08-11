@@ -361,6 +361,216 @@ def test_validate_report_rejects_retry_without_explicit_reason_and_due_time(
     assert any("retryable scope" in error for error in errors)
 
 
+def test_continuous_lane_tolerates_scheduled_retry_but_campaign_does_not() -> None:
+    """Одно и то же доказательство отвечает на два разных вопроса.
+
+    Кампания (канарейка, допуск) спрашивает «обязательство закрыто целиком?» —
+    там незакрытый повтор недопустим. Непрерывная полоса спрашивает «этот ран
+    честен?» — она обходит ~450 скоупов под временным бюджетом, и запланированный
+    повтор для неё штатное состояние. Структурные проверки одинаковы в обоих
+    режимах.
+    """
+
+    report = _report()
+    contract = report["selection"]["catalog_contract"]
+    report["status"] = "partial_success"
+    report["complete"] = False
+    report["selection"]["scope_attempts"] = [
+        _attempt(
+            contract,
+            outcome="retryable",
+            reason="scope 47=2025/2026 incomplete; outstanding={}",
+            next_retry_at=NOW + timedelta(minutes=15),
+        )
+    ]
+
+    campaign = acceptance.validate_report(report, now=NOW)
+    continuous = acceptance.validate_report(
+        report, now=NOW, require_full_completion=False
+    )
+
+    assert campaign.ok is False
+    assert any("cannot be accepted" in error for error in campaign.errors)
+    assert continuous.ok is True, continuous.errors
+
+
+def test_continuous_lane_accepts_partial_success_without_deferrals() -> None:
+    """Неполнота бывает не только от бюджета.
+
+    Раннер отдаёт partial_success и без бюджетной отсрочки — достаточно любого
+    незакрытого хвоста. Если приёмка продолжает требовать бюджетное
+    доказательство, гейт раннера и приёмка расходятся в трактовке одного слова,
+    и ран падает уже на validate_data.
+    """
+
+    report = _report()
+    report["status"] = "partial_success"
+    report["complete"] = False
+
+    campaign = acceptance.validate_report(report, now=NOW)
+    continuous = acceptance.validate_report(
+        report, now=NOW, require_full_completion=False
+    )
+
+    assert campaign.ok is False
+    assert any("deferral evidence" in error for error in campaign.errors)
+    assert continuous.ok is True, continuous.errors
+
+
+def test_continuous_lane_accepts_unfinished_transfer_stream() -> None:
+    """Недобранный поток трансферов — хвост следующего окна, а не отказ полосы.
+
+    Раннер такой случай отсрочкой не оформляет: он кладёт
+    `competition N transfer stream incomplete` в retryable операции и идёт
+    дальше, поэтому у кампании это отказ, а у непрерывной полосы — норма.
+    """
+
+    policy = {
+        "transfer_policy": {
+            "window": "1year",
+            "pagination": "unique_hits",
+            "completion_scope": "included_ids",
+            "completion_signature": "catalog_contract",
+        }
+    }
+    contract = _contract(entities=("season", "transfers"), entity_policy=policy)
+    report = _report()
+    selection = report["selection"]
+    selection["catalog_contract"] = contract
+    selection["scope_plan_signature"] = contract["plan_signature"]
+    selection["entities"] = ["season", "transfers"]
+    selection["transfer_plan_signature"] = contract["plan_signature"]
+    selection["completed_transfer_competition_ids"] = []
+    selection["scope_attempts"] = [_attempt(contract)]
+    report["status"] = "partial_success"
+    report["complete"] = False
+
+    campaign = acceptance.validate_report(report, now=NOW)
+    continuous = acceptance.validate_report(
+        report, now=NOW, require_full_completion=False
+    )
+
+    assert campaign.ok is False
+    assert any("transfer completion" in error for error in campaign.errors)
+    assert continuous.ok is True, continuous.errors
+
+
+def test_continuous_lane_reds_a_stalled_lane_with_nothing_planned() -> None:
+    """Пустой план + одни повторы в журнале = застой, и это должно краснеть.
+
+    Если источник лёг и все скоупы ушли в повтор с бэкоффом, следующий ран
+    планирует пустой список: своих исходов у него нет, гейт раннера молчит,
+    отчёт получается `success`. Без этой проверки контур сутки стоял бы под
+    зелёными ранами — ровно та слепота, которую чинит вся эта работа.
+    """
+
+    contract = _contract(scopes=((47, "2025/2026"), (47, "2024/2025")))
+    report = _report()
+    selection = report["selection"]
+    selection["catalog_contract"] = contract
+    selection["scope_plan_signature"] = contract["plan_signature"]
+    selection["planned_scopes"] = []
+    selection["completed_scopes"] = []
+    stalled = dict(
+        _attempt(
+            contract,
+            outcome="retryable",
+            reason="scope 47=2025/2026 incomplete; outstanding={}",
+            last_attempt_at=NOW - timedelta(hours=3),
+            next_retry_at=NOW + timedelta(hours=3),
+        )
+    )
+    selection["scope_attempts"] = [stalled]
+
+    result = acceptance.validate_report(
+        report, now=NOW, require_full_completion=False
+    )
+
+    assert result.ok is False
+    assert any("lane is stalled" in error for error in result.errors), result.errors
+
+
+def test_continuous_lane_ignores_retry_left_by_a_previous_run() -> None:
+    """Ран, закрывший всё, что планировал, не краснеет из-за чужого повтора.
+
+    `selection.scope_attempts` — это перечитанная карта состояний по подписи
+    плана, то есть история: скоуп, отложенный прошлым раном на 6 часов, лежит в
+    ней и в отчёте следующего рана. Если считать это «незакрытым обязательством
+    текущего рана», лучший из возможных ранов оказывается красным, а silver
+    так и не стартует.
+    """
+
+    contract = _contract(scopes=((47, "2025/2026"), (47, "2024/2025")))
+    report = _report()
+    selection = report["selection"]
+    selection["catalog_contract"] = contract
+    selection["scope_plan_signature"] = contract["plan_signature"]
+    selection["planned_scopes"] = ["47=2025/2026"]
+    stale_retry = dict(
+        _attempt(
+            contract,
+            outcome="retryable",
+            reason="scope 47=2024/2025 incomplete; outstanding={}",
+            last_attempt_at=NOW - timedelta(hours=2),
+            next_retry_at=NOW + timedelta(hours=4),
+        )
+    )
+    stale_retry["source_season_key"] = "2024/2025"
+    selection["scope_attempts"] = [_attempt(contract), stale_retry]
+
+    campaign = acceptance.validate_report(report, now=NOW)
+    continuous = acceptance.validate_report(
+        report, now=NOW, require_full_completion=False
+    )
+
+    assert campaign.ok is False
+    assert continuous.ok is True, continuous.errors
+
+
+@pytest.mark.parametrize(
+    ("outcome", "reason", "next_retry_at", "message"),
+    [
+        ("retryable", "", NOW + timedelta(minutes=15), "must record an explicit reason"),
+        (
+            "retryable",
+            "scope 47=2025/2026 incomplete; outstanding={}",
+            NOW - timedelta(hours=2),
+            "next_retry_at must follow its attempt",
+        ),
+        ("terminal", "", None, "must record an explicit reason"),
+    ],
+)
+def test_continuous_lane_keeps_structural_checks_on_retry_evidence(
+    outcome: str, reason: str, next_retry_at: datetime | None, message: str
+) -> None:
+    """Послабление снимает вопрос о ПОЛНОТЕ, но не о качестве доказательства.
+
+    Непрерывная полоса перестаёт краснеть из-за незакрытого каталога, однако
+    доказательство обязано оставаться честным: у повтора есть причина и срок,
+    и срок наступает после самой попытки.
+    """
+
+    report = _report()
+    contract = report["selection"]["catalog_contract"]
+    report["status"] = "partial_success"
+    report["complete"] = False
+    report["selection"]["scope_attempts"] = [
+        _attempt(
+            contract,
+            outcome=outcome,
+            reason=reason,
+            next_retry_at=next_retry_at,
+        )
+    ]
+
+    result = acceptance.validate_report(
+        report, now=NOW, require_full_completion=False
+    )
+
+    assert result.ok is False
+    assert any(message in error for error in result.errors), result.errors
+
+
 def test_validate_report_accepts_source_gap_only_with_two_attempt_identities() -> None:
     report = _report()
     contract = report["selection"]["catalog_contract"]

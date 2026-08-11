@@ -806,7 +806,13 @@ def validate_data(
         if automatic_catalog:
             from scripts.fotmob_catalog_acceptance import validate_report
 
-            acceptance = validate_report(result)
+            # Полоса автоматического каталога — непрерывный обход ~450 скоупов
+            # под временным бюджетом, а не кампания с обязательством закрыть
+            # каталог за один ран. Скоуп, отложенный на повтор, здесь штатное
+            # промежуточное состояние. Строгий режим остаётся ПО УМОЛЧАНИЮ —
+            # его получает CLI приёмки (scripts/fotmob_catalog_acceptance.py),
+            # которым проверяют кампанию и канарейку.
+            acceptance = validate_report(result, require_full_completion=False)
             acceptance_errors = list(acceptance.errors)
             if acceptance_errors:
                 violations.append(
