@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 
 import pytest
 
@@ -96,9 +96,9 @@ def test_persisted_daily_date_rejects_non_null_non_date_values(raw_daily_date):
 @pytest.mark.parametrize(
     ("lane", "max_requests", "max_direct_mib", "rpm"),
     [
-        (FotMobLane.DAILY, 80_000, 5_120, 60),
-        (FotMobLane.REFRESH, 80_000, 5_120, 60),
-        (FotMobLane.BACKFILL, 40_000, 2_048, 45),
+        (FotMobLane.DAILY, 24_000, 1_536, 60),
+        (FotMobLane.REFRESH, 27_000, 1_536, 60),
+        (FotMobLane.BACKFILL, 20_000, 1_024, 45),
     ],
 )
 def test_child_conf_uses_dynamic_contract_and_exact_caps(
@@ -112,9 +112,80 @@ def test_child_conf_uses_dynamic_contract_and_exact_caps(
     assert conf["requests_per_minute"] == rpm
     assert conf["max_proxy_mib"] == 0
     if lane is FotMobLane.DAILY:
-        assert conf["deadline"] == ""
+        assert conf["deadline"] == "2026-08-08T21:00:00+00:00"
     else:
         assert conf["deadline"] == "2026-08-08T13:45:00+00:00"
+
+
+def test_every_lane_gets_a_cooperative_deadline():
+    """Полоса без дедлайна останавливается только жёстким execution_timeout.
+
+    Это SIGTERM, status=incomplete и красный ран вместо мягкой отсрочки. Дневная
+    полоса жила без дедлайна, пока была прибита к 21 турниру; под автоматическим
+    каталогом она обходит весь каталог, и отсутствие дедлайна стало дефектом.
+    """
+    for lane in FotMobLane:
+        now = _at(14) if lane is FotMobLane.DAILY else _at(9)
+        deadline = build_child_conf(lane, now)["deadline"]
+        assert deadline, f"полоса {lane.value} осталась без кооперативного дедлайна"
+        assert datetime.fromisoformat(deadline) > now
+
+
+def test_lane_request_caps_are_reachable():
+    """Недостижимый потолок запросов — декоративный: остановить ран станет нечему.
+
+    Регрессия 2026-08-11: потолок 80_000 при 60 rpm недостижим ни в одном окне
+    (за 8 часов физически выдаётся 28_800), поэтому вместо бюджетной отсрочки ран
+    убивался по execution_timeout. Потолок обязан срабатывать РАНЬШЕ жёсткого
+    таймаута и раньше конца окна полосы.
+    """
+    from utils.fotmob_orchestration import (
+        BACKGROUND_DEADLINE,
+        CHILD_TIMEOUT_MINUTES,
+        DAILY_DEADLINE,
+        DAILY_WINDOW_START,
+        _LANE_CAPS,
+    )
+
+    def _minutes(start, end) -> int:
+        return (end.hour - start.hour) * 60 + (end.minute - start.minute)
+
+    windows = {
+        # фоновые полосы стартуют с полуночи, дневная — не раньше своего окна
+        FotMobLane.DAILY: _minutes(DAILY_WINDOW_START, DAILY_DEADLINE),
+        FotMobLane.REFRESH: _minutes(time(0, 0), BACKGROUND_DEADLINE),
+        FotMobLane.BACKFILL: _minutes(time(0, 0), BACKGROUND_DEADLINE),
+    }
+    for lane, (max_requests, _max_direct_mib, rpm) in _LANE_CAPS.items():
+        bound_minutes = min(windows[lane], CHILD_TIMEOUT_MINUTES)
+        reachable = rpm * bound_minutes
+        assert max_requests < reachable, (
+            f"потолок полосы {lane.value} ({max_requests}) недостижим: "
+            f"{rpm} rpm × {bound_minutes} мин = {reachable}"
+        )
+
+
+def test_child_timeout_copy_matches_the_ingest_dag():
+    """CHILD_TIMEOUT_MINUTES — копия execution_timeout из dag_ingest_fotmob.
+
+    От неё считается достижимость потолков, поэтому расхождение копии с оригиналом
+    молча вернёт недостижимые потолки.
+    """
+    import re
+    from pathlib import Path
+
+    from utils.fotmob_orchestration import CHILD_TIMEOUT_MINUTES
+
+    source = (
+        Path(__file__).resolve().parents[3] / "dags" / "dag_ingest_fotmob.py"
+    ).read_text(encoding="utf-8")
+    # между task_id и execution_timeout лежит вся bash-команда скрапера (~40 строк)
+    scraper_task = source.split('task_id="scrape_fotmob_data"', 1)[1].split(
+        "PythonOperator(", 1
+    )[0]
+    hours = re.search(r"execution_timeout=timedelta\(hours=(\d+)\)", scraper_task)
+    assert hours is not None, "не найден execution_timeout у scrape_fotmob_data"
+    assert int(hours.group(1)) * 60 == CHILD_TIMEOUT_MINUTES
 
 
 @pytest.mark.parametrize("now", [_at(13, 30), _at(15, 1), _at(23, 59)])

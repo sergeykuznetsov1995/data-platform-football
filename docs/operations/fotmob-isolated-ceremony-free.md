@@ -102,9 +102,16 @@ docker exec fotmob-airflow-scheduler bash -lc \
 
 ## Расписание
 
-Оркестратор `*/5 * * * *`. Фоновое окно **00:00–13:30 UTC** (кооперативный дедлайн 13:45),
-дневное окно **14:00–15:00 UTC**. После 15:00 `choose_lane` отдаёт `background_window_closed`
-и до полуночи ничего не запускает.
+Оркестратор `*/5 * * * *`. Фоновая полоса стартует до **13:30 UTC**, кооперативный дедлайн
+**13:45**. Дневная полоса стартует в окне **14:00–15:00 UTC**, кооперативный дедлайн **21:00**.
+После 15:00 `choose_lane` отдаёт `background_window_closed` и до полуночи ничего не запускает.
+
+Дедлайн — это мягкий стоп: скоупы за границей помечаются `deferred`, ран закрывается как
+`partial_success` и приёмка это принимает. Единственная альтернатива дедлайну — жёсткий
+`execution_timeout` (8 ч) у `scrape_fotmob_data`, то есть SIGTERM и красный ран. Отсюда
+правило для потолков запросов в `_LANE_CAPS`: **потолок обязан быть достижим** внутри
+`rpm × min(окно, 8 ч)`, иначе он декоративен и останавливать ран становится нечему.
+Инвариант закреплён тестом `test_lane_request_caps_are_reachable`.
 
 ## Мины
 
@@ -147,17 +154,39 @@ docker exec fotmob-airflow-scheduler bash -lc \
 Пауза оркестратора **не** останавливает уже запущенного ребёнка — он живёт до дедлайна
 или до 8-часового `execution_timeout`. Менять дерево под живым процессом нельзя.
 
+**Пометка рана `failed` в метабазе процесс НЕ останавливает** — она меняет ярлык, а
+`run_fotmob_scraper.py` продолжает писать бронзу до 8-часового таймаута. Поэтому UPDATE
+идёт ПОСЛЕ гейта, а не до: иначе гейт «0 активных ранов» удовлетворяет сам себя, оператор
+верит ему и меняет дерево под живым процессом.
+
 ```bash
+# R0 — заморозить источник новых волн
 docker exec fotmob-airflow-scheduler airflow dags pause dag_orchestrate_fotmob
+
+# R1 — погасить ЖИВОГО ребёнка. Пауза дага его не убивает: даг и ран независимы.
 docker exec fotmob-airflow-scheduler airflow dags pause dag_ingest_fotmob
+docker exec fotmob-airflow-scheduler pkill -f run_fotmob_scraper.py || true
+
+# R2 — ГЕЙТ. Порядок обязателен: сначала процесс, потом метабаза.
+docker exec fotmob-airflow-scheduler pgrep -af run_fotmob_scraper.py    # ждём пусто (rc=1)
+docker exec fotmob-airflow-metadb psql -U airflow -d airflow -At -c \
+  "SELECT count(*) FROM dag_run WHERE dag_id='dag_ingest_fotmob' AND state IN ('running','queued')"
+
+# R3 — только теперь прибрать ярлыки и вернуть дерево
 docker exec fotmob-airflow-metadb psql -U airflow -d airflow -c \
-  "UPDATE dag_run SET state='failed', end_date=now() WHERE dag_id='dag_ingest_fotmob' AND state IN ('running','queued')"
-# гейт: 0 активных ранов И пустой pgrep run_fotmob_scraper.py
+  "UPDATE dag_run SET state='failed', end_date=now() WHERE dag_id IN ('dag_ingest_fotmob','dag_orchestrate_fotmob') AND state IN ('running','queued')"
 git -C /root/dpf-fotmob-930-runtime checkout wip/fotmob-930-runtime-tree   # 5852151f
+
+# R4 — ВЕРНУТЬ СБОР. Одного dag_ingest_fotmob мало: у него schedule=None, он только
+# триггерится. На старом дереве владелец — dag_refresh_fotmob (@continuous).
 docker exec fotmob-airflow-scheduler airflow dags unpause dag_ingest_fotmob
-docker exec fotmob-airflow-metadb psql -U airflow -d airflow -c \
-  "UPDATE dag_run SET state='failed', end_date=now() WHERE dag_id='dag_orchestrate_fotmob' AND state IN ('running','queued')"
+docker exec fotmob-airflow-scheduler airflow dags unpause dag_refresh_fotmob
+docker exec fotmob-airflow-metadb psql -U airflow -d airflow -At -c \
+  "SELECT dag_id,is_paused FROM dag WHERE dag_id LIKE '%fotmob%' ORDER BY 1"
 ```
+
+Без шага R4 откат заканчивается полностью простаивающим контуром, и это не даёт ни одной
+ошибки — ровно та беззвучная поломка, ради которой заведён сигнал простоя в стороже.
 
 `.airflowignore` при откате **не трогать**: строка `^dag_transform_espn_silver\.py$`
 блокирует файл, которого в дереве `5852151f` не существует, а запись через `>` на
