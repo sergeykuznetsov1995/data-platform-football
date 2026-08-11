@@ -1041,9 +1041,18 @@ class FotMobIngestService:
             observed_at=utc_now(),
         )
         paths = self._persist_profile_evidence(fetch, evidence)
-        # Scope evidence must be durable before the same payload can authorize
-        # season or transfer fan-out.
-        paths.extend(self.repository.flush())
+        # Scope evidence must reach storage no later than the fan-out it
+        # authorizes -- but that ordering is the commit buffer's own invariant,
+        # not something a per-competition flush has to buy.  Evidence enters the
+        # buffer before any season or transfer row of the same competition, and
+        # ``flush`` writes every buffered table before the manifest, so a crash
+        # can only lose visibility of both together: manifest-gated ``*_current``
+        # views never expose a child whose evidence was not written.  Flushing
+        # here instead cost one Iceberg commit per included league -- 450 of them
+        # in a production wave, median 16 s apart, 2.3 h of the window (#1163).
+        # Read-your-writes inside the run does not depend on the flush either:
+        # ``_catalog_evidence`` answers the only lookup that would otherwise hit
+        # ``latest_scope_evidence`` in Trino.
         self._catalog_evidence[competition_id] = evidence
         if payload is not None:
             self._catalog_profile_fetches[competition_id] = fetch

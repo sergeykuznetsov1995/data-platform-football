@@ -323,6 +323,76 @@ def test_fresh_profile_revalidates_cached_male_before_season_fanout():
     )
 
 
+def test_included_profile_revalidation_leaves_evidence_to_the_commit_buffer():
+    # Revalidation used to flush after every included league, which is one
+    # Iceberg commit per one-row observation: a production wave spent 2.3 h on
+    # 450 of them, median 16 s apart (#1163).  Evidence must still be persisted
+    # before the fan-out it authorizes -- that is the buffer's ordering, not the
+    # flush's -- so the commit is required and the flush is not.
+    competition_ids = (47, 53, 87)
+    all_leagues = {
+        "countries": [
+            {
+                "leagues": [
+                    {"id": competition_id, "name": f"League {competition_id}"}
+                    for competition_id in competition_ids
+                ]
+            }
+        ]
+    }
+    catalog_url = canonicalize_target("allLeagues").canonical_url
+    responses = {catalog_url: all_leagues}
+    for competition_id in competition_ids:
+        responses[
+            canonicalize_target(
+                "leagues", {"id": competition_id}
+            ).canonical_url
+        ] = _competition_payload(
+            competition_id, f"League {competition_id}", gender="male"
+        )
+    first_service, _, repository = _service(responses)
+    first_service.discover_catalog()
+
+    female_responses = {catalog_url: all_leagues}
+    for competition_id in competition_ids:
+        female_responses[
+            canonicalize_target(
+                "leagues", {"id": competition_id}
+            ).canonical_url
+        ] = _competition_payload(
+            competition_id, f"League {competition_id}", gender="female"
+        )
+    second_service = FotMobIngestService(
+        transport=StubTransport(female_responses),
+        repository=repository,
+        budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+        run_id="batched-revalidation",
+    )
+    cached = second_service.discover_catalog()
+
+    flushes = []
+    buffered_flush = repository.flush
+
+    def counting_flush():
+        flushes.append(len(repository.commits))
+        return buffered_flush()
+
+    repository.flush = counting_flush
+    discovered = second_service.discover_competitions(cached.classifications)
+
+    assert [item.classification.decision for item in discovered] == [
+        ScopeDecision.EXCLUDED
+    ] * len(competition_ids)
+    revalidated = [
+        commit
+        for commit in repository.commits
+        if commit.run_id == "batched-revalidation"
+        and commit.target_type == "competition_profile"
+    ]
+    assert len(revalidated) == len(competition_ids)
+    assert flushes == []
+
+
 def test_failed_fresh_revalidation_uses_profile_backoff_before_retry():
     competition_id = 47
     all_leagues = {
