@@ -22,7 +22,12 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
         start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
         catchup=False,
         max_active_runs=1,
-        dagrun_timeout=timedelta(hours=11),
+        # A 181-scope run spends most of its wall clock waiting on the source,
+        # so the timeout has to cover the slow end of that spread rather than
+        # the median.  It must stay below ``tasks.LEASE_TTL``: a run that
+        # outlives its scope leases publishes under a lease someone else may
+        # already own.
+        dagrun_timeout=timedelta(hours=20),
         tags=["espn", "native", "bronze"],
         params={
             "scopes": Param(default=[], type="array"),
@@ -69,8 +74,10 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
                 python_callable=tasks.fetch_scoreboard_batch,
                 pool=tasks.HTTP_POOL,
                 pool_slots=1,
-                retries=1,
+                retries=3,
                 retry_delay=timedelta(minutes=1),
+                retry_exponential_backoff=True,
+                max_retry_delay=timedelta(minutes=10),
             ).expand(op_kwargs=network_selector.output)
             summary_plan = PythonOperator(
                 task_id="plan_summary_batches",
@@ -100,8 +107,10 @@ def build_espn_ingest_dag(*, dag_id: str, mode: str) -> DAG:
                 python_callable=tasks.fetch_summary_batch,
                 pool=tasks.HTTP_POOL,
                 pool_slots=1,
-                retries=1,
+                retries=3,
                 retry_delay=timedelta(minutes=1),
+                retry_exponential_backoff=True,
+                max_retry_delay=timedelta(minutes=10),
             ).expand(op_kwargs=summary_selector.output)
             raw_source = PythonOperator(
                 task_id="reduce_raw_manifests",

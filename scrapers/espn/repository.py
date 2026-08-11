@@ -21,6 +21,7 @@ import hashlib
 import json
 import math
 import re
+import time
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Sequence
 
@@ -58,6 +59,12 @@ from .selection import (
 
 REPOSITORY_VERSION = "espn-bronze-repository-v2"
 MANIFEST_VERSION = "espn-ingest-manifest-v2"
+# An Iceberg commit conflict is a neighbour landing a snapshot on the same
+# table in the same instant, not a defect in what we are writing.  A campaign
+# that publishes a hundred-odd scopes meets one by construction.
+COMMIT_CONFLICT_ATTEMPTS = 4
+COMMIT_CONFLICT_BASE_DELAY_SECONDS = 2.0
+COMMIT_CONFLICT_MAX_DELAY_SECONDS = 30.0
 CATALOG_TABLE = "espn_catalog_snapshot_v2"
 MANIFEST_TABLE = "espn_ingest_manifest_v2"
 CUTOVER_TABLE = "espn_scope_cutover_v2"
@@ -2477,16 +2484,45 @@ class EspnBronzeRepository:
         frame = pd.DataFrame(list(rows))
         if table == LEDGER_TABLE and "event_id" in frame:
             frame["event_id"] = frame["event_id"].astype("Int64")
-        return self.writer.write_dataframe(
-            frame,
-            database=self._schema_for(table),
-            table=table,
-            partition_spec=[(column, "identity") for column in TABLE_PARTITIONS[table]],
-            mode="append",
-            add_metadata=False,
-            source="espn",
-            allow_target_ddl=self.ensure_objects_on_write,
-        )
+        return self._append_retrying_commit_conflicts(frame, table)
+
+    def _append_retrying_commit_conflicts(self, frame: pd.DataFrame, table: str) -> str:
+        """Append one snapshot, retrying only lost commit races.
+
+        The writer stages every VALUES batch and lands the target in a single
+        snapshot, so a lost optimistic-concurrency race leaves the target
+        exactly as it was: retrying appends the same rows once, never twice.
+        Any other failure is about what we are writing and propagates
+        unchanged.
+        """
+
+        from scrapers.base.trino_manager import _is_iceberg_commit_conflict
+
+        last_attempt = COMMIT_CONFLICT_ATTEMPTS - 1
+        for attempt in range(COMMIT_CONFLICT_ATTEMPTS):
+            try:
+                return self.writer.write_dataframe(
+                    frame,
+                    database=self._schema_for(table),
+                    table=table,
+                    partition_spec=[
+                        (column, "identity") for column in TABLE_PARTITIONS[table]
+                    ],
+                    mode="append",
+                    add_metadata=False,
+                    source="espn",
+                    allow_target_ddl=self.ensure_objects_on_write,
+                )
+            except Exception as exc:
+                if attempt >= last_attempt or not _is_iceberg_commit_conflict(exc):
+                    raise
+                time.sleep(
+                    min(
+                        COMMIT_CONFLICT_MAX_DELAY_SECONDS,
+                        COMMIT_CONFLICT_BASE_DELAY_SECONDS * (2**attempt),
+                    )
+                )
+        raise PublicationError("commit conflict retry loop exited without a result")
 
     def _physical_row_hashes(
         self, generation: ScopeGeneration, entity: str

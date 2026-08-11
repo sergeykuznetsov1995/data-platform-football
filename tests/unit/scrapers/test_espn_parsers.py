@@ -8,7 +8,7 @@ from datetime import date, timezone
 import hashlib
 import json
 from pathlib import Path
-from types import MappingProxyType, SimpleNamespace
+from types import MappingProxyType
 
 import pytest
 
@@ -1807,6 +1807,22 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
         **_COHORT_015_CONTRADICTORY_LINEUPS,
         **_COHORT_018_CONTRADICTORY_LINEUPS,
     }
+    # The frozensets below are what the parser actually consults, so they carry
+    # the same "exact list" seal as the tables they are derived from.
+    assert summary_parser_module._REVIEWED_TRUNCATED_IDENTITIES == frozenset(
+        summary_parser_module._REVIEWED_TRUNCATED_LINEUPS.values()
+    ) | {
+        ("3929:2026", 401897987, ((884, 11), (18809, 10))),
+        ("3929:2026", 401898021, ((7242, 11), (17939, 8))),
+        ("3929:2026", 401898713, ((21583, 9), (132449, 3))),
+    }
+    assert summary_parser_module._REVIEWED_CONTRADICTORY_IDENTITIES == frozenset(
+        summary_parser_module._REVIEWED_CONTRADICTORY_LINEUPS.values()
+    ) | {("3903:2026", 401844030, ((236, 11), (10743, 11)))}
+    assert isinstance(summary_parser_module._REVIEWED_TRUNCATED_IDENTITIES, frozenset)
+    assert isinstance(
+        summary_parser_module._REVIEWED_CONTRADICTORY_IDENTITIES, frozenset
+    )
     assert dict(summary_parser_module._REVIEWED_MALFORMED_LINEUPS) == {
         "64f1f810c6a8ccfacb66cafd55c96988fdcef75ca40cf90e987a8171fa290d29": (
             "680:2026",
@@ -1882,9 +1898,15 @@ def test_reviewed_lineup_exceptions_are_exact_and_fail_closed(
         if policy_name == "truncated"
         else "_REVIEWED_CONTRADICTORY_LINEUPS"
     )
+    identity_attr = (
+        "_REVIEWED_TRUNCATED_IDENTITIES"
+        if policy_name == "truncated"
+        else "_REVIEWED_CONTRADICTORY_IDENTITIES"
+    )
     policy = getattr(summary_parser_module, policy_attr)
     assert isinstance(policy, MappingProxyType)
     assert policy[lineup_sha256] == identity
+    assert identity in getattr(summary_parser_module, identity_attr)
 
     competition, edition, event, payload = _reviewed_lineup_summary_case(
         identity,
@@ -1892,16 +1914,6 @@ def test_reviewed_lineup_exceptions_are_exact_and_fail_closed(
         lineup=CapabilityState.UNKNOWN,
     )
 
-    def use_digest(digest: str) -> None:
-        monkeypatch.setattr(
-            summary_parser_module,
-            "hashlib",
-            SimpleNamespace(
-                sha256=lambda _raw: SimpleNamespace(hexdigest=lambda: digest)
-            ),
-        )
-
-    use_digest(lineup_sha256)
     result = parse_summary(
         _raw(payload), competition=competition, edition=edition, event=event
     )
@@ -1911,79 +1923,45 @@ def test_reviewed_lineup_exceptions_are_exact_and_fail_closed(
     assert result.matchsheet_state is EntityParseState.CAPTURED
 
     failure = "11 starters" if policy_name == "truncated" else "contradictory"
-    lineup_source = {"rosters": payload["rosters"]}
-    if "format" in payload:
-        lineup_source["format"] = payload["format"]
-    reviewed_source_bytes = json.dumps(
-        lineup_source,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    monkeypatch.setattr(
-        summary_parser_module,
-        "hashlib",
-        SimpleNamespace(
-            sha256=lambda raw: (
-                SimpleNamespace(hexdigest=lambda: lineup_sha256)
-                if raw == reviewed_source_bytes
-                else hashlib.sha256(raw)
-            )
-        ),
-    )
-    changed_payload = deepcopy(payload)
-    changed_payload["rosters"][0]["roster"][0]["athlete"]["displayName"] = (
+
+    # A review must survive the source editing an athlete card: ESPN rewrites
+    # names, positions and links for years after a match, and every such edit
+    # used to expire the review and lose the whole cohort with it.  The defect
+    # this review covers is unchanged, so the verdict must be too.
+    drifted_payload = deepcopy(payload)
+    drifted_payload["rosters"][0]["roster"][0]["athlete"]["displayName"] = (
         "Changed Player"
     )
-    with pytest.raises(EspnParseError, match=failure):
-        parse_summary(
-            _raw(changed_payload),
-            competition=competition,
-            edition=edition,
-            event=event,
-        )
+    drifted = parse_summary(
+        _raw(drifted_payload),
+        competition=competition,
+        edition=edition,
+        event=event,
+    )
+    assert drifted.lineup == ()
+    assert drifted.lineup_state is EntityParseState.VALID_EMPTY
+    assert drifted.matchsheet_state is EntityParseState.CAPTURED
 
-    mutated_sha256 = ("0" if lineup_sha256[0] != "0" else "1") + lineup_sha256[1:]
-    use_digest(mutated_sha256)
-    with pytest.raises(EspnParseError, match=failure):
-        parse_summary(
-            _raw(payload), competition=competition, edition=edition, event=event
-        )
-
-    use_digest(lineup_sha256)
+    # What the review does pin stays exact: a different scope, a different
+    # event or different starter counts is a different defect, and unreviewed
+    # defects still fail closed.
     scope_id, event_id, starter_counts = identity
     first_team_id, first_count = starter_counts[0]
-    mutated_identities = (
+    for mutated_identity in (
         ("751:2026", event_id, starter_counts),
         (scope_id, event_id + 1, starter_counts),
-        (
-            scope_id,
-            event_id,
-            ((first_team_id + 1, first_count), *starter_counts[1:]),
-        ),
-        (
-            scope_id,
-            event_id,
-            ((first_team_id, first_count + 1), *starter_counts[1:]),
-        ),
-    )
-    for mutated_identity in mutated_identities:
+        (scope_id, event_id, ((first_team_id + 1, first_count), *starter_counts[1:])),
+        (scope_id, event_id, ((first_team_id, first_count + 1), *starter_counts[1:])),
+    ):
         monkeypatch.setattr(
-            summary_parser_module,
-            policy_attr,
-            MappingProxyType({lineup_sha256: mutated_identity}),
+            summary_parser_module, identity_attr, frozenset({mutated_identity})
         )
         with pytest.raises(EspnParseError, match=failure):
             parse_summary(
                 _raw(payload), competition=competition, edition=edition, event=event
             )
 
-    monkeypatch.setattr(
-        summary_parser_module,
-        policy_attr,
-        MappingProxyType({lineup_sha256: identity}),
-    )
+    monkeypatch.setattr(summary_parser_module, identity_attr, frozenset({identity}))
     proven_competition, proven_edition, proven_event, proven_payload = (
         _reviewed_lineup_summary_case(
             identity,
@@ -2324,22 +2302,10 @@ def test_only_reviewed_truncated_conventional_lineup_degrades_to_valid_empty(
         schedule[0].event_id,
         ((10, 11), (20, 10)),
     )
-    lineup_source = {"rosters": payload["rosters"]}
-    if "format" in payload:
-        lineup_source["format"] = payload["format"]
-    lineup_source_sha256 = hashlib.sha256(
-        json.dumps(
-            lineup_source,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
     monkeypatch.setattr(
         summary_parser_module,
-        "_REVIEWED_TRUNCATED_LINEUPS",
-        {lineup_source_sha256: identity},
+        "_REVIEWED_TRUNCATED_IDENTITIES",
+        frozenset({identity}),
     )
     result = parse_summary(
         raw, competition=competition, edition=edition, event=schedule[0]
@@ -2358,16 +2324,18 @@ def test_only_reviewed_truncated_conventional_lineup_degrades_to_valid_empty(
     )
     assert drifted.lineup_state is EntityParseState.VALID_EMPTY
 
-    # A roster-section change with the same starter counts must not match.
+    # A cosmetic roster edit with the same starter counts is the same defect:
+    # ESPN rewrites athlete cards years after a match, and pinning the review
+    # to those bytes expired it while the defect stayed put.
     changed_roster = deepcopy(payload)
     changed_roster["rosters"][1]["roster"][0]["athlete"]["displayName"] = "Changed"
-    with pytest.raises(EspnParseError, match="11 starters"):
-        parse_summary(
-            _raw(changed_roster),
-            competition=competition,
-            edition=edition,
-            event=schedule[0],
-        )
+    still_reviewed = parse_summary(
+        _raw(changed_roster),
+        competition=competition,
+        edition=edition,
+        event=schedule[0],
+    )
+    assert still_reviewed.lineup_state is EntityParseState.VALID_EMPTY
 
     # A lineup-relevant format change with identical rosters must not match.
     changed_format = deepcopy(payload)
@@ -2389,8 +2357,8 @@ def test_only_reviewed_truncated_conventional_lineup_degrades_to_valid_empty(
     for wrong_identity in wrong_identities:
         monkeypatch.setattr(
             summary_parser_module,
-            "_REVIEWED_TRUNCATED_LINEUPS",
-            {lineup_source_sha256: wrong_identity},
+            "_REVIEWED_TRUNCATED_IDENTITIES",
+            frozenset({wrong_identity}),
         )
         with pytest.raises(EspnParseError, match="11 starters"):
             parse_summary(
@@ -2403,8 +2371,8 @@ def test_only_reviewed_truncated_conventional_lineup_degrades_to_valid_empty(
     # Even the exact reviewed identity remains forbidden for PROVEN capability.
     monkeypatch.setattr(
         summary_parser_module,
-        "_REVIEWED_TRUNCATED_LINEUPS",
-        {lineup_source_sha256: identity},
+        "_REVIEWED_TRUNCATED_IDENTITIES",
+        frozenset({identity}),
     )
     proven_competition, proven_edition, proven_schedule = _schedule()
     with pytest.raises(EspnParseError, match="11 starters"):
@@ -2439,18 +2407,6 @@ def test_only_reviewed_contradictory_lineup_degrades_to_valid_empty(
     with pytest.raises(EspnParseError, match="contradictory"):
         parse_summary(raw, competition=competition, edition=edition, event=schedule[0])
 
-    lineup_source = {"rosters": payload["rosters"]}
-    if "format" in payload:
-        lineup_source["format"] = payload["format"]
-    lineup_source_sha256 = hashlib.sha256(
-        json.dumps(
-            lineup_source,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
     identity = (
         schedule[0].scope_id,
         schedule[0].event_id,
@@ -2458,8 +2414,8 @@ def test_only_reviewed_contradictory_lineup_degrades_to_valid_empty(
     )
     monkeypatch.setattr(
         summary_parser_module,
-        "_REVIEWED_CONTRADICTORY_LINEUPS",
-        {lineup_source_sha256: identity},
+        "_REVIEWED_CONTRADICTORY_IDENTITIES",
+        frozenset({identity}),
     )
 
     result = parse_summary(
@@ -2468,28 +2424,31 @@ def test_only_reviewed_contradictory_lineup_degrades_to_valid_empty(
     assert result.lineup == ()
     assert result.lineup_state is EntityParseState.VALID_EMPTY
 
+    # A cosmetic roster edit does not make it a different contradiction: the
+    # review is pinned to the scope, the event and the starter counts, not to
+    # bytes the source keeps rewriting.
     changed = deepcopy(payload)
     changed["rosters"][1]["roster"][0]["athlete"]["displayName"] = "Changed"
-    with pytest.raises(EspnParseError, match="contradictory"):
-        parse_summary(
-            _raw(changed),
-            competition=competition,
-            edition=edition,
-            event=schedule[0],
-        )
+    still_reviewed = parse_summary(
+        _raw(changed),
+        competition=competition,
+        edition=edition,
+        event=schedule[0],
+    )
+    assert still_reviewed.lineup_state is EntityParseState.VALID_EMPTY
 
     monkeypatch.setattr(
         summary_parser_module,
-        "_REVIEWED_CONTRADICTORY_LINEUPS",
-        {lineup_source_sha256: (schedule[0].scope_id, schedule[0].event_id, ())},
+        "_REVIEWED_CONTRADICTORY_IDENTITIES",
+        frozenset({(schedule[0].scope_id, schedule[0].event_id, ())}),
     )
     with pytest.raises(EspnParseError, match="contradictory"):
         parse_summary(raw, competition=competition, edition=edition, event=schedule[0])
 
     monkeypatch.setattr(
         summary_parser_module,
-        "_REVIEWED_CONTRADICTORY_LINEUPS",
-        {lineup_source_sha256: identity},
+        "_REVIEWED_CONTRADICTORY_IDENTITIES",
+        frozenset({identity}),
     )
     proven_competition, proven_edition, proven_schedule = _schedule()
     with pytest.raises(EspnParseError, match="proven lineup"):

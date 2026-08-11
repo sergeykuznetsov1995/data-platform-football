@@ -226,6 +226,32 @@ def test_network_and_repository_work_use_bounded_dedicated_pools():
     assert tasks["publish_scopes"]._init_kwargs["pool_slots"] == 1
 
 
+def test_only_network_fetches_retry_and_they_retry_more_than_once():
+    """One dropped card must not decide the fate of a 181-scope run.
+
+    Fetches are the only tasks whose failure is about the network rather than
+    about the data, so they are the only ones allowed a retry — and a single
+    one is not enough: two cards lost to HTTP 502 already killed one canary.
+    """
+
+    _reload("dag_ingest_espn")
+    tasks = _tasks()
+
+    retried = {
+        task_id: task._init_kwargs.get("retries")
+        for task_id, task in tasks.items()
+        if task._init_kwargs.get("retries")
+    }
+    assert retried == {
+        "fetch_scoreboard_batches": 3,
+        "fetch_summary_batches": 3,
+    }
+    for task_id in retried:
+        assert tasks[task_id]._init_kwargs["retry_exponential_backoff"] is True
+        assert tasks[task_id]._init_kwargs["retry_delay"] == timedelta(minutes=1)
+        assert tasks[task_id]._init_kwargs["max_retry_delay"] == timedelta(minutes=10)
+
+
 def test_all_executable_entrypoints_gate_current_identity_before_side_effects():
     from dags.utils import espn_native_tasks
     from dags.scripts import run_espn_scraper
@@ -303,8 +329,11 @@ def test_ingest_timeout_lease_and_mapping_bounds_cover_bounded_onboarding():
     module = _reload("dag_ingest_espn")
     tasks = _tasks()
 
-    assert module.dag._dag_kwargs["dagrun_timeout"] == timedelta(hours=11)
-    assert espn_native_tasks.LEASE_TTL == timedelta(hours=12)
+    assert module.dag._dag_kwargs["dagrun_timeout"] == timedelta(hours=20)
+    assert espn_native_tasks.LEASE_TTL == timedelta(hours=24)
+    # The pair only makes sense together: a run allowed to outlive its leases
+    # can publish a scope a second writer already reclaimed.
+    assert espn_native_tasks.LEASE_TTL > module.dag._dag_kwargs["dagrun_timeout"]
     assert espn_native_tasks.MAX_INGEST_SCOPE_MAP_ITEMS == 300
     assert espn_native_tasks.MAX_SUMMARY_BATCH_MAP_ITEMS == 1024
     assert (

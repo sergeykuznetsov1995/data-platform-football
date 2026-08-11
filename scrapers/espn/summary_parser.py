@@ -97,8 +97,9 @@ MATCHSHEET_STAT_NAME_MAP: Mapping[str, str] = MappingProxyType(
 )
 
 # ESPN occasionally publishes an otherwise conventional roster with an exact
-# reviewed starter-cardinality defect.  Bind every exception to the canonical
-# lineup source (rosters plus format), scope, event and team counts.  Discard
+# reviewed starter-cardinality defect.  The digest records which source bytes
+# were reviewed; the waiver itself matches on the identity those bytes carried
+# — scope, event and team counts, see _REVIEWED_TRUNCATED_IDENTITIES.  Discard
 # its lineup; never synthesize a player or relax cardinality elsewhere.
 _REVIEWED_TRUNCATED_LINEUPS: Mapping[
     str, tuple[str, int, tuple[tuple[int, int], ...]]
@@ -387,9 +388,34 @@ _REVIEWED_TRUNCATED_LINEUPS: Mapping[
     }
 )
 
+# The digests above expire on their own: ESPN keeps editing athlete cards for
+# years after a match — accents, positions, links — and any such edit rewrites
+# the roster bytes without touching the defect.  Measured on the reconciliation
+# corpus: 8% of Summary responses changed bytes in eight days, including five
+# of fifteen rosters in a 2012 tournament.  So match a review by what it
+# actually identifies, not by the bytes it was recorded against.
+_REVIEWED_TRUNCATED_IDENTITIES: frozenset[
+    tuple[str, int, tuple[tuple[int, int], ...]]
+] = frozenset(_REVIEWED_TRUNCATED_LINEUPS.values()) | frozenset(
+    {
+        # Honduras 2026, three full-time matches whose rosters simply stop
+        # short of the eleven ESPN itself flags as starters: 22 rows carry an
+        # eleven while 15 rows carry ten (401897987), 13 rows carry eight
+        # against a complete eleven (401898021), and 8 rows carry three
+        # against nine (401898713).  Regulation format is the ordinary two
+        # halves, no formationPlace is published for any starter, and no row
+        # is a duplicate — the missing players are absent from the response,
+        # not misread from it.
+        ("3929:2026", 401897987, ((884, 11), (18809, 10))),
+        ("3929:2026", 401898021, ((7242, 11), (17939, 8))),
+        ("3929:2026", 401898713, ((21583, 9), (132449, 3))),
+    }
+)
+
 # ESPN published internally contradictory starter/substitution flags for these
 # exact lineups. Preserve no player rows rather than guess which source flag is
-# correct.
+# correct.  As above, the digest records the reviewed bytes while the waiver
+# matches on identity — see _REVIEWED_CONTRADICTORY_IDENTITIES.
 _REVIEWED_CONTRADICTORY_LINEUPS: Mapping[
     str, tuple[str, int, tuple[tuple[int, int], ...]]
 ] = MappingProxyType(
@@ -559,6 +585,23 @@ _REVIEWED_CONTRADICTORY_LINEUPS: Mapping[
             401871509,
             ((2919, 11), (5481, 11)),
         ),
+    }
+)
+
+# Same expiry as the truncated table above; match on identity, not on bytes.
+# Reviews recorded from here on are written as identities directly — a digest
+# of the source bytes was never a durable key for a source that edits its own
+# history.
+_REVIEWED_CONTRADICTORY_IDENTITIES: frozenset[
+    tuple[str, int, tuple[tuple[int, int], ...]]
+] = frozenset(_REVIEWED_CONTRADICTORY_LINEUPS.values()) | frozenset(
+    {
+        # 3903:2026 event 401844030, played 2026-08-09: substitute Tobias Salas
+        # carries starter=true together with formationPlace 0 and
+        # subbedIn=true, while the starting eleven has no formationPlace 9 at
+        # all.  Which of the two flags is wrong cannot be known from the
+        # response, so no player rows are preserved for this event.
+        ("3903:2026", 401844030, ((236, 11), (10743, 11))),
     }
 )
 
@@ -1260,14 +1303,17 @@ def _lineup(
             event.event_id,
             tuple(sorted(starter_counts.items())),
         )
+        # No small-sided escape here, unlike the truncated branch below: the
+        # inference "this team does not field eleven starters" is void once the
+        # source declares a different format, while "one athlete is both a
+        # starter and a substitute" contradicts itself at any team size.
         if contradictory_substitution_semantics:
-            reviewed_identity = _REVIEWED_CONTRADICTORY_LINEUPS.get(
-                lineup_source_sha256
-            )
-            if reviewed_identity == observed_identity:
+            if observed_identity in _REVIEWED_CONTRADICTORY_IDENTITIES:
                 return (), _valid_empty_or_fail(capability, "lineup")
             raise EspnParseError(
-                "Summary lineup has contradictory starter/substitution semantics"
+                "Summary lineup has contradictory starter/substitution "
+                f"semantics for event {event.event_id}; "
+                f"starters {tuple(sorted(starter_counts.items()))}"
             )
     elif duplicate_athlete_rows:
         # A duplicate in the reviewed historical scope is a known semantic
@@ -1304,15 +1350,15 @@ def _lineup(
                 and capability is not CapabilityState.PROVEN
             ):
                 return (), _valid_empty_or_fail(capability, "lineup")
-            reviewed_identity = _REVIEWED_TRUNCATED_LINEUPS.get(lineup_source_sha256)
             if (
                 capability is not CapabilityState.PROVEN
-                and reviewed_identity == observed_identity
+                and small_sided_size is None
+                and observed_identity in _REVIEWED_TRUNCATED_IDENTITIES
             ):
                 return (), _valid_empty_or_fail(capability, "lineup")
             raise EspnParseError(
-                "explicit conventional lineup must contain 11 starters per team; "
-                f"got {starter_counts}"
+                "explicit conventional lineup must contain 11 starters per team "
+                f"for event {event.event_id}; got {starter_counts}"
             )
     return (
         tuple(

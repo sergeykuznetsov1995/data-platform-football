@@ -90,7 +90,10 @@ RELEASE_COMMIT_ENV = "ESPN_RELEASE_COMMIT"
 RELEASE_TREE_SHA256_ENV = "ESPN_RELEASE_TREE_SHA256"
 CANARY_CLAIM_URI_ENV = "ESPN_CANARY_CLAIM_URI"
 CANARY_CLAIM_SHA256_ENV = "ESPN_CANARY_CLAIM_SHA256"
-LEASE_TTL = timedelta(hours=12)
+# Must outlive ``dagrun_timeout`` in the DAG factory: a scope whose summary
+# wave is empty renews nothing for hours, and an expired lease invites a second
+# writer onto the same scope.
+LEASE_TTL = timedelta(hours=24)
 DAILY_BOOTSTRAP_SCOPE_LIMIT = 10
 DISCOVERY_MAX_AGE = timedelta(days=8)
 DISCOVERY_FUTURE_TOLERANCE = timedelta(minutes=5)

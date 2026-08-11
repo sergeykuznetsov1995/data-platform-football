@@ -1683,6 +1683,85 @@ def test_manifest_is_last_and_partial_commit_is_not_published():
     assert MANIFEST_TABLE not in [table for table, _ in writer.calls]
 
 
+class _CommitConflict(RuntimeError):
+    """What Trino raises when a neighbour won the snapshot race."""
+
+    error_name = "ICEBERG_COMMIT_ERROR"
+
+
+class ConflictingWriter(FakeWriter):
+    def __init__(self, conflicts: int, table: str):
+        super().__init__()
+        self.remaining = conflicts
+        self.conflict_table = table
+        self.attempts = 0
+
+    def write_dataframe(self, df, *, database, table, **kwargs):
+        if table == self.conflict_table:
+            self.attempts += 1
+            if self.remaining:
+                self.remaining -= 1
+                raise _CommitConflict("Failed to commit the transaction")
+        return super().write_dataframe(df, database=database, table=table, **kwargs)
+
+
+@pytest.mark.unit
+def test_publication_retries_a_lost_commit_race_and_appends_rows_once(monkeypatch):
+    delays: list[float] = []
+    monkeypatch.setattr(repository_module.time, "sleep", delays.append)
+    writer = ConflictingWriter(conflicts=2, table=ENTITY_TABLES["schedule"])
+    repository = EspnBronzeRepository(
+        writer=writer, query=FakeQuery(), verify_physical=False
+    )
+
+    result = repository.publish_scope(_generation())
+
+    assert result.state is ScopePublicationState.PUBLISHED
+    assert writer.attempts == 3
+    assert [table for table, _ in writer.calls] == [
+        *ENTITY_TABLES.values(),
+        repository_module.LEDGER_TABLE,
+        MANIFEST_TABLE,
+    ]
+    assert delays == [2.0, 4.0]
+
+
+@pytest.mark.unit
+def test_publication_does_not_retry_a_failure_that_is_not_a_commit_race(monkeypatch):
+    delays: list[float] = []
+    monkeypatch.setattr(repository_module.time, "sleep", delays.append)
+    writer = FakeWriter(fail_table=ENTITY_TABLES["lineup"])
+    repository = EspnBronzeRepository(
+        writer=writer, query=FakeQuery(), verify_physical=False
+    )
+
+    with pytest.raises(PublicationError, match="injected write failure"):
+        repository.publish_scope(_generation())
+
+    assert delays == []
+    assert [table for table, _ in writer.calls].count(ENTITY_TABLES["lineup"]) == 1
+
+
+@pytest.mark.unit
+def test_publication_gives_up_when_every_attempt_loses_the_commit_race(monkeypatch):
+    delays: list[float] = []
+    monkeypatch.setattr(repository_module.time, "sleep", delays.append)
+    writer = ConflictingWriter(
+        conflicts=repository_module.COMMIT_CONFLICT_ATTEMPTS,
+        table=ENTITY_TABLES["schedule"],
+    )
+    repository = EspnBronzeRepository(
+        writer=writer, query=FakeQuery(), verify_physical=False
+    )
+
+    with pytest.raises(PublicationError, match="Failed to commit the transaction"):
+        repository.publish_scope(_generation())
+
+    assert writer.attempts == repository_module.COMMIT_CONFLICT_ATTEMPTS
+    assert delays == [2.0, 4.0, 8.0]
+    assert MANIFEST_TABLE not in [table for table, _ in writer.calls]
+
+
 @pytest.mark.unit
 def test_reclaimed_lease_is_rechecked_before_complete_manifest():
     """A writer fenced after physical rows must never expose COMPLETE."""
