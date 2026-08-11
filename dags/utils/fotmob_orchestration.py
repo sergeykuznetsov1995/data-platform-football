@@ -23,6 +23,16 @@ BACKGROUND_HOLD_START = time(13, 30)
 BACKGROUND_DEADLINE = time(13, 45)
 DAILY_WINDOW_START = time(14, 0)
 DAILY_WINDOW_END = time(15, 0)
+# Дневная полоса была прибита к когорте из 21 турнира и укладывалась в минуты, поэтому
+# кооперативного дедлайна не имела. Под автоматическим каталогом она обходит весь каталог,
+# и единственным ограничителем оставался жёсткий execution_timeout ребёнка — то есть
+# SIGTERM и красный ран вместо мягкой отсрочки (deferred → partial_success).
+DAILY_DEADLINE = time(21, 0)
+
+# execution_timeout задачи scrape_fotmob_data в dag_ingest_fotmob. Продублирован здесь
+# намеренно: от него считается достижимость потолков запросов, а тест
+# test_lane_request_caps_are_reachable сверяет копию с оригиналом.
+CHILD_TIMEOUT_MINUTES = 8 * 60
 
 
 class FotMobLane(str, Enum):
@@ -167,15 +177,43 @@ def advance_after_success(
     )
 
 
+# 2026-08-10/11: потолки пересчитаны под автоматический каталог #1149.
+#
+# Прежние (10_000/512, 15_000/1_024, 10_000/512) рассчитаны на когорту из 21 турнира;
+# автоматический каталог расширяет её до ~460 мужских турниров (замер 11.08: 559 записей
+# competition_profile за один обход) при ~44 запросах на турнир, то есть полный оборот
+# стоит ~20k запросов и упирался бы в 'request budget exceeded' на первой же волне.
+#
+# ПОТОЛОК ЗАПРОСОВ ОБЯЗАН БЫТЬ ДОСТИЖИМ внутри своего ограничителя времени, иначе он
+# декоративен: остановить ран станет нечему, и вместо мягкой бюджетной отсрочки
+# (её приёмка трактует как partial_success) ран будет убит по execution_timeout —
+# SIGTERM, status=incomplete, красный ран. Именно это ломала первая редакция патча
+# с потолком 80_000: при 60 rpm за 8 часов физически выдаётся не больше 28_800.
+# Инвариант проверяется тестом test_lane_request_caps_are_reachable.
+#
+# Достижимый максимум = rpm × min(окно полосы, CHILD_TIMEOUT_MINUTES):
+#   DAILY    60 × min(14:00→21:00 = 420, 480) = 25_200 → берём 24_000
+#   REFRESH  60 × min(00:00→13:45 = 825, 480) = 28_800 → берём 27_000
+#   BACKFILL 45 × min(825, 480)               = 21_600 → берём 20_000
+#
+# Потолок байт — предохранитель от аномальных payload'ов, а не механизм темпа: при
+# замеренных ~12 КиБ на запрос (дневной ран 09.08: 913 запросов / 10,7 МиБ) он держит
+# примерно четырёхкратный запас и в норме не срабатывает. Это осознанно.
+#
+# rpm НЕ поднимаем — темп обращений к источнику прежний.
 _LANE_CAPS = {
-    FotMobLane.DAILY: (10_000, 512, 60),
-    FotMobLane.REFRESH: (15_000, 1_024, 60),
-    FotMobLane.BACKFILL: (10_000, 512, 45),
+    FotMobLane.DAILY: (24_000, 1_536, 60),
+    FotMobLane.REFRESH: (27_000, 1_536, 60),
+    FotMobLane.BACKFILL: (20_000, 1_024, 45),
 }
 
 
 def _background_deadline(now: datetime) -> datetime:
     return datetime.combine(now.date(), BACKGROUND_DEADLINE, tzinfo=UTC)
+
+
+def _daily_deadline(now: datetime) -> datetime:
+    return datetime.combine(now.date(), DAILY_DEADLINE, tzinfo=UTC)
 
 
 def build_child_conf(lane: FotMobLane, now_utc: datetime) -> dict[str, Any]:
@@ -192,10 +230,10 @@ def build_child_conf(lane: FotMobLane, now_utc: datetime) -> dict[str, Any]:
         )
     max_requests, max_direct_mib, rpm = _LANE_CAPS[normalized_lane]
     deadline = (
-        ""
+        _daily_deadline(now)
         if normalized_lane is FotMobLane.DAILY
-        else _background_deadline(now).isoformat()
-    )
+        else _background_deadline(now)
+    ).isoformat()
     return {
         "mode": normalized_lane.value,
         "scope": "",
