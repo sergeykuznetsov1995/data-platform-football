@@ -842,6 +842,16 @@ class FotMobRepository:
         self._preloaded_run_id: Optional[str] = None
         self._raw_entity_index: dict[tuple[str, str], dict[str, Any]] = {}
         self._scope_attempt_run_ids: dict[tuple[str, int, str], str] = {}
+        # Карта попыток читается полным оконным запросом по всему манифесту, а
+        # record_scope_attempt зовёт её на КАЖДУЮ попытку. Под контентной
+        # подписью запрос возвращал ноль строк и цена была незаметна; под
+        # стабильной он возвращает всю историю полосы, а вызовов за ран —
+        # сотни. Держим срез Trino на время рана и досыпаем в него собственные
+        # записи, чтобы read-your-writes сохранилось после flush().
+        self._scope_attempt_states: dict[
+            tuple[str, str], dict[tuple[int, str], ScopeAttemptState]
+        ] = {}
+        self._scope_attempt_loaded: set[tuple[str, str]] = set()
         self._preloaded = False
 
     def _write(
@@ -2233,51 +2243,71 @@ class FotMobRepository:
         signature = str(plan_signature).strip()
         if not signature:
             raise ValueError("plan_signature must not be empty")
-        output: dict[tuple[int, str], ScopeAttemptState] = {}
-        manager_getter = getattr(self.writer, "_get_trino_manager", None)
-        if manager_getter is not None:
-            trino = manager_getter()
-            safe_signature = signature.replace("'", "''")
-            safe_version = str(parser_version).replace("'", "''")
-            rows = trino.execute_query(
-                f"""
-                SELECT competition_id, source_season_key, entity_id,
-                       completed_at, retry_after, capabilities_json
-                FROM (
+        cache_key = (signature, str(parser_version))
+        if cache_key not in self._scope_attempt_loaded:
+            # Срез засчитывается загруженным только после успешного запроса:
+            # иначе сорванный запрос застыл бы пустой картой на весь ран, а
+            # вызывающий (record_scope_attempt) глотает исключение — вся полоса
+            # молча поехала бы с нулевой историей попыток.
+            loaded: dict[tuple[int, str], ScopeAttemptState] = {}
+            manager_getter = getattr(self.writer, "_get_trino_manager", None)
+            if manager_getter is not None:
+                trino = manager_getter()
+                safe_signature = signature.replace("'", "''")
+                safe_version = str(parser_version).replace("'", "''")
+                rows = trino.execute_query(
+                    f"""
                     SELECT competition_id, source_season_key, entity_id,
-                           completed_at, retry_after, capabilities_json,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY competition_id, source_season_key
-                               ORDER BY completed_at DESC, batch_id DESC
-                           ) AS row_number
-                    FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
-                    WHERE target_type = 'scope_attempt'
-                      AND entity_id = '{safe_signature}'
-                      AND parser_version = '{safe_version}'
-                      AND competition_id IS NOT NULL
-                      AND source_season_key IS NOT NULL
-                ) ranked
-                WHERE row_number = 1
-                """
-            )
-            for row in rows:
-                state = _scope_attempt_state_from_values(
-                    competition_id=row[0],
-                    source_season_key=row[1],
-                    plan_signature=row[2],
-                    completed_at=row[3],
-                    retry_after=row[4],
-                    capabilities=row[5],
+                           completed_at, retry_after, capabilities_json
+                    FROM (
+                        SELECT competition_id, source_season_key, entity_id,
+                               completed_at, retry_after, capabilities_json,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY competition_id, source_season_key
+                                   ORDER BY completed_at DESC,
+                                            COALESCE(CAST(json_extract_scalar(
+                                                capabilities_json,
+                                                '$.attempt_count'
+                                            ) AS BIGINT), 0) DESC,
+                                            batch_id DESC
+                               ) AS row_number
+                        FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
+                        WHERE target_type = 'scope_attempt'
+                          AND entity_id = '{safe_signature}'
+                          AND parser_version = '{safe_version}'
+                          AND competition_id IS NOT NULL
+                          AND source_season_key IS NOT NULL
+                    ) ranked
+                    WHERE row_number = 1
+                    """
                 )
-                if state is not None:
-                    output[state.identity] = state
-                    try:
-                        values = json.loads(row[5]) if isinstance(row[5], str) else row[5]
-                        self._scope_attempt_run_ids[
-                            (signature, *state.identity)
-                        ] = str((values or {}).get("run_id") or "")
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        pass
+                for row in rows:
+                    state = _scope_attempt_state_from_values(
+                        competition_id=row[0],
+                        source_season_key=row[1],
+                        plan_signature=row[2],
+                        completed_at=row[3],
+                        retry_after=row[4],
+                        capabilities=row[5],
+                    )
+                    if state is not None:
+                        loaded[state.identity] = state
+                        try:
+                            values = (
+                                json.loads(row[5]) if isinstance(row[5], str) else row[5]
+                            )
+                            self._scope_attempt_run_ids[
+                                (signature, *state.identity)
+                            ] = str((values or {}).get("run_id") or "")
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            pass
+            store = self._scope_attempt_states.setdefault(cache_key, {})
+            for identity, state in loaded.items():
+                store.setdefault(identity, state)
+            self._scope_attempt_loaded.add(cache_key)
+        output: dict[tuple[int, str], ScopeAttemptState] = dict(
+            self._scope_attempt_states.get(cache_key, {})
+        )
         for row in self._pending_manifest:
             if row.get("target_type") != "scope_attempt" or row.get(
                 "entity_id"
@@ -2347,6 +2377,15 @@ class FotMobRepository:
             attempt_identities=attempt_identities,
         )
         self.commit(commit)
+        # Срез Trino прочитан один раз за ран; собственную запись досыпаем сюда
+        # сразу, иначе после flush() состояние исчезнет из карты и счётчик
+        # попыток поедет назад.
+        self._scope_attempt_states.setdefault(
+            (str(plan_signature).strip(), commit.parser_version), {}
+        )[state.identity] = state
+        self._scope_attempt_run_ids[
+            (str(plan_signature).strip(), *state.identity)
+        ] = str(run_id)
         return state
 
     def scope_completion_times(

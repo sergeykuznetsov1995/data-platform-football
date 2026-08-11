@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Iterable, Mapping, Optional
 
@@ -72,6 +72,19 @@ class ScopeAttemptState:
 
 
 SCOPE_PLAN_SIGNATURE_VERSION = "fotmob-scope-plan-v1"
+
+# Сколько терминальный исход держит скоуп вне планов. Пока журнал жил под
+# контентной подписью, карта состояний была пуста на каждом ране и вечное
+# исключение никого не задевало. Со стабильной подписью одна разовая ошибка
+# коммита вычеркнула бы скоуп из обхода навсегда — тихая дыра в покрытии,
+# которую не видно ни по цвету рана, ни по числу закрытых скоупов.
+TERMINAL_RETRY_AFTER = timedelta(hours=24)
+
+
+def _naive_utc(value: datetime) -> datetime:
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 def deterministic_plan_signature(
@@ -277,9 +290,15 @@ def plan_seasons(
 
         attempt = attempts.get(identity)
         if attempt is not None:
-            if attempt.outcome == "terminal" or (
+            if (
                 attempt.outcome in {"success", "source_gap"}
                 and lane != ScopeLane.CURRENT
+            ):
+                continue
+            if (
+                attempt.outcome == "terminal"
+                and observed_now - _naive_utc(attempt.last_attempt_at)
+                < TERMINAL_RETRY_AFTER
             ):
                 continue
             retry_at = attempt.next_retry_at

@@ -923,8 +923,420 @@ class TestFotmobNativeRunner:
         ] == "schema_drift"
 
     @pytest.mark.unit
+    def test_attempt_journal_survives_a_catalog_composition_change(self, monkeypatch):
+        """История попыток обязана пережить появление нового турнира в каталоге.
+
+        Контрактная подпись хеширует состав каталога, поэтому в августе, когда
+        источник открывает сезоны пачками, она менялась почти каждый ран. Пока
+        журнал жил под ней, второй попытки не наступало никогда: дыра источника
+        не подтверждалась, скоуп оставался вечно retryable, а обход каждый раз
+        начинал с головы очереди.
+        """
+
+        from scrapers.fotmob import planner
+        from scrapers.fotmob.catalog_contract import catalog_contract_from_dict
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _competition_payload,
+            _league_payload,
+        )
+
+        mod = self._module()
+        missing_match = {"error": True, "message": "Data not found", "matchId": "100"}
+        first_catalog = {
+            "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+        }
+        second_catalog = {
+            "countries": [
+                {
+                    "leagues": [
+                        {"id": 47, "name": "Premier League"},
+                        {"id": 48, "name": "Championship"},
+                    ]
+                }
+            ]
+        }
+        base_responses = {
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target("leagues", {"id": 48}).canonical_url: (
+                _competition_payload(48, "Championship")
+            ),
+            canonicalize_target(
+                "matchDetails", {"matchId": "100"}
+            ).canonical_url: missing_match,
+        }
+        repository = MemoryFotMobRepository()
+
+        def run(catalog, run_id):
+            responses = dict(base_responses)
+            responses[canonicalize_target("allLeagues").canonical_url] = catalog
+            service = FotMobIngestService(
+                transport=StubTransport(responses),
+                repository=repository,
+                mode=RunMode.DAILY,
+                budget=TransportBudget(max_requests=200, max_direct_bytes=10_000_000),
+                run_id=run_id,
+                max_workers=2,
+            )
+            args = mod._argument_parser().parse_args(
+                [
+                    "--mode",
+                    "refresh",
+                    "--catalog-contract",
+                    "fotmob-catalog-v1",
+                    "--entities",
+                    "season,matches",
+                    "--run-id",
+                    run_id,
+                ]
+            )
+            return _run_native_admitted(mod, args, service=service)
+
+        first_rc, first_report = run(first_catalog, "composition-1")
+
+        assert first_rc == 1
+        assert first_report["selection"]["scope_attempts"][0]["outcome"] == "retryable"
+
+        real_datetime = datetime
+
+        class FutureDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return real_datetime.now(tz) + timedelta(hours=1)
+
+        monkeypatch.setattr(planner, "datetime", FutureDatetime)
+        second_rc, second_report = run(second_catalog, "composition-2")
+
+        first_contract = catalog_contract_from_dict(
+            first_report["selection"]["catalog_contract"]
+        )
+        second_contract = catalog_contract_from_dict(
+            second_report["selection"]["catalog_contract"]
+        )
+        assert first_contract.plan_signature != second_contract.plan_signature
+
+        attempts = {
+            (attempt["competition_id"], attempt["source_season_key"]): attempt
+            for attempt in second_report["selection"]["scope_attempts"]
+        }
+        gap = attempts[(47, "2025/2026")]
+        assert gap["outcome"] == "source_gap"
+        assert gap["attempt_count"] == 2
+        # Наружу отчёт отдаёт контрактную подпись, под которой стартовал ран,
+        # даже когда состояние прочитано из журнала прошлого рана.
+        assert gap["plan_signature"] == second_contract.plan_signature
+        assert second_rc == 0, second_report["errors"]
+
+    @pytest.mark.unit
+    def test_scope_attempts_evidence_is_bounded_by_the_current_contract(self):
+        """Скоуп, выпавший из каталога, не тащит свою историю в отчёт.
+
+        Журнал теперь общий для всех ранов полосы, а отчёт отвечает ровно за то
+        обязательство, под которым ран стартовал: чужой скоуп в selection —
+        это «scope attempt вне контракта» и красная приёмка.
+        """
+
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _competition_payload,
+            _league_payload,
+        )
+
+        mod = self._module()
+        base_responses = {
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target("leagues", {"id": 48}).canonical_url: (
+                _competition_payload(48, "Championship")
+            ),
+        }
+        repository = MemoryFotMobRepository()
+
+        def run(leagues, run_id):
+            responses = dict(base_responses)
+            responses[canonicalize_target("allLeagues").canonical_url] = {
+                "countries": [{"leagues": leagues}]
+            }
+            service = FotMobIngestService(
+                transport=StubTransport(responses),
+                repository=repository,
+                mode=RunMode.DAILY,
+                budget=TransportBudget(max_requests=200, max_direct_bytes=10_000_000),
+                run_id=run_id,
+                max_workers=2,
+            )
+            args = mod._argument_parser().parse_args(
+                [
+                    "--mode",
+                    "refresh",
+                    "--catalog-contract",
+                    "fotmob-catalog-v1",
+                    "--entities",
+                    "season",
+                    "--run-id",
+                    run_id,
+                ]
+            )
+            return _run_native_admitted(mod, args, service=service)
+
+        first_rc, first_report = run(
+            [{"id": 47, "name": "Premier League"}], "bounded-1"
+        )
+        assert first_rc == 0, first_report["errors"]
+        assert [
+            attempt["competition_id"]
+            for attempt in first_report["selection"]["scope_attempts"]
+        ] == [47]
+
+        second_rc, second_report = run(
+            [{"id": 48, "name": "Championship"}], "bounded-2"
+        )
+
+        assert second_rc == 0, second_report["errors"]
+        assert [
+            attempt["competition_id"]
+            for attempt in second_report["selection"]["scope_attempts"]
+        ] == [48]
+        assert second_report["selection"]["deferrals"] == []
+
+    @pytest.mark.unit
+    def test_journal_signature_separates_the_two_automatic_lanes(self):
+        """У полос `current` и `history` разные журналы, и это не случайность."""
+
+        from scrapers.fotmob.catalog_contract import catalog_contract_from_dict
+        from scrapers.fotmob.planner import (
+            RunMode,
+            TransportBudget,
+            deterministic_plan_signature,
+        )
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import StubTransport, _league_payload
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2024/2025"}
+            ).canonical_url: _league_payload("2024/2025"),
+        }
+        repository = MemoryFotMobRepository()
+
+        def run(mode, run_id):
+            service = FotMobIngestService(
+                transport=StubTransport(dict(responses)),
+                repository=repository,
+                mode=RunMode.DAILY if mode == "refresh" else RunMode.BACKFILL,
+                budget=TransportBudget(max_requests=200, max_direct_bytes=10_000_000),
+                run_id=run_id,
+                max_workers=2,
+            )
+            args = mod._argument_parser().parse_args(
+                [
+                    "--mode",
+                    mode,
+                    "--catalog-contract",
+                    "fotmob-catalog-v1",
+                    "--entities",
+                    "season",
+                    "--run-id",
+                    run_id,
+                ]
+            )
+            return _run_native_admitted(mod, args, service=service)
+
+        current_rc, current_report = run("refresh", "lane-current")
+        history_rc, history_report = run("backfill", "lane-history")
+
+        assert current_rc == 0, current_report["errors"]
+        assert history_rc == 0, history_report["errors"]
+        assert current_report["selection"]["scope_lane"] == "current"
+        assert history_report["selection"]["scope_lane"] == "history"
+
+        contract = catalog_contract_from_dict(
+            current_report["selection"]["catalog_contract"]
+        )
+        journals = {
+            lane: deterministic_plan_signature(
+                contract.entities,
+                policy={**contract.entity_policy, "scope_lane": lane},
+            )
+            for lane in ("current", "history")
+        }
+        assert journals["current"] != journals["history"]
+        # Сезон, закрытый текущей полосой, историческая не видит как закрытый:
+        # у полос раздельная память, иначе после смены сезона история молча
+        # пропускала бы то, что собиралось текущей.
+        assert repository.completed_scope_keys(journals["current"]) == {
+            (47, "2025/2026")
+        }
+        assert repository.completed_scope_keys(journals["history"]) == {
+            (47, "2024/2025")
+        }
+
+    @pytest.mark.unit
+    def test_stale_deferrals_do_not_leak_into_the_next_runs_evidence(self):
+        """Отсрочка прошлого окна не должна становиться доказательством этого.
+
+        Журнал переживает раны, поэтому скоуп, отложенный по бюджету вчера,
+        так и лежит в карте состояний со статусом `deferred`. Если отчёт
+        возьмёт его из карты, приёмка справедливо ответит «deferred scope
+        lacks explicit budget/deadline evidence»: в этом ране такой отсрочки
+        не было, обосновать её нечем.
+        """
+
+        from scripts.fotmob_catalog_acceptance import validate_report
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _competition_payload,
+            _league_payload,
+        )
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [
+                    {
+                        "leagues": [
+                            {"id": 47, "name": "Premier League"},
+                            {"id": 48, "name": "Championship"},
+                        ]
+                    }
+                ]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target("leagues", {"id": 48}).canonical_url: (
+                _competition_payload(48, "Championship")
+            ),
+        }
+        repository = MemoryFotMobRepository()
+
+        def run(run_id, season_limit):
+            service = FotMobIngestService(
+                transport=StubTransport(dict(responses)),
+                repository=repository,
+                mode=RunMode.DAILY,
+                budget=TransportBudget(max_requests=200, max_direct_bytes=10_000_000),
+                run_id=run_id,
+                max_workers=2,
+            )
+            args = mod._argument_parser().parse_args(
+                [
+                    "--mode",
+                    "refresh",
+                    "--catalog-contract",
+                    "fotmob-catalog-v1",
+                    "--entities",
+                    "season",
+                    "--season-limit",
+                    str(season_limit),
+                    "--run-id",
+                    run_id,
+                ]
+            )
+            return _run_native_admitted(mod, args, service=service)
+
+        first_rc, first_report = run("stale-deferral-1", 1)
+        assert first_rc == 0, first_report["errors"]
+        first_outcomes = {
+            attempt["competition_id"]: attempt["outcome"]
+            for attempt in first_report["selection"]["scope_attempts"]
+        }
+        assert sorted(first_outcomes.values()) == ["deferred", "success"]
+
+        # Второй ран стартует раньше, чем наступил повтор отложенного скоупа:
+        # планировать ему нечего, и своих отсрочек у него нет.
+        second_rc, second_report = run("stale-deferral-2", 0)
+
+        assert second_rc == 0, second_report["errors"]
+        assert second_report["selection"]["deferrals"] == []
+        assert second_report["selection"]["scope_attempts"] == []
+        accepted = validate_report(second_report, require_full_completion=False)
+        assert accepted.ok, accepted.errors
+
+    @pytest.mark.unit
+    def test_drained_transfer_lane_reports_durable_coverage(self):
+        """Дренированный бэкфил обязан доказать покрытие уже закрытых потоков.
+
+        Под стабильной подписью бэкфил больше не перезабирает завершённые
+        трансферы, поэтому список этого рана перестал совпадать с included_ids.
+        Приёмка спрашивает именно про обязательство: без накопительного
+        доказательства зелёный ран дренированной полосы краснел бы на
+        «transfer completion evidence is incomplete».
+        """
+
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import StubTransport, _league_payload
+
+        mod = self._module()
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: _league_payload(),
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2024/2025"}
+            ).canonical_url: _league_payload("2024/2025"),
+            canonicalize_target(
+                "transfers", {"leagueIds": "47", "page": 1}
+            ).canonical_url: {"hits": 0, "page": 1, "transfers": []},
+        }
+        repository = MemoryFotMobRepository()
+
+        def run(run_id):
+            service = FotMobIngestService(
+                transport=StubTransport(dict(responses)),
+                repository=repository,
+                mode=RunMode.BACKFILL,
+                budget=TransportBudget(max_requests=200, max_direct_bytes=10_000_000),
+                run_id=run_id,
+                max_workers=2,
+            )
+            args = mod._argument_parser().parse_args(
+                [
+                    "--mode",
+                    "backfill",
+                    "--catalog-contract",
+                    "fotmob-catalog-v1",
+                    "--entities",
+                    "season,transfers",
+                    "--run-id",
+                    run_id,
+                ]
+            )
+            return _run_native_admitted(mod, args, service=service)
+
+        first_rc, first_report = run("drained-1")
+        assert first_rc == 0, first_report["errors"]
+        assert first_report["selection"]["completed_transfer_competition_ids"] == [47]
+
+        second_rc, second_report = run("drained-2")
+
+        assert second_rc == 0, second_report["errors"]
+        assert second_report["selection"]["completed_transfer_competition_ids"] == [47]
+
+    @pytest.mark.unit
     def test_automatic_transfer_completion_uses_catalog_contract_signature(self):
         from scrapers.fotmob.catalog_contract import catalog_contract_from_dict
+        from scrapers.fotmob.planner import deterministic_plan_signature
         from scrapers.fotmob.transport import canonicalize_target
         from tests.unit.scrapers.test_fotmob_service import _league_payload, _service
 
@@ -964,7 +1376,16 @@ class TestFotmobNativeRunner:
         }
         assert selection["transfer_plan_signature"] == contract.plan_signature
         assert selection["completed_transfer_competition_ids"] == [47]
-        assert repository.completed_competition_ids(contract.plan_signature) == {47}
+        # Отчёт доказывает контракт, а журнал живёт под стабильной подписью:
+        # контентная менялась бы при каждом изменении состава каталога и
+        # обнуляла бы историю завершений.
+        journal_signature = deterministic_plan_signature(
+            contract.entities,
+            policy={**contract.entity_policy, "scope_lane": "current"},
+        )
+        assert journal_signature != contract.plan_signature
+        assert repository.completed_competition_ids(journal_signature) == {47}
+        assert repository.completed_competition_ids(contract.plan_signature) == set()
 
     @pytest.mark.unit
     def test_direct_cli_requires_exact_publication_and_matching_run_id(
