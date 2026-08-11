@@ -2305,6 +2305,11 @@ def _restore_commands(
             "exec",
             name,
             "pg_isready",
+            # Over TCP on purpose. initdb runs against a temporary server the
+            # entrypoint starts with `listen_addresses=''`; a socket probe
+            # answers "accepting connections" there, and the restore that
+            # follows then dies on a socket the entrypoint has since removed.
+            "--host=127.0.0.1",
             "--username=airflow",
             "--dbname=airflow",
         ],

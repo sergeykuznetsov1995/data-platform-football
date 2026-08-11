@@ -254,6 +254,20 @@ def test_guard_interpreter_binding_follows_the_operator_interpreter(
     assert plan["guard"]["executable"]["path"] == str(interpreter)
 
 
+def test_restore_readiness_probe_ignores_the_initdb_socket_only_server(
+    tmp_path: Path,
+) -> None:
+    # The postgres entrypoint runs initdb against a temporary server started
+    # with `listen_addresses=''` — socket only, no TCP. A socket probe answers
+    # "accepting connections" during that window, the entrypoint then stops it,
+    # and the pg_restore that follows dies on a socket that no longer exists.
+    # Probing over TCP cannot see the temporary server at all.
+    plan = deploy.build_plan(_spec(tmp_path))
+    commands = deploy._restore_commands(plan, Path(str(plan["backup_path"])))
+
+    assert "--host=127.0.0.1" in commands["ready"]
+
+
 def test_fingerprint_template_survives_a_container_without_a_healthcheck() -> None:
     # `docker inspect --format` renders .State as a map, so a bare
     # `{{if .State.Health}}` aborts with "map has no entry for key Health" on any
