@@ -361,6 +361,62 @@ def test_validate_report_rejects_retry_without_explicit_reason_and_due_time(
     assert any("retryable scope" in error for error in errors)
 
 
+def test_continuous_lane_tolerates_scheduled_retry_but_campaign_does_not() -> None:
+    """Одно и то же доказательство отвечает на два разных вопроса.
+
+    Кампания (канарейка, допуск) спрашивает «обязательство закрыто целиком?» —
+    там незакрытый повтор недопустим. Непрерывная полоса спрашивает «этот ран
+    честен?» — она обходит ~450 скоупов под временным бюджетом, и запланированный
+    повтор для неё штатное состояние. Структурные проверки одинаковы в обоих
+    режимах.
+    """
+
+    report = _report()
+    contract = report["selection"]["catalog_contract"]
+    report["status"] = "partial_success"
+    report["complete"] = False
+    report["selection"]["scope_attempts"] = [
+        _attempt(
+            contract,
+            outcome="retryable",
+            reason="scope 47=2025/2026 incomplete; outstanding={}",
+            next_retry_at=NOW + timedelta(minutes=15),
+        )
+    ]
+
+    campaign = acceptance.validate_report(report, now=NOW)
+    continuous = acceptance.validate_report(
+        report, now=NOW, require_full_completion=False
+    )
+
+    assert campaign.ok is False
+    assert any("cannot be accepted" in error for error in campaign.errors)
+    assert continuous.ok is True, continuous.errors
+
+
+def test_continuous_lane_still_rejects_retry_evidence_under_success_status() -> None:
+    report = _report()
+    contract = report["selection"]["catalog_contract"]
+    report["selection"]["scope_attempts"] = [
+        _attempt(
+            contract,
+            outcome="retryable",
+            reason="scope 47=2025/2026 incomplete; outstanding={}",
+            next_retry_at=NOW + timedelta(minutes=15),
+        )
+    ]
+
+    result = acceptance.validate_report(
+        report, now=NOW, require_full_completion=False
+    )
+
+    assert result.ok is False
+    assert any(
+        "retryable scope evidence requires incomplete report status" in error
+        for error in result.errors
+    )
+
+
 def test_validate_report_accepts_source_gap_only_with_two_attempt_identities() -> None:
     report = _report()
     contract = report["selection"]["catalog_contract"]
