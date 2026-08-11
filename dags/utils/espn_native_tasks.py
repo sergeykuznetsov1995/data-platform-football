@@ -823,20 +823,24 @@ def _current_signed_plan_admission(
     ):
         raise OperationsError("current signed plan must bind exactly one scope")
     if (
-        loaded.plan.run_id,
-        loaded.attempt,
-        loaded.mode,
-        loaded.plan.registry_signature,
-        dict(release),
-        getattr(loaded, "canary_claim", None),
-    ) != (
-        admission["run_id"],
-        admission["attempt"],
-        admission["mode"],
-        admission["registry_signature"],
-        admission["release"],
-        admission["canary_claim"],
-    ) or not set(selected_scopes).issubset(admission["scope_ids"]):
+        (
+            loaded.plan.run_id,
+            loaded.attempt,
+            loaded.mode,
+            loaded.plan.registry_signature,
+        )
+        != (
+            admission["run_id"],
+            admission["attempt"],
+            admission["mode"],
+            admission["registry_signature"],
+        )
+        or runner._canonical_bytes(release)
+        != runner._canonical_bytes(admission["release"])
+        or runner._canonical_bytes(getattr(loaded, "canary_claim", None))
+        != runner._canonical_bytes(admission["canary_claim"])
+        or not set(selected_scopes).issubset(admission["scope_ids"])
+    ):
         raise OperationsError("signed plan differs from exact current admission")
     return admission
 

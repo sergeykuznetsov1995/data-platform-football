@@ -2981,6 +2981,127 @@ def test_exact_v3_canary_admission_consumes_claim_before_control_and_is_idempote
     assert control_entries == ["migrate"]
 
 
+def test_sealed_scope_plan_authenticates_against_its_json_admission(
+    monkeypatch, tmp_path
+):
+    """Sealing freezes JSON arrays into tuples; the gate must still admit the plan."""
+
+    from dags.utils import espn_native_tasks
+    from scrapers.espn.models import IngestPlan
+
+    logical_date = datetime(2026, 8, 8, 12, tzinfo=timezone.utc)
+    registry = _generated_registry(3)
+    scopes = _scope_ids(registry)
+    discovery = {
+        "discovery_state_ref": {"uri": "file:///state.json", "sha256": "d" * 64},
+        "male_registry_ref": {"uri": "file:///registry.json", "sha256": "e" * 64},
+        "candidate_ref": {"uri": "file:///candidate.json", "sha256": "f" * 64},
+        "selection_policy": "explicit-core-gender-MALE-v1",
+        "male_scope_count": len(scopes),
+    }
+    artifact_root = (tmp_path / "artifacts").resolve().as_uri()
+    monkeypatch.setattr(espn_native_tasks, "_artifact_root", lambda: artifact_root)
+    monkeypatch.setattr(espn_native_tasks, "_raw_store_uri", lambda: "s3://raw")
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_load_discovered_registry",
+        lambda *, now: (registry, discovery),
+    )
+    monkeypatch.setattr(espn_native_tasks, "_load_registry_ref", lambda _a: registry)
+
+    class Store:
+        def migrate(self):
+            return None
+
+        def current_time(self):
+            return logical_date
+
+    monkeypatch.setattr(
+        espn_native_tasks.PostgresEspnControlStore,
+        "from_env",
+        classmethod(lambda _cls: Store()),
+    )
+    context = {
+        "dag": SimpleNamespace(dag_id="dag_backfill_espn"),
+        "dag_run": SimpleNamespace(conf={}),
+        "run_id": "manual__sealed-plan",
+        "logical_date": logical_date,
+        "params": {"attempt": 1, "scopes": [scopes[0]]},
+    }
+
+    admission_ref = espn_native_tasks.validate_registry_and_admission(
+        mode="backfill", **context
+    )
+    admission = espn_native_tasks._read_admission_ref(admission_ref)
+    assert len(admission["scope_ids"]) < len(admission["release"]["target_scope_ids"])
+
+    scope_id = admission["scope_ids"][0]
+    scope = espn_native_tasks._scope_plan(registry, scope_id)
+    scope_root = espn_native_tasks._join_uri(
+        admission["artifact_root"], "scopes", scope_id.replace(":", "-")
+    )
+    as_of = date.fromisoformat(admission["as_of"])
+    binding = espn_native_tasks._scope_binding(
+        head=None,
+        scope=scope,
+        run_id=admission["run_id"],
+        attempt=admission["attempt"],
+        mode=admission["mode"],
+        root=admission["artifact_root"],
+        ingested_at=datetime.fromisoformat(admission["logical_date"]),
+        as_of=as_of,
+    )
+    plan = IngestPlan(
+        schema_version=1,
+        run_id=admission["run_id"],
+        as_of=as_of,
+        registry_signature=admission["registry_signature"],
+        scopes=(scope,),
+        metadata={
+            "runtime": {
+                "mode": admission["mode"],
+                "attempt": admission["attempt"],
+                "registry_snapshot_uri": admission["registry_ref"]["uri"],
+                "raw_manifest_uri": espn_native_tasks._join_uri(
+                    scope_root, "raw-manifest.json"
+                ),
+                "output_uri": espn_native_tasks._join_uri(
+                    scope_root, "runner-result.json"
+                ),
+                "raw_store_uri": admission["raw_store_uri"],
+                "max_events": 100,
+                "selected_scopes": [scope_id],
+                "scope_bindings": {scope_id: binding},
+                "replay_source": None,
+                "admission_ref": admission_ref,
+                "release": admission["release"],
+                "canary_claim": admission["canary_claim"],
+            }
+        },
+    )
+    plan_ref = espn_native_tasks._write_payload(
+        espn_native_tasks._join_uri(scope_root, "plan.json"),
+        {
+            "kind": espn_native_tasks.runner.PLAN_KIND,
+            "plan": plan.to_dict(),
+            "signature": plan.signature(),
+        },
+        immutable=True,
+    )
+    loaded = espn_native_tasks.runner._load_signed_plan(plan_ref["uri"])
+
+    assert type(loaded.release["target_scope_ids"]) is tuple
+    assert type(admission["release"]["target_scope_ids"]) is list
+    assert dict(loaded.release) != admission["release"]
+
+    assert (
+        espn_native_tasks._current_signed_plan_admission(
+            loaded, expected_dag_id="dag_backfill_espn"
+        )
+        == admission
+    )
+
+
 def test_pending_empty_control_evidence_is_strictly_loaded_for_next_plan(
     monkeypatch,
 ):
