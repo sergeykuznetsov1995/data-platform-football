@@ -602,6 +602,13 @@ _REVIEWED_CONTRADICTORY_IDENTITIES: frozenset[
         # all.  Which of the two flags is wrong cannot be known from the
         # response, so no player rows are preserved for this event.
         ("3903:2026", 401844030, ((236, 11), (10743, 11))),
+        # 3945:2026 event 401842781, played 2026-08-09: Degerfors' Sebastian
+        # Ohlsson carries starter=true and formationPlace 2 — one of a complete
+        # 1..11 set — together with subbedIn=true and a subbedInFor pointing at
+        # Dijan Vukojevic.  Which flag is wrong cannot be known from the
+        # response.  Note that the counters here are those of a healthy match,
+        # so this waiver pins the event rather than the shape of the defect.
+        ("3945:2026", 401842781, ((2720, 11), (20856, 11))),
     }
 )
 
@@ -621,11 +628,15 @@ _REVIEWED_MALFORMED_LINEUPS: Mapping[
 
 # Argentina's 2026 third tier exposes no complete XI in its 17 non-empty roster
 # responses.  Copa Colombia 2026 has 10 non-XI partial conventional roster
-# responses across 54 reviewed Summaries.  Keep a future valid XI, but discard
-# only non-conventional roster shapes for these exact scopes when the registry
-# does not promise lineups.
+# responses across 54 reviewed Summaries.  El Salvador's 2026 first division
+# publishes no bench at all: in all 11 non-empty Summaries every roster row is
+# flagged a starter, eleven starters appear in 3 of 22 rosters and never on
+# both sides at once.  That is one roster shape for the whole scope, not eleven
+# separate defects, and 110 of its 121 scheduled matches are still to come.
+# Keep a future valid XI, but discard only non-conventional roster shapes for
+# these exact scopes when the registry does not promise lineups.
 _REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES: frozenset[str] = frozenset(
-    {"3904:2026", "8313:2026"}
+    {"3904:2026", "3943:2026", "8313:2026"}
 )
 
 # Six 2012 CONCACAF U23 responses concatenate two roster snapshots and repeat

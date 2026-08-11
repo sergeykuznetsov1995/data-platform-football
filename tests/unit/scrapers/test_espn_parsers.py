@@ -1818,7 +1818,10 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
     }
     assert summary_parser_module._REVIEWED_CONTRADICTORY_IDENTITIES == frozenset(
         summary_parser_module._REVIEWED_CONTRADICTORY_LINEUPS.values()
-    ) | {("3903:2026", 401844030, ((236, 11), (10743, 11)))}
+    ) | {
+        ("3903:2026", 401844030, ((236, 11), (10743, 11))),
+        ("3945:2026", 401842781, ((2720, 11), (20856, 11))),
+    }
     assert isinstance(summary_parser_module._REVIEWED_TRUNCATED_IDENTITIES, frozenset)
     assert isinstance(
         summary_parser_module._REVIEWED_CONTRADICTORY_IDENTITIES, frozenset
@@ -1831,7 +1834,7 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
         )
     }
     assert summary_parser_module._REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES == (
-        frozenset({"3904:2026", "8313:2026"})
+        frozenset({"3904:2026", "3943:2026", "8313:2026"})
     )
     assert summary_parser_module._REVIEWED_DUPLICATE_LINEUP_SCOPES == frozenset(
         {"3911:2012"}
