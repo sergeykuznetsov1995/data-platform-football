@@ -1739,6 +1739,115 @@ def test_initial_proven_schedule_rows_zero_fails_closed(
 
 
 @pytest.mark.unit
+def test_proven_scope_that_was_already_empty_publishes_a_valid_empty_generation(
+    tmp_path,
+):
+    """End to end: an always-empty proven scope reaches a COMPLETE generation."""
+
+    from scrapers.espn.repository import validate_scope_generation
+
+    competition, edition = _competition()
+    scope_id = competition.scope_id(edition)
+    prior = _prior_generation(competition, edition, event_ids=())
+    options, _ = _plan(
+        tmp_path,
+        "backfill",
+        ((competition, edition),),
+        initial_capture=False,
+        priors={scope_id: prior},
+    )
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(
+        raw_store,
+        {competition.slug: _scoreboard(competition, edition, event_ids=())},
+    )
+    repository = FakeRepository()
+
+    result = execute(
+        options,
+        repository=repository,
+        raw_store=raw_store,
+        http_client=client,
+    )
+
+    assert result.exit_code == 0, result.payload
+    assert len(repository.generations) == 1
+    generation = repository.generations[0]
+    assert generation.schedule == ()
+    report = validate_scope_generation(generation)
+    assert report.passed, report.failures
+    proof = json.loads(
+        next(
+            item.detail
+            for item in generation.dispositions
+            if item.endpoint == "schedule"
+        )
+    )
+    assert proof["method"] == "explicit_source_metadata"
+    assert proof["capability"] == "proven"
+
+
+@pytest.mark.unit
+def test_empty_proven_schedule_qualifies_only_when_prior_was_also_empty():
+    """Zero rows on a proven scope are a collapse only if it used to have rows."""
+
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    scope = _scope(competition, edition)
+    assert scope.capabilities.schedule is CapabilityState.PROVEN
+
+    current = RawLedgerRecord(
+        request_id="scoreboard:current",
+        endpoint="scoreboard",
+        event_id=None,
+        disposition=DispositionState.CAPTURED,
+        raw_uri="s3://raw/current.json",
+        raw_sha256="a" * 64,
+        fetched_at=NOW,
+        direct_bytes=10,
+        proxy_bytes=0,
+        event_ids=(),
+    )
+    windows = (
+        {
+            "request_id": current.request_id,
+            "query_start": "2026-01-01",
+            "query_end": "2026-01-31",
+            "requested_limit": 1000,
+            "event_count": 0,
+            "schema_valid": True,
+            "unsaturated": True,
+        },
+    )
+
+    def qualify(prior):
+        return runner._qualify_empty_schedule(
+            scope=scope,
+            prior=prior,
+            current_scoreboard=(current,),
+            planned_windows=windows,
+            mode="backfill",
+            current_run_id="reconcile-001",
+            pending_observation=None,
+        )
+
+    # an initial capture still fails closed
+    with pytest.raises(runner.ScopeIncompleteError, match="empty proven schedule"):
+        qualify(None)
+
+    # a scope that used to publish fixtures and now returns none is a collapse
+    with pytest.raises(runner.ScopeIncompleteError, match="empty proven schedule"):
+        qualify(_prior_generation(competition, edition))
+
+    # a scope that was already empty is a legitimate gap, e.g. a supercup whose
+    # next edition has no fixtures yet
+    disposition = qualify(_prior_generation(competition, edition, event_ids=()))
+    assert disposition.endpoint == "schedule"
+    assert disposition.state is DispositionState.VALID_EMPTY
+
+
+@pytest.mark.unit
 def test_empty_unknown_schedule_requires_second_fresh_observation():
     from scrapers.espn import runner
 

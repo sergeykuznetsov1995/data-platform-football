@@ -876,7 +876,13 @@ def test_exact_scope_dq_accepts_parsed_fixture_and_binds_hashes():
 
 
 @pytest.mark.unit
-def test_proven_schedule_rows_zero_cannot_false_green_on_raw_evidence():
+def test_proven_schedule_rows_zero_still_needs_complete_raw_evidence():
+    """A proven scope may be empty, but only against exact source evidence.
+
+    Whether zero rows are a legitimate gap or a collapse depends on the prior
+    generation, which this validator never sees; the runner owns that call.
+    """
+
     generation = _generation()
     scoreboard = RawLedgerRecord(
         **{**generation.raw_ledger[0].constructor_values(), "event_ids": ()}
@@ -894,8 +900,7 @@ def test_proven_schedule_rows_zero_cannot_false_green_on_raw_evidence():
     )
 
     report = validate_scope_generation(valid_empty)
-    assert not report.passed
-    assert "empty proven schedule capability" in report.failures
+    assert report.passed, report.failures
 
     without_scoreboard = ScopeGeneration(
         **{

@@ -1071,7 +1071,12 @@ def _empty_schedule_proof_failure(
     elif method == "explicit_source_metadata":
         if (
             set(proof) != {"kind", "method", "capability", "observations"}
-            or capability not in {CapabilityState.PARTIAL, CapabilityState.ABSENT}
+            or capability
+            not in {
+                CapabilityState.PROVEN,
+                CapabilityState.PARTIAL,
+                CapabilityState.ABSENT,
+            }
             or proof.get("capability") != capability.value
         ):
             return failure
@@ -1201,8 +1206,6 @@ def validated_empty_schedule_proof(generation: ScopeGeneration) -> dict[str, Any
 
     if not isinstance(generation, ScopeGeneration) or generation.schedule:
         raise ValueError("valid_empty proof requires an empty scope generation")
-    if generation.plan.capabilities.schedule is CapabilityState.PROVEN:
-        raise ValueError("empty proven schedule capability")
     dispositions = tuple(
         item for item in generation.dispositions if item.endpoint == "schedule"
     )
@@ -1313,8 +1316,17 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
                 "empty schedule requires complete successful scoreboard raw evidence "
                 "and no Summary/disposition rows"
             )
-        if scope.capabilities.schedule is CapabilityState.PROVEN:
-            failures.append("empty proven schedule capability")
+        if (
+            not schedule_dispositions
+            and scope.capabilities.schedule is CapabilityState.PROVEN
+        ):
+            # Whether an empty proven schedule is a legitimate gap or a
+            # collapse is a question about the scope's trajectory, and only the
+            # runner sees the prior generation. Deciding it here would also
+            # re-judge every stored generation, and this verdict feeds
+            # manifest_sha256 — a rule added later silently invalidates the
+            # identity of heads written before it.
+            pass
         elif len(schedule_dispositions) != 1:
             failures.append(
                 "empty unknown schedule requires a second scheduled observation"

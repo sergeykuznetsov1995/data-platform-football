@@ -3039,9 +3039,14 @@ def _qualify_empty_schedule(
     """Require source-backed empty evidence before zero rows may qualify."""
 
     capability = scope.capabilities.schedule
-    if capability is CapabilityState.PROVEN:
+    # A proven capability says the competition publishes a schedule, not that
+    # this edition already has fixtures. Zero rows are a collapse only when the
+    # scope used to have some: an initial capture still fails closed, and so
+    # does a scope whose prior generation carried schedule rows.
+    if capability is CapabilityState.PROVEN and (prior is None or prior.schedule):
         raise ScopeIncompleteError("empty proven schedule capability")
     explicit_source_metadata = capability in {
+        CapabilityState.PROVEN,
         CapabilityState.PARTIAL,
         CapabilityState.ABSENT,
     }
