@@ -517,6 +517,133 @@ class TestNativeValidation:
             mod.validate_data(str(report))
 
     @pytest.mark.unit
+    def test_automatic_catalog_accepts_progress_with_scheduled_retry(self, tmp_path):
+        """Ран непрерывной полосы с отложенным скоупом проходит validate_data.
+
+        Полоса обходит ~450 скоупов под временным бюджетом: требовать закрытия
+        всего каталога за один ран — значит держать гейт вечно красным, а
+        вместе с ним и trigger_silver_transform (issue #1159). Красным такой
+        ран остаётся только без единого продвижения — см. гейт раннера.
+        """
+
+        import json
+        from datetime import datetime, timedelta, timezone
+
+        from scrapers.fotmob.catalog_contract import build_catalog_contract
+
+        mod = _reload_dag_module()
+        now = datetime.now(timezone.utc)
+        contract = build_catalog_contract(
+            catalog_batch_id="catalog-batch",
+            catalog_content_hash="a" * 64,
+            classifier_version="fotmob-men-v1",
+            parser_version="fotmob-native-v2",
+            entities=["season"],
+            entity_policy={},
+            included_ids=[47, 48],
+            scopes=[(47, "2025/2026"), (48, "2025/2026")],
+        ).as_dict()
+
+        def _decision(competition_id: int, name: str) -> dict:
+            return {
+                "competition_id": competition_id,
+                "catalog_name": name,
+                "profile_name": name,
+                "source_gender": "male",
+                "source_age_group": "adult",
+                "source_type": "league",
+                "probe_status": "success",
+                "decision": "included",
+                "reason": "structurally confirmed adult men's competition",
+                "policy_rule": "include_structural_male_adult",
+                "classifier_version": "fotmob-men-v1",
+                "profile_target_key": f"leagues?id={competition_id}",
+                "profile_content_hash": "b" * 64,
+            }
+
+        payload = {
+            "run_id": "automatic-run",
+            "mode": "refresh",
+            "status": "partial_success",
+            "complete": False,
+            "operations": [
+                {
+                    "entity": "competition_catalog",
+                    "status": "success",
+                    "errors": [],
+                    "retryable": [],
+                    "terminal": [],
+                    "counts": {"competitions": 2},
+                },
+                {
+                    "entity": "season_work_plan",
+                    "status": "incomplete",
+                    "errors": [],
+                    "retryable": ["scope 48=2025/2026 incomplete; outstanding={}"],
+                    "terminal": [],
+                    "counts": {},
+                },
+            ],
+            "transport": {"attempts": 1, "direct_bytes": 1, "proxy_bytes": 0},
+            "budget": {
+                "requests": 1,
+                "max_requests": 2,
+                "direct_bytes": 1,
+                "max_direct_bytes": 2,
+                "proxy_bytes": 0,
+                "max_proxy_bytes": 0,
+            },
+            "errors": ["retryable: scope 48=2025/2026 incomplete; outstanding={}"],
+            "selection": {
+                "entities": ["season"],
+                "explicit_scopes": [],
+                "competition_limit": 0,
+                "season_limit": 0,
+                "scope_lane": "current",
+                "scope_plan_signature": contract["plan_signature"],
+                "catalog_contract": contract,
+                "catalog_ids": [47, 48],
+                "catalog_decisions": [
+                    _decision(47, "Premier League"),
+                    _decision(48, "Second League"),
+                ],
+                "planned_scopes": ["47=2025/2026", "48=2025/2026"],
+                "completed_scopes": ["47=2025/2026"],
+                "scope_attempts": [
+                    {
+                        "competition_id": 47,
+                        "source_season_key": "2025/2026",
+                        "plan_signature": contract["plan_signature"],
+                        "attempt_count": 1,
+                        "last_attempt_at": now.isoformat(),
+                        "next_retry_at": None,
+                        "outcome": "success",
+                        "reason": "scope completion committed",
+                        "attempt_identities": ["automatic-run:47=2025/2026"],
+                    },
+                    {
+                        "competition_id": 48,
+                        "source_season_key": "2025/2026",
+                        "plan_signature": contract["plan_signature"],
+                        "attempt_count": 1,
+                        "last_attempt_at": now.isoformat(),
+                        "next_retry_at": (now + timedelta(minutes=15)).isoformat(),
+                        "outcome": "retryable",
+                        "reason": "scope 48=2025/2026 incomplete; outstanding={}",
+                        "attempt_identities": ["automatic-run:48=2025/2026"],
+                    },
+                ],
+                "completed_transfer_competition_ids": [],
+                "transfer_plan_signature": None,
+                "deferrals": [],
+            },
+        }
+        report = tmp_path / "automatic-partial.json"
+        report.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert mod.validate_data(str(report))["status"] == "partial_success"
+
+    @pytest.mark.unit
     def test_source_refresh_accepts_exact_seven_terminal_targets_without_catalog(
         self, tmp_path
     ):
