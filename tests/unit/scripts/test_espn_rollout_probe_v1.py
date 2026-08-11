@@ -662,6 +662,18 @@ def test_all_five_known_events_must_exist_in_exact_scope():
 
 
 @pytest.mark.unit
+def test_five_known_events_pass_inside_a_full_season_schedule():
+    """The five are boundary witnesses, not the whole schedule of 19425:2026."""
+
+    snapshot = _healthy_snapshot()
+    snapshot["known_events"]["event_ids"].extend(range(401900001, 401900050))
+
+    report, _ = _run(snapshot)
+
+    assert _results(report)["events.leagues_cup_five"]["status"] == "ok"
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "url",
     [

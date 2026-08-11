@@ -332,7 +332,12 @@ def test_noncanonical_probe_json_fails_closed_with_every_result(
 @pytest.mark.unit
 def test_probe_bytes_are_pinned_before_invocation(tmp_path):
     probe = _install_probe_fixture(tmp_path)
-    assert EXPECTED_PROBE_SHA256 == "040c79abf7f6757f5dbbe1541b53711d44f2ef74578d0bbbda99dbcce278ed64"
+    assert (
+        EXPECTED_PROBE_SHA256
+        == hashlib.sha256(
+            Path("scripts/espn_rollout_probe_v1.py").read_bytes()
+        ).hexdigest()
+    )
     probe.write_bytes(b"# post-review replacement\n")
     host = FakeHost()
 
@@ -913,12 +918,15 @@ def test_install_artifacts_are_inactive_exact_and_hourly_arm_window_aware(tmp_pa
     assert "a94b6c9fd82a4fd4a5faf2040fe4da93cb768d78f02a51c3082405a1f1b747a9" in install_text
     assert "19198db13821f50db844a90dc5e916d06b8dc69fc8d3ba82c94d0c88a1bd773d" in install_text
     assert "811cf35601cb3a7210005da50b75c1b6db87b3f25852123fe2ce1c2ddbb4af70" in install_text
-    assert EXPECTED_PROBE_SHA256 in install_text
-    for artifact_path in (
-        Path("scripts/espn_watchdog_adapter_v1.py"),
-        patch_path,
-        cron_path,
-    ):
+    # The document installs the observer from one immutable release and its
+    # digests describe that release, not today's tree. A probe or adapter fix
+    # lands in the tree first and is re-pinned when the observer is reinstalled,
+    # so these are literals, not the current constants.
+    assert (
+        "probe_sha256="
+        "040c79abf7f6757f5dbbe1541b53711d44f2ef74578d0bbbda99dbcce278ed64"
+    ) in install_text
+    for artifact_path in (patch_path, cron_path):
         assert hashlib.sha256(artifact_path.read_bytes()).hexdigest() in install_text
     assert immutable_release in install_text
     assert "morning_report.py.pre-espn-watchdog-v1" in install_text

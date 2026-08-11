@@ -40,7 +40,7 @@ EXPECTED_HEALTH_URL = "http://127.0.0.1:8086/health"
 EXPECTED_PROBE_KIND = "espn-rollout-probe-v1"
 EXPECTED_PROBE_PATH = Path("scripts/espn_rollout_probe_v1.py")
 EXPECTED_PROBE_SHA256 = (
-    "040c79abf7f6757f5dbbe1541b53711d44f2ef74578d0bbbda99dbcce278ed64"
+    "4f2af0d38a10aa6aa96ce718ca977f35e7a1f25048d45ca0f3a30843b42d1a9b"
 )
 CONTAINER_PROBE_PATH = "/opt/airflow/scripts/espn_watchdog_adapter_v1.py"
 DOCKER = "/usr/bin/docker"

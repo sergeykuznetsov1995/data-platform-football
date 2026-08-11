@@ -1357,13 +1357,14 @@ def _check_known_events(observation: _Observation) -> dict[str, Any]:
     actual = tuple(event_ids) if event_ids is not None else ()
     valid_items = all(type(event_id) is int and event_id > 0 for event_id in actual)
     missing = sorted(set(KNOWN_LEAGUES_CUP_EVENT_IDS) - set(actual))
-    unexpected = sorted(set(actual) - set(KNOWN_LEAGUES_CUP_EVENT_IDS))
+    # The five are boundary witnesses, not the scope's whole schedule: the
+    # adapter reads every event of 19425:2026 and the season carries dozens.
+    # Demanding set equality here can never pass on real data.
     valid = (
         value.get("scope_id") == KNOWN_LEAGUES_CUP_SCOPE
         and valid_items
         and len(actual) == len(set(actual))
         and not missing
-        and not unexpected
     )
     if not valid:
         return _result(
@@ -1374,7 +1375,7 @@ def _check_known_events(observation: _Observation) -> dict[str, Any]:
                 "expected_scope_id": KNOWN_LEAGUES_CUP_SCOPE,
                 "observed_scope_id": value.get("scope_id"),
                 "missing": missing,
-                "unexpected": unexpected,
+                "observed_count": len(actual),
             },
         )
     return _result(
