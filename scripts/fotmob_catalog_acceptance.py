@@ -505,6 +505,7 @@ def _transfer_completion(
     status: Any,
     transfer_deferrals: Mapping[int, Mapping[str, Any]],
     errors: list[str],
+    require_full_completion: bool = True,
 ) -> None:
     raw_completed = selection.get("completed_transfer_competition_ids")
     if not isinstance(raw_completed, list):
@@ -562,7 +563,12 @@ def _transfer_completion(
             "transfer completion evidence is incomplete for included IDs: "
             + ", ".join(map(str, sorted(missing)))
         )
-    if status == "partial_success":
+    if status == "partial_success" and require_full_completion:
+        # Незакрытый поток трансферов раннер не оформляет отсрочкой: он кладёт
+        # `competition N transfer stream incomplete` в retryable операции
+        # (run_fotmob_scraper.py) и идёт дальше. У кампании это отказ, у
+        # непрерывной полосы — недобранный на этот раз хвост, который добирается
+        # следующим окном.
         unexplained = missing - set(transfer_deferrals)
         if unexplained:
             errors.append(
@@ -615,9 +621,16 @@ def validate_report(
     met?", so any scope still awaiting a retry invalidates the report.  A
     continuous lane asks "is this run's evidence honest?": it walks a ~450
     scope catalog under a time budget and can never close every scope in one
-    window, so a scheduled retry is a normal intermediate state.  Structural
-    checks (contract membership, signatures, timestamps, ordering, terminal
-    outcomes) stay identical in both modes.
+    window, so a scheduled retry is a normal intermediate state.
+
+    Structural checks — contract membership, plan signature, timestamps, retry
+    ordering, mandatory reasons, evidence for every scope the run planned —
+    stay identical in both modes.  What the continuous mode drops are the
+    completeness judgements over the *journal*: full catalog coverage, freshness
+    of every scope, and the verdicts on retryable/terminal states left by other
+    runs.  Those states already coloured the run that produced them, because the
+    runner's own gate counts its own outcomes.  The one journal-only signal that
+    survives is a stalled lane: nothing planned and nothing ever completed.
     """
 
     errors: list[str] = []
@@ -767,8 +780,22 @@ def validate_report(
     # назначенные прошлыми ранами (бэкофф до 24 ч). Требовать из-за них
     # incomplete у ТЕКУЩЕГО рана — значит краснеть за чужую работу; полноту
     # обхода у непрерывной полосы судит гейт раннера по своим исходам.
+    #
+    # Но есть один случай, когда история — единственный свидетель: источник лёг,
+    # все скоупы ушли в повтор с бэкоффом, и следующий ран планирует ПУСТОЙ
+    # список. Своих исходов у него нет, гейт раннера молчит, и без этой проверки
+    # получился бы зелёный ран при нулевом сборе. Признак застоя: ран ничего не
+    # планировал И в журнале нет ни одного закрытого скоупа.
+    journal_has_completion = any(
+        attempt.get("outcome") in {"success", "source_gap"}
+        for attempt in attempts.values()
+    )
     if retryable_attempts and require_full_completion:
         errors.append("retryable scope evidence requires incomplete report status")
+    elif retryable_attempts and not (planned or journal_has_completion):
+        errors.append(
+            "retryable scope evidence with no planned or completed scope: lane is stalled"
+        )
 
     _transfer_completion(
         selection,
@@ -778,6 +805,7 @@ def validate_report(
         status=status,
         transfer_deferrals=deferrals["transfer"],
         errors=errors,
+        require_full_completion=require_full_completion,
     )
     _validate_operation_retry_evidence(
         report.get("operations", []),

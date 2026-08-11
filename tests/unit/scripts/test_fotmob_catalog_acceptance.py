@@ -395,11 +395,12 @@ def test_continuous_lane_tolerates_scheduled_retry_but_campaign_does_not() -> No
 
 
 def test_continuous_lane_accepts_partial_success_without_deferrals() -> None:
-    """Неполнота бывает не только от бюджета: например незакрытый поток трансферов.
+    """Неполнота бывает не только от бюджета.
 
-    Раннер в таком случае отдаёт partial_success без отсрочек, и если приёмка
-    продолжает требовать бюджетное доказательство, ран падает уже на
-    validate_data — гейт раннера и приёмка расходятся в трактовке одного слова.
+    Раннер отдаёт partial_success и без бюджетной отсрочки — достаточно любого
+    незакрытого хвоста. Если приёмка продолжает требовать бюджетное
+    доказательство, гейт раннера и приёмка расходятся в трактовке одного слова,
+    и ран падает уже на validate_data.
     """
 
     report = _report()
@@ -414,6 +415,79 @@ def test_continuous_lane_accepts_partial_success_without_deferrals() -> None:
     assert campaign.ok is False
     assert any("deferral evidence" in error for error in campaign.errors)
     assert continuous.ok is True, continuous.errors
+
+
+def test_continuous_lane_accepts_unfinished_transfer_stream() -> None:
+    """Недобранный поток трансферов — хвост следующего окна, а не отказ полосы.
+
+    Раннер такой случай отсрочкой не оформляет: он кладёт
+    `competition N transfer stream incomplete` в retryable операции и идёт
+    дальше, поэтому у кампании это отказ, а у непрерывной полосы — норма.
+    """
+
+    policy = {
+        "transfer_policy": {
+            "window": "1year",
+            "pagination": "unique_hits",
+            "completion_scope": "included_ids",
+            "completion_signature": "catalog_contract",
+        }
+    }
+    contract = _contract(entities=("season", "transfers"), entity_policy=policy)
+    report = _report()
+    selection = report["selection"]
+    selection["catalog_contract"] = contract
+    selection["scope_plan_signature"] = contract["plan_signature"]
+    selection["entities"] = ["season", "transfers"]
+    selection["transfer_plan_signature"] = contract["plan_signature"]
+    selection["completed_transfer_competition_ids"] = []
+    selection["scope_attempts"] = [_attempt(contract)]
+    report["status"] = "partial_success"
+    report["complete"] = False
+
+    campaign = acceptance.validate_report(report, now=NOW)
+    continuous = acceptance.validate_report(
+        report, now=NOW, require_full_completion=False
+    )
+
+    assert campaign.ok is False
+    assert any("transfer completion" in error for error in campaign.errors)
+    assert continuous.ok is True, continuous.errors
+
+
+def test_continuous_lane_reds_a_stalled_lane_with_nothing_planned() -> None:
+    """Пустой план + одни повторы в журнале = застой, и это должно краснеть.
+
+    Если источник лёг и все скоупы ушли в повтор с бэкоффом, следующий ран
+    планирует пустой список: своих исходов у него нет, гейт раннера молчит,
+    отчёт получается `success`. Без этой проверки контур сутки стоял бы под
+    зелёными ранами — ровно та слепота, которую чинит вся эта работа.
+    """
+
+    contract = _contract(scopes=((47, "2025/2026"), (47, "2024/2025")))
+    report = _report()
+    selection = report["selection"]
+    selection["catalog_contract"] = contract
+    selection["scope_plan_signature"] = contract["plan_signature"]
+    selection["planned_scopes"] = []
+    selection["completed_scopes"] = []
+    stalled = dict(
+        _attempt(
+            contract,
+            outcome="retryable",
+            reason="scope 47=2025/2026 incomplete; outstanding={}",
+            last_attempt_at=NOW - timedelta(hours=3),
+            next_retry_at=NOW + timedelta(hours=3),
+        )
+    )
+    selection["scope_attempts"] = [stalled]
+
+    result = acceptance.validate_report(
+        report, now=NOW, require_full_completion=False
+    )
+
+    assert result.ok is False
+    assert any("lane is stalled" in error for error in result.errors), result.errors
 
 
 def test_continuous_lane_ignores_retry_left_by_a_previous_run() -> None:
