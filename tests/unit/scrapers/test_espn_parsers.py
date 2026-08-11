@@ -1088,6 +1088,125 @@ def test_matchsheet_with_bilateral_empty_statistics_is_valid_empty_only_when_per
         )
 
 
+def _zero_skeleton() -> list[dict[str, object]]:
+    """The shape ESPN actually sends: displayValue strings, no ``value`` key."""
+
+    return [
+        {"name": "foulsCommitted", "displayName": "Fouls", "displayValue": "0"},
+        {"name": "possessionPct", "displayName": "Possession", "displayValue": "0.0"},
+        {"name": "totalShots", "displayName": "Shots", "displayValue": "0"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "capability",
+    (CapabilityState.PARTIAL, CapabilityState.ABSENT, CapabilityState.UNKNOWN),
+)
+@pytest.mark.unit
+def test_matchsheet_one_sided_zero_skeleton_is_valid_empty_only_when_permitted(
+    capability: CapabilityState,
+) -> None:
+    """A zero-filled skeleton opposite an absent block is emptiness, not capture.
+
+    ESPN answered scope 19834:2026 event 401908161 (played, full time) with
+    ``statistics: []`` for one team and a 28-field all-zero block for the other.
+    """
+
+    competition, edition, schedule = _schedule(matchsheet=capability)
+    payload = _load("native_summary.json")
+    payload["boxscore"]["teams"][0]["statistics"] = []
+    payload["boxscore"]["teams"][1]["statistics"] = _zero_skeleton()
+
+    result = parse_summary(
+        _raw(payload), competition=competition, edition=edition, event=schedule[0]
+    )
+
+    assert result.matchsheet == ()
+    assert result.matchsheet_state is EntityParseState.VALID_EMPTY
+    # The rest of the Summary still parses: dropping the skeleton must not cost
+    # the lineup, which is the whole point of not failing the scope.
+    assert result.lineup_state is EntityParseState.CAPTURED
+    assert result.lineup
+
+    proven_competition, proven_edition, proven_schedule = _schedule()
+    with pytest.raises(EspnParseError, match="proven matchsheet"):
+        parse_summary(
+            _raw(payload),
+            competition=proven_competition,
+            edition=proven_edition,
+            event=proven_schedule[0],
+        )
+
+
+@pytest.mark.unit
+def test_matchsheet_one_sided_statistics_with_any_real_value_still_fails() -> None:
+    competition, edition, schedule = _schedule(matchsheet=CapabilityState.PARTIAL)
+    payload = _load("native_summary.json")
+    payload["boxscore"]["teams"][0]["statistics"] = []
+    # The real value sits last: an early return would hide it.
+    skeleton = _zero_skeleton()
+    skeleton.append({"name": "wonCorners", "displayValue": "3"})
+    payload["boxscore"]["teams"][1]["statistics"] = skeleton
+
+    with pytest.raises(EspnParseError, match="empty for both or neither"):
+        parse_summary(
+            _raw(payload), competition=competition, edition=edition, event=schedule[0]
+        )
+
+
+@pytest.mark.unit
+def test_matchsheet_one_sided_absent_statistics_key_follows_the_same_rule() -> None:
+    """The key may be missing rather than empty; the pair is still blank."""
+
+    competition, edition, schedule = _schedule(matchsheet=CapabilityState.PARTIAL)
+    payload = _load("native_summary.json")
+    payload["boxscore"]["teams"][0].pop("statistics")
+    payload["boxscore"]["teams"][1]["statistics"] = _zero_skeleton()
+
+    result = parse_summary(
+        _raw(payload), competition=competition, edition=edition, event=schedule[0]
+    )
+
+    assert result.matchsheet == ()
+    assert result.matchsheet_state is EntityParseState.VALID_EMPTY
+
+    payload["boxscore"]["teams"][1]["statistics"].append(
+        {"name": "wonCorners", "displayValue": "3"}
+    )
+    with pytest.raises(EspnParseError, match="exist for both or neither"):
+        parse_summary(
+            _raw(payload), competition=competition, edition=edition, event=schedule[0]
+        )
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    (
+        {"name": "unmappedThing", "displayValue": "0/0"},
+        {"displayValue": "0"},
+    ),
+)
+@pytest.mark.unit
+def test_matchsheet_blankness_probe_never_replaces_the_one_sided_failure(
+    malformed: dict[str, object],
+) -> None:
+    """A block the capture path would reject is not provably blank.
+
+    The probe must not raise its own scalar-format complaint, and must not call
+    a nameless entry blank either — both would mislead whoever reads the log.
+    """
+
+    competition, edition, schedule = _schedule(matchsheet=CapabilityState.PARTIAL)
+    payload = _load("native_summary.json")
+    payload["boxscore"]["teams"][0]["statistics"] = []
+    payload["boxscore"]["teams"][1]["statistics"] = [*_zero_skeleton(), malformed]
+
+    with pytest.raises(EspnParseError, match="empty for both or neither"):
+        parse_summary(
+            _raw(payload), competition=competition, edition=edition, event=schedule[0]
+        )
+
+
 @pytest.mark.unit
 def test_lineup_without_team_rosters_is_valid_empty_only_when_permitted() -> None:
     competition, edition, schedule = _schedule(lineup=CapabilityState.PARTIAL)

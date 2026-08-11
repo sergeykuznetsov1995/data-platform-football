@@ -9216,3 +9216,104 @@ def test_qualification_state_rejects_every_other_value(state):
 
     with pytest.raises(OperationsError, match="publication result state is invalid"):
         espn_native_tasks._qualification_state(state)
+
+
+def _incomplete_offline_parse(monkeypatch, scope_id, scopes):
+    """Drive offline_parse_scope to its incomplete branch and return the error."""
+
+    from dags.utils import espn_native_tasks
+
+    phase_ref = {"uri": "file:///phase.json", "sha256": "b" * 64}
+    raw_phase = {
+        "kind": "espn-raw-reduction-result-v1",
+        "schema_version": 1,
+        "scope_binding_ref": {"uri": "file:///binding.json", "sha256": "e" * 64},
+        "raw_manifest_ref": {"uri": "file:///raw.json", "sha256": "f" * 64},
+    }
+    descriptor = {
+        "scope_root": "file:///scope",
+        "raw_manifest_uri": "file:///raw.json",
+        "raw_store_uri": "file:///raw-store",
+    }
+    scope = SimpleNamespace(scope_id=scope_id)
+
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_read_ref",
+        lambda ref, **_kwargs: (
+            raw_phase if ref["uri"] == phase_ref["uri"] else {"selected_scopes": [scope_id]}
+        ),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner, "_validate_raw_manifest", lambda payload: payload
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_heartbeat_scope_binding",
+        lambda _ref: (None, descriptor, SimpleNamespace(), scope, None),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks, "_execution_options", lambda *_a, **_k: object()
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.EspnRawStore,
+        "from_uri",
+        classmethod(lambda _cls, _uri: object()),
+    )
+    monkeypatch.setattr(
+        espn_native_tasks,
+        "_write_payload",
+        lambda _uri, _payload: {"uri": "file:///offline-parse.json", "sha256": "a" * 64},
+    )
+    monkeypatch.setattr(
+        espn_native_tasks.runner,
+        "stage",
+        lambda _options, *, raw_store: SimpleNamespace(
+            exit_code=1, payload={"state": "incomplete", "scopes": scopes}
+        ),
+    )
+
+    with pytest.raises(espn_native_tasks.OperationsError) as excinfo:
+        espn_native_tasks.offline_parse_scope(raw_phase_ref=phase_ref)
+    return str(excinfo.value)
+
+
+def test_offline_parse_incomplete_reports_the_parser_reason(monkeypatch):
+    """A bare "incomplete" cost half an hour of artifact digging on 2026-08-11."""
+
+    # The exact scope payload the parser wrote for event 401908161.
+    message = _incomplete_offline_parse(
+        monkeypatch,
+        "19834:2026",
+        [
+            {
+                "scope_id": "19834:2026",
+                "state": "incomplete",
+                "error": (
+                    "EspnParseError: Summary matchsheet statistics must be empty "
+                    "for both or neither team"
+                ),
+            }
+        ],
+    )
+
+    assert "19834:2026" in message
+    assert "must be empty for both or neither team" in message
+
+
+def test_offline_parse_incomplete_without_a_reason_stays_terse(monkeypatch):
+    message = _incomplete_offline_parse(
+        monkeypatch, "19834:2026", [{"scope_id": "19834:2026", "state": "incomplete"}]
+    )
+
+    assert message == "offline ESPN parse incomplete for 19834:2026"
+
+
+def test_offline_parse_incomplete_reason_is_bounded(monkeypatch):
+    message = _incomplete_offline_parse(
+        monkeypatch,
+        "19834:2026",
+        [{"scope_id": "19834:2026", "state": "incomplete", "error": "x" * 4000}],
+    )
+
+    assert len(message) < 600

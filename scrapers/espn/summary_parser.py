@@ -1346,6 +1346,26 @@ def _stat_scalar(stat: Mapping[str, Any], field: str) -> str:
     raise EspnParseError(f"{field}.value must be a supported scalar value")
 
 
+def _statistics_are_blank(statistics: list[Any], field: str) -> bool:
+    """Report whether every statistic in the block is a zero placeholder.
+
+    Anything the capture path itself would reject is not provably blank: say so
+    instead of raising, so a malformed block keeps its own failure text rather
+    than a scalar-format complaint raised from a probe.
+    """
+
+    for index, raw_stat in enumerate(statistics):
+        try:
+            stat = required_mapping(raw_stat, f"{field}[{index}]")
+            required_string(stat.get("name"), f"{field}[{index}].name")
+            scalar = _stat_scalar(stat, f"{field}[{index}]")
+        except EspnParseError:
+            return False
+        if float(scalar.rstrip("%")) != 0.0:
+            return False
+    return True
+
+
 def _stat_values(statistics: list[Any], field: str) -> dict[str, str]:
     values: dict[str, str] = {}
     for index, raw_stat in enumerate(statistics):
@@ -1402,6 +1422,21 @@ def _matchsheet(
     if not any(statistics_presence):
         return (), _valid_empty_or_fail(capability, "matchsheet")
     if not all(statistics_presence):
+        # Same asymmetry as the empty-list branch below, one shape earlier: the
+        # side that does carry a block carries only zeros, so nothing is lost by
+        # treating the pair as empty.
+        if all(
+            _statistics_are_blank(
+                required_list(
+                    block.get("statistics"),
+                    f"summary.boxscore.teams[{team_id}].statistics",
+                ),
+                f"summary.boxscore.teams[{team_id}].statistics",
+            )
+            for team_id, (_, _, block) in blocks.items()
+            if "statistics" in block
+        ):
+            return (), _valid_empty_or_fail(capability, "matchsheet")
         raise EspnParseError(
             "Summary matchsheet statistics must exist for both or neither team"
         )
@@ -1418,6 +1453,26 @@ def _matchsheet(
     if len(empty_statistics) == len(statistics_by_team):
         return (), _valid_empty_or_fail(capability, "matchsheet")
     if empty_statistics:
+        # ESPN sometimes answers a played fixture with a zero-filled statistics
+        # skeleton on one side and no statistics at all on the other.  That
+        # asymmetry is syntactic: neither side carries an observation, so the
+        # matchsheet is empty rather than half captured, and the skeleton is
+        # discarded instead of being published as captured data.  One side
+        # holding real values stays a hard failure.
+        #
+        # The trade is deliberate and matches the both-sides-empty branch above:
+        # valid_empty is terminal, so a source that back-fills the box score
+        # later is never re-read for this event.  A loud failure that blocks the
+        # whole cohort is worse than a quiet gap on a source that is not proven
+        # to carry the section at all.
+        if all(
+            _statistics_are_blank(
+                statistics, f"summary.boxscore.teams[{team_id}].statistics"
+            )
+            for team_id, statistics in statistics_by_team.items()
+            if team_id not in empty_statistics
+        ):
+            return (), _valid_empty_or_fail(capability, "matchsheet")
         raise EspnParseError(
             "Summary matchsheet statistics must be empty for both or neither team"
         )

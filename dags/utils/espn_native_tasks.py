@@ -3083,7 +3083,18 @@ def offline_parse_scope(
             f"offline ESPN parse pending second empty observation for {scope.scope_id}"
         )
     if staged.exit_code != 0 or staged.payload["state"] == "incomplete":
-        raise OperationsError(f"offline ESPN parse incomplete for {scope.scope_id}")
+        # The parser already recorded why in the artifact written just above.
+        # Without it the traceback is blank and every red cohort costs an
+        # artifact dig before anyone knows what happened.
+        reasons = "; ".join(
+            str(item["error"])
+            for item in scope_result
+            if isinstance(item, Mapping) and item.get("error")
+        )[:500]
+        raise OperationsError(
+            f"offline ESPN parse incomplete for {scope.scope_id}"
+            + (f": {reasons}" if reasons else "")
+        )
     return {"offline_ref": phase_ref}
 
 
