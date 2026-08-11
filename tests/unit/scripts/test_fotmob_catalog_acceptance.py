@@ -394,15 +394,98 @@ def test_continuous_lane_tolerates_scheduled_retry_but_campaign_does_not() -> No
     assert continuous.ok is True, continuous.errors
 
 
-def test_continuous_lane_still_rejects_retry_evidence_under_success_status() -> None:
+def test_continuous_lane_accepts_partial_success_without_deferrals() -> None:
+    """Неполнота бывает не только от бюджета: например незакрытый поток трансферов.
+
+    Раннер в таком случае отдаёт partial_success без отсрочек, и если приёмка
+    продолжает требовать бюджетное доказательство, ран падает уже на
+    validate_data — гейт раннера и приёмка расходятся в трактовке одного слова.
+    """
+
     report = _report()
-    contract = report["selection"]["catalog_contract"]
-    report["selection"]["scope_attempts"] = [
+    report["status"] = "partial_success"
+    report["complete"] = False
+
+    campaign = acceptance.validate_report(report, now=NOW)
+    continuous = acceptance.validate_report(
+        report, now=NOW, require_full_completion=False
+    )
+
+    assert campaign.ok is False
+    assert any("deferral evidence" in error for error in campaign.errors)
+    assert continuous.ok is True, continuous.errors
+
+
+def test_continuous_lane_ignores_retry_left_by_a_previous_run() -> None:
+    """Ран, закрывший всё, что планировал, не краснеет из-за чужого повтора.
+
+    `selection.scope_attempts` — это перечитанная карта состояний по подписи
+    плана, то есть история: скоуп, отложенный прошлым раном на 6 часов, лежит в
+    ней и в отчёте следующего рана. Если считать это «незакрытым обязательством
+    текущего рана», лучший из возможных ранов оказывается красным, а silver
+    так и не стартует.
+    """
+
+    contract = _contract(scopes=((47, "2025/2026"), (47, "2024/2025")))
+    report = _report()
+    selection = report["selection"]
+    selection["catalog_contract"] = contract
+    selection["scope_plan_signature"] = contract["plan_signature"]
+    selection["planned_scopes"] = ["47=2025/2026"]
+    stale_retry = dict(
         _attempt(
             contract,
             outcome="retryable",
-            reason="scope 47=2025/2026 incomplete; outstanding={}",
-            next_retry_at=NOW + timedelta(minutes=15),
+            reason="scope 47=2024/2025 incomplete; outstanding={}",
+            last_attempt_at=NOW - timedelta(hours=2),
+            next_retry_at=NOW + timedelta(hours=4),
+        )
+    )
+    stale_retry["source_season_key"] = "2024/2025"
+    selection["scope_attempts"] = [_attempt(contract), stale_retry]
+
+    campaign = acceptance.validate_report(report, now=NOW)
+    continuous = acceptance.validate_report(
+        report, now=NOW, require_full_completion=False
+    )
+
+    assert campaign.ok is False
+    assert continuous.ok is True, continuous.errors
+
+
+@pytest.mark.parametrize(
+    ("outcome", "reason", "next_retry_at", "message"),
+    [
+        ("retryable", "", NOW + timedelta(minutes=15), "must record an explicit reason"),
+        (
+            "retryable",
+            "scope 47=2025/2026 incomplete; outstanding={}",
+            NOW - timedelta(hours=2),
+            "next_retry_at must follow its attempt",
+        ),
+        ("terminal", "", None, "must record an explicit reason"),
+    ],
+)
+def test_continuous_lane_keeps_structural_checks_on_retry_evidence(
+    outcome: str, reason: str, next_retry_at: datetime | None, message: str
+) -> None:
+    """Послабление снимает вопрос о ПОЛНОТЕ, но не о качестве доказательства.
+
+    Непрерывная полоса перестаёт краснеть из-за незакрытого каталога, однако
+    доказательство обязано оставаться честным: у повтора есть причина и срок,
+    и срок наступает после самой попытки.
+    """
+
+    report = _report()
+    contract = report["selection"]["catalog_contract"]
+    report["status"] = "partial_success"
+    report["complete"] = False
+    report["selection"]["scope_attempts"] = [
+        _attempt(
+            contract,
+            outcome=outcome,
+            reason=reason,
+            next_retry_at=next_retry_at,
         )
     ]
 
@@ -411,10 +494,7 @@ def test_continuous_lane_still_rejects_retry_evidence_under_success_status() -> 
     )
 
     assert result.ok is False
-    assert any(
-        "retryable scope evidence requires incomplete report status" in error
-        for error in result.errors
-    )
+    assert any(message in error for error in result.errors), result.errors
 
 
 def test_validate_report_accepts_source_gap_only_with_two_attempt_identities() -> None:
