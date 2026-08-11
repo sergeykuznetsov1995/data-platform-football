@@ -1,3 +1,4 @@
+import json
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -228,6 +229,89 @@ def test_memory_scope_attempts_are_durable_contract_bound_and_incremented():
         last_attempt_at=attempted_at + timedelta(minutes=21),
     )
     assert retried_same_run.attempt_count == 2
+
+
+class ScopeAttemptTrino:
+    """Trino, отдающий одну прошлую попытку и считающий обращения к журналу."""
+
+    def __init__(self):
+        self.sql = []
+
+    def execute_query(self, sql):
+        self.sql.append(sql)
+        return [
+            (
+                "47",
+                "2025/2026",
+                "fmplan1-journal",
+                datetime(2026, 8, 8, 9),
+                None,
+                json.dumps(
+                    {
+                        "plan_signature": "fmplan1-journal",
+                        "attempt_count": 1,
+                        "last_attempt_at": "2026-08-08T09:00:00+00:00",
+                        "next_retry_at": None,
+                        "outcome": "retryable",
+                        "reason": "HTTP 503",
+                        "attempt_identities": ["run-0:47=2025/2026"],
+                        "run_id": "run-0",
+                    }
+                ),
+            )
+        ]
+
+    @property
+    def attempt_queries(self):
+        return [sql for sql in self.sql if "target_type = 'scope_attempt'" in sql]
+
+
+class ScopeAttemptWriter(RecordingWriter):
+    def __init__(self):
+        super().__init__()
+        self.trino = ScopeAttemptTrino()
+
+    def _get_trino_manager(self):
+        return self.trino
+
+
+def test_scope_attempt_journal_is_read_once_per_run():
+    """Карта попыток читается одним оконным запросом, а не на каждую попытку.
+
+    Под контентной подписью запрос возвращал ноль строк и его цена была
+    незаметна. Под стабильной он проходит по всей истории полосы, а
+    record_scope_attempt зовёт его на каждый из ~460 скоупов — это тот самый
+    узел, из-за которого ран упирается в Trino вместо источника.
+    """
+
+    writer = ScopeAttemptWriter()
+    repository = FotMobRepository(writer=writer)
+
+    before = repository.scope_attempt_states("fmplan1-journal")
+    assert before[(47, "2025/2026")].attempt_count == 1
+
+    for index in range(3):
+        repository.record_scope_attempt(
+            run_id="run-1",
+            competition_id=100 + index,
+            source_season_key="2025/2026",
+            plan_signature="fmplan1-journal",
+            outcome="success",
+            reason="scope completion committed",
+            last_attempt_at=datetime(2026, 8, 8, 10, index),
+            attempt_identities=(f"run-1:{100 + index}=2025/2026",),
+        )
+
+    assert len(writer.trino.attempt_queries) == 1
+    after = repository.scope_attempt_states("fmplan1-journal")
+    assert sorted(identity[0] for identity in after) == [47, 100, 101, 102]
+
+    # read-your-writes переживает flush(): pending-манифест очищается, и без
+    # собственного среза счётчик попыток поехал бы назад.
+    repository.flush()
+    flushed = repository.scope_attempt_states("fmplan1-journal")
+    assert sorted(identity[0] for identity in flushed) == [47, 100, 101, 102]
+    assert len(writer.trino.attempt_queries) == 1
 
 
 def test_source_gap_requires_two_distinct_successful_attempt_identities():

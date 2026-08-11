@@ -471,11 +471,14 @@ def _catalog_decision_payload(evidence) -> dict[str, Any]:
     return payload
 
 
-def _scope_attempt_payload(state) -> dict[str, Any]:
+def _scope_attempt_payload(state, *, plan_signature: str | None = None) -> dict[str, Any]:
+    # Отчёт — доказательство о КОНТРАКТЕ, поэтому наружу идёт контрактная
+    # подпись рана; журнальная подпись, под которой состояние лежит в манифесте,
+    # остаётся внутренней деталью планировщика.
     return {
         "competition_id": state.competition_id,
         "source_season_key": state.source_season_key,
-        "plan_signature": state.plan_signature,
+        "plan_signature": plan_signature or state.plan_signature,
         "attempt_count": state.attempt_count,
         "last_attempt_at": state.last_attempt_at.replace(
             tzinfo=timezone.utc
@@ -1107,10 +1110,37 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             )
         if scope_validation.errors and scope_validation not in operations:
             operations.append(scope_validation)
+    # Две подписи с разными задачами.
+    #
+    # Контрактная (контентная) хеширует состав каталога и потому меняется, как
+    # только источник открыл новый сезон или турнир. Как доказательство «этот
+    # ран отвечал ровно за этот каталог» она верна и остаётся в отчёте.
+    #
+    # Журнальная зависит только от набора сущностей и политики полосы, то есть
+    # стабильна между ранами. Ключом журнала обязана быть именно она: под
+    # контентной подписью история попыток обнулялась каждый ран, планировщик
+    # видел пустую карту, все скоупы получали last_attempt=datetime.min и обход
+    # вечно начинался с головы очереди — хвост каталога не собирался никогда,
+    # а раны при этом были зелёными.
+    #
+    # Полоса входит в журнальную подпись явно. Сегодня `current` и `history`
+    # расходятся по ней случайно — через окно трансферов (`1year` против
+    # `all`); стоит убрать `transfers` из состава полосы, и журналы молча
+    # сольются, а `plan_seasons` перестанет планировать историей сезоны,
+    # закрытые текущей полосой. Для неавтоматического режима формула не
+    # меняется: её сверяют приёмка replay и regex публикации.
+    journal_plan_signature = deterministic_plan_signature(
+        contract_entities,
+        policy=(
+            {**scope_policy, "scope_lane": automatic_lane.value}
+            if automatic_catalog
+            else scope_policy
+        ),
+    )
     scope_plan_signature = (
         automatic_contract.plan_signature
         if automatic_contract is not None
-        else deterministic_plan_signature(contract_entities, policy=scope_policy)
+        else journal_plan_signature
     )
 
     if args.mode == RunMode.DISCOVER.value:
@@ -1145,7 +1175,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         # The drain resumes across DagRuns on plan_signature + parser_version;
         # a parser bump still reprocesses everything.
         previously_complete = service.repository.completed_scope_keys(
-            scope_plan_signature,
+            journal_plan_signature,
         )
     elif mode == RunMode.REPLAY:
         for season in seasons:
@@ -1160,7 +1190,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 previously_complete.add(season.identity)
 
     attempt_states = (
-        service.repository.scope_attempt_states(scope_plan_signature)
+        service.repository.scope_attempt_states(journal_plan_signature)
         if automatic_catalog and automatic_contract is not None
         else {}
     )
@@ -1177,7 +1207,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     daily_scope_times = {}
     if mode == RunMode.DAILY and not automatic_catalog:
         daily_scope_times = service.repository.scope_completion_times(
-            scope_plan_signature
+            journal_plan_signature
         )
         work.sort(
             key=lambda work_item: (
@@ -1191,8 +1221,13 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         attempted=len(work),
         metadata={
             "scope_plan_signature": scope_plan_signature,
+            # Ключ, по которому лежит история попыток в манифесте: без него
+            # оператор не может ни проверить прогресс обхода запросом, ни
+            # отличить «журнал переехал» от «журнал пуст».
+            "journal_plan_signature": journal_plan_signature,
             "scope_entities": sorted(scope_entities),
             "already_complete_scopes": len(previously_complete),
+            "attempt_states": len(attempt_states),
             "daily_completion_timestamps": len(daily_scope_times),
         },
     )
@@ -1233,7 +1268,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             state = service.record_scope_attempt(
                 item.competition_id,
                 item.source_season_key,
-                plan_signature=scope_plan_signature,
+                plan_signature=journal_plan_signature,
                 outcome=outcome,
                 reason=reason,
                 next_retry_at=next_retry_at,
@@ -1241,7 +1276,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             )
             attempt_operation.succeeded += 1
             attempt_operation.metadata.setdefault("outcomes", []).append(
-                _scope_attempt_payload(state)
+                _scope_attempt_payload(state, plan_signature=scope_plan_signature)
             )
         except Exception as exc:
             attempt_operation.errors.append(
@@ -1456,7 +1491,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     service.record_scope_completion(
                         item.competition_id,
                         item.source_season_key,
-                        plan_signature=scope_plan_signature,
+                        plan_signature=journal_plan_signature,
                         coverage=coverage,
                         counts=counts,
                     )
@@ -1634,7 +1669,10 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
 
     if "transfers" in entities:
         if automatic_contract is not None:
-            transfer_signature = scope_plan_signature
+            # Журнал трансферов — та же история попыток: ключом идёт стабильная
+            # подпись, а в отчёт (selection.transfer_plan_signature) уходит
+            # контрактная, которую сверяет приёмка.
+            transfer_signature = journal_plan_signature
         else:
             transfer_policy = {
                 "window": transfer_window,
@@ -1799,17 +1837,34 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 transfer_plan.retryable.append(
                     f"competition {competition_id} transfer stream incomplete"
                 )
+        # Покрытие трансферов — свойство обязательства, а не одного окна.
+        # Под стабильной подписью бэкфил перестал перезабирать уже закрытые
+        # потоки, поэтому список этого рана перестал совпадать с included_ids,
+        # а приёмка спрашивает именно про них: у дренированной полосы
+        # (закрывать нечего, ран зелёный) это дало бы «transfer completion
+        # evidence is incomplete». Добираем ранее закрытые, ограничив их
+        # текущим контрактом.
+        durable_transfer_ids = (
+            set(completed_transfer_ids) & set(automatic_contract.included_ids)
+            if automatic_contract is not None
+            else set(completed_transfer_ids)
+        )
         completed_transfer_competition_ids = sorted(
-            set(completed_transfer_competition_ids)
+            set(completed_transfer_competition_ids) | durable_transfer_ids
         )
     else:
         completed_transfer_competition_ids = []
 
-    automatic_attempts = (
-        service.repository.scope_attempt_states(scope_plan_signature)
-        if automatic_catalog and automatic_contract is not None
-        else {}
-    )
+    # Доказательства рана — это исходы, которые записал ОН САМ. Раньше здесь
+    # перечитывалась карта состояний: под контентной подписью она совпадала с
+    # работой рана, под стабильной содержит историю всей полосы, и отчёт начал
+    # бы утверждать чужое — отсрочки прошлых окон без оснований в этом ране,
+    # состояния скоупов, которых в плане не было.
+    run_attempt_outcomes = {
+        (int(entry["competition_id"]), str(entry["source_season_key"])): entry
+        for entry in attempt_operation.metadata.get("outcomes", ())
+        if isinstance(entry, Mapping)
+    }
     deferred_scope_targets = {
         target
         for evidence in automatic_deferrals
@@ -1817,12 +1872,20 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         for target in evidence.get("targets", [])
     }
     unauthorized_deferred_attempts = False
-    for state in automatic_attempts.values():
-        if state.outcome != "deferred" or format_scope_token(
-            state.competition_id, state.source_season_key
-        ) in deferred_scope_targets:
+    # Только исходы ЭТОГО рана: под стабильной журнальной подписью карта
+    # состояний хранит историю всей полосы, и отсрочки чужих ранов ушли бы в
+    # selection.deferrals как доказательства этого — приёмка справедливо
+    # ответила бы «deferral target вне контракта».
+    for entry in run_attempt_outcomes.values():
+        if entry.get("outcome") != "deferred":
             continue
-        reason = state.reason.casefold()
+        token = format_scope_token(
+            int(entry["competition_id"]), str(entry["source_season_key"])
+        )
+        if token in deferred_scope_targets:
+            continue
+        state_reason = str(entry.get("reason") or "")
+        reason = state_reason.casefold()
         if "deadline" in reason:
             kind = "deadline"
         elif "budget" in reason:
@@ -1832,12 +1895,11 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         if kind is None:
             unauthorized_deferred_attempts = True
             continue
-        token = format_scope_token(state.competition_id, state.source_season_key)
         add_automatic_deferral(
             kind=kind,
             target_type="scope",
             targets=[token],
-            reason=state.reason,
+            reason=state_reason,
         )
         deferred_scope_targets.add(token)
     rc, payload = finish()
@@ -1881,8 +1943,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 "catalog_ids": catalog_ids_evidence,
                 "catalog_decisions": catalog_decisions_evidence,
                 "scope_attempts": [
-                    _scope_attempt_payload(state)
-                    for _identity, state in sorted(automatic_attempts.items())
+                    entry for _identity, entry in sorted(run_attempt_outcomes.items())
                 ],
                 "transfer_plan_signature": (
                     scope_plan_signature if "transfers" in entities else None
@@ -1890,9 +1951,9 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 "deferrals": automatic_deferrals,
             }
         )
-        # Исходы ЭТОГО рана, а не срез истории подписи: automatic_attempts —
-        # это перечитанная карта состояний, куда попадают и скоупы, которых в
-        # текущем плане не было. Гейт обязан судить ран по тому, что сделал он.
+        # Гейт судит ран по тому, что сделал он сам. Карта состояний под
+        # стабильной подписью — это история всей полосы, включая скоупы, до
+        # которых это окно не дошло.
         run_outcomes = tuple(
             str(entry.get("outcome"))
             for entry in attempt_operation.metadata.get("outcomes", ())
