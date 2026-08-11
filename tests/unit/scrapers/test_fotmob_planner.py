@@ -106,6 +106,64 @@ def test_retryable_scope_not_due_does_not_starve_later_ready_scopes():
     assert [item.competition_id for item in plan] == [48, 49]
 
 
+def _terminal_attempt(now, age):
+    return {
+        (47, "2025/2026"): ScopeAttemptState(
+            competition_id=47,
+            source_season_key="2025/2026",
+            plan_signature="fmplan1-test",
+            attempt_count=1,
+            last_attempt_at=now - age,
+            next_retry_at=None,
+            outcome="terminal",
+            reason="scope completion commit failed: TrinoUserError",
+        )
+    }
+
+
+def test_fresh_terminal_scope_stays_out_of_the_plan():
+    now = datetime(2026, 8, 8, 10)
+    plan = plan_seasons(
+        [_classified(47), _classified(48)],
+        [
+            SeasonRef(47, "2025/2026", is_selected=True),
+            SeasonRef(48, "2025/2026", is_selected=True),
+        ],
+        mode=RunMode.DAILY,
+        lane=ScopeLane.CURRENT,
+        attempt_states=_terminal_attempt(now, timedelta(hours=23)),
+        now=now,
+    )
+
+    assert [item.competition_id for item in plan] == [48]
+
+
+def test_terminal_scope_returns_to_the_plan_after_ttl():
+    """Разовая ошибка коммита не должна вычёркивать скоуп из обхода навсегда.
+
+    Под стабильной журнальной подписью карта состояний переживает раны, поэтому
+    вечное исключение превратилось бы в тихую дыру в покрытии: ран зелёный,
+    скоуп не собирается больше никогда и об этом никто не узнает.
+    """
+
+    now = datetime(2026, 8, 8, 10)
+    plan = plan_seasons(
+        [_classified(47), _classified(48)],
+        [
+            SeasonRef(47, "2025/2026", is_selected=True),
+            SeasonRef(48, "2025/2026", is_selected=True),
+        ],
+        mode=RunMode.DAILY,
+        lane=ScopeLane.CURRENT,
+        attempt_states=_terminal_attempt(now, timedelta(hours=25)),
+        now=now,
+    )
+
+    # 48 впереди по справедливости обхода: его не пробовали ни разу
+    # (last_attempt = datetime.min), а 47 пробовали сутки назад.
+    assert [item.competition_id for item in plan] == [48, 47]
+
+
 def test_excluded_and_review_required_competitions_stay_out_of_ingest_plan():
     plan = plan_seasons(
         [
