@@ -1496,9 +1496,11 @@ def test_recovery_wave_reuses_raw_before_live_fetch(monkeypatch):
 
 
 @pytest.mark.unit
-def test_recovery_drain_fails_before_transport_when_processing_is_stalled(
+def test_recovery_drain_reports_stall_instead_of_killing_the_run(
     monkeypatch,
 ):
+    """Застрявшая когорта сырья не должна отменять живые волны (#1145 Э1)."""
+
     stalled = MagicMock()
     stalled.as_dict.return_value = {
         "cohort_size": 1,
@@ -1511,17 +1513,21 @@ def test_recovery_drain_fails_before_transport_when_processing_is_stalled(
         fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
     )
 
-    with pytest.raises(RuntimeError, match="made no progress"):
-        fbref_pipeline_tasks.run_recovery_wave(
-            airflow_run_id="manual__stalled-recovery",
-            dag_id="dag_backfill_fbref",
-            page_kinds=["match"],
-            run_type="backfill",
-            request_limit=4096,
-            byte_limit_mb=2048,
-            shard_size=25,
-        )
+    recovered = fbref_pipeline_tasks.run_recovery_wave(
+        airflow_run_id="manual__stalled-recovery",
+        dag_id="dag_backfill_fbref",
+        page_kinds=["match"],
+        run_type="backfill",
+        request_limit=4096,
+        byte_limit_mb=2048,
+        shard_size=25,
+    )
 
+    assert recovered["recovery_stalled"] is True
+    assert recovered["recovery_stalled_cohort_size"] == 1
+    # Цикл обязан оборваться, а не крутить одну и ту же когорту.
+    assert pipeline.recover_unprocessed_wave.call_count == 1
+    # Сама эта таска транспорт не открывает — волны идут отдельным шагом.
     pipeline.fetch_wave.assert_not_called()
 
 
@@ -1662,6 +1668,62 @@ def test_current_scope_freshness_fails_closed_for_stale_or_missing_evidence(
     with pytest.raises(RuntimeError, match="no current-scope freshness"):
         fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
             airflow_run_id="manual__missing",
+            dag_id="dag_backfill_fbref",
+            run_type="backfill",
+        )
+
+
+@pytest.mark.unit
+def test_current_scope_freshness_treats_never_fetched_backlog_as_warning(
+    monkeypatch,
+):
+    """Ширящийся реестр (#1145 Э5) не должен красить суточный ран."""
+
+    summary = _freshness_summary(stale_kind="schedule")
+    summary["freshness_by_page_kind"]["schedule"]["stale_targets"] = 7
+    summary["freshness_by_page_kind"]["schedule"]["never_fetched_targets"] = 7
+    summary["current_scope_freshness"]["stale_targets"] = 7
+    summary["current_scope_freshness"]["never_fetched_targets"] = 7
+    control = MagicMock()
+    control.get_run_summary.return_value = summary
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    result = fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+        airflow_run_id="scheduled__2026-08-11T06:00:00+00:00",
+        dag_id="dag_ingest_fbref",
+        run_type="current",
+    )
+
+    assert result["status"] == "passed"
+    assert any("expansion_backlog=7" in w for w in result["warnings"])
+    assert result["freshness_by_page_kind"]["schedule"]["aged_targets"] == 0
+    assert result["publication_scope_freshness"]["aged_targets"] == 0
+
+
+@pytest.mark.unit
+def test_current_scope_freshness_still_fails_on_genuinely_aged_pages(
+    monkeypatch,
+):
+    """Протухло собранное — это по-прежнему провал, бэклог его не прячет."""
+
+    from airflow.exceptions import AirflowFailException
+
+    summary = _freshness_summary(stale_kind="schedule")
+    summary["freshness_by_page_kind"]["schedule"]["stale_targets"] = 9
+    summary["freshness_by_page_kind"]["schedule"]["never_fetched_targets"] = 4
+    summary["current_scope_freshness"]["stale_targets"] = 9
+    summary["current_scope_freshness"]["never_fetched_targets"] = 4
+    control = MagicMock()
+    control.get_run_summary.return_value = summary
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    with pytest.raises(AirflowFailException, match="aged=5"):
+        fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+            airflow_run_id="manual__aged",
             dag_id="dag_backfill_fbref",
             run_type="backfill",
         )

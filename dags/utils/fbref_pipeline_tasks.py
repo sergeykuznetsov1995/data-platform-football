@@ -855,6 +855,7 @@ def validate_fbref_current_scope_freshness(
         )
 
     violations = []
+    warnings = []
     if (
         normalized_run_type == "backfill"
         and _non_negative_metric(
@@ -895,18 +896,28 @@ def validate_fbref_current_scope_freshness(
                 )
             if total == 0:
                 violations.append(f"{kind}:total_targets=0")
-            # ``never_fetched`` is diagnostic, not independently a breach:
-            # a newly discovered final match may be queued for up to its 24h
-            # SLA and is counted as fresh by the control-plane evaluator.
-            if stale:
+            # The gate exists to catch data we already hold going stale, not
+            # to punish the scope for growing.  A target that was never
+            # fetched is expansion backlog: it has no aged copy to protect,
+            # and while the registry widens (#1145 Э5) it dominates ``stale``
+            # and turns every daily run red without a single rotten page.
+            # Fallback split until Э7 lands exact counters.
+            aged = max(0, stale - never)
+            if aged:
                 violations.append(
-                    f"{kind}:stale={stale},never_fetched={never}"
+                    f"{kind}:stale={stale},never_fetched={never},aged={aged}"
+                )
+            elif stale:
+                warnings.append(
+                    f"{kind}:expansion_backlog="
+                    f"{stale},never_fetched={never}"
                 )
             normalized_kinds[kind] = {
                 "sla_seconds": reported_seconds,
                 "total_targets": total,
                 "stale_targets": stale,
                 "never_fetched_targets": never,
+                "aged_targets": aged,
             }
 
     normalized_aggregate = {}
@@ -915,18 +926,29 @@ def validate_fbref_current_scope_freshness(
         stale = _non_negative_metric(aggregate, "stale_targets")
         never = _non_negative_metric(aggregate, "never_fetched_targets")
         within_sla = aggregate.get("all_within_sla") is True
+        aged = max(0, stale - never)
         if total == 0:
             violations.append("current_scope:total_targets=0")
-        if stale or not within_sla:
+        if aged:
             violations.append(
                 "current_scope:"
-                f"stale={stale},never_fetched={never},"
+                f"stale={stale},never_fetched={never},aged={aged},"
+                f"all_within_sla={within_sla}"
+            )
+        elif stale or not within_sla:
+            # Same split as per-kind above: backlog widens the scope, it does
+            # not rot it.  ``all_within_sla`` is reported by the control plane
+            # over the same population, so it flips for backlog alone too.
+            warnings.append(
+                "current_scope:expansion_backlog="
+                f"{stale},never_fetched={never},"
                 f"all_within_sla={within_sla}"
             )
         normalized_aggregate = {
             "total_targets": total,
             "stale_targets": stale,
             "never_fetched_targets": never,
+            "aged_targets": aged,
             "all_within_sla": within_sla,
         }
 
@@ -940,11 +962,17 @@ def validate_fbref_current_scope_freshness(
         raise error_type(
             "FBref current-scope freshness failed: " + "; ".join(violations)
         )
+    if warnings:
+        logger.warning(
+            "FBref current-scope freshness passed with expansion backlog: %s",
+            "; ".join(warnings),
+        )
     return {
         "status": "passed",
         "run_type": normalized_run_type,
         "publication_scope_freshness": normalized_aggregate,
         "freshness_by_page_kind": normalized_kinds,
+        "warnings": warnings,
     }
 
 
@@ -1631,12 +1659,23 @@ def run_recovery_wave(
             elif isinstance(value, int):
                 aggregate[key] = int(aggregate.get(key, 0)) + value
         if parsed == 0 and retired == 0:
-            raise RuntimeError(
-                "FBref raw recovery made no progress with "
-                f"{cohort_size} observation(s) still selected"
+            # Расчистка сырья идёт ПЕРЕД живыми волнами, поэтому её тупик
+            # раньше убивал весь ран: 31.07 три мёртвые season-страницы
+            # зациклили recovery и роняли и кампанию, и daily при нулевом
+            # расходе. Застрявшая когорта — повод не трогать её этим раном,
+            # а не повод не собирать ничего (#1145 Э1).
+            aggregate["recovery_stalled"] = True
+            aggregate["recovery_stalled_cohort_size"] = cohort_size
+            logger.warning(
+                "FBref raw recovery made no progress with %s observation(s) "
+                "still selected — оставляю когорту следующему рану и перехожу "
+                "к живым волнам",
+                cohort_size,
             )
+            break
     aggregate.setdefault("cohort_size", 0)
     aggregate.setdefault("parsed", 0)
+    aggregate.setdefault("recovery_stalled", False)
     logger.info(
         "FBref raw recovery drain: %s",
         json.dumps(aggregate, sort_keys=True),
