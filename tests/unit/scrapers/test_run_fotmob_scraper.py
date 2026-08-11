@@ -826,6 +826,11 @@ class TestFotmobNativeRunner:
         assert rc == 0, report["errors"]
         assert report["status"] == "partial_success"
         assert report["complete"] is False
+        assert report["selection"]["scope_outcome_counts"] == {
+            "retryable": 1,
+            "success": 1,
+        }
+        assert report["selection"]["planned_scope_count"] == 2
 
         # Гейт раннера и приёмка отчёта — два независимых барьера на пути к
         # silver: покрасить может любой. Поэтому НАСТОЯЩИЙ отчёт этого рана

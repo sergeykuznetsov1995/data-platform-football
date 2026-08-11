@@ -421,7 +421,14 @@ def _scope_attempts(
             if reason is None:
                 errors.append(f"source_gap scope {token!r} must record an explicit reason")
         elif outcome == "terminal":
-            errors.append(f"terminal scope {token!r} is a hard failure")
+            # selection.scope_attempts — это перечитанная карта состояний по
+            # подписи плана, то есть ИСТОРИЯ, а не работа этого рана. У кампании
+            # история и есть предмет приёмки. У непрерывной полосы терминальный
+            # исход прошлого рана уже покрасил ТОТ ран (гейт раннера считает
+            # исходы своего рана), и повторно краснеть на нём вечно нельзя —
+            # иначе одна разовая ошибка коммита навсегда останавливает silver.
+            if require_full_completion:
+                errors.append(f"terminal scope {token!r} is a hard failure")
             if reason is None:
                 errors.append(f"terminal scope {token!r} must record an explicit reason")
         elif outcome == "deferred":
@@ -746,17 +753,21 @@ def validate_report(
         require_full_completion=require_full_completion,
     )
     deferral_count = sum(len(values) for values in deferrals.values())
-    if status == "partial_success" and deferral_count == 0 and (
-        require_full_completion or not retryable_attempts
-    ):
+    # У непрерывной полосы partial_success — ожидаемый исход почти каждого рана,
+    # и доказательством неполноты служит сам факт незакрытого каталога, а не
+    # обязательно бюджетная отсрочка. Требовать отсрочку значит красить ран,
+    # который честно сказал «сделал часть».
+    if status == "partial_success" and deferral_count == 0 and require_full_completion:
         errors.append(
             "partial_success requires explicit budget or deadline deferral evidence"
         )
     if status == "success" and deferral_count:
         errors.append("success cannot contain budget or deadline deferrals")
-    # Даже в непрерывном режиме «успех» и незакрытые повторы несовместимы:
-    # послабление касается только требования закрыть ВЕСЬ каталог за ран.
-    if retryable_attempts and (require_full_completion or status == "success"):
+    # Здесь тоже история, а не работа рана: карта состояний хранит повторы,
+    # назначенные прошлыми ранами (бэкофф до 24 ч). Требовать из-за них
+    # incomplete у ТЕКУЩЕГО рана — значит краснеть за чужую работу; полноту
+    # обхода у непрерывной полосы судит гейт раннера по своим исходам.
+    if retryable_attempts and require_full_completion:
         errors.append("retryable scope evidence requires incomplete report status")
 
     _transfer_completion(

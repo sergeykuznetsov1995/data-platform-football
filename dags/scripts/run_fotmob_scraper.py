@@ -1906,6 +1906,15 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         scope_progress = any(
             outcome in {"success", "source_gap"} for outcome in run_outcomes
         )
+        # Продвижение рана числом, а не только цветом: цвет отвечает на вопрос
+        # «ран сломан?», а мониторингу нужен вопрос «сколько он закрыл из того,
+        # что планировал». Один закрытый скоуп из двухсот — формально жёлтый
+        # ран, но по этим числам он виден сразу.
+        payload["selection"]["scope_outcome_counts"] = {
+            outcome: run_outcomes.count(outcome)
+            for outcome in sorted(set(run_outcomes))
+        }
+        payload["selection"]["planned_scope_count"] = len(planned_scopes)
         unauthorized_operation_retries = any(
             not _is_budget_deferral_error(reason)
             for operation in operations
