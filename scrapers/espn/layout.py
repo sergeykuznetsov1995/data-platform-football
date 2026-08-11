@@ -273,10 +273,17 @@ def validate_catalog_layout(
     expected_public = (
         LEGACY14_PUBLIC_OBJECTS if mode == LEGACY14 else COMPACT6_PUBLIC_OBJECTS
     )
+    # Mapped publishes run concurrently and each one writes through its own
+    # ``{table}__stg_{uuid}`` shard before swapping it in (see
+    # scrapers/base/trino_manager.py). A sibling's stage is transient, not a
+    # public object, and counting it fails whichever publish happens to
+    # inventory the catalog while another is mid-flight.
     public = {
         name: kind
         for (schema, name), kind in observed.items()
-        if schema == BRONZE_SCHEMA and name.startswith("espn_")
+        if schema == BRONZE_SCHEMA
+        and name.startswith("espn_")
+        and "__stg_" not in name
     }
     missing = sorted(set(expected_public) - set(public))
     unexpected = sorted(set(public) - set(expected_public))

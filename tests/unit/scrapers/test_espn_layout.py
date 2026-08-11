@@ -121,3 +121,22 @@ def test_reviewed_replacements_match_exact_enabled_season_mapping() -> None:
     )
 
     assert observed == REVIEWED_NATIVE_REPLACEMENTS
+
+
+def test_concurrent_staging_shards_are_not_public_objects() -> None:
+    """Mapped publishes stage through ``{table}__stg_{uuid}`` in parallel."""
+
+    from scrapers.espn.layout import LEGACY14_PUBLIC_OBJECTS, validate_catalog_layout
+
+    rows = [
+        ("bronze", name, kind) for name, kind in LEGACY14_PUBLIC_OBJECTS.items()
+    ]
+    staged = [
+        ("bronze", "espn_schedule_generation_v2__stg_729dfde3e8f4", "BASE TABLE"),
+        ("bronze", "espn_lineup_generation_v2__stg_7bfa602c7f53", "BASE TABLE"),
+    ]
+
+    report = validate_catalog_layout("legacy14", [*rows, *staged])
+
+    assert report["layout_mode"] == "legacy14"
+    assert report["public_object_count"] == len(LEGACY14_PUBLIC_OBJECTS)
