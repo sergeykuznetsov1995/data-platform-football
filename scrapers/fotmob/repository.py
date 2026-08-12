@@ -288,6 +288,13 @@ def _scope_attempt_commit(
     due_at = _evidence_datetime(next_retry_at)
     if normalized_outcome in {"retryable", "deferred"} and due_at is None:
         raise ValueError(f"{normalized_outcome} scope attempt requires next_retry_at")
+    # Вызывающий отсчитывает бэкофф от НАЧАЛА работы над скоупом, а попытка
+    # фиксируется в её конце: скоуп, работавший дольше собственного окна повтора
+    # (сотни игроков за часы), приносил next_retry_at в прошлом и краснил приёмку
+    # каталога («next_retry_at must follow its attempt»). Ожидание в этом случае
+    # уже отбыто самой попыткой — повтор доступен со следующей полосы.
+    if due_at is not None and due_at <= attempted_at:
+        due_at = attempted_at + timedelta(seconds=1)
     identities = tuple(dict.fromkeys(str(value).strip() for value in attempt_identities))
     if any(not value for value in identities):
         raise ValueError("scope attempt identities must not be empty")
