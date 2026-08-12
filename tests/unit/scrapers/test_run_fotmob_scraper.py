@@ -842,6 +842,113 @@ class TestFotmobNativeRunner:
         assert continuous.ok is True, continuous.errors
 
     @pytest.mark.unit
+    def test_automatic_transport_absence_defers_scope_instead_of_killing_it(self):
+        """404 по одной цели — повтор, а не смерть скоупа и цвета рана.
+
+        Транспортное 204/404 не доказывает отсутствия сущности: tombstone
+        ставит только entity-aware парсер по scoped-доказательству. Значит
+        такой исход не может ни красить продвинувшийся ран, ни закрывать
+        скоуп терминально с next_retry_at=None. 12.08 ровно так 134 × 404 по
+        игрокам унесли скоуп 59=2026 и весь ран целиком (#1169).
+        """
+
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import FetchOutcome, FetchResult, canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _competition_payload,
+        )
+
+        mod = self._module()
+        healthy = _competition_payload(48, "Second League")
+        healthy["fixtures"]["allMatches"][0]["id"] = 200
+        healthy["fixtures"]["allMatches"][0]["pageUrl"] = "/matches/alpha-vs-beta/x#200"
+        absent_target = canonicalize_target("matchDetails", {"matchId": "100"})
+        absent_match = FetchResult(
+            outcome=FetchOutcome.NOT_AVAILABLE,
+            target_key=absent_target.target_key,
+            url=absent_target.canonical_url,
+            http_status=404,
+            json_data=None,
+            body=None,
+            attempts=1,
+            retries=0,
+            cache_hit=False,
+            stale=False,
+            terminal=True,
+            etag=None,
+            last_modified=None,
+            raw_uri=None,
+            content_hash=None,
+            fetched_at=None,
+            encoded_bytes=0,
+            decoded_bytes=0,
+            direct_bytes=0,
+            proxy_bytes=0,
+            error="FotMob returned 404",
+        )
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [
+                    {
+                        "leagues": [
+                            {"id": 47, "name": "Premier League"},
+                            {"id": 48, "name": "Second League"},
+                        ]
+                    }
+                ]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: (
+                _competition_payload(47, "Premier League")
+            ),
+            canonicalize_target("leagues", {"id": 48}).canonical_url: healthy,
+            absent_target.canonical_url: absent_match,
+            canonicalize_target(
+                "matchDetails", {"matchId": "200"}
+            ).canonical_url: {
+                "content": {"matchFacts": {"events": []}, "stats": {"x": 1}}
+            },
+        }
+        service = FotMobIngestService(
+            transport=StubTransport(dict(responses)),
+            repository=MemoryFotMobRepository(),
+            mode=RunMode.DAILY,
+            budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+            run_id="absence-1",
+            max_workers=2,
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season,matches",
+                "--run-id",
+                "absence-1",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        attempts = {
+            attempt["competition_id"]: attempt
+            for attempt in report["selection"]["scope_attempts"]
+        }
+        assert attempts[47]["outcome"] == "retryable"
+        assert attempts[47]["next_retry_at"] is not None
+        assert attempts[48]["outcome"] == "success"
+        assert rc == 0, report["errors"]
+        assert report["status"] == "partial_success"
+        assert any(
+            "unscoped transport absence (404)" in error for error in report["errors"]
+        )
+        assert not any(error.startswith("terminal:") for error in report["errors"])
+
+    @pytest.mark.unit
     def test_automatic_competition_budget_rotates_after_repeated_failed_attempts(self):
         from scrapers.fotmob.planner import RunMode, TransportBudget
         from scrapers.fotmob.repository import MemoryFotMobRepository
