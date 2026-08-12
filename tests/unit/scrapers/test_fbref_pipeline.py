@@ -5817,6 +5817,34 @@ def test_nonpublishing_or_noncurrent_run_reports_but_does_not_gate_global_pendin
     assert "finish:True" in control.events
 
 
+def test_nonpublishing_run_is_not_gated_by_a_stale_publication_scope(tmp_path):
+    """T11: чужая протухшая витрина не может провалить непубликующий ран."""
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.run["run_type"] = "backfill"
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary["publication_scope_freshness"] = {
+        "total_targets": 11_649,
+        "stale_targets": 482,
+        "never_fetched_targets": 0,
+        "all_within_sla": False,
+    }
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    pipeline.validate_and_finish(str(uuid.uuid4()), publication_eligible=False)
+
+    assert "finish:True" in control.events
+
+    with pytest.raises(
+        RunValidationError, match="publication_scope_stale_targets=482"
+    ):
+        pipeline.validate_and_finish(
+            str(uuid.uuid4()), publication_eligible=True
+        )
+
+
 def test_validation_rejects_missing_sentinel_coverage(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)

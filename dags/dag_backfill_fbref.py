@@ -31,9 +31,11 @@ from utils.fbref_pipeline_tasks import (
     audit_fbref_raw_integrity,
     capture_fbref_raw_baseline,
     choose_fbref_backfill_mode,
+    choose_fbref_backfill_publication_path,
     export_fbref_publication_scope,
     fbref_dag_failure_callback,
     finalize_fbref_publication_lock,
+    guard_fbref_history_window,
     initialize_fbref_run,
     plan_fbref_backfill,
     run_recovery_wave,
@@ -71,6 +73,8 @@ BYTE_LIMIT_MB = (
 )
 SHARD_SIZE = "{{ dag_run.conf.get('shard_size', params.shard_size) }}"
 DRY_RUN = "{{ dag_run.conf.get('dry_run', params.dry_run) }}"
+PUBLISH = "{{ dag_run.conf.get('publish', params.publish) }}"
+MAX_BATCHES = "{{ dag_run.conf.get('max_batches', params.max_batches) }}"
 
 
 with DAG(
@@ -112,6 +116,22 @@ with DAG(
             minimum=1,
             maximum=MAX_SHARD_SIZE,
             description="Maximum historical targets claimed by one task",
+        ),
+        "publish": Param(
+            True,
+            type="boolean",
+            description=(
+                "Publish this run (export scope and trigger Silver). "
+                "Set false for a historical lane that must not touch "
+                "publication or hold the lock past its own batches"
+            ),
+        ),
+        "max_batches": Param(
+            BACKFILL_MAX_BATCHES,
+            type="integer",
+            minimum=1,
+            maximum=BACKFILL_MAX_BATCHES,
+            description="Hard ceiling of live batches for one run",
         ),
     },
     doc_md="""
@@ -164,6 +184,17 @@ with DAG(
         trigger_rule="all_success",
     )
 
+    assert_history_window = PythonOperator(
+        task_id="assert_history_window",
+        python_callable=guard_fbref_history_window,
+        op_kwargs={
+            "max_batches": MAX_BATCHES,
+            "shard_size": SHARD_SIZE,
+            "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
+        },
+        trigger_rule="all_success",
+    )
+
     initialize_run = PythonOperator(
         task_id="initialize_run",
         python_callable=initialize_fbref_run,
@@ -176,6 +207,7 @@ with DAG(
             "shard_size": SHARD_SIZE,
             "reservation_mb": 3,
             "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
+            "publishing": PUBLISH,
         },
         trigger_rule="all_success",
     )
@@ -196,6 +228,7 @@ with DAG(
             "dag_id": DAG_ID,
             "run_type": "backfill",
             "fail_fast": False,
+            "enforce": PUBLISH,
         },
         trigger_rule="all_success",
     )
@@ -239,7 +272,7 @@ with DAG(
 
     choose_mode >> plan_backfill
     choose_mode >> validate_production_readiness
-    validate_production_readiness >> initialize_run
+    validate_production_readiness >> assert_history_window >> initialize_run
     initialize_run >> validate_freshness_preflight
     validate_freshness_preflight >> acquire_publication_lock
     acquire_publication_lock >> seed_historical_seasons
@@ -258,7 +291,7 @@ with DAG(
             "shard_size": SHARD_SIZE,
             "reservation_mb": 3,
             "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
-            "max_batches": BACKFILL_MAX_BATCHES,
+            "max_batches": MAX_BATCHES,
         },
         pool=FBREF_SCRAPER_POOL,
         execution_timeout=timedelta(hours=6, minutes=5),
@@ -287,6 +320,7 @@ with DAG(
             "dag_id": DAG_ID,
             "run_type": "backfill",
             "fail_fast": True,
+            "enforce": PUBLISH,
         },
         trigger_rule="all_success",
     )
@@ -301,7 +335,18 @@ with DAG(
     validate_run = PythonOperator(
         task_id="validate_run",
         python_callable=validate_fbref_run,
-        op_kwargs={"airflow_run_id": AIRFLOW_RUN_ID, "dag_id": DAG_ID},
+        op_kwargs={
+            "airflow_run_id": AIRFLOW_RUN_ID,
+            "dag_id": DAG_ID,
+            "publication_eligible": PUBLISH,
+        },
+        trigger_rule="all_success",
+    )
+
+    choose_publication_path = BranchPythonOperator(
+        task_id="choose_publication_path",
+        python_callable=choose_fbref_backfill_publication_path,
+        op_kwargs={"publish": PUBLISH},
         trigger_rule="all_success",
     )
 
@@ -337,9 +382,12 @@ with DAG(
         trigger_rule="all_done",
     )
 
-    previous >> validate_freshness >> validate_run
-    validate_run >> export_publication_scope >> trigger_silver
+    previous >> validate_freshness >> validate_run >> choose_publication_path
+    choose_publication_path >> export_publication_scope >> trigger_silver
     trigger_silver >> release_publication_lock
+    # A non-publishing historical run holds the lock for its own batches only,
+    # instead of the six-to-eighteen hours a Silver transform costs.
+    choose_publication_path >> release_publication_lock
 
 
 __all__ = ["dag"]

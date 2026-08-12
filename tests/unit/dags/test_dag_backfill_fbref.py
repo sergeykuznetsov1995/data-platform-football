@@ -51,6 +51,10 @@ class TestFBrefBackfillTopology:
         assert params["byte_limit_mb"]._kw["enum"] == [50, 2048]
         assert params["shard_size"].default == 25
         assert params["shard_size"]._kw["maximum"] == 25
+        assert params["publish"].default is True
+        assert params["max_batches"].default == 80
+        assert params["max_batches"]._kw["minimum"] == 1
+        assert params["max_batches"]._kw["maximum"] == 80
         assert tasks["initialize_run"].op_kwargs["run_type"] == "backfill"
         assert tasks["choose_backfill_mode"].downstream_task_ids == {
             "plan_backfill",
@@ -58,6 +62,9 @@ class TestFBrefBackfillTopology:
         }
         assert tasks["plan_backfill"].downstream_task_ids == set()
         assert tasks["validate_production_readiness"].downstream_task_ids == {
+            "assert_history_window"
+        }
+        assert tasks["assert_history_window"].downstream_task_ids == {
             "initialize_run"
         }
 
@@ -81,7 +88,7 @@ class TestFBrefBackfillTopology:
         module, tasks = loaded_dag
         assert module.BACKFILL_MAX_BATCHES == 80
         assert module.BACKFILL_REQUEST_LIMIT == 4096
-        assert len(tasks) == 16
+        assert len(tasks) == 18
         assert tasks["initialize_run"].downstream_task_ids == {
             "validate_current_scope_freshness_preflight"
         }
@@ -111,7 +118,7 @@ class TestFBrefBackfillTopology:
         live = tasks["run_live_waves"]
         assert live.python_callable.__name__ == "run_fbref_live_waves"
         assert live.op_kwargs["run_type"] == "backfill"
-        assert live.op_kwargs["max_batches"] == 80
+        assert live.op_kwargs["max_batches"] == module.MAX_BATCHES
         assert live.op_kwargs["reservation_mb"] == 3
         assert live._captured_kwargs["execution_timeout"].total_seconds() == (
             6 * 60 * 60 + 5 * 60
@@ -148,7 +155,11 @@ class TestFBrefBackfillTopology:
             "validate_current_scope_freshness"
         }
         assert tasks["validate_run"].downstream_task_ids == {
-            "export_publication_scope"
+            "choose_publication_path"
+        }
+        assert tasks["choose_publication_path"].downstream_task_ids == {
+            "export_publication_scope",
+            "release_publication_lock",
         }
         trigger = tasks["trigger_silver_transform"]
         assert trigger.upstream_task_ids == {"export_publication_scope"}

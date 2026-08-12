@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -2896,3 +2897,275 @@ def test_process_group_cleanup_bounds_term_and_kill_waits(monkeypatch):
     ]
     assert stdout == "stdout-10"
     assert stderr == "stderr-10"
+
+
+def _nonpublishing_summary(*, stale_kind: str | None = None) -> dict:
+    summary = _freshness_summary(stale_kind=stale_kind)
+    summary["metadata"] = {
+        "execution_mode": "history_nonpublishing",
+        "publication_eligible": False,
+    }
+    return summary
+
+
+@pytest.mark.unit
+def test_initialize_backfill_records_nonpublishing_evidence(monkeypatch):
+    """T1: непубликующая история оставляет доказательство в метаданных рана."""
+
+    pipeline = MagicMock()
+    pipeline.initialize_run.return_value = (
+        "22222222-2222-4222-8222-222222222222"
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+
+    fbref_pipeline_tasks.initialize_fbref_run(
+        airflow_run_id="manual__history",
+        dag_id="dag_backfill_fbref",
+        run_type="backfill",
+        publishing=False,
+    )
+
+    evidence = pipeline.initialize_run.call_args.kwargs["execution_metadata"]
+    assert evidence["execution_mode"] == "history_nonpublishing"
+    assert evidence["publication_eligible"] is False
+    assert evidence["bootstrap_only"] is False
+    assert evidence["runtime_profile"] == "backfill"
+
+
+@pytest.mark.unit
+def test_initialize_backfill_default_keeps_publishing_evidence(monkeypatch):
+    """T1: у публикующего бэкфилла метаданные ровно прежние."""
+
+    pipeline = MagicMock()
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+
+    fbref_pipeline_tasks.initialize_fbref_run(
+        airflow_run_id="manual__history",
+        dag_id="dag_backfill_fbref",
+        run_type="backfill",
+    )
+
+    assert pipeline.initialize_run.call_args.kwargs["execution_metadata"] == {
+        "bootstrap_only": False,
+        "dag_run_type": None,
+        "execution_mode": "backfill",
+        "publication_eligible": True,
+        "runtime_profile": "backfill",
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("run_type", ["current", "replay"])
+def test_nonpublishing_mode_is_refused_outside_backfill(monkeypatch, run_type):
+    """T2: суточный ран и реплей не могут объявить себя непубликующими."""
+
+    pipeline = MagicMock()
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_pipeline", MagicMock(return_value=pipeline)
+    )
+
+    with pytest.raises(ValueError, match="only for backfill runs"):
+        fbref_pipeline_tasks.initialize_fbref_run(
+            airflow_run_id="scheduled__2026-08-13T06:00:00+00:00",
+            dag_id="dag_ingest_fbref",
+            run_type=run_type,
+            publishing=False,
+        )
+
+    pipeline.initialize_run.assert_not_called()
+
+
+@pytest.mark.unit
+def test_freshness_gate_without_enforce_keeps_todays_hard_verdict(monkeypatch):
+    """T3: enforce=None — поведение публикующего рана не изменилось."""
+
+    from airflow.exceptions import AirflowFailException
+
+    summary = _freshness_summary()
+    summary["promotion_pending_match_count"] = 4
+    control = MagicMock()
+    control.get_run_summary.return_value = summary
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    with pytest.raises(
+        AirflowFailException, match="promotion_pending_match_count=4"
+    ):
+        fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+            airflow_run_id="manual__backfill",
+            dag_id="dag_backfill_fbref",
+            run_type="backfill",
+        )
+
+
+@pytest.mark.unit
+def test_freshness_gate_is_advisory_for_a_nonpublishing_run(monkeypatch):
+    """T4: непубликующая история получает предупреждения вместо провала."""
+
+    summary = _nonpublishing_summary(stale_kind="schedule")
+    summary["promotion_pending_match_count"] = 4
+    control = MagicMock()
+    control.get_run_summary.return_value = summary
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    result = fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+        airflow_run_id="manual__history",
+        dag_id="dag_backfill_fbref",
+        run_type="backfill",
+        enforce=False,
+    )
+
+    assert result["status"] == "advisory"
+    assert "promotion_pending_match_count=4" in result["warnings"]
+    assert any(
+        w.startswith("advisory:schedule:stale=1") for w in result["warnings"]
+    )
+
+
+@pytest.mark.unit
+def test_advisory_freshness_is_refused_for_a_publishing_run(monkeypatch):
+    """T5: обратная пломба — enforce=False не спасает публикующий ран."""
+
+    summary = _freshness_summary(stale_kind="schedule")
+    summary["metadata"] = {
+        "execution_mode": "backfill",
+        "publication_eligible": True,
+    }
+    control = MagicMock()
+    control.get_run_summary.return_value = summary
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    with pytest.raises(RuntimeError, match="refused for a publishing run"):
+        fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+            airflow_run_id="manual__history",
+            dag_id="dag_backfill_fbref",
+            run_type="backfill",
+            enforce=False,
+        )
+
+
+@pytest.mark.unit
+def test_advisory_freshness_requires_execution_mode_evidence(monkeypatch):
+    """T6: ран без метаданных режима удерживает жёсткий гейт."""
+
+    control = MagicMock()
+    control.get_run_summary.return_value = _freshness_summary(
+        stale_kind="schedule"
+    )
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    with pytest.raises(RuntimeError, match="execution-mode evidence"):
+        fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+            airflow_run_id="manual__history",
+            dag_id="dag_backfill_fbref",
+            run_type="backfill",
+            enforce=False,
+        )
+
+
+@pytest.mark.unit
+def test_historical_pending_matches_are_never_a_gate(monkeypatch):
+    """T7: исторический долг — метрика кампании, а не провал суточного рана."""
+
+    summary = _freshness_summary()
+    summary["promotion_pending_match_count"] = 0
+    summary["historical_pending_match_count"] = 400
+    control = MagicMock()
+    control.get_run_summary.return_value = summary
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    result = fbref_pipeline_tasks.validate_fbref_current_scope_freshness(
+        airflow_run_id="manual__backfill",
+        dag_id="dag_backfill_fbref",
+        run_type="backfill",
+    )
+
+    assert result["status"] == "passed"
+    assert "historical_pending_match_count=400" in result["warnings"]
+
+
+@pytest.mark.unit
+def test_history_window_guard_refuses_a_run_that_would_reach_0600z():
+    """T8: проекция рана не имеет права дожить до суточного окна."""
+
+    from airflow.exceptions import AirflowFailException
+
+    with pytest.raises(AirflowFailException, match="daily ingest window"):
+        fbref_pipeline_tasks.guard_fbref_history_window(
+            max_batches=8,
+            shard_size=1,
+            now=datetime(2026, 8, 13, 5, 30, tzinfo=timezone.utc),
+        )
+
+
+@pytest.mark.unit
+def test_history_window_guard_passes_a_small_evening_run():
+    """T8: маленький вечерний ран проходит и объясняет свою проекцию."""
+
+    verdict = fbref_pipeline_tasks.guard_fbref_history_window(
+        max_batches=8,
+        shard_size=1,
+        now=datetime(2026, 8, 12, 22, 0, tzinfo=timezone.utc),
+    )
+
+    assert verdict["pages"] == 8
+    # 30 минут накладных + ceil(8 * 6.1 / 60) = 31 минута
+    assert verdict["projected_minutes"] == 31
+    assert verdict["deadline"] == "2026-08-13T05:15:00+00:00"
+
+
+@pytest.mark.unit
+def test_history_window_guard_margin_is_the_decisive_minute():
+    """T8: граница margin_minutes считается ровно, без люфта."""
+
+    from airflow.exceptions import AirflowFailException
+
+    kwargs = {
+        "max_batches": 1,
+        "shard_size": 1,
+        "domain_interval_seconds": 6.1,
+        "overhead_minutes": 0,
+        "margin_minutes": 45,
+    }
+    passing = fbref_pipeline_tasks.guard_fbref_history_window(
+        now=datetime(2026, 8, 13, 5, 14, tzinfo=timezone.utc), **kwargs
+    )
+    assert passing["projected_minutes"] == 1
+
+    with pytest.raises(AirflowFailException):
+        fbref_pipeline_tasks.guard_fbref_history_window(
+            now=datetime(2026, 8, 13, 5, 14, 1, tzinfo=timezone.utc), **kwargs
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("publish", "expected"),
+    [
+        (True, "export_publication_scope"),
+        (False, "release_publication_lock"),
+        ("false", "release_publication_lock"),
+    ],
+)
+def test_backfill_publication_branch_routes_by_publish_flag(publish, expected):
+    """T10: ветка публикации читает publish как булево, включая шаблон."""
+
+    assert (
+        fbref_pipeline_tasks.choose_fbref_backfill_publication_path(
+            publish=publish
+        )
+        == expected
+    )
