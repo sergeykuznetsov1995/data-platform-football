@@ -634,9 +634,13 @@ _REVIEWED_MALFORMED_LINEUPS: Mapping[
 # both sides at once.  That is one roster shape for the whole scope, not eleven
 # separate defects, and 110 of its 121 scheduled matches are still to come.
 # Keep a future valid XI, but discard only non-conventional roster shapes for
-# these exact scopes when the registry does not promise lineups.
+# these exact scopes when the registry does not promise lineups.  Costa Rica's
+# 2026 first division belongs here for the Colombian reason rather than the
+# Salvadoran one: it does publish a bench, but only one of its 11 non-empty
+# Summaries fields eleven starters on both sides, the rest run 8 to 10 against
+# a complete side, and 75 of its 90 scheduled matches are still to come.
 _REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES: frozenset[str] = frozenset(
-    {"3904:2026", "3943:2026", "8313:2026"}
+    {"3904:2026", "3943:2026", "4005:2026", "8313:2026"}
 )
 
 # Six 2012 CONCACAF U23 responses concatenate two roster snapshots and repeat
@@ -645,13 +649,29 @@ _REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES: frozenset[str] = frozenset(
 _REVIEWED_DUPLICATE_LINEUP_SCOPES: frozenset[str] = frozenset({"3911:2012"})
 
 # One Club Friendly Summary contains a one-player roster for only one side.
-# Bind the waiver to the complete canonical lineup source and event identity.
+# The digest records the reviewed bytes; the waiver matches on the identity
+# they carried — see _REVIEWED_ONE_SIDED_IDENTITIES.
 _REVIEWED_ONE_SIDED_LINEUPS: Mapping[str, tuple[str, int]] = MappingProxyType(
     {
         "54c233a36e49dee961703a659ef03de013d445659614f3e3450bad0e63ad9ced": (
             "19834:2026",
             401897918,
         )
+    }
+)
+
+# A one-sided roster has no starter counts to identify it by — the defect is
+# that one side is missing entirely — so the identity is the event itself.
+# That is no weaker than it looks: the branch is only reached when a side is
+# actually absent, so the waiver cannot excuse a healthy response.
+_REVIEWED_ONE_SIDED_IDENTITIES: frozenset[tuple[str, int]] = frozenset(
+    _REVIEWED_ONE_SIDED_LINEUPS.values()
+) | frozenset(
+    {
+        # 4005:2026 event 401876872, played 2026-08-10: Costa Rica's first
+        # division answered a full-time match with sixteen rows for one club
+        # and an empty roster list for the other.
+        ("4005:2026", 401876872),
     }
 )
 
@@ -1071,8 +1091,7 @@ def _lineup(
     if not any(roster_presence):
         return (), _valid_empty_or_fail(capability, "lineup")
     if not all(roster_presence):
-        reviewed_identity = _REVIEWED_ONE_SIDED_LINEUPS.get(lineup_source_sha256)
-        if reviewed_identity == (event.scope_id, event.event_id):
+        if (event.scope_id, event.event_id) in _REVIEWED_ONE_SIDED_IDENTITIES:
             return (), _valid_empty_or_fail(capability, "lineup")
         raise EspnParseError(
             "Summary lineup rosters must exist for both or neither team"

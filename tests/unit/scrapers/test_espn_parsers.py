@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import date, timezone
 import hashlib
 import json
@@ -1259,21 +1259,11 @@ def test_only_reviewed_one_sided_lineup_degrades_to_valid_empty(
     with pytest.raises(EspnParseError, match="both or neither"):
         parse_summary(raw, competition=competition, edition=edition, event=schedule[0])
 
-    lineup_source = {"rosters": payload["rosters"]}
-    lineup_source_sha256 = hashlib.sha256(
-        json.dumps(
-            lineup_source,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
     identity = (schedule[0].scope_id, schedule[0].event_id)
     monkeypatch.setattr(
         summary_parser_module,
-        "_REVIEWED_ONE_SIDED_LINEUPS",
-        {lineup_source_sha256: identity},
+        "_REVIEWED_ONE_SIDED_IDENTITIES",
+        frozenset({identity}),
     )
 
     result = parse_summary(
@@ -1282,14 +1272,26 @@ def test_only_reviewed_one_sided_lineup_degrades_to_valid_empty(
     assert result.lineup == ()
     assert result.lineup_state is EntityParseState.VALID_EMPTY
 
+    # A cosmetic roster edit on the side that does exist is the same missing
+    # side: the review is pinned to the event, not to bytes ESPN keeps
+    # rewriting.
     changed = deepcopy(payload)
     changed["rosters"][1]["roster"][0]["athlete"]["displayName"] = "Changed"
+    still_reviewed = parse_summary(
+        _raw(changed), competition=competition, edition=edition, event=schedule[0]
+    )
+    assert still_reviewed.lineup_state is EntityParseState.VALID_EMPTY
+
+    # Another event of the same scope is not covered by this review.
+    other_event = replace(schedule[0], event_id=schedule[0].event_id + 1)
+    other_payload = deepcopy(payload)
+    other_payload["header"]["id"] = str(other_event.event_id)
     with pytest.raises(EspnParseError, match="both or neither"):
         parse_summary(
-            _raw(changed),
+            _raw(other_payload),
             competition=competition,
             edition=edition,
-            event=schedule[0],
+            event=other_event,
         )
 
     proven_competition, proven_edition, proven_schedule = _schedule()
@@ -1834,7 +1836,7 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
         )
     }
     assert summary_parser_module._REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES == (
-        frozenset({"3904:2026", "3943:2026", "8313:2026"})
+        frozenset({"3904:2026", "3943:2026", "4005:2026", "8313:2026"})
     )
     assert summary_parser_module._REVIEWED_DUPLICATE_LINEUP_SCOPES == frozenset(
         {"3911:2012"}
@@ -1845,6 +1847,10 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
             401897918,
         )
     }
+    assert summary_parser_module._REVIEWED_ONE_SIDED_IDENTITIES == frozenset(
+        summary_parser_module._REVIEWED_ONE_SIDED_LINEUPS.values()
+    ) | {("4005:2026", 401876872)}
+    assert isinstance(summary_parser_module._REVIEWED_ONE_SIDED_IDENTITIES, frozenset)
     with pytest.raises(TypeError):
         summary_parser_module._REVIEWED_TRUNCATED_LINEUPS["0" * 64] = (  # type: ignore[index]
             "18481:2025",
