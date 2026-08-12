@@ -381,7 +381,14 @@ class TestDynamicDiscoveryDag:
         assert "python dags/scripts/run_fotmob_scraper.py" in task.bash_command
         assert "/tmp/fotmob_result_" in task.bash_command
         assert task._init_kwargs["pool"] == "fotmob_http_pool"
-        assert task._init_kwargs["execution_timeout"].total_seconds() == 8 * 3600
+        # Не магическое число: таймаут обязан совпадать с копией, от которой
+        # оркестратор считает достижимость потолков и окон полос.
+        from utils.fotmob_orchestration import CHILD_TIMEOUT_MINUTES
+
+        assert (
+            task._init_kwargs["execution_timeout"].total_seconds()
+            == CHILD_TIMEOUT_MINUTES * 60
+        )
         assert task._init_kwargs["retries"] == 0
 
     @pytest.mark.unit
