@@ -231,6 +231,44 @@ def test_memory_scope_attempts_are_durable_contract_bound_and_incremented():
     assert retried_same_run.attempt_count == 2
 
 
+def test_scope_attempt_retry_due_survives_an_attempt_longer_than_its_backoff():
+    """Скоуп, работавший дольше окна повтора, не приносит просроченный срок.
+
+    Бэкофф отсчитывается от начала работы над скоупом, а попытка фиксируется в
+    её конце: у скоупа, качавшего игроков часами, next_retry_at оказывался в
+    прошлом, и приёмка каталога краснила ран целиком.
+    """
+
+    repository = MemoryFotMobRepository()
+    started_at = datetime(2026, 8, 12, 20, 17)
+    finished_at = datetime(2026, 8, 12, 23, 4)
+    overdue = repository.record_scope_attempt(
+        run_id="run-1",
+        competition_id=489,
+        source_season_key="2026/2027",
+        plan_signature="fmplan1-one",
+        outcome="retryable",
+        reason="scope 489=2026/2027 incomplete",
+        last_attempt_at=finished_at,
+        next_retry_at=started_at + timedelta(hours=1),
+        attempt_identities=("run-1:489=2026/2027",),
+    )
+    assert overdue.next_retry_at > overdue.last_attempt_at
+
+    honest = repository.record_scope_attempt(
+        run_id="run-2",
+        competition_id=490,
+        source_season_key="2026/2027",
+        plan_signature="fmplan1-one",
+        outcome="deferred",
+        reason="run deadline deferred scope",
+        last_attempt_at=finished_at,
+        next_retry_at=finished_at + timedelta(minutes=15),
+        attempt_identities=("run-2:490=2026/2027",),
+    )
+    assert honest.next_retry_at == finished_at + timedelta(minutes=15)
+
+
 class ScopeAttemptTrino:
     """Trino, отдающий одну прошлую попытку и считающий обращения к журналу."""
 
