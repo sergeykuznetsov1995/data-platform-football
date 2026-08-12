@@ -35,64 +35,6 @@ from scrapers.espn.parser_common import source_day_bounds
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "espn"
 
-_COHORT_015_TRUNCATED_LINEUPS = {
-    "ada9a6ab03d317a5367b71f56ecf73e72ab4b732251aa9541d875d69d1e6d688": (
-        "750:2026",
-        401859282,
-        ((3384, 10), (7112, 11)),
-    ),
-    "7c7e868a01ef3a4ac078751aa3b4021462a54a5faf530e63e2bb3788c41e64ab": (
-        "750:2026",
-        401859292,
-        ((3384, 10), (7476, 11)),
-    ),
-    "76524e8804ef2730c5ee4db878cc0b38fec1c0cb9170d103e42b66b4eec88a13": (
-        "750:2026",
-        401859295,
-        ((3384, 10), (7116, 11)),
-    ),
-    "ac022e4da079afc7b3f2c240f9560dd45f8fb38f513022399a9ca559e89251c0": (
-        "750:2026",
-        401859322,
-        ((3384, 10), (3393, 11)),
-    ),
-    "67e7ca8453744a470fbad76de3b025fbf57a4252e779380abdb086d8647a4719": (
-        "750:2026",
-        401859339,
-        ((3384, 10), (7116, 11)),
-    ),
-    "7552ae5531ed4da4ac3d95bd0702c98fb4166f85da0ad5e85a8d41bb292279c3": (
-        "750:2026",
-        401859347,
-        ((3384, 10), (22167, 11)),
-    ),
-    "3f993e1d6259613cd3b0195c2b9341e2b28e9ebe0da9dabcecf98ebad1f35910": (
-        "750:2026",
-        401859367,
-        ((3384, 10), (7476, 11)),
-    ),
-    "d583d18bfe9f4aa323941c73632973a5e90d918a15d4146bfbe079dcaab9ac93": (
-        "750:2026",
-        401859392,
-        ((3384, 10), (3385, 11)),
-    ),
-    "0b5a89362ccb342baeeb963d59b81494d695b24dc2ec84d66ab8f6e096a1e97d": (
-        "750:2026",
-        401859403,
-        ((3384, 10), (7115, 11)),
-    ),
-    "fef7edf4a722fdf39b4a99a0492c81a70528225cfd74393c5fd6d46db3c60fe9": (
-        "750:2026",
-        401859429,
-        ((3384, 10), (131701, 11)),
-    ),
-    "200dcbfdbeff2c7f7e083b49d7cdf1092f227a60b3188451863f67ff890537fe": (
-        "750:2026",
-        401859435,
-        ((3384, 10), (7111, 11)),
-    ),
-}
-
 _COHORT_016_TRUNCATED_LINEUPS = {
     "fe48a61e4e03c52c8a31ead6de1c6ff5e644acd2e732a4d57066254f84ec768b": (
         "787:2023",
@@ -1660,7 +1602,6 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
             401874090,
             ((4817, 10), (5501, 11)),
         ),
-        **_COHORT_015_TRUNCATED_LINEUPS,
         **_COHORT_016_TRUNCATED_LINEUPS,
         **_COHORT_017_TRUNCATED_LINEUPS,
     }
@@ -1839,6 +1780,10 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
     assert summary_parser_module._REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES == (
         frozenset({"3904:2026", "3943:2026", "4005:2026", "8313:2026"})
     )
+    assert summary_parser_module._REVIEWED_SHORT_ROSTER_FIXTURES == frozenset(
+        {("750:2026", 3384, 10)}
+    )
+    assert isinstance(summary_parser_module._REVIEWED_SHORT_ROSTER_FIXTURES, frozenset)
     assert summary_parser_module._REVIEWED_DUPLICATE_LINEUP_SCOPES == frozenset(
         {"3911:2012"}
     )
@@ -1892,9 +1837,7 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
         *(
             ("truncated", lineup_sha256, identity)
             for lineup_sha256, identity in (
-                _COHORT_015_TRUNCATED_LINEUPS
-                | _COHORT_016_TRUNCATED_LINEUPS
-                | _COHORT_017_TRUNCATED_LINEUPS
+                _COHORT_016_TRUNCATED_LINEUPS | _COHORT_017_TRUNCATED_LINEUPS
             ).items()
         ),
         *(
@@ -2399,6 +2342,139 @@ def test_only_reviewed_truncated_conventional_lineup_degrades_to_valid_empty(
             competition=proven_competition,
             edition=proven_edition,
             event=proven_schedule[0],
+        )
+
+
+@pytest.mark.unit
+def test_reviewed_short_roster_fixture_covers_every_matchday_of_that_club(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = ("750:2026", 3384, 10)
+    matchdays = (
+        ("750:2026", 401877180, ((3384, 10), (22167, 11))),
+        ("750:2026", 401859429, ((3384, 10), (131701, 11))),
+    )
+
+    def case(identity, *, lineup=CapabilityState.UNKNOWN):
+        competition, edition, event, payload = _reviewed_lineup_summary_case(
+            identity, contradictory=False, lineup=lineup
+        )
+        return competition, edition, event, _raw(payload)
+
+    # The per-event waivers must not be the reason any of this passes.
+    monkeypatch.setattr(
+        summary_parser_module, "_REVIEWED_TRUNCATED_IDENTITIES", frozenset()
+    )
+
+    for identity in matchdays:
+        competition, edition, event, raw = case(identity)
+        monkeypatch.setattr(
+            summary_parser_module, "_REVIEWED_SHORT_ROSTER_FIXTURES", frozenset()
+        )
+        with pytest.raises(EspnParseError, match="11 starters"):
+            parse_summary(raw, competition=competition, edition=edition, event=event)
+
+        monkeypatch.setattr(
+            summary_parser_module,
+            "_REVIEWED_SHORT_ROSTER_FIXTURES",
+            frozenset({fixture}),
+        )
+        result = parse_summary(
+            raw, competition=competition, edition=edition, event=event
+        )
+        assert result.lineup == ()
+        assert result.lineup_state is EntityParseState.VALID_EMPTY
+        assert result.matchsheet_state is EntityParseState.CAPTURED
+
+    # A complete eleven from the same club in the same scope stays published.
+    competition, edition, event, raw = case(
+        ("750:2026", 401873665, ((3384, 11), (7109, 11)))
+    )
+    healthy = parse_summary(raw, competition=competition, edition=edition, event=event)
+    assert healthy.lineup_state is EntityParseState.CAPTURED
+    assert len(healthy.lineup) == 26
+
+    competition, edition, event, raw = case(matchdays[0])
+    # The waiver has to name this scope, this club and this exact magnitude.
+    for wrong_fixture in (
+        ("750:2026", 22167, 10),
+        ("750:2026", 3384, 9),
+        ("other:2026", 3384, 10),
+    ):
+        monkeypatch.setattr(
+            summary_parser_module,
+            "_REVIEWED_SHORT_ROSTER_FIXTURES",
+            frozenset({wrong_fixture}),
+        )
+        with pytest.raises(EspnParseError, match="11 starters"):
+            parse_summary(raw, competition=competition, edition=edition, event=event)
+
+    # Rows the response never carried are the reviewed defect; a side with too
+    # many starters contradicts itself and is nobody's reviewed shape.
+    over_competition, over_edition, over_event, over_raw = case(
+        ("750:2026", 401877180, ((3384, 12), (22167, 11)))
+    )
+    monkeypatch.setattr(
+        summary_parser_module,
+        "_REVIEWED_SHORT_ROSTER_FIXTURES",
+        frozenset({("750:2026", 3384, 12)}),
+    )
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            over_raw,
+            competition=over_competition,
+            edition=over_edition,
+            event=over_event,
+        )
+
+    # Both sides short is a different defect from the reviewed one.
+    both_competition, both_edition, both_event, both_raw = case(
+        ("750:2026", 401877180, ((3384, 10), (22167, 10)))
+    )
+    monkeypatch.setattr(
+        summary_parser_module,
+        "_REVIEWED_SHORT_ROSTER_FIXTURES",
+        frozenset({fixture}),
+    )
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            both_raw,
+            competition=both_competition,
+            edition=both_edition,
+            event=both_event,
+        )
+
+    # A declared format the reviewed matches never carried must not match.
+    fmt_competition, fmt_edition, fmt_event, fmt_payload = (
+        _reviewed_lineup_summary_case(
+            matchdays[0], contradictory=False, lineup=CapabilityState.UNKNOWN
+        )
+    )
+    fmt_payload["format"] = {"startersPerTeam": 5}
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            _raw(fmt_payload),
+            competition=fmt_competition,
+            edition=fmt_edition,
+            event=fmt_event,
+        )
+
+    # Standing contract of the helper itself: a complete eleven on both sides is
+    # never a short fixture, whatever the waiver names.
+    assert not summary_parser_module._short_sides_are_reviewed_fixtures(
+        "750:2026", {3384: 11, 22167: 11}
+    )
+
+    # A registry that promises lineups is never waived by a fixture review.
+    proven_competition, proven_edition, proven_event, proven_raw = case(
+        matchdays[0], lineup=CapabilityState.PROVEN
+    )
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            proven_raw,
+            competition=proven_competition,
+            edition=proven_edition,
+            event=proven_event,
         )
 
 

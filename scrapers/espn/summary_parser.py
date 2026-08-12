@@ -314,61 +314,6 @@ _REVIEWED_TRUNCATED_LINEUPS: Mapping[
             401874090,
             ((4817, 10), (5501, 11)),
         ),
-        "ada9a6ab03d317a5367b71f56ecf73e72ab4b732251aa9541d875d69d1e6d688": (
-            "750:2026",
-            401859282,
-            ((3384, 10), (7112, 11)),
-        ),
-        "7c7e868a01ef3a4ac078751aa3b4021462a54a5faf530e63e2bb3788c41e64ab": (
-            "750:2026",
-            401859292,
-            ((3384, 10), (7476, 11)),
-        ),
-        "76524e8804ef2730c5ee4db878cc0b38fec1c0cb9170d103e42b66b4eec88a13": (
-            "750:2026",
-            401859295,
-            ((3384, 10), (7116, 11)),
-        ),
-        "ac022e4da079afc7b3f2c240f9560dd45f8fb38f513022399a9ca559e89251c0": (
-            "750:2026",
-            401859322,
-            ((3384, 10), (3393, 11)),
-        ),
-        "67e7ca8453744a470fbad76de3b025fbf57a4252e779380abdb086d8647a4719": (
-            "750:2026",
-            401859339,
-            ((3384, 10), (7116, 11)),
-        ),
-        "7552ae5531ed4da4ac3d95bd0702c98fb4166f85da0ad5e85a8d41bb292279c3": (
-            "750:2026",
-            401859347,
-            ((3384, 10), (22167, 11)),
-        ),
-        "3f993e1d6259613cd3b0195c2b9341e2b28e9ebe0da9dabcecf98ebad1f35910": (
-            "750:2026",
-            401859367,
-            ((3384, 10), (7476, 11)),
-        ),
-        "d583d18bfe9f4aa323941c73632973a5e90d918a15d4146bfbe079dcaab9ac93": (
-            "750:2026",
-            401859392,
-            ((3384, 10), (3385, 11)),
-        ),
-        "0b5a89362ccb342baeeb963d59b81494d695b24dc2ec84d66ab8f6e096a1e97d": (
-            "750:2026",
-            401859403,
-            ((3384, 10), (7115, 11)),
-        ),
-        "fef7edf4a722fdf39b4a99a0492c81a70528225cfd74393c5fd6d46db3c60fe9": (
-            "750:2026",
-            401859429,
-            ((3384, 10), (131701, 11)),
-        ),
-        "200dcbfdbeff2c7f7e083b49d7cdf1092f227a60b3188451863f67ff890537fe": (
-            "750:2026",
-            401859435,
-            ((3384, 10), (7111, 11)),
-        ),
         "fe48a61e4e03c52c8a31ead6de1c6ff5e644acd2e732a4d57066254f84ec768b": (
             "787:2023",
             684600,
@@ -661,6 +606,43 @@ _REVIEWED_MALFORMED_EVENTS: frozenset[tuple[str, int]] = frozenset(
 _REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES: frozenset[str] = frozenset(
     {"3904:2026", "3943:2026", "4005:2026", "8313:2026"}
 )
+
+# A club the source publishes one starter short every other matchday is one
+# fixture shape, not a fresh waiver per match.  ESPN's J1 League 2026 feed drops
+# exactly one starter row from FC Tokyo (3384): 12 of the club's 21 reviewed
+# Summaries carry ten starters against a complete eleven, the missing
+# formationPlace wanders between matchdays (3, 4 or 8), the bench stays at nine
+# rows, no row is duplicated and every one of them declares the ordinary two
+# halves.  The league itself is healthy — 198 of its 210 Summaries field eleven
+# a side — so this names the fixture, not the scope, and 37 of the club's 58
+# scheduled matches are still to be played.  The reviewed magnitude is part of
+# the waiver: one missing row is a row the response never carried, while any
+# other count is a defect nobody has looked at yet.
+_REVIEWED_SHORT_ROSTER_FIXTURES: frozenset[tuple[str, int, int]] = frozenset(
+    {("750:2026", 3384, 10)}
+)
+
+
+def _short_sides_are_reviewed_fixtures(
+    scope_id: str, starter_counts: Mapping[int, int]
+) -> bool:
+    """Every side that is not a complete eleven is a reviewed short fixture.
+
+    The opposing side has to field its eleven: a response where both sides come
+    up short is a different defect from the reviewed one, and so is a side with
+    too many starters — that one contradicts itself rather than losing rows.
+    """
+
+    deviating = [
+        (team_id, count) for team_id, count in starter_counts.items() if count != 11
+    ]
+    if not deviating:
+        return False
+    return all(
+        count < 11 and (scope_id, team_id, count) in _REVIEWED_SHORT_ROSTER_FIXTURES
+        for team_id, count in deviating
+    )
+
 
 # Six 2012 CONCACAF U23 responses concatenate two roster snapshots and repeat
 # athletes with conflicting starter/bench flags.  Never choose or merge a
@@ -1400,6 +1382,12 @@ def _lineup(
                 capability is not CapabilityState.PROVEN
                 and small_sided_size is None
                 and observed_identity in _REVIEWED_TRUNCATED_IDENTITIES
+            ):
+                return (), _valid_empty_or_fail(capability, "lineup")
+            if (
+                capability is not CapabilityState.PROVEN
+                and small_sided_size is None
+                and _short_sides_are_reviewed_fixtures(event.scope_id, starter_counts)
             ):
                 return (), _valid_empty_or_fail(capability, "lineup")
             raise EspnParseError(
