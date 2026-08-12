@@ -1796,7 +1796,11 @@ def test_record_failure_does_not_scope_complete_generic_transport_absence():
     )
     assert result.not_available == 0
     assert "intentional_not_available" not in result.metadata
-    assert result.terminal
+    # Не tombstone, но и не терминальный отказ: цель уходит в повтор, а не
+    # хоронит скоуп и цвет рана.
+    assert result.retryable
+    assert not result.terminal
+    assert result.status == "retryable"
     assert not result.ok
 
 
