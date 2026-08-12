@@ -1816,6 +1816,8 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
         ("3929:2026", 401897987, ((884, 11), (18809, 10))),
         ("3929:2026", 401898021, ((7242, 11), (17939, 8))),
         ("3929:2026", 401898713, ((21583, 9), (132449, 3))),
+        ("680:2026", 401905176, ((2684, 11), (9999, 10))),
+        ("680:2026", 401905201, ((8416, 11), (9902, 10))),
     }
     assert summary_parser_module._REVIEWED_CONTRADICTORY_IDENTITIES == frozenset(
         summary_parser_module._REVIEWED_CONTRADICTORY_LINEUPS.values()

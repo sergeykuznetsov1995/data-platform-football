@@ -408,6 +408,13 @@ _REVIEWED_TRUNCATED_IDENTITIES: frozenset[
         ("3929:2026", 401897987, ((884, 11), (18809, 10))),
         ("3929:2026", 401898021, ((7242, 11), (17939, 8))),
         ("3929:2026", 401898713, ((21583, 9), (132449, 3))),
+        # Uruguay 2026, two full-time matches published with ten starters on one
+        # side against a complete eleven, benches of nineteen to twenty-one rows
+        # and the ordinary two halves declared.  The league itself is healthy —
+        # eleven of its 25 non-empty Summaries field a complete eleven on both
+        # sides — so these are two events, not a scope-wide roster shape.
+        ("680:2026", 401905176, ((2684, 11), (9999, 10))),
+        ("680:2026", 401905201, ((8416, 11), (9902, 10))),
     }
 )
 
