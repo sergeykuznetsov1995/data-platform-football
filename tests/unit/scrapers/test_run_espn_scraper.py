@@ -4155,3 +4155,361 @@ def test_raw_manifest_rejects_boolean_schema_version():
 
     with pytest.raises(RunnerConfigurationError, match="unsupported raw manifest"):
         runner._validate_raw_manifest(manifest)
+
+
+def _scheduled_prior(
+    competition: Competition,
+    edition: Edition,
+    *,
+    event_ids: tuple[int, ...],
+    event_date: str = "2020-11-01T18:45Z",
+) -> ScopeGeneration:
+    """A prior head of fixtures only: non-terminal, so no Summary content."""
+
+    scope = _scope(competition, edition)
+    schedule = parse_scoreboards(
+        _scoreboard(
+            competition,
+            edition,
+            event_ids=event_ids,
+            event_date=event_date,
+            status="STATUS_SCHEDULED",
+        ),
+        competition=competition,
+        edition=edition,
+        query_start=edition.start_date,
+        query_end=edition.end_date,
+    )
+    ledger = (
+        RawLedgerRecord(
+            request_id="scoreboard:prior",
+            endpoint="scoreboard",
+            event_id=None,
+            disposition=DispositionState.CAPTURED,
+            raw_uri="s3://raw/prior-scoreboard.json.gz",
+            raw_sha256=hashlib.sha256(b"prior-scoreboard").hexdigest(),
+            fetched_at=NOW - timedelta(days=1),
+            direct_bytes=100,
+            proxy_bytes=0,
+            event_ids=tuple(row.event_id for row in schedule),
+        ),
+    )
+    dispositions = tuple(
+        RequestDisposition(
+            endpoint=entity,
+            state=DispositionState.NOT_APPLICABLE,
+            detail="nonfinal schedule event does not require Summary",
+            event_id=row.event_id,
+        )
+        for row in schedule
+        for entity in ("lineup", "matchsheet")
+    )
+    return ScopeGeneration(
+        plan=scope,
+        run_id="prior-run",
+        generation_id="prior-generation",
+        registry_snapshot_uri="s3://registry/prior.json",
+        registry_signature="a" * 64,
+        plan_signature="b" * 64,
+        parser_version=PARSER_VERSION,
+        runtime_version=RUNTIME_VERSION,
+        ingested_at=NOW - timedelta(days=1),
+        batch_id="prior-batch",
+        schedule=schedule,
+        lineup=(),
+        matchsheet=(),
+        planned_request_ids=("scoreboard:prior",),
+        raw_ledger=ledger,
+        dispositions=dispositions,
+    )
+
+
+def _page(competition, edition, *, query_start: date, query_end: date):
+    from scrapers.espn import runner
+
+    dates = query_start.strftime("%Y%m%d") + "-" + query_end.strftime("%Y%m%d")
+    return runner.ScoreboardRequest(
+        scope_id=competition.scope_id(edition),
+        url=f"https://site.api.espn.com/x/{competition.slug}/scoreboard",
+        params={"dates": dates, "limit": 1000},
+        query_start=query_start,
+        query_end=query_end,
+        request_id=f"scoreboard:{dates}",
+    )
+
+
+def _withdrawal_case(
+    *,
+    prior_ids: tuple[int, ...],
+    returned_ids: tuple[int, ...],
+    missing_ids: tuple[int, ...],
+):
+    """Prior fixtures on one day against one covering page that lost some."""
+
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    prior = _scheduled_prior(competition, edition, event_ids=prior_ids)
+    body = _scoreboard(
+        competition,
+        edition,
+        event_ids=returned_ids,
+        event_date="2020-11-01T18:45Z",
+        status="STATUS_SCHEDULED",
+    )
+    page = _page(
+        competition,
+        edition,
+        query_start=date(2020, 10, 15),
+        query_end=date(2020, 11, 14),
+    )
+    return {
+        "known_events": tuple(
+            runner.KnownNonterminalEvent(
+                event_id=event_id, event_date=date(2020, 11, 1)
+            )
+            for event_id in missing_ids
+        ),
+        "pages": ((page, body),),
+        "fetched_by_event": {
+            row.event_id: row for row in prior.schedule if row.event_id in returned_ids
+        },
+        "prior": prior,
+    }
+
+
+@pytest.mark.unit
+def test_withdrawn_known_event_is_proven_offline_and_receipted():
+    from scrapers.espn import runner
+
+    case = _withdrawal_case(
+        prior_ids=tuple(range(401_000_001, 401_000_013)),
+        returned_ids=tuple(range(401_000_002, 401_000_013)),
+        missing_ids=(401_000_001,),
+    )
+
+    dispositions = runner._qualify_missing_known_events(**case)
+
+    assert len(dispositions) == 1
+    assert dispositions[0].endpoint == "schedule"
+    assert dispositions[0].state is DispositionState.SKIPPED
+    assert dispositions[0].event_id == 401_000_001
+    proof = json.loads(dispositions[0].detail)
+    assert proof["kind"] == "espn-withdrawn-known-event-v1"
+    assert proof["prior_events_in_windows"] == 11
+    assert proof["prior_events_returned"] == 11
+    assert [window["raw_event_count"] for window in proof["covering_windows"]] == [11]
+
+
+@pytest.mark.unit
+def test_missing_known_event_stays_fatal_when_the_page_did_return_it():
+    from scrapers.espn import runner
+
+    case = _withdrawal_case(
+        prior_ids=tuple(range(401_000_001, 401_000_013)),
+        returned_ids=tuple(range(401_000_001, 401_000_013)),
+        missing_ids=(401_000_001,),
+    )
+    # The source answered with the event; only the parser dropped the row.
+    case["fetched_by_event"].pop(401_000_001)
+
+    with pytest.raises(ScopeIncompleteError, match="known non-terminal events absent"):
+        runner._qualify_missing_known_events(**case)
+
+
+@pytest.mark.unit
+def test_missing_known_event_stays_fatal_when_the_covering_page_collapsed():
+    from scrapers.espn import runner
+
+    case = _withdrawal_case(
+        prior_ids=tuple(range(401_000_001, 401_000_013)),
+        returned_ids=(401_000_002, 401_000_003),
+        missing_ids=(401_000_001,),
+    )
+
+    with pytest.raises(ScopeIncompleteError, match="known non-terminal events absent"):
+        runner._qualify_missing_known_events(**case)
+
+
+@pytest.mark.unit
+def test_missing_known_events_stay_fatal_above_the_withdrawal_cap():
+    from scrapers.espn import runner
+
+    first_missing = 401_000_001
+    missing_ids = tuple(range(first_missing, first_missing + 9))
+    case = _withdrawal_case(
+        prior_ids=tuple(range(401_000_001, 401_000_031)),
+        returned_ids=tuple(range(first_missing + 9, 401_000_031)),
+        missing_ids=missing_ids,
+    )
+
+    with pytest.raises(ScopeIncompleteError, match="known non-terminal events absent"):
+        runner._qualify_missing_known_events(**case)
+
+
+@pytest.mark.unit
+def test_missing_known_event_stays_fatal_when_prior_holds_summary_content():
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    event_ids = tuple(range(401_000_001, 401_000_013))
+    prior = _prior_generation(competition, edition, event_ids=event_ids)
+    # Everything else proves out: the page covers the day and still returns
+    # every other event we knew. Only the played event's own content differs.
+    body = _scoreboard(competition, edition, event_ids=event_ids[1:])
+    page = _page(
+        competition,
+        edition,
+        query_start=date(2020, 9, 5),
+        query_end=date(2020, 10, 5),
+    )
+
+    with pytest.raises(ScopeIncompleteError, match="known non-terminal events absent"):
+        runner._qualify_missing_known_events(
+            known_events=(
+                runner.KnownNonterminalEvent(
+                    event_id=event_ids[0], event_date=date(2020, 9, 19)
+                ),
+            ),
+            pages=((page, body),),
+            fetched_by_event={
+                row.event_id: row
+                for row in prior.schedule
+                if row.event_id != event_ids[0]
+            },
+            prior=prior,
+        )
+
+
+@pytest.mark.unit
+def test_withdrawn_known_event_publishes_receipt_and_retires_the_row(tmp_path):
+    competition, edition = _competition(
+        espn_id=5672,
+        slug="aff.championship",
+        source_year=2026,
+        start=date(2026, 8, 1),
+        end=date(2026, 9, 30),
+    )
+    event_ids = tuple(range(401_854_551, 401_854_563))
+    withdrawn = event_ids[0]
+    kickoff = "2026-08-15T18:00Z"
+    scope_id = competition.scope_id(edition)
+    prior = _scheduled_prior(
+        competition, edition, event_ids=event_ids, event_date=kickoff
+    )
+
+    def scoreboard(params):
+        start, _, end = params["dates"].partition("-")
+        window_start = datetime.strptime(start, "%Y%m%d").date()
+        window_end = datetime.strptime(end or start, "%Y%m%d").date()
+        inside = window_start <= date(2026, 8, 15) <= window_end
+        return _scoreboard(
+            competition,
+            edition,
+            event_ids=event_ids[1:] if inside else (),
+            event_date=kickoff,
+            status="STATUS_SCHEDULED",
+        )
+
+    options, _ = _plan(
+        tmp_path,
+        "backfill",
+        ((competition, edition),),
+        as_of=date(2026, 8, 12),
+        initial_capture=False,
+        priors={scope_id: prior},
+        known_nonterminal_events={
+            scope_id: [
+                {"event_id": event_id, "event_date": "2026-08-15"}
+                for event_id in event_ids
+            ]
+        },
+        scoreboard_max_range_days=31,
+    )
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(raw_store, {competition.slug: scoreboard})
+    repository = FakeRepository()
+
+    result = execute(
+        options, repository=repository, raw_store=raw_store, http_client=client
+    )
+
+    assert result.exit_code == 0
+    generation = repository.generations[0]
+    assert {row.event_id for row in generation.schedule} == set(event_ids[1:])
+    receipts = [
+        item for item in generation.dispositions if item.endpoint == "schedule"
+    ]
+    assert [(item.event_id, item.state) for item in receipts] == [
+        (withdrawn, DispositionState.SKIPPED)
+    ]
+    proof = json.loads(receipts[0].detail)
+    assert proof["kind"] == "espn-withdrawn-known-event-v1"
+    assert proof["event_id"] == withdrawn
+    assert proof["prior_events_in_windows"] == proof["prior_events_returned"] == 11
+    assert all(call[1] is not EndpointType.SUMMARY for call in client.calls)
+
+
+@pytest.mark.unit
+def test_withdrawn_known_event_retires_the_row_in_an_incremental_run(tmp_path):
+    competition, edition = _competition()
+    event_ids = tuple(range(401_000_001, 401_000_013))
+    withdrawn = event_ids[0]
+    kickoff = "2020-11-01T18:45Z"
+    scope_id = competition.scope_id(edition)
+    prior = _scheduled_prior(
+        competition, edition, event_ids=event_ids, event_date=kickoff
+    )
+    as_of = date(2020, 9, 20)
+    while is_full_reconciliation_day(scope_id, as_of):
+        as_of += timedelta(days=1)
+
+    def scoreboard(params):
+        start, _, end = params["dates"].partition("-")
+        window_start = datetime.strptime(start, "%Y%m%d").date()
+        window_end = datetime.strptime(end or start, "%Y%m%d").date()
+        inside = window_start <= date(2020, 11, 1) <= window_end
+        return _scoreboard(
+            competition,
+            edition,
+            event_ids=event_ids[1:] if inside else (),
+            event_date=kickoff,
+            status="STATUS_SCHEDULED",
+        )
+
+    options, _ = _plan(
+        tmp_path,
+        "daily",
+        ((competition, edition),),
+        as_of=as_of,
+        initial_capture=False,
+        priors={scope_id: prior},
+        known_nonterminal_events={
+            scope_id: [
+                {"event_id": event_id, "event_date": "2020-11-01"}
+                for event_id in event_ids
+            ]
+        },
+    )
+    raw_store = EspnRawStore.from_uri(options.raw_store_uri)
+    client = FakeHttpClient(raw_store, {competition.slug: scoreboard})
+    repository = FakeRepository()
+
+    result = execute(
+        options, repository=repository, raw_store=raw_store, http_client=client
+    )
+
+    assert result.exit_code == 0
+    generation = repository.generations[0]
+    assert {row.event_id for row in generation.schedule} == set(event_ids[1:])
+    assert withdrawn not in {
+        event_id
+        for item in generation.raw_ledger
+        if item.endpoint == "scoreboard"
+        for event_id in item.event_ids
+    }
+    assert [
+        (item.event_id, item.state)
+        for item in generation.dispositions
+        if item.endpoint == "schedule"
+    ] == [(withdrawn, DispositionState.SKIPPED)]

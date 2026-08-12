@@ -1214,7 +1214,9 @@ def validated_empty_schedule_proof(generation: ScopeGeneration) -> dict[str, Any
     if not isinstance(generation, ScopeGeneration) or generation.schedule:
         raise ValueError("valid_empty proof requires an empty scope generation")
     dispositions = tuple(
-        item for item in generation.dispositions if item.endpoint == "schedule"
+        item
+        for item in generation.dispositions
+        if item.endpoint == "schedule" and item.event_id is None
     )
     if len(dispositions) != 1:
         raise ValueError("empty schedule requires one exact valid_empty proof")
@@ -1303,7 +1305,9 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
             )
         )
         schedule_dispositions = tuple(
-            item for item in generation.dispositions if item.endpoint == "schedule"
+            item
+            for item in generation.dispositions
+            if item.endpoint == "schedule" and item.event_id is None
         )
         entity_dispositions = tuple(
             item for item in generation.dispositions if item.endpoint != "schedule"
@@ -1434,12 +1438,24 @@ def validate_scope_generation(generation: ScopeGeneration) -> ScopeQualityReport
                 failures.append(f"{entity} two-side completeness failed for {event_id}")
 
     disposition_index: dict[tuple[str, int], RequestDisposition] = {}
+    withdrawn_event_ids: set[int] = set()
     for item in generation.dispositions:
         if item.endpoint == "schedule" and item.event_id is None:
             if generation.schedule:
                 failures.append(
                     "schedule disposition is only valid for an empty schedule"
                 )
+            continue
+        if item.endpoint == "schedule":
+            # A withdrawal receipt: the row it retires must not also be here,
+            # and the event must carry no Summary evidence of its own.
+            if item.state is not DispositionState.SKIPPED:
+                failures.append("withdrawn schedule event must be skipped")
+            if item.event_id in schedule_by_event:
+                failures.append("withdrawn schedule event is still in the schedule")
+            if item.event_id in withdrawn_event_ids:
+                failures.append("withdrawn schedule event is duplicated")
+            withdrawn_event_ids.add(item.event_id)
             continue
         if item.endpoint not in {"lineup", "matchsheet"} or item.event_id is None:
             failures.append("entity disposition has invalid endpoint or event")

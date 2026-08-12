@@ -1338,6 +1338,20 @@ def test_native_summary_planner_rejects_exactly_saturated_scoreboard_page(
         )
 
 
+def test_airflow_summary_planner_delegates_the_missing_known_event_verdict():
+    from dags.utils import espn_native_tasks
+
+    source = inspect.getsource(espn_native_tasks.plan_summary_batch_wave)
+
+    # One verdict, one implementation: a planner that judged this on its own
+    # would plan work the publishing runner then refuses, or the reverse.
+    assert "runner._qualify_missing_known_events(" in source
+    assert "known non-terminal events absent" not in source
+    assert source.index("runner._load_prior(") < source.index(
+        "runner._qualify_missing_known_events("
+    )
+
+
 def test_native_summary_planner_keeps_missing_known_event_guard(monkeypatch):
     from dags.utils import espn_native_tasks
 

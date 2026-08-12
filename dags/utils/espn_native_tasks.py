@@ -2639,6 +2639,7 @@ def plan_summary_batch_wave(
             )
         }
         parsed_pages = []
+        raw_pages = []
         raw_store = EspnRawStore.from_uri(descriptor["raw_store_uri"])
         for record in checkpoint["requests"]:
             request = request_plan.get(record["request_id"])
@@ -2652,21 +2653,24 @@ def plan_summary_batch_wave(
                 edition=edition,
             )
             parsed_pages.append((request, rows))
+            raw_pages.append((request, body))
         fetched, _winner = runner._merge_scoreboard_pages(parsed_pages)
-        missing_known = sorted(
-            item.event_id
-            for item in loaded.bindings[scope.scope_id].known_nonterminal_events
-            if item.event_id not in fetched
-        )
-        if missing_known:
-            raise OperationsError(
-                f"known non-terminal events absent from scoreboard: {missing_known}"
-            )
         prior = (
             runner._load_prior(typed_binding.prior, scope)
             if typed_binding.prior is not None
             else None
         )
+        # Same verdict as the runner, from the same code: a planner that judged
+        # this on its own would let one path plan work the other path refuses.
+        try:
+            runner._qualify_missing_known_events(
+                known_events=typed_binding.known_nonterminal_events,
+                pages=tuple(raw_pages),
+                fetched_by_event=fetched,
+                prior=prior,
+            )
+        except runner.ScopeIncompleteError as exc:
+            raise OperationsError(str(exc)) from exc
         full = runner._full_strategy(
             scope,
             typed_binding,

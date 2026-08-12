@@ -90,6 +90,14 @@ SCOPE_SNAPSHOT_KIND = "espn-scope-generation-snapshot-v1"
 ARTIFACT_POINTER_KIND = "espn-artifact-pointer-v1"
 SUMMARY_CHECKPOINT_SIZE = 50
 SCOREBOARD_LIMIT = 1000
+# A source that withdraws a handful of fixtures is volatile; one that withdraws
+# more than this in a single scope is re-indexing its calendar, and that is a
+# question for a human, not for an automatic proof.
+MAX_WITHDRAWN_KNOWN_EVENTS = 8
+# The share of the events we already knew inside the covering windows that the
+# source must still return before a withdrawal may be believed.
+WITHDRAWN_RETENTION_NUMERATOR = 9
+WITHDRAWN_RETENTION_DENOMINATOR = 10
 SCOREBOARD_MAX_RANGE_DAYS = 31
 LEGACY_SCOREBOARD_MAX_RANGE_DAYS = 365
 SCOREBOARD_RANGE_DAYS = frozenset(
@@ -2934,6 +2942,7 @@ def _merge_scoreboard_ledger(
     fetched_event_ids: set[int],
     records: Sequence[Mapping[str, Any]],
     winner: Mapping[int, str],
+    withdrawn_event_ids: frozenset[int] = frozenset(),
 ) -> list[RawLedgerRecord]:
     output: list[RawLedgerRecord] = []
     if prior is not None and not full:
@@ -2945,6 +2954,7 @@ def _merge_scoreboard_ledger(
                 event_id
                 for event_id in item.event_ids
                 if event_id not in fetched_event_ids
+                and event_id not in withdrawn_event_ids
             )
             if not retained:
                 continue
@@ -3148,6 +3158,143 @@ def _qualify_empty_schedule(
     )
 
 
+def _raw_scoreboard_event_ids(body: bytes) -> set[int]:
+    """Event IDs the source literally returned, before any parser judgement."""
+
+    document = decode_object(body, "scoreboard raw response")
+    ids: set[int] = set()
+    for item in required_list(document.get("events"), "scoreboard raw response.events"):
+        if not isinstance(item, Mapping):
+            continue
+        raw_id = item.get("id")
+        if isinstance(raw_id, bool) or not isinstance(raw_id, (int, str)):
+            continue
+        try:
+            ids.add(int(raw_id))
+        except ValueError:
+            continue
+    return ids
+
+
+def _qualify_missing_known_events(
+    *,
+    known_events: Sequence[KnownNonterminalEvent],
+    pages: Sequence[tuple[ScoreboardRequest, bytes]],
+    fetched_by_event: Mapping[int, ScheduleRow],
+    prior: ScopeGeneration | None,
+) -> tuple[RequestDisposition, ...]:
+    """Prove a known non-terminal event was withdrawn by the source, or fail.
+
+    The guard exists because a known event vanishing is the only signal that a
+    capture was truncated or that a window never covered the source day.  It
+    stays fatal for exactly those cases: the proof below is offline and only
+    passes when we did query the day, the source answered that window with the
+    events we already knew, the raw bytes really do not carry the event, and
+    the prior generation holds no Summary content for it.
+    """
+
+    missing = tuple(
+        event
+        for event in sorted(known_events, key=lambda item: item.event_id)
+        if event.event_id not in fetched_by_event
+    )
+    if not missing:
+        return ()
+    fatal = (
+        "known non-terminal events absent from scoreboard: "
+        f"{[event.event_id for event in missing]}"
+    )
+    if prior is None or len(missing) > MAX_WITHDRAWN_KNOWN_EVENTS:
+        raise ScopeIncompleteError(fatal)
+    raw_pages = tuple(
+        (request, _raw_scoreboard_event_ids(body)) for request, body in pages
+    )
+    returned_anywhere: set[int] = set()
+    for _request, ids in raw_pages:
+        returned_anywhere |= ids
+    missing_ids = {event.event_id for event in missing}
+    prior_rows = {row.event_id: row for row in prior.schedule}
+    prior_content = (
+        {row.event_id for row in prior.lineup}
+        | {row.event_id for row in prior.matchsheet}
+        | {
+            item.event_id
+            for item in prior.raw_ledger
+            if item.endpoint == "summary" and item.event_id is not None
+        }
+    )
+    dispositions: list[RequestDisposition] = []
+    for event in missing:
+        # The source returned it and the parser dropped the row: an edition or
+        # season boundary move, which is real data loss, not a withdrawal.
+        if event.event_id in returned_anywhere:
+            raise ScopeIncompleteError(fatal)
+        prior_row = prior_rows.get(event.event_id)
+        if prior_row is None or prior_row.terminal or prior_row.summary_required:
+            raise ScopeIncompleteError(fatal)
+        if event.event_id in prior_content:
+            raise ScopeIncompleteError(fatal)
+        covering = tuple(
+            (request, ids)
+            for request, ids in raw_pages
+            if source_day_contains(
+                event.event_date, request.query_start, request.query_end
+            )
+        )
+        if not covering:
+            raise ScopeIncompleteError(fatal)
+        covering_ids: set[int] = set()
+        for _request, ids in covering:
+            covering_ids |= ids
+        expected = {
+            row.event_id
+            for row in prior.schedule
+            if row.event_id not in missing_ids
+            and any(
+                source_day_contains(
+                    row.kickoff.date(), request.query_start, request.query_end
+                )
+                for request, _ids in covering
+            )
+        }
+        seen = expected & covering_ids
+        if (
+            not expected
+            or len(seen) * WITHDRAWN_RETENTION_DENOMINATOR
+            < len(expected) * WITHDRAWN_RETENTION_NUMERATOR
+        ):
+            raise ScopeIncompleteError(fatal)
+        proof = {
+            "kind": "espn-withdrawn-known-event-v1",
+            "event_id": event.event_id,
+            "event_date": event.event_date.isoformat(),
+            "prior_generation_id": prior.generation_id,
+            "covering_windows": [
+                {
+                    "request_id": request.request_id,
+                    "query_start": request.query_start.isoformat(),
+                    "query_end": request.query_end.isoformat(),
+                    "requested_limit": request.params["limit"],
+                    "raw_event_count": len(ids),
+                }
+                for request, ids in sorted(
+                    covering, key=lambda item: item[0].request_id
+                )
+            ],
+            "prior_events_in_windows": len(expected),
+            "prior_events_returned": len(seen),
+        }
+        dispositions.append(
+            RequestDisposition(
+                endpoint="schedule",
+                state=DispositionState.SKIPPED,
+                detail=canonical_json(proof),
+                event_id=event.event_id,
+            )
+        )
+    return tuple(dispositions)
+
+
 @dataclass(slots=True)
 class _BudgetState:
     max_events: int
@@ -3166,6 +3313,7 @@ class _PreparedScoreboard:
     noop_result: Mapping[str, Any] | None = None
     parser_bridge: bool = False
     schedule_disposition: RequestDisposition | None = None
+    withdrawn_dispositions: tuple[RequestDisposition, ...] = ()
 
 
 def _noop_scope_result(scope: ScopePlan, prior: ScopeGeneration) -> dict[str, Any]:
@@ -3251,15 +3399,12 @@ def _prepare_scope_scoreboard(
         parsed_pages.append((request, rows))
         scoreboard_records.append(record)
     fetched_by_event, winner = _merge_scoreboard_pages(parsed_pages)
-    missing_known = sorted(
-        event.event_id
-        for event in binding.known_nonterminal_events
-        if event.event_id not in fetched_by_event
+    withdrawn_dispositions = _qualify_missing_known_events(
+        known_events=binding.known_nonterminal_events,
+        pages=tuple((request, body) for request, body, _ in scoreboard_payloads),
+        fetched_by_event=fetched_by_event,
+        prior=prior,
     )
-    if missing_known:
-        raise ScopeIncompleteError(
-            f"known non-terminal events absent from scoreboard: {missing_known}"
-        )
     schedule_disposition = None
     if not fetched_by_event and (full or (prior is not None and not prior.schedule)):
         schedule_disposition = _qualify_empty_schedule(
@@ -3294,6 +3439,7 @@ def _prepare_scope_scoreboard(
         records=tuple(scoreboard_records),
         parser_bridge=transition == "v2-to-v3",
         schedule_disposition=schedule_disposition,
+        withdrawn_dispositions=withdrawn_dispositions,
     )
 
 
@@ -3340,6 +3486,10 @@ def _process_prepared_scope(
             else {}
         )
         schedule_by_event.update(fetched_by_event)
+    # A withdrawal is only proven once per generation; carrying the retired row
+    # forward would keep re-arming the guard on every later run.
+    for withdrawn in prepared.withdrawn_dispositions:
+        schedule_by_event.pop(withdrawn.event_id, None)
     schedule = tuple(
         sorted(schedule_by_event.values(), key=lambda row: (row.kickoff, row.event_id))
     )
@@ -3467,6 +3617,7 @@ def _process_prepared_scope(
     )
     if prepared.schedule_disposition is not None:
         dispositions.append(prepared.schedule_disposition)
+    dispositions.extend(prepared.withdrawn_dispositions)
 
     scoreboard_ledger = _merge_scoreboard_ledger(
         prior,
@@ -3474,6 +3625,9 @@ def _process_prepared_scope(
         fetched_event_ids=set(fetched_by_event),
         records=scoreboard_records,
         winner=winner,
+        withdrawn_event_ids=frozenset(
+            item.event_id for item in prepared.withdrawn_dispositions
+        ),
     )
     raw_ledger = tuple(
         sorted((*scoreboard_ledger, *summary_ledger), key=lambda item: item.request_id)
