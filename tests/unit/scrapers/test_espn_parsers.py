@@ -407,6 +407,22 @@ def test_every_scoreboard_document_is_bound_to_one_promoted_root_league(
 
 
 @pytest.mark.unit
+def test_bare_empty_scoreboard_event_is_skipped_but_any_field_stays_strict() -> None:
+    _, _, baseline = _schedule()
+
+    padded = _load("native_scoreboard.json")
+    padded["events"].append({})
+    _, _, rows = _schedule(padded)
+    assert rows == baseline
+
+    for drift in ({"id": "0"}, {"id": ""}, {"id": None}, {"date": "2020-09-19T18:45Z"}):
+        polluted = _load("native_scoreboard.json")
+        polluted["events"].append(drift)
+        with pytest.raises(EspnParseError, match="canonical positive native ID"):
+            _schedule(polluted)
+
+
+@pytest.mark.unit
 def test_schedule_joins_sides_by_home_away_and_deduplicates_native_event_id() -> None:
     payload = _load("native_scoreboard.json")
     payload["events"][0]["competitions"][0]["competitors"].reverse()
@@ -2442,6 +2458,24 @@ def test_reviewed_short_roster_fixture_covers_every_matchday_of_that_club(
             competition=both_competition,
             edition=both_edition,
             event=both_event,
+        )
+
+    # One side short while the other is long is not the reviewed shape either:
+    # the short side is no longer the only deviating one, so it stays refused.
+    mixed_competition, mixed_edition, mixed_event, mixed_raw = case(
+        ("750:2026", 401877180, ((3384, 10), (22167, 12)))
+    )
+    monkeypatch.setattr(
+        summary_parser_module,
+        "_REVIEWED_SHORT_ROSTER_FIXTURES",
+        frozenset({fixture}),
+    )
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            mixed_raw,
+            competition=mixed_competition,
+            edition=mixed_edition,
+            event=mixed_event,
         )
 
     # A declared format the reviewed matches never carried must not match.

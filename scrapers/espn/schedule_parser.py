@@ -168,6 +168,13 @@ def _event_row(
     source_extra: Mapping[str, Any],
 ) -> ScheduleRow | None:
     event = required_mapping(event_raw, "scoreboard event")
+    if not event:
+        # ESPN intermittently emits a bare {} inside events (seen 12.08.2026 on
+        # 19727:2024, where the same request had returned 16 sound events a day
+        # earlier). It carries no field at all, so there is nothing to parse and
+        # nothing to lose; a known event replaced by one is still caught by the
+        # withdrawn-events ceiling downstream. Anything with a field stays strict.
+        return None
     event_id = native_id(event.get("id"), "scoreboard event.id")
     season = required_mapping(event.get("season"), f"event[{event_id}].season")
     event_year = source_year(season.get("year"), f"event[{event_id}].season.year")
