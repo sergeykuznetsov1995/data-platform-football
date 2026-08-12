@@ -1713,6 +1713,37 @@ def finalize_fbref_publication_lock(
             "FBref publication lock was not acquired; final source verdict "
             f"fails closed (state={acquire_state})"
         )
+    export_state = states.get("export_publication_scope", "missing")
+    if (
+        states.get("choose_publication_path", "missing") == "success"
+        and export_state == "skipped"
+    ):
+        # Непубликующая историческая полоса: Silver не запускался и не должен
+        # был.  Доказательство берём не из состояний тасков, а из durable
+        # метаданных рана — ветку можно выбрать шаблоном, метаданные пишутся
+        # до первой страницы и переживают ретрай.
+        run = _control_store().get_run(
+            _control_run_id(airflow_run_id=airflow_run_id, dag_id=dag_id)
+        )
+        if run is None:
+            raise AirflowException(
+                "FBref non-publishing finalizer cannot find its control run"
+            )
+        _require_fbref_nonpublishing_mode(run)
+        released = release_fbref_publication_lock(
+            airflow_run_id=airflow_run_id, dag_id=dag_id
+        )
+        validate_state = states.get("validate_run", "missing")
+        if validate_state != "success":
+            raise AirflowException(
+                "FBref non-publishing lock was released, but its source "
+                f"verdict is red (validate_run={validate_state})"
+            )
+        return {
+            **released,
+            "publishing": False,
+            "status": "released_after_nonpublishing_run",
+        }
     silver_state = states.get("trigger_silver_transform", "missing")
     if silver_state != "success":
         if silver_state in {"skipped", "upstream_failed"}:

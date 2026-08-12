@@ -3169,3 +3169,113 @@ def test_backfill_publication_branch_routes_by_publish_flag(publish, expected):
         )
         == expected
     )
+
+
+def _nonpublishing_finalizer_dag_run(*, validate_state="success"):
+    return SimpleNamespace(
+        get_task_instances=lambda: [
+            SimpleNamespace(task_id="acquire_publication_lock", state="success"),
+            SimpleNamespace(task_id="validate_run", state=validate_state),
+            SimpleNamespace(task_id="choose_publication_path", state="success"),
+            SimpleNamespace(task_id="export_publication_scope", state="skipped"),
+            SimpleNamespace(task_id="trigger_silver_transform", state="skipped"),
+        ]
+    )
+
+
+@pytest.mark.unit
+def test_finalizer_releases_a_nonpublishing_run_without_painting_it_red(
+    monkeypatch,
+):
+    """Пропущенный Silver у истории — это план, а не «ребёнок не стартовал»."""
+
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    control = MagicMock()
+    control.get_run.return_value = {
+        "metadata": {
+            "execution_mode": "history_nonpublishing",
+            "publication_eligible": False,
+        }
+    }
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    result = fbref_pipeline_tasks.finalize_fbref_publication_lock(
+        airflow_run_id="manual__history",
+        dag_id="dag_backfill_fbref",
+        dag_run=_nonpublishing_finalizer_dag_run(),
+    )
+
+    assert result["status"] == "released_after_nonpublishing_run"
+    assert result["publishing"] is False
+    release.assert_called_once()
+
+
+@pytest.mark.unit
+def test_finalizer_refuses_the_nonpublishing_path_for_a_publishing_run(
+    monkeypatch,
+):
+    """Ветку выбирает шаблон, а доказательство — метаданные: fail-closed."""
+
+    from airflow.exceptions import AirflowException
+
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    control = MagicMock()
+    control.get_run.return_value = {
+        "metadata": {
+            "execution_mode": "backfill",
+            "publication_eligible": True,
+        }
+    }
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    with pytest.raises(RuntimeError, match="refused for a publishing run"):
+        fbref_pipeline_tasks.finalize_fbref_publication_lock(
+            airflow_run_id="manual__history",
+            dag_id="dag_backfill_fbref",
+            dag_run=_nonpublishing_finalizer_dag_run(),
+        )
+
+    release.assert_not_called()
+
+
+@pytest.mark.unit
+def test_finalizer_keeps_a_nonpublishing_run_red_when_validation_failed(
+    monkeypatch,
+):
+    """Замок отпущен, но провал validate_run остаётся провалом."""
+
+    from airflow.exceptions import AirflowException
+
+    release = MagicMock(return_value={"released": True})
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "release_fbref_publication_lock", release
+    )
+    control = MagicMock()
+    control.get_run.return_value = {
+        "metadata": {
+            "execution_mode": "history_nonpublishing",
+            "publication_eligible": False,
+        }
+    }
+    monkeypatch.setattr(
+        fbref_pipeline_tasks, "_control_store", MagicMock(return_value=control)
+    )
+
+    with pytest.raises(AirflowException, match="validate_run=failed"):
+        fbref_pipeline_tasks.finalize_fbref_publication_lock(
+            airflow_run_id="manual__history",
+            dag_id="dag_backfill_fbref",
+            dag_run=_nonpublishing_finalizer_dag_run(validate_state="failed"),
+        )
+
+    release.assert_called_once()
