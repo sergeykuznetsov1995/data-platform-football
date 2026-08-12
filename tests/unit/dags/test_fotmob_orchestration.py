@@ -165,6 +165,38 @@ def test_lane_request_caps_are_reachable():
         )
 
 
+def test_hard_timeout_outlasts_every_lane_window():
+    """Жёсткий таймаут обязан пережить окно полосы, иначе дедлайн недостижим.
+
+    Регрессия 2026-08-12: при 8 часах фоновая волна, стартующая в 00:00, умирала по
+    AirflowTaskTimeout в 08:00 — за 5 ч 45 мин до собственного дедлайна 13:45. Цена не
+    только в потерянном окне: SIGTERM вместо мягкой отсрочки красит ран, поэтому
+    публикация не закрывается, silver не триггерится, а advance_after_success не
+    выполняется — курсор полос стоит и BACKFILL не наступает никогда.
+    """
+    from utils.fotmob_orchestration import (
+        BACKGROUND_DEADLINE,
+        CHILD_TIMEOUT_MINUTES,
+        DAILY_DEADLINE,
+        DAILY_WINDOW_START,
+    )
+
+    def _minutes(start, end) -> int:
+        return (end.hour - start.hour) * 60 + (end.minute - start.minute)
+
+    windows = {
+        # фоновая полоса допускается к старту с полуночи, дневная — со своего окна
+        FotMobLane.REFRESH: _minutes(time(0, 0), BACKGROUND_DEADLINE),
+        FotMobLane.BACKFILL: _minutes(time(0, 0), BACKGROUND_DEADLINE),
+        FotMobLane.DAILY: _minutes(DAILY_WINDOW_START, DAILY_DEADLINE),
+    }
+    for lane, window in windows.items():
+        assert CHILD_TIMEOUT_MINUTES > window, (
+            f"полоса {lane.value}: жёсткий таймаут {CHILD_TIMEOUT_MINUTES} мин не "
+            f"переживает окно {window} мин — дедлайн недостижим, ран умрёт красным"
+        )
+
+
 def test_child_timeout_copy_matches_the_ingest_dag():
     """CHILD_TIMEOUT_MINUTES — копия execution_timeout из dag_ingest_fotmob.
 

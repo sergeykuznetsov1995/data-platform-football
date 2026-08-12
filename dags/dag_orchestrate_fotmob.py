@@ -531,7 +531,10 @@ if os.environ.get(ISOLATED_STACK_ENV) == "1":
             allowed_states=["success"],
             failed_states=["failed"],
             reset_dag_run=False,
-            execution_timeout=timedelta(hours=14),
+            # Родитель ждёт ребёнка, поэтому его таймаут обязан быть длиннее
+            # CHILD_TIMEOUT_MINUTES (15 ч) — иначе первым падает ожидание, а живой
+            # ребёнок остаётся сиротой и продолжает писать в bronze.
+            execution_timeout=timedelta(hours=16),
             retries=0,
         )
 

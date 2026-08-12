@@ -1015,7 +1015,11 @@ python dags/scripts/run_fotmob_scraper.py \\
         },
         append_env=True,
         pool=FOTMOB_HTTP_POOL,
-        execution_timeout=timedelta(hours=8),
+        # Должен быть ДЛИННЕЕ самого широкого окна полосы (фоновая: 00:00 → дедлайн
+        # 13:45 = 13 ч 45 мин), иначе ран убивается SIGTERM раньше кооперативного
+        # дедлайна: красный исход вместо deferred → partial_success, незакрытая
+        # публикация, непереключённый курсор полос. Копия — CHILD_TIMEOUT_MINUTES.
+        execution_timeout=timedelta(hours=15),
         retries=0,
     )
 
