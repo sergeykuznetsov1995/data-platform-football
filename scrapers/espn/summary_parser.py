@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
 import re
 from types import MappingProxyType
@@ -626,6 +625,19 @@ _REVIEWED_MALFORMED_LINEUPS: Mapping[
     }
 )
 
+# The last table to leave the bytes behind, for the same reason as the other
+# three: this scope has not been reconciled yet, and its digest is one athlete
+# card edit away from expiring on a defect that has not moved.
+_REVIEWED_MALFORMED_IDENTITIES: frozenset[
+    tuple[str, int, tuple[tuple[int, int], ...]]
+] = frozenset(_REVIEWED_MALFORMED_LINEUPS.values())
+
+# Counting starters costs a walk over both rosters, so keep the walk behind a
+# cheap membership test on the event alone.
+_REVIEWED_MALFORMED_EVENTS: frozenset[tuple[str, int]] = frozenset(
+    (scope_id, event_id) for scope_id, event_id, _ in _REVIEWED_MALFORMED_IDENTITIES
+)
+
 # Argentina's 2026 third tier exposes no complete XI in its 17 non-empty roster
 # responses.  Copa Colombia 2026 has 10 non-XI partial conventional roster
 # responses across 54 reviewed Summaries.  El Salvador's 2026 first division
@@ -1071,12 +1083,6 @@ def _lineup(
     rosters = required_list(payload["rosters"], "summary.rosters")
     if not rosters:
         return (), _valid_empty_or_fail(capability, "lineup")
-    lineup_source: dict[str, Any] = {"rosters": rosters}
-    if "format" in payload:
-        lineup_source["format"] = payload["format"]
-    lineup_source_sha256 = hashlib.sha256(
-        canonical_json(lineup_source).encode("utf-8")
-    ).hexdigest()
     blocks: dict[int, tuple[str, str, Mapping[str, Any]]] = {}
     for index, raw_roster in enumerate(rosters):
         team_id, side, team_name, block = _team_block(
@@ -1097,8 +1103,7 @@ def _lineup(
             "Summary lineup rosters must exist for both or neither team"
         )
 
-    reviewed_identity = _REVIEWED_MALFORMED_LINEUPS.get(lineup_source_sha256)
-    if reviewed_identity is not None:
+    if (event.scope_id, event.event_id) in _REVIEWED_MALFORMED_EVENTS:
         starter_counts = tuple(
             sorted(
                 (
@@ -1123,7 +1128,11 @@ def _lineup(
                 for team_id, (_, _, block) in blocks.items()
             )
         )
-        if reviewed_identity == (event.scope_id, event.event_id, starter_counts):
+        if (
+            event.scope_id,
+            event.event_id,
+            starter_counts,
+        ) in _REVIEWED_MALFORMED_IDENTITIES:
             return (), _valid_empty_or_fail(capability, "lineup")
 
     rows: list[LineupRow] = []

@@ -5,7 +5,6 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import fields, replace
 from datetime import date, timezone
-import hashlib
 import json
 from pathlib import Path
 from types import MappingProxyType
@@ -1851,6 +1850,14 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
         summary_parser_module._REVIEWED_ONE_SIDED_LINEUPS.values()
     ) | {("4005:2026", 401876872)}
     assert isinstance(summary_parser_module._REVIEWED_ONE_SIDED_IDENTITIES, frozenset)
+    assert summary_parser_module._REVIEWED_MALFORMED_IDENTITIES == frozenset(
+        summary_parser_module._REVIEWED_MALFORMED_LINEUPS.values()
+    )
+    assert summary_parser_module._REVIEWED_MALFORMED_EVENTS == frozenset(
+        (scope_id, event_id)
+        for scope_id, event_id, _ in summary_parser_module._REVIEWED_MALFORMED_IDENTITIES
+    )
+    assert isinstance(summary_parser_module._REVIEWED_MALFORMED_IDENTITIES, frozenset)
     with pytest.raises(TypeError):
         summary_parser_module._REVIEWED_TRUNCATED_LINEUPS["0" * 64] = (  # type: ignore[index]
             "18481:2025",
@@ -2485,18 +2492,18 @@ def test_only_reviewed_malformed_lineup_degrades_to_valid_empty(
     with pytest.raises(EspnParseError, match="clock.displayValue"):
         parse_summary(raw, competition=competition, edition=edition, event=schedule[0])
 
-    lineup_source = {"rosters": payload["rosters"]}
-    if "format" in payload:
-        lineup_source["format"] = payload["format"]
-    lineup_source_sha256 = hashlib.sha256(
-        json.dumps(
-            lineup_source,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    def review(*identities: tuple[str, int, tuple[tuple[int, int], ...]]) -> None:
+        monkeypatch.setattr(
+            summary_parser_module,
+            "_REVIEWED_MALFORMED_IDENTITIES",
+            frozenset(identities),
+        )
+        monkeypatch.setattr(
+            summary_parser_module,
+            "_REVIEWED_MALFORMED_EVENTS",
+            frozenset((scope_id, event_id) for scope_id, event_id, _ in identities),
+        )
+
     identity = (
         schedule[0].scope_id,
         schedule[0].event_id,
@@ -2510,11 +2517,7 @@ def test_only_reviewed_malformed_lineup_degrades_to_valid_empty(
             )
         ),
     )
-    monkeypatch.setattr(
-        summary_parser_module,
-        "_REVIEWED_MALFORMED_LINEUPS",
-        {lineup_source_sha256: identity},
-    )
+    review(identity)
 
     result = parse_summary(
         raw, competition=competition, edition=edition, event=schedule[0]
@@ -2522,15 +2525,14 @@ def test_only_reviewed_malformed_lineup_degrades_to_valid_empty(
     assert result.lineup == ()
     assert result.lineup_state is EntityParseState.VALID_EMPTY
 
+    # A cosmetic roster edit keeps the review: the empty substitution clock is
+    # still the same defect on the same event with the same starter counts.
     changed = deepcopy(payload)
     changed["rosters"][1]["roster"][0]["athlete"]["displayName"] = "Changed"
-    with pytest.raises(EspnParseError, match="clock.displayValue"):
-        parse_summary(
-            _raw(changed),
-            competition=competition,
-            edition=edition,
-            event=schedule[0],
-        )
+    still_reviewed = parse_summary(
+        _raw(changed), competition=competition, edition=edition, event=schedule[0]
+    )
+    assert still_reviewed.lineup_state is EntityParseState.VALID_EMPTY
 
     wrong_identities = (
         ("other:2026", schedule[0].event_id, identity[2]),
@@ -2538,11 +2540,7 @@ def test_only_reviewed_malformed_lineup_degrades_to_valid_empty(
         (schedule[0].scope_id, schedule[0].event_id, ()),
     )
     for wrong_identity in wrong_identities:
-        monkeypatch.setattr(
-            summary_parser_module,
-            "_REVIEWED_MALFORMED_LINEUPS",
-            {lineup_source_sha256: wrong_identity},
-        )
+        review(wrong_identity)
         with pytest.raises(EspnParseError, match="clock.displayValue"):
             parse_summary(
                 raw,
@@ -2551,11 +2549,7 @@ def test_only_reviewed_malformed_lineup_degrades_to_valid_empty(
                 event=schedule[0],
             )
 
-    monkeypatch.setattr(
-        summary_parser_module,
-        "_REVIEWED_MALFORMED_LINEUPS",
-        {lineup_source_sha256: identity},
-    )
+    review(identity)
     proven_competition, proven_edition, proven_schedule = _schedule()
     with pytest.raises(EspnParseError, match="proven lineup"):
         parse_summary(
