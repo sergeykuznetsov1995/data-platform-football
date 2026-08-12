@@ -541,6 +541,24 @@ class _FrontierSeedCandidate:
     refresh_policy: Optional[str] = None
 
 
+# Spine pages whose frontier target is season-independent or shared with the
+# live current-season lane.  ``fbref:competition:<id>`` discovered from a 1930
+# season page is the very row the daily run must refresh weekly, so a
+# historical seed must never relabel it ``historical_once``.  The frontier
+# upsert guards only ``player``/``squad`` (control/store.py, sealed), so the
+# guard lives here instead.
+_HISTORICAL_DOWNGRADE_GUARDED_KINDS = frozenset(
+    {
+        "competition",
+        "competition_index",
+        "season",
+        "schedule",
+        "standings",
+        "season_stats",
+    }
+)
+
+
 @dataclass
 class WaveResult:
     cohort_size: int = 0
@@ -3397,6 +3415,36 @@ class FBrefPipeline:
             reconcile_after=reconcile_after,
         )
 
+    def _preserve_live_policy(self, prepared: FrontierTarget) -> FrontierTarget:
+        """Keep a live current-lane policy when a historical seed touches it."""
+
+        if prepared.page_kind not in _HISTORICAL_DOWNGRADE_GUARDED_KINDS:
+            return prepared
+        getter = getattr(self.control, "get_frontier_target", None)
+        if getter is None:
+            return prepared
+        existing = getter(prepared.target_id)
+        if not existing:
+            return prepared
+        policy = str(existing.get("refresh_policy") or "")
+        if policy in {"", "historical_once", "current_completed_once"}:
+            return prepared
+        logger.info(
+            "FBref historical seed kept live policy %s for %s",
+            policy,
+            prepared.target_id,
+        )
+        return FrontierTarget(
+            target_id=prepared.target_id,
+            page_kind=prepared.page_kind,
+            canonical_url=prepared.canonical_url,
+            source_ids=prepared.source_ids,
+            refresh_policy=policy,
+            priority=int(existing.get("priority") or prepared.priority),
+            next_fetch_at=existing.get("next_fetch_at"),
+            source=prepared.source,
+        )
+
     def _seed_link_candidates(
         self,
         candidates: Iterable[_FrontierSeedCandidate],
@@ -3463,6 +3511,8 @@ class FBrefPipeline:
                     next_fetch_at=prepared.next_fetch_at,
                     source=prepared.source,
                 )
+            if candidate.historical and candidate.refresh_policy is None:
+                prepared = self._preserve_live_policy(prepared)
             existing = prepared_targets.get(target.target_id)
             if existing is None:
                 prepared_targets[target.target_id] = prepared

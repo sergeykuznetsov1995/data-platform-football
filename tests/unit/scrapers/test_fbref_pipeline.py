@@ -8580,3 +8580,112 @@ def test_a_failed_validation_leaves_the_run_open_for_its_retry(tmp_path):
     pipeline.validate_and_finish(run_id)
 
     assert "finish:True" in control.events
+
+
+def _historical_competition_seed(tmp_path, *, existing=None, page_kind="competition"):
+    """Seed one link with ``historical=True`` and return the prepared target."""
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry["9"] = {
+        "competition_id": "9",
+        "canonical_url": "https://fbref.com/en/comps/9/history/x",
+        "name": "Premier League",
+        "gender": "male",
+        "classification": "league:club",
+        "metadata": {},
+    }
+    parent = page_target_from_link(DiscoveredPageLink(
+        page_kind="season",
+        canonical_url="https://fbref.com/en/comps/9/1930-1931/x-Stats",
+        source_ids={"competition_id": "9", "season_id": "1930-1931"},
+    ))
+    _, parent_record = _commit_for_parse(raw, parent, "<html></html>")
+    if page_kind == "competition":
+        link = DiscoveredPageLink(
+            page_kind="competition",
+            canonical_url="https://fbref.com/en/comps/9/history/x",
+            source_ids={"competition_id": "9"},
+        )
+    else:
+        link = DiscoveredPageLink(
+            page_kind="player",
+            canonical_url="https://fbref.com/en/players/0000000a/Player",
+            source_ids={
+                "player_id": "0000000a",
+                "competition_id": "9",
+                "season_id": "1930-1931",
+            },
+        )
+    if existing is not None:
+        control.frontier[page_target_from_link(link).target_id] = dict(existing)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    seeded, skipped = pipeline._seed_links(
+        [link],
+        historical=True,
+        parent_record=parent_record,
+    )
+
+    assert (seeded, skipped) == (1, 0)
+    targets, _ = control.frontier_batches[0]
+    assert len(targets) == 1
+    return targets[0]
+
+
+def test_historical_seed_keeps_live_competition_policy(tmp_path):
+    target = _historical_competition_seed(
+        tmp_path,
+        existing={
+            "target_id": "fbref:competition:9",
+            "page_kind": "competition",
+            "refresh_policy": "weekly",
+            "priority": 90,
+            "next_fetch_at": NOW,
+            "state": "fetched",
+        },
+    )
+
+    assert target.refresh_policy == "weekly"
+    assert target.priority == 90
+    assert target.next_fetch_at == NOW
+
+
+def test_historical_seed_creates_unknown_competition_as_historical(tmp_path):
+    target = _historical_competition_seed(tmp_path)
+
+    assert target.refresh_policy == "historical_once"
+    assert target.priority == 10
+
+
+def test_historical_seed_leaves_one_shot_competition_alone(tmp_path):
+    target = _historical_competition_seed(
+        tmp_path,
+        existing={
+            "target_id": "fbref:competition:9",
+            "page_kind": "competition",
+            "refresh_policy": "historical_once",
+            "priority": 10,
+            "next_fetch_at": None,
+            "state": "queued",
+        },
+    )
+
+    assert target.refresh_policy == "historical_once"
+
+
+def test_historical_seed_still_downgrades_unguarded_player(tmp_path):
+    target = _historical_competition_seed(
+        tmp_path,
+        page_kind="player",
+        existing={
+            "target_id": "fbref:player:0000000a",
+            "page_kind": "player",
+            "refresh_policy": "monthly",
+            "priority": 40,
+            "next_fetch_at": NOW,
+            "state": "fetched",
+        },
+    )
+
+    assert target.refresh_policy == "historical_once"
