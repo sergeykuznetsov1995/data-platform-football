@@ -708,7 +708,12 @@ class FotMobIngestService:
     @staticmethod
     def _record_failure(result: OperationResult, key: str, fetch: FetchResult) -> None:
         if fetch.outcome == FetchOutcome.NOT_AVAILABLE:
-            result.terminal.append(
+            # Транспортное 204/404 не хоронит сущность (tombstone ставит только
+            # entity-aware парсер) — значит и неустранимым отказом операции оно
+            # быть не может: те же цели отдаются со следующей попытки. Терминал
+            # здесь красил весь ран и закрывал скоуп без права на повтор
+            # (next_retry_at=None), теряя его до конца полосы.
+            result.retryable.append(
                 f"{key}: unscoped transport absence ({fetch.http_status})"
             )
         elif fetch.outcome == FetchOutcome.RETRYABLE_FAILURE:
