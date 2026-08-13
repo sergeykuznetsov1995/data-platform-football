@@ -672,17 +672,34 @@ class FBrefFetcher:
                 and getattr(self, "_persistent_session_id", None) is not None
             )
         )
-        stats = (
-            lease_client.close_strict(
+        if strict_close:
+            try:
+                stats = lease_client.close_strict(
+                    lease,
+                    expected=self._provider_context,
+                )
+            except FBrefProxyLeaseError as strict_error:
+                # One mid-response abort latches the lease accounting-uncertain
+                # for good, so the strict proof can never arrive. The filter
+                # keeps the unproven tail as durable escrow and its counters are
+                # the final client-visible ledger, so the tolerant close still
+                # protects the budget while letting the wave continue with an
+                # ordinary target error (#1099, mirrors #1096 for Transfermarkt).
+                logger.warning(
+                    "FBref strict lease close failed for lease %s (%s); "
+                    "falling back to the escrow-backed close",
+                    lease.lease_id,
+                    strict_error,
+                )
+                stats = lease_client.close(
+                    lease,
+                    expected=self._provider_context,
+                )
+        else:
+            stats = lease_client.close(
                 lease,
                 expected=self._provider_context,
             )
-            if strict_close
-            else lease_client.close(
-                lease,
-                expected=self._provider_context,
-            )
-        )
         self._observe_provider_stats(stats)
         # Clear ownership only after close + authoritative observation both
         # succeeded. On failure, _next_proxy must retry reconciliation instead

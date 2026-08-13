@@ -808,6 +808,30 @@ def test_shrunk_browser_budget_keeps_prior_provider_spend_in_next_cap():
     assert client.acquired[1][0] == 700
 
 
+def test_persistent_finalizer_falls_back_to_escrow_backed_close():
+    client = _LeaseClient([120])
+    fetcher = FBrefFetcher(
+        proxy_file="/credentials/must-not-be-read.txt",
+        provider_context=CONTEXT,
+        provider_max_bytes=1000,
+        lease_client=client,
+        persistent_http_session=True,
+    )
+    fetcher.begin_metered_session("session-a")
+    fetcher._next_proxy()
+    fetcher._http_session = MagicMock()
+    client.close_strict = MagicMock(
+        side_effect=FBrefProxyLeaseError("strict close unavailable")
+    )
+
+    receipt = fetcher.finalize_metered_session()
+
+    assert client.events.count("close") == 1
+    assert fetcher._provider_lease is None
+    assert receipt.authoritative_provider_bytes == 120
+    assert receipt.tail_provider_bytes == 120
+
+
 def test_persistent_finalizer_failure_keeps_provider_ownership():
     client = _LeaseClient([])
     fetcher = FBrefFetcher(
@@ -824,8 +848,13 @@ def test_persistent_finalizer_failure_keeps_provider_ownership():
     client.close_strict = MagicMock(
         side_effect=FBrefProxyLeaseError("strict close unavailable")
     )
+    client.close = MagicMock(
+        side_effect=FBrefProxyLeaseError(
+            "FBref paid lease close did not return final counters"
+        )
+    )
 
-    with pytest.raises(FBrefProxyLeaseError, match="strict close unavailable"):
+    with pytest.raises(FBrefProxyLeaseError, match="did not return final counters"):
         fetcher.finalize_metered_session()
 
     assert fetcher._provider_lease is original
