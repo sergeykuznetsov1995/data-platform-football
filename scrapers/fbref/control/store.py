@@ -6571,7 +6571,10 @@ class ControlStore:
                 JOIN fbref_control.fetch_attempt AS attempt
                   ON attempt.target_id = manifest.target_id
                  AND attempt.content_hash = manifest.content_hash
+                JOIN fbref_control.page_frontier AS frontier
+                  ON frontier.target_id = attempt.target_id
                 WHERE attempt.run_id = %s AND attempt.status = 'succeeded'
+                  AND frontier.state <> 'quarantined'
                   AND (
                     %s::text IS NULL
                     OR (
@@ -6610,8 +6613,11 @@ class ControlStore:
                 FROM (
                     SELECT DISTINCT attempt.target_id, attempt.content_hash
                     FROM fbref_control.fetch_attempt AS attempt
+                    JOIN fbref_control.page_frontier AS frontier
+                      ON frontier.target_id = attempt.target_id
                     WHERE attempt.run_id = %s
                       AND attempt.status = 'succeeded'
+                      AND frontier.state <> 'quarantined'
                       AND (
                         (
                           %s::text IS NULL

@@ -1601,6 +1601,47 @@ def test_retired_targets_leave_both_the_cohort_and_the_unprocessed_raw_gate():
     assert "global_sla_overdue_count" in summary
 
 
+def test_run_summary_excludes_terminal_quarantine_from_all_raw_validation_gates():
+    executions = []
+    run_id = str(uuid.uuid4())
+
+    def handler(sql, params):
+        executions.append((sql, params))
+        if "SELECT * FROM fbref_control.crawl_run" in sql:
+            return [{"run_id": run_id, "run_type": "current"}], 1
+        if "AS missing" in sql:
+            return [{"count": 0}], 1
+        return [], 0
+
+    store, _ = make_store(handler)
+    store.get_run_summary(
+        run_id,
+        parser_version="page-current",
+        typed_parser_version="typed-current",
+        stateful_parser_version="discovery-current",
+    )
+
+    dataset_sql = next(
+        sql for sql, _ in executions
+        if "GROUP BY manifest.validation_status" in sql
+    )
+    unvalidated_sql = next(
+        sql for sql, _ in executions if "AS missing" in sql
+    )
+    raw_sql = next(
+        sql for sql, _ in executions if "AS global_sla_overdue_count" in sql
+    )
+    terminal_scope = (
+        "JOIN fbref_control.page_frontier AS frontier "
+        "ON frontier.target_id = attempt.target_id"
+    )
+    terminal_filter = "AND frontier.state <> 'quarantined'"
+
+    for sql in (dataset_sql, unvalidated_sql, raw_sql):
+        assert terminal_scope in sql
+        assert terminal_filter in sql
+
+
 BARE_SEASON_URL = "https://fbref.com/en/comps/12/La-Liga-Stats"
 DATED_SEASON_URL = (
     "https://fbref.com/en/comps/12/2025-2026/2025-2026-La-Liga-Stats"

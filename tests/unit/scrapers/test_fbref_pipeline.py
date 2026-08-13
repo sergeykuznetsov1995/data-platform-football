@@ -5803,6 +5803,11 @@ def test_canary_validation_does_not_require_global_publication_freshness(tmp_pat
     [
         ({"unprocessed_raw_count": 2}, "unprocessed_raw_count=2"),
         (
+            {"dataset_validation_counts": {"failed": 1}},
+            "failed_dataset_manifests=1",
+        ),
+        ({"unvalidated_target_count": 1}, "unvalidated_target_count=1"),
+        (
             {"global_unprocessed_raw_sla_overdue_count": 2},
             "global_unprocessed_raw_sla_overdue_count=2",
         ),
