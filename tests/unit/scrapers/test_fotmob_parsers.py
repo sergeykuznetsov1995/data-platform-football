@@ -333,6 +333,28 @@ def test_transfer_pages_use_correct_fee_fields_and_deduplicate_events():
     assert len(row["transfer_event_id"]) == 64
 
 
+def test_transfer_pages_accept_nested_transfer_list():
+    rows = parse_transfers(
+        {"data": {"transfers": [{"playerId": 7, "name": "Player"}]}}
+    )
+
+    assert rows[0]["player_id"] == 7
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"transfers": None},
+        {"data": {"transfers": None}},
+        {"transfers": [None]},
+    ],
+)
+def test_transfer_pages_reject_invalid_transfer_containers(payload):
+    with pytest.raises(TypeError):
+        parse_transfers(payload)
+
+
 def test_json_inventory_scans_all_array_elements_and_empty_containers():
     paths = inventory_json_paths({"items": [{"a": 1}, {"b": []}], "empty": {}})
     assert "$.items[].a" in paths
