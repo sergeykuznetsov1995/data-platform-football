@@ -22,6 +22,7 @@ from typing import Callable, Iterable, Mapping, Optional, Sequence
 from scrapers.fbref.bronze import (
     FBrefGenericBronzeWriter,
     GenericPagePersistItem,
+    GenericPersistenceError,
 )
 from scrapers.fbref.control import (
     BudgetExceeded,
@@ -54,6 +55,7 @@ from scrapers.fbref.discovery import (
     parse_season_html,
     season_page_is_complete_without_schedule,
     sentinel_coverage,
+    url_addresses_archived_edition,
 )
 from scrapers.fbref.fetcher import (
     FETCHER_VERSION,
@@ -66,6 +68,7 @@ from scrapers.fbref.page_document import (
     Availability,
     PageDocument,
     parse_page_document,
+    response_owns_target_page,
 )
 from scrapers.fbref.raw_store import (
     PageTarget,
@@ -127,6 +130,17 @@ PROCESSING_LEASE_SECONDS = 60 * 60
 # source contract rejection stops looking like a few unusable archived pages
 # and starts looking like FBref having changed its markup.
 MAX_ROUTINE_CONTRACT_QUARANTINES = 5
+# Kinds whose retirement loses nothing but the page itself.  A spine page is
+# excluded on purpose: match targets exist only because a schedule page was
+# parsed (generic discovery drops match links), and a season/competition page
+# carries the campaign's own frontier, so retiring one would silently amputate
+# the subtree it alone discovers.  ``player`` is excluded too, and for a
+# different reason: a player identity is one frontier row for every season and
+# both lanes (``_PAGE_SOURCE_ID_KEYS["player"] == ("player_id",)``), so a verdict
+# earned in the archive would bury the live row -- and its own legitimate
+# table-free shape is already accepted upstream by
+# ``_has_verified_zero_table_player_profile``, so nothing is lost by excluding it.
+_CONTRACT_ISOLATABLE_PAGE_KINDS = frozenset({"squad"})
 REPLAY_SOURCE_REQUEST_LIMIT = DEFAULT_REQUEST_LIMIT
 REPLAY_SOURCE_BYTE_LIMIT = DEFAULT_BYTE_LIMIT
 ACCEPTANCE_REQUEST_LIMIT = 100
@@ -4400,6 +4414,99 @@ class FBrefPipeline:
             f"Season source contract failed for {record.target_id}"
         )
 
+    def _historical_contract_rejection(
+        self, html: str, record: RawFetchRecord, page: PageDocument
+    ) -> Optional[SourceContractRejected]:
+        """Isolate a page shape only the archive can publish, and only there.
+
+        FBref serves finished-but-table-free pages for old seasons: the 1938
+        Austria squad page is a full 200 response whose whole content is a note
+        about a withdrawn World Cup tie.  The generic contract is right to
+        reject it, but a single such page must not end a run -- the target is
+        immutable, its bytes are already committed as error evidence, and every
+        later run would fetch and reject the very same bytes again.
+
+        Retirement is terminal, so it is granted only on positive evidence, the
+        same rule ``_validate_pre_promotion_contract`` states 30 lines above and
+        ``season_page_is_complete_without_schedule`` enforces for seasons: a
+        table-free response that cannot prove it is this target's own page stays
+        a loud failure, because a foreign 200 shell has the very same shape and
+        a retry of fresher bytes can still succeed.
+
+        Four gates, each of which keeps a real breakage loud:
+
+        - ``page_contract:`` verdicts only -- a parser that crashed on a
+          malformed table is a bug of ours in either lane;
+        - ``historical_once`` targets only -- on a live target a table-free page
+          is how source drift announces itself;
+        - ``_CONTRACT_ISOLATABLE_PAGE_KINDS`` only -- retiring a spine page
+          would silently drop the subtree it alone discovers (a schedule page is
+          the only source of a season's match targets), and retiring a player
+          would bury the one row both lanes share;
+        - a dated address only -- a season-less squad URL is the club's living
+          row, which the current-season lane keeps refreshing;
+        - the response must advertise this target's own canonical address.
+        """
+
+        if record.page_kind not in _CONTRACT_ISOLATABLE_PAGE_KINDS:
+            return None
+        if not page.errors:
+            return None
+        if not all(
+            error.startswith("page_contract:") for error in page.errors
+        ):
+            return None
+        if not url_addresses_archived_edition(record.canonical_url):
+            return None
+        frontier = self.control.get_frontier_target(record.target_id) or {}
+        if frontier.get("refresh_policy") != "historical_once":
+            return None
+        if not response_owns_target_page(
+            html, canonical_url=record.canonical_url
+        ):
+            return None
+        return SourceContractRejected(
+            f"Generic source contract failed for {record.target_id}",
+            target_id=record.target_id,
+            content_hash=record.content_hash,
+            reason=",".join(sorted(set(page.errors))),
+        )
+
+    def _without_retired_targets(
+        self, fetches: Sequence[Mapping[str, object]]
+    ) -> list[Mapping[str, object]]:
+        """Keep a retired target's raw out of every later batch of its own run.
+
+        ``list_run_fetches`` selects a run's own cohort with no frontier-state
+        filter -- unlike ``list_unprocessed_fetches``, which excludes retired
+        targets by name.  So the batch that retires a target is not the last one
+        to see it: every later batch of the same run re-claims the same bytes,
+        re-applies the verdict, and inflates ``contract_quarantined`` with no new
+        work.  Once such sticky targets dominate a late cohort,
+        ``_is_mass_contract_rejection`` fails the very run the retirement was
+        meant to save, and ``cohort_size`` never reaches the zero that closes the
+        batch loop.
+
+        Applied to that one branch only: a replay run selects its cohort to
+        re-parse committed bytes with a newer parser, which is the one path that
+        may legitimately revisit a retired target.
+        """
+
+        kept = [
+            item
+            for item in fetches
+            if (
+                self.control.get_frontier_target(str(item["target_id"])) or {}
+            ).get("state")
+            != "quarantined"
+        ]
+        if len(kept) != len(fetches):
+            logger.info(
+                "FBref parse cohort skipped %s already retired target(s)",
+                len(fetches) - len(kept),
+            )
+        return kept
+
     def _failed_claimed_observation(
         self,
         *,
@@ -4614,6 +4721,13 @@ class FBrefPipeline:
                     record_failure=False,
                 )
         except Exception as exc:
+            if isinstance(exc, GenericPersistenceError):
+                exc = (
+                    self._historical_contract_rejection(
+                        html, record, prepared_page
+                    )
+                    or exc
+                )
             return self._failed_claimed_observation(
                 record=record,
                 page=prepared_page,
@@ -5407,6 +5521,10 @@ class FBrefPipeline:
                 stateful_parser_version=DISCOVERY_PARSER_VERSION,
                 limit=settings.shard_size,
             )
+            # Only this branch needs the guard: ``list_unprocessed_fetches``
+            # excludes retired targets in SQL, and a replay must keep the right
+            # to re-parse retired bytes with a fixed parser version.
+            fetches = self._without_retired_targets(fetches)
         result.cohort_size = len(fetches)
 
         def stateful_identity(item):

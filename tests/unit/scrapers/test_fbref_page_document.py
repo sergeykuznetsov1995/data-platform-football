@@ -1,6 +1,10 @@
 import pytest
 
-from scrapers.fbref.page_document import Availability, parse_page_document
+from scrapers.fbref.page_document import (
+    Availability,
+    parse_page_document,
+    response_owns_target_page,
+)
 
 
 TABLELESS_PLAYER_PROFILE = """
@@ -326,3 +330,65 @@ def test_rows_repeating_the_same_entities_get_distinct_ids():
     assert len(row_ids) == 2
     assert len(set(row_ids)) == 2
     assert len(merge_keys) == len(cells)
+
+
+# Shape of the real 1938 Austria squad response: a full 200 page whose only
+# content is a note about a withdrawn World Cup tie, head and all.
+TABLELESS_SQUAD_ARCHIVE = """
+<html><head>
+  <link rel="canonical"
+    href="https://fbref.com/en/squads/d5121f10/1938/Austria-Men-Stats"/>
+  <meta property="og:url"
+    content="https://fbref.com/en/squads/d5121f10/1938/Austria-Men-Stats">
+  <meta property="og:type" content="    Organization" />
+</head><body>
+  <div id="meta"><h1><span>1938 Austria Stats</span></h1></div>
+  <div id="content"><p>Round of 16: Sweden advance to Quarter-finals.</p></div>
+</body></html>
+"""
+
+ARCHIVE_URL = "https://fbref.com/en/squads/d5121f10/1938/Austria-Men-Stats"
+
+
+def test_the_sources_own_tableless_page_proves_it_owns_the_target_url():
+    assert response_owns_target_page(
+        TABLELESS_SQUAD_ARCHIVE, canonical_url=ARCHIVE_URL
+    )
+    # A trailing slash is the same address.
+    assert response_owns_target_page(
+        TABLELESS_SQUAD_ARCHIVE, canonical_url=ARCHIVE_URL + "/"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        # A foreign 200 shell: same coarse shape, no evidence at all.
+        lambda html: "<html><head></head><body>502</body></html>",
+        # Advertises a different target: retiring ours would be wrong.
+        lambda html: html.replace("/1938/", "/1954/"),
+        # Only one of the two source-supplied addresses survives.
+        lambda html: html.replace('<link rel="canonical"', "<link rel=alt"),
+        lambda html: html.replace('property="og:url"', 'property="og:x"'),
+        # No header block of the source's own template.
+        lambda html: html.replace('<div id="meta">', '<div id="other">'),
+        # Header block present but empty.
+        lambda html: html.replace("<span>1938 Austria Stats</span>", ""),
+        # Plain http is not the source's canonical scheme.
+        lambda html: html.replace("https://fbref.com", "http://fbref.com"),
+        # A look-alike host must not pass for fbref.com.
+        lambda html: html.replace("fbref.com", "fbref.com.example.net"),
+    ],
+)
+def test_a_tableless_response_without_full_evidence_is_not_the_target_page(
+    mutation,
+):
+    assert not response_owns_target_page(
+        mutation(TABLELESS_SQUAD_ARCHIVE), canonical_url=ARCHIVE_URL
+    )
+
+
+def test_target_without_a_canonical_url_can_never_prove_ownership():
+    assert not response_owns_target_page(
+        TABLELESS_SQUAD_ARCHIVE, canonical_url=""
+    )

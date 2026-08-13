@@ -157,6 +157,69 @@ def _has_verified_zero_table_player_profile(
     )
 
 
+def _matches_target_url(value: object, expected_url: str) -> bool:
+    """Compare a source-advertised URL with the target's own canonical URL."""
+
+    expected = urlparse(str(expected_url or "").strip())
+    expected_path = expected.path.rstrip("/").casefold()
+    if not expected_path:
+        return False
+    parsed = urlparse(str(value or "").strip())
+    return (
+        parsed.scheme.casefold() == "https"
+        and str(parsed.hostname or "").casefold()
+        in {"fbref.com", "www.fbref.com"}
+        and parsed.path.rstrip("/").casefold() == expected_path
+    )
+
+
+def response_owns_target_page(html: str, *, canonical_url: str) -> bool:
+    """Prove a table-free response is the target's own page, not a shell.
+
+    A page with no tables and a generic 200 error shell have the same coarse
+    shape, so a caller that wants to retire a target on "no tables" must first
+    demand positive evidence the source itself supplies: the page advertises
+    *this* target's canonical address in both its ``link rel=canonical`` and its
+    ``og:url``, and it carries the source's own header block.  A proxy or error
+    page cannot produce that triple without being the requested page.
+
+    This is the page-kind-agnostic sibling of
+    ``_has_verified_zero_table_player_profile``; it deliberately omits
+    ``og:type``, which differs per page kind (``athlete`` for players,
+    ``Organization`` for squads).
+    """
+
+    if not canonical_url:
+        return False
+    soup = BeautifulSoup(html or "", "html.parser")
+    canonical_matches = any(
+        "canonical"
+        in {
+            str(item).strip().casefold()
+            for item in (
+                link.get("rel")
+                if isinstance(link.get("rel"), (list, tuple))
+                else str(link.get("rel") or "").split()
+            )
+        }
+        and _matches_target_url(link.get("href"), canonical_url)
+        for link in soup.find_all("link", href=True)
+    )
+    og_url_matches = any(
+        str(tag.get("property") or "").strip().casefold() == "og:url"
+        and _matches_target_url(tag.get("content"), canonical_url)
+        for tag in soup.find_all("meta")
+    )
+    page_meta = soup.find(id="meta")
+    heading = page_meta.find("h1") if isinstance(page_meta, Tag) else None
+    return (
+        canonical_matches
+        and og_url_matches
+        and isinstance(heading, Tag)
+        and bool(_text(heading))
+    )
+
+
 def _entity_ids(tag: Tag) -> Dict[str, str]:
     """Extract stable source IDs without interpreting display text."""
 
@@ -579,4 +642,5 @@ __all__ = [
     "PageRow",
     "PageTable",
     "parse_page_document",
+    "response_owns_target_page",
 ]

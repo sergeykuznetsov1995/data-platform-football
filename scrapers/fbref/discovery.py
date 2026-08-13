@@ -1268,6 +1268,32 @@ def parse_schedule_html(
     )
 
 
+_ARCHIVED_SEASON_SEGMENT_RE = re.compile(r"(?:19|20)\d{2}(?:-(?:19|20)\d{2})?")
+
+
+def url_addresses_archived_edition(canonical_url: str) -> bool:
+    """True when a URL addresses one finished season, not a living entity.
+
+    FBref addresses a club's current squad without a season
+    (``/en/squads/d5121f10/Austria-Men-Stats``) and every finished edition with
+    one (``/en/squads/d5121f10/1938/Austria-Men-Stats``); the two are separate
+    targets because a squad identity carries a per-URL discriminator.  Only the
+    dated address is immutable -- the season-less one is a row the current-season
+    lane keeps refreshing -- so a verdict that retires a target for good may only
+    be spent on the former.  Recognised conservatively: an unfamiliar shape is
+    treated as living, which keeps its failures loud.
+    """
+
+    route = [
+        part
+        for part in urlparse(str(canonical_url or "")).path.split("/")
+        if part
+    ][1:]
+    return len(route) >= 4 and bool(
+        _ARCHIVED_SEASON_SEGMENT_RE.fullmatch(route[2])
+    )
+
+
 def _has_season_component(route: Sequence[str]) -> bool:
     """True when a comps route carries an explicit season segment.
 
