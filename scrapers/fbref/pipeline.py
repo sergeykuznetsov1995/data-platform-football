@@ -22,6 +22,7 @@ from typing import Callable, Iterable, Mapping, Optional, Sequence
 from scrapers.fbref.bronze import (
     FBrefGenericBronzeWriter,
     GenericPagePersistItem,
+    GenericPersistenceError,
 )
 from scrapers.fbref.control import (
     BudgetExceeded,
@@ -4366,6 +4367,40 @@ class FBrefPipeline:
             f"Season source contract failed for {record.target_id}"
         )
 
+    def _historical_contract_rejection(
+        self, record: RawFetchRecord, page: PageDocument
+    ) -> Optional[SourceContractRejected]:
+        """Isolate a page shape only the archive can publish, and only there.
+
+        FBref serves finished-but-table-free pages for old seasons: the 1938
+        Austria squad page is a full 200 response whose whole content is a note
+        about a withdrawn World Cup tie.  The generic contract is right to
+        reject it, but a single such page must not end a run -- the target is
+        immutable, its bytes are already committed as error evidence, and every
+        later run would fetch and reject the very same bytes again.
+
+        Only a ``page_contract:`` verdict on a ``historical_once`` target is
+        isolated.  A live target keeps failing loudly, because there a
+        table-free page is how source drift announces itself, and a parser that
+        crashed on a malformed table is a bug of ours in either lane.
+        """
+
+        if not page.errors:
+            return None
+        if not all(
+            error.startswith("page_contract:") for error in page.errors
+        ):
+            return None
+        frontier = self.control.get_frontier_target(record.target_id) or {}
+        if frontier.get("refresh_policy") != "historical_once":
+            return None
+        return SourceContractRejected(
+            f"Generic source contract failed for {record.target_id}",
+            target_id=record.target_id,
+            content_hash=record.content_hash,
+            reason=",".join(sorted(set(page.errors))),
+        )
+
     def _failed_claimed_observation(
         self,
         *,
@@ -4580,6 +4615,11 @@ class FBrefPipeline:
                     record_failure=False,
                 )
         except Exception as exc:
+            if isinstance(exc, GenericPersistenceError):
+                exc = (
+                    self._historical_contract_rejection(record, prepared_page)
+                    or exc
+                )
             return self._failed_claimed_observation(
                 record=record,
                 page=prepared_page,

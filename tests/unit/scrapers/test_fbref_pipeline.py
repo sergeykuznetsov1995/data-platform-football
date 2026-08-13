@@ -41,7 +41,8 @@ from scrapers.fbref.match_parser import (
     DatasetStatus,
     MatchParseResult,
 )
-from scrapers.fbref.page_document import PAGE_DOCUMENT_VERSION
+from scrapers.fbref.bronze import GenericPersistenceError
+from scrapers.fbref.page_document import PAGE_DOCUMENT_VERSION, PageDocument
 from scrapers.fbref.pipeline import (
     FBrefPipeline,
     FETCH_LEASE_SECONDS,
@@ -4768,6 +4769,142 @@ def test_non_contract_parse_failure_still_fails_the_whole_wave(tmp_path):
         )
 
     assert control.frontier[record.target_id]["state"] == "fetched"
+
+
+class BronzePageContractWriter(FakeWriter):
+    """Reject page.errors with the exact verdict the real writer raises."""
+
+    def persist_page(self, page, **kwargs):
+        if page.errors:
+            raise GenericPersistenceError(
+                f"Page {page.target_id} contained parser errors: "
+                f"{page.errors[:3]}"
+            )
+        return super().persist_page(page, **kwargs)
+
+
+def _tableless_squad_wave(tmp_path, *, historical):
+    """Cohort of the production shape plus a healthy squad page.
+
+    FBref answers the 1938 Austria squad URL with a full 200 page carrying no
+    table at all: the team withdrew from that World Cup, so the season has
+    nothing to tabulate and no retry can change it.
+    """
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    rejected = page_target_from_link(DiscoveredPageLink(
+        page_kind="squad",
+        canonical_url=(
+            "https://fbref.com/en/squads/d5121f10/1938/Austria-Men-Stats"
+        ),
+        source_ids={"squad_id": "d5121f10", "season_id": "1938"},
+    ))
+    healthy = page_target_from_link(DiscoveredPageLink(
+        page_kind="squad",
+        canonical_url=(
+            "https://fbref.com/en/squads/d5121f10/1954/Austria-Men-Stats"
+        ),
+        source_ids={"squad_id": "d5121f10", "season_id": "1954"},
+    ))
+    pages = [
+        (rejected, """
+        <div id="content"><h1>1938 Austria Men Stats</h1>
+          <p>Round of 16 (June 4, 1938): Sweden advance to Quarter-finals.</p>
+        </div>
+        """),
+        (healthy, """
+        <div id="content"><h1>1954 Austria Men Stats</h1>
+          <table id="stats_standard_combined">
+            <thead><tr><th data-stat="player">Player</th></tr></thead>
+            <tbody><tr><td data-stat="player">Ernst Ocwirk</td></tr></tbody>
+          </table>
+        </div>
+        """),
+    ]
+    for target, html in pages:
+        refresh, record = _commit_for_parse(raw, target, html)
+        control.upsert_frontier_target(
+            frontier_target(target, historical=historical)
+        )
+        control.frontier[record.target_id].update(
+            state="fetched", last_content_hash=record.content_hash
+        )
+        control.fetches.append({
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "logical_refresh_id": refresh,
+        })
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=BronzePageContractWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+    return control, pipeline, rejected.target_id, healthy.target_id
+
+
+def test_tableless_archived_squad_is_retired_without_failing_its_cohort(
+    tmp_path,
+):
+    control, pipeline, rejected_id, healthy_id = _tableless_squad_wave(
+        tmp_path, historical=True
+    )
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["squad"],
+        settings=_settings("backfill"),
+    )
+
+    assert result.failures == []
+    assert result.contract_quarantined == 1
+    # One archived shell must not hold the rest of the campaign hostage: this
+    # is what stopped the history lane on 2026-08-13.
+    assert result.parsed == 1
+    assert control.frontier[healthy_id]["state"] == "fetched"
+    rejected = control.frontier[rejected_id]
+    assert rejected["state"] == "quarantined"
+    assert rejected["last_error_class"] == "ParseContractQuarantined"
+    assert rejected["last_error_message"] == "page_contract:no_tables"
+    assert rejected["next_fetch_at"] is None
+
+
+def test_tableless_live_squad_page_still_fails_the_wave(tmp_path):
+    control, pipeline, rejected_id, _ = _tableless_squad_wave(
+        tmp_path, historical=False
+    )
+
+    # On a recurring target a table-free page is how source drift announces
+    # itself, so it stays a loud failure instead of a silent retirement.
+    with pytest.raises(ParseWaveError, match="page_contract:no_tables"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=_settings("current"),
+        )
+
+    assert control.frontier[rejected_id]["state"] == "fetched"
+
+
+def test_parser_crash_on_an_archived_page_is_never_isolated(tmp_path):
+    control, pipeline, rejected_id, _ = _tableless_squad_wave(
+        tmp_path, historical=True
+    )
+    record = pipeline.raw_store.read_fetch_record(
+        control.fetches[0]["logical_refresh_id"]
+    )
+    crashed = PageDocument(
+        target_id=rejected_id,
+        page_kind="squad",
+        content_hash=record.content_hash,
+        parser_version=PAGE_DOCUMENT_VERSION,
+        tables=(),
+        errors=("content[0]:ValueError:broken colspan",),
+    )
+
+    # A table our own parser choked on is a bug of ours, not a source shape.
+    assert pipeline._historical_contract_rejection(record, crashed) is None
 
 
 def test_duplicate_display_label_selects_one_canonical_current_edition(
