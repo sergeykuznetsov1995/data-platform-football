@@ -111,6 +111,11 @@ MATCH_CONTENT_SECTIONS = (
 # fully exhausted stream is the source disagreeing with itself, not missing
 # collection work.
 TRANSFER_SOURCE_HITS_TOLERANCE = 2
+# Расхождение растёт вместе с потоком: 13.08 у турнира 86 (окно 1 год) источник
+# отдал 15 страниц и ровно 677 строк без единого дубля, а в ``hits`` заявил 681.
+# Собирать было нечего — не хватало самому счётчику, — но абсолютный допуск в два
+# события красил ран целиком. Поэтому допуск ещё и долевой.
+TRANSFER_SOURCE_HITS_TOLERANCE_RATIO = 0.01
 
 _BLOCKING_PARSE_ISSUES = frozenset(
     {
@@ -2288,11 +2293,11 @@ class FotMobIngestService:
             )
         elif len(unique_ids) < expected_hits:
             deficit = expected_hits - len(unique_ids)
-            if (
-                stream_exhausted
-                and result.ok
-                and deficit <= TRANSFER_SOURCE_HITS_TOLERANCE
-            ):
+            tolerance = max(
+                TRANSFER_SOURCE_HITS_TOLERANCE,
+                int(expected_hits * TRANSFER_SOURCE_HITS_TOLERANCE_RATIO),
+            )
+            if stream_exhausted and result.ok and deficit <= tolerance:
                 # #1074: every page fetched and parsed, the stream ran dry,
                 # and the shortfall to the source's own ``hits`` counter is
                 # within its known 1-2 event self-disagreement. There is no
