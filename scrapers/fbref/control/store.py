@@ -8362,6 +8362,7 @@ class ControlStore:
         parser_version: Optional[str] = None,
         typed_parser_version: Optional[str] = None,
         stateful_parser_version: Optional[str] = None,
+        include_quarantined: bool = True,
         limit: int = 25,
     ) -> list[dict]:
         """Return a bounded offline-parse handoff for successful fetches.
@@ -8443,6 +8444,7 @@ class ControlStore:
                         )
                       )
                   )
+                  AND (%s OR frontier.state <> 'quarantined')
                 ORDER BY target.ordinal, attempt.attempt_number DESC
                 LIMIT %s
                 """,
@@ -8458,6 +8460,7 @@ class ControlStore:
                     typed_parser_version,
                     parser_version,
                     parser_version,
+                    bool(include_quarantined),
                     normalized_limit,
                 ),
             )

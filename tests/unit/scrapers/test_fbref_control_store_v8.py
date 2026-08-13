@@ -788,6 +788,32 @@ def test_global_unprocessed_raw_includes_failed_source_runs_oldest_first():
     )
 
 
+def test_run_fetch_selection_can_exclude_quarantined_before_limit():
+    captured = {}
+    run_id = str(uuid.uuid4())
+
+    def handler(sql, params):
+        captured["sql"] = sql
+        captured["params"] = params
+        return [], 0
+
+    store, _ = make_store(handler)
+    assert store.list_run_fetches(
+        run_id,
+        page_kinds=["season"],
+        include_quarantined=False,
+        limit=3,
+    ) == []
+
+    assert "frontier.state <> 'quarantined'" in captured["sql"]
+    assert captured["params"][-2:] == (False, 3)
+
+    assert store.list_run_fetches(
+        run_id, page_kinds=["season"], limit=3
+    ) == []
+    assert captured["params"][-2:] == (True, 3)
+
+
 def test_unprocessed_fetches_skip_only_provably_superseded_failed_observation():
     captured = {}
 

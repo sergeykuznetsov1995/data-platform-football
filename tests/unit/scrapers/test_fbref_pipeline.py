@@ -716,10 +716,18 @@ class FakeControl:
         parser_version=None,
         typed_parser_version=None,
         stateful_parser_version=None,
+        include_quarantined=True,
     ):
         rows = [
             item for item in self.fetches if item["page_kind"] in page_kinds
         ]
+        if not include_quarantined:
+            rows = [
+                item for item in rows
+                if self.frontier.get(
+                    str(item["target_id"]), {}
+                ).get("state") != "quarantined"
+            ]
         if only_unparsed and typed_parser_version is not None:
             rows = [
                 item for item in rows
@@ -4626,6 +4634,29 @@ def test_contract_quarantine_drops_the_target_from_the_recovery_cohort(
     # which is what blocked the daily DAG behind three archived seasons.
     assert second.cohort_size == 0
     assert control.frontier[rejected_id]["state"] == "quarantined"
+
+
+def test_retired_head_does_not_hide_later_run_fetch(tmp_path):
+    control, pipeline, _, healthy_id = _schedule_less_season_wave(tmp_path)
+    settings = replace(_settings("backfill"), shard_size=1)
+    run_id = str(uuid.uuid4())
+
+    first = pipeline.parse_wave(
+        run_id, page_kinds=["season"], settings=settings
+    )
+    second = pipeline.parse_wave(
+        run_id, page_kinds=["season"], settings=settings
+    )
+
+    assert first.contract_quarantined == 1
+    assert second.cohort_size == 1
+    assert second.parsed == 1
+    assert any(
+        key[0] == control.fetches[1]["logical_refresh_id"]
+        and observed["status"] == "succeeded"
+        for key, observed in control.observations.items()
+    )
+    assert control.frontier[healthy_id]["state"] == "fetched"
 
 
 def test_unretired_contract_rejection_still_fails_the_wave(tmp_path):

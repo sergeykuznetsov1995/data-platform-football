@@ -4475,21 +4475,12 @@ class FBrefPipeline:
     def _without_retired_targets(
         self, fetches: Sequence[Mapping[str, object]]
     ) -> list[Mapping[str, object]]:
-        """Keep a retired target's raw out of every later batch of its own run.
+        """Remove targets retired after the same-run SQL cohort was selected.
 
-        ``list_run_fetches`` selects a run's own cohort with no frontier-state
-        filter -- unlike ``list_unprocessed_fetches``, which excludes retired
-        targets by name.  So the batch that retires a target is not the last one
-        to see it: every later batch of the same run re-claims the same bytes,
-        re-applies the verdict, and inflates ``contract_quarantined`` with no new
-        work.  Once such sticky targets dominate a late cohort,
-        ``_is_mass_contract_rejection`` fails the very run the retirement was
-        meant to save, and ``cohort_size`` never reaches the zero that closes the
-        batch loop.
-
-        Applied to that one branch only: a replay run selects its cohort to
-        re-parse committed bytes with a newer parser, which is the one path that
-        may legitimately revisit a retired target.
+        Ordinary parsing excludes quarantined targets before its bounded query,
+        but a target can still be retired between that selection and processing.
+        Replays deliberately bypass this guard because a newer parser may need
+        to revisit committed retired bytes.
         """
 
         kept = [
@@ -5519,11 +5510,11 @@ class FBrefPipeline:
                 parser_version=PAGE_DOCUMENT_VERSION,
                 typed_parser_version=TYPED_BRONZE_PARSER_VERSION,
                 stateful_parser_version=DISCOVERY_PARSER_VERSION,
+                include_quarantined=False,
                 limit=settings.shard_size,
             )
-            # Only this branch needs the guard: ``list_unprocessed_fetches``
-            # excludes retired targets in SQL, and a replay must keep the right
-            # to re-parse retired bytes with a fixed parser version.
+            # SQL selection skips retired targets before the cohort limit. This
+            # guard still protects against a retirement racing selection.
             fetches = self._without_retired_targets(fetches)
         result.cohort_size = len(fetches)
 
