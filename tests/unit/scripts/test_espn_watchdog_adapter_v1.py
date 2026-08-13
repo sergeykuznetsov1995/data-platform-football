@@ -20,7 +20,10 @@ from scripts.espn_watchdog_adapter_v1 import (
     EXPECTED_PROBE_SHA256,
     EXPECTED_RESULT_CODES,
     EXPECTED_SCHEDULER_CONTAINER,
+    RUNTIME_COLLECTOR_KILL_AFTER_SECONDS,
+    RUNTIME_COLLECTOR_TIMEOUT_SECONDS,
     RUNTIME_READ_METHODS,
+    RUNTIME_SNAPSHOT_TIMEOUT_SECONDS,
     SchedulerRuntimeReaders,
     _TrinoReadClient,
     _adapter_sha256,
@@ -180,6 +183,10 @@ def test_host_adapter_uses_exact_boundaries_and_streams_snapshot(tmp_path):
         "/usr/bin/docker",
         "exec",
         EXPECTED_SCHEDULER_CONTAINER,
+        "/usr/bin/timeout",
+        "--signal=TERM",
+        "--kill-after=30s",
+        "1800s",
         "python",
         "-B",
         "/opt/airflow/scripts/espn_watchdog_adapter_v1.py",
@@ -187,6 +194,14 @@ def test_host_adapter_uses_exact_boundaries_and_streams_snapshot(tmp_path):
         "--observed-at",
         OBSERVED_AT.isoformat(timespec="seconds"),
     )
+    assert host.commands[1][2] == RUNTIME_SNAPSHOT_TIMEOUT_SECONDS == 1860.0
+    assert RUNTIME_COLLECTOR_TIMEOUT_SECONDS == 1800.0
+    assert RUNTIME_COLLECTOR_KILL_AFTER_SECONDS == 30.0
+    assert (
+        RUNTIME_SNAPSHOT_TIMEOUT_SECONDS
+        > RUNTIME_COLLECTOR_TIMEOUT_SECONDS + RUNTIME_COLLECTOR_KILL_AFTER_SECONDS
+    )
+    assert host.commands[2][2] == 900.0
     assert host.commands[2][0] == (
         sys.executable,
         "-B",

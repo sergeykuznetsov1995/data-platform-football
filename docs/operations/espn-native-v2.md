@@ -192,6 +192,12 @@ proof, повреждённый checksum, unsafe ownership/mode, plan/hash drift
 adapter собирает read-only snapshot; repository probe только проверяет input и
 печатает независимые результаты. Запуск из immutable release:
 
+The 181-scope runtime snapshot is expensive and may take more than 900 seconds.
+The reviewed adapter grants it 1,800 seconds inside the scheduler, sends TERM and
+then KILL after a 30-second grace, and waits up to 1,860 seconds on the host.
+Do not overlap collectors. A timeout remains a hard failure and must leave no
+`--collect-runtime` process behind before retry or arm-window entry.
+
 ```bash
 /root/.venvs/dpf-test/bin/python scripts/espn_rollout_probe_v1.py \
   --snapshot /protected/read-only/espn-rollout-snapshot.json \

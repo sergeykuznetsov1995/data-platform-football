@@ -44,6 +44,11 @@ EXPECTED_PROBE_SHA256 = (
 )
 CONTAINER_PROBE_PATH = "/opt/airflow/scripts/espn_watchdog_adapter_v1.py"
 DOCKER = "/usr/bin/docker"
+CONTAINER_TIMEOUT = "/usr/bin/timeout"
+RUNTIME_COLLECTOR_TIMEOUT_SECONDS = 1800.0
+RUNTIME_COLLECTOR_KILL_AFTER_SECONDS = 30.0
+RUNTIME_SNAPSHOT_TIMEOUT_SECONDS = 1860.0
+PROBE_TIMEOUT_SECONDS = 900.0
 DEFAULT_PROBE_PYTHON = "/root/.venvs/dpf-test/bin/python"
 ARM_START_UTC = time(13, 50)
 ARM_END_UTC = time(14, 15)
@@ -265,6 +270,10 @@ def _runtime_observations(
         DOCKER,
         "exec",
         EXPECTED_SCHEDULER_CONTAINER,
+        CONTAINER_TIMEOUT,
+        "--signal=TERM",
+        f"--kill-after={int(RUNTIME_COLLECTOR_KILL_AFTER_SECONDS)}s",
+        f"{int(RUNTIME_COLLECTOR_TIMEOUT_SECONDS)}s",
         "python",
         "-B",
         CONTAINER_PROBE_PATH,
@@ -272,7 +281,11 @@ def _runtime_observations(
         "--observed-at",
         observed,
     )
-    completed = run_command(command, input_text=None, timeout=900.0)
+    completed = run_command(
+        command,
+        input_text=None,
+        timeout=RUNTIME_SNAPSHOT_TIMEOUT_SECONDS,
+    )
     if completed.returncode != 0:
         raise AdapterError("scheduler runtime snapshot command failed")
     envelope = _strict_json_loads(
@@ -450,7 +463,7 @@ def observe(
         completed = run_command(
             command,
             input_text=_canonical_json(snapshot),
-            timeout=900.0,
+            timeout=PROBE_TIMEOUT_SECONDS,
         )
         raw_report = _strict_json_loads(
             completed.stdout, label="versioned rollout probe stdout"
