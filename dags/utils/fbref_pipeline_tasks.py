@@ -10,12 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import signal
 import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
@@ -560,6 +562,129 @@ def _require_fbref_publication_mode(run: Mapping[str, object]) -> None:
         )
 
 
+# The daily publishing DAG is scheduled at 06:00Z and takes the publication
+# lock as its very first step.  A historical run still in flight then costs the
+# platform a whole day of publication, so the window is checked here — before
+# the control run exists, before the lock, before one paid request.
+FBREF_INGEST_WINDOW_START_UTC = dt_time(hour=6, minute=0)
+FBREF_HISTORY_WINDOW_MARGIN_MINUTES = 45
+FBREF_HISTORY_WINDOW_OVERHEAD_MINUTES = 30
+
+
+def _normalize_shard_size(value: object) -> int:
+    if type(value) is int:
+        normalized = value
+    elif isinstance(value, str) and value.strip().isdecimal():
+        normalized = int(value.strip())
+    else:
+        raise ValueError("shard_size must be an integer")
+    if not 1 <= normalized <= FBREF_MAX_WARM_SESSION_TARGETS:
+        raise ValueError(
+            f"shard_size must be between 1 and {FBREF_MAX_WARM_SESSION_TARGETS}"
+        )
+    return normalized
+
+
+def guard_fbref_history_window(
+    *,
+    max_batches,
+    shard_size,
+    domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+    margin_minutes: int = FBREF_HISTORY_WINDOW_MARGIN_MINUTES,
+    overhead_minutes: int = FBREF_HISTORY_WINDOW_OVERHEAD_MINUTES,
+    now=None,
+) -> dict:
+    """Refuse a historical run whose own ceiling would reach the daily window.
+
+    The projection uses the run's own hard ceiling — every batch full, every
+    page paying the polite domain interval — so it errs long, which is the
+    direction that protects the daily lane.
+    """
+
+    batches = _normalize_live_batch_count(max_batches)
+    shard = _normalize_shard_size(shard_size)
+    try:
+        interval_seconds = float(domain_interval_seconds)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("domain_interval_seconds must be numeric") from exc
+    if interval_seconds <= 0:
+        raise ValueError("domain_interval_seconds must be positive")
+
+    pages = batches * shard
+    projected_minutes = int(overhead_minutes) + math.ceil(
+        pages * interval_seconds / 60
+    )
+    started_at = (
+        datetime.now(timezone.utc)
+        if now is None
+        else now.astimezone(timezone.utc)
+    )
+    window_start = datetime.combine(
+        started_at.date(), FBREF_INGEST_WINDOW_START_UTC, tzinfo=timezone.utc
+    )
+    if window_start <= started_at:
+        window_start += timedelta(days=1)
+    deadline = window_start - timedelta(minutes=int(margin_minutes))
+    projected_end = started_at + timedelta(minutes=projected_minutes)
+    verdict = {
+        "pages": pages,
+        "projected_minutes": projected_minutes,
+        "projected_end": projected_end.isoformat(),
+        "deadline": deadline.isoformat(),
+        "ingest_window_start": window_start.isoformat(),
+    }
+    if projected_end > deadline:
+        from airflow.exceptions import AirflowFailException
+
+        raise AirflowFailException(
+            "FBref historical run would reach the daily ingest window: "
+            f"{pages} pages ≈ {projected_minutes} min, ends "
+            f"{projected_end.isoformat()} > {deadline.isoformat()}"
+        )
+    logger.info("FBref history window guard passed: %s", json.dumps(verdict))
+    return verdict
+
+
+def choose_fbref_backfill_publication_path(*, publish) -> str:
+    """Route a non-publishing historical run straight to lock release."""
+
+    return (
+        "export_publication_scope"
+        if _boolean_parameter(publish, name="publish")
+        else "release_publication_lock"
+    )
+
+
+FBREF_NONPUBLISHING_EXECUTION_MODES = frozenset(
+    {"history_nonpublishing", "canary_nonpublishing", "bootstrap_only"}
+)
+
+
+def _require_fbref_nonpublishing_mode(run: Mapping[str, object]) -> None:
+    """Reverse fence: only a self-declared non-publishing run gets advisory.
+
+    ``_require_fbref_publication_mode`` keeps publication away from a canary.
+    This is its mirror image and it is deliberately fail-closed: a missing or
+    unreadable execution-mode marker means the run may still publish, so it
+    must keep the hard gate rather than silently downgrade to warnings.
+    """
+
+    metadata = run.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError(
+            "FBref advisory freshness requires execution-mode evidence"
+        )
+    execution_mode = str(metadata.get("execution_mode") or "").casefold()
+    if (
+        metadata.get("publication_eligible") is not False
+        or execution_mode not in FBREF_NONPUBLISHING_EXECUTION_MODES
+    ):
+        raise RuntimeError(
+            "FBref advisory freshness refused for a publishing run "
+            f"(execution_mode={execution_mode or 'unknown'})"
+        )
+
+
 def export_fbref_publication_scope(
     *, airflow_run_id: str, dag_id: str
 ) -> dict:
@@ -822,15 +947,25 @@ def validate_fbref_current_scope_freshness(
     dag_id: str,
     run_type: str,
     fail_fast: bool = True,
+    enforce=None,
 ) -> dict:
     """Fail closed when any active male/current target exceeds its source SLA.
 
     ``ControlStore.get_run_summary`` selects the authoritative current scope.
     This callable intentionally uses only that public API, and accepts either
     the detailed per-page-kind document or its aggregate for rolling upgrades.
+
+    ``enforce=False`` downgrades the verdict to advisory for a historical run
+    that physically cannot publish.  It is not a switch an operator may flip on
+    a publishing run: the run's own durable metadata has to prove it opted out
+    (``_require_fbref_nonpublishing_mode``).  ``enforce=None`` is today's
+    behaviour and stays the default for every existing caller.
     """
 
     normalized_run_type = str(run_type).strip().casefold()
+    enforcing = (
+        True if enforce is None else _boolean_parameter(enforce, name="enforce")
+    )
     if normalized_run_type == "replay":
         return {"status": "not_applicable", "run_type": "replay"}
     if normalized_run_type not in {"current", "backfill"}:
@@ -841,7 +976,10 @@ def validate_fbref_current_scope_freshness(
     )
     if summary is None:
         raise RuntimeError("FBref freshness gate cannot find its control run")
-    _require_fbref_publication_mode(summary)
+    if enforcing:
+        _require_fbref_publication_mode(summary)
+    else:
+        _require_fbref_nonpublishing_mode(summary)
 
     aggregate = summary.get("publication_scope_freshness")
     if not isinstance(aggregate, Mapping):
@@ -856,16 +994,20 @@ def validate_fbref_current_scope_freshness(
 
     violations = []
     warnings = []
-    if (
-        normalized_run_type == "backfill"
-        and _non_negative_metric(
-            summary, "promotion_pending_match_count"
-        )
-        != 0
-    ):
-        violations.append(
-            "promotion_pending_match_count="
-            f"{int(summary['promotion_pending_match_count'])}"
+    if normalized_run_type == "backfill":
+        pending = _non_negative_metric(summary, "promotion_pending_match_count")
+        if pending:
+            (violations if enforcing else warnings).append(
+                f"promotion_pending_match_count={pending}"
+            )
+    # Historical matches are excluded from the daily publication scope by
+    # construction, so their backlog is a campaign metric, never a gate.
+    historical_pending = _non_negative_metric(
+        summary, "historical_pending_match_count"
+    )
+    if historical_pending:
+        warnings.append(
+            f"historical_pending_match_count={historical_pending}"
         )
     normalized_kinds = {}
     if isinstance(by_kind, Mapping):
@@ -952,6 +1094,12 @@ def validate_fbref_current_scope_freshness(
             "all_within_sla": within_sla,
         }
 
+    if violations and not enforcing:
+        # The run proved it cannot publish, so a rotten publication scope is
+        # somebody else's alarm: reporting it as this run's failure would only
+        # stop the historical lane from ever moving.
+        warnings.extend("advisory:" + violation for violation in violations)
+        violations = []
     if violations:
         from airflow.exceptions import AirflowException, AirflowFailException
 
@@ -968,7 +1116,7 @@ def validate_fbref_current_scope_freshness(
             "; ".join(warnings),
         )
     return {
-        "status": "passed",
+        "status": "passed" if enforcing else "advisory",
         "run_type": normalized_run_type,
         "publication_scope_freshness": normalized_aggregate,
         "freshness_by_page_kind": normalized_kinds,
@@ -1356,7 +1504,14 @@ def initialize_fbref_run(
     domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
     bootstrap_only=False,
     dag_run_type=None,
+    publishing=True,
 ) -> str:
+    normalized_run_type = str(run_type).strip().casefold()
+    publishes = _boolean_parameter(publishing, name="publishing")
+    if not publishes and normalized_run_type != "backfill":
+        raise ValueError(
+            "FBref non-publishing mode is supported only for backfill runs"
+        )
     settings = _settings(
         run_type=run_type,
         request_limit=request_limit,
@@ -1365,7 +1520,6 @@ def initialize_fbref_run(
         reservation_mb=reservation_mb,
         domain_interval_seconds=domain_interval_seconds,
     )
-    normalized_run_type = str(run_type).strip().casefold()
     if normalized_run_type == "current":
         execution = validate_fbref_current_execution_mode(
             bootstrap_only=bootstrap_only,
@@ -1386,8 +1540,13 @@ def initialize_fbref_run(
                 if dag_run_type is None
                 else str(dag_run_type).strip().casefold()
             ),
-            "execution_mode": normalized_run_type,
-            "publication_eligible": True,
+            # Durable evidence: the freshness gate and the publication fence
+            # both refuse to soften for a run that did not declare itself
+            # non-publishing here, before a single page was fetched.
+            "execution_mode": (
+                normalized_run_type if publishes else "history_nonpublishing"
+            ),
+            "publication_eligible": publishes,
             "profile": normalized_run_type,
         }
     control_execution = {
@@ -1554,6 +1713,37 @@ def finalize_fbref_publication_lock(
             "FBref publication lock was not acquired; final source verdict "
             f"fails closed (state={acquire_state})"
         )
+    export_state = states.get("export_publication_scope", "missing")
+    if (
+        states.get("choose_publication_path", "missing") == "success"
+        and export_state == "skipped"
+    ):
+        # Непубликующая историческая полоса: Silver не запускался и не должен
+        # был.  Доказательство берём не из состояний тасков, а из durable
+        # метаданных рана — ветку можно выбрать шаблоном, метаданные пишутся
+        # до первой страницы и переживают ретрай.
+        run = _control_store().get_run(
+            _control_run_id(airflow_run_id=airflow_run_id, dag_id=dag_id)
+        )
+        if run is None:
+            raise AirflowException(
+                "FBref non-publishing finalizer cannot find its control run"
+            )
+        _require_fbref_nonpublishing_mode(run)
+        released = release_fbref_publication_lock(
+            airflow_run_id=airflow_run_id, dag_id=dag_id
+        )
+        validate_state = states.get("validate_run", "missing")
+        if validate_state != "success":
+            raise AirflowException(
+                "FBref non-publishing lock was released, but its source "
+                f"verdict is red (validate_run={validate_state})"
+            )
+        return {
+            **released,
+            "publishing": False,
+            "status": "released_after_nonpublishing_run",
+        }
     silver_state = states.get("trigger_silver_transform", "missing")
     if silver_state != "success":
         if silver_state in {"skipped", "upstream_failed"}:
