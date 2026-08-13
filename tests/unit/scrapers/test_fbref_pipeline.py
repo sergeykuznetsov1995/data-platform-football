@@ -4997,6 +4997,79 @@ def test_tableless_archived_schedule_page_still_fails_the_wave(tmp_path):
     assert control.frontier[record.target_id]["state"] == "fetched"
 
 
+def _tableless_single_target_wave(tmp_path, *, page_kind, canonical_url,
+                                  source_ids):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind=page_kind,
+        canonical_url=canonical_url,
+        source_ids=source_ids,
+    ))
+    refresh, record = _commit_for_parse(
+        raw, target, _archive_shell(target.canonical_url, body="<p>x</p>")
+    )
+    control.upsert_frontier_target(frontier_target(target, historical=True))
+    control.frontier[record.target_id].update(
+        state="fetched", last_content_hash=record.content_hash
+    )
+    control.fetches.append({
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    })
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=BronzePageContractWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+    return control, pipeline, record.target_id
+
+
+def test_seasonless_squad_url_is_the_live_row_and_is_never_retired(tmp_path):
+    """A club's undated page is the row the current-season lane refreshes."""
+
+    control, pipeline, target_id = _tableless_single_target_wave(
+        tmp_path,
+        page_kind="squad",
+        canonical_url="https://fbref.com/en/squads/d5121f10/Austria-Men-Stats",
+        source_ids={"squad_id": "d5121f10"},
+    )
+
+    with pytest.raises(ParseWaveError, match="page_contract:no_tables"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=_settings("backfill"),
+        )
+
+    assert control.frontier[target_id]["state"] == "fetched"
+
+
+def test_player_target_is_never_retired_by_the_archive(tmp_path):
+    """One player row serves every season and both lanes, so it is never buried."""
+
+    control, pipeline, target_id = _tableless_single_target_wave(
+        tmp_path,
+        page_kind="player",
+        canonical_url=(
+            "https://fbref.com/en/players/406c5597/all_comps/"
+            "Naime-Said-Mchindra-Stats---All-Competitions"
+        ),
+        source_ids={"player_id": "406c5597"},
+    )
+
+    with pytest.raises(ParseWaveError, match="page_contract:no_tables"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["player"],
+            settings=_settings("backfill"),
+        )
+
+    assert control.frontier[target_id]["state"] == "fetched"
+
+
 def test_retired_target_leaves_the_cohort_of_its_own_run(tmp_path):
     control, pipeline, rejected_id, _ = _tableless_squad_wave(
         tmp_path, historical=True
@@ -5017,6 +5090,29 @@ def test_retired_target_leaves_the_cohort_of_its_own_run(tmp_path):
     assert second.cohort_size == 0
     assert second.contract_quarantined == 0
     assert second.failures == []
+
+
+def test_replay_may_still_reparse_a_retired_target(tmp_path):
+    """A fixed parser reaches retired bytes; only the run's own cohort is guarded."""
+
+    control, pipeline, rejected_id, _ = _tableless_squad_wave(
+        tmp_path, historical=True
+    )
+    pipeline.parse_wave(
+        str(uuid.uuid4()), page_kinds=["squad"], settings=_settings("backfill")
+    )
+    assert control.frontier[rejected_id]["state"] == "quarantined"
+
+    source_run_id = str(uuid.uuid4())
+    control.get_run = lambda _: _accepted_replay_source(source_run_id)
+    replay = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["squad"],
+        source_run_id=source_run_id,
+        settings=_settings("replay"),
+    )
+
+    assert replay.cohort_size == 1
 
 
 def test_duplicate_display_label_selects_one_canonical_current_edition(

@@ -55,6 +55,7 @@ from scrapers.fbref.discovery import (
     parse_season_html,
     season_page_is_complete_without_schedule,
     sentinel_coverage,
+    url_addresses_archived_edition,
 )
 from scrapers.fbref.fetcher import (
     FETCHER_VERSION,
@@ -133,8 +134,13 @@ MAX_ROUTINE_CONTRACT_QUARANTINES = 5
 # excluded on purpose: match targets exist only because a schedule page was
 # parsed (generic discovery drops match links), and a season/competition page
 # carries the campaign's own frontier, so retiring one would silently amputate
-# the subtree it alone discovers.
-_CONTRACT_ISOLATABLE_PAGE_KINDS = frozenset({"squad", "player"})
+# the subtree it alone discovers.  ``player`` is excluded too, and for a
+# different reason: a player identity is one frontier row for every season and
+# both lanes (``_PAGE_SOURCE_ID_KEYS["player"] == ("player_id",)``), so a verdict
+# earned in the archive would bury the live row -- and its own legitimate
+# table-free shape is already accepted upstream by
+# ``_has_verified_zero_table_player_profile``, so nothing is lost by excluding it.
+_CONTRACT_ISOLATABLE_PAGE_KINDS = frozenset({"squad"})
 REPLAY_SOURCE_REQUEST_LIMIT = DEFAULT_REQUEST_LIMIT
 REPLAY_SOURCE_BYTE_LIMIT = DEFAULT_BYTE_LIMIT
 ACCEPTANCE_REQUEST_LIMIT = 100
@@ -4435,7 +4441,10 @@ class FBrefPipeline:
           is how source drift announces itself;
         - ``_CONTRACT_ISOLATABLE_PAGE_KINDS`` only -- retiring a spine page
           would silently drop the subtree it alone discovers (a schedule page is
-          the only source of a season's match targets);
+          the only source of a season's match targets), and retiring a player
+          would bury the one row both lanes share;
+        - a dated address only -- a season-less squad URL is the club's living
+          row, which the current-season lane keeps refreshing;
         - the response must advertise this target's own canonical address.
         """
 
@@ -4446,6 +4455,8 @@ class FBrefPipeline:
         if not all(
             error.startswith("page_contract:") for error in page.errors
         ):
+            return None
+        if not url_addresses_archived_edition(record.canonical_url):
             return None
         frontier = self.control.get_frontier_target(record.target_id) or {}
         if frontier.get("refresh_policy") != "historical_once":
@@ -4475,6 +4486,10 @@ class FBrefPipeline:
         ``_is_mass_contract_rejection`` fails the very run the retirement was
         meant to save, and ``cohort_size`` never reaches the zero that closes the
         batch loop.
+
+        Applied to that one branch only: a replay run selects its cohort to
+        re-parse committed bytes with a newer parser, which is the one path that
+        may legitimately revisit a retired target.
         """
 
         kept = [
@@ -5506,7 +5521,10 @@ class FBrefPipeline:
                 stateful_parser_version=DISCOVERY_PARSER_VERSION,
                 limit=settings.shard_size,
             )
-        fetches = self._without_retired_targets(fetches)
+            # Only this branch needs the guard: ``list_unprocessed_fetches``
+            # excludes retired targets in SQL, and a replay must keep the right
+            # to re-parse retired bytes with a fixed parser version.
+            fetches = self._without_retired_targets(fetches)
         result.cohort_size = len(fetches)
 
         def stateful_identity(item):
