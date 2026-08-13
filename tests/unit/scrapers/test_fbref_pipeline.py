@@ -43,9 +43,11 @@ from scrapers.fbref.match_parser import (
 )
 from scrapers.fbref.bronze import GenericPersistenceError
 from scrapers.fbref.page_document import PAGE_DOCUMENT_VERSION, PageDocument
+from scrapers.fbref import pipeline as pipeline_module
 from scrapers.fbref.pipeline import (
     FBrefPipeline,
     FETCH_LEASE_SECONDS,
+    _FrontierSeedCandidate,
     FetchWaveError,
     ParseWaveError,
     PipelineError,
@@ -8964,3 +8966,75 @@ def test_historical_seed_still_downgrades_unguarded_player(tmp_path):
     )
 
     assert target.refresh_policy == "historical_once"
+
+
+def test_oversized_discovery_batch_is_split_targets_before_edges(tmp_path):
+    """Страница с >1000 ссылок больше не отвергается целиком.
+
+    Опечатанный store отвергает батч выше потолка, а не режет его, поэтому
+    одна страница статистики крупного турнира роняла разбор навсегда — вместе
+    с recovery-волной суточного рана.
+    """
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    calls = []
+
+    def record(*, targets, provenance):
+        calls.append((len(targets), len(provenance)))
+        return {"target_count": len(targets), "provenance_count": len(provenance)}
+
+    control.upsert_frontier_discovery_batch = record
+    limit = pipeline_module._DISCOVERY_TARGET_BATCH_LIMIT
+    candidates = [
+        _FrontierSeedCandidate(
+            link=DiscoveredPageLink(
+                page_kind="player",
+                canonical_url=(
+                    f"https://fbref.com/en/players/{index:05d}/Player-{index}"
+                ),
+                source_ids={"player_id": f"{index:05d}"},
+            ),
+            historical=False,
+        )
+        for index in range(limit + 7)
+    ]
+
+    pipeline._seed_link_candidates(candidates, parent_record=None)
+
+    assert calls, "посев не дошёл до control-store"
+    assert [count for count, _ in calls] == [limit, 7]
+    assert all(edges == 0 for _, edges in calls)
+
+
+def test_discovery_batch_within_the_ceiling_stays_one_atomic_write(tmp_path):
+    """Обычная страница по-прежнему пишется одной транзакцией."""
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    calls = []
+
+    def record(*, targets, provenance):
+        calls.append((len(targets), len(provenance)))
+        return {"target_count": len(targets), "provenance_count": len(provenance)}
+
+    control.upsert_frontier_discovery_batch = record
+    candidates = [
+        _FrontierSeedCandidate(
+            link=DiscoveredPageLink(
+                page_kind="player",
+                canonical_url=(
+                    f"https://fbref.com/en/players/{index:05d}/Player-{index}"
+                ),
+                source_ids={"player_id": f"{index:05d}"},
+            ),
+            historical=False,
+        )
+        for index in range(3)
+    ]
+
+    pipeline._seed_link_candidates(candidates, parent_record=None)
+
+    assert len(calls) == 1
