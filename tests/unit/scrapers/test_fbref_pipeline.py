@@ -4783,7 +4783,26 @@ class BronzePageContractWriter(FakeWriter):
         return super().persist_page(page, **kwargs)
 
 
-def _tableless_squad_wave(tmp_path, *, historical):
+def _archive_shell(canonical_url, *, identity=True, body=""):
+    """Reproduce the source's own table-free page, head and all.
+
+    The real 1938 Austria response carries the identity triple this shape must
+    prove: ``link rel=canonical``, ``og:url``, and an ``#meta`` heading.  With
+    ``identity=False`` the same table-free body arrives as a bare shell -- what a
+    foreign 200 page looks like.
+    """
+
+    head = (
+        f'<link rel="canonical" href="{canonical_url}"/>'
+        f'<meta property="og:url" content="{canonical_url}">'
+        '<div id="meta"><h1><span>1938 Austria Stats</span></h1></div>'
+        if identity
+        else ""
+    )
+    return f'<html><head>{head}</head><body>{body}</body></html>'
+
+
+def _tableless_squad_wave(tmp_path, *, historical, identity=True):
     """Cohort of the production shape plus a healthy squad page.
 
     FBref answers the 1938 Austria squad URL with a full 200 page carrying no
@@ -4808,11 +4827,14 @@ def _tableless_squad_wave(tmp_path, *, historical):
         source_ids={"squad_id": "d5121f10", "season_id": "1954"},
     ))
     pages = [
-        (rejected, """
-        <div id="content"><h1>1938 Austria Men Stats</h1>
-          <p>Round of 16 (June 4, 1938): Sweden advance to Quarter-finals.</p>
-        </div>
-        """),
+        (rejected, _archive_shell(
+            rejected.canonical_url,
+            identity=identity,
+            body=(
+                "<div id=\"content\"><p>Round of 16 (June 4, 1938): "
+                "Sweden advance to Quarter-finals.</p></div>"
+            ),
+        )),
         (healthy, """
         <div id="content"><h1>1954 Austria Men Stats</h1>
           <table id="stats_standard_combined">
@@ -4894,6 +4916,9 @@ def test_parser_crash_on_an_archived_page_is_never_isolated(tmp_path):
     record = pipeline.raw_store.read_fetch_record(
         control.fetches[0]["logical_refresh_id"]
     )
+    html, _ = pipeline.raw_store.load_fetch_html(
+        control.fetches[0]["logical_refresh_id"]
+    )
     crashed = PageDocument(
         target_id=rejected_id,
         page_kind="squad",
@@ -4904,7 +4929,92 @@ def test_parser_crash_on_an_archived_page_is_never_isolated(tmp_path):
     )
 
     # A table our own parser choked on is a bug of ours, not a source shape.
-    assert pipeline._historical_contract_rejection(record, crashed) is None
+    assert pipeline._historical_contract_rejection(
+        html, record, crashed
+    ) is None
+
+
+def test_tableless_shell_without_page_identity_is_never_retired(tmp_path):
+    control, pipeline, rejected_id, _ = _tableless_squad_wave(
+        tmp_path, historical=True, identity=False
+    )
+
+    # Retirement is terminal, so absence of tables is not evidence on its own:
+    # a foreign 200 shell has the same shape as a real archived page, and a
+    # retry of fresher bytes can still succeed.
+    with pytest.raises(ParseWaveError, match="page_contract:no_tables"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["squad"],
+            settings=_settings("backfill"),
+        )
+
+    assert control.frontier[rejected_id]["state"] == "fetched"
+
+
+def test_tableless_archived_schedule_page_still_fails_the_wave(tmp_path):
+    """A spine page is the only source of its subtree, so it is never retired."""
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="schedule",
+        canonical_url=(
+            "https://fbref.com/en/comps/1/1938/schedule/1938-WC-Scores"
+        ),
+        source_ids={"competition_id": "1", "season_id": "1938"},
+    ))
+    refresh, record = _commit_for_parse(
+        raw, target, _archive_shell(target.canonical_url, body="<p>1938</p>")
+    )
+    control.upsert_frontier_target(frontier_target(target, historical=True))
+    control.frontier[record.target_id].update(
+        state="fetched", last_content_hash=record.content_hash
+    )
+    control.fetches.append({
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    })
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=BronzePageContractWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+
+    # Match targets exist only because a schedule page was parsed, so retiring
+    # this one would amputate the season's matches with a green run.
+    with pytest.raises(ParseWaveError, match="page_contract"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["schedule"],
+            settings=_settings("backfill"),
+        )
+
+    assert control.frontier[record.target_id]["state"] == "fetched"
+
+
+def test_retired_target_leaves_the_cohort_of_its_own_run(tmp_path):
+    control, pipeline, rejected_id, _ = _tableless_squad_wave(
+        tmp_path, historical=True
+    )
+    run_id = str(uuid.uuid4())
+
+    first = pipeline.parse_wave(
+        run_id, page_kinds=["squad"], settings=_settings("backfill")
+    )
+    second = pipeline.parse_wave(
+        run_id, page_kinds=["squad"], settings=_settings("backfill")
+    )
+
+    assert first.contract_quarantined == 1
+    # The run that retires a target keeps selecting its raw (list_run_fetches has
+    # no frontier-state filter), so without the guard every later batch re-applies
+    # the verdict until _is_mass_contract_rejection fails the run it saved.
+    assert second.cohort_size == 0
+    assert second.contract_quarantined == 0
+    assert second.failures == []
 
 
 def test_duplicate_display_label_selects_one_canonical_current_edition(
