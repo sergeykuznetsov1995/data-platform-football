@@ -558,6 +558,11 @@ _HISTORICAL_DOWNGRADE_GUARDED_KINDS = frozenset(
     }
 )
 
+# Mirrors _MAX_FRONTIER_DISCOVERY_TARGETS / _MAX_FRONTIER_DISCOVERY_EDGES in the
+# sealed control store: a batch above either ceiling is rejected, not truncated.
+_DISCOVERY_TARGET_BATCH_LIMIT = 1000
+_DISCOVERY_EDGE_BATCH_LIMIT = 5000
+
 
 @dataclass
 class WaveResult:
@@ -3572,13 +3577,42 @@ class FBrefPipeline:
                         },
                     ))
         if prepared_targets or provenance_edges:
-            self.control.upsert_frontier_discovery_batch(
-                targets=[
-                    prepared_targets[target_id]
-                    for target_id in sorted(prepared_targets)
-                ],
-                provenance=provenance_edges,
-            )
+            ordered_targets = [
+                prepared_targets[target_id]
+                for target_id in sorted(prepared_targets)
+            ]
+            if (
+                len(ordered_targets) <= _DISCOVERY_TARGET_BATCH_LIMIT
+                and len(provenance_edges) <= _DISCOVERY_EDGE_BATCH_LIMIT
+            ):
+                self.control.upsert_frontier_discovery_batch(
+                    targets=ordered_targets,
+                    provenance=provenance_edges,
+                )
+            else:
+                # A season-stats page of a large competition links more than a
+                # thousand players, and the sealed control store refuses such a
+                # batch outright -- the whole page then fails to parse forever,
+                # taking the daily recovery wave down with it.  Split it, targets
+                # first: a provenance edge has a foreign key to its child target.
+                for start in range(
+                    0, len(ordered_targets), _DISCOVERY_TARGET_BATCH_LIMIT
+                ):
+                    self.control.upsert_frontier_discovery_batch(
+                        targets=ordered_targets[
+                            start:start + _DISCOVERY_TARGET_BATCH_LIMIT
+                        ],
+                        provenance=(),
+                    )
+                for start in range(
+                    0, len(provenance_edges), _DISCOVERY_EDGE_BATCH_LIMIT
+                ):
+                    self.control.upsert_frontier_discovery_batch(
+                        targets=(),
+                        provenance=provenance_edges[
+                            start:start + _DISCOVERY_EDGE_BATCH_LIMIT
+                        ],
+                    )
         if parent_record is not None and reconcile_after:
             self._reconcile_frontier_scope()
         return len(seeded_targets), len(skipped_targets)
