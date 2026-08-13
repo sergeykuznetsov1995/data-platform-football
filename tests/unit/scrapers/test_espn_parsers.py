@@ -1794,7 +1794,7 @@ def test_reviewed_truncated_lineup_identity_is_exact_and_immutable() -> None:
         )
     }
     assert summary_parser_module._REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES == (
-        frozenset({"3904:2026", "3943:2026", "4005:2026", "8313:2026"})
+        frozenset({"3904:2026", "3943:2026", "4005:2026", "8313:2026", "24455:2026"})
     )
     assert summary_parser_module._REVIEWED_SHORT_ROSTER_FIXTURES == frozenset(
         {("750:2026", 3384, 10)}
@@ -2358,6 +2358,56 @@ def test_only_reviewed_truncated_conventional_lineup_degrades_to_valid_empty(
             competition=proven_competition,
             edition=proven_edition,
             event=proven_schedule[0],
+        )
+
+
+@pytest.mark.unit
+def test_reviewed_partial_conventional_scope_discards_a_side_that_is_short(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = ("24455:2026", 401883602, ((131374, 11), (18003, 10)))
+    competition, edition, event, payload = _reviewed_lineup_summary_case(
+        identity, contradictory=False, lineup=CapabilityState.UNKNOWN
+    )
+    raw = _raw(payload)
+
+    # Neither the per-event waivers nor the fixture waiver may carry this.
+    monkeypatch.setattr(
+        summary_parser_module, "_REVIEWED_TRUNCATED_IDENTITIES", frozenset()
+    )
+    monkeypatch.setattr(
+        summary_parser_module, "_REVIEWED_SHORT_ROSTER_FIXTURES", frozenset()
+    )
+
+    monkeypatch.setattr(
+        summary_parser_module,
+        "_REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES",
+        frozenset(),
+    )
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(raw, competition=competition, edition=edition, event=event)
+
+    monkeypatch.setattr(
+        summary_parser_module,
+        "_REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES",
+        frozenset({"24455:2026"}),
+    )
+    result = parse_summary(raw, competition=competition, edition=edition, event=event)
+    assert result.lineup == ()
+    assert result.lineup_state is EntityParseState.VALID_EMPTY
+
+    # A scope that promises lineups is never forgiven, reviewed or not.
+    proven_competition, proven_edition, proven_event, proven_payload = (
+        _reviewed_lineup_summary_case(
+            identity, contradictory=False, lineup=CapabilityState.PROVEN
+        )
+    )
+    with pytest.raises(EspnParseError, match="11 starters"):
+        parse_summary(
+            _raw(proven_payload),
+            competition=proven_competition,
+            edition=proven_edition,
+            event=proven_event,
         )
 
 

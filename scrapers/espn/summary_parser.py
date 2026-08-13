@@ -603,8 +603,18 @@ _REVIEWED_MALFORMED_EVENTS: frozenset[tuple[str, int]] = frozenset(
 # Salvadoran one: it does publish a bench, but only one of its 11 non-empty
 # Summaries fields eleven starters on both sides, the rest run 8 to 10 against
 # a complete side, and 75 of its 90 scheduled matches are still to come.
+#
+# The AFC's 2026 Champions League Two qualifying round belongs here for the
+# Colombian reason as well, and it is the plainest case of the five: the round
+# schedules three matches, two of them are played, and neither answers with a
+# conventional shape.  One (401883603, full time after extra time) returns two
+# empty rosters; the other (401883602, full time) returns eleven starters for
+# one club and ten for the other while declaring no formation at all and not a
+# single formationPlace on either side — the complete side is complete by
+# accident of how many rows carry the starter flag.  Not one lineup row has
+# ever been published for this scope, and the third match is still to come.
 _REVIEWED_PARTIAL_CONVENTIONAL_LINEUP_SCOPES: frozenset[str] = frozenset(
-    {"3904:2026", "3943:2026", "4005:2026", "8313:2026"}
+    {"3904:2026", "3943:2026", "4005:2026", "8313:2026", "24455:2026"}
 )
 
 # A club the source publishes one starter short every other matchday is one
