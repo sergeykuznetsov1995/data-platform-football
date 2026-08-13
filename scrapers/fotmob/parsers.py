@@ -852,13 +852,19 @@ def parse_transfers(
     for page_index, payload in enumerate(pages):
         if not isinstance(payload, Mapping):
             raise TypeError("each transfer payload must be a mapping")
-        transfer_values = payload.get("transfers")
+        if "transfers" in payload:
+            transfer_values = payload["transfers"]
+        else:
+            data = payload.get("data")
+            if not isinstance(data, Mapping) or "transfers" not in data:
+                raise TypeError("transfer payload must contain a transfers list")
+            transfer_values = data["transfers"]
         if not isinstance(transfer_values, list):
-            transfer_values = _mapping(payload.get("data")).get("transfers")
+            raise TypeError("transfer payload transfers must be a list")
         source_page = _first_not_none(payload.get("page"), page_index)
-        for item_index, value in enumerate(_list(transfer_values)):
+        for item_index, value in enumerate(transfer_values):
             if not isinstance(value, Mapping):
-                continue
+                raise TypeError("each transfer entry must be a mapping")
             transfer = value
             position = _mapping(transfer.get("position"))
             transfer_type_value = transfer.get("transferType")

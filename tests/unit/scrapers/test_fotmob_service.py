@@ -2415,6 +2415,45 @@ def test_transfer_stream_tolerates_source_hits_self_disagreement():
     assert "next_missing_page" not in result.metadata
 
 
+def test_transfer_stream_rejects_malformed_nonempty_terminal_page():
+    page1 = canonicalize_target(
+        "transfers", {"leagueIds": "47", "page": 1}
+    ).canonical_url
+    page2 = canonicalize_target(
+        "transfers", {"leagueIds": "47", "page": 2}
+    ).canonical_url
+    first = {
+        "hits": 3,
+        "page": 1,
+        "transfers": [
+            {
+                "playerId": 1,
+                "name": "One",
+                "transferDate": "2026-07-01",
+                "fromClubId": 10,
+                "toClubId": 20,
+                "feeText": "€1m",
+            },
+            {
+                "playerId": 2,
+                "name": "Two",
+                "transferDate": "2026-07-02",
+                "fromClubId": 30,
+                "toClubId": 40,
+                "feeText": "Free",
+            },
+        ],
+    }
+    second = {"hits": 3, "page": 2, "transfers": [None]}
+    service, _, _ = _service({page1: first, page2: second})
+
+    result = service.sync_transfers(47)
+
+    assert not result.ok
+    assert any("transfers page 2 parse" in item for item in result.errors)
+    assert "source_hits_deficit" not in result.metadata
+
+
 def test_transfer_stream_tolerance_scales_with_stream_size():
     """Большой поток: расхождение счётчика источника растёт вместе с ним.
 
@@ -2451,6 +2490,38 @@ def test_transfer_stream_tolerance_scales_with_stream_size():
     assert result.ok
     assert result.counts["events"] == 297
     assert result.metadata["source_hits_deficit"] == 3
+
+
+def test_transfer_stream_large_deficit_beyond_ratio_tolerance_stays_incomplete():
+    page1 = canonicalize_target(
+        "transfers", {"leagueIds": "47", "page": 1}
+    ).canonical_url
+    page2 = canonicalize_target(
+        "transfers", {"leagueIds": "47", "page": 2}
+    ).canonical_url
+    first = {
+        "hits": 649,
+        "page": 1,
+        "transfers": [
+            {
+                "playerId": index,
+                "name": f"Player {index}",
+                "transferDate": "2026-07-01",
+                "fromClubId": 10,
+                "toClubId": 20,
+                "feeText": "Free",
+            }
+            for index in range(1, 51)
+        ],
+    }
+    second = {"hits": 649, "page": 2, "transfers": []}
+    service, _, _ = _service({page1: first, page2: second})
+
+    result = service.sync_transfers(47)
+
+    assert not result.ok
+    assert "source_hits_deficit" not in result.metadata
+    assert any("transfer pagination incomplete" in item for item in result.errors)
 
 
 def test_transfer_stream_deficit_beyond_tolerance_stays_incomplete():
