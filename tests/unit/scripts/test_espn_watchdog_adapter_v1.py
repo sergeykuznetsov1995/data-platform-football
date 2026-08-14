@@ -186,7 +186,7 @@ def test_host_adapter_uses_exact_boundaries_and_streams_snapshot(tmp_path):
         "/usr/bin/timeout",
         "--signal=TERM",
         "--kill-after=30s",
-        "1800s",
+        "3600s",
         "python",
         "-B",
         "/opt/airflow/scripts/espn_watchdog_adapter_v1.py",
@@ -194,8 +194,8 @@ def test_host_adapter_uses_exact_boundaries_and_streams_snapshot(tmp_path):
         "--observed-at",
         OBSERVED_AT.isoformat(timespec="seconds"),
     )
-    assert host.commands[1][2] == RUNTIME_SNAPSHOT_TIMEOUT_SECONDS == 1860.0
-    assert RUNTIME_COLLECTOR_TIMEOUT_SECONDS == 1800.0
+    assert host.commands[1][2] == RUNTIME_SNAPSHOT_TIMEOUT_SECONDS == 3660.0
+    assert RUNTIME_COLLECTOR_TIMEOUT_SECONDS == 3600.0
     assert RUNTIME_COLLECTOR_KILL_AFTER_SECONDS == 30.0
     assert (
         RUNTIME_SNAPSHOT_TIMEOUT_SECONDS
