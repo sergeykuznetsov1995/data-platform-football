@@ -1406,6 +1406,12 @@ def discover_page_links(
                 source_ids["player_id"] = route[1]
                 if "matchlogs" in route:
                     matchlogs_index = route.index("matchlogs")
+                    # A matchlog route is always
+                    # ``players/{player_id}/matchlogs/...``.  Empty player IDs
+                    # disappear while splitting the URL and otherwise make
+                    # the literal ``matchlogs`` look like the player identity.
+                    if matchlogs_index != 2:
+                        continue
                     suffix = route[matchlogs_index + 1 :]
                     # A navigation root such as ``.../matchlogs/`` is not a
                     # paid page identity.  Require source route components

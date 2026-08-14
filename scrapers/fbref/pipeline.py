@@ -141,6 +141,18 @@ MAX_ROUTINE_CONTRACT_QUARANTINES = 5
 # table-free shape is already accepted upstream by
 # ``_has_verified_zero_table_player_profile``, so nothing is lost by excluding it.
 _CONTRACT_ISOLATABLE_PAGE_KINDS = frozenset({"squad"})
+_LEGACY_INVALID_MATCHLOG_TARGET_ID = (
+    "fbref:matchlog:matchlogs:b201bf4bc9476c3f0cc8"
+)
+_LEGACY_INVALID_MATCHLOG_URL = (
+    "https://fbref.com/en/players//matchlogs/2016-2017/misc/"
+    "Yan-Kaye-Match-Logs"
+)
+_LEGACY_INVALID_MATCHLOG_SOURCE_IDS = {
+    "player_id": "matchlogs",
+    "matchlog_season_id": "2016-2017",
+    "matchlog_discriminator": "2016-2017/misc",
+}
 REPLAY_SOURCE_REQUEST_LIMIT = DEFAULT_REQUEST_LIMIT
 REPLAY_SOURCE_BYTE_LIMIT = DEFAULT_BYTE_LIMIT
 ACCEPTANCE_REQUEST_LIMIT = 100
@@ -4422,7 +4434,12 @@ class FBrefPipeline:
         )
 
     def _historical_contract_rejection(
-        self, html: str, record: RawFetchRecord, page: PageDocument
+        self,
+        html: str,
+        record: RawFetchRecord,
+        page: PageDocument,
+        *,
+        recover_cross_run: bool = False,
     ) -> Optional[SourceContractRejected]:
         """Isolate a page shape only the archive can publish, and only there.
 
@@ -4440,7 +4457,13 @@ class FBrefPipeline:
         a loud failure, because a foreign 200 shell has the very same shape and
         a retry of fresher bytes can still succeed.
 
-        Four gates, each of which keeps a real breakage loud:
+        The one structural exception is a legacy matchlog target whose URL has
+        no player ID.  Its stored ``player_id=matchlogs`` came from discovery
+        collapsing the empty path segment, so the address can never identify a
+        real page; historical recovery may retire it without trusting the
+        response body.
+
+        Five gates, each of which keeps a real breakage loud:
 
         - ``page_contract:`` verdicts only -- a parser that crashed on a
           malformed table is a bug of ours in either lane;
@@ -4455,18 +4478,33 @@ class FBrefPipeline:
         - the response must advertise this target's own canonical address.
         """
 
-        if record.page_kind not in _CONTRACT_ISOLATABLE_PAGE_KINDS:
-            return None
         if not page.errors:
             return None
         if not all(
             error.startswith("page_contract:") for error in page.errors
         ):
             return None
-        if not url_addresses_archived_edition(record.canonical_url):
-            return None
         frontier = self.control.get_frontier_target(record.target_id) or {}
         if frontier.get("refresh_policy") != "historical_once":
+            return None
+        malformed_matchlog = (
+            recover_cross_run
+            and record.page_kind == "matchlog"
+            and record.target_id == _LEGACY_INVALID_MATCHLOG_TARGET_ID
+            and record.canonical_url == _LEGACY_INVALID_MATCHLOG_URL
+            and dict(record.source_ids)
+            == _LEGACY_INVALID_MATCHLOG_SOURCE_IDS
+        )
+        if malformed_matchlog:
+            return SourceContractRejected(
+                f"Invalid matchlog route for {record.target_id}",
+                target_id=record.target_id,
+                content_hash=record.content_hash,
+                reason="invalid_matchlog_route",
+            )
+        if record.page_kind not in _CONTRACT_ISOLATABLE_PAGE_KINDS:
+            return None
+        if not url_addresses_archived_edition(record.canonical_url):
             return None
         if not response_owns_target_page(
             html, canonical_url=record.canonical_url
@@ -4696,6 +4734,7 @@ class FBrefPipeline:
         typed_context: Optional[TypedSourceContext] = None,
         match_id: Optional[str] = None,
         generic_persisted: bool = False,
+        recover_cross_run: bool = False,
     ) -> _ProcessedObservation:
         """Persist and finish an already-claimed observation without I/O."""
 
@@ -4722,7 +4761,10 @@ class FBrefPipeline:
             if isinstance(exc, GenericPersistenceError):
                 exc = (
                     self._historical_contract_rejection(
-                        html, record, prepared_page
+                        html,
+                        record,
+                        prepared_page,
+                        recover_cross_run=recover_cross_run,
                     )
                     or exc
                 )
@@ -5561,6 +5603,7 @@ class FBrefPipeline:
                 typed_match=None,
                 stateful_run_id=item_run_id,
                 stateful_run_type=item_run_type,
+                recover_cross_run=_recover_cross_run,
             )
             self._merge_processed_result(result, outcome)
 
@@ -5597,6 +5640,7 @@ class FBrefPipeline:
                         typed_match=None,
                         stateful_run_id=item_run_id,
                         stateful_run_type=item_run_type,
+                        recover_cross_run=_recover_cross_run,
                     )
                     self._merge_processed_result(result, outcome)
                     continue
