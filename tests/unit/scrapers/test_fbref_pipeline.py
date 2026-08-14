@@ -716,10 +716,18 @@ class FakeControl:
         parser_version=None,
         typed_parser_version=None,
         stateful_parser_version=None,
+        include_quarantined=True,
     ):
         rows = [
             item for item in self.fetches if item["page_kind"] in page_kinds
         ]
+        if not include_quarantined:
+            rows = [
+                item for item in rows
+                if self.frontier.get(
+                    str(item["target_id"]), {}
+                ).get("state") != "quarantined"
+            ]
         if only_unparsed and typed_parser_version is not None:
             rows = [
                 item for item in rows
@@ -4628,6 +4636,29 @@ def test_contract_quarantine_drops_the_target_from_the_recovery_cohort(
     assert control.frontier[rejected_id]["state"] == "quarantined"
 
 
+def test_retired_head_does_not_hide_later_run_fetch(tmp_path):
+    control, pipeline, _, healthy_id = _schedule_less_season_wave(tmp_path)
+    settings = replace(_settings("backfill"), shard_size=1)
+    run_id = str(uuid.uuid4())
+
+    first = pipeline.parse_wave(
+        run_id, page_kinds=["season"], settings=settings
+    )
+    second = pipeline.parse_wave(
+        run_id, page_kinds=["season"], settings=settings
+    )
+
+    assert first.contract_quarantined == 1
+    assert second.cohort_size == 1
+    assert second.parsed == 1
+    assert any(
+        key[0] == control.fetches[1]["logical_refresh_id"]
+        and observed["status"] == "succeeded"
+        for key, observed in control.observations.items()
+    )
+    assert control.frontier[healthy_id]["state"] == "fetched"
+
+
 def test_unretired_contract_rejection_still_fails_the_wave(tmp_path):
     control, pipeline, rejected_id, _ = _schedule_less_season_wave(tmp_path)
     # A target that raced into a lease cannot be retired, and claiming progress
@@ -5084,9 +5115,9 @@ def test_retired_target_leaves_the_cohort_of_its_own_run(tmp_path):
     )
 
     assert first.contract_quarantined == 1
-    # The run that retires a target keeps selecting its raw (list_run_fetches has
-    # no frontier-state filter), so without the guard every later batch re-applies
-    # the verdict until _is_mass_contract_rejection fails the run it saved.
+    # Ordinary SQL selection excludes already-quarantined targets before LIMIT.
+    # _without_retired_targets() remains the post-selection race fence when a
+    # target is quarantined concurrently with selection.
     assert second.cohort_size == 0
     assert second.contract_quarantined == 0
     assert second.failures == []
@@ -5771,6 +5802,11 @@ def test_canary_validation_does_not_require_global_publication_freshness(tmp_pat
     ("mutation", "expected_error"),
     [
         ({"unprocessed_raw_count": 2}, "unprocessed_raw_count=2"),
+        (
+            {"dataset_validation_counts": {"failed": 1}},
+            "failed_dataset_manifests=1",
+        ),
+        ({"unvalidated_target_count": 1}, "unvalidated_target_count=1"),
         (
             {"global_unprocessed_raw_sla_overdue_count": 2},
             "global_unprocessed_raw_sla_overdue_count=2",

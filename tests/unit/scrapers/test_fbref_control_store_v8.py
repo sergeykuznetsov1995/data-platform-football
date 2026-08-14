@@ -788,6 +788,32 @@ def test_global_unprocessed_raw_includes_failed_source_runs_oldest_first():
     )
 
 
+def test_run_fetch_selection_can_exclude_quarantined_before_limit():
+    captured = {}
+    run_id = str(uuid.uuid4())
+
+    def handler(sql, params):
+        captured["sql"] = sql
+        captured["params"] = params
+        return [], 0
+
+    store, _ = make_store(handler)
+    assert store.list_run_fetches(
+        run_id,
+        page_kinds=["season"],
+        include_quarantined=False,
+        limit=3,
+    ) == []
+
+    assert "frontier.state <> 'quarantined'" in captured["sql"]
+    assert captured["params"][-2:] == (False, 3)
+
+    assert store.list_run_fetches(
+        run_id, page_kinds=["season"], limit=3
+    ) == []
+    assert captured["params"][-2:] == (True, 3)
+
+
 def test_unprocessed_fetches_skip_only_provably_superseded_failed_observation():
     captured = {}
 
@@ -1573,6 +1599,47 @@ def test_retired_targets_leave_both_the_cohort_and_the_unprocessed_raw_gate():
     assert "attempt.status = 'succeeded'" in cohort
     assert "frontier.state <> 'quarantined'" in summary
     assert "global_sla_overdue_count" in summary
+
+
+def test_run_summary_excludes_terminal_quarantine_from_all_raw_validation_gates():
+    executions = []
+    run_id = str(uuid.uuid4())
+
+    def handler(sql, params):
+        executions.append((sql, params))
+        if "SELECT * FROM fbref_control.crawl_run" in sql:
+            return [{"run_id": run_id, "run_type": "current"}], 1
+        if "AS missing" in sql:
+            return [{"count": 0}], 1
+        return [], 0
+
+    store, _ = make_store(handler)
+    store.get_run_summary(
+        run_id,
+        parser_version="page-current",
+        typed_parser_version="typed-current",
+        stateful_parser_version="discovery-current",
+    )
+
+    dataset_sql = next(
+        sql for sql, _ in executions
+        if "GROUP BY manifest.validation_status" in sql
+    )
+    unvalidated_sql = next(
+        sql for sql, _ in executions if "AS missing" in sql
+    )
+    raw_sql = next(
+        sql for sql, _ in executions if "AS global_sla_overdue_count" in sql
+    )
+    terminal_scope = (
+        "JOIN fbref_control.page_frontier AS frontier "
+        "ON frontier.target_id = attempt.target_id"
+    )
+    terminal_filter = "AND frontier.state <> 'quarantined'"
+
+    for sql in (dataset_sql, unvalidated_sql, raw_sql):
+        assert terminal_scope in sql
+        assert terminal_filter in sql
 
 
 BARE_SEASON_URL = "https://fbref.com/en/comps/12/La-Liga-Stats"
