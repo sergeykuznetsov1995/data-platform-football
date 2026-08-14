@@ -5115,9 +5115,9 @@ def test_retired_target_leaves_the_cohort_of_its_own_run(tmp_path):
     )
 
     assert first.contract_quarantined == 1
-    # The run that retires a target keeps selecting its raw (list_run_fetches has
-    # no frontier-state filter), so without the guard every later batch re-applies
-    # the verdict until _is_mass_contract_rejection fails the run it saved.
+    # Ordinary SQL selection excludes already-quarantined targets before LIMIT.
+    # _without_retired_targets() remains the post-selection race fence when a
+    # target is quarantined concurrently with selection.
     assert second.cohort_size == 0
     assert second.contract_quarantined == 0
     assert second.failures == []
