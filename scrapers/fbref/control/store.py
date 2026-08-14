@@ -4531,9 +4531,12 @@ class ControlStore:
 
         A completed ``historical_once`` target is deliberately absent from
         subsequent runs, while missing, queued, due-retry, and formerly
-        current season targets remain eligible.  This keeps the selection
-        bounded in PostgreSQL and removes the operator-managed registry
-        cursor which previously requeued the first page on every DAG run.
+        current season targets remain eligible.  Scope quarantines created
+        only because a season was non-current are recoverable by backfill;
+        parser and contract quarantines remain terminal.  Newer editions sort
+        ahead of older ones across competitions.  This keeps the selection
+        bounded in PostgreSQL and removes the operator-managed registry cursor
+        which previously requeued the first page on every DAG run.
         """
 
         normalized_limit = int(limit)
@@ -4589,8 +4592,18 @@ class ControlStore:
                               AND frontier.next_fetch_at IS NULL
                           )
                       )
+                      OR (
+                          frontier.state = 'quarantined'
+                          AND frontier.last_error_class = 'ScopeQuarantined'
+                          AND frontier.last_error_message = 'noncurrent_season'
+                      )
                   )
-                ORDER BY season.competition_id, season.season_id
+                ORDER BY
+                    substring(
+                        season.season_id FROM '([0-9]{4})$'
+                    )::integer DESC NULLS LAST,
+                    season.season_id DESC,
+                    season.competition_id
                 LIMIT %s
                 """,
                 (_text(source, "source"), normalized_limit),

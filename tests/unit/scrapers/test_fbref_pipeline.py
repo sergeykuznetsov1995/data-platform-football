@@ -6286,6 +6286,7 @@ def test_backfill_seeds_exact_next_historical_registry_url(tmp_path):
     seeded = next(iter(control.frontier.values()))
     assert seeded["canonical_url"].endswith("/edition-42/source-owned")
     assert seeded["refresh_policy"] == "historical_once"
+    assert control.events[-2:] == ["scope_reconcile", "explicit_cohort:1"]
 
 
 def test_backfill_auto_resume_does_not_requeue_completed_historical_season(
