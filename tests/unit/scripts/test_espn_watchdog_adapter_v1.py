@@ -626,6 +626,8 @@ def test_parent_child_reader_derives_only_the_exact_scheduled_child(monkeypatch)
         interval_start,
         interval_end,
     )
+    assert "execution_date" in calls[0][0]
+    assert "logical_date" not in calls[0][0]
     assert len(calls) == 2
 
 
@@ -873,6 +875,48 @@ def test_scope_freshness_uses_existing_identity_bound_readonly_validator(monkeyp
                 "observed_at": OBSERVED_AT,
                 "repository": readonly_repository,
             },
+        )
+    ]
+
+
+@pytest.mark.unit
+def test_known_events_reader_uses_exact_control_head_generation(monkeypatch):
+    head = SimpleNamespace(generation_id="generation-known-events")
+    store_calls = []
+    store = SimpleNamespace(
+        read_scope_heads=lambda scopes: (
+            store_calls.append(scopes),
+            {"19425:2026": head},
+        )[1]
+    )
+    query_calls = []
+
+    class Repository:
+        def _qualified(self, table):
+            assert table == "espn_schedule_generation_v2"
+            return "iceberg.bronze.espn_schedule_generation_v2"
+
+        def _execute(self, sql, params=()):
+            query_calls.append((sql, params))
+            return [(401863559,), (401863560,)]
+
+    readers = SchedulerRuntimeReaders(observed_at=OBSERVED_AT)
+    monkeypatch.setattr(readers, "_store", lambda: store)
+    monkeypatch.setattr(readers, "_repository", lambda: Repository())
+
+    result = readers.read_known_events()
+
+    assert result == {
+        "scope_id": "19425:2026",
+        "event_ids": [401863559, 401863560],
+    }
+    assert store_calls == [("19425:2026",)]
+    assert query_calls == [
+        (
+            "SELECT DISTINCT event_id FROM "
+            "iceberg.bronze.espn_schedule_generation_v2 "
+            "WHERE scope_id = ? AND generation_id = ? ORDER BY event_id",
+            ("19425:2026", "generation-known-events"),
         )
     ]
 

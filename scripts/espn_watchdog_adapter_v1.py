@@ -682,10 +682,10 @@ class SchedulerRuntimeReaders:
             return dict(self._parent)
         expected_interval_start, expected_interval_end = self._daily_cycle()
         rows = self._metadata_rows(
-            "SELECT dag_id, run_id, run_type, logical_date, data_interval_start, "
+            "SELECT dag_id, run_id, run_type, execution_date, data_interval_start, "
             "data_interval_end, state FROM dag_run "
             "WHERE dag_id = %s AND run_type = 'scheduled' "
-            "AND logical_date = %s AND data_interval_start = %s "
+            "AND execution_date = %s AND data_interval_start = %s "
             "AND data_interval_end = %s ORDER BY run_id",
             (
                 "dag_trigger_espn_daily",
@@ -924,21 +924,21 @@ class SchedulerRuntimeReaders:
         ]
 
     def read_known_events(self) -> dict[str, Any]:
-        from scrapers.espn.layout import LEGACY14, require_layout_mode
-
-        mode = require_layout_mode()
-        relation = (
-            "iceberg.bronze.espn_schedule_current"
-            if mode == LEGACY14
-            else "iceberg.bronze.espn_schedule"
-        )
-        rows = self._repository()._execute(
+        scope_id = "19425:2026"
+        heads = self._store().read_scope_heads((scope_id,))
+        head = heads.get(scope_id)
+        generation_id = getattr(head, "generation_id", None)
+        if not isinstance(generation_id, str) or not generation_id:
+            raise AdapterError("known Leagues Cup scope has no control head")
+        repository = self._repository()
+        relation = repository._qualified("espn_schedule_generation_v2")
+        rows = repository._execute(
             f"SELECT DISTINCT event_id FROM {relation} "
-            "WHERE scope_id = ? ORDER BY event_id",
-            ("19425:2026",),
+            "WHERE scope_id = ? AND generation_id = ? ORDER BY event_id",
+            (scope_id, generation_id),
         )
         return {
-            "scope_id": "19425:2026",
+            "scope_id": scope_id,
             "event_ids": [int(row[0]) for row in rows],
         }
 
