@@ -2277,6 +2277,13 @@ class FBrefPipeline:
                     ordinal=ordinal,
                 )
             )
+        if cohort:
+            # Historical selection may adopt a season parked only because it
+            # was outside the current-season crawl.  The upserts above change
+            # those selected targets to historical_once; the existing scope
+            # reconciler can now reopen only its own resolved quarantines
+            # before create_run_cohort enforces crawlable membership.
+            self._reconcile_frontier_scope()
         self.control.create_run_cohort(run_id, cohort)
         return {"seeded": len(rows), "auto_resume": True}
 

@@ -598,6 +598,10 @@ def test_backfill_registry_selection_is_bounded_and_skips_completed_once():
     assert "frontier.state = 'fetched'" in source
     assert "frontier.next_fetch_at IS NULL" in source
     assert "direct_match_only" in source
+    assert "last_error_class = 'ScopeQuarantined'" in source
+    assert "last_error_message = 'noncurrent_season'" in source
+    assert "season.season_id FROM '([0-9]{4})$'" in source
+    assert "DESC NULLS LAST" in source
     assert "LIMIT %s" in source
 
     store = ControlStore(
