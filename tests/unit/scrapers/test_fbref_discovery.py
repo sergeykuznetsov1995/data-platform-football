@@ -451,6 +451,20 @@ def test_matchlog_inventory_requires_structural_discriminator():
     assert matchlogs[0].source_ids["matchlog_discriminator"] == "2025/summary"
 
 
+def test_matchlog_inventory_rejects_a_missing_player_id():
+    html = """
+    <main>
+      <a href="/en/players//matchlogs/2016-2017/misc/Yan-Kaye-Match-Logs">
+        Broken player logs
+      </a>
+    </main>
+    """
+
+    assert not any(
+        link.page_kind == "matchlog" for link in discover_page_links(html)
+    )
+
+
 def test_source_id_allowlists_remove_cross_context_inheritance():
     html = """
     <main>

@@ -4440,7 +4440,13 @@ class FBrefPipeline:
         a loud failure, because a foreign 200 shell has the very same shape and
         a retry of fresher bytes can still succeed.
 
-        Four gates, each of which keeps a real breakage loud:
+        The one structural exception is a legacy matchlog target whose URL has
+        no player ID.  Its stored ``player_id=matchlogs`` came from discovery
+        collapsing the empty path segment, so the address can never identify a
+        real page; historical recovery may retire it without trusting the
+        response body.
+
+        Five gates, each of which keeps a real breakage loud:
 
         - ``page_contract:`` verdicts only -- a parser that crashed on a
           malformed table is a bug of ours in either lane;
@@ -4455,18 +4461,32 @@ class FBrefPipeline:
         - the response must advertise this target's own canonical address.
         """
 
-        if record.page_kind not in _CONTRACT_ISOLATABLE_PAGE_KINDS:
-            return None
         if not page.errors:
             return None
         if not all(
             error.startswith("page_contract:") for error in page.errors
         ):
             return None
-        if not url_addresses_archived_edition(record.canonical_url):
-            return None
         frontier = self.control.get_frontier_target(record.target_id) or {}
         if frontier.get("refresh_policy") != "historical_once":
+            return None
+        malformed_matchlog = (
+            record.page_kind == "matchlog"
+            and str(record.source_ids.get("player_id") or "").casefold()
+            == "matchlogs"
+            and "/en/players//matchlogs/"
+            in record.canonical_url.casefold()
+        )
+        if malformed_matchlog:
+            return SourceContractRejected(
+                f"Invalid matchlog route for {record.target_id}",
+                target_id=record.target_id,
+                content_hash=record.content_hash,
+                reason="invalid_matchlog_route",
+            )
+        if record.page_kind not in _CONTRACT_ISOLATABLE_PAGE_KINDS:
+            return None
+        if not url_addresses_archived_edition(record.canonical_url):
             return None
         if not response_owns_target_page(
             html, canonical_url=record.canonical_url

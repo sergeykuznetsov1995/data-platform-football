@@ -4925,6 +4925,58 @@ def test_tableless_archived_squad_is_retired_without_failing_its_cohort(
     assert rejected["next_fetch_at"] is None
 
 
+def test_malformed_archived_matchlog_is_retired_during_recovery(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="matchlog",
+        canonical_url=(
+            "https://fbref.com/en/players//matchlogs/2016-2017/misc/"
+            "Yan-Kaye-Match-Logs"
+        ),
+        source_ids={
+            "player_id": "matchlogs",
+            "matchlog_season_id": "2016-2017",
+            "matchlog_discriminator": "2016-2017/misc",
+        },
+    ))
+    refresh, record = _commit_for_parse(raw, target, "<html></html>")
+    control.upsert_frontier_target(frontier_target(target, historical=True))
+    control.frontier[record.target_id].update(
+        state="fetched", last_content_hash=record.content_hash
+    )
+    control.fetches.append({
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    })
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=BronzePageContractWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+
+    first = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["matchlog"],
+        settings=_settings("backfill"),
+    )
+    second = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["matchlog"],
+        settings=_settings("backfill"),
+    )
+
+    assert first.failures == []
+    assert first.contract_quarantined == 1
+    assert second.cohort_size == 0
+    rejected = control.frontier[record.target_id]
+    assert rejected["state"] == "quarantined"
+    assert rejected["last_error_class"] == "ParseContractQuarantined"
+    assert rejected["last_error_message"] == "invalid_matchlog_route"
+
+
 def test_tableless_live_squad_page_still_fails_the_wave(tmp_path):
     control, pipeline, rejected_id, _ = _tableless_squad_wave(
         tmp_path, historical=False
