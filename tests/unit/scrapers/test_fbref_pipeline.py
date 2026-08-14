@@ -4925,19 +4925,24 @@ def test_tableless_archived_squad_is_retired_without_failing_its_cohort(
     assert rejected["next_fetch_at"] is None
 
 
-def test_malformed_archived_matchlog_is_retired_during_recovery(tmp_path):
+def _malformed_archived_matchlog_wave(
+    tmp_path,
+    *,
+    canonical_url=(
+        "https://fbref.com/en/players//matchlogs/2016-2017/misc/"
+        "Yan-Kaye-Match-Logs"
+    ),
+    season_id="2016-2017",
+):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
     target = page_target_from_link(DiscoveredPageLink(
         page_kind="matchlog",
-        canonical_url=(
-            "https://fbref.com/en/players//matchlogs/2016-2017/misc/"
-            "Yan-Kaye-Match-Logs"
-        ),
+        canonical_url=canonical_url,
         source_ids={
             "player_id": "matchlogs",
-            "matchlog_season_id": "2016-2017",
-            "matchlog_discriminator": "2016-2017/misc",
+            "matchlog_season_id": season_id,
+            "matchlog_discriminator": f"{season_id}/misc",
         },
     ))
     refresh, record = _commit_for_parse(raw, target, "<html></html>")
@@ -4956,6 +4961,11 @@ def test_malformed_archived_matchlog_is_retired_during_recovery(tmp_path):
         generic_writer=BronzePageContractWriter(),
         typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
     )
+    return control, pipeline, record
+
+
+def test_malformed_archived_matchlog_is_retired_during_recovery(tmp_path):
+    control, pipeline, record = _malformed_archived_matchlog_wave(tmp_path)
 
     first = pipeline.recover_unprocessed_wave(
         str(uuid.uuid4()),
@@ -4975,6 +4985,39 @@ def test_malformed_archived_matchlog_is_retired_during_recovery(tmp_path):
     assert rejected["state"] == "quarantined"
     assert rejected["last_error_class"] == "ParseContractQuarantined"
     assert rejected["last_error_message"] == "invalid_matchlog_route"
+
+
+def test_exact_malformed_matchlog_stays_loud_outside_recovery(tmp_path):
+    control, pipeline, record = _malformed_archived_matchlog_wave(tmp_path)
+
+    with pytest.raises(ParseWaveError, match="page_contract:no_tables"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["matchlog"],
+            settings=_settings("backfill"),
+        )
+
+    assert control.frontier[record.target_id]["state"] == "fetched"
+
+
+def test_other_malformed_matchlog_stays_loud_during_recovery(tmp_path):
+    control, pipeline, record = _malformed_archived_matchlog_wave(
+        tmp_path,
+        canonical_url=(
+            "https://fbref.com/en/players//matchlogs/2015-2016/misc/"
+            "Other-Player-Match-Logs"
+        ),
+        season_id="2015-2016",
+    )
+
+    with pytest.raises(ParseWaveError, match="page_contract:no_tables"):
+        pipeline.recover_unprocessed_wave(
+            str(uuid.uuid4()),
+            page_kinds=["matchlog"],
+            settings=_settings("backfill"),
+        )
+
+    assert control.frontier[record.target_id]["state"] == "fetched"
 
 
 def test_tableless_live_squad_page_still_fails_the_wave(tmp_path):
