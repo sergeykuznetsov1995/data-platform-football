@@ -254,6 +254,62 @@ def test_season_parser_ignores_same_competition_schedule_in_header():
     )
 
 
+def test_season_parser_rejects_schedule_from_another_season():
+    """A stale season page must not mint the current schedule under itself."""
+    html = """
+    <main id="content">
+      <table id="results2026-2027111_overall"><tr><td>x</td></tr></table>
+      <a href="/en/comps/11/schedule/Serie-A-M-Scores-and-Fixtures">
+        Scores &amp; Fixtures
+      </a>
+    </main>
+    """
+    season = SeasonRef(
+        comp_id="11",
+        season_id="2025-2026",
+        label="2025-2026",
+        calendar_type=CalendarType.SPLIT_YEAR,
+        season_url=(
+            "https://fbref.com/en/comps/11/2025-2026/"
+            "2025-2026-Serie-A-Stats"
+        ),
+    )
+
+    result = parse_season_html(html, season)
+    dataset = result.datasets["schedules"]
+
+    assert result.has_errors
+    assert dataset.status == DatasetStatus.ERROR
+    assert dataset.reason == "schedule_season_mismatch"
+    assert not dataset.records
+
+
+def test_current_season_parser_accepts_a_seasonless_schedule_link():
+    html = """
+    <main id="content">
+      <a href="/en/comps/11/schedule/Serie-A-Scores-and-Fixtures">
+        Scores &amp; Fixtures
+      </a>
+    </main>
+    """
+    season = SeasonRef(
+        comp_id="11",
+        season_id="2026-2027",
+        label="2026-2027",
+        calendar_type=CalendarType.SPLIT_YEAR,
+        season_url="https://fbref.com/en/comps/11/Serie-A-Stats",
+    )
+
+    result = parse_season_html(html, season)
+    dataset = result.datasets["schedules"]
+
+    assert not result.has_errors
+    assert dataset.records[0].schedule_url == (
+        "https://fbref.com/en/comps/11/schedule/"
+        "Serie-A-Scores-and-Fixtures"
+    )
+
+
 def test_schedule_prefers_sched_all_and_keeps_future_rows():
     html = """
     <table id="sched_stage_noise"><tbody><tr>

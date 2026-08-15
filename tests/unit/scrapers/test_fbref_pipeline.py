@@ -4514,6 +4514,102 @@ def test_zero_table_source_shell_fails_before_typed_promotion(tmp_path):
     assert control.frontier[record.target_id]["state"] == "fetched"
 
 
+def _redirected_season_wave(
+    tmp_path, *, canonical_url, season_id, schedule_href, historical
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry["11"] = {
+        "competition_id": "11",
+        "canonical_url": "https://fbref.com/en/comps/11/history/x",
+        "name": "Serie A",
+        "gender": "male",
+        "classification": "league:domestic",
+        "metadata": {},
+    }
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="season",
+        canonical_url=canonical_url,
+        source_ids={"competition_id": "11", "season_id": season_id},
+    ))
+    html = f"""
+    <main id="content">
+      <table id="results2026-2027111_overall"><tr><td>x</td></tr></table>
+      <a href="{schedule_href}">Scores &amp; Fixtures</a>
+    </main>
+    """
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.upsert_frontier_target(
+        frontier_target(target, historical=historical)
+    )
+    control.frontier[record.target_id].update({
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    })
+    control.fetches.append({
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    })
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=ContractWriter(),
+        typed_adapter=FakeTypedAdapter(FakeTypedWriter()),
+    )
+    return control, pipeline, record
+
+
+def test_archived_season_redirected_to_current_is_retired(tmp_path):
+    control, pipeline, record = _redirected_season_wave(
+        tmp_path,
+        canonical_url=(
+            "https://fbref.com/en/comps/11/2025-2026/"
+            "2025-2026-Serie-A-M-Stats"
+        ),
+        season_id="2025-2026",
+        schedule_href=(
+            "/en/comps/11/schedule/Serie-A-M-Scores-and-Fixtures"
+        ),
+        historical=True,
+    )
+
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season"],
+        settings=_settings("backfill"),
+    )
+
+    assert result.failures == []
+    assert result.contract_quarantined == 1
+    rejected = control.frontier[record.target_id]
+    assert rejected["state"] == "quarantined"
+    assert rejected["last_error_class"] == "ParseContractQuarantined"
+    assert rejected["last_error_message"] == "schedule_season_mismatch"
+
+
+def test_current_season_mismatch_stays_loud(tmp_path):
+    control, pipeline, record = _redirected_season_wave(
+        tmp_path,
+        canonical_url="https://fbref.com/en/comps/11/Serie-A-M-Stats",
+        season_id="2026-2027",
+        schedule_href=(
+            "/en/comps/11/2025-2026/schedule/"
+            "2025-2026-Serie-A-M-Scores-and-Fixtures"
+        ),
+        historical=False,
+    )
+
+    with pytest.raises(ParseWaveError, match="Season source contract failed"):
+        pipeline.recover_unprocessed_wave(
+            str(uuid.uuid4()),
+            page_kinds=["season"],
+            settings=_settings("current"),
+        )
+
+    assert control.frontier[record.target_id]["state"] == "fetched"
+
+
 def _schedule_less_season_wave(tmp_path):
     """Cohort of the production shape plus a healthy season page.
 
