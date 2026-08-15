@@ -3902,7 +3902,11 @@ class FBrefPipeline:
     ) -> tuple[int, int]:
         candidates: list[_FrontierSeedCandidate] = []
         if record.page_kind == "season":
-            parsed = parse_season_html(html, self._season_ref(record))
+            parsed = parse_season_html(
+                html,
+                self._season_ref(record),
+                historical=historical,
+            )
             if parsed.has_errors:
                 raise ParseWaveError(
                     f"Schedule discovery failed for {record.target_id}"
@@ -4395,14 +4399,41 @@ class FBrefPipeline:
             html, record, historical=historical
         )
 
+    def _target_is_historical(
+        self,
+        record: RawFetchRecord,
+        *,
+        run_type: str,
+    ) -> bool:
+        """Use durable target policy before the run that supplied its raw.
+
+        Cross-run recovery may parse historical target bytes captured by a
+        formerly-current run.  The frontier policy records the target's
+        present lifecycle and therefore outranks that source-run provenance.
+        """
+
+        frontier = self.control.get_frontier_target(record.target_id) or {}
+        refresh_policy = str(frontier.get("refresh_policy") or "").strip()
+        if refresh_policy:
+            return refresh_policy == "historical_once"
+        return run_type == "backfill"
+
     def _validate_pre_promotion_contract(
-        self, html: str, record: RawFetchRecord
+        self,
+        html: str,
+        record: RawFetchRecord,
+        *,
+        historical: bool,
     ) -> None:
         """Reject ambiguous source shells before replacing typed Bronze data."""
 
         if record.page_kind != "season":
             return
-        parsed = parse_season_html(html, self._season_ref(record))
+        parsed = parse_season_html(
+            html,
+            self._season_ref(record),
+            historical=historical,
+        )
         if not parsed.has_errors:
             return
         reason = ",".join(
@@ -4430,7 +4461,8 @@ class FBrefPipeline:
                 reason=reason,
             )
         if reason == "schedule_season_mismatch" and (
-            url_addresses_archived_edition(record.canonical_url)
+            historical
+            or url_addresses_archived_edition(record.canonical_url)
         ):
             raise SourceContractRejected(
                 f"Season source contract failed for {record.target_id}",
@@ -4660,7 +4692,15 @@ class FBrefPipeline:
                 f"Stateful promotion deferred for active target {record.target_id}"
             )
         if is_latest:
-            self._validate_pre_promotion_contract(html, record)
+            historical = self._target_is_historical(
+                record,
+                run_type=stateful_run_type,
+            )
+            self._validate_pre_promotion_contract(
+                html,
+                record,
+                historical=historical,
+            )
             typed_promoted = 0
             if typed_page:
                 if record.page_kind == "match" and typed_match is not None:
@@ -4701,7 +4741,7 @@ class FBrefPipeline:
                 html,
                 record,
                 run_type=stateful_run_type,
-                historical=stateful_run_type == "backfill",
+                historical=historical,
             )
             stateful_status = "succeeded"
             stale = 0

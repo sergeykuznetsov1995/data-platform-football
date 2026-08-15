@@ -284,6 +284,33 @@ def test_season_parser_rejects_schedule_from_another_season():
     assert not dataset.records
 
 
+def test_historical_season_parser_rejects_seasonless_schedule_on_bare_url():
+    """Registry rollover can leave an archived target on the bare URL."""
+
+    html = """
+    <main id="content">
+      <table id="results2026-2027111_overall"><tr><td>x</td></tr></table>
+      <a href="/en/comps/20/schedule/Bundesliga-Scores-and-Fixtures">
+        Scores &amp; Fixtures
+      </a>
+    </main>
+    """
+    season = SeasonRef(
+        comp_id="20",
+        season_id="2025-2026",
+        label="2025-2026",
+        calendar_type=CalendarType.SPLIT_YEAR,
+        season_url="https://fbref.com/en/comps/20/Bundesliga-Stats",
+    )
+
+    result = parse_season_html(html, season, historical=True)
+    dataset = result.datasets["schedules"]
+
+    assert result.has_errors
+    assert dataset.reason == "schedule_season_mismatch"
+    assert not dataset.records
+
+
 def test_current_season_parser_accepts_a_seasonless_schedule_link():
     html = """
     <main id="content">
