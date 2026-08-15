@@ -4588,6 +4588,56 @@ def test_archived_season_redirected_to_current_is_retired(tmp_path):
     assert rejected["last_error_message"] == "schedule_season_mismatch"
 
 
+def test_historical_bare_season_redirected_to_current_is_retired(tmp_path):
+    """Registry rollover must outrank a seasonless historical URL shape."""
+
+    schedule_url = (
+        "https://fbref.com/en/comps/11/schedule/"
+        "Serie-A-M-Scores-and-Fixtures"
+    )
+    control, pipeline, record = _redirected_season_wave(
+        tmp_path,
+        canonical_url="https://fbref.com/en/comps/11/Serie-A-M-Stats",
+        season_id="2025-2026",
+        schedule_href=schedule_url,
+        historical=True,
+    )
+    current_schedule = page_target_from_link(DiscoveredPageLink(
+        page_kind="schedule",
+        canonical_url=schedule_url,
+        source_ids={"competition_id": "11", "season_id": "2026-2027"},
+    ))
+    control.upsert_frontier_target(
+        frontier_target(current_schedule, historical=False)
+    )
+    original_upsert = control.upsert_frontier_target
+
+    def reject_canonical_collision(target):
+        for target_id, existing in control.frontier.items():
+            if (
+                target_id != target.target_id
+                and existing.get("canonical_url") == target.canonical_url
+            ):
+                raise StateConflict(
+                    f"Canonical URL already belongs to {target_id}"
+                )
+        return original_upsert(target)
+
+    control.upsert_frontier_target = reject_canonical_collision
+
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["season"],
+        settings=_settings("backfill"),
+    )
+
+    assert result.failures == []
+    assert result.contract_quarantined == 1
+    rejected = control.frontier[record.target_id]
+    assert rejected["state"] == "quarantined"
+    assert rejected["last_error_message"] == "schedule_season_mismatch"
+
+
 def test_current_season_mismatch_stays_loud(tmp_path):
     control, pipeline, record = _redirected_season_wave(
         tmp_path,

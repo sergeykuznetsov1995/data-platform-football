@@ -1011,6 +1011,7 @@ def parse_season_html(
     season: SeasonRef,
     *,
     parser_version: str = DISCOVERY_PARSER_VERSION,
+    historical: bool = False,
 ) -> DiscoveryPageResult:
     """Find the exact Scores & Fixtures link advertised by a season page."""
     documents = _document_soups(html)
@@ -1024,7 +1025,7 @@ def parse_season_html(
         for part in _href_path(season.season_url).split("/")
         if part
     ][1:]
-    season_url_is_archived = _has_season_component(season_route)
+    season_is_archived = historical or _has_season_component(season_route)
 
     for document in documents:
         for anchor in _discovery_anchors(document):
@@ -1039,7 +1040,7 @@ def parse_season_html(
                 candidate_has_season
                 and candidate_route[2].casefold()
                 != season.season_id.casefold()
-            ) or (not candidate_has_season and season_url_is_archived):
+            ) or (not candidate_has_season and season_is_archived):
                 season_mismatches.append(href)
                 continue
             try:
