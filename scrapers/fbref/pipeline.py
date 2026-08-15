@@ -4429,6 +4429,15 @@ class FBrefPipeline:
                 content_hash=record.content_hash,
                 reason=reason,
             )
+        if reason == "schedule_season_mismatch" and (
+            url_addresses_archived_edition(record.canonical_url)
+        ):
+            raise SourceContractRejected(
+                f"Season source contract failed for {record.target_id}",
+                target_id=record.target_id,
+                content_hash=record.content_hash,
+                reason=reason,
+            )
         raise ParseWaveError(
             f"Season source contract failed for {record.target_id}"
         )

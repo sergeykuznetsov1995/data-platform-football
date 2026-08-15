@@ -1017,7 +1017,14 @@ def parse_season_html(
     has_page_owned_table = _has_page_owned_table(documents)
     schedule: Optional[ScheduleRef] = None
     errors: List[str] = []
+    season_mismatches: List[str] = []
     expected_prefix = f"/en/comps/{season.comp_id}/"
+    season_route = [
+        part
+        for part in _href_path(season.season_url).split("/")
+        if part
+    ][1:]
+    season_url_is_archived = _has_season_component(season_route)
 
     for document in documents:
         for anchor in _discovery_anchors(document):
@@ -1025,6 +1032,15 @@ def parse_season_html(
             path = _href_path(href)
             components = [part.lower() for part in path.split("/") if part]
             if not path.startswith(expected_prefix) or "schedule" not in components:
+                continue
+            candidate_route = components[1:]
+            candidate_has_season = _has_season_component(candidate_route)
+            if (
+                candidate_has_season
+                and candidate_route[2].casefold()
+                != season.season_id.casefold()
+            ) or (not candidate_has_season and season_url_is_archived):
+                season_mismatches.append(href)
                 continue
             try:
                 schedule_url = canonicalize_fbref_url(href)
@@ -1050,6 +1066,17 @@ def parse_season_html(
             reason="schedule_link_parse_failed",
             error_type="ScheduleDiscoveryError",
             error_message="; ".join(errors)[:1000],
+        )
+    elif season_mismatches:
+        result = _dataset(
+            "schedules",
+            status=DatasetStatus.ERROR,
+            reason="schedule_season_mismatch",
+            error_type="ScheduleDiscoveryError",
+            error_message=(
+                "Schedule links belong to another season: "
+                + "; ".join(season_mismatches)
+            )[:1000],
         )
     elif not has_page_owned_table and (
         has_valid_zero_table_season_signature(
