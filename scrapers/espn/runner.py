@@ -3246,14 +3246,15 @@ def _qualify_missing_known_events(
         covering_ids: set[int] = set()
         for _request, ids in covering:
             covering_ids |= ids
+        # The one-day source/UTC buffer proves that the missing event's page was
+        # queried.  It must not inflate the retention denominator with fixtures
+        # from an adjacent UTC day that the source correctly omitted.
         expected = {
             row.event_id
             for row in prior.schedule
             if row.event_id not in missing_ids
             and any(
-                source_day_contains(
-                    row.kickoff.date(), request.query_start, request.query_end
-                )
+                request.query_start <= row.kickoff.date() <= request.query_end
                 for request, _ids in covering
             )
         }

@@ -4302,6 +4302,60 @@ def test_withdrawn_known_event_is_proven_offline_and_receipted():
 
 
 @pytest.mark.unit
+def test_withdrawn_known_event_ignores_buffer_only_rows_for_retention():
+    from scrapers.espn import runner
+
+    competition, edition = _competition()
+    target = 401_000_001
+    returned_ids = tuple(range(401_000_002, 401_000_011))
+    inside = _scheduled_prior(
+        competition,
+        edition,
+        event_ids=(target, *returned_ids),
+    )
+    buffer_only = _scheduled_prior(
+        competition,
+        edition,
+        event_ids=(401_000_011, 401_000_012),
+        event_date="2020-10-14T18:45Z",
+    )
+    prior = replace(inside, schedule=inside.schedule + buffer_only.schedule)
+    body = _scoreboard(
+        competition,
+        edition,
+        event_ids=returned_ids,
+        event_date="2020-11-01T18:45Z",
+        status="STATUS_SCHEDULED",
+    )
+    page = _page(
+        competition,
+        edition,
+        query_start=date(2020, 10, 15),
+        query_end=date(2020, 11, 14),
+    )
+
+    dispositions = runner._qualify_missing_known_events(
+        known_events=(
+            runner.KnownNonterminalEvent(
+                event_id=target,
+                event_date=date(2020, 11, 1),
+            ),
+        ),
+        pages=((page, body),),
+        fetched_by_event={
+            row.event_id: row
+            for row in inside.schedule
+            if row.event_id in returned_ids
+        },
+        prior=prior,
+    )
+
+    proof = json.loads(dispositions[0].detail)
+    assert proof["prior_events_in_windows"] == len(returned_ids)
+    assert proof["prior_events_returned"] == len(returned_ids)
+
+
+@pytest.mark.unit
 def test_missing_known_event_stays_fatal_when_the_page_did_return_it():
     from scrapers.espn import runner
 
