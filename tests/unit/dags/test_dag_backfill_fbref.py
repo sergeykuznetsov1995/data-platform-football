@@ -185,7 +185,14 @@ class TestFBrefBackfillTopology:
         run_target stays open, the wave gate counts an unclaimable target as
         unfinished, and the run raises before its first request -- the zero-work
         runs that stopped the history campaign on 2026-08-17.  Draining before
-        the seed keeps every verdict on bytes this run fetched itself.
+        the seed means no run_target is open when such a verdict lands, so the
+        wave keeps working.
+
+        Scope of this test: DAG edges only.  It cannot see the second path to
+        the same verdict -- a live wave adopting the same stale raw for a seeded
+        target (0 requests, run_target closed by complete_fetch before the
+        parse).  That path needs the page-identity check tracked in #1186, and
+        catching it offline needs the fixture-driven replay harness of D1.
         """
 
         _, tasks = loaded_dag

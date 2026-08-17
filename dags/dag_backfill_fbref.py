@@ -282,9 +282,15 @@ with DAG(
     # The retirement leaves the run_target open -- the contract quarantine only
     # touches page_frontier -- so the wave gate counted an unclaimable target as
     # unfinished and raised before the first request, turning the whole run into
-    # zero work.  Draining first keeps the verdict on the target's own fresh
-    # bytes: raw still quarantined at drain time stays hidden, and the seeded
-    # season is fetched again in this very run.
+    # zero work.  Draining first keeps the seed from handing the drain a target
+    # it has just unhidden: raw still behind a quarantine at drain time stays
+    # hidden from the drain, so no run_target is open when the verdict lands.
+    # This does NOT stop the live wave from adopting that same stale raw for a
+    # seeded target (pipeline.py lets historical_once accept committed raw with
+    # no request); there the wave survives because complete_fetch closes
+    # run_target before the parse, but the verdict is still made on old bytes.
+    # That remaining path is #1186 — it needs the page-identity check, not an
+    # edge order.
     acquire_publication_lock >> capture_raw_baseline >> recover_raw
     recover_raw >> seed_historical_seasons
     live_waves = PythonOperator(
