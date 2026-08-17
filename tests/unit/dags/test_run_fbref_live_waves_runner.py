@@ -22,7 +22,10 @@ def _healthy_proxy_meter(monkeypatch):
         runner,
         "validate_fbref_proxy_meter",
         lambda _url, *, required_bytes, **_kwargs: {
-            "daily_remaining_bytes": required_bytes,
+            # Above the run's own cap on purpose: with the two equal, the daily
+            # term always binds and the dagrun-remainder arithmetic of #1107
+            # stops being observable in any assertion.
+            "daily_remaining_bytes": required_bytes * 3,
         },
         raising=False,
     )
@@ -151,14 +154,25 @@ def test_bootstrap_control_run_is_allowed_through_live_transport(
     assert fetcher_kwargs["provider_context"]["dag_id"] == (
         "dag_bootstrap_fbref"
     )
-    assert fetcher_kwargs["provider_max_bytes"] == 2048 * 1024 * 1024
+    # The daily allowance minus the lease-extension race headroom (#1188): the
+    # meter recomputes its ceiling at the warm-HTTP boundary, so a run that
+    # claims the whole remainder gets a 409 that kills the wave.
+    assert fetcher_kwargs["provider_max_bytes"] == (
+        2048 * 1024 * 1024 - runner.LEASE_EXTENSION_RACE_HEADROOM_BYTES
+    )
     assert '"status": "complete"' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
     ("bytes_used", "bytes_reserved", "expected_provider_max_bytes"),
     [
-        (5_400_000, 100_000, 2048 * 1024 * 1024 - 5_500_000),
+        # The dagrun remainder binds (2 GiB - spend), and the lease-extension
+        # race headroom is held back on top of it (#1188).
+        (
+            5_400_000,
+            100_000,
+            2048 * 1024 * 1024 - 5_500_000 - 64 * 1024 * 1024,
+        ),
         (2048 * 1024 * 1024, 1, 0),
     ],
 )
@@ -275,10 +289,97 @@ def test_runner_caps_new_run_to_daily_bytes_left_after_another_run(
     assert runner._run(args) == 0
     pipeline.fetcher_factory(None, 4096, 2048 * mib)
 
-    assert fetcher_kwargs["provider_max_bytes"] == 400 * mib
+    # The daily remainder minus the race headroom, not all of it: the meter
+    # recomputes the lease-extension ceiling from its live daily counter, so a
+    # run that claims the whole remainder loses the race against its own spend
+    # and gets a 409 that kills the wave (#1188).
+    assert fetcher_kwargs["provider_max_bytes"] == (
+        400 * mib - runner.LEASE_EXTENSION_RACE_HEADROOM_BYTES
+    )
+    assert fetcher_kwargs["provider_max_bytes"] < 400 * mib
     assert meter.call_args.kwargs["required_bytes"] == 2048 * mib
     assert meter.call_args.kwargs["minimum_configured_exits"] == 4
 
+
+
+
+@pytest.mark.parametrize(
+    ("daily_remaining_mib", "expected_withheld_mib"),
+    [
+        # Far from the cap: the whole 64 MiB race slice is withheld.
+        (1024, 64),
+        # Exactly the cap boundary (256 MiB // 4 == 64 MiB).
+        (256, 64),
+        # Below the boundary the quarter-cap binds, so the slice shrinks
+        # instead of eating the whole remainder.
+        (128, 32),
+        (16, 4),
+    ],
+)
+def test_runner_never_claims_the_whole_daily_remainder(
+    monkeypatch, daily_remaining_mib, expected_withheld_mib
+):
+    # #1188: the meter re-derives the lease-extension ceiling from its live
+    # daily counter at the browser -> warm-HTTP boundary.  A run that claims
+    # every remaining byte therefore gets a 409 the runner classifies as
+    # hard_transport_policy, killing the wave with its paid Cloudflare
+    # bootstrap already burnt.  The claimed budget must stay STRICTLY under the
+    # remainder the meter reported, at every scale of remainder.
+    mib = 1024 * 1024
+    daily_remaining = daily_remaining_mib * mib
+    control = SimpleNamespace(
+        get_run=lambda _run_id: {
+            "run_type": "current",
+            "request_limit": 4096,
+            "byte_limit": 2048 * mib,
+            "metadata": {"dag_id": "dag_ingest_fbref"},
+            "bytes_used": 0,
+            "bytes_reserved": 0,
+        }
+    )
+    pipeline = SimpleNamespace(
+        control=control,
+        fetcher_factory=None,
+        run_live_waves=lambda *_args, **_kwargs: SimpleNamespace(
+            as_dict=lambda: {"status": "complete"}
+        ),
+    )
+    fetcher_kwargs = {}
+    monkeypatch.setenv("FBREF_PROXY_CONTROL_URL", "http://fbref_proxy_filter:8899")
+    monkeypatch.setenv("FBREF_PROXY_CONTROL_TOKEN", "x" * 32)
+    monkeypatch.setattr(runner.ControlStore, "from_env", lambda: control)
+    monkeypatch.setattr(
+        runner,
+        "validate_fbref_proxy_meter",
+        MagicMock(return_value={"daily_remaining_bytes": daily_remaining}),
+    )
+    monkeypatch.setattr(runner.FBrefPipeline, "from_env", lambda: pipeline)
+    monkeypatch.setattr(
+        runner,
+        "FBrefFetcher",
+        lambda **kwargs: fetcher_kwargs.update(kwargs) or object(),
+    )
+    args = Namespace(
+        control_run_id="control-run",
+        worker_id="headroom",
+        page_kinds="match",
+        run_type="current",
+        request_limit=4096,
+        byte_limit_mb=2048,
+        shard_size=25,
+        reservation_mb=3,
+        domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+        max_batches=80,
+    )
+
+    assert runner._run(args) == 0
+    pipeline.fetcher_factory(None, 4096, 2048 * mib)
+
+    claimed = fetcher_kwargs["provider_max_bytes"]
+    # The invariant, not the arithmetic: never the whole remainder.
+    assert 0 < claimed < daily_remaining
+    # And the withheld slice is a real wave's worth, not a token byte.
+    assert daily_remaining - claimed == expected_withheld_mib * mib
 
 def test_runner_rejects_stored_profile_mismatch_before_fetcher_construction(
     monkeypatch,
