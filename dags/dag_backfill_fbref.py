@@ -275,8 +275,18 @@ with DAG(
     validate_production_readiness >> assert_history_window >> initialize_run
     initialize_run >> validate_freshness_preflight
     validate_freshness_preflight >> acquire_publication_lock
-    acquire_publication_lock >> seed_historical_seasons
-    seed_historical_seasons >> capture_raw_baseline >> recover_raw
+    # Recovery drains raw BEFORE the seed, never after it.  The seed reopens a
+    # scope-quarantined season (reconcile_frontier_scope) and gives it a
+    # 'pending' run_target; that same step unhides the target's stale raw for
+    # the recovery drain, which can retire it on bytes captured days earlier.
+    # The retirement leaves the run_target open -- the contract quarantine only
+    # touches page_frontier -- so the wave gate counted an unclaimable target as
+    # unfinished and raised before the first request, turning the whole run into
+    # zero work.  Draining first keeps the verdict on the target's own fresh
+    # bytes: raw still quarantined at drain time stays hidden, and the seeded
+    # season is fetched again in this very run.
+    acquire_publication_lock >> capture_raw_baseline >> recover_raw
+    recover_raw >> seed_historical_seasons
     live_waves = PythonOperator(
         task_id="run_live_waves",
         python_callable=run_fbref_live_waves,
@@ -298,7 +308,7 @@ with DAG(
         retries=0,
         trigger_rule="all_success",
     )
-    recover_raw >> live_waves
+    seed_historical_seasons >> live_waves
     audit_raw_integrity = PythonOperator(
         task_id="audit_raw_integrity",
         python_callable=audit_fbref_raw_integrity,
