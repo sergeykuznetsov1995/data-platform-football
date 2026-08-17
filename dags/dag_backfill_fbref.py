@@ -58,7 +58,18 @@ BACKFILL_PAGE_KINDS = (
     "match",
 )
 BACKFILL_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT
-BACKFILL_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB
+# One run must not claim the meter's whole daily allowance.  The lease
+# extension ceiling is `min(daily_remaining, run_remaining, url_remaining)`
+# (scripts/fbref_proxy/filter_proxy.py::_fbref_lease_extension_ceiling), so a
+# run cap equal to the daily budget is always above what the meter can grant
+# once anything at all was spent today: the warm-HTTP phase boundary asks for
+# the full run cap, the meter answers 409 "lease extension exceeds remaining
+# shared budget", and that surfaces as hard_transport_policy — the whole wave
+# dies mid-flight and its paid Cloudflare bootstrap is burnt.  A run ceiling
+# well below the daily one keeps `run_remaining` the binding term, which is
+# exactly what the extension asks for.  Waves spend 1-25 MiB, so this is a
+# ~10x headroom, not a throttle.
+BACKFILL_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB // 8
 DEFAULT_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
 MAX_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
 BACKFILL_MAX_BATCHES = 80
@@ -108,7 +119,7 @@ with DAG(
             BACKFILL_BYTE_LIMIT_MB,
             type="integer",
             enum=[FBREF_CANARY_BYTE_LIMIT_MB, BACKFILL_BYTE_LIMIT_MB],
-            description="Canary (50) or production safety circuit (2048 MiB)",
+            description="Canary (50) or backfill run ceiling (256 MiB)",
         ),
         "shard_size": Param(
             DEFAULT_SHARD_SIZE,

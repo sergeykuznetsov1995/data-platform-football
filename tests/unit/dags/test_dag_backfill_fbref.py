@@ -47,8 +47,8 @@ class TestFBrefBackfillTopology:
         assert params["dry_run"].default is False
         assert params["request_limit"].default == 4096
         assert params["request_limit"]._kw["enum"] == [100, 4096]
-        assert params["byte_limit_mb"].default == 2048
-        assert params["byte_limit_mb"]._kw["enum"] == [50, 2048]
+        assert params["byte_limit_mb"].default == 256
+        assert params["byte_limit_mb"]._kw["enum"] == [50, 256]
         assert params["shard_size"].default == 25
         assert params["shard_size"]._kw["maximum"] == 25
         assert params["publish"].default is True
@@ -174,6 +174,31 @@ class TestFBrefBackfillTopology:
         assert trigger._captured_kwargs["execution_date"] == "{{ ti.start_date }}"
         assert trigger._captured_kwargs["conf"]["trigger_xref"] is False
         assert trigger.downstream_task_ids == {"release_publication_lock"}
+
+    def test_run_byte_ceiling_leaves_room_in_the_daily_allowance(
+        self, loaded_dag
+    ):
+        """A run cap equal to the daily budget makes every extension fail.
+
+        The meter grants `min(daily_remaining, run_remaining, url_remaining)`
+        as the new lease cap, while the warm-HTTP phase boundary asks for the
+        full run cap.  With both ceilings equal, `daily_remaining` is the
+        smaller term the moment anything was spent today, the meter answers
+        409, and the runner turns that into hard_transport_policy — the wave
+        dies with its paid bootstrap burnt.  Keeping the run ceiling a fraction
+        of the daily one makes `run_remaining` binding, so the extension asks
+        for exactly what the meter can grant.
+        """
+
+        from utils.fbref_pipeline_tasks import FBREF_PRODUCTION_BYTE_LIMIT_MB
+
+        module, tasks = loaded_dag
+        assert module.BACKFILL_BYTE_LIMIT_MB == 256
+        assert module.BACKFILL_BYTE_LIMIT_MB * 4 <= FBREF_PRODUCTION_BYTE_LIMIT_MB
+        assert (
+            module.dag._dag_kwargs["params"]["byte_limit_mb"].default
+            == module.BACKFILL_BYTE_LIMIT_MB
+        )
 
     def test_raw_recovery_drains_before_the_historical_seed(self, loaded_dag):
         """A seeded season must never be judged on raw the seed itself unhid.
