@@ -1580,6 +1580,42 @@ def test_preemptive_proxy_auth_rejects_bad_lease_before_network(proxy):
     assert stats["network_policy_failure"] == "invalid_proxy_credential"
 
 
+def test_geoip_failure_is_logged_with_its_exception_type(caplog):
+    """A geo-IP failure ends the whole wave, so name what actually failed.
+
+    The verdict travels as `hard_transport_policy`, which stops the wave and
+    burns its paid Cloudflare bootstrap (#1188).  Logging only "lookup failed"
+    makes a dead pool exit indistinguishable from a transient timeout, so the
+    exception type has to reach the log.
+    """
+
+    import logging
+
+    def resolver(_proxy):
+        raise TimeoutError("read timed out")
+
+    transport = CamoufoxFbrefTransport(
+        proxy={
+            "server": "http://fbref_proxy_filter:8900",
+            "username": "lease",
+            "password": "lease-token",
+        },
+        max_network_requests=10,
+        geoip_resolver=resolver,
+        geoip_database_check=lambda: None,
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="scrapers.fbref.camoufox_fetch"
+    ):
+        with pytest.raises(TimeoutError):
+            transport._start()
+
+    assert transport.traffic_stats()["geoip_lookup_failed"] is True
+    assert "TimeoutError" in caplog.text
+    assert "read timed out" in caplog.text
+
+
 def test_geoip_resolver_is_one_bounded_attempt_without_redirects(monkeypatch):
     import requests
 

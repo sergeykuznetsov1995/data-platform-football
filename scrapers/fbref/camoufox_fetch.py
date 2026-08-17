@@ -763,10 +763,19 @@ class CamoufoxFbrefTransport:
             self._unobserved_reserved_bytes += GEOIP_BYTE_RESERVATION_BYTES
             try:
                 geoip = self._geoip_resolver(self._proxy)
-            except Exception:
+            except Exception as exc:
                 # A lookup failure already spent its one paid request. Do not
                 # rotate leases and silently repeat it inside this transport.
+                # Name the failure by exception type, not by message: this one
+                # verdict ends the whole wave via hard_transport_policy, and
+                # without the type a dead pool exit reads exactly like a
+                # transient timeout (#1188).
                 self._geoip_lookup_failed = True
+                logger.warning(
+                    "Camoufox geo-IP lookup failed for this lease: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
                 raise
 
         from camoufox.addons import DefaultAddons
