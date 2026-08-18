@@ -679,6 +679,38 @@ class _ClaimedMatchObservation:
 
 
 @dataclass(frozen=True)
+class _ClaimedGenericObservation:
+    """A parsed non-match page held back so a cohort shares one write.
+
+    Carries ``recover_cross_run`` because the drain wave parses exactly these
+    pages, and the historical contract verdict reads that flag.
+    """
+
+    run_id: str
+    html: str
+    record: RawFetchRecord
+    observation_lease: ObservationLease
+    page: PageDocument
+    stateful_run_id: str
+    stateful_run_type: str
+    recover_cross_run: bool = False
+
+    def sequential_args(self, *, generic_persisted: bool = False) -> dict:
+        return {
+            "run_id": self.run_id,
+            "html": self.html,
+            "record": self.record,
+            "observation_lease": self.observation_lease,
+            "page": self.page,
+            "typed_match": None,
+            "generic_persisted": generic_persisted,
+            "stateful_run_id": self.stateful_run_id,
+            "stateful_run_type": self.stateful_run_type,
+            "recover_cross_run": self.recover_cross_run,
+        }
+
+
+@dataclass(frozen=True)
 class _LivePageSettlement:
     provider_billed_bytes: int
     budget_exceeded: bool = False
@@ -4991,6 +5023,120 @@ class FBrefPipeline:
         flush_cohort()
         return outcomes
 
+    @staticmethod
+    def _generic_item_cells(item: _ClaimedGenericObservation) -> int:
+        return len(item.page.cell_records())
+
+    def _process_claimed_generic_batch(
+        self, items: Sequence[_ClaimedGenericObservation]
+    ) -> list[_ProcessedObservation]:
+        """Cohort non-match pages the way matches are already cohorted.
+
+        A page costs three generic tables, and each table costs a staging
+        create/insert/insert-select/drop -- so a page written alone is ~12
+        statements, two of which carry a single row (its manifest and its
+        table inventory).  Measured on history_20260818T015855Z: 15 pages,
+        67 inserts of which 39 were exactly one row, 130 drops, 3485 HTTP
+        round trips to Trino.  Cohorting the same pages collapses that to one
+        merge per generic table.
+        """
+
+        materialized = tuple(items)
+        if not materialized:
+            return []
+        identities = [item.record.logical_refresh_id for item in materialized]
+        if len(identities) != len(set(identities)):
+            return [
+                self._process_claimed_observation(**item.sequential_args())
+                for item in materialized
+            ]
+        outcomes: list[_ProcessedObservation] = []
+        cohort: list[_ClaimedGenericObservation] = []
+        cohort_cells = 0
+
+        def flush_cohort() -> None:
+            nonlocal cohort, cohort_cells
+            if cohort:
+                outcomes.extend(
+                    self._persist_and_finish_generic_batch(cohort)
+                )
+                cohort = []
+                cohort_cells = 0
+
+        for item in materialized:
+            item_cells = self._generic_item_cells(item)
+            # A page with parser errors writes error evidence instead of rows,
+            # which the batch writer rejects outright; oversized pages keep
+            # their own write so one page cannot blow the cohort's cell bound.
+            if item.page.errors or item_cells > self.batch_persist_max_cells:
+                flush_cohort()
+                outcomes.append(
+                    self._process_claimed_observation(
+                        **item.sequential_args()
+                    )
+                )
+                continue
+            if cohort and (
+                len(cohort) == self.batch_persist_matches
+                or cohort_cells + item_cells > self.batch_persist_max_cells
+            ):
+                flush_cohort()
+            cohort.append(item)
+            cohort_cells += item_cells
+        flush_cohort()
+        return outcomes
+
+    def _persist_and_finish_generic_batch(
+        self, items: Sequence[_ClaimedGenericObservation]
+    ) -> list[_ProcessedObservation]:
+        try:
+            generic_counts = self.generic_writer.persist_pages(
+                [
+                    GenericPagePersistItem(
+                        page=item.page,
+                        canonical_url=item.record.canonical_url,
+                        run_id=item.run_id,
+                        staging_identity=item.record.logical_refresh_id,
+                    )
+                    for item in items
+                ]
+            )
+            if len(generic_counts) != len(items):
+                raise ParseWaveError(
+                    "Generic batch returned misaligned item counts"
+                )
+        except Exception:
+            # The writer may have committed a prefix. Re-run each page
+            # sequentially: same lease, same immutable raw, idempotent write.
+            return [
+                self._process_claimed_observation(**item.sequential_args())
+                for item in items
+            ]
+
+        outcomes: list[_ProcessedObservation] = []
+        for item in items:
+            # The per-page path records these right after its own write; the
+            # cohort has to do it here, or the pages it wrote carry no dataset
+            # manifests.
+            try:
+                self._record_generic_table_results(item.record, item.page)
+            except Exception as exc:
+                outcomes.append(
+                    self._failed_claimed_observation(
+                        record=item.record,
+                        page=item.page,
+                        observation_lease=item.observation_lease,
+                        exc=exc,
+                    )
+                )
+                continue
+            outcomes.append(
+                self._process_claimed_observation(
+                    **item.sequential_args(generic_persisted=True)
+                )
+            )
+        return outcomes
+
     def _persist_and_finish_match_batch(
         self, items: Sequence[_ClaimedMatchObservation]
     ) -> list[_ProcessedObservation]:
@@ -5765,24 +5911,82 @@ class FBrefPipeline:
             for outcome in self._process_claimed_match_batch(prepared):
                 self._merge_processed_result(result, outcome)
 
+        def flush_generic_items(buffer):
+            prepared: list[_ClaimedGenericObservation] = []
+            for item in buffer:
+                try:
+                    claimed = self._load_and_claim_observation(item)
+                except Exception as exc:
+                    result.failures.append(
+                        f"{item['target_id']}:{type(exc).__name__}:{exc}"
+                    )
+                    continue
+                if claimed is None:
+                    continue
+                result.claimed += 1
+                html, record, observation_lease = claimed
+                item_run_id, item_run_type = stateful_identity(item)
+                try:
+                    page = self._parse_generic(html, record)
+                except Exception:
+                    # Preparation failed. Preserve the sequential evidence
+                    # path on this same lease and raw.
+                    outcome = self._process_claimed_observation(
+                        run_id=run_id,
+                        html=html,
+                        record=record,
+                        observation_lease=observation_lease,
+                        page=None,
+                        typed_match=None,
+                        stateful_run_id=item_run_id,
+                        stateful_run_type=item_run_type,
+                        recover_cross_run=_recover_cross_run,
+                    )
+                    self._merge_processed_result(result, outcome)
+                    continue
+                prepared.append(_ClaimedGenericObservation(
+                    run_id=run_id,
+                    html=html,
+                    record=record,
+                    observation_lease=observation_lease,
+                    page=page,
+                    stateful_run_id=item_run_id,
+                    stateful_run_type=item_run_type,
+                    recover_cross_run=_recover_cross_run,
+                ))
+            for outcome in self._process_claimed_generic_batch(prepared):
+                self._merge_processed_result(result, outcome)
+
         if not self.batch_persist_enabled:
             for item in fetches:
                 process_sequential_item(item)
         else:
             match_buffer = []
-            for item in fetches:
-                if str(item.get("page_kind") or "") == "match":
-                    match_buffer.append(item)
-                    if len(match_buffer) == self.batch_persist_matches:
-                        flush_match_items(match_buffer)
-                        match_buffer = []
-                    continue
-                if match_buffer:
+            generic_buffer = []
+
+            def flush_buffers(*, matches: bool, generic: bool) -> None:
+                nonlocal match_buffer, generic_buffer
+                if matches and match_buffer:
                     flush_match_items(match_buffer)
                     match_buffer = []
-                process_sequential_item(item)
-            if match_buffer:
-                flush_match_items(match_buffer)
+                if generic and generic_buffer:
+                    flush_generic_items(generic_buffer)
+                    generic_buffer = []
+
+            for item in fetches:
+                if str(item.get("page_kind") or "") == "match":
+                    # Switching kinds flushes the other buffer first, so the
+                    # cohort order stays the selection order.
+                    flush_buffers(matches=False, generic=True)
+                    match_buffer.append(item)
+                    if len(match_buffer) == self.batch_persist_matches:
+                        flush_buffers(matches=True, generic=False)
+                    continue
+                flush_buffers(matches=True, generic=False)
+                generic_buffer.append(item)
+                if len(generic_buffer) == self.batch_persist_matches:
+                    flush_buffers(matches=False, generic=True)
+            flush_buffers(matches=True, generic=True)
         if result.failures:
             raise ParseWaveError("; ".join(result.failures))
         if _is_mass_contract_rejection(result):

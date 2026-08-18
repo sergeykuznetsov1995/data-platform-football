@@ -4088,6 +4088,168 @@ def test_registry_snapshot_identity_is_stable_for_raw_retry(tmp_path):
     assert uuid.UUID(snapshot_ids[0]).version == 5
 
 
+def _seasons_html(competition_id: str) -> str:
+    return f"""
+    <table id="seasons"><tbody>
+      <tr><th data-stat="season"><a href="/en/comps/{competition_id}/2024-2025/x">2024-2025</a></th></tr>
+    </tbody></table>
+    """
+
+
+def _pipeline_with_saved_generic_pages(tmp_path, competition_ids, broken=()):
+    """Competition pages ready to parse, one per id, batch persistence on."""
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.fetches = []
+    for competition_id in competition_ids:
+        control.registry[competition_id] = {
+            "competition_id": competition_id,
+            "canonical_url": (
+                f"https://fbref.com/en/comps/{competition_id}/history/x"
+            ),
+            "name": f"Competition {competition_id}",
+            "gender": "male",
+            "classification": "league:club",
+            "metadata": {},
+        }
+        target = page_target_from_link(DiscoveredPageLink(
+            page_kind="competition",
+            canonical_url=(
+                f"https://fbref.com/en/comps/{competition_id}/history/x"
+            ),
+            source_ids={"competition_id": competition_id},
+        ))
+        html = (
+            '<table id="not_seasons"><tbody><tr><td>1</td></tr></tbody></table>'
+            if competition_id in broken
+            else _seasons_html(competition_id)
+        )
+        refresh, record = _commit_for_parse(raw, target, html)
+        control.frontier[record.target_id] = {
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "source_ids": dict(record.source_ids),
+            "state": "fetched",
+            "last_content_hash": record.content_hash,
+        }
+        control.fetches.append({
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "logical_refresh_id": refresh,
+        })
+    generic = FakeWriter()
+
+    def forbidden_transport(*_args):
+        raise AssertionError("parse batching must not construct a transport")
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=generic,
+        fetcher_factory=forbidden_transport,
+    )
+    pipeline.batch_persist_enabled = True
+    return pipeline, control, generic
+
+
+def test_generic_pages_share_one_write_per_cohort(tmp_path):
+    """A page alone costs three staged writes, two of them a single row.
+
+    Measured on history_20260818T015855Z: 15 pages produced 67 inserts (39 of
+    exactly one row), 130 drops and 3485 HTTP round trips to Trino, while the
+    wave fetched for about a minute.  Matches were already cohorted; every
+    other page kind was not, and the history campaign fetches almost nothing
+    but other page kinds.
+    """
+
+    pipeline, control, generic = _pipeline_with_saved_generic_pages(
+        tmp_path, ["9", "12", "13"]
+    )
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_settings("current"),
+    )
+
+    assert generic.batch_sizes == [3]
+    assert result.claimed == result.parsed == 3
+    assert result.seeded == 3
+    assert all(
+        row["status"] == "succeeded" for row in control.observations.values()
+    )
+
+
+def test_generic_cohort_stops_at_the_configured_size(tmp_path):
+    pipeline, control, generic = _pipeline_with_saved_generic_pages(
+        tmp_path, ["9", "12", "13", "14", "15"]
+    )
+    pipeline.batch_persist_matches = 2
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=replace(_settings("current"), shard_size=5),
+    )
+
+    assert generic.batch_sizes == [2, 2, 1]
+    assert result.parsed == 5
+
+
+def test_generic_batch_failure_reuses_claims_and_raw_without_network(tmp_path):
+    pipeline, control, generic = _pipeline_with_saved_generic_pages(
+        tmp_path, ["9", "12"]
+    )
+    generic.batch_error = RuntimeError("commit reset")
+    load_calls = 0
+    original_load = pipeline.raw_store.load_fetch_html
+
+    def counted_load(logical_refresh_id):
+        nonlocal load_calls
+        load_calls += 1
+        return original_load(logical_refresh_id)
+
+    pipeline.raw_store.load_fetch_html = counted_load
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_settings("current"),
+    )
+
+    # The cohort write failed, so each page is written on its own -- on the
+    # same lease and the same raw, without a second load or any network.
+    assert result.claimed == result.parsed == 2
+    assert load_calls == 2
+    assert len(generic.pages) == 2
+    assert all(
+        row["status"] == "succeeded" for row in control.observations.values()
+    )
+
+
+def test_page_with_parser_errors_never_joins_a_cohort(tmp_path):
+    """The batch writer rejects a cohort holding parser errors outright."""
+
+    pipeline, control, generic = _pipeline_with_saved_generic_pages(
+        tmp_path, ["9", "12", "13"], broken=("12",)
+    )
+
+    # The broken page fails discovery, which fails the wave -- as it did
+    # before cohorting. What matters here is that it was written on its own.
+    with pytest.raises(ParseWaveError, match="Season discovery failed"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["competition"],
+            settings=_settings("current"),
+        )
+
+    # 9 flushes when the broken page arrives, 12 goes through the single-page
+    # path (so it never appears as a cohort), 13 follows on its own.
+    assert generic.batch_sizes == [1, 1]
+    assert len(generic.pages) == 3
+
+
 def test_current_history_parse_uses_exact_source_season_and_opaque_ids(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)

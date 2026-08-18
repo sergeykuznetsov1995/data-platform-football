@@ -309,3 +309,55 @@ def test_non_uuid_stage_identity_is_stable_and_identifier_safe():
     assert token.startswith("id_")
     assert len(token) == 35
     assert token.replace("_", "").isalnum()
+
+
+def _statement_count(manager) -> int:
+    """Manager operations, which is not the same as Trino statements.
+
+    ``insert_dataframe`` fans out into as many INSERTs as the row bytes need
+    (SQL_BYTE_BUDGET, trino_manager.py), so the cell payload keeps scaling with
+    the data whatever the cohort. What cohorting removes is the fixed cost
+    around it -- stage create/drop, count, merge -- and the two small tables
+    that carry one or two rows per page.
+    """
+
+    return (
+        len(manager._execute.call_args_list)
+        + len(manager.insert_dataframe.call_args_list)
+        + len(manager.drop_table.call_args_list)
+        + len(manager.create_iceberg_table.call_args_list)
+    )
+
+
+@pytest.mark.parametrize("cohort_size", [2, 8, 15])
+def test_a_cohort_costs_one_pages_worth_of_statements(cohort_size):
+    """The whole point of cohorting: statements stop scaling with pages.
+
+    A page written alone costs six statements per generic table -- drop stage,
+    create stage, insert, count, merge, drop stage -- and it has three tables,
+    two of which carry a single row.  Live evidence for what that costs:
+    history_20260818T015855Z persisted 15 pages and spent 3485 HTTP round
+    trips on Trino while fetching for about a minute.
+    """
+
+    items = [_page_item(str(index)) for index in range(cohort_size)]
+
+    one_by_one = _manager()
+    writer = FBrefGenericBronzeWriter(one_by_one)
+    for item in items:
+        writer.persist_pages([item])
+    alone = _statement_count(one_by_one)
+
+    cohorted = _manager()
+    FBrefGenericBronzeWriter(cohorted).persist_pages(items)
+    together = _statement_count(cohorted)
+
+    # Six statements per generic table -- drop stage, create stage, insert,
+    # count, merge, drop stage -- and three tables. The table preflight is
+    # cached per writer, so it is paid once either way.
+    per_page = 6 * 3
+    preflight = 3
+    assert together == per_page + preflight
+    assert alone == per_page * cohort_size + preflight
+    assert len(_merge_sql(cohorted)) == 3
+    assert len(_merge_sql(one_by_one)) == 3 * cohort_size
