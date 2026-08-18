@@ -1684,7 +1684,15 @@ def test_forced_player_refresh_reobserves_partial_current_run_commits():
     assert sorted(call[0] for call in transport.calls[1:]) == sorted([url10, url20])
 
 
-def test_backfill_reprocesses_prior_generation_children_for_current_lineage():
+def test_backfill_skips_fresh_prior_generation_children():
+    """#1146 отменяет контракт #995: свежие цели прошлого рана не перекачиваются.
+
+    Прежнее поведение (backfill переобрабатывает всё, что собрал предыдущий ран)
+    стоило 35 тыс. лишних запросов из 76 тыс. за трое суток — при том, что витрины
+    `*_current` берут свежайший batch по натуральному ключу и к поколению не
+    привязаны, то есть данные прошлого рана видны silver без перекачки.
+    """
+
     bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
     leaderboard_url = "https://data.fotmob.com/stats/47/season/goals.json"
     match_url = canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url
@@ -1721,6 +1729,91 @@ def test_backfill_reprocesses_prior_generation_children_for_current_lineage():
         ("player", canonicalize_target(player_url), "10"),
     )
     for target_type, target, entity_id in prior_targets:
+        commit = TargetCommit(
+            run_id="prior-publication-generation",
+            target_type=target_type,
+            target_key=target.target_key,
+            status=ManifestStatus.SUCCESS,
+            entity_id=entity_id,
+            content_hash="a" * 64,
+            raw_uri=f"memory://{target.target_key}.json.gz",
+            completed_at=datetime.now(timezone.utc),
+        )
+        repository.record(commit)
+        if target_type == "team":
+            # Состав прошлого рана обязан лежать в снимке: иначе fan-out на
+            # игроков пуст сам по себе и ассерт по игрокам ничего не проверяет.
+            repository.tables.setdefault("fotmob_squad_snapshots", []).append(
+                {
+                    "team_id": entity_id,
+                    "member_type": "player",
+                    "member_id": 10,
+                    "_target_batch_id": commit.batch_id,
+                }
+            )
+
+    leaderboard = service.sync_leaderboards(bundle)
+    matches = service.sync_match_payloads(bundle)
+    teams, player_ids = service.sync_team_snapshots(bundle)
+    players = service.sync_player_snapshots(player_ids, build_id="build-1")
+
+    assert all(result.ok for result in (leaderboard, matches, teams, players))
+    # Всё, что прошлый ран собрал только что, пропускается целиком.
+    assert leaderboard.skipped == 1
+    assert matches.skipped == 1
+    assert teams.skipped == 2
+    # Игрок из состава свежей команды в план попал и пропущен по свежести —
+    # а не «не планировался вовсе».
+    assert player_ids == {10}
+    assert players.attempted == 1
+    assert players.skipped == 1
+    # Главное следствие: ни одного сетевого обращения.
+    assert transport.calls == []
+    current_commits = [
+        commit for commit in repository.commits if commit.run_id == service.run_id
+    ]
+    assert current_commits == []
+
+
+def test_backfill_refetches_stale_prior_generation_children():
+    """Обратная сторона #1146: протухшую цель прошлого рана всё равно берём."""
+
+    bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
+    leaderboard_url = "https://data.fotmob.com/stats/47/season/goals.json"
+    team_url = canonicalize_target("teams", {"id": "1"}).canonical_url
+    # Bundle планирует обе команды; без ответа на вторую результат был бы
+    # «зелёным, но пустым» — команды берутся, но с ошибкой.
+    other_team_url = canonicalize_target("teams", {"id": "2"}).canonical_url
+    player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
+    team_payload = {
+        "details": {"name": "Alpha"},
+        "overview": {},
+        "squad": {
+            "squad": [
+                {
+                    "title": "Players",
+                    "members": [{"id": 10, "name": "Player"}],
+                }
+            ]
+        },
+    }
+    responses = {
+        leaderboard_url: {"TopLists": []},
+        team_url: team_payload,
+        other_team_url: team_payload,
+        player_url: {"pageProps": {"data": {"id": 10, "name": "Player"}}},
+    }
+    service, transport, repository = _service(responses, mode=RunMode.BACKFILL)
+    now = datetime.now(timezone.utc)
+    stale = (
+        # лидерборд: старше LEADERBOARD_REFRESH_AFTER (24 ч)
+        ("leaderboard", canonicalize_target(leaderboard_url), "goals", timedelta(hours=25)),
+        # команда: старше окна обновления состава (20 ч)
+        ("team", canonicalize_target(team_url), "1", timedelta(hours=21)),
+        # игрок: старше окна карточки игрока (7 суток)
+        ("player", canonicalize_target(player_url), "10", timedelta(days=8)),
+    )
+    for target_type, target, entity_id, age in stale:
         repository.record(
             TargetCommit(
                 run_id="prior-publication-generation",
@@ -1730,35 +1823,104 @@ def test_backfill_reprocesses_prior_generation_children_for_current_lineage():
                 entity_id=entity_id,
                 content_hash="a" * 64,
                 raw_uri=f"memory://{target.target_key}.json.gz",
+                completed_at=now - age,
+            )
+        )
+
+    leaderboard = service.sync_leaderboards(bundle)
+    teams, player_ids = service.sync_team_snapshots(bundle)
+    players = service.sync_player_snapshots(player_ids, build_id="build-1")
+
+    assert all(result.ok for result in (leaderboard, teams, players))
+    assert leaderboard.skipped == 0
+    assert players.skipped == 0
+    # Команда 1 протухла и берётся заново; команда 2 в манифесте не значится вовсе.
+    assert teams.attempted == 2
+    assert teams.skipped == 0
+    fetched = {call[0] for call in transport.calls}
+    assert leaderboard_url in fetched
+    assert team_url in fetched
+    assert other_team_url in fetched
+    assert player_url in fetched
+
+
+def test_stale_raw_replay_does_not_count_as_freshness_validation():
+    """Реплей сырья при 5xx коммитится как success — но валидацией не является.
+
+    Иначе недоступность источника морозит цель на весь TTL: лидерборд — на
+    сутки, а матч (TTL бесконечен) — навсегда.
+    """
+
+    bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
+    leaderboard_url = "https://data.fotmob.com/stats/47/season/goals.json"
+    match_url = canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url
+    responses = {
+        leaderboard_url: {"TopLists": []},
+        match_url: {"content": {"matchFacts": {"events": []}, "stats": {}}},
+    }
+    service, transport, repository = _service(responses, mode=RunMode.BACKFILL)
+    for target_type, url, entity_id in (
+        ("leaderboard", leaderboard_url, "goals"),
+        ("match", match_url, "100"),
+    ):
+        target = canonicalize_target(url)
+        repository.record(
+            TargetCommit(
+                run_id="prior-publication-generation",
+                target_type=target_type,
+                target_key=target.target_key,
+                status=ManifestStatus.SUCCESS,
+                entity_id=entity_id,
+                content_hash="a" * 64,
+                raw_uri=f"memory://{target.target_key}.json.gz",
+                stale=True,
                 completed_at=datetime.now(timezone.utc),
             )
         )
 
     leaderboard = service.sync_leaderboards(bundle)
     matches = service.sync_match_payloads(bundle)
-    teams, player_ids = service.sync_team_snapshots(bundle)
-    players = service.sync_player_snapshots(player_ids, build_id="build-1")
 
-    assert all(result.ok for result in (leaderboard, matches, teams, players))
-    assert (
-        leaderboard.skipped == matches.skipped == teams.skipped == players.skipped == 0
+    assert leaderboard.skipped == 0
+    assert matches.skipped == 0
+    fetched = {call[0] for call in transport.calls}
+    assert leaderboard_url in fetched
+    assert match_url in fetched
+
+
+def test_player_freshness_survives_build_id_rotation():
+    """Критерий A1: смена build id меняет URL игрока, но не его свежесть.
+
+    Порог по ``entity_id`` (а не по URL) — единственное, что удерживает
+    ротацию Next.js от полной перезакачки всех карточек игроков.
+    """
+
+    old_player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
+    new_player_url = "https://www.fotmob.com/_next/data/build-2/players/10.json"
+    service, transport, repository = _service(
+        {new_player_url: {"pageProps": {"data": {"id": 10, "name": "Player"}}}},
+        mode=RunMode.BACKFILL,
     )
-    assert len(transport.calls) == 5
-    current_commits = [
-        commit for commit in repository.commits if commit.run_id == service.run_id
-    ]
-    assert {commit.target_type for commit in current_commits} == {
-        "leaderboard",
-        "match",
-        "team",
-        "player",
-    }
-    assert {
-        commit.entity_id for commit in current_commits if commit.target_type == "team"
-    } == {
-        "1",
-        "2",
-    }
+    old_target = canonicalize_target(old_player_url)
+    repository.record(
+        TargetCommit(
+            run_id="prior-publication-generation",
+            target_type="player",
+            target_key=old_target.target_key,
+            status=ManifestStatus.SUCCESS,
+            entity_id="10",
+            content_hash="a" * 64,
+            raw_uri=f"memory://{old_target.target_key}.json.gz",
+            completed_at=datetime.now(timezone.utc),
+        )
+    )
+
+    players = service.sync_player_snapshots({10}, build_id="build-2")
+
+    assert canonicalize_target(new_player_url).target_key != old_target.target_key
+    assert players.attempted == 1
+    assert players.skipped == 1
+    assert transport.calls == []
 
 
 def _absent_team_fetch(outcome, team_id="2222"):
@@ -2553,3 +2715,39 @@ def test_transfer_stream_deficit_beyond_tolerance_stays_incomplete():
     assert not result.ok
     assert any("transfer pagination incomplete" in item for item in result.errors)
     assert "source_hits_deficit" not in result.metadata
+
+
+def test_leaderboard_freshness_is_keyed_by_url_not_category_name():
+    """Анти-мина #1146: порог свежести лидерборда — по target_key, не по имени.
+
+    Имя категории ("goals") повторяется у сотен турниров: живьём 72 значения
+    entity_id на 9146 разных URL. Если бы порог считался по entity_id, свежий
+    лидерборд одного турнира закрывал бы цели всех остальных.
+    """
+
+    own_url = "https://data.fotmob.com/stats/47/season/goals.json"
+    other_url = "https://data.fotmob.com/stats/48/season/goals.json"
+    other_payload = copy.deepcopy(_league_payload())
+    other_payload["details"]["id"] = 48
+    other_payload["stats"]["players"][0]["fetchAllUrl"] = other_url
+    bundle = parse_season_bundle(other_payload, ScopeRef(48, "2025/2026"))
+
+    service, transport, repository = _service({other_url: {"TopLists": []}})
+    # Свежий лидерборд ЧУЖОГО турнира с тем же именем категории.
+    repository.record(
+        TargetCommit(
+            run_id="prior-run",
+            target_type="leaderboard",
+            target_key=canonicalize_target(own_url).target_key,
+            status=ManifestStatus.SUCCESS,
+            entity_id="goals",
+            content_hash="a" * 64,
+            raw_uri="memory://own.json.gz",
+            completed_at=datetime.now(timezone.utc),
+        )
+    )
+
+    result = service.sync_leaderboards(bundle)
+
+    assert result.skipped == 0
+    assert [call[0] for call in transport.calls] == [other_url]

@@ -145,6 +145,7 @@ class EntityAttemptTrino:
                 None,
                 PARSER_VERSION,
                 "retryable_failure",
+                False,
                 datetime(2026, 8, 8, 9),
                 datetime(2026, 8, 8, 10),
                 "{}",
@@ -1382,6 +1383,7 @@ def _manifest_row(
     completed="2026-07-10 00:00:00",
     parser_version=PARSER_VERSION,
     status="success",
+    stale=False,
 ):
     return (
         target_key,
@@ -1390,6 +1392,7 @@ def _manifest_row(
         "file:///raw/x.gz",
         parser_version,
         status,
+        stale,
         completed,
         completed,
         "{}",
@@ -1419,6 +1422,26 @@ def test_preloaded_manifest_answers_every_target_read_without_a_query():
     assert repository.latest_success("https://example/match/404") is None
     assert repository.latest_entity_success("player", 404) is None
     assert len(writer.trino.queries) == queries_after_preload
+
+
+def test_manifest_reads_carry_the_stale_replay_flag():
+    # Реплей сырья коммитится как success со свежим completed_at: без этого
+    # признака порог свежести примет его за подтверждение источника и заморозит
+    # цель на весь TTL.
+    writer = PreloadWriter(
+        [
+            _manifest_row("https://example/match/1", "fm1-a", stale=True),
+            _manifest_row(
+                "https://example/player/9", "fm1-b", "player", "9", stale=True
+            ),
+        ]
+    )
+    repository = FotMobRepository(writer=writer)
+
+    repository.preload_manifest_index()
+
+    assert repository.latest_success("https://example/match/1")["stale"] is True
+    assert repository.latest_entity_success("player", 9)["stale"] is True
 
 
 def test_v1_manifest_rows_are_ineligible_for_v2_skip_state():

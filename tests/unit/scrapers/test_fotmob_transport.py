@@ -202,6 +202,53 @@ def test_etag_and_last_modified_304_replay_cached_body(tmp_path):
     assert stats.decoded_bytes == len(body)
 
 
+def test_rotated_url_neither_inherits_validators_nor_closes_on_304(tmp_path):
+    """Мина A1 (урок FBref 05.08): кэш-валидатор не переезжает на новый URL.
+
+    Ротация Next.js build id меняет физический адрес карточки игрока. Если бы
+    ETag/Last-Modified достались новому адресу, источник ответил бы 304 «не
+    изменилось» на страницу, которую никогда не качали, и цель закрылась бы
+    успехом без единого 200.
+    """
+
+    store = _store(tmp_path)
+    old_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
+    new_url = "https://www.fotmob.com/_next/data/build-2/players/10.json"
+    body = b'{"pageProps":{"data":{"id":10}}}'
+    store.store(
+        canonicalize_target(old_url),
+        body,
+        fetched_at="2026-08-18T12:00:00+00:00",
+        etag='"player-10-v7"',
+        last_modified="Mon, 18 Aug 2026 12:00:00 GMT",
+    )
+
+    transport, session = _transport([FakeResponse(304)], raw_store=store)
+    result = transport.fetch_json(new_url)
+
+    # Валидаторы прежнего адреса на новый не уехали...
+    assert session.calls[0][1]["headers"] == {}
+    # ...а 304 без собственного сырья не закрывает цель успехом.
+    assert result.outcome == FetchOutcome.TERMINAL_FAILURE
+    assert result.http_status == 304
+    assert not result.cache_hit
+    assert result.body is None
+    assert "304 without a valid raw body" in result.error
+
+    # Контроль: у прежнего адреса механизм валидаторов работает — иначе первая
+    # половина теста была бы зелёной по пустой причине.
+    same_url_transport, same_url_session = _transport(
+        [FakeResponse(304)], raw_store=store
+    )
+    replay = same_url_transport.fetch_json(old_url)
+    assert same_url_session.calls[0][1]["headers"] == {
+        "If-None-Match": '"player-10-v7"',
+        "If-Modified-Since": "Mon, 18 Aug 2026 12:00:00 GMT",
+    }
+    assert replay.outcome == FetchOutcome.NOT_MODIFIED
+    assert replay.body == body
+
+
 def test_retry_after_retryable_statuses_then_success_are_counted():
     delays = []
     session = FakeSession(

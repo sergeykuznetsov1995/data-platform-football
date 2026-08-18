@@ -143,6 +143,20 @@ def _aware_datetime(value: Optional[str | datetime]) -> Optional[datetime]:
     return parsed
 
 
+def _validated_at(previous: Optional[Mapping[str, Any]]) -> Optional[datetime]:
+    """Момент, когда цель в последний раз подтвердил сам источник.
+
+    Реплей сырья из raw store (``STALE_REPLAY`` после 5xx) коммитится как
+    ``success`` со свежим ``completed_at``, но сеть при этом ничего не
+    подтверждала. Порог свежести обязан такую запись игнорировать, иначе
+    недоступность источника замораживает цель на весь TTL (а матч, у которого
+    TTL бесконечен, — навсегда)."""
+
+    if not previous or previous.get("stale"):
+        return None
+    return _aware_datetime(previous.get("completed_at") or previous.get("fetched_at"))
+
+
 def _content_hash(values: Iterable[str]) -> str:
     material = "\0".join(sorted(str(value) for value in values)).encode("utf-8")
     return hashlib.sha256(material).hexdigest()
@@ -184,6 +198,10 @@ _PROFILE_BACKOFF = (
     timedelta(hours=24),
 )
 _PROFILE_REVIEW_INTERVAL = timedelta(days=30)
+# Порог свежести таблиц лидеров (#1146). Замер 15–18.08: ни один из 398 повторов
+# в пределах 48 часов не изменил content_hash, а на интервалах длиннее 48 часов
+# содержимое менялось у половины целей — 24 часа берём с запасом вдвое.
+LEADERBOARD_REFRESH_AFTER = timedelta(hours=24)
 
 
 def profile_probe_delay(
@@ -507,7 +525,9 @@ class FotMobIngestService:
         # the manifest about every single target it considers.
         preload = getattr(self.repository, "preload_manifest_index", None)
         if preload is not None:
-            preload(run_id=self.run_id if self.mode == RunMode.BACKFILL else None)
+            # Свежесть цели помнится глобально, а не в границах рана: backfill
+            # больше не перекачивает то, что собрал предыдущий ран (#1146).
+            preload()
 
     def cancel(self) -> None:
         """Cooperatively stop scheduling/retrying worker requests."""
@@ -1999,14 +2019,17 @@ class FotMobIngestService:
                 )
                 continue
             manifest_target = canonicalize_target(descriptor.fetch_all_url)
-            if self.mode == RunMode.BACKFILL:
-                previous = self.repository.latest_success(
-                    manifest_target.target_key,
-                    run_id=self.run_id,
-                )
+            if self.mode != RunMode.REPLAY:
+                # Ключ — target_key, а НЕ entity_id: у лидербордов имя категории
+                # повторяется у разных турниров (72 имени на 9146 URL), и порог
+                # по entity_id закрыл бы чужие цели.
+                previous = self.repository.latest_success(manifest_target.target_key)
+                validated_at = _validated_at(previous)
                 if (
                     previous is not None
                     and previous.get("parser_version") == PARSER_VERSION
+                    and validated_at is not None
+                    and utc_now() - validated_at < LEADERBOARD_REFRESH_AFTER
                 ):
                     result.skipped += 1
                     continue
@@ -2396,11 +2419,12 @@ class FotMobIngestService:
             manifest_target = canonicalize_target(
                 "matchDetails", {"matchId": str(match_id)}
             )
-            previous = self.repository.latest_success(
-                manifest_target.target_key,
-                run_id=(self.run_id if self.mode == RunMode.BACKFILL else None),
-            )
-            if previous is not None and self.mode != RunMode.REPLAY:
+            previous = self.repository.latest_success(manifest_target.target_key)
+            if (
+                previous is not None
+                and not previous.get("stale")
+                and self.mode != RunMode.REPLAY
+            ):
                 result.skipped += 1
                 continue
             by_key[key] = match
@@ -2618,18 +2642,8 @@ class FotMobIngestService:
         player_ids: set[int] = set()
         for team in teams:
             team_id = team.get("team_id")
-            previous = self.repository.latest_entity_success(
-                "team",
-                team_id,
-                run_id=(self.run_id if self.mode == RunMode.BACKFILL else None),
-            )
-            validated_at = (
-                _aware_datetime(
-                    previous.get("completed_at") or previous.get("fetched_at")
-                )
-                if previous
-                else None
-            )
+            previous = self.repository.latest_entity_success("team", team_id)
+            validated_at = _validated_at(previous)
             if (
                 previous is not None
                 and validated_at is not None
@@ -2901,18 +2915,8 @@ class FotMobIngestService:
         now = utc_now()
         due: list[int] = []
         for player_id in ids:
-            previous = self.repository.latest_entity_success(
-                "player",
-                player_id,
-                run_id=(self.run_id if self.mode == RunMode.BACKFILL else None),
-            )
-            fetched_at = (
-                _aware_datetime(
-                    previous.get("completed_at") or previous.get("fetched_at")
-                )
-                if previous
-                else None
-            )
+            previous = self.repository.latest_entity_success("player", player_id)
+            fetched_at = _validated_at(previous)
             if (
                 previous is not None
                 and fetched_at is not None
