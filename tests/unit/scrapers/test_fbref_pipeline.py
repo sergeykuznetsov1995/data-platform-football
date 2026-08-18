@@ -4181,6 +4181,46 @@ def test_generic_pages_share_one_write_per_cohort(tmp_path):
     )
 
 
+def test_scope_is_reconciled_once_per_wave_not_once_per_page(tmp_path):
+    """The reconciler sweeps the whole frontier, so its cost is per call.
+
+    Measured live 18.08: ~70s per call, running back to back, against a 122s
+    page-to-page cycle -- the largest single cost in a wave, ahead of every
+    Trino write.  Nothing claims targets while a parse wave runs, so one
+    reconcile at the end of the wave is as timely as one per page.
+    """
+
+    pipeline, control, _generic = _pipeline_with_saved_generic_pages(
+        tmp_path, ["9", "12", "13"]
+    )
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_settings("current"),
+    )
+
+    assert result.seeded == 3
+    assert control.events.count("scope_reconcile") == 1
+
+
+def test_a_failed_wave_still_reconciles_the_scope_it_changed(tmp_path):
+    pipeline, control, _generic = _pipeline_with_saved_generic_pages(
+        tmp_path, ["9", "12", "13"], broken=("12",)
+    )
+
+    with pytest.raises(ParseWaveError):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["competition"],
+            settings=_settings("current"),
+        )
+
+    # Page 9 seeded before the wave failed; leaving its scope unreconciled
+    # would park the target it created until some later run swept the frontier.
+    assert control.events.count("scope_reconcile") == 1
+
+
 def test_generic_cohort_stops_at_the_configured_size(tmp_path):
     pipeline, control, generic = _pipeline_with_saved_generic_pages(
         tmp_path, ["9", "12", "13", "14", "15"]

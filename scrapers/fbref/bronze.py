@@ -224,7 +224,11 @@ class FBrefGenericBronzeWriter:
             + f"WHEN NOT MATCHED THEN INSERT ({names}) VALUES ({values})"
         )
         try:
-            self.manager._execute(merge_sql)
+            # A natural-key upsert converges on re-execution, so it belongs on
+            # the committing path the typed writer already uses: an Iceberg
+            # commit conflict here would otherwise drop a whole cohort back to
+            # one write per page, which is the cost cohorting exists to avoid.
+            self.manager._execute_committing(merge_sql)
         except Exception:
             # Retain a fully validated stage for deterministic recovery.
             raise

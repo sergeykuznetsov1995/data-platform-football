@@ -1887,6 +1887,8 @@ class FBrefPipeline:
         self.finalization_guard = finalization_guard
         # Instance fields make the default-off rollout and bounded cohort
         # policy directly inspectable and overridable in deterministic tests.
+        self._scope_reconcile_deferred = False
+        self._scope_reconcile_pending = False
         self.batch_persist_enabled = FBREF_BATCH_PERSIST
         self.batch_persist_matches = FBREF_BATCH_PERSIST_MATCHES
         self.batch_persist_max_cells = FBREF_BATCH_PERSIST_MAX_CELLS
@@ -3740,11 +3742,45 @@ class FBrefPipeline:
         return len(seeded_targets), len(skipped_targets)
 
     def _reconcile_frontier_scope(self) -> None:
+        if self._scope_reconcile_deferred:
+            self._scope_reconcile_pending = True
+            return
         reconcile_scope = getattr(
             self.control, "reconcile_frontier_scope", None
         )
         if reconcile_scope is not None:
             reconcile_scope(source="fbref")
+
+    @contextmanager
+    def _deferred_scope_reconcile(self):
+        """Collapse a wave's per-page scope reconciles into one.
+
+        The reconciler sweeps the whole frontier -- it joins page_frontier
+        (120 919 rows) with frontier_provenance (1.7M rows) and rolls the
+        result up per target -- so it costs the same whether a page brought
+        27 links or 510.  Measured live on 18.08: ~70s a page, back to back,
+        against a 122s page-to-page cycle.  It is called once per parsed page
+        that seeded anything, which makes it the single largest cost in a
+        wave, ahead of every Trino write.
+
+        Running it once per wave keeps the guarantee that matters: nothing
+        claims targets during a parse wave, and the fetch wave that does claim
+        runs after this one returns.  The finally clause keeps that true for a
+        failed wave too, so scope is never left stale behind an exception.
+        """
+
+        previous_deferred = self._scope_reconcile_deferred
+        previous_pending = self._scope_reconcile_pending
+        self._scope_reconcile_deferred = True
+        self._scope_reconcile_pending = False
+        try:
+            yield
+        finally:
+            pending = self._scope_reconcile_pending
+            self._scope_reconcile_deferred = previous_deferred
+            self._scope_reconcile_pending = previous_pending
+            if pending:
+                self._reconcile_frontier_scope()
 
     def _parse_competition_index(
         self,
@@ -5744,7 +5780,8 @@ class FBrefPipeline:
     ) -> WaveResult:
         """Parse raw under a database-held publication-generation fence."""
 
-        with self.control.guard_publication_lock(run_id, source="fbref"):
+        with self.control.guard_publication_lock(run_id, source="fbref"), \
+                self._deferred_scope_reconcile():
             return self._parse_wave_under_publication_guard(
                 run_id,
                 page_kinds=page_kinds,

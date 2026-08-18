@@ -60,9 +60,15 @@ def _page_item(identity: str, *, page=None):
 
 
 def _merge_sql(manager):
+    # The generic MERGE goes through the committing path, the same one the
+    # typed writer uses, so an Iceberg commit conflict retries instead of
+    # dropping the cohort.
     return [
         call.args[0]
-        for call in manager._execute.call_args_list
+        for call in (
+            manager._execute.call_args_list
+            + manager._execute_committing.call_args_list
+        )
         if call.args and call.args[0].startswith("MERGE INTO")
     ]
 
@@ -227,11 +233,7 @@ def test_generic_writer_merges_by_identity_and_commits_page_manifest_last():
 
     assert counts == {"cells": 1, "tables": 1, "manifest": 1}
     assert manager.create_iceberg_table.call_count == 3
-    merge_sql = [
-        call.args[0]
-        for call in manager._execute.call_args_list
-        if call.args and call.args[0].startswith("MERGE INTO")
-    ]
+    merge_sql = _merge_sql(manager)
     assert len(merge_sql) == 3
     assert f"iceberg.bronze.{PAGE_MANIFEST_TABLE}" in merge_sql[-1]
     assert all("WHEN MATCHED THEN UPDATE" in sql for sql in merge_sql)
@@ -323,6 +325,7 @@ def _statement_count(manager) -> int:
 
     return (
         len(manager._execute.call_args_list)
+        + len(manager._execute_committing.call_args_list)
         + len(manager.insert_dataframe.call_args_list)
         + len(manager.drop_table.call_args_list)
         + len(manager.create_iceberg_table.call_args_list)
@@ -361,3 +364,25 @@ def test_a_cohort_costs_one_pages_worth_of_statements(cohort_size):
     assert alone == per_page * cohort_size + preflight
     assert len(_merge_sql(cohorted)) == 3
     assert len(_merge_sql(one_by_one)) == 3 * cohort_size
+
+
+def test_generic_merge_takes_the_committing_path():
+    """A commit conflict has to retry, not cost the cohort.
+
+    ``_execute`` raises the Iceberg conflict straight out of persist_pages,
+    and the caller's only recovery is to write the cohort one page at a time
+    -- which is exactly the cost cohorting removes. The typed writer has been
+    on the committing path all along; the generic one was not.
+    """
+
+    manager = _manager()
+
+    FBrefGenericBronzeWriter(manager).persist_pages(
+        [_page_item("a"), _page_item("b")]
+    )
+
+    assert manager._execute_committing.call_count == 3
+    assert not any(
+        call.args and str(call.args[0]).startswith("MERGE INTO")
+        for call in manager._execute.call_args_list
+    )
