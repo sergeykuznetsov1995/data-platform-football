@@ -842,6 +842,98 @@ class TestFotmobNativeRunner:
         assert continuous.ok is True, continuous.errors
 
     @pytest.mark.unit
+    def test_terminal_scope_is_counted_in_the_run_report(self):
+        """Терминальный скоуп обязан быть виден числом, а не только цветом рана.
+
+        Тихое терминальное выпадение турнира (B5) распознаётся по отчёту: если
+        terminal только красит ран, но не попадает в scope_outcome_counts,
+        мониторинг не отличит «один скоуп выпал» от «полоса не доехала».
+        """
+
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _competition_payload,
+        )
+
+        mod = self._module()
+        healthy = _competition_payload(48, "Second League")
+        healthy["fixtures"]["allMatches"][0]["id"] = 200
+        healthy["fixtures"]["allMatches"][0]["pageUrl"] = "/matches/alpha-vs-beta/x#200"
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [
+                    {
+                        "leagues": [
+                            {"id": 47, "name": "Premier League"},
+                            {"id": 48, "name": "Second League"},
+                        ]
+                    }
+                ]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: (
+                _competition_payload(47, "Premier League")
+            ),
+            canonicalize_target("leagues", {"id": 48}).canonical_url: healthy,
+            canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url: {
+                "content": {"matchFacts": {"events": []}, "stats": {"x": 1}}
+            },
+            canonicalize_target("matchDetails", {"matchId": "200"}).canonical_url: {
+                "content": {"matchFacts": {"events": []}, "stats": {"x": 1}}
+            },
+        }
+
+        class BrokenCompletionService(FotMobIngestService):
+            """Коммит завершения скоупа 47 срывается — ровно так рождается terminal."""
+
+            def record_scope_completion(self, competition_id, *args, **kwargs):
+                if int(competition_id) == 47:
+                    raise RuntimeError("commit conflict")
+                return super().record_scope_completion(
+                    competition_id, *args, **kwargs
+                )
+
+        service = BrokenCompletionService(
+            transport=StubTransport(dict(responses)),
+            repository=MemoryFotMobRepository(),
+            mode=RunMode.DAILY,
+            budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+            run_id="terminal-1",
+            max_workers=2,
+        )
+        args = mod._argument_parser().parse_args(
+            [
+                "--mode",
+                "refresh",
+                "--catalog-contract",
+                "fotmob-catalog-v1",
+                "--entities",
+                "season,matches",
+                "--run-id",
+                "terminal-1",
+            ]
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        outcomes = {
+            attempt["competition_id"]: attempt["outcome"]
+            for attempt in report["selection"]["scope_attempts"]
+        }
+        assert outcomes[47] == "terminal"
+        assert outcomes[48] == "success"
+        assert report["selection"]["scope_outcome_counts"] == {
+            "success": 1,
+            "terminal": 1,
+        }
+        # Терминальный исход по-прежнему красит ран — счётчик его не смягчает.
+        assert rc == 1
+        assert report["status"] == "incomplete"
+
+    @pytest.mark.unit
     def test_automatic_transport_absence_defers_scope_instead_of_killing_it(self):
         """404 по одной цели — повтор, а не смерть скоупа и цвета рана.
 
