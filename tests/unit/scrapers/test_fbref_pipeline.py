@@ -64,6 +64,9 @@ from scrapers.fbref.pipeline import (
     _bounded_int,
     _LiveFetchSession,
     _session_failure,
+    CLEARANCE_EXHAUSTED_BACKOFF_SECONDS,
+    MAX_CLEARANCE_EXHAUSTED_TARGETS,
+    MAX_CONSECUTIVE_CLEARANCE_REFRESHES,
 )
 from scrapers.fbref.discovery import (
     DISCOVERY_PARSER_VERSION,
@@ -8567,36 +8570,52 @@ def test_1501_pages_roll_over_into_multiple_exact_persistent_sessions():
 def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
     tmp_path,
 ):
+    """The wave ends only on evidence about the source, not about one page.
+
+    A single target that uses up its re-solves is deferred and the wave keeps
+    working (see the stubborn-page test below).  What ends the wave is
+    MAX_CLEARANCE_EXHAUSTED_TARGETS of them back to back with no page fetched
+    in between -- then the pages it never touched go back untouched.
+    """
     raw = _raw_store(tmp_path)
     control = BudgetAwareFakeControl(raw)
     control.run.update(
-        request_limit=120,
-        requests_used=35,
+        request_limit=400,
         byte_limit=100 * 1024 * 1024,
     )
     run_id = str(uuid.UUID(int=1))
 
-    def make_lease(attempt, target, refresh, epoch):
+    def make_lease(number, epoch=1):
         return TargetLease(
-            attempt_id=str(uuid.UUID(int=attempt)),
+            attempt_id=str(uuid.UUID(int=7000 + number * 10 + epoch)),
             run_id=run_id,
-            target_id=target,
-            logical_refresh_id=str(uuid.UUID(int=refresh)),
-            canonical_url="https://fbref.com/en/comps/9/history/x-Seasons",
+            target_id=f"fbref:competition:{number}",
+            logical_refresh_id=str(uuid.UUID(int=8000 + number)),
+            canonical_url=(
+                f"https://fbref.com/en/comps/{number}/history/x-Seasons"
+            ),
             page_kind="competition",
-            source_ids={"competition_id": "9"},
-            claim_token=str(uuid.UUID(int=attempt + 100)),
+            source_ids={"competition_id": str(number)},
+            claim_token=str(uuid.UUID(int=9000 + number * 10 + epoch)),
             lease_epoch=epoch,
             attempt_number=epoch,
             leased_by="worker-1",
             lease_expires_at=NOW + timedelta(minutes=10),
         )
 
-    first = make_lease(71, "fbref:competition:9", 81, 1)
-    untouched = make_lease(72, "fbref:competition:12", 82, 1)
-    retry_one = make_lease(73, first.target_id, 81, 2)
-    retry_two = make_lease(74, first.target_id, 81, 3)
-    claims = iter(([first, untouched], [retry_one], [retry_two]))
+    rejected = [make_lease(number) for number in (9, 12, 13)]
+    untouched = make_lease(14)
+    first = rejected[0]
+    claims = iter(
+        (
+            [*rejected, untouched],
+            *(
+                [make_lease(number, epoch)]
+                for number in (9, 12, 13)
+                for epoch in (2, 3)
+            ),
+        )
+    )
     control.claim_targets = lambda *args, **kwargs: next(claims)
     factories = 0
 
@@ -8627,7 +8646,7 @@ def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
             page_kinds=["competition"],
             settings=PipelineSettings(
                 run_type="current",
-                request_limit=120,
+                request_limit=400,
                 byte_limit=100 * 1024 * 1024,
                 shard_size=4,
                 request_reservation_bytes=4 * 1024 * 1024,
@@ -8635,19 +8654,178 @@ def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
             ),
         )
 
-    assert factories == 3
-    assert control.run["requests_used"] == 98
+    # Two re-solves per exhausted target, and the wave stops at the third such
+    # target -- 9 rejected attempts, never a browser per remaining page.
     assert control.run["requests_reserved"] == 0
-    assert len(control.reservations) == 3
-    assert len(control.failed) == 3
-    assert all(
-        lease.logical_refresh_id == first.logical_refresh_id
-        for lease, _ in control.failed
+    assert len(control.failed) == 3 * (MAX_CLEARANCE_EXHAUSTED_TARGETS)
+    assert (
+        sum(
+            1
+            for lease, _ in control.failed
+            if lease.logical_refresh_id == first.logical_refresh_id
+        )
+        == 3
     )
     assert control.events.count(f"requeue:{untouched.target_id}") == 1
     assert not any(
         lease.target_id == untouched.target_id
         for lease, _ in control.failed
+    )
+
+
+def test_one_stubborn_page_is_deferred_instead_of_discarding_the_wave(
+    tmp_path,
+):
+    """Live 17.08: 71 targets met a 403, 58 of them came back on the first
+    re-solve -- the fresh clearance is good, the page is not.  Four used up
+    their re-solves, and each one discarded the whole wave it was in, so the
+    pages already fetched never reached publication.  A target that cannot be
+    had is a target-level failure: defer it with backoff and keep fetching.
+    """
+
+    raw = _raw_store(tmp_path)
+    control = BudgetAwareFakeControl(raw)
+    control.run.update(
+        request_limit=400,
+        byte_limit=100 * 1024 * 1024,
+    )
+    run_id = str(uuid.UUID(int=1))
+
+    def make_lease(number, epoch=1):
+        return TargetLease(
+            attempt_id=str(uuid.UUID(int=5000 + number * 10 + epoch)),
+            run_id=run_id,
+            target_id=f"fbref:competition:{number}",
+            logical_refresh_id=str(uuid.UUID(int=6000 + number)),
+            canonical_url=(
+                f"https://fbref.com/en/comps/{number}/history/x-Seasons"
+            ),
+            page_kind="competition",
+            source_ids={"competition_id": str(number)},
+            claim_token=str(uuid.UUID(int=6500 + number * 10 + epoch)),
+            lease_epoch=epoch,
+            attempt_number=epoch,
+            leased_by="worker-1",
+            lease_expires_at=NOW + timedelta(minutes=10),
+        )
+
+    stubborn = make_lease(9)
+    claims = iter(
+        (
+            [stubborn, make_lease(12), make_lease(13)],
+            [make_lease(9, 2)],
+            [make_lease(9, 3)],
+        )
+    )
+    control.claim_targets = lambda *args, **kwargs: next(claims)
+
+    class StubbornPageFetcher:
+        """403s one URL on every clearance, serves every other page."""
+
+        def __init__(self):
+            self.session_fetches = 0
+            self.reset_calls = 0
+
+        def __enter__(self):
+            control.events.append("fetcher_enter")
+            return self
+
+        def __exit__(self, *args):
+            control.events.append("fetcher_exit")
+
+        def ensure_clearance(self):
+            control.events.append("browser")
+            self.session_fetches = 0
+            return True
+
+        def reset_clearance(self):
+            self.reset_calls += 1
+
+        def fetch(self, url, **kwargs):
+            self.session_fetches += 1
+            control.events.append("http")
+            if "/comps/9/" in url:
+                raise FetchError(
+                    "FBref warm session was rejected",
+                    error_class="http_status",
+                    http_status=403,
+                    wire_bytes=200,
+                    browser_document_bytes=500,
+                    browser_asset_bytes=100,
+                    browser_requests=20,
+                    browser_bootstrap_attempts=1,
+                    target_requests=1,
+                    http_status_history=(403,),
+                    latency_ms=100,
+                )
+            body = b"<html>ok</html>"
+            browser_requests = 20 if self.session_fetches == 1 else 0
+            return FetchResponse(
+                url=url,
+                status_code=200,
+                body=body,
+                headers={"etag": '"v1"'},
+                latency_ms=10,
+                http_wire_bytes=len(body) + 120,
+                decoded_html_bytes=len(body),
+                http_requests=1,
+                http_status_history=(200,),
+                browser_document_bytes=(500 if browser_requests else 0),
+                browser_asset_bytes=(100 if browser_requests else 0),
+                browser_requests=browser_requests,
+                browser_bootstrap_attempts=(1 if browser_requests else 0),
+            )
+
+    fetcher = StubbornPageFetcher()
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *args: fetcher,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="worker-1",
+        page_kinds=["competition"],
+        settings=PipelineSettings(
+            run_type="current",
+            request_limit=400,
+            byte_limit=100 * 1024 * 1024,
+            shard_size=4,
+            request_reservation_bytes=4 * 1024 * 1024,
+            domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+        ),
+    )
+
+    # The pages behind the stubborn one are the whole point: they were fetched
+    # and the wave carries no failure, so its run can still publish.
+    assert result.fetched == 2
+    assert result.failures == []
+    assert result.deferred_dead_clearance == 1
+    assert result.requeued_session_exhaustion == 0
+    assert result.budget_exhausted is False
+
+    stubborn_failures = [
+        kwargs
+        for lease, kwargs in control.failed
+        if lease.target_id == stubborn.target_id
+    ]
+    assert len(stubborn_failures) == MAX_CONSECUTIVE_CLEARANCE_REFRESHES + 1
+    # The first two keep the target in this run; the last returns it with
+    # backoff instead of buying it another paid session here.
+    assert [
+        kwargs.get("session_retry", False) for kwargs in stubborn_failures
+    ] == [True, True, False]
+    assert stubborn_failures[-1]["requeue"] is True
+    assert (
+        stubborn_failures[-1]["retry_delay_seconds"]
+        == CLEARANCE_EXHAUSTED_BACKOFF_SECONDS
+    )
+    assert not any(
+        lease.target_id != stubborn.target_id for lease, _ in control.failed
     )
 
 

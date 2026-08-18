@@ -171,6 +171,18 @@ CLEARANCE_REJECTED_STATUSES = frozenset({401, 403, 429})
 # expiry is independent transport churn, not evidence that the source rejects
 # every fresh clearance.
 MAX_CONSECUTIVE_CLEARANCE_REFRESHES = 2
+# Exhausting the refreshes above says the *page* did not come back on a fresh
+# clearance -- it does not say the source rejects clearances, because the very
+# next target usually fetches on that same fresh session (82% of 403s recovered
+# on the first re-solve on 17.08, 4 of 71 used up their retries).  So one
+# exhausted target is deferred with backoff and the wave moves on; only a streak
+# of them, with no page fetched in between, is source-wide evidence that ends
+# the wave.  The streak bounds the browser solves such a wave can burn at
+# MAX_CONSECUTIVE_CLEARANCE_REFRESHES x this many (#1188).
+MAX_CLEARANCE_EXHAUSTED_TARGETS = 3
+# A target that used up its re-solves is not owed another paid session in this
+# wave; it comes back in a later one, after the transport that rejected it.
+CLEARANCE_EXHAUSTED_BACKOFF_SECONDS = 15 * 60
 # One production parse batch may consume the accepted 20 seconds per match for
 # all 25 targets (500s). Add 100s for scheduler/strict-close variance, and
 # finalize before entering that offline gap whenever the 115-minute local
@@ -611,6 +623,7 @@ class WaveResult:
     requeued_at_budget: int = 0
     requeued_dead_clearance: int = 0
     requeued_session_exhaustion: int = 0
+    deferred_dead_clearance: int = 0
     contract_quarantined: int = 0
     failures: list[str] = field(default_factory=list)
 
@@ -699,6 +712,10 @@ class _LiveFetchSession:
     fetcher: Optional[object] = None
     session_id: Optional[str] = None
     consecutive_clearance_refreshes: int = 0
+    # Targets that used up their re-solves back to back, with no page fetched
+    # in between.  One such target is evidence about that page; a streak of
+    # them is evidence about the source.
+    clearance_exhausted_targets: int = 0
     needs_clearance: bool = True
     # What the next solve may spend, once the run's remaining budget can no
     # longer fund the full reservation.  ``None`` means the settings default.
@@ -2816,6 +2833,7 @@ class FBrefPipeline:
                         lease, record, historical=historical
                     )
                     live_session.consecutive_clearance_refreshes = 0
+                    live_session.clearance_exhausted_targets = 0
                     result.fetched += 1
                     result.requests += (
                         response.http_requests + response.browser_requests
@@ -2987,6 +3005,10 @@ class FBrefPipeline:
                             session_version=live_session.session_id,
                         )
                         live_session.consecutive_clearance_refreshes += 1
+                        clearance_streak_exhausted = (
+                            live_session.consecutive_clearance_refreshes
+                            > MAX_CONSECUTIVE_CLEARANCE_REFRESHES
+                        )
                         result.requeued_dead_clearance += 1
                         if settings.persistent_http_session:
                             # Page/failure evidence is durable above.  Close the
@@ -3025,20 +3047,27 @@ class FBrefPipeline:
                             byte_remaining=byte_remaining,
                         )
                         retry_fits_budget = retry_reservation is not None
-                        if retry_fits_budget:
+                        if retry_fits_budget and not clearance_streak_exhausted:
                             self.control.retry_session_fetch(
                                 lease,
                                 **retry_evidence,
                             )
                         else:
-                            # The rejected request is real evidence, but a new
-                            # browser+HTTP reservation no longer fits. This is
-                            # the same clean ceiling as reserve_budget raising
-                            # on an untouched target: return the page now,
-                            # before another proxy or browser can start.
+                            # The rejected request is real evidence, but this
+                            # target gets no further paid session in this wave:
+                            # either a new browser+HTTP reservation no longer
+                            # fits -- the same clean ceiling as reserve_budget
+                            # raising on an untouched target -- or the target
+                            # used up its re-solves and is deferred so the wave
+                            # can keep working other pages.  Return the page
+                            # now, before another proxy or browser can start.
                             self.control.fail_fetch(
                                 lease,
-                                retry_delay_seconds=0,
+                                retry_delay_seconds=(
+                                    CLEARANCE_EXHAUSTED_BACKOFF_SECONDS
+                                    if clearance_streak_exhausted
+                                    else 0
+                                ),
                                 permanent=False,
                                 requeue=True,
                                 **retry_evidence,
@@ -3089,13 +3118,17 @@ class FBrefPipeline:
                         live_session.clearance_requests = allowed_requests
                         live_session.clearance_bytes = allowed_bytes
                         logger.warning(
-                            "FBref clearance failed (%s, HTTP %s) — "
-                            "%s stays in this run and the session is being "
-                            "re-solved on a fresh proxy "
-                            "(consecutive refresh %d/%d)",
+                            "FBref clearance failed (%s, HTTP %s) — %s %s "
+                            "and the session is being re-solved on a fresh "
+                            "proxy (consecutive refresh %d/%d)",
                             exc.error_class,
                             exc.http_status,
                             lease.target_id,
+                            (
+                                "is returned to the queue"
+                                if clearance_streak_exhausted
+                                else "stays in this run"
+                            ),
                             live_session.consecutive_clearance_refreshes,
                             MAX_CONSECUTIVE_CLEARANCE_REFRESHES,
                         )
@@ -3110,22 +3143,6 @@ class FBrefPipeline:
                                 previous_requests,
                                 previous_bytes,
                             )
-                        if (
-                            live_session.consecutive_clearance_refreshes
-                            > MAX_CONSECUTIVE_CLEARANCE_REFRESHES
-                        ):
-                            untouched = leases[lease_index + 1:]
-                            result.requeued_session_exhaustion += (
-                                self.control.requeue_unfetched_targets(
-                                    untouched
-                                )
-                            )
-                            result.failures.append(
-                                "clearance_session_refreshes_exhausted="
-                                f"{MAX_CONSECUTIVE_CLEARANCE_REFRESHES}"
-                            )
-                            break
-
                         reset = getattr(
                             live_session.fetcher,
                             "reset_clearance",
@@ -3161,6 +3178,42 @@ class FBrefPipeline:
                             live_session.stack.close()
                             live_session.stack = ExitStack()
                             live_session.fetcher = None
+
+                        if clearance_streak_exhausted:
+                            # The target was deferred above.  Whether the wave
+                            # goes on depends on what the streak is evidence
+                            # of: one exhausted page, or a source that rejects
+                            # every fresh clearance it is handed.
+                            live_session.clearance_exhausted_targets += 1
+                            live_session.consecutive_clearance_refreshes = 0
+                            result.deferred_dead_clearance += 1
+                            if (
+                                live_session.clearance_exhausted_targets
+                                >= MAX_CLEARANCE_EXHAUSTED_TARGETS
+                            ):
+                                untouched = leases[lease_index + 1:]
+                                result.requeued_session_exhaustion += (
+                                    self.control.requeue_unfetched_targets(
+                                        untouched
+                                    )
+                                )
+                                result.failures.append(
+                                    "clearance_session_refreshes_exhausted="
+                                    f"{MAX_CONSECUTIVE_CLEARANCE_REFRESHES}"
+                                )
+                                break
+                            logger.warning(
+                                "FBref %s used up its %d re-solve(s) and is "
+                                "deferred for %ds — the wave continues on a "
+                                "fresh clearance (%d/%d exhausted target(s) "
+                                "in a row)",
+                                lease.target_id,
+                                MAX_CONSECUTIVE_CLEARANCE_REFRESHES,
+                                CLEARANCE_EXHAUSTED_BACKOFF_SECONDS,
+                                live_session.clearance_exhausted_targets,
+                                MAX_CLEARANCE_EXHAUSTED_TARGETS,
+                            )
+                            continue
 
                         retry_leases = self.control.claim_targets(
                             run_id,
