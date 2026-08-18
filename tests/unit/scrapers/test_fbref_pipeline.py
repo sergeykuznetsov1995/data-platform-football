@@ -64,7 +64,7 @@ from scrapers.fbref.pipeline import (
     _bounded_int,
     _LiveFetchSession,
     _session_failure,
-    CLEARANCE_EXHAUSTED_BACKOFF_SECONDS,
+    CLEARANCE_EXHAUSTED_RETRY_DELAY_SECONDS,
     MAX_CLEARANCE_EXHAUSTED_TARGETS,
     MAX_CONSECUTIVE_CLEARANCE_REFRESHES,
 )
@@ -8819,11 +8819,20 @@ def test_one_stubborn_page_is_deferred_instead_of_discarding_the_wave(
     assert [
         kwargs.get("session_retry", False) for kwargs in stubborn_failures
     ] == [True, True, False]
+    # requeue=True is what drops the target from this run: it closes the run
+    # target as 'skipped', which claim_targets will not take again.  It also
+    # clears retry_after, so no delay may be claimed here -- pinned by
+    # test_requeued_failure_clears_backoff_and_skips_this_runs_target.
     assert stubborn_failures[-1]["requeue"] is True
+    assert stubborn_failures[-1]["permanent"] is False
     assert (
         stubborn_failures[-1]["retry_delay_seconds"]
-        == CLEARANCE_EXHAUSTED_BACKOFF_SECONDS
+        == CLEARANCE_EXHAUSTED_RETRY_DELAY_SECONDS
+        == 0
     )
+    # The wave never asks for the deferred target again: the claim iterator is
+    # exhausted, so a third claim would raise StopIteration instead.
+    assert next(claims, None) is None
     assert not any(
         lease.target_id != stubborn.target_id for lease, _ in control.failed
     )

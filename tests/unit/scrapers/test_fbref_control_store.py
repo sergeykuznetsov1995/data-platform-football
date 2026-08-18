@@ -2232,3 +2232,70 @@ def test_a_successful_registry_snapshot_stays_immutable():
             content_hash="abc123",
             metadata={"page_kind": "competition"},
         )
+
+
+def test_requeued_failure_clears_backoff_and_skips_this_runs_target():
+    """The requeue path is 'the failure was ours': it hands the page back with
+    no timed backoff and closes this run's target as skipped.
+
+    The live wave depends on both halves.  ``retry_after`` is nulled whatever
+    delay the caller passes, so a caller asking for one is asking for nothing;
+    and 'skipped' is what keeps a deferred target out of the rest of this run,
+    because ``claim_targets`` only takes 'pending'/'retry' run targets.
+    """
+
+    run_id = str(uuid.uuid4())
+    refresh_id = str(uuid.uuid4())
+    lease = TargetLease(
+        attempt_id=str(uuid.uuid4()),
+        run_id=run_id,
+        target_id="fbref:squad:b49d1b16",
+        logical_refresh_id=refresh_id,
+        canonical_url="https://fbref.com/en/squads/b49d1b16/2018-2019/x-Stats",
+        page_kind="squad",
+        source_ids={"squad_id": "b49d1b16"},
+        claim_token=str(uuid.uuid4()),
+        lease_epoch=2,
+        attempt_number=2,
+        leased_by="worker-1",
+        lease_expires_at=datetime(2026, 8, 18, 13, tzinfo=timezone.utc),
+    )
+    seen = {}
+
+    def handler(sql, params):
+        if "UPDATE fbref_control.page_frontier" in sql:
+            seen["frontier_sql"] = sql
+            seen["frontier_params"] = params
+            return [{"target_id": lease.target_id}], 1
+        if "UPDATE fbref_control.run_target" in sql:
+            seen["target_status"] = params[0]
+            return [], 1
+        if "UPDATE fbref_control.fetch_attempt" in sql:
+            seen["attempt_status"] = "failed" in sql
+            return [], 1
+        raise AssertionError(sql)
+
+    store = ControlStore(
+        "postgresql://airflow:pw@postgres/airflow",
+        connection_factory=FakeFactory(handler),
+    )
+    store.fail_fetch(
+        lease,
+        error_class="http_status",
+        error_message="FBref warm session was rejected",
+        retry_delay_seconds=900,
+        permanent=False,
+        requeue=True,
+        http_status=403,
+    )
+
+    # state, then the CASE flag that decides whether retry_after survives,
+    # then the delay the flag discards.
+    assert seen["frontier_params"][0] == "queued"
+    assert seen["frontier_params"][1] is True
+    assert seen["frontier_params"][2] == 900
+    assert "retry_after = CASE WHEN %s THEN NULL" in " ".join(
+        seen["frontier_sql"].split()
+    )
+    assert seen["target_status"] == "skipped"
+    assert seen["attempt_status"] is True

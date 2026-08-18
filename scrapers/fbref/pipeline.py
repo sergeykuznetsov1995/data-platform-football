@@ -180,9 +180,14 @@ MAX_CONSECUTIVE_CLEARANCE_REFRESHES = 2
 # the wave.  The streak bounds the browser solves such a wave can burn at
 # MAX_CONSECUTIVE_CLEARANCE_REFRESHES x this many (#1188).
 MAX_CLEARANCE_EXHAUSTED_TARGETS = 3
-# A target that used up its re-solves is not owed another paid session in this
-# wave; it comes back in a later one, after the transport that rejected it.
-CLEARANCE_EXHAUSTED_BACKOFF_SECONDS = 15 * 60
+# A deferred target is returned with ``requeue=True``, which store.fail_fetch
+# defines as "the failure was ours, the page was never judged": it clears
+# retry_after and marks this run's target 'skipped'.  So the deferral is exact
+# for this wave -- claim_targets only takes 'pending'/'retry' targets, and the
+# page cannot come back inside this run -- and carries no timed backoff into
+# the next one.  Passing a retry delay here would be a lie: that argument is
+# ignored on the requeue path, and store.py is sealed.
+CLEARANCE_EXHAUSTED_RETRY_DELAY_SECONDS = 0
 # One production parse batch may consume the accepted 20 seconds per match for
 # all 25 targets (500s). Add 100s for scheduler/strict-close variance, and
 # finalize before entering that offline gap whenever the 115-minute local
@@ -3064,7 +3069,7 @@ class FBrefPipeline:
                             self.control.fail_fetch(
                                 lease,
                                 retry_delay_seconds=(
-                                    CLEARANCE_EXHAUSTED_BACKOFF_SECONDS
+                                    CLEARANCE_EXHAUSTED_RETRY_DELAY_SECONDS
                                     if clearance_streak_exhausted
                                     else 0
                                 ),
@@ -3204,12 +3209,11 @@ class FBrefPipeline:
                                 break
                             logger.warning(
                                 "FBref %s used up its %d re-solve(s) and is "
-                                "deferred for %ds — the wave continues on a "
-                                "fresh clearance (%d/%d exhausted target(s) "
-                                "in a row)",
+                                "returned to the queue for a later run — this "
+                                "wave continues on a fresh clearance (%d/%d "
+                                "exhausted target(s) in a row)",
                                 lease.target_id,
                                 MAX_CONSECUTIVE_CLEARANCE_REFRESHES,
-                                CLEARANCE_EXHAUSTED_BACKOFF_SECONDS,
                                 live_session.clearance_exhausted_targets,
                                 MAX_CLEARANCE_EXHAUSTED_TARGETS,
                             )
