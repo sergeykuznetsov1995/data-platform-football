@@ -1101,7 +1101,18 @@ class FBrefFetcher:
                 provider_stats = None
                 try:
                     provider_stats = self._wait_and_observe_provider()
-                except Exception:
+                except Exception as exc:
+                    # This verdict ends the wave and the exception is the only
+                    # evidence of why the paid lease would not drain.  Swallowed
+                    # silently it reads exactly like a policy breach: the geo-IP
+                    # path cost a day of blind red runs for the same reason,
+                    # until c343f5e2 put its type in the log (#1188).
+                    logger.warning(
+                        "FBref paid lease drain failed before the wave "
+                        "verdict: %s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
                     hard_policy = hard_policy or "browser_provider_drain_failed"
                 if (
                     (

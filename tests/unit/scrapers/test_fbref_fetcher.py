@@ -766,3 +766,43 @@ def test_non_retryable_status_remains_one_accounted_request(monkeypatch):
     assert caught.value.wire_bytes == 90
     assert fetcher._http_session.get.call_count == 1
     fetcher._sleep.assert_not_called()
+
+
+def test_lease_drain_failure_names_itself_before_ending_the_wave(caplog):
+    """A silent drain failure is indistinguishable from a policy breach.
+
+    ``browser_provider_drain_failed`` stops the wave, and the swallowed
+    exception is the only evidence of what the meter actually refused.  The
+    geo-IP path proved the cost of leaving that blind: a full day of red runs
+    whose cause only became visible once the type reached the log (#1188).
+    """
+
+    import logging
+
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    transport = MagicMock()
+    transport.fetch.return_value = None
+    transport.traffic_delta.return_value = {
+        "real_requests_count": 1,
+        "real_bytes_downloaded": 0,
+    }
+    fetcher._http_session = None
+    fetcher._transport = transport
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+    fetcher._lease_client = MagicMock()
+    fetcher._wait_and_observe_provider = MagicMock(
+        side_effect=RuntimeError("meter rejected drain: counters not final")
+    )
+    fetcher._provider_bootstrap_max_bytes = 0
+    fetcher._provider_bootstrap_spent_bytes = 0
+    fetcher._provider_lease = None
+    fetcher._provider_lease_observed_bytes = 0
+
+    with caplog.at_level(logging.WARNING, logger="scrapers.fbref.fetcher"):
+        with pytest.raises(FetchError) as raised:
+            fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "hard_transport_policy"
+    assert "browser_provider_drain_failed" in str(raised.value)
+    assert "RuntimeError" in caplog.text
+    assert "counters not final" in caplog.text
