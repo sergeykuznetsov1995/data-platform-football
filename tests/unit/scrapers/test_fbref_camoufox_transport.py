@@ -1580,6 +1580,34 @@ def test_preemptive_proxy_auth_rejects_bad_lease_before_network(proxy):
     assert stats["network_policy_failure"] == "invalid_proxy_credential"
 
 
+def test_geoip_resolver_names_the_transport_failure_it_wraps(monkeypatch):
+    """The wrapper must not flatten every transport failure into one string.
+
+    The verdict ends the wave through hard_transport_policy and only the
+    caller's log survives, so a dead pool exit (ProxyError), a refused CONNECT
+    and a plain read timeout have to stay distinguishable (#1188).
+    """
+
+    import requests
+
+    session = MagicMock()
+    session.get.side_effect = requests.exceptions.ProxyError(
+        "Cannot connect to proxy: 10001 refused"
+    )
+    monkeypatch.setattr(requests, "Session", lambda: session)
+
+    with pytest.raises(RuntimeError) as raised:
+        resolve_geoip_without_redirects({
+            "server": "http://fbref_proxy_filter:8900",
+            "username": "lease",
+            "password": "lease-token",
+        })
+
+    assert "ProxyError" in str(raised.value)
+    assert "10001 refused" in str(raised.value)
+    assert "lease-token" not in str(raised.value)
+
+
 def test_geoip_failure_is_logged_with_its_exception_type(caplog):
     """A geo-IP failure ends the whole wave, so name what actually failed.
 
@@ -1587,6 +1615,10 @@ def test_geoip_failure_is_logged_with_its_exception_type(caplog):
     burns its paid Cloudflare bootstrap (#1188).  Logging only "lookup failed"
     makes a dead pool exit indistinguishable from a transient timeout, so the
     exception type has to reach the log.
+
+    This covers the logging link only; that the resolver preserves the original
+    transport failure at all is covered by
+    ``test_geoip_resolver_names_the_transport_failure_it_wraps``.
     """
 
     import logging

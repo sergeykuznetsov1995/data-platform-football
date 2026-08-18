@@ -274,7 +274,15 @@ def resolve_geoip_without_redirects(proxy: Optional[dict]) -> str:
         finally:
             response.close()
     except requests.RequestException as exc:
-        raise RuntimeError("Camoufox geo-IP lookup failed") from exc
+        # Name the transport failure in the message itself.  This verdict ends
+        # the whole wave through hard_transport_policy, and only the caller's
+        # log survives to explain it: a dead pool exit (ProxyError), a refused
+        # CONNECT and a plain ReadTimeout must not collapse into one string
+        # (#1188).  The URL is fixed and credential-free, so the exception text
+        # carries no lease secret.
+        raise RuntimeError(
+            f"Camoufox geo-IP lookup failed: {type(exc).__name__}: {exc}"
+        ) from exc
     finally:
         session.close()
 

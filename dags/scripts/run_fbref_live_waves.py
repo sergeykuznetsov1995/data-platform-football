@@ -387,15 +387,18 @@ def _run(args: argparse.Namespace) -> int:
     # ceiling) and not a neighbour's (the gateway serialises FBref with
     # --max-active-leases 1; all ten observed deaths had zero foreign spend).
     # It is what the meter books after the fact and the fetcher never observes:
-    # a lease that collapses is charged its retained reservation under the
-    # 'uncertain-read-ahead' pseudo-host, clamped to 64 KiB per collapse
-    # (filter_proxy.py::_reap_expired_leases), plus reservations that the health
-    # endpoint's remaining does not subtract while the extension ceiling does.
-    # So the drift is discrete — 64 KiB per collapsed lease, up to ~24 leases in
-    # one process — and the headroom below is a ~1000x overshoot on purpose.
-    # It hangs on whichever term binds, because that book-keeping lands in the
-    # daily, dagrun and per-URL counters alike, and it is clamped to a quarter so
-    # a nearly spent budget still leaves a usable, non-zero cap.
+    # a lease that collapses is charged its whole retained reservation under the
+    # 'uncertain-read-ahead' pseudo-host (filter_proxy.py::_reap_expired_leases),
+    # plus reservations the health endpoint's remaining does not subtract while
+    # the extension ceiling does.  Each reader reserves at most 64 KiB, but a
+    # lease may hold several at once, so this is a bound on the observed drift
+    # (65 536 B in every death sampled over 2026-08-15..17), NOT a proof of the
+    # worst case.  The headroom below is therefore deliberate slack, not an
+    # exact figure — the real fix is to ask the meter for its current ceiling at
+    # the phase boundary instead of predicting it (#1188).  It hangs on
+    # whichever term binds, because that book-keeping lands in the daily, dagrun
+    # and per-URL counters alike, and it is clamped to a quarter so a nearly
+    # spent budget still leaves a usable, non-zero cap.
     daily_remaining = max(0, int(meter["daily_remaining_bytes"]))
     shared_remaining = min(current_run_remaining, daily_remaining)
     race_headroom = min(
