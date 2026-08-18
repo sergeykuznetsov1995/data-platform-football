@@ -1238,7 +1238,17 @@ class FBrefFetcher:
     def _hard_transport_policy_reason(stats: Optional[dict]) -> Optional[str]:
         source = stats or {}
         if source.get("geoip_lookup_failed"):
-            return "geoip_lookup_failed"
+            # An exit that could not be reached is a dead lease, not a policy
+            # breach: the warm HTTP path already treats the same ProxyError as
+            # a re-solvable session failure, and every geo-IP death measured
+            # 17-18.08 carried exactly that (3 of 3 with a recorded type, each
+            # ProxyError "Cannot connect to proxy").  Falling through here
+            # yields error_class 'clearance_failed', which re-solves on a fresh
+            # proxy under the existing exhaustion guards (2 re-solves per
+            # target, 3 targets per wave) instead of discarding the wave and
+            # everything it already collected (#1188).
+            if not source.get("geoip_transport_failure"):
+                return "geoip_lookup_failed"
         if source.get("redirect_blocked"):
             return "redirect_blocked"
         if source.get("network_policy_failed"):

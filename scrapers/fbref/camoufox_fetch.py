@@ -221,6 +221,17 @@ def _proxy_url_with_credentials(proxy: Optional[dict]) -> Optional[str]:
     return urlunsplit((parsed.scheme, netloc, "", "", ""))
 
 
+class GeoIPTransportError(RuntimeError):
+    """The paid exit could not be reached at all for the geo-IP lookup.
+
+    Separated from every other geo-IP failure because the two demand opposite
+    verdicts: an exit that refuses to connect is a dead lease the wave can
+    re-solve on a fresh proxy, while a lookup that *answered* with a redirect,
+    a non-200, or an unparsable body is evidence about the geo policy itself
+    and must still end the wave (#1188).
+    """
+
+
 def resolve_geoip_without_redirects(proxy: Optional[dict]) -> str:
     """Resolve one exit IP using exactly one bounded, non-redirecting attempt."""
 
@@ -280,7 +291,7 @@ def resolve_geoip_without_redirects(proxy: Optional[dict]) -> str:
         # CONNECT and a plain ReadTimeout must not collapse into one string
         # (#1188).  The URL is fixed and credential-free, so the exception text
         # carries no lease secret.
-        raise RuntimeError(
+        raise GeoIPTransportError(
             f"Camoufox geo-IP lookup failed: {type(exc).__name__}: {exc}"
         ) from exc
     finally:
@@ -576,6 +587,7 @@ class CamoufoxFbrefTransport:
         self._request_budget_exhausted = False
         self._redirect_blocked = False
         self._geoip_lookup_failed = False
+        self._geoip_transport_failure = False
         self._network_policy_failed = False
         self._network_policy_failure: Optional[str] = None
         # CF solve counters (feed the traffic guard / diagnostics).
@@ -779,6 +791,13 @@ class CamoufoxFbrefTransport:
                 # without the type a dead pool exit reads exactly like a
                 # transient timeout (#1188).
                 self._geoip_lookup_failed = True
+                # Record WHY separately from the latch: the latch still bars an
+                # automatic retry inside this transport (one paid lookup per
+                # lease), but an unreachable exit lets the caller re-solve on a
+                # fresh proxy instead of discarding the wave.
+                self._geoip_transport_failure = isinstance(
+                    exc, GeoIPTransportError
+                )
                 logger.warning(
                     "Camoufox geo-IP lookup failed for this lease: %s: %s",
                     type(exc).__name__,
@@ -2476,6 +2495,7 @@ class CamoufoxFbrefTransport:
             "network_policy_failed": self._network_policy_failed,
             "network_policy_failure": self._network_policy_failure,
             "geoip_lookup_failed": self._geoip_lookup_failed,
+            "geoip_transport_failure": self._geoip_transport_failure,
             "redirect_blocked": self._redirect_blocked,
             "real_bytes_by_resource_type": dict(self._bytes_by_type),
             "blocked_count": self._blocked_count,

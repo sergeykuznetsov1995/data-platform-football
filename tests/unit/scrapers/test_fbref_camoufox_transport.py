@@ -20,6 +20,7 @@ from scrapers.fbref.camoufox_fetch import (
     GEOIP_BYTE_RESERVATION_BYTES,
     GEOIP_LOOKUP_URL,
     GEOIP_REQUEST_RESERVATION,
+    GeoIPTransportError,
     UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES,
     _navigation_error_type,
     is_cloudflare_blocked,
@@ -1646,6 +1647,92 @@ def test_geoip_failure_is_logged_with_its_exception_type(caplog):
     assert transport.traffic_stats()["geoip_lookup_failed"] is True
     assert "TimeoutError" in caplog.text
     assert "read timed out" in caplog.text
+
+
+def test_unreachable_exit_and_answered_policy_breach_are_different_failures(
+    monkeypatch,
+):
+    """An exit that never answered is a dead lease; one that answered is not.
+
+    Both used to raise the same RuntimeError, so the wave could not tell a
+    re-solvable dead proxy from real geo-policy evidence and discarded itself
+    either way.  Measured 17-18.08: 3 of 3 geo-IP deaths with a recorded type
+    were ProxyError "Cannot connect to proxy" (#1188).
+    """
+
+    import requests
+
+    unreachable = MagicMock()
+    unreachable.get.side_effect = requests.exceptions.ProxyError(
+        "Cannot connect to proxy: 10001 refused"
+    )
+    monkeypatch.setattr(requests, "Session", lambda: unreachable)
+    with pytest.raises(GeoIPTransportError):
+        resolve_geoip_without_redirects({
+            "server": "http://fbref_proxy_filter:8900",
+            "username": "lease",
+            "password": "lease-token",
+        })
+
+    answered = MagicMock()
+    response = MagicMock()
+    response.status_code = 407
+    answered.get.return_value = response
+    monkeypatch.setattr(requests, "Session", lambda: answered)
+    with pytest.raises(RuntimeError) as raised:
+        resolve_geoip_without_redirects({
+            "server": "http://fbref_proxy_filter:8900",
+            "username": "lease",
+            "password": "lease-token",
+        })
+    assert not isinstance(raised.value, GeoIPTransportError)
+
+
+def test_transport_reports_whether_the_geoip_exit_was_reachable():
+    """The latch alone cannot tell the caller which verdict it earned.
+
+    ``geoip_lookup_failed`` still bars an automatic retry inside this transport
+    (one paid lookup per lease); the separate reachability flag is what lets the
+    wave re-solve on a fresh proxy instead of dying (#1188).
+    """
+
+    def unreachable(_proxy):
+        raise GeoIPTransportError("Camoufox geo-IP lookup failed: ProxyError: x")
+
+    transport = CamoufoxFbrefTransport(
+        proxy={
+            "server": "http://fbref_proxy_filter:8900",
+            "username": "lease",
+            "password": "lease-token",
+        },
+        max_network_requests=10,
+        geoip_resolver=unreachable,
+        geoip_database_check=lambda: None,
+    )
+    with pytest.raises(GeoIPTransportError):
+        transport._start()
+    stats = transport.traffic_stats()
+    assert stats["geoip_lookup_failed"] is True
+    assert stats["geoip_transport_failure"] is True
+    assert transport.traffic_delta()["geoip_transport_failure"] is True
+
+    def answered_wrong(_proxy):
+        raise RuntimeError("Camoufox geo-IP response is invalid")
+
+    policy = CamoufoxFbrefTransport(
+        proxy={
+            "server": "http://fbref_proxy_filter:8900",
+            "username": "lease",
+            "password": "lease-token",
+        },
+        max_network_requests=10,
+        geoip_resolver=answered_wrong,
+        geoip_database_check=lambda: None,
+    )
+    with pytest.raises(RuntimeError):
+        policy._start()
+    assert policy.traffic_stats()["geoip_lookup_failed"] is True
+    assert policy.traffic_stats()["geoip_transport_failure"] is False
 
 
 def test_geoip_resolver_is_one_bounded_attempt_without_redirects(monkeypatch):

@@ -558,6 +558,38 @@ def test_failed_geoip_is_a_non_refreshable_hard_transport_error():
     assert "geoip_lookup_failed" in str(raised.value)
 
 
+def test_unreachable_geoip_exit_is_a_re_solvable_clearance_failure():
+    """A dead exit must not spend the whole wave the way a policy breach does.
+
+    ``hard_transport_policy`` stops the wave before a new lease can spend, which
+    is right for an answered geo-policy breach and wrong for an exit that never
+    connected: the warm HTTP path already re-solves the identical ProxyError.
+    Emitting ``clearance_failed`` puts the failure back on the session path,
+    where the existing guards bound the cost (2 re-solves per target, 3 targets
+    per wave).  Measured 17-18.08: 6 waves died this way, one of them after
+    collecting 404 pages (#1188).
+    """
+
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    transport = MagicMock()
+    transport.fetch.return_value = None
+    transport.traffic_delta.return_value = {
+        "real_requests_count": 1,
+        "real_bytes_downloaded": 0,
+        "geoip_lookup_failed": True,
+        "geoip_transport_failure": True,
+    }
+    fetcher._http_session = None
+    fetcher._transport = transport
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "clearance_failed"
+    assert "hard transport policy" not in str(raised.value)
+
+
 def test_reset_clearance_drops_session_transport_and_metered_lease():
     fetcher = FBrefFetcher.__new__(FBrefFetcher)
     old_transport = MagicMock()
