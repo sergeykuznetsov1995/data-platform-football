@@ -791,6 +791,9 @@ class FotMobRepository:
         "raw_uri",
         "parser_version",
         "status",
+        # Реплей старого сырья тоже коммитится как success со свежим
+        # completed_at, поэтому планировщику свежести нужен сам признак.
+        "stale",
         "fetched_at",
         "completed_at",
         "actual_counts_json",
@@ -1941,7 +1944,7 @@ class FotMobRepository:
         rows = trino.execute_query(
             f"""
             SELECT target_key, batch_id, content_hash, raw_uri, parser_version,
-                   status, fetched_at, completed_at, actual_counts_json,
+                   status, stale, fetched_at, completed_at, actual_counts_json,
                    capabilities_json
             FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
             WHERE target_key = '{safe}'
@@ -1954,19 +1957,7 @@ class FotMobRepository:
         )
         if not rows:
             return None
-        columns = (
-            "target_key",
-            "batch_id",
-            "content_hash",
-            "raw_uri",
-            "parser_version",
-            "status",
-            "fetched_at",
-            "completed_at",
-            "actual_counts_json",
-            "capabilities_json",
-        )
-        view = dict(zip(columns, rows[0]))
+        view = dict(zip(self._READ_COLUMNS, rows[0]))
         return view if view.get("status") in SUCCESS_STATES else None
 
     def latest_entity_success(
@@ -2020,7 +2011,7 @@ class FotMobRepository:
         rows = trino.execute_query(
             f"""
             SELECT target_key, batch_id, content_hash, raw_uri, parser_version,
-                   status, fetched_at, completed_at, actual_counts_json,
+                   status, stale, fetched_at, completed_at, actual_counts_json,
                    capabilities_json
             FROM {self.catalog}.{self.schema}.{MANIFEST_TABLE}
             WHERE target_type = '{safe_type}'
@@ -2034,19 +2025,7 @@ class FotMobRepository:
         )
         if not rows:
             return None
-        columns = (
-            "target_key",
-            "batch_id",
-            "content_hash",
-            "raw_uri",
-            "parser_version",
-            "status",
-            "fetched_at",
-            "completed_at",
-            "actual_counts_json",
-            "capabilities_json",
-        )
-        view = dict(zip(columns, rows[0]))
+        view = dict(zip(self._READ_COLUMNS, rows[0]))
         return view if view.get("status") in SUCCESS_STATES else None
 
     def latest_entity_attempt(

@@ -143,6 +143,20 @@ def _aware_datetime(value: Optional[str | datetime]) -> Optional[datetime]:
     return parsed
 
 
+def _validated_at(previous: Optional[Mapping[str, Any]]) -> Optional[datetime]:
+    """Момент, когда цель в последний раз подтвердил сам источник.
+
+    Реплей сырья из raw store (``STALE_REPLAY`` после 5xx) коммитится как
+    ``success`` со свежим ``completed_at``, но сеть при этом ничего не
+    подтверждала. Порог свежести обязан такую запись игнорировать, иначе
+    недоступность источника замораживает цель на весь TTL (а матч, у которого
+    TTL бесконечен, — навсегда)."""
+
+    if not previous or previous.get("stale"):
+        return None
+    return _aware_datetime(previous.get("completed_at") or previous.get("fetched_at"))
+
+
 def _content_hash(values: Iterable[str]) -> str:
     material = "\0".join(sorted(str(value) for value in values)).encode("utf-8")
     return hashlib.sha256(material).hexdigest()
@@ -2010,13 +2024,7 @@ class FotMobIngestService:
                 # повторяется у разных турниров (72 имени на 9146 URL), и порог
                 # по entity_id закрыл бы чужие цели.
                 previous = self.repository.latest_success(manifest_target.target_key)
-                validated_at = (
-                    _aware_datetime(
-                        previous.get("completed_at") or previous.get("fetched_at")
-                    )
-                    if previous
-                    else None
-                )
+                validated_at = _validated_at(previous)
                 if (
                     previous is not None
                     and previous.get("parser_version") == PARSER_VERSION
@@ -2412,7 +2420,11 @@ class FotMobIngestService:
                 "matchDetails", {"matchId": str(match_id)}
             )
             previous = self.repository.latest_success(manifest_target.target_key)
-            if previous is not None and self.mode != RunMode.REPLAY:
+            if (
+                previous is not None
+                and not previous.get("stale")
+                and self.mode != RunMode.REPLAY
+            ):
                 result.skipped += 1
                 continue
             by_key[key] = match
@@ -2631,13 +2643,7 @@ class FotMobIngestService:
         for team in teams:
             team_id = team.get("team_id")
             previous = self.repository.latest_entity_success("team", team_id)
-            validated_at = (
-                _aware_datetime(
-                    previous.get("completed_at") or previous.get("fetched_at")
-                )
-                if previous
-                else None
-            )
+            validated_at = _validated_at(previous)
             if (
                 previous is not None
                 and validated_at is not None
@@ -2910,13 +2916,7 @@ class FotMobIngestService:
         due: list[int] = []
         for player_id in ids:
             previous = self.repository.latest_entity_success("player", player_id)
-            fetched_at = (
-                _aware_datetime(
-                    previous.get("completed_at") or previous.get("fetched_at")
-                )
-                if previous
-                else None
-            )
+            fetched_at = _validated_at(previous)
             if (
                 previous is not None
                 and fetched_at is not None
