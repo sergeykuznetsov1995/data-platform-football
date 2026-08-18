@@ -1688,6 +1688,53 @@ def test_unreachable_exit_and_answered_policy_breach_are_different_failures(
     assert not isinstance(raised.value, GeoIPTransportError)
 
 
+def test_a_tunnel_that_dies_mid_body_is_still_an_unreachable_exit(monkeypatch):
+    """`requests` does not wrap the streamed body, so urllib3 leaks through.
+
+    The lookup reads the payload off ``response.raw``, which is the one call in
+    this function `requests` never wraps.  A tunnel that dies after the headers
+    therefore arrives as a bare urllib3 error, misses ``RequestException`` and
+    used to be filed as an *answered* geo-policy breach — the exact confusion
+    this pair of verdicts exists to prevent.  A body that arrived and would not
+    decode stays on the answered side on purpose (#1188).
+    """
+
+    import requests
+    import urllib3
+
+    def _session_returning(read_error):
+        session = MagicMock()
+        response = MagicMock()
+        response.status_code = 200
+        response.headers = {"content-length": "11"}
+        response.raw.read.side_effect = read_error
+        session.get.return_value = response
+        return session
+
+    proxy = {
+        "server": "http://fbref_proxy_filter:8900",
+        "username": "lease",
+        "password": "lease-token",
+    }
+
+    died = _session_returning(
+        urllib3.exceptions.ReadTimeoutError(
+            None, "https://api.ipify.org", "Read timed out."
+        )
+    )
+    monkeypatch.setattr(requests, "Session", lambda: died)
+    with pytest.raises(GeoIPTransportError):
+        resolve_geoip_without_redirects(proxy)
+
+    undecodable = _session_returning(
+        urllib3.exceptions.DecodeError("failed to decode content-encoding")
+    )
+    monkeypatch.setattr(requests, "Session", lambda: undecodable)
+    with pytest.raises(Exception) as raised:
+        resolve_geoip_without_redirects(proxy)
+    assert not isinstance(raised.value, GeoIPTransportError)
+
+
 def test_transport_reports_whether_the_geoip_exit_was_reachable():
     """The latch alone cannot tell the caller which verdict it earned.
 

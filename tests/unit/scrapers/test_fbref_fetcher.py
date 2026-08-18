@@ -13,6 +13,7 @@ from scrapers.fbref.fetcher import (
     MAX_HTML_BYTES,
     MAX_TARGET_HTTP_ATTEMPTS,
 )
+from scrapers.fbref.proxy_lease import FBrefProxyLeaseError
 from scrapers.fbref.settings import (
     DEFAULT_HTTP_WIRE_OVERHEAD_RESERVATION_BYTES,
     DEFAULT_REQUEST_RESERVATION_BYTES,
@@ -588,6 +589,52 @@ def test_unreachable_geoip_exit_is_a_re_solvable_clearance_failure():
 
     assert raised.value.error_class == "clearance_failed"
     assert "hard transport policy" not in str(raised.value)
+
+
+def test_unreachable_exit_still_ends_the_wave_when_the_lease_will_not_drain():
+    """The soft geo-IP verdict only survives a lease that closes its books.
+
+    The test above runs without ``_lease_client``, which no production wave
+    does, so on its own it would advertise a rescue the paid path never
+    performs: the same dead exit that fails the lookup also leaves the lease
+    unaccounted, ``wait_drained`` raises, and ``browser_provider_drain_failed``
+    re-imposes ``hard_transport_policy``.  That is deliberate — an unresolved
+    paid ledger must stop the wave — but it means the geo-IP verdict alone did
+    not rescue the waves lost 17-18.08; the fresh proxy pool did.  Pin the real
+    behaviour so the limitation cannot be mistaken for a fix (#1188).
+    """
+
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    transport = MagicMock()
+    transport.fetch.return_value = None
+    transport.traffic_delta.return_value = {
+        "real_requests_count": 1,
+        "real_bytes_downloaded": 0,
+        "geoip_lookup_failed": True,
+        "geoip_transport_failure": True,
+    }
+    lease_client = MagicMock()
+    lease_client.wait_drained.side_effect = FBrefProxyLeaseError(
+        "FBref paid proxy drain found terminal accounting state"
+    )
+    fetcher._http_session = None
+    fetcher._transport = transport
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+    fetcher._lease_client = lease_client
+    fetcher._provider_lease = SimpleNamespace(
+        lease_id="lease-1",
+        max_bytes=16 * 1024 * 1024,
+    )
+    fetcher._provider_context = {}
+    fetcher._provider_bootstrap_max_bytes = 0
+    fetcher._provider_bootstrap_spent_bytes = 0
+    fetcher._provider_lease_observed_bytes = 0
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "hard_transport_policy"
+    assert "browser_provider_drain_failed" in str(raised.value)
 
 
 def test_reset_clearance_drops_session_transport_and_metered_lease():

@@ -1258,6 +1258,17 @@ class FBrefFetcher:
             # proxy under the existing exhaustion guards (2 re-solves per
             # target, 3 targets per wave) instead of discarding the wave and
             # everything it already collected (#1188).
+            #
+            # Known limitation, measured and pinned by
+            # test_unreachable_exit_still_ends_the_wave_when_the_lease_will_not
+            # _drain: on the paid path this rescue usually does NOT fire.  The
+            # same dead exit leaves the lease unaccounted, `wait_drained` raises
+            # and `browser_provider_drain_failed` puts hard_transport_policy
+            # back.  That is deliberate — an unresolved paid ledger must stop
+            # the wave — so this branch only helps when the lease still closes
+            # its books.  Relaxing the drain verdict for an exit that never
+            # answered (measured spend: 352 bytes of a 16 MiB lease) is a
+            # paid-metering policy change and needs the owner's call.
             if not source.get("geoip_transport_failure"):
                 return "geoip_lookup_failed"
         if source.get("redirect_blocked"):

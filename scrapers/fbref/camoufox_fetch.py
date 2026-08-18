@@ -236,6 +236,7 @@ def resolve_geoip_without_redirects(proxy: Optional[dict]) -> str:
     """Resolve one exit IP using exactly one bounded, non-redirecting attempt."""
 
     import requests
+    import urllib3
     from requests.adapters import HTTPAdapter
 
     proxy_url = _proxy_url_with_credentials(proxy)
@@ -284,7 +285,18 @@ def resolve_geoip_without_redirects(proxy: Optional[dict]) -> str:
                 raise RuntimeError("Camoufox geo-IP response is invalid") from exc
         finally:
             response.close()
-    except requests.RequestException as exc:
+    except (
+        requests.RequestException,
+        # The body is read straight off the urllib3 response, which is the one
+        # place `requests` does not wrap: a tunnel that dies after the headers
+        # arrives here as a bare urllib3 error and would otherwise be filed as
+        # an *answered* geo-policy breach.  Only the connection-death classes
+        # belong here; DecodeError stays out on purpose, because a body that
+        # arrived and would not decode is evidence about the answer itself.
+        urllib3.exceptions.TimeoutError,
+        urllib3.exceptions.ProtocolError,
+        urllib3.exceptions.IncompleteRead,
+    ) as exc:
         # Name the transport failure in the message itself.  This verdict ends
         # the whole wave through hard_transport_policy, and only the caller's
         # log survives to explain it: a dead pool exit (ProxyError), a refused
