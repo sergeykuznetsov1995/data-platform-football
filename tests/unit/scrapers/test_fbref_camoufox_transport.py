@@ -1759,6 +1759,48 @@ def test_a_tunnel_that_dies_mid_body_is_still_an_unreachable_exit(
         resolve_geoip_without_redirects(_GEOIP_PROXY)
 
 
+def test_a_body_cut_short_without_an_exception_is_still_a_dead_tunnel(
+    monkeypatch,
+):
+    """The quietest truncation of all: short bytes and no exception at all.
+
+    This one reads a genuine ``urllib3.HTTPResponse`` instead of injecting a
+    ready-made error, because that is the whole point — on urllib3 1.26.20,
+    the runtime the wave actually uses, ``enforce_content_length`` is off and
+    a connection cut mid-body simply returns what arrived.  Nothing is raised,
+    so every exception handler above is blind to it and the truncated "1.2"
+    reaches the parser, which rejects it as an invalid *answer* and ends the
+    wave for a geo-policy breach that never happened (#1188).
+    """
+
+    import io
+
+    import requests
+
+    truncated = urllib3.HTTPResponse(
+        body=io.BytesIO(b"1.2"),
+        headers={"content-length": "11"},
+        status=200,
+        preload_content=False,
+        # Pinned, not inherited: urllib3 2.x turns this on and raises a
+        # ProtocolError before the short body is ever returned, so a test run
+        # on a newer library than production would take the already-covered
+        # exception path and leave the length check untested.
+        enforce_content_length=False,
+    )
+    session = MagicMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.headers = {"content-length": "11"}
+    response.raw = truncated
+    session.get.return_value = response
+    monkeypatch.setattr(requests, "Session", lambda: session)
+
+    with pytest.raises(GeoIPTransportError) as raised:
+        resolve_geoip_without_redirects(_GEOIP_PROXY)
+    assert "3 of 11" in str(raised.value)
+
+
 def test_a_body_that_arrived_and_would_not_decode_stays_an_answer(monkeypatch):
     """DecodeError is evidence about the answer, not about the transport.
 

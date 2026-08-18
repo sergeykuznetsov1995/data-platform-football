@@ -256,7 +256,14 @@ def resolve_geoip_without_redirects(proxy: Optional[dict]) -> str:
                 GEOIP_READ_TIMEOUT_SECONDS,
             ),
             allow_redirects=False,
-            headers={"Connection": "close", "Accept": "text/plain"},
+            headers={
+                "Connection": "close",
+                "Accept": "text/plain",
+                # An IP address is 15 bytes; compressing it buys nothing and
+                # would make the declared length incomparable with the decoded
+                # one, which is the only truncation detector this lookup has.
+                "Accept-Encoding": "identity",
+            },
             stream=True,
         )
         try:
@@ -275,6 +282,22 @@ def resolve_geoip_without_redirects(proxy: Optional[dict]) -> str:
             )
             if len(payload) > GEOIP_RESPONSE_LIMIT_BYTES:
                 raise RuntimeError("Camoufox geo-IP response is oversized")
+            if (
+                raw_length
+                and not str(response.headers.get("content-encoding") or "").strip()
+                and len(payload) < int(raw_length)
+            ):
+                # urllib3 1.26 — the runtime the wave actually uses — leaves
+                # `enforce_content_length` off, so a connection cut mid-body
+                # returns the short bytes and raises nothing at all.  The parse
+                # below would then reject "1.2" as an invalid *answer* and end
+                # the wave for a geo-policy breach that never happened.  A body
+                # shorter than the length its own headers declared is a dead
+                # tunnel, and only this comparison can see it (#1188).
+                raise GeoIPTransportError(
+                    "Camoufox geo-IP lookup was truncated: "
+                    f"{len(payload)} of {int(raw_length)} declared bytes"
+                )
             try:
                 value = payload.decode("ascii").strip()
             except UnicodeDecodeError as exc:
