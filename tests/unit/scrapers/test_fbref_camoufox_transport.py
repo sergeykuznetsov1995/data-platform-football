@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call as mock_call
 
 import pytest
+import urllib3
 
 from scrapers.fbref import camoufox_fetch as camoufox_runtime
 from scrapers.fbref.camoufox_fetch import (
@@ -1688,51 +1689,95 @@ def test_unreachable_exit_and_answered_policy_breach_are_different_failures(
     assert not isinstance(raised.value, GeoIPTransportError)
 
 
-def test_a_tunnel_that_dies_mid_body_is_still_an_unreachable_exit(monkeypatch):
+def _geoip_session_whose_body_raises(read_error):
+    session = MagicMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.headers = {"content-length": "11"}
+    response.raw.read.side_effect = read_error
+    session.get.return_value = response
+    return session
+
+
+_GEOIP_PROXY = {
+    "server": "http://fbref_proxy_filter:8900",
+    "username": "lease",
+    "password": "lease-token",
+}
+
+
+@pytest.mark.parametrize(
+    "read_error",
+    [
+        pytest.param(
+            urllib3.exceptions.ReadTimeoutError(
+                None, "https://api.ipify.org", "Read timed out."
+            ),
+            id="socket-timeout",
+        ),
+        pytest.param(
+            urllib3.exceptions.ProtocolError(
+                "Connection broken: InvalidChunkLength"
+            ),
+            id="truncated-body",
+        ),
+        pytest.param(
+            urllib3.exceptions.IncompleteRead(3, 8),
+            id="short-read",
+        ),
+        pytest.param(
+            urllib3.exceptions.SSLError("TLS record layer failure"),
+            id="tls-abort",
+        ),
+    ],
+)
+def test_a_tunnel_that_dies_mid_body_is_still_an_unreachable_exit(
+    monkeypatch, read_error
+):
     """`requests` does not wrap the streamed body, so urllib3 leaks through.
 
     The lookup reads the payload off ``response.raw``, which is the one call in
     this function `requests` never wraps.  A tunnel that dies after the headers
     therefore arrives as a bare urllib3 error, misses ``RequestException`` and
     used to be filed as an *answered* geo-policy breach — the exact confusion
-    this pair of verdicts exists to prevent.  A body that arrived and would not
-    decode stays on the answered side on purpose (#1188).
+    this pair of verdicts exists to prevent.
+
+    Every case is enumerated because they are four separate classes on the
+    runtime that actually runs the wave (urllib3 1.26.20 in
+    /opt/legacy-scraper-venv): a single sample would keep passing while three
+    of the four handlers were missing (#1188).
     """
 
     import requests
-    import urllib3
 
-    def _session_returning(read_error):
-        session = MagicMock()
-        response = MagicMock()
-        response.status_code = 200
-        response.headers = {"content-length": "11"}
-        response.raw.read.side_effect = read_error
-        session.get.return_value = response
-        return session
-
-    proxy = {
-        "server": "http://fbref_proxy_filter:8900",
-        "username": "lease",
-        "password": "lease-token",
-    }
-
-    died = _session_returning(
-        urllib3.exceptions.ReadTimeoutError(
-            None, "https://api.ipify.org", "Read timed out."
-        )
+    monkeypatch.setattr(
+        requests,
+        "Session",
+        lambda: _geoip_session_whose_body_raises(read_error),
     )
-    monkeypatch.setattr(requests, "Session", lambda: died)
     with pytest.raises(GeoIPTransportError):
-        resolve_geoip_without_redirects(proxy)
+        resolve_geoip_without_redirects(_GEOIP_PROXY)
 
-    undecodable = _session_returning(
-        urllib3.exceptions.DecodeError("failed to decode content-encoding")
+
+def test_a_body_that_arrived_and_would_not_decode_stays_an_answer(monkeypatch):
+    """DecodeError is evidence about the answer, not about the transport.
+
+    It is the one urllib3 read failure that proves the exit *did* respond, so
+    it must keep ending the wave as a geo-policy breach instead of buying a
+    fresh proxy and a second paid lease (#1188).
+    """
+
+    import requests
+
+    monkeypatch.setattr(
+        requests,
+        "Session",
+        lambda: _geoip_session_whose_body_raises(
+            urllib3.exceptions.DecodeError("failed to decode content-encoding")
+        ),
     )
-    monkeypatch.setattr(requests, "Session", lambda: undecodable)
-    with pytest.raises(Exception) as raised:
-        resolve_geoip_without_redirects(proxy)
-    assert not isinstance(raised.value, GeoIPTransportError)
+    with pytest.raises(urllib3.exceptions.DecodeError):
+        resolve_geoip_without_redirects(_GEOIP_PROXY)
 
 
 def test_transport_reports_whether_the_geoip_exit_was_reachable():

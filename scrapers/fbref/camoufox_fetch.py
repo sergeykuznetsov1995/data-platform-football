@@ -293,9 +293,18 @@ def resolve_geoip_without_redirects(proxy: Optional[dict]) -> str:
         # an *answered* geo-policy breach.  Only the connection-death classes
         # belong here; DecodeError stays out on purpose, because a body that
         # arrived and would not decode is evidence about the answer itself.
+        #
+        # The list is written against the runtime that actually runs the wave —
+        # /opt/legacy-scraper-venv, urllib3 1.26.20 — not against the scheduler
+        # interpreter.  There `_error_catcher` splits a dying read four ways:
+        # a socket timeout becomes ReadTimeoutError, a truncated body becomes
+        # ProtocolError or IncompleteRead, and any other TLS failure becomes
+        # urllib3's own SSLError, which is neither of the first three and is not
+        # a RequestException either.
         urllib3.exceptions.TimeoutError,
         urllib3.exceptions.ProtocolError,
         urllib3.exceptions.IncompleteRead,
+        urllib3.exceptions.SSLError,
     ) as exc:
         # Name the transport failure in the message itself.  This verdict ends
         # the whole wave through hard_transport_policy, and only the caller's
