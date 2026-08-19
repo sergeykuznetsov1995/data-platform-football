@@ -14,6 +14,7 @@ from scrapers.fotmob.repository import (
     TargetCommit,
 )
 from scrapers.fotmob.service import (
+    PLAYER_REFRESH_AFTER,
     FotMobIngestService,
     OperationResult,
     profile_probe_delay,
@@ -1810,8 +1811,8 @@ def test_backfill_refetches_stale_prior_generation_children():
         ("leaderboard", canonicalize_target(leaderboard_url), "goals", timedelta(hours=25)),
         # команда: старше окна обновления состава (20 ч)
         ("team", canonicalize_target(team_url), "1", timedelta(hours=21)),
-        # игрок: старше окна карточки игрока (7 суток)
-        ("player", canonicalize_target(player_url), "10", timedelta(days=8)),
+        # игрок: старше окна карточки игрока (PLAYER_REFRESH_AFTER, 14 суток)
+        ("player", canonicalize_target(player_url), "10", timedelta(days=15)),
     )
     for target_type, target, entity_id, age in stale:
         repository.record(
@@ -2751,3 +2752,82 @@ def test_leaderboard_freshness_is_keyed_by_url_not_category_name():
 
     assert result.skipped == 0
     assert [call[0] for call in transport.calls] == [other_url]
+
+
+def test_player_refresh_is_rarer_but_first_collection_is_never_delayed():
+    """A2 (решение владельца 18.08): реже обновляем, но первичный сбор не трогаем.
+
+    Замер 15–18.08: игроки — 63,5 % бюджета волны, и 94,6 % этих запросов
+    приходится на ПОВТОРНОЕ обновление уже собранной карточки. Порог режет
+    именно их; игрок, которого в манифесте нет вовсе, обязан собираться сразу,
+    иначе словарь игроков перестанет пополняться.
+    """
+
+    player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
+    fresh_player_url = "https://www.fotmob.com/_next/data/build-1/players/11.json"
+    service, transport, repository = _service(
+        {
+            player_url: {"pageProps": {"data": {"id": 10, "name": "Known"}}},
+            fresh_player_url: {"pageProps": {"data": {"id": 11, "name": "New"}}},
+        },
+        mode=RunMode.BACKFILL,
+    )
+    target = canonicalize_target(player_url)
+    repository.record(
+        TargetCommit(
+            run_id="prior",
+            target_type="player",
+            target_key=target.target_key,
+            status=ManifestStatus.SUCCESS,
+            entity_id="10",
+            content_hash="a" * 64,
+            raw_uri=f"memory://{target.target_key}.json.gz",
+            # Прежний порог (7 суток) отправил бы карточку на перекачку;
+            # принятый (14 суток) — нет. Возраст фиксирован намеренно: если
+            # порог однажды опустят обратно, тест обязан упасть.
+            completed_at=datetime.now(timezone.utc) - timedelta(days=13),
+        )
+    )
+
+    players = service.sync_player_snapshots({10, 11}, build_id="build-1")
+
+    assert players.ok, players.errors
+    assert PLAYER_REFRESH_AFTER == timedelta(days=14)
+    assert players.attempted == 2
+    # Известная карточка десятидневной давности больше не перекачивается...
+    assert players.skipped == 1
+    # ...а игрок, которого в манифесте нет, собран немедленно.
+    assert players.succeeded == 1
+    assert [call[0] for call in transport.calls] == [fresh_player_url]
+
+
+def test_player_card_older_than_the_threshold_is_refetched():
+    """Обратная сторона A2: за порогом карточка всё-таки обновляется."""
+
+    player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
+    service, transport, repository = _service(
+        {player_url: {"pageProps": {"data": {"id": 10, "name": "Known"}}}},
+        mode=RunMode.BACKFILL,
+    )
+    target = canonicalize_target(player_url)
+    repository.record(
+        TargetCommit(
+            run_id="prior",
+            target_type="player",
+            target_key=target.target_key,
+            status=ManifestStatus.SUCCESS,
+            entity_id="10",
+            content_hash="a" * 64,
+            raw_uri=f"memory://{target.target_key}.json.gz",
+            # Ровно за порогом, фиксированным числом: TTL длиннее 15 суток
+            # этот тест обязан ронять.
+            completed_at=datetime.now(timezone.utc) - timedelta(days=15),
+        )
+    )
+
+    players = service.sync_player_snapshots({10}, build_id="build-1")
+
+    assert players.ok, players.errors
+    assert players.skipped == 0
+    assert players.succeeded == 1
+    assert [call[0] for call in transport.calls] == [player_url]
