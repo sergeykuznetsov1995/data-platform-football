@@ -230,6 +230,14 @@ def _validate_silver_quality_unfenced(**context) -> Dict[str, Any]:
     logger = logging.getLogger(__name__)
 
     FRESH_HOURS = 48
+    # История рыночной стоимости — единственная витрина, чья отметка свежести
+    # берётся ТОЛЬКО из карточки игрока (остальные player-таблицы подмешивают
+    # _observed_at статистики через GREATEST и обновляются вместе с ней).
+    # После A2 карточка законно не обновляется до PLAYER_REFRESH_AFTER
+    # (14 суток), поэтому общий порог 48 ч давал бы здесь штатное ложное
+    # предупреждение каждый день. Порог = TTL карточки плюс двое суток на
+    # обход каталога.
+    PLAYER_CARD_FRESH_HOURS = 16 * 24
 
     checks = [
         # --- player_season_profile (полевые игроки) ---
@@ -407,7 +415,7 @@ def _validate_silver_quality_unfenced(**context) -> Dict[str, Any]:
         CHECK.freshness(
             'silver.fotmob_player_market_value_history',
             ts_col='_bronze_ingested_at',
-            max_age_hours=FRESH_HOURS,
+            max_age_hours=PLAYER_CARD_FRESH_HOURS,
             severity='WARNING',
         ),
         CHECK.value_range(
