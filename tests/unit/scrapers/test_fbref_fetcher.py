@@ -13,6 +13,7 @@ from scrapers.fbref.fetcher import (
     MAX_HTML_BYTES,
     MAX_TARGET_HTTP_ATTEMPTS,
 )
+from scrapers.fbref.proxy_lease import FBrefProxyLeaseError
 from scrapers.fbref.settings import (
     DEFAULT_HTTP_WIRE_OVERHEAD_RESERVATION_BYTES,
     DEFAULT_REQUEST_RESERVATION_BYTES,
@@ -558,6 +559,84 @@ def test_failed_geoip_is_a_non_refreshable_hard_transport_error():
     assert "geoip_lookup_failed" in str(raised.value)
 
 
+def test_unreachable_geoip_exit_is_a_re_solvable_clearance_failure():
+    """A dead exit must not spend the whole wave the way a policy breach does.
+
+    ``hard_transport_policy`` stops the wave before a new lease can spend, which
+    is right for an answered geo-policy breach and wrong for an exit that never
+    connected: the warm HTTP path already re-solves the identical ProxyError.
+    Emitting ``clearance_failed`` puts the failure back on the session path,
+    where the existing guards bound the cost (2 re-solves per target, 3 targets
+    per wave).  Measured 17-18.08: 6 waves died this way, one of them after
+    collecting 404 pages (#1188).
+    """
+
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    transport = MagicMock()
+    transport.fetch.return_value = None
+    transport.traffic_delta.return_value = {
+        "real_requests_count": 1,
+        "real_bytes_downloaded": 0,
+        "geoip_lookup_failed": True,
+        "geoip_transport_failure": True,
+    }
+    fetcher._http_session = None
+    fetcher._transport = transport
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "clearance_failed"
+    assert "hard transport policy" not in str(raised.value)
+
+
+def test_unreachable_exit_still_ends_the_wave_when_the_lease_will_not_drain():
+    """The soft geo-IP verdict only survives a lease that closes its books.
+
+    The test above runs without ``_lease_client``, which no production wave
+    does, so on its own it would advertise a rescue the paid path never
+    performs: the same dead exit that fails the lookup also leaves the lease
+    unaccounted, ``wait_drained`` raises, and ``browser_provider_drain_failed``
+    re-imposes ``hard_transport_policy``.  That is deliberate — an unresolved
+    paid ledger must stop the wave — but it means the geo-IP verdict alone did
+    not rescue the waves lost 17-18.08; the fresh proxy pool did.  Pin the real
+    behaviour so the limitation cannot be mistaken for a fix (#1188).
+    """
+
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    transport = MagicMock()
+    transport.fetch.return_value = None
+    transport.traffic_delta.return_value = {
+        "real_requests_count": 1,
+        "real_bytes_downloaded": 0,
+        "geoip_lookup_failed": True,
+        "geoip_transport_failure": True,
+    }
+    lease_client = MagicMock()
+    lease_client.wait_drained.side_effect = FBrefProxyLeaseError(
+        "FBref paid proxy drain found terminal accounting state"
+    )
+    fetcher._http_session = None
+    fetcher._transport = transport
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+    fetcher._lease_client = lease_client
+    fetcher._provider_lease = SimpleNamespace(
+        lease_id="lease-1",
+        max_bytes=16 * 1024 * 1024,
+    )
+    fetcher._provider_context = {}
+    fetcher._provider_bootstrap_max_bytes = 0
+    fetcher._provider_bootstrap_spent_bytes = 0
+    fetcher._provider_lease_observed_bytes = 0
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "hard_transport_policy"
+    assert "browser_provider_drain_failed" in str(raised.value)
+
+
 def test_reset_clearance_drops_session_transport_and_metered_lease():
     fetcher = FBrefFetcher.__new__(FBrefFetcher)
     old_transport = MagicMock()
@@ -734,3 +813,43 @@ def test_non_retryable_status_remains_one_accounted_request(monkeypatch):
     assert caught.value.wire_bytes == 90
     assert fetcher._http_session.get.call_count == 1
     fetcher._sleep.assert_not_called()
+
+
+def test_lease_drain_failure_names_itself_before_ending_the_wave(caplog):
+    """A silent drain failure is indistinguishable from a policy breach.
+
+    ``browser_provider_drain_failed`` stops the wave, and the swallowed
+    exception is the only evidence of what the meter actually refused.  The
+    geo-IP path proved the cost of leaving that blind: a full day of red runs
+    whose cause only became visible once the type reached the log (#1188).
+    """
+
+    import logging
+
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    transport = MagicMock()
+    transport.fetch.return_value = None
+    transport.traffic_delta.return_value = {
+        "real_requests_count": 1,
+        "real_bytes_downloaded": 0,
+    }
+    fetcher._http_session = None
+    fetcher._transport = transport
+    fetcher.bootstrap_url = "https://fbref.com/en/"
+    fetcher._lease_client = MagicMock()
+    fetcher._wait_and_observe_provider = MagicMock(
+        side_effect=RuntimeError("meter rejected drain: counters not final")
+    )
+    fetcher._provider_bootstrap_max_bytes = 0
+    fetcher._provider_bootstrap_spent_bytes = 0
+    fetcher._provider_lease = None
+    fetcher._provider_lease_observed_bytes = 0
+
+    with caplog.at_level(logging.WARNING, logger="scrapers.fbref.fetcher"):
+        with pytest.raises(FetchError) as raised:
+            fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "hard_transport_policy"
+    assert "browser_provider_drain_failed" in str(raised.value)
+    assert "RuntimeError" in caplog.text
+    assert "counters not final" in caplog.text

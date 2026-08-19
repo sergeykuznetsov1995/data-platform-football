@@ -570,6 +570,115 @@ def test_wait_idle_rejects_ambiguous_open_tunnel_state(change):
         client.wait_idle(lease, expected=CONTEXT, expected_tunnels=1)
 
 
+@pytest.mark.parametrize(
+    "change,named,silent",
+    [
+        (
+            {"active_tunnels": 2, "active_provider_readers": 1},
+            ["active_tunnels=2!=1"],
+            ["active_provider_readers", "reserved_bytes"],
+        ),
+        (
+            {"active_tunnels": 1, "active_provider_readers": 3},
+            ["active_provider_readers=3!=1"],
+            ["active_tunnels", "reserved_bytes"],
+        ),
+        (
+            {
+                "active_tunnels": 1,
+                "active_provider_readers": 1,
+                "reserved_bytes": 5,
+                "provider_reserved_bytes": 4,
+            },
+            ["reserved_bytes=5!=provider_reserved_bytes=4"],
+            ["active_tunnels", "active_provider_readers"],
+        ),
+        (
+            {"active_tunnels": 0, "active_provider_readers": 0},
+            ["active_tunnels=0!=1", "active_provider_readers=0!=1"],
+            ["reserved_bytes"],
+        ),
+    ],
+)
+def test_idle_proof_names_which_condition_disagreed(change, named, silent):
+    # The proof is terminal on its first bad sample, so the exception text is
+    # the only forensic record of what the tunnel actually reported.
+    body = _stats_body(**change)
+    session = _Session([_Response(201, _lease_body()), _Response(200, body)])
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+    )
+    lease = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+
+    with pytest.raises(FBrefProxyLeaseError) as excinfo:
+        client.wait_idle(lease, expected=CONTEXT, expected_tunnels=1)
+
+    message = str(excinfo.value)
+    for fragment in named:
+        assert fragment in message
+    for absent in silent:
+        assert absent not in message
+    assert "sample=1" in message
+    assert "expected_tunnels=1" in message
+
+
+def test_zero_tunnel_idle_proof_names_the_observed_reservation():
+    body = _stats_body(reserved_bytes=64, provider_reserved_bytes=64)
+    session = _Session([_Response(201, _lease_body()), _Response(200, body)])
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+    )
+    lease = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+
+    with pytest.raises(FBrefProxyLeaseError) as excinfo:
+        client.wait_idle(lease, expected=CONTEXT, expected_tunnels=0)
+
+    message = str(excinfo.value)
+    assert "reserved_bytes=64!=0" in message
+    assert "provider_reserved_bytes=64!=0" in message
+    assert "active_tunnels" not in message
+    assert "expected_tunnels=0" in message
+
+
+def test_idle_proof_counts_samples_until_the_state_goes_ambiguous():
+    # The count is what tells "bad from the first look" apart from "looked
+    # fine for a while".  Two idle samples that AGREE would return at the
+    # second, so the pair here deliberately differs in up_bytes: the proof
+    # keeps sampling and reports the third, ambiguous one.
+    idle = _stats_body(active_tunnels=1, active_provider_readers=1)
+    broken = _stats_body(
+        active_tunnels=1,
+        active_provider_readers=2,
+        up_bytes=41,
+        total_bytes=101,
+    )
+    session = _Session(
+        [
+            _Response(201, _lease_body()),
+            _Response(200, idle),
+            _Response(200, dict(idle, up_bytes=41, total_bytes=101)),
+            _Response(200, broken),
+        ]
+    )
+    client = FBrefProxyLeaseClient(
+        "http://fbref_proxy_filter:8899",
+        control_token=TOKEN,
+        session=session,
+        sleep=lambda _seconds: None,
+        monotonic=lambda: 0.0,
+    )
+    lease = client.acquire(max_bytes=1000, ttl_seconds=7200, metadata=CONTEXT)
+
+    with pytest.raises(FBrefProxyLeaseError) as excinfo:
+        client.wait_idle(lease, expected=CONTEXT, expected_tunnels=1)
+
+    assert "sample=3" in str(excinfo.value)
+
+
 def test_close_strict_rejects_uncertainty_409_immediately():
     latched = _stats_body(
         closed=True,

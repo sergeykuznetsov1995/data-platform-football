@@ -1101,7 +1101,18 @@ class FBrefFetcher:
                 provider_stats = None
                 try:
                     provider_stats = self._wait_and_observe_provider()
-                except Exception:
+                except Exception as exc:
+                    # This verdict ends the wave and the exception is the only
+                    # evidence of why the paid lease would not drain.  Swallowed
+                    # silently it reads exactly like a policy breach: the geo-IP
+                    # path cost a day of blind red runs for the same reason,
+                    # until c343f5e2 put its type in the log (#1188).
+                    logger.warning(
+                        "FBref paid lease drain failed before the wave "
+                        "verdict: %s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
                     hard_policy = hard_policy or "browser_provider_drain_failed"
                 if (
                     (
@@ -1238,7 +1249,28 @@ class FBrefFetcher:
     def _hard_transport_policy_reason(stats: Optional[dict]) -> Optional[str]:
         source = stats or {}
         if source.get("geoip_lookup_failed"):
-            return "geoip_lookup_failed"
+            # An exit that could not be reached is a dead lease, not a policy
+            # breach: the warm HTTP path already treats the same ProxyError as
+            # a re-solvable session failure, and every geo-IP death measured
+            # 17-18.08 carried exactly that (3 of 3 with a recorded type, each
+            # ProxyError "Cannot connect to proxy").  Falling through here
+            # yields error_class 'clearance_failed', which re-solves on a fresh
+            # proxy under the existing exhaustion guards (2 re-solves per
+            # target, 3 targets per wave) instead of discarding the wave and
+            # everything it already collected (#1188).
+            #
+            # Known limitation, measured and pinned by
+            # test_unreachable_exit_still_ends_the_wave_when_the_lease_will_not
+            # _drain: on the paid path this rescue usually does NOT fire.  The
+            # same dead exit leaves the lease unaccounted, `wait_drained` raises
+            # and `browser_provider_drain_failed` puts hard_transport_policy
+            # back.  That is deliberate — an unresolved paid ledger must stop
+            # the wave — so this branch only helps when the lease still closes
+            # its books.  Relaxing the drain verdict for an exit that never
+            # answered (measured spend: 352 bytes of a 16 MiB lease) is a
+            # paid-metering policy change and needs the owner's call.
+            if not source.get("geoip_transport_failure"):
+                return "geoip_lookup_failed"
         if source.get("redirect_blocked"):
             return "redirect_blocked"
         if source.get("network_policy_failed"):

@@ -221,10 +221,22 @@ def _proxy_url_with_credentials(proxy: Optional[dict]) -> Optional[str]:
     return urlunsplit((parsed.scheme, netloc, "", "", ""))
 
 
+class GeoIPTransportError(RuntimeError):
+    """The paid exit could not be reached at all for the geo-IP lookup.
+
+    Separated from every other geo-IP failure because the two demand opposite
+    verdicts: an exit that refuses to connect is a dead lease the wave can
+    re-solve on a fresh proxy, while a lookup that *answered* with a redirect,
+    a non-200, or an unparsable body is evidence about the geo policy itself
+    and must still end the wave (#1188).
+    """
+
+
 def resolve_geoip_without_redirects(proxy: Optional[dict]) -> str:
     """Resolve one exit IP using exactly one bounded, non-redirecting attempt."""
 
     import requests
+    import urllib3
     from requests.adapters import HTTPAdapter
 
     proxy_url = _proxy_url_with_credentials(proxy)
@@ -244,7 +256,14 @@ def resolve_geoip_without_redirects(proxy: Optional[dict]) -> str:
                 GEOIP_READ_TIMEOUT_SECONDS,
             ),
             allow_redirects=False,
-            headers={"Connection": "close", "Accept": "text/plain"},
+            headers={
+                "Connection": "close",
+                "Accept": "text/plain",
+                # An IP address is 15 bytes; compressing it buys nothing and
+                # would make the declared length incomparable with the decoded
+                # one, which is the only truncation detector this lookup has.
+                "Accept-Encoding": "identity",
+            },
             stream=True,
         )
         try:
@@ -263,6 +282,27 @@ def resolve_geoip_without_redirects(proxy: Optional[dict]) -> str:
             )
             if len(payload) > GEOIP_RESPONSE_LIMIT_BYTES:
                 raise RuntimeError("Camoufox geo-IP response is oversized")
+            encoding = str(
+                response.headers.get("content-encoding") or ""
+            ).strip().lower()
+            if (
+                raw_length
+                # "identity" is the spelled-out absence of a coding, so it must
+                # not switch the detector off the way gzip has to.
+                and encoding in ("", "identity")
+                and len(payload) < int(raw_length)
+            ):
+                # urllib3 1.26 — the runtime the wave actually uses — leaves
+                # `enforce_content_length` off, so a connection cut mid-body
+                # returns the short bytes and raises nothing at all.  The parse
+                # below would then reject "1.2" as an invalid *answer* and end
+                # the wave for a geo-policy breach that never happened.  A body
+                # shorter than the length its own headers declared is a dead
+                # tunnel, and only this comparison can see it (#1188).
+                raise GeoIPTransportError(
+                    "Camoufox geo-IP lookup was truncated: "
+                    f"{len(payload)} of {int(raw_length)} declared bytes"
+                )
             try:
                 value = payload.decode("ascii").strip()
             except UnicodeDecodeError as exc:
@@ -273,8 +313,36 @@ def resolve_geoip_without_redirects(proxy: Optional[dict]) -> str:
                 raise RuntimeError("Camoufox geo-IP response is invalid") from exc
         finally:
             response.close()
-    except requests.RequestException as exc:
-        raise RuntimeError("Camoufox geo-IP lookup failed") from exc
+    except (
+        requests.RequestException,
+        # The body is read straight off the urllib3 response, which is the one
+        # place `requests` does not wrap: a tunnel that dies after the headers
+        # arrives here as a bare urllib3 error and would otherwise be filed as
+        # an *answered* geo-policy breach.  Only the connection-death classes
+        # belong here; DecodeError stays out on purpose, because a body that
+        # arrived and would not decode is evidence about the answer itself.
+        #
+        # The list is written against the runtime that actually runs the wave —
+        # /opt/legacy-scraper-venv, urllib3 1.26.20 — not against the scheduler
+        # interpreter.  There `_error_catcher` splits a dying read four ways:
+        # a socket timeout becomes ReadTimeoutError, a truncated body becomes
+        # ProtocolError or IncompleteRead, and any other TLS failure becomes
+        # urllib3's own SSLError, which is neither of the first three and is not
+        # a RequestException either.
+        urllib3.exceptions.TimeoutError,
+        urllib3.exceptions.ProtocolError,
+        urllib3.exceptions.IncompleteRead,
+        urllib3.exceptions.SSLError,
+    ) as exc:
+        # Name the transport failure in the message itself.  This verdict ends
+        # the whole wave through hard_transport_policy, and only the caller's
+        # log survives to explain it: a dead pool exit (ProxyError), a refused
+        # CONNECT and a plain ReadTimeout must not collapse into one string
+        # (#1188).  The URL is fixed and credential-free, so the exception text
+        # carries no lease secret.
+        raise GeoIPTransportError(
+            f"Camoufox geo-IP lookup failed: {type(exc).__name__}: {exc}"
+        ) from exc
     finally:
         session.close()
 
@@ -568,6 +636,7 @@ class CamoufoxFbrefTransport:
         self._request_budget_exhausted = False
         self._redirect_blocked = False
         self._geoip_lookup_failed = False
+        self._geoip_transport_failure = False
         self._network_policy_failed = False
         self._network_policy_failure: Optional[str] = None
         # CF solve counters (feed the traffic guard / diagnostics).
@@ -763,10 +832,26 @@ class CamoufoxFbrefTransport:
             self._unobserved_reserved_bytes += GEOIP_BYTE_RESERVATION_BYTES
             try:
                 geoip = self._geoip_resolver(self._proxy)
-            except Exception:
+            except Exception as exc:
                 # A lookup failure already spent its one paid request. Do not
                 # rotate leases and silently repeat it inside this transport.
+                # Name the failure by exception type, not by message: this one
+                # verdict ends the whole wave via hard_transport_policy, and
+                # without the type a dead pool exit reads exactly like a
+                # transient timeout (#1188).
                 self._geoip_lookup_failed = True
+                # Record WHY separately from the latch: the latch still bars an
+                # automatic retry inside this transport (one paid lookup per
+                # lease), but an unreachable exit lets the caller re-solve on a
+                # fresh proxy instead of discarding the wave.
+                self._geoip_transport_failure = isinstance(
+                    exc, GeoIPTransportError
+                )
+                logger.warning(
+                    "Camoufox geo-IP lookup failed for this lease: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
                 raise
 
         from camoufox.addons import DefaultAddons
@@ -2459,6 +2544,7 @@ class CamoufoxFbrefTransport:
             "network_policy_failed": self._network_policy_failed,
             "network_policy_failure": self._network_policy_failure,
             "geoip_lookup_failed": self._geoip_lookup_failed,
+            "geoip_transport_failure": self._geoip_transport_failure,
             "redirect_blocked": self._redirect_blocked,
             "real_bytes_by_resource_type": dict(self._bytes_by_type),
             "blocked_count": self._blocked_count,

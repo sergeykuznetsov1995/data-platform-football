@@ -171,6 +171,23 @@ CLEARANCE_REJECTED_STATUSES = frozenset({401, 403, 429})
 # expiry is independent transport churn, not evidence that the source rejects
 # every fresh clearance.
 MAX_CONSECUTIVE_CLEARANCE_REFRESHES = 2
+# Exhausting the refreshes above says the *page* did not come back on a fresh
+# clearance -- it does not say the source rejects clearances, because the very
+# next target usually fetches on that same fresh session (82% of 403s recovered
+# on the first re-solve on 17.08, 4 of 71 used up their retries).  So one
+# exhausted target is deferred with backoff and the wave moves on; only a streak
+# of them, with no page fetched in between, is source-wide evidence that ends
+# the wave.  The streak bounds the browser solves such a wave can burn at
+# MAX_CONSECUTIVE_CLEARANCE_REFRESHES x this many (#1188).
+MAX_CLEARANCE_EXHAUSTED_TARGETS = 3
+# A deferred target is returned with ``requeue=True``, which store.fail_fetch
+# defines as "the failure was ours, the page was never judged": it clears
+# retry_after and marks this run's target 'skipped'.  So the deferral is exact
+# for this wave -- claim_targets only takes 'pending'/'retry' targets, and the
+# page cannot come back inside this run -- and carries no timed backoff into
+# the next one.  Passing a retry delay here would be a lie: that argument is
+# ignored on the requeue path, and store.py is sealed.
+CLEARANCE_EXHAUSTED_RETRY_DELAY_SECONDS = 0
 # One production parse batch may consume the accepted 20 seconds per match for
 # all 25 targets (500s). Add 100s for scheduler/strict-close variance, and
 # finalize before entering that offline gap whenever the 115-minute local
@@ -611,6 +628,7 @@ class WaveResult:
     requeued_at_budget: int = 0
     requeued_dead_clearance: int = 0
     requeued_session_exhaustion: int = 0
+    deferred_dead_clearance: int = 0
     contract_quarantined: int = 0
     failures: list[str] = field(default_factory=list)
 
@@ -661,6 +679,38 @@ class _ClaimedMatchObservation:
 
 
 @dataclass(frozen=True)
+class _ClaimedGenericObservation:
+    """A parsed non-match page held back so a cohort shares one write.
+
+    Carries ``recover_cross_run`` because the drain wave parses exactly these
+    pages, and the historical contract verdict reads that flag.
+    """
+
+    run_id: str
+    html: str
+    record: RawFetchRecord
+    observation_lease: ObservationLease
+    page: PageDocument
+    stateful_run_id: str
+    stateful_run_type: str
+    recover_cross_run: bool = False
+
+    def sequential_args(self, *, generic_persisted: bool = False) -> dict:
+        return {
+            "run_id": self.run_id,
+            "html": self.html,
+            "record": self.record,
+            "observation_lease": self.observation_lease,
+            "page": self.page,
+            "typed_match": None,
+            "generic_persisted": generic_persisted,
+            "stateful_run_id": self.stateful_run_id,
+            "stateful_run_type": self.stateful_run_type,
+            "recover_cross_run": self.recover_cross_run,
+        }
+
+
+@dataclass(frozen=True)
 class _LivePageSettlement:
     provider_billed_bytes: int
     budget_exceeded: bool = False
@@ -699,6 +749,10 @@ class _LiveFetchSession:
     fetcher: Optional[object] = None
     session_id: Optional[str] = None
     consecutive_clearance_refreshes: int = 0
+    # Targets that used up their re-solves back to back, with no page fetched
+    # in between.  One such target is evidence about that page; a streak of
+    # them is evidence about the source.
+    clearance_exhausted_targets: int = 0
     needs_clearance: bool = True
     # What the next solve may spend, once the run's remaining budget can no
     # longer fund the full reservation.  ``None`` means the settings default.
@@ -1833,6 +1887,8 @@ class FBrefPipeline:
         self.finalization_guard = finalization_guard
         # Instance fields make the default-off rollout and bounded cohort
         # policy directly inspectable and overridable in deterministic tests.
+        self._scope_reconcile_deferred = False
+        self._scope_reconcile_pending = False
         self.batch_persist_enabled = FBREF_BATCH_PERSIST
         self.batch_persist_matches = FBREF_BATCH_PERSIST_MATCHES
         self.batch_persist_max_cells = FBREF_BATCH_PERSIST_MAX_CELLS
@@ -2816,6 +2872,7 @@ class FBrefPipeline:
                         lease, record, historical=historical
                     )
                     live_session.consecutive_clearance_refreshes = 0
+                    live_session.clearance_exhausted_targets = 0
                     result.fetched += 1
                     result.requests += (
                         response.http_requests + response.browser_requests
@@ -2987,6 +3044,10 @@ class FBrefPipeline:
                             session_version=live_session.session_id,
                         )
                         live_session.consecutive_clearance_refreshes += 1
+                        clearance_streak_exhausted = (
+                            live_session.consecutive_clearance_refreshes
+                            > MAX_CONSECUTIVE_CLEARANCE_REFRESHES
+                        )
                         result.requeued_dead_clearance += 1
                         if settings.persistent_http_session:
                             # Page/failure evidence is durable above.  Close the
@@ -3025,20 +3086,27 @@ class FBrefPipeline:
                             byte_remaining=byte_remaining,
                         )
                         retry_fits_budget = retry_reservation is not None
-                        if retry_fits_budget:
+                        if retry_fits_budget and not clearance_streak_exhausted:
                             self.control.retry_session_fetch(
                                 lease,
                                 **retry_evidence,
                             )
                         else:
-                            # The rejected request is real evidence, but a new
-                            # browser+HTTP reservation no longer fits. This is
-                            # the same clean ceiling as reserve_budget raising
-                            # on an untouched target: return the page now,
-                            # before another proxy or browser can start.
+                            # The rejected request is real evidence, but this
+                            # target gets no further paid session in this wave:
+                            # either a new browser+HTTP reservation no longer
+                            # fits -- the same clean ceiling as reserve_budget
+                            # raising on an untouched target -- or the target
+                            # used up its re-solves and is deferred so the wave
+                            # can keep working other pages.  Return the page
+                            # now, before another proxy or browser can start.
                             self.control.fail_fetch(
                                 lease,
-                                retry_delay_seconds=0,
+                                retry_delay_seconds=(
+                                    CLEARANCE_EXHAUSTED_RETRY_DELAY_SECONDS
+                                    if clearance_streak_exhausted
+                                    else 0
+                                ),
                                 permanent=False,
                                 requeue=True,
                                 **retry_evidence,
@@ -3089,13 +3157,17 @@ class FBrefPipeline:
                         live_session.clearance_requests = allowed_requests
                         live_session.clearance_bytes = allowed_bytes
                         logger.warning(
-                            "FBref clearance failed (%s, HTTP %s) — "
-                            "%s stays in this run and the session is being "
-                            "re-solved on a fresh proxy "
-                            "(consecutive refresh %d/%d)",
+                            "FBref clearance failed (%s, HTTP %s) — %s %s "
+                            "and the session is being re-solved on a fresh "
+                            "proxy (consecutive refresh %d/%d)",
                             exc.error_class,
                             exc.http_status,
                             lease.target_id,
+                            (
+                                "is returned to the queue"
+                                if clearance_streak_exhausted
+                                else "stays in this run"
+                            ),
                             live_session.consecutive_clearance_refreshes,
                             MAX_CONSECUTIVE_CLEARANCE_REFRESHES,
                         )
@@ -3110,22 +3182,6 @@ class FBrefPipeline:
                                 previous_requests,
                                 previous_bytes,
                             )
-                        if (
-                            live_session.consecutive_clearance_refreshes
-                            > MAX_CONSECUTIVE_CLEARANCE_REFRESHES
-                        ):
-                            untouched = leases[lease_index + 1:]
-                            result.requeued_session_exhaustion += (
-                                self.control.requeue_unfetched_targets(
-                                    untouched
-                                )
-                            )
-                            result.failures.append(
-                                "clearance_session_refreshes_exhausted="
-                                f"{MAX_CONSECUTIVE_CLEARANCE_REFRESHES}"
-                            )
-                            break
-
                         reset = getattr(
                             live_session.fetcher,
                             "reset_clearance",
@@ -3161,6 +3217,41 @@ class FBrefPipeline:
                             live_session.stack.close()
                             live_session.stack = ExitStack()
                             live_session.fetcher = None
+
+                        if clearance_streak_exhausted:
+                            # The target was deferred above.  Whether the wave
+                            # goes on depends on what the streak is evidence
+                            # of: one exhausted page, or a source that rejects
+                            # every fresh clearance it is handed.
+                            live_session.clearance_exhausted_targets += 1
+                            live_session.consecutive_clearance_refreshes = 0
+                            result.deferred_dead_clearance += 1
+                            if (
+                                live_session.clearance_exhausted_targets
+                                >= MAX_CLEARANCE_EXHAUSTED_TARGETS
+                            ):
+                                untouched = leases[lease_index + 1:]
+                                result.requeued_session_exhaustion += (
+                                    self.control.requeue_unfetched_targets(
+                                        untouched
+                                    )
+                                )
+                                result.failures.append(
+                                    "clearance_session_refreshes_exhausted="
+                                    f"{MAX_CONSECUTIVE_CLEARANCE_REFRESHES}"
+                                )
+                                break
+                            logger.warning(
+                                "FBref %s used up its %d re-solve(s) and is "
+                                "returned to the queue for a later run — this "
+                                "wave continues on a fresh clearance (%d/%d "
+                                "exhausted target(s) in a row)",
+                                lease.target_id,
+                                MAX_CONSECUTIVE_CLEARANCE_REFRESHES,
+                                live_session.clearance_exhausted_targets,
+                                MAX_CLEARANCE_EXHAUSTED_TARGETS,
+                            )
+                            continue
 
                         retry_leases = self.control.claim_targets(
                             run_id,
@@ -3651,11 +3742,45 @@ class FBrefPipeline:
         return len(seeded_targets), len(skipped_targets)
 
     def _reconcile_frontier_scope(self) -> None:
+        if self._scope_reconcile_deferred:
+            self._scope_reconcile_pending = True
+            return
         reconcile_scope = getattr(
             self.control, "reconcile_frontier_scope", None
         )
         if reconcile_scope is not None:
             reconcile_scope(source="fbref")
+
+    @contextmanager
+    def _deferred_scope_reconcile(self):
+        """Collapse a wave's per-page scope reconciles into one.
+
+        The reconciler sweeps the whole frontier -- it joins page_frontier
+        (120 919 rows) with frontier_provenance (1.7M rows) and rolls the
+        result up per target -- so it costs the same whether a page brought
+        27 links or 510.  Measured live on 18.08: ~70s a page, back to back,
+        against a 122s page-to-page cycle.  It is called once per parsed page
+        that seeded anything, which makes it the single largest cost in a
+        wave, ahead of every Trino write.
+
+        Running it once per wave keeps the guarantee that matters: nothing
+        claims targets during a parse wave, and the fetch wave that does claim
+        runs after this one returns.  The finally clause keeps that true for a
+        failed wave too, so scope is never left stale behind an exception.
+        """
+
+        previous_deferred = self._scope_reconcile_deferred
+        previous_pending = self._scope_reconcile_pending
+        self._scope_reconcile_deferred = True
+        self._scope_reconcile_pending = False
+        try:
+            yield
+        finally:
+            pending = self._scope_reconcile_pending
+            self._scope_reconcile_deferred = previous_deferred
+            self._scope_reconcile_pending = previous_pending
+            if pending:
+                self._reconcile_frontier_scope()
 
     def _parse_competition_index(
         self,
@@ -4934,6 +5059,120 @@ class FBrefPipeline:
         flush_cohort()
         return outcomes
 
+    @staticmethod
+    def _generic_item_cells(item: _ClaimedGenericObservation) -> int:
+        return len(item.page.cell_records())
+
+    def _process_claimed_generic_batch(
+        self, items: Sequence[_ClaimedGenericObservation]
+    ) -> list[_ProcessedObservation]:
+        """Cohort non-match pages the way matches are already cohorted.
+
+        A page costs three generic tables, and each table costs a staging
+        create/insert/insert-select/drop -- so a page written alone is ~12
+        statements, two of which carry a single row (its manifest and its
+        table inventory).  Measured on history_20260818T015855Z: 15 pages,
+        67 inserts of which 39 were exactly one row, 130 drops, 3485 HTTP
+        round trips to Trino.  Cohorting the same pages collapses that to one
+        merge per generic table.
+        """
+
+        materialized = tuple(items)
+        if not materialized:
+            return []
+        identities = [item.record.logical_refresh_id for item in materialized]
+        if len(identities) != len(set(identities)):
+            return [
+                self._process_claimed_observation(**item.sequential_args())
+                for item in materialized
+            ]
+        outcomes: list[_ProcessedObservation] = []
+        cohort: list[_ClaimedGenericObservation] = []
+        cohort_cells = 0
+
+        def flush_cohort() -> None:
+            nonlocal cohort, cohort_cells
+            if cohort:
+                outcomes.extend(
+                    self._persist_and_finish_generic_batch(cohort)
+                )
+                cohort = []
+                cohort_cells = 0
+
+        for item in materialized:
+            item_cells = self._generic_item_cells(item)
+            # A page with parser errors writes error evidence instead of rows,
+            # which the batch writer rejects outright; oversized pages keep
+            # their own write so one page cannot blow the cohort's cell bound.
+            if item.page.errors or item_cells > self.batch_persist_max_cells:
+                flush_cohort()
+                outcomes.append(
+                    self._process_claimed_observation(
+                        **item.sequential_args()
+                    )
+                )
+                continue
+            if cohort and (
+                len(cohort) == self.batch_persist_matches
+                or cohort_cells + item_cells > self.batch_persist_max_cells
+            ):
+                flush_cohort()
+            cohort.append(item)
+            cohort_cells += item_cells
+        flush_cohort()
+        return outcomes
+
+    def _persist_and_finish_generic_batch(
+        self, items: Sequence[_ClaimedGenericObservation]
+    ) -> list[_ProcessedObservation]:
+        try:
+            generic_counts = self.generic_writer.persist_pages(
+                [
+                    GenericPagePersistItem(
+                        page=item.page,
+                        canonical_url=item.record.canonical_url,
+                        run_id=item.run_id,
+                        staging_identity=item.record.logical_refresh_id,
+                    )
+                    for item in items
+                ]
+            )
+            if len(generic_counts) != len(items):
+                raise ParseWaveError(
+                    "Generic batch returned misaligned item counts"
+                )
+        except Exception:
+            # The writer may have committed a prefix. Re-run each page
+            # sequentially: same lease, same immutable raw, idempotent write.
+            return [
+                self._process_claimed_observation(**item.sequential_args())
+                for item in items
+            ]
+
+        outcomes: list[_ProcessedObservation] = []
+        for item in items:
+            # The per-page path records these right after its own write; the
+            # cohort has to do it here, or the pages it wrote carry no dataset
+            # manifests.
+            try:
+                self._record_generic_table_results(item.record, item.page)
+            except Exception as exc:
+                outcomes.append(
+                    self._failed_claimed_observation(
+                        record=item.record,
+                        page=item.page,
+                        observation_lease=item.observation_lease,
+                        exc=exc,
+                    )
+                )
+                continue
+            outcomes.append(
+                self._process_claimed_observation(
+                    **item.sequential_args(generic_persisted=True)
+                )
+            )
+        return outcomes
+
     def _persist_and_finish_match_batch(
         self, items: Sequence[_ClaimedMatchObservation]
     ) -> list[_ProcessedObservation]:
@@ -5541,7 +5780,8 @@ class FBrefPipeline:
     ) -> WaveResult:
         """Parse raw under a database-held publication-generation fence."""
 
-        with self.control.guard_publication_lock(run_id, source="fbref"):
+        with self.control.guard_publication_lock(run_id, source="fbref"), \
+                self._deferred_scope_reconcile():
             return self._parse_wave_under_publication_guard(
                 run_id,
                 page_kinds=page_kinds,
@@ -5708,24 +5948,82 @@ class FBrefPipeline:
             for outcome in self._process_claimed_match_batch(prepared):
                 self._merge_processed_result(result, outcome)
 
+        def flush_generic_items(buffer):
+            prepared: list[_ClaimedGenericObservation] = []
+            for item in buffer:
+                try:
+                    claimed = self._load_and_claim_observation(item)
+                except Exception as exc:
+                    result.failures.append(
+                        f"{item['target_id']}:{type(exc).__name__}:{exc}"
+                    )
+                    continue
+                if claimed is None:
+                    continue
+                result.claimed += 1
+                html, record, observation_lease = claimed
+                item_run_id, item_run_type = stateful_identity(item)
+                try:
+                    page = self._parse_generic(html, record)
+                except Exception:
+                    # Preparation failed. Preserve the sequential evidence
+                    # path on this same lease and raw.
+                    outcome = self._process_claimed_observation(
+                        run_id=run_id,
+                        html=html,
+                        record=record,
+                        observation_lease=observation_lease,
+                        page=None,
+                        typed_match=None,
+                        stateful_run_id=item_run_id,
+                        stateful_run_type=item_run_type,
+                        recover_cross_run=_recover_cross_run,
+                    )
+                    self._merge_processed_result(result, outcome)
+                    continue
+                prepared.append(_ClaimedGenericObservation(
+                    run_id=run_id,
+                    html=html,
+                    record=record,
+                    observation_lease=observation_lease,
+                    page=page,
+                    stateful_run_id=item_run_id,
+                    stateful_run_type=item_run_type,
+                    recover_cross_run=_recover_cross_run,
+                ))
+            for outcome in self._process_claimed_generic_batch(prepared):
+                self._merge_processed_result(result, outcome)
+
         if not self.batch_persist_enabled:
             for item in fetches:
                 process_sequential_item(item)
         else:
             match_buffer = []
-            for item in fetches:
-                if str(item.get("page_kind") or "") == "match":
-                    match_buffer.append(item)
-                    if len(match_buffer) == self.batch_persist_matches:
-                        flush_match_items(match_buffer)
-                        match_buffer = []
-                    continue
-                if match_buffer:
+            generic_buffer = []
+
+            def flush_buffers(*, matches: bool, generic: bool) -> None:
+                nonlocal match_buffer, generic_buffer
+                if matches and match_buffer:
                     flush_match_items(match_buffer)
                     match_buffer = []
-                process_sequential_item(item)
-            if match_buffer:
-                flush_match_items(match_buffer)
+                if generic and generic_buffer:
+                    flush_generic_items(generic_buffer)
+                    generic_buffer = []
+
+            for item in fetches:
+                if str(item.get("page_kind") or "") == "match":
+                    # Switching kinds flushes the other buffer first, so the
+                    # cohort order stays the selection order.
+                    flush_buffers(matches=False, generic=True)
+                    match_buffer.append(item)
+                    if len(match_buffer) == self.batch_persist_matches:
+                        flush_buffers(matches=True, generic=False)
+                    continue
+                flush_buffers(matches=True, generic=False)
+                generic_buffer.append(item)
+                if len(generic_buffer) == self.batch_persist_matches:
+                    flush_buffers(matches=False, generic=True)
+            flush_buffers(matches=True, generic=True)
         if result.failures:
             raise ParseWaveError("; ".join(result.failures))
         if _is_mass_contract_rejection(result):

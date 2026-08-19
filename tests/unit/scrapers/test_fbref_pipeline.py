@@ -64,6 +64,9 @@ from scrapers.fbref.pipeline import (
     _bounded_int,
     _LiveFetchSession,
     _session_failure,
+    CLEARANCE_EXHAUSTED_RETRY_DELAY_SECONDS,
+    MAX_CLEARANCE_EXHAUSTED_TARGETS,
+    MAX_CONSECUTIVE_CLEARANCE_REFRESHES,
 )
 from scrapers.fbref.discovery import (
     DISCOVERY_PARSER_VERSION,
@@ -4085,6 +4088,208 @@ def test_registry_snapshot_identity_is_stable_for_raw_retry(tmp_path):
     assert uuid.UUID(snapshot_ids[0]).version == 5
 
 
+def _seasons_html(competition_id: str) -> str:
+    return f"""
+    <table id="seasons"><tbody>
+      <tr><th data-stat="season"><a href="/en/comps/{competition_id}/2024-2025/x">2024-2025</a></th></tr>
+    </tbody></table>
+    """
+
+
+def _pipeline_with_saved_generic_pages(tmp_path, competition_ids, broken=()):
+    """Competition pages ready to parse, one per id, batch persistence on."""
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.fetches = []
+    for competition_id in competition_ids:
+        control.registry[competition_id] = {
+            "competition_id": competition_id,
+            "canonical_url": (
+                f"https://fbref.com/en/comps/{competition_id}/history/x"
+            ),
+            "name": f"Competition {competition_id}",
+            "gender": "male",
+            "classification": "league:club",
+            "metadata": {},
+        }
+        target = page_target_from_link(DiscoveredPageLink(
+            page_kind="competition",
+            canonical_url=(
+                f"https://fbref.com/en/comps/{competition_id}/history/x"
+            ),
+            source_ids={"competition_id": competition_id},
+        ))
+        html = (
+            '<table id="not_seasons"><tbody><tr><td>1</td></tr></tbody></table>'
+            if competition_id in broken
+            else _seasons_html(competition_id)
+        )
+        refresh, record = _commit_for_parse(raw, target, html)
+        control.frontier[record.target_id] = {
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "source_ids": dict(record.source_ids),
+            "state": "fetched",
+            "last_content_hash": record.content_hash,
+        }
+        control.fetches.append({
+            "target_id": record.target_id,
+            "page_kind": record.page_kind,
+            "logical_refresh_id": refresh,
+        })
+    generic = FakeWriter()
+
+    def forbidden_transport(*_args):
+        raise AssertionError("parse batching must not construct a transport")
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=generic,
+        fetcher_factory=forbidden_transport,
+    )
+    pipeline.batch_persist_enabled = True
+    return pipeline, control, generic
+
+
+def test_generic_pages_share_one_write_per_cohort(tmp_path):
+    """A page alone costs three staged writes, two of them a single row.
+
+    Measured on history_20260818T015855Z: 15 pages produced 67 inserts (39 of
+    exactly one row), 130 drops and 3485 HTTP round trips to Trino, while the
+    wave fetched for about a minute.  Matches were already cohorted; every
+    other page kind was not, and the history campaign fetches almost nothing
+    but other page kinds.
+    """
+
+    pipeline, control, generic = _pipeline_with_saved_generic_pages(
+        tmp_path, ["9", "12", "13"]
+    )
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_settings("current"),
+    )
+
+    assert generic.batch_sizes == [3]
+    assert result.claimed == result.parsed == 3
+    assert result.seeded == 3
+    assert all(
+        row["status"] == "succeeded" for row in control.observations.values()
+    )
+
+
+def test_scope_is_reconciled_once_per_wave_not_once_per_page(tmp_path):
+    """The reconciler sweeps the whole frontier, so its cost is per call.
+
+    Measured live 18.08: ~70s per call, running back to back, against a 122s
+    page-to-page cycle -- the largest single cost in a wave, ahead of every
+    Trino write.  Nothing claims targets while a parse wave runs, so one
+    reconcile at the end of the wave is as timely as one per page.
+    """
+
+    pipeline, control, _generic = _pipeline_with_saved_generic_pages(
+        tmp_path, ["9", "12", "13"]
+    )
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_settings("current"),
+    )
+
+    assert result.seeded == 3
+    assert control.events.count("scope_reconcile") == 1
+
+
+def test_a_failed_wave_still_reconciles_the_scope_it_changed(tmp_path):
+    pipeline, control, _generic = _pipeline_with_saved_generic_pages(
+        tmp_path, ["9", "12", "13"], broken=("12",)
+    )
+
+    with pytest.raises(ParseWaveError):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["competition"],
+            settings=_settings("current"),
+        )
+
+    # Page 9 seeded before the wave failed; leaving its scope unreconciled
+    # would park the target it created until some later run swept the frontier.
+    assert control.events.count("scope_reconcile") == 1
+
+
+def test_generic_cohort_stops_at_the_configured_size(tmp_path):
+    pipeline, control, generic = _pipeline_with_saved_generic_pages(
+        tmp_path, ["9", "12", "13", "14", "15"]
+    )
+    pipeline.batch_persist_matches = 2
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=replace(_settings("current"), shard_size=5),
+    )
+
+    assert generic.batch_sizes == [2, 2, 1]
+    assert result.parsed == 5
+
+
+def test_generic_batch_failure_reuses_claims_and_raw_without_network(tmp_path):
+    pipeline, control, generic = _pipeline_with_saved_generic_pages(
+        tmp_path, ["9", "12"]
+    )
+    generic.batch_error = RuntimeError("commit reset")
+    load_calls = 0
+    original_load = pipeline.raw_store.load_fetch_html
+
+    def counted_load(logical_refresh_id):
+        nonlocal load_calls
+        load_calls += 1
+        return original_load(logical_refresh_id)
+
+    pipeline.raw_store.load_fetch_html = counted_load
+
+    result = pipeline.parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_settings("current"),
+    )
+
+    # The cohort write failed, so each page is written on its own -- on the
+    # same lease and the same raw, without a second load or any network.
+    assert result.claimed == result.parsed == 2
+    assert load_calls == 2
+    assert len(generic.pages) == 2
+    assert all(
+        row["status"] == "succeeded" for row in control.observations.values()
+    )
+
+
+def test_page_with_parser_errors_never_joins_a_cohort(tmp_path):
+    """The batch writer rejects a cohort holding parser errors outright."""
+
+    pipeline, control, generic = _pipeline_with_saved_generic_pages(
+        tmp_path, ["9", "12", "13"], broken=("12",)
+    )
+
+    # The broken page fails discovery, which fails the wave -- as it did
+    # before cohorting. What matters here is that it was written on its own.
+    with pytest.raises(ParseWaveError, match="Season discovery failed"):
+        pipeline.parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["competition"],
+            settings=_settings("current"),
+        )
+
+    # 9 flushes when the broken page arrives, 12 goes through the single-page
+    # path (so it never appears as a cohort), 13 follows on its own.
+    assert generic.batch_sizes == [1, 1]
+    assert len(generic.pages) == 3
+
+
 def test_current_history_parse_uses_exact_source_season_and_opaque_ids(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
@@ -5901,6 +6106,50 @@ def test_validation_treats_failed_targets_as_returned_to_queue(tmp_path):
 
     pipeline.validate_and_finish(str(uuid.uuid4()))
 
+    assert "finish:True" in control.events
+
+
+def test_a_quarantine_alongside_recorded_pages_still_finishes_green(tmp_path):
+    """A retired page must not cost the run that collected everything else.
+
+    A contract quarantine is a verdict about the SOURCE's published shape —
+    the page will not become parseable by refetching it — so the pages the
+    same wave did record are the run's real output.  Reddening the gate over
+    it produced the 15-16.08 streaks of up to 12 red runs with work recorded,
+    each one buying a fresh cooldown and a fresh paid bootstrap (backlog A4).
+
+    The two halves are pinned separately elsewhere — the wave reports a
+    quarantine without a failure, and validation tolerates a terminally failed
+    target — but nothing tied them together at the gate, which is the level
+    the driver actually reads.
+    """
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    base_summary = control.get_run_summary(str(uuid.uuid4()))
+    control.get_run_summary = lambda _, **__: {
+        **base_summary,
+        # The 15-16.08 shape exactly: a cohort that mostly landed, one target
+        # retired by the source's own shape and one that terminally failed.
+        "target_counts": {"succeeded": 24, "failed": 1},
+        "traffic_totals": {"warm_http_success_rate": 1.0},
+    }
+    control.frontier["fbref:season:11:2025-2026"] = {
+        "state": "retry",
+        "last_content_hash": "deadbeef",
+    }
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    assert control.quarantine_contract_rejected_target(
+        "fbref:season:11:2025-2026",
+        content_hash="deadbeef",
+        reason="schedule_season_mismatch",
+    )
+    pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert (
+        control.frontier["fbref:season:11:2025-2026"]["state"] == "quarantined"
+    )
     assert "finish:True" in control.events
 
 
@@ -8567,36 +8816,52 @@ def test_1501_pages_roll_over_into_multiple_exact_persistent_sessions():
 def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
     tmp_path,
 ):
+    """The wave ends only on evidence about the source, not about one page.
+
+    A single target that uses up its re-solves is deferred and the wave keeps
+    working (see the stubborn-page test below).  What ends the wave is
+    MAX_CLEARANCE_EXHAUSTED_TARGETS of them back to back with no page fetched
+    in between -- then the pages it never touched go back untouched.
+    """
     raw = _raw_store(tmp_path)
     control = BudgetAwareFakeControl(raw)
     control.run.update(
-        request_limit=120,
-        requests_used=35,
+        request_limit=400,
         byte_limit=100 * 1024 * 1024,
     )
     run_id = str(uuid.UUID(int=1))
 
-    def make_lease(attempt, target, refresh, epoch):
+    def make_lease(number, epoch=1):
         return TargetLease(
-            attempt_id=str(uuid.UUID(int=attempt)),
+            attempt_id=str(uuid.UUID(int=7000 + number * 10 + epoch)),
             run_id=run_id,
-            target_id=target,
-            logical_refresh_id=str(uuid.UUID(int=refresh)),
-            canonical_url="https://fbref.com/en/comps/9/history/x-Seasons",
+            target_id=f"fbref:competition:{number}",
+            logical_refresh_id=str(uuid.UUID(int=8000 + number)),
+            canonical_url=(
+                f"https://fbref.com/en/comps/{number}/history/x-Seasons"
+            ),
             page_kind="competition",
-            source_ids={"competition_id": "9"},
-            claim_token=str(uuid.UUID(int=attempt + 100)),
+            source_ids={"competition_id": str(number)},
+            claim_token=str(uuid.UUID(int=9000 + number * 10 + epoch)),
             lease_epoch=epoch,
             attempt_number=epoch,
             leased_by="worker-1",
             lease_expires_at=NOW + timedelta(minutes=10),
         )
 
-    first = make_lease(71, "fbref:competition:9", 81, 1)
-    untouched = make_lease(72, "fbref:competition:12", 82, 1)
-    retry_one = make_lease(73, first.target_id, 81, 2)
-    retry_two = make_lease(74, first.target_id, 81, 3)
-    claims = iter(([first, untouched], [retry_one], [retry_two]))
+    rejected = [make_lease(number) for number in (9, 12, 13)]
+    untouched = make_lease(14)
+    first = rejected[0]
+    claims = iter(
+        (
+            [*rejected, untouched],
+            *(
+                [make_lease(number, epoch)]
+                for number in (9, 12, 13)
+                for epoch in (2, 3)
+            ),
+        )
+    )
     control.claim_targets = lambda *args, **kwargs: next(claims)
     factories = 0
 
@@ -8627,7 +8892,7 @@ def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
             page_kinds=["competition"],
             settings=PipelineSettings(
                 run_type="current",
-                request_limit=120,
+                request_limit=400,
                 byte_limit=100 * 1024 * 1024,
                 shard_size=4,
                 request_reservation_bytes=4 * 1024 * 1024,
@@ -8635,19 +8900,187 @@ def test_session_refresh_exhaustion_requeues_untouched_without_false_failures(
             ),
         )
 
-    assert factories == 3
-    assert control.run["requests_used"] == 98
+    # Two re-solves per exhausted target, and the wave stops at the third such
+    # target -- 9 rejected attempts, never a browser per remaining page.
     assert control.run["requests_reserved"] == 0
-    assert len(control.reservations) == 3
-    assert len(control.failed) == 3
-    assert all(
-        lease.logical_refresh_id == first.logical_refresh_id
-        for lease, _ in control.failed
+    assert len(control.failed) == 3 * (MAX_CLEARANCE_EXHAUSTED_TARGETS)
+    assert (
+        sum(
+            1
+            for lease, _ in control.failed
+            if lease.logical_refresh_id == first.logical_refresh_id
+        )
+        == 3
     )
     assert control.events.count(f"requeue:{untouched.target_id}") == 1
     assert not any(
         lease.target_id == untouched.target_id
         for lease, _ in control.failed
+    )
+
+
+def test_one_stubborn_page_is_deferred_instead_of_discarding_the_wave(
+    tmp_path,
+):
+    """Live 17.08: 71 targets met a 403, 58 of them came back on the first
+    re-solve -- the fresh clearance is good, the page is not.  Four used up
+    their re-solves, and each one discarded the whole wave it was in, so the
+    pages already fetched never reached publication.  A target that cannot be
+    had is a target-level failure: defer it with backoff and keep fetching.
+    """
+
+    raw = _raw_store(tmp_path)
+    control = BudgetAwareFakeControl(raw)
+    control.run.update(
+        request_limit=400,
+        byte_limit=100 * 1024 * 1024,
+    )
+    run_id = str(uuid.UUID(int=1))
+
+    def make_lease(number, epoch=1):
+        return TargetLease(
+            attempt_id=str(uuid.UUID(int=5000 + number * 10 + epoch)),
+            run_id=run_id,
+            target_id=f"fbref:competition:{number}",
+            logical_refresh_id=str(uuid.UUID(int=6000 + number)),
+            canonical_url=(
+                f"https://fbref.com/en/comps/{number}/history/x-Seasons"
+            ),
+            page_kind="competition",
+            source_ids={"competition_id": str(number)},
+            claim_token=str(uuid.UUID(int=6500 + number * 10 + epoch)),
+            lease_epoch=epoch,
+            attempt_number=epoch,
+            leased_by="worker-1",
+            lease_expires_at=NOW + timedelta(minutes=10),
+        )
+
+    stubborn = make_lease(9)
+    claims = iter(
+        (
+            [stubborn, make_lease(12), make_lease(13)],
+            [make_lease(9, 2)],
+            [make_lease(9, 3)],
+        )
+    )
+    control.claim_targets = lambda *args, **kwargs: next(claims)
+
+    class StubbornPageFetcher:
+        """403s one URL on every clearance, serves every other page."""
+
+        def __init__(self):
+            self.session_fetches = 0
+            self.reset_calls = 0
+
+        def __enter__(self):
+            control.events.append("fetcher_enter")
+            return self
+
+        def __exit__(self, *args):
+            control.events.append("fetcher_exit")
+
+        def ensure_clearance(self):
+            control.events.append("browser")
+            self.session_fetches = 0
+            return True
+
+        def reset_clearance(self):
+            self.reset_calls += 1
+
+        def fetch(self, url, **kwargs):
+            self.session_fetches += 1
+            control.events.append("http")
+            if "/comps/9/" in url:
+                raise FetchError(
+                    "FBref warm session was rejected",
+                    error_class="http_status",
+                    http_status=403,
+                    wire_bytes=200,
+                    browser_document_bytes=500,
+                    browser_asset_bytes=100,
+                    browser_requests=20,
+                    browser_bootstrap_attempts=1,
+                    target_requests=1,
+                    http_status_history=(403,),
+                    latency_ms=100,
+                )
+            body = b"<html>ok</html>"
+            browser_requests = 20 if self.session_fetches == 1 else 0
+            return FetchResponse(
+                url=url,
+                status_code=200,
+                body=body,
+                headers={"etag": '"v1"'},
+                latency_ms=10,
+                http_wire_bytes=len(body) + 120,
+                decoded_html_bytes=len(body),
+                http_requests=1,
+                http_status_history=(200,),
+                browser_document_bytes=(500 if browser_requests else 0),
+                browser_asset_bytes=(100 if browser_requests else 0),
+                browser_requests=browser_requests,
+                browser_bootstrap_attempts=(1 if browser_requests else 0),
+            )
+
+    fetcher = StubbornPageFetcher()
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *args: fetcher,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="worker-1",
+        page_kinds=["competition"],
+        settings=PipelineSettings(
+            run_type="current",
+            request_limit=400,
+            byte_limit=100 * 1024 * 1024,
+            shard_size=4,
+            request_reservation_bytes=4 * 1024 * 1024,
+            domain_interval_seconds=DEFAULT_DOMAIN_INTERVAL_SECONDS,
+        ),
+    )
+
+    # The pages behind the stubborn one are the whole point: they were fetched
+    # and the wave carries no failure, so its run can still publish.
+    assert result.fetched == 2
+    assert result.failures == []
+    assert result.deferred_dead_clearance == 1
+    assert result.requeued_session_exhaustion == 0
+    assert result.budget_exhausted is False
+
+    stubborn_failures = [
+        kwargs
+        for lease, kwargs in control.failed
+        if lease.target_id == stubborn.target_id
+    ]
+    assert len(stubborn_failures) == MAX_CONSECUTIVE_CLEARANCE_REFRESHES + 1
+    # The first two keep the target in this run; the last returns it with
+    # backoff instead of buying it another paid session here.
+    assert [
+        kwargs.get("session_retry", False) for kwargs in stubborn_failures
+    ] == [True, True, False]
+    # requeue=True is what drops the target from this run: it closes the run
+    # target as 'skipped', which claim_targets will not take again.  It also
+    # clears retry_after, so no delay may be claimed here -- pinned by
+    # test_requeued_failure_clears_backoff_and_skips_this_runs_target.
+    assert stubborn_failures[-1]["requeue"] is True
+    assert stubborn_failures[-1]["permanent"] is False
+    assert (
+        stubborn_failures[-1]["retry_delay_seconds"]
+        == CLEARANCE_EXHAUSTED_RETRY_DELAY_SECONDS
+        == 0
+    )
+    # The wave never asks for the deferred target again: the claim iterator is
+    # exhausted, so a third claim would raise StopIteration instead.
+    assert next(claims, None) is None
+    assert not any(
+        lease.target_id != stubborn.target_id for lease, _ in control.failed
     )
 
 

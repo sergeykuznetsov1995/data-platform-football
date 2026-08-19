@@ -34,6 +34,10 @@ from scrapers.fbref.settings import (
 
 
 RESULT_PREFIX = "FBREF_LIVE_WAVES_RESULT:"
+# Slice of the meter's allowance this run never claims, so the warm-HTTP lease
+# extension still fits after the meter booked spend the fetcher cannot see
+# (64 KiB per collapsed lease, see the note at its use site) (#1188).
+LEASE_EXTENSION_RACE_HEADROOM_BYTES = 64 * 1024 * 1024
 _PR_SET_PDEATHSIG = 1
 
 
@@ -375,10 +379,32 @@ def _run(args: argparse.Namespace) -> int:
             else 1
         ),
     )
-    provider_byte_budget = min(
-        current_run_remaining,
-        int(meter["daily_remaining_bytes"]),
+    # Claiming the whole remaining allowance makes the warm-HTTP lease extension
+    # unsatisfiable, and the runner turns the meter's 409 into
+    # hard_transport_policy — the wave dies mid-flight with its paid Cloudflare
+    # bootstrap burnt (#1188).  The missing amount is NOT this run's own spend
+    # (that cancels out: the meter adds the lease's own total back into the
+    # ceiling) and not a neighbour's (the gateway serialises FBref with
+    # --max-active-leases 1; all ten observed deaths had zero foreign spend).
+    # It is what the meter books after the fact and the fetcher never observes:
+    # a lease that collapses is charged its whole retained reservation under the
+    # 'uncertain-read-ahead' pseudo-host (filter_proxy.py::_reap_expired_leases),
+    # plus reservations the health endpoint's remaining does not subtract while
+    # the extension ceiling does.  Each reader reserves at most 64 KiB, but a
+    # lease may hold several at once, so this is a bound on the observed drift
+    # (65 536 B in every death sampled over 2026-08-15..17), NOT a proof of the
+    # worst case.  The headroom below is therefore deliberate slack, not an
+    # exact figure — the real fix is to ask the meter for its current ceiling at
+    # the phase boundary instead of predicting it (#1188).  It hangs on
+    # whichever term binds, because that book-keeping lands in the daily, dagrun
+    # and per-URL counters alike, and it is clamped to a quarter so a nearly
+    # spent budget still leaves a usable, non-zero cap.
+    daily_remaining = max(0, int(meter["daily_remaining_bytes"]))
+    shared_remaining = min(current_run_remaining, daily_remaining)
+    race_headroom = min(
+        LEASE_EXTENSION_RACE_HEADROOM_BYTES, shared_remaining // 4
     )
+    provider_byte_budget = shared_remaining - race_headroom
     pipeline = FBrefPipeline.from_env()
     pipeline.finalization_guard = _defer_sigterm_during_finalization
     pipeline.fetcher_factory = (

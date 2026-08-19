@@ -102,9 +102,6 @@ class TestFBrefBackfillTopology:
             "acquire_publication_lock"
         }
         assert tasks["acquire_publication_lock"].downstream_task_ids == {
-            "seed_historical_seasons"
-        }
-        assert tasks["seed_historical_seasons"].downstream_task_ids == {
             "capture_raw_baseline"
         }
         assert tasks["capture_raw_baseline"].downstream_task_ids == {
@@ -113,6 +110,9 @@ class TestFBrefBackfillTopology:
         recovery = tasks["recover_raw_before_fetch"]
         assert recovery.python_callable.__name__ == "run_recovery_wave"
         assert recovery.downstream_task_ids == {
+            "seed_historical_seasons"
+        }
+        assert tasks["seed_historical_seasons"].downstream_task_ids == {
             "run_live_waves"
         }
         live = tasks["run_live_waves"]
@@ -174,6 +174,40 @@ class TestFBrefBackfillTopology:
         assert trigger._captured_kwargs["execution_date"] == "{{ ti.start_date }}"
         assert trigger._captured_kwargs["conf"]["trigger_xref"] is False
         assert trigger.downstream_task_ids == {"release_publication_lock"}
+
+    def test_raw_recovery_drains_before_the_historical_seed(self, loaded_dag):
+        """A seeded season must never be judged on raw the seed itself unhid.
+
+        The seed reopens a scope-quarantined season and opens a 'pending'
+        run_target for it; the same step makes that target's days-old raw
+        visible to the recovery drain, which may retire the target on those
+        stale bytes.  A contract quarantine touches only page_frontier, so the
+        run_target stays open, the wave gate counts an unclaimable target as
+        unfinished, and the run raises before its first request -- the zero-work
+        runs that stopped the history campaign on 2026-08-17.  Draining before
+        the seed means no run_target is open when such a verdict lands, so the
+        wave keeps working.
+
+        Scope of this test: DAG edges only.  It cannot see the second path to
+        the same verdict -- a live wave adopting the same stale raw for a seeded
+        target (0 requests, run_target closed by complete_fetch before the
+        parse).  That path needs the page-identity check tracked in #1186, and
+        catching it offline needs the fixture-driven replay harness of D1.
+        """
+
+        _, tasks = loaded_dag
+        assert tasks["capture_raw_baseline"].upstream_task_ids == {
+            "acquire_publication_lock"
+        }
+        assert tasks["recover_raw_before_fetch"].upstream_task_ids == {
+            "capture_raw_baseline"
+        }
+        assert tasks["seed_historical_seasons"].upstream_task_ids == {
+            "recover_raw_before_fetch"
+        }
+        assert tasks["run_live_waves"].upstream_task_ids == {
+            "seed_historical_seasons"
+        }
 
     def test_no_manual_league_allowlist(self, loaded_dag):
         module, _ = loaded_dag

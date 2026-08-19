@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call as mock_call
 
 import pytest
+import urllib3
 
 from scrapers.fbref import camoufox_fetch as camoufox_runtime
 from scrapers.fbref.camoufox_fetch import (
@@ -20,6 +21,7 @@ from scrapers.fbref.camoufox_fetch import (
     GEOIP_BYTE_RESERVATION_BYTES,
     GEOIP_LOOKUP_URL,
     GEOIP_REQUEST_RESERVATION,
+    GeoIPTransportError,
     UNEXPECTED_BROWSER_NETWORK_RESERVATION_BYTES,
     _navigation_error_type,
     is_cloudflare_blocked,
@@ -1580,6 +1582,308 @@ def test_preemptive_proxy_auth_rejects_bad_lease_before_network(proxy):
     assert stats["network_policy_failure"] == "invalid_proxy_credential"
 
 
+def test_geoip_resolver_names_the_transport_failure_it_wraps(monkeypatch):
+    """The wrapper must not flatten every transport failure into one string.
+
+    The verdict ends the wave through hard_transport_policy and only the
+    caller's log survives, so a dead pool exit (ProxyError), a refused CONNECT
+    and a plain read timeout have to stay distinguishable (#1188).
+    """
+
+    import requests
+
+    session = MagicMock()
+    session.get.side_effect = requests.exceptions.ProxyError(
+        "Cannot connect to proxy: 10001 refused"
+    )
+    monkeypatch.setattr(requests, "Session", lambda: session)
+
+    with pytest.raises(RuntimeError) as raised:
+        resolve_geoip_without_redirects({
+            "server": "http://fbref_proxy_filter:8900",
+            "username": "lease",
+            "password": "lease-token",
+        })
+
+    assert "ProxyError" in str(raised.value)
+    assert "10001 refused" in str(raised.value)
+    assert "lease-token" not in str(raised.value)
+
+
+def test_geoip_failure_is_logged_with_its_exception_type(caplog):
+    """A geo-IP failure ends the whole wave, so name what actually failed.
+
+    The verdict travels as `hard_transport_policy`, which stops the wave and
+    burns its paid Cloudflare bootstrap (#1188).  Logging only "lookup failed"
+    makes a dead pool exit indistinguishable from a transient timeout, so the
+    exception type has to reach the log.
+
+    This covers the logging link only; that the resolver preserves the original
+    transport failure at all is covered by
+    ``test_geoip_resolver_names_the_transport_failure_it_wraps``.
+    """
+
+    import logging
+
+    def resolver(_proxy):
+        raise TimeoutError("read timed out")
+
+    transport = CamoufoxFbrefTransport(
+        proxy={
+            "server": "http://fbref_proxy_filter:8900",
+            "username": "lease",
+            "password": "lease-token",
+        },
+        max_network_requests=10,
+        geoip_resolver=resolver,
+        geoip_database_check=lambda: None,
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="scrapers.fbref.camoufox_fetch"
+    ):
+        with pytest.raises(TimeoutError):
+            transport._start()
+
+    assert transport.traffic_stats()["geoip_lookup_failed"] is True
+    assert "TimeoutError" in caplog.text
+    assert "read timed out" in caplog.text
+
+
+def test_unreachable_exit_and_answered_policy_breach_are_different_failures(
+    monkeypatch,
+):
+    """An exit that never answered is a dead lease; one that answered is not.
+
+    Both used to raise the same RuntimeError, so the wave could not tell a
+    re-solvable dead proxy from real geo-policy evidence and discarded itself
+    either way.  Measured 17-18.08: 3 of 3 geo-IP deaths with a recorded type
+    were ProxyError "Cannot connect to proxy" (#1188).
+    """
+
+    import requests
+
+    unreachable = MagicMock()
+    unreachable.get.side_effect = requests.exceptions.ProxyError(
+        "Cannot connect to proxy: 10001 refused"
+    )
+    monkeypatch.setattr(requests, "Session", lambda: unreachable)
+    with pytest.raises(GeoIPTransportError):
+        resolve_geoip_without_redirects({
+            "server": "http://fbref_proxy_filter:8900",
+            "username": "lease",
+            "password": "lease-token",
+        })
+
+    answered = MagicMock()
+    response = MagicMock()
+    response.status_code = 407
+    answered.get.return_value = response
+    monkeypatch.setattr(requests, "Session", lambda: answered)
+    with pytest.raises(RuntimeError) as raised:
+        resolve_geoip_without_redirects({
+            "server": "http://fbref_proxy_filter:8900",
+            "username": "lease",
+            "password": "lease-token",
+        })
+    assert not isinstance(raised.value, GeoIPTransportError)
+
+
+def _geoip_session_whose_body_raises(read_error):
+    session = MagicMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.headers = {"content-length": "11"}
+    response.raw.read.side_effect = read_error
+    session.get.return_value = response
+    return session
+
+
+_GEOIP_PROXY = {
+    "server": "http://fbref_proxy_filter:8900",
+    "username": "lease",
+    "password": "lease-token",
+}
+
+
+@pytest.mark.parametrize(
+    "read_error",
+    [
+        pytest.param(
+            urllib3.exceptions.ReadTimeoutError(
+                None, "https://api.ipify.org", "Read timed out."
+            ),
+            id="socket-timeout",
+        ),
+        pytest.param(
+            urllib3.exceptions.ProtocolError(
+                "Connection broken: InvalidChunkLength"
+            ),
+            id="truncated-body",
+        ),
+        pytest.param(
+            urllib3.exceptions.IncompleteRead(3, 8),
+            id="short-read",
+        ),
+        pytest.param(
+            urllib3.exceptions.SSLError("TLS record layer failure"),
+            id="tls-abort",
+        ),
+    ],
+)
+def test_a_tunnel_that_dies_mid_body_is_still_an_unreachable_exit(
+    monkeypatch, read_error
+):
+    """`requests` does not wrap the streamed body, so urllib3 leaks through.
+
+    The lookup reads the payload off ``response.raw``, which is the one call in
+    this function `requests` never wraps.  A tunnel that dies after the headers
+    therefore arrives as a bare urllib3 error, misses ``RequestException`` and
+    used to be filed as an *answered* geo-policy breach — the exact confusion
+    this pair of verdicts exists to prevent.
+
+    Every case is enumerated because they are four separate classes on the
+    runtime that actually runs the wave (urllib3 1.26.20 in
+    /opt/legacy-scraper-venv): a single sample would keep passing while three
+    of the four handlers were missing (#1188).
+    """
+
+    import requests
+
+    monkeypatch.setattr(
+        requests,
+        "Session",
+        lambda: _geoip_session_whose_body_raises(read_error),
+    )
+    with pytest.raises(GeoIPTransportError):
+        resolve_geoip_without_redirects(_GEOIP_PROXY)
+
+
+@pytest.mark.parametrize(
+    "declared_encoding",
+    [
+        pytest.param(None, id="header-absent"),
+        pytest.param("identity", id="header-identity"),
+        pytest.param("IDENTITY", id="header-identity-uppercased"),
+    ],
+)
+def test_a_body_cut_short_without_an_exception_is_still_a_dead_tunnel(
+    monkeypatch, declared_encoding
+):
+    """The quietest truncation of all: short bytes and no exception at all.
+
+    This one reads a genuine ``urllib3.HTTPResponse`` instead of injecting a
+    ready-made error, because that is the whole point — on urllib3 1.26.20,
+    the runtime the wave actually uses, ``enforce_content_length`` is off and
+    a connection cut mid-body simply returns what arrived.  Nothing is raised,
+    so every exception handler above is blind to it and the truncated "1.2"
+    reaches the parser, which rejects it as an invalid *answer* and ends the
+    wave for a geo-policy breach that never happened (#1188).
+
+    The encodings are enumerated because only a *real* coding may switch the
+    length comparison off: "identity" is the spelled-out absence of one, and
+    an exit that spells it out must not thereby buy itself an exemption.
+    """
+
+    import io
+
+    import requests
+
+    body_headers = {"content-length": "11"}
+    if declared_encoding is not None:
+        body_headers["content-encoding"] = declared_encoding
+    truncated = urllib3.HTTPResponse(
+        body=io.BytesIO(b"1.2"),
+        headers=body_headers,
+        status=200,
+        preload_content=False,
+        # Pinned, not inherited: urllib3 2.x turns this on and raises a
+        # ProtocolError before the short body is ever returned, so a test run
+        # on a newer library than production would take the already-covered
+        # exception path and leave the length check untested.
+        enforce_content_length=False,
+    )
+    session = MagicMock()
+    response = MagicMock()
+    response.status_code = 200
+    response.headers = dict(body_headers)
+    response.raw = truncated
+    session.get.return_value = response
+    monkeypatch.setattr(requests, "Session", lambda: session)
+
+    with pytest.raises(GeoIPTransportError) as raised:
+        resolve_geoip_without_redirects(_GEOIP_PROXY)
+    assert "3 of 11" in str(raised.value)
+
+
+def test_a_body_that_arrived_and_would_not_decode_stays_an_answer(monkeypatch):
+    """DecodeError is evidence about the answer, not about the transport.
+
+    It is the one urllib3 read failure that proves the exit *did* respond, so
+    it must keep ending the wave as a geo-policy breach instead of buying a
+    fresh proxy and a second paid lease (#1188).
+    """
+
+    import requests
+
+    monkeypatch.setattr(
+        requests,
+        "Session",
+        lambda: _geoip_session_whose_body_raises(
+            urllib3.exceptions.DecodeError("failed to decode content-encoding")
+        ),
+    )
+    with pytest.raises(urllib3.exceptions.DecodeError):
+        resolve_geoip_without_redirects(_GEOIP_PROXY)
+
+
+def test_transport_reports_whether_the_geoip_exit_was_reachable():
+    """The latch alone cannot tell the caller which verdict it earned.
+
+    ``geoip_lookup_failed`` still bars an automatic retry inside this transport
+    (one paid lookup per lease); the separate reachability flag is what lets the
+    wave re-solve on a fresh proxy instead of dying (#1188).
+    """
+
+    def unreachable(_proxy):
+        raise GeoIPTransportError("Camoufox geo-IP lookup failed: ProxyError: x")
+
+    transport = CamoufoxFbrefTransport(
+        proxy={
+            "server": "http://fbref_proxy_filter:8900",
+            "username": "lease",
+            "password": "lease-token",
+        },
+        max_network_requests=10,
+        geoip_resolver=unreachable,
+        geoip_database_check=lambda: None,
+    )
+    with pytest.raises(GeoIPTransportError):
+        transport._start()
+    stats = transport.traffic_stats()
+    assert stats["geoip_lookup_failed"] is True
+    assert stats["geoip_transport_failure"] is True
+    assert transport.traffic_delta()["geoip_transport_failure"] is True
+
+    def answered_wrong(_proxy):
+        raise RuntimeError("Camoufox geo-IP response is invalid")
+
+    policy = CamoufoxFbrefTransport(
+        proxy={
+            "server": "http://fbref_proxy_filter:8900",
+            "username": "lease",
+            "password": "lease-token",
+        },
+        max_network_requests=10,
+        geoip_resolver=answered_wrong,
+        geoip_database_check=lambda: None,
+    )
+    with pytest.raises(RuntimeError):
+        policy._start()
+    assert policy.traffic_stats()["geoip_lookup_failed"] is True
+    assert policy.traffic_stats()["geoip_transport_failure"] is False
+
+
 def test_geoip_resolver_is_one_bounded_attempt_without_redirects(monkeypatch):
     import requests
 
@@ -1605,6 +1909,10 @@ def test_geoip_resolver_is_one_bounded_attempt_without_redirects(monkeypatch):
     assert call.kwargs["allow_redirects"] is False
     assert call.kwargs["stream"] is True
     assert call.kwargs["headers"]["Connection"] == "close"
+    # Not cosmetic: a compressed body would make the decoded length
+    # incomparable with the declared one, and that comparison is the only
+    # detector this lookup has for a body cut short without an exception.
+    assert call.kwargs["headers"]["Accept-Encoding"] == "identity"
     assert isinstance(call.kwargs["timeout"], tuple)
     response.raw.read.assert_called_once_with(65, decode_content=True)
     response.close.assert_called_once_with()

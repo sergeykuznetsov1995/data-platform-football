@@ -60,9 +60,15 @@ def _page_item(identity: str, *, page=None):
 
 
 def _merge_sql(manager):
+    # The generic MERGE goes through the committing path, the same one the
+    # typed writer uses, so an Iceberg commit conflict retries instead of
+    # dropping the cohort.
     return [
         call.args[0]
-        for call in manager._execute.call_args_list
+        for call in (
+            manager._execute.call_args_list
+            + manager._execute_committing.call_args_list
+        )
         if call.args and call.args[0].startswith("MERGE INTO")
     ]
 
@@ -227,11 +233,7 @@ def test_generic_writer_merges_by_identity_and_commits_page_manifest_last():
 
     assert counts == {"cells": 1, "tables": 1, "manifest": 1}
     assert manager.create_iceberg_table.call_count == 3
-    merge_sql = [
-        call.args[0]
-        for call in manager._execute.call_args_list
-        if call.args and call.args[0].startswith("MERGE INTO")
-    ]
+    merge_sql = _merge_sql(manager)
     assert len(merge_sql) == 3
     assert f"iceberg.bronze.{PAGE_MANIFEST_TABLE}" in merge_sql[-1]
     assert all("WHEN MATCHED THEN UPDATE" in sql for sql in merge_sql)
@@ -309,3 +311,78 @@ def test_non_uuid_stage_identity_is_stable_and_identifier_safe():
     assert token.startswith("id_")
     assert len(token) == 35
     assert token.replace("_", "").isalnum()
+
+
+def _statement_count(manager) -> int:
+    """Manager operations, which is not the same as Trino statements.
+
+    ``insert_dataframe`` fans out into as many INSERTs as the row bytes need
+    (SQL_BYTE_BUDGET, trino_manager.py), so the cell payload keeps scaling with
+    the data whatever the cohort. What cohorting removes is the fixed cost
+    around it -- stage create/drop, count, merge -- and the two small tables
+    that carry one or two rows per page.
+    """
+
+    return (
+        len(manager._execute.call_args_list)
+        + len(manager._execute_committing.call_args_list)
+        + len(manager.insert_dataframe.call_args_list)
+        + len(manager.drop_table.call_args_list)
+        + len(manager.create_iceberg_table.call_args_list)
+    )
+
+
+@pytest.mark.parametrize("cohort_size", [2, 8, 15])
+def test_a_cohort_costs_one_pages_worth_of_statements(cohort_size):
+    """The whole point of cohorting: statements stop scaling with pages.
+
+    A page written alone costs six statements per generic table -- drop stage,
+    create stage, insert, count, merge, drop stage -- and it has three tables,
+    two of which carry a single row.  Live evidence for what that costs:
+    history_20260818T015855Z persisted 15 pages and spent 3485 HTTP round
+    trips on Trino while fetching for about a minute.
+    """
+
+    items = [_page_item(str(index)) for index in range(cohort_size)]
+
+    one_by_one = _manager()
+    writer = FBrefGenericBronzeWriter(one_by_one)
+    for item in items:
+        writer.persist_pages([item])
+    alone = _statement_count(one_by_one)
+
+    cohorted = _manager()
+    FBrefGenericBronzeWriter(cohorted).persist_pages(items)
+    together = _statement_count(cohorted)
+
+    # Six statements per generic table -- drop stage, create stage, insert,
+    # count, merge, drop stage -- and three tables. The table preflight is
+    # cached per writer, so it is paid once either way.
+    per_page = 6 * 3
+    preflight = 3
+    assert together == per_page + preflight
+    assert alone == per_page * cohort_size + preflight
+    assert len(_merge_sql(cohorted)) == 3
+    assert len(_merge_sql(one_by_one)) == 3 * cohort_size
+
+
+def test_generic_merge_takes_the_committing_path():
+    """A commit conflict has to retry, not cost the cohort.
+
+    ``_execute`` raises the Iceberg conflict straight out of persist_pages,
+    and the caller's only recovery is to write the cohort one page at a time
+    -- which is exactly the cost cohorting removes. The typed writer has been
+    on the committing path all along; the generic one was not.
+    """
+
+    manager = _manager()
+
+    FBrefGenericBronzeWriter(manager).persist_pages(
+        [_page_item("a"), _page_item("b")]
+    )
+
+    assert manager._execute_committing.call_count == 3
+    assert not any(
+        call.args and str(call.args[0]).startswith("MERGE INTO")
+        for call in manager._execute.call_args_list
+    )
