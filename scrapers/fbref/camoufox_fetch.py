@@ -282,9 +282,14 @@ def resolve_geoip_without_redirects(proxy: Optional[dict]) -> str:
             )
             if len(payload) > GEOIP_RESPONSE_LIMIT_BYTES:
                 raise RuntimeError("Camoufox geo-IP response is oversized")
+            encoding = str(
+                response.headers.get("content-encoding") or ""
+            ).strip().lower()
             if (
                 raw_length
-                and not str(response.headers.get("content-encoding") or "").strip()
+                # "identity" is the spelled-out absence of a coding, so it must
+                # not switch the detector off the way gzip has to.
+                and encoding in ("", "identity")
                 and len(payload) < int(raw_length)
             ):
                 # urllib3 1.26 — the runtime the wave actually uses — leaves

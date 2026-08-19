@@ -1759,8 +1759,16 @@ def test_a_tunnel_that_dies_mid_body_is_still_an_unreachable_exit(
         resolve_geoip_without_redirects(_GEOIP_PROXY)
 
 
+@pytest.mark.parametrize(
+    "declared_encoding",
+    [
+        pytest.param(None, id="header-absent"),
+        pytest.param("identity", id="header-identity"),
+        pytest.param("IDENTITY", id="header-identity-uppercased"),
+    ],
+)
 def test_a_body_cut_short_without_an_exception_is_still_a_dead_tunnel(
-    monkeypatch,
+    monkeypatch, declared_encoding
 ):
     """The quietest truncation of all: short bytes and no exception at all.
 
@@ -1771,15 +1779,22 @@ def test_a_body_cut_short_without_an_exception_is_still_a_dead_tunnel(
     so every exception handler above is blind to it and the truncated "1.2"
     reaches the parser, which rejects it as an invalid *answer* and ends the
     wave for a geo-policy breach that never happened (#1188).
+
+    The encodings are enumerated because only a *real* coding may switch the
+    length comparison off: "identity" is the spelled-out absence of one, and
+    an exit that spells it out must not thereby buy itself an exemption.
     """
 
     import io
 
     import requests
 
+    body_headers = {"content-length": "11"}
+    if declared_encoding is not None:
+        body_headers["content-encoding"] = declared_encoding
     truncated = urllib3.HTTPResponse(
         body=io.BytesIO(b"1.2"),
-        headers={"content-length": "11"},
+        headers=body_headers,
         status=200,
         preload_content=False,
         # Pinned, not inherited: urllib3 2.x turns this on and raises a
@@ -1791,7 +1806,7 @@ def test_a_body_cut_short_without_an_exception_is_still_a_dead_tunnel(
     session = MagicMock()
     response = MagicMock()
     response.status_code = 200
-    response.headers = {"content-length": "11"}
+    response.headers = dict(body_headers)
     response.raw = truncated
     session.get.return_value = response
     monkeypatch.setattr(requests, "Session", lambda: session)
@@ -1894,6 +1909,10 @@ def test_geoip_resolver_is_one_bounded_attempt_without_redirects(monkeypatch):
     assert call.kwargs["allow_redirects"] is False
     assert call.kwargs["stream"] is True
     assert call.kwargs["headers"]["Connection"] == "close"
+    # Not cosmetic: a compressed body would make the decoded length
+    # incomparable with the declared one, and that comparison is the only
+    # detector this lookup has for a body cut short without an exception.
+    assert call.kwargs["headers"]["Accept-Encoding"] == "identity"
     assert isinstance(call.kwargs["timeout"], tuple)
     response.raw.read.assert_called_once_with(65, decode_content=True)
     response.close.assert_called_once_with()
