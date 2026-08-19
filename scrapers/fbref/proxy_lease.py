@@ -521,6 +521,36 @@ class FBrefProxyLeaseClient:
             stats.close_complete,
         )
 
+    @staticmethod
+    def _idle_mismatches(
+        stats: FBrefLeaseStats, expected_tunnels: int
+    ) -> list[str]:
+        """Name every condition the idle proof rejects, with its reading."""
+
+        if expected_tunnels == 0:
+            observed = (
+                ("active_tunnels", stats.active_tunnels),
+                ("active_provider_readers", stats.active_provider_readers),
+                ("reserved_bytes", stats.reserved_bytes),
+                ("provider_reserved_bytes", stats.provider_reserved_bytes),
+            )
+            return [
+                f"{name}={value}!=0" for name, value in observed if value != 0
+            ]
+        mismatches = []
+        if stats.active_tunnels != 1:
+            mismatches.append(f"active_tunnels={stats.active_tunnels}!=1")
+        if stats.active_provider_readers != 1:
+            mismatches.append(
+                f"active_provider_readers={stats.active_provider_readers}!=1"
+            )
+        if stats.reserved_bytes != stats.provider_reserved_bytes:
+            mismatches.append(
+                f"reserved_bytes={stats.reserved_bytes}"
+                f"!=provider_reserved_bytes={stats.provider_reserved_bytes}"
+            )
+        return mismatches
+
     def wait_idle(
         self,
         lease: FBrefProxyLease,
@@ -535,10 +565,12 @@ class FBrefProxyLeaseClient:
         deadline = self._monotonic() + self.drain_timeout_seconds
         previous: Optional[FBrefLeaseStats] = None
         stable_samples = 0
+        samples = 0
         last_up = -1
         last_down = -1
         while True:
             stats = self.stats(lease, expected=expected)
+            samples += 1
             if stats.up_bytes < last_up or stats.down_bytes < last_down:
                 raise FBrefProxyLeaseError(
                     "FBref paid proxy idle counter moved backwards"
@@ -555,13 +587,9 @@ class FBrefProxyLeaseClient:
                 raise FBrefProxyLeaseError(
                     "FBref paid proxy idle proof found terminal or staged work"
                 )
+            mismatches = self._idle_mismatches(stats, expected_tunnels)
             if expected_tunnels == 0:
-                impossible = (
-                    stats.active_tunnels != 0
-                    or stats.active_provider_readers != 0
-                    or stats.reserved_bytes != 0
-                    or stats.provider_reserved_bytes != 0
-                )
+                impossible = bool(mismatches)
                 idle = not impossible
             else:
                 idle = (
@@ -569,14 +597,15 @@ class FBrefProxyLeaseClient:
                     and stats.active_provider_readers == 1
                     and stats.reserved_bytes == stats.provider_reserved_bytes
                 )
-                impossible = (
-                    stats.active_tunnels != 1
-                    or stats.active_provider_readers != 1
-                    or stats.reserved_bytes != stats.provider_reserved_bytes
-                )
+                impossible = bool(mismatches)
             if impossible:
+                # The proof is terminal on the first bad sample, so the
+                # message is the only forensic record of what disagreed.
                 raise FBrefProxyLeaseError(
-                    "FBref paid proxy idle proof found unexpected tunnel state"
+                    "FBref paid proxy idle proof found unexpected tunnel"
+                    f" state; sample={samples},"
+                    f" expected_tunnels={expected_tunnels},"
+                    f" mismatch={'|'.join(mismatches)}"
                 )
             if idle:
                 if (
