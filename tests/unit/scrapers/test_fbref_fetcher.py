@@ -591,28 +591,20 @@ def test_unreachable_geoip_exit_is_a_re_solvable_clearance_failure():
     assert "hard transport policy" not in str(raised.value)
 
 
-def test_unreachable_exit_still_ends_the_wave_when_the_lease_will_not_drain():
-    """The soft geo-IP verdict only survives a lease that closes its books.
-
-    The test above runs without ``_lease_client``, which no production wave
-    does, so on its own it would advertise a rescue the paid path never
-    performs: the same dead exit that fails the lookup also leaves the lease
-    unaccounted, ``wait_drained`` raises, and ``browser_provider_drain_failed``
-    re-imposes ``hard_transport_policy``.  That is deliberate — an unresolved
-    paid ledger must stop the wave — but it means the geo-IP verdict alone did
-    not rescue the waves lost 17-18.08; the fresh proxy pool did.  Pin the real
-    behaviour so the limitation cannot be mistaken for a fix (#1188).
-    """
+def _fetcher_with_dead_exit_and_failing_drain(**stats_overrides):
+    """A paid fetcher whose exit died and whose lease refuses to close."""
 
     fetcher = FBrefFetcher.__new__(FBrefFetcher)
     transport = MagicMock()
     transport.fetch.return_value = None
-    transport.traffic_delta.return_value = {
+    delta = {
         "real_requests_count": 1,
         "real_bytes_downloaded": 0,
         "geoip_lookup_failed": True,
         "geoip_transport_failure": True,
     }
+    delta.update(stats_overrides)
+    transport.traffic_delta.return_value = delta
     lease_client = MagicMock()
     lease_client.wait_drained.side_effect = FBrefProxyLeaseError(
         "FBref paid proxy drain found terminal accounting state"
@@ -629,6 +621,61 @@ def test_unreachable_exit_still_ends_the_wave_when_the_lease_will_not_drain():
     fetcher._provider_bootstrap_max_bytes = 0
     fetcher._provider_bootstrap_spent_bytes = 0
     fetcher._provider_lease_observed_bytes = 0
+    return fetcher
+
+
+def test_unreachable_exit_re_solves_even_when_its_lease_will_not_drain():
+    """An exit that never connected cannot have spent the ledger it won't close.
+
+    This used to be pinned the other way: the dead exit left the lease
+    unaccounted, ``wait_drained`` raised, and ``browser_provider_drain_failed``
+    re-imposed ``hard_transport_policy``, discarding the wave and everything it
+    had already collected.  Measured spend in that state is 352-415 bytes of a
+    16 MiB lease, and the owner's call on 19.08 was to treat it as a session
+    miss.  The wave now re-solves on a fresh proxy under the existing guards
+    (2 re-solves per target, 3 targets per wave) (#1188).
+    """
+
+    fetcher = _fetcher_with_dead_exit_and_failing_drain()
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "clearance_failed"
+    assert "browser_provider_drain_failed" not in str(raised.value)
+    assert "hard transport policy" not in str(raised.value)
+
+
+def test_an_exit_answering_from_a_bad_country_is_condemned_before_the_drain():
+    """A lookup that failed *with* a connection is a policy breach, as before.
+
+    The verdict here does not come from the drain guard at all -- it is already
+    ``geoip_lookup_failed`` by the time the lease is asked to close -- and the
+    assertion names that reason on purpose.  A mutation that widened the drain
+    exemption to this case would leave the test green, so pinning
+    ``hard_transport_policy`` alone would be pinning nothing.
+    """
+
+    fetcher = _fetcher_with_dead_exit_and_failing_drain(
+        geoip_transport_failure=False,
+    )
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "hard_transport_policy"
+    assert "geoip_lookup_failed" in str(raised.value)
+    assert "browser_provider_drain_failed" not in str(raised.value)
+
+
+def test_a_drain_failure_after_real_traffic_still_ends_the_wave():
+    """No geo-IP verdict at all: the lease simply refused to close its books."""
+
+    fetcher = _fetcher_with_dead_exit_and_failing_drain(
+        geoip_lookup_failed=False,
+        geoip_transport_failure=False,
+        real_bytes_downloaded=4096,
+    )
 
     with pytest.raises(FetchError) as raised:
         fetcher._ensure_clearance()

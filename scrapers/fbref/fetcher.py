@@ -1113,7 +1113,18 @@ class FBrefFetcher:
                         type(exc).__name__,
                         exc,
                     )
-                    hard_policy = hard_policy or "browser_provider_drain_failed"
+                    # An exit that never answered cannot have spent the ledger
+                    # it refuses to close: measured spend is 352-415 bytes of a
+                    # 16 MiB lease.  Owner's call 19.08 is to treat that narrow
+                    # case as a session miss, so the wave re-solves on a fresh
+                    # proxy under the existing guards instead of discarding
+                    # everything it already collected (#1188).  Every other
+                    # drain failure still stops the wave: an unresolved paid
+                    # ledger with real traffic behind it is a policy breach.
+                    if not self._exit_never_answered(bootstrap_stats):
+                        hard_policy = (
+                            hard_policy or "browser_provider_drain_failed"
+                        )
                 if (
                     (
                         self._provider_bootstrap_max_bytes > 0
@@ -1246,6 +1257,28 @@ class FBrefFetcher:
         return True
 
     @staticmethod
+    def _exit_never_answered(stats: Optional[dict]) -> bool:
+        """True when the geo-IP probe failed because nothing answered at all.
+
+        Both flags together are the transport-level signature written by
+        ``camoufox_fetch``: the lookup failed *and* it failed by not
+        connecting, as opposed to answering from a disallowed country.
+
+        The second flag is belt-and-braces rather than load-bearing: an exit
+        that answered from the wrong country is already condemned by
+        ``geoip_lookup_failed`` before the drain runs, so the caller's verdict
+        would not change without it.  It stays because the predicate is about
+        what the transport observed, and a reader must not have to prove that
+        coincidence to trust the exemption.
+        """
+
+        source = stats or {}
+        return bool(
+            source.get("geoip_lookup_failed")
+            and source.get("geoip_transport_failure")
+        )
+
+    @staticmethod
     def _hard_transport_policy_reason(stats: Optional[dict]) -> Optional[str]:
         source = stats or {}
         if source.get("geoip_lookup_failed"):
@@ -1259,16 +1292,14 @@ class FBrefFetcher:
             # target, 3 targets per wave) instead of discarding the wave and
             # everything it already collected (#1188).
             #
-            # Known limitation, measured and pinned by
-            # test_unreachable_exit_still_ends_the_wave_when_the_lease_will_not
-            # _drain: on the paid path this rescue usually does NOT fire.  The
-            # same dead exit leaves the lease unaccounted, `wait_drained` raises
-            # and `browser_provider_drain_failed` puts hard_transport_policy
-            # back.  That is deliberate — an unresolved paid ledger must stop
-            # the wave — so this branch only helps when the lease still closes
-            # its books.  Relaxing the drain verdict for an exit that never
-            # answered (measured spend: 352 bytes of a 16 MiB lease) is a
-            # paid-metering policy change and needs the owner's call.
+            # The paid path used to undo this rescue: the same dead exit also
+            # leaves the lease unaccounted, `wait_drained` raises, and
+            # `browser_provider_drain_failed` put hard_transport_policy back.
+            # The owner lifted that on 19.08 for this narrow case only — see
+            # `_exit_never_answered` at the drain site — because an exit that
+            # never connected cannot have spent the ledger it will not close
+            # (measured: 352-415 bytes of a 16 MiB lease).  A drain failure
+            # from any other cause still ends the wave.
             if not source.get("geoip_transport_failure"):
                 return "geoip_lookup_failed"
         if source.get("redirect_blocked"):
