@@ -644,9 +644,11 @@ def test_zero_tunnel_idle_proof_names_the_observed_reservation():
     assert "expected_tunnels=0" in message
 
 
-def test_idle_proof_reports_the_sample_that_broke_a_settled_tunnel():
-    # Distinguishes "never settled" from "settled, then went ambiguous":
-    # the first two samples are a clean idle pair that is broken on the third.
+def test_idle_proof_counts_samples_until_the_state_goes_ambiguous():
+    # The count is what tells "bad from the first look" apart from "looked
+    # fine for a while".  Two idle samples that AGREE would return at the
+    # second, so the pair here deliberately differs in up_bytes: the proof
+    # keeps sampling and reports the third, ambiguous one.
     idle = _stats_body(active_tunnels=1, active_provider_readers=1)
     broken = _stats_body(
         active_tunnels=1,

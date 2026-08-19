@@ -588,16 +588,15 @@ class FBrefProxyLeaseClient:
                     "FBref paid proxy idle proof found terminal or staged work"
                 )
             mismatches = self._idle_mismatches(stats, expected_tunnels)
-            if expected_tunnels == 0:
-                impossible = bool(mismatches)
-                idle = not impossible
-            else:
-                idle = (
-                    stats.active_tunnels == 1
-                    and stats.active_provider_readers == 1
-                    and stats.reserved_bytes == stats.provider_reserved_bytes
-                )
-                impossible = bool(mismatches)
+            impossible = bool(mismatches)
+            # The proof has no settling window by construction: idle is the
+            # exact negation of impossible, so the first non-ideal sample is
+            # terminal and the stable-sample wait below only ever runs on
+            # samples that were already idle.  Keeping one predicate keeps a
+            # later condition from landing in only half of the pair, which
+            # would strand the loop in the generic deadline error instead of
+            # the named one.
+            idle = not impossible
             if impossible:
                 # The proof is terminal on the first bad sample, so the
                 # message is the only forensic record of what disagreed.
