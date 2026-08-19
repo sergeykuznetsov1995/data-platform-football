@@ -113,6 +113,19 @@ def _run_native_admitted(mod, args, **kwargs):
         mod._ACTIVE_PUBLICATION_GENERATION = None
 
 
+@pytest.fixture(autouse=True)
+def _writer_lock_disabled(monkeypatch):
+    """У юнит-тестов нет Postgres, а замок писателя (B7) молча не обходится.
+
+    Поэтому в сьюте он выключается явно — ровно тем же выключателем, что и в
+    офлайн-реплее. Тесты самого замка ставят переменную сами.
+    """
+
+    from dags.scripts.run_fotmob_scraper import WRITER_LOCK_ENV
+
+    monkeypatch.setenv(WRITER_LOCK_ENV, "0")
+
+
 class TestFotmobNativeRunner:
     """Source-native mode is explicit and preserves exact source identities."""
 
@@ -3135,3 +3148,152 @@ class TestFotmobNativeRunner:
         assert seen["publication_generation_id"] is None
         # The stub still gives the run a retry-stable identity.
         assert seen["run_id"] == stub_id
+
+
+class _FakeCursor:
+    def __init__(self, acquired, executed):
+        self._acquired = acquired
+        self._executed = executed
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def execute(self, sql, params=None):
+        self._executed.append((sql, params))
+
+    def fetchone(self):
+        return (self._acquired,)
+
+
+class _FakeConnection:
+    def __init__(self, acquired, executed):
+        self.autocommit = False
+        self.closed = False
+        self._acquired = acquired
+        self._executed = executed
+
+    def cursor(self):
+        return _FakeCursor(self._acquired, self._executed)
+
+    def close(self):
+        self.closed = True
+
+
+def _fake_psycopg2(monkeypatch, mod, *, acquired, executed, connections):
+    def connect(dsn):
+        connections.append(dsn)
+        return _FakeConnection(acquired, executed)
+
+    monkeypatch.setitem(
+        sys.modules, "psycopg2", SimpleNamespace(connect=connect)
+    )
+    monkeypatch.setattr(
+        "scrapers.fbref.control.store.resolve_control_db_uri",
+        lambda env=None: "postgresql://airflow@metadb:5432/airflow",
+    )
+    return mod
+
+
+class TestFotmobWriterLock:
+    """B7: право записи в bronze захватывается атомарно и без ожидания.
+
+    max_active_runs=1 сериализует только DagRun'ы одного дага; ручной добор и
+    осиротевший скрапер писали в те же таблицы мимо неё, а ретрая на конфликт
+    коммита у FotMob нет.
+    """
+
+    @staticmethod
+    def _module():
+        sys.modules.pop("dags.scripts.run_fotmob_scraper", None)
+        return importlib.import_module("dags.scripts.run_fotmob_scraper")
+
+    @pytest.mark.unit
+    def test_lock_is_taken_without_waiting_and_released_by_closing(
+        self, monkeypatch
+    ):
+        mod = self._module()
+        monkeypatch.setenv(mod.WRITER_LOCK_ENV, "1")
+        executed: list[tuple[str, Any]] = []
+        connections: list[str] = []
+        _fake_psycopg2(
+            monkeypatch, mod, acquired=True, executed=executed, connections=connections
+        )
+        held = None
+
+        with mod._writer_lock() as acquired:
+            held = acquired
+            statements = list(executed)
+
+        assert held is True
+        # Именно НЕблокирующий вариант: pg_advisory_lock ждал бы второго
+        # писателя вместо мгновенного отказа.
+        assert statements == [
+            ("SELECT pg_try_advisory_lock(%s)", (mod._WRITER_LOCK_KEY,))
+        ]
+        assert connections == ["postgresql://airflow@metadb:5432/airflow"]
+
+    @pytest.mark.unit
+    def test_second_writer_is_refused_immediately(self, monkeypatch):
+        mod = self._module()
+        monkeypatch.setenv(mod.WRITER_LOCK_ENV, "1")
+        _fake_psycopg2(
+            monkeypatch, mod, acquired=False, executed=[], connections=[]
+        )
+
+        with pytest.raises(mod.WriterLockBusy) as excinfo:
+            with mod._writer_lock():
+                raise AssertionError("тело не должно выполняться")
+
+        assert "bronze writer lock" in str(excinfo.value)
+
+    @pytest.mark.unit
+    def test_busy_lock_fails_the_run_without_touching_the_scraper(
+        self, monkeypatch, tmp_path
+    ):
+        """Отказ обязан быть виден отчётом, а не тихим пропуском работы."""
+
+        from utils import fotmob_publication as publication
+
+        mod = self._module()
+        monkeypatch.setenv(mod.WRITER_LOCK_ENV, "1")
+        monkeypatch.delenv(
+            publication.FOTMOB_DEPLOYMENT_REPORT_PATH_ENV, raising=False
+        )
+        monkeypatch.delenv(
+            publication.FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV, raising=False
+        )
+        _fake_psycopg2(
+            monkeypatch, mod, acquired=False, executed=[], connections=[]
+        )
+        started = MagicMock()
+        monkeypatch.setattr(mod, "_run_native", started)
+        out = tmp_path / "report.json"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["run_fotmob_scraper.py", "--mode", "discover", "--output", str(out)],
+        )
+
+        assert mod.main() == 1
+
+        started.assert_not_called()
+        report = json.loads(out.read_text(encoding="utf-8"))
+        assert report["status"] == "incomplete"
+        assert report["complete"] is False
+        assert any("writer lock" in str(error) for error in report["errors"])
+
+    @pytest.mark.unit
+    def test_lock_can_be_disabled_only_explicitly(self, monkeypatch):
+        mod = self._module()
+        monkeypatch.setenv(mod.WRITER_LOCK_ENV, "0")
+
+        def refuse(_dsn):
+            raise AssertionError("выключенный замок не должен ходить в базу")
+
+        monkeypatch.setitem(sys.modules, "psycopg2", SimpleNamespace(connect=refuse))
+
+        with mod._writer_lock() as acquired:
+            assert acquired is False

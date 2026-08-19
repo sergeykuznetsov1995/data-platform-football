@@ -78,6 +78,20 @@ PUBLICATION_BINDING_ARGUMENTS = {
 _ACTIVE_PUBLICATION_GENERATION: str | None = None
 FOTMOB_SCOPE_JSON_ENV = "FOTMOB_SCOPE_JSON"
 
+# Единственность писателя bronze (B7). max_active_runs=1 сериализует только
+# DagRun'ы одного дага, а ручной добор и осиротевший скрапер (PPid=1) пишут в те
+# же таблицы мимо неё; ретрая на конфликт коммита у FotMob нет. Захват обязан
+# быть НЕблокирующим: второй писатель должен падать сразу с внятной ошибкой, а
+# не ждать и не писать параллельно. Advisory-замок сессии освобождается сам,
+# когда соединение умирает, — поэтому убитый SIGKILL ран не оставляет висящего
+# замка, в отличие от записи-владельца в таблице.
+WRITER_LOCK_ENV = "FOTMOB_WRITER_LOCK"
+_WRITER_LOCK_KEY = int.from_bytes(
+    hashlib.blake2b(b"fotmob-bronze-writer", digest_size=8).digest(),
+    "big",
+    signed=True,
+)
+
 
 def _publication_from_args(args) -> dict[str, Any] | None:
     """Return the canonical generation identity supplied by the owner DAG.
@@ -169,6 +183,51 @@ def _attest_native_runtime(args, publication: Mapping[str, Any]) -> dict[str, An
             "publication": dict(publication),
         },
     )
+
+
+class WriterLockBusy(RuntimeError):
+    """Другой процесс уже держит право записи в bronze FotMob."""
+
+
+@contextmanager
+def _writer_lock(environ: Mapping[str, str] | None = None) -> Iterator[bool]:
+    """Взять НЕблокирующий advisory-замок писателя на всё время рана.
+
+    Замок общий для всех входов: и полоса из DAG, и ручной добор берут один и
+    тот же ключ, поэтому второй писатель падает сразу, а не пишет параллельно.
+    Отключается только явно (``FOTMOB_WRITER_LOCK=0``) — для офлайн-реплея и
+    тестов; молчаливого обхода нет, иначе защита превращается в декорацию.
+    """
+
+    env = os.environ if environ is None else environ
+    if str(env.get(WRITER_LOCK_ENV, "1")).strip().casefold() in {"0", "false", "no"}:
+        logger.warning(
+            "FotMob writer lock disabled via %s — параллельная запись не защищена",
+            WRITER_LOCK_ENV,
+        )
+        yield False
+        return
+
+    import psycopg2
+
+    from scrapers.fbref.control.store import resolve_control_db_uri
+
+    connection = psycopg2.connect(resolve_control_db_uri(env))
+    try:
+        connection.autocommit = True
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_try_advisory_lock(%s)", (_WRITER_LOCK_KEY,))
+            acquired = bool(cursor.fetchone()[0])
+        if not acquired:
+            raise WriterLockBusy(
+                "another FotMob writer holds the bronze writer lock "
+                f"(key {_WRITER_LOCK_KEY}); refusing to write in parallel"
+            )
+        yield True
+    finally:
+        # Закрытие соединения снимает замок сессии — отдельный UNLOCK не нужен
+        # и был бы хуже: он не отработает при падении процесса.
+        connection.close()
 
 
 @contextmanager
@@ -2428,12 +2487,16 @@ def main():
     except ValueError:
         pass  # not in the main thread (unit-test harness) — keep default
     try:
-        if publication is None:
-            # Ceremony-free run: no ControlStore guard and no attestation,
-            # exactly the pre-#995 runner semantics.
-            rc, payload = _run_native_unfenced(args)
-        else:
-            rc, payload = _run_native_under_fence(args, publication)
+        # Замок писателя охватывает ОБА входа: ceremony-free ран не берёт
+        # ControlStore-guard вовсе, и без этого захвата ручной добор пишет в
+        # bronze параллельно полосе (B7).
+        with _writer_lock():
+            if publication is None:
+                # Ceremony-free run: no ControlStore guard and no attestation,
+                # exactly the pre-#995 runner semantics.
+                rc, payload = _run_native_unfenced(args)
+            else:
+                rc, payload = _run_native_under_fence(args, publication)
     except Exception as exc:
         # Guard acquisition/validation failed before the service was built.
         # Do not salvage-flush here: there is no publication authority.
