@@ -500,7 +500,25 @@ class FBrefFetcher:
                 self._http_session = None
         if self._transport is not None:
             self._transport.close()
-        self._close_provider_lease()
+        try:
+            self._close_provider_lease()
+        except FBrefProxyLeaseError as exc:
+            # A reset runs *because* the session already failed, and the most
+            # common cause -- an unreachable filter -- is also what makes the
+            # close fail.  Propagating here escapes `fetch_wave` past its
+            # `except FetchError`, so the wave's untouched targets are never
+            # requeued and stay claimed until their lease expires.  Ownership
+            # deliberately survives the failure: `_next_proxy` reconciles it
+            # before it may buy another lease, so nothing is charged blind.
+            # Same trade as the strict-close fallback (#1099): keep the wave
+            # recoverable, keep the ledger owned.
+            logger.warning(
+                "FBref clearance reset could not close lease %s (%s: %s); "
+                "ownership retained for reconciliation",
+                getattr(getattr(self, "_provider_lease", None), "lease_id", "?"),
+                type(exc).__name__,
+                exc,
+            )
         self._provider_http_ready = False
         # A pipeline clearance refresh reserves a new browser phase.  Keep
         # rotations inside one transport cumulative, but do not carry the old
@@ -1092,6 +1110,7 @@ class FBrefFetcher:
                 self._close_browser_and_collect_traffic(transport)
             )
             hard_policy = self._hard_transport_policy_reason(bootstrap_stats)
+            drain_relief = None
             if finalize_error is not None and hard_policy is None:
                 hard_policy = "browser_finalization_failed"
             if (
@@ -1121,7 +1140,20 @@ class FBrefFetcher:
                     # everything it already collected (#1188).  Every other
                     # drain failure still stops the wave: an unresolved paid
                     # ledger with real traffic behind it is a policy breach.
-                    if not self._exit_never_answered(bootstrap_stats):
+                    #
+                    # `wait_drained` raises for budget and lifecycle states too,
+                    # not only for an unreachable meter, and the cap check below
+                    # cannot re-impose the verdict once the drain failed (it has
+                    # no fresh stats to read).  So the exemption also requires
+                    # that nothing is known to have been spent -- any observed
+                    # byte means the exit did answer somebody.
+                    unspent = not self._provider_lease_observed_bytes and not int(
+                        (bootstrap_stats or {}).get("real_bytes_downloaded", 0)
+                        or 0
+                    )
+                    if self._exit_never_answered(bootstrap_stats) and unspent:
+                        drain_relief = f"{type(exc).__name__}: {exc}"
+                    else:
                         hard_policy = (
                             hard_policy or "browser_provider_drain_failed"
                         )
@@ -1152,6 +1184,14 @@ class FBrefFetcher:
                     "Camoufox hard transport policy failed: "
                     f"{hard_policy}"
                     if hard_policy is not None
+                    # `fetch_attempt.error_message` only ever stores
+                    # `str(FetchError)` (#1107), so an exemption that says
+                    # nothing here is invisible in the control DB: it reads as
+                    # any other clearance miss, and nobody can count the paid
+                    # leases abandoned unaccounted.  Name it.
+                    else "Camoufox abandoned an unreachable exit's lease: "
+                    f"{drain_relief}"
+                    if drain_relief is not None
                     else "Camoufox clearance bootstrap failed: "
                     f"{type(bootstrap_error).__name__}"
                     if bootstrap_error is not None
@@ -1288,9 +1328,12 @@ class FBrefFetcher:
             # 17-18.08 carried exactly that (3 of 3 with a recorded type, each
             # ProxyError "Cannot connect to proxy").  Falling through here
             # yields error_class 'clearance_failed', which re-solves on a fresh
-            # proxy under the existing exhaustion guards (2 re-solves per
-            # target, 3 targets per wave) instead of discarding the wave and
-            # everything it already collected (#1188).
+            # proxy under the existing exhaustion guards instead of discarding
+            # the wave and everything it already collected (#1188).  Those
+            # guards bound 2 re-solves per target and 3 *consecutive* exhausted
+            # targets -- `pipeline` resets that counter after every fetched
+            # page, so a wave alternating success and dead exit is not bounded
+            # by it at all; only the run's own byte and request budgets stop it.
             #
             # The paid path used to undo this rescue: the same dead exit also
             # leaves the lease unaccounted, `wait_drained` raises, and

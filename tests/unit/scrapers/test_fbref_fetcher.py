@@ -644,6 +644,75 @@ def test_unreachable_exit_re_solves_even_when_its_lease_will_not_drain():
     assert raised.value.error_class == "clearance_failed"
     assert "browser_provider_drain_failed" not in str(raised.value)
     assert "hard transport policy" not in str(raised.value)
+    # `fetch_attempt.error_message` stores only `str(FetchError)` (#1107): an
+    # exemption that does not name itself cannot be counted in the control DB.
+    assert "unreachable exit" in str(raised.value)
+    assert "FBrefProxyLeaseError" in str(raised.value)
+
+
+def test_an_exit_that_spent_bytes_is_not_exempted_from_the_drain_verdict():
+    """`wait_drained` also raises on budget and lifecycle states.
+
+    The cap check below the drain site cannot re-impose the verdict once the
+    drain itself failed -- it has no fresh stats to read -- so a lease that is
+    known to have spent anything must not ride the unreachable-exit exemption,
+    however the geo-IP flags happen to be set.
+    """
+
+    fetcher = _fetcher_with_dead_exit_and_failing_drain(
+        real_bytes_downloaded=2048,
+    )
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "hard_transport_policy"
+    assert "browser_provider_drain_failed" in str(raised.value)
+
+
+def test_an_observed_lease_balance_also_blocks_the_exemption():
+    """Bytes already attributed to this lease are spend just the same."""
+
+    fetcher = _fetcher_with_dead_exit_and_failing_drain()
+    fetcher._provider_lease_observed_bytes = 4096
+
+    with pytest.raises(FetchError) as raised:
+        fetcher._ensure_clearance()
+
+    assert raised.value.error_class == "hard_transport_policy"
+
+
+def test_reset_keeps_the_wave_recoverable_when_the_lease_will_not_close():
+    """A reset runs because the session failed; it must not kill the wave.
+
+    The unreachable filter that fails the drain also fails the close.  Letting
+    that escape `reset_clearance` puts it past `fetch_wave`'s ``except
+    FetchError``, so untouched targets are never requeued and stay claimed
+    until their lease expires.  Ownership survives on purpose: ``_next_proxy``
+    reconciles it before buying another lease.
+    """
+
+    fetcher = FBrefFetcher.__new__(FBrefFetcher)
+    fetcher.persistent_http_session = False
+    fetcher._persistent_session_id = None
+    fetcher._persistent_receipt = None
+    fetcher._http_session = None
+    old_transport = MagicMock()
+    new_transport = MagicMock()
+    fetcher._transport = old_transport
+    fetcher._provider_lease = SimpleNamespace(lease_id="lease-1")
+    fetcher._close_provider_lease = MagicMock(
+        side_effect=FBrefProxyLeaseError("FBref proxy meter request failed")
+    )
+    fetcher._create_transport = MagicMock(return_value=new_transport)
+
+    fetcher.reset_clearance()
+
+    assert fetcher._transport is new_transport
+    assert fetcher._clearance is None
+    # Ownership retained so the next acquisition reconciles instead of buying
+    # a second lease over an unknown first balance.
+    assert fetcher._provider_lease is not None
 
 
 def test_an_exit_answering_from_a_bad_country_is_condemned_before_the_drain():
