@@ -6109,6 +6109,50 @@ def test_validation_treats_failed_targets_as_returned_to_queue(tmp_path):
     assert "finish:True" in control.events
 
 
+def test_a_quarantine_alongside_recorded_pages_still_finishes_green(tmp_path):
+    """A retired page must not cost the run that collected everything else.
+
+    A contract quarantine is a verdict about the SOURCE's published shape —
+    the page will not become parseable by refetching it — so the pages the
+    same wave did record are the run's real output.  Reddening the gate over
+    it produced the 15-16.08 streaks of up to 12 red runs with work recorded,
+    each one buying a fresh cooldown and a fresh paid bootstrap (backlog A4).
+
+    The two halves are pinned separately elsewhere — the wave reports a
+    quarantine without a failure, and validation tolerates a terminally failed
+    target — but nothing tied them together at the gate, which is the level
+    the driver actually reads.
+    """
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    base_summary = control.get_run_summary(str(uuid.uuid4()))
+    control.get_run_summary = lambda _, **__: {
+        **base_summary,
+        # The 15-16.08 shape exactly: a cohort that mostly landed, one target
+        # retired by the source's own shape and one that terminally failed.
+        "target_counts": {"succeeded": 24, "failed": 1},
+        "traffic_totals": {"warm_http_success_rate": 1.0},
+    }
+    control.frontier["fbref:season:11:2025-2026"] = {
+        "state": "retry",
+        "last_content_hash": "deadbeef",
+    }
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    assert control.quarantine_contract_rejected_target(
+        "fbref:season:11:2025-2026",
+        content_hash="deadbeef",
+        reason="schedule_season_mismatch",
+    )
+    pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert (
+        control.frontier["fbref:season:11:2025-2026"]["state"] == "quarantined"
+    )
+    assert "finish:True" in control.events
+
+
 def test_lone_validate_clear_reanimates_before_finishing_green(tmp_path):
     """Clearing only the validate task never re-runs the waves; when the
     gates pass on a 'failed' run, validation itself must reanimate before
