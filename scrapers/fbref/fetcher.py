@@ -500,7 +500,25 @@ class FBrefFetcher:
                 self._http_session = None
         if self._transport is not None:
             self._transport.close()
-        self._close_provider_lease()
+        try:
+            self._close_provider_lease()
+        except FBrefProxyLeaseError as exc:
+            # A reset runs *because* the session already failed, and the most
+            # common cause -- an unreachable filter -- is also what makes the
+            # close fail.  Propagating here escapes `fetch_wave` past its
+            # `except FetchError`, so the wave's untouched targets are never
+            # requeued and stay claimed until their lease expires.  Ownership
+            # deliberately survives the failure: `_next_proxy` reconciles it
+            # before it may buy another lease, so nothing is charged blind.
+            # Same trade as the strict-close fallback (#1099): keep the wave
+            # recoverable, keep the ledger owned.
+            logger.warning(
+                "FBref clearance reset could not close lease %s (%s: %s); "
+                "ownership retained for reconciliation",
+                getattr(getattr(self, "_provider_lease", None), "lease_id", "?"),
+                type(exc).__name__,
+                exc,
+            )
         self._provider_http_ready = False
         # A pipeline clearance refresh reserves a new browser phase.  Keep
         # rotations inside one transport cumulative, but do not carry the old
@@ -1092,6 +1110,7 @@ class FBrefFetcher:
                 self._close_browser_and_collect_traffic(transport)
             )
             hard_policy = self._hard_transport_policy_reason(bootstrap_stats)
+            drain_relief = None
             if finalize_error is not None and hard_policy is None:
                 hard_policy = "browser_finalization_failed"
             if (
@@ -1113,7 +1132,31 @@ class FBrefFetcher:
                         type(exc).__name__,
                         exc,
                     )
-                    hard_policy = hard_policy or "browser_provider_drain_failed"
+                    # An exit that never answered cannot have spent the ledger
+                    # it refuses to close: measured spend is 352-415 bytes of a
+                    # 16 MiB lease.  Owner's call 19.08 is to treat that narrow
+                    # case as a session miss, so the wave re-solves on a fresh
+                    # proxy under the existing guards instead of discarding
+                    # everything it already collected (#1188).  Every other
+                    # drain failure still stops the wave: an unresolved paid
+                    # ledger with real traffic behind it is a policy breach.
+                    #
+                    # `wait_drained` raises for budget and lifecycle states too,
+                    # not only for an unreachable meter, and the cap check below
+                    # cannot re-impose the verdict once the drain failed (it has
+                    # no fresh stats to read).  So the exemption also requires
+                    # that nothing is known to have been spent -- any observed
+                    # byte means the exit did answer somebody.
+                    unspent = not self._provider_lease_observed_bytes and not int(
+                        (bootstrap_stats or {}).get("real_bytes_downloaded", 0)
+                        or 0
+                    )
+                    if self._exit_never_answered(bootstrap_stats) and unspent:
+                        drain_relief = f"{type(exc).__name__}: {exc}"
+                    else:
+                        hard_policy = (
+                            hard_policy or "browser_provider_drain_failed"
+                        )
                 if (
                     (
                         self._provider_bootstrap_max_bytes > 0
@@ -1141,6 +1184,14 @@ class FBrefFetcher:
                     "Camoufox hard transport policy failed: "
                     f"{hard_policy}"
                     if hard_policy is not None
+                    # `fetch_attempt.error_message` only ever stores
+                    # `str(FetchError)` (#1107), so an exemption that says
+                    # nothing here is invisible in the control DB: it reads as
+                    # any other clearance miss, and nobody can count the paid
+                    # leases abandoned unaccounted.  Name it.
+                    else "Camoufox abandoned an unreachable exit's lease: "
+                    f"{drain_relief}"
+                    if drain_relief is not None
                     else "Camoufox clearance bootstrap failed: "
                     f"{type(bootstrap_error).__name__}"
                     if bootstrap_error is not None
@@ -1246,6 +1297,28 @@ class FBrefFetcher:
         return True
 
     @staticmethod
+    def _exit_never_answered(stats: Optional[dict]) -> bool:
+        """True when the geo-IP probe failed because nothing answered at all.
+
+        Both flags together are the transport-level signature written by
+        ``camoufox_fetch``: the lookup failed *and* it failed by not
+        connecting, as opposed to answering from a disallowed country.
+
+        The second flag is belt-and-braces rather than load-bearing: an exit
+        that answered from the wrong country is already condemned by
+        ``geoip_lookup_failed`` before the drain runs, so the caller's verdict
+        would not change without it.  It stays because the predicate is about
+        what the transport observed, and a reader must not have to prove that
+        coincidence to trust the exemption.
+        """
+
+        source = stats or {}
+        return bool(
+            source.get("geoip_lookup_failed")
+            and source.get("geoip_transport_failure")
+        )
+
+    @staticmethod
     def _hard_transport_policy_reason(stats: Optional[dict]) -> Optional[str]:
         source = stats or {}
         if source.get("geoip_lookup_failed"):
@@ -1255,20 +1328,21 @@ class FBrefFetcher:
             # 17-18.08 carried exactly that (3 of 3 with a recorded type, each
             # ProxyError "Cannot connect to proxy").  Falling through here
             # yields error_class 'clearance_failed', which re-solves on a fresh
-            # proxy under the existing exhaustion guards (2 re-solves per
-            # target, 3 targets per wave) instead of discarding the wave and
-            # everything it already collected (#1188).
+            # proxy under the existing exhaustion guards instead of discarding
+            # the wave and everything it already collected (#1188).  Those
+            # guards bound 2 re-solves per target and 3 *consecutive* exhausted
+            # targets -- `pipeline` resets that counter after every fetched
+            # page, so a wave alternating success and dead exit is not bounded
+            # by it at all; only the run's own byte and request budgets stop it.
             #
-            # Known limitation, measured and pinned by
-            # test_unreachable_exit_still_ends_the_wave_when_the_lease_will_not
-            # _drain: on the paid path this rescue usually does NOT fire.  The
-            # same dead exit leaves the lease unaccounted, `wait_drained` raises
-            # and `browser_provider_drain_failed` puts hard_transport_policy
-            # back.  That is deliberate — an unresolved paid ledger must stop
-            # the wave — so this branch only helps when the lease still closes
-            # its books.  Relaxing the drain verdict for an exit that never
-            # answered (measured spend: 352 bytes of a 16 MiB lease) is a
-            # paid-metering policy change and needs the owner's call.
+            # The paid path used to undo this rescue: the same dead exit also
+            # leaves the lease unaccounted, `wait_drained` raises, and
+            # `browser_provider_drain_failed` put hard_transport_policy back.
+            # The owner lifted that on 19.08 for this narrow case only — see
+            # `_exit_never_answered` at the drain site — because an exit that
+            # never connected cannot have spent the ledger it will not close
+            # (measured: 352-415 bytes of a 16 MiB lease).  A drain failure
+            # from any other cause still ends the wave.
             if not source.get("geoip_transport_failure"):
                 return "geoip_lookup_failed"
         if source.get("redirect_blocked"):
