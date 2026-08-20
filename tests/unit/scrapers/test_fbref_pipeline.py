@@ -4,6 +4,7 @@ import hashlib
 import gzip
 import gc
 import json
+import logging
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -55,6 +56,8 @@ from scrapers.fbref.pipeline import (
     RunValidationError,
     SENTINEL_COMPETITIONS,
     WaveResult,
+    _is_mass_redirect,
+    _is_run_mass_redirect,
     affordable_clearance_reservation,
     backfill_season_cohort_capacity,
     frontier_target,
@@ -9845,3 +9848,596 @@ def test_discovery_batch_within_the_ceiling_stays_one_atomic_write(tmp_path):
     pipeline._seed_link_candidates(candidates, parent_record=None)
 
     assert len(calls) == 1
+
+
+class FakeMovedFetcher:
+    """A source that answers with a redirect instead of the page."""
+
+    STATUS = 301
+    LOCATION = (
+        "https://fbref.com/en/comps/33/2026-2027/2026-2027-2-Bundesliga-Stats"
+    )
+
+    def __init__(self, events):
+        self.events = events
+
+    def __enter__(self):
+        self.events.append("fetcher_enter")
+        return self
+
+    def __exit__(self, *args):
+        self.events.append("fetcher_exit")
+
+    def ensure_clearance(self):
+        self.events.append("browser")
+        return True
+
+    def fetch(self, url, **kwargs):
+        self.events.append("http")
+        raise FetchError(
+            f"FBref returned HTTP {self.STATUS} for {url}; attempts=1; "
+            f"status_history={self.STATUS}; location={self.LOCATION}",
+            error_class="http_status",
+            http_status=self.STATUS,
+            wire_bytes=303,
+            browser_document_bytes=0,
+            browser_asset_bytes=0,
+            browser_requests=0,
+            browser_bootstrap_attempts=0,
+            browser_unobserved_bytes=0,
+            target_requests=1,
+            http_status_history=(self.STATUS,),
+            latency_ms=321,
+            redirect_location=self.LOCATION,
+        )
+
+
+def test_moved_page_is_skipped_without_failing_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeMovedFetcher(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="worker-1",
+        page_kinds=["competition_index"],
+        settings=_settings(),
+    )
+
+    # A page that merely moved must not take the whole wave down with it.
+    assert result.failures == []
+    assert result.moved_pages_skipped == 1
+    # The attempt is still durable evidence, not a silent skip.
+    assert "fail" in control.events
+    # Handed back as 'skipped'/'queued' -- the only reversible shape.
+    # 'retry' would re-fetch it all run and still count as unfinished;
+    # 'dead' (permanent) is terminal with no path back, so one bad exit
+    # answering 301 would destroy healthy pages on first contact.
+    assert control.failed[0][1]["requeue"] is True
+    assert control.failed[0][1]["permanent"] is False
+
+
+class FakeNotFoundFetcher(FakeMovedFetcher):
+    """A genuinely broken target: not a redirect, so the wave must still die."""
+
+    def fetch(self, url, **kwargs):
+        self.events.append("http")
+        raise FetchError(
+            f"FBref returned HTTP 404 for {url}; attempts=1; "
+            "status_history=404",
+            error_class="http_status",
+            http_status=404,
+            wire_bytes=303,
+            browser_document_bytes=0,
+            browser_asset_bytes=0,
+            browser_requests=0,
+            browser_bootstrap_attempts=0,
+            browser_unobserved_bytes=0,
+            target_requests=1,
+            http_status_history=(404,),
+            latency_ms=321,
+        )
+
+
+def test_non_redirect_page_failure_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeNotFoundFetcher(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        pipeline.fetch_wave(
+            str(uuid.UUID(int=1)),
+            worker_id="worker-1",
+            page_kinds=["competition_index"],
+            settings=_settings(),
+        )
+
+
+class FakeChallengeRedirectFetcher(FakeMovedFetcher):
+    """A 302 is what a challenge or proxy error page answers with.
+
+    Location is present on purpose: the wave must fail because of the
+    *status*, not because the header happened to be missing.
+    """
+
+    STATUS = 302
+    LOCATION = "https://fbref.com/en/comps/33/somewhere-else"
+
+
+class FakeSeeOtherRedirectFetcher(FakeMovedFetcher):
+    """307 keeps the method but is still a temporary answer."""
+
+    STATUS = 307
+    LOCATION = "https://fbref.com/en/comps/33/somewhere-else"
+
+
+class FakePermanentlyRelocatedFetcher(FakeMovedFetcher):
+    """308 is 301's method-preserving twin and must be treated alike."""
+
+    STATUS = 308
+
+
+class FakeLocationlessRedirectFetcher(FakeMovedFetcher):
+    """A 301 with no Location names no address and is not actionable."""
+
+    LOCATION = None
+
+
+def test_temporary_redirect_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeChallengeRedirectFetcher(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        pipeline.fetch_wave(
+            str(uuid.UUID(int=1)),
+            worker_id="worker-1",
+            page_kinds=["competition_index"],
+            settings=_settings(),
+        )
+
+
+def test_mass_redirect_breaks_the_wave_instead_of_shrinking_scope():
+    result = WaveResult(cohort_size=10, moved_pages_skipped=6)
+    assert _is_mass_redirect(result) is True
+
+
+def test_a_couple_of_moved_pages_is_not_a_mass_redirect():
+    # The motivating case: 2 retired aliases in a full daily cohort.
+    assert _is_mass_redirect(
+        WaveResult(cohort_size=25, moved_pages_skipped=2)
+    ) is False
+    # Dominating a tiny cohort is still routine below the absolute floor.
+    assert _is_mass_redirect(
+        WaveResult(cohort_size=4, moved_pages_skipped=4)
+    ) is False
+
+
+class FakeHijackedControl(FakeControl):
+    """A cohort wide enough to reach the mass-redirect gate."""
+
+    COHORT = 12
+
+    def __init__(self, raw):
+        super().__init__(raw)
+        self.session_close_statuses = []
+
+    def close_clearance_session(self, session_id, **kwargs):
+        self.events.append("session_close")
+        self.session_close_statuses.append(kwargs.get("status"))
+
+    def claim_targets(
+        self,
+        run_id,
+        worker_id,
+        *,
+        limit,
+        lease_seconds,
+        page_kinds=None,
+        refresh_policies=None,
+    ):
+        self.events.append("claim")
+        leases = [
+            TargetLease(
+                attempt_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"a{index}")),
+                run_id=run_id,
+                target_id=f"fbref:season:{index}:2026-2027",
+                logical_refresh_id=str(
+                    uuid.uuid5(uuid.NAMESPACE_URL, f"r{index}")
+                ),
+                canonical_url=(
+                    f"https://fbref.com/en/comps/{index}/League-Stats"
+                ),
+                page_kind="season",
+                source_ids={
+                    "competition_id": str(index),
+                    "season_id": "2026-2027",
+                },
+                claim_token=str(uuid.uuid5(uuid.NAMESPACE_URL, f"t{index}")),
+                lease_epoch=1,
+                attempt_number=1,
+                leased_by=worker_id,
+                lease_expires_at=NOW + timedelta(minutes=10),
+            )
+            for index in range(self.COHORT)
+        ]
+        return leases[:limit]
+
+
+def test_a_hijacked_cohort_fails_the_wave_and_blames_the_session(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeHijackedControl(raw)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeMovedFetcher(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    # A cohort wide enough that redirects can dominate it: the gate needs
+    # both the absolute floor and more than half the wave.
+    settings = replace(_settings(), shard_size=12, request_limit=60)
+
+    with pytest.raises(FetchWaveError, match="mass_redirect"):
+        pipeline.fetch_wave(
+            str(uuid.UUID(int=1)),
+            worker_id="worker-1",
+            page_kinds=["season"],
+            settings=settings,
+        )
+
+    # The verdict must be decided before the session is closed, or the exit
+    # that hijacked the cohort is recorded as healthy on the way out.
+    assert control.session_close_statuses == ["failed"]
+
+
+def test_run_level_cap_catches_a_hijack_too_thin_for_any_single_wave():
+    # 20% of every 25-page cohort stays under the per-wave floor forever,
+    # so only the run-wide ceiling can see it.
+    thin_hijack = WaveResult(cohort_size=2000, moved_pages_skipped=400)
+    assert _is_mass_redirect(thin_hijack) is False
+    assert _is_run_mass_redirect(thin_hijack) is True
+
+
+def test_run_level_cap_leaves_a_handful_of_dead_aliases_alone():
+    # The motivating case across a whole run: comps 33 and 59, every wave.
+    assert _is_run_mass_redirect(
+        WaveResult(cohort_size=2000, moved_pages_skipped=2)
+    ) is False
+
+
+def _wave_with(control, fetcher_cls, settings=None):
+    raw = control.raw if hasattr(control, "raw") else None
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: fetcher_cls(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+    return pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="worker-1",
+        page_kinds=["competition_index"],
+        settings=settings or _settings(),
+    )
+
+
+def test_permanent_308_is_spared_like_301(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    result = _wave_with(control, FakePermanentlyRelocatedFetcher)
+
+    assert result.failures == []
+    assert result.moved_pages_skipped == 1
+
+
+def test_temporary_307_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeSeeOtherRedirectFetcher)
+
+
+def test_redirect_without_location_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    # Permanent status, but no address to name or act on: not a usable
+    # "the page moved" statement, so it must stay loud.
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeLocationlessRedirectFetcher)
+
+
+def test_run_ceiling_stops_a_hijack_spread_thin_across_waves(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    # Each wave stays under the per-wave gate (5 of a 25-page cohort never
+    # exceeds half of it), so only the run-wide ceiling can end this.
+    def fake_fetch(*args, _live_session, **kwargs):
+        _live_session.fetcher = object()
+        _live_session.needs_clearance = False
+        # A live clearance session exists while the cohort is collected, so
+        # the run's exit path has something to blame.
+        _live_session.session_id = "session"
+        _live_session.state = "control_open"
+        return WaveResult(claimed=25, cohort_size=25, moved_pages_skipped=5)
+
+    def fake_parse(*args, **kwargs):
+        return WaveResult(cohort_size=25, parsed=20)
+
+    pipeline.fetch_wave = fake_fetch
+    pipeline.parse_wave = fake_parse
+
+    closes = []
+    original_close = control.close_clearance_session
+
+    def close_recording(session_id, **kwargs):
+        closes.append(kwargs.get("status"))
+        return original_close(session_id, **kwargs)
+
+    control.close_clearance_session = close_recording
+
+    with pytest.raises(FetchWaveError, match="mass_redirect_run"):
+        pipeline.run_live_waves(
+            str(uuid.uuid4()),
+            worker_id="current-live",
+            page_kinds=["competition_index"],
+            settings=_settings(),
+            max_batches=80,
+        )
+
+    # The session that was collecting the hijacked cohort must be blamed,
+    # not closed as healthy on the way out.
+    assert closes and all(status == "failed" for status in closes)
+
+
+class FakeSeeOtherStatusFetcher(FakeMovedFetcher):
+    """303 rewrites the method and is never a "the page moved" statement."""
+
+    STATUS = 303
+    LOCATION = "https://fbref.com/en/comps/33/somewhere-else"
+
+
+def test_see_other_303_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeSeeOtherStatusFetcher)
+
+
+class FakeHijackedExitFetcher(FakeMovedFetcher):
+    """A captive portal answering 301 with its own login page."""
+
+    LOCATION = "https://portal.example/login"
+
+
+def test_redirect_off_the_source_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    # Shrinking the scope on somebody else's say-so is how a hijacked exit
+    # quietly drops pages: the mass gates only catch a wholesale takeover, so
+    # a handful of stolen pages would otherwise pass every one of them.
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeHijackedExitFetcher)
+
+
+class FakeUserinfoDisguiseFetcher(FakeMovedFetcher):
+    """A hijack dressed as the source through a userinfo segment."""
+
+    LOCATION = "https://fbref.com@portal.example/login"
+
+
+def test_redirect_disguised_by_userinfo_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    # The host here is portal.example, not fbref.com.  Sanitising the header
+    # before parsing it would rewrite '@' to '?' and make this read as the
+    # source's own address -- which is why the raw value is what gets parsed.
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeUserinfoDisguiseFetcher)
+
+
+class FakePlainHttpRedirectFetcher(FakeMovedFetcher):
+    """The right host, but downgraded to a scheme anyone can forge."""
+
+    LOCATION = "http://fbref.com/en/comps/33/2026-2027/2026-2027-Stats"
+
+
+def test_plain_http_redirect_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakePlainHttpRedirectFetcher)
+
+
+class FakeProtocolRelativeRedirectFetcher(FakeMovedFetcher):
+    """`//host/path` names a host that is not ours to assume."""
+
+    LOCATION = "//portal.example/login"
+
+
+def test_protocol_relative_redirect_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeProtocolRelativeRedirectFetcher)
+
+
+class FakeRelativeRedirectFetcher(FakeMovedFetcher):
+    """A relative Location is same-origin by construction."""
+
+    LOCATION = "/en/comps/33/2026-2027/2026-2027-2-Bundesliga-Stats"
+
+
+def test_relative_redirect_is_spared_like_an_absolute_one(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    result = _wave_with(control, FakeRelativeRedirectFetcher)
+
+    assert result.failures == []
+    assert result.moved_pages_skipped == 1
+
+
+def test_moved_page_skip_is_logged_with_its_location(tmp_path, caplog):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    with caplog.at_level(logging.WARNING, logger="scrapers.fbref.pipeline"):
+        result = _wave_with(control, FakeMovedFetcher)
+
+    assert result.moved_pages_skipped == 1
+    assert "skips moved page" in caplog.text
+    assert FakeMovedFetcher.LOCATION in caplog.text
+
+
+def test_wave_gate_boundaries_are_exact():
+    # Exactly at the absolute floor: still routine (the check is > not >=).
+    assert _is_mass_redirect(
+        WaveResult(cohort_size=10, moved_pages_skipped=5)
+    ) is False
+    # One above the floor, and past half the cohort: fires.
+    assert _is_mass_redirect(
+        WaveResult(cohort_size=10, moved_pages_skipped=6)
+    ) is True
+    # Above the floor but exactly half the cohort: does not fire.
+    assert _is_mass_redirect(
+        WaveResult(cohort_size=12, moved_pages_skipped=6)
+    ) is False
+
+
+def test_run_ceiling_boundary_is_exact():
+    # Exactly at the ceiling is still allowed; one more is not.
+    assert _is_run_mass_redirect(
+        WaveResult(cohort_size=2000, moved_pages_skipped=25)
+    ) is False
+    assert _is_run_mass_redirect(
+        WaveResult(cohort_size=2000, moved_pages_skipped=26)
+    ) is True
+
+
+def test_moved_page_is_spared_on_the_paid_persistent_path(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = PersistentFakeControl(raw)
+
+    class MovedMeteredFetcher(PersistentFakeFetcher):
+        """The production shape behind a 301: a paid persistent session.
+
+        ``reset_clearance`` mirrors the real FBrefFetcher (fetcher.py:489);
+        without it the wave takes the branch that drops the fetcher and the
+        session close reports lost ownership -- an artefact of the fake, not
+        of this code path.
+        """
+
+        reset_calls = 0
+
+        def reset_clearance(self):
+            # Mirrors FBrefFetcher.reset_clearance (fetcher.py:489): drop the
+            # clearance so the next target solves a fresh one.
+            type(self).reset_calls += 1
+            self.session_id = None
+            self.events.append("reset_clearance")
+
+        def fetch(self, url, **_kwargs):
+            self.events.append("http_error")
+            raise FetchError(
+                f"FBref returned HTTP 301 for {url}; attempts=1; "
+                "status_history=301; location=https://fbref.com/en/comps/33/"
+                "2026-2027/2026-2027-2-Bundesliga-Stats",
+                error_class="http_status",
+                http_status=301,
+                wire_bytes=80,
+                browser_document_bytes=20,
+                browser_asset_bytes=10,
+                browser_requests=1,
+                browser_bootstrap_attempts=1,
+                provider_billed_bytes=120,
+                target_requests=1,
+                http_status_history=(301,),
+                redirect_location=(
+                    "https://fbref.com/en/comps/33/2026-2027/"
+                    "2026-2027-2-Bundesliga-Stats"
+                ),
+            )
+
+    control.session_close_statuses = []
+    original_close = control.close_clearance_session
+
+    def close_recording(session_id, **kwargs):
+        control.session_close_statuses.append(kwargs.get("status"))
+        return original_close(session_id, **kwargs)
+
+    control.close_clearance_session = close_recording
+
+    fetcher = MovedMeteredFetcher(control.events)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_args: fetcher,
+        sleep=lambda _seconds: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="persistent-moved",
+        page_kinds=["competition_index"],
+        settings=_persistent_settings(),
+    )
+
+    # The production paid path, not just the plain one.
+    assert result.failures == []
+    assert result.moved_pages_skipped == 1
+    assert control.failed[0][1]["requeue"] is True
+    # Exact settlement still happened: the paid bytes are on the attempt.
+    assert control.failed[0][1]["provider_billed_bytes"] == 120
+    # The paid session is finalized as failed and then recycled -- the wave
+    # does not carry a session that just lost a page into the next target.
+    assert "failed" in control.session_close_statuses
+    assert "reset_clearance" in control.events
+    assert fetcher.reset_calls == 1

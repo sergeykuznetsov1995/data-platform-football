@@ -48,6 +48,7 @@ _PERSISTENT_SESSION_CLOSE_MARGIN_SECONDS = 5 * 60
 _FAILURE_EVIDENCE_HEADERS = (
     "content-type",
     "content-length",
+    "location",
     "server",
     "via",
     "cf-ray",
@@ -200,9 +201,13 @@ class FetchError(RuntimeError):
         http_requests: Optional[int] = None,
         http_status_history: Optional[Sequence[int]] = None,
         latency_ms: int = 0,
+        redirect_location: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.error_class = error_class
+        # Where a 3xx pointed, when the source bothered to say.  A redirect
+        # without it is not a usable "the page moved" statement.
+        self.redirect_location = redirect_location
         self.http_status = http_status
         self.wire_bytes = wire_bytes
         self.browser_document_bytes = browser_document_bytes
@@ -1651,6 +1656,26 @@ class FBrefFetcher:
             )
         if status != 200:
             evidence = self._failure_response_evidence(response, body)
+            # The raw header, deliberately unsanitised: this value decides
+            # whether a redirect may shrink the crawl scope, and
+            # _safe_header_value would change the answer.  It truncates at 160
+            # characters and rewrites everything outside its allowlist to '?',
+            # which turns "https://fbref.com@portal.example/login" into
+            # "https://fbref.com?portal.example/login" -- a parser then reads
+            # the host as fbref.com instead of portal.example.  The sanitised
+            # copy still goes to the log through `evidence` above.
+            redirect_location = (
+                str(
+                    {
+                        str(key).lower(): value
+                        for key, value in dict(
+                            getattr(response, "headers", {}) or {}
+                        ).items()
+                    }.get("location")
+                    or ""
+                ).strip()
+                or None
+            )
             raise FetchError(
                 f"FBref returned HTTP {status} for {url}; "
                 f"attempts={target_requests}; "
@@ -1667,6 +1692,7 @@ class FBrefFetcher:
                 target_requests=target_requests,
                 http_status_history=tuple(status_history),
                 latency_ms=latency_ms,
+                redirect_location=redirect_location,
             )
         if not body:
             raise FetchError(
