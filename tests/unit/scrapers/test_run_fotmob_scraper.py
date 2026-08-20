@@ -855,6 +855,157 @@ class TestFotmobNativeRunner:
         assert continuous.ok is True, continuous.errors
 
     @pytest.mark.unit
+    def test_schedule_cooldown_returns_after_the_next_kickoff_not_in_two_days(self):
+        """Главный случай — матч, который на момент обхода ЕЩЁ БУДУЩИЙ.
+
+        Обход утром видит вечерний матч не начавшимся; при фиксированных 48 часах
+        никто не пришёл бы за его флагом двое суток, а без флага не качается
+        карточка (#1193). Срок обязан приземлиться вскоре ПОСЛЕ матча.
+        """
+
+        from datetime import datetime, timedelta
+
+        mod = self._module()
+        now = datetime(2026, 8, 20, 9, 0)
+
+        vecherniy = [{"utc_time": "2026-08-20T18:00:00Z"}]
+        assert mod._schedule_cooldown(vecherniy, now) == timedelta(hours=12)
+
+        # Матч уже идёт — обязательство висит прямо сейчас.
+        idet = [{"utc_time": "2026-08-20T08:00:00Z"}]
+        assert mod._schedule_cooldown(idet, now) == timedelta(hours=2)
+
+        # Ближайший матч так далеко, что срок упирается в общий потолок.
+        daleko = [{"utc_time": "2026-08-30T18:00:00Z"}]
+        assert mod._schedule_cooldown(daleko, now) == timedelta(hours=48)
+
+        # Матч через полчаса: срок = до него плюс запас на доигрывание.
+        skoro = [{"utc_time": "2026-08-20T09:30:00Z"}]
+        assert mod._schedule_cooldown(skoro, now) == timedelta(hours=3, minutes=30)
+
+        # Считается БЛИЖАЙШИЙ будущий, а не первый по списку.
+        vperemeshku = [
+            {"utc_time": "2026-08-25T18:00:00Z"},
+            {"utc_time": "2026-08-20T18:00:00Z"},
+        ]
+        assert mod._schedule_cooldown(vperemeshku, now) == timedelta(hours=12)
+
+    @pytest.mark.unit
+    def test_schedule_cooldown_ignores_settled_and_undated_matches(self):
+        """Закрытый матч обязательством не делает, мусорная дата — тоже.
+
+        `postponed` парсер сохраняет наравне с `finished`/`cancelled`
+        (`scrapers/fotmob/parsers.py:143-146`). Без него прошедший перенесённый
+        матч висел бы обязательством вечно, и турнир опрашивался бы каждые два
+        часа бесконечно.
+        """
+
+        from datetime import datetime, timedelta
+
+        mod = self._module()
+        now = datetime(2026, 8, 20, 12, 0)
+        proshedshiy = "2026-08-20T09:00:00Z"
+
+        assert mod._schedule_cooldown([], now) == timedelta(hours=48)
+        for terminal in ("finished", "cancelled", "postponed"):
+            assert mod._schedule_cooldown(
+                [{"utc_time": proshedshiy, terminal: True}], now
+            ) == timedelta(hours=48), terminal
+        assert mod._schedule_cooldown([{"utc_time": None}], now) == timedelta(hours=48)
+        assert mod._schedule_cooldown([{"utc_time": "не дата"}], now) == timedelta(
+            hours=48
+        )
+        assert mod._schedule_cooldown([{}], now) == timedelta(hours=48)
+
+    @pytest.mark.unit
+    def test_closed_current_scope_comes_back_for_the_evening_match(self):
+        """Тот же переход «будущий → сыгранный», но через настоящий ран.
+
+        Один и тот же турнир закрывается дважды: в расписании либо только
+        давно сыгранный матч (возвращаться незачем — 48 ч), либо ещё и матч
+        сегодня вечером (вернуться надо вскоре после него).
+        """
+
+        import copy
+        from datetime import datetime, timedelta, timezone
+
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _competition_payload,
+        )
+
+        mod = self._module()
+
+        def _attempt_for(*, evening_kickoff):
+            payload = _competition_payload(47, "Premier League")
+            if evening_kickoff is not None:
+                extra = copy.deepcopy(payload["fixtures"]["allMatches"][0])
+                extra["id"] = 300
+                extra["pageUrl"] = "/matches/alpha-vs-beta/x#300"
+                extra["status"]["finished"] = False
+                extra["status"]["utcTime"] = evening_kickoff
+                payload["fixtures"]["allMatches"].append(extra)
+            responses = {
+                canonicalize_target("allLeagues").canonical_url: {
+                    "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+                },
+                canonicalize_target("leagues", {"id": 47}).canonical_url: payload,
+                canonicalize_target(
+                    "matchDetails", {"matchId": "100"}
+                ).canonical_url: {
+                    "content": {"matchFacts": {"events": []}, "stats": {"x": 1}}
+                },
+            }
+            service = FotMobIngestService(
+                transport=StubTransport(responses),
+                repository=MemoryFotMobRepository(),
+                mode=RunMode.DAILY,
+                budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+                run_id="cooldown-1",
+                max_workers=1,
+            )
+            args = mod._argument_parser().parse_args(
+                [
+                    "--mode",
+                    "refresh",
+                    "--catalog-contract",
+                    "fotmob-catalog-v1",
+                    "--entities",
+                    "season,matches",
+                    "--run-id",
+                    "cooldown-1",
+                ]
+            )
+            _rc, report = _run_native_admitted(mod, args, service=service)
+            return {
+                attempt["competition_id"]: attempt
+                for attempt in report["selection"]["scope_attempts"]
+            }[47]
+
+        def _cooldown(attempt):
+            # Срок отсчитывается от начала работы над скоупом, а метка попытки
+            # ставится в её конце, поэтому номинал недостижим на миллисекунды.
+            started = datetime.fromisoformat(attempt["last_attempt_at"])
+            due = datetime.fromisoformat(attempt["next_retry_at"])
+            return due - started
+
+        # Матч через 9 часов от «сейчас» — срок обязан лечь примерно на +12 ч.
+        soon = (datetime.now(timezone.utc) + timedelta(hours=9)).strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z"
+        )
+        settled = _attempt_for(evening_kickoff=None)
+        owing = _attempt_for(evening_kickoff=soon)
+
+        assert settled["outcome"] == "success"
+        assert owing["outcome"] == "success"
+        assert timedelta(hours=47) < _cooldown(settled) <= timedelta(hours=48)
+        assert timedelta(hours=11) < _cooldown(owing) <= timedelta(hours=12)
+
+    @pytest.mark.unit
     def test_terminal_scope_is_counted_in_the_run_report(self):
         """Терминальный скоуп обязан быть виден числом, а не только цветом рана.
 

@@ -78,6 +78,31 @@ PUBLICATION_BINDING_ARGUMENTS = {
 _ACTIVE_PUBLICATION_GENERATION: str | None = None
 FOTMOB_SCOPE_JSON_ENV = "FOTMOB_SCOPE_JSON"
 
+# Кулдаун успешно закрытого скоупа текущей полосы. 48 часов означают «турнир
+# обойдён, можно не возвращаться», но флаг `finished` матчу проставляет именно
+# обход расписания: живой замер интервалов между касаниями текущего сезона даёт
+# p50 58,3 ч и p90 152,6 ч, поэтому сыгранный матч ждёт флага двое-трое суток, а
+# без флага не качается его карточка (#1193, `include_unfinished=False`). Долг
+# «сыграно по времени, но без флага» на 20.08 — 172 матча, из них 165 моложе трёх
+# суток, то есть это ровно цена кулдауна.
+#
+# Поэтому срок выбирается по ОБЯЗАТЕЛЬСТВУ, а не константой: если в расписании
+# остались матчи, чьё начало прошло, а терминального статуса нет, скоуп должен
+# вернуться на ближайшем ране. Спрос растёт только у тех турниров, у которых
+# обязательство реально висит (20.08 это 28-31 из 450), и почти весь прирост —
+# дешёвый `not_modified` (1006 из 1554 обращений `league_season` за 7 суток).
+#
+# Известный хвост: матч, которому источник НИКОГДА не проставит терминальный
+# статус (брошенный, снятый не тем полем), держит свой турнир на коротком сроке
+# бессрочно. Цена этого — один дешёвый `league_season` на ран, а таких матчей
+# живьём два в одном турнире, поэтому потолка на число коротких сроков нет:
+# он усложнил бы правило ради случая, которого пока нет.
+CURRENT_SCOPE_COOLDOWN = timedelta(hours=48)
+CURRENT_SCOPE_OBLIGATION_COOLDOWN = timedelta(hours=2)
+# Сколько ждать ПОСЛЕ начала матча, прежде чем идти за его флагом: полтора часа
+# игры плюс запас на то, что источник проставляет терминальный статус не мгновенно.
+MATCH_SETTLE_MARGIN = timedelta(hours=3)
+
 # Единственность писателя bronze (B7). max_active_runs=1 сериализует только
 # DagRun'ы одного дага, а ручной добор и осиротевший скрапер (PPid=1) пишут в те
 # же таблицы мимо неё; ретрая на конфликт коммита у FotMob нет. Захват обязан
@@ -528,6 +553,74 @@ def _catalog_decision_payload(evidence) -> dict[str, Any]:
         value = payload.get(field)
         payload[field] = value.isoformat() if isinstance(value, datetime) else value
     return payload
+
+
+def _match_kickoff(value: Any) -> datetime | None:
+    """Время начала матча источника как наивный UTC, либо None."""
+
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _match_is_settled(match: Mapping[str, Any]) -> bool:
+    """Матч, за которым больше не надо возвращаться.
+
+    `postponed` парсер сохраняет наравне с `finished`/`cancelled`
+    (`scrapers/fotmob/parsers.py:143-146`), и без него прошедший перенесённый
+    матч навсегда остаётся «обязательством»: скоуп получал бы короткий срок
+    бесконечно.
+    """
+
+    return bool(
+        match.get("finished") or match.get("cancelled") or match.get("postponed")
+    )
+
+
+def _schedule_cooldown(matches: Iterable[Mapping[str, Any]], now: datetime) -> timedelta:
+    """Через сколько вернуться к расписанию сезона.
+
+    Считается по СВЕЖЕРАЗОБРАННОМУ расписанию, а не по числу недокачанных
+    карточек: `source_missing_matches` входит в само условие успеха скоупа
+    (`scope_ok`), поэтому в ветке успеха он тождественно ноль, и признак оттуда
+    был бы всегда ложным — правка получилась бы «зелёной, но пустой».
+
+    Три случая, и средний — главный:
+
+    * матч уже начался и не закрыт — обязательство висит прямо сейчас,
+      возвращаемся ближайшим раном;
+    * ближайший матч ещё впереди — возвращаемся вскоре ПОСЛЕ него. Только это
+      и лечит корень #1193: обход, случившийся утром, видит вечерний матч ещё
+      будущим, и при фиксированных 48 часах никто не пришёл бы за его флагом
+      двое суток;
+    * впереди ничего нет — обычный долгий срок.
+
+    Матч без разбираемого времени начала обязательством не считается: иначе
+    мусорное поле держало бы скоуп на коротком сроке вечно.
+    """
+
+    earliest_future: datetime | None = None
+    for match in matches:
+        if _match_is_settled(match):
+            continue
+        kickoff = _match_kickoff(match.get("utc_time"))
+        if kickoff is None:
+            continue
+        if kickoff <= now:
+            return CURRENT_SCOPE_OBLIGATION_COOLDOWN
+        if earliest_future is None or kickoff < earliest_future:
+            earliest_future = kickoff
+    if earliest_future is None:
+        return CURRENT_SCOPE_COOLDOWN
+    # Пол здесь не нужен: у будущего матча `kickoff > now`, поэтому срок заведомо
+    # больше запаса на доигрывание.
+    return min(CURRENT_SCOPE_COOLDOWN, earliest_future + MATCH_SETTLE_MARGIN - now)
 
 
 def _scope_attempt_payload(state, *, plan_signature: str | None = None) -> dict[str, Any]:
@@ -1564,7 +1657,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     outcome="success",
                     reason="scope completion committed",
                     next_retry_at=(
-                        observed_at + timedelta(hours=48)
+                        observed_at
+                        + _schedule_cooldown(bundle.matches, observed_at)
                         if automatic_lane == ScopeLane.CURRENT
                         else None
                     ),
