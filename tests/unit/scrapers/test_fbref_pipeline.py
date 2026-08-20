@@ -55,6 +55,7 @@ from scrapers.fbref.pipeline import (
     RunValidationError,
     SENTINEL_COMPETITIONS,
     WaveResult,
+    _is_mass_redirect,
     affordable_clearance_reservation,
     backfill_season_cohort_capacity,
     frontier_target,
@@ -9908,6 +9909,10 @@ def test_moved_page_is_skipped_without_failing_the_wave(tmp_path):
     assert result.moved_pages_skipped == 1
     # The attempt is still durable evidence, not a silent skip.
     assert "fail" in control.events
+    # Handed back as 'skipped', not left claimable in 'retry': a leftover
+    # 'retry' would both re-solve inside this run and count as unfinished.
+    assert control.failed[0][1]["requeue"] is True
+    assert control.failed[0][1]["permanent"] is False
 
 
 class FakeNotFoundFetcher(FakeMovedFetcher):
@@ -9951,3 +9956,62 @@ def test_non_redirect_page_failure_still_fails_the_wave(tmp_path):
             page_kinds=["competition_index"],
             settings=_settings(),
         )
+
+
+class FakeChallengeRedirectFetcher(FakeMovedFetcher):
+    """A 302 is what a challenge or proxy error page answers with."""
+
+    def fetch(self, url, **kwargs):
+        self.events.append("http")
+        raise FetchError(
+            f"FBref returned HTTP 302 for {url}; attempts=1; "
+            "status_history=302; location=https://proxy.example/error",
+            error_class="http_status",
+            http_status=302,
+            wire_bytes=303,
+            browser_document_bytes=0,
+            browser_asset_bytes=0,
+            browser_requests=0,
+            browser_bootstrap_attempts=0,
+            browser_unobserved_bytes=0,
+            target_requests=1,
+            http_status_history=(302,),
+            latency_ms=321,
+        )
+
+
+def test_temporary_redirect_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeChallengeRedirectFetcher(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        pipeline.fetch_wave(
+            str(uuid.UUID(int=1)),
+            worker_id="worker-1",
+            page_kinds=["competition_index"],
+            settings=_settings(),
+        )
+
+
+def test_mass_redirect_breaks_the_wave_instead_of_shrinking_scope():
+    result = WaveResult(cohort_size=10, moved_pages_skipped=6)
+    assert _is_mass_redirect(result) is True
+
+
+def test_a_couple_of_moved_pages_is_not_a_mass_redirect():
+    # The motivating case: 2 retired aliases in a full daily cohort.
+    assert _is_mass_redirect(
+        WaveResult(cohort_size=25, moved_pages_skipped=2)
+    ) is False
+    # Dominating a tiny cohort is still routine below the absolute floor.
+    assert _is_mass_redirect(
+        WaveResult(cohort_size=4, moved_pages_skipped=4)
+    ) is False
