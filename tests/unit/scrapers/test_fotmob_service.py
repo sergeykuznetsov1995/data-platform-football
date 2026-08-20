@@ -14,6 +14,7 @@ from scrapers.fotmob.repository import (
     TargetCommit,
 )
 from scrapers.fotmob.service import (
+    LEADERBOARD_REFRESH_AFTER,
     PLAYER_REFRESH_AFTER,
     FotMobIngestService,
     OperationResult,
@@ -1807,8 +1808,15 @@ def test_backfill_refetches_stale_prior_generation_children():
     service, transport, repository = _service(responses, mode=RunMode.BACKFILL)
     now = datetime.now(timezone.utc)
     stale = (
-        # лидерборд: старше LEADERBOARD_REFRESH_AFTER (24 ч)
-        ("leaderboard", canonicalize_target(leaderboard_url), "goals", timedelta(hours=25)),
+        # лидерборд: старше LEADERBOARD_REFRESH_AFTER. Возраст берём от самой
+        # константы, а не числом: тест проверяет «прошлое поколение перекачивается»,
+        # и при пересмотре порога он не должен молча начать проверять другое.
+        (
+            "leaderboard",
+            canonicalize_target(leaderboard_url),
+            "goals",
+            LEADERBOARD_REFRESH_AFTER + timedelta(hours=1),
+        ),
         # команда: старше окна обновления состава (20 ч)
         ("team", canonicalize_target(team_url), "1", timedelta(hours=21)),
         # игрок: старше окна карточки игрока (PLAYER_REFRESH_AFTER, 14 суток)
@@ -2752,6 +2760,65 @@ def test_leaderboard_freshness_is_keyed_by_url_not_category_name():
 
     assert result.skipped == 0
     assert [call[0] for call in transport.calls] == [other_url]
+
+
+def test_leaderboard_threshold_outlives_the_lane_period():
+    """A6/#1198: порог таблиц лидеров обязан быть ДЛИННЕЕ периода полосы.
+
+    Урок 74: период полосы контура — 24 часа, поэтому порог, равный периоду или
+    короче, не отсекает практически ничего. Прежние 24 часа были ровно таким
+    декоративным порогом: замер 20.08 за 7 суток дал у leaderboard 25 368 сетевых
+    обращений (28,2 % физического бюджета) при медиане реального цикла повтора
+    57,7 часа — то есть цель и так ходила вдвое реже порога.
+
+    Тест держит две вещи разом: конкретное принятое значение и правило, по
+    которому оно выбрано. Возврат к 24 часам (или к любому значению ≤ периода
+    полосы) обязан ронять этот тест, а не проходить молча.
+    """
+
+    lane_period = timedelta(hours=24)
+
+    assert LEADERBOARD_REFRESH_AFTER == timedelta(hours=72)
+    assert LEADERBOARD_REFRESH_AFTER > lane_period
+    # 57,7 ч — измеренная медиана; порог обязан её перекрывать, иначе он не
+    # отсекает даже те повторы, которые цель делает сама по себе.
+    assert LEADERBOARD_REFRESH_AFTER > timedelta(hours=57, minutes=42)
+
+
+def test_stale_leaderboard_past_the_threshold_is_still_refetched():
+    """Обратная сторона порога: перешагнувший его лидерборд обязан перекачаться.
+
+    Возраст записи задан ОТНОСИТЕЛЬНО константы, поэтому тест остаётся зелёным
+    при любом её значении — от бесконечного порога он не защищает, это делает
+    `test_leaderboard_threshold_outlives_the_lane_period`. Здесь проверяется
+    другое: что предикат свежести не вывернут и пропуск не безусловен, то есть
+    что старая запись действительно приводит к сетевому вызову.
+    """
+
+    url = "https://data.fotmob.com/stats/47/season/goals.json"
+    payload = copy.deepcopy(_league_payload())
+    payload["stats"]["players"][0]["fetchAllUrl"] = url
+    bundle = parse_season_bundle(payload, ScopeRef(47, "2025/2026"))
+
+    service, transport, repository = _service({url: {"TopLists": []}})
+    repository.record(
+        TargetCommit(
+            run_id="prior-run",
+            target_type="leaderboard",
+            target_key=canonicalize_target(url).target_key,
+            status=ManifestStatus.SUCCESS,
+            entity_id="goals",
+            content_hash="a" * 64,
+            raw_uri="memory://own.json.gz",
+            completed_at=datetime.now(timezone.utc)
+            - (LEADERBOARD_REFRESH_AFTER + timedelta(hours=1)),
+        )
+    )
+
+    result = service.sync_leaderboards(bundle)
+
+    assert result.skipped == 0
+    assert [call[0] for call in transport.calls] == [url]
 
 
 def test_player_refresh_is_rarer_but_first_collection_is_never_delayed():
