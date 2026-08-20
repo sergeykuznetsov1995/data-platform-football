@@ -20,6 +20,7 @@ from scrapers.sofascore.capture_engine import (
 from scrapers.sofascore.manifest import (
     EndpointManifest,
     InMemoryManifestStore,
+    ManifestKey,
     ManifestStatus,
 )
 from scrapers.sofascore.pipeline import (
@@ -39,6 +40,7 @@ from scrapers.sofascore.season_pipeline import (
     build_season_specs,
     build_squad_spec,
     build_standings_total_spec,
+    SeasonPartitionPlan,
     materialize_season_partition,
     plan_season_partition,
     replay_season_partition,
@@ -1419,6 +1421,9 @@ def test_runner_live_season_uses_proven_slug_url_and_committed_completeness(
     def plan(*, complete, missing, pending):
         return SimpleNamespace(
             complete=complete,
+            # These stubs carry no referee endpoint, so the player-phase view
+            # of readiness is the same as `complete` (mirror the real plan).
+            player_universe_ready=complete,
             specs=(spec,),
             missing_raw_keys=(key,) if missing else (),
             pending_keys=(key,) if pending else (),
@@ -1551,7 +1556,7 @@ def test_runner_live_player_reports_committed_not_deferred_completeness(
     )
     runtime = CaptureRuntime(engine, object(), object())
     pending = {"10": set(PLAYER_PATHS)}
-    season_plan = SimpleNamespace(complete=True)
+    season_plan = SimpleNamespace(complete=True, player_universe_ready=True)
     scraper = MagicMock()
     scraper.__enter__.return_value = scraper
     scraper.__exit__.return_value = False
@@ -1690,7 +1695,7 @@ def _player_capture_with_an_empty_signature(tmp_path, monkeypatch, probe, output
     with (
         patch(
             "scrapers.sofascore.season_pipeline.plan_season_partition",
-            return_value=SimpleNamespace(complete=True),
+            return_value=SimpleNamespace(complete=True, player_universe_ready=True),
         ),
         patch(
             "scrapers.sofascore.season_pipeline.squad_player_ids",
@@ -1805,7 +1810,7 @@ def test_runner_refuses_new_local_player_outside_signed_post_match_plan(
     with (
         patch(
             "scrapers.sofascore.season_pipeline.plan_season_partition",
-            return_value=SimpleNamespace(complete=True),
+            return_value=SimpleNamespace(complete=True, player_universe_ready=True),
         ),
         patch(
             "scrapers.sofascore.season_pipeline.squad_player_ids",
@@ -1980,6 +1985,76 @@ def test_partition_materializer_collapses_cross_page_repeat_with_ticking_user_co
     assert repeats[0]["source_page_direction"] == "last"
     assert repeats[0]["home_team_user_count"] == 59171
     assert repeats[0]["tournament_unique_tournament_user_count"] == 32989
+
+
+def _plan_with_missing(*endpoints, pending=None):
+    """Bare plan whose missing/pending raw keys are the named endpoints."""
+
+    def _key(endpoint):
+        return ManifestKey(
+            source_tournament_id="17",
+            source_season_id="76986",
+            target_type="season",
+            target_id=f"{endpoint}:1",
+            endpoint=endpoint,
+            freshness_key="day-2026-08-20",
+        )
+
+    keys = tuple(_key(endpoint) for endpoint in endpoints)
+    pending_keys = (
+        keys if pending is None else tuple(_key(endpoint) for endpoint in pending)
+    )
+    return SeasonPartitionPlan(
+        source_tournament_id="17",
+        source_season_id="76986",
+        freshness_key="day-2026-08-20",
+        event_freshness_key="final",
+        specs=(),
+        pending_keys=pending_keys,
+        missing_raw_keys=keys,
+        schedule_event_ids=(),
+        team_ids=(),
+        referee_ids=(),
+    )
+
+
+@pytest.mark.unit
+def test_referee_profile_does_not_block_the_player_universe():
+    """C2: the player branch has been dead since 2026-07-24 because a referee
+    profile counted as evidence about who PLAYED.
+
+    Referees are discovered partly from event pages captured AFTER the season
+    phase, so demanding their profiles before the player phase of the same run
+    is impossible by construction — any league that played a round is
+    guaranteed 'incomplete' that day. A referee profile is an attribute of the
+    match, not of the squad, so it must not gate players. Everything else still
+    does.
+    """
+    plan = _plan_with_missing("referee_profile")
+    assert plan.missing_raw_keys  # still captured, just not blocking
+    assert plan.player_blocking_missing_raw_keys == ()
+    assert plan.player_universe_ready is True
+
+
+@pytest.mark.unit
+def test_a_missing_squad_still_blocks_the_player_universe():
+    """The relaxation is referee-only: a missing squad is real evidence about
+    who played and must keep the player phase closed."""
+    plan = _plan_with_missing("referee_profile", "squads")
+    blocking = plan.player_blocking_missing_raw_keys
+    assert [key.endpoint for key in blocking] == ["squads"]
+    assert plan.player_universe_ready is False
+
+
+@pytest.mark.unit
+def test_player_universe_stays_closed_while_evidence_gaps_remain():
+    """`player_universe_evidence_gaps` is a different signal from raw keys and
+    must keep blocking regardless of which endpoints are pending."""
+    plan = replace(
+        _plan_with_missing("referee_profile"),
+        player_universe_evidence_gaps=("participants omitted team 42",),
+    )
+    assert plan.player_universe_ready is False
 
 
 @pytest.mark.unit

@@ -71,6 +71,13 @@ class SeasonMaterializationError(RuntimeError):
     """A planned season partition failed a fail-closed publication gate."""
 
 
+# Endpoints that are captured with the season but say nothing about WHO PLAYED,
+# so they must not gate the player phase. See
+# SeasonPartitionPlan.player_blocking_missing_raw_keys for why refereeing is the
+# one such endpoint today.
+_PLAYER_NONBLOCKING_ENDPOINTS = frozenset({"referee_profile"})
+
+
 @dataclass(frozen=True)
 class SeasonPartitionPlan:
     """Network-free endpoint plan derived only from committed local state.
@@ -97,6 +104,37 @@ class SeasonPartitionPlan:
     @property
     def complete(self) -> bool:
         return not self.pending_keys and not self.player_universe_evidence_gaps
+
+    @property
+    def player_blocking_missing_raw_keys(self) -> tuple[ManifestKey, ...]:
+        """Missing raw that really does gate the player universe.
+
+        A referee profile is an attribute of the MATCH, not evidence about who
+        played, and referees are discovered partly from event pages captured
+        after the season phase (see ``_event_referee_from_stored_page``). So
+        requiring their profiles before the player phase of the SAME run is
+        impossible by construction: any league that played a round leaves
+        ``referee_profile`` missing that day, and the player branch fails
+        closed for every league because of it (dead since 2026-07-24). The
+        profiles are still planned and captured — just on the next run.
+        """
+
+        return tuple(
+            key
+            for key in self.missing_raw_keys
+            if key.endpoint not in _PLAYER_NONBLOCKING_ENDPOINTS
+        )
+
+    @property
+    def player_universe_ready(self) -> bool:
+        """``complete`` for the player phase: referee profiles excluded."""
+
+        if self.player_universe_evidence_gaps:
+            return False
+        return not any(
+            key.endpoint not in _PLAYER_NONBLOCKING_ENDPOINTS
+            for key in self.pending_keys
+        )
 
 
 @dataclass(frozen=True)

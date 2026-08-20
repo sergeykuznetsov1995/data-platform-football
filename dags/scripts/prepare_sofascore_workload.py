@@ -460,7 +460,15 @@ def prepare_workload_plan(
                 )
             )
             continue
-        if season_plan.missing_raw_keys:
+        # Referee profiles are captured with the season but say nothing about
+        # who played, and they only become discoverable AFTER the match phase —
+        # so for the player phase they must not count as missing evidence.
+        blocking_missing = (
+            season_plan.player_blocking_missing_raw_keys
+            if phase == "players"
+            else season_plan.missing_raw_keys
+        )
+        if blocking_missing:
             # A league whose season raw is still incomplete simply has nothing
             # to capture yet — it resumes on the next run. Failing the phase
             # here made ONE stuck league cost every other league its details:
@@ -472,7 +480,7 @@ def prepare_workload_plan(
             incomplete_partitions.append(f"{item.league}={canonical}")
             print(
                 f"SofaScore {phase} plan drops {item.league} {canonical}: "
-                f"season raw is incomplete ({len(season_plan.missing_raw_keys)} "
+                f"season raw is incomplete ({len(blocking_missing)} "
                 "missing keys)",
                 file=sys.stderr,
             )

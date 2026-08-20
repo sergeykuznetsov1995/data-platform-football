@@ -104,6 +104,13 @@ def _catalog():
 
 
 def _common_patches(plan):
+    # Mirror the real SeasonPartitionPlan: the player phase asks for the
+    # referee-tolerant view of the missing raw. A stub that lacks it would let
+    # the planner pass on a shape production never sees (lesson: mocks must
+    # describe prod reality). Unless a test says otherwise, its "missing" key
+    # is a genuine blocker, not a referee profile.
+    if not hasattr(plan, "player_blocking_missing_raw_keys"):
+        plan.player_blocking_missing_raw_keys = plan.missing_raw_keys
     runtime = SimpleNamespace(raw_store=MagicMock(), manifest_store=MagicMock())
     return (
         patch(
@@ -632,6 +639,62 @@ def test_target_phase_isolates_one_incomplete_league_from_its_neighbours(
     # give two batches), and it carries the healthy league's finished matches.
     assert len(match_allocations) == 1, [item.task_id for item in match_allocations]
     assert sorted(target_ids(match_allocations[0]), key=int) == ["1", "2", "3"]
+
+
+def test_players_phase_ignores_a_referee_only_gap(tmp_path, monkeypatch):
+    """C2 wiring: a league whose ONLY missing season raw is a referee profile
+    must still get a real player plan.
+
+    Referees surface from event pages captured after the season phase, so any
+    league that played a round looks 'incomplete' on the day — which is why the
+    player branch died on 2026-07-24. The planner must consult the
+    referee-tolerant view, not the raw one.
+    """
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    referee_only = SimpleNamespace(
+        missing_raw_keys=("referee_profile",),
+        player_blocking_missing_raw_keys=(),
+    )
+    patches = _common_patches(referee_only)
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patch(
+            "dags.scripts.prepare_sofascore_workload._finished_match_ids",
+            return_value={"7"},
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._pending_targets",
+            # Matches are all terminal; the player is the only pending target.
+            side_effect=lambda _runtime, ids, _builder: (
+                () if ids == {"7"} else tuple(sorted(ids))
+            ),
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._observed_player_ids",
+            return_value={"901"},
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload.squad_player_ids",
+            return_value={"901"},
+        ),
+    ):
+        path = prepare_workload_plan(
+            dag_id="dag_ingest_sofascore",
+            base_run_id="scheduled-1",
+            phase="players",
+            competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=tmp_path / "player-plan.json",
+        )
+
+    signed = load_plan(path, control_token=TOKEN)
+    # The league is planned for real (a clean-empty drop would sign neither a
+    # universe nor a player allocation).
+    assert len(signed.player_universe_ids) == 1
+    assert [item.scope for item in signed.allocations] == ["player"]
 
 
 def test_target_phase_still_fails_when_every_league_is_incomplete(
