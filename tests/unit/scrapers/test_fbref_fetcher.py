@@ -1104,3 +1104,117 @@ def test_redirect_chain_stops_after_one_hop():
     assert caught.value.http_status == 301
     assert caught.value.http_status_history == (301, 301)
     assert fetcher._http_session.get.call_count == 2
+
+
+def test_redirect_hop_waits_the_source_minimum_interval():
+    target = (
+        "https://fbref.com/en/comps/33/2026-2027/"
+        "2026-2027-2-Bundesliga-Stats"
+    )
+    fetcher = _fetcher([
+        _response(
+            status=301,
+            body=b"moved",
+            headers={"content-type": "text/html", "location": target},
+        ),
+        _response(status=200),
+    ])
+
+    fetcher.fetch(
+        "https://fbref.com/en/comps/33/2-Bundesliga-Stats",
+        page_kind="season",
+    )
+
+    fetcher._sleep.assert_called_once_with(fetcher.status_retry_delay_seconds)
+
+
+def test_scheme_downgrading_redirect_is_not_followed():
+    fetcher = _fetcher(
+        _response(
+            status=301,
+            body=b"moved",
+            headers={
+                "content-type": "text/html",
+                "location": "http://fbref.com/en/comps/33/2026-2027/x-Stats",
+            },
+        )
+    )
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch(
+            "https://fbref.com/en/comps/33/2-Bundesliga-Stats",
+            page_kind="season",
+        )
+
+    assert caught.value.http_status_history == (301,)
+    assert fetcher._http_session.get.call_count == 1
+
+
+def test_redirect_to_a_different_entity_is_not_followed():
+    fetcher = _fetcher(
+        _response(
+            status=301,
+            body=b"moved",
+            headers={
+                "content-type": "text/html",
+                # Same host, different competition id: foreign HTML would be
+                # committed under this target's identity.
+                "location": "https://fbref.com/en/comps/20/Bundesliga-Stats",
+            },
+        )
+    )
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch(
+            "https://fbref.com/en/comps/33/2-Bundesliga-Stats",
+            page_kind="season",
+        )
+
+    assert caught.value.http_status_history == (301,)
+    assert fetcher._http_session.get.call_count == 1
+
+
+def test_redirect_index_target_is_not_followed():
+    fetcher = _fetcher(
+        _response(
+            status=301,
+            body=b"moved",
+            headers={
+                "content-type": "text/html",
+                "location": "https://fbref.com/en/comps/",
+            },
+        )
+    )
+
+    with pytest.raises(FetchError):
+        fetcher.fetch(
+            "https://fbref.com/en/comps/33/2-Bundesliga-Stats",
+            page_kind="season",
+        )
+
+    assert fetcher._http_session.get.call_count == 1
+
+
+def test_failure_after_a_followed_hop_names_the_fetched_address():
+    target = (
+        "https://fbref.com/en/comps/33/2026-2027/"
+        "2026-2027-2-Bundesliga-Stats"
+    )
+    fetcher = _fetcher([
+        _response(
+            status=301,
+            body=b"moved",
+            headers={"content-type": "text/html", "location": target},
+        ),
+        _response(status=404, body=b"gone"),
+    ])
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch(
+            "https://fbref.com/en/comps/33/2-Bundesliga-Stats",
+            page_kind="season",
+        )
+
+    assert caught.value.http_status == 404
+    assert caught.value.http_status_history == (301, 404)
+    assert f"followed_redirect_to={target}" in str(caught.value)

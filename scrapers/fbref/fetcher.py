@@ -1471,26 +1471,49 @@ class FBrefFetcher:
         return ",".join(evidence)
 
     @staticmethod
+    def _entity_prefix(path: str) -> Optional[tuple[str, ...]]:
+        """Return the ``/en/<kind>/<id>`` head that identifies one entity."""
+
+        segments = tuple(item for item in path.split("/") if item)
+        if len(segments) < 3:
+            return None
+        return segments[:3]
+
+    @classmethod
     def _same_host_redirect_target(
+        cls,
         source_url: str,
         location: object,
     ) -> Optional[str]:
-        """Resolve one same-host redirect target, or None when unusable.
+        """Resolve one redirect target inside the same entity, else None.
 
         Redirects stay disabled on the transport: a moved page must never
-        become a *different* page behind our back.  Only a target on the very
-        same host is eligible, and the caller follows it exactly once, so a
-        redirect loop cannot quietly spend the target's request budget.
+        become a *different* page behind our back.  Same host is not enough
+        for that promise -- FBref answers a retired alias with a redirect to
+        an index or to another competition, and the parser cannot notice
+        foreign HTML committed under our target's identity (it only checks
+        the record echoes its own target_id/page_kind/content_hash).  So the
+        target must also keep the ``/en/<kind>/<id>`` head, which the alias ->
+        season case satisfies.  The scheme may not be downgraded either: a
+        plaintext hop would leak session cookies and break the impersonated
+        TLS fingerprint the whole transport is built on.  The caller follows
+        at most one hop, so a redirect loop cannot spend the request budget.
         """
 
         raw_location = str(location or "").strip()
         if not raw_location:
             return None
+        split_source = urlsplit(source_url)
         target = urljoin(source_url, raw_location)
         split_target = urlsplit(target)
-        if split_target.scheme not in {"http", "https"}:
+        if split_target.scheme != split_source.scheme:
             return None
-        if split_target.netloc != urlsplit(source_url).netloc:
+        if split_target.netloc != split_source.netloc:
+            return None
+        source_prefix = cls._entity_prefix(split_source.path)
+        if source_prefix is None:
+            return None
+        if cls._entity_prefix(split_target.path) != source_prefix:
             return None
         return target
 
@@ -1628,6 +1651,11 @@ class FBrefFetcher:
                 if redirect_target is not None:
                     redirect_followed = True
                     request_url = redirect_target
+                    # The hop is a second request to fbref.com and owes the
+                    # source the same minimum spacing as the 5xx retry below.
+                    # Firing it back-to-back doubles the instantaneous rate
+                    # and buys a challenge for the whole wave.
+                    self._sleep(self.status_retry_delay_seconds)
                     continue
             if body_buffer.exceeded:
                 (
@@ -1704,7 +1732,15 @@ class FBrefFetcher:
                 f"FBref returned HTTP {status} for {url}; "
                 f"attempts={target_requests}; "
                 f"status_history={','.join(map(str, status_history))}; "
-                f"{evidence}",
+                # Name the address actually fetched: after a hop the final
+                # response carries no Location, so without this the failure
+                # would hide which URL produced it.
+                + (
+                    f"followed_redirect_to={request_url}; "
+                    if redirect_followed
+                    else ""
+                )
+                + f"{evidence}",
                 error_class="http_status",
                 http_status=status,
                 wire_bytes=wire_bytes,
