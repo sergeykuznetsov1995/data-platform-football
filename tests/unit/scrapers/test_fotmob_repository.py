@@ -9,6 +9,7 @@ import pytest
 from scrapers.fotmob.repository import (
     CURRENT_VIEW_SPECS,
     LEGACY_PARSER_VERSION,
+    _COMMIT_CONFLICT_RETRIES,
     PARSER_VERSION,
     REPLACE_TARGET_MANIFEST_IDENTITIES,
     FotMobRepository,
@@ -1850,6 +1851,184 @@ def test_inventory_preload_failure_does_not_leave_half_target_buffered():
     assert written_tables.count("fotmob_matches") == 1
     assert written_tables.count("fotmob_field_inventory") == 1
     assert written_tables.count("fotmob_ingest_manifest") == 1
+
+
+class _ConflictWriter(ReconcileWriter):
+    """Падает конфликтом коммита Iceberg — до записи или уже ПОСЛЕ неё.
+
+    Второй режим моделирует настоящий staged-путь общего писателя: INSERT в
+    цель коммитится и только потом удаляется временный стейдж, поэтому
+    распознаваемый конфликт может прилететь, когда строки уже видны.
+    """
+
+    _CONFLICT = (
+        "SQL execution failed: Failed to commit the transaction during write: "
+        "conflicting files"
+    )
+
+    def __init__(self, *, table, when="before", times=1):
+        super().__init__()
+        self.table = table
+        self.when = when
+        self.times = times
+        self.attempts = []
+
+    def write_dataframe(self, df, **kwargs):
+        table = kwargs["table"]
+        self.attempts.append(table)
+        if table == self.table and self.times:
+            self.times -= 1
+            if self.when == "after":
+                # Коммит состоялся: строки уже видны, отказ пришёл на уборке.
+                self.calls.append((df.copy(), dict(kwargs)))
+                self.rows.setdefault(table, []).extend(df.to_dict("records"))
+            raise RuntimeError(self._CONFLICT)
+        return super().write_dataframe(df, **kwargs)
+
+
+def _matches_dataset():
+    return TableRows(
+        "fotmob_matches",
+        [{"competition_id": "289", "source_season_key": "2017/2019", "match_id": "1"}],
+        "matches",
+        ("competition_id", "source_season_key"),
+    )
+
+
+def test_flush_retries_commit_conflict_that_landed_nothing(monkeypatch):
+    """Проигранная гонка снимка не должна стоить цели целиком (#1199).
+
+    Общие bronze-таблицы FotMob пишет не только волна контура: замок B7 держит
+    единственность СВОЕГО писателя, но чужой коммит в тот же снимок всё равно
+    отправляет наш в ICEBERG_COMMIT_ERROR.
+    """
+
+    monkeypatch.setattr("scrapers.fotmob.repository.time.sleep", lambda _: None)
+    writer = _ConflictWriter(table="fotmob_matches", when="before", times=2)
+    repository = FotMobRepository(writer=writer, batch_size=50)
+
+    repository.commit(_commit(), [_matches_dataset()])
+    repository.flush()
+
+    assert writer.attempts.count("fotmob_matches") == 3
+    assert len(writer.rows["fotmob_matches"]) == 1
+    assert len(writer.rows["fotmob_ingest_manifest"]) == 1
+
+
+def test_flush_retry_does_not_duplicate_rows_a_conflict_reported_after_the_commit(
+    monkeypatch,
+):
+    """Конфликт НЕ доказывает, что ничего не записалось.
+
+    Общий писатель коммитит INSERT в цель и только потом удаляет временный
+    стейдж, поэтому распознаваемый конфликт может прилететь уже после того, как
+    строки стали видны. Ретрай вокруг одной физической записи задвоил бы цель;
+    повтор всего flush() начинается со сверки по `_target_batch_id`, снимает
+    подтверждённый пакет с буфера и дописывает только недостающее.
+    """
+
+    monkeypatch.setattr("scrapers.fotmob.repository.time.sleep", lambda _: None)
+    writer = _ConflictWriter(table="fotmob_matches", when="after", times=1)
+    repository = FotMobRepository(writer=writer, batch_size=50)
+
+    repository.commit(_commit(), [_matches_dataset()])
+    repository.flush()
+
+    assert writer.attempts.count("fotmob_matches") == 1
+    assert len(writer.rows["fotmob_matches"]) == 1
+    assert len(writer.rows["fotmob_ingest_manifest"]) == 1
+    assert any(
+        "GROUP BY _target_batch_id" in query for query in writer.trino.queries
+    )
+
+
+def test_flush_retry_keeps_written_table_evidence_for_the_silver_gate(monkeypatch):
+    """Список записанных таблиц обязан пережить ретрай.
+
+    По нему даг строит `bronze_inputs_changed` и решает, пересобирать ли silver
+    (`dag_ingest_fotmob.py:833-875`). Запись, чьи строки легли, но которая потом
+    упала, своего пути не возвращает — значит подтвердить её может только сверка.
+    Иначе повторённый flush даёт зелёный ран поверх устаревшей витрины.
+    """
+
+    monkeypatch.setattr("scrapers.fotmob.repository.time.sleep", lambda _: None)
+    writer = _ConflictWriter(table="fotmob_matches", when="after", times=1)
+    repository = FotMobRepository(writer=writer, batch_size=50)
+
+    repository.commit(_commit(), [_matches_dataset()])
+    paths = repository.flush()
+
+    assert "iceberg.bronze.fotmob_matches" in paths
+    assert "iceberg.bronze.fotmob_ingest_manifest" in paths
+    assert len(paths) == len(set(paths))
+
+
+def test_flush_retry_keeps_manifest_evidence_when_the_manifest_write_conflicts(
+    monkeypatch,
+):
+    """То же самое для манифеста: он пишется последним и падает отдельно."""
+
+    monkeypatch.setattr("scrapers.fotmob.repository.time.sleep", lambda _: None)
+    writer = _ConflictWriter(table="fotmob_ingest_manifest", when="after", times=1)
+    repository = FotMobRepository(writer=writer, batch_size=50)
+
+    repository.commit(_commit(), [_matches_dataset()])
+    paths = repository.flush()
+
+    assert "iceberg.bronze.fotmob_matches" in paths
+    assert "iceberg.bronze.fotmob_ingest_manifest" in paths
+    assert len(writer.rows["fotmob_ingest_manifest"]) == 1
+    assert len(writer.rows["fotmob_matches"]) == 1
+
+
+def test_flush_without_any_conflict_reports_exactly_what_it_wrote():
+    """Регрессия: обычный flush не должен приобрести лишних путей."""
+
+    writer = ReconcileWriter()
+    repository = FotMobRepository(writer=writer, batch_size=50)
+
+    repository.commit(_commit(), [_matches_dataset()])
+    paths = repository.flush()
+
+    assert paths == [
+        "iceberg.bronze.fotmob_matches",
+        "iceberg.bronze.fotmob_ingest_manifest",
+    ]
+
+
+def test_flush_retry_ignores_every_failure_that_is_not_a_commit_conflict(monkeypatch):
+    """Отказ, после которого строки могли остаться, повторять нельзя."""
+
+    monkeypatch.setattr("scrapers.fotmob.repository.time.sleep", lambda _: None)
+    writer = ReconcileWriter(fail_after_commit="fotmob_matches")
+    repository = FotMobRepository(writer=writer, batch_size=50)
+
+    repository.commit(_commit(), [_matches_dataset()])
+    with pytest.raises(RuntimeError, match="lost writer response"):
+        repository.flush()
+
+    assert len(writer.rows["fotmob_matches"]) == 1
+    assert "fotmob_ingest_manifest" not in writer.rows
+
+
+def test_flush_conflict_that_never_clears_fails_the_target_on_a_bounded_schedule(
+    monkeypatch,
+):
+    """Исчерпанный ретрай красит цель, а паузы — ровно те, что заявлены."""
+
+    slept = []
+    monkeypatch.setattr("scrapers.fotmob.repository.time.sleep", slept.append)
+    monkeypatch.setattr("scrapers.fotmob.repository.random.uniform", lambda _a, _b: 0.0)
+    writer = _ConflictWriter(table="fotmob_matches", when="before", times=99)
+    repository = FotMobRepository(writer=writer, batch_size=50)
+
+    repository.commit(_commit(), [_matches_dataset()])
+    with pytest.raises(RuntimeError, match="conflicting files"):
+        repository.flush()
+
+    assert writer.attempts.count("fotmob_matches") == _COMMIT_CONFLICT_RETRIES
+    assert slept == [0.5, 1.0, 2.0, 4.0]
+    assert "fotmob_matches" not in writer.rows
 
 
 def test_failed_flush_retry_writes_inventory_rows_exactly_once():
