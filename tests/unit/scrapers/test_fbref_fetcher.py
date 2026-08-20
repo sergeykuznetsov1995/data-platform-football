@@ -997,3 +997,41 @@ def test_redirect_failure_evidence_names_location_target():
         "location=https://fbref.com/en/comps/33/2026-2027/"
         "2026-2027-2-Bundesliga-Stats" in str(caught.value)
     )
+
+
+def test_redirect_failure_carries_the_location_as_a_field():
+    # The pipeline decides whether a page "moved" from this field, not from
+    # the message text: if this assignment is lost, a 301 kills the wave again.
+    target = (
+        "https://fbref.com/en/comps/33/2026-2027/"
+        "2026-2027-2-Bundesliga-Stats"
+    )
+    fetcher = _fetcher(
+        _response(
+            status=301,
+            body=b"moved",
+            headers={"content-type": "text/html", "location": target},
+        )
+    )
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch(
+            "https://fbref.com/en/comps/33/2-Bundesliga-Stats",
+            page_kind="season",
+        )
+
+    assert caught.value.redirect_location == target
+
+
+def test_failure_without_a_location_header_carries_no_redirect_location():
+    fetcher = _fetcher(
+        _response(status=404, body=b"gone", headers={"content-type": "text/html"})
+    )
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch(
+            "https://fbref.com/en/comps/33/2-Bundesliga-Stats",
+            page_kind="season",
+        )
+
+    assert caught.value.redirect_location is None

@@ -1656,13 +1656,16 @@ class FBrefFetcher:
             )
         if status != 200:
             evidence = self._failure_response_evidence(response, body)
-            redirect_location = self._safe_header_value(
-                {
-                    str(key).lower(): value
-                    for key, value in dict(
-                        getattr(response, "headers", {}) or {}
-                    ).items()
-                }.get("location")
+            redirect_location = (
+                self._safe_header_value(
+                    {
+                        str(key).lower(): value
+                        for key, value in dict(
+                            getattr(response, "headers", {}) or {}
+                        ).items()
+                    }.get("location")
+                )
+                or None
             )
             raise FetchError(
                 f"FBref returned HTTP {status} for {url}; "

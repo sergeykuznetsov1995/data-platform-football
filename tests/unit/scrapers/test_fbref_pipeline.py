@@ -4,6 +4,7 @@ import hashlib
 import gzip
 import gc
 import json
+import logging
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -10203,3 +10204,122 @@ def test_run_ceiling_stops_a_hijack_spread_thin_across_waves(tmp_path):
             settings=_settings(),
             max_batches=80,
         )
+
+
+class FakeSeeOtherStatusFetcher(FakeMovedFetcher):
+    """303 rewrites the method and is never a "the page moved" statement."""
+
+    STATUS = 303
+    LOCATION = "https://fbref.com/en/comps/33/somewhere-else"
+
+
+def test_see_other_303_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeSeeOtherStatusFetcher)
+
+
+def test_moved_page_skip_is_logged_with_its_location(tmp_path, caplog):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    with caplog.at_level(logging.WARNING, logger="scrapers.fbref.pipeline"):
+        result = _wave_with(control, FakeMovedFetcher)
+
+    assert result.moved_pages_skipped == 1
+    assert "skips moved page" in caplog.text
+    assert FakeMovedFetcher.LOCATION in caplog.text
+
+
+def test_wave_gate_boundaries_are_exact():
+    # Exactly at the absolute floor: still routine (the check is > not >=).
+    assert _is_mass_redirect(
+        WaveResult(cohort_size=10, moved_pages_skipped=5)
+    ) is False
+    # One above the floor, and past half the cohort: fires.
+    assert _is_mass_redirect(
+        WaveResult(cohort_size=10, moved_pages_skipped=6)
+    ) is True
+    # Above the floor but exactly half the cohort: does not fire.
+    assert _is_mass_redirect(
+        WaveResult(cohort_size=12, moved_pages_skipped=6)
+    ) is False
+
+
+def test_run_ceiling_boundary_is_exact():
+    # Exactly at the ceiling is still allowed; one more is not.
+    assert _is_run_mass_redirect(
+        WaveResult(cohort_size=2000, moved_pages_skipped=25)
+    ) is False
+    assert _is_run_mass_redirect(
+        WaveResult(cohort_size=2000, moved_pages_skipped=26)
+    ) is True
+
+
+def test_moved_page_is_spared_on_the_paid_persistent_path(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = PersistentFakeControl(raw)
+
+    class MovedMeteredFetcher(PersistentFakeFetcher):
+        """The production shape behind a 301: a paid persistent session.
+
+        ``reset_clearance`` mirrors the real FBrefFetcher (fetcher.py:489);
+        without it the wave takes the branch that drops the fetcher and the
+        session close reports lost ownership -- an artefact of the fake, not
+        of this code path.
+        """
+
+        def reset_clearance(self):
+            self.events.append("reset_clearance")
+
+        def fetch(self, url, **_kwargs):
+            self.events.append("http_error")
+            raise FetchError(
+                f"FBref returned HTTP 301 for {url}; attempts=1; "
+                "status_history=301; location=https://fbref.com/en/comps/33/"
+                "2026-2027/2026-2027-2-Bundesliga-Stats",
+                error_class="http_status",
+                http_status=301,
+                wire_bytes=80,
+                browser_document_bytes=20,
+                browser_asset_bytes=10,
+                browser_requests=1,
+                browser_bootstrap_attempts=1,
+                provider_billed_bytes=120,
+                target_requests=1,
+                http_status_history=(301,),
+                redirect_location=(
+                    "https://fbref.com/en/comps/33/2026-2027/"
+                    "2026-2027-2-Bundesliga-Stats"
+                ),
+            )
+
+    fetcher = MovedMeteredFetcher(control.events)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_args: fetcher,
+        sleep=lambda _seconds: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="persistent-moved",
+        page_kinds=["competition_index"],
+        settings=_persistent_settings(),
+    )
+
+    # The production paid path, not just the plain one.
+    assert result.failures == []
+    assert result.moved_pages_skipped == 1
+    assert control.failed[0][1]["requeue"] is True
+    # Exact settlement still happened: the paid bytes are on the attempt.
+    assert control.failed[0][1]["provider_billed_bytes"] == 120
+    # And the session was recycled, as for any other page failure.
+    assert "reset_clearance" in control.events
