@@ -201,9 +201,13 @@ class FetchError(RuntimeError):
         http_requests: Optional[int] = None,
         http_status_history: Optional[Sequence[int]] = None,
         latency_ms: int = 0,
+        redirect_location: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.error_class = error_class
+        # Where a 3xx pointed, when the source bothered to say.  A redirect
+        # without it is not a usable "the page moved" statement.
+        self.redirect_location = redirect_location
         self.http_status = http_status
         self.wire_bytes = wire_bytes
         self.browser_document_bytes = browser_document_bytes
@@ -1652,6 +1656,14 @@ class FBrefFetcher:
             )
         if status != 200:
             evidence = self._failure_response_evidence(response, body)
+            redirect_location = self._safe_header_value(
+                {
+                    str(key).lower(): value
+                    for key, value in dict(
+                        getattr(response, "headers", {}) or {}
+                    ).items()
+                }.get("location")
+            )
             raise FetchError(
                 f"FBref returned HTTP {status} for {url}; "
                 f"attempts={target_requests}; "
@@ -1668,6 +1680,7 @@ class FBrefFetcher:
                 target_requests=target_requests,
                 http_status_history=tuple(status_history),
                 latency_ms=latency_ms,
+                redirect_location=redirect_location,
             )
         if not body:
             raise FetchError(

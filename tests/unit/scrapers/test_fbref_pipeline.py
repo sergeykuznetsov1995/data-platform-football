@@ -9852,6 +9852,11 @@ def test_discovery_batch_within_the_ceiling_stays_one_atomic_write(tmp_path):
 class FakeMovedFetcher:
     """A source that answers with a redirect instead of the page."""
 
+    STATUS = 301
+    LOCATION = (
+        "https://fbref.com/en/comps/33/2026-2027/2026-2027-2-Bundesliga-Stats"
+    )
+
     def __init__(self, events):
         self.events = events
 
@@ -9869,11 +9874,10 @@ class FakeMovedFetcher:
     def fetch(self, url, **kwargs):
         self.events.append("http")
         raise FetchError(
-            f"FBref returned HTTP 301 for {url}; attempts=1; "
-            "status_history=301; location=https://fbref.com/en/comps/33/"
-            "2026-2027/2026-2027-2-Bundesliga-Stats",
+            f"FBref returned HTTP {self.STATUS} for {url}; attempts=1; "
+            f"status_history={self.STATUS}; location={self.LOCATION}",
             error_class="http_status",
-            http_status=301,
+            http_status=self.STATUS,
             wire_bytes=303,
             browser_document_bytes=0,
             browser_asset_bytes=0,
@@ -9881,8 +9885,9 @@ class FakeMovedFetcher:
             browser_bootstrap_attempts=0,
             browser_unobserved_bytes=0,
             target_requests=1,
-            http_status_history=(301,),
+            http_status_history=(self.STATUS,),
             latency_ms=321,
+            redirect_location=self.LOCATION,
         )
 
 
@@ -9962,25 +9967,33 @@ def test_non_redirect_page_failure_still_fails_the_wave(tmp_path):
 
 
 class FakeChallengeRedirectFetcher(FakeMovedFetcher):
-    """A 302 is what a challenge or proxy error page answers with."""
+    """A 302 is what a challenge or proxy error page answers with.
 
-    def fetch(self, url, **kwargs):
-        self.events.append("http")
-        raise FetchError(
-            f"FBref returned HTTP 302 for {url}; attempts=1; "
-            "status_history=302; location=https://proxy.example/error",
-            error_class="http_status",
-            http_status=302,
-            wire_bytes=303,
-            browser_document_bytes=0,
-            browser_asset_bytes=0,
-            browser_requests=0,
-            browser_bootstrap_attempts=0,
-            browser_unobserved_bytes=0,
-            target_requests=1,
-            http_status_history=(302,),
-            latency_ms=321,
-        )
+    Location is present on purpose: the wave must fail because of the
+    *status*, not because the header happened to be missing.
+    """
+
+    STATUS = 302
+    LOCATION = "https://fbref.com/en/comps/33/somewhere-else"
+
+
+class FakeSeeOtherRedirectFetcher(FakeMovedFetcher):
+    """307 keeps the method but is still a temporary answer."""
+
+    STATUS = 307
+    LOCATION = "https://fbref.com/en/comps/33/somewhere-else"
+
+
+class FakePermanentlyRelocatedFetcher(FakeMovedFetcher):
+    """308 is 301's method-preserving twin and must be treated alike."""
+
+    STATUS = 308
+
+
+class FakeLocationlessRedirectFetcher(FakeMovedFetcher):
+    """A 301 with no Location names no address and is not actionable."""
+
+    LOCATION = None
 
 
 def test_temporary_redirect_still_fails_the_wave(tmp_path):
@@ -10113,3 +10126,80 @@ def test_run_level_cap_leaves_a_handful_of_dead_aliases_alone():
     assert _is_run_mass_redirect(
         WaveResult(cohort_size=2000, moved_pages_skipped=2)
     ) is False
+
+
+def _wave_with(control, fetcher_cls, settings=None):
+    raw = control.raw if hasattr(control, "raw") else None
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: fetcher_cls(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+    return pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="worker-1",
+        page_kinds=["competition_index"],
+        settings=settings or _settings(),
+    )
+
+
+def test_permanent_308_is_spared_like_301(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    result = _wave_with(control, FakePermanentlyRelocatedFetcher)
+
+    assert result.failures == []
+    assert result.moved_pages_skipped == 1
+
+
+def test_temporary_307_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeSeeOtherRedirectFetcher)
+
+
+def test_redirect_without_location_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    # Permanent status, but no address to name or act on: not a usable
+    # "the page moved" statement, so it must stay loud.
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeLocationlessRedirectFetcher)
+
+
+def test_run_ceiling_stops_a_hijack_spread_thin_across_waves(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    # Each wave stays under the per-wave gate (5 of a 25-page cohort never
+    # exceeds half of it), so only the run-wide ceiling can end this.
+    def fake_fetch(*args, _live_session, **kwargs):
+        _live_session.fetcher = object()
+        _live_session.needs_clearance = False
+        return WaveResult(claimed=25, cohort_size=25, moved_pages_skipped=5)
+
+    def fake_parse(*args, **kwargs):
+        return WaveResult(cohort_size=25, parsed=20)
+
+    pipeline.fetch_wave = fake_fetch
+    pipeline.parse_wave = fake_parse
+
+    with pytest.raises(FetchWaveError, match="mass_redirect_run"):
+        pipeline.run_live_waves(
+            str(uuid.uuid4()),
+            worker_id="current-live",
+            page_kinds=["competition_index"],
+            settings=_settings(),
+            max_batches=80,
+        )

@@ -173,11 +173,13 @@ CLEARANCE_REJECTED_STATUSES = frozenset({401, 403, 429})
 # Note these statuses are deliberately absent from
 # CLEARANCE_REJECTED_STATUSES above, so the redirect is never mistaken for the
 # source rejecting our clearance.  The session is still recycled afterwards,
-# exactly as it is for any other page failure -- that cost is paid once per
-# dead address, not daily, because the page is dead-lettered on the spot.
-# Only the PERMANENT redirects are listed: 302/303/307
-# are what a Cloudflare challenge or a proxy error page answers with, and
-# those must stay loud failures rather than silently shrink the scope.
+# exactly as it is for any other page failure, and the page is handed back to
+# the queue rather than dead-lettered, so that recycling recurs while the
+# address stays broken -- see the requeue rationale at the failure branch.
+# Only the PERMANENT redirects are listed: 302/303/307 are what a Cloudflare
+# challenge or a proxy error page answers with, and those must stay loud
+# failures rather than silently shrink the scope.  A redirect without a
+# Location header is not a usable "moved" statement either, and stays loud.
 MOVED_PAGE_STATUSES = frozenset({301, 308})
 # Above this count, and only when moved pages also dominate their wave, a
 # redirect stops looking like a couple of retired aliases and starts looking
@@ -1050,11 +1052,18 @@ def _session_failure(exc: FetchError) -> bool:
 
 
 def _moved_page_failure(exc: FetchError) -> bool:
-    """True when the source answered with a redirect instead of the page."""
+    """True when the source said, usably, that the page moved for good.
+
+    A permanent status alone is not that statement: without a ``Location``
+    there is no address to name in the log or to act on later, and an
+    interstitial can answer 301 with no target at all.  Such a response stays
+    a loud failure.
+    """
 
     return (
         exc.error_class == "http_status"
         and exc.http_status in MOVED_PAGE_STATUSES
+        and bool(getattr(exc, "redirect_location", None))
     )
 
 
