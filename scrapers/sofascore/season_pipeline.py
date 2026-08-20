@@ -1047,6 +1047,32 @@ _SCHEDULE_LINEAGE_COLUMNS = frozenset({
 })
 
 
+# Columns that answer "WHICH match is this row about". If two rows sharing one
+# game_id disagree here, two different matches were merged under one id — a
+# cross-contamination that must stay a hard error. Everything else describes
+# the match's mutable state (kick-off, round, status, score, detail id), and
+# the source legally moves that between two page fetches of one run: a match
+# rescheduled mid-crawl used to raise "duplicate schedule natural key" and drop
+# the season, which on 2026-08-20 cost the match phase of ALL fourteen leagues
+# (FRA-Ligue 1 game 16311125, conflicting columns detail_id/round_info_round/
+# start_timestamp).
+_SCHEDULE_IDENTITY_COLUMNS = frozenset({
+    "game_id",
+    "home_team_id",
+    "away_team_id",
+    "season_id",
+    "source_tournament_id",
+    "source_season_id",
+})
+
+
+def _schedule_observed_at(row: Mapping[str, object]) -> str:
+    """Sort key picking the fresher of two observations of one match."""
+
+    value = row.get("raw_fetched_at")
+    return "" if value is None else str(value)
+
+
 def _is_volatile_schedule_column(column: str) -> bool:
     """Popularity counters that tick between two page fetches of one run.
 
@@ -1332,8 +1358,6 @@ def materialize_season_partition(
             previous = _schedule_payload(existing)
             current = _schedule_payload(row)
             cross_page = existing.get("raw_blob_key") != row.get("raw_blob_key")
-            if previous == current and cross_page:
-                continue
             # Name the disagreeing columns: without them a conflict costs a
             # raw-store forensic dig before anyone can tell a live-feed race
             # from a parser defect.
@@ -1342,6 +1366,17 @@ def materialize_season_partition(
                 for k in set(previous) | set(current)
                 if previous.get(k) != current.get(k)
             )
+            if cross_page and not _SCHEDULE_IDENTITY_COLUMNS.intersection(conflicts):
+                # Same match seen twice across pages. Identical payload keeps
+                # the first-seen row (page provenance and follower counters
+                # included); a moved kick-off/round/status means the source
+                # updated the match between fetches, so the fresher
+                # observation wins.
+                if conflicts and _schedule_observed_at(row) > _schedule_observed_at(
+                    existing
+                ):
+                    deduped_schedule[key] = row
+                continue
             detail = (
                 f"conflicting columns: {conflicts}"
                 if conflicts

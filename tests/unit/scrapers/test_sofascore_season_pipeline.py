@@ -1874,22 +1874,33 @@ def _replayed_partition_with_cross_page_repeat(
     tmp_path,
     *,
     mutate=False,
+    mutate_identity=False,
     user_count_tick=False,
 ):
     """Partition whose live-feed pages repeat event 14000001 on BOTH pages.
 
     A live paginated feed (e.g. the World Cup knockout stage) can shift a
     settled match between page windows, so the same event legally appears on
-    two different pages with an identical payload (#951). ``mutate`` makes the
-    repeat's payload disagree — a data conflict that must stay a hard error.
-    ``user_count_tick`` moves only the popularity counters between the two
-    fetches, which is what the source really does (#1071).
+    two different pages with an identical payload (#951). ``mutate`` moves the
+    repeat's KICK-OFF — the source rescheduling a match between two page
+    fetches of one run, which is legal and must collapse. ``mutate_identity``
+    swaps the home team, i.e. two different matches merged under one id — a
+    data conflict that must stay a hard error. ``user_count_tick`` moves only
+    the popularity counters between the two fetches, which is what the source
+    really does (#1071).
     """
     raw_store = _raw_store(tmp_path)
     manifest = InMemoryManifestStore()
     event = _schedule_event(14000001)
     if mutate:
         event["startTimestamp"] = int(event.get("startTimestamp") or 0) + 3600
+    if mutate_identity:
+        # Swap the sides: both teams stay in the participants roster, so this
+        # trips the duplicate guard and not an earlier squad/evidence check.
+        event["homeTeam"], event["awayTeam"] = (
+            dict(event["awayTeam"]),
+            dict(event["homeTeam"]),
+        )
     schedule_last_payload = None
     if user_count_tick:
         schedule_last_payload = _payload(FIXTURE_PATHS["schedule_last"])
@@ -1972,12 +1983,44 @@ def test_partition_materializer_collapses_cross_page_repeat_with_ticking_user_co
 
 
 @pytest.mark.unit
-def test_partition_materializer_rejects_cross_page_payload_conflict(tmp_path):
-    """A cross-page repeat whose match payload disagrees is a data conflict,
-    not pagination noise — it must remain a hard error."""
+def test_partition_materializer_collapses_rescheduled_cross_page_repeat(tmp_path):
+    """Live incident 2026-08-20: a match moved between two page fetches of one
+    run dropped the WHOLE day for every league.
+
+    ``duplicate schedule natural key: ('FRA-Ligue 1','2627','16311125')
+    (conflicting columns: ['detail_id','round_info_round','start_timestamp'])``
+    — the same match, same teams, a new kick-off. Rescheduling is a legal
+    source event, so the repeat must collapse and the NEWER observation must
+    win; only a disagreement about WHICH match this is stays a hard error.
+    """
     plan, results = _replayed_partition_with_cross_page_repeat(
         tmp_path,
         mutate=True,
+    )
+    materialization = materialize_season_partition(
+        plan,
+        results,
+        canonical_league="ENG-Premier League",
+        canonical_season="2025/26",
+    )
+    repeats = [
+        row
+        for row in materialization.schedule_rows
+        if str(row["game_id"]) == "14000001"
+    ]
+    assert len(repeats) == 1
+    # The rescheduled (next-page) observation is the newer one and wins.
+    assert repeats[0]["source_page_direction"] == "next"
+
+
+@pytest.mark.unit
+def test_partition_materializer_rejects_cross_page_identity_conflict(tmp_path):
+    """A cross-page repeat whose IDENTITY disagrees (a different home team
+    under the same game_id) is cross-contamination, not pagination noise — it
+    must remain a hard error."""
+    plan, results = _replayed_partition_with_cross_page_repeat(
+        tmp_path,
+        mutate_identity=True,
     )
     with pytest.raises(SeasonMaterializationError, match="duplicate schedule"):
         materialize_season_partition(
@@ -1995,7 +2038,7 @@ def test_partition_materializer_conflict_names_the_disagreeing_columns(tmp_path)
     live-feed race from a parser defect (#1071)."""
     plan, results = _replayed_partition_with_cross_page_repeat(
         tmp_path,
-        mutate=True,
+        mutate_identity=True,
     )
     with pytest.raises(SeasonMaterializationError) as excinfo:
         materialize_season_partition(
@@ -2006,7 +2049,7 @@ def test_partition_materializer_conflict_names_the_disagreeing_columns(tmp_path)
         )
     message = str(excinfo.value)
     assert "conflicting columns" in message
-    assert "start_timestamp" in message
+    assert "home_team_id" in message
     assert "user_count" not in message
 
 
