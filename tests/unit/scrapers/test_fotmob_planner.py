@@ -164,6 +164,73 @@ def test_terminal_scope_returns_to_the_plan_after_ttl():
     assert [item.competition_id for item in plan] == [48, 47]
 
 
+def _history_attempt(now, age, outcome):
+    return {
+        (47, "2019/2020"): ScopeAttemptState(
+            competition_id=47,
+            source_season_key="2019/2020",
+            plan_signature="fmplan1-test",
+            attempt_count=2,
+            last_attempt_at=now - age,
+            next_retry_at=None,
+            outcome=outcome,
+            reason="source reports fewer matches than the catalog advertises",
+        )
+    }
+
+
+def _history_plan(now, attempts):
+    """Полоса истории обязательна: на CURRENT проверка пройдёт вхолостую."""
+
+    return plan_seasons(
+        [_classified(47), _classified(48)],
+        [
+            SeasonRef(47, "2019/2020", source_order=6),
+            SeasonRef(48, "2019/2020", source_order=6),
+        ],
+        mode=RunMode.BACKFILL,
+        lane=ScopeLane.HISTORY,
+        attempt_states=attempts,
+        now=now,
+    )
+
+
+def test_fresh_history_source_gap_stays_out_of_the_plan():
+    now = datetime(2026, 8, 20, 10)
+    plan = _history_plan(
+        now, _history_attempt(now, timedelta(days=29), "source_gap")
+    )
+
+    assert [item.competition_id for item in plan] == [48]
+
+
+def test_history_source_gap_returns_to_the_plan_after_review_ttl():
+    """Дыра источника у истории не должна быть безвозвратной.
+
+    У CURRENT раннер ставит `next_retry_at` +48 ч, у HISTORY срок не ставится
+    вовсе, и исход `source_gap` вычёркивал скоуп из обхода навсегда. Кампания
+    истории раздаёт этот исход массово, поэтому её собственная ошибка закрепилась
+    бы как «источник не отдаёт» — тихая дыра при зелёных ранах.
+    """
+
+    now = datetime(2026, 8, 20, 10)
+    plan = _history_plan(
+        now, _history_attempt(now, timedelta(days=31), "source_gap")
+    )
+
+    # 48 впереди по справедливости обхода: его не пробовали ни разу.
+    assert [item.competition_id for item in plan] == [48, 47]
+
+
+def test_history_success_is_never_replanned_by_the_review_ttl():
+    """Срок пересмотра дан именно дыре источника, а не собранному скоупу."""
+
+    now = datetime(2026, 8, 20, 10)
+    plan = _history_plan(now, _history_attempt(now, timedelta(days=400), "success"))
+
+    assert [item.competition_id for item in plan] == [48]
+
+
 def test_excluded_and_review_required_competitions_stay_out_of_ingest_plan():
     plan = plan_seasons(
         [

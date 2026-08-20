@@ -80,6 +80,17 @@ SCOPE_PLAN_SIGNATURE_VERSION = "fotmob-scope-plan-v1"
 # которую не видно ни по цвету рана, ни по числу закрытых скоупов.
 TERMINAL_RETRY_AFTER = timedelta(hours=24)
 
+# Сколько признанная дыра источника держит исторический скоуп вне планов.
+# У CURRENT-полосы возврат есть: раннер ставит такому скоупу next_retry_at +48 ч.
+# У HISTORY срок не ставится вовсе, а исход `source_gap` вычёркивал скоуп из
+# обхода навсегда — то есть одна ошибочная дыра становилась безвозвратной. На
+# редких дырах текущего контура (живьём 20.08 таких пять, безвозвратная одна)
+# это терпимо, но кампания истории раздаёт исход source_gap массово, и без
+# срока пересмотра её собственные ошибки закрепились бы как «источник не
+# отдаёт». Пересмотр отсчитывается от последней попытки, а не от next_retry_at:
+# у уже накопленных строк этого срока просто нет.
+SOURCE_GAP_REVIEW_AFTER = timedelta(days=30)
+
 
 def _naive_utc(value: datetime) -> datetime:
     if value.tzinfo is not None:
@@ -290,9 +301,13 @@ def plan_seasons(
 
         attempt = attempts.get(identity)
         if attempt is not None:
+            if attempt.outcome == "success" and lane != ScopeLane.CURRENT:
+                continue
             if (
-                attempt.outcome in {"success", "source_gap"}
+                attempt.outcome == "source_gap"
                 and lane != ScopeLane.CURRENT
+                and observed_now - _naive_utc(attempt.last_attempt_at)
+                < SOURCE_GAP_REVIEW_AFTER
             ):
                 continue
             if (
@@ -359,6 +374,7 @@ def utc_run_id(prefix: str = "fotmob") -> str:
 __all__ = [
     "MANDATORY_COMPETITION_IDS",
     "SCOPE_PLAN_SIGNATURE_VERSION",
+    "SOURCE_GAP_REVIEW_AFTER",
     "BudgetExceeded",
     "BudgetLedger",
     "RunMode",
