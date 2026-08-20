@@ -10239,6 +10239,89 @@ def test_see_other_303_still_fails_the_wave(tmp_path):
         _wave_with(control, FakeSeeOtherStatusFetcher)
 
 
+class FakeHijackedExitFetcher(FakeMovedFetcher):
+    """A captive portal answering 301 with its own login page."""
+
+    LOCATION = "https://portal.example/login"
+
+
+def test_redirect_off_the_source_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    # Shrinking the scope on somebody else's say-so is how a hijacked exit
+    # quietly drops pages: the mass gates only catch a wholesale takeover, so
+    # a handful of stolen pages would otherwise pass every one of them.
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeHijackedExitFetcher)
+
+
+class FakeUserinfoDisguiseFetcher(FakeMovedFetcher):
+    """A hijack dressed as the source through a userinfo segment."""
+
+    LOCATION = "https://fbref.com@portal.example/login"
+
+
+def test_redirect_disguised_by_userinfo_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    # The host here is portal.example, not fbref.com.  Sanitising the header
+    # before parsing it would rewrite '@' to '?' and make this read as the
+    # source's own address -- which is why the raw value is what gets parsed.
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeUserinfoDisguiseFetcher)
+
+
+class FakePlainHttpRedirectFetcher(FakeMovedFetcher):
+    """The right host, but downgraded to a scheme anyone can forge."""
+
+    LOCATION = "http://fbref.com/en/comps/33/2026-2027/2026-2027-Stats"
+
+
+def test_plain_http_redirect_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakePlainHttpRedirectFetcher)
+
+
+class FakeProtocolRelativeRedirectFetcher(FakeMovedFetcher):
+    """`//host/path` names a host that is not ours to assume."""
+
+    LOCATION = "//portal.example/login"
+
+
+def test_protocol_relative_redirect_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeProtocolRelativeRedirectFetcher)
+
+
+class FakeRelativeRedirectFetcher(FakeMovedFetcher):
+    """A relative Location is same-origin by construction."""
+
+    LOCATION = "/en/comps/33/2026-2027/2026-2027-2-Bundesliga-Stats"
+
+
+def test_relative_redirect_is_spared_like_an_absolute_one(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    result = _wave_with(control, FakeRelativeRedirectFetcher)
+
+    assert result.failures == []
+    assert result.moved_pages_skipped == 1
+
+
 def test_moved_page_skip_is_logged_with_its_location(tmp_path, caplog):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)

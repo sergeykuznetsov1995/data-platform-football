@@ -1023,6 +1023,54 @@ def test_redirect_failure_carries_the_location_as_a_field():
     assert caught.value.redirect_location == target
 
 
+def test_redirect_location_field_keeps_the_raw_header():
+    # The scope-shrinking decision is made from this field, so it must not be
+    # sanitised first: _safe_header_value rewrites '@' to '?', which would
+    # turn a hijacker's host into the source's own and let the redirect be
+    # swallowed as "the page moved".  The log still gets the sanitised copy.
+    target = "https://fbref.com@portal.example/login?next=%2Fen%2Fcomps"
+    fetcher = _fetcher(
+        _response(
+            status=301,
+            body=b"moved",
+            headers={"content-type": "text/html", "location": target},
+        )
+    )
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch(
+            "https://fbref.com/en/comps/33/2-Bundesliga-Stats",
+            page_kind="season",
+        )
+
+    assert caught.value.redirect_location == target
+    assert "location=https://fbref.com?portal.example/login?next=?2Fen?2Fcomps" in str(
+        caught.value
+    )
+
+
+def test_redirect_location_field_is_not_truncated():
+    # The sanitiser cuts at 160 characters; a URL parsed for its host must not
+    # arrive already cut.
+    target = "https://fbref.com/en/comps/33/" + ("segment/" * 30)
+    fetcher = _fetcher(
+        _response(
+            status=301,
+            body=b"moved",
+            headers={"content-type": "text/html", "location": target},
+        )
+    )
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch(
+            "https://fbref.com/en/comps/33/2-Bundesliga-Stats",
+            page_kind="season",
+        )
+
+    assert len(target) > 160
+    assert caught.value.redirect_location == target
+
+
 def test_failure_without_a_location_header_carries_no_redirect_location():
     fetcher = _fetcher(
         _response(status=404, body=b"gone", headers={"content-type": "text/html"})

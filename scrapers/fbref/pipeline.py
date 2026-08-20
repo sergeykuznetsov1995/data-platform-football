@@ -18,6 +18,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Mapping, Optional, Sequence
+from urllib.parse import urlparse
 
 from scrapers.fbref.bronze import (
     FBrefGenericBronzeWriter,
@@ -188,6 +189,14 @@ MAX_ROUTINE_MOVED_PAGES = 5
 # One whole cohort's worth of dead addresses across an entire run is already
 # far beyond the handful of retired aliases this exists for.
 MAX_RUN_MOVED_PAGES = 25
+# A moved-page verdict shrinks the crawl scope quietly, so it may only be
+# reached for an address that still belongs to the source.  A captive portal
+# or a hijacked residential exit answering 301 with its own login page must
+# stay a loud failure: the ceilings above only catch a wholesale hijack, and
+# four stolen pages in a cohort of twenty-five would pass every one of them.
+# Other hosts -- another subdomain, a CDN -- are to be allowed deliberately
+# once seen, not trusted in advance.
+MOVED_PAGE_HOST = "fbref.com"
 # Each consecutive refresh costs one browser solve, so a source that rejects
 # fresh clearances outright must still fail the wave rather than launch
 # browsers in a loop. A productive warm session resets this streak: later
@@ -1051,19 +1060,46 @@ def _session_failure(exc: FetchError) -> bool:
     ) or exc.error_class.startswith("warm_session_")
 
 
+def _moved_page_points_at_source(location: str) -> bool:
+    """True when a redirect stays on the source, so the scope may shrink.
+
+    Anything else -- a captive portal, a hijacking exit, a plain-HTTP hop --
+    is not the source retiring an address, and must not be swallowed quietly.
+    The value must be the raw header: a sanitised one can read as the source
+    when it is not.
+    """
+
+    candidate = location.strip()
+    if not candidate:
+        return False
+    if candidate.startswith("//"):
+        # Protocol-relative: the host after the slashes is somebody else's to
+        # name, so this is not a same-origin statement.
+        return False
+    if candidate.startswith("/"):
+        return True
+    parsed = urlparse(candidate)
+    if parsed.scheme != "https":
+        return False
+    return (parsed.hostname or "").casefold() == MOVED_PAGE_HOST
+
+
 def _moved_page_failure(exc: FetchError) -> bool:
     """True when the source said, usably, that the page moved for good.
 
     A permanent status alone is not that statement: without a ``Location``
     there is no address to name in the log or to act on later, and an
-    interstitial can answer 301 with no target at all.  Such a response stays
-    a loud failure.
+    interstitial can answer 301 with no target at all.  Neither is a redirect
+    that leaves the source -- see ``_moved_page_points_at_source``.  Such a
+    response stays a loud failure.
     """
 
     return (
         exc.error_class == "http_status"
         and exc.http_status in MOVED_PAGE_STATUSES
-        and bool(getattr(exc, "redirect_location", None))
+        and _moved_page_points_at_source(
+            str(getattr(exc, "redirect_location", "") or "")
+        )
     )
 
 

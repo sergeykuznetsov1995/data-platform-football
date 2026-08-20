@@ -1656,15 +1656,24 @@ class FBrefFetcher:
             )
         if status != 200:
             evidence = self._failure_response_evidence(response, body)
+            # The raw header, deliberately unsanitised: this value decides
+            # whether a redirect may shrink the crawl scope, and
+            # _safe_header_value would change the answer.  It truncates at 160
+            # characters and rewrites everything outside its allowlist to '?',
+            # which turns "https://fbref.com@portal.example/login" into
+            # "https://fbref.com?portal.example/login" -- a parser then reads
+            # the host as fbref.com instead of portal.example.  The sanitised
+            # copy still goes to the log through `evidence` above.
             redirect_location = (
-                self._safe_header_value(
+                str(
                     {
                         str(key).lower(): value
                         for key, value in dict(
                             getattr(response, "headers", {}) or {}
                         ).items()
                     }.get("location")
-                )
+                    or ""
+                ).strip()
                 or None
             )
             raise FetchError(
