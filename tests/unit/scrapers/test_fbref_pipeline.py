@@ -56,6 +56,7 @@ from scrapers.fbref.pipeline import (
     SENTINEL_COMPETITIONS,
     WaveResult,
     _is_mass_redirect,
+    _is_run_mass_redirect,
     affordable_clearance_reservation,
     backfill_season_cohort_capacity,
     frontier_target,
@@ -9909,10 +9910,11 @@ def test_moved_page_is_skipped_without_failing_the_wave(tmp_path):
     assert result.moved_pages_skipped == 1
     # The attempt is still durable evidence, not a silent skip.
     assert "fail" in control.events
-    # Handed back as 'skipped', not left claimable in 'retry': a leftover
-    # 'retry' would both re-solve inside this run and count as unfinished.
-    assert control.failed[0][1]["requeue"] is True
-    assert control.failed[0][1]["permanent"] is False
+    # Dead-lettered, not left claimable in 'retry' and not requeued: 'retry'
+    # would re-solve inside this run and count as unfinished, while 'queued'
+    # would sort the dead address to the head of every later cohort.
+    assert control.failed[0][1]["permanent"] is True
+    assert control.failed[0][1]["requeue"] is False
 
 
 class FakeNotFoundFetcher(FakeMovedFetcher):
@@ -10014,4 +10016,99 @@ def test_a_couple_of_moved_pages_is_not_a_mass_redirect():
     # Dominating a tiny cohort is still routine below the absolute floor.
     assert _is_mass_redirect(
         WaveResult(cohort_size=4, moved_pages_skipped=4)
+    ) is False
+
+
+class FakeHijackedControl(FakeControl):
+    """A cohort wide enough to reach the mass-redirect gate."""
+
+    COHORT = 12
+
+    def __init__(self, raw):
+        super().__init__(raw)
+        self.session_close_statuses = []
+
+    def close_clearance_session(self, session_id, **kwargs):
+        self.events.append("session_close")
+        self.session_close_statuses.append(kwargs.get("status"))
+
+    def claim_targets(
+        self,
+        run_id,
+        worker_id,
+        *,
+        limit,
+        lease_seconds,
+        page_kinds=None,
+        refresh_policies=None,
+    ):
+        self.events.append("claim")
+        leases = [
+            TargetLease(
+                attempt_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"a{index}")),
+                run_id=run_id,
+                target_id=f"fbref:season:{index}:2026-2027",
+                logical_refresh_id=str(
+                    uuid.uuid5(uuid.NAMESPACE_URL, f"r{index}")
+                ),
+                canonical_url=(
+                    f"https://fbref.com/en/comps/{index}/League-Stats"
+                ),
+                page_kind="season",
+                source_ids={
+                    "competition_id": str(index),
+                    "season_id": "2026-2027",
+                },
+                claim_token=str(uuid.uuid5(uuid.NAMESPACE_URL, f"t{index}")),
+                lease_epoch=1,
+                attempt_number=1,
+                leased_by=worker_id,
+                lease_expires_at=NOW + timedelta(minutes=10),
+            )
+            for index in range(self.COHORT)
+        ]
+        return leases[:limit]
+
+
+def test_a_hijacked_cohort_fails_the_wave_and_blames_the_session(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeHijackedControl(raw)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeMovedFetcher(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    # A cohort wide enough that redirects can dominate it: the gate needs
+    # both the absolute floor and more than half the wave.
+    settings = replace(_settings(), shard_size=12, request_limit=60)
+
+    with pytest.raises(FetchWaveError, match="mass_redirect"):
+        pipeline.fetch_wave(
+            str(uuid.UUID(int=1)),
+            worker_id="worker-1",
+            page_kinds=["season"],
+            settings=settings,
+        )
+
+    # The verdict must be decided before the session is closed, or the exit
+    # that hijacked the cohort is recorded as healthy on the way out.
+    assert control.session_close_statuses == ["failed"]
+
+
+def test_run_level_cap_catches_a_hijack_too_thin_for_any_single_wave():
+    # 20% of every 25-page cohort stays under the per-wave floor forever,
+    # so only the run-wide ceiling can see it.
+    thin_hijack = WaveResult(cohort_size=2000, moved_pages_skipped=400)
+    assert _is_mass_redirect(thin_hijack) is False
+    assert _is_run_mass_redirect(thin_hijack) is True
+
+
+def test_run_level_cap_leaves_a_handful_of_dead_aliases_alone():
+    # The motivating case across a whole run: comps 33 and 59, every wave.
+    assert _is_run_mass_redirect(
+        WaveResult(cohort_size=2000, moved_pages_skipped=2)
     ) is False

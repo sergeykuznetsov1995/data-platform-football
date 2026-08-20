@@ -171,8 +171,11 @@ CLEARANCE_REJECTED_STATUSES = frozenset({401, 403, 429})
 # such page is a gap in that page; losing the whole wave to it is a gap in
 # every other competition, which is what happened daily from 2026-08-18 on.
 # Note these statuses are deliberately absent from
-# CLEARANCE_REJECTED_STATUSES above: the session is healthy, so it is neither
-# re-solved nor blamed.  Only the PERMANENT redirects are listed: 302/303/307
+# CLEARANCE_REJECTED_STATUSES above, so the redirect is never mistaken for the
+# source rejecting our clearance.  The session is still recycled afterwards,
+# exactly as it is for any other page failure -- that cost is paid once per
+# dead address, not daily, because the page is dead-lettered on the spot.
+# Only the PERMANENT redirects are listed: 302/303/307
 # are what a Cloudflare challenge or a proxy error page answers with, and
 # those must stay loud failures rather than silently shrink the scope.
 MOVED_PAGE_STATUSES = frozenset({301, 308})
@@ -180,6 +183,9 @@ MOVED_PAGE_STATUSES = frozenset({301, 308})
 # redirect stops looking like a couple of retired aliases and starts looking
 # like an exit hijacking the cohort.
 MAX_ROUTINE_MOVED_PAGES = 5
+# One whole cohort's worth of dead addresses across an entire run is already
+# far beyond the handful of retired aliases this exists for.
+MAX_RUN_MOVED_PAGES = 25
 # Each consecutive refresh costs one browser solve, so a source that rejects
 # fresh clearances outright must still fail the wave rather than launch
 # browsers in a loop. A productive warm session resets this streak: later
@@ -1057,6 +1063,18 @@ def _is_mass_redirect(result: "WaveResult") -> bool:
 
     moved = result.moved_pages_skipped
     return moved > MAX_ROUTINE_MOVED_PAGES and moved * 2 > result.cohort_size
+
+
+def _is_run_mass_redirect(fetch: "WaveResult") -> bool:
+    """Catch a hijack too thin for any single wave to notice.
+
+    The per-wave test needs redirects to dominate their own cohort.  An exit
+    that hijacks a fifth of navigations stays under it in every one of the
+    run's up-to-80 waves while quietly dropping hundreds of targets from the
+    crawl scope, so the run keeps its own ceiling.
+    """
+
+    return fetch.moved_pages_skipped > MAX_RUN_MOVED_PAGES
 
 
 def _sentinel_gate_errors(coverage: object) -> list[str]:
@@ -3320,18 +3338,20 @@ class FBrefPipeline:
                             error_class=exc.error_class,
                             error_message=str(exc),
                             retry_delay_seconds=60,
+                            # 301/308 mean the address is permanently gone,
+                            # so dead-letter it: 'dead'/'failed' keeps it out
+                            # of every later cohort and out of the unfinished
+                            # count.  'retry' would stay claimable 60s later
+                            # and buy a fresh solve and paid lease per repeat;
+                            # 'queued' (requeue) would null retry_after and
+                            # leave next_fetch_at frozen in the past, so the
+                            # dead address would sort to the HEAD of every
+                            # later cohort -- the known starvation mine.
                             permanent=(
                                 exc.error_class == "response_too_large"
+                                or moved
                             ),
-                            # A moved page is handed back as 'skipped', the
-                            # same shape the other wave-sparing paths use.
-                            # Leaving it 'retry' would keep it claimable 60s
-                            # later -- buying a fresh solve and paid lease per
-                            # repeat for a page that cannot return 200 -- and
-                            # both gates count a leftover 'retry' as an
-                            # unfinished target, so the run would still end
-                            # red, just later and under another name.
-                            requeue=moved,
+                            requeue=False,
                             http_status=exc.http_status,
                             http_request_count=exc.http_requests,
                             http_status_history=exc.http_status_history,
@@ -3471,6 +3491,19 @@ class FBrefPipeline:
                         # conservative target evidence. Stop before a second
                         # paid session and let abort_run settle that reserve.
                         break
+            if _is_mass_redirect(result):
+                # Sparing a couple of retired aliases is the point.  Sparing a
+                # cohort's worth of them is not a property of those pages --
+                # it is an exit or a challenge answering every navigation with
+                # a redirect -- and silently shrinking the crawl scope is the
+                # one outcome worse than stopping.  This must be decided
+                # BEFORE the finally below, or the session that hijacked the
+                # cohort would be closed as healthy and its metering
+                # reconciled on the way out.
+                result.failures.append(
+                    f"mass_redirect={result.moved_pages_skipped}"
+                    f"/{result.cohort_size}"
+                )
         finally:
             if owns_session:
                 live_session.close(
@@ -3479,16 +3512,6 @@ class FBrefPipeline:
                 )
                 if settings.persistent_http_session and not result.failures:
                     self.control.assert_persistent_metering_reconciled(run_id)
-        if _is_mass_redirect(result):
-            # Sparing a couple of retired aliases is the point.  Sparing a
-            # cohort's worth of them is not a property of those pages -- it is
-            # an exit or a challenge answering every navigation with a
-            # redirect -- and silently shrinking the crawl scope is the one
-            # outcome worse than stopping.
-            result.failures.append(
-                f"mass_redirect={result.moved_pages_skipped}"
-                f"/{result.cohort_size}"
-            )
         if result.failures:
             raise FetchWaveError("; ".join(result.failures))
         return result
@@ -3565,6 +3588,12 @@ class FBrefPipeline:
                 aggregate.batches = batch
                 self._merge_wave_result(aggregate.fetch, fetched)
                 self._merge_wave_result(aggregate.parse, parsed)
+
+                if _is_run_mass_redirect(aggregate.fetch):
+                    raise FetchWaveError(
+                        "mass_redirect_run="
+                        f"{aggregate.fetch.moved_pages_skipped}"
+                    )
 
                 if fetched.budget_exhausted:
                     break
