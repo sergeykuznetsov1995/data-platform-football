@@ -381,6 +381,7 @@ def prepare_workload_plan(
     )
 
     workloads: list[PartitionWorkload] = []
+    incomplete_partitions: list[str] = []
     max_pages = int(os.environ.get("SOFASCORE_SEASON_MAX_PAGES", "50"))
     club_league_count = sum(
         1 for item in competition_seasons if not is_single_year_competition(item.league)
@@ -460,9 +461,29 @@ def prepare_workload_plan(
             )
             continue
         if season_plan.missing_raw_keys:
-            raise RuntimeError(
-                f"{item.league} season raw is incomplete; {phase} cannot be planned"
+            # A league whose season raw is still incomplete simply has nothing
+            # to capture yet — it resumes on the next run. Failing the phase
+            # here made ONE stuck league cost every other league its details:
+            # on 2026-08-20 FRA-Ligue 1/2 died on a season defect and all
+            # fourteen leagues went upstream_failed. Plan it clean-empty (the
+            # shape already used for an out-of-window competition) instead.
+            # At 1504 tournaments an all-or-nothing plan means zero details
+            # every single day.
+            incomplete_partitions.append(f"{item.league}={canonical}")
+            print(
+                f"SofaScore {phase} plan drops {item.league} {canonical}: "
+                f"season raw is incomplete ({len(season_plan.missing_raw_keys)} "
+                "missing keys)",
+                file=sys.stderr,
             )
+            workloads.append(
+                PartitionWorkload(
+                    item.league,
+                    canonical,
+                    tournament.unique_tournament_id,
+                )
+            )
+            continue
         matches = _finished_match_ids(item.league, canonical)
         def event_specs(target_id: str):
             return tuple(
@@ -531,6 +552,14 @@ def prepare_workload_plan(
                 player_universe_ids=universe,
                 pending_player_ids=_pending_targets(runtime, universe, player_specs),
             )
+        )
+    # Isolating one stuck league must not turn into a silent empty run: if
+    # NOTHING could be planned, that is a systemic outage, not pagination noise.
+    if incomplete_partitions and len(incomplete_partitions) == len(competition_seasons):
+        raise RuntimeError(
+            f"every SofaScore partition was dropped from the {phase} plan — "
+            "season raw is incomplete for "
+            + ", ".join(incomplete_partitions)
         )
     plan = build_partitioned_plan(
         policy,

@@ -1315,8 +1315,14 @@ cd /opt/airflow && \\
         do_xcom_push=True,
     )
 
+    # all_done, not the default all_success: one league whose season capture
+    # died used to leave this task upstream_failed and cost EVERY league its
+    # match phase (2026-08-20: FRA-Ligue 1/2 → all fourteen upstream_failed).
+    # The planner drops the leagues whose season raw is incomplete and signs
+    # the rest; it still fails loudly when nothing at all can be planned.
     prepare_target_plan_task = BashOperator(
         task_id="prepare_sofascore_target_plan",
+        trigger_rule="all_done",
         bash_command=f"""
 cd /opt/airflow && \\
 /opt/legacy-scraper-venv/bin/python dags/scripts/prepare_sofascore_workload.py \\

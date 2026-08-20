@@ -119,6 +119,22 @@ class TestSignedWorkloadTopology:
         for capture in dag_module.player_capture_tasks.values():
             assert "prepare_sofascore_player_plan" in capture.bash_command
 
+    def test_target_plan_survives_a_single_failed_season_task(self, dag_module):
+        """Live incident 2026-08-20: two leagues died on a season defect and
+        `prepare_sofascore_target_plan` went upstream_failed under the default
+        all_success, taking the match phase of ALL fourteen leagues with it.
+
+        The target plan must run once the season tasks are DONE, not once they
+        all succeeded — the planner then drops the incomplete leagues and signs
+        the rest (and still fails loudly if nothing at all can be planned).
+        """
+        target_plan = _bash_task("prepare_sofascore_target_plan")
+        assert target_plan is not None
+        assert target_plan._init_kwargs.get("trigger_rule") == "all_done"
+        assert target_plan.upstream_task_ids == {
+            task.task_id for task in dag_module.schedule_tasks.values()
+        }
+
     def test_player_plan_is_after_all_matches_and_gate(self, dag_module):
         gate = _python_task("gate_player_capture")
         player_plan = _bash_task("prepare_sofascore_player_plan")
