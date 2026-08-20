@@ -1090,6 +1090,9 @@ _SCHEDULE_LINEAGE_COLUMNS = frozenset({
 # cross-contamination that must stay a hard error.
 _SCHEDULE_IDENTITY_COLUMNS = frozenset({
     "game_id",
+    # ``id`` is the same source event id ``game_id`` is derived from
+    # (``normalize_event``), so it is identity too, not mutable state.
+    "id",
     "home_team_id",
     "away_team_id",
     "season_id",
@@ -1113,26 +1116,40 @@ _SCHEDULE_IDENTITY_COLUMNS = frozenset({
 # exactly how #951 (page provenance), #1071 (follower counters) and this
 # incident (kick-off) each surfaced. Keep the list current instead of widening
 # the rule.
-_SCHEDULE_MUTABLE_COLUMN_PREFIXES = (
+# Exact scalar columns. Spelled out rather than matched by prefix so that a new
+# neighbour such as ``start_timestamp_source`` or ``detail_identity`` is NOT
+# swallowed by the name it happens to begin with.
+_SCHEDULE_MUTABLE_COLUMNS = frozenset({
     "away_score",
+    "away_team",
     "away_team_gender",
     "away_team_name",
-    "changes_",
-    "current_period_",
     "detail_id",
-    "has_",
     "home_score",
+    "home_team",
     "home_team_gender",
     "home_team_name",
-    "round_info_",
     "season_name",
     "season_year",
     "start_timestamp",
-    "status_",
-    "time_",
     "winner_code",
+})
+# Families that ``_auto_flatten`` expands from a nested source object, so their
+# member names cannot be enumerated ahead of time. The match must stop at the
+# separator: ``home_score_current`` is a member of ``home_score``, while
+# ``home_scorer_id`` is a different column entirely.
+_SCHEDULE_MUTABLE_COLUMN_FAMILIES = (
+    "away_score",
+    "changes",
+    "current_period",
+    # ``has_xg`` / ``has_player_statistics``: availability flags that flip as
+    # the match progresses.
+    "has",
+    "home_score",
+    "round_info",
+    "status",
+    "time",
 )
-_SCHEDULE_MUTABLE_COLUMNS = frozenset({"away_team", "home_team", "id"})
 
 
 def _is_mutable_schedule_column(column: str) -> bool:
@@ -1142,7 +1159,10 @@ def _is_mutable_schedule_column(column: str) -> bool:
         return False
     if column in _SCHEDULE_MUTABLE_COLUMNS:
         return True
-    return column.startswith(_SCHEDULE_MUTABLE_COLUMN_PREFIXES)
+    return any(
+        column.startswith(f"{family}_")
+        for family in _SCHEDULE_MUTABLE_COLUMN_FAMILIES
+    )
 
 
 def _schedule_observed_at(row: Mapping[str, object]) -> str:

@@ -41,6 +41,7 @@ from scrapers.sofascore.season_pipeline import (
     build_squad_spec,
     build_standings_total_spec,
     SeasonPartitionPlan,
+    _is_mutable_schedule_column,
     materialize_season_partition,
     plan_season_partition,
     replay_season_partition,
@@ -1700,7 +1701,11 @@ def _player_capture_with_an_empty_signature(tmp_path, monkeypatch, probe, output
     with (
         patch(
             "scrapers.sofascore.season_pipeline.plan_season_partition",
-            return_value=SimpleNamespace(complete=True, player_universe_ready=True),
+            # Production shape on a matchday: referee profiles still pending
+            # (not `complete`), but that is not evidence about who played, so
+            # the universe IS ready. Reverting the gate to `complete` must fail
+            # this SIGNED-plan path too, not only the unsigned one (lesson №60).
+            return_value=SimpleNamespace(complete=False, player_universe_ready=True),
         ),
         patch(
             "scrapers.sofascore.season_pipeline.squad_player_ids",
@@ -1815,7 +1820,11 @@ def test_runner_refuses_new_local_player_outside_signed_post_match_plan(
     with (
         patch(
             "scrapers.sofascore.season_pipeline.plan_season_partition",
-            return_value=SimpleNamespace(complete=True, player_universe_ready=True),
+            # Production shape on a matchday: referee profiles still pending
+            # (not `complete`), but that is not evidence about who played, so
+            # the universe IS ready. Reverting the gate to `complete` must fail
+            # this SIGNED-plan path too, not only the unsigned one (lesson №60).
+            return_value=SimpleNamespace(complete=False, player_universe_ready=True),
         ),
         patch(
             "scrapers.sofascore.season_pipeline.squad_player_ids",
@@ -2098,6 +2107,54 @@ def test_partition_materializer_collapses_rescheduled_cross_page_repeat(tmp_path
     assert len(repeats) == 1
     # The rescheduled (next-page) observation is the newer one and wins.
     assert repeats[0]["source_page_direction"] == "next"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "column",
+    [
+        # Identity — never collapsible.
+        "game_id",
+        "id",
+        "home_team_id",
+        "season_id",
+        # Near-misses: names that merely BEGIN like a mutable one. A prefix
+        # match without a separator would swallow all of these.
+        "detail_identity",
+        "start_timestamp_source",
+        "home_scorer_id",
+        "season_identifier",
+        "hash_id",
+        # Simply unknown.
+        "some_brand_new_field",
+    ],
+)
+def test_unknown_and_near_miss_columns_are_not_collapsible(column):
+    assert _is_mutable_schedule_column(column) is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "column",
+    [
+        "start_timestamp",
+        "round_info_round",
+        "detail_id",
+        "status_type",
+        "home_score_current",
+        "away_score_display",
+        "home_team_name",
+        "home_team",
+        "has_xg",
+        "changes_changes",
+        "time_injury_time1",
+        "current_period_start_timestamp",
+        "winner_code",
+        "season_year",
+    ],
+)
+def test_known_mutable_columns_are_collapsible(column):
+    assert _is_mutable_schedule_column(column) is True
 
 
 @pytest.mark.unit
