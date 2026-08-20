@@ -165,6 +165,14 @@ ACCEPTANCE_EXECUTION_MODE = "acceptance_nonpublishing"
 # clearance is dead — so the wave re-solves instead of failing every remaining
 # target against it.
 CLEARANCE_REJECTED_STATUSES = frozenset({401, 403, 429})
+# A redirect is the source answering *about the address*, not rejecting us:
+# FBref publishes the bare current-season alias of some competitions (comps 33
+# and 59) and then answers it with 301.  Losing one such page is a gap in that
+# page; losing the whole wave to it is a gap in every other competition, which
+# is what happened daily from 2026-08-18 on.  Note these statuses are
+# deliberately absent from CLEARANCE_REJECTED_STATUSES above: the session is
+# healthy, so it is neither re-solved nor blamed.
+MOVED_PAGE_STATUSES = frozenset({301, 302, 303, 307, 308})
 # Each consecutive refresh costs one browser solve, so a source that rejects
 # fresh clearances outright must still fail the wave rather than launch
 # browsers in a loop. A productive warm session resets this streak: later
@@ -630,6 +638,7 @@ class WaveResult:
     requeued_session_exhaustion: int = 0
     deferred_dead_clearance: int = 0
     contract_quarantined: int = 0
+    moved_pages_skipped: int = 0
     failures: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -1025,6 +1034,15 @@ def _session_failure(exc: FetchError) -> bool:
         exc.error_class == "http_status"
         and exc.http_status in CLEARANCE_REJECTED_STATUSES
     ) or exc.error_class.startswith("warm_session_")
+
+
+def _moved_page_failure(exc: FetchError) -> bool:
+    """True when the source answered with a redirect instead of the page."""
+
+    return (
+        exc.error_class == "http_status"
+        and exc.http_status in MOVED_PAGE_STATUSES
+    )
 
 
 def _sentinel_gate_errors(coverage: object) -> list[str]:
@@ -3316,9 +3334,16 @@ class FBrefPipeline:
                                 live_session.stack = ExitStack()
                                 live_session.fetcher = None
                             live_session.needs_clearance = True
-                        result.failures.append(
-                            f"{lease.target_id}:{exc.error_class}"
-                        )
+                        if _moved_page_failure(exc):
+                            # The attempt above is durable evidence and the
+                            # target stays failed; only the wave verdict is
+                            # spared.  str(exc) carries the Location header,
+                            # so the skip is countable in fetch_attempt.
+                            result.moved_pages_skipped += 1
+                        else:
+                            result.failures.append(
+                                f"{lease.target_id}:{exc.error_class}"
+                            )
                 except Exception as exc:
                     if reservation is not None and not budget_settled:
                         if (

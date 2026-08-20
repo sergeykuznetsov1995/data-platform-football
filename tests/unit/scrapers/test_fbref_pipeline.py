@@ -9845,3 +9845,109 @@ def test_discovery_batch_within_the_ceiling_stays_one_atomic_write(tmp_path):
     pipeline._seed_link_candidates(candidates, parent_record=None)
 
     assert len(calls) == 1
+
+
+class FakeMovedFetcher:
+    """A source that answers with a redirect instead of the page."""
+
+    def __init__(self, events):
+        self.events = events
+
+    def __enter__(self):
+        self.events.append("fetcher_enter")
+        return self
+
+    def __exit__(self, *args):
+        self.events.append("fetcher_exit")
+
+    def ensure_clearance(self):
+        self.events.append("browser")
+        return True
+
+    def fetch(self, url, **kwargs):
+        self.events.append("http")
+        raise FetchError(
+            f"FBref returned HTTP 301 for {url}; attempts=1; "
+            "status_history=301; location=https://fbref.com/en/comps/33/"
+            "2026-2027/2026-2027-2-Bundesliga-Stats",
+            error_class="http_status",
+            http_status=301,
+            wire_bytes=303,
+            browser_document_bytes=0,
+            browser_asset_bytes=0,
+            browser_requests=0,
+            browser_bootstrap_attempts=0,
+            browser_unobserved_bytes=0,
+            target_requests=1,
+            http_status_history=(301,),
+            latency_ms=321,
+        )
+
+
+def test_moved_page_is_skipped_without_failing_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeMovedFetcher(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="worker-1",
+        page_kinds=["competition_index"],
+        settings=_settings(),
+    )
+
+    # A page that merely moved must not take the whole wave down with it.
+    assert result.failures == []
+    assert result.moved_pages_skipped == 1
+    # The attempt is still durable evidence, not a silent skip.
+    assert "fail" in control.events
+
+
+class FakeNotFoundFetcher(FakeMovedFetcher):
+    """A genuinely broken target: not a redirect, so the wave must still die."""
+
+    def fetch(self, url, **kwargs):
+        self.events.append("http")
+        raise FetchError(
+            f"FBref returned HTTP 404 for {url}; attempts=1; "
+            "status_history=404",
+            error_class="http_status",
+            http_status=404,
+            wire_bytes=303,
+            browser_document_bytes=0,
+            browser_asset_bytes=0,
+            browser_requests=0,
+            browser_bootstrap_attempts=0,
+            browser_unobserved_bytes=0,
+            target_requests=1,
+            http_status_history=(404,),
+            latency_ms=321,
+        )
+
+
+def test_non_redirect_page_failure_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeNotFoundFetcher(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        pipeline.fetch_wave(
+            str(uuid.UUID(int=1)),
+            worker_id="worker-1",
+            page_kinds=["competition_index"],
+            settings=_settings(),
+        )
