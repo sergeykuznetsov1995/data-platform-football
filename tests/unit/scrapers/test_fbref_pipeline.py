@@ -10188,6 +10188,10 @@ def test_run_ceiling_stops_a_hijack_spread_thin_across_waves(tmp_path):
     def fake_fetch(*args, _live_session, **kwargs):
         _live_session.fetcher = object()
         _live_session.needs_clearance = False
+        # A live clearance session exists while the cohort is collected, so
+        # the run's exit path has something to blame.
+        _live_session.session_id = "session"
+        _live_session.state = "control_open"
         return WaveResult(claimed=25, cohort_size=25, moved_pages_skipped=5)
 
     def fake_parse(*args, **kwargs):
@@ -10195,6 +10199,15 @@ def test_run_ceiling_stops_a_hijack_spread_thin_across_waves(tmp_path):
 
     pipeline.fetch_wave = fake_fetch
     pipeline.parse_wave = fake_parse
+
+    closes = []
+    original_close = control.close_clearance_session
+
+    def close_recording(session_id, **kwargs):
+        closes.append(kwargs.get("status"))
+        return original_close(session_id, **kwargs)
+
+    control.close_clearance_session = close_recording
 
     with pytest.raises(FetchWaveError, match="mass_redirect_run"):
         pipeline.run_live_waves(
@@ -10204,6 +10217,10 @@ def test_run_ceiling_stops_a_hijack_spread_thin_across_waves(tmp_path):
             settings=_settings(),
             max_batches=80,
         )
+
+    # The session that was collecting the hijacked cohort must be blamed,
+    # not closed as healthy on the way out.
+    assert closes and all(status == "failed" for status in closes)
 
 
 class FakeSeeOtherStatusFetcher(FakeMovedFetcher):
@@ -10273,7 +10290,13 @@ def test_moved_page_is_spared_on_the_paid_persistent_path(tmp_path):
         of this code path.
         """
 
+        reset_calls = 0
+
         def reset_clearance(self):
+            # Mirrors FBrefFetcher.reset_clearance (fetcher.py:489): drop the
+            # clearance so the next target solves a fresh one.
+            type(self).reset_calls += 1
+            self.session_id = None
             self.events.append("reset_clearance")
 
         def fetch(self, url, **_kwargs):
@@ -10298,6 +10321,15 @@ def test_moved_page_is_spared_on_the_paid_persistent_path(tmp_path):
                 ),
             )
 
+    control.session_close_statuses = []
+    original_close = control.close_clearance_session
+
+    def close_recording(session_id, **kwargs):
+        control.session_close_statuses.append(kwargs.get("status"))
+        return original_close(session_id, **kwargs)
+
+    control.close_clearance_session = close_recording
+
     fetcher = MovedMeteredFetcher(control.events)
     pipeline = FBrefPipeline(
         control,
@@ -10321,5 +10353,8 @@ def test_moved_page_is_spared_on_the_paid_persistent_path(tmp_path):
     assert control.failed[0][1]["requeue"] is True
     # Exact settlement still happened: the paid bytes are on the attempt.
     assert control.failed[0][1]["provider_billed_bytes"] == 120
-    # And the session was recycled, as for any other page failure.
+    # The paid session is finalized as failed and then recycled -- the wave
+    # does not carry a session that just lost a page into the next target.
+    assert "failed" in control.session_close_statuses
     assert "reset_clearance" in control.events
+    assert fetcher.reset_calls == 1
