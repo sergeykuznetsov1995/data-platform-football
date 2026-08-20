@@ -48,6 +48,7 @@ _PERSISTENT_SESSION_CLOSE_MARGIN_SECONDS = 5 * 60
 _FAILURE_EVIDENCE_HEADERS = (
     "content-type",
     "content-length",
+    "location",
     "server",
     "via",
     "cf-ray",
