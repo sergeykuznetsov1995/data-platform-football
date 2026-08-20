@@ -572,14 +572,24 @@ def _match_kickoff(value: Any) -> datetime | None:
 def _match_is_settled(match: Mapping[str, Any]) -> bool:
     """Матч, за которым больше не надо возвращаться.
 
-    `postponed` парсер сохраняет наравне с `finished`/`cancelled`
-    (`scrapers/fotmob/parsers.py:143-146`), и без него прошедший перенесённый
-    матч навсегда остаётся «обязательством»: скоуп получал бы короткий срок
-    бесконечно.
+    `postponed` и `awarded` парсер сохраняет наравне с `finished`/`cancelled`
+    (`scrapers/fotmob/parsers.py:143-146`), и без них прошедший перенесённый или
+    присуждённый матч навсегда остаётся «обязательством»: скоуп получал бы
+    короткий срок бесконечно.
+
+    Про `awarded` — замер 20.08 по `bronze.fotmob_matches_current`: присуждённых
+    матчей 169, и у ВСЕХ 169 стоит ещё и `finished`, то есть сегодня такой матч
+    и без этой ветки закрывается по `finished`. Статус добавлен не как лечение
+    живого зависания, а потому что порядок выставления флагов у источника нам не
+    подконтролен: присуждение раньше отметки о завершении дало бы вечный
+    двухчасовой опрос.
     """
 
     return bool(
-        match.get("finished") or match.get("cancelled") or match.get("postponed")
+        match.get("finished")
+        or match.get("cancelled")
+        or match.get("postponed")
+        or match.get("awarded")
     )
 
 

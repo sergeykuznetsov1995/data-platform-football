@@ -894,10 +894,10 @@ class TestFotmobNativeRunner:
     def test_schedule_cooldown_ignores_settled_and_undated_matches(self):
         """Закрытый матч обязательством не делает, мусорная дата — тоже.
 
-        `postponed` парсер сохраняет наравне с `finished`/`cancelled`
-        (`scrapers/fotmob/parsers.py:143-146`). Без него прошедший перенесённый
-        матч висел бы обязательством вечно, и турнир опрашивался бы каждые два
-        часа бесконечно.
+        `postponed` и `awarded` парсер сохраняет наравне с `finished`/`cancelled`
+        (`scrapers/fotmob/parsers.py:143-146`). Без них прошедший перенесённый или
+        присуждённый матч висел бы обязательством вечно, и турнир опрашивался бы
+        каждые два часа бесконечно.
         """
 
         from datetime import datetime, timedelta
@@ -907,7 +907,7 @@ class TestFotmobNativeRunner:
         proshedshiy = "2026-08-20T09:00:00Z"
 
         assert mod._schedule_cooldown([], now) == timedelta(hours=48)
-        for terminal in ("finished", "cancelled", "postponed"):
+        for terminal in ("finished", "cancelled", "postponed", "awarded"):
             assert mod._schedule_cooldown(
                 [{"utc_time": proshedshiy, terminal: True}], now
             ) == timedelta(hours=48), terminal
