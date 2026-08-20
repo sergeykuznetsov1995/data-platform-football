@@ -9,6 +9,7 @@ import os
 import time
 from dataclasses import dataclass, field, replace
 from typing import Mapping, Optional, Sequence
+from urllib.parse import urljoin, urlsplit
 
 from scrapers.fbref.browser_runtime import HTTP_IMPERSONATE_TARGET
 from scrapers.fbref.camoufox_fetch import CamoufoxFbrefTransport
@@ -38,6 +39,10 @@ DEFAULT_BROWSER_REQUEST_LIMIT = DEFAULT_BROWSER_REQUESTS_PER_SOLVE
 DEFAULT_BROWSER_BYTE_LIMIT = DEFAULT_BROWSER_BYTE_LIMIT_BYTES
 MAX_TARGET_HTTP_ATTEMPTS = 2
 RETRYABLE_HTTP_STATUSES = frozenset({500, 502, 503, 504})
+# FBref answers the bare current-season alias of some competitions with a
+# redirect instead of the page.  One same-host hop is cheaper than losing the
+# whole wave to a target that merely moved.
+_FOLLOWABLE_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 DEFAULT_STATUS_RETRY_DELAY_SECONDS = DEFAULT_DOMAIN_INTERVAL_SECONDS
 # Decodo and the local provider lease are both bounded to 120 minutes in the
 # production profile.  Stop admitting pages five minutes earlier so curl,
@@ -1465,6 +1470,30 @@ class FBrefFetcher:
                 evidence.append(f"{name.replace('-', '_')}={value}")
         return ",".join(evidence)
 
+    @staticmethod
+    def _same_host_redirect_target(
+        source_url: str,
+        location: object,
+    ) -> Optional[str]:
+        """Resolve one same-host redirect target, or None when unusable.
+
+        Redirects stay disabled on the transport: a moved page must never
+        become a *different* page behind our back.  Only a target on the very
+        same host is eligible, and the caller follows it exactly once, so a
+        redirect loop cannot quietly spend the target's request budget.
+        """
+
+        raw_location = str(location or "").strip()
+        if not raw_location:
+            return None
+        target = urljoin(source_url, raw_location)
+        split_target = urlsplit(target)
+        if split_target.scheme not in {"http", "https"}:
+            return None
+        if split_target.netloc != urlsplit(source_url).netloc:
+            return None
+        return target
+
     def _fetch_without_provider_meter(
         self,
         url: str,
@@ -1493,13 +1522,17 @@ class FBrefFetcher:
         target_requests = 0
         wire_bytes = 0
         status_history: list[int] = []
+        # ``url`` stays the target's identity for FetchResponse and the
+        # manifest; only the address we actually request may move.
+        request_url = url
+        redirect_followed = False
         body_buffer = _CumulativeBodyBuffer(self.max_html_bytes)
         for attempt in range(self.max_target_http_attempts):
             target_requests += 1
             body_buffer.begin_attempt()
             try:
                 response = self._http_session.get(
-                    url,
+                    request_url,
                     headers=headers or None,
                     timeout=30,
                     allow_redirects=False,
@@ -1581,6 +1614,21 @@ class FBrefFetcher:
             wire_bytes += int(_response_wire_size(response))
             status = int(response.status_code)
             status_history.append(status)
+            if (
+                status in _FOLLOWABLE_REDIRECT_STATUSES
+                and not redirect_followed
+                and attempt + 1 < self.max_target_http_attempts
+            ):
+                redirect_target = self._same_host_redirect_target(
+                    request_url,
+                    dict(getattr(response, "headers", {}) or {}).get(
+                        "location"
+                    ),
+                )
+                if redirect_target is not None:
+                    redirect_followed = True
+                    request_url = redirect_target
+                    continue
             if body_buffer.exceeded:
                 (
                     browser_document,
