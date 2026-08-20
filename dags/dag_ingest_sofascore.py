@@ -943,23 +943,30 @@ def _gate_player_capture(**context) -> bool:
 
     logger = logging.getLogger(__name__)
 
+    params = context.get("params") or {}
+    if params.get("run_players"):
+        decision = "run_players=True → running per-player capture on demand."
+    else:
+        run_boundary = _resolve_player_run_boundary(context)
+        if run_boundary is not None and run_boundary.weekday() == 5:  # Saturday
+            decision = "Saturday run → running weekly per-player capture."
+        else:
+            logger.info("Not Saturday and not forced → skip per-player capture.")
+            return False
+
+    # Producers are demanded only by a run that will ACTUALLY spend paid bytes.
+    # Demanding them first made one dead league paint a plain weekday red — a
+    # day on which the branch was going to skip anyway and spend nothing
+    # (2026-08-20: gate_player_capture failed on Thursday because the match
+    # phase had cascaded). The protection itself is unchanged for the runs it
+    # was written for: a Saturday or forced capture still refuses to build a
+    # player universe on top of a broken match phase.
     _require_successful_producers(
         context,
         [_match_capture_task_id(league) for league in SOFASCORE_LEAGUES],
     )
-
-    params = context.get("params") or {}
-    if params.get("run_players"):
-        logger.info("run_players=True → running per-player capture on demand.")
-        return True
-
-    run_boundary = _resolve_player_run_boundary(context)
-    if run_boundary is not None and run_boundary.weekday() == 5:  # Saturday
-        logger.info("Saturday run → running weekly per-player capture.")
-        return True
-
-    logger.info("Not Saturday and not forced → skip per-player capture.")
-    return False
+    logger.info(decision)
+    return True
 
 
 def _gate_player_rotation(league: str, **context) -> bool:

@@ -1087,13 +1087,7 @@ _SCHEDULE_LINEAGE_COLUMNS = frozenset({
 
 # Columns that answer "WHICH match is this row about". If two rows sharing one
 # game_id disagree here, two different matches were merged under one id — a
-# cross-contamination that must stay a hard error. Everything else describes
-# the match's mutable state (kick-off, round, status, score, detail id), and
-# the source legally moves that between two page fetches of one run: a match
-# rescheduled mid-crawl used to raise "duplicate schedule natural key" and drop
-# the season, which on 2026-08-20 cost the match phase of ALL fourteen leagues
-# (FRA-Ligue 1 game 16311125, conflicting columns detail_id/round_info_round/
-# start_timestamp).
+# cross-contamination that must stay a hard error.
 _SCHEDULE_IDENTITY_COLUMNS = frozenset({
     "game_id",
     "home_team_id",
@@ -1102,6 +1096,53 @@ _SCHEDULE_IDENTITY_COLUMNS = frozenset({
     "source_tournament_id",
     "source_season_id",
 })
+
+# Columns that describe the match's MUTABLE state, which the source legally
+# moves between two page fetches of one crawl: kick-off, round, status, score,
+# display names. A cross-page repeat that disagrees only here is pagination
+# racing a live feed, not corrupted data — on 2026-08-20 refusing it cost the
+# match phase of ALL fourteen leagues (FRA-Ligue 1 game 16311125 disagreed on
+# detail_id/round_info_round/start_timestamp; the raw pages were fetched 43 s
+# apart and the identity columns matched byte for byte).
+#
+# Deliberately an ALLOWLIST, not "everything that is not identity": an unknown
+# column appearing on both copies with different values is something nobody has
+# reasoned about, and defaulting to "collapse" would silently drop the very
+# corruption this guard exists to catch. The cost of the closed default is that
+# a NEW mutable source field fails the season until it is added here — which is
+# exactly how #951 (page provenance), #1071 (follower counters) and this
+# incident (kick-off) each surfaced. Keep the list current instead of widening
+# the rule.
+_SCHEDULE_MUTABLE_COLUMN_PREFIXES = (
+    "away_score",
+    "away_team_gender",
+    "away_team_name",
+    "changes_",
+    "current_period_",
+    "detail_id",
+    "has_",
+    "home_score",
+    "home_team_gender",
+    "home_team_name",
+    "round_info_",
+    "season_name",
+    "season_year",
+    "start_timestamp",
+    "status_",
+    "time_",
+    "winner_code",
+)
+_SCHEDULE_MUTABLE_COLUMNS = frozenset({"away_team", "home_team", "id"})
+
+
+def _is_mutable_schedule_column(column: str) -> bool:
+    """True when the source may legally change ``column`` mid-crawl."""
+
+    if column in _SCHEDULE_IDENTITY_COLUMNS:
+        return False
+    if column in _SCHEDULE_MUTABLE_COLUMNS:
+        return True
+    return column.startswith(_SCHEDULE_MUTABLE_COLUMN_PREFIXES)
 
 
 def _schedule_observed_at(row: Mapping[str, object]) -> str:
@@ -1404,12 +1445,15 @@ def materialize_season_partition(
                 for k in set(previous) | set(current)
                 if previous.get(k) != current.get(k)
             )
-            if cross_page and not _SCHEDULE_IDENTITY_COLUMNS.intersection(conflicts):
-                # Same match seen twice across pages. Identical payload keeps
-                # the first-seen row (page provenance and follower counters
-                # included); a moved kick-off/round/status means the source
-                # updated the match between fetches, so the fresher
-                # observation wins.
+            if cross_page and all(
+                _is_mutable_schedule_column(column) for column in conflicts
+            ):
+                # Same match seen twice across pages. An identical payload keeps
+                # the first-seen row so its page provenance and lineage stay
+                # stable (nothing about the match differs, so there is nothing
+                # to prefer). A real state change means the source updated the
+                # match between the two fetches, so the fresher observation
+                # wins.
                 if conflicts and _schedule_observed_at(row) > _schedule_observed_at(
                     existing
                 ):

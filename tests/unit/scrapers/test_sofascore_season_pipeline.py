@@ -1556,7 +1556,12 @@ def test_runner_live_player_reports_committed_not_deferred_completeness(
     )
     runtime = CaptureRuntime(engine, object(), object())
     pending = {"10": set(PLAYER_PATHS)}
-    season_plan = SimpleNamespace(complete=True, player_universe_ready=True)
+    # The production shape of a league on a matchday: its referee profiles are
+    # still missing (so the plan is NOT `complete`), but that says nothing about
+    # who played, so the player universe IS ready. Pinning it this way makes the
+    # test fail the moment the runner goes back to gating on `complete` — the
+    # condition that kept the player branch dead from 2026-07-24.
+    season_plan = SimpleNamespace(complete=False, player_universe_ready=True)
     scraper = MagicMock()
     scraper.__enter__.return_value = scraper
     scraper.__exit__.return_value = False
@@ -1880,6 +1885,7 @@ def _replayed_partition_with_cross_page_repeat(
     *,
     mutate=False,
     mutate_identity=False,
+    unknown_column=False,
     user_count_tick=False,
 ):
     """Partition whose live-feed pages repeat event 14000001 on BOTH pages.
@@ -1898,7 +1904,13 @@ def _replayed_partition_with_cross_page_repeat(
     manifest = InMemoryManifestStore()
     event = _schedule_event(14000001)
     if mutate:
+        # Reproduce the 2026-08-20 production repeat exactly: the source moved
+        # the fixture, so all three of these disagreed between the two pages.
         event["startTimestamp"] = int(event.get("startTimestamp") or 0) + 3600
+        event["roundInfo"] = {"round": 23}
+        event["detailId"] = 1
+    if unknown_column:
+        event["someBrandNewField"] = "changed"
     if mutate_identity:
         # Swap the sides: both teams stay in the participants roster, so this
         # trips the duplicate guard and not an earlier squad/evidence check.
@@ -2086,6 +2098,27 @@ def test_partition_materializer_collapses_rescheduled_cross_page_repeat(tmp_path
     assert len(repeats) == 1
     # The rescheduled (next-page) observation is the newer one and wins.
     assert repeats[0]["source_page_direction"] == "next"
+
+
+@pytest.mark.unit
+def test_partition_materializer_rejects_an_unreasoned_column_conflict(tmp_path):
+    """Collapsing is an ALLOWLIST, not "anything that is not identity".
+
+    A column nobody has classified disagreeing across two copies of one match is
+    exactly the corruption this guard exists to catch, so it stays a hard error
+    until someone decides the field is legally mutable.
+    """
+    plan, results = _replayed_partition_with_cross_page_repeat(
+        tmp_path,
+        unknown_column=True,
+    )
+    with pytest.raises(SeasonMaterializationError, match="duplicate schedule"):
+        materialize_season_partition(
+            plan,
+            results,
+            canonical_league="ENG-Premier League",
+            canonical_season="2025/26",
+        )
 
 
 @pytest.mark.unit
