@@ -3338,20 +3338,30 @@ class FBrefPipeline:
                             error_class=exc.error_class,
                             error_message=str(exc),
                             retry_delay_seconds=60,
-                            # 301/308 mean the address is permanently gone,
-                            # so dead-letter it: 'dead'/'failed' keeps it out
-                            # of every later cohort and out of the unfinished
-                            # count.  'retry' would stay claimable 60s later
-                            # and buy a fresh solve and paid lease per repeat;
-                            # 'queued' (requeue) would null retry_after and
-                            # leave next_fetch_at frozen in the past, so the
-                            # dead address would sort to the HEAD of every
-                            # later cohort -- the known starvation mine.
                             permanent=(
                                 exc.error_class == "response_too_large"
-                                or moved
                             ),
-                            requeue=False,
+                            # Hand it back as 'skipped'/'queued'.  Each of the
+                            # three shapes costs something and this is the
+                            # only reversible one:
+                            #   'retry' (the default) stays claimable 60s
+                            #     later, so the same unreachable page is
+                            #     re-fetched all run, and a leftover 'retry'
+                            #     counts as an unfinished target -- the run
+                            #     ends red anyway, just later.
+                            #   'dead' (permanent) is terminal with no way
+                            #     back: reanimation only touches queued/retry,
+                            #     scope re-open only skipped/quarantined, and
+                            #     the seeding upsert never resets state.  One
+                            #     CDN or exit answering 301 to healthy pages
+                            #     would destroy them permanently on first
+                            #     contact.
+                            # 'queued' does let the page sort early in later
+                            # cohorts (retry_after is nulled, next_fetch_at
+                            # keeps ageing), costing one solve a day per dead
+                            # address.  That is the price of being able to
+                            # recover, and the ceilings below bound it.
+                            requeue=moved,
                             http_status=exc.http_status,
                             http_request_count=exc.http_requests,
                             http_status_history=exc.http_status_history,

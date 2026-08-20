@@ -9910,11 +9910,12 @@ def test_moved_page_is_skipped_without_failing_the_wave(tmp_path):
     assert result.moved_pages_skipped == 1
     # The attempt is still durable evidence, not a silent skip.
     assert "fail" in control.events
-    # Dead-lettered, not left claimable in 'retry' and not requeued: 'retry'
-    # would re-solve inside this run and count as unfinished, while 'queued'
-    # would sort the dead address to the head of every later cohort.
-    assert control.failed[0][1]["permanent"] is True
-    assert control.failed[0][1]["requeue"] is False
+    # Handed back as 'skipped'/'queued' -- the only reversible shape.
+    # 'retry' would re-fetch it all run and still count as unfinished;
+    # 'dead' (permanent) is terminal with no path back, so one bad exit
+    # answering 301 would destroy healthy pages on first contact.
+    assert control.failed[0][1]["requeue"] is True
+    assert control.failed[0][1]["permanent"] is False
 
 
 class FakeNotFoundFetcher(FakeMovedFetcher):
