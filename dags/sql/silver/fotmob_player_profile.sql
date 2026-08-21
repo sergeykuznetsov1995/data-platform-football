@@ -2,10 +2,10 @@
 -- Silver: fotmob_player_profile
 -- =============================================================================
 --
--- Time-invariant snapshot per (player_id, league, season). Хранит атрибуты
--- игрока, которые не меняются в течение сезона: рост, дата рождения,
--- национальность, ведущая нога, номер на футболке. `is_current_season`
--- отличает живой roster scope от исторической leaderboard-реконструкции.
+-- As-of snapshot per (player_id, league, season). Паспортные атрибуты игрока
+-- сохраняются из одноразово собранной карточки/ростера; club, contract и market
+-- value честно относятся к card_observed_at. `is_current_season` отличает живой
+-- roster scope от исторической leaderboard-реконструкции.
 --
 -- Zerno: (player_id, league, season). Симметрично с silver.fotmob_player_season_profile
 -- и silver.fotmob_keeper_profile. Для одного игрока в одном сезоне — один row;
@@ -281,7 +281,7 @@ SELECT
     s.country                                        AS nationality,
     s.country_code,
 
-    -- ========= Slowly-changing attributes (latest snapshot per-season) =========
+    -- ========= Card attributes as of card_observed_at =========
     -- contract_end: меняется при подписании нового контракта. В native уже
     -- скаляр utcTime; у legacy-строк бывал JSON-dumped dict `{"utcTime": ...}` —
     -- COALESCE покрывает оба формата (на скаляре json_extract_scalar даёт NULL).
@@ -301,7 +301,7 @@ SELECT
     mv.current_market_value_eur,
     mv.market_value_currency,
 
-    -- Current club from FotMob (per-snapshot snapshot of primary team).
+    -- Club observed in the one-time FotMob player-card snapshot.
     d.primary_team_id,
     d.primary_team_name,
 
@@ -330,6 +330,9 @@ SELECT
     d.scope_is_current_season                        AS is_current_season,
 
     -- ========= Lineage =========
+    -- Чистый as-of карточки: не подмешивать более свежий squad timestamp.
+    d._observed_at                                   AS card_observed_at,
+
     -- Native lineage: _observed_at (в native `_ingested_at`-семантику несёт
     -- `_observed_at`; `_batch_id` не существует — cutover-mapping §2.3).
     GREATEST(
