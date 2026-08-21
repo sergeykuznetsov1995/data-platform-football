@@ -29,6 +29,18 @@ from scrapers.fotmob.scope_codec import format_scope_token, parse_scope_groups
 from scrapers.fotmob.source_refresh import (
     REPLAY_MISSING_INPUT_PROOF_SCHEMA as REPLAY_MISSING_INPUT_SCHEMA,
 )
+from scrapers.fotmob.player_collector import (
+    PLAYER_COLLECTOR_ENTITIES,
+    PLAYER_COLLECTOR_MAX_DIRECT_MIB,
+    PLAYER_COLLECTOR_MAX_REQUESTS,
+    PLAYER_COLLECTOR_MODE,
+    PLAYER_COLLECTOR_PLAYER_LIMIT,
+    PLAYER_COLLECTOR_PROFILE,
+    PLAYER_COLLECTOR_REQUESTS_PER_MINUTE,
+    normalize_player_collector_ids,
+    player_collector_ids_sha256,
+    player_collector_plan_signature,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,7 +55,14 @@ logger = logging.getLogger(__name__)
 # from the continuous refresh DAG, without the pinned 21-competition daily
 # contract.  It maps onto ``RunMode.DAILY`` internally so the source planner
 # enum stays untouched; the report keeps ``mode="refresh"`` for DAG routing.
-NATIVE_MODES = ("discover", "daily", "backfill", "replay", "refresh")
+NATIVE_MODES = (
+    "discover",
+    "daily",
+    "backfill",
+    "replay",
+    "refresh",
+    PLAYER_COLLECTOR_MODE,
+)
 NATIVE_ENTITIES = frozenset(
     {"season", "leaderboards", "matches", "teams", "players", "transfers"}
 )
@@ -767,7 +786,11 @@ def _build_native_service(args, run_id: str):
         repository=repository,
         # ``refresh`` reuses DAILY service semantics (current-season focus,
         # 1-year transfer window).  See NATIVE_MODES.
-        mode=RunMode("daily" if args.mode == "refresh" else args.mode),
+        mode=RunMode(
+            "daily"
+            if args.mode in {"refresh", PLAYER_COLLECTOR_MODE}
+            else args.mode
+        ),
         budget=budget,
         run_id=run_id,
         max_workers=args.workers,
@@ -873,6 +896,91 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         return (0 if report.ok else 1), payload
 
     source_refresh = getattr(args, "source_refresh_contract", None)
+    if args.mode == PLAYER_COLLECTOR_MODE:
+        raw_player_ids = service.repository.missing_current_squad_player_ids(
+            args.player_limit
+        )
+        player_ids = list(normalize_player_collector_ids(raw_player_ids))
+        if player_ids != raw_player_ids or len(player_ids) > args.player_limit:
+            raise RuntimeError("player collector repository selection is not canonical")
+        player_operation = service.sync_player_snapshots(
+            player_ids,
+            # A manifest success without its typed snapshot is exactly the gap
+            # this collector repairs. The anti-join prevents refreshing any
+            # identity that already has a card row.
+            force_refresh=True,
+            capture_terminal_outcomes=True,
+        )
+        operations.append(player_operation)
+        raw_outcomes = player_operation.metadata.get("terminal_outcomes")
+        valid_outcomes = (
+            isinstance(raw_outcomes, list)
+            and len(raw_outcomes) == len(player_ids)
+            and all(
+                isinstance(item, Mapping)
+                and set(item) == {"player_id", "status"}
+                and type(item.get("player_id")) is int
+                and item.get("status") in {"success", "not_available"}
+                for item in raw_outcomes
+            )
+        )
+        target_outcomes = list(raw_outcomes) if valid_outcomes else []
+        outcome_ids = (
+            [int(item["player_id"]) for item in target_outcomes]
+            if valid_outcomes
+            else []
+        )
+        contract_operation = OperationResult(
+            "player_collector_contract",
+            attempted=len(player_ids),
+            metadata={
+                "profile": PLAYER_COLLECTOR_PROFILE,
+                "player_ids_sha256": player_collector_ids_sha256(player_ids),
+                "target_outcomes": target_outcomes,
+            },
+        )
+        unavailable = sum(
+            item["status"] == "not_available" for item in target_outcomes
+        )
+        if (
+            not valid_outcomes
+            or outcome_ids != player_ids
+            or player_operation.attempted != len(player_ids)
+            or player_operation.succeeded + player_operation.not_available
+            != len(player_ids)
+            or player_operation.not_available != unavailable
+            or player_operation.skipped != 0
+        ):
+            contract_operation.errors.append(
+                "player collector did not produce one terminal outcome per target"
+            )
+        else:
+            contract_operation.succeeded = len(player_ids)
+            contract_operation.counts["terminal_targets"] = len(player_ids)
+        operations.append(contract_operation)
+        rc, payload = finish()
+        payload["selection"] = {
+            "profile": PLAYER_COLLECTOR_PROFILE,
+            "entities": list(PLAYER_COLLECTOR_ENTITIES),
+            "explicit_scopes": [],
+            "competition_limit": 0,
+            "season_limit": 0,
+            "planned_scopes": [],
+            "completed_scopes": [],
+            "completed_transfer_competition_ids": [],
+            "requests_per_minute": args.requests_per_minute,
+            "scope_plan_signature": player_collector_plan_signature(player_ids),
+            "player_collector": {
+                "profile": PLAYER_COLLECTOR_PROFILE,
+                "player_ids": player_ids,
+                "player_count": len(player_ids),
+                "player_ids_sha256": player_collector_ids_sha256(player_ids),
+                "player_limit": args.player_limit,
+            },
+            "target_outcomes": target_outcomes,
+        }
+        return rc, payload
+
     if isinstance(source_refresh, Mapping):
         player_operation = service.sync_player_snapshots(
             source_refresh["player_ids"],
@@ -2414,6 +2522,57 @@ def _validate_args(
         args.competition_scope_sha256,
         args.competition_ids_sha256,
     )
+    if args.mode == PLAYER_COLLECTOR_MODE:
+        literal_entities = tuple(
+            sorted(
+                {
+                    item.strip().casefold()
+                    for item in str(args.entities or "").split(",")
+                    if item.strip()
+                }
+            )
+        )
+        violations = []
+        if automatic_catalog:
+            violations.append("catalog contract must be empty")
+        if source_refresh is not None:
+            violations.append("source refresh must be empty")
+        if any(daily_contract_fields):
+            violations.append("daily contract fields must be empty")
+        if _parse_scopes(args.scope):
+            violations.append("exact season scope must be empty")
+        if literal_entities != PLAYER_COLLECTOR_ENTITIES:
+            violations.append("entities must be exactly players")
+        if any(
+            value != 0
+            for value in (
+                args.competition_limit,
+                args.season_limit,
+                args.match_limit,
+                args.team_limit,
+            )
+        ):
+            violations.append("non-player planner limits must be zero")
+        if args.player_limit != PLAYER_COLLECTOR_PLAYER_LIMIT:
+            violations.append("player limit")
+        if args.max_requests != PLAYER_COLLECTOR_MAX_REQUESTS:
+            violations.append("request budget")
+        if args.max_direct_mib != PLAYER_COLLECTOR_MAX_DIRECT_MIB:
+            violations.append("direct-byte budget")
+        if args.requests_per_minute != PLAYER_COLLECTOR_REQUESTS_PER_MINUTE:
+            violations.append("request rate")
+        if args.max_attempts != 4:
+            violations.append("max attempts")
+        if args.workers != 4:
+            violations.append("workers")
+        if args.next_build_id:
+            violations.append("Next build override must be empty")
+        if args.deadline:
+            violations.append("deadline must be empty")
+        if violations:
+            parser.error(
+                "invalid FotMob player collector: " + ", ".join(violations)
+            )
     if automatic_catalog:
         violations = []
         if any(daily_contract_fields):
