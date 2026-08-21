@@ -94,16 +94,25 @@ def test_exact_isolated_opt_in_materializes_manual_player_collector(monkeypatch)
         for task in PythonOperator._instances
         if task.task_id == "finalize_fotmob_publication"
     )
-    assert attestation.python_callable is module.attest_fotmob_isolated_runtime
-    assert initializer._init_kwargs["op_kwargs"] == {"publication_owner": "isolated"}
+    assert (
+        attestation.python_callable
+        is module.attest_fotmob_player_collector_runtime
+    )
+    assert (
+        initializer.python_callable
+        is module.initialize_fotmob_player_collector_publication
+    )
     assert initializer.upstream_task_ids == {"attest_isolated_runtime"}
     assert trigger.upstream_task_ids == {"initialize_fotmob_publication"}
     assert finalize.upstream_task_ids == {"trigger_fotmob_player_collector"}
     assert finalize._init_kwargs["op_kwargs"] == {
-        "publication_owner": "isolated",
         "success_task_id": "trigger_fotmob_player_collector",
         "writer_task_ids": ["trigger_fotmob_player_collector"],
     }
+    assert (
+        finalize.python_callable
+        is module.fail_unsealed_fotmob_player_collector_publication
+    )
     assert finalize._init_kwargs["trigger_rule"] == "all_done"
 
 

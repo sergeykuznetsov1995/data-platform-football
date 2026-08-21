@@ -496,6 +496,180 @@ def test_scheduled_runtime_attestation_binds_report_container_and_manifest(tmp_p
     assert "must-not-appear" not in json.dumps(result)
 
 
+def test_deployed_player_collector_owner_gets_retry_stable_nonzero_identity(
+    tmp_path, monkeypatch
+):
+    roots, _path, _report, environment, _dag_run = _isolated_runtime_evidence(
+        tmp_path
+    )
+    dag_run = SimpleNamespace(
+        dag_id="dag_collect_fotmob_players",
+        run_type="manual",
+        run_id="manual__collector-1",
+        logical_date=START,
+        data_interval_start=START,
+        data_interval_end=START,
+    )
+    context = {
+        "dag_run": dag_run,
+        "data_interval_start": START,
+        "data_interval_end": START,
+    }
+    monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
+
+    admitted = publication.attest_fotmob_player_collector_runtime(
+        environ=environment,
+        hostname="1" * 12,
+        roots=roots,
+        **context,
+    )
+    first = publication.expected_player_collector_publication(context)
+    second = publication.expected_player_collector_publication(context)
+
+    assert admitted["deployment_id"] == "f" * 32
+    assert first == second
+    assert first["binding"]["data_interval_start"] < first["binding"][
+        "data_interval_end"
+    ]
+
+
+def test_deployed_player_collector_initializer_uses_same_manual_admission(
+    tmp_path, monkeypatch
+):
+    roots, _path, _report, environment, _dag_run = _isolated_runtime_evidence(
+        tmp_path
+    )
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    initialize = MagicMock(return_value={"phase": "writing", "active": True})
+    monkeypatch.setattr(
+        publication,
+        "_control_store",
+        lambda: SimpleNamespace(initialize_publication_generation=initialize),
+    )
+    dag_run = SimpleNamespace(
+        dag_id="dag_collect_fotmob_players",
+        run_type="manual",
+        run_id="manual__collector-1",
+        logical_date=START,
+        data_interval_start=START,
+        data_interval_end=START,
+    )
+
+    result = publication.initialize_fotmob_player_collector_publication(
+        dag_run=dag_run,
+        data_interval_start=START,
+        data_interval_end=START,
+        hostname="1" * 12,
+        roots=roots,
+        ti=MagicMock(),
+    )
+
+    assert initialize.call_args.kwargs["dag_id"] == "dag_collect_fotmob_players"
+    assert initialize.call_args.kwargs["binding"] == result["binding"]
+    assert result["binding"]["data_interval_start"] < result["binding"][
+        "data_interval_end"
+    ]
+
+
+def test_player_collector_finalizer_targets_the_initialized_generation(
+    monkeypatch,
+):
+    _ceremony_env(monkeypatch)
+    monkeypatch.setenv(publication.FOTMOB_RUNTIME_FINGERPRINT_ENV, GIT_SHA)
+    dag_run = SimpleNamespace(
+        dag_id="dag_collect_fotmob_players",
+        run_type="manual",
+        run_id="manual__collector-1",
+        logical_date=START,
+        data_interval_start=START,
+        data_interval_end=START,
+        get_task_instances=lambda: [
+            SimpleNamespace(
+                task_id="trigger_fotmob_player_collector", state="success"
+            )
+        ],
+    )
+    context = {
+        "dag_run": dag_run,
+        "data_interval_start": START,
+        "data_interval_end": START,
+    }
+
+    initialized = publication.expected_player_collector_publication(context)
+    finalized = publication.fail_unsealed_fotmob_player_collector_publication(
+        success_task_id="trigger_fotmob_player_collector",
+        writer_task_ids=["trigger_fotmob_player_collector"],
+        **context,
+    )
+
+    assert finalized["generation_id"] == initialized["generation_id"]
+
+
+def test_active_player_collector_writer_requires_exact_child_and_profile(
+    tmp_path, monkeypatch
+):
+    roots, _path, _report, environment, _dag_run = _isolated_runtime_evidence(tmp_path)
+    binding = _binding()
+    generation_id = publication.make_generation_id(binding)
+    payload = {"generation_id": generation_id, "binding": binding}
+    profile = {
+        "mode": "players",
+        "scope": "",
+        "catalog_contract": "",
+        "entities": "players",
+        "max_requests": 500,
+        "max_direct_mib": 64,
+        "max_proxy_mib": 0,
+        "competition_limit": 0,
+        "season_limit": 0,
+        "match_limit": 0,
+        "team_limit": 0,
+        "player_limit": 100,
+        "requests_per_minute": 30,
+        "max_attempts": 4,
+        "deadline": "",
+        "source_refresh_profile": "",
+        "source_refresh_targets_sha256": "",
+    }
+    authorization = {
+        "owner_run_id": "manual__collector-1",
+        "ingest_run_id": f"fotmob_players__{generation_id}",
+        "lane": "players",
+        "conf": profile,
+        "silver_trigger_state": "running",
+    }
+    monkeypatch.setattr(
+        publication,
+        "_active_owner_writer_authorization",
+        lambda *_args, **_kwargs: dict(authorization),
+    )
+
+    ingest = SimpleNamespace(
+        dag_id="dag_ingest_fotmob",
+        run_id=authorization["ingest_run_id"],
+        conf={**profile, publication.FOTMOB_PUBLICATION_CONF_KEY: payload},
+    )
+    admitted = publication.attest_fotmob_isolated_runtime(
+        environ=environment,
+        hostname="1" * 12,
+        roots=roots,
+        require_scheduled_owner=False,
+        dag_run=ingest,
+    )
+    assert admitted["automatic_writer_lifecycle"]["lane"] == "players"
+
+    ingest.conf = {**ingest.conf, "player_limit": 101}
+    with pytest.raises(Exception, match="player collector profile differs"):
+        publication.attest_fotmob_isolated_runtime(
+            environ=environment,
+            hostname="1" * 12,
+            roots=roots,
+            require_scheduled_owner=False,
+            dag_run=ingest,
+        )
+
+
 def test_active_automatic_writer_requires_exact_child_ids_and_owner_profile(
     tmp_path, monkeypatch
 ):

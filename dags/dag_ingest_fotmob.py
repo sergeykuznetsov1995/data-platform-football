@@ -496,14 +496,23 @@ def _validate_player_collector_selection(
         violations.append("missing player collector operation")
     else:
         operation = player_operations[0]
+        succeeded = int(operation.get("succeeded") or 0)
         if (
             operation.get("status") != "success"
             or operation.get("attempted") != len(player_ids)
             or operation.get("skipped") != 0
             or operation.get("not_available") != unavailable
-            or int(operation.get("succeeded") or 0) + unavailable != len(player_ids)
+            or succeeded + unavailable != len(player_ids)
         ):
             violations.append("terminal player outcomes mismatch")
+        if (operation.get("metadata") or {}).get("typed_snapshot_writes") != succeeded:
+            violations.append("typed player write evidence mismatch")
+        raw_tables = result.get("tables")
+        if succeeded and (
+            not isinstance(raw_tables, list)
+            or "iceberg.bronze.fotmob_player_snapshots" not in raw_tables
+        ):
+            violations.append("typed player table evidence missing")
     if len(contract_operations) != 1:
         violations.append("missing player collector contract operation")
     else:

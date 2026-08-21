@@ -253,6 +253,7 @@ def _player_collector_report(mod):
                 "errors": [],
                 "retryable": [],
                 "terminal": [],
+                "metadata": {"typed_snapshot_writes": 1},
             },
             {
                 "entity": "player_collector_contract",
@@ -827,6 +828,16 @@ class TestNativeValidation:
             (
                 lambda payload: payload["operations"][0].__setitem__("skipped", 1),
                 "terminal player outcomes mismatch",
+            ),
+            (
+                lambda payload: payload["operations"][0]["metadata"].__setitem__(
+                    "typed_snapshot_writes", 0
+                ),
+                "typed player write evidence mismatch",
+            ),
+            (
+                lambda payload: payload.__setitem__("tables", []),
+                "typed player table evidence missing",
             ),
             (
                 lambda payload: payload["operations"].append(

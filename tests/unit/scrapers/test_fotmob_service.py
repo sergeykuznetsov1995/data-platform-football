@@ -1688,6 +1688,40 @@ def test_forced_player_refresh_reobserves_partial_current_run_commits():
     assert sorted(call[0] for call in transport.calls[1:]) == sorted([url10, url20])
 
 
+def test_player_typed_gap_repair_rewrites_same_deterministic_batch():
+    """A successful manifest must not hide its missing typed player row."""
+
+    player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
+    payload = {"pageProps": {"data": {"id": 10, "name": "Ten"}}}
+    service, transport, repository = _service({player_url: payload})
+    fetch = transport._get(player_url, None)
+    repository.record(
+        TargetCommit(
+            run_id="stale-manifest",
+            target_type="player",
+            target_key=fetch.target_key,
+            status=ManifestStatus.SUCCESS,
+            entity_id="10",
+            content_hash=fetch.content_hash,
+            raw_uri=fetch.raw_uri,
+            fetched_at=datetime.fromisoformat(fetch.fetched_at),
+        )
+    )
+    transport.calls.clear()
+
+    repaired = service.sync_player_snapshots(
+        [10],
+        build_id="build-1",
+        force_refresh=True,
+        repair_missing_snapshot=True,
+        capture_terminal_outcomes=True,
+    )
+
+    assert repaired.ok and repaired.succeeded == 1
+    assert repaired.metadata["typed_snapshot_writes"] == 1
+    assert repository.tables["fotmob_player_snapshots"][0]["player_id"] == "10"
+
+
 def test_backfill_skips_fresh_prior_generation_children():
     """#1146 отменяет контракт #995: свежие цели прошлого рана не перекачиваются.
 

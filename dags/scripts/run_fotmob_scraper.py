@@ -909,6 +909,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             # this collector repairs. The anti-join prevents refreshing any
             # identity that already has a card row.
             force_refresh=True,
+            repair_missing_snapshot=True,
             capture_terminal_outcomes=True,
         )
         operations.append(player_operation)
@@ -950,6 +951,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             != len(player_ids)
             or player_operation.not_available != unavailable
             or player_operation.skipped != 0
+            or player_operation.metadata.get("typed_snapshot_writes")
+            != player_operation.succeeded
         ):
             contract_operation.errors.append(
                 "player collector did not produce one terminal outcome per target"

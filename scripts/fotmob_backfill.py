@@ -99,6 +99,7 @@ DAILY_DAG_ID = "dag_trigger_fotmob_daily"
 AUTOMATIC_OWNER_DAG_ID = "dag_orchestrate_fotmob"
 REFRESH_DAG_ID = "dag_refresh_fotmob"
 BACKFILL_DAG_ID = "dag_backfill_fotmob"
+PLAYER_COLLECTOR_DAG_ID = "dag_collect_fotmob_players"
 # Quiescence is wider than the two DAGs temporarily enabled by this historical
 # coordinator.  Any automatic or rollback owner could trigger the same writer.
 DAGS = (
@@ -108,6 +109,7 @@ DAGS = (
     DAILY_DAG_ID,
     REFRESH_DAG_ID,
     BACKFILL_DAG_ID,
+    PLAYER_COLLECTOR_DAG_ID,
 )
 AUTOMATIC_CANARY_MODE = "automatic-canary"
 MODES = frozenset({"backfill", "replay", AUTOMATIC_CANARY_MODE})

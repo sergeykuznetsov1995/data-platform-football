@@ -2018,6 +2018,7 @@ class TestFotmobNativeRunner:
                 metadata={
                     "terminal_outcomes": outcomes,
                     "intentional_not_available": 1,
+                    "typed_snapshot_writes": 1,
                 },
             )
         )
@@ -2050,7 +2051,10 @@ class TestFotmobNativeRunner:
             args.player_limit
         )
         service.sync_player_snapshots.assert_called_once_with(
-            [21, 40], force_refresh=True, capture_terminal_outcomes=True
+            [21, 40],
+            force_refresh=True,
+            repair_missing_snapshot=True,
+            capture_terminal_outcomes=True,
         )
         service.discover_catalog.assert_not_called()
 

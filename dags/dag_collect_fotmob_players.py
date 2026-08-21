@@ -22,9 +22,9 @@ from scrapers.fotmob.player_collector import (
 )
 from utils.default_args import DEFAULT_ARGS
 from utils.fotmob_publication import (
-    attest_fotmob_isolated_runtime,
-    fail_unsealed_fotmob_publication,
-    initialize_fotmob_publication,
+    attest_fotmob_player_collector_runtime,
+    fail_unsealed_fotmob_player_collector_publication,
+    initialize_fotmob_player_collector_publication,
 )
 
 
@@ -67,14 +67,13 @@ if os.environ.get(ISOLATED_STACK_ENV) == "1":
     ) as dag:
         attest_runtime = PythonOperator(
             task_id="attest_isolated_runtime",
-            python_callable=attest_fotmob_isolated_runtime,
+            python_callable=attest_fotmob_player_collector_runtime,
             retries=0,
         )
 
         initialize_publication = PythonOperator(
             task_id=INITIALIZER_TASK_ID,
-            python_callable=initialize_fotmob_publication,
-            op_kwargs={"publication_owner": "isolated"},
+            python_callable=initialize_fotmob_player_collector_publication,
             retries=0,
         )
 
@@ -121,9 +120,8 @@ if os.environ.get(ISOLATED_STACK_ENV) == "1":
 
         finalize_publication = PythonOperator(
             task_id="finalize_fotmob_publication",
-            python_callable=fail_unsealed_fotmob_publication,
+            python_callable=fail_unsealed_fotmob_player_collector_publication,
             op_kwargs={
-                "publication_owner": "isolated",
                 "success_task_id": TRIGGER_TASK_ID,
                 "writer_task_ids": [TRIGGER_TASK_ID],
             },
