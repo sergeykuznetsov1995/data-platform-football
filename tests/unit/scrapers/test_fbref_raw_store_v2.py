@@ -5,6 +5,7 @@ import threading
 import pytest
 
 from scrapers.fbref.raw_store import (
+    PageTarget,
     RAW_MANIFEST_VERSION_V2,
     RAW_V1_BRIDGE_VERSION,
     RawPageCorrupt,
@@ -16,6 +17,23 @@ from scrapers.fbref.raw_store import (
 
 def _store(tmp_path) -> RawPageStore:
     return RawPageStore.from_uri(tmp_path.as_uri())
+
+
+def _contextual_match_target(
+    match_id: str, *, competition_id: str, season_id: str
+) -> PageTarget:
+    base = match_page_target(match_id)
+    return PageTarget(
+        source=base.source,
+        page_kind=base.page_kind,
+        target_id=base.target_id,
+        canonical_url=base.canonical_url,
+        source_ids={
+            "competition_id": competition_id,
+            "season_id": season_id,
+            "match_id": match_id,
+        },
+    )
 
 
 def test_v2_commit_preserves_exact_response_bytes_and_metrics(tmp_path):
@@ -317,6 +335,62 @@ def test_retrying_older_refresh_does_not_regress_latest_pointer(tmp_path):
     latest_body, latest = store.load_latest_response(target)
     assert latest_body == second_body
     assert latest.logical_refresh_id == newest.logical_refresh_id
+
+
+def test_match_history_accepts_same_match_rediscovered_in_another_season(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    old_target = _contextual_match_target(
+        "08171559", competition_id="69", season_id="2025-2026"
+    )
+    current_target = _contextual_match_target(
+        "08171559", competition_id="69", season_id="2026-2027"
+    )
+    old = store.commit_fetch(
+        old_target,
+        b"<html>old observation</html>",
+        logical_refresh_id="refresh-old",
+        http_status=200,
+    )
+
+    current = store.commit_fetch(
+        current_target,
+        b"<html>current observation</html>",
+        logical_refresh_id="refresh-current",
+        http_status=200,
+    )
+
+    body, latest = store.load_latest_response(current_target)
+    assert body == b"<html>current observation</html>"
+    assert latest == current
+    assert current.previous_content_hash == old.content_hash
+    assert current.source_ids == current_target.source_ids
+
+
+def test_match_history_still_rejects_another_match_id(tmp_path):
+    store = _store(tmp_path)
+    target = _contextual_match_target(
+        "08171559", competition_id="69", season_id="2026-2027"
+    )
+    record = store.commit_fetch(
+        target,
+        b"<html>match</html>",
+        logical_refresh_id="refresh-match",
+        http_status=200,
+    )
+    history_key = store._v2_target_history_manifest_key(
+        target, record.logical_refresh_id
+    )
+    payload = store.read_manifest(history_key)
+    payload["source_ids"] = {
+        **payload["source_ids"],
+        "match_id": "deadbeef",
+    }
+    store._write_json(history_key, payload)
+
+    with pytest.raises(RawPageCorrupt, match="identity mismatch"):
+        store.load_latest_response(target)
 
 
 def test_delayed_first_commit_cannot_regress_latest_or_304_base(

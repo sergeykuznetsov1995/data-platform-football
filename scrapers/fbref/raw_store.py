@@ -730,6 +730,27 @@ class RawPageStore:
         return self._load_record_blob(record, response=False), record
 
     @staticmethod
+    def _same_recovery_source_identity(
+        target: PageTarget,
+        record: RawPageRecord | RawFetchRecord,
+    ) -> bool:
+        """Compare source-owned identity while ignoring match discovery context."""
+
+        if target.page_kind != "match":
+            return dict(record.source_ids) == dict(target.source_ids)
+        target_match_id = str(
+            target.source_ids.get("match_id") or ""
+        ).lower()
+        record_match_id = str(
+            record.source_ids.get("match_id") or ""
+        ).lower()
+        return bool(
+            _MATCH_ID_RE.fullmatch(target_match_id)
+            and _MATCH_ID_RE.fullmatch(record_match_id)
+            and target_match_id == record_match_id
+        )
+
+    @staticmethod
     def _validate_recovery_identity(
         target: PageTarget,
         record: RawPageRecord | RawFetchRecord,
@@ -742,7 +763,7 @@ class RawPageStore:
             record.source != target.source
             or record.page_kind != target.page_kind
             or record.target_id != target.target_id
-            or dict(record.source_ids) != dict(target.source_ids)
+            or not RawPageStore._same_recovery_source_identity(target, record)
         ):
             raise RawPageCorrupt(
                 f"Target identity mismatch in {version} raw manifest for "
