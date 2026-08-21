@@ -68,6 +68,7 @@ ISOLATED_DAGS = (
     "dag_trigger_fotmob_daily",
     "dag_refresh_fotmob",
     "dag_backfill_fotmob",
+    "dag_collect_fotmob_players",
 )
 LEGACY_DAGS = frozenset(ISOLATED_DAGS[3:])
 ACTIVE_PAUSE_STATES = {dag_id: dag_id in LEGACY_DAGS for dag_id in ISOLATED_DAGS}

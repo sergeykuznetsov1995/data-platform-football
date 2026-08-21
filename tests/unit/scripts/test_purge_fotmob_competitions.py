@@ -807,6 +807,29 @@ def test_production_purge_fence_runs_only_in_admitted_isolated_container():
     assert all("ControlStore.from_env()" in command[-1] for command in commands)
 
 
+def test_dual_quiescence_sends_exact_writer_sets_to_each_scheduler():
+    backend = mod.TrinoAirflowRawBackend(
+        connection=object(), raw_store=object(), run=lambda *_args, **_kwargs: None
+    )
+    backend._live_isolated_scheduler_id = "1" * 64
+    backend._live_shared_scheduler_id = "2" * 64
+    proofs = []
+
+    def prove(container_id, script):
+        proofs.append((container_id, script))
+        return {"passed": True}
+
+    backend._container_proof = prove
+    backend.assert_quiescent(mod.WRITER_DAG_IDS, source="fotmob")
+
+    isolated_script = proofs[0][1]
+    shared_script = proofs[1][1]
+    assert proofs[0][0] == "1" * 64
+    assert proofs[1][0] == "2" * 64
+    assert all(dag_id in isolated_script for dag_id in mod.ISOLATED_WRITER_DAG_IDS)
+    assert all(dag_id in shared_script for dag_id in mod.SHARED_STATE_DAGS)
+
+
 class FakeBackend:
     def __init__(self, *, journal_path=None):
         self.journal_path = journal_path

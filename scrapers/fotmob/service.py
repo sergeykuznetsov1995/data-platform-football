@@ -727,6 +727,7 @@ class FotMobIngestService:
         error: Optional[str] = None,
         observation_id: Optional[str] = None,
         retry_after: Optional[datetime] = None,
+        force_dataset_write: bool = False,
     ) -> list[str]:
         manifest_status = status or _fetch_manifest_status(fetch)
         commit = TargetCommit(
@@ -782,7 +783,11 @@ class FotMobIngestService:
             }
         ):
             previous = self.repository.latest_success(fetch.target_key)
-            if previous and previous.get("batch_id") == commit.batch_id:
+            if (
+                not force_dataset_write
+                and previous
+                and previous.get("batch_id") == commit.batch_id
+            ):
                 datasets_to_write = ()
         return self.repository.commit(commit, datasets_to_write)
 
@@ -2940,6 +2945,7 @@ class FotMobIngestService:
         refresh_after: Optional[timedelta] = PLAYER_REFRESH_AFTER,
         limit: Optional[int] = None,
         force_refresh: bool = False,
+        repair_missing_snapshot: bool = False,
         capture_terminal_outcomes: bool = False,
     ) -> OperationResult:
         """Refresh global player snapshots without season mislabelling.
@@ -2961,6 +2967,8 @@ class FotMobIngestService:
         )
         terminal_outcomes: dict[str, str] = {}
         missing_raw_player_ids: set[int] = set()
+        if repair_missing_snapshot:
+            result.metadata["typed_snapshot_writes"] = 0
 
         def attach_terminal_outcomes() -> None:
             if capture_terminal_outcomes or self.mode == RunMode.REPLAY:
@@ -3133,10 +3141,19 @@ class FotMobIngestService:
                         "has_career_history": bool(row.get("career_history_json")),
                     },
                     unknown_paths=unknown,
+                    # The missing-player collector selects identities by a
+                    # typed-table anti-join. A byte-identical successful
+                    # manifest is therefore evidence of the gap, not proof
+                    # that this dataset may be suppressed.
+                    force_dataset_write=repair_missing_snapshot,
                 )
                 result.tables.extend(paths)
                 result.succeeded += 1
                 result.counts["players"] = result.counts.get("players", 0) + 1
+                if repair_missing_snapshot:
+                    result.metadata["typed_snapshot_writes"] = int(
+                        result.metadata["typed_snapshot_writes"]
+                    ) + 1
                 terminal_outcomes[str(key)] = ManifestStatus.SUCCESS.value
             except Exception as exc:
                 result.errors.append(f"player {key} parse: {type(exc).__name__}: {exc}")

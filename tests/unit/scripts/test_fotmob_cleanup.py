@@ -66,6 +66,7 @@ def test_cleanup_pause_evidence_covers_exact_six_writer_inventory(tmp_path):
         "dag_trigger_fotmob_daily",
         "dag_refresh_fotmob",
         "dag_backfill_fotmob",
+        "dag_collect_fotmob_players",
     }
     assert mod.PAUSED_DAGS == expected
 

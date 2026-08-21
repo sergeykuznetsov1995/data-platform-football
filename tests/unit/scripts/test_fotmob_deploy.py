@@ -35,6 +35,23 @@ ADVANCED_SCHEDULE_BOUNDARY = {
 }
 
 
+def test_player_collector_is_a_projected_paused_manual_owner():
+    dag_id = "dag_collect_fotmob_players"
+    dag_path = "dags/dag_collect_fotmob_players.py"
+
+    assert dag_id in mod.EXPECTED_DAGS
+    assert dag_id in mod.LEGACY_OWNER_DAGS
+    assert mod.EXPECTED_DAG_FILES[dag_id] == "/opt/airflow/" + dag_path
+    assert mod.EXPECTED_SCHEDULES[dag_id] == "None"
+    assert fotmob_runtime.PROJECTION_SOURCES[
+        "dag_collect_fotmob_players.py"
+    ] == dag_path
+    assert dag_id in fotmob_runtime.EXPECTED_DAGS
+    assert dag_id in fotmob_runtime.LEGACY_OWNER_DAGS
+    assert dag_path in fotmob_runtime.ISOLATED_DAG_ROOT_PATHS
+    assert dag_path in fotmob_runtime.SHARED_REQUIRED_RUNTIME_PATHS
+
+
 def _exact_scheduled_row(dag_id, *, state="queued", run_id=None):
     boundary = mod.validate_schedule_boundary(NEXT_SCHEDULE_BOUNDARY, label="test")
     return {
@@ -229,6 +246,7 @@ def _automatic_catalog_admission(
                 "dag_trigger_fotmob_daily",
                 "dag_refresh_fotmob",
                 "dag_backfill_fotmob",
+                "dag_collect_fotmob_players",
             )
         },
         "lane_budgets": {
@@ -1237,6 +1255,7 @@ def test_prepare_dagbag_contains_exact_root_files_and_detects_tampering(tmp_path
         "dags/dag_orchestrate_fotmob.py",
         "dags/dag_refresh_fotmob.py",
         "dags/dag_backfill_fotmob.py",
+        "dags/dag_collect_fotmob_players.py",
         "dags/dag_transform_fotmob_silver.py",
         "dags/dag_trigger_fotmob_daily.py",
         "deploy/fotmob/.airflowignore",
@@ -1252,6 +1271,7 @@ def test_prepare_dagbag_contains_exact_root_files_and_detects_tampering(tmp_path
         "dag_trigger_fotmob_daily.py",
         "dag_refresh_fotmob.py",
         "dag_backfill_fotmob.py",
+        "dag_collect_fotmob_players.py",
         ".airflowignore",
         "utils",
         "sql",
@@ -3406,7 +3426,7 @@ def test_automatic_activation_boundary_rejects_unsafe_daily_cut(boundary, now):
         mod.validate_automatic_activation_boundary(boundary, now=now)
 
 
-def test_atomic_writer_transaction_names_exact_six_and_rejects_partial_result():
+def test_atomic_writer_transaction_names_exact_seven_and_rejects_partial_result():
     commands = []
 
     def run(command, **_kwargs):

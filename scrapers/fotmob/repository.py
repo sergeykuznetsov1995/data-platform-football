@@ -2644,6 +2644,45 @@ class FotMobRepository:
                 continue
         return output
 
+    def missing_current_squad_player_ids(self, limit: int) -> list[int]:
+        """Return a bounded, deterministic roster-to-card anti-join."""
+
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be positive")
+        manager_getter = getattr(self.writer, "_get_trino_manager", None)
+        if manager_getter is None:
+            raise RuntimeError("FotMob current view is unavailable")
+        trino = manager_getter()
+        squad_table = "fotmob_squad_snapshots_current"
+        player_table = "fotmob_player_snapshots_current"
+        if not trino.table_exists(self.schema, squad_table) or not trino.table_exists(
+            self.schema, player_table
+        ):
+            raise RuntimeError("FotMob current view is unavailable")
+        rows = trino.execute_query(
+            f"""
+            SELECT DISTINCT TRY_CAST(s.member_id AS BIGINT) AS player_id
+            FROM {self.catalog}.{self.schema}.{squad_table} s
+            LEFT JOIN {self.catalog}.{self.schema}.{player_table} p
+              ON TRY_CAST(p.player_id AS BIGINT) = TRY_CAST(s.member_id AS BIGINT)
+            WHERE s.member_type = 'player'
+              AND TRY_CAST(s.member_id AS BIGINT) > 0
+              AND p.player_id IS NULL
+            ORDER BY player_id
+            LIMIT {limit}
+            """
+        )
+        output: list[int] = []
+        for row in rows:
+            value = row[0] if isinstance(row, (tuple, list)) else row
+            try:
+                player_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if player_id > 0 and player_id not in output:
+                output.append(player_id)
+        return output
+
     def previous_catalog_snapshots(self, limit: int = 2) -> list[set[int]]:
         """Return newest complete catalog ID sets before the current run."""
 
@@ -3080,6 +3119,31 @@ class MemoryFotMobRepository:
             except (KeyError, TypeError, ValueError):
                 continue
         return output
+
+    def missing_current_squad_player_ids(self, limit: int) -> list[int]:
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be positive")
+        team_ids = {
+            str(commit.entity_id)
+            for commit in self.commits
+            if commit.target_type == "team" and commit.entity_id is not None
+        }
+        squad_ids: set[int] = set()
+        for team_id in team_ids:
+            squad_ids.update(
+                player_id
+                for player_id in self.current_squad_player_ids(team_id)
+                if player_id > 0
+            )
+        existing_ids: set[int] = set()
+        for row in self.tables.get("fotmob_player_snapshots", []):
+            try:
+                player_id = int(row.get("player_id"))
+            except (TypeError, ValueError):
+                continue
+            if player_id > 0:
+                existing_ids.add(player_id)
+        return sorted(squad_ids - existing_ids)[:limit]
 
     def previous_catalog_snapshots(self, limit: int = 2) -> list[set[int]]:
         # Match the production query: an offline raw replay is useful for

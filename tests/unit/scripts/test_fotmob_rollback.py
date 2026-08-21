@@ -230,6 +230,7 @@ def test_rollback_writer_fence_covers_exact_six_writer_inventory():
         "dag_trigger_fotmob_daily",
         "dag_refresh_fotmob",
         "dag_backfill_fotmob",
+        "dag_collect_fotmob_players",
     )
 
 
@@ -613,7 +614,7 @@ def test_pause_all_writers_attempts_every_dag_and_aggregates_safely(monkeypatch)
         mod._pause_all_writers(object(), run=lambda *_a, **_k: None)
 
     assert attempted == list(mod.DAGS)
-    assert mod.DAGS[-1] == "dag_backfill_fotmob"
+    assert mod.DAGS[-1] == "dag_collect_fotmob_players"
     assert inspected == [True]
     assert verified == [writer_state]
     message = str(raised.value)

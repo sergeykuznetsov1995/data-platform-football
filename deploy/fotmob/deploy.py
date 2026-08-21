@@ -2,7 +2,7 @@
 """Deploy and admit the isolated FotMob Airflow stack.
 
 Admission is deliberately fail-closed: the scheduler must be healthy, its
-DagBag must contain exactly the six FotMob DAGs, and import errors must be empty
+DagBag must contain exactly the seven FotMob DAGs, and import errors must be empty
 before any DAG is unpaused.  A JSON report is written for every attempt.
 """
 
@@ -42,6 +42,7 @@ EXPECTED_DAGS = frozenset(
         "dag_trigger_fotmob_daily",
         "dag_refresh_fotmob",
         "dag_backfill_fotmob",
+        "dag_collect_fotmob_players",
     }
 )
 EXPECTED_DAG_FILES = {
@@ -51,6 +52,9 @@ EXPECTED_DAG_FILES = {
     "dag_trigger_fotmob_daily": "/opt/airflow/dags/dag_trigger_fotmob_daily.py",
     "dag_refresh_fotmob": "/opt/airflow/dags/dag_refresh_fotmob.py",
     "dag_backfill_fotmob": "/opt/airflow/dags/dag_backfill_fotmob.py",
+    "dag_collect_fotmob_players": (
+        "/opt/airflow/dags/dag_collect_fotmob_players.py"
+    ),
 }
 EXPECTED_SCHEDULES = {
     "dag_orchestrate_fotmob": "*/5 * * * *",
@@ -59,10 +63,16 @@ EXPECTED_SCHEDULES = {
     "dag_trigger_fotmob_daily": "None",
     "dag_refresh_fotmob": "None",
     "dag_backfill_fotmob": "None",
+    "dag_collect_fotmob_players": "None",
 }
 AUTOMATIC_OWNER_DAG_ID = "dag_orchestrate_fotmob"
 LEGACY_OWNER_DAGS = frozenset(
-    {"dag_trigger_fotmob_daily", "dag_refresh_fotmob", "dag_backfill_fotmob"}
+    {
+        "dag_trigger_fotmob_daily",
+        "dag_refresh_fotmob",
+        "dag_backfill_fotmob",
+        "dag_collect_fotmob_players",
+    }
 )
 AUTOMATIC_ACTIVE_DAGS = frozenset(
     {AUTOMATIC_OWNER_DAG_ID, "dag_ingest_fotmob", "dag_transform_fotmob_silver"}
@@ -142,6 +152,7 @@ ISOLATED_DAG_ROOT_PATHS = {
     "dags/dag_trigger_fotmob_daily.py",
     "dags/dag_refresh_fotmob.py",
     "dags/dag_backfill_fotmob.py",
+    "dags/dag_collect_fotmob_players.py",
 }
 ISOLATED_DAG_PREFIXES = (
     "dags/scripts/",
@@ -161,6 +172,7 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "dags/dag_orchestrate_fotmob.py",
     "dags/dag_refresh_fotmob.py",
     "dags/dag_backfill_fotmob.py",
+    "dags/dag_collect_fotmob_players.py",
     "dags/dag_master_pipeline.py",
     "dags/dag_sofascore_pipeline.py",
     "dags/dag_trigger_fotmob_daily.py",
@@ -190,6 +202,7 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "scrapers/fotmob/raw_store.py",
     "scrapers/fotmob/repository.py",
     "scrapers/fotmob/service.py",
+    "scrapers/fotmob/player_collector.py",
     "scrapers/fotmob/scope_codec.py",
     "scrapers/fotmob/source_refresh.py",
     "scrapers/fotmob/transport.py",
@@ -703,6 +716,8 @@ def prepare_dagbag(release_root: Path, evidence_dir: Path, sha: str) -> Path:
         / "dags/dag_trigger_fotmob_daily.py",
         "dag_refresh_fotmob.py": release_root / "dags/dag_refresh_fotmob.py",
         "dag_backfill_fotmob.py": release_root / "dags/dag_backfill_fotmob.py",
+        "dag_collect_fotmob_players.py": release_root
+        / "dags/dag_collect_fotmob_players.py",
         ".airflowignore": release_root / "deploy/fotmob/.airflowignore",
     }
     missing = [str(path) for path in sources.values() if not path.is_file()]
@@ -1025,7 +1040,7 @@ def atomic_automatic_writer_transition(
     selected_date: str | None = None,
     run: Callable[..., subprocess.CompletedProcess[str]],
 ) -> dict[str, Any]:
-    """Validate and update all six DagModel rows in one metadata transaction."""
+    """Validate and update all seven DagModel rows in one metadata transaction."""
 
     if phase not in {"children", "owner", "pause_all"}:
         raise DeploymentError("unknown automatic writer transition")
@@ -1056,7 +1071,7 @@ try:
     models = s.query(DagModel).filter(DagModel.dag_id.in_(ids)).with_for_update().all()
     by_id = {{model.dag_id: model for model in models}}
     if set(by_id) != set(ids):
-        raise RuntimeError('exact six DagModel rows are required')
+        raise RuntimeError('exact seven DagModel rows are required')
     run_rows = s.query(DagRun.dag_id, DagRun.run_id, DagRun.state).filter(
         DagRun.dag_id.in_(ids), DagRun.state.in_(('running', 'queued'))
     ).with_for_update().all()
@@ -1107,7 +1122,7 @@ try:
         for dag_id in ids
     )
     if phase == 'children' and not all_paused:
-        raise RuntimeError('children transition requires all six paused')
+        raise RuntimeError('children transition requires all seven paused')
     if phase == 'owner' and not children_shape:
         raise RuntimeError('owner transition has unexpected pause shape')
     for dag_id, model in by_id.items():
@@ -1168,7 +1183,7 @@ def inspect_automatic_writer_pause_shape(
     expected_paused: set[str] | None,
     run: Callable[..., subprocess.CompletedProcess[str]],
 ) -> dict[str, Any]:
-    """Read all six live DagModel rows without trusting the report snapshot."""
+    """Read all seven live DagModel rows without trusting the report snapshot."""
 
     if expected_paused is not None and not expected_paused.issubset(EXPECTED_DAGS):
         raise DeploymentError("automatic writer pause expectation is invalid")
@@ -2524,6 +2539,7 @@ active_ids = (
     'dag_trigger_fotmob_daily',
     'dag_refresh_fotmob',
     'dag_backfill_fotmob',
+    'dag_collect_fotmob_players',
     'dag_orchestrate_fotmob',
 )
 pause_rows = s.query(DagModel.dag_id, DagModel.is_paused).filter(
@@ -2860,6 +2876,7 @@ s.close()
             "dag_trigger_fotmob_daily",
             "dag_refresh_fotmob",
             "dag_backfill_fotmob",
+            "dag_collect_fotmob_players",
             "dag_orchestrate_fotmob",
         )
     }
@@ -2935,7 +2952,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--automatic-catalog",
         action="store_true",
-        help="Prepare the six-DAG automatic catalog rollout (must stay paused)",
+        help="Prepare the seven-DAG automatic catalog rollout (must stay paused)",
     )
     parser.add_argument(
         "--activate-automatic",
