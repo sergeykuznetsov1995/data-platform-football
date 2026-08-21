@@ -773,7 +773,7 @@ def _validate_automatic_kept_paused_writer(
 ) -> dict[str, Any] | None:
     """Admit only the exact manual automatic-daily canary namespace.
 
-    The canary is the sole dynamic writer allowed while all six DAGs remain
+    The canary is the sole dynamic writer allowed while all seven DAGs remain
     paused.  It may temporarily enable only ingest and Silver; the scheduled
     orchestrator and every legacy owner remain paused throughout.
     """
