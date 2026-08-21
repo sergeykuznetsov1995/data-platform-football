@@ -62,10 +62,24 @@ from scrapers.fotmob.source_refresh import (
     REPLAY_MISSING_INPUT_PROOF_TASK_ID,
     load_player_source_refresh_contract,
 )
+from scrapers.fotmob.player_collector import (
+    PLAYER_COLLECTOR_ENTITIES,
+    PLAYER_COLLECTOR_MAX_DIRECT_MIB,
+    PLAYER_COLLECTOR_MAX_REQUESTS,
+    PLAYER_COLLECTOR_MODE,
+    PLAYER_COLLECTOR_PLAYER_LIMIT,
+    PLAYER_COLLECTOR_PROFILE,
+    PLAYER_COLLECTOR_REQUESTS_PER_MINUTE,
+    normalize_player_collector_ids,
+    player_collector_ids_sha256,
+    player_collector_plan_signature,
+)
 
 
 RESULT_PATH = "/tmp/fotmob_result_{{ ts_nodash }}.json"
-NATIVE_MODES = frozenset({"discover", "daily", "backfill", "replay", "refresh"})
+NATIVE_MODES = frozenset(
+    {"discover", "daily", "backfill", "replay", "refresh", PLAYER_COLLECTOR_MODE}
+)
 FOTMOB_SILVER_BRONZE_INPUTS = frozenset(
     {
         "iceberg.bronze.fotmob_competition_seasons",
@@ -383,6 +397,161 @@ def _validate_source_refresh_selection(
     return violations, {
         "profile": selection.get("profile"),
         "source_refresh": selection.get("source_refresh"),
+        "target_outcomes": outcomes,
+        "planned_scopes": selection.get("planned_scopes"),
+        "completed_scopes": selection.get("completed_scopes"),
+        "requests_per_minute": selection.get("requests_per_minute"),
+    }
+
+
+def _validate_player_collector_selection(
+    *,
+    result: Dict[str, Any],
+    selection: Dict[str, Any],
+    entities: list[str],
+    raw_scopes: list[str],
+    budget: Dict[str, Any],
+) -> tuple[list[str], Dict[str, Any]]:
+    """Validate one bounded roster-to-player-card anti-join run."""
+
+    violations: list[str] = []
+    collector = selection.get("player_collector")
+    player_ids: list[int] = []
+    if not isinstance(collector, dict) or set(collector) != {
+        "profile",
+        "player_ids",
+        "player_count",
+        "player_ids_sha256",
+        "player_limit",
+    }:
+        violations.append("player collector evidence is malformed")
+        collector = {}
+    raw_player_ids = collector.get("player_ids")
+    try:
+        canonical_ids = list(normalize_player_collector_ids(raw_player_ids or []))
+    except (TypeError, ValueError):
+        canonical_ids = []
+        violations.append("player IDs are not canonical")
+    if not isinstance(raw_player_ids, list) or raw_player_ids != canonical_ids:
+        violations.append("player IDs are not canonical")
+    else:
+        player_ids = canonical_ids
+    if collector.get("player_count") != len(player_ids):
+        violations.append("player count mismatch")
+    expected_digest = player_collector_ids_sha256(player_ids)
+    if collector.get("player_ids_sha256") != expected_digest:
+        violations.append("player ID digest mismatch")
+    if collector.get("profile") != PLAYER_COLLECTOR_PROFILE:
+        violations.append("collector profile mismatch")
+    if collector.get("player_limit") != PLAYER_COLLECTOR_PLAYER_LIMIT:
+        violations.append("player limit mismatch")
+    if len(player_ids) > PLAYER_COLLECTOR_PLAYER_LIMIT:
+        violations.append("player selection exceeds limit")
+
+    outcomes = selection.get("target_outcomes")
+    valid_outcomes = (
+        isinstance(outcomes, list)
+        and len(outcomes) == len(player_ids)
+        and all(
+            isinstance(item, dict)
+            and set(item) == {"player_id", "status"}
+            and type(item.get("player_id")) is int
+            and item.get("status") in {"success", "not_available"}
+            for item in outcomes
+        )
+    )
+    if valid_outcomes:
+        valid_outcomes = [item["player_id"] for item in outcomes] == player_ids
+    if not valid_outcomes:
+        violations.append("terminal player outcomes mismatch")
+
+    operations = result.get("operations") or []
+    operation_entities = [
+        item.get("entity") for item in operations if isinstance(item, dict)
+    ]
+    expected_operation_entities = {
+        "player_snapshots",
+        "player_collector_contract",
+        "commit_flush",
+        "current_views",
+    }
+    if (
+        len(operation_entities) != len(expected_operation_entities)
+        or set(operation_entities) != expected_operation_entities
+    ):
+        violations.append("player collector performed work outside players")
+    player_operations = [
+        item for item in operations if item.get("entity") == "player_snapshots"
+    ]
+    contract_operations = [
+        item
+        for item in operations
+        if item.get("entity") == "player_collector_contract"
+    ]
+    unavailable = sum(
+        isinstance(item, dict) and item.get("status") == "not_available"
+        for item in outcomes or []
+    )
+    if len(player_operations) != 1:
+        violations.append("missing player collector operation")
+    else:
+        operation = player_operations[0]
+        if (
+            operation.get("status") != "success"
+            or operation.get("attempted") != len(player_ids)
+            or operation.get("skipped") != 0
+            or operation.get("not_available") != unavailable
+            or int(operation.get("succeeded") or 0) + unavailable != len(player_ids)
+        ):
+            violations.append("terminal player outcomes mismatch")
+    if len(contract_operations) != 1:
+        violations.append("missing player collector contract operation")
+    else:
+        operation = contract_operations[0]
+        metadata = operation.get("metadata") or {}
+        if (
+            operation.get("status") != "success"
+            or operation.get("attempted") != len(player_ids)
+            or operation.get("succeeded") != len(player_ids)
+            or (operation.get("counts") or {}).get("terminal_targets")
+            != len(player_ids)
+            or metadata.get("profile") != PLAYER_COLLECTOR_PROFILE
+            or metadata.get("player_ids_sha256") != expected_digest
+            or metadata.get("target_outcomes") != outcomes
+        ):
+            violations.append("player collector contract operation differs")
+
+    if selection.get("profile") != PLAYER_COLLECTOR_PROFILE:
+        violations.append("collector profile mismatch")
+    if raw_scopes:
+        violations.append("player collector scope must be empty")
+    if entities != list(PLAYER_COLLECTOR_ENTITIES):
+        violations.append("player collector entities must be exactly players")
+    if (
+        selection.get("competition_limit") != 0
+        or selection.get("season_limit") != 0
+        or selection.get("planned_scopes") != []
+        or selection.get("completed_scopes") != []
+        or selection.get("completed_transfer_competition_ids") != []
+    ):
+        violations.append("player collector planner surface is not empty")
+    if selection.get("requests_per_minute") != PLAYER_COLLECTOR_REQUESTS_PER_MINUTE:
+        violations.append("player collector request rate mismatch")
+    if selection.get("scope_plan_signature") != player_collector_plan_signature(
+        player_ids
+    ):
+        violations.append("player collector plan signature mismatch")
+    if (
+        budget.get("max_requests") != PLAYER_COLLECTOR_MAX_REQUESTS
+        or budget.get("max_direct_bytes")
+        != PLAYER_COLLECTOR_MAX_DIRECT_MIB * 1024 * 1024
+        or budget.get("max_proxy_bytes") != 0
+    ):
+        violations.append("player collector transport budget mismatch")
+
+    return violations, {
+        "profile": selection.get("profile"),
+        "player_collector": collector,
         "target_outcomes": outcomes,
         "planned_scopes": selection.get("planned_scopes"),
         "completed_scopes": selection.get("completed_scopes"),
@@ -777,7 +946,19 @@ def validate_data(
                         "competition_limit": selection.get("competition_limit"),
                         "season_limit": selection.get("season_limit"),
                     }
-                    if selection_profile:
+                    if mode == PLAYER_COLLECTOR_MODE:
+                        collector_violations, collector_summary = (
+                            _validate_player_collector_selection(
+                                result=result,
+                                selection=selection,
+                                entities=entities,
+                                raw_scopes=list(scope_tokens),
+                                budget=budget,
+                            )
+                        )
+                        violations.extend(collector_violations)
+                        selection_summary.update(collector_summary)
+                    elif selection_profile:
                         source_violations, source_summary = (
                             _validate_source_refresh_selection(
                                 result=result,
