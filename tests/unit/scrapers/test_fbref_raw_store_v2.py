@@ -393,6 +393,28 @@ def test_match_history_still_rejects_another_match_id(tmp_path):
         store.load_latest_response(target)
 
 
+def test_match_commit_rejects_matching_malformed_match_ids(tmp_path):
+    store = _store(tmp_path)
+    target = PageTarget(
+        source="fbref",
+        page_kind="match",
+        target_id="fbref:match:not-a-match",
+        canonical_url="https://fbref.com/en/matches/not-a-match",
+        source_ids={
+            "competition_id": "69",
+            "season_id": "2026-2027",
+            "match_id": "not-a-match",
+        },
+    )
+    with pytest.raises(RawPageCorrupt, match="identity mismatch"):
+        store.commit_fetch(
+            target,
+            b"<html>malformed match identity</html>",
+            logical_refresh_id="refresh-malformed",
+            http_status=200,
+        )
+
+
 def test_v2_pointer_imports_same_match_with_current_season_context(tmp_path):
     store = _store(tmp_path)
     old_target = _contextual_match_target(

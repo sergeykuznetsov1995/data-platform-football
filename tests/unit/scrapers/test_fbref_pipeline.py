@@ -2042,7 +2042,7 @@ def _pipeline_with_small_durable_matches(path):
       <tbody><tr><td data-stat="label">durable</td></tr></tbody>
     </table></body></html>
     """
-    for position, match_id in enumerate(("durable-a", "durable-b")):
+    for position, match_id in enumerate(("d000000a", "d000000b")):
         target = PageTarget(
             source="fbref",
             page_kind="match",

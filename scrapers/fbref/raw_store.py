@@ -743,7 +743,11 @@ class RawPageStore:
         record_match_id = str(
             record.source_ids.get("match_id") or ""
         ).lower()
-        return bool(target_match_id and target_match_id == record_match_id)
+        return bool(
+            _MATCH_ID_RE.fullmatch(target_match_id)
+            and _MATCH_ID_RE.fullmatch(record_match_id)
+            and target_match_id == record_match_id
+        )
 
     @staticmethod
     def _validate_recovery_identity(
