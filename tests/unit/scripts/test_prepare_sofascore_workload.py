@@ -104,6 +104,17 @@ def _catalog():
 
 
 def _common_patches(plan):
+    # Mirror the real SeasonPartitionPlan. The planner consults FOUR views of a
+    # season plan, and a stub missing any of them lets a test pass on a shape
+    # production never sees (lesson: mocks must describe prod reality). Unless a
+    # test says otherwise, its "missing" key is a genuine blocker (not a referee
+    # profile) and nothing else is pending.
+    if not hasattr(plan, "player_blocking_missing_raw_keys"):
+        plan.player_blocking_missing_raw_keys = plan.missing_raw_keys
+    if not hasattr(plan, "complete"):
+        plan.complete = not plan.missing_raw_keys
+    if not hasattr(plan, "player_universe_ready"):
+        plan.player_universe_ready = not plan.player_blocking_missing_raw_keys
     runtime = SimpleNamespace(raw_store=MagicMock(), manifest_store=MagicMock())
     return (
         patch(
@@ -573,6 +584,193 @@ def test_target_phase_fails_before_ids_if_season_raw_is_incomplete(
             )
 
 
+def test_target_phase_isolates_one_incomplete_league_from_its_neighbours(
+    tmp_path, monkeypatch
+):
+    """Live incident 2026-08-20: FRA-Ligue 1/2 died on a season defect and the
+    whole match phase of ALL fourteen leagues went upstream_failed — a day of
+    details lost everywhere because of two leagues.
+
+    A league whose season raw is incomplete has nothing to capture yet; it must
+    be planned CLEAN EMPTY (the shape already used for an out-of-window
+    competition) and resume next run, while its neighbours are planned as usual.
+    At 1504 tournaments an all-or-nothing plan means zero details every day.
+    """
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    complete = SimpleNamespace(missing_raw_keys=())
+    incomplete = SimpleNamespace(missing_raw_keys=("missing",))
+    patches = _common_patches(complete)
+    matches = {str(value) for value in range(1, 4)}
+
+    def pending(_runtime, ids, _builder):
+        return tuple(sorted(ids, key=int))
+
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patch(
+            "dags.scripts.prepare_sofascore_workload.plan_season_partition",
+            side_effect=[complete, incomplete],
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._finished_match_ids",
+            return_value=matches,
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._pending_targets",
+            side_effect=pending,
+        ),
+    ):
+        path = prepare_workload_plan(
+            dag_id="dag_ingest_sofascore",
+            base_run_id="scheduled-1",
+            phase="targets",
+            competition_seasons=[
+                CompetitionSeason("ENG-Premier League", "2526"),
+                CompetitionSeason("ESP-La Liga", "2526"),
+            ],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=tmp_path / "target-plan.json",
+        )
+
+    signed = load_plan(path, control_token=TOKEN)
+    match_allocations = [item for item in signed.allocations if item.scope == "match"]
+    # Only the healthy league is signed for capture; the incomplete one carries
+    # no allocation at all rather than killing the phase. The partition a
+    # match allocation belongs to is named by its task_id.
+    # Exactly ONE partition is signed for capture (both leagues healthy would
+    # give two batches), and it carries the healthy league's finished matches.
+    assert len(match_allocations) == 1, [item.task_id for item in match_allocations]
+    assert sorted(target_ids(match_allocations[0]), key=int) == ["1", "2", "3"]
+
+
+def test_target_phase_drops_a_league_that_died_after_writing_raw(tmp_path, monkeypatch):
+    """The shape a league really fails in: raw IS written, the manifest never
+    reaches a terminal state (capture died at materialisation, as FRA-Ligue 1
+    did on 2026-08-20). Then ``missing_raw_keys`` is EMPTY while the plan is
+    incomplete — dropping only on missing raw would sign match targets from
+    stale Bronze for a league whose schedule never committed.
+    """
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    healthy = SimpleNamespace(missing_raw_keys=(), complete=True)
+    died_after_raw = SimpleNamespace(missing_raw_keys=(), complete=False)
+    patches = _common_patches(healthy)
+    matches = {str(value) for value in range(1, 4)}
+
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patch(
+            "dags.scripts.prepare_sofascore_workload.plan_season_partition",
+            side_effect=[healthy, died_after_raw],
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._finished_match_ids",
+            return_value=matches,
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._pending_targets",
+            side_effect=lambda _runtime, ids, _builder: tuple(sorted(ids, key=int)),
+        ),
+    ):
+        path = prepare_workload_plan(
+            dag_id="dag_ingest_sofascore",
+            base_run_id="scheduled-1",
+            phase="targets",
+            competition_seasons=[
+                CompetitionSeason("ENG-Premier League", "2526"),
+                CompetitionSeason("ESP-La Liga", "2526"),
+            ],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=tmp_path / "target-plan.json",
+        )
+
+    signed = load_plan(path, control_token=TOKEN)
+    match_allocations = [item for item in signed.allocations if item.scope == "match"]
+    assert len(match_allocations) == 1, [item.task_id for item in match_allocations]
+
+
+def test_players_phase_ignores_a_referee_only_gap(tmp_path, monkeypatch):
+    """C2 wiring: a league whose ONLY missing season raw is a referee profile
+    must still get a real player plan.
+
+    Referees surface from event pages captured after the season phase, so any
+    league that played a round looks 'incomplete' on the day — which is why the
+    player branch died on 2026-07-24. The planner must consult the
+    referee-tolerant view, not the raw one.
+    """
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    referee_only = SimpleNamespace(
+        missing_raw_keys=("referee_profile",),
+        player_blocking_missing_raw_keys=(),
+    )
+    patches = _common_patches(referee_only)
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patch(
+            "dags.scripts.prepare_sofascore_workload._finished_match_ids",
+            return_value={"7"},
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._pending_targets",
+            # Matches are all terminal; the player is the only pending target.
+            side_effect=lambda _runtime, ids, _builder: (
+                () if ids == {"7"} else tuple(sorted(ids))
+            ),
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._observed_player_ids",
+            return_value={"901"},
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload.squad_player_ids",
+            return_value={"901"},
+        ),
+    ):
+        path = prepare_workload_plan(
+            dag_id="dag_ingest_sofascore",
+            base_run_id="scheduled-1",
+            phase="players",
+            competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=tmp_path / "player-plan.json",
+        )
+
+    signed = load_plan(path, control_token=TOKEN)
+    # The league is planned for real (a clean-empty drop would sign neither a
+    # universe nor a player allocation).
+    assert len(signed.player_universe_ids) == 1
+    assert [item.scope for item in signed.allocations] == ["player"]
+
+
+def test_target_phase_still_fails_when_every_league_is_incomplete(
+    tmp_path, monkeypatch
+):
+    """Isolating one league must not become a silent empty run: if NOTHING can
+    be planned, that is a systemic outage and has to stay loud (lesson «зелёное,
+    но пустое»)."""
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    incomplete = SimpleNamespace(missing_raw_keys=("missing",))
+    patches = _common_patches(incomplete)
+    with patches[0], patches[1], patches[2], patches[3]:
+        with pytest.raises(RuntimeError, match="season raw is incomplete"):
+            prepare_workload_plan(
+                dag_id="dag_ingest_sofascore",
+                base_run_id="scheduled-1",
+                phase="targets",
+                competition_seasons=[
+                    CompetitionSeason("ENG-Premier League", "2526"),
+                    CompetitionSeason("ESP-La Liga", "2526"),
+                ],
+                artifact_path=tmp_path / "artifact.json",
+            )
+
+
 def test_players_phase_fails_closed_until_every_match_endpoint_is_terminal(
     tmp_path, monkeypatch
 ):
@@ -906,6 +1104,44 @@ def test_rotation_boundary_parses_a_date_or_the_master_interval_datetime():
     assert _parse_rotation_boundary("2024-01-06T14:00:00Z") == date(2024, 1, 6)
     assert _parse_rotation_boundary("  ") is None
     assert _parse_rotation_boundary("not-a-date") is None
+
+
+def test_all_dropped_guard_counts_candidates_not_the_whole_scope(
+    tmp_path, monkeypatch, rotation_env
+):
+    """The guard must compare against the leagues that were actually CANDIDATES.
+
+    Comparing against the full ``--competition-season`` list lets the rotation's
+    own exclusions mask a total outage: every due league fails, the not-due ones
+    are counted as "fine", the counts differ, and an EMPTY signed plan ships as
+    a green run — the «зелёное, но пустое» failure mode.
+    """
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    dead = SimpleNamespace(
+        missing_raw_keys=(),
+        player_blocking_missing_raw_keys=(),
+        player_universe_ready=False,
+    )
+    patches = _common_patches(dead)
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patch("utils.medallion_config.get_season_team_count", return_value=20),
+    ):
+        with pytest.raises(RuntimeError, match="every SofaScore partition"):
+            prepare_workload_plan(
+                dag_id="dag_ingest_sofascore",
+                base_run_id="scheduled-guard",
+                phase="players",
+                competition_seasons=[
+                    CompetitionSeason(league, "2526") for league in ROTATION_LEAGUES
+                ],
+                artifact_path=tmp_path / "artifact.json",
+                output_path=tmp_path / "guard.json",
+                players_rotation_date=date(2026, 1, 5),
+            )
 
 
 def _players_plan_for(tmp_path, leagues, **kwargs):
