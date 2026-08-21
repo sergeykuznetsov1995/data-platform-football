@@ -393,6 +393,77 @@ def test_match_history_still_rejects_another_match_id(tmp_path):
         store.load_latest_response(target)
 
 
+def test_v2_pointer_imports_same_match_with_current_season_context(tmp_path):
+    store = _store(tmp_path)
+    old_target = _contextual_match_target(
+        "08171559", competition_id="69", season_id="2025-2026"
+    )
+    current_target = _contextual_match_target(
+        "08171559", competition_id="69", season_id="2026-2027"
+    )
+    old = store.commit_fetch(
+        old_target,
+        b"<html>old observation</html>",
+        logical_refresh_id="refresh-old",
+        http_status=200,
+    )
+    old_history_key = store._v2_target_history_manifest_key(
+        old_target, old.logical_refresh_id
+    )
+    store.filesystem.delete_file(store._path(old_history_key))
+    old_mirror_key = store._v2_target_manifest_key(old_target)
+    old_mirror = store._read_bytes(old_mirror_key)
+
+    imported = store.import_fetch_from_available_raw(
+        current_target,
+        logical_refresh_id="refresh-imported",
+    )
+
+    assert imported is not None
+    body, loaded = store.load_fetch(imported.logical_refresh_id)
+    assert body == b"<html>old observation</html>"
+    assert loaded == imported
+    assert imported.source_ids == current_target.source_ids
+    assert imported.http_requests == 0
+    assert imported.imported_from_manifest_key == store._fetch_manifest_key(
+        old.logical_refresh_id
+    )
+    assert store._read_bytes(old_mirror_key) == old_mirror
+
+
+def test_v2_pointer_304_still_rejects_another_match_id(tmp_path):
+    store = _store(tmp_path)
+    target = _contextual_match_target(
+        "08171559", competition_id="69", season_id="2026-2027"
+    )
+    record = store.commit_fetch(
+        target,
+        b"<html>match</html>",
+        logical_refresh_id="refresh-match",
+        http_status=200,
+    )
+    history_key = store._v2_target_history_manifest_key(
+        target, record.logical_refresh_id
+    )
+    store.filesystem.delete_file(store._path(history_key))
+    mirror_key = store._v2_target_manifest_key(target)
+    payload = store.read_manifest(mirror_key)
+    payload["source_ids"] = {
+        **payload["source_ids"],
+        "match_id": "deadbeef",
+    }
+    store._write_json(mirror_key, payload)
+
+    with pytest.raises(RawPageCorrupt, match="identity mismatch"):
+        store.commit_fetch(
+            target,
+            b"",
+            logical_refresh_id="refresh-304",
+            http_status=304,
+        )
+    assert not store.has_fetch("refresh-304")
+
+
 def test_delayed_first_commit_cannot_regress_latest_or_304_base(
     tmp_path,
     monkeypatch,

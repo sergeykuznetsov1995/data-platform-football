@@ -725,8 +725,7 @@ class RawPageStore:
         if not self._exists(key):
             raise RawPageNotFound(f"No v2 raw page for {target.target_id}")
         record = self._fetch_record(self._read_json(key), key)
-        if record.target_id != target.target_id:
-            raise RawPageCorrupt(f"Target mismatch in v2 raw manifest: {key}")
+        self._validate_recovery_identity(target, record, version="v2")
         return self._load_record_blob(record, response=False), record
 
     @staticmethod
@@ -744,11 +743,7 @@ class RawPageStore:
         record_match_id = str(
             record.source_ids.get("match_id") or ""
         ).lower()
-        return bool(
-            _MATCH_ID_RE.fullmatch(target_match_id)
-            and _MATCH_ID_RE.fullmatch(record_match_id)
-            and target_match_id == record_match_id
-        )
+        return bool(target_match_id and target_match_id == record_match_id)
 
     @staticmethod
     def _validate_recovery_identity(
