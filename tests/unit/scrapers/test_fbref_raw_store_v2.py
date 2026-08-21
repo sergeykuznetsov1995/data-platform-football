@@ -488,6 +488,34 @@ def test_v2_pointer_imports_same_match_with_current_season_context(tmp_path):
     assert store._read_bytes(old_mirror_key) == old_mirror
 
 
+def test_v2_pointer_import_rejects_record_url_for_another_match(tmp_path):
+    store = _store(tmp_path)
+    target = _contextual_match_target(
+        "08171559", competition_id="69", season_id="2026-2027"
+    )
+    record = store.commit_fetch(
+        target,
+        b"<html>match</html>",
+        logical_refresh_id="refresh-match",
+        http_status=200,
+    )
+    history_key = store._v2_target_history_manifest_key(
+        target, record.logical_refresh_id
+    )
+    store.filesystem.delete_file(store._path(history_key))
+    mirror_key = store._v2_target_manifest_key(target)
+    payload = store.read_manifest(mirror_key)
+    payload["canonical_url"] = "https://fbref.com/en/matches/deadbeef"
+    store._write_json(mirror_key, payload)
+
+    with pytest.raises(RawPageCorrupt, match="identity mismatch"):
+        store.import_fetch_from_available_raw(
+            target,
+            logical_refresh_id="refresh-imported",
+        )
+    assert not store.has_fetch("refresh-imported")
+
+
 def test_v2_pointer_304_still_rejects_another_match_id(tmp_path):
     store = _store(tmp_path)
     target = _contextual_match_target(
@@ -509,6 +537,36 @@ def test_v2_pointer_304_still_rejects_another_match_id(tmp_path):
         **payload["source_ids"],
         "match_id": "deadbeef",
     }
+    store._write_json(mirror_key, payload)
+
+    with pytest.raises(RawPageCorrupt, match="identity mismatch"):
+        store.commit_fetch(
+            target,
+            b"",
+            logical_refresh_id="refresh-304",
+            http_status=304,
+        )
+    assert not store.has_fetch("refresh-304")
+
+
+def test_v2_pointer_304_rejects_record_url_for_another_match(tmp_path):
+    store = _store(tmp_path)
+    target = _contextual_match_target(
+        "08171559", competition_id="69", season_id="2026-2027"
+    )
+    record = store.commit_fetch(
+        target,
+        b"<html>match</html>",
+        logical_refresh_id="refresh-match",
+        http_status=200,
+    )
+    history_key = store._v2_target_history_manifest_key(
+        target, record.logical_refresh_id
+    )
+    store.filesystem.delete_file(store._path(history_key))
+    mirror_key = store._v2_target_manifest_key(target)
+    payload = store.read_manifest(mirror_key)
+    payload["canonical_url"] = "https://fbref.com/en/matches/deadbeef"
     store._write_json(mirror_key, payload)
 
     with pytest.raises(RawPageCorrupt, match="identity mismatch"):

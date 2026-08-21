@@ -729,7 +729,9 @@ class RawPageStore:
         return self._load_record_blob(record, response=False), record
 
     @staticmethod
-    def _valid_match_target_identity(target: PageTarget) -> bool:
+    def _valid_match_target_identity(
+        target: PageTarget | RawPageRecord | RawFetchRecord,
+    ) -> bool:
         """Require every match identity field to name the same FBref page."""
 
         if target.page_kind != "match":
@@ -755,7 +757,10 @@ class RawPageStore:
 
         if target.page_kind != "match":
             return dict(record.source_ids) == dict(target.source_ids)
-        if not RawPageStore._valid_match_target_identity(target):
+        if (
+            not RawPageStore._valid_match_target_identity(target)
+            or not RawPageStore._valid_match_target_identity(record)
+        ):
             return False
         target_match_id = str(
             target.source_ids.get("match_id") or ""
