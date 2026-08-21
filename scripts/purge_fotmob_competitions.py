@@ -49,6 +49,7 @@ WRITER_DAG_IDS = (
     "dag_trigger_fotmob_daily",
     "dag_refresh_fotmob",
     "dag_backfill_fotmob",
+    "dag_collect_fotmob_players",
     "dag_ingest_fotmob",
     "dag_transform_fotmob_silver",
     "dag_iceberg_maintenance",
@@ -64,6 +65,7 @@ SHARED_PAUSE_STATES = {
 }
 SHARED_STATE_DAGS = (
     "dag_backfill_fotmob",
+    "dag_collect_fotmob_players",
     "dag_ingest_fotmob",
     "dag_master_pipeline",
     "dag_orchestrate_fotmob",

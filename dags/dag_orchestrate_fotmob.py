@@ -39,7 +39,12 @@ AUTOMATIC_ADMITTED_DAGS = frozenset(
     {OWNER_DAG_ID, "dag_ingest_fotmob", "dag_transform_fotmob_silver"}
 )
 LEGACY_PAUSED_DAGS = frozenset(
-    {"dag_trigger_fotmob_daily", "dag_refresh_fotmob", "dag_backfill_fotmob"}
+    {
+        "dag_trigger_fotmob_daily",
+        "dag_refresh_fotmob",
+        "dag_backfill_fotmob",
+        "dag_collect_fotmob_players",
+    }
 )
 DECISION_TASK_ID = "choose_fotmob_lane"
 INITIALIZER_TASK_ID = "initialize_fotmob_publication"

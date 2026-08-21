@@ -36,6 +36,15 @@ START = datetime(2026, 7, 20, 14, tzinfo=timezone.utc)
 END = START + timedelta(days=1)
 
 
+def test_player_collector_is_bound_into_publication_runtime_identity():
+    dag_id = "dag_collect_fotmob_players"
+    dag_path = "dags/dag_collect_fotmob_players.py"
+
+    assert dag_id in publication.FOTMOB_EXPECTED_ISOLATED_DAGS
+    assert dag_path in publication.FOTMOB_ISOLATED_REQUIRED_RUNTIME_PATHS
+    assert dag_path in publication.FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS
+
+
 def _ceremony_env(monkeypatch):
     """Pin a deployed ceremony so strict fail-closed semantics stay under test."""
 
@@ -122,6 +131,7 @@ def _isolated_runtime_evidence(tmp_path: Path):
                 publication.FOTMOB_ISOLATED_DAILY_DAG_ID,
                 "dag_refresh_fotmob",
                 "dag_backfill_fotmob",
+                "dag_collect_fotmob_players",
             }
         ),
         "unpaused": sorted(
@@ -292,6 +302,7 @@ def _pending_automatic_shared_wait_report(tmp_path: Path, report: dict) -> dict:
                 publication.FOTMOB_ISOLATED_DAILY_DAG_ID,
                 "dag_refresh_fotmob",
                 "dag_backfill_fotmob",
+                "dag_collect_fotmob_players",
             }
         ),
         unpaused=["dag_ingest_fotmob", "dag_transform_fotmob_silver"],
@@ -895,6 +906,7 @@ def test_pending_automatic_sofa_sensor_waits_without_claim_then_active_claims(
                 publication.FOTMOB_ISOLATED_DAILY_DAG_ID,
                 "dag_refresh_fotmob",
                 "dag_backfill_fotmob",
+                "dag_collect_fotmob_players",
             }
         ),
         unpaused=sorted(
