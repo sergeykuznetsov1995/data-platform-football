@@ -328,7 +328,7 @@ def _validate_silver_quality_unfenced(**context) -> Dict[str, Any]:
             error_threshold=0.60,
         ),
         # Главный fail-closed сигнал once-policy: новый roster player обязан
-        # получить карточку. Замер 21.08: 6 сирот на 71 467 identities.
+        # получить карточку. Замер 21.08: 4 сироты на 75 270 roster rows.
         CHECK.ref_integrity(
             child='bronze.fotmob_squad_snapshots_current',
             parent='bronze.fotmob_player_snapshots_current',
