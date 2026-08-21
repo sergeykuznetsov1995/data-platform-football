@@ -15,6 +15,7 @@ from scrapers.fotmob.repository import (
 )
 from scrapers.fotmob.service import (
     LEADERBOARD_REFRESH_AFTER,
+    PLAYER_CARD_POLICY,
     PLAYER_REFRESH_AFTER,
     TEAM_REFRESH_AFTER,
     FotMobIngestService,
@@ -1778,8 +1779,8 @@ def test_backfill_skips_fresh_prior_generation_children():
     assert current_commits == []
 
 
-def test_backfill_refetches_stale_prior_generation_children():
-    """Обратная сторона #1146: протухшую цель прошлого рана всё равно берём."""
+def test_backfill_refetches_periodic_children_but_reuses_verified_player_card():
+    """Periodic targets expire, while #1196 player identities do not."""
 
     bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
     leaderboard_url = "https://data.fotmob.com/stats/47/season/goals.json"
@@ -1821,8 +1822,13 @@ def test_backfill_refetches_stale_prior_generation_children():
         # команда: старше окна обновления состава. Возраст берём от константы,
         # а не числом: под прежними 20 часами литерал 21 ч означал «просрочено»,
         # а после подъёма порога молча стал бы означать «ещё свежее».
-        ("team", canonicalize_target(team_url), "1", TEAM_REFRESH_AFTER + timedelta(hours=1)),
-        # игрок: старше окна карточки игрока (PLAYER_REFRESH_AFTER, 14 суток)
+        (
+            "team",
+            canonicalize_target(team_url),
+            "1",
+            TEAM_REFRESH_AFTER + timedelta(hours=1),
+        ),
+        # Карточка игрока старая, но подтверждённая: once-policy её переиспользует.
         ("player", canonicalize_target(player_url), "10", timedelta(days=15)),
     )
     for target_type, target, entity_id, age in stale:
@@ -1845,7 +1851,7 @@ def test_backfill_refetches_stale_prior_generation_children():
 
     assert all(result.ok for result in (leaderboard, teams, players))
     assert leaderboard.skipped == 0
-    assert players.skipped == 0
+    assert players.skipped == 1
     # Команда 1 протухла и берётся заново; команда 2 в манифесте не значится вовсе.
     assert teams.attempted == 2
     assert teams.skipped == 0
@@ -1853,7 +1859,7 @@ def test_backfill_refetches_stale_prior_generation_children():
     assert leaderboard_url in fetched
     assert team_url in fetched
     assert other_team_url in fetched
-    assert player_url in fetched
+    assert player_url not in fetched
 
 
 def test_stale_raw_replay_does_not_count_as_freshness_validation():
@@ -2146,6 +2152,37 @@ def test_player_null_pageprops_data_is_intentional_not_available():
     commit = next(c for c in repository.commits if c.target_type == "player")
     assert commit.status == ManifestStatus.NOT_AVAILABLE
     assert commit.error_code == "source_player_no_data"
+
+
+def test_player_no_data_tombstone_remains_retryable_under_once_policy():
+    """A source gap is not the one confirmed collection promised by #1196."""
+
+    player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
+    service, transport, repository = _service(
+        {player_url: {"pageProps": {"data": {"id": 10, "name": "Appeared"}}}}
+    )
+    old_target = canonicalize_target(
+        "https://www.fotmob.com/_next/data/build-0/players/10.json"
+    )
+    repository.record(
+        TargetCommit(
+            run_id="prior",
+            target_type="player",
+            target_key=old_target.target_key,
+            status=ManifestStatus.NOT_AVAILABLE,
+            entity_id="10",
+            error_code="source_player_no_data",
+            completed_at=datetime.now(timezone.utc) - timedelta(days=400),
+        )
+    )
+
+    result = service.sync_player_snapshots([10], build_id="build-1")
+
+    assert result.ok, result.errors
+    assert result.skipped == 0
+    assert result.succeeded == 1
+    assert result.metadata["first_collection_due"] == 1
+    assert [call[0] for call in transport.calls] == [player_url]
 
 
 def test_player_payload_without_pageprops_container_stays_parse_failure():
@@ -2846,14 +2883,8 @@ def test_stale_leaderboard_past_the_threshold_is_still_refetched():
     assert [call[0] for call in transport.calls] == [url]
 
 
-def test_player_refresh_is_rarer_but_first_collection_is_never_delayed():
-    """A2 (решение владельца 18.08): реже обновляем, но первичный сбор не трогаем.
-
-    Замер 15–18.08: игроки — 63,5 % бюджета волны, и 94,6 % этих запросов
-    приходится на ПОВТОРНОЕ обновление уже собранной карточки. Порог режет
-    именно их; игрок, которого в манифесте нет вовсе, обязан собираться сразу,
-    иначе словарь игроков перестанет пополняться.
-    """
+def test_player_card_is_collected_once_per_identity():
+    """#1196: verified cards stay put, while new identities collect at once."""
 
     player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
     fresh_player_url = "https://www.fotmob.com/_next/data/build-1/players/11.json"
@@ -2874,27 +2905,26 @@ def test_player_refresh_is_rarer_but_first_collection_is_never_delayed():
             entity_id="10",
             content_hash="a" * 64,
             raw_uri=f"memory://{target.target_key}.json.gz",
-            # Прежний порог (7 суток) отправил бы карточку на перекачку;
-            # принятый (14 суток) — нет. Возраст фиксирован намеренно: если
-            # порог однажды опустят обратно, тест обязан упасть.
-            completed_at=datetime.now(timezone.utc) - timedelta(days=13),
+            completed_at=datetime.now(timezone.utc) - timedelta(days=400),
         )
     )
 
     players = service.sync_player_snapshots({10, 11}, build_id="build-1")
 
     assert players.ok, players.errors
-    assert PLAYER_REFRESH_AFTER == timedelta(days=14)
+    assert PLAYER_CARD_POLICY == "once_per_identity"
+    assert PLAYER_REFRESH_AFTER is None
     assert players.attempted == 2
-    # Известная карточка десятидневной давности больше не перекачивается...
     assert players.skipped == 1
-    # ...а игрок, которого в манифесте нет, собран немедленно.
     assert players.succeeded == 1
+    assert players.metadata["player_policy"] == "once_per_identity"
+    assert players.metadata["first_collection_due"] == 1
+    assert players.metadata["skipped_by_policy"] == 1
     assert [call[0] for call in transport.calls] == [fresh_player_url]
 
 
-def test_player_card_older_than_the_threshold_is_refetched():
-    """Обратная сторона A2: за порогом карточка всё-таки обновляется."""
+def test_periodic_player_refresh_can_be_reenabled_explicitly():
+    """A finite refresh interval remains an explicit rollback mechanism."""
 
     player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
     service, transport, repository = _service(
@@ -2911,13 +2941,15 @@ def test_player_card_older_than_the_threshold_is_refetched():
             entity_id="10",
             content_hash="a" * 64,
             raw_uri=f"memory://{target.target_key}.json.gz",
-            # Ровно за порогом, фиксированным числом: TTL длиннее 15 суток
-            # этот тест обязан ронять.
             completed_at=datetime.now(timezone.utc) - timedelta(days=15),
         )
     )
 
-    players = service.sync_player_snapshots({10}, build_id="build-1")
+    players = service.sync_player_snapshots(
+        {10},
+        build_id="build-1",
+        refresh_after=timedelta(days=14),
+    )
 
     assert players.ok, players.errors
     assert players.skipped == 0

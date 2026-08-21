@@ -5,6 +5,7 @@ import threading
 import pytest
 
 from scrapers.fbref.raw_store import (
+    PageTarget,
     RAW_MANIFEST_VERSION_V2,
     RAW_V1_BRIDGE_VERSION,
     RawPageCorrupt,
@@ -16,6 +17,23 @@ from scrapers.fbref.raw_store import (
 
 def _store(tmp_path) -> RawPageStore:
     return RawPageStore.from_uri(tmp_path.as_uri())
+
+
+def _contextual_match_target(
+    match_id: str, *, competition_id: str, season_id: str
+) -> PageTarget:
+    base = match_page_target(match_id)
+    return PageTarget(
+        source=base.source,
+        page_kind=base.page_kind,
+        target_id=base.target_id,
+        canonical_url=base.canonical_url,
+        source_ids={
+            "competition_id": competition_id,
+            "season_id": season_id,
+            "match_id": match_id,
+        },
+    )
 
 
 def test_v2_commit_preserves_exact_response_bytes_and_metrics(tmp_path):
@@ -317,6 +335,248 @@ def test_retrying_older_refresh_does_not_regress_latest_pointer(tmp_path):
     latest_body, latest = store.load_latest_response(target)
     assert latest_body == second_body
     assert latest.logical_refresh_id == newest.logical_refresh_id
+
+
+def test_match_history_accepts_same_match_rediscovered_in_another_season(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    old_target = _contextual_match_target(
+        "08171559", competition_id="69", season_id="2025-2026"
+    )
+    current_target = _contextual_match_target(
+        "08171559", competition_id="69", season_id="2026-2027"
+    )
+    old = store.commit_fetch(
+        old_target,
+        b"<html>old observation</html>",
+        logical_refresh_id="refresh-old",
+        http_status=200,
+    )
+
+    current = store.commit_fetch(
+        current_target,
+        b"<html>current observation</html>",
+        logical_refresh_id="refresh-current",
+        http_status=200,
+    )
+
+    body, latest = store.load_latest_response(current_target)
+    assert body == b"<html>current observation</html>"
+    assert latest == current
+    assert current.previous_content_hash == old.content_hash
+    assert current.source_ids == current_target.source_ids
+
+
+def test_match_history_still_rejects_another_match_id(tmp_path):
+    store = _store(tmp_path)
+    target = _contextual_match_target(
+        "08171559", competition_id="69", season_id="2026-2027"
+    )
+    record = store.commit_fetch(
+        target,
+        b"<html>match</html>",
+        logical_refresh_id="refresh-match",
+        http_status=200,
+    )
+    history_key = store._v2_target_history_manifest_key(
+        target, record.logical_refresh_id
+    )
+    payload = store.read_manifest(history_key)
+    payload["source_ids"] = {
+        **payload["source_ids"],
+        "match_id": "deadbeef",
+    }
+    store._write_json(history_key, payload)
+
+    with pytest.raises(RawPageCorrupt, match="identity mismatch"):
+        store.load_latest_response(target)
+
+
+def test_match_commit_rejects_matching_malformed_match_ids(tmp_path):
+    store = _store(tmp_path)
+    body = b"<html>malformed match identity</html>"
+    target = PageTarget(
+        source="fbref",
+        page_kind="match",
+        target_id="fbref:match:not-a-match",
+        canonical_url="https://fbref.com/en/matches/not-a-match",
+        source_ids={
+            "competition_id": "69",
+            "season_id": "2026-2027",
+            "match_id": "not-a-match",
+        },
+    )
+    with pytest.raises(RawPageCorrupt, match="identity mismatch"):
+        store.commit_fetch(
+            target,
+            body,
+            logical_refresh_id="refresh-malformed",
+            http_status=200,
+        )
+    assert not store.has_fetch("refresh-malformed")
+    assert not store._exists(
+        store._v2_target_history_manifest_key(target, "refresh-malformed")
+    )
+    assert not store._exists(store._v2_target_manifest_key(target))
+    assert not store._exists(
+        store._blob_key(hashlib.sha256(body).hexdigest())
+    )
+
+
+def test_match_commit_rejects_internally_mismatched_identity_without_writes(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    target = PageTarget(
+        source="fbref",
+        page_kind="match",
+        target_id="fbref:match:deadbeef",
+        canonical_url="https://fbref.com/en/matches/08171559",
+        source_ids={"match_id": "08171559"},
+    )
+
+    with pytest.raises(RawPageCorrupt, match="identity mismatch"):
+        store.commit_fetch(
+            target,
+            b"<html>mismatched match identity</html>",
+            logical_refresh_id="refresh-mismatched",
+            http_status=200,
+        )
+    assert not store.has_fetch("refresh-mismatched")
+    assert not store._exists(
+        store._v2_target_history_manifest_key(target, "refresh-mismatched")
+    )
+    assert not store._exists(store._v2_target_manifest_key(target))
+
+
+def test_v2_pointer_imports_same_match_with_current_season_context(tmp_path):
+    store = _store(tmp_path)
+    old_target = _contextual_match_target(
+        "08171559", competition_id="69", season_id="2025-2026"
+    )
+    current_target = _contextual_match_target(
+        "08171559", competition_id="69", season_id="2026-2027"
+    )
+    old = store.commit_fetch(
+        old_target,
+        b"<html>old observation</html>",
+        logical_refresh_id="refresh-old",
+        http_status=200,
+    )
+    old_history_key = store._v2_target_history_manifest_key(
+        old_target, old.logical_refresh_id
+    )
+    store.filesystem.delete_file(store._path(old_history_key))
+    old_mirror_key = store._v2_target_manifest_key(old_target)
+    old_mirror = store._read_bytes(old_mirror_key)
+
+    imported = store.import_fetch_from_available_raw(
+        current_target,
+        logical_refresh_id="refresh-imported",
+    )
+
+    assert imported is not None
+    body, loaded = store.load_fetch(imported.logical_refresh_id)
+    assert body == b"<html>old observation</html>"
+    assert loaded == imported
+    assert imported.source_ids == current_target.source_ids
+    assert imported.http_requests == 0
+    assert imported.imported_from_manifest_key == store._fetch_manifest_key(
+        old.logical_refresh_id
+    )
+    assert store._read_bytes(old_mirror_key) == old_mirror
+
+
+def test_v2_pointer_import_rejects_record_url_for_another_match(tmp_path):
+    store = _store(tmp_path)
+    target = _contextual_match_target(
+        "08171559", competition_id="69", season_id="2026-2027"
+    )
+    record = store.commit_fetch(
+        target,
+        b"<html>match</html>",
+        logical_refresh_id="refresh-match",
+        http_status=200,
+    )
+    history_key = store._v2_target_history_manifest_key(
+        target, record.logical_refresh_id
+    )
+    store.filesystem.delete_file(store._path(history_key))
+    mirror_key = store._v2_target_manifest_key(target)
+    payload = store.read_manifest(mirror_key)
+    payload["canonical_url"] = "https://fbref.com/en/matches/deadbeef"
+    store._write_json(mirror_key, payload)
+
+    with pytest.raises(RawPageCorrupt, match="identity mismatch"):
+        store.import_fetch_from_available_raw(
+            target,
+            logical_refresh_id="refresh-imported",
+        )
+    assert not store.has_fetch("refresh-imported")
+
+
+def test_v2_pointer_304_still_rejects_another_match_id(tmp_path):
+    store = _store(tmp_path)
+    target = _contextual_match_target(
+        "08171559", competition_id="69", season_id="2026-2027"
+    )
+    record = store.commit_fetch(
+        target,
+        b"<html>match</html>",
+        logical_refresh_id="refresh-match",
+        http_status=200,
+    )
+    history_key = store._v2_target_history_manifest_key(
+        target, record.logical_refresh_id
+    )
+    store.filesystem.delete_file(store._path(history_key))
+    mirror_key = store._v2_target_manifest_key(target)
+    payload = store.read_manifest(mirror_key)
+    payload["source_ids"] = {
+        **payload["source_ids"],
+        "match_id": "deadbeef",
+    }
+    store._write_json(mirror_key, payload)
+
+    with pytest.raises(RawPageCorrupt, match="identity mismatch"):
+        store.commit_fetch(
+            target,
+            b"",
+            logical_refresh_id="refresh-304",
+            http_status=304,
+        )
+    assert not store.has_fetch("refresh-304")
+
+
+def test_v2_pointer_304_rejects_record_url_for_another_match(tmp_path):
+    store = _store(tmp_path)
+    target = _contextual_match_target(
+        "08171559", competition_id="69", season_id="2026-2027"
+    )
+    record = store.commit_fetch(
+        target,
+        b"<html>match</html>",
+        logical_refresh_id="refresh-match",
+        http_status=200,
+    )
+    history_key = store._v2_target_history_manifest_key(
+        target, record.logical_refresh_id
+    )
+    store.filesystem.delete_file(store._path(history_key))
+    mirror_key = store._v2_target_manifest_key(target)
+    payload = store.read_manifest(mirror_key)
+    payload["canonical_url"] = "https://fbref.com/en/matches/deadbeef"
+    store._write_json(mirror_key, payload)
+
+    with pytest.raises(RawPageCorrupt, match="identity mismatch"):
+        store.commit_fetch(
+            target,
+            b"",
+            logical_refresh_id="refresh-304",
+            http_status=304,
+        )
+    assert not store.has_fetch("refresh-304")
 
 
 def test_delayed_first_commit_cannot_regress_latest_or_304_base(

@@ -70,11 +70,13 @@ columns:
   - name: retired_sofascore
     description: Флаг "ушёл из футбола" из SofaScore (boolean, может быть NULL).
   - name: contract_end_fotmob
-    description: Дата окончания контракта (FotMob; slowly-changing, as-of-latest-ingest).
+    description: Дата окончания контракта из FotMob на card_observed_at_fotmob; регулярное текущее состояние ведёт Transfermarkt.
   - name: current_market_value_eur_fotmob
-    description: Текущая рыночная стоимость EUR из FotMob market_values_json.timeline (latest точка).
+    description: Последняя известная карточке стоимость EUR из FotMob market_values_json.timeline на card_observed_at_fotmob; регулярную историю ведёт Transfermarkt.
   - name: market_value_currency_fotmob
     description: Валюта рыночной стоимости (обычно EUR).
+  - name: card_observed_at_fotmob
+    description: Timestamp сетевого наблюдения FotMob player card; as-of для FotMob contract и market-value колонок.
   - name: height_cm_tm
     description: Рост в см из Transfermarkt (парсинг с официального профиля клуба, наиболее точный из источников).
   - name: dob_tm

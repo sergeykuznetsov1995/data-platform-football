@@ -248,30 +248,16 @@ LEADERBOARD_REFRESH_AFTER = timedelta(hours=72)
 # состав берётся из БД (current_squad_player_ids), поэтому уже известные игроки
 # продолжают попадать в план как прежде.
 TEAM_REFRESH_AFTER = timedelta(hours=48)
-# Порог свежести карточки игрока (A2, решение владельца 18.08: «обновлять реже»).
+# Политика карточки игрока (#1196, решение владельца 20.08): один сетевой сбор
+# на подтверждённую identity, без регулярных обновлений. Карточка нужна прежде
+# всего ради паспортного поля foot; состав уже несёт рост и дату рождения, а
+# каноническую историю рыночной стоимости ведёт Transfermarkt.
 #
-# Замер 15–19.08 по манифесту: из 39 782 обращений к карточкам первичных всего
-# 1887 (4,7 %), остальные 37 895 (95,3 %) — повторное обновление уже собранной
-# карточки. Игроки при этом съедают 63,5 % бюджета волны, то есть порог режет
-# ровно ту часть, которая бюджет и ест.
-#
-# Почему 14 суток, а не больше: возраст повторов сейчас распределён так —
-# 7–14 суток 2729, 14–21 суток 139, старше 21 суток 62. Поток обновлений
-# целиком лежит в интервале 7–14, поэтому порог 14 забирает практически всю
-# экономию; следующая неделя ожидания добавила бы к ней единицы процентов, а
-# карточка успела бы устареть заметно сильнее (среди повторов возрастом
-# 14–21 суток значимые поля менялись у трети). Число обратимо: распределение
-# сдвинется вслед за самим порогом, поэтому перемерить через две недели.
-#
-# Что теряем, измерено по снимкам (сравнение полей, а не сырья: content_hash у
-# игроков меняется в 100 % повторов и как индикатор бесполезен). За 3–7 суток
-# словарная часть карточки — имя, дата рождения, пол, рост/вес/нога/гражданство —
-# меняется у 7,4 % повторов, клуб и контракт у 3,8 %, рыночная стоимость у 5,0 %.
-# Часто меняются матчи и статистика, но там FotMob не единственный источник.
-#
-# Первичный сбор порог не трогает вовсе: у игрока без записи в манифесте
-# previous is None, и он собирается немедленно — словарь пополняется как прежде.
-PLAYER_REFRESH_AFTER = timedelta(days=14)
+# Это не «бесконечный timedelta»: None включает явный предикат присутствия.
+# Новый игрок собирается сразу; stale replay, REPLAY и force_refresh остаются
+# штатными обходами. Возраст и покрытие карточек контролирует Silver DQ.
+PLAYER_CARD_POLICY = "once_per_identity"
+PLAYER_REFRESH_AFTER: Optional[timedelta] = None
 
 
 def profile_probe_delay(
@@ -2951,7 +2937,7 @@ class FotMobIngestService:
         player_ids: Iterable[int],
         *,
         build_id: Optional[str] = None,
-        refresh_after: timedelta = PLAYER_REFRESH_AFTER,
+        refresh_after: Optional[timedelta] = PLAYER_REFRESH_AFTER,
         limit: Optional[int] = None,
         force_refresh: bool = False,
         capture_terminal_outcomes: bool = False,
@@ -2968,7 +2954,10 @@ class FotMobIngestService:
         result = OperationResult(
             "player_snapshots",
             attempted=len(ids),
-            metadata={"snapshot_semantics": "global_observed_at_not_historical"},
+            metadata={
+                "snapshot_semantics": "global_observed_at_not_historical",
+                "player_policy": PLAYER_CARD_POLICY,
+            },
         )
         terminal_outcomes: dict[str, str] = {}
         missing_raw_player_ids: set[int] = set()
@@ -2984,13 +2973,17 @@ class FotMobIngestService:
 
         now = utc_now()
         due: list[int] = []
+        first_collection_due = 0
         for player_id in ids:
             previous = self.repository.latest_entity_success("player", player_id)
             fetched_at = _validated_at(previous)
+            confirmed = previous is not None and fetched_at is not None
+            within_policy = (
+                refresh_after is None or now - fetched_at < refresh_after
+            ) if fetched_at is not None else False
             if (
-                previous is not None
-                and fetched_at is not None
-                and now - fetched_at < refresh_after
+                confirmed
+                and within_policy
                 and self.mode != RunMode.REPLAY
                 and not force_refresh
             ):
@@ -2998,6 +2991,8 @@ class FotMobIngestService:
                 terminal_outcomes[str(player_id)] = "skipped"
             else:
                 due.append(player_id)
+                if previous is None:
+                    first_collection_due += 1
         due_before_limit = len(due)
         deferred: list[int] = []
         if limit is not None:
@@ -3006,6 +3001,8 @@ class FotMobIngestService:
             due = due[:requested_limit]
         result.metadata["due_before_limit"] = due_before_limit
         result.metadata["deferred_by_limit"] = due_before_limit - len(due)
+        result.metadata["first_collection_due"] = first_collection_due
+        result.metadata["skipped_by_policy"] = result.skipped
         for player_id in deferred:
             terminal_outcomes[str(player_id)] = "deferred"
         if not due:
