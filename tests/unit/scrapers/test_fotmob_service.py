@@ -2146,6 +2146,37 @@ def test_player_null_pageprops_data_is_intentional_not_available():
     assert commit.error_code == "source_player_no_data"
 
 
+def test_player_no_data_tombstone_remains_retryable_under_once_policy():
+    """A source gap is not the one confirmed collection promised by #1196."""
+
+    player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
+    service, transport, repository = _service(
+        {player_url: {"pageProps": {"data": {"id": 10, "name": "Appeared"}}}}
+    )
+    old_target = canonicalize_target(
+        "https://www.fotmob.com/_next/data/build-0/players/10.json"
+    )
+    repository.record(
+        TargetCommit(
+            run_id="prior",
+            target_type="player",
+            target_key=old_target.target_key,
+            status=ManifestStatus.NOT_AVAILABLE,
+            entity_id="10",
+            error_code="source_player_no_data",
+            completed_at=datetime.now(timezone.utc) - timedelta(days=400),
+        )
+    )
+
+    result = service.sync_player_snapshots([10], build_id="build-1")
+
+    assert result.ok, result.errors
+    assert result.skipped == 0
+    assert result.succeeded == 1
+    assert result.metadata["first_collection_due"] == 1
+    assert [call[0] for call in transport.calls] == [player_url]
+
+
 def test_player_payload_without_pageprops_container_stays_parse_failure():
     player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
     payload = {"unexpected": True}
