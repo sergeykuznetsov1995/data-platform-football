@@ -1660,11 +1660,10 @@ def _pipeline_with_saved_matches(tmp_path, match_ids=("0701e218", "a071faa8")):
     html = gzip.decompress(MATCH_FIXTURE.read_bytes()).decode("utf-8")
     records = []
     for position, match_id in enumerate(match_ids):
-        target_id = f"fbref:match:{match_id}:{position}"
         target = PageTarget(
             source="fbref",
             page_kind="match",
-            target_id=target_id,
+            target_id=f"fbref:match:{match_id}",
             canonical_url=(
                 f"https://fbref.com/en/matches/{match_id}/x-{position}"
             ),

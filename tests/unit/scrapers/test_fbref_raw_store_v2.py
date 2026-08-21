@@ -395,6 +395,7 @@ def test_match_history_still_rejects_another_match_id(tmp_path):
 
 def test_match_commit_rejects_matching_malformed_match_ids(tmp_path):
     store = _store(tmp_path)
+    body = b"<html>malformed match identity</html>"
     target = PageTarget(
         source="fbref",
         page_kind="match",
@@ -409,10 +410,44 @@ def test_match_commit_rejects_matching_malformed_match_ids(tmp_path):
     with pytest.raises(RawPageCorrupt, match="identity mismatch"):
         store.commit_fetch(
             target,
-            b"<html>malformed match identity</html>",
+            body,
             logical_refresh_id="refresh-malformed",
             http_status=200,
         )
+    assert not store.has_fetch("refresh-malformed")
+    assert not store._exists(
+        store._v2_target_history_manifest_key(target, "refresh-malformed")
+    )
+    assert not store._exists(store._v2_target_manifest_key(target))
+    assert not store._exists(
+        store._blob_key(hashlib.sha256(body).hexdigest())
+    )
+
+
+def test_match_commit_rejects_internally_mismatched_identity_without_writes(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    target = PageTarget(
+        source="fbref",
+        page_kind="match",
+        target_id="fbref:match:deadbeef",
+        canonical_url="https://fbref.com/en/matches/08171559",
+        source_ids={"match_id": "08171559"},
+    )
+
+    with pytest.raises(RawPageCorrupt, match="identity mismatch"):
+        store.commit_fetch(
+            target,
+            b"<html>mismatched match identity</html>",
+            logical_refresh_id="refresh-mismatched",
+            http_status=200,
+        )
+    assert not store.has_fetch("refresh-mismatched")
+    assert not store._exists(
+        store._v2_target_history_manifest_key(target, "refresh-mismatched")
+    )
+    assert not store._exists(store._v2_target_manifest_key(target))
 
 
 def test_v2_pointer_imports_same_match_with_current_season_context(tmp_path):

@@ -729,6 +729,24 @@ class RawPageStore:
         return self._load_record_blob(record, response=False), record
 
     @staticmethod
+    def _valid_match_target_identity(target: PageTarget) -> bool:
+        """Require every match identity field to name the same FBref page."""
+
+        if target.page_kind != "match":
+            return True
+        match_id = str(target.source_ids.get("match_id") or "").lower()
+        parsed = urlparse(target.canonical_url)
+        url_match = _MATCH_URL_RE.search(parsed.path)
+        return bool(
+            target.source == "fbref"
+            and _MATCH_ID_RE.fullmatch(match_id)
+            and target.target_id == f"fbref:match:{match_id}"
+            and (parsed.hostname or "").lower() in _FBREF_HOSTS
+            and url_match is not None
+            and url_match.group(1).lower() == match_id
+        )
+
+    @staticmethod
     def _same_recovery_source_identity(
         target: PageTarget,
         record: RawPageRecord | RawFetchRecord,
@@ -737,6 +755,8 @@ class RawPageStore:
 
         if target.page_kind != "match":
             return dict(record.source_ids) == dict(target.source_ids)
+        if not RawPageStore._valid_match_target_identity(target):
+            return False
         target_match_id = str(
             target.source_ids.get("match_id") or ""
         ).lower()
@@ -889,6 +909,11 @@ class RawPageStore:
         """
         if not isinstance(response_body, (bytes, bytearray, memoryview)):
             raise TypeError("response_body must be bytes-like")
+        if not self._valid_match_target_identity(target):
+            raise RawPageCorrupt(
+                f"Target identity mismatch before v2 raw commit for "
+                f"{target.target_id}"
+            )
         observed_at = fetched_at or utc_now_iso()
         body = bytes(response_body)
         refresh = _source_id(logical_refresh_id, "logical_refresh_id")
