@@ -89,6 +89,35 @@ class CatalogSnapshotWriter(RecordingWriter):
         return self.trino
 
 
+class MissingPlayerTrino:
+    def __init__(self, *, tables=None, rows=None):
+        self.tables = set(
+            tables
+            or {
+                "fotmob_squad_snapshots_current",
+                "fotmob_player_snapshots_current",
+            }
+        )
+        self.rows = list(rows or [])
+        self.sql = []
+
+    def table_exists(self, schema, table):
+        return table in self.tables
+
+    def execute_query(self, sql):
+        self.sql.append(sql)
+        return self.rows
+
+
+class MissingPlayerWriter(RecordingWriter):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.trino = MissingPlayerTrino(**kwargs)
+
+    def _get_trino_manager(self):
+        return self.trino
+
+
 class ScopeEvidenceTrino:
     def __init__(self, probe_attempt_count=0):
         self.sql = []
@@ -984,6 +1013,115 @@ def test_memory_current_squad_ids_come_only_from_latest_team_batch():
     )
 
     assert repository.current_squad_player_ids(1) == {20}
+
+
+def test_missing_current_squad_player_ids_uses_bounded_current_view_anti_join():
+    writer = MissingPlayerWriter(rows=[(21,), (40,)])
+    repository = FotMobRepository(writer=writer)
+
+    assert repository.missing_current_squad_player_ids(2) == [21, 40]
+
+    assert len(writer.trino.sql) == 1
+    sql = writer.trino.sql[0]
+    assert "fotmob_squad_snapshots_current" in sql
+    assert "fotmob_player_snapshots_current" in sql
+    assert "LEFT JOIN" in sql
+    assert "member_type = 'player'" in sql
+    assert "TRY_CAST(s.member_id AS BIGINT) > 0" in sql
+    assert "p.player_id IS NULL" in sql
+    assert "ORDER BY player_id" in sql
+    assert "LIMIT 2" in sql
+
+
+def test_missing_current_squad_player_ids_requires_both_current_views():
+    writer = MissingPlayerWriter(tables={"fotmob_squad_snapshots_current"})
+    repository = FotMobRepository(writer=writer)
+
+    with pytest.raises(RuntimeError, match="current view is unavailable"):
+        repository.missing_current_squad_player_ids(10)
+    assert writer.trino.sql == []
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_missing_current_squad_player_ids_rejects_non_positive_limit(limit):
+    with pytest.raises(ValueError, match="limit must be positive"):
+        MemoryFotMobRepository().missing_current_squad_player_ids(limit)
+
+
+def test_memory_missing_current_squad_players_are_unique_sorted_and_limited():
+    repository = MemoryFotMobRepository()
+    repository.commit(
+        _commit(
+            target_type="team",
+            target_key="team-old",
+            entity_id="1",
+            content_hash="1" * 64,
+        ),
+        [
+            TableRows(
+                "fotmob_squad_snapshots",
+                [{"team_id": "1", "member_type": "player", "member_id": "10"}],
+                "squad_snapshots",
+            )
+        ],
+    )
+    repository.commit(
+        _commit(
+            target_type="team",
+            target_key="team-current",
+            entity_id="1",
+            content_hash="2" * 64,
+        ),
+        [
+            TableRows(
+                "fotmob_squad_snapshots",
+                [
+                    {"team_id": "1", "member_type": "player", "member_id": "21"},
+                    {"team_id": "1", "member_type": "player", "member_id": "21"},
+                    {"team_id": "1", "member_type": "coach", "member_id": "22"},
+                    {"team_id": "1", "member_type": "player", "member_id": "bad"},
+                    {"team_id": "1", "member_type": "player", "member_id": "-1"},
+                ],
+                "squad_snapshots",
+            )
+        ],
+    )
+    repository.commit(
+        _commit(
+            target_type="team",
+            target_key="team-two",
+            entity_id="2",
+            content_hash="3" * 64,
+        ),
+        [
+            TableRows(
+                "fotmob_squad_snapshots",
+                [
+                    {"team_id": "2", "member_type": "player", "member_id": "40"},
+                    {"team_id": "2", "member_type": "player", "member_id": "20"},
+                ],
+                "squad_snapshots",
+            )
+        ],
+    )
+    repository.commit(
+        _commit(
+            target_type="player",
+            target_key="player-existing",
+            entity_id="20",
+            content_hash="4" * 64,
+        ),
+        [
+            TableRows(
+                "fotmob_player_snapshots",
+                [{"player_id": "20"}],
+                "player_snapshots",
+            )
+        ],
+    )
+
+    assert repository.missing_current_squad_player_ids(1) == [21]
+    assert repository.missing_current_squad_player_ids(10) == [21, 40]
 
 
 def test_catalog_absence_logic_ignores_uncommitted_physical_snapshots():
