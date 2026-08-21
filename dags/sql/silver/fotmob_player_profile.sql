@@ -330,6 +330,9 @@ SELECT
     d.scope_is_current_season                        AS is_current_season,
 
     -- ========= Lineage =========
+    -- Чистый as-of карточки: не подмешивать более свежий squad timestamp.
+    d._observed_at                                   AS card_observed_at,
+
     -- Native lineage: _observed_at (в native `_ingested_at`-семантику несёт
     -- `_observed_at`; `_batch_id` не существует — cutover-mapping §2.3).
     GREATEST(

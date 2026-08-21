@@ -189,6 +189,20 @@ class TestFotmobPlayerProfileSql:
                 f"fotmob_player_profile.sql must project `{col}`"
             )
 
+    def test_card_observed_at_is_pure_player_card_lineage(self):
+        """Card age must not inherit the frequently refreshed squad timestamp."""
+        sql = _strip_comments(_read_sql())
+        assert re.search(
+            r"d\._observed_at\s+AS\s+card_observed_at",
+            sql,
+            re.IGNORECASE,
+        )
+        assert not re.search(
+            r"GREATEST\s*\([^)]*\)\s+AS\s+card_observed_at",
+            sql,
+            re.IGNORECASE | re.DOTALL,
+        )
+
     def test_current_season_flag_follows_both_scope_branches(self):
         """Roster and leaderboard rows retain season-axis truth in the output."""
         sql = _strip_comments(_read_sql())

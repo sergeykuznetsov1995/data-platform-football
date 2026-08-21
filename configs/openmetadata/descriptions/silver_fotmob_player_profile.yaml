@@ -4,10 +4,11 @@
 table:
   fullyQualifiedName: trino_iceberg.iceberg.silver.fotmob_player_profile
   description: |
-    Время-инвариантный снимок атрибутов игрока из FotMob — один row на
-    (player_id, league, season). Хранит то, что не меняется внутри сезона: рост,
-    дату рождения, национальность, ведущую ногу, номер на футболке, действующий
-    контракт и последнюю рыночную стоимость. Источники — manifest-backed native
+    Снимок атрибутов игрока из FotMob — один row на (player_id, league, season).
+    Карточка игрока собирается один раз на identity (#1196): паспортные поля
+    сохраняются, а клуб, контракт и рыночная стоимость отражают состояние только
+    на `card_observed_at`. Регулярную историю контракта и стоимости ведёт
+    Transfermarkt. Источники — manifest-backed native
     views: fotmob_squad_snapshots_current (рост / дата рождения / страна / код /
     номер для текущего ростера), fotmob_player_snapshots_current (`foot`, contract,
     market value) и fotmob_leaderboards_current (историческое сезонное членство).
@@ -44,17 +45,17 @@ columns:
     tags:
       - PII.Low
   - name: contract_end
-    description: Дата окончания контракта (DATE; ISO-substring из JSON $.utcTime с COALESCE на сырое значение, TRY_CAST; NULL для безконтрактных).
+    description: Дата окончания контракта на card_observed_at (DATE; ISO-substring из JSON $.utcTime с COALESCE на сырое значение, TRY_CAST; NULL для безконтрактных).
     tags:
       - PII.Low
   - name: current_market_value_eur
-    description: Последняя рыночная стоимость игрока в EUR (MAX_BY по дате из market_values_json timeline, BIGINT).
+    description: Последняя известная карточке рыночная стоимость игрока в EUR на card_observed_at (MAX_BY по дате из market_values_json timeline, BIGINT); регулярную историю ведёт Transfermarkt.
   - name: market_value_currency
     description: Валюта рыночной стоимости (обычно EUR).
   - name: primary_team_id
-    description: Сырой FotMob team_id текущего клуба (FK → gold.dim_team через xref_team в Gold).
+    description: Сырой FotMob team_id клуба на card_observed_at (FK → gold.dim_team через xref_team в Gold); не гарантирует текущее состояние.
   - name: primary_team_name
-    description: Название текущего клуба игрока.
+    description: Название клуба игрока на card_observed_at; не гарантирует текущее состояние.
   - name: foot
     description: Ведущая нога ('Right' / 'Left' / 'Both'); извлечена из player_information_json по title='Preferred foot' (единственный источник, ~97% покрытие).
     tags:
@@ -63,6 +64,8 @@ columns:
     description: Игровой номер на футболке (CAST→INTEGER; источник fotmob_squad_snapshots_current).
   - name: is_current_season
     description: Boolean из native season axis (is_selected OR is_latest). TRUE означает живой roster scope; FALSE — историческое членство из leaderboards.
+  - name: card_observed_at
+    description: Timestamp сетевого наблюдения FotMob player card; as-of для primary_team, contract_end и market value без подмешивания более свежего squad snapshot.
   - name: _bronze_ingested_at
     description: Технический timestamp native Bronze lineage (GREATEST по player/squad snapshots).
   - name: league

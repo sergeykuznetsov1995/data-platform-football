@@ -79,7 +79,8 @@ fotmob_latest AS (
         -- gold.fct_player_market_value (issue #11).
         MAX_BY(contract_end,             season) AS contract_end,
         MAX_BY(current_market_value_eur, season) AS current_market_value_eur,
-        MAX_BY(market_value_currency,    season) AS market_value_currency
+        MAX_BY(market_value_currency,    season) AS market_value_currency,
+        MAX_BY(card_observed_at,         season) AS card_observed_at
     FROM iceberg.silver.fotmob_player_profile
     WHERE player_id IS NOT NULL
     GROUP BY player_id
@@ -217,6 +218,7 @@ SELECT
     fm.contract_end                                    AS contract_end_fotmob,
     fm.current_market_value_eur                        AS current_market_value_eur_fotmob,
     fm.market_value_currency                           AS market_value_currency_fotmob,
+    fm.card_observed_at                                AS card_observed_at_fotmob,
 
     -- Transfermarkt block (snapshot, as-of-latest-ingest). Primary source
     -- for height_cm (parsed from official club profile) и MV в EUR.
