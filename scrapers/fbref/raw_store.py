@@ -725,9 +725,54 @@ class RawPageStore:
         if not self._exists(key):
             raise RawPageNotFound(f"No v2 raw page for {target.target_id}")
         record = self._fetch_record(self._read_json(key), key)
-        if record.target_id != target.target_id:
-            raise RawPageCorrupt(f"Target mismatch in v2 raw manifest: {key}")
+        self._validate_recovery_identity(target, record, version="v2")
         return self._load_record_blob(record, response=False), record
+
+    @staticmethod
+    def _valid_match_target_identity(
+        target: PageTarget | RawPageRecord | RawFetchRecord,
+    ) -> bool:
+        """Require every match identity field to name the same FBref page."""
+
+        if target.page_kind != "match":
+            return True
+        match_id = str(target.source_ids.get("match_id") or "").lower()
+        parsed = urlparse(target.canonical_url)
+        url_match = _MATCH_URL_RE.search(parsed.path)
+        return bool(
+            target.source == "fbref"
+            and _MATCH_ID_RE.fullmatch(match_id)
+            and target.target_id == f"fbref:match:{match_id}"
+            and (parsed.hostname or "").lower() in _FBREF_HOSTS
+            and url_match is not None
+            and url_match.group(1).lower() == match_id
+        )
+
+    @staticmethod
+    def _same_recovery_source_identity(
+        target: PageTarget,
+        record: RawPageRecord | RawFetchRecord,
+    ) -> bool:
+        """Compare source-owned identity while ignoring match discovery context."""
+
+        if target.page_kind != "match":
+            return dict(record.source_ids) == dict(target.source_ids)
+        if (
+            not RawPageStore._valid_match_target_identity(target)
+            or not RawPageStore._valid_match_target_identity(record)
+        ):
+            return False
+        target_match_id = str(
+            target.source_ids.get("match_id") or ""
+        ).lower()
+        record_match_id = str(
+            record.source_ids.get("match_id") or ""
+        ).lower()
+        return bool(
+            _MATCH_ID_RE.fullmatch(target_match_id)
+            and _MATCH_ID_RE.fullmatch(record_match_id)
+            and target_match_id == record_match_id
+        )
 
     @staticmethod
     def _validate_recovery_identity(
@@ -742,7 +787,7 @@ class RawPageStore:
             record.source != target.source
             or record.page_kind != target.page_kind
             or record.target_id != target.target_id
-            or dict(record.source_ids) != dict(target.source_ids)
+            or not RawPageStore._same_recovery_source_identity(target, record)
         ):
             raise RawPageCorrupt(
                 f"Target identity mismatch in {version} raw manifest for "
@@ -869,6 +914,11 @@ class RawPageStore:
         """
         if not isinstance(response_body, (bytes, bytearray, memoryview)):
             raise TypeError("response_body must be bytes-like")
+        if not self._valid_match_target_identity(target):
+            raise RawPageCorrupt(
+                f"Target identity mismatch before v2 raw commit for "
+                f"{target.target_id}"
+            )
         observed_at = fetched_at or utc_now_iso()
         body = bytes(response_body)
         refresh = _source_id(logical_refresh_id, "logical_refresh_id")
