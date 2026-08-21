@@ -17,6 +17,7 @@ from scrapers.fotmob.service import (
     LEADERBOARD_REFRESH_AFTER,
     PLAYER_CARD_POLICY,
     PLAYER_REFRESH_AFTER,
+    TEAM_REFRESH_AFTER,
     FotMobIngestService,
     OperationResult,
     profile_probe_delay,
@@ -1818,8 +1819,15 @@ def test_backfill_refetches_periodic_children_but_reuses_verified_player_card():
             "goals",
             LEADERBOARD_REFRESH_AFTER + timedelta(hours=1),
         ),
-        # команда: старше окна обновления состава (20 ч)
-        ("team", canonicalize_target(team_url), "1", timedelta(hours=21)),
+        # команда: старше окна обновления состава. Возраст берём от константы,
+        # а не числом: под прежними 20 часами литерал 21 ч означал «просрочено»,
+        # а после подъёма порога молча стал бы означать «ещё свежее».
+        (
+            "team",
+            canonicalize_target(team_url),
+            "1",
+            TEAM_REFRESH_AFTER + timedelta(hours=1),
+        ),
         # Карточка игрока старая, но подтверждённая: once-policy её переиспользует.
         ("player", canonicalize_target(player_url), "10", timedelta(days=15)),
     )
@@ -2815,6 +2823,28 @@ def test_leaderboard_threshold_outlives_the_lane_period():
     # 57,7 ч — измеренная медиана; порог обязан её перекрывать, иначе он не
     # отсекает даже те повторы, которые цель делает сама по себе.
     assert LEADERBOARD_REFRESH_AFTER > timedelta(hours=57, minutes=42)
+
+
+def test_team_threshold_outlives_the_lane_period():
+    """A6/#1198: порог карточки команды обязан быть ДЛИННЕЕ периода полосы.
+
+    Прежние 20 часов были короче периода полосы (24 ч) и по уроку 74 почти ничего
+    не отсекали, при том что команда — 26,7 % физических сетевых обращений
+    платформы, вторая статья бюджета.
+
+    Цена подъёма измерена (замер 20.08, 14 суток): паспорт команды на интервале
+    24–48 ч меняется у 9 повторов из 6661 (0,14 %), состав — у 936 из 4808
+    (19,5 %). То есть порог платит не свежестью витрины команд, а задержкой
+    обнаружения смены состава на срок до двух суток.
+
+    Тест держит и значение, и правило выбора: возврат к любому значению
+    ≤ периода полосы обязан его уронить.
+    """
+
+    lane_period = timedelta(hours=24)
+
+    assert TEAM_REFRESH_AFTER == timedelta(hours=48)
+    assert TEAM_REFRESH_AFTER > lane_period
 
 
 def test_stale_leaderboard_past_the_threshold_is_still_refetched():
