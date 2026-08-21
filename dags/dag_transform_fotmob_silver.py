@@ -230,14 +230,10 @@ def _validate_silver_quality_unfenced(**context) -> Dict[str, Any]:
     logger = logging.getLogger(__name__)
 
     FRESH_HOURS = 48
-    # История рыночной стоимости — единственная витрина, чья отметка свежести
-    # берётся ТОЛЬКО из карточки игрока (остальные player-таблицы подмешивают
-    # _observed_at статистики через GREATEST и обновляются вместе с ней).
-    # После A2 карточка законно не обновляется до PLAYER_REFRESH_AFTER
-    # (14 суток), поэтому общий порог 48 ч давал бы здесь штатное ложное
-    # предупреждение каждый день. Порог = TTL карточки плюс двое суток на
-    # обход каталога.
-    PLAYER_CARD_FRESH_HOURS = 16 * 24
+    # #1196 намеренно не обновляет подтверждённую карточку. Вместо ложного
+    # freshness(MAX(timestamp)) следим за отсутствующими карточками и явно
+    # пересматриваем политику, когда p95 текущей популяции пересечёт год.
+    PLAYER_CARD_REVIEW_HORIZON_DAYS = 365
 
     checks = [
         # --- player_season_profile (полевые игроки) ---
@@ -331,6 +327,32 @@ def _validate_silver_quality_unfenced(**context) -> Dict[str, Any]:
             warn_threshold=0.90,
             error_threshold=0.60,
         ),
+        # Главный fail-closed сигнал once-policy: новый roster player обязан
+        # получить карточку. Замер 21.08: 6 сирот на 71 467 identities.
+        CHECK.ref_integrity(
+            child='bronze.fotmob_squad_snapshots_current',
+            parent='bronze.fotmob_player_snapshots_current',
+            key='member_id',
+            parent_key='player_id',
+            where="member_type = 'player'",
+            warn_rate=0.01,
+            error_rate=0.03,
+            name='fotmob_squad_players_without_card',
+        ),
+        # Неблокирующая дата пересмотра решения: при >5 % карточек старше
+        # года предупреждение показывает старение без требования обновлять их.
+        CHECK.coverage(
+            'silver.fotmob_player_profile',
+            condition=(
+                "DATE_DIFF('day', card_observed_at, CURRENT_TIMESTAMP) "
+                f"<= {PLAYER_CARD_REVIEW_HORIZON_DAYS}"
+            ),
+            where='is_current_season',
+            warn_threshold=0.95,
+            error_threshold=0.0,
+            severity='WARNING',
+            name='fotmob_player_card_review_horizon',
+        ),
 
         # --- keeper_profile (вратари) ---
         CHECK.no_nulls(
@@ -411,12 +433,6 @@ def _validate_silver_quality_unfenced(**context) -> Dict[str, Any]:
         CHECK.row_count(
             'silver.fotmob_player_market_value_history',
             min_rows=1000,
-        ),
-        CHECK.freshness(
-            'silver.fotmob_player_market_value_history',
-            ts_col='_bronze_ingested_at',
-            max_age_hours=PLAYER_CARD_FRESH_HOURS,
-            severity='WARNING',
         ),
         CHECK.value_range(
             'silver.fotmob_player_market_value_history',
