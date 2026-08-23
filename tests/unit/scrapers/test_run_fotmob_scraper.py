@@ -364,6 +364,93 @@ class TestFotmobNativeRunner:
         assert selection["scope_attempts"][0]["outcome"] == "success"
 
     @pytest.mark.unit
+    def test_automatic_history_contract_accepts_work_after_advancing_a_cycle(self):
+        from scripts.fotmob_catalog_acceptance import validate_report
+        from scrapers.fotmob.catalog_contract import catalog_contract_from_dict
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _league_payload,
+        )
+
+        mod = self._module()
+        root = _league_payload()
+        root["allAvailableSeasons"] = [
+            "2025/2026",
+            "2024/2025",
+            "2023/2024",
+        ]
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: root,
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2024/2025"}
+            ).canonical_url: _league_payload("2024/2025"),
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2023/2024"}
+            ).canonical_url: _league_payload("2023/2024"),
+        }
+        repository = MemoryFotMobRepository()
+
+        def run(run_id):
+            service = FotMobIngestService(
+                transport=StubTransport(dict(responses)),
+                repository=repository,
+                mode=RunMode.BACKFILL,
+                budget=TransportBudget(
+                    max_requests=100,
+                    max_direct_bytes=10_000_000,
+                ),
+                run_id=run_id,
+                max_workers=2,
+            )
+            args = mod._argument_parser().parse_args(
+                [
+                    "--mode",
+                    "backfill",
+                    "--catalog-contract",
+                    "fotmob-catalog-v1",
+                    "--entities",
+                    "season",
+                    "--run-id",
+                    run_id,
+                ]
+            )
+            return _run_native_admitted(mod, args, service=service)
+
+        first_rc, first_report = run("season-cycle-1")
+        second_rc, second_report = run("season-cycle-2")
+
+        assert first_rc == 0, first_report["errors"]
+        assert second_rc == 0, second_report["errors"]
+        assert first_report["selection"]["planned_scopes"] == ["47=2024/2025"]
+        assert second_report["selection"]["planned_scopes"] == ["47=2023/2024"]
+        obligation = {"47=2024/2025", "47=2023/2024"}
+        for report in (first_report, second_report):
+            contract = catalog_contract_from_dict(
+                report["selection"]["catalog_contract"]
+            )
+            assert set(contract.scopes) == obligation
+        assert {
+            (
+                attempt["competition_id"],
+                attempt["source_season_key"],
+            )
+            for attempt in second_report["selection"]["scope_attempts"]
+        } == {(47, "2023/2024")}
+
+        accepted = validate_report(
+            second_report,
+            require_full_completion=False,
+        )
+        assert accepted.ok, accepted.errors
+
+    @pytest.mark.unit
     def test_automatic_runner_removes_now_female_cached_inclusion_before_fanout(
         self,
     ):

@@ -248,7 +248,7 @@ def _history_season_cycle_key(source_season_key: str) -> tuple[int, str]:
     return -1, label.casefold()
 
 
-def plan_seasons(
+def _plan_seasons(
     classifications: Iterable[ScopeClassification],
     seasons: Iterable[SeasonRef],
     *,
@@ -258,15 +258,9 @@ def plan_seasons(
     lane: Optional[ScopeLane] = None,
     attempt_states: Mapping[tuple[int, str], ScopeAttemptState] | None = None,
     now: Optional[datetime] = None,
+    enforce_history_cycle_barrier: bool,
 ) -> list[SeasonWorkItem]:
-    """Build a stable full-catalog/daily/backfill plan.
-
-    Included adult men's competitions are eligible.  Excluded and ambiguous
-    competitions remain in the discovery catalog but never enter an ingest
-    plan. Current and history lanes are disjoint. A durable retry that is not
-    due is skipped without blocking later ready work. Exact season strings are
-    passed through unchanged and no hardcoded competition cohort affects order.
-    """
+    """Build shared catalog-obligation or runnable-plan work items."""
 
     included = {
         item.competition.competition_id
@@ -323,7 +317,8 @@ def plan_seasons(
         candidates.append((season, attempt))
 
     if (
-        mode == RunMode.BACKFILL
+        enforce_history_cycle_barrier
+        and mode == RunMode.BACKFILL
         and lane == ScopeLane.HISTORY
         and explicit_scopes is None
         and candidates
@@ -377,6 +372,68 @@ def plan_seasons(
     return sorted(
         output,
         key=lambda item: (item.priority, item.competition_id),
+    )
+
+
+def plan_seasons(
+    classifications: Iterable[ScopeClassification],
+    seasons: Iterable[SeasonRef],
+    *,
+    mode: RunMode,
+    previously_successful: Iterable[tuple[int, str]] = (),
+    explicit_scopes: Optional[Iterable[tuple[int, str]]] = None,
+    lane: Optional[ScopeLane] = None,
+    attempt_states: Mapping[tuple[int, str], ScopeAttemptState] | None = None,
+    now: Optional[datetime] = None,
+) -> list[SeasonWorkItem]:
+    """Build a stable runnable daily/backfill/replay plan.
+
+    Included adult men's competitions are eligible. Excluded and ambiguous
+    competitions remain in the discovery catalog but never enter an ingest
+    plan. Current and history lanes are disjoint. Within a selected cycle, a
+    durable retry that is not due is skipped without blocking later ready work.
+    Automatic BACKFILL + HISTORY planning selects its newest unfinished cycle
+    before cooldown filtering, so a cooling retry or fresh terminal outcome in
+    that cycle blocks all older cycles. Exact season strings pass through
+    unchanged and no hardcoded competition cohort affects order.
+    """
+
+    return _plan_seasons(
+        classifications,
+        seasons,
+        mode=mode,
+        previously_successful=previously_successful,
+        explicit_scopes=explicit_scopes,
+        lane=lane,
+        attempt_states=attempt_states,
+        now=now,
+        enforce_history_cycle_barrier=True,
+    )
+
+
+def catalog_scope_obligation(
+    classifications: Iterable[ScopeClassification],
+    seasons: Iterable[SeasonRef],
+    *,
+    mode: RunMode,
+    lane: Optional[ScopeLane] = None,
+) -> tuple[tuple[int, str], ...]:
+    """Enumerate the immutable full eligible scope obligation.
+
+    Catalog contracts describe every eligible exact source scope and therefore
+    deliberately ignore durable completion/attempt state and the runnable
+    automatic-history cycle barrier.
+    """
+
+    return tuple(
+        item.identity
+        for item in _plan_seasons(
+            classifications,
+            seasons,
+            mode=mode,
+            lane=lane,
+            enforce_history_cycle_barrier=False,
+        )
     )
 
 

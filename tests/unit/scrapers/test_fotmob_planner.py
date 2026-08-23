@@ -191,11 +191,11 @@ def test_retryable_scope_not_due_does_not_starve_later_ready_scopes():
     assert [item.competition_id for item in plan] == [48, 49]
 
 
-def _terminal_attempt(now, age):
+def _terminal_attempt(now, age, source_season_key="2025/2026"):
     return {
-        (47, "2025/2026"): ScopeAttemptState(
+        (47, source_season_key): ScopeAttemptState(
             competition_id=47,
-            source_season_key="2025/2026",
+            source_season_key=source_season_key,
             plan_signature="fmplan1-test",
             attempt_count=1,
             last_attempt_at=now - age,
@@ -247,6 +247,48 @@ def test_terminal_scope_returns_to_the_plan_after_ttl():
     # 48 впереди по справедливости обхода: его не пробовали ни разу
     # (last_attempt = datetime.min), а 47 пробовали сутки назад.
     assert [item.competition_id for item in plan] == [48, 47]
+
+
+def test_fresh_terminal_in_newest_history_cycle_blocks_older_cycles():
+    now = datetime(2026, 8, 23, 10)
+    plan = plan_seasons(
+        [_classified(47), _classified(49)],
+        [
+            SeasonRef(47, "2024/2025", source_order=1),
+            SeasonRef(49, "2023/2024", source_order=2),
+        ],
+        mode=RunMode.BACKFILL,
+        lane=ScopeLane.HISTORY,
+        attempt_states=_terminal_attempt(
+            now,
+            timedelta(hours=23),
+            source_season_key="2024/2025",
+        ),
+        now=now,
+    )
+
+    assert plan == []
+
+
+def test_expired_terminal_is_runnable_in_newest_history_cycle():
+    now = datetime(2026, 8, 23, 10)
+    plan = plan_seasons(
+        [_classified(47), _classified(49)],
+        [
+            SeasonRef(47, "2024/2025", source_order=1),
+            SeasonRef(49, "2023/2024", source_order=2),
+        ],
+        mode=RunMode.BACKFILL,
+        lane=ScopeLane.HISTORY,
+        attempt_states=_terminal_attempt(
+            now,
+            timedelta(hours=25),
+            source_season_key="2024/2025",
+        ),
+        now=now,
+    )
+
+    assert [item.identity for item in plan] == [(47, "2024/2025")]
 
 
 def _history_attempt(now, age, outcome):

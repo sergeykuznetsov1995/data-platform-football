@@ -817,6 +817,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         MANDATORY_COMPETITION_IDS,
         RunMode,
         ScopeLane,
+        catalog_scope_obligation,
         deterministic_plan_signature,
         plan_seasons,
     )
@@ -1343,10 +1344,10 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         else ScopeLane.CURRENT
     )
     if automatic_catalog:
-        contract_items = (
-            []
+        contract_scopes = (
+            ()
             if mode == RunMode.DISCOVER
-            else plan_seasons(
+            else catalog_scope_obligation(
                 classifications,
                 seasons,
                 mode=mode,
@@ -1379,7 +1380,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     for item in classifications
                     if item.decision.value == "included"
                 ],
-                scopes=[item.identity for item in contract_items],
+                scopes=contract_scopes,
             )
         if scope_validation.errors and scope_validation not in operations:
             operations.append(scope_validation)
