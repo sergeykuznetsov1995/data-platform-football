@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -237,6 +238,14 @@ def _season_recency_key(season: SeasonRef) -> int:
     if season.source_order is not None:
         return int(season.source_order)
     return 0
+
+
+def _history_season_cycle_key(source_season_key: str) -> tuple[int, str]:
+    label = str(source_season_key).strip()
+    years = [int(value) for value in re.findall(r"(?<!\d)[12]\d{3}(?!\d)", label)]
+    if years:
+        return max(years), ""
+    return -1, label.casefold()
 
 
 def plan_seasons(

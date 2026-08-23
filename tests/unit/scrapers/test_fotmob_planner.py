@@ -16,6 +16,7 @@ from scrapers.fotmob.planner import (
     ScopeLane,
     TransportBudget,
     deterministic_plan_signature,
+    _history_season_cycle_key,
     plan_seasons,
     tombstones_after_two_absences,
 )
@@ -28,6 +29,13 @@ def _classified(competition_id, decision=ScopeDecision.INCLUDED):
         "test",
         "test_rule",
     )
+
+
+def test_history_season_cycle_groups_calendar_and_split_year_labels():
+    assert _history_season_cycle_key("2024/2025") == (2025, "")
+    assert _history_season_cycle_key("2025") == (2025, "")
+    assert _history_season_cycle_key("2023/2024") < (2025, "")
+    assert _history_season_cycle_key(" Apertura ") == (-1, "apertura")
 
 
 def test_backfill_uses_source_order_not_a_hardcoded_competition_allowlist():
@@ -197,9 +205,7 @@ def _history_plan(now, attempts):
 
 def test_fresh_history_source_gap_stays_out_of_the_plan():
     now = datetime(2026, 8, 20, 10)
-    plan = _history_plan(
-        now, _history_attempt(now, timedelta(days=29), "source_gap")
-    )
+    plan = _history_plan(now, _history_attempt(now, timedelta(days=29), "source_gap"))
 
     assert [item.competition_id for item in plan] == [48]
 
@@ -214,9 +220,7 @@ def test_history_source_gap_returns_to_the_plan_after_review_ttl():
     """
 
     now = datetime(2026, 8, 20, 10)
-    plan = _history_plan(
-        now, _history_attempt(now, timedelta(days=31), "source_gap")
-    )
+    plan = _history_plan(now, _history_attempt(now, timedelta(days=31), "source_gap"))
 
     # 48 впереди по справедливости обхода: его не пробовали ни разу.
     assert [item.competition_id for item in plan] == [48, 47]
