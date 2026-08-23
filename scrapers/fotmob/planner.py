@@ -284,7 +284,7 @@ def plan_seasons(
     if observed_now.tzinfo is not None:
         observed_now = observed_now.astimezone(timezone.utc).replace(tzinfo=None)
 
-    output: list[SeasonWorkItem] = []
+    candidates: list[tuple[SeasonRef, ScopeAttemptState | None]] = []
     seen: set[tuple[int, str]] = set()
     for season in seasons:
         identity = season.identity
@@ -319,6 +319,28 @@ def plan_seasons(
                 < SOURCE_GAP_REVIEW_AFTER
             ):
                 continue
+
+        candidates.append((season, attempt))
+
+    if (
+        mode == RunMode.BACKFILL
+        and lane == ScopeLane.HISTORY
+        and explicit_scopes is None
+        and candidates
+    ):
+        newest_cycle = max(
+            _history_season_cycle_key(season.source_season_key)
+            for season, _ in candidates
+        )
+        candidates = [
+            (season, attempt)
+            for season, attempt in candidates
+            if _history_season_cycle_key(season.source_season_key) == newest_cycle
+        ]
+
+    output: list[SeasonWorkItem] = []
+    for season, attempt in candidates:
+        if attempt is not None:
             if (
                 attempt.outcome == "terminal"
                 and observed_now - _naive_utc(attempt.last_attempt_at)

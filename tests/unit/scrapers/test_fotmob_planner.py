@@ -84,6 +84,83 @@ def test_automatic_current_and_history_lanes_are_disjoint():
     assert [item.identity for item in history] == [(47, "2024/2025")]
 
 
+def test_automatic_history_plans_only_the_newest_unfinished_season_cycle():
+    plan = plan_seasons(
+        [_classified(47), _classified(48), _classified(49)],
+        [
+            SeasonRef(47, "2024/2025", source_order=1),
+            SeasonRef(48, "2025", source_order=1),
+            SeasonRef(49, "2023/2024", source_order=2),
+        ],
+        mode=RunMode.BACKFILL,
+        lane=ScopeLane.HISTORY,
+    )
+    assert {item.identity for item in plan} == {
+        (47, "2024/2025"),
+        (48, "2025"),
+    }
+
+
+def test_automatic_history_advances_after_the_newest_cycle_is_complete():
+    plan = plan_seasons(
+        [_classified(47), _classified(48), _classified(49)],
+        [
+            SeasonRef(47, "2024/2025", source_order=1),
+            SeasonRef(48, "2025", source_order=1),
+            SeasonRef(49, "2023/2024", source_order=2),
+        ],
+        mode=RunMode.BACKFILL,
+        lane=ScopeLane.HISTORY,
+        previously_successful={(47, "2024/2025"), (48, "2025")},
+    )
+    assert [item.identity for item in plan] == [(49, "2023/2024")]
+
+
+def test_automatic_history_retry_in_newest_cycle_blocks_older_cycles():
+    now = datetime(2026, 8, 23, 10)
+    attempts = {
+        (47, "2024/2025"): ScopeAttemptState(
+            competition_id=47,
+            source_season_key="2024/2025",
+            plan_signature="fmplan1-test",
+            attempt_count=1,
+            last_attempt_at=now,
+            next_retry_at=now + timedelta(hours=1),
+            outcome="retryable",
+            reason="HTTP 503",
+        )
+    }
+    plan = plan_seasons(
+        [_classified(47), _classified(49)],
+        [
+            SeasonRef(47, "2024/2025", source_order=1),
+            SeasonRef(49, "2023/2024", source_order=2),
+        ],
+        mode=RunMode.BACKFILL,
+        lane=ScopeLane.HISTORY,
+        attempt_states=attempts,
+        now=now,
+    )
+    assert plan == []
+
+
+def test_explicit_history_scopes_are_not_reduced_to_one_cycle():
+    plan = plan_seasons(
+        [_classified(47)],
+        [
+            SeasonRef(47, "2024/2025", source_order=1),
+            SeasonRef(47, "2023/2024", source_order=2),
+        ],
+        mode=RunMode.BACKFILL,
+        lane=ScopeLane.HISTORY,
+        explicit_scopes={(47, "2024/2025"), (47, "2023/2024")},
+    )
+    assert [item.identity for item in plan] == [
+        (47, "2024/2025"),
+        (47, "2023/2024"),
+    ]
+
+
 def test_retryable_scope_not_due_does_not_starve_later_ready_scopes():
     now = datetime(2026, 8, 8, 10)
     attempts = {
