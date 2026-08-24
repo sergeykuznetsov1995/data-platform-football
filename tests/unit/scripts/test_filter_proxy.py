@@ -5133,6 +5133,193 @@ def test_blocking_client_leg_cannot_hold_provider_read_reservation(mod):
     assert lease.active_provider_readers == 0
 
 
+# --- client hangup: provider tail is drained, not latched (shared module) ------
+#
+# These run against scripts/proxy_filter/filter_proxy.py (the SofaScore/WhoScored
+# gateway), not the fbref copy loaded by the ``mod`` fixture.
+
+
+def _shared_sofascore_lease(tmp_path, *, max_bytes=4096):
+    mod = _load_shared_module()
+    mod.LEDGER_PATH = str(tmp_path / "paid_requests.jsonl")
+    mod.CONTROL_TOKEN = "c" * 32
+    mod.SOFASCORE_BUDGET_ARTIFACT_ID = "a" * 64
+    mod.SOFASCORE_ALLOCATION_LEDGER_PATH = str(tmp_path / "allocations.json")
+    mod.SOFASCORE_ALLOCATION_WAL_PATH = str(tmp_path / "allocation-wal.jsonl")
+    mod.SOFASCORE_ALLOCATION_LEDGER = None
+    mod._SOFASCORE_ALLOCATION_LEDGER_KEY = None
+    mod.SOFASCORE_PARENT_ENVELOPE_PATH = str(tmp_path / "parent-envelopes.json")
+    mod.SOFASCORE_PARENT_ENVELOPE_LEDGER = None
+    mod._SOFASCORE_PARENT_ENVELOPE_LEDGER_PATH = ""
+    mod.SOURCE_MODE = "test-all"
+    mod.SOFASCORE_DAGRUN_BUDGET_BYTES = max_bytes
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = mod._create_lease(
+        mgr,
+        max_bytes=max_bytes,
+        ttl_seconds=30,
+        metadata=_sofascore_context(budget=max_bytes),
+        require_context=True,
+    )
+    mod._begin_endpoint_request(lease, "event")
+    return mod, lease
+
+
+class _HangupClientWriter:
+    """Client leg whose first ``drain`` fails like a TLS close_notify race."""
+
+    def __init__(self):
+        self.payload = bytearray()
+        self.drain_calls = 0
+        self.closed = False
+
+    def write(self, chunk):
+        self.payload.extend(chunk)
+
+    async def drain(self):
+        self.drain_calls += 1
+        raise ConnectionResetError("client hung up")
+
+    def close(self):
+        self.closed = True
+
+
+def test_shared_down_pump_drains_provider_tail_after_client_hangup(tmp_path):
+    mod, lease = _shared_sofascore_lease(tmp_path)
+    head = b"a" * 415
+    tail = b"b" * 31
+
+    class Reader:
+        def __init__(self):
+            self.chunks = [head, tail, b""]
+            self.read_calls = 0
+
+        async def read(self, size):
+            self.read_calls += 1
+            return self.chunks.pop(0)
+
+    reader = Reader()
+    writer = _HangupClientWriter()
+    asyncio.run(
+        mod._pump(
+            reader,
+            writer,
+            "www.sofascore.com",
+            defaultdict(int),
+            lease=lease,
+            direction="down",
+        )
+    )
+
+    # Every provider byte was read to EOF and billed exactly; the dead client
+    # got only the chunk that was in flight when it hung up.
+    assert reader.read_calls == 3
+    assert writer.drain_calls == 1
+    assert bytes(writer.payload) == head
+    assert writer.closed is True
+    assert lease.down_bytes == len(head) + len(tail)
+    assert lease.provider_reserved_bytes == 0
+    assert lease.reserved_bytes == 0
+    assert lease.accounting_uncertain is False
+    assert lease.closed is False
+
+
+def test_shared_down_pump_latches_when_provider_stalls_after_client_hangup(
+    tmp_path,
+):
+    mod, lease = _shared_sofascore_lease(tmp_path)
+    mod.LEASE_CLIENT_HANGUP_DRAIN_SECONDS = 0.05
+    head = b"a" * 415
+
+    class Reader:
+        def __init__(self):
+            self.chunks = [head]
+            self.read_calls = 0
+
+        async def read(self, size):
+            self.read_calls += 1
+            if self.chunks:
+                return self.chunks.pop(0)
+            await asyncio.Event().wait()
+
+    reader = Reader()
+    writer = _HangupClientWriter()
+    started = time.monotonic()
+    asyncio.run(
+        mod._pump(
+            reader,
+            writer,
+            "www.sofascore.com",
+            defaultdict(int),
+            lease=lease,
+            direction="down",
+        )
+    )
+
+    # No observed EOF: the unread provider tail is unknowable, so the lease
+    # latches as before — but only after the bounded drain window, not the TTL.
+    assert time.monotonic() - started < 5
+    assert reader.read_calls == 2
+    assert lease.down_bytes == len(head)
+    assert lease.accounting_uncertain is True
+    assert lease.usable is False
+    assert writer.closed is True
+
+
+def test_shared_up_pump_half_closes_provider_until_down_pump_finishes(tmp_path):
+    mod, lease = _shared_sofascore_lease(tmp_path)
+    provider_payload = b"provider-tail-after-client-eof"
+
+    class ClientReader:
+        async def read(self, size):
+            return b""
+
+    class ProviderReader:
+        def __init__(self):
+            self.chunks = [provider_payload, b""]
+
+        async def read(self, size):
+            await asyncio.sleep(0)
+            return self.chunks.pop(0)
+
+    class ProviderWriter(_FakeUpstreamWriter):
+        def __init__(self):
+            super().__init__()
+            self.events = []
+
+        def can_write_eof(self):
+            return True
+
+        def write_eof(self):
+            self.events.append("eof")
+
+        def close(self):
+            self.events.append("close")
+            super().close()
+
+    client_writer = _FakeUpstreamWriter()
+    provider_writer = ProviderWriter()
+    asyncio.run(
+        mod._run_tunnel_pumps(
+            ClientReader(),
+            client_writer,
+            ProviderReader(),
+            provider_writer,
+            "www.sofascore.com",
+            lease=lease,
+        )
+    )
+
+    # Client EOF half-closes the provider leg so its tail and FIN still arrive;
+    # the socket is fully closed only once both pumps have finished.
+    assert provider_writer.events == ["eof", "close"]
+    assert bytes(client_writer.data) == provider_payload
+    assert client_writer.closed is True
+    assert lease.down_bytes == len(provider_payload)
+    assert lease.accounting_uncertain is False
+    assert lease.reserved_bytes == 0
+
+
 def test_concurrent_provider_readers_keep_aggregate_upload_headroom(mod):
     mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
     lease = _make_fbref_lease(mod, mgr, max_bytes=12)

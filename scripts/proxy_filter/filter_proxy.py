@@ -241,6 +241,11 @@ MAX_ACTIVE_LEASES = 4
 # finish (#1060). Mirrors the external watchdog's LATCH_GRACE_SECONDS so an
 # in-flight client close gets its normal path first.
 LATCHED_SLOT_RECLAIM_GRACE_SECONDS = 30
+# After the local client hangs up mid-response, the down pump keeps reading the
+# provider so the remaining billed tail (and its EOF) is observed and settled
+# exactly instead of latching the lease over a few unread bytes. Each provider
+# read in that drain waits at most this long: a silent provider still latches.
+LEASE_CLIENT_HANGUP_DRAIN_SECONDS = 2.0
 LEASE_PROXY_URL = "http://proxy_filter:8900"
 LEDGER_PATH = "/opt/airflow/logs/proxy_filter/paid_requests.jsonl"
 SOFASCORE_ALLOCATION_LEDGER_PATH = (
@@ -4224,6 +4229,9 @@ async def _pump(
     if lease is not None and budget_guard is not None:
         raise ValueError("lease and legacy budget guard are mutually exclusive")
     provider_eof_observed = False
+    # Set when the client leg failed mid-response: the provider is then drained
+    # to EOF (still metered per chunk) without forwarding anything further.
+    client_gone = False
     provider_reader_registered = lease is not None and direction == "down"
     if provider_reader_registered:
         lease.active_provider_readers += 1
@@ -4303,7 +4311,16 @@ async def _pump(
                     # scheduling semantics on Python 3.11 and 3.12.  In
                     # particular an immediate EOF cannot yield between the two
                     # tunnel pumps and manufacture reservation starvation.
-                    async with asyncio.timeout(_lease_operation_timeout(lease)):
+                    async with asyncio.timeout(
+                        _lease_operation_timeout(
+                            lease,
+                            ceiling_seconds=(
+                                LEASE_CLIENT_HANGUP_DRAIN_SECONDS
+                                if client_gone
+                                else None
+                            ),
+                        )
+                    ):
                         chunk = await reader.read(read_size)
                 else:
                     chunk = await reader.read(read_size)
@@ -4386,6 +4403,9 @@ async def _pump(
                 if pending:
                     break
                 continue
+            if client_gone:
+                # Drain: the chunk is settled above; nobody is left to read it.
+                continue
             try:
                 writer.write(chunk)
                 if lease is None:
@@ -4395,12 +4415,18 @@ async def _pump(
                         writer.drain(),
                         timeout=_lease_operation_timeout(lease),
                     )
+            except Exception:
+                if lease is None or direction != "down":
+                    raise
+                # The returned chunk is exact and already durable, but the
+                # provider StreamReader may still hold billed read-ahead. Keep
+                # reading it to EOF (bounded per read by
+                # LEASE_CLIENT_HANGUP_DRAIN_SECONDS) so that tail is settled
+                # exactly; a drain timeout or a later error still latches.
+                client_gone = True
             except BaseException:
                 if lease is not None and direction == "down":
-                    # The returned chunk is exact and already durable, but the
-                    # provider StreamReader may hold additional billed
-                    # read-ahead that can no longer be observed once the
-                    # downstream client fails or this task is cancelled.
+                    # Cancellation leaves the provider read-ahead unobservable.
                     _latch_lease_accounting_uncertainty(lease)
                 raise
             if lease is None:
@@ -4418,7 +4444,13 @@ async def _pump(
             _ACTIVE_PROVIDER_READERS = max(0, _ACTIVE_PROVIDER_READERS - 1)
             _notify_reservation_turnover()
         try:
-            writer.close()
+            if direction == "up" and writer.can_write_eof():
+                # Half-close the provider leg: it still sends its response
+                # tail and FIN, which the down pump observes as an exact EOF.
+                # _run_tunnel_pumps closes the socket once both pumps finish.
+                writer.write_eof()
+            else:
+                writer.close()
         except Exception:  # noqa: BLE001
             pass
 
@@ -4463,6 +4495,12 @@ async def _run_tunnel_pumps(
             # response bytes. Retain all remaining escrow in that handoff gap.
             _latch_lease_accounting_uncertainty(lease)
         raise
+    finally:
+        # The up pump only half-closes the provider leg (see _pump).
+        try:
+            srv_w.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _read_headers(reader: asyncio.StreamReader) -> list[bytes]:
