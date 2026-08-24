@@ -969,6 +969,44 @@ def _gate_player_capture(**context) -> bool:
     return True
 
 
+INGEST_STATUS_TASK_IDS = (
+    "validate_data",
+    "run_sofascore_dq",
+    "validate_bronze_freshness",
+    "gate_player_capture",
+    "validate_player_data",
+    "validate_player_freshness",
+)
+
+
+def _propagate_ingest_status(**context) -> Dict[str, Any]:
+    """The single ``all_done`` leaf — its state IS the DagRun state.
+
+    Both freshness validators run ``all_done`` and tolerate a failed
+    ``validate_data``/``validate_player_data`` (they must still emit the
+    staleness alert), so the DagRun reported success while validation had
+    failed — and ``dag_sofascore_pipeline`` (``allowed_states=['success']``)
+    marched on.  ``skipped`` (weekday player branch) and a task instance the
+    scheduler never created are fine; ``failed``/``upstream_failed`` are not.
+    """
+    dag_run = context.get("dag_run")
+    if dag_run is None:
+        raise AirflowException("SofaScore ingest status propagation has no DagRun")
+    failures: List[str] = []
+    for task_id in INGEST_STATUS_TASK_IDS:
+        task_instance = dag_run.get_task_instance(task_id)
+        state = getattr(task_instance, "state", None)
+        value = getattr(state, "value", state)
+        normalized = str(value or "none").casefold().split(".")[-1]
+        if normalized in {"failed", "upstream_failed"}:
+            failures.append(f"{task_id}={normalized}")
+    if failures:
+        raise AirflowException(
+            "SofaScore ingest run failed: " + ", ".join(failures)
+        )
+    return {"status": "success"}
+
+
 def _gate_player_rotation(league: str, **context) -> bool:
     """ShortCircuitOperator hook — TRUE when ``league`` is in this week's cohort.
 
@@ -1596,6 +1634,15 @@ rm -f "$SOFASCORE_RESULT_DIR/{_player_output}" && \\
         trigger_rule="all_done",
     )
 
+    # The only leaf: the tolerant all_done validators above cannot carry the
+    # DagRun state, this task does (see _propagate_ingest_status).
+    propagate_ingest_status_task = PythonOperator(
+        task_id="propagate_ingest_status",
+        python_callable=_propagate_ingest_status,
+        trigger_rule="all_done",
+        retries=0,
+    )
+
     # Season and target plans are immutable phase snapshots. Match target IDs
     # are planned only after all season raw/manifest expansion has committed.
     for _schedule_task in schedule_tasks.values():
@@ -1627,3 +1674,6 @@ rm -f "$SOFASCORE_RESULT_DIR/{_player_output}" && \\
         prepare_player_plan_task >> _rotation_gate >> _player_task
         _player_task >> validate_player_data_task
     validate_player_data_task >> validate_player_freshness_task
+    [validate_bronze_freshness_task, validate_player_freshness_task] >> (
+        propagate_ingest_status_task
+    )

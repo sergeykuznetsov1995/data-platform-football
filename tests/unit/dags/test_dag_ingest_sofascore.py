@@ -154,6 +154,78 @@ class TestSignedWorkloadTopology:
         assert dag_module.dag._dag_kwargs["max_active_tasks"] == 1
 
 
+class TestIngestStatusLeaf:
+    """Both freshness validators are ``all_done`` and tolerate a failed
+    ``validate_data``, so the DagRun (and ``dag_sofascore_pipeline`` waiting
+    with ``allowed_states=['success']``) reported green while validation had
+    failed. One honest ``all_done`` leaf must own the DagRun state."""
+
+    @staticmethod
+    def _leaves():
+        from airflow.operators.bash import BashOperator
+        from airflow.operators.python import PythonOperator
+
+        return {
+            task.task_id
+            for task in PythonOperator._instances + BashOperator._instances
+            if not task.downstream_task_ids
+        }
+
+    def test_propagate_ingest_status_is_the_only_leaf(self, dag_module):
+        assert self._leaves() == {"propagate_ingest_status"}
+        leaf = _python_task("propagate_ingest_status")
+        assert leaf.python_callable is dag_module._propagate_ingest_status
+        assert leaf._init_kwargs["trigger_rule"] == "all_done"
+        assert leaf._init_kwargs["retries"] == 0
+        assert leaf.upstream_task_ids == {
+            "validate_bronze_freshness",
+            "validate_player_freshness",
+        }
+
+    @staticmethod
+    def _context(states):
+        def get_task_instance(task_id):
+            if task_id not in states:
+                return None
+            return SimpleNamespace(state=states[task_id])
+
+        return {"dag_run": SimpleNamespace(get_task_instance=get_task_instance)}
+
+    def test_failed_validation_paints_the_run_red(self, dag_module):
+        states = {
+            "validate_data": "failed",
+            "run_sofascore_dq": "upstream_failed",
+            "validate_bronze_freshness": "success",
+            "gate_player_capture": "success",
+            "validate_player_data": "skipped",
+            "validate_player_freshness": "success",
+        }
+        with pytest.raises(
+            Exception,
+            match="validate_data=failed, run_sofascore_dq=upstream_failed",
+        ):
+            dag_module._propagate_ingest_status(**self._context(states))
+
+    def test_success_skipped_and_missing_states_are_green(self, dag_module):
+        # A weekday run skips the whole player branch; a task instance the
+        # scheduler has not created yet resolves to None.
+        states = {
+            "validate_data": "success",
+            "run_sofascore_dq": "success",
+            "validate_bronze_freshness": "success",
+            "gate_player_capture": "skipped",
+            "validate_player_data": "skipped",
+        }
+        out = dag_module._propagate_ingest_status(**self._context(states))
+        assert out == {"status": "success"}
+
+    def test_enum_states_are_normalized(self, dag_module):
+        # Real Airflow returns TaskInstanceState enum members, not strings.
+        states = {"validate_data": SimpleNamespace(value="failed")}
+        with pytest.raises(Exception, match="validate_data=failed"):
+            dag_module._propagate_ingest_status(**self._context(states))
+
+
 class TestBronzeFreshnessGate:
     """#751: a ``validate_bronze_freshness`` task must exist, wired after
     canonical manifest DQ, alerting on stale ``bronze.sofascore_*`` ingestion."""
