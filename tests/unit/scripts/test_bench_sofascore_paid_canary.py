@@ -37,8 +37,14 @@ WORLD_CUP_SEASON_SHAPE = production_season_shape(
     team_count_band="33_48",
     max_pages_per_direction=50,
 )
+CUP_SEASON_SHAPE = production_season_shape(
+    season_format="split_year",
+    team_count_band="33_48",
+    max_pages_per_direction=50,
+)
 EPL_SEASON_CLASS = season_workload_class(EPL_SEASON_SHAPE)
 WORLD_CUP_SEASON_CLASS = season_workload_class(WORLD_CUP_SEASON_SHAPE)
+CUP_SEASON_CLASS = season_workload_class(CUP_SEASON_SHAPE)
 # #1218 D7: the season classes of the all-men campaign bands; each one is
 # measured on two tournaments so it transfers to the unmeasured ones.
 MEASURED_SEASON_BANDS = {
@@ -49,6 +55,8 @@ MEASURED_SEASON_BANDS = {
     ("calendar_year", "16_20"),
     ("calendar_year", "21_32"),
     ("calendar_year", "33_48"),
+    # #1218 D7b: the domestic cups of the campaign (split_year/33_48).
+    ("split_year", "33_48"),
 }
 SEASON_CLASSES = {
     season_workload_class(
@@ -306,6 +314,11 @@ def test_workload_classes_are_derived_from_the_class_manifest():
     # #1218 D7: t703 (Primera Nacional) is the second measured tournament of
     # the calendar_year/33_48 shape, so the class no longer stays pinned to t16.
     assert _spec(WORLD_CUP_SEASON_CLASS).measured_tournament_ids == (16, 703)
+    # #1218 D7b: the split_year/33_48 shape (domestic cups) is measured on
+    # t326 (Belgian Cup) and t328 (Coppa Italia).
+    assert _spec(CUP_SEASON_CLASS).measured_tournament_ids == (326, 328)
+    assert _target(CUP_SEASON_CLASS, 326).representative_season_id == 81462
+    assert _target(CUP_SEASON_CLASS, 328).representative_season_id == 77308
     assert _target(EPL_SEASON_CLASS, 17).representative_season_id == 76986
     assert _target(EPL_SEASON_CLASS, 8).representative_season_id == 77559
     assert _target(WORLD_CUP_SEASON_CLASS, 16).representative_season_id == 58210

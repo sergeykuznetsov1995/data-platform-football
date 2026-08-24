@@ -114,6 +114,31 @@
       ]
     },
     {
+      "key": "season_split_year_33_48",
+      "scope": "season",
+      "shape_params": {
+        "season_format": "split_year",
+        "team_count_band": "33_48",
+        "max_pages_per_direction": 50
+      },
+      "targets": [
+        {
+          "source_tournament_id": 326,
+          "tournament_slug": "belgian-cup",
+          "cohort_path": "proxy_canary_cohort_belgian_cup.json",
+          "cohort_name": "enabled_belgian_cup_2526_shape",
+          "representative_season_id": 81462
+        },
+        {
+          "source_tournament_id": 328,
+          "tournament_slug": "coppa-italia",
+          "cohort_path": "proxy_canary_cohort_coppa_italia.json",
+          "cohort_name": "enabled_coppa_italia_2526_shape",
+          "representative_season_id": 77308
+        }
+      ]
+    },
+    {
       "key": "season_calendar_year_8_15",
       "scope": "season",
       "shape_params": {
