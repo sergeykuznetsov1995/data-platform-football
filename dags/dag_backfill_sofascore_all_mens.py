@@ -250,7 +250,11 @@ with DAG(
         priority_weight=1,
         do_xcom_push=False,
         max_active_tis_per_dag=1,
-        retries=0,
+        # One retry keeps the same run_id: the gateway reuses the signed plan,
+        # finished allocations replay from raw, a latched lease is re-claimed
+        # once the reaper grace (30 s) has passed.
+        retries=1,
+        retry_delay=timedelta(minutes=2),
         execution_timeout=timedelta(hours=4),
     ).expand(env=plan.output)
     validate = PythonOperator.partial(
