@@ -108,6 +108,7 @@ jobs:
             tests/unit/configs/test_sofascore_proxy_canary_cohort.py \
             tests/unit/dags/test_dag_backfill_sofascore_all_mens.py \
             tests/unit/dags/test_dag_ingest_sofascore.py \
+            tests/unit/dags/test_dag_refresh_sofascore_all_mens.py \
             tests/unit/dags/test_dag_canary_sofascore_proxy.py \
             tests/unit/dags/test_dag_iceberg_maintenance.py \
             tests/unit/dags/test_dag_sofascore_pipeline.py \
@@ -149,6 +150,7 @@ jobs:
             tests/unit/scripts/test_migrate_sofascore_production.py \
             tests/unit/scripts/test_prepare_sofascore_workload.py \
             tests/unit/scripts/test_purge_sofascore_manifest_observations.py \
+            tests/unit/scripts/test_run_sofascore_daily_events.py \
             tests/unit/scripts/test_run_sofascore_scope_cycle.py \
             tests/unit/scripts/test_run_sofascore_workload.py \
             tests/unit/scripts/test_sofascore_capture_manifest_guard_v1.py \
