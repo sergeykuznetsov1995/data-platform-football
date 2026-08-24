@@ -198,6 +198,17 @@ class TestComposeFile:
             "0" * 64
         )
 
+    def test_sofascore_gateway_memory_limit_survives_wal_replay(self):
+        """The gateway replays its allocation WAL (~135 MiB) into memory on
+        every start; 256 MiB OOM-crashlooped recovery on 2026-07-24 and the
+        ``docker update --memory 1g`` workaround was lost on the 2026-08-23
+        recreate.  The limit must live in compose, at >= 1 GiB."""
+        cfg = _sofascore_gateway_config_json()
+        resources = cfg["services"]["sofascore_proxy_filter"]["deploy"]["resources"]
+        # Compose renders memory sizes as byte-count strings.
+        assert int(resources["limits"]["memory"]) >= 1 << 30
+        assert int(resources["reservations"]["memory"]) >= 256 << 20
+
     def test_scheduler_renders_with_exact_sofascore_artifact_bind(self):
         cfg = _compose_config_json()
         scheduler = cfg["services"]["airflow-scheduler"]
