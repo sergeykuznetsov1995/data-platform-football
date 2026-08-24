@@ -66,7 +66,14 @@ def plan_historical_batch(
     authorized_season_classes: Mapping[str, Iterable[int | str]] | None = None,
     task_env: Mapping[str, str] | None = None,
 ) -> list[dict[str, str]]:
-    """Select a bounded batch from one global season wave, newest first.
+    """Select a bounded batch: every tournament's newest season, then deeper.
+
+    Candidates inside the allowed waves (``start_year <= first_start_year``)
+    are ranked by ``(depth, -start_year, tournament_id)`` where ``depth`` is
+    the season's position in the tournament's newest-first season list. A
+    pending season yields one serialized metadata task for its wave; a
+    deferred (unmeasured) season is skipped and holds the deeper seasons of
+    its tournament until a later canary wave unlocks the shape.
 
     ``task_env`` is the lane's own environment (gateway URL, rate limit) and
     is forwarded verbatim to every planned task; campaign keys win over it.
@@ -97,9 +104,8 @@ def plan_historical_batch(
             str(name): frozenset(str(value) for value in tournaments)
             for name, tournaments in authorized_season_classes.items()
         }
-    by_wave: dict[int, list[tuple[Mapping[str, Any], Mapping[str, Any]]]] = {}
-    pending_by_wave: dict[int, int] = {}
-    deferred_by_wave: dict[int, int] = {}
+    # (rank, kind, tournament, season); kind in ready/completed/pending/deferred
+    ranked: list[tuple[tuple[int, int, int], str, Mapping[str, Any], Mapping[str, Any]]] = []
     for tournament in tournaments:
         if not isinstance(tournament, Mapping):
             raise CampaignPlanningError("campaign tournament must be an object")
@@ -109,6 +115,7 @@ def plan_historical_batch(
         seasons = tournament.get("seasons")
         if not isinstance(seasons, list):
             raise CampaignPlanningError("campaign seasons must be a list")
+        chain: list[tuple[int, Mapping[str, Any]]] = []
         for season in seasons:
             if not isinstance(season, Mapping):
                 raise CampaignPlanningError("campaign season must be an object")
@@ -118,13 +125,22 @@ def plan_historical_batch(
                 raise CampaignPlanningError("season start_year must be an integer") from exc
             if wave < 0 or wave > int(first_start_year):
                 continue
+            if str(season.get("metadata_status") or "pending") == "excluded":
+                continue
+            chain.append((wave, season))
+        chain.sort(key=lambda item: -item[0])
+        for depth, (wave, season) in enumerate(chain):
             status = str(season.get("metadata_status") or "pending")
-            if status == "excluded":
-                continue
+            kind = "ready"
             if tournament_status != "ready" or status != "ready":
-                pending_by_wave[wave] = pending_by_wave.get(wave, 0) + 1
-                continue
-            if authorized is not None:
+                kind = "pending"
+            elif campaign_scope_key(
+                campaign_id,
+                int(tournament["unique_tournament_id"]),
+                int(season["source_season_id"]),
+            ) in completed_keys:
+                kind = "completed"
+            elif authorized is not None:
                 source_format = str(season.get("season_format") or "")
                 capture_format = {
                     "split_year": "split_year",
@@ -137,32 +153,28 @@ def plan_historical_batch(
                         max_pages_per_direction=50,
                     )
                     class_name = season_workload_class(shape)
+                    measured = authorized.get(class_name)
                 except WorkloadPlanError:
-                    deferred_by_wave[wave] = deferred_by_wave.get(wave, 0) + 1
-                    continue
-                measured = authorized.get(class_name)
+                    measured = None
                 tournament_id = str(tournament.get("unique_tournament_id"))
                 if measured is None or (
                     tournament_id not in measured and len(measured) < 2
                 ):
-                    deferred_by_wave[wave] = deferred_by_wave.get(wave, 0) + 1
-                    continue
-            by_wave.setdefault(wave, []).append((tournament, season))
-    waves = sorted(
-        set(by_wave) | set(pending_by_wave) | set(deferred_by_wave),
-        reverse=True,
-    )
-    for wave in waves:
-        incomplete: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
-        for tournament, season in by_wave.get(wave, []):
-            key = campaign_scope_key(
-                campaign_id,
-                int(tournament["unique_tournament_id"]),
-                int(season["source_season_id"]),
-            )
-            if key not in completed_keys:
-                incomplete.append((tournament, season))
-        if pending_by_wave.get(wave, 0):
+                    kind = "deferred"
+            rank = (depth, -wave, int(tournament["unique_tournament_id"]))
+            ranked.append((rank, kind, tournament, season))
+            if kind not in ("ready", "completed"):
+                # Deeper seasons of this tournament wait behind the blocker.
+                break
+    ranked.sort(key=lambda item: item[0])
+    planned: list[dict[str, str]] = []
+    for _rank, kind, tournament, season in ranked:
+        if kind in ("completed", "deferred"):
+            continue
+        if kind == "pending":
+            if planned:
+                break
+            wave = int(season["start_year"])
             safe_run = hashlib.sha256(
                 f"{dag_run_id}:metadata:{campaign_id}:{wave}".encode("utf-8")
             ).hexdigest()[:20]
@@ -183,55 +195,43 @@ def plan_historical_batch(
                     Path(result_dir) / safe_run
                 ),
             }]
-        if incomplete:
-            incomplete.sort(
-                key=lambda pair: (
-                    int(pair[0]["unique_tournament_id"]),
-                    int(pair[1]["source_season_id"]),
-                )
-            )
-            planned: list[dict[str, str]] = []
-            for tournament, season in incomplete[:batch_size]:
-                tournament_id = int(tournament["unique_tournament_id"])
-                season_id = int(season["source_season_id"])
-                scope_key = campaign_scope_key(campaign_id, tournament_id, season_id)
-                safe_run = hashlib.sha256(
-                    f"{dag_run_id}:{scope_key}".encode("utf-8")
-                ).hexdigest()[:20]
-                planned.append({
-                    **lane_env,
-                    "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
-                    "SOFASCORE_CAMPAIGN_ACTION": "capture",
-                    "SOFASCORE_CAMPAIGN_SNAPSHOT": snapshot_path,
-                    "SOFASCORE_ALL_MENS_POLICY": policy_path,
-                    "SOFASCORE_EXPECTED_SNAPSHOT_ID": snapshot_id,
-                    "SOFASCORE_EXPECTED_CAMPAIGN_ID": campaign_id,
-                    "SOFASCORE_TOURNAMENT_ID": str(tournament_id),
-                    "SOFASCORE_SOURCE_SEASON_ID": str(season_id),
-                    "SOFASCORE_CANONICAL_SEASON": str(
-                        season["canonical_season"]
-                    ),
-                    "SOFASCORE_SCOPE_KEY": scope_key,
-                    "SOFASCORE_SCOPE_RESULT_PATH": str(
-                        Path(result_dir) / f"{safe_run}.json"
-                    ),
-                    "SOFASCORE_SCOPE_OUTPUT_DIR": str(
-                        Path(result_dir) / safe_run
-                    ),
-                    "SOFASCORE_WORKLOAD_ARTIFACT": workload_artifact,
-                    # The gateway ledger holds one immutable plan per run_id,
-                    # so scopes of one DagRun must not share it (batch > 1).
-                    # An Airflow retry keeps the same id and reuses the plan.
-                    "SOFASCORE_SCOPE_RUN_ID": (
-                        f"{dag_run_id}--{tournament_id}-{season_id}"
-                    ),
-                })
-            return planned
-        if deferred_by_wave.get(wave, 0):
-            # A later canary wave will unlock these exact shapes. Do not jump
-            # to an older season while the newest wave is intentionally held.
-            return []
-    return []
+        tournament_id = int(tournament["unique_tournament_id"])
+        season_id = int(season["source_season_id"])
+        scope_key = campaign_scope_key(campaign_id, tournament_id, season_id)
+        safe_run = hashlib.sha256(
+            f"{dag_run_id}:{scope_key}".encode("utf-8")
+        ).hexdigest()[:20]
+        planned.append({
+            **lane_env,
+            "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
+            "SOFASCORE_CAMPAIGN_ACTION": "capture",
+            "SOFASCORE_CAMPAIGN_SNAPSHOT": snapshot_path,
+            "SOFASCORE_ALL_MENS_POLICY": policy_path,
+            "SOFASCORE_EXPECTED_SNAPSHOT_ID": snapshot_id,
+            "SOFASCORE_EXPECTED_CAMPAIGN_ID": campaign_id,
+            "SOFASCORE_TOURNAMENT_ID": str(tournament_id),
+            "SOFASCORE_SOURCE_SEASON_ID": str(season_id),
+            "SOFASCORE_CANONICAL_SEASON": str(
+                season["canonical_season"]
+            ),
+            "SOFASCORE_SCOPE_KEY": scope_key,
+            "SOFASCORE_SCOPE_RESULT_PATH": str(
+                Path(result_dir) / f"{safe_run}.json"
+            ),
+            "SOFASCORE_SCOPE_OUTPUT_DIR": str(
+                Path(result_dir) / safe_run
+            ),
+            "SOFASCORE_WORKLOAD_ARTIFACT": workload_artifact,
+            # The gateway ledger holds one immutable plan per run_id,
+            # so scopes of one DagRun must not share it (batch > 1).
+            # An Airflow retry keeps the same id and reuses the plan.
+            "SOFASCORE_SCOPE_RUN_ID": (
+                f"{dag_run_id}--{tournament_id}-{season_id}"
+            ),
+        })
+        if len(planned) == batch_size:
+            break
+    return planned
 
 
 def read_snapshot(

@@ -15,33 +15,28 @@ from scrapers.sofascore.workload_plan import (
 )
 
 
-def _snapshot(*, second_status="ready"):
+def _season(tournament_id, start_year, status):
+    return {
+        "source_season_id": tournament_id * 100 + start_year % 100,
+        "canonical_season": f"{start_year % 100}{(start_year + 1) % 100}",
+        "start_year": start_year,
+        "season_format": "split_year",
+        "team_count": 20,
+        "metadata_status": status,
+        "team_count_evidence": {"count": 20, "endpoint": "/teams"},
+    }
+
+
+def _snapshot(*, second_status="ready", second_years=(2025, 2024)):
     tournaments = []
-    for tournament_id, status in ((17, "ready"), (8, second_status)):
+    for tournament_id, status, years in (
+        (17, "ready", (2025, 2024)), (8, second_status, second_years)
+    ):
         tournaments.append({
             "unique_tournament_id": tournament_id,
             "capture_key": f"SS-{tournament_id}",
             "metadata_status": status,
-            "seasons": [
-                {
-                    "source_season_id": tournament_id * 100 + 25,
-                    "canonical_season": "2526",
-                    "start_year": 2025,
-                    "season_format": "split_year",
-                    "team_count": 20,
-                    "metadata_status": status,
-                    "team_count_evidence": {"count": 20, "endpoint": "/teams"},
-                },
-                {
-                    "source_season_id": tournament_id * 100 + 24,
-                    "canonical_season": "2425",
-                    "start_year": 2024,
-                    "season_format": "split_year",
-                    "team_count": 20,
-                    "metadata_status": status,
-                    "team_count_evidence": {"count": 20, "endpoint": "/teams"},
-                },
-            ],
+            "seasons": [_season(tournament_id, year, status) for year in years],
         })
     document = {
         "schema_version": 1,
@@ -61,15 +56,29 @@ def test_planner_is_breadth_first_newest_season():
     snapshot = _snapshot()
     planned = plan_historical_batch(snapshot, completed=set(), batch_size=10)
 
-    assert {item["SOFASCORE_CANONICAL_SEASON"] for item in planned} == {"2526"}
-    assert len(planned) == 2
+    assert [item["SOFASCORE_CANONICAL_SEASON"] for item in planned] == [
+        "2526", "2526", "2425", "2425"
+    ]
     # The gateway ledger keeps one immutable plan per run_id, so two scopes
     # of one DagRun must not share it; an Airflow retry keeps the same id.
-    assert {item["SOFASCORE_SCOPE_RUN_ID"] for item in planned} == {
-        "manual--8-825", "manual--17-1725"
-    }
+    assert [item["SOFASCORE_SCOPE_RUN_ID"] for item in planned] == [
+        "manual--8-825", "manual--17-1725", "manual--8-824", "manual--17-1724"
+    ]
     assert "SOFASCORE_RATE_LIMIT_PER_MINUTE" not in planned[0]
     assert "SOFASCORE_PROXY_CONTROL_URL" not in planned[0]
+
+
+@pytest.mark.unit
+def test_each_tournaments_newest_season_precedes_deeper_seasons():
+    # Tournament 17 has 2025 and 2024, tournament 8 only 2024: the newest
+    # season of every tournament comes first, then the campaign goes deeper.
+    snapshot = _snapshot(second_years=(2024,))
+
+    planned = plan_historical_batch(snapshot, completed=set(), batch_size=10)
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:17:1725", "campaign-test:8:824", "campaign-test:17:1724"
+    ]
 
 
 @pytest.mark.unit
@@ -140,8 +149,10 @@ def test_unavailable_season_does_not_block_other_ready_scopes():
 
     planned = plan_historical_batch(snapshot, completed=set(), batch_size=10)
 
-    assert len(planned) == 1
-    assert planned[0]["SOFASCORE_TOURNAMENT_ID"] == "8"
+    # 17-1724 is now the newest usable season of tournament 17 (depth 0).
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:8:825", "campaign-test:17:1724", "campaign-test:8:824"
+    ]
 
 
 def test_planner_defers_unmeasured_shapes_and_starts_measured_wave_scope():
@@ -165,8 +176,10 @@ def test_planner_defers_unmeasured_shapes_and_starts_measured_wave_scope():
         authorized_season_classes={measured_class: (8, 17)},
     )
 
-    assert len(planned) == 1
-    assert planned[0]["SOFASCORE_TOURNAMENT_ID"] == "8"
+    # The deferred 17-1725 also holds the deeper 17-1724 (canary unlocks it).
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:8:825", "campaign-test:8:824"
+    ]
 
 
 def test_planner_does_not_advance_wave_when_only_deferred_shapes_remain():
