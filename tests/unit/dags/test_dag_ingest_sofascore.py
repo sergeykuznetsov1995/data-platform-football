@@ -98,6 +98,30 @@ def _patch_active_catalog(monkeypatch, competition_ids, source_seasons=None):
     )
 
 
+def _signed_player_plan(tmp_path, monkeypatch, leagues, *, canonical_season="2526"):
+    """Write a signed ``players`` plan whose only partitions are ``leagues``
+    (player universe of one id each, no allocations) and make it loadable."""
+    from scrapers.sofascore.workload_plan import _signed_plan, qualify_work_unit
+    from scrapers.sofascore.workload_runtime import partition_key, write_plan
+
+    token = "dag-ingest-control-token-at-least-32-bytes"
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", token)
+    plan = _signed_plan(
+        artifact_id="a" * 64,
+        dag_id="dag_ingest_sofascore",
+        run_id="scheduled__rotation::players",
+        player_universe_ids=tuple(
+            sorted(
+                qualify_work_unit(partition_key(league, canonical_season), "1")
+                for league in leagues
+            )
+        ),
+        allocations=(),
+        control_token=token,
+    )
+    return str(write_plan(tmp_path / "players.json", plan))
+
+
 class TestSignedWorkloadTopology:
     def test_phase_plans_gate_every_paid_capture(self, dag_module):
         season_plan = _bash_task("prepare_sofascore_season_plan")
@@ -1063,6 +1087,40 @@ class TestPlayerRotationGate:
         for task_id in ("prepare_sofascore_season_plan", "prepare_sofascore_target_plan"):
             assert "--players-rotation-date" not in _bash_task(task_id).bash_command
 
+    def test_due_league_the_planner_dropped_is_skipped(
+        self, dag_module, monkeypatch, tmp_path
+    ):
+        # C5: prepare_sofascore_player_plan drops a league whose season raw
+        # is incomplete (C4) — a clean-empty partition with neither player
+        # allocations nor a player universe. Its capture would only fail on
+        # the missing partition, so the gate skips it.
+        planned = dag_module.SOFASCORE_LEAGUES[0]
+        dropped = dag_module.SOFASCORE_LEAGUES[1]
+        plan_path = _signed_player_plan(tmp_path, monkeypatch, [planned])
+        context = {
+            "params": {"run_players": True},  # every league is due
+            "dag_run": SimpleNamespace(external_trigger=True, conf={}),
+            "data_interval_end": self.SATURDAY,
+            "ti": SimpleNamespace(xcom_pull=lambda task_ids: plan_path),
+        }
+        assert dag_module._player_plan_path(context) == plan_path
+        assert dag_module._gate_player_rotation(league=planned, **context) is True
+        assert dag_module._gate_player_rotation(league=dropped, **context) is False
+
+    def test_plan_path_is_the_player_plan_xcom(self, dag_module):
+        pulled = []
+        context = {
+            "ti": SimpleNamespace(
+                xcom_pull=lambda task_ids: pulled.append(task_ids) or "/plan.json"
+            )
+        }
+        assert dag_module._player_plan_path(context) == "/plan.json"
+        assert pulled == ["prepare_sofascore_player_plan"]
+        assert (
+            f"ti.xcom_pull(task_ids='{pulled[0]}')" in dag_module.PLAYER_PLAN_XCOM
+        )
+        assert dag_module._player_plan_path({}) is None
+
 
 class TestPlayerCaptureTasks:
     """#782: the player capture task + validation wiring folded in from the
@@ -1809,3 +1867,65 @@ class TestValidatePlayerDataUnderRotation:
         monkeypatch.setattr(dag_module, "_load_result", lambda path, logger: {})
         with pytest.raises(Exception, match="missing or unreadable"):
             dag_module.validate_player_data(**context)
+
+    def _forced_context(self, states, plan_path):
+        return {
+            "params": {"run_players": True},  # every league is due
+            "dag_run": SimpleNamespace(
+                external_trigger=True,
+                conf={},
+                run_id="scheduled__rotation",
+                get_task_instance=lambda task_id: SimpleNamespace(
+                    state=states.get(task_id, "success")
+                ),
+            ),
+            "run_id": "scheduled__rotation",
+            "data_interval_end": self.SATURDAY,
+            "ti": SimpleNamespace(xcom_pull=lambda task_ids: plan_path),
+        }
+
+    @staticmethod
+    def _healthy_result(path, logger):
+        return {
+            "rows": 520,
+            "profile_players": 520,
+            "season_stats_rows": 500,
+            "season_stats_players": 500,
+            "players_total": 520,
+            "fallback": False,
+            "tables": ["t"],
+            "errors": [],
+        }
+
+    def test_due_league_the_planner_dropped_may_skip(
+        self, dag_module, monkeypatch, tmp_path
+    ):
+        # C5: the gate skipped a due league the signed plan carries no
+        # partition for; the validator must accept that skip (no result
+        # file) instead of demanding success from a capture that never ran.
+        dropped = dag_module.SOFASCORE_LEAGUES[1]
+        planned = [lg for lg in dag_module.SOFASCORE_LEAGUES if lg != dropped]
+        plan_path = _signed_player_plan(tmp_path, monkeypatch, planned)
+        states = {dag_module._player_capture_task_id(dropped): "skipped"}
+        monkeypatch.setattr(dag_module, "_load_result", self._healthy_result)
+
+        out = dag_module.validate_player_data(
+            **self._forced_context(states, plan_path)
+        )
+
+        assert out["status"] == "success"
+        assert out["summary"]["planner_dropped"] == [dropped]
+        assert out["summary"]["rotation_skipped"] == []
+
+    def test_every_due_league_dropped_is_not_a_green_run(
+        self, dag_module, monkeypatch, tmp_path
+    ):
+        plan_path = _signed_player_plan(tmp_path, monkeypatch, [])
+        states = {
+            dag_module._player_capture_task_id(league): "skipped"
+            for league in dag_module.SOFASCORE_LEAGUES
+        }
+        monkeypatch.setattr(dag_module, "_load_result", self._healthy_result)
+
+        with pytest.raises(Exception, match="dropped from the signed player plan"):
+            dag_module.validate_player_data(**self._forced_context(states, plan_path))

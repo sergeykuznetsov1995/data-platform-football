@@ -78,7 +78,8 @@ mkdir -p "$SOFASCORE_RESULT_DIR"
 """.strip()
 SEASON_PLAN_XCOM = "{{ ti.xcom_pull(task_ids='prepare_sofascore_season_plan') }}"
 TARGET_PLAN_XCOM = "{{ ti.xcom_pull(task_ids='prepare_sofascore_target_plan') }}"
-PLAYER_PLAN_XCOM = "{{ ti.xcom_pull(task_ids='prepare_sofascore_player_plan') }}"
+PLAYER_PLAN_TASK_ID = "prepare_sofascore_player_plan"
+PLAYER_PLAN_XCOM = f"{{{{ ti.xcom_pull(task_ids='{PLAYER_PLAN_TASK_ID}') }}}}"
 
 
 def _context_run_id(context: Dict[str, Any]) -> str | None:
@@ -1013,6 +1014,48 @@ def _propagate_ingest_status(**context) -> Dict[str, Any]:
     return {"status": "success"}
 
 
+def _player_plan_path(context: Dict[str, Any]) -> str | None:
+    """The signed player plan every ``scrape_player_capture_*`` task reads
+    (the XCom of ``prepare_sofascore_player_plan``, same as
+    ``PLAYER_PLAN_XCOM``); ``None`` outside Airflow (direct unit calls)."""
+
+    task_instance = context.get("ti")
+    if task_instance is None:
+        return None
+    value = task_instance.xcom_pull(task_ids=PLAYER_PLAN_TASK_ID)
+    token = str(value).strip() if value is not None else ""
+    return token or None
+
+
+def _planner_dropped_leagues(context: Dict[str, Any], leagues) -> set:
+    """Leagues among ``leagues`` the signed player plan carries no work for.
+
+    ``prepare_sofascore_player_plan`` drops a league whose season raw is
+    incomplete or whose planning failed (C4) as a clean-empty partition —
+    neither player allocations nor a player universe. Its capture would only
+    fail on the missing partition, so the rotation gate skips it and the
+    validator accepts that skip. Without a plan (direct unit calls) nothing
+    is known to be dropped.
+    """
+    path = _player_plan_path(context)
+    if path is None:
+        return set()
+    from scrapers.sofascore.workload_plan import parse_qualified_work_unit
+    from scrapers.sofascore.workload_runtime import load_plan, parse_partition_key
+
+    plan = load_plan(path)
+    units = list(plan.player_universe_ids) + [
+        unit
+        for allocation in plan.allocations
+        if allocation.scope == "player"
+        for unit in allocation.units
+    ]
+    planned = {
+        parse_partition_key(parse_qualified_work_unit(unit)[0])[0] for unit in units
+    }
+    return {league for league in leagues if league not in planned}
+
+
 def _gate_player_rotation(league: str, **context) -> bool:
     """ShortCircuitOperator hook — TRUE when ``league`` is in this week's cohort.
 
@@ -1038,6 +1081,14 @@ def _gate_player_rotation(league: str, **context) -> bool:
         league,
         "due" if due else "not due (skipping its capture)",
     )
+    if due and _planner_dropped_leagues(context, [league]):
+        logger.warning(
+            "player rotation: %s is due but the signed player plan carries no "
+            "partition for it (dropped/unstarted by the planner) — skipping "
+            "its capture.",
+            league,
+        )
+        return False
     return due
 
 
@@ -1052,12 +1103,21 @@ def validate_player_data(**context) -> Dict[str, Any]:
 
     logger = logging.getLogger(__name__)
     due = _due_player_leagues(context)
+    # C5: a due league the planner dropped never ran (its rotation gate
+    # skipped it); success is demanded only from the leagues actually planned.
+    dropped = _planner_dropped_leagues(context, sorted(due))
+    if due and dropped == due:
+        raise AirflowException(
+            "every due SofaScore league was dropped from the signed player "
+            "plan — nothing was captured: " + ", ".join(sorted(dropped))
+        )
+    captured = due - dropped
     _require_successful_producers(
         context,
         [
             _player_capture_task_id(league)
             for league in SOFASCORE_LEAGUES
-            if league in due
+            if league in captured
         ],
     )
     _require_rotation_skipped(
@@ -1065,7 +1125,7 @@ def validate_player_data(**context) -> Dict[str, Any]:
         [
             _player_capture_task_id(league)
             for league in SOFASCORE_LEAGUES
-            if league not in due
+            if league not in captured
         ],
     )
 
@@ -1076,10 +1136,11 @@ def validate_player_data(**context) -> Dict[str, Any]:
             "rotation_skipped": sorted(
                 league for league in SOFASCORE_LEAGUES if league not in due
             ),
+            "planner_dropped": sorted(dropped),
         },
     }
 
-    if PRIMARY_CLUB_LEAGUE in due:
+    if PRIMARY_CLUB_LEAGUE in captured:
         primary_path = _result_path(PLAYER_CAPTURE_RESULT_PATH, context)
         result = _load_result(primary_path, logger)
 
@@ -1139,7 +1200,7 @@ def validate_player_data(**context) -> Dict[str, Any]:
             )
 
     for league in SOFASCORE_LEAGUES:
-        if league == PRIMARY_CLUB_LEAGUE or league not in due:
+        if league == PRIMARY_CLUB_LEAGUE or league not in captured:
             continue
         slug = _league_slug(league)
         path = _result_path(

@@ -1319,6 +1319,87 @@ def test_match_runner_repair_never_applies_the_scope_probe(tmp_path, monkeypatch
     assert "excluded_endpoints" not in result
 
 
+def _unallocated_plan(runtime):
+    return _signed_plan(
+        artifact_id="a" * 64,
+        dag_id="dag_ingest_sofascore",
+        run_id=runtime.engine.run_id,
+        player_universe_ids=(),
+        allocations=(),
+        control_token="c" * 32,
+    )
+
+
+def _run_match_capture_under_plan(tmp_path, runtime, plan, **kwargs):
+    from dags.scripts import run_sofascore_scraper as runner
+
+    output = tmp_path / "match-plan.json"
+    with patch(
+        "scrapers.sofascore.SofaScoreScraper", return_value=_runner_player_scraper()
+    ):
+        rc = runner._run_match_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=plan,
+            workload_allocations=(),
+            offline_replay=False,
+            **kwargs,
+        )
+    return rc, json.loads(output.read_text(encoding="utf-8"))
+
+
+def test_match_runner_names_a_partition_the_planner_dropped(tmp_path, monkeypatch):
+    """C5: a signed plan with no allocation for this partition and pending
+    endpoints without raw is a league the planner dropped (C4 isolation) —
+    say so instead of an OfflineReplayMiss on the first spec."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    runtime, transport = _runtime(tmp_path)
+    _patch_match_runner_environment(monkeypatch, runner, [EVENT_ID])
+
+    rc, result = _run_match_capture_under_plan(
+        tmp_path, runtime, _unallocated_plan(runtime)
+    )
+
+    assert rc == 1
+    assert transport.calls == 0
+    [error] = result["errors"]
+    assert "partition was dropped by the planner" in error
+    assert "prepare_sofascore_target_plan" in error
+    assert "no successful raw payload" not in error
+
+
+def test_match_runner_still_replays_unallocated_targets_from_raw(
+    tmp_path, monkeypatch
+):
+    """C5 must not touch the legitimate case: pending endpoints whose raw is
+    retained are local replay hits even without an allocation."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    runtime, transport = _runtime(tmp_path)
+    ingest_prefetched_records(
+        runtime,
+        specs={(EVENT_ID, endpoint): _spec(endpoint) for endpoint in EVENT_PATHS},
+        records={endpoint: _record(endpoint) for endpoint in EVENT_PATHS},
+    )
+    _patch_match_runner_environment(monkeypatch, runner, [EVENT_ID])
+
+    rc, result = _run_match_capture_under_plan(
+        tmp_path, runtime, _unallocated_plan(runtime)
+    )
+
+    assert rc == 0
+    assert result["errors"] == []
+    assert transport.calls == 0
+    assert all(
+        runtime.manifest_store.get(_spec(endpoint).key).is_terminal
+        for endpoint in EVENT_PATHS
+    )
+
+
 def test_player_runner_manifest_noop_is_exact_zero_traffic_before_browser(
     tmp_path,
     monkeypatch,

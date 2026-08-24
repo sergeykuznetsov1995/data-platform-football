@@ -954,6 +954,24 @@ def _run_match_capture(
                                     ", ".join(sorted(excluded)),
                                 )
                     if remaining_specs:
+                        if not workload_allocations and not force_replace:
+                            # C5: a signed plan with no allocation for this
+                            # partition is a league the planner dropped (C4:
+                            # season raw incomplete / planning failed) — its
+                            # pending endpoints without raw cannot be replay
+                            # hits.  Name that instead of an OfflineReplayMiss
+                            # on the first spec.
+                            from scrapers.sofascore.raw_store import RawPayloadNotFound
+
+                            for spec in remaining_specs.values():
+                                try:
+                                    capture_runtime.raw_store.load_bytes(spec.raw_target)
+                                except RawPayloadNotFound:
+                                    raise RuntimeError(
+                                        "partition was dropped by the planner (no "
+                                        "signed allocations); see "
+                                        "prepare_sofascore_target_plan stderr"
+                                    ) from None
                         # Unallocated targets may only be local replay hits.
                         pipeline_results.extend(
                             replay_event_specs(
