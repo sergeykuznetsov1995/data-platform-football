@@ -35,6 +35,7 @@ from scrapers.sofascore.raw_store import RawPayloadNotFound
 from scrapers.sofascore.scraper import SofaScoreScraper, _season_label
 from scrapers.sofascore.season_pipeline import (
     REFEREE_PROFILE_ENDPOINT,
+    SeasonPlanningError,
     plan_season_partition,
     squad_player_ids,
 )
@@ -434,16 +435,27 @@ def prepare_workload_plan(
             raise RuntimeError(
                 f"{item.league} {canonical} has no discovered SofaScore season"
             )
-        season_plan = plan_season_partition(
-            runtime.raw_store,
-            runtime.manifest_store,
-            source_tournament_id=tournament.unique_tournament_id,
-            source_season_id=source_season.season_id,
-            freshness_key=season_freshness,
-            event_freshness_key="final",
-            paid_proxy=True,
-            max_pages=max_pages,
-        )
+        drop_reason = None
+        try:
+            season_plan = plan_season_partition(
+                runtime.raw_store,
+                runtime.manifest_store,
+                source_tournament_id=tournament.unique_tournament_id,
+                source_season_id=source_season.season_id,
+                freshness_key=season_freshness,
+                event_freshness_key="final",
+                paid_proxy=True,
+                max_pages=max_pages,
+            )
+        except SeasonPlanningError as exc:
+            # A defect in ONE league's stored state (schema-rejected raw, a
+            # canonicalised referee without slug evidence #1081, an aggregate
+            # tournament past max_pages) must not cost every other league its
+            # plan — the 2026-08-20 shape one layer up. Only the planner's own
+            # verdict is isolated; config and Trino errors are systemic and
+            # still fail the phase.
+            season_plan = None
+            drop_reason = f"season planning failed: {exc}"
         # The class is keyed by the season's byte-driving shape, not by the
         # tournament: format comes from the discovered registry season, the
         # team-count band from competitions.yaml.  An unconfigured season raises
@@ -456,7 +468,11 @@ def prepare_workload_plan(
             ),
             max_pages_per_direction=max_pages,
         )
-        if phase == "season":
+        # Only leagues that actually reach this point are candidates for the
+        # plan: inactive competitions and leagues outside this week's rotation
+        # already skipped above and must not dilute the all-dropped guard.
+        considered_partitions += 1
+        if phase == "season" and season_plan is not None:
             workloads.append(
                 PartitionWorkload(
                     item.league,
@@ -471,26 +487,31 @@ def prepare_workload_plan(
                 )
             )
             continue
-        # Only leagues that actually reach this point are candidates for the
-        # plan: inactive competitions and leagues outside this week's rotation
-        # already skipped above and must not dilute the all-dropped guard.
-        considered_partitions += 1
-        # Two different signals, both required. Missing raw is "we never
-        # fetched it"; an incomplete plan is "we fetched it but the manifest
-        # never reached a terminal state" — the shape of a capture that died
-        # AFTER writing raw, which is exactly how a league fails in production.
-        # Referee profiles are captured with the season but are an attribute
-        # of the match, not season evidence, and they only become discoverable
-        # AFTER the match phase, so both phases use the referee-tolerant view
-        # of both signals (a profile stuck on 410/403 or a canonicalised id
-        # otherwise drops the league's matches every day).
-        blocking_missing = tuple(
-            key
-            for key in season_plan.missing_raw_keys
-            if key.endpoint != REFEREE_PROFILE_ENDPOINT
-        )
-        blocked = bool(blocking_missing) or not season_plan.match_phase_ready
-        if blocked:
+        if season_plan is not None:
+            # Two different signals, both required. Missing raw is "we never
+            # fetched it"; an incomplete plan is "we fetched it but the
+            # manifest never reached a terminal state" — the shape of a
+            # capture that died AFTER writing raw, which is exactly how a
+            # league fails in production. Referee profiles are captured with
+            # the season but are an attribute of the match, not season
+            # evidence, and they only become discoverable AFTER the match
+            # phase, so both phases use the referee-tolerant view of both
+            # signals (a profile stuck on 410/403 or a canonicalised id
+            # otherwise drops the league's matches every day).
+            blocking_missing = tuple(
+                key
+                for key in season_plan.missing_raw_keys
+                if key.endpoint != REFEREE_PROFILE_ENDPOINT
+            )
+            if blocking_missing:
+                drop_reason = f"{len(blocking_missing)} missing raw keys"
+            elif season_plan.player_universe_evidence_gaps:
+                drop_reason = "player universe evidence gaps: " + "; ".join(
+                    season_plan.player_universe_evidence_gaps
+                )
+            elif not season_plan.match_phase_ready:
+                drop_reason = "season manifest is not terminal"
+        if drop_reason is not None:
             # A league whose season raw is still incomplete simply has nothing
             # to capture yet — it resumes on the next run. Failing the phase
             # here made ONE stuck league cost every other league its details:
@@ -502,8 +523,7 @@ def prepare_workload_plan(
             incomplete_partitions.append(f"{item.league}={canonical}")
             print(
                 f"SofaScore {phase} plan drops {item.league} {canonical}: "
-                f"season raw is incomplete ({len(blocking_missing)} missing "
-                "keys, manifest not terminal)",
+                f"{drop_reason}",
                 file=sys.stderr,
             )
             workloads.append(

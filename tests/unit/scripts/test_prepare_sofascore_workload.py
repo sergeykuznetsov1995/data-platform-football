@@ -18,6 +18,7 @@ from dags.scripts.prepare_sofascore_workload import (
 from scrapers.sofascore.manifest import ManifestKey
 from scrapers.sofascore.season_pipeline import (
     SeasonPartitionPlan,
+    SeasonPlanningError,
     build_referee_profile_spec,
 )
 from scrapers.sofascore.workload_plan import (
@@ -848,6 +849,122 @@ def test_target_phase_keeps_a_league_whose_only_gap_is_a_referee_profile(
     match_allocations = [item for item in signed.allocations if item.scope == "match"]
     assert len(match_allocations) == 1
     assert sorted(target_ids(match_allocations[0]), key=int) == ["1", "2", "3"]
+
+
+def _two_league_plan(tmp_path, phase, season_plans, capsys):
+    """Sign a ``phase`` plan for two leagues whose season plans (or planning
+    errors) are ``season_plans``; returns (signed plan, stderr)."""
+    patches = _common_patches(_season_plan())
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patch(
+            "dags.scripts.prepare_sofascore_workload.plan_season_partition",
+            side_effect=season_plans,
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._finished_match_ids",
+            return_value={"1", "2", "3"},
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._pending_targets",
+            side_effect=lambda _runtime, ids, _builder: tuple(sorted(ids, key=int)),
+        ),
+    ):
+        path = prepare_workload_plan(
+            dag_id="dag_ingest_sofascore",
+            base_run_id="scheduled-1",
+            phase=phase,
+            competition_seasons=[
+                CompetitionSeason("ENG-Premier League", "2526"),
+                CompetitionSeason("ESP-La Liga", "2526"),
+            ],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=tmp_path / f"{phase}-plan.json",
+        )
+    return load_plan(path, control_token=TOKEN), capsys.readouterr().err
+
+
+def test_target_phase_isolates_a_league_whose_planning_fails(
+    tmp_path, monkeypatch, capsys
+):
+    """C4: isolation covered only the 'incomplete' signal. A SeasonPlanningError
+    for ONE league (schema-rejected stored raw, a canonicalised referee without
+    slug evidence #1081, an aggregate tournament past max_pages) still took the
+    plan of EVERY league down — the 2026-08-20 shape one layer up. The league
+    is dropped with its real cause on stderr; its neighbours are signed.
+    """
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+
+    signed, stderr = _two_league_plan(
+        tmp_path,
+        "targets",
+        [SeasonPlanningError("stored schema rejected for season-key"), _season_plan()],
+        capsys,
+    )
+
+    match_allocations = [item for item in signed.allocations if item.scope == "match"]
+    assert len(match_allocations) == 1, [item.task_id for item in match_allocations]
+    assert (
+        "drops ENG-Premier League 2526: season planning failed: "
+        "stored schema rejected for season-key"
+    ) in stderr
+
+
+def test_season_phase_isolates_a_league_whose_planning_fails(
+    tmp_path, monkeypatch, capsys
+):
+    """The season phase plans from the same stored state, so the same defect
+    must drop only its own league there too (its runner then fails alone with
+    the real cause); the healthy league keeps its season allocation."""
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+
+    signed, stderr = _two_league_plan(
+        tmp_path,
+        "season",
+        [SeasonPlanningError("exceeded max_pages=50"), _season_plan("schedule_last")],
+        capsys,
+    )
+
+    assert [item.scope for item in signed.allocations] == ["season"]
+    assert "season planning failed: exceeded max_pages=50" in stderr
+
+
+def test_season_phase_still_fails_when_planning_fails_for_every_league(
+    tmp_path, monkeypatch, capsys
+):
+    """Dropping must not turn a systemic outage into an empty green plan."""
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+
+    with pytest.raises(RuntimeError, match="every SofaScore partition"):
+        _two_league_plan(
+            tmp_path,
+            "season",
+            [SeasonPlanningError("first"), SeasonPlanningError("second")],
+            capsys,
+        )
+
+
+def test_dropped_league_diagnostics_name_the_real_cause(
+    tmp_path, monkeypatch, capsys
+):
+    """№9: the drop message was hard-wired to 'season raw is incomplete (N
+    missing keys…)' even when the cause was a player-universe evidence gap."""
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    gap = "scheduled/participating team 42 has no usable squad evidence"
+
+    signed, stderr = _two_league_plan(
+        tmp_path,
+        "targets",
+        [_season_plan(evidence_gaps=(gap,)), _season_plan()],
+        capsys,
+    )
+
+    assert len([item for item in signed.allocations if item.scope == "match"]) == 1
+    assert (
+        f"drops ENG-Premier League 2526: player universe evidence gaps: {gap}"
+    ) in stderr
 
 
 def test_target_phase_still_fails_when_every_league_is_incomplete(
