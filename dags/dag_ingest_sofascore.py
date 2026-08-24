@@ -960,10 +960,16 @@ def _gate_player_capture(**context) -> bool:
     # (2026-08-20: gate_player_capture failed on Thursday because the match
     # phase had cascaded). The protection itself is unchanged for the runs it
     # was written for: a Saturday or forced capture still refuses to build a
-    # player universe on top of a broken match phase.
+    # player universe on top of a broken match phase — of the leagues it will
+    # actually capture. A league the weekly rotation (#946 4d) leaves out spends
+    # nothing this run, so its dead match capture must not block the cohort
+    # that does; the DagRun still goes red through propagate_ingest_status.
     _require_successful_producers(
         context,
-        [_match_capture_task_id(league) for league in SOFASCORE_LEAGUES],
+        [
+            _match_capture_task_id(league)
+            for league in sorted(_due_player_leagues(context))
+        ],
     )
     logger.info(decision)
     return True

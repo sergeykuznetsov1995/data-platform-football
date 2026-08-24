@@ -788,10 +788,13 @@ class TestPlayerCaptureGate:
         )
 
     @staticmethod
-    def _dag_run_with_failed_producer(dag_module, **fields):
-        """DagRun stand-in whose first match capture did NOT succeed."""
+    def _dag_run_with_failed_producer(dag_module, league=None, **fields):
+        """DagRun stand-in whose match capture of ``league`` (default: the
+        first configured league) did NOT succeed."""
 
-        failing = dag_module._match_capture_task_id(dag_module.SOFASCORE_LEAGUES[0])
+        failing = dag_module._match_capture_task_id(
+            league or dag_module.SOFASCORE_LEAGUES[0]
+        )
 
         def get_task_instance(task_id):
             state = "upstream_failed" if task_id == failing else "success"
@@ -820,11 +823,15 @@ class TestPlayerCaptureGate:
     def test_saturday_still_refuses_to_spend_on_a_failed_producer(self, dag_module):
         """The protection itself stays: a run that WILL spend paid bytes on the
         player universe must not start from a broken match phase."""
+        # A cup is never rotated out of the weekly cohort, so its dead capture
+        # is demanded on every Saturday regardless of the rotation modulus.
         with pytest.raises(Exception, match="Required SofaScore producer"):
             dag_module._gate_player_capture(
                 params={},
                 dag_run=self._dag_run_with_failed_producer(
-                    dag_module, external_trigger=False
+                    dag_module,
+                    league=dag_module.TOURNAMENT_LEAGUES[0],
+                    external_trigger=False,
                 ),
                 logical_date=datetime(2024, 1, 6),  # Saturday
             )
@@ -838,6 +845,51 @@ class TestPlayerCaptureGate:
                     dag_module, external_trigger=False
                 ),
                 logical_date=datetime(2024, 1, 1),
+            )
+
+    def _rotation_split(self, dag_module, monkeypatch):
+        """A real cohort split on the shipped scope: (due, not due) club leagues."""
+        monkeypatch.setenv("SOFASCORE_PLAYER_ROTATION_MODULUS", "2")
+        monkeypatch.setenv("SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES", "1")
+        context = {
+            "params": {},
+            "dag_run": SimpleNamespace(external_trigger=False),
+            "logical_date": datetime(2024, 1, 6),  # Saturday
+        }
+        due = dag_module._due_player_leagues(context)
+        clubs = dag_module.CLUB_LEAGUES
+        in_cohort = [lg for lg in clubs if lg in due]
+        out_of_cohort = [lg for lg in clubs if lg not in due]
+        assert in_cohort and out_of_cohort
+        return in_cohort[0], out_of_cohort[0]
+
+    def test_saturday_demands_only_the_due_cohort(self, dag_module, monkeypatch):
+        """#946 4d: a league the weekly rotation leaves out spends nothing this
+        Saturday, so its dead match capture must not block the cohort that
+        does run (the DagRun still goes red through propagate_ingest_status)."""
+        _, not_due = self._rotation_split(dag_module, monkeypatch)
+        assert (
+            dag_module._gate_player_capture(
+                params={},
+                dag_run=self._dag_run_with_failed_producer(
+                    dag_module, league=not_due, external_trigger=False
+                ),
+                logical_date=datetime(2024, 1, 6),  # Saturday
+            )
+            is True
+        )
+
+    def test_saturday_still_refuses_a_failed_producer_in_the_cohort(
+        self, dag_module, monkeypatch
+    ):
+        due, _ = self._rotation_split(dag_module, monkeypatch)
+        with pytest.raises(Exception, match="Required SofaScore producer"):
+            dag_module._gate_player_capture(
+                params={},
+                dag_run=self._dag_run_with_failed_producer(
+                    dag_module, league=due, external_trigger=False
+                ),
+                logical_date=datetime(2024, 1, 6),  # Saturday
             )
 
     def test_saturday_master_trigger_runs_weekly_capture(self, dag_module):
