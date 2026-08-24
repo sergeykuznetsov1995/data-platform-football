@@ -1753,3 +1753,36 @@ def test_lease_traffic_reports_the_429_delta_of_this_lease_only(tmp_path):
     assert before["http_429"] == 1
     assert traffic["http_429"] == 2
     assert _zero_traffic()["http_429"] == 0
+
+
+def test_wrapping_transport_without_lease_lost_flag_captures_normally(tmp_path):
+    # The paid canary wraps the production adapter in a recorder that does not
+    # expose ``lease_lost`` (bench_sofascore_paid_canary.RecordingCanaryTransport);
+    # the batch loop must treat a missing flag as "lease not lost", not crash.
+    runtime, _ = _runtime(tmp_path)
+    client = _LeaseClient([0, 0, 100, 100, 250], final_total=250)
+    capture = _Capture(
+        [_record(b'{"items":[{"id":1}]}'), _record(b'{"items":[{"id":2}]}')]
+    )
+
+    class _WrappingFactory(_TransportFactory):
+        def __call__(self, engine, **kwargs):
+            transport = super().__call__(engine, **kwargs)
+            del transport.lease_lost
+            return transport
+
+    factory = _WrappingFactory(client, capture)
+
+    results, traffic = capture_live_specs(
+        runtime,
+        [_spec(1, "event"), _spec(2, "lineups")],
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="ENG-Premier League:2526",
+        entity="match_capture",
+        transport_factory=factory,
+    )
+
+    assert len(results) == 2
+    assert factory.calls == client.close_calls == 1
+    assert traffic["paid_proxy_bytes"] == 250
+    assert traffic["lease_relaunches"] == 0

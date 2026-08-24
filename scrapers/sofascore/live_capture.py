@@ -1088,7 +1088,10 @@ def capture_live_specs(
             engine.transport = transport
             while pending:
                 result = engine.capture(pending[0])
-                if transport.lease_lost and not relaunches:
+                # A wrapping transport (the paid canary's recorder) delegates
+                # to the production adapter without exposing the flag; it
+                # never re-leases, so a missing attribute means "not lost".
+                if getattr(transport, "lease_lost", None) and not relaunches:
                     raise _LeaseLost(
                         transport.lease_lost, transport.provider_snapshot()
                     )
