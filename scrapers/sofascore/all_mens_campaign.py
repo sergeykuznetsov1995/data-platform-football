@@ -118,8 +118,16 @@ def load_exact_scope(
     source_season_id: int,
     expected_snapshot_id: str | None = None,
     expected_campaign_id: str | None = None,
+    allow_pending_season: bool = False,
 ) -> dict[str, Any]:
-    """Load one ready tournament-season and bind it to the snapshot digest."""
+    """Load one ready tournament-season and bind it to the snapshot digest.
+
+    ``allow_pending_season`` admits a season whose metadata is still
+    ``pending`` (no team pages, hence no ``team_count``/evidence): the refresh
+    lane plans its matches from Bronze schedule evidence instead of season
+    pages.  Tournament classification and eligibility checks stay as strict as
+    for the history campaign; an ``excluded`` season is never admitted.
+    """
 
     path = Path(snapshot_path)
     try:
@@ -192,16 +200,24 @@ def load_exact_scope(
             f"snapshot must contain exactly one source season {wanted_season}"
         )
     season = season_matches[0]
-    if season.get("metadata_status") != "ready":
+    pending = allow_pending_season and season.get("metadata_status") == "pending"
+    if season.get("metadata_status") != "ready" and not pending:
         raise CampaignScopeError("season metadata_status must be ready")
-    team_count = _positive_int(season.get("team_count"), "team_count")
+    team_count = season.get("team_count")
     evidence = season.get("team_count_evidence")
-    if (
-        not isinstance(evidence, Mapping)
-        or evidence.get("count") != team_count
-        or not str(evidence.get("endpoint") or "").strip()
-    ):
-        raise CampaignScopeError("team_count evidence is missing or inconsistent")
+    if pending and team_count is None:
+        evidence = None
+    else:
+        team_count = _positive_int(team_count, "team_count")
+        if (
+            not isinstance(evidence, Mapping)
+            or evidence.get("count") != team_count
+            or not str(evidence.get("endpoint") or "").strip()
+        ):
+            raise CampaignScopeError(
+                "team_count evidence is missing or inconsistent"
+            )
+        evidence = dict(evidence)
     canonical = str(season.get("canonical_season") or "").strip()
     if not canonical or not canonical.isdigit():
         raise CampaignScopeError("canonical_season must be numeric")
@@ -230,7 +246,7 @@ def load_exact_scope(
         "canonical_season": canonical,
         "season_format": season_format,
         "team_count": team_count,
-        "team_count_evidence": dict(evidence),
+        "team_count_evidence": evidence,
     }
     if not scope["name"] or not scope["slug"] or not scope["page_path"]:
         raise CampaignScopeError("tournament identity metadata is incomplete")
@@ -238,6 +254,9 @@ def load_exact_scope(
         raise CampaignScopeError("tournament kind must be league or cup")
     scope["scope_digest"] = _scope_digest(scope)
     return scope
+
+
+PENDING_SEASON_TEAM_COUNT = 1
 
 
 def _atomic_write(path: Path, payload: bytes) -> None:
@@ -277,7 +296,9 @@ def render_scope_overlays(
     source_season_id = _positive_int(
         scope.get("source_season_id"), "source_season_id"
     )
-    team_count = _positive_int(scope.get("team_count"), "team_count")
+    team_count = scope.get("team_count")
+    if team_count is not None:
+        team_count = _positive_int(team_count, "team_count")
     canonical = str(scope.get("canonical_season") or "")
     season_format = str(scope.get("season_format") or "")
     source_name = str(scope.get("source_name") or canonical)
@@ -331,12 +352,25 @@ def render_scope_overlays(
                     "endpoint": f"/unique-tournament/{tournament_id}/seasons",
                     "value": str(scope["snapshot_id"]),
                 }],
-                "team_count": team_count,
-                "team_count_evidence": dict(scope["team_count_evidence"]),
+                **(
+                    {
+                        "team_count": team_count,
+                        "team_count_evidence": dict(scope["team_count_evidence"]),
+                    }
+                    if team_count is not None
+                    else {}
+                ),
             }],
         }],
     }
     is_cup = scope.get("kind") == "cup"
+    if team_count is None:
+        # A pending season has no team pages yet, but competitions.yaml
+        # demands a positive team_count (a DQ-floor invariant the campaign
+        # overlay never consumes).  The placeholder sits below the measured
+        # band grid, so page-evidence planning of such a season fails closed
+        # in team_count_band() instead of authorizing an unmeasured class.
+        team_count = PENDING_SEASON_TEAM_COUNT
     season_config: dict[str, Any] = {
         "id": int(canonical),
         "season_format": season_format,

@@ -12,9 +12,18 @@ from scrapers.sofascore.all_mens_campaign import (
     render_scope_overlays,
 )
 from scrapers.sofascore.catalog import SofaScoreCatalog
+from scrapers.sofascore.workload_plan import WorkloadPlanError, team_count_band
+from utils.medallion_config import _validate_competitions_schema
 
 
-def _snapshot(*, team_count=20, gender="male", metadata_status="ready"):
+def _snapshot(
+    *,
+    team_count=20,
+    gender="male",
+    metadata_status="ready",
+    season_metadata_status=None,
+    kind="league",
+):
     document = {
         "schema_version": 1,
         "candidate_count": 1,
@@ -27,7 +36,7 @@ def _snapshot(*, team_count=20, gender="male", metadata_status="ready"):
             "slug": "premier-league",
             "page_path": "football/england/premier-league",
             "category": {"id": 1, "name": "England", "slug": "england"},
-            "kind": "league",
+            "kind": kind,
             "metadata_status": metadata_status,
             "classification": {
                 "sport": "football",
@@ -60,13 +69,13 @@ def _snapshot(*, team_count=20, gender="male", metadata_status="ready"):
                 "season_format": "split_year",
                 "start_year": 2025,
                 "team_count": team_count,
-                "metadata_status": metadata_status,
+                "metadata_status": season_metadata_status or metadata_status,
                 "team_count_evidence": {
                     "type": "source_team_ids",
                     "endpoint": "/unique-tournament/17/season/76986/teams",
                     "count": team_count,
                     "team_ids_sha256": "a" * 64,
-                },
+                } if team_count is not None else None,
             }],
         }],
     }
@@ -141,3 +150,88 @@ def test_scope_overlays_are_single_tournament_and_catalog_valid(tmp_path):
     season = competitions["competitions"][0]["seasons"][0]
     assert season["id"] == 2526
     assert season["team_count"] == 20
+
+
+def _pending_snapshot(tmp_path, **kwargs):
+    document = _snapshot(
+        team_count=None, season_metadata_status="pending", **kwargs
+    )
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text(json.dumps(document), encoding="utf-8")
+    return snapshot
+
+
+@pytest.mark.unit
+def test_pending_season_is_refused_unless_the_refresh_lane_allows_it(tmp_path):
+    # The history campaign only ever pays for a season whose team pages were
+    # fetched; the refresh lane (F2) plans matches from Bronze evidence and is
+    # the only caller allowed to take a pending season.
+    snapshot = _pending_snapshot(tmp_path)
+
+    with pytest.raises(CampaignScopeError, match="metadata_status must be ready"):
+        load_exact_scope(snapshot, tournament_id=17, source_season_id=76986)
+
+    scope = load_exact_scope(
+        snapshot,
+        tournament_id=17,
+        source_season_id=76986,
+        allow_pending_season=True,
+    )
+
+    assert scope["capture_key"] == "SS-17"
+    assert scope["canonical_season"] == "2526"
+    assert scope["team_count"] is None
+    assert scope["team_count_evidence"] is None
+    assert len(scope["scope_digest"]) == 64
+
+
+@pytest.mark.unit
+def test_excluded_season_stays_refused_even_for_the_refresh_lane(tmp_path):
+    document = _snapshot(team_count=None, season_metadata_status="excluded")
+    snapshot = tmp_path / "snapshot.json"
+    snapshot.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(CampaignScopeError, match="metadata_status must be ready"):
+        load_exact_scope(
+            snapshot,
+            tournament_id=17,
+            source_season_id=76986,
+            allow_pending_season=True,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("kind", ["league", "cup"])
+def test_pending_season_overlays_carry_no_team_count_and_fail_closed_on_pages(
+    tmp_path, kind
+):
+    snapshot = _pending_snapshot(tmp_path, kind=kind)
+    scope = load_exact_scope(
+        snapshot,
+        tournament_id=17,
+        source_season_id=76986,
+        allow_pending_season=True,
+    )
+
+    paths = render_scope_overlays(scope, tmp_path / "scope")
+
+    # The registry overlay keeps the source season id (the match phase needs
+    # it for its specs) but claims no team count it never measured.
+    catalog = SofaScoreCatalog.load(paths.registry_path)
+    season = catalog.resolve_source_season(17, "2526")
+    assert season.season_id == 76986
+    assert season.team_count is None
+    registry_season = json.loads(paths.registry_path.read_text())[
+        "tournaments"
+    ][0]["seasons"][0]
+    assert "team_count" not in registry_season
+    assert "team_count_evidence" not in registry_season
+    # The medallion overlay must still load (season_format drives the Bronze
+    # partition label), yet its team count must not map onto any measured
+    # band: page-evidence planning of a pending season fails closed.
+    competitions = yaml.safe_load(paths.competitions_path.read_text())
+    _validate_competitions_schema(competitions)
+    season_config = competitions["competitions"][0]["seasons"][0]
+    assert season_config["season_format"] == "split_year"
+    with pytest.raises(WorkloadPlanError, match="outside the measured"):
+        team_count_band(season_config["team_count"])
