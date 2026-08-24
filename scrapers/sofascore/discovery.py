@@ -938,6 +938,14 @@ class LeaseBrowserSofaScoreClient:
         return self._capture
 
     def get_json(self, path: str) -> Mapping[str, Any]:
+        return self.get_json_bytes(path)[1]
+
+    def get_json_bytes(self, path: str) -> tuple[bytes, Mapping[str, Any]]:
+        """Return the exact response body with its parsed JSON object.
+
+        The bytes are the browser's ``Response.body`` as received, so a raw
+        store can keep them as the source's own answer.
+        """
         clean_path = "/" + str(path).lstrip("/")
         if "://" in clean_path or ".." in clean_path.split("/"):
             raise ValueError("discovery path must be a relative API path")
@@ -994,7 +1002,12 @@ class LeaseBrowserSofaScoreClient:
                     raise DiscoverySchemaError(
                         f"JSON root from {clean_path} must be an object"
                     )
-                return payload
+                body = record.get("body")
+                if not isinstance(body, (bytes, bytearray)):
+                    raise DiscoveryHTTPError(
+                        f"metered browser response has no exact bytes: {clean_path}"
+                    )
+                return bytes(body), payload
 
             error = DiscoveryHTTPError(
                 f"metered browser request failed: HTTP {status} {clean_path}",

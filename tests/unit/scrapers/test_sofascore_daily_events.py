@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 from datetime import date
 from pathlib import Path
 
@@ -12,6 +14,7 @@ from pyarrow import fs
 from dags.utils.sofascore_dq import SofaScoreDQViolation
 from scrapers.sofascore.daily_events import (
     SCHEDULED_EVENTS_ENDPOINT,
+    DailyEventsSchemaError,
     fetch_daily_events,
     schedule_rows_from_events,
 )
@@ -132,13 +135,21 @@ def _daily_payloads() -> dict[str, dict]:
 
 
 class _Client:
+    """Metered browser client stub: the wire bytes are NOT the canonical dump."""
+
     def __init__(self, payloads):
         self.payloads = payloads
         self.paths: list[str] = []
 
+    def body(self, path) -> bytes:
+        return json.dumps(self.payloads[path], indent=1).encode("utf-8")
+
     def get_json(self, path):
         self.paths.append(path)
         return self.payloads[path]
+
+    def get_json_bytes(self, path):
+        return self.body(path), self.get_json(path)
 
 
 def _store(tmp_path):
@@ -176,6 +187,31 @@ def test_fetch_stores_every_daily_list_and_returns_events_with_lineage(tmp_path)
     assert record.content_hash == first.content_hash
 
 
+def test_fetch_keeps_the_exact_response_bytes_as_raw_evidence(tmp_path):
+    # Coverage contract: raw lineage is the HTTP body as received, so the
+    # blob and its content hash witness the source answer byte for byte.
+    payloads = _daily_payloads()
+    client = _Client(payloads)
+    store = _store(tmp_path)
+
+    fetched = fetch_daily_events(client, [date(2026, 8, 23)], store)
+
+    path = "/sport/football/scheduled-events/2026-08-23"
+    body, record = store.load_bytes(
+        PayloadTarget(
+            source_tournament_id="0",
+            source_season_id="0",
+            target_type="date",
+            target_id="2026-08-23",
+            endpoint=SCHEDULED_EVENTS_ENDPOINT,
+            freshness_key="daily",
+        )
+    )
+    assert body == client.body(path)
+    assert record.content_hash == fetched[0].raw.content_hash
+    assert record.content_hash == hashlib.sha256(client.body(path)).hexdigest()
+
+
 def test_fetch_rejects_a_list_without_events_after_keeping_the_raw_evidence(
     tmp_path,
 ):
@@ -209,11 +245,14 @@ def test_rows_keep_ready_snapshot_tournaments_only_and_tag_league_season(
         fetched, SNAPSHOT, exclude_leagues={CONFIGURED_TOURNAMENT}
     )
 
+    # Out of scope (excluded): the configured league (2), the tournament the
+    # snapshot does not know (4) and the excluded-status tournament (5).
     assert counters == {
         "events": 7,
         "matched": 3,
-        "excluded": 1,
+        "excluded": 3,
         "unknown_seasons": 1,
+        "malformed": 0,
     }
     assert [(row["game_id"], row["league"], row["season"]) for row in rows] == [
         (1, "SS-7", "2627"),
@@ -248,3 +287,60 @@ def test_rows_reject_skeleton_events(tmp_path):
 
     with pytest.raises(SofaScoreDQViolation, match="skeleton"):
         schedule_rows_from_events(fetched, SNAPSHOT, exclude_leagues=())
+
+
+def test_rows_reject_events_whose_tournament_or_season_shape_drifted(tmp_path):
+    # Schema drift must not masquerade as "foreign tournaments": an event
+    # without tournament.uniqueTournament.id / season.id / id is malformed and
+    # fails the run (the raw list is already kept), never dropped silently.
+    first, second = _fixture_events()
+    renamed = _event(first, event_id=11, tournament_id=READY_TOURNAMENT,
+                     season_id=76953)
+    renamed["tournament"] = {"unique_tournament": {"id": READY_TOURNAMENT}}
+    no_season = _event(second, event_id=12, tournament_id=READY_TOURNAMENT,
+                       season_id=76953)
+    no_season.pop("season")
+    fine = _event(first, event_id=13, tournament_id=READY_TOURNAMENT,
+                  season_id=76953)
+    client = _Client({
+        "/sport/football/scheduled-events/2026-08-24": {
+            "events": [renamed, no_season, fine]
+        },
+        "/sport/football/scheduled-events/2026-08-24/inverse": {"events": []},
+    })
+    fetched = fetch_daily_events(client, [date(2026, 8, 24)], _store(tmp_path))
+
+    with pytest.raises(DailyEventsSchemaError, match="2 of 3"):
+        schedule_rows_from_events(fetched, SNAPSHOT, exclude_leagues=())
+
+
+def test_rows_warn_when_no_event_is_in_scope(tmp_path, caplog):
+    # A day where every event belongs to configured/foreign tournaments is a
+    # legitimate empty result, but "green and empty" must be visible in logs.
+    first, second = _fixture_events()
+    client = _Client({
+        "/sport/football/scheduled-events/2026-08-24": {
+            "events": [
+                _event(first, event_id=21, tournament_id=CONFIGURED_TOURNAMENT,
+                       season_id=76986),
+                _event(second, event_id=22, tournament_id=FOREIGN_TOURNAMENT,
+                       season_id=1),
+            ]
+        },
+        "/sport/football/scheduled-events/2026-08-24/inverse": {"events": []},
+    })
+    fetched = fetch_daily_events(client, [date(2026, 8, 24)], _store(tmp_path))
+
+    with caplog.at_level(logging.WARNING, logger="scrapers.sofascore.daily_events"):
+        rows, counters = schedule_rows_from_events(
+            fetched, SNAPSHOT, exclude_leagues={CONFIGURED_TOURNAMENT}
+        )
+
+    assert rows == []
+    assert counters["events"] == counters["excluded"] == 2
+    assert counters["matched"] == 0
+    assert any(
+        "no daily event matched" in record.getMessage()
+        and "'excluded': 2" in record.getMessage()
+        for record in caplog.records
+    )

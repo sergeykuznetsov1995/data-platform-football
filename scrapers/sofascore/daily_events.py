@@ -9,14 +9,13 @@ events of ready campaign tournaments and writes them as schedule rows tagged
 existing match phase can pick finished matches straight from Bronze.
 
 Every list is fetched through the metered discovery client (source
-``sofascore_discovery``) and kept in the raw store first; the exact wire bytes
-are not available from a browser capture, so the stored body is the canonical
-JSON re-serialization of the parsed payload.
+``sofascore_discovery``) and kept in the raw store first, as the exact
+response bytes the browser received.
 """
 
 from __future__ import annotations
 
-import json
+import logging
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Collection, Iterable, Mapping, Optional
@@ -31,6 +30,8 @@ from scrapers.sofascore.raw_store import (
 )
 
 
+log = logging.getLogger(__name__)
+
 SCHEDULED_EVENTS_ENDPOINT = "scheduled_events"
 SCHEDULED_EVENTS_TARGET_TYPE = "date"
 SCHEDULED_EVENTS_FRESHNESS_KEY = "daily"
@@ -38,6 +39,10 @@ SCHEDULED_EVENTS_FRESHNESS_KEY = "daily"
 # needs both source ids, so they are pinned to the "no tournament" sentinel.
 _NO_TOURNAMENT_ID = "0"
 _REQUEST_BASE_URL = "https://www.sofascore.com/api/v1"
+
+
+class DailyEventsSchemaError(DiscoverySchemaError):
+    """Daily events no longer carry the tournament/season/id shape we map."""
 
 
 @dataclass(frozen=True)
@@ -59,19 +64,16 @@ def scheduled_events_paths(day: date) -> tuple[tuple[str, str], ...]:
 def fetch_daily_events(
     client: Any, dates: Iterable[date], raw_store: RawPayloadStore
 ) -> list[FetchedEvent]:
-    """Fetch every daily list via ``client.get_json`` and keep it in the raw store.
+    """Fetch every daily list via ``client.get_json_bytes`` into the raw store.
 
-    The payload is stored before it is validated so a schema surprise from the
-    source leaves replayable evidence behind.
+    The exact response bytes are stored before the payload is validated so a
+    schema surprise from the source leaves replayable evidence behind.
     """
 
     fetched: list[FetchedEvent] = []
     for day in dates:
         for path, target_id in scheduled_events_paths(day):
-            payload = client.get_json(path)
-            body = json.dumps(
-                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
+            body, payload = client.get_json_bytes(path)
             record = raw_store.store_bytes(
                 PayloadTarget(
                     source_tournament_id=_NO_TOURNAMENT_ID,
@@ -135,29 +137,40 @@ def schedule_rows_from_events(
     """Turn daily events into schedule rows for ready snapshot tournaments.
 
     ``exclude_leagues`` holds the source ``unique_tournament_id`` values of the
-    configured leagues that the daily ingest already covers.  Events of
-    tournaments absent from the snapshot are dropped silently (other sports'
-    genders, youth, amateur); a ``season.id`` the snapshot does not know yet is
-    counted in ``unknown_seasons`` for the metadata wave to pick up.  A game
-    listed more than once (D-1 and D lists overlap across time zones) keeps
-    its last, freshest copy.
+    configured leagues that the daily ingest already covers.  Those events and
+    the ones of tournaments absent from the snapshot (other genders, youth,
+    amateur) are out of scope and counted in ``excluded``; a ``season.id`` the
+    snapshot does not know yet is counted in ``unknown_seasons`` for the
+    metadata wave to pick up.  An event without ``id``,
+    ``tournament.uniqueTournament.id`` or ``season.id`` is ``malformed``: that
+    is schema drift, not a foreign tournament, and fails the day (the raw list
+    is already kept).  A game listed more than once (D-1 and D lists overlap
+    across time zones) keeps its last, freshest copy.
     """
 
     index = _snapshot_index(snapshot)
     excluded_ids = {int(value) for value in exclude_leagues}
-    counters = {"events": 0, "matched": 0, "excluded": 0, "unknown_seasons": 0}
+    counters = {
+        "events": 0,
+        "matched": 0,
+        "excluded": 0,
+        "unknown_seasons": 0,
+        "malformed": 0,
+    }
     rows_by_game: dict[int, dict] = {}
     for item in events:
         counters["events"] += 1
+        event_id = _nested_int(item.event, "id")
         tournament_id = _nested_int(item.event, "tournament", "uniqueTournament", "id")
-        if tournament_id in excluded_ids:
+        season_id = _nested_int(item.event, "season", "id")
+        if event_id is None or tournament_id is None or season_id is None:
+            counters["malformed"] += 1
+            continue
+        entry = None if tournament_id in excluded_ids else index.get(tournament_id)
+        if entry is None:
             counters["excluded"] += 1
             continue
-        entry = index.get(tournament_id)
-        if entry is None:
-            continue
         capture_key, seasons = entry
-        season_id = _nested_int(item.event, "season", "id")
         canonical_season = seasons.get(season_id)
         if canonical_season is None:
             counters["unknown_seasons"] += 1
@@ -179,6 +192,17 @@ def schedule_rows_from_events(
         )
         rows_by_game[row["game_id"]] = row
         counters["matched"] += 1
+    if counters["malformed"]:
+        raise DailyEventsSchemaError(
+            f"{counters['malformed']} of {counters['events']} daily events lack "
+            f"id, tournament.uniqueTournament.id or season.id: {counters}"
+        )
+    if counters["events"] and not counters["matched"]:
+        # Legitimate (a day of configured/foreign tournaments only), but a
+        # "green and empty" outcome must be visible.
+        log.warning(
+            "no daily event matched a ready campaign tournament: %s", counters
+        )
     rows = list(rows_by_game.values())
     validate_schedule_rows(rows).require()
     return rows, counters

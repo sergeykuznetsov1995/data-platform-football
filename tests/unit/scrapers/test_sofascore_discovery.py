@@ -1060,6 +1060,28 @@ def _browser_client(records, **kwargs):
 
 
 @pytest.mark.unit
+def test_browser_lease_transport_returns_exact_response_bytes_with_the_json():
+    # Raw-store lineage needs the HTTP body as the browser received it, not a
+    # re-serialization of the parsed object (spacing here is the witness).
+    client, _, _ = _browser_client([
+        {
+            "status": 200,
+            "json": {"events": []},
+            "challenge": False,
+            "body": b'{ "events" : [ ] }',
+        },
+        {"status": 200, "json": {"events": []}, "challenge": False},
+    ])
+
+    assert client.get_json_bytes("/sport/football/scheduled-events/2026-08-24") == (
+        b'{ "events" : [ ] }',
+        {"events": []},
+    )
+    with pytest.raises(DiscoveryHTTPError, match="no exact bytes"):
+        client.get_json_bytes("/sport/football/scheduled-events/2026-08-25")
+
+
+@pytest.mark.unit
 def test_browser_lease_transport_warms_once_and_fetches_exact_json_only():
     client, provider, captures = _browser_client([
         {
