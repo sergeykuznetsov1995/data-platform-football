@@ -333,3 +333,12 @@ def test_batch_traffic_merge_sums_lease_relaunches():
         ]
     )
     assert merged["lease_relaunches"] == 2
+def test_batch_traffic_merge_sums_source_429_counts():
+    merged = _merge_live_traffic(
+        [
+            {"provider_total_bytes": 0, "http_429": 1},
+            {"provider_total_bytes": 0, "http_429": 2},
+            {"provider_total_bytes": 0},
+        ]
+    )
+    assert merged["http_429"] == 3

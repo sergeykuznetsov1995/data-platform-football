@@ -14,6 +14,8 @@ from scrapers.sofascore.capture_engine import (
 )
 from scrapers.sofascore.live_capture import (
     LeaseBackedCamoufoxTransport,
+    _live_traffic,
+    _zero_traffic,
     capture_live_dynamic_specs,
     capture_live_specs,
     hash_proxy_exit,
@@ -1607,3 +1609,19 @@ def test_lease_lost_at_close_after_the_last_spec_keeps_the_results(
     assert sleeps == []
     assert traffic["lease_relaunches"] == 0
     assert traffic["provider_total_bytes"] == traffic["paid_proxy_bytes"] == 100
+def test_lease_traffic_reports_the_429_delta_of_this_lease_only(tmp_path):
+    runtime, _ = _runtime(tmp_path)
+    engine = runtime.engine
+    engine.metrics.source_rate_limited()
+    before = engine.metrics.snapshot()
+    engine.metrics.source_rate_limited()
+    engine.metrics.source_rate_limited()
+    transport = SimpleNamespace(
+        provider_snapshot=lambda: {"provider_total_bytes": 0}
+    )
+
+    traffic = _live_traffic(engine, before, transport)
+
+    assert before["http_429"] == 1
+    assert traffic["http_429"] == 2
+    assert _zero_traffic()["http_429"] == 0

@@ -28,6 +28,7 @@ from scrapers.sofascore.manifest import (
     ManifestStore,
     utc_now_iso,
 )
+from scrapers.sofascore.rate_control import production_rate_limiter
 from scrapers.sofascore.raw_store import PayloadTarget, RawPayloadStore
 from scrapers.sofascore.workload_plan import allocation_budget_bytes
 from scripts.proxy_filter.budget import (
@@ -178,6 +179,7 @@ def build_capture_runtime(
         run_id=run_id,
         task_id=task_id,
         budget=budget,
+        rate_limiter=production_rate_limiter(os.environ),
         max_workers=max(1, int(os.environ.get('SOFASCORE_MAX_CONCURRENCY', '4'))),
     )
     return CaptureRuntime(engine, manifest_store, raw_store, budget_error)

@@ -31,9 +31,14 @@ from scripts.proxy_filter.budget import (
 class UnlimitedLimiter:
     def __init__(self):
         self.calls = 0
+        self.fallbacks = 0
 
     def acquire(self):
         self.calls += 1
+        return True
+
+    def fallback(self):
+        self.fallbacks += 1
         return True
 
 
@@ -252,6 +257,59 @@ def test_retryable_http_errors_never_commit_success(tmp_path, status):
     assert result.manifest.attempts == 3
     assert limiter.calls == 3  # rate limit is applied to every actual request
     assert sleeps == [1, 2]
+
+
+@pytest.mark.parametrize(
+    ("status", "fallbacks"),
+    [(429, 1), (403, 0), (503, 0)],
+)
+def test_only_a_source_429_falls_back_the_rate_limiter(tmp_path, status, fallbacks):
+    limiter = UnlimitedLimiter()
+    transport = FakeTransport(
+        [
+            HttpPayload(status, b'{"error":"blocked"}', provider_bytes=0),
+            HttpPayload(200, b'{"events":[{"id":1}]}', provider_bytes=0),
+        ]
+    )
+    engine = _engine(tmp_path, transport, limiter=limiter)
+
+    result = engine.capture(_spec())
+
+    assert result.manifest.status == ManifestStatus.SUCCESS
+    assert limiter.fallbacks == fallbacks
+    assert engine.metrics.snapshot()["http_429"] == fallbacks
+
+
+def test_prefetched_429_falls_back_the_rate_limiter(tmp_path):
+    limiter = UnlimitedLimiter()
+    engine = _engine(tmp_path, FakeTransport(), limiter=limiter)
+
+    result = engine.ingest_prefetched(
+        _spec(),
+        HttpPayload(429, b'{"error":"blocked"}', provider_bytes=0),
+        authorization=None,
+    )
+
+    assert result.manifest.status == ManifestStatus.RETRYABLE_FAILURE
+    assert limiter.fallbacks == 1
+    assert engine.metrics.snapshot()["http_429"] == 1
+
+
+def test_a_limiter_without_fallback_still_counts_429(tmp_path):
+    class AcquireOnly:
+        def acquire(self):
+            return True
+
+    engine = _engine(
+        tmp_path,
+        FakeTransport([HttpPayload(429, b"{}", provider_bytes=0)] * 3),
+        limiter=AcquireOnly(),
+    )
+
+    result = engine.capture(_spec())
+
+    assert result.manifest.status == ManifestStatus.RETRYABLE_FAILURE
+    assert engine.metrics.snapshot()["http_429"] == 3
 
 
 def test_retry_after_header_overrides_exponential_backoff(tmp_path):

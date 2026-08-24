@@ -412,6 +412,7 @@ def _merge_live_traffic(parts):
         "request_count": 0,
         "endpoint_request_count": 0,
         "source_request_count": 0,
+        "http_429": 0,
         "endpoint_provider_bytes": {},
         "endpoint_request_provider_bytes": {},
         "proxy_exit_hash": None,
@@ -428,6 +429,7 @@ def _merge_live_traffic(parts):
             "endpoint_request_count",
             "source_request_count",
             "lease_relaunches",
+            "http_429",
         ):
             merged[field] += int(part.get(field, 0) or 0)
         for endpoint, value in (part.get("endpoint_provider_bytes") or {}).items():
