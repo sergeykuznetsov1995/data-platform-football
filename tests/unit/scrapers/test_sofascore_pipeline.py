@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -852,6 +853,161 @@ def test_player_runner_offline_replay_writes_both_tables_without_network(
     assert result["traffic"]["request_count"] == 0
     assert result["profile_players"] == 1
     assert result["season_stats_players"] == 1
+
+
+def _recording_writer_lock(monkeypatch, events, on_exit=lambda: None):
+    """Replace the D5 bronze writer lock with one that records its span."""
+    from scrapers.sofascore import writer_lock
+
+    @contextmanager
+    def fake_lock(environ=None, **_kwargs):
+        events.append("lock:enter")
+        try:
+            yield True
+        finally:
+            on_exit()
+            events.append("lock:exit")
+
+    monkeypatch.setattr(writer_lock, "bronze_writer_lock", fake_lock)
+
+
+def _recording_scraper(events):
+    scraper = _runner_player_scraper()
+
+    def save(**kwargs):
+        events.append("save:" + kwargs["table_name"])
+        return "iceberg.bronze." + kwargs["table_name"]
+
+    scraper.save_to_iceberg.side_effect = save
+    return scraper
+
+
+def test_player_runner_merges_bronze_only_inside_the_writer_lock(
+    tmp_path,
+    monkeypatch,
+):
+    """D5: every Bronze MERGE of the player phase runs under the writer lock.
+
+    The universe MERGE precedes the paid batch, so it takes its own lock span;
+    the lock is never held across the network capture in between.
+    """
+    from dags.scripts import run_sofascore_scraper as runner
+
+    monkeypatch.setenv("SOFASCORE_PLAYER_FRESHNESS_KEY", "fixture-week")
+    _patch_complete_season_player_universe(monkeypatch)
+    monkeypatch.setattr(runner, "_source_context", lambda *args: (17, 76986))
+    runtime, _ = _runtime(tmp_path)
+    ingest_prefetched_records(
+        runtime,
+        specs={
+            (PLAYER_ID, endpoint): _player_spec(
+                endpoint, freshness_key="fixture-week"
+            )
+            for endpoint in PLAYER_PATHS
+        },
+        records={
+            endpoint: _player_record(endpoint) for endpoint in PLAYER_PATHS
+        },
+    )
+    events: list[str] = []
+    _recording_writer_lock(monkeypatch, events)
+    scraper = _recording_scraper(events)
+
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
+        rc = runner._run_player_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(tmp_path / "player-lock.json"),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=True,
+        )
+
+    assert rc == 0
+    assert events == [
+        "lock:enter",
+        "save:sofascore_player_universe",
+        "lock:exit",
+        "lock:enter",
+        "save:sofascore_player_profile",
+        "save:sofascore_player_season_stats",
+        "lock:exit",
+    ]
+
+
+def test_match_runner_merges_bronze_inside_the_writer_lock_and_finalizes_after(
+    tmp_path,
+    monkeypatch,
+):
+    """D5: one lock span covers all match-phase MERGEs; the manifest is not
+    finalized under the lock (its own MERGE retries, and it must not extend
+    the serialized window)."""
+    from dags.scripts import run_sofascore_scraper as runner
+
+    runtime, transport = _runtime(tmp_path)
+    specs = {(EVENT_ID, endpoint): _spec(endpoint) for endpoint in EVENT_PATHS}
+    ingest_prefetched_records(
+        runtime,
+        specs=specs,
+        records={endpoint: _record(endpoint) for endpoint in EVENT_PATHS},
+    )
+    monkeypatch.setattr(
+        runner,
+        "_resolve_match_ids_from_bronze",
+        lambda *args, **kwargs: [EVENT_ID],
+    )
+    monkeypatch.setattr(runner, "_source_context", lambda *args: (17, 76986))
+    monkeypatch.setattr(
+        runner,
+        "_tournament_canonical_url",
+        lambda *args: "https://www.sofascore.com/tournament/premier-league/17",
+    )
+    from dags.utils import sofascore_dq
+
+    passed = SimpleNamespace(require=lambda: None)
+    for validator in (
+        "validate_table_rows",
+        "validate_lineup_semantics",
+        "validate_event_participants",
+        "validate_season_alignment",
+    ):
+        monkeypatch.setattr(sofascore_dq, validator, lambda *args, **kwargs: passed)
+    events: list[str] = []
+    terminal_at_lock_exit: list[bool] = []
+    _recording_writer_lock(
+        monkeypatch,
+        events,
+        on_exit=lambda: terminal_at_lock_exit.append(
+            all(
+                runtime.manifest_store.get(spec.key).is_terminal
+                for spec in specs.values()
+            )
+        ),
+    )
+    scraper = _recording_scraper(events)
+
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
+        rc = runner._run_match_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(tmp_path / "match-lock.json"),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=True,
+        )
+
+    assert rc == 0
+    assert transport.calls == 0
+    saves = [event for event in events if event.startswith("save:")]
+    assert saves
+    assert events == ["lock:enter", *saves, "lock:exit"]
+    assert saves[-1] == "save:sofascore_match_capture_status"
+    assert terminal_at_lock_exit == [False]
+    assert all(
+        runtime.manifest_store.get(spec.key).is_terminal for spec in specs.values()
+    )
 
 
 def test_player_runner_manifest_noop_is_exact_zero_traffic_before_browser(

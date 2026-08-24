@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1412,6 +1413,79 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
         "cache_hit_rate": 1.0,
         "endpoint_completeness": 1.0,
     }
+
+
+@pytest.mark.unit
+def test_runner_season_merges_bronze_inside_the_writer_lock(tmp_path, monkeypatch):
+    """D5: both season MERGEs run under one writer-lock span; the manifest is
+    finalized only after the lock is released."""
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore import writer_lock
+
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    _complete_plan_with_expansion_raw(raw_store, manifest)
+    engine, transport = _engine(
+        tmp_path,
+        raw_store=raw_store,
+        manifest_store=manifest,
+        sink=DeferredCaptureSink(),
+    )
+    runtime = CaptureRuntime(engine, manifest, raw_store)
+    monkeypatch.setenv("SOFASCORE_SEASON_FRESHNESS_KEY", FRESHNESS)
+    monkeypatch.setattr(
+        runner,
+        "_source_context",
+        lambda *args: (TOURNAMENT_ID, SEASON_ID),
+    )
+    events = []
+    terminal_at_lock_exit = []
+
+    @contextmanager
+    def fake_lock(environ=None, **_kwargs):
+        events.append("lock:enter")
+        try:
+            yield True
+        finally:
+            terminal_at_lock_exit.append(
+                all(record.is_terminal for record in manifest._records.values())
+            )
+            events.append("lock:exit")
+
+    monkeypatch.setattr(writer_lock, "bronze_writer_lock", fake_lock)
+    scraper = MagicMock()
+    scraper.__enter__.return_value = scraper
+    scraper.__exit__.return_value = False
+    scraper._add_metadata.side_effect = lambda frame, entity: frame.assign(
+        _entity_type=entity,
+        _ingested_at="fixture",
+    )
+
+    def save(**kwargs):
+        events.append("save:" + kwargs["table_name"])
+        return "iceberg.bronze." + kwargs["table_name"]
+
+    scraper.save_to_iceberg.side_effect = save
+
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
+        rc = runner._run_legacy(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            output_path=str(tmp_path / "season-lock.json"),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=True,
+        )
+
+    assert rc == 0
+    assert transport.calls == 0
+    assert events == [
+        "lock:enter",
+        "save:sofascore_schedule",
+        "save:sofascore_league_table",
+        "lock:exit",
+    ]
+    assert terminal_at_lock_exit == [False]
 
 
 def _live_season_run(tmp_path, monkeypatch, committed):
