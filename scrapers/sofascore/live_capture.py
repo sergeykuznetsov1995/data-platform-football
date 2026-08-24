@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import logging
 import os
-from contextlib import AbstractContextManager
+import time
+from contextlib import AbstractContextManager, ExitStack
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Optional, Sequence
 from urllib.parse import urlsplit
@@ -29,11 +31,30 @@ from scripts.proxy_filter.budget import (
     ProxyBudgetExceeded,
 )
 from scrapers.sofascore.camoufox_capture import ProxyConnectivityError
+from scrapers.sofascore.lease_client import (
+    SofascoreLeaseProtocolError,
+    SofascoreLeaseRejected,
+)
 from scrapers.sofascore.manifest import ManifestStatus
 from scrapers.sofascore.workload_plan import SignedDagRunPlan, WorkloadAllocation
 
 
+log = logging.getLogger(__name__)
+
 _ALLOWED_SOURCE_HOSTS = frozenset({"api.sofascore.com", "www.sofascore.com"})
+
+# Gateway rejection codes that mean "this lease/slot is gone or still held",
+# not "the budget is spent": a latched lease refuses its next endpoint
+# boundary (409 endpoint_concurrent), and until the reaper reclaims it
+# (LATCHED_SLOT_RECLAIM_GRACE_SECONDS = 30) a fresh lease for the same
+# allocation is refused (409 concurrent_allocation / 429 concurrency_limited).
+_LEASE_LOST_CODES = frozenset(
+    {"endpoint_concurrent", "concurrent_allocation", "concurrency_limited"}
+)
+_RELEASE_WAIT_SECONDS = 35
+_REACQUIRE_ATTEMPTS = 3
+_REACQUIRE_STEP_SECONDS = 10
+_relaunch_sleep = time.sleep
 
 # Smallest lease worth entering a paid capture with: a single warmed HTTPS
 # fetch costs at least a few KiB of provider traffic (TLS + headers + body),
@@ -59,6 +80,7 @@ def _zero_traffic() -> dict[str, Any]:
         "endpoint_provider_bytes": {},
         "endpoint_request_provider_bytes": {},
         "proxy_exit_hash": None,
+        "lease_relaunches": 0,
     }
 
 
@@ -246,6 +268,9 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
         self._observed_upstream_repins = 0
         self._endpoint_request_provider_bytes: dict[str, list[int]] = {}
         self._completed = False
+        # Set (to the redacted reason) when the gateway revoked this lease
+        # mid-batch; ``capture_live_specs`` may then re-lease once (#1218).
+        self.lease_lost: Optional[str] = None
 
     @property
     def hard_run_bytes(self) -> int:
@@ -619,6 +644,15 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             source_after = int(
                 getattr(self._capture, "_source_request_count", source_before) or 0
             )
+            # A latched lease refuses its next endpoint boundary with 409
+            # endpoint_concurrent (one gateway message for closed/expired/
+            # busy).  Retrying the same lease can only repeat the refusal.
+            lease_lost = (
+                isinstance(exc, SofascoreLeaseRejected)
+                and exc.code in _LEASE_LOST_CODES
+            )
+            if lease_lost:
+                self.lease_lost = self._safe_error(exc)
             try:
                 if request_boundary is not None:
                     after = self._validate_stats(
@@ -652,7 +686,7 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             raise TransportError(
                 f"warmed SofaScore request failed for {path}: {self._safe_error(exc)}",
                 provider_bytes=provider_bytes,
-                retryable=not self._broken,
+                retryable=not self._broken and not lease_lost,
                 browser_sessions=sessions,
                 navigations=navigations,
                 source_requests=max(0, source_after - source_before),
@@ -679,8 +713,15 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             - source_before,
         )
         if bool(getattr(after, "budget_exceeded", False)):
+            message = "SofaScore proxy lease exhausted the logical DAG-run budget"
+            if bool(getattr(after, "closed", False)):
+                # Real exhaustion only flags ``budget_exceeded``; the gateway's
+                # accounting latch flags it AND closes the lease.  The
+                # allocation may still hold budget for a fresh lease (#1218).
+                message = "SofaScore proxy lease was revoked by the gateway mid-batch"
+                self.lease_lost = message
             raise TransportError(
-                "SofaScore proxy lease exhausted the logical DAG-run budget",
+                message,
                 provider_bytes=provider_bytes,
                 retryable=False,
                 browser_sessions=sessions,
@@ -966,29 +1007,131 @@ def capture_live_specs(
     if normalized_plan is not None and normalized_allocation is not None:
         engine.run_id = normalized_plan.run_id
         engine.task_id = normalized_allocation.task_id
-    try:
-        transport = transport_factory(
-            engine,
-            canonical_url=canonical_url,
-            scope=scope,
-            entity=entity,
-            workload_plan=normalized_plan,
-            allocation_id=allocation_id,
-            attempt_id=attempt_id,
-        )
-        with transport:
+    pending = list(network_specs)
+    leases: list[Any] = []
+    lost_provider: Optional[Mapping[str, Any]] = None
+    relaunches = 0
+
+    def run_lease(attempt: Optional[str], *, acquire_attempts: int) -> None:
+        with ExitStack() as stack:
+            for acquire in range(1, acquire_attempts + 1):
+                transport = transport_factory(
+                    engine,
+                    canonical_url=canonical_url,
+                    scope=scope,
+                    entity=entity,
+                    workload_plan=normalized_plan,
+                    allocation_id=allocation_id,
+                    attempt_id=attempt,
+                )
+                leases.append(transport)
+                try:
+                    stack.enter_context(transport)
+                except SofascoreLeaseRejected as exc:
+                    if (
+                        exc.code not in _LEASE_LOST_CODES
+                        or acquire == acquire_attempts
+                    ):
+                        raise
+                    # The reaper has not reclaimed the lost lease's slot yet.
+                    _relaunch_sleep(_REACQUIRE_STEP_SECONDS)
+                    continue
+                break
             engine.transport = transport
-            for spec in network_specs:
-                result = engine.capture(spec)
+            while pending:
+                result = engine.capture(pending[0])
+                if transport.lease_lost and not relaunches:
+                    raise _LeaseLost(
+                        transport.lease_lost, transport.provider_snapshot()
+                    )
                 _require_publishable(result)
-                captured_by_key[spec.key] = result
+                captured_by_key[pending[0].key] = result
+                del pending[0]
+
+    # One lease per batch, plus at most ONE re-lease when the gateway revokes
+    # it mid-batch (accounting latch, #1218): close the dead lease/browser,
+    # wait past the reaper grace, then continue from the first pending spec.
+    # Budget verdicts (ProxyBudgetExceeded/BudgetAccountingError) never retry.
+    try:
+        attempt = attempt_id
+        while True:
+            try:
+                run_lease(
+                    attempt,
+                    acquire_attempts=_REACQUIRE_ATTEMPTS if relaunches else 1,
+                )
+            except (
+                _LeaseLost,
+                SofascoreLeaseRejected,
+                SofascoreLeaseProtocolError,
+            ) as exc:
+                lost = leases[-1]
+                if (
+                    getattr(lost, "mode", "") != "production"
+                    or not _lease_lost(exc, pending)
+                ):
+                    raise
+                if not pending:
+                    # The gateway refused a clean close after the last spec (a
+                    # tail latch).  Every spec is captured and every billed byte
+                    # was reconciled per endpoint, so nothing is left to re-lease.
+                    log.warning(
+                        "SofaScore lease %s was lost while closing a complete "
+                        "batch: %s",
+                        getattr(lost, "attempt_id", ""),
+                        exc,
+                    )
+                    break
+                if relaunches:
+                    raise
+                relaunches = 1
+                if isinstance(exc, _LeaseLost):
+                    lost_provider = exc.provider
+                log.warning(
+                    "SofaScore lease lost with %d/%d specs pending (%s); "
+                    "re-leasing in %ds",
+                    len(pending),
+                    len(network_specs),
+                    exc,
+                    _RELEASE_WAIT_SECONDS,
+                )
+                _relaunch_sleep(_RELEASE_WAIT_SECONDS)
+                attempt = f"{lost.attempt_id}:relaunch1"
+                continue
+            break
     finally:
         engine.transport = previous_transport
         engine.budget = previous_budget
         engine.run_id = previous_run_id
         engine.task_id = previous_task_id
-    traffic = _live_traffic(engine, metrics_before, transport)
+    traffic = _live_traffic(
+        engine,
+        metrics_before,
+        leases[-1],
+        lost_provider=lost_provider,
+        lease_relaunches=relaunches,
+    )
     return [captured_by_key[spec.key] for spec in ordered_specs], traffic
+
+
+class _LeaseLost(RuntimeError):
+    """The gateway revoked the live lease while specs were still pending."""
+
+    def __init__(self, reason: str, provider: Mapping[str, Any]) -> None:
+        super().__init__(reason)
+        # Meter of the lost lease at the moment of loss: exactly the bytes the
+        # engine was charged for it (its later close may report a tail).
+        self.provider = dict(provider)
+
+
+def _lease_lost(exc: BaseException, pending: Sequence[Any]) -> bool:
+    if isinstance(exc, _LeaseLost):
+        return True
+    if isinstance(exc, SofascoreLeaseRejected):
+        return exc.code in _LEASE_LOST_CODES
+    # A protocol error can only escape the lease after the batch completed
+    # (``close`` of a latched lease); before that, ``__exit__`` swallows it.
+    return not pending
 
 
 def _require_publishable(result: Any) -> None:
@@ -1009,6 +1152,9 @@ def _live_traffic(
     engine: SofaScoreCaptureEngine,
     before: dict[str, Any],
     transport: LeaseBackedCamoufoxTransport,
+    *,
+    lost_provider: Optional[Mapping[str, Any]] = None,
+    lease_relaunches: int = 0,
 ) -> dict[str, Any]:
     """Return the exact provider breakdown for this one lease only."""
 
@@ -1074,6 +1220,17 @@ def _live_traffic(
         traffic["completed_players"] / elapsed if elapsed else 0.0
     )
     traffic.update(transport.provider_snapshot())
+    if lost_provider is not None:
+        # A lease lost mid-batch was reconciled per endpoint while it was live;
+        # its meter belongs to this batch's paid total alongside the live lease.
+        for field in (
+            "provider_up_bytes",
+            "provider_down_bytes",
+            "provider_total_bytes",
+        ):
+            traffic[field] = int(traffic[field]) + int(
+                lost_provider.get(field, 0) or 0
+            )
     provider_total = int(traffic["provider_total_bytes"])
     paid_delta = int(current["paid_proxy_bytes"]) - int(
         before["paid_proxy_bytes"]
@@ -1110,6 +1267,7 @@ def _live_traffic(
     traffic["endpoint_provider_bytes"] = endpoint_totals
     traffic["endpoint_request_provider_bytes"] = current
     traffic["browser_navigations"] = int(traffic.get("navigations", 0))
+    traffic["lease_relaunches"] = int(lease_relaunches)
     return traffic
 
 

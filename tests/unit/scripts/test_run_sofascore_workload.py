@@ -322,3 +322,14 @@ def test_multi_batch_final_metrics_come_from_one_logical_engine_snapshot():
     assert final["cache_hit_rate"] == 0.25
     assert final["replay_hit_rate"] == 0.1
     assert final["provider_total_bytes"] == 37
+
+
+def test_batch_traffic_merge_sums_lease_relaunches():
+    merged = _merge_live_traffic(
+        [
+            {"provider_total_bytes": 30, "paid_proxy_bytes": 30, "lease_relaunches": 1},
+            {"provider_total_bytes": 7, "paid_proxy_bytes": 7},
+            {"provider_total_bytes": 5, "paid_proxy_bytes": 5, "lease_relaunches": 1},
+        ]
+    )
+    assert merged["lease_relaunches"] == 2
