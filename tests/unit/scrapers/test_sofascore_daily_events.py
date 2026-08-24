@@ -314,6 +314,35 @@ def test_rows_reject_events_whose_tournament_or_season_shape_drifted(tmp_path):
         schedule_rows_from_events(fetched, SNAPSHOT, exclude_leagues=())
 
 
+@pytest.mark.parametrize("junk", [None, 5])
+def test_rows_reject_non_object_events_as_malformed(tmp_path, junk):
+    # Sol r2 #2: ``{"events": [null]}`` is schema drift like any other —
+    # it must count as malformed and fail the day after the raw list is kept,
+    # not be filtered out into a green empty result.
+    first, _ = _fixture_events()
+    fine = _event(first, event_id=31, tournament_id=READY_TOURNAMENT,
+                  season_id=76953)
+    client = _Client({
+        "/sport/football/scheduled-events/2026-08-24": {"events": [junk, fine]},
+        "/sport/football/scheduled-events/2026-08-24/inverse": {"events": []},
+    })
+    store = _store(tmp_path)
+    fetched = fetch_daily_events(client, [date(2026, 8, 24)], store)
+
+    assert store.has_payload(
+        PayloadTarget(
+            source_tournament_id="0",
+            source_season_id="0",
+            target_type="date",
+            target_id="2026-08-24",
+            endpoint=SCHEDULED_EVENTS_ENDPOINT,
+            freshness_key="daily",
+        )
+    )
+    with pytest.raises(DailyEventsSchemaError, match="1 of 2"):
+        schedule_rows_from_events(fetched, SNAPSHOT, exclude_leagues=())
+
+
 def test_rows_warn_when_no_event_is_in_scope(tmp_path, caplog):
     # A day where every event belongs to configured/foreign tournaments is a
     # legitimate empty result, but "green and empty" must be visible in logs.

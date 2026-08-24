@@ -47,9 +47,13 @@ class DailyEventsSchemaError(DiscoverySchemaError):
 
 @dataclass(frozen=True)
 class FetchedEvent:
-    """One source event together with the raw record of the list it came from."""
+    """One source event together with the raw record of the list it came from.
 
-    event: Mapping[str, Any]
+    ``event`` is whatever the list element was; anything but a mapping with
+    the expected ids is classified as malformed downstream.
+    """
+
+    event: Any
     raw: RawPayloadRecord
 
 
@@ -90,11 +94,9 @@ def fetch_daily_events(
             events = payload.get("events") if isinstance(payload, Mapping) else None
             if not isinstance(events, list):
                 raise DiscoverySchemaError(f"{path} has no events list")
-            fetched.extend(
-                FetchedEvent(event=event, raw=record)
-                for event in events
-                if isinstance(event, Mapping)
-            )
+            # Non-object elements are kept: ``schedule_rows_from_events``
+            # counts them as malformed rather than silently dropping them.
+            fetched.extend(FetchedEvent(event=event, raw=record) for event in events)
     return fetched
 
 
@@ -141,7 +143,7 @@ def schedule_rows_from_events(
     the ones of tournaments absent from the snapshot (other genders, youth,
     amateur) are out of scope and counted in ``excluded``; a ``season.id`` the
     snapshot does not know yet is counted in ``unknown_seasons`` for the
-    metadata wave to pick up.  An event without ``id``,
+    metadata wave to pick up.  An event that is not an object or lacks ``id``,
     ``tournament.uniqueTournament.id`` or ``season.id`` is ``malformed``: that
     is schema drift, not a foreign tournament, and fails the day (the raw list
     is already kept).  A game listed more than once (D-1 and D lists overlap
