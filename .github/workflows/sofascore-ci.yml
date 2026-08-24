@@ -8,6 +8,9 @@ on:
       - "compose.yaml"
       - "configs/sofascore/**"
       - "dags/dag_ingest_sofascore.py"
+      - "dags/dag_backfill_sofascore_all_mens.py"
+      - "dags/dag_refresh_sofascore_all_mens.py"
+      - "dags/utils/sofascore_all_mens_state.py"
       - "dags/dag_canary_sofascore_proxy.py"
       - "dags/dag_iceberg_maintenance.py"
       - "dags/dag_sofascore_pipeline.py"
@@ -71,12 +74,17 @@ jobs:
           ruff check \
             scrapers/sofascore \
             dags/dag_ingest_sofascore.py \
+            dags/dag_backfill_sofascore_all_mens.py \
+            dags/dag_refresh_sofascore_all_mens.py \
             dags/dag_canary_sofascore_proxy.py \
             dags/dag_iceberg_maintenance.py \
             dags/dag_sofascore_pipeline.py \
             dags/scripts/run_sofascore_scraper.py \
             dags/scripts/prepare_sofascore_workload.py \
             dags/scripts/run_sofascore_discovery.py \
+            dags/scripts/run_sofascore_scope_cycle.py \
+            dags/scripts/run_sofascore_daily_events.py \
+            dags/utils/sofascore_all_mens_state.py \
             dags/utils/maintenance_tasks.py \
             dags/utils/sofascore_dq.py \
             scripts/migrate_sofascore_production.py \

@@ -2,7 +2,7 @@
   "benchmark_samples": [],
   "bootstrap_authorizes_production": false,
   "budget_derivation": "max_observed_task_bytes_per_workload_class_v2",
-  "class_manifest_sha256": "b2d2e36e5023ca4abe52041296be6e10b7e4fe0aa58c63a6aac672749b920318",
+  "class_manifest_sha256": "65eeaf436baf07fe47cbf41daf3347e97f5dc0decec6666f0e07c33232d4289f",
   "cohort_sha256": "eab8540e7a82b95d762fbdba5b30796d964da4c1c0a850fe1322f5e4bc14c1a4",
   "collection_source": "sofascore_canary",
   "collector_version": "sofascore-paid-canary-v3",
@@ -27,7 +27,13 @@
     "required_workload_classes": [
       "match_batch_25_5943cd5a087c8ded",
       "player_batch_50_cd522de61ebecd10",
+      "season_1da176ffa2222bcc",
+      "season_5cf25f88ed2115bb",
+      "season_69608cf7368823a9",
+      "season_73022f4806a39fb1",
       "season_ae9bf9aa625c6ead",
+      "season_bd9da17d9b61ec24",
+      "season_c27b42098336e271",
       "season_c5a3a2e2e467619d"
     ]
   },
@@ -37,7 +43,7 @@
       "camoufox": "0.4.11",
       "playwright": "1.59.0"
     },
-    "digest": "9437715749ce8c46625e7b87b23e642c7ab5af9d9185accd4b1347c80575b00b",
+    "digest": "01b1a5df875dd7725a9e54e8cd1ad1d0f474e2f095699a42f16d8fe94e2979c9",
     "files": [
       "configs/medallion/competitions.yaml",
       "configs/proxy_filter/blocklist.txt",
@@ -46,7 +52,9 @@
       "dags/dag_backfill_sofascore_all_mens.py",
       "dags/dag_canary_sofascore_proxy.py",
       "dags/dag_ingest_sofascore.py",
+      "dags/dag_refresh_sofascore_all_mens.py",
       "dags/scripts/prepare_sofascore_workload.py",
+      "dags/scripts/run_sofascore_daily_events.py",
       "dags/scripts/run_sofascore_scope_cycle.py",
       "dags/scripts/run_sofascore_scraper.py",
       "dags/utils/medallion_config.py",
@@ -66,11 +74,13 @@
       "scrapers/sofascore/camoufox_capture.py",
       "scrapers/sofascore/capture_engine.py",
       "scrapers/sofascore/catalog.py",
+      "scrapers/sofascore/daily_events.py",
       "scrapers/sofascore/discovery.py",
       "scrapers/sofascore/lease_client.py",
       "scrapers/sofascore/live_capture.py",
       "scrapers/sofascore/manifest.py",
       "scrapers/sofascore/pipeline.py",
+      "scrapers/sofascore/rate_control.py",
       "scrapers/sofascore/raw_store.py",
       "scrapers/sofascore/registry.py",
       "scrapers/sofascore/runtime_fingerprint.py",
@@ -78,6 +88,7 @@
       "scrapers/sofascore/season_pipeline.py",
       "scrapers/sofascore/workload_plan.py",
       "scrapers/sofascore/workload_runtime.py",
+      "scrapers/sofascore/writer_lock.py",
       "scrapers/utils/rate_limiter.py",
       "scripts/backfill_sofascore.py",
       "scripts/build_sofascore_all_mens_snapshot.py",
@@ -170,21 +181,279 @@
       },
       "shape_digest": "cd522de61ebecd108945ca8f2b9408db9204e32b125359a536dd714bfd69e210"
     },
-    "season_ae9bf9aa625c6ead": {
+    "season_1da176ffa2222bcc": {
       "cohorts": {
-        "16": {
-          "cohort_sha256": "aef3426b297b4c12ec69c598243f25e70195024a25b71114135aa7cb35b4e2e9",
-          "name": "enabled_world_cup_2026_shape"
+        "192": {
+          "cohort_sha256": "5e2d1759974f3e06dba6f23b821bd4379cdd0b2fa864dde031d9c960866c8afd",
+          "name": "enabled_irish_premier_division_2025_shape"
+        },
+        "41": {
+          "cohort_sha256": "dae0bb5b43785c2972ab2177ca913a563f5898baa9f980e55dda283cd1017f5a",
+          "name": "enabled_veikkausliiga_2025_shape"
         }
       },
       "collection_blocker": "",
       "hard_task_bytes": null,
       "max_units": 1,
       "measured_tournament_ids": [
-        16
+        41,
+        192
       ],
       "representative_season_ids": {
-        "16": 58210
+        "192": 69981,
+        "41": 70853
+      },
+      "required_endpoints": [
+        "cup_trees",
+        "participants",
+        "referee_profile",
+        "rounds",
+        "schedule_last",
+        "schedule_next",
+        "squads",
+        "standings_total"
+      ],
+      "samples": [],
+      "scope": "season",
+      "shape": {
+        "band_scheme": "team_count_band_v1",
+        "dynamic_endpoints": [
+          "squads",
+          "referee_profile"
+        ],
+        "dynamic_evidence": "stored_schedule_participants_squads_events_v1",
+        "schedule_page_chain": {
+          "directions": [
+            "last",
+            "next"
+          ],
+          "max_pages_per_direction": 50
+        },
+        "scope": "season",
+        "season_format": "calendar_year",
+        "shape_version": 2,
+        "static_endpoints": [
+          "schedule_last",
+          "schedule_next",
+          "standings_total",
+          "rounds",
+          "cup_trees",
+          "participants"
+        ],
+        "team_count_band": "8_15"
+      },
+      "shape_digest": "1da176ffa2222bccb21aa6f57b0ccea87fb554145ea979dabfc9243b17862fcf"
+    },
+    "season_5cf25f88ed2115bb": {
+      "cohorts": {
+        "18": {
+          "cohort_sha256": "51b0a3bcfc05e42a678dfb049d13005f372be25d53209b5a80b43999dafe2ca3",
+          "name": "enabled_championship_2526_shape"
+        },
+        "54": {
+          "cohort_sha256": "31919585ff3bcdee5e4175b04dfdb82c446a94f7071bcde2c9c72d4e07148c90",
+          "name": "enabled_laliga_2_2526_shape"
+        }
+      },
+      "collection_blocker": "",
+      "hard_task_bytes": null,
+      "max_units": 1,
+      "measured_tournament_ids": [
+        18,
+        54
+      ],
+      "representative_season_ids": {
+        "18": 77347,
+        "54": 77558
+      },
+      "required_endpoints": [
+        "cup_trees",
+        "participants",
+        "referee_profile",
+        "rounds",
+        "schedule_last",
+        "schedule_next",
+        "squads",
+        "standings_total"
+      ],
+      "samples": [],
+      "scope": "season",
+      "shape": {
+        "band_scheme": "team_count_band_v1",
+        "dynamic_endpoints": [
+          "squads",
+          "referee_profile"
+        ],
+        "dynamic_evidence": "stored_schedule_participants_squads_events_v1",
+        "schedule_page_chain": {
+          "directions": [
+            "last",
+            "next"
+          ],
+          "max_pages_per_direction": 50
+        },
+        "scope": "season",
+        "season_format": "split_year",
+        "shape_version": 2,
+        "static_endpoints": [
+          "schedule_last",
+          "schedule_next",
+          "standings_total",
+          "rounds",
+          "cup_trees",
+          "participants"
+        ],
+        "team_count_band": "21_32"
+      },
+      "shape_digest": "5cf25f88ed2115bb6a38fbc39a335e6fa8006e2f0df1e459e7563dea89acb76f"
+    },
+    "season_69608cf7368823a9": {
+      "cohorts": {
+        "325": {
+          "cohort_sha256": "d516b717cf2ec79d6069000a7e32658fe27f0784dabde3d4490e615dcd50e22c",
+          "name": "enabled_brasileirao_serie_a_2025_shape"
+        },
+        "40": {
+          "cohort_sha256": "d6861e795f392e90e879444a06e9bc1762384d3766098f21d7439416cc0b05ad",
+          "name": "enabled_allsvenskan_2025_shape"
+        }
+      },
+      "collection_blocker": "",
+      "hard_task_bytes": null,
+      "max_units": 1,
+      "measured_tournament_ids": [
+        40,
+        325
+      ],
+      "representative_season_ids": {
+        "325": 72034,
+        "40": 69956
+      },
+      "required_endpoints": [
+        "cup_trees",
+        "participants",
+        "referee_profile",
+        "rounds",
+        "schedule_last",
+        "schedule_next",
+        "squads",
+        "standings_total"
+      ],
+      "samples": [],
+      "scope": "season",
+      "shape": {
+        "band_scheme": "team_count_band_v1",
+        "dynamic_endpoints": [
+          "squads",
+          "referee_profile"
+        ],
+        "dynamic_evidence": "stored_schedule_participants_squads_events_v1",
+        "schedule_page_chain": {
+          "directions": [
+            "last",
+            "next"
+          ],
+          "max_pages_per_direction": 50
+        },
+        "scope": "season",
+        "season_format": "calendar_year",
+        "shape_version": 2,
+        "static_endpoints": [
+          "schedule_last",
+          "schedule_next",
+          "standings_total",
+          "rounds",
+          "cup_trees",
+          "participants"
+        ],
+        "team_count_band": "16_20"
+      },
+      "shape_digest": "69608cf7368823a969ee653dbed73b6be441a474553e73a4cff33d0cd0e41cb6"
+    },
+    "season_73022f4806a39fb1": {
+      "cohorts": {
+        "326": {
+          "cohort_sha256": "80fc24a15caed102b4f1ded1dc4a315095f0a203fd8aa0db49ea2b13c61f1bb6",
+          "name": "enabled_belgian_cup_2526_shape"
+        },
+        "328": {
+          "cohort_sha256": "89ae77fa3e18cac2d74d8e7309e25f8fc14ddb8230b12378af2540f758fd0eba",
+          "name": "enabled_coppa_italia_2526_shape"
+        }
+      },
+      "collection_blocker": "",
+      "hard_task_bytes": null,
+      "max_units": 1,
+      "measured_tournament_ids": [
+        326,
+        328
+      ],
+      "representative_season_ids": {
+        "326": 81462,
+        "328": 77308
+      },
+      "required_endpoints": [
+        "cup_trees",
+        "participants",
+        "referee_profile",
+        "rounds",
+        "schedule_last",
+        "schedule_next",
+        "squads",
+        "standings_total"
+      ],
+      "samples": [],
+      "scope": "season",
+      "shape": {
+        "band_scheme": "team_count_band_v1",
+        "dynamic_endpoints": [
+          "squads",
+          "referee_profile"
+        ],
+        "dynamic_evidence": "stored_schedule_participants_squads_events_v1",
+        "schedule_page_chain": {
+          "directions": [
+            "last",
+            "next"
+          ],
+          "max_pages_per_direction": 50
+        },
+        "scope": "season",
+        "season_format": "split_year",
+        "shape_version": 2,
+        "static_endpoints": [
+          "schedule_last",
+          "schedule_next",
+          "standings_total",
+          "rounds",
+          "cup_trees",
+          "participants"
+        ],
+        "team_count_band": "33_48"
+      },
+      "shape_digest": "73022f4806a39fb149cbfd7a25820e5204023c72ad0715a5d5ef95af45288b21"
+    },
+    "season_ae9bf9aa625c6ead": {
+      "cohorts": {
+        "16": {
+          "cohort_sha256": "aef3426b297b4c12ec69c598243f25e70195024a25b71114135aa7cb35b4e2e9",
+          "name": "enabled_world_cup_2026_shape"
+        },
+        "703": {
+          "cohort_sha256": "7b562f0f13bb9609901cbef12f1329fe58fdb09feb5ee6d4492df3f256707eae",
+          "name": "enabled_primera_nacional_2025_shape"
+        }
+      },
+      "collection_blocker": "",
+      "hard_task_bytes": null,
+      "max_units": 1,
+      "measured_tournament_ids": [
+        16,
+        703
+      ],
+      "representative_season_ids": {
+        "16": 58210,
+        "703": 71009
       },
       "required_endpoints": [
         "cup_trees",
@@ -226,6 +495,132 @@
         "team_count_band": "33_48"
       },
       "shape_digest": "ae9bf9aa625c6ead8b0e72adaf21551a7230b8f06b45cf7cd19e9f685231a24b"
+    },
+    "season_bd9da17d9b61ec24": {
+      "cohorts": {
+        "36": {
+          "cohort_sha256": "e27f6a7d435de3252e4ba4ff27e292d6c60ec3f029e6ac6fbba29db239be4f73",
+          "name": "enabled_scottish_premiership_2526_shape"
+        },
+        "45": {
+          "cohort_sha256": "3c44ed6c1a551ff01c12106cc580394d3a1331afb8ca575d8eaf78dbfea2662a",
+          "name": "enabled_austrian_bundesliga_2526_shape"
+        }
+      },
+      "collection_blocker": "",
+      "hard_task_bytes": null,
+      "max_units": 1,
+      "measured_tournament_ids": [
+        36,
+        45
+      ],
+      "representative_season_ids": {
+        "36": 77128,
+        "45": 77382
+      },
+      "required_endpoints": [
+        "cup_trees",
+        "participants",
+        "referee_profile",
+        "rounds",
+        "schedule_last",
+        "schedule_next",
+        "squads",
+        "standings_total"
+      ],
+      "samples": [],
+      "scope": "season",
+      "shape": {
+        "band_scheme": "team_count_band_v1",
+        "dynamic_endpoints": [
+          "squads",
+          "referee_profile"
+        ],
+        "dynamic_evidence": "stored_schedule_participants_squads_events_v1",
+        "schedule_page_chain": {
+          "directions": [
+            "last",
+            "next"
+          ],
+          "max_pages_per_direction": 50
+        },
+        "scope": "season",
+        "season_format": "split_year",
+        "shape_version": 2,
+        "static_endpoints": [
+          "schedule_last",
+          "schedule_next",
+          "standings_total",
+          "rounds",
+          "cup_trees",
+          "participants"
+        ],
+        "team_count_band": "8_15"
+      },
+      "shape_digest": "bd9da17d9b61ec24d281bac0fd69d08e10402894741b222b6aef860205f5190a"
+    },
+    "season_c27b42098336e271": {
+      "cohorts": {
+        "155": {
+          "cohort_sha256": "9a12327047751e99b4133acd75a6ee3612531f2e0a4bd3288f7d8a98550da668",
+          "name": "enabled_liga_profesional_argentina_2025_shape"
+        },
+        "242": {
+          "cohort_sha256": "459ed08cb6e078ac22887bab4af222cc5ab34a06d37af53709321bbe21245f84",
+          "name": "enabled_mls_2025_shape"
+        }
+      },
+      "collection_blocker": "",
+      "hard_task_bytes": null,
+      "max_units": 1,
+      "measured_tournament_ids": [
+        155,
+        242
+      ],
+      "representative_season_ids": {
+        "155": 70268,
+        "242": 70158
+      },
+      "required_endpoints": [
+        "cup_trees",
+        "participants",
+        "referee_profile",
+        "rounds",
+        "schedule_last",
+        "schedule_next",
+        "squads",
+        "standings_total"
+      ],
+      "samples": [],
+      "scope": "season",
+      "shape": {
+        "band_scheme": "team_count_band_v1",
+        "dynamic_endpoints": [
+          "squads",
+          "referee_profile"
+        ],
+        "dynamic_evidence": "stored_schedule_participants_squads_events_v1",
+        "schedule_page_chain": {
+          "directions": [
+            "last",
+            "next"
+          ],
+          "max_pages_per_direction": 50
+        },
+        "scope": "season",
+        "season_format": "calendar_year",
+        "shape_version": 2,
+        "static_endpoints": [
+          "schedule_last",
+          "schedule_next",
+          "standings_total",
+          "rounds",
+          "cup_trees",
+          "participants"
+        ],
+        "team_count_band": "21_32"
+      },
+      "shape_digest": "c27b42098336e2718b01d8b031ce5d10814d50f368123984b69ff4a5e7fb1472"
     },
     "season_c5a3a2e2e467619d": {
       "cohorts": {
