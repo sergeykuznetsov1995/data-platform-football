@@ -54,6 +54,7 @@ def test_exact_endpoint_outcomes_match_current_capture_wiring(coverage):
         "tournament_seasons",
         "schedule_last",
         "schedule_next",
+        "scheduled_events",
         "standings_total",
         "event",
         "lineups",
@@ -95,7 +96,7 @@ def test_exact_endpoint_outcomes_match_current_capture_wiring(coverage):
         "intentionally-excluded": excluded,
     }
     assert coverage["coverage_summary"] == {
-        "normalized": 14,
+        "normalized": 15,
         "raw-only": 4,
         "unsupported": 2,
         "intentionally-excluded": 8,
@@ -310,6 +311,23 @@ def test_normalized_match_endpoints_are_exactly_pipeline_event_paths(coverage):
             "referee_profile",
         }
     )
+
+
+def test_daily_scheduled_events_is_an_optional_schedule_feed(coverage):
+    from scrapers.sofascore.daily_events import (
+        SCHEDULED_EVENTS_ENDPOINT,
+        SCHEDULED_EVENTS_TARGET_TYPE,
+    )
+
+    spec = coverage["endpoints"][SCHEDULED_EVENTS_ENDPOINT]
+    assert spec["status"] == "normalized"
+    assert spec["required"] is False
+    assert spec["target_type"] == SCHEDULED_EVENTS_TARGET_TYPE == "date"
+    assert spec["destination"] == ["bronze.sofascore_schedule"]
+    assert spec["path"] == "/sport/football/scheduled-events/{date}"
+    assert SCHEDULED_EVENTS_ENDPOINT not in coverage["manifest"][
+        "raw_replay_endpoints"
+    ]
 
 
 def test_raw_replay_tournament_and_player_writes_are_explicit(coverage):

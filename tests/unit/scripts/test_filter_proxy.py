@@ -7414,6 +7414,36 @@ def test_all_mens_metadata_uses_discovery_budget_without_losing_dag_identity(
     assert mod._source_for_dag(lease.dag_id) == "sofascore"
 
 
+def test_all_mens_refresh_dag_uses_signed_and_discovery_lanes_like_backfill(
+    tmp_path
+):
+    mod = _load_shared_module()
+    assert mod._source_for_dag("dag_refresh_sofascore_all_mens") == "sofascore"
+    mod.SOFASCORE_DAGRUN_BUDGET_BYTES = 1234
+    assert mod._dagrun_budget_bytes("dag_refresh_sofascore_all_mens") == 1234
+
+    mod.LEDGER_PATH = str(tmp_path / "paid_requests.jsonl")
+    mod.SOURCE_MODE = "test-all"
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    mod.SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 12 * 1024 * 1024
+    context = _all_mens_metadata_context(run_id="manual__all-men-refresh")
+    context.update({
+        "dag_id": "dag_refresh_sofascore_all_mens",
+        "task_id": "fetch_daily_events",
+    })
+
+    lease = mod._create_lease(
+        mgr,
+        max_bytes=8 * 1024 * 1024,
+        ttl_seconds=3600,
+        metadata=context,
+        require_context=True,
+    )
+
+    assert lease.source == "sofascore_discovery"
+    assert lease.dag_id == "dag_refresh_sofascore_all_mens"
+
+
 def test_shared_sofascore_discovery_allows_camoufox_exit_probe():
     mod = _load_shared_module()
     discovery = SimpleNamespace(source="sofascore_discovery")

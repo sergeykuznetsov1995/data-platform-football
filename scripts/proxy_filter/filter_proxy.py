@@ -211,6 +211,7 @@ FBREF_DAG_IDS = frozenset(
 SOFASCORE_DAG_IDS = frozenset({
     "dag_ingest_sofascore",
     "dag_backfill_sofascore_all_mens",
+    "dag_refresh_sofascore_all_mens",
 })
 SOFASCORE_CANARY_DAG_IDS = frozenset({"dag_canary_sofascore_proxy"})
 # Registry discovery is a non-signed, metered JSON scan of the public catalog.
@@ -219,6 +220,7 @@ SOFASCORE_CANARY_DAG_IDS = frozenset({"dag_canary_sofascore_proxy"})
 SOFASCORE_DISCOVERY_DAG_IDS = frozenset({"dag_discover_sofascore_registry"})
 SOFASCORE_METADATA_DAG_IDS = frozenset({
     "dag_backfill_sofascore_all_mens",
+    "dag_refresh_sofascore_all_mens",
     "operator_sofascore_all_mens_metadata",
 })
 SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 0

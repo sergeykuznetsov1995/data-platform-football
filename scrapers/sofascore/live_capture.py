@@ -310,6 +310,7 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             else frozenset({
                 "dag_ingest_sofascore",
                 "dag_backfill_sofascore_all_mens",
+                "dag_refresh_sofascore_all_mens",
             })
         )
         default_dag_id = (

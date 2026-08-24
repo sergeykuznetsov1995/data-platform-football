@@ -362,6 +362,7 @@ class _DiscoveryLeaseProvider:
     ALLOWED_DAG_IDS = frozenset({
         "dag_discover_sofascore_registry",
         "dag_backfill_sofascore_all_mens",
+        "dag_refresh_sofascore_all_mens",
         "operator_sofascore_all_mens_metadata",
     })
 
@@ -696,6 +697,7 @@ class SofascoreLeaseClient:
             (
                 "dag_ingest_sofascore",
                 "dag_backfill_sofascore_all_mens",
+                "dag_refresh_sofascore_all_mens",
             )
             if source == "sofascore"
             else ("dag_canary_sofascore_proxy",)

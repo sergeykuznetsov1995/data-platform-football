@@ -403,6 +403,57 @@ def test_all_mens_metadata_lease_keeps_the_real_dag_identity():
     assert request["source"] == "sofascore_discovery"
 
 
+def test_all_mens_refresh_dag_gets_both_discovery_and_signed_lanes():
+    session = _Session(_Response(201, {
+        "id": "lease-1",
+        "token": "secret-token",
+        "proxy_url": "http://proxy_filter:8900",
+        "max_bytes": 4096,
+        "expires_at": 2_000_000_000.0,
+    }))
+    provider = _DiscoveryLeaseProvider(
+        "http://proxy_filter:8899",
+        session=session,
+        control_token=CONTROL_TOKEN,
+        dag_id="dag_refresh_sofascore_all_mens",
+    )
+    provider.acquire(
+        max_bytes=4096,
+        ttl_seconds=3600,
+        run_id="manual__all-men-refresh",
+        task_id="fetch_daily_events",
+    )
+    request = session.calls[0][2]["json"]
+    assert request["dag_id"] == "dag_refresh_sofascore_all_mens"
+    assert request["source"] == "sofascore_discovery"
+
+    plan, allocation = _plan(
+        dag_id="dag_refresh_sofascore_all_mens",
+        run_id="manual__all-men-refresh--7-96518::targets",
+    )
+    session = _Session(_Response(
+        201,
+        _lease_payload(plan=plan, allocation=allocation),
+    ))
+    client = SofascoreLeaseClient(
+        "http://proxy_filter:8899", session=session, control_token=CONTROL_TOKEN
+    )
+    lease = client.acquire(
+        max_bytes=4096,
+        ttl_seconds=3600,
+        dag_id="dag_refresh_sofascore_all_mens",
+        run_id=plan.run_id,
+        task_id=allocation.task_id,
+        workload_plan=plan,
+        allocation_id=allocation.allocation_id,
+        attempt_id="attempt-1",
+    )
+    assert lease.source == "sofascore"
+    assert session.calls[0][2]["json"]["dag_id"] == (
+        "dag_refresh_sofascore_all_mens"
+    )
+
+
 def test_production_acquire_requires_signed_allocation_without_http_call():
     session = _Session()
     client = SofascoreLeaseClient(

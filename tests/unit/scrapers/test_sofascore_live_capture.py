@@ -666,6 +666,28 @@ def test_backfill_dag_enters_the_production_transport_and_acquires_lease(
     )
 
 
+def test_refresh_dag_enters_the_production_transport_and_acquires_lease(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_refresh_sofascore_all_mens")
+    runtime, _ = _runtime(tmp_path)
+    client = _LeaseClient([0, 0, 10], final_total=10)
+    factory = _TransportFactory(client, _Capture([_record(b'{"items":[]}')]))
+
+    results, traffic = capture_live_specs(
+        runtime,
+        [_spec(1)],
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="SS-7:2627",
+        entity="match_capture",
+        transport_factory=factory,
+    )
+
+    assert len(results) == 1
+    assert traffic["paid_proxy_bytes"] == 10
+    assert client.acquire_calls[0]["dag_id"] == "dag_refresh_sofascore_all_mens"
+
+
 def test_sequential_batch_reports_are_deltas_not_cumulative(tmp_path):
     runtime, _ = _runtime(tmp_path)
     first_factory = _TransportFactory(
