@@ -8821,3 +8821,65 @@ def test_fbref_proxy_hard_stops_an_oversized_browser_phase_transfer(mod):
     assert lease.total_bytes == lease.max_bytes == 12
     assert lease.budget_exceeded is True
     assert writer.closed is True
+
+
+def _append_wal_attempt(mod, lease_id, *, finished):
+    mod._append_allocation_wal(
+        "claim_intent",
+        lease_id,
+        workload_plan={"plan": lease_id},
+        allocation_id=f"alloc-{lease_id}",
+        claim_token="t" * 16,
+    )
+    mod._append_allocation_wal(
+        "endpoint_started", lease_id, request_id="r1", endpoint="lineups"
+    )
+    mod._append_allocation_wal(
+        "endpoint_finished",
+        lease_id,
+        request_id="r1",
+        endpoint="lineups",
+        provider_bytes=100,
+    )
+    if finished:
+        mod._append_allocation_wal("allocation_finished", lease_id)
+    else:
+        mod._append_allocation_wal(
+            "endpoint_started", lease_id, request_id="r2", endpoint="event"
+        )
+
+
+def test_shared_wal_compaction_keeps_only_open_attempts(tmp_path):
+    mod = _load_shared_module()
+    wal_path = tmp_path / "allocation-wal.jsonl"
+    mod.SOFASCORE_ALLOCATION_WAL_PATH = str(wal_path)
+    backup = tmp_path / "allocation-wal.jsonl.compacted.bak"
+
+    # Nothing to compact yet: neither file is touched.
+    assert mod._compact_allocation_wal(set()) == (0, 0)
+    assert not wal_path.exists() and not backup.exists()
+
+    _append_wal_attempt(mod, "lease-done-1", finished=True)
+    _append_wal_attempt(mod, "lease-open", finished=False)
+    _append_wal_attempt(mod, "lease-done-2", finished=True)
+    original_lines = wal_path.read_bytes().splitlines()
+    before = mod._read_allocation_wal()
+    open_ids = {lease_id for lease_id, s in before.items() if not s["finished"]}
+    assert open_ids == {"lease-open"}
+
+    assert mod._compact_allocation_wal(open_ids) == (12, 4)
+
+    kept_lines = wal_path.read_bytes().splitlines()
+    assert kept_lines == [
+        line for line in original_lines if b'"lease_id":"lease-open"' in line
+    ]
+    assert mod._read_allocation_wal() == {"lease-open": before["lease-open"]}
+    assert wal_path.stat().st_mode & 0o777 == 0o600
+    assert backup.read_bytes().splitlines() == original_lines
+    assert backup.stat().st_mode & 0o777 == 0o600
+
+    # Idempotent: a second start with the same open set rewrites nothing.
+    assert mod._compact_allocation_wal(open_ids) == (4, 4)
+    assert wal_path.read_bytes().splitlines() == kept_lines
+    assert backup.read_bytes().splitlines() == original_lines
+    assert mod._read_allocation_wal() == {"lease-open": before["lease-open"]}

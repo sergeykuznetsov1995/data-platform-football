@@ -2940,6 +2940,71 @@ def _recover_allocation_wal() -> int:
     return recovered
 
 
+def _compact_allocation_wal(open_lease_ids: set[str]) -> tuple[int, int]:
+    """Drop the events of finished attempts so a restart replays only live ones.
+
+    Runs after ``_recover_allocation_wal`` appended ``allocation_finished`` for
+    every crash-orphaned attempt, so any lease outside ``open_lease_ids`` is
+    already durable in the allocation ledger.  Open attempts keep every event
+    verbatim.  The previous file survives as one ``<wal>.compacted.bak`` (a hard
+    link, so the WAL itself is never absent); both stay mode 0600.  Returns the
+    event counts before and after.
+    """
+
+    path = SOFASCORE_ALLOCATION_WAL_PATH
+    try:
+        before_bytes = os.path.getsize(path)
+    except FileNotFoundError:
+        return (0, 0)
+    if before_bytes == 0:
+        return (0, 0)
+    directory_path = os.path.dirname(path) or "."
+    temporary = os.path.join(
+        directory_path,
+        f".{os.path.basename(path)}.{os.getpid()}.{secrets.token_hex(8)}.tmp",
+    )
+    total = kept = after_bytes = 0
+    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as out, open(path, "rb") as stream:
+            for raw in stream:
+                total += 1
+                lease_id = str(json.loads(raw).get("lease_id") or "").strip()
+                if lease_id in open_lease_ids:
+                    out.write(raw)
+                    kept += 1
+                    after_bytes += len(raw)
+            out.flush()
+            os.fsync(out.fileno())
+        if kept == total:
+            return (total, kept)
+        backup = path + ".compacted.bak"
+        try:
+            os.unlink(backup)
+        except FileNotFoundError:
+            pass
+        os.link(path, backup)
+        os.replace(temporary, path)
+        directory = os.open(directory_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    log.info(
+        "compacted SofaScore allocation WAL: %d -> %d events (%d -> %d bytes)",
+        total,
+        kept,
+        before_bytes,
+        after_bytes,
+    )
+    return (total, kept)
+
+
 def _signed_allocation_from_request(
     metadata: Mapping[str, Any],
     *,
@@ -7395,6 +7460,17 @@ async def main() -> None:
         "recovered %d crash-orphaned SofaScore allocation attempts",
         recovered_allocations,
     )
+    try:
+        _compact_allocation_wal(
+            {
+                lease_id
+                for lease_id, state in _read_allocation_wal().items()
+                if not state.get("finished")
+            }
+        )
+    except Exception:
+        # Compaction is housekeeping: an uncompacted WAL still replays fine.
+        log.exception("SofaScore allocation WAL compaction failed; keeping the full WAL")
 
     pidfile = str(getattr(args, "pidfile", "/tmp/filter_proxy.pid"))
     with open(pidfile, "w") as fh:
