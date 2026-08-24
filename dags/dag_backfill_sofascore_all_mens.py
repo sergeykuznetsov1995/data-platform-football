@@ -43,6 +43,44 @@ WORKLOAD_ARTIFACT = os.environ.get(
 )
 ACTIVE_COOLDOWN = timedelta(minutes=1)
 IDLE_COOLDOWN = timedelta(minutes=30)
+
+
+def _env_int(name: str, default: int | None, lo: int, hi: int) -> int | None:
+    """Read an integer knob at DAG parse; anything set but invalid fails closed."""
+
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = None
+    if value is None or not lo <= value <= hi:
+        raise ValueError(f"{name} must be an integer in [{lo}, {hi}], got {raw!r}")
+    return value
+
+
+# History lane knobs. Defaults reproduce the single-slot campaign; a second
+# lane (own gateway, own pool, several scopes per DagRun) is configured purely
+# through the scheduler environment, without touching sealed runtime code.
+HISTORY_BATCH_SIZE = _env_int("SOFASCORE_HISTORY_BATCH_SIZE", 1, 1, 64)
+HISTORY_POOL = (
+    os.environ.get("SOFASCORE_HISTORY_POOL", "").strip() or INGEST_SCRAPER_POOL
+)
+HISTORY_MAX_ACTIVE_TASKS = _env_int("SOFASCORE_HISTORY_MAX_ACTIVE_TASKS", 1, 1, 16)
+HISTORY_FIRST_START_YEAR = _env_int(
+    "SOFASCORE_HISTORY_FIRST_START_YEAR", state.DEFAULT_FIRST_START_YEAR, 2000, 2100
+)
+# Forwarded into every planned task only when set: the scope cycle reads
+# SOFASCORE_PROXY_CONTROL_URL for its gateway and SOFASCORE_RATE_LIMIT_PER_MINUTE
+# for its source rate limit.
+HISTORY_TASK_ENV: dict[str, str] = {}
+_rate_limit = _env_int("SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE", None, 1, 60)
+if _rate_limit is not None:
+    HISTORY_TASK_ENV["SOFASCORE_RATE_LIMIT_PER_MINUTE"] = str(_rate_limit)
+_control_url = os.environ.get("SOFASCORE_HISTORY_PROXY_CONTROL_URL", "").strip()
+if _control_url:
+    HISTORY_TASK_ENV["SOFASCORE_PROXY_CONTROL_URL"] = _control_url
 HISTORY_TASK_IDS = frozenset({
     "plan_historical_batch",
     "run_historical_scope",
@@ -84,7 +122,8 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
     return state.plan_historical_batch(
         snapshot,
         completed=completed,
-        batch_size=1,
+        batch_size=HISTORY_BATCH_SIZE,
+        first_start_year=HISTORY_FIRST_START_YEAR,
         snapshot_path=SNAPSHOT_PATH,
         policy_path=POLICY_PATH,
         result_dir=RESULT_DIR,
@@ -95,6 +134,7 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
             for name, budget in workload_policy.classes.items()
             if budget.scope == "season"
         },
+        task_env=HISTORY_TASK_ENV,
     )
 
 
@@ -231,7 +271,7 @@ with DAG(
     start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
     catchup=False,
     max_active_runs=1,
-    max_active_tasks=1,
+    max_active_tasks=HISTORY_MAX_ACTIVE_TASKS,
     is_paused_upon_creation=True,
     dagrun_timeout=timedelta(hours=6),
     render_template_as_native_obj=True,
@@ -246,10 +286,10 @@ with DAG(
         task_id="run_historical_scope",
         bash_command=RUN_SCOPE_COMMAND,
         append_env=True,
-        pool=INGEST_SCRAPER_POOL,
+        pool=HISTORY_POOL,
         priority_weight=1,
         do_xcom_push=False,
-        max_active_tis_per_dag=1,
+        max_active_tis_per_dag=HISTORY_MAX_ACTIVE_TASKS,
         # One retry keeps the same run_id: the gateway reuses the signed plan,
         # finished allocations replay from raw, a latched lease is re-claimed
         # once the reaper grace (30 s) has passed.

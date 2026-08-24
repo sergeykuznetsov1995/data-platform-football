@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import sys
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -69,6 +70,94 @@ def test_run_historical_scope_gets_one_airflow_retry_after_lease_grace():
     # reaper grace (30 s) so a latched lease is reclaimable.
     assert mapped._init_kwargs["retries"] == 1
     assert mapped._init_kwargs["retry_delay"] >= timedelta(seconds=60)
+
+
+def _planner_kwargs(module, monkeypatch):
+    """Drive ``_plan_historical_batch`` to the planner and capture its kwargs."""
+
+    captured = {}
+
+    def _plan(snapshot, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(module, "_production_dag_active", lambda: False)
+    monkeypatch.setattr(
+        module.state, "read_snapshot", lambda *a, **k: {"campaign_id": "c"}
+    )
+    monkeypatch.setattr(module.state, "read_completed", lambda *a, **k: set())
+    monkeypatch.setattr(
+        module, "load_verified_workload_policy",
+        lambda *a, **k: SimpleNamespace(classes={}),
+    )
+    monkeypatch.setattr(module.state, "plan_historical_batch", _plan)
+    assert module._plan_historical_batch(run_id="manual__1") == []
+    return captured
+
+
+@pytest.mark.unit
+def test_history_lane_defaults_match_the_single_slot_campaign(monkeypatch):
+    for name in (
+        "SOFASCORE_HISTORY_BATCH_SIZE",
+        "SOFASCORE_HISTORY_POOL",
+        "SOFASCORE_HISTORY_MAX_ACTIVE_TASKS",
+        "SOFASCORE_HISTORY_FIRST_START_YEAR",
+        "SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE",
+        "SOFASCORE_HISTORY_PROXY_CONTROL_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    module = _load_dag_module()
+    mapped = _run_scope_operator()
+
+    assert module.dag._dag_kwargs["max_active_tasks"] == 1
+    assert mapped._init_kwargs["pool"] == "ingest_scraper_pool"
+    assert mapped._init_kwargs["max_active_tis_per_dag"] == 1
+    kwargs = _planner_kwargs(module, monkeypatch)
+    assert kwargs["batch_size"] == 1
+    assert kwargs["first_start_year"] == 2025
+    assert kwargs["task_env"] == {}
+
+
+@pytest.mark.unit
+def test_history_lane_knobs_come_from_env(monkeypatch):
+    monkeypatch.setenv("SOFASCORE_HISTORY_BATCH_SIZE", "3")
+    monkeypatch.setenv("SOFASCORE_HISTORY_POOL", "sofascore_history_pool")
+    monkeypatch.setenv("SOFASCORE_HISTORY_MAX_ACTIVE_TASKS", "2")
+    monkeypatch.setenv("SOFASCORE_HISTORY_FIRST_START_YEAR", "2024")
+    monkeypatch.setenv("SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE", "60")
+    monkeypatch.setenv(
+        "SOFASCORE_HISTORY_PROXY_CONTROL_URL", "http://sofascore-gw-history:8080"
+    )
+    module = _load_dag_module()
+    mapped = _run_scope_operator()
+
+    assert module.dag._dag_kwargs["max_active_tasks"] == 2
+    assert mapped._init_kwargs["pool"] == "sofascore_history_pool"
+    assert mapped._init_kwargs["max_active_tis_per_dag"] == 2
+    kwargs = _planner_kwargs(module, monkeypatch)
+    assert kwargs["batch_size"] == 3
+    assert kwargs["first_start_year"] == 2024
+    assert kwargs["task_env"] == {
+        "SOFASCORE_RATE_LIMIT_PER_MINUTE": "60",
+        "SOFASCORE_PROXY_CONTROL_URL": "http://sofascore-gw-history:8080",
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("SOFASCORE_HISTORY_BATCH_SIZE", "0"),
+        ("SOFASCORE_HISTORY_MAX_ACTIVE_TASKS", "two"),
+        ("SOFASCORE_HISTORY_FIRST_START_YEAR", "1999"),
+        ("SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE", "61"),
+    ],
+)
+def test_invalid_history_lane_knob_fails_dag_parse(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        _load_dag_module()
 
 
 @pytest.mark.unit

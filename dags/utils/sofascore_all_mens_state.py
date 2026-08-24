@@ -64,9 +64,15 @@ def plan_historical_batch(
     metadata_budget_bytes: int = 64 * 1024 * 1024,
     dag_run_id: str = "manual",
     authorized_season_classes: Mapping[str, Iterable[int | str]] | None = None,
+    task_env: Mapping[str, str] | None = None,
 ) -> list[dict[str, str]]:
-    """Select a bounded batch from one global season wave, newest first."""
+    """Select a bounded batch from one global season wave, newest first.
 
+    ``task_env`` is the lane's own environment (gateway URL, rate limit) and
+    is forwarded verbatim to every planned task; campaign keys win over it.
+    """
+
+    lane_env = {str(key): str(value) for key, value in (task_env or {}).items()}
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise CampaignPlanningError("batch_size must be a positive integer")
     if (
@@ -161,6 +167,7 @@ def plan_historical_batch(
                 f"{dag_run_id}:metadata:{campaign_id}:{wave}".encode("utf-8")
             ).hexdigest()[:20]
             return [{
+                **lane_env,
                 "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
                 "SOFASCORE_CAMPAIGN_ACTION": "metadata",
                 "SOFASCORE_CAMPAIGN_SNAPSHOT": snapshot_path,
@@ -192,6 +199,7 @@ def plan_historical_batch(
                     f"{dag_run_id}:{scope_key}".encode("utf-8")
                 ).hexdigest()[:20]
                 planned.append({
+                    **lane_env,
                     "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
                     "SOFASCORE_CAMPAIGN_ACTION": "capture",
                     "SOFASCORE_CAMPAIGN_SNAPSHOT": snapshot_path,
@@ -211,7 +219,12 @@ def plan_historical_batch(
                         Path(result_dir) / safe_run
                     ),
                     "SOFASCORE_WORKLOAD_ARTIFACT": workload_artifact,
-                    "SOFASCORE_SCOPE_RUN_ID": dag_run_id,
+                    # The gateway ledger holds one immutable plan per run_id,
+                    # so scopes of one DagRun must not share it (batch > 1).
+                    # An Airflow retry keeps the same id and reuses the plan.
+                    "SOFASCORE_SCOPE_RUN_ID": (
+                        f"{dag_run_id}--{tournament_id}-{season_id}"
+                    ),
                 })
             return planned
         if deferred_by_wave.get(wave, 0):

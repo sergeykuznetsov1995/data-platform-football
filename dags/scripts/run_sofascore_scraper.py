@@ -2083,9 +2083,11 @@ def _load_runtime_workload_plan(
         raise RuntimeError(
             f"workload plan dag_id={plan.dag_id!r} does not match {expected_dag_id!r}"
         )
+    # SOFASCORE_RUN_ID is the logical run a scope cycle planned under; it may
+    # narrow one Airflow DagRun to a single scope (history lane, batch > 1).
     base_run_id = (
-        os.environ.get("AIRFLOW_CTX_DAG_RUN_ID")
-        or os.environ.get("SOFASCORE_RUN_ID")
+        os.environ.get("SOFASCORE_RUN_ID")
+        or os.environ.get("AIRFLOW_CTX_DAG_RUN_ID")
         or ""
     ).strip()
     if base_run_id and plan.run_id not in {
@@ -2385,8 +2387,8 @@ def main(argv=None):
 
         capture_runtime = build_capture_runtime(
             run_id=(
-                os.environ.get("AIRFLOW_CTX_DAG_RUN_ID")
-                or os.environ.get("SOFASCORE_RUN_ID")
+                os.environ.get("SOFASCORE_RUN_ID")
+                or os.environ.get("AIRFLOW_CTX_DAG_RUN_ID")
                 or f"manual-{os.getpid()}"
             ),
             task_id=(os.environ.get("AIRFLOW_CTX_TASK_ID") or f"cli-{entity}"),

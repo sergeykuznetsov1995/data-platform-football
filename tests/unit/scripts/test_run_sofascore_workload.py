@@ -181,6 +181,43 @@ def test_runner_accepts_backfill_dag_with_the_actual_airflow_run_id(
     assert len(allocations) == 1
 
 
+def test_runner_prefers_the_scope_run_id_over_the_dagrun_id(tmp_path, monkeypatch):
+    # One DagRun of the history campaign can carry several scopes; each scope
+    # cycle plans under its own SOFASCORE_RUN_ID, which must win over the
+    # shared AIRFLOW_CTX_DAG_RUN_ID or the plan is rejected as foreign.
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv(
+        "AIRFLOW_CTX_DAG_ID", "dag_backfill_sofascore_all_mens"
+    )
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "scheduled-backfill-1")
+    monkeypatch.setenv("SOFASCORE_RUN_ID", "scheduled-backfill-1--17-1725")
+    policy = WorkloadBudgetPolicy(
+        "c" * 64,
+        {MATCH_WORKLOAD_CLASS: _match_budget()},
+    )
+    plan = build_partitioned_plan(
+        policy,
+        dag_id="dag_backfill_sofascore_all_mens",
+        run_id="scheduled-backfill-1--17-1725::targets",
+        partitions=[PartitionWorkload(
+            "SS-17", "2526", 17, pending_match_ids=("1",)
+        )],
+        control_token=TOKEN,
+    )
+    path = write_plan(tmp_path / "scope-targets.json", plan)
+
+    loaded, allocations = _load_runtime_workload_plan(
+        str(path),
+        entity=ENTITY_MATCH_CAPTURE,
+        league="SS-17",
+        season=2526,
+        offline_replay=False,
+    )
+
+    assert loaded.run_id == "scheduled-backfill-1--17-1725::targets"
+    assert len(allocations) == 1
+
+
 def test_runner_rejects_target_plan_for_season_capture(tmp_path, monkeypatch):
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
     monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_ingest_sofascore")

@@ -63,7 +63,35 @@ def test_planner_is_breadth_first_newest_season():
 
     assert {item["SOFASCORE_CANONICAL_SEASON"] for item in planned} == {"2526"}
     assert len(planned) == 2
-    assert {item["SOFASCORE_SCOPE_RUN_ID"] for item in planned} == {"manual"}
+    # The gateway ledger keeps one immutable plan per run_id, so two scopes
+    # of one DagRun must not share it; an Airflow retry keeps the same id.
+    assert {item["SOFASCORE_SCOPE_RUN_ID"] for item in planned} == {
+        "manual--8-825", "manual--17-1725"
+    }
+    assert "SOFASCORE_RATE_LIMIT_PER_MINUTE" not in planned[0]
+    assert "SOFASCORE_PROXY_CONTROL_URL" not in planned[0]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("second_status", ["ready", "pending"])
+def test_lane_env_is_forwarded_to_every_planned_task(second_status):
+    snapshot = _snapshot(second_status=second_status)
+    task_env = {
+        "SOFASCORE_RATE_LIMIT_PER_MINUTE": "60",
+        "SOFASCORE_PROXY_CONTROL_URL": "http://sofascore-gw-history:8080",
+    }
+
+    planned = plan_historical_batch(
+        snapshot, completed=set(), batch_size=10, task_env=task_env
+    )
+
+    assert planned
+    for item in planned:
+        assert item["SOFASCORE_RATE_LIMIT_PER_MINUTE"] == "60"
+        assert item["SOFASCORE_PROXY_CONTROL_URL"] == (
+            "http://sofascore-gw-history:8080"
+        )
+        assert item["SOFASCORE_CAMPAIGN_SNAPSHOT"].endswith("snapshot.json")
 
 
 @pytest.mark.unit
