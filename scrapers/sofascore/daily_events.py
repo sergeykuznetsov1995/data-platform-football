@@ -39,6 +39,11 @@ SCHEDULED_EVENTS_FRESHNESS_KEY = "daily"
 # needs both source ids, so they are pinned to the "no tournament" sentinel.
 _NO_TOURNAMENT_ID = "0"
 _REQUEST_BASE_URL = "https://www.sofascore.com/api/v1"
+# A global day list may carry exotic events that cannot even be attributed to
+# a tournament (no ``tournament.uniqueTournament.id``, or not an object).  One
+# such event must not fail the day of ~1500 tournaments, but a list where they
+# dominate is schema drift, not exotica.
+_UNSCOPED_FAIL_SHARE = 0.5
 
 
 class DailyEventsSchemaError(DiscoverySchemaError):
@@ -143,11 +148,16 @@ def schedule_rows_from_events(
     the ones of tournaments absent from the snapshot (other genders, youth,
     amateur) are out of scope and counted in ``excluded``; a ``season.id`` the
     snapshot does not know yet is counted in ``unknown_seasons`` for the
-    metadata wave to pick up.  An event that is not an object or lacks ``id``,
-    ``tournament.uniqueTournament.id`` or ``season.id`` is ``malformed``: that
-    is schema drift, not a foreign tournament, and fails the day (the raw list
-    is already kept).  A game listed more than once (D-1 and D lists overlap
-    across time zones) keeps its last, freshest copy.
+    metadata wave to pick up.  Scope is decided first, from
+    ``tournament.uniqueTournament.id`` alone: an event that cannot be placed
+    (not an object, or no tournament id) is ``unscoped`` — tolerated with a
+    warning as long as such events stay a minority (``_UNSCOPED_FAIL_SHARE``),
+    because a global day list legitimately carries exotic entries; a list they
+    dominate is schema drift and fails the day.  An event of a ready snapshot
+    tournament that lacks ``id`` or ``season.id`` is ``malformed`` and fails the
+    day unconditionally (the raw list is already kept).  A game listed more
+    than once (D-1 and D lists overlap across time zones) keeps its last,
+    freshest copy.
     """
 
     index = _snapshot_index(snapshot)
@@ -157,20 +167,24 @@ def schedule_rows_from_events(
         "matched": 0,
         "excluded": 0,
         "unknown_seasons": 0,
+        "unscoped": 0,
         "malformed": 0,
     }
     rows_by_game: dict[int, dict] = {}
     for item in events:
         counters["events"] += 1
-        event_id = _nested_int(item.event, "id")
         tournament_id = _nested_int(item.event, "tournament", "uniqueTournament", "id")
-        season_id = _nested_int(item.event, "season", "id")
-        if event_id is None or tournament_id is None or season_id is None:
-            counters["malformed"] += 1
+        if tournament_id is None:
+            counters["unscoped"] += 1
             continue
         entry = None if tournament_id in excluded_ids else index.get(tournament_id)
         if entry is None:
             counters["excluded"] += 1
+            continue
+        event_id = _nested_int(item.event, "id")
+        season_id = _nested_int(item.event, "season", "id")
+        if event_id is None or season_id is None:
+            counters["malformed"] += 1
             continue
         capture_key, seasons = entry
         canonical_season = seasons.get(season_id)
@@ -196,8 +210,22 @@ def schedule_rows_from_events(
         counters["matched"] += 1
     if counters["malformed"]:
         raise DailyEventsSchemaError(
-            f"{counters['malformed']} of {counters['events']} daily events lack "
-            f"id, tournament.uniqueTournament.id or season.id: {counters}"
+            f"{counters['malformed']} of {counters['events']} daily events of "
+            f"ready tournaments lack id or season.id: {counters}"
+        )
+    if counters["unscoped"] and (
+        counters["unscoped"] >= counters["events"] * _UNSCOPED_FAIL_SHARE
+    ):
+        raise DailyEventsSchemaError(
+            f"{counters['unscoped']} of {counters['events']} daily events cannot "
+            f"be placed (no object or tournament.uniqueTournament.id): {counters}"
+        )
+    if counters["unscoped"]:
+        log.warning(
+            "%d of %d daily events could not be placed in a tournament: %s",
+            counters["unscoped"],
+            counters["events"],
+            counters,
         )
     if counters["events"] and not counters["matched"]:
         # Legitimate (a day of configured/foreign tournaments only), but a

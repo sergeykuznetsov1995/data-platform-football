@@ -252,6 +252,7 @@ def test_rows_keep_ready_snapshot_tournaments_only_and_tag_league_season(
         "matched": 3,
         "excluded": 3,
         "unknown_seasons": 1,
+        "unscoped": 0,
         "malformed": 0,
     }
     assert [(row["game_id"], row["league"], row["season"]) for row in rows] == [
@@ -290,9 +291,11 @@ def test_rows_reject_skeleton_events(tmp_path):
 
 
 def test_rows_reject_events_whose_tournament_or_season_shape_drifted(tmp_path):
-    # Schema drift must not masquerade as "foreign tournaments": an event
-    # without tournament.uniqueTournament.id / season.id / id is malformed and
-    # fails the run (the raw list is already kept), never dropped silently.
+    # Schema drift must not masquerade as "foreign tournaments": an event of a
+    # READY tournament without season.id / id is malformed and fails the run
+    # (the raw list is already kept), never dropped silently.  An event that
+    # cannot even be placed (renamed tournament key) is a minority "unscoped"
+    # entry here and only warns — see the exotic-event test below.
     first, second = _fixture_events()
     renamed = _event(first, event_id=11, tournament_id=READY_TOURNAMENT,
                      season_id=76953)
@@ -310,15 +313,48 @@ def test_rows_reject_events_whose_tournament_or_season_shape_drifted(tmp_path):
     })
     fetched = fetch_daily_events(client, [date(2026, 8, 24)], _store(tmp_path))
 
-    with pytest.raises(DailyEventsSchemaError, match="2 of 3"):
+    with pytest.raises(DailyEventsSchemaError, match="1 of 3 .*ready tournaments"):
         schedule_rows_from_events(fetched, SNAPSHOT, exclude_leagues=())
+
+
+def test_rows_tolerate_a_minority_of_exotic_unscoped_events(tmp_path, caplog):
+    # Sol r3: a global day list legitimately carries exotic entries without a
+    # tournament.uniqueTournament.id — one of them must not fail the day of
+    # ~1500 tournaments; it is counted as ``unscoped`` and warned about.
+    first, second = _fixture_events()
+    exotic = _event(first, event_id=41, tournament_id=READY_TOURNAMENT,
+                    season_id=76953)
+    exotic["tournament"] = {"name": "Friendly XI"}
+    exotic.pop("season")
+    fine = [
+        _event(second, event_id=42 + n, tournament_id=READY_TOURNAMENT,
+               season_id=76953)
+        for n in range(3)
+    ]
+    client = _Client({
+        "/sport/football/scheduled-events/2026-08-24": {"events": [exotic, *fine]},
+        "/sport/football/scheduled-events/2026-08-24/inverse": {"events": []},
+    })
+    fetched = fetch_daily_events(client, [date(2026, 8, 24)], _store(tmp_path))
+
+    with caplog.at_level(logging.WARNING, logger="scrapers.sofascore.daily_events"):
+        rows, counters = schedule_rows_from_events(
+            fetched, SNAPSHOT, exclude_leagues=()
+        )
+
+    assert sorted(row["game_id"] for row in rows) == [42, 43, 44]
+    assert counters["unscoped"] == 1 and counters["malformed"] == 0
+    assert any(
+        "could not be placed" in record.getMessage() for record in caplog.records
+    )
 
 
 @pytest.mark.parametrize("junk", [None, 5])
 def test_rows_reject_non_object_events_as_malformed(tmp_path, junk):
     # Sol r2 #2: ``{"events": [null]}`` is schema drift like any other —
-    # it must count as malformed and fail the day after the raw list is kept,
-    # not be filtered out into a green empty result.
+    # it must fail the day after the raw list is kept, not be filtered out
+    # into a green empty result.  Here the junk is half of the list, i.e. at
+    # the ``_UNSCOPED_FAIL_SHARE`` threshold.
     first, _ = _fixture_events()
     fine = _event(first, event_id=31, tournament_id=READY_TOURNAMENT,
                   season_id=76953)
@@ -339,7 +375,19 @@ def test_rows_reject_non_object_events_as_malformed(tmp_path, junk):
             freshness_key="daily",
         )
     )
-    with pytest.raises(DailyEventsSchemaError, match="1 of 2"):
+    with pytest.raises(DailyEventsSchemaError, match="1 of 2 .*cannot be placed"):
+        schedule_rows_from_events(fetched, SNAPSHOT, exclude_leagues=())
+
+
+def test_rows_reject_a_list_made_only_of_junk(tmp_path):
+    # ``{"events": [null]}`` alone: nothing can be placed — fully malformed.
+    client = _Client({
+        "/sport/football/scheduled-events/2026-08-24": {"events": [None]},
+        "/sport/football/scheduled-events/2026-08-24/inverse": {"events": []},
+    })
+    fetched = fetch_daily_events(client, [date(2026, 8, 24)], _store(tmp_path))
+
+    with pytest.raises(DailyEventsSchemaError, match="1 of 1 .*cannot be placed"):
         schedule_rows_from_events(fetched, SNAPSHOT, exclude_leagues=())
 
 
