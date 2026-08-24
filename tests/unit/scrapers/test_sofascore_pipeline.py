@@ -1091,10 +1091,15 @@ def test_scope_probe_needs_min_matches_of_evidence():
     assert scope_probe_exclusions(store, probe) == frozenset()
 
 
-def test_apply_endpoint_exclusions_marks_only_excluded_endpoints_unsupported():
+def test_apply_endpoint_exclusions_marks_only_excluded_endpoints_unsupported(
+    tmp_path,
+):
+    raw_store = _runtime(tmp_path)[0].raw_store
     specs = [_event_spec("7", endpoint) for endpoint in EVENT_PATHS]
 
-    applied = apply_endpoint_exclusions(specs, frozenset({"lineups"}))
+    applied = apply_endpoint_exclusions(
+        specs, frozenset({"lineups"}), raw_store=raw_store
+    )
 
     assert [spec.key for spec in applied] == [spec.key for spec in specs]
     by_endpoint = {spec.key.endpoint: spec for spec in applied}
@@ -1103,7 +1108,65 @@ def test_apply_endpoint_exclusions_marks_only_excluded_endpoints_unsupported():
     assert "lineups" in by_endpoint["lineups"].unsupported_reason
     for endpoint in ("event", "statistics", "shotmap", "incidents"):
         assert by_endpoint[endpoint] is specs[list(EVENT_PATHS).index(endpoint)]
-    assert apply_endpoint_exclusions(specs, frozenset()) == specs
+    assert apply_endpoint_exclusions(specs, frozenset(), raw_store=raw_store) == specs
+
+
+def test_exclusion_spares_a_spec_whose_2xx_raw_is_still_unmaterialized(tmp_path):
+    """Sol r2 #1: a nonterminal DeferredMaterialization (raw 200 saved, Bronze
+    MERGE interrupted) keeps its raw evidence — the scope probe must not
+    overwrite it with a synthetic not_supported.  Only a spec without usable
+    raw is excluded."""
+    from scrapers.sofascore.live_capture import capture_live_specs
+
+    runtime, transport = _runtime(tmp_path)
+    with_raw = _event_spec(EVENT_ID, "lineups")
+    without_raw = _event_spec("14023926", "lineups")
+    body = FIXTURES["lineups"].read_bytes()
+    runtime.raw_store.store_bytes(
+        with_raw.raw_target, body, request_url=with_raw.url, http_status=200
+    )
+    runtime.manifest_store.upsert(
+        EndpointManifest(
+            key=with_raw.key,
+            status=ManifestStatus.RETRYABLE_FAILURE,
+            run_id="run",
+            task_id="capture",
+            attempts=1,
+            row_count=0,
+            http_status=200,
+            error_type="DeferredMaterialization",
+        )
+    )
+
+    applied = apply_endpoint_exclusions(
+        [with_raw, without_raw], frozenset({"lineups"}), raw_store=runtime.raw_store
+    )
+
+    assert [spec.supported for spec in applied] == [True, False]
+    assert applied[0] is with_raw
+
+    results, traffic = capture_live_specs(
+        runtime,
+        applied,
+        canonical_url="https://www.sofascore.com/tournament/premier-league/17",
+        scope="ENG-Premier League:2526",
+        entity="match_capture",
+        transport_factory=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("replayable raw opened a lease")
+        ),
+    )
+
+    assert transport.calls == 0
+    assert traffic["request_count"] == 0
+    materialized, excluded = results
+    assert materialized.manifest.error_type == "DeferredMaterialization"
+    assert materialized.raw is not None
+    assert materialized.raw.content_hash == hashlib.sha256(body).hexdigest()
+    assert materialized.manifest.row_count > 0
+    finalize_materialized_results(runtime, [materialized])
+    assert runtime.manifest_store.get(with_raw.key).status == ManifestStatus.SUCCESS
+    assert excluded.manifest.status == ManifestStatus.NOT_SUPPORTED
+    assert "scope probe" in excluded.manifest.error_message
 
 
 def test_excluded_endpoint_is_recorded_not_supported_without_transport(tmp_path):
@@ -1111,7 +1174,9 @@ def test_excluded_endpoint_is_recorded_not_supported_without_transport(tmp_path)
 
     runtime, transport = _runtime(tmp_path)
     [excluded] = apply_endpoint_exclusions(
-        [_event_spec(EVENT_ID, "lineups")], frozenset({"lineups"})
+        [_event_spec(EVENT_ID, "lineups")],
+        frozenset({"lineups"}),
+        raw_store=runtime.raw_store,
     )
 
     results, traffic = capture_live_specs(
@@ -1268,6 +1333,81 @@ def test_match_runner_probes_the_first_allocation_and_excludes_missing_endpoints
         if endpoint != "event":
             assert record.status == ManifestStatus.NOT_SUPPORTED
             assert "scope probe" in record.error_message
+
+
+def test_match_runner_probe_reads_the_manifest_of_a_terminal_first_allocation(
+    tmp_path, monkeypatch
+):
+    """Sol r2 #3: on an Airflow retry the probe allocation's terminal 404s
+    are no longer live specs (endpoint_resume_plan drops them); the verdict
+    is still read from the manifest for every endpoint of the probe matches
+    and applied to the next allocation."""
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore import live_capture
+    from scrapers.sofascore.live_capture import _zero_traffic
+
+    runtime, transport = _runtime(tmp_path)
+    plan, allocations = _two_allocation_plan(runtime)
+    _patch_match_runner_environment(
+        monkeypatch, runner, [*PROBE_MATCH_IDS, *SECOND_MATCH_IDS]
+    )
+    # The first try already made the probe allocation terminal: lineups 404
+    # for all three matches, everything else captured.
+    for match_id in PROBE_MATCH_IDS:
+        for endpoint in EVENT_PATHS:
+            spec = _event_spec(match_id, endpoint)
+            runtime.manifest_store.upsert(
+                _not_supported_manifest(spec)
+                if endpoint == "lineups"
+                else _successful_manifest(spec)
+            )
+    seen: list[list[tuple[str, str, bool]]] = []
+
+    def source(runtime, specs, **kwargs):
+        seen.append([(s.key.target_id, s.key.endpoint, s.supported) for s in specs])
+        results = []
+        for spec in specs:
+            if not spec.supported:
+                results.append(runtime.engine.capture(spec))
+                continue
+            manifest = _successful_manifest(spec)
+            runtime.manifest_store.upsert(manifest)
+            results.append(CaptureResult(manifest=manifest, network_used=True))
+        return results, _zero_traffic()
+
+    monkeypatch.setattr(live_capture, "capture_live_specs", source)
+    output = tmp_path / "match-probe-retry.json"
+
+    with patch(
+        "scrapers.sofascore.SofaScoreScraper", return_value=_runner_player_scraper()
+    ):
+        rc = runner._run_match_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=plan,
+            workload_allocations=allocations,
+            offline_replay=False,
+        )
+
+    assert rc == 0
+    assert transport.calls == 0
+    # Nothing live in the probe allocation: the source is asked once, for the
+    # second allocation, and lineups is already excluded there.
+    assert seen == [
+        [
+            (match_id, endpoint, endpoint != "lineups")
+            for match_id in SECOND_MATCH_IDS
+            for endpoint in EVENT_PATHS
+        ]
+    ]
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["excluded_endpoints"] == ["lineups"]
+    record = runtime.manifest_store.get(_event_spec(SECOND_MATCH_IDS[0], "lineups").key)
+    assert record.status == ManifestStatus.NOT_SUPPORTED
+    assert "scope probe" in record.error_message
 
 
 def test_match_runner_repair_never_applies_the_scope_probe(tmp_path, monkeypatch):

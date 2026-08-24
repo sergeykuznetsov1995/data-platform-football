@@ -917,33 +917,51 @@ def _run_match_capture(
                             for spec in live_specs
                             if spec.key.target_id in batch_ids
                         ]
-                        if not batch_specs:
-                            continue
                         if excluded:
                             batch_specs = apply_endpoint_exclusions(
-                                batch_specs, excluded
+                                batch_specs,
+                                excluded,
+                                raw_store=capture_runtime.raw_store,
                             )
-                        captured, batch_traffic = capture_live_specs(
-                            capture_runtime,
-                            batch_specs,
-                            canonical_url=canonical_url,
-                            scope=f"{league}:{season_short}",
-                            entity=ENTITY_MATCH_CAPTURE,
-                            workload_plan=workload_plan,
-                            allocation_id=allocation.allocation_id,
-                            attempt_id=(
-                                os.environ.get("AIRFLOW_CTX_TRY_NUMBER", "1")
-                                + ":"
-                                + allocation.allocation_id
-                            ),
-                        )
-                        pipeline_results.extend(captured)
-                        traffic_parts.append(batch_traffic)
-                        for spec in batch_specs:
-                            remaining_specs.pop(spec.key, None)
+                        if batch_specs:
+                            captured, batch_traffic = capture_live_specs(
+                                capture_runtime,
+                                batch_specs,
+                                canonical_url=canonical_url,
+                                scope=f"{league}:{season_short}",
+                                entity=ENTITY_MATCH_CAPTURE,
+                                workload_plan=workload_plan,
+                                allocation_id=allocation.allocation_id,
+                                attempt_id=(
+                                    os.environ.get("AIRFLOW_CTX_TRY_NUMBER", "1")
+                                    + ":"
+                                    + allocation.allocation_id
+                                ),
+                            )
+                            pipeline_results.extend(captured)
+                            traffic_parts.append(batch_traffic)
+                            for spec in batch_specs:
+                                remaining_specs.pop(spec.key, None)
                         if excluded is None and not force_replace:
+                            # The verdict is read from the manifest for every
+                            # endpoint of the probe allocation's matches, not
+                            # from the live specs: on an Airflow retry the
+                            # probe's terminal 404s are no longer live, and
+                            # the evidence must still count.
+                            probe_specs = [
+                                build_event_spec(
+                                    source_tournament_id=source_tournament_id,
+                                    source_season_id=source_season_id,
+                                    target_id=match_id,
+                                    endpoint=endpoint,
+                                    freshness_key=freshness_key,
+                                    paid_proxy=True,
+                                )
+                                for match_id in target_ids(allocation)
+                                for endpoint in EVENT_PATHS
+                            ]
                             excluded = scope_probe_exclusions(
-                                capture_runtime.manifest_store, batch_specs
+                                capture_runtime.manifest_store, probe_specs
                             )
                             results["excluded_endpoints"] = sorted(excluded)
                             if excluded:

@@ -29,7 +29,11 @@ from scrapers.sofascore.manifest import (
     utc_now_iso,
 )
 from scrapers.sofascore.rate_control import production_rate_limiter
-from scrapers.sofascore.raw_store import PayloadTarget, RawPayloadStore
+from scrapers.sofascore.raw_store import (
+    PayloadTarget,
+    RawPayloadNotFound,
+    RawPayloadStore,
+)
 from scrapers.sofascore.workload_plan import allocation_budget_bytes
 from scripts.proxy_filter.budget import (
     ProductionBudgetUnavailable,
@@ -566,12 +570,28 @@ def scope_probe_exclusions(
     )
 
 
+def _has_replayable_raw(raw_store: RawPayloadStore, spec: EndpointSpec) -> bool:
+    try:
+        _, raw = raw_store.load_bytes(spec.raw_target)
+    except RawPayloadNotFound:
+        return False
+    return 200 <= raw.http_status < 300 and raw.http_status != 204
+
+
 def apply_endpoint_exclusions(
     specs: Iterable[EndpointSpec],
     excluded: Iterable[str],
+    *,
+    raw_store: RawPayloadStore,
 ) -> list[EndpointSpec]:
     """Mark ``excluded`` endpoints unsupported: the engine records
-    ``not_supported`` for them without touching the source."""
+    ``not_supported`` for them without touching the source.
+
+    A spec that already holds a usable (2xx, non-204) raw payload — e.g. a
+    nonterminal ``DeferredMaterialization`` whose Bronze MERGE was interrupted
+    — is left supported so the engine replays and materializes the saved
+    evidence instead of overwriting it with a synthetic ``not_supported``.
+    """
     names = frozenset(excluded)
     return [
         replace(
@@ -582,7 +602,7 @@ def apply_endpoint_exclusions(
                 "(every sampled match answered 404)"
             ),
         )
-        if spec.key.endpoint in names
+        if spec.key.endpoint in names and not _has_replayable_raw(raw_store, spec)
         else spec
         for spec in specs
     ]
