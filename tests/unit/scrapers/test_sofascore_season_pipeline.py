@@ -41,7 +41,8 @@ from scrapers.sofascore.season_pipeline import (
     build_squad_spec,
     build_standings_total_spec,
     SeasonPartitionPlan,
-    _is_mutable_schedule_column,
+    _SCHEDULE_IDENTITY_COLUMNS,
+    _is_schedule_identity_conflict,
     materialize_season_partition,
     plan_season_partition,
     replay_season_partition,
@@ -67,6 +68,11 @@ FIXTURE_PATHS = {
 }
 PLAYER_EVIDENCE_CASES = FIXTURES / "sofascore_season_76986_player_evidence_cases.json"
 CUP_BRACKET_NEXT_PAGE = FIXTURES / "sofascore_season_76986_cup_schedule_next_0.json"
+BRONZE_SCHEDULE_COLUMNS = sorted(
+    json.loads((FIXTURES / "bronze_schemas.json").read_text(encoding="utf-8"))[
+        "tables"
+    ]["bronze.sofascore_schedule"]["columns"]
+)
 
 
 class UnlimitedLimiter:
@@ -1896,6 +1902,8 @@ def _replayed_partition_with_cross_page_repeat(
     mutate_identity=False,
     unknown_column=False,
     user_count_tick=False,
+    rename=False,
+    placeholder_home=False,
 ):
     """Partition whose live-feed pages repeat event 14000001 on BOTH pages.
 
@@ -1907,11 +1915,26 @@ def _replayed_partition_with_cross_page_repeat(
     swaps the home team, i.e. two different matches merged under one id — a
     data conflict that must stay a hard error. ``user_count_tick`` moves only
     the popularity counters between the two fetches, which is what the source
-    really does (#1071).
+    really does (#1071). ``rename`` reproduces the 2026-08-23 NED repeat: the
+    away team's display name and the tournament's live flag changed between
+    the two pages. ``placeholder_home`` seeds the first page with an
+    unresolved bracket slot as the home team that the later page resolves
+    into the real team.
     """
     raw_store = _raw_store(tmp_path)
     manifest = InMemoryManifestStore()
     event = _schedule_event(14000001)
+    schedule_last_payload = None
+    if user_count_tick or rename or placeholder_home:
+        schedule_last_payload = _payload(FIXTURE_PATHS["schedule_last"])
+    if rename:
+        for seeded in schedule_last_payload["events"]:
+            seeded["awayTeam"]["shortName"] = "PEC Zwolle"
+            seeded["tournament"] = {"isLive": True}
+        event["awayTeam"]["shortName"] = "Zwolle"
+        event["tournament"] = {"isLive": False}
+    if placeholder_home:
+        schedule_last_payload["events"][0]["homeTeam"] = _placeholder_team(999901)
     if mutate:
         # Reproduce the 2026-08-20 production repeat exactly: the source moved
         # the fixture, so all three of these disagreed between the two pages.
@@ -1927,9 +1950,7 @@ def _replayed_partition_with_cross_page_repeat(
             dict(event["awayTeam"]),
             dict(event["homeTeam"]),
         )
-    schedule_last_payload = None
     if user_count_tick:
-        schedule_last_payload = _payload(FIXTURE_PATHS["schedule_last"])
         for seeded in schedule_last_payload["events"]:
             _stamp_user_counts(seeded, home=59171, away=8138, tournament=32989)
         _stamp_user_counts(event, home=59115, away=8142, tournament=32953)
@@ -1985,7 +2006,8 @@ def test_partition_materializer_collapses_cross_page_repeat_with_ticking_user_co
 ):
     """#1071: the source's follower counters move between two page fetches of
     one run. That is not a data conflict — the match itself is identical — and
-    it must not drop the whole season."""
+    it must not drop the whole season. One policy for every non-identity
+    column: the fresher observation wins, counters included."""
     plan, results = _replayed_partition_with_cross_page_repeat(
         tmp_path,
         user_count_tick=True,
@@ -2002,10 +2024,64 @@ def test_partition_materializer_collapses_cross_page_repeat_with_ticking_user_co
         if str(row["game_id"]) == "14000001"
     ]
     assert len(repeats) == 1
-    # The first-seen page wins, counters included.
-    assert repeats[0]["source_page_direction"] == "last"
-    assert repeats[0]["home_team_user_count"] == 59171
-    assert repeats[0]["tournament_unique_tournament_user_count"] == 32989
+    assert repeats[0]["source_page_direction"] == "next"
+    assert repeats[0]["home_team_user_count"] == 59115
+    assert repeats[0]["tournament_unique_tournament_user_count"] == 32953
+
+
+@pytest.mark.unit
+def test_partition_materializer_collapses_cross_page_repeat_after_rename(tmp_path):
+    """Live incident 2026-08-23: NED dropped the day because the away team's
+    display name ("PEC Zwolle" -> "Zwolle") and the tournament's live flag
+    changed between the two page fetches of one run. Neither says WHICH match
+    this is, so the repeat collapses and the newer observation wins."""
+    plan, results = _replayed_partition_with_cross_page_repeat(
+        tmp_path,
+        rename=True,
+    )
+    materialization = materialize_season_partition(
+        plan,
+        results,
+        canonical_league="ENG-Premier League",
+        canonical_season="2025/26",
+    )
+    repeats = [
+        row
+        for row in materialization.schedule_rows
+        if str(row["game_id"]) == "14000001"
+    ]
+    assert len(repeats) == 1
+    assert repeats[0]["source_page_direction"] == "next"
+    assert repeats[0]["away_team_short_name"] == "Zwolle"
+    assert repeats[0]["tournament_is_live"] is False
+
+
+@pytest.mark.unit
+def test_partition_materializer_collapses_placeholder_resolved_on_later_page(
+    tmp_path,
+):
+    """A cup bracket slot ("Winner of match N", ``disabled: true``, #946)
+    resolving into the real team on a later page is the source filling in a
+    slot, not a different match: the repeat collapses to the real team."""
+    plan, results = _replayed_partition_with_cross_page_repeat(
+        tmp_path,
+        placeholder_home=True,
+    )
+    materialization = materialize_season_partition(
+        plan,
+        results,
+        canonical_league="ENG-Premier League",
+        canonical_season="2025/26",
+    )
+    repeats = [
+        row
+        for row in materialization.schedule_rows
+        if str(row["game_id"]) == "14000001"
+    ]
+    assert len(repeats) == 1
+    assert repeats[0]["source_page_direction"] == "next"
+    assert str(repeats[0]["home_team_id"]) == "42"
+    assert repeats[0].get("home_team_disabled") is not True
 
 
 def _plan_with_missing(*endpoints, pending=None):
@@ -2112,70 +2188,40 @@ def test_partition_materializer_collapses_rescheduled_cross_page_repeat(tmp_path
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "column",
-    [
-        # Identity — never collapsible.
-        "game_id",
-        "id",
-        "home_team_id",
-        "season_id",
-        # Near-misses: names that merely BEGIN like a mutable one. A prefix
-        # match without a separator would swallow all of these.
-        "detail_identity",
-        "start_timestamp_source",
-        "home_scorer_id",
-        "season_identifier",
-        "hash_id",
-        # Simply unknown.
-        "some_brand_new_field",
-    ],
+    sorted(set(BRONZE_SCHEDULE_COLUMNS) | _SCHEDULE_IDENTITY_COLUMNS),
 )
-def test_unknown_and_near_miss_columns_are_not_collapsible(column):
-    assert _is_mutable_schedule_column(column) is False
+def test_only_identity_columns_conflict_across_pages(column):
+    """Every bronze schedule column: only the seven identity columns make a
+    cross-page disagreement a conflict; everything else is state the source
+    may legally move between two fetches."""
+    expected = column in _SCHEDULE_IDENTITY_COLUMNS
+    assert _is_schedule_identity_conflict(column, {column: 1}, {column: 2}) is expected
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    "column",
-    [
-        "start_timestamp",
-        "round_info_round",
-        "detail_id",
-        "status_type",
-        "home_score_current",
-        "away_score_display",
-        "home_team_name",
-        "home_team",
-        "has_xg",
-        "changes_changes",
-        "time_injury_time1",
-        "current_period_start_timestamp",
-        "winner_code",
-        "season_year",
-    ],
-)
-def test_known_mutable_columns_are_collapsible(column):
-    assert _is_mutable_schedule_column(column) is True
-
-
-@pytest.mark.unit
-def test_partition_materializer_rejects_an_unreasoned_column_conflict(tmp_path):
-    """Collapsing is an ALLOWLIST, not "anything that is not identity".
-
-    A column nobody has classified disagreeing across two copies of one match is
-    exactly the corruption this guard exists to catch, so it stays a hard error
-    until someone decides the field is legally mutable.
+def test_partition_materializer_collapses_an_unclassified_column_change(tmp_path):
+    """A column nobody has classified disagreeing across two copies of one
+    match is state, not identity: the fresher observation wins instead of the
+    season failing until someone extends an allowlist (2026-08-20, 2026-08-23).
     """
     plan, results = _replayed_partition_with_cross_page_repeat(
         tmp_path,
         unknown_column=True,
     )
-    with pytest.raises(SeasonMaterializationError, match="duplicate schedule"):
-        materialize_season_partition(
-            plan,
-            results,
-            canonical_league="ENG-Premier League",
-            canonical_season="2025/26",
-        )
+    materialization = materialize_season_partition(
+        plan,
+        results,
+        canonical_league="ENG-Premier League",
+        canonical_season="2025/26",
+    )
+    repeats = [
+        row
+        for row in materialization.schedule_rows
+        if str(row["game_id"]) == "14000001"
+    ]
+    assert len(repeats) == 1
+    assert repeats[0]["source_page_direction"] == "next"
+    assert repeats[0]["some_brand_new_field"] == "changed"
 
 
 @pytest.mark.unit
