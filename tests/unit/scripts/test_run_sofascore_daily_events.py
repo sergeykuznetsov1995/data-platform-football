@@ -165,6 +165,24 @@ def test_fetch_failure_is_reported_and_nothing_is_written(offline, monkeypatch):
 
 
 @pytest.mark.unit
+def test_report_reads_the_client_stats_after_close(offline, monkeypatch):
+    # Sol r2 #4: the bytes of the current lease are billed to paid_proxy_bytes
+    # only when the lease closes, so the report must read stats after close().
+    class _LateBytesClient(_FakeClient):
+        @property
+        def stats(self):
+            return {"requests": 4, "paid_proxy_bytes": 2_500_000 if self.closed else 0}
+
+    monkeypatch.setattr(daily, "LeaseBrowserSofaScoreClient", _LateBytesClient)
+
+    assert daily.main(_argv(
+        offline, "--dates", "2026-08-24", "--control-url", "http://gw",
+    )) == 0
+    report = json.loads(offline["output"].read_text())
+    assert report["discovery"]["paid_proxy_bytes"] == 2_500_000
+
+
+@pytest.mark.unit
 def test_no_matching_events_writes_nothing(offline, monkeypatch):
     monkeypatch.setattr(
         daily, "schedule_rows_from_events",

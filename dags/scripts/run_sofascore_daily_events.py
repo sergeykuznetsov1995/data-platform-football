@@ -176,13 +176,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         exit_code = 1
     finally:
         if client is not None:
-            report["discovery"] = dict(client.stats)
+            # Close first: the bytes of the open lease are billed to
+            # paid_proxy_bytes only when the lease closes.
             try:
                 client.close()
             except Exception as exc:
                 report["status"] = "failed"
                 report["errors"].append(f"{type(exc).__name__}: {exc}")
                 exit_code = 1
+            report["discovery"] = dict(client.stats)
         _atomic_json(Path(args.output), report)
     return exit_code
 
