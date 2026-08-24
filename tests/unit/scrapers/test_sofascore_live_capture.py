@@ -1413,7 +1413,11 @@ def test_gateway_latch_seen_on_the_endpoint_meter_is_a_lost_lease(
                 stats.budget_exceeded = True
             return stats
 
-    lost_client = _LatchedOnFinishClient([0, 0, 100, 100, 160], final_total=160)
+    # enter, spec1 before, spec1 finish, spec2 before, spec2 finish (latched),
+    # final meter after the close attempt
+    lost_client = _LatchedOnFinishClient(
+        [0, 0, 100, 100, 160, 160], final_total=160
+    )
     lost_capture = _Capture(
         [_record(b'{"items":[{"id":1}]}'), _record(b'{"items":[{"id":2}]}')]
     )
@@ -1576,24 +1580,42 @@ def test_second_lost_lease_is_fatal(tmp_path, monkeypatch):
     assert sleeps == [35]
 
 
+class _LatchedAtCloseClient(_LeaseClient):
+    """The gateway latched the lease: close is refused with the real 409.
+
+    ``/close`` of a latched lease answers ``409 lease_close_pending`` ("lease
+    provider counters are not final"); its ``/stats`` stay readable and report
+    ``final_total`` from then on (the tail read after the last boundary).
+    """
+
+    def close(self, lease, **kwargs):
+        self.close_calls += 1
+        raise SofascoreLeaseRejected(
+            "proxy lease API rejected DELETE /v1/leases/lease-1/close "
+            "(HTTP 409): lease provider counters are not final",
+            status_code=409,
+            code="lease_close_pending",
+        )
+
+    def stats(self, lease):
+        if self.close_calls:
+            self.stats_calls += 1
+            return self._stats(self.final_total, closed=True)
+        return super().stats(lease)
+
+
 def test_lease_lost_at_close_after_the_last_spec_keeps_the_results(
     tmp_path, monkeypatch
 ):
-    # A tail latch (provider bytes after the last endpoint boundary) makes the
-    # gateway refuse a clean close.  Every spec is captured and every billed
-    # byte is already reconciled per endpoint, so there is nothing to re-lease.
+    # A tail latch makes the gateway refuse a clean close with the real 409
+    # lease_close_pending.  Every spec is captured and the final meter equals
+    # what the endpoints were charged, so there is nothing to re-lease.
     runtime, _ = _runtime(tmp_path)
     plan, allocation = _relaunch_plan(runtime)
     sleeps = []
     monkeypatch.setattr(
         "scrapers.sofascore.live_capture._relaunch_sleep", sleeps.append
     )
-
-    class _LatchedAtCloseClient(_LeaseClient):
-        def close(self, lease, **kwargs):
-            self.close_calls += 1
-            raise SofascoreLeaseProtocolError("proxy lease did not close cleanly")
-
     client = _LatchedAtCloseClient([0, 0, 100], final_total=100)
     factory = _LeaseSequenceFactory(
         _TransportFactory(client, _Capture([_record(b'{"items":[{"id":1}]}')]))
@@ -1609,6 +1631,112 @@ def test_lease_lost_at_close_after_the_last_spec_keeps_the_results(
     assert sleeps == []
     assert traffic["lease_relaunches"] == 0
     assert traffic["provider_total_bytes"] == traffic["paid_proxy_bytes"] == 100
+
+
+def test_tail_bytes_after_a_lost_close_of_a_complete_batch_fail_accounting(
+    tmp_path, monkeypatch
+):
+    # Same 409 at close, but the final meter shows 30 bytes the gateway read
+    # after the last endpoint boundary.  Nobody can be charged for them any
+    # more, so the batch must not report itself as fully paid.
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _relaunch_plan(runtime)
+    monkeypatch.setattr(
+        "scrapers.sofascore.live_capture._relaunch_sleep", lambda _s: None
+    )
+    client = _LatchedAtCloseClient([0, 0, 100], final_total=130)
+    factory = _LeaseSequenceFactory(
+        _TransportFactory(client, _Capture([_record(b'{"items":[{"id":1}]}')]))
+    )
+
+    with pytest.raises(BudgetAccountingError, match="meter=130, endpoints=100"):
+        _capture_batch(runtime, [_spec(1, "event")], plan, allocation, factory)
+
+    assert factory.attempt_ids == ["1"]
+
+
+def test_protocol_error_at_close_is_an_error_not_a_lost_lease(
+    tmp_path, monkeypatch
+):
+    # Inconsistent close statistics (closed=False, tunnels left, id mismatch)
+    # are a protocol error, not the gateway's latch: no relaunch, no
+    # "complete batch" shortcut — the error surfaces as before B2.
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _relaunch_plan(runtime)
+    sleeps = []
+    monkeypatch.setattr(
+        "scrapers.sofascore.live_capture._relaunch_sleep", sleeps.append
+    )
+
+    class _InconsistentCloseClient(_LeaseClient):
+        def close(self, lease, **kwargs):
+            self.close_calls += 1
+            raise SofascoreLeaseProtocolError("proxy lease did not close cleanly")
+
+    client = _InconsistentCloseClient([0, 0, 100], final_total=100)
+    factory = _LeaseSequenceFactory(
+        _TransportFactory(client, _Capture([_record(b'{"items":[{"id":1}]}')]))
+    )
+
+    with pytest.raises(SofascoreLeaseProtocolError, match="did not close cleanly"):
+        _capture_batch(runtime, [_spec(1, "event")], plan, allocation, factory)
+
+    assert factory.attempt_ids == ["1"]
+    assert sleeps == []
+
+
+def test_tail_bytes_on_the_lost_lease_final_meter_are_charged_to_the_batch(
+    tmp_path, monkeypatch
+):
+    # The meter read at the moment of loss (100) is not final: while closing
+    # the latched lease the gateway reads a 30-byte provider tail.  The final
+    # meter is read AFTER the close attempt and the tail is charged to the
+    # lost endpoint, so the relaunched batch reports 130 + 150 paid bytes.
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _relaunch_plan(runtime)
+    sleeps = []
+    monkeypatch.setattr(
+        "scrapers.sofascore.live_capture._relaunch_sleep", sleeps.append
+    )
+
+    class _TailAfterCloseClient(_EndpointConcurrentClient):
+        def close(self, lease, **kwargs):
+            self.close_completed.append(kwargs.get("completed"))
+            self.close_calls += 1
+            raise SofascoreLeaseRejected(
+                "proxy lease API rejected DELETE /v1/leases/lease-1/close "
+                "(HTTP 409): lease provider counters are not final",
+                status_code=409,
+                code="lease_close_pending",
+            )
+
+        def stats(self, lease):
+            if self.close_calls:
+                self.stats_calls += 1
+                return self._stats(self.final_total, closed=True)
+            return super().stats(lease)
+
+    # enter, spec1 before, spec1 finish, spec2 before, (meter at loss)
+    lost_client = _TailAfterCloseClient([0, 0, 100, 100, 100], final_total=130)
+    fresh_client = _RecordingCloseClient([0, 0, 150], final_total=150)
+    factory = _LeaseSequenceFactory(
+        _TransportFactory(lost_client, _Capture([_record(b'{"items":[{"id":1}]}')])),
+        _TransportFactory(fresh_client, _Capture([_record(b'{"items":[{"id":2}]}')])),
+    )
+
+    results, traffic = _capture_batch(
+        runtime, [_spec(1, "event"), _spec(2, "lineups")], plan, allocation, factory
+    )
+
+    assert len(results) == 2
+    assert factory.attempt_ids == ["1", "1:relaunch1"]
+    assert sleeps == [35]
+    assert lost_client.close_completed == [False]
+    assert traffic["lease_relaunches"] == 1
+    assert traffic["provider_total_bytes"] == traffic["paid_proxy_bytes"] == 280
+    assert traffic["endpoint_provider_bytes"] == {"event": 100, "lineups": 180}
+
+
 def test_lease_traffic_reports_the_429_delta_of_this_lease_only(tmp_path):
     runtime, _ = _runtime(tmp_path)
     engine = runtime.engine

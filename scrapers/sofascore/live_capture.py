@@ -31,10 +31,7 @@ from scripts.proxy_filter.budget import (
     ProxyBudgetExceeded,
 )
 from scrapers.sofascore.camoufox_capture import ProxyConnectivityError
-from scrapers.sofascore.lease_client import (
-    SofascoreLeaseProtocolError,
-    SofascoreLeaseRejected,
-)
+from scrapers.sofascore.lease_client import SofascoreLeaseRejected
 from scrapers.sofascore.manifest import ManifestStatus
 from scrapers.sofascore.workload_plan import SignedDagRunPlan, WorkloadAllocation
 
@@ -45,11 +42,18 @@ _ALLOWED_SOURCE_HOSTS = frozenset({"api.sofascore.com", "www.sofascore.com"})
 
 # Gateway rejection codes that mean "this lease/slot is gone or still held",
 # not "the budget is spent": a latched lease refuses its next endpoint
-# boundary (409 endpoint_concurrent), and until the reaper reclaims it
+# boundary (409 endpoint_concurrent) and a clean close (409
+# lease_close_pending), and until the reaper reclaims it
 # (LATCHED_SLOT_RECLAIM_GRACE_SECONDS = 30) a fresh lease for the same
 # allocation is refused (409 concurrent_allocation / 429 concurrency_limited).
+# Any other control-plane error (a protocol error included) is not a loss.
 _LEASE_LOST_CODES = frozenset(
-    {"endpoint_concurrent", "concurrent_allocation", "concurrency_limited"}
+    {
+        "endpoint_concurrent",
+        "concurrent_allocation",
+        "concurrency_limited",
+        "lease_close_pending",
+    }
 )
 _RELEASE_WAIT_SECONDS = 35
 _REACQUIRE_ATTEMPTS = 3
@@ -663,6 +667,8 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
                         )
                     )
                     request_boundary = None
+                elif lease_lost:
+                    after = self.close_lost_lease()
                 else:
                     after = self._validate_stats(self._client.stats(self._lease))
                 # Include bytes that arrived after the previous endpoint's
@@ -682,6 +688,13 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
                 self._endpoint_request_provider_bytes.setdefault(
                     provider_budget.endpoint, []
                 ).append(provider_bytes)
+            except BudgetAccountingError:
+                if lease_lost:
+                    # The revoked lease's final meter is unreadable or
+                    # inconsistent: fail closed here, never relaunch on an
+                    # understated charge.
+                    raise
+                provider_bytes = None
             except Exception:
                 provider_bytes = None
             raise TransportError(
@@ -697,6 +710,21 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
             self._client.finish_endpoint(self._lease, request_boundary)
         )
         request_boundary = None
+        source_requests = max(
+            0,
+            int(getattr(self._capture, "_source_request_count", source_before) or 0)
+            - source_before,
+        )
+        # Real exhaustion only flags ``budget_exceeded``; the gateway's
+        # accounting latch flags it AND closes the lease.  The allocation may
+        # still hold budget for a fresh lease (#1218), but this lease's meter
+        # is final only after its close.
+        revoked = bool(getattr(after, "budget_exceeded", False)) and bool(
+            getattr(after, "closed", False)
+        )
+        if revoked:
+            self.lease_lost = "SofaScore proxy lease was revoked by the gateway mid-batch"
+            after = self.close_lost_lease()
         after_total = int(after.total_bytes)
         if after_total < before_total or after_total < self._accounted_provider_bytes:
             raise BudgetAccountingError(
@@ -708,19 +736,12 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
         self._endpoint_request_provider_bytes.setdefault(
             provider_budget.endpoint, []
         ).append(provider_bytes)
-        source_requests = max(
-            0,
-            int(getattr(self._capture, "_source_request_count", source_before) or 0)
-            - source_before,
-        )
-        if bool(getattr(after, "budget_exceeded", False)):
-            message = "SofaScore proxy lease exhausted the logical DAG-run budget"
-            if bool(getattr(after, "closed", False)):
-                # Real exhaustion only flags ``budget_exceeded``; the gateway's
-                # accounting latch flags it AND closes the lease.  The
-                # allocation may still hold budget for a fresh lease (#1218).
-                message = "SofaScore proxy lease was revoked by the gateway mid-batch"
-                self.lease_lost = message
+        if revoked or bool(getattr(after, "budget_exceeded", False)):
+            message = (
+                self.lease_lost
+                if revoked
+                else "SofaScore proxy lease exhausted the logical DAG-run budget"
+            )
             raise TransportError(
                 message,
                 provider_bytes=provider_bytes,
@@ -815,6 +836,32 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
                 + self._safe_error(capture_error)
             ) from None
         return final
+
+    def close_lost_lease(self) -> Any:
+        """Close the revoked lease now and return its FINAL meter.
+
+        The meter that exposed the loss is not final: while closing a latched
+        lease the gateway still reads the provider tail behind the last
+        endpoint boundary.  The close itself is refused (409
+        ``lease_close_pending``), but the lease's stats stay readable until
+        the reaper finalizes it, and that read is what this batch is charged
+        before any fresh lease is taken.  An unreadable final meter is an
+        accounting failure, never a relaunch.
+        """
+        try:
+            self.close(completed=False)
+        except Exception as exc:  # noqa: BLE001 — the final meter below is the verdict
+            log.warning(
+                "revoked SofaScore lease did not close cleanly: %s",
+                self._safe_error(exc),
+            )
+        try:
+            return self._validate_stats(self._client.stats(self._lease))
+        except Exception as exc:  # noqa: BLE001 — typed for the engine's ledger
+            raise BudgetAccountingError(
+                "final meter of the revoked SofaScore lease is unavailable: "
+                + self._safe_error(exc)
+            ) from None
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         try:
@@ -1061,21 +1108,24 @@ def capture_live_specs(
                     attempt,
                     acquire_attempts=_REACQUIRE_ATTEMPTS if relaunches else 1,
                 )
-            except (
-                _LeaseLost,
-                SofascoreLeaseRejected,
-                SofascoreLeaseProtocolError,
-            ) as exc:
+            except (_LeaseLost, SofascoreLeaseRejected) as exc:
                 lost = leases[-1]
-                if (
-                    getattr(lost, "mode", "") != "production"
-                    or not _lease_lost(exc, pending)
-                ):
+                if getattr(lost, "mode", "") != "production" or not _lease_lost(exc):
                     raise
                 if not pending:
                     # The gateway refused a clean close after the last spec (a
-                    # tail latch).  Every spec is captured and every billed byte
-                    # was reconciled per endpoint, so nothing is left to re-lease.
+                    # tail latch, 409 lease_close_pending).  Every spec is
+                    # captured, so nothing is left to re-lease — but the final
+                    # meter must still equal what the endpoints were charged:
+                    # a tail behind the last boundary has no payer any more.
+                    charged = int(lost.provider_snapshot()["provider_total_bytes"])
+                    final = int(lost.close_lost_lease().total_bytes)
+                    if final != charged:
+                        raise BudgetAccountingError(
+                            "unattributed SofaScore provider traffic after the "
+                            f"lease was lost at close: meter={final}, "
+                            f"endpoints={charged}"
+                        ) from exc
                     log.warning(
                         "SofaScore lease %s was lost while closing a complete "
                         "batch: %s",
@@ -1120,19 +1170,15 @@ class _LeaseLost(RuntimeError):
 
     def __init__(self, reason: str, provider: Mapping[str, Any]) -> None:
         super().__init__(reason)
-        # Meter of the lost lease at the moment of loss: exactly the bytes the
-        # engine was charged for it (its later close may report a tail).
+        # Final meter of the lost lease, read after its close: exactly the
+        # bytes the engine was charged for it, provider tail included.
         self.provider = dict(provider)
 
 
-def _lease_lost(exc: BaseException, pending: Sequence[Any]) -> bool:
+def _lease_lost(exc: BaseException) -> bool:
     if isinstance(exc, _LeaseLost):
         return True
-    if isinstance(exc, SofascoreLeaseRejected):
-        return exc.code in _LEASE_LOST_CODES
-    # A protocol error can only escape the lease after the batch completed
-    # (``close`` of a latched lease); before that, ``__exit__`` swallows it.
-    return not pending
+    return isinstance(exc, SofascoreLeaseRejected) and exc.code in _LEASE_LOST_CODES
 
 
 def _require_publishable(result: Any) -> None:
@@ -1223,8 +1269,9 @@ def _live_traffic(
     )
     traffic.update(transport.provider_snapshot())
     if lost_provider is not None:
-        # A lease lost mid-batch was reconciled per endpoint while it was live;
-        # its meter belongs to this batch's paid total alongside the live lease.
+        # A lease lost mid-batch was reconciled per endpoint up to its final
+        # meter; that meter belongs to this batch's paid total alongside the
+        # live lease.
         for field in (
             "provider_up_bytes",
             "provider_down_bytes",
