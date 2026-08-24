@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from utils.sofascore_dq import (
+    REQUIRED_ACCEPTABLE_STATES,
     ActiveRegistryPartition,
     CaptureExpectation,
     SofaScoreContractError,
@@ -379,7 +380,7 @@ def test_required_manifest_completeness_rejects_failure_and_schema_error():
     assert not validate_manifest_completeness(expected, observations).passed
 
 
-def test_optional_endpoint_accepts_not_supported_but_required_does_not():
+def test_not_supported_is_terminal_for_optional_and_required_endpoints():
     expected = [CaptureExpectation("standings_total", "season", "76986")]
     observed = [
         {
@@ -391,9 +392,19 @@ def test_optional_endpoint_accepts_not_supported_but_required_does_not():
     ]
     assert validate_manifest_completeness(expected, observed).passed
 
+    # A source that does not publish lineups for a tournament is an absence
+    # of data, not an incomplete capture: 403/429/5xx never become
+    # not_supported (manifest invariant), so accepting it opens no hole.
     required = [CaptureExpectation("lineups", "event", "m1")]
     observed[0].update(endpoint="lineups", target_type="event", target_id="m1")
-    assert not validate_manifest_completeness(required, observed).passed
+    assert validate_manifest_completeness(required, observed).passed
+    assert REQUIRED_ACCEPTABLE_STATES == {"success", "legitimate_empty", "not_supported"}
+
+    for state in ("retryable_failure", "schema_error"):
+        observed[0]["state"] = state
+        report = validate_manifest_completeness(required, observed)
+        assert not report.passed
+        assert report.findings[0].code == "endpoint_incomplete"
 
 
 def test_latest_manifest_attempt_wins():
@@ -739,6 +750,13 @@ def test_partition_sql_references_only_materialized_contract_tables():
     assert "source_season_id = '76986'" in completeness.sql
     for endpoint in contract["committed_state_dq"]["required_event_endpoints"]:
         assert f"'{endpoint}'" in completeness.sql
+    # The SQL gate must accept exactly the same terminal states as the
+    # in-process gate, including not_supported for required endpoints.
+    accepted_states = ", ".join(
+        f"'{state}'" for state in sorted(REQUIRED_ACCEPTABLE_STATES)
+    )
+    assert f"m.status NOT IN ({accepted_states}))" in completeness.sql
+    assert "'not_supported'" in accepted_states
 
 
 def test_active_registry_partitions_are_capture_allowed_and_sorted(monkeypatch):

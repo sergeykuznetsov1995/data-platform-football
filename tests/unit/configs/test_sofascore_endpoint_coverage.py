@@ -42,6 +42,7 @@ def test_manifest_states_are_exact_and_http_errors_not_success(coverage):
     assert set(coverage["manifest"]["acceptable_terminal_states"]["required"]) == {
         "success",
         "legitimate_empty",
+        "not_supported",
     }
 
 

@@ -40,7 +40,15 @@ MANIFEST_STATES = frozenset(
         "schema_error",
     }
 )
-REQUIRED_ACCEPTABLE_STATES = frozenset({"success", "legitimate_empty"})
+# ``not_supported`` is terminal for required endpoints too: it is written only
+# when the source genuinely does not publish the payload (a 404 under
+# ``freshness='final'`` or an explicit ``supported=False`` spec), never for
+# 403/429/5xx, which stay ``retryable_failure`` by the manifest invariant. A
+# tournament whose lineups the source does not have is therefore complete "as
+# available" rather than ``endpoint_incomplete``. Required/optional are kept as
+# two names because ``required`` still drives the coverage contract and the
+# committed-state SQL gate.
+REQUIRED_ACCEPTABLE_STATES = frozenset({"success", "legitimate_empty", "not_supported"})
 OPTIONAL_ACCEPTABLE_STATES = frozenset({"success", "legitimate_empty", "not_supported"})
 RETRYABLE_HTTP_STATUSES = frozenset({403, 429, 500, 502, 503, 504})
 
@@ -1532,6 +1540,9 @@ def build_partition_dq_queries(
     endpoint_names = ", ".join(
         _sql_literal(endpoint) for endpoint in required_endpoints
     )
+    accepted_states = ", ".join(
+        _sql_literal(state) for state in sorted(REQUIRED_ACCEPTABLE_STATES)
+    )
     queries.append(
         DQQuery(
             name="required_endpoint_completeness",
@@ -1551,7 +1562,7 @@ def build_partition_dq_queries(
                 f"endpoint IN ({endpoint_names})), latest_manifest AS (SELECT "
                 "target_id, endpoint, status FROM ranked_manifest WHERE rn = 1) "
                 "SELECT COUNT_IF(m.status IS NULL OR m.status NOT IN "
-                "('success', 'legitimate_empty')) FROM expected x LEFT JOIN "
+                f"({accepted_states})) FROM expected x LEFT JOIN "
                 "latest_manifest m ON m.target_id = x.target_id AND "
                 "m.endpoint = x.endpoint"
             ),

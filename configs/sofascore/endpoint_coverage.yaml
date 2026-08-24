@@ -38,7 +38,7 @@ manifest:
     - retryable_failure
     - schema_error
   acceptable_terminal_states:
-    required: [success, legitimate_empty]
+    required: [success, legitimate_empty, not_supported]
     optional: [success, legitimate_empty, not_supported]
   retryable_http_statuses: [403, 429, 500, 502, 503, 504]
   exact_raw_lineage:
