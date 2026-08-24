@@ -43,8 +43,6 @@ WORKLOAD_ARTIFACT = os.environ.get(
 )
 ACTIVE_COOLDOWN = timedelta(minutes=1)
 IDLE_COOLDOWN = timedelta(minutes=30)
-HISTORY_BLACKOUT_START_HOUR_UTC = 8
-HISTORY_BLACKOUT_END_HOUR_UTC = 17
 HISTORY_TASK_IDS = frozenset({
     "plan_historical_batch",
     "run_historical_scope",
@@ -54,17 +52,13 @@ HISTORY_TASK_IDS = frozenset({
 })
 
 
-def _history_start_allowed(
-    *, now: datetime, production_active: bool
-) -> bool:
-    if production_active:
-        return False
-    hour = now.astimezone(timezone.utc).hour
-    return not (
-        HISTORY_BLACKOUT_START_HOUR_UTC
-        <= hour
-        < HISTORY_BLACKOUT_END_HOUR_UTC
-    )
+def _history_start_allowed(*, production_active: bool) -> bool:
+    # No clock blackout: the daily ingest shares ``ingest_scraper_pool`` (one
+    # slot), so its 14:00 UTC run queues behind the scope in flight (usually
+    # <=75 min, at most the 4 h execution timeout) instead of colliding with
+    # it. Separate pools without a second gateway would answer 429
+    # ``concurrency_limited``; the pool stays shared until that gateway lands.
+    return not production_active
 
 
 def _production_dag_active() -> bool:
@@ -81,10 +75,7 @@ def _production_dag_active() -> bool:
 
 
 def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
-    if not _history_start_allowed(
-        now=datetime.now(timezone.utc),
-        production_active=_production_dag_active(),
-    ):
+    if not _history_start_allowed(production_active=_production_dag_active()):
         return []
     snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
     campaign_id = str(snapshot.get("campaign_id") or "")

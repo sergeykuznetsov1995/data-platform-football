@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib
 import sys
-from datetime import datetime, timezone
 
 import pytest
 
@@ -42,15 +41,13 @@ def test_all_mens_backfill_uses_one_bounded_dynamic_operator():
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("hour", "production_active", "expected"),
-    [(7, False, True), (8, False, False), (14, False, False),
-     (17, False, True), (2, True, False), (18, True, False)],
+    ("production_active", "expected"), [(False, True), (True, False)]
 )
 def test_history_admission_protects_the_daily_window(
-    hour, production_active, expected
+    production_active, expected
 ):
     module = importlib.import_module("dags.dag_backfill_sofascore_all_mens")
     assert module._history_start_allowed(
-        now=datetime(2026, 8, 22, hour, tzinfo=timezone.utc),
         production_active=production_active,
     ) is expected
+    assert not hasattr(module, "HISTORY_BLACKOUT_START_HOUR_UTC")
