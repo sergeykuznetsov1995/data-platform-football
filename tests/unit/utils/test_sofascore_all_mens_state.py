@@ -7,7 +7,10 @@ import pytest
 
 from dags.utils.sofascore_all_mens_state import (
     campaign_scope_key,
+    clear_failed,
+    mark_failed,
     plan_historical_batch,
+    read_failures,
 )
 from scrapers.sofascore.workload_plan import (
     production_season_shape,
@@ -230,3 +233,49 @@ def test_completed_keys_survive_a_new_metadata_snapshot_revision():
 
     assert snapshot["snapshot_id"] != old_snapshot_id
     assert {item["SOFASCORE_CANONICAL_SEASON"] for item in planned} == {"2425"}
+
+
+@pytest.mark.unit
+def test_scope_parks_after_max_attempts_and_its_tournament_waits(tmp_path):
+    snapshot = _snapshot()
+    campaign_id = snapshot["campaign_id"]
+    failures_path = tmp_path / "failures.json"
+    head = campaign_scope_key(campaign_id, 8, 825)
+
+    def _plan():
+        return [item["SOFASCORE_SCOPE_KEY"] for item in plan_historical_batch(
+            snapshot,
+            completed=set(),
+            batch_size=10,
+            failures=read_failures(failures_path, campaign_id=campaign_id),
+            max_scope_attempts=3,
+        )]
+
+    assert _plan()[0] == head
+    for run_id in ("run-1", "run-2"):
+        mark_failed(
+            failures_path, campaign_id=campaign_id, scope_key=head, run_id=run_id
+        )
+    assert _plan()[0] == head
+    mark_failed(
+        failures_path, campaign_id=campaign_id, scope_key=head, run_id="run-3"
+    )
+
+    # Parked: the head of the queue no longer retries forever, the next
+    # scope in rank order runs; the parked scope holds its deeper season.
+    assert _plan() == [
+        campaign_scope_key(campaign_id, 17, 1725),
+        campaign_scope_key(campaign_id, 17, 1724),
+    ]
+    attempts = read_failures(failures_path, campaign_id=campaign_id)
+    assert attempts[head]["count"] == 3
+    assert attempts[head]["last_run_id"] == "run-3"
+    assert attempts[head]["last_at"].endswith("+00:00")
+    document = json.loads(failures_path.read_text())
+    assert document["schema_version"] == 1
+    assert document["campaign_id"] == campaign_id
+
+    clear_failed(failures_path, campaign_id=campaign_id, scope_key=head)
+
+    assert head not in read_failures(failures_path, campaign_id=campaign_id)
+    assert _plan()[0] == head

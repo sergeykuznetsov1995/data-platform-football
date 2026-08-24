@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import tempfile
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -23,8 +25,12 @@ except ImportError:  # pragma: no cover - production is Linux
     fcntl = None
 
 
+logger = logging.getLogger(__name__)
+
 STATE_SCHEMA_VERSION = 1
+FAILURES_SCHEMA_VERSION = 1
 DEFAULT_FIRST_START_YEAR = 2025
+DEFAULT_MAX_SCOPE_ATTEMPTS = 3
 
 
 class CampaignPlanningError(ValueError):
@@ -65,6 +71,8 @@ def plan_historical_batch(
     dag_run_id: str = "manual",
     authorized_season_classes: Mapping[str, Iterable[int | str]] | None = None,
     task_env: Mapping[str, str] | None = None,
+    failures: Mapping[str, Mapping[str, Any]] | None = None,
+    max_scope_attempts: int = DEFAULT_MAX_SCOPE_ATTEMPTS,
 ) -> list[dict[str, str]]:
     """Select a bounded batch: every tournament's newest season, then deeper.
 
@@ -75,6 +83,10 @@ def plan_historical_batch(
     deferred (unmeasured) season is skipped and holds the deeper seasons of
     its tournament until a later canary wave unlocks the shape.
 
+    ``failures`` is the campaign's failure memory (see ``read_failures``): a
+    scope with ``count >= max_scope_attempts`` is parked like a deferred one
+    instead of retrying at the head of the queue forever.
+
     ``task_env`` is the lane's own environment (gateway URL, rate limit) and
     is forwarded verbatim to every planned task; campaign keys win over it.
     """
@@ -82,6 +94,12 @@ def plan_historical_batch(
     lane_env = {str(key): str(value) for key, value in (task_env or {}).items()}
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise CampaignPlanningError("batch_size must be a positive integer")
+    if (
+        isinstance(max_scope_attempts, bool)
+        or not isinstance(max_scope_attempts, int)
+        or max_scope_attempts < 1
+    ):
+        raise CampaignPlanningError("max_scope_attempts must be a positive integer")
     if (
         isinstance(metadata_budget_bytes, bool)
         or not isinstance(metadata_budget_bytes, int)
@@ -134,33 +152,45 @@ def plan_historical_batch(
             kind = "ready"
             if tournament_status != "ready" or status != "ready":
                 kind = "pending"
-            elif campaign_scope_key(
-                campaign_id,
-                int(tournament["unique_tournament_id"]),
-                int(season["source_season_id"]),
-            ) in completed_keys:
-                kind = "completed"
-            elif authorized is not None:
-                source_format = str(season.get("season_format") or "")
-                capture_format = {
-                    "split_year": "split_year",
-                    "single_year": "calendar_year",
-                }.get(source_format, source_format)
-                try:
-                    shape = production_season_shape(
-                        season_format=capture_format,
-                        team_count_band=team_count_band(season.get("team_count")),
-                        max_pages_per_direction=50,
+            else:
+                key = campaign_scope_key(
+                    campaign_id,
+                    int(tournament["unique_tournament_id"]),
+                    int(season["source_season_id"]),
+                )
+                attempts = (failures or {}).get(key) or {}
+                if key in completed_keys:
+                    kind = "completed"
+                elif int(attempts.get("count", 0)) >= max_scope_attempts:
+                    kind = "parked"
+                    logger.warning(
+                        "campaign scope %s parked after %s failed attempts "
+                        "(last run %s)",
+                        key, attempts.get("count"), attempts.get("last_run_id"),
                     )
-                    class_name = season_workload_class(shape)
-                    measured = authorized.get(class_name)
-                except WorkloadPlanError:
-                    measured = None
-                tournament_id = str(tournament.get("unique_tournament_id"))
-                if measured is None or (
-                    tournament_id not in measured and len(measured) < 2
-                ):
-                    kind = "deferred"
+                elif authorized is not None:
+                    source_format = str(season.get("season_format") or "")
+                    capture_format = {
+                        "split_year": "split_year",
+                        "single_year": "calendar_year",
+                    }.get(source_format, source_format)
+                    try:
+                        shape = production_season_shape(
+                            season_format=capture_format,
+                            team_count_band=team_count_band(
+                                season.get("team_count")
+                            ),
+                            max_pages_per_direction=50,
+                        )
+                        class_name = season_workload_class(shape)
+                        measured = authorized.get(class_name)
+                    except WorkloadPlanError:
+                        measured = None
+                    tournament_id = str(tournament.get("unique_tournament_id"))
+                    if measured is None or (
+                        tournament_id not in measured and len(measured) < 2
+                    ):
+                        kind = "deferred"
             rank = (depth, -wave, int(tournament["unique_tournament_id"]))
             ranked.append((rank, kind, tournament, season))
             if kind not in ("ready", "completed"):
@@ -169,7 +199,7 @@ def plan_historical_batch(
     ranked.sort(key=lambda item: item[0])
     planned: list[dict[str, str]] = []
     for _rank, kind, tournament, season in ranked:
-        if kind in ("completed", "deferred"):
+        if kind in ("completed", "deferred", "parked"):
             continue
         if kind == "pending":
             if planned:
@@ -289,41 +319,105 @@ def _state_lock(path: Path):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _write_document_atomically(destination: Path, document: Mapping[str, Any]) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{destination.name}.", dir=str(destination.parent)
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(json.dumps(
+                document, ensure_ascii=False, indent=2
+            ).encode() + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def mark_completed(path: str | Path, *, campaign_id: str, scope_key: str) -> None:
     destination = Path(path)
     with _state_lock(destination):
         completed = read_completed(destination, campaign_id=campaign_id)
         completed.add(str(scope_key))
-        document = {
+        _write_document_atomically(destination, {
             "schema_version": STATE_SCHEMA_VERSION,
             "campaign_id": campaign_id,
             "completed": sorted(completed),
+        })
+
+
+def read_failures(path: str | Path, *, campaign_id: str) -> dict[str, dict[str, Any]]:
+    """Failure memory: ``{scope_key: {"count", "last_run_id", "last_at"}}``.
+
+    Lives in ``failures.json`` next to ``state.json`` (which stays at schema
+    v1 untouched); a missing file means no failures.
+    """
+
+    source = Path(path)
+    if not source.exists():
+        return {}
+    try:
+        value = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CampaignPlanningError(f"cannot read campaign failures: {exc}") from exc
+    if (
+        not isinstance(value, Mapping)
+        or value.get("schema_version") != FAILURES_SCHEMA_VERSION
+        or value.get("campaign_id") != campaign_id
+        or not isinstance(value.get("attempts"), Mapping)
+    ):
+        raise CampaignPlanningError("campaign failures do not match the snapshot")
+    return {str(key): dict(item) for key, item in value["attempts"].items()}
+
+
+def _write_failures(
+    destination: Path, *, campaign_id: str, attempts: Mapping[str, Mapping[str, Any]]
+) -> None:
+    _write_document_atomically(destination, {
+        "schema_version": FAILURES_SCHEMA_VERSION,
+        "campaign_id": campaign_id,
+        "attempts": {key: attempts[key] for key in sorted(attempts)},
+    })
+
+
+def mark_failed(
+    path: str | Path, *, campaign_id: str, scope_key: str, run_id: str
+) -> None:
+    destination = Path(path)
+    with _state_lock(destination):
+        attempts = read_failures(destination, campaign_id=campaign_id)
+        previous = attempts.get(str(scope_key)) or {}
+        attempts[str(scope_key)] = {
+            "count": int(previous.get("count", 0)) + 1,
+            "last_run_id": str(run_id),
+            "last_at": datetime.now(timezone.utc).isoformat(),
         }
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(
-            prefix=f".{destination.name}.", dir=str(destination.parent)
-        )
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(json.dumps(
-                    document, ensure_ascii=False, indent=2
-                ).encode() + b"\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, destination)
-        except Exception:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-            raise
+        _write_failures(destination, campaign_id=campaign_id, attempts=attempts)
+
+
+def clear_failed(path: str | Path, *, campaign_id: str, scope_key: str) -> None:
+    destination = Path(path)
+    with _state_lock(destination):
+        attempts = read_failures(destination, campaign_id=campaign_id)
+        if attempts.pop(str(scope_key), None) is None:
+            return
+        _write_failures(destination, campaign_id=campaign_id, attempts=attempts)
 
 
 __all__ = [
     "CampaignPlanningError",
     "campaign_scope_key",
+    "clear_failed",
     "mark_completed",
+    "mark_failed",
     "plan_historical_batch",
     "read_completed",
+    "read_failures",
     "read_snapshot",
 ]

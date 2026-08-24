@@ -86,6 +86,7 @@ def _planner_kwargs(module, monkeypatch):
         module.state, "read_snapshot", lambda *a, **k: {"campaign_id": "c"}
     )
     monkeypatch.setattr(module.state, "read_completed", lambda *a, **k: set())
+    monkeypatch.setattr(module.state, "read_failures", lambda *a, **k: {})
     monkeypatch.setattr(
         module, "load_verified_workload_policy",
         lambda *a, **k: SimpleNamespace(classes={}),
@@ -104,6 +105,7 @@ def test_history_lane_defaults_match_the_single_slot_campaign(monkeypatch):
         "SOFASCORE_HISTORY_FIRST_START_YEAR",
         "SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE",
         "SOFASCORE_HISTORY_PROXY_CONTROL_URL",
+        "SOFASCORE_HISTORY_MAX_SCOPE_ATTEMPTS",
     ):
         monkeypatch.delenv(name, raising=False)
     module = _load_dag_module()
@@ -116,6 +118,8 @@ def test_history_lane_defaults_match_the_single_slot_campaign(monkeypatch):
     assert kwargs["batch_size"] == 1
     assert kwargs["first_start_year"] == 2025
     assert kwargs["task_env"] == {}
+    assert kwargs["max_scope_attempts"] == 3
+    assert kwargs["failures"] == {}
 
 
 @pytest.mark.unit
@@ -128,6 +132,7 @@ def test_history_lane_knobs_come_from_env(monkeypatch):
     monkeypatch.setenv(
         "SOFASCORE_HISTORY_PROXY_CONTROL_URL", "http://sofascore-gw-history:8080"
     )
+    monkeypatch.setenv("SOFASCORE_HISTORY_MAX_SCOPE_ATTEMPTS", "5")
     module = _load_dag_module()
     mapped = _run_scope_operator()
 
@@ -141,6 +146,7 @@ def test_history_lane_knobs_come_from_env(monkeypatch):
         "SOFASCORE_RATE_LIMIT_PER_MINUTE": "60",
         "SOFASCORE_PROXY_CONTROL_URL": "http://sofascore-gw-history:8080",
     }
+    assert kwargs["max_scope_attempts"] == 5
 
 
 @pytest.mark.unit
@@ -151,6 +157,7 @@ def test_history_lane_knobs_come_from_env(monkeypatch):
         ("SOFASCORE_HISTORY_MAX_ACTIVE_TASKS", "two"),
         ("SOFASCORE_HISTORY_FIRST_START_YEAR", "1999"),
         ("SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE", "61"),
+        ("SOFASCORE_HISTORY_MAX_SCOPE_ATTEMPTS", "0"),
     ],
 )
 def test_invalid_history_lane_knob_fails_dag_parse(monkeypatch, name, value):
@@ -172,3 +179,73 @@ def test_history_admission_protects_the_daily_window(
         production_active=production_active,
     ) is expected
     assert not hasattr(module, "HISTORY_BLACKOUT_START_HOUR_UTC")
+
+
+def _capture_env(scope_key):
+    return {
+        "SOFASCORE_CAMPAIGN_ACTION": "capture",
+        "SOFASCORE_EXPECTED_CAMPAIGN_ID": scope_key.split(":")[0],
+        "SOFASCORE_SCOPE_KEY": scope_key,
+    }
+
+
+@pytest.mark.unit
+def test_finalize_remembers_failed_scopes_by_map_index(monkeypatch):
+    module = _load_dag_module()
+    planned = [_capture_env("c:8:825"), _capture_env("c:17:1725")]
+    states = {0: "failed", 1: "success"}
+    marked = []
+    monkeypatch.setattr(
+        module.state, "mark_failed",
+        lambda path, **kw: marked.append((path, kw)),
+    )
+
+    def get_task_instance(task_id, map_index=-1):
+        assert task_id == "run_historical_scope"
+        return SimpleNamespace(state=states[map_index])
+
+    context = {
+        "ti": SimpleNamespace(
+            xcom_pull=lambda **kw: planned, xcom_push=lambda **kw: None
+        ),
+        "dag_run": SimpleNamespace(get_task_instance=get_task_instance),
+        "run_id": "manual__2",
+    }
+
+    assert module._finalize_historical_run(**context)["did_work"] is True
+    assert marked == [(
+        module.FAILURES_PATH,
+        {"campaign_id": "c", "scope_key": "c:8:825", "run_id": "manual__2"},
+    )]
+    # The memory lives next to the completed-state file.
+    assert module.FAILURES_PATH == str(
+        module.Path(module.STATE_PATH).with_name("failures.json")
+    )
+
+
+@pytest.mark.unit
+def test_validated_scope_clears_its_failure_memory(monkeypatch, tmp_path):
+    module = _load_dag_module()
+    result = tmp_path / "result.json"
+    result.write_text(
+        '{"status": "success", "snapshot_id": "s", "campaign_id": "c",'
+        ' "tournament_id": 8, "source_season_id": 825}'
+    )
+    calls = []
+    monkeypatch.setattr(
+        module.state, "mark_completed",
+        lambda path, **kw: calls.append(("completed", kw["scope_key"])),
+    )
+    monkeypatch.setattr(
+        module.state, "clear_failed",
+        lambda path, **kw: calls.append(("cleared", kw["scope_key"])),
+    )
+
+    module._validate_historical_scope(
+        SOFASCORE_CAMPAIGN_ACTION="capture",
+        SOFASCORE_SCOPE_RESULT_PATH=str(result),
+        SOFASCORE_EXPECTED_SNAPSHOT_ID="s",
+        SOFASCORE_SCOPE_KEY="c:8:825",
+    )
+
+    assert calls == [("completed", "c:8:825"), ("cleared", "c:8:825")]

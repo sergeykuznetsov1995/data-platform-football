@@ -33,6 +33,7 @@ STATE_PATH = os.environ.get(
     "SOFASCORE_ALL_MENS_STATE",
     "/opt/airflow/logs/sofascore-all-men/state.json",
 )
+FAILURES_PATH = str(Path(STATE_PATH).with_name("failures.json"))
 RESULT_DIR = os.environ.get(
     "SOFASCORE_ALL_MENS_RESULT_DIR",
     "/opt/airflow/logs/sofascore-all-men/results",
@@ -70,6 +71,11 @@ HISTORY_POOL = (
 HISTORY_MAX_ACTIVE_TASKS = _env_int("SOFASCORE_HISTORY_MAX_ACTIVE_TASKS", 1, 1, 16)
 HISTORY_FIRST_START_YEAR = _env_int(
     "SOFASCORE_HISTORY_FIRST_START_YEAR", state.DEFAULT_FIRST_START_YEAR, 2000, 2100
+)
+# A scope that failed this many DagRuns is parked (failures.json) instead of
+# retrying at the head of the queue forever; a validated success clears it.
+HISTORY_MAX_SCOPE_ATTEMPTS = _env_int(
+    "SOFASCORE_HISTORY_MAX_SCOPE_ATTEMPTS", state.DEFAULT_MAX_SCOPE_ATTEMPTS, 1, 100
 )
 # Forwarded into every planned task only when set: the scope cycle reads
 # SOFASCORE_PROXY_CONTROL_URL for its gateway and SOFASCORE_RATE_LIMIT_PER_MINUTE
@@ -118,10 +124,13 @@ def _plan_historical_batch(**context: Any) -> list[dict[str, str]]:
     snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
     campaign_id = str(snapshot.get("campaign_id") or "")
     completed = state.read_completed(STATE_PATH, campaign_id=campaign_id)
+    failures = state.read_failures(FAILURES_PATH, campaign_id=campaign_id)
     workload_policy = load_verified_workload_policy(WORKLOAD_ARTIFACT)
     return state.plan_historical_batch(
         snapshot,
         completed=completed,
+        failures=failures,
+        max_scope_attempts=HISTORY_MAX_SCOPE_ATTEMPTS,
         batch_size=HISTORY_BATCH_SIZE,
         first_start_year=HISTORY_FIRST_START_YEAR,
         snapshot_path=SNAPSHOT_PATH,
@@ -178,11 +187,39 @@ def _validate_historical_scope(**environment: str) -> dict[str, Any]:
         campaign_id=campaign_id,
         scope_key=environment["SOFASCORE_SCOPE_KEY"],
     )
+    state.clear_failed(
+        FAILURES_PATH,
+        campaign_id=campaign_id,
+        scope_key=environment["SOFASCORE_SCOPE_KEY"],
+    )
     return {"status": "complete", "scope_key": environment["SOFASCORE_SCOPE_KEY"]}
+
+
+def _task_state(task_instance: Any) -> str:
+    value = getattr(task_instance.state, "value", task_instance.state)
+    return str(value or "none").casefold().split(".")[-1]
 
 
 def _finalize_historical_run(**context: Any) -> dict[str, Any]:
     planned = context["ti"].xcom_pull(task_ids="plan_historical_batch") or []
+    dag_run = context.get("dag_run")
+    for index, environment in enumerate(planned):
+        scope_key = environment.get("SOFASCORE_SCOPE_KEY")
+        if not scope_key or dag_run is None:
+            continue
+        task_instance = dag_run.get_task_instance(
+            "run_historical_scope", map_index=index
+        )
+        if task_instance is None or _task_state(task_instance) not in {
+            "failed", "upstream_failed"
+        }:
+            continue
+        state.mark_failed(
+            FAILURES_PATH,
+            campaign_id=environment["SOFASCORE_EXPECTED_CAMPAIGN_ID"],
+            scope_key=scope_key,
+            run_id=str(context.get("run_id") or "manual"),
+        )
     did_work = bool(planned)
     target = datetime.now(timezone.utc) + (
         ACTIVE_COOLDOWN if did_work else IDLE_COOLDOWN
@@ -212,9 +249,7 @@ def _propagate_status(**context: Any) -> dict[str, Any]:
     for task_instance in dag_run.get_task_instances():
         if task_instance.task_id not in HISTORY_TASK_IDS:
             continue
-        value = getattr(task_instance.state, "value", task_instance.state)
-        normalized = str(value or "none").casefold().split(".")[-1]
-        if normalized in {"failed", "upstream_failed"}:
+        if _task_state(task_instance) in {"failed", "upstream_failed"}:
             failures.append(task_instance.task_id)
     if failures:
         raise AirflowException(
