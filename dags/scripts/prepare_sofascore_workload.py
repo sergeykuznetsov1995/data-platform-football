@@ -332,6 +332,7 @@ def prepare_workload_plan(
     allow_inactive_season: bool = False,
     players_rotation_date: Optional[date] = None,
     players_force: bool = False,
+    season_freshness_key: Optional[str] = None,
 ) -> Path:
     """Snapshot local work, sign it, and atomically persist one phase plan."""
 
@@ -340,8 +341,16 @@ def prepare_workload_plan(
     if not str(base_run_id).strip() or "::" in str(base_run_id):
         raise ValueError("base_run_id must be non-empty and cannot contain '::'")
     phase_run_id = f"{base_run_id}::{phase}"
+    if season_freshness_key is not None and not str(
+        season_freshness_key
+    ).strip():
+        raise ValueError("season_freshness_key cannot be blank")
     season_freshness = (
-        f"repair-{base_run_id}" if force_replace else _season_freshness_key()
+        str(season_freshness_key).strip()
+        if season_freshness_key is not None
+        else f"repair-{base_run_id}"
+        if force_replace
+        else _season_freshness_key()
     )
     player_freshness = (
         f"repair-{base_run_id}" if force_replace else _player_freshness_key()

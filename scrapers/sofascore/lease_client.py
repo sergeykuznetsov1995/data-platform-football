@@ -359,7 +359,11 @@ class _DiscoveryLeaseProvider:
     """
 
     SOURCE = "sofascore_discovery"
-    DAG_ID = "dag_discover_sofascore_registry"
+    ALLOWED_DAG_IDS = frozenset({
+        "dag_discover_sofascore_registry",
+        "dag_backfill_sofascore_all_mens",
+        "operator_sofascore_all_mens_metadata",
+    })
 
     def __init__(
         self,
@@ -368,6 +372,7 @@ class _DiscoveryLeaseProvider:
         control_token: Optional[str] = None,
         timeout_seconds: float = 5.0,
         session: Optional[Any] = None,
+        dag_id: str = "dag_discover_sofascore_registry",
     ) -> None:
         base = str(control_url).rstrip("/")
         parsed = urlsplit(base)
@@ -380,6 +385,9 @@ class _DiscoveryLeaseProvider:
             raise ValueError("proxy lease control URL must be credential-free HTTP(S)")
         if timeout_seconds <= 0:
             raise ValueError("proxy lease timeout must be positive")
+        resolved_dag_id = str(dag_id).strip()
+        if resolved_dag_id not in self.ALLOWED_DAG_IDS:
+            raise ValueError("discovery lease dag_id is not allowed")
         resolved_token = str(
             control_token
             if control_token is not None
@@ -390,6 +398,7 @@ class _DiscoveryLeaseProvider:
                 "SOFASCORE_PROXY_CONTROL_TOKEN must contain at least 32 characters"
             )
         self.control_url = base
+        self.dag_id = resolved_dag_id
         self.timeout_seconds = float(timeout_seconds)
         self._control_token = resolved_token
         self._session = session
@@ -469,7 +478,7 @@ class _DiscoveryLeaseProvider:
         ):
             raise ValueError("max_bytes and ttl_seconds must be positive integers")
         context = {
-            "dag_id": self.DAG_ID,
+            "dag_id": self.dag_id,
             "run_id": str(run_id).strip(),
             "task_id": str(task_id).strip(),
             "canonical_url": str(canonical_url).strip(),
@@ -551,6 +560,11 @@ class _DiscoveryLeaseProvider:
     @staticmethod
     def authenticated_proxy_url(lease: SofascoreProxyLease) -> str:
         return SofascoreLeaseClient.authenticated_proxy_url(lease)
+
+    @staticmethod
+    def playwright_proxy(lease: SofascoreProxyLease) -> dict[str, str]:
+        """Return credential fields accepted by Camoufox/Playwright."""
+        return SofascoreLeaseClient.playwright_proxy(lease)
 
 
 class SofascoreLeaseClient:
@@ -678,14 +692,18 @@ class SofascoreLeaseClient:
             raise ValueError(
                 "SofaScore lease source must be sofascore or sofascore_canary"
             )
-        expected_dag_id = (
-            "dag_ingest_sofascore"
+        expected_dag_ids = (
+            (
+                "dag_ingest_sofascore",
+                "dag_backfill_sofascore_all_mens",
+            )
             if source == "sofascore"
-            else "dag_canary_sofascore_proxy"
+            else ("dag_canary_sofascore_proxy",)
         )
-        if str(dag_id).strip() != expected_dag_id:
+        if str(dag_id).strip() not in expected_dag_ids:
             raise ValueError(
-                f"SofaScore source={source} lease requires dag_id={expected_dag_id}"
+                f"SofaScore source={source} lease requires dag_id="
+                + " or ".join(expected_dag_ids)
             )
         plan: Optional[SignedDagRunPlan] = None
         allocation: Optional[WorkloadAllocation] = None

@@ -208,12 +208,19 @@ FBREF_DAG_IDS = frozenset(
         "dag_accept_fbref_bronze",
     }
 )
-SOFASCORE_DAG_IDS = frozenset({"dag_ingest_sofascore"})
+SOFASCORE_DAG_IDS = frozenset({
+    "dag_ingest_sofascore",
+    "dag_backfill_sofascore_all_mens",
+})
 SOFASCORE_CANARY_DAG_IDS = frozenset({"dag_canary_sofascore_proxy"})
 # Registry discovery is a non-signed, metered JSON scan of the public catalog.
 # It carries no workload plan and no allocation: its only bound is this DagRun
 # cap, which stays zero (fail-closed) until an operator authorizes a scan.
 SOFASCORE_DISCOVERY_DAG_IDS = frozenset({"dag_discover_sofascore_registry"})
+SOFASCORE_METADATA_DAG_IDS = frozenset({
+    "dag_backfill_sofascore_all_mens",
+    "operator_sofascore_all_mens_metadata",
+})
 SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 0
 # Zero is deliberately fail-closed.  ``main`` replaces it only after loading a
 # verified SofaScore canary; there is no hand-written production allowance.
@@ -480,6 +487,18 @@ def _source_for_dag(dag_id: str) -> str:
     if dag_id in WHOSCORED_PAID_DAG_IDS:
         return "whoscored"
     return ""
+
+
+def _source_for_lease_request(dag_id: str, requested_source: str) -> str:
+    """Authorize metadata traffic without changing the caller's identity."""
+
+    normalized_source = str(requested_source or "").strip().lower()
+    if (
+        normalized_source == "sofascore_discovery"
+        and dag_id in SOFASCORE_METADATA_DAG_IDS
+    ):
+        return "sofascore_discovery"
+    return _source_for_dag(dag_id)
 
 
 def _uses_shared_daily_budget(source: str) -> bool:
@@ -1290,6 +1309,7 @@ def _lease_host_allowed(lease: Lease | None, host: str, port: int = 443) -> bool
             "fbref",
             "sofascore",
             "sofascore_canary",
+            "sofascore_discovery",
         }
     if lease is not None and lease.source in (
         "sofascore",
@@ -2977,7 +2997,7 @@ def _create_lease(
         )
     dag_id = str(metadata.get("dag_id") or "").strip()
     requested_source = str(metadata.get("source") or "").strip().lower()
-    inferred_source = _source_for_dag(dag_id)
+    inferred_source = _source_for_lease_request(dag_id, requested_source)
     if require_context and not inferred_source:
         raise ValueError("paid lease dag_id is not in the closed source allowlist")
     if requested_source and requested_source != inferred_source:
@@ -3164,6 +3184,9 @@ def _create_lease(
             expected_endpoint_labels=metadata.get("expected_endpoint_labels", ()),
         )
         dagrun_budget = proxy_campaign_approval.caps.total_provider_bytes
+    elif source == "sofascore_discovery":
+        effective_expires_at = now + ttl_seconds
+        dagrun_budget = SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES
     else:
         effective_expires_at = now + ttl_seconds
         dagrun_budget = _dagrun_budget_bytes(dag_id)
@@ -5639,7 +5662,10 @@ async def _handle_control(
             request = json.loads(body)
             if not isinstance(request, dict):
                 raise ValueError("lease request body must be a JSON object")
-            request_source = _source_for_dag(str(request.get("dag_id") or "").strip())
+            request_source = _source_for_lease_request(
+                str(request.get("dag_id") or "").strip(),
+                str(request.get("source") or "").strip(),
+            )
             if not _control_token_valid(headers, source=request_source):
                 await _send_json(writer, 401, {"error": "invalid control token"})
                 return True

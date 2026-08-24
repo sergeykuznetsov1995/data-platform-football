@@ -840,6 +840,11 @@ services:
         bind:
           create_host_path: false
       - type: bind
+        source: ${SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR:?set the durable SofaScore all-men campaign directory}
+        target: /opt/airflow/runtime/sofascore/all-men
+        bind:
+          create_host_path: false
+      - type: bind
         source: ./configs/airflow/webserver_config.py
         target: /opt/airflow/webserver_config.py
         read_only: true
@@ -906,7 +911,19 @@ services:
       airflow-webserver:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      test:
+        - CMD
+        - python
+        - /opt/airflow/scripts/sofascore_runtime_preflight.py
+        - scheduler-health
+        - --artifact
+        - /opt/airflow/runtime/sofascore/proxy_budget_canary.json
+        - --campaign-dir
+        - /opt/airflow/runtime/sofascore/all-men
+        - --campaign-policy
+        - /opt/airflow/configs/sofascore/all_mens_campaign.json
+        - --health-url
+        - http://sofascore_proxy_filter:8899/health
       interval: 30s
       timeout: 30s
       retries: 5

@@ -96,7 +96,7 @@ def test_script_entrypoint_is_standalone_and_executable(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "direct JSON by default" in result.stdout
     # The metered transport exists, but it is never the default.
-    assert "--transport {direct,lease-proxy}" in result.stdout
+    assert "--transport {direct,lease-proxy,lease-browser}" in result.stdout
     assert os.access(script, os.X_OK)
 
 
@@ -400,6 +400,11 @@ def test_default_transport_never_constructs_a_metered_client(
         "LeaseProxySofaScoreClient",
         lambda **kwargs: pytest.fail("direct discovery must not lease a proxy"),
     )
+    monkeypatch.setattr(
+        module,
+        "LeaseBrowserSofaScoreClient",
+        lambda **kwargs: pytest.fail("direct discovery must not open a browser"),
+    )
     _patch_success(module, monkeypatch, changed=False)
 
     assert module.main([
@@ -415,6 +420,10 @@ def test_default_transport_never_constructs_a_metered_client(
         (["--transport", "lease-proxy"], "requires a positive --budget-cap-bytes"),
         (
             ["--transport", "lease-proxy", "--budget-cap-bytes", "0"],
+            "requires a positive --budget-cap-bytes",
+        ),
+        (
+            ["--transport", "lease-browser"],
             "requires a positive --budget-cap-bytes",
         ),
         (
@@ -495,6 +504,59 @@ def test_lease_transport_reports_actual_paid_bytes_and_lease_metrics(
     assert result["traffic"]["upstream_repins"] == 1
     assert result["traffic"]["browser_sessions"] == 0
     assert result["traffic"]["browser_navigations"] == 0
+
+
+@pytest.mark.unit
+def test_browser_transport_is_explicit_and_preserves_browser_metrics(
+    module, monkeypatch, registry, tmp_path,
+):
+    captured = {}
+
+    class BrowserClient(_MeteredClient):
+        @property
+        def stats(self):
+            result = super().stats
+            result["browser_sessions"] = 3
+            result["browser_navigations"] = 17
+            return result
+
+    client = BrowserClient(paid_bytes=700_000)
+
+    def build(**kwargs):
+        captured.update(kwargs)
+        return client
+
+    monkeypatch.setattr(module, "LeaseBrowserSofaScoreClient", build)
+    monkeypatch.setattr(
+        module,
+        "DirectSofaScoreClient",
+        lambda: pytest.fail("browser transport must not fall back to direct"),
+    )
+    monkeypatch.setattr(
+        module,
+        "LeaseProxySofaScoreClient",
+        lambda **kwargs: pytest.fail("browser transport must not use TLS proxy"),
+    )
+
+    def discover(existing, actual_client, **kwargs):
+        assert actual_client is client
+        return deepcopy(existing), {"changed": False, "traffic": client.stats}
+
+    monkeypatch.setattr(module, "discover_registry", discover)
+    report = tmp_path / "browser-report.json"
+
+    assert module.main([
+        "--registry", str(registry), "--output", str(report), "--dry-run",
+        "--transport", "lease-browser", "--budget-cap-bytes", "1000000",
+        "--control-url", "http://proxy_filter:8899",
+    ]) == 0
+
+    result = json.loads(report.read_text())
+    assert captured["budget_cap_bytes"] == 1_000_000
+    assert result["transport"] == "lease-browser"
+    assert result["traffic"]["browser_sessions"] == 3
+    assert result["traffic"]["browser_navigations"] == 17
+    assert result["traffic"]["paid_proxy_bytes"] == 700_000
 
 
 @pytest.mark.unit

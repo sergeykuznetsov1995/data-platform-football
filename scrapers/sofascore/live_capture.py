@@ -304,15 +304,24 @@ class LeaseBackedCamoufoxTransport(AbstractContextManager):
         else:
             client_factory = self._lease_client_factory
         self._client = client_factory(self.control_url)
-        expected_dag_id = (
+        expected_dag_ids = (
+            frozenset({"dag_canary_sofascore_proxy"})
+            if self.mode == "canary"
+            else frozenset({
+                "dag_ingest_sofascore",
+                "dag_backfill_sofascore_all_mens",
+            })
+        )
+        default_dag_id = (
             "dag_canary_sofascore_proxy"
             if self.mode == "canary"
             else "dag_ingest_sofascore"
         )
-        dag_id = os.environ.get("AIRFLOW_CTX_DAG_ID", expected_dag_id)
-        if dag_id != expected_dag_id:
+        dag_id = os.environ.get("AIRFLOW_CTX_DAG_ID", default_dag_id)
+        if dag_id not in expected_dag_ids:
             raise ValueError(
-                f"SofaScore {self.mode} transport requires dag_id={expected_dag_id}"
+                f"SofaScore {self.mode} transport requires dag_id in "
+                f"{sorted(expected_dag_ids)}"
             )
         try:
             self._lease = self._client.acquire(

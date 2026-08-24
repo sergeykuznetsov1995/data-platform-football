@@ -4,7 +4,7 @@
 The default transport is direct JSON: no browser, no proxy, zero paid bytes.
 A metered residential transport exists for the catalog fan-out that SofaScore's
 edge refuses from a datacentre egress, and it is opt-in only: it requires both
-``--transport lease-proxy`` and an explicit ``--budget-cap-bytes`` ceiling.
+``--transport lease-proxy`` or ``lease-browser`` and an explicit paid-byte cap.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from scrapers.sofascore.discovery import (  # noqa: E402
     DISCOVERY_LEASE_MAX_BYTES,
     DISCOVERY_LEASE_TTL_SECONDS,
     DirectSofaScoreClient,
+    LeaseBrowserSofaScoreClient,
     LeaseProxySofaScoreClient,
     discover_registry,
     write_registry_atomic,
@@ -44,6 +45,7 @@ REPORT_SCHEMA_VERSION = 2
 DEFAULT_REPORT_PATH = "/tmp/sofascore_discovery_result.json"
 DIRECT_TRANSPORT = "direct"
 LEASE_TRANSPORT = "lease-proxy"
+BROWSER_TRANSPORT = "lease-browser"
 ZERO_TRAFFIC = {
     "requests": 0,
     "direct_response_bytes": 0,
@@ -56,8 +58,8 @@ ZERO_TRAFFIC = {
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Discover SofaScore tournaments without a browser; direct JSON by "
-            "default, metered lease proxy only on explicit opt-in"
+            "Discover SofaScore tournaments; direct JSON by default, with "
+            "metered lease proxy/browser transports only on explicit opt-in"
         ),
     )
     parser.add_argument(
@@ -94,18 +96,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--transport",
-        choices=(DIRECT_TRANSPORT, LEASE_TRANSPORT),
+        choices=(DIRECT_TRANSPORT, LEASE_TRANSPORT, BROWSER_TRANSPORT),
         default=DIRECT_TRANSPORT,
         help=(
-            "direct (default) spends zero paid bytes; lease-proxy meters every "
-            "byte through the proxy filter and requires --budget-cap-bytes"
+            "direct (default) spends zero paid bytes; lease-proxy and "
+            "lease-browser meter every byte and require --budget-cap-bytes"
         ),
     )
     parser.add_argument(
         "--budget-cap-bytes",
         type=int,
         default=None,
-        help="hard paid-byte ceiling for one lease-proxy run (no default)",
+        help="hard paid-byte ceiling for one metered run (no default)",
     )
     parser.add_argument(
         "--per-lease-max-bytes",
@@ -122,7 +124,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--control-url",
         default=os.environ.get("SOFASCORE_PROXY_CONTROL_URL", ""),
-        help="proxy-filter lease control URL (lease-proxy transport only)",
+        help="proxy-filter lease control URL (metered transports only)",
+    )
+    parser.add_argument(
+        "--include-team-counts",
+        action="store_true",
+        help="fetch and persist the exact team count for every discovered season",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -204,17 +211,18 @@ def _validate_arguments(args: argparse.Namespace) -> None:
     if args.transport == DIRECT_TRANSPORT:
         if args.budget_cap_bytes is not None:
             raise ValueError(
-                "--budget-cap-bytes is only meaningful for --transport lease-proxy"
+                "--budget-cap-bytes is only meaningful for --transport lease-proxy "
+                "or lease-browser"
             )
         return
     if args.budget_cap_bytes is None or args.budget_cap_bytes <= 0:
         raise ValueError(
-            "--transport lease-proxy requires a positive --budget-cap-bytes: "
+            f"--transport {args.transport} requires a positive --budget-cap-bytes: "
             "metered discovery never runs on an implicit budget"
         )
     if not str(args.control_url).strip():
         raise ValueError(
-            "--transport lease-proxy requires --control-url or "
+            f"--transport {args.transport} requires --control-url or "
             "SOFASCORE_PROXY_CONTROL_URL"
         )
 
@@ -222,7 +230,12 @@ def _validate_arguments(args: argparse.Namespace) -> None:
 def _build_client(args: argparse.Namespace) -> Any:
     if args.transport == DIRECT_TRANSPORT:
         return DirectSofaScoreClient()
-    return LeaseProxySofaScoreClient(
+    client_type = (
+        LeaseBrowserSofaScoreClient
+        if args.transport == BROWSER_TRANSPORT
+        else LeaseProxySofaScoreClient
+    )
+    return client_type(
         control_url=str(args.control_url).strip(),
         budget_cap_bytes=int(args.budget_cap_bytes),
         per_lease_max_bytes=int(args.per_lease_max_bytes),
@@ -257,19 +270,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         _validate_arguments(args)
         existing = _read_registry(registry)
         client = _build_client(args)
+        discovery_kwargs = (
+            {"include_team_counts": True} if args.include_team_counts else {}
+        )
         if args.scope == "full":
             # Preserve the long-standing two-argument embedding contract.
-            discovered, discovery_report = discover_registry(existing, client)
+            discovered, discovery_report = discover_registry(
+                existing, client, **discovery_kwargs
+            )
         elif args.scope == "targeted":
             discovered, discovery_report = discover_registry(
                 existing,
                 client,
                 scope=args.scope,
                 target_tournament_ids=list(args.tournament_ids or ()),
+                **discovery_kwargs,
             )
         else:
             discovered, discovery_report = discover_registry(
-                existing, client, scope=args.scope
+                existing, client, scope=args.scope, **discovery_kwargs
             )
         changed = discovered != existing
         report.update(discovery_report)
@@ -328,9 +347,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     f"{budget_cap_bytes}-byte cap",
                 ]
                 exit_code = 1
-        # No discovery transport ever opens a browser.
-        traffic["browser_sessions"] = 0
-        traffic["browser_navigations"] = 0
+        if args.transport != BROWSER_TRANSPORT:
+            traffic["browser_sessions"] = 0
+            traffic["browser_navigations"] = 0
         if report_path != registry:
             try:
                 _write_json_atomic(report_path, report)

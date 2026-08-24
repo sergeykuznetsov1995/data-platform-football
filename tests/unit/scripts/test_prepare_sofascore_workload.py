@@ -275,6 +275,29 @@ def test_season_phase_signs_only_the_bounded_season_allocation(tmp_path, monkeyp
     }
 
 
+def test_historical_scope_can_pin_season_freshness_across_days(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv("SOFASCORE_SEASON_FRESHNESS_KEY", "day-changing")
+    patches = _common_patches(SimpleNamespace(missing_raw_keys=()))
+    with patches[0], patches[1], patches[2], patches[3]:
+        path = prepare_workload_plan(
+            dag_id="dag_backfill_sofascore_all_mens",
+            base_run_id="history-1",
+            phase="season",
+            competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=tmp_path / "historical-plan.json",
+            allow_inactive_season=True,
+            season_freshness_key="final",
+        )
+
+    signed = load_plan(path, control_token=TOKEN)
+    assert signed.freshness_key("season") == "final"
+    assert signed.run_cap_bytes == 0
+
+
 def test_force_repair_gets_a_measured_allocation_even_when_old_raw_is_complete(
     tmp_path, monkeypatch
 ):

@@ -2034,7 +2034,10 @@ def _load_runtime_workload_plan(
     if offline_replay:
         return None, ()
     airflow_dag_id = os.environ.get("AIRFLOW_CTX_DAG_ID", "").strip()
-    production = airflow_dag_id == "dag_ingest_sofascore"
+    production = airflow_dag_id in {
+        "dag_ingest_sofascore",
+        "dag_backfill_sofascore_all_mens",
+    }
     if not path:
         if production:
             raise RuntimeError("production SofaScore capture requires --workload-plan")

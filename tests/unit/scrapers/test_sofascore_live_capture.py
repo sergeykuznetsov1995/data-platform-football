@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -296,7 +297,9 @@ class _TransportFactory:
             )
             plan = _signed_plan(
                 artifact_id=engine.budget.policy.artifact_id,
-                dag_id="dag_ingest_sofascore",
+                dag_id=os.environ.get(
+                    "AIRFLOW_CTX_DAG_ID", "dag_ingest_sofascore"
+                ),
                 run_id=engine.run_id,
                 player_universe_ids=(),
                 allocations=(allocation,),
@@ -634,6 +637,33 @@ def test_two_endpoints_share_one_lease_browser_and_are_not_double_paced(tmp_path
     assert sum(traffic["endpoint_provider_bytes"].values()) == 250
     assert traffic["browser_sessions"] == 1
     assert traffic["browser_navigations"] == 1
+
+
+def test_backfill_dag_enters_the_production_transport_and_acquires_lease(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(
+        "AIRFLOW_CTX_DAG_ID", "dag_backfill_sofascore_all_mens"
+    )
+    runtime, _ = _runtime(tmp_path)
+    client = _LeaseClient([0, 0, 10], final_total=10)
+    capture = _Capture([_record(b'{"items":[]}')])
+    factory = _TransportFactory(client, capture)
+
+    results, traffic = capture_live_specs(
+        runtime,
+        [_spec(1)],
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="SS-17:2526",
+        entity="match_capture",
+        transport_factory=factory,
+    )
+
+    assert len(results) == 1
+    assert traffic["paid_proxy_bytes"] == 10
+    assert client.acquire_calls[0]["dag_id"] == (
+        "dag_backfill_sofascore_all_mens"
+    )
 
 
 def test_sequential_batch_reports_are_deltas_not_cumulative(tmp_path):

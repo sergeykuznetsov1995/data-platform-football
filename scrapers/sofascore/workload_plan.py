@@ -88,6 +88,7 @@ TEAM_COUNT_BAND_GRID = (
     (16, 20, "16_20"),
     (21, 32, "21_32"),
     (33, 48, "33_48"),
+    (49, 64, "49_64"),
 )
 TEAM_COUNT_BANDS = tuple(band for _, _, band in TEAM_COUNT_BAND_GRID)
 SEASON_FORMATS = ("split_year", "calendar_year", "named")

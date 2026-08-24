@@ -639,6 +639,8 @@ def test_production_season_shape_is_bounded_by_format_and_team_count_band():
         (32, "21_32"),
         (33, "33_48"),
         (48, "33_48"),
+        (49, "49_64"),
+        (64, "49_64"),
     ],
 )
 def test_team_count_band_grid_is_contiguous(team_count, band):
@@ -646,7 +648,7 @@ def test_team_count_band_grid_is_contiguous(team_count, band):
     assert band in TEAM_COUNT_BANDS
 
 
-@pytest.mark.parametrize("team_count", [0, 7, 49, 100])
+@pytest.mark.parametrize("team_count", [0, 7, 65, 100])
 def test_team_count_outside_the_measured_grid_fails_closed(team_count):
     with pytest.raises(WorkloadPlanError, match="outside the measured"):
         team_count_band(team_count)

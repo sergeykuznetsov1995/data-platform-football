@@ -460,6 +460,10 @@ def test_scheduler_health_mode_keeps_airflow_job_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     artifact = _artifact(tmp_path)
+    campaign = tmp_path / "all-men"
+    campaign.mkdir()
+    policy = tmp_path / "all_mens_campaign.json"
+    policy.write_text("{}")
     called: list[str] = []
     monkeypatch.setattr(preflight, "require_runtime_identity", lambda: None)
     monkeypatch.setattr(
@@ -469,6 +473,9 @@ def test_scheduler_health_mode_keeps_airflow_job_check(
     )
     monkeypatch.setattr(preflight, "read_gateway_health", lambda _url: _health())
     monkeypatch.setattr(
+        preflight, "validate_campaign_directory", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
         preflight, "require_scheduler_job", lambda: called.append("scheduler")
     )
 
@@ -477,6 +484,10 @@ def test_scheduler_health_mode_keeps_airflow_job_check(
             "scheduler-health",
             "--artifact",
             str(artifact),
+            "--campaign-dir",
+            str(campaign),
+            "--campaign-policy",
+            str(policy),
             "--health-url",
             "http://sofascore_proxy_filter:8899/health",
         ]

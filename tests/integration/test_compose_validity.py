@@ -49,6 +49,7 @@ COMPOSE_TEST_ENV = {
     # production host layout while exercising fail-closed interpolation.
     "SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST": "/tmp/compose-test-sofascore-budget.json",
     "SOFASCORE_GATEWAY_STATE_HOST_DIR": "/tmp/compose-test-sofascore-gateway-state",
+    "SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR": "/tmp/compose-test-sofascore-all-men",
 }
 
 
@@ -204,12 +205,20 @@ class TestComposeFile:
         artifact_target = (
             "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
         )
+        campaign_target = "/opt/airflow/runtime/sofascore/all-men"
 
         assert volumes[artifact_target]["source"] == (
             COMPOSE_TEST_ENV["SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST"]
         )
         assert volumes[artifact_target]["read_only"] is True
         assert volumes[artifact_target]["bind"].get(
+            "create_host_path", False
+        ) is False
+        assert volumes[campaign_target]["source"] == (
+            COMPOSE_TEST_ENV["SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR"]
+        )
+        assert volumes[campaign_target].get("read_only", False) is False
+        assert volumes[campaign_target]["bind"].get(
             "create_host_path", False
         ) is False
         assert "/opt/airflow/configs/proxy_filter" in volumes
@@ -224,7 +233,12 @@ class TestComposeFile:
         assert scheduler["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"] == (
             "0" * 64
         )
-        assert scheduler["healthcheck"]["test"][0] == "CMD-SHELL"
+        assert scheduler["healthcheck"]["test"][0:4] == [
+            "CMD",
+            "python",
+            "/opt/airflow/scripts/sofascore_runtime_preflight.py",
+            "scheduler-health",
+        ]
 
     def test_fbref_filter_renders_one_production_safety_circuit(self):
         cfg = _compose_config_json()

@@ -145,6 +145,42 @@ def test_runner_selects_every_deterministic_signed_batch(
     assert len(flattened) == len(set(flattened)) == sum(expected_sizes)
 
 
+def test_runner_accepts_backfill_dag_with_the_actual_airflow_run_id(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv(
+        "AIRFLOW_CTX_DAG_ID", "dag_backfill_sofascore_all_mens"
+    )
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "scheduled-backfill-1")
+    policy = WorkloadBudgetPolicy(
+        "c" * 64,
+        {MATCH_WORKLOAD_CLASS: _match_budget()},
+    )
+    plan = build_partitioned_plan(
+        policy,
+        dag_id="dag_backfill_sofascore_all_mens",
+        run_id="scheduled-backfill-1::targets",
+        partitions=[PartitionWorkload(
+            "SS-17", "2526", 17, pending_match_ids=("1",)
+        )],
+        control_token=TOKEN,
+    )
+    path = write_plan(tmp_path / "backfill-targets.json", plan)
+
+    loaded, allocations = _load_runtime_workload_plan(
+        str(path),
+        entity=ENTITY_MATCH_CAPTURE,
+        league="SS-17",
+        season=2526,
+        offline_replay=False,
+    )
+
+    assert loaded.dag_id == "dag_backfill_sofascore_all_mens"
+    assert loaded.run_id == "scheduled-backfill-1::targets"
+    assert len(allocations) == 1
+
+
 def test_runner_rejects_target_plan_for_season_capture(tmp_path, monkeypatch):
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
     monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_ingest_sofascore")

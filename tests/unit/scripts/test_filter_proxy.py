@@ -68,6 +68,7 @@ PLAYER_WORKLOAD_CLASS = player_workload_class()
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 _SCRIPT_PATH = REPO_ROOT / "scripts" / "fbref_proxy" / "filter_proxy.py"
+_SHARED_SCRIPT_PATH = REPO_ROOT / "scripts" / "proxy_filter" / "filter_proxy.py"
 _BLOCKLIST_PATH = REPO_ROOT / "configs" / "proxy_filter" / "blocklist.txt"
 _COMPOSE_PATH = REPO_ROOT / "compose.yaml"
 # #951 (инцидент 2026-07-17): выделенный SofaScore-шлюз вынесен в СВОЙ
@@ -93,6 +94,16 @@ def _load_module():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _load_shared_module():
+    spec = importlib.util.spec_from_file_location(
+        "shared_filter_proxy", _SHARED_SCRIPT_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    return loaded
 
 
 @pytest.fixture()
@@ -1913,6 +1924,7 @@ def test_sofascore_scheduler_mounts_exact_artifact_and_fingerprint_config():
     document = yaml.safe_load(_COMPOSE_PATH.read_text())
     scheduler = document["services"]["airflow-scheduler"]
     artifact_target = "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
+    campaign_target = "/opt/airflow/runtime/sofascore/all-men"
     volumes = scheduler["volumes"]
     targets = [
         volume["target"] if isinstance(volume, dict) else volume.split(":")[1]
@@ -1931,6 +1943,16 @@ def test_sofascore_scheduler_mounts_exact_artifact_and_fingerprint_config():
     )
     assert artifact_mount["read_only"] is True
     assert artifact_mount["bind"]["create_host_path"] is False
+    campaign_mount = next(
+        volume
+        for volume in volumes
+        if isinstance(volume, dict) and volume.get("target") == campaign_target
+    )
+    assert campaign_mount["source"].startswith(
+        "${SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR:?"
+    )
+    assert campaign_mount.get("read_only", False) is False
+    assert campaign_mount["bind"]["create_host_path"] is False
     assert scheduler["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT"] == (
         artifact_target
     )
@@ -1938,8 +1960,18 @@ def test_sofascore_scheduler_mounts_exact_artifact_and_fingerprint_config():
         "${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:?"
     )
     assert scheduler["healthcheck"]["test"] == [
-        "CMD-SHELL",
-        'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"',
+        "CMD",
+        "python",
+        "/opt/airflow/scripts/sofascore_runtime_preflight.py",
+        "scheduler-health",
+        "--artifact",
+        artifact_target,
+        "--campaign-dir",
+        campaign_target,
+        "--campaign-policy",
+        "/opt/airflow/configs/sofascore/all_mens_campaign.json",
+        "--health-url",
+        "http://sofascore_proxy_filter:8899/health",
     ]
     assert not any(
         target != artifact_target and artifact_target.startswith(f"{target}/")
@@ -1953,6 +1985,7 @@ def test_sofascore_durable_mount_variables_are_documented():
     assert "\nSOFASCORE_PROXY_BUDGET_ARTIFACT_HOST=" in example
     assert "\nSOFASCORE_PROXY_BUDGET_ARTIFACT_ID=" in example
     assert "\nSOFASCORE_GATEWAY_STATE_HOST_DIR=" in example
+    assert "\nSOFASCORE_ALL_MENS_RUNTIME_HOST_DIR=" in example
 
 
 def test_fbref_has_an_isolated_metered_proxy_service():
@@ -3848,6 +3881,13 @@ def test_sofascore_source_cannot_bypass_budget_with_another_dag_id(mod):
         )
 
     assert mgr.calls == 0
+
+
+def test_all_mens_backfill_dag_uses_the_signed_sofascore_lane():
+    mod = _load_shared_module()
+    assert mod._source_for_dag("dag_backfill_sofascore_all_mens") == "sofascore"
+    mod.SOFASCORE_DAGRUN_BUDGET_BYTES = 1234
+    assert mod._dagrun_budget_bytes("dag_backfill_sofascore_all_mens") == 1234
 
 
 def test_explicit_canary_bootstraps_artifact_but_never_authorizes_production(
@@ -7114,6 +7154,15 @@ def _discovery_context(run_id="discovery__20260714T000000Z"):
     }
 
 
+def _all_mens_metadata_context(run_id="manual__all-men-metadata"):
+    context = _discovery_context(run_id=run_id)
+    context.update({
+        "dag_id": "dag_backfill_sofascore_all_mens",
+        "task_id": "run_historical_scope",
+    })
+    return context
+
+
 def test_discovery_lease_is_refused_until_a_cap_is_authorized(mod):
     mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
 
@@ -7153,6 +7202,37 @@ def test_authorized_discovery_lease_is_capped_by_its_dagrun_budget(mod):
     assert report["budget_artifact_id"] == ""
     # WhoScored remains zero until a signed campaign supplies exact caps.
     assert mod._dagrun_budget_bytes("dag_ingest_whoscored") == 0
+
+
+def test_all_mens_metadata_uses_discovery_budget_without_losing_dag_identity(
+    tmp_path
+):
+    mod = _load_shared_module()
+    mod.LEDGER_PATH = str(tmp_path / "paid_requests.jsonl")
+    mod.SOURCE_MODE = "test-all"
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    mod.SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 12 * 1024 * 1024
+
+    lease = mod._create_lease(
+        mgr,
+        max_bytes=8 * 1024 * 1024,
+        ttl_seconds=3600,
+        metadata=_all_mens_metadata_context(),
+        require_context=True,
+    )
+
+    assert lease.source == "sofascore_discovery"
+    assert lease.dag_id == "dag_backfill_sofascore_all_mens"
+    assert lease.run_id == "manual__all-men-metadata"
+    assert mod._source_for_dag(lease.dag_id) == "sofascore"
+
+
+def test_shared_sofascore_discovery_allows_camoufox_exit_probe():
+    mod = _load_shared_module()
+    discovery = SimpleNamespace(source="sofascore_discovery")
+
+    assert mod._lease_host_allowed(discovery, "api.ipify.org", 443) is True
+    assert mod._lease_host_allowed(discovery, "api.ipify.org", 80) is False
 
 
 def test_discovery_lease_is_not_truncated_by_the_2mb_per_url_ceiling(mod):

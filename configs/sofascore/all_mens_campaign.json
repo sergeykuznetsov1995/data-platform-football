@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "scope": "adult_men_professional_leagues_and_cups",
+  "candidate_count": 1504,
+  "candidate_ids_sha256": "7b0b469b910d622ecf1152d916d5a5139f6a911f7fe62d009ccf7fa6a6675a8d",
+  "allowed_kinds": [
+    "cup",
+    "league"
+  ],
+  "source_sha256": {
+    "candidates": "50b65ce40a9f39dcc090b64e1a24c0cf22f9a96ac5fcdb1c11562318d015093b",
+    "estimates": "8eb18530fdf3b7ed36255253e5540d95aa16a42c06c3e8de0a57adcd0ad1517a",
+    "recount": "f779bd4ad2a60ab18dc67f4362f74069e9e14134e24b6e2cadebcc3786adbd5c"
+  },
+  "owner_decision": {
+    "approved_on": "2026-08-20",
+    "reconfirmed_on": "2026-08-21",
+    "breadth": "all 1504 at once",
+    "depth": "newest season across all tournaments, then previous seasons"
+  },
+  "exclusions": {
+    "amateur": true,
+    "female_or_mixed": true,
+    "futsal_beach_or_esports": true,
+    "reserve": true,
+    "youth": true
+  }
+}

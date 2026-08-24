@@ -22,7 +22,9 @@ from scrapers.sofascore.discovery import (
     DiscoveryError,
     DiscoveryHTTPError,
     DiscoverySchemaError,
+    LeaseBrowserSofaScoreClient,
     LeaseProxySofaScoreClient,
+    SEASON_TEAMS_PATH,
     classify_season_year,
     discover_registry,
     parse_catalog_payload,
@@ -773,6 +775,63 @@ def test_targeted_detail_response_for_another_tournament_fails_closed():
         )
 
 
+@pytest.mark.unit
+def test_targeted_browser_discovery_persists_exact_season_team_count():
+    existing = _existing_registry()
+    client = _FakeClient()
+    client.payloads[TOURNAMENT_PATH.format(unique_tournament_id=8)] = {
+        "uniqueTournament": _catalog_item(*LALIGA[:5]),
+    }
+    client.payloads["/unique-tournament/8/seasons"] = _season_payload(LALIGA)
+    season_id = LALIGA[5]
+    teams_path = SEASON_TEAMS_PATH.format(
+        unique_tournament_id=8,
+        season_id=season_id,
+    )
+    client.payloads[teams_path] = {
+        "teams": [{"id": value} for value in range(1, 21)]
+    }
+
+    merged, _ = discover_registry(
+        existing,
+        client,
+        scope="targeted",
+        target_tournament_ids=[8],
+        include_team_counts=True,
+    )
+
+    tournament = next(
+        item for item in merged["tournaments"]
+        if item["unique_tournament_id"] == 8
+    )
+    assert tournament["seasons"][0]["team_count"] == 20
+    assert tournament["seasons"][0]["team_count_evidence"]["endpoint"] == teams_path
+    assert client.calls[-1] == teams_path
+
+
+@pytest.mark.unit
+def test_team_count_discovery_fails_closed_on_an_empty_source_list():
+    existing = _existing_registry()
+    client = _FakeClient()
+    client.payloads[TOURNAMENT_PATH.format(unique_tournament_id=8)] = {
+        "uniqueTournament": _catalog_item(*LALIGA[:5]),
+    }
+    client.payloads["/unique-tournament/8/seasons"] = _season_payload(LALIGA)
+    client.payloads[SEASON_TEAMS_PATH.format(
+        unique_tournament_id=8,
+        season_id=LALIGA[5],
+    )] = {"teams": []}
+
+    with pytest.raises(DiscoverySchemaError, match="positive team"):
+        discover_registry(
+            existing,
+            client,
+            scope="targeted",
+            target_tournament_ids=[8],
+            include_team_counts=True,
+        )
+
+
 # --- metered lease-proxy transport (opt-in) ----------------------------------
 
 
@@ -909,6 +968,238 @@ def _lease_client(proxy_filter, responses, **kwargs):
         **kwargs,
     )
     return client, sessions
+
+
+class _BrowserCapture:
+    def __init__(self, records, *, proxy, request_limiter):
+        self.records = records
+        self.proxy = proxy
+        self.request_limiter = request_limiter
+        self.entered = False
+        self.closed = False
+        self.warmed = []
+        self.calls = []
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.closed = True
+        return False
+
+    def warm_exact_json(self, url):
+        assert self.request_limiter() is True
+        self.warmed.append(url)
+
+    def fetch_api_json(self, path):
+        assert self.request_limiter() is True
+        self.calls.append(path)
+        item = self.records.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+class _BrowserLeaseProvider:
+    def __init__(self, *, provider_bytes=4096):
+        self.provider_bytes = provider_bytes
+        self.acquired = []
+        self.closed = []
+
+    def acquire(self, **kwargs):
+        self.acquired.append(dict(kwargs))
+        number = len(self.acquired)
+        return SimpleNamespace(
+            lease_id=f"browser-{number}",
+            token=f"token-{number}",
+            proxy_url="http://proxy_filter:8900",
+            max_bytes=kwargs["max_bytes"],
+            expires_at=2_000_000.0,
+        )
+
+    def playwright_proxy(self, lease):
+        return {
+            "server": lease.proxy_url,
+            "username": "lease",
+            "password": lease.token,
+        }
+
+    def stats(self, lease):
+        return SimpleNamespace(provider_bytes=min(self.provider_bytes, lease.max_bytes))
+
+    def close(self, lease):
+        self.closed.append(lease.lease_id)
+        return SimpleNamespace(
+            provider_bytes=min(self.provider_bytes, lease.max_bytes),
+            upstream_repins=1,
+        )
+
+
+def _browser_client(records, **kwargs):
+    provider = kwargs.pop("lease_provider", _BrowserLeaseProvider())
+    captures = []
+
+    def factory(**capture_kwargs):
+        capture = _BrowserCapture(records, **capture_kwargs)
+        captures.append(capture)
+        return capture
+
+    client = LeaseBrowserSofaScoreClient(
+        control_url=CONTROL_URL,
+        budget_cap_bytes=kwargs.pop("budget_cap_bytes", 10_000_000),
+        run_id="discovery__browser_test",
+        lease_provider=provider,
+        capture_factory=factory,
+        rate_limiter=SimpleNamespace(acquire=lambda: True),
+        sleeper=lambda _seconds: None,
+        clock=lambda: 1_000_000.0,
+        **kwargs,
+    )
+    return client, provider, captures
+
+
+@pytest.mark.unit
+def test_browser_lease_transport_warms_once_and_fetches_exact_json_only():
+    client, provider, captures = _browser_client([
+        {
+            "status": 200,
+            "json": {"seasons": []},
+            "challenge": False,
+            "body": b'{"seasons":[]}',
+        }
+    ])
+
+    assert client.get_json("/unique-tournament/8/seasons") == {"seasons": []}
+    client.close()
+
+    assert captures[0].proxy == {
+        "server": "http://proxy_filter:8900",
+        "username": "lease",
+        "password": "token-1",
+    }
+    assert captures[0].warmed == ["https://www.sofascore.com/"]
+    assert captures[0].calls == ["/api/v1/unique-tournament/8/seasons"]
+    assert captures[0].closed is True
+    assert provider.closed == ["browser-1"]
+    assert client.stats["requests"] == 1
+    assert client.stats["browser_sessions"] == 1
+    assert client.stats["browser_navigations"] == 2
+    assert client.stats["paid_proxy_bytes"] == 4096
+    assert client.stats["direct_response_bytes"] == 0
+    assert client.stats["accounting_status"] == "verified"
+
+
+@pytest.mark.unit
+def test_browser_final_close_failure_is_reported_and_conservatively_billed():
+    class BrokenCloseProvider(_BrowserLeaseProvider):
+        def close(self, lease):
+            raise RuntimeError("meter unavailable")
+
+    client, _, _ = _browser_client(
+        [{
+            "status": 200,
+            "json": {"seasons": []},
+            "challenge": False,
+            "body": b'{}',
+        }],
+        lease_provider=BrokenCloseProvider(),
+        per_lease_max_bytes=4096,
+    )
+    client.get_json("/unique-tournament/8/seasons")
+
+    with pytest.raises(DiscoveryError, match="did not close cleanly"):
+        client.close()
+
+    assert client.stats["paid_proxy_bytes"] == 4096
+    assert client.stats["accounting_status"] == "unresolved_close"
+
+
+@pytest.mark.unit
+def test_browser_lease_transport_retries_with_a_new_lease_and_no_direct_fallback():
+    client, provider, captures = _browser_client([
+        None,
+        {
+            "status": 200,
+            "json": {"uniqueTournament": {"id": 8}},
+            "challenge": False,
+            "body": b"{}",
+        },
+    ])
+
+    assert client.get_json("/unique-tournament/8") == {
+        "uniqueTournament": {"id": 8}
+    }
+    client.close()
+
+    assert len(captures) == 2
+    assert len(provider.acquired) == 2
+    assert provider.closed == ["browser-1", "browser-2"]
+    assert client.stats["browser_sessions"] == 2
+    assert client.stats["browser_navigations"] == 4
+    assert client.stats["paid_proxy_bytes"] == 8192
+
+
+@pytest.mark.unit
+def test_browser_lease_transport_rotates_when_browser_start_cannot_reach_exit():
+    provider = _BrowserLeaseProvider()
+    captures = []
+
+    class StartCapture(_BrowserCapture):
+        def __enter__(self):
+            if not captures:
+                captures.append(self)
+                raise RuntimeError("dead residential exit")
+            captures.append(self)
+            return super().__enter__()
+
+    records = [{
+        "status": 200,
+        "json": {"seasons": []},
+        "challenge": False,
+        "body": b'{"seasons":[]}',
+    }]
+
+    def factory(**kwargs):
+        return StartCapture(records, **kwargs)
+
+    client = LeaseBrowserSofaScoreClient(
+        control_url=CONTROL_URL,
+        budget_cap_bytes=10_000_000,
+        run_id="discovery__browser_start_retry",
+        max_attempts=2,
+        lease_provider=provider,
+        capture_factory=factory,
+        rate_limiter=SimpleNamespace(acquire=lambda: True),
+        sleeper=lambda _seconds: None,
+        clock=lambda: 1_000_000.0,
+    )
+
+    assert client.get_json("/unique-tournament/8/seasons") == {"seasons": []}
+    client.close()
+
+    assert provider.closed == ["browser-1", "browser-2"]
+    assert client.stats["lease_count"] == 2
+    assert client.stats["browser_sessions"] == 2
+
+
+@pytest.mark.unit
+def test_browser_lease_transport_never_issues_more_than_remaining_budget():
+    provider = _BrowserLeaseProvider(provider_bytes=3000)
+    client, provider, _ = _browser_client(
+        [None, None],
+        lease_provider=provider,
+        budget_cap_bytes=5000,
+        per_lease_max_bytes=4000,
+        max_attempts=2,
+    )
+
+    with pytest.raises(DiscoveryHTTPError, match="returned no response"):
+        client.get_json("/unique-tournament/8/seasons")
+    client.close()
+
+    assert [item["max_bytes"] for item in provider.acquired] == [4000, 2000]
+    assert client.stats["paid_proxy_bytes"] == 5000
 
 
 @pytest.mark.unit

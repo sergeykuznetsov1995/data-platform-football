@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[3]
 SHARED_FILTER = ROOT / "scripts/proxy_filter/filter_proxy.py"
 FBREF_FILTER = ROOT / "scripts/fbref_proxy/filter_proxy.py"
 SHARED_FILTER_SHA256 = (
-    "614ade1fd0710249ea288cfb3e208518adcfeebab7649a83fe8865d6466e1c58"
+    "bb7dbbb0cc22f09ea3201c79a8927ff70379c01b6f7dfd2d92a253d2bdabfd25"
 )
 
 

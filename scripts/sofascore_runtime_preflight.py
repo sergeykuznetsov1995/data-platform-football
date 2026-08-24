@@ -35,6 +35,9 @@ from scrapers.sofascore.workload_plan import (  # noqa: E402
     WorkloadPolicyUnavailable,
     load_verified_workload_policy,
 )
+from scrapers.sofascore.all_mens_campaign import (  # noqa: E402
+    validate_campaign_snapshot,
+)
 
 
 RUNTIME_UID = 50_000
@@ -316,6 +319,54 @@ def validate_state_directory(
         _probe_state_write(path)
 
 
+def validate_campaign_directory(
+    path: Path,
+    *,
+    policy_path: Path,
+    probe_write: bool = False,
+    require_protected_parents: bool = False,
+    runtime_uid: int = RUNTIME_UID,
+    runtime_gid: int = RUNTIME_GID,
+) -> None:
+    """Require a durable writable directory with one valid seeded snapshot."""
+
+    validate_state_directory(
+        path,
+        probe_write=probe_write,
+        require_protected_parents=require_protected_parents,
+        runtime_uid=runtime_uid,
+        runtime_gid=runtime_gid,
+    )
+    snapshot_path = path / "snapshot.json"
+    _require_canonical_path(snapshot_path, label="SofaScore all-men snapshot")
+    _require_canonical_path(policy_path, label="SofaScore all-men policy")
+    try:
+        metadata = snapshot_path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or snapshot_path.is_symlink()
+            or metadata.st_nlink != 1
+        ):
+            raise ReadinessError(
+                "SofaScore all-men snapshot must be a regular non-symlink file"
+            )
+        if not _identity_has_permissions(
+            metadata, uid=runtime_uid, gid=runtime_gid, required=0o4
+        ):
+            raise ReadinessError(
+                "SofaScore all-men snapshot is not readable by UID 50000/GID 0"
+            )
+        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        if not isinstance(snapshot, Mapping) or not isinstance(policy, Mapping):
+            raise ReadinessError("SofaScore all-men seed JSON must be an object")
+        validate_campaign_snapshot(snapshot, policy)
+    except ReadinessError:
+        raise
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ReadinessError("SofaScore all-men seed snapshot is invalid") from exc
+
+
 def read_gateway_health(url: str, *, timeout_seconds: float = 2.0) -> Mapping[str, Any]:
     parsed = urllib.parse.urlsplit(url)
     if (
@@ -407,6 +458,8 @@ def _parser() -> argparse.ArgumentParser:
     artifact_arguments(preflight)
     preflight.add_argument("--release-root", required=True, type=Path)
     preflight.add_argument("--state-dir", required=True, type=Path)
+    preflight.add_argument("--campaign-dir", required=True, type=Path)
+    preflight.add_argument("--campaign-policy", required=True, type=Path)
 
     gateway = commands.add_parser("gateway-health")
     artifact_arguments(gateway)
@@ -416,6 +469,8 @@ def _parser() -> argparse.ArgumentParser:
     scheduler = commands.add_parser("scheduler-health")
     artifact_arguments(scheduler)
     scheduler.add_argument("--health-url", required=True)
+    scheduler.add_argument("--campaign-dir", required=True, type=Path)
+    scheduler.add_argument("--campaign-policy", required=True, type=Path)
     return parser
 
 
@@ -428,6 +483,7 @@ def run(arguments: Sequence[str] | None = None) -> dict[str, str]:
             {
                 "SofaScore artifact": args.artifact,
                 "SofaScore gateway state": args.state_dir,
+                "SofaScore all-men campaign": args.campaign_dir,
             },
         )
         artifact_id = validate_artifact(
@@ -439,6 +495,11 @@ def run(arguments: Sequence[str] | None = None) -> dict[str, str]:
             args.state_dir,
             require_protected_parents=True,
         )
+        validate_campaign_directory(
+            args.campaign_dir,
+            policy_path=args.campaign_policy,
+            require_protected_parents=True,
+        )
     else:
         require_runtime_identity()
         artifact_id = validate_artifact(
@@ -448,6 +509,12 @@ def run(arguments: Sequence[str] | None = None) -> dict[str, str]:
         )
         if args.mode == "gateway-health":
             validate_state_directory(args.state_dir, probe_write=True)
+        else:
+            validate_campaign_directory(
+                args.campaign_dir,
+                policy_path=args.campaign_policy,
+                probe_write=True,
+            )
         payload = read_gateway_health(args.health_url)
         validate_gateway_health(
             payload,
