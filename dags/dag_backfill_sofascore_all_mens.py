@@ -46,42 +46,27 @@ ACTIVE_COOLDOWN = timedelta(minutes=1)
 IDLE_COOLDOWN = timedelta(minutes=30)
 
 
-def _env_int(name: str, default: int | None, lo: int, hi: int) -> int | None:
-    """Read an integer knob at DAG parse; anything set but invalid fails closed."""
-
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        value = None
-    if value is None or not lo <= value <= hi:
-        raise ValueError(f"{name} must be an integer in [{lo}, {hi}], got {raw!r}")
-    return value
-
-
 # History lane knobs. Defaults reproduce the single-slot campaign; a second
 # lane (own gateway, own pool, several scopes per DagRun) is configured purely
 # through the scheduler environment, without touching sealed runtime code.
-HISTORY_BATCH_SIZE = _env_int("SOFASCORE_HISTORY_BATCH_SIZE", 1, 1, 64)
+HISTORY_BATCH_SIZE = state.env_int("SOFASCORE_HISTORY_BATCH_SIZE", 1, 1, 64)
 HISTORY_POOL = (
     os.environ.get("SOFASCORE_HISTORY_POOL", "").strip() or INGEST_SCRAPER_POOL
 )
-HISTORY_MAX_ACTIVE_TASKS = _env_int("SOFASCORE_HISTORY_MAX_ACTIVE_TASKS", 1, 1, 16)
-HISTORY_FIRST_START_YEAR = _env_int(
+HISTORY_MAX_ACTIVE_TASKS = state.env_int("SOFASCORE_HISTORY_MAX_ACTIVE_TASKS", 1, 1, 16)
+HISTORY_FIRST_START_YEAR = state.env_int(
     "SOFASCORE_HISTORY_FIRST_START_YEAR", state.DEFAULT_FIRST_START_YEAR, 2000, 2100
 )
 # A scope that failed this many DagRuns is parked (failures.json) instead of
 # retrying at the head of the queue forever; a validated success clears it.
-HISTORY_MAX_SCOPE_ATTEMPTS = _env_int(
+HISTORY_MAX_SCOPE_ATTEMPTS = state.env_int(
     "SOFASCORE_HISTORY_MAX_SCOPE_ATTEMPTS", state.DEFAULT_MAX_SCOPE_ATTEMPTS, 1, 100
 )
 # Forwarded into every planned task only when set: the scope cycle reads
 # SOFASCORE_PROXY_CONTROL_URL for its gateway and SOFASCORE_RATE_LIMIT_PER_MINUTE
 # for its source rate limit.
 HISTORY_TASK_ENV: dict[str, str] = {}
-_rate_limit = _env_int("SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE", None, 1, 60)
+_rate_limit = state.env_int("SOFASCORE_HISTORY_RATE_LIMIT_PER_MINUTE", None, 1, 60)
 if _rate_limit is not None:
     HISTORY_TASK_ENV["SOFASCORE_RATE_LIMIT_PER_MINUTE"] = str(_rate_limit)
 _control_url = os.environ.get("SOFASCORE_HISTORY_PROXY_CONTROL_URL", "").strip()

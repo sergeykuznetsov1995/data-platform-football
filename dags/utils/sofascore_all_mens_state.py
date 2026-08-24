@@ -31,10 +31,27 @@ STATE_SCHEMA_VERSION = 1
 FAILURES_SCHEMA_VERSION = 1
 DEFAULT_FIRST_START_YEAR = 2025
 DEFAULT_MAX_SCOPE_ATTEMPTS = 3
+DEFAULT_REFRESH_BATCH_SIZE = 8
+DEFAULT_REFRESH_RESULT_DIR = "/opt/airflow/runtime/sofascore/all-men/refresh-results"
 
 
 class CampaignPlanningError(ValueError):
     """The frozen campaign cannot produce a safe next capture batch."""
+
+
+def env_int(name: str, default: int | None, lo: int, hi: int) -> int | None:
+    """Read an integer knob at DAG parse; anything set but invalid fails closed."""
+
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = None
+    if value is None or not lo <= value <= hi:
+        raise ValueError(f"{name} must be an integer in [{lo}, {hi}], got {raw!r}")
+    return value
 
 
 def _canonical_json(value: object) -> bytes:
@@ -225,40 +242,147 @@ def plan_historical_batch(
                     Path(result_dir) / safe_run
                 ),
             }]
-        tournament_id = int(tournament["unique_tournament_id"])
-        season_id = int(season["source_season_id"])
-        scope_key = campaign_scope_key(campaign_id, tournament_id, season_id)
-        safe_run = hashlib.sha256(
-            f"{dag_run_id}:{scope_key}".encode("utf-8")
-        ).hexdigest()[:20]
-        planned.append({
-            **lane_env,
-            "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
-            "SOFASCORE_CAMPAIGN_ACTION": "capture",
-            "SOFASCORE_CAMPAIGN_SNAPSHOT": snapshot_path,
-            "SOFASCORE_ALL_MENS_POLICY": policy_path,
-            "SOFASCORE_EXPECTED_SNAPSHOT_ID": snapshot_id,
-            "SOFASCORE_EXPECTED_CAMPAIGN_ID": campaign_id,
-            "SOFASCORE_TOURNAMENT_ID": str(tournament_id),
-            "SOFASCORE_SOURCE_SEASON_ID": str(season_id),
-            "SOFASCORE_CANONICAL_SEASON": str(
-                season["canonical_season"]
-            ),
-            "SOFASCORE_SCOPE_KEY": scope_key,
-            "SOFASCORE_SCOPE_RESULT_PATH": str(
-                Path(result_dir) / f"{safe_run}.json"
-            ),
-            "SOFASCORE_SCOPE_OUTPUT_DIR": str(
-                Path(result_dir) / safe_run
-            ),
-            "SOFASCORE_WORKLOAD_ARTIFACT": workload_artifact,
-            # The gateway ledger holds one immutable plan per run_id,
-            # so scopes of one DagRun must not share it (batch > 1).
-            # An Airflow retry keeps the same id and reuses the plan.
-            "SOFASCORE_SCOPE_RUN_ID": (
-                f"{dag_run_id}--{tournament_id}-{season_id}"
-            ),
-        })
+        planned.append(_scope_task_env(
+            "capture",
+            snapshot_id=snapshot_id,
+            campaign_id=campaign_id,
+            tournament_id=int(tournament["unique_tournament_id"]),
+            season=season,
+            lane_env=lane_env,
+            snapshot_path=snapshot_path,
+            policy_path=policy_path,
+            result_dir=result_dir,
+            workload_artifact=workload_artifact,
+            dag_run_id=dag_run_id,
+        ))
+        if len(planned) == batch_size:
+            break
+    return planned
+
+
+def _scope_task_env(
+    action: str,
+    *,
+    snapshot_id: str,
+    campaign_id: str,
+    tournament_id: int,
+    season: Mapping[str, Any],
+    lane_env: Mapping[str, str],
+    snapshot_path: str,
+    policy_path: str,
+    result_dir: str,
+    workload_artifact: str,
+    dag_run_id: str,
+) -> dict[str, str]:
+    """Environment of one scope-cycle task (history capture or refresh)."""
+
+    season_id = int(season["source_season_id"])
+    scope_key = campaign_scope_key(campaign_id, tournament_id, season_id)
+    safe_run = hashlib.sha256(
+        f"{dag_run_id}:{scope_key}".encode("utf-8")
+    ).hexdigest()[:20]
+    return {
+        **lane_env,
+        "PYTHONPATH": "/opt/airflow:/opt/airflow/dags",
+        "SOFASCORE_CAMPAIGN_ACTION": action,
+        "SOFASCORE_CAMPAIGN_SNAPSHOT": snapshot_path,
+        "SOFASCORE_ALL_MENS_POLICY": policy_path,
+        "SOFASCORE_EXPECTED_SNAPSHOT_ID": snapshot_id,
+        "SOFASCORE_EXPECTED_CAMPAIGN_ID": campaign_id,
+        "SOFASCORE_TOURNAMENT_ID": str(tournament_id),
+        "SOFASCORE_SOURCE_SEASON_ID": str(season_id),
+        "SOFASCORE_CANONICAL_SEASON": str(season["canonical_season"]),
+        "SOFASCORE_SCOPE_KEY": scope_key,
+        "SOFASCORE_SCOPE_RESULT_PATH": str(Path(result_dir) / f"{safe_run}.json"),
+        "SOFASCORE_SCOPE_OUTPUT_DIR": str(Path(result_dir) / safe_run),
+        "SOFASCORE_WORKLOAD_ARTIFACT": workload_artifact,
+        # The gateway ledger holds one immutable plan per run_id,
+        # so scopes of one DagRun must not share it (batch > 1).
+        # An Airflow retry keeps the same id and reuses the plan.
+        "SOFASCORE_SCOPE_RUN_ID": f"{dag_run_id}--{tournament_id}-{season_id}",
+    }
+
+
+def plan_refresh_batch(
+    snapshot: Mapping[str, Any],
+    pending_partitions: Iterable[tuple[str, str, int]],
+    *,
+    batch_size: int = DEFAULT_REFRESH_BATCH_SIZE,
+    exclude_tournament_ids: Iterable[int | str] = (),
+    snapshot_path: str = "/opt/airflow/runtime/sofascore/all-men/snapshot.json",
+    policy_path: str = "/opt/airflow/configs/sofascore/all_mens_campaign.json",
+    result_dir: str = DEFAULT_REFRESH_RESULT_DIR,
+    workload_artifact: str = (
+        "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
+    ),
+    dag_run_id: str = "manual",
+    task_env: Mapping[str, str] | None = None,
+) -> list[dict[str, str]]:
+    """Select the refresh batch: Bronze partitions with the most pending matches.
+
+    ``pending_partitions`` are ``(league, season, pending_matches)`` rows from
+    Bronze: ``SS-<id>`` partitions holding finished games that have no
+    complete capture yet.  Each row is resolved against the snapshot
+    (``capture_key`` -> tournament, ``canonical_season`` -> season); the
+    configured leagues in ``exclude_tournament_ids`` belong to the daily
+    ingest, an unknown partition or an excluded season is skipped with a log
+    line (the scope cycle would refuse it anyway).  A pending season is
+    accepted: the refresh lane runs the matches phase from Bronze evidence
+    without season pages.
+    """
+
+    lane_env = {str(key): str(value) for key, value in (task_env or {}).items()}
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise CampaignPlanningError("batch_size must be a positive integer")
+    snapshot_id = str(snapshot.get("snapshot_id") or "")
+    if not snapshot_id or snapshot_id != _snapshot_digest(snapshot):
+        raise CampaignPlanningError("campaign snapshot digest mismatch")
+    campaign_id = str(snapshot.get("campaign_id") or "")
+    if not campaign_id:
+        raise CampaignPlanningError("campaign_id is missing")
+    tournaments = snapshot.get("tournaments")
+    if not isinstance(tournaments, list):
+        raise CampaignPlanningError("campaign tournaments must be a list")
+    # Campaign partitions are keyed ``SS-<unique_tournament_id>``.
+    configured_keys = {f"SS-{int(value)}" for value in exclude_tournament_ids}
+    index: dict[tuple[str, str], tuple[int, Mapping[str, Any]]] = {}
+    for tournament in tournaments:
+        if str(tournament.get("metadata_status") or "pending") != "ready":
+            continue
+        for season in tournament.get("seasons") or ():
+            if str(season.get("metadata_status") or "pending") == "excluded":
+                continue
+            key = (str(tournament["capture_key"]), str(season["canonical_season"]))
+            index[key] = (int(tournament["unique_tournament_id"]), season)
+    ranked = sorted(
+        ((str(league), str(season), int(count)) for league, season, count in pending_partitions),
+        key=lambda item: (-item[2], item[0], item[1]),
+    )
+    planned: list[dict[str, str]] = []
+    for league, canonical, count in ranked:
+        if league in configured_keys:
+            continue
+        entry = index.get((league, canonical))
+        if entry is None:
+            logger.warning(
+                "refresh partition %s/%s (%s pending) is not a ready snapshot "
+                "season; skipped", league, canonical, count,
+            )
+            continue
+        tournament_id, season = entry
+        planned.append(_scope_task_env(
+            "refresh",
+            snapshot_id=snapshot_id,
+            campaign_id=campaign_id,
+            tournament_id=tournament_id,
+            season=season,
+            lane_env=lane_env,
+            snapshot_path=snapshot_path,
+            policy_path=policy_path,
+            result_dir=result_dir,
+            workload_artifact=workload_artifact,
+            dag_run_id=dag_run_id,
+        ))
         if len(planned) == batch_size:
             break
     return planned
@@ -414,9 +538,11 @@ __all__ = [
     "CampaignPlanningError",
     "campaign_scope_key",
     "clear_failed",
+    "env_int",
     "mark_completed",
     "mark_failed",
     "plan_historical_batch",
+    "plan_refresh_batch",
     "read_completed",
     "read_failures",
     "read_snapshot",

@@ -6,10 +6,13 @@ import json
 import pytest
 
 from dags.utils.sofascore_all_mens_state import (
+    CampaignPlanningError,
     campaign_scope_key,
     clear_failed,
+    env_int,
     mark_failed,
     plan_historical_batch,
+    plan_refresh_batch,
     read_failures,
 )
 from scrapers.sofascore.workload_plan import (
@@ -279,3 +282,114 @@ def test_scope_parks_after_max_attempts_and_its_tournament_waits(tmp_path):
 
     assert head not in read_failures(failures_path, campaign_id=campaign_id)
     assert _plan()[0] == head
+
+
+def _refresh_snapshot():
+    snapshot = _snapshot()
+    # Lane F: the current (pending, unmeasured) season of every tournament
+    # sits on top of the measured 2025 seasons.
+    for tournament in snapshot["tournaments"]:
+        tournament_id = tournament["unique_tournament_id"]
+        tournament["seasons"].insert(0, {
+            "source_season_id": tournament_id * 100 + 26,
+            "canonical_season": "2627",
+            "start_year": 2026,
+            "season_format": "split_year",
+            "team_count": None,
+            "metadata_status": "pending",
+        })
+    unsigned = dict(snapshot)
+    unsigned.pop("snapshot_id")
+    snapshot["snapshot_id"] = hashlib.sha256(json.dumps(
+        unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+    return snapshot
+
+
+@pytest.mark.unit
+def test_refresh_planner_ranks_partitions_by_pending_matches_and_bounds_batch():
+    snapshot = _refresh_snapshot()
+    pending = [("SS-8", "2526", 3), ("SS-17", "2627", 10), ("SS-17", "2526", 1)]
+
+    planned = plan_refresh_batch(
+        snapshot, pending, batch_size=2, dag_run_id="scheduled__1",
+        task_env={"SOFASCORE_PROXY_CONTROL_URL": "http://gw:8080"},
+    )
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:17:1726", "campaign-test:8:825"
+    ]
+    head = planned[0]
+    assert head["SOFASCORE_CAMPAIGN_ACTION"] == "refresh"
+    assert head["SOFASCORE_TOURNAMENT_ID"] == "17"
+    assert head["SOFASCORE_SOURCE_SEASON_ID"] == "1726"
+    assert head["SOFASCORE_CANONICAL_SEASON"] == "2627"
+    assert head["SOFASCORE_EXPECTED_SNAPSHOT_ID"] == snapshot["snapshot_id"]
+    assert head["SOFASCORE_EXPECTED_CAMPAIGN_ID"] == "campaign-test"
+    # One immutable gateway plan per run_id: scopes of one DagRun differ.
+    assert head["SOFASCORE_SCOPE_RUN_ID"] == "scheduled__1--17-1726"
+    assert planned[1]["SOFASCORE_SCOPE_RUN_ID"] == "scheduled__1--8-825"
+    assert head["SOFASCORE_SCOPE_RESULT_PATH"].startswith(
+        "/opt/airflow/runtime/sofascore/all-men/refresh-results/"
+    )
+    assert head["SOFASCORE_SCOPE_OUTPUT_DIR"] != planned[1]["SOFASCORE_SCOPE_OUTPUT_DIR"]
+    assert head["SOFASCORE_PROXY_CONTROL_URL"] == "http://gw:8080"
+    assert head["SOFASCORE_WORKLOAD_ARTIFACT"].endswith("proxy_budget_canary.json")
+
+
+@pytest.mark.unit
+def test_refresh_planner_skips_configured_unknown_and_excluded_partitions():
+    snapshot = _refresh_snapshot()
+    excluded = snapshot["tournaments"][0]["seasons"][1]  # 17 / 2526
+    excluded["metadata_status"] = "excluded"
+    unsigned = dict(snapshot)
+    unsigned.pop("snapshot_id")
+    snapshot["snapshot_id"] = hashlib.sha256(json.dumps(
+        unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+    pending = [
+        ("SS-8", "2627", 9),      # configured league: the daily ingest owns it
+        ("SS-999", "2627", 8),    # not in the snapshot
+        ("SS-17", "1999", 7),     # season the snapshot does not know
+        ("SS-17", "2526", 6),     # excluded season: the scope cycle refuses it
+        ("ENG-Premier League", "2627", 5),
+        ("SS-17", "2627", 1),
+    ]
+
+    planned = plan_refresh_batch(
+        snapshot, pending, batch_size=8, exclude_tournament_ids={8}
+    )
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:17:1726"
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_planner_rejects_a_stale_snapshot_and_bad_batch_size():
+    snapshot = _refresh_snapshot()
+
+    with pytest.raises(CampaignPlanningError, match="batch_size"):
+        plan_refresh_batch(snapshot, [], batch_size=0)
+    snapshot["snapshot_id"] = "0" * 64
+    with pytest.raises(CampaignPlanningError, match="digest"):
+        plan_refresh_batch(snapshot, [("SS-17", "2627", 1)])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("raw", "expected"), [("", 8), ("3", 3)]
+)
+def test_env_int_reads_a_bounded_integer_knob(monkeypatch, raw, expected):
+    monkeypatch.setenv("SOFASCORE_TEST_KNOB", raw)
+
+    assert env_int("SOFASCORE_TEST_KNOB", 8, 1, 64) == expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("raw", ["0", "65", "eight"])
+def test_env_int_fails_closed_on_an_invalid_knob(monkeypatch, raw):
+    monkeypatch.setenv("SOFASCORE_TEST_KNOB", raw)
+
+    with pytest.raises(ValueError, match="SOFASCORE_TEST_KNOB"):
+        env_int("SOFASCORE_TEST_KNOB", 8, 1, 64)
