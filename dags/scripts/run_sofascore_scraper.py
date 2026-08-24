@@ -882,7 +882,11 @@ def _run_match_capture(
                 )
             else:
                 from scrapers.sofascore.live_capture import capture_live_specs
-                from scrapers.sofascore.pipeline import replay_event_specs
+                from scrapers.sofascore.pipeline import (
+                    apply_endpoint_exclusions,
+                    replay_event_specs,
+                    scope_probe_exclusions,
+                )
                 from scrapers.sofascore.workload_runtime import target_ids
 
                 live_specs = [
@@ -901,6 +905,11 @@ def _run_match_capture(
                 else:
                     remaining_specs = {spec.key: spec for spec in live_specs}
                     traffic_parts = []
+                    # A2: the first allocation probes the scope with the full
+                    # endpoint set; endpoints the source published for none
+                    # of its matches are not requested for the later ones.
+                    # A repair (--force-replace) re-captures 404s (#1039).
+                    excluded = None
                     for allocation in workload_allocations:
                         batch_ids = set(target_ids(allocation))
                         batch_specs = [
@@ -910,6 +919,10 @@ def _run_match_capture(
                         ]
                         if not batch_specs:
                             continue
+                        if excluded:
+                            batch_specs = apply_endpoint_exclusions(
+                                batch_specs, excluded
+                            )
                         captured, batch_traffic = capture_live_specs(
                             capture_runtime,
                             batch_specs,
@@ -928,6 +941,18 @@ def _run_match_capture(
                         traffic_parts.append(batch_traffic)
                         for spec in batch_specs:
                             remaining_specs.pop(spec.key, None)
+                        if excluded is None and not force_replace:
+                            excluded = scope_probe_exclusions(
+                                capture_runtime.manifest_store, batch_specs
+                            )
+                            results["excluded_endpoints"] = sorted(excluded)
+                            if excluded:
+                                logger.info(
+                                    "scope probe: %s publishes no %s — not "
+                                    "requested for the remaining allocations",
+                                    f"{league}:{season_short}",
+                                    ", ".join(sorted(excluded)),
+                                )
                     if remaining_specs:
                         # Unallocated targets may only be local replay hits.
                         pipeline_results.extend(

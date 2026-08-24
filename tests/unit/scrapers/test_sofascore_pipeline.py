@@ -28,6 +28,7 @@ from scrapers.sofascore.pipeline import (
     EVENT_PATHS,
     PLAYER_PATHS,
     PLAYER_TARGET_TYPES,
+    apply_endpoint_exclusions,
     build_capture_runtime,
     build_event_spec,
     build_player_spec,
@@ -38,6 +39,7 @@ from scrapers.sofascore.pipeline import (
     promote_repaired_results,
     replay_event_specs,
     replay_player_specs,
+    scope_probe_exclusions,
 )
 from scrapers.sofascore.live_capture import _AllocationBudgetView
 from scrapers.sofascore.raw_store import RawPayloadStore
@@ -1008,6 +1010,313 @@ def test_match_runner_merges_bronze_inside_the_writer_lock_and_finalizes_after(
     assert all(
         runtime.manifest_store.get(spec.key).is_terminal for spec in specs.values()
     )
+
+
+def _event_spec(match_id: str, endpoint: str):
+    return build_event_spec(
+        source_tournament_id=17,
+        source_season_id=76986,
+        target_id=match_id,
+        endpoint=endpoint,
+        freshness_key="final",
+        paid_proxy=False,
+    )
+
+
+def _not_supported_manifest(spec, http_status=404):
+    return EndpointManifest(
+        key=spec.key,
+        status=ManifestStatus.NOT_SUPPORTED,
+        run_id="run",
+        task_id="capture",
+        attempts=1,
+        row_count=0,
+        http_status=http_status,
+    )
+
+
+def _retryable_manifest(spec):
+    return EndpointManifest(
+        key=spec.key,
+        status=ManifestStatus.RETRYABLE_FAILURE,
+        run_id="run",
+        task_id="capture",
+        attempts=1,
+        row_count=0,
+        http_status=503,
+    )
+
+
+def test_scope_probe_excludes_only_endpoints_every_sampled_match_lacks():
+    """A2: SS-186 (787/1320 not_supported) — after the probe allocation the
+    source is not asked for an endpoint it publishes for none of the sampled
+    matches; ``event`` is never a candidate."""
+    matches = ("1", "2", "3")
+    store = InMemoryManifestStore()
+    for match_id in matches:
+        # lineups: 404 for all three -> excluded
+        store.upsert(_not_supported_manifest(_event_spec(match_id, "lineups")))
+        # event: 404 for all three too (hypothetically) -> still never excluded
+        store.upsert(_not_supported_manifest(_event_spec(match_id, "event")))
+        # incidents: not terminal -> not evidence
+        store.upsert(_retryable_manifest(_event_spec(match_id, "incidents")))
+    # statistics: 2 of 3 not_supported, one success -> published sometimes
+    for match_id in matches[:2]:
+        store.upsert(_not_supported_manifest(_event_spec(match_id, "statistics")))
+    store.upsert(_successful_manifest(_event_spec("3", "statistics")))
+    # shotmap: only two sampled matches terminal -> below min_matches
+    for match_id in matches[:2]:
+        store.upsert(_not_supported_manifest(_event_spec(match_id, "shotmap")))
+    probe = [
+        _event_spec(match_id, endpoint)
+        for match_id in matches
+        for endpoint in EVENT_PATHS
+    ]
+
+    excluded = scope_probe_exclusions(store, probe)
+
+    assert excluded == frozenset({"lineups"})
+    assert "event" not in excluded
+    assert scope_probe_exclusions(store, probe, min_matches=2) == frozenset(
+        {"lineups", "shotmap"}
+    )
+
+
+def test_scope_probe_needs_min_matches_of_evidence():
+    store = InMemoryManifestStore()
+    for match_id in ("1", "2"):
+        store.upsert(_not_supported_manifest(_event_spec(match_id, "lineups")))
+    probe = [_event_spec(match_id, "lineups") for match_id in ("1", "2", "3")]
+
+    assert scope_probe_exclusions(store, probe) == frozenset()
+
+
+def test_apply_endpoint_exclusions_marks_only_excluded_endpoints_unsupported():
+    specs = [_event_spec("7", endpoint) for endpoint in EVENT_PATHS]
+
+    applied = apply_endpoint_exclusions(specs, frozenset({"lineups"}))
+
+    assert [spec.key for spec in applied] == [spec.key for spec in specs]
+    by_endpoint = {spec.key.endpoint: spec for spec in applied}
+    assert by_endpoint["lineups"].supported is False
+    assert "scope probe" in by_endpoint["lineups"].unsupported_reason
+    assert "lineups" in by_endpoint["lineups"].unsupported_reason
+    for endpoint in ("event", "statistics", "shotmap", "incidents"):
+        assert by_endpoint[endpoint] is specs[list(EVENT_PATHS).index(endpoint)]
+    assert apply_endpoint_exclusions(specs, frozenset()) == specs
+
+
+def test_excluded_endpoint_is_recorded_not_supported_without_transport(tmp_path):
+    from scrapers.sofascore.live_capture import capture_live_specs
+
+    runtime, transport = _runtime(tmp_path)
+    [excluded] = apply_endpoint_exclusions(
+        [_event_spec(EVENT_ID, "lineups")], frozenset({"lineups"})
+    )
+
+    results, traffic = capture_live_specs(
+        runtime,
+        [excluded],
+        canonical_url="https://www.sofascore.com/tournament/premier-league/17",
+        scope="ENG-Premier League:2526",
+        entity="match_capture",
+        transport_factory=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("excluded endpoint opened a lease")
+        ),
+    )
+
+    assert transport.calls == 0
+    assert traffic["request_count"] == 0
+    [result] = results
+    assert result.manifest.status == ManifestStatus.NOT_SUPPORTED
+    assert result.manifest.http_status is None
+    assert "scope probe" in result.manifest.error_message
+    assert runtime.manifest_store.get(excluded.key).is_terminal
+
+
+# Three probe matches (``min_matches``) in the first allocation, one in the next.
+PROBE_MATCH_IDS = (EVENT_ID, "14023926", "14023927")
+SECOND_MATCH_IDS = ("14023928",)
+
+
+def _two_allocation_plan(runtime):
+    from scrapers.sofascore.workload_plan import qualify_work_unit
+    from scrapers.sofascore.workload_runtime import partition_key
+
+    key = partition_key("ENG-Premier League", "2526")
+    allocations = tuple(
+        WorkloadAllocation(
+            allocation_id=f"alloc-{index}" + str(index) * 27,
+            task_id=f"capture_match_batch_{index}",
+            scope="match",
+            workload_class="match_batch_25",
+            batch_index=index,
+            units=tuple(qualify_work_unit(key, match_id) for match_id in ids),
+            budget_bytes=10_000,
+        )
+        for index, ids in enumerate((PROBE_MATCH_IDS, SECOND_MATCH_IDS))
+    )
+    plan = _signed_plan(
+        artifact_id="a" * 64,
+        dag_id="dag_ingest_sofascore",
+        run_id=runtime.engine.run_id,
+        player_universe_ids=(),
+        allocations=allocations,
+        control_token="c" * 32,
+    )
+    return plan, allocations
+
+
+def _patch_match_runner_environment(monkeypatch, runner, match_ids):
+    monkeypatch.setattr(
+        runner, "_resolve_match_ids_from_bronze", lambda *args, **kwargs: match_ids
+    )
+    monkeypatch.setattr(runner, "_source_context", lambda *args: (17, 76986))
+    monkeypatch.setattr(
+        runner,
+        "_tournament_canonical_url",
+        lambda *args: "https://www.sofascore.com/tournament/premier-league/17",
+    )
+    from dags.utils import sofascore_dq
+
+    passed = SimpleNamespace(require=lambda: None)
+    for validator in (
+        "validate_table_rows",
+        "validate_lineup_semantics",
+        "validate_event_participants",
+        "validate_season_alignment",
+    ):
+        monkeypatch.setattr(sofascore_dq, validator, lambda *args, **kwargs: passed)
+
+
+def test_match_runner_probes_the_first_allocation_and_excludes_missing_endpoints(
+    tmp_path, monkeypatch
+):
+    """A2: the first allocation is captured with the full endpoint set; every
+    endpoint the source published for none of its matches reaches the next
+    allocation as ``supported=False`` (recorded not_supported, no request)."""
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore import live_capture
+    from scrapers.sofascore.live_capture import _zero_traffic
+
+    match_ids = [*PROBE_MATCH_IDS, *SECOND_MATCH_IDS]
+    runtime, transport = _runtime(tmp_path)
+    plan, allocations = _two_allocation_plan(runtime)
+    _patch_match_runner_environment(monkeypatch, runner, match_ids)
+    seen: list[list[tuple[str, str, bool]]] = []
+
+    def source_without_lineups(runtime, specs, **kwargs):
+        # The stand-in source answers 404 to every endpoint but ``event``.
+        seen.append([(s.key.target_id, s.key.endpoint, s.supported) for s in specs])
+        results = []
+        for spec in specs:
+            if not spec.supported:
+                results.append(runtime.engine.capture(spec))
+                continue
+            if spec.key.endpoint == "event":
+                manifest = _successful_manifest(spec)
+            else:
+                manifest = _not_supported_manifest(spec)
+            runtime.manifest_store.upsert(manifest)
+            results.append(CaptureResult(manifest=manifest, network_used=True))
+        return results, _zero_traffic()
+
+    monkeypatch.setattr(live_capture, "capture_live_specs", source_without_lineups)
+    output = tmp_path / "match-probe.json"
+
+    with patch(
+        "scrapers.sofascore.SofaScoreScraper", return_value=_runner_player_scraper()
+    ):
+        rc = runner._run_match_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=plan,
+            workload_allocations=allocations,
+            offline_replay=False,
+        )
+
+    assert rc == 0
+    assert transport.calls == 0
+    assert len(seen) == 2
+    # Probe: the full set, everything supported.
+    assert seen[0] == [
+        (match_id, endpoint, True)
+        for match_id in PROBE_MATCH_IDS
+        for endpoint in EVENT_PATHS
+    ]
+    # Second allocation: only ``event`` may still be requested.
+    assert seen[1] == [
+        (match_id, endpoint, endpoint == "event")
+        for match_id in SECOND_MATCH_IDS
+        for endpoint in EVENT_PATHS
+    ]
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["excluded_endpoints"] == [
+        "incidents",
+        "lineups",
+        "shotmap",
+        "statistics",
+    ]
+    for endpoint in EVENT_PATHS:
+        record = runtime.manifest_store.get(
+            _event_spec(SECOND_MATCH_IDS[0], endpoint).key
+        )
+        assert record.is_terminal
+        if endpoint != "event":
+            assert record.status == ManifestStatus.NOT_SUPPORTED
+            assert "scope probe" in record.error_message
+
+
+def test_match_runner_repair_never_applies_the_scope_probe(tmp_path, monkeypatch):
+    """A2: ``--force-replace`` re-captures 404s (#1039) — no exclusions."""
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore import live_capture
+    from scrapers.sofascore.live_capture import _zero_traffic
+
+    runtime, _ = _runtime(tmp_path)
+    plan, allocations = _two_allocation_plan(runtime)
+    _patch_match_runner_environment(
+        monkeypatch, runner, [*PROBE_MATCH_IDS, *SECOND_MATCH_IDS]
+    )
+    seen: list[list[bool]] = []
+
+    def all_not_supported(runtime, specs, **kwargs):
+        seen.append([spec.supported for spec in specs])
+        results = []
+        for spec in specs:
+            manifest = _not_supported_manifest(spec)
+            runtime.manifest_store.upsert(manifest)
+            results.append(CaptureResult(manifest=manifest, network_used=True))
+        return results, _zero_traffic()
+
+    monkeypatch.setattr(live_capture, "capture_live_specs", all_not_supported)
+    output = tmp_path / "match-repair.json"
+
+    with patch(
+        "scrapers.sofascore.SofaScoreScraper", return_value=_runner_player_scraper()
+    ):
+        rc = runner._run_match_capture(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            limit=None,
+            output_path=str(output),
+            capture_runtime=runtime,
+            workload_plan=plan,
+            workload_allocations=allocations,
+            force_replace=True,
+            offline_replay=False,
+        )
+
+    assert rc == 0
+    assert seen == [
+        [True] * (len(EVENT_PATHS) * len(ids))
+        for ids in (PROBE_MATCH_IDS, SECOND_MATCH_IDS)
+    ]
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert "excluded_endpoints" not in result
 
 
 def test_player_runner_manifest_noop_is_exact_zero_traffic_before_browser(

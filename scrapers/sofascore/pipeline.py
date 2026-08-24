@@ -524,6 +524,70 @@ def endpoint_resume_plan(
     return {target: tuple(names) for target, names in plan.items()}
 
 
+# Endpoints a scope probe may exclude; ``event`` is the match's identity and
+# is never trimmed.
+_PROBE_EXCLUDABLE_ENDPOINTS = frozenset(EVENT_PATHS) - {'event'}
+
+
+def scope_probe_exclusions(
+    manifest_store: ManifestStore,
+    probe_specs: Iterable[EndpointSpec],
+    *,
+    min_matches: int = 3,
+) -> frozenset[str]:
+    """Endpoints the source does not publish for this scope (A2, #1218).
+
+    The first allocation of a scope is captured with the full endpoint set.
+    An endpoint whose terminal records among those probed matches are ALL
+    ``not_supported`` — with at least ``min_matches`` of them — is excluded
+    for the remaining allocations, so a lower league without lineups costs
+    about one request per match instead of five (SS-186: 787/1320
+    not_supported).
+
+    Known limitation: a cup whose early rounds lack lineups while the final
+    publishes them loses the final's lineups; the owner's "trim by
+    availability" decision accepts this.
+    """
+    verdicts: dict[str, list[bool]] = {}
+    for spec in probe_specs:
+        endpoint = spec.key.endpoint
+        if endpoint not in _PROBE_EXCLUDABLE_ENDPOINTS:
+            continue
+        record = manifest_store.get(spec.key)
+        if record is None or not record.is_terminal:
+            continue
+        verdicts.setdefault(endpoint, []).append(
+            record.status == ManifestStatus.NOT_SUPPORTED
+        )
+    return frozenset(
+        endpoint
+        for endpoint, flags in verdicts.items()
+        if len(flags) >= min_matches and all(flags)
+    )
+
+
+def apply_endpoint_exclusions(
+    specs: Iterable[EndpointSpec],
+    excluded: Iterable[str],
+) -> list[EndpointSpec]:
+    """Mark ``excluded`` endpoints unsupported: the engine records
+    ``not_supported`` for them without touching the source."""
+    names = frozenset(excluded)
+    return [
+        replace(
+            spec,
+            supported=False,
+            unsupported_reason=(
+                f"scope probe: source does not publish {spec.key.endpoint} "
+                "(every sampled match answered 404)"
+            ),
+        )
+        if spec.key.endpoint in names
+        else spec
+        for spec in specs
+    ]
+
+
 def ingest_prefetched_records(
     runtime: CaptureRuntime,
     *,
