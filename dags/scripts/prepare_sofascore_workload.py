@@ -56,6 +56,7 @@ from scrapers.sofascore.workload_runtime import (
 
 
 VALID_PHASES = frozenset({"season", "targets", "players"})
+SEASON_EVIDENCE = frozenset({"pages", "bronze"})
 SOFASCORE_BUDGET_ARTIFACT_ID_ENV = "SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"
 _LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}")
 _ZERO_SHA256 = "0" * 64
@@ -335,11 +336,22 @@ def prepare_workload_plan(
     players_rotation_date: Optional[date] = None,
     players_force: bool = False,
     season_freshness_key: Optional[str] = None,
+    season_evidence: str = "pages",
 ) -> Path:
-    """Snapshot local work, sign it, and atomically persist one phase plan."""
+    """Snapshot local work, sign it, and atomically persist one phase plan.
+
+    ``season_evidence="bronze"`` (targets phase only) plans matches straight
+    from the finished games in ``bronze.sofascore_schedule`` — the refresh
+    lane's daily event feed — without season pages or a season-shape class:
+    a pending season has no team pages and no measured team-count band.
+    """
 
     if phase not in VALID_PHASES:
         raise ValueError(f"phase must be one of {sorted(VALID_PHASES)}")
+    if season_evidence not in SEASON_EVIDENCE:
+        raise ValueError(f"season_evidence must be one of {sorted(SEASON_EVIDENCE)}")
+    if season_evidence == "bronze" and phase != "targets":
+        raise ValueError("season_evidence=bronze is only valid for the targets phase")
     if not str(base_run_id).strip() or "::" in str(base_run_id):
         raise ValueError("base_run_id must be non-empty and cannot contain '::'")
     phase_run_id = f"{base_run_id}::{phase}"
@@ -436,38 +448,40 @@ def prepare_workload_plan(
                 f"{item.league} {canonical} has no discovered SofaScore season"
             )
         drop_reason = None
-        try:
-            season_plan = plan_season_partition(
-                runtime.raw_store,
-                runtime.manifest_store,
-                source_tournament_id=tournament.unique_tournament_id,
-                source_season_id=source_season.season_id,
-                freshness_key=season_freshness,
-                event_freshness_key="final",
-                paid_proxy=True,
-                max_pages=max_pages,
+        season_plan = None
+        if season_evidence == "pages":
+            try:
+                season_plan = plan_season_partition(
+                    runtime.raw_store,
+                    runtime.manifest_store,
+                    source_tournament_id=tournament.unique_tournament_id,
+                    source_season_id=source_season.season_id,
+                    freshness_key=season_freshness,
+                    event_freshness_key="final",
+                    paid_proxy=True,
+                    max_pages=max_pages,
+                )
+            except SeasonPlanningError as exc:
+                # A defect in ONE league's stored state (schema-rejected raw,
+                # a canonicalised referee without slug evidence #1081, an
+                # aggregate tournament past max_pages) must not cost every
+                # other league its plan — the 2026-08-20 shape one layer up.
+                # Only the planner's own verdict is isolated; config and
+                # Trino errors are systemic and still fail the phase.
+                drop_reason = f"season planning failed: {exc}"
+            # The class is keyed by the season's byte-driving shape, not by
+            # the tournament: format comes from the discovered registry
+            # season, the team-count band from competitions.yaml.  An
+            # unconfigured season raises MedallionConfigError here and fails
+            # the phase — a silently skipped league is exactly the fail-open
+            # we refuse.
+            shape = production_season_shape(
+                season_format=source_season.format,
+                team_count_band=team_count_band(
+                    get_season_team_count(item.league, canonical)
+                ),
+                max_pages_per_direction=max_pages,
             )
-        except SeasonPlanningError as exc:
-            # A defect in ONE league's stored state (schema-rejected raw, a
-            # canonicalised referee without slug evidence #1081, an aggregate
-            # tournament past max_pages) must not cost every other league its
-            # plan — the 2026-08-20 shape one layer up. Only the planner's own
-            # verdict is isolated; config and Trino errors are systemic and
-            # still fail the phase.
-            season_plan = None
-            drop_reason = f"season planning failed: {exc}"
-        # The class is keyed by the season's byte-driving shape, not by the
-        # tournament: format comes from the discovered registry season, the
-        # team-count band from competitions.yaml.  An unconfigured season raises
-        # MedallionConfigError here and fails the phase — a silently skipped
-        # league is exactly the fail-open we refuse.
-        shape = production_season_shape(
-            season_format=source_season.format,
-            team_count_band=team_count_band(
-                get_season_team_count(item.league, canonical)
-            ),
-            max_pages_per_direction=max_pages,
-        )
         # Only leagues that actually reach this point are candidates for the
         # plan: inactive competitions and leagues outside this week's rotation
         # already skipped above and must not dilute the all-dropped guard.
@@ -655,6 +669,16 @@ def main(argv=None) -> int:
         action="store_true",
         help="Plan every league's players regardless of the weekly rotation.",
     )
+    parser.add_argument(
+        "--season-evidence",
+        choices=sorted(SEASON_EVIDENCE),
+        default="pages",
+        help=(
+            "Where the targets phase takes its schedule evidence from: the "
+            "captured season pages (default) or the finished games already in "
+            "bronze.sofascore_schedule (refresh lane; no season pages needed)."
+        ),
+    )
     args = parser.parse_args(argv)
     if not args.artifact:
         parser.error("--artifact or SOFASCORE_PROXY_BUDGET_ARTIFACT is required")
@@ -684,6 +708,7 @@ def main(argv=None) -> int:
         allow_inactive_season=args.allow_inactive_season,
         players_rotation_date=rotation_date,
         players_force=args.players_force,
+        season_evidence=args.season_evidence,
     )
     print(path)
     return 0

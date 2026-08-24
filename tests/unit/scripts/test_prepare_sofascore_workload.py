@@ -10,6 +10,7 @@ from dags.scripts.prepare_sofascore_workload import (
     CompetitionSeason,
     _observed_player_ids,
     _parse_rotation_boundary,
+    main as prepare_main,
     player_rotation_cohort,
     player_rotation_due,
     player_rotation_modulus,
@@ -513,6 +514,100 @@ def test_target_phase_batches_matches_only_and_never_snapshots_players(
     assert signed.player_universe_ids == ()
     observed_probe.assert_not_called()
     squad_probe.assert_not_called()
+
+
+def test_target_phase_from_bronze_evidence_never_reads_the_season_pages(
+    tmp_path, monkeypatch
+):
+    # F2 refresh lane: a pending season has no season pages (and no measured
+    # team-count band), so the finished matches in bronze.sofascore_schedule
+    # are the only evidence — the plan is signed straight from them.
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    patches = _common_patches(_season_plan())
+    matches = {str(value) for value in range(1, 28)}
+    built_for = set()
+
+    def pending(_runtime, ids, builder):
+        built_for.update(spec.key.source_season_id for spec in builder("1"))
+        return tuple(sorted(ids, key=int))
+
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patch(
+            "dags.scripts.prepare_sofascore_workload.plan_season_partition",
+            side_effect=AssertionError("bronze evidence must not plan season pages"),
+        ) as season_probe,
+        patch(
+            "dags.scripts.prepare_sofascore_workload.production_season_shape",
+            side_effect=AssertionError("bronze evidence needs no team-count band"),
+        ) as shape_probe,
+        patch(
+            "dags.scripts.prepare_sofascore_workload._finished_match_ids",
+            return_value=matches,
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._pending_targets",
+            side_effect=pending,
+        ),
+    ):
+        path = prepare_workload_plan(
+            dag_id="dag_refresh_sofascore_all_mens",
+            base_run_id="refresh-1",
+            phase="targets",
+            competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=tmp_path / "target-plan.json",
+            allow_inactive_season=True,
+            season_freshness_key="final",
+            season_evidence="bronze",
+        )
+
+    signed = load_plan(path, control_token=TOKEN)
+    assert [item.scope for item in signed.allocations] == ["match", "match"]
+    assert [len(target_ids(item)) for item in signed.allocations] == [25, 2]
+    # The match specs are keyed by the registry's source season id.
+    assert built_for == {"76986"}
+    season_probe.assert_not_called()
+    shape_probe.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "phase, evidence",
+    [("season", "bronze"), ("players", "bronze"), ("targets", "trino")],
+)
+def test_bronze_season_evidence_is_a_targets_only_input(tmp_path, phase, evidence):
+    with pytest.raises(ValueError, match="season_evidence"):
+        prepare_workload_plan(
+            dag_id="dag_refresh_sofascore_all_mens",
+            base_run_id="refresh-1",
+            phase=phase,
+            competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=tmp_path / "plan.json",
+            season_evidence=evidence,
+        )
+
+
+@pytest.mark.parametrize(
+    "extra_argv, expected",
+    [([], "pages"), (["--season-evidence", "bronze"], "bronze")],
+)
+def test_cli_forwards_season_evidence_to_the_planner(tmp_path, extra_argv, expected):
+    with patch(
+        "dags.scripts.prepare_sofascore_workload.prepare_workload_plan",
+        return_value=tmp_path / "plan.json",
+    ) as planner:
+        assert prepare_main([
+            "--run-id", "refresh-1",
+            "--phase", "targets",
+            "--competition-season", "SS-17=2526",
+            "--artifact", str(tmp_path / "artifact.json"),
+            *extra_argv,
+        ]) == 0
+
+    assert planner.call_args.kwargs["season_evidence"] == expected
 
 
 def test_players_phase_rereads_fresh_match_universe_then_signs_all_players(
