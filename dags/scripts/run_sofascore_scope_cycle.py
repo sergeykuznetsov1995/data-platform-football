@@ -80,6 +80,7 @@ def run_phase(
         force_replace=bool(scope.get("force_replace")),
         allow_inactive_season=True,
         season_freshness_key="final",
+        season_evidence=str(scope.get("season_evidence") or "pages"),
     )
     argv = [
         "--entity", entity,
@@ -120,11 +121,29 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest-backend", default="trino", choices=("trino",))
     parser.add_argument("--force-replace", action="store_true")
     parser.add_argument("--run-id")
+    parser.add_argument(
+        "--season-evidence",
+        choices=("pages", "bronze"),
+        default="pages",
+        help=(
+            "bronze: plan the matches phase from finished games already in "
+            "bronze.sofascore_schedule instead of season pages (refresh lane; "
+            "--phase matches only)."
+        ),
+    )
+    parser.add_argument(
+        "--allow-pending-season",
+        action="store_true",
+        help="Accept a snapshot season whose metadata is still pending.",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.season_evidence == "bronze" and args.phase != "matches":
+        parser.error("--season-evidence bronze requires --phase matches")
     output_dir = Path(args.output_dir).resolve()
     output = Path(args.output).resolve()
     result: dict[str, Any] = {"status": "running", "phases": [], "errors": []}
@@ -138,6 +157,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             source_season_id=args.source_season_id,
             expected_snapshot_id=args.expected_snapshot_id,
             expected_campaign_id=args.expected_campaign_id,
+            allow_pending_season=bool(args.allow_pending_season),
         )
         paths = render_scope_overlays(scope, output_dir / "scope")
         run_id = args.run_id or (
@@ -151,6 +171,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "raw_store_uri": args.raw_store_uri,
             "manifest_backend": args.manifest_backend,
             "force_replace": bool(args.force_replace),
+            "season_evidence": args.season_evidence,
             "dag_id": (
                 os.environ.get("AIRFLOW_CTX_DAG_ID")
                 or "dag_backfill_sofascore_all_mens"
