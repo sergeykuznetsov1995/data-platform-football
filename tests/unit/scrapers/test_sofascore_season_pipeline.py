@@ -20,7 +20,6 @@ from scrapers.sofascore.capture_engine import (
 from scrapers.sofascore.manifest import (
     EndpointManifest,
     InMemoryManifestStore,
-    ManifestKey,
     ManifestStatus,
 )
 from scrapers.sofascore.pipeline import (
@@ -1415,11 +1414,9 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
     }
 
 
-@pytest.mark.unit
-def test_runner_live_season_uses_proven_slug_url_and_committed_completeness(
-    tmp_path,
-    monkeypatch,
-):
+def _live_season_run(tmp_path, monkeypatch, committed):
+    """Drive the season runner through one live capture whose committed
+    replan is ``committed``; returns (rc, live kwargs, results payload)."""
     from dags.scripts import run_sofascore_scraper as runner
 
     key = SimpleNamespace(stable_id=lambda: "season-key")
@@ -1428,8 +1425,9 @@ def test_runner_live_season_uses_proven_slug_url_and_committed_completeness(
     def plan(*, complete, missing, pending):
         return SimpleNamespace(
             complete=complete,
-            # These stubs carry no referee endpoint, so the player-phase view
-            # of readiness is the same as `complete` (mirror the real plan).
+            # These stubs carry no referee endpoint, so every readiness view
+            # is the same as `complete` (mirror the real plan).
+            match_phase_ready=complete,
             player_universe_ready=complete,
             specs=(spec,),
             missing_raw_keys=(key,) if missing else (),
@@ -1441,7 +1439,6 @@ def test_runner_live_season_uses_proven_slug_url_and_committed_completeness(
 
     initial = plan(complete=False, missing=True, pending=True)
     expanded = plan(complete=False, missing=False, pending=True)
-    committed = plan(complete=True, missing=False, pending=False)
     engine = SimpleNamespace(
         budget=object(),
         run_id="run-1",
@@ -1525,14 +1522,53 @@ def test_runner_live_season_uses_proven_slug_url_and_committed_completeness(
             workload_plan=None,
             offline_replay=False,
         )
+    payload = json.loads(output.read_text(encoding="utf-8")) if output.exists() else {}
+    return rc, captured, payload
+
+
+@pytest.mark.unit
+def test_runner_live_season_uses_proven_slug_url_and_committed_completeness(
+    tmp_path,
+    monkeypatch,
+):
+    key = SimpleNamespace(stable_id=lambda: "season-key")
+    committed = SimpleNamespace(
+        complete=True,
+        match_phase_ready=True,
+        specs=(SimpleNamespace(key=key),),
+        missing_raw_keys=(),
+        pending_keys=(),
+    )
+
+    rc, captured, payload = _live_season_run(tmp_path, monkeypatch, committed)
 
     assert rc == 0
     assert captured["canonical_url"] == (
         "https://www.sofascore.com/tournament/premier-league/17"
     )
-    payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["endpoint_completeness"] == 1.0
     assert payload["traffic"]["endpoint_completeness"] == 1.0
+
+
+@pytest.mark.unit
+def test_runner_live_season_tolerates_a_pending_referee_profile_after_commit(
+    tmp_path, monkeypatch, caplog
+):
+    """C6: the committed replan may still carry a pending referee profile
+    (discovered from event pages, stuck on 410/403 or a canonicalised id) —
+    that is not the season manifest failing to commit, so the runner reports
+    it and exits green instead of failing the league every day."""
+    committed = _plan_with_missing(pending=("referee_profile",))
+    assert committed.complete is False
+
+    with caplog.at_level("WARNING"):
+        rc, _captured, payload = _live_season_run(tmp_path, monkeypatch, committed)
+
+    assert rc == 0
+    assert payload["endpoint_completeness"] == 1.0
+    assert payload["pending_endpoints"] == 1
+    assert "referee" in caplog.text
+    assert committed.pending_keys[0].stable_id() in caplog.text
 
 
 @pytest.mark.unit
@@ -2085,17 +2121,21 @@ def test_partition_materializer_collapses_placeholder_resolved_on_later_page(
 
 
 def _plan_with_missing(*endpoints, pending=None):
-    """Bare plan whose missing/pending raw keys are the named endpoints."""
+    """Bare plan whose missing/pending raw keys are the named endpoints, keyed
+    exactly as production emits them."""
 
     def _key(endpoint):
-        return ManifestKey(
+        builder, target = {
+            "referee_profile": (build_referee_profile_spec, {"referee_id": 1}),
+            "squads": (build_squad_spec, {"team_id": 1}),
+        }[endpoint]
+        return builder(
             source_tournament_id="17",
             source_season_id="76986",
-            target_type="season",
-            target_id=f"{endpoint}:1",
-            endpoint=endpoint,
             freshness_key="day-2026-08-20",
-        )
+            paid_proxy=False,
+            **target,
+        ).key
 
     keys = tuple(_key(endpoint) for endpoint in endpoints)
     pending_keys = (
@@ -2129,8 +2169,18 @@ def test_referee_profile_does_not_block_the_player_universe():
     """
     plan = _plan_with_missing("referee_profile")
     assert plan.missing_raw_keys  # still captured, just not blocking
-    assert plan.player_blocking_missing_raw_keys == ()
+    assert plan.complete is False
     assert plan.player_universe_ready is True
+
+
+@pytest.mark.unit
+def test_referee_profile_does_not_block_the_match_phase():
+    """C6: the same profile is no evidence for the match phase either — a
+    stuck raw-only endpoint (410/403, canonicalised id #1081) must not drop a
+    league's matches from the targets plan or fail its season runner."""
+    plan = _plan_with_missing("referee_profile")
+    assert plan.complete is False
+    assert plan.match_phase_ready is True
 
 
 @pytest.mark.unit
@@ -2138,8 +2188,7 @@ def test_a_missing_squad_still_blocks_the_player_universe():
     """The relaxation is referee-only: a missing squad is real evidence about
     who played and must keep the player phase closed."""
     plan = _plan_with_missing("referee_profile", "squads")
-    blocking = plan.player_blocking_missing_raw_keys
-    assert [key.endpoint for key in blocking] == ["squads"]
+    assert plan.match_phase_ready is False
     assert plan.player_universe_ready is False
 
 
@@ -2151,6 +2200,7 @@ def test_player_universe_stays_closed_while_evidence_gaps_remain():
         _plan_with_missing("referee_profile"),
         player_universe_evidence_gaps=("participants omitted team 42",),
     )
+    assert plan.match_phase_ready is False
     assert plan.player_universe_ready is False
 
 

@@ -34,6 +34,7 @@ from scrapers.sofascore.pipeline import (
 from scrapers.sofascore.raw_store import RawPayloadNotFound
 from scrapers.sofascore.scraper import SofaScoreScraper, _season_label
 from scrapers.sofascore.season_pipeline import (
+    REFEREE_PROFILE_ENDPOINT,
     plan_season_partition,
     squad_player_ids,
 )
@@ -478,15 +479,17 @@ def prepare_workload_plan(
         # fetched it"; an incomplete plan is "we fetched it but the manifest
         # never reached a terminal state" — the shape of a capture that died
         # AFTER writing raw, which is exactly how a league fails in production.
-        # Referee profiles are captured with the season but say nothing about
-        # who played, and they only become discoverable AFTER the match phase,
-        # so the player phase uses the referee-tolerant view of both.
-        if phase == "players":
-            blocking_missing = season_plan.player_blocking_missing_raw_keys
-            blocked = bool(blocking_missing) or not season_plan.player_universe_ready
-        else:
-            blocking_missing = season_plan.missing_raw_keys
-            blocked = bool(blocking_missing) or not season_plan.complete
+        # Referee profiles are captured with the season but are an attribute
+        # of the match, not season evidence, and they only become discoverable
+        # AFTER the match phase, so both phases use the referee-tolerant view
+        # of both signals (a profile stuck on 410/403 or a canonicalised id
+        # otherwise drops the league's matches every day).
+        blocking_missing = tuple(
+            key
+            for key in season_plan.missing_raw_keys
+            if key.endpoint != REFEREE_PROFILE_ENDPOINT
+        )
+        blocked = bool(blocking_missing) or not season_plan.match_phase_ready
         if blocked:
             # A league whose season raw is still incomplete simply has nothing
             # to capture yet — it resumes on the next run. Failing the phase

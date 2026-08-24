@@ -1959,9 +1959,18 @@ def _run_season_capture_engine(
             paid_proxy=True,
             max_pages=_season_max_pages(),
         )
-        if not committed.complete:
+        # `match_phase_ready`, not `complete`: a referee profile is an
+        # attribute of the match, discovered from event pages and captured on
+        # a later run, so one still pending is not a failed season commit.
+        if not committed.match_phase_ready:
             raise RuntimeError(
                 "season manifest stayed nonterminal after successful Bronze MERGEs"
+            )
+        if committed.pending_keys:
+            logger.warning(
+                "season committed with %d referee profile(s) still pending: %s",
+                len(committed.pending_keys),
+                ", ".join(key.stable_id() for key in committed.pending_keys),
             )
         promote_repaired_results(
             capture_runtime,
@@ -1973,7 +1982,7 @@ def _run_season_capture_engine(
             ),
         )
         _flush_manifest_store(capture_runtime.manifest_store)
-        results["pending_endpoints"] = 0
+        results["pending_endpoints"] = len(committed.pending_keys)
         results["endpoint_completeness"] = 1.0
         results["traffic"] = _logical_capture_traffic(
             capture_runtime.engine,

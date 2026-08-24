@@ -61,6 +61,10 @@ SQUADS_PATH = (
     "{source_season_id}/players"
 )
 REFEREE_PROFILE_PATH = "/referee/{referee_id}"
+# The one season endpoint that is an attribute of the MATCH rather than
+# evidence about the season or who played: see
+# SeasonPartitionPlan.match_phase_ready.
+REFEREE_PROFILE_ENDPOINT = "referee_profile"
 
 
 class SeasonPlanningError(RuntimeError):
@@ -69,13 +73,6 @@ class SeasonPlanningError(RuntimeError):
 
 class SeasonMaterializationError(RuntimeError):
     """A planned season partition failed a fail-closed publication gate."""
-
-
-# Endpoints that are captured with the season but say nothing about WHO PLAYED,
-# so they must not gate the player phase. See
-# SeasonPartitionPlan.player_blocking_missing_raw_keys for why refereeing is the
-# one such endpoint today.
-_PLAYER_NONBLOCKING_ENDPOINTS = frozenset({"referee_profile"})
 
 
 @dataclass(frozen=True)
@@ -106,35 +103,33 @@ class SeasonPartitionPlan:
         return not self.pending_keys and not self.player_universe_evidence_gaps
 
     @property
-    def player_blocking_missing_raw_keys(self) -> tuple[ManifestKey, ...]:
-        """Missing raw that really does gate the player universe.
+    def match_phase_ready(self) -> bool:
+        """``complete`` with referee profiles excluded.
 
-        A referee profile is an attribute of the MATCH, not evidence about who
-        played, and referees are discovered partly from event pages captured
-        after the season phase (see ``_event_referee_from_stored_page``). So
-        requiring their profiles before the player phase of the SAME run is
-        impossible by construction: any league that played a round leaves
-        ``referee_profile`` missing that day, and the player branch fails
-        closed for every league because of it (dead since 2026-07-24). The
+        A referee profile is an attribute of the MATCH, not evidence about the
+        season or about who played, and referees are discovered partly from
+        event pages captured after the season phase (see
+        ``_event_referee_from_stored_page``). So requiring their profiles
+        before the match or player phase of the SAME run is impossible by
+        construction: any league that played a round leaves
+        ``referee_profile`` pending that day, and a profile stuck on the
+        source side (410/403, a canonicalised id #1081) leaves it pending
+        every day — which dropped the league's match phase daily and killed
+        the player branch for every league (dead since 2026-07-24). The
         profiles are still planned and captured — just on the next run.
         """
-
-        return tuple(
-            key
-            for key in self.missing_raw_keys
-            if key.endpoint not in _PLAYER_NONBLOCKING_ENDPOINTS
-        )
-
-    @property
-    def player_universe_ready(self) -> bool:
-        """``complete`` for the player phase: referee profiles excluded."""
 
         if self.player_universe_evidence_gaps:
             return False
         return not any(
-            key.endpoint not in _PLAYER_NONBLOCKING_ENDPOINTS
-            for key in self.pending_keys
+            key.endpoint != REFEREE_PROFILE_ENDPOINT for key in self.pending_keys
         )
+
+    @property
+    def player_universe_ready(self) -> bool:
+        """``complete`` for the player phase: the same referee-tolerant view."""
+
+        return self.match_phase_ready
 
 
 @dataclass(frozen=True)
@@ -594,7 +589,7 @@ def build_referee_profile_spec(
             source_season_id=season,
             target_type="referee",
             target_id=referee,
-            endpoint="referee_profile",
+            endpoint=REFEREE_PROFILE_ENDPOINT,
             freshness_key=str(freshness_key),
         ),
         url=f"{BASE_URL}{path}",
@@ -1596,6 +1591,7 @@ def squad_player_ids(
 
 __all__ = [
     "BASE_URL",
+    "REFEREE_PROFILE_ENDPOINT",
     "REFEREE_PROFILE_PATH",
     "SEASON_PATHS",
     "SQUADS_PATH",

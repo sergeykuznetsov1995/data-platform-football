@@ -15,6 +15,11 @@ from dags.scripts.prepare_sofascore_workload import (
     player_rotation_modulus,
     prepare_workload_plan,
 )
+from scrapers.sofascore.manifest import ManifestKey
+from scrapers.sofascore.season_pipeline import (
+    SeasonPartitionPlan,
+    build_referee_profile_spec,
+)
 from scrapers.sofascore.workload_plan import (
     WorkloadBudgetPolicy,
     WorkloadClassBudget,
@@ -103,18 +108,55 @@ def _catalog():
     return catalog
 
 
+def _season_key(endpoint):
+    """A manifest key of the shape production emits for ``endpoint``."""
+    if endpoint == "referee_profile":
+        return build_referee_profile_spec(
+            source_tournament_id=17,
+            source_season_id=76986,
+            referee_id=1,
+            freshness_key="day-fixed",
+            paid_proxy=False,
+        ).key
+    return ManifestKey(
+        source_tournament_id="17",
+        source_season_id="76986",
+        target_type="season",
+        target_id=f"{endpoint}:0",
+        endpoint=endpoint,
+        freshness_key="day-fixed",
+    )
+
+
+def _season_plan(*missing, pending=None, evidence_gaps=()):
+    """A real SeasonPartitionPlan whose missing raw/pending keys are the named
+    endpoints (missing raw is pending unless ``pending`` says otherwise).
+
+    The planner consults several views of a season plan; a stub that hand-sets
+    one of them lets a test pass on a shape production never sees, so the
+    readiness properties are always computed by the real dataclass here.
+    """
+    missing_keys = tuple(_season_key(endpoint) for endpoint in missing)
+    return SeasonPartitionPlan(
+        source_tournament_id="17",
+        source_season_id="76986",
+        freshness_key="day-fixed",
+        event_freshness_key="final",
+        specs=(),
+        pending_keys=(
+            missing_keys
+            if pending is None
+            else tuple(_season_key(endpoint) for endpoint in pending)
+        ),
+        missing_raw_keys=missing_keys,
+        schedule_event_ids=(),
+        team_ids=(),
+        referee_ids=(),
+        player_universe_evidence_gaps=tuple(evidence_gaps),
+    )
+
+
 def _common_patches(plan):
-    # Mirror the real SeasonPartitionPlan. The planner consults FOUR views of a
-    # season plan, and a stub missing any of them lets a test pass on a shape
-    # production never sees (lesson: mocks must describe prod reality). Unless a
-    # test says otherwise, its "missing" key is a genuine blocker (not a referee
-    # profile) and nothing else is pending.
-    if not hasattr(plan, "player_blocking_missing_raw_keys"):
-        plan.player_blocking_missing_raw_keys = plan.missing_raw_keys
-    if not hasattr(plan, "complete"):
-        plan.complete = not plan.missing_raw_keys
-    if not hasattr(plan, "player_universe_ready"):
-        plan.player_universe_ready = not plan.player_blocking_missing_raw_keys
     runtime = SimpleNamespace(raw_store=MagicMock(), manifest_store=MagicMock())
     return (
         patch(
@@ -245,7 +287,7 @@ def test_season_phase_signs_only_the_bounded_season_allocation(tmp_path, monkeyp
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
     monkeypatch.setenv("SOFASCORE_SEASON_FRESHNESS_KEY", "day-fixed")
     monkeypatch.setenv("SOFASCORE_PLAYER_FRESHNESS_KEY", "week-fixed")
-    season_plan = SimpleNamespace(missing_raw_keys=("schedule-last-0",))
+    season_plan = _season_plan("schedule_last")
     patches = _common_patches(season_plan)
     with patches[0], patches[1], patches[2], patches[3]:
         path = prepare_workload_plan(
@@ -280,7 +322,7 @@ def test_historical_scope_can_pin_season_freshness_across_days(
 ):
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
     monkeypatch.setenv("SOFASCORE_SEASON_FRESHNESS_KEY", "day-changing")
-    patches = _common_patches(SimpleNamespace(missing_raw_keys=()))
+    patches = _common_patches(_season_plan())
     with patches[0], patches[1], patches[2], patches[3]:
         path = prepare_workload_plan(
             dag_id="dag_backfill_sofascore_all_mens",
@@ -302,7 +344,7 @@ def test_force_repair_gets_a_measured_allocation_even_when_old_raw_is_complete(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
-    patches = _common_patches(SimpleNamespace(missing_raw_keys=()))
+    patches = _common_patches(_season_plan())
     with patches[0], patches[1], patches[2], patches[3]:
         path = prepare_workload_plan(
             dag_id="dag_ingest_sofascore",
@@ -348,7 +390,7 @@ def test_late_retry_reuses_original_signed_day_and_week_snapshot(tmp_path, monke
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
     monkeypatch.setenv("SOFASCORE_SEASON_FRESHNESS_KEY", "day-before-midnight")
     monkeypatch.setenv("SOFASCORE_PLAYER_FRESHNESS_KEY", "week-before-boundary")
-    patches = _common_patches(SimpleNamespace(missing_raw_keys=("schedule",)))
+    patches = _common_patches(_season_plan("schedule_last"))
     with patches[0], patches[1], patches[2], patches[3]:
         path = prepare_workload_plan(
             dag_id="dag_ingest_sofascore",
@@ -391,7 +433,7 @@ def test_out_of_window_single_year_partition_is_clean_empty_plan(
 ):
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
     patches = _common_patches(
-        SimpleNamespace(missing_raw_keys=("must-not-be-read",))
+        _season_plan("schedule_last")
     )
     with (
         patches[0],
@@ -424,7 +466,7 @@ def test_target_phase_batches_matches_only_and_never_snapshots_players(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
-    season_plan = SimpleNamespace(missing_raw_keys=())
+    season_plan = _season_plan()
     patches = _common_patches(season_plan)
     matches = {str(value) for value in range(1, 28)}
 
@@ -476,7 +518,7 @@ def test_players_phase_rereads_fresh_match_universe_then_signs_all_players(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
-    patches = _common_patches(SimpleNamespace(missing_raw_keys=()))
+    patches = _common_patches(_season_plan())
     observed = {"98", "99"}
     registered = {str(value) for value in range(1, 54)}
 
@@ -530,7 +572,7 @@ def test_players_phase_rereads_fresh_match_universe_then_signs_all_players(
 
 def _players_phase_without_a_universe(tmp_path, matches):
     """Plan the players phase for a league nobody can be captured for."""
-    patches = _common_patches(SimpleNamespace(missing_raw_keys=()))
+    patches = _common_patches(_season_plan())
     with (
         patches[0],
         patches[1],
@@ -595,7 +637,7 @@ def test_target_phase_fails_before_ids_if_season_raw_is_incomplete(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
-    patches = _common_patches(SimpleNamespace(missing_raw_keys=("missing",)))
+    patches = _common_patches(_season_plan("schedule_last"))
     with patches[0], patches[1], patches[2], patches[3]:
         with pytest.raises(RuntimeError, match="season raw is incomplete"):
             prepare_workload_plan(
@@ -620,8 +662,8 @@ def test_target_phase_isolates_one_incomplete_league_from_its_neighbours(
     At 1504 tournaments an all-or-nothing plan means zero details every day.
     """
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
-    complete = SimpleNamespace(missing_raw_keys=())
-    incomplete = SimpleNamespace(missing_raw_keys=("missing",))
+    complete = _season_plan()
+    incomplete = _season_plan("schedule_last")
     patches = _common_patches(complete)
     matches = {str(value) for value in range(1, 4)}
 
@@ -676,8 +718,8 @@ def test_target_phase_drops_a_league_that_died_after_writing_raw(tmp_path, monke
     stale Bronze for a league whose schedule never committed.
     """
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
-    healthy = SimpleNamespace(missing_raw_keys=(), complete=True)
-    died_after_raw = SimpleNamespace(missing_raw_keys=(), complete=False)
+    healthy = _season_plan()
+    died_after_raw = _season_plan(pending=("schedule_last",))
     patches = _common_patches(healthy)
     matches = {str(value) for value in range(1, 4)}
 
@@ -725,11 +767,7 @@ def test_players_phase_ignores_a_referee_only_gap(tmp_path, monkeypatch):
     referee-tolerant view, not the raw one.
     """
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
-    referee_only = SimpleNamespace(
-        missing_raw_keys=("referee_profile",),
-        player_blocking_missing_raw_keys=(),
-    )
-    patches = _common_patches(referee_only)
+    patches = _common_patches(_season_plan("referee_profile"))
     with (
         patches[0],
         patches[1],
@@ -771,6 +809,47 @@ def test_players_phase_ignores_a_referee_only_gap(tmp_path, monkeypatch):
     assert [item.scope for item in signed.allocations] == ["player"]
 
 
+def test_target_phase_keeps_a_league_whose_only_gap_is_a_referee_profile(
+    tmp_path, monkeypatch
+):
+    """C6: a referee profile is an attribute of the match, not season
+    evidence, and it only becomes discoverable after the match phase — so a
+    league whose ONLY pending season key is ``referee_profile`` (a 410/403 or a
+    canonicalised id, #1081) must still get its finished matches signed.
+    Demanding ``complete`` here silently dropped that league's match phase
+    every day.
+    """
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    patches = _common_patches(_season_plan("referee_profile"))
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patch(
+            "dags.scripts.prepare_sofascore_workload._finished_match_ids",
+            return_value={"1", "2", "3"},
+        ),
+        patch(
+            "dags.scripts.prepare_sofascore_workload._pending_targets",
+            side_effect=lambda _runtime, ids, _builder: tuple(sorted(ids, key=int)),
+        ),
+    ):
+        path = prepare_workload_plan(
+            dag_id="dag_ingest_sofascore",
+            base_run_id="scheduled-1",
+            phase="targets",
+            competition_seasons=[CompetitionSeason("ENG-Premier League", "2526")],
+            artifact_path=tmp_path / "artifact.json",
+            output_path=tmp_path / "target-plan.json",
+        )
+
+    signed = load_plan(path, control_token=TOKEN)
+    match_allocations = [item for item in signed.allocations if item.scope == "match"]
+    assert len(match_allocations) == 1
+    assert sorted(target_ids(match_allocations[0]), key=int) == ["1", "2", "3"]
+
+
 def test_target_phase_still_fails_when_every_league_is_incomplete(
     tmp_path, monkeypatch
 ):
@@ -778,7 +857,7 @@ def test_target_phase_still_fails_when_every_league_is_incomplete(
     be planned, that is a systemic outage and has to stay loud (lesson «зелёное,
     но пустое»)."""
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
-    incomplete = SimpleNamespace(missing_raw_keys=("missing",))
+    incomplete = _season_plan("schedule_last")
     patches = _common_patches(incomplete)
     with patches[0], patches[1], patches[2], patches[3]:
         with pytest.raises(RuntimeError, match="season raw is incomplete"):
@@ -798,7 +877,7 @@ def test_players_phase_fails_closed_until_every_match_endpoint_is_terminal(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
-    patches = _common_patches(SimpleNamespace(missing_raw_keys=()))
+    patches = _common_patches(_season_plan())
     with (
         patches[0],
         patches[1],
@@ -949,7 +1028,7 @@ def test_league_without_a_configured_season_fails_the_phase_loudly(
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
     from utils.medallion_config import MedallionConfigError
 
-    patches = _common_patches(SimpleNamespace(missing_raw_keys=()))
+    patches = _common_patches(_season_plan())
     destination = tmp_path / "unknown-plan.json"
     with (
         patches[0],
@@ -1140,10 +1219,10 @@ def test_all_dropped_guard_counts_candidates_not_the_whole_scope(
     a green run — the «зелёное, но пустое» failure mode.
     """
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
-    dead = SimpleNamespace(
-        missing_raw_keys=(),
-        player_blocking_missing_raw_keys=(),
-        player_universe_ready=False,
+    dead = _season_plan(
+        evidence_gaps=(
+            "scheduled/participating team 42 has no usable squad evidence",
+        ),
     )
     patches = _common_patches(dead)
     with (
@@ -1170,7 +1249,7 @@ def test_all_dropped_guard_counts_candidates_not_the_whole_scope(
 def _players_plan_for(tmp_path, leagues, **kwargs):
     """Sign a players plan for ``leagues`` with every Bronze probe stubbed."""
 
-    patches = _common_patches(SimpleNamespace(missing_raw_keys=()))
+    patches = _common_patches(_season_plan())
 
     def pending(_runtime, ids, builder):
         specs = builder(next(iter(ids))) if ids else ()
@@ -1284,7 +1363,7 @@ def test_non_due_leagues_cost_no_trino_or_squad_read(
             league, rotation_date=week, club_league_count=len(ROTATION_LEAGUES)
         )
     }
-    patches = _common_patches(SimpleNamespace(missing_raw_keys=()))
+    patches = _common_patches(_season_plan())
 
     def pending(_runtime, ids, builder):
         specs = builder(next(iter(ids))) if ids else ()
