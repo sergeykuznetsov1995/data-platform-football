@@ -948,6 +948,7 @@ _ALLOWED_VOLUME_TARGETS = {
         "/opt/airflow/fotmob-admission": ("bind", True),
         "/opt/airflow/logs": ("bind", False),
         "/opt/airflow/proxys.txt": ("bind", True),
+        "/opt/airflow/runtime/sofascore/all-men": ("bind", False),
         "/opt/airflow/runtime/sofascore/proxy_budget_canary.json": (
             "bind",
             True,
@@ -1020,6 +1021,10 @@ _RUNTIME_HOST_BIND_TARGETS = {
     ): "fbref-geoip-database",
     ("airflow-scheduler", "/opt/airflow/logs"): "writable-directory",
     ("airflow-scheduler", "/opt/airflow/proxys.txt"): "protected-file",
+    (
+        "airflow-scheduler",
+        "/opt/airflow/runtime/sofascore/all-men",
+    ): "writable-directory",
     (
         "airflow-scheduler",
         "/opt/airflow/runtime/sofascore/proxy_budget_canary.json",
@@ -1187,8 +1192,18 @@ _EXPECTED_HEALTHCHECKS = {
         "Retries": 5,
         "StartPeriod": 60_000_000_000,
         "Test": (
-            "CMD-SHELL",
-            'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"',
+            "CMD",
+            "python",
+            "/opt/airflow/scripts/sofascore_runtime_preflight.py",
+            "scheduler-health",
+            "--artifact",
+            "/opt/airflow/runtime/sofascore/proxy_budget_canary.json",
+            "--campaign-dir",
+            "/opt/airflow/runtime/sofascore/all-men",
+            "--campaign-policy",
+            "/opt/airflow/configs/sofascore/all_mens_campaign.json",
+            "--health-url",
+            "http://sofascore_proxy_filter:8899/health",
         ),
         "Timeout": 30_000_000_000,
     },
@@ -8387,6 +8402,10 @@ def _validate_bind_source_policy(
             FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH,
         ),
         "scheduler-logs": ("airflow-scheduler", "/opt/airflow/logs"),
+        "sofascore-campaign-dir": (
+            "airflow-scheduler",
+            "/opt/airflow/runtime/sofascore/all-men",
+        ),
         "sofascore-budget-artifact": (
             "airflow-scheduler",
             "/opt/airflow/runtime/sofascore/proxy_budget_canary.json",
