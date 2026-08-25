@@ -60,8 +60,11 @@ PAGE_KINDS = (
 )
 
 # One unforked process advances bounded raw-first batches while retaining the
-# same clearance and proxy quarantine for the run.
-CURRENT_MAX_BATCHES = 80
+# same clearance and proxy quarantine for the run.  The observed full 25-page
+# cadence is about 20m21s; 16 waves leave about 39 minutes before the
+# six-hour-five-minute task timeout.  The current-only deferred reconciliation
+# can improve throughput, but its exact speedup requires a live canary.
+CURRENT_MAX_BATCHES = 16
 CURRENT_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT
 CURRENT_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB
 DEFAULT_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS

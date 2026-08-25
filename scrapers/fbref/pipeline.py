@@ -3835,48 +3835,73 @@ class FBrefPipeline:
         )
         failed = True
         try:
-            for batch in range(1, normalized_batches + 1):
-                fetched = self.fetch_wave(
-                    run_id,
-                    worker_id=f"{worker_id}:batch-{batch:02d}",
-                    page_kinds=page_kinds,
-                    settings=settings,
-                    _live_session=live_session,
-                )
-                live_session.rollover_if_due(
-                    self.control,
-                    within_seconds=PERSISTENT_PARSE_GUARD_SECONDS,
-                )
-                parsed = self.parse_wave(
-                    run_id,
-                    page_kinds=page_kinds,
-                    settings=settings,
-                )
-                aggregate.batches = batch
-                self._merge_wave_result(aggregate.fetch, fetched)
-                self._merge_wave_result(aggregate.parse, parsed)
+            # Each claim independently evaluates _FRONTIER_SCOPE_CTE while
+            # holding its frontier lock, so current discovery cannot lease an
+            # ineligible target while this state-repair sweep is deferred.
+            # Keep history's cadence unchanged; its historical_once reopen
+            # semantics remain isolated from the current runner optimization.
+            reconcile_context = (
+                self._deferred_scope_reconcile()
+                if settings.run_type == "current"
+                else nullcontext()
+            )
+            with reconcile_context as reconciliation:
+                for batch in range(1, normalized_batches + 1):
+                    fetched = self.fetch_wave(
+                        run_id,
+                        worker_id=f"{worker_id}:batch-{batch:02d}",
+                        page_kinds=page_kinds,
+                        settings=settings,
+                        _live_session=live_session,
+                    )
+                    live_session.rollover_if_due(
+                        self.control,
+                        within_seconds=PERSISTENT_PARSE_GUARD_SECONDS,
+                    )
+                    parsed = self.parse_wave(
+                        run_id,
+                        page_kinds=page_kinds,
+                        settings=settings,
+                    )
+                    aggregate.batches = batch
+                    self._merge_wave_result(aggregate.fetch, fetched)
+                    self._merge_wave_result(aggregate.parse, parsed)
 
-                if _is_run_mass_redirect(aggregate.fetch):
-                    raise FetchWaveError(
-                        "mass_redirect_run="
-                        f"{aggregate.fetch.moved_pages_skipped}"
-                    )
-                if _is_run_mass_match_not_found(aggregate.fetch):
-                    raise FetchWaveError(
-                        "mass_match_not_found_run="
-                        f"{aggregate.fetch.deferred_match_not_found}"
-                    )
-                if _is_run_mass_terminal_oversized_pages(aggregate.fetch):
-                    raise FetchWaveError(
-                        "mass_response_too_large_run="
-                        f"{aggregate.fetch.terminal_oversized_pages}"
-                    )
+                    if _is_run_mass_redirect(aggregate.fetch):
+                        raise FetchWaveError(
+                            "mass_redirect_run="
+                            f"{aggregate.fetch.moved_pages_skipped}"
+                        )
+                    if _is_run_mass_match_not_found(aggregate.fetch):
+                        raise FetchWaveError(
+                            "mass_match_not_found_run="
+                            f"{aggregate.fetch.deferred_match_not_found}"
+                        )
+                    if _is_run_mass_terminal_oversized_pages(aggregate.fetch):
+                        raise FetchWaveError(
+                            "mass_response_too_large_run="
+                            f"{aggregate.fetch.terminal_oversized_pages}"
+                        )
 
-                if fetched.budget_exhausted:
-                    break
-                if fetched.claimed == 0 and parsed.cohort_size == 0:
-                    aggregate.frontier_closed = True
-                    break
+                    if fetched.budget_exhausted:
+                        break
+                    if fetched.claimed == 0 and parsed.cohort_size == 0:
+                        aggregate.frontier_closed = True
+                        break
+            if (
+                aggregate.frontier_closed
+                and isinstance(reconciliation, Mapping)
+                and (
+                    bool(reconciliation.get("deferred_to_outer", False))
+                    or int(reconciliation.get("reopened", 0)) > 0
+                )
+            ):
+                # The final current-lane sweep may have made a previously
+                # quarantined target eligible after the last zero-claim wave.
+                # An enclosing defer context is equally unsafe to call closed:
+                # its eventual repair has not run yet.  Do not report a false
+                # closure to the downstream validator.
+                aggregate.frontier_closed = False
             failed = False
             return aggregate
         finally:
@@ -4112,15 +4137,16 @@ class FBrefPipeline:
             self._reconcile_frontier_scope()
         return len(seeded_targets), len(skipped_targets)
 
-    def _reconcile_frontier_scope(self) -> None:
+    def _reconcile_frontier_scope(self) -> Optional[Mapping[str, int]]:
         if self._scope_reconcile_deferred:
             self._scope_reconcile_pending = True
-            return
+            return None
         reconcile_scope = getattr(
             self.control, "reconcile_frontier_scope", None
         )
         if reconcile_scope is not None:
-            reconcile_scope(source="fbref")
+            return reconcile_scope(source="fbref")
+        return None
 
     @contextmanager
     def _deferred_scope_reconcile(self):
@@ -4142,16 +4168,27 @@ class FBrefPipeline:
 
         previous_deferred = self._scope_reconcile_deferred
         previous_pending = self._scope_reconcile_pending
+        reconciliation: dict[str, object] = {
+            "deferred_to_outer": False,
+            "reopened": 0,
+        }
         self._scope_reconcile_deferred = True
         self._scope_reconcile_pending = False
         try:
-            yield
+            yield reconciliation
         finally:
             pending = self._scope_reconcile_pending
             self._scope_reconcile_deferred = previous_deferred
             self._scope_reconcile_pending = previous_pending
+            reconciliation["deferred_to_outer"] = bool(
+                previous_deferred and (previous_pending or pending)
+            )
             if pending:
-                self._reconcile_frontier_scope()
+                result = self._reconcile_frontier_scope()
+                if isinstance(result, Mapping):
+                    reconciliation["reopened"] = int(
+                        result.get("reopened", 0)
+                    )
 
     def _parse_competition_index(
         self,
