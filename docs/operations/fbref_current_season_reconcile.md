@@ -186,7 +186,9 @@ whole batch back; it never switches to a different raw observation.
 ## Post-reconcile acceptance
 
 Require all 117 active male competitions to have exactly one current season,
-and require the current source ID to match the index-advertised season:
+and require the current source ID to match the index-advertised season. A
+display label is diagnostic, not source identity: competition 255 is the one
+reviewed label alias, and any other label mismatch is a refusal:
 
 ```sql
 BEGIN READ ONLY;
@@ -215,25 +217,54 @@ WITH active AS (
   GROUP BY c.competition_id,
            c.metadata ->> 'last_season',
            c.metadata ->> 'advertised_current_season_id'
+), classified AS (
+  SELECT *,
+         current_label IS DISTINCT FROM advertised_label
+           AS label_mismatch,
+         (competition_id = '255'
+           AND current_count = 1
+           AND current_season_id = '2026'
+           AND advertised_source_id = '2026'
+           AND current_label IS NOT NULL
+           AND advertised_label IS NOT NULL
+           AND current_label IS DISTINCT FROM advertised_label) IS TRUE
+           AS approved_label_mismatch,
+         current_count <> 1
+           OR current_season_id IS DISTINCT FROM advertised_source_id
+           AS identity_violation
+  FROM active
+), summary AS (
+  SELECT count(*) AS active_competitions,
+         count(*) FILTER (WHERE current_count = 1)
+           AS exactly_one_current,
+         count(*) FILTER (
+           WHERE current_season_id = advertised_source_id
+         ) AS advertised_source_id_matches,
+         count(*) FILTER (WHERE label_mismatch) AS label_mismatches,
+         count(*) FILTER (WHERE approved_label_mismatch)
+           AS approved_label_mismatches,
+         count(*) FILTER (
+           WHERE label_mismatch AND NOT approved_label_mismatch
+         ) AS unexpected_label_mismatches,
+         count(*) FILTER (
+           WHERE identity_violation
+              OR (label_mismatch AND NOT approved_label_mismatch)
+         ) AS violations
+  FROM classified
 )
-SELECT count(*) AS active_competitions,
-       count(*) FILTER (WHERE current_count = 1) AS exactly_one_current,
-       count(*) FILTER (
-         WHERE current_season_id = advertised_source_id
-       ) AS advertised_source_id_matches,
-       count(*) FILTER (
-         WHERE current_label = advertised_label
-       ) AS advertised_label_matches,
-       count(*) FILTER (
-         WHERE current_count <> 1
-            OR current_season_id IS DISTINCT FROM advertised_source_id
-            OR current_label IS DISTINCT FROM advertised_label
-       ) AS violations
-FROM active;
+SELECT *,
+       active_competitions = 117
+         AND exactly_one_current = 117
+         AND advertised_source_id_matches = 117
+         AND label_mismatches = 1
+         AND approved_label_mismatches = 1
+         AND unexpected_label_mismatches = 0
+         AND violations = 0 AS acceptance_pass
+FROM summary;
 COMMIT;
 ```
 
-Expected: `117 / 117 / 117 / 117 / 0`.
+Expected: `117 / 117 / 117 / 1 / 1 / 0 / 0 / true`.
 
 Before any oversized-page requeue or canary, require the two known stale
 playing-time targets to be outside the current proxy/freshness lane. This is a

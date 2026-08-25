@@ -57,6 +57,24 @@ def test_runbook_uses_only_readme_immutable_blob_function_for_apply():
     )
 
 
+def test_runbook_acceptance_allows_only_the_known_comp255_label_alias():
+    runbook = RUNBOOK.read_text()
+    acceptance = runbook.split("## Post-reconcile acceptance", 1)[1]
+    acceptance = acceptance.split(
+        "Before any oversized-page requeue", 1
+    )[0]
+
+    assert "AS label_mismatches" in acceptance
+    assert "AS approved_label_mismatches" in acceptance
+    assert "AS unexpected_label_mismatches" in acceptance
+    assert "competition_id = '255'" in acceptance
+    assert "current_season_id = '2026'" in acceptance
+    assert "advertised_source_id = '2026'" in acceptance
+    assert ") IS TRUE\n           AS approved_label_mismatch" in acceptance
+    assert "AS acceptance_pass" in acceptance
+    assert "Expected: `117 / 117 / 117 / 1 / 1 / 0 / 0 / true`." in acceptance
+
+
 def test_script_supports_exact_stdin_execution_from_runtime_workdir():
     assert remediation._repo_root_for_execution("<stdin>") is None
     result = subprocess.run(
