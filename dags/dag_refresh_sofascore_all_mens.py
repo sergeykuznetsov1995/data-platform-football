@@ -222,7 +222,8 @@ with DAG(
     max_active_tasks=REFRESH_MAX_ACTIVE_TASKS,
     is_paused_upon_creation=True,
     dagrun_timeout=timedelta(hours=5),
-    render_template_as_native_obj=True,
+    # No native rendering: ``env`` is a template field, and a native render turns
+    # the numeric budget string back into an int, which Popen refuses to encode.
     tags=["sofascore", "refresh", "all-men"],
 ) as dag:
     fetch = BashOperator(

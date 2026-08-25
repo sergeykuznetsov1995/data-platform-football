@@ -167,6 +167,26 @@ def test_refresh_lane_knobs_come_from_env(clean_env, monkeypatch):
 
 
 @pytest.mark.unit
+def test_task_env_survives_airflow_template_rendering(clean_env, monkeypatch):
+    """``env`` is a template field: a native-rendering DAG turns a numeric string
+    back into an int and BashOperator's Popen dies with ``expected str ... not int``.
+    """
+
+    from jinja2 import Environment
+    from jinja2.nativetypes import NativeEnvironment
+
+    module = _load_dag_module(monkeypatch)
+    native = bool(module.dag._dag_kwargs.get("render_template_as_native_obj"))
+    jinja = NativeEnvironment() if native else Environment()
+
+    for name, value in _operators()["fetch_daily_events"].env.items():
+        rendered = jinja.from_string(value).render()
+        assert isinstance(rendered, str), (
+            f"{name} renders as {type(rendered).__name__}, not str"
+        )
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("name", "value"),
     [
