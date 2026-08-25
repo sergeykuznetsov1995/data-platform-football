@@ -75,6 +75,7 @@ from scrapers.fbref.raw_store import (
     PageTarget,
     RawFetchRecord,
     RawPageStore,
+    canonicalize_fbref_url,
     competition_index_target,
     competition_page_target,
     match_page_target,
@@ -121,6 +122,28 @@ SENTINEL_COMPETITIONS = (
     "European Championship",
     "Copa América",
 )
+
+SEASON_INSTALL_REDIRECT_VERSION = (
+    "fbref-season-install-redirects-20260825-v1"
+)
+# Exact permanent redirects observed for these two source-advertised current
+# season slugs.  This belongs at the registry/frontier installation boundary,
+# after the v6 parser has derived the source season id: parsing the short
+# Location first would mint "2"/"3" instead of "2026-2027".  Keeping the pure
+# parser output unchanged avoids a global parser-version replay.  Values retain
+# the source's trailing slash as evidence; canonical storage removes it.
+_CURRENT_SEASON_REGISTRY_REDIRECTS = {
+    (
+        "33",
+        "2026-2027",
+        "https://fbref.com/en/comps/33/2-Bundesliga-Stats",
+    ): "https://fbref.com/en/comps/33/2/",
+    (
+        "59",
+        "2026-2027",
+        "https://fbref.com/en/comps/59/3-Liga-Stats",
+    ): "https://fbref.com/en/comps/59/3/",
+}
 
 # One Camoufox target may consume four 90s navigations plus four 45s solve
 # windows, restart overhead, and a bounded 60s throttle wait. Keep a full-hour
@@ -1811,8 +1834,23 @@ def _bronze_acceptance_replay_marker(
     }
 
 
+def _canonical_season_install_url(
+    competition_id: str,
+    season_id: str,
+    source_url: str,
+) -> str:
+    observed_location = _CURRENT_SEASON_REGISTRY_REDIRECTS.get((
+        competition_id,
+        season_id,
+        source_url,
+    ))
+    if observed_location is None:
+        return source_url
+    return canonicalize_fbref_url(observed_location)
+
+
 def page_target_from_link(link: DiscoveredPageLink) -> PageTarget:
-    """Build a stable target from an exact source-provided canonical URL."""
+    """Build a stable target, normalizing exact reviewed redirect aliases."""
 
     source_ids = normalize_page_source_ids(
         link.page_kind, link.source_ids
@@ -1835,7 +1873,13 @@ def page_target_from_link(link: DiscoveredPageLink) -> PageTarget:
         season_id = source_ids.get("season_id")
         if competition_id and season_id:
             return season_page_target(
-                competition_id, season_id, link.canonical_url
+                competition_id,
+                season_id,
+                _canonical_season_install_url(
+                    competition_id,
+                    season_id,
+                    link.canonical_url,
+                ),
             )
     if link.page_kind == "schedule":
         competition_id = source_ids.get("competition_id")
@@ -1976,6 +2020,20 @@ def _registry_entry(item: CompetitionRef) -> CompetitionRegistryEntry:
         gender=gender,
         classification=f"{item.format.value}:{item.participants.value}",
         metadata=_competition_metadata(item),
+    )
+
+
+def _season_with_registry_redirect(season: SeasonRef) -> SeasonRef:
+    installed_url = _canonical_season_install_url(
+        season.comp_id,
+        season.season_id,
+        season.season_url,
+    )
+    if installed_url == season.season_url:
+        return season
+    return replace(
+        season,
+        season_url=installed_url,
     )
 
 
@@ -4173,6 +4231,7 @@ class FBrefPipeline:
             raise ParseWaveError(
                 f"Season discovery failed for competition {competition_id}"
             )
+        seasons = [_season_with_registry_redirect(season) for season in seasons]
         current_label = competition.last_season
         current_candidates = [
             index
