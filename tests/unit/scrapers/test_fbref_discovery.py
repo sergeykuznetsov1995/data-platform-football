@@ -165,6 +165,40 @@ def test_competition_history_keeps_exact_urls_and_source_native_season_ids():
     )
 
 
+@pytest.mark.parametrize(
+    ("comp_id", "source_url", "observed_location"),
+    [
+        (
+            "33",
+            "/en/comps/33/2-Bundesliga-Stats",
+            "https://fbref.com/en/comps/33/2/",
+        ),
+        (
+            "59",
+            "/en/comps/59/3-Liga-Stats",
+            "https://fbref.com/en/comps/59/3/",
+        ),
+    ],
+)
+def test_current_season_redirect_aliases_keep_source_identity_and_url(
+    comp_id,
+    source_url,
+    observed_location,
+):
+    html = f"""
+    <table id="seasons"><tbody><tr>
+      <th data-stat="season"><a href="{source_url}">2026-2027</a></th>
+    </tr></tbody></table>
+    """
+
+    result = parse_competition_html(html, _competition(comp_id=comp_id))
+    season = result.datasets["seasons"].records[0]
+
+    assert season.season_id == "2026-2027"
+    assert observed_location.endswith("/")
+    assert season.season_url == f"https://fbref.com{source_url}"
+
+
 def test_cup_and_national_team_seasons_are_tournaments_even_with_opaque_labels():
     html = """
     <table id="seasons"><tbody><tr>

@@ -59,6 +59,7 @@ from scrapers.fbref.pipeline import (
     WaveResult,
     _is_mass_redirect,
     _is_run_mass_redirect,
+    _season_with_registry_redirect,
     affordable_clearance_reservation,
     backfill_season_cohort_capacity,
     frontier_target,
@@ -73,8 +74,10 @@ from scrapers.fbref.pipeline import (
     MAX_CONSECUTIVE_CLEARANCE_REFRESHES,
 )
 from scrapers.fbref.discovery import (
+    CalendarType,
     DISCOVERY_PARSER_VERSION,
     DiscoveredPageLink,
+    SeasonRef,
 )
 from scrapers.fbref.raw_store import (
     PageTarget,
@@ -5839,6 +5842,163 @@ def test_duplicate_display_label_selects_one_canonical_current_edition(
     ]
     assert len(current_targets) == 1
     assert current_targets[0]["source_ids"]["season_id"] == "2025"
+
+
+@pytest.mark.parametrize(
+    ("competition_id", "source_url", "observed_location"),
+    [
+        (
+            "33",
+            "https://fbref.com/en/comps/33/2-Bundesliga-Stats",
+            "https://fbref.com/en/comps/33/2/",
+        ),
+        (
+            "59",
+            "https://fbref.com/en/comps/59/3-Liga-Stats",
+            "https://fbref.com/en/comps/59/3/",
+        ),
+    ],
+)
+def test_registry_redirect_mapping_is_exact_and_preserves_season_identity(
+    competition_id,
+    source_url,
+    observed_location,
+):
+    source = SeasonRef(
+        comp_id=competition_id,
+        season_id="2026-2027",
+        label="2026-2027",
+        calendar_type=CalendarType.SPLIT_YEAR,
+        season_url=source_url,
+    )
+
+    installed = _season_with_registry_redirect(source)
+
+    assert source.season_url == source_url
+    assert installed.season_id == "2026-2027"
+    assert observed_location.endswith("/")
+    assert installed.season_url == observed_location.rstrip("/")
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="season",
+        canonical_url=source_url,
+        source_ids={
+            "competition_id": competition_id,
+            "season_id": "2026-2027",
+        },
+    ))
+    assert target.target_id == (
+        f"fbref:season:{competition_id}:2026-2027"
+    )
+    assert target.canonical_url == installed.season_url
+
+
+@pytest.mark.parametrize(
+    ("competition_id", "season_id", "source_url"),
+    [
+        (
+            "33",
+            "2025-2026",
+            "https://fbref.com/en/comps/33/2-Bundesliga-Stats",
+        ),
+        (
+            "33",
+            "2026-2027",
+            "https://fbref.com/en/comps/33/2026-2027/2-Bundesliga-Stats",
+        ),
+        (
+            "59",
+            "2027-2028",
+            "https://fbref.com/en/comps/59/3-Liga-Stats",
+        ),
+        (
+            "58",
+            "2026-2027",
+            "https://fbref.com/en/comps/58/3-Liga-Stats",
+        ),
+    ],
+)
+def test_registry_redirect_mapping_leaves_near_misses_unchanged(
+    competition_id,
+    season_id,
+    source_url,
+):
+    source = SeasonRef(
+        comp_id=competition_id,
+        season_id=season_id,
+        label=season_id,
+        calendar_type=CalendarType.OPAQUE,
+        season_url=source_url,
+    )
+
+    assert _season_with_registry_redirect(source) is source
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="season",
+        canonical_url=source_url,
+        source_ids={
+            "competition_id": competition_id,
+            "season_id": season_id,
+        },
+    ))
+    assert target.canonical_url == source_url
+
+
+@pytest.mark.parametrize(
+    ("competition_id", "source_url", "observed_location"),
+    [
+        (
+            "33",
+            "/en/comps/33/2-Bundesliga-Stats",
+            "https://fbref.com/en/comps/33/2/",
+        ),
+        (
+            "59",
+            "/en/comps/59/3-Liga-Stats",
+            "https://fbref.com/en/comps/59/3/",
+        ),
+    ],
+)
+def test_redirect_alias_mapping_reaches_registry_and_frontier(
+    tmp_path,
+    competition_id,
+    source_url,
+    observed_location,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry[competition_id] = {
+        "competition_id": competition_id,
+        "canonical_url": (
+            f"https://fbref.com/en/comps/{competition_id}/history/source"
+        ),
+        "name": "Redirected current season",
+        "gender": "male",
+        "classification": "league:club",
+        "metadata": {"last_season": "2026-2027"},
+    }
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="competition",
+        canonical_url=control.registry[competition_id]["canonical_url"],
+        source_ids={"competition_id": competition_id},
+    ))
+    html = f"""
+    <table id="seasons"><tbody><tr>
+      <th data-stat="season"><a href="{source_url}">2026-2027</a></th>
+    </tr></tbody></table>
+    """
+    _, record = _commit_for_parse(raw, target, html)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    seeded, skipped = pipeline._parse_competition(
+        str(uuid.uuid4()), html, record, run_type="current"
+    )
+
+    target_id = f"fbref:season:{competition_id}:2026-2027"
+    canonical_destination = observed_location.rstrip("/")
+    assert (seeded, skipped) == (1, 0)
+    assert [entry.canonical_url for entry in control.seasons] == [
+        canonical_destination
+    ]
+    assert control.frontier[target_id]["canonical_url"] == canonical_destination
 
 
 def test_non_conflicting_display_label_remains_resolvable(tmp_path):
