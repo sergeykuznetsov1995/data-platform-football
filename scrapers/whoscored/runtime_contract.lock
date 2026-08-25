@@ -59,7 +59,7 @@
     "scrapers/fbref/control/replay_effects.py": "c49a1ee71426c43fb970ec03de38b44dbec59eff26c91e62030380eb037dfd38",
     "scrapers/fbref/control/store.py": "c9d60f746c6786f979d24c5ee31e58aebb1004dc5c7ca9e8d2ec44d7c5fcbb5e",
     "scrapers/fbref/policy.py": "f28b736ddb4a18ffa7f14de9f3c65cf45a8fb7ced5e9bd4519bc728b2cea5cdf",
-    "scrapers/fbref/settings.py": "3fa9d34ecfb5d7c832d55ebc030f77a3ad29ac74dc9bceee687f45c3f8d85a06",
+    "scrapers/fbref/settings.py": "a8397e96e0c15711f33bde0e9a497e5f9c2cbd1b88536abd57d9bbd35d45f664",
     "scrapers/fotmob/__init__.py": "3f2163fabd0097d2162a0e7daf14851ce66c3acbc7e9ffc53aeaba4681dbc990",
     "scrapers/fotmob/constants.py": "3a3e6bc7619fa229c6cc232e268fcec2bdc3a92e93537d27e5ffa7c858d53575",
     "scrapers/sofascore/__init__.py": "2d1df1ef6078d9c956efcc26e92ee161222087de0ef8b8c21380487ae4e4cecd",
