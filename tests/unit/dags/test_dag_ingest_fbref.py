@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from scrapers.fbref.settings import DEFAULT_REQUEST_RESERVATION_BYTES, MIB
+
 
 @pytest.fixture(scope="module")
 def loaded_dag(request):
@@ -111,7 +113,13 @@ class TestFBrefCurrentTopology:
         assert live._captured_kwargs["pool"] == "fbref_scraper_pool"
         assert live.op_kwargs["page_kinds"] == module.PAGE_KINDS
         assert live.op_kwargs["max_batches"] == 80
-        assert live.op_kwargs["reservation_mb"] == 3
+        expected_reservation_mb = DEFAULT_REQUEST_RESERVATION_BYTES // MIB
+        assert expected_reservation_mb == 5
+        assert tasks["initialize_run"].op_kwargs["reservation_mb"] == (
+            expected_reservation_mb
+        )
+        assert recovery.op_kwargs["reservation_mb"] == expected_reservation_mb
+        assert live.op_kwargs["reservation_mb"] == expected_reservation_mb
         assert live.downstream_task_ids == {"audit_raw_integrity"}
         raw_audit = tasks["audit_raw_integrity"]
         assert raw_audit.python_callable.__name__ == (

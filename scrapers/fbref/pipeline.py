@@ -189,6 +189,21 @@ MAX_ROUTINE_MOVED_PAGES = 5
 # One whole cohort's worth of dead addresses across an entire run is already
 # far beyond the handful of retired aliases this exists for.
 MAX_RUN_MOVED_PAGES = 25
+# A single match endpoint can briefly answer 404 and then publish the same
+# match on a later run.  That verdict is reversible only for match pages: a
+# 404 on a spine page can amputate discovery scope and must stay loud.  Above
+# this count, and only when the deferred matches dominate their wave, the
+# response stops looking target-local and starts looking like a bad exit or a
+# source-wide outage.
+MAX_ROUTINE_DEFERRED_MATCH_NOT_FOUND = 5
+# Even a thin stream of 404s can evade the per-wave majority gate forever, so
+# a run gets the same hard ceiling as permanent redirects.
+MAX_RUN_DEFERRED_MATCH_NOT_FOUND = 25
+# A decoded-body ceiling is a terminal verdict about one target, not evidence
+# that its healthy siblings are unavailable.  Keep isolated oversized pages
+# target-local while refusing to normalize a cohort- or run-wide markup jump.
+MAX_ROUTINE_TERMINAL_OVERSIZED_PAGES = 5
+MAX_RUN_TERMINAL_OVERSIZED_PAGES = 25
 # A moved-page verdict shrinks the crawl scope quietly, so it may only be
 # reached for an address that still belongs to the source.  A captive portal
 # or a hijacked residential exit answering 301 with its own login page must
@@ -445,7 +460,7 @@ def backfill_season_cohort_capacity(
     A season root expands into schedules, squads, players, matchlogs, and
     matches.  Its admission contract therefore remains the production-tested
     conservative 7 MiB aggregate allowance instead of pretending that one
-    season is one 3 MiB HTTP target.  This preserves deterministic 7/14
+    season is one 5 MiB HTTP target.  This preserves deterministic 7/14
     canary/production dry-run cohorts while child pages are still fetched
     sequentially by the warm runner under the real shared budget.
     """
@@ -663,6 +678,8 @@ class WaveResult:
     deferred_dead_clearance: int = 0
     contract_quarantined: int = 0
     moved_pages_skipped: int = 0
+    deferred_match_not_found: int = 0
+    terminal_oversized_pages: int = 0
     failures: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -1103,6 +1120,16 @@ def _moved_page_failure(exc: FetchError) -> bool:
     )
 
 
+def _transient_match_not_found(page_kind: str, exc: FetchError) -> bool:
+    """Isolate only the observed reversible match-endpoint 404 shape."""
+
+    return (
+        page_kind == "match"
+        and exc.error_class == "http_status"
+        and exc.http_status == 404
+    )
+
+
 def _is_mass_redirect(result: "WaveResult") -> bool:
     """Tell a couple of retired aliases from a cohort-wide hijack."""
 
@@ -1120,6 +1147,38 @@ def _is_run_mass_redirect(fetch: "WaveResult") -> bool:
     """
 
     return fetch.moved_pages_skipped > MAX_RUN_MOVED_PAGES
+
+
+def _is_mass_match_not_found(result: "WaveResult") -> bool:
+    """Tell isolated unpublished matches from a cohort-wide 404 outage."""
+
+    deferred = result.deferred_match_not_found
+    return (
+        deferred > MAX_ROUTINE_DEFERRED_MATCH_NOT_FOUND
+        and deferred * 2 > result.cohort_size
+    )
+
+
+def _is_run_mass_match_not_found(fetch: "WaveResult") -> bool:
+    """Catch a thin 404 outage that stays below every wave majority gate."""
+
+    return fetch.deferred_match_not_found > MAX_RUN_DEFERRED_MATCH_NOT_FOUND
+
+
+def _is_mass_terminal_oversized_pages(result: "WaveResult") -> bool:
+    """Tell one terminally large page from a cohort-wide markup jump."""
+
+    oversized = result.terminal_oversized_pages
+    return (
+        oversized > MAX_ROUTINE_TERMINAL_OVERSIZED_PAGES
+        and oversized * 2 > result.cohort_size
+    )
+
+
+def _is_run_mass_terminal_oversized_pages(fetch: "WaveResult") -> bool:
+    """Catch oversized responses spread thinly across many waves."""
+
+    return fetch.terminal_oversized_pages > MAX_RUN_TERMINAL_OVERSIZED_PAGES
 
 
 def _sentinel_gate_errors(coverage: object) -> list[str]:
@@ -2794,18 +2853,23 @@ class FBrefPipeline:
                             "lifetime; exact tail settled before rollover"
                         )
                     # Exact logical-refresh crash recovery is always safe.
-                    # Historical targets are immutable by contract, so they
-                    # may additionally adopt the latest verified raw-v2 (or
-                    # legacy raw-v1) observation across control runs.  Current
-                    # targets still require an exact refresh: an older page may
-                    # predate a match final or a season rollover.
+                    # Historical targets other than season roots are immutable
+                    # by contract, so they may additionally adopt the latest
+                    # verified raw-v2 (or legacy raw-v1) observation across
+                    # control runs. A reseeded historical season must use its
+                    # exact refresh: prior bytes may belong to the scope verdict
+                    # that caused the target to be reopened.
                     frontier = self.control.get_frontier_target(
                         lease.target_id
                     ) or {}
-                    recoverable = (
-                        self.raw_store.has_fetch(lease.logical_refresh_id)
-                        or frontier.get("refresh_policy") == "historical_once"
+                    exact_refresh_raw = self.raw_store.has_fetch(
+                        lease.logical_refresh_id
                     )
+                    cross_run_historical_raw = (
+                        frontier.get("refresh_policy") == "historical_once"
+                        and lease.page_kind != "season"
+                    )
+                    recoverable = exact_refresh_raw or cross_run_historical_raw
                     if recoverable:
                         record = self.raw_store.import_fetch_from_available_raw(
                             target,
@@ -3378,14 +3442,18 @@ class FBrefPipeline:
                         leases.insert(lease_index + 1, retry_leases[0])
                     else:
                         moved = _moved_page_failure(exc)
+                        match_not_found = _transient_match_not_found(
+                            lease.page_kind,
+                            exc,
+                        )
+                        terminal_oversized = exc.error_class == "response_too_large"
+                        reversible_target_failure = moved or match_not_found
                         self.control.fail_fetch(
                             lease,
                             error_class=exc.error_class,
                             error_message=str(exc),
                             retry_delay_seconds=60,
-                            permanent=(
-                                exc.error_class == "response_too_large"
-                            ),
+                            permanent=terminal_oversized,
                             # Hand it back as 'skipped'/'queued'.  Each of the
                             # three shapes costs something and this is the
                             # only reversible one:
@@ -3406,7 +3474,7 @@ class FBrefPipeline:
                             # keeps ageing), costing one solve a day per dead
                             # address.  That is the price of being able to
                             # recover, and the ceilings below bound it.
-                            requeue=moved,
+                            requeue=reversible_target_failure,
                             http_status=exc.http_status,
                             http_request_count=exc.http_requests,
                             http_status_history=exc.http_status_history,
@@ -3416,21 +3484,30 @@ class FBrefPipeline:
                             transport_version=FETCHER_VERSION,
                             session_version=live_session.session_id,
                         )
-                        if settings.persistent_http_session:
+                        if (
+                            settings.persistent_http_session
+                            or match_not_found
+                        ):
                             live_session.finalize(
                                 self.control, status="failed"
                             )
-                            reset = getattr(
-                                live_session.fetcher,
-                                "reset_clearance",
-                                None,
-                            )
-                            if callable(reset):
-                                reset()
+                            if settings.persistent_http_session:
+                                reset = getattr(
+                                    live_session.fetcher,
+                                    "reset_clearance",
+                                    None,
+                                )
+                                if callable(reset):
+                                    reset()
+                                else:
+                                    live_session.stack.close()
+                                    live_session.stack = ExitStack()
+                                    live_session.fetcher = None
                             else:
-                                live_session.stack.close()
+                                # Non-persistent finalization closes and drops
+                                # the suspect transport.  Give the sibling a
+                                # fresh ExitStack for its fresh clearance.
                                 live_session.stack = ExitStack()
-                                live_session.fetcher = None
                             live_session.needs_clearance = True
                         if moved:
                             # The attempt above stays durable evidence; only
@@ -3445,6 +3522,63 @@ class FBrefPipeline:
                                 lease.target_id,
                                 str(exc),
                             )
+                        elif match_not_found:
+                            # Production evidence showed this exact match
+                            # succeeding with HTTP 200 on a later run. Keep the
+                            # failed attempt durable above, return the target
+                            # reversibly, and let healthy siblings continue.
+                            result.deferred_match_not_found += 1
+                            logger.warning(
+                                "Run %s defers transient match 404 %s: %s",
+                                run_id,
+                                lease.target_id,
+                                str(exc),
+                            )
+                            if _is_mass_match_not_found(result):
+                                untouched = leases[lease_index + 1:]
+                                returned = (
+                                    self.control.requeue_unfetched_targets(
+                                        untouched
+                                    )
+                                )
+                                logger.error(
+                                    "Run %s stops after %d/%d match 404s; "
+                                    "%d untouched target(s) returned",
+                                    run_id,
+                                    result.deferred_match_not_found,
+                                    result.cohort_size,
+                                    returned,
+                                )
+                                break
+                        elif terminal_oversized:
+                            # The body limit made this target terminal and its
+                            # paid attempt is already settled above.  That is
+                            # not evidence that healthy siblings are broken,
+                            # so keep the permanent/dead transition while
+                            # letting the wave reach offline parsing and the
+                            # run's validation gates.  A dominant cohort still
+                            # fails closed through the circuit below.
+                            result.terminal_oversized_pages += 1
+                            logger.warning(
+                                "Run %s records terminal oversized page %s: %s",
+                                run_id,
+                                lease.target_id,
+                                str(exc),
+                            )
+                            if _is_mass_terminal_oversized_pages(result):
+                                untouched = leases[lease_index + 1 :]
+                                returned = self.control.requeue_unfetched_targets(
+                                    untouched
+                                )
+                                logger.error(
+                                    "Run %s stops after %d/%d oversized "
+                                    "pages; %d untouched target(s) returned",
+                                    run_id,
+                                    result.terminal_oversized_pages,
+                                    result.cohort_size,
+                                    returned,
+                                )
+                                break
                         else:
                             result.failures.append(
                                 f"{lease.target_id}:{exc.error_class}"
@@ -3559,6 +3693,26 @@ class FBrefPipeline:
                     f"mass_redirect={result.moved_pages_skipped}"
                     f"/{result.cohort_size}"
                 )
+            if _is_mass_match_not_found(result):
+                # One temporarily unpublished match is target-local. A wave
+                # dominated by the same answer is evidence about the source
+                # or exit, so it must fail before the session is closed as
+                # healthy.
+                result.failures.append(
+                    "mass_match_not_found="
+                    f"{result.deferred_match_not_found}"
+                    f"/{result.cohort_size}"
+                )
+            if _is_mass_terminal_oversized_pages(result):
+                # One target may legitimately outgrow its page-kind cap. A
+                # wave dominated by that answer indicates a source-wide shape
+                # change and must stay red. The triggering targets remain
+                # terminal; only leases never attempted above were requeued.
+                result.failures.append(
+                    "mass_response_too_large="
+                    f"{result.terminal_oversized_pages}"
+                    f"/{result.cohort_size}"
+                )
         finally:
             if owns_session:
                 live_session.close(
@@ -3648,6 +3802,16 @@ class FBrefPipeline:
                     raise FetchWaveError(
                         "mass_redirect_run="
                         f"{aggregate.fetch.moved_pages_skipped}"
+                    )
+                if _is_run_mass_match_not_found(aggregate.fetch):
+                    raise FetchWaveError(
+                        "mass_match_not_found_run="
+                        f"{aggregate.fetch.deferred_match_not_found}"
+                    )
+                if _is_run_mass_terminal_oversized_pages(aggregate.fetch):
+                    raise FetchWaveError(
+                        "mass_response_too_large_run="
+                        f"{aggregate.fetch.terminal_oversized_pages}"
                     )
 
                 if fetched.budget_exhausted:
@@ -5974,6 +6138,7 @@ class FBrefPipeline:
                     "Cross-run recovery is not a replay source selector"
                 )
             fetches = self.control.list_unprocessed_fetches(
+                run_type=settings.run_type,
                 parser_version=PAGE_DOCUMENT_VERSION,
                 typed_parser_version=TYPED_BRONZE_PARSER_VERSION,
                 stateful_parser_version=DISCOVERY_PARSER_VERSION,
@@ -6194,7 +6359,7 @@ class FBrefPipeline:
         page_kinds: Sequence[str],
         settings: PipelineSettings,
     ) -> WaveResult:
-        """Drain committed raw left unprocessed by any earlier source run.
+        """Drain committed raw left unprocessed by this lane's source runs.
 
         This is deliberately invoked before a current/backfill fetch wave so
         parse failure can never strand immutable S3 raw behind a terminal
@@ -6519,16 +6684,38 @@ class FBrefPipeline:
                 "unprocessed_raw_count="
                 f"{int(summary['unprocessed_raw_count'])}"
             )
-        if not isolated_acceptance:
-            if "global_unprocessed_raw_sla_overdue_count" not in summary:
-                errors.append("global_unprocessed_raw_sla_overdue_count_missing")
+        summary_run_type = str(summary.get("run_type") or "").casefold()
+        if not isolated_acceptance and summary_run_type != "replay":
+            if "lane_unprocessed_raw_sla_overdue_count" not in summary:
+                errors.append("lane_unprocessed_raw_sla_overdue_count_missing")
             elif int(
-                summary.get("global_unprocessed_raw_sla_overdue_count") or 0
+                summary.get("lane_unprocessed_raw_sla_overdue_count") or 0
             ) != 0:
                 errors.append(
-                    "global_unprocessed_raw_sla_overdue_count="
-                    f"{int(summary['global_unprocessed_raw_sla_overdue_count'])}"
+                    "lane_unprocessed_raw_sla_overdue_count="
+                    f"{int(summary['lane_unprocessed_raw_sla_overdue_count'])}"
                 )
+            if "global_unprocessed_raw_sla_overdue_count" not in summary:
+                errors.append("global_unprocessed_raw_sla_overdue_count_missing")
+            else:
+                global_overdue = int(
+                    summary.get("global_unprocessed_raw_sla_overdue_count") or 0
+                )
+                lane_overdue = int(
+                    summary.get("lane_unprocessed_raw_sla_overdue_count") or 0
+                )
+                if global_overdue > lane_overdue:
+                    other_lane_overdue = global_overdue - lane_overdue
+                    warnings[
+                        "other_lane_unprocessed_raw_sla_overdue_count"
+                    ] = other_lane_overdue
+                    logger.warning(
+                        "Run %s reports %d overdue unprocessed raw "
+                        "observation(s) outside its %s recovery lane",
+                        run_id,
+                        other_lane_overdue,
+                        summary_run_type,
+                    )
 
         if not isolated_acceptance:
             crawlable_scope = summary.get("crawlable_frontier_scope_counts")

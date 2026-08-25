@@ -47,15 +47,15 @@ def _require_available_test_postgres():
         connection.close()
 
 
-def _crawl_run(cursor, *, status="failed"):
+def _crawl_run(cursor, *, status="failed", run_type="current"):
     run_id = str(uuid.uuid4())
     cursor.execute(
         """
         INSERT INTO fbref_control.crawl_run (
             run_id, run_type, status, request_limit, byte_limit
-        ) VALUES (%s, 'current', %s, 200, 104857600)
+        ) VALUES (%s, %s, %s, 200, 104857600)
         """,
-        (run_id, status),
+        (run_id, run_type, status),
     )
     return run_id
 
@@ -67,8 +67,10 @@ def _seed_refresh(
     epoch,
     content_hash,
     observation=None,
+    run_type="current",
+    run_status="failed",
 ):
-    run_id = _crawl_run(cursor)
+    run_id = _crawl_run(cursor, status=run_status, run_type=run_type)
     logical_refresh_id = str(uuid.uuid4())
     cursor.execute(
         """
@@ -224,6 +226,20 @@ def test_recovery_skips_only_strictly_newer_exact_complete_success(
                 content_hash="1" * 64,
                 observation=_failed_observation(),
             )
+            labels["cancelled"] = _seed_refresh(
+                cursor,
+                target_id="fbref:match:cancelled",
+                epoch=1,
+                content_hash="c" * 64,
+                run_status="cancelled",
+            )
+            backfill_refresh = _seed_refresh(
+                cursor,
+                target_id="fbref:match:backfill-only",
+                epoch=1,
+                content_hash="f" * 64,
+                run_type="backfill",
+            )
 
             active_target = "fbref:match:active"
             labels["active"] = _seed_refresh(
@@ -313,6 +329,7 @@ def test_recovery_skips_only_strictly_newer_exact_complete_success(
 
     store = ControlStore(isolated_postgres_uri)
     rows = store.list_unprocessed_fetches(
+        run_type="current",
         parser_version=PAGE_VERSION,
         typed_parser_version=TYPED_VERSION,
         stateful_parser_version=STATEFUL_VERSION,
@@ -322,6 +339,7 @@ def test_recovery_skips_only_strictly_newer_exact_complete_success(
     visible = {str(row["logical_refresh_id"]) for row in rows}
     expected = {
         labels["unresolved"],
+        labels["cancelled"],
         labels["active"],
         labels["different_old"],
         labels["different_new"],
@@ -331,6 +349,18 @@ def test_recovery_skips_only_strictly_newer_exact_complete_success(
     }
     assert visible == expected
 
+    backfill_rows = store.list_unprocessed_fetches(
+        run_type="backfill",
+        parser_version=PAGE_VERSION,
+        typed_parser_version=TYPED_VERSION,
+        stateful_parser_version=STATEFUL_VERSION,
+        page_kinds=["match"],
+        limit=100,
+    )
+    assert {
+        str(row["logical_refresh_id"]) for row in backfill_rows
+    } == {backfill_refresh}
+
     summary = store.get_run_summary(
         summary_run_id,
         parser_version=PAGE_VERSION,
@@ -338,7 +368,12 @@ def test_recovery_skips_only_strictly_newer_exact_complete_success(
         stateful_parser_version=STATEFUL_VERSION,
     )
     assert summary["unprocessed_raw_count"] == 0
-    assert summary["global_unprocessed_raw_count"] == len(expected)
-    assert summary["global_unprocessed_raw_by_page_kind"]["match"][
+    assert summary["recovery_lane_run_type"] == "current"
+    assert summary["lane_unprocessed_raw_count"] == len(expected)
+    assert summary["lane_unprocessed_raw_by_page_kind"]["match"][
         "count"
     ] == len(expected)
+    assert summary["global_unprocessed_raw_count"] == len(expected) + 1
+    assert summary["global_unprocessed_raw_by_page_kind"]["match"][
+        "count"
+    ] == len(expected) + 1

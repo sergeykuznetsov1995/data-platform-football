@@ -25,13 +25,15 @@ from scrapers.fbref.settings import (
     DEFAULT_BROWSER_REQUESTS_PER_SOLVE,
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
     DEFAULT_HTTP_BODY_LIMIT_BYTES,
+    DEFAULT_SEASON_STATS_HTTP_BODY_LIMIT_BYTES,
 )
 from scrapers.utils.proxy_manager import classify_error
 
 
-FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v8"
+FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v9"
 DEFAULT_BOOTSTRAP_URL = "https://fbref.com/en/"
 MAX_HTML_BYTES = DEFAULT_HTTP_BODY_LIMIT_BYTES
+MAX_SEASON_STATS_HTML_BYTES = DEFAULT_SEASON_STATS_HTTP_BODY_LIMIT_BYTES
 # The browser cap bounds ONE clearance attempt; the run's reservation covers
 # every attempt (see DEFAULT_BOOTSTRAP_REQUEST_RESERVATION).
 DEFAULT_BROWSER_REQUEST_LIMIT = DEFAULT_BROWSER_REQUESTS_PER_SOLVE
@@ -316,6 +318,7 @@ class FBrefFetcher:
         proxy_file: Optional[str] = None,
         bootstrap_url: str = DEFAULT_BOOTSTRAP_URL,
         max_html_bytes: int = MAX_HTML_BYTES,
+        max_season_stats_html_bytes: int = MAX_SEASON_STATS_HTML_BYTES,
         max_browser_requests: int = DEFAULT_BROWSER_REQUEST_LIMIT,
         max_browser_bytes: int = DEFAULT_BROWSER_BYTE_LIMIT,
         max_target_http_attempts: int = MAX_TARGET_HTTP_ATTEMPTS,
@@ -334,6 +337,9 @@ class FBrefFetcher:
         self.max_html_bytes = int(max_html_bytes)
         if self.max_html_bytes <= 0:
             raise ValueError("max_html_bytes must be positive")
+        self.max_season_stats_html_bytes = int(max_season_stats_html_bytes)
+        if self.max_season_stats_html_bytes <= 0:
+            raise ValueError("max_season_stats_html_bytes must be positive")
         attempts = int(max_target_http_attempts)
         if not 1 <= attempts <= MAX_TARGET_HTTP_ATTEMPTS:
             raise ValueError(
@@ -1497,7 +1503,12 @@ class FBrefFetcher:
         target_requests = 0
         wire_bytes = 0
         status_history: list[int] = []
-        body_buffer = _CumulativeBodyBuffer(self.max_html_bytes)
+        max_html_bytes = (
+            self.max_season_stats_html_bytes
+            if str(page_kind).strip().casefold() == "season_stats"
+            else self.max_html_bytes
+        )
+        body_buffer = _CumulativeBodyBuffer(max_html_bytes)
         for attempt in range(self.max_target_http_attempts):
             target_requests += 1
             body_buffer.begin_attempt()
@@ -1543,7 +1554,7 @@ class FBrefFetcher:
                 if body_buffer.exceeded:
                     raise FetchError(
                         "FBref cumulative response bodies exceeded "
-                        f"{self.max_html_bytes} bytes for {url}",
+                        f"{max_html_bytes} bytes for {url}",
                         error_class="response_too_large",
                         http_status=(
                             partial_status
@@ -1599,7 +1610,7 @@ class FBrefFetcher:
                 latency_ms = int((time.perf_counter() - started) * 1000)
                 raise FetchError(
                     "FBref cumulative response bodies exceeded "
-                    f"{self.max_html_bytes} bytes for {url}",
+                    f"{max_html_bytes} bytes for {url}",
                     error_class="response_too_large",
                     http_status=status,
                     wire_bytes=wire_bytes,
@@ -1709,9 +1720,9 @@ class FBrefFetcher:
                 http_status_history=tuple(status_history),
                 latency_ms=latency_ms,
             )
-        if len(body) > self.max_html_bytes:
+        if len(body) > max_html_bytes:
             raise FetchError(
-                f"FBref body exceeded {self.max_html_bytes} bytes for {url}",
+                f"FBref body exceeded {max_html_bytes} bytes for {url}",
                 error_class="response_too_large",
                 http_status=status,
                 wire_bytes=wire_bytes,
@@ -2027,6 +2038,7 @@ __all__ = [
     "FetchError",
     "FetchResponse",
     "MAX_HTML_BYTES",
+    "MAX_SEASON_STATS_HTML_BYTES",
     "MAX_TARGET_HTTP_ATTEMPTS",
     "PERSISTENT_SESSION_MAX_AGE_SECONDS",
     "PersistentMeteredSessionReceipt",

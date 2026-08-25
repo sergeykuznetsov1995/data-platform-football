@@ -92,6 +92,7 @@ _AVAILABILITY_STATES = {
     "error",
 }
 _SEASON_ALIAS_KINDS = {"source", "label", "url", "legacy", "operator"}
+_RECOVERY_RUN_TYPES = {"current", "backfill"}
 _PAGE_KIND_SLA_SECONDS = {
     "competition_index": 86_400,
     "schedule": 86_400,
@@ -327,6 +328,18 @@ def _text(value: object, name: str) -> str:
     normalized = str(value).strip()
     if not normalized:
         raise ValueError(f"{name} must not be empty")
+    return normalized
+
+
+def _recovery_run_type(value: object) -> str:
+    """Return one autonomous raw-recovery lane, rejecting every other type."""
+
+    try:
+        normalized = _text(value, "run_type").casefold()
+    except ValueError:
+        raise ValueError("run_type must be current or backfill") from None
+    if normalized not in _RECOVERY_RUN_TYPES:
+        raise ValueError("run_type must be current or backfill")
     return normalized
 
 
@@ -6395,6 +6408,19 @@ class ControlStore:
             summary = _fetchone(cursor)
             if summary is None:
                 return None
+            summary_run_type = str(summary.get("run_type") or "").casefold()
+            if summary_run_type in _RECOVERY_RUN_TYPES:
+                recovery_lane_run_type: Optional[str] = summary_run_type
+            elif summary_run_type in {"replay", "publication"}:
+                # Replay selects one explicit source run, while publication is
+                # a zero-budget generation record. Neither owns an autonomous
+                # current/backfill recovery lane.
+                recovery_lane_run_type = None
+            else:
+                raise StateConflict(
+                    "crawl run_type must be current, backfill, replay, or "
+                    "publication"
+                )
             cursor.execute(
                 """
                 SELECT status, count(*) AS count
@@ -7185,6 +7211,16 @@ class ControlStore:
                        count(*) FILTER (
                            WHERE attempt.run_id = %s
                        ) AS run_count,
+                       count(*) FILTER (
+                           WHERE source_run.run_type = %s
+                       ) AS lane_count,
+                       count(*) FILTER (
+                           WHERE source_run.run_type = %s
+                             AND COALESCE(
+                               attempt.finished_at, attempt.started_at
+                             ) < clock_timestamp()
+                               - (%s * interval '1 second')
+                       ) AS lane_sla_overdue_count,
                        count(*) AS global_count,
                        count(*) FILTER (
                            WHERE COALESCE(
@@ -7199,8 +7235,15 @@ class ControlStore:
                        ) AS run_oldest_raw_at,
                        min(COALESCE(
                            attempt.finished_at, attempt.started_at
+                       )) FILTER (
+                           WHERE source_run.run_type = %s
+                       ) AS lane_oldest_raw_at,
+                       min(COALESCE(
+                           attempt.finished_at, attempt.started_at
                        )) AS global_oldest_raw_at
                 FROM fbref_control.fetch_attempt AS attempt
+                JOIN fbref_control.crawl_run AS source_run
+                  ON source_run.run_id = attempt.run_id
                 JOIN fbref_control.page_frontier AS frontier
                   ON frontier.target_id = attempt.target_id
                 WHERE attempt.status = 'succeeded'
@@ -7288,8 +7331,12 @@ class ControlStore:
                 """,
                 (
                     run,
+                    recovery_lane_run_type,
+                    recovery_lane_run_type,
+                    raw_sla,
                     raw_sla,
                     run,
+                    recovery_lane_run_type,
                     parser,
                     parser,
                     parser,
@@ -7312,6 +7359,17 @@ class ControlStore:
                 for row in raw_rows
                 if int(row["run_count"] or 0) > 0
             }
+            lane_raw_by_kind = {
+                str(row["page_kind"]): {
+                    "count": int(row["lane_count"] or 0),
+                    "sla_overdue_count": int(
+                        row["lane_sla_overdue_count"] or 0
+                    ),
+                    "oldest_raw_at": row.get("lane_oldest_raw_at"),
+                }
+                for row in raw_rows
+                if int(row["lane_count"] or 0) > 0
+            }
             global_raw_by_kind = {
                 str(row["page_kind"]): {
                     "count": int(row["global_count"] or 0),
@@ -7326,6 +7384,18 @@ class ControlStore:
             summary["unprocessed_raw_count"] = sum(
                 row["count"] for row in run_raw_by_kind.values()
             )
+            summary["recovery_lane_run_type"] = recovery_lane_run_type
+            summary["lane_unprocessed_raw_by_page_kind"] = lane_raw_by_kind
+            summary["lane_unprocessed_raw_count"] = sum(
+                row["count"] for row in lane_raw_by_kind.values()
+            )
+            lane_sla_overdue = sum(
+                row["sla_overdue_count"]
+                for row in lane_raw_by_kind.values()
+            )
+            summary["lane_unprocessed_raw_sla_overdue_count"] = (
+                lane_sla_overdue
+            )
             summary["global_unprocessed_raw_by_page_kind"] = (
                 global_raw_by_kind
             )
@@ -7339,8 +7409,8 @@ class ControlStore:
             summary["global_unprocessed_raw_sla_overdue_count"] = (
                 global_sla_overdue
             )
-            # Compatibility for operational dashboards created before the
-            # run/global split. Validation uses the explicit global key above.
+            # Preserve the pre-lane dashboard contract. New validation uses
+            # the explicit lane key; the unqualified legacy key stays global.
             summary["unprocessed_raw_sla_overdue_count"] = global_sla_overdue
             summary["raw_processing_sla_seconds"] = raw_sla
 
@@ -7957,6 +8027,7 @@ class ControlStore:
     def list_unprocessed_fetches(
         self,
         *,
+        run_type: object,
         parser_version: object,
         typed_parser_version: object,
         stateful_parser_version: object,
@@ -7964,7 +8035,7 @@ class ControlStore:
         page_kinds: Optional[Sequence[str]] = None,
         limit: int = 25,
     ) -> list[dict]:
-        """Return global raw observations missing the exact successful parse.
+        """Return one lane's raw missing the exact successful parse.
 
         Selection is intentionally independent of the source crawl-run status:
         a successful immutable raw commit remains recoverable when a later task
@@ -7976,6 +8047,7 @@ class ControlStore:
         already proven unusable would be re-selected by every later run.
         Reopening a target requeues it and makes its raw eligible again.
         """
+        lane_run_type = _recovery_run_type(run_type)
         parser = _text(parser_version, "parser_version")
         typed_parser = _text(typed_parser_version, "typed_parser_version")
         stateful_parser = _text(
@@ -8008,6 +8080,7 @@ class ControlStore:
                 JOIN fbref_control.page_frontier AS frontier
                   ON frontier.target_id = attempt.target_id
                 WHERE frontier.source = %s
+                  AND source_run.run_type = %s
                   AND frontier.state <> 'quarantined'
                   AND attempt.status = 'succeeded'
                   AND attempt.raw_manifest_key IS NOT NULL
@@ -8072,6 +8145,7 @@ class ControlStore:
                 """,
                 (
                     _text(source, "source"),
+                    lane_run_type,
                     kinds,
                     kinds,
                     parser,

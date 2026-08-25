@@ -17,7 +17,11 @@ from airflow.models.param import Param
 from airflow.operators.python import BranchPythonOperator, PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
-from scrapers.fbref.settings import DEFAULT_DOMAIN_INTERVAL_SECONDS
+from scrapers.fbref.settings import (
+    DEFAULT_DOMAIN_INTERVAL_SECONDS,
+    DEFAULT_REQUEST_RESERVATION_BYTES,
+    MIB,
+)
 
 from utils.default_args import DEFAULT_ARGS
 from utils.fbref_pipeline_tasks import (
@@ -118,12 +122,12 @@ with DAG(
             description="Maximum historical targets claimed by one task",
         ),
         "publish": Param(
-            True,
+            False,
             type="boolean",
             description=(
-                "Publish this run (export scope and trigger Silver). "
-                "Set false for a historical lane that must not touch "
-                "publication or hold the lock past its own batches"
+                "Keep false for the isolated historical lane. Set true "
+                "explicitly only when this run should export scope and "
+                "trigger Silver after validation"
             ),
         ),
         "max_batches": Param(
@@ -147,11 +151,13 @@ with DAG(
     Live mode checks current-scope freshness immediately after run creation,
     before seeding, raw recovery, or any paid fetch, and checks it again after
     all batches to catch drift during the run.
-    Completed
-    historical targets are never requeued; verified raw-v2 or raw-v1 content
-    is imported into a new run without a network request. Run again to resume
-    the next remaining cohort automatically. A pre-run content inventory and
-    post-run raw-integrity artifact are mandatory before Silver publication.
+    Completed historical targets are never requeued. Immutable historical
+    page kinds can import verified raw-v2 or raw-v1 content into a new run
+    without a network request; season roots deliberately require exact-refresh
+    raw so a reopened scope verdict cannot reuse stale season bytes. Run again
+    to resume the next remaining cohort automatically. Backfill is
+    non-publishing by default; an explicit publishing run additionally requires
+    the pre-run content inventory and post-run raw-integrity artifact.
     """,
 ) as dag:
     choose_mode = BranchPythonOperator(
@@ -205,7 +211,7 @@ with DAG(
             "request_limit": REQUEST_LIMIT,
             "byte_limit_mb": BYTE_LIMIT_MB,
             "shard_size": SHARD_SIZE,
-            "reservation_mb": 3,
+            "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
             "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
             "publishing": PUBLISH,
         },
@@ -242,7 +248,7 @@ with DAG(
             "request_limit": REQUEST_LIMIT,
             "byte_limit_mb": BYTE_LIMIT_MB,
             "shard_size": SHARD_SIZE,
-            "reservation_mb": 3,
+            "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
         },
         trigger_rule="all_success",
     )
@@ -258,7 +264,7 @@ with DAG(
             "request_limit": REQUEST_LIMIT,
             "byte_limit_mb": BYTE_LIMIT_MB,
             "shard_size": SHARD_SIZE,
-            "reservation_mb": 3,
+            "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
         },
         trigger_rule="all_success",
     )
@@ -285,12 +291,9 @@ with DAG(
     # zero work.  Draining first keeps the seed from handing the drain a target
     # it has just unhidden: raw still behind a quarantine at drain time stays
     # hidden from the drain, so no run_target is open when the verdict lands.
-    # This does NOT stop the live wave from adopting that same stale raw for a
-    # seeded target (pipeline.py lets historical_once accept committed raw with
-    # no request); there the wave survives because complete_fetch closes
-    # run_target before the parse, but the verdict is still made on old bytes.
-    # That remaining path is #1186 — it needs the page-identity check, not an
-    # edge order.
+    # The live wave separately closes #1186 by refusing cross-run raw adoption
+    # for season roots. Exact logical-refresh raw remains eligible so a crash
+    # after raw commit still recovers without another paid request.
     acquire_publication_lock >> capture_raw_baseline >> recover_raw
     recover_raw >> seed_historical_seasons
     live_waves = PythonOperator(
@@ -305,7 +308,7 @@ with DAG(
             "request_limit": REQUEST_LIMIT,
             "byte_limit_mb": BYTE_LIMIT_MB,
             "shard_size": SHARD_SIZE,
-            "reservation_mb": 3,
+            "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
             "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
             "max_batches": MAX_BATCHES,
         },
