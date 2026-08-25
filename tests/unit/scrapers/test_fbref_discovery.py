@@ -113,6 +113,32 @@ def test_competition_index_classifies_categories_and_category_beats_popular():
     )
 
 
+def test_competition_index_preserves_source_advertised_current_season_link():
+    html = """
+    <h2>National Team Qualification</h2>
+    <table><tbody><tr>
+      <th data-stat="league_name"><a
+        href="/en/comps/6/history/WCQ----UEFA-M-Seasons"
+      >FIFA World Cup Qualification — UEFA</a></th>
+      <td data-stat="gender">M</td>
+      <td data-stat="minseason"><a
+        href="/en/comps/6/1998/1998-WCQ----UEFA-M-Stats"
+      >1998</a></td>
+      <td data-stat="maxseason"><a
+        href="/en/comps/6/WCQ----UEFA-M-Stats"
+      >2026</a></td>
+    </tr></tbody></table>
+    """
+
+    result = parse_competition_index_html(html)
+    competition = result.datasets["competitions"].records[0]
+
+    assert competition.last_season == "2026"
+    assert competition.last_season_url == (
+        "https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats"
+    )
+
+
 def test_competition_index_reads_a_table_hidden_in_an_html_comment():
     html = """
     <h1>Competitions</h1>

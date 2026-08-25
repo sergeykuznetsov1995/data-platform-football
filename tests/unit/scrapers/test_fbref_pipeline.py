@@ -75,8 +75,13 @@ from scrapers.fbref.pipeline import (
 )
 from scrapers.fbref.discovery import (
     CalendarType,
+    CompetitionFormat,
+    CompetitionGender,
+    CompetitionRef,
     DISCOVERY_PARSER_VERSION,
     DiscoveredPageLink,
+    MatchRef,
+    ParticipantType,
     SeasonRef,
 )
 from scrapers.fbref.raw_store import (
@@ -4221,7 +4226,8 @@ def test_offline_index_parse_seeds_only_male_competitions(tmp_path):
     control = FakeControl(raw)
     html = """
     <h2>Domestic Leagues</h2><table id="comps"><tbody>
-      <tr><td data-stat="gender">M</td><th><a href="/en/comps/9/history/Premier-League-Seasons">Premier League</a></th></tr>
+      <tr><td data-stat="gender">M</td><th><a href="/en/comps/9/history/Premier-League-Seasons">Premier League</a></th>
+        <td data-stat="maxseason"><a href="/en/comps/9/Premier-League-Stats">2026-2027</a></td></tr>
       <tr><td data-stat="gender">F</td><th><a href="/en/comps/189/history/Womens-Super-League-Seasons">Women's Super League</a></th></tr>
       <tr><td data-stat="gender">?</td><th><a href="/en/comps/x/history/Unknown-Seasons">Unknown Cup</a></th></tr>
     </tbody></table>
@@ -4268,6 +4274,10 @@ def test_offline_index_parse_seeds_only_male_competitions(tmp_path):
         for key, row in control.frontier.items()
         if key != "fbref:competition_index:all"
     )
+    assert control.registry["9"]["metadata"]["last_season"] == "2026-2027"
+    assert control.registry["9"]["metadata"]["last_season_url"] == (
+        "https://fbref.com/en/comps/9/Premier-League-Stats"
+    )
 
 
 def test_registry_snapshot_identity_is_stable_for_raw_retry(tmp_path):
@@ -4288,6 +4298,27 @@ def test_registry_snapshot_identity_is_stable_for_raw_retry(tmp_path):
     snapshot_ids = [item["snapshot_id"] for item in control.snapshots]
     assert snapshot_ids[0] == snapshot_ids[1]
     assert uuid.UUID(snapshot_ids[0]).version == 5
+
+
+def test_registry_snapshot_identity_tracks_current_install_contract(
+    tmp_path, monkeypatch
+):
+    raw = _raw_store(tmp_path)
+    _, record = _commit_for_parse(
+        raw,
+        competition_index_target(),
+        "<table><tr><td>index</td></tr></table>",
+    )
+
+    first = pipeline_module._registry_snapshot_id(record)
+    assert first == pipeline_module._registry_snapshot_id(record)
+    monkeypatch.setattr(
+        pipeline_module,
+        "CURRENT_SEASON_INSTALL_CONTRACT_VERSION",
+        "fbref-current-season-install-vnext",
+    )
+
+    assert pipeline_module._registry_snapshot_id(record) != first
 
 
 def _seasons_html(competition_id: str) -> str:
@@ -4551,6 +4582,215 @@ def test_current_history_parse_uses_exact_source_season_and_opaque_ids(tmp_path)
         "/spring/source-owned-current"
     )
     assert {entry.is_current for entry in control.seasons} == {True, False}
+
+
+def test_advertised_current_missing_from_history_is_installed_from_exact_href(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry["6"] = {
+        "competition_id": "6",
+        "canonical_url": "https://fbref.com/en/comps/6/history/x",
+        "name": "FIFA World Cup Qualification — UEFA",
+        "gender": "male",
+        "classification": "other:national_team",
+        "metadata": {
+            "source_section": "National Team Qualification",
+            "last_season": "2026",
+            "last_season_url": (
+                "https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats"
+            ),
+        },
+    }
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="competition",
+        canonical_url="https://fbref.com/en/comps/6/history/x",
+        source_ids={"competition_id": "6"},
+    ))
+    html = """
+    <table id="seasons"><tbody>
+      <tr><th data-stat="season"><a
+        href="/en/comps/6/2022/2022-WCQ----UEFA-M-Stats"
+      >2022 FIFA World Cup Qualification — UEFA</a></th></tr>
+      <tr><th data-stat="season"><a
+        href="/en/comps/6/2018/2018-WCQ----UEFA-M-Stats"
+      >2018 FIFA World Cup Qualification — UEFA</a></th></tr>
+    </tbody></table>
+    """
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    }]
+
+    result = FBrefPipeline(
+        control, raw, generic_writer=FakeWriter()
+    ).parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_settings("current"),
+    )
+
+    current = [entry for entry in control.seasons if entry.is_current]
+    season_targets = [
+        row for row in control.frontier.values()
+        if row["page_kind"] == "season"
+    ]
+    assert result.seeded == 1
+    assert [(entry.season_id, entry.canonical_url) for entry in current] == [(
+        "2026", "https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats"
+    )]
+    assert [row["source_ids"]["season_id"] for row in season_targets] == [
+        "2026"
+    ]
+    assert {
+        entry.season_id for entry in control.seasons if not entry.is_current
+    } == {"2018", "2022"}
+
+
+def test_advertised_current_mismatch_without_href_fails_closed(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry["6"] = {
+        "competition_id": "6",
+        "canonical_url": "https://fbref.com/en/comps/6/history/x",
+        "name": "FIFA World Cup Qualification — UEFA",
+        "gender": "male",
+        "classification": "other:national_team",
+        "metadata": {"last_season": "2026"},
+    }
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="competition",
+        canonical_url="https://fbref.com/en/comps/6/history/x",
+        source_ids={"competition_id": "6"},
+    ))
+    html = """
+    <table id="seasons"><tbody><tr><th data-stat="season"><a
+      href="/en/comps/6/2022/2022-WCQ----UEFA-M-Stats"
+    >2022 FIFA World Cup Qualification — UEFA</a></th></tr></tbody></table>
+    """
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    }]
+
+    with pytest.raises(
+        ParseWaveError, match="advertised current season 2026 has no source href"
+    ):
+        FBrefPipeline(
+            control, raw, generic_writer=FakeWriter()
+        ).parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["competition"],
+            settings=_settings("current"),
+        )
+
+
+def test_advertised_current_source_id_prevents_duplicate_long_label(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry["255"] = {
+        "competition_id": "255",
+        "canonical_url": "https://fbref.com/en/comps/255/history/x",
+        "name": "FIFA World Cup Qualification — Inter-confederation play-offs",
+        "gender": "male",
+        "classification": "cup:national_team",
+        "metadata": {
+            "last_season": "2026",
+            "last_season_url": (
+                "https://fbref.com/en/comps/255/2026/"
+                "2026-FIFA-World-Cup-Qualification-Stats"
+            ),
+        },
+    }
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="competition",
+        canonical_url="https://fbref.com/en/comps/255/history/x",
+        source_ids={"competition_id": "255"},
+    ))
+    html = """
+    <html><body><main><div class="content_grid"><a
+      href="/en/comps/255/2026/2026-FIFA-World-Cup-Qualification-Stats"
+    >2026 FIFA World Cup Qualification — Inter-confederation play-offs</a>
+    </div></main></body></html>
+    """
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    }]
+
+    FBrefPipeline(control, raw, generic_writer=FakeWriter()).parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_settings("current"),
+    )
+
+    assert [(entry.season_id, entry.is_current) for entry in control.seasons] == [
+        ("2026", True)
+    ]
+
+
+def test_advertised_current_href_wins_when_history_only_has_direct_match():
+    advertised_url = "https://fbref.com/en/comps/602/Super-Cup-Stats"
+    competition = CompetitionRef(
+        comp_id="602",
+        name="Super Cup",
+        format=CompetitionFormat.CUP,
+        participants=ParticipantType.CLUB,
+        gender=CompetitionGender.MALE,
+        source_section="Domestic Cups",
+        country="England",
+        governing_body=None,
+        tier=None,
+        first_season="1908",
+        last_season="2026",
+        history_url="https://fbref.com/en/comps/602/history/Super-Cup-Seasons",
+        last_season_url=advertised_url,
+    )
+    direct_match = MatchRef(
+        match_id="abcdef12",
+        comp_id="602",
+        season_id="2026",
+        canonical_url="https://fbref.com/en/matches/abcdef12",
+    )
+
+    seasons, current = pipeline_module._resolve_current_season_install(
+        competition,
+        [],
+        [direct_match],
+    )
+
+    assert current == "2026"
+    assert [(season.season_id, season.season_url) for season in seasons] == [
+        ("2026", advertised_url)
+    ]
 
 
 @pytest.mark.parametrize(

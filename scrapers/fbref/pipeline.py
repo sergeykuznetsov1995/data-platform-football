@@ -47,6 +47,7 @@ from scrapers.fbref.discovery import (
     DiscoveredPageLink,
     ParticipantType,
     SeasonRef,
+    advertised_current_season,
     competition_eligibility,
     discover_page_links,
     normalize_page_source_ids,
@@ -123,6 +124,9 @@ SENTINEL_COMPETITIONS = (
     "Copa América",
 )
 
+CURRENT_SEASON_INSTALL_CONTRACT_VERSION = (
+    "fbref-current-season-install-source-link-v1"
+)
 SEASON_INSTALL_REDIRECT_VERSION = (
     "fbref-season-install-redirects-20260825-v1"
 )
@@ -1080,6 +1084,7 @@ def _registry_snapshot_id(record: RawFetchRecord) -> str:
             (
                 "fbref-registry-snapshot:"
                 f"{DISCOVERY_PARSER_VERSION}:"
+                f"{CURRENT_SEASON_INSTALL_CONTRACT_VERSION}:"
                 f"{record.logical_refresh_id}:{record.target_id}:"
                 f"{record.content_hash}"
             ),
@@ -2004,6 +2009,7 @@ def _competition_metadata(item: CompetitionRef) -> dict:
         "tier": item.tier,
         "first_season": item.first_season,
         "last_season": item.last_season,
+        "last_season_url": item.last_season_url,
     }
 
 
@@ -2065,6 +2071,68 @@ def _competition_from_registry(row: Mapping[str, object]) -> CompetitionRef:
         first_season=metadata.get("first_season"),
         last_season=metadata.get("last_season"),
         history_url=str(row["canonical_url"]),
+        last_season_url=metadata.get("last_season_url"),
+    )
+
+
+def _resolve_current_season_install(
+    competition: CompetitionRef,
+    seasons: Sequence[SeasonRef],
+    direct_matches: Sequence[object],
+) -> tuple[list[SeasonRef], Optional[str]]:
+    """Merge and select only source-advertised current-season evidence."""
+
+    installed_seasons = [
+        _season_with_registry_redirect(season) for season in seasons
+    ]
+    current_label = competition.last_season
+    advertised = advertised_current_season(competition)
+    if advertised is not None:
+        advertised = _season_with_registry_redirect(advertised)
+        installed = next(
+            (
+                season
+                for season in installed_seasons
+                if season.season_id == advertised.season_id
+            ),
+            None,
+        )
+        if installed is None:
+            installed_seasons = [advertised, *installed_seasons]
+        return installed_seasons, advertised.season_id
+
+    current_candidates = [
+        index
+        for index, season in enumerate(installed_seasons)
+        if current_label and season.label == current_label
+    ]
+    if current_candidates:
+        # FBref occasionally publishes two history URLs with the same display
+        # label (competition 612 did so for "2025"). Prefer the source ID that
+        # exactly matches the advertised label, then the newest history row.
+        canonical_current = min(
+            current_candidates,
+            key=lambda index: (
+                installed_seasons[index].season_id != current_label,
+                index,
+            ),
+        )
+        return installed_seasons, installed_seasons[canonical_current].season_id
+    if current_label and any(
+        match.season_id == current_label for match in direct_matches
+    ):
+        return installed_seasons, current_label
+    if current_label:
+        raise ParseWaveError(
+            f"Competition {competition.comp_id} advertised current season "
+            f"{current_label} has no source href or matching history entry"
+        )
+    return installed_seasons, (
+        installed_seasons[0].season_id
+        if installed_seasons
+        else direct_matches[0].season_id
+        if direct_matches
+        else None
     )
 
 
@@ -4268,38 +4336,11 @@ class FBrefPipeline:
             raise ParseWaveError(
                 f"Season discovery failed for competition {competition_id}"
             )
-        seasons = [_season_with_registry_redirect(season) for season in seasons]
-        current_label = competition.last_season
-        current_candidates = [
-            index
-            for index, season in enumerate(seasons)
-            if current_label and season.label == current_label
-        ]
-        if current_candidates:
-            # FBref occasionally publishes two history URLs with the same
-            # display label (competition 612 did so for "2025"). A current
-            # edition is singular: prefer the source ID that exactly matches
-            # the advertised label, then the first/newest history row.
-            canonical_current = min(
-                current_candidates,
-                key=lambda index: (
-                    seasons[index].season_id != current_label,
-                    index,
-                ),
-            )
-            current_season_id = seasons[canonical_current].season_id
-        elif current_label and any(
-            match.season_id == current_label for match in direct_matches
-        ):
-            current_season_id = current_label
-        else:
-            current_season_id = (
-                seasons[0].season_id
-                if seasons
-                else direct_matches[0].season_id
-                if direct_matches
-                else None
-            )
+        seasons, current_season_id = _resolve_current_season_install(
+            competition,
+            seasons,
+            direct_matches,
+        )
 
         entries = [
             SeasonRegistryEntry(
