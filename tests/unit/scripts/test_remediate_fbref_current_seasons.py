@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 import uuid
 from pathlib import Path
 
 import pytest
 
-from scrapers.fbref.raw_store import RawPageStore, competition_page_target
+from scrapers.fbref.raw_store import (
+    RawPageStore,
+    competition_index_target,
+    competition_page_target,
+)
 
 
 SCRIPT = (
@@ -25,10 +30,31 @@ sys.modules[SPEC.name] = remediation
 SPEC.loader.exec_module(remediation)
 
 
+HISTORY_RUN_ID = str(uuid.UUID(int=901))
+
+
+def test_script_supports_exact_stdin_execution_from_runtime_workdir():
+    assert remediation._repo_root_for_execution("<stdin>") is None
+    result = subprocess.run(
+        [sys.executable, "-", "--help"],
+        cwd=SCRIPT.parents[2],
+        input=SCRIPT.read_text(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--competition-id" in result.stdout
+
+
 class FakeControl:
-    def __init__(self, competitions, currents):
+    def __init__(self, competitions, currents, history_records=()):
         self.competitions = list(competitions)
         self.currents = list(currents)
+        self.history_records = {
+            record.logical_refresh_id: record for record in history_records
+        }
 
     def eligible_competitions(self):
         return list(self.competitions)
@@ -45,14 +71,81 @@ class FakeControl:
             ]
         return rows[:limit]
 
+    def get_current_season_index_evidence(self, competition_id):
+        row = next(
+            item
+            for item in self.competitions
+            if item["competition_id"] == competition_id
+        )
+        if not row.get("last_snapshot_id"):
+            raise RuntimeError("missing index snapshot")
+        return dict(row["metadata"]["current_season_index"])
+
+    def get_succeeded_fetch_evidence(
+        self,
+        logical_refresh_id,
+        *,
+        target_id,
+        content_hash,
+        raw_manifest_key,
+    ):
+        record = self.history_records[str(logical_refresh_id)]
+        assert record.target_id == target_id
+        assert record.content_hash == content_hash
+        return {
+            "attempt_id": record.attempt_id,
+            "run_id": HISTORY_RUN_ID,
+            "logical_refresh_id": record.logical_refresh_id,
+            "target_id": record.target_id,
+            "content_hash": record.content_hash,
+            "raw_manifest_key": raw_manifest_key,
+        }
+
 
 def _competition(
+    raw,
     competition_id,
     *,
     last_season,
     last_season_url,
     classification="other:national_team",
 ):
+    index_html = f"""
+    <h2>National Team Qualification</h2><table><tbody><tr>
+      <th data-stat="league_name"><a
+        href="/en/comps/{competition_id}/history/x"
+      >Competition {competition_id}</a></th>
+      <td data-stat="gender">M</td>
+      <td data-stat="maxseason"><a href="{last_season_url}">{last_season}</a></td>
+    </tr></tbody></table>
+    """
+    index_record = raw.commit_fetch(
+        competition_index_target(),
+        index_html.encode(),
+        logical_refresh_id=str(uuid.uuid4()),
+        attempt_id=str(uuid.uuid4()),
+        http_status=200,
+    )
+    index_snapshot_id = str(uuid.uuid4())
+    index_run_id = str(uuid.uuid4())
+    index_evidence = {
+        "schema_version": "fbref-current-season-index-evidence-v1",
+        "snapshot_id": index_snapshot_id,
+        "run_id": index_run_id,
+        "content_hash": index_record.content_hash,
+        "raw": {
+            "attempt_id": index_record.attempt_id,
+            "content_hash": index_record.content_hash,
+            "logical_refresh_id": index_record.logical_refresh_id,
+            "manifest_key": raw.fetch_manifest_key(index_record.logical_refresh_id),
+            "target_id": index_record.target_id,
+        },
+        "advertised": {
+            "label": last_season,
+            "href": last_season_url,
+            "season_id": last_season,
+        },
+    }
     return {
         "source": "fbref",
         "competition_id": competition_id,
@@ -63,8 +156,10 @@ def _competition(
         "metadata": {
             "last_season": last_season,
             "last_season_url": last_season_url,
+            "advertised_current_season_id": last_season,
+            "current_season_index": index_evidence,
         },
-        "last_snapshot_id": f"snapshot-{competition_id}",
+        "last_snapshot_id": index_snapshot_id,
     }
 
 
@@ -94,11 +189,12 @@ def _commit_history(raw, competition, html):
 def test_dry_run_proposes_exact_comp6_source_season_without_writes(tmp_path):
     raw = RawPageStore.from_uri(tmp_path.as_uri())
     competition = _competition(
+        raw,
         "6",
         last_season="2026",
         last_season_url="https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats",
     )
-    _commit_history(
+    history_record = _commit_history(
         raw,
         competition,
         """
@@ -116,50 +212,42 @@ def test_dry_run_proposes_exact_comp6_source_season_without_writes(tmp_path):
                 "https://fbref.com/en/comps/6/2022/2022-WCQ----UEFA-M-Stats",
             )
         ],
+        [history_record],
     )
-    writes = []
 
     evidence = remediation.run_remediation(
         control,
         raw,
         competition_ids=["6"],
         apply=False,
-        apply_one=lambda *_args: writes.append(_args),
     )
 
-    assert writes == []
     assert evidence["mode"] == "dry_run"
-    assert evidence["plans"] == [
-        {
-            "competition_id": "6",
-            "installed_current_season_id": "2022",
-            "advertised_current_season_id": "2026",
-            "advertised_current_label": "2026",
-            "advertised_current_url": (
-                "https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats"
-            ),
-            "action": "reconcile",
-            "history_content_hash": evidence["plans"][0]["history_content_hash"],
-            "history_logical_refresh_id": evidence["plans"][0][
-                "history_logical_refresh_id"
-            ],
-            "competition_snapshot_id": "snapshot-6",
-            "install_contract_version": ("fbref-current-season-install-source-link-v1"),
-        }
-    ]
-
-    applied = []
-    apply_evidence = remediation.run_remediation(
-        control,
-        raw,
-        competition_ids=["6"],
-        apply=True,
-        source_run_id=str(uuid.uuid4()),
-        apply_one=lambda *args: applied.append(args),
+    plan = evidence["plans"][0]
+    index = competition["metadata"]["current_season_index"]
+    assert plan["competition_id"] == "6"
+    assert plan["installed_current_season_id"] == "2022"
+    assert plan["advertised_current_season_id"] == "2026"
+    assert plan["advertised_current_label"] == "2026"
+    assert plan["advertised_current_url"] == (
+        "https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats"
     )
-    assert apply_evidence["mode"] == "apply"
-    assert len(applied) == 1
-    assert applied[0][2].advertised_current_season_id == "2026"
+    assert plan["action"] == "reconcile"
+    assert plan["history_attempt_id"] == history_record.attempt_id
+    assert plan["history_run_id"] == HISTORY_RUN_ID
+    assert plan["history_content_hash"] == history_record.content_hash
+    assert plan["history_logical_refresh_id"] == (history_record.logical_refresh_id)
+    assert plan["history_raw_manifest_key"] == raw.fetch_manifest_key(
+        history_record.logical_refresh_id
+    )
+    assert plan["index_snapshot_id"] == index["snapshot_id"]
+    assert plan["index_run_id"] == index["run_id"]
+    assert plan["index_attempt_id"] == index["raw"]["attempt_id"]
+    assert plan["index_content_hash"] == index["content_hash"]
+    assert plan["index_raw_manifest_key"] == index["raw"]["manifest_key"]
+    assert plan["install_contract_version"] == (
+        "fbref-current-season-install-source-link-v1"
+    )
 
 
 def test_comp255_same_source_id_is_no_change_not_demotion(tmp_path):
@@ -168,12 +256,13 @@ def test_comp255_same_source_id_is_no_change_not_demotion(tmp_path):
         "https://fbref.com/en/comps/255/2026/2026-FIFA-World-Cup-Qualification-Stats"
     )
     competition = _competition(
+        raw,
         "255",
         last_season="2026",
         last_season_url=current_url,
         classification="cup:national_team",
     )
-    _commit_history(
+    history_record = _commit_history(
         raw,
         competition,
         """
@@ -186,6 +275,7 @@ def test_comp255_same_source_id_is_no_change_not_demotion(tmp_path):
     control = FakeControl(
         [competition],
         [_current("255", "2026", current_url)],
+        [history_record],
     )
 
     evidence = remediation.run_remediation(
@@ -215,11 +305,12 @@ def test_apply_requires_source_run_id_before_any_write(tmp_path):
 def test_apply_refuses_missing_source_run_raw_lineage(tmp_path):
     raw = RawPageStore.from_uri(tmp_path.as_uri())
     competition = _competition(
+        raw,
         "6",
         last_season="2026",
         last_season_url="https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats",
     )
-    _commit_history(
+    history_record = _commit_history(
         raw,
         competition,
         """
@@ -230,8 +321,8 @@ def test_apply_refuses_missing_source_run_raw_lineage(tmp_path):
     )
 
     class MissingLineageControl(FakeControl):
-        def list_fetch_attempts_for_refresh(self, run_id, logical_refresh_id):
-            return []
+        def get_succeeded_fetch_evidence(self, *_args, **_kwargs):
+            raise RuntimeError("missing history lineage")
 
     control = MissingLineageControl(
         [competition],
@@ -242,24 +333,89 @@ def test_apply_refuses_missing_source_run_raw_lineage(tmp_path):
                 "https://fbref.com/en/comps/6/2022/2022-WCQ----UEFA-M-Stats",
             )
         ],
+        [history_record],
     )
-    plan = remediation.build_remediation_plans(control, raw, competition_ids=["6"])[0]
 
     with pytest.raises(
         remediation.RemediationEvidenceError,
-        match="source-run raw lineage is not singular",
+        match="history evidence is invalid",
     ):
-        remediation._apply_one(
+        remediation.build_remediation_plans(
             control,
             raw,
-            plan,
-            str(uuid.uuid4()),
+            competition_ids=["6"],
+        )
+
+
+def test_dry_run_refuses_history_manifest_mismatch(tmp_path):
+    raw = RawPageStore.from_uri(tmp_path.as_uri())
+    competition = _competition(
+        raw,
+        "6",
+        last_season="2026",
+        last_season_url="https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats",
+    )
+    history_record = _commit_history(
+        raw,
+        competition,
+        """
+        <table id="seasons"><tbody><tr><th data-stat="season"><a
+          href="/en/comps/6/2022/old">2022</a>
+        </th></tr></tbody></table>
+        """,
+    )
+
+    class WrongManifestControl(FakeControl):
+        def get_succeeded_fetch_evidence(self, *args, **kwargs):
+            result = super().get_succeeded_fetch_evidence(*args, **kwargs)
+            result["raw_manifest_key"] = "manifests/fetches/wrong.json"
+            return result
+
+    control = WrongManifestControl(
+        [competition],
+        [_current("6", "2022", "https://fbref.com/en/comps/6/2022/old")],
+        [history_record],
+    )
+
+    with pytest.raises(
+        remediation.RemediationEvidenceError,
+        match="history evidence is not exact",
+    ):
+        remediation.build_remediation_plans(
+            control,
+            raw,
+            competition_ids=["6"],
+        )
+
+
+def test_dry_run_refuses_missing_index_snapshot(tmp_path):
+    raw = RawPageStore.from_uri(tmp_path.as_uri())
+    competition = _competition(
+        raw,
+        "6",
+        last_season="2026",
+        last_season_url="https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats",
+    )
+    competition["last_snapshot_id"] = None
+
+    with pytest.raises(
+        remediation.RemediationEvidenceError,
+        match="index evidence is invalid",
+    ):
+        remediation.build_remediation_plans(
+            FakeControl(
+                [competition],
+                [_current("6", "2022", "https://fbref.com/en/comps/6/2022/old")],
+            ),
+            raw,
+            competition_ids=["6"],
         )
 
 
 def test_requested_competition_requires_exactly_one_current_season(tmp_path):
     raw = RawPageStore.from_uri(tmp_path.as_uri())
     competition = _competition(
+        raw,
         "6",
         last_season="2026",
         last_season_url="https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats",
@@ -277,12 +433,14 @@ def test_requested_competition_requires_exactly_one_current_season(tmp_path):
         )
 
 
-def test_apply_preflights_complete_batch_before_first_write(tmp_path, monkeypatch):
+def test_apply_dispatches_one_supported_atomic_batch(tmp_path):
     raw = RawPageStore.from_uri(tmp_path.as_uri())
     competitions = []
     currents = []
+    history_records = []
     for competition_id in ("6", "678"):
         competition = _competition(
+            raw,
             competition_id,
             last_season="2026",
             last_season_url=(
@@ -297,57 +455,82 @@ def test_apply_preflights_complete_batch_before_first_write(tmp_path, monkeypatc
                 f"https://fbref.com/en/comps/{competition_id}/2022/Old-Stats",
             )
         )
-        _commit_history(
-            raw,
-            competition,
-            f"""
+        history_records.append(
+            _commit_history(
+                raw,
+                competition,
+                f"""
           <table id="seasons"><tbody><tr><th data-stat="season"><a
             href="/en/comps/{competition_id}/2022/Old-Stats"
           >2022 Old season</a></th></tr></tbody></table>
         """,
+            )
         )
 
-    class SecondLineageMissingControl(FakeControl):
-        def __init__(self):
-            super().__init__(competitions, currents)
-            self.calls = 0
+    calls = []
 
-        def list_fetch_attempts_for_refresh(self, run_id, logical_refresh_id):
-            self.calls += 1
-            if self.calls == 2:
-                return []
-            plan = plans[0]
-            return [
-                {
-                    "status": "succeeded",
-                    "target_id": plan._history_record.target_id,
-                    "content_hash": plan.history_content_hash,
-                    "raw_manifest_key": "manifest.json",
-                }
-            ]
+    class AtomicPipeline:
+        def __init__(self, control, raw_store):
+            self.control = control
+            self.raw_store = raw_store
 
-    control = SecondLineageMissingControl()
-    plans = remediation.build_remediation_plans(
-        control,
+        def remediate_current_seasons(self, items):
+            calls.append(list(items))
+            return {"competition_count": len(items), "seeded": 2, "skipped": 0}
+
+    result = remediation.run_remediation(
+        FakeControl(competitions, currents, history_records),
         raw,
         competition_ids=["6", "678"],
+        apply=True,
+        source_run_id=HISTORY_RUN_ID,
+        pipeline_factory=AtomicPipeline,
     )
-    writes = []
-    monkeypatch.setattr(remediation, "_install_one", lambda *_args: writes.append(1))
+
+    assert result["mode"] == "apply"
+    assert len(calls) == 1
+    assert [item.evidence.competition_id for item in calls[0]] == ["6", "678"]
+    assert "_parse_competition" not in SCRIPT.read_text()
+
+
+def test_apply_refuses_source_run_mismatch_before_atomic_operation(tmp_path):
+    raw = RawPageStore.from_uri(tmp_path.as_uri())
+    competition = _competition(
+        raw,
+        "6",
+        last_season="2026",
+        last_season_url="https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats",
+    )
+    history_record = _commit_history(
+        raw,
+        competition,
+        """
+        <table id="seasons"><tbody><tr><th data-stat="season"><a
+          href="/en/comps/6/2022/old">2022</a>
+        </th></tr></tbody></table>
+        """,
+    )
+
+    class ForbiddenPipeline:
+        def __init__(self, *_args):
+            raise AssertionError("atomic operation must not begin")
 
     with pytest.raises(
         remediation.RemediationEvidenceError,
-        match="source-run raw lineage is not singular",
+        match="source_run_id does not own exact history evidence",
     ):
         remediation.run_remediation(
-            control,
+            FakeControl(
+                [competition],
+                [_current("6", "2022", "https://fbref.com/en/comps/6/2022/old")],
+                [history_record],
+            ),
             raw,
-            competition_ids=["6", "678"],
+            competition_ids=["6"],
             apply=True,
             source_run_id=str(uuid.uuid4()),
+            pipeline_factory=ForbiddenPipeline,
         )
-
-    assert writes == []
 
 
 @pytest.mark.parametrize("competition_ids", [[], ["6", "6"]])

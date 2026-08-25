@@ -29,6 +29,7 @@ from scrapers.fbref.control import (
     BudgetExceeded,
     CompetitionRegistryEntry,
     ControlStore,
+    CurrentSeasonRemediationEvidence,
     FrontierProvenance,
     FrontierTarget,
     SeasonAlias,
@@ -45,6 +46,7 @@ from scrapers.fbref.discovery import (
     CompetitionGender,
     CompetitionRef,
     DiscoveredPageLink,
+    MatchRef,
     ParticipantType,
     SeasonRef,
     advertised_current_season,
@@ -364,6 +366,15 @@ class SourceContractRejected(ParseWaveError):
         self.target_id = target_id
         self.content_hash = content_hash
         self.reason = reason
+
+
+@dataclass(frozen=True)
+class CurrentSeasonRemediationItem:
+    """One exact immutable history input and its two-source control proof."""
+
+    evidence: CurrentSeasonRemediationEvidence
+    history_html: str
+    history_record: RawFetchRecord
 
 
 @dataclass(frozen=True)
@@ -1075,19 +1086,28 @@ def _target_hash(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()[:20]
 
 
-def _registry_snapshot_id(record: RawFetchRecord) -> str:
+def _registry_snapshot_id(
+    record: RawFetchRecord,
+    *,
+    current_season_index: Optional[Mapping[str, object]] = None,
+) -> str:
     """Return one retry-stable identity for a single raw observation."""
 
+    identity = {
+        "attempt_id": record.attempt_id,
+        "contract_version": CURRENT_SEASON_INSTALL_CONTRACT_VERSION,
+        "content_hash": record.content_hash,
+        "logical_refresh_id": record.logical_refresh_id,
+        "parser_version": DISCOVERY_PARSER_VERSION,
+        "target_id": record.target_id,
+    }
+    if current_season_index is not None:
+        identity["current_season_index"] = dict(current_season_index)
     return str(
         uuid.uuid5(
             uuid.NAMESPACE_URL,
-            (
-                "fbref-registry-snapshot:"
-                f"{DISCOVERY_PARSER_VERSION}:"
-                f"{CURRENT_SEASON_INSTALL_CONTRACT_VERSION}:"
-                f"{record.logical_refresh_id}:{record.target_id}:"
-                f"{record.content_hash}"
-            ),
+            "fbref-registry-snapshot:"
+            + json.dumps(identity, sort_keys=True, separators=(",", ":")),
         )
     )
 
@@ -1999,7 +2019,48 @@ def _next_fetch_at(page_kind: str, *, historical: bool) -> Optional[datetime]:
     return _utcnow() + delays.get(page_kind, timedelta(days=7))
 
 
-def _competition_metadata(item: CompetitionRef) -> dict:
+def _raw_record_evidence(
+    raw_store: RawPageStore,
+    record: RawFetchRecord,
+) -> dict[str, Optional[str]]:
+    return {
+        "attempt_id": record.attempt_id,
+        "content_hash": record.content_hash,
+        "logical_refresh_id": record.logical_refresh_id,
+        "manifest_key": raw_store.fetch_manifest_key(record.logical_refresh_id),
+        "target_id": record.target_id,
+    }
+
+
+def _current_season_index_evidence(
+    item: CompetitionRef,
+    *,
+    snapshot_id: str,
+    run_id: str,
+    record: RawFetchRecord,
+    raw_store: RawPageStore,
+) -> dict:
+    advertised = advertised_current_season(item)
+    return {
+        "schema_version": "fbref-current-season-index-evidence-v1",
+        "snapshot_id": snapshot_id,
+        "run_id": run_id,
+        "content_hash": record.content_hash,
+        "raw": _raw_record_evidence(raw_store, record),
+        "advertised": {
+            "label": item.last_season,
+            "href": item.last_season_url,
+            "season_id": None if advertised is None else advertised.season_id,
+        },
+    }
+
+
+def _competition_metadata(
+    item: CompetitionRef,
+    *,
+    current_season_index: Mapping[str, object],
+) -> dict:
+    advertised = current_season_index.get("advertised") or {}
     return {
         "format": item.format.value,
         "participants": item.participants.value,
@@ -2010,10 +2071,16 @@ def _competition_metadata(item: CompetitionRef) -> dict:
         "first_season": item.first_season,
         "last_season": item.last_season,
         "last_season_url": item.last_season_url,
+        "advertised_current_season_id": advertised.get("season_id"),
+        "current_season_index": dict(current_season_index),
     }
 
 
-def _registry_entry(item: CompetitionRef) -> CompetitionRegistryEntry:
+def _registry_entry(
+    item: CompetitionRef,
+    *,
+    current_season_index: Mapping[str, object],
+) -> CompetitionRegistryEntry:
     gender = {
         CompetitionGender.MALE: "male",
         CompetitionGender.FEMALE: "female",
@@ -2025,7 +2092,10 @@ def _registry_entry(item: CompetitionRef) -> CompetitionRegistryEntry:
         name=item.name,
         gender=gender,
         classification=f"{item.format.value}:{item.participants.value}",
-        metadata=_competition_metadata(item),
+        metadata=_competition_metadata(
+            item,
+            current_season_index=current_season_index,
+        ),
     )
 
 
@@ -2075,17 +2145,63 @@ def _competition_from_registry(row: Mapping[str, object]) -> CompetitionRef:
     )
 
 
+def _current_season_index_from_registry(
+    row: Mapping[str, object],
+) -> dict:
+    metadata = _mapping(row.get("metadata") or {})
+    value = metadata.get("current_season_index")
+    if not isinstance(value, Mapping):
+        raise ParseWaveError(
+            f"Competition {row.get('competition_id')} has no exact "
+            "competition-index lineage"
+        )
+    evidence = dict(value)
+    advertised = evidence.get("advertised")
+    raw = evidence.get("raw")
+    if (
+        evidence.get("schema_version")
+        != "fbref-current-season-index-evidence-v1"
+        or not evidence.get("snapshot_id")
+        or str(row.get("last_snapshot_id") or "")
+        != str(evidence.get("snapshot_id"))
+        or not evidence.get("run_id")
+        or not evidence.get("content_hash")
+        or not isinstance(raw, Mapping)
+        or not raw.get("attempt_id")
+        or raw.get("content_hash") != evidence.get("content_hash")
+        or not raw.get("logical_refresh_id")
+        or not raw.get("manifest_key")
+        or not raw.get("target_id")
+        or not isinstance(advertised, Mapping)
+        or advertised.get("label") != metadata.get("last_season")
+        or advertised.get("href") != metadata.get("last_season_url")
+        or advertised.get("season_id")
+        != metadata.get("advertised_current_season_id")
+    ):
+        raise ParseWaveError(
+            f"Competition {row.get('competition_id')} has incomplete or "
+            "inconsistent competition-index lineage"
+        )
+    return evidence
+
+
 def _resolve_current_season_install(
     competition: CompetitionRef,
     seasons: Sequence[SeasonRef],
-    direct_matches: Sequence[object],
+    direct_matches: Sequence[MatchRef],
 ) -> tuple[list[SeasonRef], Optional[str]]:
     """Merge and select only source-advertised current-season evidence."""
 
     installed_seasons = [
         _season_with_registry_redirect(season) for season in seasons
     ]
-    current_label = competition.last_season
+    current_label = str(competition.last_season or "").strip()
+    current_href = str(competition.last_season_url or "").strip()
+    if bool(current_label) != bool(current_href):
+        raise ParseWaveError(
+            f"Competition {competition.comp_id} advertised current season "
+            "evidence is incomplete: label and href must both be present"
+        )
     advertised = advertised_current_season(competition)
     if advertised is not None:
         advertised = _season_with_registry_redirect(advertised)
@@ -4045,7 +4161,15 @@ class FBrefPipeline:
         parent_record: Optional[RawFetchRecord] = None,
         reconcile_after: bool = True,
         eligible_competitions: Optional[Mapping[str, dict]] = None,
+        provenance_metadata: Optional[Mapping[str, object]] = None,
+        provenance_install_id: Optional[str] = None,
     ) -> tuple[int, int]:
+        install_relation_suffix = ""
+        if provenance_install_id is not None:
+            normalized_install_id = str(provenance_install_id).strip()
+            if not normalized_install_id:
+                raise ValueError("provenance_install_id must not be empty")
+            install_relation_suffix = f":install:{normalized_install_id}"
         eligible = set(
             self._eligible_competitions()
             if eligible_competitions is None
@@ -4152,7 +4276,10 @@ class FBrefPipeline:
                     provenance_edges.append(FrontierProvenance(
                         parent_target_id=parent_record.target_id,
                         child_target_id=target.target_id,
-                        relation=f"page_link:{link.page_kind}",
+                        relation=(
+                            f"page_link:{link.page_kind}"
+                            f"{install_relation_suffix}"
+                        ),
                         carried_competition_id=competition_id,
                         carried_season_id=season_id,
                         parent_content_hash=parent_record.content_hash,
@@ -4162,6 +4289,7 @@ class FBrefPipeline:
                         ),
                         metadata={
                             "child_page_kind": link.page_kind,
+                            **dict(provenance_metadata or {}),
                         },
                     ))
         if prepared_targets or provenance_edges:
@@ -4266,14 +4394,17 @@ class FBrefPipeline:
     ) -> tuple[int, int]:
         parsed = parse_competition_index_html(html)
         competitions = parsed.datasets["competitions"].records
+        snapshot_identity = _registry_snapshot_id(record)
+        raw_evidence = _raw_record_evidence(self.raw_store, record)
         snapshot_id = self.control.create_registry_snapshot(
-            snapshot_id=_registry_snapshot_id(record),
+            snapshot_id=snapshot_identity,
             run_id=run_id,
             fetched_at=_as_utc(record.fetched_at),
             successful=not parsed.has_errors,
             content_hash=record.content_hash,
             metadata={
                 "page_kind": "competition_index",
+                "raw": raw_evidence,
                 "sentinels": sentinel_coverage(
                     competitions, SENTINEL_COMPETITIONS
                 ),
@@ -4281,9 +4412,19 @@ class FBrefPipeline:
         )
         if parsed.has_errors:
             raise ParseWaveError("Competition index discovery contract failed")
-        self.control.reconcile_competitions(
-            snapshot_id, [_registry_entry(item) for item in competitions]
-        )
+        self.control.reconcile_competitions(snapshot_id, [
+            _registry_entry(
+                item,
+                current_season_index=_current_season_index_evidence(
+                    item,
+                    snapshot_id=snapshot_id,
+                    run_id=run_id,
+                    record=record,
+                    raw_store=self.raw_store,
+                ),
+            )
+            for item in competitions
+        ])
         links: list[DiscoveredPageLink] = []
         skipped = 0
         for competition in competitions:
@@ -4301,6 +4442,175 @@ class FBrefPipeline:
             links, historical=False, parent_record=record
         )
         return seeded, skipped + rejected
+
+    def validate_current_season_remediation_item(
+        self,
+        item: CurrentSeasonRemediationItem,
+        *,
+        validated_index_inputs: Optional[set[tuple[str, str]]] = None,
+    ) -> None:
+        """Validate both immutable raws behind one remediation item."""
+
+        evidence = item.evidence
+        record = item.history_record
+        if (
+            record.source != "fbref"
+            or record.page_kind != "competition"
+            or str(record.source_ids.get("competition_id") or "")
+            != evidence.competition_id
+            or record.target_id != evidence.history_target_id
+            or record.logical_refresh_id
+            != evidence.history_logical_refresh_id
+            or record.attempt_id != evidence.history_attempt_id
+            or record.content_hash != evidence.history_content_hash
+            or self.raw_store.fetch_manifest_key(record.logical_refresh_id)
+            != evidence.history_raw_manifest_key
+        ):
+            raise ParseWaveError(
+                f"Competition {evidence.competition_id} history input "
+                "differs from remediation evidence"
+            )
+        history_body, installed_history = self.raw_store.load_fetch(
+            record.logical_refresh_id
+        )
+        try:
+            installed_html = history_body.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ParseWaveError(
+                f"Competition {evidence.competition_id} history raw is not UTF-8"
+            ) from exc
+        if installed_history != record or installed_html != item.history_html:
+            raise ParseWaveError(
+                f"Competition {evidence.competition_id} history raw changed"
+            )
+
+        validated = (
+            set() if validated_index_inputs is None else validated_index_inputs
+        )
+        index_key = (
+            evidence.index_logical_refresh_id,
+            evidence.competition_id,
+        )
+        if index_key in validated:
+            return
+        index_body, index_record = self.raw_store.load_fetch(
+            evidence.index_logical_refresh_id
+        )
+        if (
+            index_record.source != "fbref"
+            or index_record.page_kind != "competition_index"
+            or index_record.target_id != evidence.index_target_id
+            or index_record.attempt_id != evidence.index_attempt_id
+            or index_record.content_hash != evidence.index_content_hash
+            or self.raw_store.fetch_manifest_key(
+                index_record.logical_refresh_id
+            )
+            != evidence.index_raw_manifest_key
+        ):
+            raise ParseWaveError(
+                "Competition-index raw differs from remediation evidence"
+            )
+        try:
+            index_html = index_body.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ParseWaveError("Competition-index raw is not UTF-8") from exc
+        parsed = parse_competition_index_html(index_html)
+        competitions = [
+            competition
+            for competition in parsed.datasets["competitions"].records
+            if competition.competition_id == evidence.competition_id
+        ]
+        if parsed.has_errors or len(competitions) != 1:
+            raise ParseWaveError(
+                f"Competition {evidence.competition_id} is not singular in "
+                "the authoritative index raw"
+            )
+        advertised = advertised_current_season(competitions[0])
+        if (
+            advertised is None
+            or advertised.label != evidence.advertised_label
+            or advertised.season_url != evidence.advertised_href
+            or advertised.season_id != evidence.advertised_season_id
+        ):
+            raise ParseWaveError(
+                f"Competition {evidence.competition_id} advertised season "
+                "differs from the authoritative index raw"
+            )
+        validated.add(index_key)
+
+    def remediate_current_seasons(
+        self,
+        items: Sequence[CurrentSeasonRemediationItem],
+    ) -> dict[str, int]:
+        """Atomically reinstall an explicit batch under the no-writer fence."""
+
+        batch = list(items)
+        if not batch:
+            raise ValueError("at least one remediation item is required")
+        evidence = [item.evidence for item in batch]
+        with self.control.current_season_remediation_transaction(
+            evidence=evidence
+        ) as transaction_control:
+            transaction_pipeline = FBrefPipeline(
+                transaction_control,
+                self.raw_store,
+                generic_writer=self.generic_writer,
+                typed_adapter=self.typed_adapter,
+                fetcher_factory=self.fetcher_factory,
+                sleep=self.sleep,
+                clock=self.clock,
+                finalization_guard=self.finalization_guard,
+            )
+            validated_index_inputs: set[tuple[str, str]] = set()
+            with transaction_pipeline._deferred_scope_reconcile():
+                seeded = 0
+                skipped = 0
+                for item in batch:
+                    transaction_pipeline.validate_current_season_remediation_item(
+                        item,
+                        validated_index_inputs=validated_index_inputs,
+                    )
+                    item_seeded, item_skipped = (
+                        transaction_pipeline._parse_competition(
+                            item.evidence.history_run_id,
+                            item.history_html,
+                            item.history_record,
+                            run_type="current",
+                        )
+                    )
+                    seeded += item_seeded
+                    skipped += item_skipped
+
+            currents: dict[str, list[str]] = {}
+            after = None
+            while True:
+                page = transaction_control.list_seasons(
+                    current=True,
+                    limit=25,
+                    after=after,
+                )
+                for row in page:
+                    currents.setdefault(
+                        str(row["competition_id"]), []
+                    ).append(str(row["season_id"]))
+                if len(page) < 25:
+                    break
+                after = (
+                    str(page[-1]["competition_id"]),
+                    str(page[-1]["season_id"]),
+                )
+            for item in batch:
+                installed = currents.get(item.evidence.competition_id, [])
+                if installed != [item.evidence.advertised_season_id]:
+                    raise StateConflict(
+                        f"Competition {item.evidence.competition_id} "
+                        "post-remediation current season is not exact"
+                    )
+        return {
+            "competition_count": len(batch),
+            "seeded": seeded,
+            "skipped": skipped,
+        }
 
     def _parse_competition(
         self,
@@ -4321,8 +4631,27 @@ class FBrefPipeline:
         parsed = parse_competition_html(html, competition)
         seasons = parsed.datasets["seasons"].records
         direct_matches = parsed.datasets["matches"].records
+        current_season_id = None
+        if not parsed.has_errors:
+            seasons, current_season_id = _resolve_current_season_install(
+                competition,
+                seasons,
+                direct_matches,
+            )
+        current_season_index = _current_season_index_from_registry(row)
+        history_raw = _raw_record_evidence(self.raw_store, record)
+        snapshot_identity = _registry_snapshot_id(
+            record,
+            current_season_index=current_season_index,
+        )
+        current_season_install = {
+            "schema_version": "fbref-current-season-install-evidence-v1",
+            "snapshot_id": snapshot_identity,
+            "history_raw": history_raw,
+            "index": current_season_index,
+        }
         snapshot_id = self.control.create_registry_snapshot(
-            snapshot_id=_registry_snapshot_id(record),
+            snapshot_id=snapshot_identity,
             run_id=run_id,
             fetched_at=_as_utc(record.fetched_at),
             successful=not parsed.has_errors,
@@ -4330,17 +4659,14 @@ class FBrefPipeline:
             metadata={
                 "page_kind": "competition",
                 "competition_id": competition_id,
+                "current_season_install": current_season_install,
+                "history_raw": history_raw,
             },
         )
         if parsed.has_errors:
             raise ParseWaveError(
                 f"Season discovery failed for competition {competition_id}"
             )
-        seasons, current_season_id = _resolve_current_season_install(
-            competition,
-            seasons,
-            direct_matches,
-        )
 
         entries = [
             SeasonRegistryEntry(
@@ -4349,7 +4675,10 @@ class FBrefPipeline:
                 canonical_url=season.season_url,
                 label=season.label,
                 is_current=season.season_id == current_season_id,
-                metadata={"calendar_type": season.calendar_type.value},
+                metadata={
+                    "calendar_type": season.calendar_type.value,
+                    "current_season_install": current_season_install,
+                },
             )
             for season in seasons
         ]
@@ -4370,6 +4699,7 @@ class FBrefPipeline:
                 metadata={
                     "calendar_type": CalendarType.TOURNAMENT.value,
                     "direct_match_only": True,
+                    "current_season_install": current_season_install,
                 },
             ))
             registered_season_ids.add(match.season_id)
@@ -4455,6 +4785,10 @@ class FBrefPipeline:
             candidates,
             parent_record=record,
             eligible_competitions=registry,
+            provenance_metadata={
+                "current_season_install": current_season_install,
+            },
+            provenance_install_id=snapshot_identity,
         )
 
     @staticmethod

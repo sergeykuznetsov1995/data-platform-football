@@ -14,19 +14,32 @@ import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Optional, Sequence
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO_ROOT))
+def _repo_root_for_execution(script_file: object) -> Optional[Path]:
+    """Return a checkout root only for an on-disk script invocation."""
 
-from scrapers.fbref.control import ControlStore  # noqa: E402
+    if str(script_file) == "<stdin>":
+        return None
+    return Path(str(script_file)).resolve().parents[2]
+
+
+REPO_ROOT = _repo_root_for_execution(__file__)
+if REPO_ROOT is not None:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scrapers.fbref.control import (  # noqa: E402
+    ControlStore,
+    CurrentSeasonRemediationEvidence,
+)
 from scrapers.fbref.discovery import (  # noqa: E402
     advertised_current_season,
     parse_competition_html,
 )
 from scrapers.fbref.pipeline import (  # noqa: E402
     CURRENT_SEASON_INSTALL_CONTRACT_VERSION,
+    CurrentSeasonRemediationItem,
     FBrefPipeline,
     _competition_from_registry,
     _resolve_current_season_install,
@@ -57,12 +70,46 @@ class CurrentSeasonRemediationPlan:
     advertised_current_label: str
     advertised_current_url: str
     action: str
+    history_attempt_id: str
+    history_run_id: str
     history_content_hash: str
     history_logical_refresh_id: str
-    competition_snapshot_id: Optional[str]
+    history_raw_manifest_key: str
+    index_snapshot_id: str
+    index_run_id: str
+    index_attempt_id: str
+    index_target_id: str
+    index_logical_refresh_id: str
+    index_content_hash: str
+    index_raw_manifest_key: str
     install_contract_version: str
     _history_html: str = field(repr=False)
     _history_record: RawFetchRecord = field(repr=False)
+
+    def remediation_item(self) -> CurrentSeasonRemediationItem:
+        return CurrentSeasonRemediationItem(
+            evidence=CurrentSeasonRemediationEvidence(
+                competition_id=self.competition_id,
+                advertised_label=self.advertised_current_label,
+                advertised_href=self.advertised_current_url,
+                advertised_season_id=self.advertised_current_season_id,
+                index_snapshot_id=self.index_snapshot_id,
+                index_run_id=self.index_run_id,
+                index_attempt_id=self.index_attempt_id,
+                index_target_id=self.index_target_id,
+                index_logical_refresh_id=self.index_logical_refresh_id,
+                index_content_hash=self.index_content_hash,
+                index_raw_manifest_key=self.index_raw_manifest_key,
+                history_run_id=self.history_run_id,
+                history_attempt_id=self.history_attempt_id,
+                history_target_id=self._history_record.target_id,
+                history_logical_refresh_id=self.history_logical_refresh_id,
+                history_content_hash=self.history_content_hash,
+                history_raw_manifest_key=self.history_raw_manifest_key,
+            ),
+            history_html=self._history_html,
+            history_record=self._history_record,
+        )
 
     def evidence(self) -> dict:
         return {
@@ -72,9 +119,18 @@ class CurrentSeasonRemediationPlan:
             "advertised_current_label": self.advertised_current_label,
             "advertised_current_url": self.advertised_current_url,
             "action": self.action,
+            "history_attempt_id": self.history_attempt_id,
+            "history_run_id": self.history_run_id,
             "history_content_hash": self.history_content_hash,
             "history_logical_refresh_id": self.history_logical_refresh_id,
-            "competition_snapshot_id": self.competition_snapshot_id,
+            "history_raw_manifest_key": self.history_raw_manifest_key,
+            "index_snapshot_id": self.index_snapshot_id,
+            "index_run_id": self.index_run_id,
+            "index_attempt_id": self.index_attempt_id,
+            "index_target_id": self.index_target_id,
+            "index_logical_refresh_id": self.index_logical_refresh_id,
+            "index_content_hash": self.index_content_hash,
+            "index_raw_manifest_key": self.index_raw_manifest_key,
             "install_contract_version": self.install_contract_version,
         }
 
@@ -142,6 +198,12 @@ def build_remediation_plans(
     plans = []
     for competition_id in scope:
         row = competitions[competition_id]
+        try:
+            index = control.get_current_season_index_evidence(competition_id)
+        except Exception as exc:
+            raise RemediationEvidenceError(
+                f"competition {competition_id} index evidence is invalid"
+            ) from exc
         competition = _competition_from_registry(row)
         advertised = advertised_current_season(competition)
         if advertised is None:
@@ -153,6 +215,35 @@ def build_remediation_plans(
             str(row["canonical_url"]),
         )
         raw, record = raw_store.load_latest_response(target)
+        history_manifest_key = raw_store.fetch_manifest_key(record.logical_refresh_id)
+        try:
+            history_attempt = control.get_succeeded_fetch_evidence(
+                record.logical_refresh_id,
+                target_id=record.target_id,
+                content_hash=record.content_hash,
+                raw_manifest_key=history_manifest_key,
+            )
+        except Exception as exc:
+            raise RemediationEvidenceError(
+                f"competition {competition_id} history evidence is invalid"
+            ) from exc
+        expected_history = {
+            "logical_refresh_id": record.logical_refresh_id,
+            "target_id": record.target_id,
+            "content_hash": record.content_hash,
+            "raw_manifest_key": history_manifest_key,
+        }
+        if (
+            any(
+                str(history_attempt.get(key) or "") != expected
+                for key, expected in expected_history.items()
+            )
+            or not history_attempt.get("attempt_id")
+            or not history_attempt.get("run_id")
+        ):
+            raise RemediationEvidenceError(
+                f"competition {competition_id} history evidence is not exact"
+            )
         try:
             history_html = raw.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -185,83 +276,40 @@ def build_remediation_plans(
             raise RemediationEvidenceError(
                 f"competition {competition_id} current season was not installed"
             )
-        plans.append(
-            CurrentSeasonRemediationPlan(
-                competition_id=competition_id,
-                installed_current_season_id=installed_id,
-                advertised_current_season_id=current_season_id,
-                advertised_current_label=advertised.label,
-                advertised_current_url=advertised.season_url,
-                action=(
-                    "no_change" if installed_id == current_season_id else "reconcile"
-                ),
-                history_content_hash=record.content_hash,
-                history_logical_refresh_id=record.logical_refresh_id,
-                competition_snapshot_id=(
-                    None
-                    if row.get("last_snapshot_id") is None
-                    else str(row["last_snapshot_id"])
-                ),
-                install_contract_version=CURRENT_SEASON_INSTALL_CONTRACT_VERSION,
-                _history_html=history_html,
-                _history_record=record,
+        index_raw = dict(index["raw"])
+        plan = CurrentSeasonRemediationPlan(
+            competition_id=competition_id,
+            installed_current_season_id=installed_id,
+            advertised_current_season_id=current_season_id,
+            advertised_current_label=advertised.label,
+            advertised_current_url=advertised.season_url,
+            action=("no_change" if installed_id == current_season_id else "reconcile"),
+            history_attempt_id=str(history_attempt["attempt_id"]),
+            history_run_id=str(history_attempt["run_id"]),
+            history_content_hash=record.content_hash,
+            history_logical_refresh_id=record.logical_refresh_id,
+            history_raw_manifest_key=history_manifest_key,
+            index_snapshot_id=str(index["snapshot_id"]),
+            index_run_id=str(index["run_id"]),
+            index_attempt_id=str(index_raw["attempt_id"]),
+            index_target_id=str(index_raw["target_id"]),
+            index_logical_refresh_id=str(index_raw["logical_refresh_id"]),
+            index_content_hash=str(index["content_hash"]),
+            index_raw_manifest_key=str(index_raw["manifest_key"]),
+            install_contract_version=CURRENT_SEASON_INSTALL_CONTRACT_VERSION,
+            _history_html=history_html,
+            _history_record=record,
+        )
+        try:
+            FBrefPipeline(control, raw_store).validate_current_season_remediation_item(
+                plan.remediation_item()
             )
-        )
+        except Exception as exc:
+            raise RemediationEvidenceError(
+                f"competition {competition_id} immutable raw evidence is invalid"
+            ) from exc
+        plans.append(plan)
     return plans
-
-
-def _verify_source_run_lineage(
-    control,
-    plan: CurrentSeasonRemediationPlan,
-    source_run_id: str,
-) -> None:
-    attempts = control.list_fetch_attempts_for_refresh(
-        source_run_id,
-        plan.history_logical_refresh_id,
-    )
-    matching = [
-        row
-        for row in attempts
-        if str(row.get("status")) == "succeeded"
-        and str(row.get("target_id")) == plan._history_record.target_id
-        and str(row.get("content_hash")) == plan.history_content_hash
-        and row.get("raw_manifest_key")
-    ]
-    if len(matching) != 1:
-        raise RemediationEvidenceError(
-            f"competition {plan.competition_id} source-run raw lineage is not singular"
-        )
-
-
-def _install_one(
-    control,
-    raw_store: RawPageStore,
-    plan: CurrentSeasonRemediationPlan,
-    source_run_id: str,
-) -> None:
-    FBrefPipeline(control, raw_store)._parse_competition(
-        source_run_id,
-        plan._history_html,
-        plan._history_record,
-        run_type="current",
-    )
-    installed = _current_seasons(control).get(plan.competition_id)
-    if installed is None or str(installed["season_id"]) != (
-        plan.advertised_current_season_id
-    ):
-        raise RemediationEvidenceError(
-            f"competition {plan.competition_id} post-apply current mismatch"
-        )
-
-
-def _apply_one(
-    control,
-    raw_store: RawPageStore,
-    plan: CurrentSeasonRemediationPlan,
-    source_run_id: str,
-) -> None:
-    _verify_source_run_lineage(control, plan, source_run_id)
-    _install_one(control, raw_store, plan, source_run_id)
 
 
 def run_remediation(
@@ -271,9 +319,7 @@ def run_remediation(
     competition_ids: Sequence[object],
     apply: bool,
     source_run_id: Optional[str] = None,
-    apply_one: Optional[
-        Callable[[object, RawPageStore, CurrentSeasonRemediationPlan, str], None]
-    ] = None,
+    pipeline_factory=FBrefPipeline,
 ) -> dict:
     scope = _normalized_scope(competition_ids)
     if apply and not str(source_run_id or "").strip():
@@ -285,17 +331,20 @@ def run_remediation(
     )
     if apply:
         reconcile_plans = [plan for plan in plans if plan.action == "reconcile"]
-        if apply_one is None:
-            # Prove the complete requested batch before the first registry
-            # write, so a later source-run mismatch cannot leave a partial
-            # remediation behind.
-            for plan in reconcile_plans:
-                _verify_source_run_lineage(control, plan, str(source_run_id))
-            for plan in reconcile_plans:
-                _install_one(control, raw_store, plan, str(source_run_id))
-        else:
-            for plan in reconcile_plans:
-                apply_one(control, raw_store, plan, str(source_run_id))
+        mismatched_runs = [
+            plan.competition_id
+            for plan in reconcile_plans
+            if plan.history_run_id != str(source_run_id)
+        ]
+        if mismatched_runs:
+            raise RemediationEvidenceError(
+                "source_run_id does not own exact history evidence: "
+                + ",".join(mismatched_runs)
+            )
+        if reconcile_plans:
+            pipeline_factory(control, raw_store).remediate_current_seasons(
+                [plan.remediation_item() for plan in reconcile_plans]
+            )
     return {
         "schema_version": "fbref-current-season-remediation-v1",
         "mode": "apply" if apply else "dry_run",

@@ -29,19 +29,36 @@ fix. A genuinely current oversized page such as competition 569 season
 not reinterpret generic or typed raw observations and therefore must not
 schedule a global typed replay. Registry snapshot UUIDs additionally include
 `CURRENT_SEASON_INSTALL_CONTRACT_VERSION =
-fbref-current-season-install-source-link-v1`. This gives the same immutable raw
-and install contract a retry-stable identity, while a changed install contract
-gets a distinct registry snapshot identity.
+fbref-current-season-install-source-link-v1`.
+
+A competition-history install snapshot is the deterministic composition of
+two immutable inputs:
+
+1. history raw attempt, logical refresh, target, content hash and manifest;
+2. successful competition-index snapshot/run plus its exact raw attempt,
+   logical refresh, target, content hash and manifest;
+3. the index-advertised label, href and source season ID;
+4. the explicit install-contract version.
+
+The same history raw plus a changed index snapshot therefore gets a distinct
+snapshot identity. Snapshot, season and frontier-provenance metadata all carry
+the same two-source dependency. Competition-history discovery relations include
+that install snapshot ID, so an unchanged history child can retain immutable
+provenance for both index editions without colliding. Reapplying an earlier
+authoritative index edition reuses its original deterministic snapshot and
+edge identities and reconciles away a season synthesized only by the later
+edition.
 
 The installed current season is derived only from:
 
 1. the saved competition-index `maxseason` label and exact href;
 2. the latest committed competition-history raw;
-3. an exact source season ID match, then a display-label match.
+3. the source season ID derived from the exact href.
 
-If the index advertises a label but neither its href nor a matching history
-entry exists, reconciliation fails closed. It never selects the first history
-row in that case.
+If exactly one of label or href is present, reconciliation fails closed. The
+legacy first-history-row fallback is allowed only when both signals are absent.
+When both are present, the exact advertised source edition is selected or
+synthesized; an old first history row is never substituted.
 
 ## Pre-deploy read-only audit
 
@@ -51,7 +68,9 @@ Run in the production control database in a read-only transaction:
 BEGIN READ ONLY;
 WITH active AS (
   SELECT c.competition_id, c.name,
-         c.metadata ->> 'last_season' AS advertised_season,
+         c.metadata ->> 'last_season' AS advertised_label,
+         c.metadata ->> 'advertised_current_season_id'
+           AS advertised_source_id,
          c.metadata ->> 'last_season_url' AS advertised_url,
          s.season_id, s.label
   FROM fbref_control.competition_registry c
@@ -66,16 +85,22 @@ WITH active AS (
     AND s.is_current
 )
 SELECT count(*) AS active_male_competitions,
-       count(*) FILTER (WHERE season_id = advertised_season)
+       count(*) FILTER (WHERE season_id = advertised_source_id)
          AS advertised_source_id_matches,
-       count(*) FILTER (WHERE season_id <> advertised_season)
+       count(*) FILTER (WHERE label = advertised_label)
+         AS advertised_label_matches,
+       count(*) FILTER (
+         WHERE season_id IS DISTINCT FROM advertised_source_id
+       )
          AS false_current_competitions
 FROM active;
 COMMIT;
 ```
 
-Before deployment, `advertised_url` is expected to be null because the old
-parser discarded it. The immutable index raw remains the source of truth.
+Before the new competition-index parse, `advertised_url` and
+`advertised_source_id` may be null because the old parser discarded the href.
+The immutable index raw remains the source of truth; do not infer either field
+from the calendar year.
 
 ## Normal repair path
 
@@ -93,14 +118,39 @@ and historical; only `is_current` and downstream frontier scope change.
 
 ## Guarded remediation when a fresh parse is not immediate
 
-The remediation script reads only committed raw and is dry-run by default:
+The remediation script is a reviewed source-only operator adapter. It is not a
+deployable runtime file: never copy or install it below `/opt/airflow/scripts`.
+The supported mutation remains `FBrefPipeline.remediate_current_seasons` in the
+deployed `scrapers` package. Stream the exact reviewed adapter from the host to
+the container's stdin, without creating a container file.
+
+Set the reviewed checkout and attest the exact source before every invocation:
 
 ```bash
-python scripts/research/remediate_fbref_current_seasons.py \
+export REVIEWED_CHECKOUT=/absolute/path/to/reviewed/checkout
+remediation_source="$REVIEWED_CHECKOUT/scripts/research/remediate_fbref_current_seasons.py"
+expected_sha256=66ae7c6295a3b4eab9755607d368826e0131e14e8f94f2486d815ccf3c5c7fdb
+actual_sha256="$(sha256sum -- "$remediation_source" | awk '{print $1}')"
+test "$actual_sha256" = "$expected_sha256"
+
+# Import/argument harness: proves python-stdin mode from the runtime workdir.
+docker exec -i -w /opt/airflow airflow-scheduler \
+  /opt/legacy-scraper-venv/bin/python - --help \
+  < "$remediation_source"
+```
+
+The finalizer must exact-ignore only this SHA-attested source-only script; all
+deployed files remain subject to its normal audit. The script reads only
+committed raw and is dry-run by default:
+
+```bash
+docker exec -i -w /opt/airflow airflow-scheduler \
+  /opt/legacy-scraper-venv/bin/python - \
   --competition-id 2 --competition-id 3 --competition-id 4 \
   --competition-id 5 --competition-id 6 --competition-id 7 \
   --competition-id 657 --competition-id 664 \
-  --competition-id 665 --competition-id 678
+  --competition-id 665 --competition-id 678 \
+  < "$remediation_source"
 ```
 
 It refuses a competition unless all of the following hold:
@@ -108,18 +158,23 @@ It refuses a competition unless all of the following hold:
 - the ID was explicitly listed (maximum 25, no duplicates);
 - the competition is active, present, eligible and male;
 - registry metadata already contains both maxseason label and href;
+- the registry points to a successful competition-index snapshot whose exact
+  content hash/raw attempt/logical refresh/target/manifest are available;
 - the latest competition-history raw is committed and parses successfully;
+- the exact successful history attempt and raw manifest match that raw;
 - the resolved current source ID equals the advertised source ID;
 - current-season cardinality is singular.
 
-Save the dry-run JSON. `history_logical_refresh_id` and
-`history_content_hash` are the immutable proof for every proposal.
+Save the dry-run JSON. It reports both complete inputs: all `history_*` fields
+including `history_raw_manifest_key`, and all `index_*` fields including the
+successful snapshot/run/content/raw identity.
 
 Apply invocations must be grouped by the control run that owns those exact
 history observations. Find it read-only from `fetch_attempt`, then pass it:
 
 ```sql
-SELECT run_id, logical_refresh_id, target_id, content_hash, raw_manifest_key
+SELECT attempt_id, run_id, logical_refresh_id, target_id,
+       content_hash, raw_manifest_key
 FROM fbref_control.fetch_attempt
 WHERE logical_refresh_id IN ('<dry-run logical refresh IDs>')
   AND status = 'succeeded'
@@ -129,15 +184,22 @@ ORDER BY run_id, target_id;
 For each distinct `run_id`, invoke only its competition IDs:
 
 ```bash
-python scripts/research/remediate_fbref_current_seasons.py \
+actual_sha256="$(sha256sum -- "$remediation_source" | awk '{print $1}')"
+test "$actual_sha256" = "$expected_sha256"
+docker exec -i -w /opt/airflow airflow-scheduler \
+  /opt/legacy-scraper-venv/bin/python - \
   --competition-id 6 --competition-id 678 \
-  --apply --source-run-id '<owning control run UUID>'
+  --apply --source-run-id '<owning control run UUID>' \
+  < "$remediation_source"
 ```
 
-Before any write, apply mode verifies exactly one successful attempt in that
-run has the target ID, logical refresh ID, content hash, and raw manifest key
-reported by dry-run. It then calls the same competition parse/reconcile path
-as a normal wave. A mismatch aborts without using another raw observation.
+Apply mode enters one supported bounded remediation operation. It holds the
+FBref no-writer/publication fence for the entire batch, refuses an active
+writer, row-locks and revalidates the exact index snapshot/raw and latest
+history frontier/attempt under that fence, then reloads both immutable raw
+objects. All snapshot, season, alias and frontier changes use one PostgreSQL
+transaction. Any evidence mismatch or failure in any competition rolls the
+whole batch back; it never switches to a different raw observation.
 
 ## Post-reconcile acceptance
 
@@ -148,13 +210,18 @@ and require the current source ID to match the index-advertised season:
 BEGIN READ ONLY;
 WITH active AS (
   SELECT c.competition_id,
-         c.metadata ->> 'last_season' AS advertised_season,
+         c.metadata ->> 'last_season' AS advertised_label,
+         c.metadata ->> 'advertised_current_season_id'
+           AS advertised_source_id,
          count(*) FILTER (
            WHERE s.present AND s.lifecycle_state = 'present' AND s.is_current
          ) AS current_count,
          max(s.season_id) FILTER (
            WHERE s.present AND s.lifecycle_state = 'present' AND s.is_current
-         ) AS current_season_id
+         ) AS current_season_id,
+         max(s.label) FILTER (
+           WHERE s.present AND s.lifecycle_state = 'present' AND s.is_current
+         ) AS current_label
   FROM fbref_control.competition_registry c
   LEFT JOIN fbref_control.season_registry s
     USING (source, competition_id)
@@ -163,22 +230,70 @@ WITH active AS (
     AND c.crawl_state = 'active'
     AND c.lifecycle_state IN ('present', 'missing_once')
     AND c.present
-  GROUP BY c.competition_id, c.metadata ->> 'last_season'
+  GROUP BY c.competition_id,
+           c.metadata ->> 'last_season',
+           c.metadata ->> 'advertised_current_season_id'
 )
 SELECT count(*) AS active_competitions,
        count(*) FILTER (WHERE current_count = 1) AS exactly_one_current,
        count(*) FILTER (
-         WHERE current_season_id = advertised_season
+         WHERE current_season_id = advertised_source_id
        ) AS advertised_source_id_matches,
        count(*) FILTER (
+         WHERE current_label = advertised_label
+       ) AS advertised_label_matches,
+       count(*) FILTER (
          WHERE current_count <> 1
-            OR current_season_id <> advertised_season
+            OR current_season_id IS DISTINCT FROM advertised_source_id
+            OR current_label IS DISTINCT FROM advertised_label
        ) AS violations
 FROM active;
 COMMIT;
 ```
 
-Expected: `117 / 117 / 117 / 0`.
+Expected: `117 / 117 / 117 / 117 / 0`.
+
+Before any oversized-page requeue or canary, require the two known stale
+playing-time targets to be outside the current proxy/freshness lane. This is a
+fail-closed acceptance gate: it must return `2 / 2 / true`.
+
+```sql
+BEGIN READ ONLY;
+WITH expected(target_id, competition_id, season_id) AS (
+  VALUES
+    ('fbref:season_stats:6:2022:playingtime', '6', '2022'),
+    ('fbref:season_stats:678:2021:playingtime', '678', '2021')
+), observed AS (
+  SELECT e.target_id,
+         NOT s.is_current
+           AND s.present
+           AND s.lifecycle_state = 'present'
+           AND f.refresh_policy = 'daily'
+           AND f.state = 'quarantined'
+           AND f.next_fetch_at IS NULL
+           AND f.last_error_class = 'ScopeQuarantined'
+           AND f.last_error_message = 'noncurrent_season' AS accepted
+  FROM expected e
+  JOIN fbref_control.season_registry s
+    ON s.source = 'fbref'
+   AND s.competition_id = e.competition_id
+   AND s.season_id = e.season_id
+  JOIN fbref_control.page_frontier f
+    ON f.source = 'fbref'
+   AND f.target_id = e.target_id
+)
+SELECT (SELECT count(*) FROM expected) AS expected_targets,
+       count(*) AS observed_targets,
+       coalesce(bool_and(accepted), false) AS scope_remediation_accepted
+FROM observed;
+COMMIT;
+```
+
+The operational order is mandatory: complete this current-season remediation
+and both acceptance gates first; only then run the independent oversized-page
+source-four verification and requeue/canary its genuine-current competition
+569 pair. The competition 6/2022 and 678/2021 targets above must not enter that
+requeue cohort.
 
 Also verify:
 
