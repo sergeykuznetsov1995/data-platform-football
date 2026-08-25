@@ -21,6 +21,12 @@ SCRIPT = (
     / "research"
     / "remediate_fbref_current_seasons.py"
 )
+RUNBOOK = (
+    Path(__file__).parents[3]
+    / "docs"
+    / "operations"
+    / "fbref_current_season_reconcile.md"
+)
 SPEC = importlib.util.spec_from_file_location(
     "_remediate_fbref_current_seasons", SCRIPT
 )
@@ -31,6 +37,24 @@ SPEC.loader.exec_module(remediation)
 
 
 HISTORY_RUN_ID = str(uuid.UUID(int=901))
+
+
+def test_runbook_uses_only_readme_immutable_blob_function_for_apply():
+    runbook = RUNBOOK.read_text()
+
+    assert '< "$remediation_source"' not in runbook
+    assert "remediation_source=" not in runbook
+    assert "docker exec -i" not in runbook
+    assert "/root/fbref-production-20260825/README.md" in runbook
+    assert 'git cat-file blob "$merged_blob"' in runbook
+    assert "same shell" in runbook
+    assert "already executes the exact bounded dry-run" in runbook
+    assert (
+        """run_reviewed_remediation \\
+  --competition-id 6 --competition-id 678 \\
+  --apply --source-run-id '<owning control run UUID>'"""
+        in runbook
+    )
 
 
 def test_script_supports_exact_stdin_execution_from_runtime_workdir():

@@ -121,37 +121,23 @@ and historical; only `is_current` and downstream frontier scope change.
 The remediation script is a reviewed source-only operator adapter. It is not a
 deployable runtime file: never copy or install it below `/opt/airflow/scripts`.
 The supported mutation remains `FBrefPipeline.remediate_current_seasons` in the
-deployed `scrapers` package. Stream the exact reviewed adapter from the host to
-the container's stdin, without creating a container file.
+deployed `scrapers` package.
 
-Set the reviewed checkout and attest the exact source before every invocation:
+Before using this runbook, execute the complete
+`Source-only current-season remediation adapter` immutable-blob block in
+`/root/fbref-production-20260825/README.md`, from its `set -Eeuo pipefail`
+through its bounded dry-run, in the same shell. Do not excerpt, reimplement, or
+rerun only part of that block. It validates the FINAL manifest and clean merged
+checkout, resolves and hashes the exact stage-0 Git object, compiles those
+bytes, and defines `run_reviewed_remediation`. That function streams
+`git cat-file blob "$merged_blob"` directly to the scheduler without creating
+a container file. The README block already executes the exact bounded dry-run;
+save its JSON output and keep that shell open for the apply calls below. There
+is no separate pathname-based `--help`, dry-run, or apply invocation.
 
-```bash
-export REVIEWED_CHECKOUT=/absolute/path/to/reviewed/checkout
-remediation_source="$REVIEWED_CHECKOUT/scripts/research/remediate_fbref_current_seasons.py"
-expected_sha256=66ae7c6295a3b4eab9755607d368826e0131e14e8f94f2486d815ccf3c5c7fdb
-actual_sha256="$(sha256sum -- "$remediation_source" | awk '{print $1}')"
-test "$actual_sha256" = "$expected_sha256"
-
-# Import/argument harness: proves python-stdin mode from the runtime workdir.
-docker exec -i -w /opt/airflow airflow-scheduler \
-  /opt/legacy-scraper-venv/bin/python - --help \
-  < "$remediation_source"
-```
-
-The finalizer must exact-ignore only this SHA-attested source-only script; all
-deployed files remain subject to its normal audit. The script reads only
-committed raw and is dry-run by default:
-
-```bash
-docker exec -i -w /opt/airflow airflow-scheduler \
-  /opt/legacy-scraper-venv/bin/python - \
-  --competition-id 2 --competition-id 3 --competition-id 4 \
-  --competition-id 5 --competition-id 6 --competition-id 7 \
-  --competition-id 657 --competition-id 664 \
-  --competition-id 665 --competition-id 678 \
-  < "$remediation_source"
-```
+The finalizer must exact-ignore only the source-only script recorded in the
+FINAL manifest; all deployed files remain subject to its normal audit. The
+adapter reads only committed raw and is dry-run by default.
 
 It refuses a competition unless all of the following hold:
 
@@ -184,13 +170,9 @@ ORDER BY run_id, target_id;
 For each distinct `run_id`, invoke only its competition IDs:
 
 ```bash
-actual_sha256="$(sha256sum -- "$remediation_source" | awk '{print $1}')"
-test "$actual_sha256" = "$expected_sha256"
-docker exec -i -w /opt/airflow airflow-scheduler \
-  /opt/legacy-scraper-venv/bin/python - \
+run_reviewed_remediation \
   --competition-id 6 --competition-id 678 \
-  --apply --source-run-id '<owning control run UUID>' \
-  < "$remediation_source"
+  --apply --source-run-id '<owning control run UUID>'
 ```
 
 Apply mode enters one supported bounded remediation operation. It holds the
