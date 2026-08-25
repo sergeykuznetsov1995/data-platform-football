@@ -67,7 +67,10 @@ class TestFBrefBootstrapTopology:
         assert live._captured_kwargs["execution_timeout"].total_seconds() == (
             6 * 60 * 60 + 5 * 60
         )
-        assert live.op_kwargs["max_batches"] == 80
+        # Bootstrap is a current-lane runner with the same 25-page waves and
+        # six-hour-five-minute task timeout, so it shares the production-safe
+        # 16-wave cap rather than reviving the stale 80-wave contract.
+        assert live.op_kwargs["max_batches"] == 16
 
     def test_dedicated_pool_is_created_idempotently(self):
         compose = (
