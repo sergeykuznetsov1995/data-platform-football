@@ -347,6 +347,11 @@ def test_season_stats_streaming_aborts_above_four_mib(monkeypatch):
     )
     response = _response(
         body=b"unused",
+        headers={
+            "content-type": "text/html",
+            "Content-Length": "4987654",
+            "Content-Encoding": "gzip",
+        },
         wire_size=4 * 1024 * 1024 + 1,
         stream_chunks=[b"x" * (4 * 1024 * 1024), b"y", b"never-read"],
     )
@@ -360,7 +365,190 @@ def test_season_stats_streaming_aborts_above_four_mib(monkeypatch):
 
     assert caught.value.error_class == "response_too_large"
     assert caught.value.http_requests == 1
+    assert "observed_body_bytes=4194305" in str(caught.value)
+    assert "attempt_body_bytes=4194305" in str(caught.value)
+    assert "content_length=4987654" in str(caught.value)
+    assert "content_encoding=gzip" in str(caught.value)
     assert fetcher._http_session.get.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "content_length",
+    [
+        "9" * 5000,
+        "-1",
+        "+1",
+        " 12",
+        "12 ",
+        "01",
+        "12, 12",
+        "12, 13",
+        "9223372036854775808",
+        "1e3",
+    ],
+)
+def test_invalid_content_length_never_masks_oversize(
+    monkeypatch,
+    content_length,
+):
+    monkeypatch.setattr(
+        "scrapers.fbref.fetcher._response_wire_size",
+        lambda response: response.wire_size,
+    )
+    response = _response(
+        headers={
+            "content-type": "text/html",
+            "content-length": content_length,
+        },
+        wire_size=11,
+        stream_chunks=[b"12345678901"],
+    )
+    fetcher = _fetcher(response, max_bytes=10)
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch("https://fbref.com/x", page_kind="season")
+
+    error = caught.value
+    assert error.error_class == "response_too_large"
+    assert "observed_body_bytes=11" in str(error)
+    assert "attempt_body_bytes=11" in str(error)
+    assert "content_length=" not in str(error)
+    assert error.http_status == 200
+    assert error.http_requests == 1
+    assert error.http_status_history == (200,)
+    assert error.wire_bytes == 11
+
+
+def test_duplicate_case_insensitive_content_length_is_untrusted(monkeypatch):
+    monkeypatch.setattr(
+        "scrapers.fbref.fetcher._response_wire_size",
+        lambda response: response.wire_size,
+    )
+    response = _response(
+        headers={
+            "content-type": "text/html",
+            "Content-Length": "11",
+            "content-length": "12",
+        },
+        wire_size=11,
+        stream_chunks=[b"12345678901"],
+    )
+    fetcher = _fetcher(response, max_bytes=10)
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch("https://fbref.com/x", page_kind="season")
+
+    assert caught.value.error_class == "response_too_large"
+    assert "content_length=" not in str(caught.value)
+
+
+def test_huge_content_length_preserves_meter_settlement(monkeypatch):
+    monkeypatch.setattr(
+        "scrapers.fbref.fetcher._response_wire_size",
+        lambda response: response.wire_size,
+    )
+    response = _response(
+        headers={
+            "content-type": "text/html",
+            "content-length": "9" * 5000,
+        },
+        wire_size=11,
+        stream_chunks=[b"12345678901"],
+    )
+    fetcher = _fetcher(response, max_bytes=10)
+    fetcher._lease_client = MagicMock()
+    fetcher.persistent_http_session = False
+    fetcher._provider_http_ready = True
+    fetcher._provider_total_bytes = 100
+
+    def settle():
+        fetcher._provider_total_bytes = 223
+
+    fetcher._finish_metered_fetch = MagicMock(side_effect=settle)
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch("https://fbref.com/x", page_kind="season")
+
+    error = caught.value
+    assert error.error_class == "response_too_large"
+    assert error.provider_billed_bytes == 123
+    assert error.http_requests == 1
+    assert error.wire_bytes == 11
+    fetcher._finish_metered_fetch.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "content_encoding",
+    [
+        "gzip\r\nX-Evil: yes",
+        "gzip\x00br",
+        "gzip=spoof",
+        "gzip,,br",
+        "gzip, gzip",
+        "gzip," + "a" * 5000,
+    ],
+)
+def test_invalid_content_encoding_is_omitted_without_masking_oversize(
+    monkeypatch,
+    content_encoding,
+):
+    monkeypatch.setattr(
+        "scrapers.fbref.fetcher._response_wire_size",
+        lambda response: response.wire_size,
+    )
+    response = _response(
+        headers={
+            "content-type": "text/html",
+            "content-encoding": content_encoding,
+        },
+        wire_size=11,
+        stream_chunks=[b"12345678901"],
+    )
+    fetcher = _fetcher(response, max_bytes=10)
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch("https://fbref.com/x", page_kind="season")
+
+    assert caught.value.error_class == "response_too_large"
+    assert "content_encoding=" not in str(caught.value)
+    assert "X-Evil" not in str(caught.value)
+    assert caught.value.http_requests == 1
+    assert caught.value.wire_bytes == 11
+
+
+@pytest.mark.parametrize(
+    ("declared", "normalized"),
+    [
+        ("gzip", "gzip"),
+        ("GZip , BR", "gzip,br"),
+        ("gzip, br", "gzip,br"),
+        ("zstd, identity", "zstd,identity"),
+    ],
+)
+def test_valid_content_encoding_is_normalized_as_rfc_token_list(
+    monkeypatch,
+    declared,
+    normalized,
+):
+    monkeypatch.setattr(
+        "scrapers.fbref.fetcher._response_wire_size",
+        lambda response: response.wire_size,
+    )
+    response = _response(
+        headers={
+            "content-type": "text/html",
+            "content-encoding": declared,
+        },
+        wire_size=11,
+        stream_chunks=[b"12345678901"],
+    )
+    fetcher = _fetcher(response, max_bytes=10)
+
+    with pytest.raises(FetchError) as caught:
+        fetcher.fetch("https://fbref.com/x", page_kind="season")
+
+    assert caught.value.error_class == "response_too_large"
+    assert f"content_encoding={normalized}" in str(caught.value)
 
 
 def test_http_200_cloudflare_challenge_poison_is_session_scoped(monkeypatch):
@@ -503,6 +691,10 @@ def test_streaming_ceiling_aborts_on_oversized_chunk_before_buffering_rest(
 
     error = caught.value
     assert error.error_class == "response_too_large"
+    assert "observed_body_bytes=11" in str(error)
+    assert "attempt_body_bytes=11" in str(error)
+    assert "content_length=" not in str(error)
+    assert "content_encoding=" not in str(error)
     assert error.target_requests == 1
     assert error.http_requests == 1
     assert error.http_status_history == (200,)
@@ -528,6 +720,10 @@ def test_streaming_ceiling_is_cumulative_across_status_retry_attempts(
             _response(
                 status=200,
                 body=b"unused",
+                headers={
+                    "content-type": "text/html",
+                    "content-length": "invalid",
+                },
                 wire_size=5,
                 stream_chunks=[b"78901"],
             ),
@@ -540,6 +736,9 @@ def test_streaming_ceiling_is_cumulative_across_status_retry_attempts(
 
     error = caught.value
     assert error.error_class == "response_too_large"
+    assert "observed_body_bytes=11" in str(error)
+    assert "attempt_body_bytes=5" in str(error)
+    assert "content_length=" not in str(error)
     assert error.target_requests == 2
     assert error.http_requests == 2
     assert error.http_status_history == (500, 200)

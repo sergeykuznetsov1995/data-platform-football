@@ -30,7 +30,7 @@ from scrapers.fbref.settings import (
 from scrapers.utils.proxy_manager import classify_error
 
 
-FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v9"
+FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v10"
 DEFAULT_BOOTSTRAP_URL = "https://fbref.com/en/"
 MAX_HTML_BYTES = DEFAULT_HTTP_BODY_LIMIT_BYTES
 MAX_SEASON_STATS_HTML_BYTES = DEFAULT_SEASON_STATS_HTTP_BODY_LIMIT_BYTES
@@ -55,6 +55,16 @@ _FAILURE_EVIDENCE_HEADERS = (
     "via",
     "cf-ray",
     "x-cache",
+)
+_MAX_DECLARED_CONTENT_LENGTH = 2**63 - 1
+_MAX_CONTENT_ENCODING_CHARS = 256
+_MAX_CONTENT_ENCODING_TOKENS = 8
+_MAX_CONTENT_ENCODING_TOKEN_CHARS = 64
+_HTTP_TOKEN_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    "0123456789"
+    "!#$%&'*+-.^_`|~"
 )
 
 # curl_cffi 0.15 exposes this only from its internal ``curl`` module. Returning
@@ -1475,6 +1485,107 @@ class FBrefFetcher:
                 evidence.append(f"{name.replace('-', '_')}={value}")
         return ",".join(evidence)
 
+    @staticmethod
+    def _unique_response_header(response, name: str) -> Optional[str]:
+        """Return one textual header value, rejecting duplicate ambiguity.
+
+        HTTP adapters commonly coalesce repeated fields with commas, while
+        simple mappings can retain differently-cased duplicates.  Callers
+        still validate the coalesced syntax; this helper makes the latter form
+        fail closed too.  No malformed third-party header object may replace a
+        target's original transport verdict.
+        """
+
+        try:
+            headers = getattr(response, "headers", None)
+            if headers is None:
+                return None
+            matches = []
+            for key, value in headers.items():
+                if isinstance(key, str) and key.casefold() == name:
+                    matches.append(value)
+                    if len(matches) > 1:
+                        return None
+        except Exception:  # noqa: BLE001 - evidence must never mask verdict
+            return None
+        if len(matches) != 1 or not isinstance(matches[0], str):
+            return None
+        return matches[0]
+
+    @classmethod
+    def _trusted_content_length(cls, response) -> Optional[int]:
+        """Parse one canonical bounded Content-Length without large ``int``.
+
+        The evidence field is stored alongside PostgreSQL ``bigint`` byte
+        counters, so values beyond signed 64-bit range are deliberately
+        untrusted.  Length and lexical bounds run before integer conversion.
+        """
+
+        value = cls._unique_response_header(response, "content-length")
+        if value is None or not 1 <= len(value) <= 19:
+            return None
+        if value != "0" and value.startswith("0"):
+            return None
+        if any(character < "0" or character > "9" for character in value):
+            return None
+        maximum = str(_MAX_DECLARED_CONTENT_LENGTH)
+        if len(value) == len(maximum) and value > maximum:
+            return None
+        return int(value)
+
+    @classmethod
+    def _trusted_content_encoding(cls, response) -> Optional[str]:
+        """Normalize one bounded RFC token list or reject the whole field."""
+
+        value = cls._unique_response_header(response, "content-encoding")
+        if value is None or not 1 <= len(value) <= _MAX_CONTENT_ENCODING_CHARS:
+            return None
+        if not value.isascii():
+            return None
+        raw_tokens = value.split(",")
+        if not 1 <= len(raw_tokens) <= _MAX_CONTENT_ENCODING_TOKENS:
+            return None
+        tokens = []
+        seen = set()
+        for raw_token in raw_tokens:
+            token = raw_token.strip(" \t")
+            if not 1 <= len(token) <= _MAX_CONTENT_ENCODING_TOKEN_CHARS:
+                return None
+            if any(character not in _HTTP_TOKEN_CHARS for character in token):
+                return None
+            normalized = token.casefold()
+            if normalized in seen:
+                return None
+            seen.add(normalized)
+            tokens.append(normalized)
+        return ",".join(tokens)
+
+    @classmethod
+    def _oversize_response_evidence(
+        cls,
+        response,
+        body_buffer: _CumulativeBodyBuffer,
+    ) -> str:
+        """Render bounded size evidence without reading beyond the hard cap.
+
+        The callback counters are the lower bound for the decoded body.  A
+        Content-Length header may describe the encoded representation when
+        Content-Encoding is present, so it remains separate evidence rather
+        than being treated as a decoded-body size or a replacement ceiling.
+        """
+
+        evidence = [
+            f"observed_body_bytes={max(0, int(body_buffer.total_seen))}",
+            f"attempt_body_bytes={max(0, int(body_buffer.attempt_seen))}",
+        ]
+        content_length = cls._trusted_content_length(response)
+        if content_length is not None:
+            evidence.append(f"content_length={content_length}")
+        content_encoding = cls._trusted_content_encoding(response)
+        if content_encoding is not None:
+            evidence.append(f"content_encoding={content_encoding}")
+        return ",".join(evidence)
+
     def _fetch_without_provider_meter(
         self,
         url: str,
@@ -1552,9 +1663,13 @@ class FBrefFetcher:
                 self._bootstrap_stats = None
                 latency_ms = int((time.perf_counter() - started) * 1000)
                 if body_buffer.exceeded:
+                    size_evidence = self._oversize_response_evidence(
+                        partial_response,
+                        body_buffer,
+                    )
                     raise FetchError(
                         "FBref cumulative response bodies exceeded "
-                        f"{max_html_bytes} bytes for {url}",
+                        f"{max_html_bytes} bytes for {url}; {size_evidence}",
                         error_class="response_too_large",
                         http_status=(
                             partial_status
@@ -1608,9 +1723,13 @@ class FBrefFetcher:
                 )
                 self._bootstrap_stats = None
                 latency_ms = int((time.perf_counter() - started) * 1000)
+                size_evidence = self._oversize_response_evidence(
+                    response,
+                    body_buffer,
+                )
                 raise FetchError(
                     "FBref cumulative response bodies exceeded "
-                    f"{max_html_bytes} bytes for {url}",
+                    f"{max_html_bytes} bytes for {url}; {size_evidence}",
                     error_class="response_too_large",
                     http_status=status,
                     wire_bytes=wire_bytes,
@@ -1721,8 +1840,13 @@ class FBrefFetcher:
                 latency_ms=latency_ms,
             )
         if len(body) > max_html_bytes:
+            size_evidence = self._oversize_response_evidence(
+                response,
+                body_buffer,
+            )
             raise FetchError(
-                f"FBref body exceeded {max_html_bytes} bytes for {url}",
+                f"FBref body exceeded {max_html_bytes} bytes for {url}; "
+                f"{size_evidence}",
                 error_class="response_too_large",
                 http_status=status,
                 wire_bytes=wire_bytes,
