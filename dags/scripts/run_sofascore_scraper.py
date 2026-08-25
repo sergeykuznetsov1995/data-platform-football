@@ -2127,6 +2127,10 @@ def _load_runtime_workload_plan(
     production = airflow_dag_id in {
         "dag_ingest_sofascore",
         "dag_backfill_sofascore_all_mens",
+        # The refresh lane runs the same paid match phase and was missing here,
+        # so a broken plan hand-off would have fallen back to an unplanned
+        # capture instead of failing closed (Sol round 12, finding 3).
+        "dag_refresh_sofascore_all_mens",
     }
     if not path:
         if production:

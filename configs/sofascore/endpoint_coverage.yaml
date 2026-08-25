@@ -17,7 +17,7 @@ coverage_statuses:
   - intentionally-excluded
 
 coverage_summary:
-  normalized: 15
+  normalized: 14
   raw-only: 4
   unsupported: 2
   intentionally-excluded: 8
@@ -157,7 +157,9 @@ tables:
       - season
       - _ingested_at
     partition_columns: [league, season]
-    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_season_capture_engine
+    materialized_by:
+      - dags/scripts/run_sofascore_scraper.py#_run_season_capture_engine
+      - dags/scripts/run_sofascore_schedule_refresh.py#write_schedule_rows
     production_write_status: raw replay/no-op wired; paid live capture fails closed pending verified provider meter
     downstream: [silver.xref_match, silver.sofascore_team_match, silver.sofascore_shots]
 
@@ -616,26 +618,15 @@ endpoints:
     natural_key: [source_season_id, event_id]
     empty_semantics: a schema-valid empty page with hasNextPage=false is legitimate
     dq: [source season match, no skeleton rows, page chain complete, exact raw lineage]
-
-  scheduled_events:
-    # Lane F (#1218): one UTC day of football events (plus the `/inverse`
-    # list) fetched by the all-men refresh DAG through the metered discovery
-    # client; events of ready snapshot tournaments become schedule rows tagged
-    # from the campaign snapshot. Not a manifest/replay endpoint: the raw list
-    # is kept for lineage only, the day list carries no per-tournament claim.
-    path: /sport/football/scheduled-events/{date}
-    target_type: date
-    status: normalized
-    required: false
-    raw_collection: events
-    preserved_arrays: [/events]
-    normalized_cardinality_paths: [/events]
-    required_json_paths: [/events]
-    destination: [bronze.sofascore_schedule]
-    grain: one event
-    natural_key: [source_season_id, event_id]
-    empty_semantics: a schema-valid day without football events is legitimate
-    dq: [snapshot tournament and season match, no skeleton rows, exact raw lineage]
+    # "page chain complete" binds the campaign, which walks the chain both ways.
+    # The refresh lane is a second consumer and reads page 0 ONLY, on purpose:
+    # the visit exists to put the next match in Bronze so the ``due`` window can
+    # open, and the matches beyond the first page are far enough away that the
+    # next visit carries them.  A longer calendar is counted (``truncated``),
+    # never walked, and the byte budget is sized for the one page.
+    consumers:
+      - dags/scripts/run_sofascore_scraper.py#_run_season_capture_engine: full page chain
+      - dags/scripts/run_sofascore_schedule_refresh.py: first page only, rest counted
 
   standings_total:
     path: /unique-tournament/{tournament_id}/season/{season_id}/standings/total

@@ -43,7 +43,7 @@
       "camoufox": "0.4.11",
       "playwright": "1.59.0"
     },
-    "digest": "91f4710d990fa1669dc2b625571d919a5d7e8427006f835ed395fb0547c8f75e",
+    "digest": "fa27eb5198447e4ab4c77643a792c00e4604c8653b53d94917d6fc5c4f0e30d3",
     "files": [
       "configs/medallion/competitions.yaml",
       "configs/proxy_filter/blocklist.txt",
@@ -54,7 +54,7 @@
       "dags/dag_ingest_sofascore.py",
       "dags/dag_refresh_sofascore_all_mens.py",
       "dags/scripts/prepare_sofascore_workload.py",
-      "dags/scripts/run_sofascore_daily_events.py",
+      "dags/scripts/run_sofascore_schedule_refresh.py",
       "dags/scripts/run_sofascore_scope_cycle.py",
       "dags/scripts/run_sofascore_scraper.py",
       "dags/utils/medallion_config.py",
@@ -74,7 +74,6 @@
       "scrapers/sofascore/camoufox_capture.py",
       "scrapers/sofascore/capture_engine.py",
       "scrapers/sofascore/catalog.py",
-      "scrapers/sofascore/daily_events.py",
       "scrapers/sofascore/discovery.py",
       "scrapers/sofascore/lease_client.py",
       "scrapers/sofascore/live_capture.py",
@@ -84,6 +83,7 @@
       "scrapers/sofascore/raw_store.py",
       "scrapers/sofascore/registry.py",
       "scrapers/sofascore/runtime_fingerprint.py",
+      "scrapers/sofascore/schedule_refresh.py",
       "scrapers/sofascore/scraper.py",
       "scrapers/sofascore/season_pipeline.py",
       "scrapers/sofascore/workload_plan.py",

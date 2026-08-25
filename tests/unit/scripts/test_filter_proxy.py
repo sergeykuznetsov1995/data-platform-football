@@ -7429,7 +7429,7 @@ def test_all_mens_refresh_dag_uses_signed_and_discovery_lanes_like_backfill(
     context = _all_mens_metadata_context(run_id="manual__all-men-refresh")
     context.update({
         "dag_id": "dag_refresh_sofascore_all_mens",
-        "task_id": "fetch_daily_events",
+        "task_id": "refresh_season_schedules",
     })
 
     lease = mod._create_lease(

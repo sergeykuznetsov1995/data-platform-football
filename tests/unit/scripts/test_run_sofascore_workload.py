@@ -379,3 +379,28 @@ def test_batch_traffic_merge_sums_source_429_counts():
         ]
     )
     assert merged["http_429"] == 3
+
+
+@pytest.mark.parametrize(
+    "dag_id",
+    [
+        "dag_ingest_sofascore",
+        "dag_backfill_sofascore_all_mens",
+        # Sol r12 #3: the refresh lane runs the very same paid match phase, and
+        # a broken plan hand-off used to fall back to an unplanned capture.
+        "dag_refresh_sofascore_all_mens",
+    ],
+)
+def test_every_production_dag_refuses_to_capture_without_a_plan(dag_id, monkeypatch):
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", dag_id)
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "scheduled-1")
+
+    with pytest.raises(RuntimeError, match="requires --workload-plan"):
+        _load_runtime_workload_plan(
+            None,
+            entity="all",
+            league="ENG-Premier League",
+            season=2025,
+            offline_replay=False,
+        )

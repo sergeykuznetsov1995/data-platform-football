@@ -33,7 +33,7 @@ RUNTIME_FILE_ENTRIES = (
     "dags/scripts/prepare_sofascore_workload.py",
     "dags/scripts/run_sofascore_scraper.py",
     "dags/scripts/run_sofascore_scope_cycle.py",
-    "dags/scripts/run_sofascore_daily_events.py",
+    "dags/scripts/run_sofascore_schedule_refresh.py",
     "dags/utils/medallion_config.py",
     "dags/utils/sofascore_dq.py",
     "dags/utils/sofascore_all_mens_state.py",

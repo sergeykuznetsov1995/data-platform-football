@@ -286,17 +286,31 @@ def validate_coverage_contract(doc: Any) -> None:
             f"tables.{table_name}.downstream",
             allow_empty=True,
         )
+        # One writer or several: ``bronze.sofascore_schedule`` gained a second
+        # one when the refresh lane started writing it directly, and naming
+        # only the older one made the provenance a lie (Sol round 20).
         materialized_by = spec.get("materialized_by")
-        if not isinstance(materialized_by, str) or not materialized_by.strip():
+        materializers = (
+            [materialized_by] if isinstance(materialized_by, str)
+            else materialized_by
+        )
+        if (
+            not isinstance(materializers, list)
+            or not materializers
+            or not all(
+                isinstance(item, str) and item.strip() for item in materializers
+            )
+        ):
             raise SofaScoreContractError(
                 f"tables.{table_name}.materialized_by is required"
             )
-        materializer_path = materialized_by.split("#", 1)[0]
-        if not (_REPO_ROOT / materializer_path).is_file():
-            raise SofaScoreContractError(
-                f"tables.{table_name}.materialized_by path does not exist: "
-                f"{materializer_path}"
-            )
+        for materializer in materializers:
+            materializer_path = materializer.split("#", 1)[0]
+            if not (_REPO_ROOT / materializer_path).is_file():
+                raise SofaScoreContractError(
+                    f"tables.{table_name}.materialized_by path does not exist: "
+                    f"{materializer_path}"
+                )
         write_status = spec.get("production_write_status")
         if not isinstance(write_status, str) or not write_status.strip():
             raise SofaScoreContractError(

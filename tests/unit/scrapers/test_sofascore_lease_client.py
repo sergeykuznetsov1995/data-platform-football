@@ -421,7 +421,7 @@ def test_all_mens_refresh_dag_gets_both_discovery_and_signed_lanes():
         max_bytes=4096,
         ttl_seconds=3600,
         run_id="manual__all-men-refresh",
-        task_id="fetch_daily_events",
+        task_id="refresh_season_schedules",
     )
     request = session.calls[0][2]["json"]
     assert request["dag_id"] == "dag_refresh_sofascore_all_mens"

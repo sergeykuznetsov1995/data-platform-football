@@ -83,7 +83,7 @@ jobs:
             dags/scripts/prepare_sofascore_workload.py \
             dags/scripts/run_sofascore_discovery.py \
             dags/scripts/run_sofascore_scope_cycle.py \
-            dags/scripts/run_sofascore_daily_events.py \
+            dags/scripts/run_sofascore_schedule_refresh.py \
             dags/utils/sofascore_all_mens_state.py \
             dags/utils/maintenance_tasks.py \
             dags/utils/sofascore_dq.py \
@@ -127,7 +127,7 @@ jobs:
             tests/unit/scrapers/test_run_sofascore_discovery.py \
             tests/unit/scrapers/test_run_sofascore_scraper.py \
             tests/unit/scrapers/test_sofascore_all_mens_campaign.py \
-            tests/unit/scrapers/test_sofascore_daily_events.py \
+            tests/unit/scrapers/test_sofascore_schedule_refresh.py \
             tests/unit/scrapers/test_sofascore_rate_control.py \
             tests/unit/scrapers/test_sofascore_writer_lock.py \
             tests/unit/scrapers/test_sofascore_camoufox_capture.py \
@@ -158,7 +158,7 @@ jobs:
             tests/unit/scripts/test_migrate_sofascore_production.py \
             tests/unit/scripts/test_prepare_sofascore_workload.py \
             tests/unit/scripts/test_purge_sofascore_manifest_observations.py \
-            tests/unit/scripts/test_run_sofascore_daily_events.py \
+            tests/unit/scripts/test_run_sofascore_schedule_refresh.py \
             tests/unit/scripts/test_run_sofascore_scope_cycle.py \
             tests/unit/scripts/test_run_sofascore_workload.py \
             tests/unit/scripts/test_sofascore_capture_manifest_guard_v1.py \

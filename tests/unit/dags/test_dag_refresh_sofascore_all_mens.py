@@ -14,6 +14,13 @@ REFRESH_KNOBS = (
     "SOFASCORE_REFRESH_POOL",
     "SOFASCORE_REFRESH_MAX_ACTIVE_TASKS",
     "SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES",
+    "SOFASCORE_REFRESH_PER_LEASE_MAX_BYTES",
+    "SOFASCORE_REFRESH_MAX_DUE",
+    "SOFASCORE_REFRESH_MAX_STALE",
+    "SOFASCORE_REFRESH_CHASE_PAGES",
+    "SOFASCORE_REFRESH_MAX_SEED",
+    "SOFASCORE_REFRESH_SEED_PAGES",
+    "SOFASCORE_REFRESH_WINDOW_HOURS",
     "SOFASCORE_REFRESH_RESULT_DIR",
     "SOFASCORE_REFRESH_PROXY_CONTROL_URL",
 )
@@ -57,31 +64,71 @@ def test_refresh_dag_runs_three_times_a_day_with_one_bounded_batch(
     assert dag.schedule == "30 0,8,15 * * *"
     assert dag._dag_kwargs["max_active_runs"] == 1
     assert dag._dag_kwargs["catchup"] is False
-    assert dag._dag_kwargs["dagrun_timeout"] == timedelta(hours=5)
+    assert dag._dag_kwargs["dagrun_timeout"] == timedelta(hours=7)
     assert dag._dag_kwargs["is_paused_upon_creation"] is True
     assert dag._dag_kwargs["default_args"] is module.DEFAULT_ARGS
     assert set(operators) == {
-        "fetch_daily_events",
+        "refresh_season_schedules",
         "plan_refresh_batch",
         "run_refresh_scope",
         "validate_refresh_scope",
         "propagate_refresh_status",
     }
 
-    fetch = operators["fetch_daily_events"]
-    assert "run_sofascore_daily_events.py" in fetch.bash_command
+    fetch = operators["refresh_season_schedules"]
+    assert "run_sofascore_schedule_refresh.py" in fetch.bash_command
     assert '--budget-cap-bytes "${SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES}"' in (
         fetch.bash_command
     )
     assert '--dag-id "${AIRFLOW_CTX_DAG_ID}"' in fetch.bash_command
     assert '--run-id "${AIRFLOW_CTX_DAG_RUN_ID}"' in fetch.bash_command
-    assert fetch.env["SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES"] == str(16 * 1024 * 1024)
+    for flag in (
+        '--max-due "${SOFASCORE_REFRESH_MAX_DUE}"',
+        '--max-stale "${SOFASCORE_REFRESH_MAX_STALE}"',
+        '--chase-pages "${SOFASCORE_REFRESH_CHASE_PAGES}"',
+        '--max-seed "${SOFASCORE_REFRESH_MAX_SEED}"',
+        '--seed-pages "${SOFASCORE_REFRESH_SEED_PAGES}"',
+        '--window-hours "${SOFASCORE_REFRESH_WINDOW_HOURS}"',
+        '--per-lease-max-bytes "${SOFASCORE_REFRESH_PER_LEASE_MAX_BYTES}"',
+        "schedule-sweep-cursor.json",
+        "schedule-sweep-incomplete.json",
+    ):
+        assert flag in fetch.bash_command
+    # 150 * 3 + 200 * (3 + 1) + 40 * (12 + 3 + 2) = 1930 pages at ~20-27 KB
+    # plus the per-lease warm-ups has to fit the cap, or the worst plan dies on
+    # bytes; the fixture page of every stale and seeded season and the step-back
+    # allowance of a resumed chain count too (Sol round 6, finding 5).
+    assert fetch.env["SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES"] == str(64 * 1024 * 1024)
+    # The preflight counts one warm-up per lease, so the ceiling has to reach it.
+    assert fetch.env["SOFASCORE_REFRESH_PER_LEASE_MAX_BYTES"] == str(8 * 1024 * 1024)
+    assert fetch.env["SOFASCORE_REFRESH_MAX_DUE"] == "150"
+    assert fetch.env["SOFASCORE_REFRESH_MAX_STALE"] == "200"
+    assert fetch.env["SOFASCORE_REFRESH_CHASE_PAGES"] == "3"
+    assert fetch.env["SOFASCORE_REFRESH_MAX_SEED"] == "40"
+    assert fetch.env["SOFASCORE_REFRESH_SEED_PAGES"] == "12"
+    assert fetch.env["SOFASCORE_REFRESH_WINDOW_HOURS"] == "36"
     assert fetch.env["SOFASCORE_CAMPAIGN_SNAPSHOT"] == module.SNAPSHOT_PATH
     assert fetch.env["SOFASCORE_REFRESH_RESULT_DIR"] == (
         "/opt/airflow/runtime/sofascore/all-men/refresh-results"
     )
     assert fetch.append_env is True
     assert fetch._init_kwargs["pool"] == "ingest_scraper_pool"
+    # Sol r12 #2: a second attempt shares the DagRun's paid budget with the
+    # first while the preflight sizes the full plan again — lesson #7.  The
+    # sweep saves its state class by class, so the next scheduled run resumes
+    # it instead.
+    assert fetch._init_kwargs["retries"] == 0
+    assert fetch._init_kwargs["execution_timeout"] == timedelta(minutes=150)
+    # And the batch is sized for BOTH attempts a scope may take, so the DagRun
+    # window holds the worst case instead of only the happy path.
+    assert module.REFRESH_SCOPE_ATTEMPTS == 2
+    assert (
+        module.REFRESH_FETCH_TIMEOUT
+        + module.REFRESH_BATCH_FITS
+        * module.REFRESH_SCOPE_TIMEOUT
+        * module.REFRESH_SCOPE_ATTEMPTS
+        <= module.REFRESH_DAGRUN_TIMEOUT
+    )
 
     run = operators["run_refresh_scope"]
     assert run.is_mapped
@@ -123,7 +170,7 @@ def test_refresh_dag_has_one_all_done_leaf(clean_env, monkeypatch):
     propagate = operators["propagate_refresh_status"]
     assert propagate._init_kwargs["trigger_rule"] == "all_done"
     assert operators["plan_refresh_batch"].upstream_task_ids == {
-        "fetch_daily_events"
+        "refresh_season_schedules"
     }
     assert operators["run_refresh_scope"].upstream_task_ids == {
         "plan_refresh_batch"
@@ -140,6 +187,9 @@ def test_refresh_lane_knobs_come_from_env(clean_env, monkeypatch):
     monkeypatch.setenv("SOFASCORE_REFRESH_POOL", "sofascore_refresh_pool")
     monkeypatch.setenv("SOFASCORE_REFRESH_MAX_ACTIVE_TASKS", "2")
     monkeypatch.setenv("SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES", "4194304")
+    monkeypatch.setenv("SOFASCORE_REFRESH_PER_LEASE_MAX_BYTES", "2097152")
+    monkeypatch.setenv("SOFASCORE_REFRESH_MAX_DUE", "120")
+    monkeypatch.setenv("SOFASCORE_REFRESH_MAX_SEED", "20")
     monkeypatch.setenv("SOFASCORE_REFRESH_RESULT_DIR", "/tmp/refresh")
     monkeypatch.setenv(
         "SOFASCORE_REFRESH_PROXY_CONTROL_URL", "http://sofascore-gw-refresh:8080"
@@ -148,9 +198,14 @@ def test_refresh_lane_knobs_come_from_env(clean_env, monkeypatch):
     operators = _operators()
 
     assert module.dag._dag_kwargs["max_active_tasks"] == 2
-    fetch = operators["fetch_daily_events"]
+    fetch = operators["refresh_season_schedules"]
     assert fetch._init_kwargs["pool"] == "sofascore_refresh_pool"
     assert fetch.env["SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES"] == "4194304"
+    # Sol r10 #5: the lease ceiling is what the preflight counts warm-ups by,
+    # and an override of it used to stop at the DAG.
+    assert fetch.env["SOFASCORE_REFRESH_PER_LEASE_MAX_BYTES"] == "2097152"
+    assert fetch.env["SOFASCORE_REFRESH_MAX_DUE"] == "120"
+    assert fetch.env["SOFASCORE_REFRESH_MAX_SEED"] == "20"
     assert fetch.env["SOFASCORE_REFRESH_RESULT_DIR"] == "/tmp/refresh"
     assert fetch.env["SOFASCORE_PROXY_CONTROL_URL"] == (
         "http://sofascore-gw-refresh:8080"
@@ -159,7 +214,11 @@ def test_refresh_lane_knobs_come_from_env(clean_env, monkeypatch):
     assert run._init_kwargs["pool"] == "sofascore_refresh_pool"
     assert run._init_kwargs["max_active_tis_per_dag"] == 2
     kwargs = _planner_kwargs(module, monkeypatch)
-    assert kwargs["batch_size"] == 3
+    # The env asks for 3, but only ONE scope fits the DagRun window next to the
+    # sweep: the cap is what actually fits, not what was configured, and a
+    # scope is allowed two attempts (Sol r12 #2 — counting one made the
+    # arithmetic decorative).
+    assert kwargs["batch_size"] == 1
     assert kwargs["result_dir"] == "/tmp/refresh"
     assert kwargs["task_env"] == {
         "SOFASCORE_PROXY_CONTROL_URL": "http://sofascore-gw-refresh:8080"
@@ -179,7 +238,7 @@ def test_task_env_survives_airflow_template_rendering(clean_env, monkeypatch):
     native = bool(module.dag._dag_kwargs.get("render_template_as_native_obj"))
     jinja = NativeEnvironment() if native else Environment()
 
-    for name, value in _operators()["fetch_daily_events"].env.items():
+    for name, value in _operators()["refresh_season_schedules"].env.items():
         rendered = jinja.from_string(value).render()
         assert isinstance(rendered, str), (
             f"{name} renders as {type(rendered).__name__}, not str"
@@ -193,6 +252,9 @@ def test_task_env_survives_airflow_template_rendering(clean_env, monkeypatch):
         ("SOFASCORE_REFRESH_BATCH_SIZE", "0"),
         ("SOFASCORE_REFRESH_MAX_ACTIVE_TASKS", "two"),
         ("SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES", "0"),
+        ("SOFASCORE_REFRESH_MAX_DUE", "0"),
+        ("SOFASCORE_REFRESH_MAX_SEED", "0"),
+        ("SOFASCORE_REFRESH_SEED_PAGES", "нет"),
     ],
 )
 def test_invalid_refresh_lane_knob_fails_dag_parse(
@@ -241,7 +303,10 @@ def test_plan_task_feeds_bronze_partitions_and_configured_exclusions(
     assert kwargs["snapshot"] == {"campaign_id": "c"}
     assert kwargs["pending_partitions"] == [("SS-17", "2627", 4)]
     assert kwargs["exclude_tournament_ids"] == frozenset({17, 8})
-    assert kwargs["batch_size"] == 8
+    # Campaign-wide default is 8; the lane runs its batch serially inside a 7 h
+    # DagRun, so it takes only what fits (Sol round 5, finding 8) — and what
+    # fits counts BOTH attempts a scope is allowed (Sol round 12, finding 2).
+    assert kwargs["batch_size"] == 1
     assert kwargs["dag_run_id"] == "manual__1"
     assert kwargs["snapshot_path"] == module.SNAPSHOT_PATH
     assert kwargs["workload_artifact"] == module.WORKLOAD_ARTIFACT
@@ -369,10 +434,10 @@ def test_validate_refresh_scope_rejects_other_campaign_actions(
 @pytest.mark.parametrize(
     ("states", "failed"),
     [
-        ({"fetch_daily_events": "success", "run_refresh_scope": "success"}, []),
+        ({"refresh_season_schedules": "success", "run_refresh_scope": "success"}, []),
         (
-            {"fetch_daily_events": "failed", "plan_refresh_batch": "upstream_failed"},
-            ["fetch_daily_events", "plan_refresh_batch"],
+            {"refresh_season_schedules": "failed", "plan_refresh_batch": "upstream_failed"},
+            ["plan_refresh_batch", "refresh_season_schedules"],
         ),
         ({"run_refresh_scope": "failed", "unrelated_task": "failed"}, ["run_refresh_scope"]),
     ],

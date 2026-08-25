@@ -1,11 +1,14 @@
 """Current-season refresh of every adult-men SofaScore tournament (lane F).
 
-Three times a day the lane asks the source for the football events of
-yesterday and today (metered discovery, ``bronze.sofascore_schedule``), then
-runs the existing matches phase of the scope cycle on the ``SS-*`` partitions
-holding finished games without a complete capture.  The 14 configured leagues
-stay with ``dag_ingest_sofascore``; the frozen campaign state (state.json,
-failures.json) is never touched by this lane.
+Three times a day the lane walks SEASON PAGES of the campaign's tournaments
+(metered discovery, ``bronze.sofascore_schedule``) — the source has no by-date
+event list, which a live probe settled on 2026-08-25 — then runs the existing
+matches phase of the scope cycle on the ``SS-*`` partitions holding finished
+games without a complete capture.  The sweep splits its targets into the
+seasons playing now, the known ones and the never-seeded, each walking its own
+cursor; ``run_sofascore_schedule_refresh.py`` carries the details.  The 14
+configured leagues stay with ``dag_ingest_sofascore``; the frozen campaign
+state (state.json, failures.json) is never touched by this lane.
 """
 
 from __future__ import annotations
@@ -44,8 +47,36 @@ RESULT_DIR = (
 )
 
 # Refresh lane knobs; every one is read at DAG parse and fails closed.
-REFRESH_BATCH_SIZE = state.env_int(
-    "SOFASCORE_REFRESH_BATCH_SIZE", state.DEFAULT_REFRESH_BATCH_SIZE, 1, 64
+# The lane's own timings; the DagRun window has to hold all of them because the
+# batch runs SERIALLY on one pool slot (``max_active_tasks`` is 1).
+REFRESH_DAGRUN_TIMEOUT = timedelta(hours=7)
+REFRESH_FETCH_TIMEOUT = timedelta(minutes=150)
+REFRESH_SCOPE_TIMEOUT = timedelta(hours=2)
+# Whatever the campaign-wide default (8) or an operator's override says, the
+# batch is capped by what actually fits: sweep + batch * scope * attempts <=
+# DagRun.  A batch of 8 would need 18 h in a 7 h window and the run would be
+# killed halfway through, losing the scopes it was in the middle of (Sol round
+# 5, finding 8).  With the sweep at 2.5 h and a scope at 2 h x 2 attempts the
+# honest answer is ONE scope per run — three a day.  The lane's job is the
+# schedule sweep; the bulk of the match phase belongs to the campaign DAG,
+# which has the whole day for it.
+# A scope may be attempted twice (``retries=1`` below, which the workload plan
+# supports on purpose — the retry resumes on the remainder of its allocation),
+# so the window has to hold both attempts.  Counting one attempt per scope made
+# the "fits" arithmetic decorative: 2.5 h + 2 x 2 h looked like 6.5 h of a 7 h
+# window, while a single retried scope already ran to 8.5 h and the DagRun
+# timeout killed the batch mid-scope — the very thing the cap exists to prevent
+# (Sol round 12, finding 2).
+REFRESH_SCOPE_ATTEMPTS = 2
+REFRESH_BATCH_FITS = int(
+    (REFRESH_DAGRUN_TIMEOUT - REFRESH_FETCH_TIMEOUT)
+    / (REFRESH_SCOPE_TIMEOUT * REFRESH_SCOPE_ATTEMPTS)
+)
+REFRESH_BATCH_SIZE = min(
+    state.env_int(
+        "SOFASCORE_REFRESH_BATCH_SIZE", state.DEFAULT_REFRESH_BATCH_SIZE, 1, 64
+    ),
+    REFRESH_BATCH_FITS,
 )
 REFRESH_POOL = (
     os.environ.get("SOFASCORE_REFRESH_POOL", "").strip() or INGEST_SCRAPER_POOL
@@ -53,9 +84,40 @@ REFRESH_POOL = (
 REFRESH_MAX_ACTIVE_TASKS = state.env_int(
     "SOFASCORE_REFRESH_MAX_ACTIVE_TASKS", 1, 1, 16
 )
-# Four daily lists of 1-3 MB each; the gateway meters them per DagRun.
+# One season page is ~20-27 KB on the campaign's own accounting, plus ~75-80 KB
+# per lease for the browser warm-up; the gateway meters them per DagRun.  The
+# knobs below admit 150 * 3 + 200 * (3 + 1) + 40 * (12 + 3 + 2) = 1930 pages
+# ~ 50 MB with warm-ups when every tail visit has to chase, every stale and
+# seeded season takes its fixture page and every resumed chain steps back —
+# ~95 minutes at the gateway's pace, inside both this cap and the fetch timeout.
+# The run computes that worst case itself and refuses to start when an override
+# pushes it over the cap (Sol round 6, finding 5).
 REFRESH_DISCOVERY_BUDGET_BYTES = state.env_int(
-    "SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES", 16 * 1024 * 1024, 1, 1024 ** 3
+    "SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES", 64 * 1024 * 1024, 1, 1024 ** 3
+)
+# Seasons playing in the window get their tail pages on every run — up to this
+# many; beyond the cap the class rotates on its cursor like the others.  That
+# is what keeps the "match finished -> row in Bronze" lag inside the interval.
+REFRESH_MAX_DUE = state.env_int("SOFASCORE_REFRESH_MAX_DUE", 150, 1, 4096)
+# Known seasons outside the window get their tail page a slice at a time: a
+# league playing once a week is outside it most of the time, and nothing else
+# would ever ask for its next round.  Three runs a day take the slice around
+# the ~1.4k campaign seasons in about 2.3 days — that is the lag ceiling for a
+# season that is not playing right now.
+REFRESH_MAX_STALE = state.env_int("SOFASCORE_REFRESH_MAX_STALE", 200, 1, 4096)
+# A tail visit walks back while the page it read is entirely newer than what
+# Bronze has: more than one page of matches can finish between two visits.
+REFRESH_CHASE_PAGES = state.env_int("SOFASCORE_REFRESH_CHASE_PAGES", 3, 1, 32)
+# Seasons Bronze has never seen are seeded a slice at a time, whole page chain.
+REFRESH_MAX_SEED = state.env_int("SOFASCORE_REFRESH_MAX_SEED", 40, 1, 4096)
+REFRESH_SEED_PAGES = state.env_int("SOFASCORE_REFRESH_SEED_PAGES", 12, 1, 64)
+REFRESH_WINDOW_HOURS = state.env_int("SOFASCORE_REFRESH_WINDOW_HOURS", 36, 1, 168)
+# The lease ceiling the gateway hands out.  It is forwarded because the sweep's
+# preflight counts one browser warm-up per lease: a smaller ceiling means more
+# of them, and an estimate that silently assumes 8 MiB would understate the run
+# (Sol round 9, finding 4).
+REFRESH_PER_LEASE_MAX_BYTES = state.env_int(
+    "SOFASCORE_REFRESH_PER_LEASE_MAX_BYTES", 8 * 1024 * 1024, 1, 1024 ** 3
 )
 # Forwarded to every task of the lane only when set: a gateway of its own.
 REFRESH_TASK_ENV: dict[str, str] = {}
@@ -63,7 +125,7 @@ _control_url = os.environ.get("SOFASCORE_REFRESH_PROXY_CONTROL_URL", "").strip()
 if _control_url:
     REFRESH_TASK_ENV["SOFASCORE_PROXY_CONTROL_URL"] = _control_url
 REFRESH_TASK_IDS = frozenset({
-    "fetch_daily_events",
+    "refresh_season_schedules",
     "plan_refresh_batch",
     "run_refresh_scope",
     "validate_refresh_scope",
@@ -181,13 +243,22 @@ FETCH_COMMAND = """
 set -euo pipefail
 cd /opt/airflow
 /opt/legacy-scraper-venv/bin/python \
-  dags/scripts/run_sofascore_daily_events.py \
+  dags/scripts/run_sofascore_schedule_refresh.py \
   --snapshot "${SOFASCORE_CAMPAIGN_SNAPSHOT}" \
   --budget-cap-bytes "${SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES}" \
+  --max-due "${SOFASCORE_REFRESH_MAX_DUE}" \
+  --max-stale "${SOFASCORE_REFRESH_MAX_STALE}" \
+  --chase-pages "${SOFASCORE_REFRESH_CHASE_PAGES}" \
+  --max-seed "${SOFASCORE_REFRESH_MAX_SEED}" \
+  --seed-pages "${SOFASCORE_REFRESH_SEED_PAGES}" \
+  --window-hours "${SOFASCORE_REFRESH_WINDOW_HOURS}" \
+  --per-lease-max-bytes "${SOFASCORE_REFRESH_PER_LEASE_MAX_BYTES}" \
+  --cursor "${SOFASCORE_REFRESH_RESULT_DIR}/schedule-sweep-cursor.json" \
+  --incomplete "${SOFASCORE_REFRESH_RESULT_DIR}/schedule-sweep-incomplete.json" \
   --dag-id "${AIRFLOW_CTX_DAG_ID}" \
   --run-id "${AIRFLOW_CTX_DAG_RUN_ID}" \
   --task-id "${AIRFLOW_CTX_TASK_ID}" \
-  --output "${SOFASCORE_REFRESH_RESULT_DIR}/daily-events-{{ ts_nodash }}.json"
+  --output "${SOFASCORE_REFRESH_RESULT_DIR}/schedule-refresh-{{ ts_nodash }}.json"
 """
 
 RUN_SCOPE_COMMAND = """
@@ -221,13 +292,15 @@ with DAG(
     max_active_runs=1,
     max_active_tasks=REFRESH_MAX_ACTIVE_TASKS,
     is_paused_upon_creation=True,
-    dagrun_timeout=timedelta(hours=5),
+    # Runs are 8 h apart: the window has to fit the sweep plus the
+    # serial match batch (one pool slot) without ever overlapping the next.
+    dagrun_timeout=REFRESH_DAGRUN_TIMEOUT,
     # No native rendering: ``env`` is a template field, and a native render turns
     # the numeric budget string back into an int, which Popen refuses to encode.
     tags=["sofascore", "refresh", "all-men"],
 ) as dag:
     fetch = BashOperator(
-        task_id="fetch_daily_events",
+        task_id="refresh_season_schedules",
         bash_command=FETCH_COMMAND,
         env={
             **REFRESH_TASK_ENV,
@@ -236,15 +309,34 @@ with DAG(
             "SOFASCORE_REFRESH_DISCOVERY_BUDGET_BYTES": str(
                 REFRESH_DISCOVERY_BUDGET_BYTES
             ),
+            "SOFASCORE_REFRESH_PER_LEASE_MAX_BYTES": str(REFRESH_PER_LEASE_MAX_BYTES),
+            "SOFASCORE_REFRESH_MAX_DUE": str(REFRESH_MAX_DUE),
+            "SOFASCORE_REFRESH_MAX_STALE": str(REFRESH_MAX_STALE),
+            "SOFASCORE_REFRESH_CHASE_PAGES": str(REFRESH_CHASE_PAGES),
+            "SOFASCORE_REFRESH_MAX_SEED": str(REFRESH_MAX_SEED),
+            "SOFASCORE_REFRESH_SEED_PAGES": str(REFRESH_SEED_PAGES),
+            "SOFASCORE_REFRESH_WINDOW_HOURS": str(REFRESH_WINDOW_HOURS),
             "SOFASCORE_REFRESH_RESULT_DIR": RESULT_DIR,
         },
         append_env=True,
         pool=REFRESH_POOL,
         priority_weight=5,
         do_xcom_push=False,
-        retries=1,
-        retry_delay=timedelta(minutes=2),
-        execution_timeout=timedelta(minutes=45),
+        # NO retry, unlike every other task here.  A second attempt keeps the
+        # same DagRun, so it walks up to the same paid plan again while the
+        # gateway hands it only what the first attempt left of the run budget —
+        # the anti-pattern of lesson #7 (#1044: three retries of one task ate
+        # the DagRun budget and killed the wave without a single source hole).
+        # The lane does not need it: every class commits its own cursor and its
+        # own unfinished chains as it finishes, so the next scheduled run picks
+        # up exactly where this one stopped, 8 h later at worst.
+        retries=0,
+        # Worst case is max_due * chase_pages + max_stale * (chase_pages + 1)
+        # + max_seed * (seed_pages + backtrack + overlap + 1) = 450 + 800 + 680 = 1930
+        # requests (the fixture page of every stale and seeded season and the
+        # step-back allowance count too); at the lane's 20/min that is ~95 min,
+        # so the task window clears it with room for the source being slow.
+        execution_timeout=REFRESH_FETCH_TIMEOUT,
     )
     plan = PythonOperator(
         task_id="plan_refresh_batch",
@@ -264,7 +356,7 @@ with DAG(
         # plan and a latched lease is re-claimed after the reaper grace.
         retries=1,
         retry_delay=timedelta(minutes=2),
-        execution_timeout=timedelta(hours=2),
+        execution_timeout=REFRESH_SCOPE_TIMEOUT,
     ).expand(env=plan.output)
     validate = PythonOperator.partial(
         task_id="validate_refresh_scope",
