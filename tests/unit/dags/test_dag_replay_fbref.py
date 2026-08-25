@@ -111,7 +111,7 @@ class TestFBrefReplayTopology:
         assert initialize.op_kwargs["request_limit"] == 0
         assert initialize.op_kwargs["byte_limit_mb"] == 0
         expected_reservation_mb = DEFAULT_REQUEST_RESERVATION_BYTES // MIB
-        assert expected_reservation_mb == 5
+        assert expected_reservation_mb == 9
         assert initialize.op_kwargs["reservation_mb"] == expected_reservation_mb
         for task_id, task in tasks.items():
             if task_id == "drain_replay":

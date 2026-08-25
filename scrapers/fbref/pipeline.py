@@ -18,7 +18,6 @@ import uuid
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlparse
 
@@ -87,6 +86,7 @@ from scrapers.fbref.raw_store import (
     schedule_page_target,
     season_page_target,
 )
+from scrapers.fbref.readiness import validate_fbref_proxy_meter
 from scrapers.fbref.settings import (
     DEFAULT_BROWSER_BYTE_LIMIT_BYTES,
     DEFAULT_BROWSER_REQUESTS_PER_SOLVE,
@@ -102,6 +102,7 @@ from scrapers.fbref.settings import (
     MIB,
     bootstrap_byte_reservation_for,
     bootstrap_reservation_for,
+    strict_binary_flag,
 )
 from scrapers.fbref.typed_bronze import (
     TYPED_BRONZE_PARSER_VERSION,
@@ -176,10 +177,7 @@ _CONTRACT_ISOLATABLE_PAGE_KINDS = frozenset({"squad"})
 _LEGACY_INVALID_MATCHLOG_TARGET_ID = (
     "fbref:matchlog:matchlogs:b201bf4bc9476c3f0cc8"
 )
-_LEGACY_INVALID_MATCHLOG_URL = (
-    "https://fbref.com/en/players//matchlogs/2016-2017/misc/"
-    "Yan-Kaye-Match-Logs"
-)
+_LEGACY_INVALID_MATCHLOG_URL = "https://fbref.com/en/players//matchlogs/2016-2017/misc/Yan-Kaye-Match-Logs"
 _LEGACY_INVALID_MATCHLOG_SOURCE_IDS = {
     "player_id": "matchlogs",
     "matchlog_season_id": "2016-2017",
@@ -499,10 +497,10 @@ def backfill_season_cohort_capacity(
 
     A season root expands into schedules, squads, players, matchlogs, and
     matches.  Its admission contract therefore remains the production-tested
-    conservative 7 MiB aggregate allowance instead of pretending that one
-    season is one 5 MiB HTTP target.  This preserves deterministic 7/14
-    canary/production dry-run cohorts while child pages are still fetched
-    sequentially by the warm runner under the real shared budget.
+    conservative 7 MiB aggregate registry-cohort allowance.  This preserves
+    deterministic 7/14 canary/production dry-run cohorts while every child
+    page is still admitted and settled sequentially under the current 9 MiB
+    per-target reservation and the real shared budget.
     """
 
     available = (
@@ -1262,8 +1260,7 @@ def _require_acceptance_settings(settings: PipelineSettings) -> None:
         or settings.shard_size != ACCEPTANCE_SHARD_SIZE
     ):
         raise ValueError(
-            "acceptance profile must be exactly 100 requests / 50 MiB / "
-            "shard 25"
+            "acceptance profile must be exactly 100 requests / 50 MiB / shard 25"
         )
 
 
@@ -1413,8 +1410,7 @@ def _acceptance_summary_errors(summary: object) -> list[str]:
         )
     if int(summary.get("unprocessed_raw_count") or 0) != 0:
         errors.append(
-            "unprocessed_raw_count="
-            f"{int(summary.get('unprocessed_raw_count') or 0)}"
+            f"unprocessed_raw_count={int(summary.get('unprocessed_raw_count') or 0)}"
         )
     if bool(summary.get("budget_exceeded")):
         errors.append("budget_exceeded=true")
@@ -1447,8 +1443,7 @@ def _acceptance_summary_errors(summary: object) -> list[str]:
             or float(success_rate) != 1.0
         ):
             errors.append(
-                f"warm_http_successes={successes}!={attempts};"
-                f"rate={success_rate!r}"
+                f"warm_http_successes={successes}!={attempts};rate={success_rate!r}"
             )
         if int(traffic.get("unclassified_failures") or 0) != 0:
             errors.append(
@@ -2956,8 +2951,7 @@ class FBrefPipeline:
         if _uses_production_safety_circuit(settings):
             result.failures.append("production_safety_circuit_exhausted")
         logger.warning(
-            "FBref run budget exhausted (%s) — %d target(s) returned "
-            "for the next run",
+            "FBref run budget exhausted (%s) — %d target(s) returned for the next run",
             reason,
             int(already_requeued) + int(returned),
         )
@@ -3393,8 +3387,7 @@ class FBrefPipeline:
                             start_index=lease_index + 1,
                             already_requeued=1,
                             reason=(
-                                "persistent failed page crossed the run "
-                                "safety circuit"
+                                "persistent failed page crossed the run safety circuit"
                             ),
                         )
                         break
@@ -3934,8 +3927,7 @@ class FBrefPipeline:
                 # cohort would be closed as healthy and its metering
                 # reconciled on the way out.
                 result.failures.append(
-                    f"mass_redirect={result.moved_pages_skipped}"
-                    f"/{result.cohort_size}"
+                    f"mass_redirect={result.moved_pages_skipped}/{result.cohort_size}"
                 )
             if _is_mass_match_not_found(result):
                 # One temporarily unpublished match is target-local. A wave
@@ -4055,8 +4047,7 @@ class FBrefPipeline:
 
                     if _is_run_mass_redirect(aggregate.fetch):
                         raise FetchWaveError(
-                            "mass_redirect_run="
-                            f"{aggregate.fetch.moved_pages_skipped}"
+                            f"mass_redirect_run={aggregate.fetch.moved_pages_skipped}"
                         )
                     if _is_run_mass_match_not_found(aggregate.fetch):
                         raise FetchWaveError(
@@ -5637,8 +5628,7 @@ class FBrefPipeline:
                 else:
                     if self._typed_context(record) is None:
                         raise TypedBronzeError(
-                            "Typed page requires source competition_id and "
-                            "season_id"
+                            "Typed page requires source competition_id and season_id"
                         )
                     self._persist_typed(run_id, html, record)
                 typed_promoted = 1
@@ -7006,8 +6996,7 @@ class FBrefPipeline:
             errors.append("unvalidated_target_count_missing")
         elif int(summary.get("unvalidated_target_count") or 0) != 0:
             errors.append(
-                "unvalidated_target_count="
-                f"{int(summary['unvalidated_target_count'])}"
+                f"unvalidated_target_count={int(summary['unvalidated_target_count'])}"
             )
         if (
             publication_eligible
@@ -7087,8 +7076,7 @@ class FBrefPipeline:
                 errors.append("no_durable_progress_after_claimed_work")
         if int(traffic.get("unclassified_failures") or 0) != 0:
             errors.append(
-                "unclassified_failures="
-                f"{int(traffic['unclassified_failures'])}"
+                f"unclassified_failures={int(traffic['unclassified_failures'])}"
             )
         if int(traffic.get("duplicate_fetch_violations") or 0) != 0:
             errors.append(
@@ -7154,8 +7142,7 @@ class FBrefPipeline:
             errors.append("unprocessed_raw_count_missing")
         elif int(summary.get("unprocessed_raw_count") or 0) != 0:
             errors.append(
-                "unprocessed_raw_count="
-                f"{int(summary['unprocessed_raw_count'])}"
+                f"unprocessed_raw_count={int(summary['unprocessed_raw_count'])}"
             )
         summary_run_type = str(summary.get("run_type") or "").casefold()
         if not isolated_acceptance and summary_run_type != "replay":
@@ -7299,6 +7286,7 @@ class OversizeEvidenceAuthority:
     source_run_id: str
     terminal_snapshot_sha256: str
     target_ids: Sequence[str]
+    diagnostic_target_ids: Sequence[str]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "review_state", str(self.review_state).strip())
@@ -7313,12 +7301,16 @@ class OversizeEvidenceAuthority:
             "target_ids",
             tuple(str(item).strip() for item in self.target_ids),
         )
+        object.__setattr__(
+            self,
+            "diagnostic_target_ids",
+            tuple(str(item).strip() for item in self.diagnostic_target_ids),
+        )
 
 
 @dataclass(frozen=True)
 class OversizeEvidenceConfig:
     logical_run_label: str
-    proxy_file: Path
 
     def __post_init__(self) -> None:
         label = str(self.logical_run_label).strip()
@@ -7326,26 +7318,17 @@ class OversizeEvidenceConfig:
             raise OversizeEvidenceConfigurationError(
                 "logical run label is invalid"
             )
-        proxy_file = Path(self.proxy_file)
-        try:
-            valid_proxy = (
-                proxy_file.is_absolute()
-                and proxy_file.is_file()
-                and proxy_file.stat().st_size > 0
-            )
-        except OSError:
-            valid_proxy = False
-        if not valid_proxy:
-            raise OversizeEvidenceConfigurationError(
-                "proxy file must be absolute, readable, and non-empty"
-            )
         object.__setattr__(self, "logical_run_label", label)
-        object.__setattr__(self, "proxy_file", proxy_file)
 
 
 CANARY_DAG_ID = "fbref_oversize_evidence_canary"
 _OVERSIZE_EVIDENCE_PAGE_KINDS = ("season_stats",)
 _OVERSIZE_EVIDENCE_LOCK_TTL_SECONDS = 4 * 60 * 60
+_OVERSIZE_EVIDENCE_BROWSER_REQUEST_LIMIT = DEFAULT_BROWSER_REQUESTS_PER_SOLVE
+_OVERSIZE_EVIDENCE_BROWSER_SOLVE_LIMIT = 1
+_OVERSIZE_EVIDENCE_PROVIDER_DAG_ID = "dag_accept_fbref_bronze"
+_OVERSIZE_EVIDENCE_PROVIDER_TASK_ID = "oversize_evidence_fetch"
+_OVERSIZE_EVIDENCE_LEASE_RACE_HEADROOM_BYTES = 64 * MIB
 _OVERSIZE_EVIDENCE_TARGET_ID = re.compile(
     r"fbref:season_stats:[^:\s]{1,64}:[^:\s]{1,64}:"
     r"(?:keepers|misc|playingtime|shooting|standard)\Z"
@@ -7359,6 +7342,10 @@ OVERSIZE_EVIDENCE_TARGET_IDS = (
     "fbref:season_stats:569:2025-2026:standard",
     "fbref:season_stats:678:2021:playingtime",
 )
+OVERSIZE_EVIDENCE_DIAGNOSTIC_TARGET_IDS = (
+    "fbref:season_stats:569:2025-2026:playingtime",
+    "fbref:season_stats:569:2025-2026:standard",
+)
 
 # Baked from the exact saved terminal TSV. There is deliberately no runtime
 # source/digest/target override: any authority change requires another commit
@@ -7370,6 +7357,7 @@ OVERSIZE_EVIDENCE_AUTHORITY = OversizeEvidenceAuthority(
         "b114e1139c50857b2985ead5ef2f72083660fc75cc9d1e9466874959a77bd543"
     ),
     target_ids=OVERSIZE_EVIDENCE_TARGET_IDS,
+    diagnostic_target_ids=OVERSIZE_EVIDENCE_DIAGNOSTIC_TARGET_IDS,
 )
 
 
@@ -7413,11 +7401,40 @@ def _validate_oversize_evidence_authority() -> OversizeEvidenceAuthority:
         raise OversizeEvidenceConfigurationError(
             "baked cohort contains a non-oversize season-stat target"
         )
+    if target_ids != OVERSIZE_EVIDENCE_TARGET_IDS:
+        raise OversizeEvidenceConfigurationError(
+            "baked source cohort differs from the reviewed terminal set"
+        )
+    diagnostic_target_ids = tuple(authority.diagnostic_target_ids)
+    if not 1 <= len(diagnostic_target_ids) <= len(target_ids):
+        raise OversizeEvidenceConfigurationError(
+            "baked diagnostic cohort has an invalid size"
+        )
+    if len(diagnostic_target_ids) != len(set(diagnostic_target_ids)):
+        raise OversizeEvidenceConfigurationError(
+            "baked diagnostic cohort contains duplicates"
+        )
+    if any(
+        not _OVERSIZE_EVIDENCE_TARGET_ID.fullmatch(item)
+        for item in diagnostic_target_ids
+    ):
+        raise OversizeEvidenceConfigurationError(
+            "baked diagnostic cohort contains a non-season-stat target"
+        )
+    if not set(diagnostic_target_ids).issubset(target_ids):
+        raise OversizeEvidenceConfigurationError(
+            "baked diagnostic cohort is outside terminal source authority"
+        )
+    if diagnostic_target_ids != OVERSIZE_EVIDENCE_DIAGNOSTIC_TARGET_IDS:
+        raise OversizeEvidenceConfigurationError(
+            "baked diagnostic cohort differs from the reviewed comp569 pair"
+        )
     return OversizeEvidenceAuthority(
         review_state="REVIEWED",
         source_run_id=source_run_id,
         terminal_snapshot_sha256=snapshot_sha256,
         target_ids=target_ids,
+        diagnostic_target_ids=diagnostic_target_ids,
     )
 
 
@@ -7425,6 +7442,9 @@ def _validate_oversize_evidence_wave_result(
     result: object,
     *,
     expected_targets: int,
+    request_limit: int,
+    byte_limit: int,
+    browser_bootstrap_limit: int,
 ) -> WaveResult:
     if not isinstance(result, WaveResult):
         raise RuntimeError("fetch wave returned an unexpected result type")
@@ -7432,7 +7452,6 @@ def _validate_oversize_evidence_wave_result(
         result.cohort_size == expected_targets
         and result.claimed == expected_targets
         and result.fetched == expected_targets
-        and result.requests == expected_targets
     )
     zero_outcomes = all(
         getattr(result, name) == 0
@@ -7451,11 +7470,15 @@ def _validate_oversize_evidence_wave_result(
             "moved_pages_skipped",
             "deferred_match_not_found",
             "terminal_oversized_pages",
-            "browser_bootstraps",
         )
     )
-    nonnegative_bytes = all(
-        value >= 0
+    bounded_requests = (
+        expected_targets <= result.requests <= request_limit
+        and 0 <= result.browser_bootstraps <= browser_bootstrap_limit
+        and result.browser_bootstraps <= result.requests - expected_targets
+    )
+    bounded_bytes = all(
+        0 <= value <= byte_limit
         for value in (
             result.wire_bytes,
             result.decoded_html_bytes,
@@ -7466,7 +7489,8 @@ def _validate_oversize_evidence_wave_result(
     if (
         not exact_counts
         or not zero_outcomes
-        or not nonnegative_bytes
+        or not bounded_requests
+        or not bounded_bytes
         or result.budget_exhausted
         or result.failures
     ):
@@ -7474,6 +7498,126 @@ def _validate_oversize_evidence_wave_result(
             "fetch wave result violates the exact oversize evidence contract"
         )
     return result
+
+
+def _oversize_evidence_settings(
+    config: OversizeEvidenceConfig,
+) -> PipelineSettings:
+    """Build and prove the one reviewed persistent diagnostic profile."""
+
+    settings = replace(
+        PipelineSettings.acceptance(
+            scope="current",
+            proxy_file=None,
+        ),
+        persistent_http_session=True,
+    )
+    solve_limit = (
+        int(settings.bootstrap_request_reservation)
+        // DEFAULT_BROWSER_REQUESTS_PER_SOLVE
+    )
+    if (
+        settings.run_type != "current"
+        or settings.request_limit != 100
+        or settings.byte_limit != 50 * MIB
+        or settings.shard_size != 25
+        or settings.request_reservation_bytes
+        != DEFAULT_REQUEST_RESERVATION_BYTES
+        or settings.target_request_reservation != MAX_TARGET_HTTP_ATTEMPTS
+        or settings.bootstrap_request_reservation
+        != _OVERSIZE_EVIDENCE_BROWSER_REQUEST_LIMIT
+        or settings.bootstrap_byte_reservation
+        != DEFAULT_BROWSER_BYTE_LIMIT_BYTES
+        or solve_limit != _OVERSIZE_EVIDENCE_BROWSER_SOLVE_LIMIT
+        or settings.persistent_http_session is not True
+    ):
+        raise OversizeEvidenceConfigurationError(
+            "oversize evidence browser and persistent HTTP profile changed"
+        )
+    return settings
+
+
+def _oversize_evidence_provider_byte_limit(
+    settings: PipelineSettings,
+) -> int:
+    """Retain the live runner's lease-extension race headroom."""
+
+    shared_remaining = settings.byte_limit
+    race_headroom = min(
+        _OVERSIZE_EVIDENCE_LEASE_RACE_HEADROOM_BYTES,
+        shared_remaining // 4,
+    )
+    return shared_remaining - race_headroom
+
+
+def _build_oversize_evidence_live_pipeline(
+    config: OversizeEvidenceConfig,
+    *,
+    run_id: str,
+    settings: PipelineSettings,
+) -> FBrefPipeline:
+    """Install the supported paid-meter factory after a zero-paid preflight."""
+
+    try:
+        persistent_enabled = strict_binary_flag(
+            "FBREF_PERSISTENT_HTTP_SESSION"
+        )
+    except ValueError as exc:
+        raise OversizeEvidenceConfigurationError(
+            "persistent HTTP deployment switch is invalid"
+        ) from exc
+    if not persistent_enabled:
+        raise OversizeEvidenceConfigurationError(
+            "persistent HTTP deployment switch must be enabled"
+        )
+
+    control_url = str(os.environ.get("FBREF_PROXY_CONTROL_URL") or "").strip()
+    control_token = str(
+        os.environ.get("FBREF_PROXY_CONTROL_TOKEN") or ""
+    ).strip()
+    try:
+        meter = validate_fbref_proxy_meter(
+            control_url,
+            control_token=control_token,
+            required_bytes=settings.byte_limit,
+            minimum_configured_exits=1,
+        )
+    except Exception as exc:  # noqa: BLE001 - redact dependency details
+        raise OversizeEvidenceConfigurationError(
+            "persistent HTTP proxy meter preflight failed"
+        ) from exc
+    if int(meter.get("daily_remaining_bytes") or 0) < settings.byte_limit:
+        raise OversizeEvidenceConfigurationError(
+            "persistent HTTP proxy meter cannot fund the exact diagnostic"
+        )
+
+    provider_context = {
+        "source": "fbref",
+        # The control run keeps its purpose-built nonpublishing identity. Paid
+        # transport uses the already-approved Bronze acceptance provenance;
+        # extending the proxy allowlist is intentionally outside this recovery.
+        "dag_id": _OVERSIZE_EVIDENCE_PROVIDER_DAG_ID,
+        "run_id": run_id,
+        "task_id": _OVERSIZE_EVIDENCE_PROVIDER_TASK_ID,
+        "scope": config.logical_run_label,
+        "canonical_url": "https://fbref.com/en/",
+    }
+    provider_byte_limit = _oversize_evidence_provider_byte_limit(settings)
+    active_pipeline = FBrefPipeline.from_env()
+    active_pipeline.fetcher_factory = (
+        lambda _proxy_file, max_browser_requests, max_browser_bytes: (
+            FBrefFetcher(
+                max_browser_requests=max_browser_requests,
+                max_browser_bytes=max_browser_bytes,
+                provider_context=provider_context,
+                provider_max_bytes=provider_byte_limit,
+                proxy_control_url=control_url,
+                proxy_control_token=control_token,
+                persistent_http_session=True,
+            )
+        )
+    )
+    return active_pipeline
 
 
 def _fail_oversize_evidence_run(
@@ -7503,10 +7647,15 @@ def run_oversize_evidence_canary(
         config.logical_run_label,
         dag_id=CANARY_DAG_ID,
     )
-    active_pipeline = pipeline or FBrefPipeline.from_env()
-    settings = PipelineSettings.acceptance(
-        scope="current",
-        proxy_file=str(config.proxy_file),
+    settings = _oversize_evidence_settings(config)
+    active_pipeline = (
+        pipeline
+        if pipeline is not None
+        else _build_oversize_evidence_live_pipeline(
+            config,
+            run_id=run_id,
+            settings=settings,
+        )
     )
     stage = "initialize"
     lock_acquired = False
@@ -7520,6 +7669,20 @@ def run_oversize_evidence_canary(
                 "reviewed_source_run_id": authority.source_run_id,
                 "reviewed_terminal_snapshot_sha256": (
                     authority.terminal_snapshot_sha256
+                ),
+                "reviewed_diagnostic_target_ids": list(
+                    authority.diagnostic_target_ids
+                ),
+                "browser_request_limit": (
+                    _OVERSIZE_EVIDENCE_BROWSER_REQUEST_LIMIT
+                ),
+                "browser_solve_limit": _OVERSIZE_EVIDENCE_BROWSER_SOLVE_LIMIT,
+                "provider_dag_id": _OVERSIZE_EVIDENCE_PROVIDER_DAG_ID,
+                "provider_task_id": _OVERSIZE_EVIDENCE_PROVIDER_TASK_ID,
+                "provider_scope": config.logical_run_label,
+                "provider_run_id": run_id,
+                "provider_byte_limit": (
+                    _oversize_evidence_provider_byte_limit(settings)
                 ),
             },
         )
@@ -7540,23 +7703,25 @@ def run_oversize_evidence_canary(
             sorted(
                 {
                     target_id.rsplit(":", 1)[-1]
-                    for target_id in authority.target_ids
+                    for target_id in authority.diagnostic_target_ids
                 }
             )
         )
         frozen = active_pipeline.seed_acceptance_cohort(
             run_id,
-            authority.target_ids,
+            authority.diagnostic_target_ids,
             settings=settings,
             required_page_kinds=_OVERSIZE_EVIDENCE_PAGE_KINDS,
             required_routes=routes,
             coverage_slots={
                 f"oversize:{index}": target_id
-                for index, target_id in enumerate(authority.target_ids)
+                for index, target_id in enumerate(
+                    authority.diagnostic_target_ids
+                )
             },
         )
         if tuple(frozen.get("target_ids") or ()) != tuple(
-            authority.target_ids
+            authority.diagnostic_target_ids
         ):
             raise RuntimeError("frozen cohort differs from requested cohort")
 
@@ -7570,7 +7735,18 @@ def run_oversize_evidence_canary(
         stage = "validate_fetch_result"
         wave = _validate_oversize_evidence_wave_result(
             wave,
-            expected_targets=len(authority.target_ids),
+            expected_targets=len(authority.diagnostic_target_ids),
+            request_limit=min(
+                settings.request_limit,
+                len(authority.diagnostic_target_ids)
+                + int(settings.bootstrap_request_reservation),
+            ),
+            byte_limit=settings.byte_limit,
+            browser_bootstrap_limit=max(
+                1,
+                settings.bootstrap_request_reservation
+                // DEFAULT_BROWSER_REQUESTS_PER_SOLVE,
+            ),
         )
 
         # A successful run must never retain a writer fence. Release first;
@@ -7597,11 +7773,20 @@ def run_oversize_evidence_canary(
     return {
         "status": "succeeded",
         "run_id": run_id,
-        "target_ids": list(authority.target_ids),
+        "target_ids": list(authority.diagnostic_target_ids),
         "request_limit": settings.request_limit,
         "byte_limit": settings.byte_limit,
         "shard_size": settings.shard_size,
         "publication_eligible": False,
+        "browser_request_limit": _OVERSIZE_EVIDENCE_BROWSER_REQUEST_LIMIT,
+        "browser_solve_limit": _OVERSIZE_EVIDENCE_BROWSER_SOLVE_LIMIT,
+        "provider_dag_id": _OVERSIZE_EVIDENCE_PROVIDER_DAG_ID,
+        "provider_task_id": _OVERSIZE_EVIDENCE_PROVIDER_TASK_ID,
+        "provider_scope": config.logical_run_label,
+        "provider_run_id": run_id,
+        "provider_byte_limit": _oversize_evidence_provider_byte_limit(
+            settings
+        ),
         "wave": wave.as_dict(),
     }
 
@@ -7624,6 +7809,7 @@ __all__ = [
     "OversizeEvidenceConfig",
     "OversizeEvidenceConfigurationError",
     "OversizeEvidenceExecutionError",
+    "OVERSIZE_EVIDENCE_DIAGNOSTIC_TARGET_IDS",
     "ParseWaveError",
     "PipelineError",
     "PipelineSettings",

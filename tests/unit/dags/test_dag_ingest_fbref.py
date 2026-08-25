@@ -120,7 +120,7 @@ class TestFBrefCurrentTopology:
         assert live.op_kwargs["page_kinds"] == module.PAGE_KINDS
         assert live.op_kwargs["max_batches"] == factory.CURRENT_MAX_BATCHES
         expected_reservation_mb = DEFAULT_REQUEST_RESERVATION_BYTES // MIB
-        assert expected_reservation_mb == 5
+        assert expected_reservation_mb == 9
         assert tasks["initialize_run"].op_kwargs["reservation_mb"] == (
             expected_reservation_mb
         )

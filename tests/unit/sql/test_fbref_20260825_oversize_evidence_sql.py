@@ -29,6 +29,11 @@ TERMINAL_TARGET_IDS = {
     "fbref:season_stats:569:2025-2026:playingtime",
     "fbref:season_stats:569:2025-2026:standard",
 }
+DIAGNOSTIC_TARGET_IDS = {
+    "fbref:season_stats:569:2025-2026:playingtime",
+    "fbref:season_stats:569:2025-2026:standard",
+}
+DEMOTED_TARGET_IDS = TERMINAL_TARGET_IDS - DIAGNOSTIC_TARGET_IDS
 TERMINAL_SOURCE_RUN_ID = "94838bac-786a-5d59-99e4-f6a2b3f7971e"
 TERMINAL_SNAPSHOT_SHA256 = (
     "b114e1139c50857b2985ead5ef2f72083660fc75cc9d1e9466874959a77bd543"
@@ -82,7 +87,9 @@ def test_operator_order_marks_terminal_candidate_no_go_pending_review() -> None:
     assert TERMINAL_SNAPSHOT_SHA256 in raw
     assert "saved terminal snapshot" in raw.lower()
     assert "git diff --check" in raw
-    assert "do not infer or install a new\n-- decoded-body cap" in raw.lower()
+    assert "8 mib decoded-body cap" in raw.lower()
+    assert "9 mib target reservation" in raw.lower()
+    assert "8 mib+1" in raw.lower()
 
 
 @pytest.mark.parametrize("path", [REMEDIATION_FILE, GATE_FILE])
@@ -124,12 +131,12 @@ def test_source_run_and_terminal_oversize_set_are_executable_guards() -> None:
     assert "attempt.http_request_count = 1" in sql
     assert "attempt.logical_refresh_id = target.logical_refresh_id" in sql
     assert (
-        "select * from fbref_20260825_oversize_evidence_expected except "
+        "select * from fbref_20260825_oversize_source_expected except "
         "select * from fbref_20260825_source_terminal_oversize"
     ) in sql
     assert (
         "select * from fbref_20260825_source_terminal_oversize except "
-        "select * from fbref_20260825_oversize_evidence_expected"
+        "select * from fbref_20260825_oversize_source_expected"
     ) in sql
     assert "select count(distinct target_id)" in sql
     assert "duplicate source target" in sql
@@ -143,10 +150,32 @@ def test_expected_set_is_exactly_the_terminal_four() -> None:
     assert ids == TERMINAL_TARGET_IDS
     assert len(ids) == 4
     raw = _raw(REMEDIATION_FILE)
-    assert "expected_count <> 4" not in raw
+    assert "expected_count <> 4" in raw
     assert "exact-three" not in raw.lower()
     assert "all three" not in raw.lower()
     assert "either target" not in raw.lower()
+
+
+def test_terminal_authority_and_diagnostic_cohort_are_distinct_exact_sets() -> (
+    None
+):
+    remediation = _sql(REMEDIATION_FILE)
+    gate = _sql(GATE_FILE)
+
+    assert "fbref_20260825_oversize_source_expected" in remediation
+    assert "fbref_20260825_oversize_diagnostic_expected" in remediation
+    assert "fbref_20260825_oversize_diagnostic_expected" in gate
+    assert "source_count <> 4" in remediation
+    assert "diagnostic_count <> 2" in remediation
+    for target_id in TERMINAL_TARGET_IDS:
+        assert target_id in remediation
+    for target_id in DIAGNOSTIC_TARGET_IDS:
+        assert target_id in gate
+    for target_id in DEMOTED_TARGET_IDS:
+        assert (
+            target_id
+            not in gate.split("diagnostic_expected", 1)[1].split(")", 1)[0]
+        )
 
 
 def test_baked_terminal_rows_reproduce_reviewed_snapshot_digest() -> None:
@@ -163,16 +192,13 @@ def test_baked_terminal_rows_reproduce_reviewed_snapshot_digest() -> None:
 
 
 def test_terminal_runner_cohort_matches_remediation_exactly() -> None:
-    runner_ids = set(
-        re.findall(
-            r'"(?P<id>fbref:season_stats:[A-Za-z0-9-]+:'
-            r'[A-Za-z0-9-]+:(?:playingtime|standard))"',
-            _raw(PIPELINE_FILE),
-        )
-    )
+    from scrapers.fbref import pipeline
 
-    assert runner_ids == TERMINAL_TARGET_IDS
-    assert runner_ids == _literal_target_ids(REMEDIATION_FILE)
+    assert set(pipeline.OVERSIZE_EVIDENCE_TARGET_IDS) == TERMINAL_TARGET_IDS
+    assert (
+        set(pipeline.OVERSIZE_EVIDENCE_DIAGNOSTIC_TARGET_IDS)
+        == DIAGNOSTIC_TARGET_IDS
+    )
 
 
 def test_transaction_serializes_frontier_and_rejects_writer_state() -> None:
@@ -231,6 +257,31 @@ def test_frontier_selection_is_exact_and_preserves_history_fields() -> None:
         assert f"{preserved} =" not in set_clause
 
 
+def test_requeue_requires_scope_remediation_and_excludes_false_currents() -> (
+    None
+):
+    raw = _raw(REMEDIATION_FILE)
+    sql = _sql(REMEDIATION_FILE)
+
+    assert "current-season remediation acceptance" in raw.lower()
+    assert "fbref_20260825_oversize_demoted_expected" in sql
+    for predicate in (
+        "season.present",
+        "season.lifecycle_state = 'present'",
+        "not season.is_current",
+        "frontier.refresh_policy = 'daily'",
+        "frontier.state = 'quarantined'",
+        "frontier.next_fetch_at is null",
+        "frontier.last_error_class = 'scopequarantined'",
+        "frontier.last_error_message = 'noncurrent_season'",
+    ):
+        assert predicate in sql
+    assert "scope remediation proof mismatch" in sql
+    update = sql[sql.index("update fbref_control.page_frontier") :]
+    for target_id in DEMOTED_TARGET_IDS:
+        assert target_id not in update
+
+
 def test_exact_cohort_mechanism_does_not_rely_on_due_time() -> None:
     raw = _raw(REMEDIATION_FILE)
     sql = _sql(REMEDIATION_FILE)
@@ -250,10 +301,19 @@ def test_purpose_built_runner_is_fetch_only_and_physically_nonpublishing() -> No
     from scrapers.fbref import pipeline
 
     runner = inspect.getsource(pipeline.run_oversize_evidence_canary)
-    authority = inspect.getsource(pipeline._validate_oversize_evidence_authority)
+    profile = inspect.getsource(pipeline._oversize_evidence_settings)
+    factory = inspect.getsource(
+        pipeline._build_oversize_evidence_live_pipeline
+    )
+    authority = inspect.getsource(
+        pipeline._validate_oversize_evidence_authority
+    )
     raw = _raw(REMEDIATION_FILE)
 
-    assert "PipelineSettings.acceptance" in runner
+    assert "_oversize_evidence_settings" in runner
+    assert "PipelineSettings.acceptance" in profile
+    assert "validate_fbref_proxy_meter" in factory
+    assert "persistent_http_session=True" in factory
     assert "initialize_acceptance_run" in runner
     assert "seed_acceptance_cohort" in runner
     assert "fetch_wave" in runner
@@ -272,6 +332,10 @@ def test_purpose_built_runner_is_fetch_only_and_physically_nonpublishing() -> No
     assert "--reviewed-terminal-snapshot-sha256" not in raw
     assert "--target-id" not in raw
     assert hashlib.sha256(PIPELINE_FILE.read_bytes()).hexdigest() in raw
+    settings_file = PROJECT_ROOT / "scrapers" / "fbref" / "settings.py"
+    assert hashlib.sha256(settings_file.read_bytes()).hexdigest() in raw
+    assert "DEFAULT_SEASON_STATS_HTTP_BODY_LIMIT_BYTES == 8388608" in raw
+    assert "DEFAULT_REQUEST_RESERVATION_BYTES == 9437184" in raw
 
 
 def test_post_run_gate_is_separate_read_only_and_fail_closed() -> None:
@@ -293,10 +357,17 @@ def test_post_run_gate_is_separate_read_only_and_fail_closed() -> None:
     assert "all_attempts as" in sql
     assert "join fbref_control.fetch_attempt as attempt" in sql
     assert "attempt.run_id = run.run_id" in sql
-    assert "count(*) = (select count(*) from expected)" in sql
+    assert "from fbref_20260825_oversize_diagnostic_expected" in sql
     assert "sum(all_attempts.http_request_count)" in sql
-    assert "run.requests_used = attempt_totals.request_count" in sql
-    assert "attempt_totals.request_count = (select count(*) from expected)" in sql
+    assert "clearance_session_page_accounting" in sql
+    assert "clearance_session_tail_reservation" in sql
+    assert (
+        "page.requests_used <> page.http_requests + page.browser_bootstrap_requests"
+        in sql
+    )
+    assert "run.requests_used = traffic_totals.page_request_count" in sql
+    assert "traffic_totals.http_request_count = (" in sql
+    assert "traffic_totals.page_request_count <= run.request_limit" in sql
     assert "registered_target_id is not null" in sql
     assert "expected_target_id is not null" in sql
     assert (
@@ -309,6 +380,136 @@ def test_post_run_gate_is_separate_read_only_and_fail_closed() -> None:
     assert "response_too_large is diagnostic red" in raw.lower()
     assert "NO-GO" in raw
     assert "raise exception" in sql
+
+
+def test_browser_traffic_is_conserved_without_being_misclassified_as_extra_http() -> (
+    None
+):
+    sql = _sql(GATE_FILE)
+
+    assert "sum(page.browser_bootstrap_requests)" in sql
+    assert "sum(session.browser_bootstrap_requests)" in sql
+    assert "sum(page.http_requests)" in sql
+    assert "sum(session.http_requests)" in sql
+    assert "page.attempt_id = all_attempts.attempt_id" in sql
+    assert "session.tail_status <> 'settled'" in sql
+    assert "session.tail_budget_requests_used <> 0" in sql
+    assert "traffic_totals.browser_request_count <= 20" in sql
+    assert "traffic_totals.page_request_count <= 22" in sql
+    assert "session_totals.session_count = 1" in sql
+    assert "metadata ->> 'browser_request_limit' = '20'" in sql
+    assert "metadata ->> 'browser_solve_limit' = '1'" in sql
+    assert "metadata ->> 'provider_dag_id' = 'dag_accept_fbref_bronze'" in sql
+    assert "metadata ->> 'provider_task_id' = 'oversize_evidence_fetch'" in sql
+    assert "metadata ->> 'provider_scope' = :'airflow_run_id'" in sql
+    assert "metadata ->> 'provider_run_id' = run.run_id::text" in sql
+    assert "metadata ->> 'provider_byte_limit' = '39321600'" in sql
+    assert "run.bytes_used <= 39321600" in sql
+    assert (
+        "session.browser_document_bytes + session.browser_asset_bytes + "
+        "session.browser_unobserved_bytes > 4194304"
+    ) in sql
+    assert "run.requests_used = attempt_totals.request_count" not in sql
+
+
+def test_persistent_ledger_gate_matches_store_reconciliation_contract() -> (
+    None
+):
+    sql = _sql(GATE_FILE)
+    pg = _raw(POSTGRES_REGRESSION_FILE)
+
+    for predicate in (
+        "run.requests_reserved = 0",
+        "run.bytes_reserved = 0",
+        "session.provider_billed_bytes is null",
+        "session.tail_page_provider_bytes is null",
+        "session.tail_authoritative_provider_bytes is null",
+        "session.tail_page_provider_bytes <> session.page_provider_bytes",
+        "session.tail_authoritative_provider_bytes <> session.provider_billed_bytes",
+        "page.attempt_reservation_id <> page.reservation_id",
+        "budget.logical_refresh_id <> budget.page_logical_refresh_id",
+        "budget.tail_logical_refresh_id <> budget.tail_session_id",
+        "budget.tail_bytes_reserved <> 9437184",
+        "session.browser_document_bytes <> session.page_browser_document_bytes",
+        "session.browser_asset_bytes <> session.page_browser_asset_bytes",
+        "session.browser_unobserved_bytes <> session.page_browser_unobserved_bytes",
+        "session.http_wire_bytes <> session.page_http_wire_bytes",
+        "session.decoded_html_bytes <> session.page_decoded_html_bytes",
+        "session.compressed_raw_bytes <> session.page_compressed_raw_bytes",
+        "page.evidence_sha256 <> page.recomputed_evidence_sha256",
+        "session.tail_settlement_sha256 <> session.recomputed_tail_settlement_sha256",
+    ):
+        assert predicate in sql
+    for label in (
+        "browser-profile-metadata-mismatch",
+        "provider-profile-metadata-mismatch",
+        "null-session-provider-bytes",
+        "contradictory-tail-receipt",
+        "outstanding-run-reservation",
+        "attempt-reservation-mismatch",
+        "reservation-logical-refresh-mismatch",
+        "target-reservation-size-mismatch",
+        "session-byte-accounting-mismatch",
+        "page-evidence-digest-mismatch",
+        "tail-evidence-digest-mismatch",
+        "browser-byte-cap-overrun",
+    ):
+        assert label in pg
+
+
+def test_both_sql_artifacts_require_the_comp569_pair_to_remain_current() -> (
+    None
+):
+    remediation = _sql(REMEDIATION_FILE)
+    gate = _sql(GATE_FILE)
+    pg = _raw(POSTGRES_REGRESSION_FILE)
+
+    for sql in (remediation, gate):
+        assert "diagnostic_current_expected" in sql
+        assert "diagnostic_current_actual" in sql
+        assert "season.competition_id = expected.competition_id" in sql
+        assert "season.season_id = expected.season_id" in sql
+        assert "season.is_current" in sql
+    assert "genuine-current-mismatch" in pg
+    assert "browser-reservation-overrun" in pg
+
+
+def test_success_gate_proves_full_raw_and_page_accounting_are_lossless() -> (
+    None
+):
+    sql = _sql(GATE_FILE)
+    pg = _raw(POSTGRES_REGRESSION_FILE)
+
+    assert "attempt.content_hash" in sql
+    assert "attempt.raw_manifest_key" in sql
+    assert "attempt.compressed_bytes" in sql
+    assert "page.attempt_decoded_bytes <> page.decoded_html_bytes" in sql
+    assert "page.attempt_compressed_bytes <> page.compressed_raw_bytes" in sql
+    assert "page.attempt_wire_bytes <> page.http_wire_bytes" in sql
+    assert (
+        "page.attempt_provider_billed_bytes <> page.provider_billed_bytes"
+        in sql
+    )
+    assert "page.decoded_html_bytes > 8388608" in sql
+    assert "all_attempts.content_hash ~ '^[0-9a-f]{64}$'" in sql
+    assert (
+        "'manifests/fetches/' || all_attempts.attempt_logical_refresh_id::text"
+        in sql
+    )
+    assert (
+        "all_attempts.transport_version = 'fbref-camoufox-metered-warm-http-v10'"
+        in sql
+    )
+    assert "page.attempt_session_version <> page.session_id::text" in sql
+    assert "raw-decoded-loss-mismatch" in pg
+    for label in (
+        "malformed-raw-content-hash",
+        "foreign-raw-manifest-key",
+        "foreign-fetcher-version",
+        "foreign-attempt-session",
+        "null-attempt-transport",
+    ):
+        assert label in pg
 
 
 def test_post_run_gate_binds_and_recomputes_reviewed_source_snapshot() -> None:
@@ -327,9 +528,9 @@ def test_post_run_gate_binds_and_recomputes_reviewed_source_snapshot() -> None:
         "metadata ->> 'reviewed_terminal_snapshot_sha256' = "
         ":'fbref_oversize_baked_snapshot_sha256'"
     ) in sql
-    assert "expected except select target_id from diagnostic_targets" in sql
-    assert "diagnostic_targets except select target_id from expected" in sql
-    assert not _literal_target_ids(GATE_FILE)
+    assert "from fbref_20260825_oversize_diagnostic_expected" in sql
+    assert "select target_id from diagnostic_targets" in sql
+    assert _literal_target_ids(GATE_FILE) == TERMINAL_TARGET_IDS
 
 
 def test_post_run_gate_requires_succeeded_run_exactly() -> None:
@@ -355,6 +556,28 @@ def test_disposable_postgres_regression_covers_false_pass_cases() -> None:
     assert "unreviewed-authority" in raw
     assert "reviewed-pass" in raw
     assert "run-accounting-mismatch" in raw
+    assert "realistic-browser-bootstrap" in raw
+    assert "browser-accounting-mismatch" in raw
+    assert "raw-decoded-loss-mismatch" in raw
+    assert "malformed-raw-content-hash" in raw
+    assert "foreign-raw-manifest-key" in raw
+    assert "foreign-fetcher-version" in raw
+    assert "foreign-attempt-session" in raw
+    assert "null-attempt-transport" in raw
+    assert "genuine-current-mismatch" in raw
+    assert "browser-reservation-overrun" in raw
+    assert "browser-profile-metadata-mismatch" in raw
+    assert "provider-profile-metadata-mismatch" in raw
+    assert "null-session-provider-bytes" in raw
+    assert "contradictory-tail-receipt" in raw
+    assert "outstanding-run-reservation" in raw
+    assert "attempt-reservation-mismatch" in raw
+    assert "reservation-logical-refresh-mismatch" in raw
+    assert "target-reservation-size-mismatch" in raw
+    assert "session-byte-accounting-mismatch" in raw
+    assert "page-evidence-digest-mismatch" in raw
+    assert "tail-evidence-digest-mismatch" in raw
+    assert "demoted-scope-mismatch" in raw
     assert "orphan-extra-attempt" in raw
     assert "failed-run" in raw
     assert "provenance-mismatch" in raw

@@ -1,11 +1,18 @@
-from pathlib import Path
+from dataclasses import replace
 
 import pytest
 
 from scrapers.fbref import pipeline as canary
 from scrapers.fbref.pipeline import WaveResult
+from scrapers.fbref.proxy_lease import FBrefProxyLeaseClient
 
 
+SOURCE_TARGETS = (
+    "fbref:season_stats:6:2022:playingtime",
+    "fbref:season_stats:569:2025-2026:playingtime",
+    "fbref:season_stats:569:2025-2026:standard",
+    "fbref:season_stats:678:2021:playingtime",
+)
 TARGETS = (
     "fbref:season_stats:569:2025-2026:playingtime",
     "fbref:season_stats:569:2025-2026:standard",
@@ -37,7 +44,10 @@ def _exact_wave(targets=TARGETS):
         cohort_size=count,
         claimed=count,
         fetched=count,
-        requests=count,
+        # A fresh paid session spends browser traffic to establish clearance,
+        # then one target HTTP request per page.
+        requests=count + 20,
+        browser_bootstraps=1,
         wire_bytes=count * 100,
         decoded_html_bytes=count * 200,
     )
@@ -69,21 +79,23 @@ class _Pipeline:
         return self.wave
 
 
-def _authority(targets=TARGETS) -> canary.OversizeEvidenceAuthority:
+def _authority(
+    targets=TARGETS,
+    *,
+    source_targets=SOURCE_TARGETS,
+) -> canary.OversizeEvidenceAuthority:
     return canary.OversizeEvidenceAuthority(
         review_state="REVIEWED",
         source_run_id=SOURCE_RUN_ID,
         terminal_snapshot_sha256=SNAPSHOT_SHA256,
-        target_ids=targets,
+        target_ids=source_targets,
+        diagnostic_target_ids=targets,
     )
 
 
-def _config(tmp_path: Path) -> canary.OversizeEvidenceConfig:
-    proxy = tmp_path / "proxy.txt"
-    proxy.write_text("http://proxy.invalid:8080\n", encoding="utf-8")
+def _config(_tmp_path) -> canary.OversizeEvidenceConfig:
     return canary.OversizeEvidenceConfig(
         logical_run_label="oversize-evidence-test",
-        proxy_file=proxy,
     )
 
 
@@ -98,6 +110,9 @@ def test_unreviewed_baked_authority_stops_before_pipeline_or_traffic(
             source_run_id="00000000-0000-0000-0000-000000000000",
             terminal_snapshot_sha256="0" * 64,
             target_ids=canary.OVERSIZE_EVIDENCE_TARGET_IDS,
+            diagnostic_target_ids=(
+                canary.OVERSIZE_EVIDENCE_DIAGNOSTIC_TARGET_IDS
+            ),
         ),
     )
     pipeline = _Pipeline()
@@ -112,14 +127,177 @@ def test_unreviewed_baked_authority_stops_before_pipeline_or_traffic(
 
 
 def test_checked_in_authority_is_the_terminal_reviewed_snapshot() -> None:
-    assert canary.OVERSIZE_EVIDENCE_AUTHORITY == canary.OversizeEvidenceAuthority(
-        review_state="REVIEWED",
-        source_run_id=SOURCE_RUN_ID,
-        terminal_snapshot_sha256=(
-            "b114e1139c50857b2985ead5ef2f72083660fc75cc9d1e9466874959a77bd543"
-        ),
-        target_ids=canary.OVERSIZE_EVIDENCE_TARGET_IDS,
+    assert (
+        canary.OVERSIZE_EVIDENCE_AUTHORITY
+        == canary.OversizeEvidenceAuthority(
+            review_state="REVIEWED",
+            source_run_id=SOURCE_RUN_ID,
+            terminal_snapshot_sha256=(
+                "b114e1139c50857b2985ead5ef2f72083660fc75cc9d1e9466874959a77bd543"
+            ),
+            target_ids=canary.OVERSIZE_EVIDENCE_TARGET_IDS,
+            diagnostic_target_ids=(
+                canary.OVERSIZE_EVIDENCE_DIAGNOSTIC_TARGET_IDS
+            ),
+        )
     )
+    assert set(canary.OVERSIZE_EVIDENCE_DIAGNOSTIC_TARGET_IDS) == set(TARGETS)
+    assert set(canary.OVERSIZE_EVIDENCE_TARGET_IDS) == set(SOURCE_TARGETS)
+
+
+def test_callable_rejects_any_diagnostic_cohort_other_than_exact_comp569_pair(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        canary,
+        "OVERSIZE_EVIDENCE_AUTHORITY",
+        _authority((SOURCE_TARGETS[0], TARGETS[0])),
+    )
+    pipeline = _Pipeline()
+
+    with pytest.raises(
+        canary.OversizeEvidenceConfigurationError,
+        match="diagnostic cohort differs",
+    ):
+        canary.run_oversize_evidence_canary(
+            _config(tmp_path), pipeline=pipeline
+        )
+
+    assert pipeline.initialized is None
+    assert pipeline.fetch is None
+
+
+def test_direct_callable_requires_persistent_meter_before_pipeline_or_traffic(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(canary, "OVERSIZE_EVIDENCE_AUTHORITY", _authority())
+    monkeypatch.delenv("FBREF_PERSISTENT_HTTP_SESSION", raising=False)
+    monkeypatch.setattr(
+        canary.FBrefPipeline,
+        "from_env",
+        lambda: (_ for _ in ()).throw(AssertionError("pipeline constructed")),
+    )
+
+    with pytest.raises(
+        canary.OversizeEvidenceConfigurationError,
+        match="persistent HTTP",
+    ):
+        canary.run_oversize_evidence_canary(_config(tmp_path))
+
+
+def test_direct_callable_constructs_supported_persistent_metered_fetcher(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(canary, "OVERSIZE_EVIDENCE_AUTHORITY", _authority())
+    monkeypatch.setenv("FBREF_PERSISTENT_HTTP_SESSION", "1")
+    monkeypatch.setenv(
+        "FBREF_PROXY_CONTROL_URL", "http://fbref-proxy-filter:8899"
+    )
+    monkeypatch.setenv("FBREF_PROXY_CONTROL_TOKEN", "t" * 32)
+    pipeline = _Pipeline()
+    events = []
+    readiness_kwargs = {}
+    fetcher_kwargs = {}
+
+    def readiness(control_url, **kwargs):
+        events.append("readiness")
+        readiness_kwargs["control_url"] = control_url
+        readiness_kwargs.update(kwargs)
+        return {"daily_remaining_bytes": 50 * 1024 * 1024}
+
+    def from_env():
+        events.append("pipeline")
+        return pipeline
+
+    monkeypatch.setattr(canary, "validate_fbref_proxy_meter", readiness)
+    monkeypatch.setattr(canary.FBrefPipeline, "from_env", from_env)
+
+    class ValidatingFetcher:
+        def __init__(self, **kwargs):
+            fetcher_kwargs.update(kwargs)
+            client = FBrefProxyLeaseClient(
+                kwargs["proxy_control_url"],
+                control_token=kwargs["proxy_control_token"],
+            )
+            client._request = lambda *_args, **_kwargs: (
+                201,
+                {
+                    "id": "lease-1",
+                    "token": "lease-token",
+                    "proxy_url": "http://fbref-proxy-filter:8899",
+                    "max_bytes": kwargs["provider_max_bytes"],
+                    "expires_at": 9999999999,
+                },
+            )
+            client.acquire(
+                max_bytes=kwargs["provider_max_bytes"],
+                ttl_seconds=7200,
+                metadata=kwargs["provider_context"],
+            )
+
+    monkeypatch.setattr(canary, "FBrefFetcher", ValidatingFetcher)
+    config = _config(tmp_path)
+
+    result = canary.run_oversize_evidence_canary(config)
+    pipeline.fetcher_factory(None, 20, 4 * 1024 * 1024)
+
+    assert events == ["readiness", "pipeline"]
+    assert readiness_kwargs == {
+        "control_url": "http://fbref-proxy-filter:8899",
+        "control_token": "t" * 32,
+        "required_bytes": 50 * 1024 * 1024,
+        "minimum_configured_exits": 1,
+    }
+    assert pipeline.initialized["settings"].persistent_http_session is True
+    assert fetcher_kwargs == {
+        "max_browser_requests": 20,
+        "max_browser_bytes": 4 * 1024 * 1024,
+        "provider_context": {
+            "source": "fbref",
+            "dag_id": "dag_accept_fbref_bronze",
+            "run_id": result["run_id"],
+            "task_id": "oversize_evidence_fetch",
+            "scope": "oversize-evidence-test",
+            "canonical_url": "https://fbref.com/en/",
+        },
+        "provider_max_bytes": 39321600,
+        "proxy_control_url": "http://fbref-proxy-filter:8899",
+        "proxy_control_token": "t" * 32,
+        "persistent_http_session": True,
+    }
+
+
+def test_altered_browser_reservation_stops_before_initialize_or_traffic(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(canary, "OVERSIZE_EVIDENCE_AUTHORITY", _authority())
+    original_acceptance = canary.PipelineSettings.acceptance
+
+    def altered_acceptance(cls, **kwargs):
+        return replace(
+            original_acceptance(**kwargs),
+            bootstrap_request_reservation=40,
+        )
+
+    monkeypatch.setattr(
+        canary.PipelineSettings,
+        "acceptance",
+        classmethod(altered_acceptance),
+    )
+    pipeline = _Pipeline()
+
+    with pytest.raises(
+        canary.OversizeEvidenceConfigurationError,
+        match="browser",
+    ):
+        canary.run_oversize_evidence_canary(
+            _config(tmp_path), pipeline=pipeline
+        )
+
+    assert pipeline.initialized is None
+    assert pipeline.seeded is None
+    assert pipeline.fetch is None
+    assert pipeline.control.events == []
 
 
 def test_run_installs_only_baked_explicit_nonpublishing_cohort(tmp_path, monkeypatch):
@@ -133,7 +311,19 @@ def test_run_installs_only_baked_explicit_nonpublishing_cohort(tmp_path, monkeyp
     assert pipeline.initialized["dag_id"] == canary.CANARY_DAG_ID
     assert pipeline.initialized["execution_metadata"] == {
         "reviewed_source_run_id": authority.source_run_id,
-        "reviewed_terminal_snapshot_sha256": (authority.terminal_snapshot_sha256),
+        "reviewed_terminal_snapshot_sha256": (
+            authority.terminal_snapshot_sha256
+        ),
+        "reviewed_diagnostic_target_ids": list(
+            authority.diagnostic_target_ids
+        ),
+        "browser_request_limit": 20,
+        "browser_solve_limit": 1,
+        "provider_dag_id": "dag_accept_fbref_bronze",
+        "provider_task_id": "oversize_evidence_fetch",
+        "provider_scope": "oversize-evidence-test",
+        "provider_run_id": result["run_id"],
+        "provider_byte_limit": 39321600,
     }
     _run_id, target_ids, seed_kwargs = pipeline.seeded
     assert target_ids == TARGETS
@@ -147,6 +337,13 @@ def test_run_installs_only_baked_explicit_nonpublishing_cohort(tmp_path, monkeyp
     assert pipeline.control.events[-2] == ("release", result["run_id"])
     assert pipeline.control.events[-1] == ("finish", result["run_id"], True)
     assert result["publication_eligible"] is False
+    assert result["browser_request_limit"] == 20
+    assert result["browser_solve_limit"] == 1
+    assert result["provider_dag_id"] == "dag_accept_fbref_bronze"
+    assert result["provider_task_id"] == "oversize_evidence_fetch"
+    assert result["provider_scope"] == "oversize-evidence-test"
+    assert result["provider_run_id"] == result["run_id"]
+    assert result["provider_byte_limit"] == 39321600
     assert result["target_ids"] == list(TARGETS)
     assert result["wave"] == pipeline.wave.as_dict()
 
@@ -165,19 +362,18 @@ def test_fetch_exception_stays_red_and_closes_control_run(tmp_path, monkeypatch)
     assert pipeline.control.events[-1][0] == "release"
 
 
-@pytest.mark.parametrize("oversized", [1, 4])
+@pytest.mark.parametrize("oversized", [1, 2])
 def test_returned_oversize_wave_stays_red_and_closes_control_run(
     tmp_path, monkeypatch, oversized
 ):
-    targets = tuple(canary.OVERSIZE_EVIDENCE_TARGET_IDS[:oversized])
-    authority = _authority(targets)
-    monkeypatch.setattr(canary, "OVERSIZE_EVIDENCE_AUTHORITY", authority)
+    monkeypatch.setattr(canary, "OVERSIZE_EVIDENCE_AUTHORITY", _authority())
     pipeline = _Pipeline(
         wave=WaveResult(
-            cohort_size=oversized,
-            claimed=oversized,
-            fetched=0,
-            requests=oversized,
+            cohort_size=2,
+            claimed=2,
+            fetched=2 - oversized,
+            requests=22,
+            browser_bootstraps=1,
             terminal_oversized_pages=oversized,
         )
     )
@@ -194,15 +390,17 @@ def test_returned_oversize_wave_stays_red_and_closes_control_run(
     assert pipeline.control.events[-1] == ("release", caught.value.run_id)
 
 
-@pytest.mark.parametrize("oversized", [1, 4])
-def test_returned_oversize_wave_exits_nonzero(tmp_path, monkeypatch, oversized):
-    targets = tuple(canary.OVERSIZE_EVIDENCE_TARGET_IDS[:oversized])
-    monkeypatch.setattr(canary, "OVERSIZE_EVIDENCE_AUTHORITY", _authority(targets))
+@pytest.mark.parametrize("oversized", [1, 2])
+def test_returned_oversize_wave_exits_nonzero(
+    tmp_path, monkeypatch, oversized
+):
+    monkeypatch.setattr(canary, "OVERSIZE_EVIDENCE_AUTHORITY", _authority())
     pipeline = _Pipeline(
         wave=WaveResult(
-            cohort_size=oversized,
-            claimed=oversized,
-            requests=oversized,
+            cohort_size=2,
+            claimed=2,
+            requests=22,
+            browser_bootstraps=1,
             terminal_oversized_pages=oversized,
         )
     )
@@ -238,7 +436,28 @@ def test_returned_oversize_wave_exits_nonzero(tmp_path, monkeypatch, oversized):
             requests=2,
             recovered_from_raw=1,
         ),
-        WaveResult(cohort_size=2, claimed=2, fetched=2, requests=3),
+        WaveResult(cohort_size=2, claimed=2, fetched=2, requests=101),
+        WaveResult(
+            cohort_size=2,
+            claimed=2,
+            fetched=2,
+            requests=23,
+            browser_bootstraps=1,
+        ),
+        WaveResult(
+            cohort_size=2,
+            claimed=2,
+            fetched=2,
+            requests=2,
+            browser_bootstraps=1,
+        ),
+        WaveResult(
+            cohort_size=2,
+            claimed=2,
+            fetched=2,
+            requests=42,
+            browser_bootstraps=2,
+        ),
     ],
 )
 def test_any_inexact_returned_wave_stays_red(tmp_path, monkeypatch, wave):
@@ -252,20 +471,45 @@ def test_any_inexact_returned_wave_stays_red(tmp_path, monkeypatch, wave):
     assert pipeline.control.events[-2][2] is False
 
 
+def test_realistic_browser_bootstrap_is_bounded_not_a_false_red(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(canary, "OVERSIZE_EVIDENCE_AUTHORITY", _authority())
+    pipeline = _Pipeline(
+        wave=WaveResult(
+            cohort_size=2,
+            claimed=2,
+            fetched=2,
+            requests=22,
+            browser_bootstraps=1,
+            wire_bytes=2000,
+            decoded_html_bytes=4000,
+            browser_document_bytes=500_000,
+            browser_asset_bytes=100_000,
+        )
+    )
+
+    result = canary.run_oversize_evidence_canary(
+        _config(tmp_path), pipeline=pipeline
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["target_ids"] == list(TARGETS)
+    assert result["wave"]["requests"] == 22
+    assert result["wave"]["browser_bootstraps"] == 1
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
         {"logical_run_label": ""},
         {"logical_run_label": "spaces are invalid"},
-        {"proxy_file": Path("relative-proxy.txt")},
     ],
 )
-def test_config_rejects_invalid_operator_inputs(tmp_path, overrides):
+def test_config_rejects_invalid_operator_inputs(overrides):
     values = {
         "logical_run_label": "oversize-evidence-test",
-        "proxy_file": tmp_path / "proxy.txt",
     }
-    values["proxy_file"].write_text("proxy\n", encoding="utf-8")
     values.update(overrides)
 
     with pytest.raises(canary.OversizeEvidenceConfigurationError):

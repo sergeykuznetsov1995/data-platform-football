@@ -94,6 +94,7 @@ from scrapers.fbref.raw_store import (
 )
 from scrapers.fbref.settings import (
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
+    DEFAULT_REQUEST_RESERVATION_BYTES,
     MIN_DOMAIN_INTERVAL_SECONDS,
 )
 from scrapers.fbref.typed_bronze import (
@@ -106,6 +107,22 @@ from scrapers.fbref.typed_bronze import (
 
 
 NOW = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
+
+
+def test_nine_mib_page_reservation_is_shared_by_every_run_profile():
+    profiles = (
+        PipelineSettings(run_type="current"),
+        PipelineSettings(run_type="backfill"),
+        PipelineSettings(run_type="replay"),
+        PipelineSettings.acceptance(scope="current"),
+        PipelineSettings.acceptance(scope="history"),
+        PipelineSettings.acceptance_replay(),
+    )
+
+    assert DEFAULT_REQUEST_RESERVATION_BYTES == 9 * 1024 * 1024
+    assert {profile.request_reservation_bytes for profile in profiles} == {
+        DEFAULT_REQUEST_RESERVATION_BYTES
+    }
 
 
 def test_persistent_tail_reservation_failure_closes_empty_control_session():
@@ -235,8 +252,8 @@ def test_persistent_rollover_waits_for_retryable_tail_and_control_close():
 @pytest.mark.parametrize(
     ("request_limit", "byte_limit", "expected"),
     [
-        (100, 50 * 1024 * 1024, 9),
-        (200, 100 * 1024 * 1024, 16),
+        (100, 50 * 1024 * 1024, 5),
+        (200, 100 * 1024 * 1024, 9),
     ],
 )
 def test_wave_capacity_matches_live_canary_and_production_admission(
@@ -5465,17 +5482,18 @@ def test_single_match_season_zero_table_shape_reaches_not_applicable_semantics(
         "classification": "cup:club",
         "metadata": {"last_season": "2013-2014"},
     }
-    target = page_target_from_link(DiscoveredPageLink(
-        page_kind="season",
-        canonical_url=(
-            "https://fbref.com/en/comps/122/2013-2014/"
-            "2013-UEFA-Super-Cup-Stats"
-        ),
-        source_ids={
-            "competition_id": "122",
-            "season_id": "2013-2014",
-        },
-    ))
+    target = page_target_from_link(
+        DiscoveredPageLink(
+            page_kind="season",
+            canonical_url=(
+                "https://fbref.com/en/comps/122/2013-2014/2013-UEFA-Super-Cup-Stats"
+            ),
+            source_ids={
+                "competition_id": "122",
+                "season_id": "2013-2014",
+            },
+        )
+    )
     html = """
     <div id="content"><h1>2013 UEFA Super Cup Stats</h1>
       <a href="/en/comps/122/history/UEFA-Super-Cup-Seasons">Seasons</a>
@@ -5518,17 +5536,18 @@ def test_single_match_season_zero_table_shape_reaches_not_applicable_semantics(
 def test_zero_table_source_shell_fails_before_typed_promotion(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
-    target = page_target_from_link(DiscoveredPageLink(
-        page_kind="season",
-        canonical_url=(
-            "https://fbref.com/en/comps/122/2013-2014/"
-            "2013-UEFA-Super-Cup-Stats"
-        ),
-        source_ids={
-            "competition_id": "122",
-            "season_id": "2013-2014",
-        },
-    ))
+    target = page_target_from_link(
+        DiscoveredPageLink(
+            page_kind="season",
+            canonical_url=(
+                "https://fbref.com/en/comps/122/2013-2014/2013-UEFA-Super-Cup-Stats"
+            ),
+            source_ids={
+                "competition_id": "122",
+                "season_id": "2013-2014",
+            },
+        )
+    )
     html = "<html><body><p>temporary source shell</p></body></html>"
     refresh, record = _commit_for_parse(raw, target, html)
     control.frontier[record.target_id] = {
@@ -5698,8 +5717,7 @@ def test_current_season_mismatch_stays_loud(tmp_path):
         canonical_url="https://fbref.com/en/comps/11/Serie-A-M-Stats",
         season_id="2026-2027",
         schedule_href=(
-            "/en/comps/11/2025-2026/schedule/"
-            "2025-2026-Serie-A-M-Scores-and-Fixtures"
+            "/en/comps/11/2025-2026/schedule/2025-2026-Serie-A-M-Scores-and-Fixtures"
         ),
         historical=False,
     )
@@ -5734,19 +5752,22 @@ def _schedule_less_season_wave(tmp_path):
             "classification": "cup:club",
             "metadata": {},
         }
-    rejected = page_target_from_link(DiscoveredPageLink(
-        page_kind="season",
-        canonical_url="https://fbref.com/en/comps/76/2017/2017-NASL-Stats",
-        source_ids={"competition_id": "76", "season_id": "2017"},
-    ))
-    healthy = page_target_from_link(DiscoveredPageLink(
-        page_kind="season",
-        canonical_url=(
-            "https://fbref.com/en/comps/122/2013-2014/"
-            "2013-UEFA-Super-Cup-Stats"
-        ),
-        source_ids={"competition_id": "122", "season_id": "2013-2014"},
-    ))
+    rejected = page_target_from_link(
+        DiscoveredPageLink(
+            page_kind="season",
+            canonical_url="https://fbref.com/en/comps/76/2017/2017-NASL-Stats",
+            source_ids={"competition_id": "76", "season_id": "2017"},
+        )
+    )
+    healthy = page_target_from_link(
+        DiscoveredPageLink(
+            page_kind="season",
+            canonical_url=(
+                "https://fbref.com/en/comps/122/2013-2014/2013-UEFA-Super-Cup-Stats"
+            ),
+            source_ids={"competition_id": "122", "season_id": "2013-2014"},
+        )
+    )
     pages = [
         (rejected, """
         <div id="content"><h1>2017 NASL Stats</h1>
@@ -6010,8 +6031,7 @@ class BronzePageContractWriter(FakeWriter):
     def persist_page(self, page, **kwargs):
         if page.errors:
             raise GenericPersistenceError(
-                f"Page {page.target_id} contained parser errors: "
-                f"{page.errors[:3]}"
+                f"Page {page.target_id} contained parser errors: {page.errors[:3]}"
             )
         return super().persist_page(page, **kwargs)
 
@@ -6129,8 +6149,7 @@ def _malformed_archived_matchlog_wave(
     tmp_path,
     *,
     canonical_url=(
-        "https://fbref.com/en/players//matchlogs/2016-2017/misc/"
-        "Yan-Kaye-Match-Logs"
+        "https://fbref.com/en/players//matchlogs/2016-2017/misc/Yan-Kaye-Match-Logs"
     ),
     season_id="2016-2017",
 ):
@@ -10326,7 +10345,11 @@ def test_one_stubborn_page_is_deferred_instead_of_discarding_the_wave(
     # backoff instead of buying it another paid session here.
     assert [
         kwargs.get("session_retry", False) for kwargs in stubborn_failures
-    ] == [True, True, False]
+    ] == [
+        True,
+        True,
+        False,
+    ]
     # requeue=True is what drops the target from this run: it closes the run
     # target as 'skipped', which claim_targets will not take again.  It also
     # clears retry_after, so no delay may be claimed here -- pinned by
@@ -10469,8 +10492,14 @@ def test_a_late_re_solve_reserves_the_rotations_it_can_still_afford():
     )
     # Bytes bind the same way.
     assert affordable_clearance_reservation(
-        daily, request_remaining=200, byte_remaining=9 * 1024 * 1024
+        daily, request_remaining=200, byte_remaining=13 * 1024 * 1024
     ) == (20, 4 * 1024 * 1024)
+    assert (
+        affordable_clearance_reservation(
+            daily, request_remaining=200, byte_remaining=12 * 1024 * 1024
+        )
+        is None
+    )
     assert (
         affordable_clearance_reservation(
             daily, request_remaining=200, byte_remaining=8 * 1024 * 1024
@@ -11189,8 +11218,7 @@ class FakeNotFoundFetcher(FakeMovedFetcher):
     def fetch(self, url, **kwargs):
         self.events.append("http")
         raise FetchError(
-            f"FBref returned HTTP 404 for {url}; attempts=1; "
-            "status_history=404",
+            f"FBref returned HTTP 404 for {url}; attempts=1; status_history=404",
             error_class="http_status",
             http_status=404,
             wire_bytes=303,
@@ -11291,8 +11319,7 @@ class FakeSelectiveMatchNotFoundFetcher(FakeFetcher):
         self.remaining_not_found[match_id] = remaining - 1
         self.events.append("http_404")
         raise FetchError(
-            f"FBref returned HTTP 404 for {url}; attempts=1; "
-            "status_history=404",
+            f"FBref returned HTTP 404 for {url}; attempts=1; status_history=404",
             error_class="http_status",
             http_status=404,
             wire_bytes=303,

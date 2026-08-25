@@ -61,7 +61,7 @@ def test_default_task_settings_reserve_largest_supported_body_plus_overhead():
         shard_size=25,
     )
 
-    assert settings.request_reservation_bytes == 5 * 1024 * 1024
+    assert settings.request_reservation_bytes == 9 * 1024 * 1024
 
 
 @pytest.mark.unit
@@ -188,8 +188,7 @@ def test_live_wave_wrapper_accepts_int_and_templated_int_string(
 
         def communicate(self, *, timeout=None):
             return (
-                'FBREF_LIVE_WAVES_RESULT:{"batches": 1, '
-                '"frontier_closed": true}\n',
+                'FBREF_LIVE_WAVES_RESULT:{"batches": 1, "frontier_closed": true}\n',
                 "",
             )
 
@@ -2062,8 +2061,7 @@ def test_live_waves_use_one_process_group_for_all_batches(monkeypatch):
         def communicate(self, *, timeout=None):
             assert timeout == fbref_pipeline_tasks.LIVE_WAVES_TIMEOUT_SECONDS
             return (
-                'FBREF_LIVE_WAVES_RESULT:{"batches": 3, '
-                '"frontier_closed": true}\n',
+                'FBREF_LIVE_WAVES_RESULT:{"batches": 3, "frontier_closed": true}\n',
                 "",
             )
 
