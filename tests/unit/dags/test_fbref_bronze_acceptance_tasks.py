@@ -10,6 +10,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from scrapers.fbref.settings import DEFAULT_REQUEST_RESERVATION_BYTES, MIB
+
 from dags.utils import fbref_bronze_acceptance_tasks as acceptance
 
 
@@ -302,6 +304,8 @@ def test_live_wrapper_has_one_exact_paid_batch(monkeypatch):
     assert kwargs["request_limit"] == 100
     assert kwargs["byte_limit_mb"] == 50
     assert kwargs["shard_size"] == 25
+    assert kwargs["reservation_mb"] == DEFAULT_REQUEST_RESERVATION_BYTES // MIB
+    assert kwargs["reservation_mb"] == 5
     assert kwargs["max_batches"] == 1
 
 

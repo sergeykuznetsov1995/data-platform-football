@@ -7,6 +7,8 @@ import sys
 
 import pytest
 
+from scrapers.fbref.settings import DEFAULT_REQUEST_RESERVATION_BYTES, MIB
+
 
 @pytest.fixture(scope="module")
 def loaded_dag(request):
@@ -51,7 +53,9 @@ class TestFBrefBackfillTopology:
         assert params["byte_limit_mb"]._kw["enum"] == [50, 2048]
         assert params["shard_size"].default == 25
         assert params["shard_size"]._kw["maximum"] == 25
-        assert params["publish"].default is True
+        assert params["publish"].default is False
+        assert params["publish"]._kw["type"] == "boolean"
+        assert "dag_run.conf.get('publish'" in module.PUBLISH
         assert params["max_batches"].default == 80
         assert params["max_batches"]._kw["minimum"] == 1
         assert params["max_batches"]._kw["maximum"] == 80
@@ -80,7 +84,9 @@ class TestFBrefBackfillTopology:
         assert "after_season_id" not in module.dag._dag_kwargs["params"]
         assert seed.op_kwargs["request_limit"] == module.REQUEST_LIMIT
         assert seed.op_kwargs["byte_limit_mb"] == module.BYTE_LIMIT_MB
-        assert seed.op_kwargs["reservation_mb"] == 3
+        expected_reservation_mb = DEFAULT_REQUEST_RESERVATION_BYTES // MIB
+        assert expected_reservation_mb == 5
+        assert seed.op_kwargs["reservation_mb"] == expected_reservation_mb
         assert "competition_index" not in module.BACKFILL_PAGE_KINDS
         assert "competition" not in module.BACKFILL_PAGE_KINDS
 
@@ -119,7 +125,12 @@ class TestFBrefBackfillTopology:
         assert live.python_callable.__name__ == "run_fbref_live_waves"
         assert live.op_kwargs["run_type"] == "backfill"
         assert live.op_kwargs["max_batches"] == module.MAX_BATCHES
-        assert live.op_kwargs["reservation_mb"] == 3
+        expected_reservation_mb = DEFAULT_REQUEST_RESERVATION_BYTES // MIB
+        assert tasks["initialize_run"].op_kwargs["reservation_mb"] == (
+            expected_reservation_mb
+        )
+        assert recovery.op_kwargs["reservation_mb"] == expected_reservation_mb
+        assert live.op_kwargs["reservation_mb"] == expected_reservation_mb
         assert live._captured_kwargs["execution_timeout"].total_seconds() == (
             6 * 60 * 60 + 5 * 60
         )

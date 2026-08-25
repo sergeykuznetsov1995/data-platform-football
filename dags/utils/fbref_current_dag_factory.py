@@ -9,7 +9,11 @@ from airflow.models.param import Param
 from airflow.operators.python import BranchPythonOperator, PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
-from scrapers.fbref.settings import DEFAULT_DOMAIN_INTERVAL_SECONDS
+from scrapers.fbref.settings import (
+    DEFAULT_DOMAIN_INTERVAL_SECONDS,
+    DEFAULT_REQUEST_RESERVATION_BYTES,
+    MIB,
+)
 
 from utils.default_args import DEFAULT_ARGS
 from utils.fbref_pipeline_tasks import (
@@ -180,7 +184,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
             "request_limit": request_limit,
             "byte_limit_mb": byte_limit_mb,
             "shard_size": shard_size,
-            "reservation_mb": 3,
+            "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
             "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
         }
         if bootstrap_only:
@@ -240,7 +244,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
                 "request_limit": request_limit,
                 "byte_limit_mb": byte_limit_mb,
                 "shard_size": shard_size,
-                "reservation_mb": 3,
+                "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
             },
             trigger_rule="all_success",
         )
@@ -257,7 +261,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
                 "request_limit": request_limit,
                 "byte_limit_mb": byte_limit_mb,
                 "shard_size": shard_size,
-                "reservation_mb": 3,
+                "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
                 "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
                 "max_batches": CURRENT_MAX_BATCHES,
             },

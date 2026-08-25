@@ -17,6 +17,7 @@ from scrapers.fbref.proxy_lease import FBrefProxyLeaseError
 from scrapers.fbref.settings import (
     DEFAULT_HTTP_WIRE_OVERHEAD_RESERVATION_BYTES,
     DEFAULT_REQUEST_RESERVATION_BYTES,
+    DEFAULT_SEASON_STATS_HTTP_BODY_LIMIT_BYTES,
 )
 
 
@@ -51,6 +52,9 @@ def _fetcher(response, *, max_bytes=2 * 1024 * 1024):
         "real_bytes_by_resource_type": {"document": 100, "script": 50},
     }
     fetcher.max_html_bytes = max_bytes
+    # Keep the page-kind-specific ceiling explicit for __new__-constructed
+    # unit fakes. Production construction supplies the same bounded default.
+    fetcher.max_season_stats_html_bytes = 4 * 1024 * 1024
     fetcher.max_target_http_attempts = MAX_TARGET_HTTP_ATTEMPTS
     fetcher.status_retry_delay_seconds = 3.0
     fetcher._sleep = MagicMock()
@@ -302,6 +306,63 @@ def test_raw_contract_and_response_ceiling_fail_closed(monkeypatch):
     assert caught.value.error_class == "response_too_large"
 
 
+def test_ordinary_page_kind_keeps_two_mib_decoded_body_ceiling(monkeypatch):
+    monkeypatch.setattr(
+        "scrapers.fbref.fetcher._response_wire_size", lambda _response: 99
+    )
+    body = b"<html>" + b"x" * (2 * 1024 * 1024) + b"</html>"
+    fetcher = _fetcher(_response(body=body))
+
+    with pytest.raises(FetchError, match="2097152 bytes") as caught:
+        fetcher.fetch("https://fbref.com/en/matches/abcdef12", page_kind="match")
+
+    assert caught.value.error_class == "response_too_large"
+
+
+def test_season_stats_accepts_body_above_two_mib_up_to_four_mib(monkeypatch):
+    monkeypatch.setattr(
+        "scrapers.fbref.fetcher._response_wire_size", lambda _response: 99
+    )
+    wrapper = b"<html></html>"
+    body = (
+        b"<html>"
+        + b"x" * (4 * 1024 * 1024 - len(wrapper))
+        + b"</html>"
+    )
+    fetcher = _fetcher(_response(body=body))
+
+    result = fetcher.fetch(
+        "https://fbref.com/en/comps/9/2025-2026/playingtime/",
+        page_kind="season_stats",
+    )
+
+    assert result.body == body
+    assert result.decoded_html_bytes == len(body)
+
+
+def test_season_stats_streaming_aborts_above_four_mib(monkeypatch):
+    monkeypatch.setattr(
+        "scrapers.fbref.fetcher._response_wire_size",
+        lambda response: response.wire_size,
+    )
+    response = _response(
+        body=b"unused",
+        wire_size=4 * 1024 * 1024 + 1,
+        stream_chunks=[b"x" * (4 * 1024 * 1024), b"y", b"never-read"],
+    )
+    fetcher = _fetcher(response)
+
+    with pytest.raises(FetchError, match="4194304 bytes") as caught:
+        fetcher.fetch(
+            "https://fbref.com/en/comps/9/2025-2026/playingtime/",
+            page_kind="season_stats",
+        )
+
+    assert caught.value.error_class == "response_too_large"
+    assert caught.value.http_requests == 1
+    assert fetcher._http_session.get.call_count == 1
+
+
 def test_http_200_cloudflare_challenge_poison_is_session_scoped(monkeypatch):
     monkeypatch.setattr(
         "scrapers.fbref.fetcher._response_wire_size", lambda _response: 42
@@ -514,6 +575,10 @@ def test_constructor_passes_hard_browser_budget(monkeypatch):
     )
     assert constructor.call_args.kwargs["max_network_bytes"] == (
         DEFAULT_BROWSER_BYTE_LIMIT
+    )
+    assert fetcher.max_html_bytes == MAX_HTML_BYTES
+    assert fetcher.max_season_stats_html_bytes == (
+        DEFAULT_SEASON_STATS_HTTP_BODY_LIMIT_BYTES
     )
     assert constructor.call_args.kwargs["headless"] == "virtual"
     assert constructor.call_args.kwargs["humanize"] is True
@@ -777,10 +842,14 @@ def test_reset_clearance_drops_session_transport_and_metered_lease():
 
 
 def test_target_and_bootstrap_have_independent_byte_reservations():
+    assert MAX_HTML_BYTES == 2 * 1024 * 1024
     assert (
-        MAX_HTML_BYTES + DEFAULT_HTTP_WIRE_OVERHEAD_RESERVATION_BYTES
-        <= DEFAULT_REQUEST_RESERVATION_BYTES
+        DEFAULT_SEASON_STATS_HTTP_BODY_LIMIT_BYTES
+        + DEFAULT_HTTP_WIRE_OVERHEAD_RESERVATION_BYTES
+        == DEFAULT_REQUEST_RESERVATION_BYTES
     )
+    assert DEFAULT_SEASON_STATS_HTTP_BODY_LIMIT_BYTES == 4 * 1024 * 1024
+    assert DEFAULT_REQUEST_RESERVATION_BYTES == 5 * 1024 * 1024
     assert DEFAULT_BROWSER_BYTE_LIMIT == 4 * 1024 * 1024
 
 

@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from scrapers.fbref.settings import DEFAULT_REQUEST_RESERVATION_BYTES, MIB
+
 
 @pytest.fixture(scope="module")
 def loaded_dag(request):
@@ -108,13 +110,15 @@ class TestFBrefReplayTopology:
         assert initialize.op_kwargs["run_type"] == "replay"
         assert initialize.op_kwargs["request_limit"] == 0
         assert initialize.op_kwargs["byte_limit_mb"] == 0
-        assert initialize.op_kwargs["reservation_mb"] == 3
+        expected_reservation_mb = DEFAULT_REQUEST_RESERVATION_BYTES // MIB
+        assert expected_reservation_mb == 5
+        assert initialize.op_kwargs["reservation_mb"] == expected_reservation_mb
         for task_id, task in tasks.items():
             if task_id == "drain_replay":
                 assert task.op_kwargs["run_type"] == "replay"
                 assert task.op_kwargs["request_limit"] == 0
                 assert task.op_kwargs["byte_limit_mb"] == 0
-                assert task.op_kwargs["reservation_mb"] == 3
+                assert task.op_kwargs["reservation_mb"] == expected_reservation_mb
                 assert task.op_kwargs["source_control_run_id"] == (
                     module.SOURCE_CONTROL_RUN_ID
                 )

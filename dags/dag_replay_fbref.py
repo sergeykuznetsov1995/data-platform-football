@@ -14,8 +14,12 @@ from airflow.models.param import Param
 from airflow.operators.python import PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
-from scrapers.fbref.settings import DEFAULT_DOMAIN_INTERVAL_SECONDS
-from scrapers.fbref.settings import FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT
+from scrapers.fbref.settings import (
+    DEFAULT_DOMAIN_INTERVAL_SECONDS,
+    DEFAULT_REQUEST_RESERVATION_BYTES,
+    FBREF_PRODUCTION_SAFETY_REQUEST_LIMIT,
+    MIB,
+)
 
 from utils.default_args import DEFAULT_ARGS
 from utils.fbref_pipeline_tasks import (
@@ -121,7 +125,7 @@ with DAG(
             "request_limit": 0,
             "byte_limit_mb": 0,
             "shard_size": REPLAY_SHARD_SIZE,
-            "reservation_mb": 3,
+            "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
             "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
         },
         trigger_rule="all_success",
@@ -156,7 +160,7 @@ with DAG(
             "request_limit": 0,
             "byte_limit_mb": 0,
             "shard_size": REPLAY_SHARD_SIZE,
-            "reservation_mb": 3,
+            "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
             "max_waves": REPLAY_MAX_WAVES,
         },
         trigger_rule="all_success",
