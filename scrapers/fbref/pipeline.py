@@ -12,11 +12,13 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urlparse
 
@@ -7276,6 +7278,334 @@ class FBrefPipeline:
         return summary
 
 
+class OversizeEvidenceConfigurationError(ValueError):
+    """The fixed oversize diagnostic contract is not executable."""
+
+
+class OversizeEvidenceExecutionError(RuntimeError):
+    """Redacted oversize diagnostic failure with its lifecycle stage."""
+
+    def __init__(self, *, stage: str, run_id: str) -> None:
+        super().__init__(f"FBref oversize diagnostic failed during {stage}")
+        self.stage = stage
+        self.run_id = run_id
+
+
+@dataclass(frozen=True)
+class OversizeEvidenceAuthority:
+    """Immutable authority replaced only by a separately reviewed commit."""
+
+    review_state: str
+    source_run_id: str
+    terminal_snapshot_sha256: str
+    target_ids: Sequence[str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "review_state", str(self.review_state).strip())
+        object.__setattr__(self, "source_run_id", str(self.source_run_id).strip())
+        object.__setattr__(
+            self,
+            "terminal_snapshot_sha256",
+            str(self.terminal_snapshot_sha256).strip(),
+        )
+        object.__setattr__(
+            self,
+            "target_ids",
+            tuple(str(item).strip() for item in self.target_ids),
+        )
+
+
+@dataclass(frozen=True)
+class OversizeEvidenceConfig:
+    logical_run_label: str
+    proxy_file: Path
+
+    def __post_init__(self) -> None:
+        label = str(self.logical_run_label).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,159}", label):
+            raise OversizeEvidenceConfigurationError(
+                "logical run label is invalid"
+            )
+        proxy_file = Path(self.proxy_file)
+        try:
+            valid_proxy = (
+                proxy_file.is_absolute()
+                and proxy_file.is_file()
+                and proxy_file.stat().st_size > 0
+            )
+        except OSError:
+            valid_proxy = False
+        if not valid_proxy:
+            raise OversizeEvidenceConfigurationError(
+                "proxy file must be absolute, readable, and non-empty"
+            )
+        object.__setattr__(self, "logical_run_label", label)
+        object.__setattr__(self, "proxy_file", proxy_file)
+
+
+CANARY_DAG_ID = "fbref_oversize_evidence_canary"
+_OVERSIZE_EVIDENCE_PAGE_KINDS = ("season_stats",)
+_OVERSIZE_EVIDENCE_LOCK_TTL_SECONDS = 4 * 60 * 60
+_OVERSIZE_EVIDENCE_TARGET_ID = re.compile(
+    r"fbref:season_stats:[^:\s]{1,64}:[^:\s]{1,64}:"
+    r"(?:keepers|misc|playingtime|shooting|standard)\Z"
+)
+_OVERSIZE_EVIDENCE_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_ZERO_UUID = "00000000-0000-0000-0000-000000000000"
+_ZERO_SHA256 = "0" * 64
+OVERSIZE_EVIDENCE_TARGET_IDS = (
+    "fbref:season_stats:6:2022:playingtime",
+    "fbref:season_stats:569:2025-2026:playingtime",
+    "fbref:season_stats:569:2025-2026:standard",
+    "fbref:season_stats:678:2021:playingtime",
+)
+
+# Baked from the exact saved terminal TSV. There is deliberately no runtime
+# source/digest/target override: any authority change requires another commit
+# and independent review before this fetch-only diagnostic may be authorized.
+OVERSIZE_EVIDENCE_AUTHORITY = OversizeEvidenceAuthority(
+    review_state="REVIEWED",
+    source_run_id="94838bac-786a-5d59-99e4-f6a2b3f7971e",
+    terminal_snapshot_sha256=(
+        "b114e1139c50857b2985ead5ef2f72083660fc75cc9d1e9466874959a77bd543"
+    ),
+    target_ids=OVERSIZE_EVIDENCE_TARGET_IDS,
+)
+
+
+def _validate_oversize_evidence_authority() -> OversizeEvidenceAuthority:
+    authority = OVERSIZE_EVIDENCE_AUTHORITY
+    if authority.review_state != "REVIEWED":
+        raise OversizeEvidenceConfigurationError(
+            "baked snapshot authority is unreviewed"
+        )
+    try:
+        source_run_id = str(uuid.UUID(authority.source_run_id))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise OversizeEvidenceConfigurationError(
+            "baked source run id is invalid"
+        ) from exc
+    if source_run_id == _ZERO_UUID:
+        raise OversizeEvidenceConfigurationError(
+            "baked source run id is a sentinel"
+        )
+    snapshot_sha256 = authority.terminal_snapshot_sha256
+    if (
+        not _OVERSIZE_EVIDENCE_SHA256.fullmatch(snapshot_sha256)
+        or snapshot_sha256 == _ZERO_SHA256
+    ):
+        raise OversizeEvidenceConfigurationError(
+            "baked terminal snapshot SHA256 is invalid"
+        )
+    target_ids = tuple(authority.target_ids)
+    if not 1 <= len(target_ids) <= 25:
+        raise OversizeEvidenceConfigurationError(
+            "baked exact cohort must contain between 1 and 25 targets"
+        )
+    if len(target_ids) != len(set(target_ids)):
+        raise OversizeEvidenceConfigurationError(
+            "baked exact cohort contains duplicates"
+        )
+    if any(
+        not _OVERSIZE_EVIDENCE_TARGET_ID.fullmatch(item)
+        for item in target_ids
+    ):
+        raise OversizeEvidenceConfigurationError(
+            "baked cohort contains a non-oversize season-stat target"
+        )
+    return OversizeEvidenceAuthority(
+        review_state="REVIEWED",
+        source_run_id=source_run_id,
+        terminal_snapshot_sha256=snapshot_sha256,
+        target_ids=target_ids,
+    )
+
+
+def _validate_oversize_evidence_wave_result(
+    result: object,
+    *,
+    expected_targets: int,
+) -> WaveResult:
+    if not isinstance(result, WaveResult):
+        raise RuntimeError("fetch wave returned an unexpected result type")
+    exact_counts = (
+        result.cohort_size == expected_targets
+        and result.claimed == expected_targets
+        and result.fetched == expected_targets
+        and result.requests == expected_targets
+    )
+    zero_outcomes = all(
+        getattr(result, name) == 0
+        for name in (
+            "recovered_from_raw",
+            "parsed",
+            "typed_promoted",
+            "stale_typed_observations_skipped",
+            "seeded",
+            "skipped_ineligible",
+            "requeued_at_budget",
+            "requeued_dead_clearance",
+            "requeued_session_exhaustion",
+            "deferred_dead_clearance",
+            "contract_quarantined",
+            "moved_pages_skipped",
+            "deferred_match_not_found",
+            "terminal_oversized_pages",
+            "browser_bootstraps",
+        )
+    )
+    nonnegative_bytes = all(
+        value >= 0
+        for value in (
+            result.wire_bytes,
+            result.decoded_html_bytes,
+            result.browser_document_bytes,
+            result.browser_asset_bytes,
+        )
+    )
+    if (
+        not exact_counts
+        or not zero_outcomes
+        or not nonnegative_bytes
+        or result.budget_exhausted
+        or result.failures
+    ):
+        raise RuntimeError(
+            "fetch wave result violates the exact oversize evidence contract"
+        )
+    return result
+
+
+def _fail_oversize_evidence_run(
+    pipeline: object,
+    run_id: str,
+    *,
+    release_lock: bool,
+) -> None:
+    """Attempt both failure finalization and lock release, in that order."""
+
+    try:
+        pipeline.control.finish_run(run_id, succeeded=False)
+    finally:
+        if release_lock:
+            pipeline.control.release_publication_lock(run_id)
+
+
+def run_oversize_evidence_canary(
+    config: OversizeEvidenceConfig,
+    *,
+    pipeline: Optional[object] = None,
+) -> dict[str, object]:
+    """Execute the baked exact cohort through one Bronze fetch-only wave."""
+
+    authority = _validate_oversize_evidence_authority()
+    run_id = make_control_run_id(
+        config.logical_run_label,
+        dag_id=CANARY_DAG_ID,
+    )
+    active_pipeline = pipeline or FBrefPipeline.from_env()
+    settings = PipelineSettings.acceptance(
+        scope="current",
+        proxy_file=str(config.proxy_file),
+    )
+    stage = "initialize"
+    lock_acquired = False
+    run_initialized = False
+    try:
+        initialized = active_pipeline.initialize_acceptance_run(
+            airflow_run_id=config.logical_run_label,
+            dag_id=CANARY_DAG_ID,
+            settings=settings,
+            execution_metadata={
+                "reviewed_source_run_id": authority.source_run_id,
+                "reviewed_terminal_snapshot_sha256": (
+                    authority.terminal_snapshot_sha256
+                ),
+            },
+        )
+        if initialized != run_id:
+            raise RuntimeError("unexpected control run identity")
+        run_initialized = True
+
+        stage = "acquire_publication_lock"
+        active_pipeline.control.acquire_publication_lock(
+            run_id,
+            dag_id=CANARY_DAG_ID,
+            ttl_seconds=_OVERSIZE_EVIDENCE_LOCK_TTL_SECONDS,
+        )
+        lock_acquired = True
+
+        stage = "seed_exact_cohort"
+        routes = tuple(
+            sorted(
+                {
+                    target_id.rsplit(":", 1)[-1]
+                    for target_id in authority.target_ids
+                }
+            )
+        )
+        frozen = active_pipeline.seed_acceptance_cohort(
+            run_id,
+            authority.target_ids,
+            settings=settings,
+            required_page_kinds=_OVERSIZE_EVIDENCE_PAGE_KINDS,
+            required_routes=routes,
+            coverage_slots={
+                f"oversize:{index}": target_id
+                for index, target_id in enumerate(authority.target_ids)
+            },
+        )
+        if tuple(frozen.get("target_ids") or ()) != tuple(
+            authority.target_ids
+        ):
+            raise RuntimeError("frozen cohort differs from requested cohort")
+
+        stage = "fetch"
+        wave = active_pipeline.fetch_wave(
+            run_id,
+            worker_id=f"oversize-evidence:{run_id}",
+            page_kinds=_OVERSIZE_EVIDENCE_PAGE_KINDS,
+            settings=settings,
+        )
+        stage = "validate_fetch_result"
+        wave = _validate_oversize_evidence_wave_result(
+            wave,
+            expected_targets=len(authority.target_ids),
+        )
+
+        # A successful run must never retain a writer fence. Release first;
+        # if release fails, the except path can only attempt a failed terminal
+        # state and the caller receives an exception/nonzero verdict.
+        stage = "release_publication_lock"
+        active_pipeline.control.release_publication_lock(run_id)
+        lock_acquired = False
+
+        stage = "finish"
+        active_pipeline.control.finish_run(run_id, succeeded=True)
+    except Exception:  # noqa: BLE001 - expose only the redacted lifecycle stage
+        if run_initialized:
+            try:
+                _fail_oversize_evidence_run(
+                    active_pipeline,
+                    run_id,
+                    release_lock=lock_acquired,
+                )
+            except Exception:  # noqa: BLE001 - original stage remains primary
+                pass
+        raise OversizeEvidenceExecutionError(stage=stage, run_id=run_id) from None
+
+    return {
+        "status": "succeeded",
+        "run_id": run_id,
+        "target_ids": list(authority.target_ids),
+        "request_limit": settings.request_limit,
+        "byte_limit": settings.byte_limit,
+        "shard_size": settings.shard_size,
+        "publication_eligible": False,
+        "wave": wave.as_dict(),
+    }
+
+
 __all__ = [
     "BACKFILL_SEASON_COHORT_RESERVATION_BYTES",
     "DEFAULT_BYTE_LIMIT",
@@ -7288,6 +7618,12 @@ __all__ = [
     "LiveRunResult",
     "MIB",
     "MAX_SHARD_SIZE",
+    "OVERSIZE_EVIDENCE_AUTHORITY",
+    "OVERSIZE_EVIDENCE_TARGET_IDS",
+    "OversizeEvidenceAuthority",
+    "OversizeEvidenceConfig",
+    "OversizeEvidenceConfigurationError",
+    "OversizeEvidenceExecutionError",
     "ParseWaveError",
     "PipelineError",
     "PipelineSettings",
@@ -7299,5 +7635,6 @@ __all__ = [
     "frontier_target",
     "live_wave_target_capacity",
     "page_target_from_link",
+    "run_oversize_evidence_canary",
     "wave_target_capacity",
 ]

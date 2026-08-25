@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import re
 from pathlib import Path
 
@@ -10,23 +12,27 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SQL_DIR = PROJECT_ROOT / "docs" / "operations" / "sql"
-REMEDIATION_FILE = (
-    SQL_DIR / "fbref_20260825_reanimate_exact_oversize_evidence.sql"
-)
+REMEDIATION_FILE = SQL_DIR / "fbref_20260825_reanimate_exact_oversize_evidence.sql"
 GATE_FILE = SQL_DIR / "fbref_20260825_oversize_evidence_canary_gate.sql"
 FETCHER_FILE = PROJECT_ROOT / "scrapers" / "fbref" / "fetcher.py"
-RUNNER_FILE = (
+PIPELINE_FILE = PROJECT_ROOT / "scrapers" / "fbref" / "pipeline.py"
+POSTGRES_REGRESSION_FILE = (
     PROJECT_ROOT
-    / "scripts"
-    / "research"
-    / "run_fbref_oversize_evidence_canary.py"
+    / "tests"
+    / "integration"
+    / "sql"
+    / "verify_fbref_oversize_evidence_gate_pg.sh"
 )
-PROVISIONAL_TARGET_IDS = {
+TERMINAL_TARGET_IDS = {
     "fbref:season_stats:6:2022:playingtime",
     "fbref:season_stats:678:2021:playingtime",
     "fbref:season_stats:569:2025-2026:playingtime",
     "fbref:season_stats:569:2025-2026:standard",
 }
+TERMINAL_SOURCE_RUN_ID = "94838bac-786a-5d59-99e4-f6a2b3f7971e"
+TERMINAL_SNAPSHOT_SHA256 = (
+    "b114e1139c50857b2985ead5ef2f72083660fc75cc9d1e9466874959a77bd543"
+)
 
 pytestmark = pytest.mark.unit
 
@@ -37,9 +43,7 @@ def _raw(path: Path) -> str:
 
 def _sql(path: Path) -> str:
     uncommented = "\n".join(
-        line
-        for line in _raw(path).splitlines()
-        if not line.lstrip().startswith("--")
+        line for line in _raw(path).splitlines() if not line.lstrip().startswith("--")
     )
     return re.sub(r"\s+", " ", uncommented).strip().lower()
 
@@ -48,33 +52,60 @@ def _literal_target_ids(path: Path) -> set[str]:
     return set(re.findall(r"'(?P<id>fbref:season_stats:[^']+)'", _raw(path)))
 
 
-def test_operator_order_is_explicitly_provisional_and_non_executable() -> None:
+def _expected_snapshot_rows() -> list[tuple[str, ...]]:
+    pattern = re.compile(
+        r"\(\s*'(?P<target_id>fbref:season_stats:[^']+)'\s*,\s*"
+        r"'(?P<canonical_url>[^']+)'\s*,\s*"
+        r"'(?P<target_status>[^']+)'\s*,\s*"
+        r"'(?P<attempt_status>[^']+)'\s*,\s*"
+        r"'(?P<error_class>[^']+)'\s*,\s*"
+        r"(?P<http_status>\d+)\s*,\s*"
+        r"(?P<http_request_count>\d+)\s*,\s*"
+        r"'(?P<error_message>[^']+)'\s*\)",
+        re.DOTALL,
+    )
+    return [match.groups() for match in pattern.finditer(_raw(REMEDIATION_FILE))]
+
+
+def test_operator_order_marks_terminal_candidate_no_go_pending_review() -> None:
     raw = _raw(REMEDIATION_FILE)
     fetcher = _raw(FETCHER_FILE)
 
     assert "fbref-camoufox-metered-warm-http-v10" in raw
     assert "fbref-camoufox-metered-warm-http-v10" in fetcher
-    assert "PROVISIONAL — PROD1 IS NOT TERMINAL" in raw
+    assert "TERMINAL AUTHORITY BAKED" in raw
+    assert "CANDIDATE NO-GO UNTIL INDEPENDENT REVIEW" in raw
     assert "DO NOT EXECUTE" in raw
-    assert "reviewed_source_run_id" in raw
-    assert "reviewed_terminal_snapshot_sha256" in raw
-    assert "replace only after the source run is terminal" in raw.lower()
-    assert "94838bac-786a-5d59-99e4-f6a2b3f7971e" in raw
-    assert "read-only terminal snapshot" in raw.lower()
+    assert "fbref_oversize_baked_source_run_id" in raw
+    assert "fbref_oversize_baked_snapshot_sha256" in raw
+    assert TERMINAL_SOURCE_RUN_ID in raw
+    assert TERMINAL_SNAPSHOT_SHA256 in raw
+    assert "saved terminal snapshot" in raw.lower()
     assert "git diff --check" in raw
     assert "do not infer or install a new\n-- decoded-body cap" in raw.lower()
 
 
-def test_placeholder_guard_refuses_unreviewed_source_snapshot() -> None:
-    sql = _sql(REMEDIATION_FILE)
+@pytest.mark.parametrize("path", [REMEDIATION_FILE, GATE_FILE])
+def test_baked_reviewed_authority_and_unreviewed_guard_are_not_operator_inputs(
+    path,
+) -> None:
+    raw = _raw(path)
+    sql = _sql(path)
 
     assert r"\set on_error_stop on" in sql
-    assert r"\if :{?reviewed_source_run_id}" in sql
-    assert r"\if :{?reviewed_terminal_snapshot_sha256}" in sql
-    assert "source run id is required after terminal review" in sql
-    assert "terminal snapshot sha256 is required after terminal review" in sql
-    assert "begin;" in sql
-    assert "commit;" in sql
+    assert r"\set fbref_oversize_authority_state reviewed" in sql
+    assert (r"\set fbref_oversize_baked_source_run_id " + TERMINAL_SOURCE_RUN_ID) in sql
+    assert (
+        r"\set fbref_oversize_baked_snapshot_sha256 " + TERMINAL_SNAPSHOT_SHA256
+    ) in sql
+    assert "fbref oversize authority is unreviewed" in sql
+    assert ":'fbref_oversize_authority_state' = 'reviewed'" in sql
+    assert ":'fbref_oversize_baked_source_run_id'::uuid" in sql
+    assert ":'fbref_oversize_baked_snapshot_sha256'" in sql
+    assert r"\if :{?reviewed_source_run_id}" not in sql
+    assert r"\if :{?reviewed_terminal_snapshot_sha256}" not in sql
+    assert "--set=reviewed_source_run_id" not in raw
+    assert "--set=reviewed_terminal_snapshot_sha256" not in raw
 
 
 def test_source_run_and_terminal_oversize_set_are_executable_guards() -> None:
@@ -83,7 +114,7 @@ def test_source_run_and_terminal_oversize_set_are_executable_guards() -> None:
     assert "from fbref_control.crawl_run" in sql
     assert "from fbref_control.run_target" in sql
     assert "fbref_control.fetch_attempt" in sql
-    assert "run.run_id = :'reviewed_source_run_id'::uuid" in sql
+    assert "run.run_id = :'fbref_oversize_baked_source_run_id'::uuid" in sql
     assert "run.finished_at is not null" in sql
     assert "run.status in ('succeeded', 'failed', 'cancelled')" in sql
     assert "target.status = 'failed'" in sql
@@ -106,16 +137,42 @@ def test_source_run_and_terminal_oversize_set_are_executable_guards() -> None:
     assert "computed_snapshot_sha256" in sql
 
 
-def test_provisional_expected_set_is_exactly_the_observed_four() -> None:
+def test_expected_set_is_exactly_the_terminal_four() -> None:
     ids = _literal_target_ids(REMEDIATION_FILE)
 
-    assert ids == PROVISIONAL_TARGET_IDS
+    assert ids == TERMINAL_TARGET_IDS
     assert len(ids) == 4
     raw = _raw(REMEDIATION_FILE)
     assert "expected_count <> 4" not in raw
     assert "exact-three" not in raw.lower()
     assert "all three" not in raw.lower()
     assert "either target" not in raw.lower()
+
+
+def test_baked_terminal_rows_reproduce_reviewed_snapshot_digest() -> None:
+    rows = _expected_snapshot_rows()
+    serialized = "".join(
+        "\t".join(row) + "\n" for row in sorted(rows, key=lambda row: row[0])
+    ).encode()
+
+    assert len(rows) == 4
+    assert hashlib.sha256(serialized).hexdigest() == TERMINAL_SNAPSHOT_SHA256
+    standard = next(row for row in rows if row[0].endswith(":569:2025-2026:standard"))
+    assert standard[1] == "https://fbref.com/en/comps/569/stats/Copa-del-Rey-Stats"
+    assert standard[7].endswith("/en/comps/569/stats/Copa-del-Rey-Stats")
+
+
+def test_terminal_runner_cohort_matches_remediation_exactly() -> None:
+    runner_ids = set(
+        re.findall(
+            r'"(?P<id>fbref:season_stats:[A-Za-z0-9-]+:'
+            r'[A-Za-z0-9-]+:(?:playingtime|standard))"',
+            _raw(PIPELINE_FILE),
+        )
+    )
+
+    assert runner_ids == TERMINAL_TARGET_IDS
+    assert runner_ids == _literal_target_ids(REMEDIATION_FILE)
 
 
 def test_transaction_serializes_frontier_and_rejects_writer_state() -> None:
@@ -154,9 +211,7 @@ def test_frontier_selection_is_exact_and_preserves_history_fields() -> None:
     assert "from fbref_20260825_oversize_evidence_selected as selected" in sql
     assert "returning frontier.target_id" in sql
 
-    update_targets = re.findall(
-        r"\bupdate (fbref_control\.[a-z0-9_]+)", sql
-    )
+    update_targets = re.findall(r"\bupdate (fbref_control\.[a-z0-9_]+)", sql)
     assert update_targets == ["fbref_control.page_frontier"]
     update = sql[sql.index("update fbref_control.page_frontier") :]
     set_clause = update[update.index(" set ") : update.index(" from ")]
@@ -192,7 +247,10 @@ def test_exact_cohort_mechanism_does_not_rely_on_due_time() -> None:
 
 
 def test_purpose_built_runner_is_fetch_only_and_physically_nonpublishing() -> None:
-    runner = _raw(RUNNER_FILE)
+    from scrapers.fbref import pipeline
+
+    runner = inspect.getsource(pipeline.run_oversize_evidence_canary)
+    authority = inspect.getsource(pipeline._validate_oversize_evidence_authority)
     raw = _raw(REMEDIATION_FILE)
 
     assert "PipelineSettings.acceptance" in runner
@@ -203,10 +261,17 @@ def test_purpose_built_runner_is_fetch_only_and_physically_nonpublishing() -> No
     assert "parse_wave" not in runner
     assert "validate_and_finish" not in runner
     assert "trigger" not in runner.lower()
-    assert "run_fbref_oversize_evidence_canary.py" in raw
-    assert "--reviewed-source-run-id" in raw
-    assert "--reviewed-terminal-snapshot-sha256" in raw
-    assert raw.count("--target-id fbref:season_stats:") == 4
+    assert "from scrapers.fbref.pipeline import OversizeEvidenceConfig" in raw
+    assert "run_oversize_evidence_canary" in raw
+    assert "/opt/airflow/scripts" not in raw
+    assert "OVERSIZE_EVIDENCE_AUTHORITY" in authority
+    assert 'review_state="REVIEWED"' in authority
+    assert "_validate_oversize_evidence_authority" in runner
+    assert "_validate_oversize_evidence_wave_result" in runner
+    assert "--reviewed-source-run-id" not in raw
+    assert "--reviewed-terminal-snapshot-sha256" not in raw
+    assert "--target-id" not in raw
+    assert hashlib.sha256(PIPELINE_FILE.read_bytes()).hexdigest() in raw
 
 
 def test_post_run_gate_is_separate_read_only_and_fail_closed() -> None:
@@ -225,22 +290,74 @@ def test_post_run_gate_is_separate_read_only_and_fail_closed() -> None:
     assert "byte_limit = 52428800" in sql
     assert "from fbref_control.publication_lock" in sql
     assert "publication_lock.released_at is null" in sql
-    assert "attempt_count = 1" in sql
-    assert "intended_attempt_count = 1" in sql
-    assert "request_count = 1" in sql
-    assert "http_3xx_count = 0" in sql
+    assert "all_attempts as" in sql
+    assert "join fbref_control.fetch_attempt as attempt" in sql
+    assert "attempt.run_id = run.run_id" in sql
+    assert "count(*) = (select count(*) from expected)" in sql
+    assert "sum(all_attempts.http_request_count)" in sql
+    assert "run.requests_used = attempt_totals.request_count" in sql
+    assert "attempt_totals.request_count = (select count(*) from expected)" in sql
+    assert "registered_target_id is not null" in sql
+    assert "expected_target_id is not null" in sql
+    assert (
+        "all_attempts.attempt_logical_refresh_id = "
+        "all_attempts.intended_logical_refresh_id"
+    ) in sql
+    assert "http_status_history = array[200]::integer[]" in sql
+    assert "'all_attempts'" in sql
     assert "foreign logical refresh" in raw.lower()
     assert "response_too_large is diagnostic red" in raw.lower()
     assert "NO-GO" in raw
     assert "raise exception" in sql
 
 
-def test_post_run_gate_derives_targets_from_reviewed_source_run() -> None:
+def test_post_run_gate_binds_and_recomputes_reviewed_source_snapshot() -> None:
     sql = _sql(GATE_FILE)
 
-    assert "run.run_id = :'reviewed_source_run_id'::uuid" in sql
+    assert "run.run_id = :'fbref_oversize_baked_source_run_id'::uuid" in sql
     assert "source_target.target_id" in sql
     assert "source_attempt.error_class = 'response_too_large'" in sql
-    assert "expected except select target_id from actual" in sql
-    assert "actual except select target_id from expected" in sql
+    assert "source_snapshot_digest" in sql
+    assert "encode(sha256(convert_to(" in sql
+    assert "snapshot_sha256 = :'fbref_oversize_baked_snapshot_sha256'" in sql
+    assert (
+        "metadata ->> 'reviewed_source_run_id' = :'fbref_oversize_baked_source_run_id'"
+    ) in sql
+    assert (
+        "metadata ->> 'reviewed_terminal_snapshot_sha256' = "
+        ":'fbref_oversize_baked_snapshot_sha256'"
+    ) in sql
+    assert "expected except select target_id from diagnostic_targets" in sql
+    assert "diagnostic_targets except select target_id from expected" in sql
     assert not _literal_target_ids(GATE_FILE)
+
+
+def test_post_run_gate_requires_succeeded_run_exactly() -> None:
+    sql = _sql(GATE_FILE)
+
+    assert "run.status = 'succeeded'" in sql
+    assert "run.status in ('succeeded', 'failed')" not in sql
+
+
+def test_no_non_deliverable_script_is_required_by_the_runbook() -> None:
+    raw = _raw(REMEDIATION_FILE)
+
+    assert "run_fbref_oversize_evidence_canary.py" not in raw
+    assert "verify_fbref_oversize_evidence_gate_pg.sh" not in raw
+    assert "/opt/airflow/scripts" not in raw
+
+
+def test_disposable_postgres_regression_covers_false_pass_cases() -> None:
+    raw = _raw(POSTGRES_REGRESSION_FILE)
+
+    assert "postgres:16-alpine" in raw
+    assert "fbref_20260825_oversize_evidence_canary_gate.sql" in raw
+    assert "unreviewed-authority" in raw
+    assert "reviewed-pass" in raw
+    assert "run-accounting-mismatch" in raw
+    assert "orphan-extra-attempt" in raw
+    assert "failed-run" in raw
+    assert "provenance-mismatch" in raw
+    assert "source-digest-mismatch" in raw
+    assert "NO-GO" in raw
+    assert "PASS: exact FBref oversize diagnostic" in raw

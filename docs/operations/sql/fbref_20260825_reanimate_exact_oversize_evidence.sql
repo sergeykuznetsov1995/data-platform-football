@@ -1,10 +1,13 @@
--- PROVISIONAL — PROD1 IS NOT TERMINAL — DO NOT EXECUTE.
+-- TERMINAL AUTHORITY BAKED — CANDIDATE NO-GO UNTIL INDEPENDENT REVIEW.
+-- DO NOT EXECUTE, DEPLOY, OR PRESENT AS OPERATIONALLY APPROVED FROM THIS
+-- UNREVIEWED CANDIDATE COMMIT.
 --
--- FBref exact oversize evidence remediation (2026-08-25).  The four VALUES
--- below are only the latest observed set from source run
--- 94838bac-786a-5d59-99e4-f6a2b3f7971e.  They are not a frozen authority.
--- Replace only after the source run is terminal and a second reviewer has
--- approved the read-only terminal snapshot, its SHA256, and this diff.
+-- FBref exact oversize evidence remediation (2026-08-25). The four VALUES,
+-- source run, and digest below are baked from the saved terminal snapshot
+-- `/root/fbref-production-20260825/oversize-terminal-snapshot-94838bac.tsv`.
+-- The source is terminal failed and the exact UTF-8 TSV SHA256 is
+-- b114e1139c50857b2985ead5ef2f72083660fc75cc9d1e9466874959a77bd543.
+-- A separate independent review must approve this candidate before use.
 --
 -- Terminal-review procedure (read-only until the final apply command):
 --
@@ -16,32 +19,36 @@
 -- 2. Export the SELECT below with `psql -XAt -F $'\t'` (no header, ordered by
 --    target_id, one LF per row), then run `sha256sum` on that exact UTF-8 TSV.
 --    The executable hash guard uses the identical tab/LF serialization.
---    Save the snapshot outside this repository, replace the provisional VALUES
---    below exactly, update the
---    expected set in the unit test, and run `git diff --check`. Missing,
---    extra, duplicate, or changed rows require a new review; never waive the
---    executable bidirectional equality below.
+--    The saved snapshot and both independent SHA256 methods must equal the
+--    baked values below, the matching gate authority, and the pipeline's
+--    OVERSIZE_EVIDENCE_AUTHORITY. The unit test must contain the same exact target set and
+--    `git diff --check` must pass. Missing, extra, duplicate, or changed rows
+--    require a new candidate commit and review; never waive the executable
+--    bidirectional equality below. Operator variables are not an approval
+--    mechanism and cannot override the baked values.
 -- 3. Deploy fbref-camoufox-metered-warm-http-v10, then run this read-only
 --    runtime attestation in the scheduler. It must print the version and three
 --    hashes exactly; a mismatch is NO-GO:
---    docker exec airflow-scheduler /opt/legacy-scraper-venv/bin/python -B -c "import hashlib,inspect,pathlib; from scrapers.fbref.fetcher import FETCHER_VERSION; from scrapers.fbref.control.store import ControlStore; from scrapers.fbref.pipeline import FBrefPipeline; a=hashlib.sha256(inspect.getsource(ControlStore.create_explicit_run_cohort).encode()).hexdigest(); b=hashlib.sha256(inspect.getsource(FBrefPipeline.seed_acceptance_cohort).encode()).hexdigest(); c=hashlib.sha256(pathlib.Path('/opt/airflow/scripts/research/run_fbref_oversize_evidence_canary.py').read_bytes()).hexdigest(); assert FETCHER_VERSION == 'fbref-camoufox-metered-warm-http-v10'; assert a == '15c5f5e578b1e0dac676b2069e66c8d9340ea1d0e824797aadaaeaea176edb0f'; assert b == '979865b0254f44532428678598c03ede952212a56cfce275f8eb07cc548f541b'; assert c == '7580817f152b19ed830d54faf7e08757086e625969aa23d5e4d208294d17fc0b'; print(FETCHER_VERSION,a,b,c)"
--- 4. Only with FBref ingestion paused and all writer/lease guards clear, apply:
+--    docker exec airflow-scheduler /opt/legacy-scraper-venv/bin/python -B -c "import hashlib,inspect,pathlib; from scrapers.fbref.fetcher import FETCHER_VERSION; from scrapers.fbref.control.store import ControlStore; from scrapers.fbref.pipeline import FBrefPipeline,run_oversize_evidence_canary; a=hashlib.sha256(inspect.getsource(ControlStore.create_explicit_run_cohort).encode()).hexdigest(); b=hashlib.sha256(inspect.getsource(FBrefPipeline.seed_acceptance_cohort).encode()).hexdigest(); c=hashlib.sha256(pathlib.Path(inspect.getsourcefile(FBrefPipeline)).read_bytes()).hexdigest(); assert callable(run_oversize_evidence_canary); assert FETCHER_VERSION == 'fbref-camoufox-metered-warm-http-v10'; assert a == '15c5f5e578b1e0dac676b2069e66c8d9340ea1d0e824797aadaaeaea176edb0f'; assert b == '979865b0254f44532428678598c03ede952212a56cfce275f8eb07cc548f541b'; assert c == 'aef0694a8fb5223dac78637aa0dfb402629187d05dfcaf669f53c3e782856ac3'; print(FETCHER_VERSION,a,b,c)"
+-- 4. Only after that reviewed commit, with FBref ingestion paused and every
+--    writer/lease guard clear, apply the baked artifact without authority
+--    parameters:
 --    psql "$FBREF_CONTROL_DB_URI" \
---      --set=reviewed_source_run_id=<terminal-reviewed-control-run-uuid> \
---      --set=reviewed_terminal_snapshot_sha256=<sha256-from-step-1> \
 --      --file=docs/operations/sql/fbref_20260825_reanimate_exact_oversize_evidence.sql
--- 5. Run the purpose-built fetch-only command below after replacing every
---    placeholder and reconciling its repeated --target-id arguments to the
---    reviewed final VALUES. It creates the 100 requests / 50 MiB / shard 25
+-- 5. Run the purpose-built fetch-only command. Its source UUID, snapshot
+--    digest, and exact targets come only from the matching baked authority in
+--    the reviewed in-place pipeline module. It creates the 100 requests / 50 MiB / shard 25
 --    acceptance_nonpublishing profile and calls seed_acceptance_cohort /
 --    create_explicit_run_cohort, so the immutable exact cohort is installed
 --    before fetch and membership does not depend on due-frontier ordering:
---    docker exec airflow-scheduler /opt/legacy-scraper-venv/bin/python -B /opt/airflow/scripts/research/run_fbref_oversize_evidence_canary.py --run-label <unique-manual-airflow-run-id> --proxy-file <scheduler-proxy-file> --reviewed-source-run-id <same-reviewed-control-run-uuid> --reviewed-terminal-snapshot-sha256 <same-reviewed-sha256> --target-id fbref:season_stats:6:2022:playingtime --target-id fbref:season_stats:569:2025-2026:playingtime --target-id fbref:season_stats:569:2025-2026:standard --target-id fbref:season_stats:678:2021:playingtime
---    The runner records publication_eligible=false, runs exactly one live wave,
---    and contains no parse, Silver/Gold, or publication finalizer call.
--- 6. Run the separate read-only gate with both exact identifiers:
+--    docker exec airflow-scheduler /opt/legacy-scraper-venv/bin/python -B -c "import json,sys; from pathlib import Path; from scrapers.fbref.pipeline import OversizeEvidenceConfig,run_oversize_evidence_canary; config=OversizeEvidenceConfig(logical_run_label=sys.argv[1],proxy_file=Path(sys.argv[2])); print(json.dumps(run_oversize_evidence_canary(config),sort_keys=True))" <unique-manual-airflow-run-id> <scheduler-proxy-file>
+--    The callable records publication_eligible=false, runs exactly one live
+--    wave, rejects any request count beyond the exact target count, releases
+--    its publication lock before committing success, and contains no parse,
+--    Silver/Gold, or publication finalizer call.
+-- 6. Run the separate read-only gate with the diagnostic identifier only; its
+--    source/snapshot authority is baked and independently reverified:
 --    psql "$FBREF_CONTROL_DB_URI" \
---      --set=reviewed_source_run_id=<same-reviewed-control-run-uuid> \
 --      --set=airflow_run_id=<exact-diagnostic-airflow-run-id> \
 --      --file=docs/operations/sql/fbref_20260825_oversize_evidence_canary_gate.sql
 --
@@ -54,26 +61,42 @@
 -- every frontier history/evidence field; it changes only state and updated_at.
 
 \set ON_ERROR_STOP on
+\set fbref_oversize_authority_state REVIEWED
+\set fbref_oversize_baked_source_run_id 94838bac-786a-5d59-99e4-f6a2b3f7971e
+\set fbref_oversize_baked_snapshot_sha256 b114e1139c50857b2985ead5ef2f72083660fc75cc9d1e9466874959a77bd543
 
-\if :{?reviewed_source_run_id}
+SELECT (
+    :'fbref_oversize_authority_state' = 'REVIEWED'
+    AND :'fbref_oversize_baked_source_run_id'::uuid
+        <> '00000000-0000-0000-0000-000000000000'::uuid
+    AND :'fbref_oversize_baked_snapshot_sha256' ~ '^[0-9a-f]{64}$'
+    AND :'fbref_oversize_baked_snapshot_sha256'
+        <> repeat('0', 64)
+) AS fbref_oversize_authority_reviewed
+\gset
+
+\if :fbref_oversize_authority_reviewed
 \else
-DO $missing_source_run_id$
+DO $unreviewed_authority$
 BEGIN
     RAISE EXCEPTION
-        'FBref oversize remediation refused: source run id is required after terminal review';
+        'FBref oversize authority is unreviewed; later reviewed commit required';
 END
-$missing_source_run_id$;
+$unreviewed_authority$;
 \endif
 
-\if :{?reviewed_terminal_snapshot_sha256}
-\else
-DO $missing_snapshot_sha256$
-BEGIN
-    RAISE EXCEPTION
-        'FBref oversize remediation refused: terminal snapshot SHA256 is required after terminal review';
-END
-$missing_snapshot_sha256$;
-\endif
+SELECT set_config(
+    'fbref.oversize_baked_source_run_id',
+    :'fbref_oversize_baked_source_run_id',
+    false
+) AS fbref_oversize_source_binding
+\gset
+SELECT set_config(
+    'fbref.oversize_baked_snapshot_sha256',
+    :'fbref_oversize_baked_snapshot_sha256',
+    false
+) AS fbref_oversize_snapshot_binding
+\gset
 
 BEGIN;
 
@@ -146,9 +169,9 @@ INSERT INTO fbref_20260825_oversize_evidence_expected VALUES
     ),
     (
         'fbref:season_stats:569:2025-2026:standard',
-        'https://fbref.com/en/comps/569/standard/Copa-del-Rey-Stats',
+        'https://fbref.com/en/comps/569/stats/Copa-del-Rey-Stats',
         'failed', 'failed', 'response_too_large', 200, 1,
-        'FBref cumulative response bodies exceeded 4194304 bytes for https://fbref.com/en/comps/569/standard/Copa-del-Rey-Stats'
+        'FBref cumulative response bodies exceeded 4194304 bytes for https://fbref.com/en/comps/569/stats/Copa-del-Rey-Stats'
     ),
     (
         'fbref:season_stats:678:2021:playingtime',
@@ -177,7 +200,7 @@ JOIN fbref_control.fetch_attempt AS attempt
   ON attempt.run_id = target.run_id
  AND attempt.target_id = target.target_id
  AND attempt.logical_refresh_id = target.logical_refresh_id
-WHERE run.run_id = :'reviewed_source_run_id'::uuid
+WHERE run.run_id = :'fbref_oversize_baked_source_run_id'::uuid
   AND run.finished_at IS NOT NULL
   AND run.status IN ('succeeded', 'failed', 'cancelled')
   AND target.status = 'failed'
@@ -201,7 +224,9 @@ DECLARE
 BEGIN
     SELECT count(*) INTO source_run_count
     FROM fbref_control.crawl_run AS run
-    WHERE run.run_id = :'reviewed_source_run_id'::uuid
+    WHERE run.run_id = current_setting(
+        'fbref.oversize_baked_source_run_id'
+    )::uuid
       AND run.finished_at IS NOT NULL
       AND run.status IN ('succeeded', 'failed', 'cancelled');
 
@@ -225,7 +250,9 @@ BEGIN
     IF EXISTS (
         SELECT 1
         FROM fbref_control.run_target AS target
-        WHERE target.run_id = :'reviewed_source_run_id'::uuid
+        WHERE target.run_id = current_setting(
+            'fbref.oversize_baked_source_run_id'
+        )::uuid
           AND target.status IN ('pending', 'leased', 'retry')
     ) THEN
         RAISE EXCEPTION
@@ -253,9 +280,9 @@ BEGIN
         RAISE EXCEPTION
             'FBref oversize remediation refused: terminal set mismatch';
     END IF;
-    IF :'reviewed_terminal_snapshot_sha256' !~ '^[0-9a-f]{64}$'
-       OR computed_snapshot_sha256
-          <> :'reviewed_terminal_snapshot_sha256' THEN
+    IF computed_snapshot_sha256 <> current_setting(
+        'fbref.oversize_baked_snapshot_sha256'
+    ) THEN
         RAISE EXCEPTION
             'FBref oversize remediation refused: terminal snapshot SHA256 mismatch';
     END IF;
