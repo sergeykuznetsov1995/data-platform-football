@@ -8818,6 +8818,224 @@ def test_live_runner_reuses_one_fetch_session_and_parses_after_each_raw_batch(
     assert result.parse.parsed == 1
 
 
+def test_current_live_run_reconciles_scope_once_after_all_waves(tmp_path):
+    """Current claims remain scope-checked while global repair is deferred."""
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    events = []
+    fetch_results = iter((WaveResult(claimed=1), WaveResult()))
+    parse_results = iter((WaveResult(cohort_size=1, parsed=1), WaveResult()))
+
+    def fetch_wave(*_args, **_kwargs):
+        events.append("fetch")
+        return next(fetch_results)
+
+    def parse_wave(*_args, **_kwargs):
+        events.append("parse")
+        # This is the same request a real parser makes after it seeds scope.
+        pipeline._reconcile_frontier_scope()
+        return next(parse_results)
+
+    pipeline.fetch_wave = fetch_wave
+    pipeline.parse_wave = parse_wave
+    def reconcile_frontier_scope(**_kwargs):
+        events.append("scope_reconcile")
+        return {"reopened": 1}
+
+    control.reconcile_frontier_scope = reconcile_frontier_scope
+
+    result = pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="current-live",
+        page_kinds=["competition"],
+        settings=_settings("current"),
+        max_batches=2,
+    )
+
+    # The final repair reopened a target after the last zero-claim wave.
+    assert result.frontier_closed is False
+    assert events == ["fetch", "parse", "fetch", "parse", "scope_reconcile"]
+
+
+def test_history_live_run_keeps_per_wave_scope_reconciliation(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    events = []
+    fetch_results = iter((WaveResult(claimed=1), WaveResult()))
+
+    pipeline.fetch_wave = lambda *_args, **_kwargs: next(fetch_results)
+
+    def parse_wave(*_args, **_kwargs):
+        pipeline._reconcile_frontier_scope()
+        return WaveResult(cohort_size=1, parsed=1)
+
+    pipeline.parse_wave = parse_wave
+    control.reconcile_frontier_scope = lambda **_kwargs: events.append(
+        "scope_reconcile"
+    )
+
+    pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="history-live",
+        page_kinds=["season"],
+        settings=_settings("backfill"),
+        max_batches=2,
+    )
+
+    assert events == ["scope_reconcile", "scope_reconcile"]
+
+
+def test_failed_current_live_run_still_reconciles_deferred_scope(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    events = []
+    fetch_calls = 0
+
+    def fetch_wave(*_args, **_kwargs):
+        nonlocal fetch_calls
+        fetch_calls += 1
+        if fetch_calls == 2:
+            raise FetchWaveError("second wave failed")
+        return WaveResult(claimed=1)
+
+    def parse_wave(*_args, **_kwargs):
+        pipeline._reconcile_frontier_scope()
+        return WaveResult(cohort_size=1, parsed=1)
+
+    pipeline.fetch_wave = fetch_wave
+    pipeline.parse_wave = parse_wave
+    control.reconcile_frontier_scope = lambda **_kwargs: events.append(
+        "scope_reconcile"
+    )
+
+    with pytest.raises(FetchWaveError, match="second wave failed"):
+        pipeline.run_live_waves(
+            str(uuid.uuid4()),
+            worker_id="current-live",
+            page_kinds=["competition"],
+            settings=_settings("current"),
+            max_batches=2,
+        )
+
+    assert events == ["scope_reconcile"]
+
+
+def test_current_final_scope_reconcile_precedes_persistent_settlement(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = PersistentFakeControl(raw)
+    control.run["bytes_used"] = 120
+    control.run["bytes_reserved"] = 10
+    control._tail_reserved = 10
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    fetch_results = iter((WaveResult(claimed=1), WaveResult()))
+    parse_calls = 0
+
+    def fetch_wave(*_args, _live_session, **_kwargs):
+        fetcher = PersistentFakeFetcher(control.events)
+        fetcher.session_id = "deferred-current-session"
+        _live_session.fetcher = fetcher
+        _live_session.session_id = "deferred-current-session"
+        _live_session.state = "active"
+        _live_session.tail_reserved = True
+        return next(fetch_results)
+
+    def parse_wave(*_args, **_kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        if parse_calls == 1:
+            pipeline._reconcile_frontier_scope()
+            return WaveResult(cohort_size=1, parsed=1)
+        return WaveResult()
+
+    pipeline.fetch_wave = fetch_wave
+    pipeline.parse_wave = parse_wave
+
+    def reconcile_frontier_scope(**_kwargs):
+        control.events.append("scope_reconcile")
+        return {"reopened": 1}
+
+    control.reconcile_frontier_scope = reconcile_frontier_scope
+
+    pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="current-live",
+        page_kinds=["competition"],
+        settings=_persistent_settings(),
+        max_batches=2,
+    )
+
+    expected = (
+        "scope_reconcile",
+        "provider_finalize",
+        "tail_settle",
+        "session_close",
+        "persistent_reconcile",
+    )
+    positions = [control.events.index(event) for event in expected]
+    assert positions == sorted(positions)
+
+
+def test_nested_current_scope_deferral_cannot_report_false_closure(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    events = []
+    fetch_results = iter((WaveResult(claimed=1), WaveResult()))
+    parse_results = iter((WaveResult(cohort_size=1, parsed=1), WaveResult()))
+
+    pipeline.fetch_wave = lambda *_args, **_kwargs: next(fetch_results)
+
+    def parse_wave(*_args, **_kwargs):
+        pipeline._reconcile_frontier_scope()
+        return next(parse_results)
+
+    pipeline.parse_wave = parse_wave
+
+    def reconcile_frontier_scope(**_kwargs):
+        events.append("scope_reconcile")
+        return {"reopened": 1}
+
+    control.reconcile_frontier_scope = reconcile_frontier_scope
+
+    with pipeline._deferred_scope_reconcile():
+        result = pipeline.run_live_waves(
+            str(uuid.uuid4()),
+            worker_id="current-live",
+            page_kinds=["competition"],
+            settings=_settings("current"),
+            max_batches=2,
+        )
+        assert result.frontier_closed is False
+        assert events == []
+
+    assert events == ["scope_reconcile"]
+
+
+def test_nested_current_deferral_keeps_true_closure_without_pending_repair(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    pipeline.fetch_wave = lambda *_args, **_kwargs: WaveResult()
+    pipeline.parse_wave = lambda *_args, **_kwargs: WaveResult()
+
+    with pipeline._deferred_scope_reconcile():
+        result = pipeline.run_live_waves(
+            str(uuid.uuid4()),
+            worker_id="current-live",
+            page_kinds=["competition"],
+            settings=_settings("current"),
+            max_batches=1,
+        )
+
+    assert result.frontier_closed is True
+
+
 def test_live_runner_closes_near_deadline_session_before_offline_parse(
     tmp_path,
 ):

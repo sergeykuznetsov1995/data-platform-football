@@ -937,6 +937,21 @@ def test_claim_rechecks_registry_scope_before_any_network_lease():
     assert "NOT (frontier.source_ids ? 'competition_id')" not in source
 
 
+def test_claim_scope_cte_filters_a_new_queued_target_without_valid_scope():
+    """Deferring repair cannot lease a newly queued unresolved target."""
+
+    source = inspect.getsource(ControlStore.claim_targets)
+
+    assert "frontier.state IN ('queued', 'retry')" in source
+    assert "LEFT JOIN scope_rollup AS scope" in source
+    assert "scope.scope_count > 0" in source
+    assert "NOT COALESCE(scope.competition_missing, true)" in source
+    assert "NOT COALESCE(scope.has_unknown, true)" in source
+    assert "NOT COALESCE(scope.has_female, false)" in source
+    assert "NOT COALESCE(scope.inactive_competition, true)" in source
+    assert "NOT COALESCE(scope.invalid_season, true)" in source
+
+
 def test_explicit_cohort_cannot_steal_target_from_active_run_or_canary():
     first_run = str(uuid.uuid4())
     canary_run = str(uuid.uuid4())
