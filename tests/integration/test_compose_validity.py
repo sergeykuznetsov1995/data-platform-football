@@ -244,11 +244,17 @@ class TestComposeFile:
         assert scheduler["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"] == (
             "0" * 64
         )
-        assert scheduler["healthcheck"]["test"][0:4] == [
-            "CMD",
-            "python",
-            "/opt/airflow/scripts/sofascore_runtime_preflight.py",
-            "scheduler-health",
+        # The artifact/campaign binds above stay; the healthcheck does not.
+        # This is the SHARED platform scheduler — it holds the other five
+        # sources and does not run the SofaScore contour (that lives in project
+        # ``sofascore-airflow`` with its own compose and its own healthcheck,
+        # and every SofaScore DAG registered here is paused).  Gating five
+        # foreign sources on the SofaScore gateway answering, and writing a
+        # probe file into the campaign directory every 30 s, was collateral
+        # damage (code review of PR #1216).
+        assert scheduler["healthcheck"]["test"] == [
+            "CMD-SHELL",
+            'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"',
         ]
 
     def test_fbref_filter_renders_one_production_safety_circuit(self):
