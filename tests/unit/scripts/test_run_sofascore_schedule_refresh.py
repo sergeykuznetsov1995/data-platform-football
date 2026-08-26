@@ -8,6 +8,15 @@ from contextlib import contextmanager
 import pytest
 
 from dags.scripts import run_sofascore_schedule_refresh as refresh
+from dags.utils.sofascore_dq import SofaScoreDQViolation
+from scrapers.sofascore.discovery import (
+    DiscoveryHTTPError,
+    DiscoverySchemaError,
+)
+from scrapers.sofascore.schedule_refresh import (
+    DailyEventsSchemaError,
+    ScheduleSweepError,
+)
 
 
 SNAPSHOT = {
@@ -41,6 +50,9 @@ SNAPSHOT = {
             "seasons": [
                 {"source_season_id": 88001, "start_year": 2026,
                  "canonical_season": "2627", "metadata_status": "pending"},
+                # The season before it: what makes a rollover PROVABLE by year.
+                {"source_season_id": 70001, "start_year": 2025,
+                 "canonical_season": "2526", "metadata_status": "ready"},
             ],
         },
         {
@@ -142,7 +154,7 @@ def offline(monkeypatch, tmp_path):
             for tournament, season in broken
             if (start_pages or {}).get((tournament, season))
         ]
-        return (
+        collected = (
             [f"event-{tournament}-{season}" for tournament, season in served],
             {"targets": len(targets), "pages": len(served),
              "events": len(served), "missing": 0, "truncated": len(truncated),
@@ -151,17 +163,40 @@ def offline(monkeypatch, tmp_path):
              "malformed_resumed": len(broken)},
             truncated,
         )
+        # A VERDICT about the slice: the real fetcher raises it only after the
+        # walk finished, and carries everything it collected on the exception.
+        if set(targets) & set(calls.get("sweep_verdict", ())):
+            raise ScheduleSweepError(
+                "seasons that owe a page served none",
+                fetched=collected[0], counters=collected[1],
+                incomplete=collected[2],
+            )
+        return collected
 
     def fixtures(client, targets, raw_store):
         targets = list(targets)
         calls.setdefault("fixtures", []).append(targets)
-        if set(targets) & set(calls.get("fixtures_fail", ())):
-            raise refresh.ScheduleSweepError("calendar pages broke the contract")
-        return (
-            [f"fixture-{tournament}-{season}" for tournament, season in targets],
-            {"targets": len(targets), "pages": len(targets),
-             "events": len(targets), "missing": 0, "foreign_season": 0},
+        broken = [pair for pair in targets if pair in calls.get("fixtures_fail", ())]
+        served = [pair for pair in targets if pair not in broken]
+        collected = (
+            [f"fixture-{tournament}-{season}" for tournament, season in served],
+            {"targets": len(targets), "pages": len(served),
+             "events": len(served), "missing": 0, "foreign_season": 0,
+             "malformed": len(broken), "truncated": 0},
         )
+        # The real threshold needs at least two broken calendars among those
+        # that answered, and the verdict CARRIES what the walk collected — a
+        # stub that raised bare, on one target, hid both (Sol r28 #5).
+        if len(broken) >= 2:
+            raise ScheduleSweepError(
+                f"{len(broken)} calendar pages broke the endpoint contract",
+                fetched=collected[0], counters=collected[1],
+            )
+        if set(targets) & set(calls.get("fixtures_boom", ())):
+            raise DiscoverySchemaError("calendar body is not an object")
+        if set(targets) & set(calls.get("fixtures_transport", ())):
+            raise DiscoveryHTTPError("HTTP 503 from the gateway", status_code=503)
+        return collected
 
     def rows(events, snapshot, exclude_leagues):
         events = list(events)
@@ -287,6 +322,9 @@ def test_main_refreshes_due_seasons_and_seeds_unknown_ones(offline):
         "targets": _digest(),
         # This run wrote rows, so the emptiness alarm is back at zero.
         "idle_runs": 0,
+        # Every class was WALKED, so none of them is holding its anchor after a
+        # cut-short walk (audit after Sol r28).
+        "interrupted_runs": {"due": 0, "stale": 0, "seed": 0},
         # Both classes have a single member, so each anchor stays where it is.
         "index": {"due": [7, 96518], "stale": [7, 96518], "seed": [7, 96518]},
     }
@@ -800,10 +838,14 @@ def test_bronze_partitions_splits_the_anchor_from_what_owes_a_page(monkeypatch):
 
     known, due, played = refresh.bronze_partitions(36)
 
+    # SS-31 has not kicked off at all: its only rows are the lane's OWN fixture
+    # rows, which say nothing about the tail chain.  Counting them as "seeded"
+    # took a season out of ``seed`` before one tail page had been written, and
+    # the tail classes then settled the chase on page 0 for ever (audit after
+    # Sol r28).
     assert known == {
         ("SS-7", "2627"): 1_000_000,
         ("SS-23", "2627"): None,
-        ("SS-31", "2627"): None,
     }
     assert due == {("SS-7", "2627")}
     assert played == {("SS-7", "2627"), ("SS-23", "2627")}
@@ -1135,22 +1177,22 @@ def test_a_broken_calendar_fails_the_run_only_after_the_class_banks_its_work(
     offline["incomplete"].write_text(
         json.dumps({"seasons": [[23, 88001, 9, 1_700_000]]})
     )
-    offline["calls"]["known"] = {("SS-7", "2627"), ("SS-23", "2627")}
-    # The calendar breaks for the QUEUED season, so the failure lands on the
-    # seed class — after the chain has come back from the fetcher (Sol r25: a
-    # blanket failure hit the earlier ``stale`` class and never exercised this
-    # path at all).  Its own page breaks too, which is what puts it back on the
-    # queue at the page it owed.
+    # Both targets are new, so BOTH sit in the seed class: the calendar verdict
+    # needs two broken pages among those that answered, exactly as in
+    # production (Sol r28 #5 — the stub used to raise on a single target).  The
+    # queued season's own page breaks too, which is what puts it back on the
+    # queue at the page it owed, and the failure therefore lands on the seed
+    # class AFTER the chain came back from the fetcher (Sol r25).
     offline["calls"]["broken"] = {(23, 88001)}
-    offline["calls"]["fixtures_fail"] = {(23, 88001)}
+    offline["calls"]["fixtures_fail"] = {(23, 88001), (7, 96518)}
 
     assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
 
     report = json.loads(offline["output"].read_text())
     assert report["status"] == "failed"
     assert "ScheduleSweepError" in report["errors"][0]
-    # The classes before it banked their rows...
-    assert report["stale_rows"] > 0 and offline["calls"]["writes"]
+    # The tail pages this class paid for reached Bronze...
+    assert report["seed_rows"] > 0 and offline["calls"]["writes"]
     # ...the seed cursor moved, so the next run takes the NEXT slice...
     assert json.loads(offline["cursor"].read_text())["index"]["seed"] is not None
     # ...and the chain is queued again WITH its attempt counted, which is what
@@ -1158,6 +1200,360 @@ def test_a_broken_calendar_fails_the_run_only_after_the_class_banks_its_work(
     assert json.loads(offline["incomplete"].read_text())["seasons"] == [
         [23, 88001, 9, 1_700_000, 1]
     ]
+
+
+@pytest.mark.unit
+def test_a_sweep_verdict_is_banked_before_the_run_fails(offline):
+    # Sol r27 #1: the final thresholds of the tail walk raise AFTER the whole
+    # slice was walked but BEFORE the rows and the cut-short chains are
+    # returned, so MERGE, cursor and queue never happened and the next run
+    # rebuilt the identical slice — for ever.  The verdict now carries what the
+    # walk collected, and the class banks it first.
+    offline["calls"]["known"] = {("SS-7", "2627"), ("SS-23", "2627")}
+    offline["calls"]["sweep_verdict"] = {(7, 96518)}
+    offline["calls"]["truncate"] = {(7, 96518)}
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+
+    report = json.loads(offline["output"].read_text())
+    assert report["status"] == "failed"
+    assert "ScheduleSweepError" in report["errors"][0]
+    # The rows the walk did collect reached Bronze — the verdict carried the
+    # events it had already paid for, they were not thrown away with it...
+    handed = [event for call in offline["calls"]["rows"] for event in call[0]]
+    assert "event-7-96518" in handed
+    assert report["stale_rows"] > 0 and offline["calls"]["writes"]
+    # ...the cursor moved, so the next run takes the NEXT slice...
+    assert json.loads(offline["cursor"].read_text())["index"]["stale"] is not None
+    # ...and the chain it cut short is queued, not lost.
+    assert json.loads(offline["incomplete"].read_text())["seasons"] == [
+        [7, 96518, 4, 1_700_000, 0]
+    ]
+
+
+@pytest.mark.unit
+def test_a_row_verdict_is_banked_and_writes_nothing(offline, monkeypatch):
+    # Sol r27 #2: the verdicts of the row builder (and the DQ gate behind it)
+    # left the class the same way — before MERGE, cursor and queue.  Nothing may
+    # be written (those rows never passed validation), but the class still banks
+    # its cursor, or the same slice comes back for ever.
+    def boom(*_args):
+        raise DailyEventsSchemaError(
+            "events of ready tournaments lack id or season.id",
+            counters={"events": 5, "matched": 0, "malformed": 5},
+        )
+
+    monkeypatch.setattr(refresh, "schedule_rows_from_events", boom)
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+
+    report = json.loads(offline["output"].read_text())
+    assert "DailyEventsSchemaError" in report["errors"][0]
+    assert offline["calls"]["writes"] == [] and report["rows_written"] == 0
+    # (the row builder is called for every class, so the first one carries it)
+    assert report["due_counters"]["malformed"] == 5
+    assert json.loads(offline["cursor"].read_text())["index"]["due"] is not None
+
+
+@pytest.mark.unit
+def test_a_queued_chain_of_a_tournament_out_of_sight_stays_queued(offline):
+    # Sol r27 #3: dropping every entry outside the target list treats "the
+    # tournament is not in this snapshot" (not ready yet, momentarily missing)
+    # as a rollover, and loses the tail of a season that is merely out of sight.
+    # Only a tournament that IS a target, with another season, proves a rollover.
+    offline["incomplete"].write_text(
+        json.dumps({"seasons": [[404, 55001, 3, 1_500_000]]})
+    )
+    offline["calls"]["known"] = {("SS-7", "2627"), ("SS-23", "2627")}
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
+
+    assert json.loads(offline["incomplete"].read_text())["seasons"] == [
+        [404, 55001, 3, 1_500_000, 0]
+    ]
+    assert json.loads(offline["output"].read_text())["abandoned_chains"] == []
+
+
+@pytest.mark.unit
+def test_abandoned_chains_reach_the_report_even_when_the_run_fails(offline):
+    # Sol r27 #4: the trimmed queue was already on disk while the report said
+    # nothing, because a deferred verdict raises before the end of the sweep.
+    offline["incomplete"].write_text(
+        json.dumps({"seasons": [[23, 70001, 4, 1_600_000]]})
+    )
+    offline["calls"]["known"] = {("SS-7", "2627"), ("SS-23", "2627")}
+    offline["calls"]["sweep_verdict"] = {(7, 96518)}
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+
+    report = json.loads(offline["output"].read_text())
+    assert report["status"] == "failed"
+    assert report["abandoned_chains"] == [[23, 70001, 4, 1_600_000]]
+    assert json.loads(offline["incomplete"].read_text())["seasons"] == []
+
+
+@pytest.mark.unit
+def test_a_calendar_failure_that_is_not_a_verdict_keeps_the_anchor(offline):
+    # Sol r28 #1: a failure that is NOT a verdict about the slice (a 200 whose
+    # body is not an object, a non-404 transport failure, a bug) means the walk
+    # did not finish — the anchor may NOT move, or the lane would step over a
+    # slice it never covered.  What was already PAID FOR is still banked: the
+    # tail rows reach Bronze and the queue is written, because throwing them
+    # away costs the run twice (Sol rounds 26-28).
+    offline["calls"]["known"] = {("SS-7", "2627"), ("SS-23", "2627")}
+    offline["calls"]["fixtures_boom"] = {(7, 96518)}
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+
+    report = json.loads(offline["output"].read_text())
+    assert report["status"] == "failed"
+    assert "DiscoverySchemaError" in report["errors"][0]
+    assert report["stale_rows"] > 0 and offline["calls"]["writes"]
+    assert json.loads(offline["cursor"].read_text())["index"]["stale"] is None
+
+
+@pytest.mark.unit
+def test_a_queued_chain_of_a_season_that_rolled_over_leaves_the_queue(offline):
+    # Code review after Sol r26: the retry slice is taken from the CURRENT
+    # target list, so an entry outside it can never be attempted — it ages
+    # neither forward nor out.  After a season rollover the previous season
+    # stops being the tournament's current one, and its entry would sit in the
+    # file for ever, growing it by a campaign a year.
+    offline["incomplete"].write_text(
+        json.dumps({"seasons": [[23, 88001, 9, 1_700_000], [23, 70001, 4, 1_600_000]]})
+    )
+    offline["calls"]["known"] = {("SS-7", "2627"), ("SS-23", "2627")}
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
+
+    # 88001 is the current season of tournament 23 and was resumed; 70001 is
+    # not a target at all any more.
+    assert json.loads(offline["incomplete"].read_text())["seasons"] == []
+    assert json.loads(offline["output"].read_text())["abandoned_chains"] == [
+        [23, 70001, 4, 1_600_000]
+    ]
+
+
+@pytest.mark.unit
+def test_a_calendar_transport_failure_keeps_the_anchor_too(offline):
+    # Sol r28 #5: the non-404 transport path was never exercised, and it is the
+    # one the gateway actually produces (429/409/503).  It is not a verdict:
+    # rows and queue are banked, the anchor stays.
+    offline["calls"]["known"] = {("SS-7", "2627"), ("SS-23", "2627")}
+    offline["calls"]["fixtures_transport"] = {(7, 96518)}
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+
+    report = json.loads(offline["output"].read_text())
+    assert "DiscoveryHTTPError" in report["errors"][0]
+    assert report["stale_rows"] > 0 and offline["calls"]["writes"]
+    assert json.loads(offline["cursor"].read_text())["index"]["stale"] is None
+
+
+@pytest.mark.unit
+def test_a_dq_refusal_is_a_verdict_and_writes_nothing(offline, monkeypatch):
+    # Sol r28 #5: the DQ gate is a REAL failure mode of the row builder
+    # (validate_schedule_rows(...).require()), and the test that claimed to
+    # cover it raised a schema error instead.
+    def refuse(*_args):
+        raise SofaScoreDQViolation("bronze.sofascore_schedule gate failed")
+
+    monkeypatch.setattr(refresh, "schedule_rows_from_events", refuse)
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+
+    report = json.loads(offline["output"].read_text())
+    assert "SofaScoreDQViolation" in report["errors"][0]
+    assert offline["calls"]["writes"] == [] and report["rows_written"] == 0
+    # A verdict about the slice: the anchor moves, or the same slice comes back
+    # for ever...
+    assert json.loads(offline["cursor"].read_text())["index"]["due"] is not None
+
+
+@pytest.mark.unit
+def test_a_class_that_wrote_no_row_does_not_move_its_chains(offline, monkeypatch):
+    # Sol r28 #3: the fresh queue entry points at the page AFTER the ones just
+    # read, so banking it when the rows were NOT written skips a prefix that
+    # never reached Bronze.
+    offline["incomplete"].write_text(
+        json.dumps({"seasons": [[23, 88001, 9, 1_700_000]]})
+    )
+    # Only the queued season is known, so BOTH targets land in the seed class:
+    # the verdict therefore lands on the class that actually carries the chain.
+    offline["calls"]["known"] = {("SS-23", "2627")}
+    offline["calls"]["truncate"] = {(23, 88001)}
+    offline["calls"]["truncate_at"] = 14
+    monkeypatch.setattr(
+        refresh, "schedule_rows_from_events",
+        lambda *a: ([], {"events": 3, "matched": 0, "excluded": 3,
+                         "unknown_seasons": 0}),
+    )
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+
+    # The chain still owes page 9, not 14: nothing of pages 9-13 is in Bronze.
+    assert json.loads(offline["incomplete"].read_text())["seasons"] == [
+        [23, 88001, 9, 1_700_000, 0]
+    ]
+
+
+@pytest.mark.unit
+def test_a_bug_in_the_row_builder_is_not_dressed_up_as_a_verdict(offline, monkeypatch):
+    # Sol r28 #2: catching every exception around the row builder turned a
+    # programming error into a "verdict" that banks a cursor.  A bug must fail
+    # the run outright, with nothing committed.
+    def boom(*_args):
+        raise TypeError("normalize_event got a str")
+
+    monkeypatch.setattr(refresh, "schedule_rows_from_events", boom)
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+
+    report = json.loads(offline["output"].read_text())
+    assert "TypeError" in report["errors"][0]
+    assert offline["calls"]["writes"] == []
+    assert not offline["cursor"].exists()
+
+
+@pytest.mark.unit
+def test_a_class_stuck_on_a_cut_short_walk_eventually_moves_on(offline):
+    # Audit after Sol r28: holding the anchor is right for a wobble, but with no
+    # bound one season whose calendar answers 403 every run pins ``stale`` on
+    # the same slice for ever — and starves every class after it, because the
+    # sweep stops there.  After MAX_INTERRUPTED_RUNS the class moves on and says
+    # so in the report.
+    offline["calls"]["known"] = {("SS-7", "2627"), ("SS-23", "2627")}
+    offline["calls"]["fixtures_transport"] = {(7, 96518)}
+
+    for run in range(refresh.MAX_INTERRUPTED_RUNS - 1):
+        offline["calls"]["fetch"].clear()
+        assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+        cursor = json.loads(offline["cursor"].read_text())
+        assert cursor["index"]["stale"] is None
+        assert cursor["interrupted_runs"]["stale"] == run + 1
+        assert "skipped_slices" not in json.loads(offline["output"].read_text())
+
+    offline["calls"]["fetch"].clear()
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+
+    cursor = json.loads(offline["cursor"].read_text())
+    assert cursor["index"]["stale"] is not None
+    assert cursor["interrupted_runs"]["stale"] == 0
+    assert json.loads(offline["output"].read_text())["skipped_slices"] == ["stale"]
+
+
+@pytest.mark.unit
+def test_a_walked_class_forgets_the_wobbles_it_survived(offline):
+    # The count is about being stuck, not about having ever wobbled: one clean
+    # walk puts the class back to zero.
+    _cursor_file(offline, {"due": 0, "stale": 0, "seed": 1})
+    cursor = json.loads(offline["cursor"].read_text())
+    cursor["interrupted_runs"] = {"stale": 2}
+    cursor["index"] = {"due": None, "stale": None, "seed": None}
+    offline["cursor"].write_text(json.dumps(cursor))
+    offline["calls"]["known"] = {("SS-7", "2627")}
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
+
+    assert json.loads(offline["cursor"].read_text())["interrupted_runs"]["stale"] == 0
+
+
+@pytest.mark.unit
+def test_a_verdict_in_one_class_does_not_stop_the_others(offline, monkeypatch):
+    # Audit after Sol r28: a verdict is about ONE class and its own cursor.
+    # Raising it immediately meant a bad ``due`` slice starved ``stale`` and
+    # ``seed`` of every run for as long as it lasted.
+    offline["calls"]["known"] = {("SS-7", "2627")}
+    offline["calls"]["due"] = {("SS-7", "2627")}
+    real_rows = refresh.schedule_rows_from_events
+    seen: list[str] = []
+
+    def rows(events, snapshot, exclude_leagues):
+        events = list(events)
+        if not seen:
+            seen.append("due")
+            raise DailyEventsSchemaError("events lack id or season.id",
+                                         counters={"events": len(events)})
+        return real_rows(events, snapshot, exclude_leagues)
+
+    monkeypatch.setattr(refresh, "schedule_rows_from_events", rows)
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+
+    report = json.loads(offline["output"].read_text())
+    assert "DailyEventsSchemaError" in report["errors"][0]
+    # The classes after the verdict still ran and still wrote their rows.
+    by_class = _fetch_by_class(offline)
+    assert by_class["seed"]["targets"] == [(23, 88001)]
+    assert report["seed_rows"] > 0
+
+
+@pytest.mark.unit
+def test_the_emptiness_counter_is_honest_when_the_run_fails(offline, monkeypatch):
+    # Audit after Sol r28: the counter was recomputed only after the sweep, so
+    # a run that MERGEd rows and then failed wrote the OLD value back — the
+    # alarm could fire on a lane that was working.
+    _cursor_file(offline, {"due": 0, "stale": 0, "seed": 1})
+    cursor = json.loads(offline["cursor"].read_text())
+    cursor["idle_runs"] = 4
+    cursor["index"] = {"due": None, "stale": None, "seed": None}
+    offline["cursor"].write_text(json.dumps(cursor))
+    offline["calls"]["known"] = {("SS-7", "2627"), ("SS-23", "2627")}
+    offline["calls"]["fixtures_transport"] = {(7, 96518)}
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+
+    # Rows reached Bronze on this run, so the alarm is back at zero even though
+    # the run itself failed.
+    assert offline["calls"]["writes"]
+    assert json.loads(offline["cursor"].read_text())["idle_runs"] == 0
+
+
+@pytest.mark.unit
+def test_what_the_source_served_is_counted_in_events_not_pages(offline, monkeypatch):
+    # Sol r13: an empty 200 is the legitimate answer of a season that owes no
+    # page, so counting PAGES made a normal pre-season answer look like drift
+    # and killed the run on its first class.  Unpinned until now (audit after
+    # Sol r28): a slice of pages that carried no event at all must stay green.
+    def fetch(client, targets, raw_store, **kwargs):
+        targets = list(targets)
+        offline["calls"]["fetch"].append({"targets": targets, **kwargs})
+        return ([], {"targets": len(targets), "pages": len(targets), "events": 0,
+                     "missing": 0, "truncated": 0, "foreign_season": 0,
+                     "resumed": 0, "chased": 0, "chase_settled": 0}, [])
+
+    def fixtures(client, targets, raw_store):
+        return ([], {"targets": len(list(targets)), "pages": 0, "events": 0,
+                     "missing": 0, "foreign_season": 0})
+
+    monkeypatch.setattr(refresh, "fetch_season_schedules", fetch)
+    monkeypatch.setattr(refresh, "fetch_season_fixtures", fixtures)
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
+
+    report = json.loads(offline["output"].read_text())
+    assert report["status"] == "success" and report["rows_written"] == 0
+
+
+@pytest.mark.unit
+def test_a_class_writes_its_queue_before_the_run_can_fail(offline, monkeypatch):
+    # Audit after Sol r28: deleting the in-loop write of the resume queue left
+    # the suite green — the ``finally`` write hid it — yet a lease that fails to
+    # close after the MERGE would then take the chain with it.
+    offline["calls"]["truncate"] = {(7, 96518)}
+    real_atomic = refresh._atomic_json
+    written: list[str] = []
+
+    def spy(path, value):
+        written.append(path.name)
+        real_atomic(path, value)
+
+    monkeypatch.setattr(refresh, "_atomic_json", spy)
+
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 0
+
+    assert written.count("incomplete.json") >= 3
+    assert written.index("cursor.json") > written.index("incomplete.json")
 
 
 @pytest.mark.unit
@@ -1344,11 +1740,17 @@ def test_pages_that_produce_no_row_fail_the_run(offline, monkeypatch):
     assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
     assert offline["calls"]["writes"] == []
     report = json.loads(offline["output"].read_text())
-    assert "rows_written" not in report
+    assert report["rows_written"] == 0
     assert "produced no schedule row" in report["errors"][0]
-    # The class that hit the drift keeps its anchor, so the next run repeats
-    # exactly that slice instead of stepping over it.
-    assert json.loads(offline["cursor"].read_text())["index"]["seed"] is None
+    # ...but the class that hit the drift still BANKED its cursor before the
+    # run failed: ``served`` counts events the fetcher itself drops (a page of
+    # a neighbour season's tail, a season the snapshot does not know yet), so a
+    # thin slice can hit this legitimately — and raising before the cursor
+    # moved made the next run rebuild the identical slice and fail identically,
+    # for ever (code review after Sol r26).
+    # (every target of this fixture is new, so the drift lands on ``seed``)
+    index = json.loads(offline["cursor"].read_text())["index"]
+    assert index["seed"] is not None
 
 
 @pytest.mark.unit

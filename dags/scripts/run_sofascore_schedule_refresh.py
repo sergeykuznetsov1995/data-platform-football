@@ -53,10 +53,11 @@ from scrapers.sofascore.discovery import (  # noqa: E402
     DISCOVERY_LEASE_TTL_SECONDS,
     LeaseBrowserSofaScoreClient,
 )
+from dags.utils.sofascore_dq import SofaScoreDQViolation  # noqa: E402
 from scrapers.sofascore.raw_store import RawPayloadStore  # noqa: E402
 from scrapers.sofascore.schedule_refresh import (  # noqa: E402
     MAX_BACKTRACK_PAGES,
-    ScheduleSweepError,
+    SweepVerdictError,
     fetch_season_fixtures,
     fetch_season_schedules,
     schedule_rows_from_events,
@@ -106,6 +107,15 @@ DEFAULT_MAX_IDLE_RUNS = 6
 # it (the same self-arming shape as the muteness check of round 11).  The chain
 # is visited three times over three runs, and on the third it is given up.
 MAX_CHAIN_ATTEMPTS = 3
+# Runs in a row a class may keep its anchor because its walk was CUT SHORT (a
+# transport failure, a schema surprise — see ``interrupted``).  Holding the
+# anchor is right for a wobble: the slice was not covered, and the next run
+# should cover it.  Holding it for ever is the wedge the whole review was about
+# — one season whose calendar answers 403 on every run would pin ``stale`` on
+# the same 200 targets and starve ``seed`` completely (audit after Sol round
+# 28).  After this many fruitless attempts the class moves on and says so in
+# the report; the slice it skipped comes back on the next lap of the cursor.
+MAX_INTERRUPTED_RUNS = 3
 
 # Campaign partitions the lane has already written: a season missing here has
 # never been seeded, so it needs the whole page chain rather than the tail.
@@ -296,6 +306,28 @@ def read_cursor(path: Path) -> dict[str, Optional[tuple[int, int]]]:
     return cursors
 
 
+def read_interrupted_runs(path: Path) -> dict[str, int]:
+    """How many runs in a row each class has kept its anchor after a cut-short
+    walk.  A missing or malformed counter reads as zero: this guard must never
+    be the reason a healthy lane cannot start.
+    """
+
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    counters = value.get("interrupted_runs") if isinstance(value, Mapping) else None
+    if not isinstance(counters, Mapping):
+        return {}
+    return {
+        name: counters[name]
+        for name in SWEEP_CLASSES
+        if isinstance(counters.get(name), int)
+        and not isinstance(counters.get(name), bool)
+        and counters[name] >= 0
+    }
+
+
 def read_idle_runs(path: Path) -> int:
     """How many committed runs in a row have written no schedule row at all.
 
@@ -392,10 +424,59 @@ def read_incomplete(
     return resume, (cursor[0], cursor[1])
 
 
+def rolled_over_chains(
+    queued: Collection[tuple[int, int]],
+    targets: Sequence[SeasonTarget],
+    snapshot: Mapping[str, Any],
+) -> set[tuple[int, int]]:
+    """Queued chains whose season the snapshot dates BEFORE the current target.
+
+    That is the only proof of a rollover this lane accepts.  ``season_id`` alone
+    says nothing about time — the ids are the source's own — so the start year
+    is read from the snapshot for BOTH seasons, and an entry is retired only
+    when both are known and the target's year is greater.  Everything else keeps
+    its chain: a tournament that is not ready in this snapshot, a season whose
+    ``canonical_season`` is missing, two seasons sharing a start year (Sol round
+    28).
+    """
+
+    years: dict[int, dict[int, int]] = {}
+    for tournament in snapshot.get("tournaments", ()):
+        try:
+            tournament_id = int(tournament["unique_tournament_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        seasons: dict[int, int] = {}
+        for season in tournament.get("seasons", ()):
+            start_year = season.get("start_year")
+            season_id = season.get("source_season_id")
+            if isinstance(start_year, bool) or not isinstance(start_year, int):
+                continue
+            try:
+                seasons[int(season_id)] = start_year
+            except (TypeError, ValueError):
+                continue
+        years[tournament_id] = seasons
+    current = {
+        target.tournament_id: years.get(target.tournament_id, {}).get(target.season_id)
+        for target in targets
+    }
+    retired: set[tuple[int, int]] = set()
+    for tournament_id, season_id in queued:
+        target_year = current.get(tournament_id)
+        queued_year = years.get(tournament_id, {}).get(season_id)
+        if target_year is None or queued_year is None:
+            continue
+        if queued_year < target_year:
+            retired.add((tournament_id, season_id))
+    return retired
+
+
 def requeue_chains(
     previous: Mapping[tuple[int, int], tuple[int, int, int]],
     attempted: Collection[tuple[int, int]],
     fresh: Iterable[tuple[int, int, int, int]],
+    rolled_over: Collection[tuple[int, int]] = (),
 ) -> tuple[list[list[int]], list[list[int]]]:
     """Rebuild the resume queue, and name the chains this run gives up on.
 
@@ -415,14 +496,32 @@ def requeue_chains(
     from the queue and returned as abandoned, for the report to carry: the rest
     of that season stays unread, and saying so is the whole point — the
     alternative is a queue that never drains.
+
+    ``rolled_over`` names the entries whose season is PROVEN to be over: the
+    snapshot dates it before the season the lane now works for that tournament.
+    Such an entry can never be attempted again — the retry slice is taken from
+    the current target list — so it would age neither forward nor out, and the
+    file would grow by a campaign every year (code review after Sol round 26).
+    Nothing weaker may be used as proof: "the pair is not a target" also happens
+    when a tournament is momentarily not ready, when the snapshot lacks a
+    canonical season, or when two seasons share a start year — and dropping the
+    chain there loses the tail of a season that is merely out of sight (Sol
+    rounds 27 and 28).  The queue is otherwise NOT tied to the snapshot: the ids
+    are the source's own and survive its reissue.
     """
 
-    queued: dict[tuple[int, int], list[int]] = {
-        pair: [pair[0], pair[1], page, anchor, attempts]
-        for pair, (page, anchor, attempts) in previous.items()
-        if pair not in attempted
-    }
+    queued: dict[tuple[int, int], list[int]] = {}
     abandoned: list[list[int]] = []
+    retired = set(rolled_over)
+    for pair, (page, anchor, attempts) in previous.items():
+        if pair in attempted:
+            continue
+        if pair in retired:
+            # A season the snapshot dates BEFORE the one the lane works now:
+            # its history belongs to the campaign, not to this lane.
+            abandoned.append([pair[0], pair[1], page, anchor])
+            continue
+        queued[pair] = [pair[0], pair[1], page, anchor, attempts]
     for tournament, season, page, anchor in fresh:
         pair = (int(tournament), int(season))
         prior = previous.get(pair)
@@ -458,10 +557,15 @@ def bronze_partitions(
 ]:
     """``(known, due, played)`` partitions of ``bronze.sofascore_schedule``.
 
-    ``known`` maps every partition the lane has ever written to its newest
-    FINISHED kick-off (a season absent from it has never been seeded); that
-    timestamp is what tells a one-page visit whether the page reached back into
-    what Bronze already has.  ``due`` is the partitions whose matches fall in
+    ``known`` maps every partition that holds a match the source has already
+    PLAYED to its newest FINISHED kick-off; that timestamp is what tells a
+    one-page visit whether the page reached back into what Bronze already has.
+    A partition whose only rows are the lane's own FIXTURE rows is NOT known:
+    those rows say nothing about the tail chain, and treating them as evidence
+    took a season out of ``seed`` before a single tail page had been written
+    for it — after which the tail classes read page 0, the chase settled there
+    at once, and the middle of that season was never asked for again (audit
+    after Sol round 28).  ``due`` is the partitions whose matches fall in
     the window around now — those are the seasons whose results change today
     and are refreshed first on every run.  ``played`` is the partitions that hold
     a match whose kick-off has passed: the source owes them a tail page, and
@@ -473,9 +577,10 @@ def bronze_partitions(
     rows = _trino_rows(KNOWN_PARTITIONS_SQL.format(grace=PLAYED_GRACE_HOURS))
     for league, season, newest, owed in rows:
         partition = (str(league), str(season))
-        known[partition] = int(newest) if newest is not None else None
-        if newest is not None or int(owed or 0) > 0:
+        has_played = newest is not None or int(owed or 0) > 0
+        if has_played:
             played.add(partition)
+            known[partition] = int(newest) if newest is not None else None
     due = {
         (str(league), str(season))
         for league, season in _trino_rows(DUE_PARTITIONS_SQL.format(hours=int(window_hours)))
@@ -943,6 +1048,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cursor_path = Path(args.cursor)
         cursors = read_cursor(cursor_path)
         idle_runs = read_idle_runs(cursor_path)
+        interrupted_runs = read_interrupted_runs(cursor_path)
         known, due, played = bronze_partitions(args.window_hours)
         # Seasons cut short by the page bound last run come first: Bronze
         # already knows their partition, so nothing else would pick them up.
@@ -1063,13 +1169,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # a run that died halfway is a FAILED run, not an idle one, and
             # must not count towards the emptiness alarm either way.
             "idle_runs": idle_runs,
+            # Per class, how many runs in a row it kept its anchor after a walk
+            # that was cut short.  Carried over untouched until each class
+            # decides its own below.
+            "interrupted_runs": dict(interrupted_runs),
             "index": {
                 name: list(pair) if pair else None
                 for name, pair in cursors.items()
             },
         }
         attempted: set[tuple[int, int]] = set()
-        queued_seasons, abandoned = requeue_chains(unfinished, attempted, ())
+        # Verdicts about slices, gathered across classes: the sweep finishes,
+        # then the run fails on the first of them.
+        verdicts: list[Exception] = []
+        rolled_over = rolled_over_chains(set(unfinished), all_targets, snapshot)
+        queued_seasons, abandoned = requeue_chains(
+            unfinished, attempted, (), rolled_over
+        )
         incomplete_state = {
             "seasons": queued_seasons,
             "cursor": list(retry_cursor) if retry_cursor else None,
@@ -1077,6 +1193,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         committed = False
         for name in SWEEP_CLASSES:
             pairs = [target.pair for target in plan[name]]
+            # Verdicts about this slice, in the order they were reached.  A
+            # verdict is not a transport failure: the walk finished, and what it
+            # collected is banked (rows, cursor, resume queue) BEFORE the run
+            # fails on the first of them.  A class that fails before its cursor
+            # moves rebuilds the identical slice on the next run and fails
+            # identically, for ever (Sol rounds 24-27).
+            deferred: list[Exception] = []
+            # A failure that is NOT a verdict about this slice: the walk did not
+            # finish, so the class banks its rows and its queue but leaves its
+            # cursor where it was — the slice has to be walked again.
+            interrupted: Optional[Exception] = None
             if name == "seed":
                 # The queue cursor moves as soon as its slice is TAKEN, not when
                 # the phase succeeds: the entries stay on the list until they are
@@ -1085,29 +1212,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 incomplete_state["cursor"] = (
                     list(next_retry_cursor) if next_retry_cursor else None
                 )
-                events, counters, cut_short = fetch_season_schedules(
-                    client, pairs, raw_store,
-                    max_pages=args.seed_pages,
-                    start_pages=start_pages,
-                    resume_anchors=resume_anchors,
-                    # A season that has not kicked off yet legitimately has no
-                    # page and the seed slice is full of them, so absences here
-                    # are not evidence of anything; failing on them would pin
-                    # the cursor to that slice for good.
-                    missing_fail_share=None,
-                )
+                try:
+                    events, counters, cut_short = fetch_season_schedules(
+                        client, pairs, raw_store,
+                        max_pages=args.seed_pages,
+                        start_pages=start_pages,
+                        resume_anchors=resume_anchors,
+                        # A season that has not kicked off yet legitimately has
+                        # no page and the seed slice is full of them, so
+                        # absences here are not evidence of anything; failing on
+                        # them would pin the cursor to that slice for good.
+                        missing_fail_share=None,
+                    )
+                except SweepVerdictError as exc:
+                    events, counters, cut_short = (
+                        exc.fetched, exc.counters, exc.incomplete
+                    )
+                    deferred.append(exc)
             else:
                 # ``chase_before`` turns the single tail page into "as many
                 # pages as it takes to reach what Bronze already has": more
                 # than a page of matches can finish between two visits.
-                events, counters, cut_short = fetch_season_schedules(
-                    client, pairs, raw_store,
-                    max_pages=args.chase_pages,
-                    chase_before=chase_before,
-                    # Only a season whose match has already kicked off owes a
-                    # page; the rest may answer 404 for as long as they like.
-                    owed_pages=owed_pages,
-                )
+                try:
+                    events, counters, cut_short = fetch_season_schedules(
+                        client, pairs, raw_store,
+                        max_pages=args.chase_pages,
+                        chase_before=chase_before,
+                        # Only a season whose match has already kicked off owes
+                        # a page; the rest may answer 404 for as long as they
+                        # like.
+                        owed_pages=owed_pages,
+                    )
+                except SweepVerdictError as exc:
+                    events, counters, cut_short = (
+                        exc.fetched, exc.counters, exc.incomplete
+                    )
+                    deferred.append(exc)
             # ``extend``, never assignment: the classes are fetched in turn and
             # each can leave a chain cut short (Sol round 5, finding 2).
             unfinished_now.extend(cut_short)
@@ -1118,7 +1258,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # died on its first class and never wrote its state — the lane then
             # rebuilt the same plan and died again, forever.
             served = counters["events"]
-            drift: Optional[ScheduleSweepError] = None
             if name in ("stale", "seed"):
                 # The seasons Bronze has never seen, and the ones it has not
                 # looked at for a while, also get their FIXTURE page: without a
@@ -1129,7 +1268,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     fixture_events, fixture_counters = fetch_season_fixtures(
                         client, pairs, raw_store
                     )
-                except ScheduleSweepError as exc:
+                except SweepVerdictError as exc:
                     # The calendar walk is an EXTRA on top of the tail pages,
                     # and those are already paid for.  Raising here threw them
                     # away and, worse, left the class before its cursor moved
@@ -1137,8 +1276,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     # rebuilt the same slice and broke on the same page, for
                     # ever (Sol round 24).  The drift is reported and the run
                     # still fails, but only once this class has banked what it
-                    # has: rows, cursor and queue.
-                    drift = exc
+                    # has: rows, cursor and queue.  EVERY failure of this walk is
+                    # banked the same way, not just the drift verdict: a 200
+                    # whose body is not an object, or a transport failure that is
+                    # not a 404, escaped the same way and cost the class the
+                    # same work (code review after Sol round 26).
+                    deferred.append(exc)
+                    fixture_events = list(exc.fetched)
+                    fixture_counters = dict(exc.counters)
+                    fixture_counters.setdefault("events", 0)
+                    fixture_counters["error"] = str(exc)
+                except Exception as exc:
+                    # NOT a verdict: a transport failure, or a bug.  The slice
+                    # was not walked to the end, so the cursor may NOT move —
+                    # but the tail pages this class already paid for still go to
+                    # Bronze, and the resume queue is still written, because
+                    # throwing them away costs the run twice (Sol rounds 26-28).
+                    interrupted = exc
                     fixture_events = []
                     fixture_counters = {"events": 0, "error": str(exc)}
                 events.extend(fixture_events)
@@ -1160,25 +1314,57 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 # here is evidence for the operator, and both ``missing``
                 # counters are already in the report above.
             report[name] = counters
-            rows, row_counters = schedule_rows_from_events(
-                events, snapshot, exclude
-            )
+            try:
+                rows, row_counters = schedule_rows_from_events(
+                    events, snapshot, exclude
+                )
+            except (SweepVerdictError, SofaScoreDQViolation) as exc:
+                # A verdict about the events of this slice — or a DQ gate that
+                # refused them — is banked exactly like the ones above: nothing
+                # is written (these rows never passed validation), but the class
+                # still records its cursor and its resume queue, because a run
+                # that fails before that rebuilds the identical slice for ever
+                # (Sol round 27).
+                # Only these two: a verdict about the events of this slice, or
+                # the DQ gate refusing them.  Anything else is a bug and must
+                # not be dressed up as a verdict that banks a cursor (Sol round
+                # 28).
+                rows, row_counters = [], dict(getattr(exc, "counters", ()) or {})
+                row_counters["error"] = str(exc)
+                deferred.append(exc)
             report[f"{name}_rows"] = len(rows)
             report[f"{name}_counters"] = row_counters
-            if served and not rows:
+            if served and not rows and not deferred:
                 # The lane asks for the pages of ITS OWN targets, so every page
                 # it gets belongs to a ready campaign season: pages without a
                 # single row means the snapshot and the source have drifted
                 # apart, not a quiet day.  Fixture pages count too — a season
                 # whose calendar came back full of another season's events would
                 # otherwise move the cursor on and stay green.
-                raise ValueError(
+                #
+                # DEFERRED like the calendar drift above, and for the same
+                # reason: ``served`` counts events the fetcher itself drops —
+                # a page carrying only a neighbour season's tail
+                # (``foreign_season``), a season the snapshot does not know yet
+                # — so a thin slice can hit this legitimately, and raising here
+                # left the class before its cursor moved.  The next run then
+                # rebuilt the identical slice and failed identically, for ever
+                # (code review after Sol round 26).
+                deferred.append(ValueError(
                     f"{name}: {counters['pages']} tail pages and {served} events "
                     f"produced no schedule row: {row_counters}"
-                )
+                ))
             if rows:
                 report["table"] = write_schedule_rows(rows)
                 rows_written += len(rows)
+            # The resume queue may only move forward on evidence that is IN
+            # Bronze.  A class that read pages and wrote no row (a verdict about
+            # its events, the DQ gate) must leave its chains where they were:
+            # the fresh entry points at the page AFTER the ones just read, so
+            # banking it would skip a prefix that was never written (Sol round
+            # 28).  A class that legitimately had nothing to serve is free to
+            # move its chains — there is no unwritten prefix to skip.
+            queue_safe = bool(rows) or not served
             # This class is done: its cursor may move, and the chains it just
             # walked drop off the retry list while fresh truncations join it.
             # Only the seed phase resumes a saved chain, so only it may retire
@@ -1186,33 +1372,81 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # chain owed (Sol round 6, finding 1).  ``pinned`` keeps such a
             # season out of the tail classes, so this is also the only place
             # where a retry target can be attempted at all.
-            cursor_state["index"][name] = (
-                list(next_cursors[name]) if next_cursors[name] else None
-            )
-            if name == "seed":
+            held = interrupted_runs.get(name, 0)
+            if interrupted is None:
+                # A class that was walked moves its anchor and forgets the
+                # wobbles it survived on the way.
+                cursor_state["index"][name] = (
+                    list(next_cursors[name]) if next_cursors[name] else None
+                )
+                held = 0
+            else:
+                held += 1
+                if held >= MAX_INTERRUPTED_RUNS:
+                    # The walk keeps being cut short in the same slice: holding
+                    # the anchor any longer starves every class after this one
+                    # (and every target after this slice) for good.  Move on and
+                    # say so; the skipped slice returns on the next lap.
+                    cursor_state["index"][name] = (
+                        list(next_cursors[name]) if next_cursors[name] else None
+                    )
+                    report.setdefault("skipped_slices", []).append(name)
+                    held = 0
+            cursor_state["interrupted_runs"][name] = held
+            if name == "seed" and queue_safe:
                 attempted.update(retried)
             committed = True
-            queued_seasons, abandoned = requeue_chains(
-                unfinished, attempted, unfinished_now
-            )
-            incomplete_state["seasons"] = queued_seasons
+            if queue_safe:
+                queued_seasons, abandoned = requeue_chains(
+                    unfinished, attempted, unfinished_now, rolled_over
+                )
+                incomplete_state["seasons"] = queued_seasons
+            # A chain the lane has stopped asking for: the rest of that season
+            # stays unread, so it goes in the report by ``(tournament, season,
+            # page)`` — an operator can put it back by hand, and nothing else
+            # would ever say the tail is missing.  Recorded HERE, inside the
+            # loop: a deferred verdict raises before the end of the sweep, and
+            # writing it after the loop meant the queue was already trimmed on
+            # disk while the report said nothing (Sol round 27).
+            report["abandoned_chains"] = abandoned
+            report["rows_written"] = rows_written
+            report["incomplete_seasons"] = len(incomplete_state["seasons"])
+            # The emptiness alarm has to be honest on EVERY exit: a run that
+            # MERGEd rows and then failed used to write the OLD counter back,
+            # so a lane that was working could still trip the alarm, and one
+            # that wrote nothing for days could hide behind a stale zero (audit
+            # after Sol round 28).
+            cursor_state["idle_runs"] = 0 if rows_written else idle_runs + 1
+            report["idle_runs"] = cursor_state["idle_runs"]
             # Written NOW, not left to ``finally``: the rows of this class are
             # already in Bronze, which makes their partition "known", and a
             # lease that then fails to close would take the rest of the chain
             # with it — nothing else ever asks for those pages again
             # (cross-check, state lens).
             _atomic_json(Path(args.incomplete), incomplete_state)
-            if drift is not None:
-                # Everything this class earned is on disk now, so the next run
-                # starts from the NEXT slice rather than from this one.
-                raise drift
+            if deferred:
+                # Everything this class earned is on disk now.  The verdict is
+                # about THIS class and its own cursor, so the classes after it
+                # still run: they have their own anchors, and letting a verdict
+                # in ``due`` stop ``stale`` and ``seed`` starved them of every
+                # run for as long as it lasted (audit after Sol round 28).  The
+                # run still fails, on the first verdict, once the sweep is done.
+                report[f"{name}_deferred"] = [
+                    f"{type(exc).__name__}: {exc}" for exc in deferred
+                ]
+                verdicts.extend(deferred)
+            if interrupted is not None:
+                # NOT a verdict: the walk was cut short, so the byte accounting
+                # of this run is in doubt and the sweep stops here.  Rows and
+                # queue are on disk; the anchor stayed put (unless this class
+                # has been stuck too long — see above), so the next run walks
+                # this slice again.
+                raise interrupted
         report["rows_written"] = rows_written
         report["incomplete_seasons"] = len(incomplete_state["seasons"])
-        # A chain the lane has stopped asking for: the rest of that season
-        # stays unread, so it goes in the report by ``(tournament, season,
-        # page)`` — an operator can put it back by hand, and nothing else would
-        # ever say the tail is missing.
         report["abandoned_chains"] = abandoned
+        if verdicts:
+            raise verdicts[0]
         # A single empty run is unremarkable; a lane that has written nothing
         # for days is a snapshot that has drifted off the source, and nothing
         # else would ever say so (Sol round 12, finding 1).  The counter is
@@ -1284,8 +1518,11 @@ __all__ = [
     "SWEEP_CLASSES",
     "read_cursor",
     "read_idle_runs",
+    "read_interrupted_runs",
+    "MAX_INTERRUPTED_RUNS",
     "read_incomplete",
     "requeue_chains",
+    "rolled_over_chains",
     "MAX_CHAIN_ATTEMPTS",
     "sweep_predicates",
     "bronze_partitions",

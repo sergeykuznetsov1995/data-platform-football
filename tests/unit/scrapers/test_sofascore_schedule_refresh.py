@@ -13,6 +13,7 @@ from pyarrow import fs
 from dags.utils.sofascore_dq import SofaScoreDQViolation
 from scrapers.sofascore.schedule_refresh import (
     SCHEDULE_PAGE_ENDPOINT,
+    FetchedEvent,
     DailyEventsSchemaError,
     ScheduleSweepError,
     FIXTURE_PAGE_ENDPOINT,
@@ -1278,6 +1279,87 @@ def test_the_drift_share_is_counted_among_the_seasons_visited_fresh(tmp_path):
         )
 
 
+def test_queued_chains_are_kept_out_of_the_drift_share_even_in_a_majority(tmp_path):
+    # Audit after Sol r28: the round-23 rule (queued chains count in NEITHER
+    # half of the drift share) was not pinned by any test — reverting it to the
+    # plain totals left the suite green.  The steady state it protects is
+    # ordinary: the seed slice is built retry-first, so a queue longer than a
+    # slice makes resumed chains the MAJORITY of it, and counting them would
+    # fail the class before the queue ever came back.
+    first, _ = _fixture_events()
+    broken = {"events": [], "hasNextPage": "yes"}
+    queued = [(911, 9011), (912, 9012), (913, 9013)]
+    client = _Client({
+        schedule_page_path(*pair, 3): broken for pair in queued
+    } | {
+        schedule_page_path(*READY_TARGET): _page(
+            _event(first, event_id=95, tournament_id=READY_TOURNAMENT,
+                   season_id=READY_SEASON),
+        ),
+    })
+
+    fetched, counters, incomplete = fetch_season_schedules(
+        client, [*queued, READY_TARGET], _store(tmp_path), max_pages=5,
+        start_pages={pair: 4 for pair in queued}, missing_fail_share=None,
+    )
+
+    # Three of four targets served a broken page — and the sweep still returns,
+    # because all three are queued chains the caller ages out itself.
+    assert counters["malformed"] == 3 and counters["malformed_resumed"] == 3
+    assert [pair[:2] for pair in incomplete] == queued
+    assert [item.event["id"] for item in fetched] == [95]
+
+
+def test_exactly_half_the_owed_seasons_unusable_already_fails(tmp_path):
+    # Audit after Sol r28: the combined guard's boundary was not pinned either —
+    # turning ``>=`` into ``>`` left the suite green, and the only test of that
+    # guard sits at 98 of 100.  Half is the documented line, exactly as for the
+    # unserved guard next to it (Sol r8 #4).
+    first, _ = _fixture_events()
+    broken = {"events": [], "hasNextPage": "yes"}
+    owed_broken = [(921, 9021), (922, 9022)]
+    owed_good = [(923, 9023), (924, 9024)]
+    quiet = [(925, 9025), (926, 9026), (927, 9027), (928, 9028)]
+    client = _Client({
+        schedule_page_path(*pair): broken for pair in owed_broken
+    } | {
+        schedule_page_path(*pair): _page(
+            _event(first, event_id=100 + index, tournament_id=pair[0],
+                   season_id=pair[1]),
+        )
+        for index, pair in enumerate(owed_good + quiet)
+    })
+
+    # Two of the four seasons that owe a page are unusable: exactly half, and
+    # the drift guard stays quiet (2 broken of 10 fresh targets).
+    with pytest.raises(ScheduleSweepError, match="were unusable"):
+        fetch_season_schedules(
+            client, [*owed_broken, *owed_good, *quiet], _store(tmp_path),
+            owed_pages={*owed_broken, *owed_good},
+        )
+
+
+def test_absent_seasons_do_not_dilute_the_drift_share(tmp_path):
+    # Audit after Sol r28: a season that has not started answers 404, and a seed
+    # slice is mostly those — counting them in the denominator diluted the drift
+    # share until it could not fire, and in ``seed`` it is the only live guard.
+    broken = {"events": [], "hasNextPage": "yes"}
+    answered = [(931, 9031), (932, 9032)]
+    absent = [(933, 9033), (934, 9034), (935, 9035), (936, 9036)]
+    client = _Client(
+        {schedule_page_path(*pair): broken for pair in answered},
+        missing=[schedule_page_path(*pair) for pair in absent],
+    )
+
+    # Two of the two seasons that answered served a broken page; six targets in
+    # total would have put the share at 2 of 6 and stayed quiet.
+    with pytest.raises(ScheduleSweepError, match="broke the endpoint contract"):
+        fetch_season_schedules(
+            client, [*answered, *absent], _store(tmp_path), max_pages=2,
+            missing_fail_share=None,
+        )
+
+
 def test_a_broken_season_takes_its_counters_back_with_its_rows(tmp_path):
     # Sol r22 #3: the rollback dropped the season's rows but left ``events``
     # standing, and the caller reads that counter as "the source served this
@@ -1413,10 +1495,77 @@ def test_one_broken_calendar_alone_in_a_slice_does_not_fail_the_sweep(tmp_path):
     assert counters["malformed"] == 1 and counters["missing"] == 1
 
 
+def test_broken_pages_of_seasons_that_owe_nothing_stay_out_of_the_sum(tmp_path):
+    # Code review after Sol r26: the combined threshold is measured against the
+    # seasons that OWE a page, so its numerator may only count those.  Counting
+    # every broken page against that denominator let two broken pre-season
+    # pages fail a slice whose owed seasons both answered — inside the fetch,
+    # before the class committed its cursor, so the slice was rebuilt for ever.
+    first, _ = _fixture_events()
+    broken = {"events": [], "hasNextPage": "yes"}
+    owed = [(906, 9006), (907, 9007)]
+    quiet = [(908, 9008), (909, 9009)]
+    client = _Client({
+        schedule_page_path(*READY_TARGET): broken,
+        schedule_page_path(*CONFIGURED_TARGET): broken,
+    } | {
+        schedule_page_path(*pair): _page(
+            _event(first, event_id=90 + index, tournament_id=pair[0],
+                   season_id=pair[1]),
+        )
+        for index, pair in enumerate(owed + quiet)
+    })
+
+    fetched, counters, _ = fetch_season_schedules(
+        client, [READY_TARGET, CONFIGURED_TARGET, *owed, *quiet],
+        _store(tmp_path), max_pages=5, owed_pages=set(owed),
+    )
+
+    # Two broken seasons out of six seen fresh is under the drift share, and
+    # neither of them owed a page: the two that did both served, so the
+    # combined threshold has nothing to count.
+    assert counters["malformed"] == 2 and counters["expected"] == 2
+    assert len(fetched) == 4
+
+
+def test_one_pair_of_matches_under_one_game_id_does_not_fail_the_run(tmp_path):
+    # Code review after Sol r26: the identity gate had no minimum mass, so a
+    # single self-contradicting duplicate in a thin slice failed the whole run
+    # — and this walk feeds a class that has not committed its cursor yet, so
+    # the same slice came back for ever.
+    first, second = _fixture_events()
+    home = _event(first, event_id=77, tournament_id=READY_TOURNAMENT,
+                  season_id=READY_SEASON)
+    away = _event(second, event_id=77, tournament_id=READY_TOURNAMENT,
+                  season_id=READY_SEASON)
+    away["homeTeam"] = {"id": 4242, "name": "Another"}
+    record = _store(tmp_path).store_bytes(
+        PayloadTarget(
+            source_tournament_id=str(READY_TOURNAMENT),
+            source_season_id=str(READY_SEASON),
+            target_type="season_page",
+            target_id="last-0",
+            endpoint=SCHEDULE_PAGE_ENDPOINT,
+            freshness_key="refresh",
+        ),
+        b"{}",
+        request_url="https://www.sofascore.com/api/v1/x",
+        http_status=200,
+    )
+    events = [FetchedEvent(event=home, raw=record), FetchedEvent(event=away, raw=record)]
+
+    rows, counters = schedule_rows_from_events(events, SNAPSHOT, set())
+
+    assert counters["identity_conflict"] == 1 and len(rows) == 1
+
+
 def test_broken_and_unserved_seasons_share_a_threshold_as_well(tmp_path):
-    # Sol r21: 49 broken pages + 49 unserved owed seasons + 2 good ones cleared
-    # BOTH per-kind thresholds and then cleared the lane's emptiness alarm with
-    # its two rows — 98 % of the slice unusable, reported as a healthy run.
+    # Sol r21: a slice can be mostly unusable while every per-kind threshold
+    # stays quiet, and then clear the lane's emptiness alarm with the handful of
+    # rows it did produce.  Here 20 broken pages (under the drift share of the
+    # 51 seasons that answered) and 49 owed seasons that served nothing (under
+    # the absence share of 100) add up to 69 % of the owed seasons being
+    # unusable — which only the combined threshold can see.
     first, _ = _fixture_events()
     broken = {"events": [], "hasNextPage": "yes"}
     good = _page(
@@ -1427,9 +1576,9 @@ def test_broken_and_unserved_seasons_share_a_threshold_as_well(tmp_path):
     payloads, missing = {}, set()
     for index, (tournament, season) in enumerate(targets):
         path = schedule_page_path(tournament, season)
-        if index < 49:
+        if index < 20:
             payloads[path] = broken
-        elif index < 98:
+        elif index < 69:
             payloads[path] = broken  # placeholder, replaced by ``missing``
             missing.add(path)
         else:

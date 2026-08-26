@@ -68,11 +68,35 @@ _FAIL_MIN_TARGETS = 2
 MAX_BACKTRACK_PAGES = 3
 
 
-class DailyEventsSchemaError(DiscoverySchemaError):
+class SweepVerdictError(DiscoverySchemaError):
+    """A verdict about a SLICE, carrying everything the walk collected first.
+
+    A verdict is not a transport failure: the walk finished, and what it read is
+    worth keeping even though the slice as a whole is unsound.  The caller banks
+    that work — rows, counters, resume queue, cursor — and only then fails the
+    run, because a class that fails before its cursor moves rebuilds the very
+    same slice on the next run and fails identically, for ever (Sol rounds 24-27).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        fetched: Iterable[Any] = (),
+        counters: Optional[Mapping[str, int]] = None,
+        incomplete: Iterable[tuple[int, int, int, int]] = (),
+    ) -> None:
+        super().__init__(message)
+        self.fetched = list(fetched)
+        self.counters = dict(counters or {})
+        self.incomplete = list(incomplete)
+
+
+class DailyEventsSchemaError(SweepVerdictError):
     """Season-page events no longer carry the tournament/season/id shape we map."""
 
 
-class ScheduleSweepError(DiscoverySchemaError):
+class ScheduleSweepError(SweepVerdictError):
     """The sweep itself is unsound: the source served almost no season page."""
 
 
@@ -210,7 +234,8 @@ def fetch_season_fixtures(
     ):
         raise ScheduleSweepError(
             f"{counters['malformed']} of {answered} calendar pages that were "
-            f"served broke the endpoint contract: {counters}"
+            f"served broke the endpoint contract: {counters}",
+            fetched=fetched, counters=counters,
         )
     return fetched, counters
 
@@ -297,6 +322,12 @@ def fetch_season_schedules(
     # that reads "1 of 1" and fails the lane outright (Sol round 23).
     resumed_targets = 0
     resumed_malformed = 0
+    # Broken pages of seasons that OWED one, which is the only population the
+    # combined threshold below may count: it is measured against ``expected``,
+    # and counting a season the source owes nothing against that denominator let
+    # two broken pre-season pages fail a slice whose two owed seasons both
+    # answered (code review after Sol round 26).
+    expected_malformed = 0
     for tournament_id, season_id in targets:
         counters["targets"] += 1
         pair = (int(tournament_id), int(season_id))
@@ -486,6 +517,8 @@ def fetch_season_schedules(
                 incomplete.append((pair[0], pair[1], owed_page, anchor))
                 resumed_malformed += 1
                 counters["malformed_resumed"] += 1
+            elif expected:
+                expected_malformed += 1
             log.warning("season page breaks its contract, skipping: %s", exc)
             continue
         if bounded:
@@ -499,7 +532,11 @@ def fetch_season_schedules(
     # queued chain that breaks has to reach the caller, which is what ages it
     # out.  Drift of the source itself shows up here all the same — it breaks
     # the pages of the seasons this slice visits for the first time too.
-    fresh_targets = counters["targets"] - resumed_targets
+    # ...and over the ones that ANSWERED: a season that has not started answers
+    # 404, and a seed slice is mostly those, so counting them diluted the share
+    # until it could never fire — in ``seed`` this is the only live drift guard
+    # (audit after Sol round 28).
+    fresh_targets = counters["targets"] - resumed_targets - counters["missing"]
     fresh_malformed = counters["malformed"] - resumed_malformed
     if (
         fresh_malformed >= _FAIL_MIN_TARGETS
@@ -507,7 +544,8 @@ def fetch_season_schedules(
     ):
         raise ScheduleSweepError(
             f"{fresh_malformed} of {fresh_targets} season pages "
-            f"broke the endpoint contract: {counters}"
+            f"broke the endpoint contract: {counters}",
+            fetched=fetched, counters=counters, incomplete=incomplete,
         )
     unserved = counters["missing_expected"] + counters["empty_expected"]
     # The two kinds of unusable target share a threshold as well as having one
@@ -531,7 +569,8 @@ def fetch_season_schedules(
     ):
         raise ScheduleSweepError(
             f"{unserved} of {counters['expected']} seasons that owe a page "
-            f"served none (missing or empty): {counters}"
+            f"served none (missing or empty): {counters}",
+            fetched=fetched, counters=counters, incomplete=incomplete,
         )
     # And the two kinds of unusable target share a threshold as well as having
     # one each.  A slice of 49 broken pages, 49 unserved owed seasons and 2 good
@@ -539,12 +578,15 @@ def fetch_season_schedules(
     # with its two rows, so 98 % of the slice being unusable read as a healthy
     # run (Sol round 21).  The denominator is the seasons the source owes an
     # answer for: one that legitimately has nothing to say is evidence of
-    # nothing, either way.
+    # nothing, either way — and so the NUMERATOR counts only broken pages of
+    # seasons that owed one.  Counting every broken page against that
+    # denominator let two broken pre-season pages fail a slice whose two owed
+    # seasons both answered (code review after Sol round 26).
     # The minimum mass applies here too, and for the same reason: one unusable
     # season out of one that owed a page would fail the class before its cursor
     # moved, and the next run would rebuild the very same slice for ever (Sol
     # rounds 24 and 25).
-    unusable = fresh_malformed + unserved
+    unusable = expected_malformed + unserved
     if (
         missing_fail_share is not None
         and unusable >= _FAIL_MIN_TARGETS
@@ -553,7 +595,8 @@ def fetch_season_schedules(
     ):
         raise ScheduleSweepError(
             f"{unusable} of {counters['expected']} seasons that owe a page "
-            f"were unusable (broken pages or none served): {counters}"
+            f"were unusable (broken pages or none served): {counters}",
+            fetched=fetched, counters=counters, incomplete=incomplete,
         )
     return fetched, counters, incomplete
 
@@ -695,23 +738,26 @@ def schedule_rows_from_events(
     if counters["malformed"]:
         raise DailyEventsSchemaError(
             f"{counters['malformed']} of {counters['events']} season-page events of "
-            f"ready tournaments lack id or season.id: {counters}"
+            f"ready tournaments lack id or season.id: {counters}",
+            counters=counters,
         )
-    if counters["identity_conflict"] and (
+    if counters["identity_conflict"] >= _FAIL_MIN_TARGETS and (
         counters["identity_conflict"]
         >= (counters["matched"] + counters["identity_conflict"]) * _UNSCOPED_FAIL_SHARE
     ):
         raise DailyEventsSchemaError(
             f"{counters['identity_conflict']} of "
             f"{counters['matched'] + counters['identity_conflict']} games came "
-            f"back twice with different teams: {counters}"
+            f"back twice with different teams: {counters}",
+            counters=counters,
         )
     if counters["unscoped"] and (
         counters["unscoped"] >= counters["events"] * _UNSCOPED_FAIL_SHARE
     ):
         raise DailyEventsSchemaError(
             f"{counters['unscoped']} of {counters['events']} season-page events cannot "
-            f"be placed (no object or tournament.uniqueTournament.id): {counters}"
+            f"be placed (no object or tournament.uniqueTournament.id): {counters}",
+            counters=counters,
         )
     if counters["unscoped"]:
         log.warning(
