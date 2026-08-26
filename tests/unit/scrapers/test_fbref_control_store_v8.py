@@ -224,6 +224,8 @@ def test_publication_lock_acquire_is_retry_idempotent_and_owner_fenced():
 
     def handler(sql, params):
         nonlocal inserted
+        if sql.startswith("SELECT pg_advisory_xact_lock"):
+            return ([{"pg_advisory_xact_lock": None}], 1)
         if sql.startswith("SELECT status FROM fbref_control.crawl_run"):
             return ([{"status": "running"}], 1)
         if sql.startswith("INSERT INTO fbref_control.publication_lock"):
@@ -267,6 +269,8 @@ def test_publication_lock_rejects_an_active_different_owner():
     now = datetime.now(timezone.utc)
 
     def handler(sql, params):
+        if sql.startswith("SELECT pg_advisory_xact_lock"):
+            return ([{"pg_advisory_xact_lock": None}], 1)
         if sql.startswith("SELECT status FROM fbref_control.crawl_run"):
             return ([{"status": "running"}], 1)
         if sql.startswith("INSERT INTO fbref_control.publication_lock"):

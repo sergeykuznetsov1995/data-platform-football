@@ -141,6 +141,7 @@ class CompetitionRef:
     first_season: Optional[str]
     last_season: Optional[str]
     history_url: str
+    last_season_url: Optional[str] = None
 
     @property
     def competition_id(self) -> str:
@@ -451,6 +452,27 @@ def _cell_text(row: Tag, *names: str) -> Optional[str]:
     return None
 
 
+def _competition_season_cell_url(
+    row: Tag,
+    competition_id: str,
+    *names: str,
+) -> Optional[str]:
+    for name in names:
+        cell = row.find(["th", "td"], attrs={"data-stat": name})
+        anchor = None if cell is None else cell.find("a", href=True)
+        if anchor is None:
+            continue
+        href = str(anchor.get("href") or "")
+        path = _href_path(href)
+        if not path.startswith(f"/en/comps/{competition_id}/"):
+            raise ValueError(
+                "Competition season link belongs to a different route: "
+                f"{href!r}"
+            )
+        return canonicalize_fbref_url(href)
+    return None
+
+
 def _href_path(href: str) -> str:
     return urlparse(str(href).strip()).path
 
@@ -613,8 +635,9 @@ def _competition_from_anchor(anchor: Tag) -> CompetitionRef:
     source_section = _source_section(anchor)
     competition_format, participants = _classify_section(source_section)
     row = row if row is not None else anchor
+    competition_id = match.group("comp_id")
     return CompetitionRef(
-        comp_id=match.group("comp_id"),
+        comp_id=competition_id,
         name=_text(anchor) or _cell_text(row, "comp_name", "comp") or "",
         format=competition_format,
         participants=participants,
@@ -626,6 +649,9 @@ def _competition_from_anchor(anchor: Tag) -> CompetitionRef:
         first_season=_cell_text(row, "first_season", "minseason"),
         last_season=_cell_text(row, "last_season", "maxseason"),
         history_url=canonicalize_fbref_url(href),
+        last_season_url=_competition_season_cell_url(
+            row, competition_id, "last_season", "maxseason"
+        ),
     )
 
 
@@ -807,6 +833,28 @@ def _calendar_type(
     # The source URL/ID is authoritative.  An unfamiliar display label must
     # never make discovery invent a year pair or discard the season.
     return CalendarType.OPAQUE
+
+
+def advertised_current_season(
+    competition: CompetitionRef,
+) -> Optional[SeasonRef]:
+    """Return the exact current season advertised by the competition index."""
+
+    label = str(competition.last_season or "").strip()
+    season_url = str(competition.last_season_url or "").strip()
+    if not label or not season_url:
+        return None
+    return SeasonRef(
+        comp_id=competition.comp_id,
+        season_id=_season_id_from_url(
+            competition.comp_id,
+            season_url,
+            label,
+        ),
+        label=label,
+        calendar_type=_calendar_type(competition, label),
+        season_url=season_url,
+    )
 
 
 def parse_competition_html(
@@ -1541,6 +1589,7 @@ __all__ = [
     "Participants",
     "ScheduleRef",
     "SeasonRef",
+    "advertised_current_season",
     "parse_competition_html",
     "parse_competition_index_html",
     "parse_schedule_html",

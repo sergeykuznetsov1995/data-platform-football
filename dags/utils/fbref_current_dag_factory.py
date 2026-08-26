@@ -65,6 +65,11 @@ PAGE_KINDS = (
 # six-hour-five-minute task timeout.  The current-only deferred reconciliation
 # can improve throughput, but its exact speedup requires a live canary.
 CURRENT_MAX_BATCHES = 16
+# Deployment marker for the reviewed cap-16 policy.  The speed release was
+# merged before it was installed, so the combined Bronze delivery must carry
+# this factory as an explicit first-parent modification instead of silently
+# leaving production on the old cap-80 bytes.
+CURRENT_MAX_BATCHES_POLICY = "fbref-current-max-batches-16-v1"
 CURRENT_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT
 CURRENT_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB
 DEFAULT_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
@@ -419,6 +424,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
 __all__ = [
     "BOOTSTRAP_DAG_ID",
     "CURRENT_MAX_BATCHES",
+    "CURRENT_MAX_BATCHES_POLICY",
     "INGEST_DAG_ID",
     "PAGE_KINDS",
     "build_fbref_current_dag",

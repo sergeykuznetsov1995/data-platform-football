@@ -82,6 +82,12 @@ class TestFBrefCurrentTopology:
 
     def test_one_warm_live_runner_replaces_cold_wave_tasks(self, loaded_dag):
         module, tasks = loaded_dag
+        factory = sys.modules["utils.fbref_current_dag_factory"]
+        assert (
+            factory.CURRENT_MAX_BATCHES_POLICY
+            == "fbref-current-max-batches-16-v1"
+        )
+        assert factory.CURRENT_MAX_BATCHES == 16
         assert module.CURRENT_MAX_BATCHES == 16
         assert len(tasks) == 16
         assert tasks["validate_production_readiness"].downstream_task_ids == {
@@ -112,9 +118,9 @@ class TestFBrefCurrentTopology:
         )
         assert live._captured_kwargs["pool"] == "fbref_scraper_pool"
         assert live.op_kwargs["page_kinds"] == module.PAGE_KINDS
-        assert live.op_kwargs["max_batches"] == 16
+        assert live.op_kwargs["max_batches"] == factory.CURRENT_MAX_BATCHES
         expected_reservation_mb = DEFAULT_REQUEST_RESERVATION_BYTES // MIB
-        assert expected_reservation_mb == 5
+        assert expected_reservation_mb == 9
         assert tasks["initialize_run"].op_kwargs["reservation_mb"] == (
             expected_reservation_mb
         )

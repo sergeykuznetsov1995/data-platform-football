@@ -28,6 +28,7 @@ from scrapers.fbref.control.models import (
     BudgetReservation,
     CohortTarget,
     CompetitionRegistryEntry,
+    CurrentSeasonRemediationEvidence,
     FrontierProvenance,
     FrontierTarget,
     ObservationLease,
@@ -122,6 +123,7 @@ _ROLLOVER_RELEASABLE_PAGE_KINDS = {
 _MAX_FRONTIER_DISCOVERY_TARGETS = 1000
 _MAX_FRONTIER_DISCOVERY_EDGES = 5000
 _PUBLICATION_SCHEMA_VERSION = "publication-generation-v1"
+_PUBLICATION_WRITER_FENCE = "fbref-control:publication-writer-fence"
 _PUBLICATION_PHASES = {
     "writing",
     "ready",
@@ -329,6 +331,73 @@ def _text(value: object, name: str) -> str:
     if not normalized:
         raise ValueError(f"{name} must not be empty")
     return normalized
+
+
+def _current_season_index_mapping(
+    evidence: CurrentSeasonRemediationEvidence,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "fbref-current-season-index-evidence-v1",
+        "snapshot_id": _uuid(evidence.index_snapshot_id, "index_snapshot_id"),
+        "run_id": _uuid(evidence.index_run_id, "index_run_id"),
+        "content_hash": _text(
+            evidence.index_content_hash, "index_content_hash"
+        ),
+        "raw": {
+            "attempt_id": _uuid(
+                evidence.index_attempt_id, "index_attempt_id"
+            ),
+            "content_hash": _text(
+                evidence.index_content_hash, "index_content_hash"
+            ),
+            "logical_refresh_id": _uuid(
+                evidence.index_logical_refresh_id,
+                "index_logical_refresh_id",
+            ),
+            "manifest_key": _text(
+                evidence.index_raw_manifest_key,
+                "index_raw_manifest_key",
+            ),
+            "target_id": _text(evidence.index_target_id, "index_target_id"),
+        },
+        "advertised": {
+            "label": _text(evidence.advertised_label, "advertised_label"),
+            "href": _text(evidence.advertised_href, "advertised_href"),
+            "season_id": _text(
+                evidence.advertised_season_id,
+                "advertised_season_id",
+            ),
+        },
+    }
+
+
+def _normalized_current_season_remediation_evidence(
+    evidence: Sequence[CurrentSeasonRemediationEvidence],
+) -> list[CurrentSeasonRemediationEvidence]:
+    items = list(evidence)
+    if not 1 <= len(items) <= 25:
+        raise ValueError("current-season remediation requires 1..25 inputs")
+    normalized = []
+    seen = set()
+    history_runs = set()
+    for item in items:
+        if not isinstance(item, CurrentSeasonRemediationEvidence):
+            raise TypeError("remediation evidence has the wrong type")
+        competition_id = _text(item.competition_id, "competition_id")
+        if competition_id in seen:
+            raise ValueError("remediation competition IDs must be unique")
+        seen.add(competition_id)
+        _current_season_index_mapping(item)
+        history_runs.add(_uuid(item.history_run_id, "history_run_id"))
+        _uuid(item.history_attempt_id, "history_attempt_id")
+        _text(item.history_target_id, "history_target_id")
+        _uuid(item.history_logical_refresh_id, "history_logical_refresh_id")
+        _text(item.history_content_hash, "history_content_hash")
+        _text(item.history_raw_manifest_key, "history_raw_manifest_key")
+        normalized.append(item)
+    if len(history_runs) != 1:
+        raise ValueError("one remediation batch must use one history source run")
+    return sorted(normalized, key=lambda item: item.competition_id)
 
 
 def _recovery_run_type(value: object) -> str:
@@ -1915,6 +1984,273 @@ class ControlStore:
             )
             return result
 
+    @staticmethod
+    def _lock_publication_writer_fence(cursor: Any, source: str) -> None:
+        cursor.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (f"{_PUBLICATION_WRITER_FENCE}:{source}",),
+        )
+
+    @staticmethod
+    def _validated_current_season_index(
+        cursor: Any,
+        competition_id: str,
+        *,
+        expected: Optional[Mapping[str, Any]] = None,
+        lock: bool,
+    ) -> dict[str, Any]:
+        cursor.execute(
+            f"""
+            SELECT competition_id, last_snapshot_id, metadata
+            FROM fbref_control.competition_registry
+            WHERE source = 'fbref' AND competition_id = %s
+              AND gender = 'male' AND crawl_state = 'active'
+              AND lifecycle_state IN ('present', 'missing_once')
+              AND present
+            {"FOR UPDATE" if lock else "FOR SHARE"}
+            """,
+            (competition_id,),
+        )
+        competition = _fetchone(cursor)
+        if competition is None or competition.get("last_snapshot_id") is None:
+            raise StateConflict(
+                f"Competition {competition_id} has no current index snapshot"
+            )
+        metadata = _json_mapping(
+            competition.get("metadata") or {}, "competition metadata"
+        )
+        index = _json_mapping(
+            metadata.get("current_season_index"),
+            "current_season_index",
+        )
+        advertised = _json_mapping(
+            index.get("advertised"), "advertised current season"
+        )
+        raw = _json_mapping(index.get("raw"), "index raw evidence")
+        if (
+            index.get("schema_version")
+            != "fbref-current-season-index-evidence-v1"
+            or str(competition["last_snapshot_id"])
+            != _uuid(index.get("snapshot_id"), "index snapshot_id")
+            or advertised.get("label") != metadata.get("last_season")
+            or advertised.get("href") != metadata.get("last_season_url")
+            or advertised.get("season_id")
+            != metadata.get("advertised_current_season_id")
+            or raw.get("content_hash") != index.get("content_hash")
+            or not advertised.get("label")
+            or not advertised.get("href")
+            or not advertised.get("season_id")
+        ):
+            raise StateConflict(
+                f"Competition {competition_id} index evidence is inconsistent"
+            )
+        normalized = {
+            "schema_version": str(index["schema_version"]),
+            "snapshot_id": _uuid(index["snapshot_id"], "index snapshot_id"),
+            "run_id": _uuid(index.get("run_id"), "index run_id"),
+            "content_hash": _text(
+                index.get("content_hash"), "index content_hash"
+            ),
+            "raw": {
+                "attempt_id": _uuid(
+                    raw.get("attempt_id"), "index attempt_id"
+                ),
+                "content_hash": _text(
+                    raw.get("content_hash"), "index raw content_hash"
+                ),
+                "logical_refresh_id": _uuid(
+                    raw.get("logical_refresh_id"),
+                    "index logical_refresh_id",
+                ),
+                "manifest_key": _text(
+                    raw.get("manifest_key"), "index manifest_key"
+                ),
+                "target_id": _text(raw.get("target_id"), "index target_id"),
+            },
+            "advertised": {
+                "label": _text(advertised["label"], "advertised label"),
+                "href": _text(advertised["href"], "advertised href"),
+                "season_id": _text(
+                    advertised["season_id"], "advertised season_id"
+                ),
+            },
+        }
+        if expected is not None and normalized != dict(expected):
+            raise StateConflict(
+                f"Competition {competition_id} index evidence changed"
+            )
+        cursor.execute(
+            """
+            SELECT run_id, content_hash, successful, metadata
+            FROM fbref_control.registry_snapshot
+            WHERE snapshot_id = %s
+            FOR SHARE
+            """,
+            (normalized["snapshot_id"],),
+        )
+        snapshot = _fetchone(cursor)
+        snapshot_metadata = (
+            {}
+            if snapshot is None
+            else _json_mapping(
+                snapshot.get("metadata") or {}, "index snapshot metadata"
+            )
+        )
+        if (
+            snapshot is None
+            or not bool(snapshot["successful"])
+            or str(snapshot.get("run_id")) != normalized["run_id"]
+            or str(snapshot.get("content_hash") or "")
+            != normalized["content_hash"]
+            or snapshot_metadata.get("page_kind") != "competition_index"
+            or _json_mapping(
+                snapshot_metadata.get("raw"), "index snapshot raw"
+            )
+            != normalized["raw"]
+        ):
+            raise StateConflict(
+                f"Competition {competition_id} index snapshot is not exact"
+            )
+        cursor.execute(
+            """
+            SELECT attempt_id, raw_manifest_key
+            FROM fbref_control.fetch_attempt
+            WHERE run_id = %s AND target_id = %s
+              AND logical_refresh_id = %s AND status = 'succeeded'
+              AND content_hash = %s
+            FOR SHARE
+            """,
+            (
+                normalized["run_id"],
+                normalized["raw"]["target_id"],
+                normalized["raw"]["logical_refresh_id"],
+                normalized["content_hash"],
+            ),
+        )
+        attempts = _fetchall(cursor)
+        if len(attempts) != 1 or (
+            str(attempts[0]["attempt_id"])
+            != normalized["raw"]["attempt_id"]
+            or str(attempts[0].get("raw_manifest_key") or "")
+            != normalized["raw"]["manifest_key"]
+        ):
+            raise StateConflict(
+                f"Competition {competition_id} index raw lineage is not exact"
+            )
+        return normalized
+
+    def get_current_season_index_evidence(
+        self,
+        competition_id: object,
+    ) -> dict[str, Any]:
+        """Return validated successful index/raw evidence for one competition."""
+
+        competition = _text(competition_id, "competition_id")
+        with self._transaction() as cursor:
+            return self._validated_current_season_index(
+                cursor,
+                competition,
+                lock=False,
+            )
+
+    @contextmanager
+    def current_season_remediation_transaction(
+        self,
+        *,
+        evidence: Sequence[CurrentSeasonRemediationEvidence],
+    ):
+        """Fence writers and atomically apply one exact two-raw repair batch."""
+
+        normalized = _normalized_current_season_remediation_evidence(evidence)
+        with self._transaction() as cursor:
+            self._lock_publication_writer_fence(cursor, "fbref")
+            cursor.execute(
+                """
+                SELECT owner_run_id, released_at,
+                       expires_at > clock_timestamp() AS active
+                FROM fbref_control.publication_lock
+                WHERE source = 'fbref'
+                FOR UPDATE
+                """
+            )
+            publication = _fetchone(cursor)
+            if (
+                publication is not None
+                and publication["released_at"] is None
+                and bool(publication["active"])
+            ):
+                raise StateConflict(
+                    "Active publication generation makes remediation unsafe"
+                )
+            for item in normalized:
+                expected_index = _current_season_index_mapping(item)
+                self._validated_current_season_index(
+                    cursor,
+                    item.competition_id,
+                    expected=expected_index,
+                    lock=True,
+                )
+                cursor.execute(
+                    """
+                    SELECT source, page_kind, state,
+                           last_content_hash, source_ids
+                    FROM fbref_control.page_frontier
+                    WHERE target_id = %s
+                    FOR NO KEY UPDATE
+                    """,
+                    (item.history_target_id,),
+                )
+                frontier = _fetchone(cursor)
+                source_ids = (
+                    {}
+                    if frontier is None
+                    else _json_mapping(
+                        frontier.get("source_ids") or {},
+                        "history frontier source_ids",
+                    )
+                )
+                if (
+                    frontier is None
+                    or frontier["source"] != "fbref"
+                    or frontier["page_kind"] != "competition"
+                    or frontier["state"] == "leased"
+                    or str(frontier.get("last_content_hash") or "")
+                    != item.history_content_hash
+                    or str(source_ids.get("competition_id") or "")
+                    != item.competition_id
+                ):
+                    raise StateConflict(
+                        f"Competition {item.competition_id} history frontier changed"
+                    )
+                cursor.execute(
+                    """
+                    SELECT attempt_id, run_id, logical_refresh_id,
+                           content_hash, raw_manifest_key
+                    FROM fbref_control.fetch_attempt
+                    WHERE target_id = %s AND status = 'succeeded'
+                    ORDER BY lease_epoch DESC, attempt_number DESC, attempt_id DESC
+                    LIMIT 1
+                    FOR SHARE
+                    """,
+                    (item.history_target_id,),
+                )
+                attempt = _fetchone(cursor)
+                if (
+                    attempt is None
+                    or str(attempt["attempt_id"]) != item.history_attempt_id
+                    or str(attempt["run_id"]) != item.history_run_id
+                    or str(attempt["logical_refresh_id"])
+                    != item.history_logical_refresh_id
+                    or str(attempt.get("content_hash") or "")
+                    != item.history_content_hash
+                    or str(attempt.get("raw_manifest_key") or "")
+                    != item.history_raw_manifest_key
+                ):
+                    raise StateConflict(
+                        f"Competition {item.competition_id} history raw changed"
+                    )
+            yield _CursorBoundControlStore(base=self, cursor=cursor)
+
     def assert_no_active_publication_generation(
         self,
         *,
@@ -1985,6 +2321,9 @@ class ControlStore:
         if not 60 <= normalized_ttl <= 14 * 24 * 60 * 60:
             raise ValueError("publication lock ttl_seconds must be 60..1209600")
         with self._transaction() as cursor:
+            self._lock_publication_writer_fence(
+                cursor, normalized_source
+            )
             cursor.execute(
                 "SELECT status FROM fbref_control.crawl_run WHERE run_id = %s",
                 (normalized_run_id,),
@@ -7968,6 +8307,41 @@ class ControlStore:
                 row[key] = str(row[key])
         return rows
 
+    def get_succeeded_fetch_evidence(
+        self,
+        logical_refresh_id: object,
+        *,
+        target_id: object,
+        content_hash: object,
+        raw_manifest_key: object,
+    ) -> dict:
+        """Return one exact successful raw/control binding across all runs."""
+
+        refresh = _uuid(logical_refresh_id, "logical_refresh_id")
+        target = _text(target_id, "target_id")
+        digest = _text(content_hash, "content_hash")
+        manifest = _text(raw_manifest_key, "raw_manifest_key")
+        with self._transaction() as cursor:
+            cursor.execute(
+                """
+                SELECT attempt_id, run_id, target_id, logical_refresh_id,
+                       content_hash, raw_manifest_key
+                FROM fbref_control.fetch_attempt
+                WHERE logical_refresh_id = %s AND target_id = %s
+                  AND status = 'succeeded' AND content_hash = %s
+                  AND raw_manifest_key = %s
+                ORDER BY lease_epoch DESC, attempt_number DESC, attempt_id DESC
+                """,
+                (refresh, target, digest, manifest),
+            )
+            rows = _fetchall(cursor)
+        if len(rows) != 1:
+            raise StateConflict("Successful fetch/raw lineage is not singular")
+        row = rows[0]
+        for key in ("attempt_id", "run_id", "logical_refresh_id"):
+            row[key] = str(row[key])
+        return row
+
     def get_observation_cleanup_evidence(
         self,
         logical_refresh_id: object,
@@ -10846,6 +11220,25 @@ class ControlStore:
                 lease_epoch=int(row["lease_epoch"]),
                 scheduled_at=row["scheduled_at"],
             )
+
+
+class _CursorBoundControlStore(ControlStore):
+    """Run ordinary control operations inside one caller-owned transaction."""
+
+    def __init__(self, *, base: ControlStore, cursor: Any) -> None:
+        super().__init__(
+            base.db_uri,
+            connection_factory=base._connection_factory,
+        )
+        self._bound_cursor = cursor
+
+    @contextmanager
+    def _transaction(self, existing_cursor: Any = None):
+        if existing_cursor not in {None, self._bound_cursor}:
+            raise ControlStoreError(
+                "bound control transaction cannot change its cursor"
+            )
+        yield self._bound_cursor
 
 
 class _CursorBoundReplayControlStore(ControlStore):

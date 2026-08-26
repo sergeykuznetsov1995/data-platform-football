@@ -85,7 +85,7 @@ class TestFBrefBackfillTopology:
         assert seed.op_kwargs["request_limit"] == module.REQUEST_LIMIT
         assert seed.op_kwargs["byte_limit_mb"] == module.BYTE_LIMIT_MB
         expected_reservation_mb = DEFAULT_REQUEST_RESERVATION_BYTES // MIB
-        assert expected_reservation_mb == 5
+        assert expected_reservation_mb == 9
         assert seed.op_kwargs["reservation_mb"] == expected_reservation_mb
         assert "competition_index" not in module.BACKFILL_PAGE_KINDS
         assert "competition" not in module.BACKFILL_PAGE_KINDS
