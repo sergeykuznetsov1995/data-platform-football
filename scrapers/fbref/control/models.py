@@ -75,6 +75,7 @@ class CurrentSeasonRemediationEvidence:
     advertised_label: str
     advertised_href: str
     advertised_season_id: str
+    resolved_season_id: str
     index_snapshot_id: str
     index_run_id: str
     index_attempt_id: str

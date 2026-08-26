@@ -5115,6 +5115,74 @@ def test_current_season_resolver_keeps_direct_match_type_contract():
     assert get_args(direct_matches) == (MatchRef,)
 
 
+def _seasonless_alias_competition_664() -> CompetitionRef:
+    return CompetitionRef(
+        comp_id="664",
+        name="AFC Asian Cup",
+        format=CompetitionFormat.CUP,
+        participants=ParticipantType.NATIONAL_TEAM,
+        gender=CompetitionGender.MALE,
+        source_section="International Cups",
+        country=None,
+        governing_body="AFC",
+        tier=None,
+        first_season="1956",
+        last_season="2024",
+        history_url=(
+            "https://fbref.com/en/comps/664/history/AFC-Asian-Cup-Seasons"
+        ),
+        last_season_url=(
+            "https://fbref.com/en/comps/664/AFC-Asian-Cup-Stats"
+        ),
+    )
+
+
+def test_resolve_current_season_uses_unique_advertised_url_before_label_id():
+    season_url = "https://fbref.com/en/comps/664/AFC-Asian-Cup-Stats"
+    history = [SeasonRef(
+        comp_id="664",
+        season_id="2023",
+        label="2023",
+        calendar_type=CalendarType.TOURNAMENT,
+        season_url=season_url,
+    )]
+
+    seasons, current_id = pipeline_module._resolve_current_season_install(
+        _seasonless_alias_competition_664(),
+        history,
+        [],
+    )
+
+    assert current_id == "2023"
+    assert [(row.season_id, row.season_url) for row in seasons] == [
+        ("2023", season_url)
+    ]
+
+
+def test_resolve_current_season_refuses_ambiguous_advertised_url():
+    season_url = "https://fbref.com/en/comps/664/AFC-Asian-Cup-Stats"
+    history = [
+        SeasonRef(
+            comp_id="664",
+            season_id=season_id,
+            label=season_id,
+            calendar_type=CalendarType.TOURNAMENT,
+            season_url=season_url,
+        )
+        for season_id in ("2023", "2019")
+    ]
+
+    with pytest.raises(
+        ParseWaveError,
+        match="advertised current URL matches multiple history seasons",
+    ):
+        pipeline_module._resolve_current_season_install(
+            _seasonless_alias_competition_664(),
+            history,
+            [],
+        )
+
+
 def test_advertised_current_source_id_prevents_duplicate_long_label(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)

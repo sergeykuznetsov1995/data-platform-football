@@ -67,6 +67,7 @@ class CurrentSeasonRemediationPlan:
     competition_id: str
     installed_current_season_id: Optional[str]
     advertised_current_season_id: str
+    resolved_current_season_id: str
     advertised_current_label: str
     advertised_current_url: str
     action: str
@@ -93,6 +94,7 @@ class CurrentSeasonRemediationPlan:
                 advertised_label=self.advertised_current_label,
                 advertised_href=self.advertised_current_url,
                 advertised_season_id=self.advertised_current_season_id,
+                resolved_season_id=self.resolved_current_season_id,
                 index_snapshot_id=self.index_snapshot_id,
                 index_run_id=self.index_run_id,
                 index_attempt_id=self.index_attempt_id,
@@ -116,6 +118,7 @@ class CurrentSeasonRemediationPlan:
             "competition_id": self.competition_id,
             "installed_current_season_id": self.installed_current_season_id,
             "advertised_current_season_id": (self.advertised_current_season_id),
+            "resolved_current_season_id": self.resolved_current_season_id,
             "advertised_current_label": self.advertised_current_label,
             "advertised_current_url": self.advertised_current_url,
             "action": self.action,
@@ -260,10 +263,9 @@ def build_remediation_plans(
             parsed.datasets["seasons"].records,
             parsed.datasets["matches"].records,
         )
-        if current_season_id != advertised.season_id:
+        if current_season_id is None:
             raise RemediationEvidenceError(
-                f"competition {competition_id} resolved current season differs "
-                "from maxseason evidence"
+                f"competition {competition_id} has no resolved current season"
             )
         installed = currents.get(competition_id)
         installed_id = None if installed is None else str(installed["season_id"])
@@ -280,7 +282,8 @@ def build_remediation_plans(
         plan = CurrentSeasonRemediationPlan(
             competition_id=competition_id,
             installed_current_season_id=installed_id,
-            advertised_current_season_id=current_season_id,
+            advertised_current_season_id=advertised.season_id,
+            resolved_current_season_id=current_season_id,
             advertised_current_label=advertised.label,
             advertised_current_url=advertised.season_url,
             action=("no_change" if installed_id == current_season_id else "reconcile"),

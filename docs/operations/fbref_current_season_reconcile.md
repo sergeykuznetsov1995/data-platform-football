@@ -13,9 +13,13 @@ Observed on 2026-08-25:
   `/en/comps/6/WCQ----UEFA-M-Stats`; history starts at `2022`;
 - competition 678: index advertises `2024` at
   `/en/comps/678/UEFA-Euro-qualification-Stats`; history starts at `2021`.
+- competition 664 is a different, reviewed shape: the index displays `2024`
+  at the seasonless `/en/comps/664/AFC-Asian-Cup-Stats`, while history assigns
+  that exact same URL the source season ID and label `2023`. It is one edition
+  with two source-surface labels, not a missing `2024` registry row.
 
 The same false-current pattern affects competitions
-`2,3,4,5,6,7,657,664,665,678`. Competition 255 is a non-bug control: its
+`2,3,4,5,6,7,657,665,678`. Competition 255 is a non-bug control: its
 display label differs, but both index and history carry source season ID
 `2026`; it must remain current.
 
@@ -29,7 +33,7 @@ fix. A genuinely current oversized page such as competition 569 season
 not reinterpret generic or typed raw observations and therefore must not
 schedule a global typed replay. Registry snapshot UUIDs additionally include
 `CURRENT_SEASON_INSTALL_CONTRACT_VERSION =
-fbref-current-season-install-source-link-v1`.
+fbref-current-season-install-source-link-v2`.
 
 A competition-history install snapshot is the deterministic composition of
 two immutable inputs:
@@ -49,16 +53,22 @@ authoritative index edition reuses its original deterministic snapshot and
 edge identities and reconciles away a season synthesized only by the later
 edition.
 
-The installed current season is derived only from:
+The installed current season is resolved only from:
 
 1. the saved competition-index `maxseason` label and exact href;
 2. the latest committed competition-history raw;
-3. the source season ID derived from the exact href.
+3. a unique history season whose canonical URL exactly equals that href;
+4. otherwise, the source season ID derived from an explicit href component,
+   with the display label used only as the legacy fallback for a seasonless
+   href that does not match history.
 
 If exactly one of label or href is present, reconciliation fails closed. The
 legacy first-history-row fallback is allowed only when both signals are absent.
-When both are present, the exact advertised source edition is selected or
-synthesized; an old first history row is never substituted.
+When both are present, a unique exact-URL history edition wins before any
+label-derived synthetic row is considered. Two history rows sharing the
+advertised URL are ambiguous and fail closed. If no URL matches, the exact
+advertised source edition is selected or synthesized; an unrelated first
+history row is never substituted.
 
 ## Pre-deploy read-only audit
 
@@ -148,7 +158,9 @@ It refuses a competition unless all of the following hold:
   content hash/raw attempt/logical refresh/target/manifest are available;
 - the latest competition-history raw is committed and parses successfully;
 - the exact successful history attempt and raw manifest match that raw;
-- the resolved current source ID equals the advertised source ID;
+- the resolved current source ID either equals the advertised source ID or is
+  the unique history season whose canonical URL exactly matches the advertised
+  href;
 - current-season cardinality is singular.
 
 Save the dry-run JSON. It reports both complete inputs: all `history_*` fields
@@ -185,16 +197,19 @@ whole batch back; it never switches to a different raw observation.
 
 ## Post-reconcile acceptance
 
-Require all 117 active male competitions to have exactly one current season,
-and require the current source ID to match the index-advertised season. A
-display label is diagnostic, not source identity: competition 255 is the one
-reviewed label alias, and any other label mismatch is a refusal:
+Require all 117 active male competitions to have exactly one current season.
+Normally the current source ID must match the index-derived ID. Competition
+664 is the one reviewed ID mismatch: its unique history season `2023` owns the
+exact seasonless href advertised under display label `2024`. Competition 255
+is the separate reviewed display-label alias with the same source ID. Any
+other ID or label mismatch is a refusal:
 
 ```sql
 BEGIN READ ONLY;
 WITH active AS (
   SELECT c.competition_id,
          c.metadata ->> 'last_season' AS advertised_label,
+         c.metadata ->> 'last_season_url' AS advertised_href,
          c.metadata ->> 'advertised_current_season_id'
            AS advertised_source_id,
          count(*) FILTER (
@@ -205,7 +220,10 @@ WITH active AS (
          ) AS current_season_id,
          max(s.label) FILTER (
            WHERE s.present AND s.lifecycle_state = 'present' AND s.is_current
-         ) AS current_label
+         ) AS current_label,
+         max(s.canonical_url) FILTER (
+           WHERE s.present AND s.lifecycle_state = 'present' AND s.is_current
+         ) AS current_canonical_url
   FROM fbref_control.competition_registry c
   LEFT JOIN fbref_control.season_registry s
     USING (source, competition_id)
@@ -216,30 +234,70 @@ WITH active AS (
     AND c.present
   GROUP BY c.competition_id,
            c.metadata ->> 'last_season',
+           c.metadata ->> 'last_season_url',
            c.metadata ->> 'advertised_current_season_id'
 ), classified AS (
   SELECT *,
+         (advertised_label IS NOT NULL
+           AND btrim(advertised_label) <> ''
+           AND advertised_href IS NOT NULL
+           AND btrim(advertised_href) <> ''
+           AND advertised_source_id IS NOT NULL
+           AND btrim(advertised_source_id) <> '') IS TRUE
+           AS complete_source_evidence,
          current_label IS DISTINCT FROM advertised_label
            AS label_mismatch,
-         (competition_id = '255'
+         (current_count = 1
+           AND current_season_id = advertised_source_id) IS TRUE
+           AS source_id_match,
+         (current_count = 1
+           AND current_season_id IS DISTINCT FROM advertised_source_id
+           AND current_canonical_url = advertised_href) IS TRUE
+           AS url_resolved_id_mismatch
+  FROM active
+), approved_identity AS (
+  SELECT *,
+         (competition_id = '664'
+           AND url_resolved_id_mismatch
+           AND current_season_id = '2023'
+           AND advertised_source_id = '2024'
+           AND current_canonical_url =
+             'https://fbref.com/en/comps/664/AFC-Asian-Cup-Stats'
+           AND advertised_href =
+             'https://fbref.com/en/comps/664/AFC-Asian-Cup-Stats') IS TRUE
+           AS approved_url_resolution
+  FROM classified
+), judged AS (
+  SELECT *,
+         ((competition_id = '255'
            AND current_count = 1
            AND current_season_id = '2026'
            AND advertised_source_id = '2026'
            AND current_label IS NOT NULL
            AND advertised_label IS NOT NULL
-           AND current_label IS DISTINCT FROM advertised_label) IS TRUE
+           AND label_mismatch)
+          OR (approved_url_resolution
+           AND current_label = '2023'
+           AND advertised_label = '2024'
+           AND label_mismatch)) IS TRUE
            AS approved_label_mismatch,
          current_count <> 1
-           OR current_season_id IS DISTINCT FROM advertised_source_id
+           OR NOT complete_source_evidence
+           OR NOT ((source_id_match OR approved_url_resolution) IS TRUE)
            AS identity_violation
-  FROM active
+  FROM approved_identity
 ), summary AS (
   SELECT count(*) AS active_competitions,
          count(*) FILTER (WHERE current_count = 1)
            AS exactly_one_current,
-         count(*) FILTER (
-           WHERE current_season_id = advertised_source_id
-         ) AS advertised_source_id_matches,
+         count(*) FILTER (WHERE complete_source_evidence)
+           AS source_evidence_complete,
+         count(*) FILTER (WHERE source_id_match)
+           AS advertised_source_id_matches,
+         count(*) FILTER (WHERE url_resolved_id_mismatch)
+           AS url_resolved_id_mismatches,
+         count(*) FILTER (WHERE approved_url_resolution)
+           AS approved_url_resolutions,
          count(*) FILTER (WHERE label_mismatch) AS label_mismatches,
          count(*) FILTER (WHERE approved_label_mismatch)
            AS approved_label_mismatches,
@@ -250,21 +308,24 @@ WITH active AS (
            WHERE identity_violation
               OR (label_mismatch AND NOT approved_label_mismatch)
          ) AS violations
-  FROM classified
+  FROM judged
 )
 SELECT *,
        active_competitions = 117
          AND exactly_one_current = 117
-         AND advertised_source_id_matches = 117
-         AND label_mismatches = 1
-         AND approved_label_mismatches = 1
+         AND source_evidence_complete = 117
+         AND advertised_source_id_matches = 116
+         AND url_resolved_id_mismatches = 1
+         AND approved_url_resolutions = 1
+         AND label_mismatches = 2
+         AND approved_label_mismatches = 2
          AND unexpected_label_mismatches = 0
          AND violations = 0 AS acceptance_pass
 FROM summary;
 COMMIT;
 ```
 
-Expected: `117 / 117 / 117 / 1 / 1 / 0 / 0 / true`.
+Expected: `117 / 117 / 117 / 116 / 1 / 1 / 2 / 2 / 0 / 0 / true`.
 
 Before any oversized-page requeue or canary, require the two known stale
 playing-time targets to be outside the current proxy/freshness lane. This is a

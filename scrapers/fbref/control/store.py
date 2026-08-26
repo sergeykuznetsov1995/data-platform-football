@@ -388,6 +388,7 @@ def _normalized_current_season_remediation_evidence(
             raise ValueError("remediation competition IDs must be unique")
         seen.add(competition_id)
         _current_season_index_mapping(item)
+        _text(item.resolved_season_id, "resolved_season_id")
         history_runs.add(_uuid(item.history_run_id, "history_run_id"))
         _uuid(item.history_attempt_id, "history_attempt_id")
         _text(item.history_target_id, "history_target_id")

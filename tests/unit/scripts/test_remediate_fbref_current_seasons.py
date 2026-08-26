@@ -4,10 +4,12 @@ import importlib.util
 import subprocess
 import sys
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from scrapers.fbref.pipeline import FBrefPipeline, ParseWaveError
 from scrapers.fbref.raw_store import (
     RawPageStore,
     competition_index_target,
@@ -57,7 +59,7 @@ def test_runbook_uses_only_readme_immutable_blob_function_for_apply():
     )
 
 
-def test_runbook_acceptance_allows_only_the_known_comp255_label_alias():
+def test_runbook_acceptance_allows_only_reviewed_label_and_url_aliases():
     runbook = RUNBOOK.read_text()
     acceptance = runbook.split("## Post-reconcile acceptance", 1)[1]
     acceptance = acceptance.split(
@@ -65,14 +67,29 @@ def test_runbook_acceptance_allows_only_the_known_comp255_label_alias():
     )[0]
 
     assert "AS label_mismatches" in acceptance
+    assert "AS source_evidence_complete" in acceptance
     assert "AS approved_label_mismatches" in acceptance
     assert "AS unexpected_label_mismatches" in acceptance
+    assert "AS url_resolved_id_mismatches" in acceptance
+    assert "AS approved_url_resolutions" in acceptance
     assert "competition_id = '255'" in acceptance
     assert "current_season_id = '2026'" in acceptance
     assert "advertised_source_id = '2026'" in acceptance
+    assert "competition_id = '664'" in acceptance
+    assert "current_season_id = '2023'" in acceptance
+    assert "advertised_source_id = '2024'" in acceptance
+    assert (
+        "https://fbref.com/en/comps/664/AFC-Asian-Cup-Stats" in acceptance
+    )
     assert ") IS TRUE\n           AS approved_label_mismatch" in acceptance
     assert "AS acceptance_pass" in acceptance
-    assert "Expected: `117 / 117 / 117 / 1 / 1 / 0 / 0 / true`." in acceptance
+    assert "source_evidence_complete = 117" in acceptance
+    assert (
+        "Expected: `117 / 117 / 117 / 116 / 1 / 1 / 2 / 2 / 0 / 0 / true`."
+        in acceptance
+    )
+    assert "resolved current source ID equals the advertised source ID" not in runbook
+    assert "unique history season whose canonical URL exactly matches" in runbook
 
 
 def test_script_supports_exact_stdin_execution_from_runtime_workdir():
@@ -270,6 +287,7 @@ def test_dry_run_proposes_exact_comp6_source_season_without_writes(tmp_path):
     assert plan["competition_id"] == "6"
     assert plan["installed_current_season_id"] == "2022"
     assert plan["advertised_current_season_id"] == "2026"
+    assert plan["resolved_current_season_id"] == "2026"
     assert plan["advertised_current_label"] == "2026"
     assert plan["advertised_current_url"] == (
         "https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats"
@@ -288,7 +306,7 @@ def test_dry_run_proposes_exact_comp6_source_season_without_writes(tmp_path):
     assert plan["index_content_hash"] == index["content_hash"]
     assert plan["index_raw_manifest_key"] == index["raw"]["manifest_key"]
     assert plan["install_contract_version"] == (
-        "fbref-current-season-install-source-link-v1"
+        "fbref-current-season-install-source-link-v2"
     )
 
 
@@ -329,6 +347,62 @@ def test_comp255_same_source_id_is_no_change_not_demotion(tmp_path):
 
     assert evidence["plans"][0]["action"] == "no_change"
     assert evidence["plans"][0]["advertised_current_season_id"] == "2026"
+
+
+def test_comp664_separates_index_label_id_from_history_url_identity(tmp_path):
+    raw = RawPageStore.from_uri(tmp_path.as_uri())
+    current_url = "https://fbref.com/en/comps/664/AFC-Asian-Cup-Stats"
+    competition = _competition(
+        raw,
+        "664",
+        last_season="2024",
+        last_season_url=current_url,
+        classification="cup:national_team",
+    )
+    history_record = _commit_history(
+        raw,
+        competition,
+        """
+      <table id="seasons"><tbody><tr><th data-stat="season"><a
+        href="/en/comps/664/AFC-Asian-Cup-Stats"
+      >2023</a></th></tr></tbody></table>
+    """,
+    )
+    control = FakeControl(
+        [competition],
+        [_current("664", "2023", current_url)],
+        [history_record],
+    )
+
+    evidence = remediation.run_remediation(
+        control,
+        raw,
+        competition_ids=["664"],
+        apply=False,
+    )
+
+    plan = evidence["plans"][0]
+    assert plan["advertised_current_season_id"] == "2024"
+    assert plan["resolved_current_season_id"] == "2023"
+    assert plan["action"] == "no_change"
+
+    remediation_plan = remediation.build_remediation_plans(
+        control,
+        raw,
+        competition_ids=["664"],
+    )[0]
+    item = remediation_plan.remediation_item()
+    mismatched = replace(
+        item,
+        evidence=replace(item.evidence, resolved_season_id="2024"),
+    )
+    with pytest.raises(
+        ParseWaveError,
+        match="resolved current season differs from remediation evidence",
+    ):
+        FBrefPipeline(control, raw).validate_current_season_remediation_item(
+            mismatched
+        )
 
 
 def test_apply_requires_source_run_id_before_any_write(tmp_path):
@@ -532,6 +606,10 @@ def test_apply_dispatches_one_supported_atomic_batch(tmp_path):
     assert result["mode"] == "apply"
     assert len(calls) == 1
     assert [item.evidence.competition_id for item in calls[0]] == ["6", "678"]
+    assert [item.evidence.resolved_season_id for item in calls[0]] == [
+        "2026",
+        "2026",
+    ]
     assert "_parse_competition" not in SCRIPT.read_text()
 
 
