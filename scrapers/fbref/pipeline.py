@@ -130,7 +130,7 @@ SENTINEL_COMPETITIONS = (
 )
 
 CURRENT_SEASON_INSTALL_CONTRACT_VERSION = (
-    "fbref-current-season-install-source-link-v1"
+    "fbref-current-season-install-source-link-v2"
 )
 SEASON_INSTALL_REDIRECT_VERSION = (
     "fbref-season-install-redirects-20260825-v1"
@@ -2202,6 +2202,18 @@ def _resolve_current_season_install(
     advertised = advertised_current_season(competition)
     if advertised is not None:
         advertised = _season_with_registry_redirect(advertised)
+        url_matches = [
+            season
+            for season in installed_seasons
+            if season.season_url == advertised.season_url
+        ]
+        if len(url_matches) > 1:
+            raise ParseWaveError(
+                f"Competition {competition.comp_id} advertised current URL "
+                "matches multiple history seasons"
+            )
+        if len(url_matches) == 1:
+            return installed_seasons, url_matches[0].season_id
         installed = next(
             (
                 season
@@ -4529,6 +4541,25 @@ class FBrefPipeline:
                 f"Competition {evidence.competition_id} advertised season "
                 "differs from the authoritative index raw"
             )
+        history_parsed = parse_competition_html(
+            installed_html,
+            competitions[0],
+        )
+        if history_parsed.has_errors:
+            raise ParseWaveError(
+                f"Competition {evidence.competition_id} history raw fails "
+                "current-season resolution"
+            )
+        _seasons, resolved_season_id = _resolve_current_season_install(
+            competitions[0],
+            history_parsed.datasets["seasons"].records,
+            history_parsed.datasets["matches"].records,
+        )
+        if resolved_season_id != evidence.resolved_season_id:
+            raise ParseWaveError(
+                f"Competition {evidence.competition_id} resolved current "
+                "season differs from remediation evidence"
+            )
         validated.add(index_key)
 
     def remediate_current_seasons(
@@ -4594,7 +4625,7 @@ class FBrefPipeline:
                 )
             for item in batch:
                 installed = currents.get(item.evidence.competition_id, [])
-                if installed != [item.evidence.advertised_season_id]:
+                if installed != [item.evidence.resolved_season_id]:
                     raise StateConflict(
                         f"Competition {item.evidence.competition_id} "
                         "post-remediation current season is not exact"
