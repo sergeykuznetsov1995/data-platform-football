@@ -240,6 +240,22 @@ def fetch_season_fixtures(
     return fetched, counters
 
 
+def empty_schedule_counters() -> dict[str, int]:
+    """The zeroed counter set of a tail walk, for a walk that never ran.
+
+    ONE definition: the caller has to report the same shape when the walk was
+    cut short by a transport failure, and a second copy of the key list would
+    drift away from this one silently.
+    """
+
+    return {
+        "targets": 0, "expected": 0, "pages": 0, "events": 0, "missing": 0,
+        "missing_expected": 0, "empty_expected": 0, "truncated": 0,
+        "foreign_season": 0, "resumed": 0, "chased": 0, "malformed": 0,
+        "chase_settled": 0, "backtracked": 0, "malformed_resumed": 0,
+    }
+
+
 def fetch_season_schedules(
     client: Any,
     targets: Iterable[tuple[int, int]],
@@ -307,12 +323,7 @@ def fetch_season_schedules(
     incomplete: list[tuple[int, int, int, int]] = []
     starts = dict(start_pages or {})
     anchors = dict(resume_anchors or {})
-    counters = {
-        "targets": 0, "expected": 0, "pages": 0, "events": 0, "missing": 0,
-        "missing_expected": 0, "empty_expected": 0, "truncated": 0,
-        "foreign_season": 0, "resumed": 0, "chased": 0, "malformed": 0, "chase_settled": 0,
-        "backtracked": 0, "malformed_resumed": 0,
-    }
+    counters = empty_schedule_counters()
     # Chains resumed from the retry queue, and how many of them broke.  They are
     # kept OUT of the drift threshold below: a queued chain whose page breaks is
     # a poison the caller already tracks, one visit at a time, and failing the
@@ -601,6 +612,40 @@ def fetch_season_schedules(
     return fetched, counters, incomplete
 
 
+def _is_identity_conflict(
+    previous: Mapping[str, Any], current: Mapping[str, Any]
+) -> bool:
+    """True when two copies of one ``game_id`` are DIFFERENT matches.
+
+    A knockout-bracket stub ("Winner of match N", ``<side>_team_disabled`` True
+    on the OLDER copy) resolving into a real team is the source filling in a
+    slot, not a contradiction.  ``season_pipeline._is_schedule_identity_conflict``
+    has exempted exactly that since Sol round 21; this lane compared the raw
+    team ids instead, so a resolved cup tie was counted as a conflict, the
+    placeholder copy was the one kept, and Bronze got the stub.  Two such ties
+    in one slice also tripped the ``identity_conflict`` threshold and failed
+    the class (code review of PR #1216).
+
+    A column absent from either copy is not evidence of anything, same as
+    there.
+    """
+
+    if previous.get("league") != current.get("league"):
+        return True
+    if previous.get("season") != current.get("season"):
+        return True
+    for side in ("home_team", "away_team"):
+        column = f"{side}_id"
+        if column not in previous or column not in current:
+            continue
+        if previous[column] == current[column]:
+            continue
+        if previous.get(f"{side}_disabled") is True:
+            continue
+        return True
+    return False
+
+
 def _identity(row: Mapping[str, Any]) -> tuple:
     """What may never change between two copies of the same game."""
 
@@ -719,7 +764,7 @@ def schedule_rows_from_events(
             }
         )
         previous = rows_by_game.get(row["game_id"])
-        if previous is not None and _identity(previous) != _identity(row):
+        if previous is not None and _is_identity_conflict(previous, row):
             # Same game id, different match.  The freshest copy wins only when
             # the two copies are the SAME game — a repeat is normal (the tail
             # page and the calendar overlap, and a resumed chain re-reads a
@@ -751,7 +796,7 @@ def schedule_rows_from_events(
             f"back twice with different teams: {counters}",
             counters=counters,
         )
-    if counters["unscoped"] and (
+    if counters["unscoped"] >= _FAIL_MIN_TARGETS and (
         counters["unscoped"] >= counters["events"] * _UNSCOPED_FAIL_SHARE
     ):
         raise DailyEventsSchemaError(

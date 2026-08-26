@@ -284,6 +284,52 @@ def test_scope_parks_after_max_attempts_and_its_tournament_waits(tmp_path):
     assert _plan()[0] == head
 
 
+@pytest.mark.unit
+def test_a_parked_scope_is_retried_once_the_cooldown_has_passed(tmp_path):
+    """A park is a pause, not a grave.
+
+    Nothing but a validated success of the parked scope itself ever cleared a
+    park, and a parked scope is never planned — so the success could not
+    happen and the whole OLDER history of that tournament, which waits behind
+    the blocker on purpose, was buried for good.  Seven tournaments were
+    already in that state in the live campaign.
+    """
+
+    from datetime import datetime, timedelta, timezone
+
+    snapshot = _snapshot()
+    campaign_id = snapshot["campaign_id"]
+    failures_path = tmp_path / "failures.json"
+    head = campaign_scope_key(campaign_id, 8, 825)
+
+    def _plan(moment=None):
+        return [item["SOFASCORE_SCOPE_KEY"] for item in plan_historical_batch(
+            snapshot,
+            completed=set(),
+            batch_size=10,
+            failures=read_failures(failures_path, campaign_id=campaign_id),
+            max_scope_attempts=3,
+            park_cooldown_hours=24,
+            moment=moment,
+        )]
+
+    for run_id in ("run-1", "run-2", "run-3"):
+        mark_failed(
+            failures_path, campaign_id=campaign_id, scope_key=head, run_id=run_id
+        )
+    # Parked right now: the tournament still waits behind it.
+    assert head not in _plan()
+
+    later = datetime.now(timezone.utc) + timedelta(hours=25)
+    assert _plan(moment=later)[0] == head
+    # And the deeper season of that tournament is reachable again with it.
+    assert campaign_scope_key(campaign_id, 8, 824) in _plan(moment=later)
+
+    # Inside the window it stays parked, so a broken scope cannot loop on
+    # paid traffic.
+    assert head not in _plan(moment=datetime.now(timezone.utc) + timedelta(hours=1))
+
+
 def _refresh_snapshot():
     snapshot = _snapshot()
     # Lane F: the current (pending, unmeasured) season of every tournament

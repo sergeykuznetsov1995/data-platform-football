@@ -8,7 +8,7 @@ import logging
 import os
 import tempfile
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -31,8 +31,41 @@ STATE_SCHEMA_VERSION = 1
 FAILURES_SCHEMA_VERSION = 1
 DEFAULT_FIRST_START_YEAR = 2025
 DEFAULT_MAX_SCOPE_ATTEMPTS = 3
+# How long a parked scope waits before it is worth ONE more attempt.  Parking
+# holds the deeper seasons of its tournament on purpose, and the only thing
+# that used to clear a park was a validated success of the parked scope itself
+# — which a parked scope can never have, because it is never planned.  So a
+# tournament whose newest season failed three times lost its ENTIRE older
+# history, permanently and silently: seven tournaments were already in that
+# state in the live campaign on 2026-08-26 (code review of PR #1216).  A
+# cooldown makes the park a pause instead of a grave: one retry per window, and
+# a scope that fails again is parked again for another window, so a genuinely
+# broken season still cannot loop on paid traffic.
+DEFAULT_PARK_COOLDOWN_HOURS = 24
 DEFAULT_REFRESH_BATCH_SIZE = 8
 DEFAULT_REFRESH_RESULT_DIR = "/opt/airflow/runtime/sofascore/all-men/refresh-results"
+
+
+def park_has_cooled(
+    attempts: Mapping[str, Any],
+    moment: datetime,
+    cooldown_hours: int = DEFAULT_PARK_COOLDOWN_HOURS,
+) -> bool:
+    """True when a parked scope has waited long enough for one more attempt.
+
+    A record without a readable ``last_at`` stays parked: guessing "long ago"
+    from a missing timestamp would unpark everything at once.
+    """
+
+    if cooldown_hours <= 0:
+        return False
+    try:
+        last_at = datetime.fromisoformat(str(attempts.get("last_at") or ""))
+    except ValueError:
+        return False
+    if last_at.tzinfo is None:
+        last_at = last_at.replace(tzinfo=timezone.utc)
+    return moment - last_at >= timedelta(hours=cooldown_hours)
 
 
 class CampaignPlanningError(ValueError):
@@ -90,6 +123,8 @@ def plan_historical_batch(
     task_env: Mapping[str, str] | None = None,
     failures: Mapping[str, Mapping[str, Any]] | None = None,
     max_scope_attempts: int = DEFAULT_MAX_SCOPE_ATTEMPTS,
+    park_cooldown_hours: int = DEFAULT_PARK_COOLDOWN_HOURS,
+    moment: datetime | None = None,
 ) -> list[dict[str, str]]:
     """Select a bounded batch: every tournament's newest season, then deeper.
 
@@ -102,12 +137,15 @@ def plan_historical_batch(
 
     ``failures`` is the campaign's failure memory (see ``read_failures``): a
     scope with ``count >= max_scope_attempts`` is parked like a deferred one
-    instead of retrying at the head of the queue forever.
+    instead of retrying at the head of the queue forever.  The park expires
+    after ``park_cooldown_hours`` and the scope gets ONE more attempt — see
+    ``DEFAULT_PARK_COOLDOWN_HOURS`` for why a park may not be permanent.
 
     ``task_env`` is the lane's own environment (gateway URL, rate limit) and
     is forwarded verbatim to every planned task; campaign keys win over it.
     """
 
+    moment = moment or datetime.now(timezone.utc)
     lane_env = {str(key): str(value) for key, value in (task_env or {}).items()}
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise CampaignPlanningError("batch_size must be a positive integer")
@@ -178,7 +216,9 @@ def plan_historical_batch(
                 attempts = (failures or {}).get(key) or {}
                 if key in completed_keys:
                     kind = "completed"
-                elif int(attempts.get("count", 0)) >= max_scope_attempts:
+                elif int(attempts.get("count", 0)) >= max_scope_attempts and not (
+                    park_has_cooled(attempts, moment, park_cooldown_hours)
+                ):
                     kind = "parked"
                     logger.warning(
                         "campaign scope %s parked after %s failed attempts "

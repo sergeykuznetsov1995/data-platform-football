@@ -1715,6 +1715,20 @@ def _lease_dagrun_budget_bytes(lease: Lease) -> int:
         if lease.workload_plan is None or lease.run_cap_bytes <= 0:
             return 0
         return lease.run_cap_bytes
+    if lease.source == "sofascore_discovery":
+        # Admission sized this lease with the discovery cap (``_create_lease``),
+        # so enforcement has to read the same number.  Falling through to
+        # ``_dagrun_budget_bytes(lease.dag_id)`` metered it against whichever
+        # cap the DAG ID maps to instead: the metadata DAGs are in
+        # ``SOFASCORE_DAG_IDS`` but NOT in ``SOFASCORE_DISCOVERY_DAG_IDS``, so a
+        # discovery lease of the refresh lane was enforced against
+        # ``SOFASCORE_DAGRUN_BUDGET_BYTES`` — the biggest single workload class
+        # of the canary artifact, ~1.2 MiB — while its sweep needs tens of MB.
+        # The lane was cut off a few dozen pages in on every run, and the bytes
+        # it did spend were charged to the production SofaScore DagRun cap
+        # while the discovery cap was never enforced at all (code review of
+        # PR #1216).
+        return SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES
     if lease.source == "whoscored":
         if lease.proxy_campaign_approval is None:
             return DEFAULT_WHOSCORED_PAID_CAP_BYTES

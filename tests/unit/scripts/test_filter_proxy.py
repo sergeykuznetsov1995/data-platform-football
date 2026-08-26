@@ -1959,19 +1959,19 @@ def test_sofascore_scheduler_mounts_exact_artifact_and_fingerprint_config():
     assert scheduler["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"].startswith(
         "${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:?"
     )
+    # This service is the SHARED platform scheduler — it holds the other five
+    # sources, and the SofaScore contour runs on its own scheduler in project
+    # ``sofascore-airflow`` (its own compose file, its own healthcheck), where
+    # every SofaScore DAG registered here is paused.  Its healthcheck must
+    # therefore answer one question only: is THIS scheduler alive.  Wiring the
+    # SofaScore runtime preflight in here gated all five other sources on the
+    # SofaScore gateway answering and on ``snapshot.json`` being present, and
+    # wrote a probe file into the campaign directory every 30 s, for a contour
+    # this scheduler does not run (code review of PR #1216).  The mounts above
+    # stay: they cost nothing and keep the artifact/campaign paths honest.
     assert scheduler["healthcheck"]["test"] == [
-        "CMD",
-        "python",
-        "/opt/airflow/scripts/sofascore_runtime_preflight.py",
-        "scheduler-health",
-        "--artifact",
-        artifact_target,
-        "--campaign-dir",
-        campaign_target,
-        "--campaign-policy",
-        "/opt/airflow/configs/sofascore/all_mens_campaign.json",
-        "--health-url",
-        "http://sofascore_proxy_filter:8899/health",
+        "CMD-SHELL",
+        'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"',
     ]
     assert not any(
         target != artifact_target and artifact_target.startswith(f"{target}/")
@@ -7442,6 +7442,18 @@ def test_all_mens_refresh_dag_uses_signed_and_discovery_lanes_like_backfill(
 
     assert lease.source == "sofascore_discovery"
     assert lease.dag_id == "dag_refresh_sofascore_all_mens"
+    # Admission sized this lease with the DISCOVERY cap, so every runtime check
+    # has to read the same number.  ``_lease_dagrun_budget_bytes`` fell through
+    # to ``_dagrun_budget_bytes(lease.dag_id)`` instead — and this DAG is in
+    # ``SOFASCORE_DAG_IDS`` but NOT in ``SOFASCORE_DISCOVERY_DAG_IDS``, so the
+    # sweep was metered against ``SOFASCORE_DAGRUN_BUDGET_BYTES``: the biggest
+    # single workload class of the canary artifact, ~1.2 MiB against the tens
+    # of MB a sweep needs.  The lane was cut off a few dozen pages in on every
+    # run, for ever, and the bytes it did spend were charged to the production
+    # SofaScore DagRun cap while the discovery cap was never enforced at all
+    # (code review of PR #1216).
+    assert mod._lease_dagrun_budget_bytes(lease) == 12 * 1024 * 1024
+    assert lease.report()["dagrun_budget_bytes"] == 12 * 1024 * 1024
 
 
 def test_shared_sofascore_discovery_allows_camoufox_exit_probe():

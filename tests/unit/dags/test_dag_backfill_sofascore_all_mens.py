@@ -201,7 +201,13 @@ def test_finalize_remembers_failed_scopes_by_map_index(monkeypatch):
     )
 
     def get_task_instance(task_id, map_index=-1):
-        assert task_id == "run_historical_scope"
+        assert task_id in ("run_historical_scope", "validate_historical_scope")
+        if task_id == "validate_historical_scope":
+            # The bash step decides this case; validation followed it.
+            return SimpleNamespace(
+                state="upstream_failed" if states[map_index] == "failed"
+                else "success"
+            )
         return SimpleNamespace(state=states[map_index])
 
     context = {
@@ -221,6 +227,46 @@ def test_finalize_remembers_failed_scopes_by_map_index(monkeypatch):
     assert module.FAILURES_PATH == str(
         module.Path(module.STATE_PATH).with_name("failures.json")
     )
+
+
+@pytest.mark.unit
+def test_finalize_remembers_a_scope_whose_validation_failed(monkeypatch):
+    """A paid scope that fails VALIDATION must age towards parking too.
+
+    The bash step succeeds, so ``mark_completed``/``clear_failed`` are never
+    reached (validation raises first) — and looking only at the bash task meant
+    ``mark_failed`` was never reached either.  The scope stayed ``ready`` at
+    ``depth=0``, came back first in the next @continuous run, was paid for in
+    full again and failed identically: an unbounded paid loop on one broken
+    scope.
+    """
+
+    module = _load_dag_module()
+    planned = [_capture_env("c:8:825")]
+    marked = []
+    monkeypatch.setattr(
+        module.state, "mark_failed",
+        lambda path, **kw: marked.append(kw),
+    )
+
+    def get_task_instance(task_id, map_index=-1):
+        # Bash green, validation red.
+        return SimpleNamespace(
+            state="success" if task_id == "run_historical_scope" else "failed"
+        )
+
+    context = {
+        "ti": SimpleNamespace(
+            xcom_pull=lambda **kw: planned, xcom_push=lambda **kw: None
+        ),
+        "dag_run": SimpleNamespace(get_task_instance=get_task_instance),
+        "run_id": "manual__3",
+    }
+
+    module._finalize_historical_run(**context)
+    assert marked == [
+        {"campaign_id": "c", "scope_key": "c:8:825", "run_id": "manual__3"}
+    ]
 
 
 @pytest.mark.unit

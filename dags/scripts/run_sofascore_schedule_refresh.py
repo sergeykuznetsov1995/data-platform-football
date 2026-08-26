@@ -58,6 +58,7 @@ from scrapers.sofascore.raw_store import RawPayloadStore  # noqa: E402
 from scrapers.sofascore.schedule_refresh import (  # noqa: E402
     MAX_BACKTRACK_PAGES,
     SweepVerdictError,
+    empty_schedule_counters,
     fetch_season_fixtures,
     fetch_season_schedules,
     schedule_rows_from_events,
@@ -203,6 +204,56 @@ class SeasonTarget:
     @property
     def partition(self) -> tuple[str, str]:
         return (self.league, self.canonical_season)
+
+
+def ambiguous_current_seasons(
+    snapshot: Mapping[str, Any], exclude_tournament_ids: frozenset[int]
+) -> list[list[Any]]:
+    """Tournaments whose NEWEST start year is claimed by more than one season.
+
+    ``current_season_targets`` breaks such a tie by keeping whichever season the
+    snapshot lists first, and ``rolled_over_chains`` refuses to rank the two at
+    all ("``season_id`` alone says nothing about time").  So the pick can land
+    on the finished half of the pair — a cup that has both a calendar-year and
+    a split-year season stamped with the same start year — and that tournament
+    is then refreshed on a season that will never produce another finished
+    match, while the one being played is never asked for.
+
+    Nothing here changes the pick: choosing correctly needs a rule the source
+    does not give us (#1219).  What it does is stop the mispick being SILENT,
+    which is the part an operator can act on.
+    """
+
+    ambiguous: list[list[Any]] = []
+    for tournament in snapshot.get("tournaments", ()):
+        if tournament.get("metadata_status") != "ready":
+            continue
+        try:
+            tournament_id = int(tournament["unique_tournament_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if tournament_id in exclude_tournament_ids:
+            continue
+        newest: Optional[int] = None
+        seasons: list[int] = []
+        for season in tournament.get("seasons", ()):
+            if season.get("metadata_status") == "excluded":
+                continue
+            start_year = season.get("start_year")
+            season_id = season.get("source_season_id")
+            canonical = season.get("canonical_season")
+            if isinstance(start_year, bool) or not isinstance(start_year, int):
+                continue
+            if season_id is None or not canonical:
+                continue
+            if newest is None or start_year > newest:
+                newest, seasons = start_year, [int(season_id)]
+            elif start_year == newest:
+                seasons.append(int(season_id))
+        if len(seasons) > 1:
+            ambiguous.append([tournament_id, newest, sorted(seasons)])
+    ambiguous.sort(key=lambda item: item[0])
+    return ambiguous
 
 
 def current_season_targets(
@@ -1133,6 +1184,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     for name, pair in cursors.items()
                 },
                 "excluded_tournaments": len(exclude),
+                # Tournaments whose current season could not be told apart from
+                # a second one with the same start year: the pick may be the
+                # finished half, and this is the only place that says so.
+                "ambiguous_current_seasons": ambiguous_current_seasons(
+                    snapshot, exclude
+                ),
             }
         )
         if report["idle"]:
@@ -1204,6 +1261,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # finish, so the class banks its rows and its queue but leaves its
             # cursor where it was — the slice has to be walked again.
             interrupted: Optional[Exception] = None
+            # Whether the TAIL walk of this class ran to the end.  A tail walk
+            # that died mid-slice knows nothing about the seasons it never
+            # reached, so its silence may not be read as "this class had
+            # nothing to serve" — see ``queue_safe`` below.
+            tail_walked = True
             if name == "seed":
                 # The queue cursor moves as soon as its slice is TAKEN, not when
                 # the phase succeeds: the entries stay on the list until they are
@@ -1229,6 +1291,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         exc.fetched, exc.counters, exc.incomplete
                     )
                     deferred.append(exc)
+                except Exception as exc:
+                    # NOT a verdict: a transport failure that is not a 404, a
+                    # dead lease, a body that is not JSON.  The fetcher lets
+                    # these propagate on purpose ("a property of the run, not
+                    # of the season"), and the class loop used to let them
+                    # propagate too — straight past every line below that banks
+                    # this class.  The events already paid for were dropped,
+                    # the cursor did not move AND ``interrupted_runs`` was never
+                    # incremented, so the MAX_INTERRUPTED_RUNS escape hatch
+                    # could not fire: one season answering 403 froze its class
+                    # and every class after it, for ever.  The calendar walk
+                    # below was given this handler in Sol rounds 26-28; the tail
+                    # walk was not (code review of PR #1216).
+                    interrupted = exc
+                    tail_walked = False
+                    events, cut_short = [], []
+                    counters = empty_schedule_counters()
+                    counters["error"] = str(exc)
             else:
                 # ``chase_before`` turns the single tail page into "as many
                 # pages as it takes to reach what Bronze already has": more
@@ -1248,6 +1328,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         exc.fetched, exc.counters, exc.incomplete
                     )
                     deferred.append(exc)
+                except Exception as exc:
+                    # Same as the seed branch above: a failure that is not a
+                    # verdict about this slice must not escape the class loop
+                    # before the class has banked what it has and counted the
+                    # interruption.
+                    interrupted = exc
+                    tail_walked = False
+                    events, cut_short = [], []
+                    counters = empty_schedule_counters()
+                    counters["error"] = str(exc)
             # ``extend``, never assignment: the classes are fetched in turn and
             # each can leave a chain cut short (Sol round 5, finding 2).
             unfinished_now.extend(cut_short)
@@ -1258,7 +1348,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # died on its first class and never wrote its state — the lane then
             # rebuilt the same plan and died again, forever.
             served = counters["events"]
-            if name in ("stale", "seed"):
+            # ``tail_walked``: the calendar walk is an EXTRA on top of the tail
+            # pages, so there is nothing to extend when the tail walk itself was
+            # cut short — and the byte accounting of this run is already in
+            # doubt, which is exactly why the sweep stops.  Paying for more
+            # pages of a slice we could not read is waste.
+            if name in ("stale", "seed") and tail_walked:
                 # The seasons Bronze has never seen, and the ones it has not
                 # looked at for a while, also get their FIXTURE page: without a
                 # future match in Bronze the ``due`` window can never open for
@@ -1364,7 +1459,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # banking it would skip a prefix that was never written (Sol round
             # 28).  A class that legitimately had nothing to serve is free to
             # move its chains — there is no unwritten prefix to skip.
-            queue_safe = bool(rows) or not served
+            #
+            # ``tail_walked`` is what separates "nothing to serve" from "we
+            # never got to ask": a tail walk killed mid-slice also reports zero
+            # events, and letting THAT move the queue would retire resumed
+            # chains that were never read — the rest of those seasons would
+            # never be asked for again (code review of PR #1216).
+            queue_safe = bool(rows) or (not served and tail_walked)
             # This class is done: its cursor may move, and the chains it just
             # walked drop off the retry list while fresh truncations join it.
             # Only the seed phase resumes a saved chain, so only it may retire

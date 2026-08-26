@@ -917,12 +917,16 @@ def test_rows_tolerate_a_minority_of_exotic_unscoped_events(tmp_path, caplog):
 def test_rows_reject_non_object_events_as_malformed(tmp_path, junk):
     # Sol r2 #2: ``{"events": [null]}`` is schema drift like any other —
     # it must fail the slice after the raw page is kept, not be filtered out
-    # into a green empty result.  Here the junk is half of the page, i.e. at
-    # the ``_UNSCOPED_FAIL_SHARE`` threshold.
+    # into a green empty result.  Here the junk is half of the page AND clears
+    # ``_FAIL_MIN_TARGETS``, so it is a pattern rather than one odd event.
     first, _ = _fixture_events()
     fine = _event(first, event_id=31, tournament_id=READY_TOURNAMENT,
                   season_id=READY_PREVIOUS_SEASON)
-    client = _Client({schedule_page_path(*PREVIOUS_TARGET): _page(junk, fine)})
+    other = _event(first, event_id=32, tournament_id=READY_TOURNAMENT,
+                   season_id=READY_PREVIOUS_SEASON)
+    client = _Client({
+        schedule_page_path(*PREVIOUS_TARGET): _page(junk, junk, fine, other)
+    })
     store = _store(tmp_path)
     fetched, _, _ = fetch_season_schedules(client, [PREVIOUS_TARGET], store)
 
@@ -936,16 +940,74 @@ def test_rows_reject_non_object_events_as_malformed(tmp_path, junk):
             freshness_key="refresh",
         )
     )
-    with pytest.raises(DailyEventsSchemaError, match="1 of 2 .*cannot be placed"):
+    with pytest.raises(DailyEventsSchemaError, match="2 of 4 .*cannot be placed"):
         schedule_rows_from_events(fetched, SNAPSHOT, exclude_leagues=())
 
 
-def test_rows_reject_a_page_made_only_of_junk(tmp_path):
-    # ``{"events": [null]}`` alone: nothing can be placed — fully malformed.
-    client = _Client({schedule_page_path(*PREVIOUS_TARGET): _page(None)})
+@pytest.mark.unit
+def test_one_unplaceable_event_does_not_fail_the_slice(tmp_path):
+    """A share taken over ONE event is not evidence of anything.
+
+    Every other threshold in this module needs ``_FAIL_MIN_TARGETS`` first, and
+    the header of ``_UNSCOPED_FAIL_SHARE`` says in so many words that one such
+    event must not fail a slice — but this gate alone had no minimum mass, so a
+    thin slice carrying a single unattributable event failed the class and
+    wrote nothing (code review of PR #1216).
+    """
+
+    first, _ = _fixture_events()
+    fine = _event(first, event_id=31, tournament_id=READY_TOURNAMENT,
+                  season_id=READY_PREVIOUS_SEASON)
+    client = _Client({schedule_page_path(*PREVIOUS_TARGET): _page(None, fine)})
     fetched, _, _ = fetch_season_schedules(client, [PREVIOUS_TARGET], _store(tmp_path))
 
-    with pytest.raises(DailyEventsSchemaError, match="1 of 1 .*cannot be placed"):
+    rows, counters = schedule_rows_from_events(
+        fetched, SNAPSHOT, exclude_leagues=()
+    )
+    assert counters["unscoped"] == 1
+    assert [row["game_id"] for row in rows] == [31]
+
+
+@pytest.mark.unit
+def test_a_resolved_bracket_stub_is_not_an_identity_conflict(tmp_path):
+    """"Winner of match N" filling in is the source resolving a slot.
+
+    ``season_pipeline._is_schedule_identity_conflict`` has exempted a disabled
+    (placeholder) team on the OLDER copy since Sol round 21; this lane compared
+    the raw team ids, so a cup tie that resolved between two pages of one visit
+    counted as a contradiction — and the branch keeps the FIRST copy, so Bronze
+    got the stub and the resolved match was dropped.  Two such ties in a slice
+    also tripped the ``identity_conflict`` threshold and failed the class
+    (code review of PR #1216).
+    """
+
+    first, _ = _fixture_events()
+    stub = _event(first, event_id=41, tournament_id=READY_TOURNAMENT,
+                  season_id=READY_PREVIOUS_SEASON)
+    stub["homeTeam"] = {"id": 900001, "name": "Winner of match 7", "disabled": True}
+    resolved = _event(first, event_id=41, tournament_id=READY_TOURNAMENT,
+                      season_id=READY_PREVIOUS_SEASON)
+    resolved["homeTeam"] = {"id": 12345, "name": "Real Team", "disabled": False}
+    client = _Client({
+        schedule_page_path(*PREVIOUS_TARGET): _page(stub, resolved)
+    })
+    fetched, _, _ = fetch_season_schedules(client, [PREVIOUS_TARGET], _store(tmp_path))
+
+    rows, counters = schedule_rows_from_events(
+        fetched, SNAPSHOT, exclude_leagues=()
+    )
+    assert counters["identity_conflict"] == 0
+    # The resolved copy is the one that reaches Bronze, not the stub.
+    assert [row["home_team_id"] for row in rows] == [12345]
+
+
+def test_rows_reject_a_page_made_only_of_junk(tmp_path):
+    # ``{"events": [null, null]}``: nothing can be placed, over enough events
+    # to be a pattern — fully malformed.
+    client = _Client({schedule_page_path(*PREVIOUS_TARGET): _page(None, None)})
+    fetched, _, _ = fetch_season_schedules(client, [PREVIOUS_TARGET], _store(tmp_path))
+
+    with pytest.raises(DailyEventsSchemaError, match="2 of 2 .*cannot be placed"):
         schedule_rows_from_events(fetched, SNAPSHOT, exclude_leagues=())
 
 

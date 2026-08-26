@@ -1191,19 +1191,12 @@ _EXPECTED_HEALTHCHECKS = {
         "Interval": 30_000_000_000,
         "Retries": 5,
         "StartPeriod": 60_000_000_000,
+        # Back to the platform-wide check, exactly as on master: this scheduler
+        # holds the other five sources and does not run the SofaScore contour
+        # (see the healthcheck comment in compose.yaml).
         "Test": (
-            "CMD",
-            "python",
-            "/opt/airflow/scripts/sofascore_runtime_preflight.py",
-            "scheduler-health",
-            "--artifact",
-            "/opt/airflow/runtime/sofascore/proxy_budget_canary.json",
-            "--campaign-dir",
-            "/opt/airflow/runtime/sofascore/all-men",
-            "--campaign-policy",
-            "/opt/airflow/configs/sofascore/all_mens_campaign.json",
-            "--health-url",
-            "http://sofascore_proxy_filter:8899/health",
+            "CMD-SHELL",
+            'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"',
         ),
         "Timeout": 30_000_000_000,
     },

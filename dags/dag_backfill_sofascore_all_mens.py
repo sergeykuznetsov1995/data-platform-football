@@ -192,12 +192,20 @@ def _finalize_historical_run(**context: Any) -> dict[str, Any]:
         scope_key = environment.get("SOFASCORE_SCOPE_KEY")
         if not scope_key or dag_run is None:
             continue
-        task_instance = dag_run.get_task_instance(
-            "run_historical_scope", map_index=index
-        )
-        if task_instance is None or _task_state(task_instance) not in {
-            "failed", "upstream_failed"
-        }:
+        # BOTH mapped tasks, not just the bash one.  ``validate`` expands over
+        # the same plan, so the map indexes line up.  A scope whose bash step
+        # succeeded but whose validation failed (provenance mismatch, result
+        # JSON absent or unreadable) was neither completed NOR failed: it came
+        # back first in the next @continuous run, was paid for in full again,
+        # failed validation again, and ``HISTORY_MAX_SCOPE_ATTEMPTS`` never grew
+        # — an unbounded paid loop on one broken scope (code review of PR
+        # #1216).
+        states = set()
+        for task_id in ("run_historical_scope", "validate_historical_scope"):
+            task_instance = dag_run.get_task_instance(task_id, map_index=index)
+            if task_instance is not None:
+                states.add(_task_state(task_instance))
+        if not states & {"failed", "upstream_failed"}:
             continue
         state.mark_failed(
             FAILURES_PATH,

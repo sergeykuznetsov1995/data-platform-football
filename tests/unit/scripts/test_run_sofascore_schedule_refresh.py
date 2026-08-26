@@ -428,7 +428,7 @@ def test_a_lone_due_season_does_not_drag_the_other_cursors(offline):
 
 @pytest.mark.unit
 def test_a_failed_run_leaves_the_cursor_where_it_was(offline, monkeypatch):
-    _cursor_file(offline, {"due": 0, "stale": 0, "seed": 1})
+    _cursor_file(offline, {"due": None, "stale": None, "seed": [23, 88001]})
 
     def fetch(client, targets, raw_store, **kwargs):
         raise RuntimeError("gateway said 429")
@@ -437,7 +437,14 @@ def test_a_failed_run_leaves_the_cursor_where_it_was(offline, monkeypatch):
 
     assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
 
-    assert json.loads(offline["cursor"].read_text())["index"]["seed"] == 1
+    cursor = json.loads(offline["cursor"].read_text())
+    # The anchors are exactly where they were: the walk did not finish, so no
+    # class may claim to have covered its slice.
+    assert cursor["index"] == {"due": None, "stale": None, "seed": [23, 88001]}
+    # ...but the interruption is COUNTED now.  Escaping the class loop before
+    # this line meant the anti-wedge counter never grew, so a target with a
+    # permanent 403 froze its class for ever (code review of PR #1216).
+    assert cursor["interrupted_runs"]["due"] == 1
     report = json.loads(offline["output"].read_text())
     assert report["status"] == "failed"
     assert report["errors"] == ["RuntimeError: gateway said 429"]
@@ -781,6 +788,11 @@ def test_an_unfinished_chain_is_kept_when_a_later_class_fails(offline, monkeypat
     assert json.loads(offline["incomplete"].read_text())["seasons"] == [
         [23, 88001, 5, 1_700_000, 0]
     ]
+    # The seed class banked its interruption before the run failed: without
+    # that the anti-wedge counter never grew and the escape hatch could not
+    # fire (code review of PR #1216).  The attempt count of the chain stays 0 —
+    # a visit that never happened is not a fruitless visit.
+    assert json.loads(offline["cursor"].read_text())["interrupted_runs"]["seed"] == 1
 
 
 @pytest.mark.unit
@@ -1424,6 +1436,90 @@ def test_a_class_stuck_on_a_cut_short_walk_eventually_moves_on(offline):
     # so in the report.
     offline["calls"]["known"] = {("SS-7", "2627"), ("SS-23", "2627")}
     offline["calls"]["fixtures_transport"] = {(7, 96518)}
+
+    for run in range(refresh.MAX_INTERRUPTED_RUNS - 1):
+        offline["calls"]["fetch"].clear()
+        assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+        cursor = json.loads(offline["cursor"].read_text())
+        assert cursor["index"]["stale"] is None
+        assert cursor["interrupted_runs"]["stale"] == run + 1
+        assert "skipped_slices" not in json.loads(offline["output"].read_text())
+
+    offline["calls"]["fetch"].clear()
+    assert refresh.main(_argv(offline, "--control-url", "http://gw")) == 1
+
+    cursor = json.loads(offline["cursor"].read_text())
+    assert cursor["index"]["stale"] is not None
+    assert cursor["interrupted_runs"]["stale"] == 0
+    assert json.loads(offline["output"].read_text())["skipped_slices"] == ["stale"]
+
+
+@pytest.mark.unit
+def test_a_tie_on_the_newest_start_year_is_reported_not_hidden():
+    """Two seasons stamped with the same start year: the pick is a coin toss.
+
+    ``current_season_targets`` keeps whichever the snapshot lists first, and
+    ``rolled_over_chains`` refuses to rank them at all ("``season_id`` alone
+    says nothing about time").  So the lane can pin a tournament on the
+    finished half of the pair and never ask for the season being played —
+    silently, with nothing in the report naming it.  31 ready tournaments of
+    the live campaign were in that state on 2026-08-26.
+    """
+
+    snapshot = {"tournaments": [
+        {
+            "capture_key": "SS-29", "unique_tournament_id": 29,
+            "metadata_status": "ready",
+            "seasons": [
+                {"source_season_id": 97020, "start_year": 2026,
+                 "canonical_season": "2627"},
+                {"source_season_id": 80163, "start_year": 2026,
+                 "canonical_season": "2026"},
+            ],
+        },
+        {
+            "capture_key": "SS-8", "unique_tournament_id": 8,
+            "metadata_status": "ready",
+            "seasons": [
+                {"source_season_id": 61627, "start_year": 2026,
+                 "canonical_season": "2627"},
+                {"source_season_id": 52186, "start_year": 2025,
+                 "canonical_season": "2526"},
+            ],
+        },
+    ]}
+
+    assert refresh.ambiguous_current_seasons(snapshot, frozenset()) == [
+        [29, 2026, [80163, 97020]]
+    ]
+    # An excluded tournament is not the lane's business.
+    assert refresh.ambiguous_current_seasons(snapshot, frozenset({29})) == []
+
+
+@pytest.mark.unit
+def test_a_class_whose_tail_walk_keeps_dying_eventually_moves_on(
+    offline, monkeypatch
+):
+    """The anti-wedge counter has to cover the TAIL walk too.
+
+    A failure there that is not a verdict escaped the class loop outright: it
+    ran past every line that banks the class, so the cursor did not move AND
+    ``interrupted_runs`` never grew — the escape hatch could not fire, and one
+    season answering 403 froze its class, and every class after it, for ever.
+    The calendar walk got this handling in Sol rounds 26-28; the tail walk did
+    not (code review of PR #1216).
+    """
+
+    offline["calls"]["known"] = {("SS-7", "2627")}
+    stub_fetch = refresh.fetch_season_schedules
+
+    def fetch(client, targets, raw_store, **kwargs):
+        targets = list(targets)
+        if targets == [(7, 96518)]:
+            raise RuntimeError("gateway said 403")
+        return stub_fetch(client, targets, raw_store, **kwargs)
+
+    monkeypatch.setattr(refresh, "fetch_season_schedules", fetch)
 
     for run in range(refresh.MAX_INTERRUPTED_RUNS - 1):
         offline["calls"]["fetch"].clear()
