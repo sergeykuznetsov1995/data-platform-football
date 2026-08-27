@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import re
 import sys
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -366,13 +365,15 @@ def test_plan_task_manual_defaults_to_fresh_and_allows_backlog_override(
     default = _planner_kwargs(
         module,
         monkeypatch,
-        dag_run=SimpleNamespace(run_type="manual", conf={}),
+        dag_run=SimpleNamespace(run_type=DagRunType.MANUAL, conf={}),
         data_interval_end=datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc),
     )
     overridden = _planner_kwargs(
         module,
         monkeypatch,
-        dag_run=SimpleNamespace(run_type="manual", conf={"queue_mode": "backlog"}),
+        dag_run=SimpleNamespace(
+            run_type=DagRunType.MANUAL, conf={"queue_mode": "backlog"}
+        ),
         data_interval_end=datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc),
     )
 
@@ -459,15 +460,13 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
     assert "LIKE 'SS-%'" in sql
     assert "status_type = 'finished'" in sql
     assert "capture_complete" in sql
-    normalized_aggregate = " ".join(sql.split())
-    assert re.search(
-        r"MAX\(.+start_timestamp.+\) AS newest_pending_start_timestamp",
-        normalized_aggregate,
-    )
-    assert "TRY_CAST" in normalized_aggregate
-    assert "BETWEEN 1 AND" in normalized_aggregate
-    assert "current_timestamp" in normalized_aggregate
-    assert "INTERVAL '6' HOUR" in normalized_aggregate
+    normalized_sql = " ".join(sql.upper().split())
+    assert (
+        "MAX(CASE WHEN TRY_CAST(S.START_TIMESTAMP AS BIGINT) BETWEEN 1 AND "
+        "CAST(TO_UNIXTIME(CURRENT_TIMESTAMP + INTERVAL '6' HOUR) AS BIGINT) "
+        "THEN TRY_CAST(S.START_TIMESTAMP AS BIGINT) END) "
+        "AS NEWEST_PENDING_START_TIMESTAMP"
+    ) in normalized_sql
 
 
 def _refresh_env(result_path, scope_key="c:8:825"):
