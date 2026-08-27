@@ -341,7 +341,6 @@ def _refresh_snapshot():
             "canonical_season": "2627",
             "start_year": 2026,
             "season_format": "split_year",
-            "is_current": True,
             "team_count": None,
             "metadata_status": "pending",
         })
@@ -372,9 +371,9 @@ def test_refresh_planner_prioritizes_an_explicit_calendar_year_current_partition
     current = snapshot["tournaments"][0]["seasons"][0]
     current.update({
         "canonical_season": "2026",
-        "season_format": "calendar_year",
+        "start_year": 2026,
+        "season_format": "single_year",
         "source_season_id": 1726,
-        "is_current": True,
     })
     unsigned = dict(snapshot)
     unsigned.pop("snapshot_id")
