@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import importlib
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -266,7 +266,7 @@ def test_invalid_refresh_lane_knob_fails_dag_parse(
         _load_dag_module(monkeypatch)
 
 
-def _planner_kwargs(module, monkeypatch):
+def _planner_kwargs(module, monkeypatch, **context):
     """Drive ``_plan_refresh_batch`` to the planner and capture its kwargs."""
 
     captured = {}
@@ -282,13 +282,13 @@ def _planner_kwargs(module, monkeypatch):
     )
     monkeypatch.setattr(
         module, "_pending_refresh_partitions",
-        lambda: [("SS-17", "2627", 4)],
+        lambda: [("SS-17", "2627", 4, "2026-08-27T00:00:00+00:00")],
     )
     monkeypatch.setattr(
         module, "_configured_tournament_ids", lambda: frozenset({17, 8})
     )
     monkeypatch.setattr(module.state, "plan_refresh_batch", _plan)
-    assert module._plan_refresh_batch(run_id="manual__1") == []
+    assert module._plan_refresh_batch(run_id="manual__1", **context) == []
     return captured
 
 
@@ -301,7 +301,9 @@ def test_plan_task_feeds_bronze_partitions_and_configured_exclusions(
     kwargs = _planner_kwargs(module, monkeypatch)
 
     assert kwargs["snapshot"] == {"campaign_id": "c"}
-    assert kwargs["pending_partitions"] == [("SS-17", "2627", 4)]
+    assert kwargs["pending_partitions"] == [
+        ("SS-17", "2627", 4, "2026-08-27T00:00:00+00:00")
+    ]
     assert kwargs["exclude_tournament_ids"] == frozenset({17, 8})
     # Campaign-wide default is 8; the lane runs its batch serially inside a 7 h
     # DagRun, so it takes only what fits (Sol round 5, finding 8) — and what
@@ -311,6 +313,89 @@ def test_plan_task_feeds_bronze_partitions_and_configured_exclusions(
     assert kwargs["snapshot_path"] == module.SNAPSHOT_PATH
     assert kwargs["workload_artifact"] == module.WORKLOAD_ARTIFACT
     assert kwargs["task_env"] == {}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("run_type", "interval_end", "expected_mode"),
+    [
+        ("scheduled", datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), "fresh"),
+        ("scheduled", datetime(2026, 8, 27, 8, 30, tzinfo=timezone.utc), "fresh"),
+        ("scheduled", datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), "backlog"),
+        ("backfill", datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), "fresh"),
+        ("backfill", datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), "backlog"),
+    ],
+)
+def test_plan_task_derives_ffb_mode_from_interval_end_not_delayed_task_start(
+    clean_env, monkeypatch, run_type, interval_end, expected_mode
+):
+    module = _load_dag_module(monkeypatch)
+    delayed_start = datetime(2026, 8, 27, 20, 4, tzinfo=timezone.utc)
+
+    kwargs = _planner_kwargs(
+        module,
+        monkeypatch,
+        dag_run=SimpleNamespace(run_type=run_type, conf={}),
+        data_interval_end=interval_end,
+        ti=SimpleNamespace(start_date=delayed_start),
+    )
+
+    assert kwargs["queue_mode"] == expected_mode
+
+
+@pytest.mark.unit
+def test_plan_task_manual_defaults_to_fresh_and_allows_backlog_override(
+    clean_env, monkeypatch
+):
+    module = _load_dag_module(monkeypatch)
+
+    default = _planner_kwargs(
+        module,
+        monkeypatch,
+        dag_run=SimpleNamespace(run_type="manual", conf={}),
+        data_interval_end=datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc),
+    )
+    overridden = _planner_kwargs(
+        module,
+        monkeypatch,
+        dag_run=SimpleNamespace(run_type="manual", conf={"queue_mode": "backlog"}),
+        data_interval_end=datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc),
+    )
+
+    assert default["queue_mode"] == "fresh"
+    assert overridden["queue_mode"] == "backlog"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("dag_run", "interval_end", "message"),
+    [
+        (
+            SimpleNamespace(run_type="manual", conf={"queue_mode": "oldest"}),
+            None,
+            "queue_mode",
+        ),
+        (
+            SimpleNamespace(run_type="scheduled", conf={}),
+            datetime(2026, 8, 27, 11, 30, tzinfo=timezone.utc),
+            "data_interval_end",
+        ),
+        (SimpleNamespace(run_type="scheduled", conf={}), None, "data_interval_end"),
+    ],
+)
+def test_plan_task_fails_closed_for_invalid_mode_or_non_ffb_interval(
+    clean_env, monkeypatch, dag_run, interval_end, message
+):
+    from airflow.exceptions import AirflowException
+
+    module = _load_dag_module(monkeypatch)
+    with pytest.raises(AirflowException, match=message):
+        _planner_kwargs(
+            module,
+            monkeypatch,
+            dag_run=dag_run,
+            data_interval_end=interval_end,
+        )
 
 
 @pytest.mark.unit
@@ -325,7 +410,10 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
             executed.append(sql)
 
         def fetchall(self):
-            return [("SS-17", "2627", 12), ("SS-8", 2026, 3)]
+            return [
+                ("SS-17", "2627", 12, "2026-08-27T00:00:00+00:00"),
+                ("SS-8", 2026, 3, None),
+            ]
 
     class _Connection:
         closed = False
@@ -343,7 +431,10 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
 
     partitions = module._pending_refresh_partitions()
 
-    assert partitions == [("SS-17", "2627", 12), ("SS-8", "2026", 3)]
+    assert partitions == [
+        ("SS-17", "2627", 12, "2026-08-27T00:00:00+00:00"),
+        ("SS-8", "2026", 3, None),
+    ]
     assert connection.closed is True
     sql = executed[0]
     assert "iceberg.bronze.sofascore_schedule" in sql
@@ -351,6 +442,8 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
     assert "LIKE 'SS-%'" in sql
     assert "status_type = 'finished'" in sql
     assert "capture_complete" in sql
+    assert "MAX(" in sql
+    assert "start_timestamp" in sql
 
 
 def _refresh_env(result_path, scope_key="c:8:825"):
