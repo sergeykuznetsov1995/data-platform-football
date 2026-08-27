@@ -19,6 +19,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import random
+import time
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -48,6 +50,40 @@ SCOPE_OBSERVATIONS_TABLE = "fotmob_competition_scope_observations"
 SCOPE_ATTEMPT_OUTCOMES = frozenset(
     {"success", "retryable", "terminal", "source_gap", "deferred"}
 )
+
+# Оптимистическая конкуренция Iceberg на пути записи FotMob (#1199).
+#
+# Единственность писателя держит advisory-замок (B7), но он защищает только от
+# ВТОРОГО FotMob: bronze-таблицы общие, и любой другой писатель в тот же снимок
+# отправляет наш коммит в ICEBERG_COMMIT_ERROR. Без ретрая проигравший теряет
+# цель целиком и молча — ровно то, что делает кампанию истории рядом с волной
+# контура недопустимой.
+#
+# Ретрай живёт на уровне flush(), а НЕ вокруг одной физической записи, и это
+# принципиально. Конфликт коммита не доказывает, что ничего не записалось:
+# staged-путь общего писателя коммитит INSERT в цель и только потом удаляет
+# временный стейдж, поэтому распознаваемый конфликт может прилететь уже ПОСЛЕ
+# того, как строки стали видны, — повтор такой записи задвоил бы цель. flush()
+# начинается со сверки `_reconcile_pending_table` / `_reconcile_pending_manifest`,
+# которая считает уже сохранённые строки по детерминированному
+# `_target_batch_id` и снимает подтверждённые пакеты с буфера (а при частичном
+# совпадении падает закрыто). Повторяя именно flush(), мы переиспользуем этот
+# готовый механизм exactly-once вместо того, чтобы предполагать недоказуемое.
+#
+# Неблокированный путь `commit()` при batch_size<=1 пишет без буфера и сверки —
+# он ретраем НЕ прикрыт сознательно. Боевые раны идут с `--commit-batch-size 50`,
+# то есть через flush().
+#
+# Ретрай в FotMob, а не в общем `scrapers/base/trino_manager.py`, потому что тот
+# файл входит в опечатанный список WhoScored (`EXPECTED_RUNTIME_FILES`), и правка
+# там требует ротации чужого доверенного корня.
+#
+# Расписание пауз при пяти попытках: 0,5 / 1 / 2 / 4 с плюс джиттер до 0,5 с
+# (после пятой попытки ошибка пробрасывается, поэтому потолок ниже нужен только
+# как ограничитель роста, если число попыток поднимут).
+_COMMIT_CONFLICT_RETRIES = 5
+_COMMIT_CONFLICT_BASE_DELAY = 0.5
+_COMMIT_CONFLICT_MAX_DELAY = 8.0
 
 _SCOPE_EVIDENCE_FIELDS = (
     "competition_id",
@@ -1564,6 +1600,51 @@ class FotMobRepository:
             self._index_pending(row)
 
     def flush(self) -> list[str]:
+        """Flush buffered targets, retrying a lost Iceberg snapshot race (#1199).
+
+        Retrying the whole flush — not one physical write — is what makes the
+        retry safe. A recognised commit conflict does not prove that nothing
+        landed: the shared writer commits the target INSERT before dropping its
+        staging table, so the conflict can surface after the rows are already
+        visible. ``_flush_once`` re-reconciles every pending batch against
+        storage first, so a confirmed batch is dropped from the buffer instead
+        of being appended twice, and a partial one fails closed.
+
+        The written-table evidence has to survive the retry as well: the DAG
+        turns this list into ``bronze_inputs_changed`` and decides from it
+        whether Silver needs a rebuild. A table whose rows landed but whose
+        write raised afterwards produces no path at all, so ``_flush_once``
+        also emits a path for every batch that reconciliation confirms as
+        already stored — otherwise a retried flush would report a green run
+        over a stale Silver.
+        """
+
+        from scrapers.base.trino_manager import _is_iceberg_commit_conflict
+
+        paths: list[str] = []
+        for attempt in range(_COMMIT_CONFLICT_RETRIES):
+            try:
+                self._flush_once(paths)
+                return list(dict.fromkeys(paths))
+            except Exception as error:
+                if attempt >= _COMMIT_CONFLICT_RETRIES - 1 or not (
+                    _is_iceberg_commit_conflict(error)
+                ):
+                    raise
+                delay = min(
+                    _COMMIT_CONFLICT_MAX_DELAY,
+                    _COMMIT_CONFLICT_BASE_DELAY * (2**attempt),
+                ) + random.uniform(0, _COMMIT_CONFLICT_BASE_DELAY)
+                logger.warning(
+                    "Iceberg commit conflict on flush (attempt %d/%d), "
+                    "reconciling and retrying in %.1fs",
+                    attempt + 1,
+                    _COMMIT_CONFLICT_RETRIES,
+                    delay,
+                )
+                time.sleep(delay)
+
+    def _flush_once(self, paths: list[str]) -> None:
         """Write every buffered target as one Iceberg commit per table.
 
         Physical rows go first and the manifest last, exactly as in the
@@ -1573,16 +1654,22 @@ class FotMobRepository:
         removed from the buffer immediately; ambiguous responses are resolved
         by counting the deterministic ``_target_batch_id`` before retrying.
         The manifest remains last, preserving logical visibility.
+
+        ``paths`` is owned by the caller so that evidence of what was written
+        survives a retry: a write whose rows landed before it raised returns no
+        path of its own, and only reconciliation can attest to it.
         """
 
         if not self._pending and not self._pending_manifest:
-            return []
-        paths: list[str] = []
+            return
         # A prior process (or a writer that lost its response after commit) may
         # already have landed any prefix of the table writes. Reconcile every
         # deterministic target batch before appending again.
         for key in list(self._pending):
+            buffered_before = len(self._pending.get(key, ()))
             self._reconcile_pending_table(key)
+            if len(self._pending.get(key, ())) < buffered_before:
+                paths.append(self._qualified_table(key[0]))
         for key in list(self._pending):
             table, entity_type, partition_cols = key
             rows = self._pending[key]
@@ -1599,7 +1686,10 @@ class FotMobRepository:
             self._pending.pop(key, None)
             self._pending_rows = sum(len(value) for value in self._pending.values())
 
+        manifest_before = len(self._pending_manifest)
         self._reconcile_pending_manifest()
+        if len(self._pending_manifest) < manifest_before:
+            paths.append(self._qualified_table(MANIFEST_TABLE))
         flushed_manifest = list(self._pending_manifest)
         if flushed_manifest:
             manifest_path = self._write(
@@ -1619,7 +1709,15 @@ class FotMobRepository:
         self._pending_entities = {}
         self._pending_raw_entities = {}
         self._pending_rows = 0
-        return paths
+
+    def _qualified_table(self, table: str) -> str:
+        """Path of a table whose rows are durable but whose write returned none.
+
+        Same shape the writer hands back on a normal commit, so the caller
+        cannot tell a reconciled table from a freshly written one.
+        """
+
+        return f"{self.catalog}.{self.schema}.{table}"
 
     def record(self, commit: TargetCommit) -> str:
         """Append a target state that carries no physical rows."""
@@ -2546,6 +2644,45 @@ class FotMobRepository:
                 continue
         return output
 
+    def missing_current_squad_player_ids(self, limit: int) -> list[int]:
+        """Return a bounded, deterministic roster-to-card anti-join."""
+
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be positive")
+        manager_getter = getattr(self.writer, "_get_trino_manager", None)
+        if manager_getter is None:
+            raise RuntimeError("FotMob current view is unavailable")
+        trino = manager_getter()
+        squad_table = "fotmob_squad_snapshots_current"
+        player_table = "fotmob_player_snapshots_current"
+        if not trino.table_exists(self.schema, squad_table) or not trino.table_exists(
+            self.schema, player_table
+        ):
+            raise RuntimeError("FotMob current view is unavailable")
+        rows = trino.execute_query(
+            f"""
+            SELECT DISTINCT TRY_CAST(s.member_id AS BIGINT) AS player_id
+            FROM {self.catalog}.{self.schema}.{squad_table} s
+            LEFT JOIN {self.catalog}.{self.schema}.{player_table} p
+              ON TRY_CAST(p.player_id AS BIGINT) = TRY_CAST(s.member_id AS BIGINT)
+            WHERE s.member_type = 'player'
+              AND TRY_CAST(s.member_id AS BIGINT) > 0
+              AND p.player_id IS NULL
+            ORDER BY player_id
+            LIMIT {limit}
+            """
+        )
+        output: list[int] = []
+        for row in rows:
+            value = row[0] if isinstance(row, (tuple, list)) else row
+            try:
+                player_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if player_id > 0 and player_id not in output:
+                output.append(player_id)
+        return output
+
     def previous_catalog_snapshots(self, limit: int = 2) -> list[set[int]]:
         """Return newest complete catalog ID sets before the current run."""
 
@@ -2982,6 +3119,31 @@ class MemoryFotMobRepository:
             except (KeyError, TypeError, ValueError):
                 continue
         return output
+
+    def missing_current_squad_player_ids(self, limit: int) -> list[int]:
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit must be positive")
+        team_ids = {
+            str(commit.entity_id)
+            for commit in self.commits
+            if commit.target_type == "team" and commit.entity_id is not None
+        }
+        squad_ids: set[int] = set()
+        for team_id in team_ids:
+            squad_ids.update(
+                player_id
+                for player_id in self.current_squad_player_ids(team_id)
+                if player_id > 0
+            )
+        existing_ids: set[int] = set()
+        for row in self.tables.get("fotmob_player_snapshots", []):
+            try:
+                player_id = int(row.get("player_id"))
+            except (TypeError, ValueError):
+                continue
+            if player_id > 0:
+                existing_ids.add(player_id)
+        return sorted(squad_ids - existing_ids)[:limit]
 
     def previous_catalog_snapshots(self, limit: int = 2) -> list[set[int]]:
         # Match the production query: an offline raw replay is useful for

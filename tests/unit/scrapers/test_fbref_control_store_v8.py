@@ -224,6 +224,8 @@ def test_publication_lock_acquire_is_retry_idempotent_and_owner_fenced():
 
     def handler(sql, params):
         nonlocal inserted
+        if sql.startswith("SELECT pg_advisory_xact_lock"):
+            return ([{"pg_advisory_xact_lock": None}], 1)
         if sql.startswith("SELECT status FROM fbref_control.crawl_run"):
             return ([{"status": "running"}], 1)
         if sql.startswith("INSERT INTO fbref_control.publication_lock"):
@@ -267,6 +269,8 @@ def test_publication_lock_rejects_an_active_different_owner():
     now = datetime.now(timezone.utc)
 
     def handler(sql, params):
+        if sql.startswith("SELECT pg_advisory_xact_lock"):
+            return ([{"pg_advisory_xact_lock": None}], 1)
         if sql.startswith("SELECT status FROM fbref_control.crawl_run"):
             return ([{"status": "running"}], 1)
         if sql.startswith("INSERT INTO fbref_control.publication_lock"):
@@ -734,7 +738,7 @@ def test_frontier_discovery_batch_rejects_unbounded_input_before_connecting():
     assert factory.connections == []
 
 
-def test_global_unprocessed_raw_includes_failed_source_runs_oldest_first():
+def test_lane_unprocessed_raw_includes_failed_source_runs_oldest_first():
     captured = {}
     raw = {
         "attempt_id": str(uuid.uuid4()),
@@ -755,6 +759,7 @@ def test_global_unprocessed_raw_includes_failed_source_runs_oldest_first():
 
     store, _ = make_store(handler)
     result = store.list_unprocessed_fetches(
+        run_type="current",
         parser_version="page-v2",
         typed_parser_version="typed-v3",
         stateful_parser_version="stateful-v4",
@@ -767,12 +772,14 @@ def test_global_unprocessed_raw_includes_failed_source_runs_oldest_first():
     assert "source_run.status AS source_run_status" in sql
     assert "source_run.run_type AS source_run_type" in sql
     assert "source_run.status =" not in sql
+    assert "source_run.run_type = %s" in sql
     assert "observed.parser_version = %s" in sql
     assert "observed.typed_parser_version = %s" in sql
     assert "observed.stateful_parser_version = %s" in sql
     assert "ORDER BY COALESCE( attempt.finished_at, attempt.started_at )" in sql
     assert captured["params"] == (
         "fbref",
+        "current",
         ["match"],
         ["match"],
         "page-v2",
@@ -785,6 +792,89 @@ def test_global_unprocessed_raw_includes_failed_source_runs_oldest_first():
         "typed-v3",
         "stateful-v4",
         10,
+    )
+
+
+@pytest.mark.parametrize("run_type", ["replay", "publication", "unknown", ""])
+def test_unprocessed_raw_recovery_rejects_unknown_lane_before_connecting(
+    run_type,
+):
+    store, factory = make_store(lambda sql, params: ([], 0))
+
+    with pytest.raises(ValueError, match="run_type must be current or backfill"):
+        store.list_unprocessed_fetches(
+            run_type=run_type,
+            parser_version="page-v2",
+            typed_parser_version="typed-v3",
+            stateful_parser_version="stateful-v4",
+        )
+
+    assert factory.connections == []
+
+
+def test_run_summary_rejects_unknown_recovery_lane():
+    run_id = str(uuid.uuid4())
+
+    def handler(sql, params):
+        if "SELECT * FROM fbref_control.crawl_run" in sql:
+            return [{"run_id": run_id, "run_type": "manual"}], 1
+        return [], 0
+
+    store, factory = make_store(handler)
+
+    with pytest.raises(
+        StateConflict,
+        match="crawl run_type must be current, backfill, replay, or publication",
+    ):
+        store.get_run_summary(run_id)
+
+    assert factory.connections[0].rolled_back is True
+
+
+def test_publication_summary_has_no_recovery_lane_but_remains_queryable():
+    run_id = str(uuid.uuid4())
+    raw_query = {}
+
+    def handler(sql, params):
+        if "SELECT * FROM fbref_control.crawl_run" in sql:
+            return [{"run_id": run_id, "run_type": "publication"}], 1
+        if ") AS missing" in sql:
+            return [{"count": 0}], 1
+        if "AS global_sla_overdue_count" in sql:
+            raw_query["params"] = params
+            return [{
+                "page_kind": "match",
+                "run_count": 0,
+                "lane_count": 0,
+                "lane_sla_overdue_count": 0,
+                "global_count": 2,
+                "global_sla_overdue_count": 1,
+                "run_oldest_raw_at": None,
+                "lane_oldest_raw_at": None,
+                "global_oldest_raw_at": datetime(
+                    2026, 7, 14, 12, tzinfo=timezone.utc
+                ),
+            }], 1
+        return [], 0
+
+    store, _ = make_store(handler)
+
+    summary = store.get_run_summary(run_id)
+
+    assert summary["recovery_lane_run_type"] is None
+    assert summary["lane_unprocessed_raw_count"] == 0
+    assert summary["lane_unprocessed_raw_sla_overdue_count"] == 0
+    assert summary["global_unprocessed_raw_count"] == 2
+    assert summary["global_unprocessed_raw_sla_overdue_count"] == 1
+    assert summary["unprocessed_raw_sla_overdue_count"] == 1
+    assert raw_query["params"][:7] == (
+        run_id,
+        None,
+        None,
+        86_400,
+        86_400,
+        run_id,
+        None,
     )
 
 
@@ -824,6 +914,7 @@ def test_unprocessed_fetches_skip_only_provably_superseded_failed_observation():
 
     store, _ = make_store(handler)
     assert store.list_unprocessed_fetches(
+        run_type="current",
         parser_version="page-v2",
         typed_parser_version="typed-v3",
         stateful_parser_version="stateful-v4",
@@ -1393,9 +1484,14 @@ def test_run_summary_separates_concurrent_raw_from_run_owned_raw():
             return [{
                 "page_kind": "match",
                 "run_count": 0,
-                "global_count": 3,
-                "global_sla_overdue_count": 0,
+                "lane_count": 3,
+                "lane_sla_overdue_count": 1,
+                "global_count": 5,
+                "global_sla_overdue_count": 2,
                 "run_oldest_raw_at": None,
+                "lane_oldest_raw_at": datetime(
+                    2026, 7, 15, 12, tzinfo=timezone.utc
+                ),
                 "global_oldest_raw_at": datetime(
                     2026, 7, 14, 12, tzinfo=timezone.utc
                 ),
@@ -1412,14 +1508,32 @@ def test_run_summary_separates_concurrent_raw_from_run_owned_raw():
 
     assert summary["unprocessed_raw_count"] == 0
     assert summary["unprocessed_raw_by_page_kind"] == {}
-    assert summary["global_unprocessed_raw_count"] == 3
-    assert summary["global_unprocessed_raw_sla_overdue_count"] == 0
+    assert summary["recovery_lane_run_type"] == "current"
+    assert summary["lane_unprocessed_raw_count"] == 3
+    assert summary["lane_unprocessed_raw_sla_overdue_count"] == 1
+    assert summary["lane_unprocessed_raw_by_page_kind"]["match"] == {
+        "count": 3,
+        "sla_overdue_count": 1,
+        "oldest_raw_at": datetime(2026, 7, 15, 12, tzinfo=timezone.utc),
+    }
+    assert summary["global_unprocessed_raw_count"] == 5
+    assert summary["global_unprocessed_raw_sla_overdue_count"] == 2
+    assert summary["unprocessed_raw_sla_overdue_count"] == 2
     assert summary["global_unprocessed_raw_by_page_kind"]["match"][
         "count"
-    ] == 3
+    ] == 5
     assert "attempt.run_id = %s" in captured["sql"]
+    assert "source_run.run_type = %s" in captured["sql"]
     assert captured["sql"].count("%s") == len(captured["params"])
-    assert captured["params"][:3] == (run_id, 86_400, run_id)
+    assert captured["params"][:7] == (
+        run_id,
+        "current",
+        "current",
+        86_400,
+        86_400,
+        run_id,
+        "current",
+    )
 
 
 def test_requeue_closes_claimed_attempt_as_cancelled():

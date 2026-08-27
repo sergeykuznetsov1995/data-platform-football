@@ -68,6 +68,30 @@ class SeasonAlias:
 
 
 @dataclass(frozen=True)
+class CurrentSeasonRemediationEvidence:
+    """Exact two-raw lineage required by one current-season repair."""
+
+    competition_id: str
+    advertised_label: str
+    advertised_href: str
+    advertised_season_id: str
+    resolved_season_id: str
+    index_snapshot_id: str
+    index_run_id: str
+    index_attempt_id: str
+    index_target_id: str
+    index_logical_refresh_id: str
+    index_content_hash: str
+    index_raw_manifest_key: str
+    history_run_id: str
+    history_attempt_id: str
+    history_target_id: str
+    history_logical_refresh_id: str
+    history_content_hash: str
+    history_raw_manifest_key: str
+
+
+@dataclass(frozen=True)
 class CohortTarget:
     target_id: str
     logical_refresh_id: str

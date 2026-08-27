@@ -113,6 +113,32 @@ def test_competition_index_classifies_categories_and_category_beats_popular():
     )
 
 
+def test_competition_index_preserves_source_advertised_current_season_link():
+    html = """
+    <h2>National Team Qualification</h2>
+    <table><tbody><tr>
+      <th data-stat="league_name"><a
+        href="/en/comps/6/history/WCQ----UEFA-M-Seasons"
+      >FIFA World Cup Qualification — UEFA</a></th>
+      <td data-stat="gender">M</td>
+      <td data-stat="minseason"><a
+        href="/en/comps/6/1998/1998-WCQ----UEFA-M-Stats"
+      >1998</a></td>
+      <td data-stat="maxseason"><a
+        href="/en/comps/6/WCQ----UEFA-M-Stats"
+      >2026</a></td>
+    </tr></tbody></table>
+    """
+
+    result = parse_competition_index_html(html)
+    competition = result.datasets["competitions"].records[0]
+
+    assert competition.last_season == "2026"
+    assert competition.last_season_url == (
+        "https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats"
+    )
+
+
 def test_competition_index_reads_a_table_hidden_in_an_html_comment():
     html = """
     <h1>Competitions</h1>
@@ -163,6 +189,40 @@ def test_competition_history_keeps_exact_urls_and_source_native_season_ids():
     assert seasons[2].season_url == (
         "https://fbref.com/en/comps/9/edition-42/source-owned-slug"
     )
+
+
+@pytest.mark.parametrize(
+    ("comp_id", "source_url", "observed_location"),
+    [
+        (
+            "33",
+            "/en/comps/33/2-Bundesliga-Stats",
+            "https://fbref.com/en/comps/33/2/",
+        ),
+        (
+            "59",
+            "/en/comps/59/3-Liga-Stats",
+            "https://fbref.com/en/comps/59/3/",
+        ),
+    ],
+)
+def test_current_season_redirect_aliases_keep_source_identity_and_url(
+    comp_id,
+    source_url,
+    observed_location,
+):
+    html = f"""
+    <table id="seasons"><tbody><tr>
+      <th data-stat="season"><a href="{source_url}">2026-2027</a></th>
+    </tr></tbody></table>
+    """
+
+    result = parse_competition_html(html, _competition(comp_id=comp_id))
+    season = result.datasets["seasons"].records[0]
+
+    assert season.season_id == "2026-2027"
+    assert observed_location.endswith("/")
+    assert season.season_url == f"https://fbref.com{source_url}"
 
 
 def test_cup_and_national_team_seasons_are_tournaments_even_with_opaque_labels():

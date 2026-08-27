@@ -25,13 +25,15 @@ from scrapers.fbref.settings import (
     DEFAULT_BROWSER_REQUESTS_PER_SOLVE,
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
     DEFAULT_HTTP_BODY_LIMIT_BYTES,
+    DEFAULT_SEASON_STATS_HTTP_BODY_LIMIT_BYTES,
 )
 from scrapers.utils.proxy_manager import classify_error
 
 
-FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v8"
+FETCHER_VERSION = "fbref-camoufox-metered-warm-http-v10"
 DEFAULT_BOOTSTRAP_URL = "https://fbref.com/en/"
 MAX_HTML_BYTES = DEFAULT_HTTP_BODY_LIMIT_BYTES
+MAX_SEASON_STATS_HTML_BYTES = DEFAULT_SEASON_STATS_HTTP_BODY_LIMIT_BYTES
 # The browser cap bounds ONE clearance attempt; the run's reservation covers
 # every attempt (see DEFAULT_BOOTSTRAP_REQUEST_RESERVATION).
 DEFAULT_BROWSER_REQUEST_LIMIT = DEFAULT_BROWSER_REQUESTS_PER_SOLVE
@@ -48,10 +50,21 @@ _PERSISTENT_SESSION_CLOSE_MARGIN_SECONDS = 5 * 60
 _FAILURE_EVIDENCE_HEADERS = (
     "content-type",
     "content-length",
+    "location",
     "server",
     "via",
     "cf-ray",
     "x-cache",
+)
+_MAX_DECLARED_CONTENT_LENGTH = 2**63 - 1
+_MAX_CONTENT_ENCODING_CHARS = 256
+_MAX_CONTENT_ENCODING_TOKENS = 8
+_MAX_CONTENT_ENCODING_TOKEN_CHARS = 64
+_HTTP_TOKEN_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    "0123456789"
+    "!#$%&'*+-.^_`|~"
 )
 
 # curl_cffi 0.15 exposes this only from its internal ``curl`` module. Returning
@@ -200,9 +213,13 @@ class FetchError(RuntimeError):
         http_requests: Optional[int] = None,
         http_status_history: Optional[Sequence[int]] = None,
         latency_ms: int = 0,
+        redirect_location: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.error_class = error_class
+        # Where a 3xx pointed, when the source bothered to say.  A redirect
+        # without it is not a usable "the page moved" statement.
+        self.redirect_location = redirect_location
         self.http_status = http_status
         self.wire_bytes = wire_bytes
         self.browser_document_bytes = browser_document_bytes
@@ -311,6 +328,7 @@ class FBrefFetcher:
         proxy_file: Optional[str] = None,
         bootstrap_url: str = DEFAULT_BOOTSTRAP_URL,
         max_html_bytes: int = MAX_HTML_BYTES,
+        max_season_stats_html_bytes: int = MAX_SEASON_STATS_HTML_BYTES,
         max_browser_requests: int = DEFAULT_BROWSER_REQUEST_LIMIT,
         max_browser_bytes: int = DEFAULT_BROWSER_BYTE_LIMIT,
         max_target_http_attempts: int = MAX_TARGET_HTTP_ATTEMPTS,
@@ -329,6 +347,9 @@ class FBrefFetcher:
         self.max_html_bytes = int(max_html_bytes)
         if self.max_html_bytes <= 0:
             raise ValueError("max_html_bytes must be positive")
+        self.max_season_stats_html_bytes = int(max_season_stats_html_bytes)
+        if self.max_season_stats_html_bytes <= 0:
+            raise ValueError("max_season_stats_html_bytes must be positive")
         attempts = int(max_target_http_attempts)
         if not 1 <= attempts <= MAX_TARGET_HTTP_ATTEMPTS:
             raise ValueError(
@@ -1464,6 +1485,107 @@ class FBrefFetcher:
                 evidence.append(f"{name.replace('-', '_')}={value}")
         return ",".join(evidence)
 
+    @staticmethod
+    def _unique_response_header(response, name: str) -> Optional[str]:
+        """Return one textual header value, rejecting duplicate ambiguity.
+
+        HTTP adapters commonly coalesce repeated fields with commas, while
+        simple mappings can retain differently-cased duplicates.  Callers
+        still validate the coalesced syntax; this helper makes the latter form
+        fail closed too.  No malformed third-party header object may replace a
+        target's original transport verdict.
+        """
+
+        try:
+            headers = getattr(response, "headers", None)
+            if headers is None:
+                return None
+            matches = []
+            for key, value in headers.items():
+                if isinstance(key, str) and key.casefold() == name:
+                    matches.append(value)
+                    if len(matches) > 1:
+                        return None
+        except Exception:  # noqa: BLE001 - evidence must never mask verdict
+            return None
+        if len(matches) != 1 or not isinstance(matches[0], str):
+            return None
+        return matches[0]
+
+    @classmethod
+    def _trusted_content_length(cls, response) -> Optional[int]:
+        """Parse one canonical bounded Content-Length without large ``int``.
+
+        The evidence field is stored alongside PostgreSQL ``bigint`` byte
+        counters, so values beyond signed 64-bit range are deliberately
+        untrusted.  Length and lexical bounds run before integer conversion.
+        """
+
+        value = cls._unique_response_header(response, "content-length")
+        if value is None or not 1 <= len(value) <= 19:
+            return None
+        if value != "0" and value.startswith("0"):
+            return None
+        if any(character < "0" or character > "9" for character in value):
+            return None
+        maximum = str(_MAX_DECLARED_CONTENT_LENGTH)
+        if len(value) == len(maximum) and value > maximum:
+            return None
+        return int(value)
+
+    @classmethod
+    def _trusted_content_encoding(cls, response) -> Optional[str]:
+        """Normalize one bounded RFC token list or reject the whole field."""
+
+        value = cls._unique_response_header(response, "content-encoding")
+        if value is None or not 1 <= len(value) <= _MAX_CONTENT_ENCODING_CHARS:
+            return None
+        if not value.isascii():
+            return None
+        raw_tokens = value.split(",")
+        if not 1 <= len(raw_tokens) <= _MAX_CONTENT_ENCODING_TOKENS:
+            return None
+        tokens = []
+        seen = set()
+        for raw_token in raw_tokens:
+            token = raw_token.strip(" \t")
+            if not 1 <= len(token) <= _MAX_CONTENT_ENCODING_TOKEN_CHARS:
+                return None
+            if any(character not in _HTTP_TOKEN_CHARS for character in token):
+                return None
+            normalized = token.casefold()
+            if normalized in seen:
+                return None
+            seen.add(normalized)
+            tokens.append(normalized)
+        return ",".join(tokens)
+
+    @classmethod
+    def _oversize_response_evidence(
+        cls,
+        response,
+        body_buffer: _CumulativeBodyBuffer,
+    ) -> str:
+        """Render bounded size evidence without reading beyond the hard cap.
+
+        The callback counters are the lower bound for the decoded body.  A
+        Content-Length header may describe the encoded representation when
+        Content-Encoding is present, so it remains separate evidence rather
+        than being treated as a decoded-body size or a replacement ceiling.
+        """
+
+        evidence = [
+            f"observed_body_bytes={max(0, int(body_buffer.total_seen))}",
+            f"attempt_body_bytes={max(0, int(body_buffer.attempt_seen))}",
+        ]
+        content_length = cls._trusted_content_length(response)
+        if content_length is not None:
+            evidence.append(f"content_length={content_length}")
+        content_encoding = cls._trusted_content_encoding(response)
+        if content_encoding is not None:
+            evidence.append(f"content_encoding={content_encoding}")
+        return ",".join(evidence)
+
     def _fetch_without_provider_meter(
         self,
         url: str,
@@ -1492,7 +1614,12 @@ class FBrefFetcher:
         target_requests = 0
         wire_bytes = 0
         status_history: list[int] = []
-        body_buffer = _CumulativeBodyBuffer(self.max_html_bytes)
+        max_html_bytes = (
+            self.max_season_stats_html_bytes
+            if str(page_kind).strip().casefold() == "season_stats"
+            else self.max_html_bytes
+        )
+        body_buffer = _CumulativeBodyBuffer(max_html_bytes)
         for attempt in range(self.max_target_http_attempts):
             target_requests += 1
             body_buffer.begin_attempt()
@@ -1536,9 +1663,13 @@ class FBrefFetcher:
                 self._bootstrap_stats = None
                 latency_ms = int((time.perf_counter() - started) * 1000)
                 if body_buffer.exceeded:
+                    size_evidence = self._oversize_response_evidence(
+                        partial_response,
+                        body_buffer,
+                    )
                     raise FetchError(
                         "FBref cumulative response bodies exceeded "
-                        f"{self.max_html_bytes} bytes for {url}",
+                        f"{max_html_bytes} bytes for {url}; {size_evidence}",
                         error_class="response_too_large",
                         http_status=(
                             partial_status
@@ -1592,9 +1723,13 @@ class FBrefFetcher:
                 )
                 self._bootstrap_stats = None
                 latency_ms = int((time.perf_counter() - started) * 1000)
+                size_evidence = self._oversize_response_evidence(
+                    response,
+                    body_buffer,
+                )
                 raise FetchError(
                     "FBref cumulative response bodies exceeded "
-                    f"{self.max_html_bytes} bytes for {url}",
+                    f"{max_html_bytes} bytes for {url}; {size_evidence}",
                     error_class="response_too_large",
                     http_status=status,
                     wire_bytes=wire_bytes,
@@ -1651,6 +1786,26 @@ class FBrefFetcher:
             )
         if status != 200:
             evidence = self._failure_response_evidence(response, body)
+            # The raw header, deliberately unsanitised: this value decides
+            # whether a redirect may shrink the crawl scope, and
+            # _safe_header_value would change the answer.  It truncates at 160
+            # characters and rewrites everything outside its allowlist to '?',
+            # which turns "https://fbref.com@portal.example/login" into
+            # "https://fbref.com?portal.example/login" -- a parser then reads
+            # the host as fbref.com instead of portal.example.  The sanitised
+            # copy still goes to the log through `evidence` above.
+            redirect_location = (
+                str(
+                    {
+                        str(key).lower(): value
+                        for key, value in dict(
+                            getattr(response, "headers", {}) or {}
+                        ).items()
+                    }.get("location")
+                    or ""
+                ).strip()
+                or None
+            )
             raise FetchError(
                 f"FBref returned HTTP {status} for {url}; "
                 f"attempts={target_requests}; "
@@ -1667,6 +1822,7 @@ class FBrefFetcher:
                 target_requests=target_requests,
                 http_status_history=tuple(status_history),
                 latency_ms=latency_ms,
+                redirect_location=redirect_location,
             )
         if not body:
             raise FetchError(
@@ -1683,9 +1839,14 @@ class FBrefFetcher:
                 http_status_history=tuple(status_history),
                 latency_ms=latency_ms,
             )
-        if len(body) > self.max_html_bytes:
+        if len(body) > max_html_bytes:
+            size_evidence = self._oversize_response_evidence(
+                response,
+                body_buffer,
+            )
             raise FetchError(
-                f"FBref body exceeded {self.max_html_bytes} bytes for {url}",
+                f"FBref body exceeded {max_html_bytes} bytes for {url}; "
+                f"{size_evidence}",
                 error_class="response_too_large",
                 http_status=status,
                 wire_bytes=wire_bytes,
@@ -2001,6 +2162,7 @@ __all__ = [
     "FetchError",
     "FetchResponse",
     "MAX_HTML_BYTES",
+    "MAX_SEASON_STATS_HTML_BYTES",
     "MAX_TARGET_HTTP_ATTEMPTS",
     "PERSISTENT_SESSION_MAX_AGE_SECONDS",
     "PersistentMeteredSessionReceipt",

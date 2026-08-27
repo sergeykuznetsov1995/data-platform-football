@@ -100,6 +100,28 @@ def _source_refresh_cli():
     ]
 
 
+def _player_collector_cli():
+    from scrapers.fotmob.player_collector import (
+        PLAYER_COLLECTOR_MAX_DIRECT_MIB,
+        PLAYER_COLLECTOR_MAX_REQUESTS,
+        PLAYER_COLLECTOR_PLAYER_LIMIT,
+        PLAYER_COLLECTOR_REQUESTS_PER_MINUTE,
+    )
+
+    return [
+        "--entities",
+        "players",
+        "--max-requests",
+        str(PLAYER_COLLECTOR_MAX_REQUESTS),
+        "--max-direct-mib",
+        str(PLAYER_COLLECTOR_MAX_DIRECT_MIB),
+        "--player-limit",
+        str(PLAYER_COLLECTOR_PLAYER_LIMIT),
+        "--requests-per-minute",
+        str(PLAYER_COLLECTOR_REQUESTS_PER_MINUTE),
+    ]
+
+
 def _run_native_admitted(mod, args, **kwargs):
     """Exercise native planning under an explicit test-only active identity."""
 
@@ -340,6 +362,93 @@ class TestFotmobNativeRunner:
         assert selection["catalog_ids"] == [47]
         assert selection["catalog_decisions"][0]["decision"] == "included"
         assert selection["scope_attempts"][0]["outcome"] == "success"
+
+    @pytest.mark.unit
+    def test_automatic_history_contract_accepts_work_after_advancing_a_cycle(self):
+        from scripts.fotmob_catalog_acceptance import validate_report
+        from scrapers.fotmob.catalog_contract import catalog_contract_from_dict
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _league_payload,
+        )
+
+        mod = self._module()
+        root = _league_payload()
+        root["allAvailableSeasons"] = [
+            "2025/2026",
+            "2024/2025",
+            "2023/2024",
+        ]
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: root,
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2024/2025"}
+            ).canonical_url: _league_payload("2024/2025"),
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2023/2024"}
+            ).canonical_url: _league_payload("2023/2024"),
+        }
+        repository = MemoryFotMobRepository()
+
+        def run(run_id):
+            service = FotMobIngestService(
+                transport=StubTransport(dict(responses)),
+                repository=repository,
+                mode=RunMode.BACKFILL,
+                budget=TransportBudget(
+                    max_requests=100,
+                    max_direct_bytes=10_000_000,
+                ),
+                run_id=run_id,
+                max_workers=2,
+            )
+            args = mod._argument_parser().parse_args(
+                [
+                    "--mode",
+                    "backfill",
+                    "--catalog-contract",
+                    "fotmob-catalog-v1",
+                    "--entities",
+                    "season",
+                    "--run-id",
+                    run_id,
+                ]
+            )
+            return _run_native_admitted(mod, args, service=service)
+
+        first_rc, first_report = run("season-cycle-1")
+        second_rc, second_report = run("season-cycle-2")
+
+        assert first_rc == 0, first_report["errors"]
+        assert second_rc == 0, second_report["errors"]
+        assert first_report["selection"]["planned_scopes"] == ["47=2024/2025"]
+        assert second_report["selection"]["planned_scopes"] == ["47=2023/2024"]
+        obligation = {"47=2024/2025", "47=2023/2024"}
+        for report in (first_report, second_report):
+            contract = catalog_contract_from_dict(
+                report["selection"]["catalog_contract"]
+            )
+            assert set(contract.scopes) == obligation
+        assert {
+            (
+                attempt["competition_id"],
+                attempt["source_season_key"],
+            )
+            for attempt in second_report["selection"]["scope_attempts"]
+        } == {(47, "2023/2024")}
+
+        accepted = validate_report(
+            second_report,
+            require_full_completion=False,
+        )
+        assert accepted.ok, accepted.errors
 
     @pytest.mark.unit
     def test_automatic_runner_removes_now_female_cached_inclusion_before_fanout(
@@ -853,6 +962,157 @@ class TestFotmobNativeRunner:
         assert validate_report(report, require_full_completion=True).ok is False
         continuous = validate_report(report, require_full_completion=False)
         assert continuous.ok is True, continuous.errors
+
+    @pytest.mark.unit
+    def test_schedule_cooldown_returns_after_the_next_kickoff_not_in_two_days(self):
+        """Главный случай — матч, который на момент обхода ЕЩЁ БУДУЩИЙ.
+
+        Обход утром видит вечерний матч не начавшимся; при фиксированных 48 часах
+        никто не пришёл бы за его флагом двое суток, а без флага не качается
+        карточка (#1193). Срок обязан приземлиться вскоре ПОСЛЕ матча.
+        """
+
+        from datetime import datetime, timedelta
+
+        mod = self._module()
+        now = datetime(2026, 8, 20, 9, 0)
+
+        vecherniy = [{"utc_time": "2026-08-20T18:00:00Z"}]
+        assert mod._schedule_cooldown(vecherniy, now) == timedelta(hours=12)
+
+        # Матч уже идёт — обязательство висит прямо сейчас.
+        idet = [{"utc_time": "2026-08-20T08:00:00Z"}]
+        assert mod._schedule_cooldown(idet, now) == timedelta(hours=2)
+
+        # Ближайший матч так далеко, что срок упирается в общий потолок.
+        daleko = [{"utc_time": "2026-08-30T18:00:00Z"}]
+        assert mod._schedule_cooldown(daleko, now) == timedelta(hours=48)
+
+        # Матч через полчаса: срок = до него плюс запас на доигрывание.
+        skoro = [{"utc_time": "2026-08-20T09:30:00Z"}]
+        assert mod._schedule_cooldown(skoro, now) == timedelta(hours=3, minutes=30)
+
+        # Считается БЛИЖАЙШИЙ будущий, а не первый по списку.
+        vperemeshku = [
+            {"utc_time": "2026-08-25T18:00:00Z"},
+            {"utc_time": "2026-08-20T18:00:00Z"},
+        ]
+        assert mod._schedule_cooldown(vperemeshku, now) == timedelta(hours=12)
+
+    @pytest.mark.unit
+    def test_schedule_cooldown_ignores_settled_and_undated_matches(self):
+        """Закрытый матч обязательством не делает, мусорная дата — тоже.
+
+        `postponed` и `awarded` парсер сохраняет наравне с `finished`/`cancelled`
+        (`scrapers/fotmob/parsers.py:143-146`). Без них прошедший перенесённый или
+        присуждённый матч висел бы обязательством вечно, и турнир опрашивался бы
+        каждые два часа бесконечно.
+        """
+
+        from datetime import datetime, timedelta
+
+        mod = self._module()
+        now = datetime(2026, 8, 20, 12, 0)
+        proshedshiy = "2026-08-20T09:00:00Z"
+
+        assert mod._schedule_cooldown([], now) == timedelta(hours=48)
+        for terminal in ("finished", "cancelled", "postponed", "awarded"):
+            assert mod._schedule_cooldown(
+                [{"utc_time": proshedshiy, terminal: True}], now
+            ) == timedelta(hours=48), terminal
+        assert mod._schedule_cooldown([{"utc_time": None}], now) == timedelta(hours=48)
+        assert mod._schedule_cooldown([{"utc_time": "не дата"}], now) == timedelta(
+            hours=48
+        )
+        assert mod._schedule_cooldown([{}], now) == timedelta(hours=48)
+
+    @pytest.mark.unit
+    def test_closed_current_scope_comes_back_for_the_evening_match(self):
+        """Тот же переход «будущий → сыгранный», но через настоящий ран.
+
+        Один и тот же турнир закрывается дважды: в расписании либо только
+        давно сыгранный матч (возвращаться незачем — 48 ч), либо ещё и матч
+        сегодня вечером (вернуться надо вскоре после него).
+        """
+
+        import copy
+        from datetime import datetime, timedelta, timezone
+
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _competition_payload,
+        )
+
+        mod = self._module()
+
+        def _attempt_for(*, evening_kickoff):
+            payload = _competition_payload(47, "Premier League")
+            if evening_kickoff is not None:
+                extra = copy.deepcopy(payload["fixtures"]["allMatches"][0])
+                extra["id"] = 300
+                extra["pageUrl"] = "/matches/alpha-vs-beta/x#300"
+                extra["status"]["finished"] = False
+                extra["status"]["utcTime"] = evening_kickoff
+                payload["fixtures"]["allMatches"].append(extra)
+            responses = {
+                canonicalize_target("allLeagues").canonical_url: {
+                    "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+                },
+                canonicalize_target("leagues", {"id": 47}).canonical_url: payload,
+                canonicalize_target(
+                    "matchDetails", {"matchId": "100"}
+                ).canonical_url: {
+                    "content": {"matchFacts": {"events": []}, "stats": {"x": 1}}
+                },
+            }
+            service = FotMobIngestService(
+                transport=StubTransport(responses),
+                repository=MemoryFotMobRepository(),
+                mode=RunMode.DAILY,
+                budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+                run_id="cooldown-1",
+                max_workers=1,
+            )
+            args = mod._argument_parser().parse_args(
+                [
+                    "--mode",
+                    "refresh",
+                    "--catalog-contract",
+                    "fotmob-catalog-v1",
+                    "--entities",
+                    "season,matches",
+                    "--run-id",
+                    "cooldown-1",
+                ]
+            )
+            _rc, report = _run_native_admitted(mod, args, service=service)
+            return {
+                attempt["competition_id"]: attempt
+                for attempt in report["selection"]["scope_attempts"]
+            }[47]
+
+        def _cooldown(attempt):
+            # Срок отсчитывается от начала работы над скоупом, а метка попытки
+            # ставится в её конце, поэтому номинал недостижим на миллисекунды.
+            started = datetime.fromisoformat(attempt["last_attempt_at"])
+            due = datetime.fromisoformat(attempt["next_retry_at"])
+            return due - started
+
+        # Матч через 9 часов от «сейчас» — срок обязан лечь примерно на +12 ч.
+        soon = (datetime.now(timezone.utc) + timedelta(hours=9)).strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z"
+        )
+        settled = _attempt_for(evening_kickoff=None)
+        owing = _attempt_for(evening_kickoff=soon)
+
+        assert settled["outcome"] == "success"
+        assert owing["outcome"] == "success"
+        assert timedelta(hours=47) < _cooldown(settled) <= timedelta(hours=48)
+        assert timedelta(hours=11) < _cooldown(owing) <= timedelta(hours=12)
 
     @pytest.mark.unit
     def test_terminal_scope_is_counted_in_the_run_report(self):
@@ -1750,6 +2010,177 @@ class TestFotmobNativeRunner:
             force_refresh=True,
             capture_terminal_outcomes=True,
         )
+        service.discover_catalog.assert_not_called()
+
+    @pytest.mark.unit
+    def test_player_collector_cli_is_exact_and_rejects_widening(self, monkeypatch):
+        from scrapers.fotmob.player_collector import PLAYER_COLLECTOR_MODE
+
+        mod = self._module()
+        publication_args, publication = _publication_cli(monkeypatch)
+        parser = mod._argument_parser()
+        base = _player_collector_cli()
+        args = parser.parse_args(
+            ["--mode", PLAYER_COLLECTOR_MODE, *base, *publication_args]
+        )
+
+        assert mod._validate_args(parser, args) == publication
+
+        rejected = (
+            ["--scope", "47=2026/2027"],
+            ["--catalog-contract", "fotmob-catalog-v1"],
+            ["--entities", "players,teams"],
+            ["--competition-limit", "1"],
+            ["--season-limit", "1"],
+            ["--match-limit", "1"],
+            ["--team-limit", "1"],
+            ["--player-limit", "99"],
+            ["--max-requests", "499"],
+            ["--max-direct-mib", "65"],
+            ["--requests-per-minute", "31"],
+            ["--max-attempts", "3"],
+            ["--workers", "5"],
+            ["--next-build-id", "operator-build"],
+            ["--deadline", "2026-08-22T00:00:00Z"],
+            ["--daily-contract", "fotmob-daily-v1"],
+        )
+        for replacement in rejected:
+            option = replacement[0]
+            mutated = list(base)
+            if option in mutated:
+                mutated[mutated.index(option) + 1] = replacement[1]
+            else:
+                mutated.extend(replacement)
+            with pytest.raises(SystemExit):
+                candidate = parser.parse_args(
+                    [
+                        "--mode",
+                        PLAYER_COLLECTOR_MODE,
+                        *mutated,
+                        *publication_args,
+                    ]
+                )
+                mod._validate_args(parser, candidate)
+
+    @pytest.mark.unit
+    def test_player_collector_fetches_only_selected_missing_players(self, monkeypatch):
+        from scrapers.fotmob.player_collector import (
+            PLAYER_COLLECTOR_MODE,
+            PLAYER_COLLECTOR_PROFILE,
+            player_collector_ids_sha256,
+            player_collector_plan_signature,
+        )
+        from scrapers.fotmob.planner import RunMode
+        from scrapers.fotmob.service import OperationResult
+        from tests.unit.scrapers.test_fotmob_service import _service
+
+        mod = self._module()
+        publication_args, _publication = _publication_cli(monkeypatch)
+        parser = mod._argument_parser()
+        args = parser.parse_args(
+            [
+                "--mode",
+                PLAYER_COLLECTOR_MODE,
+                *_player_collector_cli(),
+                *publication_args,
+            ]
+        )
+        mod._validate_args(parser, args)
+        service, _transport, repository = _service({}, mode=RunMode.DAILY)
+        repository.missing_current_squad_player_ids = MagicMock(return_value=[21, 40])
+        repository.ensure_current_views = MagicMock(return_value=[])
+        service.discover_catalog = MagicMock(
+            side_effect=AssertionError("player collector must not discover catalog")
+        )
+        outcomes = [
+            {"player_id": 21, "status": "success"},
+            {"player_id": 40, "status": "not_available"},
+        ]
+        service.sync_player_snapshots = MagicMock(
+            return_value=OperationResult(
+                "player_snapshots",
+                attempted=2,
+                succeeded=1,
+                not_available=1,
+                metadata={
+                    "terminal_outcomes": outcomes,
+                    "intentional_not_available": 1,
+                    "typed_snapshot_writes": 1,
+                },
+            )
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0, report["errors"]
+        assert report["mode"] == PLAYER_COLLECTOR_MODE
+        assert report["selection"] == {
+            "profile": PLAYER_COLLECTOR_PROFILE,
+            "entities": ["players"],
+            "explicit_scopes": [],
+            "competition_limit": 0,
+            "season_limit": 0,
+            "planned_scopes": [],
+            "completed_scopes": [],
+            "completed_transfer_competition_ids": [],
+            "requests_per_minute": args.requests_per_minute,
+            "scope_plan_signature": player_collector_plan_signature([21, 40]),
+            "player_collector": {
+                "profile": PLAYER_COLLECTOR_PROFILE,
+                "player_ids": [21, 40],
+                "player_count": 2,
+                "player_ids_sha256": player_collector_ids_sha256([21, 40]),
+                "player_limit": args.player_limit,
+            },
+            "target_outcomes": outcomes,
+        }
+        repository.missing_current_squad_player_ids.assert_called_once_with(
+            args.player_limit
+        )
+        service.sync_player_snapshots.assert_called_once_with(
+            [21, 40],
+            force_refresh=True,
+            repair_missing_snapshot=True,
+            capture_terminal_outcomes=True,
+        )
+        service.discover_catalog.assert_not_called()
+
+    @pytest.mark.unit
+    def test_player_collector_empty_backlog_is_green_without_network(self, monkeypatch):
+        from scrapers.fotmob.player_collector import PLAYER_COLLECTOR_MODE
+        from scrapers.fotmob.planner import RunMode
+        from tests.unit.scrapers.test_fotmob_service import _service
+
+        mod = self._module()
+        publication_args, _publication = _publication_cli(monkeypatch)
+        parser = mod._argument_parser()
+        args = parser.parse_args(
+            [
+                "--mode",
+                PLAYER_COLLECTOR_MODE,
+                *_player_collector_cli(),
+                *publication_args,
+            ]
+        )
+        mod._validate_args(parser, args)
+        service, transport, repository = _service({}, mode=RunMode.DAILY)
+        repository.missing_current_squad_player_ids = MagicMock(return_value=[])
+        repository.ensure_current_views = MagicMock(return_value=[])
+        service.discover_catalog = MagicMock(
+            side_effect=AssertionError("player collector must not discover catalog")
+        )
+
+        rc, report = _run_native_admitted(mod, args, service=service)
+
+        assert rc == 0, report["errors"]
+        player_operation = next(
+            operation
+            for operation in report["operations"]
+            if operation["entity"] == "player_snapshots"
+        )
+        assert player_operation["attempted"] == 0
+        assert report["selection"]["player_collector"]["player_ids"] == []
+        assert transport.calls == []
         service.discover_catalog.assert_not_called()
 
     @pytest.mark.unit

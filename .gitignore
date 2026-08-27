@@ -221,6 +221,8 @@ docs/operations/sql/*
 !docs/operations/sql/fbref_production_acceptance.sql
 !docs/operations/sql/fbref_control_dataset_acceptance.sql
 !docs/operations/sql/fbref_canary_acceptance.sql
+!docs/operations/sql/fbref_20260825_repoint_current_season_redirect_aliases.sql
+!docs/operations/sql/fbref_20260825_redirect_alias_canary_gate.sql
 !docs/architecture/
 docs/architecture/*
 !docs/architecture/fotmob-native-silver.md

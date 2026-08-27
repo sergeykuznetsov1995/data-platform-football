@@ -50,6 +50,7 @@ PROJECTION_SOURCES = {
     "dag_trigger_fotmob_daily.py": "dags/dag_trigger_fotmob_daily.py",
     "dag_refresh_fotmob.py": "dags/dag_refresh_fotmob.py",
     "dag_backfill_fotmob.py": "dags/dag_backfill_fotmob.py",
+    "dag_collect_fotmob_players.py": "dags/dag_collect_fotmob_players.py",
     ".airflowignore": "deploy/fotmob/.airflowignore",
 }
 PROJECTION_DIRECTORIES = {"utils", "sql", "scripts"}
@@ -62,6 +63,7 @@ EXPECTED_DAGS = {
     "dag_trigger_fotmob_daily",
     "dag_refresh_fotmob",
     "dag_backfill_fotmob",
+    "dag_collect_fotmob_players",
 }
 SCHEDULE_BOUNDARY_FIELDS = (
     "logical_date",
@@ -100,6 +102,7 @@ ISOLATED_DAG_ROOT_PATHS = {
     "dags/dag_trigger_fotmob_daily.py",
     "dags/dag_refresh_fotmob.py",
     "dags/dag_backfill_fotmob.py",
+    "dags/dag_collect_fotmob_players.py",
 }
 ISOLATED_DAG_PREFIXES = (
     "dags/scripts/",
@@ -116,6 +119,7 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "dags/dag_orchestrate_fotmob.py",
     "dags/dag_refresh_fotmob.py",
     "dags/dag_backfill_fotmob.py",
+    "dags/dag_collect_fotmob_players.py",
     "dags/dag_master_pipeline.py",
     "dags/dag_sofascore_pipeline.py",
     "dags/dag_trigger_fotmob_daily.py",
@@ -145,6 +149,7 @@ SHARED_REQUIRED_RUNTIME_PATHS = {
     "scrapers/fotmob/raw_store.py",
     "scrapers/fotmob/repository.py",
     "scrapers/fotmob/service.py",
+    "scrapers/fotmob/player_collector.py",
     "scrapers/fotmob/scope_codec.py",
     "scrapers/fotmob/source_refresh.py",
     "scrapers/fotmob/transport.py",
@@ -170,6 +175,7 @@ SHARED_STATE_DAGS = {
     "dag_trigger_fotmob_daily",
     "dag_refresh_fotmob",
     "dag_backfill_fotmob",
+    "dag_collect_fotmob_players",
     "dag_orchestrate_fotmob",
 }
 EXPECTED_SHARED_PAUSE_STATES = {
@@ -202,6 +208,7 @@ LEGACY_OWNER_DAGS = frozenset(
         "dag_trigger_fotmob_daily",
         "dag_refresh_fotmob",
         "dag_backfill_fotmob",
+        "dag_collect_fotmob_players",
     }
 )
 AUTOMATIC_ACTIVE_DAGS = frozenset(
@@ -219,6 +226,7 @@ AUTOMATIC_EXPECTED_SCHEDULES = {
     "dag_trigger_fotmob_daily": "None",
     "dag_refresh_fotmob": "None",
     "dag_backfill_fotmob": "None",
+    "dag_collect_fotmob_players": "None",
 }
 AUTOMATIC_LANES = frozenset({"daily", "refresh", "backfill"})
 AUTOMATIC_ADMISSION_MAX_AGE = timedelta(minutes=15)
@@ -344,7 +352,7 @@ def validate_automatic_catalog_admission(
         or writer_snapshot.get("active_runs") != {}
     ):
         raise RuntimeBindingError(
-            "automatic writer snapshot is not one atomic paused six-DAG view"
+            "automatic writer snapshot is not one atomic paused seven-DAG view"
         )
 
     legacy = value.get("legacy_owners")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -79,6 +80,17 @@ SCOPE_PLAN_SIGNATURE_VERSION = "fotmob-scope-plan-v1"
 # коммита вычеркнула бы скоуп из обхода навсегда — тихая дыра в покрытии,
 # которую не видно ни по цвету рана, ни по числу закрытых скоупов.
 TERMINAL_RETRY_AFTER = timedelta(hours=24)
+
+# Сколько признанная дыра источника держит исторический скоуп вне планов.
+# У CURRENT-полосы возврат есть: раннер ставит такому скоупу next_retry_at +48 ч.
+# У HISTORY срок не ставится вовсе, а исход `source_gap` вычёркивал скоуп из
+# обхода навсегда — то есть одна ошибочная дыра становилась безвозвратной. На
+# редких дырах текущего контура (живьём 20.08 таких пять, безвозвратная одна)
+# это терпимо, но кампания истории раздаёт исход source_gap массово, и без
+# срока пересмотра её собственные ошибки закрепились бы как «источник не
+# отдаёт». Пересмотр отсчитывается от последней попытки, а не от next_retry_at:
+# у уже накопленных строк этого срока просто нет.
+SOURCE_GAP_REVIEW_AFTER = timedelta(days=30)
 
 
 def _naive_utc(value: datetime) -> datetime:
@@ -228,7 +240,15 @@ def _season_recency_key(season: SeasonRef) -> int:
     return 0
 
 
-def plan_seasons(
+def _history_season_cycle_key(source_season_key: str) -> tuple[int, str]:
+    label = str(source_season_key).strip()
+    years = [int(value) for value in re.findall(r"(?<!\d)[12]\d{3}(?!\d)", label)]
+    if years:
+        return max(years), ""
+    return -1, label.casefold()
+
+
+def _plan_seasons(
     classifications: Iterable[ScopeClassification],
     seasons: Iterable[SeasonRef],
     *,
@@ -238,15 +258,9 @@ def plan_seasons(
     lane: Optional[ScopeLane] = None,
     attempt_states: Mapping[tuple[int, str], ScopeAttemptState] | None = None,
     now: Optional[datetime] = None,
+    enforce_history_cycle_barrier: bool,
 ) -> list[SeasonWorkItem]:
-    """Build a stable full-catalog/daily/backfill plan.
-
-    Included adult men's competitions are eligible.  Excluded and ambiguous
-    competitions remain in the discovery catalog but never enter an ingest
-    plan. Current and history lanes are disjoint. A durable retry that is not
-    due is skipped without blocking later ready work. Exact season strings are
-    passed through unchanged and no hardcoded competition cohort affects order.
-    """
+    """Build shared catalog-obligation or runnable-plan work items."""
 
     included = {
         item.competition.competition_id
@@ -264,7 +278,7 @@ def plan_seasons(
     if observed_now.tzinfo is not None:
         observed_now = observed_now.astimezone(timezone.utc).replace(tzinfo=None)
 
-    output: list[SeasonWorkItem] = []
+    candidates: list[tuple[SeasonRef, ScopeAttemptState | None]] = []
     seen: set[tuple[int, str]] = set()
     for season in seasons:
         identity = season.identity
@@ -290,11 +304,38 @@ def plan_seasons(
 
         attempt = attempts.get(identity)
         if attempt is not None:
+            if attempt.outcome == "success" and lane != ScopeLane.CURRENT:
+                continue
             if (
-                attempt.outcome in {"success", "source_gap"}
+                attempt.outcome == "source_gap"
                 and lane != ScopeLane.CURRENT
+                and observed_now - _naive_utc(attempt.last_attempt_at)
+                < SOURCE_GAP_REVIEW_AFTER
             ):
                 continue
+
+        candidates.append((season, attempt))
+
+    if (
+        enforce_history_cycle_barrier
+        and mode == RunMode.BACKFILL
+        and lane == ScopeLane.HISTORY
+        and explicit_scopes is None
+        and candidates
+    ):
+        newest_cycle = max(
+            _history_season_cycle_key(season.source_season_key)
+            for season, _ in candidates
+        )
+        candidates = [
+            (season, attempt)
+            for season, attempt in candidates
+            if _history_season_cycle_key(season.source_season_key) == newest_cycle
+        ]
+
+    output: list[SeasonWorkItem] = []
+    for season, attempt in candidates:
+        if attempt is not None:
             if (
                 attempt.outcome == "terminal"
                 and observed_now - _naive_utc(attempt.last_attempt_at)
@@ -334,6 +375,68 @@ def plan_seasons(
     )
 
 
+def plan_seasons(
+    classifications: Iterable[ScopeClassification],
+    seasons: Iterable[SeasonRef],
+    *,
+    mode: RunMode,
+    previously_successful: Iterable[tuple[int, str]] = (),
+    explicit_scopes: Optional[Iterable[tuple[int, str]]] = None,
+    lane: Optional[ScopeLane] = None,
+    attempt_states: Mapping[tuple[int, str], ScopeAttemptState] | None = None,
+    now: Optional[datetime] = None,
+) -> list[SeasonWorkItem]:
+    """Build a stable runnable daily/backfill/replay plan.
+
+    Included adult men's competitions are eligible. Excluded and ambiguous
+    competitions remain in the discovery catalog but never enter an ingest
+    plan. Current and history lanes are disjoint. Within a selected cycle, a
+    durable retry that is not due is skipped without blocking later ready work.
+    Automatic BACKFILL + HISTORY planning selects its newest unfinished cycle
+    before cooldown filtering, so a cooling retry or fresh terminal outcome in
+    that cycle blocks all older cycles. Exact season strings pass through
+    unchanged and no hardcoded competition cohort affects order.
+    """
+
+    return _plan_seasons(
+        classifications,
+        seasons,
+        mode=mode,
+        previously_successful=previously_successful,
+        explicit_scopes=explicit_scopes,
+        lane=lane,
+        attempt_states=attempt_states,
+        now=now,
+        enforce_history_cycle_barrier=True,
+    )
+
+
+def catalog_scope_obligation(
+    classifications: Iterable[ScopeClassification],
+    seasons: Iterable[SeasonRef],
+    *,
+    mode: RunMode,
+    lane: Optional[ScopeLane] = None,
+) -> tuple[tuple[int, str], ...]:
+    """Enumerate the immutable full eligible scope obligation.
+
+    Catalog contracts describe every eligible exact source scope and therefore
+    deliberately ignore durable completion/attempt state and the runnable
+    automatic-history cycle barrier.
+    """
+
+    return tuple(
+        item.identity
+        for item in _plan_seasons(
+            classifications,
+            seasons,
+            mode=mode,
+            lane=lane,
+            enforce_history_cycle_barrier=False,
+        )
+    )
+
+
 def tombstones_after_two_absences(
     previous_snapshot_ids: Iterable[int],
     snapshot_before_previous_ids: Iterable[int],
@@ -359,6 +462,7 @@ def utc_run_id(prefix: str = "fotmob") -> str:
 __all__ = [
     "MANDATORY_COMPETITION_IDS",
     "SCOPE_PLAN_SIGNATURE_VERSION",
+    "SOURCE_GAP_REVIEW_AFTER",
     "BudgetExceeded",
     "BudgetLedger",
     "RunMode",

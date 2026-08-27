@@ -29,6 +29,18 @@ from scrapers.fotmob.scope_codec import format_scope_token, parse_scope_groups
 from scrapers.fotmob.source_refresh import (
     REPLAY_MISSING_INPUT_PROOF_SCHEMA as REPLAY_MISSING_INPUT_SCHEMA,
 )
+from scrapers.fotmob.player_collector import (
+    PLAYER_COLLECTOR_ENTITIES,
+    PLAYER_COLLECTOR_MAX_DIRECT_MIB,
+    PLAYER_COLLECTOR_MAX_REQUESTS,
+    PLAYER_COLLECTOR_MODE,
+    PLAYER_COLLECTOR_PLAYER_LIMIT,
+    PLAYER_COLLECTOR_PROFILE,
+    PLAYER_COLLECTOR_REQUESTS_PER_MINUTE,
+    normalize_player_collector_ids,
+    player_collector_ids_sha256,
+    player_collector_plan_signature,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,7 +55,14 @@ logger = logging.getLogger(__name__)
 # from the continuous refresh DAG, without the pinned 21-competition daily
 # contract.  It maps onto ``RunMode.DAILY`` internally so the source planner
 # enum stays untouched; the report keeps ``mode="refresh"`` for DAG routing.
-NATIVE_MODES = ("discover", "daily", "backfill", "replay", "refresh")
+NATIVE_MODES = (
+    "discover",
+    "daily",
+    "backfill",
+    "replay",
+    "refresh",
+    PLAYER_COLLECTOR_MODE,
+)
 NATIVE_ENTITIES = frozenset(
     {"season", "leaderboards", "matches", "teams", "players", "transfers"}
 )
@@ -77,6 +96,31 @@ PUBLICATION_BINDING_ARGUMENTS = {
 }
 _ACTIVE_PUBLICATION_GENERATION: str | None = None
 FOTMOB_SCOPE_JSON_ENV = "FOTMOB_SCOPE_JSON"
+
+# Кулдаун успешно закрытого скоупа текущей полосы. 48 часов означают «турнир
+# обойдён, можно не возвращаться», но флаг `finished` матчу проставляет именно
+# обход расписания: живой замер интервалов между касаниями текущего сезона даёт
+# p50 58,3 ч и p90 152,6 ч, поэтому сыгранный матч ждёт флага двое-трое суток, а
+# без флага не качается его карточка (#1193, `include_unfinished=False`). Долг
+# «сыграно по времени, но без флага» на 20.08 — 172 матча, из них 165 моложе трёх
+# суток, то есть это ровно цена кулдауна.
+#
+# Поэтому срок выбирается по ОБЯЗАТЕЛЬСТВУ, а не константой: если в расписании
+# остались матчи, чьё начало прошло, а терминального статуса нет, скоуп должен
+# вернуться на ближайшем ране. Спрос растёт только у тех турниров, у которых
+# обязательство реально висит (20.08 это 28-31 из 450), и почти весь прирост —
+# дешёвый `not_modified` (1006 из 1554 обращений `league_season` за 7 суток).
+#
+# Известный хвост: матч, которому источник НИКОГДА не проставит терминальный
+# статус (брошенный, снятый не тем полем), держит свой турнир на коротком сроке
+# бессрочно. Цена этого — один дешёвый `league_season` на ран, а таких матчей
+# живьём два в одном турнире, поэтому потолка на число коротких сроков нет:
+# он усложнил бы правило ради случая, которого пока нет.
+CURRENT_SCOPE_COOLDOWN = timedelta(hours=48)
+CURRENT_SCOPE_OBLIGATION_COOLDOWN = timedelta(hours=2)
+# Сколько ждать ПОСЛЕ начала матча, прежде чем идти за его флагом: полтора часа
+# игры плюс запас на то, что источник проставляет терминальный статус не мгновенно.
+MATCH_SETTLE_MARGIN = timedelta(hours=3)
 
 # Единственность писателя bronze (B7). max_active_runs=1 сериализует только
 # DagRun'ы одного дага, а ручной добор и осиротевший скрапер (PPid=1) пишут в те
@@ -530,6 +574,84 @@ def _catalog_decision_payload(evidence) -> dict[str, Any]:
     return payload
 
 
+def _match_kickoff(value: Any) -> datetime | None:
+    """Время начала матча источника как наивный UTC, либо None."""
+
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _match_is_settled(match: Mapping[str, Any]) -> bool:
+    """Матч, за которым больше не надо возвращаться.
+
+    `postponed` и `awarded` парсер сохраняет наравне с `finished`/`cancelled`
+    (`scrapers/fotmob/parsers.py:143-146`), и без них прошедший перенесённый или
+    присуждённый матч навсегда остаётся «обязательством»: скоуп получал бы
+    короткий срок бесконечно.
+
+    Про `awarded` — замер 20.08 по `bronze.fotmob_matches_current`: присуждённых
+    матчей 169, и у ВСЕХ 169 стоит ещё и `finished`, то есть сегодня такой матч
+    и без этой ветки закрывается по `finished`. Статус добавлен не как лечение
+    живого зависания, а потому что порядок выставления флагов у источника нам не
+    подконтролен: присуждение раньше отметки о завершении дало бы вечный
+    двухчасовой опрос.
+    """
+
+    return bool(
+        match.get("finished")
+        or match.get("cancelled")
+        or match.get("postponed")
+        or match.get("awarded")
+    )
+
+
+def _schedule_cooldown(matches: Iterable[Mapping[str, Any]], now: datetime) -> timedelta:
+    """Через сколько вернуться к расписанию сезона.
+
+    Считается по СВЕЖЕРАЗОБРАННОМУ расписанию, а не по числу недокачанных
+    карточек: `source_missing_matches` входит в само условие успеха скоупа
+    (`scope_ok`), поэтому в ветке успеха он тождественно ноль, и признак оттуда
+    был бы всегда ложным — правка получилась бы «зелёной, но пустой».
+
+    Три случая, и средний — главный:
+
+    * матч уже начался и не закрыт — обязательство висит прямо сейчас,
+      возвращаемся ближайшим раном;
+    * ближайший матч ещё впереди — возвращаемся вскоре ПОСЛЕ него. Только это
+      и лечит корень #1193: обход, случившийся утром, видит вечерний матч ещё
+      будущим, и при фиксированных 48 часах никто не пришёл бы за его флагом
+      двое суток;
+    * впереди ничего нет — обычный долгий срок.
+
+    Матч без разбираемого времени начала обязательством не считается: иначе
+    мусорное поле держало бы скоуп на коротком сроке вечно.
+    """
+
+    earliest_future: datetime | None = None
+    for match in matches:
+        if _match_is_settled(match):
+            continue
+        kickoff = _match_kickoff(match.get("utc_time"))
+        if kickoff is None:
+            continue
+        if kickoff <= now:
+            return CURRENT_SCOPE_OBLIGATION_COOLDOWN
+        if earliest_future is None or kickoff < earliest_future:
+            earliest_future = kickoff
+    if earliest_future is None:
+        return CURRENT_SCOPE_COOLDOWN
+    # Пол здесь не нужен: у будущего матча `kickoff > now`, поэтому срок заведомо
+    # больше запаса на доигрывание.
+    return min(CURRENT_SCOPE_COOLDOWN, earliest_future + MATCH_SETTLE_MARGIN - now)
+
+
 def _scope_attempt_payload(state, *, plan_signature: str | None = None) -> dict[str, Any]:
     # Отчёт — доказательство о КОНТРАКТЕ, поэтому наружу идёт контрактная
     # подпись рана; журнальная подпись, под которой состояние лежит в манифесте,
@@ -664,7 +786,11 @@ def _build_native_service(args, run_id: str):
         repository=repository,
         # ``refresh`` reuses DAILY service semantics (current-season focus,
         # 1-year transfer window).  See NATIVE_MODES.
-        mode=RunMode("daily" if args.mode == "refresh" else args.mode),
+        mode=RunMode(
+            "daily"
+            if args.mode in {"refresh", PLAYER_COLLECTOR_MODE}
+            else args.mode
+        ),
         budget=budget,
         run_id=run_id,
         max_workers=args.workers,
@@ -691,6 +817,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         MANDATORY_COMPETITION_IDS,
         RunMode,
         ScopeLane,
+        catalog_scope_obligation,
         deterministic_plan_signature,
         plan_seasons,
     )
@@ -770,6 +897,94 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         return (0 if report.ok else 1), payload
 
     source_refresh = getattr(args, "source_refresh_contract", None)
+    if args.mode == PLAYER_COLLECTOR_MODE:
+        raw_player_ids = service.repository.missing_current_squad_player_ids(
+            args.player_limit
+        )
+        player_ids = list(normalize_player_collector_ids(raw_player_ids))
+        if player_ids != raw_player_ids or len(player_ids) > args.player_limit:
+            raise RuntimeError("player collector repository selection is not canonical")
+        player_operation = service.sync_player_snapshots(
+            player_ids,
+            # A manifest success without its typed snapshot is exactly the gap
+            # this collector repairs. The anti-join prevents refreshing any
+            # identity that already has a card row.
+            force_refresh=True,
+            repair_missing_snapshot=True,
+            capture_terminal_outcomes=True,
+        )
+        operations.append(player_operation)
+        raw_outcomes = player_operation.metadata.get("terminal_outcomes")
+        valid_outcomes = (
+            isinstance(raw_outcomes, list)
+            and len(raw_outcomes) == len(player_ids)
+            and all(
+                isinstance(item, Mapping)
+                and set(item) == {"player_id", "status"}
+                and type(item.get("player_id")) is int
+                and item.get("status") in {"success", "not_available"}
+                for item in raw_outcomes
+            )
+        )
+        target_outcomes = list(raw_outcomes) if valid_outcomes else []
+        outcome_ids = (
+            [int(item["player_id"]) for item in target_outcomes]
+            if valid_outcomes
+            else []
+        )
+        contract_operation = OperationResult(
+            "player_collector_contract",
+            attempted=len(player_ids),
+            metadata={
+                "profile": PLAYER_COLLECTOR_PROFILE,
+                "player_ids_sha256": player_collector_ids_sha256(player_ids),
+                "target_outcomes": target_outcomes,
+            },
+        )
+        unavailable = sum(
+            item["status"] == "not_available" for item in target_outcomes
+        )
+        if (
+            not valid_outcomes
+            or outcome_ids != player_ids
+            or player_operation.attempted != len(player_ids)
+            or player_operation.succeeded + player_operation.not_available
+            != len(player_ids)
+            or player_operation.not_available != unavailable
+            or player_operation.skipped != 0
+            or player_operation.metadata.get("typed_snapshot_writes")
+            != player_operation.succeeded
+        ):
+            contract_operation.errors.append(
+                "player collector did not produce one terminal outcome per target"
+            )
+        else:
+            contract_operation.succeeded = len(player_ids)
+            contract_operation.counts["terminal_targets"] = len(player_ids)
+        operations.append(contract_operation)
+        rc, payload = finish()
+        payload["selection"] = {
+            "profile": PLAYER_COLLECTOR_PROFILE,
+            "entities": list(PLAYER_COLLECTOR_ENTITIES),
+            "explicit_scopes": [],
+            "competition_limit": 0,
+            "season_limit": 0,
+            "planned_scopes": [],
+            "completed_scopes": [],
+            "completed_transfer_competition_ids": [],
+            "requests_per_minute": args.requests_per_minute,
+            "scope_plan_signature": player_collector_plan_signature(player_ids),
+            "player_collector": {
+                "profile": PLAYER_COLLECTOR_PROFILE,
+                "player_ids": player_ids,
+                "player_count": len(player_ids),
+                "player_ids_sha256": player_collector_ids_sha256(player_ids),
+                "player_limit": args.player_limit,
+            },
+            "target_outcomes": target_outcomes,
+        }
+        return rc, payload
+
     if isinstance(source_refresh, Mapping):
         player_operation = service.sync_player_snapshots(
             source_refresh["player_ids"],
@@ -1129,10 +1344,10 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         else ScopeLane.CURRENT
     )
     if automatic_catalog:
-        contract_items = (
-            []
+        contract_scopes = (
+            ()
             if mode == RunMode.DISCOVER
-            else plan_seasons(
+            else catalog_scope_obligation(
                 classifications,
                 seasons,
                 mode=mode,
@@ -1165,7 +1380,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     for item in classifications
                     if item.decision.value == "included"
                 ],
-                scopes=[item.identity for item in contract_items],
+                scopes=contract_scopes,
             )
         if scope_validation.errors and scope_validation not in operations:
             operations.append(scope_validation)
@@ -1564,7 +1779,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                     outcome="success",
                     reason="scope completion committed",
                     next_retry_at=(
-                        observed_at + timedelta(hours=48)
+                        observed_at
+                        + _schedule_cooldown(bundle.matches, observed_at)
                         if automatic_lane == ScopeLane.CURRENT
                         else None
                     ),
@@ -2310,6 +2526,57 @@ def _validate_args(
         args.competition_scope_sha256,
         args.competition_ids_sha256,
     )
+    if args.mode == PLAYER_COLLECTOR_MODE:
+        literal_entities = tuple(
+            sorted(
+                {
+                    item.strip().casefold()
+                    for item in str(args.entities or "").split(",")
+                    if item.strip()
+                }
+            )
+        )
+        violations = []
+        if automatic_catalog:
+            violations.append("catalog contract must be empty")
+        if source_refresh is not None:
+            violations.append("source refresh must be empty")
+        if any(daily_contract_fields):
+            violations.append("daily contract fields must be empty")
+        if _parse_scopes(args.scope):
+            violations.append("exact season scope must be empty")
+        if literal_entities != PLAYER_COLLECTOR_ENTITIES:
+            violations.append("entities must be exactly players")
+        if any(
+            value != 0
+            for value in (
+                args.competition_limit,
+                args.season_limit,
+                args.match_limit,
+                args.team_limit,
+            )
+        ):
+            violations.append("non-player planner limits must be zero")
+        if args.player_limit != PLAYER_COLLECTOR_PLAYER_LIMIT:
+            violations.append("player limit")
+        if args.max_requests != PLAYER_COLLECTOR_MAX_REQUESTS:
+            violations.append("request budget")
+        if args.max_direct_mib != PLAYER_COLLECTOR_MAX_DIRECT_MIB:
+            violations.append("direct-byte budget")
+        if args.requests_per_minute != PLAYER_COLLECTOR_REQUESTS_PER_MINUTE:
+            violations.append("request rate")
+        if args.max_attempts != 4:
+            violations.append("max attempts")
+        if args.workers != 4:
+            violations.append("workers")
+        if args.next_build_id:
+            violations.append("Next build override must be empty")
+        if args.deadline:
+            violations.append("deadline must be empty")
+        if violations:
+            parser.error(
+                "invalid FotMob player collector: " + ", ".join(violations)
+            )
     if automatic_catalog:
         violations = []
         if any(daily_contract_fields):

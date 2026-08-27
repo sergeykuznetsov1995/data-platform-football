@@ -112,6 +112,7 @@ def test_writer_fence_covers_automatic_owner_and_all_manual_legacy_owners():
         "dag_trigger_fotmob_daily",
         "dag_refresh_fotmob",
         "dag_backfill_fotmob",
+        "dag_collect_fotmob_players",
     }
     assert set(mod.DAGS).issubset(mod.runtime_binding.SHARED_STATE_DAGS)
 

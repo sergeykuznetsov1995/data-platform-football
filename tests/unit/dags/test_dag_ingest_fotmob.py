@@ -230,6 +230,98 @@ def _source_refresh_report(mod):
     }
 
 
+def _player_collector_report(mod):
+    player_ids = [21, 40]
+    outcomes = [
+        {"player_id": 21, "status": "success"},
+        {"player_id": 40, "status": "not_available"},
+    ]
+    player_ids_sha256 = mod.player_collector_ids_sha256(player_ids)
+    return {
+        "run_id": "player-collector-run",
+        "mode": mod.PLAYER_COLLECTOR_MODE,
+        "status": "success",
+        "complete": True,
+        "operations": [
+            {
+                "entity": "player_snapshots",
+                "status": "success",
+                "attempted": 2,
+                "succeeded": 1,
+                "skipped": 0,
+                "not_available": 1,
+                "errors": [],
+                "retryable": [],
+                "terminal": [],
+                "metadata": {"typed_snapshot_writes": 1},
+            },
+            {
+                "entity": "player_collector_contract",
+                "status": "success",
+                "attempted": 2,
+                "succeeded": 2,
+                "skipped": 0,
+                "not_available": 0,
+                "errors": [],
+                "retryable": [],
+                "terminal": [],
+                "counts": {"terminal_targets": 2},
+                "metadata": {
+                    "profile": mod.PLAYER_COLLECTOR_PROFILE,
+                    "player_ids_sha256": player_ids_sha256,
+                    "target_outcomes": outcomes,
+                },
+            },
+            {
+                "entity": "commit_flush",
+                "status": "success",
+                "errors": [],
+                "retryable": [],
+                "terminal": [],
+            },
+            {
+                "entity": "current_views",
+                "status": "success",
+                "errors": [],
+                "retryable": [],
+                "terminal": [],
+            },
+        ],
+        "transport": {"attempts": 3, "direct_bytes": 2048, "proxy_bytes": 0},
+        "budget": {
+            "requests": 3,
+            "max_requests": mod.PLAYER_COLLECTOR_MAX_REQUESTS,
+            "direct_bytes": 2048,
+            "max_direct_bytes": mod.PLAYER_COLLECTOR_MAX_DIRECT_MIB * 1024 * 1024,
+            "proxy_bytes": 0,
+            "max_proxy_bytes": 0,
+        },
+        "errors": [],
+        "rows": {"fotmob_player_snapshots": 1},
+        "tables": ["iceberg.bronze.fotmob_player_snapshots"],
+        "selection": {
+            "profile": mod.PLAYER_COLLECTOR_PROFILE,
+            "entities": ["players"],
+            "explicit_scopes": [],
+            "competition_limit": 0,
+            "season_limit": 0,
+            "scope_plan_signature": mod.player_collector_plan_signature(player_ids),
+            "planned_scopes": [],
+            "completed_scopes": [],
+            "completed_transfer_competition_ids": [],
+            "requests_per_minute": mod.PLAYER_COLLECTOR_REQUESTS_PER_MINUTE,
+            "player_collector": {
+                "profile": mod.PLAYER_COLLECTOR_PROFILE,
+                "player_ids": player_ids,
+                "player_count": 2,
+                "player_ids_sha256": player_ids_sha256,
+                "player_limit": mod.PLAYER_COLLECTOR_PLAYER_LIMIT,
+            },
+            "target_outcomes": outcomes,
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -311,6 +403,7 @@ class TestFotmobNativeParams:
         assert params["source_refresh_profile"].default == ""
         assert params["source_refresh_targets_sha256"].default == ""
         assert params["source_refresh_target_count"].default == 0
+        assert "players" in params["mode"]._kw["enum"]
         assert "season" not in params
 
     @pytest.mark.unit
@@ -665,6 +758,116 @@ class TestNativeValidation:
         assert summary["selection"]["profile"] == (mod.PLAYER_SOURCE_REFRESH_PROFILE)
         assert len(summary["selection"]["target_outcomes"]) == 7
         assert summary["selection"]["explicit_scope_count"] == 0
+
+    @pytest.mark.unit
+    def test_player_collector_accepts_exact_missing_identity_evidence(
+        self, tmp_path
+    ):
+        import json
+
+        mod = _reload_dag_module()
+        report = tmp_path / "player-collector.json"
+        report.write_text(json.dumps(_player_collector_report(mod)), encoding="utf-8")
+
+        summary = mod.validate_data(str(report))
+
+        assert summary["mode"] == mod.PLAYER_COLLECTOR_MODE
+        assert summary["selection"]["profile"] == mod.PLAYER_COLLECTOR_PROFILE
+        assert summary["selection"]["player_collector"]["player_ids"] == [21, 40]
+        assert summary["selection"]["explicit_scope_count"] == 0
+        assert summary["bronze_inputs_changed"] == [
+            "iceberg.bronze.fotmob_player_snapshots"
+        ]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("mutation", "message"),
+        [
+            (
+                lambda payload: payload["selection"].__setitem__(
+                    "profile", "unreviewed-profile"
+                ),
+                "collector profile mismatch",
+            ),
+            (
+                lambda payload: payload["selection"]["player_collector"].__setitem__(
+                    "player_ids", [40, 21]
+                ),
+                "player IDs are not canonical",
+            ),
+            (
+                lambda payload: payload["selection"]["player_collector"].__setitem__(
+                    "player_count", 3
+                ),
+                "player count mismatch",
+            ),
+            (
+                lambda payload: payload["selection"]["player_collector"].__setitem__(
+                    "player_ids_sha256", "0" * 64
+                ),
+                "player ID digest mismatch",
+            ),
+            (
+                lambda payload: payload["selection"].__setitem__(
+                    "scope_plan_signature", "fmplan1-" + "0" * 64
+                ),
+                "plan signature mismatch",
+            ),
+            (
+                lambda payload: payload["budget"].__setitem__(
+                    "max_requests", payload["budget"]["max_requests"] + 1
+                ),
+                "transport budget mismatch",
+            ),
+            (
+                lambda payload: payload["selection"].__setitem__(
+                    "planned_scopes", ["47=2026/2027"]
+                ),
+                "planner surface is not empty",
+            ),
+            (
+                lambda payload: payload["operations"][0].__setitem__("skipped", 1),
+                "terminal player outcomes mismatch",
+            ),
+            (
+                lambda payload: payload["operations"][0]["metadata"].__setitem__(
+                    "typed_snapshot_writes", 0
+                ),
+                "typed player write evidence mismatch",
+            ),
+            (
+                lambda payload: payload.__setitem__("tables", []),
+                "typed player table evidence missing",
+            ),
+            (
+                lambda payload: payload["operations"].append(
+                    {
+                        "entity": "competition_catalog",
+                        "status": "success",
+                        "errors": [],
+                        "retryable": [],
+                        "terminal": [],
+                    }
+                ),
+                "performed work outside players",
+            ),
+        ],
+    )
+    def test_player_collector_rejects_widened_or_drifted_evidence(
+        self, tmp_path, mutation, message
+    ):
+        import json
+
+        from airflow.exceptions import AirflowException
+
+        mod = _reload_dag_module()
+        payload = _player_collector_report(mod)
+        mutation(payload)
+        report = tmp_path / "player-collector-mutated.json"
+        report.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(AirflowException, match=message):
+            mod.validate_data(str(report))
 
     @pytest.mark.unit
     @pytest.mark.parametrize(

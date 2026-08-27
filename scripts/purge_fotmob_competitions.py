@@ -44,13 +44,17 @@ PURGE_COMPETITION_IDS = (10557, 10558)
 PLAN_TTL = timedelta(hours=1)
 MAX_EVIDENCE_AGE = timedelta(days=30)
 MAX_PROTECTED_REPORT_BYTES = 2 * 1024 * 1024
-WRITER_DAG_IDS = (
+ISOLATED_WRITER_DAG_IDS = (
     "dag_orchestrate_fotmob",
     "dag_trigger_fotmob_daily",
     "dag_refresh_fotmob",
     "dag_backfill_fotmob",
+    "dag_collect_fotmob_players",
     "dag_ingest_fotmob",
     "dag_transform_fotmob_silver",
+)
+WRITER_DAG_IDS = (
+    *ISOLATED_WRITER_DAG_IDS,
     "dag_iceberg_maintenance",
     "dag_iceberg_maintenance_daily",
 )
@@ -64,6 +68,7 @@ SHARED_PAUSE_STATES = {
 }
 SHARED_STATE_DAGS = (
     "dag_backfill_fotmob",
+    "dag_collect_fotmob_players",
     "dag_ingest_fotmob",
     "dag_master_pipeline",
     "dag_orchestrate_fotmob",
@@ -2679,7 +2684,8 @@ class TrinoAirflowRawBackend:
         if not isolated_id or not shared_id:
             raise PurgeRefused("quiescence has no admitted scheduler identities")
         isolated = self._container_proof(
-            isolated_id, self._quiescence_script(WRITER_DAG_IDS[:6], control=True)
+            isolated_id,
+            self._quiescence_script(ISOLATED_WRITER_DAG_IDS, control=True),
         )
         shared = self._container_proof(
             shared_id,

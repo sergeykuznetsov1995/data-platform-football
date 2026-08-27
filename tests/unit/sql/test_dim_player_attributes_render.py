@@ -98,6 +98,21 @@ class TestDimPlayerAttributesSql:
                 f"dim_player_attributes.sql must project `{col}`"
             )
 
+    def test_fotmob_contract_block_carries_card_observation_time(self):
+        """Frozen FotMob contract/value fields must expose their as-of time."""
+        sql = _strip_comments(_read_sql())
+        assert re.search(
+            r"MAX_BY\s*\(\s*card_observed_at\s*,\s*season\s*\)\s+"
+            r"AS\s+card_observed_at",
+            sql,
+            re.IGNORECASE,
+        )
+        assert re.search(
+            r"fm\.card_observed_at\s+AS\s+card_observed_at_fotmob",
+            sql,
+            re.IGNORECASE,
+        )
+
     def test_player_name_uses_coalesce_only_for_label(self):
         """Единственное место где допустим COALESCE между источниками — это
         display label (player_name). Атрибуты — нет."""

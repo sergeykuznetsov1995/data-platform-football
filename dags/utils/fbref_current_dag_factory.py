@@ -9,7 +9,11 @@ from airflow.models.param import Param
 from airflow.operators.python import BranchPythonOperator, PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
-from scrapers.fbref.settings import DEFAULT_DOMAIN_INTERVAL_SECONDS
+from scrapers.fbref.settings import (
+    DEFAULT_DOMAIN_INTERVAL_SECONDS,
+    DEFAULT_REQUEST_RESERVATION_BYTES,
+    MIB,
+)
 
 from utils.default_args import DEFAULT_ARGS
 from utils.fbref_pipeline_tasks import (
@@ -56,8 +60,16 @@ PAGE_KINDS = (
 )
 
 # One unforked process advances bounded raw-first batches while retaining the
-# same clearance and proxy quarantine for the run.
-CURRENT_MAX_BATCHES = 80
+# same clearance and proxy quarantine for the run.  The observed full 25-page
+# cadence is about 20m21s; 16 waves leave about 39 minutes before the
+# six-hour-five-minute task timeout.  The current-only deferred reconciliation
+# can improve throughput, but its exact speedup requires a live canary.
+CURRENT_MAX_BATCHES = 16
+# Deployment marker for the reviewed cap-16 policy.  The speed release was
+# merged before it was installed, so the combined Bronze delivery must carry
+# this factory as an explicit first-parent modification instead of silently
+# leaving production on the old cap-80 bytes.
+CURRENT_MAX_BATCHES_POLICY = "fbref-current-max-batches-16-v1"
 CURRENT_REQUEST_LIMIT = FBREF_PRODUCTION_REQUEST_LIMIT
 CURRENT_BYTE_LIMIT_MB = FBREF_PRODUCTION_BYTE_LIMIT_MB
 DEFAULT_SHARD_SIZE = FBREF_MAX_WARM_SESSION_TARGETS
@@ -180,7 +192,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
             "request_limit": request_limit,
             "byte_limit_mb": byte_limit_mb,
             "shard_size": shard_size,
-            "reservation_mb": 3,
+            "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
             "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
         }
         if bootstrap_only:
@@ -240,7 +252,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
                 "request_limit": request_limit,
                 "byte_limit_mb": byte_limit_mb,
                 "shard_size": shard_size,
-                "reservation_mb": 3,
+                "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
             },
             trigger_rule="all_success",
         )
@@ -257,7 +269,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
                 "request_limit": request_limit,
                 "byte_limit_mb": byte_limit_mb,
                 "shard_size": shard_size,
-                "reservation_mb": 3,
+                "reservation_mb": DEFAULT_REQUEST_RESERVATION_BYTES // MIB,
                 "domain_interval_seconds": DEFAULT_DOMAIN_INTERVAL_SECONDS,
                 "max_batches": CURRENT_MAX_BATCHES,
             },
@@ -412,6 +424,7 @@ def build_fbref_current_dag(*, bootstrap_only: bool) -> DAG:
 __all__ = [
     "BOOTSTRAP_DAG_ID",
     "CURRENT_MAX_BATCHES",
+    "CURRENT_MAX_BATCHES_POLICY",
     "INGEST_DAG_ID",
     "PAGE_KINDS",
     "build_fbref_current_dag",

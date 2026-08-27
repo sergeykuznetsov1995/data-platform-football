@@ -17,11 +17,18 @@ DEFAULT_SHARD_SIZE = 8
 # exits, so the browser cap and the control reservation must scale together.
 DEFAULT_BROWSER_BYTE_LIMIT_BYTES = 4 * MIB
 DEFAULT_HTTP_BODY_LIMIT_BYTES = 2 * MIB
+# The 2026-08-25 terminal evidence proved four healthy HTTP-200 season-stat
+# responses exceeded 4 MiB.  Keep the expansion page-kind-specific and bounded
+# to one doubling; every other FBref page retains the 2 MiB ceiling.
+DEFAULT_SEASON_STATS_HTTP_BODY_LIMIT_BYTES = 8 * MIB
 DEFAULT_HTTP_WIRE_OVERHEAD_RESERVATION_BYTES = MIB
 # Compatibility name used by DAG parameters and older callers.  It now means
 # one warm target reservation only; bootstrap traffic has its own reservation.
 DEFAULT_REQUEST_RESERVATION_BYTES = (
-    DEFAULT_HTTP_BODY_LIMIT_BYTES
+    max(
+        DEFAULT_HTTP_BODY_LIMIT_BYTES,
+        DEFAULT_SEASON_STATS_HTTP_BODY_LIMIT_BYTES,
+    )
     + DEFAULT_HTTP_WIRE_OVERHEAD_RESERVATION_BYTES
 )
 # Sports Reference publishes a hard FBref limit of ten page requests per
@@ -110,6 +117,7 @@ __all__ = [
     "FBREF_PERSISTENT_HTTP_SESSION",
     "DEFAULT_DOMAIN_INTERVAL_SECONDS",
     "DEFAULT_HTTP_BODY_LIMIT_BYTES",
+    "DEFAULT_SEASON_STATS_HTTP_BODY_LIMIT_BYTES",
     "DEFAULT_HTTP_WIRE_OVERHEAD_RESERVATION_BYTES",
     "DEFAULT_REQUEST_LIMIT",
     "DEFAULT_REQUEST_RESERVATION_BYTES",

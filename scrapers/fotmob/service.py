@@ -198,34 +198,66 @@ _PROFILE_BACKOFF = (
     timedelta(hours=24),
 )
 _PROFILE_REVIEW_INTERVAL = timedelta(days=30)
-# Порог свежести таблиц лидеров (#1146). Замер 15–18.08: ни один из 398 повторов
-# в пределах 48 часов не изменил content_hash, а на интервалах длиннее 48 часов
-# содержимое менялось у половины целей — 24 часа берём с запасом вдвое.
-LEADERBOARD_REFRESH_AFTER = timedelta(hours=24)
-# Порог свежести карточки игрока (A2, решение владельца 18.08: «обновлять реже»).
+# Порог свежести таблиц лидеров (A6/#1198). Исходно (#1146) стоял 24 часа: замер
+# 15–18.08 показал, что в пределах 48 часов content_hash не менялся ни у одного из
+# 398 повторов, и 24 часа взяли с запасом вдвое.
 #
-# Замер 15–19.08 по манифесту: из 39 782 обращений к карточкам первичных всего
-# 1887 (4,7 %), остальные 37 895 (95,3 %) — повторное обновление уже собранной
-# карточки. Игроки при этом съедают 63,5 % бюджета волны, то есть порог режет
-# ровно ту часть, которая бюджет и ест.
+# Почему 24 часа оказались декоративными (урок 74): период полосы контура тоже
+# 24 часа, поэтому порог, равный периоду, не отсекает почти ничего. Замер 20.08
+# по манифесту за 7 суток это подтверждает: leaderboard — самая крупная статья
+# бюджета (28,2 % физических сетевых вызовов, 25 368 обращений), из них 47,0 %
+# возвращают 304, а медиана фактического цикла повтора — 57,7 часа. То есть порог
+# 24 часа стоит вдвое ниже того интервала, с которым цель реально ходит.
 #
-# Почему 14 суток, а не больше: возраст повторов сейчас распределён так —
-# 7–14 суток 2729, 14–21 суток 139, старше 21 суток 62. Поток обновлений
-# целиком лежит в интервале 7–14, поэтому порог 14 забирает практически всю
-# экономию; следующая неделя ожидания добавила бы к ней единицы процентов, а
-# карточка успела бы устареть заметно сильнее (среди повторов возрастом
-# 14–21 суток значимые поля менялись у трети). Число обратимо: распределение
-# сдвинется вслед за самим порогом, поэтому перемерить через две недели.
+# Почему 72, а не 120: 72 часа впервые перекрывают реальную медиану 57,7 ч и
+# начинают отсекать повторы, оставаясь в пределах наблюдаемого поведения. Для 120
+# часов данных нет — замер #1146 фиксирует неизменность только до 48 часов, а
+# дальше содержимое у части целей уже менялось; пять суток задержки увеличили бы
+# устарелость без основания.
 #
-# Что теряем, измерено по снимкам (сравнение полей, а не сырья: content_hash у
-# игроков меняется в 100 % повторов и как индикатор бесполезен). За 3–7 суток
-# словарная часть карточки — имя, дата рождения, пол, рост/вес/нога/гражданство —
-# меняется у 7,4 % повторов, клуб и контракт у 3,8 %, рыночная стоимость у 5,0 %.
-# Часто меняются матчи и статистика, но там FotMob не единственный источник.
+# Экономию НЕ выводить из доли 28,2 %: распределение возрастов внутри интервала
+# 57–72 ч неизвестно, а 304 не тождественен «ничего не изменилось» у каждого
+# ответа 200. Перемерить по закрытой волне после доставки.
+LEADERBOARD_REFRESH_AFTER = timedelta(hours=72)
+# Порог свежести карточки команды (A6/#1198). Раньше стоял безымянным литералом
+# timedelta(hours=20) прямо в сигнатуре sync_team_snapshots — то есть был короче
+# периода полосы (24 ч) и по уроку 74 почти ничего не отсекал.
 #
-# Первичный сбор порог не трогает вовсе: у игрока без записи в манифесте
-# previous is None, и он собирается немедленно — словарь пополняется как прежде.
-PLAYER_REFRESH_AFTER = timedelta(days=14)
+# Замер 20.08 по снимкам за 14 суток, что мы теряем при удлинении порога:
+#
+#   интервал      повторов   изменился паспорт   изменился состав
+#   < 24 ч          3054       33 (1,1 %)          442 (18,0 %)
+#   24–48 ч         6661        9 (0,14 %)         936 (19,5 %)
+#   48–72 ч         4790        9 (0,19 %)         566 (22,9 %)
+#   > 72 ч          1852       13 (0,7 %)          387 (38,7 %)
+#
+# Паспорт (название, страна, стадион, вместимость) не меняется практически
+# никогда, поэтому за него порог не платит. Платит он составом: тот меняется у
+# 19,5 % команд на интервале 24–48 ч, а состав — единственный источник НОВЫХ
+# игроков (см. ниже current_squad_player_ids). Цена 48 часов — узнать о переходе
+# позже на срок до двух суток; данные при этом не теряются, только отстают.
+#
+# Почему это приемлемо: команда — 26,7 % физических сетевых обращений платформы,
+# вторая статья бюджета после таблиц лидеров, а на сами матчи уходит 2,8 %.
+# Освобождённые слоты уходят матчам, ради чего порог и поднимается.
+#
+# ⚠️ Замер сделан в августе, при ОТКРЫТОМ трансферном окне — это верхняя оценка
+# изменчивости состава, а не годовая норма. Перемерить в сентябре.
+#
+# Важно: пропуск свежей команды НЕ останавливает поиск игроков — в ветке пропуска
+# состав берётся из БД (current_squad_player_ids), поэтому уже известные игроки
+# продолжают попадать в план как прежде.
+TEAM_REFRESH_AFTER = timedelta(hours=48)
+# Политика карточки игрока (#1196, решение владельца 20.08): один сетевой сбор
+# на подтверждённую identity, без регулярных обновлений. Карточка нужна прежде
+# всего ради паспортного поля foot; состав уже несёт рост и дату рождения, а
+# каноническую историю рыночной стоимости ведёт Transfermarkt.
+#
+# Это не «бесконечный timedelta»: None включает явный предикат присутствия.
+# Новый игрок собирается сразу; stale replay, REPLAY и force_refresh остаются
+# штатными обходами. Возраст и покрытие карточек контролирует Silver DQ.
+PLAYER_CARD_POLICY = "once_per_identity"
+PLAYER_REFRESH_AFTER: Optional[timedelta] = None
 
 
 def profile_probe_delay(
@@ -695,6 +727,7 @@ class FotMobIngestService:
         error: Optional[str] = None,
         observation_id: Optional[str] = None,
         retry_after: Optional[datetime] = None,
+        force_dataset_write: bool = False,
     ) -> list[str]:
         manifest_status = status or _fetch_manifest_status(fetch)
         commit = TargetCommit(
@@ -750,7 +783,11 @@ class FotMobIngestService:
             }
         ):
             previous = self.repository.latest_success(fetch.target_key)
-            if previous and previous.get("batch_id") == commit.batch_id:
+            if (
+                not force_dataset_write
+                and previous
+                and previous.get("batch_id") == commit.batch_id
+            ):
                 datasets_to_write = ()
         return self.repository.commit(commit, datasets_to_write)
 
@@ -2647,7 +2684,7 @@ class FotMobIngestService:
         self,
         bundle: SeasonBundle,
         *,
-        refresh_after: timedelta = timedelta(hours=20),
+        refresh_after: timedelta = TEAM_REFRESH_AFTER,
         limit: Optional[int] = None,
         allow_advertised_absence: bool = False,
     ) -> tuple[OperationResult, set[int]]:
@@ -2905,9 +2942,10 @@ class FotMobIngestService:
         player_ids: Iterable[int],
         *,
         build_id: Optional[str] = None,
-        refresh_after: timedelta = PLAYER_REFRESH_AFTER,
+        refresh_after: Optional[timedelta] = PLAYER_REFRESH_AFTER,
         limit: Optional[int] = None,
         force_refresh: bool = False,
+        repair_missing_snapshot: bool = False,
         capture_terminal_outcomes: bool = False,
     ) -> OperationResult:
         """Refresh global player snapshots without season mislabelling.
@@ -2922,10 +2960,15 @@ class FotMobIngestService:
         result = OperationResult(
             "player_snapshots",
             attempted=len(ids),
-            metadata={"snapshot_semantics": "global_observed_at_not_historical"},
+            metadata={
+                "snapshot_semantics": "global_observed_at_not_historical",
+                "player_policy": PLAYER_CARD_POLICY,
+            },
         )
         terminal_outcomes: dict[str, str] = {}
         missing_raw_player_ids: set[int] = set()
+        if repair_missing_snapshot:
+            result.metadata["typed_snapshot_writes"] = 0
 
         def attach_terminal_outcomes() -> None:
             if capture_terminal_outcomes or self.mode == RunMode.REPLAY:
@@ -2938,13 +2981,17 @@ class FotMobIngestService:
 
         now = utc_now()
         due: list[int] = []
+        first_collection_due = 0
         for player_id in ids:
             previous = self.repository.latest_entity_success("player", player_id)
             fetched_at = _validated_at(previous)
+            confirmed = previous is not None and fetched_at is not None
+            within_policy = (
+                refresh_after is None or now - fetched_at < refresh_after
+            ) if fetched_at is not None else False
             if (
-                previous is not None
-                and fetched_at is not None
-                and now - fetched_at < refresh_after
+                confirmed
+                and within_policy
                 and self.mode != RunMode.REPLAY
                 and not force_refresh
             ):
@@ -2952,6 +2999,8 @@ class FotMobIngestService:
                 terminal_outcomes[str(player_id)] = "skipped"
             else:
                 due.append(player_id)
+                if previous is None:
+                    first_collection_due += 1
         due_before_limit = len(due)
         deferred: list[int] = []
         if limit is not None:
@@ -2960,6 +3009,8 @@ class FotMobIngestService:
             due = due[:requested_limit]
         result.metadata["due_before_limit"] = due_before_limit
         result.metadata["deferred_by_limit"] = due_before_limit - len(due)
+        result.metadata["first_collection_due"] = first_collection_due
+        result.metadata["skipped_by_policy"] = result.skipped
         for player_id in deferred:
             terminal_outcomes[str(player_id)] = "deferred"
         if not due:
@@ -3090,10 +3141,19 @@ class FotMobIngestService:
                         "has_career_history": bool(row.get("career_history_json")),
                     },
                     unknown_paths=unknown,
+                    # The missing-player collector selects identities by a
+                    # typed-table anti-join. A byte-identical successful
+                    # manifest is therefore evidence of the gap, not proof
+                    # that this dataset may be suppressed.
+                    force_dataset_write=repair_missing_snapshot,
                 )
                 result.tables.extend(paths)
                 result.succeeded += 1
                 result.counts["players"] = result.counts.get("players", 0) + 1
+                if repair_missing_snapshot:
+                    result.metadata["typed_snapshot_writes"] = int(
+                        result.metadata["typed_snapshot_writes"]
+                    ) + 1
                 terminal_outcomes[str(key)] = ManifestStatus.SUCCESS.value
             except Exception as exc:
                 result.errors.append(f"player {key} parse: {type(exc).__name__}: {exc}")

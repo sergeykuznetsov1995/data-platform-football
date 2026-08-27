@@ -47,6 +47,7 @@ PAUSED_DAGS = {
     "dag_trigger_fotmob_daily",
     "dag_refresh_fotmob",
     "dag_backfill_fotmob",
+    "dag_collect_fotmob_players",
 }
 # Dynamic catalog rows and structural-decision evidence are rollback inputs,
 # never cleanup targets. Keep their current views protected as well.

@@ -25,6 +25,14 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
 from scrapers.fotmob.scope_codec import parse_scope_token, validate_scope_tokens
+from scrapers.fotmob.player_collector import (
+    PLAYER_COLLECTOR_ENTITIES,
+    PLAYER_COLLECTOR_MAX_DIRECT_MIB,
+    PLAYER_COLLECTOR_MAX_REQUESTS,
+    PLAYER_COLLECTOR_MODE,
+    PLAYER_COLLECTOR_PLAYER_LIMIT,
+    PLAYER_COLLECTOR_REQUESTS_PER_MINUTE,
+)
 from scrapers.fotmob.source_refresh import (
     PLAYER_SOURCE_REFRESH_ARTIFACT,
     PLAYER_SOURCE_REFRESH_MAX_DIRECT_MIB,
@@ -113,6 +121,7 @@ FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH_ENV = "FOTMOB_SHARED_DEPLOYMENT_REPORT_PATH
 FOTMOB_SHARED_EVIDENCE_ROOT = "/opt/airflow/fotmob-admission"
 FOTMOB_ISOLATED_DAILY_DAG_ID = "dag_trigger_fotmob_daily"
 FOTMOB_AUTOMATIC_OWNER_DAG_ID = "dag_orchestrate_fotmob"
+FOTMOB_PLAYER_COLLECTOR_DAG_ID = "dag_collect_fotmob_players"
 # Every isolated schedule owner allowed to mint a publication generation.
 # ``@continuous`` refresh/backfill DagRuns are ``scheduled`` runs too.
 FOTMOB_ISOLATED_OWNER_DAG_IDS = frozenset(
@@ -164,6 +173,7 @@ FOTMOB_EXPECTED_ISOLATED_DAGS = frozenset(
         FOTMOB_ISOLATED_DAILY_DAG_ID,
         "dag_refresh_fotmob",
         "dag_backfill_fotmob",
+        FOTMOB_PLAYER_COLLECTOR_DAG_ID,
     }
 )
 FOTMOB_ISOLATED_RUNTIME_ROOTS = {
@@ -196,6 +206,7 @@ FOTMOB_ISOLATED_REQUIRED_RUNTIME_PATHS = frozenset(
         "dags/dag_orchestrate_fotmob.py",
         "dags/dag_refresh_fotmob.py",
         "dags/dag_backfill_fotmob.py",
+        "dags/dag_collect_fotmob_players.py",
         "dags/dag_transform_fotmob_silver.py",
         "dags/dag_trigger_fotmob_daily.py",
         "dags/scripts/run_fotmob_scraper.py",
@@ -206,6 +217,7 @@ FOTMOB_ISOLATED_REQUIRED_RUNTIME_PATHS = frozenset(
         "scrapers/fotmob/domain.py",
         "scrapers/fotmob/repository.py",
         "scrapers/fotmob/service.py",
+        "scrapers/fotmob/player_collector.py",
         "scrapers/fotmob/scope_codec.py",
         "scrapers/fotmob/source_refresh.py",
     }
@@ -220,6 +232,7 @@ FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS = frozenset(
         "dags/dag_orchestrate_fotmob.py",
         "dags/dag_refresh_fotmob.py",
         "dags/dag_backfill_fotmob.py",
+        "dags/dag_collect_fotmob_players.py",
         "dags/dag_master_pipeline.py",
         "dags/dag_sofascore_pipeline.py",
         "dags/dag_trigger_fotmob_daily.py",
@@ -249,6 +262,7 @@ FOTMOB_SHARED_REQUIRED_RUNTIME_PATHS = frozenset(
         "scrapers/fotmob/raw_store.py",
         "scrapers/fotmob/repository.py",
         "scrapers/fotmob/service.py",
+        "scrapers/fotmob/player_collector.py",
         "scrapers/fotmob/scope_codec.py",
         "scrapers/fotmob/source_refresh.py",
         "scrapers/fotmob/transport.py",
@@ -531,11 +545,13 @@ def _active_owner_writer_authorization(
     def state(value: Any) -> str:
         return str(getattr(value, "value", value) or "").casefold()
 
-    def xcom_value(session: Any, run_id: str, task_id: str) -> Any:
+    def xcom_value(
+        session: Any, owner_dag_id: str, run_id: str, task_id: str
+    ) -> Any:
         row = (
             session.query(XCom)
             .filter(
-                XCom.dag_id == FOTMOB_AUTOMATIC_OWNER_DAG_ID,
+                XCom.dag_id == owner_dag_id,
                 XCom.run_id == run_id,
                 XCom.task_id == task_id,
                 XCom.key == "return_value",
@@ -550,7 +566,12 @@ def _active_owner_writer_authorization(
         initializer_rows = (
             session.query(XCom)
             .filter(
-                XCom.dag_id == FOTMOB_AUTOMATIC_OWNER_DAG_ID,
+                XCom.dag_id.in_(
+                    (
+                        FOTMOB_AUTOMATIC_OWNER_DAG_ID,
+                        FOTMOB_PLAYER_COLLECTOR_DAG_ID,
+                    )
+                ),
                 XCom.task_id == "initialize_fotmob_publication",
                 XCom.key == "return_value",
             )
@@ -558,7 +579,7 @@ def _active_owner_writer_authorization(
             .limit(50)
             .all()
         )
-        matches: list[tuple[str, Mapping[str, Any]]] = []
+        matches: list[tuple[str, str, Mapping[str, Any]]] = []
         for row in initializer_rows:
             value = XCom.deserialize_value(row)
             if (
@@ -566,16 +587,21 @@ def _active_owner_writer_authorization(
                 and value.get("generation_id") == generation_id
                 and value.get("binding") == publication.get("binding")
             ):
-                matches.append((str(row.run_id), value))
+                matches.append((str(row.dag_id), str(row.run_id), value))
         if len(matches) != 1:
             raise _airflow_exception(
                 "FotMob writer has no unique scheduled owner authorization"
             )
-        owner_run_id = matches[0][0]
+        owner_dag_id, owner_run_id, _initializer = matches[0]
+        trigger_task_id = (
+            "trigger_fotmob_ingest"
+            if owner_dag_id == FOTMOB_AUTOMATIC_OWNER_DAG_ID
+            else "trigger_fotmob_player_collector"
+        )
         owner = (
             session.query(DagRun)
             .filter(
-                DagRun.dag_id == FOTMOB_AUTOMATIC_OWNER_DAG_ID,
+                DagRun.dag_id == owner_dag_id,
                 DagRun.run_id == owner_run_id,
             )
             .one_or_none()
@@ -583,30 +609,57 @@ def _active_owner_writer_authorization(
         trigger = (
             session.query(TaskInstance)
             .filter(
-                TaskInstance.dag_id == FOTMOB_AUTOMATIC_OWNER_DAG_ID,
+                TaskInstance.dag_id == owner_dag_id,
                 TaskInstance.run_id == owner_run_id,
-                TaskInstance.task_id == "trigger_fotmob_ingest",
+                TaskInstance.task_id == trigger_task_id,
             )
             .one_or_none()
         )
-        decision = xcom_value(session, owner_run_id, "choose_fotmob_lane")
+        decision = (
+            xcom_value(
+                session,
+                owner_dag_id,
+                owner_run_id,
+                "choose_fotmob_lane",
+            )
+            if owner_dag_id == FOTMOB_AUTOMATIC_OWNER_DAG_ID
+            else None
+        )
         conf = decision.get("conf") if isinstance(decision, Mapping) else None
-        lane = str(decision.get("lane") or "") if isinstance(decision, Mapping) else ""
+        lane = (
+            str(decision.get("lane") or "")
+            if isinstance(decision, Mapping)
+            else PLAYER_COLLECTOR_MODE
+        )
+        expected_run_type = (
+            "scheduled"
+            if owner_dag_id == FOTMOB_AUTOMATIC_OWNER_DAG_ID
+            else "manual"
+        )
         if (
             owner is None
-            or state(owner.run_type) != "scheduled"
+            or state(owner.run_type) != expected_run_type
             or state(owner.state) not in {"running", "success"}
             or trigger is None
             or state(trigger.state)
             not in {"running", "success", "deferred", "up_for_reschedule"}
-            or not isinstance(conf, Mapping)
-            or lane not in {"daily", "refresh", "backfill"}
-            or conf.get("mode") != lane
+            or (
+                owner_dag_id == FOTMOB_AUTOMATIC_OWNER_DAG_ID
+                and (
+                    not isinstance(conf, Mapping)
+                    or lane not in {"daily", "refresh", "backfill"}
+                    or conf.get("mode") != lane
+                )
+            )
         ):
             raise _airflow_exception(
                 "FotMob writer owner decision/trigger lineage is incomplete"
             )
-        ingest_run_id = f"fotmob_orchestrated__{generation_id}"
+        ingest_run_id = (
+            f"fotmob_orchestrated__{generation_id}"
+            if owner_dag_id == FOTMOB_AUTOMATIC_OWNER_DAG_ID
+            else f"fotmob_players__{generation_id}"
+        )
         ingest = (
             session.query(DagRun)
             .filter(
@@ -622,6 +675,8 @@ def _active_owner_writer_authorization(
             or ingest.conf.get(FOTMOB_PUBLICATION_CONF_KEY) != publication
         ):
             raise _airflow_exception("FotMob writer ingest lineage is incomplete")
+        if owner_dag_id == FOTMOB_PLAYER_COLLECTOR_DAG_ID:
+            conf = dict(ingest.conf)
         silver_trigger = (
             session.query(TaskInstance)
             .filter(
@@ -632,6 +687,7 @@ def _active_owner_writer_authorization(
             .one_or_none()
         )
         return {
+            "owner_dag_id": owner_dag_id,
             "owner_run_id": owner_run_id,
             "ingest_run_id": ingest_run_id,
             "lane": lane,
@@ -678,6 +734,60 @@ def _validate_active_automatic_writer(
     authorized_conf = authorization.get("conf")
     if not isinstance(authorized_conf, Mapping):
         raise _airflow_exception("FotMob active writer profile is missing")
+    collector_lane = authorization.get("lane") == PLAYER_COLLECTOR_MODE
+
+    def normalized_entities(value: Any) -> list[str]:
+        return sorted(
+            str(item).strip().casefold()
+            for item in (
+                value.split(",") if isinstance(value, str) else value or ()
+            )
+            if str(item).strip()
+        )
+
+    def exact_collector_profile(value: Mapping[str, Any]) -> bool:
+        def exact_int(key: str, expected: int) -> bool:
+            raw = value.get(key)
+            return type(raw) is int and raw == expected
+
+        raw_scopes = value.get("scopes", value.get("scope", ""))
+        scopes = (
+            [item for item in raw_scopes.split(",") if item]
+            if isinstance(raw_scopes, str)
+            else list(raw_scopes or ())
+        )
+        return (
+            not scopes
+            and normalized_entities(value.get("entities"))
+            == list(PLAYER_COLLECTOR_ENTITIES)
+            and str(value.get("mode") or "") == PLAYER_COLLECTOR_MODE
+            and str(value.get("catalog_contract") or "") == ""
+            and exact_int("max_requests", PLAYER_COLLECTOR_MAX_REQUESTS)
+            and exact_int("max_direct_mib", PLAYER_COLLECTOR_MAX_DIRECT_MIB)
+            and exact_int("max_proxy_mib", 0)
+            and all(
+                exact_int(key, expected)
+                for key, expected in (
+                    ("competition_limit", 0),
+                    ("season_limit", 0),
+                    ("match_limit", 0),
+                    ("team_limit", 0),
+                    ("player_limit", PLAYER_COLLECTOR_PLAYER_LIMIT),
+                )
+            )
+            and exact_int(
+                "requests_per_minute", PLAYER_COLLECTOR_REQUESTS_PER_MINUTE
+            )
+            and exact_int("max_attempts", 4)
+            and str(value.get("deadline") or "") == ""
+            and str(value.get("next_build_id") or "") == ""
+            and str(value.get("source_refresh_profile") or "") == ""
+            and str(value.get("source_refresh_targets_sha256") or "") == ""
+            and value.get("source_refresh_target_count") in {None, "", 0, "0"}
+        )
+
+    if collector_lane and not exact_collector_profile(authorized_conf):
+        raise _airflow_exception("FotMob player collector profile differs")
     component = str(identity.get("component") or "")
     dag_id = str(identity.get("dag_id") or "")
     run_id = str(identity.get("run_id") or "")
@@ -704,6 +814,16 @@ def _validate_active_automatic_writer(
         }
     else:
         raise _airflow_exception("FotMob active writer component is not authorized")
+
+    if collector_lane:
+        if not exact_collector_profile(identity):
+            raise _airflow_exception("FotMob player collector profile differs")
+        return {
+            "generation_id": generation_id,
+            "owner_run_id": authorization["owner_run_id"],
+            "ingest_run_id": expected_ingest,
+            "lane": authorization["lane"],
+        }
 
     raw_scopes = identity.get("scopes")
     scopes = (
@@ -768,7 +888,7 @@ def _validate_automatic_kept_paused_writer(
 ) -> dict[str, Any] | None:
     """Admit only the exact manual automatic-daily canary namespace.
 
-    The canary is the sole dynamic writer allowed while all six DAGs remain
+    The canary is the sole dynamic writer allowed while all seven DAGs remain
     paused.  It may temporarily enable only ingest and Silver; the scheduled
     orchestrator and every legacy owner remain paused throughout.
     """
@@ -1328,6 +1448,35 @@ def fotmob_ceremony_configured(
     )
 
 
+def _player_collector_owner_context(context: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind one trigger-only collector run to a stable non-zero interval."""
+
+    dag_run = context.get("dag_run")
+    dag_id = getattr(dag_run, "dag_id", None)
+    run_id = str(getattr(dag_run, "run_id", None) or "").strip()
+    run_type = getattr(dag_run, "run_type", None)
+    normalized_run_type = str(getattr(run_type, "value", run_type) or "").casefold()
+    if (
+        dag_id != FOTMOB_PLAYER_COLLECTOR_DAG_ID
+        or normalized_run_type != "manual"
+        or not run_id
+    ):
+        raise _airflow_exception(
+            "FotMob player collector requires its exact manual owner DagRun"
+        )
+    logical_date = (
+        context.get("logical_date")
+        or getattr(dag_run, "logical_date", None)
+        or getattr(dag_run, "execution_date", None)
+    )
+    canonical = _canonical_instant(logical_date, field="logical_date")
+    start = datetime.fromisoformat(canonical)
+    normalized = dict(context)
+    normalized["data_interval_start"] = start
+    normalized["data_interval_end"] = start + timedelta(microseconds=1)
+    return normalized
+
+
 def attest_fotmob_isolated_runtime(
     *,
     report_path: str | os.PathLike[str] | None = None,
@@ -1336,6 +1485,7 @@ def attest_fotmob_isolated_runtime(
     roots: Mapping[str, str | os.PathLike[str]] | None = None,
     require_scheduled_owner: bool = True,
     allow_kept_paused_writer: bool = False,
+    allow_manual_player_collector: bool = False,
     writer_identity: Mapping[str, Any] | None = None,
     **context: Any,
 ) -> dict[str, Any]:
@@ -1400,6 +1550,7 @@ def attest_fotmob_isolated_runtime(
                 FOTMOB_ISOLATED_DAILY_DAG_ID,
                 "dag_refresh_fotmob",
                 "dag_backfill_fotmob",
+                "dag_collect_fotmob_players",
             }
         )
         and report_unpaused
@@ -1501,7 +1652,18 @@ def attest_fotmob_isolated_runtime(
             if pending_consumer_admission
             else FOTMOB_ISOLATED_OWNER_DAG_IDS
         )
-        if dag_id not in admitted_owner_ids or normalized_run_type != "scheduled":
+        manual_collector = False
+        if allow_manual_player_collector:
+            if not active_admission:
+                raise _airflow_exception(
+                    "FotMob player collector requires active deployment admission"
+                )
+            _player_collector_owner_context(context)
+            manual_collector = True
+        if (
+            not manual_collector
+            and (dag_id not in admitted_owner_ids or normalized_run_type != "scheduled")
+        ):
             raise _airflow_exception(
                 "FotMob daily producer requires an exact scheduled DagRun"
             )
@@ -1558,6 +1720,16 @@ def attest_fotmob_isolated_runtime(
     if automatic_admission is not None:
         result["automatic_catalog_admission"] = automatic_admission
     return result
+
+
+def attest_fotmob_player_collector_runtime(**context: Any) -> dict[str, Any]:
+    """Attest only the exact trigger-only manual player collector owner."""
+
+    normalized = _player_collector_owner_context(context)
+    return attest_fotmob_isolated_runtime(
+        allow_manual_player_collector=True,
+        **normalized,
+    )
 
 
 def attest_fotmob_shared_runtime(
@@ -1621,6 +1793,7 @@ def attest_fotmob_shared_runtime(
             FOTMOB_ISOLATED_DAILY_DAG_ID,
             "dag_refresh_fotmob",
             "dag_backfill_fotmob",
+            "dag_collect_fotmob_players",
         }
         and isinstance(unpaused, list)
         and set(unpaused)
@@ -1642,6 +1815,7 @@ def attest_fotmob_shared_runtime(
             FOTMOB_ISOLATED_DAILY_DAG_ID,
             "dag_refresh_fotmob",
             "dag_backfill_fotmob",
+            "dag_collect_fotmob_players",
         }
         and isinstance(unpaused, list)
         and set(unpaused)
@@ -1931,6 +2105,15 @@ def expected_publication(owner: str, context: Mapping[str, Any]) -> dict[str, An
     return {"generation_id": make_generation_id(binding), "binding": binding}
 
 
+def expected_player_collector_publication(
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the retry-stable publication identity of one manual collector."""
+
+    normalized = _player_collector_owner_context(context)
+    return expected_publication("isolated", normalized)
+
+
 def _control_store():
     from scrapers.fbref.control import ControlStore
 
@@ -1978,13 +2161,19 @@ def _ceremony_disabled_publication(
 
 
 def initialize_fotmob_publication(
-    *, publication_owner: str, **context: Any
+    *,
+    publication_owner: str,
+    allow_manual_player_collector: bool = False,
+    **context: Any,
 ) -> dict[str, Any]:
     """Atomically create/acquire the exact generation before any write."""
 
     normalized_owner = str(publication_owner or "").strip().casefold()
     if normalized_owner == "isolated":
-        attest_fotmob_isolated_runtime(**context)
+        attest_fotmob_isolated_runtime(
+            allow_manual_player_collector=allow_manual_player_collector,
+            **context,
+        )
     elif normalized_owner == "shared":
         attest_fotmob_shared_runtime(**context)
     if not fotmob_ceremony_configured():
@@ -2021,6 +2210,19 @@ def initialize_fotmob_publication(
             value=publication,
         )
     return publication
+
+
+def initialize_fotmob_player_collector_publication(
+    **context: Any,
+) -> dict[str, Any]:
+    """Initialize only the exact manual collector's stable generation."""
+
+    normalized = _player_collector_owner_context(context)
+    return initialize_fotmob_publication(
+        publication_owner="isolated",
+        allow_manual_player_collector=True,
+        **normalized,
+    )
 
 
 def _dag_run_conf(context: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -2371,6 +2573,20 @@ def fail_unsealed_fotmob_publication(
         "FotMob generation did not reach ready; "
         "lock retained because child-writer state is ambiguous"
         f" (success_task={success_state}, writers={writer_states}, state={state})"
+    )
+
+
+def fail_unsealed_fotmob_player_collector_publication(
+    *, success_task_id: str, writer_task_ids: Sequence[str] = (), **context: Any
+) -> dict[str, Any]:
+    """Finalize the same stable generation minted by the manual collector."""
+
+    normalized = _player_collector_owner_context(context)
+    return fail_unsealed_fotmob_publication(
+        publication_owner="isolated",
+        success_task_id=success_task_id,
+        writer_task_ids=writer_task_ids,
+        **normalized,
     )
 
 

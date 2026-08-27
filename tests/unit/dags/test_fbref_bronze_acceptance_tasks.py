@@ -10,6 +10,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from scrapers.fbref.settings import DEFAULT_REQUEST_RESERVATION_BYTES, MIB
+
 from dags.utils import fbref_bronze_acceptance_tasks as acceptance
 
 
@@ -148,8 +150,7 @@ def _history_candidates(competition_id: str, season_id: str) -> list[dict]:
             **row,
             "target_id": f"{competition_id}-{season_id}-{row['target_id']}",
             "canonical_url": (
-                "https://fbref.com/en/"
-                f"{competition_id}/{season_id}/{row['target_id']}"
+                f"https://fbref.com/en/{competition_id}/{season_id}/{row['target_id']}"
             ),
             "competition_id": competition_id,
             "season_id": season_id,
@@ -302,6 +303,8 @@ def test_live_wrapper_has_one_exact_paid_batch(monkeypatch):
     assert kwargs["request_limit"] == 100
     assert kwargs["byte_limit_mb"] == 50
     assert kwargs["shard_size"] == 25
+    assert kwargs["reservation_mb"] == DEFAULT_REQUEST_RESERVATION_BYTES // MIB
+    assert kwargs["reservation_mb"] == 9
     assert kwargs["max_batches"] == 1
 
 

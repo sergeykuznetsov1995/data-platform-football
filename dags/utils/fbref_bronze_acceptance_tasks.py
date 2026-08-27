@@ -18,12 +18,14 @@ from collections.abc import Mapping, Sequence
 from functools import lru_cache
 from typing import Any
 
+from scrapers.fbref.settings import DEFAULT_REQUEST_RESERVATION_BYTES, MIB
+
 logger = logging.getLogger(__name__)
 
 ACCEPTANCE_REQUEST_LIMIT = 100
 ACCEPTANCE_BYTE_LIMIT_MB = 50
 ACCEPTANCE_SHARD_SIZE = 25
-ACCEPTANCE_RESERVATION_MB = 3
+ACCEPTANCE_RESERVATION_MB = DEFAULT_REQUEST_RESERVATION_BYTES // MIB
 ACCEPTANCE_MAX_BATCHES = 1
 ACCEPTANCE_REPLAY_DEFAULT_SCHEMA = "fbref_acceptance_sequential"
 # The DAG itself times out after three hours.  A four-hour lock preserves the

@@ -4,11 +4,13 @@ import hashlib
 import gzip
 import gc
 import json
+import logging
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import get_args, get_type_hints
 
 import pytest
 
@@ -49,12 +51,16 @@ from scrapers.fbref.pipeline import (
     FETCH_LEASE_SECONDS,
     _FrontierSeedCandidate,
     FetchWaveError,
+    LiveRunResult,
     ParseWaveError,
     PipelineError,
     PipelineSettings,
     RunValidationError,
     SENTINEL_COMPETITIONS,
     WaveResult,
+    _is_mass_redirect,
+    _is_run_mass_redirect,
+    _season_with_registry_redirect,
     affordable_clearance_reservation,
     backfill_season_cohort_capacity,
     frontier_target,
@@ -69,8 +75,15 @@ from scrapers.fbref.pipeline import (
     MAX_CONSECUTIVE_CLEARANCE_REFRESHES,
 )
 from scrapers.fbref.discovery import (
+    CalendarType,
+    CompetitionFormat,
+    CompetitionGender,
+    CompetitionRef,
     DISCOVERY_PARSER_VERSION,
     DiscoveredPageLink,
+    MatchRef,
+    ParticipantType,
+    SeasonRef,
 )
 from scrapers.fbref.raw_store import (
     PageTarget,
@@ -81,6 +94,7 @@ from scrapers.fbref.raw_store import (
 )
 from scrapers.fbref.settings import (
     DEFAULT_DOMAIN_INTERVAL_SECONDS,
+    DEFAULT_REQUEST_RESERVATION_BYTES,
     MIN_DOMAIN_INTERVAL_SECONDS,
 )
 from scrapers.fbref.typed_bronze import (
@@ -93,6 +107,22 @@ from scrapers.fbref.typed_bronze import (
 
 
 NOW = datetime(2026, 7, 11, 12, 0, tzinfo=timezone.utc)
+
+
+def test_nine_mib_page_reservation_is_shared_by_every_run_profile():
+    profiles = (
+        PipelineSettings(run_type="current"),
+        PipelineSettings(run_type="backfill"),
+        PipelineSettings(run_type="replay"),
+        PipelineSettings.acceptance(scope="current"),
+        PipelineSettings.acceptance(scope="history"),
+        PipelineSettings.acceptance_replay(),
+    )
+
+    assert DEFAULT_REQUEST_RESERVATION_BYTES == 9 * 1024 * 1024
+    assert {profile.request_reservation_bytes for profile in profiles} == {
+        DEFAULT_REQUEST_RESERVATION_BYTES
+    }
 
 
 def test_persistent_tail_reservation_failure_closes_empty_control_session():
@@ -222,8 +252,8 @@ def test_persistent_rollover_waits_for_retryable_tail_and_control_close():
 @pytest.mark.parametrize(
     ("request_limit", "byte_limit", "expected"),
     [
-        (100, 50 * 1024 * 1024, 15),
-        (200, 100 * 1024 * 1024, 25),
+        (100, 50 * 1024 * 1024, 5),
+        (200, 100 * 1024 * 1024, 9),
     ],
 )
 def test_wave_capacity_matches_live_canary_and_production_admission(
@@ -513,6 +543,7 @@ class FakeControl:
         self.claim_calls = []
         self.observation_claim_calls = []
         self.replay_control_runs = []
+        self.recovery_run_types = []
         self.eligible_competition_calls = 0
         self.run = {
             "run_type": "current",
@@ -769,12 +800,14 @@ class FakeControl:
     def list_unprocessed_fetches(
         self,
         *,
+        run_type,
         parser_version,
         typed_parser_version,
         stateful_parser_version,
         page_kinds,
         limit,
     ):
+        self.recovery_run_types.append(run_type)
         rows = self.list_run_fetches(
             "all-runs",
             page_kinds=page_kinds,
@@ -793,6 +826,7 @@ class FakeControl:
                 **item,
             }
             for item in rows
+            if item.get("source_run_type", self.run["run_type"]) == run_type
             if self.frontier.get(
                 str(item["target_id"]), {}
             ).get("state") != "quarantined"
@@ -913,11 +947,30 @@ class FakeControl:
                 "gender": entry.gender,
                 "classification": entry.classification,
                 "metadata": dict(entry.metadata),
+                "last_snapshot_id": snapshot_id,
             }
         return {}
 
     def eligible_competitions(self):
         self.eligible_competition_calls += 1
+        for row in self.registry.values():
+            metadata = row.setdefault("metadata", {})
+            if "current_season_index" in metadata:
+                continue
+            label = metadata.get("last_season")
+            href = metadata.get("last_season_url")
+            if bool(label) != bool(href):
+                continue
+            evidence = _fake_current_season_index(
+                str(row["competition_id"]),
+                label,
+                href,
+            )
+            metadata["advertised_current_season_id"] = evidence[
+                "advertised"
+            ]["season_id"]
+            metadata["current_season_index"] = evidence
+            row["last_snapshot_id"] = evidence["snapshot_id"]
         return [
             row for row in self.registry.values() if row["gender"] == "male"
         ]
@@ -1047,6 +1100,8 @@ class FakeControl:
             "unknown_gender_registry_count": 0,
             "unvalidated_target_count": 0,
             "unprocessed_raw_count": 0,
+            "lane_unprocessed_raw_count": 0,
+            "lane_unprocessed_raw_sla_overdue_count": 0,
             "global_unprocessed_raw_count": 0,
             "global_unprocessed_raw_sla_overdue_count": 0,
             "crawlable_frontier_scope_counts": {"eligible_male": 1},
@@ -1634,6 +1689,37 @@ def _commit_for_parse(store, target, html):
     return refresh, record
 
 
+def _fake_current_season_index(
+    competition_id: str,
+    label: str | None,
+    href: str | None,
+    *,
+    season_id: str | None = None,
+) -> dict:
+    return {
+        "schema_version": "fbref-current-season-index-evidence-v1",
+        "snapshot_id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"index:{competition_id}")),
+        "run_id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"index-run:{competition_id}")),
+        "content_hash": f"index-content-{competition_id}",
+        "raw": {
+            "attempt_id": str(
+                uuid.uuid5(uuid.NAMESPACE_URL, f"index-attempt:{competition_id}")
+            ),
+            "content_hash": f"index-content-{competition_id}",
+            "logical_refresh_id": str(
+                uuid.uuid5(uuid.NAMESPACE_URL, f"index-refresh:{competition_id}")
+            ),
+            "manifest_key": f"manifests/fetches/index-{competition_id}.json",
+            "target_id": "fbref:competition_index:all",
+        },
+        "advertised": {
+            "label": label,
+            "href": href,
+            "season_id": label if season_id is None else season_id,
+        },
+    }
+
+
 MATCH_FIXTURE = (
     Path(__file__).parents[2]
     / "fixtures"
@@ -1657,11 +1743,10 @@ def _pipeline_with_saved_matches(tmp_path, match_ids=("0701e218", "a071faa8")):
     html = gzip.decompress(MATCH_FIXTURE.read_bytes()).decode("utf-8")
     records = []
     for position, match_id in enumerate(match_ids):
-        target_id = f"fbref:match:{match_id}:{position}"
         target = PageTarget(
             source="fbref",
             page_kind="match",
-            target_id=target_id,
+            target_id=f"fbref:match:{match_id}",
             canonical_url=(
                 f"https://fbref.com/en/matches/{match_id}/x-{position}"
             ),
@@ -2039,7 +2124,7 @@ def _pipeline_with_small_durable_matches(path):
       <tbody><tr><td data-stat="label">durable</td></tr></tbody>
     </table></body></html>
     """
-    for position, match_id in enumerate(("durable-a", "durable-b")):
+    for position, match_id in enumerate(("d000000a", "d000000b")):
         target = PageTarget(
             source="fbref",
             page_kind="match",
@@ -2950,6 +3035,15 @@ def test_cross_run_recovery_processes_raw_from_failed_source_run_offline(
         generic_writer=FakeWriter(),
         fetcher_factory=forbidden_transport,
     )
+    stateful_provenance = []
+    pipeline._apply_stateful_effects = (
+        lambda stateful_run_id, _html, _record, *, run_type, historical: (
+            stateful_provenance.append(
+                (stateful_run_id, run_type, historical)
+            )
+            or (0, 0)
+        )
+    )
     result = pipeline.recover_unprocessed_wave(
         str(uuid.uuid4()),
         page_kinds=["player"],
@@ -2957,6 +3051,8 @@ def test_cross_run_recovery_processes_raw_from_failed_source_run_offline(
     )
 
     assert result.parsed == 1
+    assert control.recovery_run_types == ["current"]
+    assert stateful_provenance == [(source_run_id, "current", False)]
     key = (
         refresh,
         PAGE_DOCUMENT_VERSION,
@@ -2964,6 +3060,54 @@ def test_cross_run_recovery_processes_raw_from_failed_source_run_offline(
         DISCOVERY_PARSER_VERSION,
     )
     assert control.observations[key]["status"] == "succeeded"
+
+
+@pytest.mark.parametrize(
+    ("source_lane", "invoking_lane"),
+    [("current", "backfill"), ("backfill", "current")],
+)
+def test_cross_run_recovery_cannot_select_other_lane_raw(
+    tmp_path,
+    source_lane,
+    invoking_lane,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="player",
+        canonical_url="https://fbref.com/en/players/1234abcd/Player",
+        source_ids={"player_id": "1234abcd"},
+    ))
+    refresh, record = _commit_for_parse(
+        raw,
+        target,
+        "<table id='stats_standard'></table>",
+    )
+    control.frontier[target.target_id] = {
+        "target_id": target.target_id,
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "run_id": str(uuid.uuid4()),
+        "source_run_status": "cancelled",
+        "source_run_type": source_lane,
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+        "content_hash": record.content_hash,
+    }]
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    result = pipeline.recover_unprocessed_wave(
+        str(uuid.uuid4()),
+        page_kinds=["player"],
+        settings=_settings(invoking_lane),
+    )
+
+    assert result.cohort_size == 0
+    assert result.parsed == 0
+    assert control.recovery_run_types == [invoking_lane]
 
 
 def test_page_v3_recovers_verified_tableless_player_from_v2_raw_offline(
@@ -3913,8 +4057,139 @@ def test_current_completed_transition_refreshes_instead_of_adopting_prior_raw(
     assert "http" in control.events
 
 
+def test_historical_season_does_not_adopt_prior_logical_refresh_raw(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    run_id = str(uuid.UUID(int=1))
+    prior_refresh_id = str(uuid.UUID(int=19))
+    refresh_id = str(uuid.UUID(int=20))
+    target = season_page_target(
+        "9",
+        "2024-2025",
+        "https://fbref.com/en/comps/9/2024-2025/Premier-League-Stats",
+    )
+    stale = b"<html>prior-season-observation</html>"
+    fresh = b"<html>fresh-season-observation</html>"
+    raw.commit_fetch(
+        target,
+        stale,
+        logical_refresh_id=prior_refresh_id,
+        http_status=200,
+    )
+    lease = TargetLease(
+        attempt_id=str(uuid.UUID(int=21)),
+        run_id=run_id,
+        target_id=target.target_id,
+        logical_refresh_id=refresh_id,
+        canonical_url=target.canonical_url,
+        page_kind=target.page_kind,
+        source_ids=dict(target.source_ids),
+        claim_token=str(uuid.UUID(int=22)),
+        lease_epoch=1,
+        attempt_number=1,
+        leased_by="worker-1",
+        lease_expires_at=NOW + timedelta(minutes=10),
+    )
+    control.claim_targets = lambda *args, **kwargs: [lease]
+    control.frontier[target.target_id] = {
+        "refresh_policy": "historical_once",
+        "state": "queued",
+    }
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeFetcher(control.events, fresh),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="worker-1",
+        page_kinds=["season"],
+        settings=_settings("backfill"),
+    )
+
+    assert result.recovered_from_raw == 0
+    assert result.fetched == 1
+    assert result.requests == 2
+    committed_body, committed = raw.load_fetch(refresh_id)
+    assert committed_body == fresh
+    assert committed.imported_from_manifest_key is None
+    assert "reserve" in control.events
+    assert "http" in control.events
+
+
+def test_historical_season_recovers_exact_logical_refresh_raw_without_network(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    run_id = str(uuid.UUID(int=1))
+    refresh_id = str(uuid.UUID(int=20))
+    source_attempt_id = str(uuid.UUID(int=99))
+    target = season_page_target(
+        "9",
+        "2024-2025",
+        "https://fbref.com/en/comps/9/2024-2025/Premier-League-Stats",
+    )
+    exact_body = b"<html>exact-season-crash-recovery</html>"
+    raw.commit_fetch(
+        target,
+        exact_body,
+        logical_refresh_id=refresh_id,
+        attempt_id=source_attempt_id,
+        http_status=200,
+    )
+    lease = TargetLease(
+        attempt_id=str(uuid.UUID(int=21)),
+        run_id=run_id,
+        target_id=target.target_id,
+        logical_refresh_id=refresh_id,
+        canonical_url=target.canonical_url,
+        page_kind=target.page_kind,
+        source_ids=dict(target.source_ids),
+        claim_token=str(uuid.UUID(int=22)),
+        lease_epoch=1,
+        attempt_number=1,
+        leased_by="worker-1",
+        lease_expires_at=NOW + timedelta(minutes=10),
+    )
+    control.claim_targets = lambda *args, **kwargs: [lease]
+    control.frontier[target.target_id] = {
+        "refresh_policy": "historical_once",
+        "state": "queued",
+    }
+
+    def unexpected_fetcher(*_args):
+        raise AssertionError("exact season crash recovery must stay offline")
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=unexpected_fetcher,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="worker-1",
+        page_kinds=["season"],
+        settings=_settings("backfill"),
+    )
+
+    assert result.recovered_from_raw == 1
+    assert result.fetched == 0
+    assert result.requests == 0
+    assert "reserve" not in control.events
+    assert "http" not in control.events
+    assert control.completed[0][1]["recovered_from_attempt_id"] == source_attempt_id
+
+
 @pytest.mark.parametrize("raw_version", ["v1", "prior-v2"])
-def test_historical_once_adopts_verified_prior_raw_without_network(
+def test_historical_match_adopts_verified_prior_raw_without_network(
     tmp_path,
     raw_version,
 ):
@@ -4019,7 +4294,8 @@ def test_offline_index_parse_seeds_only_male_competitions(tmp_path):
     control = FakeControl(raw)
     html = """
     <h2>Domestic Leagues</h2><table id="comps"><tbody>
-      <tr><td data-stat="gender">M</td><th><a href="/en/comps/9/history/Premier-League-Seasons">Premier League</a></th></tr>
+      <tr><td data-stat="gender">M</td><th><a href="/en/comps/9/history/Premier-League-Seasons">Premier League</a></th>
+        <td data-stat="maxseason"><a href="/en/comps/9/Premier-League-Stats">2026-2027</a></td></tr>
       <tr><td data-stat="gender">F</td><th><a href="/en/comps/189/history/Womens-Super-League-Seasons">Women's Super League</a></th></tr>
       <tr><td data-stat="gender">?</td><th><a href="/en/comps/x/history/Unknown-Seasons">Unknown Cup</a></th></tr>
     </tbody></table>
@@ -4047,8 +4323,9 @@ def test_offline_index_parse_seeds_only_male_competitions(tmp_path):
         generic_writer=FakeWriter(),
         fetcher_factory=forbidden,
     )
+    run_id = str(uuid.uuid4())
     result = pipeline.parse_wave(
-        str(uuid.uuid4()),
+        run_id,
         page_kinds=["competition_index"],
         settings=_settings(),
     )
@@ -4066,6 +4343,35 @@ def test_offline_index_parse_seeds_only_male_competitions(tmp_path):
         for key, row in control.frontier.items()
         if key != "fbref:competition_index:all"
     )
+    assert control.registry["9"]["metadata"]["last_season"] == "2026-2027"
+    assert control.registry["9"]["metadata"]["last_season_url"] == (
+        "https://fbref.com/en/comps/9/Premier-League-Stats"
+    )
+    assert control.registry["9"]["metadata"][
+        "advertised_current_season_id"
+    ] == "2026-2027"
+    index_evidence = control.registry["9"]["metadata"][
+        "current_season_index"
+    ]
+    assert index_evidence == {
+        "schema_version": "fbref-current-season-index-evidence-v1",
+        "snapshot_id": control.snapshots[0]["snapshot_id"],
+        "run_id": run_id,
+        "content_hash": record.content_hash,
+        "raw": {
+            "attempt_id": record.attempt_id,
+            "content_hash": record.content_hash,
+            "logical_refresh_id": record.logical_refresh_id,
+            "manifest_key": raw.fetch_manifest_key(record.logical_refresh_id),
+            "target_id": record.target_id,
+        },
+        "advertised": {
+            "label": "2026-2027",
+            "href": "https://fbref.com/en/comps/9/Premier-League-Stats",
+            "season_id": "2026-2027",
+        },
+    }
+    assert control.snapshots[0]["metadata"]["raw"] == index_evidence["raw"]
 
 
 def test_registry_snapshot_identity_is_stable_for_raw_retry(tmp_path):
@@ -4086,6 +4392,85 @@ def test_registry_snapshot_identity_is_stable_for_raw_retry(tmp_path):
     snapshot_ids = [item["snapshot_id"] for item in control.snapshots]
     assert snapshot_ids[0] == snapshot_ids[1]
     assert uuid.UUID(snapshot_ids[0]).version == 5
+
+
+def test_registry_snapshot_identity_tracks_exact_history_attempt(tmp_path):
+    raw = _raw_store(tmp_path)
+    _, record = _commit_for_parse(
+        raw,
+        competition_index_target(),
+        "<table><tr><td>index</td></tr></table>",
+    )
+
+    assert pipeline_module._registry_snapshot_id(record) != (
+        pipeline_module._registry_snapshot_id(
+            replace(record, attempt_id=str(uuid.uuid4()))
+        )
+    )
+
+
+def test_registry_snapshot_identity_tracks_current_install_contract(
+    tmp_path, monkeypatch
+):
+    raw = _raw_store(tmp_path)
+    _, record = _commit_for_parse(
+        raw,
+        competition_index_target(),
+        "<table><tr><td>index</td></tr></table>",
+    )
+
+    first = pipeline_module._registry_snapshot_id(record)
+    assert first == pipeline_module._registry_snapshot_id(record)
+    monkeypatch.setattr(
+        pipeline_module,
+        "CURRENT_SEASON_INSTALL_CONTRACT_VERSION",
+        "fbref-current-season-install-vnext",
+    )
+
+    assert pipeline_module._registry_snapshot_id(record) != first
+
+
+def test_registry_snapshot_identity_tracks_exact_index_input(tmp_path):
+    raw = _raw_store(tmp_path)
+    _, record = _commit_for_parse(
+        raw,
+        page_target_from_link(DiscoveredPageLink(
+            page_kind="competition",
+            canonical_url="https://fbref.com/en/comps/6/history/x",
+            source_ids={"competition_id": "6"},
+        )),
+        "<table><tr><td>history</td></tr></table>",
+    )
+    index_v1 = {
+        "snapshot_id": str(uuid.uuid4()),
+        "content_hash": "index-hash-v1",
+        "advertised": {
+            "label": "2026",
+            "href": "https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats",
+            "season_id": "2026",
+        },
+    }
+    index_v2 = {
+        **index_v1,
+        "snapshot_id": str(uuid.uuid4()),
+        "content_hash": "index-hash-v2",
+        "advertised": {
+            "label": "2030",
+            "href": "https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats",
+            "season_id": "2030",
+        },
+    }
+
+    first = pipeline_module._registry_snapshot_id(
+        record, current_season_index=index_v1
+    )
+
+    assert first == pipeline_module._registry_snapshot_id(
+        record, current_season_index=index_v1
+    )
+    assert first != pipeline_module._registry_snapshot_id(
+        record, current_season_index=index_v2
+    )
 
 
 def _seasons_html(competition_id: str) -> str:
@@ -4302,6 +4687,9 @@ def test_current_history_parse_uses_exact_source_season_and_opaque_ids(tmp_path)
         "metadata": {
             "source_section": "Domestic Leagues",
             "last_season": "Spring Edition",
+            "last_season_url": (
+                "https://fbref.com/en/comps/9/spring/source-owned-current"
+            ),
         },
     }
     target = page_target_from_link(DiscoveredPageLink(
@@ -4351,6 +4739,546 @@ def test_current_history_parse_uses_exact_source_season_and_opaque_ids(tmp_path)
     assert {entry.is_current for entry in control.seasons} == {True, False}
 
 
+def test_advertised_current_missing_from_history_is_installed_from_exact_href(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    advertised_url = "https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats"
+    index_evidence = _fake_current_season_index(
+        "6", "2026", advertised_url
+    )
+    control.registry["6"] = {
+        "competition_id": "6",
+        "canonical_url": "https://fbref.com/en/comps/6/history/x",
+        "name": "FIFA World Cup Qualification — UEFA",
+        "gender": "male",
+        "classification": "other:national_team",
+        "metadata": {
+            "source_section": "National Team Qualification",
+            "last_season": "2026",
+            "last_season_url": advertised_url,
+            "advertised_current_season_id": "2026",
+            "current_season_index": index_evidence,
+        },
+        "last_snapshot_id": index_evidence["snapshot_id"],
+    }
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="competition",
+        canonical_url="https://fbref.com/en/comps/6/history/x",
+        source_ids={"competition_id": "6"},
+    ))
+    html = """
+    <table id="seasons"><tbody>
+      <tr><th data-stat="season"><a
+        href="/en/comps/6/2022/2022-WCQ----UEFA-M-Stats"
+      >2022 FIFA World Cup Qualification — UEFA</a></th></tr>
+      <tr><th data-stat="season"><a
+        href="/en/comps/6/2018/2018-WCQ----UEFA-M-Stats"
+      >2018 FIFA World Cup Qualification — UEFA</a></th></tr>
+    </tbody></table>
+    """
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    }]
+
+    result = FBrefPipeline(
+        control, raw, generic_writer=FakeWriter()
+    ).parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_settings("current"),
+    )
+
+    current = [entry for entry in control.seasons if entry.is_current]
+    season_targets = [
+        row for row in control.frontier.values()
+        if row["page_kind"] == "season"
+    ]
+    assert result.seeded == 1
+    assert [(entry.season_id, entry.canonical_url) for entry in current] == [(
+        "2026", "https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats"
+    )]
+    assert [row["source_ids"]["season_id"] for row in season_targets] == [
+        "2026"
+    ]
+    assert {
+        entry.season_id for entry in control.seasons if not entry.is_current
+    } == {"2018", "2022"}
+    history_snapshot = control.snapshots[-1]
+    install = history_snapshot["metadata"]["current_season_install"]
+    assert install["index"] == control.registry["6"]["metadata"][
+        "current_season_index"
+    ]
+    assert install["history_raw"]["manifest_key"] == raw.fetch_manifest_key(
+        record.logical_refresh_id
+    )
+    assert install["history_raw"]["attempt_id"] == record.attempt_id
+    assert install["history_raw"]["content_hash"] == record.content_hash
+    assert all(
+        entry.metadata["current_season_install"] == install
+        for entry in control.seasons
+    )
+    assert all(
+        edge["metadata"]["current_season_install"] == install
+        for edge in control.provenance
+        if edge["parent_target_id"] == record.target_id
+    )
+
+
+def test_comp678_installs_advertised_2024_when_history_starts_at_2021(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    advertised_url = (
+        "https://fbref.com/en/comps/678/UEFA-Euro-qualification-Stats"
+    )
+    index_evidence = _fake_current_season_index(
+        "678", "2024", advertised_url
+    )
+    control.registry["678"] = {
+        "competition_id": "678",
+        "canonical_url": "https://fbref.com/en/comps/678/history/x",
+        "name": "UEFA European Championship Qualifying",
+        "gender": "male",
+        "classification": "other:national_team",
+        "metadata": {
+            "source_section": "National Team Qualification",
+            "last_season": "2024",
+            "last_season_url": advertised_url,
+            "advertised_current_season_id": "2024",
+            "current_season_index": index_evidence,
+        },
+        "last_snapshot_id": index_evidence["snapshot_id"],
+    }
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="competition",
+        canonical_url="https://fbref.com/en/comps/678/history/x",
+        source_ids={"competition_id": "678"},
+    ))
+    html = """
+    <table id="seasons"><tbody>
+      <tr><th data-stat="season"><a
+        href="/en/comps/678/2021/2021-UEFA-Euro-qualification-Stats"
+      >2021 UEFA Euro Qualification</a></th></tr>
+      <tr><th data-stat="season"><a
+        href="/en/comps/678/2016/2016-UEFA-Euro-qualification-Stats"
+      >2016 UEFA Euro Qualification</a></th></tr>
+    </tbody></table>
+    """
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    }]
+
+    result = FBrefPipeline(
+        control, raw, generic_writer=FakeWriter()
+    ).parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_settings("current"),
+    )
+
+    assert result.seeded == 1
+    assert [
+        (entry.season_id, entry.canonical_url)
+        for entry in control.seasons if entry.is_current
+    ] == [("2024", advertised_url)]
+    assert [
+        row["source_ids"]["season_id"]
+        for row in control.frontier.values()
+        if row["page_kind"] == "season"
+    ] == ["2024"]
+    assert {
+        entry.season_id for entry in control.seasons if not entry.is_current
+    } == {"2016", "2021"}
+
+
+def test_same_history_with_new_index_gets_new_snapshot_and_reverts_old_current(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+
+    class ReconcilingControl(FakeControl):
+        def reconcile_seasons(self, snapshot_id, competition_id, entries):
+            self.seasons = [
+                entry for entry in self.seasons
+                if entry.competition_id != competition_id
+            ] + list(entries)
+            return {}
+
+    control = ReconcilingControl(raw)
+    history_url = "https://fbref.com/en/comps/6/history/x"
+    advertised_url = "https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats"
+    index_v1 = _fake_current_season_index("6", "2026", advertised_url)
+    control.registry["6"] = {
+        "competition_id": "6",
+        "canonical_url": history_url,
+        "name": "FIFA World Cup Qualification — UEFA",
+        "gender": "male",
+        "classification": "other:national_team",
+        "metadata": {
+            "last_season": "2026",
+            "last_season_url": advertised_url,
+            "advertised_current_season_id": "2026",
+            "current_season_index": index_v1,
+        },
+        "last_snapshot_id": index_v1["snapshot_id"],
+    }
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="competition",
+        canonical_url=history_url,
+        source_ids={"competition_id": "6"},
+    ))
+    html = """
+    <table id="seasons"><tbody><tr><th data-stat="season"><a
+      href="/en/comps/6/2022/2022-WCQ----UEFA-M-Stats"
+    >2022 FIFA World Cup Qualification — UEFA</a></th></tr></tbody></table>
+    """
+    _, record = _commit_for_parse(raw, target, html)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    run_id = str(uuid.uuid4())
+
+    pipeline._parse_competition(run_id, html, record, run_type="backfill")
+    first_snapshot = control.snapshots[-1]["snapshot_id"]
+    first_relations = {
+        edge["relation"]
+        for edge in control.provenance
+        if edge["parent_target_id"] == record.target_id
+    }
+    assert first_relations == {
+        f"page_link:season:install:{first_snapshot}"
+    }
+    assert [
+        entry.season_id for entry in control.seasons if entry.is_current
+    ] == ["2026"]
+
+    index_v2 = {
+        **_fake_current_season_index("6", "2030", advertised_url),
+        "snapshot_id": str(uuid.uuid4()),
+        "content_hash": "index-content-v2",
+    }
+    index_v2["raw"]["content_hash"] = "index-content-v2"
+    control.registry["6"]["metadata"].update({
+        "last_season": "2030",
+        "advertised_current_season_id": "2030",
+        "current_season_index": index_v2,
+    })
+    control.registry["6"]["last_snapshot_id"] = index_v2["snapshot_id"]
+
+    pipeline._parse_competition(run_id, html, record, run_type="backfill")
+
+    second_snapshot = control.snapshots[-1]["snapshot_id"]
+    assert second_snapshot != first_snapshot
+    assert {
+        edge["relation"]
+        for edge in control.provenance
+        if edge["parent_target_id"] == record.target_id
+    } == {
+        f"page_link:season:install:{first_snapshot}",
+        f"page_link:season:install:{second_snapshot}",
+    }
+    assert [
+        entry.season_id for entry in control.seasons if entry.is_current
+    ] == ["2030"]
+    assert "2026" not in {entry.season_id for entry in control.seasons}
+
+    control.registry["6"]["metadata"].update({
+        "last_season": "2026",
+        "advertised_current_season_id": "2026",
+        "current_season_index": index_v1,
+    })
+    control.registry["6"]["last_snapshot_id"] = index_v1["snapshot_id"]
+
+    pipeline._parse_competition(run_id, html, record, run_type="backfill")
+
+    assert control.snapshots[-1]["snapshot_id"] == first_snapshot
+    assert [
+        entry.season_id for entry in control.seasons if entry.is_current
+    ] == ["2026"]
+    assert "2030" not in {entry.season_id for entry in control.seasons}
+    assert len([
+        edge for edge in control.provenance
+        if edge["parent_target_id"] == record.target_id
+    ]) == 2
+
+
+def test_advertised_current_mismatch_without_href_fails_closed(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry["6"] = {
+        "competition_id": "6",
+        "canonical_url": "https://fbref.com/en/comps/6/history/x",
+        "name": "FIFA World Cup Qualification — UEFA",
+        "gender": "male",
+        "classification": "other:national_team",
+        "metadata": {"last_season": "2026"},
+    }
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="competition",
+        canonical_url="https://fbref.com/en/comps/6/history/x",
+        source_ids={"competition_id": "6"},
+    ))
+    html = """
+    <table id="seasons"><tbody><tr><th data-stat="season"><a
+      href="/en/comps/6/2022/2022-WCQ----UEFA-M-Stats"
+    >2022 FIFA World Cup Qualification — UEFA</a></th></tr></tbody></table>
+    """
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    }]
+
+    with pytest.raises(
+        ParseWaveError,
+        match="advertised current season evidence is incomplete",
+    ):
+        FBrefPipeline(
+            control, raw, generic_writer=FakeWriter()
+        ).parse_wave(
+            str(uuid.uuid4()),
+            page_kinds=["competition"],
+            settings=_settings("current"),
+        )
+
+
+def test_advertised_current_href_without_label_fails_closed():
+    competition = CompetitionRef(
+        comp_id="6",
+        name="FIFA World Cup Qualification — UEFA",
+        format=CompetitionFormat.OTHER,
+        participants=ParticipantType.NATIONAL_TEAM,
+        gender=CompetitionGender.MALE,
+        source_section="National Team Qualification",
+        country=None,
+        governing_body=None,
+        tier=None,
+        first_season="1998",
+        last_season=None,
+        history_url="https://fbref.com/en/comps/6/history/x",
+        last_season_url="https://fbref.com/en/comps/6/WCQ----UEFA-M-Stats",
+    )
+    old = SeasonRef(
+        comp_id="6",
+        season_id="2022",
+        label="2022 FIFA World Cup Qualification — UEFA",
+        calendar_type=CalendarType.TOURNAMENT,
+        season_url=(
+            "https://fbref.com/en/comps/6/2022/"
+            "2022-WCQ----UEFA-M-Stats"
+        ),
+    )
+
+    with pytest.raises(
+        ParseWaveError,
+        match="advertised current season evidence is incomplete",
+    ):
+        pipeline_module._resolve_current_season_install(
+            competition,
+            [old],
+            [],
+        )
+
+
+def test_current_season_resolver_keeps_direct_match_type_contract():
+    direct_matches = get_type_hints(
+        pipeline_module._resolve_current_season_install
+    )["direct_matches"]
+
+    assert get_args(direct_matches) == (MatchRef,)
+
+
+def _seasonless_alias_competition_664() -> CompetitionRef:
+    return CompetitionRef(
+        comp_id="664",
+        name="AFC Asian Cup",
+        format=CompetitionFormat.CUP,
+        participants=ParticipantType.NATIONAL_TEAM,
+        gender=CompetitionGender.MALE,
+        source_section="International Cups",
+        country=None,
+        governing_body="AFC",
+        tier=None,
+        first_season="1956",
+        last_season="2024",
+        history_url=(
+            "https://fbref.com/en/comps/664/history/AFC-Asian-Cup-Seasons"
+        ),
+        last_season_url=(
+            "https://fbref.com/en/comps/664/AFC-Asian-Cup-Stats"
+        ),
+    )
+
+
+def test_resolve_current_season_uses_unique_advertised_url_before_label_id():
+    season_url = "https://fbref.com/en/comps/664/AFC-Asian-Cup-Stats"
+    history = [SeasonRef(
+        comp_id="664",
+        season_id="2023",
+        label="2023",
+        calendar_type=CalendarType.TOURNAMENT,
+        season_url=season_url,
+    )]
+
+    seasons, current_id = pipeline_module._resolve_current_season_install(
+        _seasonless_alias_competition_664(),
+        history,
+        [],
+    )
+
+    assert current_id == "2023"
+    assert [(row.season_id, row.season_url) for row in seasons] == [
+        ("2023", season_url)
+    ]
+
+
+def test_resolve_current_season_refuses_ambiguous_advertised_url():
+    season_url = "https://fbref.com/en/comps/664/AFC-Asian-Cup-Stats"
+    history = [
+        SeasonRef(
+            comp_id="664",
+            season_id=season_id,
+            label=season_id,
+            calendar_type=CalendarType.TOURNAMENT,
+            season_url=season_url,
+        )
+        for season_id in ("2023", "2019")
+    ]
+
+    with pytest.raises(
+        ParseWaveError,
+        match="advertised current URL matches multiple history seasons",
+    ):
+        pipeline_module._resolve_current_season_install(
+            _seasonless_alias_competition_664(),
+            history,
+            [],
+        )
+
+
+def test_advertised_current_source_id_prevents_duplicate_long_label(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    advertised_url = (
+        "https://fbref.com/en/comps/255/2026/"
+        "2026-FIFA-World-Cup-Qualification-Stats"
+    )
+    index_evidence = _fake_current_season_index(
+        "255", "2026", advertised_url
+    )
+    control.registry["255"] = {
+        "competition_id": "255",
+        "canonical_url": "https://fbref.com/en/comps/255/history/x",
+        "name": "FIFA World Cup Qualification — Inter-confederation play-offs",
+        "gender": "male",
+        "classification": "cup:national_team",
+        "metadata": {
+            "last_season": "2026",
+            "last_season_url": advertised_url,
+            "advertised_current_season_id": "2026",
+            "current_season_index": index_evidence,
+        },
+        "last_snapshot_id": index_evidence["snapshot_id"],
+    }
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="competition",
+        canonical_url="https://fbref.com/en/comps/255/history/x",
+        source_ids={"competition_id": "255"},
+    ))
+    html = """
+    <html><body><main><div class="content_grid"><a
+      href="/en/comps/255/2026/2026-FIFA-World-Cup-Qualification-Stats"
+    >2026 FIFA World Cup Qualification — Inter-confederation play-offs</a>
+    </div></main></body></html>
+    """
+    refresh, record = _commit_for_parse(raw, target, html)
+    control.frontier[record.target_id] = {
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "source_ids": dict(record.source_ids),
+        "state": "fetched",
+        "last_content_hash": record.content_hash,
+    }
+    control.fetches = [{
+        "target_id": record.target_id,
+        "page_kind": record.page_kind,
+        "logical_refresh_id": refresh,
+    }]
+
+    FBrefPipeline(control, raw, generic_writer=FakeWriter()).parse_wave(
+        str(uuid.uuid4()),
+        page_kinds=["competition"],
+        settings=_settings("current"),
+    )
+
+    assert [(entry.season_id, entry.is_current) for entry in control.seasons] == [
+        ("2026", True)
+    ]
+
+
+def test_advertised_current_href_wins_when_history_only_has_direct_match():
+    advertised_url = "https://fbref.com/en/comps/602/Super-Cup-Stats"
+    competition = CompetitionRef(
+        comp_id="602",
+        name="Super Cup",
+        format=CompetitionFormat.CUP,
+        participants=ParticipantType.CLUB,
+        gender=CompetitionGender.MALE,
+        source_section="Domestic Cups",
+        country="England",
+        governing_body=None,
+        tier=None,
+        first_season="1908",
+        last_season="2026",
+        history_url="https://fbref.com/en/comps/602/history/Super-Cup-Seasons",
+        last_season_url=advertised_url,
+    )
+    direct_match = MatchRef(
+        match_id="abcdef12",
+        comp_id="602",
+        season_id="2026",
+        canonical_url="https://fbref.com/en/matches/abcdef12",
+    )
+
+    seasons, current = pipeline_module._resolve_current_season_install(
+        competition,
+        [],
+        [direct_match],
+    )
+
+    assert current == "2026"
+    assert [(season.season_id, season.season_url) for season in seasons] == [
+        ("2026", advertised_url)
+    ]
+
+
 @pytest.mark.parametrize(
     "run_type",
     ["current", "backfill"],
@@ -4366,7 +5294,7 @@ def test_single_match_competition_inventories_current_and_backfill_targets(
         "name": "Super Cup",
         "gender": "male",
         "classification": "cup:club",
-        "metadata": {"last_season": "2025"},
+        "metadata": {},
     }
     target = page_target_from_link(DiscoveredPageLink(
         page_kind="competition",
@@ -4455,7 +5383,7 @@ def test_competition_history_aggregates_seasons_and_direct_matches(
         "name": "Super Cup",
         "gender": "male",
         "classification": "cup:club",
-        "metadata": {"last_season": "2025"},
+        "metadata": {},
     }
     target = page_target_from_link(DiscoveredPageLink(
         page_kind="competition",
@@ -4528,7 +5456,12 @@ def test_card_grid_competition_passes_generic_then_semantic_contract(tmp_path):
         "name": "Inter-confederation play-offs",
         "gender": "male",
         "classification": "cup:national_team",
-        "metadata": {"last_season": "2026"},
+        "metadata": {
+            "last_season": "2026",
+            "last_season_url": (
+                "https://fbref.com/en/comps/255/2026/2026-Play-offs-Stats"
+            ),
+        },
     }
     target = page_target_from_link(DiscoveredPageLink(
         page_kind="competition",
@@ -4617,17 +5550,18 @@ def test_single_match_season_zero_table_shape_reaches_not_applicable_semantics(
         "classification": "cup:club",
         "metadata": {"last_season": "2013-2014"},
     }
-    target = page_target_from_link(DiscoveredPageLink(
-        page_kind="season",
-        canonical_url=(
-            "https://fbref.com/en/comps/122/2013-2014/"
-            "2013-UEFA-Super-Cup-Stats"
-        ),
-        source_ids={
-            "competition_id": "122",
-            "season_id": "2013-2014",
-        },
-    ))
+    target = page_target_from_link(
+        DiscoveredPageLink(
+            page_kind="season",
+            canonical_url=(
+                "https://fbref.com/en/comps/122/2013-2014/2013-UEFA-Super-Cup-Stats"
+            ),
+            source_ids={
+                "competition_id": "122",
+                "season_id": "2013-2014",
+            },
+        )
+    )
     html = """
     <div id="content"><h1>2013 UEFA Super Cup Stats</h1>
       <a href="/en/comps/122/history/UEFA-Super-Cup-Seasons">Seasons</a>
@@ -4670,17 +5604,18 @@ def test_single_match_season_zero_table_shape_reaches_not_applicable_semantics(
 def test_zero_table_source_shell_fails_before_typed_promotion(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
-    target = page_target_from_link(DiscoveredPageLink(
-        page_kind="season",
-        canonical_url=(
-            "https://fbref.com/en/comps/122/2013-2014/"
-            "2013-UEFA-Super-Cup-Stats"
-        ),
-        source_ids={
-            "competition_id": "122",
-            "season_id": "2013-2014",
-        },
-    ))
+    target = page_target_from_link(
+        DiscoveredPageLink(
+            page_kind="season",
+            canonical_url=(
+                "https://fbref.com/en/comps/122/2013-2014/2013-UEFA-Super-Cup-Stats"
+            ),
+            source_ids={
+                "competition_id": "122",
+                "season_id": "2013-2014",
+            },
+        )
+    )
     html = "<html><body><p>temporary source shell</p></body></html>"
     refresh, record = _commit_for_parse(raw, target, html)
     control.frontier[record.target_id] = {
@@ -4752,6 +5687,7 @@ def _redirected_season_wave(
         "last_content_hash": record.content_hash,
     })
     control.fetches.append({
+        "source_run_type": "backfill" if historical else "current",
         "target_id": record.target_id,
         "page_kind": record.page_kind,
         "logical_refresh_id": refresh,
@@ -4849,8 +5785,7 @@ def test_current_season_mismatch_stays_loud(tmp_path):
         canonical_url="https://fbref.com/en/comps/11/Serie-A-M-Stats",
         season_id="2026-2027",
         schedule_href=(
-            "/en/comps/11/2025-2026/schedule/"
-            "2025-2026-Serie-A-M-Scores-and-Fixtures"
+            "/en/comps/11/2025-2026/schedule/2025-2026-Serie-A-M-Scores-and-Fixtures"
         ),
         historical=False,
     )
@@ -4885,19 +5820,22 @@ def _schedule_less_season_wave(tmp_path):
             "classification": "cup:club",
             "metadata": {},
         }
-    rejected = page_target_from_link(DiscoveredPageLink(
-        page_kind="season",
-        canonical_url="https://fbref.com/en/comps/76/2017/2017-NASL-Stats",
-        source_ids={"competition_id": "76", "season_id": "2017"},
-    ))
-    healthy = page_target_from_link(DiscoveredPageLink(
-        page_kind="season",
-        canonical_url=(
-            "https://fbref.com/en/comps/122/2013-2014/"
-            "2013-UEFA-Super-Cup-Stats"
-        ),
-        source_ids={"competition_id": "122", "season_id": "2013-2014"},
-    ))
+    rejected = page_target_from_link(
+        DiscoveredPageLink(
+            page_kind="season",
+            canonical_url="https://fbref.com/en/comps/76/2017/2017-NASL-Stats",
+            source_ids={"competition_id": "76", "season_id": "2017"},
+        )
+    )
+    healthy = page_target_from_link(
+        DiscoveredPageLink(
+            page_kind="season",
+            canonical_url=(
+                "https://fbref.com/en/comps/122/2013-2014/2013-UEFA-Super-Cup-Stats"
+            ),
+            source_ids={"competition_id": "122", "season_id": "2013-2014"},
+        )
+    )
     pages = [
         (rejected, """
         <div id="content"><h1>2017 NASL Stats</h1>
@@ -5161,8 +6099,7 @@ class BronzePageContractWriter(FakeWriter):
     def persist_page(self, page, **kwargs):
         if page.errors:
             raise GenericPersistenceError(
-                f"Page {page.target_id} contained parser errors: "
-                f"{page.errors[:3]}"
+                f"Page {page.target_id} contained parser errors: {page.errors[:3]}"
             )
         return super().persist_page(page, **kwargs)
 
@@ -5280,8 +6217,7 @@ def _malformed_archived_matchlog_wave(
     tmp_path,
     *,
     canonical_url=(
-        "https://fbref.com/en/players//matchlogs/2016-2017/misc/"
-        "Yan-Kaye-Match-Logs"
+        "https://fbref.com/en/players//matchlogs/2016-2017/misc/Yan-Kaye-Match-Logs"
     ),
     season_id="2016-2017",
 ):
@@ -5302,6 +6238,7 @@ def _malformed_archived_matchlog_wave(
         state="fetched", last_content_hash=record.content_hash
     )
     control.fetches.append({
+        "source_run_type": "backfill",
         "target_id": record.target_id,
         "page_kind": record.page_kind,
         "logical_refresh_id": refresh,
@@ -5603,7 +6540,12 @@ def test_duplicate_display_label_selects_one_canonical_current_edition(
         "name": "Supercoppa",
         "gender": "male",
         "classification": "cup:club",
-        "metadata": {"last_season": "2025"},
+        "metadata": {
+            "last_season": "2025",
+            "last_season_url": (
+                "https://fbref.com/en/comps/612/2025/current"
+            ),
+        },
     }
     target = page_target_from_link(DiscoveredPageLink(
         page_kind="competition",
@@ -5640,6 +6582,166 @@ def test_duplicate_display_label_selects_one_canonical_current_edition(
     assert current_targets[0]["source_ids"]["season_id"] == "2025"
 
 
+@pytest.mark.parametrize(
+    ("competition_id", "source_url", "observed_location"),
+    [
+        (
+            "33",
+            "https://fbref.com/en/comps/33/2-Bundesliga-Stats",
+            "https://fbref.com/en/comps/33/2/",
+        ),
+        (
+            "59",
+            "https://fbref.com/en/comps/59/3-Liga-Stats",
+            "https://fbref.com/en/comps/59/3/",
+        ),
+    ],
+)
+def test_registry_redirect_mapping_is_exact_and_preserves_season_identity(
+    competition_id,
+    source_url,
+    observed_location,
+):
+    source = SeasonRef(
+        comp_id=competition_id,
+        season_id="2026-2027",
+        label="2026-2027",
+        calendar_type=CalendarType.SPLIT_YEAR,
+        season_url=source_url,
+    )
+
+    installed = _season_with_registry_redirect(source)
+
+    assert source.season_url == source_url
+    assert installed.season_id == "2026-2027"
+    assert observed_location.endswith("/")
+    assert installed.season_url == observed_location.rstrip("/")
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="season",
+        canonical_url=source_url,
+        source_ids={
+            "competition_id": competition_id,
+            "season_id": "2026-2027",
+        },
+    ))
+    assert target.target_id == (
+        f"fbref:season:{competition_id}:2026-2027"
+    )
+    assert target.canonical_url == installed.season_url
+
+
+@pytest.mark.parametrize(
+    ("competition_id", "season_id", "source_url"),
+    [
+        (
+            "33",
+            "2025-2026",
+            "https://fbref.com/en/comps/33/2-Bundesliga-Stats",
+        ),
+        (
+            "33",
+            "2026-2027",
+            "https://fbref.com/en/comps/33/2026-2027/2-Bundesliga-Stats",
+        ),
+        (
+            "59",
+            "2027-2028",
+            "https://fbref.com/en/comps/59/3-Liga-Stats",
+        ),
+        (
+            "58",
+            "2026-2027",
+            "https://fbref.com/en/comps/58/3-Liga-Stats",
+        ),
+    ],
+)
+def test_registry_redirect_mapping_leaves_near_misses_unchanged(
+    competition_id,
+    season_id,
+    source_url,
+):
+    source = SeasonRef(
+        comp_id=competition_id,
+        season_id=season_id,
+        label=season_id,
+        calendar_type=CalendarType.OPAQUE,
+        season_url=source_url,
+    )
+
+    assert _season_with_registry_redirect(source) is source
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="season",
+        canonical_url=source_url,
+        source_ids={
+            "competition_id": competition_id,
+            "season_id": season_id,
+        },
+    ))
+    assert target.canonical_url == source_url
+
+
+@pytest.mark.parametrize(
+    ("competition_id", "source_url", "observed_location"),
+    [
+        (
+            "33",
+            "/en/comps/33/2-Bundesliga-Stats",
+            "https://fbref.com/en/comps/33/2/",
+        ),
+        (
+            "59",
+            "/en/comps/59/3-Liga-Stats",
+            "https://fbref.com/en/comps/59/3/",
+        ),
+    ],
+)
+def test_redirect_alias_mapping_reaches_registry_and_frontier(
+    tmp_path,
+    competition_id,
+    source_url,
+    observed_location,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.registry[competition_id] = {
+        "competition_id": competition_id,
+        "canonical_url": (
+            f"https://fbref.com/en/comps/{competition_id}/history/source"
+        ),
+        "name": "Redirected current season",
+        "gender": "male",
+        "classification": "league:club",
+        "metadata": {
+            "last_season": "2026-2027",
+            "last_season_url": f"https://fbref.com{source_url}",
+        },
+    }
+    target = page_target_from_link(DiscoveredPageLink(
+        page_kind="competition",
+        canonical_url=control.registry[competition_id]["canonical_url"],
+        source_ids={"competition_id": competition_id},
+    ))
+    html = f"""
+    <table id="seasons"><tbody><tr>
+      <th data-stat="season"><a href="{source_url}">2026-2027</a></th>
+    </tr></tbody></table>
+    """
+    _, record = _commit_for_parse(raw, target, html)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    seeded, skipped = pipeline._parse_competition(
+        str(uuid.uuid4()), html, record, run_type="current"
+    )
+
+    target_id = f"fbref:season:{competition_id}:2026-2027"
+    canonical_destination = observed_location.rstrip("/")
+    assert (seeded, skipped) == (1, 0)
+    assert [entry.canonical_url for entry in control.seasons] == [
+        canonical_destination
+    ]
+    assert control.frontier[target_id]["canonical_url"] == canonical_destination
+
+
 def test_non_conflicting_display_label_remains_resolvable(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
@@ -5649,7 +6751,12 @@ def test_non_conflicting_display_label_remains_resolvable(tmp_path):
         "name": "Premier League",
         "gender": "male",
         "classification": "league:club",
-        "metadata": {"last_season": "2025"},
+        "metadata": {
+            "last_season": "2025",
+            "last_season_url": (
+                "https://fbref.com/en/comps/9/2024-2025/x"
+            ),
+        },
     }
     target = page_target_from_link(DiscoveredPageLink(
         page_kind="competition",
@@ -5688,7 +6795,10 @@ def test_source_season_ids_win_over_shifted_display_labels(tmp_path):
         "name": "FIFA Club World Cup",
         "gender": "male",
         "classification": "cup:club",
-        "metadata": {"last_season": "2025"},
+        "metadata": {
+            "last_season": "2025",
+            "last_season_url": "https://fbref.com/en/comps/719/2025/x",
+        },
     }
     target = page_target_from_link(DiscoveredPageLink(
         page_kind="competition",
@@ -6298,8 +7408,8 @@ def test_canary_validation_does_not_require_global_publication_freshness(tmp_pat
         ),
         ({"unvalidated_target_count": 1}, "unvalidated_target_count=1"),
         (
-            {"global_unprocessed_raw_sla_overdue_count": 2},
-            "global_unprocessed_raw_sla_overdue_count=2",
+            {"lane_unprocessed_raw_sla_overdue_count": 2},
+            "lane_unprocessed_raw_sla_overdue_count=2",
         ),
         (
             {"unknown_gender_registry_count": 1},
@@ -6343,21 +7453,42 @@ def test_validation_enforces_production_scope_and_recovery_gates(
     assert "finish:False" not in control.events
 
 
-def test_validation_allows_fresh_raw_owned_by_a_concurrent_run(tmp_path):
+def test_validation_reports_but_does_not_gate_other_lane_overdue_raw(tmp_path):
     raw = _raw_store(tmp_path)
     control = FakeControl(raw)
     summary = control.get_run_summary(str(uuid.uuid4()))
     summary.update({
         "unprocessed_raw_count": 0,
+        "lane_unprocessed_raw_count": 0,
+        "lane_unprocessed_raw_sla_overdue_count": 0,
         "global_unprocessed_raw_count": 3,
-        "global_unprocessed_raw_sla_overdue_count": 0,
+        "global_unprocessed_raw_sla_overdue_count": 3,
     })
     control.get_run_summary = lambda _, **__: summary
     pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
 
-    pipeline.validate_and_finish(str(uuid.uuid4()))
+    result = pipeline.validate_and_finish(str(uuid.uuid4()))
 
+    assert result["global_unprocessed_raw_count"] == 3
+    assert result["global_unprocessed_raw_sla_overdue_count"] == 3
     assert "finish:True" in control.events
+
+
+def test_validation_fails_closed_without_lane_overdue_metric(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    summary = control.get_run_summary(str(uuid.uuid4()))
+    summary.pop("lane_unprocessed_raw_sla_overdue_count")
+    control.get_run_summary = lambda _, **__: summary
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    with pytest.raises(
+        RunValidationError,
+        match="lane_unprocessed_raw_sla_overdue_count_missing",
+    ):
+        pipeline.validate_and_finish(str(uuid.uuid4()))
+
+    assert "finish:True" not in control.events
 
 
 def test_validation_rejects_a_browser_driven_page_by_page_session(tmp_path):
@@ -8436,6 +9567,224 @@ def test_live_runner_reuses_one_fetch_session_and_parses_after_each_raw_batch(
     assert result.parse.parsed == 1
 
 
+def test_current_live_run_reconciles_scope_once_after_all_waves(tmp_path):
+    """Current claims remain scope-checked while global repair is deferred."""
+
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    events = []
+    fetch_results = iter((WaveResult(claimed=1), WaveResult()))
+    parse_results = iter((WaveResult(cohort_size=1, parsed=1), WaveResult()))
+
+    def fetch_wave(*_args, **_kwargs):
+        events.append("fetch")
+        return next(fetch_results)
+
+    def parse_wave(*_args, **_kwargs):
+        events.append("parse")
+        # This is the same request a real parser makes after it seeds scope.
+        pipeline._reconcile_frontier_scope()
+        return next(parse_results)
+
+    pipeline.fetch_wave = fetch_wave
+    pipeline.parse_wave = parse_wave
+    def reconcile_frontier_scope(**_kwargs):
+        events.append("scope_reconcile")
+        return {"reopened": 1}
+
+    control.reconcile_frontier_scope = reconcile_frontier_scope
+
+    result = pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="current-live",
+        page_kinds=["competition"],
+        settings=_settings("current"),
+        max_batches=2,
+    )
+
+    # The final repair reopened a target after the last zero-claim wave.
+    assert result.frontier_closed is False
+    assert events == ["fetch", "parse", "fetch", "parse", "scope_reconcile"]
+
+
+def test_history_live_run_keeps_per_wave_scope_reconciliation(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    events = []
+    fetch_results = iter((WaveResult(claimed=1), WaveResult()))
+
+    pipeline.fetch_wave = lambda *_args, **_kwargs: next(fetch_results)
+
+    def parse_wave(*_args, **_kwargs):
+        pipeline._reconcile_frontier_scope()
+        return WaveResult(cohort_size=1, parsed=1)
+
+    pipeline.parse_wave = parse_wave
+    control.reconcile_frontier_scope = lambda **_kwargs: events.append(
+        "scope_reconcile"
+    )
+
+    pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="history-live",
+        page_kinds=["season"],
+        settings=_settings("backfill"),
+        max_batches=2,
+    )
+
+    assert events == ["scope_reconcile", "scope_reconcile"]
+
+
+def test_failed_current_live_run_still_reconciles_deferred_scope(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    events = []
+    fetch_calls = 0
+
+    def fetch_wave(*_args, **_kwargs):
+        nonlocal fetch_calls
+        fetch_calls += 1
+        if fetch_calls == 2:
+            raise FetchWaveError("second wave failed")
+        return WaveResult(claimed=1)
+
+    def parse_wave(*_args, **_kwargs):
+        pipeline._reconcile_frontier_scope()
+        return WaveResult(cohort_size=1, parsed=1)
+
+    pipeline.fetch_wave = fetch_wave
+    pipeline.parse_wave = parse_wave
+    control.reconcile_frontier_scope = lambda **_kwargs: events.append(
+        "scope_reconcile"
+    )
+
+    with pytest.raises(FetchWaveError, match="second wave failed"):
+        pipeline.run_live_waves(
+            str(uuid.uuid4()),
+            worker_id="current-live",
+            page_kinds=["competition"],
+            settings=_settings("current"),
+            max_batches=2,
+        )
+
+    assert events == ["scope_reconcile"]
+
+
+def test_current_final_scope_reconcile_precedes_persistent_settlement(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = PersistentFakeControl(raw)
+    control.run["bytes_used"] = 120
+    control.run["bytes_reserved"] = 10
+    control._tail_reserved = 10
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    fetch_results = iter((WaveResult(claimed=1), WaveResult()))
+    parse_calls = 0
+
+    def fetch_wave(*_args, _live_session, **_kwargs):
+        fetcher = PersistentFakeFetcher(control.events)
+        fetcher.session_id = "deferred-current-session"
+        _live_session.fetcher = fetcher
+        _live_session.session_id = "deferred-current-session"
+        _live_session.state = "active"
+        _live_session.tail_reserved = True
+        return next(fetch_results)
+
+    def parse_wave(*_args, **_kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        if parse_calls == 1:
+            pipeline._reconcile_frontier_scope()
+            return WaveResult(cohort_size=1, parsed=1)
+        return WaveResult()
+
+    pipeline.fetch_wave = fetch_wave
+    pipeline.parse_wave = parse_wave
+
+    def reconcile_frontier_scope(**_kwargs):
+        control.events.append("scope_reconcile")
+        return {"reopened": 1}
+
+    control.reconcile_frontier_scope = reconcile_frontier_scope
+
+    pipeline.run_live_waves(
+        str(uuid.uuid4()),
+        worker_id="current-live",
+        page_kinds=["competition"],
+        settings=_persistent_settings(),
+        max_batches=2,
+    )
+
+    expected = (
+        "scope_reconcile",
+        "provider_finalize",
+        "tail_settle",
+        "session_close",
+        "persistent_reconcile",
+    )
+    positions = [control.events.index(event) for event in expected]
+    assert positions == sorted(positions)
+
+
+def test_nested_current_scope_deferral_cannot_report_false_closure(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    events = []
+    fetch_results = iter((WaveResult(claimed=1), WaveResult()))
+    parse_results = iter((WaveResult(cohort_size=1, parsed=1), WaveResult()))
+
+    pipeline.fetch_wave = lambda *_args, **_kwargs: next(fetch_results)
+
+    def parse_wave(*_args, **_kwargs):
+        pipeline._reconcile_frontier_scope()
+        return next(parse_results)
+
+    pipeline.parse_wave = parse_wave
+
+    def reconcile_frontier_scope(**_kwargs):
+        events.append("scope_reconcile")
+        return {"reopened": 1}
+
+    control.reconcile_frontier_scope = reconcile_frontier_scope
+
+    with pipeline._deferred_scope_reconcile():
+        result = pipeline.run_live_waves(
+            str(uuid.uuid4()),
+            worker_id="current-live",
+            page_kinds=["competition"],
+            settings=_settings("current"),
+            max_batches=2,
+        )
+        assert result.frontier_closed is False
+        assert events == []
+
+    assert events == ["scope_reconcile"]
+
+
+def test_nested_current_deferral_keeps_true_closure_without_pending_repair(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    pipeline.fetch_wave = lambda *_args, **_kwargs: WaveResult()
+    pipeline.parse_wave = lambda *_args, **_kwargs: WaveResult()
+
+    with pipeline._deferred_scope_reconcile():
+        result = pipeline.run_live_waves(
+            str(uuid.uuid4()),
+            worker_id="current-live",
+            page_kinds=["competition"],
+            settings=_settings("current"),
+            max_batches=1,
+        )
+
+    assert result.frontier_closed is True
+
+
 def test_live_runner_closes_near_deadline_session_before_offline_parse(
     tmp_path,
 ):
@@ -9064,7 +10413,11 @@ def test_one_stubborn_page_is_deferred_instead_of_discarding_the_wave(
     # backoff instead of buying it another paid session here.
     assert [
         kwargs.get("session_retry", False) for kwargs in stubborn_failures
-    ] == [True, True, False]
+    ] == [
+        True,
+        True,
+        False,
+    ]
     # requeue=True is what drops the target from this run: it closes the run
     # target as 'skipped', which claim_targets will not take again.  It also
     # clears retry_after, so no delay may be claimed here -- pinned by
@@ -9207,11 +10560,17 @@ def test_a_late_re_solve_reserves_the_rotations_it_can_still_afford():
     )
     # Bytes bind the same way.
     assert affordable_clearance_reservation(
-        daily, request_remaining=200, byte_remaining=8 * 1024 * 1024
+        daily, request_remaining=200, byte_remaining=13 * 1024 * 1024
     ) == (20, 4 * 1024 * 1024)
     assert (
         affordable_clearance_reservation(
-            daily, request_remaining=200, byte_remaining=6 * 1024 * 1024
+            daily, request_remaining=200, byte_remaining=12 * 1024 * 1024
+        )
+        is None
+    )
+    assert (
+        affordable_clearance_reservation(
+            daily, request_remaining=200, byte_remaining=8 * 1024 * 1024
         )
         is None
     )
@@ -9845,3 +11204,1227 @@ def test_discovery_batch_within_the_ceiling_stays_one_atomic_write(tmp_path):
     pipeline._seed_link_candidates(candidates, parent_record=None)
 
     assert len(calls) == 1
+
+
+class FakeMovedFetcher:
+    """A source that answers with a redirect instead of the page."""
+
+    STATUS = 301
+    LOCATION = (
+        "https://fbref.com/en/comps/33/2026-2027/2026-2027-2-Bundesliga-Stats"
+    )
+
+    def __init__(self, events):
+        self.events = events
+
+    def __enter__(self):
+        self.events.append("fetcher_enter")
+        return self
+
+    def __exit__(self, *args):
+        self.events.append("fetcher_exit")
+
+    def ensure_clearance(self):
+        self.events.append("browser")
+        return True
+
+    def fetch(self, url, **kwargs):
+        self.events.append("http")
+        raise FetchError(
+            f"FBref returned HTTP {self.STATUS} for {url}; attempts=1; "
+            f"status_history={self.STATUS}; location={self.LOCATION}",
+            error_class="http_status",
+            http_status=self.STATUS,
+            wire_bytes=303,
+            browser_document_bytes=0,
+            browser_asset_bytes=0,
+            browser_requests=0,
+            browser_bootstrap_attempts=0,
+            browser_unobserved_bytes=0,
+            target_requests=1,
+            http_status_history=(self.STATUS,),
+            latency_ms=321,
+            redirect_location=self.LOCATION,
+        )
+
+
+def test_moved_page_is_skipped_without_failing_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeMovedFetcher(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="worker-1",
+        page_kinds=["competition_index"],
+        settings=_settings(),
+    )
+
+    # A page that merely moved must not take the whole wave down with it.
+    assert result.failures == []
+    assert result.moved_pages_skipped == 1
+    # The attempt is still durable evidence, not a silent skip.
+    assert "fail" in control.events
+    # Handed back as 'skipped'/'queued' -- the only reversible shape.
+    # 'retry' would re-fetch it all run and still count as unfinished;
+    # 'dead' (permanent) is terminal with no path back, so one bad exit
+    # answering 301 would destroy healthy pages on first contact.
+    assert control.failed[0][1]["requeue"] is True
+    assert control.failed[0][1]["permanent"] is False
+
+
+class FakeNotFoundFetcher(FakeMovedFetcher):
+    """A genuinely broken target: not a redirect, so the wave must still die."""
+
+    def fetch(self, url, **kwargs):
+        self.events.append("http")
+        raise FetchError(
+            f"FBref returned HTTP 404 for {url}; attempts=1; status_history=404",
+            error_class="http_status",
+            http_status=404,
+            wire_bytes=303,
+            browser_document_bytes=0,
+            browser_asset_bytes=0,
+            browser_requests=0,
+            browser_bootstrap_attempts=0,
+            browser_unobserved_bytes=0,
+            target_requests=1,
+            http_status_history=(404,),
+            latency_ms=321,
+        )
+
+
+def test_non_redirect_page_failure_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeNotFoundFetcher(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        pipeline.fetch_wave(
+            str(uuid.UUID(int=1)),
+            worker_id="worker-1",
+            page_kinds=["competition_index"],
+            settings=_settings(),
+        )
+
+    assert control.failed[0][1]["requeue"] is False
+
+
+def _match_fetch_lease(run_id, number, *, attempt_number=1):
+    match_id = f"{number:08x}"
+    return TargetLease(
+        attempt_id=str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"match-attempt:{run_id}:{match_id}:{attempt_number}",
+            )
+        ),
+        run_id=run_id,
+        target_id=f"fbref:match:{match_id}",
+        logical_refresh_id=str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"match-refresh:{run_id}:{match_id}",
+            )
+        ),
+        canonical_url=f"https://fbref.com/en/matches/{match_id}",
+        page_kind="match",
+        source_ids={"match_id": match_id},
+        claim_token=str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"match-token:{run_id}:{match_id}:{attempt_number}",
+            )
+        ),
+        lease_epoch=attempt_number,
+        attempt_number=attempt_number,
+        leased_by="match-worker",
+        lease_expires_at=NOW + timedelta(minutes=10),
+    )
+
+
+class FakeMatchCohortControl(FakeControl):
+    """Return one exact scripted match cohort for each fetch wave."""
+
+    def __init__(self, raw, cohorts):
+        super().__init__(raw)
+        self.cohorts = [list(cohort) for cohort in cohorts]
+
+    def claim_targets(self, run_id, worker_id, *, limit, **_kwargs):
+        self.events.append("claim")
+        cohort = self.cohorts.pop(0)
+        assert all(lease.run_id == run_id for lease in cohort)
+        assert len(cohort) <= limit
+        return cohort
+
+
+class FakeSelectiveMatchNotFoundFetcher(FakeFetcher):
+    """Return one durable 404 per configured match, then recover to 200."""
+
+    def __init__(self, events, remaining_not_found):
+        super().__init__(events, b"<html>healthy-match</html>")
+        self.remaining_not_found = remaining_not_found
+
+    def fetch(self, url, **kwargs):
+        match_id = url.rstrip("/").rsplit("/", 1)[-1]
+        remaining = self.remaining_not_found.get(match_id, 0)
+        if remaining <= 0:
+            return super().fetch(url, **kwargs)
+        self.remaining_not_found[match_id] = remaining - 1
+        self.events.append("http_404")
+        raise FetchError(
+            f"FBref returned HTTP 404 for {url}; attempts=1; status_history=404",
+            error_class="http_status",
+            http_status=404,
+            wire_bytes=303,
+            browser_document_bytes=0,
+            browser_asset_bytes=0,
+            browser_requests=0,
+            browser_bootstrap_attempts=0,
+            browser_unobserved_bytes=0,
+            target_requests=1,
+            http_status_history=(404,),
+            latency_ms=321,
+        )
+
+
+def _match_not_found_pipeline(tmp_path, cohorts, not_found_counts):
+    raw = _raw_store(tmp_path)
+    control = FakeMatchCohortControl(raw, cohorts)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeSelectiveMatchNotFoundFetcher(
+            control.events,
+            not_found_counts,
+        ),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+    return pipeline, control
+
+
+def test_match_404_is_deferred_while_sibling_and_next_run_succeed(tmp_path):
+    first_run_id = str(uuid.UUID(int=7101))
+    retry_run_id = str(uuid.UUID(int=7102))
+    missing = _match_fetch_lease(first_run_id, 1)
+    healthy = _match_fetch_lease(first_run_id, 2)
+    retry = _match_fetch_lease(retry_run_id, 1, attempt_number=2)
+    pipeline, control = _match_not_found_pipeline(
+        tmp_path,
+        [[missing, healthy], [retry]],
+        {missing.source_ids["match_id"]: 1},
+    )
+    settings = replace(_settings(), shard_size=2)
+
+    first = pipeline.fetch_wave(
+        first_run_id,
+        worker_id="match-worker",
+        page_kinds=["match"],
+        settings=settings,
+    )
+
+    assert first.failures == []
+    assert first.deferred_match_not_found == 1
+    assert first.fetched == 1
+    assert control.failed[0][0].target_id == missing.target_id
+    assert control.failed[0][1]["http_status"] == 404
+    assert control.failed[0][1]["requeue"] is True
+    assert control.failed[0][1]["permanent"] is False
+    assert control.completed[0][0].target_id == healthy.target_id
+    # A target-local 404 cannot leak its suspect session into the sibling.
+    assert control.events.count("fetcher_enter") == 2
+
+    second = pipeline.fetch_wave(
+        retry_run_id,
+        worker_id="match-worker",
+        page_kinds=["match"],
+        settings=settings,
+    )
+
+    assert second.deferred_match_not_found == 0
+    assert second.fetched == 1
+    assert control.completed[-1][0].target_id == missing.target_id
+
+
+@pytest.mark.parametrize(
+    ("error_class", "http_status", "permanent"),
+    [
+        ("http_status", 500, False),
+    ],
+)
+def test_other_match_target_failure_remains_fail_closed(
+    tmp_path,
+    error_class,
+    http_status,
+    permanent,
+):
+    run_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"match-error:{error_class}"))
+    lease = _match_fetch_lease(run_id, 1)
+    raw = _raw_store(tmp_path)
+    control = FakeMatchCohortControl(raw, [[lease]])
+
+    class OtherMatchFailureFetcher(FakeFetcher):
+        def fetch(self, url, **_kwargs):
+            self.events.append("http_error")
+            raise FetchError(
+                f"target failure for {url}",
+                error_class=error_class,
+                http_status=http_status,
+                wire_bytes=303,
+                browser_document_bytes=0,
+                browser_asset_bytes=0,
+                browser_requests=0,
+                browser_bootstrap_attempts=0,
+                browser_unobserved_bytes=0,
+                target_requests=1,
+                http_status_history=(
+                    () if http_status is None else (http_status,)
+                ),
+                latency_ms=321,
+            )
+
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: OtherMatchFailureFetcher(
+            control.events,
+            b"unused",
+        ),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError, match=error_class):
+        pipeline.fetch_wave(
+            run_id,
+            worker_id="match-worker",
+            page_kinds=["match"],
+            settings=replace(_settings(), shard_size=1),
+        )
+
+    assert control.failed[0][1]["requeue"] is False
+    assert control.failed[0][1]["permanent"] is permanent
+
+
+@pytest.mark.parametrize(
+    ("cohort_size", "not_found_count"),
+    [(10, 5), (12, 6)],
+)
+def test_match_404_at_floor_or_exactly_half_stays_target_local(
+    tmp_path,
+    cohort_size,
+    not_found_count,
+):
+    run_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"routine-404:{cohort_size}"))
+    leases = [
+        _match_fetch_lease(run_id, number)
+        for number in range(1, cohort_size + 1)
+    ]
+    missing = {
+        lease.source_ids["match_id"]: 1
+        for lease in leases[:not_found_count]
+    }
+    pipeline, _control = _match_not_found_pipeline(
+        tmp_path,
+        [leases],
+        missing,
+    )
+
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="match-worker",
+        page_kinds=["match"],
+        settings=replace(
+            _settings(),
+            shard_size=cohort_size,
+            request_limit=100,
+        ),
+    )
+
+    assert result.deferred_match_not_found == not_found_count
+    assert result.fetched == cohort_size - not_found_count
+
+
+def test_match_404_above_floor_and_majority_trips_wave_circuit(tmp_path):
+    run_id = str(uuid.UUID(int=7201))
+    leases = [
+        _match_fetch_lease(run_id, number) for number in range(1, 11)
+    ]
+    missing = {
+        lease.source_ids["match_id"]: 1 for lease in leases[:6]
+    }
+    pipeline, control = _match_not_found_pipeline(
+        tmp_path,
+        [leases],
+        missing,
+    )
+
+    with pytest.raises(FetchWaveError, match="mass_match_not_found=6/10"):
+        pipeline.fetch_wave(
+            run_id,
+            worker_id="match-worker",
+            page_kinds=["match"],
+            settings=replace(
+                _settings(),
+                shard_size=10,
+                request_limit=100,
+            ),
+        )
+
+    assert len(control.failed) == 6
+    assert all(item[1]["requeue"] is True for item in control.failed)
+    assert len(control.completed) == 0
+    assert sum(
+        event.startswith("requeue:") for event in control.events
+    ) == 4
+
+
+@pytest.mark.parametrize(
+    ("batches", "raises"),
+    [(5, False), (6, True)],
+)
+def test_run_level_match_404_ceiling_is_strictly_above_twenty_five(
+    tmp_path,
+    batches,
+    raises,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    def fake_fetch(*_args, **_kwargs):
+        return WaveResult(
+            claimed=25,
+            cohort_size=25,
+            deferred_match_not_found=5,
+        )
+
+    pipeline.fetch_wave = fake_fetch
+    pipeline.parse_wave = lambda *_args, **_kwargs: WaveResult(
+        cohort_size=25,
+        parsed=20,
+    )
+
+    def execute():
+        return pipeline.run_live_waves(
+            str(uuid.UUID(int=7300 + batches)),
+            worker_id="match-worker",
+            page_kinds=["match"],
+            settings=_settings(),
+            max_batches=batches,
+        )
+
+    if raises:
+        with pytest.raises(
+            FetchWaveError,
+            match="mass_match_not_found_run=30",
+        ):
+            execute()
+    else:
+        result = execute()
+        assert result.fetch.deferred_match_not_found == 25
+
+
+def test_live_run_serialization_exposes_deferred_match_not_found():
+    payload = LiveRunResult(
+        fetch=WaveResult(deferred_match_not_found=1)
+    ).as_dict()
+
+    assert payload["fetch"]["deferred_match_not_found"] == 1
+
+
+def _season_stats_fetch_lease(run_id, number):
+    competition_id = str(number)
+    stat_type = f"playingtime-{number}"
+    return TargetLease(
+        attempt_id=str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"season-stats-attempt:{run_id}:{competition_id}:{stat_type}",
+            )
+        ),
+        run_id=run_id,
+        target_id=(f"fbref:season_stats:{competition_id}:2026-2027:{stat_type}"),
+        logical_refresh_id=str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"season-stats-refresh:{run_id}:{competition_id}:{stat_type}",
+            )
+        ),
+        canonical_url=(
+            f"https://fbref.com/en/comps/{competition_id}/{stat_type}/"
+            f"2026-2027-{stat_type}-Stats"
+        ),
+        page_kind="season_stats",
+        source_ids={
+            "competition_id": competition_id,
+            "season_id": "2026-2027",
+            "stat_type": stat_type,
+        },
+        claim_token=str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"season-stats-token:{run_id}:{competition_id}:{stat_type}",
+            )
+        ),
+        lease_epoch=1,
+        attempt_number=1,
+        leased_by="season-stats-worker",
+        lease_expires_at=NOW + timedelta(minutes=10),
+    )
+
+
+class FakeSelectiveOversizedFetcher(FakeFetcher):
+    """Reject selected pages at the decoded-body ceiling, not the session."""
+
+    def __init__(self, events, oversized_urls):
+        super().__init__(events, b"<html>healthy-season-stats</html>")
+        self.oversized_urls = set(oversized_urls)
+
+    def fetch(self, url, **kwargs):
+        if url not in self.oversized_urls:
+            return super().fetch(url, **kwargs)
+        self.events.append("response_too_large")
+        raise FetchError(
+            f"FBref response body exceeds decoded limit for {url}",
+            error_class="response_too_large",
+            http_status=200,
+            wire_bytes=303,
+            browser_document_bytes=20,
+            browser_asset_bytes=10,
+            browser_requests=1,
+            browser_bootstrap_attempts=1,
+            browser_unobserved_bytes=0,
+            provider_billed_bytes=321,
+            target_requests=1,
+            http_status_history=(200,),
+            latency_ms=321,
+        )
+
+
+def _oversized_pipeline(tmp_path, cohorts, oversized_urls):
+    raw = _raw_store(tmp_path)
+    control = FakeMatchCohortControl(raw, cohorts)
+    fetcher = FakeSelectiveOversizedFetcher(control.events, oversized_urls)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: fetcher,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+    return pipeline, control
+
+
+def test_single_oversized_page_is_terminal_but_run_reaches_validation(
+    tmp_path,
+):
+    run_id = str(uuid.UUID(int=7401))
+    oversized = _season_stats_fetch_lease(run_id, 1)
+    healthy = _season_stats_fetch_lease(run_id, 2)
+    pipeline, control = _oversized_pipeline(
+        tmp_path,
+        [[oversized, healthy]],
+        {oversized.canonical_url},
+    )
+    parse_calls = []
+
+    def parse_wave(*_args, **_kwargs):
+        parse_calls.append("parse")
+        return WaveResult(cohort_size=1, parsed=1)
+
+    pipeline.parse_wave = parse_wave
+
+    result = pipeline.run_live_waves(
+        run_id,
+        worker_id="season-stats-worker",
+        page_kinds=["season_stats"],
+        settings=replace(_settings(), shard_size=2),
+        max_batches=1,
+    )
+    pipeline.validate_and_finish(run_id, publication_eligible=False)
+
+    assert result.fetch.terminal_oversized_pages == 1
+    assert result.fetch.fetched == 1
+    assert parse_calls == ["parse"]
+    failure = control.failed[0][1]
+    assert failure["permanent"] is True
+    assert failure["requeue"] is False
+    assert failure["provider_billed_bytes"] == 321
+    assert control.events.index("settle") < control.events.index("fail")
+    assert control.completed[0][0].target_id == healthy.target_id
+    assert "finish:True" in control.events
+
+
+def test_terminal_oversized_page_preserves_exact_persistent_settlement(
+    tmp_path,
+):
+    raw = _raw_store(tmp_path)
+    control = PersistentFakeControl(raw)
+    run_id = str(uuid.UUID(int=7402))
+    lease = _season_stats_fetch_lease(run_id, 1)
+    control.claim_targets = lambda *_args, **_kwargs: [lease]
+
+    class PersistentOversizedFetcher(PersistentFakeFetcher):
+        def reset_clearance(self):
+            self.events.append("reset_clearance")
+
+        def fetch(self, url, **_kwargs):
+            self.events.append("response_too_large")
+            raise FetchError(
+                f"FBref response body exceeds decoded limit for {url}",
+                error_class="response_too_large",
+                http_status=200,
+                wire_bytes=80,
+                browser_document_bytes=20,
+                browser_asset_bytes=10,
+                browser_requests=1,
+                browser_bootstrap_attempts=1,
+                provider_billed_bytes=120,
+                target_requests=1,
+                http_status_history=(200,),
+                latency_ms=321,
+            )
+
+    fetcher = PersistentOversizedFetcher(control.events)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_args: fetcher,
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="season-stats-worker",
+        page_kinds=["season_stats"],
+        settings=replace(_persistent_settings(), shard_size=1),
+    )
+
+    assert result.terminal_oversized_pages == 1
+    assert len(control.page_evidence) == 1
+    assert control.page_evidence[0][2]["provider_billed_bytes"] == 120
+    assert len(control.tail_evidence) == 1
+    assert control.run["requests_reserved"] == 0
+    assert control.run["bytes_reserved"] == 0
+    expected_order = (
+        "page_settle",
+        "fail",
+        "provider_finalize",
+        "tail_settle",
+        "session_close",
+        "persistent_reconcile",
+    )
+    positions = [control.events.index(item) for item in expected_order]
+    assert positions == sorted(positions)
+
+
+@pytest.mark.parametrize(
+    ("cohort_size", "oversized_count"),
+    [(10, 5), (12, 6)],
+)
+def test_oversized_page_at_floor_or_exactly_half_stays_target_local(
+    tmp_path,
+    cohort_size,
+    oversized_count,
+):
+    run_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"routine-oversized:{cohort_size}"))
+    leases = [
+        _season_stats_fetch_lease(run_id, number)
+        for number in range(1, cohort_size + 1)
+    ]
+    oversized_urls = {lease.canonical_url for lease in leases[:oversized_count]}
+    pipeline, control = _oversized_pipeline(
+        tmp_path,
+        [leases],
+        oversized_urls,
+    )
+
+    result = pipeline.fetch_wave(
+        run_id,
+        worker_id="season-stats-worker",
+        page_kinds=["season_stats"],
+        settings=replace(
+            _settings(),
+            shard_size=cohort_size,
+            request_limit=100,
+        ),
+    )
+
+    assert result.terminal_oversized_pages == oversized_count
+    assert result.fetched == cohort_size - oversized_count
+    assert all(item[1]["permanent"] is True for item in control.failed)
+    assert all(item[1]["requeue"] is False for item in control.failed)
+
+
+def test_oversized_page_above_floor_and_majority_trips_wave_circuit(tmp_path):
+    run_id = str(uuid.UUID(int=7501))
+    leases = [_season_stats_fetch_lease(run_id, number) for number in range(1, 11)]
+    oversized_urls = {lease.canonical_url for lease in leases[:6]}
+    pipeline, control = _oversized_pipeline(
+        tmp_path,
+        [leases],
+        oversized_urls,
+    )
+
+    with pytest.raises(FetchWaveError, match="mass_response_too_large=6/10"):
+        pipeline.fetch_wave(
+            run_id,
+            worker_id="season-stats-worker",
+            page_kinds=["season_stats"],
+            settings=replace(
+                _settings(),
+                shard_size=10,
+                request_limit=100,
+            ),
+        )
+
+    assert len(control.failed) == 6
+    assert all(item[1]["permanent"] is True for item in control.failed)
+    assert all(item[1]["requeue"] is False for item in control.failed)
+    assert len(control.completed) == 0
+    assert sum(event.startswith("requeue:") for event in control.events) == 4
+
+
+@pytest.mark.parametrize(
+    ("batches", "raises"),
+    [(5, False), (6, True)],
+)
+def test_run_level_oversized_page_ceiling_is_strictly_above_twenty_five(
+    tmp_path,
+    batches,
+    raises,
+):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+    pipeline.fetch_wave = lambda *_args, **_kwargs: WaveResult(
+        claimed=25,
+        cohort_size=25,
+        terminal_oversized_pages=5,
+    )
+    pipeline.parse_wave = lambda *_args, **_kwargs: WaveResult(
+        cohort_size=25,
+        parsed=20,
+    )
+
+    def execute():
+        return pipeline.run_live_waves(
+            str(uuid.UUID(int=7600 + batches)),
+            worker_id="season-stats-worker",
+            page_kinds=["season_stats"],
+            settings=_settings(),
+            max_batches=batches,
+        )
+
+    if raises:
+        with pytest.raises(
+            FetchWaveError,
+            match="mass_response_too_large_run=30",
+        ):
+            execute()
+    else:
+        result = execute()
+        assert result.fetch.terminal_oversized_pages == 25
+
+
+def test_live_run_serialization_exposes_terminal_oversized_pages():
+    payload = LiveRunResult(fetch=WaveResult(terminal_oversized_pages=1)).as_dict()
+
+    assert payload["fetch"]["terminal_oversized_pages"] == 1
+
+
+class FakeChallengeRedirectFetcher(FakeMovedFetcher):
+    """A 302 is what a challenge or proxy error page answers with.
+
+    Location is present on purpose: the wave must fail because of the
+    *status*, not because the header happened to be missing.
+    """
+
+    STATUS = 302
+    LOCATION = "https://fbref.com/en/comps/33/somewhere-else"
+
+
+class FakeSeeOtherRedirectFetcher(FakeMovedFetcher):
+    """307 keeps the method but is still a temporary answer."""
+
+    STATUS = 307
+    LOCATION = "https://fbref.com/en/comps/33/somewhere-else"
+
+
+class FakePermanentlyRelocatedFetcher(FakeMovedFetcher):
+    """308 is 301's method-preserving twin and must be treated alike."""
+
+    STATUS = 308
+
+
+class FakeLocationlessRedirectFetcher(FakeMovedFetcher):
+    """A 301 with no Location names no address and is not actionable."""
+
+    LOCATION = None
+
+
+def test_temporary_redirect_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeChallengeRedirectFetcher(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        pipeline.fetch_wave(
+            str(uuid.UUID(int=1)),
+            worker_id="worker-1",
+            page_kinds=["competition_index"],
+            settings=_settings(),
+        )
+
+
+def test_mass_redirect_breaks_the_wave_instead_of_shrinking_scope():
+    result = WaveResult(cohort_size=10, moved_pages_skipped=6)
+    assert _is_mass_redirect(result) is True
+
+
+def test_a_couple_of_moved_pages_is_not_a_mass_redirect():
+    # The motivating case: 2 retired aliases in a full daily cohort.
+    assert _is_mass_redirect(
+        WaveResult(cohort_size=25, moved_pages_skipped=2)
+    ) is False
+    # Dominating a tiny cohort is still routine below the absolute floor.
+    assert _is_mass_redirect(
+        WaveResult(cohort_size=4, moved_pages_skipped=4)
+    ) is False
+
+
+class FakeHijackedControl(FakeControl):
+    """A cohort wide enough to reach the mass-redirect gate."""
+
+    COHORT = 12
+
+    def __init__(self, raw):
+        super().__init__(raw)
+        self.session_close_statuses = []
+
+    def close_clearance_session(self, session_id, **kwargs):
+        self.events.append("session_close")
+        self.session_close_statuses.append(kwargs.get("status"))
+
+    def claim_targets(
+        self,
+        run_id,
+        worker_id,
+        *,
+        limit,
+        lease_seconds,
+        page_kinds=None,
+        refresh_policies=None,
+    ):
+        self.events.append("claim")
+        leases = [
+            TargetLease(
+                attempt_id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"a{index}")),
+                run_id=run_id,
+                target_id=f"fbref:season:{index}:2026-2027",
+                logical_refresh_id=str(
+                    uuid.uuid5(uuid.NAMESPACE_URL, f"r{index}")
+                ),
+                canonical_url=(
+                    f"https://fbref.com/en/comps/{index}/League-Stats"
+                ),
+                page_kind="season",
+                source_ids={
+                    "competition_id": str(index),
+                    "season_id": "2026-2027",
+                },
+                claim_token=str(uuid.uuid5(uuid.NAMESPACE_URL, f"t{index}")),
+                lease_epoch=1,
+                attempt_number=1,
+                leased_by=worker_id,
+                lease_expires_at=NOW + timedelta(minutes=10),
+            )
+            for index in range(self.COHORT)
+        ]
+        return leases[:limit]
+
+
+def test_a_hijacked_cohort_fails_the_wave_and_blames_the_session(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeHijackedControl(raw)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: FakeMovedFetcher(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+
+    # A cohort wide enough that redirects can dominate it: the gate needs
+    # both the absolute floor and more than half the wave.
+    settings = replace(_settings(), shard_size=12, request_limit=60)
+
+    with pytest.raises(FetchWaveError, match="mass_redirect"):
+        pipeline.fetch_wave(
+            str(uuid.UUID(int=1)),
+            worker_id="worker-1",
+            page_kinds=["season"],
+            settings=settings,
+        )
+
+    # The verdict must be decided before the session is closed, or the exit
+    # that hijacked the cohort is recorded as healthy on the way out.
+    assert control.session_close_statuses == ["failed"]
+
+
+def test_run_level_cap_catches_a_hijack_too_thin_for_any_single_wave():
+    # 20% of every 25-page cohort stays under the per-wave floor forever,
+    # so only the run-wide ceiling can see it.
+    thin_hijack = WaveResult(cohort_size=2000, moved_pages_skipped=400)
+    assert _is_mass_redirect(thin_hijack) is False
+    assert _is_run_mass_redirect(thin_hijack) is True
+
+
+def test_run_level_cap_leaves_a_handful_of_dead_aliases_alone():
+    # The motivating case across a whole run: comps 33 and 59, every wave.
+    assert _is_run_mass_redirect(
+        WaveResult(cohort_size=2000, moved_pages_skipped=2)
+    ) is False
+
+
+def _wave_with(control, fetcher_cls, settings=None):
+    raw = control.raw if hasattr(control, "raw") else None
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_: fetcher_cls(control.events),
+        sleep=lambda _: None,
+        clock=lambda: NOW,
+    )
+    return pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="worker-1",
+        page_kinds=["competition_index"],
+        settings=settings or _settings(),
+    )
+
+
+def test_permanent_308_is_spared_like_301(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    result = _wave_with(control, FakePermanentlyRelocatedFetcher)
+
+    assert result.failures == []
+    assert result.moved_pages_skipped == 1
+
+
+def test_temporary_307_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeSeeOtherRedirectFetcher)
+
+
+def test_redirect_without_location_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    # Permanent status, but no address to name or act on: not a usable
+    # "the page moved" statement, so it must stay loud.
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeLocationlessRedirectFetcher)
+
+
+def test_run_ceiling_stops_a_hijack_spread_thin_across_waves(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    pipeline = FBrefPipeline(control, raw, generic_writer=FakeWriter())
+
+    # Each wave stays under the per-wave gate (5 of a 25-page cohort never
+    # exceeds half of it), so only the run-wide ceiling can end this.
+    def fake_fetch(*args, _live_session, **kwargs):
+        _live_session.fetcher = object()
+        _live_session.needs_clearance = False
+        # A live clearance session exists while the cohort is collected, so
+        # the run's exit path has something to blame.
+        _live_session.session_id = "session"
+        _live_session.state = "control_open"
+        return WaveResult(claimed=25, cohort_size=25, moved_pages_skipped=5)
+
+    def fake_parse(*args, **kwargs):
+        return WaveResult(cohort_size=25, parsed=20)
+
+    pipeline.fetch_wave = fake_fetch
+    pipeline.parse_wave = fake_parse
+
+    closes = []
+    original_close = control.close_clearance_session
+
+    def close_recording(session_id, **kwargs):
+        closes.append(kwargs.get("status"))
+        return original_close(session_id, **kwargs)
+
+    control.close_clearance_session = close_recording
+
+    with pytest.raises(FetchWaveError, match="mass_redirect_run"):
+        pipeline.run_live_waves(
+            str(uuid.uuid4()),
+            worker_id="current-live",
+            page_kinds=["competition_index"],
+            settings=_settings(),
+            max_batches=80,
+        )
+
+    # The session that was collecting the hijacked cohort must be blamed,
+    # not closed as healthy on the way out.
+    assert closes and all(status == "failed" for status in closes)
+
+
+class FakeSeeOtherStatusFetcher(FakeMovedFetcher):
+    """303 rewrites the method and is never a "the page moved" statement."""
+
+    STATUS = 303
+    LOCATION = "https://fbref.com/en/comps/33/somewhere-else"
+
+
+def test_see_other_303_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeSeeOtherStatusFetcher)
+
+
+class FakeHijackedExitFetcher(FakeMovedFetcher):
+    """A captive portal answering 301 with its own login page."""
+
+    LOCATION = "https://portal.example/login"
+
+
+def test_redirect_off_the_source_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    # Shrinking the scope on somebody else's say-so is how a hijacked exit
+    # quietly drops pages: the mass gates only catch a wholesale takeover, so
+    # a handful of stolen pages would otherwise pass every one of them.
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeHijackedExitFetcher)
+
+
+class FakeUserinfoDisguiseFetcher(FakeMovedFetcher):
+    """A hijack dressed as the source through a userinfo segment."""
+
+    LOCATION = "https://fbref.com@portal.example/login"
+
+
+def test_redirect_disguised_by_userinfo_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    # The host here is portal.example, not fbref.com.  Sanitising the header
+    # before parsing it would rewrite '@' to '?' and make this read as the
+    # source's own address -- which is why the raw value is what gets parsed.
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeUserinfoDisguiseFetcher)
+
+
+class FakePlainHttpRedirectFetcher(FakeMovedFetcher):
+    """The right host, but downgraded to a scheme anyone can forge."""
+
+    LOCATION = "http://fbref.com/en/comps/33/2026-2027/2026-2027-Stats"
+
+
+def test_plain_http_redirect_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakePlainHttpRedirectFetcher)
+
+
+class FakeProtocolRelativeRedirectFetcher(FakeMovedFetcher):
+    """`//host/path` names a host that is not ours to assume."""
+
+    LOCATION = "//portal.example/login"
+
+
+def test_protocol_relative_redirect_still_fails_the_wave(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    with pytest.raises(FetchWaveError, match="http_status"):
+        _wave_with(control, FakeProtocolRelativeRedirectFetcher)
+
+
+class FakeRelativeRedirectFetcher(FakeMovedFetcher):
+    """A relative Location is same-origin by construction."""
+
+    LOCATION = "/en/comps/33/2026-2027/2026-2027-2-Bundesliga-Stats"
+
+
+def test_relative_redirect_is_spared_like_an_absolute_one(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    result = _wave_with(control, FakeRelativeRedirectFetcher)
+
+    assert result.failures == []
+    assert result.moved_pages_skipped == 1
+
+
+def test_moved_page_skip_is_logged_with_its_location(tmp_path, caplog):
+    raw = _raw_store(tmp_path)
+    control = FakeControl(raw)
+    control.raw = raw
+
+    with caplog.at_level(logging.WARNING, logger="scrapers.fbref.pipeline"):
+        result = _wave_with(control, FakeMovedFetcher)
+
+    assert result.moved_pages_skipped == 1
+    assert "skips moved page" in caplog.text
+    assert FakeMovedFetcher.LOCATION in caplog.text
+
+
+def test_wave_gate_boundaries_are_exact():
+    # Exactly at the absolute floor: still routine (the check is > not >=).
+    assert _is_mass_redirect(
+        WaveResult(cohort_size=10, moved_pages_skipped=5)
+    ) is False
+    # One above the floor, and past half the cohort: fires.
+    assert _is_mass_redirect(
+        WaveResult(cohort_size=10, moved_pages_skipped=6)
+    ) is True
+    # Above the floor but exactly half the cohort: does not fire.
+    assert _is_mass_redirect(
+        WaveResult(cohort_size=12, moved_pages_skipped=6)
+    ) is False
+
+
+def test_run_ceiling_boundary_is_exact():
+    # Exactly at the ceiling is still allowed; one more is not.
+    assert _is_run_mass_redirect(
+        WaveResult(cohort_size=2000, moved_pages_skipped=25)
+    ) is False
+    assert _is_run_mass_redirect(
+        WaveResult(cohort_size=2000, moved_pages_skipped=26)
+    ) is True
+
+
+def test_moved_page_is_spared_on_the_paid_persistent_path(tmp_path):
+    raw = _raw_store(tmp_path)
+    control = PersistentFakeControl(raw)
+
+    class MovedMeteredFetcher(PersistentFakeFetcher):
+        """The production shape behind a 301: a paid persistent session.
+
+        ``reset_clearance`` mirrors the real FBrefFetcher (fetcher.py:489);
+        without it the wave takes the branch that drops the fetcher and the
+        session close reports lost ownership -- an artefact of the fake, not
+        of this code path.
+        """
+
+        reset_calls = 0
+
+        def reset_clearance(self):
+            # Mirrors FBrefFetcher.reset_clearance (fetcher.py:489): drop the
+            # clearance so the next target solves a fresh one.
+            type(self).reset_calls += 1
+            self.session_id = None
+            self.events.append("reset_clearance")
+
+        def fetch(self, url, **_kwargs):
+            self.events.append("http_error")
+            raise FetchError(
+                f"FBref returned HTTP 301 for {url}; attempts=1; "
+                "status_history=301; location=https://fbref.com/en/comps/33/"
+                "2026-2027/2026-2027-2-Bundesliga-Stats",
+                error_class="http_status",
+                http_status=301,
+                wire_bytes=80,
+                browser_document_bytes=20,
+                browser_asset_bytes=10,
+                browser_requests=1,
+                browser_bootstrap_attempts=1,
+                provider_billed_bytes=120,
+                target_requests=1,
+                http_status_history=(301,),
+                redirect_location=(
+                    "https://fbref.com/en/comps/33/2026-2027/"
+                    "2026-2027-2-Bundesliga-Stats"
+                ),
+            )
+
+    control.session_close_statuses = []
+    original_close = control.close_clearance_session
+
+    def close_recording(session_id, **kwargs):
+        control.session_close_statuses.append(kwargs.get("status"))
+        return original_close(session_id, **kwargs)
+
+    control.close_clearance_session = close_recording
+
+    fetcher = MovedMeteredFetcher(control.events)
+    pipeline = FBrefPipeline(
+        control,
+        raw,
+        generic_writer=FakeWriter(),
+        fetcher_factory=lambda *_args: fetcher,
+        sleep=lambda _seconds: None,
+        clock=lambda: NOW,
+    )
+
+    result = pipeline.fetch_wave(
+        str(uuid.UUID(int=1)),
+        worker_id="persistent-moved",
+        page_kinds=["competition_index"],
+        settings=_persistent_settings(),
+    )
+
+    # The production paid path, not just the plain one.
+    assert result.failures == []
+    assert result.moved_pages_skipped == 1
+    assert control.failed[0][1]["requeue"] is True
+    # Exact settlement still happened: the paid bytes are on the attempt.
+    assert control.failed[0][1]["provider_billed_bytes"] == 120
+    # The paid session is finalized as failed and then recycled -- the wave
+    # does not carry a session that just lost a page into the next target.
+    assert "failed" in control.session_close_statuses
+    assert "reset_clearance" in control.events
+    assert fetcher.reset_calls == 1

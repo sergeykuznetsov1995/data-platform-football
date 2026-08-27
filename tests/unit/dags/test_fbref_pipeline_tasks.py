@@ -53,6 +53,17 @@ def _freshness_summary(*, stale_kind: str | None = None) -> dict:
     }
 
 
+def test_default_task_settings_reserve_largest_supported_body_plus_overhead():
+    settings = fbref_pipeline_tasks._settings(
+        run_type="current",
+        request_limit=100,
+        byte_limit_mb=50,
+        shard_size=25,
+    )
+
+    assert settings.request_reservation_bytes == 9 * 1024 * 1024
+
+
 @pytest.mark.unit
 def test_runtime_limits_allow_only_hard_production_canary_and_replay_profiles():
     production = fbref_pipeline_tasks.validate_fbref_runtime_limits(
@@ -177,8 +188,7 @@ def test_live_wave_wrapper_accepts_int_and_templated_int_string(
 
         def communicate(self, *, timeout=None):
             return (
-                'FBREF_LIVE_WAVES_RESULT:{"batches": 1, '
-                '"frontier_closed": true}\n',
+                'FBREF_LIVE_WAVES_RESULT:{"batches": 1, "frontier_closed": true}\n',
                 "",
             )
 
@@ -2051,8 +2061,7 @@ def test_live_waves_use_one_process_group_for_all_batches(monkeypatch):
         def communicate(self, *, timeout=None):
             assert timeout == fbref_pipeline_tasks.LIVE_WAVES_TIMEOUT_SECONDS
             return (
-                'FBREF_LIVE_WAVES_RESULT:{"batches": 3, '
-                '"frontier_closed": true}\n',
+                'FBREF_LIVE_WAVES_RESULT:{"batches": 3, "frontier_closed": true}\n',
                 "",
             )
 
@@ -2096,7 +2105,10 @@ def test_live_waves_use_one_process_group_for_all_batches(monkeypatch):
         fbref_pipeline_tasks.os.getpid()
     )
     assert command[command.index("--max-batches") + 1] == "80"
-    assert command[command.index("--reservation-mb") + 1] == "3"
+    assert command[command.index("--reservation-mb") + 1] == str(
+        fbref_pipeline_tasks.DEFAULT_REQUEST_RESERVATION_BYTES
+        // fbref_pipeline_tasks.MIB
+    )
 
 
 @pytest.mark.unit
@@ -3220,8 +3232,6 @@ def test_finalizer_refuses_the_nonpublishing_path_for_a_publishing_run(
     monkeypatch,
 ):
     """Ветку выбирает шаблон, а доказательство — метаданные: fail-closed."""
-
-    from airflow.exceptions import AirflowException
 
     release = MagicMock(return_value={"released": True})
     monkeypatch.setattr(

@@ -12,12 +12,14 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Mapping, Optional, Sequence
+from urllib.parse import urlparse
 
 from scrapers.fbref.bronze import (
     FBrefGenericBronzeWriter,
@@ -28,6 +30,7 @@ from scrapers.fbref.control import (
     BudgetExceeded,
     CompetitionRegistryEntry,
     ControlStore,
+    CurrentSeasonRemediationEvidence,
     FrontierProvenance,
     FrontierTarget,
     SeasonAlias,
@@ -44,8 +47,10 @@ from scrapers.fbref.discovery import (
     CompetitionGender,
     CompetitionRef,
     DiscoveredPageLink,
+    MatchRef,
     ParticipantType,
     SeasonRef,
+    advertised_current_season,
     competition_eligibility,
     discover_page_links,
     normalize_page_source_ids,
@@ -74,12 +79,14 @@ from scrapers.fbref.raw_store import (
     PageTarget,
     RawFetchRecord,
     RawPageStore,
+    canonicalize_fbref_url,
     competition_index_target,
     competition_page_target,
     match_page_target,
     schedule_page_target,
     season_page_target,
 )
+from scrapers.fbref.readiness import validate_fbref_proxy_meter
 from scrapers.fbref.settings import (
     DEFAULT_BROWSER_BYTE_LIMIT_BYTES,
     DEFAULT_BROWSER_REQUESTS_PER_SOLVE,
@@ -95,6 +102,7 @@ from scrapers.fbref.settings import (
     MIB,
     bootstrap_byte_reservation_for,
     bootstrap_reservation_for,
+    strict_binary_flag,
 )
 from scrapers.fbref.typed_bronze import (
     TYPED_BRONZE_PARSER_VERSION,
@@ -121,6 +129,31 @@ SENTINEL_COMPETITIONS = (
     "Copa América",
 )
 
+CURRENT_SEASON_INSTALL_CONTRACT_VERSION = (
+    "fbref-current-season-install-source-link-v2"
+)
+SEASON_INSTALL_REDIRECT_VERSION = (
+    "fbref-season-install-redirects-20260825-v1"
+)
+# Exact permanent redirects observed for these two source-advertised current
+# season slugs.  This belongs at the registry/frontier installation boundary,
+# after the v6 parser has derived the source season id: parsing the short
+# Location first would mint "2"/"3" instead of "2026-2027".  Keeping the pure
+# parser output unchanged avoids a global parser-version replay.  Values retain
+# the source's trailing slash as evidence; canonical storage removes it.
+_CURRENT_SEASON_REGISTRY_REDIRECTS = {
+    (
+        "33",
+        "2026-2027",
+        "https://fbref.com/en/comps/33/2-Bundesliga-Stats",
+    ): "https://fbref.com/en/comps/33/2/",
+    (
+        "59",
+        "2026-2027",
+        "https://fbref.com/en/comps/59/3-Liga-Stats",
+    ): "https://fbref.com/en/comps/59/3/",
+}
+
 # One Camoufox target may consume four 90s navigations plus four 45s solve
 # windows, restart overhead, and a bounded 60s throttle wait. Keep a full-hour
 # fence and renew all outstanding sequential leases before every target.
@@ -144,10 +177,7 @@ _CONTRACT_ISOLATABLE_PAGE_KINDS = frozenset({"squad"})
 _LEGACY_INVALID_MATCHLOG_TARGET_ID = (
     "fbref:matchlog:matchlogs:b201bf4bc9476c3f0cc8"
 )
-_LEGACY_INVALID_MATCHLOG_URL = (
-    "https://fbref.com/en/players//matchlogs/2016-2017/misc/"
-    "Yan-Kaye-Match-Logs"
-)
+_LEGACY_INVALID_MATCHLOG_URL = "https://fbref.com/en/players//matchlogs/2016-2017/misc/Yan-Kaye-Match-Logs"
 _LEGACY_INVALID_MATCHLOG_SOURCE_IDS = {
     "player_id": "matchlogs",
     "matchlog_season_id": "2016-2017",
@@ -165,6 +195,52 @@ ACCEPTANCE_EXECUTION_MODE = "acceptance_nonpublishing"
 # clearance is dead — so the wave re-solves instead of failing every remaining
 # target against it.
 CLEARANCE_REJECTED_STATUSES = frozenset({401, 403, 429})
+# A permanent redirect is the source answering *about the address*, not
+# rejecting us: FBref publishes the bare current-season alias of some
+# competitions (comps 33 and 59) and then answers it with 301.  Losing one
+# such page is a gap in that page; losing the whole wave to it is a gap in
+# every other competition, which is what happened daily from 2026-08-18 on.
+# Note these statuses are deliberately absent from
+# CLEARANCE_REJECTED_STATUSES above, so the redirect is never mistaken for the
+# source rejecting our clearance.  The session is still recycled afterwards,
+# exactly as it is for any other page failure, and the page is handed back to
+# the queue rather than dead-lettered, so that recycling recurs while the
+# address stays broken -- see the requeue rationale at the failure branch.
+# Only the PERMANENT redirects are listed: 302/303/307 are what a Cloudflare
+# challenge or a proxy error page answers with, and those must stay loud
+# failures rather than silently shrink the scope.  A redirect without a
+# Location header is not a usable "moved" statement either, and stays loud.
+MOVED_PAGE_STATUSES = frozenset({301, 308})
+# Above this count, and only when moved pages also dominate their wave, a
+# redirect stops looking like a couple of retired aliases and starts looking
+# like an exit hijacking the cohort.
+MAX_ROUTINE_MOVED_PAGES = 5
+# One whole cohort's worth of dead addresses across an entire run is already
+# far beyond the handful of retired aliases this exists for.
+MAX_RUN_MOVED_PAGES = 25
+# A single match endpoint can briefly answer 404 and then publish the same
+# match on a later run.  That verdict is reversible only for match pages: a
+# 404 on a spine page can amputate discovery scope and must stay loud.  Above
+# this count, and only when the deferred matches dominate their wave, the
+# response stops looking target-local and starts looking like a bad exit or a
+# source-wide outage.
+MAX_ROUTINE_DEFERRED_MATCH_NOT_FOUND = 5
+# Even a thin stream of 404s can evade the per-wave majority gate forever, so
+# a run gets the same hard ceiling as permanent redirects.
+MAX_RUN_DEFERRED_MATCH_NOT_FOUND = 25
+# A decoded-body ceiling is a terminal verdict about one target, not evidence
+# that its healthy siblings are unavailable.  Keep isolated oversized pages
+# target-local while refusing to normalize a cohort- or run-wide markup jump.
+MAX_ROUTINE_TERMINAL_OVERSIZED_PAGES = 5
+MAX_RUN_TERMINAL_OVERSIZED_PAGES = 25
+# A moved-page verdict shrinks the crawl scope quietly, so it may only be
+# reached for an address that still belongs to the source.  A captive portal
+# or a hijacked residential exit answering 301 with its own login page must
+# stay a loud failure: the ceilings above only catch a wholesale hijack, and
+# four stolen pages in a cohort of twenty-five would pass every one of them.
+# Other hosts -- another subdomain, a CDN -- are to be allowed deliberately
+# once seen, not trusted in advance.
+MOVED_PAGE_HOST = "fbref.com"
 # Each consecutive refresh costs one browser solve, so a source that rejects
 # fresh clearances outright must still fail the wave rather than launch
 # browsers in a loop. A productive warm session resets this streak: later
@@ -293,6 +369,15 @@ class SourceContractRejected(ParseWaveError):
 
 
 @dataclass(frozen=True)
+class CurrentSeasonRemediationItem:
+    """One exact immutable history input and its two-source control proof."""
+
+    evidence: CurrentSeasonRemediationEvidence
+    history_html: str
+    history_record: RawFetchRecord
+
+
+@dataclass(frozen=True)
 class PipelineSettings:
     run_type: str = "current"
     request_limit: int = DEFAULT_REQUEST_LIMIT
@@ -412,10 +497,10 @@ def backfill_season_cohort_capacity(
 
     A season root expands into schedules, squads, players, matchlogs, and
     matches.  Its admission contract therefore remains the production-tested
-    conservative 7 MiB aggregate allowance instead of pretending that one
-    season is one 3 MiB HTTP target.  This preserves deterministic 7/14
-    canary/production dry-run cohorts while child pages are still fetched
-    sequentially by the warm runner under the real shared budget.
+    conservative 7 MiB aggregate registry-cohort allowance.  This preserves
+    deterministic 7/14 canary/production dry-run cohorts while every child
+    page is still admitted and settled sequentially under the current 9 MiB
+    per-target reservation and the real shared budget.
     """
 
     available = (
@@ -630,6 +715,9 @@ class WaveResult:
     requeued_session_exhaustion: int = 0
     deferred_dead_clearance: int = 0
     contract_quarantined: int = 0
+    moved_pages_skipped: int = 0
+    deferred_match_not_found: int = 0
+    terminal_oversized_pages: int = 0
     failures: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -998,18 +1086,28 @@ def _target_hash(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()[:20]
 
 
-def _registry_snapshot_id(record: RawFetchRecord) -> str:
+def _registry_snapshot_id(
+    record: RawFetchRecord,
+    *,
+    current_season_index: Optional[Mapping[str, object]] = None,
+) -> str:
     """Return one retry-stable identity for a single raw observation."""
 
+    identity = {
+        "attempt_id": record.attempt_id,
+        "contract_version": CURRENT_SEASON_INSTALL_CONTRACT_VERSION,
+        "content_hash": record.content_hash,
+        "logical_refresh_id": record.logical_refresh_id,
+        "parser_version": DISCOVERY_PARSER_VERSION,
+        "target_id": record.target_id,
+    }
+    if current_season_index is not None:
+        identity["current_season_index"] = dict(current_season_index)
     return str(
         uuid.uuid5(
             uuid.NAMESPACE_URL,
-            (
-                "fbref-registry-snapshot:"
-                f"{DISCOVERY_PARSER_VERSION}:"
-                f"{record.logical_refresh_id}:{record.target_id}:"
-                f"{record.content_hash}"
-            ),
+            "fbref-registry-snapshot:"
+            + json.dumps(identity, sort_keys=True, separators=(",", ":")),
         )
     )
 
@@ -1025,6 +1123,110 @@ def _session_failure(exc: FetchError) -> bool:
         exc.error_class == "http_status"
         and exc.http_status in CLEARANCE_REJECTED_STATUSES
     ) or exc.error_class.startswith("warm_session_")
+
+
+def _moved_page_points_at_source(location: str) -> bool:
+    """True when a redirect stays on the source, so the scope may shrink.
+
+    Anything else -- a captive portal, a hijacking exit, a plain-HTTP hop --
+    is not the source retiring an address, and must not be swallowed quietly.
+    The value must be the raw header: a sanitised one can read as the source
+    when it is not.
+    """
+
+    candidate = location.strip()
+    if not candidate:
+        return False
+    if candidate.startswith("//"):
+        # Protocol-relative: the host after the slashes is somebody else's to
+        # name, so this is not a same-origin statement.
+        return False
+    if candidate.startswith("/"):
+        return True
+    parsed = urlparse(candidate)
+    if parsed.scheme != "https":
+        return False
+    return (parsed.hostname or "").casefold() == MOVED_PAGE_HOST
+
+
+def _moved_page_failure(exc: FetchError) -> bool:
+    """True when the source said, usably, that the page moved for good.
+
+    A permanent status alone is not that statement: without a ``Location``
+    there is no address to name in the log or to act on later, and an
+    interstitial can answer 301 with no target at all.  Neither is a redirect
+    that leaves the source -- see ``_moved_page_points_at_source``.  Such a
+    response stays a loud failure.
+    """
+
+    return (
+        exc.error_class == "http_status"
+        and exc.http_status in MOVED_PAGE_STATUSES
+        and _moved_page_points_at_source(
+            str(getattr(exc, "redirect_location", "") or "")
+        )
+    )
+
+
+def _transient_match_not_found(page_kind: str, exc: FetchError) -> bool:
+    """Isolate only the observed reversible match-endpoint 404 shape."""
+
+    return (
+        page_kind == "match"
+        and exc.error_class == "http_status"
+        and exc.http_status == 404
+    )
+
+
+def _is_mass_redirect(result: "WaveResult") -> bool:
+    """Tell a couple of retired aliases from a cohort-wide hijack."""
+
+    moved = result.moved_pages_skipped
+    return moved > MAX_ROUTINE_MOVED_PAGES and moved * 2 > result.cohort_size
+
+
+def _is_run_mass_redirect(fetch: "WaveResult") -> bool:
+    """Catch a hijack too thin for any single wave to notice.
+
+    The per-wave test needs redirects to dominate their own cohort.  An exit
+    that hijacks a fifth of navigations stays under it in every one of the
+    run's up-to-80 waves while quietly dropping hundreds of targets from the
+    crawl scope, so the run keeps its own ceiling.
+    """
+
+    return fetch.moved_pages_skipped > MAX_RUN_MOVED_PAGES
+
+
+def _is_mass_match_not_found(result: "WaveResult") -> bool:
+    """Tell isolated unpublished matches from a cohort-wide 404 outage."""
+
+    deferred = result.deferred_match_not_found
+    return (
+        deferred > MAX_ROUTINE_DEFERRED_MATCH_NOT_FOUND
+        and deferred * 2 > result.cohort_size
+    )
+
+
+def _is_run_mass_match_not_found(fetch: "WaveResult") -> bool:
+    """Catch a thin 404 outage that stays below every wave majority gate."""
+
+    return fetch.deferred_match_not_found > MAX_RUN_DEFERRED_MATCH_NOT_FOUND
+
+
+def _is_mass_terminal_oversized_pages(result: "WaveResult") -> bool:
+    """Tell one terminally large page from a cohort-wide markup jump."""
+
+    oversized = result.terminal_oversized_pages
+    return (
+        oversized > MAX_ROUTINE_TERMINAL_OVERSIZED_PAGES
+        and oversized * 2 > result.cohort_size
+    )
+
+
+def _is_run_mass_terminal_oversized_pages(fetch: "WaveResult") -> bool:
+    """Catch oversized responses spread thinly across many waves."""
+
+    return fetch.terminal_oversized_pages > MAX_RUN_TERMINAL_OVERSIZED_PAGES
 
 
 def _sentinel_gate_errors(coverage: object) -> list[str]:
@@ -1058,8 +1260,7 @@ def _require_acceptance_settings(settings: PipelineSettings) -> None:
         or settings.shard_size != ACCEPTANCE_SHARD_SIZE
     ):
         raise ValueError(
-            "acceptance profile must be exactly 100 requests / 50 MiB / "
-            "shard 25"
+            "acceptance profile must be exactly 100 requests / 50 MiB / shard 25"
         )
 
 
@@ -1209,8 +1410,7 @@ def _acceptance_summary_errors(summary: object) -> list[str]:
         )
     if int(summary.get("unprocessed_raw_count") or 0) != 0:
         errors.append(
-            "unprocessed_raw_count="
-            f"{int(summary.get('unprocessed_raw_count') or 0)}"
+            f"unprocessed_raw_count={int(summary.get('unprocessed_raw_count') or 0)}"
         )
     if bool(summary.get("budget_exceeded")):
         errors.append("budget_exceeded=true")
@@ -1243,8 +1443,7 @@ def _acceptance_summary_errors(summary: object) -> list[str]:
             or float(success_rate) != 1.0
         ):
             errors.append(
-                f"warm_http_successes={successes}!={attempts};"
-                f"rate={success_rate!r}"
+                f"warm_http_successes={successes}!={attempts};rate={success_rate!r}"
             )
         if int(traffic.get("unclassified_failures") or 0) != 0:
             errors.append(
@@ -1657,8 +1856,23 @@ def _bronze_acceptance_replay_marker(
     }
 
 
+def _canonical_season_install_url(
+    competition_id: str,
+    season_id: str,
+    source_url: str,
+) -> str:
+    observed_location = _CURRENT_SEASON_REGISTRY_REDIRECTS.get((
+        competition_id,
+        season_id,
+        source_url,
+    ))
+    if observed_location is None:
+        return source_url
+    return canonicalize_fbref_url(observed_location)
+
+
 def page_target_from_link(link: DiscoveredPageLink) -> PageTarget:
-    """Build a stable target from an exact source-provided canonical URL."""
+    """Build a stable target, normalizing exact reviewed redirect aliases."""
 
     source_ids = normalize_page_source_ids(
         link.page_kind, link.source_ids
@@ -1681,7 +1895,13 @@ def page_target_from_link(link: DiscoveredPageLink) -> PageTarget:
         season_id = source_ids.get("season_id")
         if competition_id and season_id:
             return season_page_target(
-                competition_id, season_id, link.canonical_url
+                competition_id,
+                season_id,
+                _canonical_season_install_url(
+                    competition_id,
+                    season_id,
+                    link.canonical_url,
+                ),
             )
     if link.page_kind == "schedule":
         competition_id = source_ids.get("competition_id")
@@ -1796,7 +2016,48 @@ def _next_fetch_at(page_kind: str, *, historical: bool) -> Optional[datetime]:
     return _utcnow() + delays.get(page_kind, timedelta(days=7))
 
 
-def _competition_metadata(item: CompetitionRef) -> dict:
+def _raw_record_evidence(
+    raw_store: RawPageStore,
+    record: RawFetchRecord,
+) -> dict[str, Optional[str]]:
+    return {
+        "attempt_id": record.attempt_id,
+        "content_hash": record.content_hash,
+        "logical_refresh_id": record.logical_refresh_id,
+        "manifest_key": raw_store.fetch_manifest_key(record.logical_refresh_id),
+        "target_id": record.target_id,
+    }
+
+
+def _current_season_index_evidence(
+    item: CompetitionRef,
+    *,
+    snapshot_id: str,
+    run_id: str,
+    record: RawFetchRecord,
+    raw_store: RawPageStore,
+) -> dict:
+    advertised = advertised_current_season(item)
+    return {
+        "schema_version": "fbref-current-season-index-evidence-v1",
+        "snapshot_id": snapshot_id,
+        "run_id": run_id,
+        "content_hash": record.content_hash,
+        "raw": _raw_record_evidence(raw_store, record),
+        "advertised": {
+            "label": item.last_season,
+            "href": item.last_season_url,
+            "season_id": None if advertised is None else advertised.season_id,
+        },
+    }
+
+
+def _competition_metadata(
+    item: CompetitionRef,
+    *,
+    current_season_index: Mapping[str, object],
+) -> dict:
+    advertised = current_season_index.get("advertised") or {}
     return {
         "format": item.format.value,
         "participants": item.participants.value,
@@ -1806,10 +2067,17 @@ def _competition_metadata(item: CompetitionRef) -> dict:
         "tier": item.tier,
         "first_season": item.first_season,
         "last_season": item.last_season,
+        "last_season_url": item.last_season_url,
+        "advertised_current_season_id": advertised.get("season_id"),
+        "current_season_index": dict(current_season_index),
     }
 
 
-def _registry_entry(item: CompetitionRef) -> CompetitionRegistryEntry:
+def _registry_entry(
+    item: CompetitionRef,
+    *,
+    current_season_index: Mapping[str, object],
+) -> CompetitionRegistryEntry:
     gender = {
         CompetitionGender.MALE: "male",
         CompetitionGender.FEMALE: "female",
@@ -1821,7 +2089,24 @@ def _registry_entry(item: CompetitionRef) -> CompetitionRegistryEntry:
         name=item.name,
         gender=gender,
         classification=f"{item.format.value}:{item.participants.value}",
-        metadata=_competition_metadata(item),
+        metadata=_competition_metadata(
+            item,
+            current_season_index=current_season_index,
+        ),
+    )
+
+
+def _season_with_registry_redirect(season: SeasonRef) -> SeasonRef:
+    installed_url = _canonical_season_install_url(
+        season.comp_id,
+        season.season_id,
+        season.season_url,
+    )
+    if installed_url == season.season_url:
+        return season
+    return replace(
+        season,
+        season_url=installed_url,
     )
 
 
@@ -1853,6 +2138,126 @@ def _competition_from_registry(row: Mapping[str, object]) -> CompetitionRef:
         first_season=metadata.get("first_season"),
         last_season=metadata.get("last_season"),
         history_url=str(row["canonical_url"]),
+        last_season_url=metadata.get("last_season_url"),
+    )
+
+
+def _current_season_index_from_registry(
+    row: Mapping[str, object],
+) -> dict:
+    metadata = _mapping(row.get("metadata") or {})
+    value = metadata.get("current_season_index")
+    if not isinstance(value, Mapping):
+        raise ParseWaveError(
+            f"Competition {row.get('competition_id')} has no exact "
+            "competition-index lineage"
+        )
+    evidence = dict(value)
+    advertised = evidence.get("advertised")
+    raw = evidence.get("raw")
+    if (
+        evidence.get("schema_version")
+        != "fbref-current-season-index-evidence-v1"
+        or not evidence.get("snapshot_id")
+        or str(row.get("last_snapshot_id") or "")
+        != str(evidence.get("snapshot_id"))
+        or not evidence.get("run_id")
+        or not evidence.get("content_hash")
+        or not isinstance(raw, Mapping)
+        or not raw.get("attempt_id")
+        or raw.get("content_hash") != evidence.get("content_hash")
+        or not raw.get("logical_refresh_id")
+        or not raw.get("manifest_key")
+        or not raw.get("target_id")
+        or not isinstance(advertised, Mapping)
+        or advertised.get("label") != metadata.get("last_season")
+        or advertised.get("href") != metadata.get("last_season_url")
+        or advertised.get("season_id")
+        != metadata.get("advertised_current_season_id")
+    ):
+        raise ParseWaveError(
+            f"Competition {row.get('competition_id')} has incomplete or "
+            "inconsistent competition-index lineage"
+        )
+    return evidence
+
+
+def _resolve_current_season_install(
+    competition: CompetitionRef,
+    seasons: Sequence[SeasonRef],
+    direct_matches: Sequence[MatchRef],
+) -> tuple[list[SeasonRef], Optional[str]]:
+    """Merge and select only source-advertised current-season evidence."""
+
+    installed_seasons = [
+        _season_with_registry_redirect(season) for season in seasons
+    ]
+    current_label = str(competition.last_season or "").strip()
+    current_href = str(competition.last_season_url or "").strip()
+    if bool(current_label) != bool(current_href):
+        raise ParseWaveError(
+            f"Competition {competition.comp_id} advertised current season "
+            "evidence is incomplete: label and href must both be present"
+        )
+    advertised = advertised_current_season(competition)
+    if advertised is not None:
+        advertised = _season_with_registry_redirect(advertised)
+        url_matches = [
+            season
+            for season in installed_seasons
+            if season.season_url == advertised.season_url
+        ]
+        if len(url_matches) > 1:
+            raise ParseWaveError(
+                f"Competition {competition.comp_id} advertised current URL "
+                "matches multiple history seasons"
+            )
+        if len(url_matches) == 1:
+            return installed_seasons, url_matches[0].season_id
+        installed = next(
+            (
+                season
+                for season in installed_seasons
+                if season.season_id == advertised.season_id
+            ),
+            None,
+        )
+        if installed is None:
+            installed_seasons = [advertised, *installed_seasons]
+        return installed_seasons, advertised.season_id
+
+    current_candidates = [
+        index
+        for index, season in enumerate(installed_seasons)
+        if current_label and season.label == current_label
+    ]
+    if current_candidates:
+        # FBref occasionally publishes two history URLs with the same display
+        # label (competition 612 did so for "2025"). Prefer the source ID that
+        # exactly matches the advertised label, then the newest history row.
+        canonical_current = min(
+            current_candidates,
+            key=lambda index: (
+                installed_seasons[index].season_id != current_label,
+                index,
+            ),
+        )
+        return installed_seasons, installed_seasons[canonical_current].season_id
+    if current_label and any(
+        match.season_id == current_label for match in direct_matches
+    ):
+        return installed_seasons, current_label
+    if current_label:
+        raise ParseWaveError(
+            f"Competition {competition.comp_id} advertised current season "
+            f"{current_label} has no source href or matching history entry"
+        )
+    return installed_seasons, (
+        installed_seasons[0].season_id
+        if installed_seasons
+        else direct_matches[0].season_id
+        if direct_matches
+        else None
     )
 
 
@@ -2558,8 +2963,7 @@ class FBrefPipeline:
         if _uses_production_safety_circuit(settings):
             result.failures.append("production_safety_circuit_exhausted")
         logger.warning(
-            "FBref run budget exhausted (%s) — %d target(s) returned "
-            "for the next run",
+            "FBref run budget exhausted (%s) — %d target(s) returned for the next run",
             reason,
             int(already_requeued) + int(returned),
         )
@@ -2699,18 +3103,23 @@ class FBrefPipeline:
                             "lifetime; exact tail settled before rollover"
                         )
                     # Exact logical-refresh crash recovery is always safe.
-                    # Historical targets are immutable by contract, so they
-                    # may additionally adopt the latest verified raw-v2 (or
-                    # legacy raw-v1) observation across control runs.  Current
-                    # targets still require an exact refresh: an older page may
-                    # predate a match final or a season rollover.
+                    # Historical targets other than season roots are immutable
+                    # by contract, so they may additionally adopt the latest
+                    # verified raw-v2 (or legacy raw-v1) observation across
+                    # control runs. A reseeded historical season must use its
+                    # exact refresh: prior bytes may belong to the scope verdict
+                    # that caused the target to be reopened.
                     frontier = self.control.get_frontier_target(
                         lease.target_id
                     ) or {}
-                    recoverable = (
-                        self.raw_store.has_fetch(lease.logical_refresh_id)
-                        or frontier.get("refresh_policy") == "historical_once"
+                    exact_refresh_raw = self.raw_store.has_fetch(
+                        lease.logical_refresh_id
                     )
+                    cross_run_historical_raw = (
+                        frontier.get("refresh_policy") == "historical_once"
+                        and lease.page_kind != "season"
+                    )
+                    recoverable = exact_refresh_raw or cross_run_historical_raw
                     if recoverable:
                         record = self.raw_store.import_fetch_from_available_raw(
                             target,
@@ -2990,8 +3399,7 @@ class FBrefPipeline:
                             start_index=lease_index + 1,
                             already_requeued=1,
                             reason=(
-                                "persistent failed page crossed the run "
-                                "safety circuit"
+                                "persistent failed page crossed the run safety circuit"
                             ),
                         )
                         break
@@ -3282,15 +3690,40 @@ class FBrefPipeline:
                             break
                         leases.insert(lease_index + 1, retry_leases[0])
                     else:
+                        moved = _moved_page_failure(exc)
+                        match_not_found = _transient_match_not_found(
+                            lease.page_kind,
+                            exc,
+                        )
+                        terminal_oversized = exc.error_class == "response_too_large"
+                        reversible_target_failure = moved or match_not_found
                         self.control.fail_fetch(
                             lease,
                             error_class=exc.error_class,
                             error_message=str(exc),
                             retry_delay_seconds=60,
-                            permanent=(
-                                exc.error_class == "response_too_large"
-                            ),
-                            requeue=False,
+                            permanent=terminal_oversized,
+                            # Hand it back as 'skipped'/'queued'.  Each of the
+                            # three shapes costs something and this is the
+                            # only reversible one:
+                            #   'retry' (the default) stays claimable 60s
+                            #     later, so the same unreachable page is
+                            #     re-fetched all run, and a leftover 'retry'
+                            #     counts as an unfinished target -- the run
+                            #     ends red anyway, just later.
+                            #   'dead' (permanent) is terminal with no way
+                            #     back: reanimation only touches queued/retry,
+                            #     scope re-open only skipped/quarantined, and
+                            #     the seeding upsert never resets state.  One
+                            #     CDN or exit answering 301 to healthy pages
+                            #     would destroy them permanently on first
+                            #     contact.
+                            # 'queued' does let the page sort early in later
+                            # cohorts (retry_after is nulled, next_fetch_at
+                            # keeps ageing), costing one solve a day per dead
+                            # address.  That is the price of being able to
+                            # recover, and the ceilings below bound it.
+                            requeue=reversible_target_failure,
                             http_status=exc.http_status,
                             http_request_count=exc.http_requests,
                             http_status_history=exc.http_status_history,
@@ -3300,25 +3733,105 @@ class FBrefPipeline:
                             transport_version=FETCHER_VERSION,
                             session_version=live_session.session_id,
                         )
-                        if settings.persistent_http_session:
+                        if (
+                            settings.persistent_http_session
+                            or match_not_found
+                        ):
                             live_session.finalize(
                                 self.control, status="failed"
                             )
-                            reset = getattr(
-                                live_session.fetcher,
-                                "reset_clearance",
-                                None,
-                            )
-                            if callable(reset):
-                                reset()
+                            if settings.persistent_http_session:
+                                reset = getattr(
+                                    live_session.fetcher,
+                                    "reset_clearance",
+                                    None,
+                                )
+                                if callable(reset):
+                                    reset()
+                                else:
+                                    live_session.stack.close()
+                                    live_session.stack = ExitStack()
+                                    live_session.fetcher = None
                             else:
-                                live_session.stack.close()
+                                # Non-persistent finalization closes and drops
+                                # the suspect transport.  Give the sibling a
+                                # fresh ExitStack for its fresh clearance.
                                 live_session.stack = ExitStack()
-                                live_session.fetcher = None
                             live_session.needs_clearance = True
-                        result.failures.append(
-                            f"{lease.target_id}:{exc.error_class}"
-                        )
+                        if moved:
+                            # The attempt above stays durable evidence; only
+                            # the wave verdict is spared.  Log it as loudly as
+                            # every other wave-sparing outcome -- str(exc)
+                            # carries the Location header, so the operator can
+                            # see which page moved and where.
+                            result.moved_pages_skipped += 1
+                            logger.warning(
+                                "Run %s skips moved page %s: %s",
+                                run_id,
+                                lease.target_id,
+                                str(exc),
+                            )
+                        elif match_not_found:
+                            # Production evidence showed this exact match
+                            # succeeding with HTTP 200 on a later run. Keep the
+                            # failed attempt durable above, return the target
+                            # reversibly, and let healthy siblings continue.
+                            result.deferred_match_not_found += 1
+                            logger.warning(
+                                "Run %s defers transient match 404 %s: %s",
+                                run_id,
+                                lease.target_id,
+                                str(exc),
+                            )
+                            if _is_mass_match_not_found(result):
+                                untouched = leases[lease_index + 1:]
+                                returned = (
+                                    self.control.requeue_unfetched_targets(
+                                        untouched
+                                    )
+                                )
+                                logger.error(
+                                    "Run %s stops after %d/%d match 404s; "
+                                    "%d untouched target(s) returned",
+                                    run_id,
+                                    result.deferred_match_not_found,
+                                    result.cohort_size,
+                                    returned,
+                                )
+                                break
+                        elif terminal_oversized:
+                            # The body limit made this target terminal and its
+                            # paid attempt is already settled above.  That is
+                            # not evidence that healthy siblings are broken,
+                            # so keep the permanent/dead transition while
+                            # letting the wave reach offline parsing and the
+                            # run's validation gates.  A dominant cohort still
+                            # fails closed through the circuit below.
+                            result.terminal_oversized_pages += 1
+                            logger.warning(
+                                "Run %s records terminal oversized page %s: %s",
+                                run_id,
+                                lease.target_id,
+                                str(exc),
+                            )
+                            if _is_mass_terminal_oversized_pages(result):
+                                untouched = leases[lease_index + 1 :]
+                                returned = self.control.requeue_unfetched_targets(
+                                    untouched
+                                )
+                                logger.error(
+                                    "Run %s stops after %d/%d oversized "
+                                    "pages; %d untouched target(s) returned",
+                                    run_id,
+                                    result.terminal_oversized_pages,
+                                    result.cohort_size,
+                                    returned,
+                                )
+                                break
+                        else:
+                            result.failures.append(
+                                f"{lease.target_id}:{exc.error_class}"
+                            )
                 except Exception as exc:
                     if reservation is not None and not budget_settled:
                         if (
@@ -3416,6 +3929,38 @@ class FBrefPipeline:
                         # conservative target evidence. Stop before a second
                         # paid session and let abort_run settle that reserve.
                         break
+            if _is_mass_redirect(result):
+                # Sparing a couple of retired aliases is the point.  Sparing a
+                # cohort's worth of them is not a property of those pages --
+                # it is an exit or a challenge answering every navigation with
+                # a redirect -- and silently shrinking the crawl scope is the
+                # one outcome worse than stopping.  This must be decided
+                # BEFORE the finally below, or the session that hijacked the
+                # cohort would be closed as healthy and its metering
+                # reconciled on the way out.
+                result.failures.append(
+                    f"mass_redirect={result.moved_pages_skipped}/{result.cohort_size}"
+                )
+            if _is_mass_match_not_found(result):
+                # One temporarily unpublished match is target-local. A wave
+                # dominated by the same answer is evidence about the source
+                # or exit, so it must fail before the session is closed as
+                # healthy.
+                result.failures.append(
+                    "mass_match_not_found="
+                    f"{result.deferred_match_not_found}"
+                    f"/{result.cohort_size}"
+                )
+            if _is_mass_terminal_oversized_pages(result):
+                # One target may legitimately outgrow its page-kind cap. A
+                # wave dominated by that answer indicates a source-wide shape
+                # change and must stay red. The triggering targets remain
+                # terminal; only leases never attempted above were requeued.
+                result.failures.append(
+                    "mass_response_too_large="
+                    f"{result.terminal_oversized_pages}"
+                    f"/{result.cohort_size}"
+                )
         finally:
             if owns_session:
                 live_session.close(
@@ -3480,32 +4025,72 @@ class FBrefPipeline:
         )
         failed = True
         try:
-            for batch in range(1, normalized_batches + 1):
-                fetched = self.fetch_wave(
-                    run_id,
-                    worker_id=f"{worker_id}:batch-{batch:02d}",
-                    page_kinds=page_kinds,
-                    settings=settings,
-                    _live_session=live_session,
-                )
-                live_session.rollover_if_due(
-                    self.control,
-                    within_seconds=PERSISTENT_PARSE_GUARD_SECONDS,
-                )
-                parsed = self.parse_wave(
-                    run_id,
-                    page_kinds=page_kinds,
-                    settings=settings,
-                )
-                aggregate.batches = batch
-                self._merge_wave_result(aggregate.fetch, fetched)
-                self._merge_wave_result(aggregate.parse, parsed)
+            # Each claim independently evaluates _FRONTIER_SCOPE_CTE while
+            # holding its frontier lock, so current discovery cannot lease an
+            # ineligible target while this state-repair sweep is deferred.
+            # Keep history's cadence unchanged; its historical_once reopen
+            # semantics remain isolated from the current runner optimization.
+            reconcile_context = (
+                self._deferred_scope_reconcile()
+                if settings.run_type == "current"
+                else nullcontext()
+            )
+            with reconcile_context as reconciliation:
+                for batch in range(1, normalized_batches + 1):
+                    fetched = self.fetch_wave(
+                        run_id,
+                        worker_id=f"{worker_id}:batch-{batch:02d}",
+                        page_kinds=page_kinds,
+                        settings=settings,
+                        _live_session=live_session,
+                    )
+                    live_session.rollover_if_due(
+                        self.control,
+                        within_seconds=PERSISTENT_PARSE_GUARD_SECONDS,
+                    )
+                    parsed = self.parse_wave(
+                        run_id,
+                        page_kinds=page_kinds,
+                        settings=settings,
+                    )
+                    aggregate.batches = batch
+                    self._merge_wave_result(aggregate.fetch, fetched)
+                    self._merge_wave_result(aggregate.parse, parsed)
 
-                if fetched.budget_exhausted:
-                    break
-                if fetched.claimed == 0 and parsed.cohort_size == 0:
-                    aggregate.frontier_closed = True
-                    break
+                    if _is_run_mass_redirect(aggregate.fetch):
+                        raise FetchWaveError(
+                            f"mass_redirect_run={aggregate.fetch.moved_pages_skipped}"
+                        )
+                    if _is_run_mass_match_not_found(aggregate.fetch):
+                        raise FetchWaveError(
+                            "mass_match_not_found_run="
+                            f"{aggregate.fetch.deferred_match_not_found}"
+                        )
+                    if _is_run_mass_terminal_oversized_pages(aggregate.fetch):
+                        raise FetchWaveError(
+                            "mass_response_too_large_run="
+                            f"{aggregate.fetch.terminal_oversized_pages}"
+                        )
+
+                    if fetched.budget_exhausted:
+                        break
+                    if fetched.claimed == 0 and parsed.cohort_size == 0:
+                        aggregate.frontier_closed = True
+                        break
+            if (
+                aggregate.frontier_closed
+                and isinstance(reconciliation, Mapping)
+                and (
+                    bool(reconciliation.get("deferred_to_outer", False))
+                    or int(reconciliation.get("reopened", 0)) > 0
+                )
+            ):
+                # The final current-lane sweep may have made a previously
+                # quarantined target eligible after the last zero-claim wave.
+                # An enclosing defer context is equally unsafe to call closed:
+                # its eventual repair has not run yet.  Do not report a false
+                # closure to the downstream validator.
+                aggregate.frontier_closed = False
             failed = False
             return aggregate
         finally:
@@ -3581,7 +4166,15 @@ class FBrefPipeline:
         parent_record: Optional[RawFetchRecord] = None,
         reconcile_after: bool = True,
         eligible_competitions: Optional[Mapping[str, dict]] = None,
+        provenance_metadata: Optional[Mapping[str, object]] = None,
+        provenance_install_id: Optional[str] = None,
     ) -> tuple[int, int]:
+        install_relation_suffix = ""
+        if provenance_install_id is not None:
+            normalized_install_id = str(provenance_install_id).strip()
+            if not normalized_install_id:
+                raise ValueError("provenance_install_id must not be empty")
+            install_relation_suffix = f":install:{normalized_install_id}"
         eligible = set(
             self._eligible_competitions()
             if eligible_competitions is None
@@ -3688,7 +4281,10 @@ class FBrefPipeline:
                     provenance_edges.append(FrontierProvenance(
                         parent_target_id=parent_record.target_id,
                         child_target_id=target.target_id,
-                        relation=f"page_link:{link.page_kind}",
+                        relation=(
+                            f"page_link:{link.page_kind}"
+                            f"{install_relation_suffix}"
+                        ),
                         carried_competition_id=competition_id,
                         carried_season_id=season_id,
                         parent_content_hash=parent_record.content_hash,
@@ -3698,6 +4294,7 @@ class FBrefPipeline:
                         ),
                         metadata={
                             "child_page_kind": link.page_kind,
+                            **dict(provenance_metadata or {}),
                         },
                     ))
         if prepared_targets or provenance_edges:
@@ -3741,15 +4338,16 @@ class FBrefPipeline:
             self._reconcile_frontier_scope()
         return len(seeded_targets), len(skipped_targets)
 
-    def _reconcile_frontier_scope(self) -> None:
+    def _reconcile_frontier_scope(self) -> Optional[Mapping[str, int]]:
         if self._scope_reconcile_deferred:
             self._scope_reconcile_pending = True
-            return
+            return None
         reconcile_scope = getattr(
             self.control, "reconcile_frontier_scope", None
         )
         if reconcile_scope is not None:
-            reconcile_scope(source="fbref")
+            return reconcile_scope(source="fbref")
+        return None
 
     @contextmanager
     def _deferred_scope_reconcile(self):
@@ -3771,16 +4369,27 @@ class FBrefPipeline:
 
         previous_deferred = self._scope_reconcile_deferred
         previous_pending = self._scope_reconcile_pending
+        reconciliation: dict[str, object] = {
+            "deferred_to_outer": False,
+            "reopened": 0,
+        }
         self._scope_reconcile_deferred = True
         self._scope_reconcile_pending = False
         try:
-            yield
+            yield reconciliation
         finally:
             pending = self._scope_reconcile_pending
             self._scope_reconcile_deferred = previous_deferred
             self._scope_reconcile_pending = previous_pending
+            reconciliation["deferred_to_outer"] = bool(
+                previous_deferred and (previous_pending or pending)
+            )
             if pending:
-                self._reconcile_frontier_scope()
+                result = self._reconcile_frontier_scope()
+                if isinstance(result, Mapping):
+                    reconciliation["reopened"] = int(
+                        result.get("reopened", 0)
+                    )
 
     def _parse_competition_index(
         self,
@@ -3790,14 +4399,17 @@ class FBrefPipeline:
     ) -> tuple[int, int]:
         parsed = parse_competition_index_html(html)
         competitions = parsed.datasets["competitions"].records
+        snapshot_identity = _registry_snapshot_id(record)
+        raw_evidence = _raw_record_evidence(self.raw_store, record)
         snapshot_id = self.control.create_registry_snapshot(
-            snapshot_id=_registry_snapshot_id(record),
+            snapshot_id=snapshot_identity,
             run_id=run_id,
             fetched_at=_as_utc(record.fetched_at),
             successful=not parsed.has_errors,
             content_hash=record.content_hash,
             metadata={
                 "page_kind": "competition_index",
+                "raw": raw_evidence,
                 "sentinels": sentinel_coverage(
                     competitions, SENTINEL_COMPETITIONS
                 ),
@@ -3805,9 +4417,19 @@ class FBrefPipeline:
         )
         if parsed.has_errors:
             raise ParseWaveError("Competition index discovery contract failed")
-        self.control.reconcile_competitions(
-            snapshot_id, [_registry_entry(item) for item in competitions]
-        )
+        self.control.reconcile_competitions(snapshot_id, [
+            _registry_entry(
+                item,
+                current_season_index=_current_season_index_evidence(
+                    item,
+                    snapshot_id=snapshot_id,
+                    run_id=run_id,
+                    record=record,
+                    raw_store=self.raw_store,
+                ),
+            )
+            for item in competitions
+        ])
         links: list[DiscoveredPageLink] = []
         skipped = 0
         for competition in competitions:
@@ -3825,6 +4447,194 @@ class FBrefPipeline:
             links, historical=False, parent_record=record
         )
         return seeded, skipped + rejected
+
+    def validate_current_season_remediation_item(
+        self,
+        item: CurrentSeasonRemediationItem,
+        *,
+        validated_index_inputs: Optional[set[tuple[str, str]]] = None,
+    ) -> None:
+        """Validate both immutable raws behind one remediation item."""
+
+        evidence = item.evidence
+        record = item.history_record
+        if (
+            record.source != "fbref"
+            or record.page_kind != "competition"
+            or str(record.source_ids.get("competition_id") or "")
+            != evidence.competition_id
+            or record.target_id != evidence.history_target_id
+            or record.logical_refresh_id
+            != evidence.history_logical_refresh_id
+            or record.attempt_id != evidence.history_attempt_id
+            or record.content_hash != evidence.history_content_hash
+            or self.raw_store.fetch_manifest_key(record.logical_refresh_id)
+            != evidence.history_raw_manifest_key
+        ):
+            raise ParseWaveError(
+                f"Competition {evidence.competition_id} history input "
+                "differs from remediation evidence"
+            )
+        history_body, installed_history = self.raw_store.load_fetch(
+            record.logical_refresh_id
+        )
+        try:
+            installed_html = history_body.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ParseWaveError(
+                f"Competition {evidence.competition_id} history raw is not UTF-8"
+            ) from exc
+        if installed_history != record or installed_html != item.history_html:
+            raise ParseWaveError(
+                f"Competition {evidence.competition_id} history raw changed"
+            )
+
+        validated = (
+            set() if validated_index_inputs is None else validated_index_inputs
+        )
+        index_key = (
+            evidence.index_logical_refresh_id,
+            evidence.competition_id,
+        )
+        if index_key in validated:
+            return
+        index_body, index_record = self.raw_store.load_fetch(
+            evidence.index_logical_refresh_id
+        )
+        if (
+            index_record.source != "fbref"
+            or index_record.page_kind != "competition_index"
+            or index_record.target_id != evidence.index_target_id
+            or index_record.attempt_id != evidence.index_attempt_id
+            or index_record.content_hash != evidence.index_content_hash
+            or self.raw_store.fetch_manifest_key(
+                index_record.logical_refresh_id
+            )
+            != evidence.index_raw_manifest_key
+        ):
+            raise ParseWaveError(
+                "Competition-index raw differs from remediation evidence"
+            )
+        try:
+            index_html = index_body.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ParseWaveError("Competition-index raw is not UTF-8") from exc
+        parsed = parse_competition_index_html(index_html)
+        competitions = [
+            competition
+            for competition in parsed.datasets["competitions"].records
+            if competition.competition_id == evidence.competition_id
+        ]
+        if parsed.has_errors or len(competitions) != 1:
+            raise ParseWaveError(
+                f"Competition {evidence.competition_id} is not singular in "
+                "the authoritative index raw"
+            )
+        advertised = advertised_current_season(competitions[0])
+        if (
+            advertised is None
+            or advertised.label != evidence.advertised_label
+            or advertised.season_url != evidence.advertised_href
+            or advertised.season_id != evidence.advertised_season_id
+        ):
+            raise ParseWaveError(
+                f"Competition {evidence.competition_id} advertised season "
+                "differs from the authoritative index raw"
+            )
+        history_parsed = parse_competition_html(
+            installed_html,
+            competitions[0],
+        )
+        if history_parsed.has_errors:
+            raise ParseWaveError(
+                f"Competition {evidence.competition_id} history raw fails "
+                "current-season resolution"
+            )
+        _seasons, resolved_season_id = _resolve_current_season_install(
+            competitions[0],
+            history_parsed.datasets["seasons"].records,
+            history_parsed.datasets["matches"].records,
+        )
+        if resolved_season_id != evidence.resolved_season_id:
+            raise ParseWaveError(
+                f"Competition {evidence.competition_id} resolved current "
+                "season differs from remediation evidence"
+            )
+        validated.add(index_key)
+
+    def remediate_current_seasons(
+        self,
+        items: Sequence[CurrentSeasonRemediationItem],
+    ) -> dict[str, int]:
+        """Atomically reinstall an explicit batch under the no-writer fence."""
+
+        batch = list(items)
+        if not batch:
+            raise ValueError("at least one remediation item is required")
+        evidence = [item.evidence for item in batch]
+        with self.control.current_season_remediation_transaction(
+            evidence=evidence
+        ) as transaction_control:
+            transaction_pipeline = FBrefPipeline(
+                transaction_control,
+                self.raw_store,
+                generic_writer=self.generic_writer,
+                typed_adapter=self.typed_adapter,
+                fetcher_factory=self.fetcher_factory,
+                sleep=self.sleep,
+                clock=self.clock,
+                finalization_guard=self.finalization_guard,
+            )
+            validated_index_inputs: set[tuple[str, str]] = set()
+            with transaction_pipeline._deferred_scope_reconcile():
+                seeded = 0
+                skipped = 0
+                for item in batch:
+                    transaction_pipeline.validate_current_season_remediation_item(
+                        item,
+                        validated_index_inputs=validated_index_inputs,
+                    )
+                    item_seeded, item_skipped = (
+                        transaction_pipeline._parse_competition(
+                            item.evidence.history_run_id,
+                            item.history_html,
+                            item.history_record,
+                            run_type="current",
+                        )
+                    )
+                    seeded += item_seeded
+                    skipped += item_skipped
+
+            currents: dict[str, list[str]] = {}
+            after = None
+            while True:
+                page = transaction_control.list_seasons(
+                    current=True,
+                    limit=25,
+                    after=after,
+                )
+                for row in page:
+                    currents.setdefault(
+                        str(row["competition_id"]), []
+                    ).append(str(row["season_id"]))
+                if len(page) < 25:
+                    break
+                after = (
+                    str(page[-1]["competition_id"]),
+                    str(page[-1]["season_id"]),
+                )
+            for item in batch:
+                installed = currents.get(item.evidence.competition_id, [])
+                if installed != [item.evidence.resolved_season_id]:
+                    raise StateConflict(
+                        f"Competition {item.evidence.competition_id} "
+                        "post-remediation current season is not exact"
+                    )
+        return {
+            "competition_count": len(batch),
+            "seeded": seeded,
+            "skipped": skipped,
+        }
 
     def _parse_competition(
         self,
@@ -3845,8 +4655,27 @@ class FBrefPipeline:
         parsed = parse_competition_html(html, competition)
         seasons = parsed.datasets["seasons"].records
         direct_matches = parsed.datasets["matches"].records
+        current_season_id = None
+        if not parsed.has_errors:
+            seasons, current_season_id = _resolve_current_season_install(
+                competition,
+                seasons,
+                direct_matches,
+            )
+        current_season_index = _current_season_index_from_registry(row)
+        history_raw = _raw_record_evidence(self.raw_store, record)
+        snapshot_identity = _registry_snapshot_id(
+            record,
+            current_season_index=current_season_index,
+        )
+        current_season_install = {
+            "schema_version": "fbref-current-season-install-evidence-v1",
+            "snapshot_id": snapshot_identity,
+            "history_raw": history_raw,
+            "index": current_season_index,
+        }
         snapshot_id = self.control.create_registry_snapshot(
-            snapshot_id=_registry_snapshot_id(record),
+            snapshot_id=snapshot_identity,
             run_id=run_id,
             fetched_at=_as_utc(record.fetched_at),
             successful=not parsed.has_errors,
@@ -3854,42 +4683,13 @@ class FBrefPipeline:
             metadata={
                 "page_kind": "competition",
                 "competition_id": competition_id,
+                "current_season_install": current_season_install,
+                "history_raw": history_raw,
             },
         )
         if parsed.has_errors:
             raise ParseWaveError(
                 f"Season discovery failed for competition {competition_id}"
-            )
-        current_label = competition.last_season
-        current_candidates = [
-            index
-            for index, season in enumerate(seasons)
-            if current_label and season.label == current_label
-        ]
-        if current_candidates:
-            # FBref occasionally publishes two history URLs with the same
-            # display label (competition 612 did so for "2025"). A current
-            # edition is singular: prefer the source ID that exactly matches
-            # the advertised label, then the first/newest history row.
-            canonical_current = min(
-                current_candidates,
-                key=lambda index: (
-                    seasons[index].season_id != current_label,
-                    index,
-                ),
-            )
-            current_season_id = seasons[canonical_current].season_id
-        elif current_label and any(
-            match.season_id == current_label for match in direct_matches
-        ):
-            current_season_id = current_label
-        else:
-            current_season_id = (
-                seasons[0].season_id
-                if seasons
-                else direct_matches[0].season_id
-                if direct_matches
-                else None
             )
 
         entries = [
@@ -3899,7 +4699,10 @@ class FBrefPipeline:
                 canonical_url=season.season_url,
                 label=season.label,
                 is_current=season.season_id == current_season_id,
-                metadata={"calendar_type": season.calendar_type.value},
+                metadata={
+                    "calendar_type": season.calendar_type.value,
+                    "current_season_install": current_season_install,
+                },
             )
             for season in seasons
         ]
@@ -3920,6 +4723,7 @@ class FBrefPipeline:
                 metadata={
                     "calendar_type": CalendarType.TOURNAMENT.value,
                     "direct_match_only": True,
+                    "current_season_install": current_season_install,
                 },
             ))
             registered_season_ids.add(match.season_id)
@@ -4005,6 +4809,10 @@ class FBrefPipeline:
             candidates,
             parent_record=record,
             eligible_competitions=registry,
+            provenance_metadata={
+                "current_season_install": current_season_install,
+            },
+            provenance_install_id=snapshot_identity,
         )
 
     @staticmethod
@@ -4851,8 +5659,7 @@ class FBrefPipeline:
                 else:
                     if self._typed_context(record) is None:
                         raise TypedBronzeError(
-                            "Typed page requires source competition_id and "
-                            "season_id"
+                            "Typed page requires source competition_id and season_id"
                         )
                     self._persist_typed(run_id, html, record)
                 typed_promoted = 1
@@ -5825,6 +6632,7 @@ class FBrefPipeline:
                     "Cross-run recovery is not a replay source selector"
                 )
             fetches = self.control.list_unprocessed_fetches(
+                run_type=settings.run_type,
                 parser_version=PAGE_DOCUMENT_VERSION,
                 typed_parser_version=TYPED_BRONZE_PARSER_VERSION,
                 stateful_parser_version=DISCOVERY_PARSER_VERSION,
@@ -6045,7 +6853,7 @@ class FBrefPipeline:
         page_kinds: Sequence[str],
         settings: PipelineSettings,
     ) -> WaveResult:
-        """Drain committed raw left unprocessed by any earlier source run.
+        """Drain committed raw left unprocessed by this lane's source runs.
 
         This is deliberately invoked before a current/backfill fetch wave so
         parse failure can never strand immutable S3 raw behind a terminal
@@ -6219,8 +7027,7 @@ class FBrefPipeline:
             errors.append("unvalidated_target_count_missing")
         elif int(summary.get("unvalidated_target_count") or 0) != 0:
             errors.append(
-                "unvalidated_target_count="
-                f"{int(summary['unvalidated_target_count'])}"
+                f"unvalidated_target_count={int(summary['unvalidated_target_count'])}"
             )
         if (
             publication_eligible
@@ -6300,8 +7107,7 @@ class FBrefPipeline:
                 errors.append("no_durable_progress_after_claimed_work")
         if int(traffic.get("unclassified_failures") or 0) != 0:
             errors.append(
-                "unclassified_failures="
-                f"{int(traffic['unclassified_failures'])}"
+                f"unclassified_failures={int(traffic['unclassified_failures'])}"
             )
         if int(traffic.get("duplicate_fetch_violations") or 0) != 0:
             errors.append(
@@ -6367,19 +7173,40 @@ class FBrefPipeline:
             errors.append("unprocessed_raw_count_missing")
         elif int(summary.get("unprocessed_raw_count") or 0) != 0:
             errors.append(
-                "unprocessed_raw_count="
-                f"{int(summary['unprocessed_raw_count'])}"
+                f"unprocessed_raw_count={int(summary['unprocessed_raw_count'])}"
             )
-        if not isolated_acceptance:
-            if "global_unprocessed_raw_sla_overdue_count" not in summary:
-                errors.append("global_unprocessed_raw_sla_overdue_count_missing")
+        summary_run_type = str(summary.get("run_type") or "").casefold()
+        if not isolated_acceptance and summary_run_type != "replay":
+            if "lane_unprocessed_raw_sla_overdue_count" not in summary:
+                errors.append("lane_unprocessed_raw_sla_overdue_count_missing")
             elif int(
-                summary.get("global_unprocessed_raw_sla_overdue_count") or 0
+                summary.get("lane_unprocessed_raw_sla_overdue_count") or 0
             ) != 0:
                 errors.append(
-                    "global_unprocessed_raw_sla_overdue_count="
-                    f"{int(summary['global_unprocessed_raw_sla_overdue_count'])}"
+                    "lane_unprocessed_raw_sla_overdue_count="
+                    f"{int(summary['lane_unprocessed_raw_sla_overdue_count'])}"
                 )
+            if "global_unprocessed_raw_sla_overdue_count" not in summary:
+                errors.append("global_unprocessed_raw_sla_overdue_count_missing")
+            else:
+                global_overdue = int(
+                    summary.get("global_unprocessed_raw_sla_overdue_count") or 0
+                )
+                lane_overdue = int(
+                    summary.get("lane_unprocessed_raw_sla_overdue_count") or 0
+                )
+                if global_overdue > lane_overdue:
+                    other_lane_overdue = global_overdue - lane_overdue
+                    warnings[
+                        "other_lane_unprocessed_raw_sla_overdue_count"
+                    ] = other_lane_overdue
+                    logger.warning(
+                        "Run %s reports %d overdue unprocessed raw "
+                        "observation(s) outside its %s recovery lane",
+                        run_id,
+                        other_lane_overdue,
+                        summary_run_type,
+                    )
 
         if not isolated_acceptance:
             crawlable_scope = summary.get("crawlable_frontier_scope_counts")
@@ -6469,6 +7296,532 @@ class FBrefPipeline:
         return summary
 
 
+class OversizeEvidenceConfigurationError(ValueError):
+    """The fixed oversize diagnostic contract is not executable."""
+
+
+class OversizeEvidenceExecutionError(RuntimeError):
+    """Redacted oversize diagnostic failure with its lifecycle stage."""
+
+    def __init__(self, *, stage: str, run_id: str) -> None:
+        super().__init__(f"FBref oversize diagnostic failed during {stage}")
+        self.stage = stage
+        self.run_id = run_id
+
+
+@dataclass(frozen=True)
+class OversizeEvidenceAuthority:
+    """Immutable authority replaced only by a separately reviewed commit."""
+
+    review_state: str
+    source_run_id: str
+    terminal_snapshot_sha256: str
+    target_ids: Sequence[str]
+    diagnostic_target_ids: Sequence[str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "review_state", str(self.review_state).strip())
+        object.__setattr__(self, "source_run_id", str(self.source_run_id).strip())
+        object.__setattr__(
+            self,
+            "terminal_snapshot_sha256",
+            str(self.terminal_snapshot_sha256).strip(),
+        )
+        object.__setattr__(
+            self,
+            "target_ids",
+            tuple(str(item).strip() for item in self.target_ids),
+        )
+        object.__setattr__(
+            self,
+            "diagnostic_target_ids",
+            tuple(str(item).strip() for item in self.diagnostic_target_ids),
+        )
+
+
+@dataclass(frozen=True)
+class OversizeEvidenceConfig:
+    logical_run_label: str
+
+    def __post_init__(self) -> None:
+        label = str(self.logical_run_label).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,159}", label):
+            raise OversizeEvidenceConfigurationError(
+                "logical run label is invalid"
+            )
+        object.__setattr__(self, "logical_run_label", label)
+
+
+CANARY_DAG_ID = "fbref_oversize_evidence_canary"
+_OVERSIZE_EVIDENCE_PAGE_KINDS = ("season_stats",)
+_OVERSIZE_EVIDENCE_LOCK_TTL_SECONDS = 4 * 60 * 60
+_OVERSIZE_EVIDENCE_BROWSER_REQUEST_LIMIT = DEFAULT_BROWSER_REQUESTS_PER_SOLVE
+_OVERSIZE_EVIDENCE_BROWSER_SOLVE_LIMIT = 1
+_OVERSIZE_EVIDENCE_PROVIDER_DAG_ID = "dag_accept_fbref_bronze"
+_OVERSIZE_EVIDENCE_PROVIDER_TASK_ID = "oversize_evidence_fetch"
+_OVERSIZE_EVIDENCE_LEASE_RACE_HEADROOM_BYTES = 64 * MIB
+_OVERSIZE_EVIDENCE_TARGET_ID = re.compile(
+    r"fbref:season_stats:[^:\s]{1,64}:[^:\s]{1,64}:"
+    r"(?:keepers|misc|playingtime|shooting|standard)\Z"
+)
+_OVERSIZE_EVIDENCE_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_ZERO_UUID = "00000000-0000-0000-0000-000000000000"
+_ZERO_SHA256 = "0" * 64
+OVERSIZE_EVIDENCE_TARGET_IDS = (
+    "fbref:season_stats:6:2022:playingtime",
+    "fbref:season_stats:569:2025-2026:playingtime",
+    "fbref:season_stats:569:2025-2026:standard",
+    "fbref:season_stats:678:2021:playingtime",
+)
+OVERSIZE_EVIDENCE_DIAGNOSTIC_TARGET_IDS = (
+    "fbref:season_stats:569:2025-2026:playingtime",
+    "fbref:season_stats:569:2025-2026:standard",
+)
+
+# Baked from the exact saved terminal TSV. There is deliberately no runtime
+# source/digest/target override: any authority change requires another commit
+# and independent review before this fetch-only diagnostic may be authorized.
+OVERSIZE_EVIDENCE_AUTHORITY = OversizeEvidenceAuthority(
+    review_state="REVIEWED",
+    source_run_id="94838bac-786a-5d59-99e4-f6a2b3f7971e",
+    terminal_snapshot_sha256=(
+        "b114e1139c50857b2985ead5ef2f72083660fc75cc9d1e9466874959a77bd543"
+    ),
+    target_ids=OVERSIZE_EVIDENCE_TARGET_IDS,
+    diagnostic_target_ids=OVERSIZE_EVIDENCE_DIAGNOSTIC_TARGET_IDS,
+)
+
+
+def _validate_oversize_evidence_authority() -> OversizeEvidenceAuthority:
+    authority = OVERSIZE_EVIDENCE_AUTHORITY
+    if authority.review_state != "REVIEWED":
+        raise OversizeEvidenceConfigurationError(
+            "baked snapshot authority is unreviewed"
+        )
+    try:
+        source_run_id = str(uuid.UUID(authority.source_run_id))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise OversizeEvidenceConfigurationError(
+            "baked source run id is invalid"
+        ) from exc
+    if source_run_id == _ZERO_UUID:
+        raise OversizeEvidenceConfigurationError(
+            "baked source run id is a sentinel"
+        )
+    snapshot_sha256 = authority.terminal_snapshot_sha256
+    if (
+        not _OVERSIZE_EVIDENCE_SHA256.fullmatch(snapshot_sha256)
+        or snapshot_sha256 == _ZERO_SHA256
+    ):
+        raise OversizeEvidenceConfigurationError(
+            "baked terminal snapshot SHA256 is invalid"
+        )
+    target_ids = tuple(authority.target_ids)
+    if not 1 <= len(target_ids) <= 25:
+        raise OversizeEvidenceConfigurationError(
+            "baked exact cohort must contain between 1 and 25 targets"
+        )
+    if len(target_ids) != len(set(target_ids)):
+        raise OversizeEvidenceConfigurationError(
+            "baked exact cohort contains duplicates"
+        )
+    if any(
+        not _OVERSIZE_EVIDENCE_TARGET_ID.fullmatch(item)
+        for item in target_ids
+    ):
+        raise OversizeEvidenceConfigurationError(
+            "baked cohort contains a non-oversize season-stat target"
+        )
+    if target_ids != OVERSIZE_EVIDENCE_TARGET_IDS:
+        raise OversizeEvidenceConfigurationError(
+            "baked source cohort differs from the reviewed terminal set"
+        )
+    diagnostic_target_ids = tuple(authority.diagnostic_target_ids)
+    if not 1 <= len(diagnostic_target_ids) <= len(target_ids):
+        raise OversizeEvidenceConfigurationError(
+            "baked diagnostic cohort has an invalid size"
+        )
+    if len(diagnostic_target_ids) != len(set(diagnostic_target_ids)):
+        raise OversizeEvidenceConfigurationError(
+            "baked diagnostic cohort contains duplicates"
+        )
+    if any(
+        not _OVERSIZE_EVIDENCE_TARGET_ID.fullmatch(item)
+        for item in diagnostic_target_ids
+    ):
+        raise OversizeEvidenceConfigurationError(
+            "baked diagnostic cohort contains a non-season-stat target"
+        )
+    if not set(diagnostic_target_ids).issubset(target_ids):
+        raise OversizeEvidenceConfigurationError(
+            "baked diagnostic cohort is outside terminal source authority"
+        )
+    if diagnostic_target_ids != OVERSIZE_EVIDENCE_DIAGNOSTIC_TARGET_IDS:
+        raise OversizeEvidenceConfigurationError(
+            "baked diagnostic cohort differs from the reviewed comp569 pair"
+        )
+    return OversizeEvidenceAuthority(
+        review_state="REVIEWED",
+        source_run_id=source_run_id,
+        terminal_snapshot_sha256=snapshot_sha256,
+        target_ids=target_ids,
+        diagnostic_target_ids=diagnostic_target_ids,
+    )
+
+
+def _validate_oversize_evidence_wave_result(
+    result: object,
+    *,
+    expected_targets: int,
+    request_limit: int,
+    byte_limit: int,
+    browser_bootstrap_limit: int,
+) -> WaveResult:
+    if not isinstance(result, WaveResult):
+        raise RuntimeError("fetch wave returned an unexpected result type")
+    exact_counts = (
+        result.cohort_size == expected_targets
+        and result.claimed == expected_targets
+        and result.fetched == expected_targets
+    )
+    zero_outcomes = all(
+        getattr(result, name) == 0
+        for name in (
+            "recovered_from_raw",
+            "parsed",
+            "typed_promoted",
+            "stale_typed_observations_skipped",
+            "seeded",
+            "skipped_ineligible",
+            "requeued_at_budget",
+            "requeued_dead_clearance",
+            "requeued_session_exhaustion",
+            "deferred_dead_clearance",
+            "contract_quarantined",
+            "moved_pages_skipped",
+            "deferred_match_not_found",
+            "terminal_oversized_pages",
+        )
+    )
+    bounded_requests = (
+        expected_targets <= result.requests <= request_limit
+        and 0 <= result.browser_bootstraps <= browser_bootstrap_limit
+        and result.browser_bootstraps <= result.requests - expected_targets
+    )
+    bounded_bytes = all(
+        0 <= value <= byte_limit
+        for value in (
+            result.wire_bytes,
+            result.decoded_html_bytes,
+            result.browser_document_bytes,
+            result.browser_asset_bytes,
+        )
+    )
+    if (
+        not exact_counts
+        or not zero_outcomes
+        or not bounded_requests
+        or not bounded_bytes
+        or result.budget_exhausted
+        or result.failures
+    ):
+        raise RuntimeError(
+            "fetch wave result violates the exact oversize evidence contract"
+        )
+    return result
+
+
+def _oversize_evidence_settings(
+    config: OversizeEvidenceConfig,
+) -> PipelineSettings:
+    """Build and prove the one reviewed persistent diagnostic profile."""
+
+    settings = replace(
+        PipelineSettings.acceptance(
+            scope="current",
+            proxy_file=None,
+        ),
+        persistent_http_session=True,
+    )
+    solve_limit = (
+        int(settings.bootstrap_request_reservation)
+        // DEFAULT_BROWSER_REQUESTS_PER_SOLVE
+    )
+    if (
+        settings.run_type != "current"
+        or settings.request_limit != 100
+        or settings.byte_limit != 50 * MIB
+        or settings.shard_size != 25
+        or settings.request_reservation_bytes
+        != DEFAULT_REQUEST_RESERVATION_BYTES
+        or settings.target_request_reservation != MAX_TARGET_HTTP_ATTEMPTS
+        or settings.bootstrap_request_reservation
+        != _OVERSIZE_EVIDENCE_BROWSER_REQUEST_LIMIT
+        or settings.bootstrap_byte_reservation
+        != DEFAULT_BROWSER_BYTE_LIMIT_BYTES
+        or solve_limit != _OVERSIZE_EVIDENCE_BROWSER_SOLVE_LIMIT
+        or settings.persistent_http_session is not True
+    ):
+        raise OversizeEvidenceConfigurationError(
+            "oversize evidence browser and persistent HTTP profile changed"
+        )
+    return settings
+
+
+def _oversize_evidence_provider_byte_limit(
+    settings: PipelineSettings,
+) -> int:
+    """Retain the live runner's lease-extension race headroom."""
+
+    shared_remaining = settings.byte_limit
+    race_headroom = min(
+        _OVERSIZE_EVIDENCE_LEASE_RACE_HEADROOM_BYTES,
+        shared_remaining // 4,
+    )
+    return shared_remaining - race_headroom
+
+
+def _build_oversize_evidence_live_pipeline(
+    config: OversizeEvidenceConfig,
+    *,
+    run_id: str,
+    settings: PipelineSettings,
+) -> FBrefPipeline:
+    """Install the supported paid-meter factory after a zero-paid preflight."""
+
+    try:
+        persistent_enabled = strict_binary_flag(
+            "FBREF_PERSISTENT_HTTP_SESSION"
+        )
+    except ValueError as exc:
+        raise OversizeEvidenceConfigurationError(
+            "persistent HTTP deployment switch is invalid"
+        ) from exc
+    if not persistent_enabled:
+        raise OversizeEvidenceConfigurationError(
+            "persistent HTTP deployment switch must be enabled"
+        )
+
+    control_url = str(os.environ.get("FBREF_PROXY_CONTROL_URL") or "").strip()
+    control_token = str(
+        os.environ.get("FBREF_PROXY_CONTROL_TOKEN") or ""
+    ).strip()
+    try:
+        meter = validate_fbref_proxy_meter(
+            control_url,
+            control_token=control_token,
+            required_bytes=settings.byte_limit,
+            minimum_configured_exits=1,
+        )
+    except Exception as exc:  # noqa: BLE001 - redact dependency details
+        raise OversizeEvidenceConfigurationError(
+            "persistent HTTP proxy meter preflight failed"
+        ) from exc
+    if int(meter.get("daily_remaining_bytes") or 0) < settings.byte_limit:
+        raise OversizeEvidenceConfigurationError(
+            "persistent HTTP proxy meter cannot fund the exact diagnostic"
+        )
+
+    provider_context = {
+        "source": "fbref",
+        # The control run keeps its purpose-built nonpublishing identity. Paid
+        # transport uses the already-approved Bronze acceptance provenance;
+        # extending the proxy allowlist is intentionally outside this recovery.
+        "dag_id": _OVERSIZE_EVIDENCE_PROVIDER_DAG_ID,
+        "run_id": run_id,
+        "task_id": _OVERSIZE_EVIDENCE_PROVIDER_TASK_ID,
+        "scope": config.logical_run_label,
+        "canonical_url": "https://fbref.com/en/",
+    }
+    provider_byte_limit = _oversize_evidence_provider_byte_limit(settings)
+    active_pipeline = FBrefPipeline.from_env()
+    active_pipeline.fetcher_factory = (
+        lambda _proxy_file, max_browser_requests, max_browser_bytes: (
+            FBrefFetcher(
+                max_browser_requests=max_browser_requests,
+                max_browser_bytes=max_browser_bytes,
+                provider_context=provider_context,
+                provider_max_bytes=provider_byte_limit,
+                proxy_control_url=control_url,
+                proxy_control_token=control_token,
+                persistent_http_session=True,
+            )
+        )
+    )
+    return active_pipeline
+
+
+def _fail_oversize_evidence_run(
+    pipeline: object,
+    run_id: str,
+    *,
+    release_lock: bool,
+) -> None:
+    """Attempt both failure finalization and lock release, in that order."""
+
+    try:
+        pipeline.control.finish_run(run_id, succeeded=False)
+    finally:
+        if release_lock:
+            pipeline.control.release_publication_lock(run_id)
+
+
+def run_oversize_evidence_canary(
+    config: OversizeEvidenceConfig,
+    *,
+    pipeline: Optional[object] = None,
+) -> dict[str, object]:
+    """Execute the baked exact cohort through one Bronze fetch-only wave."""
+
+    authority = _validate_oversize_evidence_authority()
+    run_id = make_control_run_id(
+        config.logical_run_label,
+        dag_id=CANARY_DAG_ID,
+    )
+    settings = _oversize_evidence_settings(config)
+    active_pipeline = (
+        pipeline
+        if pipeline is not None
+        else _build_oversize_evidence_live_pipeline(
+            config,
+            run_id=run_id,
+            settings=settings,
+        )
+    )
+    stage = "initialize"
+    lock_acquired = False
+    run_initialized = False
+    try:
+        initialized = active_pipeline.initialize_acceptance_run(
+            airflow_run_id=config.logical_run_label,
+            dag_id=CANARY_DAG_ID,
+            settings=settings,
+            execution_metadata={
+                "reviewed_source_run_id": authority.source_run_id,
+                "reviewed_terminal_snapshot_sha256": (
+                    authority.terminal_snapshot_sha256
+                ),
+                "reviewed_diagnostic_target_ids": list(
+                    authority.diagnostic_target_ids
+                ),
+                "browser_request_limit": (
+                    _OVERSIZE_EVIDENCE_BROWSER_REQUEST_LIMIT
+                ),
+                "browser_solve_limit": _OVERSIZE_EVIDENCE_BROWSER_SOLVE_LIMIT,
+                "provider_dag_id": _OVERSIZE_EVIDENCE_PROVIDER_DAG_ID,
+                "provider_task_id": _OVERSIZE_EVIDENCE_PROVIDER_TASK_ID,
+                "provider_scope": config.logical_run_label,
+                "provider_run_id": run_id,
+                "provider_byte_limit": (
+                    _oversize_evidence_provider_byte_limit(settings)
+                ),
+            },
+        )
+        if initialized != run_id:
+            raise RuntimeError("unexpected control run identity")
+        run_initialized = True
+
+        stage = "acquire_publication_lock"
+        active_pipeline.control.acquire_publication_lock(
+            run_id,
+            dag_id=CANARY_DAG_ID,
+            ttl_seconds=_OVERSIZE_EVIDENCE_LOCK_TTL_SECONDS,
+        )
+        lock_acquired = True
+
+        stage = "seed_exact_cohort"
+        routes = tuple(
+            sorted(
+                {
+                    target_id.rsplit(":", 1)[-1]
+                    for target_id in authority.diagnostic_target_ids
+                }
+            )
+        )
+        frozen = active_pipeline.seed_acceptance_cohort(
+            run_id,
+            authority.diagnostic_target_ids,
+            settings=settings,
+            required_page_kinds=_OVERSIZE_EVIDENCE_PAGE_KINDS,
+            required_routes=routes,
+            coverage_slots={
+                f"oversize:{index}": target_id
+                for index, target_id in enumerate(
+                    authority.diagnostic_target_ids
+                )
+            },
+        )
+        if tuple(frozen.get("target_ids") or ()) != tuple(
+            authority.diagnostic_target_ids
+        ):
+            raise RuntimeError("frozen cohort differs from requested cohort")
+
+        stage = "fetch"
+        wave = active_pipeline.fetch_wave(
+            run_id,
+            worker_id=f"oversize-evidence:{run_id}",
+            page_kinds=_OVERSIZE_EVIDENCE_PAGE_KINDS,
+            settings=settings,
+        )
+        stage = "validate_fetch_result"
+        wave = _validate_oversize_evidence_wave_result(
+            wave,
+            expected_targets=len(authority.diagnostic_target_ids),
+            request_limit=min(
+                settings.request_limit,
+                len(authority.diagnostic_target_ids)
+                + int(settings.bootstrap_request_reservation),
+            ),
+            byte_limit=settings.byte_limit,
+            browser_bootstrap_limit=max(
+                1,
+                settings.bootstrap_request_reservation
+                // DEFAULT_BROWSER_REQUESTS_PER_SOLVE,
+            ),
+        )
+
+        # A successful run must never retain a writer fence. Release first;
+        # if release fails, the except path can only attempt a failed terminal
+        # state and the caller receives an exception/nonzero verdict.
+        stage = "release_publication_lock"
+        active_pipeline.control.release_publication_lock(run_id)
+        lock_acquired = False
+
+        stage = "finish"
+        active_pipeline.control.finish_run(run_id, succeeded=True)
+    except Exception:  # noqa: BLE001 - expose only the redacted lifecycle stage
+        if run_initialized:
+            try:
+                _fail_oversize_evidence_run(
+                    active_pipeline,
+                    run_id,
+                    release_lock=lock_acquired,
+                )
+            except Exception:  # noqa: BLE001 - original stage remains primary
+                pass
+        raise OversizeEvidenceExecutionError(stage=stage, run_id=run_id) from None
+
+    return {
+        "status": "succeeded",
+        "run_id": run_id,
+        "target_ids": list(authority.diagnostic_target_ids),
+        "request_limit": settings.request_limit,
+        "byte_limit": settings.byte_limit,
+        "shard_size": settings.shard_size,
+        "publication_eligible": False,
+        "browser_request_limit": _OVERSIZE_EVIDENCE_BROWSER_REQUEST_LIMIT,
+        "browser_solve_limit": _OVERSIZE_EVIDENCE_BROWSER_SOLVE_LIMIT,
+        "provider_dag_id": _OVERSIZE_EVIDENCE_PROVIDER_DAG_ID,
+        "provider_task_id": _OVERSIZE_EVIDENCE_PROVIDER_TASK_ID,
+        "provider_scope": config.logical_run_label,
+        "provider_run_id": run_id,
+        "provider_byte_limit": _oversize_evidence_provider_byte_limit(
+            settings
+        ),
+        "wave": wave.as_dict(),
+    }
+
+
 __all__ = [
     "BACKFILL_SEASON_COHORT_RESERVATION_BYTES",
     "DEFAULT_BYTE_LIMIT",
@@ -6481,6 +7834,13 @@ __all__ = [
     "LiveRunResult",
     "MIB",
     "MAX_SHARD_SIZE",
+    "OVERSIZE_EVIDENCE_AUTHORITY",
+    "OVERSIZE_EVIDENCE_TARGET_IDS",
+    "OversizeEvidenceAuthority",
+    "OversizeEvidenceConfig",
+    "OversizeEvidenceConfigurationError",
+    "OversizeEvidenceExecutionError",
+    "OVERSIZE_EVIDENCE_DIAGNOSTIC_TARGET_IDS",
     "ParseWaveError",
     "PipelineError",
     "PipelineSettings",
@@ -6492,5 +7852,6 @@ __all__ = [
     "frontier_target",
     "live_wave_target_capacity",
     "page_target_from_link",
+    "run_oversize_evidence_canary",
     "wave_target_capacity",
 ]

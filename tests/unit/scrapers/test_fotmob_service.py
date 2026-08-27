@@ -14,7 +14,10 @@ from scrapers.fotmob.repository import (
     TargetCommit,
 )
 from scrapers.fotmob.service import (
+    LEADERBOARD_REFRESH_AFTER,
+    PLAYER_CARD_POLICY,
     PLAYER_REFRESH_AFTER,
+    TEAM_REFRESH_AFTER,
     FotMobIngestService,
     OperationResult,
     profile_probe_delay,
@@ -1685,6 +1688,40 @@ def test_forced_player_refresh_reobserves_partial_current_run_commits():
     assert sorted(call[0] for call in transport.calls[1:]) == sorted([url10, url20])
 
 
+def test_player_typed_gap_repair_rewrites_same_deterministic_batch():
+    """A successful manifest must not hide its missing typed player row."""
+
+    player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
+    payload = {"pageProps": {"data": {"id": 10, "name": "Ten"}}}
+    service, transport, repository = _service({player_url: payload})
+    fetch = transport._get(player_url, None)
+    repository.record(
+        TargetCommit(
+            run_id="stale-manifest",
+            target_type="player",
+            target_key=fetch.target_key,
+            status=ManifestStatus.SUCCESS,
+            entity_id="10",
+            content_hash=fetch.content_hash,
+            raw_uri=fetch.raw_uri,
+            fetched_at=datetime.fromisoformat(fetch.fetched_at),
+        )
+    )
+    transport.calls.clear()
+
+    repaired = service.sync_player_snapshots(
+        [10],
+        build_id="build-1",
+        force_refresh=True,
+        repair_missing_snapshot=True,
+        capture_terminal_outcomes=True,
+    )
+
+    assert repaired.ok and repaired.succeeded == 1
+    assert repaired.metadata["typed_snapshot_writes"] == 1
+    assert repository.tables["fotmob_player_snapshots"][0]["player_id"] == "10"
+
+
 def test_backfill_skips_fresh_prior_generation_children():
     """#1146 отменяет контракт #995: свежие цели прошлого рана не перекачиваются.
 
@@ -1776,8 +1813,8 @@ def test_backfill_skips_fresh_prior_generation_children():
     assert current_commits == []
 
 
-def test_backfill_refetches_stale_prior_generation_children():
-    """Обратная сторона #1146: протухшую цель прошлого рана всё равно берём."""
+def test_backfill_refetches_periodic_children_but_reuses_verified_player_card():
+    """Periodic targets expire, while #1196 player identities do not."""
 
     bundle = parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
     leaderboard_url = "https://data.fotmob.com/stats/47/season/goals.json"
@@ -1807,11 +1844,25 @@ def test_backfill_refetches_stale_prior_generation_children():
     service, transport, repository = _service(responses, mode=RunMode.BACKFILL)
     now = datetime.now(timezone.utc)
     stale = (
-        # лидерборд: старше LEADERBOARD_REFRESH_AFTER (24 ч)
-        ("leaderboard", canonicalize_target(leaderboard_url), "goals", timedelta(hours=25)),
-        # команда: старше окна обновления состава (20 ч)
-        ("team", canonicalize_target(team_url), "1", timedelta(hours=21)),
-        # игрок: старше окна карточки игрока (PLAYER_REFRESH_AFTER, 14 суток)
+        # лидерборд: старше LEADERBOARD_REFRESH_AFTER. Возраст берём от самой
+        # константы, а не числом: тест проверяет «прошлое поколение перекачивается»,
+        # и при пересмотре порога он не должен молча начать проверять другое.
+        (
+            "leaderboard",
+            canonicalize_target(leaderboard_url),
+            "goals",
+            LEADERBOARD_REFRESH_AFTER + timedelta(hours=1),
+        ),
+        # команда: старше окна обновления состава. Возраст берём от константы,
+        # а не числом: под прежними 20 часами литерал 21 ч означал «просрочено»,
+        # а после подъёма порога молча стал бы означать «ещё свежее».
+        (
+            "team",
+            canonicalize_target(team_url),
+            "1",
+            TEAM_REFRESH_AFTER + timedelta(hours=1),
+        ),
+        # Карточка игрока старая, но подтверждённая: once-policy её переиспользует.
         ("player", canonicalize_target(player_url), "10", timedelta(days=15)),
     )
     for target_type, target, entity_id, age in stale:
@@ -1834,7 +1885,7 @@ def test_backfill_refetches_stale_prior_generation_children():
 
     assert all(result.ok for result in (leaderboard, teams, players))
     assert leaderboard.skipped == 0
-    assert players.skipped == 0
+    assert players.skipped == 1
     # Команда 1 протухла и берётся заново; команда 2 в манифесте не значится вовсе.
     assert teams.attempted == 2
     assert teams.skipped == 0
@@ -1842,7 +1893,7 @@ def test_backfill_refetches_stale_prior_generation_children():
     assert leaderboard_url in fetched
     assert team_url in fetched
     assert other_team_url in fetched
-    assert player_url in fetched
+    assert player_url not in fetched
 
 
 def test_stale_raw_replay_does_not_count_as_freshness_validation():
@@ -2135,6 +2186,37 @@ def test_player_null_pageprops_data_is_intentional_not_available():
     commit = next(c for c in repository.commits if c.target_type == "player")
     assert commit.status == ManifestStatus.NOT_AVAILABLE
     assert commit.error_code == "source_player_no_data"
+
+
+def test_player_no_data_tombstone_remains_retryable_under_once_policy():
+    """A source gap is not the one confirmed collection promised by #1196."""
+
+    player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
+    service, transport, repository = _service(
+        {player_url: {"pageProps": {"data": {"id": 10, "name": "Appeared"}}}}
+    )
+    old_target = canonicalize_target(
+        "https://www.fotmob.com/_next/data/build-0/players/10.json"
+    )
+    repository.record(
+        TargetCommit(
+            run_id="prior",
+            target_type="player",
+            target_key=old_target.target_key,
+            status=ManifestStatus.NOT_AVAILABLE,
+            entity_id="10",
+            error_code="source_player_no_data",
+            completed_at=datetime.now(timezone.utc) - timedelta(days=400),
+        )
+    )
+
+    result = service.sync_player_snapshots([10], build_id="build-1")
+
+    assert result.ok, result.errors
+    assert result.skipped == 0
+    assert result.succeeded == 1
+    assert result.metadata["first_collection_due"] == 1
+    assert [call[0] for call in transport.calls] == [player_url]
 
 
 def test_player_payload_without_pageprops_container_stays_parse_failure():
@@ -2754,14 +2836,89 @@ def test_leaderboard_freshness_is_keyed_by_url_not_category_name():
     assert [call[0] for call in transport.calls] == [other_url]
 
 
-def test_player_refresh_is_rarer_but_first_collection_is_never_delayed():
-    """A2 (решение владельца 18.08): реже обновляем, но первичный сбор не трогаем.
+def test_leaderboard_threshold_outlives_the_lane_period():
+    """A6/#1198: порог таблиц лидеров обязан быть ДЛИННЕЕ периода полосы.
 
-    Замер 15–18.08: игроки — 63,5 % бюджета волны, и 94,6 % этих запросов
-    приходится на ПОВТОРНОЕ обновление уже собранной карточки. Порог режет
-    именно их; игрок, которого в манифесте нет вовсе, обязан собираться сразу,
-    иначе словарь игроков перестанет пополняться.
+    Урок 74: период полосы контура — 24 часа, поэтому порог, равный периоду или
+    короче, не отсекает практически ничего. Прежние 24 часа были ровно таким
+    декоративным порогом: замер 20.08 за 7 суток дал у leaderboard 25 368 сетевых
+    обращений (28,2 % физического бюджета) при медиане реального цикла повтора
+    57,7 часа — то есть цель и так ходила вдвое реже порога.
+
+    Тест держит две вещи разом: конкретное принятое значение и правило, по
+    которому оно выбрано. Возврат к 24 часам (или к любому значению ≤ периода
+    полосы) обязан ронять этот тест, а не проходить молча.
     """
+
+    lane_period = timedelta(hours=24)
+
+    assert LEADERBOARD_REFRESH_AFTER == timedelta(hours=72)
+    assert LEADERBOARD_REFRESH_AFTER > lane_period
+    # 57,7 ч — измеренная медиана; порог обязан её перекрывать, иначе он не
+    # отсекает даже те повторы, которые цель делает сама по себе.
+    assert LEADERBOARD_REFRESH_AFTER > timedelta(hours=57, minutes=42)
+
+
+def test_team_threshold_outlives_the_lane_period():
+    """A6/#1198: порог карточки команды обязан быть ДЛИННЕЕ периода полосы.
+
+    Прежние 20 часов были короче периода полосы (24 ч) и по уроку 74 почти ничего
+    не отсекали, при том что команда — 26,7 % физических сетевых обращений
+    платформы, вторая статья бюджета.
+
+    Цена подъёма измерена (замер 20.08, 14 суток): паспорт команды на интервале
+    24–48 ч меняется у 9 повторов из 6661 (0,14 %), состав — у 936 из 4808
+    (19,5 %). То есть порог платит не свежестью витрины команд, а задержкой
+    обнаружения смены состава на срок до двух суток.
+
+    Тест держит и значение, и правило выбора: возврат к любому значению
+    ≤ периода полосы обязан его уронить.
+    """
+
+    lane_period = timedelta(hours=24)
+
+    assert TEAM_REFRESH_AFTER == timedelta(hours=48)
+    assert TEAM_REFRESH_AFTER > lane_period
+
+
+def test_stale_leaderboard_past_the_threshold_is_still_refetched():
+    """Обратная сторона порога: перешагнувший его лидерборд обязан перекачаться.
+
+    Возраст записи задан ОТНОСИТЕЛЬНО константы, поэтому тест остаётся зелёным
+    при любом её значении — от бесконечного порога он не защищает, это делает
+    `test_leaderboard_threshold_outlives_the_lane_period`. Здесь проверяется
+    другое: что предикат свежести не вывернут и пропуск не безусловен, то есть
+    что старая запись действительно приводит к сетевому вызову.
+    """
+
+    url = "https://data.fotmob.com/stats/47/season/goals.json"
+    payload = copy.deepcopy(_league_payload())
+    payload["stats"]["players"][0]["fetchAllUrl"] = url
+    bundle = parse_season_bundle(payload, ScopeRef(47, "2025/2026"))
+
+    service, transport, repository = _service({url: {"TopLists": []}})
+    repository.record(
+        TargetCommit(
+            run_id="prior-run",
+            target_type="leaderboard",
+            target_key=canonicalize_target(url).target_key,
+            status=ManifestStatus.SUCCESS,
+            entity_id="goals",
+            content_hash="a" * 64,
+            raw_uri="memory://own.json.gz",
+            completed_at=datetime.now(timezone.utc)
+            - (LEADERBOARD_REFRESH_AFTER + timedelta(hours=1)),
+        )
+    )
+
+    result = service.sync_leaderboards(bundle)
+
+    assert result.skipped == 0
+    assert [call[0] for call in transport.calls] == [url]
+
+
+def test_player_card_is_collected_once_per_identity():
+    """#1196: verified cards stay put, while new identities collect at once."""
 
     player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
     fresh_player_url = "https://www.fotmob.com/_next/data/build-1/players/11.json"
@@ -2782,27 +2939,26 @@ def test_player_refresh_is_rarer_but_first_collection_is_never_delayed():
             entity_id="10",
             content_hash="a" * 64,
             raw_uri=f"memory://{target.target_key}.json.gz",
-            # Прежний порог (7 суток) отправил бы карточку на перекачку;
-            # принятый (14 суток) — нет. Возраст фиксирован намеренно: если
-            # порог однажды опустят обратно, тест обязан упасть.
-            completed_at=datetime.now(timezone.utc) - timedelta(days=13),
+            completed_at=datetime.now(timezone.utc) - timedelta(days=400),
         )
     )
 
     players = service.sync_player_snapshots({10, 11}, build_id="build-1")
 
     assert players.ok, players.errors
-    assert PLAYER_REFRESH_AFTER == timedelta(days=14)
+    assert PLAYER_CARD_POLICY == "once_per_identity"
+    assert PLAYER_REFRESH_AFTER is None
     assert players.attempted == 2
-    # Известная карточка десятидневной давности больше не перекачивается...
     assert players.skipped == 1
-    # ...а игрок, которого в манифесте нет, собран немедленно.
     assert players.succeeded == 1
+    assert players.metadata["player_policy"] == "once_per_identity"
+    assert players.metadata["first_collection_due"] == 1
+    assert players.metadata["skipped_by_policy"] == 1
     assert [call[0] for call in transport.calls] == [fresh_player_url]
 
 
-def test_player_card_older_than_the_threshold_is_refetched():
-    """Обратная сторона A2: за порогом карточка всё-таки обновляется."""
+def test_periodic_player_refresh_can_be_reenabled_explicitly():
+    """A finite refresh interval remains an explicit rollback mechanism."""
 
     player_url = "https://www.fotmob.com/_next/data/build-1/players/10.json"
     service, transport, repository = _service(
@@ -2819,13 +2975,15 @@ def test_player_card_older_than_the_threshold_is_refetched():
             entity_id="10",
             content_hash="a" * 64,
             raw_uri=f"memory://{target.target_key}.json.gz",
-            # Ровно за порогом, фиксированным числом: TTL длиннее 15 суток
-            # этот тест обязан ронять.
             completed_at=datetime.now(timezone.utc) - timedelta(days=15),
         )
     )
 
-    players = service.sync_player_snapshots({10}, build_id="build-1")
+    players = service.sync_player_snapshots(
+        {10},
+        build_id="build-1",
+        refresh_after=timedelta(days=14),
+    )
 
     assert players.ok, players.errors
     assert players.skipped == 0
