@@ -65,6 +65,89 @@ class SeasonTarget:
         return (self.league, self.canonical_season)
 
 
+def _coerce_refresh_id(value: Any) -> int | None:
+    """Return a non-boolean integer identifier, or ``None`` when malformed."""
+
+    if isinstance(value, bool):
+        return None
+    try:
+        identifier = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    return identifier
+
+
+def _refresh_snapshot_tournaments(
+    snapshot: Mapping[str, Any],
+) -> list[tuple[int, str, list[Any]]]:
+    """Return ready refresh records, logging and skipping malformed entries."""
+
+    tournaments = snapshot.get("tournaments", ())
+    if not isinstance(tournaments, list):
+        logger.warning("invalid refresh snapshot tournaments; expected a list")
+        return []
+    ready: list[tuple[int, str, list[Any]]] = []
+    for tournament in tournaments:
+        if not isinstance(tournament, Mapping):
+            logger.warning("invalid refresh snapshot tournament; skipped")
+            continue
+        if tournament.get("metadata_status") != "ready":
+            continue
+        tournament_id = _coerce_refresh_id(tournament.get("unique_tournament_id"))
+        capture_key = tournament.get("capture_key")
+        seasons = tournament.get("seasons")
+        if tournament_id is None or not capture_key or not isinstance(seasons, list):
+            logger.warning("invalid refresh snapshot ready tournament; skipped")
+            continue
+        ready.append((tournament_id, str(capture_key), seasons))
+    return ready
+
+
+def _refresh_snapshot_seasons(
+    tournament_id: int,
+    seasons: list[Any],
+    *,
+    require_start_year: bool,
+) -> list[tuple[Mapping[str, Any], int, int | None, str]]:
+    """Return usable refresh seasons, logging and skipping malformed entries."""
+
+    usable: list[tuple[Mapping[str, Any], int, int | None, str]] = []
+    for season in seasons:
+        if not isinstance(season, Mapping):
+            logger.warning(
+                "invalid refresh snapshot season for tournament %s; skipped",
+                tournament_id,
+            )
+            continue
+        if str(season.get("metadata_status") or "pending") == "excluded":
+            continue
+        season_id = _coerce_refresh_id(season.get("source_season_id"))
+        canonical = season.get("canonical_season")
+        start_year = season.get("start_year")
+        if (
+            season_id is None
+            or not canonical
+            or (
+                require_start_year
+                and (isinstance(start_year, bool) or not isinstance(start_year, int))
+            )
+        ):
+            logger.warning(
+                "invalid refresh snapshot season for tournament %s; skipped",
+                tournament_id,
+            )
+            continue
+        usable.append((
+            season,
+            season_id,
+            start_year if isinstance(start_year, int) else None,
+            str(canonical),
+        ))
+    return usable
+
+
 def current_season_targets(
     snapshot: Mapping[str, Any], exclude_tournament_ids: frozenset[int]
 ) -> list[SeasonTarget]:
@@ -76,34 +159,23 @@ def current_season_targets(
     """
 
     targets: list[SeasonTarget] = []
-    for tournament in snapshot.get("tournaments", ()):
-        if tournament.get("metadata_status") != "ready":
-            continue
-        tournament_id = int(tournament["unique_tournament_id"])
+    for tournament_id, capture_key, seasons in _refresh_snapshot_tournaments(snapshot):
         if tournament_id in exclude_tournament_ids:
             continue
         newest: tuple[int, SeasonTarget] | None = None
-        for season in tournament.get("seasons") or ():
-            if season.get("metadata_status") == "excluded":
-                continue
-            start_year = season.get("start_year")
-            season_id = season.get("source_season_id")
-            canonical = season.get("canonical_season")
-            if (
-                isinstance(start_year, bool)
-                or not isinstance(start_year, int)
-                or season_id is None
-                or not canonical
-            ):
+        for _season, season_id, start_year, canonical in _refresh_snapshot_seasons(
+            tournament_id, seasons, require_start_year=True
+        ):
+            if start_year is None:  # Guard the dynamic helper contract.
                 continue
             if newest is None or start_year > newest[0]:
                 newest = (
                     start_year,
                     SeasonTarget(
                         tournament_id=tournament_id,
-                        season_id=int(season_id),
-                        league=str(tournament["capture_key"]),
-                        canonical_season=str(canonical),
+                        season_id=season_id,
+                        league=capture_key,
+                        canonical_season=canonical,
                     ),
                 )
         if newest is not None:
@@ -459,14 +531,11 @@ def plan_refresh_batch(
         for target in current_season_targets(snapshot, excluded_tournament_ids)
     }
     index: dict[tuple[str, str], tuple[int, Mapping[str, Any]]] = {}
-    for tournament in tournaments:
-        if str(tournament.get("metadata_status") or "pending") != "ready":
-            continue
-        for season in tournament.get("seasons") or ():
-            if str(season.get("metadata_status") or "pending") == "excluded":
-                continue
-            key = (str(tournament["capture_key"]), str(season["canonical_season"]))
-            index[key] = (int(tournament["unique_tournament_id"]), season)
+    for tournament_id, capture_key, seasons in _refresh_snapshot_tournaments(snapshot):
+        for season, _season_id, _start_year, canonical in _refresh_snapshot_seasons(
+            tournament_id, seasons, require_start_year=False
+        ):
+            index[(capture_key, canonical)] = (tournament_id, season)
     ranked = sorted(
         ((str(league), str(season), int(count)) for league, season, count in pending_partitions),
         key=lambda item: (
@@ -654,8 +723,10 @@ def clear_failed(path: str | Path, *, campaign_id: str, scope_key: str) -> None:
 
 __all__ = [
     "CampaignPlanningError",
+    "SeasonTarget",
     "campaign_scope_key",
     "clear_failed",
+    "current_season_targets",
     "env_int",
     "mark_completed",
     "mark_failed",
