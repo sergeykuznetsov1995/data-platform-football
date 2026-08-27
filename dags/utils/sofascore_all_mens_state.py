@@ -483,8 +483,9 @@ def _scope_task_env(
 
 def plan_refresh_batch(
     snapshot: Mapping[str, Any],
-    pending_partitions: Iterable[tuple[str, str, int]],
+    pending_partitions: Iterable[tuple[str, str, int, int | None]],
     *,
+    queue_mode: str,
     batch_size: int = DEFAULT_REFRESH_BATCH_SIZE,
     exclude_tournament_ids: Iterable[int | str] = (),
     snapshot_path: str = "/opt/airflow/runtime/sofascore/all-men/snapshot.json",
@@ -496,22 +497,30 @@ def plan_refresh_batch(
     dag_run_id: str = "manual",
     task_env: Mapping[str, str] | None = None,
 ) -> list[dict[str, str]]:
-    """Select a current-first refresh batch with historical fallback.
+    """Select a timestamp-aware fresh or largest-backlog refresh batch.
 
-    ``pending_partitions`` are ``(league, season, pending_matches)`` rows from
-    Bronze: ``SS-<id>`` partitions holding finished games that have no
-    complete capture yet.  Each row is resolved against the snapshot
-    (``capture_key`` -> tournament, ``canonical_season`` -> season); the
+    ``pending_partitions`` are ``(league, season, pending_matches,
+    newest_pending_start_timestamp)`` rows from Bronze: ``SS-<id>`` partitions
+    holding finished games that have no complete capture yet.  Each row is
+    resolved against the snapshot (``capture_key`` -> tournament,
+    ``canonical_season`` -> season); the
     configured leagues in ``exclude_tournament_ids`` belong to the daily
     ingest, an unknown partition or an excluded season is skipped with a log
     line (the scope cycle would refuse it anyway).  A pending season is
     accepted: the refresh lane runs the matches phase from Bronze evidence
-    without season pages.
+    without season pages.  ``fresh`` ranks the newest timestamp first, while
+    ``backlog`` ranks the largest unfinished partition first.
     """
 
     lane_env = {str(key): str(value) for key, value in (task_env or {}).items()}
-    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or batch_size < 1
+    ):
         raise CampaignPlanningError("batch_size must be a positive integer")
+    if queue_mode not in {"fresh", "backlog"}:
+        raise CampaignPlanningError("queue_mode must be 'fresh' or 'backlog'")
     snapshot_id = str(snapshot.get("snapshot_id") or "")
     if not snapshot_id or snapshot_id != _snapshot_digest(snapshot):
         raise CampaignPlanningError("campaign snapshot digest mismatch")
@@ -522,54 +531,78 @@ def plan_refresh_batch(
     if not isinstance(tournaments, list):
         raise CampaignPlanningError("campaign tournaments must be a list")
     # Campaign partitions are keyed ``SS-<unique_tournament_id>``.
-    excluded_tournament_ids = frozenset(
-        int(value) for value in exclude_tournament_ids
-    )
+    excluded_tournament_ids = frozenset(int(value) for value in exclude_tournament_ids)
     configured_keys = {f"SS-{value}" for value in excluded_tournament_ids}
-    current_partitions = {
-        target.partition
-        for target in current_season_targets(snapshot, excluded_tournament_ids)
-    }
     index: dict[tuple[str, str], tuple[int, Mapping[str, Any]]] = {}
     for tournament_id, capture_key, seasons in _refresh_snapshot_tournaments(snapshot):
         for season, _season_id, _start_year, canonical in _refresh_snapshot_seasons(
             tournament_id, seasons, require_start_year=False
         ):
             index[(capture_key, canonical)] = (tournament_id, season)
-    ranked = sorted(
-        ((str(league), str(season), int(count)) for league, season, count in pending_partitions),
-        key=lambda item: (
-            0 if (item[0], item[1]) in current_partitions else 1,
-            -item[2],
-            item[0],
-            item[1],
-        ),
-    )
-    planned: list[dict[str, str]] = []
-    for league, canonical, count in ranked:
+    candidates: list[tuple[str, str, int, int | None, int, Mapping[str, Any]]] = []
+    for league, canonical, count, timestamp in pending_partitions:
+        league = str(league)
+        canonical = str(canonical)
         if league in configured_keys:
             continue
         entry = index.get((league, canonical))
         if entry is None:
             logger.warning(
                 "refresh partition %s/%s (%s pending) is not a ready snapshot "
-                "season; skipped", league, canonical, count,
+                "season; skipped",
+                league,
+                canonical,
+                count,
             )
             continue
+        # Filtering is deliberately complete before timestamp normalization:
+        # malformed data in a configured, unknown, or excluded partition cannot
+        # poison an otherwise safe batch.
+        normalized_timestamp = (
+            timestamp
+            if isinstance(timestamp, int) and not isinstance(timestamp, bool)
+            else None
+        )
         tournament_id, season = entry
-        planned.append(_scope_task_env(
-            "refresh",
-            snapshot_id=snapshot_id,
-            campaign_id=campaign_id,
-            tournament_id=tournament_id,
-            season=season,
-            lane_env=lane_env,
-            snapshot_path=snapshot_path,
-            policy_path=policy_path,
-            result_dir=result_dir,
-            workload_artifact=workload_artifact,
-            dag_run_id=dag_run_id,
-        ))
+        candidates.append(
+            (
+                league,
+                canonical,
+                int(count),
+                normalized_timestamp,
+                tournament_id,
+                season,
+            )
+        )
+    if queue_mode == "fresh":
+        candidates.sort(
+            key=lambda item: (
+                item[3] is None,
+                -(item[3] or 0),
+                -item[2],
+                item[0],
+                item[1],
+            )
+        )
+    else:
+        candidates.sort(key=lambda item: (-item[2], item[0], item[1]))
+    planned: list[dict[str, str]] = []
+    for _league, _canonical, _count, _timestamp, tournament_id, season in candidates:
+        planned.append(
+            _scope_task_env(
+                "refresh",
+                snapshot_id=snapshot_id,
+                campaign_id=campaign_id,
+                tournament_id=tournament_id,
+                season=season,
+                lane_env=lane_env,
+                snapshot_path=snapshot_path,
+                policy_path=policy_path,
+                result_dir=result_dir,
+                workload_artifact=workload_artifact,
+                dag_run_id=dag_run_id,
+            )
+        )
         if len(planned) == batch_size:
             break
     return planned

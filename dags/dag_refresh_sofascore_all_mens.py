@@ -132,11 +132,16 @@ REFRESH_TASK_IDS = frozenset({
 })
 
 # Finished games of campaign partitions that have no complete capture yet,
-# per partition, busiest first.  ``season`` is CAST on both sides because the
+# per partition.  ``season`` is CAST on both sides because the
 # schedule stores it as the source ships it while the status table is text.
 PENDING_PARTITIONS_SQL = """
 SELECT s.league, CAST(s.season AS varchar) AS season,
-       count(DISTINCT s.game_id) AS pending_matches
+       count(DISTINCT s.game_id) AS pending_matches,
+       MAX(CASE
+           WHEN TRY_CAST(s.start_timestamp AS bigint) BETWEEN 1
+                AND CAST(to_unixtime(current_timestamp + INTERVAL '6' HOUR) AS bigint)
+           THEN TRY_CAST(s.start_timestamp AS bigint)
+       END) AS newest_pending_start_timestamp
 FROM iceberg.bronze.sofascore_schedule s
 LEFT JOIN iceberg.bronze.sofascore_match_capture_status c
   ON c.league = s.league
@@ -147,11 +152,10 @@ WHERE s.league LIKE 'SS-%'
   AND s.status_type = 'finished'
   AND c.match_id IS NULL
 GROUP BY 1, 2
-ORDER BY 3 DESC, 1, 2
 """
 
 
-def _pending_refresh_partitions() -> list[tuple[str, str, int]]:
+def _pending_refresh_partitions() -> list[tuple[str, str, int, int | None]]:
     """Query at task runtime; no Trino client is touched at DAG parse."""
 
     from utils.silver_tasks import _get_trino_connection
@@ -161,8 +165,13 @@ def _pending_refresh_partitions() -> list[tuple[str, str, int]]:
         cursor = conn.cursor()
         cursor.execute(PENDING_PARTITIONS_SQL)
         return [
-            (str(league), str(season), int(count))
-            for league, season, count in cursor.fetchall()
+            (
+                str(league),
+                str(season),
+                int(count),
+                int(timestamp) if timestamp is not None else None,
+            )
+            for league, season, count, timestamp in cursor.fetchall()
         ]
     finally:
         conn.close()
@@ -176,12 +185,55 @@ def _configured_tournament_ids() -> frozenset[int]:
     return frozenset(SofaScoreCatalog.load().tournament_map(enabled_only=True).values())
 
 
+def _dag_run_type_name(dag_run: Any) -> str:
+    """Normalize Airflow's enum and string DagRun type representations."""
+
+    try:
+        run_type = dag_run.run_type
+    except AttributeError as exc:
+        raise AirflowException("refresh DagRun has no run_type") from exc
+    return str(getattr(run_type, "value", run_type)).casefold().split(".")[-1]
+
+
+def _refresh_queue_mode(context: dict[str, Any]) -> str:
+    """Resolve F,F,B for scheduled/backfill runs and manual explicit intent."""
+
+    dag_run = context.get("dag_run")
+    # Airflow supplies a DagRun in production.  Keeping the direct-call default
+    # makes the pure callable usable by local tooling that has no DagRun object.
+    if dag_run is None:
+        return "fresh"
+    run_type = _dag_run_type_name(dag_run)
+    if run_type in {"scheduled", "backfill"}:
+        interval_end = context.get("data_interval_end")
+        if not isinstance(interval_end, datetime) or interval_end.tzinfo is None:
+            raise AirflowException("data_interval_end must be an aware datetime")
+        interval_end = interval_end.astimezone(timezone.utc)
+        modes = {(0, 30): "fresh", (8, 30): "fresh", (15, 30): "backlog"}
+        try:
+            return modes[(interval_end.hour, interval_end.minute)]
+        except KeyError as exc:
+            raise AirflowException("data_interval_end is not an F,F,B slot") from exc
+    if run_type != "manual":
+        raise AirflowException(f"unsupported refresh run_type: {run_type!r}")
+    conf = getattr(dag_run, "conf", {}) or {}
+    if not isinstance(conf, dict):
+        raise AirflowException(
+            "manual DagRun queue_mode configuration must be a mapping"
+        )
+    queue_mode = conf.get("queue_mode", "fresh")
+    if queue_mode not in {"fresh", "backlog"}:
+        raise AirflowException("queue_mode must be 'fresh' or 'backlog'")
+    return queue_mode
+
+
 def _plan_refresh_batch(**context: Any) -> list[dict[str, str]]:
     snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
     return state.plan_refresh_batch(
         snapshot,
         _pending_refresh_partitions(),
         batch_size=REFRESH_BATCH_SIZE,
+        queue_mode=_refresh_queue_mode(context),
         exclude_tournament_ids=_configured_tournament_ids(),
         snapshot_path=SNAPSHOT_PATH,
         policy_path=POLICY_PATH,
