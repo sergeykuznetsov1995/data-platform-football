@@ -20,6 +20,7 @@ from scrapers.sofascore.capture_engine import (
 from scrapers.sofascore.manifest import (
     EndpointManifest,
     InMemoryManifestStore,
+    ManifestKey,
     ManifestStatus,
 )
 from scrapers.sofascore.pipeline import (
@@ -39,6 +40,8 @@ from scrapers.sofascore.season_pipeline import (
     build_season_specs,
     build_squad_spec,
     build_standings_total_spec,
+    SeasonPartitionPlan,
+    _is_mutable_schedule_column,
     materialize_season_partition,
     plan_season_partition,
     replay_season_partition,
@@ -1419,6 +1422,9 @@ def test_runner_live_season_uses_proven_slug_url_and_committed_completeness(
     def plan(*, complete, missing, pending):
         return SimpleNamespace(
             complete=complete,
+            # These stubs carry no referee endpoint, so the player-phase view
+            # of readiness is the same as `complete` (mirror the real plan).
+            player_universe_ready=complete,
             specs=(spec,),
             missing_raw_keys=(key,) if missing else (),
             pending_keys=(key,) if pending else (),
@@ -1551,7 +1557,12 @@ def test_runner_live_player_reports_committed_not_deferred_completeness(
     )
     runtime = CaptureRuntime(engine, object(), object())
     pending = {"10": set(PLAYER_PATHS)}
-    season_plan = SimpleNamespace(complete=True)
+    # The production shape of a league on a matchday: its referee profiles are
+    # still missing (so the plan is NOT `complete`), but that says nothing about
+    # who played, so the player universe IS ready. Pinning it this way makes the
+    # test fail the moment the runner goes back to gating on `complete` — the
+    # condition that kept the player branch dead from 2026-07-24.
+    season_plan = SimpleNamespace(complete=False, player_universe_ready=True)
     scraper = MagicMock()
     scraper.__enter__.return_value = scraper
     scraper.__exit__.return_value = False
@@ -1690,7 +1701,11 @@ def _player_capture_with_an_empty_signature(tmp_path, monkeypatch, probe, output
     with (
         patch(
             "scrapers.sofascore.season_pipeline.plan_season_partition",
-            return_value=SimpleNamespace(complete=True),
+            # Production shape on a matchday: referee profiles still pending
+            # (not `complete`), but that is not evidence about who played, so
+            # the universe IS ready. Reverting the gate to `complete` must fail
+            # this SIGNED-plan path too, not only the unsigned one (lesson №60).
+            return_value=SimpleNamespace(complete=False, player_universe_ready=True),
         ),
         patch(
             "scrapers.sofascore.season_pipeline.squad_player_ids",
@@ -1805,7 +1820,11 @@ def test_runner_refuses_new_local_player_outside_signed_post_match_plan(
     with (
         patch(
             "scrapers.sofascore.season_pipeline.plan_season_partition",
-            return_value=SimpleNamespace(complete=True),
+            # Production shape on a matchday: referee profiles still pending
+            # (not `complete`), but that is not evidence about who played, so
+            # the universe IS ready. Reverting the gate to `complete` must fail
+            # this SIGNED-plan path too, not only the unsigned one (lesson №60).
+            return_value=SimpleNamespace(complete=False, player_universe_ready=True),
         ),
         patch(
             "scrapers.sofascore.season_pipeline.squad_player_ids",
@@ -1874,22 +1893,40 @@ def _replayed_partition_with_cross_page_repeat(
     tmp_path,
     *,
     mutate=False,
+    mutate_identity=False,
+    unknown_column=False,
     user_count_tick=False,
 ):
     """Partition whose live-feed pages repeat event 14000001 on BOTH pages.
 
     A live paginated feed (e.g. the World Cup knockout stage) can shift a
     settled match between page windows, so the same event legally appears on
-    two different pages with an identical payload (#951). ``mutate`` makes the
-    repeat's payload disagree — a data conflict that must stay a hard error.
-    ``user_count_tick`` moves only the popularity counters between the two
-    fetches, which is what the source really does (#1071).
+    two different pages with an identical payload (#951). ``mutate`` moves the
+    repeat's KICK-OFF — the source rescheduling a match between two page
+    fetches of one run, which is legal and must collapse. ``mutate_identity``
+    swaps the home team, i.e. two different matches merged under one id — a
+    data conflict that must stay a hard error. ``user_count_tick`` moves only
+    the popularity counters between the two fetches, which is what the source
+    really does (#1071).
     """
     raw_store = _raw_store(tmp_path)
     manifest = InMemoryManifestStore()
     event = _schedule_event(14000001)
     if mutate:
+        # Reproduce the 2026-08-20 production repeat exactly: the source moved
+        # the fixture, so all three of these disagreed between the two pages.
         event["startTimestamp"] = int(event.get("startTimestamp") or 0) + 3600
+        event["roundInfo"] = {"round": 23}
+        event["detailId"] = 1
+    if unknown_column:
+        event["someBrandNewField"] = "changed"
+    if mutate_identity:
+        # Swap the sides: both teams stay in the participants roster, so this
+        # trips the duplicate guard and not an earlier squad/evidence check.
+        event["homeTeam"], event["awayTeam"] = (
+            dict(event["awayTeam"]),
+            dict(event["homeTeam"]),
+        )
     schedule_last_payload = None
     if user_count_tick:
         schedule_last_payload = _payload(FIXTURE_PATHS["schedule_last"])
@@ -1971,13 +2008,184 @@ def test_partition_materializer_collapses_cross_page_repeat_with_ticking_user_co
     assert repeats[0]["tournament_unique_tournament_user_count"] == 32989
 
 
+def _plan_with_missing(*endpoints, pending=None):
+    """Bare plan whose missing/pending raw keys are the named endpoints."""
+
+    def _key(endpoint):
+        return ManifestKey(
+            source_tournament_id="17",
+            source_season_id="76986",
+            target_type="season",
+            target_id=f"{endpoint}:1",
+            endpoint=endpoint,
+            freshness_key="day-2026-08-20",
+        )
+
+    keys = tuple(_key(endpoint) for endpoint in endpoints)
+    pending_keys = (
+        keys if pending is None else tuple(_key(endpoint) for endpoint in pending)
+    )
+    return SeasonPartitionPlan(
+        source_tournament_id="17",
+        source_season_id="76986",
+        freshness_key="day-2026-08-20",
+        event_freshness_key="final",
+        specs=(),
+        pending_keys=pending_keys,
+        missing_raw_keys=keys,
+        schedule_event_ids=(),
+        team_ids=(),
+        referee_ids=(),
+    )
+
+
 @pytest.mark.unit
-def test_partition_materializer_rejects_cross_page_payload_conflict(tmp_path):
-    """A cross-page repeat whose match payload disagrees is a data conflict,
-    not pagination noise — it must remain a hard error."""
+def test_referee_profile_does_not_block_the_player_universe():
+    """C2: the player branch has been dead since 2026-07-24 because a referee
+    profile counted as evidence about who PLAYED.
+
+    Referees are discovered partly from event pages captured AFTER the season
+    phase, so demanding their profiles before the player phase of the same run
+    is impossible by construction — any league that played a round is
+    guaranteed 'incomplete' that day. A referee profile is an attribute of the
+    match, not of the squad, so it must not gate players. Everything else still
+    does.
+    """
+    plan = _plan_with_missing("referee_profile")
+    assert plan.missing_raw_keys  # still captured, just not blocking
+    assert plan.player_blocking_missing_raw_keys == ()
+    assert plan.player_universe_ready is True
+
+
+@pytest.mark.unit
+def test_a_missing_squad_still_blocks_the_player_universe():
+    """The relaxation is referee-only: a missing squad is real evidence about
+    who played and must keep the player phase closed."""
+    plan = _plan_with_missing("referee_profile", "squads")
+    blocking = plan.player_blocking_missing_raw_keys
+    assert [key.endpoint for key in blocking] == ["squads"]
+    assert plan.player_universe_ready is False
+
+
+@pytest.mark.unit
+def test_player_universe_stays_closed_while_evidence_gaps_remain():
+    """`player_universe_evidence_gaps` is a different signal from raw keys and
+    must keep blocking regardless of which endpoints are pending."""
+    plan = replace(
+        _plan_with_missing("referee_profile"),
+        player_universe_evidence_gaps=("participants omitted team 42",),
+    )
+    assert plan.player_universe_ready is False
+
+
+@pytest.mark.unit
+def test_partition_materializer_collapses_rescheduled_cross_page_repeat(tmp_path):
+    """Live incident 2026-08-20: a match moved between two page fetches of one
+    run dropped the WHOLE day for every league.
+
+    ``duplicate schedule natural key: ('FRA-Ligue 1','2627','16311125')
+    (conflicting columns: ['detail_id','round_info_round','start_timestamp'])``
+    — the same match, same teams, a new kick-off. Rescheduling is a legal
+    source event, so the repeat must collapse and the NEWER observation must
+    win; only a disagreement about WHICH match this is stays a hard error.
+    """
     plan, results = _replayed_partition_with_cross_page_repeat(
         tmp_path,
         mutate=True,
+    )
+    materialization = materialize_season_partition(
+        plan,
+        results,
+        canonical_league="ENG-Premier League",
+        canonical_season="2025/26",
+    )
+    repeats = [
+        row
+        for row in materialization.schedule_rows
+        if str(row["game_id"]) == "14000001"
+    ]
+    assert len(repeats) == 1
+    # The rescheduled (next-page) observation is the newer one and wins.
+    assert repeats[0]["source_page_direction"] == "next"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "column",
+    [
+        # Identity — never collapsible.
+        "game_id",
+        "id",
+        "home_team_id",
+        "season_id",
+        # Near-misses: names that merely BEGIN like a mutable one. A prefix
+        # match without a separator would swallow all of these.
+        "detail_identity",
+        "start_timestamp_source",
+        "home_scorer_id",
+        "season_identifier",
+        "hash_id",
+        # Simply unknown.
+        "some_brand_new_field",
+    ],
+)
+def test_unknown_and_near_miss_columns_are_not_collapsible(column):
+    assert _is_mutable_schedule_column(column) is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "column",
+    [
+        "start_timestamp",
+        "round_info_round",
+        "detail_id",
+        "status_type",
+        "home_score_current",
+        "away_score_display",
+        "home_team_name",
+        "home_team",
+        "has_xg",
+        "changes_changes",
+        "time_injury_time1",
+        "current_period_start_timestamp",
+        "winner_code",
+        "season_year",
+    ],
+)
+def test_known_mutable_columns_are_collapsible(column):
+    assert _is_mutable_schedule_column(column) is True
+
+
+@pytest.mark.unit
+def test_partition_materializer_rejects_an_unreasoned_column_conflict(tmp_path):
+    """Collapsing is an ALLOWLIST, not "anything that is not identity".
+
+    A column nobody has classified disagreeing across two copies of one match is
+    exactly the corruption this guard exists to catch, so it stays a hard error
+    until someone decides the field is legally mutable.
+    """
+    plan, results = _replayed_partition_with_cross_page_repeat(
+        tmp_path,
+        unknown_column=True,
+    )
+    with pytest.raises(SeasonMaterializationError, match="duplicate schedule"):
+        materialize_season_partition(
+            plan,
+            results,
+            canonical_league="ENG-Premier League",
+            canonical_season="2025/26",
+        )
+
+
+@pytest.mark.unit
+def test_partition_materializer_rejects_cross_page_identity_conflict(tmp_path):
+    """A cross-page repeat whose IDENTITY disagrees (a different home team
+    under the same game_id) is cross-contamination, not pagination noise — it
+    must remain a hard error."""
+    plan, results = _replayed_partition_with_cross_page_repeat(
+        tmp_path,
+        mutate_identity=True,
     )
     with pytest.raises(SeasonMaterializationError, match="duplicate schedule"):
         materialize_season_partition(
@@ -1995,7 +2203,7 @@ def test_partition_materializer_conflict_names_the_disagreeing_columns(tmp_path)
     live-feed race from a parser defect (#1071)."""
     plan, results = _replayed_partition_with_cross_page_repeat(
         tmp_path,
-        mutate=True,
+        mutate_identity=True,
     )
     with pytest.raises(SeasonMaterializationError) as excinfo:
         materialize_season_partition(
@@ -2006,7 +2214,7 @@ def test_partition_materializer_conflict_names_the_disagreeing_columns(tmp_path)
         )
     message = str(excinfo.value)
     assert "conflicting columns" in message
-    assert "start_timestamp" in message
+    assert "home_team_id" in message
     assert "user_count" not in message
 
 

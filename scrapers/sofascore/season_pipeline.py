@@ -71,6 +71,13 @@ class SeasonMaterializationError(RuntimeError):
     """A planned season partition failed a fail-closed publication gate."""
 
 
+# Endpoints that are captured with the season but say nothing about WHO PLAYED,
+# so they must not gate the player phase. See
+# SeasonPartitionPlan.player_blocking_missing_raw_keys for why refereeing is the
+# one such endpoint today.
+_PLAYER_NONBLOCKING_ENDPOINTS = frozenset({"referee_profile"})
+
+
 @dataclass(frozen=True)
 class SeasonPartitionPlan:
     """Network-free endpoint plan derived only from committed local state.
@@ -97,6 +104,37 @@ class SeasonPartitionPlan:
     @property
     def complete(self) -> bool:
         return not self.pending_keys and not self.player_universe_evidence_gaps
+
+    @property
+    def player_blocking_missing_raw_keys(self) -> tuple[ManifestKey, ...]:
+        """Missing raw that really does gate the player universe.
+
+        A referee profile is an attribute of the MATCH, not evidence about who
+        played, and referees are discovered partly from event pages captured
+        after the season phase (see ``_event_referee_from_stored_page``). So
+        requiring their profiles before the player phase of the SAME run is
+        impossible by construction: any league that played a round leaves
+        ``referee_profile`` missing that day, and the player branch fails
+        closed for every league because of it (dead since 2026-07-24). The
+        profiles are still planned and captured — just on the next run.
+        """
+
+        return tuple(
+            key
+            for key in self.missing_raw_keys
+            if key.endpoint not in _PLAYER_NONBLOCKING_ENDPOINTS
+        )
+
+    @property
+    def player_universe_ready(self) -> bool:
+        """``complete`` for the player phase: referee profiles excluded."""
+
+        if self.player_universe_evidence_gaps:
+            return False
+        return not any(
+            key.endpoint not in _PLAYER_NONBLOCKING_ENDPOINTS
+            for key in self.pending_keys
+        )
 
 
 @dataclass(frozen=True)
@@ -1047,6 +1085,93 @@ _SCHEDULE_LINEAGE_COLUMNS = frozenset({
 })
 
 
+# Columns that answer "WHICH match is this row about". If two rows sharing one
+# game_id disagree here, two different matches were merged under one id — a
+# cross-contamination that must stay a hard error.
+_SCHEDULE_IDENTITY_COLUMNS = frozenset({
+    "game_id",
+    # ``id`` is the same source event id ``game_id`` is derived from
+    # (``normalize_event``), so it is identity too, not mutable state.
+    "id",
+    "home_team_id",
+    "away_team_id",
+    "season_id",
+    "source_tournament_id",
+    "source_season_id",
+})
+
+# Columns that describe the match's MUTABLE state, which the source legally
+# moves between two page fetches of one crawl: kick-off, round, status, score,
+# display names. A cross-page repeat that disagrees only here is pagination
+# racing a live feed, not corrupted data — on 2026-08-20 refusing it cost the
+# match phase of ALL fourteen leagues (FRA-Ligue 1 game 16311125 disagreed on
+# detail_id/round_info_round/start_timestamp; the raw pages were fetched 43 s
+# apart and the identity columns matched byte for byte).
+#
+# Deliberately an ALLOWLIST, not "everything that is not identity": an unknown
+# column appearing on both copies with different values is something nobody has
+# reasoned about, and defaulting to "collapse" would silently drop the very
+# corruption this guard exists to catch. The cost of the closed default is that
+# a NEW mutable source field fails the season until it is added here — which is
+# exactly how #951 (page provenance), #1071 (follower counters) and this
+# incident (kick-off) each surfaced. Keep the list current instead of widening
+# the rule.
+# Exact scalar columns. Spelled out rather than matched by prefix so that a new
+# neighbour such as ``start_timestamp_source`` or ``detail_identity`` is NOT
+# swallowed by the name it happens to begin with.
+_SCHEDULE_MUTABLE_COLUMNS = frozenset({
+    "away_score",
+    "away_team",
+    "away_team_gender",
+    "away_team_name",
+    "detail_id",
+    "home_score",
+    "home_team",
+    "home_team_gender",
+    "home_team_name",
+    "season_name",
+    "season_year",
+    "start_timestamp",
+    "winner_code",
+})
+# Families that ``_auto_flatten`` expands from a nested source object, so their
+# member names cannot be enumerated ahead of time. The match must stop at the
+# separator: ``home_score_current`` is a member of ``home_score``, while
+# ``home_scorer_id`` is a different column entirely.
+_SCHEDULE_MUTABLE_COLUMN_FAMILIES = (
+    "away_score",
+    "changes",
+    "current_period",
+    # ``has_xg`` / ``has_player_statistics``: availability flags that flip as
+    # the match progresses.
+    "has",
+    "home_score",
+    "round_info",
+    "status",
+    "time",
+)
+
+
+def _is_mutable_schedule_column(column: str) -> bool:
+    """True when the source may legally change ``column`` mid-crawl."""
+
+    if column in _SCHEDULE_IDENTITY_COLUMNS:
+        return False
+    if column in _SCHEDULE_MUTABLE_COLUMNS:
+        return True
+    return any(
+        column.startswith(f"{family}_")
+        for family in _SCHEDULE_MUTABLE_COLUMN_FAMILIES
+    )
+
+
+def _schedule_observed_at(row: Mapping[str, object]) -> str:
+    """Sort key picking the fresher of two observations of one match."""
+
+    value = row.get("raw_fetched_at")
+    return "" if value is None else str(value)
+
+
 def _is_volatile_schedule_column(column: str) -> bool:
     """Popularity counters that tick between two page fetches of one run.
 
@@ -1332,8 +1457,6 @@ def materialize_season_partition(
             previous = _schedule_payload(existing)
             current = _schedule_payload(row)
             cross_page = existing.get("raw_blob_key") != row.get("raw_blob_key")
-            if previous == current and cross_page:
-                continue
             # Name the disagreeing columns: without them a conflict costs a
             # raw-store forensic dig before anyone can tell a live-feed race
             # from a parser defect.
@@ -1342,6 +1465,20 @@ def materialize_season_partition(
                 for k in set(previous) | set(current)
                 if previous.get(k) != current.get(k)
             )
+            if cross_page and all(
+                _is_mutable_schedule_column(column) for column in conflicts
+            ):
+                # Same match seen twice across pages. An identical payload keeps
+                # the first-seen row so its page provenance and lineage stay
+                # stable (nothing about the match differs, so there is nothing
+                # to prefer). A real state change means the source updated the
+                # match between the two fetches, so the fresher observation
+                # wins.
+                if conflicts and _schedule_observed_at(row) > _schedule_observed_at(
+                    existing
+                ):
+                    deduped_schedule[key] = row
+                continue
             detail = (
                 f"conflicting columns: {conflicts}"
                 if conflicts

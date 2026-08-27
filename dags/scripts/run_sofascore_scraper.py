@@ -1383,7 +1383,11 @@ def _run_player_capture(
             paid_proxy=True,
             max_pages=_season_max_pages(),
         )
-        if not season_plan.complete:
+        # `player_universe_ready`, not `complete`: a pending referee profile is
+        # an attribute of the match, not evidence about who played, and it only
+        # becomes discoverable after the match phase — demanding it here closed
+        # the player branch for every league (dead since 2026-07-24).
+        if not season_plan.player_universe_ready:
             raise RuntimeError(
                 "season/squad manifest is incomplete; refusing a partial "
                 "player universe"
