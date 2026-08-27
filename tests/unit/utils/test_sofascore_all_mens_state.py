@@ -341,6 +341,7 @@ def _refresh_snapshot():
             "canonical_season": "2627",
             "start_year": 2026,
             "season_format": "split_year",
+            "is_current": True,
             "team_count": None,
             "metadata_status": "pending",
         })
@@ -350,6 +351,57 @@ def _refresh_snapshot():
         unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode()).hexdigest()
     return snapshot
+
+
+@pytest.mark.unit
+def test_refresh_planner_prioritizes_a_small_current_partition_over_history():
+    snapshot = _refresh_snapshot()
+    pending = [("SS-17", "2627", 1), ("SS-8", "2526", 10)]
+
+    planned = plan_refresh_batch(snapshot, pending, batch_size=2)
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:17:1726",  # current, even with fewer pending matches
+        "campaign-test:8:825",     # historical fallback
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_planner_prioritizes_an_explicit_calendar_year_current_partition():
+    snapshot = _refresh_snapshot()
+    current = snapshot["tournaments"][0]["seasons"][0]
+    current.update({
+        "canonical_season": "2026",
+        "season_format": "calendar_year",
+        "source_season_id": 1726,
+        "is_current": True,
+    })
+    unsigned = dict(snapshot)
+    unsigned.pop("snapshot_id")
+    snapshot["snapshot_id"] = hashlib.sha256(json.dumps(
+        unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+    pending = [("SS-17", "2026", 1), ("SS-8", "2526", 10)]
+
+    planned = plan_refresh_batch(snapshot, pending, batch_size=2)
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:17:1726",  # current calendar year
+        "campaign-test:8:825",     # older split year fallback
+    ]
+
+
+@pytest.mark.unit
+def test_refresh_planner_uses_pending_match_count_when_current_is_absent():
+    snapshot = _refresh_snapshot()
+    pending = [("SS-17", "2526", 3), ("SS-8", "2526", 10)]
+
+    planned = plan_refresh_batch(snapshot, pending, batch_size=2)
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:8:825",  # historical backlog, most pending matches
+        "campaign-test:17:1725",
+    ]
 
 
 @pytest.mark.unit
