@@ -222,7 +222,11 @@ def test_refresh_lane_knobs_come_from_env(clean_env, monkeypatch):
     run = operators["run_refresh_scope"]
     assert run._init_kwargs["pool"] == "sofascore_refresh_pool"
     assert run._init_kwargs["max_active_tis_per_dag"] == 2
-    kwargs = _planner_kwargs(module, monkeypatch)
+    kwargs = _planner_kwargs(
+        module,
+        monkeypatch,
+        dag_run=SimpleNamespace(run_type=DagRunType.MANUAL, conf={}),
+    )
     # The env asks for 3, but only ONE scope fits the DagRun window next to the
     # sweep: the cap is what actually fits, not what was configured, and a
     # scope is allowed two attempts (Sol r12 #2 — counting one made the
@@ -307,7 +311,11 @@ def test_plan_task_feeds_bronze_partitions_and_configured_exclusions(
 ):
     module = _load_dag_module(monkeypatch)
 
-    kwargs = _planner_kwargs(module, monkeypatch)
+    kwargs = _planner_kwargs(
+        module,
+        monkeypatch,
+        dag_run=SimpleNamespace(run_type=DagRunType.MANUAL, conf={}),
+    )
 
     assert kwargs["snapshot"] == {"campaign_id": "c"}
     assert kwargs["pending_partitions"] == [
@@ -414,6 +422,16 @@ def test_plan_task_fails_closed_for_invalid_mode_or_non_ffb_interval(
             dag_run=dag_run,
             data_interval_end=interval_end,
         )
+
+
+@pytest.mark.unit
+def test_plan_task_fails_closed_without_a_dag_run(clean_env, monkeypatch):
+    from airflow.exceptions import AirflowException
+
+    module = _load_dag_module(monkeypatch)
+
+    with pytest.raises(AirflowException, match="run_type"):
+        module._plan_refresh_batch(run_id="manual__1")
 
 
 @pytest.mark.unit

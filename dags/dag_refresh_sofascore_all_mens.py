@@ -199,10 +199,6 @@ def _refresh_queue_mode(context: dict[str, Any]) -> str:
     """Resolve F,F,B for scheduled/backfill runs and manual explicit intent."""
 
     dag_run = context.get("dag_run")
-    # Airflow supplies a DagRun in production.  Keeping the direct-call default
-    # makes the pure callable usable by local tooling that has no DagRun object.
-    if dag_run is None:
-        return "fresh"
     run_type = _dag_run_type_name(dag_run)
     if run_type in {"scheduled", "backfill"}:
         interval_end = context.get("data_interval_end")
@@ -228,12 +224,13 @@ def _refresh_queue_mode(context: dict[str, Any]) -> str:
 
 
 def _plan_refresh_batch(**context: Any) -> list[dict[str, str]]:
+    queue_mode = _refresh_queue_mode(context)
     snapshot = state.read_snapshot(SNAPSHOT_PATH, policy_path=POLICY_PATH)
     return state.plan_refresh_batch(
         snapshot,
         _pending_refresh_partitions(),
         batch_size=REFRESH_BATCH_SIZE,
-        queue_mode=_refresh_queue_mode(context),
+        queue_mode=queue_mode,
         exclude_tournament_ids=_configured_tournament_ids(),
         snapshot_path=SNAPSHOT_PATH,
         policy_path=POLICY_PATH,
