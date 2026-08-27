@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib
+import re
 import sys
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +26,14 @@ REFRESH_KNOBS = (
     "SOFASCORE_REFRESH_RESULT_DIR",
     "SOFASCORE_REFRESH_PROXY_CONTROL_URL",
 )
+
+
+class DagRunType(str, Enum):
+    """Airflow's concrete ``str, Enum`` DagRunType representation."""
+
+    MANUAL = "manual"
+    SCHEDULED = "scheduled"
+    BACKFILL = "backfill"
 
 
 def _load_dag_module(monkeypatch=None):
@@ -282,7 +292,7 @@ def _planner_kwargs(module, monkeypatch, **context):
     )
     monkeypatch.setattr(
         module, "_pending_refresh_partitions",
-        lambda: [("SS-17", "2627", 4, "2026-08-27T00:00:00+00:00")],
+        lambda: [("SS-17", "2627", 4, 1_787_788_800)],
     )
     monkeypatch.setattr(
         module, "_configured_tournament_ids", lambda: frozenset({17, 8})
@@ -302,7 +312,7 @@ def test_plan_task_feeds_bronze_partitions_and_configured_exclusions(
 
     assert kwargs["snapshot"] == {"campaign_id": "c"}
     assert kwargs["pending_partitions"] == [
-        ("SS-17", "2627", 4, "2026-08-27T00:00:00+00:00")
+        ("SS-17", "2627", 4, 1_787_788_800)
     ]
     assert kwargs["exclude_tournament_ids"] == frozenset({17, 8})
     # Campaign-wide default is 8; the lane runs its batch serially inside a 7 h
@@ -317,17 +327,21 @@ def test_plan_task_feeds_bronze_partitions_and_configured_exclusions(
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    ("run_type", "interval_end", "expected_mode"),
+    ("run_type", "interval_end", "conf", "expected_mode"),
     [
-        ("scheduled", datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), "fresh"),
-        ("scheduled", datetime(2026, 8, 27, 8, 30, tzinfo=timezone.utc), "fresh"),
-        ("scheduled", datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), "backlog"),
-        ("backfill", datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), "fresh"),
-        ("backfill", datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), "backlog"),
+        ("scheduled", datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), {}, "fresh"),
+        ("scheduled", datetime(2026, 8, 27, 8, 30, tzinfo=timezone.utc), {}, "fresh"),
+        ("scheduled", datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), {}, "backlog"),
+        (DagRunType.SCHEDULED, datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), {}, "fresh"),
+        (DagRunType.BACKFILL, datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), {}, "backlog"),
+        ("backfill", datetime(2026, 8, 27, 2, 30, tzinfo=timezone(timedelta(hours=2))), {}, "fresh"),
+        ("scheduled", datetime(2026, 8, 27, 17, 30, tzinfo=timezone(timedelta(hours=2))), {}, "backlog"),
+        ("scheduled", datetime(2026, 8, 27, 0, 30, tzinfo=timezone.utc), {"queue_mode": "backlog"}, "fresh"),
+        ("backfill", datetime(2026, 8, 27, 15, 30, tzinfo=timezone.utc), {"queue_mode": "fresh"}, "backlog"),
     ],
 )
 def test_plan_task_derives_ffb_mode_from_interval_end_not_delayed_task_start(
-    clean_env, monkeypatch, run_type, interval_end, expected_mode
+    clean_env, monkeypatch, run_type, interval_end, conf, expected_mode
 ):
     module = _load_dag_module(monkeypatch)
     delayed_start = datetime(2026, 8, 27, 20, 4, tzinfo=timezone.utc)
@@ -335,7 +349,7 @@ def test_plan_task_derives_ffb_mode_from_interval_end_not_delayed_task_start(
     kwargs = _planner_kwargs(
         module,
         monkeypatch,
-        dag_run=SimpleNamespace(run_type=run_type, conf={}),
+        dag_run=SimpleNamespace(run_type=run_type, conf=conf),
         data_interval_end=interval_end,
         ti=SimpleNamespace(start_date=delayed_start),
     )
@@ -381,6 +395,9 @@ def test_plan_task_manual_defaults_to_fresh_and_allows_backlog_override(
             "data_interval_end",
         ),
         (SimpleNamespace(run_type="scheduled", conf={}), None, "data_interval_end"),
+        (SimpleNamespace(run_type="scheduled", conf={}), datetime(2026, 8, 27, 0, 30), "data_interval_end"),
+        (SimpleNamespace(run_type="unexpected", conf={}), None, "run_type"),
+        (SimpleNamespace(conf={}), None, "run_type"),
     ],
 )
 def test_plan_task_fails_closed_for_invalid_mode_or_non_ffb_interval(
@@ -411,7 +428,7 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
 
         def fetchall(self):
             return [
-                ("SS-17", "2627", 12, "2026-08-27T00:00:00+00:00"),
+                ("SS-17", "2627", 12, 1_787_788_800),
                 ("SS-8", 2026, 3, None),
             ]
 
@@ -432,7 +449,7 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
     partitions = module._pending_refresh_partitions()
 
     assert partitions == [
-        ("SS-17", "2627", 12, "2026-08-27T00:00:00+00:00"),
+        ("SS-17", "2627", 12, 1_787_788_800),
         ("SS-8", "2026", 3, None),
     ]
     assert connection.closed is True
@@ -442,8 +459,15 @@ def test_pending_partitions_query_joins_finished_games_without_complete_capture(
     assert "LIKE 'SS-%'" in sql
     assert "status_type = 'finished'" in sql
     assert "capture_complete" in sql
-    assert "MAX(" in sql
-    assert "start_timestamp" in sql
+    normalized_aggregate = " ".join(sql.split())
+    assert re.search(
+        r"MAX\(.+start_timestamp.+\) AS newest_pending_start_timestamp",
+        normalized_aggregate,
+    )
+    assert "TRY_CAST" in normalized_aggregate
+    assert "BETWEEN 1 AND" in normalized_aggregate
+    assert "current_timestamp" in normalized_aggregate
+    assert "INTERVAL '6' HOUR" in normalized_aggregate
 
 
 def _refresh_env(result_path, scope_key="c:8:825"):

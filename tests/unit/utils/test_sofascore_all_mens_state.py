@@ -354,7 +354,7 @@ def _refresh_snapshot():
     return snapshot
 
 
-def _refresh_pending(league, season, count, timestamp="2026-08-27T00:00:00+00:00"):
+def _refresh_pending(league, season, count, timestamp=1_787_788_800):
     """One Bronze pending row under the timestamp-aware planner contract."""
 
     return (league, season, count, timestamp)
@@ -517,12 +517,12 @@ def test_refresh_planner_orders_fresh_rows_by_timestamp_with_deterministic_ties(
     planned = plan_refresh_batch(
         snapshot,
         [
-            _refresh_pending("SS-8", "2526", 5, "2026-08-22T00:00:00+00:00"),
-            _refresh_pending("SS-17", "2627", 7, "2026-08-27T07:00:00+00:00"),
-            _refresh_pending("SS-17", "2425", 5, "2026-08-24T00:00:00+00:00"),
-            _refresh_pending("SS-17", "2324", 5, "2026-08-24T00:00:00+00:00"),
-            _refresh_pending("SS-8", "2627", 10, "2026-08-27T08:00:00+00:00"),
-            _refresh_pending("SS-17", "2526", 9, "2026-08-26T00:00:00+00:00"),
+            _refresh_pending("SS-8", "2526", 5, 1_787_356_800),
+            _refresh_pending("SS-17", "2627", 7, 1_787_814_000),
+            _refresh_pending("SS-17", "2425", 5, 1_787_529_600),
+            _refresh_pending("SS-17", "2324", 5, 1_787_529_600),
+            _refresh_pending("SS-8", "2627", 10, 1_787_817_600),
+            _refresh_pending("SS-17", "2526", 9, 1_787_702_400),
         ],
         batch_size=8, queue_mode="fresh",
     )
@@ -541,8 +541,8 @@ def test_refresh_planner_orders_fresh_rows_by_timestamp_with_deterministic_ties(
 def test_refresh_planner_fresh_prioritizes_a_newer_small_partition_over_old_backlog():
     snapshot = _refresh_snapshot()
     pending = [
-        _refresh_pending("SS-17", "2627", 1, "2026-08-27T09:00:00+00:00"),
-        _refresh_pending("SS-8", "2526", 10, "2026-08-26T09:00:00+00:00"),
+        _refresh_pending("SS-17", "2627", 1, 1_787_821_200),
+        _refresh_pending("SS-8", "2526", 10, 1_787_734_800),
     ]
 
     planned = plan_refresh_batch(
@@ -571,8 +571,8 @@ def test_refresh_planner_prioritizes_an_explicit_calendar_year_current_partition
         unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode()).hexdigest()
     pending = [
-        _refresh_pending("SS-17", "2026", 1, "2026-08-27T09:00:00+00:00"),
-        _refresh_pending("SS-8", "2526", 10, "2026-08-26T09:00:00+00:00"),
+        _refresh_pending("SS-17", "2026", 1, 1_787_821_200),
+        _refresh_pending("SS-8", "2526", 10, 1_787_734_800),
     ]
 
     planned = plan_refresh_batch(
@@ -589,8 +589,8 @@ def test_refresh_planner_prioritizes_an_explicit_calendar_year_current_partition
 def test_refresh_planner_backlog_preserves_largest_old_partition_first():
     snapshot = _refresh_snapshot()
     pending = [
-        _refresh_pending("SS-17", "2526", 3, "2026-08-27T09:00:00+00:00"),
-        _refresh_pending("SS-8", "2526", 10, "2026-08-26T09:00:00+00:00"),
+        _refresh_pending("SS-17", "2526", 3, 1_787_821_200),
+        _refresh_pending("SS-8", "2526", 10, 1_787_734_800),
     ]
 
     planned = plan_refresh_batch(
@@ -630,11 +630,11 @@ def test_refresh_planner_fresh_uses_null_last_newest_timestamp_and_stable_ties()
         snapshot,
         [
             _refresh_pending("SS-17", "2526", 99, None),
-            _refresh_pending("SS-17", "2324", 5, "2026-08-26T10:00:00+00:00"),
-            _refresh_pending("SS-17", "2425", 5, "2026-08-26T10:00:00+00:00"),
-            _refresh_pending("SS-17", "2627", 1, "2026-08-27T10:00:00+00:00"),
-            _refresh_pending("SS-8", "2526", 6, "2026-08-26T10:00:00+00:00"),
-            _refresh_pending("SS-8", "2627", 4, "2026-08-26T10:00:00+00:00"),
+            _refresh_pending("SS-17", "2324", 5, 1_787_738_400),
+            _refresh_pending("SS-17", "2425", 5, 1_787_738_400),
+            _refresh_pending("SS-17", "2627", 1, 1_787_824_800),
+            _refresh_pending("SS-8", "2526", 6, 1_787_738_400),
+            _refresh_pending("SS-8", "2627", 4, 1_787_738_400),
         ],
         batch_size=8,
         queue_mode="fresh",
@@ -672,7 +672,7 @@ def test_refresh_planner_filters_poisoned_rows_before_timestamp_normalization():
             _refresh_pending("SS-8", "2627", 50, object()),
             _refresh_pending("SS-999", "2627", 40, object()),
             _refresh_pending("SS-17", "2526", 30, object()),
-            _refresh_pending("SS-17", "2627", 1, "2026-08-27T10:00:00+00:00"),
+            _refresh_pending("SS-17", "2627", 1, 1_787_824_800),
             _refresh_pending("SS-17", "2425", 99, "not-a-timestamp"),
         ],
         batch_size=8,
