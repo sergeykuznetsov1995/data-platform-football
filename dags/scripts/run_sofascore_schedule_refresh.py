@@ -37,7 +37,6 @@ import json
 import os
 import sys
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Collection, Iterable, Mapping, Optional, Sequence
 
@@ -54,6 +53,10 @@ from scrapers.sofascore.discovery import (  # noqa: E402
     LeaseBrowserSofaScoreClient,
 )
 from dags.utils.sofascore_dq import SofaScoreDQViolation  # noqa: E402
+from dags.utils.sofascore_all_mens_state import (  # noqa: E402
+    SeasonTarget,
+    current_season_targets,
+)
 from scrapers.sofascore.raw_store import RawPayloadStore  # noqa: E402
 from scrapers.sofascore.schedule_refresh import (  # noqa: E402
     MAX_BACKTRACK_PAGES,
@@ -188,24 +191,6 @@ def _configured_tournament_ids() -> frozenset[int]:
     return frozenset(SofaScoreCatalog.load().tournament_map(enabled_only=True).values())
 
 
-@dataclass(frozen=True)
-class SeasonTarget:
-    """One sweep target and the Bronze partition it writes into."""
-
-    tournament_id: int
-    season_id: int
-    league: str
-    canonical_season: str
-
-    @property
-    def pair(self) -> tuple[int, int]:
-        return (self.tournament_id, self.season_id)
-
-    @property
-    def partition(self) -> tuple[str, str]:
-        return (self.league, self.canonical_season)
-
-
 def ambiguous_current_seasons(
     snapshot: Mapping[str, Any], exclude_tournament_ids: frozenset[int]
 ) -> list[list[Any]]:
@@ -254,48 +239,6 @@ def ambiguous_current_seasons(
             ambiguous.append([tournament_id, newest, sorted(seasons)])
     ambiguous.sort(key=lambda item: item[0])
     return ambiguous
-
-
-def current_season_targets(
-    snapshot: Mapping[str, Any], exclude_tournament_ids: frozenset[int]
-) -> list[SeasonTarget]:
-    """Newest non-excluded season of every ready tournament, by tournament id.
-
-    The order is stable so the cursor walks a fixed sequence.  An ``excluded``
-    season is never a target (the campaign will not take it either); a
-    tournament whose seasons are all excluded is skipped.
-    """
-
-    targets: list[SeasonTarget] = []
-    for tournament in snapshot.get("tournaments", ()):
-        if tournament.get("metadata_status") != "ready":
-            continue
-        tournament_id = int(tournament["unique_tournament_id"])
-        if tournament_id in exclude_tournament_ids:
-            continue
-        newest: Optional[tuple[int, SeasonTarget]] = None
-        for season in tournament.get("seasons", ()):
-            if season.get("metadata_status") == "excluded":
-                continue
-            start_year = season.get("start_year")
-            season_id = season.get("source_season_id")
-            canonical = season.get("canonical_season")
-            if not isinstance(start_year, int) or season_id is None or not canonical:
-                continue
-            if newest is None or start_year > newest[0]:
-                newest = (
-                    start_year,
-                    SeasonTarget(
-                        tournament_id=tournament_id,
-                        season_id=int(season_id),
-                        league=str(tournament["capture_key"]),
-                        canonical_season=str(canonical),
-                    ),
-                )
-        if newest is not None:
-            targets.append(newest[1])
-    targets.sort(key=lambda target: target.pair)
-    return targets
 
 
 def targets_digest(targets: Sequence[SeasonTarget]) -> str:

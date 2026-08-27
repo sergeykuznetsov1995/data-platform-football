@@ -8,6 +8,7 @@ import logging
 import os
 import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -44,6 +45,66 @@ DEFAULT_MAX_SCOPE_ATTEMPTS = 3
 DEFAULT_PARK_COOLDOWN_HOURS = 24
 DEFAULT_REFRESH_BATCH_SIZE = 8
 DEFAULT_REFRESH_RESULT_DIR = "/opt/airflow/runtime/sofascore/all-men/refresh-results"
+
+
+@dataclass(frozen=True)
+class SeasonTarget:
+    """One refresh target and the Bronze partition it writes into."""
+
+    tournament_id: int
+    season_id: int
+    league: str
+    canonical_season: str
+
+    @property
+    def pair(self) -> tuple[int, int]:
+        return (self.tournament_id, self.season_id)
+
+    @property
+    def partition(self) -> tuple[str, str]:
+        return (self.league, self.canonical_season)
+
+
+def current_season_targets(
+    snapshot: Mapping[str, Any], exclude_tournament_ids: frozenset[int]
+) -> list[SeasonTarget]:
+    """Newest non-excluded season of every ready tournament, by tournament id.
+
+    The order is stable so callers walk a fixed sequence.  An ``excluded``
+    season is never a target; a tournament whose seasons are all excluded is
+    skipped.  Ties retain the first matching season in snapshot order.
+    """
+
+    targets: list[SeasonTarget] = []
+    for tournament in snapshot.get("tournaments", ()):
+        if tournament.get("metadata_status") != "ready":
+            continue
+        tournament_id = int(tournament["unique_tournament_id"])
+        if tournament_id in exclude_tournament_ids:
+            continue
+        newest: tuple[int, SeasonTarget] | None = None
+        for season in tournament.get("seasons", ()):
+            if season.get("metadata_status") == "excluded":
+                continue
+            start_year = season.get("start_year")
+            season_id = season.get("source_season_id")
+            canonical = season.get("canonical_season")
+            if not isinstance(start_year, int) or season_id is None or not canonical:
+                continue
+            if newest is None or start_year > newest[0]:
+                newest = (
+                    start_year,
+                    SeasonTarget(
+                        tournament_id=tournament_id,
+                        season_id=int(season_id),
+                        league=str(tournament["capture_key"]),
+                        canonical_season=str(canonical),
+                    ),
+                )
+        if newest is not None:
+            targets.append(newest[1])
+    targets.sort(key=lambda target: target.pair)
+    return targets
 
 
 def park_has_cooled(
@@ -358,7 +419,7 @@ def plan_refresh_batch(
     dag_run_id: str = "manual",
     task_env: Mapping[str, str] | None = None,
 ) -> list[dict[str, str]]:
-    """Select the refresh batch: Bronze partitions with the most pending matches.
+    """Select a current-first refresh batch with historical fallback.
 
     ``pending_partitions`` are ``(league, season, pending_matches)`` rows from
     Bronze: ``SS-<id>`` partitions holding finished games that have no
@@ -384,7 +445,14 @@ def plan_refresh_batch(
     if not isinstance(tournaments, list):
         raise CampaignPlanningError("campaign tournaments must be a list")
     # Campaign partitions are keyed ``SS-<unique_tournament_id>``.
-    configured_keys = {f"SS-{int(value)}" for value in exclude_tournament_ids}
+    excluded_tournament_ids = frozenset(
+        int(value) for value in exclude_tournament_ids
+    )
+    configured_keys = {f"SS-{value}" for value in excluded_tournament_ids}
+    current_partitions = {
+        target.partition
+        for target in current_season_targets(snapshot, excluded_tournament_ids)
+    }
     index: dict[tuple[str, str], tuple[int, Mapping[str, Any]]] = {}
     for tournament in tournaments:
         if str(tournament.get("metadata_status") or "pending") != "ready":
@@ -396,7 +464,12 @@ def plan_refresh_batch(
             index[key] = (int(tournament["unique_tournament_id"]), season)
     ranked = sorted(
         ((str(league), str(season), int(count)) for league, season, count in pending_partitions),
-        key=lambda item: (-item[2], item[0], item[1]),
+        key=lambda item: (
+            0 if (item[0], item[1]) in current_partitions else 1,
+            -item[2],
+            item[0],
+            item[1],
+        ),
     )
     planned: list[dict[str, str]] = []
     for league, canonical, count in ranked:

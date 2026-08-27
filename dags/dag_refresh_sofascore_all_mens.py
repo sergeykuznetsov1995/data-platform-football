@@ -348,7 +348,8 @@ with DAG(
         bash_command=RUN_SCOPE_COMMAND,
         append_env=True,
         pool=REFRESH_POOL,
-        # Above the history lane (1) in the shared pool.
+        # Current partitions run before historical fallback, above the history
+        # lane (1) in the shared pool.
         priority_weight=5,
         do_xcom_push=False,
         max_active_tis_per_dag=REFRESH_MAX_ACTIVE_TASKS,
