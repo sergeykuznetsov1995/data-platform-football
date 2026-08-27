@@ -41,6 +41,8 @@ class CatalogSeason:
     start_date: Optional[str]
     end_date: Optional[str]
     aliases: tuple[str, ...]
+    team_count: Optional[int] = None
+    team_count_evidence: Optional[Mapping[str, Any]] = None
 
     @property
     def activatable(self) -> bool:
@@ -487,6 +489,33 @@ class SofaScoreCatalog:
                             f"{season_prefix}.evidence must be a non-empty "
                             "object list"
                         )
+                    team_count = _optional_positive_int(
+                        raw_season.get("team_count"),
+                        f"{season_prefix}.team_count",
+                    )
+                    raw_team_count_evidence = raw_season.get(
+                        "team_count_evidence"
+                    )
+                    if team_count is not None:
+                        if not isinstance(raw_team_count_evidence, Mapping):
+                            raise CatalogError(
+                                f"{season_prefix}.team_count_evidence must be "
+                                "an object when team_count is present"
+                            )
+                        if (
+                            int(raw_team_count_evidence.get("count", 0) or 0)
+                            != team_count
+                        ):
+                            raise CatalogError(
+                                f"{season_prefix}.team_count_evidence count mismatch"
+                            )
+                        team_count_evidence = dict(raw_team_count_evidence)
+                    elif raw_team_count_evidence is not None:
+                        raise CatalogError(
+                            f"{season_prefix}.team_count_evidence requires team_count"
+                        )
+                    else:
+                        team_count_evidence = None
                 else:
                     source_name = _required_string(
                         raw_season.get("name"), f"{season_prefix}.name"
@@ -498,6 +527,8 @@ class SofaScoreCatalog:
                         canonical_season,
                         source_name,
                     ))))
+                    team_count = None
+                    team_count_evidence = None
 
                 resolution_tokens = set(aliases) | {year, source_name}
                 resolution_tokens.add(
@@ -529,6 +560,8 @@ class SofaScoreCatalog:
                         start_date=start_date,
                         end_date=end_date,
                         aliases=aliases,
+                        team_count=team_count,
+                        team_count_evidence=team_count_evidence,
                     )
                 )
 

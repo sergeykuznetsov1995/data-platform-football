@@ -28,7 +28,12 @@ from scrapers.sofascore.manifest import (
     ManifestStore,
     utc_now_iso,
 )
-from scrapers.sofascore.raw_store import PayloadTarget, RawPayloadStore
+from scrapers.sofascore.rate_control import production_rate_limiter
+from scrapers.sofascore.raw_store import (
+    PayloadTarget,
+    RawPayloadNotFound,
+    RawPayloadStore,
+)
 from scrapers.sofascore.workload_plan import allocation_budget_bytes
 from scripts.proxy_filter.budget import (
     ProductionBudgetUnavailable,
@@ -178,6 +183,7 @@ def build_capture_runtime(
         run_id=run_id,
         task_id=task_id,
         budget=budget,
+        rate_limiter=production_rate_limiter(os.environ),
         max_workers=max(1, int(os.environ.get('SOFASCORE_MAX_CONCURRENCY', '4'))),
     )
     return CaptureRuntime(engine, manifest_store, raw_store, budget_error)
@@ -520,6 +526,86 @@ def endpoint_resume_plan(
             continue
         plan.setdefault(spec.key.target_id, []).append(spec.key.endpoint)
     return {target: tuple(names) for target, names in plan.items()}
+
+
+# Endpoints a scope probe may exclude; ``event`` is the match's identity and
+# is never trimmed.
+_PROBE_EXCLUDABLE_ENDPOINTS = frozenset(EVENT_PATHS) - {'event'}
+
+
+def scope_probe_exclusions(
+    manifest_store: ManifestStore,
+    probe_specs: Iterable[EndpointSpec],
+    *,
+    min_matches: int = 3,
+) -> frozenset[str]:
+    """Endpoints the source does not publish for this scope (A2, #1218).
+
+    The first allocation of a scope is captured with the full endpoint set.
+    An endpoint whose terminal records among those probed matches are ALL
+    ``not_supported`` — with at least ``min_matches`` of them — is excluded
+    for the remaining allocations, so a lower league without lineups costs
+    about one request per match instead of five (SS-186: 787/1320
+    not_supported).
+
+    Known limitation: a cup whose early rounds lack lineups while the final
+    publishes them loses the final's lineups; the owner's "trim by
+    availability" decision accepts this.
+    """
+    verdicts: dict[str, list[bool]] = {}
+    for spec in probe_specs:
+        endpoint = spec.key.endpoint
+        if endpoint not in _PROBE_EXCLUDABLE_ENDPOINTS:
+            continue
+        record = manifest_store.get(spec.key)
+        if record is None or not record.is_terminal:
+            continue
+        verdicts.setdefault(endpoint, []).append(
+            record.status == ManifestStatus.NOT_SUPPORTED
+        )
+    return frozenset(
+        endpoint
+        for endpoint, flags in verdicts.items()
+        if len(flags) >= min_matches and all(flags)
+    )
+
+
+def _has_replayable_raw(raw_store: RawPayloadStore, spec: EndpointSpec) -> bool:
+    try:
+        _, raw = raw_store.load_bytes(spec.raw_target)
+    except RawPayloadNotFound:
+        return False
+    return 200 <= raw.http_status < 300 and raw.http_status != 204
+
+
+def apply_endpoint_exclusions(
+    specs: Iterable[EndpointSpec],
+    excluded: Iterable[str],
+    *,
+    raw_store: RawPayloadStore,
+) -> list[EndpointSpec]:
+    """Mark ``excluded`` endpoints unsupported: the engine records
+    ``not_supported`` for them without touching the source.
+
+    A spec that already holds a usable (2xx, non-204) raw payload — e.g. a
+    nonterminal ``DeferredMaterialization`` whose Bronze MERGE was interrupted
+    — is left supported so the engine replays and materializes the saved
+    evidence instead of overwriting it with a synthetic ``not_supported``.
+    """
+    names = frozenset(excluded)
+    return [
+        replace(
+            spec,
+            supported=False,
+            unsupported_reason=(
+                f"scope probe: source does not publish {spec.key.endpoint} "
+                "(every sampled match answered 404)"
+            ),
+        )
+        if spec.key.endpoint in names and not _has_replayable_raw(raw_store, spec)
+        else spec
+        for spec in specs
+    ]
 
 
 def ingest_prefetched_records(

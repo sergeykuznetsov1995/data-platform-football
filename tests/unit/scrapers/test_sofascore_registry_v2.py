@@ -12,8 +12,10 @@ import pytest
 from scrapers.sofascore.catalog import SofaScoreCatalog
 from scrapers.sofascore.discovery import (
     DiscoveryConcurrentUpdate,
+    DiscoverySchemaError,
     merge_registry,
     parse_seasons_payload,
+    parse_team_count_payload,
 )
 from scrapers.sofascore.registry import (
     ActivationError,
@@ -208,6 +210,37 @@ def test_season_v2_split_calendar_named_dates_and_explicit_euro_alias():
     assert split_year["canonical_season"] == "2425"
     assert named["format"] == "named"
     assert named["canonical_season"] is None
+
+
+@pytest.mark.unit
+def test_team_count_is_unique_positive_source_evidence():
+    count, evidence = parse_team_count_payload(
+        {"teams": [{"id": 7}, {"id": 8}, {"id": 7}]},
+        unique_tournament_id=17,
+        season_id=76986,
+    )
+
+    assert count == 2
+    assert evidence == {
+        "type": "source_team_ids",
+        "endpoint": "/unique-tournament/17/season/76986/teams",
+        "count": 2,
+        "team_ids_sha256": (
+            "def4fe4f74f38325f2f5e330fcb0e51d"
+            "476035250b64f6158662026485f0e557"
+        ),
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("payload", [{}, {"teams": []}, {"teams": [{"id": 0}]}])
+def test_team_count_fails_closed_without_positive_team_ids(payload):
+    with pytest.raises(DiscoverySchemaError, match="positive"):
+        parse_team_count_payload(
+            payload,
+            unique_tournament_id=17,
+            season_id=76986,
+        )
 
 
 @pytest.mark.unit

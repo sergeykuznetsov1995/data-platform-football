@@ -130,10 +130,15 @@ services:
       start_period: 5s
     deploy:
       resources:
+        # Startup replays the allocation WAL (~135 MB by 2026-08-23) into
+        # memory at <2x its size; 256M OOM-crashlooped recovery on 2026-07-24
+        # and the `docker update --memory 1g` workaround was silently dropped
+        # by the 2026-08-23 recreate.  The limit must live here, not in
+        # `docker update`.
         limits:
-          memory: 256M
+          memory: 1G
         reservations:
-          memory: 64M
+          memory: 256M
     networks:
       - dp-backend
 

@@ -19,6 +19,14 @@ def set_trino_password(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def sofascore_writer_lock_disabled(monkeypatch):
+    """D5: unit tests have no Postgres and the SofaScore bronze writer lock
+    fails closed, so disable it with the same explicit switch the offline
+    replay uses. Tests of the lock itself pass their own environ."""
+    monkeypatch.setenv('SOFASCORE_WRITER_LOCK', '0')
+
+
+@pytest.fixture(autouse=True)
 def isolated_soccerdata_dir(monkeypatch, tmp_path):
     """#920 Phase 3: SoccerdataScraper.__init__ installs the repo league_dict
     fragment into $SOCCERDATA_DIR/config — point it at tmp_path so tests

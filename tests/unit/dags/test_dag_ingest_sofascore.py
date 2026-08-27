@@ -98,6 +98,30 @@ def _patch_active_catalog(monkeypatch, competition_ids, source_seasons=None):
     )
 
 
+def _signed_player_plan(tmp_path, monkeypatch, leagues, *, canonical_season="2526"):
+    """Write a signed ``players`` plan whose only partitions are ``leagues``
+    (player universe of one id each, no allocations) and make it loadable."""
+    from scrapers.sofascore.workload_plan import _signed_plan, qualify_work_unit
+    from scrapers.sofascore.workload_runtime import partition_key, write_plan
+
+    token = "dag-ingest-control-token-at-least-32-bytes"
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", token)
+    plan = _signed_plan(
+        artifact_id="a" * 64,
+        dag_id="dag_ingest_sofascore",
+        run_id="scheduled__rotation::players",
+        player_universe_ids=tuple(
+            sorted(
+                qualify_work_unit(partition_key(league, canonical_season), "1")
+                for league in leagues
+            )
+        ),
+        allocations=(),
+        control_token=token,
+    )
+    return str(write_plan(tmp_path / "players.json", plan))
+
+
 class TestSignedWorkloadTopology:
     def test_phase_plans_gate_every_paid_capture(self, dag_module):
         season_plan = _bash_task("prepare_sofascore_season_plan")
@@ -152,6 +176,78 @@ class TestSignedWorkloadTopology:
 
     def test_single_proxy_lease_is_serialized_without_manual_pool(self, dag_module):
         assert dag_module.dag._dag_kwargs["max_active_tasks"] == 1
+
+
+class TestIngestStatusLeaf:
+    """Both freshness validators are ``all_done`` and tolerate a failed
+    ``validate_data``, so the DagRun (and ``dag_sofascore_pipeline`` waiting
+    with ``allowed_states=['success']``) reported green while validation had
+    failed. One honest ``all_done`` leaf must own the DagRun state."""
+
+    @staticmethod
+    def _leaves():
+        from airflow.operators.bash import BashOperator
+        from airflow.operators.python import PythonOperator
+
+        return {
+            task.task_id
+            for task in PythonOperator._instances + BashOperator._instances
+            if not task.downstream_task_ids
+        }
+
+    def test_propagate_ingest_status_is_the_only_leaf(self, dag_module):
+        assert self._leaves() == {"propagate_ingest_status"}
+        leaf = _python_task("propagate_ingest_status")
+        assert leaf.python_callable is dag_module._propagate_ingest_status
+        assert leaf._init_kwargs["trigger_rule"] == "all_done"
+        assert leaf._init_kwargs["retries"] == 0
+        assert leaf.upstream_task_ids == {
+            "validate_bronze_freshness",
+            "validate_player_freshness",
+        }
+
+    @staticmethod
+    def _context(states):
+        def get_task_instance(task_id):
+            if task_id not in states:
+                return None
+            return SimpleNamespace(state=states[task_id])
+
+        return {"dag_run": SimpleNamespace(get_task_instance=get_task_instance)}
+
+    def test_failed_validation_paints_the_run_red(self, dag_module):
+        states = {
+            "validate_data": "failed",
+            "run_sofascore_dq": "upstream_failed",
+            "validate_bronze_freshness": "success",
+            "gate_player_capture": "success",
+            "validate_player_data": "skipped",
+            "validate_player_freshness": "success",
+        }
+        with pytest.raises(
+            Exception,
+            match="validate_data=failed, run_sofascore_dq=upstream_failed",
+        ):
+            dag_module._propagate_ingest_status(**self._context(states))
+
+    def test_success_skipped_and_missing_states_are_green(self, dag_module):
+        # A weekday run skips the whole player branch; a task instance the
+        # scheduler has not created yet resolves to None.
+        states = {
+            "validate_data": "success",
+            "run_sofascore_dq": "success",
+            "validate_bronze_freshness": "success",
+            "gate_player_capture": "skipped",
+            "validate_player_data": "skipped",
+        }
+        out = dag_module._propagate_ingest_status(**self._context(states))
+        assert out == {"status": "success"}
+
+    def test_enum_states_are_normalized(self, dag_module):
+        # Real Airflow returns TaskInstanceState enum members, not strings.
+        states = {"validate_data": SimpleNamespace(value="failed")}
+        with pytest.raises(Exception, match="validate_data=failed"):
+            dag_module._propagate_ingest_status(**self._context(states))
 
 
 class TestBronzeFreshnessGate:
@@ -716,10 +812,13 @@ class TestPlayerCaptureGate:
         )
 
     @staticmethod
-    def _dag_run_with_failed_producer(dag_module, **fields):
-        """DagRun stand-in whose first match capture did NOT succeed."""
+    def _dag_run_with_failed_producer(dag_module, league=None, **fields):
+        """DagRun stand-in whose match capture of ``league`` (default: the
+        first configured league) did NOT succeed."""
 
-        failing = dag_module._match_capture_task_id(dag_module.SOFASCORE_LEAGUES[0])
+        failing = dag_module._match_capture_task_id(
+            league or dag_module.SOFASCORE_LEAGUES[0]
+        )
 
         def get_task_instance(task_id):
             state = "upstream_failed" if task_id == failing else "success"
@@ -748,11 +847,15 @@ class TestPlayerCaptureGate:
     def test_saturday_still_refuses_to_spend_on_a_failed_producer(self, dag_module):
         """The protection itself stays: a run that WILL spend paid bytes on the
         player universe must not start from a broken match phase."""
+        # A cup is never rotated out of the weekly cohort, so its dead capture
+        # is demanded on every Saturday regardless of the rotation modulus.
         with pytest.raises(Exception, match="Required SofaScore producer"):
             dag_module._gate_player_capture(
                 params={},
                 dag_run=self._dag_run_with_failed_producer(
-                    dag_module, external_trigger=False
+                    dag_module,
+                    league=dag_module.TOURNAMENT_LEAGUES[0],
+                    external_trigger=False,
                 ),
                 logical_date=datetime(2024, 1, 6),  # Saturday
             )
@@ -766,6 +869,51 @@ class TestPlayerCaptureGate:
                     dag_module, external_trigger=False
                 ),
                 logical_date=datetime(2024, 1, 1),
+            )
+
+    def _rotation_split(self, dag_module, monkeypatch):
+        """A real cohort split on the shipped scope: (due, not due) club leagues."""
+        monkeypatch.setenv("SOFASCORE_PLAYER_ROTATION_MODULUS", "2")
+        monkeypatch.setenv("SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES", "1")
+        context = {
+            "params": {},
+            "dag_run": SimpleNamespace(external_trigger=False),
+            "logical_date": datetime(2024, 1, 6),  # Saturday
+        }
+        due = dag_module._due_player_leagues(context)
+        clubs = dag_module.CLUB_LEAGUES
+        in_cohort = [lg for lg in clubs if lg in due]
+        out_of_cohort = [lg for lg in clubs if lg not in due]
+        assert in_cohort and out_of_cohort
+        return in_cohort[0], out_of_cohort[0]
+
+    def test_saturday_demands_only_the_due_cohort(self, dag_module, monkeypatch):
+        """#946 4d: a league the weekly rotation leaves out spends nothing this
+        Saturday, so its dead match capture must not block the cohort that
+        does run (the DagRun still goes red through propagate_ingest_status)."""
+        _, not_due = self._rotation_split(dag_module, monkeypatch)
+        assert (
+            dag_module._gate_player_capture(
+                params={},
+                dag_run=self._dag_run_with_failed_producer(
+                    dag_module, league=not_due, external_trigger=False
+                ),
+                logical_date=datetime(2024, 1, 6),  # Saturday
+            )
+            is True
+        )
+
+    def test_saturday_still_refuses_a_failed_producer_in_the_cohort(
+        self, dag_module, monkeypatch
+    ):
+        due, _ = self._rotation_split(dag_module, monkeypatch)
+        with pytest.raises(Exception, match="Required SofaScore producer"):
+            dag_module._gate_player_capture(
+                params={},
+                dag_run=self._dag_run_with_failed_producer(
+                    dag_module, league=due, external_trigger=False
+                ),
+                logical_date=datetime(2024, 1, 6),  # Saturday
             )
 
     def test_saturday_master_trigger_runs_weekly_capture(self, dag_module):
@@ -938,6 +1086,40 @@ class TestPlayerRotationGate:
         # Matches and league tables are not rotated.
         for task_id in ("prepare_sofascore_season_plan", "prepare_sofascore_target_plan"):
             assert "--players-rotation-date" not in _bash_task(task_id).bash_command
+
+    def test_due_league_the_planner_dropped_is_skipped(
+        self, dag_module, monkeypatch, tmp_path
+    ):
+        # C5: prepare_sofascore_player_plan drops a league whose season raw
+        # is incomplete (C4) — a clean-empty partition with neither player
+        # allocations nor a player universe. Its capture would only fail on
+        # the missing partition, so the gate skips it.
+        planned = dag_module.SOFASCORE_LEAGUES[0]
+        dropped = dag_module.SOFASCORE_LEAGUES[1]
+        plan_path = _signed_player_plan(tmp_path, monkeypatch, [planned])
+        context = {
+            "params": {"run_players": True},  # every league is due
+            "dag_run": SimpleNamespace(external_trigger=True, conf={}),
+            "data_interval_end": self.SATURDAY,
+            "ti": SimpleNamespace(xcom_pull=lambda task_ids: plan_path),
+        }
+        assert dag_module._player_plan_path(context) == plan_path
+        assert dag_module._gate_player_rotation(league=planned, **context) is True
+        assert dag_module._gate_player_rotation(league=dropped, **context) is False
+
+    def test_plan_path_is_the_player_plan_xcom(self, dag_module):
+        pulled = []
+        context = {
+            "ti": SimpleNamespace(
+                xcom_pull=lambda task_ids: pulled.append(task_ids) or "/plan.json"
+            )
+        }
+        assert dag_module._player_plan_path(context) == "/plan.json"
+        assert pulled == ["prepare_sofascore_player_plan"]
+        assert (
+            f"ti.xcom_pull(task_ids='{pulled[0]}')" in dag_module.PLAYER_PLAN_XCOM
+        )
+        assert dag_module._player_plan_path({}) is None
 
 
 class TestPlayerCaptureTasks:
@@ -1685,3 +1867,65 @@ class TestValidatePlayerDataUnderRotation:
         monkeypatch.setattr(dag_module, "_load_result", lambda path, logger: {})
         with pytest.raises(Exception, match="missing or unreadable"):
             dag_module.validate_player_data(**context)
+
+    def _forced_context(self, states, plan_path):
+        return {
+            "params": {"run_players": True},  # every league is due
+            "dag_run": SimpleNamespace(
+                external_trigger=True,
+                conf={},
+                run_id="scheduled__rotation",
+                get_task_instance=lambda task_id: SimpleNamespace(
+                    state=states.get(task_id, "success")
+                ),
+            ),
+            "run_id": "scheduled__rotation",
+            "data_interval_end": self.SATURDAY,
+            "ti": SimpleNamespace(xcom_pull=lambda task_ids: plan_path),
+        }
+
+    @staticmethod
+    def _healthy_result(path, logger):
+        return {
+            "rows": 520,
+            "profile_players": 520,
+            "season_stats_rows": 500,
+            "season_stats_players": 500,
+            "players_total": 520,
+            "fallback": False,
+            "tables": ["t"],
+            "errors": [],
+        }
+
+    def test_due_league_the_planner_dropped_may_skip(
+        self, dag_module, monkeypatch, tmp_path
+    ):
+        # C5: the gate skipped a due league the signed plan carries no
+        # partition for; the validator must accept that skip (no result
+        # file) instead of demanding success from a capture that never ran.
+        dropped = dag_module.SOFASCORE_LEAGUES[1]
+        planned = [lg for lg in dag_module.SOFASCORE_LEAGUES if lg != dropped]
+        plan_path = _signed_player_plan(tmp_path, monkeypatch, planned)
+        states = {dag_module._player_capture_task_id(dropped): "skipped"}
+        monkeypatch.setattr(dag_module, "_load_result", self._healthy_result)
+
+        out = dag_module.validate_player_data(
+            **self._forced_context(states, plan_path)
+        )
+
+        assert out["status"] == "success"
+        assert out["summary"]["planner_dropped"] == [dropped]
+        assert out["summary"]["rotation_skipped"] == []
+
+    def test_every_due_league_dropped_is_not_a_green_run(
+        self, dag_module, monkeypatch, tmp_path
+    ):
+        plan_path = _signed_player_plan(tmp_path, monkeypatch, [])
+        states = {
+            dag_module._player_capture_task_id(league): "skipped"
+            for league in dag_module.SOFASCORE_LEAGUES
+        }
+        monkeypatch.setattr(dag_module, "_load_result", self._healthy_result)
+
+        with pytest.raises(Exception, match="dropped from the signed player plan"):
+            dag_module.validate_player_data(**self._forced_context(states, plan_path))

@@ -68,6 +68,7 @@ PLAYER_WORKLOAD_CLASS = player_workload_class()
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 _SCRIPT_PATH = REPO_ROOT / "scripts" / "fbref_proxy" / "filter_proxy.py"
+_SHARED_SCRIPT_PATH = REPO_ROOT / "scripts" / "proxy_filter" / "filter_proxy.py"
 _BLOCKLIST_PATH = REPO_ROOT / "configs" / "proxy_filter" / "blocklist.txt"
 _COMPOSE_PATH = REPO_ROOT / "compose.yaml"
 # #951 (инцидент 2026-07-17): выделенный SofaScore-шлюз вынесен в СВОЙ
@@ -93,6 +94,16 @@ def _load_module():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def _load_shared_module():
+    spec = importlib.util.spec_from_file_location(
+        "shared_filter_proxy", _SHARED_SCRIPT_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    return loaded
 
 
 @pytest.fixture()
@@ -1913,6 +1924,7 @@ def test_sofascore_scheduler_mounts_exact_artifact_and_fingerprint_config():
     document = yaml.safe_load(_COMPOSE_PATH.read_text())
     scheduler = document["services"]["airflow-scheduler"]
     artifact_target = "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
+    campaign_target = "/opt/airflow/runtime/sofascore/all-men"
     volumes = scheduler["volumes"]
     targets = [
         volume["target"] if isinstance(volume, dict) else volume.split(":")[1]
@@ -1931,12 +1943,32 @@ def test_sofascore_scheduler_mounts_exact_artifact_and_fingerprint_config():
     )
     assert artifact_mount["read_only"] is True
     assert artifact_mount["bind"]["create_host_path"] is False
+    campaign_mount = next(
+        volume
+        for volume in volumes
+        if isinstance(volume, dict) and volume.get("target") == campaign_target
+    )
+    assert campaign_mount["source"].startswith(
+        "${SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR:?"
+    )
+    assert campaign_mount.get("read_only", False) is False
+    assert campaign_mount["bind"]["create_host_path"] is False
     assert scheduler["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT"] == (
         artifact_target
     )
     assert scheduler["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"].startswith(
         "${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:?"
     )
+    # This service is the SHARED platform scheduler — it holds the other five
+    # sources, and the SofaScore contour runs on its own scheduler in project
+    # ``sofascore-airflow`` (its own compose file, its own healthcheck), where
+    # every SofaScore DAG registered here is paused.  Its healthcheck must
+    # therefore answer one question only: is THIS scheduler alive.  Wiring the
+    # SofaScore runtime preflight in here gated all five other sources on the
+    # SofaScore gateway answering and on ``snapshot.json`` being present, and
+    # wrote a probe file into the campaign directory every 30 s, for a contour
+    # this scheduler does not run (code review of PR #1216).  The mounts above
+    # stay: they cost nothing and keep the artifact/campaign paths honest.
     assert scheduler["healthcheck"]["test"] == [
         "CMD-SHELL",
         'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"',
@@ -1953,6 +1985,7 @@ def test_sofascore_durable_mount_variables_are_documented():
     assert "\nSOFASCORE_PROXY_BUDGET_ARTIFACT_HOST=" in example
     assert "\nSOFASCORE_PROXY_BUDGET_ARTIFACT_ID=" in example
     assert "\nSOFASCORE_GATEWAY_STATE_HOST_DIR=" in example
+    assert "\nSOFASCORE_ALL_MENS_RUNTIME_HOST_DIR=" in example
 
 
 def test_fbref_has_an_isolated_metered_proxy_service():
@@ -3850,6 +3883,13 @@ def test_sofascore_source_cannot_bypass_budget_with_another_dag_id(mod):
     assert mgr.calls == 0
 
 
+def test_all_mens_backfill_dag_uses_the_signed_sofascore_lane():
+    mod = _load_shared_module()
+    assert mod._source_for_dag("dag_backfill_sofascore_all_mens") == "sofascore"
+    mod.SOFASCORE_DAGRUN_BUDGET_BYTES = 1234
+    assert mod._dagrun_budget_bytes("dag_backfill_sofascore_all_mens") == 1234
+
+
 def test_explicit_canary_bootstraps_artifact_but_never_authorizes_production(
     mod,
     tmp_path,
@@ -5091,6 +5131,193 @@ def test_blocking_client_leg_cannot_hold_provider_read_reservation(mod):
     assert provider_writer.closed is True
     assert lease.usable is True
     assert lease.active_provider_readers == 0
+
+
+# --- client hangup: provider tail is drained, not latched (shared module) ------
+#
+# These run against scripts/proxy_filter/filter_proxy.py (the SofaScore/WhoScored
+# gateway), not the fbref copy loaded by the ``mod`` fixture.
+
+
+def _shared_sofascore_lease(tmp_path, *, max_bytes=4096):
+    mod = _load_shared_module()
+    mod.LEDGER_PATH = str(tmp_path / "paid_requests.jsonl")
+    mod.CONTROL_TOKEN = "c" * 32
+    mod.SOFASCORE_BUDGET_ARTIFACT_ID = "a" * 64
+    mod.SOFASCORE_ALLOCATION_LEDGER_PATH = str(tmp_path / "allocations.json")
+    mod.SOFASCORE_ALLOCATION_WAL_PATH = str(tmp_path / "allocation-wal.jsonl")
+    mod.SOFASCORE_ALLOCATION_LEDGER = None
+    mod._SOFASCORE_ALLOCATION_LEDGER_KEY = None
+    mod.SOFASCORE_PARENT_ENVELOPE_PATH = str(tmp_path / "parent-envelopes.json")
+    mod.SOFASCORE_PARENT_ENVELOPE_LEDGER = None
+    mod._SOFASCORE_PARENT_ENVELOPE_LEDGER_PATH = ""
+    mod.SOURCE_MODE = "test-all"
+    mod.SOFASCORE_DAGRUN_BUDGET_BYTES = max_bytes
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    lease = mod._create_lease(
+        mgr,
+        max_bytes=max_bytes,
+        ttl_seconds=30,
+        metadata=_sofascore_context(budget=max_bytes),
+        require_context=True,
+    )
+    mod._begin_endpoint_request(lease, "event")
+    return mod, lease
+
+
+class _HangupClientWriter:
+    """Client leg whose first ``drain`` fails like a TLS close_notify race."""
+
+    def __init__(self):
+        self.payload = bytearray()
+        self.drain_calls = 0
+        self.closed = False
+
+    def write(self, chunk):
+        self.payload.extend(chunk)
+
+    async def drain(self):
+        self.drain_calls += 1
+        raise ConnectionResetError("client hung up")
+
+    def close(self):
+        self.closed = True
+
+
+def test_shared_down_pump_drains_provider_tail_after_client_hangup(tmp_path):
+    mod, lease = _shared_sofascore_lease(tmp_path)
+    head = b"a" * 415
+    tail = b"b" * 31
+
+    class Reader:
+        def __init__(self):
+            self.chunks = [head, tail, b""]
+            self.read_calls = 0
+
+        async def read(self, size):
+            self.read_calls += 1
+            return self.chunks.pop(0)
+
+    reader = Reader()
+    writer = _HangupClientWriter()
+    asyncio.run(
+        mod._pump(
+            reader,
+            writer,
+            "www.sofascore.com",
+            defaultdict(int),
+            lease=lease,
+            direction="down",
+        )
+    )
+
+    # Every provider byte was read to EOF and billed exactly; the dead client
+    # got only the chunk that was in flight when it hung up.
+    assert reader.read_calls == 3
+    assert writer.drain_calls == 1
+    assert bytes(writer.payload) == head
+    assert writer.closed is True
+    assert lease.down_bytes == len(head) + len(tail)
+    assert lease.provider_reserved_bytes == 0
+    assert lease.reserved_bytes == 0
+    assert lease.accounting_uncertain is False
+    assert lease.closed is False
+
+
+def test_shared_down_pump_latches_when_provider_stalls_after_client_hangup(
+    tmp_path,
+):
+    mod, lease = _shared_sofascore_lease(tmp_path)
+    mod.LEASE_CLIENT_HANGUP_DRAIN_SECONDS = 0.05
+    head = b"a" * 415
+
+    class Reader:
+        def __init__(self):
+            self.chunks = [head]
+            self.read_calls = 0
+
+        async def read(self, size):
+            self.read_calls += 1
+            if self.chunks:
+                return self.chunks.pop(0)
+            await asyncio.Event().wait()
+
+    reader = Reader()
+    writer = _HangupClientWriter()
+    started = time.monotonic()
+    asyncio.run(
+        mod._pump(
+            reader,
+            writer,
+            "www.sofascore.com",
+            defaultdict(int),
+            lease=lease,
+            direction="down",
+        )
+    )
+
+    # No observed EOF: the unread provider tail is unknowable, so the lease
+    # latches as before — but only after the bounded drain window, not the TTL.
+    assert time.monotonic() - started < 5
+    assert reader.read_calls == 2
+    assert lease.down_bytes == len(head)
+    assert lease.accounting_uncertain is True
+    assert lease.usable is False
+    assert writer.closed is True
+
+
+def test_shared_up_pump_half_closes_provider_until_down_pump_finishes(tmp_path):
+    mod, lease = _shared_sofascore_lease(tmp_path)
+    provider_payload = b"provider-tail-after-client-eof"
+
+    class ClientReader:
+        async def read(self, size):
+            return b""
+
+    class ProviderReader:
+        def __init__(self):
+            self.chunks = [provider_payload, b""]
+
+        async def read(self, size):
+            await asyncio.sleep(0)
+            return self.chunks.pop(0)
+
+    class ProviderWriter(_FakeUpstreamWriter):
+        def __init__(self):
+            super().__init__()
+            self.events = []
+
+        def can_write_eof(self):
+            return True
+
+        def write_eof(self):
+            self.events.append("eof")
+
+        def close(self):
+            self.events.append("close")
+            super().close()
+
+    client_writer = _FakeUpstreamWriter()
+    provider_writer = ProviderWriter()
+    asyncio.run(
+        mod._run_tunnel_pumps(
+            ClientReader(),
+            client_writer,
+            ProviderReader(),
+            provider_writer,
+            "www.sofascore.com",
+            lease=lease,
+        )
+    )
+
+    # Client EOF half-closes the provider leg so its tail and FIN still arrive;
+    # the socket is fully closed only once both pumps have finished.
+    assert provider_writer.events == ["eof", "close"]
+    assert bytes(client_writer.data) == provider_payload
+    assert client_writer.closed is True
+    assert lease.down_bytes == len(provider_payload)
+    assert lease.accounting_uncertain is False
+    assert lease.reserved_bytes == 0
 
 
 def test_concurrent_provider_readers_keep_aggregate_upload_headroom(mod):
@@ -7114,6 +7341,15 @@ def _discovery_context(run_id="discovery__20260714T000000Z"):
     }
 
 
+def _all_mens_metadata_context(run_id="manual__all-men-metadata"):
+    context = _discovery_context(run_id=run_id)
+    context.update({
+        "dag_id": "dag_backfill_sofascore_all_mens",
+        "task_id": "run_historical_scope",
+    })
+    return context
+
+
 def test_discovery_lease_is_refused_until_a_cap_is_authorized(mod):
     mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
 
@@ -7153,6 +7389,79 @@ def test_authorized_discovery_lease_is_capped_by_its_dagrun_budget(mod):
     assert report["budget_artifact_id"] == ""
     # WhoScored remains zero until a signed campaign supplies exact caps.
     assert mod._dagrun_budget_bytes("dag_ingest_whoscored") == 0
+
+
+def test_all_mens_metadata_uses_discovery_budget_without_losing_dag_identity(
+    tmp_path
+):
+    mod = _load_shared_module()
+    mod.LEDGER_PATH = str(tmp_path / "paid_requests.jsonl")
+    mod.SOURCE_MODE = "test-all"
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    mod.SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 12 * 1024 * 1024
+
+    lease = mod._create_lease(
+        mgr,
+        max_bytes=8 * 1024 * 1024,
+        ttl_seconds=3600,
+        metadata=_all_mens_metadata_context(),
+        require_context=True,
+    )
+
+    assert lease.source == "sofascore_discovery"
+    assert lease.dag_id == "dag_backfill_sofascore_all_mens"
+    assert lease.run_id == "manual__all-men-metadata"
+    assert mod._source_for_dag(lease.dag_id) == "sofascore"
+
+
+def test_all_mens_refresh_dag_uses_signed_and_discovery_lanes_like_backfill(
+    tmp_path
+):
+    mod = _load_shared_module()
+    assert mod._source_for_dag("dag_refresh_sofascore_all_mens") == "sofascore"
+    mod.SOFASCORE_DAGRUN_BUDGET_BYTES = 1234
+    assert mod._dagrun_budget_bytes("dag_refresh_sofascore_all_mens") == 1234
+
+    mod.LEDGER_PATH = str(tmp_path / "paid_requests.jsonl")
+    mod.SOURCE_MODE = "test-all"
+    mgr = _FakeManager(["http://u:p@pool.invalid:10000"])
+    mod.SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 12 * 1024 * 1024
+    context = _all_mens_metadata_context(run_id="manual__all-men-refresh")
+    context.update({
+        "dag_id": "dag_refresh_sofascore_all_mens",
+        "task_id": "refresh_season_schedules",
+    })
+
+    lease = mod._create_lease(
+        mgr,
+        max_bytes=8 * 1024 * 1024,
+        ttl_seconds=3600,
+        metadata=context,
+        require_context=True,
+    )
+
+    assert lease.source == "sofascore_discovery"
+    assert lease.dag_id == "dag_refresh_sofascore_all_mens"
+    # Admission sized this lease with the DISCOVERY cap, so every runtime check
+    # has to read the same number.  ``_lease_dagrun_budget_bytes`` fell through
+    # to ``_dagrun_budget_bytes(lease.dag_id)`` instead — and this DAG is in
+    # ``SOFASCORE_DAG_IDS`` but NOT in ``SOFASCORE_DISCOVERY_DAG_IDS``, so the
+    # sweep was metered against ``SOFASCORE_DAGRUN_BUDGET_BYTES``: the biggest
+    # single workload class of the canary artifact, ~1.2 MiB against the tens
+    # of MB a sweep needs.  The lane was cut off a few dozen pages in on every
+    # run, for ever, and the bytes it did spend were charged to the production
+    # SofaScore DagRun cap while the discovery cap was never enforced at all
+    # (code review of PR #1216).
+    assert mod._lease_dagrun_budget_bytes(lease) == 12 * 1024 * 1024
+    assert lease.report()["dagrun_budget_bytes"] == 12 * 1024 * 1024
+
+
+def test_shared_sofascore_discovery_allows_camoufox_exit_probe():
+    mod = _load_shared_module()
+    discovery = SimpleNamespace(source="sofascore_discovery")
+
+    assert mod._lease_host_allowed(discovery, "api.ipify.org", 443) is True
+    assert mod._lease_host_allowed(discovery, "api.ipify.org", 80) is False
 
 
 def test_discovery_lease_is_not_truncated_by_the_2mb_per_url_ceiling(mod):
@@ -8524,3 +8833,65 @@ def test_fbref_proxy_hard_stops_an_oversized_browser_phase_transfer(mod):
     assert lease.total_bytes == lease.max_bytes == 12
     assert lease.budget_exceeded is True
     assert writer.closed is True
+
+
+def _append_wal_attempt(mod, lease_id, *, finished):
+    mod._append_allocation_wal(
+        "claim_intent",
+        lease_id,
+        workload_plan={"plan": lease_id},
+        allocation_id=f"alloc-{lease_id}",
+        claim_token="t" * 16,
+    )
+    mod._append_allocation_wal(
+        "endpoint_started", lease_id, request_id="r1", endpoint="lineups"
+    )
+    mod._append_allocation_wal(
+        "endpoint_finished",
+        lease_id,
+        request_id="r1",
+        endpoint="lineups",
+        provider_bytes=100,
+    )
+    if finished:
+        mod._append_allocation_wal("allocation_finished", lease_id)
+    else:
+        mod._append_allocation_wal(
+            "endpoint_started", lease_id, request_id="r2", endpoint="event"
+        )
+
+
+def test_shared_wal_compaction_keeps_only_open_attempts(tmp_path):
+    mod = _load_shared_module()
+    wal_path = tmp_path / "allocation-wal.jsonl"
+    mod.SOFASCORE_ALLOCATION_WAL_PATH = str(wal_path)
+    backup = tmp_path / "allocation-wal.jsonl.compacted.bak"
+
+    # Nothing to compact yet: neither file is touched.
+    assert mod._compact_allocation_wal(set()) == (0, 0)
+    assert not wal_path.exists() and not backup.exists()
+
+    _append_wal_attempt(mod, "lease-done-1", finished=True)
+    _append_wal_attempt(mod, "lease-open", finished=False)
+    _append_wal_attempt(mod, "lease-done-2", finished=True)
+    original_lines = wal_path.read_bytes().splitlines()
+    before = mod._read_allocation_wal()
+    open_ids = {lease_id for lease_id, s in before.items() if not s["finished"]}
+    assert open_ids == {"lease-open"}
+
+    assert mod._compact_allocation_wal(open_ids) == (12, 4)
+
+    kept_lines = wal_path.read_bytes().splitlines()
+    assert kept_lines == [
+        line for line in original_lines if b'"lease_id":"lease-open"' in line
+    ]
+    assert mod._read_allocation_wal() == {"lease-open": before["lease-open"]}
+    assert wal_path.stat().st_mode & 0o777 == 0o600
+    assert backup.read_bytes().splitlines() == original_lines
+    assert backup.stat().st_mode & 0o777 == 0o600
+
+    # Idempotent: a second start with the same open set rewrites nothing.
+    assert mod._compact_allocation_wal(open_ids) == (4, 4)
+    assert wal_path.read_bytes().splitlines() == kept_lines
+    assert backup.read_bytes().splitlines() == original_lines
+    assert mod._read_allocation_wal() == {"lease-open": before["lease-open"]}

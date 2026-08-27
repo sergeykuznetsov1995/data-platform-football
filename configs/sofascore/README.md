@@ -8,7 +8,7 @@ Schema v2 separates fields by ownership:
 
 - discovery owns source identity, slugs, category, `classification`, and season
   source metadata (`season_id`, original name/year, dates, format, canonical
-  season, and evidence);
+  season, evidence, and optional evidenced `team_count`);
 - operators own `canonical_id`, `enabled`, `review`, custom fields, explicit
   season aliases, and named-season canonical overrides. Discovery preserves
   these fields byte-for-byte. Euro 2020's
@@ -39,6 +39,18 @@ repository proxy file are disabled at the libcurl transport layer; the report
 always records zero paid-proxy bytes, browser sessions, and navigations. A 403,
 missing category fan-out, missing season response, or schema error aborts before
 the atomic compare-and-swap write.
+
+When the public JSON edge returns 403, an operator may explicitly choose the
+metered browser transport. It has no direct fallback, needs a positive cap, and
+records provider bytes plus browser sessions/navigations. Team counts are also
+opt-in and fail closed on an empty/malformed team list:
+
+```bash
+python dags/scripts/run_sofascore_discovery.py \
+  --scope targeted --tournament-id 17 \
+  --transport lease-browser --budget-cap-bytes 8000000 \
+  --include-team-counts --dry-run
+```
 
 For a read-only drift check (exit 2 means the registry would change):
 
@@ -147,6 +159,15 @@ of one run.  Make the host directory writable by UID 50000/group 0 before
 starting the gateway.  Compose uses `create_host_path: false` for both durable
 binds and therefore fails closed when either source is missing.
 
+The all-men history queue has a separate writable campaign bind. Before the
+scheduler is created, pre-create `SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR`, copy the
+reviewed `snapshot.json` into it, and make the directory writable by container
+UID 50000/group 0 (for example, owner `50000:0`, mode `0750`). Compose mounts
+only that directory at `/opt/airflow/runtime/sofascore/all-men` with
+`create_host_path: false`; the immutable canary artifact remains a separate
+read-only file. Metadata checkpoints compare the planned snapshot ID while
+holding a file lock, so a stale writer cannot replace a newer revision.
+
 Before creating either container, run the UID-aware host preflight against the
 exact deployment paths:
 
@@ -155,6 +176,8 @@ python scripts/sofascore_runtime_preflight.py preflight \
   --release-root /root/dpf-release-immutable \
   --artifact /durable/path/sofascore/proxy_budget_canary.json \
   --state-dir /durable/path/sofascore/gateway-state \
+  --campaign-dir /durable/path/sofascore/all-men \
+  --campaign-policy /root/dpf-release-immutable/configs/sofascore/all_mens_campaign.json \
   --expected-artifact-id <reviewed-64-hex-artifact-id>
 ```
 

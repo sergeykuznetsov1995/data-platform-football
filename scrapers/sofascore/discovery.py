@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -41,6 +42,9 @@ CATALOG_FALLBACK_PATH = "/config/top-unique-tournaments/EN/football"
 CATEGORIES_PATH = "/sport/football/categories/all"
 CATEGORIES_FALLBACK_PATH = "/sport/football/categories"
 TOURNAMENT_PATH = "/unique-tournament/{unique_tournament_id}"
+SEASON_TEAMS_PATH = (
+    "/unique-tournament/{unique_tournament_id}/season/{season_id}/teams"
+)
 # One fingerprint for both discovery transports.  The lease path must look
 # exactly like the direct path to SofaScore's edge; only the egress differs.
 TLS_CLIENT_IDENTIFIER = "chrome_133"
@@ -544,6 +548,7 @@ class LeaseProxySofaScoreClient:
         self._paid_proxy_bytes = 0
         self._lease_count = 0
         self._upstream_repins = 0
+        self._accounting_status = "verified"
 
     @staticmethod
     def _default_provider(control_url: str, control_token: Optional[str]) -> Any:
@@ -560,7 +565,7 @@ class LeaseProxySofaScoreClient:
         return get_rate_limiter("sofascore_discovery")
 
     @property
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, Any]:
         """Report billed traffic; call :meth:`close` before reading it."""
 
         return {
@@ -571,6 +576,7 @@ class LeaseProxySofaScoreClient:
             "browser_navigations": 0,
             "lease_count": self._lease_count,
             "upstream_repins": self._upstream_repins,
+            "accounting_status": self._accounting_status,
         }
 
     def _acquire(self) -> Any:
@@ -621,6 +627,7 @@ class LeaseProxySofaScoreClient:
             # Unmeasured paid traffic is never assumed to be zero: charge the
             # whole lease allowance and let the caller decide to stop.
             self._paid_proxy_bytes += int(getattr(lease, "max_bytes", 0) or 0)
+            self._accounting_status = "unresolved_close"
             if raise_on_error:
                 raise DiscoveryError(
                     f"SofaScore discovery lease did not close cleanly: {exc}"
@@ -722,6 +729,310 @@ class LeaseProxySofaScoreClient:
         self._release(raise_on_error=False)
 
     def __enter__(self) -> "LeaseProxySofaScoreClient":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        self.close()
+        return False
+
+
+class LeaseBrowserSofaScoreClient:
+    """Exact SofaScore JSON discovery in a metered, warmed browser.
+
+    This is the fail-closed fallback for discovery when SofaScore refuses the
+    direct/TLS fingerprint. Every browser byte crosses a proxy-filter lease;
+    retries always create a new lease and there is no direct-network fallback.
+    """
+
+    def __init__(
+        self,
+        *,
+        control_url: str,
+        budget_cap_bytes: int,
+        run_id: str,
+        task_id: str = "discover_sofascore_registry_browser",
+        dag_id: str = "dag_discover_sofascore_registry",
+        control_token: Optional[str] = None,
+        per_lease_max_bytes: int = DISCOVERY_LEASE_MAX_BYTES,
+        lease_ttl_seconds: int = DISCOVERY_LEASE_TTL_SECONDS,
+        max_attempts: int = 3,
+        sleeper: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.time,
+        capture_factory: Optional[Callable[..., Any]] = None,
+        lease_provider: Optional[Any] = None,
+        rate_limiter: Optional[Any] = None,
+    ) -> None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
+        if not isinstance(budget_cap_bytes, int) or isinstance(
+            budget_cap_bytes, bool
+        ):
+            raise ValueError("budget_cap_bytes must be a positive integer")
+        if budget_cap_bytes <= 0:
+            raise ValueError(
+                "metered discovery requires an explicit positive budget_cap_bytes"
+            )
+        if per_lease_max_bytes <= 0 or lease_ttl_seconds <= 0:
+            raise ValueError("per-lease byte and TTL bounds must be positive")
+        self.budget_cap_bytes = int(budget_cap_bytes)
+        self.per_lease_max_bytes = int(per_lease_max_bytes)
+        self.lease_ttl_seconds = int(lease_ttl_seconds)
+        self.max_attempts = int(max_attempts)
+        self.run_id = str(run_id)
+        self.task_id = str(task_id)
+        self._sleeper = sleeper
+        self._clock = clock
+        self._capture_factory = capture_factory
+        self._provider = lease_provider or self._default_provider(
+            control_url, control_token, dag_id
+        )
+        self._rate_limiter = rate_limiter or self._default_rate_limiter()
+        self._lease: Optional[Any] = None
+        self._capture_cm: Optional[Any] = None
+        self._capture: Optional[Any] = None
+        self._lease_provider_bytes = 0
+        self._requests = 0
+        self._paid_proxy_bytes = 0
+        self._browser_sessions = 0
+        self._browser_navigations = 0
+        self._lease_count = 0
+        self._upstream_repins = 0
+        self._accounting_status = "verified"
+
+    @staticmethod
+    def _default_provider(
+        control_url: str, control_token: Optional[str], dag_id: str
+    ) -> Any:
+        from scrapers.sofascore.lease_client import _DiscoveryLeaseProvider
+
+        return _DiscoveryLeaseProvider(
+            control_url,
+            control_token=control_token,
+            dag_id=dag_id,
+        )
+
+    @staticmethod
+    def _default_rate_limiter() -> Any:
+        from scrapers.utils.rate_limiter import get_rate_limiter
+
+        return get_rate_limiter("sofascore_discovery")
+
+    @staticmethod
+    def _default_capture_factory(**kwargs: Any) -> Any:
+        from scrapers.sofascore.camoufox_capture import SofascoreCamoufoxCapture
+
+        return SofascoreCamoufoxCapture(**kwargs)
+
+    @property
+    def stats(self) -> dict[str, Any]:
+        return {
+            "requests": self._requests,
+            "direct_response_bytes": 0,
+            "paid_proxy_bytes": self._paid_proxy_bytes,
+            "browser_sessions": self._browser_sessions,
+            "browser_navigations": self._browser_navigations,
+            "lease_count": self._lease_count,
+            "upstream_repins": self._upstream_repins,
+            "accounting_status": self._accounting_status,
+        }
+
+    def _acquire(self) -> Any:
+        remaining = self.budget_cap_bytes - self._paid_proxy_bytes
+        if remaining <= 0:
+            raise DiscoveryError(
+                "SofaScore discovery paid-byte budget exhausted: "
+                f"{self._paid_proxy_bytes}/{self.budget_cap_bytes} bytes"
+            )
+        lease: Optional[Any] = None
+        capture_cm: Optional[Any] = None
+        try:
+            lease = self._provider.acquire(
+                max_bytes=min(self.per_lease_max_bytes, remaining),
+                ttl_seconds=self.lease_ttl_seconds,
+                run_id=self.run_id,
+                task_id=self.task_id,
+            )
+            proxy = self._provider.playwright_proxy(lease)
+            factory = self._capture_factory or self._default_capture_factory
+            capture_cm = factory(
+                proxy=proxy,
+                request_limiter=lambda: self._rate_limiter.acquire(),
+            )
+            self._lease = lease
+            self._capture_cm = capture_cm
+            self._lease_count += 1
+            self._browser_sessions += 1
+            self._capture = capture_cm.__enter__()
+            self._browser_navigations += 1
+            self._capture.warm_exact_json("https://www.sofascore.com/")
+            self._lease_provider_bytes = 0
+            return self._capture
+        except Exception as exc:
+            # Publish acquired resources before releasing so a failed browser
+            # start/warm is still closed and billed exactly once.
+            if self._lease is None and lease is not None:
+                self._lease = lease
+            if self._capture_cm is None and capture_cm is not None:
+                self._capture_cm = capture_cm
+            self._release(raise_on_error=False)
+            raise DiscoveryError(
+                f"SofaScore discovery browser lease unavailable: {exc}"
+            ) from exc
+
+    def _release(self, *, raise_on_error: bool) -> None:
+        lease, capture_cm = self._lease, self._capture_cm
+        self._lease = None
+        self._capture = None
+        self._capture_cm = None
+        self._lease_provider_bytes = 0
+        if capture_cm is not None:
+            try:
+                capture_cm.__exit__(None, None, None)
+            except Exception:  # noqa: BLE001 - teardown is best effort
+                pass
+        if lease is None:
+            return
+        try:
+            snapshot = self._provider.close(lease)
+        except Exception as exc:
+            self._paid_proxy_bytes += int(getattr(lease, "max_bytes", 0) or 0)
+            self._accounting_status = "unresolved_close"
+            if raise_on_error:
+                raise DiscoveryError(
+                    f"SofaScore discovery lease did not close cleanly: {exc}"
+                ) from exc
+            return
+        self._paid_proxy_bytes += int(snapshot.provider_bytes)
+        self._upstream_repins += int(snapshot.upstream_repins)
+        if self._paid_proxy_bytes > self.budget_cap_bytes and raise_on_error:
+            raise DiscoveryError(
+                "SofaScore discovery exceeded its paid-byte cap: "
+                f"{self._paid_proxy_bytes}/{self.budget_cap_bytes} bytes"
+            )
+
+    def _refresh_live_bytes(self) -> None:
+        if self._lease is None:
+            return
+        try:
+            snapshot = self._provider.stats(self._lease)
+            current = int(snapshot.provider_bytes)
+        except Exception as exc:
+            self._release(raise_on_error=False)
+            raise DiscoveryError(
+                f"SofaScore discovery lease meter unavailable: {exc}"
+            ) from exc
+        if current < self._lease_provider_bytes:
+            self._release(raise_on_error=False)
+            raise DiscoveryError("SofaScore discovery lease meter moved backwards")
+        self._lease_provider_bytes = current
+
+    def _live_capture(self) -> Any:
+        lease = self._lease
+        if lease is not None and (
+            self._lease_provider_bytes >= _LEASE_BYTE_HEADROOM * lease.max_bytes
+            or self._clock() >= lease.expires_at - _LEASE_TTL_MARGIN_SECONDS
+        ):
+            self._release(raise_on_error=True)
+        if self._lease is None:
+            return self._acquire()
+        return self._capture
+
+    def get_json(self, path: str) -> Mapping[str, Any]:
+        return self.get_json_bytes(path)[1]
+
+    def get_json_bytes(self, path: str) -> tuple[bytes, Mapping[str, Any]]:
+        """Return the exact response body with its parsed JSON object.
+
+        The bytes are the browser's ``Response.body`` as received, so a raw
+        store can keep them as the source's own answer.
+        """
+        clean_path = "/" + str(path).lstrip("/")
+        if "://" in clean_path or ".." in clean_path.split("/"):
+            raise ValueError("discovery path must be a relative API path")
+        api_path = "/api/v1" + clean_path
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                capture = self._live_capture()
+            except DiscoveryError as exc:
+                last_error = exc
+                if attempt == self.max_attempts:
+                    break
+                self._sleeper(min(2 ** (attempt - 1), 4))
+                continue
+            self._requests += 1
+            self._browser_navigations += 1
+            try:
+                record = capture.fetch_api_json(api_path)
+                self._refresh_live_bytes()
+            except DiscoveryError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                self._release(raise_on_error=True)
+                if attempt == self.max_attempts:
+                    break
+                self._sleeper(min(2 ** (attempt - 1), 4))
+                continue
+
+            if record is None:
+                last_error = DiscoveryHTTPError(
+                    f"metered browser returned no response for {clean_path}"
+                )
+                self._release(raise_on_error=True)
+                if attempt < self.max_attempts:
+                    self._sleeper(min(2 ** (attempt - 1), 4))
+                    continue
+                break
+            try:
+                status = int(record.get("status", 0))
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise DiscoveryHTTPError(
+                    f"metered browser response has no valid status: {clean_path}"
+                ) from exc
+            payload = record.get("json")
+            if status == 200:
+                if record.get("challenge"):
+                    raise DiscoveryHTTPError(
+                        f"metered browser challenge for {clean_path}",
+                        status_code=403,
+                    )
+                if not isinstance(payload, Mapping):
+                    raise DiscoverySchemaError(
+                        f"JSON root from {clean_path} must be an object"
+                    )
+                body = record.get("body")
+                if not isinstance(body, (bytes, bytearray)):
+                    raise DiscoveryHTTPError(
+                        f"metered browser response has no exact bytes: {clean_path}"
+                    )
+                return bytes(body), payload
+
+            error = DiscoveryHTTPError(
+                f"metered browser request failed: HTTP {status} {clean_path}",
+                status_code=status,
+            )
+            if status == 403:
+                raise error
+            if status == 429 or 500 <= status <= 599:
+                last_error = error
+                self._release(raise_on_error=True)
+                if attempt < self.max_attempts:
+                    self._sleeper(min(2 ** (attempt - 1), 4))
+                    continue
+            raise error
+
+        raise DiscoveryHTTPError(
+            f"metered browser request failed after {self.max_attempts} "
+            f"attempts: {clean_path}: {last_error}",
+            status_code=getattr(last_error, "status_code", None),
+        ) from last_error
+
+    def close(self) -> None:
+        self._release(raise_on_error=True)
+
+    def __enter__(self) -> "LeaseBrowserSofaScoreClient":
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
@@ -1025,6 +1336,46 @@ def parse_seasons_payload(
     return [by_id[season_id] for season_id in sorted(by_id)]
 
 
+def parse_team_count_payload(
+    payload: Mapping[str, Any],
+    *,
+    unique_tournament_id: int,
+    season_id: int,
+) -> tuple[int, dict[str, Any]]:
+    """Return an evidenced unique-team count for one exact source season."""
+
+    endpoint = SEASON_TEAMS_PATH.format(
+        unique_tournament_id=unique_tournament_id,
+        season_id=season_id,
+    )
+    raw_teams = payload.get("teams")
+    if not isinstance(raw_teams, list):
+        raise DiscoverySchemaError(
+            f"{endpoint} must contain a positive team list"
+        )
+    team_ids: set[int] = set()
+    for index, raw in enumerate(raw_teams):
+        if not isinstance(raw, Mapping):
+            raise DiscoverySchemaError(
+                f"{endpoint} teams[{index}] must contain a positive team id"
+            )
+        team_ids.add(
+            _positive_int(raw.get("id"), f"{endpoint} teams[{index}].id")
+        )
+    if not team_ids:
+        raise DiscoverySchemaError(f"{endpoint} must contain positive team ids")
+    ordered = sorted(team_ids)
+    digest = hashlib.sha256(
+        json.dumps(ordered, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return len(ordered), {
+        "type": "source_team_ids",
+        "endpoint": endpoint,
+        "count": len(ordered),
+        "team_ids_sha256": digest,
+    }
+
+
 def _upgrade_season_v2(
     raw: Mapping[str, Any], unique_tournament_id: int,
 ) -> dict[str, Any]:
@@ -1091,7 +1442,12 @@ def _merge_season_record(
     # A source response can temporarily omit dates.  Retain the last evidenced
     # value rather than turning a complete registry into a partial one.
     retained_source_value = False
-    for field in ("start_date", "end_date"):
+    for field in (
+        "start_date",
+        "end_date",
+        "team_count",
+        "team_count_evidence",
+    ):
         if merged.get(field) is None and previous.get(field) is not None:
             merged[field] = previous.get(field)
             retained_source_value = True
@@ -1109,7 +1465,7 @@ def _merge_season_record(
     source_fields = {
         "season_id", "name", "source_name", "year", "format",
         "season_format", "canonical_season", "start_date", "end_date",
-        "evidence", "aliases",
+        "evidence", "aliases", "team_count", "team_count_evidence",
     }
     for field, value in previous.items():
         if field not in source_fields:
@@ -1303,6 +1659,7 @@ def discover_registry(
     *,
     scope: str = "full",
     target_tournament_ids: Optional[Sequence[Any]] = None,
+    include_team_counts: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Fetch the complete catalog and every season list before merging."""
 
@@ -1488,6 +1845,22 @@ def discover_registry(
                 f"enabled tournament {source_id} has no usable seasons in "
                 "the current source response"
             )
+        if include_team_counts:
+            for season in seasons:
+                season_id = int(season["season_id"])
+                teams_payload = client.get_json(
+                    SEASON_TEAMS_PATH.format(
+                        unique_tournament_id=source_id,
+                        season_id=season_id,
+                    )
+                )
+                team_count, team_count_evidence = parse_team_count_payload(
+                    teams_payload,
+                    unique_tournament_id=source_id,
+                    season_id=season_id,
+                )
+                season["team_count"] = team_count
+                season["team_count_evidence"] = team_count_evidence
         tournament["seasons"] = seasons
 
     merged, counts = merge_registry(existing, tournaments)
@@ -1621,7 +1994,9 @@ __all__ = [
     "DISCOVERY_LEASE_TTL_SECONDS",
     "TLS_CLIENT_IDENTIFIER",
     "TOURNAMENT_PATH",
+    "SEASON_TEAMS_PATH",
     "DirectSofaScoreClient",
+    "LeaseBrowserSofaScoreClient",
     "LeaseProxySofaScoreClient",
     "DiscoveryError",
     "DiscoveryConcurrentUpdate",
@@ -1634,6 +2009,7 @@ __all__ = [
     "parse_catalog_payload",
     "parse_categories_payload",
     "parse_seasons_payload",
+    "parse_team_count_payload",
     "render_registry",
     "write_registry_atomic",
 ]

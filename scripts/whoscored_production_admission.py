@@ -948,6 +948,7 @@ _ALLOWED_VOLUME_TARGETS = {
         "/opt/airflow/fotmob-admission": ("bind", True),
         "/opt/airflow/logs": ("bind", False),
         "/opt/airflow/proxys.txt": ("bind", True),
+        "/opt/airflow/runtime/sofascore/all-men": ("bind", False),
         "/opt/airflow/runtime/sofascore/proxy_budget_canary.json": (
             "bind",
             True,
@@ -1020,6 +1021,10 @@ _RUNTIME_HOST_BIND_TARGETS = {
     ): "fbref-geoip-database",
     ("airflow-scheduler", "/opt/airflow/logs"): "writable-directory",
     ("airflow-scheduler", "/opt/airflow/proxys.txt"): "protected-file",
+    (
+        "airflow-scheduler",
+        "/opt/airflow/runtime/sofascore/all-men",
+    ): "writable-directory",
     (
         "airflow-scheduler",
         "/opt/airflow/runtime/sofascore/proxy_budget_canary.json",
@@ -1186,6 +1191,9 @@ _EXPECTED_HEALTHCHECKS = {
         "Interval": 30_000_000_000,
         "Retries": 5,
         "StartPeriod": 60_000_000_000,
+        # Back to the platform-wide check, exactly as on master: this scheduler
+        # holds the other five sources and does not run the SofaScore contour
+        # (see the healthcheck comment in compose.yaml).
         "Test": (
             "CMD-SHELL",
             'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"',
@@ -8387,6 +8395,10 @@ def _validate_bind_source_policy(
             FBREF_CAMOUFOX_GEOIP_DATABASE_CONTAINER_PATH,
         ),
         "scheduler-logs": ("airflow-scheduler", "/opt/airflow/logs"),
+        "sofascore-campaign-dir": (
+            "airflow-scheduler",
+            "/opt/airflow/runtime/sofascore/all-men",
+        ),
         "sofascore-budget-artifact": (
             "airflow-scheduler",
             "/opt/airflow/runtime/sofascore/proxy_budget_canary.json",

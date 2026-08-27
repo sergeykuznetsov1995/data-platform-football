@@ -266,6 +266,7 @@ class CaptureMetrics:
         self.cache_hits = 0
         self.replay_hits = 0
         self.completed_rows = 0
+        self.http_429 = 0
         self.status_counts = {status.value: 0 for status in ManifestStatus}
         self._completed_matches: set[str] = set()
         self._completed_players: set[str] = set()
@@ -307,6 +308,11 @@ class CaptureMetrics:
             self.browser_sessions += error.browser_sessions
             self.navigations += error.navigations
 
+    def source_rate_limited(self) -> None:
+        """Count one HTTP 429 answered by the source itself (not the gateway)."""
+        with self._lock:
+            self.http_429 += 1
+
     def finish(self, result: CaptureResult, duration_ms: int) -> None:
         with self._lock:
             self.cache_hits += int(result.cache_hit)
@@ -347,6 +353,7 @@ class CaptureMetrics:
                 "navigations": self.navigations,
                 "cache_hits": self.cache_hits,
                 "replay_hits": self.replay_hits,
+                "http_429": self.http_429,
                 "cache_hit_rate": (self.cache_hits + self.replay_hits) / completed,
                 "replay_hit_rate": self.replay_hits / completed,
                 "row_count": self.completed_rows,
@@ -464,6 +471,18 @@ class SofaScoreCaptureEngine:
     def _finish_result(self, result: CaptureResult, started: float) -> CaptureResult:
         self.metrics.finish(result, max(0, int((self.monotonic() - started) * 1000)))
         return result
+
+    def _source_rate_limited(self) -> None:
+        """The source answered 429: count it and let an adaptive limiter slow down.
+
+        Only responses that reached the source count here; a gateway 429
+        (``SofascoreLeaseRejected``) is raised by the transport and never
+        reaches this path, so lease concurrency does not throttle the engine.
+        """
+        self.metrics.source_rate_limited()
+        fallback = getattr(self.rate_limiter, "fallback", None)
+        if fallback is not None:
+            fallback()
 
     def authorize_request(
         self,
@@ -871,6 +890,8 @@ class SofaScoreCaptureEngine:
                 continue
 
             status = response.status_code
+            if status == 429:
+                self._source_rate_limited()
             if status in {403, 429} or status >= 500:
                 last_error = TransportError(
                     f"retryable SofaScore HTTP status {status}",
@@ -989,6 +1010,8 @@ class SofaScoreCaptureEngine:
         )
         attempts = (existing.attempts if existing else 0) + 1
         status = response.status_code
+        if status == 429:
+            self._source_rate_limited()
         if status in {403, 429} or status >= 500:
             error = TransportError(
                 f"retryable SofaScore HTTP status {status}",

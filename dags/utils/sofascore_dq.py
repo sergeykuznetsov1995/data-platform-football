@@ -40,7 +40,15 @@ MANIFEST_STATES = frozenset(
         "schema_error",
     }
 )
-REQUIRED_ACCEPTABLE_STATES = frozenset({"success", "legitimate_empty"})
+# ``not_supported`` is terminal for required endpoints too: it is written only
+# when the source genuinely does not publish the payload (a 404 under
+# ``freshness='final'`` or an explicit ``supported=False`` spec), never for
+# 403/429/5xx, which stay ``retryable_failure`` by the manifest invariant. A
+# tournament whose lineups the source does not have is therefore complete "as
+# available" rather than ``endpoint_incomplete``. Required/optional are kept as
+# two names because ``required`` still drives the coverage contract and the
+# committed-state SQL gate.
+REQUIRED_ACCEPTABLE_STATES = frozenset({"success", "legitimate_empty", "not_supported"})
 OPTIONAL_ACCEPTABLE_STATES = frozenset({"success", "legitimate_empty", "not_supported"})
 RETRYABLE_HTTP_STATUSES = frozenset({403, 429, 500, 502, 503, 504})
 
@@ -278,17 +286,31 @@ def validate_coverage_contract(doc: Any) -> None:
             f"tables.{table_name}.downstream",
             allow_empty=True,
         )
+        # One writer or several: ``bronze.sofascore_schedule`` gained a second
+        # one when the refresh lane started writing it directly, and naming
+        # only the older one made the provenance a lie (Sol round 20).
         materialized_by = spec.get("materialized_by")
-        if not isinstance(materialized_by, str) or not materialized_by.strip():
+        materializers = (
+            [materialized_by] if isinstance(materialized_by, str)
+            else materialized_by
+        )
+        if (
+            not isinstance(materializers, list)
+            or not materializers
+            or not all(
+                isinstance(item, str) and item.strip() for item in materializers
+            )
+        ):
             raise SofaScoreContractError(
                 f"tables.{table_name}.materialized_by is required"
             )
-        materializer_path = materialized_by.split("#", 1)[0]
-        if not (_REPO_ROOT / materializer_path).is_file():
-            raise SofaScoreContractError(
-                f"tables.{table_name}.materialized_by path does not exist: "
-                f"{materializer_path}"
-            )
+        for materializer in materializers:
+            materializer_path = materializer.split("#", 1)[0]
+            if not (_REPO_ROOT / materializer_path).is_file():
+                raise SofaScoreContractError(
+                    f"tables.{table_name}.materialized_by path does not exist: "
+                    f"{materializer_path}"
+                )
         write_status = spec.get("production_write_status")
         if not isinstance(write_status, str) or not write_status.strip():
             raise SofaScoreContractError(
@@ -1532,6 +1554,9 @@ def build_partition_dq_queries(
     endpoint_names = ", ".join(
         _sql_literal(endpoint) for endpoint in required_endpoints
     )
+    accepted_states = ", ".join(
+        _sql_literal(state) for state in sorted(REQUIRED_ACCEPTABLE_STATES)
+    )
     queries.append(
         DQQuery(
             name="required_endpoint_completeness",
@@ -1551,7 +1576,7 @@ def build_partition_dq_queries(
                 f"endpoint IN ({endpoint_names})), latest_manifest AS (SELECT "
                 "target_id, endpoint, status FROM ranked_manifest WHERE rn = 1) "
                 "SELECT COUNT_IF(m.status IS NULL OR m.status NOT IN "
-                "('success', 'legitimate_empty')) FROM expected x LEFT JOIN "
+                f"({accepted_states})) FROM expected x LEFT JOIN "
                 "latest_manifest m ON m.target_id = x.target_id AND "
                 "m.endpoint = x.endpoint"
             ),

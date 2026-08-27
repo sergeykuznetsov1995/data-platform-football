@@ -49,6 +49,7 @@ COMPOSE_TEST_ENV = {
     # production host layout while exercising fail-closed interpolation.
     "SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST": "/tmp/compose-test-sofascore-budget.json",
     "SOFASCORE_GATEWAY_STATE_HOST_DIR": "/tmp/compose-test-sofascore-gateway-state",
+    "SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR": "/tmp/compose-test-sofascore-all-men",
 }
 
 
@@ -197,6 +198,17 @@ class TestComposeFile:
             "0" * 64
         )
 
+    def test_sofascore_gateway_memory_limit_survives_wal_replay(self):
+        """The gateway replays its allocation WAL (~135 MiB) into memory on
+        every start; 256 MiB OOM-crashlooped recovery on 2026-07-24 and the
+        ``docker update --memory 1g`` workaround was lost on the 2026-08-23
+        recreate.  The limit must live in compose, at >= 1 GiB."""
+        cfg = _sofascore_gateway_config_json()
+        resources = cfg["services"]["sofascore_proxy_filter"]["deploy"]["resources"]
+        # Compose renders memory sizes as byte-count strings.
+        assert int(resources["limits"]["memory"]) >= 1 << 30
+        assert int(resources["reservations"]["memory"]) >= 256 << 20
+
     def test_scheduler_renders_with_exact_sofascore_artifact_bind(self):
         cfg = _compose_config_json()
         scheduler = cfg["services"]["airflow-scheduler"]
@@ -204,12 +216,20 @@ class TestComposeFile:
         artifact_target = (
             "/opt/airflow/runtime/sofascore/proxy_budget_canary.json"
         )
+        campaign_target = "/opt/airflow/runtime/sofascore/all-men"
 
         assert volumes[artifact_target]["source"] == (
             COMPOSE_TEST_ENV["SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST"]
         )
         assert volumes[artifact_target]["read_only"] is True
         assert volumes[artifact_target]["bind"].get(
+            "create_host_path", False
+        ) is False
+        assert volumes[campaign_target]["source"] == (
+            COMPOSE_TEST_ENV["SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR"]
+        )
+        assert volumes[campaign_target].get("read_only", False) is False
+        assert volumes[campaign_target]["bind"].get(
             "create_host_path", False
         ) is False
         assert "/opt/airflow/configs/proxy_filter" in volumes
@@ -224,7 +244,18 @@ class TestComposeFile:
         assert scheduler["environment"]["SOFASCORE_PROXY_BUDGET_ARTIFACT_ID"] == (
             "0" * 64
         )
-        assert scheduler["healthcheck"]["test"][0] == "CMD-SHELL"
+        # The artifact/campaign binds above stay; the healthcheck does not.
+        # This is the SHARED platform scheduler — it holds the other five
+        # sources and does not run the SofaScore contour (that lives in project
+        # ``sofascore-airflow`` with its own compose and its own healthcheck,
+        # and every SofaScore DAG registered here is paused).  Gating five
+        # foreign sources on the SofaScore gateway answering, and writing a
+        # probe file into the campaign directory every 30 s, was collateral
+        # damage (code review of PR #1216).
+        assert scheduler["healthcheck"]["test"] == [
+            "CMD-SHELL",
+            'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"',
+        ]
 
     def test_fbref_filter_renders_one_production_safety_circuit(self):
         cfg = _compose_config_json()

@@ -208,12 +208,21 @@ FBREF_DAG_IDS = frozenset(
         "dag_accept_fbref_bronze",
     }
 )
-SOFASCORE_DAG_IDS = frozenset({"dag_ingest_sofascore"})
+SOFASCORE_DAG_IDS = frozenset({
+    "dag_ingest_sofascore",
+    "dag_backfill_sofascore_all_mens",
+    "dag_refresh_sofascore_all_mens",
+})
 SOFASCORE_CANARY_DAG_IDS = frozenset({"dag_canary_sofascore_proxy"})
 # Registry discovery is a non-signed, metered JSON scan of the public catalog.
 # It carries no workload plan and no allocation: its only bound is this DagRun
 # cap, which stays zero (fail-closed) until an operator authorizes a scan.
 SOFASCORE_DISCOVERY_DAG_IDS = frozenset({"dag_discover_sofascore_registry"})
+SOFASCORE_METADATA_DAG_IDS = frozenset({
+    "dag_backfill_sofascore_all_mens",
+    "dag_refresh_sofascore_all_mens",
+    "operator_sofascore_all_mens_metadata",
+})
 SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES = 0
 # Zero is deliberately fail-closed.  ``main`` replaces it only after loading a
 # verified SofaScore canary; there is no hand-written production allowance.
@@ -234,6 +243,11 @@ MAX_ACTIVE_LEASES = 4
 # finish (#1060). Mirrors the external watchdog's LATCH_GRACE_SECONDS so an
 # in-flight client close gets its normal path first.
 LATCHED_SLOT_RECLAIM_GRACE_SECONDS = 30
+# After the local client hangs up mid-response, the down pump keeps reading the
+# provider so the remaining billed tail (and its EOF) is observed and settled
+# exactly instead of latching the lease over a few unread bytes. Each provider
+# read in that drain waits at most this long: a silent provider still latches.
+LEASE_CLIENT_HANGUP_DRAIN_SECONDS = 2.0
 LEASE_PROXY_URL = "http://proxy_filter:8900"
 LEDGER_PATH = "/opt/airflow/logs/proxy_filter/paid_requests.jsonl"
 SOFASCORE_ALLOCATION_LEDGER_PATH = (
@@ -480,6 +494,18 @@ def _source_for_dag(dag_id: str) -> str:
     if dag_id in WHOSCORED_PAID_DAG_IDS:
         return "whoscored"
     return ""
+
+
+def _source_for_lease_request(dag_id: str, requested_source: str) -> str:
+    """Authorize metadata traffic without changing the caller's identity."""
+
+    normalized_source = str(requested_source or "").strip().lower()
+    if (
+        normalized_source == "sofascore_discovery"
+        and dag_id in SOFASCORE_METADATA_DAG_IDS
+    ):
+        return "sofascore_discovery"
+    return _source_for_dag(dag_id)
 
 
 def _uses_shared_daily_budget(source: str) -> bool:
@@ -1290,6 +1316,7 @@ def _lease_host_allowed(lease: Lease | None, host: str, port: int = 443) -> bool
             "fbref",
             "sofascore",
             "sofascore_canary",
+            "sofascore_discovery",
         }
     if lease is not None and lease.source in (
         "sofascore",
@@ -1688,6 +1715,20 @@ def _lease_dagrun_budget_bytes(lease: Lease) -> int:
         if lease.workload_plan is None or lease.run_cap_bytes <= 0:
             return 0
         return lease.run_cap_bytes
+    if lease.source == "sofascore_discovery":
+        # Admission sized this lease with the discovery cap (``_create_lease``),
+        # so enforcement has to read the same number.  Falling through to
+        # ``_dagrun_budget_bytes(lease.dag_id)`` metered it against whichever
+        # cap the DAG ID maps to instead: the metadata DAGs are in
+        # ``SOFASCORE_DAG_IDS`` but NOT in ``SOFASCORE_DISCOVERY_DAG_IDS``, so a
+        # discovery lease of the refresh lane was enforced against
+        # ``SOFASCORE_DAGRUN_BUDGET_BYTES`` — the biggest single workload class
+        # of the canary artifact, ~1.2 MiB — while its sweep needs tens of MB.
+        # The lane was cut off a few dozen pages in on every run, and the bytes
+        # it did spend were charged to the production SofaScore DagRun cap
+        # while the discovery cap was never enforced at all (code review of
+        # PR #1216).
+        return SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES
     if lease.source == "whoscored":
         if lease.proxy_campaign_approval is None:
             return DEFAULT_WHOSCORED_PAID_CAP_BYTES
@@ -2913,6 +2954,71 @@ def _recover_allocation_wal() -> int:
     return recovered
 
 
+def _compact_allocation_wal(open_lease_ids: set[str]) -> tuple[int, int]:
+    """Drop the events of finished attempts so a restart replays only live ones.
+
+    Runs after ``_recover_allocation_wal`` appended ``allocation_finished`` for
+    every crash-orphaned attempt, so any lease outside ``open_lease_ids`` is
+    already durable in the allocation ledger.  Open attempts keep every event
+    verbatim.  The previous file survives as one ``<wal>.compacted.bak`` (a hard
+    link, so the WAL itself is never absent); both stay mode 0600.  Returns the
+    event counts before and after.
+    """
+
+    path = SOFASCORE_ALLOCATION_WAL_PATH
+    try:
+        before_bytes = os.path.getsize(path)
+    except FileNotFoundError:
+        return (0, 0)
+    if before_bytes == 0:
+        return (0, 0)
+    directory_path = os.path.dirname(path) or "."
+    temporary = os.path.join(
+        directory_path,
+        f".{os.path.basename(path)}.{os.getpid()}.{secrets.token_hex(8)}.tmp",
+    )
+    total = kept = after_bytes = 0
+    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as out, open(path, "rb") as stream:
+            for raw in stream:
+                total += 1
+                lease_id = str(json.loads(raw).get("lease_id") or "").strip()
+                if lease_id in open_lease_ids:
+                    out.write(raw)
+                    kept += 1
+                    after_bytes += len(raw)
+            out.flush()
+            os.fsync(out.fileno())
+        if kept == total:
+            return (total, kept)
+        backup = path + ".compacted.bak"
+        try:
+            os.unlink(backup)
+        except FileNotFoundError:
+            pass
+        os.link(path, backup)
+        os.replace(temporary, path)
+        directory = os.open(directory_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    log.info(
+        "compacted SofaScore allocation WAL: %d -> %d events (%d -> %d bytes)",
+        total,
+        kept,
+        before_bytes,
+        after_bytes,
+    )
+    return (total, kept)
+
+
 def _signed_allocation_from_request(
     metadata: Mapping[str, Any],
     *,
@@ -2977,7 +3083,7 @@ def _create_lease(
         )
     dag_id = str(metadata.get("dag_id") or "").strip()
     requested_source = str(metadata.get("source") or "").strip().lower()
-    inferred_source = _source_for_dag(dag_id)
+    inferred_source = _source_for_lease_request(dag_id, requested_source)
     if require_context and not inferred_source:
         raise ValueError("paid lease dag_id is not in the closed source allowlist")
     if requested_source and requested_source != inferred_source:
@@ -3164,6 +3270,9 @@ def _create_lease(
             expected_endpoint_labels=metadata.get("expected_endpoint_labels", ()),
         )
         dagrun_budget = proxy_campaign_approval.caps.total_provider_bytes
+    elif source == "sofascore_discovery":
+        effective_expires_at = now + ttl_seconds
+        dagrun_budget = SOFASCORE_DISCOVERY_DAGRUN_BUDGET_BYTES
     else:
         effective_expires_at = now + ttl_seconds
         dagrun_budget = _dagrun_budget_bytes(dag_id)
@@ -4201,6 +4310,9 @@ async def _pump(
     if lease is not None and budget_guard is not None:
         raise ValueError("lease and legacy budget guard are mutually exclusive")
     provider_eof_observed = False
+    # Set when the client leg failed mid-response: the provider is then drained
+    # to EOF (still metered per chunk) without forwarding anything further.
+    client_gone = False
     provider_reader_registered = lease is not None and direction == "down"
     if provider_reader_registered:
         lease.active_provider_readers += 1
@@ -4280,7 +4392,16 @@ async def _pump(
                     # scheduling semantics on Python 3.11 and 3.12.  In
                     # particular an immediate EOF cannot yield between the two
                     # tunnel pumps and manufacture reservation starvation.
-                    async with asyncio.timeout(_lease_operation_timeout(lease)):
+                    async with asyncio.timeout(
+                        _lease_operation_timeout(
+                            lease,
+                            ceiling_seconds=(
+                                LEASE_CLIENT_HANGUP_DRAIN_SECONDS
+                                if client_gone
+                                else None
+                            ),
+                        )
+                    ):
                         chunk = await reader.read(read_size)
                 else:
                     chunk = await reader.read(read_size)
@@ -4363,6 +4484,9 @@ async def _pump(
                 if pending:
                     break
                 continue
+            if client_gone:
+                # Drain: the chunk is settled above; nobody is left to read it.
+                continue
             try:
                 writer.write(chunk)
                 if lease is None:
@@ -4372,12 +4496,18 @@ async def _pump(
                         writer.drain(),
                         timeout=_lease_operation_timeout(lease),
                     )
+            except Exception:
+                if lease is None or direction != "down":
+                    raise
+                # The returned chunk is exact and already durable, but the
+                # provider StreamReader may still hold billed read-ahead. Keep
+                # reading it to EOF (bounded per read by
+                # LEASE_CLIENT_HANGUP_DRAIN_SECONDS) so that tail is settled
+                # exactly; a drain timeout or a later error still latches.
+                client_gone = True
             except BaseException:
                 if lease is not None and direction == "down":
-                    # The returned chunk is exact and already durable, but the
-                    # provider StreamReader may hold additional billed
-                    # read-ahead that can no longer be observed once the
-                    # downstream client fails or this task is cancelled.
+                    # Cancellation leaves the provider read-ahead unobservable.
                     _latch_lease_accounting_uncertainty(lease)
                 raise
             if lease is None:
@@ -4395,7 +4525,13 @@ async def _pump(
             _ACTIVE_PROVIDER_READERS = max(0, _ACTIVE_PROVIDER_READERS - 1)
             _notify_reservation_turnover()
         try:
-            writer.close()
+            if direction == "up" and writer.can_write_eof():
+                # Half-close the provider leg: it still sends its response
+                # tail and FIN, which the down pump observes as an exact EOF.
+                # _run_tunnel_pumps closes the socket once both pumps finish.
+                writer.write_eof()
+            else:
+                writer.close()
         except Exception:  # noqa: BLE001
             pass
 
@@ -4440,6 +4576,12 @@ async def _run_tunnel_pumps(
             # response bytes. Retain all remaining escrow in that handoff gap.
             _latch_lease_accounting_uncertainty(lease)
         raise
+    finally:
+        # The up pump only half-closes the provider leg (see _pump).
+        try:
+            srv_w.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _read_headers(reader: asyncio.StreamReader) -> list[bytes]:
@@ -5639,7 +5781,10 @@ async def _handle_control(
             request = json.loads(body)
             if not isinstance(request, dict):
                 raise ValueError("lease request body must be a JSON object")
-            request_source = _source_for_dag(str(request.get("dag_id") or "").strip())
+            request_source = _source_for_lease_request(
+                str(request.get("dag_id") or "").strip(),
+                str(request.get("source") or "").strip(),
+            )
             if not _control_token_valid(headers, source=request_source):
                 await _send_json(writer, 401, {"error": "invalid control token"})
                 return True
@@ -7329,6 +7474,17 @@ async def main() -> None:
         "recovered %d crash-orphaned SofaScore allocation attempts",
         recovered_allocations,
     )
+    try:
+        _compact_allocation_wal(
+            {
+                lease_id
+                for lease_id, state in _read_allocation_wal().items()
+                if not state.get("finished")
+            }
+        )
+    except Exception:
+        # Compaction is housekeeping: an uncompacted WAL still replays fine.
+        log.exception("SofaScore allocation WAL compaction failed; keeping the full WAL")
 
     pidfile = str(getattr(args, "pidfile", "/tmp/filter_proxy.pid"))
     with open(pidfile, "w") as fh:

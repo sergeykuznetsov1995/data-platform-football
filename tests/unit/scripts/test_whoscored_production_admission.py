@@ -2740,7 +2740,7 @@ def _materialize_bind_sources(rendered: Mapping[str, object], tmp_path: Path) ->
     host = tmp_path / "host"
     host.mkdir()
     writable: dict[str, Path] = {}
-    for name in ("logs", "gateway-state", "filter-state"):
+    for name in ("logs", "all-men", "gateway-state", "filter-state"):
         path = host / name
         path.mkdir()
         path.chmod(0o770)
@@ -2773,6 +2773,10 @@ def _materialize_bind_sources(rendered: Mapping[str, object], tmp_path: Path) ->
         ): fotmob_admission,
         ("airflow-scheduler", "/opt/airflow/logs"): writable["logs"],
         ("airflow-scheduler", "/opt/airflow/proxys.txt"): proxy_file,
+        (
+            "airflow-scheduler",
+            "/opt/airflow/runtime/sofascore/all-men",
+        ): writable["all-men"],
         (
             "airflow-scheduler",
             "/opt/airflow/runtime/sofascore/proxy_budget_canary.json",

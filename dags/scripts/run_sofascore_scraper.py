@@ -412,9 +412,11 @@ def _merge_live_traffic(parts):
         "request_count": 0,
         "endpoint_request_count": 0,
         "source_request_count": 0,
+        "http_429": 0,
         "endpoint_provider_bytes": {},
         "endpoint_request_provider_bytes": {},
         "proxy_exit_hash": None,
+        "lease_relaunches": 0,
     }
     for part in parts:
         for field in (
@@ -426,6 +428,8 @@ def _merge_live_traffic(parts):
             "request_count",
             "endpoint_request_count",
             "source_request_count",
+            "lease_relaunches",
+            "http_429",
         ):
             merged[field] += int(part.get(field, 0) or 0)
         for endpoint, value in (part.get("endpoint_provider_bytes") or {}).items():
@@ -878,7 +882,11 @@ def _run_match_capture(
                 )
             else:
                 from scrapers.sofascore.live_capture import capture_live_specs
-                from scrapers.sofascore.pipeline import replay_event_specs
+                from scrapers.sofascore.pipeline import (
+                    apply_endpoint_exclusions,
+                    replay_event_specs,
+                    scope_probe_exclusions,
+                )
                 from scrapers.sofascore.workload_runtime import target_ids
 
                 live_specs = [
@@ -897,6 +905,11 @@ def _run_match_capture(
                 else:
                     remaining_specs = {spec.key: spec for spec in live_specs}
                     traffic_parts = []
+                    # A2: the first allocation probes the scope with the full
+                    # endpoint set; endpoints the source published for none
+                    # of its matches are not requested for the later ones.
+                    # A repair (--force-replace) re-captures 404s (#1039).
+                    excluded = None
                     for allocation in workload_allocations:
                         batch_ids = set(target_ids(allocation))
                         batch_specs = [
@@ -904,27 +917,79 @@ def _run_match_capture(
                             for spec in live_specs
                             if spec.key.target_id in batch_ids
                         ]
-                        if not batch_specs:
-                            continue
-                        captured, batch_traffic = capture_live_specs(
-                            capture_runtime,
-                            batch_specs,
-                            canonical_url=canonical_url,
-                            scope=f"{league}:{season_short}",
-                            entity=ENTITY_MATCH_CAPTURE,
-                            workload_plan=workload_plan,
-                            allocation_id=allocation.allocation_id,
-                            attempt_id=(
-                                os.environ.get("AIRFLOW_CTX_TRY_NUMBER", "1")
-                                + ":"
-                                + allocation.allocation_id
-                            ),
-                        )
-                        pipeline_results.extend(captured)
-                        traffic_parts.append(batch_traffic)
-                        for spec in batch_specs:
-                            remaining_specs.pop(spec.key, None)
+                        if excluded:
+                            batch_specs = apply_endpoint_exclusions(
+                                batch_specs,
+                                excluded,
+                                raw_store=capture_runtime.raw_store,
+                            )
+                        if batch_specs:
+                            captured, batch_traffic = capture_live_specs(
+                                capture_runtime,
+                                batch_specs,
+                                canonical_url=canonical_url,
+                                scope=f"{league}:{season_short}",
+                                entity=ENTITY_MATCH_CAPTURE,
+                                workload_plan=workload_plan,
+                                allocation_id=allocation.allocation_id,
+                                attempt_id=(
+                                    os.environ.get("AIRFLOW_CTX_TRY_NUMBER", "1")
+                                    + ":"
+                                    + allocation.allocation_id
+                                ),
+                            )
+                            pipeline_results.extend(captured)
+                            traffic_parts.append(batch_traffic)
+                            for spec in batch_specs:
+                                remaining_specs.pop(spec.key, None)
+                        if excluded is None and not force_replace:
+                            # The verdict is read from the manifest for every
+                            # endpoint of the probe allocation's matches, not
+                            # from the live specs: on an Airflow retry the
+                            # probe's terminal 404s are no longer live, and
+                            # the evidence must still count.
+                            probe_specs = [
+                                build_event_spec(
+                                    source_tournament_id=source_tournament_id,
+                                    source_season_id=source_season_id,
+                                    target_id=match_id,
+                                    endpoint=endpoint,
+                                    freshness_key=freshness_key,
+                                    paid_proxy=True,
+                                )
+                                for match_id in target_ids(allocation)
+                                for endpoint in EVENT_PATHS
+                            ]
+                            excluded = scope_probe_exclusions(
+                                capture_runtime.manifest_store, probe_specs
+                            )
+                            results["excluded_endpoints"] = sorted(excluded)
+                            if excluded:
+                                logger.info(
+                                    "scope probe: %s publishes no %s — not "
+                                    "requested for the remaining allocations",
+                                    f"{league}:{season_short}",
+                                    ", ".join(sorted(excluded)),
+                                )
                     if remaining_specs:
+                        if not workload_allocations and not force_replace:
+                            # C5: a signed plan with no allocation for this
+                            # partition is a league the planner dropped (C4:
+                            # season raw incomplete / planning failed) — its
+                            # pending endpoints without raw cannot be replay
+                            # hits.  Name that instead of an OfflineReplayMiss
+                            # on the first spec.
+                            from scrapers.sofascore.raw_store import RawPayloadNotFound
+
+                            for spec in remaining_specs.values():
+                                try:
+                                    capture_runtime.raw_store.load_bytes(spec.raw_target)
+                                except RawPayloadNotFound:
+                                    raise RuntimeError(
+                                        "partition was dropped by the planner (no "
+                                        "signed allocations); see "
+                                        "prepare_sofascore_target_plan stderr"
+                                    ) from None
                         # Unallocated targets may only be local replay hits.
                         pipeline_results.extend(
                             replay_event_specs(
@@ -1003,180 +1068,232 @@ def _run_match_capture(
             # Every captured frame is a delta over immutable finished matches.
             # Iceberg MERGE updates/inserts only its natural keys: no pandas
             # full-partition read, no partition rewrite, and no shrink window.
-            if not stats_empty:
-                spath = scraper.save_to_iceberg(
-                    df=stats_df,
-                    table_name="sofascore_match_stats",
-                    partition_cols=["league", "season"],
-                    natural_keys=[
-                        "league",
-                        "season",
-                        "match_id",
-                        "period",
-                        "stat_group",
-                        "statistic_key",
-                    ],
-                )
-                results["tables"].append(spath)
-                results["match_stats_rows"] = int(len(stats_df))
-                results["match_stats_matches"] = int(stats_df["match_id"].nunique())
-                logger.info(
-                    "Saved %d match_stats rows -> %s",
-                    results["match_stats_rows"],
-                    spath,
-                )
+            # One writer-lock span serializes every Bronze MERGE of the phase
+            # across processes (D5); the manifest below stays outside it.
+            from scrapers.sofascore.writer_lock import bronze_writer_lock
 
-            # event_shotmap is a required endpoint state. A schema-valid empty
-            # payload has no rows to merge; any non-empty payload is committed
-            # before the completion markers below.
-            if not shot_empty:
-                shpath = scraper.save_to_iceberg(
-                    df=shot_df,
-                    table_name="sofascore_event_shotmap",
-                    partition_cols=["league", "season"],
-                    natural_keys=["league", "season", "match_id", "shot_id"],
-                )
-                results["tables"].append(shpath)
-                results["shotmap_rows"] = int(len(shot_df))
-                results["shotmap_matches"] = int(shot_df["match_id"].nunique())
-                logger.info(
-                    "Saved %d shotmap rows -> %s", results["shotmap_rows"], shpath
-                )
-
-            # venue (#753) — one row per match from the SAME capture pass;
-            # full-state refresh like the others. Best-effort: empty when the
-            # event payload carried no venue.
-            if not venue_empty:
-                vpath = scraper.save_to_iceberg(
-                    df=venue_df,
-                    table_name="sofascore_venue",
-                    partition_cols=["league", "season"],
-                    natural_keys=["league", "season", "game_id"],
-                )
-                results["tables"].append(vpath)
-                results["venue_rows"] = int(len(venue_df))
-                results["venue_matches"] = int(venue_df["game_id"].nunique())
-                logger.info("Saved %d venue rows -> %s", results["venue_rows"], vpath)
-
-            if not event_empty:
-                evpath = scraper.save_to_iceberg(
-                    df=event_df,
-                    table_name="sofascore_events",
-                    partition_cols=["league", "season"],
-                    natural_keys=["league", "season", "match_id"],
-                )
-                results["tables"].append(evpath)
-                results["event_rows"] = int(len(event_df))
-
-            if not participant_empty:
-                eppath = scraper.save_to_iceberg(
-                    df=participant_df,
-                    table_name="sofascore_event_participants",
-                    partition_cols=["league", "season"],
-                    natural_keys=[
-                        "league",
-                        "season",
-                        "match_id",
-                        "team_id",
-                    ],
-                )
-                results["tables"].append(eppath)
-                results["participant_rows"] = int(len(participant_df))
-
-            if not incident_empty:
-                ipath = scraper.save_to_iceberg(
-                    df=incident_df,
-                    table_name="sofascore_incidents",
-                    partition_cols=["league", "season"],
-                    natural_keys=[
-                        "league",
-                        "season",
-                        "match_id",
-                        "incident_id",
-                    ],
-                )
-                results["tables"].append(ipath)
-                results["incident_rows"] = int(len(incident_df))
-                results["incident_matches"] = int(incident_df["match_id"].nunique())
-
-            # Save the two lineup-derived data tables after optional payloads;
-            # the explicit status manifest below is the only completion marker.
-            if not lineup_empty:
-                lpath = scraper.save_to_iceberg(
-                    df=lineup_df,
-                    table_name="sofascore_lineups",
-                    partition_cols=["league", "season"],
-                    natural_keys=[
-                        "league",
-                        "season",
-                        "match_id",
-                        "player_id",
-                    ],
-                )
-                results["tables"].append(lpath)
-                results["lineup_rows"] = int(len(lineup_df))
-                results["lineup_matches"] = int(lineup_df["match_id"].nunique())
-                if "is_unused_substitute" in lineup_df.columns:
-                    results["unused_substitutes"] = int(
-                        lineup_df["is_unused_substitute"]
-                        .fillna(False)
-                        .astype(bool)
-                        .sum()
+            with bronze_writer_lock():
+                if not stats_empty:
+                    spath = scraper.save_to_iceberg(
+                        df=stats_df,
+                        table_name="sofascore_match_stats",
+                        partition_cols=["league", "season"],
+                        natural_keys=[
+                            "league",
+                            "season",
+                            "match_id",
+                            "period",
+                            "stat_group",
+                            "statistic_key",
+                        ],
+                    )
+                    results["tables"].append(spath)
+                    results["match_stats_rows"] = int(len(stats_df))
+                    results["match_stats_matches"] = int(stats_df["match_id"].nunique())
+                    logger.info(
+                        "Saved %d match_stats rows -> %s",
+                        results["match_stats_rows"],
+                        spath,
                     )
 
-            if not eps_empty:
-                epath = scraper.save_to_iceberg(
-                    df=eps_df,
-                    table_name="sofascore_event_player_stats",
-                    partition_cols=["league", "season"],
-                    natural_keys=[
-                        "league",
-                        "season",
-                        "match_id",
-                        "player_id",
-                    ],
-                )
-                results["tables"].append(epath)
-                results["eps_rows"] = int(len(eps_df))
-                results["eps_matches"] = int(eps_df["match_id"].nunique())
-                logger.info("Saved %d eps rows -> %s", results["eps_rows"], epath)
+                # event_shotmap is a required endpoint state. A schema-valid empty
+                # payload has no rows to merge; any non-empty payload is committed
+                # before the completion markers below.
+                if not shot_empty:
+                    shpath = scraper.save_to_iceberg(
+                        df=shot_df,
+                        table_name="sofascore_event_shotmap",
+                        partition_cols=["league", "season"],
+                        natural_keys=["league", "season", "match_id", "shot_id"],
+                    )
+                    results["tables"].append(shpath)
+                    results["shotmap_rows"] = int(len(shot_df))
+                    results["shotmap_matches"] = int(shot_df["match_id"].nunique())
+                    logger.info(
+                        "Saved %d shotmap rows -> %s", results["shotmap_rows"], shpath
+                    )
 
-            # Ratings remains the primary data table, but is not used as status.
-            if not ratings_empty:
-                rpath = scraper.save_to_iceberg(
-                    df=ratings_df,
-                    table_name="sofascore_player_ratings",
-                    partition_cols=["league", "season"],
-                    natural_keys=[
-                        "league",
-                        "season",
-                        "match_id",
-                        "player_id",
-                    ],
-                )
-                results["tables"].append(rpath)
-                results["rows"] = int(len(ratings_df))
-                results["matches_with_ratings"] = int(ratings_df["match_id"].nunique())
-                logger.info("Saved %d rating rows -> %s", results["rows"], rpath)
+                # venue (#753) — one row per match from the SAME capture pass;
+                # full-state refresh like the others. Best-effort: empty when the
+                # event payload carried no venue.
+                if not venue_empty:
+                    vpath = scraper.save_to_iceberg(
+                        df=venue_df,
+                        table_name="sofascore_venue",
+                        partition_cols=["league", "season"],
+                        natural_keys=["league", "season", "game_id"],
+                    )
+                    results["tables"].append(vpath)
+                    results["venue_rows"] = int(len(venue_df))
+                    results["venue_matches"] = int(venue_df["game_id"].nunique())
+                    logger.info("Saved %d venue rows -> %s", results["venue_rows"], vpath)
 
-            # Compatibility status must commit before the canonical long
-            # manifest becomes terminal. If this write fails, exact raw stays
-            # replayable and the retry repairs status with zero source traffic.
-            if not status_empty and not pipeline_results:
-                cpath = scraper.save_to_iceberg(
-                    df=status_df,
-                    table_name=_MATCH_CAPTURE_STATUS_TABLE,
-                    partition_cols=["league", "season"],
-                    natural_keys=["league", "season", "match_id"],
-                )
-                results["tables"].append(cpath)
-                results["capture_status_rows"] = int(len(status_df))
-                results["matches_complete"] = int(
-                    status_df.loc[
-                        status_df["capture_complete"].fillna(False).astype(bool),
-                        "match_id",
-                    ].nunique()
-                )
+                if not event_empty:
+                    evpath = scraper.save_to_iceberg(
+                        df=event_df,
+                        table_name="sofascore_events",
+                        partition_cols=["league", "season"],
+                        natural_keys=["league", "season", "match_id"],
+                    )
+                    results["tables"].append(evpath)
+                    results["event_rows"] = int(len(event_df))
+
+                if not participant_empty:
+                    eppath = scraper.save_to_iceberg(
+                        df=participant_df,
+                        table_name="sofascore_event_participants",
+                        partition_cols=["league", "season"],
+                        natural_keys=[
+                            "league",
+                            "season",
+                            "match_id",
+                            "team_id",
+                        ],
+                    )
+                    results["tables"].append(eppath)
+                    results["participant_rows"] = int(len(participant_df))
+
+                if not incident_empty:
+                    ipath = scraper.save_to_iceberg(
+                        df=incident_df,
+                        table_name="sofascore_incidents",
+                        partition_cols=["league", "season"],
+                        natural_keys=[
+                            "league",
+                            "season",
+                            "match_id",
+                            "incident_id",
+                        ],
+                    )
+                    results["tables"].append(ipath)
+                    results["incident_rows"] = int(len(incident_df))
+                    results["incident_matches"] = int(incident_df["match_id"].nunique())
+
+                # Save the two lineup-derived data tables after optional payloads;
+                # the explicit status manifest below is the only completion marker.
+                if not lineup_empty:
+                    lpath = scraper.save_to_iceberg(
+                        df=lineup_df,
+                        table_name="sofascore_lineups",
+                        partition_cols=["league", "season"],
+                        natural_keys=[
+                            "league",
+                            "season",
+                            "match_id",
+                            "player_id",
+                        ],
+                    )
+                    results["tables"].append(lpath)
+                    results["lineup_rows"] = int(len(lineup_df))
+                    results["lineup_matches"] = int(lineup_df["match_id"].nunique())
+                    if "is_unused_substitute" in lineup_df.columns:
+                        results["unused_substitutes"] = int(
+                            lineup_df["is_unused_substitute"]
+                            .fillna(False)
+                            .astype(bool)
+                            .sum()
+                        )
+
+                if not eps_empty:
+                    epath = scraper.save_to_iceberg(
+                        df=eps_df,
+                        table_name="sofascore_event_player_stats",
+                        partition_cols=["league", "season"],
+                        natural_keys=[
+                            "league",
+                            "season",
+                            "match_id",
+                            "player_id",
+                        ],
+                    )
+                    results["tables"].append(epath)
+                    results["eps_rows"] = int(len(eps_df))
+                    results["eps_matches"] = int(eps_df["match_id"].nunique())
+                    logger.info("Saved %d eps rows -> %s", results["eps_rows"], epath)
+
+                # Ratings remains the primary data table, but is not used as status.
+                if not ratings_empty:
+                    rpath = scraper.save_to_iceberg(
+                        df=ratings_df,
+                        table_name="sofascore_player_ratings",
+                        partition_cols=["league", "season"],
+                        natural_keys=[
+                            "league",
+                            "season",
+                            "match_id",
+                            "player_id",
+                        ],
+                    )
+                    results["tables"].append(rpath)
+                    results["rows"] = int(len(ratings_df))
+                    results["matches_with_ratings"] = int(ratings_df["match_id"].nunique())
+                    logger.info("Saved %d rating rows -> %s", results["rows"], rpath)
+
+                # Compatibility status must commit before the canonical long
+                # manifest becomes terminal. If this write fails, exact raw stays
+                # replayable and the retry repairs status with zero source traffic.
+                if not status_empty and not pipeline_results:
+                    cpath = scraper.save_to_iceberg(
+                        df=status_df,
+                        table_name=_MATCH_CAPTURE_STATUS_TABLE,
+                        partition_cols=["league", "season"],
+                        natural_keys=["league", "season", "match_id"],
+                    )
+                    results["tables"].append(cpath)
+                    results["capture_status_rows"] = int(len(status_df))
+                    results["matches_complete"] = int(
+                        status_df.loc[
+                            status_df["capture_complete"].fillna(False).astype(bool),
+                            "match_id",
+                        ].nunique()
+                    )
+
+                if pipeline_results:
+                    from scrapers.sofascore.adapters import (
+                        project_legacy_match_status,
+                    )
+
+                    compatibility_rows = project_legacy_match_status(
+                        _complete_manifest_records_for_projection(
+                            capture_runtime.manifest_store,
+                            endpoint_specs,
+                            pipeline_results,
+                        ),
+                        league=league,
+                        season=season_short,
+                        endpoints=(
+                            "event",
+                            "lineups",
+                            "statistics",
+                            "shotmap",
+                            "incidents",
+                        ),
+                    )
+                    if not compatibility_rows:
+                        raise RuntimeError(
+                            "long manifest cannot finalize without compatibility status"
+                        )
+                    if compatibility_rows:
+                        import pandas as pd
+
+                        compatibility = scraper._add_metadata(
+                            pd.DataFrame(compatibility_rows),
+                            "match_capture_status",
+                        )
+                        cpath = scraper.save_to_iceberg(
+                            df=compatibility,
+                            table_name=_MATCH_CAPTURE_STATUS_TABLE,
+                            partition_cols=["league", "season"],
+                            natural_keys=["league", "season", "match_id"],
+                        )
+                        results["tables"].append(cpath)
+                        results["capture_status_rows"] = len(compatibility)
+                        results["matches_complete"] = int(
+                            compatibility.loc[
+                                compatibility["capture_complete"].astype(bool),
+                                "match_id",
+                            ].nunique()
+                        )
 
             if pipeline_results:
                 from dags.utils.sofascore_dq import (
@@ -1187,52 +1304,6 @@ def _run_match_capture(
                     finalize_materialized_results,
                     promote_repaired_results,
                 )
-
-                from scrapers.sofascore.adapters import (
-                    project_legacy_match_status,
-                )
-
-                compatibility_rows = project_legacy_match_status(
-                    _complete_manifest_records_for_projection(
-                        capture_runtime.manifest_store,
-                        endpoint_specs,
-                        pipeline_results,
-                    ),
-                    league=league,
-                    season=season_short,
-                    endpoints=(
-                        "event",
-                        "lineups",
-                        "statistics",
-                        "shotmap",
-                        "incidents",
-                    ),
-                )
-                if not compatibility_rows:
-                    raise RuntimeError(
-                        "long manifest cannot finalize without compatibility status"
-                    )
-                if compatibility_rows:
-                    import pandas as pd
-
-                    compatibility = scraper._add_metadata(
-                        pd.DataFrame(compatibility_rows),
-                        "match_capture_status",
-                    )
-                    cpath = scraper.save_to_iceberg(
-                        df=compatibility,
-                        table_name=_MATCH_CAPTURE_STATUS_TABLE,
-                        partition_cols=["league", "season"],
-                        natural_keys=["league", "season", "match_id"],
-                    )
-                    results["tables"].append(cpath)
-                    results["capture_status_rows"] = len(compatibility)
-                    results["matches_complete"] = int(
-                        compatibility.loc[
-                            compatibility["capture_complete"].astype(bool),
-                            "match_id",
-                        ].nunique()
-                    )
 
                 finalize_materialized_results(capture_runtime, pipeline_results)
                 promote_repaired_results(capture_runtime, pipeline_results)
@@ -1510,14 +1581,18 @@ def _run_player_capture(
                 expected_source_season_id=source_season_id,
                 expected_canonical_season=season_short,
             ).require()
-            upath = scraper.save_to_iceberg(
-                df=universe_df,
-                table_name="sofascore_player_universe",
-                partition_cols=["league", "season"],
-                natural_keys=["league", "season", "player_id"],
-            )
-            results["tables"].append(upath)
-            results["universe_players"] = len(universe_df)
+            # D5: its own writer-lock span; the paid batch below runs unlocked.
+            from scrapers.sofascore.writer_lock import bronze_writer_lock
+
+            with bronze_writer_lock():
+                upath = scraper.save_to_iceberg(
+                    df=universe_df,
+                    table_name="sofascore_player_universe",
+                    partition_cols=["league", "season"],
+                    natural_keys=["league", "season", "player_id"],
+                )
+                results["tables"].append(upath)
+                results["universe_players"] = len(universe_df)
 
             canonical_player_freshness = os.environ.get(
                 "SOFASCORE_PLAYER_FRESHNESS_KEY", ""
@@ -1646,31 +1721,32 @@ def _run_player_capture(
                         expected_canonical_season=season_short,
                     ).require()
 
-            ppath = scraper.save_to_iceberg(
-                df=profile_df,
-                table_name="sofascore_player_profile",
-                partition_cols=["league", "season"],
-                natural_keys=["league", "season", "player_id"],
-            )
-            results["tables"].append(ppath)
-            results["rows"] = len(profile_df)
-            results["profile_players"] = profile_df["player_id"].nunique()
-            if not season_df.empty:
-                spath = scraper.save_to_iceberg(
-                    df=season_df,
-                    table_name="sofascore_player_season_stats",
+            with bronze_writer_lock():
+                ppath = scraper.save_to_iceberg(
+                    df=profile_df,
+                    table_name="sofascore_player_profile",
                     partition_cols=["league", "season"],
-                    natural_keys=[
-                        "league",
-                        "season",
-                        "player_id",
-                        "unique_tournament_id",
-                        "sofascore_season_id",
-                    ],
+                    natural_keys=["league", "season", "player_id"],
                 )
-                results["tables"].append(spath)
-                results["season_stats_rows"] = len(season_df)
-                results["season_stats_players"] = season_df["player_id"].nunique()
+                results["tables"].append(ppath)
+                results["rows"] = len(profile_df)
+                results["profile_players"] = profile_df["player_id"].nunique()
+                if not season_df.empty:
+                    spath = scraper.save_to_iceberg(
+                        df=season_df,
+                        table_name="sofascore_player_season_stats",
+                        partition_cols=["league", "season"],
+                        natural_keys=[
+                            "league",
+                            "season",
+                            "player_id",
+                            "unique_tournament_id",
+                            "sofascore_season_id",
+                        ],
+                    )
+                    results["tables"].append(spath)
+                    results["season_stats_rows"] = len(season_df)
+                    results["season_stats_players"] = season_df["player_id"].nunique()
 
             finalize_materialized_results(capture_runtime, replayed)
             remaining = endpoint_resume_plan(capture_runtime.manifest_store, specs)
@@ -1915,7 +1991,12 @@ def _run_season_capture_engine(
                 "offline season replay did not cover every planned endpoint"
             )
 
-        with SofaScoreScraper(leagues=[league], seasons=[season]) as scraper:
+        from scrapers.sofascore.writer_lock import bronze_writer_lock
+
+        # D5: both MERGEs under one writer-lock span; the manifest stays outside.
+        with SofaScoreScraper(
+            leagues=[league], seasons=[season]
+        ) as scraper, bronze_writer_lock():
             # The season endpoints are one atomic logical capture. Even a
             # compatibility ``--entity schedule``/``league_table`` invocation
             # publishes both normalized datasets before their shared manifest
@@ -1959,9 +2040,18 @@ def _run_season_capture_engine(
             paid_proxy=True,
             max_pages=_season_max_pages(),
         )
-        if not committed.complete:
+        # `match_phase_ready`, not `complete`: a referee profile is an
+        # attribute of the match, discovered from event pages and captured on
+        # a later run, so one still pending is not a failed season commit.
+        if not committed.match_phase_ready:
             raise RuntimeError(
                 "season manifest stayed nonterminal after successful Bronze MERGEs"
+            )
+        if committed.pending_keys:
+            logger.warning(
+                "season committed with %d referee profile(s) still pending: %s",
+                len(committed.pending_keys),
+                ", ".join(key.stable_id() for key in committed.pending_keys),
             )
         promote_repaired_results(
             capture_runtime,
@@ -1973,7 +2063,7 @@ def _run_season_capture_engine(
             ),
         )
         _flush_manifest_store(capture_runtime.manifest_store)
-        results["pending_endpoints"] = 0
+        results["pending_endpoints"] = len(committed.pending_keys)
         results["endpoint_completeness"] = 1.0
         results["traffic"] = _logical_capture_traffic(
             capture_runtime.engine,
@@ -2034,7 +2124,14 @@ def _load_runtime_workload_plan(
     if offline_replay:
         return None, ()
     airflow_dag_id = os.environ.get("AIRFLOW_CTX_DAG_ID", "").strip()
-    production = airflow_dag_id == "dag_ingest_sofascore"
+    production = airflow_dag_id in {
+        "dag_ingest_sofascore",
+        "dag_backfill_sofascore_all_mens",
+        # The refresh lane runs the same paid match phase and was missing here,
+        # so a broken plan hand-off would have fallen back to an unplanned
+        # capture instead of failing closed (Sol round 12, finding 3).
+        "dag_refresh_sofascore_all_mens",
+    }
     if not path:
         if production:
             raise RuntimeError("production SofaScore capture requires --workload-plan")
@@ -2051,9 +2148,11 @@ def _load_runtime_workload_plan(
         raise RuntimeError(
             f"workload plan dag_id={plan.dag_id!r} does not match {expected_dag_id!r}"
         )
+    # SOFASCORE_RUN_ID is the logical run a scope cycle planned under; it may
+    # narrow one Airflow DagRun to a single scope (history lane, batch > 1).
     base_run_id = (
-        os.environ.get("AIRFLOW_CTX_DAG_RUN_ID")
-        or os.environ.get("SOFASCORE_RUN_ID")
+        os.environ.get("SOFASCORE_RUN_ID")
+        or os.environ.get("AIRFLOW_CTX_DAG_RUN_ID")
         or ""
     ).strip()
     if base_run_id and plan.run_id not in {
@@ -2353,8 +2452,8 @@ def main(argv=None):
 
         capture_runtime = build_capture_runtime(
             run_id=(
-                os.environ.get("AIRFLOW_CTX_DAG_RUN_ID")
-                or os.environ.get("SOFASCORE_RUN_ID")
+                os.environ.get("SOFASCORE_RUN_ID")
+                or os.environ.get("AIRFLOW_CTX_DAG_RUN_ID")
                 or f"manual-{os.getpid()}"
             ),
             task_id=(os.environ.get("AIRFLOW_CTX_TASK_ID") or f"cli-{entity}"),

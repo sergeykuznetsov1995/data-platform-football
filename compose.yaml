@@ -840,6 +840,11 @@ services:
         bind:
           create_host_path: false
       - type: bind
+        source: ${SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR:?set the durable SofaScore all-men campaign directory}
+        target: /opt/airflow/runtime/sofascore/all-men
+        bind:
+          create_host_path: false
+      - type: bind
         source: ./configs/airflow/webserver_config.py
         target: /opt/airflow/webserver_config.py
         read_only: true
@@ -905,6 +910,15 @@ services:
         condition: service_completed_successfully
       airflow-webserver:
         condition: service_healthy
+    # This is the SHARED platform scheduler: it holds the other five sources,
+    # and the SofaScore contour runs on its own scheduler in project
+    # ``sofascore-airflow`` (its own compose, its own healthcheck) — every
+    # SofaScore DAG registered here is paused.  A SofaScore-specific preflight
+    # was wired in here and gated all five other sources on the SofaScore
+    # gateway answering and ``snapshot.json`` being present, while writing a
+    # probe file into the campaign directory every 30 s — for a contour this
+    # scheduler does not run.  The SofaScore runtime preflight belongs to the
+    # SofaScore scheduler, not to this one (code review of PR #1216).
     healthcheck:
       test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
       interval: 30s

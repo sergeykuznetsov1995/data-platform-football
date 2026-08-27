@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,7 +21,6 @@ from scrapers.sofascore.capture_engine import (
 from scrapers.sofascore.manifest import (
     EndpointManifest,
     InMemoryManifestStore,
-    ManifestKey,
     ManifestStatus,
 )
 from scrapers.sofascore.pipeline import (
@@ -41,7 +41,8 @@ from scrapers.sofascore.season_pipeline import (
     build_squad_spec,
     build_standings_total_spec,
     SeasonPartitionPlan,
-    _is_mutable_schedule_column,
+    _SCHEDULE_IDENTITY_COLUMNS,
+    _is_schedule_identity_conflict,
     materialize_season_partition,
     plan_season_partition,
     replay_season_partition,
@@ -67,6 +68,11 @@ FIXTURE_PATHS = {
 }
 PLAYER_EVIDENCE_CASES = FIXTURES / "sofascore_season_76986_player_evidence_cases.json"
 CUP_BRACKET_NEXT_PAGE = FIXTURES / "sofascore_season_76986_cup_schedule_next_0.json"
+BRONZE_SCHEDULE_COLUMNS = sorted(
+    json.loads((FIXTURES / "bronze_schemas.json").read_text(encoding="utf-8"))[
+        "tables"
+    ]["bronze.sofascore_schedule"]["columns"]
+)
 
 
 class UnlimitedLimiter:
@@ -1410,10 +1416,81 @@ def test_runner_offline_season_replay_merges_then_noops_without_browser(
 
 
 @pytest.mark.unit
-def test_runner_live_season_uses_proven_slug_url_and_committed_completeness(
-    tmp_path,
-    monkeypatch,
-):
+def test_runner_season_merges_bronze_inside_the_writer_lock(tmp_path, monkeypatch):
+    """D5: both season MERGEs run under one writer-lock span; the manifest is
+    finalized only after the lock is released."""
+    from dags.scripts import run_sofascore_scraper as runner
+    from scrapers.sofascore import writer_lock
+
+    raw_store = _raw_store(tmp_path)
+    manifest = InMemoryManifestStore()
+    _complete_plan_with_expansion_raw(raw_store, manifest)
+    engine, transport = _engine(
+        tmp_path,
+        raw_store=raw_store,
+        manifest_store=manifest,
+        sink=DeferredCaptureSink(),
+    )
+    runtime = CaptureRuntime(engine, manifest, raw_store)
+    monkeypatch.setenv("SOFASCORE_SEASON_FRESHNESS_KEY", FRESHNESS)
+    monkeypatch.setattr(
+        runner,
+        "_source_context",
+        lambda *args: (TOURNAMENT_ID, SEASON_ID),
+    )
+    events = []
+    terminal_at_lock_exit = []
+
+    @contextmanager
+    def fake_lock(environ=None, **_kwargs):
+        events.append("lock:enter")
+        try:
+            yield True
+        finally:
+            terminal_at_lock_exit.append(
+                all(record.is_terminal for record in manifest._records.values())
+            )
+            events.append("lock:exit")
+
+    monkeypatch.setattr(writer_lock, "bronze_writer_lock", fake_lock)
+    scraper = MagicMock()
+    scraper.__enter__.return_value = scraper
+    scraper.__exit__.return_value = False
+    scraper._add_metadata.side_effect = lambda frame, entity: frame.assign(
+        _entity_type=entity,
+        _ingested_at="fixture",
+    )
+
+    def save(**kwargs):
+        events.append("save:" + kwargs["table_name"])
+        return "iceberg.bronze." + kwargs["table_name"]
+
+    scraper.save_to_iceberg.side_effect = save
+
+    with patch("scrapers.sofascore.SofaScoreScraper", return_value=scraper):
+        rc = runner._run_legacy(
+            leagues=["ENG-Premier League"],
+            season=2025,
+            output_path=str(tmp_path / "season-lock.json"),
+            capture_runtime=runtime,
+            workload_plan=None,
+            offline_replay=True,
+        )
+
+    assert rc == 0
+    assert transport.calls == 0
+    assert events == [
+        "lock:enter",
+        "save:sofascore_schedule",
+        "save:sofascore_league_table",
+        "lock:exit",
+    ]
+    assert terminal_at_lock_exit == [False]
+
+
+def _live_season_run(tmp_path, monkeypatch, committed):
+    """Drive the season runner through one live capture whose committed
+    replan is ``committed``; returns (rc, live kwargs, results payload)."""
     from dags.scripts import run_sofascore_scraper as runner
 
     key = SimpleNamespace(stable_id=lambda: "season-key")
@@ -1422,8 +1499,9 @@ def test_runner_live_season_uses_proven_slug_url_and_committed_completeness(
     def plan(*, complete, missing, pending):
         return SimpleNamespace(
             complete=complete,
-            # These stubs carry no referee endpoint, so the player-phase view
-            # of readiness is the same as `complete` (mirror the real plan).
+            # These stubs carry no referee endpoint, so every readiness view
+            # is the same as `complete` (mirror the real plan).
+            match_phase_ready=complete,
             player_universe_ready=complete,
             specs=(spec,),
             missing_raw_keys=(key,) if missing else (),
@@ -1435,7 +1513,6 @@ def test_runner_live_season_uses_proven_slug_url_and_committed_completeness(
 
     initial = plan(complete=False, missing=True, pending=True)
     expanded = plan(complete=False, missing=False, pending=True)
-    committed = plan(complete=True, missing=False, pending=False)
     engine = SimpleNamespace(
         budget=object(),
         run_id="run-1",
@@ -1519,14 +1596,53 @@ def test_runner_live_season_uses_proven_slug_url_and_committed_completeness(
             workload_plan=None,
             offline_replay=False,
         )
+    payload = json.loads(output.read_text(encoding="utf-8")) if output.exists() else {}
+    return rc, captured, payload
+
+
+@pytest.mark.unit
+def test_runner_live_season_uses_proven_slug_url_and_committed_completeness(
+    tmp_path,
+    monkeypatch,
+):
+    key = SimpleNamespace(stable_id=lambda: "season-key")
+    committed = SimpleNamespace(
+        complete=True,
+        match_phase_ready=True,
+        specs=(SimpleNamespace(key=key),),
+        missing_raw_keys=(),
+        pending_keys=(),
+    )
+
+    rc, captured, payload = _live_season_run(tmp_path, monkeypatch, committed)
 
     assert rc == 0
     assert captured["canonical_url"] == (
         "https://www.sofascore.com/tournament/premier-league/17"
     )
-    payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["endpoint_completeness"] == 1.0
     assert payload["traffic"]["endpoint_completeness"] == 1.0
+
+
+@pytest.mark.unit
+def test_runner_live_season_tolerates_a_pending_referee_profile_after_commit(
+    tmp_path, monkeypatch, caplog
+):
+    """C6: the committed replan may still carry a pending referee profile
+    (discovered from event pages, stuck on 410/403 or a canonicalised id) —
+    that is not the season manifest failing to commit, so the runner reports
+    it and exits green instead of failing the league every day."""
+    committed = _plan_with_missing(pending=("referee_profile",))
+    assert committed.complete is False
+
+    with caplog.at_level("WARNING"):
+        rc, _captured, payload = _live_season_run(tmp_path, monkeypatch, committed)
+
+    assert rc == 0
+    assert payload["endpoint_completeness"] == 1.0
+    assert payload["pending_endpoints"] == 1
+    assert "referee" in caplog.text
+    assert committed.pending_keys[0].stable_id() in caplog.text
 
 
 @pytest.mark.unit
@@ -1896,6 +2012,8 @@ def _replayed_partition_with_cross_page_repeat(
     mutate_identity=False,
     unknown_column=False,
     user_count_tick=False,
+    rename=False,
+    placeholder_home=False,
 ):
     """Partition whose live-feed pages repeat event 14000001 on BOTH pages.
 
@@ -1907,11 +2025,26 @@ def _replayed_partition_with_cross_page_repeat(
     swaps the home team, i.e. two different matches merged under one id — a
     data conflict that must stay a hard error. ``user_count_tick`` moves only
     the popularity counters between the two fetches, which is what the source
-    really does (#1071).
+    really does (#1071). ``rename`` reproduces the 2026-08-23 NED repeat: the
+    away team's display name and the tournament's live flag changed between
+    the two pages. ``placeholder_home`` seeds the first page with an
+    unresolved bracket slot as the home team that the later page resolves
+    into the real team.
     """
     raw_store = _raw_store(tmp_path)
     manifest = InMemoryManifestStore()
     event = _schedule_event(14000001)
+    schedule_last_payload = None
+    if user_count_tick or rename or placeholder_home:
+        schedule_last_payload = _payload(FIXTURE_PATHS["schedule_last"])
+    if rename:
+        for seeded in schedule_last_payload["events"]:
+            seeded["awayTeam"]["shortName"] = "PEC Zwolle"
+            seeded["tournament"] = {"isLive": True}
+        event["awayTeam"]["shortName"] = "Zwolle"
+        event["tournament"] = {"isLive": False}
+    if placeholder_home:
+        schedule_last_payload["events"][0]["homeTeam"] = _placeholder_team(999901)
     if mutate:
         # Reproduce the 2026-08-20 production repeat exactly: the source moved
         # the fixture, so all three of these disagreed between the two pages.
@@ -1927,9 +2060,7 @@ def _replayed_partition_with_cross_page_repeat(
             dict(event["awayTeam"]),
             dict(event["homeTeam"]),
         )
-    schedule_last_payload = None
     if user_count_tick:
-        schedule_last_payload = _payload(FIXTURE_PATHS["schedule_last"])
         for seeded in schedule_last_payload["events"]:
             _stamp_user_counts(seeded, home=59171, away=8138, tournament=32989)
         _stamp_user_counts(event, home=59115, away=8142, tournament=32953)
@@ -1985,7 +2116,8 @@ def test_partition_materializer_collapses_cross_page_repeat_with_ticking_user_co
 ):
     """#1071: the source's follower counters move between two page fetches of
     one run. That is not a data conflict — the match itself is identical — and
-    it must not drop the whole season."""
+    it must not drop the whole season. One policy for every non-identity
+    column: the fresher observation wins, counters included."""
     plan, results = _replayed_partition_with_cross_page_repeat(
         tmp_path,
         user_count_tick=True,
@@ -2002,24 +2134,82 @@ def test_partition_materializer_collapses_cross_page_repeat_with_ticking_user_co
         if str(row["game_id"]) == "14000001"
     ]
     assert len(repeats) == 1
-    # The first-seen page wins, counters included.
-    assert repeats[0]["source_page_direction"] == "last"
-    assert repeats[0]["home_team_user_count"] == 59171
-    assert repeats[0]["tournament_unique_tournament_user_count"] == 32989
+    assert repeats[0]["source_page_direction"] == "next"
+    assert repeats[0]["home_team_user_count"] == 59115
+    assert repeats[0]["tournament_unique_tournament_user_count"] == 32953
+
+
+@pytest.mark.unit
+def test_partition_materializer_collapses_cross_page_repeat_after_rename(tmp_path):
+    """Live incident 2026-08-23: NED dropped the day because the away team's
+    display name ("PEC Zwolle" -> "Zwolle") and the tournament's live flag
+    changed between the two page fetches of one run. Neither says WHICH match
+    this is, so the repeat collapses and the newer observation wins."""
+    plan, results = _replayed_partition_with_cross_page_repeat(
+        tmp_path,
+        rename=True,
+    )
+    materialization = materialize_season_partition(
+        plan,
+        results,
+        canonical_league="ENG-Premier League",
+        canonical_season="2025/26",
+    )
+    repeats = [
+        row
+        for row in materialization.schedule_rows
+        if str(row["game_id"]) == "14000001"
+    ]
+    assert len(repeats) == 1
+    assert repeats[0]["source_page_direction"] == "next"
+    assert repeats[0]["away_team_short_name"] == "Zwolle"
+    assert repeats[0]["tournament_is_live"] is False
+
+
+@pytest.mark.unit
+def test_partition_materializer_collapses_placeholder_resolved_on_later_page(
+    tmp_path,
+):
+    """A cup bracket slot ("Winner of match N", ``disabled: true``, #946)
+    resolving into the real team on a later page is the source filling in a
+    slot, not a different match: the repeat collapses to the real team."""
+    plan, results = _replayed_partition_with_cross_page_repeat(
+        tmp_path,
+        placeholder_home=True,
+    )
+    materialization = materialize_season_partition(
+        plan,
+        results,
+        canonical_league="ENG-Premier League",
+        canonical_season="2025/26",
+    )
+    repeats = [
+        row
+        for row in materialization.schedule_rows
+        if str(row["game_id"]) == "14000001"
+    ]
+    assert len(repeats) == 1
+    assert repeats[0]["source_page_direction"] == "next"
+    assert str(repeats[0]["home_team_id"]) == "42"
+    assert repeats[0].get("home_team_disabled") is not True
 
 
 def _plan_with_missing(*endpoints, pending=None):
-    """Bare plan whose missing/pending raw keys are the named endpoints."""
+    """Bare plan whose missing/pending raw keys are the named endpoints, keyed
+    exactly as production emits them."""
 
     def _key(endpoint):
-        return ManifestKey(
+        builder, target = {
+            "referee_profile": (build_referee_profile_spec, {"referee_id": 1}),
+            "squads": (build_squad_spec, {"team_id": 1}),
+        }[endpoint]
+        return builder(
             source_tournament_id="17",
             source_season_id="76986",
-            target_type="season",
-            target_id=f"{endpoint}:1",
-            endpoint=endpoint,
             freshness_key="day-2026-08-20",
-        )
+            paid_proxy=False,
+            **target,
+        ).key
 
     keys = tuple(_key(endpoint) for endpoint in endpoints)
     pending_keys = (
@@ -2053,8 +2243,18 @@ def test_referee_profile_does_not_block_the_player_universe():
     """
     plan = _plan_with_missing("referee_profile")
     assert plan.missing_raw_keys  # still captured, just not blocking
-    assert plan.player_blocking_missing_raw_keys == ()
+    assert plan.complete is False
     assert plan.player_universe_ready is True
+
+
+@pytest.mark.unit
+def test_referee_profile_does_not_block_the_match_phase():
+    """C6: the same profile is no evidence for the match phase either — a
+    stuck raw-only endpoint (410/403, canonicalised id #1081) must not drop a
+    league's matches from the targets plan or fail its season runner."""
+    plan = _plan_with_missing("referee_profile")
+    assert plan.complete is False
+    assert plan.match_phase_ready is True
 
 
 @pytest.mark.unit
@@ -2062,8 +2262,7 @@ def test_a_missing_squad_still_blocks_the_player_universe():
     """The relaxation is referee-only: a missing squad is real evidence about
     who played and must keep the player phase closed."""
     plan = _plan_with_missing("referee_profile", "squads")
-    blocking = plan.player_blocking_missing_raw_keys
-    assert [key.endpoint for key in blocking] == ["squads"]
+    assert plan.match_phase_ready is False
     assert plan.player_universe_ready is False
 
 
@@ -2075,6 +2274,7 @@ def test_player_universe_stays_closed_while_evidence_gaps_remain():
         _plan_with_missing("referee_profile"),
         player_universe_evidence_gaps=("participants omitted team 42",),
     )
+    assert plan.match_phase_ready is False
     assert plan.player_universe_ready is False
 
 
@@ -2112,70 +2312,40 @@ def test_partition_materializer_collapses_rescheduled_cross_page_repeat(tmp_path
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "column",
-    [
-        # Identity — never collapsible.
-        "game_id",
-        "id",
-        "home_team_id",
-        "season_id",
-        # Near-misses: names that merely BEGIN like a mutable one. A prefix
-        # match without a separator would swallow all of these.
-        "detail_identity",
-        "start_timestamp_source",
-        "home_scorer_id",
-        "season_identifier",
-        "hash_id",
-        # Simply unknown.
-        "some_brand_new_field",
-    ],
+    sorted(set(BRONZE_SCHEDULE_COLUMNS) | _SCHEDULE_IDENTITY_COLUMNS),
 )
-def test_unknown_and_near_miss_columns_are_not_collapsible(column):
-    assert _is_mutable_schedule_column(column) is False
+def test_only_identity_columns_conflict_across_pages(column):
+    """Every bronze schedule column: only the seven identity columns make a
+    cross-page disagreement a conflict; everything else is state the source
+    may legally move between two fetches."""
+    expected = column in _SCHEDULE_IDENTITY_COLUMNS
+    assert _is_schedule_identity_conflict(column, {column: 1}, {column: 2}) is expected
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    "column",
-    [
-        "start_timestamp",
-        "round_info_round",
-        "detail_id",
-        "status_type",
-        "home_score_current",
-        "away_score_display",
-        "home_team_name",
-        "home_team",
-        "has_xg",
-        "changes_changes",
-        "time_injury_time1",
-        "current_period_start_timestamp",
-        "winner_code",
-        "season_year",
-    ],
-)
-def test_known_mutable_columns_are_collapsible(column):
-    assert _is_mutable_schedule_column(column) is True
-
-
-@pytest.mark.unit
-def test_partition_materializer_rejects_an_unreasoned_column_conflict(tmp_path):
-    """Collapsing is an ALLOWLIST, not "anything that is not identity".
-
-    A column nobody has classified disagreeing across two copies of one match is
-    exactly the corruption this guard exists to catch, so it stays a hard error
-    until someone decides the field is legally mutable.
+def test_partition_materializer_collapses_an_unclassified_column_change(tmp_path):
+    """A column nobody has classified disagreeing across two copies of one
+    match is state, not identity: the fresher observation wins instead of the
+    season failing until someone extends an allowlist (2026-08-20, 2026-08-23).
     """
     plan, results = _replayed_partition_with_cross_page_repeat(
         tmp_path,
         unknown_column=True,
     )
-    with pytest.raises(SeasonMaterializationError, match="duplicate schedule"):
-        materialize_season_partition(
-            plan,
-            results,
-            canonical_league="ENG-Premier League",
-            canonical_season="2025/26",
-        )
+    materialization = materialize_season_partition(
+        plan,
+        results,
+        canonical_league="ENG-Premier League",
+        canonical_season="2025/26",
+    )
+    repeats = [
+        row
+        for row in materialization.schedule_rows
+        if str(row["game_id"]) == "14000001"
+    ]
+    assert len(repeats) == 1
+    assert repeats[0]["source_page_direction"] == "next"
+    assert repeats[0]["some_brand_new_field"] == "changed"
 
 
 @pytest.mark.unit

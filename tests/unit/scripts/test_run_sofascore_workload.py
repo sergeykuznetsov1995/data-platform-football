@@ -145,6 +145,79 @@ def test_runner_selects_every_deterministic_signed_batch(
     assert len(flattened) == len(set(flattened)) == sum(expected_sizes)
 
 
+def test_runner_accepts_backfill_dag_with_the_actual_airflow_run_id(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv(
+        "AIRFLOW_CTX_DAG_ID", "dag_backfill_sofascore_all_mens"
+    )
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "scheduled-backfill-1")
+    policy = WorkloadBudgetPolicy(
+        "c" * 64,
+        {MATCH_WORKLOAD_CLASS: _match_budget()},
+    )
+    plan = build_partitioned_plan(
+        policy,
+        dag_id="dag_backfill_sofascore_all_mens",
+        run_id="scheduled-backfill-1::targets",
+        partitions=[PartitionWorkload(
+            "SS-17", "2526", 17, pending_match_ids=("1",)
+        )],
+        control_token=TOKEN,
+    )
+    path = write_plan(tmp_path / "backfill-targets.json", plan)
+
+    loaded, allocations = _load_runtime_workload_plan(
+        str(path),
+        entity=ENTITY_MATCH_CAPTURE,
+        league="SS-17",
+        season=2526,
+        offline_replay=False,
+    )
+
+    assert loaded.dag_id == "dag_backfill_sofascore_all_mens"
+    assert loaded.run_id == "scheduled-backfill-1::targets"
+    assert len(allocations) == 1
+
+
+def test_runner_prefers_the_scope_run_id_over_the_dagrun_id(tmp_path, monkeypatch):
+    # One DagRun of the history campaign can carry several scopes; each scope
+    # cycle plans under its own SOFASCORE_RUN_ID, which must win over the
+    # shared AIRFLOW_CTX_DAG_RUN_ID or the plan is rejected as foreign.
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv(
+        "AIRFLOW_CTX_DAG_ID", "dag_backfill_sofascore_all_mens"
+    )
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "scheduled-backfill-1")
+    monkeypatch.setenv("SOFASCORE_RUN_ID", "scheduled-backfill-1--17-1725")
+    policy = WorkloadBudgetPolicy(
+        "c" * 64,
+        {MATCH_WORKLOAD_CLASS: _match_budget()},
+    )
+    plan = build_partitioned_plan(
+        policy,
+        dag_id="dag_backfill_sofascore_all_mens",
+        run_id="scheduled-backfill-1--17-1725::targets",
+        partitions=[PartitionWorkload(
+            "SS-17", "2526", 17, pending_match_ids=("1",)
+        )],
+        control_token=TOKEN,
+    )
+    path = write_plan(tmp_path / "scope-targets.json", plan)
+
+    loaded, allocations = _load_runtime_workload_plan(
+        str(path),
+        entity=ENTITY_MATCH_CAPTURE,
+        league="SS-17",
+        season=2526,
+        offline_replay=False,
+    )
+
+    assert loaded.run_id == "scheduled-backfill-1--17-1725::targets"
+    assert len(allocations) == 1
+
+
 def test_runner_rejects_target_plan_for_season_capture(tmp_path, monkeypatch):
     monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
     monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_ingest_sofascore")
@@ -286,3 +359,48 @@ def test_multi_batch_final_metrics_come_from_one_logical_engine_snapshot():
     assert final["cache_hit_rate"] == 0.25
     assert final["replay_hit_rate"] == 0.1
     assert final["provider_total_bytes"] == 37
+
+
+def test_batch_traffic_merge_sums_lease_relaunches():
+    merged = _merge_live_traffic(
+        [
+            {"provider_total_bytes": 30, "paid_proxy_bytes": 30, "lease_relaunches": 1},
+            {"provider_total_bytes": 7, "paid_proxy_bytes": 7},
+            {"provider_total_bytes": 5, "paid_proxy_bytes": 5, "lease_relaunches": 1},
+        ]
+    )
+    assert merged["lease_relaunches"] == 2
+def test_batch_traffic_merge_sums_source_429_counts():
+    merged = _merge_live_traffic(
+        [
+            {"provider_total_bytes": 0, "http_429": 1},
+            {"provider_total_bytes": 0, "http_429": 2},
+            {"provider_total_bytes": 0},
+        ]
+    )
+    assert merged["http_429"] == 3
+
+
+@pytest.mark.parametrize(
+    "dag_id",
+    [
+        "dag_ingest_sofascore",
+        "dag_backfill_sofascore_all_mens",
+        # Sol r12 #3: the refresh lane runs the very same paid match phase, and
+        # a broken plan hand-off used to fall back to an unplanned capture.
+        "dag_refresh_sofascore_all_mens",
+    ],
+)
+def test_every_production_dag_refuses_to_capture_without_a_plan(dag_id, monkeypatch):
+    monkeypatch.setenv("SOFASCORE_PROXY_CONTROL_TOKEN", TOKEN)
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", dag_id)
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_RUN_ID", "scheduled-1")
+
+    with pytest.raises(RuntimeError, match="requires --workload-plan"):
+        _load_runtime_workload_plan(
+            None,
+            entity="all",
+            league="ENG-Premier League",
+            season=2025,
+            offline_replay=False,
+        )

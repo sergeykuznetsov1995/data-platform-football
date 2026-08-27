@@ -37,8 +37,37 @@ WORLD_CUP_SEASON_SHAPE = production_season_shape(
     team_count_band="33_48",
     max_pages_per_direction=50,
 )
+CUP_SEASON_SHAPE = production_season_shape(
+    season_format="split_year",
+    team_count_band="33_48",
+    max_pages_per_direction=50,
+)
 EPL_SEASON_CLASS = season_workload_class(EPL_SEASON_SHAPE)
 WORLD_CUP_SEASON_CLASS = season_workload_class(WORLD_CUP_SEASON_SHAPE)
+CUP_SEASON_CLASS = season_workload_class(CUP_SEASON_SHAPE)
+# #1218 D7: the season classes of the all-men campaign bands; each one is
+# measured on two tournaments so it transfers to the unmeasured ones.
+MEASURED_SEASON_BANDS = {
+    ("split_year", "8_15"),
+    ("split_year", "16_20"),
+    ("split_year", "21_32"),
+    ("calendar_year", "8_15"),
+    ("calendar_year", "16_20"),
+    ("calendar_year", "21_32"),
+    ("calendar_year", "33_48"),
+    # #1218 D7b: the domestic cups of the campaign (split_year/33_48).
+    ("split_year", "33_48"),
+}
+SEASON_CLASSES = {
+    season_workload_class(
+        production_season_shape(
+            season_format=season_format,
+            team_count_band=band,
+            max_pages_per_direction=50,
+        )
+    )
+    for season_format, band in MEASURED_SEASON_BANDS
+}
 # The paid canary measures these two tournaments; every other enabled league is
 # authorized through the by-shape transfer rule, never through its own samples.
 MEASURED_TOURNAMENT_IDS = {16, 17}
@@ -270,12 +299,7 @@ def test_workload_classes_are_derived_from_the_class_manifest():
     manifest = canary.CLASS_MANIFEST
 
     assert canary.REQUIRED_WORKLOAD_CLASSES == tuple(sorted(manifest.classes))
-    assert set(manifest.classes) == {
-        MATCH_CLASS,
-        PLAYER_CLASS,
-        EPL_SEASON_CLASS,
-        WORLD_CUP_SEASON_CLASS,
-    }
+    assert set(manifest.classes) == {MATCH_CLASS, PLAYER_CLASS} | SEASON_CLASSES
     assert _spec(MATCH_CLASS).shape == production_match_shape()
     assert _spec(PLAYER_CLASS).shape == production_player_shape()
     assert _spec(EPL_SEASON_CLASS).shape == EPL_SEASON_SHAPE
@@ -287,7 +311,14 @@ def test_workload_classes_are_derived_from_the_class_manifest():
     # #951+: t8 (La Liga) is the second measured tournament of the split_year
     # season shape, so the class can transfer to the unmeasured club leagues.
     assert _spec(EPL_SEASON_CLASS).measured_tournament_ids == (8, 17)
-    assert _spec(WORLD_CUP_SEASON_CLASS).measured_tournament_ids == (16,)
+    # #1218 D7: t703 (Primera Nacional) is the second measured tournament of
+    # the calendar_year/33_48 shape, so the class no longer stays pinned to t16.
+    assert _spec(WORLD_CUP_SEASON_CLASS).measured_tournament_ids == (16, 703)
+    # #1218 D7b: the split_year/33_48 shape (domestic cups) is measured on
+    # t326 (Belgian Cup) and t328 (Coppa Italia).
+    assert _spec(CUP_SEASON_CLASS).measured_tournament_ids == (326, 328)
+    assert _target(CUP_SEASON_CLASS, 326).representative_season_id == 81462
+    assert _target(CUP_SEASON_CLASS, 328).representative_season_id == 77308
     assert _target(EPL_SEASON_CLASS, 17).representative_season_id == 76986
     assert _target(EPL_SEASON_CLASS, 8).representative_season_id == 77559
     assert _target(WORLD_CUP_SEASON_CLASS, 16).representative_season_id == 58210
@@ -297,6 +328,33 @@ def test_workload_classes_are_derived_from_the_class_manifest():
             assert cohort.source_tournament_id == target.source_tournament_id
 
 
+def test_every_season_class_transfers_to_unmeasured_tournaments():
+    """#1218 D7: a season class measured on one tournament authorizes only it.
+
+    The history campaign classifies every ready scope by (season_format,
+    team_count_band); a class transfers to an unmeasured tournament only
+    after >= 2 tournaments were measured, so each declared season class must
+    name two distinct tournaments whose cohorts carry the representative
+    season.
+    """
+
+    manifest = canary.load_class_manifest()
+    season_specs = [
+        spec for spec in manifest.classes.values() if spec.scope == "season"
+    ]
+
+    assert {
+        (spec.shape["season_format"], spec.shape["team_count_band"])
+        for spec in season_specs
+    } == MEASURED_SEASON_BANDS
+    for spec in season_specs:
+        tournaments = {target.source_tournament_id for target in spec.targets}
+        assert len(tournaments) >= MIN_MEASURED_TOURNAMENTS_FOR_TRANSFER, spec.key
+        for target in spec.targets:
+            cohort = canary.load_target_cohort(target)
+            assert cohort.source_season_id == target.representative_season_id
+
+
 def test_manifest_names_are_recomputed_and_never_drawn(tmp_path):
     payload = json.loads(canary.DEFAULT_CLASS_MANIFEST_PATH.read_text())
     for entry in payload["classes"]:
@@ -304,7 +362,8 @@ def test_manifest_names_are_recomputed_and_never_drawn(tmp_path):
         if entry["scope"] == "season" and entry["shape_params"][
             "team_count_band"
         ] == "16_20":
-            entry["shape_params"]["team_count_band"] = "21_32"
+            # 49_64 is the only band no shipped class declares (#1218 D7).
+            entry["shape_params"]["team_count_band"] = "49_64"
     path = tmp_path / "classes.json"
     path.write_text(json.dumps(payload))
     # The cohorts live next to the shipped manifest.
@@ -316,7 +375,7 @@ def test_manifest_names_are_recomputed_and_never_drawn(tmp_path):
     rebanded = season_workload_class(
         production_season_shape(
             season_format="split_year",
-            team_count_band="21_32",
+            team_count_band="49_64",
             max_pages_per_direction=50,
         )
     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -13,9 +14,15 @@ from scrapers.sofascore.capture_engine import (
 )
 from scrapers.sofascore.live_capture import (
     LeaseBackedCamoufoxTransport,
+    _live_traffic,
+    _zero_traffic,
     capture_live_dynamic_specs,
     capture_live_specs,
     hash_proxy_exit,
+)
+from scrapers.sofascore.lease_client import (
+    SofascoreLeaseProtocolError,
+    SofascoreLeaseRejected,
 )
 from scrapers.sofascore.manifest import InMemoryManifestStore, ManifestKey
 from scrapers.sofascore.pipeline import CaptureRuntime, DeferredCaptureSink
@@ -296,7 +303,9 @@ class _TransportFactory:
             )
             plan = _signed_plan(
                 artifact_id=engine.budget.policy.artifact_id,
-                dag_id="dag_ingest_sofascore",
+                dag_id=os.environ.get(
+                    "AIRFLOW_CTX_DAG_ID", "dag_ingest_sofascore"
+                ),
                 run_id=engine.run_id,
                 player_universe_ids=(),
                 allocations=(allocation,),
@@ -634,6 +643,55 @@ def test_two_endpoints_share_one_lease_browser_and_are_not_double_paced(tmp_path
     assert sum(traffic["endpoint_provider_bytes"].values()) == 250
     assert traffic["browser_sessions"] == 1
     assert traffic["browser_navigations"] == 1
+
+
+def test_backfill_dag_enters_the_production_transport_and_acquires_lease(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv(
+        "AIRFLOW_CTX_DAG_ID", "dag_backfill_sofascore_all_mens"
+    )
+    runtime, _ = _runtime(tmp_path)
+    client = _LeaseClient([0, 0, 10], final_total=10)
+    capture = _Capture([_record(b'{"items":[]}')])
+    factory = _TransportFactory(client, capture)
+
+    results, traffic = capture_live_specs(
+        runtime,
+        [_spec(1)],
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="SS-17:2526",
+        entity="match_capture",
+        transport_factory=factory,
+    )
+
+    assert len(results) == 1
+    assert traffic["paid_proxy_bytes"] == 10
+    assert client.acquire_calls[0]["dag_id"] == (
+        "dag_backfill_sofascore_all_mens"
+    )
+
+
+def test_refresh_dag_enters_the_production_transport_and_acquires_lease(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AIRFLOW_CTX_DAG_ID", "dag_refresh_sofascore_all_mens")
+    runtime, _ = _runtime(tmp_path)
+    client = _LeaseClient([0, 0, 10], final_total=10)
+    factory = _TransportFactory(client, _Capture([_record(b'{"items":[]}')]))
+
+    results, traffic = capture_live_specs(
+        runtime,
+        [_spec(1)],
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="SS-7:2627",
+        entity="match_capture",
+        transport_factory=factory,
+    )
+
+    assert len(results) == 1
+    assert traffic["paid_proxy_bytes"] == 10
+    assert client.acquire_calls[0]["dag_id"] == "dag_refresh_sofascore_all_mens"
 
 
 def test_sequential_batch_reports_are_deltas_not_cumulative(tmp_path):
@@ -1200,3 +1258,531 @@ def test_starved_lease_names_budget_exhaustion_not_dead_exit(tmp_path):
 
     assert client.close_calls == 1
     assert capture.enter_calls == 0
+
+
+# --- #1218 B2: a lease lost mid-batch is re-leased once, not fatal ----------
+
+
+class _LeaseSequenceFactory:
+    """Hand out one prepared transport factory per lease construction."""
+
+    def __init__(self, *factories):
+        self.factories = deque(factories)
+        self.attempt_ids = []
+
+    def __call__(self, engine, **kwargs):
+        self.attempt_ids.append(kwargs.get("attempt_id"))
+        return self.factories.popleft()(engine, **kwargs)
+
+
+class _RecordingCloseClient(_LeaseClient):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.close_completed = []
+
+    def close(self, lease, **kwargs):
+        self.close_completed.append(kwargs.get("completed"))
+        return super().close(lease, **kwargs)
+
+
+class _EndpointConcurrentClient(_RecordingCloseClient):
+    """The gateway latched the lease: the 2nd endpoint boundary is refused."""
+
+    def begin_endpoint(self, lease, endpoint):
+        if self.endpoint_counter == 1:
+            raise SofascoreLeaseRejected(
+                "proxy lease API rejected POST /v1/leases/lease-1/endpoints "
+                "(HTTP 409): lease cannot start a concurrent endpoint request",
+                status_code=409,
+                code="endpoint_concurrent",
+            )
+        return super().begin_endpoint(lease, endpoint)
+
+
+class _BusySlotClient(_LeaseClient):
+    """The reaper has not reclaimed the lost lease's slot yet."""
+
+    def acquire(self, **kwargs):
+        raise SofascoreLeaseRejected(
+            "proxy lease API rejected POST /v1/leases (HTTP 429): SofaScore "
+            "paid-proxy concurrency limit reached",
+            status_code=429,
+            code="concurrency_limited",
+        )
+
+
+def _relaunch_plan(runtime):
+    allocation = WorkloadAllocation(
+        allocation_id="alloc-" + "7" * 32,
+        task_id="capture",
+        scope="match",
+        workload_class="match_batch_25",
+        batch_index=0,
+        units=("1", "2"),
+        budget_bytes=10_000,
+    )
+    plan = _signed_plan(
+        artifact_id="a" * 64,
+        dag_id="dag_ingest_sofascore",
+        run_id=runtime.engine.run_id,
+        player_universe_ids=(),
+        allocations=(allocation,),
+        control_token="c" * 32,
+    )
+    return plan, allocation
+
+
+def _capture_batch(runtime, specs, plan, allocation, factory):
+    return capture_live_specs(
+        runtime,
+        specs,
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="ENG-Premier League:2526",
+        entity="match_capture",
+        workload_plan=plan,
+        allocation_id=allocation.allocation_id,
+        attempt_id="1",
+        transport_factory=factory,
+    )
+
+
+def test_lease_lost_mid_batch_is_released_once_and_the_batch_continues(
+    tmp_path, monkeypatch
+):
+    # Night 23→24.08: 9 of 12 red campaign runs were HTTP 409 on the endpoint
+    # boundary after the gateway latched the lease (#1218).  The batch must
+    # close the dead lease/browser, wait past the reaper grace, take a fresh
+    # lease under a relaunch attempt id and continue from the failed spec.
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _relaunch_plan(runtime)
+    sleeps = []
+    monkeypatch.setattr(
+        "scrapers.sofascore.live_capture._relaunch_sleep", sleeps.append
+    )
+    # enter, spec1 before, spec1 finish, spec2 before, spec2 failure meter
+    lost_client = _EndpointConcurrentClient([0, 0, 100, 100, 100], final_total=100)
+    lost_capture = _Capture([_record(b'{"items":[{"id":1}]}')])
+    fresh_client = _RecordingCloseClient([0, 0, 150], final_total=150)
+    fresh_capture = _Capture([_record(b'{"items":[{"id":2}]}')])
+    factory = _LeaseSequenceFactory(
+        _TransportFactory(lost_client, lost_capture),
+        _TransportFactory(fresh_client, fresh_capture),
+    )
+
+    results, traffic = _capture_batch(
+        runtime, [_spec(1, "event"), _spec(2, "lineups")], plan, allocation, factory
+    )
+
+    # Both payloads are normalized and only wait for their Bronze MERGE.
+    assert [result.manifest.error_type for result in results] == [
+        "DeferredMaterialization",
+        "DeferredMaterialization",
+    ]
+    assert factory.attempt_ids == ["1", "1:relaunch1"]
+    assert sleeps == [35]
+    assert lost_client.close_completed == [False]
+    assert fresh_client.close_completed == [True]
+    assert lost_capture.exit_calls == 1  # browser gone before the new lease
+    assert lost_capture.fetch_paths == ["/api/v1/event/1/event"]
+    assert fresh_capture.fetch_paths == ["/api/v1/event/2/lineups"]
+    assert traffic["lease_relaunches"] == 1
+    assert traffic["provider_total_bytes"] == traffic["paid_proxy_bytes"] == 250
+    assert traffic["endpoint_provider_bytes"] == {"event": 100, "lineups": 150}
+    assert traffic["browser_sessions"] == 2
+
+
+def test_gateway_latch_seen_on_the_endpoint_meter_is_a_lost_lease(
+    tmp_path, monkeypatch
+):
+    # The other 409-class disguise: the fetch itself succeeded, but the endpoint
+    # meter already reports the lease closed AND budget_exceeded — the latch
+    # signature (real exhaustion only flags budget_exceeded).  Previously this
+    # died as "exhausted the logical DAG-run budget" at 0.4 MB of 1.4 MB.
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _relaunch_plan(runtime)
+    sleeps = []
+    monkeypatch.setattr(
+        "scrapers.sofascore.live_capture._relaunch_sleep", sleeps.append
+    )
+
+    class _LatchedOnFinishClient(_RecordingCloseClient):
+        def finish_endpoint(self, lease, request_id):
+            stats = super().finish_endpoint(lease, request_id)
+            if self.endpoint_counter == 2:
+                stats.closed = True
+                stats.budget_exceeded = True
+            return stats
+
+    # enter, spec1 before, spec1 finish, spec2 before, spec2 finish (latched),
+    # final meter after the close attempt
+    lost_client = _LatchedOnFinishClient(
+        [0, 0, 100, 100, 160, 160], final_total=160
+    )
+    lost_capture = _Capture(
+        [_record(b'{"items":[{"id":1}]}'), _record(b'{"items":[{"id":2}]}')]
+    )
+    fresh_client = _RecordingCloseClient([0, 0, 150], final_total=150)
+    fresh_capture = _Capture([_record(b'{"items":[{"id":2}]}')])
+    factory = _LeaseSequenceFactory(
+        _TransportFactory(lost_client, lost_capture),
+        _TransportFactory(fresh_client, fresh_capture),
+    )
+
+    results, traffic = _capture_batch(
+        runtime, [_spec(1, "event"), _spec(2, "lineups")], plan, allocation, factory
+    )
+
+    assert len(results) == 2
+    assert factory.attempt_ids == ["1", "1:relaunch1"]
+    assert sleeps == [35]
+    assert lost_client.close_completed == [False]
+    assert traffic["lease_relaunches"] == 1
+    # The bytes billed on the lost lease (100 + 60) stay in this batch's meter.
+    assert traffic["provider_total_bytes"] == traffic["paid_proxy_bytes"] == 310
+    assert traffic["endpoint_provider_bytes"] == {"event": 100, "lineups": 210}
+
+
+def test_relaunch_waits_for_the_reaper_to_free_the_slot(tmp_path, monkeypatch):
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _relaunch_plan(runtime)
+    sleeps = []
+    monkeypatch.setattr(
+        "scrapers.sofascore.live_capture._relaunch_sleep", sleeps.append
+    )
+    busy = _TransportFactory(_BusySlotClient([], final_total=0), _Capture([]))
+    factory = _LeaseSequenceFactory(
+        _TransportFactory(
+            _EndpointConcurrentClient([0, 0, 100, 100, 100], final_total=100),
+            _Capture([_record(b'{"items":[{"id":1}]}')]),
+        ),
+        busy,
+        busy,
+        _TransportFactory(
+            _LeaseClient([0, 0, 150], final_total=150),
+            _Capture([_record(b'{"items":[{"id":2}]}')]),
+        ),
+    )
+
+    results, traffic = _capture_batch(
+        runtime, [_spec(1, "event"), _spec(2, "lineups")], plan, allocation, factory
+    )
+
+    assert len(results) == 2
+    assert factory.attempt_ids == ["1"] + ["1:relaunch1"] * 3
+    assert sleeps == [35, 10, 10]
+    assert traffic["lease_relaunches"] == 1
+
+
+def test_relaunch_gives_up_when_the_slot_stays_busy(tmp_path, monkeypatch):
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _relaunch_plan(runtime)
+    sleeps = []
+    monkeypatch.setattr(
+        "scrapers.sofascore.live_capture._relaunch_sleep", sleeps.append
+    )
+    busy = _TransportFactory(_BusySlotClient([], final_total=0), _Capture([]))
+    factory = _LeaseSequenceFactory(
+        _TransportFactory(
+            _EndpointConcurrentClient([0, 0, 100, 100, 100], final_total=100),
+            _Capture([_record(b'{"items":[{"id":1}]}')]),
+        ),
+        busy,
+        busy,
+        busy,
+    )
+
+    with pytest.raises(SofascoreLeaseRejected, match="concurrency limit"):
+        _capture_batch(
+            runtime,
+            [_spec(1, "event"), _spec(2, "lineups")],
+            plan,
+            allocation,
+            factory,
+        )
+
+    assert factory.attempt_ids == ["1"] + ["1:relaunch1"] * 3
+    assert sleeps == [35, 10, 10]
+
+
+def test_exhausted_allocation_is_not_releaunched_again(tmp_path, monkeypatch):
+    # A real budget verdict ends the batch: the fresh lease is clamped below
+    # the viable floor (#1044) → ProxyBudgetExceeded, no third lease.
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _relaunch_plan(runtime)
+    sleeps = []
+    monkeypatch.setattr(
+        "scrapers.sofascore.live_capture._relaunch_sleep", sleeps.append
+    )
+
+    class _StarvedClient(_LeaseClient):
+        def acquire(self, **kwargs):
+            lease = super().acquire(**kwargs)
+            lease.max_bytes = 29
+            return lease
+
+        def _stats(self, total, **values):
+            stats = super()._stats(total, **values)
+            stats.max_bytes = 29
+            stats.allocation_remaining_provider_bytes = 29
+            return stats
+
+    factory = _LeaseSequenceFactory(
+        _TransportFactory(
+            _EndpointConcurrentClient([0, 0, 100, 100, 100], final_total=100),
+            _Capture([_record(b'{"items":[{"id":1}]}')]),
+        ),
+        _TransportFactory(_StarvedClient([0], final_total=0), _Capture([])),
+    )
+
+    with pytest.raises(ProxyBudgetExceeded, match="budget is exhausted"):
+        _capture_batch(
+            runtime,
+            [_spec(1, "event"), _spec(2, "lineups")],
+            plan,
+            allocation,
+            factory,
+        )
+
+    assert factory.attempt_ids == ["1", "1:relaunch1"]
+    assert sleeps == [35]
+
+
+def test_second_lost_lease_is_fatal(tmp_path, monkeypatch):
+    # Exactly one relaunch per capture_live_specs call: the relaunched lease
+    # dying too surfaces the spec's own failure, no third lease, no more sleep.
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _relaunch_plan(runtime)
+    sleeps = []
+    monkeypatch.setattr(
+        "scrapers.sofascore.live_capture._relaunch_sleep", sleeps.append
+    )
+    factory = _LeaseSequenceFactory(
+        _TransportFactory(
+            _EndpointConcurrentClient([0, 0, 100, 100, 100], final_total=100),
+            _Capture([_record(b'{"items":[{"id":1}]}')]),
+        ),
+        _TransportFactory(
+            _EndpointConcurrentClient([0, 0, 100, 100, 100], final_total=100),
+            _Capture([_record(b'{"items":[{"id":2}]}')]),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="did not reach a publishable state"):
+        _capture_batch(
+            runtime,
+            [_spec(1, "event"), _spec(2, "lineups"), _spec(3, "lineups")],
+            plan,
+            allocation,
+            factory,
+        )
+
+    assert factory.attempt_ids == ["1", "1:relaunch1"]
+    assert sleeps == [35]
+
+
+class _LatchedAtCloseClient(_LeaseClient):
+    """The gateway latched the lease: close is refused with the real 409.
+
+    ``/close`` of a latched lease answers ``409 lease_close_pending`` ("lease
+    provider counters are not final"); its ``/stats`` stay readable and report
+    ``final_total`` from then on (the tail read after the last boundary).
+    """
+
+    def close(self, lease, **kwargs):
+        self.close_calls += 1
+        raise SofascoreLeaseRejected(
+            "proxy lease API rejected DELETE /v1/leases/lease-1/close "
+            "(HTTP 409): lease provider counters are not final",
+            status_code=409,
+            code="lease_close_pending",
+        )
+
+    def stats(self, lease):
+        if self.close_calls:
+            self.stats_calls += 1
+            return self._stats(self.final_total, closed=True)
+        return super().stats(lease)
+
+
+def test_lease_lost_at_close_after_the_last_spec_keeps_the_results(
+    tmp_path, monkeypatch
+):
+    # A tail latch makes the gateway refuse a clean close with the real 409
+    # lease_close_pending.  Every spec is captured and the final meter equals
+    # what the endpoints were charged, so there is nothing to re-lease.
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _relaunch_plan(runtime)
+    sleeps = []
+    monkeypatch.setattr(
+        "scrapers.sofascore.live_capture._relaunch_sleep", sleeps.append
+    )
+    client = _LatchedAtCloseClient([0, 0, 100], final_total=100)
+    factory = _LeaseSequenceFactory(
+        _TransportFactory(client, _Capture([_record(b'{"items":[{"id":1}]}')]))
+    )
+
+    results, traffic = _capture_batch(
+        runtime, [_spec(1, "event")], plan, allocation, factory
+    )
+
+    assert len(results) == 1
+    assert client.close_calls == 1
+    assert factory.attempt_ids == ["1"]
+    assert sleeps == []
+    assert traffic["lease_relaunches"] == 0
+    assert traffic["provider_total_bytes"] == traffic["paid_proxy_bytes"] == 100
+
+
+def test_tail_bytes_after_a_lost_close_of_a_complete_batch_fail_accounting(
+    tmp_path, monkeypatch
+):
+    # Same 409 at close, but the final meter shows 30 bytes the gateway read
+    # after the last endpoint boundary.  Nobody can be charged for them any
+    # more, so the batch must not report itself as fully paid.
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _relaunch_plan(runtime)
+    monkeypatch.setattr(
+        "scrapers.sofascore.live_capture._relaunch_sleep", lambda _s: None
+    )
+    client = _LatchedAtCloseClient([0, 0, 100], final_total=130)
+    factory = _LeaseSequenceFactory(
+        _TransportFactory(client, _Capture([_record(b'{"items":[{"id":1}]}')]))
+    )
+
+    with pytest.raises(BudgetAccountingError, match="meter=130, endpoints=100"):
+        _capture_batch(runtime, [_spec(1, "event")], plan, allocation, factory)
+
+    assert factory.attempt_ids == ["1"]
+
+
+def test_protocol_error_at_close_is_an_error_not_a_lost_lease(
+    tmp_path, monkeypatch
+):
+    # Inconsistent close statistics (closed=False, tunnels left, id mismatch)
+    # are a protocol error, not the gateway's latch: no relaunch, no
+    # "complete batch" shortcut — the error surfaces as before B2.
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _relaunch_plan(runtime)
+    sleeps = []
+    monkeypatch.setattr(
+        "scrapers.sofascore.live_capture._relaunch_sleep", sleeps.append
+    )
+
+    class _InconsistentCloseClient(_LeaseClient):
+        def close(self, lease, **kwargs):
+            self.close_calls += 1
+            raise SofascoreLeaseProtocolError("proxy lease did not close cleanly")
+
+    client = _InconsistentCloseClient([0, 0, 100], final_total=100)
+    factory = _LeaseSequenceFactory(
+        _TransportFactory(client, _Capture([_record(b'{"items":[{"id":1}]}')]))
+    )
+
+    with pytest.raises(SofascoreLeaseProtocolError, match="did not close cleanly"):
+        _capture_batch(runtime, [_spec(1, "event")], plan, allocation, factory)
+
+    assert factory.attempt_ids == ["1"]
+    assert sleeps == []
+
+
+def test_tail_bytes_on_the_lost_lease_final_meter_are_charged_to_the_batch(
+    tmp_path, monkeypatch
+):
+    # The meter read at the moment of loss (100) is not final: while closing
+    # the latched lease the gateway reads a 30-byte provider tail.  The final
+    # meter is read AFTER the close attempt and the tail is charged to the
+    # lost endpoint, so the relaunched batch reports 130 + 150 paid bytes.
+    runtime, _ = _runtime(tmp_path)
+    plan, allocation = _relaunch_plan(runtime)
+    sleeps = []
+    monkeypatch.setattr(
+        "scrapers.sofascore.live_capture._relaunch_sleep", sleeps.append
+    )
+
+    class _TailAfterCloseClient(_EndpointConcurrentClient):
+        def close(self, lease, **kwargs):
+            self.close_completed.append(kwargs.get("completed"))
+            self.close_calls += 1
+            raise SofascoreLeaseRejected(
+                "proxy lease API rejected DELETE /v1/leases/lease-1/close "
+                "(HTTP 409): lease provider counters are not final",
+                status_code=409,
+                code="lease_close_pending",
+            )
+
+        def stats(self, lease):
+            if self.close_calls:
+                self.stats_calls += 1
+                return self._stats(self.final_total, closed=True)
+            return super().stats(lease)
+
+    # enter, spec1 before, spec1 finish, spec2 before, (meter at loss)
+    lost_client = _TailAfterCloseClient([0, 0, 100, 100, 100], final_total=130)
+    fresh_client = _RecordingCloseClient([0, 0, 150], final_total=150)
+    factory = _LeaseSequenceFactory(
+        _TransportFactory(lost_client, _Capture([_record(b'{"items":[{"id":1}]}')])),
+        _TransportFactory(fresh_client, _Capture([_record(b'{"items":[{"id":2}]}')])),
+    )
+
+    results, traffic = _capture_batch(
+        runtime, [_spec(1, "event"), _spec(2, "lineups")], plan, allocation, factory
+    )
+
+    assert len(results) == 2
+    assert factory.attempt_ids == ["1", "1:relaunch1"]
+    assert sleeps == [35]
+    assert lost_client.close_completed == [False]
+    assert traffic["lease_relaunches"] == 1
+    assert traffic["provider_total_bytes"] == traffic["paid_proxy_bytes"] == 280
+    assert traffic["endpoint_provider_bytes"] == {"event": 100, "lineups": 180}
+
+
+def test_lease_traffic_reports_the_429_delta_of_this_lease_only(tmp_path):
+    runtime, _ = _runtime(tmp_path)
+    engine = runtime.engine
+    engine.metrics.source_rate_limited()
+    before = engine.metrics.snapshot()
+    engine.metrics.source_rate_limited()
+    engine.metrics.source_rate_limited()
+    transport = SimpleNamespace(
+        provider_snapshot=lambda: {"provider_total_bytes": 0}
+    )
+
+    traffic = _live_traffic(engine, before, transport)
+
+    assert before["http_429"] == 1
+    assert traffic["http_429"] == 2
+    assert _zero_traffic()["http_429"] == 0
+
+
+def test_wrapping_transport_without_lease_lost_flag_captures_normally(tmp_path):
+    # The paid canary wraps the production adapter in a recorder that does not
+    # expose ``lease_lost`` (bench_sofascore_paid_canary.RecordingCanaryTransport);
+    # the batch loop must treat a missing flag as "lease not lost", not crash.
+    runtime, _ = _runtime(tmp_path)
+    client = _LeaseClient([0, 0, 100, 100, 250], final_total=250)
+    capture = _Capture(
+        [_record(b'{"items":[{"id":1}]}'), _record(b'{"items":[{"id":2}]}')]
+    )
+
+    class _WrappingFactory(_TransportFactory):
+        def __call__(self, engine, **kwargs):
+            transport = super().__call__(engine, **kwargs)
+            del transport.lease_lost
+            return transport
+
+    factory = _WrappingFactory(client, capture)
+
+    results, traffic = capture_live_specs(
+        runtime,
+        [_spec(1, "event"), _spec(2, "lineups")],
+        canonical_url="https://www.sofascore.com/event/1",
+        scope="ENG-Premier League:2526",
+        entity="match_capture",
+        transport_factory=factory,
+    )
+
+    assert len(results) == 2
+    assert factory.calls == client.close_calls == 1
+    assert traffic["paid_proxy_bytes"] == 250
+    assert traffic["lease_relaunches"] == 0

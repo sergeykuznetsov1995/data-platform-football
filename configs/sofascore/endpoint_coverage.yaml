@@ -38,7 +38,7 @@ manifest:
     - retryable_failure
     - schema_error
   acceptable_terminal_states:
-    required: [success, legitimate_empty]
+    required: [success, legitimate_empty, not_supported]
     optional: [success, legitimate_empty, not_supported]
   retryable_http_statuses: [403, 429, 500, 502, 503, 504]
   exact_raw_lineage:
@@ -157,7 +157,9 @@ tables:
       - season
       - _ingested_at
     partition_columns: [league, season]
-    materialized_by: dags/scripts/run_sofascore_scraper.py#_run_season_capture_engine
+    materialized_by:
+      - dags/scripts/run_sofascore_scraper.py#_run_season_capture_engine
+      - dags/scripts/run_sofascore_schedule_refresh.py#write_schedule_rows
     production_write_status: raw replay/no-op wired; paid live capture fails closed pending verified provider meter
     downstream: [silver.xref_match, silver.sofascore_team_match, silver.sofascore_shots]
 
@@ -616,6 +618,15 @@ endpoints:
     natural_key: [source_season_id, event_id]
     empty_semantics: a schema-valid empty page with hasNextPage=false is legitimate
     dq: [source season match, no skeleton rows, page chain complete, exact raw lineage]
+    # "page chain complete" binds the campaign, which walks the chain both ways.
+    # The refresh lane is a second consumer and reads page 0 ONLY, on purpose:
+    # the visit exists to put the next match in Bronze so the ``due`` window can
+    # open, and the matches beyond the first page are far enough away that the
+    # next visit carries them.  A longer calendar is counted (``truncated``),
+    # never walked, and the byte budget is sized for the one page.
+    consumers:
+      - dags/scripts/run_sofascore_scraper.py#_run_season_capture_engine: full page chain
+      - dags/scripts/run_sofascore_schedule_refresh.py: first page only, rest counted
 
   standings_total:
     path: /unique-tournament/{tournament_id}/season/{season_id}/standings/total

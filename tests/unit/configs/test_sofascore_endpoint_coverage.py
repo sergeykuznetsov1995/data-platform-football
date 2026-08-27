@@ -42,6 +42,7 @@ def test_manifest_states_are_exact_and_http_errors_not_success(coverage):
     assert set(coverage["manifest"]["acceptable_terminal_states"]["required"]) == {
         "success",
         "legitimate_empty",
+        "not_supported",
     }
 
 
@@ -158,10 +159,20 @@ def test_every_normalized_destination_has_grain_key_dq_and_downstream(coverage):
 
 def test_every_claimed_table_has_a_real_materializer_file_and_status(coverage):
     for table_name, table in coverage["tables"].items():
-        relative_path = table["materialized_by"].split("#", 1)[0]
-        materializer = ROOT / relative_path
-        assert materializer.is_file(), (table_name, relative_path)
-        assert table_name.split(".")[-1] in materializer.read_text(encoding="utf-8")
+        claimed = table["materialized_by"]
+        # A table may have more than one writer: the refresh lane writes
+        # ``bronze.sofascore_schedule`` directly, next to the capture engine
+        # (Sol round 20).  Every one of them has to be a real file that
+        # actually mentions the table.
+        writers = [claimed] if isinstance(claimed, str) else claimed
+        assert writers, table_name
+        for writer in writers:
+            relative_path = writer.split("#", 1)[0]
+            materializer = ROOT / relative_path
+            assert materializer.is_file(), (table_name, relative_path)
+            assert table_name.split(".")[-1] in materializer.read_text(
+                encoding="utf-8"
+            )
         assert table["production_write_status"]
 
 
@@ -308,6 +319,24 @@ def test_normalized_match_endpoints_are_exactly_pipeline_event_paths(coverage):
             "squads",
             "referee_profile",
         }
+    )
+
+
+def test_refresh_lane_reuses_the_measured_season_page_endpoint(coverage):
+    # Lane F walks season pages, not a by-date feed: the source answered 404
+    # for every by-date shape on 2026-08-25, so the lane rides the class the
+    # campaign already measures and the coverage file carries no date feed.
+    from scrapers.sofascore.schedule_refresh import (
+        SCHEDULE_PAGE_ENDPOINT,
+        SCHEDULE_PAGE_TARGET_TYPE,
+    )
+
+    assert "scheduled_events" not in coverage["endpoints"]
+    spec = coverage["endpoints"][SCHEDULE_PAGE_ENDPOINT]
+    assert spec["target_type"] == SCHEDULE_PAGE_TARGET_TYPE == "season_page"
+    assert spec["destination"] == ["bronze.sofascore_schedule"]
+    assert spec["path"] == (
+        "/unique-tournament/{tournament_id}/season/{season_id}/events/last/{page}"
     )
 
 
