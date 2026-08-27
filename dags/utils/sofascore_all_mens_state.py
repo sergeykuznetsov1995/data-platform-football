@@ -83,13 +83,18 @@ def current_season_targets(
         if tournament_id in exclude_tournament_ids:
             continue
         newest: tuple[int, SeasonTarget] | None = None
-        for season in tournament.get("seasons", ()):
+        for season in tournament.get("seasons") or ():
             if season.get("metadata_status") == "excluded":
                 continue
             start_year = season.get("start_year")
             season_id = season.get("source_season_id")
             canonical = season.get("canonical_season")
-            if not isinstance(start_year, int) or season_id is None or not canonical:
+            if (
+                isinstance(start_year, bool)
+                or not isinstance(start_year, int)
+                or season_id is None
+                or not canonical
+            ):
                 continue
             if newest is None or start_year > newest[0]:
                 newest = (

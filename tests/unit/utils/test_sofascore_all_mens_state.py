@@ -7,8 +7,10 @@ import pytest
 
 from dags.utils.sofascore_all_mens_state import (
     CampaignPlanningError,
+    SeasonTarget,
     campaign_scope_key,
     clear_failed,
+    current_season_targets,
     env_int,
     mark_failed,
     plan_historical_batch,
@@ -350,6 +352,58 @@ def _refresh_snapshot():
         unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode()).hexdigest()
     return snapshot
+
+
+@pytest.mark.unit
+def test_refresh_planner_skips_tournament_with_null_seasons():
+    snapshot = _refresh_snapshot()
+    snapshot["tournaments"][0]["seasons"] = None
+    unsigned = dict(snapshot)
+    unsigned.pop("snapshot_id")
+    snapshot["snapshot_id"] = hashlib.sha256(json.dumps(
+        unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+
+    planned = plan_refresh_batch(
+        snapshot,
+        [("SS-17", "2627", 1), ("SS-8", "2526", 10)],
+        batch_size=2,
+    )
+
+    assert [item["SOFASCORE_SCOPE_KEY"] for item in planned] == [
+        "campaign-test:8:825"
+    ]
+
+
+@pytest.mark.unit
+def test_current_season_targets_reject_a_boolean_start_year():
+    snapshot = _refresh_snapshot()
+    tournament = snapshot["tournaments"][0]
+    tournament["seasons"] = [
+        {
+            "source_season_id": 171,
+            "canonical_season": "invalid-boolean",
+            "start_year": True,
+            "metadata_status": "pending",
+        },
+        {
+            "source_season_id": 170,
+            "canonical_season": "valid-integer",
+            "start_year": 0,
+            "metadata_status": "pending",
+        },
+    ]
+
+    targets = current_season_targets(snapshot, frozenset())
+
+    assert next(target for target in targets if target.tournament_id == 17) == (
+        SeasonTarget(
+            tournament_id=17,
+            season_id=170,
+            league="SS-17",
+            canonical_season="valid-integer",
+        )
+    )
 
 
 @pytest.mark.unit
