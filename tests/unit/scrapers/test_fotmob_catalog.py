@@ -302,6 +302,82 @@ def test_season_discovery_unions_all_exact_source_lists_without_derivation():
     ]
 
 
+def test_phase_split_competition_does_not_gain_a_phantom_bare_season():
+    payload = {
+        "details": {
+            "id": 230,
+            "name": "Liga MX",
+            "selectedSeason": "2026/2027 - Apertura",
+            "latestSeason": "2026/2027 - Apertura",
+        },
+        "allAvailableSeasons": ["2026/2027 - Apertura", "2025/2026 - Clausura"],
+        "stats": {
+            "seasonStatLinks": [
+                {
+                    "Name": "2026/2027",
+                    "Group": "Apertura",
+                    "League": "Liga MX - Apertura",
+                }
+            ]
+        },
+    }
+
+    seasons = parse_seasons(payload, 230)
+
+    assert [item.source_season_key for item in seasons] == [
+        "2026/2027 - Apertura",
+        "2025/2026 - Clausura",
+    ]
+
+
+def test_secondary_only_season_without_a_phase_sibling_is_kept():
+    payload = {
+        "details": {"id": 230, "name": "Liga MX", "selectedSeason": "2026/2027 - Apertura"},
+        "allAvailableSeasons": ["2026/2027 - Apertura"],
+        "stats": {
+            "seasonsWithLinks": ["2017/2018"],
+            "seasonStatLinks": [{"Name": "2016/2017", "Group": "Apertura"}],
+        },
+    }
+
+    seasons = parse_seasons(payload, 230)
+
+    assert [item.source_season_key for item in seasons] == [
+        "2026/2027 - Apertura",
+        "2017/2018",
+        "2016/2017",
+    ]
+
+
+def test_dropping_a_phantom_season_keeps_source_order_of_real_editions():
+    payload = {
+        "details": {
+            "id": 230,
+            "name": "Liga MX",
+            "selectedSeason": "2026/2027 - Apertura",
+            "latestSeason": "2026/2027 - Apertura",
+        },
+        "allAvailableSeasons": [
+            "2026/2027 - Apertura",
+            "2025/2026 - Clausura",
+            "2025/2026 - Apertura",
+        ],
+        "stats": {
+            "seasonsWithLinks": ["2026/2027", "2015/2016"],
+            "seasonStatLinks": [{"Name": "2025/2026", "Group": "Clausura"}],
+        },
+    }
+
+    seasons = parse_seasons(payload, 230)
+
+    assert [(item.source_season_key, item.source_order) for item in seasons] == [
+        ("2026/2027 - Apertura", 0),
+        ("2025/2026 - Clausura", 1),
+        ("2025/2026 - Apertura", 2),
+        ("2015/2016", 3),
+    ]
+
+
 def test_irregular_exact_seasons_are_not_reformatted_or_sorted():
     payload = {
         "details": {

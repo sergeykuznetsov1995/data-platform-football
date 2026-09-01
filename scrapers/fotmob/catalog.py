@@ -499,6 +499,13 @@ def validate_selected_season(
     return selected
 
 
+def _phase_edition_present(season: str, seasons: Sequence[str]) -> bool:
+    """True when ``seasons`` already holds a phase edition ``"<season> - …"``."""
+
+    prefix = f"{season} - "
+    return any(existing.startswith(prefix) for existing in seasons)
+
+
 def parse_seasons(
     payload: Mapping[str, Any],
     competition: CompetitionRef | int | None = None,
@@ -531,11 +538,13 @@ def parse_seasons(
 
     # Some competitions expose older/stat-enabled editions only through these
     # secondary source lists.  Union exact strings; never derive a year range.
+    # Apertura/Clausura competitions drop the phase from these lists, so a bare
+    # label whose phase editions are already known is a phantom, not a season.
     stats = payload.get("stats") or {}
     if isinstance(stats, Mapping):
         for index, value in enumerate(stats.get("seasonsWithLinks") or []):
             season = _source_key(value, field=f"stats.seasonsWithLinks[{index}]")
-            if season not in seasons:
+            if season not in seasons and not _phase_edition_present(season, seasons):
                 seasons.append(season)
         for index, value in enumerate(stats.get("seasonStatLinks") or []):
             if not isinstance(value, Mapping) or value.get("Name") is None:
@@ -543,7 +552,7 @@ def parse_seasons(
             season = _source_key(
                 value["Name"], field=f"stats.seasonStatLinks[{index}].Name"
             )
-            if season not in seasons:
+            if season not in seasons and not _phase_edition_present(season, seasons):
                 seasons.append(season)
 
     selected_value = details.get("selectedSeason")
