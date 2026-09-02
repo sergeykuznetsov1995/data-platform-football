@@ -122,6 +122,7 @@ jobs:
             tests/unit/dags/test_dag_sofascore_pipeline.py \
             tests/unit/dags/test_dag_transform_e3_sofascore_dq.py \
             tests/unit/dags/test_maintenance_tasks.py \
+            tests/unit/deploy/test_sofascore_contour_recipe.py \
             tests/unit/deploy/test_sofascore_gateway_lease_watchdog.py \
             tests/unit/dq/test_sofascore_dq.py \
             tests/unit/scrapers/test_run_sofascore_discovery.py \

@@ -1,0 +1,237 @@
+# Изолированный SofaScore-Airflow (#951): проект sofascore-airflow, своя metadata-DB,
+# scheduler на пинованном образе, код — bind-mount одного замороженного дерева
+# ${SOFASCORE_RELEASE_ROOT}. Общий проект data-platform НЕ трогает.
+#
+# Один файл вместо цепочки «база + all-men override + pkg2 override», которая жила
+# вне git (#1155, этап 3). Каждый путь хоста — переменная без дефолта: без значения
+# `docker compose config` падает, а не молча подставляет чужое дерево.
+# Переменные и рецепт ротации — deploy/sofascore/sofascore.env.example и
+# docs/operations/sofascore-production.md. Секреты приходят только через --env-file.
+#
+# Сети: sofascore-net (своя, внешняя, создаётся руками один раз) + dp-storage (чужая,
+# только ради алиасов trino/seaweedfs). dp-backend сознательно НЕ подключаем: флапает
+# и несёт alias postgres общей Airflow-БД — риск двойного scheduler'а на одной базе.
+#
+# Запуск — только через deploy/sofascore/deploy.sh. Вручную (после `set -a; . sofascore.env`):
+#   docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
+#     --env-file <общий .env> --env-file <sofascore.env> up -d --no-deps airflow-scheduler
+#   ВСЕГДА --no-deps: без него depends_on пересоздаст airflow-init (см. SHARED-STACK-PROTOCOL.md).
+name: sofascore-airflow
+
+x-ss-airflow-common: &ss-airflow-common
+  image: ${SOFASCORE_AIRFLOW_IMAGE:?set the pinned SofaScore Airflow image}
+  shm_size: '512m'
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  cap_add: [CHOWN, SETGID, SETUID, SYS_PTRACE]
+  environment: &ss-airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:?set the Airflow fernet key}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # СВОЯ metadata-DB: сервис airflow-metadb в этом проекте. Ни при каких
+    # обстоятельствах не менять на общий postgres — двойной scheduler на одной БД.
+    # Пароль контура отдельный от общего AIRFLOW_DB_PASSWORD: база инициализирована
+    # 2026-07-17 своим значением, общий .env с тех пор сменил пароль.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${SOFASCORE_AIRFLOW_DB_PASSWORD:?set the SofaScore metadata-DB password}@airflow-metadb:5432/airflow
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY:?set the Airflow webserver secret key}
+    PYTHONPATH: /opt/airflow
+    # Trino/S3 — по алиасам через внешнюю dp-storage.
+    TRINO_HOST: trino
+    TRINO_PORT: ${TRINO_PORT:?set Trino port}
+    TRINO_PASSWORD: ${TRINO_PASSWORD:?set Trino password}
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3 access key}
+    S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3 secret key}
+    SOFASCORE_RAW_STORE_URI: s3://${ICEBERG_WAREHOUSE:?set warehouse bucket}/raw/sofascore
+    SOFASCORE_RAW_S3_ENDPOINT: seaweedfs:8333
+    SOFASCORE_RAW_S3_SCHEME: http
+    SOFASCORE_MANIFEST_BACKEND: trino
+    SOFASCORE_REGISTRY_PATH: /opt/airflow/configs/sofascore/tournaments.json
+    # Verified-артефакт смонтирован ВНЕ configs/sofascore: вложенный file-bind под
+    # read-only каталогом был виден в `docker inspect`, но отсутствовал в mountinfo
+    # контейнера, и воркеры читали шаблон verified:false из чекаута.
+    SOFASCORE_PROXY_BUDGET_ARTIFACT: /opt/airflow/runtime/sofascore/proxy_budget_canary.json
+    SOFASCORE_PROXY_BUDGET_ARTIFACT_ID: ${SOFASCORE_PROXY_BUDGET_ARTIFACT_ID:?set the exact verified SofaScore artifact SHA-256}
+    SOFASCORE_PROXY_BUDGET_LEDGER: /opt/airflow/logs/sofascore/proxy-budget-ledger.json
+    SOFASCORE_WORKLOAD_PLAN_DIR: /opt/airflow/logs/sofascore/workload-plans
+    # Хардкод (не из .env): в sofascore-net алиас sofascore_proxy_filter — наш шлюз
+    # проекта sofascore-gw (container_name у него другой, alias — от имени сервиса).
+    SOFASCORE_PROXY_CONTROL_URL: http://sofascore_proxy_filter:8899
+    SOFASCORE_PROXY_CONTROL_TOKEN: ${SOFASCORE_PROXY_CONTROL_TOKEN:-}
+    SOFASCORE_PROXY_LEASE_TTL_SECONDS: ${SOFASCORE_PROXY_LEASE_TTL_SECONDS:-3600}
+    SOFASCORE_PLAYER_ROTATION_MODULUS: ${SOFASCORE_PLAYER_ROTATION_MODULUS:-4}
+    SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES: ${SOFASCORE_PLAYER_ROTATION_MIN_LEAGUES:-10}
+    PROXY_FILTER_SOFASCORE_CANARY_HARD_CAP_BYTES: "0"
+    # Кампания «все мужские» (#1218): состояние и результаты — в runtime-каталоге
+    # вне дерева релиза, чтобы переживать ротации.
+    SOFASCORE_ALL_MENS_POLICY: /opt/airflow/configs/sofascore/all_mens_campaign.json
+    SOFASCORE_ALL_MENS_SNAPSHOT: /opt/airflow/runtime/sofascore/all-men/snapshot.json
+    SOFASCORE_ALL_MENS_STATE: /opt/airflow/runtime/sofascore/all-men/state.json
+    SOFASCORE_ALL_MENS_RESULT_DIR: /opt/airflow/runtime/sofascore/all-men/results
+    SOFASCORE_REFRESH_RESULT_DIR: /opt/airflow/runtime/sofascore/all-men/refresh-results
+    # Батч полосы актуалки урезан с дефолтных 8 до 3: при max_active_tasks=1 и
+    # execution_timeout=2h на скоуп восемь скоупов не влезают в dagrun_timeout=5h
+    # (находка code-review 25.08). Вернуть к 8 после замера реальной длительности скоупа.
+    SOFASCORE_REFRESH_BATCH_SIZE: ${SOFASCORE_REFRESH_BATCH_SIZE:-3}
+    TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+    TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    ALERT_ENV: sofascore-isolated
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+  volumes:
+    # DagBag = dags/ дерева релиза. Мини-DAG контура (dag_trigger_sofascore_daily,
+    # dag_sofascore_manifest_maintenance) лежат в dags/ репозитория; на общем
+    # scheduler'е их прячет dags/.airflowignore, здесь его накрывает свой блок-лист.
+    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/dags:/opt/airflow/dags:ro
+    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/deploy/sofascore/.airflowignore:/opt/airflow/dags/.airflowignore:ro
+    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/logs:/opt/airflow/logs
+    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/scrapers:/opt/airflow/scrapers:ro
+    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/scripts:/opt/airflow/scripts:ro
+    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/configs/medallion:/opt/airflow/configs/medallion:ro
+    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/configs/soccerdata:/opt/airflow/configs/soccerdata:ro
+    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/configs/sofascore:/opt/airflow/configs/sofascore:ro
+    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
+    # RUNTIME_FILE_ENTRIES после #1002 включают docker/images/airflow/requirements-*.txt;
+    # вшитый в пинованный образ runtime-contract их не содержит (собран раньше) —
+    # fingerprint читает их из дерева (дерево имеет приоритет над baked-копией).
+    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/docker:/opt/airflow/docker:ro
+    # Immutable digest-адресуемый verified-артефакт и состояние кампании — вне дерева
+    # релиза. Длинный синтаксис: Docker не подменит отсутствующий источник пустым файлом.
+    - type: bind
+      source: ${SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST:?set the immutable verified SofaScore budget artifact host file}
+      target: /opt/airflow/runtime/sofascore/proxy_budget_canary.json
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR:?set the durable all-men campaign runtime host directory}
+      target: /opt/airflow/runtime/sofascore/all-men
+      bind:
+        create_host_path: false
+    # Пул прокси scheduler'а (секрет, вне git).
+    - ${SOFASCORE_PROXY_POOL_FILE:?set the host proxy pool file for the scheduler}:/opt/airflow/proxys.txt:ro
+    # master-DAG зовёт /opt/legacy-scraper-venv/bin/python (изолированный venv в
+    # НОВЫХ образах). В пинованном образе те же скрейпинг-зависимости живут в основном
+    # интерпретаторе — каталог-шим с симлинком bin/python восстанавливает семантику.
+    - ${SOFASCORE_LEGACY_SCRAPER_VENV_HOST_DIR:?set the legacy-scraper-venv shim directory}:/opt/legacy-scraper-venv:ro
+    - ss_soccerdata_cache:/home/airflow/soccerdata
+  networks:
+    - sofascore-net
+    - dp-storage
+
+services:
+  airflow-metadb:
+    image: ${SOFASCORE_POSTGRES_IMAGE:-postgres:16-alpine}
+    container_name: sofascore-airflow-metadb
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID, FOWNER, DAC_READ_SEARCH]
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${SOFASCORE_AIRFLOW_DB_PASSWORD:?set the SofaScore metadata-DB password}
+      POSTGRES_DB: airflow
+    volumes:
+      - ss_airflow_pgdata:/var/lib/postgresql/data
+    networks:
+      - sofascore-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  airflow-init:
+    <<: *ss-airflow-common
+    container_name: sofascore-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -euo pipefail
+        airflow db migrate
+        airflow users create \
+          --username $${_AIRFLOW_WWW_USER_USERNAME} \
+          --password $${_AIRFLOW_WWW_USER_PASSWORD} \
+          --firstname Admin --lastname User --role Admin \
+          --email admin@example.com || true
+        airflow pools set 'ingest_scraper_pool' 1 'Serialize heavy ingest scrapers (isolated sofascore stack #951)'
+        echo "sofascore-airflow init complete"
+    environment:
+      <<: *ss-airflow-env
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:?set the Airflow admin user}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:?set the Airflow admin password}
+    restart: "no"
+    depends_on:
+      airflow-metadb:
+        condition: service_healthy
+
+  airflow-scheduler:
+    <<: *ss-airflow-common
+    container_name: sofascore-airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 10G
+        reservations:
+          memory: 1G
+
+  # Опциональный UI для приёмки: ... --profile ui up -d ; http://127.0.0.1:8083
+  airflow-webserver:
+    <<: *ss-airflow-common
+    container_name: sofascore-airflow-webserver
+    command: webserver
+    profiles: ["ui"]
+    ports:
+      - "127.0.0.1:8083:8080"
+    environment:
+      <<: *ss-airflow-env
+      AIRFLOW__WEBSERVER__WORKERS: "1"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+volumes:
+  # Имена совпадают с живыми томами контура — данные метабазы переживают смену файла.
+  ss_airflow_pgdata:
+    name: sofascore_airflow_pgdata
+  ss_soccerdata_cache:
+    name: sofascore_soccerdata_cache
+
+networks:
+  sofascore-net:
+    external: true
+    name: sofascore-net
+  dp-storage:
+    external: true
+    name: dp-storage
