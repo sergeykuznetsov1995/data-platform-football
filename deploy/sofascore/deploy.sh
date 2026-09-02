@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Выкат замороженного дерева на контур SofaScore (проекты sofascore-airflow / sofascore-gw).
 # Использование: bash deploy/sofascore/deploy.sh <release-root> [old-release-root]
-# Предпосылки: VERIFIED в <runtime>/canary-<digest8>; окно вне 14:00–15:30 UTC;
-#   кампания ставится на паузу и ждёт idle здесь же.
+# Предпосылки: VERIFIED в <runtime>/canary-<digest8>; окно вне 13:55–15:35 UTC;
+#   обе кампании (история и актуалка) ставятся на паузу и ждут idle здесь же,
+#   актуалка после выката возвращается в прежнее состояние.
 # Переменные — из $SOFASCORE_ENV_FILE (по умолчанию /etc/data-platform/sofascore.env);
 #   скрипт сам переписывает в нём SOFASCORE_RELEASE_ROOT / _PROXY_BUDGET_ARTIFACT_HOST / _ID —
 #   этот файл и есть единственный источник «какое дерево в бою» (compose, сторож, приёмка).
@@ -11,8 +12,9 @@ set -euo pipefail
 RELEASE="${1:?путь к замороженному дереву}"
 OLD_RELEASE="${2:-}"
 ENV_FILE="${SOFASCORE_ENV_FILE:-/etc/data-platform/sofascore.env}"
-# shellcheck disable=SC1090
-set -a; . "$ENV_FILE"; set +a
+# shellcheck source=deploy/sofascore/env.sh
+. "$(dirname "$0")/env.sh"
+sofascore_load_env "$ENV_FILE"
 : "${SOFASCORE_RUNTIME_DIR:?}" "${SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR:?}" "${SOFASCORE_GATEWAY_STATE_HOST_DIR:?}" \
   "${SOFASCORE_PLATFORM_ENV_FILE:?}" "${SOFASCORE_HOST_PYTHON:?}"
 
@@ -26,6 +28,7 @@ CAMPAIGN="$SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR"
 STATE="$SOFASCORE_GATEWAY_STATE_HOST_DIR"
 HIST=dag_backfill_sofascore_all_mens
 REFRESH=dag_refresh_sofascore_all_mens
+DAILY=dag_ingest_sofascore
 PSQL="docker exec sofascore-airflow-metadb psql -U airflow -d airflow -At -c"
 
 log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG"; }
@@ -34,24 +37,30 @@ set_env_var() {  # set_env_var KEY VALUE — переписать строку K
   grep -qE "^${key}=" "$ENV_FILE" || { echo "в $ENV_FILE нет строки ${key}=" >&2; exit 2; }
   sed -i "s#^${key}=.*#${key}=${value}#" "$ENV_FILE"
 }
+is_paused() { $PSQL "SELECT is_paused FROM dag WHERE dag_id='$1';"; }
+pause_dag() {
+  docker exec sofascore-airflow-scheduler airflow dags pause "$1" >> "$LOG" 2>&1
+  [ "$(is_paused "$1")" = "t" ] || { log "$1 did not pause"; exit 7; }
+}
 
 [ -f "$WORKSPACE/VERIFIED" ] || { echo "нет VERIFIED в $WORKSPACE" >&2; exit 2; }
 [ -f "$SCHED_COMPOSE" ] && [ -f "$GW_COMPOSE" ] || { echo "в $RELEASE нет deploy/sofascore/*.compose.yaml" >&2; exit 2; }
 hour=$(date -u +%H%M)
 if [ "$hour" -ge 1355 ] && [ "$hour" -le 1535 ]; then echo "окно дейли 14:00–15:30 UTC — позже" >&2; exit 3; fi
 
-log "pause $HIST and wait for idle"
-docker exec sofascore-airflow-scheduler airflow dags pause "$HIST" >> "$LOG" 2>&1
-paused=$($PSQL "SELECT is_paused FROM dag WHERE dag_id='$HIST';")
-[ "$paused" = "t" ] || { log "$HIST did not pause"; exit 7; }
+# Пересоздание scheduler'а обрывает любой идущий таск, поэтому на паузу — обе кампании.
+# Актуалка после выката возвращается в то состояние, в каком была; история остаётся
+# на паузе до ручного решения (как и раньше).
+REFRESH_WAS_PAUSED=$(is_paused "$REFRESH")
+log "pause $HIST and $REFRESH (refresh was paused=$REFRESH_WAS_PAUSED), wait for idle"
+pause_dag "$HIST"
+pause_dag "$REFRESH"
 while true; do
-  busy=$($PSQL "SELECT count(*) FROM task_instance WHERE dag_id IN ('dag_ingest_sofascore','$HIST') AND state IN ('queued','running');")
-  active_daily=$($PSQL "SELECT count(*) FROM dag_run WHERE dag_id='dag_ingest_sofascore' AND state IN ('queued','running');")
-  [ "$busy" = "0" ] && [ "$active_daily" = "0" ] && break
+  busy=$($PSQL "SELECT count(*) FROM task_instance WHERE dag_id IN ('$DAILY','$HIST','$REFRESH') AND state IN ('queued','running');")
+  active=$($PSQL "SELECT count(*) FROM dag_run WHERE dag_id IN ('$DAILY','$HIST','$REFRESH') AND state IN ('queued','running');")
+  [ "$busy" = "0" ] && [ "$active" = "0" ] && break
   sleep 60
 done
-active_history=$($PSQL "SELECT count(*) FROM dag_run WHERE dag_id='$HIST' AND state IN ('queued','running');")
-[ "$active_history" = "0" ] || { log "$HIST still has $active_history active DagRun(s)"; exit 7; }
 log "idle"
 
 DIGEST=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$RELEASE" "$SOFASCORE_HOST_PYTHON" -B -c \
@@ -89,16 +98,26 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$RELEASE" "$SOFASCORE_HOST_PYTHON" -B \
 log "preflight ok"
 
 # Единственный источник истины о бое — env-файл контура; compose и сторож читают его.
+# Значения этого выката передаются compose и явно (окружение процесса сильнее
+# --env-file — так старое значение никогда не перекроет новое).
 set_env_var SOFASCORE_RELEASE_ROOT "$RELEASE"
 set_env_var SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST "$ARTIFACT_DEST"
 set_env_var SOFASCORE_PROXY_BUDGET_ARTIFACT_ID "$ARTIFACT_ID"
+sofascore_load_env "$ENV_FILE"
+[ "$SOFASCORE_RELEASE_ROOT" = "$RELEASE" ] || { log "env file did not take the new release root"; exit 2; }
 log "env file $ENV_FILE repinned to $RELEASE"
 
+SOFASCORE_RELEASE_ROOT="$RELEASE" \
+SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST="$ARTIFACT_DEST" \
+SOFASCORE_PROXY_BUDGET_ARTIFACT_ID="$ARTIFACT_ID" \
 docker compose -p sofascore-airflow -f "$SCHED_COMPOSE" \
   --env-file "$SOFASCORE_PLATFORM_ENV_FILE" --env-file "$ENV_FILE" \
   up -d --no-deps --force-recreate airflow-scheduler >> "$LOG" 2>&1
 log "scheduler up"
 
+SOFASCORE_RELEASE_ROOT="$RELEASE" \
+SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST="$ARTIFACT_DEST" \
+SOFASCORE_PROXY_BUDGET_ARTIFACT_ID="$ARTIFACT_ID" \
 docker compose -p sofascore-gw -f "$GW_COMPOSE" \
   --project-directory "$RELEASE" \
   --env-file "$SOFASCORE_PLATFORM_ENV_FILE" --env-file "$ENV_FILE" \
@@ -113,7 +132,8 @@ done
 [ "$(docker inspect -f '{{.State.Health.Status}}' sofascore_gw_951)" = "healthy" ] || { log "gateway unhealthy"; exit 5; }
 mem=$(docker inspect -f '{{.HostConfig.Memory}}' sofascore_gw_951)
 log "gateway healthy; HostConfig.Memory=$mem (ожидание 1073741824)"
-docker logs sofascore_gw_951 --since 10m 2>&1 | grep -E "residential pool|paid_enabled|compacted|listening|SofaScore paid leases disabled" | tail -8 | tee -a "$LOG"
+# `|| true`: пустой лог за 10 минут — не повод обрывать выкат (pipefail + grep=1).
+docker logs sofascore_gw_951 --since 10m 2>&1 | grep -E "residential pool|paid_enabled|compacted|listening|SofaScore paid leases disabled" | tail -8 | tee -a "$LOG" || true
 
 docker exec sofascore-airflow-scheduler python /opt/airflow/scripts/sofascore_runtime_preflight.py scheduler-health \
   --artifact /opt/airflow/runtime/sofascore/proxy_budget_canary.json \
@@ -122,17 +142,21 @@ docker exec sofascore-airflow-scheduler python /opt/airflow/scripts/sofascore_ru
   --campaign-policy /opt/airflow/configs/sofascore/all_mens_campaign.json >> "$LOG" 2>&1
 for _ in $(seq 1 30); do
   errs=$($PSQL "SELECT count(*) FROM import_error;")
-  present=$($PSQL "SELECT count(*) FROM dag WHERE dag_id IN ('$HIST','$REFRESH','dag_ingest_sofascore') AND is_active=true;")
+  present=$($PSQL "SELECT count(*) FROM dag WHERE dag_id IN ('$HIST','$REFRESH','$DAILY') AND is_active=true;")
   [ "$present" = "3" ] && break
   sleep 10
 done
 log "dags active=$present import_errors=$errs"
 [ "$errs" = "0" ] || { log "import errors present — см. import_error"; exit 6; }
 
-docker exec sofascore-airflow-scheduler airflow dags pause "$HIST" >> "$LOG" 2>&1
-paused=$($PSQL "SELECT is_paused FROM dag WHERE dag_id='$HIST';")
-[ "$paused" = "t" ] || { log "$HIST did not remain paused"; exit 7; }
-log "history kept paused; $REFRESH остаётся paused до принятого ручного fresh-прогона"
+pause_dag "$HIST"
+if [ "$REFRESH_WAS_PAUSED" = "f" ]; then
+  docker exec sofascore-airflow-scheduler airflow dags unpause "$REFRESH" >> "$LOG" 2>&1
+  [ "$(is_paused "$REFRESH")" = "f" ] || { log "$REFRESH did not unpause"; exit 7; }
+  log "history kept paused; $REFRESH unpaused (restored)"
+else
+  log "history kept paused; $REFRESH kept paused (as before)"
+fi
 
 # Сторож аренд читает тот же env-файл (EnvironmentFile= в unit) — достаточно рестарта.
 systemctl restart sofascore-gw-lease-watchdog.service

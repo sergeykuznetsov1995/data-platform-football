@@ -15,8 +15,9 @@ umask 0022
 
 SHA="${1:?sha коммита для заморозки}"
 ENV_FILE="${SOFASCORE_ENV_FILE:-/etc/data-platform/sofascore.env}"
-# shellcheck disable=SC1090
-set -a; . "$ENV_FILE"; set +a
+# shellcheck source=deploy/sofascore/env.sh
+. "$(dirname "$0")/env.sh"
+sofascore_load_env "$ENV_FILE"
 : "${SOFASCORE_SOURCE_REPO:?}" "${SOFASCORE_RELEASES_DIR:?}" "${SOFASCORE_HOST_PYTHON:?}"
 
 [ -d "$SOFASCORE_RELEASES_DIR" ] || { echo "нет каталога релизов $SOFASCORE_RELEASES_DIR" >&2; exit 1; }

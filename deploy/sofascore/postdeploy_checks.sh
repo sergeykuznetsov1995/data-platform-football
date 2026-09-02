@@ -1,51 +1,65 @@
 #!/usr/bin/env bash
-# Приёмка выката на контур SofaScore. Только чтение.
+# Приёмка выката на контур SofaScore. Только чтение; код выхода 1, если хоть одна
+# проверка не сошлась (монты не на ожидаемом дереве, import_error, неактивные DAG,
+# сторож не на дереве или не active, /health не отвечает).
 # Использование: bash deploy/sofascore/postdeploy_checks.sh [release-root]
 #   (по умолчанию — SOFASCORE_RELEASE_ROOT из $SOFASCORE_ENV_FILE)
 set -uo pipefail
 ENV_FILE="${SOFASCORE_ENV_FILE:-/etc/data-platform/sofascore.env}"
-# shellcheck disable=SC1090
-set -a; . "$ENV_FILE"; set +a
+# shellcheck source=deploy/sofascore/env.sh
+. "$(dirname "$0")/env.sh"
+sofascore_load_env "$ENV_FILE"
 RELEASE="${1:-${SOFASCORE_RELEASE_ROOT:?}}"
 CAMPAIGN="${SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR:?}"
 PSQL="docker exec sofascore-airflow-metadb psql -U airflow -d airflow -At -c"
+FAILS=0
+fail() { echo "  ✗ $*"; FAILS=$((FAILS + 1)); }
+ok() { echo "  ✓ $*"; }
 
 echo "== 0. Ожидаемое дерево: $RELEASE =="
 
 echo "== 1. Шлюз: память, дерево, старт =="
 docker inspect -f 'Memory={{.HostConfig.Memory}} Started={{.State.StartedAt}} Health={{.State.Health.Status}}' sofascore_gw_951
 docker inspect -f '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}' sofascore_gw_951
+[ "$(docker inspect -f '{{.State.Health.Status}}' sofascore_gw_951 2>/dev/null)" = "healthy" ] && ok "шлюз healthy" || fail "шлюз не healthy"
+[ "$(docker inspect -f '{{.HostConfig.Memory}}' sofascore_gw_951 2>/dev/null)" = "1073741824" ] && ok "лимит памяти 1 GiB" || fail "лимит памяти шлюза ≠ 1 GiB"
 echo "-- аргумент бюджета discovery (в Cmd) --"
 docker inspect -f '{{range .Config.Cmd}}{{println .}}{{end}}' sofascore_gw_951 \
-  | grep -A1 -E "discovery-dagrun-budget-bytes" || echo "(нет аргумента бюджета discovery!)"
+  | grep -A1 -E "discovery-dagrun-budget-bytes" || fail "нет аргумента бюджета discovery"
 docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' sofascore_gw_951 | grep -E "ARTIFACT|PAID" || true
 
 echo
 echo "== 2. Лог шлюза: пул, платный путь, компакция WAL =="
 docker logs sofascore_gw_951 --since 30m 2>&1 \
-  | grep -E "residential pool|paid_enabled|compacted|listening|paid leases disabled" | tail -10
+  | grep -E "residential pool|paid_enabled|compacted|listening|paid leases disabled" | tail -10 || true
 
 echo
 echo "== 3. Планировщик: дерево и env кампании =="
 docker inspect -f 'Started={{.State.StartedAt}} Health={{.State.Health.Status}}' sofascore-airflow-scheduler
 docker inspect -f '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}' sofascore-airflow-scheduler
-docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' sofascore-airflow-scheduler | grep -E "ALL_MENS_(STATE|RESULT)|REFRESH" || echo "(нет env кампании!)"
-echo "-- монты не на ожидаемом дереве --"
-docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' sofascore-airflow-scheduler sofascore_gw_951 \
-  | grep -E "/release-|dpf-release-" | grep -v "^$RELEASE" || echo "(все монты релиза на $RELEASE)"
+[ "$(docker inspect -f '{{.State.Health.Status}}' sofascore-airflow-scheduler 2>/dev/null)" = "healthy" ] && ok "scheduler healthy" || fail "scheduler не healthy"
+docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' sofascore-airflow-scheduler | grep -qE "ALL_MENS_STATE=" && ok "env кампании на месте" || fail "нет env кампании"
+echo "-- монты релиза не на ожидаемом дереве --"
+stray=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' sofascore-airflow-scheduler sofascore_gw_951 \
+  | grep -E "/release-|dpf-release-" | grep -v "^$RELEASE\(/\|$\)" || true)
+if [ -n "$stray" ]; then echo "$stray"; fail "есть монты не на $RELEASE"; else ok "все монты релиза на $RELEASE"; fi
 
 echo
 echo "== 4. Метабаза: import_error, состояние DAG-ов =="
-$PSQL "SELECT count(*) FROM import_error;" | sed 's/^/import_error=/'
+errs=$($PSQL "SELECT count(*) FROM import_error;")
+echo "import_error=$errs"
+[ "$errs" = "0" ] && ok "import_error=0" || fail "import_error=$errs"
 $PSQL "SELECT dag_id, is_paused, is_active FROM dag WHERE dag_id LIKE '%sofascore%' ORDER BY 1;"
+active=$($PSQL "SELECT count(*) FROM dag WHERE dag_id IN ('dag_backfill_sofascore_all_mens','dag_refresh_sofascore_all_mens','dag_ingest_sofascore','dag_trigger_sofascore_daily','dag_sofascore_manifest_maintenance') AND is_active=true;")
+[ "$active" = "5" ] && ok "5 DAG контура активны" || fail "активных DAG контура: $active из 5"
 
 echo
 echo "== 5. Состояние кампании =="
-python3 - "$CAMPAIGN/state.json" <<'PY'
+python3 - "$CAMPAIGN/state.json" <<'PY' || fail "state.json кампании не читается"
 import json, sys, os
 p = sys.argv[1]
 if not os.path.exists(p):
-    print("НЕТ", p); raise SystemExit
+    print("НЕТ", p); raise SystemExit(1)
 s = json.load(open(p))
 print("completed =", len(s.get("completed", [])), "| файл:", p)
 PY
@@ -54,12 +68,17 @@ ls -1 "$CAMPAIGN/results" 2>/dev/null | wc -l | sed 's/^/results файлов: /
 
 echo
 echo "== 6. Вотчдог аренд =="
-systemctl show -p ExecStart sofascore-gw-lease-watchdog.service | grep -o -- "--expected-mount [^ ]*"
-systemctl is-active sofascore-gw-lease-watchdog.service
+pin=$(systemctl show -p ExecStart sofascore-gw-lease-watchdog.service | grep -o -- "--expected-mount [^ ;]*" || true)
+echo "${pin:-(нет --expected-mount)}"
+[ "$pin" = "--expected-mount $RELEASE" ] && ok "сторож на $RELEASE" || fail "сторож не на $RELEASE"
+[ "$(systemctl is-active sofascore-gw-lease-watchdog.service)" = "active" ] && ok "сторож active" || fail "сторож не active"
 
 echo
 echo "== 7. Health шлюза =="
 docker exec sofascore-airflow-scheduler python -c "
 import json,urllib.request
 print(json.dumps(json.load(urllib.request.urlopen('http://sofascore_proxy_filter:8899/health', timeout=15)), ensure_ascii=False)[:600])
-" 2>&1 | tail -3
+" 2>&1 | tail -3 && ok "/health отвечает" || fail "/health не отвечает"
+
+echo
+if [ "$FAILS" -eq 0 ]; then echo "ПРИЁМКА: ок"; else echo "ПРИЁМКА: $FAILS проблем(ы)"; exit 1; fi

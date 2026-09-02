@@ -5,15 +5,16 @@
 # Использование: bash deploy/sofascore/run_canary.sh <release-root>
 # Переменные — из $SOFASCORE_ENV_FILE: SOFASCORE_RUNTIME_DIR, SOFASCORE_GATEWAY_IMAGE,
 #   SOFASCORE_CANARY_COLLECTOR_IMAGE, SOFASCORE_GATEWAY_FALLBACK_PROXY_FILE,
-#   SOFASCORE_PROXY_POOL_ENV_FILE, SOFASCORE_HOST_PYTHON.
+#   SOFASCORE_PROXY_POOL_JSON (тот же пул, что у боевого шлюза), SOFASCORE_HOST_PYTHON.
 set -uo pipefail
 
 RELEASE="${1:?путь к замороженному дереву}"
 ENV_FILE="${SOFASCORE_ENV_FILE:-/etc/data-platform/sofascore.env}"
-# shellcheck disable=SC1090
-set -a; . "$ENV_FILE"; set +a
+# shellcheck source=deploy/sofascore/env.sh
+. "$(dirname "$0")/env.sh"
+sofascore_load_env "$ENV_FILE"
 : "${SOFASCORE_RUNTIME_DIR:?}" "${SOFASCORE_GATEWAY_IMAGE:?}" "${SOFASCORE_CANARY_COLLECTOR_IMAGE:?}" \
-  "${SOFASCORE_GATEWAY_FALLBACK_PROXY_FILE:?}" "${SOFASCORE_PROXY_POOL_ENV_FILE:?}" "${SOFASCORE_HOST_PYTHON:?}"
+  "${SOFASCORE_GATEWAY_FALLBACK_PROXY_FILE:?}" "${SOFASCORE_PROXY_POOL_JSON:?}" "${SOFASCORE_HOST_PYTHON:?}"
 
 TAG=$(basename "$RELEASE" | sed 's/^release-//')
 WORKSPACE="$SOFASCORE_RUNTIME_DIR/canary-$TAG"
@@ -34,18 +35,10 @@ if [ ! -s "$TOKEN_FILE" ]; then
   openssl rand -hex 24 > "$TOKEN_FILE"
 fi
 TOKEN=$(<"$TOKEN_FILE")
-# Файл с одной строкой SOFASCORE_PROXY_POOL_JSON=<json>; значение уходит контейнеру
-# только через окружение, в лог и argv не попадает.
-IFS= read -r POOL_LINE < "$SOFASCORE_PROXY_POOL_ENV_FILE"
-case "$POOL_LINE" in
-  SOFASCORE_PROXY_POOL_JSON=*) PROXY_POOL_JSON=${POOL_LINE#SOFASCORE_PROXY_POOL_JSON=} ;;
-  *) echo "pool env file has an unexpected format (expected SOFASCORE_PROXY_POOL_JSON=...)" >&2; exit 4 ;;
-esac
-case "$PROXY_POOL_JSON" in
-  \'*\') PROXY_POOL_JSON=${PROXY_POOL_JSON#\'}; PROXY_POOL_JSON=${PROXY_POOL_JSON%\'} ;;
-esac
-export PROXY_POOL_JSON
-unset POOL_LINE
+# Канарейка проверяет ровно тот пул, который затем уйдёт в бой (gateway.compose.yaml
+# читает ту же SOFASCORE_PROXY_POOL_JSON); значение уходит контейнеру только через
+# окружение, в лог и argv не попадает.
+export PROXY_POOL_JSON="$SOFASCORE_PROXY_POOL_JSON"
 ARTIFACT_ID=$(sha256sum "$TEMPLATE" | awk '{print $1}')
 
 cleanup() {
