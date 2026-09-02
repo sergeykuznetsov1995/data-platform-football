@@ -47,7 +47,7 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
             *"SELECT is_paused"*)
               dag=${{sql#*dag_id=\\'}}; dag=${{dag%%\\'*}}
               cat "$STATE/paused_$dag" ;;
-            *"is_active=true"*) echo 3 ;;
+            *"is_active=true"*) cat "$STATE/active_count" 2>/dev/null || echo 3 ;;
             *"count(*)"*) echo 0 ;;
             *) echo "unexpected sql: $sql" >&2; exit 9 ;;
           esac
@@ -58,7 +58,10 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
           exit 0
         fi
         if [ "$1" = inspect ]; then
-          case "$*" in *Health.Status*) echo healthy ;; *HostConfig.Memory*) echo 1073741824 ;; esac
+          case "$*" in
+            *Health.Status*) cat "$STATE/health" 2>/dev/null || echo healthy ;;
+            *HostConfig.Memory*) echo 1073741824 ;;
+          esac
           exit 0
         fi
         exit 0
@@ -67,6 +70,8 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
     )
     _write(bin_dir / "systemctl", "#!/usr/bin/env bash\necho active\n", 0o755)
     _write(bin_dir / "chown", "#!/usr/bin/env bash\nexit 0\n", 0o755)
+    # The script polls with sleep 10/60; the stub makes failure paths finish instantly.
+    _write(bin_dir / "sleep", "#!/usr/bin/env bash\nexit 0\n", 0o755)
     _write(
         bin_dir / "date",
         '#!/usr/bin/env bash\ncase "$*" in *%H%M*) echo 0000 ;; *) echo 2026-01-01T00:00:00Z ;; esac\n',
@@ -81,7 +86,7 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
 
 def _layout(tmp_path: Path, *, refresh_paused: str) -> tuple[Path, Path, Path, Path]:
     runtime = tmp_path / "runtime"
-    release = tmp_path / "releases" / f"release-{TAG}"
+    release = tmp_path / "releases" / f"release-{TAG}-abcdef12"
     state_dir = tmp_path / "stub-state"
     bin_dir = tmp_path / "bin"
     state_dir.mkdir()
@@ -195,29 +200,190 @@ def test_deploy_keeps_refresh_paused_when_it_was_paused_before(tmp_path: Path) -
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("break_state", "expected_rc", "expected_step"),
+    [({"health": "unhealthy"}, 5, "gateway-health"), ({"active_count": "2"}, 6, "scheduler-health")],
+    ids=["gateway-unhealthy", "core-dags-missing"],
+)
+def test_deploy_restores_refresh_and_names_the_step_when_a_late_step_fails(
+    tmp_path: Path, break_state: dict, expected_rc: int, expected_step: str
+) -> None:
+    runtime, release, env_file, state_dir = _layout(tmp_path, refresh_paused="f")
+    for name, value in break_state.items():
+        (state_dir / name).write_text(value + "\n")
+    env = {**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}", "SOFASCORE_ENV_FILE": str(env_file)}
+    proc = subprocess.run(
+        ["bash", str(DEPLOY / "deploy.sh"), str(release)], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == expected_rc, proc.stdout + proc.stderr
+    log = (runtime / "all-men" / "deploy.log").read_text(encoding="utf-8")
+    assert f"FAILED at step '{expected_step}'" in log
+    # The refresh campaign was unpaused before the rotation; a failed rotation
+    # must not leave it paused.
+    assert (state_dir / f"paused_{REFRESH}").read_text().strip() == "f"
+    args = [call[0] for call in _calls(state_dir)]
+    assert args.index(f"exec sofascore-airflow-scheduler airflow dags unpause {REFRESH}") > max(
+        i for i, a in enumerate(args) if a.startswith("compose ")
+    )
+
+
+@pytest.mark.unit
 def test_env_loader_strips_quotes_and_never_expands_or_exports(tmp_path: Path) -> None:
-    env_file = _write(
-        tmp_path / "x.env",
-        """\
-        # comment
-        PLAIN=a b
-        SINGLE='[{"host":"h","port":1},{"x":"$HOME"}]'
-        DOUBLE="q,{r}"
-        EMPTY=
-        """,
+    env_file = tmp_path / "x.env"
+    env_file.write_bytes(
+        b"# comment\r\n"
+        b"SOFASCORE_PLAIN=a b\r\n"
+        b"SOFASCORE_SINGLE='[{\"host\":\"h\",\"port\":1},{\"x\":\"$HOME\"}]'\r\n"
+        b'SOFASCORE_DOUBLE="q,{r} \\"quoted\\" back\\\\slash"\n'
+        b"SOFASCORE_EMPTY=\r\n"
+        b"SOFASCORE_STALE=fresh\n"
     )
     script = f"""\
+        export SOFASCORE_STALE=from-operator-shell
         . {DEPLOY}/env.sh
-        sofascore_load_env {env_file}
-        printf '%s|%s|%s|%s\\n' "$PLAIN" "$SINGLE" "$DOUBLE" "${{EMPTY-unset}}"
-        env | grep -c '^SINGLE=' || true
+        sofascore_load_env {env_file} || exit 9
+        printf '%s|%s|%s|%s|%s\\n' "$SOFASCORE_PLAIN" "$SOFASCORE_SINGLE" "$SOFASCORE_DOUBLE" \\
+          "${{SOFASCORE_EMPTY-unset}}" "$SOFASCORE_STALE"
+        env | grep -c '^SOFASCORE_' || true
         """
     proc = subprocess.run(["bash", "-c", textwrap.dedent(script)], capture_output=True, text=True, check=True)
     values, exported = proc.stdout.splitlines()
-    assert values == 'a b|[{"host":"h","port":1},{"x":"$HOME"}]|q,{r}|'
+    assert values == 'a b|[{"host":"h","port":1},{"x":"$HOME"}]|q,{r} "quoted" back\\slash||fresh'
+    # A value inherited as exported from the operator shell is replaced AND un-exported.
     assert exported == "0"
-    bad = _write(tmp_path / "bad.env", "NOT A LINE\n")
-    proc = subprocess.run(
-        ["bash", "-c", f". {DEPLOY}/env.sh; sofascore_load_env {bad}"], capture_output=True, text=True
+    for bad_text, reason in (
+        ("NOT A LINE\n", "no equals sign"),
+        ("PATH=/evil\n", "foreign key must not clobber the script environment"),
+        ("SOFASCORE_ok-ish=1\n", "invalid identifier"),
+    ):
+        bad = _write(tmp_path / "bad.env", bad_text)
+        proc = subprocess.run(
+            ["bash", "-c", f"export PATH; . {DEPLOY}/env.sh; sofascore_load_env {bad}; echo rc=$?; command -v bash"],
+            capture_output=True, text=True,
+        )
+        assert "rc=2" in proc.stdout, reason
+        assert proc.stdout.strip().endswith("bash"), "PATH survived the rejected file"
+
+
+def _postdeploy_stub(bin_dir: Path, mounts_file: Path) -> None:
+    _write(
+        bin_dir / "docker",
+        f"""\
+        #!/usr/bin/env bash
+        if [ "$1" = inspect ]; then
+          case "$*" in
+            *".Destination}}}}={{{{.Source}}}}"*) grep "^$(printf '%s' "${{@: -1}}")|" "{mounts_file}" | cut -d'|' -f2- ;;
+            *Health.Status*) echo healthy ;;
+            *HostConfig.Memory*) echo 1073741824 ;;
+            *Config.Cmd*) echo -- --sofascore-discovery-dagrun-budget-bytes; echo 67108864 ;;
+            *Config.Env*) echo SOFASCORE_ALL_MENS_STATE=/x ;;
+            *) echo "Memory=1073741824 Started=now Health=healthy" ;;
+          esac
+          exit 0
+        fi
+        if [ "$1" = exec ] && [ "$2" = sofascore-airflow-metadb ]; then
+          case "${{@: -1}}" in *import_error*) echo 0 ;; *is_active=true*) echo 5 ;; *) echo "dag|f|t" ;; esac
+          exit 0
+        fi
+        if [ "$1" = exec ]; then echo '{{"status":"ok"}}'; exit 0; fi
+        exit 0
+        """,
+        0o755,
     )
-    assert proc.returncode == 2
+    _write(
+        bin_dir / "systemctl",
+        '#!/usr/bin/env bash\ncase "$*" in *show*) echo "ExecStart={{ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /usr/local/libexec/sofascore-gw-lease-watchdog --container sofascore_gw_951 --state-dir /s --expected-mount $EXPECTED_MOUNT --alert-command /a ; ignore_errors=no }}" ;; *) echo active ;; esac\n',
+        0o755,
+    )
+
+
+def _run_postdeploy(tmp_path: Path, scheduler_mounts: dict[str, str], gateway_mounts: dict[str, str]) -> subprocess.CompletedProcess:
+    runtime = tmp_path / "runtime"
+    release = tmp_path / "releases" / f"release-{TAG}-abcdef12"
+    _write(runtime / "all-men" / "state.json", json.dumps({"completed": [1, 2]}))
+    (runtime / "all-men" / "results").mkdir(parents=True, exist_ok=True)
+    env_file = _write(
+        tmp_path / "sofascore.env",
+        f"""\
+        SOFASCORE_RELEASE_ROOT={release}
+        SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR={runtime}/all-men
+        SOFASCORE_GATEWAY_STATE_HOST_DIR={runtime}/gateway-state
+        SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST={runtime}/artifacts/{DIGEST}/proxy_budget_canary.json
+        SOFASCORE_PROXY_POOL_FILE={runtime}/proxys.txt
+        SOFASCORE_GATEWAY_FALLBACK_PROXY_FILE={runtime}/fallback.txt
+        SOFASCORE_LEGACY_SCRAPER_VENV_HOST_DIR={runtime}/legacy-scraper-venv
+        """,
+    )
+    mounts_file = tmp_path / "mounts.txt"
+    mounts_file.write_text(
+        "".join(f"sofascore-airflow-scheduler|{d}={s}\n" for d, s in scheduler_mounts.items())
+        + "".join(f"sofascore_gw_951|{d}={s}\n" for d, s in gateway_mounts.items()),
+        encoding="utf-8",
+    )
+    _postdeploy_stub(tmp_path / "bin", mounts_file)
+    env = {
+        **os.environ,
+        "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
+        "SOFASCORE_ENV_FILE": str(env_file),
+        "EXPECTED_MOUNT": str(release),
+    }
+    return subprocess.run(
+        ["bash", str(DEPLOY / "postdeploy_checks.sh")], env=env, capture_output=True, text=True, timeout=60
+    )
+
+
+def _expected_mounts(tmp_path: Path) -> tuple[dict[str, str], dict[str, str]]:
+    runtime = tmp_path / "runtime"
+    release = tmp_path / "releases" / f"release-{TAG}-abcdef12"
+    artifact = f"{runtime}/artifacts/{DIGEST}/proxy_budget_canary.json"
+    scheduler = {
+        "/opt/airflow/dags": f"{release}/dags",
+        "/opt/airflow/dags/.airflowignore": f"{release}/deploy/sofascore/.airflowignore",
+        "/opt/airflow/logs": f"{release}/logs",
+        "/opt/airflow/scrapers": f"{release}/scrapers",
+        "/opt/airflow/scripts": f"{release}/scripts",
+        "/opt/airflow/configs/medallion": f"{release}/configs/medallion",
+        "/opt/airflow/configs/soccerdata": f"{release}/configs/soccerdata",
+        "/opt/airflow/configs/sofascore": f"{release}/configs/sofascore",
+        "/opt/airflow/configs/proxy_filter": f"{release}/configs/proxy_filter",
+        "/opt/airflow/docker": f"{release}/docker",
+        "/opt/airflow/runtime/sofascore/proxy_budget_canary.json": artifact,
+        "/opt/airflow/runtime/sofascore/all-men": f"{runtime}/all-men",
+        "/opt/airflow/proxys.txt": f"{runtime}/proxys.txt",
+        "/opt/legacy-scraper-venv": f"{runtime}/legacy-scraper-venv",
+        "/home/airflow/soccerdata": "/var/lib/docker/volumes/sofascore_soccerdata_cache/_data",
+    }
+    gateway = {
+        "/opt/sofascore-repo": str(release),
+        "/opt/airflow/proxys.txt": f"{runtime}/fallback.txt",
+        "/opt/airflow/runtime/sofascore/proxy_budget_canary.json": artifact,
+        "/opt/airflow/logs/sofascore_proxy_filter": f"{runtime}/gateway-state",
+    }
+    return scheduler, gateway
+
+
+@pytest.mark.unit
+def test_postdeploy_passes_only_when_every_mount_pair_matches(tmp_path: Path) -> None:
+    scheduler, gateway = _expected_mounts(tmp_path)
+    proc = _run_postdeploy(tmp_path, scheduler, gateway)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "ПРИЁМКА: ок" in proc.stdout
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda s, g: s.__setitem__("/opt/airflow/scripts", "/old/release-deadbeef/scripts"),
+        lambda s, g: s.pop("/opt/airflow/docker"),
+        lambda s, g: s.__setitem__("/opt/airflow/dags/dag_trigger_sofascore_daily.py", "/old/runtime/dag.py"),
+        lambda s, g: g.__setitem__("/opt/sofascore-repo", "/old/release-deadbeef"),
+    ],
+    ids=["old-tree-mount", "missing-mount", "stale-mini-dag-file-bind", "gateway-old-tree"],
+)
+def test_postdeploy_fails_on_a_wrong_missing_or_extra_mount(tmp_path: Path, mutate) -> None:
+    scheduler, gateway = _expected_mounts(tmp_path)
+    mutate(scheduler, gateway)
+    proc = _run_postdeploy(tmp_path, scheduler, gateway)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "ПРИЁМКА: 1 проблем" in proc.stdout, proc.stdout

@@ -12,11 +12,12 @@ RELEASE="${1:?путь к замороженному дереву}"
 ENV_FILE="${SOFASCORE_ENV_FILE:-/etc/data-platform/sofascore.env}"
 # shellcheck source=deploy/sofascore/env.sh
 . "$(dirname "$0")/env.sh"
-sofascore_load_env "$ENV_FILE"
+sofascore_load_env "$ENV_FILE" || exit 2
 : "${SOFASCORE_RUNTIME_DIR:?}" "${SOFASCORE_GATEWAY_IMAGE:?}" "${SOFASCORE_CANARY_COLLECTOR_IMAGE:?}" \
   "${SOFASCORE_GATEWAY_FALLBACK_PROXY_FILE:?}" "${SOFASCORE_PROXY_POOL_JSON:?}" "${SOFASCORE_HOST_PYTHON:?}"
 
-TAG=$(basename "$RELEASE" | sed 's/^release-//')
+# release-<digest8>[-<gitsha8>] → рабочий каталог по digest (идентичность контракта).
+TAG=$(basename "$RELEASE" | sed -e 's/^release-//' -e 's/-.*$//')
 WORKSPACE="$SOFASCORE_RUNTIME_DIR/canary-$TAG"
 STATE="$WORKSPACE/gateway-state"
 ARTIFACT="$WORKSPACE/candidate.json"

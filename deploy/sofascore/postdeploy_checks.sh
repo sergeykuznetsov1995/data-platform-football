@@ -8,7 +8,7 @@ set -uo pipefail
 ENV_FILE="${SOFASCORE_ENV_FILE:-/etc/data-platform/sofascore.env}"
 # shellcheck source=deploy/sofascore/env.sh
 . "$(dirname "$0")/env.sh"
-sofascore_load_env "$ENV_FILE"
+sofascore_load_env "$ENV_FILE" || exit 2
 RELEASE="${1:-${SOFASCORE_RELEASE_ROOT:?}}"
 CAMPAIGN="${SOFASCORE_ALL_MENS_RUNTIME_HOST_DIR:?}"
 PSQL="docker exec sofascore-airflow-metadb psql -U airflow -d airflow -At -c"
@@ -39,10 +39,39 @@ docker inspect -f 'Started={{.State.StartedAt}} Health={{.State.Health.Status}}'
 docker inspect -f '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}' sofascore-airflow-scheduler
 [ "$(docker inspect -f '{{.State.Health.Status}}' sofascore-airflow-scheduler 2>/dev/null)" = "healthy" ] && ok "scheduler healthy" || fail "scheduler не healthy"
 docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' sofascore-airflow-scheduler | grep -qE "ALL_MENS_STATE=" && ok "env кампании на месте" || fail "нет env кампании"
-echo "-- монты релиза не на ожидаемом дереве --"
-stray=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' sofascore-airflow-scheduler sofascore_gw_951 \
-  | grep -E "/release-|dpf-release-" | grep -v "^$RELEASE\(/\|$\)" || true)
-if [ -n "$stray" ]; then echo "$stray"; fail "есть монты не на $RELEASE"; else ok "все монты релиза на $RELEASE"; fi
+echo "-- точные пары монтов (destination → ожидаемый source) --"
+check_mounts() {  # check_mounts <container> <dest>=<expected-source> ...
+  local container="$1"; shift
+  local actual dest expected got extra
+  actual=$(docker inspect -f '{{range .Mounts}}{{.Destination}}={{.Source}}{{"\n"}}{{end}}' "$container")
+  for pair in "$@"; do
+    dest=${pair%%=*}; expected=${pair#*=}
+    got=$(printf '%s\n' "$actual" | grep -F -- "$dest=" | grep -E "^$(printf '%s' "$dest" | sed 's/[][\.*^$]/\\&/g')=" | head -1 | cut -d= -f2-)
+    if [ "$got" = "$expected" ]; then ok "$container $dest ← $expected"; else fail "$container $dest ← '${got:-<нет монта>}' (ожидалось $expected)"; fi
+  done
+  extra=$(printf '%s\n' "$actual" | grep -E '^/opt/airflow/dags/' | grep -vF '/opt/airflow/dags/.airflowignore=' || true)
+  [ -z "$extra" ] || fail "$container: лишние монты поверх dags/: $extra"
+}
+check_mounts sofascore-airflow-scheduler \
+  "/opt/airflow/dags=$RELEASE/dags" \
+  "/opt/airflow/dags/.airflowignore=$RELEASE/deploy/sofascore/.airflowignore" \
+  "/opt/airflow/logs=$RELEASE/logs" \
+  "/opt/airflow/scrapers=$RELEASE/scrapers" \
+  "/opt/airflow/scripts=$RELEASE/scripts" \
+  "/opt/airflow/configs/medallion=$RELEASE/configs/medallion" \
+  "/opt/airflow/configs/soccerdata=$RELEASE/configs/soccerdata" \
+  "/opt/airflow/configs/sofascore=$RELEASE/configs/sofascore" \
+  "/opt/airflow/configs/proxy_filter=$RELEASE/configs/proxy_filter" \
+  "/opt/airflow/docker=$RELEASE/docker" \
+  "/opt/airflow/runtime/sofascore/proxy_budget_canary.json=${SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST:?}" \
+  "/opt/airflow/runtime/sofascore/all-men=$CAMPAIGN" \
+  "/opt/airflow/proxys.txt=${SOFASCORE_PROXY_POOL_FILE:?}" \
+  "/opt/legacy-scraper-venv=${SOFASCORE_LEGACY_SCRAPER_VENV_HOST_DIR:?}"
+check_mounts sofascore_gw_951 \
+  "/opt/sofascore-repo=$RELEASE" \
+  "/opt/airflow/proxys.txt=${SOFASCORE_GATEWAY_FALLBACK_PROXY_FILE:?}" \
+  "/opt/airflow/runtime/sofascore/proxy_budget_canary.json=${SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST:?}" \
+  "/opt/airflow/logs/sofascore_proxy_filter=${SOFASCORE_GATEWAY_STATE_HOST_DIR:?}"
 
 echo
 echo "== 4. Метабаза: import_error, состояние DAG-ов =="

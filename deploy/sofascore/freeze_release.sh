@@ -17,7 +17,7 @@ SHA="${1:?sha коммита для заморозки}"
 ENV_FILE="${SOFASCORE_ENV_FILE:-/etc/data-platform/sofascore.env}"
 # shellcheck source=deploy/sofascore/env.sh
 . "$(dirname "$0")/env.sh"
-sofascore_load_env "$ENV_FILE"
+sofascore_load_env "$ENV_FILE" || exit 2
 : "${SOFASCORE_SOURCE_REPO:?}" "${SOFASCORE_RELEASES_DIR:?}" "${SOFASCORE_HOST_PYTHON:?}"
 
 [ -d "$SOFASCORE_RELEASES_DIR" ] || { echo "нет каталога релизов $SOFASCORE_RELEASES_DIR" >&2; exit 1; }
@@ -46,7 +46,12 @@ TPL_DIGEST=$(python3 -c "import json;print(json.load(open('$TMP_TREE/configs/sof
   echo "ОШИБКА: digest шаблона $TPL_DIGEST != fingerprint дерева $DIGEST (перештамповать bootstrap)" >&2
   exit 1; }
 
-TREE="$SOFASCORE_RELEASES_DIR/release-${DIGEST:0:8}"
+# Имя: release-<digest8>-<gitsha8>. digest — идентичность runtime-контракта (по нему
+# ищутся канарейка и артефакт), sha различает деревья с одинаковым контрактом — правка
+# только рецепта deploy/sofascore/ или мини-DAG (они в fingerprint не входят) получает
+# новое дерево и не упирается в «уже существует».
+GIT_SHA=$(git -C "$TMP_TREE" rev-parse --short=8 HEAD)
+TREE="$SOFASCORE_RELEASES_DIR/release-${DIGEST:0:8}-${GIT_SHA}"
 [ -e "$TREE" ] && { echo "ОШИБКА: $TREE уже существует" >&2; exit 1; }
 mv "$TMP_TREE" "$TREE"
 trap - EXIT
@@ -59,5 +64,5 @@ chmod 755 "$TREE"
 mkdir -p "$TREE/logs"
 chown -R 50000:root "$TREE/logs"
 
-echo "дерево заморожено: $TREE (sha $SHA, digest $DIGEST)"
+echo "дерево заморожено: $TREE (sha $GIT_SHA, digest $DIGEST)"
 echo "дальше: bash deploy/sofascore/run_canary.sh $TREE  (tmux), затем deploy.sh после VERIFIED"
