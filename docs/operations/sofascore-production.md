@@ -28,7 +28,10 @@
 ## Единый источник истины
 
 - **Код** — одно замороженное дерево `${SOFASCORE_RELEASE_ROOT}`
-  (`${SOFASCORE_RELEASES_DIR}/release-<digest8>`, digest = `runtime_fingerprint` дерева).
+  (`${SOFASCORE_RELEASES_DIR}/release-<digest8>-<gitsha8>`: digest = `runtime_fingerprint`
+  дерева, идентичность runtime-контракта — по нему ищутся канарейка и артефакт; sha
+  различает деревья с одинаковым контрактом, например правку только рецепта или мини-DAG,
+  которые в fingerprint не входят).
   Оба compose-файла берут из него всё: `dags/`, `scripts/`, `scrapers/`, `configs/*`,
   `docker/`, `deploy/sofascore/.airflowignore`. Пустышек-mountpoint'ов и симлинков в
   дереве больше нет — `freeze_release.sh` их не создаёт, а проверяет, что рецепт есть
@@ -88,7 +91,7 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
 1. `bash deploy/sofascore/freeze_release.sh <sha>` — клон из `SOFASCORE_SOURCE_REPO`,
    `checkout --detach`, digest дерева сверяется с шаблоном
    `configs/sofascore/proxy_budget_canary.json` того же коммита, дерево переезжает в
-   `${SOFASCORE_RELEASES_DIR}/release-<digest8>` (0755, `logs/` под uid 50000).
+   `${SOFASCORE_RELEASES_DIR}/release-<digest8>-<gitsha8>` (0755, `logs/` под uid 50000).
 2. `bash deploy/sofascore/run_canary.sh <дерево>` (в tmux) — отдельный шлюз из нового
    дерева (без боевого DNS-алиаса) + коллектор `SOFASCORE_CANARY_COLLECTOR_IMAGE`,
    холодные сэмплы по классам манифеста, `verify` → файл `VERIFIED` в
@@ -100,12 +103,16 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
    состояния кампании (только если `state.json` ещё нет); `sofascore_runtime_preflight.py
    preflight`; перепин трёх строк в `sofascore.env`; `up -d --no-deps --force-recreate`
    scheduler'а и шлюза; ожидание healthy (10 мин), `scheduler-health`, `import_error=0`,
-   три активных DAG; история остаётся на паузе, актуалка возвращается в прежнее
-   состояние; `systemctl restart` сторожа.
+   ровно три активных core-DAG; история остаётся на паузе, актуалка возвращается в
+   прежнее состояние; `systemctl restart` сторожа. Любой аварийный выход после паузы
+   (preflight, compose, healthcheck, DAG-и) тоже возвращает актуалку и пишет в лог, на
+   каком шаге встали и какое дерево записано в env-файле (перепин делается до `up`, так
+   что после падения между scheduler'ом и шлюзом контур смешанный — повторить `deploy.sh`).
 4. `bash deploy/sofascore/postdeploy_checks.sh` — только чтение, код выхода 1 при любой
-   несошедшейся проверке: healthy и память шлюза, env кампании, монты обоих контейнеров
-   только на ожидаемом дереве, `import_error=0`, пять активных DAG контура, состояние
-   кампании, пин и статус сторожа (`systemctl show -p ExecStart`), `/health` шлюза.
+   несошедшейся проверке: healthy и память шлюза, env кампании, точные пары
+   «destination → source» всех монтов scheduler'а и шлюза (и ни одного лишнего монта
+   поверх `dags/`), `import_error=0`, пять активных DAG контура, состояние кампании, пин
+   и статус сторожа (`systemctl show -p ExecStart`), `/health` шлюза.
 
 Всегда `--no-deps`: без него `depends_on` пересоздаст `airflow-init` (см.
 `/root/SHARED-STACK-PROTOCOL.md`). Общий compose-проект `data-platform` эти команды не
@@ -127,6 +134,15 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
   своим значением); в compose он больше не зашит — `SOFASCORE_AIRFLOW_DB_PASSWORD`.
 
 ## Переезд живого контура на этот рецепт (этап 4 #1155)
+
+> **Предусловие.** Живое дерево `dpf-release-6e91eb05` = коммит `04502731` локальной
+> ветки `feat/sofascore-all-men-scaleout` (в `/root/data-platform-football`, на origin
+> не запушена): 12 коммитов, которых нет в master — приоритет актуалки, валидация
+> снапшота, очереди свежести (`dags/dag_refresh_sofascore_all_mens.py`,
+> `dags/scripts/run_sofascore_schedule_refresh.py`, `dags/utils/sofascore_all_mens_state.py`,
+> тесты, перештампованный `configs/sofascore/proxy_budget_canary.json`). Заморозка дерева
+> из master до их мержа откатит логику актуалки. Сначала — PR этой ветки в master
+> (`git merge-tree` конфликтов не показывает), потом этап 4.
 
 Живой контур на 02.09.2026 поднят из `/root/sofascore-runtime/*.yaml` (цепочки вне git)
 на дереве `/root/dpf-release-6e91eb05`; рендер `airflow.compose.yaml` и
