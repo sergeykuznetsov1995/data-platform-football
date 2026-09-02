@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -10,6 +11,7 @@ from scrapers.fotmob.domain import ProbeStatus, ScopeDecision, ScopeRef
 from scrapers.fotmob.parsers import parse_season_bundle
 from scrapers.fotmob.planner import RunMode, TransportBudget
 from scrapers.fotmob.repository import (
+    FotMobRepository,
     ManifestStatus,
     MemoryFotMobRepository,
     TargetCommit,
@@ -23,6 +25,7 @@ from scrapers.fotmob.service import (
     OperationResult,
     profile_probe_delay,
 )
+from tests.unit.scrapers.test_fotmob_repository import ReconcileTrino, ReconcileWriter
 from scrapers.fotmob.transport import (
     FetchOutcome,
     FetchResult,
@@ -3037,52 +3040,127 @@ def test_seasons_batch_identity_follows_the_seasons_parser_version(monkeypatch):
     assert old.batch_id != new.batch_id
 
 
-def test_unchanged_seasons_bytes_keep_one_batch_across_runs():
-    # The new identity must not turn every wave into a fresh batch the way the
-    # run-scoped catalog identity does: same bytes and same seasons parser mean
-    # one batch id, so a later observation is reconciled against the stored rows
-    # instead of duplicating them.
-    first_service, _, repository = _service(_seasons_responses())
-    first = _last_seasons_commit(first_service, repository)
+class _SeasonsTrino(ReconcileTrino):
+    """Reconcile double that also answers the planner's manifest preload."""
 
-    second_service = FotMobIngestService(
+    def execute_query(self, sql):
+        if "rn = 1" in sql:
+            return []
+        return super().execute_query(sql)
+
+
+class _SeasonsWriter(ReconcileWriter):
+    def __init__(self):
+        super().__init__()
+        self.trino = _SeasonsTrino(self)
+
+
+def _seasons_manifest_rows(writer):
+    return [
+        row
+        for row in writer.rows.get("fotmob_ingest_manifest", [])
+        if row["target_type"] == "competition_seasons"
+    ]
+
+
+def _seasons_batch_counts(writer):
+    counts = {}
+    for row in writer.rows.get("fotmob_competition_seasons", []):
+        batch_id = row["_target_batch_id"]
+        counts[batch_id] = counts.get(batch_id, 0) + 1
+    return counts
+
+
+def _run_seasons_wave(writer, run_id, classification=None):
+    """One wave: the planner hands an included scope to the collector."""
+
+    repository = FotMobRepository(writer=writer, batch_size=1000)
+    service = FotMobIngestService(
         transport=StubTransport(_seasons_responses()),
         repository=repository,
         budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
-        run_id="second-run",
+        run_id=run_id,
     )
-    second = _last_seasons_commit(second_service, repository)
+    if classification is None:
+        classification = service.discover_catalog().classifications[0]
+    service.discover_competition(classification)
+    repository.flush()
+    return classification
 
-    assert second.run_id == "second-run"
-    assert first.run_id != second.run_id
-    assert first.observation_id == second.observation_id
-    assert "second-run" not in second.observation_id
-    assert first.batch_id == second.batch_id
-    assert {
-        row["_target_batch_id"]
-        for row in repository.tables["fotmob_competition_seasons"]
-    } == {first.batch_id}
+
+def test_reparsed_seasons_reach_storage_only_with_the_new_parse_identity(monkeypatch):
+    # The incident end to end, on the production service and the production
+    # repository flush: the pre-#1230 parse is stored, the same bytes are parsed
+    # again into fewer rows, and the write survives only because the parse
+    # identity moved.  Without the version bump the wave dies exactly as it did
+    # in production on 02.09.
+    real_parse = service_module.parse_seasons
+
+    def old_parse(payload, competition=None, **kwargs):
+        seasons = real_parse(payload, competition, **kwargs)
+        return seasons + tuple(
+            replace(
+                seasons[-1],
+                source_season_key=f"phantom-{index}",
+                is_selected=False,
+                is_latest=False,
+                source_order=len(seasons) + index,
+            )
+            for index in range(3)
+        )
+
+    writer = _SeasonsWriter()
+    monkeypatch.setattr(service_module, "SEASONS_PARSER_VERSION", "fotmob-seasons-v1")
+    monkeypatch.setattr(service_module, "parse_seasons", old_parse)
+    scope = _run_seasons_wave(writer, "wave-old-parse")
+    stored_before = _seasons_batch_counts(writer)
+    old_batch = _seasons_manifest_rows(writer)[-1]["batch_id"]
+    assert stored_before == {old_batch: 5}
+
+    # Control: the parser changes, the identity does not -- the exact production
+    # failure, and the whole buffered wave is lost with it.
+    monkeypatch.setattr(service_module, "parse_seasons", real_parse)
+    with pytest.raises(
+        RuntimeError, match="has 5 stored rows; expected either 0 or 2"
+    ):
+        _run_seasons_wave(writer, "wave-no-version-bump", scope)
+    assert _seasons_batch_counts(writer) == stored_before
+
+    monkeypatch.setattr(service_module, "SEASONS_PARSER_VERSION", "fotmob-seasons-v2")
+    _run_seasons_wave(writer, "wave-new-identity", scope)
+    new_batch = _seasons_manifest_rows(writer)[-1]["batch_id"]
+    assert new_batch != old_batch
+    assert _seasons_batch_counts(writer) == {old_batch: 5, new_batch: 2}
+
+    # And the next wave over unchanged bytes neither fails nor duplicates: the
+    # batch is the same one, so the reconcile drops the re-observed rows.
+    _run_seasons_wave(writer, "wave-repeat", scope)
+    assert _seasons_manifest_rows(writer)[-1]["batch_id"] == new_batch
+    assert _seasons_batch_counts(writer) == {old_batch: 5, new_batch: 2}
 
 
 def test_seasons_identity_leaves_other_target_identities_untouched():
     # Regression guard for the blast radius: only the catalog, the scope
-    # evidence and now the seasons carry a non-content identity; everything
-    # else stays content-addressed.
-    service, _, repository = _service(_seasons_responses())
+    # evidence and now the seasons carry a non-content identity; a match -- the
+    # bulk of every wave -- stays content-addressed.
+    responses = _seasons_responses()
+    match_url = canonicalize_target("matchDetails", {"matchId": "100"}).canonical_url
+    responses[match_url] = {"content": {"matchFacts": {"events": []}, "stats": {"x": 1}}}
+    service, _, repository = _service(responses)
     _last_seasons_commit(service, repository)
+    service.sync_match_payloads(
+        parse_season_bundle(_league_payload(), ScopeRef(47, "2025/2026"))
+    )
 
     identities = {
         commit.target_type: commit.observation_id for commit in repository.commits
     }
 
-    assert identities["all_leagues"] == "test-run"
-    assert identities["competition_profile"] == "test-run:47"
-    assert identities["competition_seasons"] == (
-        f"seasons-parser:{service_module.SEASONS_PARSER_VERSION}"
-    )
-    assert all(
-        commit.observation_id is None
-        for commit in repository.commits
-        if commit.target_type
-        not in {"all_leagues", "competition_profile", "competition_seasons"}
-    )
+    assert identities == {
+        "all_leagues": "test-run",
+        "competition_profile": "test-run:47",
+        "competition_seasons": (
+            f"seasons-parser:{service_module.SEASONS_PARSER_VERSION}"
+        ),
+        "match": None,
+    }

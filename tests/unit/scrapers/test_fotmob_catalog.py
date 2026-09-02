@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from dataclasses import asdict
 
 import pytest
 
@@ -455,13 +457,15 @@ def test_seasons_parse_snapshot_is_pinned_to_the_seasons_parser_version():
     }
 
     seasons = parse_seasons(payload, 230)
+    # The whole stored row is pinned, not just the key set: order, source_order
+    # and the selected/latest flags all travel into bronze as well.
     digest = hashlib.sha256(
-        "\n".join(sorted(item.source_season_key for item in seasons)).encode()
+        json.dumps([asdict(item) for item in seasons], sort_keys=True).encode()
     ).hexdigest()
 
     assert (SEASONS_PARSER_VERSION, digest) == (
         "fotmob-seasons-v2",
-        "b6c9dd780ed0d57b3b81f41328d53bfa171a38285f7817240153438b7f05df03",
+        "c93920ac37e3e01d7d7ef3686f55be04202c99bdd41272beaf9a3158ff5bd33d",
     ), (
         "разбор сезонов изменился при той же SEASONS_PARSER_VERSION: подними "
         "версию (иначе новый разбор столкнётся с сохранённым пакетом, #1234)"

@@ -1247,6 +1247,11 @@ class ReconcileTrino:
     def table_exists(self, schema, table):
         return bool(self.writer.rows.get(table))
 
+    def _execute(self, sql):
+        # DDL of `ensure_schema`: recorded, never a source of rows.
+        self.queries.append(sql)
+        return None
+
     def execute_query(self, sql):
         self.queries.append(sql)
         marker = "FROM iceberg.bronze."
