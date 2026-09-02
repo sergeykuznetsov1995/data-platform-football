@@ -685,6 +685,77 @@ def _is_budget_deferral_error(value: Any) -> bool:
     return "budget" in text and ("request" in text or "byte" in text)
 
 
+def _wave_metrics_line(payload: Mapping[str, Any], rc: Any = None) -> str:
+    """Одна greppable строка с числами волны.
+
+    Разбор волны сегодня требует SQL по метабазе или jq по гигабайтному логу:
+    цвет рана виден, а «сколько запланировано, сколько осталось в очереди,
+    сколько закрыто» — нет. Строка чисто вычисляемая и никогда не бросает:
+    отсутствующее поле отчёта печатается как ``n/a``.
+    """
+
+    def _mapping(value: Any) -> Mapping[str, Any]:
+        return value if isinstance(value, Mapping) else {}
+
+    def _total(value: Any) -> Any:
+        mapping = _mapping(value)
+        if not mapping:
+            return None
+        try:
+            return sum(int(item) for item in mapping.values())
+        except (TypeError, ValueError):
+            return None
+
+    selection = _mapping(payload.get("selection"))
+    work_plan: Mapping[str, Any] = {}
+    operations = payload.get("operations")
+    if isinstance(operations, list):
+        for operation in operations:
+            if (
+                isinstance(operation, Mapping)
+                and operation.get("entity") == "season_work_plan"
+            ):
+                work_plan = operation
+    metadata = _mapping(work_plan.get("metadata"))
+    raw_outcomes = selection.get("scope_outcome_counts")
+    outcomes = raw_outcomes if isinstance(raw_outcomes, Mapping) else None
+
+    def _outcome(name: str) -> Any:
+        # Отсутствующий блок исходов — это «неизвестно», а не «ноль»: нули на
+        # усечённом отчёте читались бы как доказанное отсутствие работы.
+        return None if outcomes is None else outcomes.get(name, 0)
+    transport = _mapping(payload.get("transport"))
+    budget = _mapping(payload.get("budget"))
+    max_requests = budget.get("max_requests")
+    used_requests = budget.get("requests")
+    requests_left: Any = None
+    if isinstance(max_requests, int) and isinstance(used_requests, int):
+        requests_left = max_requests - used_requests
+    fields = (
+        ("mode", payload.get("mode")),
+        ("lane", selection.get("scope_lane")),
+        ("status", payload.get("status")),
+        ("rc", rc),
+        ("planned", selection.get("planned_scope_count")),
+        ("obligation", metadata.get("obligation_scopes")),
+        ("already_complete", metadata.get("already_complete_scopes")),
+        ("pending", metadata.get("pending_candidate_scopes")),
+        ("success", _outcome("success")),
+        ("source_gap", _outcome("source_gap")),
+        ("retryable", _outcome("retryable")),
+        ("terminal", _outcome("terminal")),
+        ("deferred", _outcome("deferred")),
+        ("rows_total", _total(payload.get("rows"))),
+        ("requests", transport.get("attempts")),
+        ("not_modified", transport.get("not_modified")),
+        ("encoded_bytes", transport.get("encoded_bytes")),
+        ("budget_requests_left", requests_left),
+    )
+    return " ".join(
+        f"{key}={'n/a' if value is None else value}" for key, value in fields
+    )
+
+
 def _native_output_payload(report) -> dict[str, Any]:
     payload = report.as_dict()
     tables: list[str] = []
@@ -1343,6 +1414,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         if mode == RunMode.BACKFILL
         else ScopeLane.CURRENT
     )
+    contract_scopes: tuple[tuple[int, str], ...] = ()
     if automatic_catalog:
         contract_scopes = (
             ()
@@ -1490,6 +1562,11 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 work_item.competition_id,
             )
         )
+    # Очередь кандидатов полосы: обязательство каталога минус скоупы, уже
+    # закрытые в журнале. Именно она отличает «всё собрано» от «полоса стоит»:
+    # без неё пустой план backfill молча выглядел как законное завершение.
+    obligation_scopes = set(contract_scopes)
+    pending_candidate_scopes = obligation_scopes - previously_complete
     work_plan = OperationResult(
         "season_work_plan",
         attempted=len(work),
@@ -1501,6 +1578,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             "journal_plan_signature": journal_plan_signature,
             "scope_entities": sorted(scope_entities),
             "already_complete_scopes": len(previously_complete),
+            "obligation_scopes": len(obligation_scopes),
+            "pending_candidate_scopes": len(pending_candidate_scopes),
             "attempt_states": len(attempt_states),
             "daily_completion_timestamps": len(daily_scope_times),
         },
@@ -1512,6 +1591,23 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     ):
         work_plan.errors.append(
             f"{mode.value} discovered no eligible exact season targets"
+        )
+    # Четвёртый барьер цвета: автоматическая полоса истории, запланировавшая
+    # ноль скоупов при непустой очереди кандидатов, обязана быть КРАСНОЙ.
+    # Пустой план не даёт исходов попыток, поэтому ни гейт исходов рана, ни
+    # приёмка каталога такую волну не красят — она шесть дней притворялась
+    # здоровой (#1227). Пустая очередь (всё обязательство уже в журнале)
+    # остаётся законным зелёным завершением.
+    if (
+        not work
+        and automatic_catalog
+        and mode == RunMode.BACKFILL
+        and pending_candidate_scopes
+    ):
+        work_plan.errors.append(
+            f"backfill planned no scopes while {len(pending_candidate_scopes)} "
+            f"of {len(obligation_scopes)} obligation scopes remain outside the "
+            "completion journal: history lane is stalled"
         )
     if mode == RunMode.DAILY and daily_competition_ids:
         planned_competition_ids = {item.competition_id for item in work}
@@ -2771,6 +2867,7 @@ def main():
         payload = _failure_payload(args, exc)
         rc = 1
     _deactivate_native_service()
+    logger.info("FotMob wave metrics: %s", _wave_metrics_line(payload, rc))
     _write_json_atomic(output, payload)
     logger.info("FotMob report: %s", output)
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
