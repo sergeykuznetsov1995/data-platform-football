@@ -50,12 +50,25 @@ pause_dag() {
 REFRESH_WAS_PAUSED=""
 STEP="start"
 on_exit() {
-  local rc=$?
+  local rc=$? state
   [ "$rc" -eq 0 ] && return 0
+  # Внутри trap ничего не должно оборвать откат: set -e снимаем, каждый шаг — best effort.
+  set +e
   log "FAILED at step '$STEP' (rc=$rc); env file: $ENV_FILE — проверь, какое дерево там записано"
   if [ "$REFRESH_WAS_PAUSED" = "f" ]; then
-    docker exec sofascore-airflow-scheduler airflow dags unpause "$REFRESH" >> "$LOG" 2>&1 || true
-    log "$REFRESH unpaused back after failure: paused=$(is_paused "$REFRESH" 2>/dev/null || echo '?')"
+    # Сначала штатно через scheduler; если он сам лежит (упал recreate/health) —
+    # напрямую в метабазе контура одной строкой (то же, что делает `airflow dags unpause`).
+    docker exec sofascore-airflow-scheduler airflow dags unpause "$REFRESH" >> "$LOG" 2>&1
+    state=$(is_paused "$REFRESH" 2>/dev/null)
+    if [ "$state" != "f" ]; then
+      $PSQL "UPDATE dag SET is_paused=false WHERE dag_id='$REFRESH';" >> "$LOG" 2>&1
+      state=$(is_paused "$REFRESH" 2>/dev/null)
+    fi
+    if [ "$state" = "f" ]; then
+      log "$REFRESH unpaused back after failure"
+    else
+      log "MANUAL ACTION REQUIRED: $REFRESH is still paused (paused='${state:-?}') — unpause it by hand"
+    fi
   fi
   exit "$rc"
 }

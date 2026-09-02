@@ -44,6 +44,9 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
         if [ "$1" = exec ] && [ "$2" = sofascore-airflow-metadb ]; then
           sql="${{@: -1}}"
           case "$sql" in
+            *"UPDATE dag SET is_paused=false"*)
+              dag=${{sql#*dag_id=\\'}}; dag=${{dag%%\\'*}}
+              echo f > "$STATE/paused_$dag"; echo "UPDATE 1" ;;
             *"SELECT is_paused"*)
               dag=${{sql#*dag_id=\\'}}; dag=${{dag%%\\'*}}
               cat "$STATE/paused_$dag" ;;
@@ -54,6 +57,8 @@ def _stubs(bin_dir: Path, state_dir: Path) -> None:
           exit 0
         fi
         if [ "$1" = exec ] && [ "$2" = sofascore-airflow-scheduler ] && [ "$3" = airflow ]; then
+          # scheduler-down simulation: `airflow dags unpause` fails once the flag exists
+          [ "$5" = unpause ] && [ -e "$STATE/scheduler_down" ] && exit 1
           case "$5" in pause) echo t > "$STATE/paused_$6" ;; unpause) echo f > "$STATE/paused_$6" ;; esac
           exit 0
         fi
@@ -202,8 +207,12 @@ def test_deploy_keeps_refresh_paused_when_it_was_paused_before(tmp_path: Path) -
 @pytest.mark.unit
 @pytest.mark.parametrize(
     ("break_state", "expected_rc", "expected_step"),
-    [({"health": "unhealthy"}, 5, "gateway-health"), ({"active_count": "2"}, 6, "scheduler-health")],
-    ids=["gateway-unhealthy", "core-dags-missing"],
+    [
+        ({"health": "unhealthy"}, 5, "gateway-health"),
+        ({"active_count": "2"}, 6, "scheduler-health"),
+        ({"health": "unhealthy", "scheduler_down": ""}, 5, "gateway-health"),
+    ],
+    ids=["gateway-unhealthy", "core-dags-missing", "scheduler-down-unpause-via-metadb"],
 )
 def test_deploy_restores_refresh_and_names_the_step_when_a_late_step_fails(
     tmp_path: Path, break_state: dict, expected_rc: int, expected_step: str
@@ -225,6 +234,9 @@ def test_deploy_restores_refresh_and_names_the_step_when_a_late_step_fails(
     assert args.index(f"exec sofascore-airflow-scheduler airflow dags unpause {REFRESH}") > max(
         i for i, a in enumerate(args) if a.startswith("compose ")
     )
+    via_metadb = any("UPDATE dag SET is_paused=false" in a for a in args)
+    assert via_metadb == ("scheduler_down" in break_state)
+    assert "MANUAL ACTION REQUIRED" not in log
 
 
 @pytest.mark.unit
@@ -272,7 +284,7 @@ def _postdeploy_stub(bin_dir: Path, mounts_file: Path) -> None:
         #!/usr/bin/env bash
         if [ "$1" = inspect ]; then
           case "$*" in
-            *".Destination}}}}={{{{.Source}}}}"*) grep "^$(printf '%s' "${{@: -1}}")|" "{mounts_file}" | cut -d'|' -f2- ;;
+            *".Type}}}}:{{{{.Destination}}}}={{{{.Source}}}}"*) grep "^$(printf '%s' "${{@: -1}}")|" "{mounts_file}" | cut -d'|' -f2- ;;
             *Health.Status*) echo healthy ;;
             *HostConfig.Memory*) echo 1073741824 ;;
             *Config.Cmd*) echo -- --sofascore-discovery-dagrun-budget-bytes; echo 67108864 ;;
@@ -315,9 +327,13 @@ def _run_postdeploy(tmp_path: Path, scheduler_mounts: dict[str, str], gateway_mo
         """,
     )
     mounts_file = tmp_path / "mounts.txt"
+    def _typed(dest: str, source: str) -> str:
+        kind = "volume" if source.startswith("/var/lib/docker/volumes/") else "bind"
+        return f"{kind}:{dest}={source}"
+
     mounts_file.write_text(
-        "".join(f"sofascore-airflow-scheduler|{d}={s}\n" for d, s in scheduler_mounts.items())
-        + "".join(f"sofascore_gw_951|{d}={s}\n" for d, s in gateway_mounts.items()),
+        "".join(f"sofascore-airflow-scheduler|{_typed(d, s)}\n" for d, s in scheduler_mounts.items())
+        + "".join(f"sofascore_gw_951|{_typed(d, s)}\n" for d, s in gateway_mounts.items()),
         encoding="utf-8",
     )
     _postdeploy_stub(tmp_path / "bin", mounts_file)
@@ -378,8 +394,13 @@ def test_postdeploy_passes_only_when_every_mount_pair_matches(tmp_path: Path) ->
         lambda s, g: s.pop("/opt/airflow/docker"),
         lambda s, g: s.__setitem__("/opt/airflow/dags/dag_trigger_sofascore_daily.py", "/old/runtime/dag.py"),
         lambda s, g: g.__setitem__("/opt/sofascore-repo", "/old/release-deadbeef"),
+        lambda s, g: s.__setitem__("/opt/airflow/extra", "/old/release-deadbeef/scripts"),
+        lambda s, g: g.__setitem__("/opt/airflow/proxys-extra.txt", "/old/runtime/proxys.txt"),
     ],
-    ids=["old-tree-mount", "missing-mount", "stale-mini-dag-file-bind", "gateway-old-tree"],
+    ids=[
+        "old-tree-mount", "missing-mount", "stale-mini-dag-file-bind", "gateway-old-tree",
+        "scheduler-extra-bind-elsewhere", "gateway-extra-bind",
+    ],
 )
 def test_postdeploy_fails_on_a_wrong_missing_or_extra_mount(tmp_path: Path, mutate) -> None:
     scheduler, gateway = _expected_mounts(tmp_path)

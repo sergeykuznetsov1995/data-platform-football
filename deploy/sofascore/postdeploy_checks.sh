@@ -41,16 +41,22 @@ docker inspect -f '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end
 docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' sofascore-airflow-scheduler | grep -qE "ALL_MENS_STATE=" && ok "env кампании на месте" || fail "нет env кампании"
 echo "-- точные пары монтов (destination → ожидаемый source) --"
 check_mounts() {  # check_mounts <container> <dest>=<expected-source> ...
+  # Точное множество bind-монтов: каждая ожидаемая пара должна совпасть, а любой bind,
+  # которого нет в списке (второе дерево, старый file-bind мини-DAG, чужой файл), — ошибка.
+  # Именованные тома (type=volume) не сверяются.
   local container="$1"; shift
-  local actual dest expected got extra
-  actual=$(docker inspect -f '{{range .Mounts}}{{.Destination}}={{.Source}}{{"\n"}}{{end}}' "$container")
+  local actual dest expected got line
+  actual=$(docker inspect -f '{{range .Mounts}}{{.Type}}:{{.Destination}}={{.Source}}{{"\n"}}{{end}}' "$container" | grep '^bind:' | sed 's/^bind://')
   for pair in "$@"; do
     dest=${pair%%=*}; expected=${pair#*=}
-    got=$(printf '%s\n' "$actual" | grep -F -- "$dest=" | grep -E "^$(printf '%s' "$dest" | sed 's/[][\.*^$]/\\&/g')=" | head -1 | cut -d= -f2-)
+    got=$(printf '%s\n' "$actual" | grep -E "^$(printf '%s' "$dest" | sed 's/[][\.*^$]/\\&/g')=" | head -1 | cut -d= -f2-)
     if [ "$got" = "$expected" ]; then ok "$container $dest ← $expected"; else fail "$container $dest ← '${got:-<нет монта>}' (ожидалось $expected)"; fi
   done
-  extra=$(printf '%s\n' "$actual" | grep -E '^/opt/airflow/dags/' | grep -vF '/opt/airflow/dags/.airflowignore=' || true)
-  [ -z "$extra" ] || fail "$container: лишние монты поверх dags/: $extra"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    dest=${line%%=*}
+    case " $* " in *" $dest="*) ;; *) fail "$container: лишний bind-монт $line" ;; esac
+  done <<< "$actual"
 }
 check_mounts sofascore-airflow-scheduler \
   "/opt/airflow/dags=$RELEASE/dags" \
