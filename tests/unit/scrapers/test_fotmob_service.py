@@ -3048,7 +3048,9 @@ class _SeasonsTrino(ReconcileTrino):
     """Reconcile double that also answers the planner's manifest preload."""
 
     def execute_query(self, sql):
-        if "rn = 1" not in sql:
+        # Only the manifest preload of the planner; every other query -- scope
+        # evidence, batch counts -- belongs to the reconcile double.
+        if "fotmob_ingest_manifest" not in sql or "ROW_NUMBER()" not in sql:
             return super().execute_query(sql)
         rows = [
             row
@@ -3102,8 +3104,8 @@ def _seasons_batch_counts(writer):
     return counts
 
 
-def _run_seasons_wave(writer, run_id, classification=None, variant=False):
-    """One wave: the planner hands an included scope to the collector."""
+def _run_seasons_wave(writer, run_id, scope=None, variant=False):
+    """One wave of the production path: catalog, then the included scope."""
 
     repository = FotMobRepository(writer=writer, batch_size=1000)
     service = FotMobIngestService(
@@ -3112,20 +3114,32 @@ def _run_seasons_wave(writer, run_id, classification=None, variant=False):
         budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
         run_id=run_id,
     )
-    if classification is None:
-        classification = service.discover_catalog().classifications[0]
-    service.discover_competition(classification)
+    if scope is None:
+        scope = service.discover_catalog().classifications[0]
+    discovered = service.discover_competitions([scope])
     repository.flush()
-    return classification
+    return scope, discovered[0]
+
+
+def _assert_seasons_wave_committed(writer, discovered, run_id, seasons):
+    """A wave that did the work, not a silent no-op."""
+
+    assert discovered.operation.errors == []
+    assert discovered.operation.succeeded == seasons
+    assert len(discovered.seasons) == seasons
+    row = _seasons_manifest_rows(writer)[-1]
+    assert row["run_id"] == run_id
+    assert row["status"] == "success"
+    return row["batch_id"]
 
 
 def test_reparsed_seasons_reach_storage_only_with_the_new_parse_identity(monkeypatch):
-    # The incident end to end, on the production service and the production
-    # repository flush.  A league page changes bytes between waves, so the
-    # newest manifest row for its target key belongs to another observation and
-    # the `latest_success` fast path cannot mask the write: when the earlier
-    # bytes come back and the parse has changed underneath the unchanged
-    # identity, the wave dies exactly as it did in production on 02.09.
+    # The incident end to end, on the production path (`discover_catalog` ->
+    # `discover_competitions`) and the production `FotMobRepository.flush`.
+    # A league page changes bytes between waves, so the newest manifest row for
+    # its target key belongs to another observation: when the earlier bytes come
+    # back to a parser that has changed underneath an unchanged identity, the
+    # wave dies exactly as it did in production on 02.09.
     real_parse = service_module.parse_seasons
 
     def old_parse(payload, competition=None, **kwargs):
@@ -3144,20 +3158,22 @@ def test_reparsed_seasons_reach_storage_only_with_the_new_parse_identity(monkeyp
     writer = _SeasonsWriter()
     monkeypatch.setattr(service_module, "SEASONS_PARSER_VERSION", "fotmob-seasons-v1")
     monkeypatch.setattr(service_module, "parse_seasons", old_parse)
-    scope = _run_seasons_wave(writer, "wave-old-parse")
-    old_batch = _seasons_manifest_rows(writer)[-1]["batch_id"]
+    scope, discovered = _run_seasons_wave(writer, "wave-old-parse")
+    old_batch = _assert_seasons_wave_committed(writer, discovered, "wave-old-parse", 5)
     assert _seasons_batch_counts(writer) == {old_batch: 5}
 
     # A later wave sees different bytes, so it is that observation -- not the
     # stored one -- that the next wave compares itself against.
     monkeypatch.setattr(service_module, "parse_seasons", real_parse)
-    _run_seasons_wave(writer, "wave-other-bytes", scope, variant=True)
-    other_batch = _seasons_manifest_rows(writer)[-1]["batch_id"]
+    _, discovered = _run_seasons_wave(writer, "wave-other-bytes", scope, variant=True)
+    other_batch = _assert_seasons_wave_committed(
+        writer, discovered, "wave-other-bytes", 2
+    )
     assert other_batch != old_batch
     stored_before = _seasons_batch_counts(writer)
     assert stored_before == {old_batch: 5, other_batch: 2}
 
-    # Control: the earlier bytes come back, the parser has changed and the
+    # Control: the earlier bytes come back, the parse has changed and the
     # identity has not -- the exact production failure, and the whole buffered
     # wave is lost with it.
     with pytest.raises(
@@ -3168,28 +3184,32 @@ def test_reparsed_seasons_reach_storage_only_with_the_new_parse_identity(monkeyp
 
     monkeypatch.setattr(service_module, "SEASONS_PARSER_VERSION", "fotmob-seasons-v2")
     writing_queries_before = len(writer.trino.queries)
-    _run_seasons_wave(writer, "wave-new-identity", scope)
-    new_batch = _seasons_manifest_rows(writer)[-1]["batch_id"]
-    # A wave that really writes reconciles the table first -- the counterpart of
-    # the silence asserted for the skipped wave below.
-    assert [
-        query
-        for query in writer.trino.queries[writing_queries_before:]
-        if "fotmob_competition_seasons" in query
-    ]
+    _, discovered = _run_seasons_wave(writer, "wave-new-identity", scope)
+    new_batch = _assert_seasons_wave_committed(
+        writer, discovered, "wave-new-identity", 2
+    )
     assert new_batch not in {old_batch, other_batch}
     assert _seasons_batch_counts(writer) == {
         old_batch: 5,
         other_batch: 2,
         new_batch: 2,
     }
+    # This wave really wrote: it reconciled the table against storage first.
+    assert [
+        query
+        for query in writer.trino.queries[writing_queries_before:]
+        if "fotmob_competition_seasons" in query
+    ]
 
-    # And the next wave over unchanged bytes writes nothing at all: the stored
-    # manifest for this target key now carries the very same batch, so the
-    # dataset write is skipped before the buffer is even touched.
+    # And the wave after it re-observes the same bytes: same batch, no second
+    # copy of the rows, and the dataset write is skipped before the buffer is
+    # touched, so the table is not even reconciled.
     queries_before = len(writer.trino.queries)
-    _run_seasons_wave(writer, "wave-repeat", scope)
-    assert _seasons_manifest_rows(writer)[-1]["batch_id"] == new_batch
+    _, discovered = _run_seasons_wave(writer, "wave-repeat", scope)
+    assert (
+        _assert_seasons_wave_committed(writer, discovered, "wave-repeat", 2)
+        == new_batch
+    )
     assert _seasons_batch_counts(writer) == {
         old_batch: 5,
         other_batch: 2,
