@@ -717,7 +717,13 @@ def _wave_metrics_line(payload: Mapping[str, Any], rc: Any = None) -> str:
             ):
                 work_plan = operation
     metadata = _mapping(work_plan.get("metadata"))
-    outcomes = _mapping(selection.get("scope_outcome_counts"))
+    raw_outcomes = selection.get("scope_outcome_counts")
+    outcomes = raw_outcomes if isinstance(raw_outcomes, Mapping) else None
+
+    def _outcome(name: str) -> Any:
+        # Отсутствующий блок исходов — это «неизвестно», а не «ноль»: нули на
+        # усечённом отчёте читались бы как доказанное отсутствие работы.
+        return None if outcomes is None else outcomes.get(name, 0)
     transport = _mapping(payload.get("transport"))
     budget = _mapping(payload.get("budget"))
     max_requests = budget.get("max_requests")
@@ -734,11 +740,11 @@ def _wave_metrics_line(payload: Mapping[str, Any], rc: Any = None) -> str:
         ("obligation", metadata.get("obligation_scopes")),
         ("already_complete", metadata.get("already_complete_scopes")),
         ("pending", metadata.get("pending_candidate_scopes")),
-        ("success", outcomes.get("success", 0) if outcomes else 0),
-        ("source_gap", outcomes.get("source_gap", 0) if outcomes else 0),
-        ("retryable", outcomes.get("retryable", 0) if outcomes else 0),
-        ("terminal", outcomes.get("terminal", 0) if outcomes else 0),
-        ("deferred", outcomes.get("deferred", 0) if outcomes else 0),
+        ("success", _outcome("success")),
+        ("source_gap", _outcome("source_gap")),
+        ("retryable", _outcome("retryable")),
+        ("terminal", _outcome("terminal")),
+        ("deferred", _outcome("deferred")),
         ("rows_total", _total(payload.get("rows"))),
         ("requests", transport.get("attempts")),
         ("not_modified", transport.get("not_modified")),
@@ -2861,8 +2867,8 @@ def main():
         payload = _failure_payload(args, exc)
         rc = 1
     _deactivate_native_service()
-    _write_json_atomic(output, payload)
     logger.info("FotMob wave metrics: %s", _wave_metrics_line(payload, rc))
+    _write_json_atomic(output, payload)
     logger.info("FotMob report: %s", output)
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return rc

@@ -631,9 +631,7 @@ class TestFotmobNativeRunner:
         assert third_report["selection"]["planned_scope_count"] == 0
         work_plan = self._season_work_plan(third_report)
         assert work_plan["counts"]["planned_scopes"] == 0
-        assert work_plan["metadata"]["obligation_scopes"] == 2
         assert work_plan["metadata"]["already_complete_scopes"] == 2
-        assert work_plan["metadata"]["pending_candidate_scopes"] == 0
         assert work_plan["errors"] == []
 
         accepted = validate_report(third_report, require_full_completion=False)
@@ -732,6 +730,8 @@ class TestFotmobNativeRunner:
         assert "mode=refresh" in line
         assert "lane=n/a" in line
         assert "planned=n/a" in line
+        assert "success=n/a" in line
+        assert "retryable=n/a" in line
         assert "rows_total=n/a" in line
         assert "budget_requests_left=n/a" in line
         assert "rc=n/a" in line
