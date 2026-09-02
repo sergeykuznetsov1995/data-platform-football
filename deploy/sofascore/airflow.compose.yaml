@@ -79,24 +79,74 @@ x-ss-airflow-common: &ss-airflow-common
     ALERT_ENV: sofascore-isolated
     JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
   volumes:
+    # Везде длинный синтаксис + create_host_path: false: отсутствующий источник —
+    # ошибка запуска, а не молча созданный Docker'ом пустой каталог.
     # DagBag = dags/ дерева релиза. Мини-DAG контура (dag_trigger_sofascore_daily,
     # dag_sofascore_manifest_maintenance) лежат в dags/ репозитория; на общем
     # scheduler'е их прячет dags/.airflowignore, здесь его накрывает свой блок-лист.
-    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/dags:/opt/airflow/dags:ro
-    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/deploy/sofascore/.airflowignore:/opt/airflow/dags/.airflowignore:ro
-    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/logs:/opt/airflow/logs
-    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/scrapers:/opt/airflow/scrapers:ro
-    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/scripts:/opt/airflow/scripts:ro
-    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/configs/medallion:/opt/airflow/configs/medallion:ro
-    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/configs/soccerdata:/opt/airflow/configs/soccerdata:ro
-    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/configs/sofascore:/opt/airflow/configs/sofascore:ro
-    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/configs/proxy_filter:/opt/airflow/configs/proxy_filter:ro
+    - type: bind
+      source: ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/dags
+      target: /opt/airflow/dags
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/deploy/sofascore/.airflowignore
+      target: /opt/airflow/dags/.airflowignore
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/logs
+      target: /opt/airflow/logs
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/scrapers
+      target: /opt/airflow/scrapers
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/scripts
+      target: /opt/airflow/scripts
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/configs/medallion
+      target: /opt/airflow/configs/medallion
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/configs/soccerdata
+      target: /opt/airflow/configs/soccerdata
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/configs/sofascore
+      target: /opt/airflow/configs/sofascore
+      read_only: true
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/configs/proxy_filter
+      target: /opt/airflow/configs/proxy_filter
+      read_only: true
+      bind:
+        create_host_path: false
     # RUNTIME_FILE_ENTRIES после #1002 включают docker/images/airflow/requirements-*.txt;
     # вшитый в пинованный образ runtime-contract их не содержит (собран раньше) —
     # fingerprint читает их из дерева (дерево имеет приоритет над baked-копией).
-    - ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/docker:/opt/airflow/docker:ro
-    # Immutable digest-адресуемый verified-артефакт и состояние кампании — вне дерева
-    # релиза. Длинный синтаксис: Docker не подменит отсутствующий источник пустым файлом.
+    - type: bind
+      source: ${SOFASCORE_RELEASE_ROOT:?set the absolute frozen release root}/docker
+      target: /opt/airflow/docker
+      read_only: true
+      bind:
+        create_host_path: false
+    # Immutable digest-адресуемый verified-артефакт и состояние кампании — вне дерева релиза.
     - type: bind
       source: ${SOFASCORE_PROXY_BUDGET_ARTIFACT_HOST:?set the immutable verified SofaScore budget artifact host file}
       target: /opt/airflow/runtime/sofascore/proxy_budget_canary.json
@@ -109,11 +159,21 @@ x-ss-airflow-common: &ss-airflow-common
       bind:
         create_host_path: false
     # Пул прокси scheduler'а (секрет, вне git).
-    - ${SOFASCORE_PROXY_POOL_FILE:?set the host proxy pool file for the scheduler}:/opt/airflow/proxys.txt:ro
+    - type: bind
+      source: ${SOFASCORE_PROXY_POOL_FILE:?set the host proxy pool file for the scheduler}
+      target: /opt/airflow/proxys.txt
+      read_only: true
+      bind:
+        create_host_path: false
     # master-DAG зовёт /opt/legacy-scraper-venv/bin/python (изолированный venv в
     # НОВЫХ образах). В пинованном образе те же скрейпинг-зависимости живут в основном
     # интерпретаторе — каталог-шим с симлинком bin/python восстанавливает семантику.
-    - ${SOFASCORE_LEGACY_SCRAPER_VENV_HOST_DIR:?set the legacy-scraper-venv shim directory}:/opt/legacy-scraper-venv:ro
+    - type: bind
+      source: ${SOFASCORE_LEGACY_SCRAPER_VENV_HOST_DIR:?set the legacy-scraper-venv shim directory}
+      target: /opt/legacy-scraper-venv
+      read_only: true
+      bind:
+        create_host_path: false
     - ss_soccerdata_cache:/home/airflow/soccerdata
   networks:
     - sofascore-net
@@ -121,7 +181,7 @@ x-ss-airflow-common: &ss-airflow-common
 
 services:
   airflow-metadb:
-    image: ${SOFASCORE_POSTGRES_IMAGE:-postgres:16-alpine}
+    image: ${SOFASCORE_POSTGRES_IMAGE:?set the pinned PostgreSQL image of the SofaScore metadata-DB}
     container_name: sofascore-airflow-metadb
     restart: unless-stopped
     security_opt:

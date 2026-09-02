@@ -64,6 +64,7 @@ COMPOSE_TEST_ENV = {
     "SOFASCORE_PROXY_POOL_JSON": "[]",
     "SOFASCORE_LEGACY_SCRAPER_VENV_HOST_DIR": "/tmp/compose-test-sofascore-legacy-venv",
     "SOFASCORE_AIRFLOW_DB_PASSWORD": "ci-not-a-secret",
+    "SOFASCORE_POSTGRES_IMAGE": "postgres:16-alpine",
 }
 
 
@@ -326,6 +327,8 @@ class TestComposeFile:
         )
         for volume in binds.values():
             assert volume["source"].startswith("/tmp/compose-test-sofascore-"), volume
+            # A missing source must fail the start, never become an empty dir.
+            assert volume["bind"].get("create_host_path", False) is False, volume
         env = scheduler["environment"]
         assert env["SOFASCORE_PROXY_CONTROL_URL"] == "http://sofascore_proxy_filter:8899"
         assert env["SOFASCORE_ALL_MENS_STATE"] == (

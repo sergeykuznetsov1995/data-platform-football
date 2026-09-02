@@ -102,11 +102,16 @@ def test_compose_is_self_contained_and_host_agnostic(compose: Path) -> None:
     assert cfg["name"] in {"sofascore-airflow", "sofascore-gw"}
     for name, service in cfg["services"].items():
         assert "build" not in service, f"{name}: the contour never builds images in place"
-        assert FAIL_CLOSED_VAR.match(str(service.get("image", ""))) or name == "airflow-metadb", (
+        assert FAIL_CLOSED_VAR.match(str(service.get("image", ""))), (
             f"{name}: image must be a pinned fail-closed variable"
         )
         for source in _bind_sources(service):
             assert FAIL_CLOSED_VAR.match(source), f"{name}: bind source {source!r} is not a fail-closed variable"
+        for volume in service.get("volumes", []):
+            if isinstance(volume, str) and not volume.startswith("ss_"):
+                pytest.fail(f"{name}: short-syntax bind {volume!r} lets Docker create a missing source")
+            if isinstance(volume, dict) and volume.get("type") == "bind":
+                assert volume["bind"]["create_host_path"] is False, f"{name}: {volume['target']}"
     for network in cfg["networks"].values():
         assert network.get("external") is True
 
@@ -185,7 +190,10 @@ def test_gateway_compose_pins_the_live_gateway_shape() -> None:
 @pytest.mark.unit
 def test_mini_dags_are_repository_files_hidden_only_from_the_shared_scheduler() -> None:
     for name in MINI_DAGS:
-        assert (ROOT / "dags" / name).stat().st_size > 0
+        source = (ROOT / "dags" / name).read_text(encoding="utf-8")
+        assert source.strip(), name
+        compile(source, name, "exec")
+        assert f'dag_id="{name[:-3]}"' in source
     shared = [
         line for line in SHARED_AIRFLOWIGNORE.read_text(encoding="utf-8").splitlines()
         if line and not line.startswith("#")
@@ -215,7 +223,9 @@ def test_rotation_scripts_take_every_host_path_from_the_env_file() -> None:
     for script in SCRIPTS:
         text = _code_lines(script)
         assert not HOST_PATH_LITERAL.search(text), f"{script.name}: host path literal"
-        assert "SOFASCORE_ENV_FILE" in text, f"{script.name}: must source the contour env file"
+        assert "SOFASCORE_ENV_FILE" in text, f"{script.name}: must read the contour env file"
+        assert 'sofascore_load_env "$ENV_FILE"' in text, f"{script.name}: must use the shared loader"
+        assert "set -a" not in text, f"{script.name}: exporting the env file lets stale values outrank --env-file"
         subprocess.run(["bash", "-n", str(script)], check=True)
         for key in re.findall(r"\$\{(SOFASCORE_[A-Z0-9_]+):\?", text):
             assert key in example_keys, f"{script.name}: {key} missing from sofascore.env.example"
