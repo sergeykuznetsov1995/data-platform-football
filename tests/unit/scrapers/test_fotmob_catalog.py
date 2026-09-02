@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from scrapers.fotmob.catalog import (
     CLASSIFIER_VERSION,
+    SEASONS_PARSER_VERSION,
     CatalogConflictError,
     SelectedSeasonMismatch,
     classify_competition,
@@ -426,3 +429,40 @@ def test_competition_from_league_payload_keeps_source_metadata():
     assert item.country_code == "INT"
     assert item.age_group == "adult"
     assert item.presentation_slug == "289-africa-cup-nations"
+
+
+def test_seasons_parse_snapshot_is_pinned_to_the_seasons_parser_version():
+    # #1234: a change of `parse_seasons` that alters the rows for unchanged
+    # bytes collides with the stored batch unless SEASONS_PARSER_VERSION moves
+    # with it.  Pin the pair here so the next such change is caught in CI and
+    # not by a red wave in production.
+    payload = {
+        "details": {
+            "id": 230,
+            "name": "Liga MX",
+            "selectedSeason": "2026/2027 - Apertura",
+            "latestSeason": "2026/2027 - Apertura",
+        },
+        "allAvailableSeasons": [
+            "2026/2027 - Apertura",
+            "2025/2026 - Clausura",
+            "2025/2026 - Apertura",
+        ],
+        "stats": {
+            "seasonsWithLinks": ["2026/2027", "2015/2016"],
+            "seasonStatLinks": [{"Name": "2025/2026", "Group": "Clausura"}],
+        },
+    }
+
+    seasons = parse_seasons(payload, 230)
+    digest = hashlib.sha256(
+        "\n".join(sorted(item.source_season_key for item in seasons)).encode()
+    ).hexdigest()
+
+    assert (SEASONS_PARSER_VERSION, digest) == (
+        "fotmob-seasons-v2",
+        "b6c9dd780ed0d57b3b81f41328d53bfa171a38285f7817240153438b7f05df03",
+    ), (
+        "разбор сезонов изменился при той же SEASONS_PARSER_VERSION: подними "
+        "версию (иначе новый разбор столкнётся с сохранённым пакетом, #1234)"
+    )
