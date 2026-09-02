@@ -38,10 +38,18 @@
   переписывает `deploy.sh`; compose, сторож и приёмка читают тот же файл. Drop-in'ов
   systemd и `sed` по `/etc` нет.
 - **Пути хоста и образы** — только переменные без дефолта (`${VAR:?…}`): без значения
-  `docker compose config` падает, а не подставляет чужое дерево. Полный список —
-  `sofascore.env.example`; проверка, что compose не зашивает `/root`, `/tmp`, секреты
-  и override-теги — `tests/unit/deploy/test_sofascore_contour_recipe.py`; рендер —
-  `tests/integration/test_compose_validity.py` (`-k sofascore`).
+  `docker compose config` падает, а не подставляет чужое дерево; каждый bind — длинный
+  синтаксис с `create_host_path: false` (отсутствующий источник = ошибка запуска, а не
+  молча созданный пустой каталог). Полный список — `sofascore.env.example`; проверка, что
+  compose не зашивает `/root`, `/tmp`, секреты и override-теги —
+  `tests/unit/deploy/test_sofascore_contour_recipe.py`; рендер —
+  `tests/integration/test_compose_validity.py` (`-k sofascore`); прогон `deploy.sh`
+  против заглушек docker/systemctl — `tests/unit/deploy/test_sofascore_deploy_script.py`.
+- **Env-файл читается как compose, не как shell**: `deploy/sofascore/env.sh`
+  (`sofascore_load_env`) снимает внешние кавычки и ничего не подставляет и не экспортирует —
+  compose получает значения только через `--env-file`, а `deploy.sh` дополнительно
+  передаёт дерево/артефакт этого выката явно, чтобы устаревшее значение из окружения
+  оператора не перекрыло перепинованный файл. JSON пула — в одинарных кавычках.
 - **Секреты** — общий `.env` платформы (fernet, S3, Trino, Telegram, control-token)
   плюс контурные значения в `sofascore.env` (пароль метабазы контура
   `SOFASCORE_AIRFLOW_DB_PASSWORD`, платный пул `SOFASCORE_PROXY_POOL_JSON`). В git —
@@ -86,15 +94,18 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
    холодные сэмплы по классам манифеста, `verify` → файл `VERIFIED` в
    `${SOFASCORE_RUNTIME_DIR}/canary-<digest8>/`. Бой не останавливается.
 3. `bash deploy/sofascore/deploy.sh <дерево> [старое-дерево]` — вне окна 13:55–15:35 UTC:
-   пауза `dag_backfill_sofascore_all_mens` и ожидание idle по метабазе; сверка digest
-   дерева с кандидатом; публикация артефакта в `artifacts/<digest64>/`; перенос
+   пауза обеих кампаний (`dag_backfill_sofascore_all_mens`, `dag_refresh_sofascore_all_mens`)
+   и ожидание idle по метабазе (таски и DagRun ежедневника, истории, актуалки); сверка
+   digest дерева с кандидатом; публикация артефакта в `artifacts/<digest64>/`; перенос
    состояния кампании (только если `state.json` ещё нет); `sofascore_runtime_preflight.py
    preflight`; перепин трёх строк в `sofascore.env`; `up -d --no-deps --force-recreate`
    scheduler'а и шлюза; ожидание healthy (10 мин), `scheduler-health`, `import_error=0`,
-   три активных DAG; история остаётся на паузе; `systemctl restart` сторожа.
-4. `bash deploy/sofascore/postdeploy_checks.sh` — только чтение: монты и память шлюза,
-   лог шлюза, env кампании, `import_error`, состояние DAG-ов и кампании, пин сторожа
-   (`systemctl show -p ExecStart`), `/health` шлюза.
+   три активных DAG; история остаётся на паузе, актуалка возвращается в прежнее
+   состояние; `systemctl restart` сторожа.
+4. `bash deploy/sofascore/postdeploy_checks.sh` — только чтение, код выхода 1 при любой
+   несошедшейся проверке: healthy и память шлюза, env кампании, монты обоих контейнеров
+   только на ожидаемом дереве, `import_error=0`, пять активных DAG контура, состояние
+   кампании, пин и статус сторожа (`systemctl show -p ExecStart`), `/health` шлюза.
 
 Всегда `--no-deps`: без него `depends_on` пересоздаст `airflow-init` (см.
 `/root/SHARED-STACK-PROTOCOL.md`). Общий compose-проект `data-platform` эти команды не
@@ -129,8 +140,9 @@ docker compose -p sofascore-airflow -f deploy/sofascore/airflow.compose.yaml \
    `/root/sofascore-runtime/{all-men,gateway-state,legacy-scraper-venv}`,
    `SOFASCORE_PROXY_POOL_FILE=/root/fbref-949-runtime/proxys.txt`, fallback-файл,
    `SOFASCORE_AIRFLOW_DB_PASSWORD` — значение из строки `SQL_ALCHEMY_CONN` старого
-   `sofascore-airflow.compose.yaml`, `SOFASCORE_PROXY_POOL_JSON` — из
-   `.env.proxy-pool.decodo`; в файле пула переименовать ключ в `SOFASCORE_PROXY_POOL_JSON`).
+   `sofascore-airflow.compose.yaml`, `SOFASCORE_PROXY_POOL_JSON` — значение из
+   `.env.proxy-pool.decodo`, в одинарных кавычках; `SOFASCORE_POSTGRES_IMAGE=postgres:16-alpine`
+   как у живой метабазы).
 2. Заморозить дерево с коммитом, содержащим этот рецепт, прогнать канарейку, выкатить
    `deploy.sh` — первое дерево в `/opt/sofascore/releases/`.
 3. Установить unit и бинарь сторожа из репозитория, снять drop-in
