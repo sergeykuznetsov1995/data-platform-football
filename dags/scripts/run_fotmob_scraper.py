@@ -1343,6 +1343,7 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
         if mode == RunMode.BACKFILL
         else ScopeLane.CURRENT
     )
+    contract_scopes: tuple[tuple[int, str], ...] = ()
     if automatic_catalog:
         contract_scopes = (
             ()
@@ -1490,6 +1491,11 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
                 work_item.competition_id,
             )
         )
+    # Очередь кандидатов полосы: обязательство каталога минус скоупы, уже
+    # закрытые в журнале. Именно она отличает «всё собрано» от «полоса стоит»:
+    # без неё пустой план backfill молча выглядел как законное завершение.
+    obligation_scopes = set(contract_scopes)
+    pending_candidate_scopes = obligation_scopes - previously_complete
     work_plan = OperationResult(
         "season_work_plan",
         attempted=len(work),
@@ -1501,6 +1507,8 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
             "journal_plan_signature": journal_plan_signature,
             "scope_entities": sorted(scope_entities),
             "already_complete_scopes": len(previously_complete),
+            "obligation_scopes": len(obligation_scopes),
+            "pending_candidate_scopes": len(pending_candidate_scopes),
             "attempt_states": len(attempt_states),
             "daily_completion_timestamps": len(daily_scope_times),
         },
@@ -1512,6 +1520,23 @@ def _run_native(args, *, service=None, raw_store=None) -> tuple[int, dict[str, A
     ):
         work_plan.errors.append(
             f"{mode.value} discovered no eligible exact season targets"
+        )
+    # Четвёртый барьер цвета: автоматическая полоса истории, запланировавшая
+    # ноль скоупов при непустой очереди кандидатов, обязана быть КРАСНОЙ.
+    # Пустой план не даёт исходов попыток, поэтому ни гейт исходов рана, ни
+    # приёмка каталога такую волну не красят — она шесть дней притворялась
+    # здоровой (#1227). Пустая очередь (всё обязательство уже в журнале)
+    # остаётся законным зелёным завершением.
+    if (
+        not work
+        and automatic_catalog
+        and mode == RunMode.BACKFILL
+        and pending_candidate_scopes
+    ):
+        work_plan.errors.append(
+            f"backfill planned no scopes while {len(pending_candidate_scopes)} "
+            f"of {len(obligation_scopes)} obligation scopes remain outside the "
+            "completion journal: history lane is stalled"
         )
     if mode == RunMode.DAILY and daily_competition_ids:
         planned_competition_ids = {item.competition_id for item in work}

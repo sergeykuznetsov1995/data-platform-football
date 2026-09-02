@@ -450,6 +450,195 @@ class TestFotmobNativeRunner:
         )
         assert accepted.ok, accepted.errors
 
+    @staticmethod
+    def _season_work_plan(report):
+        """Операция плана сезонов из отчёта — источник чисел очереди."""
+
+        return next(
+            operation
+            for operation in report["operations"]
+            if operation["entity"] == "season_work_plan"
+        )
+
+    @pytest.mark.unit
+    def test_automatic_backfill_empty_plan_with_pending_queue_turns_run_red(self):
+        """Пустой план истории при непустой очереди — КРАСНАЯ волна (#1227).
+
+        Сценарий ровно тот, что шесть дней притворялся здоровым: часть скоупов
+        обязательства закрыта, оставшийся стоит на остывании после повтора,
+        план пуст, попыток в ране нет — значит ни гейт исходов, ни приёмка
+        каталога такую волну не красят.
+        """
+
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService, OperationResult
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _league_payload,
+        )
+
+        mod = self._module()
+        root = _league_payload()
+        root["allAvailableSeasons"] = ["2025/2026", "2024/2025", "2023/2024"]
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: root,
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2024/2025"}
+            ).canonical_url: _league_payload("2024/2025"),
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2023/2024"}
+            ).canonical_url: _league_payload("2023/2024"),
+        }
+        repository = MemoryFotMobRepository()
+
+        def run(run_id, *, retryable=False):
+            service = FotMobIngestService(
+                transport=StubTransport(dict(responses)),
+                repository=repository,
+                mode=RunMode.BACKFILL,
+                budget=TransportBudget(
+                    max_requests=100,
+                    max_direct_bytes=10_000_000,
+                ),
+                run_id=run_id,
+                max_workers=2,
+            )
+            if retryable:
+                service.sync_season = MagicMock(
+                    return_value=(
+                        OperationResult(
+                            "season_bundle",
+                            attempted=1,
+                            retryable=["HTTP 503 from FotMob"],
+                        ),
+                        None,
+                    )
+                )
+            args = mod._argument_parser().parse_args(
+                [
+                    "--mode",
+                    "backfill",
+                    "--catalog-contract",
+                    "fotmob-catalog-v1",
+                    "--entities",
+                    "season",
+                    "--run-id",
+                    run_id,
+                ]
+            )
+            return _run_native_admitted(mod, args, service=service)
+
+        first_rc, first_report = run("stalled-cycle-1")
+        assert first_rc == 0, first_report["errors"]
+        assert first_report["selection"]["planned_scopes"] == ["47=2024/2025"]
+
+        second_rc, second_report = run("stalled-cycle-2", retryable=True)
+        assert second_rc == 1
+        assert second_report["selection"]["planned_scopes"] == ["47=2023/2024"]
+        assert second_report["selection"]["scope_attempts"][0]["outcome"] == "retryable"
+
+        third_rc, third_report = run("stalled-cycle-3")
+
+        assert third_report["selection"]["planned_scopes"] == []
+        assert third_report["selection"]["scope_attempts"] == []
+        assert third_rc == 1
+        assert third_report["status"] != "success"
+        assert third_report["complete"] is False
+        work_plan = self._season_work_plan(third_report)
+        assert work_plan["metadata"]["obligation_scopes"] == 2
+        assert work_plan["metadata"]["already_complete_scopes"] == 1
+        assert work_plan["metadata"]["pending_candidate_scopes"] == 1
+        assert any(
+            "history lane is stalled" in error for error in work_plan["errors"]
+        ), work_plan["errors"]
+
+    @pytest.mark.unit
+    def test_automatic_backfill_empty_plan_with_empty_queue_stays_green(self):
+        """Законно пустая очередь остаётся зелёной и проходит приёмку.
+
+        Ложный красный на «всё уже собрано» хуже молчания: он приучает
+        оператора не смотреть на цвет. Отчёт судит НАСТОЯЩАЯ приёмка каталога,
+        не синтетика.
+        """
+
+        from scripts.fotmob_catalog_acceptance import validate_report
+        from scrapers.fotmob.planner import RunMode, TransportBudget
+        from scrapers.fotmob.repository import MemoryFotMobRepository
+        from scrapers.fotmob.service import FotMobIngestService
+        from scrapers.fotmob.transport import canonicalize_target
+        from tests.unit.scrapers.test_fotmob_service import (
+            StubTransport,
+            _league_payload,
+        )
+
+        mod = self._module()
+        root = _league_payload()
+        root["allAvailableSeasons"] = ["2025/2026", "2024/2025", "2023/2024"]
+        responses = {
+            canonicalize_target("allLeagues").canonical_url: {
+                "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+            },
+            canonicalize_target("leagues", {"id": 47}).canonical_url: root,
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2024/2025"}
+            ).canonical_url: _league_payload("2024/2025"),
+            canonicalize_target(
+                "leagues", {"id": 47, "season": "2023/2024"}
+            ).canonical_url: _league_payload("2023/2024"),
+        }
+        repository = MemoryFotMobRepository()
+
+        def run(run_id):
+            service = FotMobIngestService(
+                transport=StubTransport(dict(responses)),
+                repository=repository,
+                mode=RunMode.BACKFILL,
+                budget=TransportBudget(
+                    max_requests=100,
+                    max_direct_bytes=10_000_000,
+                ),
+                run_id=run_id,
+                max_workers=2,
+            )
+            args = mod._argument_parser().parse_args(
+                [
+                    "--mode",
+                    "backfill",
+                    "--catalog-contract",
+                    "fotmob-catalog-v1",
+                    "--entities",
+                    "season",
+                    "--run-id",
+                    run_id,
+                ]
+            )
+            return _run_native_admitted(mod, args, service=service)
+
+        first_rc, first_report = run("drained-cycle-1")
+        second_rc, second_report = run("drained-cycle-2")
+        assert first_rc == 0, first_report["errors"]
+        assert second_rc == 0, second_report["errors"]
+
+        third_rc, third_report = run("drained-cycle-3")
+
+        assert third_rc == 0, third_report["errors"]
+        assert third_report["status"] == "success"
+        assert third_report["selection"]["planned_scope_count"] == 0
+        work_plan = self._season_work_plan(third_report)
+        assert work_plan["counts"]["planned_scopes"] == 0
+        assert work_plan["metadata"]["obligation_scopes"] == 2
+        assert work_plan["metadata"]["already_complete_scopes"] == 2
+        assert work_plan["metadata"]["pending_candidate_scopes"] == 0
+        assert work_plan["errors"] == []
+
+        accepted = validate_report(third_report, require_full_completion=False)
+        assert accepted.ok, accepted.errors
+
     @pytest.mark.unit
     def test_automatic_runner_removes_now_female_cached_inclusion_before_fanout(
         self,
