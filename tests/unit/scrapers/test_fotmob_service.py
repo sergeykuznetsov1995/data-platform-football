@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from scrapers.fotmob import service as service_module
 from scrapers.fotmob.domain import ProbeStatus, ScopeDecision, ScopeRef
 from scrapers.fotmob.parsers import parse_season_bundle
 from scrapers.fotmob.planner import RunMode, TransportBudget
@@ -2989,3 +2990,99 @@ def test_periodic_player_refresh_can_be_reenabled_explicitly():
     assert players.skipped == 0
     assert players.succeeded == 1
     assert [call[0] for call in transport.calls] == [player_url]
+
+
+def _seasons_responses():
+    return {
+        canonicalize_target("allLeagues").canonical_url: {
+            "countries": [{"leagues": [{"id": 47, "name": "Premier League"}]}]
+        },
+        canonicalize_target("leagues", {"id": 47}).canonical_url: (
+            _competition_payload(47, "Premier League")
+        ),
+    }
+
+
+def _last_seasons_commit(service, repository):
+    catalog = service.discover_catalog()
+    service.discover_competitions(
+        catalog.classifications, profile_payloads=catalog.profile_payloads
+    )
+    return next(
+        commit
+        for commit in reversed(repository.commits)
+        if commit.target_type == "competition_seasons"
+    )
+
+
+def test_seasons_batch_identity_follows_the_seasons_parser_version(monkeypatch):
+    # #1234: the seasons batch id was content identity only, so #1230's
+    # phase-edition filter returned fewer rows for byte-identical bytes under
+    # the very batch id that already held the old parse.  Every wave then died
+    # in the row-count reconcile ("has 46 stored rows; expected either 0 or
+    # 34") and lost its whole write buffer.  The identity of the parse has to
+    # travel in the batch id, so a re-parse of unchanged bytes is a new batch.
+    monkeypatch.setattr(service_module, "SEASONS_PARSER_VERSION", "fotmob-seasons-v1")
+    old_service, _, old_repository = _service(_seasons_responses())
+    old = _last_seasons_commit(old_service, old_repository)
+
+    monkeypatch.setattr(service_module, "SEASONS_PARSER_VERSION", "fotmob-seasons-v2")
+    new_service, _, new_repository = _service(_seasons_responses())
+    new = _last_seasons_commit(new_service, new_repository)
+
+    assert old.content_hash == new.content_hash
+    assert old.parser_version == new.parser_version
+    assert old.observation_id == "seasons-parser:fotmob-seasons-v1"
+    assert new.observation_id == "seasons-parser:fotmob-seasons-v2"
+    assert old.batch_id != new.batch_id
+
+
+def test_unchanged_seasons_bytes_keep_one_batch_across_runs():
+    # The new identity must not turn every wave into a fresh batch the way the
+    # run-scoped catalog identity does: same bytes and same seasons parser mean
+    # one batch id, so a later observation is reconciled against the stored rows
+    # instead of duplicating them.
+    first_service, _, repository = _service(_seasons_responses())
+    first = _last_seasons_commit(first_service, repository)
+
+    second_service = FotMobIngestService(
+        transport=StubTransport(_seasons_responses()),
+        repository=repository,
+        budget=TransportBudget(max_requests=100, max_direct_bytes=10_000_000),
+        run_id="second-run",
+    )
+    second = _last_seasons_commit(second_service, repository)
+
+    assert second.run_id == "second-run"
+    assert first.run_id != second.run_id
+    assert first.observation_id == second.observation_id
+    assert "second-run" not in second.observation_id
+    assert first.batch_id == second.batch_id
+    assert {
+        row["_target_batch_id"]
+        for row in repository.tables["fotmob_competition_seasons"]
+    } == {first.batch_id}
+
+
+def test_seasons_identity_leaves_other_target_identities_untouched():
+    # Regression guard for the blast radius: only the catalog, the scope
+    # evidence and now the seasons carry a non-content identity; everything
+    # else stays content-addressed.
+    service, _, repository = _service(_seasons_responses())
+    _last_seasons_commit(service, repository)
+
+    identities = {
+        commit.target_type: commit.observation_id for commit in repository.commits
+    }
+
+    assert identities["all_leagues"] == "test-run"
+    assert identities["competition_profile"] == "test-run:47"
+    assert identities["competition_seasons"] == (
+        f"seasons-parser:{service_module.SEASONS_PARSER_VERSION}"
+    )
+    assert all(
+        commit.observation_id is None
+        for commit in repository.commits
+        if commit.target_type
+        not in {"all_leagues", "competition_profile", "competition_seasons"}
+    )
