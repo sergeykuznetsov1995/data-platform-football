@@ -640,6 +640,103 @@ class TestFotmobNativeRunner:
         assert accepted.ok, accepted.errors
 
     @pytest.mark.unit
+    def test_wave_metrics_line_reads_the_wave_without_sql(self):
+        """Одна строка чисел волны: числа взяты с настоящей волны 9247c244.
+
+        Замер 02.09.2026: отчёт волны 31.08 12:54–16:03 UTC (backfill, история)
+        нёс planned_scopes=0, already_complete_scopes=589, rows=6075,
+        transport.attempts=450/not_modified=367, budget 450 из 20000 — и
+        прочитать это можно было только jq по десятимегабайтному логу.
+        """
+
+        mod = self._module()
+        payload = {
+            "mode": "backfill",
+            "status": "incomplete",
+            "complete": False,
+            "rows": {
+                "commit_flush": 1,
+                "competition_catalog": 558,
+                "competition_discovery_plan": 0,
+                "competition_seasons": 5500,
+                "current_views": 16,
+                "scope_attempts": 0,
+                "season_work_plan": 0,
+                "transfer_work_plan": 0,
+            },
+            "transport": {
+                "attempts": 450,
+                "not_modified": 367,
+                "encoded_bytes": 3438525,
+            },
+            "budget": {"max_requests": 20000, "requests": 450},
+            "selection": {
+                "scope_lane": "history",
+                "planned_scope_count": 0,
+                "scope_outcome_counts": {},
+            },
+            "operations": [
+                {"entity": "competition_catalog", "metadata": {}},
+                {
+                    "entity": "season_work_plan",
+                    "counts": {"planned_scopes": 0},
+                    "metadata": {
+                        "already_complete_scopes": 589,
+                        "obligation_scopes": 5066,
+                        "pending_candidate_scopes": 4477,
+                    },
+                },
+            ],
+        }
+
+        line = mod._wave_metrics_line(payload, 1)
+
+        assert "\n" not in line
+        assert line == (
+            "mode=backfill lane=history status=incomplete rc=1 planned=0 "
+            "obligation=5066 already_complete=589 pending=4477 success=0 "
+            "source_gap=0 retryable=0 terminal=0 deferred=0 rows_total=6075 "
+            "requests=450 not_modified=367 encoded_bytes=3438525 "
+            "budget_requests_left=19550"
+        )
+
+    @pytest.mark.unit
+    def test_wave_metrics_line_never_throws_on_a_truncated_report(self):
+        """Строка метрик — не источник новых отказов: нет поля — печатаем n/a."""
+
+        mod = self._module()
+
+        line = mod._wave_metrics_line({"mode": "refresh"})
+
+        keys = [field.split("=", 1)[0] for field in line.split(" ")]
+        assert keys == [
+            "mode",
+            "lane",
+            "status",
+            "rc",
+            "planned",
+            "obligation",
+            "already_complete",
+            "pending",
+            "success",
+            "source_gap",
+            "retryable",
+            "terminal",
+            "deferred",
+            "rows_total",
+            "requests",
+            "not_modified",
+            "encoded_bytes",
+            "budget_requests_left",
+        ]
+        assert "mode=refresh" in line
+        assert "lane=n/a" in line
+        assert "planned=n/a" in line
+        assert "rows_total=n/a" in line
+        assert "budget_requests_left=n/a" in line
+        assert "rc=n/a" in line
+
+    @pytest.mark.unit
     def test_automatic_runner_removes_now_female_cached_inclusion_before_fanout(
         self,
     ):

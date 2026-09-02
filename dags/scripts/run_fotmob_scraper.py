@@ -685,6 +685,71 @@ def _is_budget_deferral_error(value: Any) -> bool:
     return "budget" in text and ("request" in text or "byte" in text)
 
 
+def _wave_metrics_line(payload: Mapping[str, Any], rc: Any = None) -> str:
+    """Одна greppable строка с числами волны.
+
+    Разбор волны сегодня требует SQL по метабазе или jq по гигабайтному логу:
+    цвет рана виден, а «сколько запланировано, сколько осталось в очереди,
+    сколько закрыто» — нет. Строка чисто вычисляемая и никогда не бросает:
+    отсутствующее поле отчёта печатается как ``n/a``.
+    """
+
+    def _mapping(value: Any) -> Mapping[str, Any]:
+        return value if isinstance(value, Mapping) else {}
+
+    def _total(value: Any) -> Any:
+        mapping = _mapping(value)
+        if not mapping:
+            return None
+        try:
+            return sum(int(item) for item in mapping.values())
+        except (TypeError, ValueError):
+            return None
+
+    selection = _mapping(payload.get("selection"))
+    work_plan: Mapping[str, Any] = {}
+    operations = payload.get("operations")
+    if isinstance(operations, list):
+        for operation in operations:
+            if (
+                isinstance(operation, Mapping)
+                and operation.get("entity") == "season_work_plan"
+            ):
+                work_plan = operation
+    metadata = _mapping(work_plan.get("metadata"))
+    outcomes = _mapping(selection.get("scope_outcome_counts"))
+    transport = _mapping(payload.get("transport"))
+    budget = _mapping(payload.get("budget"))
+    max_requests = budget.get("max_requests")
+    used_requests = budget.get("requests")
+    requests_left: Any = None
+    if isinstance(max_requests, int) and isinstance(used_requests, int):
+        requests_left = max_requests - used_requests
+    fields = (
+        ("mode", payload.get("mode")),
+        ("lane", selection.get("scope_lane")),
+        ("status", payload.get("status")),
+        ("rc", rc),
+        ("planned", selection.get("planned_scope_count")),
+        ("obligation", metadata.get("obligation_scopes")),
+        ("already_complete", metadata.get("already_complete_scopes")),
+        ("pending", metadata.get("pending_candidate_scopes")),
+        ("success", outcomes.get("success", 0) if outcomes else 0),
+        ("source_gap", outcomes.get("source_gap", 0) if outcomes else 0),
+        ("retryable", outcomes.get("retryable", 0) if outcomes else 0),
+        ("terminal", outcomes.get("terminal", 0) if outcomes else 0),
+        ("deferred", outcomes.get("deferred", 0) if outcomes else 0),
+        ("rows_total", _total(payload.get("rows"))),
+        ("requests", transport.get("attempts")),
+        ("not_modified", transport.get("not_modified")),
+        ("encoded_bytes", transport.get("encoded_bytes")),
+        ("budget_requests_left", requests_left),
+    )
+    return " ".join(
+        f"{key}={'n/a' if value is None else value}" for key, value in fields
+    )
+
+
 def _native_output_payload(report) -> dict[str, Any]:
     payload = report.as_dict()
     tables: list[str] = []
@@ -2797,6 +2862,7 @@ def main():
         rc = 1
     _deactivate_native_service()
     _write_json_atomic(output, payload)
+    logger.info("FotMob wave metrics: %s", _wave_metrics_line(payload, rc))
     logger.info("FotMob report: %s", output)
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return rc
