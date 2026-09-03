@@ -32,6 +32,12 @@ STATE="$SOFASCORE_GATEWAY_STATE_HOST_DIR"
 HIST=dag_backfill_sofascore_all_mens
 REFRESH=dag_refresh_sofascore_all_mens
 DAILY=dag_ingest_sofascore
+# Три полосы источника (#1244): свой шлюз, свой пул, свой сторож аренд у каждой.
+GATEWAYS="sofascore_proxy_filter sofascore_gw_history sofascore_gw_players"
+GATEWAY_CONTAINERS="sofascore_gw_951 sofascore_gw_history sofascore_gw_players"
+WATCHDOG_UNITS="sofascore-gw-lease-watchdog.service
+sofascore-gw-lease-watchdog-history.service
+sofascore-gw-lease-watchdog-players.service"
 PSQL="docker exec sofascore-airflow-metadb psql -U airflow -d airflow -At -c"
 
 log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG"; }
@@ -159,20 +165,25 @@ SOFASCORE_PROXY_BUDGET_ARTIFACT_ID="$ARTIFACT_ID" \
 docker compose -p sofascore-gw -f "$GW_COMPOSE" \
   --project-directory "$RELEASE" \
   --env-file "$SOFASCORE_PLATFORM_ENV_FILE" --env-file "$ENV_FILE" \
-  up -d --no-deps --force-recreate sofascore_proxy_filter >> "$LOG" 2>&1
-log "gateway up"
+  up -d --no-deps --force-recreate $GATEWAYS >> "$LOG" 2>&1
+log "gateways up: $GATEWAYS"
 
 STEP="gateway-health"
-# 10 минут: 5 минут не хватило 25.08, healthcheck успел стать healthy на 30 с позже выхода.
-for _ in $(seq 1 60); do
-  [ "$(docker inspect -f '{{.State.Health.Status}}' sofascore_gw_951 2>/dev/null)" = "healthy" ] && break
-  sleep 10
+# 10 минут на шлюз: 5 минут не хватило 25.08, healthcheck успел стать healthy на 30 с
+# позже выхода. Лимит памяти проверяется, а не только логируется: `docker update
+# --memory 1g` уже терялся при пересоздании (23.08), а на 1 GiB рассчитан порог WAL.
+for gw in $GATEWAY_CONTAINERS; do
+  for _ in $(seq 1 60); do
+    [ "$(docker inspect -f '{{.State.Health.Status}}' "$gw" 2>/dev/null)" = "healthy" ] && break
+    sleep 10
+  done
+  [ "$(docker inspect -f '{{.State.Health.Status}}' "$gw")" = "healthy" ] || { log "$gw unhealthy"; exit 5; }
+  mem=$(docker inspect -f '{{.HostConfig.Memory}}' "$gw")
+  [ "$mem" = "1073741824" ] || { log "$gw HostConfig.Memory=$mem (ожидание 1073741824)"; exit 5; }
+  log "$gw healthy; HostConfig.Memory=$mem"
+  # `|| true`: пустой лог за 10 минут — не повод обрывать выкат (pipefail + grep=1).
+  docker logs "$gw" --since 10m 2>&1 | grep -E "residential pool|paid_enabled|compacted|listening|SofaScore paid leases disabled" | tail -8 | tee -a "$LOG" || true
 done
-[ "$(docker inspect -f '{{.State.Health.Status}}' sofascore_gw_951)" = "healthy" ] || { log "gateway unhealthy"; exit 5; }
-mem=$(docker inspect -f '{{.HostConfig.Memory}}' sofascore_gw_951)
-log "gateway healthy; HostConfig.Memory=$mem (ожидание 1073741824)"
-# `|| true`: пустой лог за 10 минут — не повод обрывать выкат (pipefail + grep=1).
-docker logs sofascore_gw_951 --since 10m 2>&1 | grep -E "residential pool|paid_enabled|compacted|listening|SofaScore paid leases disabled" | tail -8 | tee -a "$LOG" || true
 
 STEP="scheduler-health"
 docker exec sofascore-airflow-scheduler python /opt/airflow/scripts/sofascore_runtime_preflight.py scheduler-health \
@@ -190,6 +201,20 @@ log "dags active=$present import_errors=$errs"
 [ "$errs" = "0" ] || { log "import errors present — см. import_error"; exit 6; }
 [ "$present" = "3" ] || { log "expected 3 active core DAGs, got $present"; exit 6; }
 
+STEP="pools"
+# Пулы полос заводит airflow-init, но deploy.sh пересоздаёт только scheduler и шлюзы —
+# на ротации init не запускается. Без этого шага задачи полосы повисли бы в
+# несуществующем пуле. `airflow pools set` идемпотентен: создаёт или переставляет слоты.
+set_pool() {  # set_pool <name> <slots> <description>
+  docker exec sofascore-airflow-scheduler airflow pools set "$1" "$2" "$3" >> "$LOG" 2>&1
+}
+HISTORY_SLOTS="${SOFASCORE_HISTORY_POOL_SLOTS:-1}"
+PLAYERS_SLOTS="${SOFASCORE_PLAYERS_POOL_SLOTS:-1}"
+set_pool ingest_scraper_pool 1 'Serialize heavy ingest scrapers (isolated sofascore stack #951)'
+set_pool sofascore_history_pool "$HISTORY_SLOTS" 'SofaScore history lane'
+set_pool sofascore_players_pool "$PLAYERS_SLOTS" 'SofaScore players lane'
+log "pools set: ingest_scraper_pool=1 sofascore_history_pool=$HISTORY_SLOTS sofascore_players_pool=$PLAYERS_SLOTS"
+
 STEP="restore-pause"
 pause_dag "$HIST"
 if [ "$REFRESH_WAS_PAUSED" = "f" ]; then
@@ -202,6 +227,9 @@ fi
 
 STEP="watchdog"
 # Сторож аренд читает тот же env-файл (EnvironmentFile= в unit) — достаточно рестарта.
-systemctl restart sofascore-gw-lease-watchdog.service
-log "watchdog restarted on $RELEASE: $(systemctl is-active sofascore-gw-lease-watchdog.service)"
+# Свой unit на каждый шлюз: сторож смотрит один контейнер и один каталог состояния.
+while IFS= read -r unit; do
+  systemctl restart "$unit"
+  log "watchdog restarted on $RELEASE: $unit $(systemctl is-active "$unit")"
+done <<< "$WATCHDOG_UNITS"
 log "DONE artifact_id=$ARTIFACT_ID runtime=$DIGEST"

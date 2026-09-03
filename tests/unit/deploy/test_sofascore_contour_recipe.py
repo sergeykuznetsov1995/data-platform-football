@@ -290,7 +290,9 @@ def test_rotation_scripts_take_every_host_path_from_the_env_file() -> None:
         assert f"set_env_var {key} " in deploy, f"deploy.sh must repin {key} in the env file"
     assert "sed -i" not in deploy.replace('sed -i "s#^${key}=', ""), "no ad-hoc edits of system files"
     assert "--no-deps --force-recreate airflow-scheduler" in deploy
-    assert "--no-deps --force-recreate sofascore_proxy_filter" in deploy
+    # Все три шлюза поднимаются одним вызовом того же compose-проекта.
+    assert "--no-deps --force-recreate $GATEWAYS" in deploy
+    assert 'GATEWAYS="sofascore_proxy_filter sofascore_gw_history sofascore_gw_players"' in deploy
     assert "--project-directory \"$RELEASE\"" in deploy
 
 
