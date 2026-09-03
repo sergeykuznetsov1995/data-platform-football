@@ -55,6 +55,16 @@ ClassifierHook = Callable[[CompetitionRef], Optional[ScopeClassification]]
 
 CLASSIFIER_VERSION = "fotmob-men-v1"
 
+# Identity of the seasons parse itself.  ``parse_seasons`` can return a
+# different set of rows for byte-identical bytes -- #1230 taught it to drop the
+# phantom bare season of Apertura/Clausura competitions -- while the batch id of
+# ``competition_seasons`` was content identity only.  The re-parse then landed in
+# the batch that already held the old parse and the row-count reconcile killed
+# every wave (#1234).  Bump on ANY change of ``parse_seasons`` that alters the
+# rows for unchanged bytes; v1 -- before #1230, v2 -- with the
+# ``_phase_edition_present`` filter.
+SEASONS_PARSER_VERSION = "fotmob-seasons-v2"
+
 
 _FEMALE_RE = re.compile(
     r"(?:\bwomen(?:'s)?\b|\bwoman\b|\bfemale\b|\bfeminine\b|\bfemenin[oa]\b|"

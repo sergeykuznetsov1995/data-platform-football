@@ -23,6 +23,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from .catalog import (
     CLASSIFIER_VERSION,
+    SEASONS_PARSER_VERSION,
     CatalogDiscovery,
     CatalogShapeError,
     SelectedSeasonMismatch,
@@ -1654,6 +1655,9 @@ class FotMobIngestService:
                 target_type="competition_seasons",
                 competition_id=competition.competition_id,
                 entity_id=competition.competition_id,
+                # A re-parse of unchanged bytes is a new observation, not the
+                # stored one (#1234).
+                observation_id=f"seasons-parser:{SEASONS_PARSER_VERSION}",
                 datasets=[
                     TableRows(
                         "fotmob_competition_seasons",

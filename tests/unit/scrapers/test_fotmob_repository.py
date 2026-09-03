@@ -1247,6 +1247,11 @@ class ReconcileTrino:
     def table_exists(self, schema, table):
         return bool(self.writer.rows.get(table))
 
+    def _execute(self, sql):
+        # DDL of `ensure_schema`: recorded, never a source of rows.
+        self.queries.append(sql)
+        return None
+
     def execute_query(self, sql):
         self.queries.append(sql)
         marker = "FROM iceberg.bronze."
@@ -2196,3 +2201,77 @@ def test_failed_flush_retry_writes_inventory_rows_exactly_once():
     ]
     assert len(inventory) == 1
     assert set(inventory[0][0]["json_path"]) == {"content.stats", "content.lineup"}
+
+
+def test_reparsed_seasons_collide_under_one_batch_and_fail_the_reconcile():
+    # The #1234 incident in one test: 46 rows of the pre-#1230 parse are
+    # already stored under the content-only batch id, the new parse of the very
+    # same bytes yields 34, and the reconcile refuses to append into a batch
+    # that holds a different row count -- killing the whole wave buffer.
+    writer = ReconcileWriter()
+    commit = _commit(target_type="competition_seasons")
+    stored = [
+        {"_target_batch_id": commit.batch_id, "source_season_key": f"s{index}"}
+        for index in range(46)
+    ]
+    writer.rows["fotmob_competition_seasons"] = stored
+    repository = FotMobRepository(writer=writer, batch_size=500)
+    repository.commit(
+        commit,
+        [
+            TableRows(
+                "fotmob_competition_seasons",
+                [
+                    {"competition_id": "289", "source_season_key": f"s{index}"}
+                    for index in range(34)
+                ],
+                "competition_seasons",
+                ("competition_id",),
+            )
+        ],
+    )
+
+    with pytest.raises(
+        RuntimeError, match="has 46 stored rows; expected either 0 or 34"
+    ):
+        repository.flush()
+
+
+def test_seasons_parse_identity_gives_the_reparse_its_own_batch():
+    # With the parse identity in the batch id the same bytes land in a fresh
+    # batch: the 46 historical rows stay, the 34 new ones are appended.
+    writer = ReconcileWriter()
+    old = _commit(
+        target_type="competition_seasons",
+        observation_id="seasons-parser:fotmob-seasons-v1",
+    )
+    new = _commit(
+        target_type="competition_seasons",
+        observation_id="seasons-parser:fotmob-seasons-v2",
+    )
+    assert old.batch_id != new.batch_id
+    writer.rows["fotmob_competition_seasons"] = [
+        {"_target_batch_id": old.batch_id, "source_season_key": f"s{index}"}
+        for index in range(46)
+    ]
+    repository = FotMobRepository(writer=writer, batch_size=500)
+    repository.commit(
+        new,
+        [
+            TableRows(
+                "fotmob_competition_seasons",
+                [
+                    {"competition_id": "289", "source_season_key": f"s{index}"}
+                    for index in range(34)
+                ],
+                "competition_seasons",
+                ("competition_id",),
+            )
+        ],
+    )
+    repository.flush()
+
+    counts = {}
+    for row in writer.rows["fotmob_competition_seasons"]:
+        counts[row["_target_batch_id"]] = counts.get(row["_target_batch_id"], 0) + 1
+    assert counts == {old.batch_id: 46, new.batch_id: 34}
