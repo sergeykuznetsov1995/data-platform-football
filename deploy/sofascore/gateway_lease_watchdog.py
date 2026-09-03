@@ -91,8 +91,16 @@ MAX_RESTARTS_PER_DAY = 12
 ALERT_REPEAT_SECONDS = 6 * 3600.0
 
 # Above this the gateway OOM-kills itself replaying the WAL into memory before
-# the HTTP server starts (256M memcg, 133MB WAL took ~500MB heap on 2026-07-24).
-WAL_OOM_RISK_BYTES = 50 * 1024 * 1024
+# the HTTP server starts.  The original 50MB was sized for a 256M memcg (133MB
+# WAL took ~500MB heap on 2026-07-24).  The gateway limit is 1G since
+# 2026-07-31 (now pinned in deploy/sofascore/gateway.compose.yaml), and on
+# 2026-08-23 a 134MB WAL replayed in <2x its size (ledger replay 2.7s, HTTP
+# in 13.6s, no OOM).  The WAL grows ~14MB/day under the all-men campaign, so
+# 50MB or 150MB would freeze the watchdog within days; 300MB keeps a <2x
+# replay (~600MB) inside 1G.  This is the value the production host has run
+# since 2026-08-24 (returned to git by #1155).  Re-lower it if the container
+# limit ever drops.  Real fix is WAL compaction in the gateway (#1218).
+WAL_OOM_RISK_BYTES = 300 * 1024 * 1024
 
 logger = logging.getLogger("sofascore-gw-watchdog")
 

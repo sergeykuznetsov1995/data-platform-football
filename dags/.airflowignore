@@ -1,1 +1,7 @@
-^$
+# Общий scheduler (проект data-platform). Мини-DAG изолированного контура SofaScore
+# (deploy/sofascore/airflow.compose.yaml) здесь не регистрируем: dag_trigger_sofascore_daily
+# дублирует триггер из dag_sofascore_pipeline, dag_sofascore_manifest_maintenance —
+# обслуживание из dag_iceberg_maintenance; двойной запуск = двойной прогон.
+# Изолированный контур накрывает этот файл своим deploy/sofascore/.airflowignore.
+^dag_trigger_sofascore_daily\.py$
+^dag_sofascore_manifest_maintenance\.py$
