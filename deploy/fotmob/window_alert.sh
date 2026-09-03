@@ -15,6 +15,10 @@ STATE=${FOTMOB_STATE_DIR:?FOTMOB_STATE_DIR не задан в env-файле}
 METADB=${FOTMOB_METADB_CONTAINER:?FOTMOB_METADB_CONTAINER не задан в env-файле}
 TG_HOOK=${FOTMOB_TG_HOOK:?FOTMOB_TG_HOOK не задан в env-файле}
 LOG=${FOTMOB_LOG:?FOTMOB_LOG не задан в env-файле}
+# Хук алерта — внешний (ставится отдельно от репозитория). Без него сторож не имеет
+# смысла: раньше суточная защёлка ставилась и при провалившейся отправке, и окно
+# терялось молча. Нет хука — громко в cron-лог и без защёлки (ревью Sol, #1155).
+[ -x "$TG_HOOK" ] || { echo "нет исполняемого хука алерта $TG_HOOK — сторож окна не работает" >&2; exit 2; }
 
 hm=$(date -u +%H%M)
 # strip возможного ведущего нуля для арифметики

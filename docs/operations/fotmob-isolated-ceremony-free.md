@@ -71,9 +71,25 @@ init, v2 для scheduler'а), блок-лист, мёртвая копия ми
   Контейнеры при доставке не пересоздаются.
 - **Пины выката** — пять строк `FOTMOB_TARGET`, `FOTMOB_ROLLBACK_REF`, `FOTMOB_ROLLBACK_SHA`,
   `FOTMOB_NEW_CODE_FILE`, `FOTMOB_NEW_CODE_MD5` в `/etc/data-platform/fotmob.env`.
-  «Поднять пин» = переписать их атомарно (write + `mv`) вне окна 19:45–23:20 UTC и не в
-  момент тика cron; скрипты не правятся и не расходятся с репозиторием. md5 цели —
-  `git show <TARGET>:scrapers/fotmob/<модуль>.py | md5sum`.
+  `FOTMOB_TARGET` и `FOTMOB_ROLLBACK_SHA` — КОРОТКИЕ SHA (7–8 hex, как печатает
+  `git rev-parse --short`): автомат сравнивает их с `--short HEAD` по префиксу, полный SHA
+  не совпал бы никогда (скрипты с ним не стартуют). «Поднять пин» = переписать строки
+  атомарно и с сохранением прав, вне окна 19:45–23:20 UTC и не в момент тика cron:
+
+  ```bash
+  umask 077
+  sed -e 's/^FOTMOB_TARGET=.*/FOTMOB_TARGET=<sha8 цели>/' \
+      -e 's/^FOTMOB_ROLLBACK_REF=.*/FOTMOB_ROLLBACK_REF=<sha8 прежней цели>/' \
+      -e 's/^FOTMOB_ROLLBACK_SHA=.*/FOTMOB_ROLLBACK_SHA=<sha8 прежней цели>/' \
+      -e 's|^FOTMOB_NEW_CODE_FILE=.*|FOTMOB_NEW_CODE_FILE=/opt/airflow/scrapers/fotmob/<модуль>.py|' \
+      -e 's/^FOTMOB_NEW_CODE_MD5=.*/FOTMOB_NEW_CODE_MD5=<md5>/' \
+      /etc/data-platform/fotmob.env > /etc/data-platform/fotmob.env.new
+  chown root:root /etc/data-platform/fotmob.env.new && chmod 0600 /etc/data-platform/fotmob.env.new
+  mv -f /etc/data-platform/fotmob.env.new /etc/data-platform/fotmob.env
+  ```
+
+  md5 цели — `git show <TARGET>:scrapers/fotmob/<модуль>.py | md5sum`. Скрипты не правятся и
+  не расходятся с репозиторием.
 - **Блок-лист** — `deploy/fotmob/isolated.airflowignore`. Тест
   `tests/unit/deploy/test_fotmob_contour_recipe.py` требует, чтобы в нём был КАЖДЫЙ чужой
   `dags/dag_*.py` и ни один из семи своих: новый чужой DAG на master без строки здесь — красный
@@ -87,24 +103,40 @@ init, v2 для scheduler'а), блок-лист, мёртвая копия ми
   (статика), `tests/integration/test_compose_validity.py -k fotmob` (рендер),
   `tests/unit/deploy/test_fotmob_delivery_scripts.py` (скрипты против заглушек).
 - **Env-файл читается как compose**: `deploy/fotmob/env.sh` (`fotmob_load_env`) принимает
-  только ключи `FOTMOB_*`, ничего не подставляет и не экспортирует. Секреты платформы
+  только ключи `FOTMOB_*`, ничего не подставляет и не экспортирует; чтобы compose и скрипты
+  не прочли один файл по-разному, значения с `$` и inline-комментарии ` #` загрузчик
+  отвергает, пути пишутся без хвостового `/`. В shell оператора не должно быть
+  экспортированных `FOTMOB_*`: окружение процесса у compose старше `--env-file` и молча
+  перекрыло бы файл — перед `docker compose` снимайте их (`unset $(compgen -v FOTMOB_)`,
+  как в командах ниже). Секреты платформы
   (fernet, S3, Trino, Telegram) — по-прежнему в общем `.env`; в `fotmob.env` — только пароль
   метабазы контура (`FOTMOB_AIRFLOW_DB_PASSWORD`: база инициализирована 17.07 значением общего
   `AIRFLOW_DB_PASSWORD` того дня, ротация общего `.env` не должна её ломать).
 
 ### Установка (один раз на хост)
 
+Всё от root (env-файл 0600, docker, каталог состояния, cron — root'а). Порядок важен: env-файл
+заполняется ПЕРВЫМ и дальше не перезаписывается (`[ -e … ] ||`), его значения загружаются в
+текущий shell без export — на них ссылаются остальные команды.
+
 ```bash
 install -d -m 0755 /etc/data-platform /usr/local/libexec/fotmob
-install -m 0600 deploy/fotmob/fotmob.env.example /etc/data-platform/fotmob.env   # заполнить
+[ -e /etc/data-platform/fotmob.env ] || install -m 0600 -o root -g root \
+  deploy/fotmob/fotmob.env.example /etc/data-platform/fotmob.env
+"$EDITOR" /etc/data-platform/fotmob.env                    # заполнить (короткие SHA, пути без хвостового /)
+. deploy/fotmob/env.sh && fotmob_load_env /etc/data-platform/fotmob.env   # значения в этот shell, без export
 install -m 0755 deploy/fotmob/auto_deliver.sh deploy/fotmob/b6_deliver.sh \
   deploy/fotmob/window_alert.sh /usr/local/libexec/fotmob/
 install -m 0644 deploy/fotmob/env.sh /usr/local/libexec/fotmob/
-install -m 0644 deploy/fotmob/isolated.airflowignore "$FOTMOB_DAGBAG_IGNORE_FILE"  # дальше только >>
-install -d -m 0755 "$FOTMOB_STATE_DIR"   # автомат каталог состояния не создаёт
+test -x "$FOTMOB_TG_HOOK"                                  # хук алерта — внешний, ставится отдельно
+[ -e "$FOTMOB_DAGBAG_IGNORE_FILE" ] || \
+  install -m 0644 deploy/fotmob/isolated.airflowignore "$FOTMOB_DAGBAG_IGNORE_FILE"   # дальше только >>
+install -d -m 0755 "$FOTMOB_STATE_DIR"                     # автомат каталог состояния не создаёт
+install -d -o 50000 -g 0 -m 0775 "$FOTMOB_RELEASE_ROOT/logs"   # logs/ не в git; compose источники bind'ов не создаёт
 ```
 
-Cron (`crontab -e`, обе строки раз в 5 минут; окно и одноразовость — внутри скриптов):
+Cron root'а (`crontab -e` под root; обе строки раз в 5 минут; окно и одноразовость — внутри
+скриптов):
 
 ```
 */5 * * * * /usr/local/libexec/fotmob/window_alert.sh >> /var/log/fotmob-window-alert.log 2>&1
@@ -115,8 +147,9 @@ Cron (`crontab -e`, обе строки раз в 5 минут; окно и од
 образа или лимитов — всегда `--no-deps`, иначе `depends_on` пересоздаст `airflow-init`:
 
 ```bash
+unset $(compgen -v FOTMOB_)   # экспортированные FOTMOB_* перекрыли бы --env-file
 docker compose -p fotmob-airflow -f deploy/fotmob/isolated.compose.yaml \
-  --env-file "$FOTMOB_PLATFORM_ENV_FILE" --env-file /etc/data-platform/fotmob.env \
+  --env-file <общий .env платформы> --env-file /etc/data-platform/fotmob.env \
   up -d airflow-metadb airflow-init
 ```
 
@@ -137,15 +170,19 @@ file-bind мини-DAG); пароль метабазы — своя переме
    `FOTMOB_DAGBAG_IGNORE_FILE=/root/fotmob-runtime/airflowignore-fotmob.v2`, пути автомата
    (`/root/fotmob_history_backfill`, `/root/watchdog/state`, `/root/watchdog/fotmob_auto_deliver.log`,
    файл `telegram.env`, хук `tg-send.sh`, `pytest` из `/root/.venvs/dpf-test`), пины — из
-   строк `TARGET=`/`ROLLBACK_*`/`NEW_CODE_*` живого `/root/fotmob-auto-deliver.sh`.
-2. Установить скрипты и cron по разделу «Установка»; старые строки cron
-   (`/root/fotmob-auto-deliver.sh`, `/root/watchdog/fotmob_window_alert.sh`) снять тем же
-   `crontab -e`. Замок, маркеры и защёлки в `/root/watchdog/state` — те же файлы, автомат
-   продолжит с текущего состояния (`fotmob-b6-accepted` = принятый SHA).
-3. Пересоздать scheduler из рецепта (`up -d --no-deps --force-recreate airflow-scheduler`) —
-   только при нуле активных ранов ингеста и пустом `pgrep run_fotmob_scraper`; metadb не
-   трогать (том `fotmob_airflow_pgdata` тот же). Init пересоздавать не обязательно; если
-   пересоздаётся — только из этого файла (v1-блок-лист больше не вернётся).
+   строк `TARGET=`/`ROLLBACK_*`/`NEW_CODE_*` живого `/root/fotmob-auto-deliver.sh` (там они
+   уже короткие SHA — переносить как есть).
+2. Установить скрипты и cron по разделу «Установка» (env-файл уже заполнен — шаг с example
+   его не тронет; `logs/` в живом дереве есть, `install -d` его не меняет; хостовая копия
+   блок-листа уже на месте). Старые строки cron (`/root/fotmob-auto-deliver.sh`,
+   `/root/watchdog/fotmob_window_alert.sh`) снять тем же root-`crontab -e`. Замок, маркеры и
+   защёлки в `/root/watchdog/state` — те же файлы, автомат продолжит с текущего состояния
+   (`fotmob-b6-accepted` = принятый SHA).
+3. Пересоздать scheduler из рецепта (`up -d --no-deps --force-recreate airflow-scheduler`, из
+   shell без экспортированных `FOTMOB_*`) — только при нуле активных ранов ингеста и пустом
+   `pgrep run_fotmob_scraper`; metadb не трогать (том `fotmob_airflow_pgdata` тот же). Init
+   пересоздавать не обязательно; если пересоздаётся — только из этого файла (v1-блок-лист
+   больше не вернётся).
 4. Приёмка: `docker inspect fotmob-airflow-scheduler` — ровно семь bind'ов: шесть на
    `${FOTMOB_RELEASE_ROOT}/…` и один на `${FOTMOB_DAGBAG_IGNORE_FILE}`; `import_error=0`, семь
    активных DAG контура, `sha256sum` хостовой копии блок-листа = репозиторной.
@@ -178,8 +215,9 @@ docker exec fotmob-airflow-metadb psql -U airflow -d airflow -c \
 docker exec fotmob-airflow-metadb psql -U airflow -d airflow -At -c "SELECT count(*) FROM import_error"
 ```
 
-Приёмка: 7 строк (6 fotmob-дагов + неактивный легаси `dag_accept_fbref_bronze`), у всех
-шести `has_import_errors=f` и `reparsed=t`, `import_error=0`, иноды маунтов не изменились.
+Приёмка: 8 строк (7 fotmob-дагов, включая `dag_collect_fotmob_players` с 25.08, + неактивный
+легаси `dag_accept_fbref_bronze`), у всех семи `has_import_errors=f` и `reparsed=t`,
+`import_error=0`, иноды маунтов не изменились.
 
 После `unpause` проверять **данными**, а не кодом выхода:
 

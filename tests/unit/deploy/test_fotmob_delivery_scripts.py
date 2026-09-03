@@ -73,9 +73,10 @@ def _layout(tmp_path: Path) -> dict[str, str]:
         "FOTMOB_TG_ENV": str(tmp_path / "telegram.env"),
         "FOTMOB_TG_HOOK": str(tmp_path / "bin" / "tg-send"),
         "FOTMOB_HOST_PYTEST": "/bin/true",
-        "FOTMOB_TARGET": "1" * 40,
-        "FOTMOB_ROLLBACK_REF": "2" * 40,
-        "FOTMOB_ROLLBACK_SHA": "2" * 40,
+        # Короткие SHA, как `git rev-parse --short`: автомат сравнивает пины с ним по префиксу.
+        "FOTMOB_TARGET": "11111111",
+        "FOTMOB_ROLLBACK_REF": "22222222",
+        "FOTMOB_ROLLBACK_SHA": "22222222",
         "FOTMOB_NEW_CODE_FILE": "/opt/airflow/scrapers/fotmob/service.py",
         "FOTMOB_NEW_CODE_MD5": "0" * 32,
     }
@@ -120,11 +121,18 @@ def test_env_loader_reads_the_file_like_compose_and_never_exports(tmp_path: Path
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == 'abc123|/x/with space/log|/x/q"uote\\y|0\n'
 
-    foreign = _write_env(tmp_path / "foreign.env", FOTMOB_TARGET="a", PATH="/evil")
-    proc = subprocess.run(
-        ["bash", "-c", f'. "{ENV_SH}"; fotmob_load_env "{foreign}"'], capture_output=True, text=True, check=False,
-    )
-    assert proc.returncode == 2 and "недопустимый ключ" in proc.stderr
+    for name, values, message in (
+        ("foreign", {"FOTMOB_TARGET": "a", "PATH": "/evil"}, "недопустимый ключ"),
+        # Compose подставил бы ${X} и отрезал бы ` # …` — загрузчик такое отвергает, а не
+        # читает по-своему.
+        ("interp", {"FOTMOB_LOG": "/x/${HOME}/log"}, "подстановки не поддерживаются"),
+        ("inline", {"FOTMOB_LOG": "/x/log # comment"}, "inline-комментарий"),
+    ):
+        bad = _write_env(tmp_path / f"{name}.env", **values)
+        proc = subprocess.run(
+            ["bash", "-c", f'. "{ENV_SH}"; fotmob_load_env "{bad}"'], capture_output=True, text=True, check=False,
+        )
+        assert proc.returncode == 2 and message in proc.stderr, (name, proc.stderr)
 
 
 @pytest.mark.unit
@@ -171,6 +179,20 @@ def test_auto_deliver_fails_closed_on_a_missing_pin(tmp_path: Path) -> None:
     assert not (Path(values["FOTMOB_STATE_DIR"]) / "fotmob-auto-deliver.lock").exists()
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("script", [AUTO, B6], ids=["auto", "b6"])
+def test_scripts_refuse_a_full_length_sha_pin(tmp_path: Path, script: Path) -> None:
+    """Пины сравниваются с `git rev-parse --short HEAD` по префиксу: полный SHA никогда не
+    совпал бы, и исправное дерево считалось бы незаконным — лучше не стартовать."""
+    values = _layout(tmp_path)
+    values["FOTMOB_TARGET"] = "1" * 40
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    proc = _run(script, "check", env_file=env_file)
+    assert proc.returncode == 2, proc.stderr
+    assert "FOTMOB_TARGET" in proc.stderr and "короткий SHA" in proc.stderr
+    assert not (Path(values["FOTMOB_STATE_DIR"]) / "fotmob-auto-deliver.lock").exists()
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
@@ -193,18 +215,18 @@ def test_b6_check_dry_run_validates_the_tree_against_pins_from_the_env_file(tmp_
     two = _git(repo, "rev-parse", "HEAD")
     _git(repo, "checkout", "-q", "--detach", one)
 
-    values.update(FOTMOB_TARGET=two, FOTMOB_ROLLBACK_REF=one, FOTMOB_ROLLBACK_SHA=one[:8])
+    values.update(FOTMOB_TARGET=two[:8], FOTMOB_ROLLBACK_REF=one[:8], FOTMOB_ROLLBACK_SHA=one[:8])
     env_file = _write_env(tmp_path / "fotmob.env", **values)
     # TREE ≠ FOTMOB_RELEASE_ROOT → сухой прогон: без окна, docker и замка.
     proc = _run(B6, "check", env_file=env_file, extra_env={"TREE": str(repo)})
     assert proc.returncode == 0, proc.stderr + proc.stdout
     assert "сухой прогон на копии" in proc.stdout
-    assert f"дерево чистое на {one[:8]}, цель {two} доступна" in proc.stdout
+    assert f"дерево чистое на {one[:8]}, цель {two[:8]} доступна" in proc.stdout
     assert "check ПРОЙДЕН" in proc.stdout
     assert _git(repo, "rev-parse", "HEAD") == one, "check ничего не переключает"
 
     # Пин отката не совпадает с HEAD копии — отказ до любого checkout.
-    values.update(FOTMOB_ROLLBACK_SHA=two)
+    values.update(FOTMOB_ROLLBACK_SHA=two[:8])
     env_file = _write_env(tmp_path / "fotmob.env", **values)
     proc = _run(B6, "check", env_file=env_file, extra_env={"TREE": str(repo)})
     assert proc.returncode == 1
@@ -218,6 +240,63 @@ def test_b6_refuses_a_production_apply_outside_the_automaton(tmp_path: Path) -> 
     proc = _run(B6, "apply", env_file=env_file)
     assert proc.returncode == 1
     assert "ручная доставка на бой запрещена" in proc.stderr
+
+
+@pytest.mark.unit
+def test_b6_apply_under_the_automaton_lock_switches_the_tree_and_accepts(tmp_path: Path) -> None:
+    """Эстафета замка автомат → b6 с путями из env-файла: fd 9 на замке, который автомат
+    открыл по СЫРОМУ пути (с хвостовым `/` в FOTMOB_STATE_DIR), одноразовый пропуск,
+    окно, checkout цели и приёмка против заглушек docker/pgrep/date/sleep."""
+    values = _layout(tmp_path)
+    repo = Path(values["FOTMOB_RELEASE_ROOT"])
+    _git(repo, "init", "-q")
+    (repo / "a.txt").write_text("a", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-q", "-m", "one")
+    one = _git(repo, "rev-parse", "HEAD")
+    (repo / "a.txt").write_text("b", encoding="utf-8")
+    _git(repo, "commit", "-q", "-am", "two")
+    two = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", "--detach", one)
+    state = Path(values["FOTMOB_STATE_DIR"])
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    values.update(
+        FOTMOB_STATE_DIR=str(state) + "/",
+        FOTMOB_TARGET=two[:8], FOTMOB_ROLLBACK_REF=one[:8], FOTMOB_ROLLBACK_SHA=one[:8],
+        FOTMOB_NEW_CODE_MD5=md5,
+    )
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    _date_stub(stubs, "2000")
+    _stub(stubs, "sleep", "exit 0\n")
+    _stub(stubs, "pgrep", "exit 1\n")
+    calls = tmp_path / "docker.calls"
+    _stub(
+        stubs, "docker",
+        f'echo "$*" >> "{calls}"\n'
+        f'case "$*" in *md5sum*) echo "{md5}  file" ;; *"count(*)"*) echo 0 ;; *) echo "dag_x | f" ;; esac\n',
+    )
+    nonce_file = state / "fotmob-deliver-nonce"
+    raw_lock = f"{state}//fotmob-auto-deliver.lock"   # ровно так его открывает автомат
+    automaton = tmp_path / "automaton.sh"
+    automaton.write_text(
+        "#!/bin/bash\n"
+        f'exec 9>"{raw_lock}"\n'
+        "flock -n 9 || exit 99\n"
+        f'printf "%s\\n" nonce-1 > "{nonce_file}"\n'
+        f'FOTMOB_DELIVERY_LOCK=held FOTMOB_DELIVER_NONCE=nonce-1 FOTMOB_DELIVER_NONCE_FILE="{nonce_file}" '
+        f'bash "{B6}" apply\n',
+        encoding="utf-8",
+    )
+    proc = _run(automaton, env_file=env_file, stubs=stubs)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "окно открыто" in proc.stdout and "B6 ДОСТАВЛЕН" in proc.stdout
+    assert _git(repo, "rev-parse", "HEAD") == two
+    assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "deploy/fotmob-b6-master"
+    assert not nonce_file.exists(), "пропуск одноразовый"
+    log = calls.read_text(encoding="utf-8")
+    assert "exec stub-metadb psql" in log and "exec stub-scheduler md5sum /opt/airflow/scrapers/fotmob/service.py" in log
 
 
 def _date_stub(stubs: Path, hhmm: str) -> None:
@@ -240,10 +319,24 @@ def test_window_alert_outside_the_window_touches_nothing(tmp_path: Path) -> None
     stubs.mkdir()
     _date_stub(stubs, "1200")
     _stub(stubs, "docker", 'echo "docker must not be called" >&2; exit 99\n')
+    _stub(stubs, "tg-send", 'echo "hook must not be called" >&2; exit 99\n')
     proc = _run(ALERT, env_file=env_file, stubs=stubs)
     assert proc.returncode == 0, proc.stderr
     assert proc.stderr == ""
     assert not list(Path(values["FOTMOB_STATE_DIR"]).iterdir())
+
+
+@pytest.mark.unit
+def test_window_alert_without_the_hook_is_loud_and_sets_no_latch(tmp_path: Path) -> None:
+    values = _layout(tmp_path)
+    env_file = _write_env(tmp_path / "fotmob.env", **values)
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    _date_stub(stubs, "2000")
+    proc = _run(ALERT, env_file=env_file, stubs=stubs)
+    assert proc.returncode == 2
+    assert values["FOTMOB_TG_HOOK"] in proc.stderr
+    assert not list(Path(values["FOTMOB_STATE_DIR"]).iterdir()), "без хука защёлка не ставится"
 
 
 @pytest.mark.unit

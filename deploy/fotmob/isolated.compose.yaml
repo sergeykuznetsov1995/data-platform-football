@@ -91,6 +91,8 @@ x-fm-airflow-common: &fm-airflow-common
       read_only: true
       bind:
         create_host_path: false
+    # logs/ не в git и compose'ом не создаётся (create_host_path: false): каталог с
+    # uid 50000 создаёт установка контура (рунбук), в живом дереве он уже есть.
     - type: bind
       source: ${FOTMOB_RELEASE_ROOT:?set the absolute FotMob release tree}/logs
       target: /opt/airflow/logs

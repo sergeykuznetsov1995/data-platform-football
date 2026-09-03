@@ -22,6 +22,15 @@ TARGET=${FOTMOB_TARGET:?FOTMOB_TARGET не задан в env-файле}        
 ROLLBACK_REF=${FOTMOB_ROLLBACK_REF:?FOTMOB_ROLLBACK_REF не задан в env-файле} # текущий боевой HEAD; голый SHA —
 ROLLBACK_SHA=${FOTMOB_ROLLBACK_SHA:?FOTMOB_ROLLBACK_SHA не задан в env-файле} # ветка deploy/fotmob-b6-master при apply переезжает на цель
 PROD_TREE=${FOTMOB_RELEASE_ROOT:?FOTMOB_RELEASE_ROOT не задан в env-файле}
+# Пины — только короткие SHA (7–8 hex, как `git rev-parse --short`): автомат сравнивает
+# их с `--short HEAD` по префиксу, полный SHA не совпал бы никогда (ревью Sol, #1155).
+for pin in TARGET ROLLBACK_SHA; do
+  case "${!pin}" in
+    ???????|????????) case "${!pin}" in *[!0-9a-f]*) ;; *) continue ;; esac ;;
+  esac
+  echo "FOTMOB_$pin='${!pin}': ожидается короткий SHA (7–8 hex, как git rev-parse --short)" >&2
+  exit 2
+done
 METADB=${FOTMOB_METADB_CONTAINER:?FOTMOB_METADB_CONTAINER не задан в env-файле}
 SCHED=${FOTMOB_SCHEDULER_CONTAINER:?FOTMOB_SCHEDULER_CONTAINER не задан в env-файле}
 CAMPAIGN=${FOTMOB_CAMPAIGN_DIR:?FOTMOB_CAMPAIGN_DIR не задан в env-файле}
@@ -69,8 +78,13 @@ if [ "$MODE" = apply ] && [ "$DRY" = 0 ]; then
   # занятом кем-то замке — отказ. Спрашивать /proc/locks бесполезно: там
   # владельцем записан pid уже завершившейся команды flock, а не автомата.
   # Замок — тот же файл, что открывает автомат: $STATE/fotmob-auto-deliver.lock,
-  # оба выводят путь из одного FOTMOB_STATE_DIR.
+  # оба выводят путь из одного FOTMOB_STATE_DIR. Сравниваем с РАЗРЕШЁННЫМ путём:
+  # /proc/self/fd/9 показывает канонический путь, а в env-файле мог оказаться
+  # хвостовой `/` или symlink в родителе — сырой текст не совпал бы, и законный
+  # вызов автомата отбивался бы уже после израсходованного пропуска и суточной
+  # защёлки (ревью Sol, #1155 этап 3).
   LOCKFILE=${FOTMOB_STATE_DIR:?FOTMOB_STATE_DIR не задан в env-файле}/fotmob-auto-deliver.lock
+  LOCK_REAL=$(realpath -e "$LOCKFILE" 2>/dev/null) || LOCK_REAL=__нет-замка__
   # Четвёртое условие — одноразовый пропуск. Три предыдущих обходятся тем, кто сам
   # откроет дескриптор и сам возьмёт замок (ревью Sol, раунд 22). Пропуск автомат
   # выписывает перед вызовом: значение приходит переменной, а файл мы сверяем и
@@ -84,7 +98,7 @@ if [ "$MODE" = apply ] && [ "$DRY" = 0 ]; then
     nonce_ok=1
     rm -f "$FOTMOB_DELIVER_NONCE_FILE"
   fi
-  if [ "$(readlink /proc/self/fd/9 2>/dev/null)" != "$LOCKFILE" ] \
+  if [ "$(readlink /proc/self/fd/9 2>/dev/null)" != "$LOCK_REAL" ] \
      || flock -n "$LOCKFILE" true 2>/dev/null \
      || ! flock -n 9 2>/dev/null \
      || [ "$nonce_ok" != 1 ]; then

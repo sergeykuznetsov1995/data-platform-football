@@ -46,7 +46,6 @@
 # и очередь — автомат глушит сам себя, чтобы не действовать молча.
 set -u
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export HOME=${HOME:-/root}
 
 # Env-файл контура читается как compose (ключи FOTMOB_*, без подстановок и без
 # export — см. env.sh). Нет файла — автомат не делает НИЧЕГО: без него неизвестны ни
@@ -65,6 +64,17 @@ IS_PROD=$([ "$TREE" = "$(realpath -m "$PROD_TREE")" ] && echo 1 || echo 0)
 TARGET=${FOTMOB_TARGET:?FOTMOB_TARGET не задан в env-файле}                   # цель выката
 ROLLBACK_REF=${FOTMOB_ROLLBACK_REF:?FOTMOB_ROLLBACK_REF не задан в env-файле} # прежний боевой HEAD; голый SHA:
 ROLLBACK_SHA=${FOTMOB_ROLLBACK_SHA:?FOTMOB_ROLLBACK_SHA не задан в env-файле} # ветка deploy/fotmob-b6-master при apply переезжает на цель
+# Пины сравниваются с `git rev-parse --short HEAD` по префиксу (head_of/on_target):
+# полный 40-значный SHA не совпал бы никогда, и исправное дерево считалось бы
+# незаконным (кампания стоп, выключатель). Поэтому только короткая форма — 7–8 hex,
+# как печатает `git rev-parse --short` (ревью Sol, #1155 этап 3).
+for pin in TARGET ROLLBACK_SHA; do
+  case "${!pin}" in
+    ???????|????????) case "${!pin}" in *[!0-9a-f]*) ;; *) continue ;; esac ;;
+  esac
+  echo "FOTMOB_$pin='${!pin}': ожидается короткий SHA (7–8 hex, как git rev-parse --short)" >&2
+  exit 2
+done
 # Доказательство доставки — целевой md5 модуля, который меняет цель, в контейнере
 # (bind-mount цел, checkout дошёл) плюс живой контур: есть даг, перечитанный
 # планировщиком за окно свежести, и ноль ошибок импорта. Появление нового дага

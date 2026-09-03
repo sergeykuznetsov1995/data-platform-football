@@ -44,7 +44,7 @@ CONTOUR_DAGS = {
 
 # Host-side paths that must never be baked into the recipe; /home/airflow is the
 # container home and is allowed.
-HOST_PATH_LITERAL = re.compile(r"(?<![\w$])/(root/|tmp/|home/(?!airflow/))")
+HOST_PATH_LITERAL = re.compile(r"(?<![\w$])/(root|tmp)(?![\w-])|(?<![\w$])/home/(?!airflow/)")
 FAIL_CLOSED_VAR = re.compile(r"^\$\{(?P<name>[A-Z0-9_]+):\?[^}]+\}")
 SECRET_LITERAL = re.compile(r"://[^:/\s]+:(?!\$\{)[^@\s]+@")
 HEX40 = re.compile(r"\b[0-9a-f]{40}\b")
