@@ -1,0 +1,32 @@
+# Изолированный fotmob-стек (#930): в DagBag пускаем ТОЛЬКО пять дагов FotMob —
+# dag_ingest_fotmob, dag_transform_fotmob_silver, dag_trigger_fotmob_daily,
+# dag_refresh_fotmob (#1021), dag_backfill_fotmob (#1020).
+#
+# ВНИМАНИЕ: движок regexp здесь RE2 (не Python re) — negative lookahead (?!...)
+# НЕ поддерживается и молча игнорируется, поэтому allow-list выразить нельзя и
+# ниже стоит ПОЛНЫЙ блок-лист: перечислены все чужие даги master поимённо.
+# Блокировка каталогов влияет только на парсинг DagBag; импорты utils/, sql/
+# из самих дагов работают как обычно.
+#
+# v2 (28.07.2026), сгенерирован из dags/*.py на master 9b05d18:
+#   * v1 глушила ^dag_backfill_ целиком и вместе с чужими бэкфиллами прятала
+#     dag_backfill_fotmob.py (#1020), а групповые префиксы пропускали новые
+#     чужие даги (dag_accept_fbref_bronze, dag_backup_whoscored_storage);
+#   * поимённый список от этого защищает: любой НОВЫЙ чужой даг на master
+#     нужно дописать сюда — иначе он попадёт в DagBag изолята.
+#   * dag_trigger_fotmob_daily.py на master лежит в репозитории и приезжает
+#     каталожным маунтом; одиночный file-bind снят.
+^configs/
+^scripts/
+^sql/
+^utils/
+^(dag_accept_fbref_bronze|dag_backfill_fbref|dag_backfill_transfermarkt|dag_backfill_understat|dag_backfill_whoscored|dag_backup_whoscored_storage|dag_bootstrap_fbref|dag_canary_sofascore_proxy|dag_canary_whoscored_proxy|dag_discover_transfermarkt_registry|dag_e3_backfill|dag_iceberg_maintenance|dag_iceberg_maintenance_daily|dag_ingest_capology|dag_ingest_clubelo|dag_ingest_espn|dag_ingest_fbref|dag_ingest_matchhistory|dag_ingest_sofascore|dag_ingest_sofifa|dag_ingest_transfermarkt|dag_ingest_understat|dag_ingest_whoscored|dag_master_pipeline|dag_proxy_traffic_report|dag_replay_fbref|dag_replay_fbref_bronze|dag_sofascore_pipeline|dag_superset_alerts|dag_transform_capology_silver|dag_transform_e3|dag_transform_e4|dag_transform_fbref_gold|dag_transform_fbref_silver|dag_transform_sofifa_silver|dag_transform_transfermarkt_silver|dag_transform_xref)\.py$
+
+# v2.1 (10.08.2026, доставка #1149): новый чужой даг на master после 28.07 —
+# dag_transform_espn_silver. Дописан отдельной строкой (append сохраняет инод;
+# sed -i / cp / mv меняют инод и рвут file-bind в контейнер).
+^dag_transform_espn_silver\.py$
+
+# v2.2 (01.09.2026, пин 2c7e469f): новые чужие даги на master после 10.08 —
+# кампания SofaScore all-mens (#1216). Дописано append-ом: file-bind живёт на иноде.
+^(dag_backfill_sofascore_all_mens|dag_refresh_sofascore_all_mens)\.py$
